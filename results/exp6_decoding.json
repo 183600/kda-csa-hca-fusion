@@ -1,0 +1,82 @@
+[
+  {
+    "prefill_ms": 67.67385999955877,
+    "mean_decode_ms_per_token": 11.3914646000012,
+    "median_decode_ms_per_token": 1.287402000343718,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 128,
+    "n_decode": 20,
+    "op": "softmax",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 57.909861000553065,
+    "mean_decode_ms_per_token": 1.6928236999774526,
+    "median_decode_ms_per_token": 1.6636769996694056,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 128,
+    "n_decode": 20,
+    "op": "kda",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 10.799840000800032,
+    "mean_decode_ms_per_token": 0.913847649917443,
+    "median_decode_ms_per_token": 0.7160519999160897,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 512,
+    "n_decode": 20,
+    "op": "softmax",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 156.7441159995724,
+    "mean_decode_ms_per_token": 1.1804517500422662,
+    "median_decode_ms_per_token": 1.1535550002008677,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 512,
+    "n_decode": 20,
+    "op": "kda",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 22.475126999779604,
+    "mean_decode_ms_per_token": 1.2150358500093716,
+    "median_decode_ms_per_token": 0.9245560004274012,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 1024,
+    "n_decode": 20,
+    "op": "softmax",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 256.5744759995141,
+    "mean_decode_ms_per_token": 1.15176935009913,
+    "median_decode_ms_per_token": 1.1495629996716161,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 1024,
+    "n_decode": 20,
+    "op": "kda",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 36.58615099993767,
+    "mean_decode_ms_per_token": 1.3205381000261696,
+    "median_decode_ms_per_token": 0.8978329997262335,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 2048,
+    "n_decode": 20,
+    "op": "softmax",
+    "device": "cpu"
+  },
+  {
+    "prefill_ms": 458.330756999203,
+    "mean_decode_ms_per_token": 1.1531425001976459,
+    "median_decode_ms_per_token": 1.1174689998370013,
+    "peak_mem_MB": 0.0,
+    "prefill_len": 2048,
+    "n_decode": 20,
+    "op": "kda",
+    "device": "cpu"
+  }
+]

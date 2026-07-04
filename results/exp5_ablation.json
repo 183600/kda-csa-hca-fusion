@@ -1,0 +1,194 @@
+[
+  {
+    "ratio": "3:1:1",
+    "layout": "KDA-KDA-KDA-CSA-HCA",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "ratio": "3:1:1",
+        "layout": "KDA-KDA-KDA-CSA-HCA",
+        "final_acc": 0.09375,
+        "final_loss": 2.8239539861679077,
+        "fwd_ms": 54.59283879990835,
+        "n_params": 26788,
+        "n_layers": 5,
+        "seed": 42,
+        "steps": 30,
+        "last_train_loss": 2.9747262001037598,
+        "mean_last10_loss": 2.887717628479004,
+        "train_time_s": 46.15554666519165
+      },
+      {
+        "ratio": "3:1:1",
+        "layout": "KDA-KDA-KDA-CSA-HCA",
+        "final_acc": 0.08203125,
+        "final_loss": 2.7920409440994263,
+        "fwd_ms": 53.71627840013389,
+        "n_params": 26788,
+        "n_layers": 5,
+        "seed": 43,
+        "steps": 30,
+        "last_train_loss": 2.5740156173706055,
+        "mean_last10_loss": 2.8102622032165527,
+        "train_time_s": 43.98096799850464
+      }
+    ],
+    "mean_acc": 0.087890625,
+    "std_acc": 0.008286407592029853,
+    "ci95_acc": 0.07444921874999999,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 4.333333333333334,
+    "mean_fwd_ms": 54.15455860002112,
+    "n_params": 26788,
+    "n_layers": 5,
+    "mean_train_time_s": 45.068257331848145
+  },
+  {
+    "ratio": "4:1:1",
+    "layout": "KDA-KDA-KDA-KDA-CSA-HCA",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "ratio": "4:1:1",
+        "layout": "KDA-KDA-KDA-KDA-CSA-HCA",
+        "final_acc": 0.0390625,
+        "final_loss": 2.8774011731147766,
+        "fwd_ms": 65.54936460015597,
+        "n_params": 32164,
+        "n_layers": 6,
+        "seed": 42,
+        "steps": 30,
+        "last_train_loss": 2.8323512077331543,
+        "mean_last10_loss": 2.881407141685486,
+        "train_time_s": 46.67079281806946
+      },
+      {
+        "ratio": "4:1:1",
+        "layout": "KDA-KDA-KDA-KDA-CSA-HCA",
+        "final_acc": 0.0859375,
+        "final_loss": 2.8386327624320984,
+        "fwd_ms": 69.27833019999525,
+        "n_params": 32164,
+        "n_layers": 6,
+        "seed": 43,
+        "steps": 30,
+        "last_train_loss": 2.6833672523498535,
+        "mean_last10_loss": 2.8077375650405885,
+        "train_time_s": 46.781919717788696
+      }
+    ],
+    "mean_acc": 0.0625,
+    "std_acc": 0.03314563036811941,
+    "ci95_acc": 0.29779687499999996,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 0.0,
+    "mean_fwd_ms": 67.41384740007561,
+    "n_params": 32164,
+    "n_layers": 6,
+    "mean_train_time_s": 46.72635626792908
+  },
+  {
+    "ratio": "3:0:1",
+    "layout": "KDA-KDA-KDA-HCA",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "ratio": "3:0:1",
+        "layout": "KDA-KDA-KDA-HCA",
+        "final_acc": 0.11328125,
+        "final_loss": 2.8429441452026367,
+        "fwd_ms": 33.663729399995646,
+        "n_params": 20354,
+        "n_layers": 4,
+        "seed": 42,
+        "steps": 30,
+        "last_train_loss": 2.9215025901794434,
+        "mean_last10_loss": 2.894283962249756,
+        "train_time_s": 9.706803321838379
+      },
+      {
+        "ratio": "3:0:1",
+        "layout": "KDA-KDA-KDA-HCA",
+        "final_acc": 0.07421875,
+        "final_loss": 2.84697026014328,
+        "fwd_ms": 33.904229199833935,
+        "n_params": 20354,
+        "n_layers": 4,
+        "seed": 43,
+        "steps": 30,
+        "last_train_loss": 2.8144116401672363,
+        "mean_last10_loss": 2.8811023473739623,
+        "train_time_s": 10.092332363128662
+      }
+    ],
+    "mean_acc": 0.09375,
+    "std_acc": 0.027621358640099514,
+    "ci95_acc": 0.24816406249999998,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 1.6,
+    "mean_fwd_ms": 33.78397929991479,
+    "n_params": 20354,
+    "n_layers": 4,
+    "mean_train_time_s": 9.89956784248352
+  },
+  {
+    "ratio": "3:1:0",
+    "layout": "KDA-KDA-KDA-CSA",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "ratio": "3:1:0",
+        "layout": "KDA-KDA-KDA-CSA",
+        "final_acc": 0.07421875,
+        "final_loss": 2.8298981189727783,
+        "fwd_ms": 51.67897079991235,
+        "n_params": 22562,
+        "n_layers": 4,
+        "seed": 42,
+        "steps": 30,
+        "last_train_loss": 2.743086576461792,
+        "mean_last10_loss": 2.8247005939483643,
+        "train_time_s": 40.32519721984863
+      },
+      {
+        "ratio": "3:1:0",
+        "layout": "KDA-KDA-KDA-CSA",
+        "final_acc": 0.078125,
+        "final_loss": 2.789032280445099,
+        "fwd_ms": 52.88943760006077,
+        "n_params": 22562,
+        "n_layers": 4,
+        "seed": 43,
+        "steps": 30,
+        "last_train_loss": 2.723219871520996,
+        "mean_last10_loss": 2.8401180505752563,
+        "train_time_s": 40.928810596466064
+      }
+    ],
+    "mean_acc": 0.076171875,
+    "std_acc": 0.0027621358640099515,
+    "ci95_acc": 0.02481640625,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 7.0,
+    "mean_fwd_ms": 52.28420419998656,
+    "n_params": 22562,
+    "n_layers": 4,
+    "mean_train_time_s": 40.62700390815735
+  }
+]

@@ -1,0 +1,112 @@
+[
+  {
+    "name": "output shape",
+    "status": "PASS",
+    "detail": "(2, 128, 4, 32)"
+  },
+  {
+    "name": "output max abs diff",
+    "status": "PASS",
+    "detail": "1.92e-09"
+  },
+  {
+    "name": "state max abs diff",
+    "status": "PASS",
+    "detail": "1.30e-08"
+  },
+  {
+    "name": "GVA output shape",
+    "status": "PASS",
+    "detail": "(1, 64, 4, 32)"
+  },
+  {
+    "name": "GVA state shape",
+    "status": "PASS",
+    "detail": "(1, 4, 32, 32)"
+  },
+  {
+    "name": "GVA finite",
+    "status": "PASS",
+    "detail": ""
+  },
+  {
+    "name": "CSA compressed shape",
+    "status": "PASS",
+    "detail": "(1, 8, 16)"
+  },
+  {
+    "name": "CSA indices shape",
+    "status": "PASS",
+    "detail": "(1, 64, 4)"
+  },
+  {
+    "name": "CSA causal selection",
+    "status": "PASS",
+    "detail": "all selected blocks precede the query"
+  },
+  {
+    "name": "HCA output shape",
+    "status": "PASS",
+    "detail": "(1, 128, 32)"
+  },
+  {
+    "name": "HCA finite",
+    "status": "PASS",
+    "detail": ""
+  },
+  {
+    "name": "hybrid output shape",
+    "status": "PASS",
+    "detail": "(2, 64, 64)"
+  },
+  {
+    "name": "hybrid finite",
+    "status": "PASS",
+    "detail": ""
+  },
+  {
+    "name": "hybrid layout",
+    "status": "PASS",
+    "detail": "layout=KDA-KDA-KDA-CSA-HCA params=49604"
+  },
+  {
+    "name": "overlap no-future-leakage",
+    "status": "PASS",
+    "detail": "max diff over all blocks = 0.00e+00 (fp64)"
+  },
+  {
+    "name": "block 0 no-prev-dependency",
+    "status": "PASS",
+    "detail": "block 0 diff when perturbing prev = 0.00e+00"
+  },
+  {
+    "name": "KDA gradient matches finite-diff",
+    "status": "PASS",
+    "detail": "max relative error = 9.87e-08 (fp64, 40 coords)"
+  },
+  {
+    "name": "CSA indices in range",
+    "status": "PASS",
+    "detail": "topk=4, n_blocks=8"
+  },
+  {
+    "name": "CSA indices causal",
+    "status": "PASS",
+    "detail": "all selected blocks precede query"
+  },
+  {
+    "name": "CSA early queries empty",
+    "status": "PASS",
+    "detail": "queries t<8 have no preceding block -> all -1"
+  },
+  {
+    "name": "HCA sliding-window causal",
+    "status": "PASS",
+    "detail": "max diff in unaffected region = 1.11e-16 (fp64, win=4)"
+  },
+  {
+    "name": "CSA full pipeline causal",
+    "status": "PASS",
+    "detail": "max diff in unaffected region = 1.11e-16 (fp64, win=4)"
+  }
+]

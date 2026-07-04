@@ -1,0 +1,174 @@
+[
+  {
+    "op": "softmax",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "op": "softmax",
+        "final_acc": 0.09765625,
+        "final_loss": 2.7747251987457275,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.0625,
+        "mean_last10_loss": 2.7773903369903565,
+        "mean_last10_acc": 0.0625,
+        "steps": 50,
+        "seed": 42,
+        "train_time_s": 3.675673484802246
+      },
+      {
+        "op": "softmax",
+        "final_acc": 0.0859375,
+        "final_loss": 2.7786543369293213,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.03125,
+        "mean_last10_loss": 2.782011532783508,
+        "mean_last10_acc": 0.084375,
+        "steps": 50,
+        "seed": 43,
+        "train_time_s": 1.3695459365844727
+      }
+    ],
+    "mean_acc": 0.091796875,
+    "std_acc": 0.008286407592029853,
+    "ci95_acc": 0.07444921874999999,
+    "mean_loss": 2.7766897678375244,
+    "std_loss": 0.0027783202538381345,
+    "ci95_loss": 0.02496181488037109,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 5.000000000000001,
+    "mean_train_time_s": 2.5226097106933594
+  },
+  {
+    "op": "kda",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "op": "kda",
+        "final_acc": 0.08203125,
+        "final_loss": 2.867818236351013,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.0625,
+        "mean_last10_loss": 2.8550721645355224,
+        "mean_last10_acc": 0.08125,
+        "steps": 30,
+        "seed": 42,
+        "train_time_s": 2.596485137939453
+      },
+      {
+        "op": "kda",
+        "final_acc": 0.07421875,
+        "final_loss": 2.8241806030273438,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.0625,
+        "mean_last10_loss": 2.8489343166351317,
+        "mean_last10_acc": 0.05625,
+        "steps": 30,
+        "seed": 43,
+        "train_time_s": 2.6318533420562744
+      }
+    ],
+    "mean_acc": 0.078125,
+    "std_acc": 0.005524271728019903,
+    "ci95_acc": 0.0496328125,
+    "mean_loss": 2.8459994196891785,
+    "std_loss": 0.030856466438098716,
+    "ci95_loss": 0.27722988450527186,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 4.0,
+    "mean_train_time_s": 2.6141692399978638
+  },
+  {
+    "op": "csa",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "op": "csa",
+        "final_acc": 0.09375,
+        "final_loss": 2.8208975791931152,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.0,
+        "mean_last10_loss": 2.8019121408462526,
+        "mean_last10_acc": 0.1,
+        "steps": 30,
+        "seed": 42,
+        "train_time_s": 68.50719738006592
+      },
+      {
+        "op": "csa",
+        "final_acc": 0.0859375,
+        "final_loss": 2.7659952640533447,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.125,
+        "mean_last10_loss": 2.8346308708190917,
+        "mean_last10_acc": 0.0625,
+        "steps": 30,
+        "seed": 43,
+        "train_time_s": 65.70441126823425
+      }
+    ],
+    "mean_acc": 0.08984375,
+    "std_acc": 0.005524271728019903,
+    "ci95_acc": 0.0496328125,
+    "mean_loss": 2.79344642162323,
+    "std_loss": 0.03882179933817258,
+    "ci95_loss": 0.34879440808296197,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 7.0,
+    "mean_train_time_s": 67.10580432415009
+  },
+  {
+    "op": "hca",
+    "n_seeds": 2,
+    "seeds": [
+      42,
+      43
+    ],
+    "per_seed": [
+      {
+        "op": "hca",
+        "final_acc": 0.07421875,
+        "final_loss": 2.8249659538269043,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.0625,
+        "mean_last10_loss": 2.8286338329315184,
+        "mean_last10_acc": 0.0875,
+        "steps": 30,
+        "seed": 42,
+        "train_time_s": 7.519918203353882
+      },
+      {
+        "op": "hca",
+        "final_acc": 0.0859375,
+        "final_loss": 2.8166423439979553,
+        "chance_acc": 0.0625,
+        "last_train_acc": 0.03125,
+        "mean_last10_loss": 2.821897053718567,
+        "mean_last10_acc": 0.09375,
+        "steps": 30,
+        "seed": 43,
+        "train_time_s": 7.1818764209747314
+      }
+    ],
+    "mean_acc": 0.080078125,
+    "std_acc": 0.008286407592029853,
+    "ci95_acc": 0.07444921874999999,
+    "mean_loss": 2.82080414891243,
+    "std_loss": 0.005885680954000819,
+    "ci95_loss": 0.05287989324331283,
+    "chance_acc": 0.0625,
+    "t_stat_vs_chance": 3.0000000000000004,
+    "mean_train_time_s": 7.350897312164307
+  }
+]
