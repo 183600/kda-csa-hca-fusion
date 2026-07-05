@@ -203,7 +203,19 @@ def naive_csa(
     q_idx = (cQ @ W_IUQ).view(B_, T, nIh, c_I)                     # [B, T, nIh, c_I]
     w_idx = H @ W_w                                                # [B, T, nIh]
     cbm = _causal_block_mask(T, n_blocks, m, device)
-    indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk, scale=scale,
+    # The lightning indexer scores are dot products over DI = c_I (not c),
+    # so the correct scale is c_I ** -0.5 (per the DeepSeek-V4 paper Eq. 15:
+    # score = ReLU(q_idx . K_idx / sqrt(DI))). We previously passed the
+    # outer ``scale`` (defaulting to c ** -0.5), which is the correct scale
+    # for the sparse MQA core (dot product over c) but NOT for the indexer.
+    #
+    # Note: this does not change the top-k selection (ReLU is positively
+    # homogeneous, so scaling all scores by a positive constant preserves
+    # their relative ordering), but it makes the code match the documented
+    # formula and ensures the logits have the intended magnitude if they
+    # are ever exposed for downstream use (e.g. learnable temperature).
+    indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
+                                    scale=c_I ** -0.5,
                                     causal_block_mask=cbm)          # [B, T, topk]
 
     # --- 3. Shared-KV MQA core attention ---

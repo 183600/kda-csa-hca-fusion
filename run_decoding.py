@@ -130,9 +130,17 @@ class KDAAttnDecoding(nn.Module):
         v = F.silu(self.v(x)).view(B, T_new, self.H, self.V)
         g = -F.softplus(self.g(x)).view(B, T_new, self.H, self.K) * 0.1
         beta = torch.sigmoid(self.beta(x))
+        # Detach the incoming state in training mode so the autograd graph
+        # from the previous step is not retained (otherwise backward() would
+        # raise "backward through the graph a second time"). In eval/decoding
+        # mode we keep the graph so that stateful generation works.
+        # Mirrors the fix in ops_fused.py::HybridKCHAttention.forward.
+        state = self._state
+        if state is not None and self.training:
+            state = state.detach()
         o, self._state = naive_recurrent_kda(
             q, k, v, g, beta, scale=self.K ** -0.5,
-            initial_state=self._state, output_final_state=True,
+            initial_state=state, output_final_state=True,
         )
         return self.o(o.reshape(B, T_new, self.H * self.V))
 

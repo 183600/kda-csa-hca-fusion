@@ -106,6 +106,41 @@ def test_kda_gva(device='cpu'):
     ]
 
 
+def test_kda_chunk_gva(device='cpu'):
+    """Verify naive_chunk_kda matches naive_recurrent_kda under GVA (HV > H).
+
+    The chunk path uses ``repeat_interleave(G, dim=...)`` to expand q/k from
+    H heads to HV heads, mirroring the recurrent path. This was previously
+    only tested with HV == H (G=1, no GVA); the GVA chunk path was
+    unverified. This test closes that gap by checking chunk-vs-recurrent
+    agreement with HV=4, H=2 (G=2).
+    """
+    logger.info("Test: KDA chunk vs recurrent with GVA (HV > H)")
+    torch.manual_seed(13)
+    B, T, H, K, V, HV = 2, 128, 2, 32, 32, 4
+    q = torch.randn(B, T, H, K, dtype=torch.float32, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.float32, device=device)
+    q = torch.nn.functional.normalize(q, dim=-1)
+    k = torch.nn.functional.normalize(k, dim=-1)
+    v = torch.randn(B, T, HV, V, dtype=torch.float32, device=device) * 0.1
+    g = -torch.rand(B, T, HV, K, dtype=torch.float32, device=device) * 0.05
+    beta = torch.rand(B, T, HV, dtype=torch.float32, device=device) * 0.2
+
+    o_rec, s_rec = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+    o_chk, s_chk = naive_chunk_kda(q, k, v, g, beta, output_final_state=True, chunk_size=64)
+
+    o_diff = (o_rec - o_chk).abs().max().item()
+    s_diff = (s_rec - s_chk).abs().max().item()
+    return [
+        _ok('GVA chunk output shape', o_chk.shape == o_rec.shape == (B, T, HV, V),
+            str(tuple(o_chk.shape))),
+        _ok('GVA chunk state shape', s_chk.shape == s_rec.shape == (B, HV, K, V),
+            str(tuple(s_chk.shape))),
+        _ok('GVA chunk vs recurrent output', o_diff < 1e-4, f'{o_diff:.2e}'),
+        _ok('GVA chunk vs recurrent state', s_diff < 1e-4, f'{s_diff:.2e}'),
+    ]
+
+
 def test_csa_causality(device='cpu'):
     logger.info("Test: CSA compression + indexer causality")
     torch.manual_seed(2)
@@ -917,6 +952,7 @@ def main():
     all_results = []
     all_results += test_kda_chunk_vs_recurrent(device)
     all_results += test_kda_gva(device)
+    all_results += test_kda_chunk_gva(device)
     all_results += test_csa_causality(device)
     all_results += test_hca_causality(device)
     all_results += test_fused_hybrid(device)
