@@ -188,20 +188,16 @@ def bench_kda_chunk(B, T, H, K, V, device):
     g = -torch.rand(B, T, H, K, device=device) * 0.05
     beta = torch.rand(B, T, H, device=device) * 0.2
     BT = 64
-    pad = (-T) % BT
-    if pad:
-        qp = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad))
-        kp = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad))
-        vp = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad))
-        gp = torch.nn.functional.pad(g, (0, 0, 0, 0, 0, pad))
-        bp = torch.nn.functional.pad(beta, (0, 0, 0, pad))
-
-        def fn():
-            with torch.no_grad():
-                o, _ = naive_chunk_kda(qp, kp, vp, gp, bp, output_final_state=True, chunk_size=BT)
-                return o[:T]
-        return fn
-
+    # NOTE: ``naive_chunk_kda`` already right-pads T up to a multiple of
+    # ``chunk_size`` internally and returns ``o[:, :original_T]``. The previous
+    # version of this bench duplicated that padding *and* then trimmed with
+    # ``o[:T]``, which slices dim=0 (batch) instead of dim=1 (sequence) — the
+    # same class of bug that was fixed in ``ops_fused.py`` and
+    # ``run_quality.py::CSAAttn.forward``. For B=1 the wrong slice happened to
+    # return the full tensor so the benchmark kept working, but for B>1 it
+    # silently corrupted results, and for any B the reported timing reflected
+    # the padded length rather than T. We now let ``naive_chunk_kda`` handle
+    # padding end-to-end and just time it directly.
     def fn():
         with torch.no_grad():
             return naive_chunk_kda(q, k, v, g, beta, output_final_state=True, chunk_size=BT)

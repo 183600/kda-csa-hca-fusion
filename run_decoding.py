@@ -70,7 +70,7 @@ class SoftmaxAttnDecoding(nn.Module):
         self._cache_v = None
 
     def forward(self, x):
-        # x: [B, T_new, d] — T_new = 1 during decoding.
+        # x: [B, T_new, d] — T_new = prefill_len during prefill, 1 during decoding.
         B, T_new, d = x.shape
         q = self.q(x).view(B, T_new, self.H, self.K)
         k = self.k(x).view(B, T_new, self.H, self.K)
@@ -83,6 +83,24 @@ class SoftmaxAttnDecoding(nn.Module):
             self._cache_v = torch.cat([self._cache_v, v], dim=1)
         T_full = self._cache_k.shape[1]
         s = torch.einsum('bthk,bshk->bhts', q, self._cache_k) * self.scale
+        # Causal mask: query at relative position t in the current chunk is at
+        # absolute position (T_full - T_new + t); it may only attend to keys
+        # at absolute positions <= (T_full - T_new + t).
+        # For prefill (T_new == T_full) this reduces to the standard
+        # lower-triangular mask. For decoding (T_new == 1) the single query
+        # is at position T_full - 1, so it attends to all cached keys and the
+        # mask is all-False (we skip the masked_fill entirely to avoid the
+        # overhead of constructing a [1, T_full] mask per decode step).
+        # Previously no causal mask was applied at all, which made the prefill
+        # non-causal — the prefill output is discarded by the benchmark, but
+        # the missing mask still made prefill_ms artificially low (no mask
+        # construction / fill) and was incorrect for any autoregressive use.
+        if T_new > 1:
+            q_offset = T_full - T_new
+            q_pos = torch.arange(T_new, device=x.device) + q_offset     # [T_new]
+            k_pos = torch.arange(T_full, device=x.device)               # [T_full]
+            causal_mask = k_pos[None, :] > q_pos[:, None]               # [T_new, T_full]
+            s = s.masked_fill(causal_mask[None, None, :, :], float('-inf'))
         p = torch.softmax(s, dim=-1)
         out = torch.einsum('bhts,bshv->bthv', p, self._cache_v)
         return self.o(out.reshape(B, T_new, self.H * self.V))
