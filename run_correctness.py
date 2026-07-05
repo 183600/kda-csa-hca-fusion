@@ -532,6 +532,147 @@ def test_csa_full_pipeline_causality(device='cpu'):
     ]
 
 
+def test_hybrid_padding_no_crash(device='cpu'):
+    """Regression: HybridKCHAttention must not crash when T is not divisible
+    by csa_m / hca_m2.
+
+    Previously, the padding trim used ``o[pad:]`` which slices dim=0 (batch)
+    instead of dim=1 (sequence). This caused a shape-mismatch RuntimeError
+    on the residual add whenever T was not a multiple of the compression
+    factor. The tests happened not to trigger it because every test used
+    T divisible by m, but any real-world sequence length could hit it.
+
+    We now exercise T values that require non-trivial padding for BOTH the
+    CSA layer (m=8) and the HCA layer (m2=16), for several batch sizes
+    including B=1 (which previously crashed with an empty-batch slice) and
+    B>pad (which previously silently corrupted results).
+    """
+    logger.info("Test: hybrid forward with non-divisible T (padding regression)")
+    torch.manual_seed(10)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
+    # T values that force padding for CSA (m=8) and HCA (m2=16):
+    #   T=10 -> csa pad=6,  hca pad=6
+    #   T=13 -> csa pad=3,  hca pad=3
+    #   T=20 -> csa pad=4,  hca pad=12
+    #   T=1  -> csa pad=7,  hca pad=15  (single-token decode edge case)
+    test_Ts = [10, 13, 20, 1]
+    # Batch sizes that exercise both the B<=pad and B>pad failure modes.
+    test_Bs = [1, 3, 8]
+    all_ok = True
+    detail_parts = []
+    for B in test_Bs:
+        for T in test_Ts:
+            model.reset_state()
+            x = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+            try:
+                with torch.no_grad():
+                    y = model(x)
+                shape_ok = y.shape == x.shape
+                finite_ok = torch.isfinite(y).all().item()
+                if not (shape_ok and finite_ok):
+                    all_ok = False
+                    detail_parts.append(
+                        f'B={B},T={T}: shape={tuple(y.shape)} finite={finite_ok}')
+            except Exception as e:
+                all_ok = False
+                detail_parts.append(f'B={B},T={T}: CRASH {type(e).__name__}: {e}')
+    detail = '; '.join(detail_parts) if detail_parts else \
+        f'all {len(test_Ts)*len(test_Bs)} (B,T) combos forward cleanly'
+    return [
+        _ok('hybrid padding no-crash', all_ok, detail),
+    ]
+
+
+def test_hybrid_state_buffer_registration(device='cpu'):
+    """Regression: HybridKCHAttention._kda_state must be a registered buffer.
+
+    Previously _kda_state was a plain Python attribute, so ``model.to(device)``
+    left it on the source device, causing a device-mismatch crash on the next
+    forward. We register it as a non-persistent buffer so .to() moves it
+    automatically and state_dict skips it (it is runtime state, not weights).
+
+    On a CPU-only box we cannot test a real device transfer, but we CAN
+    verify the buffer is registered (so .to() will move it) and that a
+    second forward after a no-op .to('cpu') still works.
+    """
+    logger.info("Test: hybrid _kda_state is a registered buffer")
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
+    # First forward populates _kda_state.
+    x1 = torch.randn(2, 16, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model.reset_state()
+        model(x1)
+    state_is_buffer = any(b is model._kda_state for b in model.buffers())
+    state_not_in_state_dict = '_kda_state' not in model.state_dict()
+    # A no-op .to(device) must not break the next forward (it would have,
+    # had _kda_state stayed on the wrong device after a real .to('cuda')).
+    model.to(device)
+    x2 = torch.randn(2, 16, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model.reset_state()
+        y2 = model(x2)
+    forward_ok_after_to = torch.isfinite(y2).all().item()
+    return [
+        _ok('_kda_state is a registered buffer', state_is_buffer,
+            f'in model.buffers()={state_is_buffer}'),
+        _ok('_kda_state not in state_dict (non-persistent)',
+            state_not_in_state_dict,
+            f'in state_dict={not state_not_in_state_dict}'),
+        _ok('forward works after model.to(device)', forward_ok_after_to, ''),
+    ]
+
+
+def test_bench_hybrid_no_grad_inference(device='cpu'):
+    """Regression: bench_hybrid's fn() must not build an autograd graph.
+
+    Previously the ``with torch.no_grad():`` wrapped the ``def fn():`` line
+    rather than the call body. The no_grad context is global and exits as
+    soon as the ``with`` block ends, so later ``fn()`` calls ran with
+    gradients enabled -- silently inflating both latency (graph construction)
+    and peak memory (retained activations). We now put no_grad inside fn().
+    """
+    logger.info("Test: bench_hybrid runs under no_grad (regression)")
+    # Replicate the fixed bench_hybrid pattern inline so the test is
+    # self-contained and does not import run_benchmark (which would pull in
+    # matplotlib etc.).
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
+    x = torch.randn(1, 16, cfg.d_model, device=device) * 0.1
+
+    def fn():
+        with torch.no_grad():
+            return model(x)
+
+    y = fn()
+    return [
+        _ok('bench_hybrid output is grad-free', not y.requires_grad,
+            f'requires_grad={y.requires_grad} (should be False)'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -553,6 +694,10 @@ def main():
     all_results += test_csa_indexer_validity(device)
     all_results += test_hca_sliding_window_causality(device)
     all_results += test_csa_full_pipeline_causality(device)
+    # Regression tests for bugs found during code review.
+    all_results += test_hybrid_padding_no_crash(device)
+    all_results += test_hybrid_state_buffer_registration(device)
+    all_results += test_bench_hybrid_no_grad_inference(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

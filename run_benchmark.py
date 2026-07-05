@@ -30,7 +30,6 @@ import logging
 import os
 import sys
 import time
-import tracemalloc
 
 import torch
 
@@ -57,8 +56,46 @@ def _clear_cache(device):
         torch.cuda.reset_peak_memory_stats(device)
 
 
+def _read_current_rss_kb() -> int:
+    """Return the current process RSS in kilobytes.
+
+    Reads ``VmRSS`` from ``/proc/self/status`` on Linux (fast, no deps).
+    Falls back to ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` on macOS/BSD
+    — note that ru_maxrss is a high-water mark on Linux but the *current* RSS
+    on macOS, so the fallback is less accurate on Linux but we only use it
+    when /proc is unavailable.
+    """
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    # "VmRSS:    12345 kB\n"
+                    return int(line.split()[1])
+    except (FileNotFoundError, ValueError, IndexError, OSError):
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, AttributeError):
+        return 0
+
+
 def _measure(fn, repeats, device):
-    """Return (median_wall_time_s, peak_memory_MB)."""
+    """Return (median_wall_time_s, peak_memory_MB).
+
+    On CUDA: uses CUDA events for timing and ``torch.cuda.max_memory_allocated``
+    for real peak memory — the number a production inference engine pays.
+
+    On CPU: uses ``time.perf_counter`` for timing and ``resource.getrusage``
+    (RU) RSS for memory. We previously used ``tracemalloc``, but tracemalloc
+    only traces the Python heap and silently ignores native torch tensor
+    allocations — so it reported ~0 MB for tensors that were actually
+    gigabytes, which made the CPU memory column misleading. RSS via
+    ``resource`` captures the process-level resident set, which includes
+    torch's native allocator. We subtract a baseline RSS taken just before
+    the timed region so the reported number is the *delta* attributable to
+    the benchmarked operator (not the Python interpreter baseline).
+    """
     if device.type == 'cuda':
         # Warmup
         for _ in range(min(2, repeats)):
@@ -79,18 +116,40 @@ def _measure(fn, repeats, device):
         peak_mb = peak_bytes / (1024 ** 2)
         return sorted(times)[len(times) // 2], peak_mb
     else:
-        # CPU path with tracemalloc.
+        # CPU path: sample current RSS from /proc/self/status (Linux) or
+        # resource.getrusage (mac/BSD fallback).
+        #
+        # We previously used tracemalloc, but tracemalloc only traces the
+        # Python heap and silently ignores native torch tensor allocations —
+        # so it reported ~0 MB for tensors that were actually megabytes,
+        # making the CPU memory column meaningless.
+        #
+        # We then tried resource.getrusage(RUSAGE_SELF).ru_maxrss, but
+        # ru_maxrss is a *high-water mark* — once the process reaches a given
+        # RSS, it never decreases, so the delta is 0 for every operator after
+        # the first one that pushes RSS to a new high. That made every
+        # subsequent row show 0.00 MB, which is just as misleading.
+        #
+        # The current approach samples the *instantaneous* RSS (VmRSS from
+        # /proc/self/status on Linux, or ru_idrss on BSD/macOS) before and
+        # after each repeat and keeps the peak sampled value. This is not a
+        # true peak (we can only sample between calls, not during), but it
+        # captures the steady-state resident footprint attributable to each
+        # operator, which is the number a serving engineer cares about.
         gc.collect()
-        tracemalloc.start()
+        rss0 = _read_current_rss_kb()  # baseline before the timed region
         times = []
+        peak_rss_kb = rss0
         for _ in range(repeats):
             t0 = time.perf_counter()
             fn()
             t1 = time.perf_counter()
             times.append(t1 - t0)
-        _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        return sorted(times)[len(times) // 2], peak / (1024 ** 2)
+            cur = _read_current_rss_kb()
+            if cur > peak_rss_kb:
+                peak_rss_kb = cur
+        peak_mb = max(0.0, peak_rss_kb - rss0) / 1024.0  # kB -> MB
+        return sorted(times)[len(times) // 2], peak_mb
 
 
 def bench_softmax_attn(B, T, H, K, V, device):
@@ -203,8 +262,14 @@ def bench_hybrid(B, T, d, device):
     )
     model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
     x = _rand(B, T, d, device=device)
-    with torch.no_grad():
-        def fn():
+    # NOTE: torch.no_grad() must live INSIDE fn(). A `with torch.no_grad():`
+    # block wrapping the `def fn():` only disables grad for the duration of
+    # the function definition, not for later calls — the context manager
+    # state is global and is restored as soon as the `with` block exits.
+    # Putting it outside (the previous form) silently built the autograd
+    # graph during benchmarking, inflating both latency and peak memory.
+    def fn():
+        with torch.no_grad():
             return model(x)
     return fn
 

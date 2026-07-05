@@ -238,8 +238,14 @@ def naive_csa(
         # ever shift scores down, keeping them aligned with log_sink
         # which is already in log space (shifting up would inflate
         # exp() and could overflow).
-        m = scores.amax(-1, keepdim=True).clamp(min=0)              # [B, T, nh, 1]
-        shifted = scores - m                                        # [B, T, nh, topk]
+        #
+        # NOTE: renamed from `m` to `row_max` to avoid shadowing the
+        # `m` parameter (compression factor). The previous `m = ...`
+        # silently clobbered the compression factor for the rest of the
+        # function; it happened not to be read again here, but the
+        # shadowing was a latent footgun for future edits.
+        row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, T, nh, 1]
+        shifted = scores - row_max                                  # [B, T, nh, topk]
         log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
         log_denom = torch.logaddexp(log_sum_exp, log_sink)          # [B, T, nh, 1]
         p = ((shifted - log_denom).exp() * vmask)                   # [B, T, nh, topk]

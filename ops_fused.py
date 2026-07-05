@@ -205,7 +205,15 @@ class HybridKCHAttention(nn.Module):
         # that KDA's O(1) per-head memory is preserved during autoregressive
         # decoding (the whole point of KDA). CSA/HCA are stateless and must
         # NOT touch this attribute.
-        self._kda_state: torch.Tensor | None = None
+        #
+        # Registered as a non-persistent buffer so that:
+        #   * model.to(device) moves it along with the parameters (a plain
+        #     attribute would be left on the original device, causing a
+        #     device-mismatch crash on the next forward);
+        #   * it is NOT saved into state_dict (persistent=False), since it is
+        #     runtime state that should be reset between sequences / sessions
+        #     via reset_state(), not restored from a checkpoint.
+        self.register_buffer('_kda_state', None, persistent=False)
 
     def reset_state(self) -> None:
         """Clear the persistent KDA recurrent state.
@@ -213,6 +221,9 @@ class HybridKCHAttention(nn.Module):
         Call this at the start of training, at the start of each sequence
         during evaluation, or between independent generation sessions.
         """
+        # Assigning None to a registered buffer is supported by nn.Module
+        # and keeps the buffer slot present (just empty) so a subsequent
+        # model.to(device) / state_dict save still works correctly.
         self._kda_state = None
 
     def _build_layout(self) -> list[str]:
@@ -237,9 +248,13 @@ class HybridKCHAttention(nn.Module):
         # mode we keep the graph so that stateful generation works.
         #
         # If the batch size changed (e.g. train batch=16, eval batch=8), the
-        # old state is invalid and we drop it.
+        # old state is invalid and we drop it. We also drop it on a device
+        # mismatch as a defensive measure (should not happen now that the
+        # state is a registered buffer moved by .to(), but cheap to guard).
         state = self._kda_state
-        if state is not None and state.shape[0] != x.shape[0]:
+        if state is not None and (
+            state.shape[0] != x.shape[0] or state.device != x.device
+        ):
             state = None
         if self.training and state is not None:
             state = state.detach()
@@ -269,7 +284,11 @@ class HybridKCHAttention(nn.Module):
                 if pad:
                     xp = F.pad(x, (0, 0, pad, 0))
                     o, _ = layer(xp, None)
-                    o = o[pad:]
+                    # Trim the padded prefix off the SEQUENCE axis (dim=1).
+                    # Using `o[pad:]` would slice the batch axis (dim=0)
+                    # instead, causing a shape mismatch on the residual add
+                    # and silently producing wrong results for B>1.
+                    o = o[:, pad:]
                 else:
                     o, _ = layer(x, None)
             x = residual + o

@@ -263,7 +263,10 @@ class CSAAttn(nn.Module):
             sliding_window=4, sink_logits=self.sink,
         )
         if pad:
-            o = o[pad:]
+            # Trim the padded prefix off the SEQUENCE axis (dim=1).
+            # `o[pad:]` slices dim=0 (batch) which both crashes for B<=pad
+            # and silently corrupts results for B>pad.
+            o = o[:, pad:]
         return self.o(o)
 
 
@@ -292,7 +295,10 @@ class HCAAttn(nn.Module):
                       m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                       sliding_window=4, sink_logits=self.sink)
         if pad:
-            o = o[pad:]
+            # Trim the padded prefix off the SEQUENCE axis (dim=1).
+            # `o[pad:]` slices dim=0 (batch) which both crashes for B<=pad
+            # and silently corrupts results for B>pad.
+            o = o[:, pad:]
         return self.o(o)
 
 

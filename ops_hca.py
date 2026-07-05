@@ -79,8 +79,8 @@ def naive_hca(
         # at causally-masked slots, so logsumexp/ exp naturally yield
         # 0 there; fully-masked rows also collapse to p=0 (logaddexp
         # (-inf, log_sink) = log_sink, exp(-inf - log_sink) = 0).
-        m = scores.amax(-1, keepdim=True).clamp(min=0)             # [B, nh, T, 1]
-        shifted = scores - m                                       # [B, nh, T, n_blocks]
+        row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, nh, T, 1]
+        shifted = scores - row_max                                  # [B, nh, T, n_blocks]
         lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
         log_denom = torch.logaddexp(lse, log_sink)                 # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]

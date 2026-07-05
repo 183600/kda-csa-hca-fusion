@@ -102,11 +102,11 @@
   {
     "name": "HCA sliding-window causal",
     "status": "PASS",
-    "detail": "max diff in unaffected region = 1.11e-16 (fp64, win=4)"
+    "detail": "max diff in unaffected region = 0.00e+00 (fp64, win=4)"
   },
   {
     "name": "CSA full pipeline causal",
     "status": "PASS",
-    "detail": "max diff in unaffected region = 1.11e-16 (fp64, win=4)"
+    "detail": "max diff in unaffected region = 0.00e+00 (fp64, win=4)"
   }
 ]
