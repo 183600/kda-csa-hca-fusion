@@ -197,6 +197,26 @@ class SoftmaxAttn(nn.Module):
         self.o = nn.Linear(H * V, d_model, bias=False)
         self.H, self.K, self.V = H, K, V
         self.scale = K ** -0.5
+        # Lazily-built causal mask cache. T is not known at __init__ (it
+        # depends on the input), so we build the mask on the first forward
+        # and cache it. Subsequent forwards with the same T reuse the cached
+        # mask instead of allocating a new [T, T] tensor every call. The
+        # cache is keyed by (T, device) to handle seq-len or device changes.
+        # Registered as a non-persistent buffer so .to(device) moves it and
+        # state_dict skips it (it is derived, not learned).
+        self.register_buffer('_causal_mask', None, persistent=False)
+        self._mask_key = None  # (T, device) the cached mask was built for
+
+    def _get_causal_mask(self, T, device):
+        """Return the cached [T, T] strictly-upper-triangular bool mask,
+        rebuilding it only when T or device changes."""
+        key = (T, str(device))
+        if self._mask_key != key or self._causal_mask is None:
+            self._causal_mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
+            )
+            self._mask_key = key
+        return self._causal_mask
 
     def forward(self, x):
         B, T, d = x.shape
@@ -204,7 +224,7 @@ class SoftmaxAttn(nn.Module):
         k = self.k(x).view(B, T, self.H, self.K)
         v = self.v(x).view(B, T, self.H, self.V)
         s = torch.einsum('bthk,bshk->bhts', q, k) * self.scale
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
+        mask = self._get_causal_mask(T, x.device)
         s = s.masked_fill(mask, float('-inf'))
         p = torch.softmax(s, dim=-1)
         out = torch.einsum('bhts,bshv->bthv', p, v)

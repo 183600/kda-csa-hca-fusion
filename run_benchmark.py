@@ -166,12 +166,22 @@ def bench_softmax_attn(B, T, H, K, V, device):
     k = _rand(B, T, H, K, device=device)
     v = _rand(B, T, H, V, device=device)
     scale = K ** -0.5
+    # Precompute the causal mask OUTSIDE the timed region so the benchmark
+    # measures attention compute, not mask allocation. A production
+    # implementation would cache this mask (it is the same every call) rather
+    # than reconstructing a [T, T] tensor per forward. For T=2048 this avoids
+    # a 4M-element allocation + fill on every timed iteration, which previously
+    # inflated softmax's measured latency and made the cross-operator
+    # comparison unfair (KDA/CSA/HCA don't have this per-call [T, T]
+    # allocation overhead in their bench wrappers).
+    causal_mask = torch.triu(
+        torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
+    )
 
     def fn():
         with torch.no_grad():
             scores = torch.einsum('bthk,bshk->bhts', q, k) * scale
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
-            scores = scores.masked_fill(mask, float('-inf'))
+            scores = scores.masked_fill(causal_mask, float('-inf'))
             p = torch.softmax(scores, dim=-1)
             return torch.einsum('bhts,bshv->bthv', p, v)
     return fn
