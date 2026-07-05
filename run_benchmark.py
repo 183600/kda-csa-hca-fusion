@@ -101,6 +101,15 @@ def _measure(fn, repeats, device):
         for _ in range(min(2, repeats)):
             fn()
         torch.cuda.synchronize()
+        # Reset peak memory stats AFTER warmup so the reported peak reflects
+        # only the timed region's activations, NOT the model parameters or
+        # warmup allocations. Without this reset, max_memory_allocated()
+        # returns the high-water mark since the last _clear_cache() call,
+        # which includes the model .to(device) allocation and warmup tensors
+        # -- inflating the reported memory by a constant offset that varies
+        # per operator (different parameter counts) and makes the comparison
+        # less fair.
+        torch.cuda.reset_peak_memory_stats(device)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = []

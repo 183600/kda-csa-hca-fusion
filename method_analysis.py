@@ -185,7 +185,11 @@ class HeadwiseFusedAttention(nn.Module):
         H, c, m = self.cfg.H_csa, self.cfg.csa_c, self.cfg.csa_m
         pad = (-T) % m
         if pad:
-            x = F.pad(x, (0, 0, pad, 0))
+            # RIGHT-pad: real tokens keep original positions; only the last
+            # partial block contains padding zeros, and no real token
+            # attends to it (causal block mask). Left-padding corrupted
+            # block 0's compressed KV and silently changed real-token outputs.
+            x = F.pad(x, (0, 0, 0, pad))
         Tp = x.shape[1]
         n_blocks = Tp // m
         C = self.csa_kv(x)
@@ -207,7 +211,7 @@ class HeadwiseFusedAttention(nn.Module):
         p = p.masked_fill(all_masked, 0.0)
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)
         if pad:
-            out = out[:, pad:]
+            out = out[:, :T]
         return out  # [B, T, H, c]
 
     def _hca_heads(self, x):
@@ -215,7 +219,11 @@ class HeadwiseFusedAttention(nn.Module):
         H, c, m2 = self.cfg.H_hca, self.cfg.hca_c, self.cfg.hca_m2
         pad = (-T) % m2
         if pad:
-            x = F.pad(x, (0, 0, pad, 0))
+            # RIGHT-pad: real tokens keep original positions; only the last
+            # partial block contains padding zeros, and no real token
+            # attends to it (causal block mask). Left-padding corrupted
+            # block 0's compressed KV and silently changed real-token outputs.
+            x = F.pad(x, (0, 0, 0, pad))
         Tp = x.shape[1]
         n_blocks = Tp // m2
         C = self.hca_kv(x)
@@ -235,7 +243,7 @@ class HeadwiseFusedAttention(nn.Module):
         p = p.masked_fill(all_masked, 0.0)
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)
         if pad:
-            out = out[:, pad:]
+            out = out[:, :T]
         return out
 
     def forward(self, x):

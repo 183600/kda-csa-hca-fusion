@@ -304,13 +304,22 @@ class HybridKCHAttention(nn.Module):
                 # Stateless CSA/HCA: do NOT pass `state` in, do NOT let the
                 # returned None overwrite it.
                 if pad:
-                    xp = F.pad(x, (0, 0, pad, 0))
+                    # RIGHT-pad (append zeros at the end) so real tokens keep
+                    # their original positions and block alignment. The padded
+                    # tokens land in the LAST partial block; no real token
+                    # attends to it (real tokens only attend to PRECEDING
+                    # blocks via the causal block mask), so real-token outputs
+                    # are bit-identical to the no-padding case.
+                    #
+                    # LEFT-padding (the previous approach) shifted real tokens
+                    # to positions [pad, pad+T), corrupting block 0's
+                    # compressed KV (mix of padding zeros and real tokens).
+                    # Every subsequent block's real queries then attended to
+                    # that corrupted block 0, silently producing wrong outputs.
+                    xp = F.pad(x, (0, 0, 0, pad))
                     o, _ = layer(xp, None)
-                    # Trim the padded prefix off the SEQUENCE axis (dim=1).
-                    # Using `o[pad:]` would slice the batch axis (dim=0)
-                    # instead, causing a shape mismatch on the residual add
-                    # and silently producing wrong results for B>1.
-                    o = o[:, pad:]
+                    # Trim the padded SUFFIX off the SEQUENCE axis (dim=1).
+                    o = o[:, :T]
                 else:
                     o, _ = layer(x, None)
             x = residual + o

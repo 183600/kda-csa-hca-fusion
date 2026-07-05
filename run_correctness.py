@@ -39,6 +39,7 @@ import os
 import sys
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -591,6 +592,107 @@ def test_hybrid_padding_no_crash(device='cpu'):
     ]
 
 
+def test_csa_hca_right_padding_correctness(device='cpu'):
+    """Regression: CSA/HCA right-padding must preserve real-token outputs.
+
+    Previously the code LEFT-padded (zeros at the start), which shifted real
+    tokens to positions [pad, pad+T) and corrupted block 0's compressed KV
+    (a mix of padding zeros and real tokens). Every subsequent block's real
+    queries then attended to that corrupted block 0, silently producing
+    wrong outputs for any T not divisible by m.
+
+    With RIGHT-padding (zeros at the end), real tokens keep their original
+    positions and block alignment. Only the LAST partial block contains
+    padding zeros, and -- crucially -- no real token attends to it (the
+    causal block mask only allows attending to PRECEDING blocks). So
+    real-token outputs are bit-identical to running with T_padded real
+    tokens and taking the first T_orig outputs.
+
+    This test verifies that property for both CSA and HCA: run the operator
+    on T_padded real tokens (no padding needed) and on the first T_orig
+    tokens (right-padded to T_padded), and check the first T_orig outputs
+    match.
+    """
+    logger.info("Test: CSA/HCA right-padding preserves real-token outputs")
+    torch.manual_seed(12)
+    dtype = torch.float64
+
+    # HCA test (simpler -- single branch compression, dense attention).
+    B, T_padded, d = 1, 32, 16
+    m2, nh, c, dc = 8, 2, 8, 16
+    T_orig = 25  # not divisible by m2=8 -> pad=7
+    pad = (-T_orig) % m2
+    assert pad == 7, f"expected pad=7, got {pad}"
+
+    H_full = torch.randn(B, T_padded, d, dtype=dtype, device=device) * 0.1
+    W_KV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_Z = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    B_pos = torch.randn(m2, c, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
+    sink = torch.zeros(nh, dtype=dtype, device=device)
+
+    # Reference: run on all T_padded real tokens (no padding).
+    o_ref = naive_hca(H_full, W_KV, W_Z, B_pos, W_DQ, W_UQ,
+                      m2=m2, nh=nh, c=c, dc=dc,
+                      sliding_window=4, sink_logits=sink)
+
+    # Right-padded: run on first T_orig tokens, right-padded to T_padded.
+    H_short = H_full[:, :T_orig].clone()
+    H_padded = F.pad(H_short, (0, 0, 0, pad))
+    o_pad = naive_hca(H_padded, W_KV, W_Z, B_pos, W_DQ, W_UQ,
+                      m2=m2, nh=nh, c=c, dc=dc,
+                      sliding_window=4, sink_logits=sink)
+
+    # The first T_orig outputs must match (real tokens see only all-real
+    # preceding blocks in both cases).
+    hca_diff = (o_ref[:, :T_orig] - o_pad[:, :T_orig]).abs().max().item()
+
+    # CSA test (two-branch overlapped compression + sparse selection).
+    B2, T_padded2, d2 = 1, 32, 16
+    m, topk, nh2, nIh, c2, c_I, dc2 = 8, 4, 2, 2, 8, 4, 8
+    T_orig2 = 25
+    pad2 = (-T_orig2) % m
+    assert pad2 == 7
+
+    H_full2 = torch.randn(B2, T_padded2, d2, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    Ba = torch.randn(m, c2, dtype=dtype, device=device) * 0.1
+    Bb = torch.randn(m, c2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(dc2, c_I * nIh, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(d2, nIh, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(d2, c_I, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(d2, c_I, dtype=dtype, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
+    sink2 = torch.zeros(nh2, dtype=dtype, device=device)
+
+    o_ref2 = naive_csa(H_full2, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                       W_DQ2, W_UQ2, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                       m=m, topk=topk, nh=nh2, nIh=nIh, c=c2, c_I=c_I, dc=dc2,
+                       sliding_window=4, sink_logits=sink2)
+
+    H_short2 = H_full2[:, :T_orig2].clone()
+    H_padded2 = F.pad(H_short2, (0, 0, 0, pad2))
+    o_pad2 = naive_csa(H_padded2, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                       W_DQ2, W_UQ2, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                       m=m, topk=topk, nh=nh2, nIh=nIh, c=c2, c_I=c_I, dc=dc2,
+                       sliding_window=4, sink_logits=sink2)
+
+    csa_diff = (o_ref2[:, :T_orig2] - o_pad2[:, :T_orig2]).abs().max().item()
+
+    return [
+        _ok('HCA right-padding preserves outputs', hca_diff < 1e-10,
+            f'max diff = {hca_diff:.2e} (fp64, T_orig={T_orig}, m2={m2})'),
+        _ok('CSA right-padding preserves outputs', csa_diff < 1e-10,
+            f'max diff = {csa_diff:.2e} (fp64, T_orig={T_orig2}, m={m})'),
+    ]
+
+
 def test_hybrid_state_buffer_registration(device='cpu'):
     """Regression: HybridKCHAttention._kda_state must be a registered buffer.
 
@@ -778,10 +880,12 @@ def test_hybrid_per_layer_kda_state(device='cpu'):
                 else:
                     pad = (-T_h) % cfg.hca_m2
                 if pad:
-                    import torch.nn.functional as _F
-                    hp = _F.pad(h_norm, (0, 0, pad, 0))
+                    # RIGHT-pad to match HybridKCHAttention.forward's padding
+                    # direction (real tokens keep original positions; only the
+                    # last partial block contains padding zeros).
+                    hp = F.pad(h_norm, (0, 0, 0, pad))
                     o, _ = layer(hp, None)
-                    o = o[:, pad:]
+                    o = o[:, :T_h]
                 else:
                     o, _ = layer(h_norm, None)
             h = residual + o
@@ -827,6 +931,7 @@ def main():
     all_results += test_hybrid_state_buffer_registration(device)
     all_results += test_bench_hybrid_no_grad_inference(device)
     all_results += test_hybrid_per_layer_kda_state(device)
+    all_results += test_csa_hca_right_padding_correctness(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

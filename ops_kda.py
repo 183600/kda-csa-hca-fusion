@@ -71,6 +71,12 @@ def naive_recurrent_kda(
         o[:, i] = torch.einsum('b h k, b h k v -> b h v', q_i, S)
     if not output_final_state:
         S = None
+    else:
+        # Cast the returned state back to the caller's dtype for consistency
+        # (compute_dtype may be fp32/fp64 while the caller passed fp16/bf16).
+        # This avoids dtype-mismatch surprises if the state is reused as
+        # initial_state in a subsequent call with a different input dtype.
+        S = S.to(dtype)
     return o.to(dtype), S
 
 
@@ -157,5 +163,9 @@ def naive_chunk_kda(
         S += rearrange((g_i[:, :, -1:] - g_i).exp() * k_i, 'b h c k -> b h k c') @ v_i
     if not output_final_state:
         S = None
+    else:
+        # Cast the returned state back to the caller's dtype for consistency
+        # (mirrors naive_recurrent_kda).
+        S = S.to(dtype)
     o = rearrange(o, 'b h n c d -> b (n c) h d').to(dtype)
     return o[:, :original_T], S

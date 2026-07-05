@@ -142,9 +142,14 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
     Returns dict with prefill_ms, mean_decode_ms_per_token, peak_mem_MB.
     """
-    _clear_cache(device)
+    # Move model to device FIRST, then clear cache and reset peak memory
+    # stats. The previous order (_clear_cache -> model.to(device)) meant
+    # max_memory_allocated captured the model parameter allocation too,
+    # inflating peak_mem_MB by the parameter count (a constant offset that
+    # varies per operator and makes the comparison less fair).
     model = model.to(device).eval()
     model.reset()
+    _clear_cache(device)
 
     # Prefill: process the whole context at once.
     x_prefill = torch.randn(1, prefill_len, d_model, device=device) * 0.1

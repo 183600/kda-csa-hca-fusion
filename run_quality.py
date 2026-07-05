@@ -262,7 +262,11 @@ class CSAAttn(nn.Module):
         T = x.shape[1]
         pad = (-T) % self.m
         if pad:
-            x = F.pad(x, (0, 0, pad, 0))
+            # RIGHT-pad: real tokens keep original positions; only the last
+            # partial block contains padding zeros, and no real token
+            # attends to it (causal block mask). Left-padding corrupted
+            # block 0's compressed KV and silently changed real-token outputs.
+            x = F.pad(x, (0, 0, 0, pad))
         o = naive_csa(
             x, self.W_aKV.weight.T, self.W_bKV.weight.T,
             self.W_aZ.weight.T, self.W_bZ.weight.T, self.Ba, self.Bb,
@@ -274,10 +278,8 @@ class CSAAttn(nn.Module):
             sliding_window=4, sink_logits=self.sink,
         )
         if pad:
-            # Trim the padded prefix off the SEQUENCE axis (dim=1).
-            # `o[pad:]` slices dim=0 (batch) which both crashes for B<=pad
-            # and silently corrupts results for B>pad.
-            o = o[:, pad:]
+            # Trim the padded SUFFIX off the SEQUENCE axis (dim=1).
+            o = o[:, :T]
         return self.o(o)
 
 
@@ -300,16 +302,18 @@ class HCAAttn(nn.Module):
         T = x.shape[1]
         pad = (-T) % self.m2
         if pad:
-            x = F.pad(x, (0, 0, pad, 0))
+            # RIGHT-pad: real tokens keep original positions; only the last
+            # partial block contains padding zeros, and no real token
+            # attends to it (causal block mask). Left-padding corrupted
+            # block 0's compressed KV and silently changed real-token outputs.
+            x = F.pad(x, (0, 0, 0, pad))
         o = naive_hca(x, self.W_KV.weight.T, self.W_Z.weight.T, self.B_pos,
                       self.W_DQ.weight.T, self.W_UQ.weight.T,
                       m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                       sliding_window=4, sink_logits=self.sink)
         if pad:
-            # Trim the padded prefix off the SEQUENCE axis (dim=1).
-            # `o[pad:]` slices dim=0 (batch) which both crashes for B<=pad
-            # and silently corrupts results for B>pad.
-            o = o[:, pad:]
+            # Trim the padded SUFFIX off the SEQUENCE axis (dim=1).
+            o = o[:, :T]
         return self.o(o)
 
 
