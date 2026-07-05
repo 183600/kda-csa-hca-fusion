@@ -113,7 +113,7 @@ def naive_hca(
         # win_mask broadcasts from [1, 1, T, T] -> [B, nh, T, T].
         # NOTE: every query t always has itself in the window (dist=0 satisfies
         # the mask for win >= 1), so no row is fully -inf and softmax is NaN-free.
-        C_local = F.normalize(H @ W_KV, dim=-1)                  # [B, T, c]
+        C_local = F.normalize(C, dim=-1)                            # [B, T, c]
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_local) * scale
         scores = scores.masked_fill(~win_mask[None, None], float('-inf'))
         p = torch.softmax(scores, dim=-1)

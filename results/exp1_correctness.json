@@ -108,5 +108,50 @@
     "name": "CSA full pipeline causal",
     "status": "PASS",
     "detail": "max diff in unaffected region = 0.00e+00 (fp64, win=4)"
+  },
+  {
+    "name": "hybrid padding no-crash",
+    "status": "PASS",
+    "detail": "all 12 (B,T) combos forward cleanly"
+  },
+  {
+    "name": "_kda_state is a registered buffer",
+    "status": "PASS",
+    "detail": "in model.buffers()=True"
+  },
+  {
+    "name": "_kda_state not in state_dict (non-persistent)",
+    "status": "PASS",
+    "detail": "in state_dict=False"
+  },
+  {
+    "name": "forward works after model.to(device)",
+    "status": "PASS",
+    "detail": ""
+  },
+  {
+    "name": "bench_hybrid output is grad-free",
+    "status": "PASS",
+    "detail": "requires_grad=False (should be False)"
+  },
+  {
+    "name": "per-layer state shape [n_kda,B,HV,K,V]",
+    "status": "PASS",
+    "detail": "expected (3,2,2,16,16), got (3, 2, 2, 16, 16)"
+  },
+  {
+    "name": "per-layer states are pairwise distinct",
+    "status": "PASS",
+    "detail": "slices differ across layers (not aliased to one tensor)"
+  },
+  {
+    "name": "each layer state evolves across calls",
+    "status": "PASS",
+    "detail": "every layer i: state_after_call1 != state_after_call2"
+  },
+  {
+    "name": "stacked state matches per-layer reference",
+    "status": "PASS",
+    "detail": "model._kda_state[i] == reference state for layer i"
   }
 ]

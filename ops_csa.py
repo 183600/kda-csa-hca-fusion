@@ -281,9 +281,13 @@ def naive_csa(
         # win_mask broadcasts from [1, 1, T, T] -> [B, nh, T, T].
         # NOTE: every query t always has itself in the window (dist=0 satisfies
         # the mask for win >= 1), so no row is fully -inf and softmax is NaN-free.
+        # q is already L2-normalized above (line: q = F.normalize(q, dim=-1)),
+        # so the sliding-window branch reuses it directly. Re-normalizing here
+        # was a redundant O(B*T*nh*c) op that produced numerically identical
+        # results (L2-norm of an already-L2-normalized vector is a no-op
+        # modulo fp rounding).
         C_local = F.normalize(H_proj, dim=-1)                    # [B, T, c]
-        q_local = F.normalize(q, dim=-1)                         # [B, T, nh, c]
-        scores = torch.einsum('b t h d, b n d -> b h t n', q_local, C_local) * scale
+        scores = torch.einsum('b t h d, b n d -> b h t n', q, C_local) * scale
         scores = scores.masked_fill(~win_mask[None, None], float('-inf'))
         p = torch.softmax(scores, dim=-1)
         sw_out = torch.einsum('b h t n, b n d -> b t h d', p, C_local)

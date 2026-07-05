@@ -2,84 +2,84 @@
   {
     "T": 128,
     "op": "softmax",
-    "time_ms": 0.33876199995575007,
-    "peak_mem_MB": 0.0,
+    "time_ms": 0.3566020000107528,
+    "peak_mem_MB": 0.31640625,
     "device": "cpu"
   },
   {
     "T": 128,
     "op": "kda_rec",
-    "time_ms": 5.471741999826918,
+    "time_ms": 5.795155000214436,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 128,
     "op": "kda_chunk",
-    "time_ms": 34.647738999865396,
+    "time_ms": 45.97766599999886,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 128,
     "op": "csa",
-    "time_ms": 1.2713870000879979,
+    "time_ms": 1.2282730003789766,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 128,
     "op": "hca",
-    "time_ms": 0.844129000142857,
+    "time_ms": 0.864261000060651,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 128,
     "op": "hybrid",
-    "time_ms": 19.25115599988203,
+    "time_ms": 18.703165000260924,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 256,
     "op": "softmax",
-    "time_ms": 1.0343789999751607,
+    "time_ms": 1.120721000006597,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 256,
     "op": "kda_rec",
-    "time_ms": 10.751732000244374,
+    "time_ms": 11.261379000188754,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 256,
     "op": "kda_chunk",
-    "time_ms": 70.50791100027709,
+    "time_ms": 70.30565399963962,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 256,
     "op": "csa",
-    "time_ms": 2.446589000101085,
+    "time_ms": 15.045476000068447,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 256,
     "op": "hca",
-    "time_ms": 11.770541000259982,
+    "time_ms": 12.019630999930087,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   },
   {
     "T": 256,
     "op": "hybrid",
-    "time_ms": 36.98297299979458,
+    "time_ms": 38.584818999879644,
     "peak_mem_MB": 0.0,
     "device": "cpu"
   }

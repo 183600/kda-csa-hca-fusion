@@ -201,15 +201,25 @@ class HybridKCHAttention(nn.Module):
             else:
                 raise ValueError(kind)
         self.norms = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in self.layout])
-        # Persistent KDA recurrent state. Survives across forward calls so
-        # that KDA's O(1) per-head memory is preserved during autoregressive
-        # decoding (the whole point of KDA). CSA/HCA are stateless and must
-        # NOT touch this attribute.
+        # Number of KDA layers in the stack (each one needs its OWN state).
+        # Different KDA layers have different parameters (q_proj, k_proj, ...),
+        # so they must not share recurrent state. Sharing state across layers
+        # is a correctness bug that silently corrupts autoregressive decoding
+        # and training: layer 2 would be seeded with layer 0's state instead
+        # of its own, and on the next forward call layer 0 would be seeded
+        # with the last layer's state from the previous call.
+        self.n_kda_layers = sum(1 for k in self.layout if k == 'kda')
+        # Persistent KDA recurrent states, one per KDA layer. Survives across
+        # forward calls so that KDA's O(1) per-head memory is preserved during
+        # autoregressive decoding (the whole point of KDA). CSA/HCA are
+        # stateless and must NOT touch this attribute.
         #
-        # Registered as a non-persistent buffer so that:
-        #   * model.to(device) moves it along with the parameters (a plain
-        #     attribute would be left on the original device, causing a
-        #     device-mismatch crash on the next forward);
+        # Stored as a single stacked tensor of shape
+        # ``[n_kda_layers, B, HV, K, V]`` (or ``None`` when freshly reset) and
+        # registered as a non-persistent buffer so that:
+        #   * model.to(device) moves the whole stack along with the parameters
+        #     (a plain Python list attribute would be left on the original
+        #     device, causing a device-mismatch crash on the next forward);
         #   * it is NOT saved into state_dict (persistent=False), since it is
         #     runtime state that should be reset between sequences / sessions
         #     via reset_state(), not restored from a checkpoint.
@@ -237,10 +247,13 @@ class HybridKCHAttention(nn.Module):
         return layout[:self.total_layers]
 
     def forward(self, x: torch.Tensor):
-        # Seed from the persistent KDA state. Only KDA layers read/update
-        # `state`; CSA/HCA are stateless and leave it untouched, so a layout
-        # like [KDA, CSA, KDA, HCA, KDA] correctly chains the KDA state
-        # across the non-KDA layers in between.
+        # Unpack the stacked per-layer KDA states. ``_kda_state`` is either
+        # ``None`` (freshly reset) or a stacked tensor of shape
+        # ``[n_kda_layers, B, HV, K, V]``. We split it into a per-layer list
+        # so each KDA layer can be seeded with its OWN state from the previous
+        # call — sharing a single state across layers is a correctness bug
+        # (each KDA layer has different parameters, so its recurrent state is
+        # not interchangeable with another layer's state).
         #
         # Detach the incoming state in training mode so the autograd graph
         # from the previous step is not retained (otherwise backward() would
@@ -251,13 +264,19 @@ class HybridKCHAttention(nn.Module):
         # old state is invalid and we drop it. We also drop it on a device
         # mismatch as a defensive measure (should not happen now that the
         # state is a registered buffer moved by .to(), but cheap to guard).
-        state = self._kda_state
-        if state is not None and (
-            state.shape[0] != x.shape[0] or state.device != x.device
-        ):
-            state = None
-        if self.training and state is not None:
-            state = state.detach()
+        stacked = self._kda_state
+        if stacked is not None:
+            # Batch dim is axis 1 (axis 0 is the per-layer index).
+            if stacked.shape[1] != x.shape[0] or stacked.device != x.device:
+                stacked = None
+            elif self.training:
+                stacked = stacked.detach()
+        if stacked is not None:
+            states = [stacked[i] for i in range(stacked.shape[0])]
+        else:
+            states = [None] * self.n_kda_layers
+
+        kda_idx = 0
         for layer, norm, kind in zip(self.layers, self.norms, self.layout):
             residual = x
             x = norm(x)
@@ -277,7 +296,10 @@ class HybridKCHAttention(nn.Module):
                         "KDA layer received a sequence that would require "
                         "padding; padding breaks recurrent state alignment."
                     )
-                o, state = layer(x, state)
+                # Thread THIS layer's own state; do not touch the others.
+                o, new_state = layer(x, states[kda_idx])
+                states[kda_idx] = new_state
+                kda_idx += 1
             else:
                 # Stateless CSA/HCA: do NOT pass `state` in, do NOT let the
                 # returned None overwrite it.
@@ -292,8 +314,14 @@ class HybridKCHAttention(nn.Module):
                 else:
                     o, _ = layer(x, None)
             x = residual + o
-        # Persist the latest KDA state for the next forward call.
-        self._kda_state = state
+        # Restack the per-layer states for persistence. All KDA layers share
+        # the same config (HV, K, V), so every entry has the same shape and
+        # torch.stack is safe. If n_kda_layers == 0 (no KDA in the layout),
+        # there is nothing to persist.
+        if self.n_kda_layers > 0 and all(s is not None for s in states):
+            self._kda_state = torch.stack(states, dim=0)
+        else:
+            self._kda_state = None
         return x
 
     def layout_str(self) -> str:

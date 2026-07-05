@@ -673,6 +673,134 @@ def test_bench_hybrid_no_grad_inference(device='cpu'):
     ]
 
 
+def test_hybrid_per_layer_kda_state(device='cpu'):
+    """Regression: each KDA layer must keep its OWN recurrent state.
+
+    Previously ``_kda_state`` was a single tensor shared across all KDA
+    layers in the stack. With layout ``[KDA, CSA, KDA, HCA, KDA]`` this meant
+    layer 0's state was passed as the initial state to layer 2, and layer 2's
+    state to layer 4 -- which is mathematically wrong because each KDA layer
+    has its own parameters (q_proj/k_proj/...). On the NEXT forward call,
+    layer 0 would then be seeded with layer 4's state from the previous
+    call, silently corrupting autoregressive decoding and biasing training.
+
+    The fix is to keep one state per KDA layer, stored as a stacked tensor
+    of shape ``[n_kda_layers, B, HV, K, V]``. This test verifies:
+      1. After a forward pass, ``_kda_state`` has the per-layer leading axis.
+      2. Across two consecutive forward passes (no reset), each layer's
+         state evolves independently -- i.e. the state for layer i after
+         call 2 differs from the state for layer i after call 1 (proving
+         we are not just overwriting a single shared slot).
+      3. The per-layer states differ from each other within one call
+         (proving they are not aliased to the same tensor).
+    """
+    logger.info("Test: hybrid per-layer KDA state independence")
+    torch.manual_seed(11)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
+    n_kda_layers = sum(1 for k in model.layout if k == 'kda')
+    B, T = 2, 16
+    HV, K_dim, V_dim = cfg.n_heads_v, cfg.head_dim_k, cfg.head_dim_v
+
+    # --- 1. Shape check: _kda_state must carry a per-layer leading axis. ---
+    model.reset_state()
+    x1 = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model(x1)
+    shape_ok = (
+        model._kda_state is not None
+        and model._kda_state.shape[0] == n_kda_layers
+        and model._kda_state.shape == (n_kda_layers, B, HV, K_dim, V_dim)
+    )
+    shape_detail = (
+        f'expected ({n_kda_layers},{B},{HV},{K_dim},{V_dim}), got '
+        f'{tuple(model._kda_state.shape) if model._kda_state is not None else None}'
+    )
+
+    # --- 2. Per-layer states must NOT alias each other (independence). ---
+    # If the implementation shared a single state across layers, all slices
+    # would be bitwise-identical (because the same tensor would be stacked
+    # with itself). With per-layer states, each slice carries a different
+    # layer's recurrence result and should differ.
+    stacked1 = model._kda_state
+    pairwise_distinct = True
+    for i in range(n_kda_layers):
+        for j in range(i + 1, n_kda_layers):
+            if torch.equal(stacked1[i], stacked1[j]):
+                pairwise_distinct = False
+                break
+        if not pairwise_distinct:
+            break
+
+    # --- 3. Across two forward calls, each layer's state must evolve. ---
+    # Run a second forward WITHOUT resetting state. Each layer's state should
+    # change because each KDA layer ingested x2 on top of its own prior state.
+    # If state were shared (single slot), only the LAST layer's state would
+    # persist across calls -- and the "layer 0" slice would actually hold the
+    # last layer's old state, not its own.
+    x2 = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model(x2)
+    stacked2 = model._kda_state
+    all_evolved = True
+    for i in range(n_kda_layers):
+        if torch.equal(stacked1[i], stacked2[i]):
+            all_evolved = False
+            break
+
+    # --- 4. Functional equivalence: per-layer state threading must match
+    #     running each KDA layer in isolation with its own carried state. ---
+    # Build a reference: run the model step by step, but for each KDA layer
+    # keep a separate state, and verify the model's stacked[i] matches the
+    # reference state for layer i after the same two calls.
+    model.reset_state()
+    ref_states = [None] * n_kda_layers
+    for x in (x1, x2):
+        kda_idx = 0
+        h = x
+        for layer, norm, kind in zip(model.layers, model.norms, model.layout):
+            residual = h
+            h_norm = norm(h)
+            if kind == 'kda':
+                o, ref_states[kda_idx] = layer(h_norm, ref_states[kda_idx])
+                kda_idx += 1
+            else:
+                T_h = h_norm.shape[1]
+                if kind == 'csa':
+                    pad = (-T_h) % cfg.csa_m
+                else:
+                    pad = (-T_h) % cfg.hca_m2
+                if pad:
+                    import torch.nn.functional as _F
+                    hp = _F.pad(h_norm, (0, 0, pad, 0))
+                    o, _ = layer(hp, None)
+                    o = o[:, pad:]
+                else:
+                    o, _ = layer(h_norm, None)
+            h = residual + o
+    ref_match = all(
+        torch.allclose(stacked2[i], ref_states[i], atol=1e-6)
+        for i in range(n_kda_layers)
+    )
+
+    return [
+        _ok('per-layer state shape [n_kda,B,HV,K,V]', shape_ok, shape_detail),
+        _ok('per-layer states are pairwise distinct', pairwise_distinct,
+            'slices differ across layers (not aliased to one tensor)'),
+        _ok('each layer state evolves across calls', all_evolved,
+            'every layer i: state_after_call1 != state_after_call2'),
+        _ok('stacked state matches per-layer reference', ref_match,
+            'model._kda_state[i] == reference state for layer i'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -698,6 +826,7 @@ def main():
     all_results += test_hybrid_padding_no_crash(device)
     all_results += test_hybrid_state_buffer_registration(device)
     all_results += test_bench_hybrid_no_grad_inference(device)
+    all_results += test_hybrid_per_layer_kda_state(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)
