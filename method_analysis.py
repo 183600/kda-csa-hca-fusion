@@ -181,6 +181,16 @@ class HeadwiseFusedAttention(nn.Module):
         return o  # [B, T, H, hd]
 
     def _csa_heads(self, x):
+        """CSA-style heads with single-branch compression + DENSE attention.
+
+        NOTE: This prototype uses DENSE attention over all compressed blocks
+        (no top-k sparse selection). The full CSA operator (ops_csa.py) adds
+        a lightning indexer that selects top-k blocks per query — that is
+        CSA's defining feature. The ``csa_topk`` field in HeadwiseConfig is
+        accepted for API symmetry but is NOT used here. For the headwise
+        prototype, dense attention is simpler and sufficient to demonstrate
+        the fusion API; see ``naive_csa`` for the faithful sparse CSA.
+        """
         B, T, d = x.shape
         H, c, m = self.cfg.H_csa, self.cfg.csa_c, self.cfg.csa_m
         pad = (-T) % m

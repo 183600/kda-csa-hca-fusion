@@ -57,10 +57,13 @@ def naive_hca(
     q = (cQ @ W_UQ).view(B_, T, nh, c)                            # [B, T, nh, c]
     q = F.normalize(q, dim=-1)
 
-    # Causal block mask: query t attends to blocks strictly before floor(t/m2).
-    # Plus we add the block containing t to keep causality at block boundaries
-    # (matches the paper's "preceding compressed KV blocks" with the sliding
-    # window handling intra-block tokens).
+    # Causal block mask: query t attends ONLY to blocks strictly before
+    # floor(t/m2) — i.e. blocks that contain only past tokens. The block
+    # containing t is NOT included because its compressed representation
+    # aggregates all m2 tokens in the block (including t itself and any
+    # later tokens in the same block), so attending to it would leak future
+    # information. The sliding-window branch handles intra-block and
+    # near-context attention separately.
     cbm = _causal_block_mask(T, n_blocks, m2, device)
 
     # Precompute all (B, T, n_blocks) attention logits at once (fully vectorized).
