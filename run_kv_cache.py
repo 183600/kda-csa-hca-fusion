@@ -119,8 +119,13 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return compressed
 
     if op == 'hybrid_kch':
-        # 3 KDA + 1 CSA + 1 HCA per 5-layer unit.
-        n_kda, n_csa, n_hca = 3, 1, 1
+        # 3 KDA + 1 CSA + 1 HCA per 5-layer unit (default 3:1:1).
+        # Allow override via kwargs so non-default ratios are accounted for
+        # correctly — previously the ratio was hardcoded, which silently
+        # produced wrong KV-cache numbers for any ablation ratio.
+        n_kda = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
         kda_part = n_kda * kv_cache_elements('kda', T, mode=mode, **p)
         csa_part = n_csa * kv_cache_elements('csa', T, mode=mode, **p)
         hca_part = n_hca * kv_cache_elements('hca', T, mode=mode, **p)
@@ -155,9 +160,13 @@ def prefill_flops(op: str, T: int, **kw):
         sw = 2 * T * p['hca_sliding_window'] * hca_c * H
         return compress + core + sw
     if op == 'hybrid_kch':
-        return (3 * prefill_flops('kda', T, **p)
-                + prefill_flops('csa', T, **p)
-                + prefill_flops('hca', T, **p))
+        # Mirror the configurable ratio in kv_cache_elements.
+        n_kda = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
+        return (n_kda * prefill_flops('kda', T, **p)
+                + n_csa * prefill_flops('csa', T, **p)
+                + n_hca * prefill_flops('hca', T, **p))
     raise ValueError(op)
 
 

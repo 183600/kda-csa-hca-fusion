@@ -154,10 +154,13 @@ def setup_kaggle(verbose: bool = True) -> None:
     index_url = _detect_cuda_wheel_index()
     if verbose:
         print(f"[kaggle_setup] Using PyTorch wheel index: {index_url}")
+    # The upper bound was previously pinned to <2.6, which prevents installation
+    # on environments with newer torch (2.6+). Remove the upper bound and rely
+    # on ``--upgrade-strategy=only-if-needed`` to avoid unnecessary upgrades.
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--upgrade-strategy", "only-if-needed",
-        "torch>=2.1,<2.6", "--index-url", index_url,
+        "torch>=2.1", "--index-url", index_url,
     ])
     if verbose:
         print("[kaggle_setup] Done. CUDA should now be available after a restart "

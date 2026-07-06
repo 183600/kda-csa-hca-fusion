@@ -62,8 +62,13 @@ class SoftmaxAttnDecoding(nn.Module):
         self.o = nn.Linear(H * V, d_model, bias=False)
         self.H, self.K, self.V = H, K, V
         self.scale = K ** -0.5
-        self._cache_k = None
-        self._cache_v = None
+        # Register KV cache as non-persistent buffers so model.to(device)
+        # moves them automatically (a plain attribute would stay on the
+        # source device, causing a device-mismatch crash on the next forward).
+        # Non-persistent => not saved into state_dict (runtime state, not
+        # learned weights).
+        self.register_buffer('_cache_k', None, persistent=False)
+        self.register_buffer('_cache_v', None, persistent=False)
 
     def reset(self):
         self._cache_k = None
@@ -118,7 +123,12 @@ class KDAAttnDecoding(nn.Module):
         self.beta = nn.Linear(d_model, H, bias=False)
         self.o = nn.Linear(H * V, d_model, bias=False)
         self.H, self.K, self.V = H, K, V
-        self._state = None
+        # Register the recurrent state as a non-persistent buffer so
+        # model.to(device) moves it along with the parameters. A plain
+        # attribute would be left on the source device, causing a
+        # device-mismatch crash on the next forward — the same class of
+        # bug that was fixed in ops_fused.py::HybridKCHAttention.
+        self.register_buffer('_state', None, persistent=False)
 
     def reset(self):
         self._state = None

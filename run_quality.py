@@ -44,6 +44,9 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device, get_device, to_device
+from ops_kda import naive_recurrent_kda
+from ops_csa import naive_csa
+from ops_hca import naive_hca
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +246,6 @@ class KDAAttn(nn.Module):
         self.H, self.K, self.V = H, K, V
 
     def forward(self, x):
-        from ops_kda import naive_recurrent_kda
         B, T, d = x.shape
         q = F.normalize(F.silu(self.q(x)), dim=-1).view(B, T, self.H, self.K)
         k = F.normalize(F.silu(self.k(x)), dim=-1).view(B, T, self.H, self.K)
@@ -278,7 +280,6 @@ class CSAAttn(nn.Module):
         self.o = nn.Linear(c * nh, d_model, bias=False)
 
     def forward(self, x):
-        from ops_csa import naive_csa
         T = x.shape[1]
         pad = (-T) % self.m
         if pad:
@@ -318,7 +319,6 @@ class HCAAttn(nn.Module):
         self.o = nn.Linear(c * nh, d_model, bias=False)
 
     def forward(self, x):
-        from ops_hca import naive_hca
         T = x.shape[1]
         pad = (-T) % self.m2
         if pad:

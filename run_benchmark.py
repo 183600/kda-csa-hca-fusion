@@ -277,6 +277,12 @@ def bench_hybrid(B, T, d, device):
     )
     model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
     x = _rand(B, T, d, device=device)
+    # Reset KDA recurrent state before each fn() call so that warmup and
+    # timed repeats start from the same fresh state. Without this, the KDA
+    # state grows across repeats — for latency this is O(1) per layer so
+    # the timing impact is negligible, but for peak-memory measurement the
+    # retained state tensors would be double-counted across repeats,
+    # inflating the reported memory footprint.
     # NOTE: torch.no_grad() must live INSIDE fn(). A `with torch.no_grad():`
     # block wrapping the `def fn():` only disables grad for the duration of
     # the function definition, not for later calls — the context manager
@@ -285,6 +291,7 @@ def bench_hybrid(B, T, d, device):
     # graph during benchmarking, inflating both latency and peak memory.
     def fn():
         with torch.no_grad():
+            model.reset_state()
             return model(x)
     return fn
 

@@ -299,7 +299,7 @@ def test_kda_gradient(device='cpu'):
     q = torch.randn(B, T, H, K, dtype=torch.float64, device=device, requires_grad=True)
     k = torch.randn(B, T, H, K, dtype=torch.float64, device=device, requires_grad=True)
     v = torch.randn(B, T, H, V, dtype=torch.float64, device=device, requires_grad=True)
-    g = (-torch.rand(B, T, H, K, dtype=torch.float64, device=device) * 0.1).clone().requires_grad_(True)
+    g = (-torch.rand(B, T, H, K, dtype=torch.float64, device=device) * 0.1).requires_grad_(True)
     beta = (torch.rand(B, T, H, dtype=torch.float64, device=device) * 0.2).requires_grad_(True)
 
     def loss_fn(qq, kk, vv, gg, bb):
@@ -897,33 +897,37 @@ def test_hybrid_per_layer_kda_state(device='cpu'):
     # Build a reference: run the model step by step, but for each KDA layer
     # keep a separate state, and verify the model's stacked[i] matches the
     # reference state for layer i after the same two calls.
+    # Wrap in torch.no_grad() to match the test's intent (functional
+    # equivalence check, not gradient tracking) and avoid building a
+    # computation graph that would waste memory on a 5-layer eval loop.
     model.reset_state()
     ref_states = [None] * n_kda_layers
-    for x in (x1, x2):
-        kda_idx = 0
-        h = x
-        for layer, norm, kind in zip(model.layers, model.norms, model.layout):
-            residual = h
-            h_norm = norm(h)
-            if kind == 'kda':
-                o, ref_states[kda_idx] = layer(h_norm, ref_states[kda_idx])
-                kda_idx += 1
-            else:
-                T_h = h_norm.shape[1]
-                if kind == 'csa':
-                    pad = (-T_h) % cfg.csa_m
+    with torch.no_grad():
+        for x in (x1, x2):
+            kda_idx = 0
+            h = x
+            for layer, norm, kind in zip(model.layers, model.norms, model.layout):
+                residual = h
+                h_norm = norm(h)
+                if kind == 'kda':
+                    o, ref_states[kda_idx] = layer(h_norm, ref_states[kda_idx])
+                    kda_idx += 1
                 else:
-                    pad = (-T_h) % cfg.hca_m2
-                if pad:
-                    # RIGHT-pad to match HybridKCHAttention.forward's padding
-                    # direction (real tokens keep original positions; only the
-                    # last partial block contains padding zeros).
-                    hp = F.pad(h_norm, (0, 0, 0, pad))
-                    o, _ = layer(hp, None)
-                    o = o[:, :T_h]
-                else:
-                    o, _ = layer(h_norm, None)
-            h = residual + o
+                    T_h = h_norm.shape[1]
+                    if kind == 'csa':
+                        pad = (-T_h) % cfg.csa_m
+                    else:
+                        pad = (-T_h) % cfg.hca_m2
+                    if pad:
+                        # RIGHT-pad to match HybridKCHAttention.forward's padding
+                        # direction (real tokens keep original positions; only the
+                        # last partial block contains padding zeros).
+                        hp = F.pad(h_norm, (0, 0, 0, pad))
+                        o, _ = layer(hp, None)
+                        o = o[:, :T_h]
+                    else:
+                        o, _ = layer(h_norm, None)
+                h = residual + o
     ref_match = all(
         torch.allclose(stacked2[i], ref_states[i], atol=1e-6)
         for i in range(n_kda_layers)
