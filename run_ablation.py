@@ -70,11 +70,23 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
                 n_batches=4, batch=64):
     model.eval()
     head.eval()
+    embed.eval()  # nn.Embedding has no dropout/batchnorm so this is a no-op,
+                  # but we set it for symmetry with model/head so future
+                  # additions (e.g. embedding dropout) do not silently stay
+                  # in train mode during evaluation. Mirrors run_quality.py.
     correct, total = 0, 0
     losses = []
+    # Fixed seed for the eval generator so every ratio sees the SAME eval
+    # batches (apples-to-apples comparison at eval time too, not just train).
+    # Different ratios consume different numbers of RNG draws during model
+    # init (different parameter counts), so using the global RNG would desync
+    # eval batches across ratios. Mirrors run_quality.py::_eval_model.
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(12345)
     with torch.no_grad():
         for _ in range(n_batches):
-            x_emb, target, cue_pos = make_mqar_batch(batch, seq_len, n_kv, 16, embed, device)
+            x_emb, target, cue_pos = make_mqar_batch(
+                batch, seq_len, n_kv, 16, embed, device, generator=eval_gen)
             model.reset_state()  # independent eval batch
             h = model(x_emb)
             logits = head(h, cue_pos)
@@ -85,7 +97,7 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
 
 
 def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=42,
-                device='cpu', eval_batches=4, eval_batch=64):
+                device='cpu', eval_batches=4, eval_batch=64, train_batch=None):
     torch.manual_seed(seed)
     cfg = _make_cfg(d_model, ratio)
     total = sum(ratio)
@@ -97,16 +109,40 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
 
     layout = model.layout_str()
     n_params = sum(p.numel() for p in model.parameters())
+
+    # Separate generator for batch generation so the per-step batches are
+    # IDENTICAL across ratios for a given seed. Different ratios have different
+    # parameter counts, so they consume a different number of RNG draws during
+    # model init. Without a separate generator for batch generation, the same
+    # seed would produce different training data per ratio — a silent confound
+    # in the multi-seed CI that undermines the apples-to-apples comparison.
+    # Mirrors run_quality.py::train_one.
+    batch_gen = torch.Generator(device=device)
+    batch_gen.manual_seed(seed + 1)  # offset so it does not collide with
+                                      # the seed used for model init.
+
+    # Configurable training batch size (default 16, overridable via the
+    # ABL_TRAIN_BATCH env var for memory-constrained or GPU runs). Mirrors
+    # run_quality.py's MQAR_TRAIN_BATCH.
+    if train_batch is None:
+        train_batch = int(os.environ.get('ABL_TRAIN_BATCH', '16'))
+
+    # Set train mode ONCE before the loop, not per step. The previous code
+    # called model.train()/head.train() inside the loop, which is a redundant
+    # O(steps) no-op once the modules are already in train mode. Mirrors
+    # run_quality.py::train_one.
+    model.train()
+    head.train()
+    embed.train()
+
     losses = []
     for step in range(steps):
-        x_emb, target, cue_pos = make_mqar_batch(16, seq_len, n_kv, 16, embed, device)
-        model.train()
-        head.train()
+        x_emb, target, cue_pos = make_mqar_batch(
+            train_batch, seq_len, n_kv, 16, embed, device, generator=batch_gen)
         # Each MQAR batch is independent — clear KDA recurrent state so
         # samples from the previous batch don't leak in.
         model.reset_state()
-        x = x_emb
-        h = model(x)
+        h = model(x_emb)
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
         opt.zero_grad()
@@ -147,6 +183,7 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
         'n_layers': total,
         'seed': seed,
         'steps': steps,
+        'train_batch': train_batch,
         'last_train_loss': losses[-1],
         'mean_last10_loss': sum(losses[-10:]) / min(10, len(losses)),
         # Full per-step loss curve so the figure / paper can plot convergence
