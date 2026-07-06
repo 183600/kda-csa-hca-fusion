@@ -170,15 +170,23 @@ def run_all(seeds=None, steps=None):
     # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
     if skip_slow and is_cpu:
         print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to 3 seeds / 100 steps.')
-        os.environ.setdefault('MQAR_SEEDS', '3')
-        os.environ.setdefault('MQAR_STEPS', '100')
-        os.environ.setdefault('MQAR_SOFTMAX_STEPS', '200')
+        # NOTE: use direct assignment, NOT ``setdefault``. The earlier block at
+        # the top of ``run_all`` already set ``MQAR_SEEDS`` / ``MQAR_STEPS`` via
+        # direct assignment from the ``seeds`` / ``steps`` parameters, so
+        # ``setdefault`` here is a no-op and the reduction never happens —
+        # the log message lies and the full 5-seed / 200-step run is launched,
+        # defeating the whole point of SKIP_SLOW on CPU.
+        os.environ['MQAR_SEEDS'] = '3'
+        os.environ['MQAR_STEPS'] = '100'
+        os.environ['MQAR_SOFTMAX_STEPS'] = '200'
     summary['runs'].append(_run('exp4_mqar', run_quality.main))
 
     # 6. Ablation — multi-seed.
     if skip_slow and is_cpu:
-        os.environ.setdefault('ABL_SEEDS', '3')
-        os.environ.setdefault('ABL_STEPS', '50')
+        # Same direct-assignment fix as above (``setdefault`` is a no-op
+        # because ``ABL_SEEDS`` / ``ABL_STEPS`` were already set above).
+        os.environ['ABL_SEEDS'] = '3'
+        os.environ['ABL_STEPS'] = '50'
     summary['runs'].append(_run('exp5_ablation', run_ablation.main))
 
     # 7. Decoding latency — fast (only softmax + KDA).

@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, get_device, to_device
+from kaggle_setup import configure_torch_for_device
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import csa_compress_kv, csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
@@ -95,8 +95,15 @@ def test_kda_gva(device='cpu'):
     B, T, H, K, V, HV = 1, 64, 2, 32, 32, 4
     q = torch.randn(B, T, H, K, device=device)
     k = torch.randn(B, T, H, K, device=device)
-    v = torch.randn(B, T, HV, V, device=device)
-    g = torch.randn(B, T, HV, K, device=device) * 0.1
+    v = torch.randn(B, T, HV, V, device=device) * 0.1
+    # NEGATIVE gate (log-decay). The KDA recurrence multiplies the state by
+    # ``g.exp()`` at every step, so a positive g amplifies the state. The
+    # previous version used ``torch.randn(...) * 0.1`` (mean 0, std 0.1),
+    # which left ~50% of steps in the amplifying regime — the test only
+    # happened to pass because the seed-1 draw did not blow up to inf in 64
+    # steps. Other KDA tests in this file correctly use
+    # ``-torch.rand(...) * 0.05``; we align this test with them.
+    g = -torch.rand(B, T, HV, K, device=device) * 0.05
     beta = torch.rand(B, T, HV, device=device) * 0.5
     o, s = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
     return [
@@ -457,11 +464,31 @@ def test_hca_sliding_window_causality(device='cpu'):
     # Outside the expected region, diff must be ~0.  This covers both
     # causality (t < p: future must not affect past) and the window-size
     # gap (p+win <= t < (floor(p/m2)+1)*m2: outside both branches).
-    max_diff = diff[~expected_affected].max().item()
+    #
+    # BIDIRECTIONAL assertion: we also check that the AFFECTED region actually
+    # sees a non-trivial diff. A degenerate implementation (e.g. one that
+    # zeros out the SW or dense branch) would pass the one-sided
+    # "unaffected == 0" check trivially; requiring affected > 0 rules out
+    # such silent regressions. We use a small floor (1e-6) because the
+    # perturbation magnitude is 10.0 * randn and the attention output is
+    # bounded, so any real dependency should produce a clearly non-zero diff.
+    if (~expected_affected).any():
+        max_diff = diff[~expected_affected].max().item()
+    else:
+        max_diff = 0.0
+    if expected_affected.any():
+        min_affected = diff[expected_affected].min().item()
+    else:
+        min_affected = float('inf')
 
     return [
-        _ok('HCA sliding-window causal', max_diff < 1e-9,
+        _ok('HCA sliding-window causal (unaffected region is stable)',
+            max_diff < 1e-9,
             f'max diff in unaffected region = {max_diff:.2e} (fp64, win={win})'),
+        _ok('HCA sliding-window affected region actually changes',
+            min_affected > 1e-6,
+            f'min diff in affected region = {min_affected:.2e} '
+            f'(guards against zero-output regressions)'),
     ]
 
 
@@ -560,11 +587,34 @@ def test_csa_full_pipeline_causality(device='cpu'):
     # Outside the expected region, diff must be ~0.  This covers both
     # causality (t < p: future must not affect past) and the window-size gap
     # (p+win <= t < (floor(p/m)+1)*m: outside both branches).
-    max_diff = diff[~expected_affected].max().item()
+    #
+    # BIDIRECTIONAL assertion (mirrors test_hca_sliding_window_causality):
+    # also verify that the SW AFFECTED region actually sees a non-trivial diff,
+    # so a degenerate implementation that zeros out the SW branch cannot pass
+    # the causality check trivially. We only check the SW region (NOT the
+    # sparse region) because the sparse_affected mask is an *upper bound*:
+    # block ``bp`` is selectable by queries ``t >= (bp+1)*m``, but it might
+    # not be in the top-k for a given query — so a zero diff at some
+    # (p, t) in sparse_affected is legitimate (block not selected), not a bug.
+    if (~expected_affected).any():
+        max_diff = diff[~expected_affected].max().item()
+    else:
+        max_diff = 0.0
+    if sw_affected.any():
+        min_sw_affected = diff[sw_affected].min().item()
+    else:
+        min_sw_affected = float('inf')
 
     return [
-        _ok('CSA full pipeline causal', max_diff < 1e-9,
+        _ok('CSA full pipeline causal (unaffected region is stable)',
+            max_diff < 1e-9,
             f'max diff in unaffected region = {max_diff:.2e} (fp64, win={win})'),
+        _ok('CSA full pipeline SW-affected region actually changes',
+            min_sw_affected > 1e-6,
+            f'min diff in SW-affected region = {min_sw_affected:.2e} '
+            f'(guards against zero-SW-output regressions; sparse region '
+            f'is not checked because top-k may legitimately not select '
+            f'block bp)'),
     ]
 
 

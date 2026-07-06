@@ -70,10 +70,28 @@ def fig_kv_cache():
     Uses the apples-to-apples 5-layer GQA8 baseline (``kv_ratio_vs_gqa_5l``)
     when available, falling back to the 1-layer baseline
     (``kv_ratio_vs_gqa_1l``) for older result files.
+
+    The new ``run_kv_cache.py`` writes TWO records per ``(T, op)`` — one for
+    ``accounting_mode='compressed_kv_only'`` and one for
+    ``'full_accounting'``. Plotting both into the same series produces two
+    y-values per x, which after sorting by T draws vertical segments and
+    creates a zigzag artifact on the log-scale plot. We filter to a single
+    accounting mode (defaulting to ``full_accounting`` since that is the more
+    honest number; the other mode is reported separately in the JSON).
     """
     data = load('exp3_kv_cache.json')
+    # Pick the accounting mode from the first record that has the field;
+    # default to 'full_accounting' for the figure. Older result files without
+    # the field fall through with mode=None and we plot all rows (legacy).
+    mode = None
+    for r in data:
+        if 'accounting_mode' in r:
+            mode = 'full_accounting'
+            break
     ops = {}
     for r in data:
+        if mode is not None and r.get('accounting_mode', mode) != mode:
+            continue
         # Prefer the 5-layer (apples-to-apples) baseline; fall back to 1-layer.
         ratio = r.get('kv_ratio_vs_gqa_5l', r.get('kv_ratio_vs_gqa_1l',
                                                    r.get('kv_ratio_vs_gqa')))
@@ -108,10 +126,23 @@ def fig_kv_cache():
 
 
 def fig_flops():
-    """Figure: prefill FLOPs ratio vs GQA baseline."""
+    """Figure: prefill FLOPs ratio vs GQA baseline.
+
+    Same accounting-mode filter as ``fig_kv_cache``: ``exp3_kv_cache.json``
+    contains two records per ``(T, op)`` (one per ``accounting_mode``) and
+    plotting both into the same series creates a zigzag on the log-scale plot.
+    We default to ``full_accounting`` for consistency with ``fig_kv_cache``.
+    """
     data = load('exp3_kv_cache.json')
+    mode = None
+    for r in data:
+        if 'accounting_mode' in r:
+            mode = 'full_accounting'
+            break
     ops = {}
     for r in data:
+        if mode is not None and r.get('accounting_mode', mode) != mode:
+            continue
         ratio = r.get('flops_ratio_vs_gqa_5l', r.get('flops_ratio_vs_gqa_1l',
                                                       r.get('flops_ratio_vs_gqa')))
         if ratio is None:
@@ -285,12 +316,20 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     fig.suptitle(f'Ablation: ratio trade-off (n_kv={n_kv}, multi-seed). '
                  '4:1:1 has 6 layers vs 3:1:1 has 5 — depth confound noted in paper.',
                  fontsize=9, y=1.02)
+    # ``constrained_layout`` is the modern replacement for ``tight_layout``
+    # and is incompatible with ``bbox_inches='tight'`` (the latter recomputes
+    # the bbox from scratch and silently undoes the former's padding). We pick
+    # ``tight_layout`` + ``bbox_inches='tight'`` here for backwards compat
+    # with the existing figure layout, but only call ONE of them — the prior
+    # code called both, which double-applied padding and could clip axis
+    # labels. ``constrained_layout=True`` would be even better but would
+    # require restructuring the subplots call.
     fig.tight_layout()
-    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150, bbox_inches='tight')
-    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150, bbox_inches='tight')
+    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150)
+    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150)
     if write_legacy_name:
-        fig.savefig('figures/fig_ablation.pdf', dpi=150, bbox_inches='tight')
-        fig.savefig('figures/fig_ablation.png', dpi=150, bbox_inches='tight')
+        fig.savefig('figures/fig_ablation.pdf', dpi=150)
+        fig.savefig('figures/fig_ablation.png', dpi=150)
     plt.close(fig)
     msg = f'Saved figures/fig_ablation_nkv{n_kv}.pdf'
     if write_legacy_name:

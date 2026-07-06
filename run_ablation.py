@@ -39,7 +39,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, get_device
+from kaggle_setup import configure_torch_for_device
 from ops_fused import HybridKCHAttention, HybridConfig
 from run_quality import make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975
 
@@ -48,12 +48,20 @@ logger = logging.getLogger(__name__)
 
 def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     n_kda, n_csa, n_hca = ratio
+    # HCA's defining feature is *heavy* compression: m2 should be >> m so the
+    # HCA branch produces far fewer compressed blocks than CSA, trading recall
+    # granularity for global context. The previous config set m2 == m == 4,
+    # which made HCA behave identically to CSA (minus the lightning indexer)
+    # and silently defeated the purpose of including HCA in the ablation.
+    # With seq_len=16 and m=4, n_blocks_CSA = 4; setting m2=8 gives
+    # n_blocks_HCA = 2, exercising the "heavier compression" regime while
+    # staying within the small ablation budget.
     return HybridConfig(
         d_model=d_model, n_heads_qk=2, n_heads_v=2,
         head_dim_k=16, head_dim_v=16,
         csa_m=4, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
         csa_sliding_window=4,
-        hca_m2=4, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=4,
+        hca_m2=8, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=4,
         n_kda=n_kda, n_csa=n_csa, n_hca=n_hca,
     )
 
@@ -141,6 +149,10 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
         'steps': steps,
         'last_train_loss': losses[-1],
         'mean_last10_loss': sum(losses[-10:]) / min(10, len(losses)),
+        # Full per-step loss curve so the figure / paper can plot convergence
+        # trajectories. The docstring promised "convergence curves" but the
+        # previous version discarded the list and saved only the last value.
+        'loss_curve': losses,
     }
 
 
@@ -149,14 +161,39 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
     per_seed = []
     for s in seeds:
         t0 = time.time()
-        r = eval_layout(ratio, seed=s, steps=steps, device=device, **kw)
-        r['train_time_s'] = time.time() - t0
-        per_seed.append(r)
-        logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
-                    f"fwd={r['fwd_ms']:.2f}ms  time={r['train_time_s']:.1f}s")
+        # Per-seed try/except: one divergent seed (NaN loss, OOM, etc.) should
+        # not crash the whole ratio. We log and skip; the aggregate stats are
+        # computed over whichever seeds succeeded (and n in the CI formula
+        # shrinks accordingly).
+        try:
+            r = eval_layout(ratio, seed=s, steps=steps, device=device, **kw)
+            r['train_time_s'] = time.time() - t0
+            per_seed.append(r)
+            logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
+                        f"fwd={r['fwd_ms']:.2f}ms  time={r['train_time_s']:.1f}s")
+        except Exception as e:
+            logger.warning(f"    seed {s} FAILED: {e}")
+            per_seed.append({
+                'seed': s, 'error': str(e),
+                'final_acc': None, 'final_loss': None, 'fwd_ms': None,
+            })
+        # On GPU, clear the CUDA cache between seeds so the allocator does
+        # not accumulate freed-but-unreleased blocks across 35 trainings
+        # (5 ratios x 7 seeds x model+opt state), which could cause an
+        # avoidable OOM on a constrained GPU.
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-    accs = [r['final_acc'] for r in per_seed]
-    fwds = [r['fwd_ms'] for r in per_seed]
+    # Filter out failed seeds before computing aggregate stats.
+    ok_per_seed = [r for r in per_seed if 'error' not in r]
+    if not ok_per_seed:
+        # All seeds failed: propagate the first error so the outer per-ratio
+        # try/except can record a stub result.
+        raise RuntimeError(f"all {n_seeds} seeds failed for ratio {ratio}; "
+                           f"first error: {per_seed[0].get('error')}")
+
+    accs = [r['final_acc'] for r in ok_per_seed]
+    fwds = [r['fwd_ms'] for r in ok_per_seed]
     n = len(accs)
     mean_acc = sum(accs) / n
     mean_fwd = sum(fwds) / n
@@ -180,10 +217,12 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         t_stat = None
 
     return {
-        'ratio': per_seed[0]['ratio'],
-        'n_kv': per_seed[0]['n_kv'],
-        'layout': per_seed[0]['layout'],
-        'n_seeds': n,
+        'ratio': ok_per_seed[0]['ratio'],
+        'n_kv': ok_per_seed[0]['n_kv'],
+        'layout': ok_per_seed[0]['layout'],
+        'n_seeds_ok': n,
+        'n_seeds_failed': len(per_seed) - n,
+        'n_seeds': len(per_seed),
         'seeds': seeds,
         'per_seed': per_seed,
         'mean_acc': mean_acc,
@@ -192,9 +231,9 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         'chance_acc': chance,
         't_stat_vs_chance': t_stat,
         'mean_fwd_ms': mean_fwd,
-        'n_params': per_seed[0]['n_params'],
-        'n_layers': per_seed[0]['n_layers'],
-        'mean_train_time_s': sum(r['train_time_s'] for r in per_seed) / n,
+        'n_params': ok_per_seed[0]['n_params'],
+        'n_layers': ok_per_seed[0]['n_layers'],
+        'mean_train_time_s': sum(r.get('train_time_s', 0.0) for r in ok_per_seed) / n,
     }
 
 
@@ -219,13 +258,36 @@ def main():
         for r in ratios:
             logger.info(f'\n-- ratio KDA:CSA:HCA = {r[0]}:{r[1]}:{r[2]} '
                         f'(n_kv={n_kv}, {n_seeds} seeds) --')
-            res = eval_layout_multi_seed(r, n_seeds=n_seeds, steps=steps,
-                                         device=device, n_kv=n_kv)
-            all_results.append(res)
-            logger.info(f"  layout={res['layout']}  n_params={res['n_params']}  n_layers={res['n_layers']}")
-            logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {res['ci95_acc']:.4f} "
-                        f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)})")
-            logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")
+            # Per-ratio try/except so ONE failing ratio (OOM, divergence,
+            # assertion) does not crash the entire sweep and lose ALL the
+            # other ratios' results. The error is logged and recorded as a
+            # stub result with status='error' so the JSON file is always
+            # written and downstream figure generation can skip the missing
+            # ratio gracefully.
+            try:
+                res = eval_layout_multi_seed(r, n_seeds=n_seeds, steps=steps,
+                                             device=device, n_kv=n_kv)
+                all_results.append(res)
+                logger.info(f"  layout={res['layout']}  n_params={res['n_params']}  n_layers={res['n_layers']}")
+                logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {res['ci95_acc']:.4f} "
+                            f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)})")
+                logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")
+            except Exception as e:
+                import traceback as _tb
+                logger.error(f"  ratio {r[0]}:{r[1]}:{r[2]} FAILED: {e}")
+                _tb.print_exc()
+                all_results.append({
+                    'ratio': f'{r[0]}:{r[1]}:{r[2]}',
+                    'n_kv': n_kv,
+                    'n_seeds': n_seeds,
+                    'error': str(e),
+                    'mean_acc': None,
+                    'ci95_acc': None,
+                    'std_acc': None,
+                    'mean_fwd_ms': None,
+                    'n_params': None,
+                    'n_layers': sum(r),
+                })
 
     # Summary table (grouped by n_kv)
     print('\n' + '=' * 95)
@@ -233,9 +295,19 @@ def main():
           f"{'mean_acc':>10} | {'+/- CI95':>10} | {'t_vs_chance':>12} | {'fwd_ms':>8}")
     print('-' * 95)
     for r in all_results:
-        print(f"{r['n_kv']:>4} | {r['ratio']:>8} | {r['layout']:>22} | {r['n_layers']:>6} | "
-              f"{r['n_params']:>8} | {r['mean_acc']:>10.4f} | {r['ci95_acc']:>10.4f} | "
-              f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_fwd_ms']:>8.2f}")
+        # Skip error rows in the summary table (they have null fields).
+        if 'error' in r:
+            print(f"{r['n_kv']:>4} | {r['ratio']:>8} | {'(error)':>22} | {r['n_layers']:>6} | "
+                  f"{'-':>8} | {'-':>10} | {'-':>10} | {'-':>12} | {'-':>8}   ERROR: {r['error']}")
+            continue
+        layout_str = r.get('layout', '') or ''
+        n_params = r.get('n_params') or 0
+        mean_acc = r.get('mean_acc') or 0.0
+        ci95 = r.get('ci95_acc') or 0.0
+        fwd = r.get('mean_fwd_ms') or 0.0
+        print(f"{r['n_kv']:>4} | {r['ratio']:>8} | {layout_str:>22} | {r['n_layers']:>6} | "
+              f"{n_params:>8} | {mean_acc:>10.4f} | {ci95:>10.4f} | "
+              f"{_fmt_tstat(r.get('t_stat_vs_chance'), width=12, prec=2)} | {fwd:>8.2f}")
     print(f"{'':>4} | {'chance':>8} | {'':>22} | {'':>6} | {'':>8} | {1/16:>10.4f} |")
 
     # Honest note about depth confound

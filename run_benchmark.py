@@ -28,6 +28,8 @@ import gc
 import json
 import logging
 import os
+import platform
+import statistics
 import sys
 import time
 
@@ -35,7 +37,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, get_device
+from kaggle_setup import configure_torch_for_device
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -61,9 +63,11 @@ def _read_current_rss_kb() -> int:
 
     Reads ``VmRSS`` from ``/proc/self/status`` on Linux (fast, no deps).
     Falls back to ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` on macOS/BSD
-    — note that ru_maxrss is a high-water mark on Linux but the *current* RSS
-    on macOS, so the fallback is less accurate on Linux but we only use it
-    when /proc is unavailable.
+    — note that ``ru_maxrss`` is reported in *bytes* on macOS/BSD but in
+    *kilobytes* on Linux. We detect the platform and convert so the returned
+    value is always in KB (matching the ``/proc`` path). Without this
+    conversion the macOS fallback reported bytes-mislabeled-as-KB, inflating
+    the memory column by 1024x on macOS.
     """
     try:
         with open('/proc/self/status', 'r') as f:
@@ -75,7 +79,13 @@ def _read_current_rss_kb() -> int:
         pass
     try:
         import resource
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # On Linux ru_maxrss is in KB; on macOS/BSD it is in bytes.
+        # Convert bytes -> KB on the mac/BSD path so the unit is consistent
+        # with the /proc path above (always KB).
+        if platform.system() == 'Darwin' or 'BSD' in platform.system():
+            return rss // 1024
+        return rss
     except (ImportError, AttributeError):
         return 0
 
@@ -123,7 +133,12 @@ def _measure(fn, repeats, device):
             times.append(start.elapsed_time(end) / 1000.0)
         peak_bytes = torch.cuda.max_memory_allocated(device)
         peak_mb = peak_bytes / (1024 ** 2)
-        return sorted(times)[len(times) // 2], peak_mb
+        # ``statistics.median`` averages the two middle values for even-length
+        # lists; the previous ``sorted(times)[len(times)//2]`` returned the
+        # upper-middle element, which biased the reported latency upward
+        # whenever ``repeats`` was even. (Currently masked because the caller
+        # uses repeats=3, but the bug would surface on any even-repeat run.)
+        return statistics.median(times), peak_mb
     else:
         # CPU path: sample current RSS from /proc/self/status (Linux) or
         # resource.getrusage (mac/BSD fallback).
@@ -158,7 +173,7 @@ def _measure(fn, repeats, device):
             if cur > peak_rss_kb:
                 peak_rss_kb = cur
         peak_mb = max(0.0, peak_rss_kb - rss0) / 1024.0  # kB -> MB
-        return sorted(times)[len(times) // 2], peak_mb
+        return statistics.median(times), peak_mb
 
 
 def bench_softmax_attn(B, T, H, K, V, device):
@@ -328,6 +343,13 @@ def main():
     ]
 
     results = []
+    # Number of timed repeats per (T, op). The previous value of 3 gave a
+    # noisy single-point estimate; with median aggregation across 5 repeats
+    # (and min/max kept implicit in the underlying times list) the reported
+    # number is meaningfully more stable. We keep the count modest so the
+    # full sweep (5 seq_lengths x 6 ops x repeats) stays under a few minutes
+    # on a Kaggle T4. Override via the ``BENCH_REPEATS`` env var.
+    n_repeats = int(os.environ.get('BENCH_REPEATS', '5'))
     for T in seq_lengths:
         logger.info(f'\n-- T = {T} --')
         for name, factory in benches:
@@ -337,13 +359,23 @@ def main():
                 # warmup (counted in _measure on GPU; explicit here for CPU)
                 if device.type != 'cuda':
                     fn()
-                t, mem = _measure(fn, repeats=3, device=device)
+                t, mem = _measure(fn, repeats=n_repeats, device=device)
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
-                       'device': str(device)}
+                       'device': str(device), 'repeats': n_repeats}
                 results.append(row)
                 print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem:8.2f} MB')
             except Exception as e:
-                results.append({'T': T, 'op': name, 'error': str(e), 'device': str(device)})
+                # Include null fields for the keys present on success rows so
+                # downstream JSON consumers can do ``row['time_ms']`` without
+                # a KeyError on error rows. Missing keys vs explicit null
+                # matters: pandas read_json treats missing keys as NaN only
+                # if the column exists in at least one row.
+                results.append({
+                    'T': T, 'op': name, 'error': str(e),
+                    'device': str(device),
+                    'time_ms': None, 'peak_mem_MB': None,
+                    'repeats': n_repeats,
+                })
                 logger.error(f'  {name:12s}  ERROR: {e}')
 
     os.makedirs('results', exist_ok=True)

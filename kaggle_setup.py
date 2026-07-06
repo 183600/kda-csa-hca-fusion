@@ -45,6 +45,16 @@ import torch
 KAGGLE_FLAG_PATH = "/kaggle/input"
 
 
+# Module-level flag guarding the one-shot ``torch.set_num_interop_threads(1)``
+# call. PyTorch only allows setting interop threads ONCE per process; any
+# subsequent call raises ``RuntimeError: cannot set number of interop threads
+# after parallel work has started``. ``run_all.py`` invokes
+# ``configure_torch_for_device`` from every experiment's ``main()``, so without
+# this guard the second experiment (after the first ``backward()`` triggers
+# inter-op parallelism) would crash the whole runner.
+_interop_threads_set = False
+
+
 # PyTorch CUDA wheel index URLs (see https://pytorch.org/get-started/locally/).
 # Ordered from newest to oldest; cu121 is the historical default for Kaggle T4.
 _PYTORCH_WHEEL_INDEX_URLS = {
@@ -157,10 +167,18 @@ def setup_kaggle(verbose: bool = True) -> None:
     # The upper bound was previously pinned to <2.6, which prevents installation
     # on environments with newer torch (2.6+). Remove the upper bound and rely
     # on ``--upgrade-strategy=only-if-needed`` to avoid unnecessary upgrades.
+    #
+    # Use ``--extra-index-url`` instead of ``--index-url``: the latter REPLACES
+    # PyPI entirely, which breaks resolution of any non-torch dependency that
+    # torch wheels pull in (e.g. ``typing-extensions``, ``sympy``) — pip would
+    # 404 on those packages because they live on PyPI, not on the PyTorch wheel
+    # index. ``--extra-index-url`` keeps PyPI as the primary source and adds
+    # the PyTorch wheel index as a fallback, so torch's CUDA wheels are found
+    # there while their non-torch deps still resolve from PyPI.
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--upgrade-strategy", "only-if-needed",
-        "torch>=2.1", "--index-url", index_url,
+        "torch>=2.1", "--extra-index-url", index_url,
     ])
     if verbose:
         print("[kaggle_setup] Done. CUDA should now be available after a restart "
@@ -258,7 +276,23 @@ def configure_torch_for_device(device: torch.device | None = None) -> EnvInfo:
         device = info.device
     if device.type == "cpu":
         torch.set_num_threads(info.num_threads)
-        torch.set_num_interop_threads(1)
+        # ``set_num_interop_threads`` can only be called ONCE per process
+        # (PyTorch raises ``RuntimeError`` on any subsequent call, even after
+        # ``import torch`` alone has triggered inter-op init in some builds).
+        # ``run_all.py`` calls this function from every experiment's main(),
+        # so without the guard the second experiment would crash. The module-
+        # level ``_interop_threads_set`` flag remembers that we already did it.
+        global _interop_threads_set
+        if not _interop_threads_set:
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                # Already set (e.g. user called it manually, or torch init
+                # happened before us). Silently ignore — the value is either
+                # already 1 or close enough that inter-op contention is not
+                # the bottleneck on the CPU path.
+                pass
+            _interop_threads_set = True
     else:
         # cuDNN autotune is a big win on T4 for the fixed shapes we benchmark.
         torch.backends.cudnn.benchmark = True

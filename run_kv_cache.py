@@ -87,9 +87,12 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         if mode == 'full_accounting':
             # KDA layers also carry a short-conv state of O(d) per layer
             # (the d-element convolutional lookahead buffer used to feed the
-            # recurrent update). This is negligible next to the recurrent
-            # state but a production engine must retain it.
-            short_conv_state = p['d']
+            # recurrent update). The actual ``nn.Conv1d(kernel_size=3, groups=d)``
+            # in ``ops_fused.py::KDAHybridLayer`` needs ``(kernel_size - 1) * d``
+            # = 2*d elements of left-padding buffer for streaming — not just d.
+            # This is negligible next to the recurrent state but a production
+            # engine must retain it.
+            short_conv_state = 2 * p['d']
             return recurrent_state + short_conv_state
         # compressed_kv_only: just the recurrent state.
         return recurrent_state
@@ -106,8 +109,10 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             indexer = n_blocks * csa_cI
             # Compression metadata: the per-block softmax weights Z are recomputed
             # from the input hidden state during decoding, so they are NOT cached.
-            # Sink: nh elements (negligible).
-            return compressed + sw + indexer
+            # Sink: nh elements (negligible, included for completeness —
+            # documented here even though the value is tiny).
+            sink = p.get('csa_nh', H)
+            return compressed + sw + indexer + sink
         return compressed
 
     if op == 'hca':
@@ -115,7 +120,8 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':
             sw = min(T, hca_sw) * hca_c
-            return compressed + sw
+            sink = p.get('hca_nh', H)
+            return compressed + sw + sink
         return compressed
 
     if op == 'hybrid_kch':
@@ -135,7 +141,37 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
 
 
 def prefill_flops(op: str, T: int, **kw):
-    """Approximate prefill FLOPs (2 * MACs) for a single attention layer."""
+    """Approximate prefill FLOPs (2 * MACs) for a single attention layer.
+
+    Accounting conventions
+    ----------------------
+    Every attention op has TWO matmuls in its core: ``QK^T`` (over the key
+    dim) and ``softmax(P) @ V`` (over the value dim). Both must be counted
+    for the comparison to be fair across operators. The previous version
+    counted BOTH for ``softmax_gqa`` (``2 * T * T * H * (K + V)``) but
+    ONLY the ``QK^T`` term for CSA / HCA — undercounting their core FLOPs
+    by ~2x and biasing the ``flops_ratio_vs_gqa_*`` columns roughly 2x in
+    the hybrid's favor.
+
+    For KDA, the recurrence (see ``ops_kda.py::naive_recurrent_kda``) has
+    roughly 4 ``HV*K*V``-sized matvec operations per step:
+
+      1. ``S * g_i.exp()``                — elementwise (no FLOPs)
+      2. ``(k_i * S).sum(-2)``            — HV*V dots of length K  -> HV*V*K MACs
+      3. ``b_i * k_i ⊗ (v_i - ...)``     — outer product HV*K*V MACs
+      4. ``q_i^T S``                       — HV*V dots of length K  -> HV*V*K MACs
+
+    i.e. ~3 * HV*K*V MACs per step (the dominant terms), or
+    ~6 * T * HV*K*V FLOPs total. The previous formula used
+    ``2 * T * HV*K*V``, a ~3x underestimate. We also include the input
+    projection FLOPs (q/k/v/g/beta) for parity with CSA/HCA, whose
+    ``compress`` term already includes the input projection.
+
+    For CSA, the ``compress`` term previously counted only ``W_aKV``
+    (one ``T*d*c`` projection). The actual implementation
+    (``ops_csa.py::naive_csa``) does SIX input projections:
+    ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx``. We count all six.
+    """
     p = {**DEFAULTS, **kw}
     H, K, V, d = p['H'], p['K'], p['V'], p['d']
     csa_m, csa_topk, csa_c = p['csa_m'], p['csa_topk'], p['csa_c']
@@ -143,21 +179,41 @@ def prefill_flops(op: str, T: int, **kw):
     kda_hv, kda_k, kda_v = p['kda_hv'], p['kda_k'], p['kda_v']
 
     if op == 'softmax_gqa':
+        # QK^T (K term) + softmax·V (V term) over T x T x H heads.
         return 2 * T * T * H * (K + V)
     if op == 'kda':
-        return 2 * T * kda_hv * kda_k * kda_v
+        # Input projections (q, k, v, g_down+g_up, beta) — five T*d*?
+        # matmuls. q/k/v are d -> H*K / H*K / HV*V; g is d->K->HV*K (two
+        # matmuls); beta is d->HV. We approximate as 5 * T * d * kda_k
+        # (treating g's two-pass as one T*d*K + one T*K*HV*K, dominated by
+        # the second pass at T*K*HV*K ≈ T*d*K under typical K≈d/HV).
+        proj = 2 * T * d * kda_k * 5
+        # Recurrence: ~3 HV*K*V MACs per step (see docstring).
+        recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
+        return proj + recurrent
     if op == 'csa':
-        n_blocks = T // csa_m
-        compress = 2 * T * d * csa_c
-        indexer = 2 * T * p['csa_cI'] * p['csa_nIh'] * n_blocks
-        core = 2 * T * csa_topk * csa_c * H
-        sw = 2 * T * p['csa_sliding_window'] * csa_c * H
+        n_blocks = max(1, T // csa_m)
+        # Compression: SIX input projections (W_aKV, W_bKV, W_aZ, W_bZ,
+        # W_KV_idx, W_Z_idx), each T*d*c or T*d*c_I. The first four are
+        # T*d*c; the last two are T*d*c_I.
+        compress = 2 * T * d * (4 * csa_c + 2 * p['csa_cI'])
+        # Indexer: per-head similarities T * n_blocks * c_I * nIh, then
+        # weighted sum across heads T * n_blocks * nIh.
+        indexer = 2 * T * p['csa_cI'] * p['csa_nIh'] * n_blocks \
+                  + 2 * T * p['csa_nIh'] * n_blocks
+        # Core sparse attention: QK^T (c term) + softmax·V (c term).
+        core = 2 * T * csa_topk * csa_c * H * 2
+        # Sliding window: QK^T + softmax·V over the local window.
+        sw = 2 * T * p['csa_sliding_window'] * csa_c * H * 2
         return compress + indexer + core + sw
     if op == 'hca':
-        n_blocks = T // hca_m2
-        compress = 2 * T * d * hca_c
-        core = 2 * T * n_blocks * hca_c * H
-        sw = 2 * T * p['hca_sliding_window'] * hca_c * H
+        n_blocks = max(1, T // hca_m2)
+        # Compression: TWO input projections (W_KV, W_Z), each T*d*c.
+        compress = 2 * T * d * hca_c * 2
+        # Core dense attention over all n_blocks: QK^T (c) + softmax·V (c).
+        core = 2 * T * n_blocks * hca_c * H * 2
+        # Sliding window: QK^T + softmax·V over the local window.
+        sw = 2 * T * p['hca_sliding_window'] * hca_c * H * 2
         return compress + core + sw
     if op == 'hybrid_kch':
         # Mirror the configurable ratio in kv_cache_elements.

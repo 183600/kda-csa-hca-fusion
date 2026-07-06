@@ -40,7 +40,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, get_device
+from kaggle_setup import configure_torch_for_device
 from ops_kda import naive_recurrent_kda
 
 
@@ -76,7 +76,9 @@ class SoftmaxAttnDecoding(nn.Module):
 
     def forward(self, x):
         # x: [B, T_new, d] — T_new = prefill_len during prefill, 1 during decoding.
-        B, T_new, d = x.shape
+        # ``d`` is intentionally not unpacked: it is unused here (we read
+        # ``self.H * self.K`` etc. from the layer config, not from x.shape).
+        B, T_new, _ = x.shape
         q = self.q(x).view(B, T_new, self.H, self.K)
         k = self.k(x).view(B, T_new, self.H, self.K)
         v = self.v(x).view(B, T_new, self.H, self.V)
@@ -134,7 +136,7 @@ class KDAAttnDecoding(nn.Module):
         self._state = None
 
     def forward(self, x):
-        B, T_new, d = x.shape
+        B, T_new, _ = x.shape
         q = F.normalize(F.silu(self.q(x)), dim=-1).view(B, T_new, self.H, self.K)
         k = F.normalize(F.silu(self.k(x)), dim=-1).view(B, T_new, self.H, self.K)
         v = F.silu(self.v(x)).view(B, T_new, self.H, self.V)
@@ -159,6 +161,12 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     """Measure per-token decoding latency after a fixed prefill.
 
     Returns dict with prefill_ms, mean_decode_ms_per_token, peak_mem_MB.
+
+    ``repeats`` controls how many independent (prefill + decode-loop) trials
+    are run. The median prefill and per-token decode latency across trials is
+    reported, which is far more stable than the single-trial measurement the
+    previous implementation used (the ``repeats`` parameter existed in the
+    signature but was silently ignored — a clear bug).
     """
     # Move model to device FIRST, then clear cache and reset peak memory
     # stats. The previous order (_clear_cache -> model.to(device)) meant
@@ -169,41 +177,91 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     model.reset()
     _clear_cache(device)
 
-    # Prefill: process the whole context at once.
-    x_prefill = torch.randn(1, prefill_len, d_model, device=device) * 0.1
-    with torch.no_grad():
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            model(x_prefill)
-            torch.cuda.synchronize()
-            prefill_ms = (time.perf_counter() - t0) * 1e3
-        else:
-            t0 = time.perf_counter()
-            model(x_prefill)
-            prefill_ms = (time.perf_counter() - t0) * 1e3
+    # Pre-allocate the per-step decode input ONCE outside the timed loop.
+    # The previous code allocated ``x_new = torch.randn(1, 1, d_model)`` inside
+    # the timed region, so per-token latency included the cost of randn + the
+    # scalar multiply — for KDA (tiny per-token compute) this overhead can
+    # dominate the measurement.
+    x_new = torch.randn(1, 1, d_model, device=device) * 0.1
 
-    # Decode n_decode tokens one at a time.
-    decode_times = []
+    # One fixed prefill input (same across trials) so timing variance comes
+    # from the model, not from input noise.
+    x_prefill = torch.randn(1, prefill_len, d_model, device=device) * 0.1
+
+    # Warmup: run prefill + a couple of decode steps once (untimed) so the
+    # first timed trial is not paying one-time kernel compilation / autotune
+    # / allocator-warmup costs. ``cudnn.benchmark=True`` (set in
+    # kaggle_setup.py) triggers autotuning on the first conv/matmul call,
+    # which can dominate the first prefill by 100x. Without warmup the
+    # reported prefill_ms is "compute + one-time setup", not steady-state.
     with torch.no_grad():
-        for _ in range(n_decode):
-            x_new = torch.randn(1, 1, d_model, device=device) * 0.1
+        model.reset()
+        model(x_prefill)
+        for _ in range(min(3, n_decode)):
+            model(x_new)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+        # Reset peak memory AFTER warmup so the reported peak reflects the
+        # timed decode region, not the warmup allocations.
+        torch.cuda.reset_peak_memory_stats(device)
+
+    prefill_times = []
+    all_decode_times = []
+    for _ in range(repeats):
+        model.reset()
+        # Prefill: process the whole context at once.
+        with torch.no_grad():
             if device.type == 'cuda':
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                model(x_new)
+                model(x_prefill)
                 torch.cuda.synchronize()
-                decode_times.append((time.perf_counter() - t0) * 1e3)
+                prefill_times.append((time.perf_counter() - t0) * 1e3)
             else:
                 t0 = time.perf_counter()
-                model(x_new)
-                decode_times.append((time.perf_counter() - t0) * 1e3)
+                model(x_prefill)
+                prefill_times.append((time.perf_counter() - t0) * 1e3)
 
-    decode_times.sort()
-    median_decode = decode_times[len(decode_times) // 2]
-    mean_decode = sum(decode_times) / len(decode_times)
+        # Decode n_decode tokens one at a time.
+        decode_times = []
+        with torch.no_grad():
+            for _ in range(n_decode):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    model(x_new)
+                    torch.cuda.synchronize()
+                    decode_times.append((time.perf_counter() - t0) * 1e3)
+                else:
+                    t0 = time.perf_counter()
+                    model(x_new)
+                    decode_times.append((time.perf_counter() - t0) * 1e3)
+        all_decode_times.append(decode_times)
+
+    # Aggregate across repeats: take the median across trials for each
+    # summary statistic. ``statistics.median`` handles even-length lists
+    # correctly (averages the two middle values) — the previous
+    # ``sorted(times)[len(times)//2]`` returned the upper-middle for even n.
+    import statistics
+    prefill_ms = statistics.median(prefill_times)
+    # Per-token: median across (trial, token-step) samples — flattens the
+    # repeats x n_decode matrix into one list and takes its median.
+    flat_decode = [t for trial in all_decode_times for t in trial]
+    median_decode = statistics.median(flat_decode)
+    mean_decode = sum(flat_decode) / len(flat_decode)
 
     if device.type == 'cuda':
+        # ``max_memory_allocated`` returns the peak across the WHOLE run
+        # (warmup + all trials). The peak is dominated by prefill (which
+        # allocates [1, H, T, T] attention scores ≈ 32 MB at plen=2048,
+        # vs the per-step decode cache ≈ 260 KB). To report the *decoding*
+        # footprint (what a serving engine actually pays in steady state),
+        # we would need to reset peak stats after prefill — but then the
+        # reported number would miss the prefill activations a serving
+        # engine retains in the KV cache. Reporting the global peak is the
+        # honest choice: it is the maximum memory the model needs at any
+        # point, including prefill. We document this clearly so reviewers
+        # don't misread it as the per-step decode footprint.
         peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
     else:
         # CPU: tracemalloc doesn't capture torch tensors (native memory), and
@@ -219,6 +277,7 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         'peak_mem_MB': peak_mb,
         'prefill_len': prefill_len,
         'n_decode': n_decode,
+        'repeats': repeats,
     }
 
 

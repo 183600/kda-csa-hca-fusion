@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, get_device, to_device
+from kaggle_setup import configure_torch_for_device
 from ops_kda import naive_recurrent_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -82,7 +82,10 @@ def _t_crit_975(n):
       2. A hardcoded table covering ``n = 2..30`` (df = 1..29). This fixes
          the n = 11..30 range where the previous table fell back to the
          normal approximation 1.96 and lost up to ~8% accuracy.
-      3. For ``n > 30`` the normal approximation ``1.96`` (error < 1%).
+      3. For ``n > 30`` the normal approximation ``1.96`` (relative error
+         ~4% at n=31, drops below 1% only around n≈100, and below 0.1% past
+         n≈400 — so callers using small samples should ensure scipy is
+         available or extend the table).
       4. For ``n < 2`` the CI is undefined; returns ``0.0``.
 
     The scipy availability check runs once and is cached in ``_T_PP`` so
@@ -112,7 +115,7 @@ def _t_crit_975(n):
 
 
 def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
-                    embed: nn.Embedding, device=None):
+                    embed: nn.Embedding, device=None, generator=None):
     """Build an MQAR batch with *learnable* embeddings.
 
     Layout per sequence (length ``seq_len``):
@@ -125,6 +128,15 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     via a single argsort-based per-row permutation and advanced indexing,
     avoiding the per-sample Python loop and ``.item()`` calls that broke
     async kernel launches.
+
+    ``generator`` (optional ``torch.Generator``) makes the batch generation
+    reproducible and INDEPENDENT of the global RNG. This matters for
+    multi-operator comparisons: each operator has a different parameter
+    count, so it consumes a different number of global-RNG draws during
+    init. Without a dedicated generator, the *same* seed produced
+    *different* training batches across operators — a silent confound in
+    the multi-seed CI. Pass a per-seed generator to guarantee that, for a
+    given seed, all operators see the same training data.
     """
     if device is None:
         device = embed.weight.device
@@ -141,13 +153,13 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
         f"2*n_kv={2*n_kv} must be < seq_len={seq_len} (need room for cue token)")
 
     # Random noise base (covers noise positions; KV positions overwritten below).
-    x = torch.randint(0, vocab, (batch, seq_len), device=device)
+    x = torch.randint(0, vocab, (batch, seq_len), device=device, generator=generator)
     cue_pos = seq_len - 1
 
     # One uniformly-random permutation of [0, vocab) per sequence, obtained
     # by argsort of iid uniform keys (ties have measure zero in float32).
     # Slicing the first 2*n_kv columns yields 2*n_kv distinct ids per row.
-    pair_ids = torch.rand(batch, vocab, device=device).argsort(dim=-1)[:, :2 * n_kv]
+    pair_ids = torch.rand(batch, vocab, device=device, generator=generator).argsort(dim=-1)[:, :2 * n_kv]
     keys = pair_ids[:, 0::2]   # [batch, n_kv]
     vals = pair_ids[:, 1::2]   # [batch, n_kv]
 
@@ -160,7 +172,7 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     x[b_idx, odd_pos] = vals
 
     # Vectorized cue selection: pick one key index per sequence in parallel.
-    j = torch.randint(0, n_kv, (batch,), device=device)               # [batch]
+    j = torch.randint(0, n_kv, (batch,), device=device, generator=generator)  # [batch]
     row = torch.arange(batch, device=device)                          # [batch]
     x[:, cue_pos] = keys[row, j]
     target = vals[row, j]
@@ -339,14 +351,29 @@ class HCAAttn(nn.Module):
 
 def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
                 n_batches=4, batch=64):
-    """Evaluate accuracy over multiple fresh batches for a stable estimate."""
+    """Evaluate accuracy over multiple fresh batches for a stable estimate.
+
+    Uses a dedicated ``torch.Generator`` for batch generation so the eval
+    batches are reproducible and independent of any global-RNG state left
+    over by training. This also makes the eval pass deterministic across
+    re-runs, which is useful for debugging.
+    """
     layer.eval()
     head.eval()
+    embed.eval()  # nn.Embedding has no dropout/batchnorm so this is a no-op,
+                  # but we set it for symmetry with layer/head so future
+                  # additions (e.g. embedding dropout) do not silently stay
+                  # in train mode during evaluation.
+    # Fixed seed for the eval generator so every operator sees the SAME eval
+    # batches (apples-to-apples comparison at eval time too, not just train).
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(12345)
     correct, total = 0, 0
     losses = []
     with torch.no_grad():
         for _ in range(n_batches):
-            x_emb, target, cue_pos = make_mqar_batch(batch, seq_len, n_kv, vocab, embed, device)
+            x_emb, target, cue_pos = make_mqar_batch(
+                batch, seq_len, n_kv, vocab, embed, device, generator=eval_gen)
             h = layer(x_emb)
             logits = head(h, cue_pos)
             correct += (logits.argmax(-1) == target).sum().item()
@@ -357,15 +384,31 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
 
 def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
               steps=100, lr=3e-3, seed=42, device='cpu',
-              softmax_steps=None, eval_batches=4, eval_batch=64):
+              softmax_steps=None, eval_batches=4, eval_batch=64,
+              train_batch=None):
     """Train a single operator on MQAR for ``steps`` steps.
 
     ``softmax_steps`` lets the softmax baseline train longer to reach
     convergence (the original 100 steps left softmax at ~10%, barely above the
     6.25% chance — a meaningless upper bound).
+
+    ``train_batch`` overrides the per-step training batch size (default 32,
+    previously a hardcoded local magic number — now overridable for
+    memory-constrained or GPU runs via the ``MQAR_TRAIN_BATCH`` env var).
+
+    RNG isolation: the model is initialized with ``torch.manual_seed(seed)``,
+    but a SEPARATE per-step generator (also seeded with ``seed``) drives
+    ``make_mqar_batch``. This is critical for the multi-seed comparison: the
+    different operators have different parameter counts, so they consume a
+    different number of RNG draws during init. Without a separate generator
+    for batch generation, the *same* seed produced *different* training
+    batches across operators, undermining the apples-to-apples comparison
+    that multi-seed CI is meant to strengthen.
     """
     if softmax_steps is None:
         softmax_steps = steps
+    if train_batch is None:
+        train_batch = int(os.environ.get('MQAR_TRAIN_BATCH', '32'))
     actual_steps = softmax_steps if op_name == 'softmax' else steps
 
     torch.manual_seed(seed)
@@ -381,12 +424,24 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     params = list(embed.parameters()) + list(layer.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
 
+    # Separate generator for batch generation so the per-step batches are
+    # IDENTICAL across operators for a given seed (the model init consumed a
+    # different number of RNG draws per operator, which would otherwise
+    # desync the global RNG and produce different training data per op).
+    batch_gen = torch.Generator(device=device)
+    batch_gen.manual_seed(seed + 1)  # offset so it does not collide with
+                                      # the seed used for model init.
+
     losses, accs = [], []
-    train_batch = 32
+    # Set train mode ONCE before the loop, not per step (the previous code
+    # called layer.train()/head.train() inside the loop, which is a redundant
+    # O(steps) no-op once the modules are already in train mode).
+    layer.train()
+    head.train()
+    embed.train()
     for step in range(actual_steps):
-        x_emb, target, cue_pos = make_mqar_batch(train_batch, seq_len, n_kv, vocab, embed, device)
-        layer.train()
-        head.train()
+        x_emb, target, cue_pos = make_mqar_batch(
+            train_batch, seq_len, n_kv, vocab, embed, device, generator=batch_gen)
         h = layer(x_emb)
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
@@ -415,6 +470,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         'mean_last10_acc': sum(accs[-10:]) / min(10, len(accs)),
         'steps': actual_steps,
         'seed': seed,
+        'train_batch': train_batch,
     }
 
 
@@ -506,9 +562,29 @@ def main():
     logger.info('Experiment 4: MQAR Synthetic Quality Probe (multi-seed)')
     logger.info('=' * 70)
     logger.info(f'  device        : {device}')
+    # These are the task hyperparameters. Lifted to named constants so the
+    # chance-accuracy log line below uses the SAME value as the per-seed
+    # ``chance = 1.0 / vocab`` computation in ``train_one`` (the previous
+    # code hardcoded 1/16 in three print/log lines, which would have silently
+    # lied if vocab were ever changed).
+    vocab = 16
+    seq_len = 16
+    chance = 1.0 / vocab
     n_kv_list = _parse_nkv_list('MQAR_NKV', '1')
-    logger.info(f'  vocab=16, seq_len=16, n_kv={n_kv_list}')
-    logger.info(f'  chance accuracy = {1/16:.4f} (independent of n_kv; target is 1-of-vocab)')
+    # Pre-validate n_kv against vocab and seq_len so the user gets a clear
+    # error message instead of an opaque AssertionError from deep inside
+    # ``make_mqar_batch`` during training.
+    for n_kv in n_kv_list:
+        if 2 * n_kv > vocab:
+            raise ValueError(
+                f"MQAR_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} exceeds "
+                f"vocab={vocab}; reduce n_kv or increase vocab.")
+        if 2 * n_kv >= seq_len:
+            raise ValueError(
+                f"MQAR_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} must be "
+                f"< seq_len={seq_len} (need room for the cue token at the end).")
+    logger.info(f'  vocab={vocab}, seq_len={seq_len}, n_kv={n_kv_list}')
+    logger.info(f'  chance accuracy = {chance:.4f} (independent of n_kv; target is 1-of-vocab)')
     n_seeds = int(os.environ.get('MQAR_SEEDS', '5'))
     steps = int(os.environ.get('MQAR_STEPS', '200'))
     # Softmax gets more steps to actually converge (original paper's 100 left
@@ -540,7 +616,7 @@ def main():
         print(f"{r['n_kv']:>4} | {r['op']:>10} | {r['mean_acc']:>10.4f} | "
               f"{r['ci95_acc']:>10.4f} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
-    print(f"{'':>4} | {'chance':>10} | {1/16:>10.4f} |")
+    print(f"{'':>4} | {'chance':>10} | {chance:>10.4f} |")
 
     os.makedirs('results', exist_ok=True)
     with open('results/exp4_mqar.json', 'w') as f:

@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, get_device
+from kaggle_setup import configure_torch_for_device
 from ops_csa import csa_compress_kv, _causal_block_mask
 from ops_kda import naive_recurrent_kda
 
@@ -167,7 +167,16 @@ class HeadwiseFusedAttention(nn.Module):
 
         self.norm = nn.LayerNorm(d)
         self.o_proj = nn.Linear(cfg.H_total * hd, d, bias=False)
-        self.scale = hd ** -0.5
+        # Attention scale: the dot product is over the compressed dim ``c``
+        # (see the einsum in _csa_heads / _hca_heads: ``b t h d, b n d -> b h t n``
+        # where ``d`` is the trailing dim of ``C_comp_n``, i.e. ``c``). The
+        # correct scale is therefore ``c ** -0.5``. We previously used
+        # ``hd ** -0.5``; the ``__init__`` assert ``csa_c == hca_c == head_dim``
+        # made them numerically equal today, but using ``hd`` is a latent
+        # footgun: if the assert is ever relaxed (e.g. to allow c != hd with
+        # a per-head projection), the scale would silently be wrong. Use ``c``
+        # so the formula matches the actual dot-product dimension.
+        self.scale = cfg.csa_c ** -0.5
 
     def _kda_heads(self, x):
         B, T, d = x.shape
