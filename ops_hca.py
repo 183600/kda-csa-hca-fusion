@@ -81,12 +81,23 @@ def naive_hca(
         # inflate exp() and overflow). scores already carries -inf
         # at causally-masked slots, so logsumexp/ exp naturally yield
         # 0 there; fully-masked rows also collapse to p=0 (logaddexp
-        # (-inf, log_sink) = log_sink, exp(-inf - log_sink) = 0).
+        # (-inf, log_sink) = log_sink, exp(-inf - log_sink) = 0)
+        # — PROVIDED log_sink is finite. If log_sink is also -inf
+        # (e.g. sink_logits diverged to -inf during training), then
+        # (shifted - log_denom) = (-inf - (-inf)) = NaN. The
+        # all_masked guard below zeros out such rows so the downstream
+        # einsum produces 0 instead of NaN. Mirrors the guard in the
+        # ``else`` branch and in ``ops_csa.py::naive_csa``.
         row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, nh, T, 1]
         shifted = scores - row_max                                  # [B, nh, T, n_blocks]
         lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
         log_denom = torch.logaddexp(lse, log_sink)                 # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
+        # NaN guard: zero out rows where every block is causally masked
+        # (e.g. t < m2). Without this, a -inf log_sink would produce NaN
+        # via (-inf - (-inf)) = NaN, and the einsum would propagate it.
+        all_masked = torch.isinf(scores).all(-1, keepdim=True)   # [B, nh, T, 1]
+        p = p.masked_fill(all_masked, 0.0)
     else:
         # Rows with no valid block to attend to (e.g. t < m2 under the
         # causal block mask) are entirely -inf; softmax over them would

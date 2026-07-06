@@ -197,19 +197,41 @@ def fig_mqar():
 
 
 def _plot_mqar_group(records, n_kv, write_legacy_name):
+    """Plot MQAR accuracy bars for one ``n_kv`` group.
+
+    Handles error rows (where ``mean_acc`` is ``None`` because all seeds
+    failed) by skipping them — a partial figure with the surviving
+    operators is more useful than crashing the entire figure-generation
+    step. The error is logged so the user knows data was dropped.
+    """
     ops, means, cis = [], [], []
     chance = 1 / 16
+    skipped = 0
     for r in records:
+        # Skip error rows (mean_acc is None when all seeds failed).
+        # Without this guard, the downstream ``m + c`` and ``f'{m:.3f}'``
+        # calls crash with ``TypeError: unsupported operand type(s) for +:
+        # 'int' and 'NoneType'`` (or ``ValueError: Unknown format code 'f'
+        # for object of type 'str'``), taking down the whole figure step.
+        if r.get('mean_acc') is None and r.get('final_acc') is None:
+            skipped += 1
+            continue
         ops.append(r['op'])
         if _has_multiseed(r):
             means.append(r['mean_acc'])
-            cis.append(r.get('ci95_acc', 0.0))
+            cis.append(r.get('ci95_acc', 0.0) or 0.0)
             chance = r.get('chance_acc', chance)
         else:
             # Legacy single-seed format.
             means.append(r['final_acc'])
             cis.append(0.0)
             chance = r.get('chance_acc', chance)
+    if not ops:
+        print(f'Skipping MQAR figure for n_kv={n_kv} (all records are '
+              f'error rows, no data to plot)')
+        return
+    if skipped:
+        print(f'[fig_mqar] skipped {skipped} error row(s) for n_kv={n_kv}')
     fig, ax = plt.subplots(figsize=(6, 4))
     colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B2']
     bars = ax.bar(ops, means, yerr=cis, capsize=5,
@@ -219,16 +241,21 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
                label=f'Chance ({chance:.3f})')
     ax.set_ylabel('MQAR accuracy (mean over seeds, 95% CI)')
     # Number of seeds (fall back to 1 for legacy / empty data).
-    if records:
-        n_seeds = records[0].get('n_seeds', 1)
+    # Use the first non-error record so the title reflects the actual
+    # seed count of the plotted data, not a failed row's stub.
+    ok_records = [r for r in records
+                  if r.get('mean_acc') is not None
+                  or r.get('final_acc') is not None]
+    if ok_records:
+        n_seeds = ok_records[0].get('n_seeds', 1)
     else:
         n_seeds = 1
 
     # Training steps: take from the first per_seed entry when present.
     # Falls back to 100 for missing key, empty per_seed list, or empty data.
     steps = 100
-    if records:
-        per_seed = records[0].get('per_seed') or []
+    if ok_records:
+        per_seed = ok_records[0].get('per_seed') or []
         if per_seed:
             steps = per_seed[0].get('steps', 100)
     ax.set_title(f'Multi-Query Associative Recall (n_kv={n_kv}, '
@@ -277,18 +304,68 @@ def fig_ablation():
 
 
 def _plot_ablation_group(records, n_kv, write_legacy_name):
-    ratios = [r['ratio'] for r in records]
-    accs = [r.get('mean_acc', r.get('final_acc', 0.0)) for r in records]
-    acc_cis = [r.get('ci95_acc', 0.0) for r in records]
-    fwds = [r.get('mean_fwd_ms', r.get('fwd_ms', 0.0)) for r in records]
-    n_params = [r.get('n_params', 0) for r in records]
-    n_layers = [r.get('n_layers', sum(int(x) for x in r['ratio'].split(':'))) for r in records]
+    """Plot ablation accuracy + latency bars for one ``n_kv`` group.
+
+    Handles error rows (where ``mean_acc`` is ``None`` because all seeds
+    for that ratio failed) by substituting 0.0 and labeling the bar as
+    ``"ERR"``. A partial figure with the failed ratios marked is more
+    useful than crashing the entire figure-generation step and losing the
+    successful ratios' plots. The error is also logged.
+
+    Previously, a single error row (``mean_acc=None``) crashed the whole
+    function at ``max(a + c for a, c in zip(accs, acc_cis))`` with
+    ``TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'``,
+    because ``r.get('mean_acc', r.get('final_acc', 0.0))`` returns ``None``
+    (not the default ``0.0``) when the key exists with value ``None`` —
+    ``dict.get`` only falls back to the default when the key is *absent*,
+    not when its value is ``None``.
+    """
+    ratios = []
+    accs = []
+    acc_cis = []
+    fwds = []
+    n_params = []
+    n_layers = []
+    error_flags = []
+    skipped = 0
+    for r in records:
+        ratio = r['ratio']
+        # ``r.get('mean_acc', ...)`` returns None when the key exists with
+        # value None (error row), NOT the fallback default. Detect error
+        # rows explicitly via the 'error' key or by checking for None.
+        is_error = 'error' in r or (
+            r.get('mean_acc') is None and r.get('final_acc') is None)
+        if is_error:
+            error_flags.append(True)
+            ratios.append(ratio)
+            accs.append(0.0)
+            acc_cis.append(0.0)
+            fwds.append(0.0)
+            n_params.append(r.get('n_params') or 0)
+            n_layers.append(r.get('n_layers')
+                            or sum(int(x) for x in ratio.split(':')))
+            skipped += 1
+        else:
+            error_flags.append(False)
+            ratios.append(ratio)
+            accs.append(r.get('mean_acc', r.get('final_acc', 0.0)) or 0.0)
+            acc_cis.append(r.get('ci95_acc', 0.0) or 0.0)
+            fwds.append(r.get('mean_fwd_ms', r.get('fwd_ms', 0.0)) or 0.0)
+            n_params.append(r.get('n_params') or 0)
+            n_layers.append(r.get('n_layers')
+                            or sum(int(x) for x in ratio.split(':')))
+
+    if skipped:
+        print(f'[fig_ablation] {skipped} ratio(s) had errors and are shown '
+              f'as 0-height "ERR" bars for n_kv={n_kv}')
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
     x = np.arange(len(ratios))
 
-    # Accuracy with CI95 error bars.
-    bars1 = ax1.bar(x, accs, yerr=acc_cis, capsize=4, color='#4C72B0',
+    # Accuracy with CI95 error bars. Error rows get a distinct color so
+    # they are visually identifiable rather than silently blending in.
+    bar_colors = ['#C44E52' if e else '#4C72B0' for e in error_flags]
+    bars1 = ax1.bar(x, accs, yerr=acc_cis, capsize=4, color=bar_colors,
                     error_kw={'linewidth': 1.3, 'ecolor': '#333'})
     ax1.set_xticks(x)
     ax1.set_xticklabels([f'{r}\n({l}L, {p}p)' for r, l, p in zip(ratios, n_layers, n_params)],
@@ -296,22 +373,25 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     ax1.set_ylabel('MQAR accuracy (mean +/- CI95)')
     ax1.set_title('Accuracy vs. KDA:CSA:HCA ratio')
     ax1.axhline(1/16, color='gray', linestyle='--', alpha=0.5, label='chance (1/16)')
-    for bar, acc in zip(bars1, accs):
+    for bar, acc, is_err in zip(bars1, accs, error_flags):
+        label = 'ERR' if is_err else f'{acc:.3f}'
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
-                 f'{acc:.3f}', ha='center', va='bottom', fontsize=9)
+                 label, ha='center', va='bottom', fontsize=9)
     ax1.legend(fontsize=8)
     ax1.set_ylim(0, max(max(a + c for a, c in zip(accs, acc_cis)) * 1.3, 0.2))
 
     # Latency.
-    bars2 = ax2.bar(x, fwds, color='#55A868')
+    bar_colors2 = ['#C44E52' if e else '#55A868' for e in error_flags]
+    bars2 = ax2.bar(x, fwds, color=bar_colors2)
     ax2.set_xticks(x)
     ax2.set_xticklabels([f'{r}\n({l}L)' for r, l in zip(ratios, n_layers)],
                         rotation=0, fontsize=8)
     ax2.set_ylabel('Forward latency (ms)')
     ax2.set_title('Latency vs. KDA:CSA:HCA ratio')
-    for bar, fwd in zip(bars2, fwds):
+    for bar, fwd, is_err in zip(bars2, fwds, error_flags):
+        label = 'ERR' if is_err else f'{fwd:.1f}'
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                 f'{fwd:.1f}', ha='center', va='bottom', fontsize=9)
+                 label, ha='center', va='bottom', fontsize=9)
 
     fig.suptitle(f'Ablation: ratio trade-off (n_kv={n_kv}, multi-seed). '
                  '4:1:1 has 6 layers vs 3:1:1 has 5 — depth confound noted in paper.',

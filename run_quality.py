@@ -480,20 +480,53 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
 
     Returns a dict with per-seed results plus aggregate stats (mean, std,
     95% CI half-width via t-distribution).
+
+    Per-seed error handling: a single divergent seed (NaN loss, OOM, etc.)
+    is caught and recorded as a stub entry in ``per_seed`` rather than
+    crashing the whole operator's multi-seed run. Aggregate stats are
+    computed over the surviving (successful) seeds. If ALL seeds fail, the
+    function raises a ``RuntimeError`` so the caller can record a stub
+    result for the operator (mirrors ``run_ablation.py::eval_layout_multi_seed``).
+    Previously, a single seed failure crashed the entire experiment, losing
+    all other operators' results — inconsistent with the ablation runner's
+    more robust pattern.
     """
     seeds = [42 + i for i in range(n_seeds)]
     per_seed = []
     for s in seeds:
         t0 = time.time()
-        r = train_one(op_name, seed=s, steps=steps, device=device,
-                      softmax_steps=softmax_steps, **kw)
-        r['train_time_s'] = time.time() - t0
-        per_seed.append(r)
-        logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
-                    f"steps={r['steps']}  time={r['train_time_s']:.1f}s")
+        # Per-seed try/except: one divergent seed should not crash the
+        # whole operator. We log and record a stub; the aggregate stats
+        # are computed over whichever seeds succeeded.
+        try:
+            r = train_one(op_name, seed=s, steps=steps, device=device,
+                          softmax_steps=softmax_steps, **kw)
+            r['train_time_s'] = time.time() - t0
+            per_seed.append(r)
+            logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
+                        f"steps={r['steps']}  time={r['train_time_s']:.1f}s")
+        except Exception as e:
+            logger.warning(f"    seed {s} FAILED: {e}")
+            per_seed.append({
+                'seed': s, 'error': str(e),
+                'final_acc': None, 'final_loss': None,
+            })
+        # On GPU, clear the CUDA cache between seeds so the allocator does
+        # not accumulate freed-but-unreleased blocks across seeds.
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-    accs = [r['final_acc'] for r in per_seed]
-    losses = [r['final_loss'] for r in per_seed]
+    # Filter out failed seeds before computing aggregate stats.
+    ok_per_seed = [r for r in per_seed if 'error' not in r]
+    if not ok_per_seed:
+        # All seeds failed: propagate the error so the caller can record
+        # a stub result for this operator.
+        raise RuntimeError(
+            f"all {n_seeds} seeds failed for op '{op_name}'; "
+            f"first error: {per_seed[0].get('error')}")
+
+    accs = [r['final_acc'] for r in ok_per_seed]
+    losses = [r['final_loss'] for r in ok_per_seed]
     n = len(accs)
     mean_acc = sum(accs) / n
     mean_loss = sum(losses) / n
@@ -514,7 +547,7 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
     # chance level. The t-statistic is only defined when n > 1 and the
     # sample standard deviation is strictly positive; otherwise we return
     # None (the test is not computable, not "infinitely significant").
-    chance = per_seed[0]['chance_acc']
+    chance = ok_per_seed[0]['chance_acc']
     if n > 1 and std_acc > 0:
         t_stat = (mean_acc - chance) / (std_acc / math.sqrt(n))
     else:
@@ -522,8 +555,11 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
 
     return {
         'op': op_name,
-        'n_kv': per_seed[0]['n_kv'],
+        'n_kv': ok_per_seed[0]['n_kv'],
         'n_seeds': n,
+        'n_seeds_ok': n,
+        'n_seeds_failed': len(per_seed) - n,
+        'n_seeds_total': len(per_seed),
         'seeds': seeds,
         'per_seed': per_seed,
         'mean_acc': mean_acc,
@@ -534,7 +570,8 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
         'ci95_loss': ci_loss,
         'chance_acc': chance,
         't_stat_vs_chance': t_stat,
-        'mean_train_time_s': sum(r['train_time_s'] for r in per_seed) / n,
+        'mean_train_time_s': sum(r.get('train_time_s', 0.0)
+                                 for r in ok_per_seed) / n,
     }
 
 
@@ -600,12 +637,38 @@ def main():
         logger.info(f'{"=" * 70}')
         for op in ['softmax', 'kda', 'csa', 'hca']:
             logger.info(f'\nTraining {op} (n_kv={n_kv}, {n_seeds} seeds)...')
-            r = train_multi_seed(op, n_seeds=n_seeds, steps=steps,
-                                 softmax_steps=softmax_steps, device=device,
-                                 n_kv=n_kv)
-            all_results.append(r)
-            logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {r['ci95_acc']:.4f} "
-                        f"(std={r['std_acc']:.4f}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
+            # Per-operator try/except so ONE failing operator (all seeds
+            # diverged / OOMed) does not crash the whole experiment and
+            # lose the other operators' results. The error is logged and
+            # recorded as a stub result so the JSON file is always written
+            # and downstream figure generation can skip the missing op
+            # gracefully (mirrors run_ablation.py's per-ratio try/except).
+            try:
+                r = train_multi_seed(op, n_seeds=n_seeds, steps=steps,
+                                     softmax_steps=softmax_steps, device=device,
+                                     n_kv=n_kv)
+                all_results.append(r)
+                logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {r['ci95_acc']:.4f} "
+                            f"(std={r['std_acc']:.4f}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
+            except Exception as e:
+                import traceback as _tb
+                logger.error(f"  op '{op}' FAILED: {e}")
+                _tb.print_exc()
+                all_results.append({
+                    'op': op,
+                    'n_kv': n_kv,
+                    'n_seeds': n_seeds,
+                    'error': str(e),
+                    'mean_acc': None,
+                    'ci95_acc': None,
+                    'std_acc': None,
+                    'mean_loss': None,
+                    'std_loss': None,
+                    'ci95_loss': None,
+                    'chance_acc': 1.0 / vocab,
+                    't_stat_vs_chance': None,
+                    'per_seed': [],
+                })
 
     # Summary table (grouped by n_kv)
     print('\n' + '=' * 80)
@@ -613,6 +676,13 @@ def main():
           f"{'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
     print('-' * 80)
     for r in all_results:
+        # Error rows have None for all numeric fields; render them as
+        # dashes instead of crashing on ``f'{None:.4f}'``.
+        if 'error' in r:
+            err_msg = (r.get('error') or '')[:40]
+            print(f"{r['n_kv']:>4} | {r['op']:>10} | {'-':>10} | "
+                  f"{'-':>10} | {'-':>8} | {'-':>12} | {'-':>10}   ERROR: {err_msg}")
+            continue
         print(f"{r['n_kv']:>4} | {r['op']:>10} | {r['mean_acc']:>10.4f} | "
               f"{r['ci95_acc']:>10.4f} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")

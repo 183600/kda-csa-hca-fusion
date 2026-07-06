@@ -71,7 +71,7 @@ def _ensure_deps():
 
 def _setup():
     """Probe environment, install CUDA torch on Kaggle if needed."""
-    from kaggle_setup import setup_kaggle, print_env_summary, configure_torch_for_device
+    from kaggle_setup import setup_kaggle, print_env_summary
     setup_kaggle(verbose=True)
     info = print_env_summary()
     return info

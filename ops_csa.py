@@ -261,6 +261,21 @@ def naive_csa(
         log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
         log_denom = torch.logaddexp(log_sum_exp, log_sink)          # [B, T, nh, 1]
         p = ((shifted - log_denom).exp() * vmask)                   # [B, T, nh, topk]
+        # NaN guard for all-masked rows (early queries with no preceding
+        # causal block). When every slot in a row is -inf, log_sum_exp =
+        # -inf, log_denom = logaddexp(-inf, log_sink) = log_sink. If
+        # log_sink is also -inf (e.g. sink_logits diverged to -inf during
+        # training), then (shifted - log_denom) = (-inf - (-inf)) = NaN,
+        # and NaN * 0 (vmask) = NaN in IEEE 754. Zero out any row where
+        # all slots are invalid so the downstream einsum produces 0
+        # instead of NaN. This mirrors the all_masked guard in the
+        # ``else`` branch and in ``ops_hca.py::naive_hca``.
+        #
+        # Shape: valid_mask is [B, T, topk]; we reduce over topk to get
+        # [B, T, 1], then add a head axis [:, :, None] to broadcast over
+        # the nh dimension of p ([B, T, nh, topk]).
+        all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
+        p = p.masked_fill(all_invalid, 0.0)
     else:
         # NaN-safe softmax: rows that are entirely -inf yield all-zero p.
         row_max = scores.amax(-1, keepdim=True)                     # [B, T, nh, 1]
