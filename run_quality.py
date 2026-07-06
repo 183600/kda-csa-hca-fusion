@@ -459,6 +459,24 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         n_batches=eval_batches, batch=eval_batch,
     )
     chance = 1.0 / vocab
+    # Guard against steps=0 (would crash on accs[-1] / sum([])/0 below).
+    # Returns a stub with the eval result and zeros for the training
+    # trajectory fields. ``actual_steps`` is reported as 0 so downstream
+    # consumers can detect the degenerate case.
+    if not losses:
+        return {
+            'op': op_name,
+            'n_kv': n_kv,
+            'final_acc': final_acc,
+            'final_loss': final_loss,
+            'chance_acc': chance,
+            'last_train_acc': 0.0,
+            'mean_last10_loss': 0.0,
+            'mean_last10_acc': 0.0,
+            'steps': actual_steps,
+            'seed': seed,
+            'train_batch': train_batch,
+        }
     return {
         'op': op_name,
         'n_kv': n_kv,
@@ -556,7 +574,12 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
     return {
         'op': op_name,
         'n_kv': ok_per_seed[0]['n_kv'],
-        'n_seeds': n,
+        # Report the REQUESTED seed count (len(per_seed)), not the surviving
+        # count (n), so the figure title and downstream consumers reflect
+        # how many seeds were actually run. ``n_seeds_ok`` / ``n_seeds_failed``
+        # carry the surviving / failed breakdown. Mirrors run_ablation.py's
+        # convention (which already used len(per_seed) here).
+        'n_seeds': len(per_seed),
         'n_seeds_ok': n,
         'n_seeds_failed': len(per_seed) - n,
         'n_seeds_total': len(per_seed),

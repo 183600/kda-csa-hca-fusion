@@ -243,14 +243,22 @@ def naive_csa(
         # log space (never exp it, which could overflow to inf when the
         # learnable parameter grows during training and makes denom=inf,
         # p=0/inf=nan or inf/inf=nan).
-        log_sink = sink_logits.view(1, 1, nh, 1)                    # [1, 1, nh, 1]
-        vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
-        # scores already carries -inf at invalid slots (masked above),
-        # i.e. it is the "safe scores". Row max clamped >= 0 so we only
-        # ever shift scores down, keeping them aligned with log_sink
-        # which is already in log space (shifting up would inflate
-        # exp() and could overflow).
         #
+        # Math: we want p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink)).
+        # For numerical stability we subtract row_max from every score
+        # (and from the sink!) so the largest exp() argument is 0:
+        #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
+        # where M = max(0, max_i s_i).  The previous code forgot to
+        # shift the sink, producing
+        #   p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink) * exp(M))
+        # i.e. the sink was over-weighted by a factor exp(M) — a
+        # systematic ~13% bias in the default c=64 config and up to 65%
+        # at c=4.  Shifting log_sink by -row_max restores the identity
+        #   logaddexp(a - M, b - M) = logaddexp(a, b) - M
+        # so the shifted computation is mathematically identical to the
+        # unshifted (overflow-prone) one.
+        log_sink = sink_logits.view(1, 1, nh, 1).to(scores.dtype)  # [1, 1, nh, 1]
+        vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
         # NOTE: renamed from `m` to `row_max` to avoid shadowing the
         # `m` parameter (compression factor). The previous `m = ...`
         # silently clobbered the compression factor for the rest of the
@@ -258,8 +266,9 @@ def naive_csa(
         # shadowing was a latent footgun for future edits.
         row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, T, nh, 1]
         shifted = scores - row_max                                  # [B, T, nh, topk]
+        shifted_sink = log_sink - row_max                           # [B, T, nh, 1]
         log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(log_sum_exp, log_sink)          # [B, T, nh, 1]
+        log_denom = torch.logaddexp(log_sum_exp, shifted_sink)      # [B, T, nh, 1]
         p = ((shifted - log_denom).exp() * vmask)                   # [B, T, nh, topk]
         # NaN guard for all-masked rows (early queries with no preceding
         # causal block). When every slot in a row is -inf, log_sum_exp =

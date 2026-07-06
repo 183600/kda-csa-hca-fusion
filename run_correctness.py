@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
-from ops_csa import csa_compress_kv, csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
+from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig
 
@@ -359,7 +359,6 @@ def test_csa_indexer_validity(device='cpu'):
     torch.manual_seed(7)
     B, T, m, topk = 1, 64, 8, 4
     n_blocks = T // m
-    c = 16
     HI, DI = 2, 8
     q_idx = torch.randn(B, T, HI, DI, device=device)
     k_idx = torch.randn(B, n_blocks, DI, device=device)
@@ -994,6 +993,153 @@ def test_hybrid_per_layer_kda_state(device='cpu'):
     ]
 
 
+def test_csa_hca_sink_numerical_correctness(device='cpu'):
+    """Regression: attention sink must be shifted by -row_max in the log-space softmax.
+
+    The attention sink adds a per-head constant ``exp(sink_logits[h])`` to the
+    softmax denominator:
+
+        p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink))
+
+    For numerical stability we subtract ``row_max = max(0, max_i s_i)`` from
+    every score. The sink MUST be shifted by the same amount:
+
+        p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
+
+    The previous code forgot to shift the sink, producing
+
+        p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink) * exp(M))
+
+    i.e. the sink was over-weighted by a factor ``exp(row_max)``. In the
+    default ``c=64`` config this is a ~13% systematic bias; at ``c=4`` it
+    reaches 65%. The existing sink tests all used ``sink_logits=zeros(nh)``
+    and only checked shape/finiteness, so the bias went undetected.
+
+    This test builds a CORRECT reference implementation (with the shift) and
+    compares both ``naive_csa`` and ``naive_hca`` against it, using a
+    non-zero ``sink_logits`` so the bias is detectable.
+    """
+    logger.info("Test: CSA/HCA attention sink numerical correctness (log-space shift)")
+    torch.manual_seed(14)
+    dtype = torch.float64
+
+    # --- CSA sink test ---
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
+    # Non-zero sink so the bias is detectable.
+    sink = torch.tensor([0.5, -0.3], dtype=dtype, device=device)
+
+    # Run naive_csa with sliding_window=0 to isolate the sparse+sink path.
+    o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                      W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                      m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                      sliding_window=0, sink_logits=sink)
+
+    # Build a CORRECT reference for the sparse MQA core with sink.
+    from ops_csa import csa_compress_kv, csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask
+    Ca = H @ W_aKV; Cb = H @ W_bKV; Za = H @ W_aZ; Zb = H @ W_bZ
+    C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)
+    n_blocks = T // m
+    K_idx_raw = H @ W_KV_idx; Z_idx = H @ W_Z_idx
+    K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)
+    cQ = H @ W_DQ
+    q_idx = (cQ @ W_IUQ).view(B, T, nIh, c_I)
+    w_idx = H @ W_w
+    cbm = _causal_block_mask(T, n_blocks, m, H.device)
+    indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
+                                     scale=c_I ** -0.5, causal_block_mask=cbm)
+    q = (cQ @ W_UQ).view(B, T, nh, c)
+    q = F.normalize(q, dim=-1)
+    C_comp_n = F.normalize(C_comp, dim=-1)
+    valid_mask = indices >= 0
+    idx_safe = indices.clamp(min=0)
+    batch_idx = torch.arange(B, device=H.device).view(B, 1, 1)
+    kv = C_comp_n[batch_idx, idx_safe]
+    scale = c ** -0.5
+    scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv) * scale
+    scores = scores.masked_fill(~valid_mask[:, :, None, :], float('-inf'))
+    # CORRECT reference: shift the sink by -row_max.
+    row_max = scores.amax(-1, keepdim=True).clamp(min=0)
+    shifted = scores - row_max
+    log_sink = sink.view(1, 1, nh, 1)
+    shifted_sink = log_sink - row_max
+    lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+    log_denom = torch.logaddexp(lse, shifted_sink)
+    vmask = valid_mask[:, :, None, :].to(scores.dtype)
+    p_ref = ((shifted - log_denom).exp() * vmask)
+    all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]
+    p_ref = p_ref.masked_fill(all_invalid, 0.0)
+    out_ref = torch.einsum('b t h k, b t k d -> b t h d', p_ref, kv)
+    out_ref_flat = out_ref.reshape(B, T, nh * c)
+
+    csa_diff = (o_csa - out_ref_flat).abs().max().item()
+
+    # --- HCA sink test ---
+    B2, T2, d2 = 1, 32, 16
+    m2, nh2, c2, dc2 = 16, 2, 8, 16
+    H2 = torch.randn(B2, T2, d2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    sink2 = torch.tensor([0.7, -0.2], dtype=dtype, device=device)
+
+    o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                      m2=m2, nh=nh2, c=c2, dc=dc2,
+                      sliding_window=0, sink_logits=sink2)
+
+    # Correct reference for HCA dense attention with sink.
+    C2 = H2 @ W_KV2; Z2 = H2 @ W_Z2
+    from ops_csa import csa_compress_kv as _compress
+    C_comp2 = _compress(C2, Z2, B_pos2, m2)
+    n_blocks2 = T2 // m2
+    C_comp_n2 = F.normalize(C_comp2, dim=-1)
+    cQ2 = H2 @ W_DQ2
+    q2 = (cQ2 @ W_UQ2).view(B2, T2, nh2, c2)
+    q2 = F.normalize(q2, dim=-1)
+    cbm2 = _causal_block_mask(T2, n_blocks2, m2, H2.device)
+    scale2 = c2 ** -0.5
+    scores2 = torch.einsum('b t h d, b n d -> b h t n', q2, C_comp_n2) * scale2
+    scores2 = scores2.masked_fill(~cbm2[None, None], float('-inf'))
+    row_max2 = scores2.amax(-1, keepdim=True).clamp(min=0)
+    shifted2 = scores2 - row_max2
+    log_sink2 = sink2.view(1, nh2, 1, 1)
+    shifted_sink2 = log_sink2 - row_max2
+    lse2 = torch.logsumexp(shifted2, dim=-1, keepdim=True)
+    log_denom2 = torch.logaddexp(lse2, shifted_sink2)
+    p_ref2 = (shifted2 - log_denom2).exp()
+    all_masked2 = torch.isinf(scores2).all(-1, keepdim=True)
+    p_ref2 = p_ref2.masked_fill(all_masked2, 0.0)
+    out_ref2 = torch.einsum('b h t n, b n d -> b t h d', p_ref2, C_comp_n2)
+    out_ref2_flat = out_ref2.reshape(B2, T2, nh2 * c2)
+
+    hca_diff = (o_hca - out_ref2_flat).abs().max().item()
+
+    return [
+        _ok('CSA sink matches shifted-logsumexp reference', csa_diff < 1e-10,
+            f'max diff = {csa_diff:.2e} (fp64, sink=[0.5,-0.3]); '
+            f'a non-zero diff means the sink is not shifted by -row_max'),
+        _ok('HCA sink matches shifted-logsumexp reference', hca_diff < 1e-10,
+            f'max diff = {hca_diff:.2e} (fp64, sink=[0.7,-0.2]); '
+            f'a non-zero diff means the sink is not shifted by -row_max'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1022,6 +1168,7 @@ def main():
     all_results += test_bench_hybrid_no_grad_inference(device)
     all_results += test_hybrid_per_layer_kda_state(device)
     all_results += test_csa_hca_right_padding_correctness(device)
+    all_results += test_csa_hca_sink_numerical_correctness(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

@@ -202,8 +202,16 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     if device.type == 'cuda':
         torch.cuda.synchronize()
         # Reset peak memory AFTER warmup so the reported peak reflects the
-        # timed decode region, not the warmup allocations.
+        # timed trials, not the warmup allocations.
         torch.cuda.reset_peak_memory_stats(device)
+        # Capture the baseline allocation (model params + persistent state
+        # like the KV cache / KDA recurrent state) right after the reset.
+        # The final peak is reported as ``max_memory_allocated - baseline``
+        # so the number isolates the activation footprint from the constant
+        # parameter offset that varies per operator.
+        baseline_bytes = torch.cuda.memory_allocated(device)
+    else:
+        baseline_bytes = 0
 
     prefill_times = []
     all_decode_times = []
@@ -251,18 +259,27 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     mean_decode = sum(flat_decode) / len(flat_decode)
 
     if device.type == 'cuda':
-        # ``max_memory_allocated`` returns the peak across the WHOLE run
-        # (warmup + all trials). The peak is dominated by prefill (which
-        # allocates [1, H, T, T] attention scores ≈ 32 MB at plen=2048,
-        # vs the per-step decode cache ≈ 260 KB). To report the *decoding*
-        # footprint (what a serving engine actually pays in steady state),
-        # we would need to reset peak stats after prefill — but then the
-        # reported number would miss the prefill activations a serving
-        # engine retains in the KV cache. Reporting the global peak is the
-        # honest choice: it is the maximum memory the model needs at any
-        # point, including prefill. We document this clearly so reviewers
-        # don't misread it as the per-step decode footprint.
-        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        # ``max_memory_allocated`` returns the peak across all timed trials
+        # (warmup was excluded by the reset_peak_memory_stats call above).
+        # We subtract the baseline allocation captured right after the reset
+        # so the reported peak isolates the activation footprint (prefill
+        # scores + KV cache growth) from the constant model-parameter offset
+        # that varies per operator. Without the subtraction, the hybrid
+        # model (more params) would report a higher "peak memory" than
+        # softmax even if their activation footprints were identical — an
+        # unfair comparison.
+        #
+        # The peak is dominated by prefill (which allocates [1, H, T, T]
+        # attention scores ≈ 32 MB at plen=2048, vs the per-step decode
+        # cache ≈ 260 KB). To report the *decoding* footprint (what a
+        # serving engine actually pays in steady state), we would need to
+        # reset peak stats after prefill — but then the reported number
+        # would miss the prefill activations a serving engine retains in
+        # the KV cache. Reporting the global peak (minus baseline) is the
+        # honest choice: it is the maximum activation memory the model
+        # needs at any point, including prefill.
+        peak_bytes = torch.cuda.max_memory_allocated(device)
+        peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
     else:
         # CPU: tracemalloc doesn't capture torch tensors (native memory), and
         # RSS-based approximations are unreliable across platforms. Report
@@ -311,8 +328,17 @@ def main():
                       f"decode/tok={r['median_decode_ms_per_token']:8.3f}ms  "
                       f"peak_mem={peak_str:>10}")
             except Exception as e:
+                # Include null fields for the keys present on success rows so
+                # downstream JSON consumers can do ``r['prefill_ms']`` without
+                # a KeyError on error rows (mirrors run_benchmark.py's pattern).
                 results.append({'op': name, 'prefill_len': plen, 'error': str(e),
-                                'device': str(device)})
+                                'device': str(device),
+                                'prefill_ms': None,
+                                'mean_decode_ms_per_token': None,
+                                'median_decode_ms_per_token': None,
+                                'peak_mem_MB': None,
+                                'n_decode': n_decode,
+                                'repeats': None})
                 print(f"  {name:10s}  ERROR: {e}")
 
     # Summary: decode latency growth rate.

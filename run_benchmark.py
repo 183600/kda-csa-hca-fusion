@@ -28,7 +28,6 @@ import gc
 import json
 import logging
 import os
-import platform
 import statistics
 import sys
 import time
@@ -59,15 +58,15 @@ def _clear_cache(device):
 
 
 def _read_current_rss_kb() -> int:
-    """Return the current process RSS in kilobytes.
+    """Return the current process RSS in kilobytes (Linux only).
 
-    Reads ``VmRSS`` from ``/proc/self/status`` on Linux (fast, no deps).
-    Falls back to ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` on macOS/BSD
-    — note that ``ru_maxrss`` is reported in *bytes* on macOS/BSD but in
-    *kilobytes* on Linux. We detect the platform and convert so the returned
-    value is always in KB (matching the ``/proc`` path). Without this
-    conversion the macOS fallback reported bytes-mislabeled-as-KB, inflating
-    the memory column by 1024x on macOS.
+    Reads ``VmRSS`` from ``/proc/self/status``. Returns 0 on macOS/BSD or
+    when ``/proc`` is unavailable — the previous ``resource.getrusage``
+    fallback returned ``ru_maxrss`` (a *high-water mark* that never
+    decreases), which made every operator after the first report a 0 delta.
+    Since the CPU ``_measure`` path now returns ``None`` for peak memory
+    (see the docstring there), this function is retained only for any
+    future caller that wants a best-effort instantaneous RSS on Linux.
     """
     try:
         with open('/proc/self/status', 'r') as f:
@@ -77,34 +76,23 @@ def _read_current_rss_kb() -> int:
                     return int(line.split()[1])
     except (FileNotFoundError, ValueError, IndexError, OSError):
         pass
-    try:
-        import resource
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # On Linux ru_maxrss is in KB; on macOS/BSD it is in bytes.
-        # Convert bytes -> KB on the mac/BSD path so the unit is consistent
-        # with the /proc path above (always KB).
-        if platform.system() == 'Darwin' or 'BSD' in platform.system():
-            return rss // 1024
-        return rss
-    except (ImportError, AttributeError):
-        return 0
+    return 0
 
 
 def _measure(fn, repeats, device):
     """Return (median_wall_time_s, peak_memory_MB).
 
     On CUDA: uses CUDA events for timing and ``torch.cuda.max_memory_allocated``
-    for real peak memory — the number a production inference engine pays.
+    (with baseline subtraction) for the real activation peak memory — the
+    number that characterises the operator's memory behavior, isolated from
+    the constant model-parameter offset that varies per operator.
 
-    On CPU: uses ``time.perf_counter`` for timing and ``resource.getrusage``
-    (RU) RSS for memory. We previously used ``tracemalloc``, but tracemalloc
-    only traces the Python heap and silently ignores native torch tensor
-    allocations — so it reported ~0 MB for tensors that were actually
-    gigabytes, which made the CPU memory column misleading. RSS via
-    ``resource`` captures the process-level resident set, which includes
-    torch's native allocator. We subtract a baseline RSS taken just before
-    the timed region so the reported number is the *delta* attributable to
-    the benchmarked operator (not the Python interpreter baseline).
+    On CPU: uses ``time.perf_counter`` for timing. Peak memory is reported
+    as ``None`` because torch's native CPU allocator retains freed blocks
+    in its pool, so RSS-based sampling between calls reports 0 for every
+    operator after the first (the pool is reused, not returned to the OS).
+    See the CPU-path comment below for details. JSON serializes ``None`` to
+    ``null``, which is clearly "no data" rather than the misleading 0.0.
     """
     if device.type == 'cuda':
         # Warmup
@@ -112,14 +100,18 @@ def _measure(fn, repeats, device):
             fn()
         torch.cuda.synchronize()
         # Reset peak memory stats AFTER warmup so the reported peak reflects
-        # only the timed region's activations, NOT the model parameters or
-        # warmup allocations. Without this reset, max_memory_allocated()
-        # returns the high-water mark since the last _clear_cache() call,
-        # which includes the model .to(device) allocation and warmup tensors
-        # -- inflating the reported memory by a constant offset that varies
-        # per operator (different parameter counts) and makes the comparison
-        # less fair.
+        # only the timed region's activations, NOT the warmup allocations.
         torch.cuda.reset_peak_memory_stats(device)
+        # Capture the baseline allocation AFTER the reset. The model
+        # parameters and any persistent state (e.g. KDA recurrent state)
+        # are still in ``memory_allocated()`` at this point, so without
+        # subtracting the baseline the reported peak would be
+        # ``params + peak_activations`` — a constant offset that varies
+        # per operator (different parameter counts) and makes the
+        # cross-operator comparison unfair. Subtracting the baseline
+        # isolates the activation footprint, which is the number that
+        # actually characterises an operator's memory behavior.
+        baseline_bytes = torch.cuda.memory_allocated(device)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = []
@@ -132,7 +124,7 @@ def _measure(fn, repeats, device):
             # preserve the (seconds, MB) contract of this function.
             times.append(start.elapsed_time(end) / 1000.0)
         peak_bytes = torch.cuda.max_memory_allocated(device)
-        peak_mb = peak_bytes / (1024 ** 2)
+        peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
         # ``statistics.median`` averages the two middle values for even-length
         # lists; the previous ``sorted(times)[len(times)//2]`` returned the
         # upper-middle element, which biased the reported latency upward
@@ -140,39 +132,31 @@ def _measure(fn, repeats, device):
         # uses repeats=3, but the bug would surface on any even-repeat run.)
         return statistics.median(times), peak_mb
     else:
-        # CPU path: sample current RSS from /proc/self/status (Linux) or
-        # resource.getrusage (mac/BSD fallback).
+        # CPU path: we previously tried sampling VmRSS from /proc/self/status
+        # between ``fn()`` calls, but torch's native CPU allocator (like
+        # malloc) retains freed blocks in its pool for reuse rather than
+        # returning them to the OS. So after the first operator pushes RSS
+        # to a new high, every subsequent operator reuses the pool and the
+        # sampled RSS delta is 0 — making every row after the first report
+        # ``0.00 MB``, which is misleading (it looks like a real measurement
+        # but is in fact "no new RSS growth detected").
         #
-        # We previously used tracemalloc, but tracemalloc only traces the
-        # Python heap and silently ignores native torch tensor allocations —
-        # so it reported ~0 MB for tensors that were actually megabytes,
-        # making the CPU memory column meaningless.
+        # tracemalloc is even worse: it only traces the Python heap and
+        # silently ignores native torch tensor allocations, so it reports
+        # ~0 MB for tensors that are actually megabytes.
         #
-        # We then tried resource.getrusage(RUSAGE_SELF).ru_maxrss, but
-        # ru_maxrss is a *high-water mark* — once the process reaches a given
-        # RSS, it never decreases, so the delta is 0 for every operator after
-        # the first one that pushes RSS to a new high. That made every
-        # subsequent row show 0.00 MB, which is just as misleading.
-        #
-        # The current approach samples the *instantaneous* RSS (VmRSS from
-        # /proc/self/status on Linux, or ru_idrss on BSD/macOS) before and
-        # after each repeat and keeps the peak sampled value. This is not a
-        # true peak (we can only sample between calls, not during), but it
-        # captures the steady-state resident footprint attributable to each
-        # operator, which is the number a serving engineer cares about.
+        # The honest choice is to report ``None`` on CPU (matching
+        # ``run_decoding.py``), so JSON serializes to ``null`` (clearly "no
+        # data") rather than a misleading 0.0. On GPU we report the real
+        # ``torch.cuda.max_memory_allocated`` (with baseline subtraction).
         gc.collect()
-        rss0 = _read_current_rss_kb()  # baseline before the timed region
         times = []
-        peak_rss_kb = rss0
         for _ in range(repeats):
             t0 = time.perf_counter()
             fn()
             t1 = time.perf_counter()
             times.append(t1 - t0)
-            cur = _read_current_rss_kb()
-            if cur > peak_rss_kb:
-                peak_rss_kb = cur
-        peak_mb = max(0.0, peak_rss_kb - rss0) / 1024.0  # kB -> MB
+        peak_mb = None  # CPU peak memory is not reliably measurable
         return statistics.median(times), peak_mb
 
 
@@ -363,7 +347,10 @@ def main():
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
                 results.append(row)
-                print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem:8.2f} MB')
+                # mem may be None on CPU (unreliable RSS sampling); render
+                # as 'n/a' instead of crashing on ``f'{None:8.2f}'``.
+                mem_str = f'{mem:8.2f} MB' if mem is not None else '     n/a'
+                print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem_str}')
             except Exception as e:
                 # Include null fields for the keys present on success rows so
                 # downstream JSON consumers can do ``row['time_ms']`` without

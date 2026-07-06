@@ -172,6 +172,9 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
             torch.cuda.synchronize()
         fwd_ms = (time.perf_counter() - t0) / 5 * 1e3
 
+    # Guard against steps=0 (would crash on losses[-1] / sum([])/0 below).
+    last_loss = losses[-1] if losses else 0.0
+    mean_last10 = sum(losses[-10:]) / min(10, len(losses)) if losses else 0.0
     return {
         'ratio': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
         'n_kv': n_kv,
@@ -184,8 +187,8 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
         'seed': seed,
         'steps': steps,
         'train_batch': train_batch,
-        'last_train_loss': losses[-1],
-        'mean_last10_loss': sum(losses[-10:]) / min(10, len(losses)),
+        'last_train_loss': last_loss,
+        'mean_last10_loss': mean_last10,
         # Full per-step loss curve so the figure / paper can plot convergence
         # trajectories. The docstring promised "convergence curves" but the
         # previous version discarded the list and saved only the last value.

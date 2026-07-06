@@ -73,7 +73,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
     kda_hv, kda_k, kda_v = p['kda_hv'], p['kda_k'], p['kda_v']
     csa_sw = p['csa_sliding_window']
     hca_sw = p['hca_sliding_window']
-    csa_cI, csa_nIh = p['csa_cI'], p['csa_nIh']
+    csa_cI = p['csa_cI']  # csa_nIh not needed for KV-cache accounting (only for FLOPs)
 
     if op == 'softmax_gqa':
         # GQA: 8 KV heads, each with K=V=128. Cache is T * H_kv * (K + V).
@@ -182,21 +182,46 @@ def prefill_flops(op: str, T: int, **kw):
         # QK^T (K term) + softmax·V (V term) over T x T x H heads.
         return 2 * T * T * H * (K + V)
     if op == 'kda':
-        # Input projections (q, k, v, g_down+g_up, beta) — five T*d*?
-        # matmuls. q/k/v are d -> H*K / H*K / HV*V; g is d->K->HV*K (two
-        # matmuls); beta is d->HV. We approximate as 5 * T * d * kda_k
-        # (treating g's two-pass as one T*d*K + one T*K*HV*K, dominated by
-        # the second pass at T*K*HV*K ≈ T*d*K under typical K≈d/HV).
-        proj = 2 * T * d * kda_k * 5
+        # Input projections — count the ACTUAL matmul shapes from
+        # ops_fused.py::KDAHybridLayer, not an approximation. The previous
+        # formula ``2 * T * d * kda_k * 5`` treated all 5 projections as
+        # ``T*d*K`` MACs, dropping the H/HV factor — a ~5x underestimate
+        # at the default H=8, K=128.
+        #   q_proj  : d -> H*K    -> T*d*H*kda_k MACs
+        #   k_proj  : d -> H*K    -> T*d*H*kda_k MACs
+        #   v_proj  : d -> HV*V   -> T*d*kda_hv*kda_v MACs  (V==kda_v)
+        #   g_down  : d -> K      -> T*d*kda_k MACs
+        #   g_up    : K -> HV*K   -> T*kda_k*kda_hv*kda_k MACs
+        #   beta    : d -> HV     -> T*d*kda_hv MACs
+        proj = 2 * T * (
+              d * (2 * H * kda_k + kda_hv * kda_v + kda_k + kda_hv)
+            + kda_k * kda_hv * kda_k   # g_up: inner dim is kda_k, not d
+        )
         # Recurrence: ~3 HV*K*V MACs per step (see docstring).
         recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
         return proj + recurrent
     if op == 'csa':
         n_blocks = max(1, T // csa_m)
-        # Compression: SIX input projections (W_aKV, W_bKV, W_aZ, W_bZ,
-        # W_KV_idx, W_Z_idx), each T*d*c or T*d*c_I. The first four are
-        # T*d*c; the last two are T*d*c_I.
+        # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
+        # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last
+        # two are T*d*c_I.
         compress = 2 * T * d * (4 * csa_c + 2 * p['csa_cI'])
+        # Query-side projections (W_DQ, W_UQ, W_IUQ, W_w) — previously
+        # OMITTED, undercounting CSA's prefill FLOPs by ~8% at the default
+        # config. The parity comment ("compress term already includes the
+        # input projection") was wrong: compress only covers the KV side.
+        #   W_DQ  : d -> dc       -> T*d*csa_dc MACs
+        #   W_UQ  : dc -> c*nh    -> T*csa_dc*csa_c*H MACs
+        #   W_IUQ : dc -> c_I*nIh -> T*csa_dc*csa_cI*csa_nIh MACs
+        #   W_w   : d -> nIh      -> T*d*csa_nIh MACs
+        csa_dc = p.get('csa_dc', 128)
+        csa_nh = p.get('csa_nh', H)
+        query_proj = 2 * T * (
+              d * csa_dc
+            + csa_dc * csa_c * csa_nh
+            + csa_dc * p['csa_cI'] * p['csa_nIh']
+            + d * p['csa_nIh']
+        )
         # Indexer: per-head similarities T * n_blocks * c_I * nIh, then
         # weighted sum across heads T * n_blocks * nIh.
         indexer = 2 * T * p['csa_cI'] * p['csa_nIh'] * n_blocks \
@@ -205,16 +230,23 @@ def prefill_flops(op: str, T: int, **kw):
         core = 2 * T * csa_topk * csa_c * H * 2
         # Sliding window: QK^T + softmax·V over the local window.
         sw = 2 * T * p['csa_sliding_window'] * csa_c * H * 2
-        return compress + indexer + core + sw
+        return compress + query_proj + indexer + core + sw
     if op == 'hca':
         n_blocks = max(1, T // hca_m2)
-        # Compression: TWO input projections (W_KV, W_Z), each T*d*c.
+        # KV-side compression: TWO input projections (W_KV, W_Z), each T*d*c.
         compress = 2 * T * d * hca_c * 2
+        # Query-side projections (W_DQ, W_UQ) — previously OMITTED,
+        # undercounting HCA's prefill FLOPs by ~11% at the default config.
+        #   W_DQ : d -> dc    -> T*d*hca_dc MACs
+        #   W_UQ : dc -> c*nh -> T*hca_dc*hca_c*H MACs
+        hca_dc = p.get('hca_dc', 128)
+        hca_nh = p.get('hca_nh', H)
+        query_proj = 2 * T * (d * hca_dc + hca_dc * hca_c * hca_nh)
         # Core dense attention over all n_blocks: QK^T (c) + softmax·V (c).
         core = 2 * T * n_blocks * hca_c * H * 2
         # Sliding window: QK^T + softmax·V over the local window.
         sw = 2 * T * p['hca_sliding_window'] * hca_c * H * 2
-        return compress + core + sw
+        return compress + query_proj + core + sw
     if op == 'hybrid_kch':
         # Mirror the configurable ratio in kv_cache_elements.
         n_kda = p.get('hybrid_n_kda', 3)

@@ -75,23 +75,27 @@ def naive_hca(
         # log space (never exp it, which could overflow to inf when the
         # learnable parameter grows during training and makes denom=inf,
         # p=0/inf=nan or inf/inf=nan). Mirrors the fix in ops_csa.py.
-        log_sink = sink_logits.view(1, nh, 1, 1)                   # [1, nh, 1, 1]
-        # Row max clamped >= 0 so we only ever shift scores down,
-        # keeping them aligned with log_sink (shifting up could
-        # inflate exp() and overflow). scores already carries -inf
-        # at causally-masked slots, so logsumexp/ exp naturally yield
-        # 0 there; fully-masked rows also collapse to p=0 (logaddexp
-        # (-inf, log_sink) = log_sink, exp(-inf - log_sink) = 0)
-        # — PROVIDED log_sink is finite. If log_sink is also -inf
-        # (e.g. sink_logits diverged to -inf during training), then
-        # (shifted - log_denom) = (-inf - (-inf)) = NaN. The
-        # all_masked guard below zeros out such rows so the downstream
-        # einsum produces 0 instead of NaN. Mirrors the guard in the
-        # ``else`` branch and in ``ops_csa.py::naive_csa``.
+        #
+        # The sink MUST be shifted by -row_max along with the scores:
+        #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
+        # Without the shift the sink is over-weighted by exp(M), a
+        # systematic ~13% bias in the default c=64 config. See the
+        # detailed comment in ops_csa.py::naive_csa for the algebra.
+        log_sink = sink_logits.view(1, nh, 1, 1).to(scores.dtype)  # [1, nh, 1, 1]
+        # scores already carries -inf at causally-masked slots, so
+        # logsumexp/exp naturally yield 0 there; fully-masked rows also
+        # collapse to p=0 (logaddexp(-inf, log_sink) = log_sink,
+        # exp(-inf - log_sink) = 0) — PROVIDED log_sink is finite. If
+        # log_sink is also -inf (e.g. sink_logits diverged to -inf
+        # during training), then (shifted - log_denom) = (-inf - (-inf))
+        # = NaN. The all_masked guard below zeros out such rows so the
+        # downstream einsum produces 0 instead of NaN. Mirrors the guard
+        # in the ``else`` branch and in ``ops_csa.py::naive_csa``.
         row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, nh, T, 1]
         shifted = scores - row_max                                  # [B, nh, T, n_blocks]
+        shifted_sink = log_sink - row_max                           # [B, nh, T, 1]
         lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(lse, log_sink)                 # [B, nh, T, 1]
+        log_denom = torch.logaddexp(lse, shifted_sink)              # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
         # NaN guard: zero out rows where every block is causally masked
         # (e.g. t < m2). Without this, a -inf log_sink would produce NaN
