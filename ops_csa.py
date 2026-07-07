@@ -118,6 +118,33 @@ def csa_lightning_indexer(
     """Top-k selection over compressed indexer keys (Eq. 13–17).
 
     Returns indices of shape ``[B, T, topk]`` (padded with -1).
+
+    .. note:: Gradient-flow limitation (known).
+        The returned ``idx`` tensor is an integer tensor produced by
+        ``torch.topk``. Integer indices do NOT propagate gradients, so
+        autograd cannot flow back from the loss through the selection to
+        the indexer parameters (``W_IUQ``, ``W_w``, ``W_KV_idx``,
+        ``W_Z_idx``, ``B_idx`` in ``CSAHybridLayer``). After a backward
+        pass these parameters have ``.grad is None`` and are silently
+        skipped by ``AdamW`` (including weight decay).
+
+        This matches the *structure* of DeepSeek-V4's lightning indexer
+        but omits the auxiliary training signal the paper uses (a
+        straight-through estimator or a contrastive auxiliary loss on
+        the selection logits). Adding such a signal would require either
+        (a) returning the soft logits alongside the hard indices and
+        adding an auxiliary loss in ``CSAHybridLayer.forward``, or
+        (b) replacing the hard top-k gather with a soft attention over
+        all compressed blocks (which would change the algorithm from
+        sparse to dense and defeat CSA's purpose).
+
+        In practice the indexer parameters remain at their (random)
+        initialization, and CSA effectively performs *random sparse
+        selection* over the (learned) compressed KV entries. The
+        compressed KV representations themselves ARE trained through
+        the differentiable compression + attention path, so CSA-based
+        models still learn useful representations — just without
+        learned retrieval.
     """
     if scale is None:
         scale = q_idx.shape[-1] ** -0.5

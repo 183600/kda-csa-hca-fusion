@@ -55,7 +55,14 @@ def fig_benchmark():
     ax.set_title('Operator latency vs. sequence length')
     ax.set_xscale('log', base=2)
     ax.set_yscale('log')
-    ax.legend(fontsize=8, loc='upper left')
+    # Only call legend() if at least one labeled artist was plotted. Without
+    # this guard, an empty / all-error benchmark result file triggers a noisy
+    # ``UserWarning: No artists with labels found to put in legend`` from
+    # matplotlib. Skipping the legend when there's nothing to show is cleaner
+    # than emitting the warning, and the figure remains structurally valid
+    # (just empty axes).
+    if ops:
+        ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, which='both', alpha=0.3)
     fig.tight_layout()
     fig.savefig('figures/fig_benchmark.pdf', dpi=150)
@@ -371,6 +378,17 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
         print(f'[fig_ablation] {skipped} ratio(s) had errors and are shown '
               f'as 0-height "ERR" bars for n_kv={n_kv}')
 
+    # Guard against the empty-records case (e.g. all records were filtered
+    # out before reaching this function, or the function was called with
+    # an empty list). Previously the next line
+    # ``max(max(a + c for a, c in zip(accs, acc_cis)) * 1.3, 0.2)`` would
+    # raise ``ValueError: max() iterable argument is empty`` because the
+    # inner generator produces nothing when accs is empty. Skip plotting
+    # entirely and return — there is nothing to draw.
+    if not ratios:
+        print(f'Skipping ablation figure for n_kv={n_kv} (no records to plot)')
+        return
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
     x = np.arange(len(ratios))
 
@@ -390,7 +408,15 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
                  label, ha='center', va='bottom', fontsize=9)
     ax1.legend(fontsize=8)
-    ax1.set_ylim(0, max(max(a + c for a, c in zip(accs, acc_cis)) * 1.3, 0.2))
+    # Compute the y-axis upper bound safely. ``accs`` may be all zeros
+    # (all-error case) — the previous ``max(max(...), 0.2)`` would still
+    # work in that case (the inner max returns 0.0, then 0.2 wins), but
+    # the empty-list case is now handled by the early return above.
+    # Use a defensive ``or 0.0`` so a None in accs (should not happen
+    # here, but cheap to guard) does not crash the multiplication.
+    acc_upper = max((float(a) + float(c) for a, c in zip(accs, acc_cis)),
+                    default=0.0) * 1.3
+    ax1.set_ylim(0, max(acc_upper, 0.2))
 
     # Latency.
     bar_colors2 = ['#C44E52' if e else '#55A868' for e in error_flags]
@@ -408,24 +434,33 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     fig.suptitle(f'Ablation: ratio trade-off (n_kv={n_kv}, multi-seed). '
                  '4:1:1 has 6 layers vs 3:1:1 has 5 — depth confound noted in paper.',
                  fontsize=9, y=1.02)
-    # ``constrained_layout`` is the modern replacement for ``tight_layout``
-    # and is incompatible with ``bbox_inches='tight'`` (the latter recomputes
-    # the bbox from scratch and silently undoes the former's padding). We pick
-    # ``tight_layout`` + ``bbox_inches='tight'`` here for backwards compat
-    # with the existing figure layout, but only call ONE of them — the prior
-    # code called both, which double-applied padding and could clip axis
-    # labels. ``constrained_layout=True`` would be even better but would
-    # require restructuring the subplots call.
+    # ``tight_layout`` constrains the AXES to the rect region so the suptitle
+    # (positioned at y=1.02, just above the figure's top edge) does not
+    # overlap any axis labels. ``rect=[0, 0, 1, 0.94]`` reserves the top 6%
+    # of the figure for the suptitle; without it, tight_layout would fill
+    # the entire figure area and the suptitle would overlap the axis titles.
     #
-    # Use ``rect`` to reserve space at the top for the suptitle (y=1.02).
-    # Without this, ``tight_layout()`` fills the entire figure area and the
-    # suptitle gets clipped at the top edge of the saved PDF/PNG.
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150)
-    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150)
+    # ``bbox_inches='tight'`` on savefig expands the saved image's bounding
+    # box to include ALL artists, even those positioned OUTSIDE the figure
+    # area (such as a suptitle at y=1.02). Without it, the suptitle is
+    # silently clipped at the top edge of the saved PDF/PNG — the previous
+    # code omitted bbox_inches='tight' and the suptitle was indeed clipped
+    # (the top half of the title text was cut off in the saved image).
+    #
+    # We use BOTH tight_layout (for in-figure axis spacing) AND
+    # bbox_inches='tight' (for the saved image's bounding box). They operate
+    # at different levels — tight_layout rearranges axes within the figure;
+    # bbox_inches='tight' expands the figure's saved bbox — so they do not
+    # conflict. (The earlier comment claiming they were mutually exclusive
+    # was wrong and led to the clipping bug.)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150,
+                bbox_inches='tight')
+    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150,
+                bbox_inches='tight')
     if write_legacy_name:
-        fig.savefig('figures/fig_ablation.pdf', dpi=150)
-        fig.savefig('figures/fig_ablation.png', dpi=150)
+        fig.savefig('figures/fig_ablation.pdf', dpi=150, bbox_inches='tight')
+        fig.savefig('figures/fig_ablation.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
     msg = f'Saved figures/fig_ablation_nkv{n_kv}.pdf'
     if write_legacy_name:

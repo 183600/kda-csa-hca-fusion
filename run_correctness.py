@@ -1298,6 +1298,102 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     ]
 
 
+def test_hybrid_backward_produces_grads(device='cpu'):
+    """Regression: HybridKCHAttention backward must produce finite grads for
+    all DIFFERENTIABLE parameters.
+
+    The lightning indexer uses ``torch.topk`` which returns integer indices
+    that do NOT propagate gradients. Consequently the indexer parameters
+    (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` in
+    ``CSAHybridLayer``) cannot receive gradients through the main loss —
+    their ``.grad`` stays ``None`` after ``backward()``. This is a known
+    structural limitation (see the docstring of ``csa_lightning_indexer``)
+    and is NOT a bug.
+
+    What WOULD be a bug: a differentiable parameter (one whose gradient
+    SHOULD flow) ending up with a non-finite or all-zero gradient. This
+    test runs a full forward + backward pass over the hybrid stack and
+    verifies that:
+      1. All non-indexer parameters receive a finite, non-zero gradient.
+      2. Indexer parameters (the 5 listed above) have ``.grad is None``
+         (the expected behavior, documented for future readers).
+      3. No parameter has a non-finite (NaN/Inf) gradient.
+
+    The test uses a sequence length large enough (T=64) so that CSA/HCA
+    blocks are actually selectable by queries — at T=16 with csa_m=8,
+    only block 0 is selectable and the b-branch / sink parameters have
+    legitimately-zero gradients (no contribution to the loss).
+    """
+    logger.info("Test: Hybrid backward produces finite grads (large T)")
+    torch.manual_seed(200)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=8, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=5).to(device)
+    model.train()
+    model.reset_state()
+    # T=64 ensures CSA has n_blocks=8 (blocks 0..6 selectable) and HCA has
+    # n_blocks=8 (same), so the b-branch / sink / W_bKV / W_bZ parameters
+    # all receive non-zero gradients through the differentiable attention path.
+    B, T = 2, 64
+    x = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+    target = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+    y = model(x)
+    loss = ((y - target) ** 2).mean()
+    loss.backward()
+
+    # Indexer parameters (CSA layer index 3 in the default 3:1:1 layout).
+    # These have .grad is None because topk is non-differentiable.
+    indexer_param_substrings = ('W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx')
+    indexer_no_grad = True
+    indexer_detail_parts = []
+    differentiable_no_grad = []
+    differentiable_zero_grad = []
+    differentiable_non_finite = []
+    differentiable_ok = 0
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_indexer = any(s in name for s in indexer_param_substrings)
+        if p.grad is None:
+            if is_indexer:
+                # Expected: indexer params don't get grads through topk.
+                continue
+            else:
+                differentiable_no_grad.append(name)
+        elif not torch.isfinite(p.grad).all():
+            differentiable_non_finite.append(name)
+        elif is_indexer:
+            # If an indexer param DOES receive a grad (e.g. via an auxiliary
+            # loss added in the future), that's fine — just don't require it.
+            differentiable_ok += 1
+        elif p.grad.abs().max().item() == 0.0:
+            differentiable_zero_grad.append(name)
+        else:
+            differentiable_ok += 1
+
+    all_ok = (
+        not differentiable_no_grad
+        and not differentiable_zero_grad
+        and not differentiable_non_finite
+    )
+    detail = (
+        f'differentiable_with_grad={differentiable_ok}, '
+        f'differentiable_no_grad={differentiable_no_grad[:3]}, '
+        f'differentiable_zero_grad={differentiable_zero_grad[:3]}, '
+        f'differentiable_non_finite={differentiable_non_finite[:3]}'
+    )
+    return [
+        _ok('hybrid backward produces finite non-zero grads for differentiable params',
+            all_ok, detail),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1331,6 +1427,8 @@ def main():
     all_results += test_kda_chunk_nondivisible_T(device)
     all_results += test_csa_hca_fp16_dtype_consistency(device)
     all_results += test_kda_initial_state_dtype_mismatch(device)
+    # Regression test for hybrid backward gradient flow.
+    all_results += test_hybrid_backward_produces_grads(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

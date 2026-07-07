@@ -268,5 +268,10 @@
     "name": "KDA accepts fp64 initial_state with fp32 inputs",
     "status": "PASS",
     "detail": ""
+  },
+  {
+    "name": "hybrid backward produces finite non-zero grads for differentiable params",
+    "status": "PASS",
+    "detail": "differentiable_with_grad=54, differentiable_no_grad=[], differentiable_zero_grad=[], differentiable_non_finite=[]"
   }
 ]
