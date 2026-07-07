@@ -292,14 +292,13 @@ class CSAAttn(nn.Module):
         self.o = nn.Linear(c * nh, d_model, bias=False)
 
     def forward(self, x):
-        T = x.shape[1]
-        pad = (-T) % self.m
-        if pad:
-            # RIGHT-pad: real tokens keep original positions; only the last
-            # partial block contains padding zeros, and no real token
-            # attends to it (causal block mask). Left-padding corrupted
-            # block 0's compressed KV and silently changed real-token outputs.
-            x = F.pad(x, (0, 0, 0, pad))
+        # ``naive_csa`` handles non-divisible T via internal right-padding
+        # and trims its output back to the original T, so we no longer need
+        # to pad/trim here. The external padding was originally added to fix
+        # a LEFT-padding bug, but that fix now lives inside ``naive_csa``
+        # itself (see ``test_csa_hca_non_divisible_T``). Removing the
+        # redundant padding keeps this wrapper thin and avoids doing the
+        # pad/trim twice.
         o = naive_csa(
             x, self.W_aKV.weight.T, self.W_bKV.weight.T,
             self.W_aZ.weight.T, self.W_bZ.weight.T, self.Ba, self.Bb,
@@ -310,9 +309,6 @@ class CSAAttn(nn.Module):
             c=self.c, c_I=self.cI, dc=self.dc,
             sliding_window=4, sink_logits=self.sink,
         )
-        if pad:
-            # Trim the padded SUFFIX off the SEQUENCE axis (dim=1).
-            o = o[:, :T]
         return self.o(o)
 
 
@@ -331,21 +327,14 @@ class HCAAttn(nn.Module):
         self.o = nn.Linear(c * nh, d_model, bias=False)
 
     def forward(self, x):
-        T = x.shape[1]
-        pad = (-T) % self.m2
-        if pad:
-            # RIGHT-pad: real tokens keep original positions; only the last
-            # partial block contains padding zeros, and no real token
-            # attends to it (causal block mask). Left-padding corrupted
-            # block 0's compressed KV and silently changed real-token outputs.
-            x = F.pad(x, (0, 0, 0, pad))
+        # ``naive_hca`` handles non-divisible T via internal right-padding
+        # and trims its output back to the original T, so we no longer need
+        # to pad/trim here. See the comment in ``CSAAttn.forward`` for the
+        # full rationale.
         o = naive_hca(x, self.W_KV.weight.T, self.W_Z.weight.T, self.B_pos,
                       self.W_DQ.weight.T, self.W_UQ.weight.T,
                       m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                       sliding_window=4, sink_logits=self.sink)
-        if pad:
-            # Trim the padded SUFFIX off the SEQUENCE axis (dim=1).
-            o = o[:, :T]
         return self.o(o)
 
 
@@ -545,7 +534,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     }
 
 
-def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
+def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=500,
                      device='cpu', **kw):
     """Train ``op_name`` over ``n_seeds`` seeds.
 

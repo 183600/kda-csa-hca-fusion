@@ -279,7 +279,12 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
             steps = per_seed[0].get('steps', 100)
     ax.set_title(f'Multi-Query Associative Recall (n_kv={n_kv}, '
                  f'{n_seeds} seeds, {steps} steps)')
-    ax.set_ylim(0, max(max(m + c for m, c in zip(means, cis)) * 1.3, 0.35))
+    # Defensive ``default=0.0`` on the inner ``max`` so an empty ``means``
+    # list (e.g. all records were error rows but somehow bypassed the early
+    # return) yields 0.0 instead of raising ``ValueError: max() iterable
+    # argument is empty``. Mirrors the fix in ``_plot_ablation_group``.
+    acc_upper = max((m + c for m, c in zip(means, cis)), default=0.0) * 1.3
+    ax.set_ylim(0, max(acc_upper, 0.35))
     for bar, m, c in zip(bars, means, cis):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + c + 0.005,
                 f'{m:.3f}', ha='center', va='bottom', fontsize=10)

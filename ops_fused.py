@@ -280,48 +280,26 @@ class HybridKCHAttention(nn.Module):
         for layer, norm, kind in zip(self.layers, self.norms, self.layout):
             residual = x
             x = norm(x)
-            # CSA/HCA need T divisible by their compression factor; pad & trim.
-            T = x.shape[1]
-            if kind == 'csa':
-                pad = (-T) % self.cfg.csa_m
-            elif kind == 'hca':
-                pad = (-T) % self.cfg.hca_m2
-            else:
-                pad = 0
             if kind == 'kda':
-                if pad:
-                    # KDA is stateful and sequence-continuous; left-padding
-                    # would desync the recurrent state, so we reject it.
-                    raise RuntimeError(
-                        "KDA layer received a sequence that would require "
-                        "padding; padding breaks recurrent state alignment."
-                    )
-                # Thread THIS layer's own state; do not touch the others.
+                # KDA is stateful and sequence-continuous. It has no
+                # compression factor, so T never needs padding here (padding
+                # would desync the recurrent state anyway). Thread THIS
+                # layer's own state; do not touch the others.
                 o, new_state = layer(x, states[kda_idx])
                 states[kda_idx] = new_state
                 kda_idx += 1
             else:
-                # Stateless CSA/HCA: do NOT pass `state` in, do NOT let the
-                # returned None overwrite it.
-                if pad:
-                    # RIGHT-pad (append zeros at the end) so real tokens keep
-                    # their original positions and block alignment. The padded
-                    # tokens land in the LAST partial block; no real token
-                    # attends to it (real tokens only attend to PRECEDING
-                    # blocks via the causal block mask), so real-token outputs
-                    # are bit-identical to the no-padding case.
-                    #
-                    # LEFT-padding (the previous approach) shifted real tokens
-                    # to positions [pad, pad+T), corrupting block 0's
-                    # compressed KV (mix of padding zeros and real tokens).
-                    # Every subsequent block's real queries then attended to
-                    # that corrupted block 0, silently producing wrong outputs.
-                    xp = F.pad(x, (0, 0, 0, pad))
-                    o, _ = layer(xp, None)
-                    # Trim the padded SUFFIX off the SEQUENCE axis (dim=1).
-                    o = o[:, :T]
-                else:
-                    o, _ = layer(x, None)
+                # Stateless CSA/HCA. ``naive_csa`` / ``naive_hca`` handle
+                # non-divisible T via internal right-padding and trim their
+                # output back to the original T (see
+                # ``test_csa_hca_non_divisible_T``), so we no longer need the
+                # external pad/trim that used to live here. The external
+                # padding was originally added to fix a LEFT-padding bug; that
+                # fix now lives inside the operators themselves, making the
+                # wrapper-level pad/trim redundant. Do NOT pass ``state`` in,
+                # and do NOT let the returned ``None`` overwrite the KDA
+                # states list.
+                o, _ = layer(x, None)
             x = residual + o
         # Restack the per-layer states for persistence. All KDA layers share
         # the same config (HV, K, V), so every entry has the same shape and

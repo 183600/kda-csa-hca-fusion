@@ -1262,9 +1262,10 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
                       sliding_window=0, sink_logits=sink2)
 
     # Correct reference for HCA dense attention with sink.
+    # ``csa_compress_kv`` is already imported at the top of this function
+    # (line ~1211); reuse it instead of re-importing under an alias.
     C2 = H2 @ W_KV2; Z2 = H2 @ W_Z2
-    from ops_csa import csa_compress_kv as _compress
-    C_comp2 = _compress(C2, Z2, B_pos2, m2)
+    C_comp2 = csa_compress_kv(C2, Z2, B_pos2, m2)
     n_blocks2 = T2 // m2
     C_comp_n2 = F.normalize(C_comp2, dim=-1)
     cQ2 = H2 @ W_DQ2
