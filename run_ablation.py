@@ -45,6 +45,16 @@ from run_quality import make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, 
 
 logger = logging.getLogger(__name__)
 
+# Vocab and seq_len are task hyperparameters. Lifted to a single module-level
+# constant so the chance baseline (1/VOCAB) is computed in exactly ONE place
+# and stays consistent with the vocab passed to make_mqar_batch / nn.Embedding.
+# The previous code hardcoded ``1/16`` in three independent sites (the chance
+# baseline in eval_layout_multi_seed, the summary-table chance row, and the
+# vocab arg to make_mqar_batch / nn.Embedding), which would silently lie if
+# any one site were ever changed.
+VOCAB = 16
+SEQ_LEN = 16
+
 
 def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     n_kda, n_csa, n_hca = ratio
@@ -68,36 +78,55 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
 
 def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
                 n_batches=4, batch=64):
-    model.eval()
-    head.eval()
-    embed.eval()  # nn.Embedding has no dropout/batchnorm so this is a no-op,
-                  # but we set it for symmetry with model/head so future
-                  # additions (e.g. embedding dropout) do not silently stay
-                  # in train mode during evaluation. Mirrors run_quality.py.
-    correct, total = 0, 0
-    losses = []
-    # Fixed seed for the eval generator so every ratio sees the SAME eval
-    # batches (apples-to-apples comparison at eval time too, not just train).
-    # Different ratios consume different numbers of RNG draws during model
-    # init (different parameter counts), so using the global RNG would desync
-    # eval batches across ratios. Mirrors run_quality.py::_eval_model.
-    eval_gen = torch.Generator(device=device)
-    eval_gen.manual_seed(12345)
-    with torch.no_grad():
-        for _ in range(n_batches):
-            x_emb, target, cue_pos = make_mqar_batch(
-                batch, seq_len, n_kv, 16, embed, device, generator=eval_gen)
-            model.reset_state()  # independent eval batch
-            h = model(x_emb)
-            logits = head(h, cue_pos)
-            correct += (logits.argmax(-1) == target).sum().item()
-            total += target.numel()
-            losses.append(F.cross_entropy(logits, target).item())
-    return correct / total, sum(losses) / len(losses)
+    # Save the prior train/eval state so we can restore it after eval —
+    # a latent footgun if a caller ever invokes _eval_model mid-training
+    # (e.g. for periodic validation). Mirrors the fix in run_quality.py.
+    was_training = {m: m.training for m in (model, head, embed)}
+    try:
+        model.eval()
+        head.eval()
+        embed.eval()  # nn.Embedding has no dropout/batchnorm so this is a no-op,
+                      # but we set it for symmetry with model/head so future
+                      # additions (e.g. embedding dropout) do not silently stay
+                      # in train mode during evaluation. Mirrors run_quality.py.
+        correct, total = 0, 0
+        losses = []
+        # Fixed seed for the eval generator so every ratio sees the SAME eval
+        # batches (apples-to-apples comparison at eval time too, not just train).
+        # Different ratios consume different numbers of RNG draws during model
+        # init (different parameter counts), so using the global RNG would desync
+        # eval batches across ratios. Mirrors run_quality.py::_eval_model.
+        eval_gen = torch.Generator(device=device)
+        eval_gen.manual_seed(12345)
+        with torch.no_grad():
+            for _ in range(n_batches):
+                x_emb, target, cue_pos = make_mqar_batch(
+                    batch, seq_len, n_kv, VOCAB, embed, device, generator=eval_gen)
+                model.reset_state()  # independent eval batch
+                h = model(x_emb)
+                logits = head(h, cue_pos)
+                correct += (logits.argmax(-1) == target).sum().item()
+                total += target.numel()
+                losses.append(F.cross_entropy(logits, target).item())
+        # Guard against n_batches=0 (or batch=0): without this the function
+        # raises ZeroDivisionError on ``correct / total`` and
+        # ``sum([]) / len([])``. Returns 0.0 for both metrics so the caller
+        # gets a finite (if meaningless) value rather than a crash. Mirrors
+        # run_quality.py::_eval_model.
+        if total == 0 or not losses:
+            return 0.0, 0.0
+        return correct / total, sum(losses) / len(losses)
+    finally:
+        for m, was in was_training.items():
+            m.train(was)
 
 
 def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=42,
                 device='cpu', eval_batches=4, eval_batch=64, train_batch=None):
+    # Coerce string device -> torch.device for notebook callers. Mirrors
+    # run_quality.py::train_one / train_multi_seed.
+    if isinstance(device, str):
+        device = torch.device(device)
     torch.manual_seed(seed)
     # Create embed and head BEFORE the ratio-specific model so their initial
     # weights are IDENTICAL across ratios for a given seed. Different ratios
@@ -106,8 +135,8 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
     # embed/head init — a silent confound in the multi-seed CI. (The previous
     # order was model -> head -> embed, which left both embed and head
     # ratio-dependent.) Mirrors the fix in run_quality.py::train_one.
-    embed = nn.Embedding(16, d_model).to(device)
-    head = MQARHead(d_model, 16).to(device)
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
     cfg = _make_cfg(d_model, ratio)
     total = sum(ratio)
     model = HybridKCHAttention(cfg, total_layers=total).to(device)
@@ -145,13 +174,23 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
     losses = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
-            train_batch, seq_len, n_kv, 16, embed, device, generator=batch_gen)
+            train_batch, seq_len, n_kv, VOCAB, embed, device, generator=batch_gen)
         # Each MQAR batch is independent — clear KDA recurrent state so
         # samples from the previous batch don't leak in.
         model.reset_state()
         h = model(x_emb)
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
+        # NaN/Inf guard: mirrors run_quality.py::train_one. A divergent step
+        # would otherwise propagate NaN into all parameters via backward +
+        # opt.step, and the final eval would still return a finite (bogus)
+        # accuracy, silently corrupting the aggregate mean/CI. Raise here so
+        # the per-seed try/except in eval_layout_multi_seed catches it.
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"non-finite loss at step {step}: {loss.item()} "
+                f"(ratio={ratio}, seed={seed}); aborting this seed to "
+                f"prevent silent NaN propagation into aggregate stats")
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -204,6 +243,10 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
 
 
 def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
+    # Coerce string device -> torch.device for notebook callers. Mirrors
+    # run_quality.py::train_multi_seed.
+    if isinstance(device, str):
+        device = torch.device(device)
     seeds = [42 + i for i in range(n_seeds)]
     per_seed = []
     for s in seeds:
@@ -232,7 +275,19 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
             torch.cuda.empty_cache()
 
     # Filter out failed seeds before computing aggregate stats.
-    ok_per_seed = [r for r in per_seed if 'error' not in r]
+    # A seed that diverged to NaN loss is caught by eval_layout's NaN guard
+    # and recorded with an 'error' key — but defensively reject any seed
+    # whose final_acc/final_loss is None or non-finite, mirroring
+    # run_quality.py::train_multi_seed. NaN propagates through sum()/std()
+    # and would silently corrupt the aggregate mean/CI otherwise.
+    ok_per_seed = [
+        r for r in per_seed
+        if 'error' not in r
+        and r.get('final_acc') is not None
+        and math.isfinite(r['final_acc'])
+        and r.get('final_loss') is not None
+        and math.isfinite(r['final_loss'])
+    ]
     if not ok_per_seed:
         # All seeds failed: propagate the first error so the outer per-ratio
         # try/except can record a stub result.
@@ -254,10 +309,10 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         ci_acc = 0.0
 
     # One-sample t-test vs chance: tests whether mean_acc differs from the
-    # chance level (1/16 here). The t-statistic is only defined when n > 1
+    # chance level (1/VOCAB here). The t-statistic is only defined when n > 1
     # and the sample standard deviation is strictly positive; otherwise we
     # return None (the test is not computable, not "infinitely significant").
-    chance = 1.0 / 16
+    chance = 1.0 / VOCAB
     if n > 1 and std_acc > 0:
         t_stat = (mean_acc - chance) / (std_acc / math.sqrt(n))
     else:
@@ -270,6 +325,7 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         'n_seeds_ok': n,
         'n_seeds_failed': len(per_seed) - n,
         'n_seeds': len(per_seed),
+        'n_seeds_total': len(per_seed),
         'seeds': seeds,
         'per_seed': per_seed,
         'mean_acc': mean_acc,
@@ -294,8 +350,55 @@ def main():
     n_seeds = int(os.environ.get('ABL_SEEDS', '5'))
     steps = int(os.environ.get('ABL_STEPS', '100'))
     n_kv_list = _parse_nkv_list('ABL_NKV', '1')
+    # Pre-validate n_kv against VOCAB and SEQ_LEN so the user gets a clear
+    # error message instead of an opaque AssertionError from deep inside
+    # ``make_mqar_batch`` during the first training step (after spending
+    # time on model init for every ratio). Mirrors run_quality.py::main.
+    for n_kv in n_kv_list:
+        if 2 * n_kv > VOCAB:
+            raise ValueError(
+                f"ABL_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} exceeds "
+                f"VOCAB={VOCAB}; reduce n_kv or increase VOCAB.")
+        if 2 * n_kv >= SEQ_LEN:
+            raise ValueError(
+                f"ABL_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} must be "
+                f"< SEQ_LEN={SEQ_LEN} (need room for the cue token at the end).")
     logger.info(f'  n_seeds={n_seeds}, steps={steps}, n_kv={n_kv_list}')
     ratios = [(3, 1, 1), (4, 1, 1), (2, 1, 1), (1, 1, 1), (3, 0, 1), (3, 1, 0), (0, 1, 1)]
+    # Bonferroni correction: we run len(ratios) * len(n_kv_list) one-sample
+    # t-tests vs chance at alpha=0.05 each. Without correction the
+    # family-wise false-positive rate inflates to ~1-(1-0.05)^(n_tests)
+    # (~30% for 7 tests, ~66% for 21). We compute the corrected alpha and
+    # the corresponding t-critical value, then flag each result as
+    # significant_bonferroni iff |t_stat| exceeds the corrected critical
+    # value (with n-1 dof). The raw t_stat and uncorrected interpretation
+    # are preserved in the JSON for transparency.
+    n_tests = len(ratios) * len(n_kv_list)
+    alpha_corrected = 0.05 / n_tests
+    # Bonferroni-corrected two-sided critical value: use the same _t_crit_975
+    # helper but at the corrected alpha. _t_crit_975 returns the two-sided
+    # 95% (alpha=0.05) critical value; for an arbitrary alpha we want the
+    # two-sided (1-alpha) critical value, i.e. the (1-alpha/2) quantile.
+    # scipy is available (the helper falls back to a table for n<=30 and
+    # 1.96 for n>30); for the small n (5) used here the corrected alpha is
+    # ~0.007, far below what the table covers, so we fall back to scipy if
+    # available, else use a conservative normal-approximation upper bound.
+    try:
+        from scipy.stats import t as _t_dist
+        def _bonferroni_crit(n, alpha=alpha_corrected):
+            if n < 2:
+                return float('inf')
+            return float(_t_dist.ppf(1 - alpha / 2, n - 1))
+        bonferroni_available = True
+    except ImportError:
+        # Conservatively use the uncorrected critical value (smaller), so
+        # we under-report significance rather than over-report it.
+        def _bonferroni_crit(n, alpha=alpha_corrected):
+            return _t_crit_975(n)
+        bonferroni_available = False
+    logger.info(f'  {n_tests} one-sample t-tests vs chance; '
+                f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
+                f'(scipy={bonferroni_available})')
 
     all_results = []
     for n_kv in n_kv_list:
@@ -314,19 +417,40 @@ def main():
             try:
                 res = eval_layout_multi_seed(r, n_seeds=n_seeds, steps=steps,
                                              device=device, n_kv=n_kv)
+                # Bonferroni significance flag: |t_stat| exceeds the corrected
+                # critical value for this n. Stored alongside the raw t_stat so
+                # downstream consumers can show both the uncorrected and the
+                # corrected interpretation.
+                t_stat = res.get('t_stat_vs_chance')
+                n_ok = res.get('n_seeds_ok', 0)
+                if t_stat is not None and n_ok >= 2:
+                    crit = _bonferroni_crit(n_ok)
+                    res['t_crit_bonferroni'] = crit
+                    res['significant_bonferroni'] = abs(t_stat) > crit
+                else:
+                    res['t_crit_bonferroni'] = None
+                    res['significant_bonferroni'] = False
                 all_results.append(res)
                 logger.info(f"  layout={res['layout']}  n_params={res['n_params']}  n_layers={res['n_layers']}")
                 logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {res['ci95_acc']:.4f} "
-                            f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)})")
+                            f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)}, "
+                            f"sig_bonferroni={res['significant_bonferroni']})")
                 logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")
             except Exception as e:
                 import traceback as _tb
                 logger.error(f"  ratio {r[0]}:{r[1]}:{r[2]} FAILED: {e}")
                 _tb.print_exc()
+                # Error stub MUST include every key that success rows carry
+                # so downstream JSON consumers do not KeyError on error rows.
+                # Mirrors the fix in run_quality.py::main.
                 all_results.append({
                     'ratio': f'{r[0]}:{r[1]}:{r[2]}',
                     'n_kv': n_kv,
                     'n_seeds': n_seeds,
+                    'n_seeds_ok': 0,
+                    'n_seeds_failed': n_seeds,
+                    'n_seeds_total': n_seeds,
+                    'seeds': [],
                     'error': str(e),
                     'mean_acc': None,
                     'ci95_acc': None,
@@ -334,6 +458,12 @@ def main():
                     'mean_fwd_ms': None,
                     'n_params': None,
                     'n_layers': sum(r),
+                    'chance_acc': 1.0 / VOCAB,
+                    't_stat_vs_chance': None,
+                    't_crit_bonferroni': None,
+                    'significant_bonferroni': False,
+                    'mean_train_time_s': None,
+                    'per_seed': [],
                 })
 
     # Summary table (grouped by n_kv)
@@ -355,7 +485,8 @@ def main():
         print(f"{r['n_kv']:>4} | {r['ratio']:>8} | {layout_str:>22} | {r['n_layers']:>6} | "
               f"{n_params:>8} | {mean_acc:>10.4f} | {ci95:>10.4f} | "
               f"{_fmt_tstat(r.get('t_stat_vs_chance'), width=12, prec=2)} | {fwd:>8.2f}")
-    print(f"{'':>4} | {'chance':>8} | {'':>22} | {'':>6} | {'':>8} | {1/16:>10.4f} |")
+    print(f"{'':>4} | {'chance':>8} | {'':>22} | {'':>6} | {'':>8} | "
+          f"{1.0/VOCAB:>10.4f} | {'':>10} | {'':>12} | {'':>8}")
 
     # Honest note about depth confound
     logger.info('\nNote on the 4:1:1 anomaly:')
@@ -365,8 +496,27 @@ def main():
     logger.info('  See the per-seed trajectories in the JSON for convergence evidence.')
 
     os.makedirs('results', exist_ok=True)
+    # Write strict JSON (allow_nan=False): if a divergent seed slipped past
+    # the NaN guard and the per_seed filter, Python's default json.dump
+    # would emit literal ``NaN``/``Infinity`` tokens, which are INVALID JSON
+    # per RFC 8259 and cause strict parsers (js, jq, pandas with
+    # ``orient='records'``) to reject the whole file. With allow_nan=False
+    # the call raises ValueError instead — surfacing the corruption loudly
+    # rather than shipping a broken file. Mirrors run_quality.py::main.
     with open('results/exp5_ablation.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
+        try:
+            json.dump(all_results, f, indent=2, allow_nan=False)
+        except ValueError as e:
+            logger.error(f'non-finite value in results; sanitizing to null: {e}')
+            def _sanitize(o):
+                if isinstance(o, float) and not math.isfinite(o):
+                    return None
+                if isinstance(o, dict):
+                    return {k: _sanitize(v) for k, v in o.items()}
+                if isinstance(o, list):
+                    return [_sanitize(x) for x in o]
+                return o
+            json.dump(_sanitize(all_results), f, indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp5_ablation.json')
 
 

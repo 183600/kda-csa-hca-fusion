@@ -406,7 +406,14 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
                         rotation=0, fontsize=8)
     ax1.set_ylabel('MQAR accuracy (mean +/- CI95)')
     ax1.set_title('Accuracy vs. KDA:CSA:HCA ratio')
-    ax1.axhline(1/16, color='gray', linestyle='--', alpha=0.5, label='chance (1/16)')
+    # Use the chance_acc carried by the records (defaulting to 1/16) so the
+    # dashed reference line stays correct if the task vocab changes. The
+    # previous code hardcoded ``1/16`` here, which would silently lie if the
+    # upstream experiment ever changed VOCAB. Mirrors the fix in
+    # run_ablation.py (chance = 1.0 / VOCAB).
+    chance_acc = records[0].get('chance_acc', 1/16) if records else 1/16
+    ax1.axhline(chance_acc, color='gray', linestyle='--', alpha=0.5,
+                label=f'chance ({chance_acc:.4f})')
     for bar, acc, is_err in zip(bars1, accs, error_flags):
         label = 'ERR' if is_err else f'{acc:.3f}'
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
@@ -434,6 +441,15 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
         label = 'ERR' if is_err else f'{fwd:.1f}'
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                  label, ha='center', va='bottom', fontsize=9)
+    # Explicit y-axis upper bound so the per-bar text labels (placed at
+    # ``bar.get_height() + 0.5``) don't get clipped at the top of the axes.
+    # Without this, matplotlib auto-scales to ~max(fwds)*1.05, and the 0.5-ms
+    # offset pushes the tallest label above the axes box (invisible in the
+    # saved PDF/PNG). Use a relative offset for the upper bound so it scales
+    # with the data (a fixed ``+0.5`` would be too tight at large latencies
+    # and too loose at small ones).
+    fwd_max = max((float(f) for f in fwds), default=0.0)
+    ax2.set_ylim(0, max(fwd_max * 1.25, 1.0))
 
     # Place the suptitle and use ``subplots_adjust`` (not ``tight_layout``) to
     # manually control margins. ``tight_layout`` emits
@@ -446,8 +462,28 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     # are tuned to leave room for: top=0.91 (suptitle), bottom=0.18
     # (two-line x-tick labels), left=0.08 (y-axis label), right=0.97,
     # wspace=0.3 (gap between the two subplots).
+    # Compute the depth-confound note dynamically from the records rather
+    # than hardcoding "4:1:1 has 6 layers vs 3:1:1 has 5". The hardcoded
+    # text was correct only for the default ablation set
+    # [(3,1,1),(4,1,1),(2,1,1),(1,1,1),(3,0,1),(3,1,0),(0,1,1)]; a user
+    # running a custom subset (e.g. only (2,1,1) vs (1,1,1)) would get a
+    # misleading suptitle. We identify the max-depth and min-depth ratios
+    # and only mention the confound when they actually differ.
+    if n_layers:
+        max_l = max(n_layers)
+        min_l = min(n_layers)
+        if max_l != min_l:
+            # Find the first ratio at max depth and the first at min depth.
+            max_r = ratios[n_layers.index(max_l)]
+            min_r = ratios[n_layers.index(min_l)]
+            depth_note = (f'{max_r} has {max_l}L vs {min_r} has {min_l}L — '
+                          'depth confound noted in paper.')
+        else:
+            depth_note = 'all ratios have equal depth.'
+    else:
+        depth_note = 'depth confound noted in paper.'
     fig.suptitle(f'Ablation: ratio trade-off (n_kv={n_kv}, multi-seed). '
-                 '4:1:1 has 6 layers vs 3:1:1 has 5 — depth confound noted in paper.',
+                 f'{depth_note}',
                  fontsize=9, y=0.98)
     fig.subplots_adjust(top=0.91, bottom=0.18, left=0.08, right=0.97, wspace=0.3)
     fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150,

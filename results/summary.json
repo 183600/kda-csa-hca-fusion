@@ -4,45 +4,45 @@
     {
       "name": "exp1_correctness",
       "status": "ok",
-      "time_s": 2.5500805377960205
+      "time_s": 2.5392839908599854
     },
     {
       "name": "exp3_kv_cache",
       "status": "ok",
-      "time_s": 0.0018222332000732422
+      "time_s": 0.0018093585968017578
     },
     {
       "name": "method_analysis",
       "status": "ok",
-      "time_s": 0.005037546157836914
+      "time_s": 0.005185842514038086
     },
     {
       "name": "exp2_benchmark",
       "status": "ok",
-      "time_s": 5.531793594360352
+      "time_s": 5.337783336639404
     },
     {
       "name": "exp4_mqar",
       "status": "ok",
-      "time_s": 8.216355085372925
+      "time_s": 8.097126722335815
     },
     {
       "name": "exp5_ablation",
       "status": "ok",
-      "time_s": 23.297926664352417
+      "time_s": 23.1963529586792
     },
     {
       "name": "exp6_decoding",
       "status": "ok",
-      "time_s": 1.804785966873169
+      "time_s": 1.8906512260437012
     },
     {
       "name": "make_figures",
       "status": "ok",
-      "time_s": 3.0172312259674072
+      "time_s": 2.9768192768096924
     }
   ],
   "n_ok": 8,
   "n_fail": 0,
-  "total_time_s": 44.4250328540802
+  "total_time_s": 44.04501271247864
 }

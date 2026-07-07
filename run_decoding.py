@@ -86,8 +86,21 @@ class SoftmaxAttnDecoding(nn.Module):
             self._cache_k = k
             self._cache_v = v
         else:
-            self._cache_k = torch.cat([self._cache_k, k], dim=1)
-            self._cache_v = torch.cat([self._cache_v, v], dim=1)
+            # Cast incoming k/v to the cache's dtype before concat. The
+            # cache is set on the FIRST forward call (prefill) and retains
+            # whatever dtype prefill used. If a later call passes a
+            # different dtype (e.g. fp16 prefill then fp32 decode, or
+            # mixed-precision training where weights are fp32 but inputs
+            # are fp16), torch.cat([fp16, fp32]) raises
+            # ``RuntimeError: Expected object of scalar type Half but got
+            # scalar type Float``. Casting to the cache dtype makes the
+            # contract explicit: the cache dtype is fixed by the first
+            # call, and all subsequent calls are coerced to match. This
+            # mirrors the dtype-coercion pattern in
+            # ops_kda.py::naive_recurrent_kda (initial_state.to(compute_dtype)).
+            cache_dtype = self._cache_k.dtype
+            self._cache_k = torch.cat([self._cache_k, k.to(cache_dtype)], dim=1)
+            self._cache_v = torch.cat([self._cache_v, v.to(cache_dtype)], dim=1)
         T_full = self._cache_k.shape[1]
         s = torch.einsum('bthk,bshk->bhts', q, self._cache_k) * self.scale
         # Causal mask: query at relative position t in the current chunk is at

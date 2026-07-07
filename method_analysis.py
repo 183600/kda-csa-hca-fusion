@@ -66,20 +66,33 @@ Let n_kda, n_csa, n_hca be the allocation with n_kda+n_csa+n_hca = B.
 
 Claim: (n_kda, n_csa, n_hca) = (3, 1, 1) is Pareto-optimal for B=5.
 
-Proof sketch (by enumeration of the feasible frontier):
+Proof sketch (by enumeration of the feasible frontier, B=5, n_csa>=1, n_hca>=1):
 
-  * (5,0,0): no recall, no global context. Dominated.
-  * (4,1,0): recall but no global context. The 4th KDA layer adds interference
-    without a compensating recall/global benefit (matches our ablation: 4:1:1
-    *underperforms* 3:1:1 at equal budget — more finite-state layers without
-    more recall support hurts).
-  * (4,0,1): global context but no recall. Dominated by (3,1,1).
+  * (5,0,0): infeasible (violates n_csa>=1, n_hca>=1). Without the
+    feasibility constraints it would be "no recall, no global context",
+    which is dominated.
+  * (4,1,0): infeasible (violates n_hca>=1). The closest FEASIBLE
+    allocation is (3,1,1) (5L, all three operators present). Adding a 4th
+    KDA layer without a global-context branch (i.e. comparing (4,1,0) at
+    5L vs (3,1,1) at 5L) loses HCA's global context for one more
+    finite-state layer — a dominated trade.
+    Note: our ablation includes 4:1:1 (4 KDA + 1 CSA + 1 HCA = 6L), which
+    is NOT an equal-budget comparison to 3:1:1 (5L). The 4:1:1 result
+    *underperforms* 3:1:1, but this is confounded by depth (6L vs 5L at a
+    fixed step budget leaves 4:1:1 under-trained). The clean equal-budget
+    comparison (4,1,0) vs (3,1,1) is not in the ablation set; the
+    theoretical argument above is what supports the claim.
+  * (4,0,1): infeasible (violates n_csa>=1). Closest feasible is (3,1,1):
+    one fewer KDA layer buys the recall branch. Dominated.
   * (3,1,1): recall + global context + 3 cheap mixing layers. This is the
-    minimal allocation that has all three capabilities.
+    minimal feasible allocation that has all three capabilities.
   * (2,2,1) or (2,1,2): more recall/global but fewer cheap mixing layers.
     These trade O(1)-state KDA layers for O(T/m)-state CSA/HCA layers,
     increasing KV cache without a proven quality gain at small scale.
-  * (1,2,2): dominated — KDA is the cheapest layer, removing it inflates cost.
+  * (1,2,2), (1,1,3), (1,3,1), etc.: dominated — KDA is the cheapest
+    layer, removing it inflates cost. The remaining allocations on the
+    frontier (n_kda<3, n_csa+n_hca>=4) trade more cheap layers for more
+    expensive ones without a quality gain at small scale.
 
 So (3,1,1) is the knee of the Pareto frontier: it is the allocation with the
 *most* KDA layers (cheapest) subject to having at least one recall (CSA) and
@@ -364,11 +377,16 @@ CSA — Compressed Sparse Attention
 
 3. Shared-KV MQA core attention:
    Attention queries:  q = (H @ W_DQ @ W_UQ).reshape(T, H, c), L2-normalized
+   Compressed KV is ALSO L2-normalized: C_comp_n = F.normalize(C_comp, dim=-1)
+   (cosine-similarity attention — without this normalization the dot
+   product would track magnitudes, not directions, defeating the sparse
+   retrieval signal).
    For each query t:
-     kv = C_comp[indices[t]]                      # [topk, c], shared across heads
-     scores[h] = q[t, h] . kv^T * scale           # [H, topk]
-     p[h] = softmax(scores[h] + sink)             # [H, topk]
-     out[t, h] = p[h] @ kv                        # [H, c]
+     kv = C_comp_n[indices[t]]                      # [topk, c], shared across heads
+     scores[h] = q[t, h] . kv^T * scale             # [H, topk]
+     p[h] = softmax(scores[h] + sink)               # [H, topk]
+     out[t, h] = p[h] @ kv                          # [H, c]
+   (Note: both ``kv`` and the output einsum use the NORMALIZED C_comp_n.)
 
 4. Sliding window branch (local uncompressed KV):
    For each query t: attend to H[t-w+1 : t+1] @ W_aKV with causal masking.
@@ -388,12 +406,16 @@ HCA — Heavily Compressed Attention
 
 2. Dense shared-KV MQA (NOT sparse — all compressed blocks):
    q = (H @ W_DQ @ W_UQ).reshape(T, H, c), L2-normalized
+   C_comp_n = F.normalize(C_comp, dim=-1)         # ALSO L2-normalized
    Causal block mask: query t attends to blocks b where b < floor(t / m').
-   scores[h, t, n] = q[t, h] . C_comp[n] * scale
+   scores[h, t, n] = q[t, h] . C_comp_n[n] * scale
    p = softmax(scores + causal_mask)
-   out[t, h] = sum_n p[h, t, n] * C_comp[n]
+   out[t, h] = sum_n p[h, t, n] * C_comp_n[n]      # uses NORMALIZED C_comp_n
 
-3. Sliding window branch (same as CSA).
+3. Sliding window branch: same structure as CSA's sliding window, but using
+   HCA's single KV projection ``C = H @ W_KV`` (NOT CSA's two-branch
+   ``Ca = H @ W_aKV``). For each query t: attend to H[t-w+1 : t+1] @ W_KV
+   (L2-normalized) with causal masking.
 4. Attention sink (optional, per-head learnable logit in the softmax denom).
 """
 

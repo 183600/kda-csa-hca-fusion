@@ -1,8 +1,8 @@
 [
   {
-    "prefill_ms": 0.26331599974582787,
-    "mean_decode_ms_per_token": 0.09260094999111364,
-    "median_decode_ms_per_token": 0.08647099980407802,
+    "prefill_ms": 0.24337899958482012,
+    "mean_decode_ms_per_token": 0.0874819000576584,
+    "median_decode_ms_per_token": 0.08009049997781403,
     "peak_mem_MB": null,
     "prefill_len": 128,
     "n_decode": 20,
@@ -11,9 +11,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 6.96090000019467,
-    "mean_decode_ms_per_token": 0.22274164996360923,
-    "median_decode_ms_per_token": 0.2119974999459373,
+    "prefill_ms": 5.4713650006306125,
+    "mean_decode_ms_per_token": 0.1741540333720574,
+    "median_decode_ms_per_token": 0.17262549999941257,
     "peak_mem_MB": null,
     "prefill_len": 128,
     "n_decode": 20,
@@ -22,9 +22,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 3.7970100001984974,
-    "mean_decode_ms_per_token": 0.11389848334601993,
-    "median_decode_ms_per_token": 0.10509250000723114,
+    "prefill_ms": 1.8140639995181118,
+    "mean_decode_ms_per_token": 0.10596028340235837,
+    "median_decode_ms_per_token": 0.09698500025479007,
     "peak_mem_MB": null,
     "prefill_len": 512,
     "n_decode": 20,
@@ -33,9 +33,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 26.549389000138035,
-    "mean_decode_ms_per_token": 0.2333863333130163,
-    "median_decode_ms_per_token": 0.2150910002001183,
+    "prefill_ms": 22.022738000487152,
+    "mean_decode_ms_per_token": 0.1858843500334236,
+    "median_decode_ms_per_token": 0.17652799988354673,
     "peak_mem_MB": null,
     "prefill_len": 512,
     "n_decode": 20,
@@ -44,9 +44,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 15.715383000042493,
-    "mean_decode_ms_per_token": 0.12717860001885128,
-    "median_decode_ms_per_token": 0.11299550010335224,
+    "prefill_ms": 15.95356300003914,
+    "mean_decode_ms_per_token": 0.13479448340755576,
+    "median_decode_ms_per_token": 0.11376400016160915,
     "peak_mem_MB": null,
     "prefill_len": 1024,
     "n_decode": 20,
@@ -55,9 +55,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 51.97229799978231,
-    "mean_decode_ms_per_token": 0.22562596664101875,
-    "median_decode_ms_per_token": 0.21066249973955564,
+    "prefill_ms": 44.14390900001308,
+    "mean_decode_ms_per_token": 0.18973740002365957,
+    "median_decode_ms_per_token": 0.1866560000962636,
     "peak_mem_MB": null,
     "prefill_len": 1024,
     "n_decode": 20,
@@ -66,9 +66,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 85.16997500009893,
-    "mean_decode_ms_per_token": 0.158486566654877,
-    "median_decode_ms_per_token": 0.13345549996301997,
+    "prefill_ms": 84.33687999968242,
+    "mean_decode_ms_per_token": 0.1533137333505389,
+    "median_decode_ms_per_token": 0.13634300012199674,
     "peak_mem_MB": null,
     "prefill_len": 2048,
     "n_decode": 20,
@@ -77,9 +77,9 @@
     "device": "cpu"
   },
   {
-    "prefill_ms": 105.87504099976286,
-    "mean_decode_ms_per_token": 0.24380369998198148,
-    "median_decode_ms_per_token": 0.2183490000788879,
+    "prefill_ms": 87.36358300029679,
+    "mean_decode_ms_per_token": 0.20788373335562937,
+    "median_decode_ms_per_token": 0.19957299991801847,
     "peak_mem_MB": null,
     "prefill_len": 2048,
     "n_decode": 20,

@@ -335,7 +335,20 @@ def main():
     # number is meaningfully more stable. We keep the count modest so the
     # full sweep (5 seq_lengths x 6 ops x repeats) stays under a few minutes
     # on a Kaggle T4. Override via the ``BENCH_REPEATS`` env var.
-    n_repeats = int(os.environ.get('BENCH_REPEATS', '5'))
+    # Parse BENCH_REPEATS defensively: the sibling BENCH_LENGTHS env var is
+    # already wrapped in try/except with a graceful fallback, but BENCH_REPEATS
+    # was a bare ``int()`` that crashed the whole benchmark on malformed input
+    # like ``BENCH_REPEATS=abc`` or ``BENCH_REPEATS=5.0``. Mirror BENCH_LENGTHS'
+    # robustness contract so the two env vars behave consistently.
+    try:
+        n_repeats = int(os.environ.get('BENCH_REPEATS', '5'))
+        if n_repeats < 1:
+            raise ValueError(f"must be >= 1, got {n_repeats}")
+    except ValueError as e:
+        logger.warning(
+            f'[run_benchmark] invalid BENCH_REPEATS='
+            f'{os.environ.get("BENCH_REPEATS")!r} ({e}); using default 5.')
+        n_repeats = 5
     for T in seq_lengths:
         logger.info(f'\n-- T = {T} --')
         for name, factory in benches:

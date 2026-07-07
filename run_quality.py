@@ -357,29 +357,47 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
     batches are reproducible and independent of any global-RNG state left
     over by training. This also makes the eval pass deterministic across
     re-runs, which is useful for debugging.
+
+    Restores each module's train/eval mode after evaluation so a future
+    caller that evaluates mid-training does not silently resume training
+    in eval mode (no dropout, BN using running stats).
     """
-    layer.eval()
-    head.eval()
-    embed.eval()  # nn.Embedding has no dropout/batchnorm so this is a no-op,
-                  # but we set it for symmetry with layer/head so future
-                  # additions (e.g. embedding dropout) do not silently stay
-                  # in train mode during evaluation.
-    # Fixed seed for the eval generator so every operator sees the SAME eval
-    # batches (apples-to-apples comparison at eval time too, not just train).
-    eval_gen = torch.Generator(device=device)
-    eval_gen.manual_seed(12345)
-    correct, total = 0, 0
-    losses = []
-    with torch.no_grad():
-        for _ in range(n_batches):
-            x_emb, target, cue_pos = make_mqar_batch(
-                batch, seq_len, n_kv, vocab, embed, device, generator=eval_gen)
-            h = layer(x_emb)
-            logits = head(h, cue_pos)
-            correct += (logits.argmax(-1) == target).sum().item()
-            total += target.numel()
-            losses.append(F.cross_entropy(logits, target).item())
-    return correct / total, sum(losses) / len(losses)
+    # Save the prior train/eval state so we can restore it after eval —
+    # a latent footgun if a caller ever invokes _eval_model mid-training.
+    was_training = {m: m.training for m in (layer, head, embed)}
+    try:
+        layer.eval()
+        head.eval()
+        embed.eval()  # nn.Embedding has no dropout/batchnorm so this is a no-op,
+                      # but we set it for symmetry with layer/head so future
+                      # additions (e.g. embedding dropout) do not silently stay
+                      # in train mode during evaluation.
+        # Fixed seed for the eval generator so every operator sees the SAME eval
+        # batches (apples-to-apples comparison at eval time too, not just train).
+        eval_gen = torch.Generator(device=device)
+        eval_gen.manual_seed(12345)
+        correct, total = 0, 0
+        losses = []
+        with torch.no_grad():
+            for _ in range(n_batches):
+                x_emb, target, cue_pos = make_mqar_batch(
+                    batch, seq_len, n_kv, vocab, embed, device, generator=eval_gen)
+                h = layer(x_emb)
+                logits = head(h, cue_pos)
+                correct += (logits.argmax(-1) == target).sum().item()
+                total += target.numel()
+                losses.append(F.cross_entropy(logits, target).item())
+        # Guard against n_batches=0 (or batch=0): without this the function
+        # raises ZeroDivisionError on ``correct / total`` and
+        # ``sum([]) / len([])``. Returns 0.0 for both metrics so the caller
+        # gets a finite (if meaningless) value rather than a crash. Mirrors
+        # the steps=0 guard in train_one.
+        if total == 0 or not losses:
+            return 0.0, 0.0
+        return correct / total, sum(losses) / len(losses)
+    finally:
+        for m, was in was_training.items():
+            m.train(was)
 
 
 def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
@@ -404,7 +422,18 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     for batch generation, the *same* seed produced *different* training
     batches across operators, undermining the apples-to-apples comparison
     that multi-seed CI is meant to strengthen.
+
+    ``device`` may be passed as a string ('cpu'/'cuda') or a
+    ``torch.device``; string inputs are coerced to ``torch.device`` so
+    callers from notebooks don't hit ``AttributeError`` on ``device.type``.
     """
+    # Coerce string device (e.g. 'cpu', 'cuda') to torch.device so callers
+    # passing a string from a notebook don't hit AttributeError on
+    # ``device.type`` inside this function. main() already passes a real
+    # torch.device, but train_one is a public function and the coercion is
+    # cheap and idempotent.
+    if isinstance(device, str):
+        device = torch.device(device)
     if softmax_steps is None:
         softmax_steps = steps
     if train_batch is None:
@@ -452,6 +481,23 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         h = layer(x_emb)
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
+        # NaN/Inf guard: if a single step diverges (e.g. AdamW + lr=3e-3
+        # instability, or a single Inf in KDA state from a bad beta/g
+        # combination), backward() would propagate NaN into ALL parameter
+        # grads, opt.step() would write NaN into ALL parameters, and the
+        # rest of training would silently produce NaN logits — the loss
+        # curve would look like [..., 2.4, 2.5, NaN, NaN, NaN, ...] with
+        # no error raised. Worse, the final eval would still return a
+        # *finite* accuracy (argmax on NaN is undefined but deterministic,
+        # often returning 0), so the divergent seed would NOT be caught by
+        # the per-seed try/except in train_multi_seed and would silently
+        # corrupt the aggregate mean/CI. Raise here so the per-seed
+        # try/except catches it as a failed seed.
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"non-finite loss at step {step}: {loss.item()} "
+                f"(op={op_name}, seed={seed}); aborting this seed to "
+                f"prevent silent NaN propagation into aggregate stats")
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad()
         loss.backward()
@@ -515,7 +561,14 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
     Previously, a single seed failure crashed the entire experiment, losing
     all other operators' results — inconsistent with the ablation runner's
     more robust pattern.
+
+    ``device`` may be passed as a string or a ``torch.device``; string
+    inputs are coerced for notebook callers.
     """
+    # Coerce string device -> torch.device so callers passing 'cpu'/'cuda'
+    # from a notebook don't hit AttributeError on ``device.type`` below.
+    if isinstance(device, str):
+        device = torch.device(device)
     seeds = [42 + i for i in range(n_seeds)]
     per_seed = []
     for s in seeds:
@@ -542,7 +595,21 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=300,
             torch.cuda.empty_cache()
 
     # Filter out failed seeds before computing aggregate stats.
-    ok_per_seed = [r for r in per_seed if 'error' not in r]
+    # A seed that diverged to NaN loss is caught by train_one's NaN guard
+    # and recorded with an 'error' key — but a seed that produced a NaN
+    # final_acc/final_loss via a path the guard did not cover (e.g. eval
+    # on NaN params from a step that crashed before the guard fired) would
+    # survive the 'error' filter and silently corrupt the aggregate mean
+    # (NaN propagates through sum()/std()). Defensively reject any seed
+    # whose final_acc or final_loss is None or non-finite.
+    ok_per_seed = [
+        r for r in per_seed
+        if 'error' not in r
+        and r.get('final_acc') is not None
+        and math.isfinite(r['final_acc'])
+        and r.get('final_loss') is not None
+        and math.isfinite(r['final_loss'])
+    ]
     if not ok_per_seed:
         # All seeds failed: propagate the error so the caller can record
         # a stub result for this operator.
@@ -684,10 +751,20 @@ def main():
                 import traceback as _tb
                 logger.error(f"  op '{op}' FAILED: {e}")
                 _tb.print_exc()
+                # Error stub MUST include every key that success rows
+                # carry, set to None/empty/zero as appropriate, so
+                # downstream JSON consumers (make_figures.py, pandas
+                # DataFrames, etc.) iterating over fields do not KeyError
+                # on error rows. The success-row schema is defined by
+                # train_multi_seed's return dict — mirror it exactly.
                 all_results.append({
                     'op': op,
                     'n_kv': n_kv,
                     'n_seeds': n_seeds,
+                    'n_seeds_ok': 0,
+                    'n_seeds_failed': n_seeds,
+                    'n_seeds_total': n_seeds,
+                    'seeds': [],
                     'error': str(e),
                     'mean_acc': None,
                     'ci95_acc': None,
@@ -697,6 +774,7 @@ def main():
                     'ci95_loss': None,
                     'chance_acc': 1.0 / vocab,
                     't_stat_vs_chance': None,
+                    'mean_train_time_s': None,
                     'per_seed': [],
                 })
 
@@ -716,11 +794,38 @@ def main():
         print(f"{r['n_kv']:>4} | {r['op']:>10} | {r['mean_acc']:>10.4f} | "
               f"{r['ci95_acc']:>10.4f} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
-    print(f"{'':>4} | {'chance':>10} | {chance:>10.4f} |")
+    # Chance row: fill ALL columns so the table renders as a clean grid
+    # (the previous version only filled 3 of 7 columns, leaving the right
+    # side of the row ragged with no trailing pipe separators).
+    print(f"{'':>4} | {'chance':>10} | {chance:>10.4f} | "
+          f"{'':>10} | {'':>8} | {'':>12} | {'':>10}")
 
     os.makedirs('results', exist_ok=True)
+    # Write strict JSON (allow_nan=False): if a divergent seed slipped
+    # past the NaN guard and the per_seed filter, Python's default
+    # json.dump would emit literal ``NaN``/``Infinity`` tokens, which are
+    # INVALID JSON per RFC 8259 and cause strict parsers (js, jq, pandas
+    # with ``orient='records'``) to reject the whole file. With
+    # allow_nan=False the call raises ValueError instead — surfacing the
+    # corruption loudly rather than shipping a broken file.
     with open('results/exp4_mqar.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
+        try:
+            json.dump(all_results, f, indent=2, allow_nan=False)
+        except ValueError as e:
+            # Fall back to replacing non-finite values with null so the
+            # file is still written (downstream code handles None), and
+            # log the corruption loudly.
+            logger.error(f'non-finite value in results; sanitizing to null: {e}')
+            import math as _math
+            def _sanitize(o):
+                if isinstance(o, float) and not _math.isfinite(o):
+                    return None
+                if isinstance(o, dict):
+                    return {k: _sanitize(v) for k, v in o.items()}
+                if isinstance(o, list):
+                    return [_sanitize(x) for x in o]
+                return o
+            json.dump(_sanitize(all_results), f, indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp4_mqar.json')
 
 

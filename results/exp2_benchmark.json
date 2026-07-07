@@ -2,7 +2,7 @@
   {
     "T": 128,
     "op": "softmax",
-    "time_ms": 0.392251999983273,
+    "time_ms": 0.24260000009235227,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -10,7 +10,7 @@
   {
     "T": 128,
     "op": "kda_rec",
-    "time_ms": 12.313638999785326,
+    "time_ms": 5.829958000504121,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -18,7 +18,7 @@
   {
     "T": 128,
     "op": "kda_chunk",
-    "time_ms": 10.408096999981353,
+    "time_ms": 31.20553899952938,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -26,7 +26,7 @@
   {
     "T": 128,
     "op": "csa",
-    "time_ms": 1.2256859999979497,
+    "time_ms": 1.1799349995271768,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -34,7 +34,7 @@
   {
     "T": 128,
     "op": "hca",
-    "time_ms": 0.8860240000103659,
+    "time_ms": 0.8407120003539603,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -42,7 +42,7 @@
   {
     "T": 128,
     "op": "hybrid",
-    "time_ms": 24.612032000277395,
+    "time_ms": 19.681263000165927,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -50,7 +50,7 @@
   {
     "T": 256,
     "op": "softmax",
-    "time_ms": 0.9466040000916109,
+    "time_ms": 0.9106959996643127,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -58,7 +58,7 @@
   {
     "T": 256,
     "op": "kda_rec",
-    "time_ms": 22.255505000430276,
+    "time_ms": 11.758951000047091,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -66,7 +66,7 @@
   {
     "T": 256,
     "op": "kda_chunk",
-    "time_ms": 16.43181499957791,
+    "time_ms": 48.592703999929654,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -74,7 +74,7 @@
   {
     "T": 256,
     "op": "csa",
-    "time_ms": 3.6463139999796113,
+    "time_ms": 2.2496700003102887,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -82,7 +82,7 @@
   {
     "T": 256,
     "op": "hca",
-    "time_ms": 4.525857999851723,
+    "time_ms": 1.8754359998638392,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
@@ -90,7 +90,55 @@
   {
     "T": 256,
     "op": "hybrid",
-    "time_ms": 46.44828799973766,
+    "time_ms": 37.5428949992056,
+    "peak_mem_MB": null,
+    "device": "cpu",
+    "repeats": 5
+  },
+  {
+    "T": 512,
+    "op": "softmax",
+    "time_ms": 13.283854999826872,
+    "peak_mem_MB": null,
+    "device": "cpu",
+    "repeats": 5
+  },
+  {
+    "T": 512,
+    "op": "kda_rec",
+    "time_ms": 22.4592800004757,
+    "peak_mem_MB": null,
+    "device": "cpu",
+    "repeats": 5
+  },
+  {
+    "T": 512,
+    "op": "kda_chunk",
+    "time_ms": 82.59752100002515,
+    "peak_mem_MB": null,
+    "device": "cpu",
+    "repeats": 5
+  },
+  {
+    "T": 512,
+    "op": "csa",
+    "time_ms": 21.616613000333018,
+    "peak_mem_MB": null,
+    "device": "cpu",
+    "repeats": 5
+  },
+  {
+    "T": 512,
+    "op": "hca",
+    "time_ms": 21.567540999967605,
+    "peak_mem_MB": null,
+    "device": "cpu",
+    "repeats": 5
+  },
+  {
+    "T": 512,
+    "op": "hybrid",
+    "time_ms": 117.10577200028638,
     "peak_mem_MB": null,
     "device": "cpu",
     "repeats": 5
