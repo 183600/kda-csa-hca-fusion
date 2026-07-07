@@ -222,7 +222,7 @@ def naive_csa(
     # attention queries (low-rank up-projection)
     q = (cQ @ W_UQ).view(B_, T, nh, c)                             # [B, T, nh, c]
     q = F.normalize(q, dim=-1)
-    C_comp_n = F.normalize(C_comp, dim=-1)                         # head-wise RMSNorm simplified
+    C_comp_n = F.normalize(C_comp, dim=-1)                         # L2-normalize (cosine-similarity attention)
 
     # --- Vectorized sparse MQA core attention ---
     # Gather selected compressed KV entries for every (b, t) in one shot.
@@ -286,14 +286,22 @@ def naive_csa(
         all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
         p = p.masked_fill(all_invalid, 0.0)
     else:
-        # NaN-safe softmax: rows that are entirely -inf yield all-zero p.
-        row_max = scores.amax(-1, keepdim=True)                     # [B, T, nh, 1]
-        row_max = torch.where(torch.isinf(row_max),
-                              torch.zeros_like(row_max), row_max)
-        vmask = valid_mask[:, :, None, :].to(scores.dtype)
-        exp_scores = (scores - row_max).exp() * vmask               # 0 at invalid slots
-        denom = exp_scores.sum(-1, keepdim=True).clamp(min=1e-20)
-        p = exp_scores / denom                                       # [B, T, nh, topk]
+        # NaN-safe softmax: rows that are entirely -inf (e.g. early
+        # queries with no preceding causal block, or all-topk slots
+        # padded with -1) yield all-zero p. We use the same explicit
+        # all_masked guard as ops_hca.py::naive_hca and the sink branch
+        # above for consistency: detect fully-masked rows, replace their
+        # -inf entries with 0 so softmax is finite, then zero the result.
+        #
+        # The previous implementation used a clamp(min=1e-20) trick on
+        # the denominator, which also produces p=0 for all-masked rows
+        # but relies on a magic epsilon. The explicit guard is clearer
+        # and avoids any theoretical concern about the epsilon being
+        # too small for fp16/bf16 inputs (where 1e-20 underflows to 0).
+        all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
+        safe_scores = scores.masked_fill(all_invalid, 0.0)
+        p = torch.softmax(safe_scores, dim=-1)                       # [B, T, nh, topk]
+        p = p.masked_fill(all_invalid, 0.0)
 
     out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c]
     out = out.to(H.dtype)
