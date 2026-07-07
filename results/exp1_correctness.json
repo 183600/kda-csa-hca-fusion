@@ -338,5 +338,45 @@
     "name": "hybrid no-KDA state is None",
     "status": "PASS",
     "detail": "_kda_state is None: True"
+  },
+  {
+    "name": "CSA non-divisible T shape",
+    "status": "PASS",
+    "detail": "expected (1, 20, 16), got (1, 20, 16)"
+  },
+  {
+    "name": "CSA non-divisible T matches padded-prefix",
+    "status": "PASS",
+    "detail": "max diff = 0.00e+00"
+  },
+  {
+    "name": "HCA non-divisible T shape",
+    "status": "PASS",
+    "detail": "expected (1, 20, 16), got (1, 20, 16)"
+  },
+  {
+    "name": "HCA non-divisible T matches padded-prefix",
+    "status": "PASS",
+    "detail": "max diff = 0.00e+00"
+  },
+  {
+    "name": "CSA topk=0 no-SW produces zero output",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16), max|o|=0.00e+00"
+  },
+  {
+    "name": "CSA topk=0 with-SW produces non-zero output",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16), max|o|=6.23e-01"
+  },
+  {
+    "name": "HCA T<m2 no-SW produces zero output",
+    "status": "PASS",
+    "detail": "shape=(1, 8, 16), max|o|=0.00e+00"
+  },
+  {
+    "name": "HCA T<m2 with-SW produces non-zero output",
+    "status": "PASS",
+    "detail": "shape=(1, 8, 16), max|o|=7.49e-01"
   }
 ]

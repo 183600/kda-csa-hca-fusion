@@ -38,13 +38,31 @@ def naive_hca(
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
 ) -> torch.Tensor:
-    """Full HCA forward (heavy compression + dense MQA + optional SW + sink)."""
+    """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
+
+    ``T`` does NOT need to be divisible by ``m2``: the function right-pads
+    the sequence with zeros up to the next multiple of ``m2`` and trims the
+    output back to the original length, mirroring the contract of
+    ``naive_chunk_kda`` and ``naive_csa``. Real tokens keep their original
+    positions; only the last partial block contains padding zeros, and the
+    causal block mask ensures no real token attends to it.
+    """
     B_, T, d = H.shape
     if scale is None:
         scale = c ** -0.5
     device = H.device
+    # Right-pad T up to a multiple of m2 so callers don't have to. Real
+    # tokens keep their original positions; only the last partial block
+    # contains padding zeros, and no real token attends to it (causal block
+    # mask). This removes a footgun where direct callers (without the
+    # external padding done by ``HybridKCHAttention`` or ``HCAAttn``) would
+    # hit a bare ``AssertionError`` with no message.
+    original_T = T
+    pad = (-T) % m2
+    if pad:
+        H = F.pad(H, (0, 0, 0, pad))
+        T = T + pad
     n_blocks = T // m2
-    assert T % m2 == 0
 
     # --- 1. Heavy KV compression (single branch, no overlap) ---
     C = H @ W_KV                                                   # [B, T, c]
@@ -154,4 +172,7 @@ def naive_hca(
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
     # [B, T, nh*c]; the caller performs the grouped output projection.
-    return out.reshape(B_, T, nh * c).to(H.dtype)
+    # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
+    # matches the input's original T (right-padding added zeros at the end,
+    # which never affect real-token outputs thanks to the causal block mask).
+    return out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]

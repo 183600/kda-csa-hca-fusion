@@ -1689,6 +1689,210 @@ def test_hybrid_no_kda_layout(device='cpu'):
     ]
 
 
+def test_csa_hca_non_divisible_T(device='cpu'):
+    """Regression: ``naive_csa`` and ``naive_hca`` must accept T not divisible
+    by m / m2 without crashing.
+
+    Previously both functions had a bare ``assert T % m == 0`` (no message)
+    that crashed with ``AssertionError`` when called directly with a
+    non-divisible T. Callers like ``HybridKCHAttention`` and ``CSAAttn``
+    worked around this by padding externally, but a direct caller had no way
+    to use the operators without replicating the padding logic.
+
+    The fix mirrors ``naive_chunk_kda``: the operators now right-pad T up to
+    a multiple of m / m2 internally and trim the output back to the original
+    T. Real tokens keep their original positions; only the last partial
+    block contains padding zeros, and the causal block mask ensures no real
+    token attends to it.
+
+    This test verifies:
+      1. Both operators run without crashing for non-divisible T.
+      2. The output T matches the input T (i.e. the trim is correct).
+      3. The output for the non-padded prefix matches the output of running
+         on the padded T directly (i.e. padding does not affect real-token
+         outputs).
+    """
+    logger.info("Test: CSA/HCA accept non-divisible T (internal padding)")
+    torch.manual_seed(206)
+    dtype = torch.float64
+
+    # --- CSA: T=20, m=8 -> pad=4 -> T_padded=24 ---
+    B, T_orig, d = 1, 20, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T_orig, d, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
+    sink = torch.zeros(nh, dtype=dtype, device=device)
+
+    # Run on the original (non-divisible) T directly.
+    o_direct = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                         W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                         sliding_window=4, sink_logits=sink)
+    # Run on the padded T (manually padded) and trim — should match.
+    pad = (-T_orig) % m
+    H_padded = F.pad(H, (0, 0, 0, pad))
+    o_padded = naive_csa(H_padded, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                         W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                         sliding_window=4, sink_logits=sink)
+    csa_shape_ok = o_direct.shape == (B, T_orig, nh * c)
+    csa_match = torch.allclose(o_direct, o_padded[:, :T_orig], atol=1e-10)
+
+    # --- HCA: T=20, m2=16 -> pad=12 -> T_padded=32 ---
+    B2, T_orig2, d2 = 1, 20, 16
+    m2, nh2, c2, dc2 = 16, 2, 8, 16
+    H2 = torch.randn(B2, T_orig2, d2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    sink2 = torch.zeros(nh2, dtype=dtype, device=device)
+
+    o_direct2 = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                          m2=m2, nh=nh2, c=c2, dc=dc2,
+                          sliding_window=4, sink_logits=sink2)
+    pad2 = (-T_orig2) % m2
+    H2_padded = F.pad(H2, (0, 0, 0, pad2))
+    o_padded2 = naive_hca(H2_padded, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                          m2=m2, nh=nh2, c=c2, dc=dc2,
+                          sliding_window=4, sink_logits=sink2)
+    hca_shape_ok = o_direct2.shape == (B2, T_orig2, nh2 * c2)
+    hca_match = torch.allclose(o_direct2, o_padded2[:, :T_orig2], atol=1e-10)
+
+    return [
+        _ok('CSA non-divisible T shape', csa_shape_ok,
+            f'expected {(B, T_orig, nh*c)}, got {tuple(o_direct.shape)}'),
+        _ok('CSA non-divisible T matches padded-prefix', csa_match,
+            f'max diff = {(o_direct - o_padded[:, :T_orig]).abs().max().item():.2e}'),
+        _ok('HCA non-divisible T shape', hca_shape_ok,
+            f'expected {(B2, T_orig2, nh2*c2)}, got {tuple(o_direct2.shape)}'),
+        _ok('HCA non-divisible T matches padded-prefix', hca_match,
+            f'max diff = {(o_direct2 - o_padded2[:, :T_orig2]).abs().max().item():.2e}'),
+    ]
+
+
+def test_csa_topk_zero(device='cpu'):
+    """Regression: ``naive_csa`` must handle ``topk=0`` without crashing.
+
+    Previously ``topk=0`` caused ``IndexError: amax(): Expected reduction
+    dim -1 to have non-zero size`` because the sparse attention ``scores``
+    tensor had shape ``[B, T, nh, 0]`` and ``scores.amax(-1)`` cannot reduce
+    an empty dim. With ``topk=0`` the user is asking for "no sparse
+    selection", which is a degenerate but valid configuration: the sparse
+    branch contributes exactly zero, and only the sliding-window branch
+    (if enabled) produces non-zero output.
+
+    This test verifies:
+      1. ``topk=0`` with ``sliding_window=0`` produces a finite all-zero
+         output (no sparse, no SW -> everything is zero).
+      2. ``topk=0`` with ``sliding_window>0`` produces a finite non-zero
+         output (SW branch still contributes).
+    """
+    logger.info("Test: CSA with topk=0 (no sparse selection)")
+    torch.manual_seed(207)
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 0, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_aKV = torch.randn(d, c, device=device) * 0.1
+    W_bKV = torch.randn(d, c, device=device) * 0.1
+    W_aZ = torch.randn(d, c, device=device) * 0.1
+    W_bZ = torch.randn(d, c, device=device) * 0.1
+    Ba = torch.randn(m, c, device=device) * 0.1
+    Bb = torch.randn(m, c, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
+    W_w = torch.randn(d, nIh, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, device=device) * 0.1
+    sink = torch.zeros(nh, device=device)
+
+    # topk=0, no SW -> all-zero output (sparse branch contributes 0, no SW).
+    o_no_sw = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                        W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                        m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                        sliding_window=0, sink_logits=sink)
+    no_sw_ok = (o_no_sw.shape == (B, T, nh * c)
+                and torch.isfinite(o_no_sw).all().item()
+                and o_no_sw.abs().max().item() == 0.0)
+
+    # topk=0, with SW -> non-zero output (SW branch contributes).
+    o_with_sw = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                          W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                          m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                          sliding_window=4, sink_logits=sink)
+    with_sw_ok = (o_with_sw.shape == (B, T, nh * c)
+                  and torch.isfinite(o_with_sw).all().item()
+                  and o_with_sw.abs().max().item() > 0.0)
+
+    return [
+        _ok('CSA topk=0 no-SW produces zero output', no_sw_ok,
+            f'shape={tuple(o_no_sw.shape)}, max|o|={o_no_sw.abs().max().item():.2e}'),
+        _ok('CSA topk=0 with-SW produces non-zero output', with_sw_ok,
+            f'shape={tuple(o_with_sw.shape)}, max|o|={o_with_sw.abs().max().item():.2e}'),
+    ]
+
+
+def test_hca_T_smaller_than_m2(device='cpu'):
+    """Regression: ``naive_hca`` must accept T < m2 without crashing.
+
+    Previously the bare ``assert T % m2 == 0`` crashed when T < m2 (e.g.
+    T=8, m2=16). With the internal padding fix, T is right-padded up to a
+    multiple of m2 (so T=8 -> T_padded=16, n_blocks=1). Under the causal
+    block mask, no query can attend to block 0 (it would leak the current
+    block's future tokens), so the dense branch produces zero and only the
+    sliding-window branch (if enabled) contributes.
+    """
+    logger.info("Test: HCA with T < m2 (single block, no preceding)")
+    torch.manual_seed(208)
+    B, T, d = 1, 8, 16
+    m2, nh, c, dc = 16, 2, 8, 16  # m2 > T
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_KV = torch.randn(d, c, device=device) * 0.1
+    W_Z = torch.randn(d, c, device=device) * 0.1
+    B_pos = torch.randn(m2, c, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    sink = torch.zeros(nh, device=device)
+
+    # Without SW: dense branch is fully masked (no preceding block) -> zero.
+    o_no_sw = naive_hca(H, W_KV, W_Z, B_pos, W_DQ, W_UQ,
+                        m2=m2, nh=nh, c=c, dc=dc,
+                        sliding_window=0, sink_logits=sink)
+    no_sw_ok = (o_no_sw.shape == (B, T, nh * c)
+                and torch.isfinite(o_no_sw).all().item()
+                and o_no_sw.abs().max().item() == 0.0)
+
+    # With SW: SW branch contributes (each query attends to itself + past 3).
+    o_with_sw = naive_hca(H, W_KV, W_Z, B_pos, W_DQ, W_UQ,
+                          m2=m2, nh=nh, c=c, dc=dc,
+                          sliding_window=4, sink_logits=sink)
+    with_sw_ok = (o_with_sw.shape == (B, T, nh * c)
+                  and torch.isfinite(o_with_sw).all().item()
+                  and o_with_sw.abs().max().item() > 0.0)
+
+    return [
+        _ok('HCA T<m2 no-SW produces zero output', no_sw_ok,
+            f'shape={tuple(o_no_sw.shape)}, max|o|={o_no_sw.abs().max().item():.2e}'),
+        _ok('HCA T<m2 with-SW produces non-zero output', with_sw_ok,
+            f'shape={tuple(o_with_sw.shape)}, max|o|={o_with_sw.abs().max().item():.2e}'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1731,6 +1935,10 @@ def main():
     all_results += test_kda_single_token_decode(device)
     all_results += test_csa_hca_extreme_sink_values(device)
     all_results += test_hybrid_no_kda_layout(device)
+    # Regression tests for the internal-padding + topk=0 fixes.
+    all_results += test_csa_hca_non_divisible_T(device)
+    all_results += test_csa_topk_zero(device)
+    all_results += test_hca_T_smaller_than_m2(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

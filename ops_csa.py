@@ -205,13 +205,29 @@ def naive_csa(
 
     Returns output ``[B, T, d]`` (after a simple grouped-output projection is
     elided here for clarity; we project ``[B, T, c*nh] -> d`` with one matrix).
+
+    ``T`` does NOT need to be divisible by ``m``: the function right-pads the
+    sequence with zeros up to the next multiple of ``m`` and trims the output
+    back to the original length, mirroring the contract of
+    ``naive_chunk_kda``. Real tokens keep their original positions; only the
+    last partial block contains padding zeros, and the causal block mask
+    ensures no real token attends to it. This removes a footgun where direct
+    callers (without the external padding done by ``HybridKCHAttention`` or
+    ``CSAAttn``) would hit a bare ``AssertionError`` with no message.
     """
     B_, T, d = H.shape
     if scale is None:
         scale = c ** -0.5
     device = H.device
+    # Right-pad T up to a multiple of m so callers don't have to. Real tokens
+    # keep their original positions; only the last partial block contains
+    # padding zeros, and no real token attends to it (causal block mask).
+    original_T = T
+    pad = (-T) % m
+    if pad:
+        H = F.pad(H, (0, 0, 0, pad))
+        T = T + pad
     n_blocks = T // m
-    assert T % m == 0
 
     # --- 1. Compress KV (two-branch overlapped) ---
     Ca = H @ W_aKV
@@ -261,86 +277,96 @@ def naive_csa(
     q = F.normalize(q, dim=-1)
     C_comp_n = F.normalize(C_comp, dim=-1)                         # L2-normalize (cosine-similarity attention)
 
-    # --- Vectorized sparse MQA core attention ---
-    # Gather selected compressed KV entries for every (b, t) in one shot.
-    # indices: [B, T, topk], padded with -1 for invalid slots.
-    valid_mask = indices >= 0                                        # [B, T, topk]
-    idx_safe = indices.clamp(min=0)                                  # [B, T, topk]
-    batch_idx = torch.arange(B_, device=device).view(B_, 1, 1)      # [B, 1, 1]
-    kv = C_comp_n[batch_idx, idx_safe]                               # [B, T, topk, c]
-
-    # Per-head attention scores over the topk selected blocks.
-    scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv) * scale  # [B, T, nh, topk]
-    # Mask -1 padding so those slots get zero weight after softmax.
-    scores = scores.masked_fill(~valid_mask[:, :, None, :], float('-inf'))
-
-    if sink_logits is not None:
-        # Attention sink: a per-head constant added to the denominator.
-        # Numerically stable logsumexp approach — keep sink_logits in
-        # log space (never exp it, which could overflow to inf when the
-        # learnable parameter grows during training and makes denom=inf,
-        # p=0/inf=nan or inf/inf=nan).
-        #
-        # Math: we want p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink)).
-        # For numerical stability we subtract row_max from every score
-        # (and from the sink!) so the largest exp() argument is 0:
-        #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
-        # where M = max(0, max_i s_i).  The previous code forgot to
-        # shift the sink, producing
-        #   p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink) * exp(M))
-        # i.e. the sink was over-weighted by a factor exp(M) — a
-        # systematic ~13% bias in the default c=64 config and up to 65%
-        # at c=4.  Shifting log_sink by -row_max restores the identity
-        #   logaddexp(a - M, b - M) = logaddexp(a, b) - M
-        # so the shifted computation is mathematically identical to the
-        # unshifted (overflow-prone) one.
-        log_sink = sink_logits.view(1, 1, nh, 1).to(scores.dtype)  # [1, 1, nh, 1]
-        vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
-        # NOTE: renamed from `m` to `row_max` to avoid shadowing the
-        # `m` parameter (compression factor). The previous `m = ...`
-        # silently clobbered the compression factor for the rest of the
-        # function; it happened not to be read again here, but the
-        # shadowing was a latent footgun for future edits.
-        row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, T, nh, 1]
-        shifted = scores - row_max                                  # [B, T, nh, topk]
-        shifted_sink = log_sink - row_max                           # [B, T, nh, 1]
-        log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(log_sum_exp, shifted_sink)      # [B, T, nh, 1]
-        p = ((shifted - log_denom).exp() * vmask)                   # [B, T, nh, topk]
-        # NaN guard for all-masked rows (early queries with no preceding
-        # causal block). When every slot in a row is -inf, log_sum_exp =
-        # -inf, log_denom = logaddexp(-inf, log_sink) = log_sink. If
-        # log_sink is also -inf (e.g. sink_logits diverged to -inf during
-        # training), then (shifted - log_denom) = (-inf - (-inf)) = NaN,
-        # and NaN * 0 (vmask) = NaN in IEEE 754. Zero out any row where
-        # all slots are invalid so the downstream einsum produces 0
-        # instead of NaN. This mirrors the all_masked guard in the
-        # ``else`` branch and in ``ops_hca.py::naive_hca``.
-        #
-        # Shape: valid_mask is [B, T, topk]; we reduce over topk to get
-        # [B, T, 1], then add a head axis [:, :, None] to broadcast over
-        # the nh dimension of p ([B, T, nh, topk]).
-        all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
-        p = p.masked_fill(all_invalid, 0.0)
+    # Handle topk=0 (degenerate but valid: caller asks for no sparse
+    # selection). Without this guard the downstream ``scores.amax(-1)``
+    # raises ``IndexError: Expected reduction dim -1 to have non-zero size``
+    # because ``scores`` would have shape ``[B, T, nh, 0]``. With topk=0
+    # the sparse branch contributes exactly zero; only the SW branch (if
+    # enabled) produces non-zero output. We still need ``q`` (for the SW
+    # branch) so the early return is placed AFTER q is computed.
+    if indices.shape[-1] == 0:
+        out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
     else:
-        # NaN-safe softmax: rows that are entirely -inf (e.g. early
-        # queries with no preceding causal block, or all-topk slots
-        # padded with -1) yield all-zero p. We use the same explicit
-        # all_masked guard as ops_hca.py::naive_hca and the sink branch
-        # above for consistency: detect fully-masked rows, replace their
-        # -inf entries with 0 so softmax is finite, then zero the result.
-        #
-        # The previous implementation used a clamp(min=1e-20) trick on
-        # the denominator, which also produces p=0 for all-masked rows
-        # but relies on a magic epsilon. The explicit guard is clearer
-        # and avoids any theoretical concern about the epsilon being
-        # too small for fp16/bf16 inputs (where 1e-20 underflows to 0).
-        all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
-        safe_scores = scores.masked_fill(all_invalid, 0.0)
-        p = torch.softmax(safe_scores, dim=-1)                       # [B, T, nh, topk]
-        p = p.masked_fill(all_invalid, 0.0)
+        # --- Vectorized sparse MQA core attention ---
+        # Gather selected compressed KV entries for every (b, t) in one shot.
+        # indices: [B, T, topk], padded with -1 for invalid slots.
+        valid_mask = indices >= 0                                        # [B, T, topk]
+        idx_safe = indices.clamp(min=0)                                  # [B, T, topk]
+        batch_idx = torch.arange(B_, device=device).view(B_, 1, 1)      # [B, 1, 1]
+        kv = C_comp_n[batch_idx, idx_safe]                               # [B, T, topk, c]
 
-    out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c] in compute_dtype
+        # Per-head attention scores over the topk selected blocks.
+        scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv) * scale  # [B, T, nh, topk]
+        # Mask -1 padding so those slots get zero weight after softmax.
+        scores = scores.masked_fill(~valid_mask[:, :, None, :], float('-inf'))
+
+        if sink_logits is not None:
+            # Attention sink: a per-head constant added to the denominator.
+            # Numerically stable logsumexp approach — keep sink_logits in
+            # log space (never exp it, which could overflow to inf when the
+            # learnable parameter grows during training and makes denom=inf,
+            # p=0/inf=nan or inf/inf=nan).
+            #
+            # Math: we want p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink)).
+            # For numerical stability we subtract row_max from every score
+            # (and from the sink!) so the largest exp() argument is 0:
+            #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
+            # where M = max(0, max_i s_i).  The previous code forgot to
+            # shift the sink, producing
+            #   p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink) * exp(M))
+            # i.e. the sink was over-weighted by a factor exp(M) — a
+            # systematic ~13% bias in the default c=64 config and up to 65%
+            # at c=4.  Shifting log_sink by -row_max restores the identity
+            #   logaddexp(a - M, b - M) = logaddexp(a, b) - M
+            # so the shifted computation is mathematically identical to the
+            # unshifted (overflow-prone) one.
+            log_sink = sink_logits.view(1, 1, nh, 1).to(scores.dtype)  # [1, 1, nh, 1]
+            vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
+            # NOTE: renamed from `m` to `row_max` to avoid shadowing the
+            # `m` parameter (compression factor). The previous `m = ...`
+            # silently clobbered the compression factor for the rest of the
+            # function; it happened not to be read again here, but the
+            # shadowing was a latent footgun for future edits.
+            row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, T, nh, 1]
+            shifted = scores - row_max                                  # [B, T, nh, topk]
+            shifted_sink = log_sink - row_max                           # [B, T, nh, 1]
+            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)      # [B, T, nh, 1]
+            p = ((shifted - log_denom).exp() * vmask)                   # [B, T, nh, topk]
+            # NaN guard for all-masked rows (early queries with no preceding
+            # causal block). When every slot in a row is -inf, log_sum_exp =
+            # -inf, log_denom = logaddexp(-inf, log_sink) = log_sink. If
+            # log_sink is also -inf (e.g. sink_logits diverged to -inf during
+            # training), then (shifted - log_denom) = (-inf - (-inf)) = NaN,
+            # and NaN * 0 (vmask) = NaN in IEEE 754. Zero out any row where
+            # all slots are invalid so the downstream einsum produces 0
+            # instead of NaN. This mirrors the all_masked guard in the
+            # ``else`` branch and in ``ops_hca.py::naive_hca``.
+            #
+            # Shape: valid_mask is [B, T, topk]; we reduce over topk to get
+            # [B, T, 1], then add a head axis [:, :, None] to broadcast over
+            # the nh dimension of p ([B, T, nh, topk]).
+            all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
+            p = p.masked_fill(all_invalid, 0.0)
+        else:
+            # NaN-safe softmax: rows that are entirely -inf (e.g. early
+            # queries with no preceding causal block, or all-topk slots
+            # padded with -1) yield all-zero p. We use the same explicit
+            # all_masked guard as ops_hca.py::naive_hca and the sink branch
+            # above for consistency: detect fully-masked rows, replace their
+            # -inf entries with 0 so softmax is finite, then zero the result.
+            #
+            # The previous implementation used a clamp(min=1e-20) trick on
+            # the denominator, which also produces p=0 for all-masked rows
+            # but relies on a magic epsilon. The explicit guard is clearer
+            # and avoids any theoretical concern about the epsilon being
+            # too small for fp16/bf16 inputs (where 1e-20 underflows to 0).
+            all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
+            safe_scores = scores.masked_fill(all_invalid, 0.0)
+            p = torch.softmax(safe_scores, dim=-1)                       # [B, T, nh, topk]
+            p = p.masked_fill(all_invalid, 0.0)
+
+        out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c] in compute_dtype
 
     # optional sliding window branch (local uncompressed KV)
     if sliding_window > 0:
@@ -384,4 +410,7 @@ def naive_csa(
     # Cast to H.dtype at the very end so all intermediate computation benefits
     # from compute_dtype precision (previously the sparse branch output was
     # cast to H.dtype *before* the SW branch, losing precision unnecessarily).
-    return out.reshape(B_, T, nh * c).to(H.dtype)
+    # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
+    # matches the input's original T (right-padding added zeros at the end,
+    # which never affect real-token outputs thanks to the causal block mask).
+    return out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
