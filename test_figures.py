@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import warnings
 
 import matplotlib
@@ -33,7 +34,13 @@ import make_figures
 
 
 RESULTS_DIR = os.path.join(HERE, 'results')
-BACKUP_DIR = '/tmp/_fig_test_backups'
+# Use tempfile.gettempdir() instead of a hardcoded /tmp path so the backup
+# directory resolves correctly on platforms where /tmp does not exist
+# (e.g. Windows, or containers with a different temp root). The previous
+# hardcoded ``/tmp/_fig_test_backups`` violated the convention that all
+# test artifacts should live under a discoverable, platform-appropriate
+# temp directory.
+BACKUP_DIR = os.path.join(tempfile.gettempdir(), '_fig_test_backups')
 
 
 def _backup_results():

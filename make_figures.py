@@ -389,7 +389,11 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
         print(f'Skipping ablation figure for n_kv={n_kv} (no records to plot)')
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    # Use a taller figure (5.0in vs the original 4.5in) to accommodate
+    # the two-line x-tick labels (e.g. ``"3:1:1\n(5L, 26852p)"``) and the
+    # suptitle. See the ``subplots_adjust`` comment below for why we don't
+    # use ``tight_layout``.
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.0))
     x = np.arange(len(ratios))
 
     # Accuracy with CI95 error bars. Error rows get a distinct color so
@@ -431,29 +435,21 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                  label, ha='center', va='bottom', fontsize=9)
 
+    # Place the suptitle and use ``subplots_adjust`` (not ``tight_layout``) to
+    # manually control margins. ``tight_layout`` emits
+    # ``UserWarning: Tight layout not applied. The bottom and top margins
+    # cannot be made large enough to accommodate all Axes decorations.``
+    # when the figure has both a suptitle AND two-line x-tick labels (e.g.
+    # ``"3:1:1\n(5L, 26852p)"``), because its iterative constraint solver
+    # cannot converge within the default margin bounds. ``subplots_adjust``
+    # sets the margins directly (no solver), so it never warns. The values
+    # are tuned to leave room for: top=0.91 (suptitle), bottom=0.18
+    # (two-line x-tick labels), left=0.08 (y-axis label), right=0.97,
+    # wspace=0.3 (gap between the two subplots).
     fig.suptitle(f'Ablation: ratio trade-off (n_kv={n_kv}, multi-seed). '
                  '4:1:1 has 6 layers vs 3:1:1 has 5 — depth confound noted in paper.',
-                 fontsize=9, y=1.02)
-    # ``tight_layout`` constrains the AXES to the rect region so the suptitle
-    # (positioned at y=1.02, just above the figure's top edge) does not
-    # overlap any axis labels. ``rect=[0, 0, 1, 0.94]`` reserves the top 6%
-    # of the figure for the suptitle; without it, tight_layout would fill
-    # the entire figure area and the suptitle would overlap the axis titles.
-    #
-    # ``bbox_inches='tight'`` on savefig expands the saved image's bounding
-    # box to include ALL artists, even those positioned OUTSIDE the figure
-    # area (such as a suptitle at y=1.02). Without it, the suptitle is
-    # silently clipped at the top edge of the saved PDF/PNG — the previous
-    # code omitted bbox_inches='tight' and the suptitle was indeed clipped
-    # (the top half of the title text was cut off in the saved image).
-    #
-    # We use BOTH tight_layout (for in-figure axis spacing) AND
-    # bbox_inches='tight' (for the saved image's bounding box). They operate
-    # at different levels — tight_layout rearranges axes within the figure;
-    # bbox_inches='tight' expands the figure's saved bbox — so they do not
-    # conflict. (The earlier comment claiming they were mutually exclusive
-    # was wrong and led to the clipping bug.)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+                 fontsize=9, y=0.98)
+    fig.subplots_adjust(top=0.91, bottom=0.18, left=0.08, right=0.97, wspace=0.3)
     fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150,
                 bbox_inches='tight')
     fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150,
