@@ -213,9 +213,12 @@ class HeadwiseFusedAttention(nn.Module):
         n_blocks = Tp // m
         C = self.csa_kv(x)
         Z = self.csa_z(x)
-        C_comp = csa_compress_kv(C, Z, self.csa_B, m)           # [B, n_blocks, c]
+        C_comp = csa_compress_kv(C, Z, self.csa_B, m)           # [B, n_blocks, c] in compute_dtype
         C_comp_n = F.normalize(C_comp, dim=-1)
-        q = F.normalize(self.csa_q(x).view(B, Tp, H, c), dim=-1)
+        # Dtype: cast q to C_comp_n's dtype so the einsum doesn't crash on
+        # fp16/bf16 inputs (C_comp is fp32 from the compression function).
+        # Mirrors the fix in ops_csa.py::naive_csa and ops_hca.py::naive_hca.
+        q = F.normalize(self.csa_q(x).view(B, Tp, H, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, n_blocks, m, x.device)
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None], float('-inf'))
@@ -249,7 +252,10 @@ class HeadwiseFusedAttention(nn.Module):
         Z = self.hca_z(x)
         C_comp = csa_compress_kv(C, Z, self.hca_B, m2)
         C_comp_n = F.normalize(C_comp, dim=-1)
-        q = F.normalize(self.hca_q(x).view(B, Tp, H, c), dim=-1)
+        # Dtype: cast q to C_comp_n's dtype so the einsum doesn't crash on
+        # fp16/bf16 inputs (C_comp is fp32 from the compression function).
+        # Mirrors the fix in ops_csa.py::naive_csa and ops_hca.py::naive_hca.
+        q = F.normalize(self.hca_q(x).view(B, Tp, H, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, n_blocks, m2, x.device)
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None], float('-inf'))
@@ -276,7 +282,18 @@ class HeadwiseFusedAttention(nn.Module):
         hca_o = self._hca_heads(h)                                  # [B, T, H_hca, c]
         # If c != hd, we need a per-head projection. For the prototype we
         # assert c == hd so concat is direct (checked in __init__).
-        all_heads = torch.cat([kda_o, csa_o, hca_o], dim=2)        # [B, T, H_total, hd]
+        #
+        # Dtype: KDA output is in x.dtype (naive_recurrent_kda casts back),
+        # but CSA/HCA outputs are in compute_dtype (fp32 for fp16 inputs)
+        # because the compression functions return fp32. Concatenating mixed
+        # dtypes promotes to fp32, which then crashes o_proj (fp16 weights)
+        # with ``RuntimeError: expected m1 and m2 to have the same dtype``.
+        # Cast all heads to x.dtype before concat so the entire forward runs
+        # in the caller's dtype. The internal fp32 computation in CSA/HCA is
+        # already done — this only affects the stored output precision.
+        all_heads = torch.cat([
+            kda_o.to(x.dtype), csa_o.to(x.dtype), hca_o.to(x.dtype)
+        ], dim=2)                                                   # [B, T, H_total, hd]
         return x + self.o_proj(all_heads.reshape(B, T, self.cfg.H_total * hd))
 
 

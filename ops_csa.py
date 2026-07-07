@@ -220,7 +220,17 @@ def naive_csa(
 
     # --- 3. Shared-KV MQA core attention ---
     # attention queries (low-rank up-projection)
-    q = (cQ @ W_UQ).view(B_, T, nh, c)                             # [B, T, nh, c]
+    #
+    # Dtype consistency: ``C_comp`` is returned by ``csa_compress_kv_overlapped``
+    # in ``compute_dtype`` (fp32 for fp16 inputs, fp64 for fp64 inputs). The
+    # gathered ``kv`` and all downstream softmax/scores must therefore also be
+    # in ``compute_dtype``. If we leave ``q`` in ``H.dtype`` (e.g. fp16),
+    # ``torch.einsum`` does NOT auto-promote mixed dtypes and raises
+    # ``RuntimeError: Expected object of scalar type Half but got scalar type
+    # Float``. We cast ``q`` to ``compute_dtype`` before normalization so the
+    # entire attention core runs in one consistent precision.
+    compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
+    q = (cQ @ W_UQ).view(B_, T, nh, c).to(compute_dtype)            # [B, T, nh, c]
     q = F.normalize(q, dim=-1)
     C_comp_n = F.normalize(C_comp, dim=-1)                         # L2-normalize (cosine-similarity attention)
 
@@ -303,8 +313,7 @@ def naive_csa(
         p = torch.softmax(safe_scores, dim=-1)                       # [B, T, nh, topk]
         p = p.masked_fill(all_invalid, 0.0)
 
-    out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c]
-    out = out.to(H.dtype)
+    out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c] in compute_dtype
 
     # optional sliding window branch (local uncompressed KV)
     if sliding_window > 0:
@@ -330,7 +339,13 @@ def naive_csa(
         # was a redundant O(B*T*nh*c) op that produced numerically identical
         # results (L2-norm of an already-L2-normalized vector is a no-op
         # modulo fp rounding).
-        C_local = F.normalize(H_proj, dim=-1)                    # [B, T, c]
+        #
+        # Dtype: cast H_proj to compute_dtype so the SW branch matches the
+        # sparse branch's precision. Without this, the SW softmax runs in
+        # H.dtype (e.g. fp16) while the sparse softmax ran in compute_dtype
+        # (fp32) — an asymmetric precision loss that silently degrades the
+        # SW branch's contribution for fp16 inputs.
+        C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_local) * scale
         scores = scores.masked_fill(~win_mask[None, None], float('-inf'))
         p = torch.softmax(scores, dim=-1)
@@ -339,4 +354,7 @@ def naive_csa(
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
     # [B, T, nh*c]; the caller performs the grouped output projection.
+    # Cast to H.dtype at the very end so all intermediate computation benefits
+    # from compute_dtype precision (previously the sparse branch output was
+    # cast to H.dtype *before* the SW branch, losing precision unnecessarily).
     return out.reshape(B_, T, nh * c).to(H.dtype)

@@ -98,6 +98,13 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return recurrent_state
 
     if op == 'csa':
+        # Use max(1, ...) so T < csa_m still reports 1 block (the partial
+        # block that a real engine would allocate). Without this, T=0 would
+        # report 0 compressed KV elements, which is technically correct but
+        # makes the KV/GQA ratio 0/0 = NaN at T=0. The slight overestimate at
+        # T < csa_m (1 block instead of 0) is negligible next to the sliding-
+        # window term and matches what a production engine actually allocates
+        # (it reserves the block buffer upfront, not lazily per token).
         n_blocks = max(1, T // csa_m)
         # Compressed KV: n_blocks entries of c elements (keys serve as values).
         compressed = n_blocks * csa_c
@@ -116,6 +123,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return compressed
 
     if op == 'hca':
+        # Same max(1, ...) rationale as the 'csa' branch.
         n_blocks = max(1, T // hca_m2)
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':

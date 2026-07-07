@@ -130,7 +130,9 @@ def _measure(fn, repeats, device):
         # upper-middle element, which biased the reported latency upward
         # whenever ``repeats`` was even. (Currently masked because the caller
         # uses repeats=3, but the bug would surface on any even-repeat run.)
-        return statistics.median(times), peak_mb
+        # Guard against repeats=0: ``statistics.median([])`` raises
+        # ``StatisticsError``. Returns 0.0 so the JSON row is well-formed.
+        return (statistics.median(times) if times else 0.0), peak_mb
     else:
         # CPU path: we previously tried sampling VmRSS from /proc/self/status
         # between ``fn()`` calls, but torch's native CPU allocator (like
@@ -157,7 +159,7 @@ def _measure(fn, repeats, device):
             t1 = time.perf_counter()
             times.append(t1 - t0)
         peak_mb = None  # CPU peak memory is not reliably measurable
-        return statistics.median(times), peak_mb
+        return (statistics.median(times) if times else 0.0), peak_mb
 
 
 def bench_softmax_attn(B, T, H, K, V, device):

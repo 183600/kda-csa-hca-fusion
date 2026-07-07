@@ -30,6 +30,26 @@
     "detail": ""
   },
   {
+    "name": "GVA chunk output shape",
+    "status": "PASS",
+    "detail": "(2, 128, 4, 32)"
+  },
+  {
+    "name": "GVA chunk state shape",
+    "status": "PASS",
+    "detail": "(2, 4, 32, 32)"
+  },
+  {
+    "name": "GVA chunk vs recurrent output",
+    "status": "PASS",
+    "detail": "2.33e-09"
+  },
+  {
+    "name": "GVA chunk vs recurrent state",
+    "status": "PASS",
+    "detail": "1.12e-08"
+  },
+  {
     "name": "CSA compressed shape",
     "status": "PASS",
     "detail": "(1, 8, 16)"
@@ -100,14 +120,24 @@
     "detail": "queries t<8 have no preceding block -> all -1"
   },
   {
-    "name": "HCA sliding-window causal",
+    "name": "HCA sliding-window causal (unaffected region is stable)",
     "status": "PASS",
     "detail": "max diff in unaffected region = 0.00e+00 (fp64, win=4)"
   },
   {
-    "name": "CSA full pipeline causal",
+    "name": "HCA sliding-window affected region actually changes",
+    "status": "PASS",
+    "detail": "min diff in affected region = 7.14e-02 (guards against zero-output regressions)"
+  },
+  {
+    "name": "CSA full pipeline causal (unaffected region is stable)",
     "status": "PASS",
     "detail": "max diff in unaffected region = 0.00e+00 (fp64, win=4)"
+  },
+  {
+    "name": "CSA full pipeline SW-affected region actually changes",
+    "status": "PASS",
+    "detail": "min diff in SW-affected region = 1.10e-01 (guards against zero-SW-output regressions; sparse region is not checked because top-k may legitimately not select block bp)"
   },
   {
     "name": "hybrid padding no-crash",
@@ -153,5 +183,90 @@
     "name": "stacked state matches per-layer reference",
     "status": "PASS",
     "detail": "model._kda_state[i] == reference state for layer i"
+  },
+  {
+    "name": "HCA right-padding preserves outputs",
+    "status": "PASS",
+    "detail": "max diff = 0.00e+00 (fp64, T_orig=25, m2=8)"
+  },
+  {
+    "name": "CSA right-padding preserves outputs",
+    "status": "PASS",
+    "detail": "max diff = 0.00e+00 (fp64, T_orig=25, m=8)"
+  },
+  {
+    "name": "CSA sink matches shifted-logsumexp reference",
+    "status": "PASS",
+    "detail": "max diff = 0.00e+00 (fp64, sink=[0.5,-0.3]); a non-zero diff means the sink is not shifted by -row_max"
+  },
+  {
+    "name": "HCA sink matches shifted-logsumexp reference",
+    "status": "PASS",
+    "detail": "max diff = 0.00e+00 (fp64, sink=[0.7,-0.2]); a non-zero diff means the sink is not shifted by -row_max"
+  },
+  {
+    "name": "chunk non-divisible T=100,BT=64 output",
+    "status": "PASS",
+    "detail": "o_diff=2.79e-09, shape=(2, 100, 2, 16)"
+  },
+  {
+    "name": "chunk non-divisible T=100,BT=64 state",
+    "status": "PASS",
+    "detail": "s_diff=1.12e-08"
+  },
+  {
+    "name": "chunk non-divisible T=50,BT=64 output",
+    "status": "PASS",
+    "detail": "o_diff=2.33e-09, shape=(2, 50, 2, 16)"
+  },
+  {
+    "name": "chunk non-divisible T=50,BT=64 state",
+    "status": "PASS",
+    "detail": "s_diff=1.26e-08"
+  },
+  {
+    "name": "chunk non-divisible T=1,BT=64 output",
+    "status": "PASS",
+    "detail": "o_diff=1.16e-10, shape=(2, 1, 2, 16)"
+  },
+  {
+    "name": "chunk non-divisible T=1,BT=64 state",
+    "status": "PASS",
+    "detail": "s_diff=9.31e-10"
+  },
+  {
+    "name": "chunk non-divisible T=127,BT=32 output",
+    "status": "PASS",
+    "detail": "o_diff=3.73e-09, shape=(2, 127, 2, 16)"
+  },
+  {
+    "name": "chunk non-divisible T=127,BT=32 state",
+    "status": "PASS",
+    "detail": "s_diff=1.12e-08"
+  },
+  {
+    "name": "chunk non-divisible T=65,BT=64 output",
+    "status": "PASS",
+    "detail": "o_diff=3.73e-09, shape=(2, 65, 2, 16)"
+  },
+  {
+    "name": "chunk non-divisible T=65,BT=64 state",
+    "status": "PASS",
+    "detail": "s_diff=1.49e-08"
+  },
+  {
+    "name": "CSA fp16 forward",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16) "
+  },
+  {
+    "name": "HCA fp16 forward",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16) "
+  },
+  {
+    "name": "KDA accepts fp64 initial_state with fp32 inputs",
+    "status": "PASS",
+    "detail": ""
   }
 ]

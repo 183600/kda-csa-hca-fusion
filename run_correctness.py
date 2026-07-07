@@ -148,6 +148,164 @@ def test_kda_chunk_gva(device='cpu'):
     ]
 
 
+def test_kda_chunk_nondivisible_T(device='cpu'):
+    """Verify naive_chunk_kda matches naive_recurrent_kda when T is NOT
+    divisible by chunk_size.
+
+    The chunk path internally right-pads T up to a multiple of ``chunk_size``
+    and returns ``o[:, :original_T]``. This padding code path was previously
+    unverified — all existing tests used T divisible by chunk_size (e.g.
+    T=128, chunk_size=64). A bug in the padding logic (wrong trim axis,
+    incorrect cumsum handling of padded zeros, etc.) would go undetected.
+
+    We test multiple (T, chunk_size) combinations that trigger non-trivial
+    padding, including the edge case T=1 (single-token decode).
+    """
+    logger.info("Test: KDA chunk vs recurrent with non-divisible T (padding)")
+    torch.manual_seed(15)
+    results = []
+    for T, BT in [(100, 64), (50, 64), (1, 64), (127, 32), (65, 64)]:
+        B, H, K, V, HV = 2, 2, 16, 16, 2
+        q = torch.randn(B, T, H, K, dtype=torch.float32, device=device)
+        k = torch.randn(B, T, H, K, dtype=torch.float32, device=device)
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+        v = torch.randn(B, T, HV, V, dtype=torch.float32, device=device) * 0.1
+        g = -torch.rand(B, T, HV, K, dtype=torch.float32, device=device) * 0.05
+        beta = torch.rand(B, T, HV, dtype=torch.float32, device=device) * 0.2
+
+        o_rec, s_rec = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+        o_chk, s_chk = naive_chunk_kda(q, k, v, g, beta,
+                                        output_final_state=True, chunk_size=BT)
+
+        o_diff = (o_rec - o_chk).abs().max().item()
+        s_diff = (s_rec - s_chk).abs().max().item()
+        results.append(_ok(
+            f'chunk non-divisible T={T},BT={BT} output',
+            o_diff < 1e-4 and o_chk.shape == o_rec.shape == (B, T, HV, V),
+            f'o_diff={o_diff:.2e}, shape={tuple(o_chk.shape)}'))
+        results.append(_ok(
+            f'chunk non-divisible T={T},BT={BT} state',
+            s_diff < 1e-4 and s_chk.shape == s_rec.shape == (B, HV, K, V),
+            f's_diff={s_diff:.2e}'))
+    return results
+
+
+def test_csa_hca_fp16_dtype_consistency(device='cpu'):
+    """Verify CSA and HCA run without dtype-mismatch crashes on fp16 inputs.
+
+    The compression functions (csa_compress_kv, csa_compress_kv_overlapped)
+    return ``compute_dtype`` (fp32 for fp16 inputs). The attention query ``q``
+    was previously left in ``H.dtype`` (fp16), causing
+    ``torch.einsum`` to raise ``RuntimeError: Expected object of scalar type
+    Half but got scalar type Float`` for fp16 inputs. This test verifies the
+    dtype-consistency fix by running the full forward pass in fp16.
+
+    We only check shape and finiteness (not numerical correctness against a
+    reference) because fp16 has ~3 decimal digits of precision — the existing
+    fp64 correctness tests already cover the math.
+    """
+    logger.info("Test: CSA/HCA fp16 dtype consistency (no mixed-dtype crash)")
+    torch.manual_seed(16)
+    dtype = torch.float16
+    results = []
+
+    # --- CSA fp16 ---
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
+    sink = torch.zeros(nh, dtype=dtype, device=device)
+
+    try:
+        o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                          W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                          m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                          sliding_window=4, sink_logits=sink)
+        csa_ok = o_csa.shape == (B, T, nh * c) and torch.isfinite(o_csa.float()).all().item()
+        csa_err = ''
+    except Exception as e:
+        csa_ok = False
+        csa_err = f'{type(e).__name__}: {e}'
+    results.append(_ok('CSA fp16 forward', csa_ok,
+                       f'shape={tuple(o_csa.shape) if csa_ok else "n/a"} '
+                       f'{csa_err}'))
+
+    # --- HCA fp16 ---
+    B2, T2, d2 = 1, 32, 16
+    m2, nh2, c2, dc2 = 16, 2, 8, 16
+    H2 = torch.randn(B2, T2, d2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    sink2 = torch.zeros(nh2, dtype=dtype, device=device)
+
+    try:
+        o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                          m2=m2, nh=nh2, c=c2, dc=dc2,
+                          sliding_window=4, sink_logits=sink2)
+        hca_ok = o_hca.shape == (B2, T2, nh2 * c2) and torch.isfinite(o_hca.float()).all().item()
+        hca_err = ''
+    except Exception as e:
+        hca_ok = False
+        hca_err = f'{type(e).__name__}: {e}'
+    results.append(_ok('HCA fp16 forward', hca_ok,
+                       f'shape={tuple(o_hca.shape) if hca_ok else "n/a"} '
+                       f'{hca_err}'))
+
+    return results
+
+
+def test_kda_initial_state_dtype_mismatch(device='cpu'):
+    """Verify KDA handles initial_state with a different dtype than the inputs.
+
+    Previously, ``S += initial_state`` would raise ``RuntimeError: result type
+    Double can't be cast to the desired output type Float`` if initial_state
+    had a higher precision dtype than compute_dtype. This can happen when the
+    caller changes dtype between calls and reuses the returned state.
+    """
+    logger.info("Test: KDA initial_state dtype mismatch (fp64 state, fp32 inputs)")
+    torch.manual_seed(17)
+    B, T, H, K, V = 1, 16, 2, 8, 8
+    q = torch.randn(B, T, H, K, dtype=torch.float32, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.float32, device=device)
+    v = torch.randn(B, T, H, V, dtype=torch.float32, device=device) * 0.1
+    g = -torch.rand(B, T, H, K, dtype=torch.float32, device=device) * 0.05
+    beta = torch.rand(B, T, H, dtype=torch.float32, device=device) * 0.2
+
+    # First call with fp32 -> returns fp32 state.
+    _, s_fp32 = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+    # Cast state to fp64 (simulates a caller who stored it in higher precision).
+    s_fp64 = s_fp32.to(torch.float64)
+
+    # Second call with fp32 inputs but fp64 initial_state.
+    try:
+        o, s = naive_recurrent_kda(q, k, v, g, beta,
+                                   initial_state=s_fp64, output_final_state=True)
+        ok = torch.isfinite(o).all().item() and torch.isfinite(s).all().item()
+        err = ''
+    except Exception as e:
+        ok = False
+        err = f'{type(e).__name__}: {e}'
+    return [
+        _ok('KDA accepts fp64 initial_state with fp32 inputs', ok, err),
+    ]
+
+
 def test_csa_causality(device='cpu'):
     logger.info("Test: CSA compression + indexer causality")
     torch.manual_seed(2)
@@ -1169,6 +1327,10 @@ def main():
     all_results += test_hybrid_per_layer_kda_state(device)
     all_results += test_csa_hca_right_padding_correctness(device)
     all_results += test_csa_hca_sink_numerical_correctness(device)
+    # New tests for dtype consistency and chunk padding edge cases.
+    all_results += test_kda_chunk_nondivisible_T(device)
+    all_results += test_csa_hca_fp16_dtype_consistency(device)
+    all_results += test_kda_initial_state_dtype_mismatch(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

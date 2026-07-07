@@ -49,12 +49,20 @@ def naive_hca(
     # --- 1. Heavy KV compression (single branch, no overlap) ---
     C = H @ W_KV                                                   # [B, T, c]
     Z = H @ W_Z                                                    # [B, T, c]
-    C_comp = csa_compress_kv(C, Z, B_pos, m2)                     # [B, n_blocks, c]
+    C_comp = csa_compress_kv(C, Z, B_pos, m2)                     # [B, n_blocks, c] in compute_dtype
     C_comp_n = F.normalize(C_comp, dim=-1)
 
     # --- 2. Dense shared-KV MQA ---
+    # Dtype consistency: ``C_comp`` is returned by ``csa_compress_kv`` in
+    # ``compute_dtype`` (fp32 for fp16 inputs, fp64 for fp64 inputs). The
+    # downstream ``scores`` einsum mixes ``q`` (H.dtype) with ``C_comp_n``
+    # (compute_dtype); ``torch.einsum`` does NOT auto-promote mixed dtypes and
+    # raises ``RuntimeError`` for fp16/bf16 inputs. We cast ``q`` to
+    # ``compute_dtype`` before normalization so the entire attention core runs
+    # in one consistent precision. Mirrors the fix in ``ops_csa.py::naive_csa``.
+    compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     cQ = H @ W_DQ                                                  # [B, T, dc]
-    q = (cQ @ W_UQ).view(B_, T, nh, c)                            # [B, T, nh, c]
+    q = (cQ @ W_UQ).view(B_, T, nh, c).to(compute_dtype)           # [B, T, nh, c]
     q = F.normalize(q, dim=-1)
 
     # Causal block mask: query t attends ONLY to blocks strictly before
@@ -131,7 +139,13 @@ def naive_hca(
         # win_mask broadcasts from [1, 1, T, T] -> [B, nh, T, T].
         # NOTE: every query t always has itself in the window (dist=0 satisfies
         # the mask for win >= 1), so no row is fully -inf and softmax is NaN-free.
-        C_local = F.normalize(C, dim=-1)                            # [B, T, c]
+        #
+        # Dtype: cast C to compute_dtype so the SW branch matches the dense
+        # branch's precision. Without this, the SW softmax runs in H.dtype
+        # (e.g. fp16) while the dense softmax ran in compute_dtype (fp32) —
+        # an asymmetric precision loss that silently degrades the SW branch's
+        # contribution for fp16 inputs. Mirrors the fix in ops_csa.py.
+        C_local = F.normalize(C.to(compute_dtype), dim=-1)              # [B, T, c]
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_local) * scale
         scores = scores.masked_fill(~win_mask[None, None], float('-inf'))
         p = torch.softmax(scores, dim=-1)

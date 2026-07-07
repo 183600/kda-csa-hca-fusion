@@ -61,7 +61,14 @@ def naive_recurrent_kda(
 
     S = q.new_zeros(B, HV, K, V)
     if initial_state is not None:
-        S += initial_state
+        # Cast initial_state to compute_dtype before adding. If the caller
+        # passes a higher-precision state (e.g. fp64 state with fp32 inputs
+        # where compute_dtype=fp32), the in-place add would raise
+        # ``RuntimeError: result type Double can't be cast to the desired
+        # output type Float``. This can happen when the caller changes dtype
+        # between calls (e.g. fp64 first call -> fp32 second call) and reuses
+        # the returned state as initial_state.
+        S += initial_state.to(compute_dtype)
     o = torch.zeros_like(v)
     for i in range(0, T):
         q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
@@ -145,7 +152,10 @@ def naive_chunk_kda(
 
     S = q.new_zeros(B, HV, K, V)
     if initial_state is not None:
-        S += initial_state
+        # Cast initial_state to compute_dtype before adding (same reason as
+        # naive_recurrent_kda: prevents dtype-mismatch RuntimeError when the
+        # caller reuses a state from a different-precision call).
+        S += initial_state.to(compute_dtype)
     o = torch.zeros_like(v)
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
     for i in range(0, NT):

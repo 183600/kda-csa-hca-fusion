@@ -251,12 +251,17 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     # correctly (averages the two middle values) — the previous
     # ``sorted(times)[len(times)//2]`` returned the upper-middle for even n.
     import statistics
-    prefill_ms = statistics.median(prefill_times)
+    # Guard against empty timing lists (n_decode=0 or repeats=0). Previously
+    # ``statistics.median([])`` raised ``StatisticsError: no median for empty
+    # data`` and ``sum([])/0`` raised ``ZeroDivisionError``. Both are
+    # degenerate configurations, but a defensive guard prevents a confusing
+    # crash and instead reports zeros so the JSON row is still well-formed.
+    prefill_ms = statistics.median(prefill_times) if prefill_times else 0.0
     # Per-token: median across (trial, token-step) samples — flattens the
     # repeats x n_decode matrix into one list and takes its median.
     flat_decode = [t for trial in all_decode_times for t in trial]
-    median_decode = statistics.median(flat_decode)
-    mean_decode = sum(flat_decode) / len(flat_decode)
+    median_decode = statistics.median(flat_decode) if flat_decode else 0.0
+    mean_decode = sum(flat_decode) / len(flat_decode) if flat_decode else 0.0
 
     if device.type == 'cuda':
         # ``max_memory_allocated`` returns the peak across all timed trials

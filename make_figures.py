@@ -80,14 +80,21 @@ def fig_kv_cache():
     honest number; the other mode is reported separately in the JSON).
     """
     data = load('exp3_kv_cache.json')
-    # Pick the accounting mode from the first record that has the field;
-    # default to 'full_accounting' for the figure. Older result files without
-    # the field fall through with mode=None and we plot all rows (legacy).
-    mode = None
-    for r in data:
-        if 'accounting_mode' in r:
-            mode = 'full_accounting'
-            break
+    # Pick the accounting mode: prefer 'full_accounting' (the more honest
+    # number), but only if it actually exists in the data. Fall back to
+    # 'compressed_kv_only' if that's all that's available. Older result files
+    # without the field fall through with mode=None and we plot all rows
+    # (legacy). Previously the code unconditionally picked 'full_accounting'
+    # whenever ANY record had the field, which would silently produce an empty
+    # figure if the JSON only contained 'compressed_kv_only' records (e.g.
+    # from a partial run).
+    available_modes = {r.get('accounting_mode') for r in data if 'accounting_mode' in r}
+    if 'full_accounting' in available_modes:
+        mode = 'full_accounting'
+    elif 'compressed_kv_only' in available_modes:
+        mode = 'compressed_kv_only'
+    else:
+        mode = None  # legacy: no accounting_mode field, plot all rows
     ops = {}
     for r in data:
         if mode is not None and r.get('accounting_mode', mode) != mode:
@@ -134,11 +141,16 @@ def fig_flops():
     We default to ``full_accounting`` for consistency with ``fig_kv_cache``.
     """
     data = load('exp3_kv_cache.json')
-    mode = None
-    for r in data:
-        if 'accounting_mode' in r:
-            mode = 'full_accounting'
-            break
+    # Same mode-selection logic as fig_kv_cache: prefer 'full_accounting' but
+    # fall back to 'compressed_kv_only' if that's all that exists. Prevents
+    # an empty figure when the JSON only has one mode.
+    available_modes = {r.get('accounting_mode') for r in data if 'accounting_mode' in r}
+    if 'full_accounting' in available_modes:
+        mode = 'full_accounting'
+    elif 'compressed_kv_only' in available_modes:
+        mode = 'compressed_kv_only'
+    else:
+        mode = None
     ops = {}
     for r in data:
         if mode is not None and r.get('accounting_mode', mode) != mode:
@@ -404,7 +416,11 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     # code called both, which double-applied padding and could clip axis
     # labels. ``constrained_layout=True`` would be even better but would
     # require restructuring the subplots call.
-    fig.tight_layout()
+    #
+    # Use ``rect`` to reserve space at the top for the suptitle (y=1.02).
+    # Without this, ``tight_layout()`` fills the entire figure area and the
+    # suptitle gets clipped at the top edge of the saved PDF/PNG.
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150)
     fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150)
     if write_legacy_name:
