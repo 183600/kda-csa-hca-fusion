@@ -418,9 +418,16 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         'csa':     lambda: CSAAttn(d_model),
         'hca':     lambda: HCAAttn(d_model),
     }
+    # Create embed and head BEFORE the operator-specific layer so their
+    # initial weights are IDENTICAL across operators for a given seed.
+    # Different operators have different parameter counts, so creating the
+    # layer first would consume a different number of RNG draws and desync
+    # the downstream head init — a silent confound in the multi-seed CI.
+    # (The previous order was embed -> layer -> head, which left the head's
+    # init operator-dependent.)
     embed = nn.Embedding(vocab, d_model).to(device)
-    layer = ResidualAttnLayer(factories[op_name](), d_model).to(device)
     head = MQARHead(d_model, vocab).to(device)
+    layer = ResidualAttnLayer(factories[op_name](), d_model).to(device)
     params = list(embed.parameters()) + list(layer.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
 

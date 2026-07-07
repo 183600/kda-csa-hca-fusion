@@ -273,5 +273,70 @@
     "name": "hybrid backward produces finite non-zero grads for differentiable params",
     "status": "PASS",
     "detail": "differentiable_with_grad=54, differentiable_no_grad=[], differentiable_zero_grad=[], differentiable_non_finite=[]"
+  },
+  {
+    "name": "CSA bf16 forward",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16) "
+  },
+  {
+    "name": "HCA bf16 forward",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16) "
+  },
+  {
+    "name": "CSA no-sink no-SW",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16)"
+  },
+  {
+    "name": "HCA no-sink no-SW",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16)"
+  },
+  {
+    "name": "CSA topk==n_blocks",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16), finite=True, topk=4"
+  },
+  {
+    "name": "CSA topk>n_blocks",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 16), finite=True, topk=8"
+  },
+  {
+    "name": "KDA T=1 output shape",
+    "status": "PASS",
+    "detail": "(2, 1, 2, 8)"
+  },
+  {
+    "name": "KDA T=1 state shape",
+    "status": "PASS",
+    "detail": "(2, 2, 8, 8)"
+  },
+  {
+    "name": "KDA T=1 finite",
+    "status": "PASS",
+    "detail": ""
+  },
+  {
+    "name": "CSA extreme sink",
+    "status": "PASS",
+    "detail": "finite=True"
+  },
+  {
+    "name": "HCA extreme sink",
+    "status": "PASS",
+    "detail": "finite=True"
+  },
+  {
+    "name": "hybrid no-KDA forward",
+    "status": "PASS",
+    "detail": "shape=(2, 16, 32), layout=CSA-HCA"
+  },
+  {
+    "name": "hybrid no-KDA state is None",
+    "status": "PASS",
+    "detail": "_kda_state is None: True"
   }
 ]

@@ -99,11 +99,18 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
 def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=42,
                 device='cpu', eval_batches=4, eval_batch=64, train_batch=None):
     torch.manual_seed(seed)
+    # Create embed and head BEFORE the ratio-specific model so their initial
+    # weights are IDENTICAL across ratios for a given seed. Different ratios
+    # have different parameter counts, so creating the model first would
+    # consume a different number of RNG draws and desync the downstream
+    # embed/head init — a silent confound in the multi-seed CI. (The previous
+    # order was model -> head -> embed, which left both embed and head
+    # ratio-dependent.) Mirrors the fix in run_quality.py::train_one.
+    embed = nn.Embedding(16, d_model).to(device)
+    head = MQARHead(d_model, 16).to(device)
     cfg = _make_cfg(d_model, ratio)
     total = sum(ratio)
     model = HybridKCHAttention(cfg, total_layers=total).to(device)
-    head = MQARHead(d_model, 16).to(device)
-    embed = nn.Embedding(16, d_model).to(device)
     params = list(model.parameters()) + list(head.parameters()) + list(embed.parameters())
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
 

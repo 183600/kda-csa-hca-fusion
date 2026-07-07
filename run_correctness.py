@@ -1394,6 +1394,301 @@ def test_hybrid_backward_produces_grads(device='cpu'):
     ]
 
 
+def test_csa_hca_bf16_dtype_consistency(device='cpu'):
+    """Verify CSA and HCA run without dtype-mismatch crashes on bf16 inputs.
+
+    The existing fp16 test covers the half-precision code path, but bf16 has
+    a different exponent/mantissa split (8 exponent bits vs 10 for fp16) and
+    may expose different rounding behavior. This test mirrors
+    ``test_csa_hca_fp16_dtype_consistency`` for bf16.
+    """
+    logger.info("Test: CSA/HCA bf16 dtype consistency (no mixed-dtype crash)")
+    torch.manual_seed(200)
+    dtype = torch.bfloat16
+    results = []
+
+    # --- CSA bf16 ---
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
+    sink = torch.zeros(nh, dtype=dtype, device=device)
+
+    try:
+        o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                          W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                          m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                          sliding_window=4, sink_logits=sink)
+        csa_ok = o_csa.shape == (B, T, nh * c) and torch.isfinite(o_csa.float()).all().item()
+        csa_err = ''
+    except Exception as e:
+        csa_ok = False
+        csa_err = f'{type(e).__name__}: {e}'
+    results.append(_ok('CSA bf16 forward', csa_ok,
+                       f'shape={tuple(o_csa.shape) if csa_ok else "n/a"} '
+                       f'{csa_err}'))
+
+    # --- HCA bf16 ---
+    B2, T2, d2 = 1, 32, 16
+    m2, nh2, c2, dc2 = 16, 2, 8, 16
+    H2 = torch.randn(B2, T2, d2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    sink2 = torch.zeros(nh2, dtype=dtype, device=device)
+
+    try:
+        o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                          m2=m2, nh=nh2, c=c2, dc=dc2,
+                          sliding_window=4, sink_logits=sink2)
+        hca_ok = o_hca.shape == (B2, T2, nh2 * c2) and torch.isfinite(o_hca.float()).all().item()
+        hca_err = ''
+    except Exception as e:
+        hca_ok = False
+        hca_err = f'{type(e).__name__}: {e}'
+    results.append(_ok('HCA bf16 forward', hca_ok,
+                       f'shape={tuple(o_hca.shape) if hca_ok else "n/a"} '
+                       f'{hca_err}'))
+
+    return results
+
+
+def test_csa_hca_no_sink_no_sliding_window(device='cpu'):
+    """Verify CSA/HCA work with sink_logits=None and sliding_window=0.
+
+    The default config in HybridConfig uses both sink and sliding_window, so
+    the no-sink/no-SW code path is only exercised when explicitly tested.
+    A bug in either branch (e.g. a None check on sink_logits, or a missing
+    guard for sliding_window=0) would go undetected without this test.
+    """
+    logger.info("Test: CSA/HCA with no sink and no sliding window")
+    torch.manual_seed(201)
+    results = []
+
+    # --- CSA no sink, no SW ---
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_aKV = torch.randn(d, c, device=device) * 0.1
+    W_bKV = torch.randn(d, c, device=device) * 0.1
+    W_aZ = torch.randn(d, c, device=device) * 0.1
+    W_bZ = torch.randn(d, c, device=device) * 0.1
+    Ba = torch.randn(m, c, device=device) * 0.1
+    Bb = torch.randn(m, c, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
+    W_w = torch.randn(d, nIh, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, device=device) * 0.1
+    try:
+        o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                          W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                          m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                          sliding_window=0, sink_logits=None)
+        csa_ok = o_csa.shape == (B, T, nh * c) and torch.isfinite(o_csa).all().item()
+    except Exception as e:
+        csa_ok = False
+    results.append(_ok('CSA no-sink no-SW', csa_ok,
+                       f'shape={tuple(o_csa.shape) if csa_ok else "n/a"}'))
+
+    # --- HCA no sink, no SW ---
+    B2, T2, d2 = 1, 32, 16
+    m2, nh2, c2, dc2 = 16, 2, 8, 16
+    H2 = torch.randn(B2, T2, d2, device=device) * 0.1
+    W_KV2 = torch.randn(d2, c2, device=device) * 0.1
+    W_Z2 = torch.randn(d2, c2, device=device) * 0.1
+    B_pos2 = torch.randn(m2, c2, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, device=device) * 0.1
+    try:
+        o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                          m2=m2, nh=nh2, c=c2, dc=dc2,
+                          sliding_window=0, sink_logits=None)
+        hca_ok = o_hca.shape == (B2, T2, nh2 * c2) and torch.isfinite(o_hca).all().item()
+    except Exception as e:
+        hca_ok = False
+    results.append(_ok('HCA no-sink no-SW', hca_ok,
+                       f'shape={tuple(o_hca.shape) if hca_ok else "n/a"}'))
+
+    return results
+
+
+def test_csa_topk_edge_cases(device='cpu'):
+    """Verify CSA handles topk == n_blocks and topk > n_blocks.
+
+    When topk >= n_blocks, every selected index is valid (no -1 padding
+    needed). When topk > n_blocks, the lightning indexer pads with -1 and
+    the sparse MQA core must mask those slots to -inf in the softmax. A bug
+    in either the padding or the masking would produce NaN or wrong outputs.
+    """
+    logger.info("Test: CSA topk edge cases (==n_blocks, >n_blocks)")
+    torch.manual_seed(202)
+    results = []
+    B, T, d = 1, 32, 16
+    m, nh, nIh, c, c_I, dc = 8, 2, 2, 8, 4, 8
+    n_blocks = T // m
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_aKV = torch.randn(d, c, device=device) * 0.1
+    W_bKV = torch.randn(d, c, device=device) * 0.1
+    W_aZ = torch.randn(d, c, device=device) * 0.1
+    W_bZ = torch.randn(d, c, device=device) * 0.1
+    Ba = torch.randn(m, c, device=device) * 0.1
+    Bb = torch.randn(m, c, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
+    W_w = torch.randn(d, nIh, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, device=device) * 0.1
+    sink = torch.zeros(nh, device=device)
+
+    for topk, label in [(n_blocks, 'topk==n_blocks'),
+                        (n_blocks + 4, 'topk>n_blocks')]:
+        try:
+            o = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                          W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                          m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                          sliding_window=0, sink_logits=sink)
+            ok_ = o.shape == (B, T, nh * c) and torch.isfinite(o).all().item()
+            results.append(_ok(f'CSA {label}', ok_,
+                               f'shape={tuple(o.shape)}, finite={ok_}, topk={topk}'))
+        except Exception as e:
+            results.append(_ok(f'CSA {label}', False, f'{type(e).__name__}: {e}'))
+    return results
+
+
+def test_kda_single_token_decode(device='cpu'):
+    """Verify KDA handles T=1 (single-token decode step).
+
+    This is the critical path for autoregressive decoding: each decode step
+    processes exactly T=1 token. A bug in the T=1 path (e.g. an off-by-one
+    in the recurrent loop, or a shape mismatch in the output) would break
+    decoding but might not be caught by tests using T>=16.
+    """
+    logger.info("Test: KDA with T=1 (single-token decode)")
+    torch.manual_seed(203)
+    B, T, H, K, V = 2, 1, 2, 8, 8
+    q = torch.randn(B, T, H, K, device=device)
+    k = torch.randn(B, T, H, K, device=device)
+    v = torch.randn(B, T, H, V, device=device) * 0.1
+    g = -torch.rand(B, T, H, K, device=device) * 0.05
+    beta = torch.rand(B, T, H, device=device) * 0.2
+    o, s = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+    return [
+        _ok('KDA T=1 output shape', o.shape == (B, T, H, V), str(tuple(o.shape))),
+        _ok('KDA T=1 state shape', s.shape == (B, H, K, V), str(tuple(s.shape))),
+        _ok('KDA T=1 finite', torch.isfinite(o).all().item() and torch.isfinite(s).all().item(), ''),
+    ]
+
+
+def test_csa_hca_extreme_sink_values(device='cpu'):
+    """Verify CSA/HCA do not produce NaN with extreme sink_logits (+/-100).
+
+    The log-space sink implementation shifts by -row_max for numerical
+    stability. Extreme sink values (e.g. +100 or -100) test that the shift
+    prevents overflow (exp(100) = inf) and underflow (exp(-100) = 0) without
+    producing NaN. A bug in the shift logic would produce NaN via inf/inf or
+    -inf - (-inf).
+    """
+    logger.info("Test: CSA/HCA with extreme sink_logits (+/-100)")
+    torch.manual_seed(204)
+    results = []
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_aKV = torch.randn(d, c, device=device) * 0.1
+    W_bKV = torch.randn(d, c, device=device) * 0.1
+    W_aZ = torch.randn(d, c, device=device) * 0.1
+    W_bZ = torch.randn(d, c, device=device) * 0.1
+    Ba = torch.randn(m, c, device=device) * 0.1
+    Bb = torch.randn(m, c, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
+    W_w = torch.randn(d, nIh, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, device=device) * 0.1
+    sink = torch.tensor([100.0, -100.0], device=device)
+    try:
+        o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
+                          W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
+                          m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                          sliding_window=0, sink_logits=sink)
+        results.append(_ok('CSA extreme sink', torch.isfinite(o_csa).all().item(),
+                           f'finite={torch.isfinite(o_csa).all().item()}'))
+    except Exception as e:
+        results.append(_ok('CSA extreme sink', False, f'{type(e).__name__}: {e}'))
+
+    # HCA extreme sink
+    B2, T2, d2 = 1, 32, 16
+    m2, nh2, c2, dc2 = 16, 2, 8, 16
+    H2 = torch.randn(B2, T2, d2, device=device) * 0.1
+    W_KV2 = torch.randn(d2, c2, device=device) * 0.1
+    W_Z2 = torch.randn(d2, c2, device=device) * 0.1
+    B_pos2 = torch.randn(m2, c2, device=device) * 0.1
+    W_DQ2 = torch.randn(d2, dc2, device=device) * 0.1
+    W_UQ2 = torch.randn(dc2, c2 * nh2, device=device) * 0.1
+    sink2 = torch.tensor([100.0, -100.0], device=device)
+    try:
+        o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
+                          m2=m2, nh=nh2, c=c2, dc=dc2,
+                          sliding_window=0, sink_logits=sink2)
+        results.append(_ok('HCA extreme sink', torch.isfinite(o_hca).all().item(),
+                           f'finite={torch.isfinite(o_hca).all().item()}'))
+    except Exception as e:
+        results.append(_ok('HCA extreme sink', False, f'{type(e).__name__}: {e}'))
+    return results
+
+
+def test_hybrid_no_kda_layout(device='cpu'):
+    """Verify HybridKCHAttention works with n_kda=0 (CSA+HCA only).
+
+    When there are no KDA layers, ``_kda_state`` should remain None and the
+    forward pass should not attempt to stack empty states. A bug in the
+    ``n_kda_layers > 0`` guard or the state-stacking logic would crash.
+    """
+    logger.info("Test: Hybrid with no-KDA layout (CSA+HCA only)")
+    torch.manual_seed(205)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=0, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=2).to(device).eval()
+    x = torch.randn(2, 16, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model.reset_state()
+        y = model(x)
+    state_is_none = model._kda_state is None
+    return [
+        _ok('hybrid no-KDA forward', y.shape == x.shape and torch.isfinite(y).all().item(),
+            f'shape={tuple(y.shape)}, layout={model.layout_str()}'),
+        _ok('hybrid no-KDA state is None', state_is_none,
+            f'_kda_state is None: {state_is_none}'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1429,6 +1724,13 @@ def main():
     all_results += test_kda_initial_state_dtype_mismatch(device)
     # Regression test for hybrid backward gradient flow.
     all_results += test_hybrid_backward_produces_grads(device)
+    # Additional edge-case tests for broader coverage.
+    all_results += test_csa_hca_bf16_dtype_consistency(device)
+    all_results += test_csa_hca_no_sink_no_sliding_window(device)
+    all_results += test_csa_topk_edge_cases(device)
+    all_results += test_kda_single_token_decode(device)
+    all_results += test_csa_hca_extreme_sink_values(device)
+    all_results += test_hybrid_no_kda_layout(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)
