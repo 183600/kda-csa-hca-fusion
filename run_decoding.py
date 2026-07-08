@@ -83,8 +83,17 @@ class SoftmaxAttnDecoding(nn.Module):
         k = self.k(x).view(B, T_new, self.H, self.K)
         v = self.v(x).view(B, T_new, self.H, self.V)
         if self._cache_k is None:
-            self._cache_k = k
-            self._cache_v = v
+            # Detach k/v before caching so the KV cache does not accumulate
+            # autograd graph nodes across decode steps. Without this, each
+            # ``torch.cat`` in the else-branch below would retain the previous
+            # step's graph, causing an O(N) memory leak across N decode steps
+            # when the caller forgets to wrap inference in ``torch.no_grad()``.
+            # The cache is just a tensor of numbers (keys/values); it does not
+            # need to carry gradients. Mirrors the always-detach pattern in
+            # ops_fused.py::HybridKCHAttention.forward and the KDA state fix
+            # in KDAAttnDecoding.forward below.
+            self._cache_k = k.detach()
+            self._cache_v = v.detach()
         else:
             # Cast incoming k/v to the cache's dtype before concat. The
             # cache is set on the FIRST forward call (prefill) and retains
@@ -98,9 +107,14 @@ class SoftmaxAttnDecoding(nn.Module):
             # call, and all subsequent calls are coerced to match. This
             # mirrors the dtype-coercion pattern in
             # ops_kda.py::naive_recurrent_kda (initial_state.to(compute_dtype)).
+            #
+            # Detach before concat for the same reason as the first-call
+            # branch: prevent graph accumulation across decode steps.
             cache_dtype = self._cache_k.dtype
-            self._cache_k = torch.cat([self._cache_k, k.to(cache_dtype)], dim=1)
-            self._cache_v = torch.cat([self._cache_v, v.to(cache_dtype)], dim=1)
+            self._cache_k = torch.cat(
+                [self._cache_k, k.to(cache_dtype).detach()], dim=1)
+            self._cache_v = torch.cat(
+                [self._cache_v, v.to(cache_dtype).detach()], dim=1)
         T_full = self._cache_k.shape[1]
         s = torch.einsum('bthk,bshk->bhts', q, self._cache_k) * self.scale
         # Causal mask: query at relative position t in the current chunk is at
@@ -155,13 +169,18 @@ class KDAAttnDecoding(nn.Module):
         v = F.silu(self.v(x)).view(B, T_new, self.H, self.V)
         g = -F.softplus(self.g(x)).view(B, T_new, self.H, self.K) * 0.1
         beta = torch.sigmoid(self.beta(x))
-        # Detach the incoming state in training mode so the autograd graph
-        # from the previous step is not retained (otherwise backward() would
-        # raise "backward through the graph a second time"). In eval/decoding
-        # mode we keep the graph so that stateful generation works.
+        # Always detach the incoming state so the autograd graph from the
+        # previous step is not retained. In training mode this prevents
+        # "backward through the graph a second time" errors; in eval mode it
+        # prevents an O(N) memory leak across N forward calls when the caller
+        # forgets to wrap inference in ``torch.no_grad()`` (each call would
+        # otherwise retain the previous call's graph, accumulating unbounded
+        # memory during long autoregressive decoding). Stateful generation
+        # works fine with a detached state — the state is just a tensor of
+        # numbers, not a graph node.
         # Mirrors the fix in ops_fused.py::HybridKCHAttention.forward.
         state = self._state
-        if state is not None and self.training:
+        if state is not None:
             state = state.detach()
         o, self._state = naive_recurrent_kda(
             q, k, v, g, beta, scale=self.K ** -0.5,
