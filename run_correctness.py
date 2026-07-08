@@ -511,6 +511,69 @@ def test_kda_gradient(device='cpu'):
     ]
 
 
+def test_kda_chunk_vs_recurrent_gradient(device='cpu'):
+    """Gradient agreement between ``naive_recurrent_kda`` and ``naive_chunk_kda``.
+
+    The forward-pass agreement is already checked by
+    ``test_kda_chunk_vs_recurrent``. This companion test verifies that the
+    BACKWARD path of the chunkwise implementation (which routes gradients
+    through ``torch.linalg.solve_triangular`` and the Neumann series) also
+    agrees with the reference recurrence. A silent gradient mismatch would
+    let training "work" (loss decreases) while learning wrong parameter
+    updates — a particularly insidious class of bug.
+
+    The check uses fp64 so the agreement tolerance can be tight (1e-8).
+    """
+    logger.info("Test: KDA chunk vs recurrent GRADIENT agreement (fp64)")
+    torch.manual_seed(7)
+    B, T, H, K, V = 1, 64, 2, 8, 8
+    # Use the same leaf tensors for both paths so the gradients are directly
+    # comparable (no RNG desync from re-sampling).
+    q0 = torch.randn(B, T, H, K, dtype=torch.float64, device=device)
+    k0 = torch.randn(B, T, H, K, dtype=torch.float64, device=device)
+    v0 = torch.randn(B, T, H, V, dtype=torch.float64, device=device) * 0.1
+    g0 = -torch.rand(B, T, H, K, dtype=torch.float64, device=device) * 0.05
+    b0 = torch.rand(B, T, H, dtype=torch.float64, device=device) * 0.2
+
+    def make_leaves():
+        return [t.clone().requires_grad_(True) for t in (q0, k0, v0, g0, b0)]
+
+    # Recurrent path.
+    q, k, v, g, beta = make_leaves()
+    o_rec, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
+    loss_rec = (o_rec ** 2).sum()
+    loss_rec.backward()
+    rec_grads = [t.grad.clone() for t in (q, k, v, g, beta)]
+
+    # Chunk path.
+    q, k, v, g, beta = make_leaves()
+    o_chk, _ = naive_chunk_kda(q, k, v, g, beta, output_final_state=False,
+                               chunk_size=16)
+    loss_chk = (o_chk ** 2).sum()
+    loss_chk.backward()
+    chk_grads = [t.grad.clone() for t in (q, k, v, g, beta)]
+
+    names = ['q', 'k', 'v', 'g', 'beta']
+    max_diff = 0.0
+    for name, rg, cg in zip(names, rec_grads, chk_grads):
+        d = (rg - cg).abs().max().item()
+        max_diff = max(max_diff, d)
+    return [
+        _ok('chunk grad == recurrent grad (q)', (rec_grads[0] - chk_grads[0]).abs().max().item() < 1e-8,
+            f'max|d|={((rec_grads[0] - chk_grads[0]).abs().max().item()):.2e}'),
+        _ok('chunk grad == recurrent grad (k)', (rec_grads[1] - chk_grads[1]).abs().max().item() < 1e-8,
+            f'max|d|={((rec_grads[1] - chk_grads[1]).abs().max().item()):.2e}'),
+        _ok('chunk grad == recurrent grad (v)', (rec_grads[2] - chk_grads[2]).abs().max().item() < 1e-8,
+            f'max|d|={((rec_grads[2] - chk_grads[2]).abs().max().item()):.2e}'),
+        _ok('chunk grad == recurrent grad (g)', (rec_grads[3] - chk_grads[3]).abs().max().item() < 1e-8,
+            f'max|d|={((rec_grads[3] - chk_grads[3]).abs().max().item()):.2e}'),
+        _ok('chunk grad == recurrent grad (beta)', (rec_grads[4] - chk_grads[4]).abs().max().item() < 1e-8,
+            f'max|d|={((rec_grads[4] - chk_grads[4]).abs().max().item()):.2e}'),
+        _ok('chunk vs recurrent max grad diff (all tensors)', max_diff < 1e-8,
+            f'max_diff={max_diff:.2e} (fp64)'),
+    ]
+
+
 def test_csa_indexer_validity(device='cpu'):
     """Check CSA top-k indices are in range and the count is correct."""
     logger.info("Test: CSA indexer top-k validity")
@@ -1996,6 +2059,76 @@ def test_weight_decay_param_groups(device='cpu'):
     ]
 
 
+def test_csa_hca_zero_length_sequence(device='cpu'):
+    """Regression: ``naive_csa`` / ``naive_hca`` must accept T=0 without crashing.
+
+    Previously an empty input (T=0) caused a cryptic broadcasting error deep
+    inside ``csa_compress_kv`` / ``csa_compress_kv_overlapped`` because
+    ``n_blocks=0`` made the [B, n_blocks, m, c] reshape collapse against the
+    [m, c] positional bias. The fix adds an early-return guard at the top of
+    each operator. This test verifies the guard fires and returns a properly
+    shaped zero output.
+    """
+    logger.info("Test: CSA/HCA accept T=0 (empty sequence)")
+    torch.manual_seed(210)
+    B, T, d = 1, 0, 16
+    m, m2, nh, c, dc = 8, 16, 2, 8, 16
+    H = torch.randn(B, T, d, device=device) * 0.1
+    # CSA weights
+    W_aKV = torch.randn(d, c, device=device) * 0.1
+    W_bKV = torch.randn(d, c, device=device) * 0.1
+    W_aZ = torch.randn(d, c, device=device) * 0.1
+    W_bZ = torch.randn(d, c, device=device) * 0.1
+    Ba = torch.randn(m, c, device=device) * 0.1
+    Bb = torch.randn(m, c, device=device) * 0.1
+    W_DQ = torch.randn(d, dc, device=device) * 0.1
+    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_w = torch.randn(d, nh, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c, device=device) * 0.1
+    B_idx = torch.randn(m, c, device=device) * 0.1
+    sink = torch.zeros(nh, device=device)
+    # HCA weights
+    W_KV = torch.randn(d, c, device=device) * 0.1
+    W_Z = torch.randn(d, c, device=device) * 0.1
+    B_pos = torch.randn(m2, c, device=device) * 0.1
+
+    csa_ok = False
+    try:
+        o_csa = naive_csa(
+            H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb, W_DQ, W_UQ, W_IUQ,
+            W_w, W_KV_idx, W_Z_idx, B_idx,
+            m=m, topk=4, nh=nh, nIh=2, c=c, c_I=c, dc=dc,
+            sliding_window=0, sink_logits=sink,
+        )
+        csa_ok = (o_csa.shape == (B, 0, nh * c)
+                  and torch.isfinite(o_csa).all().item())
+    except Exception as e:
+        csa_err = f'{type(e).__name__}: {e}'
+    else:
+        csa_err = ''
+    hca_ok = False
+    try:
+        o_hca = naive_hca(
+            H, W_KV, W_Z, B_pos, W_DQ, W_UQ,
+            m2=m2, nh=nh, c=c, dc=dc,
+            sliding_window=0, sink_logits=sink,
+        )
+        hca_ok = (o_hca.shape == (B, 0, nh * c)
+                  and torch.isfinite(o_hca).all().item())
+    except Exception as e:
+        hca_err = f'{type(e).__name__}: {e}'
+    else:
+        hca_err = ''
+    return [
+        _ok('CSA T=0 returns zero-shaped output', csa_ok,
+            f'shape={tuple(o_csa.shape) if csa_ok else "n/a"}, err={csa_err}'),
+        _ok('HCA T=0 returns zero-shaped output', hca_ok,
+            f'shape={tuple(o_hca.shape) if hca_ok else "n/a"}, err={hca_err}'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -2015,6 +2148,8 @@ def main():
     # New reviewer-driven checks.
     all_results += test_overlap_causality(device)
     all_results += test_kda_gradient(device)
+    # Regression test for chunk-vs-recurrent gradient agreement (fp64).
+    all_results += test_kda_chunk_vs_recurrent_gradient(device)
     all_results += test_csa_indexer_validity(device)
     all_results += test_hca_sliding_window_causality(device)
     all_results += test_csa_full_pipeline_causality(device)
@@ -2044,6 +2179,8 @@ def main():
     all_results += test_hca_T_smaller_than_m2(device)
     # Regression test for weight-decay parameter grouping.
     all_results += test_weight_decay_param_groups(device)
+    # Regression test for T=0 (empty sequence) edge case.
+    all_results += test_csa_hca_zero_length_sequence(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

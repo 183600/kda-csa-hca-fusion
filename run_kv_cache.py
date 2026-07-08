@@ -46,7 +46,15 @@ BF16_BYTES = 2
 DEFAULTS = dict(
     H=8, K=128, V=128, d=4096,
     csa_m=16, csa_c=128, csa_topk=512, csa_nIh=4, csa_cI=32, csa_sliding_window=2048,
+    # Number of attention heads for CSA / HCA core. The paper's §3.3 uses 8
+    # heads (matching H); the sink has ``nh`` elements per layer. Previously
+    # these keys were absent from DEFAULTS, so ``kv_cache_elements`` fell back
+    # to ``p.get('csa_nh', H)`` and silently used H=8 — which happened to be
+    # correct, but only by accident. Make the value explicit so the sink
+    # count is correct even if H is ever changed.
+    csa_nh=8, csa_dc=128,
     hca_m2=64, hca_c=128, hca_sliding_window=2048,
+    hca_nh=8, hca_dc=128,
     kda_hv=8, kda_k=128, kda_v=128,
 )
 

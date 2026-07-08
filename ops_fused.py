@@ -255,10 +255,17 @@ class HybridKCHAttention(nn.Module):
         # (each KDA layer has different parameters, so its recurrent state is
         # not interchangeable with another layer's state).
         #
-        # Detach the incoming state in training mode so the autograd graph
-        # from the previous step is not retained (otherwise backward() would
-        # raise "backward through the graph a second time"). In eval/decoding
-        # mode we keep the graph so that stateful generation works.
+        # Detach the incoming state so the autograd graph from the previous
+        # step is not retained. In training mode this prevents
+        # "backward through the graph a second time" errors; in eval mode it
+        # prevents an O(N) memory leak across N forward calls when the caller
+        # forgets to wrap inference in ``torch.no_grad()`` (each call would
+        # otherwise retain the previous call's graph, accumulating
+        # unbounded memory during long autoregressive decoding). The graph is
+        # never needed for inference — eval-with-backward is unusual; if a
+        # caller genuinely needs gradients through the recurrent state across
+        # calls (e.g. BPTT), they should keep the graph manually rather than
+        # relying on this implicit behavior.
         #
         # If the batch size changed (e.g. train batch=16, eval batch=8), the
         # old state is invalid and we drop it. We also drop it on a device
@@ -269,7 +276,9 @@ class HybridKCHAttention(nn.Module):
             # Batch dim is axis 1 (axis 0 is the per-layer index).
             if stacked.shape[1] != x.shape[0] or stacked.device != x.device:
                 stacked = None
-            elif self.training:
+            else:
+                # Always detach: training (BPTT safety) AND eval (memory leak
+                # prevention). See the comment above for the full rationale.
                 stacked = stacked.detach()
         if stacked is not None:
             states = [stacked[i] for i in range(stacked.shape[0])]

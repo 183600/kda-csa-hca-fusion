@@ -51,6 +51,14 @@ def naive_hca(
     if scale is None:
         scale = c ** -0.5
     device = H.device
+    # Degenerate case: empty sequence. Without this guard the downstream
+    # ``csa_compress_kv`` would raise a cryptic broadcasting error
+    # (``Expected size 0 but got size 1``) because n_blocks=0 makes the
+    # [B, n_blocks, m2, c] reshape collapse against [m2, c] positional bias.
+    # Return a zero-shaped output matching the contract. Mirrors the guard
+    # in ``ops_csa.py::naive_csa``.
+    if T == 0:
+        return torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
     # Right-pad T up to a multiple of m2 so callers don't have to. Real
     # tokens keep their original positions; only the last partial block
     # contains padding zeros, and no real token attends to it (causal block

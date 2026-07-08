@@ -371,7 +371,16 @@ class HCAAttn(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         c, dc = 32, 64
-        m2, nh = 4, 2
+        # HCA's defining feature is *heavy* compression: m2 should be >> m so
+        # the HCA branch produces far fewer compressed blocks than CSA, trading
+        # recall granularity for global context. The previous value m2=4 was
+        # equal to CSA's m=4 (see CSAAttn above), which made HCA behave
+        # identically to CSA-without-indexer and silently defeated the purpose
+        # of including HCA in the MQAR comparison. With seq_len=16 and CSA
+        # m=4 (n_blocks_CSA=4), setting m2=8 gives n_blocks_HCA=2, exercising
+        # the heavier-compression regime. Mirrors the rationale already
+        # documented in run_ablation.py::_make_cfg.
+        m2, nh = 8, 2
         self.m2, self.nh, self.c, self.dc = m2, nh, c, dc
         self.W_KV = nn.Linear(d_model, c, bias=False)
         self.W_Z = nn.Linear(d_model, c, bias=False)
