@@ -115,7 +115,7 @@ def naive_hca(
         # Without the shift the sink is over-weighted by exp(M), a
         # systematic ~13% bias in the default c=64 config. See the
         # detailed comment in ops_csa.py::naive_csa for the algebra.
-        log_sink = sink_logits.view(1, nh, 1, 1).to(scores.dtype)  # [1, nh, 1, 1]
+        log_sink = sink_logits.view(1, nh, 1, 1).to(scores)  # [1, nh, 1, 1]
         # scores already carries -inf at causally-masked slots, so
         # logsumexp/exp naturally yield 0 there; fully-masked rows also
         # collapse to p=0 (logaddexp(-inf, log_sink) = log_sink,

@@ -335,8 +335,13 @@ class KDAAttn(nn.Module):
 
     def forward(self, x):
         B, T, d = x.shape
-        q = F.normalize(F.silu(self.q(x)), dim=-1).view(B, T, self.H, self.K)
-        k = F.normalize(F.silu(self.k(x)), dim=-1).view(B, T, self.H, self.K)
+        # View BEFORE normalize: F.normalize(dim=-1) must operate on each
+        # per-head K-dim vector, not on the concatenated H*K vector. The
+        # previous form normalized the full H*K vector, shrinking each
+        # head's L2 norm to ~1/sqrt(H) and under-scaling q.k dot products
+        # by 1/H. Mirrors the fix in ops_fused.py::KDAHybridLayer.
+        q = F.normalize(F.silu(self.q(x)).view(B, T, self.H, self.K), dim=-1)
+        k = F.normalize(F.silu(self.k(x)).view(B, T, self.H, self.K), dim=-1)
         v = F.silu(self.v(x)).view(B, T, self.H, self.V)
         g = -F.softplus(self.g(x)).view(B, T, self.H, self.K) * 0.1
         beta = torch.sigmoid(self.beta(x))

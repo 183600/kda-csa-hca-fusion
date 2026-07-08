@@ -96,8 +96,16 @@ class KDAHybridLayer(nn.Module):
         # padding=0 conv keeps length T -> causal short-conv output.
         x_conv = F.pad(x.transpose(1, 2), (self.short_conv.kernel_size[0] - 1, 0))
         x_conv = self.short_conv(x_conv).transpose(1, 2)
-        q = F.normalize(F.silu(self.q_proj(x_conv)), dim=-1).view(B, T, H, K)
-        k = F.normalize(F.silu(self.k_proj(x_conv)), dim=-1).view(B, T, H, K)
+        # View BEFORE normalize: ``F.normalize(dim=-1)`` must operate on each
+        # per-head K-dim vector, not on the concatenated H*K vector. The
+        # previous form ``F.normalize(F.silu(...), dim=-1).view(B, T, H, K)``
+        # L2-normalized the full H*K vector, so each head's L2 norm became
+        # ~1/sqrt(H) instead of 1. This silently shrinks q.k dot products by
+        # a factor of 1/H, which propagates into the KDA recurrence as
+        # under-scaled delta-rule updates. Mirrors the (correct) CSA/HCA
+        # branches below and the fix in method_analysis.py.
+        q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
+        k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
         v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
         # log-space gate: low-rank down/up with a softplus-style decay
         g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * 0.1

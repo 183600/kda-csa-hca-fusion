@@ -33,15 +33,24 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Anchor every relative path to THIS FILE's directory so the script works
-# regardless of the current working directory. Previously ``load()`` opened
-# ``'results/{name}'`` (relative to cwd), so running the script from a
-# different directory (e.g. ``python ../make_figures.py``) failed with
-# ``FileNotFoundError`` on every figure. The same fix applies to every
-# ``fig.savefig(os.path.join(_FIGURES_DIR, '...'))`` call below.
+# Anchor every relative path to THIS FILE's directory by default so the
+# script works regardless of the current working directory. Previously
+# ``load()`` opened ``'results/{name}'`` (relative to cwd), so running the
+# script from a different directory (e.g. ``python ../make_figures.py``)
+# failed with ``FileNotFoundError`` on every figure.
+#
+# On Kaggle, however, ``run_all.py`` does ``os.chdir(out_root)`` (typically
+# ``/kaggle/working``) before running the experiments, so the *experiment
+# scripts* write their JSONs to ``/kaggle/working/results/`` while this
+# module's ``_ROOT`` still points at the read-only ``/kaggle/input/...``.
+# Without honoring an override, every data-driven figure was silently
+# skipped (existence checks failed) and ``fig_architecture`` raised
+# ``OSError [Errno 30]``. We therefore let the caller redirect both
+# ``_RESULTS_DIR`` and ``_FIGURES_DIR`` via env vars (set by ``run_all.py``
+# to ``{out_root}/results`` / ``{out_root}/figures`` on Kaggle).
 _ROOT = os.path.dirname(os.path.abspath(__file__))
-_RESULTS_DIR = os.path.join(_ROOT, 'results')
-_FIGURES_DIR = os.path.join(_ROOT, 'figures')
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', os.path.join(_ROOT, 'results'))
+_FIGURES_DIR = os.environ.get('FIGURES_DIR', os.path.join(_ROOT, 'figures'))
 
 
 def load(name):
@@ -370,8 +379,11 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
                 f'{m:.3f}', ha='center', va='bottom', fontsize=10)
     ax.legend(fontsize=9)
     _ensure_figures_dir()
-    fig.savefig(f'figures/fig_mqar_nkv{n_kv}.pdf', dpi=150)
-    fig.savefig(f'figures/fig_mqar_nkv{n_kv}.png', dpi=150)
+    # Use _FIGURES_DIR (env-overridable) instead of a relative path so the
+    # file lands in the same directory as every other figure and respects
+    # the Kaggle output-dir override set by run_all.py.
+    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_mqar_nkv{n_kv}.pdf'), dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_mqar_nkv{n_kv}.png'), dpi=150)
     if write_legacy_name:
         fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.pdf'), dpi=150)
         fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.png'), dpi=150)
@@ -391,7 +403,11 @@ def fig_ablation():
     when only a single ``n_kv`` group is present the original
     ``figures/fig_ablation.pdf/.png`` filename is also written.
     """
-    path = 'results/exp5_ablation.json'
+    # Use _RESULTS_DIR (env-overridable) for the existence check, not a
+    # relative path. The ``load()`` call below uses _RESULTS_DIR; checking a
+    # different path meant the figure was silently skipped whenever the
+    # script was run from a different cwd (e.g. via run_all.py on Kaggle).
+    path = os.path.join(_RESULTS_DIR, 'exp5_ablation.json')
     if not os.path.exists(path):
         print('Skipping ablation figure (no results yet)')
         return

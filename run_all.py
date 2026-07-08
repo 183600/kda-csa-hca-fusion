@@ -95,6 +95,26 @@ def _run(name, fn):
         return {'name': name, 'status': 'fail', 'time_s': dt, 'error': str(e)}
 
 
+def _sanitize(obj):
+    """Recursively replace NaN/Inf floats with None so json.dump(allow_nan=False)
+    succeeds. Mirrors the helper in run_kv_cache.py / run_decoding.py.
+
+    A single experiment crash that leaves a NaN in the summary (e.g. a
+    ``time_s=float('nan')`` from a clock glitch) used to make the entire
+    ``summary.json`` write raise ``ValueError: Out of range float values are
+    not JSON compliant``, dropping the whole summary on the floor. The
+    summary fields are normally finite, but the defensive guard is cheap.
+    """
+    import math
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def run_all(seeds=None, steps=None):
     """Run every experiment in sequence.
 
@@ -131,6 +151,15 @@ def run_all(seeds=None, steps=None):
     os.chdir(out_root)
     os.makedirs('results', exist_ok=True)
     os.makedirs('figures', exist_ok=True)
+    # Tell make_figures.py where to read results and write figures. On Kaggle
+    # this is /kaggle/working/{results,figures}, NOT the read-only
+    # /kaggle/input/... directory where this script lives. Without these env
+    # vars, make_figures.py reads from _ROOT/results (read-only, possibly
+    # stale) and tries to write to _ROOT/figures (raising OSError [Errno 30]).
+    # On a normal clone, out_root==HERE so the env vars match the defaults
+    # already used by make_figures.py and the behavior is unchanged.
+    os.environ['RESULTS_DIR'] = os.path.join(out_root, 'results')
+    os.environ['FIGURES_DIR'] = os.path.join(out_root, 'figures')
 
     summary = {'env': repr(info), 'runs': []}
 
@@ -218,7 +247,7 @@ def run_all(seeds=None, steps=None):
     print(f'  {n_ok} ok, {n_fail} failed, total {total_t:.1f}s')
 
     with open('results/summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(_sanitize(summary), f, indent=2, allow_nan=False)
     print('\nSaved: results/summary.json')
 
 

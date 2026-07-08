@@ -294,9 +294,13 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         try:
             r = eval_layout(ratio, seed=s, steps=steps, device=device, **kw)
             r['train_time_s'] = time.time() - t0
-            per_seed.append(r)
+            # Log BEFORE appending so that if the formatter raises (e.g. on an
+            # unexpected None field) the except branch appends a single clean
+            # stub, not a duplicate of the half-built entry. Mirrors the fix
+            # in run_quality.py::train_multi_seed.
             logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
                         f"fwd={r['fwd_ms']:.2f}ms  time={r['train_time_s']:.1f}s")
+            per_seed.append(r)
         except Exception as e:
             logger.warning(f"    seed {s} FAILED: {e}")
             per_seed.append({
@@ -481,7 +485,14 @@ def main():
                     res['significant_bonferroni'] = False
                 all_results.append(res)
                 logger.info(f"  layout={res['layout']}  n_params={res['n_params']}  n_layers={res['n_layers']}")
-                logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {res['ci95_acc']:.4f} "
+                # ci95_acc is None when only one seed survived (see
+                # eval_layout_multi_seed). Formatting None directly raises
+                # ``TypeError: unsupported format string passed to NoneType``.
+                # Fall back to 'n/a' for the log line; the JSON summary table
+                # (line below) already handles None via ``r.get(...) or 0.0``.
+                _ci = res['ci95_acc']
+                _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
+                logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {_ci_str} "
                             f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)}, "
                             f"sig_bonferroni={res['significant_bonferroni']})")
                 logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")

@@ -1769,6 +1769,80 @@ def test_hybrid_no_kda_layout(device='cpu'):
     ]
 
 
+def test_hybrid_no_csa_layout(device='cpu'):
+    """Verify HybridKCHAttention works with n_csa=0 (KDA+HCA only).
+
+    The ablation experiment sweeps ratios including ``(3,0,1)``; a bug in
+    ``_build_layout`` or the per-layer dispatcher would only surface as a
+    runtime error during the ablation. This test mirrors
+    ``test_hybrid_no_kda_layout`` for the no-CSA case: forward shape,
+    finiteness, and KDA state survives across calls.
+    """
+    logger.info("Test: Hybrid with no-CSA layout (KDA+HCA only)")
+    torch.manual_seed(207)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        kda_chunk_size=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=1, n_csa=0, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=2).to(device).eval()
+    x = torch.randn(2, 16, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model.reset_state()
+        y1 = model(x)
+        # Second call: KDA state should persist and be re-used.
+        y2 = model(x)
+    state_is_stacked = model._kda_state is not None
+    return [
+        _ok('hybrid no-CSA forward', y1.shape == x.shape and torch.isfinite(y1).all().item(),
+            f'shape={tuple(y1.shape)}, layout={model.layout_str()}'),
+        _ok('hybrid no-CSA state persists', state_is_stacked,
+            f'_kda_state is not None: {state_is_stacked}'),
+        _ok('hybrid no-CSA second call', y2.shape == x.shape and torch.isfinite(y2).all().item(),
+            f'shape={tuple(y2.shape)}'),
+    ]
+
+
+def test_hybrid_no_hca_layout(device='cpu'):
+    """Verify HybridKCHAttention works with n_hca=0 (KDA+CSA only).
+
+    The ablation experiment sweeps ratios including ``(3,1,0)`` and
+    ``(0,1,0)``; a bug in ``_build_layout`` or the per-layer dispatcher
+    would only surface as a runtime error during the ablation. This test
+    mirrors ``test_hybrid_no_kda_layout`` for the no-HCA case.
+    """
+    logger.info("Test: Hybrid with no-HCA layout (KDA+CSA only)")
+    torch.manual_seed(208)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        kda_chunk_size=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=1, n_csa=1, n_hca=0,
+    )
+    model = HybridKCHAttention(cfg, total_layers=2).to(device).eval()
+    x = torch.randn(2, 16, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        model.reset_state()
+        y1 = model(x)
+        y2 = model(x)
+    state_is_stacked = model._kda_state is not None
+    return [
+        _ok('hybrid no-HCA forward', y1.shape == x.shape and torch.isfinite(y1).all().item(),
+            f'shape={tuple(y1.shape)}, layout={model.layout_str()}'),
+        _ok('hybrid no-HCA state persists', state_is_stacked,
+            f'_kda_state is not None: {state_is_stacked}'),
+        _ok('hybrid no-HCA second call', y2.shape == x.shape and torch.isfinite(y2).all().item(),
+            f'shape={tuple(y2.shape)}'),
+    ]
+
+
 def test_csa_hca_non_divisible_T(device='cpu'):
     """Regression: ``naive_csa`` and ``naive_hca`` must accept T not divisible
     by m / m2 without crashing.
@@ -2226,6 +2300,9 @@ def main():
     all_results += _run_safe(test_kda_single_token_decode, device)
     all_results += _run_safe(test_csa_hca_extreme_sink_values, device)
     all_results += _run_safe(test_hybrid_no_kda_layout, device)
+    # Regression tests for n_csa=0 / n_hca=0 layouts (ablation sweep coverage).
+    all_results += _run_safe(test_hybrid_no_csa_layout, device)
+    all_results += _run_safe(test_hybrid_no_hca_layout, device)
     # Regression tests for the internal-padding + topk=0 fixes.
     all_results += _run_safe(test_csa_hca_non_divisible_T, device)
     all_results += _run_safe(test_csa_topk_zero, device)

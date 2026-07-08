@@ -165,8 +165,13 @@ class KDAAttnDecoding(nn.Module):
 
     def forward(self, x):
         B, T_new, _ = x.shape
-        q = F.normalize(F.silu(self.q(x)), dim=-1).view(B, T_new, self.H, self.K)
-        k = F.normalize(F.silu(self.k(x)), dim=-1).view(B, T_new, self.H, self.K)
+        # View BEFORE normalize: F.normalize(dim=-1) must operate on each
+        # per-head K-dim vector, not on the concatenated H*K vector. The
+        # previous form normalized the full H*K vector, shrinking each
+        # head's L2 norm to ~1/sqrt(H) and under-scaling q.k dot products
+        # by 1/H. Mirrors the fix in ops_fused.py::KDAHybridLayer.
+        q = F.normalize(F.silu(self.q(x)).view(B, T_new, self.H, self.K), dim=-1)
+        k = F.normalize(F.silu(self.k(x)).view(B, T_new, self.H, self.K), dim=-1)
         v = F.silu(self.v(x)).view(B, T_new, self.H, self.V)
         g = -F.softplus(self.g(x)).view(B, T_new, self.H, self.K) * 0.1
         beta = torch.sigmoid(self.beta(x))
@@ -245,9 +250,6 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
             model(x_new)
     if device.type == 'cuda':
         torch.cuda.synchronize()
-        # Reset peak memory AFTER warmup so the reported peak reflects the
-        # timed trials, not the warmup allocations.
-        torch.cuda.reset_peak_memory_stats(device)
         # IMPORTANT: reset the model state BEFORE capturing the baseline.
         # The warmup above populated the KV cache (softmax) / recurrent
         # state (KDA) with (prefill_len + 3) tokens of context. If we
@@ -263,6 +265,14 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # Re-capture baseline AFTER the reset: now it's just the model
         # parameters and any persistent buffers, NOT the warmup cache.
         baseline_bytes = torch.cuda.memory_allocated(device)
+        # Reset peak memory AFTER both warmup AND model.reset() so the
+        # reported peak reflects only the timed trials, not the warmup
+        # allocations. ``model.reset()`` is currently a no-op on memory
+        # (just sets ``self._state = None``), but resetting peak AFTER
+        # the reset is the robust order — if reset ever switches to
+        # zeroing buffers in place, no transient reset allocation can
+        # leak into the reported peak.
+        torch.cuda.reset_peak_memory_stats(device)
     else:
         baseline_bytes = 0
 

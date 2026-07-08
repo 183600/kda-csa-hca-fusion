@@ -327,7 +327,7 @@ def naive_csa(
             #   logaddexp(a - M, b - M) = logaddexp(a, b) - M
             # so the shifted computation is mathematically identical to the
             # unshifted (overflow-prone) one.
-            log_sink = sink_logits.view(1, 1, nh, 1).to(scores.dtype)  # [1, 1, nh, 1]
+            log_sink = sink_logits.view(1, 1, nh, 1).to(scores)  # [1, 1, nh, 1]
             vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
             # NOTE: renamed from `m` to `row_max` to avoid shadowing the
             # `m` parameter (compression factor). The previous `m = ...`
