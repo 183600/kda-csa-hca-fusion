@@ -51,6 +51,61 @@ from ops_hca import naive_hca
 logger = logging.getLogger(__name__)
 
 
+def _build_param_groups(*modules, weight_decay=0.01):
+    """Build AdamW parameter groups with proper weight-decay exclusion.
+
+    Standard ML practice: embeddings, biases, and LayerNorm parameters should
+    NOT be weight-decayed. Weight decay on these can hurt training quality
+    (e.g. shrinking the embedding table towards zero degrades representation
+    quality; decaying LayerNorm affine params breaks normalization statistics).
+
+    Grouping rules:
+      * Parameters from ``nn.Embedding`` modules -> no decay
+      * Parameters from ``nn.LayerNorm`` modules -> no decay
+      * 1-D parameters (biases, e.g. ``nn.Conv1d.bias``, ``nn.Linear.bias``)
+        -> no decay
+      * All other parameters (e.g. ``nn.Linear.weight``, ``nn.Conv1d.weight``,
+        ``nn.Parameter`` tensors of ndim >= 2) -> decay
+
+    Note: we check the MODULE TYPE (not the parameter name) to identify
+    embeddings and LayerNorms, because ``named_parameters()`` on a submodule
+    returns names RELATIVE to that submodule (e.g. just ``weight``, not
+    ``embed.weight``). A name-based heuristic would miss the embedding table.
+
+    Returns a list of param groups suitable for ``torch.optim.AdamW``.
+    """
+    no_decay = []
+    decay = []
+    for module in modules:
+        # Collect the ids of parameters that belong to Embedding / LayerNorm
+        # submodules. We walk the module tree once so that nested modules
+        # (e.g. ``layer.norm`` inside ``ResidualAttnLayer``) are correctly
+        # identified by their module type, not by a fragile name match.
+        no_decay_ids = set()
+        for submod in module.modules():
+            if isinstance(submod, (nn.Embedding, nn.LayerNorm)):
+                for p in submod.parameters(recurse=False):
+                    no_decay_ids.add(id(p))
+        for name, p in module.named_parameters():
+            if not p.requires_grad:
+                continue
+            # Exclude: Embedding/LayerNorm params (by module type), 1-D params
+            # (biases), and any nn.Parameter with ndim < 2 (e.g. the CSA/HCA
+            # positional biases Ba/Bb/B_idx/B_pos and the sink logits).
+            is_no_decay = (
+                id(p) in no_decay_ids
+                or p.ndim <= 1
+            )
+            if is_no_decay:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+    return [
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
+
+
 def _fmt_tstat(t, width=12, prec=2):
     """Format a t-statistic for display, None-safe.
 
@@ -446,8 +501,13 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     embed = nn.Embedding(vocab, d_model).to(device)
     head = MQARHead(d_model, vocab).to(device)
     layer = ResidualAttnLayer(factories[op_name](), d_model).to(device)
-    params = list(embed.parameters()) + list(layer.parameters()) + list(head.parameters())
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    # Build parameter groups with proper weight-decay exclusion: embeddings,
+    # biases, and LayerNorm parameters are NOT weight-decayed (standard ML
+    # practice — decaying these can hurt training quality). The previous
+    # version applied weight decay uniformly to all parameters.
+    param_groups = _build_param_groups(embed, layer, head, weight_decay=0.01)
+    opt = torch.optim.AdamW(param_groups, lr=lr)
+    params = [p for g in param_groups for p in g['params']]
 
     # Separate generator for batch generation so the per-step batches are
     # IDENTICAL across operators for a given seed (the model init consumed a

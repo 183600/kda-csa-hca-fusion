@@ -990,26 +990,21 @@ def test_bench_hybrid_no_grad_inference(device='cpu'):
     soon as the ``with`` block ends, so later ``fn()`` calls ran with
     gradients enabled -- silently inflating both latency (graph construction)
     and peak memory (retained activations). We now put no_grad inside fn().
+
+    This test imports the ACTUAL ``bench_hybrid`` from ``run_benchmark``
+    (which has no matplotlib dependency) so that any future regression in
+    ``bench_hybrid`` itself — not just in an inline replica — is caught.
+    The previous version re-implemented the bench pattern inline, which meant
+    a bug introduced into ``run_benchmark.bench_hybrid`` would go undetected.
     """
     logger.info("Test: bench_hybrid runs under no_grad (regression)")
-    # Replicate the fixed bench_hybrid pattern inline so the test is
-    # self-contained and does not import run_benchmark (which would pull in
-    # matplotlib etc.).
-    cfg = HybridConfig(
-        d_model=32, n_heads_qk=2, n_heads_v=2,
-        head_dim_k=16, head_dim_v=16,
-        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
-        csa_sliding_window=8,
-        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
-        n_kda=3, n_csa=1, n_hca=1,
-    )
-    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
-    x = torch.randn(1, 16, cfg.d_model, device=device) * 0.1
-
-    def fn():
-        with torch.no_grad():
-            return model(x)
-
+    # Import the actual bench_hybrid so the test catches regressions in the
+    # real function, not just in an inline replica. ``run_benchmark`` does
+    # NOT import matplotlib (only ``make_figures`` does), so the import is
+    # lightweight and safe.
+    from run_benchmark import bench_hybrid
+    B, T, d = 1, 16, 32
+    fn = bench_hybrid(B, T, d, device)
     y = fn()
     return [
         _ok('bench_hybrid output is grad-free', not y.requires_grad,
@@ -1894,6 +1889,113 @@ def test_hca_T_smaller_than_m2(device='cpu'):
     ]
 
 
+def test_weight_decay_param_groups(device='cpu'):
+    """Regression: ``_build_param_groups`` must exclude embeddings, biases,
+    and LayerNorm parameters from the weight-decay group.
+
+    Standard ML practice: embeddings, biases, and LayerNorm affine parameters
+    should NOT be weight-decayed. The ``_build_param_groups`` helper in
+    ``run_quality.py`` implements this grouping; this test verifies:
+
+      1. ``nn.Embedding`` weights are in the no-decay group.
+      2. ``nn.LayerNorm`` weight and bias are in the no-decay group.
+      3. ``nn.Linear`` bias is in the no-decay group.
+      4. ``nn.Linear`` weight (2-D) is in the decay group.
+      5. 1-D ``nn.Parameter`` tensors (e.g. CSA sink logits, positional
+         biases) are in the no-decay group.
+      6. The total parameter count in both groups matches the sum of all
+         module parameters (no parameter is dropped or duplicated).
+      7. The weight_decay values are correctly set on each group.
+    """
+    logger.info("Test: weight decay param groups (embed/bias/LayerNorm excluded)")
+    from run_quality import _build_param_groups
+    from ops_fused import HybridKCHAttention, HybridConfig
+
+    embed = torch.nn.Embedding(16, 32).to(device)
+    head = torch.nn.Sequential(
+        torch.nn.LayerNorm(32),
+        torch.nn.Linear(32, 16),  # has bias=True by default
+    ).to(device)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=5).to(device)
+
+    groups = _build_param_groups(embed, head, model, weight_decay=0.01)
+    decay_params = groups[0]['params']
+    no_decay_params = groups[1]['params']
+    decay_wd = groups[0]['weight_decay']
+    no_decay_wd = groups[1]['weight_decay']
+
+    # 7. Weight decay values are correct.
+    wd_ok = (decay_wd == 0.01 and no_decay_wd == 0.0)
+
+    # 6. Total param count matches.
+    total_in_groups = len(decay_params) + len(no_decay_params)
+    total_in_modules = len(list(embed.parameters())) + len(list(head.parameters())) + len(list(model.parameters()))
+    count_ok = (total_in_groups == total_in_modules)
+
+    # Build id sets for fast lookup.
+    decay_ids = {id(p) for p in decay_params}
+    no_decay_ids = {id(p) for p in no_decay_params}
+
+    # 1. Embedding weight is in no-decay.
+    embed_weight_id = id(list(embed.parameters())[0])
+    embed_ok = embed_weight_id in no_decay_ids
+
+    # 2. LayerNorm weight and bias are in no-decay.
+    ln_params = [p for m in head.modules() if isinstance(m, torch.nn.LayerNorm)
+                 for p in m.parameters(recurse=False)]
+    ln_ok = all(id(p) in no_decay_ids for p in ln_params) and len(ln_params) >= 2
+
+    # 3. Linear bias is in no-decay.
+    linear_biases = [p for m in head.modules() if isinstance(m, torch.nn.Linear)
+                     for p in m.parameters(recurse=False) if p.ndim == 1]
+    linear_bias_ok = all(id(p) in no_decay_ids for p in linear_biases) and len(linear_biases) >= 1
+
+    # 4. Linear weight (2-D) is in decay.
+    linear_weights = [p for m in head.modules() if isinstance(m, torch.nn.Linear)
+                      for p in m.parameters(recurse=False) if p.ndim == 2]
+    linear_weight_ok = all(id(p) in decay_ids for p in linear_weights) and len(linear_weights) >= 1
+
+    # 5. 1-D nn.Parameter tensors (sink logits, positional biases) are in
+    #    no-decay. The CSA sink is shape (nh,) = (2,), 1-D.
+    sink_params = [p for n, p in model.named_parameters() if 'sink' in n.lower()]
+    sink_ok = all(id(p) in no_decay_ids for p in sink_params) and len(sink_params) >= 1
+
+    # 5b. 2-D nn.Parameter tensors (Ba, Bb, B_idx, B_pos) are in decay.
+    # These are 2-D positional bias parameters; whether to decay them is a
+    # judgment call. Our heuristic puts them in the decay group (ndim >= 2).
+    pos_bias_params = [p for n, p in model.named_parameters()
+                       if any(k in n for k in ('Ba', 'Bb', 'B_idx', 'B_pos'))
+                       and p.ndim == 2]
+    pos_bias_ok = all(id(p) in decay_ids for p in pos_bias_params) and len(pos_bias_params) >= 1
+
+    return [
+        _ok('weight_decay values correct (0.01 / 0.0)', wd_ok,
+            f'decay_wd={decay_wd}, no_decay_wd={no_decay_wd}'),
+        _ok('param count matches (no params dropped/duplicated)', count_ok,
+            f'in_groups={total_in_groups}, in_modules={total_in_modules}'),
+        _ok('nn.Embedding weight in no-decay group', embed_ok,
+            f'embed.weight id in no_decay: {embed_ok}'),
+        _ok('nn.LayerNorm params in no-decay group', ln_ok,
+            f'{len(ln_params)} LayerNorm params, all in no_decay'),
+        _ok('nn.Linear bias in no-decay group', linear_bias_ok,
+            f'{len(linear_biases)} Linear biases, all in no_decay'),
+        _ok('nn.Linear weight in decay group', linear_weight_ok,
+            f'{len(linear_weights)} Linear weights, all in decay'),
+        _ok('1-D nn.Parameter (sink) in no-decay group', sink_ok,
+            f'{len(sink_params)} sink params, all in no_decay'),
+        _ok('2-D nn.Parameter (positional bias) in decay group', pos_bias_ok,
+            f'{len(pos_bias_params)} pos-bias params, all in decay'),
+    ]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1940,6 +2042,8 @@ def main():
     all_results += test_csa_hca_non_divisible_T(device)
     all_results += test_csa_topk_zero(device)
     all_results += test_hca_T_smaller_than_m2(device)
+    # Regression test for weight-decay parameter grouping.
+    all_results += test_weight_decay_param_groups(device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

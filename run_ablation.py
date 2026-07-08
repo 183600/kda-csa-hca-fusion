@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device
 from ops_fused import HybridKCHAttention, HybridConfig
-from run_quality import make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975
+from run_quality import make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975, _build_param_groups
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +140,12 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
     cfg = _make_cfg(d_model, ratio)
     total = sum(ratio)
     model = HybridKCHAttention(cfg, total_layers=total).to(device)
-    params = list(model.parameters()) + list(head.parameters()) + list(embed.parameters())
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    # Build parameter groups with proper weight-decay exclusion: embeddings,
+    # biases, and LayerNorm parameters are NOT weight-decayed (standard ML
+    # practice). Mirrors the fix in run_quality.py::train_one.
+    param_groups = _build_param_groups(model, head, embed, weight_decay=0.01)
+    opt = torch.optim.AdamW(param_groups, lr=lr)
+    params = [p for g in param_groups for p in g['params']]
 
     layout = model.layout_str()
     n_params = sum(p.numel() for p in model.parameters())
