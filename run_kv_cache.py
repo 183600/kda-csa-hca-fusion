@@ -31,6 +31,7 @@ Linear §3.2 / §7.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -195,8 +196,18 @@ def prefill_flops(op: str, T: int, **kw):
     kda_hv, kda_k, kda_v = p['kda_hv'], p['kda_k'], p['kda_v']
 
     if op == 'softmax_gqa':
-        # QK^T (K term) + softmax·V (V term) over T x T x H heads.
-        return 2 * T * T * H * (K + V)
+        # CAUSAL attention (matching the SoftmaxAttn baseline in
+        # run_quality.py and run_decoding.py::SoftmaxAttnDecoding which
+        # apply a strictly-upper-triangular mask). Each query t attends
+        # to keys [0, t], i.e. (t+1) keys. Total attention entries over
+        # all queries = T*(T+1)/2 (the upper-triangular-inclusive count).
+        # The previous formula ``2 * T * T * H * (K + V)`` assumed a FULL
+        # T*T attention matrix (non-causal), overcounting FLOPs by ~2x.
+        # Since ``flops_ratio_vs_gqa_* = flops(op) / flops(softmax_gqa)``,
+        # this 2x baseline bias made every other operator look ~2x
+        # cheaper than it really is.
+        causal_entries = T * (T + 1) // 2
+        return 2 * causal_entries * H * (K + V)
     if op == 'kda':
         # Input projections — count the ACTUAL matmul shapes from
         # ops_fused.py::KDAHybridLayer, not an approximation. The previous
@@ -244,8 +255,17 @@ def prefill_flops(op: str, T: int, **kw):
                   + 2 * T * p['csa_nIh'] * n_blocks
         # Core sparse attention: QK^T (c term) + softmax·V (c term).
         core = 2 * T * csa_topk * csa_c * H * 2
-        # Sliding window: QK^T + softmax·V over the local window.
-        sw = 2 * T * p['csa_sliding_window'] * csa_c * H * 2
+        # Sliding window: causal window — query t attends to positions
+        # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
+        # query). The previous formula ``T * w`` assumed every query
+        # attends to exactly w keys, which overcounts by ~8x at T=512
+        # (where w=2048 but only ~131K of the 1M claimed entries exist).
+        # Total causal-window entries = T*w - w*(w-1)/2 when T >= w,
+        # else T*(T+1)/2.
+        sw_w = p['csa_sliding_window']
+        eff_sw = min(T, sw_w)
+        sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
+        sw = 2 * sw_entries * csa_c * H * 2
         return compress + query_proj + indexer + core + sw
     if op == 'hca':
         n_blocks = max(1, T // hca_m2)
@@ -260,8 +280,11 @@ def prefill_flops(op: str, T: int, **kw):
         query_proj = 2 * T * (d * hca_dc + hca_dc * hca_c * hca_nh)
         # Core dense attention over all n_blocks: QK^T (c) + softmax·V (c).
         core = 2 * T * n_blocks * hca_c * H * 2
-        # Sliding window: QK^T + softmax·V over the local window.
-        sw = 2 * T * p['hca_sliding_window'] * hca_c * H * 2
+        # Sliding window: causal window (same fix as CSA above).
+        sw_w = p['hca_sliding_window']
+        eff_sw = min(T, sw_w)
+        sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
+        sw = 2 * sw_entries * hca_c * H * 2
         return compress + query_proj + core + sw
     if op == 'hybrid_kch':
         # Mirror the configurable ratio in kv_cache_elements.
@@ -354,8 +377,34 @@ def main():
                 print(f"    FLOPs / GQA8 (5-layer)        = {r['flops_ratio_vs_gqa_5l']*100:.2f}%")
 
     os.makedirs('results', exist_ok=True)
+
+    # Sanitize non-finite floats to null before serializing. ``json.dump``
+    # with default ``allow_nan=True`` emits non-standard ``NaN``/``Infinity``
+    # literals that most downstream parsers (JS ``JSON.parse``, pandas
+    # ``read_json`` with default flags, jq) reject. The T=0 edge case
+    # (currently absent from main() but reachable via direct API call)
+    # would produce ``inf`` from ``kv / baseline_1l`` when baseline_1l == 0;
+    # without sanitization, the whole JSON file would be unparseable.
+    def _sanitize(o):
+        if isinstance(o, float) and not math.isfinite(o):
+            return None
+        if isinstance(o, dict):
+            return {k: _sanitize(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_sanitize(x) for x in o]
+        return o
+    sanitized = [_sanitize(r) for r in rows]
+    try:
+        text = json.dumps(sanitized, indent=2, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        # Fallback: log the corruption and write without allow_nan=False
+        # so results are not lost entirely. Non-finite values would have
+        # been converted to None by _sanitize above, so this branch only
+        # fires on truly unexpected types (e.g. a tensor slipped in).
+        print(f'[run_kv_cache] WARNING: JSON serialization failed: {e}')
+        text = json.dumps(sanitized, indent=2, default=str)
     with open('results/exp3_kv_cache.json', 'w') as f:
-        json.dump(rows, f, indent=2)
+        f.write(text)
     print('\nSaved: results/exp3_kv_cache.json')
 
 

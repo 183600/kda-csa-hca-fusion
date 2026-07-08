@@ -72,8 +72,24 @@ def _build_param_groups(*modules, weight_decay=0.01):
     returns names RELATIVE to that submodule (e.g. just ``weight``, not
     ``embed.weight``). A name-based heuristic would miss the embedding table.
 
+    The CSA/HCA positional biases (``Ba``, ``Bb``, ``B_idx``, ``B_pos``) are
+    2-D ``nn.Parameter`` tensors of shape ``(m, c)`` or ``(m, c_I)`` but
+    function analogously to embeddings (they are lookup tables indexed by
+    block-position, not weights applied to activations). Decaying them
+    shrinks the table toward zero and degrades the model's ability to
+    represent position-dependent compression patterns. We exclude them
+    from decay via an explicit name suffix match (their ndim == 2 means
+    the generic ``p.ndim <= 1`` rule does not catch them).
+
     Returns a list of param groups suitable for ``torch.optim.AdamW``.
     """
+    # nn.Parameter names ending in any of these suffixes are positional
+    # bias tables and should NOT be weight-decayed. Listed explicitly
+    # because they are 2-D (so the ``ndim <= 1`` rule misses them) and
+    # are not submodules of nn.Embedding/nn.LayerNorm (so the module-type
+    # rule misses them too).
+    _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'B_pos')
+
     no_decay = []
     decay = []
     for module in modules:
@@ -89,12 +105,17 @@ def _build_param_groups(*modules, weight_decay=0.01):
         for name, p in module.named_parameters():
             if not p.requires_grad:
                 continue
+            # Strip the trailing ``.weight`` / ``.bias`` etc. so the suffix
+            # check below matches the leaf parameter's own name, not the
+            # parent module's. e.g. ``csa_layers.0.Ba`` -> ``Ba``.
+            leaf_name = name.rsplit('.', 1)[-1]
             # Exclude: Embedding/LayerNorm params (by module type), 1-D params
-            # (biases), and any nn.Parameter with ndim < 2 (e.g. the CSA/HCA
-            # positional biases Ba/Bb/B_idx/B_pos and the sink logits).
+            # (biases), and 2-D positional-bias parameters (Ba/Bb/B_idx/B_pos,
+            # which function like embeddings and would be shrunk by decay).
             is_no_decay = (
                 id(p) in no_decay_ids
                 or p.ndim <= 1
+                or leaf_name in _POSITIONAL_BIAS_SUFFIXES
             )
             if is_no_decay:
                 no_decay.append(p)
@@ -559,6 +580,22 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad()
         loss.backward()
+        # Guard against NaN/Inf gradients BEFORE clip+step. ``clip_grad_norm_``
+        # computes ``total_norm`` and (if NaN) the comparison
+        # ``total_norm > max_norm`` is False, so no clipping happens and the
+        # NaN grads pass through to ``opt.step()`` unchecked. That corrupts
+        # ALL parameters in one step; the NEXT iteration's forward then
+        # produces a NaN loss, which the finite-loss guard above catches —
+        # but by then every parameter is already NaN and the seed is lost
+        # without a clear root cause. Check here so the per-seed try/except
+        # surfaces the real failure mode.
+        bad_grads = [p for p in params
+                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if bad_grads:
+            raise RuntimeError(
+                f"non-finite gradient at step {step} in {len(bad_grads)} "
+                f"params (op={op_name}, seed={seed}); aborting this seed "
+                f"to prevent NaN propagation into parameters")
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
@@ -638,9 +675,15 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=500,
             r = train_one(op_name, seed=s, steps=steps, device=device,
                           softmax_steps=softmax_steps, **kw)
             r['train_time_s'] = time.time() - t0
-            per_seed.append(r)
+            # Log BEFORE appending to per_seed. The previous order appended
+            # first, so if ``logger.info`` raised (e.g. a handler error, or
+            # a formatting error on an unexpected None field) the seed had
+            # already been recorded as a success and the except branch would
+            # append a second stub entry for the same seed — corrupting
+            # aggregate stats with a duplicate seed.
             logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
                         f"steps={r['steps']}  time={r['train_time_s']:.1f}s")
+            per_seed.append(r)
         except Exception as e:
             logger.warning(f"    seed {s} FAILED: {e}")
             per_seed.append({
@@ -888,7 +931,12 @@ def main():
                 return None
             if isinstance(o, dict):
                 return {k: _sanitize(v) for k, v in o.items()}
-            if isinstance(o, list):
+            # Recurse into both lists AND tuples: json.dumps serializes
+            # tuples as JSON arrays, but the previous check only handled
+            # lists, so a tuple containing a NaN/Inf would slip through
+            # _sanitize and re-trigger the ValueError on the second
+            # json.dumps(..., allow_nan=False), crashing the whole write.
+            if isinstance(o, (list, tuple)):
                 return [_sanitize(x) for x in o]
             return o
         text = json.dumps(_sanitize(all_results), indent=2, allow_nan=False)

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import sys
 import time
@@ -209,16 +210,27 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     model.reset()
     _clear_cache(device)
 
+    # Seed a dedicated generator (NOT the global RNG) so the input tensors
+    # are identical across operators, prefill lengths, and runs. The
+    # previous code called ``torch.randn(...)`` against the global RNG,
+    # which consumed different states per operator (because each model's
+    # ``nn.Linear`` init made a different number of RNG draws during
+    # construction). This made run-to-run latency variance confounded
+    # with input variance, and made the "median over repeats" noisier than
+    # the inter-operator gap being measured.
+    _seed_gen = torch.Generator(device=device)
+    _seed_gen.manual_seed(0)
+
     # Pre-allocate the per-step decode input ONCE outside the timed loop.
     # The previous code allocated ``x_new = torch.randn(1, 1, d_model)`` inside
     # the timed region, so per-token latency included the cost of randn + the
     # scalar multiply — for KDA (tiny per-token compute) this overhead can
     # dominate the measurement.
-    x_new = torch.randn(1, 1, d_model, device=device) * 0.1
+    x_new = torch.randn(1, 1, d_model, device=device, generator=_seed_gen) * 0.1
 
     # One fixed prefill input (same across trials) so timing variance comes
     # from the model, not from input noise.
-    x_prefill = torch.randn(1, prefill_len, d_model, device=device) * 0.1
+    x_prefill = torch.randn(1, prefill_len, d_model, device=device, generator=_seed_gen) * 0.1
 
     # Warmup: run prefill + a couple of decode steps once (untimed) so the
     # first timed trial is not paying one-time kernel compilation / autotune
@@ -236,11 +248,20 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # Reset peak memory AFTER warmup so the reported peak reflects the
         # timed trials, not the warmup allocations.
         torch.cuda.reset_peak_memory_stats(device)
-        # Capture the baseline allocation (model params + persistent state
-        # like the KV cache / KDA recurrent state) right after the reset.
-        # The final peak is reported as ``max_memory_allocated - baseline``
-        # so the number isolates the activation footprint from the constant
-        # parameter offset that varies per operator.
+        # IMPORTANT: reset the model state BEFORE capturing the baseline.
+        # The warmup above populated the KV cache (softmax) / recurrent
+        # state (KDA) with (prefill_len + 3) tokens of context. If we
+        # captured baseline_bytes WITHOUT resetting, the reported
+        # ``peak - baseline`` would only include the (n_decode - 3)-token
+        # cache GROWTH during the timed region, NOT the full cache that
+        # a serving engine pays for. For softmax with plen=2048, H=2,
+        # K=V=16, fp32, the omitted cache is ~524 KB — making softmax
+        # look artificially cheaper than KDA (whose state is ~2 KB).
+        # Resetting here drops baseline to (params + persistent state)
+        # so the reported peak reflects (params + full cache + activations).
+        model.reset()
+        # Re-capture baseline AFTER the reset: now it's just the model
+        # parameters and any persistent buffers, NOT the warmup cache.
         baseline_bytes = torch.cuda.memory_allocated(device)
     else:
         baseline_bytes = 0
@@ -344,6 +365,13 @@ def main():
     d_model = 64
     prefill_lens = [128, 512, 1024, 2048]
     n_decode = 20
+    # Hoist n_repeats into a module-visible variable so the error path can
+    # record the same value as the success path. Previously success rows
+    # recorded ``repeats=3`` (the bench_decoding default) while error rows
+    # recorded ``repeats=None`` — a schema inconsistency that broke
+    # downstream consumers doing arithmetic on ``repeats`` (e.g.
+    # ``n_decode / repeats``) on error rows.
+    N_REPEATS = 3
 
     models = {
         'softmax': lambda: SoftmaxAttnDecoding(d_model),
@@ -356,7 +384,8 @@ def main():
         for name, factory in models.items():
             try:
                 model = factory()
-                r = bench_decoding(model, d_model, plen, n_decode, device)
+                r = bench_decoding(model, d_model, plen, n_decode, device,
+                                   repeats=N_REPEATS)
                 r['op'] = name
                 r['device'] = str(device)
                 results.append(r)
@@ -368,6 +397,8 @@ def main():
                 # Include null fields for the keys present on success rows so
                 # downstream JSON consumers can do ``r['prefill_ms']`` without
                 # a KeyError on error rows (mirrors run_benchmark.py's pattern).
+                # ``repeats`` records N_REPEATS (not None) so error rows
+                # match the success-row schema.
                 results.append({'op': name, 'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
                                 'prefill_ms': None,
@@ -375,7 +406,7 @@ def main():
                                 'median_decode_ms_per_token': None,
                                 'peak_mem_MB': None,
                                 'n_decode': n_decode,
-                                'repeats': None})
+                                'repeats': N_REPEATS})
                 print(f"  {name:10s}  ERROR: {e}")
 
     # Summary: decode latency growth rate.
@@ -402,8 +433,30 @@ def main():
         print('torch.cuda.max_memory_allocated, the real serving cost.')
 
     os.makedirs('results', exist_ok=True)
+
+    # Sanitize non-finite floats to null before serializing (mirrors
+    # run_kv_cache.py). Without this, a single NaN/Inf in
+    # ``prefill_ms`` / ``decode_ms_per_token`` / ``peak_mem_MB`` (e.g. from
+    # KDA recurrence overflow, or from ``statistics.median`` propagating
+    # a NaN in the underlying times list) would cause ``json.dump`` to
+    # emit non-standard ``NaN`` / ``Infinity`` literals, breaking
+    # downstream parsers (JS ``JSON.parse``, pandas, jq).
+    def _sanitize(o):
+        if isinstance(o, float) and not math.isfinite(o):
+            return None
+        if isinstance(o, dict):
+            return {k: _sanitize(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_sanitize(x) for x in o]
+        return o
+    sanitized = [_sanitize(r) for r in results]
+    try:
+        text = json.dumps(sanitized, indent=2, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        print(f'[run_decoding] WARNING: JSON serialization failed: {e}')
+        text = json.dumps(sanitized, indent=2, default=str)
     with open('results/exp6_decoding.json', 'w') as f:
-        json.dump(results, f, indent=2)
+        f.write(text)
     print('\nSaved: results/exp6_decoding.json')
 
 

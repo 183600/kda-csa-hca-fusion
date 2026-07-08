@@ -374,10 +374,17 @@ def test_fused_hybrid(device='cpu'):
         hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
         n_kda=3, n_csa=1, n_hca=1,
     )
-    model = HybridKCHAttention(cfg, total_layers=5).to(device)
+    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
     B, T = 2, 64
     x = torch.randn(B, T, cfg.d_model, device=device) * 0.1
-    y = model(x)
+    # Use eval() + no_grad() for this sanity check: (a) the model has no
+    # dropout/BN today so eval() is a no-op, but adding it future-proofs
+    # the "finite" check against any later stochastic module; (b) without
+    # no_grad() the full 5-layer autograd graph is retained on ``y`` until
+    # it goes out of scope, wasting memory on a sanity-check test that
+    # never calls backward().
+    with torch.no_grad():
+        y = model(x)
     n_params = sum(p.numel() for p in model.parameters())
     return [
         _ok('hybrid output shape', y.shape == x.shape, str(tuple(y.shape))),
@@ -480,6 +487,12 @@ def test_kda_gradient(device='cpu'):
     }
 
     # Finite-difference check on a few random coordinates of each tensor.
+    # The forward passes only need the scalar loss value, so wrap them in
+    # ``no_grad()`` to avoid building (and retaining) the full KDA autograd
+    # graph on every perturbation. The previous form built a retained graph
+    # for both ``lp`` and ``lm`` on every coordinate check; for the tiny
+    # shapes here the cost is negligible, but the pattern scales badly if
+    # anyone copies this test for larger models.
     eps = 1e-6
     max_rel = 0.0
     n_check = 0
@@ -493,13 +506,11 @@ def test_kda_gradient(device='cpu'):
             orig = flat[idx].item()
             with torch.no_grad():
                 flat[idx] = orig + eps
-            lp = loss_fn(q, k, v, g, beta)
-            with torch.no_grad():
+                lp = loss_fn(q, k, v, g, beta)
                 flat[idx] = orig - eps
-            lm = loss_fn(q, k, v, g, beta)
-            with torch.no_grad():
+                lm = loss_fn(q, k, v, g, beta)
                 flat[idx] = orig
-            num_grad = (lp - lm).item() / (2 * eps)
+                num_grad = (lp - lm).item() / (2 * eps)
             ana_grad = grads[name].view(-1)[idx].item()
             denom = max(1e-8, abs(num_grad) + abs(ana_grad))
             rel = abs(num_grad - ana_grad) / denom
@@ -1131,7 +1142,12 @@ def test_hybrid_per_layer_kda_state(device='cpu'):
     # would be bitwise-identical (because the same tensor would be stacked
     # with itself). With per-layer states, each slice carries a different
     # layer's recurrence result and should differ.
-    stacked1 = model._kda_state
+    # Clone (with detach) so the snapshot is immune to any future in-place
+    # updates to ``_kda_state``. If forward ever switched to in-place updates
+    # (e.g. ``self._kda_state[i].copy_(...)``), ``stacked1`` would alias the
+    # live buffer and the "evolved across calls" check below would trivially
+    # pass with a false negative.
+    stacked1 = model._kda_state.detach().clone()
     pairwise_distinct = True
     for i in range(n_kda_layers):
         for j in range(i + 1, n_kda_layers):
@@ -1409,8 +1425,6 @@ def test_hybrid_backward_produces_grads(device='cpu'):
     # Indexer parameters (CSA layer index 3 in the default 3:1:1 layout).
     # These have .grad is None because topk is non-differentiable.
     indexer_param_substrings = ('W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx')
-    indexer_no_grad = True
-    indexer_detail_parts = []
     differentiable_no_grad = []
     differentiable_zero_grad = []
     differentiable_non_finite = []
@@ -1431,7 +1445,10 @@ def test_hybrid_backward_produces_grads(device='cpu'):
             # If an indexer param DOES receive a grad (e.g. via an auxiliary
             # loss added in the future), that's fine — just don't require it.
             differentiable_ok += 1
-        elif p.grad.abs().max().item() == 0.0:
+        # Use a small epsilon rather than exact == 0.0: a legitimately tiny
+        # but non-zero fp32 grad (e.g. from underflow in a masked branch)
+        # would otherwise be counted as differentiable_ok, hiding real bugs.
+        elif p.grad.abs().max().item() < 1e-12:
             differentiable_zero_grad.append(name)
         else:
             differentiable_ok += 1
@@ -1561,10 +1578,12 @@ def test_csa_hca_no_sink_no_sliding_window(device='cpu'):
                           m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
                           sliding_window=0, sink_logits=None)
         csa_ok = o_csa.shape == (B, T, nh * c) and torch.isfinite(o_csa).all().item()
+        csa_err = ''
     except Exception as e:
         csa_ok = False
+        csa_err = f'{type(e).__name__}: {e}'
     results.append(_ok('CSA no-sink no-SW', csa_ok,
-                       f'shape={tuple(o_csa.shape) if csa_ok else "n/a"}'))
+                       f'shape={tuple(o_csa.shape) if csa_ok else "n/a"} {csa_err}'.strip()))
 
     # --- HCA no sink, no SW ---
     B2, T2, d2 = 1, 32, 16
@@ -1580,10 +1599,12 @@ def test_csa_hca_no_sink_no_sliding_window(device='cpu'):
                           m2=m2, nh=nh2, c=c2, dc=dc2,
                           sliding_window=0, sink_logits=None)
         hca_ok = o_hca.shape == (B2, T2, nh2 * c2) and torch.isfinite(o_hca).all().item()
+        hca_err = ''
     except Exception as e:
         hca_ok = False
+        hca_err = f'{type(e).__name__}: {e}'
     results.append(_ok('HCA no-sink no-SW', hca_ok,
-                       f'shape={tuple(o_hca.shape) if hca_ok else "n/a"}'))
+                       f'shape={tuple(o_hca.shape) if hca_ok else "n/a"} {hca_err}'.strip()))
 
     return results
 
@@ -2031,13 +2052,18 @@ def test_weight_decay_param_groups(device='cpu'):
     sink_params = [p for n, p in model.named_parameters() if 'sink' in n.lower()]
     sink_ok = all(id(p) in no_decay_ids for p in sink_params) and len(sink_params) >= 1
 
-    # 5b. 2-D nn.Parameter tensors (Ba, Bb, B_idx, B_pos) are in decay.
-    # These are 2-D positional bias parameters; whether to decay them is a
-    # judgment call. Our heuristic puts them in the decay group (ndim >= 2).
+    # 5b. 2-D nn.Parameter tensors (Ba, Bb, B_idx, B_pos) are in NO-decay.
+    # These are positional bias tables that function analogously to
+    # embeddings (lookup tables indexed by block-position, not weights
+    # applied to activations). Decaying them shrinks the table toward
+    # zero and degrades the model's ability to represent
+    # position-dependent compression patterns. ``_build_param_groups``
+    # excludes them via an explicit name-suffix match (their ndim == 2
+    # so the ``p.ndim <= 1`` rule does not catch them).
     pos_bias_params = [p for n, p in model.named_parameters()
                        if any(k in n for k in ('Ba', 'Bb', 'B_idx', 'B_pos'))
                        and p.ndim == 2]
-    pos_bias_ok = all(id(p) in decay_ids for p in pos_bias_params) and len(pos_bias_params) >= 1
+    pos_bias_ok = all(id(p) in no_decay_ids for p in pos_bias_params) and len(pos_bias_params) >= 1
 
     return [
         _ok('weight_decay values correct (0.01 / 0.0)', wd_ok,
@@ -2054,8 +2080,8 @@ def test_weight_decay_param_groups(device='cpu'):
             f'{len(linear_weights)} Linear weights, all in decay'),
         _ok('1-D nn.Parameter (sink) in no-decay group', sink_ok,
             f'{len(sink_params)} sink params, all in no_decay'),
-        _ok('2-D nn.Parameter (positional bias) in decay group', pos_bias_ok,
-            f'{len(pos_bias_params)} pos-bias params, all in decay'),
+        _ok('2-D nn.Parameter (positional bias) in no-decay group', pos_bias_ok,
+            f'{len(pos_bias_params)} pos-bias params, all in no_decay'),
     ]
 
 
@@ -2072,9 +2098,17 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
     logger.info("Test: CSA/HCA accept T=0 (empty sequence)")
     torch.manual_seed(210)
     B, T, d = 1, 0, 16
-    m, m2, nh, c, dc = 8, 16, 2, 8, 16
+    # Use DISTINCT values for nh, nIh, c, c_I so the test would actually
+    # catch a wrong-dimension weight. Previously all of {nh, nIh, c, c_I}
+    # collapsed to {2, 2, 8, 8}, which made several wrong-dim weight
+    # constructions coincidentally shape-correct.
+    m, m2, nh, nIh, c, c_I, dc = 8, 16, 2, 3, 8, 4, 16
     H = torch.randn(B, T, d, device=device) * 0.1
-    # CSA weights
+    # CSA weights — shapes must match the documented contract:
+    #   W_aKV: [d, c], W_aZ: [d, c], Ba: [m, c], Bb: [m, c]
+    #   W_DQ:  [d, dc], W_UQ: [dc, c*nh], W_IUQ: [dc, c_I*nIh]
+    #   W_w:   [d, nIh], W_KV_idx: [d, c_I], W_Z_idx: [d, c_I]
+    #   B_idx: [m, c_I], sink: [nh]
     W_aKV = torch.randn(d, c, device=device) * 0.1
     W_bKV = torch.randn(d, c, device=device) * 0.1
     W_aZ = torch.randn(d, c, device=device) * 0.1
@@ -2083,11 +2117,11 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
     Bb = torch.randn(m, c, device=device) * 0.1
     W_DQ = torch.randn(d, dc, device=device) * 0.1
     W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_w = torch.randn(d, nh, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c, device=device) * 0.1
-    B_idx = torch.randn(m, c, device=device) * 0.1
+    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
+    W_w = torch.randn(d, nIh, device=device) * 0.1
+    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    B_idx = torch.randn(m, c_I, device=device) * 0.1
     sink = torch.zeros(nh, device=device)
     # HCA weights
     W_KV = torch.randn(d, c, device=device) * 0.1
@@ -2099,7 +2133,7 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
         o_csa = naive_csa(
             H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb, W_DQ, W_UQ, W_IUQ,
             W_w, W_KV_idx, W_Z_idx, B_idx,
-            m=m, topk=4, nh=nh, nIh=2, c=c, c_I=c, dc=dc,
+            m=m, topk=4, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
             sliding_window=0, sink_logits=sink,
         )
         csa_ok = (o_csa.shape == (B, 0, nh * c)
@@ -2129,6 +2163,25 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
     ]
 
 
+def _run_safe(fn, device):
+    """Run one test function with exception isolation.
+
+    Without this wrapper, a single test crash (e.g. an unexpected
+    ``RuntimeError`` from a dtype mismatch, or an ``ImportError``)
+    propagates up through ``main()`` and discards every subsequent
+    test result. The JSON report is never written, so the user has
+    no way to see which tests passed before the crash. Wrapping each
+    test lets the rest of the suite continue and produces a full
+    report with the crashed test marked as FAIL.
+    """
+    try:
+        return fn(device)
+    except Exception as e:
+        logger.exception(f"Test {fn.__name__} crashed")
+        return [_ok(fn.__name__, False,
+                    f'CRASH: {type(e).__name__}: {e}')]
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -2139,48 +2192,48 @@ def main():
     logger.info(f'Experiment 1: Correctness Verification ({device})')
     logger.info('=' * 70)
     all_results = []
-    all_results += test_kda_chunk_vs_recurrent(device)
-    all_results += test_kda_gva(device)
-    all_results += test_kda_chunk_gva(device)
-    all_results += test_csa_causality(device)
-    all_results += test_hca_causality(device)
-    all_results += test_fused_hybrid(device)
+    all_results += _run_safe(test_kda_chunk_vs_recurrent, device)
+    all_results += _run_safe(test_kda_gva, device)
+    all_results += _run_safe(test_kda_chunk_gva, device)
+    all_results += _run_safe(test_csa_causality, device)
+    all_results += _run_safe(test_hca_causality, device)
+    all_results += _run_safe(test_fused_hybrid, device)
     # New reviewer-driven checks.
-    all_results += test_overlap_causality(device)
-    all_results += test_kda_gradient(device)
+    all_results += _run_safe(test_overlap_causality, device)
+    all_results += _run_safe(test_kda_gradient, device)
     # Regression test for chunk-vs-recurrent gradient agreement (fp64).
-    all_results += test_kda_chunk_vs_recurrent_gradient(device)
-    all_results += test_csa_indexer_validity(device)
-    all_results += test_hca_sliding_window_causality(device)
-    all_results += test_csa_full_pipeline_causality(device)
+    all_results += _run_safe(test_kda_chunk_vs_recurrent_gradient, device)
+    all_results += _run_safe(test_csa_indexer_validity, device)
+    all_results += _run_safe(test_hca_sliding_window_causality, device)
+    all_results += _run_safe(test_csa_full_pipeline_causality, device)
     # Regression tests for bugs found during code review.
-    all_results += test_hybrid_padding_no_crash(device)
-    all_results += test_hybrid_state_buffer_registration(device)
-    all_results += test_bench_hybrid_no_grad_inference(device)
-    all_results += test_hybrid_per_layer_kda_state(device)
-    all_results += test_csa_hca_right_padding_correctness(device)
-    all_results += test_csa_hca_sink_numerical_correctness(device)
+    all_results += _run_safe(test_hybrid_padding_no_crash, device)
+    all_results += _run_safe(test_hybrid_state_buffer_registration, device)
+    all_results += _run_safe(test_bench_hybrid_no_grad_inference, device)
+    all_results += _run_safe(test_hybrid_per_layer_kda_state, device)
+    all_results += _run_safe(test_csa_hca_right_padding_correctness, device)
+    all_results += _run_safe(test_csa_hca_sink_numerical_correctness, device)
     # New tests for dtype consistency and chunk padding edge cases.
-    all_results += test_kda_chunk_nondivisible_T(device)
-    all_results += test_csa_hca_fp16_dtype_consistency(device)
-    all_results += test_kda_initial_state_dtype_mismatch(device)
+    all_results += _run_safe(test_kda_chunk_nondivisible_T, device)
+    all_results += _run_safe(test_csa_hca_fp16_dtype_consistency, device)
+    all_results += _run_safe(test_kda_initial_state_dtype_mismatch, device)
     # Regression test for hybrid backward gradient flow.
-    all_results += test_hybrid_backward_produces_grads(device)
+    all_results += _run_safe(test_hybrid_backward_produces_grads, device)
     # Additional edge-case tests for broader coverage.
-    all_results += test_csa_hca_bf16_dtype_consistency(device)
-    all_results += test_csa_hca_no_sink_no_sliding_window(device)
-    all_results += test_csa_topk_edge_cases(device)
-    all_results += test_kda_single_token_decode(device)
-    all_results += test_csa_hca_extreme_sink_values(device)
-    all_results += test_hybrid_no_kda_layout(device)
+    all_results += _run_safe(test_csa_hca_bf16_dtype_consistency, device)
+    all_results += _run_safe(test_csa_hca_no_sink_no_sliding_window, device)
+    all_results += _run_safe(test_csa_topk_edge_cases, device)
+    all_results += _run_safe(test_kda_single_token_decode, device)
+    all_results += _run_safe(test_csa_hca_extreme_sink_values, device)
+    all_results += _run_safe(test_hybrid_no_kda_layout, device)
     # Regression tests for the internal-padding + topk=0 fixes.
-    all_results += test_csa_hca_non_divisible_T(device)
-    all_results += test_csa_topk_zero(device)
-    all_results += test_hca_T_smaller_than_m2(device)
+    all_results += _run_safe(test_csa_hca_non_divisible_T, device)
+    all_results += _run_safe(test_csa_topk_zero, device)
+    all_results += _run_safe(test_hca_T_smaller_than_m2, device)
     # Regression test for weight-decay parameter grouping.
-    all_results += test_weight_decay_param_groups(device)
+    all_results += _run_safe(test_weight_decay_param_groups, device)
     # Regression test for T=0 (empty sequence) edge case.
-    all_results += test_csa_hca_zero_length_sequence(device)
+    all_results += _run_safe(test_csa_hca_zero_length_sequence, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

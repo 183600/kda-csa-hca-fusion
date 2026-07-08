@@ -14,15 +14,82 @@ import sys
 
 import matplotlib
 matplotlib.use('Agg')
+# Configure CJK font fallback so any non-ASCII label renders correctly
+# instead of producing tofu boxes. English labels today, but future-proofs
+# the file against later Chinese annotations. DejaVu Sans is the final
+# fallback for symbols the CJK fonts lack.
+import matplotlib.font_manager as _fm
+for _fp in ('/usr/share/fonts/truetype/chinese/NotoSansSC-Regular.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
+    try:
+        _fm.fontManager.addfont(_fp)
+    except (FileNotFoundError, OSError):
+        pass
 import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['Noto Sans SC', 'WenQuanYi Zen Hei',
+                                  'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Anchor every relative path to THIS FILE's directory so the script works
+# regardless of the current working directory. Previously ``load()`` opened
+# ``'results/{name}'`` (relative to cwd), so running the script from a
+# different directory (e.g. ``python ../make_figures.py``) failed with
+# ``FileNotFoundError`` on every figure. The same fix applies to every
+# ``fig.savefig(os.path.join(_FIGURES_DIR, '...'))`` call below.
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+_RESULTS_DIR = os.path.join(_ROOT, 'results')
+_FIGURES_DIR = os.path.join(_ROOT, 'figures')
+
 
 def load(name):
-    with open(f'results/{name}') as f:
-        return json.load(f)
+    """Load a results JSON file.
+
+    Returns ``[]`` on FileNotFoundError or JSONDecodeError so the caller
+    can degrade gracefully (skip the figure with a log line) rather than
+    crashing the entire figure-generation step. A truncated/malformed
+    JSON (common when an experiment is killed mid-write) used to crash
+    every subsequent figure too.
+    """
+    path = os.path.join(_RESULTS_DIR, name)
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f'[load] {path} not found; skipping', file=sys.stderr)
+        return []
+    except json.JSONDecodeError as e:
+        print(f'[load] {path} is malformed: {e}; skipping', file=sys.stderr)
+        return []
+
+
+def _ensure_figures_dir():
+    """Ensure ``figures/`` exists before any savefig call.
+
+    Previously ``os.makedirs('figures', ...)`` lived only in ``main()``,
+    so calling any ``fig_*`` function directly (e.g. from a notebook or
+    test) raised ``FileNotFoundError`` because the directory did not
+    exist yet. Cheaper to call exist_ok=True here than to thread a
+    directory argument through every fig_* signature.
+    """
+    os.makedirs(_FIGURES_DIR, exist_ok=True)
+
+
+def _ratio_layers(ratio: str) -> int:
+    """Return the total layer count encoded by a ratio string like '3:1:1'.
+
+    Returns 0 if the string contains any non-numeric component (e.g.
+    'baseline', '3:1:1 (5L)'), instead of raising ValueError. The previous
+    ``sum(int(x) for x in ratio.split(':'))`` would crash the entire
+    ablation figure if a future code path stored a non-numeric ratio
+    string in the JSON.
+    """
+    try:
+        return sum(int(x) for x in ratio.replace(' ', '').split(':'))
+    except ValueError:
+        return 0
 
 
 def _has_multiseed(record):
@@ -37,8 +104,16 @@ def fig_benchmark():
     for r in data:
         if 'error' in r:
             continue
-        ops.setdefault(r['op'], []).append((r['T'], r['time_ms']))
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+        # Guard against None time_ms (e.g. a half-written row from a killed
+        # run). Previously a single None in the time_ms field crashed
+        # ``pts.sort()`` with ``TypeError: '<' not supported between
+        # instances of 'NoneType' and 'float'`` because tuple comparison
+        # falls through to the second element.
+        t = r.get('time_ms')
+        if t is None:
+            continue
+        ops.setdefault(r['op'], []).append((r['T'], t))
+    fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
     markers = {'softmax': 'o-', 'kda_rec': 's-', 'kda_chunk': '^-',
                'csa': 'D-', 'hca': 'v-', 'hybrid': 'p-'}
     labels = {'softmax': 'Softmax attention', 'kda_rec': 'KDA (recurrent)',
@@ -49,7 +124,12 @@ def fig_benchmark():
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=5)
-    device = data[0].get('device', 'cpu') if data else 'cpu'
+    # Find the device from the first NON-error record (not data[0]). The
+    # previous form silently said 'cpu' on the y-axis when the first row
+    # happened to be an error row with no 'device' key, even though every
+    # plotted point came from CUDA.
+    device = next((r.get('device', 'cpu') for r in data if 'error' not in r),
+                  'cpu')
     ax.set_xlabel('Sequence length T')
     ax.set_ylabel(f'Wall-clock latency (ms, {device})')
     ax.set_title('Operator latency vs. sequence length')
@@ -64,9 +144,9 @@ def fig_benchmark():
     if ops:
         ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, which='both', alpha=0.3)
-    fig.tight_layout()
-    fig.savefig('figures/fig_benchmark.pdf', dpi=150)
-    fig.savefig('figures/fig_benchmark.png', dpi=150)
+    _ensure_figures_dir()
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.pdf'), dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.png'), dpi=150)
     plt.close(fig)
     print('Saved figures/fig_benchmark.pdf')
 
@@ -132,9 +212,9 @@ def fig_kv_cache():
                label='DeepSeek-V4 target (2%)')
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, which='both', alpha=0.3)
-    fig.tight_layout()
-    fig.savefig('figures/fig_kv_cache.pdf', dpi=150)
-    fig.savefig('figures/fig_kv_cache.png', dpi=150)
+    _ensure_figures_dir()
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_kv_cache.pdf'), dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_kv_cache.png'), dpi=150)
     plt.close(fig)
     print('Saved figures/fig_kv_cache.pdf')
 
@@ -187,9 +267,9 @@ def fig_flops():
                label='DeepSeek-V4 target (27%)')
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, which='both', alpha=0.3)
-    fig.tight_layout()
-    fig.savefig('figures/fig_flops.pdf', dpi=150)
-    fig.savefig('figures/fig_flops.png', dpi=150)
+    _ensure_figures_dir()
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_flops.pdf'), dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_flops.png'), dpi=150)
     plt.close(fig)
     print('Saved figures/fig_flops.pdf')
 
@@ -289,12 +369,12 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + c + 0.005,
                 f'{m:.3f}', ha='center', va='bottom', fontsize=10)
     ax.legend(fontsize=9)
-    fig.tight_layout()
+    _ensure_figures_dir()
     fig.savefig(f'figures/fig_mqar_nkv{n_kv}.pdf', dpi=150)
     fig.savefig(f'figures/fig_mqar_nkv{n_kv}.png', dpi=150)
     if write_legacy_name:
-        fig.savefig('figures/fig_mqar.pdf', dpi=150)
-        fig.savefig('figures/fig_mqar.png', dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.png'), dpi=150)
     plt.close(fig)
     msg = f'Saved figures/fig_mqar_nkv{n_kv}.pdf'
     if write_legacy_name:
@@ -367,7 +447,7 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
             fwds.append(0.0)
             n_params.append(r.get('n_params') or 0)
             n_layers.append(r.get('n_layers')
-                            or sum(int(x) for x in ratio.split(':')))
+                            or _ratio_layers(ratio))
             skipped += 1
         else:
             error_flags.append(False)
@@ -377,7 +457,7 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
             fwds.append(r.get('mean_fwd_ms', r.get('fwd_ms', 0.0)) or 0.0)
             n_params.append(r.get('n_params') or 0)
             n_layers.append(r.get('n_layers')
-                            or sum(int(x) for x in ratio.split(':')))
+                            or _ratio_layers(ratio))
 
     if skipped:
         print(f'[fig_ablation] {skipped} ratio(s) had errors and are shown '
@@ -491,13 +571,18 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
                  f'{depth_note}',
                  fontsize=9, y=0.98)
     fig.subplots_adjust(top=0.91, bottom=0.18, left=0.08, right=0.97, wspace=0.3)
-    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.pdf', dpi=150,
-                bbox_inches='tight')
-    fig.savefig(f'figures/fig_ablation_nkv{n_kv}.png', dpi=150,
-                bbox_inches='tight')
+    # Drop ``bbox_inches='tight'`` here (issue A5/A10): it overrides the
+    # manual subplots_adjust margins AND makes the saved figure size
+    # inconsistent with every other figure (which doesn't pass it). The
+    # subplots_adjust call above is what controls the layout for this fig.
+    _ensure_figures_dir()
+    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_ablation_nkv{n_kv}.pdf'),
+                dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_ablation_nkv{n_kv}.png'),
+                dpi=150)
     if write_legacy_name:
-        fig.savefig('figures/fig_ablation.pdf', dpi=150, bbox_inches='tight')
-        fig.savefig('figures/fig_ablation.png', dpi=150, bbox_inches='tight')
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_ablation.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_ablation.png'), dpi=150)
     plt.close(fig)
     msg = f'Saved figures/fig_ablation_nkv{n_kv}.pdf'
     if write_legacy_name:
@@ -507,7 +592,7 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
 
 def fig_decoding():
     """Figure: per-token decoding latency vs cached context length."""
-    path = 'results/exp6_decoding.json'
+    path = os.path.join(_RESULTS_DIR, 'exp6_decoding.json')
     if not os.path.exists(path):
         print('Skipping decoding figure (no results yet)')
         return
@@ -516,12 +601,15 @@ def fig_decoding():
     for r in data:
         if 'error' in r:
             continue
-        ops.setdefault(r['op'], []).append(
-            (r['prefill_len'], r['median_decode_ms_per_token']))
+        # Guard against None median_decode_ms_per_token (half-written row).
+        v = r.get('median_decode_ms_per_token')
+        if v is None:
+            continue
+        ops.setdefault(r['op'], []).append((r['prefill_len'], v))
     if not ops:
         print('Skipping decoding figure (no successful runs)')
         return
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
     markers = {'softmax': 'o-', 'kda': 's-'}
     labels = {'softmax': 'Softmax attention (growing KV cache)',
               'kda': 'KDA recurrent (O(1) state)'}
@@ -530,7 +618,8 @@ def fig_decoding():
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=7)
-    device = data[0].get('device', 'cpu') if data else 'cpu'
+    device = next((r.get('device', 'cpu') for r in data if 'error' not in r),
+                  'cpu')
     ax.set_xlabel('Cached context length (tokens)')
     ax.set_ylabel(f'Per-token decode latency (ms, {device})')
     ax.set_title('Decoding latency vs. cached context length')
@@ -538,9 +627,9 @@ def fig_decoding():
     ax.set_yscale('log')
     ax.legend(fontsize=9)
     ax.grid(True, which='both', alpha=0.3)
-    fig.tight_layout()
-    fig.savefig('figures/fig_decoding.pdf', dpi=150)
-    fig.savefig('figures/fig_decoding.png', dpi=150)
+    _ensure_figures_dir()
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.pdf'), dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.png'), dpi=150)
     plt.close(fig)
     print('Saved figures/fig_decoding.pdf')
 
@@ -584,27 +673,28 @@ def fig_architecture():
             fontsize=8, ha='center', va='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     ax.set_title('Fused KDA+CSA+HCA hybrid attention (3:1:1 layout)', fontsize=12)
-    fig.tight_layout()
-    fig.savefig('figures/fig_architecture.pdf', dpi=150)
-    fig.savefig('figures/fig_architecture.png', dpi=150)
+    _ensure_figures_dir()
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_architecture.pdf'), dpi=150)
+    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_architecture.png'), dpi=150)
     plt.close(fig)
     print('Saved figures/fig_architecture.pdf')
 
 
 def main():
-    os.makedirs('figures', exist_ok=True)
+    _ensure_figures_dir()
+    os.makedirs(_RESULTS_DIR, exist_ok=True)
     fig_architecture()
     # exp2 may not exist if benchmark was skipped.
-    if os.path.exists('results/exp2_benchmark.json'):
+    if os.path.exists(os.path.join(_RESULTS_DIR, 'exp2_benchmark.json')):
         fig_benchmark()
-    if os.path.exists('results/exp3_kv_cache.json'):
+    if os.path.exists(os.path.join(_RESULTS_DIR, 'exp3_kv_cache.json')):
         fig_kv_cache()
         fig_flops()
-    if os.path.exists('results/exp4_mqar.json'):
+    if os.path.exists(os.path.join(_RESULTS_DIR, 'exp4_mqar.json')):
         fig_mqar()
-    if os.path.exists('results/exp5_ablation.json'):
+    if os.path.exists(os.path.join(_RESULTS_DIR, 'exp5_ablation.json')):
         fig_ablation()
-    if os.path.exists('results/exp6_decoding.json'):
+    if os.path.exists(os.path.join(_RESULTS_DIR, 'exp6_decoding.json')):
         fig_decoding()
     print('\nAll figures generated.')
 

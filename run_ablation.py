@@ -197,6 +197,20 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
                 f"prevent silent NaN propagation into aggregate stats")
         opt.zero_grad()
         loss.backward()
+        # Guard against NaN/Inf gradients BEFORE clip+step. clip_grad_norm_
+        # computes total_norm = NaN when any grad is NaN, and the
+        # ``total_norm > max_norm`` comparison is False for NaN, so no
+        # clipping happens and the NaN grads pass through to opt.step(),
+        # corrupting all parameters in one step. The next iteration's
+        # forward would then produce a NaN loss caught by the guard
+        # above, but the seed is already lost without a clear root cause.
+        bad_grads = [p for p in params
+                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if bad_grads:
+            raise RuntimeError(
+                f"non-finite gradient at step {step} in {len(bad_grads)} "
+                f"params (ratio={ratio}, seed={seed}); aborting this seed "
+                f"to prevent NaN propagation into parameters")
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
@@ -207,20 +221,38 @@ def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=
         n_batches=eval_batches, batch=eval_batch,
     )
 
-    # Forward latency (on the actual device)
-    x = torch.randn(1, seq_len, d_model, device=device) * 0.1
-    with torch.no_grad():
-        model.reset_state()
-        model(x)  # warmup
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(5):
+    # Forward latency (on the actual device).
+    # Use a dedicated seeded generator (NOT the global RNG) so the latency
+    # input is identical across ratios and seeds. The global RNG state
+    # differs per ratio because different ratios have different parameter
+    # counts (different ``nn.Linear`` init RNG draws during
+    # ``HybridKCHAttention.__init__``), so the previous code's
+    # ``torch.randn(...)`` produced different inputs across ratios,
+    # confounding latency comparisons.
+    lat_gen = torch.Generator(device=device)
+    lat_gen.manual_seed(99)
+    x = torch.randn(1, seq_len, d_model, device=device, generator=lat_gen) * 0.1
+    # Switch to eval mode so any future Dropout/BN-style stochasticity
+    # does not contaminate the latency measurement. Today the model has
+    # only LayerNorm (eval is a no-op), but the guard future-proofs the
+    # measurement.
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
             model.reset_state()
-            model(x)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        fwd_ms = (time.perf_counter() - t0) / 5 * 1e3
+            model(x)  # warmup
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(5):
+                model.reset_state()
+                model(x)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            fwd_ms = (time.perf_counter() - t0) / 5 * 1e3
+    finally:
+        model.train(was_training)
 
     # Guard against steps=0 (would crash on losses[-1] / sum([])/0 below).
     last_loss = losses[-1] if losses else 0.0
@@ -309,8 +341,13 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         t = _t_crit_975(n)
         ci_acc = t * std_acc / math.sqrt(n)
     else:
+        # With one surviving seed, uncertainty is maximal — NOT zero.
+        # Returning ``ci_acc = 0.0`` (the previous value) implies perfect
+        # precision and misleads downstream figure generation and the
+        # ``significant_bonferroni`` flag. Mirror ``t_stat=None`` (line
+        # below) which already marks the test as undefined for n=1.
         std_acc = 0.0
-        ci_acc = 0.0
+        ci_acc = None
 
     # One-sample t-test vs chance: tests whether mean_acc differs from the
     # chance level (1/VOCAB here). The t-statistic is only defined when n > 1
@@ -395,10 +432,18 @@ def main():
             return float(_t_dist.ppf(1 - alpha / 2, n - 1))
         bonferroni_available = True
     except ImportError:
-        # Conservatively use the uncorrected critical value (smaller), so
-        # we under-report significance rather than over-report it.
+        # scipy unavailable: cannot compute the corrected quantile.
+        # Return ``inf`` so ``|t| > inf`` is never True, i.e. we
+        # NEVER declare Bonferroni significance when scipy is missing.
+        # The previous fallback returned the UNCORRECTED 95% critical
+        # value (``_t_crit_975(n)``), which is SMALLER than the
+        # corrected critical value — the OPPOSITE of "conservative".
+        # With the previous code, a t-statistic of 3.0 (which is
+        # significant at uncorrected alpha=0.05 but NOT at corrected
+        # alpha=0.007) would be flagged ``significant_bonferroni=True``,
+        # over-reporting significance despite the comment's claim.
         def _bonferroni_crit(n, alpha=alpha_corrected):
-            return _t_crit_975(n)
+            return float('inf')
         bonferroni_available = False
     logger.info(f'  {n_tests} one-sample t-tests vs chance; '
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
@@ -456,6 +501,12 @@ def main():
                     'n_seeds_total': n_seeds,
                     'seeds': [],
                     'error': str(e),
+                    # 'layout' is present on success rows (line 359), so include
+                    # it on error rows too for schema consistency. Without it,
+                    # ``r['layout']`` KeyError on error rows for strict-schema
+                    # consumers (e.g. pandas with explicit dtype, or downstream
+                    # figure scripts).
+                    'layout': None,
                     'mean_acc': None,
                     'ci95_acc': None,
                     'std_acc': None,
@@ -526,7 +577,12 @@ def main():
                 return None
             if isinstance(o, dict):
                 return {k: _sanitize(v) for k, v in o.items()}
-            if isinstance(o, list):
+            # Recurse into both lists AND tuples (mirrors run_quality.py).
+            # json.dumps serializes tuples as JSON arrays, but the previous
+            # check only handled lists, so a tuple containing a NaN/Inf
+            # would slip through and re-trigger ValueError on the second
+            # allow_nan=False dump, crashing the write.
+            if isinstance(o, (list, tuple)):
                 return [_sanitize(x) for x in o]
             return o
         text = json.dumps(_sanitize(all_results), indent=2, allow_nan=False)

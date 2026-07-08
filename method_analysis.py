@@ -194,10 +194,20 @@ class HeadwiseFusedAttention(nn.Module):
     def _kda_heads(self, x):
         B, T, d = x.shape
         H, hd = self.cfg.H_kda, self.cfg.head_dim
-        q = F.normalize(F.silu(self.kda_q(x)), dim=-1).view(B, T, H, hd)
-        k = F.normalize(F.silu(self.kda_k(x)), dim=-1).view(B, T, H, hd)
+        # View BEFORE normalize: F.normalize(dim=-1) must operate on each
+        # per-head hd-vector, not on the concatenated H*hd vector. The
+        # previous form ``F.normalize(F.silu(self.kda_q(x)), dim=-1).view(...)``
+        # L2-normalized the full H*hd vector, so each head's L2 norm became
+        # ~1/sqrt(H) instead of 1. This silently shrinks q·k dot products
+        # by a factor of 1/H, which propagates into the KDA recurrence as
+        # under-scaled delta-rule updates. Mirrors the (correct) CSA/HCA
+        # branches in _csa_heads / _hca_heads which view-then-normalize.
+        q = F.normalize(F.silu(self.kda_q(x)).view(B, T, H, hd), dim=-1)
+        k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
-        g = -F.softplus(self.kda_g(x)).view(B, T, H, hd) * 0.1
+        # Parenthesize explicitly so the sign applies to the scaled value
+        # (operator-precedence-safe): want g in (-inf, 0] so exp(g) in (0, 1].
+        g = (-F.softplus(self.kda_g(x)) * 0.1).view(B, T, H, hd)
         beta = torch.sigmoid(self.kda_beta(x))
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return o  # [B, T, H, hd]
