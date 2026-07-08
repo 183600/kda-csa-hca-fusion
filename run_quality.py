@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device
+from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json
 from ops_kda import naive_recurrent_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -517,7 +517,14 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     if softmax_steps is None:
         softmax_steps = steps
     if train_batch is None:
-        train_batch = int(os.environ.get('MQAR_TRAIN_BATCH', '32'))
+        # Robust env var parsing: a malformed ``MQAR_TRAIN_BATCH=abc`` (or
+        # ``=0``, which would crash on the first batch with ZeroDivisionError)
+        # previously crashed the whole experiment with no informative error.
+        # ``parse_int_env`` logs a warning and falls back to the default,
+        # matching the robustness pattern already used for BENCH_REPEATS in
+        # run_benchmark.py.
+        train_batch = parse_int_env('MQAR_TRAIN_BATCH', 32, min_value=1,
+                                    logger=logger)
     actual_steps = softmax_steps if op_name == 'softmax' else steps
 
     torch.manual_seed(seed)
@@ -833,11 +840,17 @@ def main():
                 f"< seq_len={seq_len} (need room for the cue token at the end).")
     logger.info(f'  vocab={vocab}, seq_len={seq_len}, n_kv={n_kv_list}')
     logger.info(f'  chance accuracy = {chance:.4f} (independent of n_kv; target is 1-of-vocab)')
-    n_seeds = int(os.environ.get('MQAR_SEEDS', '5'))
-    steps = int(os.environ.get('MQAR_STEPS', '200'))
+    # Robust env var parsing: a single malformed value (e.g. ``MQAR_SEEDS=abc``)
+    # previously crashed the whole multi-seed experiment with a bare
+    # ``ValueError: invalid literal for int()``. ``parse_int_env`` logs a
+    # warning and falls back to the default, matching the robustness pattern
+    # already used for BENCH_REPEATS / BENCH_LENGTHS in run_benchmark.py.
+    n_seeds = parse_int_env('MQAR_SEEDS', 5, min_value=1, logger=logger)
+    steps = parse_int_env('MQAR_STEPS', 200, min_value=1, logger=logger)
     # Softmax gets more steps to actually converge (original paper's 100 left
     # it at ~10%, barely above 6.25% chance — a useless upper bound).
-    softmax_steps = int(os.environ.get('MQAR_SOFTMAX_STEPS', '500'))
+    softmax_steps = parse_int_env('MQAR_SOFTMAX_STEPS', 500, min_value=1,
+                                  logger=logger)
     logger.info(f'  n_seeds       : {n_seeds}')
     logger.info(f'  steps         : {steps}  (softmax: {softmax_steps})')
 
@@ -947,22 +960,14 @@ def main():
     except ValueError as e:
         # Fall back to replacing non-finite values with null so the
         # file is still written (downstream code handles None), and
-        # log the corruption loudly.
+        # log the corruption loudly. Uses the centralized
+        # ``sanitize_for_json`` helper from kaggle_setup.py (was a local
+        # ``_sanitize`` closure; centralizing removes 5 copies of the same
+        # logic across run_*.py and ensures any future edge-case fix
+        # propagates everywhere).
         logger.error(f'non-finite value in results; sanitizing to null: {e}')
-        def _sanitize(o):
-            if isinstance(o, float) and not math.isfinite(o):
-                return None
-            if isinstance(o, dict):
-                return {k: _sanitize(v) for k, v in o.items()}
-            # Recurse into both lists AND tuples: json.dumps serializes
-            # tuples as JSON arrays, but the previous check only handled
-            # lists, so a tuple containing a NaN/Inf would slip through
-            # _sanitize and re-trigger the ValueError on the second
-            # json.dumps(..., allow_nan=False), crashing the whole write.
-            if isinstance(o, (list, tuple)):
-                return [_sanitize(x) for x in o]
-            return o
-        text = json.dumps(_sanitize(all_results), indent=2, allow_nan=False)
+        text = json.dumps(sanitize_for_json(all_results), indent=2,
+                          allow_nan=False)
     with open('results/exp4_mqar.json', 'w') as f:
         f.write(text)
     logger.info('\nSaved: results/exp4_mqar.json')

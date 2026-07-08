@@ -104,15 +104,14 @@ def _sanitize(obj):
     ``summary.json`` write raise ``ValueError: Out of range float values are
     not JSON compliant``, dropping the whole summary on the floor. The
     summary fields are normally finite, but the defensive guard is cheap.
+
+    Delegates to the centralized ``sanitize_for_json`` helper in
+    kaggle_setup.py (was a local copy; the wrapper is kept here so
+    run_all.py's _run / summary code path that calls ``_sanitize(summary)``
+    below continues to work without touching the call sites).
     """
-    import math
-    if isinstance(obj, float):
-        return None if (math.isnan(obj) or math.isinf(obj)) else obj
-    if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize(v) for v in obj]
-    return obj
+    from kaggle_setup import sanitize_for_json
+    return sanitize_for_json(obj)
 
 
 def run_all(seeds=None, steps=None):

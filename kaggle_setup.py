@@ -333,6 +333,84 @@ def print_env_summary() -> EnvInfo:
     return info
 
 
+def parse_int_env(var_name: str, default: int, *, min_value: int = 1,
+                  logger: logging.Logger | None = None) -> int:
+    """Parse an int environment variable with robust fallback.
+
+    Returns the parsed int value, or ``default`` if the env var is unset OR
+    set to a value that cannot be parsed as an int (e.g. ``'abc'``,
+    ``'5.0'``) OR that fails the ``min_value`` check. A warning is logged
+    when the env var is set but invalid, so the user knows their setting
+    was ignored rather than silently dropped.
+
+    This mirrors the robust pattern already used for ``BENCH_REPEATS`` /
+    ``BENCH_LENGTHS`` in ``run_benchmark.py`` (which previously crashed
+    the whole benchmark on malformed input). Extending the same pattern
+    to ``MQAR_SEEDS`` / ``MQAR_STEPS`` / ``MQAR_SOFTMAX_STEPS`` /
+    ``MQAR_TRAIN_BATCH`` / ``ABL_SEEDS`` / ``ABL_STEPS`` / ``ABL_TRAIN_BATCH``
+    prevents a single typo from crashing an entire multi-hour experiment
+    with no informative error message — previously the bare
+    ``int(os.environ.get(...))`` raised ``ValueError: invalid literal for
+    int() with base 10: 'abc'`` with no context about WHICH env var was
+    bad or what the default would have been.
+
+    Args:
+        var_name: environment variable name to read.
+        default: value to return when the env var is unset or invalid.
+        min_value: inclusive lower bound; values below this fall back to
+            ``default`` (with a warning). Use ``min_value=0`` to allow
+            zero, or a negative value to disable the check.
+        logger: optional logger to receive the warning; falls back to the
+            module logger for this file.
+    """
+    raw = os.environ.get(var_name)
+    if raw is None:
+        return default
+    log = logger if logger is not None else logging.getLogger(__name__)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            f'invalid {var_name}={raw!r} (not an int); using default {default}')
+        return default
+    if val < min_value:
+        log.warning(
+            f'invalid {var_name}={raw!r} (must be >= {min_value}); '
+            f'using default {default}')
+        return default
+    return val
+
+
+def sanitize_for_json(obj):
+    """Recursively replace non-finite floats with ``None`` for strict JSON.
+
+    Mirrors the inline ``_sanitize`` helpers previously duplicated across
+    ``run_kv_cache.py`` / ``run_quality.py`` / ``run_ablation.py`` /
+    ``run_decoding.py`` / ``run_all.py``. Centralizing here removes 5
+    copies of the same logic and ensures any future fix (e.g. handling a
+    new edge case) propagates everywhere.
+
+    Python's default ``json.dump`` emits non-standard ``NaN`` / ``Infinity``
+    literals which most strict parsers (JS ``JSON.parse``, pandas
+    ``read_json``, jq) reject. ``json.dump(..., allow_nan=False)`` raises
+    ``ValueError`` instead, but the raised error fires mid-write — leaving
+    a partial JSON file that no parser can read. Sanitizing to ``None``
+    first lets the strict write succeed cleanly.
+
+    Recurses into dicts, lists, AND tuples (``json.dumps`` serializes
+    tuples as JSON arrays, so a tuple containing a NaN/Inf must also be
+    sanitized to avoid crashing the second ``allow_nan=False`` dump).
+    """
+    import math
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(x) for x in obj]
+    return obj
+
+
 if __name__ == "__main__":
     # When run directly, probe and optionally install the CUDA wheel.
     setup_kaggle()

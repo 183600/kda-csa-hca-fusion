@@ -36,7 +36,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device
+from kaggle_setup import configure_torch_for_device, parse_int_env
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -338,17 +338,11 @@ def main():
     # Parse BENCH_REPEATS defensively: the sibling BENCH_LENGTHS env var is
     # already wrapped in try/except with a graceful fallback, but BENCH_REPEATS
     # was a bare ``int()`` that crashed the whole benchmark on malformed input
-    # like ``BENCH_REPEATS=abc`` or ``BENCH_REPEATS=5.0``. Mirror BENCH_LENGTHS'
-    # robustness contract so the two env vars behave consistently.
-    try:
-        n_repeats = int(os.environ.get('BENCH_REPEATS', '5'))
-        if n_repeats < 1:
-            raise ValueError(f"must be >= 1, got {n_repeats}")
-    except ValueError as e:
-        logger.warning(
-            f'[run_benchmark] invalid BENCH_REPEATS='
-            f'{os.environ.get("BENCH_REPEATS")!r} ({e}); using default 5.')
-        n_repeats = 5
+    # like ``BENCH_REPEATS=abc`` or ``BENCH_REPEATS=5.0``. Use the shared
+    # ``parse_int_env`` helper so the robustness contract is identical across
+    # BENCH_REPEATS / BENCH_LENGTHS here AND MQAR_SEEDS / ABL_SEEDS / etc in
+    # the sibling experiment runners (single source of truth for the pattern).
+    n_repeats = parse_int_env('BENCH_REPEATS', 5, min_value=1, logger=logger)
     for T in seq_lengths:
         logger.info(f'\n-- T = {T} --')
         for name, factory in benches:

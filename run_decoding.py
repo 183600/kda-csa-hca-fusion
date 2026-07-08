@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import gc
 import json
-import math
 import os
 import statistics
 import sys
@@ -42,7 +41,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device
+from kaggle_setup import configure_torch_for_device, sanitize_for_json
 from ops_kda import naive_recurrent_kda
 
 
@@ -452,15 +451,12 @@ def main():
     # a NaN in the underlying times list) would cause ``json.dump`` to
     # emit non-standard ``NaN`` / ``Infinity`` literals, breaking
     # downstream parsers (JS ``JSON.parse``, pandas, jq).
-    def _sanitize(o):
-        if isinstance(o, float) and not math.isfinite(o):
-            return None
-        if isinstance(o, dict):
-            return {k: _sanitize(v) for k, v in o.items()}
-        if isinstance(o, (list, tuple)):
-            return [_sanitize(x) for x in o]
-        return o
-    sanitized = [_sanitize(r) for r in results]
+    #
+    # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py
+    # (was a local ``_sanitize`` closure; centralizing removes 5 copies of
+    # the same logic across run_*.py and ensures any future edge-case fix
+    # propagates everywhere).
+    sanitized = [sanitize_for_json(r) for r in results]
     try:
         text = json.dumps(sanitized, indent=2, allow_nan=False)
     except (TypeError, ValueError) as e:

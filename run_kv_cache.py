@@ -31,11 +31,12 @@ Linear §3.2 / §7.
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from kaggle_setup import sanitize_for_json
 
 
 # Reference GQA8, head_dim=128, BF16 baseline (as in DeepSeek-V4 §2.3.4).
@@ -412,22 +413,19 @@ def main():
     # (currently absent from main() but reachable via direct API call)
     # would produce ``inf`` from ``kv / baseline_1l`` when baseline_1l == 0;
     # without sanitization, the whole JSON file would be unparseable.
-    def _sanitize(o):
-        if isinstance(o, float) and not math.isfinite(o):
-            return None
-        if isinstance(o, dict):
-            return {k: _sanitize(v) for k, v in o.items()}
-        if isinstance(o, (list, tuple)):
-            return [_sanitize(x) for x in o]
-        return o
-    sanitized = [_sanitize(r) for r in rows]
+    #
+    # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py
+    # (was a local ``_sanitize`` closure; centralizing removes 5 copies of
+    # the same logic across run_*.py and ensures any future edge-case fix
+    # propagates everywhere).
+    sanitized = [sanitize_for_json(r) for r in rows]
     try:
         text = json.dumps(sanitized, indent=2, allow_nan=False)
     except (TypeError, ValueError) as e:
         # Fallback: log the corruption and write without allow_nan=False
         # so results are not lost entirely. Non-finite values would have
-        # been converted to None by _sanitize above, so this branch only
-        # fires on truly unexpected types (e.g. a tensor slipped in).
+        # been converted to None by sanitize_for_json above, so this branch
+        # only fires on truly unexpected types (e.g. a tensor slipped in).
         print(f'[run_kv_cache] WARNING: JSON serialization failed: {e}')
         text = json.dumps(sanitized, indent=2, default=str)
     with open('results/exp3_kv_cache.json', 'w') as f:
