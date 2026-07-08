@@ -61,14 +61,27 @@ def naive_recurrent_kda(
 
     S = q.new_zeros(B, HV, K, V)
     if initial_state is not None:
-        # Cast initial_state to compute_dtype before adding. If the caller
-        # passes a higher-precision state (e.g. fp64 state with fp32 inputs
-        # where compute_dtype=fp32), the in-place add would raise
-        # ``RuntimeError: result type Double can't be cast to the desired
-        # output type Float``. This can happen when the caller changes dtype
-        # between calls (e.g. fp64 first call -> fp32 second call) and reuses
-        # the returned state as initial_state.
-        S += initial_state.to(compute_dtype)
+        # Cast initial_state to compute_dtype AND move it to S's device before
+        # adding. Previously we only cast dtype (``.to(compute_dtype)``); a
+        # device mismatch (e.g. caller manually moves the model to CUDA but
+        # passes a stale CPU state) would raise ``RuntimeError: Expected all
+        # tensors to be on the same device``. Mirrors the more defensive
+        # ``.to(Z)`` pattern used in ops_csa.py / ops_hca.py.
+        S += initial_state.to(device=S.device, dtype=compute_dtype)
+    # Degenerate case: empty sequence. The for-loop body would not execute,
+    # and the function would *happen* to return correct shapes by accident
+    # (o=torch.zeros_like(v) is [B, 0, HV, V]; S is uninitialized [B, HV, K, V]).
+    # But the S.to(dtype) cast at the end of the function would run
+    # unnecessarily and a future edit touching the loop body could break the
+    # accident. Guard explicitly for clarity and consistency with
+    # naive_csa / naive_hca / naive_chunk_kda.
+    if T == 0:
+        o = torch.zeros_like(v)
+        if not output_final_state:
+            S = None
+        else:
+            S = S.to(dtype)
+        return o.to(dtype), S
     o = torch.zeros_like(v)
     for i in range(0, T):
         q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
@@ -105,6 +118,22 @@ def naive_chunk_kda(
     assert HV % H == 0, f"HV={HV} must be divisible by H={H} (GVA factor)"
     BT = chunk_size
     original_T = T
+    # Degenerate case: empty sequence. The downstream
+    # ``torch.linalg.solve_triangular`` on an empty NT=0 batch raises
+    # ``RuntimeError: solve_triangular: A and b must have the same number
+    # of rows``. Guard explicitly (mirrors naive_recurrent_kda /
+    # naive_csa / naive_hca).
+    if T == 0:
+        compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
+        S = q.new_zeros(B, HV, K, V)
+        if initial_state is not None:
+            S += initial_state.to(device=S.device, dtype=compute_dtype)
+        o = q.new_zeros(B, 0, HV, V)
+        if not output_final_state:
+            S = None
+        else:
+            S = S.to(dtype)
+        return o.to(dtype), S
     pad = (-T) % BT
     if pad:
         # Right-pad T up to a multiple of BT so callers don't have to.
@@ -142,8 +171,11 @@ def naive_chunk_kda(
     # computes ``N + N^2 + N^3 + ... = (I - N)^{-1} N`` (each row is updated
     # using the already-finalized rows above it). A single batched triangular
     # solve evaluates the same quantity without BT iterations x 3 clones.
+    # Standardize both ``torch.eye`` calls on (compute_dtype, q.device) so a
+    # future cast of ``A`` to a different dtype (e.g. for memory) does not
+    # silently diverge the two eyes and break the ``I - A`` / ``A + I`` math.
     A = torch.linalg.solve_triangular(
-        torch.eye(BT, dtype=A.dtype, device=A.device) - A, A, upper=False
+        torch.eye(BT, dtype=compute_dtype, device=q.device) - A, A, upper=False
     )
     A = (A + torch.eye(BT, dtype=compute_dtype, device=q.device)) * beta[..., None, :]
 
@@ -152,10 +184,10 @@ def naive_chunk_kda(
 
     S = q.new_zeros(B, HV, K, V)
     if initial_state is not None:
-        # Cast initial_state to compute_dtype before adding (same reason as
-        # naive_recurrent_kda: prevents dtype-mismatch RuntimeError when the
-        # caller reuses a state from a different-precision call).
-        S += initial_state.to(compute_dtype)
+        # Cast initial_state to compute_dtype AND move to S's device before
+        # adding (mirrors the fix in naive_recurrent_kda: prevents both
+        # dtype- and device-mismatch RuntimeErrors).
+        S += initial_state.to(device=S.device, dtype=compute_dtype)
     o = torch.zeros_like(v)
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
     for i in range(0, NT):
@@ -170,7 +202,13 @@ def naive_chunk_kda(
         v_i = u_i - w_i @ S
         o[:, :, i] = (q_i * g_i.exp()) @ S + Aqk @ v_i
         S = S * rearrange(g_i[:, :, -1].exp(), 'b h k -> b h k 1')
-        S += rearrange((g_i[:, :, -1:] - g_i).exp() * k_i, 'b h c k -> b h k c') @ v_i
+        # Use out-of-place ``S = S + ...`` (not in-place ``S += ...``) so the
+        # state-update step is safe under future gradient-checkpointing. The
+        # in-place variant would raise "one of the variables needed for
+        # gradient computation has been modified by an inplace operation" if
+        # anyone ever wraps this loop with checkpoint(). Mirrors the
+        # out-of-place pattern in naive_recurrent_kda (line: S = S + einsum(...)).
+        S = S + rearrange((g_i[:, :, -1:] - g_i).exp() * k_i, 'b h c k -> b h k c') @ v_i
     if not output_final_state:
         S = None
     else:

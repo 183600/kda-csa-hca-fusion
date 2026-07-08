@@ -201,6 +201,14 @@ def fig_kv_cache():
         if ratio is None:
             continue
         ops.setdefault(r['op'], []).append((r['T'], ratio))
+    # Empty-data guard: if filtering left no plottable series, skip the
+    # figure entirely. An empty-axes PDF on disk is indistinguishable from a
+    # real one and confuses downstream consumers (mirrors the guard in
+    # ``fig_decoding`` / ``_plot_mqar_group``).
+    if not ops:
+        print('Skipping fig_kv_cache (no data to plot for the selected '
+              f'accounting_mode={mode!r})')
+        return
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
@@ -222,10 +230,17 @@ def fig_kv_cache():
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, which='both', alpha=0.3)
     _ensure_figures_dir()
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_kv_cache.pdf'), dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_kv_cache.png'), dpi=150)
-    plt.close(fig)
-    print('Saved figures/fig_kv_cache.pdf')
+    # try/finally around savefig so a savefig failure (disk full, read-only
+    # Kaggle input dir, etc.) does not leak the figure. Without the finally,
+    # ``plt.close(fig)`` would be skipped on exception and the half-built
+    # figure would persist into the next fig_* call. Mirrors the pattern in
+    # the other fig_* functions.
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_kv_cache.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_kv_cache.png'), dpi=150)
+    finally:
+        plt.close(fig)
+    print(f'Saved {os.path.join(_FIGURES_DIR, "fig_kv_cache.pdf")}')
 
 
 def fig_flops():
@@ -256,6 +271,11 @@ def fig_flops():
         if ratio is None:
             continue
         ops.setdefault(r['op'], []).append((r['T'], ratio))
+    # Empty-data guard (mirrors fig_kv_cache).
+    if not ops:
+        print('Skipping fig_flops (no data to plot for the selected '
+              f'accounting_mode={mode!r})')
+        return
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
@@ -277,10 +297,12 @@ def fig_flops():
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, which='both', alpha=0.3)
     _ensure_figures_dir()
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_flops.pdf'), dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_flops.png'), dpi=150)
-    plt.close(fig)
-    print('Saved figures/fig_flops.pdf')
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_flops.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_flops.png'), dpi=150)
+    finally:
+        plt.close(fig)
+    print(f'Saved {os.path.join(_FIGURES_DIR, "fig_flops.pdf")}')
 
 
 def fig_mqar():
@@ -327,13 +349,22 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
         ops.append(r['op'])
         if _has_multiseed(r):
             means.append(r['mean_acc'])
-            cis.append(r.get('ci95_acc', 0.0) or 0.0)
-            chance = r.get('chance_acc', chance)
+            # ``or 0.0`` coerces both missing AND explicitly-None ci95_acc
+            # (the single-seed case where train_multi_seed returns None) to
+            # 0.0 so the error bar disappears. Without the ``or``, an
+            # explicit None would later crash ``m + c`` (int + NoneType).
+            cis.append(r.get('ci95_acc') or 0.0)
+            # Same ``or`` guard for chance_acc: a record with
+            # ``chance_acc: None`` (e.g. partially-failed seed wrote null)
+            # would set ``chance = None`` and crash ``ax.axhline(None, ...)``
+            # with TypeError. The default ``chance`` from line 316 is
+            # preserved when the value is missing OR None.
+            chance = r.get('chance_acc') or chance
         else:
             # Legacy single-seed format.
             means.append(r['final_acc'])
             cis.append(0.0)
-            chance = r.get('chance_acc', chance)
+            chance = r.get('chance_acc') or chance
     if not ops:
         print(f'Skipping MQAR figure for n_kv={n_kv} (all records are '
               f'error rows, no data to plot)')
@@ -512,7 +543,17 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     # previous code hardcoded ``1/16`` here, which would silently lie if the
     # upstream experiment ever changed VOCAB. Mirrors the fix in
     # run_ablation.py (chance = 1.0 / VOCAB).
-    chance_acc = records[0].get('chance_acc', 1/16) if records else 1/16
+    #
+    # Pick the first NON-ERROR record's chance_acc — ``records[0]`` may be
+    # an error row whose chance_acc is None, which would crash
+    # ``axhline(None, ...)`` with TypeError. Use ``or 1/16`` so an explicit
+    # None (or missing key) falls back to the default. Mirrors the None-safe
+    # read in _plot_mqar_group.
+    _ok_rec = next((r for r in records
+                    if 'error' not in r
+                    and (r.get('mean_acc') is not None
+                         or r.get('final_acc') is not None)), {})
+    chance_acc = _ok_rec.get('chance_acc') or 1/16
     ax1.axhline(chance_acc, color='gray', linestyle='--', alpha=0.5,
                 label=f'chance ({chance_acc:.4f})')
     for bar, acc, is_err in zip(bars1, accs, error_flags):

@@ -251,10 +251,28 @@ def prefill_flops(op: str, T: int, **kw):
         )
         # Indexer: per-head similarities T * n_blocks * c_I * nIh, then
         # weighted sum across heads T * n_blocks * nIh.
-        indexer = 2 * T * p['csa_cI'] * p['csa_nIh'] * n_blocks \
-                  + 2 * T * p['csa_nIh'] * n_blocks
+        # The lightning indexer applies the causal block mask BEFORE top-k
+        # (csa_lightning_indexer masks non-causal blocks to -inf), so query t
+        # only scores floor(t / csa_m) valid blocks. Total causal block
+        # entries = T*n_blocks - n_blocks*(n_blocks-1)/2 (triangular). The
+        # previous formula used the full T*n_blocks product, overcounting the
+        # aggregation term by ~2x and biasing flops_ratio_vs_gqa_*.
+        causal_block_entries = T * n_blocks - n_blocks * (n_blocks - 1) // 2
+        indexer = 2 * causal_block_entries * p['csa_cI'] * p['csa_nIh'] \
+                  + 2 * causal_block_entries * p['csa_nIh']
         # Core sparse attention: QK^T (c term) + softmax·V (c term).
-        core = 2 * T * csa_topk * csa_c * H * 2
+        # ``csa_lightning_indexer`` clamps topk to ``min(topk, n_blocks)``
+        # AND masks non-causal blocks to -inf before top-k, so the EFFECTIVE
+        # per-query topk is ``min(csa_topk, floor(t / csa_m))``. Average
+        # effective topk over all queries is roughly
+        # ``min(csa_topk, n_blocks / 2)`` (causal triangular). The previous
+        # formula used ``csa_topk`` directly, overcounting by up to 16x at
+        # short T (e.g. T=512 -> n_blocks=32 -> effective topk=16, but
+        # csa_topk=512 in the default config -> 32x overcount). Use the
+        # clamped value; for very long T (n_blocks >> csa_topk) this
+        # converges to the original formula.
+        effective_topk = min(csa_topk, max(1, n_blocks // 2))
+        core = 2 * T * effective_topk * csa_c * H * 2
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
         # query). The previous formula ``T * w`` assumed every query
@@ -278,8 +296,17 @@ def prefill_flops(op: str, T: int, **kw):
         hca_dc = p.get('hca_dc', 128)
         hca_nh = p.get('hca_nh', H)
         query_proj = 2 * T * (d * hca_dc + hca_dc * hca_c * hca_nh)
-        # Core dense attention over all n_blocks: QK^T (c) + softmax·V (c).
-        core = 2 * T * n_blocks * hca_c * H * 2
+        # Core dense attention over the compressed blocks. The dense branch
+        # in naive_hca applies the causal block mask (query t attends only
+        # to blocks STRICTLY before floor(t / hca_m2)), so the actual number
+        # of (query, block) entries is the causal triangular count
+        # ``T*n_blocks - n_blocks*(n_blocks-1)/2``, NOT the full
+        # ``T * n_blocks``. The previous formula used the full product,
+        # overcounting HCA core FLOPs by ~2x and biasing
+        # flops_ratio_vs_gqa_* accordingly. Mirrors the softmax causal-tri
+        # fix above and the CSA indexer fix.
+        causal_block_entries = T * n_blocks - n_blocks * (n_blocks - 1) // 2
+        core = 2 * causal_block_entries * hca_c * H * 2
         # Sliding window: causal window (same fix as CSA above).
         sw_w = p['hca_sliding_window']
         eff_sw = min(T, sw_w)

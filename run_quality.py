@@ -217,6 +217,7 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     if device is None:
         device = embed.weight.device
 
+    assert n_kv >= 1, f"n_kv={n_kv} must be >= 1"
     # Guard against silent shape corruption: if 2*n_kv exceeds vocab, the
     # argsort slice returns fewer than 2*n_kv ids and keys/vals end up with
     # mismatched shapes ([batch, vocab//2] vs the expected [batch, n_kv]).
@@ -738,8 +739,15 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=500,
         ci_acc = t * std_acc / math.sqrt(n)
         ci_loss = t * std_loss / math.sqrt(n)
     else:
+        # With a single seed, the sample std is undefined and the t-CI is
+        # NOT zero — the uncertainty is maximal. Mirror the convention
+        # used in run_ablation.py::eval_layout_multi_seed: return None so
+        # downstream consumers (summary table, make_figures.py) can render
+        # 'n/a' instead of a misleading '0.0000' that implies perfect
+        # precision. The previous code returned ``0.0``, which lied about
+        # the precision of a single-seed mean.
         std_acc = std_loss = 0.0
-        ci_acc = ci_loss = 0.0
+        ci_acc = ci_loss = None
 
     # One-sample t-test vs chance: tests whether mean_acc differs from the
     # chance level. The t-statistic is only defined when n > 1 and the
@@ -849,9 +857,13 @@ def main():
             try:
                 r = train_multi_seed(op, n_seeds=n_seeds, steps=steps,
                                      softmax_steps=softmax_steps, device=device,
-                                     n_kv=n_kv)
+                                     n_kv=n_kv, vocab=vocab, seq_len=seq_len)
                 all_results.append(r)
-                logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {r['ci95_acc']:.4f} "
+                # ci95_acc may be None when only one seed survived (see
+                # train_multi_seed). Render as 'n/a' instead of crashing on
+                # ``f'{None:.4f}'``.
+                ci_str = f"{r['ci95_acc']:.4f}" if r['ci95_acc'] is not None else 'n/a'
+                logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {ci_str} "
                             f"(std={r['std_acc']:.4f}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
             except Exception as e:
                 import traceback as _tb
@@ -884,11 +896,12 @@ def main():
                     'per_seed': [],
                 })
 
-    # Summary table (grouped by n_kv)
-    print('\n' + '=' * 80)
+    # Summary table (grouped by n_kv). Header is 82 chars wide:
+    # 4+3+10+3+10+3+10+3+8+3+12+3+10 = 82. Use the same width for the rules.
+    print('\n' + '=' * 82)
     print(f"{'n_kv':>4} | {'op':>10} | {'mean_acc':>10} | {'+/- CI95':>10} | "
           f"{'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
-    print('-' * 80)
+    print('-' * 82)
     for r in all_results:
         # Error rows have None for all numeric fields; render them as
         # dashes instead of crashing on ``f'{None:.4f}'``.
@@ -897,8 +910,13 @@ def main():
             print(f"{r['n_kv']:>4} | {r['op']:>10} | {'-':>10} | "
                   f"{'-':>10} | {'-':>8} | {'-':>12} | {'-':>10}   ERROR: {err_msg}")
             continue
+        # ci95_acc may be None when only one seed survived; render 'n/a'.
+        if r['ci95_acc'] is not None:
+            ci_str = f"{r['ci95_acc']:>10.4f}"
+        else:
+            ci_str = f"{'n/a':>10}"
         print(f"{r['n_kv']:>4} | {r['op']:>10} | {r['mean_acc']:>10.4f} | "
-              f"{r['ci95_acc']:>10.4f} | {r['std_acc']:>8.4f} | "
+              f"{ci_str} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
     # Chance row: fill ALL columns so the table renders as a clean grid
     # (the previous version only filled 3 of 7 columns, leaving the right

@@ -290,6 +290,17 @@ def main():
                 # it loudly but keep going so the user sees all failures.
                 print(f"  [CRASH] {fn.__name__}: {type(e).__name__}: {e}")
                 results.append(False)
+            finally:
+                # Close any figures the test may have left open. The pytest
+                # autouse fixture (_close_figs_fixture) handles this under
+                # pytest, but when ``python test_figures.py`` is run
+                # directly (e.g. from run_all.py), no such fixture runs and
+                # a half-built figure from a CRASHed test would leak into
+                # the next test, potentially causing
+                # ``RuntimeWarning: More than 20 figures`` or canvas-state
+                # surprises.
+                import matplotlib.pyplot as _plt
+                _plt.close('all')
     finally:
         _restore_results()
         try:

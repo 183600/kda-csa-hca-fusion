@@ -331,8 +331,16 @@ def demo_headwise_fusion():
                          head_dim=16, csa_m=4, csa_topk=4, hca_m2=8,
                          csa_c=16, hca_c=16)
     model = HeadwiseFusedAttention(cfg).to(device)
+    # Use eval() + no_grad() for this demo: the demo only checks output
+    # shape/finiteness, so building the autograd graph is pure waste (the
+    # graph would be retained on ``y`` until it goes out of scope). eval()
+    # also disables any future dropout/BN that might be added to
+    # HeadwiseFusedAttention, future-proofing the finiteness check.
+    # Mirrors the pattern in run_correctness.py::test_fused_hybrid.
+    model.eval()
     x = (torch.randn(2, 32, 64, device=device) * 0.1)
-    y = model(x)
+    with torch.no_grad():
+        y = model(x)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  input shape  : {tuple(x.shape)}")
     print(f"  output shape : {tuple(y.shape)}")

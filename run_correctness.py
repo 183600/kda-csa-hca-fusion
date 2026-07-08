@@ -386,11 +386,20 @@ def test_fused_hybrid(device='cpu'):
     with torch.no_grad():
         y = model(x)
     n_params = sum(p.numel() for p in model.parameters())
+    # Verify the layout matches the configured n_kda:n_csa:n_hca ratio.
+    # Previously this was a tautological ``_ok(..., True, ...)`` that always
+    # passed regardless of model state, providing zero test value. Replace
+    # with a real invariant: with n_kda=3, n_csa=1, n_hca=1, total_layers=5,
+    # the layout must be exactly 'KDA-KDA-KDA-CSA-HCA'. A bug in
+    # _build_layout (e.g. wrong ordering of the unit tuple, off-by-one in
+    # the truncation) would now be caught.
+    expected_layout = 'KDA-KDA-KDA-CSA-HCA'
+    layout_ok = model.layout_str() == expected_layout
     return [
         _ok('hybrid output shape', y.shape == x.shape, str(tuple(y.shape))),
         _ok('hybrid finite', torch.isfinite(y).all().item(), ''),
-        _ok('hybrid layout', True,
-            f'layout={model.layout_str()} params={n_params}'),
+        _ok('hybrid layout', layout_ok,
+            f'layout={model.layout_str()} expected={expected_layout} params={n_params}'),
     ]
 
 
@@ -602,27 +611,35 @@ def test_csa_indexer_validity(device='cpu'):
     valid_idx = indices >= 0
     in_range = (indices[valid_idx] < n_blocks).all().item()
     # Every selected block must be causal (strictly preceding the query).
-    causal_ok = True
-    for t in range(T):
-        sel = indices[0, t]
-        sel = sel[sel >= 0]
-        if sel.numel() and not cbm[t, sel].all():
-            causal_ok = False
-            break
+    # Vectorized: clamp -1 to 0, gather cbm[t, idx] for every (b, t, k),
+    # then OR with the (indices < 0) mask so invalid slots don't trip the
+    # check. Replaces the per-t Python loop with a single batched gather.
+    idx_safe = indices.clamp(min=0)                              # [B, T, topk]
+    t_grid = torch.arange(T, device=device).view(T, 1).expand(T, idx_safe.shape[-1])
+    causal_per_slot = cbm[t_grid, idx_safe[0]] | (indices[0] < 0)  # [T, topk]
+    causal_ok = causal_per_slot.all().item()
     # For early queries (t < m), no preceding block exists, so all indices
-    # should be -1 (padded).
-    early_ok = True
-    for t in range(m):
-        sel = indices[0, t]
-        if not (sel == -1).all():
-            early_ok = False
-            break
+    # should be -1 (padded). Vectorized: (indices[0, :m] == -1).all().
+    early_ok = (indices[0, :m] == -1).all().item()
+    # Count check: every query t should have exactly min(topk, t // m)
+    # valid (non -1) indices. The docstring promises this check but the
+    # original implementation never performed it; a bug where the indexer
+    # returned e.g. only 2 of 4 valid indices (or 6 padded -1s with 2
+    # valid) would have passed silently. We verify the count for EVERY
+    # query, not just a sample, so an off-by-one or wrong-padding bug at
+    # any t is caught.
+    expected_counts = torch.tensor(
+        [min(topk, t // m) for t in range(T)], device=device)
+    actual_counts = (indices[0] >= 0).sum(-1)                   # [T]
+    count_ok = (actual_counts == expected_counts).all().item()
 
     return [
         _ok('CSA indices in range', in_range, f'topk={topk}, n_blocks={n_blocks}'),
         _ok('CSA indices causal', causal_ok, 'all selected blocks precede query'),
         _ok('CSA early queries empty', early_ok,
             f'queries t<{m} have no preceding block -> all -1'),
+        _ok('CSA index count per query', count_ok,
+            f'each query t has min(topk={topk}, t//m) valid indices'),
     ]
 
 
@@ -1282,7 +1299,11 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
                       sliding_window=0, sink_logits=sink)
 
     # Build a CORRECT reference for the sparse MQA core with sink.
-    from ops_csa import csa_compress_kv, csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask
+    # NOTE: ``csa_compress_kv`` is the only name not already imported at
+    # module level (line 48 imports csa_compress_kv_overlapped /
+    # csa_lightning_indexer / _causal_block_mask / naive_csa). Import just
+    # the missing name instead of re-shadowing the other three.
+    from ops_csa import csa_compress_kv
     Ca = H @ W_aKV; Cb = H @ W_bKV; Za = H @ W_aZ; Zb = H @ W_bZ
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)
     n_blocks = T // m
@@ -1336,8 +1357,11 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
                       sliding_window=0, sink_logits=sink2)
 
     # Correct reference for HCA dense attention with sink.
-    # ``csa_compress_kv`` is already imported at the top of this function
-    # (line ~1211); reuse it instead of re-importing under an alias.
+    # ``csa_compress_kv`` was imported earlier in this function (the
+    # ``from ops_csa import csa_compress_kv`` line near the CSA reference
+    # computation above); reuse it instead of re-importing under an alias.
+    # (Previous comment referenced "line ~1211", which was wrong — that line
+    # is in a different function. The actual import is ~100 lines above.)
     C2 = H2 @ W_KV2; Z2 = H2 @ W_Z2
     C_comp2 = csa_compress_kv(C2, Z2, B_pos2, m2)
     n_blocks2 = T2 // m2
@@ -2066,8 +2090,13 @@ def test_weight_decay_param_groups(device='cpu'):
       7. The weight_decay values are correctly set on each group.
     """
     logger.info("Test: weight decay param groups (embed/bias/LayerNorm excluded)")
+    # ``_build_param_groups`` is imported lazily because run_quality.py is a
+    # heavy module (it builds nn.Modules at import time); importing it at
+    # module load would slow down the entire test suite for one test.
+    # ``HybridKCHAttention`` / ``HybridConfig`` are ALREADY imported at module
+    # level (line 50) — the previous inline re-import was a copy-paste smell
+    # that shadowed the module-level imports for no reason.
     from run_quality import _build_param_groups
-    from ops_fused import HybridKCHAttention, HybridConfig
 
     embed = torch.nn.Embedding(16, 32).to(device)
     head = torch.nn.Sequential(
@@ -2175,8 +2204,11 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
     # Use DISTINCT values for nh, nIh, c, c_I so the test would actually
     # catch a wrong-dimension weight. Previously all of {nh, nIh, c, c_I}
     # collapsed to {2, 2, 8, 8}, which made several wrong-dim weight
-    # constructions coincidentally shape-correct.
-    m, m2, nh, nIh, c, c_I, dc = 8, 16, 2, 3, 8, 4, 16
+    # constructions coincidentally shape-correct. ALSO: keep c distinct
+    # from m (the previous code had c == m == 8, so a bug that built the
+    # CSA early-return shape as ``nh * m`` instead of ``nh * c`` would
+    # have passed). c=10 here makes that bug detectable.
+    m, m2, nh, nIh, c, c_I, dc = 8, 16, 2, 3, 10, 4, 16
     H = torch.randn(B, T, d, device=device) * 0.1
     # CSA weights — shapes must match the documented contract:
     #   W_aKV: [d, c], W_aZ: [d, c], Ba: [m, c], Bb: [m, c]

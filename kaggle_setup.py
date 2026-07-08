@@ -296,7 +296,22 @@ def configure_torch_for_device(device: torch.device | None = None) -> EnvInfo:
     else:
         # cuDNN autotune is a big win on T4 for the fixed shapes we benchmark.
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
+        # TF32 (TensorFloat-32) matmul is only supported on Ampere (sm_80)
+        # and later. Kaggle's T4 is sm_75 (Turing), so allow_tf32=True is a
+        # no-op there — harmless but misleading (it suggests TF32 acceleration
+        # is active when it is not). Guard with a capability check so the
+        # flag is only set on GPUs that actually use it. On Ampere+ this
+        # gives a ~8x matmul speedup with ~3 decimal digits of precision
+        # (perfectly fine for our benchmarks); on Turing it correctly does
+        # nothing.
+        try:
+            _cap = torch.cuda.get_device_capability(0)
+            if _cap[0] >= 8:  # sm_80+ (Ampere, Ada, Hopper, ...)
+                torch.backends.cuda.matmul.allow_tf32 = True
+        except (RuntimeError, IndexError):
+            # Capability query failed (e.g. CUDA device vanished mid-run).
+            # Silently skip — the default (False) is always safe.
+            pass
     return info
 
 

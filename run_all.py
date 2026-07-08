@@ -148,108 +148,122 @@ def run_all(seeds=None, steps=None):
         # HERE is already on sys.path (module load), so imports still work
         # after we chdir away from it.
         print(f'[run_all] script dir is read-only; writing outputs to {out_root}')
+    # Save the caller's CWD so we can restore it in the finally block below.
+    # ``os.chdir`` is a process-global side effect: if a notebook calls
+    # ``run_all()`` and then writes files relative to their original CWD,
+    # those files would silently land in ``out_root`` instead. Restoring
+    # the CWD on exit (including on exception) makes run_all() behave as a
+    # well-behaved library function rather than a process mutator.
+    _orig_cwd = os.getcwd()
     os.chdir(out_root)
-    os.makedirs('results', exist_ok=True)
-    os.makedirs('figures', exist_ok=True)
-    # Tell make_figures.py where to read results and write figures. On Kaggle
-    # this is /kaggle/working/{results,figures}, NOT the read-only
-    # /kaggle/input/... directory where this script lives. Without these env
-    # vars, make_figures.py reads from _ROOT/results (read-only, possibly
-    # stale) and tries to write to _ROOT/figures (raising OSError [Errno 30]).
-    # On a normal clone, out_root==HERE so the env vars match the defaults
-    # already used by make_figures.py and the behavior is unchanged.
-    os.environ['RESULTS_DIR'] = os.path.join(out_root, 'results')
-    os.environ['FIGURES_DIR'] = os.path.join(out_root, 'figures')
+    try:
+        os.makedirs('results', exist_ok=True)
+        os.makedirs('figures', exist_ok=True)
+        # Tell make_figures.py where to read results and write figures. On Kaggle
+        # this is /kaggle/working/{results,figures}, NOT the read-only
+        # /kaggle/input/... directory where this script lives. Without these env
+        # vars, make_figures.py reads from _ROOT/results (read-only, possibly
+        # stale) and tries to write to _ROOT/figures (raising OSError [Errno 30]).
+        # On a normal clone, out_root==HERE so the env vars match the defaults
+        # already used by make_figures.py and the behavior is unchanged.
+        os.environ['RESULTS_DIR'] = os.path.join(out_root, 'results')
+        os.environ['FIGURES_DIR'] = os.path.join(out_root, 'figures')
 
-    summary = {'env': repr(info), 'runs': []}
+        summary = {'env': repr(info), 'runs': []}
 
-    # Import after deps are installed.
-    import run_correctness
-    import run_kv_cache
-    import run_benchmark
-    import run_quality
-    import run_ablation
-    import run_decoding
-    import method_analysis
-    import make_figures
+        # Import after deps are installed.
+        import run_correctness
+        import run_kv_cache
+        import run_benchmark
+        import run_quality
+        import run_ablation
+        import run_decoding
+        import method_analysis
+        import make_figures
 
-    skip_slow = os.environ.get('SKIP_SLOW', '0') == '1'
-    is_cpu = not info.has_gpu
+        skip_slow = os.environ.get('SKIP_SLOW', '0') == '1'
+        is_cpu = not info.has_gpu
 
-    # 1. Correctness — always run (fast, ~seconds).
-    summary['runs'].append(_run('exp1_correctness', run_correctness.main))
+        # 1. Correctness — always run (fast, ~seconds).
+        summary['runs'].append(_run('exp1_correctness', run_correctness.main))
 
-    # 2. KV cache analysis — pure arithmetic, always run.
-    summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))
+        # 2. KV cache analysis — pure arithmetic, always run.
+        summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))
 
-    # 3. Method analysis (formulas + headwise demo) — always run.
-    summary['runs'].append(_run('method_analysis', method_analysis.main))
+        # 3. Method analysis (formulas + headwise demo) — always run.
+        summary['runs'].append(_run('method_analysis', method_analysis.main))
 
-    # 4. Latency benchmark — on CPU the CSA/HCA Python loops are slow at T=2048.
-    #    Skip the largest lengths on CPU if SKIP_SLOW is set.
-    if skip_slow and is_cpu:
-        print('\n[run_all] SKIP_SLOW=1 on CPU: truncating benchmark lengths.')
-        # run_benchmark.main() reads BENCH_LENGTHS (comma-separated) and
-        # falls back to the full sweep {128,256,512,1024,2048} when unset.
-        os.environ['BENCH_LENGTHS'] = '128,256,512'
-        summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
-    else:
-        summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
+        # 4. Latency benchmark — on CPU the CSA/HCA Python loops are slow at T=2048.
+        #    Skip the largest lengths on CPU if SKIP_SLOW is set.
+        if skip_slow and is_cpu:
+            print('\n[run_all] SKIP_SLOW=1 on CPU: truncating benchmark lengths.')
+            # run_benchmark.main() reads BENCH_LENGTHS (comma-separated) and
+            # falls back to the full sweep {128,256,512,1024,2048} when unset.
+            os.environ['BENCH_LENGTHS'] = '128,256,512'
+            summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
+        else:
+            summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
 
-    # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
-    if skip_slow and is_cpu:
-        print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to 3 seeds / 100 steps.')
-        # NOTE: use direct assignment, NOT ``setdefault``. The earlier block at
-        # the top of ``run_all`` already set ``MQAR_SEEDS`` / ``MQAR_STEPS`` via
-        # direct assignment from the ``seeds`` / ``steps`` parameters, so
-        # ``setdefault`` here is a no-op and the reduction never happens —
-        # the log message lies and the full 5-seed / 200-step run is launched,
-        # defeating the whole point of SKIP_SLOW on CPU.
-        os.environ['MQAR_SEEDS'] = '3'
-        os.environ['MQAR_STEPS'] = '100'
-        os.environ['MQAR_SOFTMAX_STEPS'] = '200'
-    summary['runs'].append(_run('exp4_mqar', run_quality.main))
+        # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
+        if skip_slow and is_cpu:
+            print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to 3 seeds / 100 steps.')
+            # NOTE: use direct assignment, NOT ``setdefault``. The earlier block at
+            # the top of ``run_all`` already set ``MQAR_SEEDS`` / ``MQAR_STEPS`` via
+            # direct assignment from the ``seeds`` / ``steps`` parameters, so
+            # ``setdefault`` here is a no-op and the reduction never happens —
+            # the log message lies and the full 5-seed / 200-step run is launched,
+            # defeating the whole point of SKIP_SLOW on CPU.
+            os.environ['MQAR_SEEDS'] = '3'
+            os.environ['MQAR_STEPS'] = '100'
+            os.environ['MQAR_SOFTMAX_STEPS'] = '200'
+        summary['runs'].append(_run('exp4_mqar', run_quality.main))
 
-    # 6. Ablation — multi-seed.
-    if skip_slow and is_cpu:
-        # Same direct-assignment fix as above (``setdefault`` is a no-op
-        # because ``ABL_SEEDS`` / ``ABL_STEPS`` were already set above).
-        os.environ['ABL_SEEDS'] = '3'
-        os.environ['ABL_STEPS'] = '50'
-    summary['runs'].append(_run('exp5_ablation', run_ablation.main))
+        # 6. Ablation — multi-seed.
+        if skip_slow and is_cpu:
+            # Same direct-assignment fix as above (``setdefault`` is a no-op
+            # because ``ABL_SEEDS`` / ``ABL_STEPS`` were already set above).
+            os.environ['ABL_SEEDS'] = '3'
+            os.environ['ABL_STEPS'] = '50'
+        summary['runs'].append(_run('exp5_ablation', run_ablation.main))
 
-    # 7. Decoding latency — fast (only softmax + KDA).
-    summary['runs'].append(_run('exp6_decoding', run_decoding.main))
+        # 7. Decoding latency — fast (only softmax + KDA).
+        summary['runs'].append(_run('exp6_decoding', run_decoding.main))
 
-    # 8. Figures — generate from whatever results exist.
-    def _make_figs():
-        try:
-            make_figures.main()
-        except Exception as e:
-            # Figures are best-effort; a missing result file shouldn't fail the run.
-            print(f'[make_figures] partial: {e}')
-    summary['runs'].append(_run('make_figures', _make_figs))
+        # 8. Figures — generate from whatever results exist.
+        def _make_figs():
+            try:
+                make_figures.main()
+            except Exception as e:
+                # Figures are best-effort; a missing result file shouldn't fail the run.
+                print(f'[make_figures] partial: {e}')
+        summary['runs'].append(_run('make_figures', _make_figs))
 
-    # Final summary.
-    n_ok = sum(1 for r in summary['runs'] if r['status'] == 'ok')
-    n_fail = sum(1 for r in summary['runs'] if r['status'] == 'fail')
-    total_t = sum(r['time_s'] for r in summary['runs'])
-    summary['n_ok'] = n_ok
-    summary['n_fail'] = n_fail
-    summary['total_time_s'] = total_t
+        # Final summary.
+        n_ok = sum(1 for r in summary['runs'] if r['status'] == 'ok')
+        n_fail = sum(1 for r in summary['runs'] if r['status'] == 'fail')
+        total_t = sum(r['time_s'] for r in summary['runs'])
+        summary['n_ok'] = n_ok
+        summary['n_fail'] = n_fail
+        summary['total_time_s'] = total_t
 
-    print('\n' + '=' * 70)
-    print('Run-all summary')
-    print('=' * 70)
-    for r in summary['runs']:
-        print(f"  {r['status'].upper():>4}  {r['name']:<24}  {r['time_s']:>8.1f}s")
-    print('-' * 70)
-    print(f'  {n_ok} ok, {n_fail} failed, total {total_t:.1f}s')
+        print('\n' + '=' * 70)
+        print('Run-all summary')
+        print('=' * 70)
+        for r in summary['runs']:
+            print(f"  {r['status'].upper():>4}  {r['name']:<24}  {r['time_s']:>8.1f}s")
+        print('-' * 70)
+        print(f'  {n_ok} ok, {n_fail} failed, total {total_t:.1f}s')
 
-    with open('results/summary.json', 'w') as f:
-        json.dump(_sanitize(summary), f, indent=2, allow_nan=False)
-    print('\nSaved: results/summary.json')
+        with open('results/summary.json', 'w') as f:
+            json.dump(_sanitize(summary), f, indent=2, allow_nan=False)
+        print('\nSaved: results/summary.json')
 
 
+    finally:
+        # Restore the caller's CWD (saved before os.chdir above) so
+        # run_all() does not leave the process in out_root on return.
+        # This runs on both clean exit and exception, so a notebook
+        # caller never finds itself unexpectedly in /kaggle/working.
+        os.chdir(_orig_cwd)
 if __name__ == '__main__':
     run_all()

@@ -57,6 +57,13 @@ SEQ_LEN = 16
 
 
 def _make_cfg(d_model=32, ratio=(3, 1, 1)):
+    # Validate ratio so a typo (e.g. ``ratio=(3, 1)`` or ``ratio=(-1, 1, 1)``)
+    # produces a clear error instead of an opaque ValueError from the
+    # tuple-unpack or a silently-empty KDA layout (``['kda'] * -1 == []``).
+    assert isinstance(ratio, tuple) and len(ratio) == 3, (
+        f"ratio must be a 3-tuple (n_kda, n_csa, n_hca), got {ratio!r}")
+    assert all(isinstance(n, int) and n >= 0 for n in ratio), (
+        f"ratio components must be non-negative ints, got {ratio!r}")
     n_kda, n_csa, n_hca = ratio
     # HCA's defining feature is *heavy* compression: m2 should be >> m so the
     # HCA branch produces far fewer compressed blocks than CSA, trading recall
@@ -121,7 +128,7 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
             m.train(was)
 
 
-def eval_layout(ratio, d_model=32, seq_len=16, n_kv=1, steps=100, lr=3e-3, seed=42,
+def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, seed=42,
                 device='cpu', eval_batches=4, eval_batch=64, train_batch=None):
     # Coerce string device -> torch.device for notebook callers. Mirrors
     # run_quality.py::train_one / train_multi_seed.
@@ -532,11 +539,12 @@ def main():
                     'per_seed': [],
                 })
 
-    # Summary table (grouped by n_kv)
-    print('\n' + '=' * 95)
+    # Summary table (grouped by n_kv). Header is 112 chars wide:
+    # 4+3+8+3+22+3+6+3+8+3+10+3+10+3+12+3+8 = 112. Use the same width for rules.
+    print('\n' + '=' * 112)
     print(f"{'n_kv':>4} | {'ratio':>8} | {'layout':>22} | {'layers':>6} | {'params':>8} | "
           f"{'mean_acc':>10} | {'+/- CI95':>10} | {'t_vs_chance':>12} | {'fwd_ms':>8}")
-    print('-' * 95)
+    print('-' * 112)
     for r in all_results:
         # Skip error rows in the summary table (they have null fields).
         if 'error' in r:
@@ -544,12 +552,18 @@ def main():
                   f"{'-':>8} | {'-':>10} | {'-':>10} | {'-':>12} | {'-':>8}   ERROR: {r['error']}")
             continue
         layout_str = r.get('layout', '') or ''
-        n_params = r.get('n_params') or 0
-        mean_acc = r.get('mean_acc') or 0.0
-        ci95 = r.get('ci95_acc') or 0.0
-        fwd = r.get('mean_fwd_ms') or 0.0
+        # Use explicit ``is not None`` checks (not ``or 0.0``): ``or`` would
+        # silently coalesce a legitimate 0.0 (e.g. an all-zero mean_acc)
+        # into the fallback, and more importantly would render a None CI
+        # (single-seed case) as ``0.0000`` instead of 'n/a' — implying
+        # perfect precision when in fact the uncertainty is maximal.
+        n_params = r['n_params'] if r.get('n_params') is not None else 0
+        mean_acc = r['mean_acc'] if r.get('mean_acc') is not None else 0.0
+        ci95 = r['ci95_acc']
+        fwd = r['mean_fwd_ms'] if r.get('mean_fwd_ms') is not None else 0.0
+        ci_str = f"{ci95:>10.4f}" if ci95 is not None else f"{'n/a':>10}"
         print(f"{r['n_kv']:>4} | {r['ratio']:>8} | {layout_str:>22} | {r['n_layers']:>6} | "
-              f"{n_params:>8} | {mean_acc:>10.4f} | {ci95:>10.4f} | "
+              f"{n_params:>8} | {mean_acc:>10.4f} | {ci_str} | "
               f"{_fmt_tstat(r.get('t_stat_vs_chance'), width=12, prec=2)} | {fwd:>8.2f}")
     print(f"{'':>4} | {'chance':>8} | {'':>22} | {'':>6} | {'':>8} | "
           f"{1.0/VOCAB:>10.4f} | {'':>10} | {'':>12} | {'':>8}")

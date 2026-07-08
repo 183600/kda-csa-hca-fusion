@@ -276,14 +276,21 @@ class HybridKCHAttention(nn.Module):
         # relying on this implicit behavior.
         #
         # If the batch size changed (e.g. train batch=16, eval batch=8), the
-        # old state is invalid and we drop it. We also drop it on a device
-        # mismatch as a defensive measure (should not happen now that the
-        # state is a registered buffer moved by .to(), but cheap to guard).
+        # old state is invalid and we drop it. For a DEVICE mismatch (which
+        # should not happen now that the state is a registered buffer moved
+        # by .to(), but cheap to guard) we MOVE the state instead of dropping
+        # it: dropping irreversibly loses the recurrent memory, while moving
+        # preserves it. The previous behavior (drop on device mismatch) would
+        # silently reset the KDA state whenever the caller forgot to call
+        # ``model.to(device)`` before passing inputs on a different device.
         stacked = self._kda_state
         if stacked is not None:
             # Batch dim is axis 1 (axis 0 is the per-layer index).
-            if stacked.shape[1] != x.shape[0] or stacked.device != x.device:
+            if stacked.shape[1] != x.shape[0]:
                 stacked = None
+            elif stacked.device != x.device:
+                # Move (and keep detached) rather than drop.
+                stacked = stacked.to(x.device).detach()
             else:
                 # Always detach: training (BPTT safety) AND eval (memory leak
                 # prevention). See the comment above for the full rationale.
@@ -322,7 +329,22 @@ class HybridKCHAttention(nn.Module):
         # the same config (HV, K, V), so every entry has the same shape and
         # torch.stack is safe. If n_kda_layers == 0 (no KDA in the layout),
         # there is nothing to persist.
-        if self.n_kda_layers > 0 and all(s is not None for s in states):
+        #
+        # If any single KDA layer returned ``None`` for its new_state (which
+        # should not happen because KDA's ``output_final_state=True`` always
+        # returns a tensor), we raise rather than silently nuking the OTHER
+        # layers' valid states. The previous ``all(s is not None for s in
+        # states)`` check would have set ``_kda_state = None``, throwing away
+        # every layer's state because of one bad layer — a latent footgun for
+        # any future KDA variant that conditionally returns None.
+        if self.n_kda_layers > 0:
+            if any(s is None for s in states):
+                raise RuntimeError(
+                    "HybridKCHAttention: a KDA layer returned new_state=None "
+                    "despite output_final_state=True. Refusing to persist a "
+                    "partial state stack (would silently drop other layers' "
+                    "states). Check the KDA layer implementation."
+                )
             self._kda_state = torch.stack(states, dim=0)
         else:
             self._kda_state = None

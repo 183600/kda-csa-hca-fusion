@@ -32,6 +32,7 @@ import gc
 import json
 import math
 import os
+import statistics
 import sys
 import time
 
@@ -313,7 +314,7 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     # summary statistic. ``statistics.median`` handles even-length lists
     # correctly (averages the two middle values) — the previous
     # ``sorted(times)[len(times)//2]`` returned the upper-middle for even n.
-    import statistics
+    # (statistics is imported at module top.)
     # Guard against empty timing lists (n_decode=0 or repeats=0). Previously
     # ``statistics.median([])`` raised ``StatisticsError: no median for empty
     # data`` and ``sum([])/0`` raised ``ZeroDivisionError``. Both are
