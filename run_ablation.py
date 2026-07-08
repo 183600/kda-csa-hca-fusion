@@ -507,20 +507,31 @@ def main():
     # ``orient='records'``) to reject the whole file. With allow_nan=False
     # the call raises ValueError instead — surfacing the corruption loudly
     # rather than shipping a broken file. Mirrors run_quality.py::main.
+    #
+    # CRITICAL: serialize to a STRING first (json.dumps), then write the
+    # string to the file. The previous pattern called json.dump directly
+    # on the file object inside a try/except — when the first dump raised
+    # ValueError mid-write (on encountering a NaN), the file was left
+    # with a PARTIAL JSON document. The fallback json.dump then APPENDED
+    # to the partial content, producing invalid JSON (two concatenated
+    # fragments) that no parser could read. Serializing to a string first
+    # guarantees atomicity: either the complete JSON is written or nothing
+    # is. Mirrors the fix in run_quality.py::main.
+    try:
+        text = json.dumps(all_results, indent=2, allow_nan=False)
+    except ValueError as e:
+        logger.error(f'non-finite value in results; sanitizing to null: {e}')
+        def _sanitize(o):
+            if isinstance(o, float) and not math.isfinite(o):
+                return None
+            if isinstance(o, dict):
+                return {k: _sanitize(v) for k, v in o.items()}
+            if isinstance(o, list):
+                return [_sanitize(x) for x in o]
+            return o
+        text = json.dumps(_sanitize(all_results), indent=2, allow_nan=False)
     with open('results/exp5_ablation.json', 'w') as f:
-        try:
-            json.dump(all_results, f, indent=2, allow_nan=False)
-        except ValueError as e:
-            logger.error(f'non-finite value in results; sanitizing to null: {e}')
-            def _sanitize(o):
-                if isinstance(o, float) and not math.isfinite(o):
-                    return None
-                if isinstance(o, dict):
-                    return {k: _sanitize(v) for k, v in o.items()}
-                if isinstance(o, list):
-                    return [_sanitize(x) for x in o]
-                return o
-            json.dump(_sanitize(all_results), f, indent=2, allow_nan=False)
+        f.write(text)
     logger.info('\nSaved: results/exp5_ablation.json')
 
 
