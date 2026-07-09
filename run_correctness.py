@@ -2269,6 +2269,49 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
     ]
 
 
+def test_csa_compress_kv_overlapped_zero_length(device='cpu'):
+    """Regression: ``csa_compress_kv_overlapped`` must accept T=0 directly.
+
+    The public ``naive_csa`` guards T=0 with an early return, so the
+    overlapped compression function is never reached through that API.
+    However ``csa_compress_kv_overlapped`` is itself a public function
+    (no underscore prefix) imported directly by
+    ``run_correctness.py::test_overlap_causality`` and ``method_analysis.py``.
+    Calling it with T=0 previously crashed with a confusing
+    ``RuntimeError: Sizes of tensors must match except in dimension 2``
+    because the ``-inf`` pad always inserts one block while ``A_logits``
+    was empty (0 blocks), making the ``torch.cat([A_logits, Bb_logits],
+    dim=2)`` fail on the mismatched dim-1 sizes.
+
+    The sibling ``csa_compress_kv`` (single-branch) already handled T=0
+    correctly via the view operation returning an empty ``[B, 0, m, c]``
+    tensor. This test verifies the defensive guard added to
+    ``csa_compress_kv_overlapped`` makes its contract match the
+    single-branch version: T=0 returns ``[B, 0, c]`` without raising.
+    """
+    logger.info("Test: csa_compress_kv_overlapped accepts T=0 (direct call)")
+    torch.manual_seed(211)
+    B, T, m, c = 2, 0, 8, 16
+    Ca = torch.randn(B, T, c, device=device)
+    Cb = torch.randn(B, T, c, device=device)
+    Za = torch.randn(B, T, c, device=device)
+    Zb = torch.randn(B, T, c, device=device)
+    Ba = torch.randn(m, c, device=device) * 0.1
+    Bb = torch.randn(m, c, device=device) * 0.1
+    try:
+        out = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)
+        ok = out.shape == (B, 0, c) and torch.isfinite(out).all().item()
+        err = ''
+    except Exception as e:
+        out = None
+        ok = False
+        err = f'{type(e).__name__}: {e}'
+    return [
+        _ok('overlapped compression T=0 returns [B,0,c]', ok,
+            f'shape={tuple(out.shape) if out is not None else "n/a"}, err={err}'),
+    ]
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -2343,6 +2386,8 @@ def main():
     all_results += _run_safe(test_weight_decay_param_groups, device)
     # Regression test for T=0 (empty sequence) edge case.
     all_results += _run_safe(test_csa_hca_zero_length_sequence, device)
+    # Regression test for csa_compress_kv_overlapped T=0 (direct call).
+    all_results += _run_safe(test_csa_compress_kv_overlapped_zero_length, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

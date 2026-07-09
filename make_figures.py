@@ -154,9 +154,16 @@ def fig_benchmark():
         ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, which='both', alpha=0.3)
     _ensure_figures_dir()
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.pdf'), dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.png'), dpi=150)
-    plt.close(fig)
+    # try/finally around savefig so a savefig failure (disk full, read-only
+    # Kaggle input dir, etc.) does not leak the figure. Without the finally,
+    # ``plt.close(fig)`` would be skipped on exception and the half-built
+    # figure would persist into the next fig_* call. Mirrors the pattern in
+    # ``fig_kv_cache`` / ``fig_flops``.
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.png'), dpi=150)
+    finally:
+        plt.close(fig)
     print('Saved figures/fig_benchmark.pdf')
 
 
@@ -413,12 +420,17 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
     # Use _FIGURES_DIR (env-overridable) instead of a relative path so the
     # file lands in the same directory as every other figure and respects
     # the Kaggle output-dir override set by run_all.py.
-    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_mqar_nkv{n_kv}.pdf'), dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_mqar_nkv{n_kv}.png'), dpi=150)
-    if write_legacy_name:
-        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.pdf'), dpi=150)
-        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.png'), dpi=150)
-    plt.close(fig)
+    # try/finally around savefig so a savefig failure (disk full, read-only
+    # Kaggle input dir, etc.) does not leak the figure. Mirrors the pattern
+    # in ``fig_kv_cache`` / ``fig_flops`` / ``fig_benchmark``.
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, f'fig_mqar_nkv{n_kv}.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, f'fig_mqar_nkv{n_kv}.png'), dpi=150)
+        if write_legacy_name:
+            fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.pdf'), dpi=150)
+            fig.savefig(os.path.join(_FIGURES_DIR, 'fig_mqar.png'), dpi=150)
+    finally:
+        plt.close(fig)
     msg = f'Saved figures/fig_mqar_nkv{n_kv}.pdf'
     if write_legacy_name:
         msg += ' (and fig_mqar.pdf)'
@@ -633,14 +645,21 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     # inconsistent with every other figure (which doesn't pass it). The
     # subplots_adjust call above is what controls the layout for this fig.
     _ensure_figures_dir()
-    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_ablation_nkv{n_kv}.pdf'),
-                dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, f'fig_ablation_nkv{n_kv}.png'),
-                dpi=150)
-    if write_legacy_name:
-        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_ablation.pdf'), dpi=150)
-        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_ablation.png'), dpi=150)
-    plt.close(fig)
+    # try/finally around savefig so a savefig failure (disk full, read-only
+    # Kaggle input dir, etc.) does not leak the figure. Without the finally,
+    # ``plt.close(fig)`` would be skipped on exception and the half-built
+    # figure would persist into the next fig_* call. Mirrors the pattern in
+    # ``fig_kv_cache`` / ``fig_flops`` / ``fig_benchmark``.
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, f'fig_ablation_nkv{n_kv}.pdf'),
+                    dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, f'fig_ablation_nkv{n_kv}.png'),
+                    dpi=150)
+        if write_legacy_name:
+            fig.savefig(os.path.join(_FIGURES_DIR, 'fig_ablation.pdf'), dpi=150)
+            fig.savefig(os.path.join(_FIGURES_DIR, 'fig_ablation.png'), dpi=150)
+    finally:
+        plt.close(fig)
     msg = f'Saved figures/fig_ablation_nkv{n_kv}.pdf'
     if write_legacy_name:
         msg += ' (and fig_ablation.pdf)'
@@ -685,9 +704,14 @@ def fig_decoding():
     ax.legend(fontsize=9)
     ax.grid(True, which='both', alpha=0.3)
     _ensure_figures_dir()
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.pdf'), dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.png'), dpi=150)
-    plt.close(fig)
+    # try/finally around savefig so a savefig failure (disk full, read-only
+    # Kaggle input dir, etc.) does not leak the figure. Mirrors the pattern
+    # in ``fig_kv_cache`` / ``fig_flops`` / ``fig_benchmark``.
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.png'), dpi=150)
+    finally:
+        plt.close(fig)
     print('Saved figures/fig_decoding.pdf')
 
 
@@ -731,9 +755,14 @@ def fig_architecture():
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     ax.set_title('Fused KDA+CSA+HCA hybrid attention (3:1:1 layout)', fontsize=12)
     _ensure_figures_dir()
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_architecture.pdf'), dpi=150)
-    fig.savefig(os.path.join(_FIGURES_DIR, 'fig_architecture.png'), dpi=150)
-    plt.close(fig)
+    # try/finally around savefig so a savefig failure (disk full, read-only
+    # Kaggle input dir, etc.) does not leak the figure. Mirrors the pattern
+    # in ``fig_kv_cache`` / ``fig_flops`` / ``fig_benchmark``.
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_architecture.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_architecture.png'), dpi=150)
+    finally:
+        plt.close(fig)
     print('Saved figures/fig_architecture.pdf')
 
 

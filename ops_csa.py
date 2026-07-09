@@ -77,6 +77,20 @@ def csa_compress_kv_overlapped(
     assert T % m == 0
     n_blocks = T // m
     compute_dtype = torch.float64 if Ca.dtype == torch.float64 else torch.float
+    # Degenerate case: empty sequence. The downstream
+    # ``torch.cat([A_logits, Bb_logits], dim=2)`` crashes with
+    # ``RuntimeError: Sizes of tensors must match except in dimension 2``
+    # because ``A_logits`` is ``[B, 0, m, c]`` (from the Za + Ba broadcast)
+    # while ``Bb_logits`` is ``[B, 1, m, c]`` (the -inf pad always inserts one
+    # block). The public ``naive_csa`` guards T=0 with an early return, so this
+    # path is unreachable through that API — but ``csa_compress_kv_overlapped``
+    # is also a public function (no underscore prefix) imported directly by
+    # ``run_correctness.py::test_overlap_causality`` and
+    # ``method_analysis.py``, so a defensive guard here makes the contract
+    # match ``csa_compress_kv`` (which already handles T=0 correctly via the
+    # view operation returning an empty [B, 0, m, c] tensor).
+    if T == 0:
+        return Ca.new_zeros(B_, 0, c)
     Ca = Ca.to(compute_dtype).view(B_, n_blocks, m, c)
     Cb = Cb.to(compute_dtype).view(B_, n_blocks, m, c)
     Za = Za.to(compute_dtype).view(B_, n_blocks, m, c)
