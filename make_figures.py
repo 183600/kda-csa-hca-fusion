@@ -26,8 +26,20 @@ for _fp in ('/usr/share/fonts/truetype/chinese/NotoSansSC-Regular.ttf',
     except (FileNotFoundError, OSError):
         pass
 import matplotlib.pyplot as plt
-plt.rcParams['font.sans-serif'] = ['Noto Sans SC', 'WenQuanYi Zen Hei',
-                                  'DejaVu Sans']
+# Font priority order rationale:
+#   1. DejaVu Sans — has full coverage of the mathtext glyphs that the log-scale
+#      tick formatter needs (notably U+2212 MINUS SIGN, which appears in
+#      ``$10^{-3}$`` style labels). WITHOUT DejaVu Sans first, matplotlib's
+#      mathtext engine emits "Font 'default' does not have a glyph for '\u2212',
+#      substituting with a dummy symbol" for every negative-exponent tick label,
+#      and the rendered PDF/PNG has a broken (dummy) minus sign.
+#   2. Noto Sans SC / WenQuanYi Zen Hei — CJK fallback for any future Chinese
+#      annotations. Listed AFTER DejaVu Sans so that mathtext rendering always
+#      resolves to a font with U+2212; regular text still falls through to the
+#      CJK fonts for characters DejaVu Sans lacks (per-glyph fallback in
+#      matplotlib 3.6+).
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Noto Sans SC',
+                                  'WenQuanYi Zen Hei']
 plt.rcParams['axes.unicode_minus'] = False
 import numpy as np
 

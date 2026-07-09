@@ -26,6 +26,7 @@ behaviour, not throughput.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -35,6 +36,8 @@ import torch.nn.functional as F
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_kda import naive_recurrent_kda
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -287,6 +290,21 @@ class HybridKCHAttention(nn.Module):
         if stacked is not None:
             # Batch dim is axis 1 (axis 0 is the per-layer index).
             if stacked.shape[1] != x.shape[0]:
+                # Log the batch-size change so the user understands WHY the
+                # recurrent state was dropped. Without this log the drop is
+                # silent, and a user switching from train (large batch) to
+                # eval (small batch) may not realize their KDA state is being
+                # reset on every call — which is correct behavior (the state
+                # is per-sequence and cannot be reused across different batch
+                # sizes) but surprising if you expected streaming continuity.
+                # Use a debug-level message (not warning) because this is a
+                # routine occurrence during train/eval switches, not an error.
+                logger.debug(
+                    "HybridKCHAttention: dropping KDA recurrent state because "
+                    "batch size changed (was %d, now %d). This is expected when "
+                    "switching between train/eval batches; call reset_state() "
+                    "explicitly to suppress this message.",
+                    stacked.shape[1], x.shape[0])
                 stacked = None
             elif stacked.device != x.device:
                 # Move (and keep detached) rather than drop.

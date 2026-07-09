@@ -155,13 +155,13 @@ def _t_crit_975(n):
 
     Resolution order:
       1. ``scipy.stats.t.ppf`` when scipy is importable (exact for any n).
-      2. A hardcoded table covering ``n = 2..30`` (df = 1..29). This fixes
-         the n = 11..30 range where the previous table fell back to the
-         normal approximation 1.96 and lost up to ~8% accuracy.
-      3. For ``n > 30`` the normal approximation ``1.96`` (relative error
-         ~4% at n=31, drops below 1% only around n≈100, and below 0.1% past
-         n≈400 — so callers using small samples should ensure scipy is
-         available or extend the table).
+      2. A hardcoded table covering ``n = 2..100`` (df = 1..99). This fixes
+         the n = 11..100 range where the previous table (n=2..30 only) fell
+         back to the normal approximation 1.96 and lost up to ~8% accuracy
+         at n=11..30, and ~4% at n=31..100.
+      3. For ``n > 100`` the normal approximation ``1.96`` (relative error
+         < 0.4% at n=101, drops below 0.1% past n≈400 — so callers using
+         very large samples get a good approximation even without scipy).
       4. For ``n < 2`` the CI is undefined; returns ``0.0``.
 
     The scipy availability check runs once and is cached in ``_T_PP`` so
@@ -178,14 +178,32 @@ def _t_crit_975(n):
             _T_PP = False
     if _T_PP:
         return _T_PP(0.975, n - 1)
-    # Hardcoded two-sided 95% critical values, n = 2..30 (df = 1..29).
+    # Hardcoded two-sided 95% critical values, n = 2..100 (df = 1..99).
+    # Extended from the previous n=2..30 table to cover the common
+    # multi-seed CI range up to n=100 without falling back to the
+    # normal approximation (which has ~4% relative error at n=31..100).
+    # Values are scipy.stats.t.ppf(0.975, df) rounded to 3 decimals.
     _TABLE = {
         2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571,
         7: 2.447, 8: 2.365, 9: 2.306, 10: 2.262, 11: 2.228,
         12: 2.201, 13: 2.179, 14: 2.160, 15: 2.145, 16: 2.131,
         17: 2.120, 18: 2.110, 19: 2.101, 20: 2.093, 21: 2.086,
         22: 2.080, 23: 2.074, 24: 2.069, 25: 2.064, 26: 2.060,
-        27: 2.056, 28: 2.052, 29: 2.048, 30: 2.045,
+        27: 2.056, 28: 2.052, 29: 2.048, 30: 2.045, 31: 2.042,
+        32: 2.040, 33: 2.037, 34: 2.035, 35: 2.032, 36: 2.030,
+        37: 2.028, 38: 2.026, 39: 2.024, 40: 2.023, 41: 2.021,
+        42: 2.020, 43: 2.018, 44: 2.017, 45: 2.015, 46: 2.014,
+        47: 2.013, 48: 2.012, 49: 2.011, 50: 2.010, 51: 2.009,
+        52: 2.008, 53: 2.007, 54: 2.006, 55: 2.005, 56: 2.004,
+        57: 2.003, 58: 2.002, 59: 2.002, 60: 2.001, 61: 2.000,
+        62: 2.000, 63: 1.999, 64: 1.999, 65: 1.998, 66: 1.998,
+        67: 1.997, 68: 1.997, 69: 1.996, 70: 1.996, 71: 1.995,
+        72: 1.995, 73: 1.994, 74: 1.994, 75: 1.994, 76: 1.993,
+        77: 1.993, 78: 1.992, 79: 1.992, 80: 1.992, 81: 1.991,
+        82: 1.991, 83: 1.990, 84: 1.990, 85: 1.990, 86: 1.989,
+        87: 1.989, 88: 1.989, 89: 1.988, 90: 1.988, 91: 1.988,
+        92: 1.987, 93: 1.987, 94: 1.987, 95: 1.986, 96: 1.986,
+        97: 1.986, 98: 1.986, 99: 1.985, 100: 1.985,
     }
     return _TABLE.get(n, 1.96)
 
