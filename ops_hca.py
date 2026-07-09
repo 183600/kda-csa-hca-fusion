@@ -55,6 +55,14 @@ def naive_hca(
     assert nh >= 1, f"nh={nh} must be >= 1"
     assert c >= 1, f"c={c} must be >= 1"
     assert dc >= 1, f"dc={dc} must be >= 1"
+    # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
+    # negative value silently skips the SW branch (looking like the caller
+    # intentionally disabled it). A negative window is never a meaningful
+    # configuration — reject it so the caller learns about the typo instead
+    # of getting a model with no local-attention branch. Mirrors the
+    # validation added to ``naive_csa``.
+    assert sliding_window >= 0, (
+        f"sliding_window={sliding_window} must be >= 0 (0 disables the branch)")
     if scale is None:
         scale = c ** -0.5
     device = H.device

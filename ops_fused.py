@@ -215,6 +215,19 @@ class HybridKCHAttention(nn.Module):
     def __init__(self, cfg: HybridConfig, total_layers: int = 5):
         super().__init__()
         self.cfg = cfg
+        # Validate total_layers BEFORE anything else. A negative value is
+        # never a meaningful configuration, but ``_build_layout`` silently
+        # accepts it: ``while len(layout) < total_layers`` is False from
+        # the start (0 < -1 is False), so the loop never runs and
+        # ``layout[:total_layers]`` returns ``[]`` (empty list). The model
+        # then has zero layers and ``forward`` is a no-op (returns the
+        # input unchanged) — a silently broken model with no diagnostic.
+        # total_layers == 0 IS a valid (if useless) no-op and is allowed.
+        if not isinstance(total_layers, int) or total_layers < 0:
+            raise ValueError(
+                f"total_layers={total_layers!r} must be a non-negative int "
+                f"(0 produces an empty no-op model; use >= 1 for a real model)."
+            )
         self.total_layers = total_layers
         # Guard against the all-zero-ratio infinite loop BEFORE calling
         # _build_layout. If n_kda == n_csa == n_hca == 0 the repeating

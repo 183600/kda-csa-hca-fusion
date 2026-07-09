@@ -2312,6 +2312,189 @@ def test_csa_compress_kv_overlapped_zero_length(device='cpu'):
     ]
 
 
+def test_csa_hca_input_validation(device='cpu'):
+    """Regression: ``naive_csa`` / ``naive_hca`` / ``csa_lightning_indexer``
+    must reject invalid structural params with a clear AssertionError.
+
+    Previously these operators silently accepted several degenerate
+    configurations, producing either a cryptic crash deep inside the
+    operator (with no diagnostic about WHICH parameter was bad) or — worse
+    — a silently meaningless output:
+
+      * ``naive_csa(c_I=0)``: crashed with ``ZeroDivisionError: 0.0 cannot
+        be raised to a negative power`` from the explicit
+        ``scale=c_I ** -0.5`` (line 295). The existing asserts validated
+        m, topk, nh, c, dc — but NOT c_I or nIh.
+      * ``naive_csa(nIh=0)``: produced a finite but meaningless output
+        (the indexer's ``sum(1)`` over an empty head dim is 0, so top-k
+        silently selected the first k blocks for every query).
+      * ``naive_csa(sliding_window=-1)`` / ``naive_hca(sliding_window=-1)``:
+        the ``if sliding_window > 0`` gate silently skipped the SW branch,
+        making it look like the caller intentionally disabled it. A
+        negative window is never a meaningful configuration.
+      * ``csa_lightning_indexer(topk=-1)``: crashed with
+        ``RuntimeError: selected index k out of range`` from ``torch.topk``
+        (which received ``S = min(-1, n_blocks) = -1``). The public
+        ``naive_csa`` already validated topk >= 0, but
+        ``csa_lightning_indexer`` is itself a public function imported by
+        ``run_correctness.py`` and ``method_analysis.py`` — it must defend
+        its own contract.
+      * ``HybridKCHAttention(total_layers=-1)``: silently produced an
+        empty model (the ``while len(layout) < total_layers`` loop never
+        ran and ``layout[:total_layers]`` returned ``[]``). ``forward``
+        was then a no-op returning the input unchanged — a silently
+        broken model with no diagnostic.
+
+    This test verifies each operator now raises AssertionError (or
+    ValueError for HybridKCHAttention, matching its existing error style)
+    with an informative message mentioning the bad parameter.
+    """
+    logger.info("Test: CSA/HCA/indexer/hybrid input validation rejects bad params")
+    torch.manual_seed(212)
+    B, T, d = 1, 16, 32
+    H = torch.randn(B, T, d, device=device) * 0.1
+    m, nh, c, dc, nIh, cI = 4, 2, 16, 32, 2, 8
+    results = []
+
+    def _build_csa_weights():
+        return dict(
+            W_aKV=torch.randn(d, c, device=device),
+            W_bKV=torch.randn(d, c, device=device),
+            W_aZ=torch.randn(d, c, device=device),
+            W_bZ=torch.randn(d, c, device=device),
+            Ba=torch.randn(m, c, device=device),
+            Bb=torch.randn(m, c, device=device),
+            W_DQ=torch.randn(d, dc, device=device),
+            W_UQ=torch.randn(dc, c * nh, device=device),
+            W_IUQ=torch.randn(dc, cI * nIh, device=device),
+            W_w=torch.randn(d, nIh, device=device),
+            W_KV_idx=torch.randn(d, cI, device=device),
+            W_Z_idx=torch.randn(d, cI, device=device),
+            B_idx=torch.randn(m, cI, device=device),
+        )
+
+    def _build_hca_weights():
+        m2 = 8
+        return dict(
+            W_KV=torch.randn(d, c, device=device),
+            W_Z=torch.randn(d, c, device=device),
+            B_pos=torch.randn(m2, c, device=device),
+            W_DQ=torch.randn(d, dc, device=device),
+            W_UQ=torch.randn(dc, c * nh, device=device),
+        ), m2
+
+    # --- c_I=0 must raise ---
+    w = _build_csa_weights()
+    # Build separate weights with cI=0 (the W_IUQ/W_KV_idx/W_Z_idx/B_idx
+    # must match the new cI=0 to avoid shape errors masking the assert).
+    w0 = dict(w)
+    w0['W_IUQ'] = torch.randn(dc, 0 * nIh, device=device)
+    w0['W_KV_idx'] = torch.randn(d, 0, device=device)
+    w0['W_Z_idx'] = torch.randn(d, 0, device=device)
+    w0['B_idx'] = torch.randn(m, 0, device=device)
+    try:
+        naive_csa(H, **w0, m=m, topk=2, nh=nh, nIh=nIh, c=c, c_I=0, dc=dc,
+                  sliding_window=4, sink_logits=torch.zeros(nh, device=device))
+        ok_cI = False
+        err_cI = 'no error raised (expected AssertionError)'
+    except AssertionError as e:
+        ok_cI = 'c_I' in str(e)
+        err_cI = str(e)[:80]
+    except Exception as e:
+        ok_cI = False
+        err_cI = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('naive_csa rejects c_I=0', ok_cI, err_cI))
+
+    # --- nIh=0 must raise ---
+    w_n0 = dict(w)
+    w_n0['W_IUQ'] = torch.randn(dc, cI * 0, device=device)
+    w_n0['W_w'] = torch.randn(d, 0, device=device)
+    try:
+        naive_csa(H, **w_n0, m=m, topk=2, nh=nh, nIh=0, c=c, c_I=cI, dc=dc,
+                  sliding_window=4, sink_logits=torch.zeros(nh, device=device))
+        ok_nIh = False
+        err_nIh = 'no error raised (expected AssertionError)'
+    except AssertionError as e:
+        ok_nIh = 'nIh' in str(e)
+        err_nIh = str(e)[:80]
+    except Exception as e:
+        ok_nIh = False
+        err_nIh = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('naive_csa rejects nIh=0', ok_nIh, err_nIh))
+
+    # --- sliding_window=-1 must raise (CSA) ---
+    try:
+        naive_csa(H, **w, m=m, topk=2, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+                  sliding_window=-1, sink_logits=torch.zeros(nh, device=device))
+        ok_sw_csa = False
+        err_sw_csa = 'no error raised (expected AssertionError)'
+    except AssertionError as e:
+        ok_sw_csa = 'sliding_window' in str(e)
+        err_sw_csa = str(e)[:80]
+    except Exception as e:
+        ok_sw_csa = False
+        err_sw_csa = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('naive_csa rejects sliding_window=-1', ok_sw_csa, err_sw_csa))
+
+    # --- sliding_window=-1 must raise (HCA) ---
+    hw, m2 = _build_hca_weights()
+    try:
+        naive_hca(H, **hw, m2=m2, nh=nh, c=c, dc=dc,
+                  sliding_window=-1, sink_logits=torch.zeros(nh, device=device))
+        ok_sw_hca = False
+        err_sw_hca = 'no error raised (expected AssertionError)'
+    except AssertionError as e:
+        ok_sw_hca = 'sliding_window' in str(e)
+        err_sw_hca = str(e)[:80]
+    except Exception as e:
+        ok_sw_hca = False
+        err_sw_hca = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('naive_hca rejects sliding_window=-1', ok_sw_hca, err_sw_hca))
+
+    # --- csa_lightning_indexer topk=-1 must raise ---
+    q_idx = torch.randn(1, 8, 2, 4, device=device)
+    k_idx = torch.randn(1, 4, 4, device=device)
+    w_idx = torch.randn(1, 8, 2, device=device)
+    try:
+        csa_lightning_indexer(q_idx, k_idx, w_idx, topk=-1)
+        ok_topk = False
+        err_topk = 'no error raised (expected AssertionError)'
+    except AssertionError as e:
+        ok_topk = 'topk' in str(e)
+        err_topk = str(e)[:80]
+    except Exception as e:
+        ok_topk = False
+        err_topk = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('csa_lightning_indexer rejects topk=-1', ok_topk, err_topk))
+
+    # --- HybridKCHAttention total_layers=-1 must raise ---
+    try:
+        HybridKCHAttention(HybridConfig(d_model=32), total_layers=-1)
+        ok_tl = False
+        err_tl = 'no error raised (expected ValueError)'
+    except ValueError as e:
+        ok_tl = 'total_layers' in str(e)
+        err_tl = str(e)[:80]
+    except Exception as e:
+        ok_tl = False
+        err_tl = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('HybridKCHAttention rejects total_layers=-1', ok_tl, err_tl))
+
+    # --- total_layers=0 is still allowed (valid no-op) ---
+    try:
+        model = HybridKCHAttention(HybridConfig(d_model=32), total_layers=0)
+        out = model(torch.randn(1, 8, 32, device=device))
+        ok_zero = out.shape == (1, 8, 32) and len(model.layers) == 0
+        err_zero = f'shape={tuple(out.shape)}, n_layers={len(model.layers)}'
+    except Exception as e:
+        ok_zero = False
+        err_zero = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('HybridKCHAttention accepts total_layers=0 (no-op)',
+                       ok_zero, err_zero))
+
+    return results
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -2388,6 +2571,9 @@ def main():
     all_results += _run_safe(test_csa_hca_zero_length_sequence, device)
     # Regression test for csa_compress_kv_overlapped T=0 (direct call).
     all_results += _run_safe(test_csa_compress_kv_overlapped_zero_length, device)
+    # Regression test for missing input validation (c_I=0, nIh=0,
+    # sliding_window<0, topk<0, total_layers<0).
+    all_results += _run_safe(test_csa_hca_input_validation, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

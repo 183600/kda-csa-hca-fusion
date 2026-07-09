@@ -165,6 +165,16 @@ def csa_lightning_indexer(
         models still learn useful representations — just without
         learned retrieval.
     """
+    # Validate topk BEFORE ``min(topk, n_blocks)`` so a caller passing
+    # topk=-1 gets a clear AssertionError instead of a cryptic
+    # ``RuntimeError: selected index k out of range`` from ``torch.topk``
+    # (which receives ``S = min(-1, n_blocks) = -1`` and crashes with no
+    # diagnostic about WHICH parameter was bad). The caller ``naive_csa``
+    # already validates topk >= 0, but ``csa_lightning_indexer`` is a PUBLIC
+    # function (no underscore prefix) imported directly by
+    # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
+    # its own contract.
+    assert topk >= 0, f"topk={topk} must be >= 0 (0 selects zero blocks)"
     if scale is None:
         scale = q_idx.shape[-1] ** -0.5
     B_, T, HI, DI = q_idx.shape
@@ -243,6 +253,23 @@ def naive_csa(
     assert nh >= 1, f"nh={nh} must be >= 1"
     assert c >= 1, f"c={c} must be >= 1"
     assert dc >= 1, f"dc={dc} must be >= 1"
+    # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) MUST be
+    # validated here, not inside ``csa_lightning_indexer``: the explicit
+    # ``scale=c_I ** -0.5`` below raises
+    # ``ZeroDivisionError: 0.0 cannot be raised to a negative power`` when
+    # c_I == 0, and ``nIh == 0`` makes the indexer produce an all-zero
+    # ``logits`` tensor (the ``sum(1)`` over an empty head dim is 0), so
+    # top-k silently selects the first k blocks for every query — a
+    # meaningless result with no diagnostic. Reject both up-front.
+    assert c_I >= 1, f"c_I={c_I} must be >= 1 (indexer key dim)"
+    assert nIh >= 1, f"nIh={nIh} must be >= 1 (indexer head count)"
+    # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
+    # negative value silently skips the SW branch (looking like the caller
+    # intentionally disabled it). A negative window is never a meaningful
+    # configuration — reject it so the caller learns about the typo instead
+    # of getting a model with no local-attention branch.
+    assert sliding_window >= 0, (
+        f"sliding_window={sliding_window} must be >= 0 (0 disables the branch)")
     if scale is None:
         scale = c ** -0.5
     device = H.device
