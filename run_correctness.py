@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device
+from kaggle_setup import configure_torch_for_device, sanitize_for_json
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
@@ -2394,8 +2394,29 @@ def main():
     logger.info(f'Total: {passed}/{len(all_results)} passed')
 
     os.makedirs('results', exist_ok=True)
+    # Write strict JSON (allow_nan=False): if a NaN/Inf slipped into a test's
+    # ``detail`` field (e.g. a KDA recurrence overflow producing a non-finite
+    # ``o_diff = (o_rec - o_chk).abs().max().item()``, or a NaN-propagating
+    # sink test), Python's default json.dump would emit literal ``NaN``/
+    # ``Infinity`` tokens that are INVALID JSON per RFC 8259 and break strict
+    # parsers (JS ``JSON.parse``, jq, pandas with ``orient='records'``). The
+    # sibling runners (run_kv_cache.py, run_decoding.py, run_quality.py,
+    # run_ablation.py) all already use this pattern; this closes the
+    # consistency gap.
+    #
+    # CRITICAL: serialize to a STRING first, then write the string. The
+    # previous ``json.dump(all_results, f, indent=2)`` (default
+    # allow_nan=True) wrote directly to the file, so a NaN mid-stream left
+    # a partial JSON document. Mirrors the atomicity fix in
+    # run_quality.py::main / run_ablation.py::main.
+    try:
+        text = json.dumps(all_results, indent=2, allow_nan=False)
+    except ValueError as e:
+        logger.error(f'non-finite value in results; sanitizing to null: {e}')
+        text = json.dumps(sanitize_for_json(all_results), indent=2,
+                          allow_nan=False)
     with open('results/exp1_correctness.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
+        f.write(text)
     logger.info('Saved: results/exp1_correctness.json')
     return 0 if passed == len(all_results) else 1
 

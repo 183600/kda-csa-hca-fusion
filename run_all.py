@@ -233,8 +233,16 @@ def run_all(seeds=None, steps=None):
             try:
                 make_figures.main()
             except Exception as e:
-                # Figures are best-effort; a missing result file shouldn't fail the run.
+                # Figures are best-effort; a missing result file shouldn't fail
+                # the whole run-all. BUT print the traceback so a real
+                # programming error (NameError, AttributeError, KeyError from
+                # a refactor, missing matplotlib backend, etc.) is not
+                # silently reduced to a one-line ``[make_figures] partial:
+                # <str(e)>`` message that hides the cause. The previous
+                # swallow-without-traceback made debugging figure-generation
+                # failures nearly impossible from the run-all summary alone.
                 print(f'[make_figures] partial: {e}')
+                traceback.print_exc()
         summary['runs'].append(_run('make_figures', _make_figs))
 
         # Final summary.

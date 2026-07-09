@@ -36,7 +36,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env
+from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -375,8 +375,29 @@ def main():
                 logger.error(f'  {name:12s}  ERROR: {e}')
 
     os.makedirs('results', exist_ok=True)
+    # Write strict JSON (allow_nan=False): if a benchmark row's ``time_ms``
+    # became non-finite (e.g. a CUDA event glitch producing inf, or a future
+    # code path that returns float('nan') on a degenerate input), Python's
+    # default json.dump would emit literal ``NaN``/``Infinity`` tokens that
+    # are INVALID JSON per RFC 8259 and break strict parsers (JS
+    # ``JSON.parse``, jq, pandas with ``orient='records'``). The sibling
+    # runners (run_kv_cache.py, run_decoding.py, run_quality.py,
+    # run_ablation.py) all already use this pattern; this closes the
+    # consistency gap.
+    #
+    # CRITICAL: serialize to a STRING first, then write the string. The
+    # previous ``json.dump(results, f, indent=2)`` (default allow_nan=True)
+    # wrote directly to the file, so a NaN mid-stream left a partial JSON
+    # document. Mirrors the atomicity fix in run_quality.py::main /
+    # run_ablation.py::main.
+    try:
+        text = json.dumps(results, indent=2, allow_nan=False)
+    except ValueError as e:
+        logger.error(f'non-finite value in results; sanitizing to null: {e}')
+        text = json.dumps(sanitize_for_json(results), indent=2,
+                          allow_nan=False)
     with open('results/exp2_benchmark.json', 'w') as f:
-        json.dump(results, f, indent=2)
+        f.write(text)
     logger.info('\nSaved: results/exp2_benchmark.json')
 
 

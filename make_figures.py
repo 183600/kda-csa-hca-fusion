@@ -364,8 +364,9 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
             # Same ``or`` guard for chance_acc: a record with
             # ``chance_acc: None`` (e.g. partially-failed seed wrote null)
             # would set ``chance = None`` and crash ``ax.axhline(None, ...)``
-            # with TypeError. The default ``chance`` from line 316 is
-            # preserved when the value is missing OR None.
+            # with TypeError. The function-local default ``chance = 1 / 16``
+            # (set at the top of this function) is preserved when the value
+            # is missing OR None.
             chance = r.get('chance_acc') or chance
         else:
             # Legacy single-seed format.
