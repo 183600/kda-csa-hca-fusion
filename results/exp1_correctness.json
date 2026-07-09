@@ -87,7 +87,7 @@
   {
     "name": "hybrid layout",
     "status": "PASS",
-    "detail": "layout=KDA-KDA-KDA-CSA-HCA params=49604"
+    "detail": "layout=KDA-KDA-KDA-CSA-HCA expected=KDA-KDA-KDA-CSA-HCA params=49604"
   },
   {
     "name": "overlap no-future-leakage",
@@ -105,6 +105,36 @@
     "detail": "max relative error = 9.87e-08 (fp64, 40 coords)"
   },
   {
+    "name": "chunk grad == recurrent grad (q)",
+    "status": "PASS",
+    "detail": "max|d|=1.04e-17"
+  },
+  {
+    "name": "chunk grad == recurrent grad (k)",
+    "status": "PASS",
+    "detail": "max|d|=5.55e-17"
+  },
+  {
+    "name": "chunk grad == recurrent grad (v)",
+    "status": "PASS",
+    "detail": "max|d|=3.33e-16"
+  },
+  {
+    "name": "chunk grad == recurrent grad (g)",
+    "status": "PASS",
+    "detail": "max|d|=6.94e-17"
+  },
+  {
+    "name": "chunk grad == recurrent grad (beta)",
+    "status": "PASS",
+    "detail": "max|d|=8.88e-16"
+  },
+  {
+    "name": "chunk vs recurrent max grad diff (all tensors)",
+    "status": "PASS",
+    "detail": "max_diff=8.88e-16 (fp64)"
+  },
+  {
     "name": "CSA indices in range",
     "status": "PASS",
     "detail": "topk=4, n_blocks=8"
@@ -118,6 +148,11 @@
     "name": "CSA early queries empty",
     "status": "PASS",
     "detail": "queries t<8 have no preceding block -> all -1"
+  },
+  {
+    "name": "CSA index count per query",
+    "status": "PASS",
+    "detail": "each query t has min(topk=4, t//m) valid indices"
   },
   {
     "name": "HCA sliding-window causal (unaffected region is stable)",
@@ -340,6 +375,36 @@
     "detail": "_kda_state is None: True"
   },
   {
+    "name": "hybrid no-CSA forward",
+    "status": "PASS",
+    "detail": "shape=(2, 16, 32), layout=KDA-HCA"
+  },
+  {
+    "name": "hybrid no-CSA state persists",
+    "status": "PASS",
+    "detail": "_kda_state is not None: True"
+  },
+  {
+    "name": "hybrid no-CSA second call",
+    "status": "PASS",
+    "detail": "shape=(2, 16, 32)"
+  },
+  {
+    "name": "hybrid no-HCA forward",
+    "status": "PASS",
+    "detail": "shape=(2, 16, 32), layout=KDA-CSA"
+  },
+  {
+    "name": "hybrid no-HCA state persists",
+    "status": "PASS",
+    "detail": "_kda_state is not None: True"
+  },
+  {
+    "name": "hybrid no-HCA second call",
+    "status": "PASS",
+    "detail": "shape=(2, 16, 32)"
+  },
+  {
     "name": "CSA non-divisible T shape",
     "status": "PASS",
     "detail": "expected (1, 20, 16), got (1, 20, 16)"
@@ -378,5 +443,60 @@
     "name": "HCA T<m2 with-SW produces non-zero output",
     "status": "PASS",
     "detail": "shape=(1, 8, 16), max|o|=7.49e-01"
+  },
+  {
+    "name": "weight_decay values correct (0.01 / 0.0)",
+    "status": "PASS",
+    "detail": "decay_wd=0.01, no_decay_wd=0.0"
+  },
+  {
+    "name": "param count matches (no params dropped/duplicated)",
+    "status": "PASS",
+    "detail": "in_groups=64, in_modules=64"
+  },
+  {
+    "name": "nn.Embedding weight in no-decay group",
+    "status": "PASS",
+    "detail": "embed.weight id in no_decay: True"
+  },
+  {
+    "name": "nn.LayerNorm params in no-decay group",
+    "status": "PASS",
+    "detail": "2 LayerNorm params, all in no_decay"
+  },
+  {
+    "name": "nn.Linear bias in no-decay group",
+    "status": "PASS",
+    "detail": "1 Linear biases, all in no_decay"
+  },
+  {
+    "name": "nn.Linear weight in decay group",
+    "status": "PASS",
+    "detail": "1 Linear weights, all in decay"
+  },
+  {
+    "name": "1-D nn.Parameter (sink) in no-decay group",
+    "status": "PASS",
+    "detail": "2 sink params, all in no_decay"
+  },
+  {
+    "name": "2-D nn.Parameter (positional bias) in no-decay group",
+    "status": "PASS",
+    "detail": "4 pos-bias params, all in no_decay"
+  },
+  {
+    "name": "CSA T=0 returns zero-shaped output",
+    "status": "PASS",
+    "detail": "shape=(1, 0, 20), err="
+  },
+  {
+    "name": "HCA T=0 returns zero-shaped output",
+    "status": "PASS",
+    "detail": "shape=(1, 0, 20), err="
+  },
+  {
+    "name": "overlapped compression T=0 returns [B,0,c]",
+    "status": "PASS",
+    "detail": "shape=(2, 0, 16), err="
   }
 ]

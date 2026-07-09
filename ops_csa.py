@@ -47,6 +47,9 @@ def csa_compress_kv(
         m: compression factor (T must be divisible by m).
     """
     B_, T, c = C.shape
+    # Validate m BEFORE ``T % m`` so a caller passing m=0 gets a clear
+    # AssertionError instead of a bare ``ZeroDivisionError`` with no context.
+    assert m >= 1, f"compression factor m={m} must be >= 1"
     assert T % m == 0, f"T={T} must be divisible by m={m}"
     n_blocks = T // m
     # Preserve float64 for high-precision tests; default to float32 otherwise.
@@ -74,7 +77,9 @@ def csa_compress_kv_overlapped(
     compressed entries share half of their source tokens.
     """
     B_, T, c = Ca.shape
-    assert T % m == 0
+    # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv).
+    assert m >= 1, f"compression factor m={m} must be >= 1"
+    assert T % m == 0, f"T={T} must be divisible by m={m}"
     n_blocks = T // m
     compute_dtype = torch.float64 if Ca.dtype == torch.float64 else torch.float
     # Degenerate case: empty sequence. The downstream
@@ -230,6 +235,14 @@ def naive_csa(
     ``CSAAttn``) would hit a bare ``AssertionError`` with no message.
     """
     B_, T, d = H.shape
+    # Validate structural params early so a caller passing m=0, topk=-1,
+    # etc. gets a clear AssertionError instead of a cryptic ZeroDivisionError
+    # or IndexError deep inside the operator.
+    assert m >= 1, f"compression factor m={m} must be >= 1"
+    assert topk >= 0, f"topk={topk} must be >= 0 (0 disables sparse selection)"
+    assert nh >= 1, f"nh={nh} must be >= 1"
+    assert c >= 1, f"c={c} must be >= 1"
+    assert dc >= 1, f"dc={dc} must be >= 1"
     if scale is None:
         scale = c ** -0.5
     device = H.device

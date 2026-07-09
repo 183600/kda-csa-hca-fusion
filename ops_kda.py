@@ -46,6 +46,12 @@ def naive_recurrent_kda(
     """
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
+    # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear AssertionError
+    # instead of a bare ZeroDivisionError. Also validates non-negativity of
+    # head dims so a malformed caller gets an informative message.
+    assert H >= 1, f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)"
+    assert K >= 1, f"K={K} must be >= 1"
+    assert V >= 1, f"V={V} must be >= 1"
     G = HV // H
     assert HV % H == 0, f"HV={HV} must be divisible by H={H} (GVA factor)"
     if scale is None:
@@ -114,6 +120,16 @@ def naive_chunk_kda(
     """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error."""
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
+    # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
+    # ``T // BT`` so zero or negative values produce a clear AssertionError
+    # instead of a bare ZeroDivisionError. Mirrors naive_recurrent_kda.
+    assert H >= 1, f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)"
+    assert K >= 1, f"K={K} must be >= 1"
+    assert V >= 1, f"V={V} must be >= 1"
+    assert chunk_size >= 1, (
+        f"chunk_size={chunk_size} must be >= 1 "
+        f"(would cause ZeroDivisionError in T // chunk_size and (-T) % chunk_size)"
+    )
     G = HV // H
     assert HV % H == 0, f"HV={HV} must be divisible by H={H} (GVA factor)"
     BT = chunk_size

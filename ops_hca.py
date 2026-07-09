@@ -48,6 +48,13 @@ def naive_hca(
     causal block mask ensures no real token attends to it.
     """
     B_, T, d = H.shape
+    # Validate structural params early so a caller passing m2=0, nh=0, etc.
+    # gets a clear AssertionError instead of a cryptic ZeroDivisionError or
+    # IndexError deep inside the operator. Mirrors naive_csa's validation.
+    assert m2 >= 1, f"heavy compression factor m2={m2} must be >= 1"
+    assert nh >= 1, f"nh={nh} must be >= 1"
+    assert c >= 1, f"c={c} must be >= 1"
+    assert dc >= 1, f"dc={dc} must be >= 1"
     if scale is None:
         scale = c ** -0.5
     device = H.device

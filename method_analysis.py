@@ -205,8 +205,11 @@ class HeadwiseFusedAttention(nn.Module):
         q = F.normalize(F.silu(self.kda_q(x)).view(B, T, H, hd), dim=-1)
         k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
-        # Parenthesize explicitly so the sign applies to the scaled value
-        # (operator-precedence-safe): want g in (-inf, 0] so exp(g) in (0, 1].
+        # log-space gate: g in (-inf, 0] so exp(g) in (0, 1] (per-channel
+        # fine-grained forget gate). The form ``-F.softplus(...) * 0.1``
+        # equals ``-0.1 * softplus(...)`` regardless of parenthesization
+        # (unary minus binds tighter than ``*`` in Python), matching the
+        # pattern in ops_fused.py::KDAHybridLayer and run_quality.py::KDAAttn.
         g = (-F.softplus(self.kda_g(x)) * 0.1).view(B, T, H, hd)
         beta = torch.sigmoid(self.kda_beta(x))
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)

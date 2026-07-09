@@ -67,7 +67,23 @@ class HybridConfig:
     n_kda: int = 3
     n_csa: int = 1
     n_hca: int = 1
+    # NOTE: ``dropout`` is accepted for API compatibility / future use but is
+    # NOT yet implemented in any sub-layer (KDA/CSA/HCA). A non-zero value is
+    # rejected here so a caller who sets it expecting dropout to be applied
+    # gets a clear error instead of silently running without dropout (which
+    # would be a silent correctness bug in their training recipe). Remove
+    # this guard once dropout is actually wired into the forward passes.
     dropout: float = 0.0
+
+    def __post_init__(self):
+        if self.dropout != 0.0:
+            raise NotImplementedError(
+                f"HybridConfig.dropout={self.dropout} is not yet implemented. "
+                f"The KDA/CSA/HCA sub-layers do not apply dropout in their "
+                f"forward passes. Set dropout=0.0 (the default) or implement "
+                f"dropout in KDAHybridLayer / CSAHybridLayer / HCAHybridLayer "
+                f"before enabling it."
+            )
 
 
 class KDAHybridLayer(nn.Module):
@@ -200,6 +216,21 @@ class HybridKCHAttention(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.total_layers = total_layers
+        # Guard against the all-zero-ratio infinite loop BEFORE calling
+        # _build_layout. If n_kda == n_csa == n_hca == 0 the repeating
+        # ``unit`` is empty and ``while len(layout) < total_layers`` never
+        # terminates (layout never grows). A user running a custom ablation
+        # with (0, 0, 0) would hang the interpreter with no diagnostic.
+        # total_layers == 0 is a valid (if useless) no-op and is allowed:
+        # _build_layout returns [] and the ModuleLists are empty.
+        if total_layers > 0 and cfg.n_kda == 0 and cfg.n_csa == 0 and cfg.n_hca == 0:
+            raise ValueError(
+                "HybridKCHAttention requires at least one non-zero layer "
+                f"count (n_kda, n_csa, n_hca); got "
+                f"({cfg.n_kda}, {cfg.n_csa}, {cfg.n_hca}) with "
+                f"total_layers={total_layers}, which would produce an "
+                f"empty repeating unit and an infinite loop in _build_layout."
+            )
         self.layout = self._build_layout()
         self.layers = nn.ModuleList()
         for kind in self.layout:
@@ -252,6 +283,16 @@ class HybridKCHAttention(nn.Module):
         unit = (['kda'] * self.cfg.n_kda
                 + ['csa'] * self.cfg.n_csa
                 + ['hca'] * self.cfg.n_hca)
+        # Defensive guard: if the unit is empty (all ratios zero) AND
+        # total_layers > 0, the while loop below would never terminate.
+        # __init__ already rejects this case, but we guard here too so a
+        # future subclass that overrides __init__ cannot reintroduce the
+        # hang by calling _build_layout without the pre-check.
+        if not unit and self.total_layers > 0:
+            raise ValueError(
+                "_build_layout: cannot build a non-empty layout from an "
+                "empty repeating unit (n_kda=n_csa=n_hca=0)."
+            )
         layout = []
         while len(layout) < self.total_layers:
             layout.extend(unit)

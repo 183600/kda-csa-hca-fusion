@@ -57,28 +57,6 @@ def _clear_cache(device):
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def _read_current_rss_kb() -> int:
-    """Return the current process RSS in kilobytes (Linux only).
-
-    Reads ``VmRSS`` from ``/proc/self/status``. Returns 0 on macOS/BSD or
-    when ``/proc`` is unavailable — the previous ``resource.getrusage``
-    fallback returned ``ru_maxrss`` (a *high-water mark* that never
-    decreases), which made every operator after the first report a 0 delta.
-    Since the CPU ``_measure`` path now returns ``None`` for peak memory
-    (see the docstring there), this function is retained only for any
-    future caller that wants a best-effort instantaneous RSS on Linux.
-    """
-    try:
-        with open('/proc/self/status', 'r') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    # "VmRSS:    12345 kB\n"
-                    return int(line.split()[1])
-    except (FileNotFoundError, ValueError, IndexError, OSError):
-        pass
-    return 0
-
-
 def _measure(fn, repeats, device):
     """Return (median_wall_time_s, peak_memory_MB).
 
