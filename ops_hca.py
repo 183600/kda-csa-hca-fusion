@@ -51,18 +51,31 @@ def naive_hca(
     # Validate structural params early so a caller passing m2=0, nh=0, etc.
     # gets a clear AssertionError instead of a cryptic ZeroDivisionError or
     # IndexError deep inside the operator. Mirrors naive_csa's validation.
-    assert m2 >= 1, f"heavy compression factor m2={m2} must be >= 1"
-    assert nh >= 1, f"nh={nh} must be >= 1"
-    assert c >= 1, f"c={c} must be >= 1"
-    assert dc >= 1, f"dc={dc} must be >= 1"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic crashes these guards are specifically meant to prevent.
+    # ``raise AssertionError`` preserves the exception type the existing
+    # tests in ``run_correctness.py::test_csa_hca_input_validation`` expect
+    # (they catch ``AssertionError``).
+    if m2 < 1:
+        raise AssertionError(f"heavy compression factor m2={m2} must be >= 1")
+    if nh < 1:
+        raise AssertionError(f"nh={nh} must be >= 1")
+    if c < 1:
+        raise AssertionError(f"c={c} must be >= 1")
+    if dc < 1:
+        raise AssertionError(f"dc={dc} must be >= 1")
     # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
     # negative value silently skips the SW branch (looking like the caller
     # intentionally disabled it). A negative window is never a meaningful
     # configuration — reject it so the caller learns about the typo instead
     # of getting a model with no local-attention branch. Mirrors the
     # validation added to ``naive_csa``.
-    assert sliding_window >= 0, (
-        f"sliding_window={sliding_window} must be >= 0 (0 disables the branch)")
+    if sliding_window < 0:
+        raise AssertionError(
+            f"sliding_window={sliding_window} must be >= 0 "
+            f"(0 disables the branch)")
     if scale is None:
         scale = c ** -0.5
     device = H.device

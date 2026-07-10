@@ -49,8 +49,14 @@ def csa_compress_kv(
     B_, T, c = C.shape
     # Validate m BEFORE ``T % m`` so a caller passing m=0 gets a clear
     # AssertionError instead of a bare ``ZeroDivisionError`` with no context.
-    assert m >= 1, f"compression factor m={m} must be >= 1"
-    assert T % m == 0, f"T={T} must be divisible by m={m}"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the check
+    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
+    if m < 1:
+        raise AssertionError(f"compression factor m={m} must be >= 1")
+    if T % m != 0:
+        raise AssertionError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
     # Preserve float64 for high-precision tests; default to float32 otherwise.
     compute_dtype = torch.float64 if C.dtype == torch.float64 else torch.float
@@ -78,8 +84,14 @@ def csa_compress_kv_overlapped(
     """
     B_, T, c = Ca.shape
     # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv).
-    assert m >= 1, f"compression factor m={m} must be >= 1"
-    assert T % m == 0, f"T={T} must be divisible by m={m}"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the check
+    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
+    if m < 1:
+        raise AssertionError(f"compression factor m={m} must be >= 1")
+    if T % m != 0:
+        raise AssertionError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
     compute_dtype = torch.float64 if Ca.dtype == torch.float64 else torch.float
     # Degenerate case: empty sequence. The downstream
@@ -174,7 +186,14 @@ def csa_lightning_indexer(
     # function (no underscore prefix) imported directly by
     # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
     # its own contract.
-    assert topk >= 0, f"topk={topk} must be >= 0 (0 selects zero blocks)"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the check
+    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic torch.topk RuntimeError this guard is specifically meant to
+    # prevent.
+    if topk < 0:
+        raise AssertionError(
+            f"topk={topk} must be >= 0 (0 selects zero blocks)")
     if scale is None:
         scale = q_idx.shape[-1] ** -0.5
     B_, T, HI, DI = q_idx.shape
@@ -248,11 +267,24 @@ def naive_csa(
     # Validate structural params early so a caller passing m=0, topk=-1,
     # etc. gets a clear AssertionError instead of a cryptic ZeroDivisionError
     # or IndexError deep inside the operator.
-    assert m >= 1, f"compression factor m={m} must be >= 1"
-    assert topk >= 0, f"topk={topk} must be >= 0 (0 disables sparse selection)"
-    assert nh >= 1, f"nh={nh} must be >= 1"
-    assert c >= 1, f"c={c} must be >= 1"
-    assert dc >= 1, f"dc={dc} must be >= 1"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic crashes these guards are specifically meant to prevent.
+    # ``raise AssertionError`` preserves the exception type the existing
+    # tests in ``run_correctness.py::test_csa_hca_input_validation`` expect
+    # (they catch ``AssertionError``).
+    if m < 1:
+        raise AssertionError(f"compression factor m={m} must be >= 1")
+    if topk < 0:
+        raise AssertionError(
+            f"topk={topk} must be >= 0 (0 disables sparse selection)")
+    if nh < 1:
+        raise AssertionError(f"nh={nh} must be >= 1")
+    if c < 1:
+        raise AssertionError(f"c={c} must be >= 1")
+    if dc < 1:
+        raise AssertionError(f"dc={dc} must be >= 1")
     # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) MUST be
     # validated here, not inside ``csa_lightning_indexer``: the explicit
     # ``scale=c_I ** -0.5`` below raises
@@ -261,15 +293,19 @@ def naive_csa(
     # ``logits`` tensor (the ``sum(1)`` over an empty head dim is 0), so
     # top-k silently selects the first k blocks for every query — a
     # meaningless result with no diagnostic. Reject both up-front.
-    assert c_I >= 1, f"c_I={c_I} must be >= 1 (indexer key dim)"
-    assert nIh >= 1, f"nIh={nIh} must be >= 1 (indexer head count)"
+    if c_I < 1:
+        raise AssertionError(f"c_I={c_I} must be >= 1 (indexer key dim)")
+    if nIh < 1:
+        raise AssertionError(f"nIh={nIh} must be >= 1 (indexer head count)")
     # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
     # negative value silently skips the SW branch (looking like the caller
     # intentionally disabled it). A negative window is never a meaningful
     # configuration — reject it so the caller learns about the typo instead
     # of getting a model with no local-attention branch.
-    assert sliding_window >= 0, (
-        f"sliding_window={sliding_window} must be >= 0 (0 disables the branch)")
+    if sliding_window < 0:
+        raise AssertionError(
+            f"sliding_window={sliding_window} must be >= 0 "
+            f"(0 disables the branch)")
     if scale is None:
         scale = c ** -0.5
     device = H.device

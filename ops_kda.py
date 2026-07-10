@@ -49,11 +49,21 @@ def naive_recurrent_kda(
     # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear AssertionError
     # instead of a bare ZeroDivisionError. Also validates non-negativity of
     # head dims so a malformed caller gets an informative message.
-    assert H >= 1, f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)"
-    assert K >= 1, f"K={K} must be >= 1"
-    assert V >= 1, f"V={V} must be >= 1"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
+    if H < 1:
+        raise AssertionError(
+            f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)")
+    if K < 1:
+        raise AssertionError(f"K={K} must be >= 1")
+    if V < 1:
+        raise AssertionError(f"V={V} must be >= 1")
     G = HV // H
-    assert HV % H == 0, f"HV={HV} must be divisible by H={H} (GVA factor)"
+    if HV % H != 0:
+        raise AssertionError(
+            f"HV={HV} must be divisible by H={H} (GVA factor)")
     if scale is None:
         scale = K ** -0.5
 
@@ -123,15 +133,26 @@ def naive_chunk_kda(
     # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
     # ``T // BT`` so zero or negative values produce a clear AssertionError
     # instead of a bare ZeroDivisionError. Mirrors naive_recurrent_kda.
-    assert H >= 1, f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)"
-    assert K >= 1, f"K={K} must be >= 1"
-    assert V >= 1, f"V={V} must be >= 1"
-    assert chunk_size >= 1, (
-        f"chunk_size={chunk_size} must be >= 1 "
-        f"(would cause ZeroDivisionError in T // chunk_size and (-T) % chunk_size)"
-    )
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
+    if H < 1:
+        raise AssertionError(
+            f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)")
+    if K < 1:
+        raise AssertionError(f"K={K} must be >= 1")
+    if V < 1:
+        raise AssertionError(f"V={V} must be >= 1")
+    if chunk_size < 1:
+        raise AssertionError(
+            f"chunk_size={chunk_size} must be >= 1 "
+            f"(would cause ZeroDivisionError in T // chunk_size and "
+            f"(-T) % chunk_size)")
     G = HV // H
-    assert HV % H == 0, f"HV={HV} must be divisible by H={H} (GVA factor)"
+    if HV % H != 0:
+        raise AssertionError(
+            f"HV={HV} must be divisible by H={H} (GVA factor)")
     BT = chunk_size
     original_T = T
     # Degenerate case: empty sequence. The downstream
