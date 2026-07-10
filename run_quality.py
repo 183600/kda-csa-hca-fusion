@@ -235,17 +235,25 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     if device is None:
         device = embed.weight.device
 
-    assert n_kv >= 1, f"n_kv={n_kv} must be >= 1"
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # silent shape corruption / trivially-solvable-task bugs these guards
+    # are meant to prevent. Mirrors the convention established in ops_kda.py.
+    if n_kv < 1:
+        raise AssertionError(f"n_kv={n_kv} must be >= 1")
     # Guard against silent shape corruption: if 2*n_kv exceeds vocab, the
     # argsort slice returns fewer than 2*n_kv ids and keys/vals end up with
     # mismatched shapes ([batch, vocab//2] vs the expected [batch, n_kv]).
     # If 2*n_kv >= seq_len, the cue at position seq_len-1 would overwrite a
     # KV pair (or fall inside the KV region), making the task trivially
     # solvable or unsolvable. Both used to fail silently.
-    assert 2 * n_kv <= vocab, (
-        f"2*n_kv={2*n_kv} must be <= vocab={vocab} (need 2*n_kv distinct ids)")
-    assert 2 * n_kv < seq_len, (
-        f"2*n_kv={2*n_kv} must be < seq_len={seq_len} (need room for cue token)")
+    if 2 * n_kv > vocab:
+        raise AssertionError(
+            f"2*n_kv={2*n_kv} must be <= vocab={vocab} (need 2*n_kv distinct ids)")
+    if 2 * n_kv >= seq_len:
+        raise AssertionError(
+            f"2*n_kv={2*n_kv} must be < seq_len={seq_len} (need room for cue token)")
 
     # Random noise base (covers noise positions; KV positions overwritten below).
     x = torch.randint(0, vocab, (batch, seq_len), device=device, generator=generator)

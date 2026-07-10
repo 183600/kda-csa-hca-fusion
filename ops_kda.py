@@ -83,7 +83,19 @@ def naive_recurrent_kda(
         # passes a stale CPU state) would raise ``RuntimeError: Expected all
         # tensors to be on the same device``. Mirrors the more defensive
         # ``.to(Z)`` pattern used in ops_csa.py / ops_hca.py.
-        S += initial_state.to(device=S.device, dtype=compute_dtype)
+        #
+        # Use out-of-place ``S = S + ...`` (NOT in-place ``S += ...``) so a
+        # caller passing a leaf ``initial_state`` with ``requires_grad=True``
+        # (e.g. BPTT across call boundaries) does not hit
+        # ``RuntimeError: one of the variables needed for gradient
+        # computation has been modified by an inplace operation`` on the
+        # next backward(). ``Tensor.to(...)`` returns the *same* tensor when
+        # dtype and device already match, so the in-place variant would
+        # mutate a tensor that may participate in the user's autograd graph.
+        # Mirrors the out-of-place pattern documented in the recurrence
+        # loop below (see the comment block starting at the ``for i in
+        # range(0, T)`` loop).
+        S = S + initial_state.to(device=S.device, dtype=compute_dtype)
     # Degenerate case: empty sequence. The for-loop body would not execute,
     # and the function would *happen* to return correct shapes by accident
     # (o=torch.zeros_like(v) is [B, 0, HV, V]; S is uninitialized [B, HV, K, V]).
@@ -162,10 +174,26 @@ def naive_chunk_kda(
     # naive_csa / naive_hca).
     if T == 0:
         compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
-        S = q.new_zeros(B, HV, K, V)
+        # Allocate S in ``compute_dtype`` (NOT q.dtype) so the in-place add
+        # below does not crash with ``RuntimeError: result type Float cannot
+        # be cast to the desired output type Half`` for fp16/bf16 callers
+        # that pass a carried-over ``initial_state`` (e.g. a streaming
+        # decoder whose first chunk happens to be empty). Mirrors the
+        # ordering in ``naive_recurrent_kda`` (lines 74-86), where the
+        # inputs are cast to ``compute_dtype`` *before* ``S = q.new_zeros``
+        # so ``S`` is already in ``compute_dtype`` when the add runs.
+        S = q.new_zeros(B, HV, K, V, dtype=compute_dtype, device=q.device)
         if initial_state is not None:
-            S += initial_state.to(device=S.device, dtype=compute_dtype)
-        o = q.new_zeros(B, 0, HV, V)
+            # Out-of-place add (not ``S += ...``) for autograd safety: a
+            # caller passing a leaf ``initial_state`` with
+            # ``requires_grad=True`` would otherwise hit "one of the
+            # variables needed for gradient computation has been modified
+            # by an inplace operation" on the next backward(). Mirrors the
+            # out-of-place pattern documented in the recurrence loop
+            # (see the ``S = S + ...`` state-update step inside the
+            # ``for i in range(0, NT)`` loop below).
+            S = S + initial_state.to(device=S.device, dtype=compute_dtype)
+        o = q.new_zeros(B, 0, HV, V, dtype=compute_dtype, device=q.device)
         if not output_final_state:
             S = None
         else:
@@ -223,8 +251,14 @@ def naive_chunk_kda(
     if initial_state is not None:
         # Cast initial_state to compute_dtype AND move to S's device before
         # adding (mirrors the fix in naive_recurrent_kda: prevents both
-        # dtype- and device-mismatch RuntimeErrors).
-        S += initial_state.to(device=S.device, dtype=compute_dtype)
+        # dtype- and device-mismatch RuntimeErrors). Use out-of-place
+        # ``S = S + ...`` (NOT in-place ``S += ...``) for autograd safety
+        # — same rationale as the ``S = S + ...`` state-update step inside
+        # the ``for i in range(0, NT)`` loop below. ``Tensor.to(...)`` may
+        # return the *same* tensor when dtype/device already match, so the
+        # in-place variant could mutate a tensor that participates in the
+        # caller's autograd graph (e.g. BPTT across call boundaries).
+        S = S + initial_state.to(device=S.device, dtype=compute_dtype)
     o = torch.zeros_like(v)
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
     for i in range(0, NT):

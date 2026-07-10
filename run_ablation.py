@@ -60,10 +60,17 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     # Validate ratio so a typo (e.g. ``ratio=(3, 1)`` or ``ratio=(-1, 1, 1)``)
     # produces a clear error instead of an opaque ValueError from the
     # tuple-unpack or a silently-empty KDA layout (``['kda'] * -1 == []``).
-    assert isinstance(ratio, tuple) and len(ratio) == 3, (
-        f"ratio must be a 3-tuple (n_kda, n_csa, n_hca), got {ratio!r}")
-    assert all(isinstance(n, int) and n >= 0 for n in ratio), (
-        f"ratio components must be non-negative ints, got {ratio!r}")
+    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
+    # are silently stripped under optimization, which would re-expose the
+    # cryptic ValueError / silent-empty-layout this guard is meant to
+    # prevent. Mirrors the convention established in ops_kda.py.
+    if not (isinstance(ratio, tuple) and len(ratio) == 3):
+        raise AssertionError(
+            f"ratio must be a 3-tuple (n_kda, n_csa, n_hca), got {ratio!r}")
+    if not all(isinstance(n, int) and n >= 0 for n in ratio):
+        raise AssertionError(
+            f"ratio components must be non-negative ints, got {ratio!r}")
     n_kda, n_csa, n_hca = ratio
     # HCA's defining feature is *heavy* compression: m2 should be >> m so the
     # HCA branch produces far fewer compressed blocks than CSA, trading recall

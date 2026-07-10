@@ -38,12 +38,27 @@ import make_figures  # noqa: E402
 RESULTS_DIR = os.path.join(HERE, 'results')
 FIGURES_DIR = os.path.join(HERE, 'figures')
 
-# Per-session backup directory. Use mkdtemp so concurrent test runs (e.g.
-# CI matrix) do not collide on a shared global path. The previous
+# Per-session backup directory. Lazily created on the first call to
+# ``_get_backup_dir()`` (NOT at module import) so that simply importing
+# ``test_figures`` — e.g. by a test collector, ``run_all.py``, or an IDE
+# auto-import — does not leak an orphan temp directory that is only
+# cleaned up if ``main()`` or the pytest session-scoped fixture runs to
+# completion. The previous ``_BACKUP_DIR = tempfile.mkdtemp(...)`` at
+# module scope ran at import time and accumulated orphan dirs on every
+# bare import. Uses mkdtemp so concurrent test runs (e.g. CI matrix) do
+# not collide on a shared global path. The previous-previous
 # ``BACKUP_DIR = os.path.join(tempfile.gettempdir(), '_fig_test_backups')``
 # was a fixed global path; two parallel test runs would overwrite each
 # other's backups.
-_BACKUP_DIR = tempfile.mkdtemp(prefix='_fig_test_backups_')
+_BACKUP_DIR: str | None = None
+
+
+def _get_backup_dir() -> str:
+    """Lazily create and cache the per-session backup directory."""
+    global _BACKUP_DIR
+    if _BACKUP_DIR is None:
+        _BACKUP_DIR = tempfile.mkdtemp(prefix='_fig_test_backups_')
+    return _BACKUP_DIR
 
 
 def _backup_results():
@@ -53,11 +68,12 @@ def _backup_results():
     into ``figures/`` (via ``make_figures.fig_*``). After a test run the
     real figures were silently overwritten by synthetic test output.
     """
-    os.makedirs(_BACKUP_DIR, exist_ok=True)
+    backup_dir = _get_backup_dir()
+    os.makedirs(backup_dir, exist_ok=True)
     for src_dir, name in [(RESULTS_DIR, 'results'), (FIGURES_DIR, 'figures')]:
         if not os.path.isdir(src_dir):
             continue
-        dst = os.path.join(_BACKUP_DIR, name)
+        dst = os.path.join(backup_dir, name)
         os.makedirs(dst, exist_ok=True)
         for fname in os.listdir(src_dir):
             src = os.path.join(src_dir, fname)
@@ -67,8 +83,9 @@ def _backup_results():
 
 def _restore_results():
     """Restore result files AND figures from the backup."""
+    backup_dir = _get_backup_dir()
     for dst_dir, name in [(RESULTS_DIR, 'results'), (FIGURES_DIR, 'figures')]:
-        src_dir = os.path.join(_BACKUP_DIR, name)
+        src_dir = os.path.join(backup_dir, name)
         if not os.path.isdir(src_dir):
             continue
         os.makedirs(dst_dir, exist_ok=True)
@@ -124,11 +141,17 @@ try:
         _backup_results()
         yield
         _restore_results()
-        # Best-effort cleanup of the backup dir.
-        try:
-            shutil.rmtree(_BACKUP_DIR)
-        except OSError:
-            pass
+        # Best-effort cleanup of the backup dir. ``_BACKUP_DIR`` is lazily
+        # created by ``_get_backup_dir()`` (called from ``_backup_results``),
+        # so it is guaranteed non-None here — but guard defensively in case
+        # ``_backup_results`` ever learns to short-circuit on an empty repo.
+        global _BACKUP_DIR
+        if _BACKUP_DIR is not None:
+            try:
+                shutil.rmtree(_BACKUP_DIR)
+            except OSError:
+                pass
+            _BACKUP_DIR = None
 
     @pytest.fixture(autouse=True)
     def _close_figs_fixture():
@@ -303,10 +326,17 @@ def main():
                 _plt.close('all')
     finally:
         _restore_results()
-        try:
-            shutil.rmtree(_BACKUP_DIR)
-        except OSError:
-            pass
+        # Best-effort cleanup. ``_BACKUP_DIR`` is lazily created by
+        # ``_get_backup_dir()`` (called from ``_backup_results`` at the
+        # start of ``main()``); guard for None in case the backup step
+        # was never reached (e.g. KeyboardInterrupt during setup).
+        global _BACKUP_DIR
+        if _BACKUP_DIR is not None:
+            try:
+                shutil.rmtree(_BACKUP_DIR)
+            except OSError:
+                pass
+            _BACKUP_DIR = None
     n_pass = sum(1 for r in results if r)
     n_total = len(results)
     print('-' * 70)

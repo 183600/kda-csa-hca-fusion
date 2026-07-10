@@ -154,9 +154,21 @@ class HeadwiseFusedAttention(nn.Module):
     def __init__(self, cfg: HeadwiseConfig):
         super().__init__()
         self.cfg = cfg
-        assert cfg.H_kda + cfg.H_csa + cfg.H_hca == cfg.H_total
-        assert cfg.csa_c == cfg.head_dim and cfg.hca_c == cfg.head_dim, \
-            "Prototype requires csa_c == hca_c == head_dim"
+        # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+        # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
+        # are silently stripped under optimization, which would let a
+        # misconfigured cfg slip through and crash deep inside __init__ with
+        # an opaque shape-mismatch error. Mirrors the convention established
+        # in ops_kda.py.
+        if cfg.H_kda + cfg.H_csa + cfg.H_hca != cfg.H_total:
+            raise AssertionError(
+                f"H_kda({cfg.H_kda}) + H_csa({cfg.H_csa}) + H_hca({cfg.H_hca}) "
+                f"!= H_total({cfg.H_total})")
+        if not (cfg.csa_c == cfg.head_dim and cfg.hca_c == cfg.head_dim):
+            raise AssertionError(
+                "Prototype requires csa_c == hca_c == head_dim "
+                f"(got csa_c={cfg.csa_c}, hca_c={cfg.hca_c}, "
+                f"head_dim={cfg.head_dim})")
         d, hd = cfg.d_model, cfg.head_dim
 
         # KDA branch (H_kda heads).
