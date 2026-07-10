@@ -272,8 +272,18 @@ def prefill_flops(op: str, T: int, **kw):
         # csa_topk=512 in the default config -> 32x overcount). Use the
         # clamped value; for very long T (n_blocks >> csa_topk) this
         # converges to the original formula.
+        #
+        # Head count: the CSA core attention uses ``csa_nh`` heads (NOT ``H``
+        # — the GQA head count). The ``q`` tensor is shaped
+        # ``[B, T, csa_nh, c]`` (see ops_csa.py::naive_csa line 337), and the
+        # QK^T / softmax·V einsums both iterate over the ``csa_nh`` axis.
+        # The previous formula used ``H`` here, which happened to be correct
+        # only because the default config sets ``csa_nh == H == 8``. A user
+        # who overrides ``csa_nh`` (e.g. to ablate head count) would get a
+        # silently wrong FLOPs number. Use ``csa_nh`` so the formula matches
+        # the actual operator.
         effective_topk = min(csa_topk, max(1, n_blocks // 2))
-        core = 2 * T * effective_topk * csa_c * H * 2
+        core = 2 * T * effective_topk * csa_c * csa_nh * 2
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
         # query). The previous formula ``T * w`` assumed every query
@@ -284,7 +294,10 @@ def prefill_flops(op: str, T: int, **kw):
         sw_w = p['csa_sliding_window']
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
-        sw = 2 * sw_entries * csa_c * H * 2
+        # Same head-count fix as ``core`` above: the SW branch uses
+        # ``csa_nh`` heads (the ``q`` tensor is shared with the sparse
+        # branch), NOT ``H``.
+        sw = 2 * sw_entries * csa_c * csa_nh * 2
         return compress + query_proj + indexer + core + sw
     if op == 'hca':
         n_blocks = max(1, T // hca_m2)
@@ -306,13 +319,22 @@ def prefill_flops(op: str, T: int, **kw):
         # overcounting HCA core FLOPs by ~2x and biasing
         # flops_ratio_vs_gqa_* accordingly. Mirrors the softmax causal-tri
         # fix above and the CSA indexer fix.
+        #
+        # Head count: the HCA core attention uses ``hca_nh`` heads (NOT ``H``).
+        # The ``q`` tensor is shaped ``[B, T, hca_nh, c]`` (see
+        # ops_hca.py::naive_hca line 106), and both einsums iterate over the
+        # ``hca_nh`` axis. The previous formula used ``H`` here, which was
+        # correct only because the default config sets ``hca_nh == H == 8``.
+        # Use ``hca_nh`` so the formula matches the actual operator.
         causal_block_entries = T * n_blocks - n_blocks * (n_blocks - 1) // 2
-        core = 2 * causal_block_entries * hca_c * H * 2
+        core = 2 * causal_block_entries * hca_c * hca_nh * 2
         # Sliding window: causal window (same fix as CSA above).
+        # Same head-count fix as ``core`` above: the SW branch uses
+        # ``hca_nh`` heads.
         sw_w = p['hca_sliding_window']
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
-        sw = 2 * sw_entries * hca_c * H * 2
+        sw = 2 * sw_entries * hca_c * hca_nh * 2
         return compress + query_proj + core + sw
     if op == 'hybrid_kch':
         # Mirror the configurable ratio in kv_cache_elements.

@@ -381,6 +381,24 @@ class HybridKCHAttention(nn.Module):
         # preserves it. The previous behavior (drop on device mismatch) would
         # silently reset the KDA state whenever the caller forgot to call
         # ``model.to(device)`` before passing inputs on a different device.
+        #
+        # DTYPE mismatch (e.g. caller did ``model.half()`` between forwards):
+        # ``stacked.to(x.device)`` only moves the device, NOT the dtype. The
+        # downstream ``naive_recurrent_kda`` does implicitly cast
+        # ``initial_state`` to ``compute_dtype`` (fp32 for fp16 inputs), so
+        # the recurrence itself does not crash — but the returned
+        # ``new_state`` is in ``v.dtype`` (= ``x.dtype`` after ``model.half()``),
+        # while any OTHER KDA layer whose state we have not yet overwritten
+        # is still in the OLD dtype. ``torch.stack(states, dim=0)`` at the
+        # end of forward then crashes with
+        # ``RuntimeError: Expected object of scalar type Half but got scalar
+        # type Float`` because the per-layer states have mixed dtypes.
+        # The fix: explicitly cast ``stacked`` to ``x.dtype`` alongside the
+        # device move (and in the same-dtype/device branch too, defensively).
+        # This makes the contract explicit: the state is ALWAYS in
+        # ``x.dtype`` before being passed to the KDA layers, so all
+        # ``new_state`` returns are in ``x.dtype`` and ``torch.stack`` is
+        # guaranteed homogeneous.
         stacked = self._kda_state
         if stacked is not None:
             # Batch dim is axis 1 (axis 0 is the per-layer index).
@@ -401,9 +419,12 @@ class HybridKCHAttention(nn.Module):
                     "explicitly to suppress this message.",
                     stacked.shape[1], x.shape[0])
                 stacked = None
-            elif stacked.device != x.device:
-                # Move (and keep detached) rather than drop.
-                stacked = stacked.to(x.device).detach()
+            elif stacked.device != x.device or stacked.dtype != x.dtype:
+                # Move (device AND dtype) and keep detached rather than drop.
+                # ``.to(device=x.device, dtype=x.dtype)`` is a no-op for the
+                # dimension that already matches, so this also covers the
+                # dtype-only-mismatch case (device matches, dtype differs).
+                stacked = stacked.to(device=x.device, dtype=x.dtype).detach()
             else:
                 # Always detach: training (BPTT safety) AND eval (memory leak
                 # prevention). See the comment above for the full rationale.

@@ -2551,6 +2551,256 @@ def test_csa_hca_input_validation(device='cpu'):
     return results
 
 
+def test_hybrid_kda_state_dtype_mismatch(device='cpu'):
+    """Regression: ``HybridKCHAttention`` must survive a dtype change between forwards.
+
+    Previously, the cached ``_kda_state`` retained its original dtype when the
+    caller did ``model.half()`` (or any dtype change) between forward calls.
+    The downstream ``naive_recurrent_kda`` implicitly cast ``initial_state``
+    to ``compute_dtype``, so the recurrence itself did not crash — but the
+    returned ``new_state`` was in ``v.dtype`` (= new dtype), while any OTHER
+    KDA layer whose state had not yet been overwritten was still in the OLD
+    dtype. ``torch.stack(states, dim=0)`` at the end of forward then crashed
+    with ``RuntimeError: Expected object of scalar type Half but got scalar
+    type Float`` because the per-layer states had mixed dtypes.
+
+    The fix explicitly casts ``stacked`` to ``x.dtype`` alongside the device
+    move. This test verifies the fix: a fp32 forward followed by a fp16
+    forward (after ``model.half()``) must not crash, and the output must be
+    finite.
+    """
+    logger.info("Test: HybridKCHAttention survives dtype change between forwards")
+    torch.manual_seed(220)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        csa_m=4, csa_topk=2, csa_nh=2, csa_c=8, csa_dc=16, csa_nIh=2, csa_cI=4,
+        csa_sliding_window=4,
+        hca_m2=8, hca_nh=2, hca_c=8, hca_dc=16, hca_sliding_window=4,
+        n_kda=2, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=4).to(device).eval()
+    # First forward in fp32 — populates _kda_state with fp32 tensors.
+    x_fp32 = torch.randn(1, 8, cfg.d_model, device=device, dtype=torch.float32) * 0.1
+    with torch.no_grad():
+        y1 = model(x_fp32)
+    fp32_state_dtype = model._kda_state.dtype if model._kda_state is not None else None
+
+    # Switch model to fp16. The cached _kda_state is still fp32 (registered
+    # buffer is NOT moved by .half() — only parameters are; but we manually
+    # cast the buffer to simulate the dtype-mismatch scenario the fix targets).
+    # Actually, .half() DOES move non-persistent buffers too in modern torch,
+    # so the state would be fp16 after .half(). To test the actual fix path
+    # (dtype mismatch between _kda_state and x), we manually restore the
+    # state to fp32 AFTER .half() to simulate a stale-state scenario.
+    model = model.half()
+    if model._kda_state is not None:
+        model._kda_state = model._kda_state.to(torch.float32)
+
+    # Second forward in fp16 — must not crash despite _kda_state being fp32.
+    x_fp16 = x_fp32.to(torch.float16)
+    try:
+        with torch.no_grad():
+            y2 = model(x_fp16)
+        ok = (y2.shape == x_fp16.shape
+              and y2.dtype == torch.float16
+              and torch.isfinite(y2.float()).all().item())
+        err = ''
+    except Exception as e:
+        ok = False
+        err = f'{type(e).__name__}: {e}'
+    return [
+        _ok('hybrid survives dtype change (fp32 state -> fp16 forward)', ok,
+            f'y2.shape={tuple(y2.shape) if ok else "n/a"}, '
+            f'fp32_state_dtype={fp32_state_dtype}, err={err}'),
+    ]
+
+
+def test_hybrid_kda_state_batch_size_change(device='cpu'):
+    """Regression: ``HybridKCHAttention`` drops KDA state on batch-size change.
+
+    Previously, the KDA recurrent state was retained across batch-size
+    changes, causing a shape mismatch crash inside ``naive_recurrent_kda``
+    (the state has the old B, the new q/k/v have the new B, and the einsums
+    broadcast-incompatibly). The fix drops the state on batch-size change
+    (the state is per-sequence and cannot be reused across different batch
+    sizes). This test verifies the drop: a B=2 forward followed by a B=1
+    forward must not crash, and the state after the second forward must
+    have B=1.
+    """
+    logger.info("Test: HybridKCHAttention drops KDA state on batch-size change")
+    torch.manual_seed(221)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        csa_m=4, csa_topk=2, csa_nh=2, csa_c=8, csa_dc=16, csa_nIh=2, csa_cI=4,
+        csa_sliding_window=4,
+        hca_m2=8, hca_nh=2, hca_c=8, hca_dc=16, hca_sliding_window=4,
+        n_kda=2, n_csa=1, n_hca=1,
+    )
+    model = HybridKCHAttention(cfg, total_layers=4).to(device).eval()
+    # First forward with B=2 — populates _kda_state with B=2.
+    x_b2 = torch.randn(2, 8, cfg.d_model, device=device) * 0.1
+    with torch.no_grad():
+        y1 = model(x_b2)
+    b2_state_shape = (model._kda_state.shape[1]
+                     if model._kda_state is not None else None)
+
+    # Second forward with B=1 — must drop the B=2 state, not crash.
+    x_b1 = torch.randn(1, 8, cfg.d_model, device=device) * 0.1
+    try:
+        with torch.no_grad():
+            y2 = model(x_b1)
+        ok = (y2.shape == x_b1.shape
+              and torch.isfinite(y2).all().item()
+              and model._kda_state is not None
+              and model._kda_state.shape[1] == 1)
+        err = ''
+    except Exception as e:
+        ok = False
+        err = f'{type(e).__name__}: {e}'
+    return [
+        _ok('hybrid drops KDA state on batch-size change (B=2 -> B=1)', ok,
+            f'b2_state_B={b2_state_shape}, '
+            f'b1_state_B={model._kda_state.shape[1] if model._kda_state is not None else "n/a"}, '
+            f'err={err}'),
+    ]
+
+
+def test_prefill_flops_head_count(device='cpu'):
+    """Regression: ``prefill_flops`` must use csa_nh/hca_nh (not H) for core/SW FLOPs.
+
+    Previously, the CSA and HCA core attention and sliding-window FLOPs
+    formulas used ``H`` (the GQA head count) instead of ``csa_nh`` / ``hca_nh``
+    (the actual attention head count of those operators). The default config
+    sets them equal (csa_nh == hca_nh == H == 8), so the bug was silent —
+    but a user who overrode ``csa_nh`` (e.g. to ablate head count) would get
+    a silently wrong FLOPs number.
+
+    This test verifies the fix: with csa_nh=4 and H=8 (deliberately
+    different), the CSA core+SW FLOPs must be HALF of what they'd be with
+    csa_nh=8 (since FLOPs scale linearly with head count). The old formula
+    (using H) would produce the SAME number for both, failing the test.
+    """
+    logger.info("Test: prefill_flops uses csa_nh/hca_nh (not H) for core/SW FLOPs")
+    # Import lazily so this test does not add a hard dependency to the
+    # top-level imports (run_correctness.py is the only consumer).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from run_kv_cache import prefill_flops
+
+    T = 4096
+    # Common base params with H=8.
+    base = dict(H=8, K=128, V=128, d=4096,
+                csa_m=16, csa_c=128, csa_topk=512, csa_nIh=4, csa_cI=32,
+                csa_sliding_window=2048, csa_dc=128,
+                hca_m2=64, hca_c=128, hca_sliding_window=2048,
+                hca_dc=128,
+                kda_hv=8, kda_k=128, kda_v=128)
+
+    # Variant A: csa_nh=4, hca_nh=4 (HALF of H=8).
+    fl_4 = prefill_flops('csa', T, csa_nh=4, hca_nh=4, **base)
+    fl_4_hca = prefill_flops('hca', T, csa_nh=4, hca_nh=4, **base)
+
+    # Variant B: csa_nh=8, hca_nh=8 (EQUAL to H=8).
+    fl_8 = prefill_flops('csa', T, csa_nh=8, hca_nh=8, **base)
+    fl_8_hca = prefill_flops('hca', T, csa_nh=8, hca_nh=8, **base)
+
+    # With the fix, the core+SW terms (which scale with head count) should
+    # be ~half when csa_nh=4 vs csa_nh=8. The compress/query_proj/indexer
+    # terms do NOT scale with csa_nh (except W_UQ which does), so the total
+    # ratio is NOT exactly 0.5 — but it must be strictly less than 1.0
+    # (proving csa_nh is used somewhere) and strictly greater than the
+    # ratio we'd get if H were used everywhere (which would be 1.0).
+    # A simpler check: the two variants must NOT be equal. With the old
+    # formula (H used for core+SW), both would be identical because H=8
+    # in both variants. With the fix (csa_nh used), they differ.
+    csa_differs = fl_4 != fl_8
+    hca_differs = fl_4_hca != fl_8_hca
+    # And the smaller-head variant must have FEWER FLOPs (since core+SW
+    # scale linearly with head count and the other terms are unchanged).
+    csa_smaller = fl_4 < fl_8
+    hca_smaller = fl_4_hca < fl_8_hca
+    return [
+        _ok('prefill_flops(csa) differs by csa_nh', csa_differs and csa_smaller,
+            f'csa_nh=4: {fl_4}, csa_nh=8: {fl_8}, ratio={fl_4/fl_8:.4f}'),
+        _ok('prefill_flops(hca) differs by hca_nh', hca_differs and hca_smaller,
+            f'hca_nh=4: {fl_4_hca}, hca_nh=8: {fl_8_hca}, ratio={fl_4_hca/fl_8_hca:.4f}'),
+    ]
+
+
+def test_decoding_batch_size_change(device='cpu'):
+    """Regression: ``SoftmaxAttnDecoding`` / ``KDAAttnDecoding`` must handle
+    batch-size changes between forward calls without crashing.
+
+    Previously, ``SoftmaxAttnDecoding`` cached K/V on the first forward and
+    concatenated on subsequent forwards. If the batch size changed between
+    calls (e.g. prefill with B>1 then decode with B=1, or train batch=16
+    then eval batch=8), ``torch.cat`` would raise
+    ``RuntimeError: Sizes of tensors must match except in dimension 1``
+    because the batch dims (dim=0) differed.
+
+    Similarly, ``KDAAttnDecoding`` cached the recurrent state, which would
+    crash inside the recurrence on a batch-size change (the state has the
+    old B, the new q/k/v have the new B, and the einsums broadcast-
+    incompatibly).
+
+    The fix adds a batch-size guard to both classes: on a batch-size
+    change, the cache/state is reset and the new batch starts fresh.
+    Mirrors the batch-size guard in ``HybridKCHAttention``.
+    """
+    logger.info("Test: decoding modules handle batch-size change without crashing")
+    torch.manual_seed(222)
+    # Import lazily so this test does not add a hard dependency to the
+    # top-level imports.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from run_decoding import SoftmaxAttnDecoding, KDAAttnDecoding
+
+    d_model = 32
+    results = []
+
+    # --- SoftmaxAttnDecoding ---
+    sm = SoftmaxAttnDecoding(d_model).to(device).eval()
+    # First forward: B=2, T=4 (prefill with batch=2).
+    x_b2 = torch.randn(2, 4, d_model, device=device) * 0.1
+    with torch.no_grad():
+        y1 = sm(x_b2)
+    # Second forward: B=1, T=1 (decode with batch=1).
+    # Without the guard, torch.cat([B=2 cache, B=1 k], dim=1) crashes.
+    x_b1 = torch.randn(1, 1, d_model, device=device) * 0.1
+    try:
+        with torch.no_grad():
+            y2 = sm(x_b1)
+        sm_ok = (y2.shape == (1, 1, d_model)
+                 and torch.isfinite(y2).all().item())
+        sm_err = ''
+    except Exception as e:
+        sm_ok = False
+        sm_err = f'{type(e).__name__}: {e}'
+    results.append(_ok('SoftmaxAttnDecoding survives B=2 -> B=1', sm_ok,
+                       f'y2.shape={tuple(y2.shape) if sm_ok else "n/a"}, err={sm_err}'))
+
+    # --- KDAAttnDecoding ---
+    kda = KDAAttnDecoding(d_model).to(device).eval()
+    # First forward: B=2, T=4.
+    with torch.no_grad():
+        y3 = kda(x_b2)
+    # Second forward: B=1, T=1. Without the guard, the recurrence crashes
+    # because the state has B=2 but q/k/v have B=1.
+    try:
+        with torch.no_grad():
+            y4 = kda(x_b1)
+        kda_ok = (y4.shape == (1, 1, d_model)
+                  and torch.isfinite(y4).all().item())
+        kda_err = ''
+    except Exception as e:
+        kda_ok = False
+        kda_err = f'{type(e).__name__}: {e}'
+    results.append(_ok('KDAAttnDecoding survives B=2 -> B=1', kda_ok,
+                       f'y4.shape={tuple(y4.shape) if kda_ok else "n/a"}, err={kda_err}'))
+
+    return results
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -2630,6 +2880,12 @@ def main():
     # Regression test for missing input validation (c_I=0, nIh=0,
     # sliding_window<0, topk<0, total_layers<0).
     all_results += _run_safe(test_csa_hca_input_validation, device)
+    # Regression tests for KDA state dtype/batch-size handling and
+    # prefill_flops head-count correctness (recently fixed).
+    all_results += _run_safe(test_hybrid_kda_state_dtype_mismatch, device)
+    all_results += _run_safe(test_hybrid_kda_state_batch_size_change, device)
+    all_results += _run_safe(test_prefill_flops_head_count, device)
+    all_results += _run_safe(test_decoding_batch_size_change, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

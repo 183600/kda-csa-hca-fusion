@@ -553,5 +553,35 @@
     "name": "HybridConfig warns when kda_chunk_size is non-default",
     "status": "PASS",
     "detail": "warning_emitted=True"
+  },
+  {
+    "name": "hybrid survives dtype change (fp32 state -> fp16 forward)",
+    "status": "PASS",
+    "detail": "y2.shape=(1, 8, 32), fp32_state_dtype=torch.float32, err="
+  },
+  {
+    "name": "hybrid drops KDA state on batch-size change (B=2 -> B=1)",
+    "status": "PASS",
+    "detail": "b2_state_B=2, b1_state_B=1, err="
+  },
+  {
+    "name": "prefill_flops(csa) differs by csa_nh",
+    "status": "PASS",
+    "detail": "csa_nh=4: 38656574464, csa_nh=8: 53154186240, ratio=0.7273"
+  },
+  {
+    "name": "prefill_flops(hca) differs by hca_nh",
+    "status": "PASS",
+    "detail": "hca_nh=4: 26841513984, hca_nh=8: 40798126080, ratio=0.6579"
+  },
+  {
+    "name": "SoftmaxAttnDecoding survives B=2 -> B=1",
+    "status": "PASS",
+    "detail": "y2.shape=(1, 1, 32), err="
+  },
+  {
+    "name": "KDAAttnDecoding survives B=2 -> B=1",
+    "status": "PASS",
+    "detail": "y4.shape=(1, 1, 32), err="
   }
 ]

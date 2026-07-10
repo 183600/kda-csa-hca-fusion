@@ -95,6 +95,24 @@ class SoftmaxAttnDecoding(nn.Module):
             # in KDAAttnDecoding.forward below.
             self._cache_k = k.detach()
             self._cache_v = v.detach()
+        elif self._cache_k.shape[0] != B:
+            # Batch size changed between calls (e.g. train batch=16, eval
+            # batch=8, or prefill with B>1 then decode with B=1). The cached
+            # K/V belong to the OLD batch and cannot be concatenated with the
+            # new batch's K/V along dim=1 (sequence). ``torch.cat`` would
+            # raise ``RuntimeError: Sizes of tensors must match except in
+            # dimension 1`` because the batch dims (dim=0) differ.
+            #
+            # The right thing to do is reset the cache and start fresh: the
+            # KV cache is per-sequence, and a batch-size change means we are
+            # now processing different sequences. Mirrors the batch-size
+            # guard in ops_fused.py::HybridKCHAttention.forward (which drops
+            # the KDA recurrent state on batch-size change). The benchmark
+            # already calls ``model.reset()`` between trials, so this guard
+            # is defensive for callers who reuse the module outside the
+            # benchmark without resetting.
+            self._cache_k = k.detach()
+            self._cache_v = v.detach()
         else:
             # Cast incoming k/v to the cache's dtype before concat. The
             # cache is set on the FIRST forward call (prefill) and retains
@@ -185,9 +203,31 @@ class KDAAttnDecoding(nn.Module):
         # works fine with a detached state — the state is just a tensor of
         # numbers, not a graph node.
         # Mirrors the fix in ops_fused.py::HybridKCHAttention.forward.
+        #
+        # Batch-size + dtype + device guards: if the caller switches batch
+        # size (e.g. train B=16 -> eval B=8) or dtype/device (e.g. model.half()
+        # or model.to(cuda)) between forward calls, the cached state is
+        # invalid. ``naive_recurrent_kda`` would implicitly cast via
+        # ``initial_state.to(device=S.device, dtype=compute_dtype)``, so a
+        # dtype/device mismatch does not crash — but a BATCH-SIZE mismatch
+        # WOULD crash inside the recurrence (the state has the old B, the
+        # new q/k/v have the new B, and the einsums broadcast-incompatibly).
+        # Drop the state on batch-size change (the state is per-sequence and
+        # cannot be reused across different batch sizes). For dtype/device
+        # mismatch, explicitly cast so the contract is clear and the state
+        # is in the right form before being passed to the recurrence.
+        # Mirrors the guards in ops_fused.py::HybridKCHAttention.forward.
         state = self._state
         if state is not None:
-            state = state.detach()
+            if state.shape[0] != B:
+                # Batch size changed — drop the state (per-sequence, cannot
+                # be reused across different batch sizes).
+                state = None
+            elif state.device != x.device or state.dtype != x.dtype:
+                # Device or dtype changed — move/cast and keep detached.
+                state = state.to(device=x.device, dtype=x.dtype).detach()
+            else:
+                state = state.detach()
         o, self._state = naive_recurrent_kda(
             q, k, v, g, beta, scale=self.K ** -0.5,
             initial_state=state, output_final_state=True,
