@@ -498,5 +498,60 @@
     "name": "overlapped compression T=0 returns [B,0,c]",
     "status": "PASS",
     "detail": "shape=(2, 0, 16), err="
+  },
+  {
+    "name": "naive_csa rejects c_I=0",
+    "status": "PASS",
+    "detail": "c_I=0 must be >= 1 (indexer key dim)"
+  },
+  {
+    "name": "naive_csa rejects nIh=0",
+    "status": "PASS",
+    "detail": "nIh=0 must be >= 1 (indexer head count)"
+  },
+  {
+    "name": "naive_csa rejects sliding_window=-1",
+    "status": "PASS",
+    "detail": "sliding_window=-1 must be >= 0 (0 disables the branch)"
+  },
+  {
+    "name": "naive_hca rejects sliding_window=-1",
+    "status": "PASS",
+    "detail": "sliding_window=-1 must be >= 0 (0 disables the branch)"
+  },
+  {
+    "name": "csa_lightning_indexer rejects topk=-1",
+    "status": "PASS",
+    "detail": "topk=-1 must be >= 0 (0 selects zero blocks)"
+  },
+  {
+    "name": "HybridKCHAttention rejects total_layers=-1",
+    "status": "PASS",
+    "detail": "total_layers=-1 must be a non-negative int (0 produces an empty no-op model; use"
+  },
+  {
+    "name": "HybridKCHAttention accepts total_layers=0 (no-op)",
+    "status": "PASS",
+    "detail": "shape=(1, 8, 32), n_layers=0"
+  },
+  {
+    "name": "HybridConfig rejects n_heads_v not divisible by n_heads_qk",
+    "status": "PASS",
+    "detail": "n_heads_v=4 must be divisible by n_heads_qk=3 (KDA GVA factor G = HV // H must b"
+  },
+  {
+    "name": "HybridConfig accepts valid GVA (HV divisible by H)",
+    "status": "PASS",
+    "detail": "accepted (HV=4, H=2, G=2)"
+  },
+  {
+    "name": "HybridConfig rejects n_heads_qk=0",
+    "status": "PASS",
+    "detail": "n_heads_qk=0 must be >= 1"
+  },
+  {
+    "name": "HybridConfig warns when kda_chunk_size is non-default",
+    "status": "PASS",
+    "detail": "warning_emitted=True"
   }
 ]

@@ -84,6 +84,47 @@ class HybridConfig:
                 f"dropout in KDAHybridLayer / CSAHybridLayer / HCAHybridLayer "
                 f"before enabling it."
             )
+        # GVA (Grouped Value Attention) constraint: KDA's recurrence requires
+        # HV to be an integer multiple of H so that ``repeat_interleave(G, dim=2)``
+        # can expand q/k from H heads to HV heads (G = HV // H). Without this
+        # check, a misconfigured ``n_heads_qk`` / ``n_heads_v`` pair (e.g.
+        # H=3, HV=4) would only surface deep inside ``naive_recurrent_kda``
+        # as ``AssertionError: HV=4 must be divisible by H=3 (GVA factor)``
+        # — at the first forward pass, with no hint that the *config* (not
+        # the call site) is the root cause. Validate here so the error fires
+        # at construction time with a clear, actionable message.
+        if self.n_heads_qk < 1:
+            raise ValueError(
+                f"n_heads_qk={self.n_heads_qk} must be >= 1")
+        if self.n_heads_v < 1:
+            raise ValueError(
+                f"n_heads_v={self.n_heads_v} must be >= 1")
+        if self.n_heads_v % self.n_heads_qk != 0:
+            raise ValueError(
+                f"n_heads_v={self.n_heads_v} must be divisible by "
+                f"n_heads_qk={self.n_heads_qk} (KDA GVA factor G = HV // H "
+                f"must be an integer). Adjust n_heads_v or n_heads_qk so the "
+                f"ratio is a whole number (e.g. H=2, HV=4 -> G=2).")
+        # ``kda_chunk_size`` is accepted for API backwards-compatibility but
+        # is NOT used: ``KDAHybridLayer.forward`` always calls
+        # ``naive_recurrent_kda`` (the step-by-step reference), never
+        # ``naive_chunk_kda``. A caller setting ``kda_chunk_size=16`` would
+        # silently get the recurrent path, which is a footgun — the value
+        # looks like it controls the chunk size but has no effect. Warn
+        # loudly (do not raise: existing test configs pass non-default values
+        # that we do not want to break) so the caller notices.
+        if self.kda_chunk_size != 64:
+            import warnings
+            warnings.warn(
+                f"HybridConfig.kda_chunk_size={self.kda_chunk_size} is set "
+                f"but UNUSED: KDAHybridLayer always uses naive_recurrent_kda "
+                f"(the step-by-step reference), never naive_chunk_kda. The "
+                f"field is retained for backwards compatibility. To silence "
+                f"this warning, leave kda_chunk_size at its default (64) or "
+                f"wire it into KDAHybridLayer.forward to select the chunk "
+                f"implementation.",
+                stacklevel=2,
+            )
 
 
 class KDAHybridLayer(nn.Module):

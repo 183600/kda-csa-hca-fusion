@@ -1198,6 +1198,18 @@ def test_hybrid_per_layer_kda_state(device='cpu'):
     # Wrap in torch.no_grad() to match the test's intent (functional
     # equivalence check, not gradient tracking) and avoid building a
     # computation graph that would waste memory on a 5-layer eval loop.
+    #
+    # NOTE: this reference mirrors ``HybridKCHAttention.forward`` EXACTLY —
+    # it does NOT externally pad/trim CSA/HCA inputs, because
+    # ``HybridKCHAttention.forward`` doesn't either (it relies on
+    # ``naive_csa`` / ``naive_hca``'s internal right-padding + output trim,
+    # verified by ``test_csa_hca_non_divisible_T``). The previous version of
+    # this reference DID pad externally, which was both redundant AND a
+    # maintenance trap: if the internal padding contract ever changed, the
+    # reference would silently diverge from the actual implementation while
+    # still passing the test (because the test only uses T divisible by m,
+    # where external and internal padding produce identical results).
+    # Removing the external padding makes the reference a faithful replica.
     model.reset_state()
     ref_states = [None] * n_kda_layers
     with torch.no_grad():
@@ -1211,20 +1223,11 @@ def test_hybrid_per_layer_kda_state(device='cpu'):
                     o, ref_states[kda_idx] = layer(h_norm, ref_states[kda_idx])
                     kda_idx += 1
                 else:
-                    T_h = h_norm.shape[1]
-                    if kind == 'csa':
-                        pad = (-T_h) % cfg.csa_m
-                    else:
-                        pad = (-T_h) % cfg.hca_m2
-                    if pad:
-                        # RIGHT-pad to match HybridKCHAttention.forward's padding
-                        # direction (real tokens keep original positions; only the
-                        # last partial block contains padding zeros).
-                        hp = F.pad(h_norm, (0, 0, 0, pad))
-                        o, _ = layer(hp, None)
-                        o = o[:, :T_h]
-                    else:
-                        o, _ = layer(h_norm, None)
+                    # Stateless CSA/HCA: pass h_norm directly. The operators
+                    # handle non-divisible T internally (right-pad + output
+                    # trim), so no external padding is needed — matching
+                    # HybridKCHAttention.forward exactly.
+                    o, _ = layer(h_norm, None)
                 h = residual + o
     ref_match = all(
         torch.allclose(stacked2[i], ref_states[i], atol=1e-6)
@@ -1807,7 +1810,6 @@ def test_hybrid_no_csa_layout(device='cpu'):
     cfg = HybridConfig(
         d_model=32, n_heads_qk=2, n_heads_v=2,
         head_dim_k=16, head_dim_v=16,
-        kda_chunk_size=16,
         csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
         csa_sliding_window=8,
         hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
@@ -1844,7 +1846,6 @@ def test_hybrid_no_hca_layout(device='cpu'):
     cfg = HybridConfig(
         d_model=32, n_heads_qk=2, n_heads_v=2,
         head_dim_k=16, head_dim_v=16,
-        kda_chunk_size=16,
         csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
         csa_sliding_window=8,
         hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
@@ -2491,6 +2492,61 @@ def test_csa_hca_input_validation(device='cpu'):
         err_zero = f'{type(e).__name__}: {str(e)[:60]}'
     results.append(_ok('HybridKCHAttention accepts total_layers=0 (no-op)',
                        ok_zero, err_zero))
+
+    # --- HybridConfig GVA divisibility validation ---
+    # n_heads_v must be divisible by n_heads_qk (KDA's repeat_interleave
+    # requires G = HV // H to be an integer). A misconfigured pair should
+    # fail at config construction, not at the first forward pass.
+    try:
+        HybridConfig(d_model=32, n_heads_qk=3, n_heads_v=4)
+        ok_gva = False
+        err_gva = 'no error raised (expected ValueError)'
+    except ValueError as e:
+        ok_gva = 'divisible' in str(e).lower() or 'gva' in str(e).lower()
+        err_gva = str(e)[:80]
+    except Exception as e:
+        ok_gva = False
+        err_gva = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('HybridConfig rejects n_heads_v not divisible by n_heads_qk',
+                       ok_gva, err_gva))
+
+    # Valid GVA (HV = 2*H) should be accepted.
+    try:
+        HybridConfig(d_model=32, n_heads_qk=2, n_heads_v=4)
+        ok_gva_ok = True
+        err_gva_ok = 'accepted (HV=4, H=2, G=2)'
+    except Exception as e:
+        ok_gva_ok = False
+        err_gva_ok = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('HybridConfig accepts valid GVA (HV divisible by H)',
+                       ok_gva_ok, err_gva_ok))
+
+    # n_heads_qk=0 should be rejected.
+    try:
+        HybridConfig(d_model=32, n_heads_qk=0, n_heads_v=0)
+        ok_h0 = False
+        err_h0 = 'no error raised (expected ValueError)'
+    except ValueError as e:
+        ok_h0 = 'n_heads_qk' in str(e)
+        err_h0 = str(e)[:80]
+    except Exception as e:
+        ok_h0 = False
+        err_h0 = f'{type(e).__name__}: {str(e)[:60]}'
+    results.append(_ok('HybridConfig rejects n_heads_qk=0', ok_h0, err_h0))
+
+    # --- kda_chunk_size warning when set to non-default ---
+    # The field is unused (KDAHybridLayer always uses naive_recurrent_kda),
+    # so setting it should emit a UserWarning so callers are not silently
+    # misled into thinking they're configuring the chunk size.
+    import warnings as _w
+    with _w.catch_warnings(record=True) as _wlist:
+        _w.simplefilter('always')
+        HybridConfig(d_model=32, kda_chunk_size=16)
+        warned = any('kda_chunk_size' in str(wm.message) and 'UNUSED' in str(wm.message)
+                     for wm in _wlist)
+    results.append(_ok('HybridConfig warns when kda_chunk_size is non-default',
+                       warned,
+                       f'warning_emitted={warned}'))
 
     return results
 
