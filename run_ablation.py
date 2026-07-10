@@ -450,22 +450,33 @@ def main():
         from scipy.stats import t as _t_dist
         def _bonferroni_crit(n, alpha=alpha_corrected):
             if n < 2:
-                return float('inf')
+                return None
             return float(_t_dist.ppf(1 - alpha / 2, n - 1))
         bonferroni_available = True
     except ImportError:
         # scipy unavailable: cannot compute the corrected quantile.
-        # Return ``inf`` so ``|t| > inf`` is never True, i.e. we
-        # NEVER declare Bonferroni significance when scipy is missing.
-        # The previous fallback returned the UNCORRECTED 95% critical
-        # value (``_t_crit_975(n)``), which is SMALLER than the
-        # corrected critical value — the OPPOSITE of "conservative".
-        # With the previous code, a t-statistic of 3.0 (which is
-        # significant at uncorrected alpha=0.05 but NOT at corrected
-        # alpha=0.007) would be flagged ``significant_bonferroni=True``,
-        # over-reporting significance despite the comment's claim.
+        # Return ``None`` (NOT ``float('inf')``) so:
+        #   (a) the value is JSON-serializable under ``allow_nan=False``
+        #       (inf raises ``ValueError: Out of range float values are
+        #       not JSON compliant``, which previously triggered the
+        #       sanitize-fallback on EVERY ablation run when scipy was
+        #       missing — logging a misleading ERROR and silently
+        #       nuking the field to null anyway);
+        #   (b) ``significant_bonferroni`` is set to ``False`` (via the
+        #       ``crit is not None`` guard in the comparison below), so
+        #       we NEVER declare Bonferroni significance when scipy is
+        #       missing — the same conservative behaviour the previous
+        #       ``inf`` return value aimed for, but without the JSON
+        #       serialization crash.
+        # The previous-previous fallback returned the UNCORRECTED 95%
+        # critical value (``_t_crit_975(n)``), which is SMALLER than
+        # the corrected critical value — the OPPOSITE of "conservative".
+        # With that code, a t-statistic of 3.0 (which is significant at
+        # uncorrected alpha=0.05 but NOT at corrected alpha=0.007) would
+        # be flagged ``significant_bonferroni=True``, over-reporting
+        # significance despite the comment's claim.
         def _bonferroni_crit(n, alpha=alpha_corrected):
-            return float('inf')
+            return None
         bonferroni_available = False
     logger.info(f'  {n_tests} one-sample t-tests vs chance; '
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
@@ -497,7 +508,17 @@ def main():
                 if t_stat is not None and n_ok >= 2:
                     crit = _bonferroni_crit(n_ok)
                     res['t_crit_bonferroni'] = crit
-                    res['significant_bonferroni'] = abs(t_stat) > crit
+                    # ``crit`` is None when scipy is unavailable (see
+                    # ``_bonferroni_crit``). ``abs(t_stat) > None`` raises
+                    # ``TypeError: '>' not supported between instances of
+                    # 'float' and 'NoneType'`` in Python 3, so guard the
+                    # comparison: when the critical value cannot be
+                    # computed we conservatively report ``False`` (not
+                    # significant), matching the previous ``inf``-based
+                    # behaviour without the JSON-serialization crash.
+                    res['significant_bonferroni'] = (
+                        crit is not None and abs(t_stat) > crit
+                    )
                 else:
                     res['t_crit_bonferroni'] = None
                     res['significant_bonferroni'] = False
