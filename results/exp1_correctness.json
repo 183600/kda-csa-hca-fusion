@@ -567,12 +567,47 @@
   {
     "name": "prefill_flops(csa) differs by csa_nh",
     "status": "PASS",
-    "detail": "csa_nh=4: 38656574464, csa_nh=8: 53154186240, ratio=0.7273"
+    "detail": "csa_nh=4: 38526238720, csa_nh=8: 53023850496, ratio=0.7266"
   },
   {
     "name": "prefill_flops(hca) differs by hca_nh",
     "status": "PASS",
-    "detail": "hca_nh=4: 26841513984, hca_nh=8: 40798126080, ratio=0.6579"
+    "detail": "hca_nh=4: 26573012992, hca_nh=8: 40261124096, ratio=0.6600"
+  },
+  {
+    "name": "CSA causal_block_entries correct at T=512",
+    "status": "PASS",
+    "detail": "actual=3694131200, expected_correct=3694131200, expected_broken=3696230528, cbe_correct=7936, cbe_broken=15888"
+  },
+  {
+    "name": "CSA causal_block_entries correct at T=1024",
+    "status": "PASS",
+    "detail": "actual=8533438464, expected_correct=8533438464, expected_broken=8541692160, cbe_correct=32256, cbe_broken=63520"
+  },
+  {
+    "name": "CSA causal_block_entries correct at T=4096",
+    "status": "PASS",
+    "detail": "actual=53023850496, expected_correct=53023850496, expected_broken=53154186240, cbe_correct=522240, cbe_broken=1015936"
+  },
+  {
+    "name": "HCA causal_block_entries correct at T=512",
+    "status": "PASS",
+    "detail": "actual=2290089984, expected_correct=2290089984, expected_broken=2299412480, cbe_correct=1792, cbe_broken=4068"
+  },
+  {
+    "name": "HCA causal_block_entries correct at T=1024",
+    "status": "PASS",
+    "detail": "actual=5670699008, expected_correct=5670699008, expected_broken=5705859072, cbe_correct=7680, cbe_broken=16264"
+  },
+  {
+    "name": "HCA causal_block_entries correct at T=4096",
+    "status": "PASS",
+    "detail": "actual=40261124096, expected_correct=40261124096, expected_broken=40798126080, cbe_correct=129024, cbe_broken=260128"
+  },
+  {
+    "name": "softmax_gqa includes input/output projections",
+    "status": "PASS",
+    "detail": "actual=17717788672, core_only=537919488, proj_diff=17179869184, expected_proj=17179869184, kda/gqa_ratio=0.7897x"
   },
   {
     "name": "SoftmaxAttnDecoding survives B=2 -> B=1",

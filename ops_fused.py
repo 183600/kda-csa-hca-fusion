@@ -105,6 +105,31 @@ class HybridConfig:
                 f"n_heads_qk={self.n_heads_qk} (KDA GVA factor G = HV // H "
                 f"must be an integer). Adjust n_heads_v or n_heads_qk so the "
                 f"ratio is a whole number (e.g. H=2, HV=4 -> G=2).")
+        # Validate strictly-positive dimensional params. ``KDAHybridLayer``
+        # computes ``self.scale = K ** -0.5`` (line 149), which raises
+        # ``ZeroDivisionError`` if ``head_dim_k == 0``. Similarly, ``csa_cI``
+        # feeds into ``csa_lightning_indexer``'s ``scale = DI ** -0.5``. A
+        # zero value in any of these would otherwise surface as a cryptic
+        # torch error deep inside the first forward pass. Validate here so
+        # the error fires at config construction with a clear message.
+        for name, val in [
+            ('d_model', self.d_model),
+            ('head_dim_k', self.head_dim_k),
+            ('head_dim_v', self.head_dim_v),
+            ('csa_m', self.csa_m),
+            ('csa_c', self.csa_c),
+            ('csa_dc', self.csa_dc),
+            ('csa_cI', self.csa_cI),
+            ('csa_nIh', self.csa_nIh),
+            ('hca_m2', self.hca_m2),
+            ('hca_c', self.hca_c),
+            ('hca_dc', self.hca_dc),
+        ]:
+            if val < 1:
+                raise ValueError(
+                    f"HybridConfig.{name}={val} must be >= 1. A zero or "
+                    f"negative value would cause a division-by-zero or "
+                    f"shape error inside the sub-layer forward pass.")
         # ``kda_chunk_size`` is accepted for API backwards-compatibility but
         # is NOT used: ``KDAHybridLayer.forward`` always calls
         # ``naive_recurrent_kda`` (the step-by-step reference), never

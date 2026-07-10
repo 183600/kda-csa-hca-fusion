@@ -64,6 +64,22 @@ def naive_recurrent_kda(
     if HV % H != 0:
         raise AssertionError(
             f"HV={HV} must be divisible by H={H} (GVA factor)")
+    # Validate g and beta head dimensions match HV. Without this, a mismatched
+    # g (e.g. [B, T, H, K] instead of [B, T, HV, K]) would silently broadcast
+    # or crash deep inside the recurrence loop with a cryptic einsum error.
+    # Use ``raise AssertionError`` (NOT ``assert``) so the checks survive ``-O``.
+    if g.shape[2] != HV:
+        raise AssertionError(
+            f"g.shape[2]={g.shape[2]} must equal HV={HV} "
+            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
+    if g.shape[-1] != K:
+        raise AssertionError(
+            f"g.shape[-1]={g.shape[-1]} must equal K={K} "
+            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
+    if beta.shape[2] != HV:
+        raise AssertionError(
+            f"beta.shape[2]={beta.shape[2]} must equal HV={HV} "
+            f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
     if scale is None:
         scale = K ** -0.5
 
@@ -165,6 +181,22 @@ def naive_chunk_kda(
     if HV % H != 0:
         raise AssertionError(
             f"HV={HV} must be divisible by H={H} (GVA factor)")
+    # Validate g and beta head dimensions match HV (mirrors
+    # naive_recurrent_kda). Without this, a mismatched g or beta would
+    # crash deep inside the chunk computation with a cryptic einsum error.
+    # Use ``raise AssertionError`` (NOT ``assert``) so the checks survive ``-O``.
+    if g.shape[2] != HV:
+        raise AssertionError(
+            f"g.shape[2]={g.shape[2]} must equal HV={HV} "
+            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
+    if g.shape[-1] != K:
+        raise AssertionError(
+            f"g.shape[-1]={g.shape[-1]} must equal K={K} "
+            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
+    if beta.shape[2] != HV:
+        raise AssertionError(
+            f"beta.shape[2]={beta.shape[2]} must equal HV={HV} "
+            f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
     BT = chunk_size
     original_T = T
     # Degenerate case: empty sequence. The downstream

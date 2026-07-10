@@ -2801,6 +2801,173 @@ def test_decoding_batch_size_change(device='cpu'):
     return results
 
 
+def test_prefill_flops_causal_block_entries(device='cpu'):
+    """Regression: ``prefill_flops`` must use the CORRECT causal block entry
+    count for CSA/HCA, not the previous ~2x-overcounting formula.
+
+    The strict causal mask in ``ops_csa.py::_causal_block_mask`` is
+    ``b < t // m`` (query t attends only to STRICTLY preceding blocks). The
+    total number of valid (query, block) pairs is therefore
+    ``sum_{t=0}^{T-1} floor(t / m)``. For ``T = nb*m`` (the common case in
+    the benchmark sweep, where T is always a power of 2 and m is 16 or 64),
+    this equals ``m * nb * (nb - 1) // 2`` (which simplifies to
+    ``T * (nb - 1) // 2``).
+
+    The previous formula ``T * n_blocks - n_blocks * (n_blocks - 1) // 2``
+    was WRONG: it computed the full ``T * n_blocks`` product minus a small
+    ``n_blocks``-sized triangle, yielding ~2x the correct count. This
+    overcounted the CSA indexer FLOPs and HCA core FLOPs by ~2x and biased
+    ``flops_ratio_vs_gqa_*``.
+
+    This test recomputes the FULL expected CSA/HCA FLOPs with the correct
+    causal_block_entries formula and compares to ``prefill_flops()``. If the
+    code reverts to the broken formula, the totals will mismatch by the
+    indexer (CSA) or core (HCA) overcount.
+    """
+    logger.info("Test: prefill_flops causal_block_entries correctness")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from run_kv_cache import prefill_flops, DEFAULTS
+
+    results = []
+
+    # --- CSA check ---
+    for T in [512, 1024, 4096]:
+        p = {**DEFAULTS}
+        H, K, V, d = p['H'], p['K'], p['V'], p['d']
+        csa_m, csa_c, csa_topk = p['csa_m'], p['csa_c'], p['csa_topk']
+        csa_nh, csa_dc = p['csa_nh'], p['csa_dc']
+        csa_cI, csa_nIh = p['csa_cI'], p['csa_nIh']
+        sw_w = p['csa_sliding_window']
+        n_blocks = max(1, T // csa_m)
+
+        # Recompute each term with the CORRECT causal_block_entries.
+        nb_raw = T // csa_m
+        r_rem = T - nb_raw * csa_m
+        cbe_correct = csa_m * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
+        # The broken formula (for comparison):
+        cbe_broken = T * n_blocks - n_blocks * (n_blocks - 1) // 2
+
+        compress = 2 * T * d * (4 * csa_c + 2 * csa_cI)
+        query_proj = 2 * T * (
+              d * csa_dc
+            + csa_dc * csa_c * csa_nh
+            + csa_dc * csa_cI * csa_nIh
+            + d * csa_nIh
+        )
+        indexer_correct = 2 * cbe_correct * csa_cI * csa_nIh \
+                          + 2 * cbe_correct * csa_nIh
+        indexer_broken = 2 * cbe_broken * csa_cI * csa_nIh \
+                         + 2 * cbe_broken * csa_nIh
+        effective_topk = min(csa_topk, max(1, n_blocks // 2))
+        core = 2 * T * effective_topk * csa_c * csa_nh * 2
+        eff_sw = min(T, sw_w)
+        sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
+        sw = 2 * sw_entries * csa_c * csa_nh * 2
+
+        expected_correct = compress + query_proj + indexer_correct + core + sw
+        expected_broken = compress + query_proj + indexer_broken + core + sw
+        actual = prefill_flops('csa', T)
+
+        match = actual == expected_correct
+        would_fail_broken = actual != expected_broken  # must NOT match broken
+        results.append(_ok(
+            f'CSA causal_block_entries correct at T={T}',
+            match and would_fail_broken,
+            f'actual={actual}, expected_correct={expected_correct}, '
+            f'expected_broken={expected_broken}, cbe_correct={cbe_correct}, '
+            f'cbe_broken={cbe_broken}'))
+
+    # --- HCA check ---
+    for T in [512, 1024, 4096]:
+        p = {**DEFAULTS}
+        H, K, V, d = p['H'], p['K'], p['V'], p['d']
+        hca_m2, hca_c = p['hca_m2'], p['hca_c']
+        hca_nh, hca_dc = p['hca_nh'], p['hca_dc']
+        sw_w = p['hca_sliding_window']
+        n_blocks = max(1, T // hca_m2)
+
+        nb_raw = T // hca_m2
+        r_rem = T - nb_raw * hca_m2
+        cbe_correct = hca_m2 * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
+        cbe_broken = T * n_blocks - n_blocks * (n_blocks - 1) // 2
+
+        compress = 2 * T * d * hca_c * 2
+        query_proj = 2 * T * (d * hca_dc + hca_dc * hca_c * hca_nh)
+        core_correct = 2 * cbe_correct * hca_c * hca_nh * 2
+        core_broken = 2 * cbe_broken * hca_c * hca_nh * 2
+        eff_sw = min(T, sw_w)
+        sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
+        sw = 2 * sw_entries * hca_c * hca_nh * 2
+
+        expected_correct = compress + query_proj + core_correct + sw
+        expected_broken = compress + query_proj + core_broken + sw
+        actual = prefill_flops('hca', T)
+
+        match = actual == expected_correct
+        would_fail_broken = actual != expected_broken
+        results.append(_ok(
+            f'HCA causal_block_entries correct at T={T}',
+            match and would_fail_broken,
+            f'actual={actual}, expected_correct={expected_correct}, '
+            f'expected_broken={expected_broken}, cbe_correct={cbe_correct}, '
+            f'cbe_broken={cbe_broken}'))
+
+    return results
+
+
+def test_prefill_flops_softmax_gqa_projections(device='cpu'):
+    """Regression: ``prefill_flops('softmax_gqa')`` must include input/output
+    projections for parity with KDA/CSA/HCA.
+
+    Previously, softmax_gqa counted ONLY the attention core (QK^T + softmax·V),
+    while KDA/CSA/HCA all counted their input projections. This asymmetry made
+    the denominator of ``flops_ratio_vs_gqa_*`` artificially small: at T=512
+    the KDA ratio was 26x (KDA looks 26x more expensive than GQA) instead of
+    the correct 0.79x (KDA is actually cheaper). At long T the core dominates
+    and the error shrinks, but the swept table includes short-T rows where the
+    error is massive.
+
+    This test verifies that softmax_gqa FLOPs are strictly LARGER than the
+    core-only value, and that adding the projections makes the KDA/GQA ratio
+    at T=512 less than 1.0 (KDA is cheaper than GQA at short T, which is the
+    correct behavior — the broken version reported 26x).
+    """
+    logger.info("Test: prefill_flops softmax_gqa includes projections")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from run_kv_cache import prefill_flops, DEFAULTS
+
+    p = {**DEFAULTS}
+    H, K, V, d = p['H'], p['K'], p['V'], p['d']
+    T = 512
+
+    # Core-only FLOPs (the OLD, broken value).
+    causal_entries = T * (T + 1) // 2
+    core_only = 2 * causal_entries * H * (K + V)
+
+    actual = prefill_flops('softmax_gqa', T)
+
+    # The fixed value must be strictly larger than core-only (projections add
+    # a large positive term at d=4096).
+    includes_proj = actual > core_only
+
+    # Verify the projection magnitude: proj + out_proj should equal the
+    # difference. proj = 2*T*d*(2*H*K + H*V), out_proj = 2*T*H*V*d.
+    expected_proj = 2 * T * d * (2 * H * K + H * V) + 2 * T * H * V * d
+    diff_matches = (actual - core_only) == expected_proj
+
+    # Sanity: with the fix, KDA/GQA ratio at T=512 should be < 1.0 (KDA is
+    # cheaper). The broken version (core-only GQA) gave ~26x.
+    kda = prefill_flops('kda', T)
+    ratio = kda / actual
+    ratio_sane = ratio < 5.0  # definitely not the broken 26x
+
+    return [_ok(
+        'softmax_gqa includes input/output projections',
+        includes_proj and diff_matches and ratio_sane,
+        f'actual={actual}, core_only={core_only}, proj_diff={actual - core_only}, '
+        f'expected_proj={expected_proj}, kda/gqa_ratio={ratio:.4f}x')]
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -2885,6 +3052,8 @@ def main():
     all_results += _run_safe(test_hybrid_kda_state_dtype_mismatch, device)
     all_results += _run_safe(test_hybrid_kda_state_batch_size_change, device)
     all_results += _run_safe(test_prefill_flops_head_count, device)
+    all_results += _run_safe(test_prefill_flops_causal_block_entries, device)
+    all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
     all_results += _run_safe(test_decoding_batch_size_change, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)

@@ -208,7 +208,23 @@ def prefill_flops(op: str, T: int, **kw):
         # this 2x baseline bias made every other operator look ~2x
         # cheaper than it really is.
         causal_entries = T * (T + 1) // 2
-        return 2 * causal_entries * H * (K + V)
+        core = 2 * causal_entries * H * (K + V)
+        # Input/output projections — counted for PARITY with KDA / CSA / HCA,
+        # whose ``proj`` / ``compress`` / ``query_proj`` terms already include
+        # them. The previous version omitted them from softmax_gqa, making the
+        # denominator of ``flops_ratio_vs_gqa_*`` artificially small and the
+        # ratios artificially large. At short T (e.g. 512) this swung the KDA
+        # ratio from 0.79x (KDA is cheaper) to 26x (KDA looks 26x more
+        # expensive) — a ~33x error in the headline comparison. At long T the
+        # core dominates and the asymmetry shrinks to <2%, but the swept table
+        # includes short-T rows where the error is large.
+        #   q_proj : d -> H*K  -> T*d*H*K MACs
+        #   k_proj : d -> H*K  -> T*d*H*K MACs
+        #   v_proj : d -> H*V  -> T*d*H*V MACs
+        #   o_proj : H*V -> d  -> T*H*V*d MACs
+        proj = 2 * T * d * (2 * H * K + H * V)
+        out_proj = 2 * T * H * V * d
+        return core + proj + out_proj
     if op == 'kda':
         # Input projections — count the ACTUAL matmul shapes from
         # ops_fused.py::KDAHybridLayer, not an approximation. The previous
@@ -254,11 +270,19 @@ def prefill_flops(op: str, T: int, **kw):
         # weighted sum across heads T * n_blocks * nIh.
         # The lightning indexer applies the causal block mask BEFORE top-k
         # (csa_lightning_indexer masks non-causal blocks to -inf), so query t
-        # only scores floor(t / csa_m) valid blocks. Total causal block
-        # entries = T*n_blocks - n_blocks*(n_blocks-1)/2 (triangular). The
-        # previous formula used the full T*n_blocks product, overcounting the
-        # aggregation term by ~2x and biasing flops_ratio_vs_gqa_*.
-        causal_block_entries = T * n_blocks - n_blocks * (n_blocks - 1) // 2
+        # only scores floor(t / csa_m) valid (strictly preceding) blocks.
+        # Total causal (query, block) entries = sum_{t=0}^{T-1} floor(t / csa_m).
+        # For T = nb*m + r (nb = T // m, r = T % m), this equals
+        #   m * nb * (nb - 1) // 2 + r * nb
+        # (when T is a multiple of m, this simplifies to T*(nb-1)//2).
+        # The previous formula ``T*n_blocks - n_blocks*(n_blocks-1)//2`` was
+        # WRONG: it computed the full T*n_blocks product minus a small
+        # n_blocks-sized triangle, which is ~2x the correct count (verified:
+        # at T=512, m=16 it gave 15888 vs the correct 7936). This overcounted
+        # the indexer FLOPs by ~2x and biased flops_ratio_vs_gqa_*.
+        nb_raw = T // csa_m
+        r_rem = T - nb_raw * csa_m
+        causal_block_entries = csa_m * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
         indexer = 2 * causal_block_entries * p['csa_cI'] * p['csa_nIh'] \
                   + 2 * causal_block_entries * p['csa_nIh']
         # Core sparse attention: QK^T (c term) + softmax·V (c term).
@@ -313,12 +337,13 @@ def prefill_flops(op: str, T: int, **kw):
         # Core dense attention over the compressed blocks. The dense branch
         # in naive_hca applies the causal block mask (query t attends only
         # to blocks STRICTLY before floor(t / hca_m2)), so the actual number
-        # of (query, block) entries is the causal triangular count
-        # ``T*n_blocks - n_blocks*(n_blocks-1)/2``, NOT the full
-        # ``T * n_blocks``. The previous formula used the full product,
-        # overcounting HCA core FLOPs by ~2x and biasing
-        # flops_ratio_vs_gqa_* accordingly. Mirrors the softmax causal-tri
-        # fix above and the CSA indexer fix.
+        # of (query, block) entries is sum_{t=0}^{T-1} floor(t / hca_m2).
+        # For T = nb*m2 + r (nb = T // m2, r = T % m2), this equals
+        #   m2 * nb * (nb - 1) // 2 + r * nb
+        # The previous formula ``T*n_blocks - n_blocks*(n_blocks-1)//2`` was
+        # WRONG (same bug as the CSA indexer branch): it gave ~2x the correct
+        # count (verified: at T=512, m2=64 it gave 4068 vs the correct 1792),
+        # overcounting HCA core FLOPs by ~2x and biasing flops_ratio_vs_gqa_*.
         #
         # Head count: the HCA core attention uses ``hca_nh`` heads (NOT ``H``).
         # The ``q`` tensor is shaped ``[B, T, hca_nh, c]`` (see
@@ -326,7 +351,9 @@ def prefill_flops(op: str, T: int, **kw):
         # ``hca_nh`` axis. The previous formula used ``H`` here, which was
         # correct only because the default config sets ``hca_nh == H == 8``.
         # Use ``hca_nh`` so the formula matches the actual operator.
-        causal_block_entries = T * n_blocks - n_blocks * (n_blocks - 1) // 2
+        nb_raw = T // hca_m2
+        r_rem = T - nb_raw * hca_m2
+        causal_block_entries = hca_m2 * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
         core = 2 * causal_block_entries * hca_c * hca_nh * 2
         # Sliding window: causal window (same fix as CSA above).
         # Same head-count fix as ``core`` above: the SW branch uses

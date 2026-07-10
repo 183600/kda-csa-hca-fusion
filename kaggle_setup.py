@@ -175,8 +175,16 @@ def setup_kaggle(verbose: bool = True) -> None:
     # index. ``--extra-index-url`` keeps PyPI as the primary source and adds
     # the PyTorch wheel index as a fallback, so torch's CUDA wheels are found
     # there while their non-torch deps still resolve from PyPI.
+    #
+    # CRITICAL: ``--upgrade`` is REQUIRED. Without it, pip treats the already-
+    # installed (CPU-only) torch as satisfying ``torch>=2.1`` and does NOTHING.
+    # ``--upgrade-strategy=only-if-needed`` is a modifier of ``--upgrade`` and
+    # is meaningless on its own (per ``pip install --help``). Kaggle preinstalls
+    # CPU-only torch, so the previous command (without ``--upgrade``) was a
+    # silent no-op: every "GPU" experiment on Kaggle silently ran on CPU.
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
+        "--upgrade",
         "--upgrade-strategy", "only-if-needed",
         "torch>=2.1", "--extra-index-url", index_url,
     ])

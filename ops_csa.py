@@ -194,6 +194,17 @@ def csa_lightning_indexer(
     if topk < 0:
         raise AssertionError(
             f"topk={topk} must be >= 0 (0 selects zero blocks)")
+    # Validate the indexer key dimension BEFORE computing ``scale = DI ** -0.5``,
+    # which would raise ``ZeroDivisionError: 0.0 cannot be raised to a
+    # negative power`` if ``DI == 0``. ``naive_csa`` already validates
+    # ``c_I >= 1``, but this is a PUBLIC function imported directly by
+    # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
+    # its own contract. Use ``raise AssertionError`` (NOT ``assert``) so the
+    # check survives ``python -O``.
+    if q_idx.shape[-1] < 1:
+        raise AssertionError(
+            f"q_idx.shape[-1]={q_idx.shape[-1]} must be >= 1 "
+            f"(indexer key dimension c_I must be positive)")
     if scale is None:
         scale = q_idx.shape[-1] ** -0.5
     B_, T, HI, DI = q_idx.shape
