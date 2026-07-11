@@ -36,19 +36,42 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.1",
-    "einops>=0.6",
-    "matplotlib>=3.5",
-    "numpy>=1.21",
-    # scipy is optional; run_quality.py has a fallback t-distribution table
-    # when scipy is missing. Listed here so `pip install -e .` pulls it in
-    # for the canonical statistical-test path.
-    "scipy>=1.7; python_version >= '3.9'",
+    # P0 fix: pin UPPER bounds. torch 2.3 vs 2.6 differ in
+    # ``scaled_dot_product_attention`` behaviour (kernel selection,
+    # padding handling) which affects the softmax baseline numbers in
+    # ``run_benchmark`` / ``run_quality``. einops 0.8 changed the
+    # default ``rearrange`` error message format. matplotlib 3.10
+    # dropped several deprecated APIs. Without upper bounds, a fresh
+    # ``pip install -e .`` on a new machine can silently pull a
+    # breaking release and produce numerically different results from
+    # the published ones. The bounded ranges below match the versions
+    # used to generate the committed historical results.
+    "torch>=2.2,<2.7",
+    "einops>=0.6,<0.9",
+    "matplotlib>=3.5,<3.11",
+    "numpy>=1.21,<2.3",
+    # scipy is optional; run_quality.py has a fallback t-distribution
+    # table when scipy is missing. Listed here so `pip install -e .`
+    # pulls it in for the canonical statistical-test path. scipy 1.13+
+    # changed the default ``stats.t.ppf`` numerical precision in edge
+    # cases.
+    "scipy>=1.7,<1.15; python_version >= '3.9'",
 ]
 
 [project.optional-dependencies]
+# P1 fix: declare the full dev toolchain so
+# ``pip install -e .[dev]`` brings in every tool a contributor needs.
+# Previously only ``pytest`` was listed, so contributors had to
+# discover scipy / mypy / ruff requirements by trial and error (the
+# test suite uses scipy.stats.t.ppf with a fallback table; the codebase
+# has typing annotations that mypy can check; the style is
+# black-isort-ruff compatible).
 dev = [
-    "pytest>=7.0",
+    "pytest>=7.0,<9.0",
+    "pytest-xdist>=3.0,<5.0",  # parallel test execution; -n auto
+    "scipy>=1.7,<1.15",        # for stats.t.ppf (CI95 / Bonferroni)
+    "mypy>=1.0,<2.0",          # type-check the annotations
+    "ruff>=0.4,<0.10",         # linter + formatter (PEP 8 compliant)
 ]
 
 [project.urls]

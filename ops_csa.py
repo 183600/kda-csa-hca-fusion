@@ -146,10 +146,66 @@ def csa_lightning_indexer(
     scale: float | None = None,
     causal_block_mask: torch.Tensor | None = None,   # [T, n_blocks]
     return_soft_weights: bool = False,
-) -> torch.Tensor:
+    *,
+    ste_mode: str = 'topk_columns',
+    normalize_qk: bool = False,
+):
     """Top-k selection over compressed indexer keys (Eq. 13–17).
 
     Returns indices of shape ``[B, T, topk]`` (padded with -1).
+
+    Parameters
+    ----------
+
+    ste_mode : str, default ``'topk_columns'``
+        Controls the backward-path behaviour of the straight-through
+        estimator (STE) when ``return_soft_weights=True``:
+
+        * ``'topk_columns'`` (default, current implementation): the
+          differentiable ``soft_weights`` returned for the STE is
+          gathered ONLY along the hard top-k columns. The gradient on
+          non-selected blocks is exactly zero — this mirrors the hard
+          selection's forward semantics but means the indexer never
+          learns "you should have been selected". This is the
+          simplified variant documented as the current behaviour in
+          the README.
+        * ``'full_softmax'``: the STE gradient flows through the full
+          softmax over all blocks. Non-selected blocks receive a
+          (small) gradient. Slightly less faithful to the sparse
+          forward semantics but provides a denser training signal.
+          (Currently aliased to ``'topk_columns'`` for forward
+          equivalence; the difference is only realised when the
+          caller unpacks ``soft_weights`` and uses it differently —
+          see ``naive_csa``'s STE block.)
+        * ``'aux_contrastive'``: reserved for a future implementation
+          of DeepSeek-V4's contrastive auxiliary loss on the
+          selection logits. Currently raises ``NotImplementedError``
+          if explicitly requested.
+
+        The current code path always returns the same ``soft_weights``
+        tensor (the full softmax over all blocks); the ``ste_mode``
+        parameter is read by ``naive_csa``'s STE gather block to
+        decide whether to gather top-k columns (default) or use the
+        full distribution. The default ``'topk_columns'`` matches the
+        historical behaviour and the published CSA reference
+        implementation; the other modes are documented for
+        extensibility and ablation.
+
+    normalize_qk : bool, default ``False``
+        If True, L2-normalize ``q_idx`` and ``k_idx`` along the
+        per-head key dimension (``DI``) before computing the ReLU
+        dot-product scores. This makes the indexer's top-k selection
+        invariant to the magnitude of the indexer queries/keys (the
+        DeepSeek-V4 paper specifies cosine-style scoring), preventing
+        a high-norm indexer query from dominating the top-k ranking
+        purely by magnitude. Setting to ``False`` (the default)
+        preserves the historical un-normalized behaviour for backward
+        compatibility with existing benchmark results; **new use cases
+        should pass ``normalize_qk=True``** to match the
+        magnitude-invariant contract of the CSA/HCA core attention
+        (which L2-normalizes both ``q`` and ``C_comp``). The option
+        is also exposed for ablation against the magnitude-sensitive
+        baseline.
 
     .. note:: P0-4 fix — straight-through estimator (STE) for the indexer.
 
@@ -185,6 +241,22 @@ def csa_lightning_indexer(
         loss on the selection logits); the STE here is the simplest
         implementation that closes the gradient-flow gap without adding
         a separate auxiliary loss term.
+
+    .. note:: topk=0 guard (P0 API self-containment).
+
+        ``topk=0`` is a valid degenerate configuration ("no sparse
+        selection"). The downstream ``naive_csa`` guards against the
+        ``scores.amax(-1)`` crash on an empty dim, but historically
+        relied on its own early return. We now also guard here so a
+        direct caller of ``csa_lightning_indexer`` (it is a PUBLIC
+        function imported by ``run_correctness.py`` and
+        ``method_analysis.py``) does not crash with
+        ``RuntimeError: selected index k out of range`` from
+        ``torch.topk``. With ``topk=0`` we return an indices tensor
+        of shape ``[B, T, 0]`` (no valid slots) and, if requested, a
+        ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` (the
+        full differentiable distribution — still useful for an
+        auxiliary loss even when no hard selection is made).
     """
     # Validate topk BEFORE ``min(topk, n_blocks)`` so a caller passing
     # topk=-1 gets a clear ValueError instead of a cryptic
@@ -214,6 +286,20 @@ def csa_lightning_indexer(
         raise ValueError(
             f"q_idx.shape[-1]={q_idx.shape[-1]} must be >= 1 "
             f"(indexer key dimension c_I must be positive)")
+    # Validate ``ste_mode`` so a typo (e.g. ``ste_mode='topk'``) does not
+    # silently fall through to the default branch — the caller would think
+    # they enabled ``'full_softmax'`` while actually getting
+    # ``'topk_columns'`` (forward-equivalent but backward-different).
+    if ste_mode not in ('topk_columns', 'full_softmax', 'aux_contrastive'):
+        raise ValueError(
+            f"ste_mode={ste_mode!r} must be one of 'topk_columns', "
+            f"'full_softmax', or 'aux_contrastive'.")
+    if ste_mode == 'aux_contrastive':
+        raise NotImplementedError(
+            "ste_mode='aux_contrastive' is reserved for a future "
+            "implementation of DeepSeek-V4's contrastive auxiliary loss "
+            "on the indexer selection logits. Use 'topk_columns' (the "
+            "default, simplified STE) or 'full_softmax' (dense STE) for now.")
     if scale is None:
         scale = q_idx.shape[-1] ** -0.5
     B_, T, HI, DI = q_idx.shape
@@ -223,6 +309,19 @@ def csa_lightning_indexer(
     k_idx = k_idx.to(compute_dtype)
     if w_idx is not None:
         w_idx = w_idx.to(compute_dtype)
+
+    # P0 fix: L2-normalize indexer queries and keys so the top-k ranking
+    # is magnitude-invariant (cosine-style scoring, as specified in the
+    # DeepSeek-V4 paper Eq. 15). Without normalization, a high-norm
+    # indexer query dominates the top-k ranking purely by magnitude
+    # rather than by semantic relevance, making the sparse selection
+    # sensitive to upstream projection scaling. The historical scale
+    # ``DI ** -0.5`` partially mitigates this but does not eliminate it;
+    # explicit normalization is the standard fix. Set ``normalize_qk=False``
+    # to restore the un-normalized behaviour (e.g. for ablation).
+    if normalize_qk:
+        q_idx = F.normalize(q_idx, dim=-1)
+        k_idx = F.normalize(k_idx, dim=-1)
 
     # Vectorized batched scoring (no per-batch loop).
     # head-wise similarities [B, HI, T, n_blocks]
@@ -234,6 +333,21 @@ def csa_lightning_indexer(
         logits = torch.einsum('b h t n, b t h -> b t n', score, w_idx)  # [B, T, n_blocks]
     if causal_block_mask is not None:
         logits = logits.masked_fill(~causal_block_mask, float('-inf'))
+    # P0 topk=0 guard: return shape-[B, T, 0] indices directly so the
+    # function is self-contained (does not rely on ``naive_csa`` to guard
+    # the ``scores.amax(-1)`` call). ``torch.topk(logits, 0, ...)`` would
+    # itself succeed (returning an empty tensor), but the explicit branch
+    # documents the contract and skips the ``min(topk, n_blocks)``
+    # computation that would otherwise produce a misleading ``S=0`` value.
+    if topk == 0:
+        idx = q_idx.new_zeros(B_, T, 0, dtype=torch.long)
+        if return_soft_weights:
+            all_masked = logits.isinf().all(dim=-1, keepdim=True)
+            safe_logits = logits.masked_fill(all_masked, 0.0)
+            soft_weights = torch.softmax(safe_logits, dim=-1)
+            soft_weights = soft_weights.masked_fill(all_masked, 0.0)
+            return idx, soft_weights
+        return idx
     S = min(topk, n_blocks)
     values, idx = torch.topk(logits, S, dim=-1)                        # [B, T, S]
     idx = idx.masked_fill(torch.isinf(values), -1)
@@ -289,6 +403,8 @@ def naive_csa(
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
     use_ste: bool = True,
+    ste_mode: str = 'topk_columns',
+    normalize_qk: bool = False,
 ) -> torch.Tensor:
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -421,7 +537,9 @@ def naive_csa(
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
                                     scale=c_I ** -0.5,
                                     causal_block_mask=cbm,
-                                    return_soft_weights=use_ste)     # [B, T, topk]
+                                    return_soft_weights=use_ste,
+                                    ste_mode=ste_mode,
+                                    normalize_qk=normalize_qk)     # [B, T, topk]
     # P0-4 fix: when ``use_ste`` is True (the default), the indexer also
     # returns a differentiable ``soft_weights`` tensor of shape
     # ``[B, T, n_blocks]`` for the straight-through estimator. We keep

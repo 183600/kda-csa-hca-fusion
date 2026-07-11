@@ -34,6 +34,7 @@ import os
 import statistics
 import sys
 import time
+import warnings
 
 import torch
 import torch.nn as nn
@@ -43,6 +44,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device, sanitize_for_json
 from ops_kda import naive_recurrent_kda
+
+# P0 fix: emit a one-shot warning at import time so notebook / REPL
+# users do not silently misread the decoding results as a fair
+# three-way comparison. The README's "Fairness notes" #4 acknowledges
+# this gap, but a code-level warning is more visible to a user who
+# skips the README and goes straight to ``python run_decoding.py``.
+# The warning is emitted once per process (Python's default warning
+# filter deduplicates by (message, category, module, lineno)).
+warnings.warn(
+    "run_decoding.py: only softmax attention and KDA are benchmarked "
+    "here. CSA and HCA do NOT have an incremental KV-block cache "
+    "implemented in this repository, so their decoding latency is not "
+    "measured. Do NOT interpret the softmax-vs-KDA numbers as a "
+    "three-way comparison. See README 'Fairness notes' #4 for the "
+    "acknowledged scope gap and the planned incremental-cache roadmap.",
+    stacklevel=2,
+)
 
 
 def _clear_cache(device):

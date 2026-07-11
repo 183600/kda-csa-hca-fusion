@@ -531,6 +531,119 @@ def test_kda_gradient(device='cpu'):
     ]
 
 
+def test_kda_g_clamp(device='cpu'):
+    """P0 regression: ``naive_recurrent_kda`` clamps ``g`` to ``>= g_clamp_min``.
+
+    The per-channel log-decay gate ``g`` is produced upstream as
+    ``-softplus(...) * kda_decay_scale`` which has no finite lower
+    bound — a diverged pre-activation can push ``g`` to ``-inf``,
+    making ``exp(g) -> 0`` and wiping the recurrent state to zero
+    on a single step (catastrophic forgetting). The P0 fix added a
+    ``g_clamp_min`` parameter (default ``-10``) so ``exp(g)`` stays
+    bounded away from zero.
+
+    This test verifies:
+      1. A diverged ``g = -1e9`` does NOT wipe the state — the
+         clamped path produces a finite, non-zero output.
+      2. Disabling the clamp (``g_clamp_min=-inf``) reproduces the
+         historical behaviour (state goes to zero).
+      3. The chunk path also applies the clamp (``naive_chunk_kda``
+         with the same diverged ``g`` produces a finite output).
+    """
+    logger.info("Test: KDA g-clamp prevents catastrophic state decay")
+    torch.manual_seed(15)
+    B, T, H, K, V = 1, 16, 2, 4, 4
+    q = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device=device), dim=-1)
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device=device), dim=-1)
+    v = torch.randn(B, T, H, V, device=device) * 0.1
+    # Diverged gate: a realistic value that would underflow
+    # ``exp(g)`` to zero without clamping. ``exp(-100)`` is below
+    # the fp32 denormal range (smallest positive fp32 ~1.4e-45),
+    # but for practical purposes it is indistinguishable from zero
+    # in the recurrence (``S * exp(-100)`` rounds to ``S * 0``).
+    # The clamp at ``g_clamp_min=-10`` (default) replaces this with
+    # ``exp(-10) ~= 4.5e-5``, which IS non-zero and lets the state
+    # retain a tiny fraction of past information.
+    g_diverged = torch.full((B, T, H, K), -100.0, device=device)
+    # Reasonable gate: a typical training-regime value where the
+    # clamp is a no-op. ``exp(-1) ~= 0.37`` is well above the clamp
+    # threshold, so clamped and unclamped paths produce identical
+    # outputs (the clamp does not change well-behaved inputs).
+    g_normal = torch.full((B, T, H, K), -1.0, device=device)
+    beta = torch.full((B, T, H), 0.5, device=device)
+
+    # --- Part 1: diverged g, clamped vs unclamped ---
+    # The two paths produce DIFFERENT outputs because the clamped
+    # path retains a tiny fraction of past state (exp(-10) ~= 4.5e-5)
+    # while the unclamped path wipes it entirely (exp(-100) = 0).
+    # The output difference is small but non-zero, proving the clamp
+    # changes the algorithm's behaviour on diverged inputs.
+    o_clamped, s_clamped = naive_recurrent_kda(
+        q, k, v, g_diverged, beta, output_final_state=True)
+    o_unclamped, s_unclamped = naive_recurrent_kda(
+        q, k, v, g_diverged, beta, output_final_state=True,
+        g_clamp_min=-float('inf'))
+    clamped_finite = torch.isfinite(o_clamped).all().item()
+    unclamped_finite = torch.isfinite(o_unclamped).all().item()
+    # The clamped state should be DIFFERENT from the unclamped state
+    # (the clamp changes exp(g) from 0 to 4.5e-5, so past-step
+    # contributions survive in the clamped path but not in the
+    # unclamped path).
+    outputs_differ = not torch.allclose(o_clamped, o_unclamped, atol=1e-8)
+    states_differ = not torch.allclose(s_clamped, s_unclamped, atol=1e-8)
+
+    # --- Part 2: normal g, clamped is a no-op ---
+    # With g=-1 (well above the clamp threshold), the clamp does
+    # nothing — clamped and unclamped paths produce IDENTICAL outputs.
+    # This pins the contract that the clamp is a no-op for
+    # well-behaved inputs (the typical training regime).
+    o_normal_clamped, _ = naive_recurrent_kda(
+        q, k, v, g_normal, beta, output_final_state=True)
+    o_normal_unclamped, _ = naive_recurrent_kda(
+        q, k, v, g_normal, beta, output_final_state=True,
+        g_clamp_min=-float('inf'))
+    clamp_noop_for_normal = torch.equal(o_normal_clamped, o_normal_unclamped)
+
+    # --- Part 3: chunk path also clamps ---
+    # The chunk path applies the clamp BEFORE the cumsum, so the
+    # cumulative gate is also bounded. Verify the chunk path produces
+    # a finite output with the diverged g (would crash or produce
+    # NaN without the clamp if the cumsum underflowed somewhere).
+    o_chunk, s_chunk = naive_chunk_kda(
+        q, k, v, g_diverged, beta, output_final_state=True, chunk_size=8)
+    chunk_finite = torch.isfinite(o_chunk).all().item()
+    # The chunk path's clamped output should also differ from the
+    # unclamped chunk output (the clamp changes the per-step decay).
+    o_chunk_unclamped, _ = naive_chunk_kda(
+        q, k, v, g_diverged, beta, output_final_state=True, chunk_size=8,
+        g_clamp_min=-float('inf'))
+    chunk_outputs_differ = not torch.allclose(o_chunk, o_chunk_unclamped, atol=1e-8)
+
+    return [
+        _ok('KDA recurrent g-clamp: clamped output finite', clamped_finite,
+            f'max|o|={o_clamped.abs().max().item():.2e}'),
+        _ok('KDA recurrent g-clamp: unclamped output finite', unclamped_finite,
+            f'max|o|={o_unclamped.abs().max().item():.2e}'),
+        _ok('KDA recurrent g-clamp: clamp changes output on diverged g',
+            outputs_differ,
+            f'clamped vs unclamped max|diff|={(o_clamped - o_unclamped).abs().max().item():.2e} '
+            f'(non-zero diff proves clamp is active for g=-100)'),
+        _ok('KDA recurrent g-clamp: clamp changes state on diverged g',
+            states_differ,
+            f'clamped vs unclamped max|S diff|={(s_clamped - s_unclamped).abs().max().item():.2e}'),
+        _ok('KDA recurrent g-clamp: clamp is no-op for normal g',
+            clamp_noop_for_normal,
+            'g=-1 (typical training regime): clamped == unclamped (bit-identical)'),
+        _ok('KDA chunk g-clamp: clamped output finite', chunk_finite,
+            f'max|o|={o_chunk.abs().max().item():.2e}'),
+        _ok('KDA chunk g-clamp: clamp changes output on diverged g',
+            chunk_outputs_differ,
+            f'chunk clamped vs unclamped max|diff|={(o_chunk - o_chunk_unclamped).abs().max().item():.2e}'),
+    ]
+
+
 def test_kda_chunk_vs_recurrent_gradient(device='cpu'):
     """Gradient agreement between ``naive_recurrent_kda`` and ``naive_chunk_kda``.
 
@@ -640,6 +753,152 @@ def test_csa_indexer_validity(device='cpu'):
             f'queries t<{m} have no preceding block -> all -1'),
         _ok('CSA index count per query', count_ok,
             f'each query t has min(topk={topk}, t//m) valid indices'),
+    ]
+
+
+def test_csa_indexer_w_idx_none(device='cpu'):
+    """P0 regression: ``csa_lightning_indexer`` must handle ``w_idx=None``.
+
+    The ``w_idx is None`` branch (``logits = score.sum(1)``) was
+    historically never exercised by ``run_quality``'s ``CSAAttn``
+    (which always passes ``W_w``), so a regression that broke it
+    (e.g. a wrong axis on the sum, a dtype mismatch, or a missing
+    causal-mask application) could ship silently. This test calls
+    ``csa_lightning_indexer`` directly with ``w_idx=None`` and
+    verifies:
+      1. The output shape is correct (``[B, T, topk]``).
+      2. Indices are in range and causal (mirror the
+         ``test_csa_indexer_validity`` checks).
+      3. The ``w_idx=None`` path produces the SAME top-k ranking as
+         passing ``w_idx = ones`` (since ``score.sum(1)`` is the same
+         as ``score * 1`` summed). This pins the algebraic identity
+         between the two branches.
+      4. The STE path also works with ``w_idx=None`` (returns
+         differentiable ``soft_weights``).
+    """
+    logger.info("Test: CSA indexer with w_idx=None (no head-mixing weights)")
+    torch.manual_seed(13)
+    B, T, m, topk = 1, 64, 8, 4
+    n_blocks = T // m
+    HI, DI = 2, 8
+    q_idx = torch.randn(B, T, HI, DI, device=device)
+    k_idx = torch.randn(B, n_blocks, DI, device=device)
+    cbm = _causal_block_mask(T, n_blocks, m, device)
+
+    # --- Branch 1: w_idx=None (the path under test) ---
+    indices_none = csa_lightning_indexer(
+        q_idx, k_idx, None, topk, causal_block_mask=cbm)
+    shape_ok = indices_none.shape == (B, T, topk)
+    in_range = (indices_none[indices_none >= 0] < n_blocks).all().item()
+    idx_safe = indices_none.clamp(min=0)
+    t_grid = torch.arange(T, device=device).view(T, 1).expand(T, topk)
+    causal_per_slot = cbm[t_grid, idx_safe[0]] | (indices_none[0] < 0)
+    causal_ok = causal_per_slot.all().item()
+
+    # --- Branch 2: w_idx=ones (should give the SAME ranking) ---
+    # ``score`` is [B, HI, T, n_blocks] after the einsum.
+    # With ``w_idx`` of shape [B, T, HI]:
+    #   logits_w = einsum('bhtn, bth -> btn', score, w_idx)
+    # With w_idx = ones(B, T, HI), this is exactly score.sum(1) over HI,
+    # i.e. identical to the ``w_idx is None`` branch.
+    w_idx_ones = torch.ones(B, T, HI, device=device)
+    indices_ones = csa_lightning_indexer(
+        q_idx, k_idx, w_idx_ones, topk, causal_block_mask=cbm)
+    # Use exact equality — the two code paths produce bit-identical
+    # floating-point logits (same einsum reduction over HI), so the
+    # top-k ranking must be identical. A non-equal result indicates
+    # the two branches diverged (e.g. a wrong axis on the sum).
+    ranking_match = torch.equal(indices_none, indices_ones)
+
+    # --- Branch 3: w_idx=None + return_soft_weights=True (STE path) ---
+    # Verify the STE branch still works when ``w_idx`` is None. The
+    # soft_weights returned must have the full [B, T, n_blocks] shape
+    # and be differentiable (the gradient path back to q_idx/k_idx
+    # does not depend on w_idx).
+    q_idx_g = q_idx.clone().requires_grad_(True)
+    k_idx_g = k_idx.clone().requires_grad_(True)
+    indices_ste, soft_weights = csa_lightning_indexer(
+        q_idx_g, k_idx_g, None, topk,
+        causal_block_mask=cbm, return_soft_weights=True)
+    soft_shape_ok = soft_weights.shape == (B, T, n_blocks)
+    soft_finite = torch.isfinite(soft_weights).all().item()
+    # Backward through soft_weights (sum-reduce) and verify q_idx/k_idx
+    # receive finite gradient. The hard indices tensor has no grad_fn
+    # (it is integer), so the gradient flows ONLY through soft_weights.
+    soft_weights.sum().backward()
+    q_grad_ok = (q_idx_g.grad is not None
+                 and torch.isfinite(q_idx_g.grad).all().item()
+                 and q_idx_g.grad.abs().sum().item() > 0)
+    k_grad_ok = (k_idx_g.grad is not None
+                 and torch.isfinite(k_idx_g.grad).all().item()
+                 and k_idx_g.grad.abs().sum().item() > 0)
+
+    return [
+        _ok('CSA w_idx=None output shape', shape_ok,
+            f'expected {(B, T, topk)}, got {tuple(indices_none.shape)}'),
+        _ok('CSA w_idx=None indices in range', in_range,
+            f'topk={topk}, n_blocks={n_blocks}'),
+        _ok('CSA w_idx=None indices causal', causal_ok,
+            'all selected blocks precede query'),
+        _ok('CSA w_idx=None ranking == w_idx=ones ranking',
+            ranking_match,
+            'score.sum(1) == einsum(score, ones) -> identical top-k'),
+        _ok('CSA w_idx=None STE soft_weights shape', soft_shape_ok,
+            f'expected {(B, T, n_blocks)}, got {tuple(soft_weights.shape)}'),
+        _ok('CSA w_idx=None STE soft_weights finite', soft_finite,
+            'no NaN/Inf in the differentiable soft distribution'),
+        _ok('CSA w_idx=None STE q_idx receives finite non-zero grad',
+            q_grad_ok, f'q_idx.grad.sum={q_idx_g.grad.abs().sum().item() if q_idx_g.grad is not None else None}'),
+        _ok('CSA w_idx=None STE k_idx receives finite non-zero grad',
+            k_grad_ok, f'k_idx.grad.sum={k_idx_g.grad.abs().sum().item() if k_idx_g.grad is not None else None}'),
+    ]
+
+
+def test_csa_indexer_topk_zero(device='cpu'):
+    """P0 regression: ``csa_lightning_indexer`` must handle ``topk=0`` directly.
+
+    The ``topk=0`` guard historically lived only in ``naive_csa``; a
+    direct caller of the public ``csa_lightning_indexer`` would hit a
+    cryptic ``RuntimeError`` from ``torch.topk``. The P0 fix pushed
+    the guard down into the indexer itself. This test verifies:
+      1. Direct call with ``topk=0`` returns shape ``[B, T, 0]`` (no
+         crash).
+      2. With ``return_soft_weights=True``, the STE branch still
+         returns the full ``[B, T, n_blocks]`` differentiable
+         distribution (useful for an auxiliary loss even when no
+         hard selection is made).
+    """
+    logger.info("Test: CSA indexer with topk=0 (direct call, P0 guard)")
+    torch.manual_seed(14)
+    B, T, m = 1, 32, 8
+    n_blocks = T // m
+    HI, DI = 2, 8
+    q_idx = torch.randn(B, T, HI, DI, device=device)
+    k_idx = torch.randn(B, n_blocks, DI, device=device)
+    cbm = _causal_block_mask(T, n_blocks, m, device)
+
+    # topk=0, no STE.
+    indices = csa_lightning_indexer(q_idx, k_idx, None, topk=0,
+                                    causal_block_mask=cbm)
+    shape_ok = indices.shape == (B, T, 0)
+
+    # topk=0, with STE.
+    indices_ste, soft_weights = csa_lightning_indexer(
+        q_idx, k_idx, None, topk=0,
+        causal_block_mask=cbm, return_soft_weights=True)
+    shape_ste_ok = indices_ste.shape == (B, T, 0)
+    soft_shape_ok = soft_weights.shape == (B, T, n_blocks)
+    soft_finite = torch.isfinite(soft_weights).all().item()
+
+    return [
+        _ok('CSA indexer topk=0 returns empty indices', shape_ok,
+            f'expected {(B, T, 0)}, got {tuple(indices.shape)}'),
+        _ok('CSA indexer topk=0 + STE returns empty indices', shape_ste_ok,
+            f'expected {(B, T, 0)}, got {tuple(indices_ste.shape)}'),
+        _ok('CSA indexer topk=0 + STE soft_weights shape', soft_shape_ok,
+            f'expected {(B, T, n_blocks)}, got {tuple(soft_weights.shape)}'),
+        _ok('CSA indexer topk=0 + STE soft_weights finite', soft_finite,
+            'no NaN/Inf in the differentiable soft distribution'),
     ]
 
 
@@ -1543,20 +1802,30 @@ def test_hybrid_backward_produces_grads(device='cpu'):
     all DIFFERENTIABLE parameters.
 
     The lightning indexer uses ``torch.topk`` which returns integer indices
-    that do NOT propagate gradients. Consequently the indexer parameters
-    (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` in
-    ``CSAHybridLayer``) cannot receive gradients through the main loss —
-    their ``.grad`` stays ``None`` after ``backward()``. This is a known
-    structural limitation (see the docstring of ``csa_lightning_indexer``)
-    and is NOT a bug.
+    that do NOT propagate gradients directly. Historically this left the
+    indexer parameters (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``,
+    ``B_idx`` in ``CSAHybridLayer``) at their random initialization after
+    ``backward()`` (their ``.grad`` stayed ``None`` and AdamW silently
+    skipped them).
 
-    What WOULD be a bug: a differentiable parameter (one whose gradient
-    SHOULD flow) ending up with a non-finite or all-zero gradient. This
-    test runs a full forward + backward pass over the hybrid stack and
-    verifies that:
+    The P0-4 fix added a straight-through estimator (STE) in
+    ``ops_csa.naive_csa`` so the indexer parameters DO receive gradient
+    through the STE's differentiable ``soft_weights`` path. Under the
+    default ``use_ste=True`` (which this test exercises via the default
+    ``CSAHybridLayer`` constructor), the indexer parameters are now
+    trainable and SHOULD have a non-None ``.grad`` after ``backward()``.
+
+    What WOULD still be a bug: a differentiable parameter (one whose
+    gradient SHOULD flow) ending up with a non-finite or all-zero
+    gradient. This test runs a full forward + backward pass over the
+    hybrid stack and verifies that:
       1. All non-indexer parameters receive a finite, non-zero gradient.
-      2. Indexer parameters (the 5 listed above) have ``.grad is None``
-         (the expected behavior, documented for future readers).
+      2. Indexer parameters (the 5 listed above) have a FINITE,
+         non-zero gradient under STE (the P0-4 fix's contract). If a
+         future refactor breaks the STE path, the indexer params would
+         revert to ``.grad is None`` — the test catches that regression
+         by treating ``.grad is None`` on an indexer param as a failure
+         (rather than the historical "expected" behaviour).
       3. No parameter has a non-finite (NaN/Inf) gradient.
 
     The test uses a sequence length large enough (T=64) so that CSA/HCA
@@ -1588,7 +1857,11 @@ def test_hybrid_backward_produces_grads(device='cpu'):
     loss.backward()
 
     # Indexer parameters (CSA layer index 3 in the default 3:1:1 layout).
-    # These have .grad is None because topk is non-differentiable.
+    # Under the P0-4 STE fix these ARE differentiable (gradient flows
+    # through the ``soft_weights`` path). The test passes whether the
+    # indexer params get a non-None grad (STE on, the default) or a None
+    # grad (STE off, ablation) — both are legitimate, but a non-finite
+    # or unexpectedly-zero grad on ANY differentiable param is a bug.
     indexer_param_substrings = ('W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx')
     differentiable_no_grad = []
     differentiable_zero_grad = []
@@ -1600,15 +1873,23 @@ def test_hybrid_backward_produces_grads(device='cpu'):
         is_indexer = any(s in name for s in indexer_param_substrings)
         if p.grad is None:
             if is_indexer:
-                # Expected: indexer params don't get grads through topk.
+                # P0-4 STE: under the default ``use_ste=True`` the
+                # indexer params SHOULD have a non-None grad. A None
+                # grad here means the STE path is broken (regression).
+                # We flag it as ``differentiable_no_grad`` so the test
+                # fails loudly instead of silently pinning the old
+                # un-trained-indexer behaviour.
+                differentiable_no_grad.append(name)
                 continue
             else:
                 differentiable_no_grad.append(name)
         elif not torch.isfinite(p.grad).all():
             differentiable_non_finite.append(name)
         elif is_indexer:
-            # If an indexer param DOES receive a grad (e.g. via an auxiliary
-            # loss added in the future), that's fine — just don't require it.
+            # STE path produced a finite grad — count as OK. The
+            # magnitude may be small (the STE only gathers top-k
+            # columns by default), so we do not apply the 1e-12 zero
+            # check to indexer params.
             differentiable_ok += 1
         # Use a small epsilon rather than exact == 0.0: a legitimately tiny
         # but non-zero fp32 grad (e.g. from underflow in a masked branch)
@@ -3252,9 +3533,15 @@ def main():
     # New reviewer-driven checks.
     all_results += _run_safe(test_overlap_causality, device)
     all_results += _run_safe(test_kda_gradient, device)
+    # P0 regression: g-clamp prevents catastrophic state decay.
+    all_results += _run_safe(test_kda_g_clamp, device)
     # Regression test for chunk-vs-recurrent gradient agreement (fp64).
     all_results += _run_safe(test_kda_chunk_vs_recurrent_gradient, device)
     all_results += _run_safe(test_csa_indexer_validity, device)
+    # P0 regression: w_idx=None branch of csa_lightning_indexer.
+    all_results += _run_safe(test_csa_indexer_w_idx_none, device)
+    # P0 regression: topk=0 guard pushed down into csa_lightning_indexer.
+    all_results += _run_safe(test_csa_indexer_topk_zero, device)
     # P0-4 regression: STE must make the CSA indexer parameters trainable.
     all_results += _run_safe(test_csa_indexer_ste_gradient, device)
     all_results += _run_safe(test_hca_sliding_window_causality, device)

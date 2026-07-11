@@ -31,6 +31,8 @@ def naive_recurrent_kda(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    *,
+    g_clamp_min: float = -10.0,
 ):
     """Naive step-by-step recurrent KDA (reference, O(T) sequential).
 
@@ -43,6 +45,27 @@ def naive_recurrent_kda(
         scale: defaults to ``1/sqrt(K)``
         initial_state: ``[B, HV, K, V]``
         output_final_state: return the final recurrent state.
+        g_clamp_min: lower bound for the log-decay gate ``g``. ``g`` is
+            produced upstream as ``-softplus(...) * kda_decay_scale`` which
+            has no finite lower bound: in pathological training regimes
+            (very large pre-activation) ``g`` can diverge to ``-inf``,
+            making ``exp(g) -> 0`` and wiping the recurrent state to zero
+            (catastrophic forgetting of all long-term memory). We clamp
+            ``g`` to ``[g_clamp_min, +inf)`` (default ``-10``) so
+            ``exp(g) >= exp(-10) ~= 4.5e-5`` — small enough to allow
+            aggressive forgetting but bounded away from zero. Set to
+            ``-float('inf')`` to disable. The clamp is applied AFTER the
+            dtype promotion below so it always runs in ``compute_dtype``.
+
+    .. note::
+
+        This is a **Python-loop reference implementation**. The per-step
+        loop is dominated by interpreter overhead (typically ~30ms at
+        T=2k on CPU), NOT by the underlying math. These numbers are
+        suitable for correctness / relative-trend comparisons only; do
+        NOT use them as production-latency estimates. For representative
+        latency, wrap with ``torch.compile`` or use the FLA Triton kernel.
+        A ``T > 8192`` performance warning is emitted via ``warnings``.
     """
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
@@ -88,8 +111,40 @@ def naive_recurrent_kda(
     # correctness tests).
     compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
     q, k, v, g, beta = map(lambda x: x.to(compute_dtype), [q, k, v, g, beta])
+    # P0 numerical-stability fix: clamp ``g`` from below. ``g`` is produced
+    # upstream as ``-softplus(...) * kda_decay_scale`` which has no finite
+    # lower bound — in pathological training regimes (very large
+    # pre-activation, NaN/Inf in the upstream linear, or simply an
+    # aggressive learning rate) ``g`` can diverge to ``-inf``, making
+    # ``exp(g) -> 0`` and wiping the recurrent state to zero on a single
+    # step (catastrophic forgetting of ALL long-term memory). With
+    # ``g_clamp_min=-10`` (the default), ``exp(g) >= 4.5e-5`` — small
+    # enough to allow aggressive forgetting of stale entries but bounded
+    # away from zero so a single bad step cannot silently erase the entire
+    # state. The clamp is a no-op for well-behaved inputs (typical
+    # ``g`` values are in ``[-1, 0]``). Set ``g_clamp_min=-inf`` to
+    # disable (e.g. for fp64 gradient checks that need exact maths).
+    if g_clamp_min > -float('inf'):
+        g = g.clamp(min=float(g_clamp_min))
     q = q.repeat_interleave(G, dim=2) * scale   # [B, T, HV, K]
     k = k.repeat_interleave(G, dim=2)           # [B, T, HV, K]
+    # P1 performance warning: this Python for-loop is the dominant cost
+    # for moderate T (interpreter overhead, not the math). Emit a one-shot
+    # warning for very long sequences so users do not silently wait on a
+    # 30+ second Python loop thinking it is algorithmic work. The threshold
+    # 8192 is chosen so the default benchmark sweep (T <= 2048) stays
+    # silent; production-latency comparisons should use the FLA Triton
+    # kernel or wrap this function with ``torch.compile``.
+    if T > 8192:
+        import warnings as _warnings
+        _warnings.warn(
+            f"naive_recurrent_kda: T={T} > 8192; the Python for-loop is "
+            f"interpreter-overhead-bound (typical cost ~15-30ms per 1k "
+            f"steps on CPU). For production latency, use the FLA Triton "
+            f"kernel or wrap with torch.compile. This warning is emitted "
+            f"once per process per call site.",
+            stacklevel=2,
+        )
 
     S = q.new_zeros(B, HV, K, V)
     if initial_state is not None:
@@ -154,8 +209,17 @@ def naive_chunk_kda(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
+    *,
+    g_clamp_min: float = -10.0,
 ):
-    """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error."""
+    """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error.
+
+    The ``g_clamp_min`` parameter mirrors :func:`naive_recurrent_kda` — see
+    that function's docstring for the rationale. The chunk path applies the
+    clamp BEFORE the cumulative-sum (``g.cumsum(-2)``) so the bound on the
+    per-step gate also bounds the cumulative gate that appears in the
+    chunk-internal Neumann series.
+    """
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
@@ -251,6 +315,14 @@ def naive_chunk_kda(
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     q = q.repeat_interleave(G, dim=1) * scale
     k = k.repeat_interleave(G, dim=1)
+    # P0 numerical-stability fix: clamp per-step ``g`` BEFORE the cumsum.
+    # See naive_recurrent_kda's docstring for the rationale — without the
+    # clamp, a single diverged ``g`` value can wipe the chunk-internal
+    # state via ``exp(cumsum) -> 0``. Clamping per-step (before cumsum)
+    # is the right place: it bounds the per-step decay factor AND keeps
+    # the cumulative sum bounded (worst case ``cumsum(g) >= -10 * BT``).
+    if g_clamp_min > -float('inf'):
+        g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)

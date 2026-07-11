@@ -198,7 +198,23 @@ def bench_kda_chunk(B, T, H, K, V, device):
     # padding end-to-end and just time it directly.
     def fn():
         with torch.no_grad():
-            return naive_chunk_kda(q, k, v, g, beta, output_final_state=True, chunk_size=BT)
+            o, s = naive_chunk_kda(q, k, v, g, beta, output_final_state=True, chunk_size=BT)
+            # P1 fix: assert the output sequence dimension matches T. The
+            # previous version had a slicing bug (``o[:T]`` sliced dim=0
+            # batch instead of dim=1 sequence) that was fixed by letting
+            # ``naive_chunk_kda`` handle padding end-to-end. This assert
+            # pins the fix so a future regression (e.g. accidentally
+            # reintroducing the wrong slice, or a chunk-size change that
+            # breaks the padding contract) is caught immediately rather
+            # than silently corrupting the benchmark numbers.
+            assert o.shape[1] == T, (
+                f"naive_chunk_kda output shape {tuple(o.shape)} does not "
+                f"match input T={T} on dim=1 (sequence). The chunk path "
+                f"is supposed to right-pad T up to a multiple of "
+                f"chunk_size={BT} and trim back to original_T internally; "
+                f"a shape mismatch indicates a regression in the trim "
+                f"logic.")
+            return o, s
     return fn
 
 
