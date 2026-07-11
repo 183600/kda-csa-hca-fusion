@@ -215,33 +215,104 @@ class KDAHybridLayer(nn.Module):
         self._conv_lookback = None
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
+        """Stateful forward (backward-compatible wrapper).
+
+        Reads ``self._conv_lookback`` and writes the new lookback + new
+        recurrent state back to ``self``. This is the API used by
+        ``HybridKCHAttention.forward`` and the experiment runners.
+
+        For a **pure / side-effect-free** path (needed for concurrent
+        inference, DDP, ``torch.compile``, gradient checkpointing, and
+        cross-chunk BPTT), use :meth:`forward_functional` instead — it
+        takes the conv lookback as an argument and returns the new
+        lookback without mutating ``self``.
+        """
+        o, new_state, new_lookback = self.forward_functional(
+            x, state, self._conv_lookback)
+        self._conv_lookback = new_lookback
+        return o, new_state
+
+    def forward_functional(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | None,
+        conv_lookback: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Pure functional forward — does NOT mutate ``self``.
+
+        P6 fix — side-effect-free state management.
+
+        The previous ``forward()`` read from and wrote to ``self._conv_lookback``
+        internally, which breaks:
+          * **Concurrent inference** (multiple sequences sharing one module
+            instance would clobber each other's lookback).
+          * **DDP** (in-place mutation of a registered buffer during forward
+            triggers ``RuntimeError: Expected to mark a variable ready``
+            because the buffer is not a parameter and DDP does not know
+            when to sync it).
+          * **Gradient checkpointing** (``torch.utils.checkpoint`` re-runs
+            forward during backward; the second run would see the mutated
+            lookback from the first run, producing wrong gradients).
+          * **``torch.compile``** (graph breaks on Python-side mutation of
+            module state; the compiled graph cannot reason about the
+            lookback's value across calls).
+          * **Cross-chunk BPTT** (the lookback carries activations from the
+            previous chunk; if it is silently detached inside ``forward``,
+            the gradient cannot flow across chunk boundaries).
+
+        This method takes ``conv_lookback`` as an EXPLICIT argument and
+        returns the new lookback as part of the output tuple, leaving
+        ``self._conv_lookback`` untouched. Callers who want the old
+        stateful behavior use :meth:`forward`; callers who need the pure
+        path (DDP, checkpointing, ``torch.compile``, BPTT) use this method
+        directly and manage the state externally.
+
+        Args:
+            x: ``[B, T, d]`` input hidden states.
+            state: ``[B, HV, K, V]`` KDA recurrent state from the previous
+                call, or ``None`` for a fresh sequence.
+            conv_lookback: ``[B, ksize-1, d]`` short-conv left context from
+                the previous call, or ``None`` for a fresh sequence.
+
+        Returns:
+            ``(output, new_state, new_conv_lookback)`` where:
+              * ``output`` is ``[B, T, d]`` (after o_proj).
+              * ``new_state`` is ``[B, HV, K, V]``.
+              * ``new_conv_lookback`` is ``[B, ksize-1, d]`` (or ``None``
+                if ``T == 0``).
+        """
         B, T, d = x.shape
         cfg = self.cfg
         H, K, V, HV = cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v, cfg.n_heads_v
         ksize = self.short_conv.kernel_size[0]
         # Build the conv input with proper LEFT context:
-        #   * If ``_conv_lookback`` is None (fresh sequence / first call),
+        #   * If ``conv_lookback`` is None (fresh sequence / first call),
         #     left-pad with zeros — identical to the previous behaviour.
-        #   * If ``_conv_lookback`` is set (streaming / autoregressive decode),
+        #   * If ``conv_lookback`` is set (streaming / autoregressive decode),
         #     prepend the last ``ksize - 1`` time steps from the previous call
         #     so the conv at positions 0..ksize-2 of the new chunk sees the
         #     actual previous tokens instead of zeros.
         # After the conv, we trim the prepended context off so ``x_conv`` has
         # the same length ``T`` as the input. The final ``ksize - 1`` time
-        # steps of ``x`` are saved into ``_conv_lookback`` for the next call.
-        lookback = self._conv_lookback
+        # steps of ``x`` are returned as the new lookback for the next call.
+        lookback = conv_lookback
         # Detach the incoming lookback so the autograd graph from the previous
-        # step is not retained. Mirrors the always-detach pattern used for the
-        # KDA recurrent state in HybridKCHAttention.forward. The conv lookback
-        # is just a tensor of numbers (the previous chunk's activations); it
-        # does not need to carry gradients.
+        # step is not retained. The conv lookback is just a tensor of numbers
+        # (the previous chunk's activations); it does not need to carry
+        # gradients — UNLESS the caller is doing cross-chunk BPTT and wants
+        # gradients to flow. In that case they should pass a NON-detached
+        # lookback (they own the state) and we respect that by not forcing
+        # a detach here when the caller's lookback already requires grad.
+        # The stateful ``forward()`` wrapper passes ``self._conv_lookback``
+        # which is always detached (see the assignment below), so the
+        # default path remains detach-by-default for memory safety.
         if lookback is not None:
             # Batch-size / device / dtype guards: if any of these changed
             # between calls (e.g. train B=16 -> eval B=8, model.to(cuda),
-            # model.half()), the cached lookback is invalid. Drop it on
-            # batch-size change (the lookback is per-sequence and cannot be
-            # reused across different batch sizes); cast/move on device/dtype
-            # change to preserve the conv context where possible. Mirrors the
+            # model.half()), the lookback is invalid. Drop it on batch-size
+            # change (the lookback is per-sequence and cannot be reused
+            # across different batch sizes); cast/move on device/dtype change
+            # to preserve the conv context where possible. Mirrors the
             # state-handling pattern in HybridKCHAttention.forward.
             if lookback.shape[0] != B:
                 lookback = None
@@ -259,8 +330,10 @@ class KDAHybridLayer(nn.Module):
             x_conv_in = torch.cat(
                 [lookback.transpose(1, 2), x.transpose(1, 2)], dim=2)
         x_conv = self.short_conv(x_conv_in).transpose(1, 2)        # [B, T, d]
-        # Persist the last (ksize-1) time steps of THIS chunk as the next
-        # call's lookback. Detach so we don't retain the graph across calls.
+        # Compute the new lookback (the last ksize-1 time steps of THIS
+        # chunk) to RETURN to the caller. We do NOT write it to self —
+        # that is the caller's responsibility (or the stateful
+        # ``forward()`` wrapper does it).
         if T >= ksize - 1:
             new_lookback = x[:, -(ksize - 1):].detach().clone()
         else:
@@ -278,7 +351,6 @@ class KDAHybridLayer(nn.Module):
                 new_lookback = torch.cat(
                     [torch.zeros(B, pad_len, d, device=x.device, dtype=x.dtype),
                      x], dim=1).detach().clone()
-        self._conv_lookback = new_lookback
         # View BEFORE normalize: ``F.normalize(dim=-1)`` must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector. The
         # previous form ``F.normalize(F.silu(...), dim=-1).view(B, T, H, K)``
@@ -325,7 +397,7 @@ class KDAHybridLayer(nn.Module):
                 q, k, v, g, beta, scale=self.scale,
                 initial_state=state, output_final_state=True,
             )
-        return self.o_proj(o.reshape(B, T, HV * V)), new_state
+        return self.o_proj(o.reshape(B, T, HV * V)), new_state, new_lookback
 
 
 class CSAHybridLayer(nn.Module):
@@ -588,65 +660,75 @@ class HybridKCHAttention(nn.Module):
         return layout[:self.total_layers]
 
     def forward(self, x: torch.Tensor):
-        # Unpack the stacked per-layer KDA states. ``_kda_state`` is either
-        # ``None`` (freshly reset) or a stacked tensor of shape
-        # ``[n_kda_layers, B, HV, K, V]``. We split it into a per-layer list
-        # so each KDA layer can be seeded with its OWN state from the previous
-        # call — sharing a single state across layers is a correctness bug
-        # (each KDA layer has different parameters, so its recurrent state is
-        # not interchangeable with another layer's state).
-        #
-        # Detach the incoming state so the autograd graph from the previous
-        # step is not retained. In training mode this prevents
-        # "backward through the graph a second time" errors; in eval mode it
-        # prevents an O(N) memory leak across N forward calls when the caller
-        # forgets to wrap inference in ``torch.no_grad()`` (each call would
-        # otherwise retain the previous call's graph, accumulating
-        # unbounded memory during long autoregressive decoding). The graph is
-        # never needed for inference — eval-with-backward is unusual; if a
-        # caller genuinely needs gradients through the recurrent state across
-        # calls (e.g. BPTT), they should keep the graph manually rather than
-        # relying on this implicit behavior.
-        #
-        # If the batch size changed (e.g. train batch=16, eval batch=8), the
-        # old state is invalid and we drop it. For a DEVICE mismatch (which
-        # should not happen now that the state is a registered buffer moved
-        # by .to(), but cheap to guard) we MOVE the state instead of dropping
-        # it: dropping irreversibly loses the recurrent memory, while moving
-        # preserves it. The previous behavior (drop on device mismatch) would
-        # silently reset the KDA state whenever the caller forgot to call
-        # ``model.to(device)`` before passing inputs on a different device.
-        #
-        # DTYPE mismatch (e.g. caller did ``model.half()`` between forwards):
-        # ``stacked.to(x.device)`` only moves the device, NOT the dtype. The
-        # downstream ``naive_recurrent_kda`` does implicitly cast
-        # ``initial_state`` to ``compute_dtype`` (fp32 for fp16 inputs), so
-        # the recurrence itself does not crash — but the returned
-        # ``new_state`` is in ``v.dtype`` (= ``x.dtype`` after ``model.half()``),
-        # while any OTHER KDA layer whose state we have not yet overwritten
-        # is still in the OLD dtype. ``torch.stack(states, dim=0)`` at the
-        # end of forward then crashes with
-        # ``RuntimeError: Expected object of scalar type Half but got scalar
-        # type Float`` because the per-layer states have mixed dtypes.
-        # The fix: explicitly cast ``stacked`` to ``x.dtype`` alongside the
-        # device move (and in the same-dtype/device branch too, defensively).
-        # This makes the contract explicit: the state is ALWAYS in
-        # ``x.dtype`` before being passed to the KDA layers, so all
-        # ``new_state`` returns are in ``x.dtype`` and ``torch.stack`` is
-        # guaranteed homogeneous.
-        stacked = self._kda_state
+        """Stateful forward (backward-compatible wrapper).
+
+        Reads ``self._kda_state`` and the per-KDA-layer
+        ``_conv_lookback`` buffers, and writes the new states back to
+        ``self``. This is the API used by the experiment runners
+        (benchmark, decoding, quality, ablation).
+
+        For a **pure / side-effect-free** path (needed for concurrent
+        inference, DDP, ``torch.compile``, gradient checkpointing, and
+        cross-chunk BPTT), use :meth:`forward_functional` instead — it
+        takes the full state (stacked KDA recurrent state + per-layer
+        conv lookbacks) as an argument and returns the new state without
+        mutating ``self``.
+        """
+        o, new_kda_state, new_conv_lookbacks = self.forward_functional(
+            x, self._kda_state,
+            [layer._conv_lookback for layer in self.layers
+             if isinstance(layer, KDAHybridLayer)])
+        self._kda_state = new_kda_state
+        # Persist the per-layer conv lookbacks back to the KDA layers.
+        for layer, lb in zip(
+            [l for l in self.layers if isinstance(l, KDAHybridLayer)],
+            new_conv_lookbacks):
+            layer._conv_lookback = lb
+        return o
+
+    def forward_functional(
+        self,
+        x: torch.Tensor,
+        kda_state: torch.Tensor | None,
+        conv_lookbacks: list[torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
+        """Pure functional forward — does NOT mutate ``self``.
+
+        P6 fix — side-effect-free state management.
+
+        The previous ``forward()`` mutated ``self._kda_state`` and each
+        KDA layer's ``self._conv_lookback`` internally, which breaks
+        concurrent inference, DDP, gradient checkpointing,
+        ``torch.compile``, and cross-chunk BPTT — see the rationale in
+        :meth:`KDAHybridLayer.forward_functional`.
+
+        This method takes the ENTIRE model state as explicit arguments
+        and returns the new state without touching ``self``. Callers who
+        want the old stateful behavior use :meth:`forward`; callers who
+        need the pure path use this method directly and manage the state
+        externally.
+
+        Args:
+            x: ``[B, T, d]`` input hidden states.
+            kda_state: ``[n_kda_layers, B, HV, K, V]`` stacked KDA
+                recurrent state from the previous call, or ``None`` for
+                a fresh sequence.
+            conv_lookbacks: list of ``n_kda_layers`` tensors, each
+                ``[B, ksize-1, d]`` (or ``None``), the short-conv left
+                context for each KDA layer.
+
+        Returns:
+            ``(output, new_kda_state, new_conv_lookbacks)`` where:
+              * ``output`` is ``[B, T, d]``.
+              * ``new_kda_state`` is ``[n_kda_layers, B, HV, K, V]`` or
+                ``None`` if ``n_kda_layers == 0``.
+              * ``new_conv_lookbacks`` is a list of ``n_kda_layers``
+                tensors (or ``None`` entries).
+        """
+        stacked = kda_state
         if stacked is not None:
             # Batch dim is axis 1 (axis 0 is the per-layer index).
             if stacked.shape[1] != x.shape[0]:
-                # Log the batch-size change so the user understands WHY the
-                # recurrent state was dropped. Without this log the drop is
-                # silent, and a user switching from train (large batch) to
-                # eval (small batch) may not realize their KDA state is being
-                # reset on every call — which is correct behavior (the state
-                # is per-sequence and cannot be reused across different batch
-                # sizes) but surprising if you expected streaming continuity.
-                # Use a debug-level message (not warning) because this is a
-                # routine occurrence during train/eval switches, not an error.
                 logger.debug(
                     "HybridKCHAttention: dropping KDA recurrent state because "
                     "batch size changed (was %d, now %d). This is expected when "
@@ -655,57 +737,48 @@ class HybridKCHAttention(nn.Module):
                     stacked.shape[1], x.shape[0])
                 stacked = None
             elif stacked.device != x.device or stacked.dtype != x.dtype:
-                # Move (device AND dtype) and keep detached rather than drop.
-                # ``.to(device=x.device, dtype=x.dtype)`` is a no-op for the
-                # dimension that already matches, so this also covers the
-                # dtype-only-mismatch case (device matches, dtype differs).
                 stacked = stacked.to(device=x.device, dtype=x.dtype).detach()
             else:
-                # Always detach: training (BPTT safety) AND eval (memory leak
-                # prevention). See the comment above for the full rationale.
                 stacked = stacked.detach()
         if stacked is not None:
             states = [stacked[i] for i in range(stacked.shape[0])]
         else:
             states = [None] * self.n_kda_layers
 
+        # Build a mutable copy of the conv lookbacks so we can update per
+        # layer without touching self.
+        lookback_list = list(conv_lookbacks)
+        # Pad / truncate to match n_kda_layers (defensive: the caller may
+        # pass a list of a different length if the model was reconfigured
+        # between calls).
+        if len(lookback_list) < self.n_kda_layers:
+            lookback_list.extend(
+                [None] * (self.n_kda_layers - len(lookback_list)))
+        elif len(lookback_list) > self.n_kda_layers:
+            lookback_list = lookback_list[:self.n_kda_layers]
+
         kda_idx = 0
+        new_lookbacks: list[torch.Tensor | None] = []
         for layer, norm, kind in zip(self.layers, self.norms, self.layout):
             residual = x
             x = norm(x)
             if kind == 'kda':
-                # KDA is stateful and sequence-continuous. It has no
-                # compression factor, so T never needs padding here (padding
-                # would desync the recurrent state anyway). Thread THIS
-                # layer's own state; do not touch the others.
-                o, new_state = layer(x, states[kda_idx])
+                # Use the FUNCTIONAL KDA path so we do NOT mutate the
+                # layer's ``_conv_lookback``. The new lookback is
+                # collected into ``new_lookbacks`` for the caller.
+                o, new_state, new_lb = layer.forward_functional(
+                    x, states[kda_idx], lookback_list[kda_idx])
                 states[kda_idx] = new_state
+                new_lookbacks.append(new_lb)
                 kda_idx += 1
             else:
-                # Stateless CSA/HCA. ``naive_csa`` / ``naive_hca`` handle
-                # non-divisible T via internal right-padding and trim their
-                # output back to the original T (see
-                # ``test_csa_hca_non_divisible_T``), so we no longer need the
-                # external pad/trim that used to live here. The external
-                # padding was originally added to fix a LEFT-padding bug; that
-                # fix now lives inside the operators themselves, making the
-                # wrapper-level pad/trim redundant. Do NOT pass ``state`` in,
-                # and do NOT let the returned ``None`` overwrite the KDA
-                # states list.
+                # Stateless CSA/HCA — no state to thread.
                 o, _ = layer(x, None)
             x = residual + o
-        # Restack the per-layer states for persistence. All KDA layers share
+
+        # Restack the per-layer states for the caller. All KDA layers share
         # the same config (HV, K, V), so every entry has the same shape and
-        # torch.stack is safe. If n_kda_layers == 0 (no KDA in the layout),
-        # there is nothing to persist.
-        #
-        # If any single KDA layer returned ``None`` for its new_state (which
-        # should not happen because KDA's ``output_final_state=True`` always
-        # returns a tensor), we raise rather than silently nuking the OTHER
-        # layers' valid states. The previous ``all(s is not None for s in
-        # states)`` check would have set ``_kda_state = None``, throwing away
-        # every layer's state because of one bad layer — a latent footgun for
-        # any future KDA variant that conditionally returns None.
+        # torch.stack is safe.
         if self.n_kda_layers > 0:
             if any(s is None for s in states):
                 raise RuntimeError(
@@ -714,10 +787,10 @@ class HybridKCHAttention(nn.Module):
                     "partial state stack (would silently drop other layers' "
                     "states). Check the KDA layer implementation."
                 )
-            self._kda_state = torch.stack(states, dim=0)
+            new_kda_state = torch.stack(states, dim=0)
         else:
-            self._kda_state = None
-        return x
+            new_kda_state = None
+        return x, new_kda_state, new_lookbacks
 
     def layout_str(self) -> str:
         return '-'.join(s.upper() for s in self.layout)

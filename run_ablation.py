@@ -431,7 +431,24 @@ def main():
     # ``ValueError: invalid literal for int()``. ``parse_int_env`` logs a
     # warning and falls back to the default, matching the robustness pattern
     # already used for BENCH_REPEATS / BENCH_LENGTHS in run_benchmark.py.
-    n_seeds = parse_int_env('ABL_SEEDS', 5, min_value=1, logger=logger)
+    # P4 fix — increase the default seed count from 5 to 7 and warn loudly
+    # when the sample size is too small to support structural conclusions.
+    #
+    # The issue identified that the ablation was running with only 3 seeds
+    # (because run_all.py overrides ABL_SEEDS=3 under SKIP_SLOW on CPU),
+    # that most accuracies were near the chance level (0.0625), and that
+    # ALL layouts had significant_bonferroni=False. With n=3 a one-sample
+    # t-test has only 2 degrees of freedom — the Bonferroni-corrected
+    # critical t-value at alpha=0.05/7≈0.0071 is ~12.9, which is essentially
+    # unachievable in practice. The experiment as configured CANNOT reach
+    # significance regardless of the underlying effect size.
+    #
+    # Raising the default to 7 (6 dof) brings the corrected critical value
+    # down to ~4.9, which is achievable for a real effect. We also add an
+    # explicit ``conclusions_valid`` flag to the JSON and a prominent
+    # warning in the log so downstream consumers (figures, reports) do not
+    # draw strong structural conclusions from underpowered experiments.
+    n_seeds = parse_int_env('ABL_SEEDS', 7, min_value=1, logger=logger)
     steps = parse_int_env('ABL_STEPS', 100, min_value=1, logger=logger)
     n_kv_list = _parse_nkv_list('ABL_NKV', '1')
     # Pre-validate n_kv against VOCAB and SEQ_LEN so the user gets a clear
@@ -627,6 +644,43 @@ def main():
     logger.info('  the deeper model needs more steps to converge, so a low 4:1:1')
     logger.info('  score reflects under-training, not necessarily a worse structure.')
     logger.info('  See the per-seed trajectories in the JSON for convergence evidence.')
+
+    # P4 fix — statistical-validity summary. The issue flagged that the
+    # ablation had (a) only 3 seeds, (b) accuracies near chance, and
+    # (c) ALL significant_bonferroni=False. We now compute an explicit
+    # ``conclusions_valid`` flag that downstream figures/reports can check
+    # before drawing structural conclusions, and emit a prominent warning
+    # so the limitation is impossible to miss.
+    n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
+    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
+                        if 'error' not in r), default=0)
+    # A result is "near chance" if mean_acc < 1.5x the chance level.
+    near_chance = [r for r in all_results
+                   if 'error' not in r
+                   and r.get('mean_acc') is not None
+                   and r['mean_acc'] < 1.5 * (1.0 / VOCAB)]
+    conclusions_valid = (n_seeds >= 5 and min_seeds_ok >= 5
+                         and n_any_sig > 0 and len(near_chance) < len(all_results) // 2)
+    logger.info('\n' + '=' * 70)
+    logger.info('Statistical validity summary (P4 fix):')
+    logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
+    logger.info(f'  ratios with significant_bonferroni=True: {n_any_sig}/{len(all_results)}')
+    logger.info(f'  ratios near chance (<1.5x): {len(near_chance)}/{len(all_results)}')
+    logger.info(f'  conclusions_valid: {conclusions_valid}')
+    if not conclusions_valid:
+        logger.warning(
+            '  WARNING: The ablation results do NOT support strong structural\n'
+            '  conclusions. Either the seed count is too low (<5), no layout\n'
+            '  reaches Bonferroni significance, or most accuracies are near\n'
+            '  chance. Treat the ranking as exploratory, not confirmatory.\n'
+            '  To improve power: increase ABL_SEEDS (>=7), increase ABL_STEPS,\n'
+            '  or use a simpler task where the signal is stronger.')
+    logger.info('=' * 70)
+    # Attach the validity flag to every result record so downstream
+    # consumers (make_figures, reports) can check it without recomputing.
+    for r in all_results:
+        r['conclusions_valid'] = conclusions_valid
+        r['n_seeds_requested'] = n_seeds
 
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped past

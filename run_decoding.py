@@ -53,7 +53,41 @@ def _clear_cache(device):
 
 
 class SoftmaxAttnDecoding(nn.Module):
-    """Softmax attention that caches K/V for autoregressive decoding."""
+    """Softmax attention that caches K/V for autoregressive decoding.
+
+    P3 fix — pre-allocated KV cache (was O(T) ``torch.cat`` per token).
+
+    The previous implementation rebuilt the entire KV cache on every decode
+    step via ``torch.cat([self._cache_k, k], dim=1)``. Each ``torch.cat``
+    allocates a NEW tensor of shape ``[B, T_full, H, K]`` and copies ALL
+    existing cached keys into it — an ``O(T)`` memory copy per generated
+    token, giving ``O(T²)`` total copy cost over a ``T``-token generation
+    pass. This inflated softmax's measured per-token decode latency by a
+    factor that grows with the cached context length, systematically
+    amplifying softmax's disadvantage relative to KDA (whose recurrent state
+    is genuinely ``O(1)`` per token). The comparison was therefore not
+    measuring the attention kernel's decoding cost — it was measuring
+    softmax's cache-rebuild overhead.
+
+    The fix uses a **pre-allocated ring-style cache**:
+      * On the first forward (prefill), allocate a cache buffer with some
+        initial capacity (``max(T_new * 2, 64)``) and a write pointer
+        ``_cache_len``.
+      * On each decode step, write the new k/v into ``cache[:, _cache_len]``
+        (an ``O(1)`` in-place write, no copy) and increment the pointer.
+      * If the capacity is exceeded, grow the buffer geometrically (double
+        the capacity, copy the old data — amortized ``O(1)`` per token).
+      * Attention is computed over ``cache[:, :_cache_len]`` (a view, no
+        copy).
+
+    This makes the per-token decode cost genuinely ``O(1)`` in the cache
+    length (modulo amortized geometric growth), so the benchmark now
+    measures the attention kernel itself, not the cache-management
+    overhead. The attention score computation is still ``O(T)`` per token
+    (one query attending to all cached keys) — that is the irreducible
+    cost of softmax attention during decoding and is exactly the cost we
+    want to compare against KDA's ``O(1)`` recurrent update.
+    """
 
     def __init__(self, d_model, H=2, K=16, V=16):
         super().__init__()
@@ -63,79 +97,103 @@ class SoftmaxAttnDecoding(nn.Module):
         self.o = nn.Linear(H * V, d_model, bias=False)
         self.H, self.K, self.V = H, K, V
         self.scale = K ** -0.5
-        # Register KV cache as non-persistent buffers so model.to(device)
-        # moves them automatically (a plain attribute would stay on the
-        # source device, causing a device-mismatch crash on the next forward).
-        # Non-persistent => not saved into state_dict (runtime state, not
-        # learned weights).
+        # Pre-allocated KV cache buffers. Shape ``[B, capacity, H, K/V]``.
+        # ``_cache_len`` is the write pointer = number of valid entries.
+        # ``capacity`` is the allocated size; the buffer grows geometrically
+        # (doubles) when ``_cache_len`` would exceed it, giving amortized
+        # O(1) per-token write cost.
+        #
+        # Registered as non-persistent buffers so model.to(device) moves them
+        # automatically (a plain attribute would stay on the source device,
+        # causing a device-mismatch crash on the next forward). Non-persistent
+        # => not saved into state_dict (runtime state, not learned weights).
         self.register_buffer('_cache_k', None, persistent=False)
         self.register_buffer('_cache_v', None, persistent=False)
+        # ``_cache_len`` is a plain Python int (not a buffer) because it is
+        # a scalar counter, not a tensor — there is nothing for ``.to()``
+        # to move. Storing it as a 0-dim tensor would add unnecessary
+        # overhead on every read/write.
+        self._cache_len = 0
 
     def reset(self):
         self._cache_k = None
         self._cache_v = None
+        self._cache_len = 0
+
+    def _ensure_cache_capacity(self, B, needed_len, dtype, device):
+        """Ensure the pre-allocated cache can hold ``needed_len`` entries.
+
+        Allocates a fresh buffer on the first call, or grows it geometrically
+        (doubles capacity) when the current capacity is exceeded. Growing
+        involves one ``O(capacity)`` copy, but because capacity doubles each
+        time, the amortized cost per appended token is ``O(1)``.
+        """
+        cur = self._cache_k
+        if cur is None or cur.shape[0] != B or cur.dtype != dtype \
+                or cur.device != device or cur.shape[1] < needed_len:
+            # Determine new capacity: at least ``needed_len``, but if we're
+            # growing an existing buffer, double it (geometric growth for
+            # amortized O(1)). For a fresh allocation, use
+            # ``max(needed_len * 2, 64)`` so the first few decode steps
+            # don't trigger a grow on every single token.
+            if cur is not None and cur.shape[1] < needed_len:
+                new_cap = max(needed_len, cur.shape[1] * 2)
+            elif cur is None:
+                new_cap = max(needed_len * 2, 64)
+            else:
+                # Batch/dtype/device changed but capacity is sufficient.
+                new_cap = cur.shape[1]
+            new_k = torch.zeros(B, new_cap, self.H, self.K,
+                                dtype=dtype, device=device)
+            new_v = torch.zeros(B, new_cap, self.H, self.V,
+                                dtype=dtype, device=device)
+            # Copy existing valid data if any (and batch matches).
+            if cur is not None and cur.shape[0] == B and self._cache_len > 0:
+                copy_len = min(self._cache_len, new_cap)
+                new_k[:, :copy_len] = cur[:, :copy_len]
+                new_v[:, :copy_len] = self._cache_v[:, :copy_len]
+            elif cur is not None and cur.shape[0] != B:
+                # Batch size changed — start fresh (per-sequence cache).
+                self._cache_len = 0
+            self._cache_k = new_k
+            self._cache_v = new_v
 
     def forward(self, x):
         # x: [B, T_new, d] — T_new = prefill_len during prefill, 1 during decoding.
-        # ``d`` is intentionally not unpacked: it is unused here (we read
-        # ``self.H * self.K`` etc. from the layer config, not from x.shape).
         B, T_new, _ = x.shape
         q = self.q(x).view(B, T_new, self.H, self.K)
         k = self.k(x).view(B, T_new, self.H, self.K)
         v = self.v(x).view(B, T_new, self.H, self.V)
-        if self._cache_k is None:
-            # Detach k/v before caching so the KV cache does not accumulate
-            # autograd graph nodes across decode steps. Without this, each
-            # ``torch.cat`` in the else-branch below would retain the previous
-            # step's graph, causing an O(N) memory leak across N decode steps
-            # when the caller forgets to wrap inference in ``torch.no_grad()``.
-            # The cache is just a tensor of numbers (keys/values); it does not
-            # need to carry gradients. Mirrors the always-detach pattern in
-            # ops_fused.py::HybridKCHAttention.forward and the KDA state fix
-            # in KDAAttnDecoding.forward below.
-            self._cache_k = k.detach()
-            self._cache_v = v.detach()
-        elif self._cache_k.shape[0] != B:
-            # Batch size changed between calls (e.g. train batch=16, eval
-            # batch=8, or prefill with B>1 then decode with B=1). The cached
-            # K/V belong to the OLD batch and cannot be concatenated with the
-            # new batch's K/V along dim=1 (sequence). ``torch.cat`` would
-            # raise ``RuntimeError: Sizes of tensors must match except in
-            # dimension 1`` because the batch dims (dim=0) differ.
-            #
-            # The right thing to do is reset the cache and start fresh: the
-            # KV cache is per-sequence, and a batch-size change means we are
-            # now processing different sequences. Mirrors the batch-size
-            # guard in ops_fused.py::HybridKCHAttention.forward (which drops
-            # the KDA recurrent state on batch-size change). The benchmark
-            # already calls ``model.reset()`` between trials, so this guard
-            # is defensive for callers who reuse the module outside the
-            # benchmark without resetting.
-            self._cache_k = k.detach()
-            self._cache_v = v.detach()
-        else:
-            # Cast incoming k/v to the cache's dtype before concat. The
-            # cache is set on the FIRST forward call (prefill) and retains
-            # whatever dtype prefill used. If a later call passes a
-            # different dtype (e.g. fp16 prefill then fp32 decode, or
-            # mixed-precision training where weights are fp32 but inputs
-            # are fp16), torch.cat([fp16, fp32]) raises
-            # ``RuntimeError: Expected object of scalar type Half but got
-            # scalar type Float``. Casting to the cache dtype makes the
-            # contract explicit: the cache dtype is fixed by the first
-            # call, and all subsequent calls are coerced to match. This
-            # mirrors the dtype-coercion pattern in
-            # ops_kda.py::naive_recurrent_kda (initial_state.to(compute_dtype)).
-            #
-            # Detach before concat for the same reason as the first-call
-            # branch: prevent graph accumulation across decode steps.
-            cache_dtype = self._cache_k.dtype
-            self._cache_k = torch.cat(
-                [self._cache_k, k.to(cache_dtype).detach()], dim=1)
-            self._cache_v = torch.cat(
-                [self._cache_v, v.to(cache_dtype).detach()], dim=1)
-        T_full = self._cache_k.shape[1]
-        s = torch.einsum('bthk,bshk->bhts', q, self._cache_k) * self.scale
+        # Detach k/v before caching so the KV cache does not accumulate
+        # autograd graph nodes across decode steps. Without this, each cached
+        # k/v would retain the previous step's graph, causing an O(N) memory
+        # leak across N decode steps when the caller forgets to wrap inference
+        # in ``torch.no_grad()``. The cache is just a tensor of numbers
+        # (keys/values); it does not need to carry gradients. Mirrors the
+        # always-detach pattern in ops_fused.py::HybridKCHAttention.forward
+        # and the KDA state fix in KDAAttnDecoding.forward below.
+        k = k.detach()
+        v = v.detach()
+
+        # Ensure the pre-allocated cache has room for the new T_new entries.
+        # On the first call this allocates; on subsequent calls it may grow
+        # geometrically if capacity is exceeded (amortized O(1) per token).
+        needed_len = self._cache_len + T_new
+        self._ensure_cache_capacity(B, needed_len, k.dtype, x.device)
+
+        # Write the new k/v into the pre-allocated slots — O(T_new) write,
+        # NO copy of the existing cache (unlike the old torch.cat approach
+        # which copied ALL existing entries on every call).
+        self._cache_k[:, self._cache_len:self._cache_len + T_new] = k
+        self._cache_v[:, self._cache_len:self._cache_len + T_new] = v
+        self._cache_len = self._cache_len + T_new
+
+        # Slice the valid portion of the cache (a view, no copy).
+        T_full = self._cache_len
+        cache_k = self._cache_k[:, :T_full]
+        cache_v = self._cache_v[:, :T_full]
+
+        s = torch.einsum('bthk,bshk->bhts', q, cache_k) * self.scale
         # Causal mask: query at relative position t in the current chunk is at
         # absolute position (T_full - T_new + t); it may only attend to keys
         # at absolute positions <= (T_full - T_new + t).
@@ -144,10 +202,6 @@ class SoftmaxAttnDecoding(nn.Module):
         # is at position T_full - 1, so it attends to all cached keys and the
         # mask is all-False (we skip the masked_fill entirely to avoid the
         # overhead of constructing a [1, T_full] mask per decode step).
-        # Previously no causal mask was applied at all, which made the prefill
-        # non-causal — the prefill output is discarded by the benchmark, but
-        # the missing mask still made prefill_ms artificially low (no mask
-        # construction / fill) and was incorrect for any autoregressive use.
         if T_new > 1:
             q_offset = T_full - T_new
             q_pos = torch.arange(T_new, device=x.device) + q_offset     # [T_new]
@@ -155,7 +209,7 @@ class SoftmaxAttnDecoding(nn.Module):
             causal_mask = k_pos[None, :] > q_pos[:, None]               # [T_new, T_full]
             s = s.masked_fill(causal_mask[None, None, :, :], float('-inf'))
         p = torch.softmax(s, dim=-1)
-        out = torch.einsum('bhts,bshv->bthv', p, self._cache_v)
+        out = torch.einsum('bhts,bshv->bthv', p, cache_v)
         return self.o(out.reshape(B, T_new, self.H * self.V))
 
 

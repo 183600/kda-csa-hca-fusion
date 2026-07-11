@@ -146,64 +146,130 @@ def _has_multiseed(record):
 
 
 def fig_benchmark():
-    """Figure: latency vs sequence length for each operator."""
+    """Figure: latency vs sequence length for each operator.
+
+    P2 fix — SEPARATE subplots by compute boundary (was: all ops in one plot).
+
+    The benchmark measures three DIFFERENT compute boundaries:
+
+      * **core** (softmax, kda_rec, kda_chunk): only the attention /
+        recurrence kernel is timed, with q/k/v (and g/beta for KDA)
+        pre-projected OUTSIDE the timed region.
+      * **end_to_end_single_layer** (csa, hca): timing starts from the hidden
+        state ``H`` and includes ALL input projections + compression +
+        indexer + attention + output projection for ONE layer.
+      * **end_to_end_multi_layer** (hybrid): a full 5-layer stack with
+        LayerNorm, projections, attention, and state management.
+
+    These numbers are NOT directly comparable as "operator latency" because
+    the compute boundary differs — a single-axis plot with all 6 lines invites
+    exactly the misleading cross-boundary comparison the issue calls out
+    (e.g. "softmax is 10x faster than hybrid" ignores that hybrid is 5 layers
+    end-to-end while softmax is just the core kernel).
+
+    The fix splits the figure into **separate subplots** grouped by compute
+    boundary, so only ops sharing the same boundary appear on the same axes.
+    A prominent suptitle warns that cross-subplot comparison is not
+    apples-to-apples. Within each subplot the comparison IS fair (same
+    boundary, same measurement methodology).
+    """
     data = load('exp2_benchmark.json')
+    # Fallback boundary mapping for older result files that predate the
+    # ``compute_boundary`` field (added by the P1-1 fix). Without this
+    # fallback, every op would be grouped under 'unknown' and the split-by-
+    # boundary subplot layout would collapse back to the single-plot
+    # anti-pattern the P2 fix is specifically meant to eliminate.
+    _OP_BOUNDARY_FALLBACK = {
+        'softmax': 'core',
+        'kda_rec': 'core',
+        'kda_chunk': 'core',
+        'csa': 'end_to_end_single_layer',
+        'hca': 'end_to_end_single_layer',
+        'hybrid': 'end_to_end_multi_layer',
+    }
+    # Collect (T, time_ms, compute_boundary, n_layers) per op.
     ops = {}
     for r in data:
         if 'error' in r:
             continue
-        # Guard against None time_ms (e.g. a half-written row from a killed
-        # run). Previously a single None in the time_ms field crashed
-        # ``pts.sort()`` with ``TypeError: '<' not supported between
-        # instances of 'NoneType' and 'float'`` because tuple comparison
-        # falls through to the second element.
         t = r.get('time_ms')
         if t is None:
             continue
-        ops.setdefault(r['op'], []).append((r['T'], t))
-    fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
+        boundary = r.get('compute_boundary')
+        if boundary is None:
+            boundary = _OP_BOUNDARY_FALLBACK.get(r['op'], 'unknown')
+        n_layers = r.get('n_layers', 1)
+        ops.setdefault(r['op'], {
+            'points': [],
+            'boundary': boundary,
+            'n_layers': n_layers,
+        })['points'].append((r['T'], t))
+    # Group ops by compute boundary so we only plot same-boundary ops together.
+    boundary_groups = {}
+    for op, info in ops.items():
+        boundary_groups.setdefault(info['boundary'], []).append(op)
+
     markers = {'softmax': 'o-', 'kda_rec': 's-', 'kda_chunk': '^-',
                'csa': 'D-', 'hca': 'v-', 'hybrid': 'p-'}
     labels = {'softmax': 'Softmax attention', 'kda_rec': 'KDA (recurrent)',
               'kda_chunk': 'KDA (chunk)', 'csa': 'CSA', 'hca': 'HCA',
               'hybrid': 'Fused KDA+CSA+HCA'}
-    for op, pts in ops.items():
-        pts.sort()
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=5)
-    # Find the device from the first NON-error record (not data[0]). The
-    # previous form silently said 'cpu' on the y-axis when the first row
-    # happened to be an error row with no 'device' key, even though every
-    # plotted point came from CUDA.
+    boundary_titles = {
+        'core': 'Core kernel only\n(q/k/v pre-projected; 1 layer)',
+        'end_to_end_single_layer': 'End-to-end single layer\n(H -> projections -> attention -> o_proj)',
+        'end_to_end_multi_layer': 'End-to-end multi-layer\n(5-layer stack with LayerNorm + state)',
+        'unknown': 'Unknown boundary',
+    }
+    # Order subplots: core first, then single-layer, then multi-layer.
+    boundary_order = ['core', 'end_to_end_single_layer',
+                      'end_to_end_multi_layer', 'unknown']
+    ordered_boundaries = [b for b in boundary_order if b in boundary_groups]
+
     device = next((r.get('device', 'cpu') for r in data if 'error' not in r),
                   'cpu')
-    ax.set_xlabel('Sequence length T')
-    ax.set_ylabel(f'Wall-clock latency (ms, {device})')
-    # P1-1 fix: the benchmark mixes compute boundaries (core vs
-    # end_to_end_single_layer vs end_to_end_multi_layer). Surface this
-    # in the title so a reader does not misinterpret the cross-op
-    # comparison as a fair kernel-level benchmark. The detailed boundary
-    # per op is in the JSON (``compute_boundary`` / ``n_layers`` fields).
-    ax.set_title('Operator latency vs. sequence length\n'
-                 '(WARNING: compute boundaries differ — see JSON metadata)')
-    ax.set_xscale('log', base=2)
-    ax.set_yscale('log')
-    # Only call legend() if at least one labeled artist was plotted. Without
-    # this guard, an empty / all-error benchmark result file triggers a noisy
-    # ``UserWarning: No artists with labels found to put in legend`` from
-    # matplotlib. Skipping the legend when there's nothing to show is cleaner
-    # than emitting the warning, and the figure remains structurally valid
-    # (just empty axes).
-    if ops:
-        ax.legend(fontsize=8, loc='upper left')
-    ax.grid(True, which='both', alpha=0.3)
+
+    n_subplots = len(ordered_boundaries)
+    if n_subplots == 0:
+        print('Skipping fig_benchmark (no data to plot)')
+        return
+
+    # Use a tall figure with one subplot per boundary group, sharing the x
+    # axis so the reader can visually align sequence lengths across groups.
+    # Each subplot has its OWN y-axis (log scale) because the absolute
+    # latencies differ by orders of magnitude across boundaries — sharing a
+    # y-axis would compress the core subplot to a flat line.
+    fig, axes = plt.subplots(n_subplots, 1, figsize=(7, 3.0 * n_subplots),
+                             sharex=True, constrained_layout=True)
+    if n_subplots == 1:
+        axes = [axes]
+
+    for ax, boundary in zip(axes, ordered_boundaries):
+        group_ops = boundary_groups[boundary]
+        for op in group_ops:
+            pts = ops[op]['points']
+            pts.sort()
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.plot(xs, ys, markers.get(op, 'o-'),
+                    label=labels.get(op, op), markersize=5)
+        ax.set_ylabel(f'Latency (ms, {device})')
+        ax.set_title(boundary_titles.get(boundary, boundary), fontsize=9)
+        ax.set_yscale('log')
+        ax.grid(True, which='both', alpha=0.3)
+        if group_ops:
+            ax.legend(fontsize=8, loc='upper left')
+
+    axes[-1].set_xlabel('Sequence length T')
+    axes[-1].set_xscale('log', base=2)
+
+    # Prominent suptitle: warn that cross-subplot comparison is unfair.
+    fig.suptitle(
+        'Operator latency vs. sequence length — split by compute boundary\n'
+        'WARNING: each subplot uses a DIFFERENT measurement boundary; '
+        'cross-subplot comparison is NOT apples-to-apples',
+        fontsize=10, fontweight='bold')
+
     _ensure_figures_dir()
-    # try/finally around savefig so a savefig failure (disk full, read-only
-    # Kaggle input dir, etc.) does not leak the figure. Without the finally,
-    # ``plt.close(fig)`` would be skipped on exception and the half-built
-    # figure would persist into the next fig_* call. Mirrors the pattern in
-    # ``fig_kv_cache`` / ``fig_flops``.
     try:
         fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.pdf'), dpi=150)
         fig.savefig(os.path.join(_FIGURES_DIR, 'fig_benchmark.png'), dpi=150)
@@ -669,6 +735,21 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     # running a custom subset (e.g. only (2,1,1) vs (1,1,1)) would get a
     # misleading suptitle. We identify the max-depth and min-depth ratios
     # and only mention the confound when they actually differ.
+    # P4 fix — surface statistical validity in the suptitle. The issue
+    # flagged that the ablation had only 3 seeds, accuracies near chance,
+    # and ALL significant_bonferroni=False. We now check the
+    # ``conclusions_valid`` flag (written by run_ablation.py) and add a
+    # prominent warning to the suptitle so the figure does not invite
+    # strong structural conclusions from underpowered data.
+    _valid = all(r.get('conclusions_valid', True) for r in records
+                 if 'error' not in r)
+    _n_sig = sum(1 for r in records if r.get('significant_bonferroni'))
+    _n_total = sum(1 for r in records if 'error' not in r)
+    validity_note = ''
+    if not _valid:
+        validity_note = (f' WARNING: conclusions_valid=False '
+                         f'({_n_sig}/{_n_total} Bonferroni-sig). '
+                         f'Treat as exploratory, not confirmatory.')
     if n_layers:
         max_l = max(n_layers)
         min_l = min(n_layers)
@@ -683,8 +764,8 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     else:
         depth_note = 'depth confound noted in paper.'
     fig.suptitle(f'Ablation: ratio trade-off (n_kv={n_kv}, multi-seed). '
-                 f'{depth_note}',
-                 fontsize=9, y=0.98)
+                 f'{depth_note}{validity_note}',
+                 fontsize=8, y=0.98)
     fig.subplots_adjust(top=0.91, bottom=0.18, left=0.08, right=0.97, wspace=0.3)
     # Drop ``bbox_inches='tight'`` here (issue A5/A10): it overrides the
     # manual subplots_adjust margins AND makes the saved figure size

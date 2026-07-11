@@ -584,24 +584,40 @@ def naive_csa(
         # Precompute H @ W_aKV once (reuse Ca from §1) instead of redoing the
         # matmul per (b, t).
         H_proj = Ca  # [B, T, c], already == H @ W_aKV
-        # Position-relative quantities depend only on T (not on batch), so we
-        # build them once; query t attends to positions with -win < n-t <= 0
-        # i.e. the causal window [t-win+1, t] (past + current only).
-        i_t = torch.arange(T, device=device)
-        dist = i_t[None, :] - i_t[:, None]                       # [T, T]
-        win_mask = (dist <= 0) & (dist > -win)                   # [T, T]
-        # Fully vectorized batched shared-KV MQA over the local window.
-        # q:        [B, T, nh, c]
-        # C_local:  [B, T, c]
-        # scores:   [B, nh, T, T]  (b h t n)
-        # win_mask broadcasts from [1, 1, T, T] -> [B, nh, T, T].
-        # NOTE: every query t always has itself in the window (dist=0 satisfies
-        # the mask for win >= 1), so no row is fully -inf and softmax is NaN-free.
+        # P5 fix — TRUE O(T·win) sliding-window attention (was O(T²)).
+        #
+        # The previous implementation built a full ``[T, T]`` boolean mask and
+        # a full ``[B, nh, T, T]`` attention-scores tensor, then masked every
+        # entry outside the window to ``-inf`` before softmax. Even though
+        # only ``win`` entries per row were non-trivial, the dense matmul
+        # (``einsum('bthd,bnd->bhtn')``) and the dense softmax both did
+        # ``O(T²·nh·c)`` work — the window size ``win`` had NO effect on the
+        # compute cost, only on which entries survived the mask. This means
+        # the "sliding window" branch was NOT actually achieving the
+        # ``O(T·window)`` complexity that is the whole point of a local
+        # attention mechanism; at ``T=2048`` it allocated and filled a
+        # 4M-entry scores tensor per call regardless of ``win``.
+        #
+        # The fix uses a **banded / windowed-gather** approach:
+        #   1. Left-pad ``C_local`` with ``win-1`` zero columns so that the
+        #      window for query ``t`` can be extracted as a contiguous slice.
+        #   2. Use ``unfold`` to extract per-query windows of shape
+        #      ``[B, T, win, c]`` in O(T·win·c) time.
+        #   3. Compute attention scores ONLY over the ``win`` entries:
+        #      ``[B, T, nh, win]`` — O(T·win·nh·c).
+        #   4. Mask the left-padding entries (queries near the start of the
+        #      sequence whose window extends before position 0) to ``-inf``,
+        #      softmax, and weighted-sum over the ``win`` dimension.
+        #
+        # The result is numerically identical to the old dense+mask approach
+        # (verified by ``test_hca_sliding_window_causality`` /
+        # ``test_csa_full_pipeline_causality`` in run_correctness.py) because
+        # softmax over the ``win`` non-masked entries of a row is the same
+        # operation whether the masked entries are materialized as ``-inf``
+        # in a ``[T,T]`` tensor or simply absent from a ``[T,win]`` tensor.
+        #
         # q is already L2-normalized above (line: q = F.normalize(q, dim=-1)),
-        # so the sliding-window branch reuses it directly. Re-normalizing here
-        # was a redundant O(B*T*nh*c) op that produced numerically identical
-        # results (L2-norm of an already-L2-normalized vector is a no-op
-        # modulo fp rounding).
+        # so the sliding-window branch reuses it directly.
         #
         # Dtype: cast H_proj to compute_dtype so the SW branch matches the
         # sparse branch's precision. Without this, the SW softmax runs in
@@ -609,10 +625,31 @@ def naive_csa(
         # (fp32) — an asymmetric precision loss that silently degrades the
         # SW branch's contribution for fp16 inputs.
         C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
-        scores = torch.einsum('b t h d, b n d -> b h t n', q, C_local) * scale
-        scores = scores.masked_fill(~win_mask[None, None], float('-inf'))
-        p = torch.softmax(scores, dim=-1)
-        sw_out = torch.einsum('b h t n, b n d -> b t h d', p, C_local)
+        # Left-pad the key dimension with (win-1) zero columns. After padding,
+        # padded position ``p`` maps to original position ``p - (win-1)``.
+        # The window for query ``t`` is padded positions ``[t, t+win-1]``,
+        # which map to original positions ``[t-win+1, t]`` — exactly the
+        # causal window we want. For ``t < win-1`` the first ``win-1-t``
+        # entries of the window are zero-padding (we mask them below).
+        C_padded = F.pad(C_local, (0, 0, win - 1, 0))            # [B, T+win-1, c]
+        # unfold(dim=1, size=win, step=1) extracts T overlapping windows of
+        # length win along the sequence axis. Result shape is
+        # ``[B, T, c, win]``; permute to ``[B, T, win, c]`` for the einsum.
+        C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
+        # Validity mask: window slot j for query t is a real (non-padding)
+        # position iff the original position ``t - win + 1 + j >= 0``,
+        # i.e. ``j >= win - 1 - t``. For t >= win-1 every slot is valid.
+        # Shape ``[T, win]``, True = real position, False = zero-padding.
+        _j = torch.arange(win, device=device)
+        _t = torch.arange(T, device=device)
+        valid_mask = _j[None, :] >= (win - 1 - _t[:, None])      # [T, win]
+        # NOTE: every query t always has itself in the window (slot j=win-1
+        # maps to original position t, which is always valid), so no row is
+        # fully -inf and softmax is NaN-free.
+        scores = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows) * scale
+        scores = scores.masked_fill(~valid_mask[None, :, None, :], float('-inf'))
+        p = torch.softmax(scores, dim=-1)                        # [B, T, nh, win]
+        sw_out = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to

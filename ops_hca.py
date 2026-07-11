@@ -185,21 +185,31 @@ def naive_hca(
     # --- 3. Sliding window branch (uncompressed local KV) ---
     if sliding_window > 0:
         win = sliding_window
-        # Position-relative quantities depend only on T (not on batch), so we
-        # build them once outside the batch loop instead of recreating them
-        # per-batch like the original reference implementation did.
-        i_t = torch.arange(T, device=device)
-        # dist[t, n] = n - t; query t attends to positions with -win < n-t <= 0
-        # i.e. the causal window [t-win+1, t] (past + current only).
-        dist = i_t[None, :] - i_t[:, None]                       # [T, T]
-        win_mask = (dist <= 0) & (dist > -win)                   # [T, T]
-        # Fully vectorized batched shared-KV MQA over the local window.
-        # q:        [B, T, nh, c]
-        # C_local:  [B, T, c]
-        # scores:   [B, nh, T, T]  (b h t n)
-        # win_mask broadcasts from [1, 1, T, T] -> [B, nh, T, T].
-        # NOTE: every query t always has itself in the window (dist=0 satisfies
-        # the mask for win >= 1), so no row is fully -inf and softmax is NaN-free.
+        # P5 fix — TRUE O(T·win) sliding-window attention (was O(T²)).
+        #
+        # The previous implementation built a full ``[T, T]`` boolean mask
+        # (``win_mask``) and a full ``[B, nh, T, T]`` attention-scores tensor,
+        # then masked every entry outside the window to ``-inf`` before
+        # softmax. Even though only ``win`` entries per row were non-trivial,
+        # the dense matmul (``einsum('bthd,bnd->bhtn')``) and the dense
+        # softmax both did ``O(T²·nh·c)`` work — the window size ``win`` had
+        # NO effect on the compute cost. At ``T=2048`` this allocated and
+        # filled a 4M-entry scores tensor per call regardless of ``win``,
+        # defeating the whole purpose of a local-attention mechanism.
+        #
+        # The fix uses a banded / windowed-gather approach: left-pad
+        # ``C_local`` with ``win-1`` zero columns, use ``unfold`` to extract
+        # per-query windows of shape ``[B, T, win, c]``, compute scores ONLY
+        # over the ``win`` entries (``[B, T, nh, win]``), mask the left-edge
+        # padding slots to ``-inf``, softmax, and weighted-sum over the
+        # ``win`` dimension. This is ``O(T·win·nh·c)`` — the window size now
+        # genuinely controls the cost.
+        #
+        # Numerically identical to the old dense+mask approach (verified by
+        # ``test_hca_sliding_window_causality`` in run_correctness.py):
+        # softmax over the ``win`` non-masked entries of a row is the same
+        # whether the masked entries are materialized as ``-inf`` in a
+        # ``[T,T]`` tensor or absent from a ``[T,win]`` tensor.
         #
         # Dtype: cast C to compute_dtype so the SW branch matches the dense
         # branch's precision. Without this, the SW softmax runs in H.dtype
@@ -207,10 +217,30 @@ def naive_hca(
         # an asymmetric precision loss that silently degrades the SW branch's
         # contribution for fp16 inputs. Mirrors the fix in ops_csa.py.
         C_local = F.normalize(C.to(compute_dtype), dim=-1)              # [B, T, c]
-        scores = torch.einsum('b t h d, b n d -> b h t n', q, C_local) * scale
-        scores = scores.masked_fill(~win_mask[None, None], float('-inf'))
-        p = torch.softmax(scores, dim=-1)
-        sw_out = torch.einsum('b h t n, b n d -> b t h d', p, C_local)
+        # Left-pad the key dimension with (win-1) zero columns. After padding,
+        # padded position ``p`` maps to original position ``p - (win-1)``.
+        # The window for query ``t`` is padded positions ``[t, t+win-1]``,
+        # which map to original positions ``[t-win+1, t]`` — the causal
+        # window. For ``t < win-1`` the first ``win-1-t`` entries are
+        # zero-padding (masked below).
+        C_padded = F.pad(C_local, (0, 0, win - 1, 0))            # [B, T+win-1, c]
+        # unfold(dim=1, size=win, step=1) extracts T overlapping windows of
+        # length win. Result shape ``[B, T, c, win]``; permute to
+        # ``[B, T, win, c]`` for the einsum.
+        C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
+        # Validity mask: window slot j for query t is a real (non-padding)
+        # position iff ``t - win + 1 + j >= 0``, i.e. ``j >= win-1-t``.
+        # For t >= win-1 every slot is valid. Shape ``[T, win]``.
+        # NOTE: every query t always has itself in the window (slot j=win-1
+        # maps to original position t, always valid), so no row is fully
+        # -inf and softmax is NaN-free.
+        _j = torch.arange(win, device=device)
+        _t = torch.arange(T, device=device)
+        valid_mask = _j[None, :] >= (win - 1 - _t[:, None])      # [T, win]
+        scores = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows) * scale
+        scores = scores.masked_fill(~valid_mask[None, :, None, :], float('-inf'))
+        p = torch.softmax(scores, dim=-1)                        # [B, T, nh, win]
+        sw_out = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to

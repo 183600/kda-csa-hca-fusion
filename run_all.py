@@ -267,9 +267,18 @@ def run_all(seeds=None, steps=None):
 
         # 6. Ablation — multi-seed.
         if skip_slow and is_cpu:
-            # Same direct-assignment fix as above (``setdefault`` is a no-op
-            # because ``ABL_SEEDS`` / ``ABL_STEPS`` were already set above).
-            os.environ['ABL_SEEDS'] = '3'
+            # P4 fix: do NOT reduce ABL_SEEDS below 5 on CPU. The previous
+            # override (ABL_SEEDS=3) made the Bonferroni-corrected t-test
+            # essentially unachievable (n=3 -> 2 dof -> critical t ≈ 12.9 at
+            # corrected alpha=0.007), guaranteeing significant_bonferroni=False
+            # for EVERY layout regardless of the true effect size. With 3 seeds
+            # the experiment cannot support any structural conclusion, so the
+            # "skip slow" shortcut was silently invalidating the entire
+            # ablation. We keep the step reduction (50 steps is enough to show
+            # the trend) but preserve the seed count at the default (7) so the
+            # statistical test retains adequate power. If CPU runtime is a
+            # concern, reduce the number of RATIOS or n_kv values instead.
+            os.environ['ABL_SEEDS'] = os.environ.get('ABL_SEEDS', '7')
             os.environ['ABL_STEPS'] = '50'
         summary['runs'].append(_run('exp5_ablation', run_ablation.main))
 
