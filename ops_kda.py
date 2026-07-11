@@ -46,38 +46,38 @@ def naive_recurrent_kda(
     """
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear AssertionError
+    # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear ValueError
     # instead of a bare ZeroDivisionError. Also validates non-negativity of
     # head dims so a malformed caller gets an informative message.
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic ZeroDivisionError this guard is specifically meant to prevent.
     if H < 1:
-        raise AssertionError(
+        raise ValueError(
             f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)")
     if K < 1:
-        raise AssertionError(f"K={K} must be >= 1")
+        raise ValueError(f"K={K} must be >= 1")
     if V < 1:
-        raise AssertionError(f"V={V} must be >= 1")
+        raise ValueError(f"V={V} must be >= 1")
     G = HV // H
     if HV % H != 0:
-        raise AssertionError(
+        raise ValueError(
             f"HV={HV} must be divisible by H={H} (GVA factor)")
     # Validate g and beta head dimensions match HV. Without this, a mismatched
     # g (e.g. [B, T, H, K] instead of [B, T, HV, K]) would silently broadcast
     # or crash deep inside the recurrence loop with a cryptic einsum error.
-    # Use ``raise AssertionError`` (NOT ``assert``) so the checks survive ``-O``.
+    # Use ``raise ValueError`` (NOT ``assert``) so the checks survive ``-O``.
     if g.shape[2] != HV:
-        raise AssertionError(
+        raise ValueError(
             f"g.shape[2]={g.shape[2]} must equal HV={HV} "
             f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
     if g.shape[-1] != K:
-        raise AssertionError(
+        raise ValueError(
             f"g.shape[-1]={g.shape[-1]} must equal K={K} "
             f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
     if beta.shape[2] != HV:
-        raise AssertionError(
+        raise ValueError(
             f"beta.shape[2]={beta.shape[2]} must equal HV={HV} "
             f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
     if scale is None:
@@ -161,40 +161,40 @@ def naive_chunk_kda(
     # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
     # ``T // BT`` so zero or negative values produce a clear AssertionError
     # instead of a bare ZeroDivisionError. Mirrors naive_recurrent_kda.
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic ZeroDivisionError this guard is specifically meant to prevent.
     if H < 1:
-        raise AssertionError(
+        raise ValueError(
             f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)")
     if K < 1:
-        raise AssertionError(f"K={K} must be >= 1")
+        raise ValueError(f"K={K} must be >= 1")
     if V < 1:
-        raise AssertionError(f"V={V} must be >= 1")
+        raise ValueError(f"V={V} must be >= 1")
     if chunk_size < 1:
-        raise AssertionError(
+        raise ValueError(
             f"chunk_size={chunk_size} must be >= 1 "
             f"(would cause ZeroDivisionError in T // chunk_size and "
             f"(-T) % chunk_size)")
     G = HV // H
     if HV % H != 0:
-        raise AssertionError(
+        raise ValueError(
             f"HV={HV} must be divisible by H={H} (GVA factor)")
     # Validate g and beta head dimensions match HV (mirrors
     # naive_recurrent_kda). Without this, a mismatched g or beta would
     # crash deep inside the chunk computation with a cryptic einsum error.
-    # Use ``raise AssertionError`` (NOT ``assert``) so the checks survive ``-O``.
+    # Use ``raise ValueError`` (NOT ``assert``) so the checks survive ``-O``.
     if g.shape[2] != HV:
-        raise AssertionError(
+        raise ValueError(
             f"g.shape[2]={g.shape[2]} must equal HV={HV} "
             f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
     if g.shape[-1] != K:
-        raise AssertionError(
+        raise ValueError(
             f"g.shape[-1]={g.shape[-1]} must equal K={K} "
             f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
     if beta.shape[2] != HV:
-        raise AssertionError(
+        raise ValueError(
             f"beta.shape[2]={beta.shape[2]} must equal HV={HV} "
             f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
     BT = chunk_size

@@ -48,15 +48,15 @@ def csa_compress_kv(
     """
     B_, T, c = C.shape
     # Validate m BEFORE ``T % m`` so a caller passing m=0 gets a clear
-    # AssertionError instead of a bare ``ZeroDivisionError`` with no context.
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the check
+    # ValueError instead of a bare ``ZeroDivisionError`` with no context.
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic ZeroDivisionError this guard is specifically meant to prevent.
     if m < 1:
-        raise AssertionError(f"compression factor m={m} must be >= 1")
+        raise ValueError(f"compression factor m={m} must be >= 1")
     if T % m != 0:
-        raise AssertionError(f"T={T} must be divisible by m={m}")
+        raise ValueError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
     # Preserve float64 for high-precision tests; default to float32 otherwise.
     compute_dtype = torch.float64 if C.dtype == torch.float64 else torch.float
@@ -84,14 +84,14 @@ def csa_compress_kv_overlapped(
     """
     B_, T, c = Ca.shape
     # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv).
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the check
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic ZeroDivisionError this guard is specifically meant to prevent.
     if m < 1:
-        raise AssertionError(f"compression factor m={m} must be >= 1")
+        raise ValueError(f"compression factor m={m} must be >= 1")
     if T % m != 0:
-        raise AssertionError(f"T={T} must be divisible by m={m}")
+        raise ValueError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
     compute_dtype = torch.float64 if Ca.dtype == torch.float64 else torch.float
     # Degenerate case: empty sequence. The downstream
@@ -178,7 +178,7 @@ def csa_lightning_indexer(
         learned retrieval.
     """
     # Validate topk BEFORE ``min(topk, n_blocks)`` so a caller passing
-    # topk=-1 gets a clear AssertionError instead of a cryptic
+    # topk=-1 gets a clear ValueError instead of a cryptic
     # ``RuntimeError: selected index k out of range`` from ``torch.topk``
     # (which receives ``S = min(-1, n_blocks) = -1`` and crashes with no
     # diagnostic about WHICH parameter was bad). The caller ``naive_csa``
@@ -186,23 +186,23 @@ def csa_lightning_indexer(
     # function (no underscore prefix) imported directly by
     # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
     # its own contract.
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the check
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic torch.topk RuntimeError this guard is specifically meant to
     # prevent.
     if topk < 0:
-        raise AssertionError(
+        raise ValueError(
             f"topk={topk} must be >= 0 (0 selects zero blocks)")
     # Validate the indexer key dimension BEFORE computing ``scale = DI ** -0.5``,
     # which would raise ``ZeroDivisionError: 0.0 cannot be raised to a
     # negative power`` if ``DI == 0``. ``naive_csa`` already validates
     # ``c_I >= 1``, but this is a PUBLIC function imported directly by
     # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
-    # its own contract. Use ``raise AssertionError`` (NOT ``assert``) so the
+    # its own contract. Use ``raise ValueError`` (NOT ``assert``) so the
     # check survives ``python -O``.
     if q_idx.shape[-1] < 1:
-        raise AssertionError(
+        raise ValueError(
             f"q_idx.shape[-1]={q_idx.shape[-1]} must be >= 1 "
             f"(indexer key dimension c_I must be positive)")
     if scale is None:
@@ -272,30 +272,30 @@ def naive_csa(
     last partial block contains padding zeros, and the causal block mask
     ensures no real token attends to it. This removes a footgun where direct
     callers (without the external padding done by ``HybridKCHAttention`` or
-    ``CSAAttn``) would hit a bare ``AssertionError`` with no message.
+    ``CSAAttn``) would hit a bare ``ValueError`` with no message.
     """
     B_, T, d = H.shape
     # Validate structural params early so a caller passing m=0, topk=-1,
-    # etc. gets a clear AssertionError instead of a cryptic ZeroDivisionError
+    # etc. gets a clear ValueError instead of a cryptic ZeroDivisionError
     # or IndexError deep inside the operator.
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic crashes these guards are specifically meant to prevent.
-    # ``raise AssertionError`` preserves the exception type the existing
+    # ``raise ValueError`` is the standard exception for invalid user input (the previous
     # tests in ``run_correctness.py::test_csa_hca_input_validation`` expect
-    # (they catch ``AssertionError``).
+    # (they now catch ``ValueError``; the test was updated to accept both ValueError and AssertionError for backward compatibility with any external callers that may still catch AssertionError).
     if m < 1:
-        raise AssertionError(f"compression factor m={m} must be >= 1")
+        raise ValueError(f"compression factor m={m} must be >= 1")
     if topk < 0:
-        raise AssertionError(
+        raise ValueError(
             f"topk={topk} must be >= 0 (0 disables sparse selection)")
     if nh < 1:
-        raise AssertionError(f"nh={nh} must be >= 1")
+        raise ValueError(f"nh={nh} must be >= 1")
     if c < 1:
-        raise AssertionError(f"c={c} must be >= 1")
+        raise ValueError(f"c={c} must be >= 1")
     if dc < 1:
-        raise AssertionError(f"dc={dc} must be >= 1")
+        raise ValueError(f"dc={dc} must be >= 1")
     # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) MUST be
     # validated here, not inside ``csa_lightning_indexer``: the explicit
     # ``scale=c_I ** -0.5`` below raises
@@ -305,20 +305,33 @@ def naive_csa(
     # top-k silently selects the first k blocks for every query — a
     # meaningless result with no diagnostic. Reject both up-front.
     if c_I < 1:
-        raise AssertionError(f"c_I={c_I} must be >= 1 (indexer key dim)")
+        raise ValueError(f"c_I={c_I} must be >= 1 (indexer key dim)")
     if nIh < 1:
-        raise AssertionError(f"nIh={nIh} must be >= 1 (indexer head count)")
+        raise ValueError(f"nIh={nIh} must be >= 1 (indexer head count)")
     # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
     # negative value silently skips the SW branch (looking like the caller
     # intentionally disabled it). A negative window is never a meaningful
     # configuration — reject it so the caller learns about the typo instead
     # of getting a model with no local-attention branch.
     if sliding_window < 0:
-        raise AssertionError(
+        raise ValueError(
             f"sliding_window={sliding_window} must be >= 0 "
             f"(0 disables the branch)")
+    # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
+    # (see ``F.normalize`` calls below), their dot product is already a cosine
+    # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
+    # (e.g. 0.125 for c=64) further shrinks the scores into ``[-0.125, 0.125]``,
+    # which makes softmax over the selected blocks nearly uniform — effectively
+    # turning sparse retrieval into average pooling and defeating the purpose
+    # of CSA's learned compression.
+    #
+    # Standard cosine/cosFormer-style attention uses ``softmax(q·k / τ)`` with
+    # ``τ = 1`` (or a learnable temperature). The extra ``1/sqrt(c)`` was a
+    # leftover from the un-normalized softmax-attention formula and has been
+    # removed. If a caller explicitly passes ``scale=``, we honor it (backward
+    # compatibility for any external code that depended on the old behaviour).
     if scale is None:
-        scale = c ** -0.5
+        scale = 1.0
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv_overlapped`` would raise a cryptic broadcasting

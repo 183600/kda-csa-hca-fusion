@@ -67,6 +67,14 @@ class HybridConfig:
     n_kda: int = 3
     n_csa: int = 1
     n_hca: int = 1
+    # KDA decay scale: the per-channel log-decay gate is computed as
+    # ``g = -F.softplus(...) * kda_decay_scale``. The historical magic value
+    # 0.1 appeared in 4 independent KDA instantiations (KDAHybridLayer,
+    # run_quality.KDAAttn, run_decoding.KDAAttnDecoding,
+    # method_analysis._kda_heads); lifting it to a config field keeps all
+    # instantiations consistent and makes the value tunable. The default
+    # preserves the historical behaviour.
+    kda_decay_scale: float = 0.1
     # NOTE: ``dropout`` is accepted for API compatibility / future use but is
     # NOT yet implemented in any sub-layer (KDA/CSA/HCA). A non-zero value is
     # rejected here so a caller who sets it expecting dropout to be applied
@@ -130,26 +138,32 @@ class HybridConfig:
                     f"HybridConfig.{name}={val} must be >= 1. A zero or "
                     f"negative value would cause a division-by-zero or "
                     f"shape error inside the sub-layer forward pass.")
-        # ``kda_chunk_size`` is accepted for API backwards-compatibility but
-        # is NOT used: ``KDAHybridLayer.forward`` always calls
-        # ``naive_recurrent_kda`` (the step-by-step reference), never
-        # ``naive_chunk_kda``. A caller setting ``kda_chunk_size=16`` would
-        # silently get the recurrent path, which is a footgun — the value
-        # looks like it controls the chunk size but has no effect. Warn
-        # loudly (do not raise: existing test configs pass non-default values
-        # that we do not want to break) so the caller notices.
-        if self.kda_chunk_size != 64:
-            import warnings
-            warnings.warn(
-                f"HybridConfig.kda_chunk_size={self.kda_chunk_size} is set "
-                f"but UNUSED: KDAHybridLayer always uses naive_recurrent_kda "
-                f"(the step-by-step reference), never naive_chunk_kda. The "
-                f"field is retained for backwards compatibility. To silence "
-                f"this warning, leave kda_chunk_size at its default (64) or "
-                f"wire it into KDAHybridLayer.forward to select the chunk "
-                f"implementation.",
-                stacklevel=2,
-            )
+        # ``kda_chunk_size`` controls whether KDAHybridLayer uses the
+        # step-by-step recurrent path (``naive_recurrent_kda``) or the
+        # chunkwise-parallel path (``naive_chunk_kda``).
+        #   * ``kda_chunk_size <= 0`` -> always use the recurrent path
+        #     (the historical default behaviour; also used during
+        #     autoregressive decoding where T is small).
+        #   * ``kda_chunk_size >= 1`` -> use the chunk path when T is at
+        #     least one full chunk (T >= kda_chunk_size), falling back to
+        #     the recurrent path for short sequences (where the chunk
+        #     path's overhead exceeds the parallelism win).
+        # Previously this field was unused (always recurrent) and emitted a
+        # "UNUSED" warning; the warning is now removed because the field IS
+        # wired in. The chunk path matches the recurrent path to fp tolerance
+        # (verified by test_kda_chunk_vs_recurrent in run_correctness.py).
+        # NOTE: the chunk path does not support carrying the short-conv
+        # lookback across calls (naive_chunk_kda accepts an initial_state but
+        # the conv lookback is applied to x BEFORE the q/k/v/g/beta
+        # projections, which are the same for both paths — so the conv state
+        # is independent of which KDA path is taken). Streaming-decode callers
+        # should leave kda_chunk_size at its default if they want chunked
+        # training, OR set it to 0 to force the recurrent path during decode.
+        if not isinstance(self.kda_chunk_size, int):
+            raise ValueError(
+                f"kda_chunk_size={self.kda_chunk_size!r} must be an int "
+                f"(>= 1 enables the chunk path; <= 0 forces the recurrent "
+                f"path; default 64).")
 
 
 class KDAHybridLayer(nn.Module):
@@ -172,15 +186,99 @@ class KDAHybridLayer(nn.Module):
         # Conv1d padding=0; left-pad by (k-1) in forward via F.pad.
         self.short_conv = nn.Conv1d(d, d, kernel_size=3, padding=0, groups=d, bias=True)
         self.scale = K ** -0.5
+        # Persistent short-conv lookback buffer of shape ``[B, k-1, d]`` (i.e.
+        # the last ``kernel_size - 1`` time steps of the previous chunk). This
+        # is REQUIRED for streaming / autoregressive decoding, where the model
+        # is called multiple times with the next chunk: without carrying the
+        # conv context, each chunk boundary loses ``k-1`` tokens of left
+        # context and produces a boundary artifact (the conv output for the
+        # first ``k-1`` tokens of each new chunk is computed against a
+        # zero-padded left edge instead of the actual previous tokens).
+        #
+        # For one-shot forward (training on a full sequence) this buffer is
+        # ``None`` and the existing left-pad-with-zeros path is used; the
+        # output is identical because the conv is causal and the first ``k-1``
+        # positions of a fresh sequence genuinely have no left context.
+        #
+        # Registered as a non-persistent buffer so ``.to(device)`` /
+        # ``.half()`` move/cast it automatically (a plain attribute would be
+        # left on the source device / dtype and crash the next forward).
+        self.register_buffer('_conv_lookback', None, persistent=False)
+
+    def reset_conv_state(self) -> None:
+        """Clear the persistent short-conv lookback buffer.
+
+        Call this between independent sequences so the conv does not "see"
+        tokens from the previous sequence as left context for the next one.
+        ``HybridKCHAttention.reset_state`` calls this for every KDA layer.
+        """
+        self._conv_lookback = None
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         B, T, d = x.shape
         cfg = self.cfg
         H, K, V, HV = cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v, cfg.n_heads_v
-        # x: [B, T, d] -> [B, d, T]; left-pad by (k-1)=2, right-pad 0;
-        # padding=0 conv keeps length T -> causal short-conv output.
-        x_conv = F.pad(x.transpose(1, 2), (self.short_conv.kernel_size[0] - 1, 0))
-        x_conv = self.short_conv(x_conv).transpose(1, 2)
+        ksize = self.short_conv.kernel_size[0]
+        # Build the conv input with proper LEFT context:
+        #   * If ``_conv_lookback`` is None (fresh sequence / first call),
+        #     left-pad with zeros — identical to the previous behaviour.
+        #   * If ``_conv_lookback`` is set (streaming / autoregressive decode),
+        #     prepend the last ``ksize - 1`` time steps from the previous call
+        #     so the conv at positions 0..ksize-2 of the new chunk sees the
+        #     actual previous tokens instead of zeros.
+        # After the conv, we trim the prepended context off so ``x_conv`` has
+        # the same length ``T`` as the input. The final ``ksize - 1`` time
+        # steps of ``x`` are saved into ``_conv_lookback`` for the next call.
+        lookback = self._conv_lookback
+        # Detach the incoming lookback so the autograd graph from the previous
+        # step is not retained. Mirrors the always-detach pattern used for the
+        # KDA recurrent state in HybridKCHAttention.forward. The conv lookback
+        # is just a tensor of numbers (the previous chunk's activations); it
+        # does not need to carry gradients.
+        if lookback is not None:
+            # Batch-size / device / dtype guards: if any of these changed
+            # between calls (e.g. train B=16 -> eval B=8, model.to(cuda),
+            # model.half()), the cached lookback is invalid. Drop it on
+            # batch-size change (the lookback is per-sequence and cannot be
+            # reused across different batch sizes); cast/move on device/dtype
+            # change to preserve the conv context where possible. Mirrors the
+            # state-handling pattern in HybridKCHAttention.forward.
+            if lookback.shape[0] != B:
+                lookback = None
+            elif lookback.device != x.device or lookback.dtype != x.dtype:
+                lookback = lookback.to(device=x.device, dtype=x.dtype).detach()
+            else:
+                lookback = lookback.detach()
+        if lookback is None:
+            # Fresh sequence: left-pad with zeros (no previous context).
+            x_conv_in = F.pad(x.transpose(1, 2), (ksize - 1, 0))
+        else:
+            # Streaming: prepend the previous chunk's last (ksize-1) tokens.
+            # ``lookback`` is [B, ksize-1, d]; concatenate along the time axis
+            # (dim=2 after transpose to [B, d, T]).
+            x_conv_in = torch.cat(
+                [lookback.transpose(1, 2), x.transpose(1, 2)], dim=2)
+        x_conv = self.short_conv(x_conv_in).transpose(1, 2)        # [B, T, d]
+        # Persist the last (ksize-1) time steps of THIS chunk as the next
+        # call's lookback. Detach so we don't retain the graph across calls.
+        if T >= ksize - 1:
+            new_lookback = x[:, -(ksize - 1):].detach().clone()
+        else:
+            # Chunk shorter than the lookback window: keep what we have and
+            # prepend the existing lookback (the most recent ``ksize-1`` tokens
+            # overall). This branch is rare (only the final chunk of a stream
+            # can be shorter than ksize-1=2) but the right thing to do.
+            if lookback is not None:
+                combined = torch.cat([lookback, x], dim=1)
+                new_lookback = combined[:, -(ksize - 1):].detach().clone()
+            else:
+                # No previous lookback and chunk shorter than window: pad with
+                # zeros on the left to keep the shape contract.
+                pad_len = (ksize - 1) - T
+                new_lookback = torch.cat(
+                    [torch.zeros(B, pad_len, d, device=x.device, dtype=x.dtype),
+                     x], dim=1).detach().clone()
+        self._conv_lookback = new_lookback
         # View BEFORE normalize: ``F.normalize(dim=-1)`` must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector. The
         # previous form ``F.normalize(F.silu(...), dim=-1).view(B, T, H, K)``
@@ -192,18 +290,77 @@ class KDAHybridLayer(nn.Module):
         q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
         k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
         v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
-        # log-space gate: low-rank down/up with a softplus-style decay
-        g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * 0.1
+        # log-space gate: low-rank down/up with a softplus-style decay. The
+        # magic constant 0.1 is exposed as ``HybridConfig.kda_decay_scale`` so
+        # all KDA instantiations (this layer, run_quality.KDAAttn,
+        # run_decoding.KDAAttnDecoding, method_analysis._kda_heads) use the
+        # same value. The default (0.1) preserves the historical behaviour.
+        decay_scale = getattr(cfg, 'kda_decay_scale', 0.1)
+        g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * decay_scale
         beta = torch.sigmoid(self.beta(x_conv))                   # [B, T, HV]
-        o, new_state = naive_recurrent_kda(
-            q, k, v, g, beta, scale=self.scale,
-            initial_state=state, output_final_state=True,
-        )
+        # Choose between the step-by-step recurrent path and the
+        # chunkwise-parallel path based on ``cfg.kda_chunk_size``:
+        #   * ``kda_chunk_size <= 0`` -> always recurrent (historical
+        #     behaviour; also the only option for streaming decode where
+        #     T is small).
+        #   * ``kda_chunk_size >= 1`` AND ``T >= kda_chunk_size`` -> chunk
+        #     path (faster on CPU/GPU for long training sequences; matches
+        #     the recurrent path to fp tolerance — verified by
+        #     ``test_kda_chunk_vs_recurrent`` in run_correctness.py).
+        #   * ``kda_chunk_size >= 1`` AND ``T < kda_chunk_size`` -> recurrent
+        #     path (the chunk path's per-chunk overhead exceeds the win at
+        #     short T; also avoids the chunk path's right-padding cost).
+        # The chunk path is now wired in (previously ``kda_chunk_size`` was
+        # a dead field — see the P1-4 fix in ``HybridConfig.__post_init__``).
+        use_chunk = (cfg.kda_chunk_size >= 1 and T >= cfg.kda_chunk_size)
+        if use_chunk:
+            from ops_kda import naive_chunk_kda
+            o, new_state = naive_chunk_kda(
+                q, k, v, g, beta, scale=self.scale,
+                initial_state=state, output_final_state=True,
+                chunk_size=cfg.kda_chunk_size,
+            )
+        else:
+            o, new_state = naive_recurrent_kda(
+                q, k, v, g, beta, scale=self.scale,
+                initial_state=state, output_final_state=True,
+            )
         return self.o_proj(o.reshape(B, T, HV * V)), new_state
 
 
 class CSAHybridLayer(nn.Module):
-    """A single CSA sub-layer (compression + sparse selection + MQA)."""
+    """A single CSA sub-layer (compression + sparse selection + MQA).
+
+    .. warning:: Indexer parameters are NOT trained (known limitation).
+        The lightning indexer uses ``torch.topk`` which returns integer
+        indices that do NOT propagate gradients (see the docstring of
+        ``csa_lightning_indexer``). Consequently the indexer parameters
+        ``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` stay at
+        their random initialization after ``backward()`` (their ``.grad``
+        is ``None`` and AdamW silently skips them). The compressed KV
+        representations (``W_aKV``, ``W_bKV``, ``W_aZ``, ``W_bZ``, ``Ba``,
+        ``Bb``) ARE trained through the differentiable compression +
+        attention path, so CSA-based models still learn useful
+        representations — just without *learned* retrieval.
+
+        This means CSA's sparse top-k selection is effectively **random
+        sparse** over the (learned) compressed KV entries, not the
+        "learned sparse retrieval" the paper's narrative implies. Any
+        experiment reporting CSA quality (e.g. MQAR, ablation) should
+        disclose this caveat: the result measures "learned compression +
+        uniform/random top-k retrieval", not "learned sparse retrieval".
+
+        A straight-through estimator (STE) or contrastive auxiliary loss
+        on the selection logits would fix this, but would change the
+        algorithm. We expose the limitation via ``indexer_is_trained``
+        and emit a one-time warning on the first forward when the layer
+        is in training mode.
+    """
+
+    # Class-level flag so the warning fires once per process, not once per
+    # forward call (which would spam the training log). Reset to False at
+    # the start of each training run by ``CSAHybridLayer.reset_warned``.
+    _indexer_warned = False
 
     def __init__(self, cfg: HybridConfig):
         super().__init__()
@@ -224,9 +381,46 @@ class CSAHybridLayer(nn.Module):
         self.B_idx = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_cI) * 0.02)
         self.sink = nn.Parameter(torch.zeros(cfg.csa_nh))
         self.o_proj = nn.Linear(c * cfg.csa_nh, d, bias=False)
+        # Expose the indexer-training limitation as a public attribute so
+        # experiment runners can include it in their result JSON (reviewers
+        # reading the JSON see the caveat alongside the accuracy number).
+        # This is a constant (False) for the current implementation; if STE
+        # or an auxiliary loss is ever added, flip this to True (or to a
+        # config-driven flag) so the warning and the experiment disclosure
+        # both update automatically.
+        self.indexer_is_trained = False
+
+    @classmethod
+    def reset_warned(cls):
+        """Reset the one-time indexer-not-trained warning flag.
+
+        Call this at the start of a fresh training run if you want the
+        warning to fire again (e.g. after rotating log files).
+        """
+        cls._indexer_warned = False
+
+    def _maybe_warn_indexer(self):
+        if not self.indexer_is_trained and not CSAHybridLayer._indexer_warned:
+            import warnings
+            warnings.warn(
+                "CSAHybridLayer: the lightning indexer parameters "
+                "(W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx) are NOT trained — "
+                "torch.topk returns integer indices that do not propagate "
+                "gradients. CSA's sparse top-k selection is therefore "
+                "effectively RANDOM over the (learned) compressed KV "
+                "entries, not 'learned sparse retrieval' as the paper "
+                "narrative implies. See CSAHybridLayer docstring and "
+                "ops_csa.py::csa_lightning_indexer for the full explanation. "
+                "Set ``indexer_is_trained = True`` (or implement an STE / "
+                "auxiliary loss) to silence this warning.",
+                stacklevel=3,
+            )
+            CSAHybridLayer._indexer_warned = True
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         cfg = self.cfg
+        if self.training:
+            self._maybe_warn_indexer()
         o = naive_csa(
             x, self.W_aKV.weight.T, self.W_bKV.weight.T,
             self.W_aZ.weight.T, self.W_bZ.weight.T, self.Ba, self.Bb,
@@ -347,7 +541,7 @@ class HybridKCHAttention(nn.Module):
         self.register_buffer('_kda_state', None, persistent=False)
 
     def reset_state(self) -> None:
-        """Clear the persistent KDA recurrent state.
+        """Clear the persistent KDA recurrent state AND short-conv lookback.
 
         Call this at the start of training, at the start of each sequence
         during evaluation, or between independent generation sessions.
@@ -356,6 +550,14 @@ class HybridKCHAttention(nn.Module):
         # and keeps the buffer slot present (just empty) so a subsequent
         # model.to(device) / state_dict save still works correctly.
         self._kda_state = None
+        # Also clear the short-conv lookback on every KDA layer so the conv
+        # does not "see" tokens from the previous sequence as left context
+        # for the next one. Each KDA layer owns its own lookback buffer
+        # (registered in KDAHybridLayer.__init__); we clear them here in one
+        # place so callers only have to remember a single reset call.
+        for layer in self.layers:
+            if isinstance(layer, KDAHybridLayer):
+                layer.reset_conv_state()
 
     def _build_layout(self) -> list[str]:
         # One repeating unit = n_kda KDA + n_csa CSA + n_hca HCA.

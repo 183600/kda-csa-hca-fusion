@@ -41,7 +41,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json
 from ops_fused import HybridKCHAttention, HybridConfig
-from run_quality import make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975, _build_param_groups
+from run_quality import (
+    make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
+    _build_param_groups, SMALL_MODEL_SPEC,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,32 +63,43 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     # Validate ratio so a typo (e.g. ``ratio=(3, 1)`` or ``ratio=(-1, 1, 1)``)
     # produces a clear error instead of an opaque ValueError from the
     # tuple-unpack or a silently-empty KDA layout (``['kda'] * -1 == []``).
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic ValueError / silent-empty-layout this guard is meant to
     # prevent. Mirrors the convention established in ops_kda.py.
     if not (isinstance(ratio, tuple) and len(ratio) == 3):
-        raise AssertionError(
+        raise ValueError(
             f"ratio must be a 3-tuple (n_kda, n_csa, n_hca), got {ratio!r}")
     if not all(isinstance(n, int) and n >= 0 for n in ratio):
-        raise AssertionError(
+        raise ValueError(
             f"ratio components must be non-negative ints, got {ratio!r}")
     n_kda, n_csa, n_hca = ratio
+    # Use the shared small-model spec so Experiment 5 (ablation) tests the
+    # SAME CSA/HCA sub-layer widths as Experiment 4 (standalone MQAR).
+    # Previously this used csa_c=16, csa_cI=8, csa_dc=32, hca_c=16,
+    # hca_dc=32 — HALF the width of run_quality.CSAAttn / HCAAttn — making
+    # cross-experiment comparisons silently confounded. The shared spec is
+    # defined in run_quality.py (imported above) so there is exactly ONE
+    # place to tune the small-model architecture.
+    spec = SMALL_MODEL_SPEC
     # HCA's defining feature is *heavy* compression: m2 should be >> m so the
     # HCA branch produces far fewer compressed blocks than CSA, trading recall
-    # granularity for global context. The previous config set m2 == m == 4,
-    # which made HCA behave identically to CSA (minus the lightning indexer)
-    # and silently defeated the purpose of including HCA in the ablation.
-    # With seq_len=16 and m=4, n_blocks_CSA = 4; setting m2=8 gives
-    # n_blocks_HCA = 2, exercising the "heavier compression" regime while
+    # granularity for global context. The shared spec already enforces
+    # m2=8 > m=4. With seq_len=16 and m=4, n_blocks_CSA=4; setting m2=8 gives
+    # n_blocks_HCA=2, exercising the "heavier compression" regime while
     # staying within the small ablation budget.
     return HybridConfig(
         d_model=d_model, n_heads_qk=2, n_heads_v=2,
         head_dim_k=16, head_dim_v=16,
-        csa_m=4, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
-        csa_sliding_window=4,
-        hca_m2=8, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=4,
+        csa_m=spec['csa_m'], csa_topk=spec['csa_topk'],
+        csa_nh=spec['csa_nh'], csa_c=spec['csa_c'],
+        csa_dc=spec['csa_dc'], csa_nIh=spec['csa_nIh'],
+        csa_cI=spec['csa_cI'],
+        csa_sliding_window=spec['csa_sliding_window'],
+        hca_m2=spec['hca_m2'], hca_nh=spec['hca_nh'],
+        hca_c=spec['hca_c'], hca_dc=spec['hca_dc'],
+        hca_sliding_window=spec['hca_sliding_window'],
         n_kda=n_kda, n_csa=n_csa, n_hca=n_hca,
     )
 

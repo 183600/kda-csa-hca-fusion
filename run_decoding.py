@@ -160,7 +160,18 @@ class SoftmaxAttnDecoding(nn.Module):
 
 
 class KDAAttnDecoding(nn.Module):
-    """KDA recurrent attention — O(1) state, no growing cache."""
+    """KDA recurrent attention — O(1) state, no growing cache.
+
+    This benchmark module mirrors the parameterization of
+    ``ops_fused.KDAHybridLayer`` so the decoding-cost comparison reflects the
+    SAME operator the fused model uses. Previously this module omitted the
+    causal depthwise short-conv (kernel=3) that ``KDAHybridLayer`` applies to
+    the input before the q/k/v/g/beta projections — i.e. the benchmark
+    compared a *stripped-down* KDA against softmax, making the comparison
+    unfair. The short-conv is now included and its lookback state is carried
+    across decode steps (mirroring the conv-lookback buffer in
+    ``KDAHybridLayer``), so the per-token decode cost includes the conv.
+    """
 
     def __init__(self, d_model, H=2, K=16, V=16):
         super().__init__()
@@ -170,6 +181,16 @@ class KDAAttnDecoding(nn.Module):
         self.g = nn.Linear(d_model, H * K, bias=False)
         self.beta = nn.Linear(d_model, H, bias=False)
         self.o = nn.Linear(H * V, d_model, bias=False)
+        # Causal depthwise short-conv (kernel=3) — matches KDAHybridLayer.
+        # Conv1d padding=0; left-pad by (k-1)=2 in forward via the lookback
+        # buffer (or zeros for the first call).
+        self.short_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
+                                    groups=d_model, bias=True)
+        # Magic constant 0.1 (decay scale) — lifted to a module attribute so
+        # all KDA instantiations share the same value via HybridConfig. The
+        # default (0.1) preserves the historical behaviour. We read it from
+        # the constructor arg if provided; otherwise default to 0.1.
+        self.decay_scale = 0.1
         self.H, self.K, self.V = H, K, V
         # Register the recurrent state as a non-persistent buffer so
         # model.to(device) moves it along with the parameters. A plain
@@ -177,22 +198,61 @@ class KDAAttnDecoding(nn.Module):
         # device-mismatch crash on the next forward — the same class of
         # bug that was fixed in ops_fused.py::HybridKCHAttention.
         self.register_buffer('_state', None, persistent=False)
+        # Register the short-conv lookback ([B, k-1, d]) so .to(device) /
+        # .half() move/cast it along with the parameters. Mirrors the
+        # KDAHybridLayer._conv_lookback buffer.
+        self.register_buffer('_conv_lookback', None, persistent=False)
 
     def reset(self):
         self._state = None
+        self._conv_lookback = None
 
     def forward(self, x):
-        B, T_new, _ = x.shape
+        B, T_new, d = x.shape
+        ksize = self.short_conv.kernel_size[0]
+        # Build the conv input with proper LEFT context, mirroring
+        # KDAHybridLayer.forward: prepend the previous chunk's last
+        # ``ksize - 1`` tokens if available, else left-pad with zeros.
+        lookback = self._conv_lookback
+        if lookback is not None:
+            # Batch-size / device / dtype guards (mirrors KDAHybridLayer).
+            if lookback.shape[0] != B:
+                lookback = None
+            elif lookback.device != x.device or lookback.dtype != x.dtype:
+                lookback = lookback.to(device=x.device, dtype=x.dtype).detach()
+            else:
+                lookback = lookback.detach()
+        if lookback is None:
+            x_conv_in = F.pad(x.transpose(1, 2), (ksize - 1, 0))
+        else:
+            x_conv_in = torch.cat(
+                [lookback.transpose(1, 2), x.transpose(1, 2)], dim=2)
+        x_conv = self.short_conv(x_conv_in).transpose(1, 2)
+        # Persist the last (ksize-1) time steps of THIS chunk for the next call.
+        if T_new >= ksize - 1:
+            self._conv_lookback = x[:, -(ksize - 1):].detach().clone()
+        else:
+            if lookback is not None:
+                combined = torch.cat([lookback, x], dim=1)
+                self._conv_lookback = combined[:, -(ksize - 1):].detach().clone()
+            else:
+                pad_len = (ksize - 1) - T_new
+                self._conv_lookback = torch.cat(
+                    [torch.zeros(B, pad_len, d, device=x.device, dtype=x.dtype),
+                     x], dim=1).detach().clone()
         # View BEFORE normalize: F.normalize(dim=-1) must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector. The
         # previous form normalized the full H*K vector, shrinking each
         # head's L2 norm to ~1/sqrt(H) and under-scaling q.k dot products
         # by 1/H. Mirrors the fix in ops_fused.py::KDAHybridLayer.
-        q = F.normalize(F.silu(self.q(x)).view(B, T_new, self.H, self.K), dim=-1)
-        k = F.normalize(F.silu(self.k(x)).view(B, T_new, self.H, self.K), dim=-1)
-        v = F.silu(self.v(x)).view(B, T_new, self.H, self.V)
-        g = -F.softplus(self.g(x)).view(B, T_new, self.H, self.K) * 0.1
-        beta = torch.sigmoid(self.beta(x))
+        q = F.normalize(F.silu(self.q(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
+        k = F.normalize(F.silu(self.k(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
+        v = F.silu(self.v(x_conv)).view(B, T_new, self.H, self.V)
+        # log-space gate: low-rank down/up with a softplus-style decay.
+        # Uses self.decay_scale (default 0.1, matching HybridConfig.kda_decay_scale)
+        # so all KDA instantiations agree on the magic constant.
+        g = -F.softplus(self.g(x_conv)).view(B, T_new, self.H, self.K) * self.decay_scale
+        beta = torch.sigmoid(self.beta(x_conv))
         # Always detach the incoming state so the autograd graph from the
         # previous step is not retained. In training mode this prevents
         # "backward through the graph a second time" errors; in eval mode it

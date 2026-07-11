@@ -49,23 +49,23 @@ def naive_hca(
     """
     B_, T, d = H.shape
     # Validate structural params early so a caller passing m2=0, nh=0, etc.
-    # gets a clear AssertionError instead of a cryptic ZeroDivisionError or
+    # gets a clear ValueError instead of a cryptic ZeroDivisionError or
     # IndexError deep inside the operator. Mirrors naive_csa's validation.
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic crashes these guards are specifically meant to prevent.
-    # ``raise AssertionError`` preserves the exception type the existing
+    # ``raise ValueError`` is the standard exception for invalid user input (the previous
     # tests in ``run_correctness.py::test_csa_hca_input_validation`` expect
-    # (they catch ``AssertionError``).
+    # (they now catch ``ValueError``; the test was updated to accept both ValueError and AssertionError for backward compatibility with any external callers that may still catch AssertionError).
     if m2 < 1:
-        raise AssertionError(f"heavy compression factor m2={m2} must be >= 1")
+        raise ValueError(f"heavy compression factor m2={m2} must be >= 1")
     if nh < 1:
-        raise AssertionError(f"nh={nh} must be >= 1")
+        raise ValueError(f"nh={nh} must be >= 1")
     if c < 1:
-        raise AssertionError(f"c={c} must be >= 1")
+        raise ValueError(f"c={c} must be >= 1")
     if dc < 1:
-        raise AssertionError(f"dc={dc} must be >= 1")
+        raise ValueError(f"dc={dc} must be >= 1")
     # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
     # negative value silently skips the SW branch (looking like the caller
     # intentionally disabled it). A negative window is never a meaningful
@@ -73,11 +73,18 @@ def naive_hca(
     # of getting a model with no local-attention branch. Mirrors the
     # validation added to ``naive_csa``.
     if sliding_window < 0:
-        raise AssertionError(
+        raise ValueError(
             f"sliding_window={sliding_window} must be >= 0 "
             f"(0 disables the branch)")
+    # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
+    # (see ``F.normalize`` calls below), their dot product is already a cosine
+    # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
+    # further shrinks the scores into a narrow band, making softmax over the
+    # compressed blocks nearly uniform — effectively turning dense attention
+    # into average pooling. Standard cosine-attention uses ``τ = 1``. The extra
+    # ``1/sqrt(c)`` was a leftover from un-normalized softmax-attention.
     if scale is None:
-        scale = c ** -0.5
+        scale = 1.0
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv`` would raise a cryptic broadcasting error
@@ -92,7 +99,7 @@ def naive_hca(
     # contains padding zeros, and no real token attends to it (causal block
     # mask). This removes a footgun where direct callers (without the
     # external padding done by ``HybridKCHAttention`` or ``HCAAttn``) would
-    # hit a bare ``AssertionError`` with no message.
+    # hit a bare ``ValueError`` with no message.
     original_T = T
     pad = (-T) % m2
     if pad:

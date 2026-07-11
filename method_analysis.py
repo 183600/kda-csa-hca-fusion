@@ -151,21 +151,28 @@ class HeadwiseFusedAttention(nn.Module):
     Forward: x -> [LN -> headwise KDA|CSA|HCA -> concat -> o_proj] + residual.
     """
 
+    # Class-level default for the per-channel log-decay scale. Historically a
+    # magic 0.1 was hardcoded in 4 independent KDA instantiations
+    # (KDAHybridLayer, KDAAttn, KDAAttnDecoding, _kda_heads). Lifted to a
+    # named constant so all KDA modules share the same value. Mirrors
+    # HybridConfig.kda_decay_scale and run_quality.KDAAttn.DECAY_SCALE.
+    DECAY_SCALE = 0.1
+
     def __init__(self, cfg: HeadwiseConfig):
         super().__init__()
         self.cfg = cfg
-        # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+        # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
         # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
         # are silently stripped under optimization, which would let a
         # misconfigured cfg slip through and crash deep inside __init__ with
         # an opaque shape-mismatch error. Mirrors the convention established
         # in ops_kda.py.
         if cfg.H_kda + cfg.H_csa + cfg.H_hca != cfg.H_total:
-            raise AssertionError(
+            raise ValueError(
                 f"H_kda({cfg.H_kda}) + H_csa({cfg.H_csa}) + H_hca({cfg.H_hca}) "
                 f"!= H_total({cfg.H_total})")
         if not (cfg.csa_c == cfg.head_dim and cfg.hca_c == cfg.head_dim):
-            raise AssertionError(
+            raise ValueError(
                 "Prototype requires csa_c == hca_c == head_dim "
                 f"(got csa_c={cfg.csa_c}, hca_c={cfg.hca_c}, "
                 f"head_dim={cfg.head_dim})")
@@ -192,16 +199,14 @@ class HeadwiseFusedAttention(nn.Module):
 
         self.norm = nn.LayerNorm(d)
         self.o_proj = nn.Linear(cfg.H_total * hd, d, bias=False)
-        # Attention scale: the dot product is over the compressed dim ``c``
-        # (see the einsum in _csa_heads / _hca_heads: ``b t h d, b n d -> b h t n``
-        # where ``d`` is the trailing dim of ``C_comp_n``, i.e. ``c``). The
-        # correct scale is therefore ``c ** -0.5``. We previously used
-        # ``hd ** -0.5``; the ``__init__`` assert ``csa_c == hca_c == head_dim``
-        # made them numerically equal today, but using ``hd`` is a latent
-        # footgun: if the assert is ever relaxed (e.g. to allow c != hd with
-        # a per-head projection), the scale would silently be wrong. Use ``c``
-        # so the formula matches the actual dot-product dimension.
-        self.scale = cfg.csa_c ** -0.5
+        # Cosine-attention scale: ``q`` and ``C_comp`` are both L2-normalized
+        # inside ``_csa_heads`` / ``_hca_heads``, so their dot product is
+        # already a cosine similarity in ``[-1, 1]``. Standard cosine-attention
+        # uses ``softmax(q·k / τ)`` with ``τ = 1``. The previous value
+        # ``csa_c ** -0.5`` (e.g. 0.125 for c=16) further shrunk the scores,
+        # flattening softmax over the compressed blocks and turning attention
+        # into near-uniform averaging — defeating the purpose of compression.
+        self.scale = 1.0
 
     def _kda_heads(self, x):
         B, T, d = x.shape
@@ -218,11 +223,14 @@ class HeadwiseFusedAttention(nn.Module):
         k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
         # log-space gate: g in (-inf, 0] so exp(g) in (0, 1] (per-channel
-        # fine-grained forget gate). The form ``-F.softplus(...) * 0.1``
-        # equals ``-0.1 * softplus(...)`` regardless of parenthesization
+        # fine-grained forget gate). The form ``-F.softplus(...) * DECAY_SCALE``
+        # equals ``-DECAY_SCALE * softplus(...)`` regardless of parenthesization
         # (unary minus binds tighter than ``*`` in Python), matching the
         # pattern in ops_fused.py::KDAHybridLayer and run_quality.py::KDAAttn.
-        g = (-F.softplus(self.kda_g(x)) * 0.1).view(B, T, H, hd)
+        # DECAY_SCALE (default 0.1) is a class-level constant so all KDA
+        # instantiations share the same value; mirrors
+        # HybridConfig.kda_decay_scale.
+        g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
         beta = torch.sigmoid(self.kda_beta(x))
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return o  # [B, T, H, hd]

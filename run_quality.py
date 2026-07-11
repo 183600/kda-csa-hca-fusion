@@ -208,6 +208,40 @@ def _t_crit_975(n):
     return _TABLE.get(n, 1.96)
 
 
+# ---------------------------------------------------------------------------
+# Shared small-model architecture spec — used by both run_quality.CSAAttn /
+# HCAAttn (Experiment 4: standalone MQAR) and run_ablation._make_cfg
+# (Experiment 5: hybrid layout ablation). Previously these two experiments
+# used INCONSISTENT CSA/HCA sub-layer widths:
+#   * run_quality.CSAAttn:      c=32, cI=16, m=4, nh=2, nIh=2, topk=4, dc=64
+#   * run_ablation._make_cfg:   c=16, cI=8,  m=4, nh=2, nIh=2, topk=4, dc=32
+# I.e. the ablation's CSA sub-layer was HALF the width of the standalone
+# MQAR experiment's CSA. Cross-experiment comparisons (e.g. "the hybrid
+# block's CSA contributes X to MQAR accuracy") were silently confounded by
+# this width difference. We lift the spec to a single module-level constant
+# so both experiments use the SAME widths, making cross-experiment
+# comparisons apples-to-apples. The values match the (wider) run_quality
+# spec since that is the more informative regime for CSA's sparse retrieval.
+# ---------------------------------------------------------------------------
+SMALL_MODEL_SPEC = {
+    # CSA sub-layer
+    'csa_c':      32,   # compressed KV dim
+    'csa_cI':     16,   # indexer key dim
+    'csa_dc':     64,   # down-projected query dim
+    'csa_m':      4,    # compression factor
+    'csa_nh':     2,    # number of attention heads
+    'csa_nIh':    2,    # number of indexer heads
+    'csa_topk':   4,    # top-k blocks per query
+    'csa_sliding_window': 4,
+    # HCA sub-layer (m2 >> m so HCA produces fewer compressed blocks)
+    'hca_c':      32,
+    'hca_dc':     64,
+    'hca_m2':     8,    # heavy compression (2x CSA's m=4)
+    'hca_nh':     2,
+    'hca_sliding_window': 4,
+}
+
+
 def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
                     embed: nn.Embedding, device=None, generator=None):
     """Build an MQAR batch with *learnable* embeddings.
@@ -235,13 +269,13 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     if device is None:
         device = embed.weight.device
 
-    # NOTE: use ``raise AssertionError`` (NOT ``assert``) so the checks
+    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # silent shape corruption / trivially-solvable-task bugs these guards
     # are meant to prevent. Mirrors the convention established in ops_kda.py.
     if n_kv < 1:
-        raise AssertionError(f"n_kv={n_kv} must be >= 1")
+        raise ValueError(f"n_kv={n_kv} must be >= 1")
     # Guard against silent shape corruption: if 2*n_kv exceeds vocab, the
     # argsort slice returns fewer than 2*n_kv ids and keys/vals end up with
     # mismatched shapes ([batch, vocab//2] vs the expected [batch, n_kv]).
@@ -249,10 +283,10 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     # KV pair (or fall inside the KV region), making the task trivially
     # solvable or unsolvable. Both used to fail silently.
     if 2 * n_kv > vocab:
-        raise AssertionError(
+        raise ValueError(
             f"2*n_kv={2*n_kv} must be <= vocab={vocab} (need 2*n_kv distinct ids)")
     if 2 * n_kv >= seq_len:
-        raise AssertionError(
+        raise ValueError(
             f"2*n_kv={2*n_kv} must be < seq_len={seq_len} (need room for cue token)")
 
     # Random noise base (covers noise positions; KV positions overwritten below).
@@ -350,6 +384,15 @@ class SoftmaxAttn(nn.Module):
 
 
 class KDAAttn(nn.Module):
+    # Module-level default for the per-channel log-decay scale. Historically
+    # a magic 0.1 was hardcoded in 4 independent KDA instantiations
+    # (KDAHybridLayer, KDAAttn, KDAAttnDecoding, _kda_heads). We lift it to
+    # a named constant here so all KDA modules share the same value via
+    # HybridConfig.kda_decay_scale (the fused model) or this attribute (the
+    # standalone KDAAttn). The default (0.1) preserves the historical
+    # behaviour. Mirrors run_decoding.KDAAttnDecoding.decay_scale.
+    DECAY_SCALE = 0.1
+
     def __init__(self, d_model, H=2, K=16, V=16):
         super().__init__()
         self.q = nn.Linear(d_model, H * K, bias=False)
@@ -370,7 +413,9 @@ class KDAAttn(nn.Module):
         q = F.normalize(F.silu(self.q(x)).view(B, T, self.H, self.K), dim=-1)
         k = F.normalize(F.silu(self.k(x)).view(B, T, self.H, self.K), dim=-1)
         v = F.silu(self.v(x)).view(B, T, self.H, self.V)
-        g = -F.softplus(self.g(x)).view(B, T, self.H, self.K) * 0.1
+        # log-space gate: low-rank down/up with a softplus-style decay.
+        # Uses the named DECAY_SCALE constant so all KDA instantiations agree.
+        g = -F.softplus(self.g(x)).view(B, T, self.H, self.K) * self.DECAY_SCALE
         beta = torch.sigmoid(self.beta(x))
         out, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return self.o(out.reshape(B, T, self.H * self.V))
@@ -379,8 +424,17 @@ class KDAAttn(nn.Module):
 class CSAAttn(nn.Module):
     def __init__(self, d_model):
         super().__init__()
-        c, dc = 32, 64
-        m, nh, nIh, cI, topk = 4, 2, 2, 16, 4
+        # Use the shared small-model spec so Experiment 4 (standalone MQAR)
+        # and Experiment 5 (ablation) test the SAME CSA sub-layer widths.
+        # Previously this used c=32, cI=16, dc=64 while run_ablation._make_cfg
+        # used c=16, cI=8, dc=32 — half the width — making cross-experiment
+        # comparisons silently confounded.
+        spec = SMALL_MODEL_SPEC
+        c, dc = spec['csa_c'], spec['csa_dc']
+        m, nh, nIh, cI, topk = (
+            spec['csa_m'], spec['csa_nh'], spec['csa_nIh'],
+            spec['csa_cI'], spec['csa_topk'],
+        )
         self.m, self.topk, self.nh, self.nIh, self.c, self.cI, self.dc = \
             m, topk, nh, nIh, c, cI, dc
         self.W_aKV = nn.Linear(d_model, c, bias=False)
@@ -415,7 +469,8 @@ class CSAAttn(nn.Module):
             self.B_idx,
             m=self.m, topk=self.topk, nh=self.nh, nIh=self.nIh,
             c=self.c, c_I=self.cI, dc=self.dc,
-            sliding_window=4, sink_logits=self.sink,
+            sliding_window=SMALL_MODEL_SPEC['csa_sliding_window'],
+            sink_logits=self.sink,
         )
         return self.o(o)
 
@@ -423,17 +478,15 @@ class CSAAttn(nn.Module):
 class HCAAttn(nn.Module):
     def __init__(self, d_model):
         super().__init__()
-        c, dc = 32, 64
-        # HCA's defining feature is *heavy* compression: m2 should be >> m so
-        # the HCA branch produces far fewer compressed blocks than CSA, trading
-        # recall granularity for global context. The previous value m2=4 was
-        # equal to CSA's m=4 (see CSAAttn above), which made HCA behave
-        # identically to CSA-without-indexer and silently defeated the purpose
-        # of including HCA in the MQAR comparison. With seq_len=16 and CSA
-        # m=4 (n_blocks_CSA=4), setting m2=8 gives n_blocks_HCA=2, exercising
-        # the heavier-compression regime. Mirrors the rationale already
-        # documented in run_ablation.py::_make_cfg.
-        m2, nh = 8, 2
+        # Use the shared small-model spec (mirrors CSAAttn). HCA's defining
+        # feature is *heavy* compression: m2 >> m so the HCA branch produces
+        # far fewer compressed blocks than CSA, trading recall granularity
+        # for global context. With seq_len=16 and CSA m=4 (n_blocks_CSA=4),
+        # setting m2=8 gives n_blocks_HCA=2, exercising the heavier-
+        # compression regime.
+        spec = SMALL_MODEL_SPEC
+        c, dc = spec['hca_c'], spec['hca_dc']
+        m2, nh = spec['hca_m2'], spec['hca_nh']
         self.m2, self.nh, self.c, self.dc = m2, nh, c, dc
         self.W_KV = nn.Linear(d_model, c, bias=False)
         self.W_Z = nn.Linear(d_model, c, bias=False)
@@ -451,7 +504,8 @@ class HCAAttn(nn.Module):
         o = naive_hca(x, self.W_KV.weight.T, self.W_Z.weight.T, self.B_pos,
                       self.W_DQ.weight.T, self.W_UQ.weight.T,
                       m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
-                      sliding_window=4, sink_logits=self.sink)
+                      sliding_window=SMALL_MODEL_SPEC['hca_sliding_window'],
+                      sink_logits=self.sink)
         return self.o(o)
 
 
@@ -994,6 +1048,30 @@ def main():
         logger.error(f'non-finite value in results; sanitizing to null: {e}')
         text = json.dumps(sanitize_for_json(all_results), indent=2,
                           allow_nan=False)
+    # Prepend a metadata header disclosing the CSA indexer-not-trained
+    # limitation so reviewers reading the JSON see the caveat alongside
+    # the accuracy numbers. Without this disclosure, CSA's MQAR accuracy
+    # could be misread as evidence for "learned sparse retrieval" when it
+    # actually measures "learned compression + random/uniform top-k
+    # selection". See CSAHybridLayer docstring for the full explanation.
+    metadata = {
+        '_metadata': {
+            'csa_indexer_trained': False,
+            'csa_caveat': (
+                "CSA's lightning indexer parameters (W_IUQ, W_w, W_KV_idx, "
+                "W_Z_idx, B_idx) are NOT trained: torch.topk returns integer "
+                "indices that do not propagate gradients, so the indexer "
+                "stays at random initialization. CSA's sparse top-k selection "
+                "is therefore effectively RANDOM over the (learned) compressed "
+                "KV entries, not 'learned sparse retrieval'. CSA's accuracy "
+                "here measures 'learned compression + random top-k retrieval'."
+            ),
+        },
+    }
+    try:
+        text = json.dumps(metadata, indent=2, allow_nan=False) + '\n' + text
+    except (TypeError, ValueError):
+        pass
     with open('results/exp4_mqar.json', 'w') as f:
         f.write(text)
     logger.info('\nSaved: results/exp4_mqar.json')
