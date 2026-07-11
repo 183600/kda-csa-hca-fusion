@@ -760,6 +760,15 @@ class HybridKCHAttention(nn.Module):
 
         Call this at the start of training, at the start of each sequence
         during evaluation, or between independent generation sessions.
+
+        Also resets the class-level ``_stateful_warned`` flag so the next
+        training-time forward re-emits the "stateful forward in training
+        mode" warning if the caller forgot to switch to
+        ``forward_functional``. Without this reset, the warning would fire
+        only once per PROCESS (the flag is class-level), so a second
+        training run in the same process (e.g. a notebook re-execution)
+        would silently lose the warning even though the same footgun
+        applies.
         """
         # Assigning None to a registered buffer is supported by nn.Module
         # and keeps the buffer slot present (just empty) so a subsequent
@@ -773,6 +782,15 @@ class HybridKCHAttention(nn.Module):
         for layer in self.layers:
             if isinstance(layer, KDAHybridLayer):
                 layer.reset_conv_state()
+        # Batch-3 fix: reset the class-level warning flag so the next
+        # training run re-emits the stateful-forward warning. The flag is
+        # class-level (not instance-level) because the warning is about
+        # the API contract (stateful forward in training is dangerous
+        # regardless of which instance triggers it), but resetting it on
+        # ``reset_state()`` is the right place: ``reset_state()`` is
+        # called at the start of every training run / eval sequence, so
+        # the warning re-fires for each new "session" of use.
+        HybridKCHAttention._stateful_warned = False
 
     def _build_layout(self) -> list[str]:
         # One repeating unit = n_kda KDA + n_csa CSA + n_hca HCA.

@@ -1,24 +1,19 @@
 # Runtime dependencies for the paper experiments in this directory.
-# This file captures the runtime deps required to run the experiments/
-# scripts (benchmarks, ablations, correctness, decoding, kv-cache, quality,
-# and figure generation).
 #
-# P0 fix: pin UPPER bounds. torch 2.3 vs 2.6 differ in
-# ``scaled_dot_product_attention`` behaviour (kernel selection, padding
-# handling) which affects the softmax baseline numbers in
-# ``run_benchmark`` / ``run_quality``. einops 0.8 changed the
-# default ``rearrange`` error message format. matplotlib 3.10 dropped
-# several deprecated APIs. Without upper bounds, a fresh
-# ``pip install -r requirements.txt`` on a new machine can silently
-# pull a breaking release and produce numerically different results
-# from the published ones. The bounded ranges below match the
-# versions used to generate the committed historical results.
+# P1-4 / Batch-3 fix: the canonical source of truth for runtime deps is
+# now `pyproject.toml`'s `[project].dependencies` field. This file is
+# kept for backward compatibility with `pip install -r requirements.txt`
+# workflows, but it mirrors the same version bounds as pyproject.toml so
+# the two paths produce identical environments. If you need to pin
+# exact versions for full reproducibility, generate a lock file
+# (`pip freeze > constraints.txt`) instead of editing this file.
+#
+# When updating bounds here, ALSO update pyproject.toml — the two must
+# stay in sync. The CI should run `pip install -e .` (which reads
+# pyproject.toml) for the canonical environment; this file is a
+# convenience for users who prefer the requirements.txt workflow.
 torch>=2.2,<2.7
 einops>=0.6,<0.9
 matplotlib>=3.5,<3.11
 numpy>=1.21,<2.3
-# scipy is optional; run_quality.py has a fallback t-distribution table
-# when scipy is missing. Listed here so `pip install -r requirements.txt`
-# pulls it in for the canonical statistical-test path. scipy 1.13+ changed
-# the default ``stats.t.ppf`` numerical precision in edge cases.
 scipy>=1.7,<1.15

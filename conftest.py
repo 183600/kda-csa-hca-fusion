@@ -81,13 +81,38 @@ _SLOW_TESTS = {
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-mark slow tests and set the device argument default.
+    """Auto-mark slow tests and skip CUDA tests when CUDA is unavailable.
 
     Test functions in ``run_correctness.py`` take an optional
     ``device='cpu'`` argument. When pytest collects them, it sees the
     parameter and tries to fixture-inject it. We mark slow tests with the
     ``slow`` marker so they can be skipped with ``-m "not slow"``.
+
+    P1-6 fix (Batch-3): when the user passes ``--device cuda`` but CUDA is
+    unavailable, previously the tests would run with ``device='cuda'`` and
+    crash deep inside torch with a cryptic ``RuntimeError: CUDA is not
+    available``. Now we detect this up-front and skip the CUDA-only tests
+    with a clear ``skip`` reason instead of letting them crash.
     """
+    device = config.getoption('--device')
+    if device == 'cuda':
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+        if not cuda_available:
+            skip_cuda = pytest.mark.skip(
+                reason='--device cuda requested but torch.cuda.is_available() '
+                       'is False; run on CPU (the default) or fix your CUDA '
+                       'environment before re-running with --device cuda.')
+            for item in items:
+                # Only skip tests that actually take a ``device`` argument
+                # (functions without ``device`` are device-agnostic and
+                # should still run).
+                if 'device' in getattr(item, 'fixturenames', ()):
+                    item.add_marker(skip_cuda)
+            return  # Skip the slow-test marking; the items are already skipped.
     for item in items:
         # Mark slow tests by function name.
         for slow_name in _SLOW_TESTS:

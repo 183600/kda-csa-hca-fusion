@@ -118,3 +118,50 @@ testpaths = ["."]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
+
+# Batch-3 fix: add Ruff config so ``ruff check .`` can be used as a CI gate.
+# The config is intentionally permissive about line length (the codebase
+# has many long docstring examples and URL comments that would be noisy
+# to wrap) but enforces the most impactful rules: undefined names,
+# unused imports, obvious bugs (F-class), and PEP 8 conventions (E/W).
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "results",
+    "figures",
+]
+
+[tool.ruff.lint]
+# Enable the F-class (Pyflakes) and E/W-class (PEP 8) rules. The F-class
+# catches undefined names, unused imports, and redefined symbols — the
+# highest-signal lint checks. The E/W-class catches style issues that
+# often hide real bugs (e.g. E741 ambiguous variable names). We
+# intentionally do NOT enable the full B-class (bugbear) or C-class
+# (complexity) yet because the codebase has many long functions that
+# would require a larger refactor to pass; those are tracked as
+# Batch-3 "split large files" work in the code-review report.
+select = ["E", "W", "F"]
+# Ignore E402 (module-level import not at top) because the scripts use
+# ``sys.path.insert`` before their local imports by design (mirroring
+# the ``pip install -e .`` flat-package layout).
+ignore = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# run_correctness.py and method_analysis.py have several ``import copy``
+# / ``import torch.nn.functional as F`` inside test functions for
+# scoping clarity; allow F401 (unused import) in test files since the
+# imports may be used in later test functions collected from the same
+# module.
+"run_correctness.py" = ["F401"]
+"test_figures.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+# The codebase has thorough type annotations but mypy strict mode would
+# flag many torch API stubs as untyped. Run mypy in "soft" mode for now
+# (catches undefined names and obvious type errors, ignores missing
+# stubs for third-party libraries).
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_unused_ignores = true

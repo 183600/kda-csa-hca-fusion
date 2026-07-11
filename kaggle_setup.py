@@ -365,22 +365,49 @@ def configure_logging(verbose: bool = True) -> None:
     """Configure the root logger with a single ``StreamHandler`` and a simple
     ``"[%(levelname)s] %(message)s"`` formatter.
 
-    Level is ``INFO`` if ``verbose`` else ``WARNING``. Idempotent: repeated
-    calls reset the root logger's handlers so multiple experiments in one
-    process do not stack duplicate handlers.
+    Level is ``INFO`` if ``verbose`` else ``WARNING``.
 
     Called from ``configure_torch_for_device`` so every experiment that calls
     ``configure_torch_for_device`` gets logging set up.
+
+    Batch-3 fix: previously this function UNCONDITIONALLY removed all
+    existing root handlers and replaced them with our own. When the host
+    application (Jupyter notebook, MLflow, a parent pipeline) had
+    configured its own root handlers, our call silently destroyed them
+    — breaking the host's logging. The report flagged this as a side
+    effect that "may break host notebook/application logs".
+
+    The fix: only configure the root logger if it has NO handlers yet
+    (``logging.getLogger().handlers == []``). If the host already
+    configured logging, we respect its configuration and only adjust
+    the LEVEL (downgrading WARNING→INFO is safe; the host's handlers
+    still see the records). This mirrors the standard library's
+    ``logging.basicConfig`` idempotency contract (basicConfig is a
+    no-op if the root already has handlers).
+
+    The experiment scripts use ``logging.getLogger(__name__)`` which
+    propagates to the root, so configuring root is the right level
+    (catches all module loggers uniformly). A future refactor could
+    move all loggers under a named project logger (``kch_fusion``)
+    for full isolation, but that requires touching every runner and
+    is tracked as Batch-3 "split large files" follow-up work.
     """
     root = logging.getLogger()
-    # Remove any pre-existing handlers so repeated calls do not duplicate
-    # output (e.g. when run_all.py invokes several experiment mains in turn).
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-    root.addHandler(handler)
-    root.setLevel(logging.INFO if verbose else logging.WARNING)
+    if not root.handlers:
+        # No host handlers: install our own. This is the "fresh process"
+        # path (the common case when running ``python run_all.py`` from
+        # the command line). ``logging.basicConfig`` would do the same,
+        # but we want our specific formatter.
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        root.addHandler(handler)
+    # Always set the level (downgrading is safe; the host's handlers
+    # still see records at or above this level). If the host set a MORE
+    # VERBOSE level (e.g. DEBUG), we don't override it — only adjust
+    # toward our level if the current level is more verbose than ours.
+    target_level = logging.INFO if verbose else logging.WARNING
+    if root.level > target_level:
+        root.setLevel(target_level)
 
 
 def configure_torch_for_device(device: torch.device | None = None) -> EnvInfo:

@@ -49,8 +49,8 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 ├── run_all.py             # Single-entry runner (Kaggle-friendly)
 ├── kaggle_setup.py        # CUDA bootstrap + shared utilities (sanitize_for_json, parse_int_env)
 ├── test_figures.py        # Tests for the figure generation pipeline
-├── results/               # Committed JSON outputs (exp1..exp6, summary)
-├── figures/               # Committed PDF/PNG outputs
+├── results/               # Generated JSON outputs (gitignored; regenerate via run_all.py)
+├── figures/               # Generated PDF/PNG outputs (gitignored; regenerate via make_figures.py)
 ├── requirements.txt
 ├── pyproject.toml         # `pip install -e .` makes the modules importable as a package
 └── README.md              # this file
@@ -60,17 +60,21 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 
 ## Installation
 
+**Requires Python ≥ 3.10** (the source uses PEP 604 `X | None` union syntax, which
+requires Python 3.10+). The `pyproject.toml` declares `requires-python = ">=3.10"`.
+
 ```bash
 # 1. Clone
 git clone https://gitee.com/qwe12345678/kda-csa-hca-fusion.git
 cd kda-csa-hca-fusion
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 2. Install dependencies (pinned to match the committed historical results)
+pip install -e .        # installs torch, einops, matplotlib, numpy, scipy
+#    OR, if you only need the runtime deps without the dev toolchain:
+#    pip install -r requirements.txt
 
-# 3. (Optional) Install as an editable package so the modules are importable
-#    from anywhere without sys.path hacks:
-pip install -e .
+# 3. (Optional) Install dev tooling (pytest, pytest-xdist, mypy, ruff):
+pip install -e .[dev]
 ```
 
 After `pip install -e .`, the experiment scripts can be run as modules:
