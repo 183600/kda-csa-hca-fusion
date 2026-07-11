@@ -24,11 +24,11 @@ from ops_csa import csa_compress_kv, _causal_block_mask
 
 def naive_hca(
     H: torch.Tensor,               # [B, T, d]
-    W_KV: torch.Tensor,            # [d, c]
-    W_Z: torch.Tensor,             # [d, c]
+    W_KV: torch.Tensor,            # [c, d]   (nn.Linear.weight layout: [out, in])
+    W_Z: torch.Tensor,             # [c, d]
     B_pos: torch.Tensor,           # [m2, c]
-    W_DQ: torch.Tensor,            # [d, dc]
-    W_UQ: torch.Tensor,            # [dc, c*nh]
+    W_DQ: torch.Tensor,            # [dc, d]
+    W_UQ: torch.Tensor,            # [c*nh, dc]
     *,
     m2: int,                       # heavy compression factor (m' in the paper)
     nh: int,
@@ -39,6 +39,12 @@ def naive_hca(
     sink_logits: torch.Tensor | None = None,    # [nh]
 ) -> torch.Tensor:
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
+
+    **Weight layout** (P0 API fix): all ``W_*`` tensors follow the
+    ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
+    Internally we use ``F.linear(x, W)`` (which computes ``x @ W.T``) instead
+    of the previous ``x @ W`` form that required callers to pass
+    ``self.W_KV.weight.T``. Callers now pass ``self.W_KV.weight`` directly.
 
     ``T`` does NOT need to be divisible by ``m2``: the function right-pads
     the sequence with zeros up to the next multiple of ``m2`` and trims the
@@ -108,8 +114,9 @@ def naive_hca(
     n_blocks = T // m2
 
     # --- 1. Heavy KV compression (single branch, no overlap) ---
-    C = H @ W_KV                                                   # [B, T, c]
-    Z = H @ W_Z                                                    # [B, T, c]
+    # P0 API fix: use F.linear with W in nn.Linear.weight layout [out, in].
+    C = F.linear(H, W_KV)                                          # [B, T, c]
+    Z = F.linear(H, W_Z)                                           # [B, T, c]
     C_comp = csa_compress_kv(C, Z, B_pos, m2)                     # [B, n_blocks, c] in compute_dtype
     C_comp_n = F.normalize(C_comp, dim=-1)
 
@@ -122,8 +129,8 @@ def naive_hca(
     # ``compute_dtype`` before normalization so the entire attention core runs
     # in one consistent precision. Mirrors the fix in ``ops_csa.py::naive_csa``.
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
-    cQ = H @ W_DQ                                                  # [B, T, dc]
-    q = (cQ @ W_UQ).view(B_, T, nh, c).to(compute_dtype)           # [B, T, nh, c]
+    cQ = F.linear(H, W_DQ)                                         # [B, T, dc]
+    q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
     q = F.normalize(q, dim=-1)
 
     # Causal block mask: query t attends ONLY to blocks strictly before

@@ -214,18 +214,18 @@ def test_csa_hca_fp16_dtype_consistency(device='cpu'):
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
     H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
-    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
     Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
     Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
-    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(nIh, d, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
     B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
     sink = torch.zeros(nh, dtype=dtype, device=device)
 
@@ -247,11 +247,11 @@ def test_csa_hca_fp16_dtype_consistency(device='cpu'):
     B2, T2, d2 = 1, 32, 16
     m2, nh2, c2, dc2 = 16, 2, 8, 16
     H2 = torch.randn(B2, T2, d2, dtype=dtype, device=device) * 0.1
-    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
     B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, dtype=dtype, device=device) * 0.1
     sink2 = torch.zeros(nh2, dtype=dtype, device=device)
 
     try:
@@ -348,11 +348,11 @@ def test_hca_causality(device='cpu'):
     B, T, d = 1, 128, 32
     m2, nh, c, dc = 32, 2, 16, 32
     H = torch.randn(B, T, d, device=device) * 0.1
-    W_KV = torch.randn(d, c, device=device) * 0.1
-    W_Z = torch.randn(d, c, device=device) * 0.1
+    W_KV = torch.randn(c, d, device=device) * 0.1
+    W_Z = torch.randn(c, d, device=device) * 0.1
     B_pos = torch.randn(m2, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
     sink = torch.zeros(nh, device=device)
     o = naive_hca(H, W_KV, W_Z, B_pos, W_DQ, W_UQ,
                   m2=m2, nh=nh, c=c, dc=dc,
@@ -670,18 +670,18 @@ def test_csa_indexer_ste_gradient(device='cpu'):
 
     def _make_params():
         return dict(
-            W_aKV=torch.randn(d, c, dtype=torch.float64) * 0.1,
-            W_bKV=torch.randn(d, c, dtype=torch.float64) * 0.1,
-            W_aZ=torch.randn(d, c, dtype=torch.float64) * 0.1,
-            W_bZ=torch.randn(d, c, dtype=torch.float64) * 0.1,
+            W_aKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_aZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
             Ba=torch.randn(m, c, dtype=torch.float64) * 0.02,
             Bb=torch.randn(m, c, dtype=torch.float64) * 0.02,
-            W_DQ=torch.randn(d, dc, dtype=torch.float64) * 0.1,
-            W_UQ=torch.randn(dc, c * nh, dtype=torch.float64) * 0.1,
-            W_IUQ=torch.randn(dc, cI * nIh, dtype=torch.float64) * 0.1,
-            W_w=torch.randn(d, nIh, dtype=torch.float64) * 0.1,
-            W_KV_idx=torch.randn(d, cI, dtype=torch.float64) * 0.1,
-            W_Z_idx=torch.randn(d, cI, dtype=torch.float64) * 0.1,
+            W_DQ=torch.randn(dc, d, dtype=torch.float64) * 0.1,
+            W_UQ=torch.randn(c * nh, dc, dtype=torch.float64) * 0.1,
+            W_IUQ=torch.randn(cI * nIh, dc, dtype=torch.float64) * 0.1,
+            W_w=torch.randn(nIh, d, dtype=torch.float64) * 0.1,
+            W_KV_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            W_Z_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
             B_idx=torch.randn(m, cI, dtype=torch.float64) * 0.02,
         )
 
@@ -800,11 +800,11 @@ def test_hca_sliding_window_causality(device='cpu'):
     B, T, d = 1, 64, 16
     m2, nh, c, dc = 16, 2, 8, 16
     H = torch.randn(B, T, d, dtype=torch.float64, device=device) * 0.1
-    W_KV = torch.randn(d, c, dtype=torch.float64, device=device) * 0.1
-    W_Z = torch.randn(d, c, dtype=torch.float64, device=device) * 0.1
+    W_KV = torch.randn(c, d, dtype=torch.float64, device=device) * 0.1
+    W_Z = torch.randn(c, d, dtype=torch.float64, device=device) * 0.1
     B_pos = torch.randn(m2, c, dtype=torch.float64, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=torch.float64, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=torch.float64, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=torch.float64, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=torch.float64, device=device) * 0.1
     sink = torch.zeros(nh, dtype=torch.float64, device=device)
     win = 4
 
@@ -915,18 +915,18 @@ def test_csa_full_pipeline_causality(device='cpu'):
     dtype = torch.float64
 
     H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
-    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
     Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
     Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
-    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(nIh, d, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
     B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
     sink = torch.zeros(nh, dtype=dtype, device=device)
 
@@ -1090,11 +1090,11 @@ def test_csa_hca_right_padding_correctness(device='cpu'):
     assert pad == 7, f"expected pad=7, got {pad}"
 
     H_full = torch.randn(B, T_padded, d, dtype=dtype, device=device) * 0.1
-    W_KV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_Z = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_KV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_Z = torch.randn(c, d, dtype=dtype, device=device) * 0.1
     B_pos = torch.randn(m2, c, dtype=dtype, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=dtype, device=device) * 0.1
     sink = torch.zeros(nh, dtype=dtype, device=device)
 
     # Reference: run on all T_padded real tokens (no padding).
@@ -1121,18 +1121,18 @@ def test_csa_hca_right_padding_correctness(device='cpu'):
     assert pad2 == 7
 
     H_full2 = torch.randn(B2, T_padded2, d2, dtype=dtype, device=device) * 0.1
-    W_aKV = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_bKV = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_aZ = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_bZ = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
     Ba = torch.randn(m, c2, dtype=dtype, device=device) * 0.1
     Bb = torch.randn(m, c2, dtype=dtype, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
-    W_IUQ = torch.randn(dc2, c_I * nIh, dtype=dtype, device=device) * 0.1
-    W_w = torch.randn(d2, nIh, dtype=dtype, device=device) * 0.1
-    W_KV_idx = torch.randn(d2, c_I, dtype=dtype, device=device) * 0.1
-    W_Z_idx = torch.randn(d2, c_I, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc2, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(nIh, d2, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d2, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d2, dtype=dtype, device=device) * 0.1
     B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
     sink2 = torch.zeros(nh2, dtype=dtype, device=device)
 
@@ -1411,18 +1411,18 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
     H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
-    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
     Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
     Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
-    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(nIh, d, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
     B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
     # Non-zero sink so the bias is detectable.
     sink = torch.tensor([0.5, -0.3], dtype=dtype, device=device)
@@ -1439,18 +1439,18 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     # csa_lightning_indexer / _causal_block_mask / naive_csa). Import just
     # the missing name instead of re-shadowing the other three.
     from ops_csa import csa_compress_kv
-    Ca = H @ W_aKV; Cb = H @ W_bKV; Za = H @ W_aZ; Zb = H @ W_bZ
+    Ca = F.linear(H, W_aKV); Cb = F.linear(H, W_bKV); Za = F.linear(H, W_aZ); Zb = F.linear(H, W_bZ)
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)
     n_blocks = T // m
-    K_idx_raw = H @ W_KV_idx; Z_idx = H @ W_Z_idx
+    K_idx_raw = F.linear(H, W_KV_idx); Z_idx = F.linear(H, W_Z_idx)
     K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)
-    cQ = H @ W_DQ
-    q_idx = (cQ @ W_IUQ).view(B, T, nIh, c_I)
-    w_idx = H @ W_w
+    cQ = F.linear(H, W_DQ)
+    q_idx = F.linear(cQ, W_IUQ).view(B, T, nIh, c_I)
+    w_idx = F.linear(H, W_w)
     cbm = _causal_block_mask(T, n_blocks, m, H.device)
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
                                      scale=c_I ** -0.5, causal_block_mask=cbm)
-    q = (cQ @ W_UQ).view(B, T, nh, c)
+    q = F.linear(cQ, W_UQ).view(B, T, nh, c)
     q = F.normalize(q, dim=-1)
     C_comp_n = F.normalize(C_comp, dim=-1)
     valid_mask = indices >= 0
@@ -1484,11 +1484,11 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     B2, T2, d2 = 1, 32, 16
     m2, nh2, c2, dc2 = 16, 2, 8, 16
     H2 = torch.randn(B2, T2, d2, dtype=dtype, device=device) * 0.1
-    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
     B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, dtype=dtype, device=device) * 0.1
     sink2 = torch.tensor([0.7, -0.2], dtype=dtype, device=device)
 
     o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
@@ -1501,12 +1501,12 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     # computation above); reuse it instead of re-importing under an alias.
     # (Previous comment referenced "line ~1211", which was wrong — that line
     # is in a different function. The actual import is ~100 lines above.)
-    C2 = H2 @ W_KV2; Z2 = H2 @ W_Z2
+    C2 = F.linear(H2, W_KV2); Z2 = F.linear(H2, W_Z2)
     C_comp2 = csa_compress_kv(C2, Z2, B_pos2, m2)
     n_blocks2 = T2 // m2
     C_comp_n2 = F.normalize(C_comp2, dim=-1)
-    cQ2 = H2 @ W_DQ2
-    q2 = (cQ2 @ W_UQ2).view(B2, T2, nh2, c2)
+    cQ2 = F.linear(H2, W_DQ2)
+    q2 = F.linear(cQ2, W_UQ2).view(B2, T2, nh2, c2)
     q2 = F.normalize(q2, dim=-1)
     cbm2 = _causal_block_mask(T2, n_blocks2, m2, H2.device)
     # Cosine-attention scale: q2 and C_comp_n2 are L2-normalized, so the
@@ -1652,18 +1652,18 @@ def test_csa_hca_bf16_dtype_consistency(device='cpu'):
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
     H = torch.randn(B, T, d, dtype=dtype, device=device) * 0.1
-    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
     Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
     Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
-    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(nIh, d, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
     B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
     sink = torch.zeros(nh, dtype=dtype, device=device)
 
@@ -1685,11 +1685,11 @@ def test_csa_hca_bf16_dtype_consistency(device='cpu'):
     B2, T2, d2 = 1, 32, 16
     m2, nh2, c2, dc2 = 16, 2, 8, 16
     H2 = torch.randn(B2, T2, d2, dtype=dtype, device=device) * 0.1
-    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
     B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, dtype=dtype, device=device) * 0.1
     sink2 = torch.zeros(nh2, dtype=dtype, device=device)
 
     try:
@@ -1724,18 +1724,18 @@ def test_csa_hca_no_sink_no_sliding_window(device='cpu'):
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
     H = torch.randn(B, T, d, device=device) * 0.1
-    W_aKV = torch.randn(d, c, device=device) * 0.1
-    W_bKV = torch.randn(d, c, device=device) * 0.1
-    W_aZ = torch.randn(d, c, device=device) * 0.1
-    W_bZ = torch.randn(d, c, device=device) * 0.1
+    W_aKV = torch.randn(c, d, device=device) * 0.1
+    W_bKV = torch.randn(c, d, device=device) * 0.1
+    W_aZ = torch.randn(c, d, device=device) * 0.1
+    W_bZ = torch.randn(c, d, device=device) * 0.1
     Ba = torch.randn(m, c, device=device) * 0.1
     Bb = torch.randn(m, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
-    W_w = torch.randn(d, nIh, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, device=device) * 0.1
+    W_w = torch.randn(nIh, d, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, device=device) * 0.1
     B_idx = torch.randn(m, c_I, device=device) * 0.1
     try:
         o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
@@ -1754,11 +1754,11 @@ def test_csa_hca_no_sink_no_sliding_window(device='cpu'):
     B2, T2, d2 = 1, 32, 16
     m2, nh2, c2, dc2 = 16, 2, 8, 16
     H2 = torch.randn(B2, T2, d2, device=device) * 0.1
-    W_KV2 = torch.randn(d2, c2, device=device) * 0.1
-    W_Z2 = torch.randn(d2, c2, device=device) * 0.1
+    W_KV2 = torch.randn(c2, d2, device=device) * 0.1
+    W_Z2 = torch.randn(c2, d2, device=device) * 0.1
     B_pos2 = torch.randn(m2, c2, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, device=device) * 0.1
     try:
         o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
                           m2=m2, nh=nh2, c=c2, dc=dc2,
@@ -1789,18 +1789,18 @@ def test_csa_topk_edge_cases(device='cpu'):
     m, nh, nIh, c, c_I, dc = 8, 2, 2, 8, 4, 8
     n_blocks = T // m
     H = torch.randn(B, T, d, device=device) * 0.1
-    W_aKV = torch.randn(d, c, device=device) * 0.1
-    W_bKV = torch.randn(d, c, device=device) * 0.1
-    W_aZ = torch.randn(d, c, device=device) * 0.1
-    W_bZ = torch.randn(d, c, device=device) * 0.1
+    W_aKV = torch.randn(c, d, device=device) * 0.1
+    W_bKV = torch.randn(c, d, device=device) * 0.1
+    W_aZ = torch.randn(c, d, device=device) * 0.1
+    W_bZ = torch.randn(c, d, device=device) * 0.1
     Ba = torch.randn(m, c, device=device) * 0.1
     Bb = torch.randn(m, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
-    W_w = torch.randn(d, nIh, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, device=device) * 0.1
+    W_w = torch.randn(nIh, d, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, device=device) * 0.1
     B_idx = torch.randn(m, c_I, device=device) * 0.1
     sink = torch.zeros(nh, device=device)
 
@@ -1858,18 +1858,18 @@ def test_csa_hca_extreme_sink_values(device='cpu'):
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
     H = torch.randn(B, T, d, device=device) * 0.1
-    W_aKV = torch.randn(d, c, device=device) * 0.1
-    W_bKV = torch.randn(d, c, device=device) * 0.1
-    W_aZ = torch.randn(d, c, device=device) * 0.1
-    W_bZ = torch.randn(d, c, device=device) * 0.1
+    W_aKV = torch.randn(c, d, device=device) * 0.1
+    W_bKV = torch.randn(c, d, device=device) * 0.1
+    W_aZ = torch.randn(c, d, device=device) * 0.1
+    W_bZ = torch.randn(c, d, device=device) * 0.1
     Ba = torch.randn(m, c, device=device) * 0.1
     Bb = torch.randn(m, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
-    W_w = torch.randn(d, nIh, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, device=device) * 0.1
+    W_w = torch.randn(nIh, d, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, device=device) * 0.1
     B_idx = torch.randn(m, c_I, device=device) * 0.1
     sink = torch.tensor([100.0, -100.0], device=device)
     try:
@@ -1886,11 +1886,11 @@ def test_csa_hca_extreme_sink_values(device='cpu'):
     B2, T2, d2 = 1, 32, 16
     m2, nh2, c2, dc2 = 16, 2, 8, 16
     H2 = torch.randn(B2, T2, d2, device=device) * 0.1
-    W_KV2 = torch.randn(d2, c2, device=device) * 0.1
-    W_Z2 = torch.randn(d2, c2, device=device) * 0.1
+    W_KV2 = torch.randn(c2, d2, device=device) * 0.1
+    W_Z2 = torch.randn(c2, d2, device=device) * 0.1
     B_pos2 = torch.randn(m2, c2, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, device=device) * 0.1
     sink2 = torch.tensor([100.0, -100.0], device=device)
     try:
         o_hca = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
@@ -2037,18 +2037,18 @@ def test_csa_hca_non_divisible_T(device='cpu'):
     B, T_orig, d = 1, 20, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 2, 2, 2, 8, 4, 8
     H = torch.randn(B, T_orig, d, dtype=dtype, device=device) * 0.1
-    W_aKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bKV = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_aZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
-    W_bZ = torch.randn(d, c, dtype=dtype, device=device) * 0.1
+    W_aKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bKV = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_aZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
+    W_bZ = torch.randn(c, d, dtype=dtype, device=device) * 0.1
     Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
     Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, dtype=dtype, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, dtype=dtype, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, dtype=dtype, device=device) * 0.1
-    W_w = torch.randn(d, nIh, dtype=dtype, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, dtype=dtype, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, dtype=dtype, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, dtype=dtype, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, dtype=dtype, device=device) * 0.1
+    W_w = torch.randn(nIh, d, dtype=dtype, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, dtype=dtype, device=device) * 0.1
     B_idx = torch.randn(m, c_I, dtype=dtype, device=device) * 0.1
     sink = torch.zeros(nh, dtype=dtype, device=device)
 
@@ -2071,11 +2071,11 @@ def test_csa_hca_non_divisible_T(device='cpu'):
     B2, T_orig2, d2 = 1, 20, 16
     m2, nh2, c2, dc2 = 16, 2, 8, 16
     H2 = torch.randn(B2, T_orig2, d2, dtype=dtype, device=device) * 0.1
-    W_KV2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
-    W_Z2 = torch.randn(d2, c2, dtype=dtype, device=device) * 0.1
+    W_KV2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
+    W_Z2 = torch.randn(c2, d2, dtype=dtype, device=device) * 0.1
     B_pos2 = torch.randn(m2, c2, dtype=dtype, device=device) * 0.1
-    W_DQ2 = torch.randn(d2, dc2, dtype=dtype, device=device) * 0.1
-    W_UQ2 = torch.randn(dc2, c2 * nh2, dtype=dtype, device=device) * 0.1
+    W_DQ2 = torch.randn(dc2, d2, dtype=dtype, device=device) * 0.1
+    W_UQ2 = torch.randn(c2 * nh2, dc2, dtype=dtype, device=device) * 0.1
     sink2 = torch.zeros(nh2, dtype=dtype, device=device)
 
     o_direct2 = naive_hca(H2, W_KV2, W_Z2, B_pos2, W_DQ2, W_UQ2,
@@ -2123,18 +2123,18 @@ def test_csa_topk_zero(device='cpu'):
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, c_I, dc = 8, 0, 2, 2, 8, 4, 8
     H = torch.randn(B, T, d, device=device) * 0.1
-    W_aKV = torch.randn(d, c, device=device) * 0.1
-    W_bKV = torch.randn(d, c, device=device) * 0.1
-    W_aZ = torch.randn(d, c, device=device) * 0.1
-    W_bZ = torch.randn(d, c, device=device) * 0.1
+    W_aKV = torch.randn(c, d, device=device) * 0.1
+    W_bKV = torch.randn(c, d, device=device) * 0.1
+    W_aZ = torch.randn(c, d, device=device) * 0.1
+    W_bZ = torch.randn(c, d, device=device) * 0.1
     Ba = torch.randn(m, c, device=device) * 0.1
     Bb = torch.randn(m, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
-    W_w = torch.randn(d, nIh, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, device=device) * 0.1
+    W_w = torch.randn(nIh, d, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, device=device) * 0.1
     B_idx = torch.randn(m, c_I, device=device) * 0.1
     sink = torch.zeros(nh, device=device)
 
@@ -2179,11 +2179,11 @@ def test_hca_T_smaller_than_m2(device='cpu'):
     B, T, d = 1, 8, 16
     m2, nh, c, dc = 16, 2, 8, 16  # m2 > T
     H = torch.randn(B, T, d, device=device) * 0.1
-    W_KV = torch.randn(d, c, device=device) * 0.1
-    W_Z = torch.randn(d, c, device=device) * 0.1
+    W_KV = torch.randn(c, d, device=device) * 0.1
+    W_Z = torch.randn(c, d, device=device) * 0.1
     B_pos = torch.randn(m2, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
     sink = torch.zeros(nh, device=device)
 
     # Without SW: dense branch is fully masked (no preceding block) -> zero.
@@ -2354,23 +2354,23 @@ def test_csa_hca_zero_length_sequence(device='cpu'):
     #   W_DQ:  [d, dc], W_UQ: [dc, c*nh], W_IUQ: [dc, c_I*nIh]
     #   W_w:   [d, nIh], W_KV_idx: [d, c_I], W_Z_idx: [d, c_I]
     #   B_idx: [m, c_I], sink: [nh]
-    W_aKV = torch.randn(d, c, device=device) * 0.1
-    W_bKV = torch.randn(d, c, device=device) * 0.1
-    W_aZ = torch.randn(d, c, device=device) * 0.1
-    W_bZ = torch.randn(d, c, device=device) * 0.1
+    W_aKV = torch.randn(c, d, device=device) * 0.1
+    W_bKV = torch.randn(c, d, device=device) * 0.1
+    W_aZ = torch.randn(c, d, device=device) * 0.1
+    W_bZ = torch.randn(c, d, device=device) * 0.1
     Ba = torch.randn(m, c, device=device) * 0.1
     Bb = torch.randn(m, c, device=device) * 0.1
-    W_DQ = torch.randn(d, dc, device=device) * 0.1
-    W_UQ = torch.randn(dc, c * nh, device=device) * 0.1
-    W_IUQ = torch.randn(dc, c_I * nIh, device=device) * 0.1
-    W_w = torch.randn(d, nIh, device=device) * 0.1
-    W_KV_idx = torch.randn(d, c_I, device=device) * 0.1
-    W_Z_idx = torch.randn(d, c_I, device=device) * 0.1
+    W_DQ = torch.randn(dc, d, device=device) * 0.1
+    W_UQ = torch.randn(c * nh, dc, device=device) * 0.1
+    W_IUQ = torch.randn(c_I * nIh, dc, device=device) * 0.1
+    W_w = torch.randn(nIh, d, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, device=device) * 0.1
     B_idx = torch.randn(m, c_I, device=device) * 0.1
     sink = torch.zeros(nh, device=device)
     # HCA weights
-    W_KV = torch.randn(d, c, device=device) * 0.1
-    W_Z = torch.randn(d, c, device=device) * 0.1
+    W_KV = torch.randn(c, d, device=device) * 0.1
+    W_Z = torch.randn(c, d, device=device) * 0.1
     B_pos = torch.randn(m2, c, device=device) * 0.1
 
     csa_ok = False
@@ -2497,29 +2497,29 @@ def test_csa_hca_input_validation(device='cpu'):
 
     def _build_csa_weights():
         return dict(
-            W_aKV=torch.randn(d, c, device=device),
-            W_bKV=torch.randn(d, c, device=device),
-            W_aZ=torch.randn(d, c, device=device),
-            W_bZ=torch.randn(d, c, device=device),
+            W_aKV=torch.randn(c, d, device=device),
+            W_bKV=torch.randn(c, d, device=device),
+            W_aZ=torch.randn(c, d, device=device),
+            W_bZ=torch.randn(c, d, device=device),
             Ba=torch.randn(m, c, device=device),
             Bb=torch.randn(m, c, device=device),
-            W_DQ=torch.randn(d, dc, device=device),
-            W_UQ=torch.randn(dc, c * nh, device=device),
-            W_IUQ=torch.randn(dc, cI * nIh, device=device),
-            W_w=torch.randn(d, nIh, device=device),
-            W_KV_idx=torch.randn(d, cI, device=device),
-            W_Z_idx=torch.randn(d, cI, device=device),
+            W_DQ=torch.randn(dc, d, device=device),
+            W_UQ=torch.randn(c * nh, dc, device=device),
+            W_IUQ=torch.randn(cI * nIh, dc, device=device),
+            W_w=torch.randn(nIh, d, device=device),
+            W_KV_idx=torch.randn(cI, d, device=device),
+            W_Z_idx=torch.randn(cI, d, device=device),
             B_idx=torch.randn(m, cI, device=device),
         )
 
     def _build_hca_weights():
         m2 = 8
         return dict(
-            W_KV=torch.randn(d, c, device=device),
-            W_Z=torch.randn(d, c, device=device),
+            W_KV=torch.randn(c, d, device=device),
+            W_Z=torch.randn(c, d, device=device),
             B_pos=torch.randn(m2, c, device=device),
-            W_DQ=torch.randn(d, dc, device=device),
-            W_UQ=torch.randn(dc, c * nh, device=device),
+            W_DQ=torch.randn(dc, d, device=device),
+            W_UQ=torch.randn(c * nh, dc, device=device),
         ), m2
 
     # --- c_I=0 must raise ---

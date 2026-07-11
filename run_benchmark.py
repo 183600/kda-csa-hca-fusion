@@ -211,12 +211,12 @@ def bench_csa(B, T, d, device):
         sliding_window=8, sink_logits=torch.zeros(nh, device=device),
     )
     weights = dict(
-        W_aKV=_rand(d, c, device=device), W_bKV=_rand(d, c, device=device),
-        W_aZ=_rand(d, c, device=device), W_bZ=_rand(d, c, device=device),
+        W_aKV=_rand(c, d, device=device), W_bKV=_rand(c, d, device=device),
+        W_aZ=_rand(c, d, device=device), W_bZ=_rand(c, d, device=device),
         Ba=_rand(m, c, device=device), Bb=_rand(m, c, device=device),
-        W_DQ=_rand(d, dc, device=device), W_UQ=_rand(dc, c * nh, device=device),
-        W_IUQ=_rand(dc, cI * nIh, device=device), W_w=_rand(d, nIh, device=device),
-        W_KV_idx=_rand(d, cI, device=device), W_Z_idx=_rand(d, cI, device=device),
+        W_DQ=_rand(dc, d, device=device), W_UQ=_rand(c * nh, dc, device=device),
+        W_IUQ=_rand(cI * nIh, dc, device=device), W_w=_rand(nIh, d, device=device),
+        W_KV_idx=_rand(cI, d, device=device), W_Z_idx=_rand(cI, d, device=device),
         B_idx=_rand(m, cI, device=device),
     )
 
@@ -234,9 +234,9 @@ def bench_hca(B, T, d, device):
         sliding_window=8, sink_logits=torch.zeros(nh, device=device),
     )
     weights = dict(
-        W_KV=_rand(d, c, device=device), W_Z=_rand(d, c, device=device),
+        W_KV=_rand(c, d, device=device), W_Z=_rand(c, d, device=device),
         B_pos=_rand(m2, c, device=device),
-        W_DQ=_rand(d, dc, device=device), W_UQ=_rand(dc, c * nh, device=device),
+        W_DQ=_rand(dc, d, device=device), W_UQ=_rand(c * nh, dc, device=device),
     )
 
     def fn():

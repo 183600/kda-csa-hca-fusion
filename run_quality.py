@@ -462,10 +462,10 @@ class CSAAttn(nn.Module):
         # redundant padding keeps this wrapper thin and avoids doing the
         # pad/trim twice.
         o = naive_csa(
-            x, self.W_aKV.weight.T, self.W_bKV.weight.T,
-            self.W_aZ.weight.T, self.W_bZ.weight.T, self.Ba, self.Bb,
-            self.W_DQ.weight.T, self.W_UQ.weight.T, self.W_IUQ.weight.T,
-            self.W_w.weight.T, self.W_KV_idx.weight.T, self.W_Z_idx.weight.T,
+            x, self.W_aKV.weight, self.W_bKV.weight,
+            self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
+            self.W_DQ.weight, self.W_UQ.weight, self.W_IUQ.weight,
+            self.W_w.weight, self.W_KV_idx.weight, self.W_Z_idx.weight,
             self.B_idx,
             m=self.m, topk=self.topk, nh=self.nh, nIh=self.nIh,
             c=self.c, c_I=self.cI, dc=self.dc,
@@ -501,8 +501,8 @@ class HCAAttn(nn.Module):
         # and trims its output back to the original T, so we no longer need
         # to pad/trim here. See the comment in ``CSAAttn.forward`` for the
         # full rationale.
-        o = naive_hca(x, self.W_KV.weight.T, self.W_Z.weight.T, self.B_pos,
-                      self.W_DQ.weight.T, self.W_UQ.weight.T,
+        o = naive_hca(x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
+                      self.W_DQ.weight, self.W_UQ.weight,
                       m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                       sliding_window=SMALL_MODEL_SPEC['hca_sliding_window'],
                       sink_logits=self.sink)
@@ -1016,6 +1016,17 @@ def main():
     # side of the row ragged with no trailing pipe separators).
     print(f"{'':>4} | {'chance':>10} | {chance:>10.4f} | "
           f"{'':>10} | {'':>8} | {'':>12} | {'':>10}")
+    # Fairness annotation: the softmax baseline is trained for
+    # ``softmax_steps`` steps while the other ops get ``steps`` steps. This
+    # is intentional (softmax needs more steps to converge above chance —
+    # see the comment block at the top of this file), but a reader of the
+    # summary table alone has no way to know that. Print the asymmetry
+    # explicitly so cross-op comparisons are not misread as "softmax is
+    # unfairly advantaged" or "softmax is just better".
+    if softmax_steps != steps:
+        print(f"\nNOTE: softmax trained for {softmax_steps} steps; "
+              f"other ops trained for {steps} steps. See MQAR_SOFTMAX_STEPS "
+              f"env var / README 'Fairness notes' section for rationale.")
 
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped
@@ -1080,6 +1091,19 @@ def main():
                 "CSA is still sparse retrieval — but makes the indexer "
                 "learnable."
             ),
+            'training_steps_fairness': {
+                'softmax_steps': softmax_steps,
+                'other_ops_steps': steps,
+                'note': (
+                    "The softmax baseline is trained for more steps than "
+                    "the other operators so it actually converges (the "
+                    "original 100 steps left softmax at ~10% accuracy, "
+                    "barely above the 6.25% chance level — a useless "
+                    "upper bound). Any cross-op accuracy comparison must "
+                    "annotate this asymmetry. See README 'Fairness notes' "
+                    "section."
+                ),
+            },
             'schema_version': 1,
         },
         'results': all_results,

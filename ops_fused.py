@@ -501,10 +501,10 @@ class CSAHybridLayer(nn.Module):
         if self.training and not self.use_ste:
             self._maybe_warn_indexer()
         o = naive_csa(
-            x, self.W_aKV.weight.T, self.W_bKV.weight.T,
-            self.W_aZ.weight.T, self.W_bZ.weight.T, self.Ba, self.Bb,
-            self.W_DQ.weight.T, self.W_UQ.weight.T, self.W_IUQ.weight.T,
-            self.W_w.weight.T, self.W_KV_idx.weight.T, self.W_Z_idx.weight.T,
+            x, self.W_aKV.weight, self.W_bKV.weight,
+            self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
+            self.W_DQ.weight, self.W_UQ.weight, self.W_IUQ.weight,
+            self.W_w.weight, self.W_KV_idx.weight, self.W_Z_idx.weight,
             self.B_idx,
             m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
             c=cfg.csa_c, c_I=cfg.csa_cI, dc=cfg.csa_dc,
@@ -532,8 +532,8 @@ class HCAHybridLayer(nn.Module):
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         cfg = self.cfg
         o = naive_hca(
-            x, self.W_KV.weight.T, self.W_Z.weight.T, self.B_pos,
-            self.W_DQ.weight.T, self.W_UQ.weight.T,
+            x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
+            self.W_DQ.weight, self.W_UQ.weight,
             m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
             sliding_window=cfg.hca_sliding_window, sink_logits=self.sink,
         )

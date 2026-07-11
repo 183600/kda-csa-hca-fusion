@@ -264,18 +264,18 @@ def csa_lightning_indexer(
 
 def naive_csa(
     H: torch.Tensor,               # [B, T, d]   input hidden states
-    W_aKV: torch.Tensor,           # [d, c]
-    W_bKV: torch.Tensor,           # [d, c]
-    W_aZ: torch.Tensor,            # [d, c]
-    W_bZ: torch.Tensor,            # [d, c]
+    W_aKV: torch.Tensor,           # [c, d]   (nn.Linear.weight layout: [out, in])
+    W_bKV: torch.Tensor,           # [c, d]
+    W_aZ: torch.Tensor,            # [c, d]
+    W_bZ: torch.Tensor,            # [c, d]
     Ba: torch.Tensor,              # [m, c]
     Bb: torch.Tensor,              # [m, c]
-    W_DQ: torch.Tensor,            # [d, dc]
-    W_UQ: torch.Tensor,            # [dc, c*nh]
-    W_IUQ: torch.Tensor,           # [dc, c_I*nIh]
-    W_w: torch.Tensor,             # [d, nIh]
-    W_KV_idx: torch.Tensor,        # [d, c_I]   for indexer key compression
-    W_Z_idx: torch.Tensor,         # [d, c_I]
+    W_DQ: torch.Tensor,            # [dc, d]
+    W_UQ: torch.Tensor,            # [c*nh, dc]
+    W_IUQ: torch.Tensor,           # [c_I*nIh, dc]
+    W_w: torch.Tensor,             # [nIh, d]
+    W_KV_idx: torch.Tensor,        # [c_I, d]   for indexer key compression
+    W_Z_idx: torch.Tensor,         # [c_I, d]
     B_idx: torch.Tensor,           # [m, c_I]
     *,
     m: int,
@@ -292,8 +292,15 @@ def naive_csa(
 ) -> torch.Tensor:
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
-    Returns output ``[B, T, d]`` (after a simple grouped-output projection is
-    elided here for clarity; we project ``[B, T, c*nh] -> d`` with one matrix).
+    Returns output ``[B, T, nh*c]`` (the caller performs the grouped output
+    projection ``[B, T, nh*c] -> d``).
+
+    **Weight layout** (P0 API fix): all ``W_*`` tensors follow the
+    ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
+    Internally we use ``F.linear(x, W)`` (which computes ``x @ W.T``) instead
+    of the previous ``x @ W`` form that required callers to pass
+    ``self.W_aKV.weight.T`` (a non-contiguous view materialized on every
+    forward). Callers now pass ``self.W_aKV.weight`` directly.
 
     ``T`` does NOT need to be divisible by ``m``: the function right-pads the
     sequence with zeros up to the next multiple of ``m`` and trims the output
@@ -381,21 +388,24 @@ def naive_csa(
     n_blocks = T // m
 
     # --- 1. Compress KV (two-branch overlapped) ---
-    Ca = H @ W_aKV
-    Cb = H @ W_bKV
-    Za = H @ W_aZ
-    Zb = H @ W_bZ
+    # P0 API fix: use F.linear (computes H @ W.T) with W in nn.Linear.weight
+    # layout [out, in] — avoids the non-contiguous .weight.T view that the
+    # previous ``H @ W_aKV`` form required at every call site.
+    Ca = F.linear(H, W_aKV)                                       # [B, T, c]
+    Cb = F.linear(H, W_bKV)                                       # [B, T, c]
+    Za = F.linear(H, W_aZ)                                        # [B, T, c]
+    Zb = F.linear(H, W_bZ)                                        # [B, T, c]
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)   # [B, n_blocks, c]
 
     # --- 2. Lightning indexer ---
     # compressed indexer keys via the same compression (single-branch here for simplicity)
-    K_idx_raw = H @ W_KV_idx
-    Z_idx = H @ W_Z_idx
+    K_idx_raw = F.linear(H, W_KV_idx)                             # [B, T, c_I]
+    Z_idx = F.linear(H, W_Z_idx)                                  # [B, T, c_I]
     K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)            # [B, n_blocks, c_I]
     # indexer queries (low-rank)
-    cQ = H @ W_DQ                                                   # [B, T, dc]
-    q_idx = (cQ @ W_IUQ).view(B_, T, nIh, c_I)                     # [B, T, nIh, c_I]
-    w_idx = H @ W_w                                                # [B, T, nIh]
+    cQ = F.linear(H, W_DQ)                                        # [B, T, dc]
+    q_idx = F.linear(cQ, W_IUQ).view(B_, T, nIh, c_I)              # [B, T, nIh, c_I]
+    w_idx = F.linear(H, W_w)                                      # [B, T, nIh]
     cbm = _causal_block_mask(T, n_blocks, m, device)
     # The lightning indexer scores are dot products over DI = c_I (not c),
     # so the correct scale is c_I ** -0.5 (per the DeepSeek-V4 paper Eq. 15:
@@ -434,7 +444,7 @@ def naive_csa(
     # Float``. We cast ``q`` to ``compute_dtype`` before normalization so the
     # entire attention core runs in one consistent precision.
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
-    q = (cQ @ W_UQ).view(B_, T, nh, c).to(compute_dtype)            # [B, T, nh, c]
+    q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
     q = F.normalize(q, dim=-1)
     C_comp_n = F.normalize(C_comp, dim=-1)                         # L2-normalize (cosine-similarity attention)
 
@@ -581,9 +591,9 @@ def naive_csa(
     # optional sliding window branch (local uncompressed KV)
     if sliding_window > 0:
         win = sliding_window
-        # Precompute H @ W_aKV once (reuse Ca from §1) instead of redoing the
-        # matmul per (b, t).
-        H_proj = Ca  # [B, T, c], already == H @ W_aKV
+        # Precompute F.linear(H, W_aKV) once (reuse Ca from §1) instead of
+        # redoing the matmul per (b, t).
+        H_proj = Ca  # [B, T, c], already == F.linear(H, W_aKV)
         # P5 fix — TRUE O(T·win) sliding-window attention (was O(T²)).
         #
         # The previous implementation built a full ``[T, T]`` boolean mask and

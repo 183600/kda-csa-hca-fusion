@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kda-csa-hca-fusion"
+version = "0.1.0"
+description = "Naive PyTorch reference implementation and experimental harness for the KDA+CSA+HCA hybrid linear-attention architecture."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "kda-csa-hca-fusion contributors" },
+]
+keywords = [
+    "linear-attention",
+    "kda",
+    "csa",
+    "hca",
+    "deepseek-v4",
+    "kimi-linear",
+    "long-context",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "einops>=0.6",
+    "matplotlib>=3.5",
+    "numpy>=1.21",
+    # scipy is optional; run_quality.py has a fallback t-distribution table
+    # when scipy is missing. Listed here so `pip install -e .` pulls it in
+    # for the canonical statistical-test path.
+    "scipy>=1.7; python_version >= '3.9'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+"Source" = "https://gitee.com/qwe12345678/kda-csa-hca-fusion"
+
+# Treat the repository root as a flat package (the modules live at the top
+# level, not under a `kch_fusion/` directory). This lets `pip install -e .`
+# make `ops_kda`, `ops_csa`, `ops_hca`, `ops_fused`, `run_*`, etc. importable
+# from anywhere — eliminating the `sys.path.insert(0, os.path.dirname(...))`
+# hacks scattered across the scripts.
+#
+# Note: the legacy `sys.path.insert` calls are kept in the scripts for
+# backward compatibility with the `python script.py` invocation pattern;
+# they are no-ops once the package is installed.
+[tool.setuptools]
+py-modules = [
+    "ops_kda",
+    "ops_csa",
+    "ops_hca",
+    "ops_fused",
+    "run_correctness",
+    "run_benchmark",
+    "run_quality",
+    "run_ablation",
+    "run_decoding",
+    "run_kv_cache",
+    "run_all",
+    "make_figures",
+    "method_analysis",
+    "kaggle_setup",
+    "test_figures",
+]
+
+[tool.pytest.ini_options]
+# Make pytest discover the test functions in run_correctness.py and
+# test_figures.py. The test functions use the standard `test_*` naming
+# convention but the files also contain a `main()` that the custom runner
+# calls; pytest will collect only the `test_*` functions, which is the
+# desired behavior for selective / parallel runs.
+python_files = ["run_correctness.py", "test_figures.py", "test_*.py"]
+python_functions = ["test_*"]
+testpaths = ["."]
+# Register the ``slow`` marker (used by conftest.py to tag long-running
+# tests so ``pytest -m "not slow"`` can skip them during fast CI loops).
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
