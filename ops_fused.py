@@ -350,8 +350,29 @@ class KDAHybridLayer(nn.Module):
         # chunk) to RETURN to the caller. We do NOT write it to self —
         # that is the caller's responsibility (or the stateful
         # ``forward()`` wrapper does it).
+        #
+        # P0-3 fix: respect ``detach_lookback``. Previously ALL three
+        # branches unconditionally called ``.detach().clone()``, which
+        # meant ``detach_lookback=False`` had NO effect on the NEW
+        # lookback returned to the caller — only the INCOMING lookback
+        # was conditionally detached. That broke the documented
+        # cross-chunk BPTT contract: the docstring at the top of
+        # ``_kda_forward`` says ``detach_lookback=False`` lets gradients
+        # flow across chunks, but the next chunk's lookback (produced
+        # here) was always detached, so gradient flow stopped at the
+        # first chunk boundary.
+        #
+        # The fix: build the new lookback from the (possibly
+        # non-detached) ``x`` tensor first, then detach+clone it ONLY if
+        # ``detach_lookback=True``. When ``detach_lookback=False``, the
+        # caller receives a lookback that still carries the autograd
+        # graph from the current chunk's input, so the next chunk's
+        # forward can backprop into the current chunk's parameters
+        # (true cross-chunk BPTT). The ``.clone()`` is always applied
+        # so the caller can mutate the returned tensor without
+        # aliasing the source slice (a defensive copy).
         if T >= ksize - 1:
-            new_lookback = x[:, -(ksize - 1):].detach().clone()
+            new_lookback = x[:, -(ksize - 1):]
         else:
             # Chunk shorter than the lookback window: keep what we have and
             # prepend the existing lookback (the most recent ``ksize-1`` tokens
@@ -359,14 +380,17 @@ class KDAHybridLayer(nn.Module):
             # can be shorter than ksize-1=2) but the right thing to do.
             if lookback is not None:
                 combined = torch.cat([lookback, x], dim=1)
-                new_lookback = combined[:, -(ksize - 1):].detach().clone()
+                new_lookback = combined[:, -(ksize - 1):]
             else:
                 # No previous lookback and chunk shorter than window: pad with
                 # zeros on the left to keep the shape contract.
                 pad_len = (ksize - 1) - T
                 new_lookback = torch.cat(
                     [torch.zeros(B, pad_len, d, device=x.device, dtype=x.dtype),
-                     x], dim=1).detach().clone()
+                     x], dim=1)
+        if detach_lookback:
+            new_lookback = new_lookback.detach()
+        new_lookback = new_lookback.clone()
         # View BEFORE normalize: ``F.normalize(dim=-1)`` must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector. The
         # previous form ``F.normalize(F.silu(...), dim=-1).view(B, T, H, K)``

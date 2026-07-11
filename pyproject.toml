@@ -7,7 +7,7 @@ name = "kda-csa-hca-fusion"
 version = "0.1.0"
 description = "Naive PyTorch reference implementation and experimental harness for the KDA+CSA+HCA hybrid linear-attention architecture."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
     { name = "kda-csa-hca-fusion contributors" },
@@ -29,7 +29,6 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -55,7 +54,7 @@ dependencies = [
     # pulls it in for the canonical statistical-test path. scipy 1.13+
     # changed the default ``stats.t.ppf`` numerical precision in edge
     # cases.
-    "scipy>=1.7,<1.15; python_version >= '3.9'",
+    "scipy>=1.7,<1.15; python_version >= '3.10'",
 ]
 
 [project.optional-dependencies]

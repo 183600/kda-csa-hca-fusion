@@ -161,35 +161,34 @@ def csa_lightning_indexer(
         Controls the backward-path behaviour of the straight-through
         estimator (STE) when ``return_soft_weights=True``:
 
-        * ``'topk_columns'`` (default, current implementation): the
-          differentiable ``soft_weights`` returned for the STE is
-          gathered ONLY along the hard top-k columns. The gradient on
-          non-selected blocks is exactly zero — this mirrors the hard
-          selection's forward semantics but means the indexer never
-          learns "you should have been selected". This is the
-          simplified variant documented as the current behaviour in
-          the README.
-        * ``'full_softmax'``: the STE gradient flows through the full
-          softmax over all blocks. Non-selected blocks receive a
-          (small) gradient. Slightly less faithful to the sparse
-          forward semantics but provides a denser training signal.
-          (Currently aliased to ``'topk_columns'`` for forward
-          equivalence; the difference is only realised when the
-          caller unpacks ``soft_weights`` and uses it differently —
-          see ``naive_csa``'s STE block.)
+        * ``'topk_columns'`` (default): the differentiable ``soft_weights``
+          returned for the STE is gathered ONLY along the hard top-k
+          columns. The gradient on non-selected blocks is exactly zero —
+          this mirrors the hard selection's forward semantics but means
+          the indexer never learns "you should have been selected". This
+          is the simplified variant documented as the current behaviour
+          in the README.
+        * ``'full_softmax'``: the STE gradient additionally flows through
+          the FULL softmax distribution over all blocks (including
+          non-selected ones). The forward pass is unchanged (still the
+          hard top-k gather, preserving sparsity), but the backward pass
+          routes gradient through ``soft_weights`` for EVERY block — the
+          indexer learns from non-selected blocks too, providing a denser
+          training signal. This is implemented in ``naive_csa``'s STE
+          block via a zero-in-forward addend whose backward is the full
+          softmax's expected KV.
         * ``'aux_contrastive'``: reserved for a future implementation
           of DeepSeek-V4's contrastive auxiliary loss on the
           selection logits. Currently raises ``NotImplementedError``
           if explicitly requested.
 
-        The current code path always returns the same ``soft_weights``
-        tensor (the full softmax over all blocks); the ``ste_mode``
-        parameter is read by ``naive_csa``'s STE gather block to
-        decide whether to gather top-k columns (default) or use the
-        full distribution. The default ``'topk_columns'`` matches the
-        historical behaviour and the published CSA reference
-        implementation; the other modes are documented for
-        extensibility and ablation.
+        ``csa_lightning_indexer`` itself always returns the same
+        ``soft_weights`` tensor (the full softmax over all blocks); the
+        ``ste_mode`` parameter is consumed by ``naive_csa``'s STE gather
+        block, which builds a different differentiable surrogate for each
+        mode. The default ``'topk_columns'`` matches the historical
+        behaviour and the published CSA reference implementation; the
+        other modes are documented for extensibility and ablation.
 
     normalize_qk : bool, default ``False``
         If True, L2-normalize ``q_idx`` and ``k_idx`` along the
@@ -606,19 +605,50 @@ def naive_csa(
         # After ``backward()``, those parameters now have non-None
         # ``.grad`` and are updated by the optimizer.
         #
-        # We only gather the top-k columns of ``soft_weights`` (rather
-        # than the full [B, T, n_blocks] matrix) so the STE gradient
-        # matches the hard selection as closely as possible: the
-        # gradient on a non-selected block is zero in the hard path, so
-        # we mirror that by only passing gradient through the selected
-        # columns. (Using the full soft_weights would also work but
-        # would push gradient toward ALL blocks, which is less faithful
-        # to the sparse selection semantics.)
+        # P0-2 fix — implement ``ste_mode`` as two genuinely distinct
+        # branches instead of silently aliasing ``'full_softmax'`` to
+        # ``'topk_columns'``. Both modes share the same STE identity
+        #
+        #     kv_ste = soft_kv + (kv - soft_kv).detach()
+        #
+        # which makes the forward pass identical to the hard top-k gather
+        # (preserving sparsity) but routes the backward pass through
+        # ``soft_kv`` (and therefore through ``soft_weights`` -> ``logits``
+        # -> indexer parameters). The two modes differ in WHAT ``soft_kv``
+        # depends on:
+        #
+        # * ``topk_columns``: ``soft_kv`` depends only on the top-k columns
+        #   of ``soft_weights`` (via ``torch.gather``). The gradient on
+        #   non-selected blocks is exactly zero — the indexer only learns
+        #   "the selected blocks were right/wrong", never "you should have
+        #   selected block j".
+        #
+        # * ``full_softmax``: ``soft_kv`` ADDITIONALLY depends on the full
+        #   softmax distribution via a zero-in-forward addend:
+        #
+        #       aux = soft_full_expanded - soft_full_expanded.detach()
+        #
+        #   where ``soft_full = sum_b soft_weights[b,t,b] * C_comp_n[b,b,:]``
+        #   is the full-softmax expected KV (shape [B,T,c], broadcast across
+        #   the topk axis). Forward value of ``aux`` is exactly zero (so
+        #   the forward pass is unchanged), but its backward is
+        #   ``d(soft_full)`` which flows gradient to EVERY block's
+        #   ``soft_weights`` entry. This gives the indexer a denser training
+        #   signal: non-selected blocks now receive a (typically small)
+        #   gradient proportional to their softmax probability.
+        #
+        # The two modes are forward-equivalent (same sparse top-k gather)
+        # but backward-distinct (different gradient distributions), exactly
+        # as documented in the ``ste_mode`` docstring above. A regression
+        # test in ``run_correctness.py::test_csa_indexer_ste_full_softmax``
+        # verifies both the forward-equivalence and the backward-distinctness
+        # (non-selected blocks receive non-zero gradient only under
+        # ``full_softmax``).
         if use_ste and soft_weights is not None:
-            # Gather the top-k columns of soft_weights using the SAME
-            # indices (idx_safe). soft_weights is [B, T, n_blocks];
-            # we want soft_weights_selected[b, t, k] = soft_weights[b, t, idx_safe[b, t, k]].
-            # ``torch.gather`` along the last dim does exactly this.
+            # Common path: gather top-k columns of soft_weights. This is
+            # the differentiable surrogate for both modes (forward-equivalent
+            # to the hard gather). ``full_softmax`` adds an additional
+            # term below.
             soft_weights_selected = torch.gather(
                 soft_weights, dim=-1, index=idx_safe)                # [B, T, topk]
             # Mask out invalid (-1) slots so they contribute zero
@@ -630,6 +660,31 @@ def naive_csa(
             # w.r.t. soft_weights (and therefore the indexer params).
             # soft_kv[b, t, k, :] = soft_weights_selected[b, t, k] * kv[b, t, k, :]
             soft_kv = soft_weights_selected.unsqueeze(-1) * kv       # [B, T, topk, c]
+
+            if ste_mode == 'full_softmax':
+                # Add a zero-in-forward term whose backward is the full
+                # softmax's expected KV, so gradient flows to ALL blocks
+                # (not just the top-k). This is the dense training signal
+                # that distinguishes ``full_softmax`` from ``topk_columns``.
+                #
+                # ``C_comp_n`` is [B, n_blocks, c]; ``soft_weights`` is
+                # [B, T, n_blocks]. Their contraction gives the expected
+                # KV per (b, t): [B, T, c]. We then broadcast across the
+                # topk axis so the shape matches ``soft_kv`` for the STE
+                # identity below.
+                soft_full = torch.einsum(
+                    'btn,bnc->btc', soft_weights, C_comp_n)          # [B, T, c]
+                # Expand to [B, T, topk, c] and apply the STE zero-in-forward
+                # trick: forward = soft_full - soft_full.detach() = 0,
+                # backward = d(soft_full) (flows to all blocks).
+                topk_size = kv.shape[2]
+                aux = (soft_full.unsqueeze(2).expand(-1, -1, topk_size, -1)
+                       - soft_full.unsqueeze(2).expand(-1, -1, topk_size, -1).detach())
+                # ``aux`` has zero forward value but its backward adds
+                # ``d(soft_full)`` to ``d(soft_kv)``, so the total
+                # differentiable path now depends on ALL blocks' soft_weights.
+                soft_kv = soft_kv + aux
+
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
             kv = soft_kv + (kv - soft_kv).detach()
 

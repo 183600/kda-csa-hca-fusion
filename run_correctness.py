@@ -1034,6 +1034,261 @@ def test_csa_indexer_ste_gradient(device='cpu'):
     ]
 
 
+def test_csa_indexer_ste_full_softmax(device='cpu'):
+    """P0-2 regression: ``ste_mode='full_softmax'`` must be distinct from
+    ``'topk_columns'`` and from the no-STE path.
+
+    Before the P0-2 fix, ``ste_mode='full_softmax'`` was silently aliased
+    to ``'topk_columns'`` — the docstring claimed a denser gradient
+    signal but the code path was identical. This test pins the fix:
+
+    1. **Forward equivalence**: ``full_softmax`` and ``topk_columns``
+       produce bit-identical forward outputs (the STE only changes the
+       backward path).
+
+    2. **Backward distinctness**: under ``full_softmax``, the gradient
+       on ``soft_weights`` (and therefore on the indexer parameters) is
+       NON-ZERO for non-selected blocks; under ``topk_columns`` it is
+       EXACTLY ZERO for non-selected blocks. We verify this by checking
+       that the indexer parameter ``W_KV_idx`` receives a LARGER
+       gradient norm under ``full_softmax`` than under ``topk_columns``
+       (because more blocks contribute).
+
+    3. **No-STE distinctness**: ``ste_mode`` has NO effect when
+       ``use_ste=False`` — both modes produce bit-identical forward
+       outputs and no gradient on indexer params. This is a sanity
+       check that the ``ste_mode`` branch is correctly guarded by
+       ``use_ste``.
+    """
+    logger.info("Test: CSA indexer STE full_softmax distinctness (P0-2 fix)")
+    torch.manual_seed(7)
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, cI, dc = 4, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device, dtype=torch.float64)
+
+    def _make_params():
+        return dict(
+            W_aKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_aZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            Ba=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            Bb=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            W_DQ=torch.randn(dc, d, dtype=torch.float64) * 0.1,
+            W_UQ=torch.randn(c * nh, dc, dtype=torch.float64) * 0.1,
+            W_IUQ=torch.randn(cI * nIh, dc, dtype=torch.float64) * 0.1,
+            W_w=torch.randn(nIh, d, dtype=torch.float64) * 0.1,
+            W_KV_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            W_Z_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            B_idx=torch.randn(m, cI, dtype=torch.float64) * 0.02,
+        )
+
+    common = dict(m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+                  sliding_window=0, sink_logits=None)
+
+    # --- Part 1: forward equivalence between the two STE modes ---
+    import copy
+    p_ref = _make_params()
+    p_fs = copy.deepcopy(p_ref)
+    with torch.no_grad():
+        o_tk = naive_csa(H, **p_ref, use_ste=True,
+                         ste_mode='topk_columns', **common)
+        o_fs = naive_csa(H, **p_fs, use_ste=True,
+                         ste_mode='full_softmax', **common)
+    fwd_equiv = torch.allclose(o_tk, o_fs, rtol=0, atol=1e-12)
+    fwd_diff = (o_tk - o_fs).abs().max().item() if not fwd_equiv else 0.0
+
+    # --- Part 2: backward distinctness ---
+    # Under ``full_softmax``, gradient flows to ALL blocks (including
+    # non-selected ones), so the total gradient norm on the indexer
+    # params is larger than under ``topk_columns`` (where only the
+    # selected blocks contribute). We measure the L1 norm of the
+    # gradient on ``W_KV_idx`` (which directly produces the indexer
+    # keys) under both modes and assert full_softmax > topk_columns.
+    #
+    # We also verify both modes produce non-None gradients (they're
+    # both STE paths).
+    indexer_param_names = ['W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx']
+
+    def _run_backward(ste_mode):
+        p = _make_params()
+        for name in indexer_param_names:
+            p[name] = p[name].clone().requires_grad_(True)
+        o = naive_csa(H, **p, use_ste=True, ste_mode=ste_mode, **common)
+        o.sum().backward()
+        return {name: p[name].grad for name in indexer_param_names}
+
+    grads_tk = _run_backward('topk_columns')
+    grads_fs = _run_backward('full_softmax')
+
+    # All grads must be non-None and finite.
+    tk_grads_finite = all(
+        g is not None and torch.isfinite(g).all() for g in grads_tk.values())
+    fs_grads_finite = all(
+        g is not None and torch.isfinite(g).all() for g in grads_fs.values())
+
+    # full_softmax must produce STRICTLY LARGER total L1 grad norm on
+    # W_KV_idx than topk_columns. The "strictly larger" comes from the
+    # additional gradient path through non-selected blocks. We use a
+    # margin of 1e-12 to allow for fp64 rounding noise.
+    tk_norm = grads_tk['W_KV_idx'].abs().sum().item()
+    fs_norm = grads_fs['W_KV_idx'].abs().sum().item()
+    fs_dense_signal = fs_norm > tk_norm + 1e-12
+
+    # --- Part 3: no-STE invariance ---
+    # ste_mode has no effect when use_ste=False. Both modes produce
+    # identical forward outputs.
+    p_noste_a = _make_params()
+    p_noste_b = copy.deepcopy(p_noste_a)
+    with torch.no_grad():
+        o_noste_tk = naive_csa(H, **p_noste_a, use_ste=False,
+                               ste_mode='topk_columns', **common)
+        o_noste_fs = naive_csa(H, **p_noste_b, use_ste=False,
+                               ste_mode='full_softmax', **common)
+    noste_equiv = torch.allclose(o_noste_tk, o_noste_fs, rtol=0, atol=0)
+
+    return [
+        _ok('full_softmax forward == topk_columns forward (bit-identical)',
+            fwd_equiv, f'max_abs_diff={fwd_diff}'),
+        _ok('topk_columns: all indexer grads finite & non-None',
+            tk_grads_finite,
+            f'W_KV_idx.grad is None: {grads_tk["W_KV_idx"] is None}'),
+        _ok('full_softmax: all indexer grads finite & non-None',
+            fs_grads_finite,
+            f'W_KV_idx.grad is None: {grads_fs["W_KV_idx"] is None}'),
+        _ok('full_softmax has denser grad signal (||W_KV_idx.grad||_1 larger)',
+            fs_dense_signal,
+            f'topk_columns={tk_norm:.6e}, full_softmax={fs_norm:.6e}'),
+        _ok('no-STE: ste_mode has no effect (forward bit-identical)',
+            noste_equiv,
+            f'diff={(o_noste_tk - o_noste_fs).abs().max().item() if not noste_equiv else 0}'),
+    ]
+
+
+def test_kda_cross_chunk_bptt(device='cpu'):
+    """P0-3 regression: ``detach_lookback=False`` enables cross-chunk BPTT.
+
+    Before the P0-3 fix, ``KDAHybridLayer.forward_functional`` unconditionally
+    called ``.detach().clone()`` on the new lookback returned to the caller.
+    This meant ``detach_lookback=False`` had NO effect on the OUTGOING
+    lookback — only the INCOMING lookback was conditionally detached. As a
+    result, gradient flow stopped at the first chunk boundary even when the
+    caller explicitly requested cross-chunk BPTT.
+
+    This test verifies the fix:
+
+    1. **detach_lookback=True (default)**: gradients do NOT flow across
+       chunks. Perturbing chunk-1's input does not affect chunk-2's
+       output's gradient w.r.t. chunk-1's parameters (the lookback is
+       detached, so chunk-2's forward sees a constant).
+
+    2. **detach_lookback=False**: gradients DO flow across chunks.
+       Chunk-2's output depends on chunk-1's parameters through the
+       lookback tensor, so backward through chunk-2 produces non-None
+       gradients on chunk-1's parameters.
+
+    We test the KDA layer directly (not the full HybridKCHAttention) so
+    the lookback path is isolated from the recurrent state path (which
+    is controlled by a separate ``detach_state`` flag in the hybrid
+    layer and is NOT part of the P0-3 fix scope).
+    """
+    logger.info("Test: KDA cross-chunk BPTT via detach_lookback=False (P0-3 fix)")
+    torch.manual_seed(123)
+    cfg = HybridConfig(
+        d_model=16, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        kda_chunk_size=0,  # use recurrent path (short chunks)
+        n_kda=1, n_csa=0, n_hca=0,
+    )
+    layer = KDAHybridLayer(cfg).to(device).to(torch.float64)
+
+    # Two chunks. We'll run chunk 1, get the new lookback, then run
+    # chunk 2 with that lookback.
+    B, T1, T2 = 1, 8, 8
+    x1 = torch.randn(B, T1, cfg.d_model, device=device, dtype=torch.float64,
+                     requires_grad=True)
+    x2 = torch.randn(B, T2, cfg.d_model, device=device, dtype=torch.float64)
+
+    def _run_two_chunks(detach_lookback):
+        # Re-init layer weights to the SAME values for fair comparison.
+        torch.manual_seed(456)
+        layer2 = KDAHybridLayer(cfg).to(device).to(torch.float64)
+        # Copy weights from the original layer so both runs use identical params.
+        layer2.load_state_dict(layer.state_dict())
+        # First chunk: no state, no lookback (fresh sequence).
+        o1, new_state, new_lookback = layer2.forward_functional(
+            x1.clone().requires_grad_(True), None, None,
+            detach_lookback=detach_lookback)
+        # Second chunk: use the lookback from chunk 1. The state is also
+        # carried over (but the state path is NOT controlled by
+        # detach_lookback; we focus on the lookback path here).
+        # We pass detach_lookback again so the lookback returned by chunk 2
+        # is also non-detached (irrelevant for this test but consistent).
+        o2, _, _ = layer2.forward_functional(
+            x2.clone(), new_state, new_lookback,
+            detach_lookback=detach_lookback)
+        return o2
+
+    # --- Case A: detach_lookback=True (default; no cross-chunk BPTT) ---
+    # The lookback returned by chunk 1 is detached, so chunk 2's output
+    # cannot backprop into chunk 1's input x1 (via the lookback path).
+    # We verify this by checking that x1.grad is None (or zero) after
+    # backward through chunk 2 only.
+    #
+    # NOTE: there's a subtlety — the recurrent ``state`` returned by
+    # chunk 1 also carries gradient. To isolate the LOOKBACK path, we
+    # detach the state explicitly before passing it to chunk 2. This
+    # ensures the only cross-chunk path is the lookback.
+    o2_det = _run_two_chunks(detach_lookback=True)
+    # Sum-reduce to a scalar and backward.
+    o2_det.sum().backward()
+    # x1's grad should be None (no cross-chunk path through lookback,
+    # and state was detached).
+    # We need to access x1 from the inner scope. Re-run with explicit tracking:
+    torch.manual_seed(456)
+    layer_a = KDAHybridLayer(cfg).to(device).to(torch.float64)
+    layer_a.load_state_dict(layer.state_dict())
+    x1_a = x1.clone().detach().requires_grad_(True)
+    o1_a, st_a, lb_a = layer_a.forward_functional(x1_a, None, None,
+                                                   detach_lookback=True)
+    # Detach state to isolate the lookback path.
+    st_a_det = st_a.detach()
+    o2_a, _, _ = layer_a.forward_functional(x2.clone(), st_a_det, lb_a,
+                                             detach_lookback=True)
+    o2_a.sum().backward()
+    x1_grad_a_none = (x1_a.grad is None) or (x1_a.grad.abs().sum().item() == 0.0)
+
+    # --- Case B: detach_lookback=False (cross-chunk BPTT) ---
+    torch.manual_seed(456)
+    layer_b = KDAHybridLayer(cfg).to(device).to(torch.float64)
+    layer_b.load_state_dict(layer.state_dict())
+    x1_b = x1.clone().detach().requires_grad_(True)
+    o1_b, st_b, lb_b = layer_b.forward_functional(x1_b, None, None,
+                                                   detach_lookback=False)
+    # Detach state to isolate the lookback path.
+    st_b_det = st_b.detach()
+    o2_b, _, _ = layer_b.forward_functional(x2.clone(), st_b_det, lb_b,
+                                             detach_lookback=False)
+    o2_b.sum().backward()
+    # x1's grad should now be non-None and non-zero (gradient flows
+    # from chunk 2's output back through the lookback into chunk 1's input).
+    x1_grad_b_exists = (x1_b.grad is not None)
+    x1_grad_b_nonzero = (x1_grad_b_exists and
+                          x1_b.grad.abs().sum().item() > 0)
+
+    return [
+        _ok('detach_lookback=True: x1.grad is None (no cross-chunk BPTT)',
+            x1_grad_a_none,
+            f'x1.grad = {x1_a.grad}'),
+        _ok('detach_lookback=False: x1.grad exists (cross-chunk path)',
+            x1_grad_b_exists,
+            f'x1.grad is None: {not x1_grad_b_exists}'),
+        _ok('detach_lookback=False: x1.grad is non-zero (BPTT flows)',
+            x1_grad_b_nonzero,
+            f'x1.grad.abs().sum() = {x1_b.grad.abs().sum().item() if x1_grad_b_exists else 0}'),
+    ]
+
+
 def test_hca_sliding_window_causality(device='cpu'):
     """Verify HCA's sliding-window branch only attends to past + current.
 
@@ -3544,6 +3799,11 @@ def main():
     all_results += _run_safe(test_csa_indexer_topk_zero, device)
     # P0-4 regression: STE must make the CSA indexer parameters trainable.
     all_results += _run_safe(test_csa_indexer_ste_gradient, device)
+    # P0-2 regression: ste_mode='full_softmax' must be a distinct branch
+    # (not silently aliased to 'topk_columns').
+    all_results += _run_safe(test_csa_indexer_ste_full_softmax, device)
+    # P0-3 regression: detach_lookback=False enables cross-chunk BPTT.
+    all_results += _run_safe(test_kda_cross_chunk_bptt, device)
     all_results += _run_safe(test_hca_sliding_window_causality, device)
     all_results += _run_safe(test_csa_full_pipeline_causality, device)
     # Regression tests for bugs found during code review.
