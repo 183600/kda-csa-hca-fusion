@@ -42,7 +42,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, sanitize_for_json
+from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
 from ops_kda import naive_recurrent_kda
 
 # P0 fix: emit a one-shot warning at import time so notebook / REPL
@@ -629,13 +629,17 @@ def main():
     # the same logic across run_*.py and ensures any future edge-case fix
     # propagates everywhere).
     sanitized = [sanitize_for_json(r) for r in results]
+    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
     try:
-        text = json.dumps(sanitized, indent=2, allow_nan=False)
+        write_json_atomic(sanitized, 'results/exp6_decoding.json',
+                          indent=2, allow_nan=False)
     except (TypeError, ValueError) as e:
         print(f'[run_decoding] WARNING: JSON serialization failed: {e}')
-        text = json.dumps(sanitized, indent=2, default=str)
-    with open('results/exp6_decoding.json', 'w') as f:
-        f.write(text)
+        write_json_atomic(sanitized, 'results/exp6_decoding.json',
+                          indent=2, default=str)
     print('\nSaved: results/exp6_decoding.json')
 
 

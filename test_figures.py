@@ -6,10 +6,12 @@ These tests verify that ``make_figures.py`` handles edge cases gracefully:
   * Missing result files (file does not exist)
   * Suptitle positioning (no clipping at the top of the saved image)
 
-The tests are designed to be self-contained: they create temporary result
-files, run the figure functions, and assert properties via ``assert``
-(raising AssertionError on failure). They do NOT depend on the actual
-experiment results.
+The tests are self-contained: they redirect ``make_figures._RESULTS_DIR``
+and ``make_figures._FIGURES_DIR`` to a per-test temp directory (via pytest's
+``tmp_path`` + ``monkeypatch``, or via ``tempfile.TemporaryDirectory`` for
+the direct ``python3 test_figures.py`` path). They NEVER touch the real
+``results/`` or ``figures/`` directories, so they are safe to run in
+parallel (pytest-xdist) and do not require backup/restore machinery.
 
 Run via pytest:
     pytest test_figures.py
@@ -19,9 +21,9 @@ Or directly:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 import warnings
@@ -34,79 +36,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import make_figures  # noqa: E402
-
-RESULTS_DIR = os.path.join(HERE, 'results')
-FIGURES_DIR = os.path.join(HERE, 'figures')
-
-# Per-session backup directory. Lazily created on the first call to
-# ``_get_backup_dir()`` (NOT at module import) so that simply importing
-# ``test_figures`` — e.g. by a test collector, ``run_all.py``, or an IDE
-# auto-import — does not leak an orphan temp directory that is only
-# cleaned up if ``main()`` or the pytest session-scoped fixture runs to
-# completion. The previous ``_BACKUP_DIR = tempfile.mkdtemp(...)`` at
-# module scope ran at import time and accumulated orphan dirs on every
-# bare import. Uses mkdtemp so concurrent test runs (e.g. CI matrix) do
-# not collide on a shared global path. The previous-previous
-# ``BACKUP_DIR = os.path.join(tempfile.gettempdir(), '_fig_test_backups')``
-# was a fixed global path; two parallel test runs would overwrite each
-# other's backups.
-_BACKUP_DIR: str | None = None
-
-
-def _get_backup_dir() -> str:
-    """Lazily create and cache the per-session backup directory."""
-    global _BACKUP_DIR
-    if _BACKUP_DIR is None:
-        _BACKUP_DIR = tempfile.mkdtemp(prefix='_fig_test_backups_')
-    return _BACKUP_DIR
-
-
-def _backup_results():
-    """Back up all existing result files AND figures to a temp dir.
-
-    Previously only ``results/`` was backed up, but the tests also write
-    into ``figures/`` (via ``make_figures.fig_*``). After a test run the
-    real figures were silently overwritten by synthetic test output.
-    """
-    backup_dir = _get_backup_dir()
-    os.makedirs(backup_dir, exist_ok=True)
-    for src_dir, name in [(RESULTS_DIR, 'results'), (FIGURES_DIR, 'figures')]:
-        if not os.path.isdir(src_dir):
-            continue
-        dst = os.path.join(backup_dir, name)
-        os.makedirs(dst, exist_ok=True)
-        for fname in os.listdir(src_dir):
-            src = os.path.join(src_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy(src, os.path.join(dst, fname))
-
-
-def _restore_results():
-    """Restore result files AND figures from the backup."""
-    backup_dir = _get_backup_dir()
-    for dst_dir, name in [(RESULTS_DIR, 'results'), (FIGURES_DIR, 'figures')]:
-        src_dir = os.path.join(backup_dir, name)
-        if not os.path.isdir(src_dir):
-            continue
-        os.makedirs(dst_dir, exist_ok=True)
-        for fname in os.listdir(src_dir):
-            src = os.path.join(src_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy(src, os.path.join(dst_dir, fname))
-
-
-def _write_results(name, data):
-    """Write a synthetic results JSON file into the real results/ dir.
-
-    The test must run ``make_figures.fig_*`` against the same directory
-    ``make_figures.load`` reads from (``_RESULTS_DIR`` inside
-    ``make_figures.py``, which equals ``HERE/results``). So we have to
-    write into the real ``results/`` dir — but the autouse fixture below
-    backs it up and restores it after the session.
-    """
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(os.path.join(RESULTS_DIR, name), 'w') as f:
-        json.dump(data, f)
 
 
 def _ok(name, cond, detail=''):
@@ -123,35 +52,61 @@ def _ok(name, cond, detail=''):
     return cond
 
 
-# --- pytest integration ---------------------------------------------------
-# When run via pytest (``pytest test_figures.py``), the test_* functions
-# are picked up by name. Without this autouse fixture, pytest would NOT
-# call ``main()``, so the backup/restore in ``main()`` would never run,
-# and the synthetic test data written by ``_write_results`` would
-# silently OVERWRITE the real ``results/exp2_benchmark.json`` (and
-# ``figures/fig_*.png/pdf``) — corrupting committed experiment data.
+# --- per-test temp-directory helpers ------------------------------------
+# P1-6 fix: every test must run against a per-test temp directory, NOT the
+# real ``results/`` / ``figures/`` directories. The previous backup/restore
+# mechanism was broken in two ways:
+#   1. ``_restore_results`` only copied old files back — it did NOT delete
+#      files that the test created and that didn't exist before. So a test
+#      that wrote ``_test_envelope.json`` would leave that file in the real
+#      ``results/`` dir forever.
+#   2. Multiple pytest-xdist workers would compete on the same real
+#      directory, corrupting each other's backup/restore cycles.
+# The fix uses pytest's ``tmp_path`` + ``monkeypatch`` (or a
+# ``tempfile.TemporaryDirectory`` for the direct-run path) to redirect
+# ``make_figures._RESULTS_DIR`` and ``make_figures._FIGURES_DIR`` to a
+# per-test temp dir. The real directories are never touched.
+
+@contextlib.contextmanager
+def _redirect_dirs(tmpdir: str):
+    """Redirect ``make_figures._RESULTS_DIR`` and ``_FIGURES_DIR`` to
+    ``tmpdir`` for the duration of the ``with`` block.
+
+    Creates ``{tmpdir}/results`` and ``{tmpdir}/figures`` subdirectories
+    so the figure functions' ``os.makedirs(..., exist_ok=True)`` calls
+    are no-ops. Restores the original values on exit (even on exception).
+    """
+    results_dir = os.path.join(tmpdir, 'results')
+    figures_dir = os.path.join(tmpdir, 'figures')
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+    orig_results = make_figures._RESULTS_DIR
+    orig_figures = make_figures._FIGURES_DIR
+    make_figures._RESULTS_DIR = results_dir
+    make_figures._FIGURES_DIR = figures_dir
+    try:
+        yield results_dir, figures_dir
+    finally:
+        make_figures._RESULTS_DIR = orig_results
+        make_figures._FIGURES_DIR = orig_figures
+
+
+def _write_results(results_dir: str, name: str, data):
+    """Write a synthetic results JSON file into ``results_dir``."""
+    os.makedirs(results_dir, exist_ok=True)
+    with open(os.path.join(results_dir, name), 'w') as f:
+        json.dump(data, f)
+
+
+# --- pytest integration -------------------------------------------------
+# When run via pytest, each test receives ``tmp_path`` (a per-test
+# ``pathlib.Path``) and ``monkeypatch``. We use ``_redirect_dirs`` to
+# point ``make_figures`` at the temp dir for the duration of the test.
+# No autouse session fixture is needed — there is no shared state to
+# back up or restore.
 
 try:
     import pytest
-
-    @pytest.fixture(autouse=True, scope='session')
-    def _backup_restore_fixture():
-        """Session-scoped autouse fixture: back up real results/figures
-        before any test runs, and restore them after the session ends."""
-        _backup_results()
-        yield
-        _restore_results()
-        # Best-effort cleanup of the backup dir. ``_BACKUP_DIR`` is lazily
-        # created by ``_get_backup_dir()`` (called from ``_backup_results``),
-        # so it is guaranteed non-None here — but guard defensively in case
-        # ``_backup_results`` ever learns to short-circuit on an empty repo.
-        global _BACKUP_DIR
-        if _BACKUP_DIR is not None:
-            try:
-                shutil.rmtree(_BACKUP_DIR)
-            except OSError:
-                pass
-            _BACKUP_DIR = None
 
     @pytest.fixture(autouse=True)
     def _close_figs_fixture():
@@ -164,13 +119,14 @@ try:
 
 except ImportError:
     # pytest not installed — running via ``python3 test_figures.py``.
-    # The ``main()`` function below handles backup/restore manually.
+    # The ``main()`` function below creates a single TemporaryDirectory
+    # and each test uses it via ``_redirect_dirs``.
     pass
 
 
 # --- tests ---------------------------------------------------------------
 
-def test_load_envelope_format():
+def test_load_envelope_format(tmp_path=None, monkeypatch=None):
     """``make_figures.load`` must accept the P0-1 envelope schema.
 
     The MQAR writer (``run_quality.main``) emits a single JSON object
@@ -181,26 +137,21 @@ def test_load_envelope_format():
     the new envelope is parsed into the inner ``results`` array.
     """
     print("\nTest: load() unwraps the {metadata, results} envelope")
-    _write_results('_test_envelope.json', {
-        'metadata': {'schema_version': 1, 'csa_indexer_trained': False},
-        'results': [
-            {'op': 'softmax', 'T': 128, 'acc': 0.5},
-            {'op': 'kda', 'T': 128, 'acc': 0.4},
-        ],
-    })
-    data = make_figures.load('_test_envelope.json')
-    _ok('envelope unwrapped to results list',
-        isinstance(data, list) and len(data) == 2,
-        f'type={type(data).__name__}, len={len(data) if isinstance(data, list) else "n/a"}')
-    # Clean up the synthetic file so it does not leak into the real
-    # results dir (the session fixture restores originals, but removing
-    # it explicitly is hygienic and makes the test re-runnable).
-    _p = os.path.join(RESULTS_DIR, '_test_envelope.json')
-    if os.path.exists(_p):
-        os.remove(_p)
+    with _redirect_dirs_for(tmp_path, monkeypatch) as (results_dir, _):
+        _write_results(results_dir, '_test_envelope.json', {
+            'metadata': {'schema_version': 1, 'csa_indexer_trained': False},
+            'results': [
+                {'op': 'softmax', 'T': 128, 'acc': 0.5},
+                {'op': 'kda', 'T': 128, 'acc': 0.4},
+            ],
+        })
+        data = make_figures.load('_test_envelope.json')
+        _ok('envelope unwrapped to results list',
+            isinstance(data, list) and len(data) == 2,
+            f'type={type(data).__name__}, len={len(data) if isinstance(data, list) else "n/a"}')
 
 
-def test_load_legacy_bare_array():
+def test_load_legacy_bare_array(tmp_path=None, monkeypatch=None):
     """``make_figures.load`` must still accept the legacy bare-array schema.
 
     All non-MQAR result files (benchmark, kv_cache, ablation, decoding,
@@ -208,56 +159,51 @@ def test_load_legacy_bare_array():
     them.
     """
     print("\nTest: load() still accepts legacy bare-array schema")
-    _write_results('_test_bare.json', [
-        {'op': 'softmax', 'T': 128, 'acc': 0.5},
-        {'op': 'kda', 'T': 128, 'acc': 0.4},
-    ])
-    data = make_figures.load('_test_bare.json')
-    _ok('bare array returned as-is',
-        isinstance(data, list) and len(data) == 2,
-        f'type={type(data).__name__}, len={len(data) if isinstance(data, list) else "n/a"}')
-    _p = os.path.join(RESULTS_DIR, '_test_bare.json')
-    if os.path.exists(_p):
-        os.remove(_p)
+    with _redirect_dirs_for(tmp_path, monkeypatch) as (results_dir, _):
+        _write_results(results_dir, '_test_bare.json', [
+            {'op': 'softmax', 'T': 128, 'acc': 0.5},
+            {'op': 'kda', 'T': 128, 'acc': 0.4},
+        ])
+        data = make_figures.load('_test_bare.json')
+        _ok('bare array returned as-is',
+            isinstance(data, list) and len(data) == 2,
+            f'type={type(data).__name__}, len={len(data) if isinstance(data, list) else "n/a"}')
 
 
-def test_fig_benchmark_empty_data():
+def test_fig_benchmark_empty_data(tmp_path=None, monkeypatch=None):
     """fig_benchmark with empty data should not crash or emit legend warning."""
     print("\nTest: fig_benchmark with empty data")
-    _write_results('exp2_benchmark.json', [])
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter('always')
-        # Let exceptions propagate — pytest (or main's try/finally) will
-        # surface the traceback. The previous bare ``except Exception``
-        # swallowed real programming errors (NameError, AttributeError
-        # from a refactor) and only printed them, making debugging
-        # nearly impossible.
-        make_figures.fig_benchmark()
-        legend_warned = any('No artists with labels' in str(wm.message)
-                            for wm in w)
-        _ok('no crash + no legend warning',
-            not legend_warned,
-            f'legend_warning={legend_warned}')
+    with _redirect_dirs_for(tmp_path, monkeypatch) as (results_dir, _):
+        _write_results(results_dir, 'exp2_benchmark.json', [])
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            make_figures.fig_benchmark()
+            legend_warned = any('No artists with labels' in str(wm.message)
+                                for wm in w)
+            _ok('no crash + no legend warning',
+                not legend_warned,
+                f'legend_warning={legend_warned}')
 
 
-def test_fig_benchmark_all_errors():
+def test_fig_benchmark_all_errors(tmp_path=None, monkeypatch=None):
     """fig_benchmark with all-error data should not crash or warn."""
     print("\nTest: fig_benchmark with all-error data")
-    _write_results('exp2_benchmark.json', [
-        {'T': 128, 'op': 'softmax', 'error': 'OOM', 'device': 'cpu'},
-        {'T': 128, 'op': 'kda', 'error': 'OOM', 'device': 'cpu'},
-    ])
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter('always')
-        make_figures.fig_benchmark()
-        legend_warned = any('No artists with labels' in str(wm.message)
-                            for wm in w)
-        _ok('no crash + no legend warning',
-            not legend_warned,
-            f'legend_warning={legend_warned}')
+    with _redirect_dirs_for(tmp_path, monkeypatch) as (results_dir, _):
+        _write_results(results_dir, 'exp2_benchmark.json', [
+            {'T': 128, 'op': 'softmax', 'error': 'OOM', 'device': 'cpu'},
+            {'T': 128, 'op': 'kda', 'error': 'OOM', 'device': 'cpu'},
+        ])
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            make_figures.fig_benchmark()
+            legend_warned = any('No artists with labels' in str(wm.message)
+                                for wm in w)
+            _ok('no crash + no legend warning',
+                not legend_warned,
+                f'legend_warning={legend_warned}')
 
 
-def test_plot_ablation_group_empty_data():
+def test_plot_ablation_group_empty_data(tmp_path=None, monkeypatch=None):
     """_plot_ablation_group with empty records should not crash.
 
     Previously this raised ``ValueError: max() iterable argument is empty``
@@ -265,11 +211,12 @@ def test_plot_ablation_group_empty_data():
     when accs was empty.
     """
     print("\nTest: _plot_ablation_group with empty data")
-    make_figures._plot_ablation_group([], 1, False)
-    _ok('no crash on empty data', True, '')
+    with _redirect_dirs_for(tmp_path, monkeypatch):
+        make_figures._plot_ablation_group([], 1, False)
+        _ok('no crash on empty data', True, '')
 
 
-def test_plot_ablation_group_all_errors():
+def test_plot_ablation_group_all_errors(tmp_path=None, monkeypatch=None):
     """_plot_ablation_group with all-error records should plot ERR bars."""
     print("\nTest: _plot_ablation_group with all-error data")
     records = [
@@ -278,20 +225,19 @@ def test_plot_ablation_group_all_errors():
         {'ratio': '4:1:1', 'n_kv': 1, 'error': 'err', 'mean_acc': None,
          'n_layers': 6, 'n_params': None},
     ]
-    # Delete the figure file BEFORE the call so the existence check
-    # cannot pass on a stale file from a prior run (the previous test
-    # silently passed because the committed ``figures/fig_ablation_nkv1.png``
-    # already existed, regardless of whether the function actually wrote it).
-    fig_path = os.path.join(FIGURES_DIR, 'fig_ablation_nkv1.png')
-    if os.path.exists(fig_path):
-        os.remove(fig_path)
-    make_figures._plot_ablation_group(records, 1, False)
-    saved = os.path.exists(fig_path)
-    _ok('all-error data plotted as ERR bars', saved,
-        f'figure_saved={saved}')
+    with _redirect_dirs_for(tmp_path, monkeypatch) as (_, figures_dir):
+        # Delete the figure file BEFORE the call so the existence check
+        # cannot pass on a stale file from a prior run.
+        fig_path = os.path.join(figures_dir, 'fig_ablation_nkv1.png')
+        if os.path.exists(fig_path):
+            os.remove(fig_path)
+        make_figures._plot_ablation_group(records, 1, False)
+        saved = os.path.exists(fig_path)
+        _ok('all-error data plotted as ERR bars', saved,
+            f'figure_saved={saved}')
 
 
-def test_fig_ablation_suptitle_not_clipped():
+def test_fig_ablation_suptitle_not_clipped(tmp_path=None, monkeypatch=None):
     """The fig_ablation suptitle must not be clipped at the top of the image.
 
     Previously the suptitle was positioned at y=1.02 (above the figure's
@@ -314,82 +260,107 @@ def test_fig_ablation_suptitle_not_clipped():
         'mean_fwd_ms': 4.0, 'n_params': 26852, 'n_layers': 5,
         'mean_train_time_s': 1.0,
     }]
-    # Capture mtime BEFORE the call so we can assert the figure was
-    # actually rewritten (not just read from a stale prior-run file).
-    fig_path = os.path.join(FIGURES_DIR, 'fig_ablation_nkv1.png')
-    mtime_before = os.path.getmtime(fig_path) if os.path.exists(fig_path) else 0
-    make_figures._plot_ablation_group(records, 1, False)
-    assert os.path.exists(fig_path), 'figure was not written'
-    assert os.path.getmtime(fig_path) > mtime_before, \
-        'figure was not regenerated (stale file from a prior run)'
+    with _redirect_dirs_for(tmp_path, monkeypatch) as (_, figures_dir):
+        # Capture mtime BEFORE the call so we can assert the figure was
+        # actually rewritten (not just read from a stale prior-run file).
+        fig_path = os.path.join(figures_dir, 'fig_ablation_nkv1.png')
+        mtime_before = os.path.getmtime(fig_path) if os.path.exists(fig_path) else 0
+        make_figures._plot_ablation_group(records, 1, False)
+        assert os.path.exists(fig_path), 'figure was not written'
+        assert os.path.getmtime(fig_path) > mtime_before, \
+            'figure was not regenerated (stale file from a prior run)'
 
-    img = mpimg.imread(fig_path)
-    # The top 5 rows should be predominantly white (padding above the
-    # suptitle). If the suptitle is clipped, row 0 will have substantial
-    # non-white (text) pixels.
-    top_5_rows = img[:5, :, :3]
-    white_mask = (top_5_rows > 0.95).all(axis=-1)
-    white_pct = white_mask.mean() * 100
-    not_clipped = white_pct > 99.0  # Allow up to 1% non-white (anti-aliasing)
-    _ok('suptitle not clipped at top',
-        not_clipped,
-        f'top_5_rows_white_pct={white_pct:.1f}% (need >99%)')
+        img = mpimg.imread(fig_path)
+        # The top 5 rows should be predominantly white (padding above the
+        # suptitle). If the suptitle is clipped, row 0 will have substantial
+        # non-white (text) pixels.
+        top_5_rows = img[:5, :, :3]
+        white_mask = (top_5_rows > 0.95).all(axis=-1)
+        white_pct = white_mask.mean() * 100
+        not_clipped = white_pct > 99.0  # Allow up to 1% non-white (anti-aliasing)
+        _ok('suptitle not clipped at top',
+            not_clipped,
+            f'top_5_rows_white_pct={white_pct:.1f}% (need >99%)')
+
+
+# --- helper to bridge pytest (tmp_path/monkeypatch) and direct-run -----
+
+@contextlib.contextmanager
+def _redirect_dirs_for(tmp_path, monkeypatch):
+    """Bridge pytest's ``tmp_path`` / ``monkeypatch`` fixtures and the
+    direct-run path (``python3 test_figures.py``).
+
+    * Under pytest: both fixtures are non-None. Use ``monkeypatch.setattr``
+      so pytest auto-undoes the redirect at test teardown (defensive — even
+      if our ``finally`` block in ``_redirect_dirs`` is skipped by a
+      SIGKILL, pytest's teardown still runs).
+    * Under direct run: both are None. Use the context-manager form
+      ``_redirect_dirs`` with a ``tempfile.TemporaryDirectory``.
+    """
+    if tmp_path is not None and monkeypatch is not None:
+        # pytest path: use the per-test tmp_path directory.
+        results_dir = os.path.join(str(tmp_path), 'results')
+        figures_dir = os.path.join(str(tmp_path), 'figures')
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(figures_dir, exist_ok=True)
+        monkeypatch.setattr(make_figures, '_RESULTS_DIR', results_dir)
+        monkeypatch.setattr(make_figures, '_FIGURES_DIR', figures_dir)
+        try:
+            yield results_dir, figures_dir
+        finally:
+            # monkeypatch auto-undoes the setattr, but we yield in a
+            # try/finally so the directories are cleaned up even if the
+            # test body raises.
+            pass
+    else:
+        # Direct-run path: use a per-test TemporaryDirectory. The
+        # directory is cleaned up automatically when the ``with`` block
+        # exits (``_redirect_dirs`` is a context manager that yields and
+        # restores on exit, and ``tempfile.TemporaryDirectory`` cleans
+        # up the temp dir on exit).
+        with tempfile.TemporaryDirectory(prefix='_fig_test_') as tmpdir:
+            with _redirect_dirs(tmpdir) as (results_dir, figures_dir):
+                yield results_dir, figures_dir
 
 
 def main():
     print('=' * 70)
     print('Figure Generation Regression Tests')
     print('=' * 70)
-    os.makedirs(FIGURES_DIR, exist_ok=True)
-    _backup_results()
     results = []
-    try:
-        # Each test function now asserts internally; we still capture
-        # bool returns for the summary printout (and to keep running
-        # subsequent tests even if one asserts).
-        for fn in [
-            test_load_envelope_format,
-            test_load_legacy_bare_array,
-            test_fig_benchmark_empty_data,
-            test_fig_benchmark_all_errors,
-            test_plot_ablation_group_empty_data,
-            test_plot_ablation_group_all_errors,
-            test_fig_ablation_suptitle_not_clipped,
-        ]:
-            try:
-                fn()
-                results.append(True)
-            except AssertionError:
-                results.append(False)
-            except Exception as e:
-                # Unexpected exception (not an assertion failure). Surface
-                # it loudly but keep going so the user sees all failures.
-                print(f"  [CRASH] {fn.__name__}: {type(e).__name__}: {e}")
-                results.append(False)
-            finally:
-                # Close any figures the test may have left open. The pytest
-                # autouse fixture (_close_figs_fixture) handles this under
-                # pytest, but when ``python test_figures.py`` is run
-                # directly (e.g. from run_all.py), no such fixture runs and
-                # a half-built figure from a CRASHed test would leak into
-                # the next test, potentially causing
-                # ``RuntimeWarning: More than 20 figures`` or canvas-state
-                # surprises.
-                import matplotlib.pyplot as _plt
-                _plt.close('all')
-    finally:
-        _restore_results()
-        # Best-effort cleanup. ``_BACKUP_DIR`` is lazily created by
-        # ``_get_backup_dir()`` (called from ``_backup_results`` at the
-        # start of ``main()``); guard for None in case the backup step
-        # was never reached (e.g. KeyboardInterrupt during setup).
-        global _BACKUP_DIR
-        if _BACKUP_DIR is not None:
-            try:
-                shutil.rmtree(_BACKUP_DIR)
-            except OSError:
-                pass
-            _BACKUP_DIR = None
+    # When run directly (not via pytest), each test gets a fresh temp
+    # directory via the ``_redirect_dirs_for`` context manager. We pass
+    # ``tmp_path=None, monkeypatch=None`` to signal the direct-run path.
+    for fn in [
+        test_load_envelope_format,
+        test_load_legacy_bare_array,
+        test_fig_benchmark_empty_data,
+        test_fig_benchmark_all_errors,
+        test_plot_ablation_group_empty_data,
+        test_plot_ablation_group_all_errors,
+        test_fig_ablation_suptitle_not_clipped,
+    ]:
+        try:
+            fn()
+            results.append(True)
+        except AssertionError:
+            results.append(False)
+        except Exception as e:
+            # Unexpected exception (not an assertion failure). Surface
+            # it loudly but keep going so the user sees all failures.
+            print(f"  [CRASH] {fn.__name__}: {type(e).__name__}: {e}")
+            results.append(False)
+        finally:
+            # Close any figures the test may have left open. The pytest
+            # autouse fixture (_close_figs_fixture) handles this under
+            # pytest, but when ``python test_figures.py`` is run
+            # directly (e.g. from run_all.py), no such fixture runs and
+            # a half-built figure from a CRASHed test would leak into
+            # the next test, potentially causing
+            # ``RuntimeWarning: More than 20 figures`` or canvas-state
+            # surprises.
+            import matplotlib.pyplot as _plt
+            _plt.close('all')
     n_pass = sum(1 for r in results if r)
     n_total = len(results)
     print('-' * 70)

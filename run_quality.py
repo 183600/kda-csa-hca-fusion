@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json
+from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json, write_json_atomic
 from ops_kda import naive_recurrent_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -1028,6 +1028,101 @@ def main():
               f"other ops trained for {steps} steps. See MQAR_SOFTMAX_STEPS "
               f"env var / README 'Fairness notes' section for rationale.")
 
+    # P1-1 fix — add Bonferroni correction + ``conclusions_valid`` to Exp 4,
+    # mirroring the logic already present in run_ablation.py::main for Exp 5.
+    # The README documents Exp 4's JSON schema as including
+    # ``conclusions_valid`` and a Bonferroni-corrected t-test, but
+    # run_quality.py previously emitted only the raw ``t_stat_vs_chance``
+    # field. This made the README's "authoritative signal" claim false:
+    # consumers reading ``conclusions_valid`` from ``exp4_mqar.json`` would
+    # KeyError (the field was absent), and the Bonferroni correction was
+    # silently missing.
+    #
+    # The fix mirrors run_ablation.py's logic:
+    #   1. Compute the number of one-sample t-tests vs chance we are running
+    #      (4 ops * len(n_kv_list) = 4 by default).
+    #   2. Compute the Bonferroni-corrected alpha (0.05 / n_tests) and the
+    #      corresponding t-critical value (scipy if available, else None).
+    #   3. For each result, set ``significant_bonferroni`` and
+    #      ``t_crit_bonferroni`` fields based on |t_stat| > crit.
+    #   4. Compute an experiment-level ``conclusions_valid`` flag combining
+    #      seed count, minimum surviving seeds, presence of any significant
+    #      result, and the fraction of near-chance results.
+    #   5. Attach ``conclusions_valid`` to every result record (matching
+    #      run_ablation.py's convention) so downstream consumers can check
+    #      it per-record without recomputing.
+    n_tests = len(['softmax', 'kda', 'csa', 'hca']) * len(n_kv_list)
+    alpha_corrected = 0.05 / n_tests
+    try:
+        from scipy.stats import t as _t_dist
+        def _bonferroni_crit_q(n, alpha=alpha_corrected):
+            if n < 2:
+                return None
+            return float(_t_dist.ppf(1 - alpha / 2, n - 1))
+        bonferroni_available = True
+    except ImportError:
+        # scipy unavailable: cannot compute the corrected quantile. Return
+        # None so the comparison below conservatively reports False (not
+        # significant). Mirrors run_ablation.py's fallback contract.
+        def _bonferroni_crit_q(n, alpha=alpha_corrected):
+            return None
+        bonferroni_available = False
+    logger.info(f'\n  {n_tests} one-sample t-tests vs chance; '
+                f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
+                f'(scipy={bonferroni_available})')
+    for r in all_results:
+        # Skip error rows: they have t_stat_vs_chance=None already.
+        if 'error' in r:
+            r['t_crit_bonferroni'] = None
+            r['significant_bonferroni'] = False
+            continue
+        t_stat = r.get('t_stat_vs_chance')
+        n_ok = r.get('n_seeds_ok', 0)
+        if t_stat is not None and n_ok >= 2:
+            crit = _bonferroni_crit_q(n_ok)
+            r['t_crit_bonferroni'] = crit
+            # ``crit`` is None when scipy is unavailable — guard the
+            # comparison to avoid TypeError (mirrors run_ablation.py).
+            r['significant_bonferroni'] = (
+                crit is not None and abs(t_stat) > crit
+            )
+        else:
+            r['t_crit_bonferroni'] = None
+            r['significant_bonferroni'] = False
+
+    # Experiment-level statistical validity summary. Mirrors run_ablation.py
+    # but with the appropriate thresholds for the 4-op MQAR sweep.
+    n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
+    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
+                        if 'error' not in r), default=0)
+    # A result is "near chance" if mean_acc < 1.5x the chance level.
+    near_chance = [r for r in all_results
+                   if 'error' not in r
+                   and r.get('mean_acc') is not None
+                   and r['mean_acc'] < 1.5 * chance]
+    conclusions_valid = (n_seeds >= 5 and min_seeds_ok >= 5
+                         and n_any_sig > 0 and len(near_chance) < len(all_results) // 2)
+    logger.info('\n' + '=' * 70)
+    logger.info('Statistical validity summary (P1-1 fix):')
+    logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
+    logger.info(f'  ops with significant_bonferroni=True: {n_any_sig}/{len(all_results)}')
+    logger.info(f'  ops near chance (<1.5x): {len(near_chance)}/{len(all_results)}')
+    logger.info(f'  conclusions_valid: {conclusions_valid}')
+    if not conclusions_valid:
+        logger.warning(
+            '  WARNING: The MQAR results do NOT support strong structural\n'
+            '  conclusions. Either the seed count is too low (<5), no op\n'
+            '  reaches Bonferroni significance, or most accuracies are near\n'
+            '  chance. Treat the ranking as exploratory, not confirmatory.\n'
+            '  To improve power: increase MQAR_SEEDS (>=7), increase MQAR_STEPS,\n'
+            '  or use a simpler task where the signal is stronger.')
+    logger.info('=' * 70)
+    # Attach the validity flag to every result record so downstream
+    # consumers (make_figures, reports) can check it without recomputing.
+    for r in all_results:
+        r['conclusions_valid'] = conclusions_valid
+        r['n_seeds_requested'] = n_seeds
+
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped
     # past the NaN guard and the per_seed filter, Python's default
@@ -1046,33 +1141,14 @@ def main():
     # fragments) that no parser could read. Serializing to a string first
     # guarantees atomicity: either the complete JSON is written or nothing
     # is, so the fallback can safely overwrite the (empty) file.
-    try:
-        text = json.dumps(all_results, indent=2, allow_nan=False)
-    except ValueError as e:
-        # Fall back to replacing non-finite values with null so the
-        # file is still written (downstream code handles None), and
-        # log the corruption loudly. Uses the centralized
-        # ``sanitize_for_json`` helper from kaggle_setup.py (was a local
-        # ``_sanitize`` closure; centralizing removes 5 copies of the same
-        # logic across run_*.py and ensures any future edge-case fix
-        # propagates everywhere).
-        logger.error(f'non-finite value in results; sanitizing to null: {e}')
-        text = json.dumps(sanitize_for_json(all_results), indent=2,
-                          allow_nan=False)
-    # Write a SINGLE valid JSON object (not two concatenated documents).
-    # The previous implementation prepended a standalone metadata object
-    # to the results array, producing:
-    #     {"_metadata": {...}}\n[{...}, {...}]
-    # which is NOT a valid JSON document (``json.load`` raises
-    # ``Extra data``). ``make_figures.load`` then treated the file as
-    # malformed and silently returned ``[]``, skipping the MQAR figure.
-    # The committed ``results/exp4_mqar.json`` is still a bare array
-    # (pre-bug), so source and artifact had already diverged.
-    #
-    # Fix: emit a single top-level object ``{"metadata": ..., "results": [...]}``
-    # and teach ``make_figures.load`` to accept both the new envelope and
-    # the legacy bare-array format. We also re-parse the serialized text
-    # before writing as a regression guard.
+    # P1-1 fix's payload structure: emit a single top-level object
+    # ``{"metadata": ..., "results": [...]}`` (NOT two concatenated
+    # documents). The previous implementation prepended a standalone
+    # metadata object to the results array, producing invalid JSON.
+    # ``make_figures.load`` accepts both the envelope and the legacy
+    # bare-array format. The P1-5 fix below uses ``write_json_atomic``
+    # so the file is written atomically (temp + fsync + os.replace),
+    # eliminating the truncated-partial-JSON failure mode.
     payload = {
         'metadata': {
             'csa_indexer_trained': True,
@@ -1108,26 +1184,23 @@ def main():
         },
         'results': all_results,
     }
+    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document. The previous ``with open(...) as f: f.write(text)``
+    # pattern was NOT atomic — see kaggle_setup.write_json_atomic's
+    # docstring for the full rationale. The regression guard (re-parse
+    # the serialized text) is now inside write_json_atomic itself: it
+    # serializes to a string first, which raises ValueError on any
+    # non-serializable value BEFORE touching the filesystem.
     try:
-        text = json.dumps(payload, indent=2, allow_nan=False)
+        write_json_atomic(payload, 'results/exp4_mqar.json',
+                          indent=2, allow_nan=False)
     except ValueError as e:
         logger.error(f'non-finite value in payload; sanitizing to null: {e}')
-        payload = sanitize_for_json(payload)
-        text = json.dumps(payload, indent=2, allow_nan=False)
-    # Regression guard: re-parse the serialized text before touching the
-    # file so we never write a document that ``json.load`` would reject.
-    # This catches any future code path that accidentally reintroduces the
-    # concatenated-document bug (or any other serializer regression).
-    try:
-        json.loads(text)
-    except json.JSONDecodeError as e:
-        # Should be unreachable given the dumps above, but fail loudly
-        # rather than shipping a broken file.
-        raise RuntimeError(
-            f"internal error: serialized MQAR payload is not valid JSON: {e}"
-        ) from e
-    with open('results/exp4_mqar.json', 'w') as f:
-        f.write(text)
+        write_json_atomic(sanitize_for_json(payload),
+                          'results/exp4_mqar.json',
+                          indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp4_mqar.json')
 
 

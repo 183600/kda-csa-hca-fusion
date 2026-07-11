@@ -39,7 +39,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json
+from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json, write_json_atomic
 from ops_fused import HybridKCHAttention, HybridConfig
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
@@ -700,20 +700,19 @@ def main():
     # fragments) that no parser could read. Serializing to a string first
     # guarantees atomicity: either the complete JSON is written or nothing
     # is. Mirrors the fix in run_quality.py::main.
+    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document. See kaggle_setup.write_json_atomic's docstring
+    # for the full rationale.
     try:
-        text = json.dumps(all_results, indent=2, allow_nan=False)
+        write_json_atomic(all_results, 'results/exp5_ablation.json',
+                          indent=2, allow_nan=False)
     except ValueError as e:
-        # Fall back to replacing non-finite values with null so the file is
-        # still written (downstream code handles None), and log the
-        # corruption loudly. Uses the centralized ``sanitize_for_json``
-        # helper from kaggle_setup.py (was a local ``_sanitize`` closure;
-        # centralizing removes 5 copies of the same logic across run_*.py
-        # and ensures any future edge-case fix propagates everywhere).
         logger.error(f'non-finite value in results; sanitizing to null: {e}')
-        text = json.dumps(sanitize_for_json(all_results), indent=2,
-                          allow_nan=False)
-    with open('results/exp5_ablation.json', 'w') as f:
-        f.write(text)
+        write_json_atomic(sanitize_for_json(all_results),
+                          'results/exp5_ablation.json',
+                          indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp5_ablation.json')
 
 

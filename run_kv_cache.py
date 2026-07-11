@@ -36,7 +36,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import sanitize_for_json
+from kaggle_setup import sanitize_for_json, write_json_atomic
 
 
 # Reference GQA8, head_dim=128, BF16 baseline (as in DeepSeek-V4 §2.3.4).
@@ -497,17 +497,21 @@ def main():
     # the same logic across run_*.py and ensures any future edge-case fix
     # propagates everywhere).
     sanitized = [sanitize_for_json(r) for r in rows]
+    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
     try:
-        text = json.dumps(sanitized, indent=2, allow_nan=False)
+        write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
+                          indent=2, allow_nan=False)
     except (TypeError, ValueError) as e:
         # Fallback: log the corruption and write without allow_nan=False
         # so results are not lost entirely. Non-finite values would have
         # been converted to None by sanitize_for_json above, so this branch
         # only fires on truly unexpected types (e.g. a tensor slipped in).
         print(f'[run_kv_cache] WARNING: JSON serialization failed: {e}')
-        text = json.dumps(sanitized, indent=2, default=str)
-    with open('results/exp3_kv_cache.json', 'w') as f:
-        f.write(text)
+        write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
+                          indent=2, default=str)
     print('\nSaved: results/exp3_kv_cache.json')
 
 

@@ -27,6 +27,7 @@ behaviour, not throughput.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import torch
@@ -164,6 +165,100 @@ class HybridConfig:
                 f"kda_chunk_size={self.kda_chunk_size!r} must be an int "
                 f"(>= 1 enables the chunk path; <= 0 forces the recurrent "
                 f"path; default 64).")
+        # P1-3 fix — validate the remaining structural params that were
+        # previously unchecked. Negative values for these fields would
+        # either silently produce an empty layer list (Python's
+        # ``[x] * -1 == []``), crash with a cryptic torch error inside
+        # the first forward pass, or silently disable a branch (looking
+        # like the caller intentionally turned it off). Validate them
+        # here so the error fires at config construction with a clear
+        # message pointing at the misconfigured field.
+        #
+        # Layer counts: negative values silently produce empty lists via
+        # Python's ``[layer] * n`` semantics (``[x] * -1 == []``), so a
+        # typo like ``n_kda=-1`` would silently build a model with NO
+        # KDA layers instead of crashing. Reject negative values up-front.
+        for name, val in [
+            ('n_kda', self.n_kda),
+            ('n_csa', self.n_csa),
+            ('n_hca', self.n_hca),
+        ]:
+            if not isinstance(val, int):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be an int.")
+            if val < 0:
+                raise ValueError(
+                    f"HybridConfig.{name}={val} must be >= 0. A negative "
+                    f"value would silently produce an empty layer list "
+                    f"(Python's ``[x] * n`` semantics), building a model "
+                    f"with no {name.replace('n_', '').upper()} layers "
+                    f"instead of crashing loudly.")
+        if self.n_kda + self.n_csa + self.n_hca == 0:
+            raise ValueError(
+                f"HybridConfig has n_kda=n_csa=n_hca=0; the model would "
+                f"have no attention layers at all. Set at least one of "
+                f"n_kda / n_csa / n_hca to a positive value.")
+        # CSA-specific: topk=0 is valid (disables sparse selection) but
+        # negative values would crash ``torch.topk``. nh must be >= 1
+        # (it's a head count). sliding_window=0 disables the branch
+        # (valid); negative would silently skip the branch.
+        if not isinstance(self.csa_topk, int) or self.csa_topk < 0:
+            raise ValueError(
+                f"csa_topk={self.csa_topk!r} must be a non-negative int "
+                f"(0 disables sparse selection; negative would crash "
+                f"torch.topk).")
+        if not isinstance(self.csa_nh, int) or self.csa_nh < 1:
+            raise ValueError(
+                f"csa_nh={self.csa_nh!r} must be a positive int (head count).")
+        if not isinstance(self.csa_sliding_window, int) or self.csa_sliding_window < 0:
+            raise ValueError(
+                f"csa_sliding_window={self.csa_sliding_window!r} must be a "
+                f"non-negative int (0 disables the branch; negative would "
+                f"silently skip the sliding-window code path).")
+        # HCA-specific: mirrors CSA's checks for the HCA analogs.
+        if not isinstance(self.hca_nh, int) or self.hca_nh < 1:
+            raise ValueError(
+                f"hca_nh={self.hca_nh!r} must be a positive int (head count).")
+        if not isinstance(self.hca_sliding_window, int) or self.hca_sliding_window < 0:
+            raise ValueError(
+                f"hca_sliding_window={self.hca_sliding_window!r} must be a "
+                f"non-negative int (0 disables the branch; negative would "
+                f"silently skip the sliding-window code path).")
+        # kda_decay_scale must be a finite, non-negative float. A NaN or
+        # inf would propagate into the gate ``g = -softplus(...) * scale``
+        # and silently poison the entire recurrence. A negative scale
+        # would invert the decay sign (making g positive -> exp(g) > 1
+        # -> state explosion), which is never a meaningful configuration.
+        if not isinstance(self.kda_decay_scale, (int, float)):
+            raise ValueError(
+                f"kda_decay_scale={self.kda_decay_scale!r} must be a number.")
+        if not math.isfinite(self.kda_decay_scale):
+            raise ValueError(
+                f"kda_decay_scale={self.kda_decay_scale} must be finite "
+                f"(NaN or inf would poison the KDA gate computation).")
+        if self.kda_decay_scale < 0:
+            raise ValueError(
+                f"kda_decay_scale={self.kda_decay_scale} must be >= 0 "
+                f"(negative would invert the decay sign and cause state "
+                f"explosion).")
+        # dropout: currently only 0.0 is allowed (rejected above), but
+        # also reject NaN/inf so a typo like ``dropout=float('nan')``
+        # doesn't slip through the ``!= 0.0`` check (NaN != 0.0 is True
+        # in Python, so the existing check would raise NotImplementedError
+        # with a misleading message). Also reject values outside [0, 1)
+        # for forward compatibility (when dropout is implemented, values
+        # outside this range are invalid).
+        if not isinstance(self.dropout, (int, float)):
+            raise ValueError(
+                f"dropout={self.dropout!r} must be a number.")
+        if not math.isfinite(self.dropout):
+            raise ValueError(
+                f"dropout={self.dropout} must be finite (NaN or inf is "
+                f"not a valid dropout rate).")
+        if self.dropout < 0 or self.dropout >= 1:
+            raise ValueError(
+                f"dropout={self.dropout} must be in [0, 1) (a negative "
+                f"or >=1 rate is not a valid dropout probability).")
 
 
 class KDAHybridLayer(nn.Module):
@@ -842,8 +937,16 @@ class HybridKCHAttention(nn.Module):
                     "explicitly to suppress this message.",
                     stacked.shape[1], x.shape[0])
                 stacked = None
-            elif stacked.device != x.device or stacked.dtype != x.dtype:
-                stacked = stacked.to(device=x.device, dtype=x.dtype)
+            elif stacked.device != x.device:
+                # Device mismatch (e.g. model moved to cuda, stale CPU state):
+                # move the state to x's device. Do NOT cast dtype here — the
+                # KDA op's ``initial_state.to(compute_dtype)`` handles any
+                # dtype mismatch internally (P1-2 fix: the state is now
+                # returned in ``compute_dtype`` by default, so casting it to
+                # ``x.dtype`` here would reintroduce the fp32→fp16→fp32
+                # round-trip that accumulates quantization error in long
+                # streaming inference).
+                stacked = stacked.to(device=x.device)
                 if detach_state:
                     stacked = stacked.detach()
             elif detach_state:

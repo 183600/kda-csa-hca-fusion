@@ -276,7 +276,15 @@ def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
         sys.executable, "-m", "pip", "install", "-q",
         "--upgrade",
         "--upgrade-strategy", "only-if-needed",
-        "torch>=2.1", "--extra-index-url", index_url,
+        # P1-4 fix: pin the SAME upper bound as pyproject.toml's
+        # ``torch>=2.2,<2.7``. The previous ``torch>=2.1`` had no upper
+        # bound, so a fresh Kaggle bootstrap could pull torch 2.7+ which
+        # changes ``scaled_dot_product_attention`` kernel selection and
+        # padding handling — silently producing numerically different
+        # benchmark results from the committed ones. Bumping the lower
+        # bound to 2.2 matches pyproject.toml exactly; keeping the upper
+        # bound at <2.7 prevents breaking changes from sneaking in.
+        "torch>=2.2,<2.7", "--extra-index-url", index_url,
     ])
     # The install succeeded, but the CURRENT process still has the old
     # CPU-only torch loaded. Force the caller to restart.
@@ -519,6 +527,94 @@ def sanitize_for_json(obj):
     if isinstance(obj, (list, tuple)):
         return [sanitize_for_json(x) for x in obj]
     return obj
+
+
+def write_json_atomic(payload, target_path: str, *, indent: int = 2,
+                      allow_nan: bool = False, default=None) -> None:
+    """Atomically write ``payload`` as JSON to ``target_path``.
+
+    P1-5 fix: the previous pattern across all runners was::
+
+        text = json.dumps(payload, indent=2, allow_nan=False)
+        with open('results/expN.json', 'w') as f:
+            f.write(text)
+
+    This is NOT atomic. If the process is killed (SIGKILL, OOM, Kaggle
+    session timeout) or the disk fills up mid-write, the target file is
+    left TRUNCATED — a partial JSON document that no parser can read.
+    Downstream code (``make_figures.load``) would then silently skip the
+    experiment, or worse, crash with a confusing ``JSONDecodeError`` that
+    doesn't point at the real cause.
+
+    The atomic fix uses the standard temp-file + ``os.replace`` pattern:
+
+    1. Serialize to a string first (catches NaN/Inf via ``allow_nan=False``
+       BEFORE touching the filesystem — the target file is never opened
+       for writing until serialization succeeds).
+    2. Write the string to a TEMPORARY file in the SAME directory as the
+       target (so ``os.replace`` is a same-filesystem rename and therefore
+       atomic on POSIX).
+    3. ``flush()`` + ``os.fsync()`` to durable storage (so the data is
+       actually on disk, not just in the OS page cache — a power loss
+       after ``close()`` but before ``fsync()`` could still lose the
+       write).
+    4. ``os.replace(temp, target)`` — atomic rename. Either the target
+       file is the OLD version (write in progress) or the NEW version
+       (write complete); there is no intermediate truncated state.
+
+    Args:
+        payload: the object to serialize (must be JSON-serializable after
+            ``sanitize_for_json`` if ``allow_nan=False``).
+        target_path: the final file path. Parent directories must already
+            exist (runners call ``os.makedirs('results', exist_ok=True)``
+            before this function).
+        indent: passed to ``json.dumps`` (default 2 for readability).
+        allow_nan: passed to ``json.dumps`` (default False for strict
+            RFC 8259 compliance — call ``sanitize_for_json`` first if the
+            payload may contain non-finite floats).
+        default: passed to ``json.dumps`` (default None — use
+            ``sanitize_for_json`` instead of this for non-finite handling).
+    """
+    import json
+    import os
+    import tempfile
+
+    # Step 1: serialize to a string. If allow_nan=False and the payload
+    # contains NaN/Inf, this raises ValueError BEFORE we touch the
+    # filesystem — the target file is never opened for writing.
+    text = json.dumps(payload, indent=indent, allow_nan=allow_nan,
+                      default=default)
+
+    # Step 2: write to a temp file in the SAME directory as the target
+    # (so os.replace is a same-filesystem rename and therefore atomic).
+    target_dir = os.path.dirname(os.path.abspath(target_path))
+    # tempfile.mkstemp returns (fd, path); the file is created with
+    # mode 0600 by default, which is fine for experiment outputs.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix='.tmp_',
+        suffix=os.path.basename(target_path),
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # Step 3: atomic rename. On POSIX this is guaranteed atomic by
+        # rename(2); on Windows it's atomic as long as the target doesn't
+        # exist or both files are on the same filesystem (which they are,
+        # since we created the temp in the same directory).
+        os.replace(tmp_path, target_path)
+    except Exception:
+        # If anything went wrong (write error, fsync error, rename error),
+        # clean up the temp file so we don't leave orphaned .tmp_* files
+        # in the results directory. The target file is untouched (still
+        # the old version or absent), so the failure is recoverable.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":

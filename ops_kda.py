@@ -22,6 +22,76 @@ import torch.nn.functional as F
 from einops import rearrange
 
 
+def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):
+    """Centralized shape / device / dtype contract validation for KDA inputs.
+
+    P1-7 fix: previously each KDA operator validated only a subset of the
+    shape contract (head dims, GVA divisibility). A malformed caller
+    passing e.g. ``q`` with rank 3 instead of 4, or ``k`` on a different
+    device than ``v``, would crash deep inside the recurrence loop with a
+    cryptic einsum or broadcasting error that gave no hint about WHICH
+    input was wrong. This helper validates the full contract up-front so
+    the error message points at the misconfigured input.
+
+    Validated:
+      * ``q``, ``k``: rank 4, shape ``[B, T, H, K]``.
+      * ``v``: rank 4, shape ``[B, T, HV, V]``.
+      * ``g``: rank 4, shape ``[B, T, HV, K]``.
+      * ``beta``: rank 3, shape ``[B, T, HV]``.
+      * B and T consistent across all tensors.
+      * All tensors on the same device.
+      * All tensors of the same dtype.
+
+    Args:
+        q, k, v, g, beta: the KDA inputs (see ``naive_recurrent_kda``'s
+            docstring for the expected shapes).
+        fn_name: the calling function name, used in error messages so the
+            user knows which operator rejected the input.
+
+    Raises:
+        ValueError: with a message naming the misconfigured input.
+    """
+    # Rank checks.
+    for name, t, expected_rank in [
+        ('q', q, 4), ('k', k, 4), ('v', v, 4), ('g', g, 4),
+        ('beta', beta, 3),
+    ]:
+        if t.dim() != expected_rank:
+            raise ValueError(
+                f"{fn_name}: {name} must have rank {expected_rank} but got "
+                f"rank {t.dim()} (shape={tuple(t.shape)}). "
+                f"Expected shape: " +
+                ("[B, T, H, K]" if name in ('q', 'k') else
+                 "[B, T, HV, V]" if name == 'v' else
+                 "[B, T, HV, K]" if name == 'g' else
+                 "[B, T, HV]"))
+    # B and T consistency. q and v must agree on B and T (the leading two
+    # dims); k must match q; g and beta must match q on B and T.
+    B_q, T_q = q.shape[0], q.shape[1]
+    for name, t in [('k', k), ('v', v), ('g', g), ('beta', beta)]:
+        if t.shape[0] != B_q or t.shape[1] != T_q:
+            raise ValueError(
+                f"{fn_name}: {name}.shape[0:2]={tuple(t.shape[0:2])} does not "
+                f"match q.shape[0:2]=({B_q}, {T_q}). All inputs must share "
+                f"the same batch (B) and sequence (T) dimensions.")
+    # Device consistency.
+    ref_device = q.device
+    for name, t in [('k', k), ('v', v), ('g', g), ('beta', beta)]:
+        if t.device != ref_device:
+            raise ValueError(
+                f"{fn_name}: {name}.device={t.device} does not match "
+                f"q.device={ref_device}. All inputs must be on the same "
+                f"device.")
+    # Dtype consistency.
+    ref_dtype = q.dtype
+    for name, t in [('k', k), ('v', v), ('g', g), ('beta', beta)]:
+        if t.dtype != ref_dtype:
+            raise ValueError(
+                f"{fn_name}: {name}.dtype={t.dtype} does not match "
+                f"q.dtype={ref_dtype}. All inputs must share the same "
+                f"dtype (cast before calling if needed).")
+
+
 def naive_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -33,6 +103,7 @@ def naive_recurrent_kda(
     output_final_state: bool = False,
     *,
     g_clamp_min: float = -10.0,
+    state_dtype: torch.dtype | None = None,
 ):
     """Naive step-by-step recurrent KDA (reference, O(T) sequential).
 
@@ -56,6 +127,17 @@ def naive_recurrent_kda(
             aggressive forgetting but bounded away from zero. Set to
             ``-float('inf')`` to disable. The clamp is applied AFTER the
             dtype promotion below so it always runs in ``compute_dtype``.
+        state_dtype: dtype of the RETURNED recurrent state. If ``None``
+            (the default), the state is returned in ``compute_dtype``
+            (fp32 for fp16/bf16 inputs, fp64 for fp64 inputs) — this
+            preserves precision across chunked/streaming calls where the
+            state is passed back as ``initial_state`` repeatedly. The
+            OUTPUT tensor ``o`` is still cast back to ``v.dtype``. Pass
+            ``state_dtype=torch.float16`` (or any dtype) to override
+            (e.g. for memory-constrained streaming). P1-2 fix: previously
+            the state was always cast back to ``v.dtype``, causing
+            repeated fp32→fp16→fp32 round-trips that accumulated
+            quantization error in long streaming inference.
 
     .. note::
 
@@ -69,6 +151,14 @@ def naive_recurrent_kda(
     """
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
+    # P1-7 fix: centralized shape/device/dtype contract validation. Run
+    # BEFORE the head-dim checks below so a rank-mismatch (e.g. ``q`` is
+    # 3D instead of 4D) is caught with a clear message instead of
+    # crashing on ``q.shape[3]`` with an IndexError. The head-dim checks
+    # below remain as a secondary validation layer (they catch
+    # GVA-divisibility and g/beta head-dim mismatches that the generic
+    # contract check cannot).
+    _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
     # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear ValueError
     # instead of a bare ZeroDivisionError. Also validates non-negativity of
     # head dims so a malformed caller gets an informative message.
@@ -179,7 +269,12 @@ def naive_recurrent_kda(
         if not output_final_state:
             S = None
         else:
-            S = S.to(dtype)
+            # P1-2 fix: mirror the main return path — keep state in
+            # compute_dtype by default (NOT v.dtype) to avoid fp32→fp16
+            # precision loss in streaming inference.
+            target_state_dtype = (state_dtype if state_dtype is not None
+                                  else compute_dtype)
+            S = S.to(target_state_dtype)
         return o.to(dtype), S
     o = torch.zeros_like(v)
     for i in range(0, T):
@@ -191,11 +286,17 @@ def naive_recurrent_kda(
     if not output_final_state:
         S = None
     else:
-        # Cast the returned state back to the caller's dtype for consistency
-        # (compute_dtype may be fp32/fp64 while the caller passed fp16/bf16).
-        # This avoids dtype-mismatch surprises if the state is reused as
-        # initial_state in a subsequent call with a different input dtype.
-        S = S.to(dtype)
+        # P1-2 fix: return the state in ``compute_dtype`` (fp32 for fp16/bf16
+        # inputs, fp64 for fp64 inputs) by default — NOT ``v.dtype``. The
+        # previous ``S = S.to(dtype)`` caused repeated fp32→fp16→fp32
+        # round-trips when the state was passed back as ``initial_state`` in
+        # streaming inference, accumulating quantization error in long
+        # sessions. The OUTPUT ``o`` is still cast to ``v.dtype`` below so
+        # the model's forward pass sees the expected dtype; only the
+        # PERSISTENT state stays in compute precision. Callers can override
+        # via ``state_dtype`` (e.g. for memory-constrained streaming).
+        target_state_dtype = state_dtype if state_dtype is not None else compute_dtype
+        S = S.to(target_state_dtype)
     return o.to(dtype), S
 
 
@@ -211,6 +312,7 @@ def naive_chunk_kda(
     chunk_size: int = 64,
     *,
     g_clamp_min: float = -10.0,
+    state_dtype: torch.dtype | None = None,
 ):
     """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error.
 
@@ -219,9 +321,19 @@ def naive_chunk_kda(
     clamp BEFORE the cumulative-sum (``g.cumsum(-2)``) so the bound on the
     per-step gate also bounds the cumulative gate that appears in the
     chunk-internal Neumann series.
+
+    The ``state_dtype`` parameter mirrors :func:`naive_recurrent_kda` (P1-2
+    fix): the returned state defaults to ``compute_dtype`` (fp32 for
+    fp16/bf16 inputs) instead of being downcast to ``v.dtype``, preventing
+    precision loss in streaming inference where the state is repeatedly
+    passed back as ``initial_state``.
     """
     dtype = v.dtype
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
+    # P1-7 fix: centralized shape/device/dtype contract validation (mirrors
+    # naive_recurrent_kda). Run BEFORE the head-dim / chunk_size checks so
+    # a rank-mismatch is caught with a clear message.
+    _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_chunk_kda')
     # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
     # ``T // BT`` so zero or negative values produce a clear AssertionError
     # instead of a bare ZeroDivisionError. Mirrors naive_recurrent_kda.
@@ -293,7 +405,11 @@ def naive_chunk_kda(
         if not output_final_state:
             S = None
         else:
-            S = S.to(dtype)
+            # P1-2 fix: mirror the main return path — keep state in
+            # compute_dtype by default to avoid fp32→fp16 precision loss.
+            target_state_dtype = (state_dtype if state_dtype is not None
+                                  else compute_dtype)
+            S = S.to(target_state_dtype)
         return o.to(dtype), S
     pad = (-T) % BT
     if pad:
@@ -387,8 +503,13 @@ def naive_chunk_kda(
     if not output_final_state:
         S = None
     else:
-        # Cast the returned state back to the caller's dtype for consistency
-        # (mirrors naive_recurrent_kda).
-        S = S.to(dtype)
+        # P1-2 fix: return the state in ``compute_dtype`` (fp32 for fp16/bf16
+        # inputs, fp64 for fp64 inputs) by default — NOT ``v.dtype``. The
+        # previous ``S = S.to(dtype)`` caused repeated fp32→fp16→fp32
+        # round-trips when the state was passed back as ``initial_state`` in
+        # streaming inference, accumulating quantization error in long
+        # sessions. Mirrors the fix in naive_recurrent_kda.
+        target_state_dtype = state_dtype if state_dtype is not None else compute_dtype
+        S = S.to(target_state_dtype)
     o = rearrange(o, 'b h n c d -> b (n c) h d').to(dtype)
     return o[:, :original_T], S

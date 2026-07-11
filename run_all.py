@@ -56,17 +56,34 @@ if HERE not in sys.path:
 
 
 def _ensure_deps():
-    """Install einops if missing (Kaggle's default env may not have it)."""
+    """Install einops and matplotlib if missing, using the SAME version
+    constraints as pyproject.toml.
+
+    P1-4 fix: previously this function installed ``einops`` and
+    ``matplotlib`` with NO version constraints, which could pull breaking
+    releases (einops 0.8 changed error messages; matplotlib 3.10 dropped
+    deprecated APIs). The pyproject.toml pins ``einops>=0.6,<0.9`` and
+    ``matplotlib>=3.5,<3.11`` to match the versions used to generate the
+    committed historical results. We now mirror those bounds here so a
+    ``python run_all.py`` invocation produces the same environment as
+    ``pip install -e .`` — eliminating a silent reproduction drift.
+    """
     try:
         import einops  # noqa: F401
     except ImportError:
-        print('[run_all] installing einops...')
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'einops'])
+        print('[run_all] installing einops (bounded to match pyproject.toml)...')
+        subprocess.check_call([
+            sys.executable, '-m', 'pip', 'install', '-q',
+            'einops>=0.6,<0.9',
+        ])
     try:
         import matplotlib  # noqa: F401
     except ImportError:
-        print('[run_all] installing matplotlib...')
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'matplotlib'])
+        print('[run_all] installing matplotlib (bounded to match pyproject.toml)...')
+        subprocess.check_call([
+            sys.executable, '-m', 'pip', 'install', '-q',
+            'matplotlib>=3.5,<3.11',
+        ])
 
 
 def _setup():
@@ -341,8 +358,13 @@ def run_all(seeds=None, steps=None):
         print('-' * 70)
         print(f'  {n_ok} ok, {n_fail} failed, total {total_t:.1f}s')
 
-        with open('results/summary.json', 'w') as f:
-            json.dump(_sanitize(summary), f, indent=2, allow_nan=False)
+        # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+        # os.replace) so a process kill or disk-full mid-write leaves the
+        # target file as the OLD version (or absent) rather than a truncated
+        # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
+        from kaggle_setup import write_json_atomic
+        write_json_atomic(_sanitize(summary), 'results/summary.json',
+                          indent=2, allow_nan=False)
         print('\nSaved: results/summary.json')
 
         # P0-2 fix: return the summary AND a non-zero exit code when any

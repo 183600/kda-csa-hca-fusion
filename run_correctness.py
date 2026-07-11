@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, sanitize_for_json
+from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
@@ -1287,6 +1287,97 @@ def test_kda_cross_chunk_bptt(device='cpu'):
             x1_grad_b_nonzero,
             f'x1.grad.abs().sum() = {x1_b.grad.abs().sum().item() if x1_grad_b_exists else 0}'),
     ]
+
+
+def test_kda_state_dtype_preservation(device='cpu'):
+    """P1-2 regression: KDA recurrent state preserves fp32 precision for
+    fp16/bf16 inputs.
+
+    Before the P1-2 fix, both ``naive_recurrent_kda`` and
+    ``naive_chunk_kda`` cast the returned state back to ``v.dtype``
+    (fp16/bf16) at the end of the forward. The next call would then cast
+    the state back up to fp32 (``compute_dtype``) for computation. In
+    long streaming inference this fp32→fp16→fp32 round-trip accumulated
+    quantization error on every chunk, degrading the recurrent state's
+    precision over time.
+
+    The fix returns the state in ``compute_dtype`` (fp32 for fp16/bf16
+    inputs) by default, while still casting the OUTPUT ``o`` back to
+    ``v.dtype``. This separates "persistent state dtype" (fp32) from
+    "output activation dtype" (matches input).
+
+    This test verifies:
+    1. For fp16 inputs, the returned state is fp32 (NOT fp16).
+    2. For fp32 inputs, the returned state is fp32 (unchanged).
+    3. For fp64 inputs, the returned state is fp64 (unchanged).
+    4. The OUTPUT ``o`` always matches ``v.dtype`` (backward compat).
+    5. The ``state_dtype`` parameter overrides the default.
+    """
+    logger.info("Test: KDA state dtype preservation (P1-2 fix)")
+    torch.manual_seed(71)
+    B, T, H, K, V = 1, 32, 2, 8, 8
+    results = []
+
+    for input_dtype, expected_state_dtype in [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+    ]:
+        q = torch.randn(B, T, H, K, dtype=input_dtype, device=device)
+        k = torch.randn(B, T, H, K, dtype=input_dtype, device=device)
+        v = torch.randn(B, T, H, V, dtype=input_dtype, device=device) * 0.1
+        g = -torch.rand(B, T, H, K, dtype=input_dtype, device=device) * 0.05
+        beta = torch.rand(B, T, H, dtype=input_dtype, device=device) * 0.2
+        # L2-normalize q/k (the KDA paper does this for eigenvalue stability).
+        q = torch.nn.functional.normalize(q.float(), dim=-1).to(input_dtype)
+        k = torch.nn.functional.normalize(k.float(), dim=-1).to(input_dtype)
+
+        # Recurrent path.
+        o_rec, s_rec = naive_recurrent_kda(
+            q, k, v, g, beta, output_final_state=True)
+        rec_state_dtype_ok = (s_rec.dtype == expected_state_dtype)
+        rec_output_dtype_ok = (o_rec.dtype == input_dtype)
+        results.append(_ok(
+            f'recurrent: state dtype={str(expected_state_dtype)} for input={str(input_dtype)}',
+            rec_state_dtype_ok,
+            f'state.dtype={s_rec.dtype}, expected={expected_state_dtype}'))
+        results.append(_ok(
+            f'recurrent: output dtype={str(input_dtype)} for input={str(input_dtype)}',
+            rec_output_dtype_ok,
+            f'o.dtype={o_rec.dtype}, expected={input_dtype}'))
+
+        # Chunk path (only if T >= chunk_size to engage the chunk code).
+        o_chk, s_chk = naive_chunk_kda(
+            q, k, v, g, beta, output_final_state=True, chunk_size=16)
+        chk_state_dtype_ok = (s_chk.dtype == expected_state_dtype)
+        chk_output_dtype_ok = (o_chk.dtype == input_dtype)
+        results.append(_ok(
+            f'chunk: state dtype={str(expected_state_dtype)} for input={str(input_dtype)}',
+            chk_state_dtype_ok,
+            f'state.dtype={s_chk.dtype}, expected={expected_state_dtype}'))
+        results.append(_ok(
+            f'chunk: output dtype={str(input_dtype)} for input={str(input_dtype)}',
+            chk_output_dtype_ok,
+            f'o.dtype={o_chk.dtype}, expected={input_dtype}'))
+
+    # Test the state_dtype override: explicitly request fp16 state for fp16 inputs.
+    q = torch.randn(B, T, H, K, dtype=torch.float16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.float16, device=device)
+    v = torch.randn(B, T, H, V, dtype=torch.float16, device=device) * 0.1
+    g = -torch.rand(B, T, H, K, dtype=torch.float16, device=device) * 0.05
+    beta = torch.rand(B, T, H, dtype=torch.float16, device=device) * 0.2
+    o_override, s_override = naive_recurrent_kda(
+        q, k, v, g, beta, output_final_state=True,
+        state_dtype=torch.float16)
+    override_ok = (s_override.dtype == torch.float16
+                   and o_override.dtype == torch.float16)
+    results.append(_ok(
+        'state_dtype=torch.float16 override is honored',
+        override_ok,
+        f'state.dtype={s_override.dtype}, o.dtype={o_override.dtype}'))
+
+    return results
 
 
 def test_hca_sliding_window_causality(device='cpu'):
@@ -3804,6 +3895,8 @@ def main():
     all_results += _run_safe(test_csa_indexer_ste_full_softmax, device)
     # P0-3 regression: detach_lookback=False enables cross-chunk BPTT.
     all_results += _run_safe(test_kda_cross_chunk_bptt, device)
+    # P1-2 regression: KDA state preserves fp32 precision for fp16/bf16 inputs.
+    all_results += _run_safe(test_kda_state_dtype_preservation, device)
     all_results += _run_safe(test_hca_sliding_window_causality, device)
     all_results += _run_safe(test_csa_full_pipeline_causality, device)
     # Regression tests for bugs found during code review.
@@ -3873,14 +3966,20 @@ def main():
     # allow_nan=True) wrote directly to the file, so a NaN mid-stream left
     # a partial JSON document. Mirrors the atomicity fix in
     # run_quality.py::main / run_ablation.py::main.
+    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document. The previous ``with open(...) as f: f.write(text)``
+    # pattern was NOT atomic — see kaggle_setup.write_json_atomic's
+    # docstring for the full rationale.
     try:
-        text = json.dumps(all_results, indent=2, allow_nan=False)
+        write_json_atomic(all_results, 'results/exp1_correctness.json',
+                          indent=2, allow_nan=False)
     except ValueError as e:
         logger.error(f'non-finite value in results; sanitizing to null: {e}')
-        text = json.dumps(sanitize_for_json(all_results), indent=2,
-                          allow_nan=False)
-    with open('results/exp1_correctness.json', 'w') as f:
-        f.write(text)
+        write_json_atomic(sanitize_for_json(all_results),
+                          'results/exp1_correctness.json',
+                          indent=2, allow_nan=False)
     logger.info('Saved: results/exp1_correctness.json')
     return 0 if passed == len(all_results) else 1
 

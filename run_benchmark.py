@@ -36,7 +36,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json
+from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json, write_json_atomic
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -433,14 +433,18 @@ def main():
     # wrote directly to the file, so a NaN mid-stream left a partial JSON
     # document. Mirrors the atomicity fix in run_quality.py::main /
     # run_ablation.py::main.
+    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
     try:
-        text = json.dumps(results, indent=2, allow_nan=False)
+        write_json_atomic(results, 'results/exp2_benchmark.json',
+                          indent=2, allow_nan=False)
     except ValueError as e:
         logger.error(f'non-finite value in results; sanitizing to null: {e}')
-        text = json.dumps(sanitize_for_json(results), indent=2,
-                          allow_nan=False)
-    with open('results/exp2_benchmark.json', 'w') as f:
-        f.write(text)
+        write_json_atomic(sanitize_for_json(results),
+                          'results/exp2_benchmark.json',
+                          indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp2_benchmark.json')
 
 
