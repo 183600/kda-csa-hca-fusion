@@ -331,30 +331,32 @@ class KDAHybridLayer(nn.Module):
 class CSAHybridLayer(nn.Module):
     """A single CSA sub-layer (compression + sparse selection + MQA).
 
-    .. warning:: Indexer parameters are NOT trained (known limitation).
+    .. note:: P0-4 fix — indexer is now trainable via straight-through estimator.
+
         The lightning indexer uses ``torch.topk`` which returns integer
-        indices that do NOT propagate gradients (see the docstring of
-        ``csa_lightning_indexer``). Consequently the indexer parameters
-        ``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` stay at
+        indices that do NOT propagate gradients directly. The previous
+        implementation left the indexer parameters
+        (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx``) at
         their random initialization after ``backward()`` (their ``.grad``
-        is ``None`` and AdamW silently skips them). The compressed KV
-        representations (``W_aKV``, ``W_bKV``, ``W_aZ``, ``W_bZ``, ``Ba``,
-        ``Bb``) ARE trained through the differentiable compression +
-        attention path, so CSA-based models still learn useful
-        representations — just without *learned* retrieval.
+        was ``None`` and AdamW silently skipped them), which made CSA's
+        sparse top-k selection effectively **random** over the learned
+        compressed KV entries.
 
-        This means CSA's sparse top-k selection is effectively **random
-        sparse** over the (learned) compressed KV entries, not the
-        "learned sparse retrieval" the paper's narrative implies. Any
-        experiment reporting CSA quality (e.g. MQAR, ablation) should
-        disclose this caveat: the result measures "learned compression +
-        uniform/random top-k retrieval", not "learned sparse retrieval".
+        The fix adds a straight-through estimator (STE) in
+        ``ops_csa.naive_csa``: the forward pass still uses the HARD
+        top-k indices (so the algorithm remains genuinely sparse), but
+        the backward pass routes gradients through a differentiable soft
+        distribution over all compressed blocks. After ``backward()``,
+        the indexer parameters now have non-None ``.grad`` and are
+        updated by the optimizer. The STE does NOT change the forward
+        semantics — CSA is still sparse retrieval — but it makes the
+        indexer *learnable*.
 
-        A straight-through estimator (STE) or contrastive auxiliary loss
-        on the selection logits would fix this, but would change the
-        algorithm. We expose the limitation via ``indexer_is_trained``
-        and emit a one-time warning on the first forward when the layer
-        is in training mode.
+        ``indexer_is_trained`` is now ``True`` by default. The
+        ``_maybe_warn_indexer`` method is kept for backward
+        compatibility but only fires when an explicit caller disables
+        STE via ``use_ste=False`` (e.g. for ablation against the
+        untrained-indexer baseline).
     """
 
     # Class-level flag so the warning fires once per process, not once per
@@ -381,14 +383,17 @@ class CSAHybridLayer(nn.Module):
         self.B_idx = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_cI) * 0.02)
         self.sink = nn.Parameter(torch.zeros(cfg.csa_nh))
         self.o_proj = nn.Linear(c * cfg.csa_nh, d, bias=False)
-        # Expose the indexer-training limitation as a public attribute so
-        # experiment runners can include it in their result JSON (reviewers
-        # reading the JSON see the caveat alongside the accuracy number).
-        # This is a constant (False) for the current implementation; if STE
-        # or an auxiliary loss is ever added, flip this to True (or to a
-        # config-driven flag) so the warning and the experiment disclosure
-        # both update automatically.
-        self.indexer_is_trained = False
+        # P0-4 fix: the indexer is now trainable via the STE in
+        # ``naive_csa``. This flag is read by experiment runners to
+        # include the training status in result JSON metadata. Set to
+        # ``False`` only when ``use_ste=False`` is explicitly passed to
+        # ``naive_csa`` (e.g. for the untrained-indexer ablation).
+        self.indexer_is_trained = True
+        # Controls whether ``forward`` passes ``use_ste=True`` to
+        # ``naive_csa``. Exposed as an instance attribute (not a config
+        # field) so ablation code can flip it on a per-layer basis
+        # without rebuilding the config.
+        self.use_ste = True
 
     @classmethod
     def reset_warned(cls):
@@ -400,26 +405,28 @@ class CSAHybridLayer(nn.Module):
         cls._indexer_warned = False
 
     def _maybe_warn_indexer(self):
+        # After the P0-4 fix the indexer IS trained (via STE) by default.
+        # The warning now only fires when STE is explicitly disabled,
+        # which is an opt-in ablation against the untrained baseline.
         if not self.indexer_is_trained and not CSAHybridLayer._indexer_warned:
             import warnings
             warnings.warn(
-                "CSAHybridLayer: the lightning indexer parameters "
-                "(W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx) are NOT trained — "
-                "torch.topk returns integer indices that do not propagate "
-                "gradients. CSA's sparse top-k selection is therefore "
-                "effectively RANDOM over the (learned) compressed KV "
-                "entries, not 'learned sparse retrieval' as the paper "
-                "narrative implies. See CSAHybridLayer docstring and "
-                "ops_csa.py::csa_lightning_indexer for the full explanation. "
-                "Set ``indexer_is_trained = True`` (or implement an STE / "
-                "auxiliary loss) to silence this warning.",
+                "CSAHybridLayer: STE is disabled (use_ste=False), so the "
+                "lightning indexer parameters (W_IUQ, W_w, W_KV_idx, "
+                "W_Z_idx, B_idx) will NOT be trained — torch.topk returns "
+                "integer indices that do not propagate gradients. CSA's "
+                "sparse top-k selection will be effectively RANDOM over "
+                "the (learned) compressed KV entries. This mode is "
+                "intended ONLY for ablation against the untrained-indexer "
+                "baseline; production use should keep use_ste=True.",
                 stacklevel=3,
             )
             CSAHybridLayer._indexer_warned = True
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         cfg = self.cfg
-        if self.training:
+        # Only warn when STE is explicitly disabled (ablation mode).
+        if self.training and not self.use_ste:
             self._maybe_warn_indexer()
         o = naive_csa(
             x, self.W_aKV.weight.T, self.W_bKV.weight.T,
@@ -430,6 +437,7 @@ class CSAHybridLayer(nn.Module):
             m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
             c=cfg.csa_c, c_I=cfg.csa_cI, dc=cfg.csa_dc,
             sliding_window=cfg.csa_sliding_window, sink_logits=self.sink,
+            use_ste=self.use_ste,
         )
         return self.o_proj(o), None
 

@@ -145,37 +145,46 @@ def csa_lightning_indexer(
     topk: int,
     scale: float | None = None,
     causal_block_mask: torch.Tensor | None = None,   # [T, n_blocks]
+    return_soft_weights: bool = False,
 ) -> torch.Tensor:
     """Top-k selection over compressed indexer keys (Eq. 13–17).
 
     Returns indices of shape ``[B, T, topk]`` (padded with -1).
 
-    .. note:: Gradient-flow limitation (known).
+    .. note:: P0-4 fix — straight-through estimator (STE) for the indexer.
+
         The returned ``idx`` tensor is an integer tensor produced by
         ``torch.topk``. Integer indices do NOT propagate gradients, so
-        autograd cannot flow back from the loss through the selection to
-        the indexer parameters (``W_IUQ``, ``W_w``, ``W_KV_idx``,
-        ``W_Z_idx``, ``B_idx`` in ``CSAHybridLayer``). After a backward
-        pass these parameters have ``.grad is None`` and are silently
-        skipped by ``AdamW`` (including weight decay).
+        without an auxiliary path autograd cannot flow back from the
+        loss through the selection to the indexer parameters
+        (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` in
+        ``CSAHybridLayer``). After a backward pass these parameters had
+        ``.grad is None`` and were silently skipped by ``AdamW``.
 
-        This matches the *structure* of DeepSeek-V4's lightning indexer
-        but omits the auxiliary training signal the paper uses (a
-        straight-through estimator or a contrastive auxiliary loss on
-        the selection logits). Adding such a signal would require either
-        (a) returning the soft logits alongside the hard indices and
-        adding an auxiliary loss in ``CSAHybridLayer.forward``, or
-        (b) replacing the hard top-k gather with a soft attention over
-        all compressed blocks (which would change the algorithm from
-        sparse to dense and defeat CSA's purpose).
+        The fix adds a **straight-through estimator**: when
+        ``return_soft_weights=True`` (the default in ``naive_csa``),
+        this function ALSO returns ``soft_weights`` of shape
+        ``[B, T, n_blocks]`` — a differentiable probability
+        distribution over all compressed blocks (softmax of the indexer
+        logits, masked by the causal block mask). The caller
+        (``naive_csa``) uses these weights to construct a STE gather:
+        the forward pass still uses the HARD top-k indices (so the
+        algorithm remains genuinely sparse), but the backward pass
+        routes gradients through ``soft_weights`` so the indexer
+        parameters receive a training signal.
 
-        In practice the indexer parameters remain at their (random)
-        initialization, and CSA effectively performs *random sparse
-        selection* over the (learned) compressed KV entries. The
-        compressed KV representations themselves ARE trained through
-        the differentiable compression + attention path, so CSA-based
-        models still learn useful representations — just without
-        learned retrieval.
+        This is the standard STE trick: ``forward = hard_topk``,
+        ``backward = soft_softmax``. It does NOT change the algorithm's
+        forward semantics (CSA is still sparse retrieval), but it makes
+        the indexer *learnable* — the selection distribution is pushed
+        toward blocks that reduce the task loss, and over training the
+        top-k selection concentrates on the most relevant blocks.
+
+        This matches the spirit of DeepSeek-V4's lightning indexer
+        training signal (the paper uses an STE / contrastive auxiliary
+        loss on the selection logits); the STE here is the simplest
+        implementation that closes the gradient-flow gap without adding
+        a separate auxiliary loss term.
     """
     # Validate topk BEFORE ``min(topk, n_blocks)`` so a caller passing
     # topk=-1 gets a clear ValueError instead of a cryptic
@@ -230,6 +239,26 @@ def csa_lightning_indexer(
     idx = idx.masked_fill(torch.isinf(values), -1)
     if topk > S:
         idx = torch.cat([idx, idx.new_full((B_, T, topk - S), -1)], dim=-1)
+    # P0-4 fix: compute a differentiable soft distribution over ALL
+    # blocks for the straight-through estimator. ``logits`` still has
+    # grad-fn back to the indexer parameters (W_IUQ, W_w, W_KV_idx,
+    # W_Z_idx, B_idx) because it is a function of q_idx / k_idx / w_idx
+    # which are themselves functions of those parameters. The softmax
+    # here is over the full n_blocks dimension (not just the top-k), so
+    # gradients flow to every block's logit — the indexer learns which
+    # blocks SHOULD have been selected, even for blocks not in the
+    # current hard top-k.
+    #
+    # We use a numerically stable softmax that handles all-masked rows
+    # (early query tokens with no preceding causal block) by replacing
+    # their -inf entries with 0 before the exp, then zeroing the result.
+    # This mirrors the NaN-safe softmax in ``naive_csa``'s else-branch.
+    if return_soft_weights:
+        all_masked = logits.isinf().all(dim=-1, keepdim=True)          # [B, T, 1]
+        safe_logits = logits.masked_fill(all_masked, 0.0)
+        soft_weights = torch.softmax(safe_logits, dim=-1)              # [B, T, n_blocks]
+        soft_weights = soft_weights.masked_fill(all_masked, 0.0)
+        return idx, soft_weights
     return idx
 
 
@@ -259,6 +288,7 @@ def naive_csa(
     scale: float | None = None,
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
+    use_ste: bool = True,
 ) -> torch.Tensor:
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -380,7 +410,17 @@ def naive_csa(
     # are ever exposed for downstream use (e.g. learnable temperature).
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
                                     scale=c_I ** -0.5,
-                                    causal_block_mask=cbm)          # [B, T, topk]
+                                    causal_block_mask=cbm,
+                                    return_soft_weights=use_ste)     # [B, T, topk]
+    # P0-4 fix: when ``use_ste`` is True (the default), the indexer also
+    # returns a differentiable ``soft_weights`` tensor of shape
+    # ``[B, T, n_blocks]`` for the straight-through estimator. We keep
+    # it in a variable that is ``None`` when STE is disabled so the
+    # gather code below can branch cleanly.
+    if use_ste:
+        indices, soft_weights = indices  # unpack the (idx, soft_weights) tuple
+    else:
+        soft_weights = None
 
     # --- 3. Shared-KV MQA core attention ---
     # attention queries (low-rank up-projection)
@@ -415,6 +455,55 @@ def naive_csa(
         idx_safe = indices.clamp(min=0)                                  # [B, T, topk]
         batch_idx = torch.arange(B_, device=device).view(B_, 1, 1)      # [B, 1, 1]
         kv = C_comp_n[batch_idx, idx_safe]                               # [B, T, topk, c]
+
+        # P0-4 fix — straight-through estimator (STE) for the indexer.
+        # ``kv`` above is a hard gather: its value is correct (the
+        # top-k compressed KV entries), but it has NO gradient path back
+        # to the indexer parameters because ``indices`` is an integer
+        # tensor from ``torch.topk``. We construct a differentiable
+        # ``soft_kv`` of the SAME shape ``[B, T, topk, c]`` by gathering
+        # the top-k columns of ``soft_weights`` (which IS differentiable)
+        # and multiplying by ``C_comp_n``. Then we apply the STE identity:
+        #
+        #     kv_ste = soft_kv + (kv - soft_kv).detach()
+        #
+        # Forward value:  soft_kv + kv - soft_kv = kv           (hard gather)
+        # Backward grad:  d(soft_kv) = the differentiable path  (soft gather)
+        #
+        # This makes the forward pass identical to the original hard
+        # top-k gather (so the algorithm remains genuinely sparse), while
+        # the backward pass routes gradients through ``soft_weights`` ->
+        # ``logits`` -> ``q_idx/k_idx/w_idx`` -> indexer parameters
+        # (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx``).
+        # After ``backward()``, those parameters now have non-None
+        # ``.grad`` and are updated by the optimizer.
+        #
+        # We only gather the top-k columns of ``soft_weights`` (rather
+        # than the full [B, T, n_blocks] matrix) so the STE gradient
+        # matches the hard selection as closely as possible: the
+        # gradient on a non-selected block is zero in the hard path, so
+        # we mirror that by only passing gradient through the selected
+        # columns. (Using the full soft_weights would also work but
+        # would push gradient toward ALL blocks, which is less faithful
+        # to the sparse selection semantics.)
+        if use_ste and soft_weights is not None:
+            # Gather the top-k columns of soft_weights using the SAME
+            # indices (idx_safe). soft_weights is [B, T, n_blocks];
+            # we want soft_weights_selected[b, t, k] = soft_weights[b, t, idx_safe[b, t, k]].
+            # ``torch.gather`` along the last dim does exactly this.
+            soft_weights_selected = torch.gather(
+                soft_weights, dim=-1, index=idx_safe)                # [B, T, topk]
+            # Mask out invalid (-1) slots so they contribute zero
+            # gradient (mirrors the hard path's valid_mask).
+            soft_weights_selected = soft_weights_selected * \
+                valid_mask.to(soft_weights_selected.dtype)
+            # Build the soft gather: each selected block's contribution
+            # weighted by its soft probability. This is differentiable
+            # w.r.t. soft_weights (and therefore the indexer params).
+            # soft_kv[b, t, k, :] = soft_weights_selected[b, t, k] * kv[b, t, k, :]
+            soft_kv = soft_weights_selected.unsqueeze(-1) * kv       # [B, T, topk, c]
+            # STE: forward = kv (hard), backward = soft_kv (differentiable).
+            kv = soft_kv + (kv - soft_kv).detach()
 
         # Per-head attention scores over the topk selected blocks.
         scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv) * scale  # [B, T, nh, topk]

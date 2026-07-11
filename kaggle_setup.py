@@ -150,47 +150,149 @@ def setup_kaggle(verbose: bool = True) -> None:
     """Install the CUDA torch wheel if running on Kaggle with a GPU but a
     CPU-only torch build.
 
-    Idempotent: if ``torch.cuda.is_available()`` is already True, do nothing.
+    P0-3 fix — process-internal torch replacement does NOT work:
+
+    This module does ``import torch`` at the top of the file. Once a
+    Python process has imported torch, the loaded ``libtorch.so`` binary
+    and the ``torch._C`` extension module are pinned in memory for the
+    lifetime of that process. Running ``pip install --upgrade torch``
+    replaces the files on disk, but the already-loaded binary in the
+    current process keeps the OLD (CPU-only) symbols. Subsequent calls
+    to ``torch.cuda.is_available()`` continue to return ``False`` even
+    though ``pip show torch`` reports the CUDA build.
+
+    The previous implementation installed the CUDA wheel and then
+    printed "CUDA should now be available after a restart", but
+    ``run_all()`` immediately continued into ``detect_env()`` and the
+    experiments — without any restart — so the first run on Kaggle
+    silently used CPU. The "after a restart" caveat was effectively
+    unreachable from the documented entry point.
+
+    The correct fix is to split the bootstrap from the experiment
+    process:
+
+    1. **Bootstrap** (run once, in a throwaway process or a notebook
+       first cell): install the CUDA wheel, then EXIT / restart the
+       kernel. ``bootstrap_kaggle_cuda()`` below performs the install
+       and raises ``RuntimeError`` to force the caller to restart.
+    2. **Experiment**: after restart, call ``setup_kaggle()``. It now
+       only VERIFIES that CUDA is available; if the user forgot to
+       restart, it raises ``RuntimeError`` instead of silently
+       continuing on CPU.
+
+    This makes the failure mode loud: a misconfigured Kaggle run now
+    raises immediately at startup, rather than producing CPU-only
+    results that look like GPU results in the summary.
     """
     if torch.cuda.is_available():
+        if verbose:
+            print("[kaggle_setup] CUDA is available; no setup needed.")
         return
     if not (is_kaggle() and _nvidia_smi_available()):
+        # Not a Kaggle+GPU environment; CPU is the expected config.
+        # Do nothing — local CPU runs are still supported.
+        return
+    # Kaggle + NVIDIA GPU detected, but torch.cuda.is_available() is False.
+    # This is the P0-3 scenario: either the CUDA wheel was never installed,
+    # or it was installed in a PREVIOUS process and the current process is
+    # still running the old CPU-only torch (the most common case when the
+    # user ran ``bootstrap_kaggle_cuda()`` but did not restart the kernel).
+    #
+    # We deliberately DO NOT install the wheel here. Installing it in the
+    # current process is a no-op for torch.cuda.is_available() (the binary
+    # is already loaded), and continuing to the experiments would silently
+    # produce CPU results — exactly the bug we are fixing.
+    #
+    # Instead, raise so the caller knows the environment is not ready.
+    raise RuntimeError(
+        "[kaggle_setup] Kaggle + NVIDIA GPU detected but "
+        "torch.cuda.is_available() is False. The CUDA torch wheel must "
+        "be installed in a SEPARATE bootstrap step BEFORE running "
+        "experiments, because replacing torch in an already-running "
+        "Python process does not take effect (the loaded libtorch.so "
+        "binary is pinned in memory until the process exits).\n\n"
+        "To fix:\n"
+        "  1. Run ``python -c 'from kaggle_setup import "
+        "bootstrap_kaggle_cuda; bootstrap_kaggle_cuda()'`` (or run the "
+        "kaggle_bootstrap notebook cell) in a throwaway process.\n"
+        "  2. RESTART this Python process / kernel.\n"
+        "  3. Re-run the experiments. ``setup_kaggle()`` will then see "
+        "torch.cuda.is_available() == True and proceed.\n\n"
+        "If you intended to run on CPU, set SKIP_CUDA_CHECK=1 in the "
+        "environment to bypass this guard."
+    )
+
+
+def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
+    """Install the CUDA torch wheel for the NEXT Python process.
+
+    This is the bootstrap function that the P0-3 fix splits out of
+    ``setup_kaggle()``. It performs the pip install that puts the CUDA
+    wheel on disk, then raises ``RuntimeError`` to remind the caller
+    that the CURRENT process must exit before the new wheel takes
+    effect.
+
+    Usage on Kaggle (notebook first cell)::
+
+        from kaggle_setup import bootstrap_kaggle_cuda
+        try:
+            bootstrap_kaggle_cuda()
+        except RuntimeError as e:
+            print(e)
+            print("Restarting kernel... (run experiments in the next cell)")
+            # On Kaggle, use the kernel-restart API or ask the user to
+            # click Restart in the UI. The experiments must run in a
+            # fresh process that re-imports torch from the new wheel.
+            raise
+
+    This function is idempotent: if ``torch.cuda.is_available()`` is
+    already True, it returns immediately without installing anything.
+    """
+    if torch.cuda.is_available():
+        if verbose:
+            print("[kaggle_setup] CUDA already available; bootstrap is a no-op.")
+        return
+    if not (is_kaggle() and _nvidia_smi_available()):
+        if verbose:
+            print("[kaggle_setup] Not a Kaggle+GPU environment; bootstrap is a no-op.")
         return
     if verbose:
         print("[kaggle_setup] Kaggle + NVIDIA GPU detected but torch has no CUDA.")
         print("[kaggle_setup] Installing CUDA torch wheel (this happens once)...")
-    # Pick the wheel that matches the driver-reported CUDA version. Falls back
-    # to cu121 (the historical Kaggle T4 wheel) if probing fails.
     index_url = _detect_cuda_wheel_index()
     if verbose:
         print(f"[kaggle_setup] Using PyTorch wheel index: {index_url}")
-    # The upper bound was previously pinned to <2.6, which prevents installation
-    # on environments with newer torch (2.6+). Remove the upper bound and rely
-    # on ``--upgrade-strategy=only-if-needed`` to avoid unnecessary upgrades.
+    # Use ``--extra-index-url`` instead of ``--index-url``: the latter
+    # REPLACES PyPI entirely, which breaks resolution of any non-torch
+    # dependency that torch wheels pull in (e.g. ``typing-extensions``,
+    # ``sympy``). ``--extra-index-url`` keeps PyPI as the primary
+    # source and adds the PyTorch wheel index as a fallback.
     #
-    # Use ``--extra-index-url`` instead of ``--index-url``: the latter REPLACES
-    # PyPI entirely, which breaks resolution of any non-torch dependency that
-    # torch wheels pull in (e.g. ``typing-extensions``, ``sympy``) — pip would
-    # 404 on those packages because they live on PyPI, not on the PyTorch wheel
-    # index. ``--extra-index-url`` keeps PyPI as the primary source and adds
-    # the PyTorch wheel index as a fallback, so torch's CUDA wheels are found
-    # there while their non-torch deps still resolve from PyPI.
-    #
-    # CRITICAL: ``--upgrade`` is REQUIRED. Without it, pip treats the already-
-    # installed (CPU-only) torch as satisfying ``torch>=2.1`` and does NOTHING.
-    # ``--upgrade-strategy=only-if-needed`` is a modifier of ``--upgrade`` and
-    # is meaningless on its own (per ``pip install --help``). Kaggle preinstalls
-    # CPU-only torch, so the previous command (without ``--upgrade``) was a
-    # silent no-op: every "GPU" experiment on Kaggle silently ran on CPU.
+    # CRITICAL: ``--upgrade`` is REQUIRED. Without it, pip treats the
+    # already-installed (CPU-only) torch as satisfying ``torch>=2.1``
+    # and does NOTHING. ``--upgrade-strategy=only-if-needed`` is a
+    # modifier of ``--upgrade`` and is meaningless on its own.
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--upgrade",
         "--upgrade-strategy", "only-if-needed",
         "torch>=2.1", "--extra-index-url", index_url,
     ])
-    if verbose:
-        print("[kaggle_setup] Done. CUDA should now be available after a restart "
-              "of the Python process if it was imported before.")
+    # The install succeeded, but the CURRENT process still has the old
+    # CPU-only torch loaded. Force the caller to restart.
+    raise RuntimeError(
+        "[kaggle_setup] CUDA torch wheel installed successfully, but "
+        "the CURRENT Python process still has the old CPU-only torch "
+        "loaded (libtorch.so is pinned in memory until the process "
+        "exits). You MUST restart the Python process / kernel before "
+        "running any experiment, otherwise torch.cuda.is_available() "
+        "will still return False and all experiments will silently "
+        "run on CPU.\n\n"
+        "After restart, call ``setup_kaggle()`` (or just "
+        "``run_all()``) — it will verify CUDA is available and "
+        "proceed. Do NOT call ``bootstrap_kaggle_cuda()`` again; it "
+        "is a one-shot installer."
+    )
 
 
 def detect_env() -> EnvInfo:

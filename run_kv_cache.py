@@ -108,14 +108,25 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return recurrent_state
 
     if op == 'csa':
-        # Use max(1, ...) so T < csa_m still reports 1 block (the partial
-        # block that a real engine would allocate). Without this, T=0 would
-        # report 0 compressed KV elements, which is technically correct but
-        # makes the KV/GQA ratio 0/0 = NaN at T=0. The slight overestimate at
-        # T < csa_m (1 block instead of 0) is negligible next to the sliding-
-        # window term and matches what a production engine actually allocates
-        # (it reserves the block buffer upfront, not lazily per token).
-        n_blocks = max(1, T // csa_m)
+        # P1-4 fix: use ceil(T / m) for the LOGICAL block count, not
+        # floor. The previous ``max(1, T // csa_m)`` returned 1 block
+        # for T = m + 1 (which actually needs 2 blocks: one full + one
+        # partial), silently undercounting the compressed KV and
+        # indexer cache at non-divisible T. The correct count of
+        # ALLOCATED blocks (including a partial trailing block) is
+        # ``ceil(T / m) = (T + m - 1) // m``.
+        #
+        # The ``max(1, ...)`` wrapper is kept ONLY to preserve the
+        # "allocated capacity" semantics: a production engine reserves
+        # at least one block buffer upfront (even at T=0), so the
+        # KV/GQA ratio is well-defined at T=0 instead of 0/0 = NaN.
+        # This is the SAME semantics the old code intended (see the
+        # original comment below), but now with the correct ceil count
+        # for 0 < T not divisible by m.
+        #
+        # For the FLOPs path (``prefill_flops``), the LOGICAL count
+        # (without the max(1, ...)) is used instead — see that function.
+        n_blocks = max(1, (T + csa_m - 1) // csa_m)
         # Compressed KV: n_blocks entries of c elements (keys serve as values).
         compressed = n_blocks * csa_c
         if mode == 'full_accounting':
@@ -133,8 +144,11 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return compressed
 
     if op == 'hca':
-        # Same max(1, ...) rationale as the 'csa' branch.
-        n_blocks = max(1, T // hca_m2)
+        # P1-4 fix: same ceil correction as the 'csa' branch above.
+        # ``max(1, T // hca_m2)`` undercounted blocks at non-divisible T;
+        # the correct allocated-capacity count is ``ceil(T / m2)`` with
+        # a floor of 1 for the T=0 ratio convention.
+        n_blocks = max(1, (T + hca_m2 - 1) // hca_m2)
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':
             sw = min(T, hca_sw) * hca_c
@@ -245,7 +259,19 @@ def prefill_flops(op: str, T: int, **kw):
         recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
         return proj + recurrent
     if op == 'csa':
-        n_blocks = max(1, T // csa_m)
+        # P1-4 fix: use ceil(T / m) for the logical block count. The
+        # FLOPs path does NOT use the ``max(1, ...)`` floor because at
+        # T=0 there is genuinely no computation (no compression, no
+        # indexer scoring, no attention). The ``kv_cache_elements``
+        # function keeps the floor for "allocated capacity" semantics
+        # (a production engine reserves a block buffer even at T=0),
+        # but FLOPs measure actual work done, which is zero at T=0.
+        #
+        # The previous ``max(1, T // csa_m)`` returned 1 block for
+        # T = m + 1 (which actually compresses 2 blocks: one full +
+        # one partial), undercounting the compression / indexer FLOPs
+        # at non-divisible T. ``ceil(T / m)`` is the correct count.
+        n_blocks = (T + csa_m - 1) // csa_m if T > 0 else 0
         # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
         # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last
         # two are T*d*c_I.
@@ -306,7 +332,7 @@ def prefill_flops(op: str, T: int, **kw):
         # who overrides ``csa_nh`` (e.g. to ablate head count) would get a
         # silently wrong FLOPs number. Use ``csa_nh`` so the formula matches
         # the actual operator.
-        effective_topk = min(csa_topk, max(1, n_blocks // 2))
+        effective_topk = min(csa_topk, max(1, n_blocks // 2)) if n_blocks > 0 else 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
@@ -324,7 +350,10 @@ def prefill_flops(op: str, T: int, **kw):
         sw = 2 * sw_entries * csa_c * csa_nh * 2
         return compress + query_proj + indexer + core + sw
     if op == 'hca':
-        n_blocks = max(1, T // hca_m2)
+        # P1-4 fix: same ceil correction as the CSA branch above.
+        # FLOPs use the logical block count (no ``max(1, ...)`` floor);
+        # at T=0 there is no computation, so n_blocks=0 is correct.
+        n_blocks = (T + hca_m2 - 1) // hca_m2 if T > 0 else 0
         # KV-side compression: TWO input projections (W_KV, W_Z), each T*d*c.
         compress = 2 * T * d * hca_c * 2
         # Query-side projections (W_DQ, W_UQ) — previously OMITTED,

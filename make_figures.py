@@ -73,17 +73,44 @@ def load(name):
     crashing the entire figure-generation step. A truncated/malformed
     JSON (common when an experiment is killed mid-write) used to crash
     every subsequent figure too.
+
+    Supports two on-disk schemas:
+
+    1. **Legacy bare array** ``[{...}, {...}]`` (the historical format;
+       still used by all result files except ``exp4_mqar.json`` after the
+       P0-1 fix).
+    2. **Envelope object** ``{"metadata": {...}, "results": [...]}``
+       introduced by the P0-1 fix so that a result file can carry
+       provenance / caveats alongside the data array without producing
+       the invalid concatenated-document form ``{...}\\n[...]`` that
+       ``json.load`` rejects with ``Extra data``.
+
+    For the envelope form, this function returns the inner ``results``
+    array so downstream figure code keeps working unchanged. The
+    ``metadata`` block is intentionally discarded here because no current
+    figure consumes it; if a future figure needs provenance, add a
+    sibling ``load_with_metadata()`` that returns ``(metadata, results)``.
     """
     path = os.path.join(_RESULTS_DIR, name)
     try:
         with open(path, encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
         print(f'[load] {path} not found; skipping', file=sys.stderr)
         return []
     except json.JSONDecodeError as e:
         print(f'[load] {path} is malformed: {e}; skipping', file=sys.stderr)
         return []
+    # Unwrap the envelope form. A top-level dict with a ``results`` key
+    # holding a list unambiguously signals the envelope introduced by the
+    # P0-1 fix. All current legacy result files are bare arrays (the
+    # kv_cache / benchmark / correctness / ablation / decoding files all
+    # serialize Python lists), so this branch only fires for the new
+    # envelope form and leaves every other file's behavior unchanged.
+    if isinstance(data, dict) and 'results' in data and isinstance(
+            data['results'], list):
+        return data['results']
+    return data
 
 
 def _ensure_figures_dir():
@@ -153,7 +180,13 @@ def fig_benchmark():
                   'cpu')
     ax.set_xlabel('Sequence length T')
     ax.set_ylabel(f'Wall-clock latency (ms, {device})')
-    ax.set_title('Operator latency vs. sequence length')
+    # P1-1 fix: the benchmark mixes compute boundaries (core vs
+    # end_to_end_single_layer vs end_to_end_multi_layer). Surface this
+    # in the title so a reader does not misinterpret the cross-op
+    # comparison as a fair kernel-level benchmark. The detailed boundary
+    # per op is in the JSON (``compute_boundary`` / ``n_layers`` fields).
+    ax.set_title('Operator latency vs. sequence length\n'
+                 '(WARNING: compute boundaries differ — see JSON metadata)')
     ax.set_xscale('log', base=2)
     ax.set_yscale('log')
     # Only call legend() if at least one labeled artist was plotted. Without

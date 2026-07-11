@@ -170,6 +170,57 @@ except ImportError:
 
 # --- tests ---------------------------------------------------------------
 
+def test_load_envelope_format():
+    """``make_figures.load`` must accept the P0-1 envelope schema.
+
+    The MQAR writer (``run_quality.main``) emits a single JSON object
+    ``{"metadata": {...}, "results": [...]}``. The previous writer
+    concatenated two top-level documents (``{...}\\n[...]``) which is
+    not valid JSON; ``make_figures.load`` then returned ``[]`` and the
+    MQAR figure was silently skipped. This test pins the contract that
+    the new envelope is parsed into the inner ``results`` array.
+    """
+    print("\nTest: load() unwraps the {metadata, results} envelope")
+    _write_results('_test_envelope.json', {
+        'metadata': {'schema_version': 1, 'csa_indexer_trained': False},
+        'results': [
+            {'op': 'softmax', 'T': 128, 'acc': 0.5},
+            {'op': 'kda', 'T': 128, 'acc': 0.4},
+        ],
+    })
+    data = make_figures.load('_test_envelope.json')
+    _ok('envelope unwrapped to results list',
+        isinstance(data, list) and len(data) == 2,
+        f'type={type(data).__name__}, len={len(data) if isinstance(data, list) else "n/a"}')
+    # Clean up the synthetic file so it does not leak into the real
+    # results dir (the session fixture restores originals, but removing
+    # it explicitly is hygienic and makes the test re-runnable).
+    _p = os.path.join(RESULTS_DIR, '_test_envelope.json')
+    if os.path.exists(_p):
+        os.remove(_p)
+
+
+def test_load_legacy_bare_array():
+    """``make_figures.load`` must still accept the legacy bare-array schema.
+
+    All non-MQAR result files (benchmark, kv_cache, ablation, decoding,
+    correctness) are bare arrays. The P0-1 envelope fix must not break
+    them.
+    """
+    print("\nTest: load() still accepts legacy bare-array schema")
+    _write_results('_test_bare.json', [
+        {'op': 'softmax', 'T': 128, 'acc': 0.5},
+        {'op': 'kda', 'T': 128, 'acc': 0.4},
+    ])
+    data = make_figures.load('_test_bare.json')
+    _ok('bare array returned as-is',
+        isinstance(data, list) and len(data) == 2,
+        f'type={type(data).__name__}, len={len(data) if isinstance(data, list) else "n/a"}')
+    _p = os.path.join(RESULTS_DIR, '_test_bare.json')
+    if os.path.exists(_p):
+        os.remove(_p)
+
+
 def test_fig_benchmark_empty_data():
     """fig_benchmark with empty data should not crash or emit legend warning."""
     print("\nTest: fig_benchmark with empty data")
@@ -297,6 +348,8 @@ def main():
         # bool returns for the summary printout (and to keep running
         # subsequent tests even if one asserts).
         for fn in [
+            test_load_envelope_format,
+            test_load_legacy_bare_array,
             test_fig_benchmark_empty_data,
             test_fig_benchmark_all_errors,
             test_plot_ablation_group_empty_data,

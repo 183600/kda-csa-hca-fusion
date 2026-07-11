@@ -305,6 +305,45 @@ def main():
         ('hca',      lambda T: bench_hca(B, T, d, device)),
         ('hybrid',   lambda T: bench_hybrid(B, T, d, device)),
     ]
+    # P1-1 fix: record the compute boundary and layer count for each op
+    # so downstream consumers (figures, reports) can distinguish fair
+    # comparisons from unfair ones. The previous benchmark mixed:
+    #
+    #   * softmax / kda_rec / kda_chunk: "core" — only the attention /
+    #     recurrence kernel is timed, with q/k/v (and g/beta for KDA)
+    #     pre-projected outside the timed region.
+    #   * csa / hca: "end_to_end_single_layer" — timing starts from the
+    #     hidden state ``H`` and includes the input projections
+    #     (W_aKV, W_DQ, W_UQ, ...), compression, indexer, sparse
+    #     attention, and the output projection.
+    #   * hybrid: "end_to_end_multi_layer" — a full 5-layer stack with
+    #     LayerNorm, projections, attention, and state management.
+    #
+    # These numbers are NOT directly comparable as "operator latency"
+    # because the compute boundary differs. Recording the boundary
+    # explicitly lets the figure caption warn the reader and lets a
+    # future fair-comparison benchmark (same boundary for all ops) be
+    # added without breaking the historical data.
+    op_boundary = {
+        'softmax':   {'compute_boundary': 'core',
+                      'n_layers': 1,
+                      'note': 'attention core only; q/k/v pre-projected'},
+        'kda_rec':   {'compute_boundary': 'core',
+                      'n_layers': 1,
+                      'note': 'recurrence core only; q/k/v/g/beta pre-projected'},
+        'kda_chunk': {'compute_boundary': 'core',
+                      'n_layers': 1,
+                      'note': 'chunked recurrence core only; q/k/v/g/beta pre-projected'},
+        'csa':       {'compute_boundary': 'end_to_end_single_layer',
+                      'n_layers': 1,
+                      'note': 'single CSA layer from hidden state H (includes all projections + compression + indexer + sparse attention + o_proj)'},
+        'hca':       {'compute_boundary': 'end_to_end_single_layer',
+                      'n_layers': 1,
+                      'note': 'single HCA layer from hidden state H (includes all projections + compression + dense attention + o_proj)'},
+        'hybrid':    {'compute_boundary': 'end_to_end_multi_layer',
+                      'n_layers': 5,
+                      'note': '5-layer KDA+CSA+HCA stack with LayerNorm, projections, attention, state management (3:1:1 default ratio)'},
+    }
 
     results = []
     # Number of timed repeats per (T, op). The previous value of 3 gave a
@@ -331,8 +370,14 @@ def main():
                 if device.type != 'cuda':
                     fn()
                 t, mem = _measure(fn, repeats=n_repeats, device=device)
+                # P1-1 fix: include the compute boundary metadata so
+                # downstream consumers know which ops are comparable.
+                # Without this, a reader comparing softmax's "core" time
+                # to hybrid's "5-layer end-to-end" time would draw
+                # wrong conclusions about operator efficiency.
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
+                row.update(op_boundary[name])
                 results.append(row)
                 # mem may be None on CPU (unreliable RSS sampling); render
                 # as 'n/a' instead of crashing on ``f'{None:8.2f}'``.
@@ -344,12 +389,16 @@ def main():
                 # a KeyError on error rows. Missing keys vs explicit null
                 # matters: pandas read_json treats missing keys as NaN only
                 # if the column exists in at least one row.
-                results.append({
+                err_row = {
                     'T': T, 'op': name, 'error': str(e),
                     'device': str(device),
                     'time_ms': None, 'peak_mem_MB': None,
                     'repeats': n_repeats,
-                })
+                }
+                # P1-1 fix: also annotate error rows with the boundary
+                # metadata so the figure loader can still group them.
+                err_row.update(op_boundary[name])
+                results.append(err_row)
                 logger.error(f'  {name:12s}  ERROR: {e}')
 
     os.makedirs('results', exist_ok=True)

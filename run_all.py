@@ -70,29 +70,77 @@ def _ensure_deps():
 
 
 def _setup():
-    """Probe environment, install CUDA torch on Kaggle if needed."""
+    """Probe environment; on Kaggle+GPU verify CUDA is available.
+
+    P0-3 fix: the previous version called ``setup_kaggle()`` which
+    installed the CUDA wheel IN-PROCESS. As documented in
+    ``kaggle_setup.setup_kaggle``'s new docstring, that install does
+    NOT take effect in the current process (libtorch.so is pinned in
+    memory until the process exits), so the first Kaggle run silently
+    used CPU.
+
+    ``setup_kaggle()`` now ONLY VERIFIES CUDA availability (it raises
+    ``RuntimeError`` if Kaggle+GPU is detected but
+    ``torch.cuda.is_available()`` is False). The actual wheel install
+    must be done in a separate bootstrap step via
+    ``kaggle_setup.bootstrap_kaggle_cuda()`` followed by a kernel
+    restart.
+
+    ``SKIP_CUDA_CHECK=1`` bypasses the guard for users who intentionally
+    want to run on CPU on a GPU machine (e.g. for debugging).
+    """
     from kaggle_setup import setup_kaggle, print_env_summary
-    setup_kaggle(verbose=True)
+    if os.environ.get('SKIP_CUDA_CHECK', '0') == '1':
+        print('[run_all] SKIP_CUDA_CHECK=1: bypassing CUDA availability guard.')
+    else:
+        setup_kaggle(verbose=True)
     info = print_env_summary()
     return info
 
 
 def _run(name, fn):
-    """Run one experiment with timing and error capture."""
+    """Run one experiment with timing and error capture.
+
+    Contract for ``fn``'s return value (the P0-2 fix):
+
+    * ``None`` or ``0``  -> success.
+    * non-zero int / non-None truthy value -> failure (recorded as
+      ``status='fail'`` with the return value in ``error``).
+
+    The previous implementation ignored the return value entirely, so
+    ``run_correctness.main()`` — which returns ``1`` when any test fails
+    — was silently recorded as ``status='ok'``. Combined with the
+    figure-generation swallow (see ``_make_figs`` below), the runner
+    could report 8/8 OK on a run that actually had correctness failures
+    AND a malformed MQAR JSON. This made the green summary unreliable.
+
+    We deliberately keep the contract permissive (None/0 == success) so
+    that existing experiment ``main()`` functions that implicitly return
+    ``None`` continue to be treated as success; only callers that
+    explicitly opt into the return-code protocol (currently just
+    ``run_correctness.main``) are affected.
+    """
     print('\n' + '#' * 70)
     print(f'# {name}')
     print('#' * 70)
     t0 = time.time()
     try:
-        fn()
-        dt = time.time() - t0
-        print(f'\n[{name}] OK ({dt:.1f}s)')
-        return {'name': name, 'status': 'ok', 'time_s': dt}
+        rc = fn()
     except Exception as e:
         dt = time.time() - t0
         print(f'\n[{name}] FAILED ({dt:.1f}s): {e}')
         traceback.print_exc()
         return {'name': name, 'status': 'fail', 'time_s': dt, 'error': str(e)}
+    dt = time.time() - t0
+    # Honor the explicit return-code contract. A non-zero / non-None
+    # return value signals failure even when no exception was raised.
+    if rc is not None and rc != 0:
+        msg = f'{name} returned non-zero status: {rc!r}'
+        print(f'\n[{name}] FAILED ({dt:.1f}s): {msg}')
+        return {'name': name, 'status': 'fail', 'time_s': dt, 'error': msg,
+                'return_code': str(rc)}
+    print(f'\n[{name}] OK ({dt:.1f}s)')
+    return {'name': name, 'status': 'ok', 'time_s': dt}
 
 
 def _sanitize(obj):
@@ -229,20 +277,43 @@ def run_all(seeds=None, steps=None):
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
 
         # 8. Figures — generate from whatever results exist.
+        # The P0-2 fix: the previous ``_make_figs`` swallowed EVERY
+        # exception (including programming errors like NameError,
+        # AttributeError, KeyError from a refactor, or a malformed-JSON
+        # ``json.JSONDecodeError`` that should have been caught upstream
+        # but wasn't). The outer ``_run`` therefore ALWAYS recorded
+        # ``status='ok'``, so a broken ``make_figures.main`` was
+        # invisible in the run-all summary — the user saw 8/8 green.
+        #
+        # We now distinguish two failure modes:
+        #
+        # * ``FileNotFoundError`` / ``json.JSONDecodeError``: a result
+        #   file is missing or malformed. ``make_figures.load`` already
+        #   degrades gracefully for individual figures (returns ``[]``
+        #   and logs a skip), so a propagated instance of these means
+        #   the figure step as a whole could not even enumerate inputs.
+        #   Treat as a soft warning: print and continue, but mark the
+        #   step failed in the summary so the user knows the figures
+        #   are incomplete.
+        #
+        # * Any other exception: a programming error. Re-raise so
+        #   ``_run`` records ``status='fail'`` with the full traceback
+        #   in the summary. The green-report bug is fixed.
         def _make_figs():
             try:
                 make_figures.main()
-            except Exception as e:
-                # Figures are best-effort; a missing result file shouldn't fail
-                # the whole run-all. BUT print the traceback so a real
-                # programming error (NameError, AttributeError, KeyError from
-                # a refactor, missing matplotlib backend, etc.) is not
-                # silently reduced to a one-line ``[make_figures] partial:
-                # <str(e)>`` message that hides the cause. The previous
-                # swallow-without-traceback made debugging figure-generation
-                # failures nearly impossible from the run-all summary alone.
-                print(f'[make_figures] partial: {e}')
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                # Soft failure: a result file is missing or malformed.
+                # ``make_figures.load`` handles per-figure skips, but a
+                # top-level FileNotFoundError means the whole results
+                # dir is unreachable. Print a warning and return a
+                # non-zero status so ``_run`` records it as a failure
+                # (the figure step is incomplete, not "ok").
+                print(f'[make_figures] incomplete: {e}')
                 traceback.print_exc()
+                return 1
+            # Any other exception propagates to ``_run``'s except block
+            # and is recorded as status='fail'. No more silent swallow.
         summary['runs'].append(_run('make_figures', _make_figs))
 
         # Final summary.
@@ -265,6 +336,15 @@ def run_all(seeds=None, steps=None):
             json.dump(_sanitize(summary), f, indent=2, allow_nan=False)
         print('\nSaved: results/summary.json')
 
+        # P0-2 fix: return the summary AND a non-zero exit code when any
+        # run failed. The previous version returned ``None`` implicitly
+        # and the ``if __name__ == '__main__'`` block called
+        # ``run_all()`` without ``sys.exit``, so even a fully-red
+        # summary exited 0 — CI gates that check ``$?`` would pass.
+        # We now return the summary dict so programmatic callers
+        # (notebook, downstream scripts) can inspect ``n_fail``, and
+        # the ``__main__`` block maps ``n_fail > 0`` to ``sys.exit(1)``.
+        return summary
 
     finally:
         # Restore the caller's CWD (saved before os.chdir above) so
@@ -275,4 +355,9 @@ def run_all(seeds=None, steps=None):
 
 
 if __name__ == '__main__':
-    run_all()
+    _summary = run_all()
+    # P0-2 fix: propagate failure to the shell. Without this, CI that
+    # gates on ``$?`` would pass even when every experiment failed.
+    if _summary is not None and _summary.get('n_fail', 0) > 0:
+        sys.exit(1)
+    sys.exit(0)

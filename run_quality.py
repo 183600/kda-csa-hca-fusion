@@ -1048,30 +1048,60 @@ def main():
         logger.error(f'non-finite value in results; sanitizing to null: {e}')
         text = json.dumps(sanitize_for_json(all_results), indent=2,
                           allow_nan=False)
-    # Prepend a metadata header disclosing the CSA indexer-not-trained
-    # limitation so reviewers reading the JSON see the caveat alongside
-    # the accuracy numbers. Without this disclosure, CSA's MQAR accuracy
-    # could be misread as evidence for "learned sparse retrieval" when it
-    # actually measures "learned compression + random/uniform top-k
-    # selection". See CSAHybridLayer docstring for the full explanation.
-    metadata = {
-        '_metadata': {
-            'csa_indexer_trained': False,
+    # Write a SINGLE valid JSON object (not two concatenated documents).
+    # The previous implementation prepended a standalone metadata object
+    # to the results array, producing:
+    #     {"_metadata": {...}}\n[{...}, {...}]
+    # which is NOT a valid JSON document (``json.load`` raises
+    # ``Extra data``). ``make_figures.load`` then treated the file as
+    # malformed and silently returned ``[]``, skipping the MQAR figure.
+    # The committed ``results/exp4_mqar.json`` is still a bare array
+    # (pre-bug), so source and artifact had already diverged.
+    #
+    # Fix: emit a single top-level object ``{"metadata": ..., "results": [...]}``
+    # and teach ``make_figures.load`` to accept both the new envelope and
+    # the legacy bare-array format. We also re-parse the serialized text
+    # before writing as a regression guard.
+    payload = {
+        'metadata': {
+            'csa_indexer_trained': True,
+            'csa_ste_enabled': True,
             'csa_caveat': (
-                "CSA's lightning indexer parameters (W_IUQ, W_w, W_KV_idx, "
-                "W_Z_idx, B_idx) are NOT trained: torch.topk returns integer "
-                "indices that do not propagate gradients, so the indexer "
-                "stays at random initialization. CSA's sparse top-k selection "
-                "is therefore effectively RANDOM over the (learned) compressed "
-                "KV entries, not 'learned sparse retrieval'. CSA's accuracy "
-                "here measures 'learned compression + random top-k retrieval'."
+                "CSA's lightning indexer is trained via a straight-through "
+                "estimator (STE): the forward pass uses hard top-k indices "
+                "(genuine sparse selection), but the backward pass routes "
+                "gradients through a differentiable soft distribution over "
+                "all compressed blocks. After backward(), the indexer "
+                "parameters (W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx) receive "
+                "non-None .grad and are updated by the optimizer. This "
+                "closes the P0-4 gap where the indexer stayed at random "
+                "initialization and CSA's sparse selection was effectively "
+                "random. The STE does NOT change the forward semantics — "
+                "CSA is still sparse retrieval — but makes the indexer "
+                "learnable."
             ),
+            'schema_version': 1,
         },
+        'results': all_results,
     }
     try:
-        text = json.dumps(metadata, indent=2, allow_nan=False) + '\n' + text
-    except (TypeError, ValueError):
-        pass
+        text = json.dumps(payload, indent=2, allow_nan=False)
+    except ValueError as e:
+        logger.error(f'non-finite value in payload; sanitizing to null: {e}')
+        payload = sanitize_for_json(payload)
+        text = json.dumps(payload, indent=2, allow_nan=False)
+    # Regression guard: re-parse the serialized text before touching the
+    # file so we never write a document that ``json.load`` would reject.
+    # This catches any future code path that accidentally reintroduces the
+    # concatenated-document bug (or any other serializer regression).
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as e:
+        # Should be unreachable given the dumps above, but fail loudly
+        # rather than shipping a broken file.
+        raise RuntimeError(
+            f"internal error: serialized MQAR payload is not valid JSON: {e}"
+        ) from e
     with open('results/exp4_mqar.json', 'w') as f:
         f.write(text)
     logger.info('\nSaved: results/exp4_mqar.json')

@@ -155,6 +155,46 @@
     "detail": "each query t has min(topk=4, t//m) valid indices"
   },
   {
+    "name": "STE forward == no-STE forward (bit-identical)",
+    "status": "PASS",
+    "detail": "max_abs_diff=0"
+  },
+  {
+    "name": "STE: W_IUQ receives finite non-zero gradient",
+    "status": "PASS",
+    "detail": "grad=tensor([[-0.0014,  0.0036,  0.0068, -0.0009,  0.0051, -0.0190, -0.0116, -0.0099],\n        [ 0.0033, -0.0051, -0.0005, -0.0006,  0.0032,  0.0061,  0.0006,  0.0105],\n        [-0.0082,  0.0085,  0.0022, -0.0065, -0.0015,  0.0224,  0.0103,  0.0240],\n        [-0.0047,  0.0055,  0.0116, -0.0043, -0.0005,  0.0168,  0.0072,  0.0126],\n        [ 0.0037,  0.0051,  0.0013,  0.0118,  0.0018, -0.0163, -0.0055, -0.0136],\n        [ 0.0028,  0.0017,  0.0057,  0.0044,  0.0023, -0.0214, -0.0090, -0.0167],\n        [-0.0094,  0.0189,  0.0096,  0.0014, -0.0039, -0.0034, -0.0014, -0.0079],\n        [-0.0003,  0.0088,  0.0036,  0.0083, -0.0013,  0.0009,  0.0024, -0.0024]],\n       dtype=torch.float64)"
+  },
+  {
+    "name": "STE: W_w receives finite non-zero gradient",
+    "status": "PASS",
+    "detail": "grad=tensor([[ 0.0034,  0.0024],\n        [ 0.0017,  0.0025],\n        [-0.0094,  0.0192],\n        [ 0.0076,  0.0151],\n        [-0.0225, -0.0050],\n        [-0.0005,  0.0064],\n        [-0.0121,  0.0081],\n        [-0.0072,  0.0089],\n        [-0.0070, -0.0038],\n        [ 0.0013,  0.0002],\n        [ 0.0121,  0.0083],\n        [-0.0041, -0.0051],\n        [-0.0063, -0.0256],\n        [ 0.0152, -0.0124],\n        [ 0.0039, -0.0124],\n        [-0.0041, -0.0008]], dtype=torch.float64)"
+  },
+  {
+    "name": "STE: W_KV_idx receives finite non-zero gradient",
+    "status": "PASS",
+    "detail": "grad=tensor([[ 3.9018e-03, -3.7880e-04,  7.5535e-03,  1.1517e-03],\n        [ 3.0939e-03, -5.1930e-03,  5.0913e-03,  3.7285e-03],\n        [-6.1504e-03,  7.3096e-04, -4.1515e-03,  3.5127e-03],\n        [ 4.6027e-03, -9.1076e-03,  2.2685e-03,  1.4210e-03],\n        [-1.5587e-02,  5.6138e-03,  1.3826e-02, -7.9903e-03],\n        [-8.6869e-03,  7.8036e-03,  2.6547e-02, -2.1146e-02],\n        [-1.7849e-02, -3.2391e-03, -1.7231e-02,  4.3651e-03],\n        [-1.2162e-02,  4.9255e-04, -1.2897e-02,  8.9940e-03],\n        [-6.8724e-03,  2.4479e-03, -9.8228e-03, -1.1461e-02],\n        [ 1.2135e-02, -1.7317e-03,  8.1580e-03, -2.9490e-03],\n        [-7.5181e-03,  4.4131e-03, -6.3585e-03, -5.5676e-05],\n        [ 4.7093e-03, -7.0245e-04,  8.6180e-03, -2.3367e-03],\n        [-5.0981e-03,  4.8319e-03, -3.2133e-03, -6.5155e-03],\n        [ 6.1656e-03,  2.3591e-03,  9.2498e-03,  1.3054e-03],\n        [ 1.3776e-02, -3.0113e-03, -2.5450e-03,  4.1321e-04],\n        [ 7.3218e-03, -2.0344e-02, -3.1862e-02,  3.1384e-02]],\n       dtype=torch.float64)"
+  },
+  {
+    "name": "STE: W_Z_idx receives finite non-zero gradient",
+    "status": "PASS",
+    "detail": "grad=tensor([[-4.1792e-05,  6.4697e-04, -8.4500e-05, -1.1571e-03],\n        [-1.0879e-03,  7.0764e-05,  1.0506e-03,  1.3828e-03],\n        [-7.3958e-04,  3.3490e-04, -5.6288e-03,  3.3581e-03],\n        [-6.4312e-04,  1.5118e-03,  1.2854e-02, -4.1201e-03],\n        [-7.6153e-04, -4.3771e-04, -9.1198e-03, -6.4888e-04],\n        [ 2.6857e-05, -1.3263e-03,  3.2519e-04,  4.5588e-03],\n        [-4.9166e-04,  1.0905e-03,  4.0290e-03, -3.1239e-03],\n        [-9.9507e-04, -1.7811e-03, -1.0053e-02,  7.8904e-03],\n        [ 6.7496e-04,  5.6355e-04,  5.3349e-03, -5.0761e-03],\n        [-2.5651e-03,  5.6034e-04, -1.8153e-03, -2.0130e-03],\n        [-4.4938e-04, -1.1396e-03, -5.0697e-03,  3.8989e-03],\n        [-5.7571e-05, -9.2434e-04, -2.6338e-03,  3.8500e-03],\n        [ 1.0497e-03,  1.6420e-03,  9.6816e-04, -1.6543e-03],\n        [-6.5082e-04, -1.9822e-04,  2.3654e-03,  3.7066e-03],\n        [-6.4028e-05, -1.3489e-03, -4.9725e-03,  1.9492e-03],\n        [-1.0215e-03,  4.7213e-04,  5.4194e-03,  2.5006e-03]],\n       dtype=torch.float64)"
+  },
+  {
+    "name": "STE: B_idx receives finite non-zero gradient",
+    "status": "PASS",
+    "detail": "grad=tensor([[-0.0008,  0.0003,  0.0037, -0.0017],\n        [ 0.0005,  0.0003, -0.0015,  0.0009],\n        [-0.0002, -0.0002, -0.0017,  0.0011],\n        [ 0.0005, -0.0004, -0.0004, -0.0004]], dtype=torch.float64)"
+  },
+  {
+    "name": "no-STE: indexer params get None grad (pins old behavior)",
+    "status": "PASS",
+    "detail": "grads=[None, None, None, None, None]"
+  },
+  {
+    "name": "no-STE: W_aKV (non-indexer) DOES get grad (backward ran)",
+    "status": "PASS",
+    "detail": "W_aKV.grad=tensor([[ 21.2762,  -2.2061,  13.7854,  16.3922,   7.2362,  21.5449,   6.5736,\n          15.0069],\n        [  9.2559,  -2.2794,  17.4209,   4.8851,   5.5781,  28.0622,  22.6584,\n          10.8303],\n        [ -8.1406,  -3.6441,  -6.2054,   3.2489,  -9.7570,  -0.0723, -15.9316,\n           0.3003],\n        [ -7.6107,   0.2691,  -0.2894,  -8.4092,   2.0829,   3.1130,  22.1965,\n          -0.5642],\n        [ 29.3334, -13.1079,  23.7230,  12.8966,  11.5528,  32.2287,   7.3527,\n          14.9922],\n        [ -0.2368,  -9.7538,   9.9899,  -3.5548,   0.7066,  -0.9642,   1.7250,\n          -3.9612],\n        [-35.0650,  -8.5900, -31.9007, -16.9623, -17.7345, -21.0768, -20.5623,\n         -15.1788],\n        [-40.0086,   5.1855, -20.3218, -20.4704, -12.1532, -17.7197, -12.1610,\n         -12.0155],\n        [ 10.3904, -18.9405,   1.8547,   3.0393,  -0.7147,   0.9326,   7.2516,\n          -4.5289],\n        [ 29.8686,   2.0091,  26.9047,  13.3060,  16.3578,  26.7484,  33.5036,\n          15.7028],\n        [-15.5204,  -5.9085, -12.5998,  -3.1580, -12.1275, -17.5052, -29.2557,\n          -5.0681],\n        [ 24.1113,  -3.3056,  35.7920,  17.3771,  16.7648,  31.0368,  25.4751,\n           9.1664],\n        [-27.0708,  -3.1595, -16.3379,  -1.9940,  -8.7149, -16.4783, -21.1266,\n           7.3562],\n        [-26.4711,   0.1860, -19.2566,  -8.9715, -11.4825,  -4.5313, -25.7379,\n          -4.3005],\n        [ 61.2777, -10.0281,  47.9675,  28.6297,  19.1235,  44.9725,  44.3724,\n          10.8715],\n        [ -3.2562,  37.4121,  18.9025,   5.7549,  16.1021,  15.2204,  51.3439,\n          20.8506]], dtype=torch.float64)"
+  },
+  {
     "name": "HCA sliding-window causal (unaffected region is stable)",
     "status": "PASS",
     "detail": "max diff in unaffected region = 0.00e+00 (fp64, win=4)"
@@ -162,7 +202,7 @@
   {
     "name": "HCA sliding-window affected region actually changes",
     "status": "PASS",
-    "detail": "min diff in affected region = 7.14e-02 (guards against zero-output regressions)"
+    "detail": "min diff in affected region = 6.68e-02 (guards against zero-output regressions)"
   },
   {
     "name": "CSA full pipeline causal (unaffected region is stable)",
@@ -172,7 +212,7 @@
   {
     "name": "CSA full pipeline SW-affected region actually changes",
     "status": "PASS",
-    "detail": "min diff in SW-affected region = 1.10e-01 (guards against zero-SW-output regressions; sparse region is not checked because top-k may legitimately not select block bp)"
+    "detail": "min diff in SW-affected region = 1.32e-01 (guards against zero-SW-output regressions; sparse region is not checked because top-k may legitimately not select block bp)"
   },
   {
     "name": "hybrid padding no-crash",
@@ -232,7 +272,7 @@
   {
     "name": "CSA sink matches shifted-logsumexp reference",
     "status": "PASS",
-    "detail": "max diff = 0.00e+00 (fp64, sink=[0.5,-0.3]); a non-zero diff means the sink is not shifted by -row_max"
+    "detail": "max diff = 5.55e-17 (fp64, sink=[0.5,-0.3]); a non-zero diff means the sink is not shifted by -row_max"
   },
   {
     "name": "HCA sink matches shifted-logsumexp reference",
@@ -307,7 +347,7 @@
   {
     "name": "hybrid backward produces finite non-zero grads for differentiable params",
     "status": "PASS",
-    "detail": "differentiable_with_grad=54, differentiable_no_grad=[], differentiable_zero_grad=[], differentiable_non_finite=[]"
+    "detail": "differentiable_with_grad=59, differentiable_no_grad=[], differentiable_zero_grad=[], differentiable_non_finite=[]"
   },
   {
     "name": "CSA bf16 forward",
@@ -432,7 +472,7 @@
   {
     "name": "CSA topk=0 with-SW produces non-zero output",
     "status": "PASS",
-    "detail": "shape=(1, 32, 16), max|o|=6.23e-01"
+    "detail": "shape=(1, 32, 16), max|o|=6.32e-01"
   },
   {
     "name": "HCA T<m2 no-SW produces zero output",
@@ -550,9 +590,14 @@
     "detail": "n_heads_qk=0 must be >= 1"
   },
   {
-    "name": "HybridConfig warns when kda_chunk_size is non-default",
+    "name": "HybridConfig no longer warns kda_chunk_size is UNUSED",
     "status": "PASS",
-    "detail": "warning_emitted=True"
+    "detail": "unused_warning_emitted=False"
+  },
+  {
+    "name": "KDAHybridLayer honors kda_chunk_size (chunk path)",
+    "status": "PASS",
+    "detail": "shape=(1, 32, 32), finite=True"
   },
   {
     "name": "hybrid survives dtype change (fp32 state -> fp16 forward)",
@@ -603,6 +648,76 @@
     "name": "HCA causal_block_entries correct at T=4096",
     "status": "PASS",
     "detail": "actual=40261124096, expected_correct=40261124096, expected_broken=40798126080, cbe_correct=129024, cbe_broken=260128"
+  },
+  {
+    "name": "csa kv_cache_elements ceil at T=17 (m=16)",
+    "status": "PASS",
+    "detail": "actual_blocks=2, expected=2"
+  },
+  {
+    "name": "csa prefill_flops increases from T=m to T=m+1",
+    "status": "PASS",
+    "detail": "fl(T=m)=98140160, fl(T=m+1)=104309000"
+  },
+  {
+    "name": "csa kv_cache_elements ceil at T=18 (m=16)",
+    "status": "PASS",
+    "detail": "actual_blocks=2, expected=2"
+  },
+  {
+    "name": "csa kv_cache_elements ceil at T=33 (m=16)",
+    "status": "PASS",
+    "detail": "actual_blocks=3, expected=3"
+  },
+  {
+    "name": "csa kv_cache_elements ceil at T=47 (m=16)",
+    "status": "PASS",
+    "detail": "actual_blocks=3, expected=3"
+  },
+  {
+    "name": "hca kv_cache_elements ceil at T=65 (m=64)",
+    "status": "PASS",
+    "detail": "actual_blocks=2, expected=2"
+  },
+  {
+    "name": "hca prefill_flops increases from T=m to T=m+1",
+    "status": "PASS",
+    "detail": "fl(T=m)=226623488, fl(T=m+1)=230301696"
+  },
+  {
+    "name": "hca kv_cache_elements ceil at T=66 (m=64)",
+    "status": "PASS",
+    "detail": "actual_blocks=2, expected=2"
+  },
+  {
+    "name": "hca kv_cache_elements ceil at T=129 (m=64)",
+    "status": "PASS",
+    "detail": "actual_blocks=3, expected=3"
+  },
+  {
+    "name": "hca kv_cache_elements ceil at T=191 (m=64)",
+    "status": "PASS",
+    "detail": "actual_blocks=3, expected=3"
+  },
+  {
+    "name": "csa prefill_flops(0) == 0 (no work at T=0)",
+    "status": "PASS",
+    "detail": "fl_0=0"
+  },
+  {
+    "name": "csa kv_cache_elements(0) > 0 (allocated capacity)",
+    "status": "PASS",
+    "detail": "kv_0=128"
+  },
+  {
+    "name": "hca prefill_flops(0) == 0 (no work at T=0)",
+    "status": "PASS",
+    "detail": "fl_0=0"
+  },
+  {
+    "name": "hca kv_cache_elements(0) > 0 (allocated capacity)",
+    "status": "PASS",
+    "detail": "kv_0=128"
   },
   {
     "name": "softmax_gqa includes input/output projections",

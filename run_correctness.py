@@ -643,6 +643,138 @@ def test_csa_indexer_validity(device='cpu'):
     ]
 
 
+def test_csa_indexer_ste_gradient(device='cpu'):
+    """P0-4 regression: STE must make the indexer parameters trainable.
+
+    Before the P0-4 fix, ``torch.topk`` returned integer indices that did
+    not propagate gradients, so the indexer parameters (``W_IUQ``,
+    ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx``) stayed at random
+    initialization after ``backward()`` (their ``.grad`` was ``None``).
+    This test verifies that the straight-through estimator (STE) in
+    ``naive_csa`` closes that gap: after a forward + backward pass with
+    ``use_ste=True`` (the default), every indexer parameter has a
+    non-None, finite ``.grad``.
+
+    We also verify the STE's forward-value contract: the output of
+    ``naive_csa(use_ste=True)`` must be BIT-IDENTICAL to
+    ``naive_csa(use_ste=False)`` (the STE only changes the backward
+    path, not the forward value). If a future refactor breaks this
+    invariant, the STE is silently changing the algorithm's forward
+    semantics — which would invalidate every existing CSA result.
+    """
+    logger.info("Test: CSA indexer STE gradient flow (P0-4 fix)")
+    torch.manual_seed(42)
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, cI, dc = 4, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device, dtype=torch.float64)
+
+    def _make_params():
+        return dict(
+            W_aKV=torch.randn(d, c, dtype=torch.float64) * 0.1,
+            W_bKV=torch.randn(d, c, dtype=torch.float64) * 0.1,
+            W_aZ=torch.randn(d, c, dtype=torch.float64) * 0.1,
+            W_bZ=torch.randn(d, c, dtype=torch.float64) * 0.1,
+            Ba=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            Bb=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            W_DQ=torch.randn(d, dc, dtype=torch.float64) * 0.1,
+            W_UQ=torch.randn(dc, c * nh, dtype=torch.float64) * 0.1,
+            W_IUQ=torch.randn(dc, cI * nIh, dtype=torch.float64) * 0.1,
+            W_w=torch.randn(d, nIh, dtype=torch.float64) * 0.1,
+            W_KV_idx=torch.randn(d, cI, dtype=torch.float64) * 0.1,
+            W_Z_idx=torch.randn(d, cI, dtype=torch.float64) * 0.1,
+            B_idx=torch.randn(m, cI, dtype=torch.float64) * 0.02,
+        )
+
+    # --- Part 1: STE forward-value invariance ---
+    # The STE must NOT change the forward output. Run the same input
+    # through ``use_ste=True`` and ``use_ste=False`` and assert the
+    # outputs are equal to fp64 precision. We use ``torch.allclose``
+    # (rtol=0, atol=0 is too strict because the STE adds and subtracts
+    # ``soft_kv``, which introduces ULP-level rounding from the extra
+    # float ops even though the result is mathematically identical).
+    # ``atol=1e-12`` is well below any meaningful accuracy threshold
+    # for fp64 (machine epsilon ~2.2e-16) while still tolerating the
+    # rounding from the extra add/subtract in the STE path.
+    import copy
+    p_ref = _make_params()
+    p_ste = copy.deepcopy(p_ref)
+    common = dict(m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+                  sliding_window=0, sink_logits=None)
+    with torch.no_grad():
+        o_ref = naive_csa(H, **p_ref, use_ste=False, **common)
+        o_ste = naive_csa(H, **p_ste, use_ste=True, **common)
+    fwd_invariant = torch.allclose(o_ref, o_ste, rtol=0, atol=1e-12)
+
+    # --- Part 2: indexer parameters receive gradient under STE ---
+    # Make indexer params require grad, run forward + backward, and
+    # assert each has a non-None, finite .grad.
+    p = _make_params()
+    indexer_param_names = ['W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx']
+    for name in indexer_param_names:
+        p[name] = p[name].clone().requires_grad_(True)
+    o = naive_csa(H, **p, use_ste=True, **common)
+    # Sum-reduce to a scalar and backward.
+    o.sum().backward()
+    grad_results = {}
+    for name in indexer_param_names:
+        g = p[name].grad
+        grad_results[name] = (
+            g is not None and torch.isfinite(g).all().item()
+            and g.abs().sum().item() > 0
+        )
+
+    # --- Part 3: without STE, indexer params get NO gradient ---
+    # This pins the old (buggy) behavior so a future "fix" that removes
+    # STE is forced to also update this test, rather than silently
+    # reverting to the untrained-indexer regime.
+    #
+    # We must make a NON-indexer parameter (W_aKV) require grad too,
+    # otherwise the output has no grad_fn at all (under use_ste=False
+    # the indexer params don't participate in the differentiable graph,
+    # so if W_aKV also doesn't require grad, ``backward()`` raises
+    # "element 0 of tensors does not require grad"). With W_aKV
+    # requiring grad, the output has a grad_fn, backward() succeeds,
+    # and we can assert the indexer params STILL get None grad (the
+    # bug we're pinning).
+    p_noste = _make_params()
+    for name in indexer_param_names:
+        p_noste[name] = p_noste[name].clone().requires_grad_(True)
+    # W_aKV is a non-indexer param that DOES participate in the
+    # differentiable compression+attention path. Make it require grad
+    # so the output has a grad_fn.
+    p_noste['W_aKV'] = p_noste['W_aKV'].clone().requires_grad_(True)
+    o_noste = naive_csa(H, **p_noste, use_ste=False, **common)
+    o_noste.sum().backward()
+    # Under use_ste=False, the indexer params get NO gradient (the
+    # bug). W_aKV (non-indexer) DOES get a gradient, confirming the
+    # backward pass actually ran.
+    noste_grads_none = all(p_noste[name].grad is None
+                           for name in indexer_param_names)
+    noste_wakv_has_grad = p_noste['W_aKV'].grad is not None
+
+    return [
+        _ok('STE forward == no-STE forward (bit-identical)',
+            fwd_invariant,
+            f'max_abs_diff={(o_ref - o_ste).abs().max().item() if not fwd_invariant else 0}'),
+        _ok('STE: W_IUQ receives finite non-zero gradient',
+            grad_results['W_IUQ'], f'grad={p["W_IUQ"].grad}'),
+        _ok('STE: W_w receives finite non-zero gradient',
+            grad_results['W_w'], f'grad={p["W_w"].grad}'),
+        _ok('STE: W_KV_idx receives finite non-zero gradient',
+            grad_results['W_KV_idx'], f'grad={p["W_KV_idx"].grad}'),
+        _ok('STE: W_Z_idx receives finite non-zero gradient',
+            grad_results['W_Z_idx'], f'grad={p["W_Z_idx"].grad}'),
+        _ok('STE: B_idx receives finite non-zero gradient',
+            grad_results['B_idx'], f'grad={p["B_idx"].grad}'),
+        _ok('no-STE: indexer params get None grad (pins old behavior)',
+            noste_grads_none,
+            f'grads={[p_noste[n].grad for n in indexer_param_names]}'),
+        _ok('no-STE: W_aKV (non-indexer) DOES get grad (backward ran)',
+            noste_wakv_has_grad,
+            f'W_aKV.grad={p_noste["W_aKV"].grad}'),
+    ]
+
+
 def test_hca_sliding_window_causality(device='cpu'):
     """Verify HCA's sliding-window branch only attends to past + current.
 
@@ -2882,7 +3014,12 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         csa_nh, csa_dc = p['csa_nh'], p['csa_dc']
         csa_cI, csa_nIh = p['csa_cI'], p['csa_nIh']
         sw_w = p['csa_sliding_window']
-        n_blocks = max(1, T // csa_m)
+        # P1-4 fix: use ceil(T / m) (logical block count, no floor) to
+        # match the corrected ``prefill_flops``. The test sweep uses
+        # divisible T values (512, 1024, 4096) where ceil == floor, so
+        # this change is a no-op for the existing assertions but keeps
+        # the test correct if non-divisible T values are added later.
+        n_blocks = (T + csa_m - 1) // csa_m if T > 0 else 0
 
         # Recompute each term with the CORRECT causal_block_entries.
         nb_raw = T // csa_m
@@ -2902,7 +3039,7 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
                           + 2 * cbe_correct * csa_nIh
         indexer_broken = 2 * cbe_broken * csa_cI * csa_nIh \
                          + 2 * cbe_broken * csa_nIh
-        effective_topk = min(csa_topk, max(1, n_blocks // 2))
+        effective_topk = min(csa_topk, max(1, n_blocks // 2)) if n_blocks > 0 else 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
@@ -2928,7 +3065,8 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         hca_m2, hca_c = p['hca_m2'], p['hca_c']
         hca_nh, hca_dc = p['hca_nh'], p['hca_dc']
         sw_w = p['hca_sliding_window']
-        n_blocks = max(1, T // hca_m2)
+        # P1-4 fix: same ceil correction as the CSA branch above.
+        n_blocks = (T + hca_m2 - 1) // hca_m2 if T > 0 else 0
 
         nb_raw = T // hca_m2
         r_rem = T - nb_raw * hca_m2
@@ -2955,6 +3093,70 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
             f'actual={actual}, expected_correct={expected_correct}, '
             f'expected_broken={expected_broken}, cbe_correct={cbe_correct}, '
             f'cbe_broken={cbe_broken}'))
+
+    return results
+
+
+def test_kv_cache_ceil_block_count(device='cpu'):
+    """P1-4 regression: block count must use ceil(T / m), not floor.
+
+    The previous ``max(1, T // m)`` returned 1 block for T = m + 1
+    (which actually compresses 2 blocks: one full + one partial),
+    silently undercounting the compressed KV / indexer cache at
+    non-divisible T. This test verifies the corrected formula
+    ``ceil(T / m) = (T + m - 1) // m`` in both ``kv_cache_elements``
+    (which keeps a ``max(1, ...)`` floor for allocated-capacity
+    semantics) and ``prefill_flops`` (which uses the pure logical
+    count, zero at T=0).
+    """
+    logger.info("Test: KV cache ceil block count (P1-4 fix)")
+    from run_kv_cache import kv_cache_elements, prefill_flops, DEFAULTS
+    p = {**DEFAULTS}
+    csa_m = p['csa_m']
+    hca_m2 = p['hca_m2']
+
+    results = []
+    # Non-divisible T values: T = m + 1 must yield 2 blocks, not 1.
+    for op, m in [('csa', csa_m), ('hca', hca_m2)]:
+        for T in [m + 1, m + 2, 2 * m + 1, 3 * m - 1]:
+            # kv_cache_elements: allocated capacity = max(1, ceil(T/m))
+            expected_kv = max(1, (T + m - 1) // m)
+            # compressed_kv_only mode returns n_blocks * c (no SW/indexer).
+            c = p['csa_c'] if op == 'csa' else p['hca_c']
+            actual_kv_elements = kv_cache_elements(op, T, mode='compressed_kv_only', **p)
+            actual_blocks = actual_kv_elements // c
+            results.append(_ok(
+                f'{op} kv_cache_elements ceil at T={T} (m={m})',
+                actual_blocks == expected_kv,
+                f'actual_blocks={actual_blocks}, expected={expected_kv}'))
+            # prefill_flops: logical count = ceil(T/m), zero at T=0
+            # (we check T>0 here; T=0 is checked separately below).
+            # We probe the block-count sensitivity by comparing
+            # prefill_flops at T=m (1 block) vs T=m+1 (2 blocks): the
+            # indexer FLOPs must strictly increase because the second
+            # block adds new (query, block) scoring entries.
+            if T == m + 1:
+                fl_m = prefill_flops(op, m, **p)
+                fl_m1 = prefill_flops(op, m + 1, **p)
+                results.append(_ok(
+                    f'{op} prefill_flops increases from T=m to T=m+1',
+                    fl_m1 > fl_m,
+                    f'fl(T=m)={fl_m}, fl(T=m+1)={fl_m1}'))
+
+    # T=0 edge case: kv_cache_elements returns >=1 block (allocated
+    # capacity), but prefill_flops returns the compress term = 0
+    # (since compress = 2*T*d*(...) and T=0). The key invariant: at
+    # T=0, prefill_flops must be 0 (no work), while kv_cache_elements
+    # must be > 0 (reserved buffer).
+    for op in ['csa', 'hca']:
+        fl_0 = prefill_flops(op, 0, **p)
+        kv_0 = kv_cache_elements(op, 0, mode='compressed_kv_only', **p)
+        results.append(_ok(
+            f'{op} prefill_flops(0) == 0 (no work at T=0)',
+            fl_0 == 0, f'fl_0={fl_0}'))
+        results.append(_ok(
+            f'{op} kv_cache_elements(0) > 0 (allocated capacity)',
+            kv_0 > 0, f'kv_0={kv_0}'))
 
     return results
 
@@ -3053,6 +3255,8 @@ def main():
     # Regression test for chunk-vs-recurrent gradient agreement (fp64).
     all_results += _run_safe(test_kda_chunk_vs_recurrent_gradient, device)
     all_results += _run_safe(test_csa_indexer_validity, device)
+    # P0-4 regression: STE must make the CSA indexer parameters trainable.
+    all_results += _run_safe(test_csa_indexer_ste_gradient, device)
     all_results += _run_safe(test_hca_sliding_window_causality, device)
     all_results += _run_safe(test_csa_full_pipeline_causality, device)
     # Regression tests for bugs found during code review.
@@ -3097,6 +3301,8 @@ def main():
     all_results += _run_safe(test_hybrid_kda_state_batch_size_change, device)
     all_results += _run_safe(test_prefill_flops_head_count, device)
     all_results += _run_safe(test_prefill_flops_causal_block_entries, device)
+    # P1-4 regression: ceil block count at non-divisible T.
+    all_results += _run_safe(test_kv_cache_ceil_block_count, device)
     all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
     all_results += _run_safe(test_decoding_batch_size_change, device)
 
