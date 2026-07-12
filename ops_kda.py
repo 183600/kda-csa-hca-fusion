@@ -412,7 +412,9 @@ def compiled_recurrent_kda(
     HV, V = v.shape[2], v.shape[-1]
     cache_key = (
         B, T, H, K, HV, V,
-        q.dtype, q.device.type, q.requires_grad or k.requires_grad or v.requires_grad,
+        q.dtype, q.device.type,
+        q.requires_grad or k.requires_grad or v.requires_grad
+        or g.requires_grad or beta.requires_grad,
         mode, dynamic, fullgraph,
         bool(output_final_state),
         bool(initial_state is not None),
