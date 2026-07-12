@@ -813,9 +813,13 @@ def fig_decoding():
         print('Skipping decoding figure (no successful runs)')
         return
     fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
-    markers = {'softmax': 'o-', 'kda': 's-'}
+    markers = {'softmax': 'o-', 'kda': 's-', 'csa': '^-',
+               'hca': 'D-', 'hybrid': 'v-'}
     labels = {'softmax': 'Softmax attention (growing KV cache)',
-              'kda': 'KDA recurrent (O(1) state)'}
+              'kda': 'KDA recurrent (O(1) state)',
+              'csa': 'CSA sparse (incremental cache)',
+              'hca': 'HCA dense (incremental cache)',
+              'hybrid': 'Hybrid KDA+CSA+HCA stack'}
     for op, pts in ops.items():
         pts.sort()
         xs = [p[0] for p in pts]

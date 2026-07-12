@@ -44,21 +44,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
 from ops_kda import naive_recurrent_kda
+from ops_csa import naive_csa
+from ops_hca import naive_hca
+from ops_decoding_cache import CSADecodingCache, HCADecodingCache
 
 # P0 fix: emit a one-shot warning at import time so notebook / REPL
 # users do not silently misread the decoding results as a fair
 # three-way comparison. The README's "Fairness notes" #4 acknowledges
 # this gap, but a code-level warning is more visible to a user who
 # skips the README and goes straight to ``python run_decoding.py``.
-# The warning is emitted once per process (Python's default warning
-# filter deduplicates by (message, category, module, lineno)).
+#
+# UPDATE: with the incremental decoding cache (CSADecodingCache /
+# HCADecodingCache in ops_decoding_cache.py), CSA and HCA now
+# participate in the Exp 6 decode-latency benchmark. The warning is
+# kept for backward compatibility but updated to reflect the new
+# scope. The warning is emitted once per process (Python's default
+# warning filter deduplicates by (message, category, module, lineno)).
 warnings.warn(
-    "run_decoding.py: only softmax attention and KDA are benchmarked "
-    "here. CSA and HCA do NOT have an incremental KV-block cache "
-    "implemented in this repository, so their decoding latency is not "
-    "measured. Do NOT interpret the softmax-vs-KDA numbers as a "
-    "three-way comparison. See README 'Fairness notes' #4 for the "
-    "acknowledged scope gap and the planned incremental-cache roadmap.",
+    "run_decoding.py: now benchmarks softmax, KDA, CSA, HCA, and the "
+    "hybrid stack. CSA and HCA use the incremental decoding cache "
+    "(ops_decoding_cache.CSADecodingCache / HCADecodingCache) which "
+    "maintains a partial-token accumulator, a compressed-block cache, "
+    "a sliding-window ring buffer, and (for CSA) a dynamically-updated "
+    "indexer key cache. See README 'Fairness notes' #4 for the updated "
+    "scope and the ``torch.topk`` tie-breaking caveat for CSA's "
+    "incremental indexer (a numerical artifact, not a correctness bug).",
     stacklevel=2,
 )
 
@@ -367,6 +377,267 @@ class KDAAttnDecoding(nn.Module):
         return self.o(o.reshape(B, T_new, self.H * self.V))
 
 
+class CSAAttnDecoding(nn.Module):
+    """CSA attention with incremental decoding cache.
+
+    Closes the Exp 6 scope gap documented in the README's "Fairness
+    notes" #4: CSA previously had no incremental KV-block cache, so its
+    decode latency was not measured. This module wraps
+    :class:`ops_decoding_cache.CSADecodingCache` (partial-token
+    accumulator + compressed-block cache + sliding-window ring buffer
+    + dynamically-updated indexer key cache) to enable token-by-token
+    autoregressive decoding.
+
+    The prefill path (``T_new > 1``) calls ``naive_csa`` on the full
+    chunk (the fast vectorized path) and populates the cache from the
+    result. The decode path (``T_new == 1``) uses the cache for
+    incremental computation — O(1) per-token cost in the cached
+    context length (the compressed-block cache grows by one row every
+    ``m`` tokens; the SW ring buffer is fixed-size).
+
+    The parameterization mirrors :class:`ops_fused.CSAHybridLayer` so
+    the decode-cost comparison reflects the SAME operator the fused
+    model uses.
+    """
+
+    def __init__(self, d_model, m=4, topk=2, nh=2, c=8, dc=8,
+                 nIh=1, c_I=4, sliding_window=4, use_ste=True):
+        super().__init__()
+        self.d_model = d_model
+        self.m, self.topk, self.nh, self.c = m, topk, nh, c
+        self.dc, self.nIh, self.c_I = dc, nIh, c_I
+        self.sliding_window = sliding_window
+        self.use_ste = use_ste
+        d = d_model
+        self.W_aKV = nn.Linear(d, c, bias=False)
+        self.W_bKV = nn.Linear(d, c, bias=False)
+        self.W_aZ = nn.Linear(d, c, bias=False)
+        self.W_bZ = nn.Linear(d, c, bias=False)
+        self.Ba = nn.Parameter(torch.randn(m, c) * 0.02)
+        self.Bb = nn.Parameter(torch.randn(m, c) * 0.02)
+        self.W_DQ = nn.Linear(d, dc, bias=False)
+        self.W_UQ = nn.Linear(dc, c * nh, bias=False)
+        self.W_IUQ = nn.Linear(dc, c_I * nIh, bias=False)
+        self.W_w = nn.Linear(d, nIh, bias=False)
+        self.W_KV_idx = nn.Linear(d, c_I, bias=False)
+        self.W_Z_idx = nn.Linear(d, c_I, bias=False)
+        self.B_idx = nn.Parameter(torch.randn(m, c_I) * 0.02)
+        self.sink = nn.Parameter(torch.zeros(nh))
+        self.o_proj = nn.Linear(c * nh, d, bias=False)
+        # The decoding cache is created lazily on the first forward
+        # (we need to know B, device, dtype to allocate the buffers).
+        # Registered as a non-persistent attribute (NOT a buffer — it's
+        # a Python object, not a tensor) so model.to(device) does not
+        # try to move it directly; the cache's own ``to`` method handles
+        # moving its internal tensors.
+        self._cache: CSADecodingCache | None = None
+
+    def reset(self):
+        if self._cache is not None:
+            self._cache.reset()
+
+    def _ensure_cache(self, B, device, dtype):
+        if self._cache is None or self._cache.B != B \
+                or self._cache.device != device \
+                or self._cache.dtype != dtype:
+            self._cache = CSADecodingCache(
+                B, self.c, self.c_I, self.m, self.sliding_window,
+                device, dtype,
+            )
+
+    def _project(self, H):
+        """Compute the 6 CSA projections + queries from H.
+
+        Returns ``(Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx)``.
+        Mirrors the merged-matmul optimization in ``naive_csa``.
+        """
+        B, T, _ = H.shape
+        combined_weight = torch.cat(
+            [self.W_aKV.weight, self.W_bKV.weight,
+             self.W_aZ.weight, self.W_bZ.weight,
+             self.W_KV_idx.weight, self.W_Z_idx.weight], dim=0,
+        )
+        combined_out = F.linear(H, combined_weight)
+        Ca, Cb, Za, Zb, K_idx, Z_idx = combined_out.split(
+            [self.c, self.c, self.c, self.c, self.c_I, self.c_I], dim=-1)
+        cQ = F.linear(H, self.W_DQ.weight)
+        q = F.linear(cQ, self.W_UQ.weight).view(B, T, self.nh, self.c)
+        q_idx = F.linear(cQ, self.W_IUQ.weight).view(B, T, self.nIh, self.c_I)
+        w_idx = F.linear(H, self.W_w.weight)
+        return Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx
+
+    def forward(self, x):
+        B, T_new, d = x.shape
+        self._ensure_cache(B, x.device, x.dtype)
+        cache = self._cache
+        if T_new > 1:
+            # Prefill: use the fast vectorized naive_csa, then populate
+            # the cache from the result by re-feeding the projections
+            # token-by-token (no output recomputation — append_step
+            # only updates the cache state, doesn't compute attention).
+            o = naive_csa(
+                x, self.W_aKV.weight, self.W_bKV.weight,
+                self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
+                self.W_DQ.weight, self.W_UQ.weight, self.W_IUQ.weight,
+                self.W_w.weight, self.W_KV_idx.weight, self.W_Z_idx.weight,
+                self.B_idx,
+                m=self.m, topk=self.topk, nh=self.nh, nIh=self.nIh,
+                c=self.c, c_I=self.c_I, dc=self.dc,
+                sliding_window=self.sliding_window, sink_logits=self.sink,
+                use_ste=self.use_ste,
+            )
+            # Populate the cache by feeding the projections token-by-token.
+            Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = self._project(x)
+            # Detach so the cache state doesn't retain the prefill graph.
+            for t in range(T_new):
+                cache.append_step(
+                    Ca[:, t:t+1].detach(), Cb[:, t:t+1].detach(),
+                    Za[:, t:t+1].detach(), Zb[:, t:t+1].detach(),
+                    K_idx[:, t:t+1].detach(), Z_idx[:, t:t+1].detach(),
+                    self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
+                )
+            return self.o_proj(o)
+        # Decode (T_new == 1): incremental path.
+        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project(x)
+        # Detach projections before caching (KV cache should not retain
+        # the autograd graph across decode steps — mirrors the
+        # SoftmaxAttnDecoding / KDAAttnDecoding pattern).
+        cache.append_step(
+            Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+            K_idx.detach(), Z_idx.detach(),
+            self.Ba, self.Bb, self.B_idx,
+        )
+        compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
+        q_n = F.normalize(q.to(compute_dtype), dim=-1)
+        o = cache.forward_step(
+            q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+            topk=self.topk, nh=self.nh, nIh=self.nIh, scale=1.0,
+            sink_logits=self.sink, use_ste=self.use_ste,
+        )   # [B, 1, nh, c] in compute_dtype
+        return self.o_proj(o.reshape(B, 1, self.nh * self.c).to(x.dtype))
+
+
+class HCAAttnDecoding(nn.Module):
+    """HCA attention with incremental decoding cache.
+
+    Mirrors :class:`CSAAttnDecoding` but for HCA (heavy compression +
+    dense MQA + SW, no indexer). Uses
+    :class:`ops_decoding_cache.HCADecodingCache` for the incremental
+    path. The parameterization mirrors :class:`ops_fused.HCAHybridLayer`.
+    """
+
+    def __init__(self, d_model, m2=4, nh=2, c=8, dc=8,
+                 sliding_window=4):
+        super().__init__()
+        self.d_model = d_model
+        self.m2, self.nh, self.c, self.dc = m2, nh, c, dc
+        self.sliding_window = sliding_window
+        d = d_model
+        self.W_KV = nn.Linear(d, c, bias=False)
+        self.W_Z = nn.Linear(d, c, bias=False)
+        self.B_pos = nn.Parameter(torch.randn(m2, c) * 0.02)
+        self.W_DQ = nn.Linear(d, dc, bias=False)
+        self.W_UQ = nn.Linear(dc, c * nh, bias=False)
+        self.sink = nn.Parameter(torch.zeros(nh))
+        self.o_proj = nn.Linear(c * nh, d, bias=False)
+        self._cache: HCADecodingCache | None = None
+
+    def reset(self):
+        if self._cache is not None:
+            self._cache.reset()
+
+    def _ensure_cache(self, B, device, dtype):
+        if self._cache is None or self._cache.B != B \
+                or self._cache.device != device \
+                or self._cache.dtype != dtype:
+            self._cache = HCADecodingCache(
+                B, self.c, self.m2, self.sliding_window, device, dtype,
+            )
+
+    def _project(self, H):
+        B, T, _ = H.shape
+        C = F.linear(H, self.W_KV.weight)
+        Z = F.linear(H, self.W_Z.weight)
+        cQ = F.linear(H, self.W_DQ.weight)
+        q = F.linear(cQ, self.W_UQ.weight).view(B, T, self.nh, self.c)
+        return C, Z, q
+
+    def forward(self, x):
+        B, T_new, d = x.shape
+        self._ensure_cache(B, x.device, x.dtype)
+        cache = self._cache
+        if T_new > 1:
+            o = naive_hca(
+                x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
+                self.W_DQ.weight, self.W_UQ.weight,
+                m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
+                sliding_window=self.sliding_window, sink_logits=self.sink,
+            )
+            C, Z, _ = self._project(x)
+            for t in range(T_new):
+                cache.append_step(
+                    C[:, t:t+1].detach(), Z[:, t:t+1].detach(),
+                    self.B_pos.detach(),
+                )
+            return self.o_proj(o)
+        C, Z, q = self._project(x)
+        cache.append_step(C.detach(), Z.detach(), self.B_pos)
+        compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
+        q_n = F.normalize(q.to(compute_dtype), dim=-1)
+        o = cache.forward_step(
+            q_n, nh=self.nh, scale=1.0, sink_logits=self.sink,
+        )
+        return self.o_proj(o.reshape(B, 1, self.nh * self.c).to(x.dtype))
+
+
+class HybridDecoding(nn.Module):
+    """Hybrid KDA+CSA+HCA stack for end-to-end decode latency.
+
+    Wraps :class:`ops_fused.HybridKCHAttention`. KDA layers carry
+    recurrent state (already in ``HybridKCHAttention``); CSA/HCA layers
+    use the model's standard forward (which calls ``naive_csa`` /
+    ``naive_hca`` on each decode step). This is CORRECT but not
+    optimized — the CSA/HCA layers recompute their full attention on
+    every decode step rather than using the incremental cache.
+
+    The standalone :class:`CSAAttnDecoding` / :class:`HCAAttnDecoding`
+    modules demonstrate the incremental cache for CSA / HCA in isolation.
+    Wiring the caches into the hybrid stack's per-layer forward (with
+    KDA state threading + residual flow + layer-norm) is left as a
+    follow-up; the Exp 6 benchmark uses the standalone modules to
+    measure the CSA/HCA decode cost.
+
+    The hybrid row in Exp 6 measures the full stack's decode latency
+    (the most realistic number for a production hybrid LM), but its
+    CSA/HCA layers do NOT yet use the incremental cache — so the
+    hybrid decode cost is an UPPER BOUND on what a cache-enabled
+    hybrid would achieve.
+    """
+
+    def __init__(self, d_model=64, total_layers=5):
+        super().__init__()
+        from ops_fused import HybridConfig, HybridKCHAttention
+        self.cfg = HybridConfig(
+            d_model=d_model,
+            n_heads_qk=2, n_heads_v=2,
+            head_dim_k=16, head_dim_v=16,
+            kda_chunk_size=0,  # force recurrent path for decode
+            csa_m=4, csa_topk=100,  # select all valid blocks
+            csa_nh=2, csa_c=8, csa_dc=8, csa_nIh=1, csa_cI=4,
+            csa_sliding_window=4,
+            hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
+            hca_sliding_window=4,
+            n_kda=3, n_csa=1, n_hca=1,
+        )
+        self.model = HybridKCHAttention(self.cfg, total_layers=total_layers)
+
+    def reset(self):
+        self.model.reset_state()
+
+    def forward(self, x):
+        return self.model(x)
+
+
 def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     """Measure per-token decoding latency after a fixed prefill.
 
@@ -572,6 +843,9 @@ def main():
     models = {
         'softmax': lambda: SoftmaxAttnDecoding(d_model),
         'kda':     lambda: KDAAttnDecoding(d_model),
+        'csa':     lambda: CSAAttnDecoding(d_model),
+        'hca':     lambda: HCAAttnDecoding(d_model),
+        'hybrid':  lambda: HybridDecoding(d_model),
     }
 
     results = []

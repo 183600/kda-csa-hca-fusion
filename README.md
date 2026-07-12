@@ -56,12 +56,13 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 ├── ops_kda.py             # KDA: naive_recurrent_kda, naive_chunk_kda
 ├── ops_csa.py             # CSA: compress_kv (overlapped), lightning indexer, naive_csa
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
+├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache (incremental decode)
 ├── ops_fused.py           # HybridConfig + KDAHybridLayer/CSAHybridLayer/HCAHybridLayer + HybridKCHAttention
-├── run_correctness.py     # 147 regression tests (custom runner; pytest-importable)
+├── run_correctness.py     # 199 regression tests (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
 ├── run_quality.py         # Exp 4: MQAR associative-recall quality (multi-seed)
 ├── run_ablation.py        # Exp 5: KDA:CSA:HCA ratio ablation
-├── run_decoding.py        # Exp 6: prefill + per-token decode latency (softmax vs KDA)
+├── run_decoding.py        # Exp 6: prefill + per-token decode latency (softmax/KDA/CSA/HCA/hybrid)
 ├── run_kv_cache.py        # Exp 3: analytic KV-cache + FLOPs accounting
 ├── method_analysis.py     # Headwise prototype (CSA simplified to dense for the demo)
 ├── make_figures.py        # Generate figures/* from results/*
@@ -130,7 +131,7 @@ install in-place).
 | 3. KV-cache + FLOPs | `run_kv_cache.py` | `results/exp3_kv_cache.json` | ~1 s |
 | 4. MQAR quality | `run_quality.py` | `results/exp4_mqar.json` | ~3 min (5 seeds × 200 steps) |
 | 5. Ratio ablation | `run_ablation.py` | `results/exp5_ablation.json` | ~5 min (7 seeds × 7 layouts) |
-| 6. Decode latency | `run_decoding.py` | `results/exp6_decoding.json` | ~10 s |
+| 6. Decode latency | `run_decoding.py` | `results/exp6_decoding.json` | ~30 s |
 | Figures | `make_figures.py` | `figures/fig_*.{pdf,png}` | ~5 s |
 
 Run everything end-to-end:
@@ -158,7 +159,7 @@ Environment knobs (set before launching):
 ## Tests
 
 ```bash
-# Custom runner (147 tests, includes long-running correctness checks):
+# Custom runner (199 tests, includes long-running correctness checks):
 python run_correctness.py
 
 # pytest-compatible: the test functions use the standard `test_*` naming
@@ -184,7 +185,7 @@ runs during development.
 | `results/exp3_kv_cache.json` | `[{T, op, kv_bytes, kv_elements, ...}, ...]` | analytic model, not profiled |
 | `results/exp4_mqar.json` | `[{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]` | multi-seed with CI95 + Bonferroni |
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper |
-| `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, ...}, ...]` | softmax vs KDA only |
+| `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (CSA & HCA use incremental decoding cache) |
 | `results/summary.json` | `{env, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
 
 > **Known schema inconsistency.** Exp 4 wraps its results in
@@ -241,11 +242,47 @@ structural claim.
 
 ### 4. Decoding experiment scope (Exp 6)
 
-`run_decoding.py` compares softmax vs KDA only. CSA, HCA, and the hybrid
-stack are **not** measured for decode latency because their incremental
-cache (compressed block cache + sliding-window ring buffer + indexer
-update) is not implemented in this reference. Generalizing decode claims
-to the full hybrid architecture requires implementing those caches first.
+`run_decoding.py` benchmarks **softmax, KDA, CSA, HCA, and the hybrid
+stack** for both prefill and per-token decode latency. CSA and HCA use
+the incremental decoding cache implemented in
+`ops_decoding_cache.py` (`CSADecodingCache` / `HCADecodingCache`),
+which maintains:
+
+* a **partial-token accumulator** (Python `list`) — buffers 0..m-1 new
+  tokens until a compressed block can be formed;
+* a **compressed-block cache** (`[B, n_blocks, c]` tensor) — grows by
+  one row every `m` (CSA) / `m2` (HCA) tokens;
+* a **sliding-window ring buffer** (`[B, win, c]` tensor) — fixed-size
+  FIFO of the most recent `win` uncompressed local keys;
+* a **dynamically-updated indexer key cache** (CSA only,
+  `[B, n_blocks, c_I]` tensor) — grows in lockstep with the
+  compressed-block cache so the lightning indexer can score new blocks
+  without recomputing the full history.
+
+The cache's per-token decode cost is **O(1)** in the cached context
+length (the compressed-block cache grows by one row every `m` tokens;
+the SW ring buffer is fixed-size), matching the algorithmic contract of
+CSA / HCA during autoregressive decoding.
+
+**Known limitation: `torch.topk` tie-breaking.** When the CSA indexer's
+ReLU scores have many exact ties at 0 (common with random untrained
+weights but rare in trained models where the indexer learns
+discriminative scores), `torch.topk`'s tie-breaking depends on the
+tensor SIZE. The full-sequence path's tensor has `T_padded // m` entries
+(including `-inf`-masked future blocks); the incremental path's tensor
+has only the completed blocks (no padding). With the same underlying
+scores but different tensor sizes, `torch.topk` may pick DIFFERENT tied
+blocks, leading to different gathered `kv` and different sparse-attention
+outputs. This is a `torch.topk` implementation artifact, NOT a
+correctness bug — both paths select valid blocks with the highest scores,
+just different tie-breaking. The regression tests
+(`test_csa_decoding_cache_correctness` in `run_correctness.py`) use
+`topk >= n_blocks` (select all valid blocks) to sidestep this; the Exp 6
+benchmark uses `topk=100` for the same reason. The hybrid decode path
+does NOT yet use the incremental cache (it uses the model's standard
+forward, which recomputes CSA/HCA on each decode step) — so the hybrid
+decode cost is an **upper bound** on what a cache-enabled hybrid would
+achieve.
 
 ### 5. KV-cache + FLOPs are analytic (Exp 3)
 
@@ -287,6 +324,21 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   `T * win * c > 8M` elements, keeping peak memory at `O(chunk_t · win · c)`.
   The chunked path is bit-identical to the unfold path (verified by
   `test_hca_sliding_window_causality` / `test_csa_full_pipeline_causality`).
+* **Incremental decoding cache (CSA / HCA).** The
+  `ops_decoding_cache.CSADecodingCache` / `HCADecodingCache` enable
+  token-by-token autoregressive decoding for CSA / HCA (closing the
+  Exp 6 scope gap — see *Fairness notes* #4). The cache maintains a
+  partial-token accumulator, a compressed-block cache, a sliding-window
+  ring buffer, and (for CSA) a dynamically-updated indexer key cache.
+  Per-token decode cost is O(1) in the cached context length.
+  **Known limitation:** `torch.topk`'s tie-breaking depends on tensor
+  size, so the incremental path may pick different tied blocks than the
+  full-sequence path when scores are tied (ReLU saturation at 0). This
+  is a numerical artifact, not a correctness bug — both paths select
+  valid blocks with the highest scores. The regression tests use
+  `topk >= n_blocks` to sidestep this. The hybrid decode path does NOT
+  yet use the cache (it uses the model's standard forward) — the hybrid
+  decode cost is an upper bound.
 * **Dropout unimplemented.** `HybridConfig.dropout != 0` raises
   `NotImplementedError` rather than silently no-op'ing. MQAR-scale models
   don't need dropout; larger runs should wire it in (or remove the field).

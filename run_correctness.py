@@ -3888,6 +3888,403 @@ def test_prefill_flops_softmax_gqa_projections(device='cpu'):
         f'expected_proj={expected_proj}, kda/gqa_ratio={ratio:.4f}x')]
 
 
+# =============================================================================
+# Incremental decoding cache tests (ops_decoding_cache.py)
+# -----------------------------------------------------------------------------
+# These tests verify that the incremental decoding cache
+# (CSADecodingCache / HCADecodingCache) produces bit-identical outputs to
+# ``naive_csa`` / ``naive_hca`` called once on the full sequence. The
+# cache closes the Exp 6 scope gap documented in the README's "Fairness
+# notes" #4 — without it, CSA / HCA could not participate in token-by-
+# token autoregressive decoding.
+#
+# The tests use ``topk >= n_blocks`` (select ALL valid compressed blocks)
+# so the sparse-attention output is permutation-invariant over the
+# selected set. This sidesteps the ``torch.topk`` tie-breaking artifact
+# (different tensor sizes break ties differently) documented in
+# ``ops_decoding_cache.py``'s module docstring. With ``topk < n_blocks``,
+# the topk selection can differ between the full and incremental paths
+# when scores are tied (ReLU saturation at 0) — a numerical artifact,
+# not a correctness bug.
+# =============================================================================
+
+def _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=0):
+    """Build random CSA parameters for the decoding cache tests."""
+    import torch.nn as nn
+    g = torch.Generator(device=device).manual_seed(seed)
+    def rp(out, inp):
+        return nn.Linear(inp, out, bias=False).weight.detach().to(device)
+    return dict(
+        W_aKV=rp(c, d), W_bKV=rp(c, d), W_aZ=rp(c, d), W_bZ=rp(c, d),
+        Ba=torch.randn(m, c, generator=g, device=device) * 0.02,
+        Bb=torch.randn(m, c, generator=g, device=device) * 0.02,
+        W_DQ=rp(dc, d), W_UQ=rp(c * nh, dc), W_IUQ=rp(c_I * nIh, dc),
+        W_w=rp(nIh, d), W_KV_idx=rp(c_I, d), W_Z_idx=rp(c_I, d),
+        B_idx=torch.randn(m, c_I, generator=g, device=device) * 0.02,
+    )
+
+
+def _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=0):
+    """Build random HCA parameters for the decoding cache tests."""
+    import torch.nn as nn
+    g = torch.Generator(device=device).manual_seed(seed)
+    def rp(out, inp):
+        return nn.Linear(inp, out, bias=False).weight.detach().to(device)
+    return dict(
+        W_KV=rp(c, d), W_Z=rp(c, d),
+        B_pos=torch.randn(m2, c, generator=g, device=device) * 0.02,
+        W_DQ=rp(dc, d), W_UQ=rp(c * nh, dc),
+    )
+
+
+def _project_csa_for_cache(H, p, c, c_I, dc, nh, nIh):
+    """Compute the 6 CSA projections + queries from H (mirrors naive_csa)."""
+    import torch.nn.functional as F
+    combined_weight = torch.cat(
+        [p['W_aKV'], p['W_bKV'], p['W_aZ'], p['W_bZ'],
+         p['W_KV_idx'], p['W_Z_idx']], dim=0)
+    combined_out = F.linear(H, combined_weight)
+    Ca, Cb, Za, Zb, K_idx_raw, Z_idx = combined_out.split(
+        [c, c, c, c, c_I, c_I], dim=-1)
+    cQ = F.linear(H, p['W_DQ'])
+    q = F.linear(cQ, p['W_UQ']).view(*H.shape[:2], nh, c)
+    q_idx = F.linear(cQ, p['W_IUQ']).view(*H.shape[:2], nIh, c_I)
+    w_idx = F.linear(H, p['W_w'])
+    return Ca, Cb, Za, Zb, K_idx_raw, Z_idx, q, q_idx, w_idx
+
+
+def _project_hca_for_cache(H, p, c, dc, nh):
+    """Compute the HCA projections + queries from H (mirrors naive_hca)."""
+    import torch.nn.functional as F
+    C = F.linear(H, p['W_KV'])
+    Z = F.linear(H, p['W_Z'])
+    cQ = F.linear(H, p['W_DQ'])
+    q = F.linear(cQ, p['W_UQ']).view(*H.shape[:2], nh, c)
+    return C, Z, q
+
+
+def test_csa_decoding_cache_correctness(device='cpu'):
+    """Incremental CSA decoding == naive_csa on the full sequence.
+
+    Feeds T tokens one at a time through CSADecodingCache and compares
+    the per-token outputs to naive_csa called once on the full
+    sequence. Uses topk=100 (select all valid blocks) so the output is
+    permutation-invariant over the selected set, sidestepping the
+    torch.topk tie-breaking artifact.
+    """
+    from ops_decoding_cache import CSADecodingCache
+    torch.manual_seed(42)
+    d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8
+    topk, win = 100, 4
+    p = _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=1)
+    T = 17
+    B = 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+
+    o_full = naive_csa(
+        H, p['W_aKV'], p['W_bKV'], p['W_aZ'], p['W_bZ'],
+        p['Ba'], p['Bb'], p['W_DQ'], p['W_UQ'], p['W_IUQ'],
+        p['W_w'], p['W_KV_idx'], p['W_Z_idx'], p['B_idx'],
+        m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+        sliding_window=win, sink_logits=None, use_ste=False,
+    )
+
+    cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)
+    outs = []
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+        q_n = F.normalize(q.to(torch.float), dim=-1)
+        o_t = cache.forward_step(
+            q_n, q_idx, w_idx,
+            topk=topk, nh=nh, nIh=nIh, scale=1.0,
+            sink_logits=None, use_ste=False,
+        )
+        outs.append(o_t.reshape(B, 1, nh * c))
+    o_inc = torch.cat(outs, dim=1).to(o_full.dtype)
+
+    max_diff = (o_full - o_inc).abs().max().item()
+    return [_ok(
+        'csa_decoding_cache_matches_naive',
+        max_diff < 1e-4,
+        f'max_diff={max_diff:.6e} (tol=1e-4), T={T}, m={m}, win={win}, '
+        f'topk={topk} (select-all)')]
+
+
+def test_hca_decoding_cache_correctness(device='cpu'):
+    """Incremental HCA decoding == naive_hca on the full sequence."""
+    from ops_decoding_cache import HCADecodingCache
+    torch.manual_seed(42)
+    d, c, m2, nh, dc = 32, 8, 4, 2, 8
+    win = 4
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=2)
+    T = 17
+    B = 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+
+    o_full = naive_hca(
+        H, p['W_KV'], p['W_Z'], p['B_pos'],
+        p['W_DQ'], p['W_UQ'],
+        m2=m2, nh=nh, c=c, dc=dc,
+        sliding_window=win, sink_logits=None,
+    )
+
+    cache = HCADecodingCache(B, c, m2, win, device, torch.float32)
+    outs = []
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        C, Z, q = _project_hca_for_cache(H_t, p, c, dc, nh)
+        cache.append_step(C, Z, p['B_pos'])
+        q_n = F.normalize(q.to(torch.float), dim=-1)
+        o_t = cache.forward_step(
+            q_n, nh=nh, scale=1.0, sink_logits=None,
+        )
+        outs.append(o_t.reshape(B, 1, nh * c))
+    o_inc = torch.cat(outs, dim=1).to(o_full.dtype)
+
+    max_diff = (o_full - o_inc).abs().max().item()
+    return [_ok(
+        'hca_decoding_cache_matches_naive',
+        max_diff < 1e-4,
+        f'max_diff={max_diff:.6e} (tol=1e-4), T={T}, m2={m2}, win={win}')]
+
+
+def test_csa_decoding_cache_compressed_blocks_match(device='cpu'):
+    """The compressed block cache stores EXACTLY naive_csa's C_comp."""
+    from ops_decoding_cache import CSADecodingCache
+    from ops_csa import csa_compress_kv_overlapped, csa_compress_kv
+    torch.manual_seed(42)
+    d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8
+    topk, win = 100, 4
+    p = _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=3)
+    T = 16  # divisible by m for a clean comparison
+    B = 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+
+    # Full compression.
+    Ca_f, Cb_f, Za_f, Zb_f, K_idx_f, Z_idx_f, _, _, _ = _project_csa_for_cache(
+        H, p, c, c_I, dc, nh, nIh)
+    C_comp_full = csa_compress_kv_overlapped(
+        Ca_f, Cb_f, Za_f, Zb_f, p['Ba'], p['Bb'], m)
+    K_IComp_full = csa_compress_kv(K_idx_f, Z_idx_f, p['B_idx'], m)
+
+    # Incremental.
+    cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+
+    c_diff = (C_comp_full - cache.C_comp).abs().max().item()
+    k_diff = (K_IComp_full - cache.K_IComp).abs().max().item()
+    n_blocks_match = cache.n_blocks == T // m
+    return [_ok(
+        'csa_decoding_cache_compressed_blocks_match',
+        c_diff < 1e-5 and k_diff < 1e-5 and n_blocks_match,
+        f'C_comp_diff={c_diff:.6e}, K_IComp_diff={k_diff:.6e}, '
+        f'n_blocks_inc={cache.n_blocks} (expected {T // m})')]
+
+
+def test_csa_decoding_cache_sliding_window_ring_buffer(device='cpu'):
+    """The SW ring buffer holds the last ``win`` entries in causal order."""
+    from ops_decoding_cache import CSADecodingCache, _SlidingWindowRingBuffer
+    torch.manual_seed(42)
+    B, win, c = 1, 4, 8
+    buf = _SlidingWindowRingBuffer(B, win, c, device, torch.float32)
+
+    # Append 2*win + 1 entries; the buffer should hold only the last win.
+    entries = []
+    for i in range(2 * win + 1):
+        x = torch.full((B, 1, c), float(i), device=device)
+        buf.append(x)
+        entries.append(i)
+    contents = buf.get()  # [B, win, c]
+    expected_last_win = [entries[-win:]]  # [[win+1, win+2, ..., 2*win]]
+    actual = contents[0, :, 0].tolist()  # first channel of each entry
+    n_valid_ok = buf.n_valid == win
+    contents_ok = actual == expected_last_win[0]
+    return [_ok(
+        'csa_decoding_cache_sw_ring_buffer',
+        n_valid_ok and contents_ok,
+        f'n_valid={buf.n_valid} (expected {win}), '
+        f'contents={actual} (expected {expected_last_win[0]})')]
+
+
+def test_csa_decoding_cache_indexer_dynamic_update(device='cpu'):
+    """The indexer key cache grows in lockstep with the compressed block cache."""
+    from ops_decoding_cache import CSADecodingCache
+    torch.manual_seed(42)
+    d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8
+    topk, win = 100, 4
+    p = _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=5)
+    T = 13  # 3 full blocks + 1 partial
+    B = 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+
+    cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)
+    expected_n_blocks = 0
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+        # After appending token t, the number of completed blocks should
+        # be (t+1) // m.
+        expected_n_blocks = (t + 1) // m
+        if cache.n_blocks != expected_n_blocks:
+            return [_ok(
+                'csa_decoding_cache_indexer_dynamic_update',
+                False,
+                f'at t={t}: n_blocks={cache.n_blocks} '
+                f'(expected {expected_n_blocks})')]
+    # Final check: C_comp and K_IComp should have the same length.
+    final_ok = (cache.C_comp is not None and cache.K_IComp is not None
+                and cache.C_comp.shape[1] == cache.K_IComp.shape[1]
+                == cache.n_blocks)
+    return [_ok(
+        'csa_decoding_cache_indexer_dynamic_update',
+        final_ok,
+        f'final n_blocks={cache.n_blocks}, '
+        f'C_comp.shape={tuple(cache.C_comp.shape) if cache.C_comp is not None else None}, '
+        f'K_IComp.shape={tuple(cache.K_IComp.shape) if cache.K_IComp is not None else None}')]
+
+
+def test_csa_decoding_cache_prefill_then_decode(device='cpu'):
+    """Prefill (T_new > 1) then decode (T_new == 1) produces correct shapes."""
+    from ops_decoding_cache import CSADecodingCache
+    torch.manual_seed(42)
+    d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8
+    topk, win = 100, 4
+    p = _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=6)
+    prefill_len = 16
+    n_decode = 5
+    B = 1
+    H_pre = torch.randn(B, prefill_len, d, device=device) * 0.1
+
+    # Build the cache by feeding the prefill token-by-token (the
+    # ``append_step`` path that CSAAttnDecoding uses during prefill).
+    cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)
+    for t in range(prefill_len):
+        H_t = H_pre[:, t:t+1]
+        Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+
+    prefill_n_blocks_ok = cache.n_blocks == prefill_len // m
+    prefill_acc_ok = cache.accumulator_len == prefill_len % m
+
+    # Decode: feed one token at a time and verify the cache state evolves.
+    decode_shapes_ok = True
+    for t in range(n_decode):
+        H_t = torch.randn(B, 1, d, device=device) * 0.1
+        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+        q_n = F.normalize(q.to(torch.float), dim=-1)
+        o_t = cache.forward_step(
+            q_n, q_idx, w_idx,
+            topk=topk, nh=nh, nIh=nIh, scale=1.0,
+            sink_logits=None, use_ste=False,
+        )
+        if o_t.shape != (B, 1, nh, c):
+            decode_shapes_ok = False
+            break
+
+    final_n_blocks = cache.n_blocks
+    expected_final_n_blocks = (prefill_len + n_decode) // m
+    final_n_blocks_ok = final_n_blocks == expected_final_n_blocks
+
+    return [_ok(
+        'csa_decoding_cache_prefill_then_decode',
+        prefill_n_blocks_ok and prefill_acc_ok and decode_shapes_ok
+        and final_n_blocks_ok,
+        f'prefill_n_blocks={cache.n_blocks if not decode_shapes_ok else "ok"} '
+        f'(prefill_blocks_ok={prefill_n_blocks_ok}, acc_ok={prefill_acc_ok}, '
+        f'decode_shapes_ok={decode_shapes_ok}, '
+        f'final_n_blocks={final_n_blocks} expected={expected_final_n_blocks})')]
+
+
+def test_hca_decoding_cache_compressed_blocks_match(device='cpu'):
+    """The HCA compressed block cache stores EXACTLY naive_hca's C_comp."""
+    from ops_decoding_cache import HCADecodingCache
+    from ops_csa import csa_compress_kv
+    torch.manual_seed(42)
+    d, c, m2, nh, dc = 32, 8, 4, 2, 8
+    win = 4
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=7)
+    T = 16  # divisible by m2
+    B = 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+
+    C_f, Z_f, _ = _project_hca_for_cache(H, p, c, dc, nh)
+    C_comp_full = csa_compress_kv(C_f, Z_f, p['B_pos'], m2)
+
+    cache = HCADecodingCache(B, c, m2, win, device, torch.float32)
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        C, Z, _ = _project_hca_for_cache(H_t, p, c, dc, nh)
+        cache.append_step(C, Z, p['B_pos'])
+
+    c_diff = (C_comp_full - cache.C_comp).abs().max().item()
+    n_blocks_match = cache.n_blocks == T // m2
+    return [_ok(
+        'hca_decoding_cache_compressed_blocks_match',
+        c_diff < 1e-5 and n_blocks_match,
+        f'C_comp_diff={c_diff:.6e}, n_blocks_inc={cache.n_blocks} '
+        f'(expected {T // m2})')]
+
+
+def test_decoding_cache_reset_clears_state(device='cpu'):
+    """reset() clears all cache state (blocks, accumulator, SW buffer)."""
+    from ops_decoding_cache import CSADecodingCache
+    torch.manual_seed(42)
+    d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8
+    topk, win = 100, 4
+    p = _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=8)
+    B = 1
+    H = torch.randn(B, 10, d, device=device) * 0.1
+
+    cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)
+    for t in range(10):
+        H_t = H[:, t:t+1]
+        Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+
+    # State should be non-empty.
+    pre_n_blocks = cache.n_blocks
+    pre_acc = cache.accumulator_len
+    pre_sw = cache.sw_buffer.n_valid if cache.sw_buffer else 0
+    pre_reset_nonempty = (pre_n_blocks > 0 or pre_acc > 0 or pre_sw > 0)
+    cache.reset()
+    post_reset_empty = (cache.n_blocks == 0 and cache.accumulator_len == 0
+                        and (cache.sw_buffer is None
+                             or cache.sw_buffer.n_valid == 0)
+                        and cache.C_comp is None and cache.K_IComp is None)
+    return [_ok(
+        'decoding_cache_reset_clears_state',
+        pre_reset_nonempty and post_reset_empty,
+        f'pre_reset: n_blocks={pre_n_blocks}, acc={pre_acc}, '
+        f'sw_valid={pre_sw}; '
+        f'post_reset: n_blocks={cache.n_blocks}, acc={cache.accumulator_len}, '
+        f'sw_valid={cache.sw_buffer.n_valid if cache.sw_buffer else 0}')]
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -3992,6 +4389,17 @@ def main():
     all_results += _run_safe(test_kv_cache_ceil_block_count, device)
     all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
     all_results += _run_safe(test_decoding_batch_size_change, device)
+    # Incremental decoding cache tests (ops_decoding_cache.py).
+    # These verify the new CSADecodingCache / HCADecodingCache that
+    # close the Exp 6 scope gap (CSA / HCA decode latency).
+    all_results += _run_safe(test_csa_decoding_cache_correctness, device)
+    all_results += _run_safe(test_hca_decoding_cache_correctness, device)
+    all_results += _run_safe(test_csa_decoding_cache_compressed_blocks_match, device)
+    all_results += _run_safe(test_csa_decoding_cache_sliding_window_ring_buffer, device)
+    all_results += _run_safe(test_csa_decoding_cache_indexer_dynamic_update, device)
+    all_results += _run_safe(test_csa_decoding_cache_prefill_then_decode, device)
+    all_results += _run_safe(test_hca_decoding_cache_compressed_blocks_match, device)
+    all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)
