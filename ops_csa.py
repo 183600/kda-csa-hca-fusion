@@ -20,6 +20,118 @@ import torch
 import torch.nn.functional as F
 
 
+# =============================================================================
+# Chunked sliding-window attention helper (issue 2.2 fix)
+# -----------------------------------------------------------------------------
+# The previous sliding-window implementation used
+# ``C_padded.unfold(1, win, 1)`` which materializes a ``[B, T, win, c]`` tensor
+# in a single allocation. For ``T=64K, win=2K, c=64, B=1`` this is
+# ``64K × 2K × 64 × 4B = 32 GB`` — far beyond GPU memory. The README's
+# *Limitations* section acknowledges this but no fix was provided in-repo.
+#
+# This helper processes the window axis in chunks of ``chunk_t`` query
+# positions at a time, keeping peak memory at ``O(chunk_t · win · c)`` instead
+# of ``O(T · win · c)``. The default threshold ``CHUNKED_SW_THRESHOLD``
+# auto-engages the chunked path when ``T * win * c`` exceeds 8M elements
+# (≈32MB in fp32) — small enough that the chunked path's Python overhead is
+# negligible relative to the matmul cost, but large enough that the
+# vectorized ``unfold`` path stays fast for the common ``T≤4k, win≤512``
+# case documented as safe in the README.
+#
+# Numerical contract: IDENTICAL to the ``unfold``-based path. Softmax over
+# the ``win`` non-masked entries of a row is the same operation whether the
+# row was extracted as a slice of a ``[T, win]`` unfold view or as one chunk
+# of ``[chunk_t, win]`` slices. Verified by
+# ``test_hca_sliding_window_causality`` / ``test_csa_full_pipeline_causality``
+# in run_correctness.py.
+# ============================================================================
+
+# Auto-engage chunked path when the materialized unfold tensor would exceed
+# 8M elements (≈32MB fp32). Below this threshold the unfold path's
+# vectorized CUDA kernel beats the chunked path's Python-loop overhead.
+CHUNKED_SW_THRESHOLD = 8_000_000
+
+
+def _sliding_window_attention(
+    q: torch.Tensor,           # [B, T, nh, c]   (L2-normalized)
+    C_local: torch.Tensor,     # [B, T, c]       (L2-normalized)
+    win: int,
+    scale: float,
+    device,
+    *,
+    chunk_t: int | None = None,
+) -> torch.Tensor:
+    """Memory-efficient sliding-window attention.
+
+    Returns ``[B, T, nh, c]`` — the local-window contribution to the per-head
+    output. Adds nothing to the global state; the caller adds it to the
+    sparse-attention output.
+
+    Args:
+        q: per-head queries, shape ``[B, T, nh, c]``, already L2-normalized.
+        C_local: per-position keys, shape ``[B, T, c]``, already L2-normalized.
+        win: sliding window size (causal: query ``t`` attends to positions
+            ``[t-win+1, t]``).
+        scale: scalar multiplied to scores before softmax (cosine-attention
+            scale; typically 1.0 for normalized q/k).
+        device: torch.device for any intermediates.
+        chunk_t: number of query positions to process per chunk. ``None``
+            auto-picks ``min(T, max(64, ceil(T * win / (CHUNKED_SW_THRESHOLD /
+            win))))`` so peak memory stays near the threshold.
+
+    Numerical contract:
+        Identical to the equivalent ``unfold``-based implementation, up to
+        floating-point reassociation in the per-chunk softmax. Differences
+        are well below the fp32 tolerance enforced by ``run_correctness.py``.
+    """
+    B, T, nh, c = q.shape
+    # Pre-build the static validity mask once (shape [T, win]) — this is
+    # O(T * win) booleans = ~T*win/8 bytes (e.g. 64K*2K/8 = 16MB at the
+    # worst case documented in the README), small relative to the [B, T,
+    # win, c] float tensor we avoid materializing.
+    _j = torch.arange(win, device=device)
+    _t = torch.arange(T, device=device)
+    valid_mask = _j[None, :] >= (win - 1 - _t[:, None])    # [T, win], True=real
+
+    # Auto-pick chunk_t if not given. Goal: keep peak memory near
+    # CHUNKED_SW_THRESHOLD / win / c per chunk (in elements). Round up to a
+    # multiple of 64 for matmul efficiency.
+    if chunk_t is None:
+        # Target: chunk_t * win * c <= CHUNKED_SW_THRESHOLD
+        # => chunk_t <= CHUNKED_SW_THRESHOLD / (win * c)
+        target = max(64, CHUNKED_SW_THRESHOLD // max(1, win * c))
+        chunk_t = min(T, ((target + 63) // 64) * 64)
+    chunk_t = max(1, chunk_t)
+
+    # Left-pad C_local so we can extract the window for query ``t`` as a
+    # contiguous slice of length ``win`` starting at padded position ``t``.
+    C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
+
+    out = q.new_zeros(B, T, nh, c)
+    # Process query positions [t_lo, t_hi) per chunk. For each chunk we
+    # extract the per-query windows via unfold on a small slice of C_padded,
+    # compute scores/softmax/output, and accumulate into ``out``. The peak
+    # intermediate is ``[B, chunk_t, win, c]`` — bounded by chunk_t.
+    for t_lo in range(0, T, chunk_t):
+        t_hi = min(T, t_lo + chunk_t)
+        ct = t_hi - t_lo
+        # Extract windows for this chunk: window for query ``t_lo + i`` starts
+        # at padded position ``t_lo + i``, ends at ``t_lo + i + win - 1``.
+        # Equivalent to slicing C_padded[:, t_lo : t_hi + win - 1] and then
+        # unfolding along dim=1 with size=win, step=1. We use unfold here
+        # too — but on the small ``ct + win - 1`` slice, not on the full
+        # ``T + win - 1`` tensor.
+        C_slice = C_padded[:, t_lo : t_hi + win - 1]       # [B, ct+win-1, c]
+        C_windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, ct, win, c]
+        q_chunk = q[:, t_lo:t_hi]                            # [B, ct, nh, c]
+        mask_chunk = valid_mask[t_lo:t_hi]                   # [ct, win]
+        scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows) * scale
+        scores = scores.masked_fill(~mask_chunk[None, :, None, :], float('-inf'))
+        p = torch.softmax(scores, dim=-1)                   # [B, ct, nh, win]
+        out[:, t_lo:t_hi] = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
+    return out
+
+
 def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     """Return ``[T, n_blocks]`` mask: query t can attend to compressed block b
     only if ``b < t // m`` (strictly preceding blocks)."""
@@ -506,16 +618,86 @@ def naive_csa(
     # P0 API fix: use F.linear (computes H @ W.T) with W in nn.Linear.weight
     # layout [out, in] — avoids the non-contiguous .weight.T view that the
     # previous ``H @ W_aKV`` form required at every call site.
-    Ca = F.linear(H, W_aKV)                                       # [B, T, c]
-    Cb = F.linear(H, W_bKV)                                       # [B, T, c]
-    Za = F.linear(H, W_aZ)                                        # [B, T, c]
-    Zb = F.linear(H, W_bZ)                                        # [B, T, c]
+    #
+    # Issue 2.3 fix: previously this block did 6 SEPARATE ``F.linear(H, W_x)``
+    # calls — ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`` — each launching
+    # its own GEMM kernel. At ``B=1, T=2048, d=512`` this is 6 kernel launches
+    # and 6 separate ``[B, T, d] · [d, out]`` matmuls where a single fused
+    # matmul would do the same work in one launch with better arithmetic
+    # intensity (the concatenated weight tensor has more rows, giving cuBLAS
+    # a larger M dimension to tile over).
+    #
+    # We concatenate all 6 weights along their out_features axis (dim=0) and
+    # do ONE ``F.linear`` call, then ``tensor.split`` the result back into
+    # the 6 named projections. The split is a zero-copy view (``split``
+    # returns views into the concatenated tensor), so the only additional
+    # cost is the one-time ``torch.cat`` on the weight tensors. We do NOT
+    # cache the concatenated weight because (a) the optimizer may update
+    # the individual weights in-place between forward passes, invalidating
+    # any cache, and (b) the cat cost on small weight tensors
+    # (e.g. ``6 × [64, 512] = 196K elements``) is <<1ms — negligible
+    # relative to the matmul cost.
+    #
+    # Numerical contract: IDENTICAL to the 6 separate calls. ``F.linear`` is
+    # ``x @ W.T``; concatenating the W's along dim=0 (out_features) and then
+    # slicing the result along dim=-1 is mathematically identical to doing
+    # each matmul independently. Bit-identical up to GEMM kernel reduction
+    # order (which may differ slightly when the kernel sees a larger M,
+    # but well below the fp32 tolerance enforced by ``run_correctness.py``).
+    #
+    # Autograd contract CHANGE (intentional): under ``use_ste=False`` the
+    # indexer weights ``W_KV_idx`` and ``W_Z_idx`` previously received
+    # ``None`` grad (because the indexer's top-k selection didn't propagate
+    # gradient, and the weights weren't tied to any other path). With the
+    # merged matmul they now receive a ZERO (but non-None) grad, because
+    # autograd flows backward through the single matmul into all 6 weight
+    # slices. The substantive contract — "indexer params don't learn
+    # without STE" — is preserved: the grad is zero, so the optimizer
+    # step is a no-op. ``test_csa_indexer_ste_gradient`` was updated to
+    # check for "no useful gradient" (None OR all-zero) instead of
+    # requiring None specifically.
+    #
+    # All 6 weights must share dtype & device with H (they come from the
+    # same ``nn.Linear`` module hierarchy, so this is true by construction).
+    # We add a defensive check so a misconfigured caller gets a clear error
+    # instead of a cryptic ``Expected all tensors to be on the same device``
+    # from inside ``torch.cat``.
+    for _w_name, _w in [
+        ('W_aKV', W_aKV), ('W_bKV', W_bKV), ('W_aZ', W_aZ), ('W_bZ', W_bZ),
+        ('W_KV_idx', W_KV_idx), ('W_Z_idx', W_Z_idx),
+    ]:
+        if _w.device != H.device:
+            raise ValueError(
+                f"naive_csa: {_w_name}.device={_w.device} does not match "
+                f"H.device={H.device}. All weights must be on the same "
+                f"device as the input.")
+        if _w.dtype != H.dtype:
+            raise ValueError(
+                f"naive_csa: {_w_name}.dtype={_w.dtype} does not match "
+                f"H.dtype={H.dtype}. All weights must share the input's "
+                f"dtype (cast before calling if needed).")
+        if _w.shape[1] != d:
+            raise ValueError(
+                f"naive_csa: {_w_name}.shape={tuple(_w.shape)} — second dim "
+                f"(in_features) must equal d={d} (H.shape[-1]).")
+    # Concatenate all 6 weights along the out_features axis (dim=0). The
+    # ``split_sizes`` list below MUST match this ordering — if you add or
+    # reorder weights here, update both lists in lockstep.
+    combined_weight = torch.cat(
+        [W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx],
+        dim=0,
+    )                                                              # [4c + 2*c_I, d]
+    combined_out = F.linear(H, combined_weight)                    # [B, T, 4c + 2*c_I]
+    # ``torch.split`` returns views into ``combined_out`` — no copy.
+    # split_sizes MUST match the order of weights in ``torch.cat`` above.
+    Ca, Cb, Za, Zb, K_idx_raw, Z_idx = combined_out.split(
+        [c, c, c, c, c_I, c_I], dim=-1,
+    )
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)   # [B, n_blocks, c]
 
     # --- 2. Lightning indexer ---
     # compressed indexer keys via the same compression (single-branch here for simplicity)
-    K_idx_raw = F.linear(H, W_KV_idx)                             # [B, T, c_I]
-    Z_idx = F.linear(H, W_Z_idx)                                  # [B, T, c_I]
+    # K_idx_raw and Z_idx were computed in the merged matmul above.
     K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)            # [B, n_blocks, c_I]
     # indexer queries (low-rank)
     cQ = F.linear(H, W_DQ)                                        # [B, T, dc]
@@ -805,7 +987,7 @@ def naive_csa(
         # attention mechanism; at ``T=2048`` it allocated and filled a
         # 4M-entry scores tensor per call regardless of ``win``.
         #
-        # The fix uses a **banded / windowed-gather** approach:
+        # The P5 fix used a **banded / windowed-gather** approach:
         #   1. Left-pad ``C_local`` with ``win-1`` zero columns so that the
         #      window for query ``t`` can be extracted as a contiguous slice.
         #   2. Use ``unfold`` to extract per-query windows of shape
@@ -815,6 +997,16 @@ def naive_csa(
         #   4. Mask the left-padding entries (queries near the start of the
         #      sequence whose window extends before position 0) to ``-inf``,
         #      softmax, and weighted-sum over the ``win`` dimension.
+        #
+        # Issue 2.2 fix: the ``unfold`` call materialized a single ``[B, T,
+        # win, c]`` tensor — fine for ``T≤4k, win≤512`` (≤4M elements) but
+        # blowing up at ``T=64k, win=2k`` (≈8B elements / 32 GB). We now
+        # delegate to ``_sliding_window_attention`` which auto-engages a
+        # chunked path when ``T * win * c`` exceeds ``CHUNKED_SW_THRESHOLD``
+        # (default 8M elements), keeping peak memory at
+        # ``O(chunk_t · win · c)``. For the small-T / small-win case the
+        # helper still uses ``unfold`` on a single slice — same vectorized
+        # fast path as before.
         #
         # The result is numerically identical to the old dense+mask approach
         # (verified by ``test_hca_sliding_window_causality`` /
@@ -832,31 +1024,7 @@ def naive_csa(
         # (fp32) — an asymmetric precision loss that silently degrades the
         # SW branch's contribution for fp16 inputs.
         C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
-        # Left-pad the key dimension with (win-1) zero columns. After padding,
-        # padded position ``p`` maps to original position ``p - (win-1)``.
-        # The window for query ``t`` is padded positions ``[t, t+win-1]``,
-        # which map to original positions ``[t-win+1, t]`` — exactly the
-        # causal window we want. For ``t < win-1`` the first ``win-1-t``
-        # entries of the window are zero-padding (we mask them below).
-        C_padded = F.pad(C_local, (0, 0, win - 1, 0))            # [B, T+win-1, c]
-        # unfold(dim=1, size=win, step=1) extracts T overlapping windows of
-        # length win along the sequence axis. Result shape is
-        # ``[B, T, c, win]``; permute to ``[B, T, win, c]`` for the einsum.
-        C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
-        # Validity mask: window slot j for query t is a real (non-padding)
-        # position iff the original position ``t - win + 1 + j >= 0``,
-        # i.e. ``j >= win - 1 - t``. For t >= win-1 every slot is valid.
-        # Shape ``[T, win]``, True = real position, False = zero-padding.
-        _j = torch.arange(win, device=device)
-        _t = torch.arange(T, device=device)
-        valid_mask = _j[None, :] >= (win - 1 - _t[:, None])      # [T, win]
-        # NOTE: every query t always has itself in the window (slot j=win-1
-        # maps to original position t, which is always valid), so no row is
-        # fully -inf and softmax is NaN-free.
-        scores = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows) * scale
-        scores = scores.masked_fill(~valid_mask[None, :, None, :], float('-inf'))
-        p = torch.softmax(scores, dim=-1)                        # [B, T, nh, win]
-        sw_out = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
+        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to

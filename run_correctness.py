@@ -62,6 +62,19 @@ def _ok(name: str, cond: bool, detail: str = '') -> dict:
     return {'name': name, 'status': status, 'detail': detail}
 
 
+def _none_or_norm(g):
+    """Return ``'None'`` if ``g is None`` else the L1 norm as a float.
+
+    Used by ``test_csa_indexer_ste_gradient`` to render the per-parameter
+    gradient in a compact form for the failure detail message. Returning
+    the L1 norm (instead of the full tensor) keeps log lines short even
+    when the test runs at large ``c`` / ``c_I``.
+    """
+    if g is None:
+        return 'None'
+    return float(g.abs().sum().item())
+
+
 def test_kda_chunk_vs_recurrent(device='cpu'):
     logger.info("Test: KDA chunk vs recurrent agreement")
     torch.manual_seed(0)
@@ -982,10 +995,22 @@ def test_csa_indexer_ste_gradient(device='cpu'):
             and g.abs().sum().item() > 0
         )
 
-    # --- Part 3: without STE, indexer params get NO gradient ---
-    # This pins the old (buggy) behavior so a future "fix" that removes
-    # STE is forced to also update this test, rather than silently
+    # --- Part 3: without STE, indexer params get NO useful gradient ---
+    # This pins the substantive old (buggy) behavior so a future "fix" that
+    # removes STE is forced to also update this test, rather than silently
     # reverting to the untrained-indexer regime.
+    #
+    # Issue 2.3 fix note: the F.linear fusion in ``naive_csa`` merges
+    # ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`` into a single matmul.
+    # Under ``use_ste=False`` the indexer's top-k selection still doesn't
+    # propagate gradient, but ``W_KV_idx`` and ``W_Z_idx`` now receive a
+    # ZERO (but non-None) grad because autograd flows backward through the
+    # merged matmul into all 6 weight slices. The substantive contract —
+    # "indexer params don't learn without STE" — is preserved: a zero grad
+    # means the optimizer step is a no-op. We therefore check for "no
+    # useful gradient" (None OR all-zero) instead of requiring None
+    # specifically. ``W_IUQ``, ``W_w`` and ``B_idx`` are NOT in the merged
+    # matmul, so they still receive ``None`` grad under ``use_ste=False``.
     #
     # We must make a NON-indexer parameter (W_aKV) require grad too,
     # otherwise the output has no grad_fn at all (under use_ste=False
@@ -993,8 +1018,8 @@ def test_csa_indexer_ste_gradient(device='cpu'):
     # so if W_aKV also doesn't require grad, ``backward()`` raises
     # "element 0 of tensors does not require grad"). With W_aKV
     # requiring grad, the output has a grad_fn, backward() succeeds,
-    # and we can assert the indexer params STILL get None grad (the
-    # bug we're pinning).
+    # and we can assert the indexer params STILL get no useful grad
+    # (the bug we're pinning).
     p_noste = _make_params()
     for name in indexer_param_names:
         p_noste[name] = p_noste[name].clone().requires_grad_(True)
@@ -1004,12 +1029,21 @@ def test_csa_indexer_ste_gradient(device='cpu'):
     p_noste['W_aKV'] = p_noste['W_aKV'].clone().requires_grad_(True)
     o_noste = naive_csa(H, **p_noste, use_ste=False, **common)
     o_noste.sum().backward()
-    # Under use_ste=False, the indexer params get NO gradient (the
-    # bug). W_aKV (non-indexer) DOES get a gradient, confirming the
-    # backward pass actually ran.
-    noste_grads_none = all(p_noste[name].grad is None
-                           for name in indexer_param_names)
-    noste_wakv_has_grad = p_noste['W_aKV'].grad is not None
+    # Under use_ste=False, the indexer params get NO useful gradient
+    # (None for W_IUQ/W_w/B_idx which aren't in the merged matmul;
+    # all-zero for W_KV_idx/W_Z_idx which ARE in the merged matmul and
+    # therefore receive a zero slice of the merged weight's grad).
+    # Either way, the optimizer step is a no-op — the indexer doesn't
+    # learn without STE. W_aKV (non-indexer) DOES get a non-trivial
+    # gradient, confirming the backward pass actually ran.
+    def _no_useful_grad(g):
+        if g is None:
+            return True
+        return bool(g.abs().sum().item() == 0)
+    noste_grads_useless = all(_no_useful_grad(p_noste[name].grad)
+                              for name in indexer_param_names)
+    noste_wakv_has_grad = (p_noste['W_aKV'].grad is not None
+                            and p_noste['W_aKV'].grad.abs().sum().item() > 0)
 
     return [
         _ok('STE forward == no-STE forward (bit-identical)',
@@ -1025,12 +1059,12 @@ def test_csa_indexer_ste_gradient(device='cpu'):
             grad_results['W_Z_idx'], f'grad={p["W_Z_idx"].grad}'),
         _ok('STE: B_idx receives finite non-zero gradient',
             grad_results['B_idx'], f'grad={p["B_idx"].grad}'),
-        _ok('no-STE: indexer params get None grad (pins old behavior)',
-            noste_grads_none,
-            f'grads={[p_noste[n].grad for n in indexer_param_names]}'),
-        _ok('no-STE: W_aKV (non-indexer) DOES get grad (backward ran)',
+        _ok('no-STE: indexer params get no useful grad (None or all-zero; pins old behavior)',
+            noste_grads_useless,
+            f'grads={[(_none_or_norm(p_noste[n].grad)) for n in indexer_param_names]}'),
+        _ok('no-STE: W_aKV (non-indexer) DOES get non-trivial grad (backward ran)',
             noste_wakv_has_grad,
-            f'W_aKV.grad={p_noste["W_aKV"].grad}'),
+            f'W_aKV.grad_norm={(_none_or_norm(p_noste["W_aKV"].grad))}'),
     ]
 
 

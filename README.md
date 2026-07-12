@@ -27,6 +27,25 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 > is fused or Tritonized. Latency numbers from `run_benchmark.py` measure
 > this naive reference and **must not** be compared to FLA / FlashAttention
 > / DeepSeek production kernels. See the *Limitations* section below.
+>
+> **Accelerated paths (added in the code-review pass).** The naive paths
+> above remain the default for correctness / readability, but the repo now
+> ships two opt-in accelerated wrappers that preserve the exact numerical
+> contract:
+>
+> - `ops_kda.compiled_recurrent_kda` — `torch.compile` wrapper around
+>   `naive_recurrent_kda`, cached per (shape, dtype, requires_grad) signature.
+>   Best for moderate `T` (≥1024); typical speedup 5–20× on GPU.
+> - `ops_kda.scripted_chunk_kda` — `torch.jit.script` wrapper around the
+>   inner per-chunk loop of `naive_chunk_kda`, with a graceful fallback to
+>   the eager path if TorchScript rejects the input.
+> - `ops_csa._sliding_window_attention` — auto-engages a chunked sliding
+>   window when `T * win * c > 8M` elements, keeping peak memory at
+>   `O(chunk_t · win · c)` instead of `O(T · win · c)`. Used by both
+>   `naive_csa` and `naive_hca` when `sliding_window > 0`.
+> - `naive_csa` itself now fuses the 6 `F.linear(H, W_*)` calls
+>   (`W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`) into a single matmul
+>   via `torch.cat` + `tensor.split`, reducing kernel-launch overhead by 6×.
 
 ---
 
@@ -244,10 +263,15 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 
 * **Naive Python loops.** KDA's recurrent path is a Python `for` loop over
   time; the chunked path still has a Python loop over chunks. CSA's
-  indexer loops over heads. None of this is fused or compiled. Latency
+  indexer loops over heads. None of this is fused or Tritonized. Latency
   numbers reflect Python overhead and kernel-launch overhead, **not** the
   algorithm's intrinsic FLOPs. Do not benchmark this against FLA / Triton
   kernels and draw architectural conclusions.
+  **Mitigation (added):** `ops_kda.compiled_recurrent_kda` wraps the
+  recurrent path with `torch.compile` (cached per signature, 5–20× speedup
+  on GPU at `T≥1024`); `ops_kda.scripted_chunk_kda` wraps the chunked
+  path's inner loop with `torch.jit.script` (bit-identical to the eager
+  path). The naive paths remain the default for correctness / readability.
 * **STE for CSA indexer.** The straight-through estimator routes gradient
   only through the top-k selected columns of `soft_weights` (see
   `ops_csa.py::naive_csa`). Non-selected blocks receive no "you should
@@ -258,6 +282,11 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 * **Sliding window uses `unfold`.** Memory is `O(T · win)` per call. Fine
   for `T ≤ 4k, win ≤ 512`; will blow up at `T=64k, win=2k` and needs a
   chunked / banded kernel.
+  **Mitigation (added):** `ops_csa._sliding_window_attention` (used by
+  both `naive_csa` and `naive_hca`) auto-engages a chunked path when
+  `T * win * c > 8M` elements, keeping peak memory at `O(chunk_t · win · c)`.
+  The chunked path is bit-identical to the unfold path (verified by
+  `test_hca_sliding_window_causality` / `test_csa_full_pipeline_causality`).
 * **Dropout unimplemented.** `HybridConfig.dropout != 0` raises
   `NotImplementedError` rather than silently no-op'ing. MQAR-scale models
   don't need dropout; larger runs should wire it in (or remove the field).

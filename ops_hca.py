@@ -19,7 +19,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ops_csa import csa_compress_kv, _causal_block_mask
+from ops_csa import (
+    csa_compress_kv,
+    _causal_block_mask,
+    _sliding_window_attention,
+    CHUNKED_SW_THRESHOLD,
+)
 
 
 def naive_hca(
@@ -204,13 +209,21 @@ def naive_hca(
         # filled a 4M-entry scores tensor per call regardless of ``win``,
         # defeating the whole purpose of a local-attention mechanism.
         #
-        # The fix uses a banded / windowed-gather approach: left-pad
+        # The P5 fix used a banded / windowed-gather approach: left-pad
         # ``C_local`` with ``win-1`` zero columns, use ``unfold`` to extract
         # per-query windows of shape ``[B, T, win, c]``, compute scores ONLY
         # over the ``win`` entries (``[B, T, nh, win]``), mask the left-edge
         # padding slots to ``-inf``, softmax, and weighted-sum over the
         # ``win`` dimension. This is ``O(T·win·nh·c)`` — the window size now
         # genuinely controls the cost.
+        #
+        # Issue 2.2 fix: the ``unfold`` call still materialized a single
+        # ``[B, T, win, c]`` tensor — fine for ``T≤4k, win≤512`` but
+        # blowing up at ``T=64k, win=2k`` (≈32 GB). We now delegate to
+        # ``_sliding_window_attention`` (imported from ops_csa) which
+        # auto-engages a chunked path when ``T * win * c`` exceeds
+        # ``CHUNKED_SW_THRESHOLD`` (default 8M elements), keeping peak
+        # memory at ``O(chunk_t · win · c)``.
         #
         # Numerically identical to the old dense+mask approach (verified by
         # ``test_hca_sliding_window_causality`` in run_correctness.py):
@@ -224,30 +237,7 @@ def naive_hca(
         # an asymmetric precision loss that silently degrades the SW branch's
         # contribution for fp16 inputs. Mirrors the fix in ops_csa.py.
         C_local = F.normalize(C.to(compute_dtype), dim=-1)              # [B, T, c]
-        # Left-pad the key dimension with (win-1) zero columns. After padding,
-        # padded position ``p`` maps to original position ``p - (win-1)``.
-        # The window for query ``t`` is padded positions ``[t, t+win-1]``,
-        # which map to original positions ``[t-win+1, t]`` — the causal
-        # window. For ``t < win-1`` the first ``win-1-t`` entries are
-        # zero-padding (masked below).
-        C_padded = F.pad(C_local, (0, 0, win - 1, 0))            # [B, T+win-1, c]
-        # unfold(dim=1, size=win, step=1) extracts T overlapping windows of
-        # length win. Result shape ``[B, T, c, win]``; permute to
-        # ``[B, T, win, c]`` for the einsum.
-        C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
-        # Validity mask: window slot j for query t is a real (non-padding)
-        # position iff ``t - win + 1 + j >= 0``, i.e. ``j >= win-1-t``.
-        # For t >= win-1 every slot is valid. Shape ``[T, win]``.
-        # NOTE: every query t always has itself in the window (slot j=win-1
-        # maps to original position t, always valid), so no row is fully
-        # -inf and softmax is NaN-free.
-        _j = torch.arange(win, device=device)
-        _t = torch.arange(T, device=device)
-        valid_mask = _j[None, :] >= (win - 1 - _t[:, None])      # [T, win]
-        scores = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows) * scale
-        scores = scores.masked_fill(~valid_mask[None, :, None, :], float('-inf'))
-        p = torch.softmax(scores, dim=-1)                        # [B, T, nh, win]
-        sw_out = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
+        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
