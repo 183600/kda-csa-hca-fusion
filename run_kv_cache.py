@@ -314,25 +314,33 @@ def prefill_flops(op: str, T: int, **kw):
         # Core sparse attention: QK^T (c term) + softmax·V (c term).
         # ``csa_lightning_indexer`` clamps topk to ``min(topk, n_blocks)``
         # AND masks non-causal blocks to -inf before top-k, so the EFFECTIVE
-        # per-query topk is ``min(csa_topk, floor(t / csa_m))``. Average
-        # effective topk over all queries is roughly
-        # ``min(csa_topk, n_blocks / 2)`` (causal triangular). The previous
-        # formula used ``csa_topk`` directly, overcounting by up to 16x at
-        # short T (e.g. T=512 -> n_blocks=32 -> effective topk=16, but
-        # csa_topk=512 in the default config -> 32x overcount). Use the
-        # clamped value; for very long T (n_blocks >> csa_topk) this
-        # converges to the original formula.
+        # per-query topk is ``min(csa_topk, floor(t / csa_m))``. The AVERAGE
+        # effective topk over all queries is therefore
+        # ``sum_{t=0}^{T-1} min(csa_topk, t // csa_m) / T``.
         #
-        # Head count: the CSA core attention uses ``csa_nh`` heads (NOT ``H``
-        # — the GQA head count). The ``q`` tensor is shaped
-        # ``[B, T, csa_nh, c]`` (see ops_csa.py::naive_csa line 337), and the
-        # QK^T / softmax·V einsums both iterate over the ``csa_nh`` axis.
-        # The previous formula used ``H`` here, which happened to be correct
-        # only because the default config sets ``csa_nh == H == 8``. A user
-        # who overrides ``csa_nh`` (e.g. to ablate head count) would get a
-        # silently wrong FLOPs number. Use ``csa_nh`` so the formula matches
-        # the actual operator.
-        effective_topk = min(csa_topk, max(1, n_blocks // 2)) if n_blocks > 0 else 0
+        # P0-4 fix (precise): the previous ``min(csa_topk, max(1, n_blocks // 2))``
+        # was a rough approximation that erred at short T. For example, at
+        # T = m = 16 (n_blocks = 1), every query has ZERO strictly-preceding
+        # blocks, so the true average effective topk is 0 — but the old
+        # formula returned ``min(topk, max(1, 0)) = min(topk, 1) = 1``,
+        # overcounting the core FLOPs by T*1*c*nh*4 = 16*1*16*8*4 = 8192
+        # FLOPs that don't actually happen. The precise closed form is:
+        #   Let k_cap = min(csa_topk, nb_raw).
+        #   total_sel = m * k_cap*(k_cap-1)/2       (k in [0, k_cap): each block contributes k*m)
+        #             + k_cap * m * (nb_raw - k_cap) (k in [k_cap, nb_raw): each contributes k_cap*m)
+        #             + k_cap * r_rem                (partial block: min(topk, nb_raw)*r_rem)
+        #   effective_topk = total_sel / T
+        # This is exact (no approximation) and O(1) (no Python loop).
+        if T > 0 and n_blocks > 0:
+            nb_raw = T // csa_m
+            r_rem = T - nb_raw * csa_m
+            k_cap = min(csa_topk, nb_raw)
+            total_sel = (csa_m * k_cap * (k_cap - 1) // 2
+                         + k_cap * csa_m * (nb_raw - k_cap)
+                         + k_cap * r_rem)
+            effective_topk = total_sel / T
+        else:
+            effective_topk = 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
@@ -513,6 +521,12 @@ def main():
         write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
                           indent=2, default=str)
     print('\nSaved: results/exp3_kv_cache.json')
+    # P0-2 fix: explicit return for consistency with the other runners
+    # (run_benchmark / run_quality / run_ablation / run_decoding). This
+    # experiment is pure arithmetic and does not have error rows, so it
+    # always returns 0 (success); the explicit return makes the contract
+    # visible to ``run_all._run``.
+    return 0
 
 
 if __name__ == '__main__':

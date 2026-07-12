@@ -45,8 +45,14 @@ from ops_fused import HybridKCHAttention, HybridConfig
 logger = logging.getLogger(__name__)
 
 
-def _rand(*shape, scale=0.1, device=None, dtype=None):
-    t = torch.randn(*shape, device=device, dtype=dtype)
+def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
+    # P0 determinism fix: accept an optional ``generator`` so callers can
+    # seed the input construction. Without a generator, two runs of
+    # ``BENCH_REPEATS=5`` at the same T could produce medians that differ by
+    # a few percent purely from input noise — making the cross-run comparison
+    # unreliable. The bench factories below pass a seeded ``torch.Generator``
+    # keyed on (op, T) so the same T always sees the same inputs across runs.
+    t = torch.randn(*shape, device=device, dtype=dtype, generator=generator)
     return t * scale
 
 
@@ -141,9 +147,16 @@ def _measure(fn, repeats, device):
 
 
 def bench_softmax_attn(B, T, H, K, V, device):
-    q = _rand(B, T, H, K, device=device)
-    k = _rand(B, T, H, K, device=device)
-    v = _rand(B, T, H, V, device=device)
+    # P0 determinism fix: seed the input generator so the same (op, T) pair
+    # produces the same inputs across runs. Previously the unseeded
+    # ``torch.randn`` made the median latency drift by a few percent between
+    # runs, obscuring real regressions. The seed is deterministic (hash of
+    # op name + T) so it is reproducible without needing an env var.
+    gen = torch.Generator(device=device).manual_seed(
+        (hash('softmax') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    q = _rand(B, T, H, K, device=device, generator=gen)
+    k = _rand(B, T, H, K, device=device, generator=gen)
+    v = _rand(B, T, H, V, device=device, generator=gen)
     scale = K ** -0.5
     # Precompute the causal mask OUTSIDE the timed region so the benchmark
     # measures attention compute, not mask allocation. A production
@@ -167,11 +180,14 @@ def bench_softmax_attn(B, T, H, K, V, device):
 
 
 def bench_kda_recurrent(B, T, H, K, V, device):
-    q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device), dim=-1)
-    k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device), dim=-1)
-    v = _rand(B, T, H, V, device=device)
-    g = -torch.rand(B, T, H, K, device=device) * 0.05
-    beta = torch.rand(B, T, H, device=device) * 0.2
+    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
+    gen = torch.Generator(device=device).manual_seed(
+        (hash('kda_rec') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
+    k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
+    v = _rand(B, T, H, V, device=device, generator=gen)
+    g = -torch.rand(B, T, H, K, device=device, generator=gen) * 0.05
+    beta = torch.rand(B, T, H, device=device, generator=gen) * 0.2
 
     def fn():
         with torch.no_grad():
@@ -180,11 +196,14 @@ def bench_kda_recurrent(B, T, H, K, V, device):
 
 
 def bench_kda_chunk(B, T, H, K, V, device):
-    q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device), dim=-1)
-    k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device), dim=-1)
-    v = _rand(B, T, H, V, device=device)
-    g = -torch.rand(B, T, H, K, device=device) * 0.05
-    beta = torch.rand(B, T, H, device=device) * 0.2
+    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
+    gen = torch.Generator(device=device).manual_seed(
+        (hash('kda_chunk') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
+    k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
+    v = _rand(B, T, H, V, device=device, generator=gen)
+    g = -torch.rand(B, T, H, K, device=device, generator=gen) * 0.05
+    beta = torch.rand(B, T, H, device=device, generator=gen) * 0.2
     BT = 64
     # NOTE: ``naive_chunk_kda`` already right-pads T up to a multiple of
     # ``chunk_size`` internally and returns ``o[:, :original_T]``. The previous
@@ -221,19 +240,22 @@ def bench_kda_chunk(B, T, H, K, V, device):
 def bench_csa(B, T, d, device):
     m, topk = 8, 4
     nh, c, dc, nIh, cI = 4, 16, 32, 2, 8
-    H = _rand(B, T, d, device=device)
+    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
+    gen = torch.Generator(device=device).manual_seed(
+        (hash('csa') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
         sliding_window=8, sink_logits=torch.zeros(nh, device=device),
     )
     weights = dict(
-        W_aKV=_rand(c, d, device=device), W_bKV=_rand(c, d, device=device),
-        W_aZ=_rand(c, d, device=device), W_bZ=_rand(c, d, device=device),
-        Ba=_rand(m, c, device=device), Bb=_rand(m, c, device=device),
-        W_DQ=_rand(dc, d, device=device), W_UQ=_rand(c * nh, dc, device=device),
-        W_IUQ=_rand(cI * nIh, dc, device=device), W_w=_rand(nIh, d, device=device),
-        W_KV_idx=_rand(cI, d, device=device), W_Z_idx=_rand(cI, d, device=device),
-        B_idx=_rand(m, cI, device=device),
+        W_aKV=_rand(c, d, device=device, generator=gen), W_bKV=_rand(c, d, device=device, generator=gen),
+        W_aZ=_rand(c, d, device=device, generator=gen), W_bZ=_rand(c, d, device=device, generator=gen),
+        Ba=_rand(m, c, device=device, generator=gen), Bb=_rand(m, c, device=device, generator=gen),
+        W_DQ=_rand(dc, d, device=device, generator=gen), W_UQ=_rand(c * nh, dc, device=device, generator=gen),
+        W_IUQ=_rand(cI * nIh, dc, device=device, generator=gen), W_w=_rand(nIh, d, device=device, generator=gen),
+        W_KV_idx=_rand(cI, d, device=device, generator=gen), W_Z_idx=_rand(cI, d, device=device, generator=gen),
+        B_idx=_rand(m, cI, device=device, generator=gen),
     )
 
     def fn():
@@ -244,15 +266,18 @@ def bench_csa(B, T, d, device):
 
 def bench_hca(B, T, d, device):
     m2, nh, c, dc = 16, 4, 16, 32
-    H = _rand(B, T, d, device=device)
+    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
+    gen = torch.Generator(device=device).manual_seed(
+        (hash('hca') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
         m2=m2, nh=nh, c=c, dc=dc,
         sliding_window=8, sink_logits=torch.zeros(nh, device=device),
     )
     weights = dict(
-        W_KV=_rand(c, d, device=device), W_Z=_rand(c, d, device=device),
-        B_pos=_rand(m2, c, device=device),
-        W_DQ=_rand(dc, d, device=device), W_UQ=_rand(c * nh, dc, device=device),
+        W_KV=_rand(c, d, device=device, generator=gen), W_Z=_rand(c, d, device=device, generator=gen),
+        B_pos=_rand(m2, c, device=device, generator=gen),
+        W_DQ=_rand(dc, d, device=device, generator=gen), W_UQ=_rand(c * nh, dc, device=device, generator=gen),
     )
 
     def fn():
@@ -262,6 +287,9 @@ def bench_hca(B, T, d, device):
 
 
 def bench_hybrid(B, T, d, device):
+    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
+    gen = torch.Generator(device=device).manual_seed(
+        (hash('hybrid') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
     cfg = HybridConfig(
         d_model=d, n_heads_qk=2, n_heads_v=2,
         head_dim_k=16, head_dim_v=16,
@@ -271,7 +299,7 @@ def bench_hybrid(B, T, d, device):
         n_kda=3, n_csa=1, n_hca=1,
     )
     model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
-    x = _rand(B, T, d, device=device)
+    x = _rand(B, T, d, device=device, generator=gen)
     # Reset KDA recurrent state before each fn() call so that warmup and
     # timed repeats start from the same fresh state. Without this, the KDA
     # state grows across repeats — for latency this is O(1) per layer so
@@ -446,6 +474,20 @@ def main():
                           'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp2_benchmark.json')
+    # P0-2 fix: return non-zero if any (T, op) cell errored out, so
+    # ``run_all._run`` records the experiment as ``status='fail'`` instead of
+    # silently treating a partial run as success. The previous ``main()``
+    # implicitly returned ``None`` even when every op at every T crashed,
+    # which combined with ``run_all._run``'s ``None == success`` contract
+    # produced a green summary on a fully-red experiment. Returning 1 forces
+    # the failure to propagate to ``run_all``'s summary and exit code.
+    n_errors = sum(1 for r in results if 'error' in r)
+    if n_errors:
+        logger.error(
+            f'\n[P0-2] {n_errors}/{len(results)} (T, op) cells errored out. '
+            f'Returning non-zero so run_all records this experiment as failed.')
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

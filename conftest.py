@@ -134,20 +134,63 @@ def pytest_collection_modifyitems(config, items):
 # be silently marked as PASS by pytest — a "false green" that hides real
 # regressions when contributors run ``pytest -q run_correctness.py``.
 #
-# This hook runs after each test function returns. If the return value is a
-# list of dicts containing a ``status`` field, we scan for any non-PASS
-# entries and convert them into an ``AssertionError`` so pytest reports the
-# test as failed (with a useful message listing every failed sub-check).
+# The previous implementation used a ``pytest_runtest_call`` hookwrapper and
+# read ``outcome.get_result()``. That DOES NOT WORK: for ``pytest_runtest_call``
+# the outcome's result is the return value of ``item.runtest()``, which is
+# always ``None`` (the test function's return value is discarded by pytest's
+# default ``pytest_pyfunc_call`` implementation BEFORE ``runtest`` returns).
+# Verified: a test returning ``[{'status': 'FAIL'}]`` was still reported as
+# ``1 passed`` with only a ``PytestReturnNotNoneWarning``.
 #
-# The custom ``main()`` runner is unaffected because it reads the same list
-# directly. Both protocols now agree: a FAIL in any ``_ok`` is a test failure
-# in both the JSON report AND pytest's exit code.
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_call(item):
-    outcome = yield
-    res = outcome.get_result()
-    # Only inspect list-of-dict returns (the ``_ok`` pattern). Anything else
-    # (None, scalar, etc.) is left to pytest's default behaviour.
+# The fix: replace the default ``pytest_pyfunc_call`` implementation with our
+# own that (a) calls the test function, (b) captures the return value, (c)
+# inspects it for the ``_ok`` list-of-dict pattern, and (d) raises
+# ``AssertionError`` if any sub-check has ``status != 'PASS'``. The
+# ``tryfirst=True`` ensures our hook runs before pytest's default
+# implementation, and returning ``True`` stops the default from running.
+# Returning ``None`` (for async / generator tests we do not handle) lets the
+# default implementation run as usual.
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """Capture test function return values and convert list-of-dict FAIL
+    entries into real AssertionError failures.
+
+    Replaces the broken ``pytest_runtest_call`` hookwrapper (which could not
+    see the test function's return value because ``outcome.get_result()``
+    returns ``None`` for non-raising tests).
+
+    Only handles plain synchronous functions. Async tests, generator tests,
+    and any other exotic test types fall through to pytest's default
+    implementation (return ``None`` to yield to the next hook).
+    """
+    import inspect as _inspect
+    testfunction = pyfuncitem.obj
+    # Let the default impl handle async / generator test functions — replacing
+    # them would require duplicating pytest's async-runner logic, which is
+    # fragile and outside the scope of this fix.
+    if _inspect.iscoroutinefunction(testfunction) or \
+       _inspect.isasyncgenfunction(testfunction) or \
+       _inspect.isgeneratorfunction(testfunction):
+        return None  # fall through to default impl
+    funcargs = pyfuncitem.funcargs
+    # Filter funcargs to only the parameters the test function actually
+    # accepts, so we don't pass unexpected kwargs (which would raise
+    # TypeError). Mirrors how pytest's default impl resolves arguments via
+    # ``pyfuncitem._fixtureinfo.argnames`` but uses the public
+    # ``inspect.signature`` API instead of the private ``_fixtureinfo``.
+    try:
+        sig = _inspect.signature(testfunction)
+        accepted = set(sig.parameters.keys())
+        testargs = {k: v for k, v in funcargs.items() if k in accepted}
+    except (ValueError, TypeError):
+        # Builtins or C-implemented functions may not have a signature;
+        # fall back to passing all funcargs (the default impl's behaviour).
+        testargs = dict(funcargs)
+    res = testfunction(**testargs)
+    # Inspect the return value (the ``_ok`` pattern from run_correctness.py).
+    # Only list-of-dict-with-'status' returns are interpreted; everything
+    # else (None, scalar, etc.) is left to pytest's default behaviour (which
+    # is to issue a ``PytestReturnNotNoneWarning`` for non-None returns).
     if isinstance(res, list) and res and all(
             isinstance(r, dict) and 'status' in r for r in res):
         failures = [r for r in res if r.get('status') != 'PASS']
@@ -156,4 +199,5 @@ def pytest_runtest_call(item):
                 f"  - [{r.get('status','?')}] {r.get('name','?')}: "
                 f"{r.get('detail','')}" for r in failures)
             raise AssertionError(
-                f"{len(failures)} check(s) failed in {item.name}:\n{msgs}")
+                f"{len(failures)} check(s) failed in {pyfuncitem.name}:\n{msgs}")
+    return True  # stop the default impl from running

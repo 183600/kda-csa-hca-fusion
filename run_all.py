@@ -184,6 +184,20 @@ def run_all(seeds=None, steps=None):
 
     ``seeds`` and ``steps`` override the environment variables if given.
     """
+    # P1 env-leak fix: save the env vars we are about to override so they can
+    # be restored in the ``finally`` block below. The previous code mutated
+    # ``MQAR_SEEDS`` / ``ABL_SEEDS`` / ``MQAR_STEPS`` / ``ABL_STEPS`` /
+    # ``MQAR_SOFTMAX_STEPS`` permanently — a notebook calling
+    # ``run_all(seeds=5)`` would leave ``MQAR_SEEDS=5`` set for the rest of
+    # the session, silently affecting any subsequent experiment run. We now
+    # snapshot the original values and restore them on exit (including on
+    # exception), making ``run_all()`` behave as a well-behaved library
+    # function rather than a process mutator. Mirrors the CWD-restore pattern
+    # already in place.
+    _env_keys = ('MQAR_SEEDS', 'ABL_SEEDS', 'MQAR_STEPS', 'ABL_STEPS',
+                 'MQAR_SOFTMAX_STEPS', 'BENCH_LENGTHS', 'RESULTS_DIR',
+                 'FIGURES_DIR', 'SKIP_SLOW')
+    _orig_env = {k: os.environ.get(k) for k in _env_keys}
     if seeds is not None:
         os.environ['MQAR_SEEDS'] = str(seeds)
         os.environ['ABL_SEEDS'] = str(seeds)
@@ -383,6 +397,15 @@ def run_all(seeds=None, steps=None):
         # This runs on both clean exit and exception, so a notebook
         # caller never finds itself unexpectedly in /kaggle/working.
         os.chdir(_orig_cwd)
+        # P1 env-leak fix: restore the env vars we overrode so a notebook
+        # caller does not find ``MQAR_SEEDS=5`` etc. permanently set after
+        # run_all() returns. Matches the CWD-restore contract: run_all() is
+        # a library function, not a process mutator.
+        for _k, _v in _orig_env.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
 
 
 if __name__ == '__main__':

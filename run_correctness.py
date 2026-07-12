@@ -3666,7 +3666,20 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
                           + 2 * cbe_correct * csa_nIh
         indexer_broken = 2 * cbe_broken * csa_cI * csa_nIh \
                          + 2 * cbe_broken * csa_nIh
-        effective_topk = min(csa_topk, max(1, n_blocks // 2)) if n_blocks > 0 else 0
+        # P0-4 fix (precise effective_topk): mirror the corrected formula in
+        # ``run_kv_cache.prefill_flops``. The previous test used the old
+        # approximate ``min(csa_topk, max(1, n_blocks // 2))`` which is what
+        # the production code used BEFORE the P0-4 fix; now that the
+        # production code uses the precise closed form
+        # ``sum_{t=0}^{T-1} min(topk, t // m) / T``, this test must match.
+        if T > 0 and n_blocks > 0:
+            k_cap = min(csa_topk, nb_raw)
+            total_sel = (csa_m * k_cap * (k_cap - 1) // 2
+                         + k_cap * csa_m * (nb_raw - k_cap)
+                         + k_cap * r_rem)
+            effective_topk = total_sel / T
+        else:
+            effective_topk = 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2

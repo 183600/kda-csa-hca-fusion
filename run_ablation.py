@@ -537,7 +537,7 @@ def main():
             try:
                 res = eval_layout_multi_seed(r, n_seeds=n_seeds, steps=steps,
                                              device=device, n_kv=n_kv)
-                # Bonferroni significance flag: |t_stat| exceeds the corrected
+                # Bonferroni significance flag: t_stat exceeds the corrected
                 # critical value for this n. Stored alongside the raw t_stat so
                 # downstream consumers can show both the uncorrected and the
                 # corrected interpretation.
@@ -547,15 +547,28 @@ def main():
                     crit = _bonferroni_crit(n_ok)
                     res['t_crit_bonferroni'] = crit
                     # ``crit`` is None when scipy is unavailable (see
-                    # ``_bonferroni_crit``). ``abs(t_stat) > None`` raises
+                    # ``_bonferroni_crit``). ``t_stat > None`` raises
                     # ``TypeError: '>' not supported between instances of
                     # 'float' and 'NoneType'`` in Python 3, so guard the
                     # comparison: when the critical value cannot be
                     # computed we conservatively report ``False`` (not
                     # significant), matching the previous ``inf``-based
                     # behaviour without the JSON-serialization crash.
+                    #
+                    # P0-3 fix: use a ONE-SIDED test (``t_stat > crit``) instead
+                    # of ``abs(t_stat) > crit``. The research question is "does
+                    # this layout learn the task ABOVE chance", which is
+                    # directional. The previous two-sided test flagged a layout
+                    # as "significant" even when its accuracy was significantly
+                    # BELOW chance (large negative t_stat), which is the
+                    # opposite of what "this layout works" means. A
+                    # below-chance result indicates the model is systematically
+                    # wrong, NOT that the layout "works". The Bonferroni-corrected
+                    # critical value ``_bonferroni_crit`` is already the
+                    # upper-tail quantile, so the one-sided comparison is the
+                    # correct use of that quantile.
                     res['significant_bonferroni'] = (
-                        crit is not None and abs(t_stat) > crit
+                        crit is not None and t_stat > crit
                     )
                 else:
                     res['t_crit_bonferroni'] = None
@@ -714,6 +727,17 @@ def main():
                           'results/exp5_ablation.json',
                           indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp5_ablation.json')
+    # P0-2 fix: return non-zero if any layout's training crashed
+    # (``'error' in r``), so ``run_all._run`` records the experiment as
+    # ``status='fail'`` instead of silently treating a partial run as success.
+    # Mirrors the fix in run_quality.py::main and run_benchmark.py::main.
+    n_errors = sum(1 for r in all_results if 'error' in r)
+    if n_errors:
+        logger.error(
+            f'\n[P0-2] {n_errors}/{len(all_results)} layouts errored out. '
+            f'Returning non-zero so run_all records this experiment as failed.')
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

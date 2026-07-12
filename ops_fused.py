@@ -85,6 +85,35 @@ class HybridConfig:
     dropout: float = 0.0
 
     def __post_init__(self):
+        # P1-8 fix: validate dropout TYPE / finite / range BEFORE the
+        # ``NotImplementedError`` guard. The previous order (``if dropout != 0:
+        # raise NotImplementedError``) was the FIRST check, so a caller passing
+        # ``dropout=NaN``, ``dropout="abc"``, or ``dropout=-0.1`` all got the
+        # misleading ``NotImplementedError`` instead of a proper TypeError /
+        # ValueError pointing at the actual problem. Now we validate type and
+        # range first, and only raise ``NotImplementedError`` for values that
+        # ARE valid floats but non-zero (the "not yet wired in" case).
+        if not isinstance(self.dropout, (int, float)):
+            raise TypeError(
+                f"HybridConfig.dropout={self.dropout!r} must be a float, "
+                f"got {type(self.dropout).__name__}.")
+        # bool is a subclass of int; reject it explicitly so ``dropout=True``
+        # does not silently become ``dropout=1``.
+        if isinstance(self.dropout, bool):
+            raise TypeError(
+                f"HybridConfig.dropout={self.dropout!r} must be a float, "
+                f"got bool.")
+        import math as _math
+        if _math.isnan(self.dropout) or _math.isinf(self.dropout):
+            raise ValueError(
+                f"HybridConfig.dropout={self.dropout} must be finite "
+                f"(not NaN or Inf).")
+        if self.dropout < 0.0 or self.dropout > 1.0:
+            raise ValueError(
+                f"HybridConfig.dropout={self.dropout} must be in [0.0, 1.0].")
+        # Now the legitimate-but-unimplemented case: a valid float in [0,1]
+        # that is not 0.0. Raise NotImplementedError pointing at the missing
+        # implementation (NOT at the value itself, which is a valid config).
         if self.dropout != 0.0:
             raise NotImplementedError(
                 f"HybridConfig.dropout={self.dropout} is not yet implemented. "

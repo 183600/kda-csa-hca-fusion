@@ -150,15 +150,12 @@ def naive_recurrent_kda(
         A ``T > 8192`` performance warning is emitted via ``warnings``.
     """
     dtype = v.dtype
-    B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    # P1-7 fix: centralized shape/device/dtype contract validation. Run
-    # BEFORE the head-dim checks below so a rank-mismatch (e.g. ``q`` is
-    # 3D instead of 4D) is caught with a clear message instead of
-    # crashing on ``q.shape[3]`` with an IndexError. The head-dim checks
-    # below remain as a secondary validation layer (they catch
-    # GVA-divisibility and g/beta head-dim mismatches that the generic
-    # contract check cannot).
+    # P1-7 fix (revised): validate BEFORE unpacking q.shape so a rank-mismatch
+    # (e.g. ``q`` is 3D instead of 4D) is caught with a clear message instead
+    # of crashing on ``B, T, H, K, HV, V = *q.shape, ...`` with the cryptic
+    # ``ValueError: not enough values to unpack (expected 6, got 5)``.
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
+    B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear ValueError
     # instead of a bare ZeroDivisionError. Also validates non-negativity of
     # head dims so a malformed caller gets an informative message.
@@ -276,13 +273,26 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
-    o = torch.zeros_like(v)
+    # P0 autograd-safety fix: accumulate per-step outputs in a Python list and
+    # ``torch.stack`` at the end, instead of in-place ``o[:, i] = ...`` on a
+    # pre-allocated ``torch.zeros_like(v)`` buffer. The in-place form saves a
+    # CopySlices node on ``o`` for backward; when ``compute_dtype == dtype``
+    # (e.g. fp32 inputs) the final ``o.to(dtype)`` returns the SAME tensor, so
+    # that saved CopySlices is part of the autograd graph. Under
+    # ``torch.utils.checkpoint`` the forward is recomputed during backward, and
+    # the recompute re-runs the in-place writes — mutating a tensor that autograd
+    # already saved, raising ``RuntimeError: one of the variables needed for
+    # gradient computation has been modified by an inplace operation``. The
+    # out-of-place ``stack`` form has no such dependency. The cost (one extra
+    # list of T tensors) is negligible relative to the per-step einsum cost.
+    outs = []
     for i in range(0, T):
         q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
         S = S * g_i[..., None].exp()
         S = S + torch.einsum('b h k, b h v -> b h k v', b_i[..., None] * k_i,
                              v_i - (k_i[..., None] * S).sum(-2))
-        o[:, i] = torch.einsum('b h k, b h k v -> b h v', q_i, S)
+        outs.append(torch.einsum('b h k, b h k v -> b h v', q_i, S))
+    o = torch.stack(outs, dim=1)
     if not output_final_state:
         S = None
     else:
@@ -329,11 +339,11 @@ def naive_chunk_kda(
     passed back as ``initial_state``.
     """
     dtype = v.dtype
-    B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    # P1-7 fix: centralized shape/device/dtype contract validation (mirrors
-    # naive_recurrent_kda). Run BEFORE the head-dim / chunk_size checks so
-    # a rank-mismatch is caught with a clear message.
+    # P1-7 fix (revised): validate BEFORE unpacking q.shape (mirrors
+    # naive_recurrent_kda) so a rank-mismatch is caught with a clear message
+    # instead of the cryptic ``ValueError: not enough values to unpack``.
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_chunk_kda')
+    B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
     # ``T // BT`` so zero or negative values produce a clear AssertionError
     # instead of a bare ZeroDivisionError. Mirrors naive_recurrent_kda.
@@ -446,7 +456,21 @@ def naive_chunk_kda(
     for i in range(BT):
         k_i = k[..., i, :]
         g_i = g[..., i:i+1, :]
-        A[..., i] = torch.einsum('... c d, ... d -> ... c', k * (g - g_i).exp(), k_i)
+        # P0 numerical-stability fix: clamp the upper bound of ``g - g_i`` BEFORE
+        # ``exp``. ``g`` is the cumulative sum of per-step log-decays; for c < i
+        # (lower triangular) ``g_c - g_i`` is POSITIVE (it equals the negated
+        # cumulative decay from c+1 to i, and decay < 1 so its negation > 0).
+        # With ``g_clamp_min=-10`` and ``BT=64`` this difference can reach ~630,
+        # and ``exp(630) = inf`` in fp32 — which then propagates NaN through
+        # ``solve_triangular``. The subsequent ``A.masked_fill(mask, 0)`` only
+        # zeroes the UPPER triangular (c >= i); the overflowing LOWER triangular
+        # entries are KEPT, so the inf/NaN reaches the solver. Clamping the
+        # exponent to a safe upper bound (``exp(50) ~= 5e21``, finite in fp32)
+        # prevents the overflow without changing the math for reasonable g
+        # values (typical g in [-1, 0] gives differences well below 50). The
+        # mask at line 451 still zeroes the upper triangle as before.
+        g_diff = (g - g_i).clamp(max=50.0)
+        A[..., i] = torch.einsum('... c d, ... d -> ... c', k * g_diff.exp(), k_i)
     A = A * beta[..., None]
     A = -A.masked_fill(mask, 0)
     # Vectorized Neumann series. At this point ``A`` is strictly lower
@@ -479,8 +503,15 @@ def naive_chunk_kda(
         # in-place variant could mutate a tensor that participates in the
         # caller's autograd graph (e.g. BPTT across call boundaries).
         S = S + initial_state.to(device=S.device, dtype=compute_dtype)
-    o = torch.zeros_like(v)
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # P0 autograd-safety fix: accumulate per-chunk outputs in a list and
+    # ``torch.stack`` at the end instead of in-place ``o[:, :, i] = ...`` on a
+    # pre-allocated buffer. Mirrors the fix in ``naive_recurrent_kda``: the
+    # in-place form saves a CopySlices node on ``o`` for backward, and under
+    # ``torch.utils.checkpoint`` the recompute mutates the saved tensor,
+    # raising ``RuntimeError: one of the variables needed for gradient
+    # computation has been modified by an inplace operation``.
+    chunk_outs = []
     for i in range(0, NT):
         q_i = q[:, :, i]
         k_i = k[:, :, i]
@@ -491,7 +522,7 @@ def naive_chunk_kda(
         Aqk = (q_i.unsqueeze(-2) * diff.exp() * k_i.unsqueeze(-3)).sum(-1)
         Aqk = Aqk.masked_fill(mask, 0)
         v_i = u_i - w_i @ S
-        o[:, :, i] = (q_i * g_i.exp()) @ S + Aqk @ v_i
+        chunk_outs.append((q_i * g_i.exp()) @ S + Aqk @ v_i)
         S = S * rearrange(g_i[:, :, -1].exp(), 'b h k -> b h k 1')
         # Use out-of-place ``S = S + ...`` (not in-place ``S += ...``) so the
         # state-update step is safe under future gradient-checkpointing. The
@@ -500,6 +531,7 @@ def naive_chunk_kda(
         # anyone ever wraps this loop with checkpoint(). Mirrors the
         # out-of-place pattern in naive_recurrent_kda (line: S = S + einsum(...)).
         S = S + rearrange((g_i[:, :, -1:] - g_i).exp() * k_i, 'b h c k -> b h k c') @ v_i
+    o = torch.stack(chunk_outs, dim=2)
     if not output_final_state:
         S = None
     else:

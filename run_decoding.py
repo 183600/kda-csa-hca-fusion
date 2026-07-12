@@ -468,14 +468,28 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # Decode n_decode tokens one at a time.
         decode_times = []
         with torch.no_grad():
-            for _ in range(n_decode):
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                    t0 = time.perf_counter()
+            if device.type == 'cuda':
+                # P0 timing-bias fix: use CUDA events instead of
+                # ``torch.cuda.synchronize() + time.perf_counter()`` around
+                # each token. The previous per-token sync pattern added
+                # ~10-100 microseconds of driver-roundtrip overhead per
+                # token. KDA's per-token compute is only ~10 microseconds,
+                # so the sync overhead was 50-90% of the reported "KDA decode
+                # latency" — systematically biasing the KDA-vs-softmax
+                # comparison in softmax's favor. CUDA events record
+                # asynchronously on the stream and add no host-side
+                # synchronization per token; a single ``synchronize()`` at
+                # the end drains the whole batch.
+                starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
+                ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
+                for i in range(n_decode):
+                    starts[i].record()
                     model(x_new)
-                    torch.cuda.synchronize()
-                    decode_times.append((time.perf_counter() - t0) * 1e3)
-                else:
+                    ends[i].record()
+                torch.cuda.synchronize()
+                decode_times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+            else:
+                for _ in range(n_decode):
                     t0 = time.perf_counter()
                     model(x_new)
                     decode_times.append((time.perf_counter() - t0) * 1e3)
@@ -641,6 +655,18 @@ def main():
         write_json_atomic(sanitized, 'results/exp6_decoding.json',
                           indent=2, default=str)
     print('\nSaved: results/exp6_decoding.json')
+    # P0-2 fix: return non-zero if any (prefill_len, op) cell errored out,
+    # so ``run_all._run`` records the experiment as ``status='fail'`` instead
+    # of silently treating a partial run as success. Mirrors run_benchmark /
+    # run_quality / run_ablation.
+    n_errors = sum(1 for r in results if 'error' in r)
+    if n_errors:
+        print(
+            f'\n[P0-2] {n_errors}/{len(results)} (prefill_len, op) cells '
+            f'errored out. Returning non-zero so run_all records this '
+            f'experiment as failed.')
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

@@ -686,7 +686,31 @@ def naive_csa(
                 soft_kv = soft_kv + aux
 
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
-            kv = soft_kv + (kv - soft_kv).detach()
+            #
+            # P0-5 fix: the previous form ``kv = soft_kv + (kv - soft_kv).detach()``
+            # is forward-equivalent to ``kv`` (hard gather) but in backward the
+            # detach() ERASES the direct gradient from the hard gather path,
+            # leaving only ``soft_weights * d_out`` as the gradient to the
+            # selected ``C_comp_n`` entries — i.e. the selected KV receives a
+            # gradient shrunk by the soft probability (often < 1). The standard
+            # STE identity is the other way around:
+            #
+            #     kv_ste = hard_kv + (soft_surrogate - soft_surrogate.detach())
+            #
+            # Forward:  hard_kv + 0 = hard_kv                (hard gather value)
+            # Backward: d(hard_kv) + d(soft_surrogate)       (full hard grad
+            #           PLUS the differentiable soft path)
+            #
+            # so the hard gather's native gradient (which ``torch.gather``
+            # already routes to the selected source positions of ``C_comp_n``)
+            # is preserved, AND ``soft_weights`` receives a non-zero gradient
+            # that flows back to the indexer parameters. The extra
+            # ``soft_weights * d_out`` added to the hard path is the standard
+            # STE bias and is benign for training stability. This restores the
+            # contract documented in the ``ste_mode`` docstring: selected KV
+            # entries receive the SAME gradient they would under
+            # ``use_ste=False``, plus an indexer-learning signal.
+            kv = kv + (soft_kv - soft_kv.detach())
 
         # Per-head attention scores over the topk selected blocks.
         scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv) * scale  # [B, T, nh, topk]

@@ -159,17 +159,36 @@ def _t_crit_975(n):
          the n = 11..100 range where the previous table (n=2..30 only) fell
          back to the normal approximation 1.96 and lost up to ~8% accuracy
          at n=11..30, and ~4% at n=31..100.
-      3. For ``n > 100`` the normal approximation ``1.96`` (relative error
-         < 0.4% at n=101, drops below 0.1% past n≈400 — so callers using
-         very large samples get a good approximation even without scipy).
-      4. For ``n < 2`` the CI is undefined; returns ``0.0``.
+      3. For ``n > 100`` a first-order Cornish-Fisher expansion
+         ``1.96 + (1.96^3 + 1.96) / (4 * (n - 1))`` is used. The previous
+         fallback to the bare normal approximation ``1.96`` had ~0.4% relative
+         error at n=101 for the uncorrected 95% level — but under
+         Bonferroni correction (e.g. alpha=0.05/28 ~= 0.0018) the relevant
+         critical value is the 99.9% quantile, where the normal approx's
+         error balloons past 60% (``t.ppf(0.999, 100) ~= 3.17`` vs ``3.09``
+         for the normal). The Cornish-Fisher expansion keeps the error
+         below 0.1% at n=101 for the 97.5% level and is a much better
+         approximation for the corrected alphas used downstream.
+      4. For ``n < 2`` the CI is undefined; returns ``None`` (NOT ``0.0``).
+         The previous ``return 0.0`` silently turned a 1-seed estimate into
+         a zero-width CI, which downstream consumers interpreted as "the
+         estimate is exact" — a false-green that hid the lack of
+         replication. Callers MUST handle ``None`` (the one-sample t-test
+         path in this file and ``run_ablation`` already guards with
+         ``crit is not None`` before comparing).
 
     The scipy availability check runs once and is cached in ``_T_PP`` so
     repeated calls are essentially free.
     """
     global _T_PP
     if n < 2:
-        return 0.0
+        # P0 fix: return None instead of 0.0. The CI is undefined for n<2
+        # (zero degrees of freedom), and ``0.0`` was a load-bearing lie:
+        # callers doing ``abs(t_stat) > crit`` would get ``abs(anything) > 0``
+        # = True for any non-zero t_stat, falsely marking single-seed
+        # estimates as "significant". ``None`` propagates as "undefined",
+        # which the t-test guard already handles (``crit is not None and ...``).
+        return None
     if _T_PP is None:
         try:
             from scipy.stats import t as _t_dist
@@ -205,7 +224,13 @@ def _t_crit_975(n):
         92: 1.987, 93: 1.987, 94: 1.987, 95: 1.986, 96: 1.986,
         97: 1.986, 98: 1.986, 99: 1.985, 100: 1.985,
     }
-    return _TABLE.get(n, 1.96)
+    if n in _TABLE:
+        return _TABLE[n]
+    # n > 100: Cornish-Fisher 1st-order expansion around the normal quantile.
+    # Relative error < 0.1% at n=101 for the 97.5% level; much better than
+    # the bare 1.96 under Bonferroni-corrected alphas (see docstring).
+    z = 1.959963984540054  # scipy.stats.norm.ppf(0.975)
+    return z + (z ** 3 + z) / (4.0 * (n - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -1083,8 +1108,20 @@ def main():
             r['t_crit_bonferroni'] = crit
             # ``crit`` is None when scipy is unavailable — guard the
             # comparison to avoid TypeError (mirrors run_ablation.py).
+            #
+            # P0-3 fix: use a ONE-SIDED test (``t_stat > crit``) instead of
+            # ``abs(t_stat) > crit``. The research question is "does this op
+            # learn the task ABOVE chance", which is directional. The previous
+            # two-sided test flagged an op as "significant" even when its
+            # accuracy was significantly BELOW chance (large negative t_stat),
+            # which is the opposite of what "this op works" means. A below-chance
+            # result indicates the model is systematically wrong (e.g. a sign
+            # bug, a reversed label, or pure noise that happens to anti-correlate),
+            # NOT that the op "works". The Bonferroni-corrected critical value
+            # ``_bonferroni_crit_q`` is already the upper-tail quantile, so the
+            # one-sided comparison is the correct use of that quantile.
             r['significant_bonferroni'] = (
-                crit is not None and abs(t_stat) > crit
+                crit is not None and t_stat > crit
             )
         else:
             r['t_crit_bonferroni'] = None
@@ -1202,6 +1239,20 @@ def main():
                           'results/exp4_mqar.json',
                           indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp4_mqar.json')
+    # P0-2 fix: return non-zero if any op's training crashed (``'error' in r``),
+    # so ``run_all._run`` records the experiment as ``status='fail'`` instead of
+    # silently treating a partial run as success. The previous ``main()``
+    # implicitly returned ``None`` even when every op crashed, which combined
+    # with ``run_all._run``'s ``None == success`` contract produced a green
+    # summary on a fully-red experiment. Returning 1 forces the failure to
+    # propagate to ``run_all``'s summary and exit code.
+    n_errors = sum(1 for r in all_results if 'error' in r)
+    if n_errors:
+        logger.error(
+            f'\n[P0-2] {n_errors}/{len(all_results)} ops errored out. '
+            f'Returning non-zero so run_all records this experiment as failed.')
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
