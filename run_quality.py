@@ -259,9 +259,12 @@ def _bonferroni_crit_q(n, alpha=0.05):
          ``t_stat > crit`` comparisons in Exp4/Exp5; using ``1-alpha/2``
          would be a two-sided threshold and silently make the test too
          conservative. The
-         relative error stays below ~1% at n >= 5 for the typical
-         corrected alphas (0.001-0.005), which is well below the noise
-         floor of 5-10 seed estimates.
+         third-order expansion is important at the small seed counts used
+         here: first-order Cornish-Fisher underestimates the n=7,
+         alpha=0.05/7 critical value by about 7%, which can falsely mark
+         a borderline result significant when scipy is unavailable. The
+         third-order form keeps the common n>=7 corrected-alpha cases within
+         about 1% of scipy.
       4. For ``n < 2`` returns ``None`` (CI undefined — caller must guard).
 
     Being at module scope means ``run_ablation.py`` can import and reuse
@@ -315,7 +318,20 @@ def _bonferroni_crit_q(n, alpha=0.05):
         x = -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
              ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
     z = float(x)
-    crit = z + (z ** 3 + z) / (4.0 * (n - 1))
+    nu = n - 1
+    # Third-order Cornish-Fisher expansion for the Student-t quantile.
+    # The earlier first-order form was finite but too liberal at the small
+    # seed counts used by Exp4/Exp5 (e.g. n=7, alpha=0.05/7 was ~7% below
+    # scipy.stats.t.ppf), which could affect borderline significance when
+    # scipy is unavailable. Adding the 1/nu^2 and 1/nu^3 terms keeps the
+    # fallback close enough for experiment-level validity flags.
+    crit = (
+        z
+        + (z ** 3 + z) / (4.0 * nu)
+        + (5.0 * z ** 5 + 16.0 * z ** 3 + 3.0 * z) / (96.0 * nu ** 2)
+        + (3.0 * z ** 7 + 19.0 * z ** 5 + 17.0 * z ** 3 - 15.0 * z)
+        / (384.0 * nu ** 3)
+    )
     if not math.isfinite(crit):
         raise RuntimeError(
             f"_bonferroni_crit_q fallback produced non-finite critical value: {crit}")
