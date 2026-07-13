@@ -117,13 +117,12 @@ class SoftmaxAttnDecoding(nn.Module):
       * Attention is computed over ``cache[:, :_cache_len]`` (a view, no
         copy).
 
-    This makes the per-token decode cost genuinely ``O(1)`` in the cache
-    length (modulo amortized geometric growth), so the benchmark now
-    measures the attention kernel itself, not the cache-management
-    overhead. The attention score computation is still ``O(T)`` per token
-    (one query attending to all cached keys) — that is the irreducible
-    cost of softmax attention during decoding and is exactly the cost we
-    want to compare against KDA's ``O(1)`` recurrent update.
+    This makes the per-token CACHE-UPDATE cost ``O(1)`` in the cache length
+    (modulo amortized geometric growth), so the benchmark measures the
+    attention kernel itself rather than cache-rebuild overhead. The total
+    softmax decode step is still ``O(T)`` per token because one query attends
+    to all cached keys — that is the irreducible cost we want to compare
+    against KDA's ``O(1)`` recurrent update.
     """
 
     def __init__(self, d_model, H=2, K=16, V=16):
