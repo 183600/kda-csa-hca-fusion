@@ -23,6 +23,7 @@ from ops_csa import (
     csa_compress_kv,
     _causal_block_mask,
     _sliding_window_attention,
+    _nan_safe_softmax,
     CHUNKED_SW_THRESHOLD,
 )
 
@@ -39,7 +40,7 @@ def naive_hca(
     nh: int,
     c: int,
     dc: int,
-    scale: float | None = None,
+    scale: float = 1.0,            # H7 fix: drop None sentinel (None → 1.0 anyway)
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
 ) -> torch.Tensor:
@@ -87,6 +88,38 @@ def naive_hca(
         raise ValueError(
             f"sliding_window={sliding_window} must be >= 0 "
             f"(0 disables the branch)")
+    # H3 fix: tensor shape/dtype validation. Previously only scalar params
+    # were validated; a misshapen ``B_pos`` (e.g. ``[m2, c_other]``) would
+    # silently broadcast inside ``csa_compress_kv`` and produce wrong
+    # results without any error. Validate the full contract up-front so
+    # errors point at the misconfigured weight.
+    if not torch.is_floating_point(H):
+        raise TypeError(
+            f"naive_hca: H must be a floating-point tensor, got dtype={H.dtype}")
+    if W_KV.shape != (c, d):
+        raise ValueError(
+            f"naive_hca: W_KV.shape={tuple(W_KV.shape)} must equal (c, d)="
+            f"({c}, {d})")
+    if W_Z.shape != (c, d):
+        raise ValueError(
+            f"naive_hca: W_Z.shape={tuple(W_Z.shape)} must equal (c, d)="
+            f"({c}, {d})")
+    if W_DQ.shape != (dc, d):
+        raise ValueError(
+            f"naive_hca: W_DQ.shape={tuple(W_DQ.shape)} must equal (dc, d)="
+            f"({dc}, {d})")
+    if W_UQ.shape != (c * nh, dc):
+        raise ValueError(
+            f"naive_hca: W_UQ.shape={tuple(W_UQ.shape)} must equal "
+            f"(c*nh, dc)=({c*nh}, {dc})")
+    if B_pos.shape != (m2, c):
+        raise ValueError(
+            f"naive_hca: B_pos.shape={tuple(B_pos.shape)} must equal "
+            f"(m2, c)=({m2}, {c})")
+    if sink_logits is not None and sink_logits.shape != (nh,):
+        raise ValueError(
+            f"naive_hca: sink_logits.shape={tuple(sink_logits.shape)} must "
+            f"equal (nh,)=({nh},)")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (see ``F.normalize`` calls below), their dot product is already a cosine
     # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
@@ -94,8 +127,7 @@ def naive_hca(
     # compressed blocks nearly uniform — effectively turning dense attention
     # into average pooling. Standard cosine-attention uses ``τ = 1``. The extra
     # ``1/sqrt(c)`` was a leftover from un-normalized softmax-attention.
-    if scale is None:
-        scale = 1.0
+    # H7 fix: scale defaults to 1.0 in the signature; no None sentinel needed.
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv`` would raise a cryptic broadcasting error
@@ -184,14 +216,13 @@ def naive_hca(
         all_masked = torch.isinf(scores).all(-1, keepdim=True)   # [B, nh, T, 1]
         p = p.masked_fill(all_masked, 0.0)
     else:
-        # Rows with no valid block to attend to (e.g. t < m2 under the
-        # causal block mask) are entirely -inf; softmax over them would
-        # yield NaN. Detect such rows and force their weights to 0 so the
-        # contribution is 0 instead of NaN.
-        all_masked = torch.isinf(scores).all(-1, keepdim=True)   # [B, nh, T, 1]
-        safe = scores.masked_fill(all_masked, 0.0)
-        p = torch.softmax(safe, dim=-1)
-        p = p.masked_fill(all_masked, 0.0)
+        # H2 fix: delegate to shared _nan_safe_softmax helper (defined in
+        # ops_csa.py) instead of duplicating the 4-line all_masked /
+        # masked_fill / softmax / masked_fill block. Rows with no valid
+        # block to attend to (e.g. t < m2 under the causal block mask) are
+        # entirely -inf; the helper detects them and zeros their weights
+        # so the contribution is 0 instead of NaN.
+        p = _nan_safe_softmax(scores, dim=-1)
     out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
 
     # --- 3. Sliding window branch (uncompressed local KV) ---

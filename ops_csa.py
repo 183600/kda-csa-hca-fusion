@@ -250,6 +250,33 @@ def csa_compress_kv_overlapped(
     return out
 
 
+# C5 fix: NaN-safe softmax helper, used by csa_lightning_indexer (twice)
+# and naive_csa (twice). The previous implementation copy-pasted the
+# 4-line ``all_masked / safe_logits / softmax / masked_fill_`` block in
+# four places. Any future numerical-stability fix must now be applied in
+# exactly one spot.
+def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
+    """Softmax that returns zeros on rows where every entry is ``-inf``.
+
+    Args:
+        logits: the pre-softmax tensor.
+        dim: the softmax reduction dim.
+        all_masked_mask: optional precomputed boolean mask of fully-masked
+            rows (shape broadcastable to ``logits`` with ``dim`` reduced).
+            If ``None`` we compute it from ``logits.isinf().all(dim=...)``.
+
+    Returns:
+        Softmax along ``dim`` with fully-masked rows zeroed.
+    """
+    if all_masked_mask is None:
+        all_masked = logits.isinf().all(dim=dim, keepdim=True)
+    else:
+        all_masked = all_masked_mask
+    safe_logits = logits.masked_fill(all_masked, 0.0)
+    soft = torch.softmax(safe_logits, dim=dim)
+    return soft.masked_fill(all_masked, 0.0)
+
+
 def csa_lightning_indexer(
     q_idx: torch.Tensor,            # [B, T, HI, DI]
     k_idx: torch.Tensor,            # [B, n_blocks, DI]
@@ -397,10 +424,14 @@ def csa_lightning_indexer(
         raise ValueError(
             f"q_idx.shape[-1]={q_idx.shape[-1]} must be >= 1 "
             f"(indexer key dimension c_I must be positive)")
-    # Validate ``ste_mode`` so a typo (e.g. ``ste_mode='topk'``) does not
-    # silently fall through to the default branch — the caller would think
-    # they enabled ``'full_softmax'`` while actually getting
-    # ``'topk_columns'`` (forward-equivalent but backward-different).
+    # C3 fix: ``ste_mode`` is accepted here only for backwards-compatible
+    # call-site ergonomics (``naive_csa`` passes it through unconditionally
+    # at line 745). The actual STE branching happens INSIDE ``naive_csa``
+    # (lines 869, 915) — this function only returns the indices + (optionally)
+    # the soft_weights, which are the SAME for every ste_mode. We still
+    # validate the value so a typo (``ste_mode='topk'``) doesn't silently
+    # fall through, but callers should be aware the parameter has NO effect
+    # in this function.
     if ste_mode not in ('topk_columns', 'full_softmax', 'aux_contrastive'):
         raise ValueError(
             f"ste_mode={ste_mode!r} must be one of 'topk_columns', "
@@ -453,10 +484,8 @@ def csa_lightning_indexer(
     if topk == 0:
         idx = q_idx.new_zeros(B_, T, 0, dtype=torch.long)
         if return_soft_weights:
-            all_masked = logits.isinf().all(dim=-1, keepdim=True)
-            safe_logits = logits.masked_fill(all_masked, 0.0)
-            soft_weights = torch.softmax(safe_logits, dim=-1)
-            soft_weights = soft_weights.masked_fill(all_masked, 0.0)
+            # C5 fix: use shared _nan_safe_softmax helper.
+            soft_weights = _nan_safe_softmax(logits, dim=-1)
             return idx, soft_weights
         return idx
     S = min(topk, n_blocks)
@@ -479,10 +508,8 @@ def csa_lightning_indexer(
     # their -inf entries with 0 before the exp, then zeroing the result.
     # This mirrors the NaN-safe softmax in ``naive_csa``'s else-branch.
     if return_soft_weights:
-        all_masked = logits.isinf().all(dim=-1, keepdim=True)          # [B, T, 1]
-        safe_logits = logits.masked_fill(all_masked, 0.0)
-        soft_weights = torch.softmax(safe_logits, dim=-1)              # [B, T, n_blocks]
-        soft_weights = soft_weights.masked_fill(all_masked, 0.0)
+        # C5 fix: use shared _nan_safe_softmax helper.
+        soft_weights = _nan_safe_softmax(logits, dim=-1)               # [B, T, n_blocks]
         return idx, soft_weights
     return idx
 
@@ -961,9 +988,11 @@ def naive_csa(
             # and avoids any theoretical concern about the epsilon being
             # too small for fp16/bf16 inputs (where 1e-20 underflows to 0).
             all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
-            safe_scores = scores.masked_fill(all_invalid, 0.0)
-            p = torch.softmax(safe_scores, dim=-1)                       # [B, T, nh, topk]
-            p = p.masked_fill(all_invalid, 0.0)
+            # C5 fix: delegate to shared _nan_safe_softmax helper. We pass
+            # the precomputed all_masked mask so we don't recompute it
+            # (the indexer-style ``logits.isinf().all`` would not match
+            # this branch's ``valid_mask``-based definition of "masked").
+            p = _nan_safe_softmax(scores, dim=-1, all_masked_mask=all_invalid)
 
         out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c] in compute_dtype
 
