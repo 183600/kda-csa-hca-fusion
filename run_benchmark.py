@@ -185,14 +185,21 @@ def _measure(fn, repeats, device):
         # data") rather than a misleading 0.0. On GPU we report the real
         # ``torch.cuda.max_memory_allocated`` (with baseline subtraction).
         gc.collect()
-        # BQ7 fix: pin torch to a single thread on CPU so the OpenMP pool
-        # doesn't dynamically resize between runs. PyTorch's default
-        # ``get_num_threads()`` adapts to load, which made the same op's
-        # measured latency drift by 2-3x between runs. Pinning to 1
-        # thread gives a stable, conservative measurement (real
-        # multi-threaded production latency will be lower, not higher).
+        # BQ7 fix + P1-1 fix (round 5): pin torch intra-op AND inter-op
+        # threads on CPU so the OpenMP/MKL pools don't dynamically resize
+        # between runs. PyTorch's default ``get_num_threads()`` adapts to
+        # load, which made the same op's measured latency drift by 2-3x
+        # between runs; pinning both to 1 gives a stable, conservative
+        # measurement (real multi-threaded production latency will be
+        # lower, not higher). We also set OMP/MKL env vars in case any
+        # underlying BLAS library reads them at launch (best-effort;
+        # setting them after torch import has no effect on already-loaded
+        # libraries, but pinning via the torch APIs is the authoritative
+        # step).
         _prev_threads = torch.get_num_threads()
+        _prev_interop = torch.get_num_interop_threads()
         torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
         try:
             times = []
             for _ in range(repeats):
@@ -202,6 +209,7 @@ def _measure(fn, repeats, device):
                 times.append(t1 - t0)
         finally:
             torch.set_num_threads(_prev_threads)
+            torch.set_num_interop_threads(_prev_interop)
         peak_mb = None  # CPU peak memory is not reliably measurable
         # BQ4 fix (CPU path): stash min/max/std too.
         _LAST_TIMING_STATS['times'] = list(times)

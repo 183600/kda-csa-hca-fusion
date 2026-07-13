@@ -911,50 +911,64 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
     prefill_times = []
     all_decode_times = []
-    for _ in range(repeats):
-        model.reset()
-        # Prefill: process the whole context at once.
-        with torch.no_grad():
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                model(x_prefill)
-                torch.cuda.synchronize()
-                prefill_times.append((time.perf_counter() - t0) * 1e3)
-            else:
-                t0 = time.perf_counter()
-                model(x_prefill)
-                prefill_times.append((time.perf_counter() - t0) * 1e3)
-
-        # Decode n_decode tokens one at a time.
-        decode_times = []
-        with torch.no_grad():
-            if device.type == 'cuda':
-                # P0 timing-bias fix: use CUDA events instead of
-                # ``torch.cuda.synchronize() + time.perf_counter()`` around
-                # each token. The previous per-token sync pattern added
-                # ~10-100 microseconds of driver-roundtrip overhead per
-                # token. KDA's per-token compute is only ~10 microseconds,
-                # so the sync overhead was 50-90% of the reported "KDA decode
-                # latency" — systematically biasing the KDA-vs-softmax
-                # comparison in softmax's favor. CUDA events record
-                # asynchronously on the stream and add no host-side
-                # synchronization per token; a single ``synchronize()`` at
-                # the end drains the whole batch.
-                starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
-                ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
-                for i in range(n_decode):
-                    starts[i].record()
-                    model(x_new)
-                    ends[i].record()
-                torch.cuda.synchronize()
-                decode_times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
-            else:
-                for _ in range(n_decode):
+    # P1-1 fix (round 5): pin torch threads on CPU for stable measurement,
+    # mirroring run_benchmark._measure. Dynamic inter/intra-op thread
+    # resizing causes 2-3x run-to-run jitter on CPU that dominates the
+    # inter-op latency gap.
+    _prev_thr = torch.get_num_threads()
+    _prev_interop = torch.get_num_interop_threads()
+    if device.type != 'cuda':
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    try:
+        for _ in range(repeats):
+            model.reset()
+            # Prefill: process the whole context at once.
+            with torch.no_grad():
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
                     t0 = time.perf_counter()
-                    model(x_new)
-                    decode_times.append((time.perf_counter() - t0) * 1e3)
-        all_decode_times.append(decode_times)
+                    model(x_prefill)
+                    torch.cuda.synchronize()
+                    prefill_times.append((time.perf_counter() - t0) * 1e3)
+                else:
+                    t0 = time.perf_counter()
+                    model(x_prefill)
+                    prefill_times.append((time.perf_counter() - t0) * 1e3)
+
+            # Decode n_decode tokens one at a time.
+            decode_times = []
+            with torch.no_grad():
+                if device.type == 'cuda':
+                    # P0 timing-bias fix: use CUDA events instead of
+                    # ``torch.cuda.synchronize() + time.perf_counter()`` around
+                    # each token. The previous per-token sync pattern added
+                    # ~10-100 microseconds of driver-roundtrip overhead per
+                    # token. KDA's per-token compute is only ~10 microseconds,
+                    # so the sync overhead was 50-90% of the reported "KDA decode
+                    # latency" — systematically biasing the KDA-vs-softmax
+                    # comparison in softmax's favor. CUDA events record
+                    # asynchronously on the stream and add no host-side
+                    # synchronization per token; a single ``synchronize()`` at
+                    # the end drains the whole batch.
+                    starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
+                    ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
+                    for i in range(n_decode):
+                        starts[i].record()
+                        model(x_new)
+                        ends[i].record()
+                    torch.cuda.synchronize()
+                    decode_times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+                else:
+                    for _ in range(n_decode):
+                        t0 = time.perf_counter()
+                        model(x_new)
+                        decode_times.append((time.perf_counter() - t0) * 1e3)
+            all_decode_times.append(decode_times)
+    finally:
+        if device.type != 'cuda':
+            torch.set_num_threads(_prev_thr)
+            torch.set_num_interop_threads(_prev_interop)
 
     # Aggregate across repeats: take the median across trials for each
     # summary statistic. ``statistics.median`` handles even-length lists
