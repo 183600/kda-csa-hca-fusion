@@ -183,7 +183,7 @@ runs during development.
 |---|---|---|
 | `results/exp1_correctness.json` | `{ metadata, results: [...] }` | per-test `{name, ok, detail}` rows |
 | `results/exp2_benchmark.json` | `[{T, op, time_ms, peak_mem_MB, device, repeats, compute_boundary, n_layers, note}, ...]` | **`compute_boundary` differs per op** — see *Fairness notes* |
-| `results/exp3_kv_cache.json` | `[{T, op, kv_bytes, kv_elements, ...}, ...]` | analytic model, not profiled |
+| `results/exp3_kv_cache.json` | `[{T, op, accounting_mode, accounting_semantics, kv_bytes, kv_elements, ...}, ...]` | analytic model, not profiled |
 | `results/exp4_mqar.json` | `[{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]` | multi-seed with CI95 + Bonferroni |
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper |
 | `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches) |

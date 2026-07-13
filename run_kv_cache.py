@@ -496,8 +496,15 @@ def main():
                     'op': op,
                     'accounting_mode': mode,
                     'accounting_semantics': (
-                        'compressed_kv_only' if mode == 'compressed_kv_only'
-                        else 'compressed_kv_plus_runtime_decode_state'
+                        'compressed_kv_only'
+                        if mode == 'compressed_kv_only'
+                        else 'full_gqa_kv_cache'
+                        if op == 'softmax_gqa'
+                        else 'recurrent_state_plus_short_conv'
+                        if op == 'kda'
+                        else 'compressed_rows_plus_runtime_decode_state'
+                        if op in ('csa', 'hca')
+                        else 'hybrid_full_runtime_decode_state'
                     ),
                     'kv_elements': kv,
                     # Ratios against the 1-layer baseline (original paper's convention).
