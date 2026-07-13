@@ -1,8 +1,10 @@
 # 代码审查报告：kda-csa-hca-fusion 实验结果影响分析
 
+> **Superseded / 已被后续报告覆盖（2026-07-13）**：本文件是在 commit `1e24819` 基础上的上一轮审查记录。后续审查发现并修复了两个会影响实验结果解释的问题：Exp3 FLOPs 漏计 KDA/CSA/HCA grouped output projection，以及 Exp4/Exp6 standalone KDA gate 参数化与 Hybrid/Exp3 不一致。请以 `EXPERIMENT_RESULT_IMPACT_AUDIT_2026_07_13.md` 和最新提交为准；本文件保留为历史记录。
+
 **仓库**：https://gitee.com/qwe12345678/kda-csa-hca-fusion
 **审查日期**：2026-07-13
-**当前 HEAD commit**：`1e24819`（20轮复查最终记录）
+**当前 HEAD commit**：`1e24819`（20轮复查最终记录，历史值）
 
 ---
 

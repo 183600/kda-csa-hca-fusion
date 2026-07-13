@@ -78,6 +78,7 @@ g: d -> H*K
 | `.gitignore` | 仅忽略缓存、构建产物、结果目录；不会直接改变实验数值。 | 无需修改 |
 | `CODE_REVIEW.md` | 历史审查记录，包含已修复问题说明；不参与运行。 | 无需修改 |
 | `EXPERIMENT_IMPACT_REVIEW_20_ROUNDS.md` | 历史 20 轮复查记录；最新代码已有本轮新修复。 | 保留历史，不改写 |
+| `EXPERIMENT_RESULTS_IMPACT_ANALYSIS.md` | 远端新增的上一轮综合审查报告，结论为“未发现新问题”；该结论已被本轮 P0-1/P0-2 发现覆盖。 | 已追加 superseded 提示 |
 | `LICENSE` | 许可证文本。 | 无需修改 |
 | `README.md` | Exp3 描述未明确输出投影计入口径。 | 已更新 Exp3 FLOPs 说明 |
 | `conftest.py` | pytest 设备参数、slow 标记、fixture 逻辑；未发现会改写实验结果的问题。 | 无需修改 |
