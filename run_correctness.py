@@ -52,6 +52,34 @@ from ops_fused import HybridKCHAttention, HybridConfig, KDAHybridLayer
 logger = logging.getLogger(__name__)
 
 
+# T7 fix: central tolerance table. Previously each test picked a magic
+# number (1e-4, 1e-8, 1e-9, 1e-10, 1e-12, 1e-5) ad-hoc, with no
+# documentation of why a particular value was chosen. This table
+# codifies the (dtype, check_kind) → tolerance mapping so future tests
+# can look up the right value instead of guessing. Tests that need a
+# tighter or looser tolerance can still override, but they should add a
+# comment explaining why.
+TOL = {
+    # Default tolerance for "outputs match a reference" checks.
+    'match': {
+        torch.float32: 1e-5,
+        torch.float64: 1e-9,
+        torch.float16: 1e-2,
+        torch.bfloat16: 1e-2,
+    },
+    # Tolerance for "outputs are bit-identical across two code paths" checks
+    # (e.g. chunk vs recurrent KDA — same math, different reduction order).
+    'bit_match': {
+        torch.float32: 1e-6,
+        torch.float64: 1e-10,
+        torch.float16: 1e-3,
+        torch.bfloat16: 1e-3,
+    },
+    # Tolerance for "value is effectively zero" checks (T9 fix).
+    'zero': 1e-12,
+}
+
+
 def _ok(name: str, cond: bool, detail: str = '') -> dict:
     status = 'PASS' if cond else 'FAIL'
     msg = f"  [{status}] {name}: {detail}"
@@ -355,8 +383,16 @@ def test_csa_causality(device='cpu'):
     ]
 
 
-def test_hca_causality(device='cpu'):
-    logger.info("Test: HCA dense attention causality (block-level)")
+def test_hca_forward_smoke(device='cpu'):
+    """T5 fix: this test was misnamed ``test_hca_causality`` but only
+    checks the output shape and finiteness — it does NOT verify any
+    causal property. The real HCA causality test is
+    ``test_hca_sliding_window_causality`` (line ~1417). Renamed to
+    ``test_hca_forward_smoke`` so the test name reflects what it
+    actually checks. A future reader who needs a causality test should
+    look at ``test_hca_sliding_window_causality``, not here."""
+    logger.info("Test: HCA forward smoke (shape + finiteness only; "
+                "causality is tested in test_hca_sliding_window_causality)")
     torch.manual_seed(3)
     B, T, d = 1, 128, 32
     m2, nh, c, dc = 32, 2, 16, 32
@@ -1039,7 +1075,12 @@ def test_csa_indexer_ste_gradient(device='cpu'):
     def _no_useful_grad(g):
         if g is None:
             return True
-        return bool(g.abs().sum().item() == 0)
+        # T9 fix: use ``< 1e-12`` instead of exact ``== 0``. Exact float
+        # equality is fragile — a future refactor that introduces a tiny
+        # but non-zero contribution (e.g. fp rounding through a different
+        # kernel path) would make this test spuriously fail even though
+        # the optimizer step is still effectively a no-op.
+        return bool(g.abs().sum().item() < 1e-12)
     noste_grads_useless = all(_no_useful_grad(p_noste[name].grad)
                               for name in indexer_param_names)
     noste_wakv_has_grad = (p_noste['W_aKV'].grad is not None
@@ -1290,7 +1331,8 @@ def test_kda_cross_chunk_bptt(device='cpu'):
     o2_a, _, _ = layer_a.forward_functional(x2.clone(), st_a_det, lb_a,
                                              detach_lookback=True)
     o2_a.sum().backward()
-    x1_grad_a_none = (x1_a.grad is None) or (x1_a.grad.abs().sum().item() == 0.0)
+    # T9 fix: use ``< 1e-12`` instead of exact ``== 0.0`` (fragile).
+    x1_grad_a_none = (x1_a.grad is None) or (x1_a.grad.abs().sum().item() < 1e-12)
 
     # --- Case B: detach_lookback=False (cross-chunk BPTT) ---
     torch.manual_seed(456)
@@ -2806,7 +2848,7 @@ def test_csa_topk_zero(device='cpu'):
                         sliding_window=0, sink_logits=sink)
     no_sw_ok = (o_no_sw.shape == (B, T, nh * c)
                 and torch.isfinite(o_no_sw).all().item()
-                and o_no_sw.abs().max().item() == 0.0)
+                and o_no_sw.abs().max().item() < 1e-12)  # T9 fix: was == 0.0
 
     # topk=0, with SW -> non-zero output (SW branch contributes).
     o_with_sw = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
@@ -2853,7 +2895,7 @@ def test_hca_T_smaller_than_m2(device='cpu'):
                         sliding_window=0, sink_logits=sink)
     no_sw_ok = (o_no_sw.shape == (B, T, nh * c)
                 and torch.isfinite(o_no_sw).all().item()
-                and o_no_sw.abs().max().item() == 0.0)
+                and o_no_sw.abs().max().item() < 1e-12)  # T9 fix: was == 0.0
 
     # With SW: SW branch contributes (each query attends to itself + past 3).
     o_with_sw = naive_hca(H, W_KV, W_Z, B_pos, W_DQ, W_UQ,
@@ -4318,7 +4360,7 @@ def main():
     all_results += _run_safe(test_kda_gva, device)
     all_results += _run_safe(test_kda_chunk_gva, device)
     all_results += _run_safe(test_csa_causality, device)
-    all_results += _run_safe(test_hca_causality, device)
+    all_results += _run_safe(test_hca_forward_smoke, device)
     all_results += _run_safe(test_fused_hybrid, device)
     # New reviewer-driven checks.
     all_results += _run_safe(test_overlap_causality, device)
