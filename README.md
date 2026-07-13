@@ -317,7 +317,14 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   silently returning a non-finite result with no diagnostic; see
   `test_kda_unnormalized_input_warns` in `run_correctness.py`. Always
   `F.normalize(q, dim=-1)` / `F.normalize(k, dim=-1)` before calling into
-  KDA unless you have a specific reason not to.
+  KDA unless you have a specific reason not to. **Follow-up fix:** this
+  non-finite check is data-dependent Python control flow, which initially
+  broke `compiled_recurrent_kda(..., fullgraph=True)` (`torch.compile`
+  cannot trace a branch that depends on tensor runtime values). The check
+  is now guarded with `torch.compiler.is_compiling()` (the documented
+  "skip while being traced" pattern) so it is pruned away inside a
+  `torch.compile` graph and only runs in eager mode; see
+  `test_compiled_recurrent_kda_fullgraph` in `run_correctness.py`.
 * **Naive Python loops.** KDA's recurrent path is a Python `for` loop over
   time; the chunked path still has a Python loop over chunks. CSA's
   indexer loops over heads. None of this is fused or Tritonized. Latency

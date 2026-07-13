@@ -184,7 +184,50 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
     inspect it) and does NOT raise: KDA is a research reference
     implementation, and this repository's contract is "warn loudly, don't
     silently corrupt state" rather than "hard-fail on any exotic input".
+
+    .. note:: review-fix 1.1-a — ``torch.compile`` / ``fullgraph=True``
+        compatibility.
+
+        The ``if not torch.isfinite(o).all(): ...`` check below is
+        data-dependent Python control flow. When this function runs
+        UNCOMPILED (the common case — direct calls to
+        ``naive_recurrent_kda`` / ``naive_chunk_kda`` / ``scripted_chunk_kda``)
+        this is perfectly fine: it is a single boolean reduction plus an
+        ordinary ``if``. But when this function is invoked from INSIDE a
+        ``torch.compile``-traced graph — which happens for
+        ``compiled_recurrent_kda`` (the ``torch.compile`` wrapper around
+        ``naive_recurrent_kda`` added for issue 2.1) — Dynamo cannot trace
+        a branch whose condition depends on a tensor's runtime values, and
+        raises ``Unsupported: Data-dependent branching``. This was a real
+        regression introduced by review-fix 1.1: before that fix,
+        ``naive_recurrent_kda``'s return path had no such data-dependent
+        branch, so ``compiled_recurrent_kda(..., fullgraph=True)`` compiled
+        successfully; after review-fix 1.1 it did not.
+
+        We guard the check with ``torch.compiler.is_compiling()`` — the
+        officially documented pattern (see ``torch.compiler.is_compiling``'s
+        own docstring example) for "skip this logic while being traced by
+        torch.compile / torch.export". ``is_compiling()`` itself is handled
+        specially by Dynamo (it is NOT treated as data-dependent branching
+        the same way an arbitrary tensor predicate is — Dynamo resolves it
+        at trace time to a compile-time constant), so the surrounding
+        ``if`` is graph-safe: under ``torch.compile`` the entire block is
+        pruned away at trace time (no diagnostic overhead in the compiled
+        graph, and no graph break), while EAGER calls (including calls
+        made through ``compiled_recurrent_kda`` before the FIRST trace, and
+        any direct eager call to the naive functions) still get the
+        non-finite check and warning. This restores
+        ``compiled_recurrent_kda(..., fullgraph=True)`` compilation while
+        keeping the eager-path diagnostic that review-fix 1.1 was written
+        to add. See ``test_compiled_recurrent_kda_fullgraph`` and
+        ``test_kda_unnormalized_input_warns`` in ``run_correctness.py``
+        for regression coverage of both halves of this contract.
     """
+    if torch.compiler.is_compiling():
+        # Skip the check entirely inside a torch.compile / torch.export
+        # trace — see the review-fix 1.1-a note above. The compiled graph
+        # therefore never contains this data-dependent branch.
+        return
     if not torch.isfinite(o).all():
         _warnings.warn(
             f"{fn_name}: output contains NaN/Inf. The KDA delta-rule "

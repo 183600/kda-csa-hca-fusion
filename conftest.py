@@ -77,6 +77,10 @@ _SLOW_TESTS = {
     'test_kv_cache_ceil_block_count',
     'test_csa_hca_extreme_sink_values',
     'test_hca_sliding_window_causality',
+    # torch.compile has a real one-time compilation cost (observed
+    # 5-15s even for a tiny T=8 recurrence on CPU) that is unrelated to
+    # the algorithm itself; mark slow so fast CI loops can skip it.
+    'test_compiled_recurrent_kda_fullgraph',
 }
 
 

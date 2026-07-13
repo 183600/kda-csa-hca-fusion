@@ -44,7 +44,10 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
-from ops_kda import naive_recurrent_kda, naive_chunk_kda, scripted_chunk_kda
+from ops_kda import (
+    naive_recurrent_kda, naive_chunk_kda, scripted_chunk_kda,
+    compiled_recurrent_kda,
+)
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig, KDAHybridLayer
@@ -189,6 +192,78 @@ def test_kda_chunk_gva(device='cpu'):
     ]
 
 
+def test_compiled_recurrent_kda_fullgraph(device='cpu'):
+    """Review-fix 1.1-a regression: ``compiled_recurrent_kda`` compiles + matches.
+
+    Review-fix 1.1 added a non-finite-output check
+    (``ops_kda._warn_if_nonfinite``) to the tail of ``naive_recurrent_kda``.
+    That check is a data-dependent Python ``if`` (``if not
+    torch.isfinite(o).all(): ...``), which broke
+    ``compiled_recurrent_kda(..., fullgraph=True)`` — before review-fix 1.1
+    this compiled successfully; after it, ``torch.compile`` raised
+    ``Unsupported: Data-dependent branching`` because Dynamo cannot trace a
+    branch whose condition depends on tensor runtime values.
+    ``compiled_recurrent_kda`` had NO regression test at all before this
+    fix, so the break went undetected by the 227-test suite that otherwise
+    covers review-fix 1.1.
+
+    Review-fix 1.1-a guards the check with
+    ``torch.compiler.is_compiling()`` (the documented pattern for
+    "skip while being traced") so the branch is pruned away at trace time
+    instead of breaking the graph. This test pins:
+
+      1. ``compiled_recurrent_kda(..., fullgraph=True)`` compiles and runs
+         without raising (the direct regression for the ``torch.compile``
+         incompatibility).
+      2. The compiled output matches ``naive_recurrent_kda`` to fp
+         tolerance (the wrapper must still be numerically faithful).
+      3. The compiled output matches with ``output_final_state=True``
+         (state agreement too).
+
+    Uses a tiny ``T`` (well below the review-fix 1.1 divergence threshold
+    of ``T~500`` for unnormalized inputs, and small enough to bound the
+    one-time ``torch.compile`` cost) — this test verifies the COMPILE
+    succeeds and the VALUE matches, not divergence behaviour (that is
+    ``test_kda_unnormalized_input_warns``'s job, which only exercises the
+    eager path).
+    """
+    logger.info("Test: compiled_recurrent_kda(fullgraph=True) compiles (review-fix 1.1-a)")
+    torch.manual_seed(31)
+    B, T, H, K, V = 1, 8, 1, 4, 4
+    q = F.normalize(torch.randn(B, T, H, K, dtype=torch.float32, device=device), dim=-1)
+    k = F.normalize(torch.randn(B, T, H, K, dtype=torch.float32, device=device), dim=-1)
+    v = torch.randn(B, T, H, V, dtype=torch.float32, device=device) * 0.1
+    g = -torch.rand(B, T, H, K, dtype=torch.float32, device=device) * 0.05
+    beta = torch.rand(B, T, H, dtype=torch.float32, device=device) * 0.2
+
+    o_ref, s_ref = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+
+    compile_ok = True
+    compile_err = ''
+    try:
+        import torch._dynamo as _dynamo
+        _dynamo.reset()
+        o_compiled, s_compiled = compiled_recurrent_kda(
+            q, k, v, g, beta, output_final_state=True, fullgraph=True)
+    except Exception as exc:
+        compile_ok = False
+        compile_err = f'{type(exc).__name__}: {exc}'
+        o_compiled = torch.full_like(o_ref, float('nan'))
+        s_compiled = torch.full_like(s_ref, float('nan'))
+
+    o_diff = (o_ref - o_compiled).abs().max().item() if compile_ok else float('inf')
+    s_diff = (s_ref - s_compiled).abs().max().item() if compile_ok else float('inf')
+
+    return [
+        _ok('compiled_recurrent_kda(fullgraph=True) compiles without raising',
+            compile_ok, compile_err or 'ok'),
+        _ok('compiled_recurrent_kda output matches naive_recurrent_kda',
+            compile_ok and o_diff < 1e-4, f'max|diff|={o_diff:.2e}'),
+        _ok('compiled_recurrent_kda state matches naive_recurrent_kda',
+            compile_ok and s_diff < 1e-4, f'max|diff|={s_diff:.2e}'),
+    ]
+
+
 def test_scripted_chunk_kda_matches_naive(device='cpu'):
     """Review-fix 1.2 regression: ``scripted_chunk_kda`` == ``naive_chunk_kda``.
 
@@ -231,7 +306,8 @@ def test_scripted_chunk_kda_matches_naive(device='cpu'):
                                                 chunk_size=BT, use_script=False)
 
         chk_vs_scr_o = (o_chk - o_scr).abs().max().item()
-        chk_vs_scr_s = 0.0 if (s_chk is None or s_scr is None) else (s_chk - s_scr).abs().max().item()
+        chk_vs_scr_s = (0.0 if (s_chk is None or s_scr is None)
+                        else (s_chk - s_scr).abs().max().item())
         scr_vs_rec_o = (o_rec - o_scr).abs().max().item()
         noscript_matches_chk = torch.equal(o_scr_ns, o_chk)
 
@@ -264,8 +340,10 @@ def test_scripted_chunk_kda_matches_naive(device='cpu'):
     v0 = torch.zeros(B, 0, HV, V, dtype=torch.float32, device=device)
     g0 = torch.zeros(B, 0, HV, K, dtype=torch.float32, device=device)
     beta0 = torch.zeros(B, 0, HV, dtype=torch.float32, device=device)
-    o0_chk, s0_chk = naive_chunk_kda(q0, k0, v0, g0, beta0, output_final_state=True, chunk_size=64)
-    o0_scr, s0_scr = scripted_chunk_kda(q0, k0, v0, g0, beta0, output_final_state=True, chunk_size=64)
+    o0_chk, s0_chk = naive_chunk_kda(
+        q0, k0, v0, g0, beta0, output_final_state=True, chunk_size=64)
+    o0_scr, s0_scr = scripted_chunk_kda(
+        q0, k0, v0, g0, beta0, output_final_state=True, chunk_size=64)
     results.append(_ok(
         'T=0: scripted_chunk_kda shape matches naive_chunk_kda',
         o0_scr.shape == o0_chk.shape == (B, 0, HV, V),
@@ -4645,6 +4723,13 @@ def main():
     all_results += _run_safe(test_kda_chunk_vs_recurrent, device)
     all_results += _run_safe(test_kda_gva, device)
     all_results += _run_safe(test_kda_chunk_gva, device)
+    # Review-fix 1.1-a regression: compiled_recurrent_kda(fullgraph=True)
+    # must still compile after review-fix 1.1 added the non-finite-output
+    # check (which is data-dependent branching and, unguarded, breaks
+    # torch.compile tracing). Has a real one-time torch.compile cost
+    # (several seconds even for tiny T on CPU) — marked 'slow' in
+    # conftest.py so `pytest -m "not slow"` can skip it during fast loops.
+    all_results += _run_safe(test_compiled_recurrent_kda_fullgraph, device)
     # Review-fix 1.2 regression: scripted_chunk_kda (both use_script=True
     # and False) agrees with naive_chunk_kda / naive_recurrent_kda now
     # that the two share _chunk_kda_prepare/_chunk_kda_finalize instead of
