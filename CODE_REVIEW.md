@@ -133,9 +133,9 @@ cache's device=cpu. Call cache.to(device=q.device) or move q to the cache's devi
 
 | 检查项 | 结果 |
 |---|---|
-| `run_correctness.py`（标准入口） | 230/230 通过 |
-| `test_figures.py` | 7/7 通过 |
-| `pytest -m "not slow" run_correctness.py` | 54 passed, 3 failed（§2.1 描述的既有 pytest 专属问题，与本次修复无关）, 6 deselected |
+| `run_correctness.py`（标准入口） | 历史记录：当时 230/230 通过；当前测试数已继续增长，请以最新 `run_correctness.py` 输出为准 |
+| `test_figures.py` | 历史记录：当时 7/7 通过 |
+| `pytest -m "not slow" run_correctness.py` | 历史记录：当时暴露出 §2.1 的 device 比较问题；该问题已在后续修复中处理，当前状态请以最新 pytest 输出为准 |
 | `ruff check ops_kda.py` | 1 处既有 E501（第二轮已记录，未变化） |
 | `ruff check conftest.py` | 0 处新增问题 |
 | `ruff check run_correctness.py`（新增代码范围内） | 0 处新增问题 |
@@ -148,7 +148,7 @@ cache's device=cpu. Call cache.to(device=q.device) or move q to the cache's devi
 | 类别 | 状态 |
 |---|---|
 | review-fix 1.1-a（本轮新增） | ✅ 已修复并验证：`compiled_recurrent_kda(fullgraph=True)` 恢复可编译，eager 路径诊断能力不受影响，新增 3 项回归测试子检查填补了该函数此前完全无测试覆盖的空白 |
-| review-fix 1.1 / 1.2 / 1.3（上两轮） | ✅ 保持修复状态，230 项回归测试全部通过 |
+| review-fix 1.1 / 1.2 / 1.3（上两轮） | ✅ 保持修复状态；历史记录为当时 230 项回归测试全部通过，当前测试数已增加 |
 | 新发现的独立问题（§2.1） | ⚠️ 已定位根因并记录，**不在本次修复范围内**，建议作为下一个独立任务处理 |
 | 遗留中优先级维护事项（§2.2） | 非实验结果阻断项，后续可继续工程化改进 |
 
