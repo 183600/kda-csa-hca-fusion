@@ -80,8 +80,10 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
     mode : str
         'compressed_kv_only'  — only the compressed KV entries (original paper's
                                  optimistic accounting).
-        'full_accounting'     — compressed KV + sliding-window KV + indexer key
-                                 cache + compression metadata + sink.
+        'full_accounting'     — compressed rows actually materialized by the
+                                 incremental cache + fixed sliding-window buffer
+                                 capacity + indexer key cache + partial-token
+                                 accumulators + CSA overlap state + sink.
     """
     p = {**DEFAULTS, **kw}
     # AK12 fix: reject unknown kwargs so a typo (e.g. ``csa_topk_typo=64``)
@@ -510,7 +512,7 @@ def main():
 
     # Pretty-print a compact table for the full-accounting mode at key lengths.
     print(f"\n{'='*100}")
-    print("Full accounting (compressed KV + sliding window + indexer + sink)")
+    print("Full accounting (compressed rows + SW buffer + indexer + partial/overlap state + sink)")
     print(f"{'='*100}")
     print(f"{'T':>8} | {'op':>14} | {'KV elems':>14} | {'KV/GQA(1L)':>10} | "
           f"{'KV/GQA(5L)':>10} | {'FL/GQA(1L)':>10} | {'FL/GQA(5L)':>10}")
