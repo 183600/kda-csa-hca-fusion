@@ -17,6 +17,8 @@ forget gate per head).
 
 from __future__ import annotations
 
+import warnings as _warnings  # K7 fix: lifted to module scope
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -92,6 +94,63 @@ def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):
                 f"dtype (cast before calling if needed).")
 
 
+def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None):
+    """Validate KDA shape dimensions (K2 fix — eliminates triplicated code).
+
+    ``_validate_kda_inputs`` checks rank / device / dtype consistency. This
+    helper checks the DIMENSION-value contract (H>=1, K>=1, V>=1, HV%H==0,
+    g.shape[2]==HV, g.shape[-1]==K, beta.shape[2]==HV) that was previously
+    copy-pasted into all three KDA entrypoints (naive_recurrent_kda,
+    naive_chunk_kda, scripted_chunk_kda). Any future fix to the validation
+    message now lives in ONE place.
+
+    Args:
+        chunk_size: if not None, also validates chunk_size >= 1 (chunk path
+            only).
+    """
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[-1]
+    if H < 1:
+        raise ValueError(
+            f"{fn_name}: H={H} must be >= 1 "
+            f"(would cause ZeroDivisionError in HV // H)")
+    if K < 1:
+        raise ValueError(f"{fn_name}: K={K} must be >= 1")
+    if V < 1:
+        raise ValueError(f"{fn_name}: V={V} must be >= 1")
+    if chunk_size is not None and chunk_size < 1:
+        raise ValueError(
+            f"{fn_name}: chunk_size={chunk_size} must be >= 1 "
+            f"(would cause ZeroDivisionError in T // chunk_size and "
+            f"(-T) % chunk_size)")
+    if HV % H != 0:
+        raise ValueError(
+            f"{fn_name}: HV={HV} must be divisible by H={H} (GVA factor)")
+    if g.shape[2] != HV:
+        raise ValueError(
+            f"{fn_name}: g.shape[2]={g.shape[2]} must equal HV={HV} "
+            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
+    if g.shape[-1] != K:
+        raise ValueError(
+            f"{fn_name}: g.shape[-1]={g.shape[-1]} must equal K={K} "
+            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
+    if beta.shape[2] != HV:
+        raise ValueError(
+            f"{fn_name}: beta.shape[2]={beta.shape[2]} must equal HV={HV} "
+            f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
+
+
+def _compute_dtype(dtype):
+    """K4 fix: pick the compute dtype for KDA math (centralized helper).
+
+    fp64 inputs stay in fp64 (gradient checks, high-precision correctness
+    tests). Everything else (fp16, bf16, fp32) computes in fp32 for
+    numerical stability — the recurrence accumulates ``exp(g)`` over T
+    steps, which loses too much precision in fp16/bf16 to be safe.
+    """
+    return torch.float64 if dtype == torch.float64 else torch.float
+
+
 def naive_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -156,47 +215,16 @@ def naive_recurrent_kda(
     # ``ValueError: not enough values to unpack (expected 6, got 5)``.
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    # Validate H BEFORE ``G = HV // H`` so H=0 produces a clear ValueError
-    # instead of a bare ZeroDivisionError. Also validates non-negativity of
-    # head dims so a malformed caller gets an informative message.
-    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
-    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
-    # are silently stripped under optimization, which would re-expose the
-    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
-    if H < 1:
-        raise ValueError(
-            f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)")
-    if K < 1:
-        raise ValueError(f"K={K} must be >= 1")
-    if V < 1:
-        raise ValueError(f"V={V} must be >= 1")
+    # K2 fix: shape validation centralized in ``_validate_kda_shapes`` so
+    # the same contract is enforced identically across naive_recurrent_kda,
+    # naive_chunk_kda, and scripted_chunk_kda.
+    _validate_kda_shapes(q, k, v, g, beta, fn_name='naive_recurrent_kda')
     G = HV // H
-    if HV % H != 0:
-        raise ValueError(
-            f"HV={HV} must be divisible by H={H} (GVA factor)")
-    # Validate g and beta head dimensions match HV. Without this, a mismatched
-    # g (e.g. [B, T, H, K] instead of [B, T, HV, K]) would silently broadcast
-    # or crash deep inside the recurrence loop with a cryptic einsum error.
-    # Use ``raise ValueError`` (NOT ``assert``) so the checks survive ``-O``.
-    if g.shape[2] != HV:
-        raise ValueError(
-            f"g.shape[2]={g.shape[2]} must equal HV={HV} "
-            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
-    if g.shape[-1] != K:
-        raise ValueError(
-            f"g.shape[-1]={g.shape[-1]} must equal K={K} "
-            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
-    if beta.shape[2] != HV:
-        raise ValueError(
-            f"beta.shape[2]={beta.shape[2]} must equal HV={HV} "
-            f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
     if scale is None:
         scale = K ** -0.5
 
-    # Compute in at least float32 for numerical stability, but preserve
-    # float64 when the caller asks for it (gradient checks, high-precision
-    # correctness tests).
-    compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
+    # K4 fix: compute-dtype selection centralized in ``_compute_dtype``.
+    compute_dtype = _compute_dtype(dtype)
     q, k, v, g, beta = map(lambda x: x.to(compute_dtype), [q, k, v, g, beta])
     # P0 numerical-stability fix: clamp ``g`` from below. ``g`` is produced
     # upstream as ``-softplus(...) * kda_decay_scale`` which has no finite
@@ -223,13 +251,27 @@ def naive_recurrent_kda(
     # silent; production-latency comparisons should use the FLA Triton
     # kernel or wrap this function with ``torch.compile``.
     if T > 8192:
-        import warnings as _warnings
         _warnings.warn(
             f"naive_recurrent_kda: T={T} > 8192; the Python for-loop is "
             f"interpreter-overhead-bound (typical cost ~15-30ms per 1k "
             f"steps on CPU). For production latency, use the FLA Triton "
             f"kernel or wrap with torch.compile. This warning is emitted "
             f"once per process per call site.",
+            stacklevel=2,
+        )
+    elif T > 1024 and q.is_cuda:
+        # K8 fix: lower threshold on CUDA — the Python interpreter dispatch
+        # dominates the math once T crosses ~1k on GPU, so the user is
+        # silently paying a 5-20x overhead vs ``compiled_recurrent_kda``.
+        # We do NOT auto-delegate (that would change the function's
+        # observable contract and could surprise callers measuring the
+        # naive path explicitly), but we do emit a one-shot info-level
+        # nudge so users know the faster path exists.
+        _warnings.warn(
+            f"naive_recurrent_kda: T={T} > 1024 on CUDA — the Python "
+            f"for-loop is interpreter-overhead-bound here. Consider "
+            f"calling compiled_recurrent_kda(...) for a 5-20x speedup "
+            f"(one-time compile cost ~5-30s, then cached).",
             stacklevel=2,
         )
 
@@ -347,7 +389,15 @@ def naive_recurrent_kda(
 # pattern used by ``torch._inductor``'s own ``cache_size`` limiter — we cap
 # at ``_COMPILED_CACHE_MAX`` entries to bound memory in long-lived processes
 # (e.g. a training loop that varies ``T`` per batch).
-_COMPILED_KDA_CACHE: dict = {}
+#
+# K6 fix: the previous eviction policy was FIFO
+# (``pop(next(iter(...)))``). In a training loop that varies ``T`` per
+# batch, FIFO can evict a just-compiled signature before its second use,
+# forcing a recompile. We now use ``collections.OrderedDict`` and
+# ``move_to_end`` on every hit so the eviction is LRU (least-recently-
+# used), which keeps hot signatures resident.
+import collections as _collections
+_COMPILED_KDA_CACHE: 'OrderedDict' = _collections.OrderedDict()
 _COMPILED_CACHE_MAX = 32
 
 
@@ -428,8 +478,11 @@ def compiled_recurrent_kda(
     compiled_fn = _COMPILED_KDA_CACHE.get(cache_key)
     if compiled_fn is None:
         if len(_COMPILED_KDA_CACHE) >= _COMPILED_CACHE_MAX:
-            # Evict oldest entry to bound cache size in long-lived processes.
-            _COMPILED_KDA_CACHE.pop(next(iter(_COMPILED_KDA_CACHE)))
+            # K6 fix: LRU eviction (least-recently-used) instead of FIFO.
+            # ``popitem(last=False)`` removes the OLDEST entry in insertion
+            # order, but because we ``move_to_end`` on every hit below, the
+            # oldest insertion-order entry IS the least-recently-used one.
+            _COMPILED_KDA_CACHE.popitem(last=False)
         # Wrap the inner recurrence with torch.compile. We compile a thin
         # closure that takes only tensor args (no Python floats / bools) so
         # ``dynamic=True`` can vary T/B without re-tracing. Scalar args
@@ -454,6 +507,10 @@ def compiled_recurrent_kda(
             compile_kwargs["mode"] = mode
         compiled_fn = torch.compile(_kda_kernel, **compile_kwargs)
         _COMPILED_KDA_CACHE[cache_key] = compiled_fn
+    else:
+        # K6 fix: LRU — promote the just-hit entry to the end so it is the
+        # LAST to be evicted by ``popitem(last=False)`` above.
+        _COMPILED_KDA_CACHE.move_to_end(cache_key)
 
     return compiled_fn(
         q, k, v, g, beta,
@@ -496,45 +553,13 @@ def naive_chunk_kda(
     # instead of the cryptic ``ValueError: not enough values to unpack``.
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_chunk_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    # Validate H and chunk_size BEFORE the divisions ``HV // H`` and
-    # ``T // BT`` so zero or negative values produce a clear AssertionError
-    # instead of a bare ZeroDivisionError. Mirrors naive_recurrent_kda.
-    # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
-    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
-    # are silently stripped under optimization, which would re-expose the
-    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
-    if H < 1:
-        raise ValueError(
-            f"H={H} must be >= 1 (would cause ZeroDivisionError in HV // H)")
-    if K < 1:
-        raise ValueError(f"K={K} must be >= 1")
-    if V < 1:
-        raise ValueError(f"V={V} must be >= 1")
-    if chunk_size < 1:
-        raise ValueError(
-            f"chunk_size={chunk_size} must be >= 1 "
-            f"(would cause ZeroDivisionError in T // chunk_size and "
-            f"(-T) % chunk_size)")
+    # K2 fix: shape + chunk_size validation centralized in
+    # ``_validate_kda_shapes`` so naive_chunk_kda and scripted_chunk_kda
+    # share the same contract.
+    _validate_kda_shapes(
+        q, k, v, g, beta, fn_name='naive_chunk_kda', chunk_size=chunk_size,
+    )
     G = HV // H
-    if HV % H != 0:
-        raise ValueError(
-            f"HV={HV} must be divisible by H={H} (GVA factor)")
-    # Validate g and beta head dimensions match HV (mirrors
-    # naive_recurrent_kda). Without this, a mismatched g or beta would
-    # crash deep inside the chunk computation with a cryptic einsum error.
-    # Use ``raise ValueError`` (NOT ``assert``) so the checks survive ``-O``.
-    if g.shape[2] != HV:
-        raise ValueError(
-            f"g.shape[2]={g.shape[2]} must equal HV={HV} "
-            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
-    if g.shape[-1] != K:
-        raise ValueError(
-            f"g.shape[-1]={g.shape[-1]} must equal K={K} "
-            f"(g must be [B, T, HV, K], got {tuple(g.shape)})")
-    if beta.shape[2] != HV:
-        raise ValueError(
-            f"beta.shape[2]={beta.shape[2]} must equal HV={HV} "
-            f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
     BT = chunk_size
     original_T = T
     # Degenerate case: empty sequence. The downstream
@@ -543,7 +568,7 @@ def naive_chunk_kda(
     # of rows``. Guard explicitly (mirrors naive_recurrent_kda /
     # naive_csa / naive_hca).
     if T == 0:
-        compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
+        compute_dtype = _compute_dtype(dtype)
         # Allocate S in ``compute_dtype`` (NOT q.dtype) so the in-place add
         # below does not crash with ``RuntimeError: result type Float cannot
         # be cast to the desired output type Half`` for fp16/bf16 callers
@@ -588,7 +613,7 @@ def naive_chunk_kda(
     if scale is None:
         scale = K ** -0.5
 
-    compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
+    compute_dtype = _compute_dtype(dtype)
     q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     q = q.repeat_interleave(G, dim=1) * scale
@@ -828,27 +853,17 @@ def scripted_chunk_kda(
     dtype = v.dtype
     _validate_kda_inputs(q, k, v, g, beta, fn_name='scripted_chunk_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    if H < 1:
-        raise ValueError(f"H={H} must be >= 1")
-    if K < 1:
-        raise ValueError(f"K={K} must be >= 1")
-    if V < 1:
-        raise ValueError(f"V={V} must be >= 1")
-    if chunk_size < 1:
-        raise ValueError(f"chunk_size={chunk_size} must be >= 1")
+    # K2 fix: shape + chunk_size validation centralized in
+    # ``_validate_kda_shapes`` (mirrors naive_chunk_kda).
+    _validate_kda_shapes(
+        q, k, v, g, beta, fn_name='scripted_chunk_kda', chunk_size=chunk_size,
+    )
     G = HV // H
-    if HV % H != 0:
-        raise ValueError(f"HV={HV} must be divisible by H={H}")
-    if g.shape[2] != HV:
-        raise ValueError(f"g.shape[2]={g.shape[2]} must equal HV={HV}")
-    if g.shape[-1] != K:
-        raise ValueError(f"g.shape[-1]={g.shape[-1]} must equal K={K}")
-    if beta.shape[2] != HV:
-        raise ValueError(f"beta.shape[2]={beta.shape[2]} must equal HV={HV}")
     BT = chunk_size
     original_T = T
     if T == 0:
-        compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
+        # K4 fix: compute-dtype selection centralized in ``_compute_dtype``.
+        compute_dtype = _compute_dtype(dtype)
         S = q.new_zeros(B, HV, K, V, dtype=compute_dtype, device=q.device)
         if initial_state is not None:
             S = S + initial_state.to(device=S.device, dtype=compute_dtype)
@@ -872,7 +887,7 @@ def scripted_chunk_kda(
     if scale is None:
         scale = K ** -0.5
 
-    compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
+    compute_dtype = _compute_dtype(dtype)
     q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     q = q.repeat_interleave(G, dim=1) * scale
@@ -912,7 +927,6 @@ def scripted_chunk_kda(
         scripted_inner = torch.jit.script(_chunk_kda_inner_loop)
         chunk_outs, S = scripted_inner(q, k, u, g, w, S, upper_mask, NT)
     except Exception as exc:
-        import warnings as _warnings
         _warnings.warn(
             f"scripted_chunk_kda: torch.jit.script failed ({type(exc).__name__}: "
             f"{exc}); falling back to the eager inner loop. The output is "
