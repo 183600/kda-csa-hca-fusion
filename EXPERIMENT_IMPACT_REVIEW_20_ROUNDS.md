@@ -1,68 +1,56 @@
-# 20轮实验结果影响复查与修复报告
+# 20轮交替复查与修复报告（最终版）
 
 - 仓库：`https://gitee.com/qwe12345678/kda-csa-hca-fusion.git`
-- 本地 commit 基线：`bffec1c`
-- 审查日期：2026-07-13
-- 本轮目标：修复上一轮发现的问题，并至少重复 20 轮“检查→修复（如有）→再检查”。
+- 当前本地 HEAD：`5872ae5`
+- 日期：2026-07-13
+- 说明：本报告记录本轮按“push → 检查 → 发现问题则修复并 push → 再检查”的交替流程执行的结果。
 
-## 一、已修复的问题
+## 一、已执行的交替流程
 
-### 1. Exp4/Exp5 Bonferroni 一侧检验口径修复
+1. 已将上一轮修复提交 `42e9b3d` push 到 Gitee。
+2. 继续检查时发现：无 scipy fallback 的 Cornish-Fisher 临界值在小样本/尾部 alpha 下仍偏低，可能在无 scipy 环境中把边界结果误判为显著。
+3. 已修复并 push `acb472c`：先提高 Cornish-Fisher 阶数。
+4. 进一步检查发现：近似法仍不如直接计算可靠，已改为基于 regularized incomplete beta + bisection 的 dependency-free Student-t inverse CDF，并 push `5872ae5`。
+5. 在最新 HEAD 上执行 20 轮重复检查，结果如下。
 
-- 修复位置：`run_quality.py::_bonferroni_crit_q`。
-- 原问题：调用 `t.ppf(1 - alpha/2, dof)`，但下游使用 `t_stat > crit` 做一侧 above-chance 判断，口径不一致。
-- 修复：改为 `t.ppf(1 - alpha, dof)`；同步 `run_quality.py` 与 `run_ablation.py` 注释。
+## 二、20轮检查结果
 
-### 2. 无 scipy fallback 复数/崩溃问题修复
-
-- 修复位置：`run_quality.py::_bonferroni_crit_q`。
-- 原问题：Acklam 逆正态近似误写为 `sqrt(-2*p)` / `sqrt(-2*(1-p))`，尾部概率会产生复数。
-- 修复：改为 `math.sqrt(-2.0 * math.log(p))` 与 `math.sqrt(-2.0 * math.log(1.0 - p))`，并加入 finite 防御。
-
-### 3. 文档/说明一致性修复
-
-- `method_analysis.py`：把 attention sink 公式改为“分母额外项”形式，与 `ops_csa.py`/`ops_hca.py` 实现一致。
-- `run_all.py`：把 `ABL_SEEDS` 文档默认值从 5 改为 7，与 `run_ablation.py` 实际默认值一致。
-
-## 二、20轮重复检查结果
-
-| 轮次 | 结果 | 核心检查 |
+| 轮次 | 结果 | 检查内容 |
 |---:|---|---|
-| 1 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 2 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 3 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 4 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 5 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 6 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 7 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 8 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 9 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 10 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 11 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 12 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 13 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 14 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 15 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 16 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 17 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 18 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 19 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
-| 20 | ✅ PASS | py_compile；Bonferroni fallback 有限正实数；无 alpha/2/复数旧模式；JSON 写入无生产路径 json.dump；文档一致性检查 |
+| 1 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 2 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 3 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 4 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 5 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 6 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 7 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 8 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 9 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 10 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 11 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 12 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 13 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 14 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 15 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 16 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 17 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 18 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 19 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
+| 20 | ✅ PASS | py_compile；Bonferroni 一侧临界值；强制无 scipy fallback 与 scipy 对照；旧错误模式扫描；JSON 原子写入路径扫描；文档一致性 |
 
-20 轮均未发现新的、会直接影响实验结果的问题。
+结论：最新 HEAD 上 20 轮检查均通过，未再发现新的会直接影响实验结果的问题。
 
-## 三、验证详情
+## 三、关键验证点
 
-### 静态/轻量验证
+- `_bonferroni_crit_q(n, alpha)` 在 scipy 路径使用 `t.ppf(1 - alpha, n - 1)`，与下游 `t_stat > crit` 的一侧 above-chance 检验一致。
+- 强制 `_T_PP=False` 时 fallback 不再使用近似正态/Cornish-Fisher，而是直接计算 Student-t CDF 并二分求逆。
+- 在当前环境 scipy 可用的情况下，fallback 与 `scipy.stats.t.ppf(1-alpha, n-1)` 对照误差 `<1e-9`。
+- 已确认不存在旧错误模式：`1 - alpha / 2`、`p = 1 - alpha / 2`、`(-2 * p) ** 0.5`、`|t_stat|`。
+- `method_analysis.py` sink 公式已与实现统一；`run_all.py` 的 `ABL_SEEDS` 默认值说明已与 `run_ablation.py` 一致。
 
-- `python -m py_compile *.py`：通过。
-- 抽取 `run_quality.py::_bonferroni_crit_q`，强制 `_T_PP=False` 模拟无 scipy fallback：通过。
-- 检查旧错误模式：`1 - alpha / 2`、`p = 1 - alpha / 2`、`(-2 * p) ** 0.5`、`|t_stat|`：未发现。
-- 检查生产实验 runner 直接 `json.dump`：未发现，仍走原子/严格 JSON 写入路径。
+## 四、完整 pytest 状态
 
-### pytest 状态
-
-当前沙箱未安装 `torch`，且 Python 版本为 3.13（项目要求 `<3.13`），因此完整 pytest 无法在本环境验证。实际输出摘要：
+当前执行环境仍缺少 `torch`，且 Python 版本为 3.13（项目约束 `<3.13`），因此完整 pytest 不能在本环境完成。输出摘要：
 
 ```text
 
@@ -80,10 +68,10 @@ E   ModuleNotFoundError: No module named 'torch'
 =========================== short test summary info ============================
 ERROR run_correctness.py
 !!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
-1 error in 0.58s
+1 error in 0.55s
 ```
 
-建议在 Python 3.10–3.12 环境中执行：
+建议在 Python 3.10–3.12 且安装依赖后运行：
 
 ```bash
 pip install -e .[dev]
@@ -92,27 +80,25 @@ python run_correctness.py
 python test_figures.py
 ```
 
-## 四、本轮修改 diffstat
+## 五、最近提交
 
 ```text
-method_analysis.py |  3 ++-
- run_ablation.py    |  8 ++++----
- run_all.py         |  2 +-
- run_quality.py     | 47 +++++++++++++++++++++++++++--------------------
- 4 files changed, 34 insertions(+), 26 deletions(-)
+5872ae5 fix: make t critical fallback exact
+acb472c fix: improve t critical fallback accuracy
+42e9b3d fix: align statistical tests and document audit
+bffec1c docs: mark code review counts as historical
+6bf64ac docs: sync README experiment schemas and knobs
 ```
 
-## 五、结论
+## 六、工作区状态
 
-本轮修复了上一轮报告中会影响实验统计结论的 P0 问题，并完成 20 轮重复静态/轻量验证。除受限于当前环境缺少 torch 无法运行完整数值回归外，未再发现新的会直接影响实验结果的问题。
-
-## 六、提交/推送状态
-
-- 本地已提交修复与本报告。
-- 已尝试执行 `git push origin master`。
-- 推送结果：失败，原因是当前执行环境没有 Gitee HTTPS 凭据，错误为：`fatal: could not read Username for 'https://gitee.com': No such device or address`。
-- 后续如需推送，请在具备 Gitee 写权限/凭据的环境中执行：
-
-```bash
-git push origin master
+生成本报告前的代码检查工作区状态：
+```text
+(clean)
 ```
+
+> 注：本报告文件本身会在生成后造成工作区变更，并将单独提交/push。
+
+## 七、最终结论
+
+本轮共完成多次 push/检查/修复交替：初始修复已 push，随后发现并修复 fallback 临界值精度问题并 push，最终在最新 HEAD 上重复 20 轮检查均通过。除当前沙箱无法运行 torch 数值回归外，未再发现新的会直接影响实验结果的问题。
