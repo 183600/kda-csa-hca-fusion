@@ -58,7 +58,7 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
 ├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache (incremental decode)
 ├── ops_fused.py           # HybridConfig + KDAHybridLayer/CSAHybridLayer/HCAHybridLayer + HybridKCHAttention
-├── run_correctness.py     # 199 regression tests (custom runner; pytest-importable)
+├── run_correctness.py     # 230+ regression checks (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
 ├── run_quality.py         # Exp 4: MQAR associative-recall quality (multi-seed)
 ├── run_ablation.py        # Exp 5: KDA:CSA:HCA ratio ablation
@@ -152,6 +152,10 @@ Environment knobs (set before launching):
 | `ABL_STEPS` | `100` | training steps for Exp 5 |
 | `BENCH_LENGTHS` | `128,256,512,1024,2048` | sequence lengths for Exp 2 |
 | `BENCH_REPEATS` | `5` | timed repeats per (T, op) in Exp 2 |
+| `MQAR_TRAIN_BATCH` | `32` | training batch size for Exp 4 |
+| `ABL_TRAIN_BATCH` | `16` | training batch size for Exp 5 |
+| `MQAR_NKV` | `1` | comma-separated MQAR `n_kv` values for Exp 4 (e.g. `1,2,4`) |
+| `ABL_NKV` | `1` | comma-separated MQAR `n_kv` values for Exp 5 |
 | `SKIP_SLOW` | `0` | `1` truncates Exp 2/4/5 on CPU |
 | `SKIP_CUDA_CHECK` | `0` | `1` bypasses the CUDA-availability guard |
 
@@ -160,7 +164,7 @@ Environment knobs (set before launching):
 ## Tests
 
 ```bash
-# Custom runner (199 tests, includes long-running correctness checks):
+# Custom runner (230+ checks, includes long-running correctness checks):
 python run_correctness.py
 
 # pytest-compatible: the test functions use the standard `test_*` naming
@@ -181,10 +185,10 @@ runs during development.
 
 | File | Schema | Notes |
 |---|---|---|
-| `results/exp1_correctness.json` | `{ metadata, results: [...] }` | per-test `{name, ok, detail}` rows |
+| `results/exp1_correctness.json` | `[{name, status, detail}, ...]` | per-check rows from the custom runner |
 | `results/exp2_benchmark.json` | `[{T, op, time_ms, peak_mem_MB, device, repeats, compute_boundary, n_layers, note}, ...]` | **`compute_boundary` differs per op** — see *Fairness notes* |
 | `results/exp3_kv_cache.json` | `[{T, op, accounting_mode, accounting_semantics, kv_bytes, kv_elements, ...}, ...]` | analytic model, not profiled |
-| `results/exp4_mqar.json` | `[{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]` | multi-seed with CI95 + Bonferroni |
+| `results/exp4_mqar.json` | `{metadata, results: [{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]}` | multi-seed with CI95 + Bonferroni |
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper |
 | `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches) |
 | `results/summary.json` | `{env, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
