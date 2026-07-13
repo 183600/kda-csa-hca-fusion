@@ -960,6 +960,15 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     if isinstance(device, str):
         device = torch.device(device)
     seeds = [42 + i for i in range(n_seeds)]
+    # Compute the actual training-step count for THIS op once, mirroring
+    # ``train_one``'s ``actual_steps = softmax_steps if op_name == 'softmax'
+    # else steps`` logic. Used in the per-seed error stub below so the
+    # recorded ``steps`` field matches what a SUCCESS row would have
+    # recorded (the previous stub used ``steps`` unconditionally, which
+    # is wrong for the softmax op when ``softmax_steps != steps`` —
+    # silently mislabelling the figure title and any downstream
+    # ``pd.DataFrame(per_seed)['steps']`` analysis).
+    actual_steps_for_op = softmax_steps if op_name == 'softmax' else steps
     per_seed = []
     for s in seeds:
         t0 = time.time()
@@ -1004,7 +1013,16 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 'last_train_acc': None,
                 'mean_last10_loss': None,
                 'mean_last10_acc': None,
-                'steps': steps,
+                # Use the OP-SPECIFIC step count (softmax_steps for softmax,
+                # steps for others) so the stub matches what a success row
+                # would record. Critical for the long-training softmax
+                # sensitivity run (MQAR_SOFTMAX_STEPS != MQAR_STEPS): if
+                # softmax seed 42 fails, the stub must still record the
+                # softmax budget, not the other-ops budget, otherwise
+                # make_figures._plot_mqar_group's title (which reads
+                # ``per_seed[0].get('steps')`` for the softmax row)
+                # silently hides the asymmetry.
+                'steps': actual_steps_for_op,
                 'seed': s,
                 'train_batch': kw.get('train_batch'),
                 'train_time_s': time.time() - t0,
