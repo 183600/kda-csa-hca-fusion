@@ -444,6 +444,18 @@ def csa_lightning_indexer(
             "default, simplified STE) or 'full_softmax' (dense STE) for now.")
     if scale is None:
         scale = q_idx.shape[-1] ** -0.5
+    # P0-2 fix (round 1): when the caller has L2-normalized both q_idx and
+    # k_idx (normalize_qk=True), scores are cosine similarities in [-1, 1]
+    # and the ``1/sqrt(c_I)`` factor — a leftover from un-normalized
+    # dot-product attention — over-shrinks the ReLU scores and (critically
+    # for the STE training path) makes the softmax over-compressed blocks
+    # nearly uniform. That damps the straight-through gradient flowing
+    # back to W_IUQ / W_w / W_KV_idx / W_Z_idx / B_idx by a factor of
+    # ~sqrt(c_I), systematically slowing indexer learning. Use scale=1.0
+    # for the cosine case (matching naive_csa's core-attention scale
+    # convention, which already defaults to 1.0 for L2-normalized q/C).
+    if normalize_qk:
+        scale = 1.0
     B_, T, HI, DI = q_idx.shape
     n_blocks = k_idx.shape[1]
     compute_dtype = torch.float64 if q_idx.dtype == torch.float64 else torch.float
@@ -789,17 +801,6 @@ def naive_csa(
     q_idx = F.linear(cQ, W_IUQ).view(B_, T, nIh, c_I)              # [B, T, nIh, c_I]
     w_idx = F.linear(H, W_w)                                      # [B, T, nIh]
     cbm = _causal_block_mask(T, n_blocks, m, device)
-    # The lightning indexer scores are dot products over DI = c_I (not c),
-    # so the correct scale is c_I ** -0.5 (per the DeepSeek-V4 paper Eq. 15:
-    # score = ReLU(q_idx . K_idx / sqrt(DI))). We previously passed the
-    # outer ``scale`` (defaulting to c ** -0.5), which is the correct scale
-    # for the sparse MQA core (dot product over c) but NOT for the indexer.
-    #
-    # Note: this does not change the top-k selection (ReLU is positively
-    # homogeneous, so scaling all scores by a positive constant preserves
-    # their relative ordering), but it makes the code match the documented
-    # formula and ensures the logits have the intended magnitude if they
-    # are ever exposed for downstream use (e.g. learnable temperature).
     # Inference / benchmark fix: STE is a TRAINING-only surrogate for the
     # non-differentiable top-k indexer. It is forward-equivalent to the hard
     # gather but costs an extra full softmax + soft gather. Under
@@ -808,8 +809,15 @@ def naive_csa(
     # on ``torch.is_grad_enabled()`` so training keeps the default behaviour,
     # while no-grad inference uses the lean hard-index path.
     effective_use_ste = use_ste and torch.is_grad_enabled()
+    # The lightning indexer scores are dot products over DI = c_I (not c).
+    # Scale policy: csa_lightning_indexer now AUTO-SELECTS the scale —
+    #   * normalize_qk=True  -> scale=1.0 (cosine similarity; P0-2 fix round 1)
+    #   * normalize_qk=False -> scale=c_I**-0.5 (classical dot-product attention)
+    # Callers pass scale=None to defer to that policy; previously we hard-coded
+    # ``c_I ** -0.5`` which, combined with normalize_qk=True, over-shrunk the
+    # logits and damped the STE gradient (systematically slowing indexer learning).
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
-                                    scale=c_I ** -0.5,
+                                    scale=None,
                                     causal_block_mask=cbm,
                                     return_soft_weights=effective_use_ste,
                                     ste_mode=ste_mode,

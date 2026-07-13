@@ -60,6 +60,10 @@ DEFAULTS = dict(
     hca_m2=64, hca_c=128, hca_sliding_window=2048,
     hca_nh=8, hca_dc=128,
     kda_hv=8, kda_k=128, kda_v=128,
+    # KDA short-conv kernel size (depthwise Conv1d in KDAHybridLayer).
+    # P0-1 fix (round 1): the short-conv FLOPs were previously omitted;
+    # make kernel size configurable here so future changes propagate.
+    kda_conv_ksize=3,
     # Hybrid layer-count ratio. Keeping these in DEFAULTS makes the documented
     # kwargs override path work (unknown-key validation below otherwise rejects
     # hybrid_n_kda / hybrid_n_csa / hybrid_n_hca before the hybrid branch sees
@@ -317,12 +321,21 @@ def prefill_flops(op: str, T: int, **kw):
               d * (2 * H * kda_k + kda_hv * kda_v + kda_k + kda_hv)
             + kda_k * kda_hv * kda_k   # g_up: inner dim is kda_k, not d
         )
+        # Causal depthwise short-conv (KDAHybridLayer.short_conv):
+        # Conv1d(in=d, out=d, kernel_size=ksize, groups=d, bias=True).
+        # Depthwise: each output channel = 1 * ksize MACs per timestep,
+        # for a total of ``T * d * ksize`` MACs -> 2*T*d*ksize FLOPs.
+        # The bias adds T*d FLOPs, negligible vs 6*T*d for ksize=3.
+        # Previously omitted, systematically understating KDA FLOPs
+        # by ~3-6% depending on d (P0-1 fix, round 1).
+        ksize = p.get('kda_conv_ksize', 3)
+        short_conv = 2 * T * d * ksize
         # Recurrence: ~3 HV*K*V MACs per step (see docstring).
         recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
         # Grouped output projection: HV*V -> d (matches KDAHybridLayer.o_proj,
         # run_quality.KDAAttn.o, and run_decoding.KDAAttnDecoding.o).
         out_proj = 2 * T * kda_hv * kda_v * d
-        return proj + recurrent + out_proj
+        return proj + short_conv + recurrent + out_proj
     if op == 'csa':
         # P1-4 fix: use ceil(T / m) for the logical block count. The
         # FLOPs path does NOT use the ``max(1, ...)`` floor because at

@@ -852,7 +852,12 @@ class CSADecodingCache:
                 self._K_IComp.to(compute_dtype),                       # [B, n_blocks, c_I]
                 w_idx.to(compute_dtype),                               # [B, 1, nIh]
                 topk,
-                scale=self.c_I ** -0.5,
+                # P0-2 fix (round 1): defer scale selection to
+                # csa_lightning_indexer — it picks 1.0 when
+                # normalize_qk=True (cosine), 1/sqrt(c_I) otherwise.
+                # Previously hard-coding self.c_I**-0.5 over-shrunk
+                # normalized cosine scores and damped STE gradients.
+                scale=None,
                 causal_block_mask=cbm,
                 return_soft_weights=effective_use_ste,
                 ste_mode=ste_mode,
