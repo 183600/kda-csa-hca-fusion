@@ -226,11 +226,21 @@ def _t_crit_975(n):
     }
     if n in _TABLE:
         return _TABLE[n]
-    # n > 100: Cornish-Fisher 1st-order expansion around the normal quantile.
-    # Relative error < 0.1% at n=101 for the 97.5% level; much better than
-    # the bare 1.96 under Bonferroni-corrected alphas (see docstring).
-    z = 1.959963984540054  # scipy.stats.norm.ppf(0.975)
-    return z + (z ** 3 + z) / (4.0 * (n - 1))
+    # n > 100: delegate to the exact Student-t inverse CDF used by
+    # _bonferroni_crit_q (regularized incomplete beta + bisection). The
+    # previous Cornish-Fisher expansion was accurate for the 97.5% level
+    # (<0.1% error) but is still an approximation; using the exact path
+    # guarantees <1e-9 accuracy without scipy and keeps the CI consistent
+    # with the Bonferroni critical values (which already use the exact path).
+    # P2-1 fix (2026-07-13): n=200 seeds now gets an exact CI instead of
+    # an approximate one.
+    try:
+        return _bonferroni_crit_q(n, alpha=0.025)
+    except Exception:
+        # Fallback to Cornish-Fisher if _bonferroni path itself fails
+        # (should never happen, but keep a safe net).
+        z = 1.959963984540054  # scipy.stats.norm.ppf(0.975)
+        return z + (z ** 3 + z) / (4.0 * (n - 1))
 
 
 def _bonferroni_crit_q(n, alpha=0.05):

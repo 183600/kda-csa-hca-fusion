@@ -151,6 +151,35 @@ def _compute_dtype(dtype):
     return torch.float64 if dtype == torch.float64 else torch.float
 
 
+def _is_compiling_safely() -> bool:
+    """Return True if we are inside a torch.compile / torch.export trace.
+
+    P0-2 fix — torch 2.2 compatibility: ``torch.compiler.is_compiling()``
+    was introduced in torch 2.3. On torch 2.2 (allowed by pyproject.toml
+    ``torch>=2.2,<2.7``) the attribute does not exist and a direct call
+    raises ``AttributeError``, crashing ``naive_recurrent_kda`` entirely.
+    We try the new API first, then fall back to ``torch._dynamo``'s
+    equivalent, then to False. The helper never raises.
+    """
+    try:
+        # torch >=2.3 path (official documented pattern)
+        return torch.compiler.is_compiling()  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    except Exception:
+        # Any other error inside is_compiling (e.g. dynamo not initialized)
+        # should be treated as "not compiling" rather than crashing the op.
+        return False
+    try:
+        import torch._dynamo as _dm  # local import to avoid hard dep
+        fn = getattr(_dm, "is_compiling", None)
+        if callable(fn):
+            return bool(fn())
+    except Exception:
+        pass
+    return False
+
+
 def _warn_if_nonfinite(o, fn_name, stacklevel=3):
     """Review-fix 1.1: surface non-finite KDA outputs with an actionable hint.
 
@@ -223,7 +252,8 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
         ``test_kda_unnormalized_input_warns`` in ``run_correctness.py``
         for regression coverage of both halves of this contract.
     """
-    if torch.compiler.is_compiling():
+    # P0-2 fix — safe wrapper for torch 2.2 compat (see _is_compiling_safely)
+    if _is_compiling_safely():
         # Skip the check entirely inside a torch.compile / torch.export
         # trace — see the review-fix 1.1-a note above. The compiled graph
         # therefore never contains this data-dependent branch.
@@ -599,6 +629,15 @@ def compiled_recurrent_kda(
         # the cache would silently return the wrong-dtype state. Include it
         # in the key so a differing state_dtype forces a fresh compile.
         str(state_dtype),
+        # P0-1 fix (2026-07-13): scale and g_clamp_min are also baked into
+        # the closure's captured values (via _kda_kernel's closure over
+        # state_dtype and the passed scale_val/g_clamp_min_val). If two
+        # calls share shape/dtype but differ in scale (e.g. K**-0.5 vs 1.0)
+        # they must NOT hit the same cached graph, otherwise the second
+        # call would silently use the first call's scale, producing wrong
+        # numerical results. Include both in the key.
+        repr(scale),
+        repr(g_clamp_min),
     )
     compiled_fn = _COMPILED_KDA_CACHE.get(cache_key)
     if compiled_fn is None:
