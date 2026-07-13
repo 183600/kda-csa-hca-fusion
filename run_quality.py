@@ -43,7 +43,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json, write_json_atomic
+from kaggle_setup import (configure_torch_for_device, parse_int_env,
+                          sanitize_for_json, write_json_atomic,
+                          make_seeded_generator)
 from ops_kda import naive_recurrent_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -716,8 +718,7 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
                       # in train mode during evaluation.
         # Fixed seed for the eval generator so every operator sees the SAME eval
         # batches (apples-to-apples comparison at eval time too, not just train).
-        eval_gen = torch.Generator(device=device)
-        eval_gen.manual_seed(12345)
+        eval_gen = make_seeded_generator(12345, device=device)
         correct, total = 0, 0
         losses = []
         with torch.no_grad():
@@ -818,7 +819,6 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # IDENTICAL across operators for a given seed (the model init consumed a
     # different number of RNG draws per operator, which would otherwise
     # desync the global RNG and produce different training data per op).
-    batch_gen = torch.Generator(device=device)
     # BQ9 fix: use a LARGE offset (1_000_000) instead of ``+ 1``. The
     # previous offset collided with the next seed's model init: seed 42's
     # batch used seed 43, which is the SAME RNG stream as seed 43's
@@ -826,7 +826,9 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # the t-test's independence assumption. A large offset puts the
     # batch RNG stream in a completely different region of the seed
     # space, eliminating the overlap.
-    batch_gen.manual_seed(seed + 1_000_000)
+    # P2-1 fix (round 3): route through make_seeded_generator for
+    # CPU-fallback on older torch builds.
+    batch_gen = make_seeded_generator(seed + 1_000_000, device=device)
 
     losses, accs = [], []
     # Set train mode ONCE before the loop, not per step (the previous code

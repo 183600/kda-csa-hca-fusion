@@ -705,6 +705,36 @@ def write_json_atomic(payload, target_path: str, *, indent: int = 2,
         raise
 
 
+def make_seeded_generator(seed: int, device=None):
+    """Create a seeded ``torch.Generator`` with a safe CPU fallback.
+
+    P2-1 helper (round 3): older torch builds or CPU-only installs do not
+    support ``torch.Generator(device='cuda')`` (raises ``RuntimeError``).
+    A bare ``torch.Generator(device=device)`` in those environments crashes
+    experiment startup (Exp2/4/5/6). This helper tries the requested device
+    first and falls back to a CPU generator, which is still accepted by
+    ``torch.randn(..., device='cuda', generator=cpu_gen)`` (the RNG draws
+    happen on CPU, then tensors are materialized on the target device;
+    determinism is preserved).
+
+    Args:
+        seed: integer seed (callers are responsible for choosing a
+            per-op / per-seed / per-call unique value).
+        device: target device (torch.device, string, or None for CPU).
+    """
+    import torch
+    if device is None:
+        device = torch.device('cpu')
+    else:
+        device = torch.device(device)
+    try:
+        return torch.Generator(device=device).manual_seed(int(seed))
+    except Exception:
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        return g
+
+
 def write_results_json(payload, target_path, *, indent=2, logger=None):
     """AK1 fix: shared "atomic write + sanitize-fallback" helper.
 

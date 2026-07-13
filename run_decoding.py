@@ -42,7 +42,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
+from kaggle_setup import (configure_torch_for_device, sanitize_for_json,
+                          write_json_atomic, make_seeded_generator)
 from ops_kda import naive_recurrent_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -856,8 +857,8 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     # construction). This made run-to-run latency variance confounded
     # with input variance, and made the "median over repeats" noisier than
     # the inter-operator gap being measured.
-    _seed_gen = torch.Generator(device=device)
-    _seed_gen.manual_seed(0)
+    # P2-1 fix (round 3): route through make_seeded_generator for CPU-fallback.
+    _seed_gen = make_seeded_generator(0, device=device)
 
     # Pre-allocate the per-step decode input ONCE outside the timed loop.
     # The previous code allocated ``x_new = torch.randn(1, 1, d_model)`` inside

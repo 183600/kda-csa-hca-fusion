@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (
     configure_torch_for_device, parse_int_env, sanitize_for_json,
     write_json_atomic, write_results_json, capture_provenance,
+    make_seeded_generator,
 )
 from ops_fused import HybridKCHAttention, HybridConfig
 from run_quality import (
@@ -127,8 +128,7 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
         # Different ratios consume different numbers of RNG draws during model
         # init (different parameter counts), so using the global RNG would desync
         # eval batches across ratios. Mirrors run_quality.py::_eval_model.
-        eval_gen = torch.Generator(device=device)
-        eval_gen.manual_seed(12345)
+        eval_gen = make_seeded_generator(12345, device=device)
         with torch.no_grad():
             for _ in range(n_batches):
                 x_emb, target, cue_pos = make_mqar_batch(
@@ -188,11 +188,8 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
     # seed would produce different training data per ratio — a silent confound
     # in the multi-seed CI that undermines the apples-to-apples comparison.
     # Mirrors run_quality.py::train_one.
-    batch_gen = torch.Generator(device=device)
-    # Use the same large offset as run_quality.py. The old ``seed + 1`` made
-    # seed 42's batch RNG identical to seed 43's model-init RNG stream,
-    # weakening the independence assumption behind the multi-seed CI.
-    batch_gen.manual_seed(seed + 1_000_000)
+    # P2-1 fix (round 3): route through make_seeded_generator for CPU-fallback.
+    batch_gen = make_seeded_generator(seed + 1_000_000, device=device)
 
     # Configurable training batch size (default 16, overridable via the
     # ABL_TRAIN_BATCH env var for memory-constrained or GPU runs). Mirrors
@@ -268,8 +265,8 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
     # ``HybridKCHAttention.__init__``), so the previous code's
     # ``torch.randn(...)`` produced different inputs across ratios,
     # confounding latency comparisons.
-    lat_gen = torch.Generator(device=device)
-    lat_gen.manual_seed(99)
+    # P2-1 fix (round 3): route through make_seeded_generator for CPU-fallback.
+    lat_gen = make_seeded_generator(99, device=device)
     x = torch.randn(1, seq_len, d_model, device=device, generator=lat_gen) * 0.1
     # Switch to eval mode so any future Dropout/BN-style stochasticity
     # does not contaminate the latency measurement. Today the model has

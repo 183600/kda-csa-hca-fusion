@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (
     configure_torch_for_device, parse_int_env, sanitize_for_json,
-    write_json_atomic, capture_provenance,
+    write_json_atomic, capture_provenance, make_seeded_generator,
 )
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
@@ -78,10 +78,18 @@ def _make_op_gen(op_name, T, device):
     goal. We switch to ``zlib.crc32`` which is a stable, process-
     independent hash of the byte string, so the seed is reproducible
     without any env-var cooperation.
+
+    P2-1 fix (round 3): older torch / CPU-only builds don't support
+    ``torch.Generator(device='cuda')`` (raises RuntimeError). Fall back
+    to a CPU generator in that case; ``torch.randn(..., device='cuda',
+    generator=cpu_gen)`` is supported and still produces reproducible
+    (CPU-seeded, then GPU-materialized) draws. Without this fallback a
+    user on a CPU-only torch would crash Exp2 immediately.
     """
     name_hash = zlib.crc32(op_name.encode('utf-8')) & 0xFFFFFFFF
     t_hash = (T * 2654435761) & 0xFFFFFFFF
-    return torch.Generator(device=device).manual_seed(name_hash ^ t_hash)
+    seed = name_hash ^ t_hash
+    return make_seeded_generator(seed, device=device)
 
 
 def _clear_cache(device):
