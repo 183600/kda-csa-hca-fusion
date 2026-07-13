@@ -4258,11 +4258,11 @@ def test_kv_cache_full_accounting_runtime_state(device='cpu'):
     hca_m2, hca_c = p['hca_m2'], p['hca_c']
 
     T_csa = csa_m + 3
-    n_blocks_csa = max(1, (T_csa + csa_m - 1) // csa_m)
+    n_completed_csa = T_csa // csa_m
     expected_csa = (
-        n_blocks_csa * csa_c                       # compressed KV capacity
-        + min(T_csa, p['csa_sliding_window']) * csa_c
-        + n_blocks_csa * csa_cI                    # indexer key cache
+        n_completed_csa * csa_c                    # completed compressed KV rows
+        + p['csa_sliding_window'] * csa_c         # allocated SW ring buffer
+        + n_completed_csa * csa_cI                 # completed indexer key rows
         + (T_csa % csa_m) * (4 * csa_c + 2 * csa_cI)
         + 2 * csa_m * csa_c                        # previous Cb/Zb overlap
         + p['csa_nh']                              # sink
@@ -4270,10 +4270,10 @@ def test_kv_cache_full_accounting_runtime_state(device='cpu'):
     actual_csa = kv_cache_elements('csa', T_csa, mode='full_accounting', **p)
 
     T_hca = hca_m2 + 5
-    n_blocks_hca = max(1, (T_hca + hca_m2 - 1) // hca_m2)
+    n_completed_hca = T_hca // hca_m2
     expected_hca = (
-        n_blocks_hca * hca_c
-        + min(T_hca, p['hca_sliding_window']) * hca_c
+        n_completed_hca * hca_c
+        + p['hca_sliding_window'] * hca_c         # allocated SW ring buffer
         + (T_hca % hca_m2) * (2 * hca_c)
         + p['hca_nh']
     )

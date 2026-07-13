@@ -150,14 +150,26 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         # For the FLOPs path (``prefill_flops``), the LOGICAL count
         # (without the max(1, ...)) is used instead — see that function.
         n_blocks = max(1, (T + csa_m - 1) // csa_m)
-        # Compressed KV: n_blocks entries of c elements (keys serve as values).
+        # ``compressed_kv_only`` keeps the historical allocated-capacity / padded
+        # prefill semantics: reserve enough compressed slots for the trailing
+        # partial block as if it were padded out to length m.
         compressed = n_blocks * csa_c
         if mode == 'full_accounting':
-            # Sliding-window branch: uncompressed local KV, c per token, for the
-            # last `csa_sw` tokens. In decoding we only keep the last window.
-            sw = min(T, csa_sw) * csa_c
-            # Indexer key cache: n_blocks compressed indexer keys of c_I elements.
-            indexer = n_blocks * csa_cI
+            # Full-accounting mode tracks the *incremental decoding cache* state
+            # after T tokens have actually been appended. The reference cache only
+            # materializes compressed rows after a FULL block completes, so use
+            # floor(T/m) here (not the ceil capacity used above). The trailing
+            # partial block is represented by the partial accumulator below.
+            n_completed = T // csa_m
+            compressed_runtime = n_completed * csa_c
+            # Sliding-window branch: the reference decoding cache pre-allocates
+            # a fixed ring buffer of length csa_sw (when enabled), so memory
+            # accounting should count capacity, not just the number of currently
+            # valid tokens. This is conservative and matches the actual tensor
+            # allocated by _SlidingWindowRingBuffer.
+            sw = csa_sw * csa_c
+            # Indexer key cache: one compressed indexer key per completed block.
+            indexer = n_completed * csa_cI
             # Incremental decode also retains a partial-token accumulator until
             # a full block is available. CSA stores six per-token projections:
             # Ca/Cb/Za/Zb (4*c) plus indexer K/Z (2*c_I). The previous
@@ -168,13 +180,13 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             # Overlapped CSA compression needs the previous block's Cb/Zb as
             # the b-branch partner for the NEXT block. Once at least one block
             # has completed, the decoding cache retains two [m, c] tensors.
-            overlap_prev = (2 * csa_m * csa_c) if T >= csa_m else 0
+            overlap_prev = (2 * csa_m * csa_c) if n_completed >= 1 else 0
             # Compression metadata: the per-block softmax weights Z are recomputed
             # from the input hidden state during decoding, so they are NOT cached.
             # Sink: nh elements (negligible, included for completeness —
             # documented here even though the value is tiny).
             sink = p.get('csa_nh', H)
-            return compressed + sw + indexer + partial + overlap_prev + sink
+            return compressed_runtime + sw + indexer + partial + overlap_prev + sink
         return compressed
 
     if op == 'hca':
@@ -185,13 +197,20 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         n_blocks = max(1, (T + hca_m2 - 1) // hca_m2)
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':
-            sw = min(T, hca_sw) * hca_c
+            # Incremental HCA cache materializes compressed rows only for
+            # completed heavy-compression blocks; the trailing partial block is
+            # represented by the partial accumulator below.
+            n_completed = T // hca_m2
+            compressed_runtime = n_completed * hca_c
+            # HCA uses the same fixed-capacity sliding-window ring buffer as
+            # CSA, so count the allocated window capacity.
+            sw = hca_sw * hca_c
             # HCA's incremental cache retains a partial accumulator until m2
             # tokens are available: C and Z projections for each partial token.
             partial_tokens = T % hca_m2
             partial = partial_tokens * (2 * hca_c)
             sink = p.get('hca_nh', H)
-            return compressed + sw + partial + sink
+            return compressed_runtime + sw + partial + sink
         return compressed
 
     if op == 'hybrid_kch':
