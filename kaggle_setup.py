@@ -11,9 +11,14 @@ It exposes:
 
   * ``detect_env()``        -> dict with flags (is_kaggle, has_gpu, device, ...)
   * ``get_device()``         -> ``torch.device``
-  * ``setup_kaggle()``       -> call once at the top of a notebook; installs the
-                                right torch wheel if CUDA is present but
-                                ``torch.cuda.is_available()`` is False.
+  * ``setup_kaggle()``       -> SM1 fix: previously documented as "installs
+                                the right torch wheel"; the implementation
+                                (see ``bootstrap_kaggle_cuda``) actually
+                                VALIDATES CUDA availability and raises
+                                ``RuntimeError`` if a GPU was expected but
+                                not found. The wheel-install logic lives
+                                in ``bootstrap_kaggle_cuda``; this function
+                                is the validation entry point.
   * ``to_device(x, device)`` -> moves tensors / modules recursively.
   * ``num_workers()``        -> sensible DataLoader worker count.
 
@@ -355,7 +360,16 @@ def to_device(x, device: torch.device | None = None):
 
 
 def num_workers() -> int:
-    """Sensible DataLoader worker count for the current environment."""
+    """Sensible DataLoader worker count for the current environment.
+
+    SM7 note: this function is currently NOT called by any of the four
+    experiment runners (run_benchmark / run_quality / run_ablation /
+    run_decoding / run_kv_cache) — they all use ``batch_size=1`` training
+    loops with no DataLoader. It is kept for external callers (e.g. a
+    user adapting the repo to a real training pipeline) and for the
+    module's documented public API. If you remove it, also update the
+    module docstring above.
+    """
     if is_kaggle():
         return 2
     return max(1, (os.cpu_count() or 2) // 2)
@@ -410,12 +424,21 @@ def configure_logging(verbose: bool = True) -> None:
         root.setLevel(target_level)
 
 
-def configure_torch_for_device(device: torch.device | None = None) -> EnvInfo:
+def configure_torch_for_device(
+    device: torch.device | None = None,
+    *,
+    verbose: bool = True,  # SM5 fix: was hardcoded True; now a kwarg.
+) -> EnvInfo:
     """Set global thread count + cudnn flags appropriate for the device.
 
     Call this once at the top of every experiment script.
+
+    Args:
+        verbose: if True, configure logging at INFO level. Set to False
+            for non-experiment callers (e.g. ``method_analysis.demo_*``)
+            that don't want the global logger reconfigured.
     """
-    configure_logging(verbose=True)
+    configure_logging(verbose=verbose)
     info = detect_env()
     if device is None:
         device = info.device
