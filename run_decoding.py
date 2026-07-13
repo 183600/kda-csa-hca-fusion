@@ -893,11 +893,10 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         baseline_bytes = torch.cuda.memory_allocated(device)
         # Reset peak memory AFTER both warmup AND model.reset() so the
         # reported peak reflects only the timed trials, not the warmup
-        # allocations. ``model.reset()`` is currently a no-op on memory
-        # (just sets ``self._state = None``), but resetting peak AFTER
-        # the reset is the robust order — if reset ever switches to
-        # zeroing buffers in place, no transient reset allocation can
-        # leak into the reported peak.
+        # allocations. Some reset() implementations intentionally drop cache
+        # tensors (CSA/HCA/hybrid) so the timed prefill's cache allocation is
+        # counted in peak_mem; resetting stats after reset prevents the warmup
+        # deallocation/reallocation churn from leaking into the reported peak.
         torch.cuda.reset_peak_memory_stats(device)
     else:
         baseline_bytes = 0
@@ -977,14 +976,13 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # softmax even if their activation footprints were identical — an
         # unfair comparison.
         #
-        # The peak is dominated by prefill (which allocates [1, H, T, T]
-        # attention scores ≈ 32 MB at plen=2048, vs the per-step decode
-        # cache ≈ 260 KB). To report the *decoding* footprint (what a
-        # serving engine actually pays in steady state), we would need to
-        # reset peak stats after prefill — but then the reported number
-        # would miss the prefill activations a serving engine retains in
-        # the KV cache. Reporting the global peak (minus baseline) is the
-        # honest choice: it is the maximum activation memory the model
+        # The peak is usually dominated by prefill activations (e.g. dense
+        # softmax scores) plus whatever runtime cache is allocated for the
+        # operator. To report only the *post-prefill decode-step* footprint we
+        # would need to reset peak stats after prefill, but then the reported
+        # number would miss the cache allocations a serving engine retains.
+        # Reporting the global peak (minus the parameter baseline) is the
+        # honest choice: it is the maximum activation/cache memory the model
         # needs at any point, including prefill.
         peak_bytes = torch.cuda.max_memory_allocated(device)
         peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
