@@ -981,9 +981,34 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
             per_seed.append(r)
         except Exception as e:
             logger.warning(f"    seed {s} FAILED: {e}")
+            # Per-seed error stub: include ALL success-row fields (set to
+            # None / 0 where not applicable) so downstream consumers using
+            # ``pd.DataFrame(per_seed)`` or ``per_seed[0].get('steps', ...)``
+            # see a consistent schema. The previous stub only carried
+            # {seed, error, final_acc, final_loss}, which silently broke:
+            #   1. ``make_figures._plot_mqar_group`` — reads
+            #      ``per_seed[0].get('steps', 100)`` for the figure title;
+            #      if seed 42 failed, the title rendered "100 steps" instead
+            #      of the actual step count.
+            #   2. ``pd.DataFrame(per_seed)`` — uses the first record's keys
+            #      as columns, so all extra fields on success rows were
+            #      silently dropped, breaking any analyst doing
+            #      ``pd.DataFrame(per_seed)['steps']``.
+            # Mirrors the top-level error-stub fix (round 1, Task 1-f).
             per_seed.append({
-                'seed': s, 'error': str(e),
-                'final_acc': None, 'final_loss': None,
+                'op': op_name,
+                'n_kv': kw.get('n_kv', 1),
+                'final_acc': None,
+                'final_loss': None,
+                'chance_acc': 1.0 / kw.get('vocab', 16) if 'vocab' in kw else None,
+                'last_train_acc': None,
+                'mean_last10_loss': None,
+                'mean_last10_acc': None,
+                'steps': steps,
+                'seed': s,
+                'train_batch': kw.get('train_batch'),
+                'train_time_s': time.time() - t0,
+                'error': str(e),
             })
         # On GPU, clear the CUDA cache between seeds so the allocator does
         # not accumulate freed-but-unreleased blocks across seeds.
@@ -1400,6 +1425,14 @@ def main():
             'training_steps_fairness': {
                 'softmax_steps': softmax_steps,
                 'other_ops_steps': steps,
+                # Make the note CONDITIONAL on the actual asymmetry,
+                # matching the summary-table note at lines 1230-1233.
+                # The previous unconditional note claimed "softmax is
+                # trained for more steps" even when softmax_steps ==
+                # steps (the default fair comparison since the P0-3
+                # fix), contradicting the numeric fields above and
+                # misleading any reader who consults the JSON metadata
+                # without re-deriving the comparison.
                 'note': (
                     "The softmax baseline is trained for more steps than "
                     "the other operators so it actually converges (the "
@@ -1408,6 +1441,15 @@ def main():
                     "upper bound). Any cross-op accuracy comparison must "
                     "annotate this asymmetry. See README 'Fairness notes' "
                     "section."
+                ) if softmax_steps != steps else (
+                    "Default fair comparison: every operator (including "
+                    "softmax) receives the same optimizer-step budget "
+                    "(MQAR_STEPS). An optional longer-softmax "
+                    "sensitivity run can be requested via the "
+                    "MQAR_SOFTMAX_STEPS env var; in that case "
+                    "softmax_steps > other_ops_steps and the asymmetry "
+                    "must be annotated as a non-fixed-budget comparison. "
+                    "See README 'Fairness notes' section."
                 ),
             },
             'schema_version': 1,

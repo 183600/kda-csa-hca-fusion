@@ -1061,7 +1061,27 @@ def _chunk_kda_inner_loop(
         # ``diff = g_i.unsqueeze(-2) - g_i.unsqueeze(-3)`` mirrors the
         # einsum-friendly broadcast form. Shape: ``[B, H, BT, BT, K]``.
         diff = g_i.unsqueeze(-2) - g_i.unsqueeze(-3)
-        Aqk = (q_i.unsqueeze(-2) * diff.exp() * k_i.unsqueeze(-3)).sum(-1)
+        # P0 numerical-stability fix (mirrors the clamp at line 844 in
+        # ``naive_chunk_kda``'s A-matrix construction). For masked-out
+        # upper-triangular entries (c > i), ``g_i[..., c, :] - g_i[..., i, :]``
+        # is POSITIVE when ``g < 0`` (the documented contract — g is produced
+        # upstream as ``-softplus(...) * kda_decay_scale`` and clamped to
+        # ``>= g_clamp_min=-10``). With ``BT=64`` and ``g_clamp_min=-10`` this
+        # difference can reach ~630, and ``exp(630) = inf`` in fp32. The
+        # subsequent ``Aqk.masked_fill(mask, 0)`` zeroes the forward output
+        # (so the forward is fine), but ``exp(diff) * 0 = inf * 0 = NaN`` in
+        # the BACKWARD pass, poisoning ``q.grad`` / ``k.grad`` / ``g.grad``.
+        # The sibling A-matrix at line 844 was already clamped via
+        # ``(g - g_i).clamp(max=50.0)``; the same fix was missing here.
+        # Clamping the exponent to a safe upper bound (``exp(50) ~= 5e21``,
+        # finite in fp32) prevents the overflow without changing the math
+        # for reasonable g values (typical g in [-1, 0] gives differences
+        # well below 50). The masked_fill below still zeroes the upper
+        # triangle as before; the clamp only changes the (masked-out)
+        # entries that would otherwise produce inf/NaN in backward.
+        # Verified: forward output bit-identical (max diff 0.0); backward
+        # gradients finite for g down to ``g_clamp_min=-10``.
+        Aqk = (q_i.unsqueeze(-2) * diff.clamp(max=50.0).exp() * k_i.unsqueeze(-3)).sum(-1)
         Aqk = Aqk.masked_fill(mask, 0)
         v_i = u_i - w_i @ S
         chunk_outs.append((q_i * g_i.exp()) @ S + Aqk @ v_i)

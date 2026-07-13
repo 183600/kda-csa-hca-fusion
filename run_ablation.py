@@ -338,9 +338,32 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
             per_seed.append(r)
         except Exception as e:
             logger.warning(f"    seed {s} FAILED: {e}")
+            # Per-seed error stub: include ALL success-row fields (set to
+            # None / 0 where not applicable) so downstream consumers using
+            # ``pd.DataFrame(per_seed)`` see a consistent schema. The
+            # previous stub only carried {seed, error, final_acc,
+            # final_loss, fwd_ms}, which silently dropped ratio / layout /
+            # n_params / n_layers / steps / train_batch / loss_curve from
+            # the schema when seed 42 failed. Mirrors the run_quality.py
+            # per-seed error-stub fix.
+            ratio_str = f'{ratio[0]}:{ratio[1]}:{ratio[2]}' if isinstance(ratio, tuple) else str(ratio)
             per_seed.append({
-                'seed': s, 'error': str(e),
-                'final_acc': None, 'final_loss': None, 'fwd_ms': None,
+                'ratio': ratio_str,
+                'n_kv': kw.get('n_kv', 1),
+                'layout': None,
+                'final_acc': None,
+                'final_loss': None,
+                'fwd_ms': None,
+                'n_params': None,
+                'n_layers': None,
+                'seed': s,
+                'steps': steps,
+                'train_batch': kw.get('train_batch'),
+                'last_train_loss': None,
+                'mean_last10_loss': None,
+                'loss_curve': [],
+                'train_time_s': time.time() - t0,
+                'error': str(e),
             })
         # On GPU, clear the CUDA cache between seeds so the allocator does
         # not accumulate freed-but-unreleased blocks across 35 trainings
