@@ -234,7 +234,7 @@ def _t_crit_975(n):
 
 
 def _bonferroni_crit_q(n, alpha=0.05):
-    """Bonferroni-corrected one-sided t critical value with ``n-1`` dof.
+    """Bonferroni-corrected ONE-SIDED t critical value with ``n-1`` dof.
 
     P0-3 fix (lifted to module scope): the previous implementation was a
     nested function inside ``main()`` that returned ``None`` whenever scipy
@@ -250,13 +250,15 @@ def _bonferroni_crit_q(n, alpha=0.05):
          Under Bonferroni correction alpha is typically divided by 20-30,
          but the table is the EXACT scipy value at the 97.5% level — for
          the corrected alphas used downstream (e.g. 0.05/28 ~= 0.0018,
-         one-sided 0.0009) we need the 99.91% quantile, which is far in
-         the tail. We therefore do NOT use the table for corrected alphas;
-         we only fall through to the Cornish-Fisher expansion below.
+         one-sided) we need the ``1-alpha`` upper-tail quantile, which is
+         far in the tail. We therefore do NOT use the 97.5% table for
+         corrected alphas; we only fall through to the Cornish-Fisher
+         expansion below.
       3. Cornish-Fisher expansion around the normal quantile for the
-         requested ``1 - alpha/2`` level. This is the SAME formula used
-         by ``_t_crit_975`` but with ``z`` chosen for the Bonferroni-
-         corrected alpha rather than the hardcoded 0.975 level. The
+         requested ``1 - alpha`` level. This matches the one-sided
+         ``t_stat > crit`` comparisons in Exp4/Exp5; using ``1-alpha/2``
+         would be a two-sided threshold and silently make the test too
+         conservative. The
          relative error stays below ~1% at n >= 5 for the typical
          corrected alphas (0.001-0.005), which is well below the noise
          floor of 5-10 seed estimates.
@@ -277,14 +279,14 @@ def _bonferroni_crit_q(n, alpha=0.05):
         except ImportError:
             _T_PP = False
     if _T_PP:
-        return float(_T_PP(1 - alpha / 2, n - 1))
+        return float(_T_PP(1 - alpha, n - 1))
     # scipy unavailable: use the Cornish-Fisher expansion around the
-    # normal quantile for the requested alpha. This is the same formula
-    # ``_t_crit_975`` uses for n > 100, but with z chosen dynamically.
-    # We need scipy.stats.norm.ppf(1 - alpha/2); compute via a small
-    # rational approximation (Acklam's algorithm) so we don't require
-    # scipy just for the normal quantile.
-    p = 1 - alpha / 2
+    # normal quantile for the requested one-sided alpha. This is the same
+    # Cornish-Fisher shape that ``_t_crit_975`` uses for n > 100, but with
+    # z chosen dynamically. We need scipy.stats.norm.ppf(1 - alpha); compute
+    # via a small rational approximation (Acklam's algorithm) so we don't
+    # require scipy just for the normal quantile.
+    p = 1 - alpha
     # Acklam's inverse-normal approximation (max rel error ~1.15e-9).
     a = [-3.969683028665376e+01, 2.209460984245205e+02,
          -2.759285104469687e+02, 1.383577518672690e+02,
@@ -300,7 +302,7 @@ def _bonferroni_crit_q(n, alpha=0.05):
     p_low = 0.02425
     p_high = 1 - p_low
     if p < p_low:
-        q = (-2 * p) ** 0.5
+        q = math.sqrt(-2.0 * math.log(p))
         x = (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
             ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
     elif p <= p_high:
@@ -309,11 +311,15 @@ def _bonferroni_crit_q(n, alpha=0.05):
         x = (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q / \
             (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
     else:
-        q = (-2 * (1 - p)) ** 0.5
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
         x = -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
              ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
-    z = x
-    return z + (z ** 3 + z) / (4.0 * (n - 1))
+    z = float(x)
+    crit = z + (z ** 3 + z) / (4.0 * (n - 1))
+    if not math.isfinite(crit):
+        raise RuntimeError(
+            f"_bonferroni_crit_q fallback produced non-finite critical value: {crit}")
+    return float(crit)
 
 
 # ---------------------------------------------------------------------------
@@ -1173,7 +1179,8 @@ def main():
     #   2. Compute the Bonferroni-corrected alpha (0.05 / n_tests) and the
     #      corresponding t-critical value (scipy if available, else None).
     #   3. For each result, set ``significant_bonferroni`` and
-    #      ``t_crit_bonferroni`` fields based on |t_stat| > crit.
+    #      ``t_crit_bonferroni`` fields based on the one-sided
+    #      comparison ``t_stat > crit``.
     #   4. Compute an experiment-level ``conclusions_valid`` flag combining
     #      seed count, minimum surviving seeds, presence of any significant
     #      result, and the fraction of near-chance results.
@@ -1217,7 +1224,7 @@ def main():
             # result indicates the model is systematically wrong (e.g. a sign
             # bug, a reversed label, or pure noise that happens to anti-correlate),
             # NOT that the op "works". The Bonferroni-corrected critical value
-            # ``_bonferroni_crit_q`` is already the upper-tail quantile, so the
+            # ``_bonferroni_crit_q`` is already the one-sided upper-tail quantile, so the
             # one-sided comparison is the correct use of that quantile.
             r['significant_bonferroni'] = (
                 crit is not None and t_stat > crit

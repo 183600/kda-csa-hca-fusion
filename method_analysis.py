@@ -425,7 +425,8 @@ CSA — Compressed Sparse Attention
    For each query t:
      kv = C_comp_n[indices[t]]                      # [topk, c], shared across heads
      scores[h] = q[t, h] . kv^T * scale             # [H, topk]
-     p[h] = softmax(scores[h] + sink)               # [H, topk]
+     denom[h] = sum_i exp(scores[h, i]) + exp(sink[h])
+     p[h, i] = exp(scores[h, i]) / denom[h]         # sink is an extra denominator term
      out[t, h] = p[h] @ kv                          # [H, c]
    (Note: both ``kv`` and the output einsum use the NORMALIZED C_comp_n.)
 

@@ -32,7 +32,7 @@ Environment knobs (set before importing / via ``os.environ``):
   * ``MQAR_SEEDS``      (default 5)   — seeds for the MQAR experiment.
   * ``MQAR_STEPS``      (default 200) — training steps for non-softmax ops.
   * ``MQAR_SOFTMAX_STEPS`` (default 500) — extra steps for the softmax baseline.
-  * ``ABL_SEEDS``       (default 5)   — seeds for the ablation.
+  * ``ABL_SEEDS``       (default 7)   — seeds for the ablation (run_all(seeds=...) overrides).
   * ``ABL_STEPS``       (default 100) — training steps for the ablation.
   * ``SKIP_SLOW``       (default 0)   — if "1", skip CSA-heavy experiments on CPU.
 

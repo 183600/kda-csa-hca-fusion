@@ -476,8 +476,8 @@ def main():
     # family-wise false-positive rate inflates to ~1-(1-0.05)^(n_tests)
     # (~30% for 7 tests, ~66% for 21). We compute the corrected alpha and
     # the corresponding t-critical value, then flag each result as
-    # significant_bonferroni iff |t_stat| exceeds the corrected critical
-    # value (with n-1 dof). The raw t_stat and uncorrected interpretation
+    # significant_bonferroni iff t_stat exceeds the corrected one-sided
+    # critical value (with n-1 dof). The raw t_stat and uncorrected interpretation
     # are preserved in the JSON for transparency.
     n_tests = len(ratios) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests
@@ -539,8 +539,8 @@ def main():
                     # opposite of what "this layout works" means. A
                     # below-chance result indicates the model is systematically
                     # wrong, NOT that the layout "works". The Bonferroni-corrected
-                    # critical value ``_bonferroni_crit`` is already the
-                    # upper-tail quantile, so the one-sided comparison is the
+                    # critical value ``_bonferroni_crit_q`` is already the
+                    # one-sided upper-tail quantile, so the comparison is the
                     # correct use of that quantile.
                     res['significant_bonferroni'] = (
                         crit is not None and t_stat > crit
