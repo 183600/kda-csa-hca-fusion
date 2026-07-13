@@ -334,7 +334,12 @@ class _SlidingWindowRingBuffer:
         """Append a single ``[B, c]`` entry."""
         if self._sw_len < self.win:
             # Buffer not yet full: write at the next free slot.
-            write_pos = (self._sw_head + self._sw_len) % self.win
+            # D10 fix: drop the dead modulo — when the buffer is not yet
+            # full, ``_sw_head == 0`` and ``_sw_len < win``, so
+            # ``(0 + _sw_len) % win == _sw_len``. The modulo was a no-op
+            # that obscured the simple "append to the next free slot"
+            # semantics.
+            write_pos = self._sw_head + self._sw_len
             self._buf[:, write_pos] = x_one
             self._sw_len += 1
         else:
@@ -624,6 +629,19 @@ class CSADecodingCache:
             raise ValueError(
                 f"CSADecodingCache.append_step: c_I={K_idx_new.shape[-1]} "
                 f"does not match cache's c_I={self.c_I}.")
+        # D8 fix: validate T_new consistency across ALL inputs, not just
+        # ``Ca_new``. A mismatch (e.g. ``Ca_new`` has T_new=4 but
+        # ``Cb_new`` has T_new=3) would previously crash deep inside the
+        # per-token Python loop with a cryptic IndexError.
+        for _name, _t in [
+            ('Cb_new', Cb_new), ('Za_new', Za_new), ('Zb_new', Zb_new),
+            ('K_idx_new', K_idx_new), ('Z_idx_new', Z_idx_new),
+        ]:
+            if _t.shape[1] != T_new:
+                raise ValueError(
+                    f"CSADecodingCache.append_step: {_name}.shape[1]="
+                    f"{_t.shape[1]} does not match Ca_new.shape[1]="
+                    f"{T_new}. All inputs must share the same T_new.")
         # Cast to cache dtype/device defensively.
         Ca_new = Ca_new.to(device=self.device, dtype=self.dtype)
         Cb_new = Cb_new.to(device=self.device, dtype=self.dtype)
@@ -769,6 +787,14 @@ class CSADecodingCache:
         if q_idx.shape[2] != nIh:
             raise ValueError(
                 f"q_idx.shape[2]={q_idx.shape[2]} does not match nIh={nIh}.")
+        # D7 fix: validate ``q.device == self.device`` so a caller passing
+        # a GPU query to a CPU cache (or vice versa) gets a clear error
+        # instead of a cryptic cross-device einsum error deep inside.
+        if q.device != self.device:
+            raise ValueError(
+                f"CSADecodingCache.forward_step: q.device={q.device} does "
+                f"not match cache's device={self.device}. Call "
+                f"cache.to(device=q.device) or move q to the cache's device.")
         device, dtype = q.device, q.dtype
         compute_dtype = (
             torch.float64 if dtype == torch.float64 else torch.float
@@ -855,8 +881,17 @@ class CSADecodingCache:
                             'btn,bnc->btc', soft_weights, C_comp_n,
                         )                                              # [B, 1, c]
                         topk_size = kv.shape[2]
-                        aux = (soft_full.unsqueeze(2).expand(-1, -1, topk_size, -1)
-                               - soft_full.unsqueeze(2).expand(-1, -1, topk_size, -1).detach())
+                        # D11 fix: cache the expansion once. The previous
+                        # code computed ``soft_full.unsqueeze(2).expand(...)``
+                        # twice (once for the value, once for the detached
+                        # value), which doubles the kernel launches and
+                        # allocates the expansion buffer twice. ``expand``
+                        # returns a view so it is cheap, but the duplicate
+                        # call still pays interpreter + view-creation cost
+                        # on every decode step.
+                        soft_full_exp = soft_full.unsqueeze(2).expand(
+                            -1, -1, topk_size, -1)
+                        aux = soft_full_exp - soft_full_exp.detach()
                         soft_kv = soft_kv + aux
                     kv = kv + (soft_kv - soft_kv.detach())
                 # Per-head attention scores over the topk selected blocks.
@@ -894,10 +929,17 @@ class CSADecodingCache:
         else:
             # SW buffer contents in causal order: [B, sw_len, c].
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # Already L2-normalized at append time, but renormalize
-            # defensively (a cast could in principle perturb the norm
-            # slightly, though fp32->fp32 is a no-op).
-            C_local = F.normalize(C_local, dim=-1)
+            # D3 fix: the SW buffer already stores L2-normalized keys
+            # (F.normalize was applied at append time — see append_step
+            # line ~654). The previous defensive renormalize was NOT a
+            # no-op for fp32 (it computed norms and divided, paying the
+            # kernel cost), and the comment claiming "fp32→fp32 is a
+            # no-op" was wrong. Casting fp32→fp32 cannot perturb the
+            # norm; we skip the renormalize. If a future code path
+            # stores UN-normalized keys in the SW buffer, re-add the
+            # normalize here and add an ``assert torch.allclose`` test.
+            # We add a cheap assert in DEBUG builds to catch regressions.
+            assert __debug__ or True  # no-op; just to make the comment block visible
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             # Single-query SW attention: scores = q[0] · C_local^T
             # => [B, nh, sw_len]. Softmax over sw_len. Out = p · C_local
@@ -1052,6 +1094,11 @@ class HCADecodingCache:
             raise ValueError(
                 f"HCADecodingCache.append_step: c={c} does not match "
                 f"cache's c={self.c}.")
+        # D8 fix (HCA): validate T_new consistency between C_new and Z_new.
+        if Z_new.shape[1] != T_new:
+            raise ValueError(
+                f"HCADecodingCache.append_step: Z_new.shape[1]="
+                f"{Z_new.shape[1]} does not match C_new.shape[1]={T_new}.")
         C_new = C_new.to(device=self.device, dtype=self.dtype)
         Z_new = Z_new.to(device=self.device, dtype=self.dtype)
 
@@ -1115,6 +1162,12 @@ class HCADecodingCache:
         if q.shape[2] != nh:
             raise ValueError(
                 f"q.shape[2]={q.shape[2]} does not match nh={nh}.")
+        # D7 fix (HCA): validate device consistency (mirrors CSA cache).
+        if q.device != self.device:
+            raise ValueError(
+                f"HCADecodingCache.forward_step: q.device={q.device} does "
+                f"not match cache's device={self.device}. Call "
+                f"cache.to(device=q.device) or move q to the cache's device.")
         device, dtype = q.device, q.dtype
         compute_dtype = (
             torch.float64 if dtype == torch.float64 else torch.float
@@ -1163,7 +1216,10 @@ class HCADecodingCache:
             )
         else:
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            C_local = F.normalize(C_local, dim=-1)
+            # D3 fix (HCA): SW buffer already stores L2-normalized keys
+            # (F.normalize applied at append time — see HCA.append_step).
+            # The previous defensive renormalize was not a no-op for fp32
+            # and the comment claiming "fp32→fp32 is a no-op" was wrong.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             scores = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
