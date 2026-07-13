@@ -507,6 +507,12 @@ def main():
                         else 'hybrid_full_runtime_decode_state'
                     ),
                     'kv_elements': kv,
+                    # Explicit byte count under the BF16 accounting convention used
+                    # throughout the cache analysis. README has long documented a
+                    # ``kv_bytes`` field; writing it here keeps the JSON schema
+                    # self-contained so downstream reports do not have to remember
+                    # to multiply elements by BF16_BYTES themselves.
+                    'kv_bytes': kv * BF16_BYTES,
                     # Ratios against the 1-layer baseline (original paper's convention).
                     'kv_ratio_vs_gqa_1l': kv / baseline_1l,
                     'flops_ratio_vs_gqa_1l': fl / flops_base_1l,
