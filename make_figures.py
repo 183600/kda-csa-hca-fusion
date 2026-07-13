@@ -330,7 +330,7 @@ def fig_kv_cache():
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
-    labels = {'softmax_gqa': 'Softmax GQA8 (5-layer baseline)', 'kda': 'KDA',
+    labels = {'softmax_gqa': 'Softmax GQA8 (1 layer)', 'kda': 'KDA',
               'csa': 'CSA', 'hca': 'HCA', 'hybrid_kch': 'Fused hybrid (3:1:1)'}
     for op, pts in ops.items():
         pts.sort()
@@ -397,7 +397,7 @@ def fig_flops():
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
-    labels = {'softmax_gqa': 'Softmax GQA8 (5-layer baseline)', 'kda': 'KDA',
+    labels = {'softmax_gqa': 'Softmax GQA8 (1 layer)', 'kda': 'KDA',
               'csa': 'CSA', 'hca': 'HCA', 'hybrid_kch': 'Fused hybrid (3:1:1)'}
     for op, pts in ops.items():
         pts.sort()
