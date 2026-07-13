@@ -12,8 +12,20 @@
 # stay in sync. The CI should run `pip install -e .` (which reads
 # pyproject.toml) for the canonical environment; this file is a
 # convenience for users who prefer the requirements.txt workflow.
+#
+# CT9 fix: previously this file had ``scipy>=1.7,<1.15`` WITHOUT the
+# ``python_version >= '3.10'`` marker that pyproject.toml had. Since
+# ``requires-python = ">=3.10"`` makes the marker redundant, both files
+# should now agree. We also add the dev tools (pytest, mypy, ruff) so
+# ``pip install -r requirements.txt`` brings in the full dev toolchain
+# (matching ``pip install -e .[dev]``).
 torch>=2.2,<2.7
 einops>=0.6,<0.9
 matplotlib>=3.5,<3.11
 numpy>=1.21,<2.3
 scipy>=1.7,<1.15
+# Dev tools (CT9 fix: were missing — only obtainable via ``pip install -e .[dev]``).
+pytest>=7.0,<9.0
+pytest-xdist>=3.0,<5.0
+mypy>=1.0,<2.0
+ruff>=0.4,<0.10

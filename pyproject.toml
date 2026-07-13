@@ -101,7 +101,13 @@ py-modules = [
     "make_figures",
     "method_analysis",
     "kaggle_setup",
-    "test_figures",
+    # CT6 fix: removed ``test_figures`` from py-modules. Test files should
+    # NOT be installed as importable top-level modules — ``pip install -e .``
+    # would otherwise make ``import test_figures`` succeed in production
+    # environments, conflating test code with library code. ``run_correctness``
+    # is kept because it doubles as a pytest collection target AND a
+    # standalone script the README references; ``test_figures`` is purely a
+    # test file.
 ]
 
 [tool.pytest.ini_options]
@@ -113,10 +119,43 @@ py-modules = [
 python_files = ["run_correctness.py", "test_figures.py", "test_*.py"]
 python_functions = ["test_*"]
 testpaths = ["."]
+# CT8 fix: add ``--strict-markers`` and ``--strict-config`` to ``addopts``.
+# Without ``--strict-markers``, a typo like ``@pytest.mark.sloww`` silently
+# creates an unknown marker instead of raising — masking the typo. Without
+# ``--strict-config``, pyproject errors (e.g. bad ini value) are silently
+# swallowed. Both flags make pytest loud about configuration mistakes.
+addopts = "--strict-markers --strict-config"
 # Register the ``slow`` marker (used by conftest.py to tag long-running
 # tests so ``pytest -m "not slow"`` can skip them during fast CI loops).
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+# CT8 fix: add a coverage config so ``pytest --cov`` produces a meaningful
+# report. Without this, coverage defaults to skipping the ``ops_*`` modules
+# (the actual library code) and only covering the test files themselves.
+[tool.coverage.run]
+source = ["ops_kda", "ops_csa", "ops_hca", "ops_fused", "ops_decoding_cache"]
+branch = true
+omit = [
+    "run_*",       # experiment runners (not library code)
+    "kaggle_setup.py",
+    "make_figures.py",
+    "method_analysis.py",
+    "test_*",
+    "conftest.py",
+]
+
+[tool.coverage.report]
+# Show missing lines in the report so contributors can see what to add
+# tests for.
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
 ]
 
 # Batch-3 fix: add Ruff config so ``ruff check .`` can be used as a CI gate.
@@ -163,5 +202,9 @@ python_version = "3.10"
 # (catches undefined names and obvious type errors, ignores missing
 # stubs for third-party libraries).
 ignore_missing_imports = true
-check_untyped_defs = false
+# CT7 fix: enable ``check_untyped_defs``. The previous ``false`` disabled
+# mypy's checks on untyped function bodies — exactly where most bugs hide.
+# Typing the existing functions is incremental; enabling this flag at
+# least catches NEW untyped functions that introduce type errors.
+check_untyped_defs = true
 warn_unused_ignores = true
