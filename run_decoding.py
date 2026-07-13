@@ -1068,16 +1068,43 @@ def main():
                 # placeholder. Keep explicit metadata for downstream figures.
                 r['upper_bound'] = False
                 r['uses_incremental_cache'] = (name in {'csa', 'hca', 'hybrid'})
-                r['prefill_cache_build'] = (
-                    'reference_python_append' if name in {'csa', 'hca', 'hybrid'}
-                    else 'native_operator_state'
-                )
-                r['prefill_latency_note'] = (
-                    'CSA/HCA cache-enabled rows include correctness-first Python '
-                    'cache population during prefill; decode/token timings use '
-                    'the incremental cache.' if r['uses_incremental_cache'] else
-                    'prefill uses the module native state/cache path.'
-                )
+                if name == 'hybrid':
+                    # Hybrid's CSA/HCA sub-layers also use batched ``append_step``
+                    # (one call with the full prefill projection tensor;
+                    # append_step internally walks tokens to build blocks),
+                    # but hybrid runs N sub-layers layer-by-layer and shares
+                    # KDA's recurrent state, so its prefill-cache overhead is
+                    # structurally different from a standalone CSA/HCA module.
+                    # Tag separately so figures/README can distinguish the two
+                    # instead of implying hybrid pays the same per-token
+                    # Python overhead as standalone CSA/HCA.
+                    r['prefill_cache_build'] = (
+                        'batched_populate_layer_by_layer'
+                    )
+                elif name in {'csa', 'hca'}:
+                    r['prefill_cache_build'] = 'batched_append_from_naive_output'
+                else:
+                    r['prefill_cache_build'] = 'native_operator_state'
+                if name == 'hybrid':
+                    r['prefill_latency_note'] = (
+                        'Hybrid row wires KDA recurrent state + per-layer CSA/HCA '
+                        'incremental caches. CSA/HCA sub-layer caches are populated '
+                        'from batched prefill projections during prefill (one '
+                        'append_step call per sub-layer); decode/token timings use '
+                        'the incremental caches alongside KDA recurrence.'
+                    )
+                elif r['uses_incremental_cache']:
+                    r['prefill_latency_note'] = (
+                        'Standalone CSA/HCA rows include correctness-first batched '
+                        'cache population during prefill (one append_step call '
+                        'with the full prefill projection tensor; append_step '
+                        'internally walks tokens to build compressed blocks); '
+                        'decode/token timings use the incremental cache.'
+                    )
+                else:
+                    r['prefill_latency_note'] = (
+                        'prefill uses the module native state/cache path.'
+                    )
                 results.append(r)
                 peak_str = 'n/a' if r['peak_mem_MB'] is None else f"{r['peak_mem_MB']:.2f}MB"
                 print(f"  {name:10s}  prefill={r['prefill_ms']:8.2f}ms  "
@@ -1100,9 +1127,10 @@ def main():
                                 'upper_bound': False,
                                 'uses_incremental_cache': (name in {'csa', 'hca', 'hybrid'}),
                                 'prefill_cache_build': (
-                                    'reference_python_append'
-                                    if name in {'csa', 'hca', 'hybrid'}
-                                    else 'native_operator_state'),
+                                    'batched_populate_layer_by_layer' if name == 'hybrid'
+                                    else ('batched_append_from_naive_output'
+                                          if name in {'csa', 'hca'}
+                                          else 'native_operator_state')),
                                 'prefill_latency_note': None})
                 print(f"  {name:10s}  ERROR: {e}")
 
