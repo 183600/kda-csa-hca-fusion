@@ -441,8 +441,11 @@ class CSAAttnDecoding(nn.Module):
         self._cache: CSADecodingCache | None = None
 
     def reset(self):
-        if self._cache is not None:
-            self._cache.reset()
+        # Drop (not just clear) the cache object so CUDA peak-memory accounting
+        # in bench_decoding counts the full runtime cache allocation in the
+        # timed region. Keeping an empty _SlidingWindowRingBuffer alive across
+        # reset would put that tensor in the baseline and under-report peak_mem.
+        self._cache = None
 
     def _ensure_cache(self, B, device, dtype):
         if self._cache is None or self._cache.B != B \
@@ -479,10 +482,9 @@ class CSAAttnDecoding(nn.Module):
         self._ensure_cache(B, x.device, x.dtype)
         cache = self._cache
         if T_new > 1:
-            # Prefill: use the fast vectorized naive_csa, then populate
-            # the cache from the result by re-feeding the projections
-            # token-by-token (no output recomputation — append_step
-            # only updates the cache state, doesn't compute attention).
+            # Prefill: use the fast vectorized naive_csa for the output, then
+            # populate the cache from the same full projection tensors (no
+            # output recomputation — append_step only updates cache state).
             o = naive_csa(
                 x, self.W_aKV.weight, self.W_bKV.weight,
                 self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
@@ -555,8 +557,11 @@ class HCAAttnDecoding(nn.Module):
         self._cache: HCADecodingCache | None = None
 
     def reset(self):
-        if self._cache is not None:
-            self._cache.reset()
+        # Drop (not just clear) the cache object so CUDA peak-memory accounting
+        # in bench_decoding counts the full runtime cache allocation in the
+        # timed region. Keeping an empty _SlidingWindowRingBuffer alive across
+        # reset would put that tensor in the baseline and under-report peak_mem.
+        self._cache = None
 
     def _ensure_cache(self, B, device, dtype):
         if self._cache is None or self._cache.B != B \
@@ -648,12 +653,11 @@ class HybridDecoding(nn.Module):
 
     def reset(self):
         self.model.reset_state()
-        for cache in self._csa_caches:
-            if cache is not None:
-                cache.reset()
-        for cache in self._hca_caches:
-            if cache is not None:
-                cache.reset()
+        # Drop cache objects rather than leaving empty SW ring buffers alive.
+        # Otherwise CUDA memory baselines captured after reset would subtract
+        # those buffers and under-report the hybrid runtime cache footprint.
+        self._csa_caches = [None for _ in self._csa_caches]
+        self._hca_caches = [None for _ in self._hca_caches]
 
     def _ensure_csa_cache(self, idx: int, layer: CSAHybridLayer,
                           h: torch.Tensor) -> CSADecodingCache:
