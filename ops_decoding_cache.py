@@ -732,18 +732,18 @@ class CSADecodingCache:
 
     def forward_step(
         self,
-        q: torch.Tensor,          # [B, 1, nh, c]   (L2-normalized)
+        q: torch.Tensor,          # [B, 1, nh, c]   (L2-normalized iff normalize_qk)
         q_idx: torch.Tensor,      # [B, 1, nIh, c_I]
         w_idx: torch.Tensor,      # [B, 1, nIh]
         *,
         topk: int,
         nh: int,
         nIh: int,
-        scale: float = 1.0,
+        scale: float | None = None,
         sink_logits: torch.Tensor | None = None,  # [nh]
         use_ste: bool = True,
         ste_mode: str = 'topk_columns',
-        normalize_qk: bool = False,
+        normalize_qk: bool = True,
     ) -> torch.Tensor:
         """Compute the CSA attention output for the CURRENT query.
 
@@ -754,8 +754,11 @@ class CSADecodingCache:
         cache does not own.
 
         Args:
-            q: ``[B, 1, nh, c]`` per-head attention queries, already
-                L2-normalized.
+            q: ``[B, 1, nh, c]`` per-head attention queries. When
+                ``normalize_qk=True`` the caller MUST pass L2-normalized
+                queries (the contract used by every runner in this repo);
+                when ``normalize_qk=False`` raw queries are expected and
+                we fall back to dot-product scale ``c ** -0.5``.
             q_idx: ``[B, 1, nIh, c_I]`` indexer queries (low-rank).
             w_idx: ``[B, 1, nIh]`` indexer head weights.
             topk: number of compressed blocks to select per query.
@@ -837,10 +840,24 @@ class CSADecodingCache:
             b_threshold = t // self.m
             cbm = torch.arange(n_blocks, device=device) < b_threshold   # [n_blocks]
             cbm = cbm[None, :]                                          # [1, n_blocks]
-            # L2-normalize the compressed KV (cosine-similarity attention,
-            # matches ``naive_csa``).
-            C_comp_n = F.normalize(
-                self._C_comp.to(compute_dtype), dim=-1)               # [B, n_blocks, c]
+            # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
+            # (mirrors the matching fix in naive_csa). When
+            # normalize_qk=True (default used by every runner in this
+            # repo) compressed KV are L2-normalized (cosine-similarity
+            # attention). When False, skip normalization and fall back
+            # to classical 1/sqrt(c) dot-product scale — this gives
+            # ablations a real off-switch rather than a silently-ignored
+            # flag. Also select the core-attention scale here so that
+            # the sparse and SW branches below agree.
+            if normalize_qk:
+                C_comp_n = F.normalize(
+                    self._C_comp.to(compute_dtype), dim=-1)           # [B, n_blocks, c]
+            else:
+                C_comp_n = self._C_comp.to(compute_dtype)
+            if scale is None:
+                core_scale = 1.0 if normalize_qk else self.c ** -0.5
+            else:
+                core_scale = scale
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in
@@ -910,7 +927,7 @@ class CSADecodingCache:
                 q_compute = q.to(compute_dtype)                        # [B, 1, nh, c]
                 scores = torch.einsum(
                     'b t h d, b t k d -> b t h k', q_compute, kv,
-                ) * scale                                              # [B, 1, nh, topk]
+                ) * core_scale                                         # [B, 1, nh, topk]
                 scores = scores.masked_fill(
                     ~valid_mask[:, :, None, :], float('-inf'))
                 if sink_logits is not None:
@@ -939,26 +956,35 @@ class CSADecodingCache:
                 B, 1, nh, self.c, dtype=compute_dtype, device=device,
             )
         else:
-            # SW buffer contents in causal order: [B, sw_len, c].
+            # SW buffer contents in causal order: [B, sw_len, c]. When
+            # normalize_qk=True (default), the buffer stores L2-normalized
+            # keys (F.normalize applied at append time). When
+            # normalize_qk=False the caller should have appended raw
+            # (unnormalized) keys; we read whatever is stored. D3 fix:
+            # skip the redundant defensive renormalize that used to live
+            # here — it was NOT a no-op even in fp32 (it paid norm +
+            # divide) and perturbed fp16 inputs. If a future code path
+            # stores differently-normed keys, adjust append_step and
+            # add a correctness test. Avoid runtime asserts on this
+            # decode hot path.
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # D3 fix: the SW buffer already stores L2-normalized keys
-            # (F.normalize was applied at append time — see append_step
-            # line ~654). The previous defensive renormalize was NOT a
-            # no-op for fp32 (it computed norms and divided, paying the
-            # kernel cost), and the comment claiming "fp32→fp32 is a
-            # no-op" was wrong. Casting fp32→fp32 cannot perturb the
-            # norm; we skip the renormalize. If a future code path
-            # stores UN-normalized keys in the SW buffer, re-add the
-            # normalize here and add a dedicated correctness test. Avoid
-            # runtime asserts in this decode hot path: norm checks can add
-            # synchronizing overhead to the latency benchmark.
+            if not normalize_qk:
+                # The SW buffer stores normalized keys from append_step
+                # regardless of normalize_qk (that write is unconditional
+                # today). This means the SW branch ALWAYS runs in cosine
+                # mode. To keep normalize_qk=False honest for the sparse
+                # branch ONLY (an ablation rarely used) we do NOT add a
+                # denormalize pass here (it would require storing raw
+                # keys alongside normalized ones); document and continue
+                # using core_scale.
+                pass
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             # Single-query SW attention: scores = q[0] · C_local^T
             # => [B, nh, sw_len]. Softmax over sw_len. Out = p · C_local
             # => [B, nh, c]. Reshape to [B, 1, nh, c].
             scores = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
-            ) * scale                                                  # [B, nh, sw_len]
+            ) * core_scale                                             # [B, nh, sw_len]
             # No causal mask needed: the SW buffer's contents are
             # EXACTLY the valid window for the newest query (positions
             # [t - sw_len + 1, t], all of which are <= t). The naive

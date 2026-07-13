@@ -662,20 +662,17 @@ def naive_csa(
             f"sliding_window={sliding_window} must be >= 0 "
             f"(0 disables the branch)")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
-    # (see ``F.normalize`` calls below), their dot product is already a cosine
-    # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
-    # (e.g. 0.125 for c=64) further shrinks the scores into ``[-0.125, 0.125]``,
-    # which makes softmax over the selected blocks nearly uniform — effectively
-    # turning sparse retrieval into average pooling and defeating the purpose
-    # of CSA's learned compression.
-    #
-    # Standard cosine/cosFormer-style attention uses ``softmax(q·k / τ)`` with
-    # ``τ = 1`` (or a learnable temperature). The extra ``1/sqrt(c)`` was a
-    # leftover from the un-normalized softmax-attention formula and has been
-    # removed. If a caller explicitly passes ``scale=``, we honor it (backward
-    # compatibility for any external code that depended on the old behaviour).
+    # (i.e. when ``normalize_qk=True``, see the normalization block below),
+    # their dot product is a cosine similarity in ``[-1, 1]`` and the natural
+    # temperature is 1.0 (cosFormer-style). Using 1/sqrt(c) further shrinks
+    # the scores and makes softmax nearly uniform — defeating CSA's learned
+    # sparse retrieval. When ``normalize_qk=False`` we fall back to the
+    # classical 1/sqrt(c) dot-product scale (mirroring the indexer scale
+    # policy further below). If a caller explicitly passes ``scale=`` we
+    # honour it (backward compatibility for any external code pinning a
+    # temperature).
     if scale is None:
-        scale = 1.0
+        scale = 1.0 if normalize_qk else c ** -0.5
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv_overlapped`` would raise a cryptic broadcasting
@@ -847,8 +844,31 @@ def naive_csa(
     # entire attention core runs in one consistent precision.
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
-    q = F.normalize(q, dim=-1)
-    C_comp_n = F.normalize(C_comp, dim=-1)                         # L2-normalize (cosine-similarity attention)
+    # P0-6 (round 8) fix: honor ``normalize_qk`` for the CORE attention as
+    # well as the indexer. Previously q and C_comp were UNCONDITIONALLY
+    # L2-normalized a few lines below, so a caller passing
+    # ``normalize_qk=False`` (e.g. an ablation of the cosine-attention
+    # recipe) got cosine attention anyway — the flag was silently ignored
+    # for the core path while the indexer branch correctly honored it.
+    # When ``normalize_qk=True`` (the default used by every experiment
+    # runner — see run_quality, run_benchmark, run_decoding, ops_fused),
+    # q and C_comp are L2-normalized and ``scale`` defaults to 1.0
+    # (cosine attention). When ``normalize_qk=False``, we skip both
+    # normalizations and fall back to the classical ``c ** -0.5``
+    # dot-product scale (just like the indexer branch does for its DI).
+    # This makes the flag's semantics consistent across both branches and
+    # gives ablations a genuine knob to turn off normalization.
+    if normalize_qk:
+        q = F.normalize(q, dim=-1)
+    C_comp_n = F.normalize(C_comp, dim=-1) if normalize_qk else C_comp.to(compute_dtype)
+    # Core-attention scale auto-selection (mirrors the indexer scale
+    # policy above). A caller can still override by passing an explicit
+    # ``scale=``.
+    if scale is None:
+        if normalize_qk:
+            scale = 1.0
+        else:
+            scale = c ** -0.5
 
     # Handle topk=0 (degenerate but valid: caller asks for no sparse
     # selection). Without this guard the downstream ``scores.amax(-1)``
@@ -1120,15 +1140,25 @@ def naive_csa(
         # operation whether the masked entries are materialized as ``-inf``
         # in a ``[T,T]`` tensor or simply absent from a ``[T,win]`` tensor.
         #
-        # q is already L2-normalized above (line: q = F.normalize(q, dim=-1)),
-        # so the sliding-window branch reuses it directly.
+        # q is already prepared above (L2-normalized if normalize_qk else
+        # raw), so the sliding-window branch reuses it directly.
         #
         # Dtype: cast H_proj to compute_dtype so the SW branch matches the
         # sparse branch's precision. Without this, the SW softmax runs in
         # H.dtype (e.g. fp16) while the sparse softmax ran in compute_dtype
         # (fp32) — an asymmetric precision loss that silently degrades the
         # SW branch's contribution for fp16 inputs.
-        C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
+        #
+        # P0-6 (round 8): honor ``normalize_qk`` here too (mirrors the core
+        # attention block above). When normalize_qk=False we must NOT
+        # L2-normalize C_local either — that would give cosine attention in
+        # the SW branch while the sparse branch stays in dot-product mode,
+        # producing an inconsistent mixing of scales between the two
+        # branches.
+        if normalize_qk:
+            C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
+        else:
+            C_local = H_proj.to(compute_dtype)
         sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 

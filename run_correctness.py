@@ -2493,8 +2493,21 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     q_idx = F.linear(cQ, W_IUQ).view(B, T, nIh, c_I)
     w_idx = F.linear(H, W_w)
     cbm = _causal_block_mask(T, n_blocks, m, H.device)
+    # P0-6 (round 8): the reference indexer call MUST match what the
+    # production ``naive_csa`` now does when ``normalize_qk=True``
+    # (the default for every experiment runner). Previously this line
+    # hard-coded ``scale=c_I**-0.5``, which is the UN-normalized scale —
+    # but the reference (like production) L2-normalizes q/K_IComp below
+    # implicitly? Actually no: ``csa_lightning_indexer`` normalizes
+    # q_idx/k_idx only when ``normalize_qk=True``. We pass
+    # ``normalize_qk=True`` to match the production path and let the
+    # indexer auto-select scale=1.0 (cosine). Passing the old 1/sqrt(c_I)
+    # scale here would make the reference indexer logits OVER-shrunk
+    # relative to production, producing different top-k selections and
+    # causing the test to fail spuriously.
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
-                                     scale=c_I ** -0.5, causal_block_mask=cbm)
+                                     scale=None, causal_block_mask=cbm,
+                                     normalize_qk=True)
     q = F.linear(cQ, W_UQ).view(B, T, nh, c)
     q = F.normalize(q, dim=-1)
     C_comp_n = F.normalize(C_comp, dim=-1)
@@ -3527,10 +3540,13 @@ def test_csa_hca_input_validation(device='cpu'):
     operator (with no diagnostic about WHICH parameter was bad) or — worse
     — a silently meaningless output:
 
-      * ``naive_csa(c_I=0)``: crashed with ``ZeroDivisionError: 0.0 cannot
-        be raised to a negative power`` from the explicit
-        ``scale=c_I ** -0.5`` (line 295). The existing asserts validated
-        m, topk, nh, c, dc — but NOT c_I or nIh.
+      * ``naive_csa(c_I=0)``: would crash with ``ZeroDivisionError: 0.0
+        cannot be raised to a negative power`` from the 1/sqrt(c_I)
+        indexer scale when ``normalize_qk=False``. The existing asserts
+        validated m, topk, nh, c, dc — but NOT c_I or nIh. (Since the
+        round-8 fix the scale is auto-selected inside
+        ``csa_lightning_indexer``/``naive_csa`` AFTER validation, so the
+        guard in ``csa_lightning_indexer`` is what catches c_I=0 first.)
       * ``naive_csa(nIh=0)``: produced a finite but meaningless output
         (the indexer's ``sum(1)`` over an empty head dim is 0, so top-k
         silently selected the first k blocks for every query).
