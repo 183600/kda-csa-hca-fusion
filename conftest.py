@@ -84,20 +84,50 @@ _SLOW_TESTS = {
 }
 
 
+def _env_flag(name, default=False):
+    """Parse an env var as a boolean flag (accepts 0/1, true/false, yes/no)."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
 def pytest_collection_modifyitems(config, items):
-    """Auto-mark slow tests and skip CUDA tests when CUDA is unavailable.
+    """Auto-mark slow tests and honor SKIP_SLOW env var + CUDA availability.
 
     Test functions in ``run_correctness.py`` take an optional
     ``device='cpu'`` argument. When pytest collects them, it sees the
     parameter and tries to fixture-inject it. We mark slow tests with the
-    ``slow`` marker so they can be skipped with ``-m "not slow"``.
+    ``slow`` marker so they can be skipped with ``-m "not slow"`` OR by
+    setting ``SKIP_SLOW=1`` in the environment (useful in CI/quick smoke
+    runs where remembering to pass ``-m "not slow"`` every time is easy
+    to forget).
 
     P1-6 fix (Batch-3): when the user passes ``--device cuda`` but CUDA is
     unavailable, previously the tests would run with ``device='cuda'`` and
     crash deep inside torch with a cryptic ``RuntimeError: CUDA is not
     available``. Now we detect this up-front and skip the CUDA-only tests
     with a clear ``skip`` reason instead of letting them crash.
+
+    P2-2 (round 7): honor ``SKIP_SLOW=1`` (or SKIP_SLOW=true/yes/on) by
+    automatically skipping any test marked ``slow``, regardless of the
+    ``-m`` expression. This provides a single environment-driven knob that
+    CI (e.g. Kaggle CPU smoke, GitHub Actions quick job) can flip without
+    re-writing the pytest invocation line.
     """
+    # P2-2: pre-register the "slow" marker so pytest does not emit
+    # PytestUnknownMarkWarning for our dynamically-applied markers. The
+    # marker is already documented above, but registering it silences the
+    # warning and makes it show up in ``pytest --markers``.
+    config.addinivalue_line(
+        'markers',
+        'slow: marks tests as slow (deselect with ``-m "not slow"`` or set '
+        'SKIP_SLOW=1 in the environment)')
+
+    skip_slow = _env_flag('SKIP_SLOW', default=False)
+    slow_skip_marker = pytest.mark.skip(
+        reason='Skipped because SKIP_SLOW=1 is set in the environment.')
+
     device = config.getoption('--device')
     if device == 'cuda':
         try:
@@ -116,12 +146,20 @@ def pytest_collection_modifyitems(config, items):
                 # should still run).
                 if 'device' in getattr(item, 'fixturenames', ()):
                     item.add_marker(skip_cuda)
-            return  # Skip the slow-test marking; the items are already skipped.
+                elif skip_slow:
+                    for slow_name in _SLOW_TESTS:
+                        if item.name.startswith(slow_name):
+                            item.add_marker(slow_skip_marker)
+                            break
+            return  # CUDA unavailability dominates the rest.
     for item in items:
-        # Mark slow tests by function name.
+        # Mark slow tests by function name. If SKIP_SLOW is set, also
+        # attach a skip marker so they are deselected automatically.
         for slow_name in _SLOW_TESTS:
             if item.name.startswith(slow_name):
                 item.add_marker(pytest.mark.slow)
+                if skip_slow:
+                    item.add_marker(slow_skip_marker)
                 break
 
 
