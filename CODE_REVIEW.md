@@ -86,7 +86,7 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
 
 ## 二、复审中额外发现的问题（不在本次修复范围内，供后续跟踪）
 
-### 2.1 【新发现，独立问题】`CSADecodingCache`/`HCADecodingCache` 在 pytest 下的设备比较误判
+### 2.1 【已在后续修复】`CSADecodingCache`/`HCADecodingCache` 在 pytest 下的设备比较误判
 
 用 `pytest -m "not slow"` 跑全量测试时发现 3 个既有测试失败
 （`test_csa_decoding_cache_correctness`、`test_hca_decoding_cache_correctness`、
@@ -112,14 +112,14 @@ cache's device=cpu. Call cache.to(device=q.device) or move q to the cache's devi
   * 只有通过 `conftest.py` 的 `device` fixture 以 pytest 方式运行时，某些测试路径
     构造出的 `torch.device` 对象与字符串比较才会触发问题。
 
-**未在本次修复**：这是一个新发现的、范围明确的独立 bug，建议作为单独的后续修复
-（对齐 `ops_decoding_cache.py` 中所有 `.device` 比较，统一转换为 `torch.device(...)`
-后再比较，或统一存储为字符串）处理，不与本次的 3 个高优先级修复混在一起，以保持
-每次改动的可审查性。
+**后续状态**：该问题已在后续实验语义修复中处理：`CSADecodingCache`、
+`HCADecodingCache` 和 `_SlidingWindowRingBuffer` 在构造 / `.to(...)` 时统一把
+`device` 规范化为 `torch.device(...)`，因此 pytest fixture 传入字符串 `'cpu'`
+或张量 `.device` 返回 `torch.device('cpu')` 时不再误判。
 
-### 2.2 （历史遗留，仍未处理）
+### 2.2 （历史遗留维护事项，非实验结果阻断项）
 
-第二轮报告中列出的以下问题本轮未处理，状态不变：
+第二轮报告中列出的以下维护事项不改变当前实验数值语义，后续可作为工程质量改进继续跟踪：
   * KDA 星号解包模式导致的 mypy 报错（`ops_kda.py` 中 `B, T, H, K, HV, V = *q.shape, ...`
     写法，36 处报错，根因未消除）；
   * KDA/CSA/HCA 教学版实现在 4 个文件中重复（`ops_fused.py`/`run_quality.py`/
@@ -150,9 +150,25 @@ cache's device=cpu. Call cache.to(device=q.device) or move q to the cache's devi
 | review-fix 1.1-a（本轮新增） | ✅ 已修复并验证：`compiled_recurrent_kda(fullgraph=True)` 恢复可编译，eager 路径诊断能力不受影响，新增 3 项回归测试子检查填补了该函数此前完全无测试覆盖的空白 |
 | review-fix 1.1 / 1.2 / 1.3（上两轮） | ✅ 保持修复状态，230 项回归测试全部通过 |
 | 新发现的独立问题（§2.1） | ⚠️ 已定位根因并记录，**不在本次修复范围内**，建议作为下一个独立任务处理 |
-| 遗留中优先级问题（§2.2） | 未处理，状态与第二轮相同 |
+| 遗留中优先级维护事项（§2.2） | 非实验结果阻断项，后续可继续工程化改进 |
 
 **核心结论**：本轮修复了第二轮复审发现的"修复 A 破坏 B"式回归，且没有引入新的同类问题——
 通过为 `compiled_recurrent_kda` 补齐直接测试覆盖，弥补了导致上一次回归未被发现的
 测试盲区。复审过程中额外发现的 `CSADecodingCache` 设备比较问题是一个独立、范围明确的
 既有缺陷，已如实记录但刻意未在本次改动中一并修复，以保持每次修复的原子性和可审查性。
+
+---
+
+## 2026-07-13 后续实验语义修复记录（commit 078b770 及后续）
+
+本节补充最近一轮针对“是否影响实验结果”的复审与修复状态，避免旧章节中的历史问题误导读者：
+
+* `ops_decoding_cache.CSADecodingCache` / `HCADecodingCache` 的 device 存储已统一规范化为 `torch.device(...)`，此前记录的 string-vs-`torch.device` 假阳性问题已处理。
+* Exp6 的 `HybridDecoding` 已为每个 CSA/HCA 子层接入 incremental decoding cache；hybrid decode 行不再是“CSA/HCA 无历史上下文”的占位结果，也不再标记为 upper bound。
+* `naive_csa` 与 `CSADecodingCache.forward_step` 在 `torch.no_grad()` 推理/benchmark 下会跳过 STE soft surrogate，避免把训练代理开销计入延迟。
+* Exp2 的 standalone CSA/HCA benchmark 已计入 grouped output projection，使 JSON/README 中的 `end_to_end_single_layer` 边界与代码一致。
+* 主要实验路径（Hybrid、Exp4、Exp6、Exp2 CSA benchmark）已显式启用 `normalize_qk=True`，使 CSA lightning indexer 的 top-k 选择使用 cosine-style 方向相似度，而不是受 q_idx/K_idx 范数支配。
+* Exp3 KV-cache `full_accounting` 已补入 incremental runtime state：partial-token accumulators 以及 CSA overlapped compression 的 previous-block state。
+* `pyproject.toml` 已把 `ops_decoding_cache` 纳入 `py-modules`，保证安装态 `python -m run_decoding` 能导入缓存模块。
+
+剩余需要解释而非静默忽略的 caveat 已写入 README / JSON metadata：Exp6 cache-enabled prefill latency 包含 correctness-first Python cache population，因此是保守 reference-wrapper 数字；Exp4/Exp5 的显著性标记主要是 vs chance baseline，不是 pairwise operator/layout superiority test。

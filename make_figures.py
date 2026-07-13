@@ -819,7 +819,7 @@ def fig_decoding():
               'kda': 'KDA recurrent (O(1) state)',
               'csa': 'CSA sparse (incremental cache)',
               'hca': 'HCA dense (incremental cache)',
-              'hybrid': 'Hybrid KDA+CSA+HCA stack'}
+              'hybrid': 'Hybrid KDA+CSA+HCA stack (incremental caches)'}
     for op, pts in ops.items():
         pts.sort()
         xs = [p[0] for p in pts]

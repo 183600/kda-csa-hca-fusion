@@ -1290,6 +1290,7 @@ def main():
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,
+            'significance_scope': 'vs_chance_baseline_not_pairwise_between_ops',
             'csa_caveat': (
                 "CSA's lightning indexer is trained via a straight-through "
                 "estimator (STE): the forward pass uses hard top-k indices "

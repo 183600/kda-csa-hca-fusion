@@ -7,7 +7,7 @@ name = "kda-csa-hca-fusion"
 version = "0.1.0"
 description = "Naive PyTorch reference implementation and experimental harness for the KDA+CSA+HCA hybrid linear-attention architecture."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { file = "LICENSE" }
 authors = [
     { name = "kda-csa-hca-fusion contributors" },
@@ -91,6 +91,7 @@ py-modules = [
     "ops_csa",
     "ops_hca",
     "ops_fused",
+    "ops_decoding_cache",
     "run_correctness",
     "run_benchmark",
     "run_quality",

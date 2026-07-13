@@ -944,9 +944,9 @@ class CSADecodingCache:
             # no-op" was wrong. Casting fp32→fp32 cannot perturb the
             # norm; we skip the renormalize. If a future code path
             # stores UN-normalized keys in the SW buffer, re-add the
-            # normalize here and add an ``assert torch.allclose`` test.
-            # We add a cheap assert in DEBUG builds to catch regressions.
-            assert __debug__ or True  # no-op; just to make the comment block visible
+            # normalize here and add a dedicated correctness test. Avoid
+            # runtime asserts in this decode hot path: norm checks can add
+            # synchronizing overhead to the latency benchmark.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             # Single-query SW attention: scores = q[0] · C_local^T
             # => [B, nh, sw_len]. Softmax over sw_len. Out = p · C_local

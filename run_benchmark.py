@@ -488,6 +488,12 @@ def main():
                 # wrong conclusions about operator efficiency.
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
+                if name in {'csa', 'hybrid'}:
+                    row['csa_indexer_normalize_qk'] = True
+                    # ``torch.no_grad()`` gates off the STE surrogate in
+                    # naive_csa, so the timed region measures hard top-k
+                    # inference rather than the training proxy.
+                    row['csa_ste_in_timed_region'] = False
                 # BQ4 fix: attach variance stats from the side channel.
                 row['time_min_ms'] = _LAST_TIMING_STATS.get('min_ms')
                 row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
@@ -512,6 +518,9 @@ def main():
                     'time_std_ms': None,
                     'repeats': n_repeats,
                 }
+                if name in {'csa', 'hybrid'}:
+                    err_row['csa_indexer_normalize_qk'] = True
+                    err_row['csa_ste_in_timed_region'] = False
                 # P1-1 fix: also annotate error rows with the boundary
                 # metadata so the figure loader can still group them.
                 err_row.update(op_boundary[name])

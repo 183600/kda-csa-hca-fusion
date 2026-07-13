@@ -670,6 +670,7 @@ def main():
         r['conclusions_valid'] = conclusions_valid
         r['n_seeds_requested'] = n_seeds
         r['csa_indexer_normalize_qk'] = True
+        r['significance_scope'] = 'vs_chance_baseline_not_pairwise_between_layouts'
 
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped past

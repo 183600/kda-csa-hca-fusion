@@ -496,16 +496,18 @@ class CSAAttnDecoding(nn.Module):
                 use_ste=self.use_ste,
                 normalize_qk=True,
             )
-            # Populate the cache by feeding the projections token-by-token.
+            # Populate the cache from the full projection tensors in one call.
+            # ``append_step`` still walks tokens internally (compression is
+            # block-stateful), but avoiding an outer Python loop cuts reference
+            # prefill overhead and keeps the cache path aligned with the hybrid
+            # wrapper below. Detach so cache state doesn't retain the prefill
+            # graph.
             Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = self._project(x)
-            # Detach so the cache state doesn't retain the prefill graph.
-            for t in range(T_new):
-                cache.append_step(
-                    Ca[:, t:t+1].detach(), Cb[:, t:t+1].detach(),
-                    Za[:, t:t+1].detach(), Zb[:, t:t+1].detach(),
-                    K_idx[:, t:t+1].detach(), Z_idx[:, t:t+1].detach(),
-                    self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
-                )
+            cache.append_step(
+                Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+                K_idx.detach(), Z_idx.detach(),
+                self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
+            )
             return self.o_proj(o)
         # Decode (T_new == 1): incremental path.
         Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project(x)
@@ -585,11 +587,7 @@ class HCAAttnDecoding(nn.Module):
                 sliding_window=self.sliding_window, sink_logits=self.sink,
             )
             C, Z, _ = self._project(x)
-            for t in range(T_new):
-                cache.append_step(
-                    C[:, t:t+1].detach(), Z[:, t:t+1].detach(),
-                    self.B_pos.detach(),
-                )
+            cache.append_step(C.detach(), Z.detach(), self.B_pos.detach())
             return self.o_proj(o)
         C, Z, q = self._project(x)
         cache.append_step(C.detach(), Z.detach(), self.B_pos)
@@ -1047,6 +1045,16 @@ def main():
                 # placeholder. Keep explicit metadata for downstream figures.
                 r['upper_bound'] = False
                 r['uses_incremental_cache'] = (name in {'csa', 'hca', 'hybrid'})
+                r['prefill_cache_build'] = (
+                    'reference_python_append' if name in {'csa', 'hca', 'hybrid'}
+                    else 'native_operator_state'
+                )
+                r['prefill_latency_note'] = (
+                    'CSA/HCA cache-enabled rows include correctness-first Python '
+                    'cache population during prefill; decode/token timings use '
+                    'the incremental cache.' if r['uses_incremental_cache'] else
+                    'prefill uses the module native state/cache path.'
+                )
                 results.append(r)
                 peak_str = 'n/a' if r['peak_mem_MB'] is None else f"{r['peak_mem_MB']:.2f}MB"
                 print(f"  {name:10s}  prefill={r['prefill_ms']:8.2f}ms  "
@@ -1067,7 +1075,12 @@ def main():
                                 'n_decode': n_decode,
                                 'repeats': N_REPEATS,
                                 'upper_bound': False,
-                                'uses_incremental_cache': (name in {'csa', 'hca', 'hybrid'})})
+                                'uses_incremental_cache': (name in {'csa', 'hca', 'hybrid'}),
+                                'prefill_cache_build': (
+                                    'reference_python_append'
+                                    if name in {'csa', 'hca', 'hybrid'}
+                                    else 'native_operator_state'),
+                                'prefill_latency_note': None})
                 print(f"  {name:10s}  ERROR: {e}")
 
     # Summary: decode latency growth rate.

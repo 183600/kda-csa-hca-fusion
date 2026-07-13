@@ -15,8 +15,10 @@ We now report TWO accounting modes:
   * ``compressed_kv_only``  — the optimistic number (matches the original
     paper's "1.01% of GQA8" claim). This is what you get if you only count
     the compressed KV entries.
-  * ``full_accounting``     — includes every auxiliary cache listed above.
-    This is the number a production inference engine would actually pay.
+  * ``full_accounting``     — includes every auxiliary cache listed above plus
+    incremental runtime state (partial-token accumulators and CSA's previous
+    overlapped Cb/Zb block). This is the number a production inference engine
+    would actually pay for the reference cache design.
 
 We also make the baseline explicit: the GQA8 baseline is a *5-layer* unit
 (5 full GQA8 attention layers) so that the comparison to the 3:1:1 hybrid
@@ -156,12 +158,23 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             sw = min(T, csa_sw) * csa_c
             # Indexer key cache: n_blocks compressed indexer keys of c_I elements.
             indexer = n_blocks * csa_cI
+            # Incremental decode also retains a partial-token accumulator until
+            # a full block is available. CSA stores six per-token projections:
+            # Ca/Cb/Za/Zb (4*c) plus indexer K/Z (2*c_I). The previous
+            # ``full_accounting`` mode omitted this runtime state, so it was not
+            # truly full for non-divisible T.
+            partial_tokens = T % csa_m
+            partial = partial_tokens * (4 * csa_c + 2 * csa_cI)
+            # Overlapped CSA compression needs the previous block's Cb/Zb as
+            # the b-branch partner for the NEXT block. Once at least one block
+            # has completed, the decoding cache retains two [m, c] tensors.
+            overlap_prev = (2 * csa_m * csa_c) if T >= csa_m else 0
             # Compression metadata: the per-block softmax weights Z are recomputed
             # from the input hidden state during decoding, so they are NOT cached.
             # Sink: nh elements (negligible, included for completeness —
             # documented here even though the value is tiny).
             sink = p.get('csa_nh', H)
-            return compressed + sw + indexer + sink
+            return compressed + sw + indexer + partial + overlap_prev + sink
         return compressed
 
     if op == 'hca':
@@ -173,8 +186,12 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':
             sw = min(T, hca_sw) * hca_c
+            # HCA's incremental cache retains a partial accumulator until m2
+            # tokens are available: C and Z projections for each partial token.
+            partial_tokens = T % hca_m2
+            partial = partial_tokens * (2 * hca_c)
             sink = p.get('hca_nh', H)
-            return compressed + sw + sink
+            return compressed + sw + partial + sink
         return compressed
 
     if op == 'hybrid_kch':
@@ -457,6 +474,10 @@ def main():
                     'T': T,
                     'op': op,
                     'accounting_mode': mode,
+                    'accounting_semantics': (
+                        'compressed_kv_only' if mode == 'compressed_kv_only'
+                        else 'compressed_kv_plus_runtime_decode_state'
+                    ),
                     'kv_elements': kv,
                     # Ratios against the 1-layer baseline (original paper's convention).
                     'kv_ratio_vs_gqa_1l': kv / baseline_1l,

@@ -4241,6 +4241,54 @@ def test_kv_cache_ceil_block_count(device='cpu'):
     return results
 
 
+def test_kv_cache_full_accounting_runtime_state(device='cpu'):
+    """KV-cache full_accounting must include incremental runtime state.
+
+    CSA/HCA decoding caches retain more than compressed KV: partial-token
+    accumulators (until a full block is available) and, for CSA overlap, the
+    previous block's Cb/Zb tensors. Exp3's ``full_accounting`` is the number
+    readers interpret as "what the decoding runtime retains", so omitting these
+    tensors undercounts non-divisible sequence lengths and small contexts.
+    """
+    logger.info("Test: KV full_accounting includes partial/overlap runtime state")
+    from run_kv_cache import kv_cache_elements, DEFAULTS
+
+    p = {**DEFAULTS}
+    csa_m, csa_c, csa_cI = p['csa_m'], p['csa_c'], p['csa_cI']
+    hca_m2, hca_c = p['hca_m2'], p['hca_c']
+
+    T_csa = csa_m + 3
+    n_blocks_csa = max(1, (T_csa + csa_m - 1) // csa_m)
+    expected_csa = (
+        n_blocks_csa * csa_c                       # compressed KV capacity
+        + min(T_csa, p['csa_sliding_window']) * csa_c
+        + n_blocks_csa * csa_cI                    # indexer key cache
+        + (T_csa % csa_m) * (4 * csa_c + 2 * csa_cI)
+        + 2 * csa_m * csa_c                        # previous Cb/Zb overlap
+        + p['csa_nh']                              # sink
+    )
+    actual_csa = kv_cache_elements('csa', T_csa, mode='full_accounting', **p)
+
+    T_hca = hca_m2 + 5
+    n_blocks_hca = max(1, (T_hca + hca_m2 - 1) // hca_m2)
+    expected_hca = (
+        n_blocks_hca * hca_c
+        + min(T_hca, p['hca_sliding_window']) * hca_c
+        + (T_hca % hca_m2) * (2 * hca_c)
+        + p['hca_nh']
+    )
+    actual_hca = kv_cache_elements('hca', T_hca, mode='full_accounting', **p)
+
+    return [
+        _ok('csa full_accounting includes partial + overlap state',
+            actual_csa == expected_csa,
+            f'actual={actual_csa}, expected={expected_csa}, T={T_csa}'),
+        _ok('hca full_accounting includes partial accumulator',
+            actual_hca == expected_hca,
+            f'actual={actual_hca}, expected={expected_hca}, T={T_hca}'),
+    ]
+
+
 def test_prefill_flops_softmax_gqa_projections(device='cpu'):
     """Regression: ``prefill_flops('softmax_gqa')`` must include input/output
     projections for parity with KDA/CSA/HCA.
@@ -4691,6 +4739,55 @@ def test_decoding_cache_reset_clears_state(device='cpu'):
         f'sw_valid={cache.sw_buffer.n_valid if cache.sw_buffer else 0}')]
 
 
+def test_hybrid_decoding_cache_matches_full_sequence(device='cpu'):
+    """HybridDecoding prefill+token decode matches full-sequence hybrid output.
+
+    Exp6's hybrid row now wires one CSADecodingCache / HCADecodingCache into
+    every CSA/HCA sub-layer. This is a high-risk state-threading path: KDA
+    recurrent state, KDA short-conv lookback, CSA cache, HCA cache, residuals,
+    and LayerNorm all have to stay aligned across layers. A pure standalone
+    CSA/HCA cache test does not cover that integration.
+
+    Use ``csa_topk=100`` (select all valid compressed blocks in this tiny
+    sequence) to sidestep torch.topk tie-breaking differences. The full path
+    and incremental path share the SAME underlying HybridKCHAttention weights
+    because HybridDecoding owns the fused model internally.
+    """
+    logger.info("Test: HybridDecoding cache path matches full-sequence hybrid")
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(707)
+    d_model = 32
+    prefill_len = 8
+    n_decode = 4
+    total_len = prefill_len + n_decode
+    model = HybridDecoding(d_model=d_model, total_layers=5, csa_topk=100).to(device).eval()
+    x = torch.randn(1, total_len, d_model, device=device) * 0.1
+
+    with torch.no_grad():
+        # Full-sequence reference through the underlying fused model.
+        model.reset()
+        y_full = model.model(x)
+        # Incremental path: prefill then one token at a time through
+        # HybridDecoding's per-layer CSA/HCA caches.
+        model.reset()
+        y_prefill = model(x[:, :prefill_len])
+        ys = []
+        for t in range(prefill_len, total_len):
+            ys.append(model(x[:, t:t+1]))
+        y_inc_decode = torch.cat(ys, dim=1)
+
+    ref_decode = y_full[:, prefill_len:]
+    max_diff = (ref_decode - y_inc_decode).abs().max().item()
+    shape_ok = (y_prefill.shape == (1, prefill_len, d_model)
+                and y_inc_decode.shape == (1, n_decode, d_model))
+    return [_ok(
+        'hybrid_decoding_cache_matches_full_sequence',
+        shape_ok and max_diff < 1e-4,
+        f'max_diff={max_diff:.6e}, shape_ok={shape_ok}, '
+        f'prefill_len={prefill_len}, n_decode={n_decode}, csa_topk=100')]
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -4812,6 +4909,7 @@ def main():
     all_results += _run_safe(test_prefill_flops_causal_block_entries, device)
     # P1-4 regression: ceil block count at non-divisible T.
     all_results += _run_safe(test_kv_cache_ceil_block_count, device)
+    all_results += _run_safe(test_kv_cache_full_accounting_runtime_state, device)
     all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
     all_results += _run_safe(test_decoding_batch_size_change, device)
     # Incremental decoding cache tests (ops_decoding_cache.py).
@@ -4825,6 +4923,8 @@ def main():
     all_results += _run_safe(test_csa_decoding_cache_prefill_then_decode, device)
     all_results += _run_safe(test_hca_decoding_cache_compressed_blocks_match, device)
     all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
+    # Integrated Exp6 hybrid decode-cache path (KDA state + CSA/HCA caches).
+    all_results += _run_safe(test_hybrid_decoding_cache_matches_full_sequence, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

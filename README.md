@@ -80,8 +80,9 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 
 ## Installation
 
-**Requires Python ≥ 3.10** (the source uses PEP 604 `X | None` union syntax, which
-requires Python 3.10+). The `pyproject.toml` declares `requires-python = ">=3.10"`.
+**Requires Python 3.10–3.12** (the source uses PEP 604 `X | None` union syntax,
+and the pinned torch/scipy ranges are validated for the 3.10–3.12 wheel matrix).
+The `pyproject.toml` declares `requires-python = ">=3.10,<3.13"`.
 
 ```bash
 # 1. Clone
@@ -185,7 +186,7 @@ runs during development.
 | `results/exp3_kv_cache.json` | `[{T, op, kv_bytes, kv_elements, ...}, ...]` | analytic model, not profiled |
 | `results/exp4_mqar.json` | `[{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]` | multi-seed with CI95 + Bonferroni |
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper |
-| `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (CSA & HCA use incremental decoding cache) |
+| `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches) |
 | `results/summary.json` | `{env, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
 
 > **Known schema inconsistency.** Exp 4 wraps its results in
@@ -238,7 +239,10 @@ accuracy 6.25%. Several ablations land within a few percentage points of
 chance, so the `conclusions_valid` flag and the Bonferroni-corrected
 t-test in `run_quality.py` are the authoritative signal — `mean_acc` alone
 is misleading. Treat near-chance results as a *smoke quality probe*, not a
-structural claim.
+structural claim. The statistical tests currently reported are primarily
+**vs. the chance baseline**, not pairwise operator-vs-operator tests; do not
+claim that operator A is significantly better than operator B unless you add
+and report an explicit pairwise test.
 
 ### 4. Decoding experiment scope (Exp 6)
 
@@ -267,7 +271,11 @@ the hybrid row use these caches during token decode; the hybrid wrapper
 threads one cache per CSA/HCA sub-layer through the full KDA+CSA+HCA
 stack, so CSA/HCA layers can see the prefill history instead of only the
 current token. The small decode benchmark uses `csa_topk=2`, matching the
-small ablation setting.
+small ablation setting. The `prefill_ms` for cache-enabled CSA/HCA/hybrid rows
+includes correctness-first Python cache population (`prefill_cache_build =
+"reference_python_append"` in the JSON); it is therefore a conservative
+reference-wrapper prefill number. The per-token decode timings are the main
+cache-efficiency signal.
 
 **Known limitation: `torch.topk` tie-breaking.** When the CSA indexer's
 ReLU scores have many exact ties at 0 (common with random untrained
@@ -288,8 +296,9 @@ just different tie-breaking. The regression tests
 
 `run_kv_cache.py` computes KV-bytes and FLOPs from closed-form formulas
 (derived from the operator definitions, with corrections for ceil-block
-counts, causal entries, and projection terms). They are **not** measured
-from a real forward pass. The unit tests in `run_correctness.py`
+counts, causal entries, projection terms, and the incremental CSA/HCA runtime
+state such as partial-token accumulators and CSA overlap state). They are
+**not** measured from a real forward pass. The unit tests in `run_correctness.py`
 (`test_prefill_flops_*`, `test_kv_cache_ceil_block_count`) verify the
 formulas against hand-computed expected values; for production claims,
 cross-check with `torch.cuda.memory_allocated` and a FLOP counter.

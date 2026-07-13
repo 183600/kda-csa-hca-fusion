@@ -309,7 +309,18 @@ def run_all(seeds=None, steps=None):
             # the trend) but preserve the seed count at the default (7) so the
             # statistical test retains adequate power. If CPU runtime is a
             # concern, reduce the number of RATIOS or n_kv values instead.
-            os.environ['ABL_SEEDS'] = os.environ.get('ABL_SEEDS', '7')
+            # Preserve/raise the seed count to at least 5 even if the caller
+            # passed ``run_all(seeds=3)`` or exported ``ABL_SEEDS=3``. Below 5
+            # seeds the Bonferroni-corrected ablation is knowingly
+            # underpowered; the result JSON would carry
+            # ``conclusions_valid=False`` but downstream users often look only
+            # at mean_acc. Be conservative and keep the shortcut statistically
+            # usable.
+            try:
+                _abl_seeds = int(os.environ.get('ABL_SEEDS', '7'))
+            except ValueError:
+                _abl_seeds = 7
+            os.environ['ABL_SEEDS'] = str(max(5, _abl_seeds))
             os.environ['ABL_STEPS'] = '50'
         summary['runs'].append(_run('exp5_ablation', run_ablation.main))
 
