@@ -39,7 +39,10 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json, write_json_atomic
+from kaggle_setup import (
+    configure_torch_for_device, parse_int_env, sanitize_for_json,
+    write_json_atomic, write_results_json, capture_provenance,
+)
 from ops_fused import HybridKCHAttention, HybridConfig
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
@@ -688,14 +691,17 @@ def main():
     # target file as the OLD version (or absent) rather than a truncated
     # partial JSON document. See kaggle_setup.write_json_atomic's docstring
     # for the full rationale.
+    # AK1 fix: use shared ``write_results_json`` helper instead of
+    # copy-pasting the try/except sanitize-fallback pattern.
+    write_results_json(all_results, 'results/exp5_ablation.json',
+                       logger=logger)
+    # AK10 fix: also write a sibling provenance JSON.
     try:
-        write_json_atomic(all_results, 'results/exp5_ablation.json',
-                          indent=2, allow_nan=False)
-    except ValueError as e:
-        logger.error(f'non-finite value in results; sanitizing to null: {e}')
-        write_json_atomic(sanitize_for_json(all_results),
-                          'results/exp5_ablation.json',
-                          indent=2, allow_nan=False)
+        write_results_json(capture_provenance(),
+                           'results/exp5_ablation_provenance.json',
+                           logger=logger)
+    except Exception as e:
+        logger.warning(f'failed to write provenance: {e}')
     logger.info('\nSaved: results/exp5_ablation.json')
     # P0-2 fix: return non-zero if any layout's training crashed
     # (``'error' in r``), so ``run_all._run`` records the experiment as

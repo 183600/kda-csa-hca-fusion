@@ -60,7 +60,12 @@ from ops_decoding_cache import CSADecodingCache, HCADecodingCache
 # kept for backward compatibility but updated to reflect the new
 # scope. The warning is emitted once per process (Python's default
 # warning filter deduplicates by (message, category, module, lineno)).
-warnings.warn(
+# AK11 fix: this warning was emitted at MODULE IMPORT TIME, which means
+# any ``from run_decoding import SoftmaxAttnDecoding`` (e.g. in tests or
+# downstream consumers) triggers it — polluting the output and potentially
+# tripping ``pytest -W error``. Move it to ``main()`` so it only fires
+# when the script is run directly, not when it is imported as a library.
+_DEFERRED_IMPORT_WARNING = (
     "run_decoding.py: now benchmarks softmax, KDA, CSA, HCA, and the "
     "hybrid stack. CSA and HCA use the incremental decoding cache "
     "(ops_decoding_cache.CSADecodingCache / HCADecodingCache) which "
@@ -68,8 +73,7 @@ warnings.warn(
     "a sliding-window ring buffer, and (for CSA) a dynamically-updated "
     "indexer key cache. See README 'Fairness notes' #4 for the updated "
     "scope and the ``torch.topk`` tie-breaking caveat for CSA's "
-    "incremental indexer (a numerical artifact, not a correctness bug).",
-    stacklevel=2,
+    "incremental indexer (a numerical artifact, not a correctness bug)."
 )
 
 
@@ -840,6 +844,8 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
 
 def main():
+    # AK11 fix: emit the scope warning HERE (in main), not at import time.
+    warnings.warn(_DEFERRED_IMPORT_WARNING, stacklevel=2)
     info = configure_torch_for_device()
     device = info.device
     print('=' * 70)

@@ -77,6 +77,22 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
                                  cache + compression metadata + sink.
     """
     p = {**DEFAULTS, **kw}
+    # AK12 fix: reject unknown kwargs so a typo (e.g. ``csa_topk_typo=64``)
+    # is surfaced immediately rather than silently absorbed into ``p`` and
+    # ignored. Also validate ``op`` up-front so an invalid op produces a
+    # clear error at entry rather than falling through every ``if op ==``
+    # branch to a generic ``raise ValueError(op)`` 100+ lines down.
+    _valid_keys = set(DEFAULTS.keys())
+    _unknown = set(kw.keys()) - _valid_keys
+    if _unknown:
+        raise ValueError(
+            f"kv_cache_elements: unknown keyword argument(s) "
+            f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
+    _valid_ops = {'softmax_gqa', 'kda', 'csa', 'hca', 'hybrid_kch'}
+    if op not in _valid_ops:
+        raise ValueError(
+            f"kv_cache_elements: op={op!r} must be one of "
+            f"{sorted(_valid_ops)}.")
     H, K, V = p['H'], p['K'], p['V']
     csa_m, csa_c = p['csa_m'], p['csa_c']
     hca_m2, hca_c = p['hca_m2'], p['hca_c']

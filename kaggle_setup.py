@@ -682,6 +682,28 @@ def write_json_atomic(payload, target_path: str, *, indent: int = 2,
         raise
 
 
+def write_results_json(payload, target_path, *, indent=2, logger=None):
+    """AK1 fix: shared "atomic write + sanitize-fallback" helper.
+
+    Previously the same ~10-line ``try: write_json_atomic(allow_nan=False)
+    except ValueError: write_json_atomic(sanitize_for_json(...))`` pattern
+    was copy-pasted in run_ablation.py, run_decoding.py, run_kv_cache.py,
+    run_benchmark.py, and run_quality.py. The copy-paste had already
+    drifted (e.g. some log the error, some don't; some use
+    ``logger.error``, some ``logger.warning``). This helper consolidates
+    the pattern so future fixes land in one place.
+    """
+    try:
+        write_json_atomic(payload, target_path, indent=indent,
+                          allow_nan=False)
+    except ValueError as exc:
+        if logger is not None:
+            logger.error(
+                f'non-finite value in results; sanitizing to null: {exc}')
+        write_json_atomic(sanitize_for_json(payload), target_path,
+                          indent=indent, allow_nan=False)
+
+
 if __name__ == "__main__":
     # When run directly, probe and optionally install the CUDA wheel.
     setup_kaggle()
