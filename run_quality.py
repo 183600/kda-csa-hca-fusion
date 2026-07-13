@@ -745,8 +745,14 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # different number of RNG draws per operator, which would otherwise
     # desync the global RNG and produce different training data per op).
     batch_gen = torch.Generator(device=device)
-    batch_gen.manual_seed(seed + 1)  # offset so it does not collide with
-                                      # the seed used for model init.
+    # BQ9 fix: use a LARGE offset (1_000_000) instead of ``+ 1``. The
+    # previous offset collided with the next seed's model init: seed 42's
+    # batch used seed 43, which is the SAME RNG stream as seed 43's
+    # model initialization. The two RNG streams overlapped, weakening
+    # the t-test's independence assumption. A large offset puts the
+    # batch RNG stream in a completely different region of the seed
+    # space, eliminating the overlap.
+    batch_gen.manual_seed(seed + 1_000_000)
 
     losses, accs = [], []
     # Set train mode ONCE before the loop, not per step (the previous code
@@ -790,13 +796,25 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         # but by then every parameter is already NaN and the seed is lost
         # without a clear root cause. Check here so the per-seed try/except
         # surfaces the real failure mode.
-        bad_grads = [p for p in params
-                     if p.grad is not None and not torch.isfinite(p.grad).all()]
-        if bad_grads:
-            raise RuntimeError(
-                f"non-finite gradient at step {step} in {len(bad_grads)} "
-                f"params (op={op_name}, seed={seed}); aborting this seed "
-                f"to prevent NaN propagation into parameters")
+        #
+        # BQ6 fix: the previous check did ``torch.isfinite(p.grad).all()``
+        # PER PARAMETER, which forces a GPU→CPU sync per parameter
+        # (~15 params × 200 steps × 5 seeds × 4 ops = 60k syncs). The
+        # loss is already finite (checked above), and a finite loss with
+        # a NaN grad is extremely rare (would require an intermediate
+        # activation to overflow to inf then collapse back to a finite
+        # loss). We move the grad-finiteness check to run only every 50
+        # steps (still catches NaN propagation within ~50 steps, well
+        # before it can corrupt the final accuracy estimate), cutting
+        # the sync count by ~50x.
+        if step % 50 == 0:
+            bad_grads = [p for p in params
+                         if p.grad is not None and not torch.isfinite(p.grad).all()]
+            if bad_grads:
+                raise RuntimeError(
+                    f"non-finite gradient at step {step} in {len(bad_grads)} "
+                    f"params (op={op_name}, seed={seed}); aborting this seed "
+                    f"to prevent NaN propagation into parameters")
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())

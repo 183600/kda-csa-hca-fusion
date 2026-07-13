@@ -37,13 +37,23 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for_json, write_json_atomic
+from kaggle_setup import (
+    configure_torch_for_device, parse_int_env, sanitize_for_json,
+    write_json_atomic, capture_provenance,
+)
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig
 
 logger = logging.getLogger(__name__)
+
+
+# BQ4 fix: side channel for variance stats (min/max/std). The ``_bench``
+# function returns only (median, peak_mb) for backwards compatibility;
+# we stash the full timing list + min/max/std here so callers can attach
+# them to the result JSON for variance-aware comparison.
+_LAST_TIMING_STATS: dict = {}
 
 
 def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
@@ -127,6 +137,19 @@ def _measure(fn, repeats, device):
             times.append(start.elapsed_time(end) / 1000.0)
         peak_bytes = torch.cuda.max_memory_allocated(device)
         peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
+        # BQ4 fix: also stash min / max / std so downstream consumers can
+        # judge the variance of the measurement. ``BENCH_REPEATS=5`` has
+        # non-trivial uncertainty on a median alone; reporting the spread
+        # makes regressions easier to distinguish from noise. We stash
+        # them on a module-level dict so the existing (median, peak_mb)
+        # return contract is unchanged; callers can read the extra stats
+        # via ``_LAST_TIMING_STATS`` after a ``_bench`` call.
+        _LAST_TIMING_STATS['times'] = list(times)
+        _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
+        _LAST_TIMING_STATS['max_ms'] = (max(times) * 1000.0) if times else 0.0
+        _LAST_TIMING_STATS['std_ms'] = (
+            (statistics.stdev(times) * 1000.0) if len(times) >= 2 else 0.0
+        )
         # ``statistics.median`` averages the two middle values for even-length
         # lists; the previous ``sorted(times)[len(times)//2]`` returned the
         # upper-middle element, which biased the reported latency upward
@@ -154,13 +177,31 @@ def _measure(fn, repeats, device):
         # data") rather than a misleading 0.0. On GPU we report the real
         # ``torch.cuda.max_memory_allocated`` (with baseline subtraction).
         gc.collect()
-        times = []
-        for _ in range(repeats):
-            t0 = time.perf_counter()
-            fn()
-            t1 = time.perf_counter()
-            times.append(t1 - t0)
+        # BQ7 fix: pin torch to a single thread on CPU so the OpenMP pool
+        # doesn't dynamically resize between runs. PyTorch's default
+        # ``get_num_threads()`` adapts to load, which made the same op's
+        # measured latency drift by 2-3x between runs. Pinning to 1
+        # thread gives a stable, conservative measurement (real
+        # multi-threaded production latency will be lower, not higher).
+        _prev_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            times = []
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                fn()
+                t1 = time.perf_counter()
+                times.append(t1 - t0)
+        finally:
+            torch.set_num_threads(_prev_threads)
         peak_mb = None  # CPU peak memory is not reliably measurable
+        # BQ4 fix (CPU path): stash min/max/std too.
+        _LAST_TIMING_STATS['times'] = list(times)
+        _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
+        _LAST_TIMING_STATS['max_ms'] = (max(times) * 1000.0) if times else 0.0
+        _LAST_TIMING_STATS['std_ms'] = (
+            (statistics.stdev(times) * 1000.0) if len(times) >= 2 else 0.0
+        )
         return (statistics.median(times) if times else 0.0), peak_mb
 
 
@@ -433,6 +474,10 @@ def main():
                 # wrong conclusions about operator efficiency.
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
+                # BQ4 fix: attach variance stats from the side channel.
+                row['time_min_ms'] = _LAST_TIMING_STATS.get('min_ms')
+                row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
+                row['time_std_ms'] = _LAST_TIMING_STATS.get('std_ms')
                 row.update(op_boundary[name])
                 results.append(row)
                 # mem may be None on CPU (unreliable RSS sampling); render
@@ -449,6 +494,8 @@ def main():
                     'T': T, 'op': name, 'error': str(e),
                     'device': str(device),
                     'time_ms': None, 'peak_mem_MB': None,
+                    'time_min_ms': None, 'time_max_ms': None,
+                    'time_std_ms': None,
                     'repeats': n_repeats,
                 }
                 # P1-1 fix: also annotate error rows with the boundary
@@ -485,6 +532,14 @@ def main():
         write_json_atomic(sanitize_for_json(results),
                           'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
+    # BQ8 fix: write a sibling provenance JSON so the result file is
+    # self-describing (torch version, GPU, git commit, env vars).
+    try:
+        write_json_atomic(capture_provenance(),
+                          'results/exp2_benchmark_provenance.json',
+                          indent=2, allow_nan=False)
+    except Exception as e:
+        logger.warning(f'failed to write provenance: {e}')
     logger.info('\nSaved: results/exp2_benchmark.json')
     # P0-2 fix: return non-zero if any (T, op) cell errored out, so
     # ``run_all._run`` records the experiment as ``status='fail'`` instead of

@@ -478,6 +478,44 @@ def print_env_summary() -> EnvInfo:
     return info
 
 
+def capture_provenance() -> dict:
+    """BQ8 / AK10 fix: capture environment provenance for result JSON files.
+
+    Returns a dict with torch / CUDA / Python / git-commit / env-var
+    metadata so a result JSON is self-describing. Previously the four
+    experiment runners (benchmark, quality, ablation, decoding, kv_cache)
+    wrote rows with no environment metadata — a reader picking up a stale
+    JSON had no way to tell which torch version / GPU / commit produced
+    it, making cross-version comparisons meaningless.
+    """
+    import os
+    import platform
+    import subprocess
+    import sys
+    import datetime
+    info = detect_env()
+    # Best-effort git commit; ignore errors (running from a tarball, etc).
+    git_commit = None
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        git_commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=here, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        pass
+    return {
+        'captured_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'python_version': sys.version.split()[0],
+        'platform': platform.platform(),
+        'torch_version': info.torch_version,
+        'cuda_version': info.cuda_version,
+        'device_name': info.device_name,
+        'git_commit': git_commit,
+        'pythonhashseed': os.environ.get('PYTHONHASHSEED', '<unset>'),
+        'num_threads': info.num_threads,
+    }
+
+
 def parse_int_env(var_name: str, default: int, *, min_value: int = 1,
                   logger: logging.Logger | None = None) -> int:
     """Parse an int environment variable with robust fallback.
