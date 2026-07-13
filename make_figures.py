@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import collections
 import json
+import math
 import os
 import sys
 
@@ -467,11 +468,17 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
         ops.append(r['op'])
         if _has_multiseed(r):
             means.append(r['mean_acc'])
-            # ``or 0.0`` coerces both missing AND explicitly-None ci95_acc
-            # (the single-seed case where train_multi_seed returns None) to
-            # 0.0 so the error bar disappears. Without the ``or``, an
-            # explicit None would later crash ``m + c`` (int + NoneType).
-            cis.append(r.get('ci95_acc') or 0.0)
+            # ci95_acc is None when only one seed survived (see
+            # run_quality.py::train_multi_seed / run_ablation.py::
+            # eval_layout_multi_seed). Coercing None -> 0.0 (the previous
+            # behaviour) produces a ZERO-WIDTH error bar that visually
+            # implies perfect precision, contradicting the upstream intent
+            # of writing None to signal "uncertainty is maximal / n/a".
+            # Use NaN instead: matplotlib skips the error bar entirely
+            # (visually: no error bar), which honestly reflects that the
+            # CI is undefined rather than zero.
+            _ci = r.get('ci95_acc')
+            cis.append(float('nan') if _ci is None else float(_ci))
             # Same ``or`` guard for chance_acc: a record with
             # ``chance_acc: None`` (e.g. partially-failed seed wrote null)
             # would set ``chance = None`` and crash ``ax.axhline(None, ...)``
@@ -547,10 +554,20 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
     # list (e.g. all records were error rows but somehow bypassed the early
     # return) yields 0.0 instead of raising ``ValueError: max() iterable
     # argument is empty``. Mirrors the fix in ``_plot_ablation_group``.
-    acc_upper = max((m + c for m, c in zip(means, cis)), default=0.0) * 1.3
+    # NaN-safe upper bound: a NaN ci (single-seed record) would propagate
+    # through ``m + c`` and turn the whole max into NaN, breaking the ylim.
+    # Filter to finite values only; if everything is NaN/empty, fall back
+    # to 0.0 so the ``max(acc_upper, 0.35)`` floor still applies.
+    _finite_upper = [m + c for m, c in zip(means, cis)
+                     if math.isfinite(m + c)]
+    acc_upper = (max(_finite_upper, default=0.0)) * 1.3
     ax.set_ylim(0, max(acc_upper, 0.35))
     for bar, m, c in zip(bars, means, cis):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + c + 0.005,
+        # Use 0.0 for the text y-offset when c is NaN (single-seed record)
+        # so the accuracy label still renders at the top of the bar.
+        _c_offset = 0.0 if not math.isfinite(c) else c
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + _c_offset + 0.005,
                 f'{m:.3f}', ha='center', va='bottom', fontsize=10)
     ax.legend(fontsize=9)
     _ensure_figures_dir()
@@ -649,7 +666,11 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
             error_flags.append(False)
             ratios.append(ratio)
             accs.append(r.get('mean_acc', r.get('final_acc', 0.0)) or 0.0)
-            acc_cis.append(r.get('ci95_acc', 0.0) or 0.0)
+            # ci95_acc is None when only one seed survived (see comment in
+            # _plot_mqar_group). Use NaN so the error bar is omitted rather
+            # than rendered as a misleading zero-width bar.
+            _ci = r.get('ci95_acc')
+            acc_cis.append(float('nan') if _ci is None else float(_ci))
             fwds.append(r.get('mean_fwd_ms', r.get('fwd_ms', 0.0)) or 0.0)
             n_params.append(r.get('n_params') or 0)
             n_layers.append(r.get('n_layers')
@@ -716,8 +737,12 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     # the empty-list case is now handled by the early return above.
     # Use a defensive ``or 0.0`` so a None in accs (should not happen
     # here, but cheap to guard) does not crash the multiplication.
-    acc_upper = max((float(a) + float(c) for a, c in zip(accs, acc_cis)),
-                    default=0.0) * 1.3
+    # NaN-safe upper bound (mirrors _plot_mqar_group): a NaN ci (single-
+    # seed record) would propagate through ``a + c`` and turn the whole
+    # max into NaN. Filter to finite values only.
+    _finite_upper = [float(a) + float(c) for a, c in zip(accs, acc_cis)
+                     if math.isfinite(float(a) + float(c))]
+    acc_upper = (max(_finite_upper, default=0.0)) * 1.3
     ax1.set_ylim(0, max(acc_upper, 0.2))
 
     # Latency.

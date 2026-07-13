@@ -640,8 +640,23 @@ class HybridDecoding(nn.Module):
     def __init__(self, d_model=64, total_layers=5, csa_topk: int = 2):
         """``csa_topk`` is exposed so decode ablations can sweep it.
 
-        Default ``2`` matches the small-model ablation setting; unlike the old
-        hardcoded ``100`` it preserves CSA's sparse top-k retrieval.
+        The standalone decode-latency benchmark uses a SMALLER config than
+        the Exp 5 ablation / Exp 4 quality models (which use
+        ``run_quality.SMALL_MODEL_SPEC``: ``c=32, dc=64, cI=16, nIh=2,
+        topk=4, m2=8, d_model=32``). The decoding config here
+        (``c=8, dc=8, cI=4, nIh=1, topk=2, m2=4, d_model=64``) is
+        intentionally lighter so per-token decode work stays small enough
+        to benchmark on CPU at the default ``prefill_lens`` (up to 2048)
+        without the cache-tensor allocation dominating the timed region.
+        Decode numbers MUST NOT be compared head-to-head with Exp 4/5
+        quality numbers — the model geometry is different by design.
+
+        The default ``csa_topk=2`` (not 4) preserves CSA's sparse top-k
+        retrieval property at this smaller block count, matching the
+        decode benchmark's intent to measure the *sparse* CSA path rather
+        than the dense fallback. The previous hardcoded ``100`` effectively
+        turned CSA into dense attention, defeating the point of the
+        comparison.
         """
         super().__init__()
         self.cfg = HybridConfig(

@@ -296,7 +296,19 @@ def run_all(seeds=None, steps=None):
             # Keep the primary comparison fair even in the reduced CPU run.
             # A longer softmax-only sensitivity run must be requested
             # explicitly by the caller, not silently enabled here.
-            os.environ['MQAR_SOFTMAX_STEPS'] = '100'
+            #
+            # BUGFIX: only override MQAR_SOFTMAX_STEPS if the caller did NOT
+            # explicitly set it. The previous unconditional override silently
+            # broke the long-training softmax sensitivity run: a caller who
+            # exported ``MQAR_SOFTMAX_STEPS=2000`` to measure softmax
+            # convergence (the explicit-request path documented in the
+            # README's "Fairness notes #2") would have it silently reduced
+            # to 100 by SKIP_SLOW=1, producing a sensitivity row that
+            # understates softmax's converged accuracy. Honor the explicit
+            # request and only fall back to ``MQAR_STEPS`` (the reduced
+            # budget) when the caller left it unset.
+            if 'MQAR_SOFTMAX_STEPS' not in os.environ:
+                os.environ['MQAR_SOFTMAX_STEPS'] = '100'
         summary['runs'].append(_run('exp4_mqar', run_quality.main))
 
         # 6. Ablation — multi-seed.
@@ -355,7 +367,13 @@ def run_all(seeds=None, steps=None):
         #   in the summary. The green-report bug is fixed.
         def _make_figs():
             try:
-                make_figures.main()
+                # Propagate the return value so a non-zero rc from
+                # ``make_figures.main()`` (signalling partial failure without
+                # raising) is honored by ``_run``. The previous code called
+                # ``make_figures.main()`` and discarded the return value,
+                # so a non-zero rc was silently treated as success — re-opening
+                # the P0-2 green-report hole the surrounding block documents.
+                return make_figures.main()
             except (FileNotFoundError, json.JSONDecodeError) as e:
                 # Soft failure: a result file is missing or malformed.
                 # ``make_figures.load`` handles per-figure skips, but a
