@@ -252,19 +252,15 @@ def _bonferroni_crit_q(n, alpha=0.05):
          the corrected alphas used downstream (e.g. 0.05/28 ~= 0.0018,
          one-sided) we need the ``1-alpha`` upper-tail quantile, which is
          far in the tail. We therefore do NOT use the 97.5% table for
-         corrected alphas; we only fall through to the Cornish-Fisher
-         expansion below.
-      3. Cornish-Fisher expansion around the normal quantile for the
-         requested ``1 - alpha`` level. This matches the one-sided
-         ``t_stat > crit`` comparisons in Exp4/Exp5; using ``1-alpha/2``
-         would be a two-sided threshold and silently make the test too
-         conservative. The
-         third-order expansion is important at the small seed counts used
-         here: first-order Cornish-Fisher underestimates the n=7,
-         alpha=0.05/7 critical value by about 7%, which can falsely mark
-         a borderline result significant when scipy is unavailable. The
-         third-order form keeps the common n>=7 corrected-alpha cases within
-         about 1% of scipy.
+         corrected alphas; we fall through to the dependency-free inverse-CDF
+         computation below.
+      3. Dependency-free Student-t inverse CDF using the regularized
+         incomplete beta function plus bisection for the requested
+         ``1 - alpha`` level. This matches the one-sided ``t_stat > crit``
+         comparisons in Exp4/Exp5; using ``1-alpha/2`` would be a two-sided
+         threshold and silently make the test too conservative. A previous
+         Cornish-Fisher approximation was finite but still too liberal for
+         small seed counts, so the fallback now computes the t CDF directly.
       4. For ``n < 2`` returns ``None`` (CI undefined — caller must guard).
 
     Being at module scope means ``run_ablation.py`` can import and reuse
@@ -283,55 +279,91 @@ def _bonferroni_crit_q(n, alpha=0.05):
             _T_PP = False
     if _T_PP:
         return float(_T_PP(1 - alpha, n - 1))
-    # scipy unavailable: use the Cornish-Fisher expansion around the
-    # normal quantile for the requested one-sided alpha. This is the same
-    # Cornish-Fisher shape that ``_t_crit_975`` uses for n > 100, but with
-    # z chosen dynamically. We need scipy.stats.norm.ppf(1 - alpha); compute
-    # via a small rational approximation (Acklam's algorithm) so we don't
-    # require scipy just for the normal quantile.
-    p = 1 - alpha
-    # Acklam's inverse-normal approximation (max rel error ~1.15e-9).
-    a = [-3.969683028665376e+01, 2.209460984245205e+02,
-         -2.759285104469687e+02, 1.383577518672690e+02,
-         -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02,
-         -1.556989798598866e+02, 6.680131188771972e+01,
-         -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01,
-         -2.400758277161838e+00, -2.549732539343734e+00,
-         4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01,
-         2.445134137142996e+00, 3.754408661907416e+00]
-    p_low = 0.02425
-    p_high = 1 - p_low
-    if p < p_low:
-        q = math.sqrt(-2.0 * math.log(p))
-        x = (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
-            ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
-    elif p <= p_high:
-        q = p - 0.5
-        r = q * q
-        x = (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q / \
-            (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
-    else:
-        q = math.sqrt(-2.0 * math.log(1.0 - p))
-        x = -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
-             ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
-    z = float(x)
-    nu = n - 1
-    # Third-order Cornish-Fisher expansion for the Student-t quantile.
-    # The earlier first-order form was finite but too liberal at the small
-    # seed counts used by Exp4/Exp5 (e.g. n=7, alpha=0.05/7 was ~7% below
-    # scipy.stats.t.ppf), which could affect borderline significance when
-    # scipy is unavailable. Adding the 1/nu^2 and 1/nu^3 terms keeps the
-    # fallback close enough for experiment-level validity flags.
-    crit = (
-        z
-        + (z ** 3 + z) / (4.0 * nu)
-        + (5.0 * z ** 5 + 16.0 * z ** 3 + 3.0 * z) / (96.0 * nu ** 2)
-        + (3.0 * z ** 7 + 19.0 * z ** 5 + 17.0 * z ** 3 - 15.0 * z)
-        / (384.0 * nu ** 3)
-    )
+    # scipy unavailable: compute the Student-t quantile directly via the
+    # regularized incomplete beta function and bisection. Earlier fallback
+    # revisions used a Cornish-Fisher approximation; even the third-order
+    # form can be a few percent liberal at n=5 in Bonferroni-tail regimes,
+    # which is enough to flip borderline ``significant_bonferroni`` flags.
+    # The numerical integration below is dependency-free and accurate for
+    # the small seed counts used by Exp4/Exp5.
+    target_p = 1.0 - alpha
+
+    def _betacf(a, b, x):
+        # Continued fraction for incomplete beta (Numerical Recipes).
+        max_iter = 200
+        eps = 3.0e-14
+        fpmin = 1.0e-300
+        qab = a + b
+        qap = a + 1.0
+        qam = a - 1.0
+        c = 1.0
+        d = 1.0 - qab * x / qap
+        if abs(d) < fpmin:
+            d = fpmin
+        d = 1.0 / d
+        h = d
+        for m in range(1, max_iter + 1):
+            m2 = 2 * m
+            aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < fpmin:
+                d = fpmin
+            c = 1.0 + aa / c
+            if abs(c) < fpmin:
+                c = fpmin
+            d = 1.0 / d
+            h *= d * c
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+            d = 1.0 + aa * d
+            if abs(d) < fpmin:
+                d = fpmin
+            c = 1.0 + aa / c
+            if abs(c) < fpmin:
+                c = fpmin
+            d = 1.0 / d
+            delta = d * c
+            h *= delta
+            if abs(delta - 1.0) < eps:
+                break
+        return h
+
+    def _betai(a, b, x):
+        if x <= 0.0:
+            return 0.0
+        if x >= 1.0:
+            return 1.0
+        bt = math.exp(
+            math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+            + a * math.log(x) + b * math.log1p(-x)
+        )
+        if x < (a + 1.0) / (a + b + 2.0):
+            return bt * _betacf(a, b, x) / a
+        return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+    def _student_t_cdf(t_value, dof):
+        if t_value == 0.0:
+            return 0.5
+        x = dof / (dof + t_value * t_value)
+        ib = _betai(0.5 * dof, 0.5, x)
+        if t_value > 0.0:
+            return 1.0 - 0.5 * ib
+        return 0.5 * ib
+
+    dof = n - 1
+    lo, hi = 0.0, 1.0
+    while _student_t_cdf(hi, dof) < target_p:
+        hi *= 2.0
+        if hi > 1.0e6:
+            raise RuntimeError(
+                f"_bonferroni_crit_q fallback could not bracket quantile "
+                f"for n={n}, alpha={alpha}")
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if _student_t_cdf(mid, dof) < target_p:
+            lo = mid
+        else:
+            hi = mid
+    crit = 0.5 * (lo + hi)
     if not math.isfinite(crit):
         raise RuntimeError(
             f"_bonferroni_crit_q fallback produced non-finite critical value: {crit}")
