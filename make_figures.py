@@ -509,15 +509,40 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
     else:
         n_seeds = 1
 
-    # Training steps: take from the first per_seed entry when present.
-    # Falls back to 100 for missing key, empty per_seed list, or empty data.
+    # Training steps: take from the first per_seed entry of a NON-softmax
+    # record when available. ``run_quality.py`` appends records in the fixed
+    # order ``['softmax', 'kda', 'csa', 'hca']``, and softmax may use a
+    # DIFFERENT step budget (``MQAR_SOFTMAX_STEPS``) than the other ops
+    # (``MQAR_STEPS``). Using ``ok_records[0]`` (which is softmax whenever it
+    # succeeds) would put softmax's step count in the title, mislabeling the
+    # budget that kda/csa/hca actually trained for. Prefer a non-softmax
+    # record so the title reflects the canonical ``MQAR_STEPS`` budget; fall
+    # back to the first record (softmax) only if no non-softmax record
+    # succeeded.
+    title_rec = next((r for r in ok_records if r.get('op') != 'softmax'),
+                     ok_records[0] if ok_records else None)
+    # Also pick up softmax's step count so we can show both when they differ.
+    softmax_rec = next((r for r in ok_records if r.get('op') == 'softmax'),
+                       None)
     steps = 100
-    if ok_records:
-        per_seed = ok_records[0].get('per_seed') or []
+    softmax_steps = None
+    if title_rec:
+        per_seed = title_rec.get('per_seed') or []
         if per_seed:
             steps = per_seed[0].get('steps', 100)
+    if softmax_rec is not None:
+        ps = softmax_rec.get('per_seed') or []
+        if ps:
+            softmax_steps = ps[0].get('steps')
+    # If softmax used a different step budget, surface BOTH in the title so
+    # the figure is not misleading (the README's Fairness notes #2 explicitly
+    # requires this case to be "labelled separately").
+    if softmax_steps is not None and softmax_steps != steps:
+        title_steps = f'softmax={softmax_steps}, others={steps}'
+    else:
+        title_steps = str(steps)
     ax.set_title(f'Multi-Query Associative Recall (n_kv={n_kv}, '
-                 f'{n_seeds} seeds, {steps} steps)')
+                 f'{n_seeds} seeds, {title_steps} steps)')
     # Defensive ``default=0.0`` on the inner ``max`` so an empty ``means``
     # list (e.g. all records were error rows but somehow bypassed the early
     # return) yields 0.0 instead of raising ``ValueError: max() iterable

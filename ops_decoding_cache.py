@@ -828,6 +828,23 @@ class CSADecodingCache:
         # The causal_block_mask passed to ``csa_lightning_indexer`` is
         # ``[T, n_blocks]`` (one row per query). With T=1, it's
         # ``[1, n_blocks]`` with True for blocks whose index < t // m.
+        # Core-attention scale: compute ONCE here so it is available to
+        # BOTH the sparse branch (below) and the sliding-window branch
+        # (further down). Previously ``core_scale`` was assigned INSIDE the
+        # sparse branch's ``else`` block, which meant it was left unbound
+        # when ``self._C_comp is None or self._n_blocks == 0`` (the first
+        # ``m`` decode steps before the first compressed block is formed).
+        # The SW branch then crashed with ``cannot access local variable
+        # 'core_scale'`` whenever the SW ring buffer had entries during
+        # those early steps — a real bug that broke incremental decoding
+        # from a cold cache (no prefill). Moving the assignment here
+        # guarantees ``core_scale`` is always bound before either branch
+        # can read it.
+        if scale is None:
+            core_scale = 1.0 if normalize_qk else self.c ** -0.5
+        else:
+            core_scale = scale
+
         if self._C_comp is None or self._n_blocks == 0:
             # No compressed blocks yet — sparse branch contributes zero.
             sparse_out = torch.zeros(
@@ -847,17 +864,12 @@ class CSADecodingCache:
             # attention). When False, skip normalization and fall back
             # to classical 1/sqrt(c) dot-product scale — this gives
             # ablations a real off-switch rather than a silently-ignored
-            # flag. Also select the core-attention scale here so that
-            # the sparse and SW branches below agree.
+            # flag.
             if normalize_qk:
                 C_comp_n = F.normalize(
                     self._C_comp.to(compute_dtype), dim=-1)           # [B, n_blocks, c]
             else:
                 C_comp_n = self._C_comp.to(compute_dtype)
-            if scale is None:
-                core_scale = 1.0 if normalize_qk else self.c ** -0.5
-            else:
-                core_scale = scale
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in

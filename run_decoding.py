@@ -490,10 +490,14 @@ class CSAAttnDecoding(nn.Module):
         self._ensure_cache(B, x.device, x.dtype)
         cache = self._cache
         if T_new > 1:
-            # Prefill: use the fast vectorized naive_csa for the output, then
-            # populate the cache from the same full projection tensors (no
-            # output recomputation — append_step only updates cache state).
-            o = naive_csa(
+            # Prefill: use the fast vectorized naive_csa for the output AND
+            # reuse its internally-computed projections to populate the cache
+            # (return_projections=True). This eliminates a redundant fused
+            # matmul that previously recomputed the same 6 KV/indexer
+            # projections via _project(x), inflating CSA prefill latency by
+            # ~1.5-3x relative to softmax/KDA (whose prefill populates the
+            # cache as a side effect of the native forward call).
+            o, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
                 x, self.W_aKV.weight, self.W_bKV.weight,
                 self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
                 self.W_DQ.weight, self.W_UQ.weight, self.W_IUQ.weight,
@@ -504,14 +508,12 @@ class CSAAttnDecoding(nn.Module):
                 sliding_window=self.sliding_window, sink_logits=self.sink,
                 use_ste=self.use_ste,
                 normalize_qk=True,
+                return_projections=True,
             )
-            # Populate the cache from the full projection tensors in one call.
+            # Populate the cache from the projections returned by naive_csa
+            # (detached so cache state doesn't retain the prefill graph).
             # ``append_step`` still walks tokens internally (compression is
-            # block-stateful), but avoiding an outer Python loop cuts reference
-            # prefill overhead and keeps the cache path aligned with the hybrid
-            # wrapper below. Detach so cache state doesn't retain the prefill
-            # graph.
-            Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = self._project(x)
+            # block-stateful), but the projection matmul cost is paid once.
             cache.append_step(
                 Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
                 K_idx.detach(), Z_idx.detach(),
@@ -592,13 +594,18 @@ class HCAAttnDecoding(nn.Module):
         self._ensure_cache(B, x.device, x.dtype)
         cache = self._cache
         if T_new > 1:
-            o = naive_hca(
+            # Prefill: use naive_hca for the output AND reuse its
+            # internally-computed C/Z projections to populate the cache
+            # (return_projections=True). Eliminates a redundant matmul that
+            # previously recomputed the same 2 projections via _project(x),
+            # inflating HCA prefill latency relative to softmax/KDA.
+            o, (C, Z) = naive_hca(
                 x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
                 self.W_DQ.weight, self.W_UQ.weight,
                 m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                 sliding_window=self.sliding_window, sink_logits=self.sink,
+                return_projections=True,
             )
-            C, Z, _ = self._project(x)
             cache.append_step(C.detach(), Z.detach(), self.B_pos.detach())
             return self.o_proj(o)
         C, Z, q = self._project(x)
@@ -733,18 +740,14 @@ class HybridDecoding(nn.Module):
         if T_new == 0:
             return h.new_zeros(B, 0, cfg.d_model)
         cache = self._ensure_csa_cache(cache_idx, layer, h)
-        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project_csa(layer, h)
-        # Cache state is runtime inference state; detach to avoid retaining
-        # prefill/decode graphs if a caller forgets no_grad().
-        cache.append_step(
-            Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
-            K_idx.detach(), Z_idx.detach(),
-            layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
-        )
         if T_new > 1:
-            # Prefill: vectorized full-sequence operator for the output, while
-            # the cache above is populated for subsequent token decode.
-            o_core = naive_csa(
+            # Prefill: vectorized full-sequence operator for the output AND
+            # reuse its internally-computed projections to populate the cache
+            # (return_projections=True). Eliminates a redundant fused matmul
+            # that previously recomputed the same 6 KV/indexer projections
+            # via _project_csa, inflating hybrid prefill latency relative
+            # to softmax/KDA.
+            o_core, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
                 h, layer.W_aKV.weight, layer.W_bKV.weight,
                 layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
                 layer.W_DQ.weight, layer.W_UQ.weight, layer.W_IUQ.weight,
@@ -754,8 +757,23 @@ class HybridDecoding(nn.Module):
                 nIh=cfg.csa_nIh, c=cfg.csa_c, c_I=cfg.csa_cI,
                 dc=cfg.csa_dc, sliding_window=cfg.csa_sliding_window,
                 sink_logits=layer.sink, use_ste=False, normalize_qk=True,
+                return_projections=True,
+            )
+            # Cache state is runtime inference state; detach to avoid retaining
+            # prefill/decode graphs if a caller forgets no_grad().
+            cache.append_step(
+                Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+                K_idx.detach(), Z_idx.detach(),
+                layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
             )
         else:
+            # Decode (T_new == 1): incremental path.
+            Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project_csa(layer, h)
+            cache.append_step(
+                Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+                K_idx.detach(), Z_idx.detach(),
+                layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
+            )
             compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
             q_n = F.normalize(q.to(compute_dtype), dim=-1)
             o = cache.forward_step(
@@ -774,16 +792,23 @@ class HybridDecoding(nn.Module):
         if T_new == 0:
             return h.new_zeros(B, 0, cfg.d_model)
         cache = self._ensure_hca_cache(cache_idx, layer, h)
-        C, Z, q = self._project_hca(layer, h)
-        cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
         if T_new > 1:
-            o_core = naive_hca(
+            # Prefill: vectorized full-sequence operator for the output AND
+            # reuse its internally-computed C/Z projections to populate the
+            # cache (return_projections=True). Eliminates a redundant matmul
+            # that previously recomputed the same 2 projections via
+            # _project_hca, inflating hybrid prefill latency.
+            o_core, (C, Z) = naive_hca(
                 h, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
                 layer.W_DQ.weight, layer.W_UQ.weight,
                 m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
                 sliding_window=cfg.hca_sliding_window, sink_logits=layer.sink,
+                return_projections=True,
             )
+            cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
         else:
+            C, Z, q = self._project_hca(layer, h)
+            cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
             compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
             q_n = F.normalize(q.to(compute_dtype), dim=-1)
             o = cache.forward_step(

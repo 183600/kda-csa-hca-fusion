@@ -43,8 +43,18 @@ def naive_hca(
     scale: float = 1.0,            # H7 fix: drop None sentinel (None → 1.0 anyway)
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
-) -> torch.Tensor:
+    return_projections: bool = False,
+):
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
+
+    When ``return_projections=True``, returns ``(output, projections)`` where
+    ``projections`` is a tuple ``(C, Z)`` of the 2 per-token KV compression
+    projections (each ``[B, original_T, c]``, trimmed to the input's original
+    T before any right-padding). This lets incremental-decoding callers (e.g.
+    ``run_decoding.HCAAttnDecoding``) populate an
+    :class:`ops_decoding_cache.HCADecodingCache` WITHOUT recomputing the 2
+    projections a second time — eliminating a redundant matmul that previously
+    inflated HCA/hybrid prefill latency relative to softmax/KDA.
 
     **Weight layout** (P0 API fix): all ``W_*`` tensors follow the
     ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
@@ -276,4 +286,15 @@ def naive_hca(
     # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
     # matches the input's original T (right-padding added zeros at the end,
     # which never affect real-token outputs thanks to the causal block mask).
-    return out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
+    out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
+    if return_projections:
+        # Return the 2 per-token KV compression projections (trimmed to
+        # original_T) so incremental-decoding callers can populate an
+        # HCADecodingCache without recomputing them. The projections are
+        # in H.dtype (F.linear preserves dtype) and on the input's device.
+        projections = (
+            C[:, :original_T],   # [B, original_T, c]
+            Z[:, :original_T],   # [B, original_T, c]
+        )
+        return out_final, projections
+    return out_final

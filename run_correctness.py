@@ -2473,10 +2473,16 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     sink = torch.tensor([0.5, -0.3], dtype=dtype, device=device)
 
     # Run naive_csa with sliding_window=0 to isolate the sparse+sink path.
+    # Pass normalize_qk=True to match the reference implementation below
+    # (which L2-normalizes q and C_comp and uses scale=1.0). Without this,
+    # naive_csa defaults to normalize_qk=False (un-normalized, scale=c**-0.5),
+    # which is a DIFFERENT attention computation than the reference — the
+    # test would fail spuriously even when the sink shift is correct.
     o_csa = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
                       W_DQ, W_UQ, W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx,
                       m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
-                      sliding_window=0, sink_logits=sink)
+                      sliding_window=0, sink_logits=sink,
+                      normalize_qk=True)
 
     # Build a CORRECT reference for the sparse MQA core with sink.
     # NOTE: ``csa_compress_kv`` is the only name not already imported at
@@ -4569,6 +4575,7 @@ def test_csa_decoding_cache_correctness(device='cpu'):
         p['W_w'], p['W_KV_idx'], p['W_Z_idx'], p['B_idx'],
         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
         sliding_window=win, sink_logits=None, use_ste=False,
+        normalize_qk=True,
     )
 
     cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)

@@ -558,11 +558,24 @@ def naive_csa(
     ste_mode: str = 'topk_columns',
     normalize_qk: bool = False,
     fuse_projections: bool = True,
-) -> torch.Tensor:
+    return_projections: bool = False,
+):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
     Returns output ``[B, T, nh*c]`` (the caller performs the grouped output
     projection ``[B, T, nh*c] -> d``).
+
+    When ``return_projections=True``, returns ``(output, projections)`` where
+    ``projections`` is a tuple ``(Ca, Cb, Za, Zb, K_idx, Z_idx)`` of the 6
+    per-token KV/indexer projections (each ``[B, original_T, c]`` or
+    ``[B, original_T, c_I]``, trimmed to the input's original T before any
+    right-padding). This lets incremental-decoding callers (e.g.
+    ``run_decoding.CSAAttnDecoding``) populate a
+    :class:`ops_decoding_cache.CSADecodingCache` WITHOUT recomputing the 6
+    projections a second time — eliminating a redundant fused matmul that
+    previously inflated CSA/HCA/hybrid prefill latency by ~1.5-3x relative
+    to softmax/KDA (whose prefill populates the cache as a side effect of
+    the native forward call).
 
     **Weight layout** (P0 API fix): all ``W_*`` tensors follow the
     ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
@@ -1170,4 +1183,23 @@ def naive_csa(
     # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
     # matches the input's original T (right-padding added zeros at the end,
     # which never affect real-token outputs thanks to the causal block mask).
-    return out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
+    out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
+    if return_projections:
+        # Return the 6 per-token KV/indexer projections (trimmed to
+        # original_T) so incremental-decoding callers can populate a
+        # CSADecodingCache without recomputing them. The projections are
+        # in H.dtype (F.linear preserves dtype) and on the input's device.
+        # ``Ca`` is also used internally for the SW branch (H_proj = Ca),
+        # so we return it directly. ``K_idx_raw`` is the uncompressed
+        # indexer key projection (before csa_compress_kv compresses it to
+        # K_IComp) — that's what CSADecodingCache.append_step expects.
+        projections = (
+            Ca[:, :original_T],       # [B, original_T, c]
+            Cb[:, :original_T],       # [B, original_T, c]
+            Za[:, :original_T],       # [B, original_T, c]
+            Zb[:, :original_T],       # [B, original_T, c]
+            K_idx_raw[:, :original_T],# [B, original_T, c_I]
+            Z_idx[:, :original_T],    # [B, original_T, c_I]
+        )
+        return out_final, projections
+    return out_final
