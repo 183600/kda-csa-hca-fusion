@@ -579,6 +579,9 @@ class CSAAttn(nn.Module):
             c=self.c, c_I=self.cI, dc=self.dc,
             sliding_window=SMALL_MODEL_SPEC['csa_sliding_window'],
             sink_logits=self.sink,
+            # Use cosine-style indexer scoring for the quality experiment so
+            # top-k selection is not confounded by q_idx / K_idx vector norms.
+            normalize_qk=True,
         )
         return self.o(o)
 
@@ -1286,6 +1289,7 @@ def main():
         'metadata': {
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
+            'csa_indexer_normalize_qk': True,
             'csa_caveat': (
                 "CSA's lightning indexer is trained via a straight-through "
                 "estimator (STE): the forward pass uses hard top-k indices "

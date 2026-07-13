@@ -800,18 +800,26 @@ def naive_csa(
     # their relative ordering), but it makes the code match the documented
     # formula and ensures the logits have the intended magnitude if they
     # are ever exposed for downstream use (e.g. learnable temperature).
+    # Inference / benchmark fix: STE is a TRAINING-only surrogate for the
+    # non-differentiable top-k indexer. It is forward-equivalent to the hard
+    # gather but costs an extra full softmax + soft gather. Under
+    # ``torch.no_grad()`` there is no backward path to preserve, so computing
+    # the STE surrogate only inflates inference latency (Exp2 / Exp6). Gate it
+    # on ``torch.is_grad_enabled()`` so training keeps the default behaviour,
+    # while no-grad inference uses the lean hard-index path.
+    effective_use_ste = use_ste and torch.is_grad_enabled()
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
                                     scale=c_I ** -0.5,
                                     causal_block_mask=cbm,
-                                    return_soft_weights=use_ste,
+                                    return_soft_weights=effective_use_ste,
                                     ste_mode=ste_mode,
                                     normalize_qk=normalize_qk)     # [B, T, topk]
-    # P0-4 fix: when ``use_ste`` is True (the default), the indexer also
-    # returns a differentiable ``soft_weights`` tensor of shape
-    # ``[B, T, n_blocks]`` for the straight-through estimator. We keep
-    # it in a variable that is ``None`` when STE is disabled so the
-    # gather code below can branch cleanly.
-    if use_ste:
+    # P0-4 fix: when STE is active, the indexer also returns a differentiable
+    # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
+    # straight-through estimator. We keep it in a variable that is ``None``
+    # when STE is disabled (or no-grad inference is active) so the gather code
+    # below can branch cleanly.
+    if effective_use_ste:
         indices, soft_weights = indices  # unpack the (idx, soft_weights) tuple
     else:
         soft_weights = None
@@ -911,7 +919,7 @@ def naive_csa(
         # verifies both the forward-equivalence and the backward-distinctness
         # (non-selected blocks receive non-zero gradient only under
         # ``full_softmax``).
-        if use_ste and soft_weights is not None:
+        if effective_use_ste and soft_weights is not None:
             # Common path: gather top-k columns of soft_weights. This is
             # the differentiable surrogate for both modes (forward-equivalent
             # to the hard gather). ``full_softmax`` adds an additional

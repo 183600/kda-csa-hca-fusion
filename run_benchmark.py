@@ -302,6 +302,12 @@ def bench_csa(B, T, d, device):
     cfg = dict(
         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
         sliding_window=8, sink_logits=torch.zeros(nh, device=device),
+        # Inference benchmark: STE is training-only and forward-equivalent;
+        # disabling it avoids measuring the extra soft surrogate path.
+        use_ste=False,
+        # Match the cosine-style indexer contract used by the quality / hybrid
+        # experiments after the normalization fix.
+        normalize_qk=True,
     )
     weights = dict(
         W_aKV=_rand(c, d, device=device, generator=gen), W_bKV=_rand(c, d, device=device, generator=gen),
@@ -312,10 +318,14 @@ def bench_csa(B, T, d, device):
         W_KV_idx=_rand(cI, d, device=device, generator=gen), W_Z_idx=_rand(cI, d, device=device, generator=gen),
         B_idx=_rand(m, cI, device=device, generator=gen),
     )
+    W_O = _rand(d, nh * c, device=device, generator=gen)
 
     def fn():
         with torch.no_grad():
-            return naive_csa(H, **weights, **cfg)
+            out = naive_csa(H, **weights, **cfg)
+            # Count the grouped output projection so the benchmark boundary
+            # really is end-to-end single-layer (matching the JSON metadata).
+            return torch.nn.functional.linear(out, W_O)
     return fn
 
 
@@ -333,10 +343,14 @@ def bench_hca(B, T, d, device):
         B_pos=_rand(m2, c, device=device, generator=gen),
         W_DQ=_rand(dc, d, device=device, generator=gen), W_UQ=_rand(c * nh, dc, device=device, generator=gen),
     )
+    W_O = _rand(d, nh * c, device=device, generator=gen)
 
     def fn():
         with torch.no_grad():
-            return naive_hca(H, **weights, **cfg)
+            out = naive_hca(H, **weights, **cfg)
+            # Count the grouped output projection so the benchmark boundary
+            # really is end-to-end single-layer (matching the JSON metadata).
+            return torch.nn.functional.linear(out, W_O)
     return fn
 
 

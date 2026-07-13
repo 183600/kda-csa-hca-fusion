@@ -58,6 +58,11 @@ DEFAULTS = dict(
     hca_m2=64, hca_c=128, hca_sliding_window=2048,
     hca_nh=8, hca_dc=128,
     kda_hv=8, kda_k=128, kda_v=128,
+    # Hybrid layer-count ratio. Keeping these in DEFAULTS makes the documented
+    # kwargs override path work (unknown-key validation below otherwise rejects
+    # hybrid_n_kda / hybrid_n_csa / hybrid_n_hca before the hybrid branch sees
+    # them).
+    hybrid_n_kda=3, hybrid_n_csa=1, hybrid_n_hca=1,
 )
 
 

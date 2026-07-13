@@ -283,12 +283,12 @@ class _SlidingWindowRingBuffer:
                 f"(win=0 disables the SW branch and should bypass this "
                 f"class entirely).")
         self.B, self.win, self.c = B, win, c
-        self.device, self.dtype = device, dtype
+        self.device, self.dtype = torch.device(device), dtype
         # Pre-allocated buffer. Entries at indices >= _sw_len are stale
         # (left over from a previous write cycle before a reset) and
         # MUST NOT be read; ``get`` only ever returns the first
         # ``_sw_len`` entries of the causal-order view.
-        self._buf = torch.zeros(B, win, c, device=device, dtype=dtype)
+        self._buf = torch.zeros(B, win, c, device=self.device, dtype=dtype)
         # Number of valid entries currently in the buffer (0..win).
         self._sw_len = 0
         # Index in ``self._buf`` of the OLDEST valid entry. Stays at 0
@@ -382,6 +382,8 @@ class _SlidingWindowRingBuffer:
 
     def to(self, device=None, dtype=None) -> '_SlidingWindowRingBuffer':
         """Move the buffer to a new device / dtype (in-place)."""
+        if device is not None:
+            device = torch.device(device)
         if device is not None and device != self._buf.device:
             self._buf = self._buf.to(device=device)
             self.device = self._buf.device
@@ -480,7 +482,7 @@ class CSADecodingCache:
         if win < 0:
             raise ValueError(f"win={win} must be >= 0 (0 disables SW)")
         self.B, self.c, self.c_I, self.m, self.win = B, c, c_I, m, win
-        self.device, self.dtype = device, dtype
+        self.device, self.dtype = torch.device(device), dtype
         self.reset()
 
     def reset(self) -> None:
@@ -544,6 +546,8 @@ class CSADecodingCache:
 
     def to(self, device=None, dtype=None) -> 'CSADecodingCache':
         """Move all cache tensors to a new device / dtype (in-place)."""
+        if device is not None:
+            device = torch.device(device)
         if device is not None and device != self.device:
             self.device = device
         if dtype is not None and dtype != self.dtype:
@@ -839,7 +843,10 @@ class CSADecodingCache:
                 self._C_comp.to(compute_dtype), dim=-1)               # [B, n_blocks, c]
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
-            # block mask).
+            # block mask). STE is only useful when autograd is enabled; in
+            # no-grad inference it is forward-equivalent but adds avoidable
+            # softmax/gather work, so gate it just like ``naive_csa``.
+            effective_use_ste = use_ste and torch.is_grad_enabled()
             indexer_result = csa_lightning_indexer(
                 q_idx.to(compute_dtype),                               # [B, 1, nIh, c_I]
                 self._K_IComp.to(compute_dtype),                       # [B, n_blocks, c_I]
@@ -847,11 +854,11 @@ class CSADecodingCache:
                 topk,
                 scale=self.c_I ** -0.5,
                 causal_block_mask=cbm,
-                return_soft_weights=use_ste,
+                return_soft_weights=effective_use_ste,
                 ste_mode=ste_mode,
                 normalize_qk=normalize_qk,
             )
-            if use_ste:
+            if effective_use_ste:
                 indices, soft_weights = indexer_result
             else:
                 indices = indexer_result
@@ -869,7 +876,7 @@ class CSADecodingCache:
                 batch_idx = torch.arange(B, device=device).view(B, 1, 1)
                 kv = C_comp_n[batch_idx, idx_safe]                     # [B, 1, topk, c]
                 # STE for the indexer (mirrors ``naive_csa``).
-                if use_ste and soft_weights is not None:
+                if effective_use_ste and soft_weights is not None:
                     soft_weights_selected = torch.gather(
                         soft_weights, dim=-1, index=idx_safe,
                     )                                                  # [B, 1, topk]
@@ -1008,7 +1015,7 @@ class HCADecodingCache:
         if win < 0:
             raise ValueError(f"win={win} must be >= 0 (0 disables SW)")
         self.B, self.c, self.m2, self.win = B, c, m2, win
-        self.device, self.dtype = device, dtype
+        self.device, self.dtype = torch.device(device), dtype
         self.reset()
 
     def reset(self) -> None:
@@ -1049,6 +1056,8 @@ class HCADecodingCache:
     # ----- state migration -----------------------------------------------
 
     def to(self, device=None, dtype=None) -> 'HCADecodingCache':
+        if device is not None:
+            device = torch.device(device)
         if device is not None and device != self.device:
             self.device = device
         if dtype is not None and dtype != self.dtype:

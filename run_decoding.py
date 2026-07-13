@@ -47,6 +47,10 @@ from ops_kda import naive_recurrent_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_decoding_cache import CSADecodingCache, HCADecodingCache
+from ops_fused import (
+    HybridConfig, HybridKCHAttention, KDAHybridLayer, CSAHybridLayer,
+    HCAHybridLayer,
+)
 
 # P0 fix: emit a one-shot warning at import time so notebook / REPL
 # users do not silently misread the decoding results as a fair
@@ -71,9 +75,10 @@ _DEFERRED_IMPORT_WARNING = (
     "(ops_decoding_cache.CSADecodingCache / HCADecodingCache) which "
     "maintains a partial-token accumulator, a compressed-block cache, "
     "a sliding-window ring buffer, and (for CSA) a dynamically-updated "
-    "indexer key cache. See README 'Fairness notes' #4 for the updated "
-    "scope and the ``torch.topk`` tie-breaking caveat for CSA's "
-    "incremental indexer (a numerical artifact, not a correctness bug)."
+    "indexer key cache. The hybrid row now wires the same CSA/HCA caches "
+    "into the full KDA+CSA+HCA stack. See README 'Fairness notes' #4 for "
+    "the ``torch.topk`` tie-breaking caveat for CSA's incremental indexer "
+    "(a numerical artifact, not a correctness bug)."
 )
 
 
@@ -395,9 +400,9 @@ class CSAAttnDecoding(nn.Module):
     The prefill path (``T_new > 1``) calls ``naive_csa`` on the full
     chunk (the fast vectorized path) and populates the cache from the
     result. The decode path (``T_new == 1``) uses the cache for
-    incremental computation — O(1) per-token cost in the cached
-    context length (the compressed-block cache grows by one row every
-    ``m`` tokens; the SW ring buffer is fixed-size).
+    incremental computation: it avoids full-prefix recompression, while
+    the indexer/attention work still scales with the number of completed
+    compressed blocks (roughly O(T/m + win)).
 
     The parameterization mirrors :class:`ops_fused.CSAHybridLayer` so
     the decode-cost comparison reflects the SAME operator the fused
@@ -405,7 +410,7 @@ class CSAAttnDecoding(nn.Module):
     """
 
     def __init__(self, d_model, m=4, topk=2, nh=2, c=8, dc=8,
-                 nIh=1, c_I=4, sliding_window=4, use_ste=True):
+                 nIh=1, c_I=4, sliding_window=4, use_ste=False):
         super().__init__()
         self.d_model = d_model
         self.m, self.topk, self.nh, self.c = m, topk, nh, c
@@ -489,6 +494,7 @@ class CSAAttnDecoding(nn.Module):
                 c=self.c, c_I=self.c_I, dc=self.dc,
                 sliding_window=self.sliding_window, sink_logits=self.sink,
                 use_ste=self.use_ste,
+                normalize_qk=True,
             )
             # Populate the cache by feeding the projections token-by-token.
             Ca, Cb, Za, Zb, K_idx, Z_idx, _, _, _ = self._project(x)
@@ -517,6 +523,7 @@ class CSAAttnDecoding(nn.Module):
             q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
             topk=self.topk, nh=self.nh, nIh=self.nIh, scale=1.0,
             sink_logits=self.sink, use_ste=self.use_ste,
+            normalize_qk=True,
         )   # [B, 1, nh, c] in compute_dtype
         return self.o_proj(o.reshape(B, 1, self.nh * self.c).to(x.dtype))
 
@@ -595,54 +602,37 @@ class HCAAttnDecoding(nn.Module):
 
 
 class HybridDecoding(nn.Module):
-    """Hybrid KDA+CSA+HCA stack for end-to-end decode latency.
+    """Hybrid KDA+CSA+HCA stack with real per-layer decode caches.
 
-    Wraps :class:`ops_fused.HybridKCHAttention`. KDA layers carry
-    recurrent state (already in ``HybridKCHAttention``); CSA/HCA layers
-    use the model's standard forward (which calls ``naive_csa`` /
-    ``naive_hca`` on each decode step). This is CORRECT but not
-    optimized — the CSA/HCA layers recompute their full attention on
-    every decode step rather than using the incremental cache.
+    Earlier versions routed ``forward(x_new)`` through
+    :class:`ops_fused.HybridKCHAttention` directly. That preserved KDA's
+    recurrent state, but CSA/HCA are stateless in the fused module, so during
+    token-by-token decode they saw ONLY the current token and had no access to
+    the prefill context. The resulting "hybrid" row was neither a correct
+    autoregressive hybrid decode nor a safe upper bound.
 
-    The standalone :class:`CSAAttnDecoding` / :class:`HCAAttnDecoding`
-    modules demonstrate the incremental cache for CSA / HCA in isolation.
-    Wiring the caches into the hybrid stack's per-layer forward (with
-    KDA state threading + residual flow + layer-norm) is left as a
-    follow-up; the Exp 6 benchmark uses the standalone modules to
-    measure the CSA/HCA decode cost.
-
-    The hybrid row in Exp 6 measures the full stack's decode latency
-    (the most realistic number for a production hybrid LM), but its
-    CSA/HCA layers do NOT yet use the incremental cache — so the
-    hybrid decode cost is an UPPER BOUND on what a cache-enabled
-    hybrid would achieve.
-
-    P0-5 fix: ``csa_topk`` was previously hardcoded to 100 "to select
-    all valid blocks", which silently disabled CSA's sparse top-k
-    retrieval (the core mechanism that gives CSA its sub-quadratic
-    decode cost). With topk=100 the CSA sub-layer in the hybrid stack
-    degenerated into dense attention over ALL compressed blocks, making
-    the hybrid decode latency look artificially slow relative to a
-    real deployment. We now use ``csa_topk=2`` to match
-    ``run_ablation._make_cfg``'s setting (which is the value used by
-    every other experiment in the suite), so the hybrid row is
-    apples-to-apples with the standalone CSA decode row.
+    This wrapper now executes the fused stack layer-by-layer and maintains a
+    decoding cache for every CSA/HCA sub-layer, alongside the fused model's KDA
+    recurrent states / short-conv lookbacks. Prefill uses the vectorized full
+    CSA/HCA operators for the output while also populating the caches from the
+    same normalized layer inputs. Decode uses ``CSADecodingCache`` /
+    ``HCADecodingCache`` for the CSA/HCA layers, so all three operator types
+    see the same history they would see in a full-sequence pass.
     """
 
     def __init__(self, d_model=64, total_layers=5, csa_topk: int = 2):
-        """``csa_topk`` is exposed as a constructor parameter (P0-5 fix) so
-        ablation runs can sweep it without monkey-patching. Default ``2``
-        matches ``run_ablation._make_cfg`` rather than the previous
-        ``100`` (which silently selected all blocks and made the CSA
-        sub-layer in the hybrid stack run as dense attention)."""
+        """``csa_topk`` is exposed so decode ablations can sweep it.
+
+        Default ``2`` matches the small-model ablation setting; unlike the old
+        hardcoded ``100`` it preserves CSA's sparse top-k retrieval.
+        """
         super().__init__()
-        from ops_fused import HybridConfig, HybridKCHAttention
         self.cfg = HybridConfig(
             d_model=d_model,
             n_heads_qk=2, n_heads_v=2,
             head_dim_k=16, head_dim_v=16,
             kda_chunk_size=0,  # force recurrent path for decode
-            csa_m=4, csa_topk=csa_topk,  # P0-5: was 100 (silently dense)
+            csa_m=4, csa_topk=csa_topk,
             csa_nh=2, csa_c=8, csa_dc=8, csa_nIh=1, csa_cI=4,
             csa_sliding_window=4,
             hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
@@ -650,12 +640,184 @@ class HybridDecoding(nn.Module):
             n_kda=3, n_csa=1, n_hca=1,
         )
         self.model = HybridKCHAttention(self.cfg, total_layers=total_layers)
+        # One cache slot per CSA/HCA layer in layout order. The cache tensors
+        # are allocated lazily once B/device/dtype are known.
+        self._csa_caches: list[CSADecodingCache | None] = [
+            None for layer in self.model.layers if isinstance(layer, CSAHybridLayer)
+        ]
+        self._hca_caches: list[HCADecodingCache | None] = [
+            None for layer in self.model.layers if isinstance(layer, HCAHybridLayer)
+        ]
 
     def reset(self):
         self.model.reset_state()
+        for cache in self._csa_caches:
+            if cache is not None:
+                cache.reset()
+        for cache in self._hca_caches:
+            if cache is not None:
+                cache.reset()
+
+    def _ensure_csa_cache(self, idx: int, layer: CSAHybridLayer,
+                          h: torch.Tensor) -> CSADecodingCache:
+        cfg = layer.cfg
+        B = h.shape[0]
+        cache = self._csa_caches[idx]
+        if cache is None or cache.B != B or cache.device != h.device \
+                or cache.dtype != h.dtype:
+            cache = CSADecodingCache(
+                B, cfg.csa_c, cfg.csa_cI, cfg.csa_m,
+                cfg.csa_sliding_window, h.device, h.dtype,
+            )
+            self._csa_caches[idx] = cache
+        return cache
+
+    def _ensure_hca_cache(self, idx: int, layer: HCAHybridLayer,
+                          h: torch.Tensor) -> HCADecodingCache:
+        cfg = layer.cfg
+        B = h.shape[0]
+        cache = self._hca_caches[idx]
+        if cache is None or cache.B != B or cache.device != h.device \
+                or cache.dtype != h.dtype:
+            cache = HCADecodingCache(
+                B, cfg.hca_c, cfg.hca_m2, cfg.hca_sliding_window,
+                h.device, h.dtype,
+            )
+            self._hca_caches[idx] = cache
+        return cache
+
+    @staticmethod
+    def _project_csa(layer: CSAHybridLayer, h: torch.Tensor):
+        cfg = layer.cfg
+        B, T, _ = h.shape
+        combined_weight = torch.cat(
+            [layer.W_aKV.weight, layer.W_bKV.weight,
+             layer.W_aZ.weight, layer.W_bZ.weight,
+             layer.W_KV_idx.weight, layer.W_Z_idx.weight], dim=0,
+        )
+        combined_out = F.linear(h, combined_weight)
+        Ca, Cb, Za, Zb, K_idx, Z_idx = combined_out.split(
+            [cfg.csa_c, cfg.csa_c, cfg.csa_c, cfg.csa_c,
+             cfg.csa_cI, cfg.csa_cI], dim=-1,
+        )
+        cQ = F.linear(h, layer.W_DQ.weight)
+        q = F.linear(cQ, layer.W_UQ.weight).view(B, T, cfg.csa_nh, cfg.csa_c)
+        q_idx = F.linear(cQ, layer.W_IUQ.weight).view(
+            B, T, cfg.csa_nIh, cfg.csa_cI)
+        w_idx = F.linear(h, layer.W_w.weight)
+        return Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx
+
+    @staticmethod
+    def _project_hca(layer: HCAHybridLayer, h: torch.Tensor):
+        cfg = layer.cfg
+        B, T, _ = h.shape
+        C = F.linear(h, layer.W_KV.weight)
+        Z = F.linear(h, layer.W_Z.weight)
+        cQ = F.linear(h, layer.W_DQ.weight)
+        q = F.linear(cQ, layer.W_UQ.weight).view(B, T, cfg.hca_nh, cfg.hca_c)
+        return C, Z, q
+
+    def _forward_csa_layer(self, layer: CSAHybridLayer, h: torch.Tensor,
+                           cache_idx: int) -> torch.Tensor:
+        cfg = layer.cfg
+        B, T_new, _ = h.shape
+        if T_new == 0:
+            return h.new_zeros(B, 0, cfg.d_model)
+        cache = self._ensure_csa_cache(cache_idx, layer, h)
+        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project_csa(layer, h)
+        # Cache state is runtime inference state; detach to avoid retaining
+        # prefill/decode graphs if a caller forgets no_grad().
+        cache.append_step(
+            Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+            K_idx.detach(), Z_idx.detach(),
+            layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
+        )
+        if T_new > 1:
+            # Prefill: vectorized full-sequence operator for the output, while
+            # the cache above is populated for subsequent token decode.
+            o_core = naive_csa(
+                h, layer.W_aKV.weight, layer.W_bKV.weight,
+                layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
+                layer.W_DQ.weight, layer.W_UQ.weight, layer.W_IUQ.weight,
+                layer.W_w.weight, layer.W_KV_idx.weight, layer.W_Z_idx.weight,
+                layer.B_idx,
+                m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh,
+                nIh=cfg.csa_nIh, c=cfg.csa_c, c_I=cfg.csa_cI,
+                dc=cfg.csa_dc, sliding_window=cfg.csa_sliding_window,
+                sink_logits=layer.sink, use_ste=False, normalize_qk=True,
+            )
+        else:
+            compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
+            q_n = F.normalize(q.to(compute_dtype), dim=-1)
+            o = cache.forward_step(
+                q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+                topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
+                scale=1.0, sink_logits=layer.sink, use_ste=False,
+                normalize_qk=True,
+            )
+            o_core = o.reshape(B, T_new, cfg.csa_nh * cfg.csa_c).to(h.dtype)
+        return layer.o_proj(o_core)
+
+    def _forward_hca_layer(self, layer: HCAHybridLayer, h: torch.Tensor,
+                           cache_idx: int) -> torch.Tensor:
+        cfg = layer.cfg
+        B, T_new, _ = h.shape
+        if T_new == 0:
+            return h.new_zeros(B, 0, cfg.d_model)
+        cache = self._ensure_hca_cache(cache_idx, layer, h)
+        C, Z, q = self._project_hca(layer, h)
+        cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
+        if T_new > 1:
+            o_core = naive_hca(
+                h, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
+                layer.W_DQ.weight, layer.W_UQ.weight,
+                m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
+                sliding_window=cfg.hca_sliding_window, sink_logits=layer.sink,
+            )
+        else:
+            compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
+            q_n = F.normalize(q.to(compute_dtype), dim=-1)
+            o = cache.forward_step(
+                q_n, nh=cfg.hca_nh, scale=1.0, sink_logits=layer.sink,
+            )
+            o_core = o.reshape(B, T_new, cfg.hca_nh * cfg.hca_c).to(h.dtype)
+        return layer.o_proj(o_core)
 
     def forward(self, x):
-        return self.model(x)
+        B = x.shape[0]
+        # Thread the KDA recurrent states explicitly, mirroring
+        # HybridKCHAttention.forward but keeping room to update CSA/HCA caches
+        # at the matching layer positions.
+        stacked = self.model._kda_state
+        if stacked is not None and stacked.shape[1] == B:
+            states = list(stacked.unbind(0))
+        else:
+            states = [None] * self.model.n_kda_layers
+
+        kda_idx = csa_idx = hca_idx = 0
+        for layer, norm, kind in zip(
+                self.model.layers, self.model.norms, self.model.layout):
+            residual = x
+            h = norm(x)
+            if kind == 'kda':
+                o, new_state = layer(h, states[kda_idx])
+                states[kda_idx] = new_state
+                kda_idx += 1
+            elif kind == 'csa':
+                o = self._forward_csa_layer(layer, h, csa_idx)
+                csa_idx += 1
+            elif kind == 'hca':
+                o = self._forward_hca_layer(layer, h, hca_idx)
+                hca_idx += 1
+            else:  # defensive: layout is validated by HybridKCHAttention
+                raise ValueError(kind)
+            x = residual + o
+
+        if self.model.n_kda_layers > 0:
+            self.model._kda_state = torch.stack(states, dim=0)
+        else:
+            self.model._kda_state = None
+        return x
 
 
 def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
@@ -880,25 +1042,16 @@ def main():
                                    repeats=N_REPEATS)
                 r['op'] = name
                 r['device'] = str(device)
-                # P0-5 fairness footnote: mark the hybrid row as an upper
-                # bound so readers of the JSON / printed table know the
-                # hybrid decode latency is NOT directly comparable to the
-                # standalone CSA/HCA rows (which use the incremental cache
-                # the hybrid stack has not yet wired up).
-                if name == 'hybrid':
-                    r['upper_bound'] = True
-                else:
-                    r['upper_bound'] = False
+                # The hybrid wrapper now wires CSA/HCA incremental caches into
+                # the full stack, so the row is no longer an upper-bound
+                # placeholder. Keep explicit metadata for downstream figures.
+                r['upper_bound'] = False
+                r['uses_incremental_cache'] = (name in {'csa', 'hca', 'hybrid'})
                 results.append(r)
                 peak_str = 'n/a' if r['peak_mem_MB'] is None else f"{r['peak_mem_MB']:.2f}MB"
-                marker = ' *' if r.get('upper_bound') else ''
-                print(f"  {name:10s}{marker}  prefill={r['prefill_ms']:8.2f}ms  "
+                print(f"  {name:10s}  prefill={r['prefill_ms']:8.2f}ms  "
                       f"decode/tok={r['median_decode_ms_per_token']:8.3f}ms  "
                       f"peak_mem={peak_str:>10}")
-                if name == 'hybrid':
-                    print('    * hybrid decode is an UPPER BOUND — CSA/HCA '
-                          'sub-layers recompute full attention (no incremental '
-                          'cache wired into the hybrid stack yet).')
             except Exception as e:
                 # Include null fields for the keys present on success rows so
                 # downstream JSON consumers can do ``r['prefill_ms']`` without
@@ -913,7 +1066,8 @@ def main():
                                 'peak_mem_MB': None,
                                 'n_decode': n_decode,
                                 'repeats': N_REPEATS,
-                                'upper_bound': (name == 'hybrid')})
+                                'upper_bound': False,
+                                'uses_incremental_cache': (name in {'csa', 'hca', 'hybrid'})})
                 print(f"  {name:10s}  ERROR: {e}")
 
     # Summary: decode latency growth rate.
@@ -923,8 +1077,7 @@ def main():
     print(f"{'op':>10} | " + " | ".join(f"{p:>8}" for p in prefill_lens))
     print('-' * 70)
     for name in models:
-        marker = ' *' if name == 'hybrid' else ''
-        cells = [f"{name:>10}{marker}"]
+        cells = [f"{name:>10}"]
         for plen in prefill_lens:
             vals = [r['median_decode_ms_per_token'] for r in results
                     if r.get('op') == name and r.get('prefill_len') == plen
@@ -934,8 +1087,8 @@ def main():
             else:
                 cells.append(f"{'n/a':>8}")
         print(" | ".join(cells))
-    print('  * hybrid row is an UPPER BOUND (CSA/HCA sub-layers do not use '
-          'the incremental cache; see P0-5 note in HybridDecoding docstring).')
+    print('  CSA, HCA, and hybrid rows use incremental compressed-block / '
+          'sliding-window caches during token decode.')
 
     if device.type == 'cpu':
         print('\nNote: CPU peak memory is not reported (torch tensors use native')

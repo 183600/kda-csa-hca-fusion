@@ -259,10 +259,15 @@ which maintains:
   compressed-block cache so the lightning indexer can score new blocks
   without recomputing the full history.
 
-The cache's per-token decode cost is **O(1)** in the cached context
-length (the compressed-block cache grows by one row every `m` tokens;
-the SW ring buffer is fixed-size), matching the algorithmic contract of
-CSA / HCA during autoregressive decoding.
+The cache avoids recomputing compression over the full prefix on every decode
+step, but the attention/indexer work still scales with the number of completed
+compressed blocks: roughly **O(T/m + win)** for CSA and **O(T/m2 + win)** for
+HCA (plus Python-reference overhead). The standalone CSA/HCA rows and
+the hybrid row use these caches during token decode; the hybrid wrapper
+threads one cache per CSA/HCA sub-layer through the full KDA+CSA+HCA
+stack, so CSA/HCA layers can see the prefill history instead of only the
+current token. The small decode benchmark uses `csa_topk=2`, matching the
+small ablation setting.
 
 **Known limitation: `torch.topk` tie-breaking.** When the CSA indexer's
 ReLU scores have many exact ties at 0 (common with random untrained
@@ -277,12 +282,7 @@ outputs. This is a `torch.topk` implementation artifact, NOT a
 correctness bug — both paths select valid blocks with the highest scores,
 just different tie-breaking. The regression tests
 (`test_csa_decoding_cache_correctness` in `run_correctness.py`) use
-`topk >= n_blocks` (select all valid blocks) to sidestep this; the Exp 6
-benchmark uses `topk=100` for the same reason. The hybrid decode path
-does NOT yet use the incremental cache (it uses the model's standard
-forward, which recomputes CSA/HCA on each decode step) — so the hybrid
-decode cost is an **upper bound** on what a cache-enabled hybrid would
-achieve.
+`topk >= n_blocks` (select all valid blocks) to sidestep this.
 
 ### 5. KV-cache + FLOPs are analytic (Exp 3)
 
@@ -336,13 +336,15 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   on GPU at `T≥1024`); `ops_kda.scripted_chunk_kda` wraps the chunked
   path's inner loop with `torch.jit.script` (bit-identical to the eager
   path). The naive paths remain the default for correctness / readability.
-* **STE for CSA indexer.** The straight-through estimator routes gradient
-  only through the top-k selected columns of `soft_weights` (see
-  `ops_csa.py::naive_csa`). Non-selected blocks receive no "you should
-  have been picked" gradient. This is a known simplification relative to
-  the DeepSeek indexer's auxiliary contrastive loss; see the in-code
-  comment for the trade-off. An ablation over `ste_topk_columns` vs
-  `ste_full_softmax` vs `aux_contrastive_loss` is left as future work.
+* **STE for CSA indexer.** The default straight-through estimator
+  (`ste_mode='topk_columns'`) routes gradient through the top-k selected
+  columns of `soft_weights` (see `ops_csa.py::naive_csa`). Non-selected
+  blocks receive no "you should have been picked" gradient unless the
+  optional `ste_mode='full_softmax'` dense surrogate is selected;
+  `aux_contrastive_loss` remains future work. The STE path is training-only:
+  `naive_csa` and the decoding cache automatically skip the soft surrogate
+  under `torch.no_grad()` so inference/benchmark latency measures the hard
+  top-k path, not the training proxy.
 * **Fusing the 6 KV/indexer projections changes the `use_ste=False`
   gradient contract (not just performance).** `naive_csa` fuses
   `W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx` into one `F.linear` call
@@ -374,15 +376,17 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   Exp 6 scope gap — see *Fairness notes* #4). The cache maintains a
   partial-token accumulator, a compressed-block cache, a sliding-window
   ring buffer, and (for CSA) a dynamically-updated indexer key cache.
-  Per-token decode cost is O(1) in the cached context length.
+  The cache avoids full-prefix recompression on every decode step; per-token
+  work still scales with completed compressed blocks (about O(T/m + win) for
+  CSA and O(T/m2 + win) for HCA). The Exp 6 hybrid wrapper now wires one such
+  cache into every CSA/HCA sub-layer of the full stack, so the hybrid row is
+  no longer a "CSA/HCA no-history" placeholder.
   **Known limitation:** `torch.topk`'s tie-breaking depends on tensor
   size, so the incremental path may pick different tied blocks than the
   full-sequence path when scores are tied (ReLU saturation at 0). This
   is a numerical artifact, not a correctness bug — both paths select
   valid blocks with the highest scores. The regression tests use
-  `topk >= n_blocks` to sidestep this. The hybrid decode path does NOT
-  yet use the cache (it uses the model's standard forward) — the hybrid
-  decode cost is an upper bound.
+  `topk >= n_blocks` to sidestep this.
 * **Dropout unimplemented.** `HybridConfig.dropout != 0` raises
   `NotImplementedError` rather than silently no-op'ing. MQAR-scale models
   don't need dropout; larger runs should wire it in (or remove the field).
@@ -393,8 +397,10 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   but easy to misread; document it in any derivative work.
 * **Cosine scale is fixed at 1.0.** `naive_csa` / `naive_hca` L2-normalize
   `q` and `C_comp` and use `scale=1.0` (a deliberate fix — the old
-  `c ** -0.5` flattened softmax). No learnable temperature is exposed.
-  Pass `scale=` explicitly to override.
+  `c ** -0.5` flattened softmax). The repository experiments now also pass
+  `normalize_qk=True` for the CSA lightning indexer so top-k selection is
+  direction-based rather than dominated by q_idx / K_idx vector norms. No
+  learnable temperature is exposed. Pass `scale=` explicitly to override.
 
 ---
 

@@ -428,6 +428,29 @@ class KDAHybridLayer(nn.Module):
         B, T, d = x.shape
         cfg = self.cfg
         H, K, V, HV = cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v, cfg.n_heads_v
+        # Degenerate empty-sequence case. ``nn.Conv1d`` cannot consume a
+        # length-0 input, while the lower-level KDA operators already define a
+        # sensible T==0 contract. Preserve/initialize the recurrent state and
+        # leave the conv lookback unchanged (modulo batch/device/dtype guards),
+        # returning a zero-length output so HybridKCHAttention can handle empty
+        # batches consistently with naive_csa / naive_hca.
+        if T == 0:
+            compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
+            if state is not None and state.shape[0] == B:
+                new_state = state.to(device=x.device, dtype=compute_dtype)
+            else:
+                new_state = torch.zeros(
+                    B, HV, K, V, device=x.device, dtype=compute_dtype)
+            new_lookback = conv_lookback
+            if new_lookback is not None:
+                if new_lookback.shape[0] != B:
+                    new_lookback = None
+                else:
+                    new_lookback = new_lookback.to(device=x.device, dtype=x.dtype)
+                    if detach_lookback:
+                        new_lookback = new_lookback.detach()
+                    new_lookback = new_lookback.clone()
+            return x.new_zeros(B, 0, d), new_state, new_lookback
         ksize = self.short_conv.kernel_size[0]
         # Build the conv input with proper LEFT context:
         #   * If ``conv_lookback`` is None (fresh sequence / first call),
@@ -688,6 +711,9 @@ class CSAHybridLayer(nn.Module):
             c=cfg.csa_c, c_I=cfg.csa_cI, dc=cfg.csa_dc,
             sliding_window=cfg.csa_sliding_window, sink_logits=self.sink,
             use_ste=self.use_ste,
+            # Match the cosine-style CSA indexer contract: rankings should be
+            # driven by direction, not by arbitrary q_idx / K_idx magnitudes.
+            normalize_qk=True,
         )
         return self.o_proj(o), None
 

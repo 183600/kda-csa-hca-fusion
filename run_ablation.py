@@ -189,8 +189,10 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
     # in the multi-seed CI that undermines the apples-to-apples comparison.
     # Mirrors run_quality.py::train_one.
     batch_gen = torch.Generator(device=device)
-    batch_gen.manual_seed(seed + 1)  # offset so it does not collide with
-                                      # the seed used for model init.
+    # Use the same large offset as run_quality.py. The old ``seed + 1`` made
+    # seed 42's batch RNG identical to seed 43's model-init RNG stream,
+    # weakening the independence assumption behind the multi-seed CI.
+    batch_gen.manual_seed(seed + 1_000_000)
 
     # Configurable training batch size (default 16, overridable via the
     # ABL_TRAIN_BATCH env var for memory-constrained or GPU runs). Mirrors
@@ -667,6 +669,7 @@ def main():
     for r in all_results:
         r['conclusions_valid'] = conclusions_valid
         r['n_seeds_requested'] = n_seeds
+        r['csa_indexer_normalize_qk'] = True
 
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped past
