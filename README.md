@@ -298,6 +298,26 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 
 ## Limitations
 
+* **KDA requires unit-norm `q`/`k` for numerical stability.** Neither
+  `naive_recurrent_kda` nor `naive_chunk_kda` enforces this — nothing stops
+  a caller from passing raw (non-normalized) `q`/`k`. The delta-rule
+  recurrence is only numerically bounded when `q`/`k` are L2-normalized
+  along the last axis (the standard KDA/DeltaNet convention, and what every
+  regression test in `run_correctness.py` does). With un-normalized inputs,
+  the recurrent state can diverge over a long sequence: empirically this
+  starts producing non-finite (`NaN`) output around `T~500` for
+  standard-normal `q`/`k` at `K=64`. The **recurrent** and **chunked**
+  paths diverge *differently* once inputs are unnormalized (recurrent tends
+  to decay straight to `NaN`; chunked can produce a mix of `NaN`/`Inf`
+  because its Neumann-series solve amplifies large values differently) —
+  the two paths are only guaranteed to agree to fp tolerance when both stay
+  finite. **Mitigation (added):** both functions now run a cheap
+  `torch.isfinite` check on the finished output and emit a one-shot,
+  actionable `RuntimeWarning` (naming the function and the fix) instead of
+  silently returning a non-finite result with no diagnostic; see
+  `test_kda_unnormalized_input_warns` in `run_correctness.py`. Always
+  `F.normalize(q, dim=-1)` / `F.normalize(k, dim=-1)` before calling into
+  KDA unless you have a specific reason not to.
 * **Naive Python loops.** KDA's recurrent path is a Python `for` loop over
   time; the chunked path still has a Python loop over chunks. CSA's
   indexer loops over heads. None of this is fused or Tritonized. Latency
@@ -316,6 +336,23 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   the DeepSeek indexer's auxiliary contrastive loss; see the in-code
   comment for the trade-off. An ablation over `ste_topk_columns` vs
   `ste_full_softmax` vs `aux_contrastive_loss` is left as future work.
+* **Fusing the 6 KV/indexer projections changes the `use_ste=False`
+  gradient contract (not just performance).** `naive_csa` fuses
+  `W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx` into one `F.linear` call
+  by default (`fuse_projections=True` — issue 2.3 fix, purely a kernel-
+  launch-count optimization with an identical forward value). This has a
+  side effect on **backward**: with STE disabled (`use_ste=False`, e.g.
+  the untrained-indexer ablation), `W_KV_idx`/`W_Z_idx` now receive a
+  zero-but-**non-None** gradient (they share a matmul with 4 other,
+  differentiable weights) instead of `None` (the pre-fusion behaviour,
+  where they were only reachable through the non-differentiable
+  `torch.topk` selection). The optimizer step is a no-op either way, but
+  any code that branches on `param.grad is None` to mean "this parameter
+  did not participate in this forward pass" will observe a difference.
+  **Mitigation (added):** pass `fuse_projections=False` to restore the
+  original 6-separate-matmul path (identical forward value, `None` grad
+  under `use_ste=False`); see `test_csa_fuse_projections_grad_contract`
+  in `run_correctness.py` for a regression pinning both branches.
 * **Sliding window uses `unfold`.** Memory is `O(T · win)` per call. Fine
   for `T ≤ 4k, win ≤ 512`; will blow up at `T=64k, win=2k` and needs a
   chunked / banded kernel.

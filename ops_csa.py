@@ -543,6 +543,7 @@ def naive_csa(
     use_ste: bool = True,
     ste_mode: str = 'topk_columns',
     normalize_qk: bool = False,
+    fuse_projections: bool = True,
 ) -> torch.Tensor:
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -564,6 +565,44 @@ def naive_csa(
     ensures no real token attends to it. This removes a footgun where direct
     callers (without the external padding done by ``HybridKCHAttention`` or
     ``CSAAttn``) would hit a bare ``ValueError`` with no message.
+
+    .. warning:: **review-fix 1.3 — ``fuse_projections`` and the**
+        ``use_ste=False`` **gradient contract.**
+
+        By default (``fuse_projections=True``) this function concatenates
+        the 6 KV/indexer-compression weights (``W_aKV, W_bKV, W_aZ, W_bZ,
+        W_KV_idx, W_Z_idx``) into a single matmul (issue 2.3 fix — see the
+        in-code comment above ``combined_weight`` for the performance
+        rationale). This is a pure **forward-value-preserving**
+        optimization — the output is bit-identical (to fp32 tolerance) to
+        doing the 6 ``F.linear`` calls separately — but it has an
+        observable side effect on the **backward** pass when
+        ``use_ste=False`` (STE disabled, e.g. for the untrained-indexer
+        ablation): the indexer weights ``W_KV_idx`` / ``W_Z_idx`` receive a
+        **zero-but-non-None** ``.grad`` after ``backward()``, instead of
+        ``None``. Without the fusion, these two weights are ONLY consumed
+        by the indexer's ``torch.topk`` selection, which does not
+        propagate gradient at all when STE is off — so they would get
+        ``None`` (never touched by autograd). With the fusion, they share
+        one ``F.linear`` call with 4 OTHER weights that DO participate in
+        the differentiable compression path, so autograd dutifully
+        allocates and back-propagates a (all-zero) gradient into every
+        slice of the merged weight, including the two indexer slices.
+
+        The *substantive* contract — "the indexer does not learn without
+        STE" — is unaffected either way (a zero gradient is still a
+        no-op for the optimizer). But code that inspects
+        ``param.grad is None`` to decide whether a parameter "participated
+        in this forward pass" (e.g. custom gradient-clipping, gradient
+        diagnostics, or ``torch.autograd.grad(..., allow_unused=True)``
+        callers that branch on ``None`` vs a real tensor) will observe a
+        difference depending on ``fuse_projections``. Pass
+        ``fuse_projections=False`` to restore the 6-separate-matmul
+        eager-autograd path (identical forward value, ``None`` grad on
+        ``W_KV_idx``/``W_Z_idx`` under ``use_ste=False``) if your code
+        depends on the ``None``-means-untouched convention. See
+        ``test_csa_fuse_projections_grad_contract`` in
+        ``run_correctness.py`` for a regression pinning both branches.
     """
     B_, T, d = H.shape
     # Validate structural params early so a caller passing m=0, topk=-1,
@@ -707,19 +746,38 @@ def naive_csa(
             raise ValueError(
                 f"naive_csa: {_w_name}.shape={tuple(_w.shape)} — second dim "
                 f"(in_features) must equal d={d} (H.shape[-1]).")
-    # Concatenate all 6 weights along the out_features axis (dim=0). The
-    # ``split_sizes`` list below MUST match this ordering — if you add or
-    # reorder weights here, update both lists in lockstep.
-    combined_weight = torch.cat(
-        [W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx],
-        dim=0,
-    )                                                              # [4c + 2*c_I, d]
-    combined_out = F.linear(H, combined_weight)                    # [B, T, 4c + 2*c_I]
-    # ``torch.split`` returns views into ``combined_out`` — no copy.
-    # split_sizes MUST match the order of weights in ``torch.cat`` above.
-    Ca, Cb, Za, Zb, K_idx_raw, Z_idx = combined_out.split(
-        [c, c, c, c, c_I, c_I], dim=-1,
-    )
+    if fuse_projections:
+        # Concatenate all 6 weights along the out_features axis (dim=0). The
+        # ``split_sizes`` list below MUST match this ordering — if you add or
+        # reorder weights here, update both lists in lockstep.
+        combined_weight = torch.cat(
+            [W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx],
+            dim=0,
+        )                                                          # [4c + 2*c_I, d]
+        combined_out = F.linear(H, combined_weight)                # [B, T, 4c + 2*c_I]
+        # ``torch.split`` returns views into ``combined_out`` — no copy.
+        # split_sizes MUST match the order of weights in ``torch.cat`` above.
+        Ca, Cb, Za, Zb, K_idx_raw, Z_idx = combined_out.split(
+            [c, c, c, c, c_I, c_I], dim=-1,
+        )
+    else:
+        # Review-fix 1.3: ``fuse_projections=False`` restores the 6
+        # separate ``F.linear`` calls (the pre-issue-2.3 behaviour). The
+        # forward VALUE is identical to the fused path (up to GEMM
+        # reduction-order noise, well below the fp32 test tolerance), but
+        # the BACKWARD path differs when ``use_ste=False``: here,
+        # ``W_KV_idx``/``W_Z_idx`` are consumed ONLY by the (non-
+        # differentiable-under-no-STE) indexer path, so they receive
+        # ``None`` gradient instead of the fused path's zero-but-non-None
+        # gradient. See the "review-fix 1.3" docstring warning above for
+        # the full rationale and ``test_csa_fuse_projections_grad_contract``
+        # in run_correctness.py for the regression test.
+        Ca = F.linear(H, W_aKV)
+        Cb = F.linear(H, W_bKV)
+        Za = F.linear(H, W_aZ)
+        Zb = F.linear(H, W_bZ)
+        K_idx_raw = F.linear(H, W_KV_idx)
+        Z_idx = F.linear(H, W_Z_idx)
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)   # [B, n_blocks, c]
 
     # --- 2. Lightning indexer ---

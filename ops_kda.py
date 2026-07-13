@@ -151,6 +151,58 @@ def _compute_dtype(dtype):
     return torch.float64 if dtype == torch.float64 else torch.float
 
 
+def _warn_if_nonfinite(o, fn_name, stacklevel=3):
+    """Review-fix 1.1: surface non-finite KDA outputs with an actionable hint.
+
+    ``naive_recurrent_kda`` / ``naive_chunk_kda`` implement the delta-rule
+    recurrence ``S_t = (I - beta_t k_t k_t^T) Diag(alpha_t) S_{t-1} + beta_t
+    k_t v_t^T``. This recurrence is only numerically bounded when ``q``/``k``
+    are unit-norm (as the KDA paper assumes for eigenvalue stability — every
+    correctness test in this repo L2-normalizes ``q``/``k`` before calling
+    into KDA) and ``v`` is of moderate magnitude. Neither function enforces
+    this contract: nothing prevents a caller from passing un-normalized
+    ``q``/``k`` or large-magnitude ``v``.
+
+    When that contract is violated, the state ``S`` can grow without bound
+    over a long sequence, and the accumulated per-step outputs silently
+    become ``NaN`` (recurrent path) or a mix of ``NaN``/``Inf`` (chunk path
+    — the two paths diverge differently because the chunk path's Neumann
+    series and ``solve_triangular`` amplify large intermediate values
+    differently than the strictly-sequential recurrence). Previously this
+    propagated silently into the caller's loss / downstream layers with no
+    diagnostic, making the eventual ``NaN`` in a much later part of the
+    model very hard to trace back to "un-normalized KDA input" — the true
+    root cause is far away, in the projections that produced ``q``/``k``/``v``.
+
+    This helper performs one ``torch.isfinite(...).all()`` pass over the
+    finished output (negligible cost relative to the O(T) per-step math it
+    follows) and emits a single, actionable ``RuntimeWarning`` pointing at
+    the likely cause and the fix, instead of leaving the caller to discover
+    a bare ``NaN`` several layers downstream. This does NOT change the
+    return value (the non-finite output is still returned as-is — some
+    callers, e.g. NaN-tolerant gradient-checking utilities, may want to
+    inspect it) and does NOT raise: KDA is a research reference
+    implementation, and this repository's contract is "warn loudly, don't
+    silently corrupt state" rather than "hard-fail on any exotic input".
+    """
+    if not torch.isfinite(o).all():
+        _warnings.warn(
+            f"{fn_name}: output contains NaN/Inf. The KDA delta-rule "
+            f"recurrence is only numerically bounded for unit-norm "
+            f"q/k (L2-normalize along the last dim before calling, as "
+            f"every regression test in this repo does) and "
+            f"moderate-magnitude v; un-normalized or large-magnitude "
+            f"inputs can make the recurrent state S diverge over a long "
+            f"sequence, producing NaN (recurrent path) or NaN/Inf (chunk "
+            f"path — the two paths amplify divergence differently, so "
+            f"they are NOT expected to agree once either produces "
+            f"non-finite values). If this is unexpected, check that q/k "
+            f"passed to {fn_name} are L2-normalized and that g_clamp_min "
+            f"is not disabled (g_clamp_min=-inf).",
+            stacklevel=stacklevel,
+        )
+
+
 def naive_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -165,6 +217,31 @@ def naive_recurrent_kda(
     state_dtype: torch.dtype | None = None,
 ):
     """Naive step-by-step recurrent KDA (reference, O(T) sequential).
+
+    .. warning:: **Input contract — q/k should be unit-norm.**
+
+        Review-fix 1.1: this function does NOT itself normalize ``q``/``k``,
+        but the delta-rule recurrence ``S_t = (I - beta_t k_t k_t^T)
+        Diag(alpha_t) S_{t-1} + beta_t k_t v_t^T`` is only numerically
+        bounded when ``q``/``k`` are unit-norm along the last (``K``) axis
+        — this is the standard KDA/DeltaNet convention (see the paper) and
+        is what every regression test in ``run_correctness.py`` does before
+        calling into KDA. With un-normalized ``q``/``k`` (e.g. raw
+        ``torch.randn`` outputs) or large-magnitude ``v``, the recurrent
+        state can grow without bound over a long sequence and the output
+        silently becomes non-finite (``NaN``) after enough steps — this was
+        empirically confirmed to start around ``T~500`` for standard-normal
+        inputs at ``K=64``. The **chunked** path (:func:`naive_chunk_kda`)
+        diverges differently once inputs are unnormalized (it can produce a
+        mix of ``NaN`` **and** ``Inf`` rather than pure ``NaN``, because the
+        chunk-internal Neumann series / ``solve_triangular`` amplify large
+        intermediate values differently than the strictly sequential
+        recurrence) — the two paths are only guaranteed to numerically
+        agree when both remain finite. Callers should ``F.normalize(q,
+        dim=-1)`` / ``F.normalize(k, dim=-1)`` before calling this function
+        unless they have a specific reason not to. If the returned output
+        is non-finite, a one-shot ``RuntimeWarning`` is emitted pointing at
+        this contract (see :func:`_warn_if_nonfinite`).
 
     Args:
         q: ``[B, T, H, K]``
@@ -349,7 +426,12 @@ def naive_recurrent_kda(
         # via ``state_dtype`` (e.g. for memory-constrained streaming).
         target_state_dtype = state_dtype if state_dtype is not None else compute_dtype
         S = S.to(target_state_dtype)
-    return o.to(dtype), S
+    o = o.to(dtype)
+    # Review-fix 1.1: warn (do not raise) if the recurrence diverged to
+    # non-finite values — see the "Input contract" note in this function's
+    # docstring and :func:`_warn_if_nonfinite` for the rationale.
+    _warn_if_nonfinite(o, 'naive_recurrent_kda')
+    return o, S
 
 
 # =============================================================================
@@ -397,7 +479,7 @@ def naive_recurrent_kda(
 # ``move_to_end`` on every hit so the eviction is LRU (least-recently-
 # used), which keeps hot signatures resident.
 import collections as _collections
-_COMPILED_KDA_CACHE: 'OrderedDict' = _collections.OrderedDict()
+_COMPILED_KDA_CACHE: '_collections.OrderedDict' = _collections.OrderedDict()
 _COMPILED_CACHE_MAX = 32
 
 
@@ -519,46 +601,77 @@ def compiled_recurrent_kda(
     )
 
 
-def naive_chunk_kda(
+# =============================================================================
+# Shared chunk-path setup/finalize helpers (review-fix 1.2)
+# -----------------------------------------------------------------------------
+# ``naive_chunk_kda`` and ``scripted_chunk_kda`` previously duplicated ~90
+# lines of setup code (validation, T==0 early return, right-padding,
+# chunk-rearrange, gate clamping/cumsum, building + solving the
+# chunk-internal Neumann series, computing ``w``/``u``, seeding ``S`` from
+# ``initial_state``) AND ~20 lines of tail code (stacking per-chunk outputs,
+# casting the returned state's dtype, rearranging back to ``[B, T, ...]``,
+# trimming padding, and the non-finite-output warning). The two copies had
+# already drifted apart once in review history (only ``naive_chunk_kda``
+# picked up the review-fix 1.1 non-finite warning until this refactor), and
+# any future numerical-stability fix to one copy could silently fail to
+# propagate to the other.
+#
+# ``_chunk_kda_prepare`` centralizes the setup: it does everything up to
+# (but not including) the per-chunk loop, and returns either an "early"
+# result (T == 0) or the pieces the loop needs. ``_chunk_kda_finalize``
+# centralizes the tail. Both ``naive_chunk_kda`` and ``scripted_chunk_kda``
+# now call these helpers and differ ONLY in which inner-loop implementation
+# they invoke (eager Python loop vs. ``torch.jit.script``-compiled loop) —
+# the one piece of genuine, unavoidable divergence between the two
+# functions. ``_chunk_kda_inner_loop`` (below) is written entirely in
+# TorchScript-compatible ops and is numerically identical whether called
+# eagerly or under ``torch.jit.script``, so ``naive_chunk_kda`` now calls
+# the very same function ``scripted_chunk_kda`` scripts — there is no
+# longer a second, hand-duplicated eager loop body to keep in sync.
+# ============================================================================
+
+
+def _chunk_kda_prepare(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    chunk_size: int = 64,
-    *,
-    g_clamp_min: float = -10.0,
-    state_dtype: torch.dtype | None = None,
+    scale: float | None,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    chunk_size: int,
+    g_clamp_min: float,
+    state_dtype: torch.dtype | None,
+    fn_name: str,
 ):
-    """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error.
+    """Shared setup for the chunk-parallel KDA path (review-fix 1.2).
 
-    The ``g_clamp_min`` parameter mirrors :func:`naive_recurrent_kda` — see
-    that function's docstring for the rationale. The chunk path applies the
-    clamp BEFORE the cumulative-sum (``g.cumsum(-2)``) so the bound on the
-    per-step gate also bounds the cumulative gate that appears in the
-    chunk-internal Neumann series.
+    Performs validation, the ``T == 0`` degenerate case, right-padding to a
+    multiple of ``chunk_size``, chunk-rearrangement, gate clamping/cumsum,
+    the chunk-internal Neumann series solve, and ``w``/``u``/``S``
+    construction — everything ``naive_chunk_kda`` and ``scripted_chunk_kda``
+    need before their (potentially different) inner per-chunk loop runs.
 
-    The ``state_dtype`` parameter mirrors :func:`naive_recurrent_kda` (P1-2
-    fix): the returned state defaults to ``compute_dtype`` (fp32 for
-    fp16/bf16 inputs) instead of being downcast to ``v.dtype``, preventing
-    precision loss in streaming inference where the state is repeatedly
-    passed back as ``initial_state``.
+    Returns:
+        A dict. If ``dict['early']`` is ``True``, the sequence was empty
+        (``T == 0``); ``dict['o']`` and ``dict['S']`` are the final return
+        values (already cast to the right dtypes) and the caller should
+        return them directly without running any inner loop. Otherwise the
+        dict contains the keys ``q, k, u, g, w, S, upper_mask, NT, dtype,
+        compute_dtype, original_T`` needed to run the inner loop and then
+        call :func:`_chunk_kda_finalize`.
     """
     dtype = v.dtype
     # P1-7 fix (revised): validate BEFORE unpacking q.shape (mirrors
     # naive_recurrent_kda) so a rank-mismatch is caught with a clear message
     # instead of the cryptic ``ValueError: not enough values to unpack``.
-    _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_chunk_kda')
+    _validate_kda_inputs(q, k, v, g, beta, fn_name=fn_name)
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     # K2 fix: shape + chunk_size validation centralized in
     # ``_validate_kda_shapes`` so naive_chunk_kda and scripted_chunk_kda
     # share the same contract.
-    _validate_kda_shapes(
-        q, k, v, g, beta, fn_name='naive_chunk_kda', chunk_size=chunk_size,
-    )
+    _validate_kda_shapes(q, k, v, g, beta, fn_name=fn_name, chunk_size=chunk_size)
     G = HV // H
     BT = chunk_size
     original_T = T
@@ -597,7 +710,7 @@ def naive_chunk_kda(
             target_state_dtype = (state_dtype if state_dtype is not None
                                   else compute_dtype)
             S = S.to(target_state_dtype)
-        return o.to(dtype), S
+        return {'early': True, 'o': o.to(dtype), 'S': S}
     pad = (-T) % BT
     if pad:
         # Right-pad T up to a multiple of BT so callers don't have to.
@@ -680,34 +793,37 @@ def naive_chunk_kda(
         # in-place variant could mutate a tensor that participates in the
         # caller's autograd graph (e.g. BPTT across call boundaries).
         S = S + initial_state.to(device=S.device, dtype=compute_dtype)
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
-    # P0 autograd-safety fix: accumulate per-chunk outputs in a list and
-    # ``torch.stack`` at the end instead of in-place ``o[:, :, i] = ...`` on a
-    # pre-allocated buffer. Mirrors the fix in ``naive_recurrent_kda``: the
-    # in-place form saves a CopySlices node on ``o`` for backward, and under
-    # ``torch.utils.checkpoint`` the recompute mutates the saved tensor,
-    # raising ``RuntimeError: one of the variables needed for gradient
-    # computation has been modified by an inplace operation``.
-    chunk_outs = []
-    for i in range(0, NT):
-        q_i = q[:, :, i]
-        k_i = k[:, :, i]
-        u_i = u[:, :, i]
-        g_i = g[:, :, i]
-        w_i = w[:, :, i]
-        diff = g_i.unsqueeze(-2) - g_i.unsqueeze(-3)
-        Aqk = (q_i.unsqueeze(-2) * diff.exp() * k_i.unsqueeze(-3)).sum(-1)
-        Aqk = Aqk.masked_fill(mask, 0)
-        v_i = u_i - w_i @ S
-        chunk_outs.append((q_i * g_i.exp()) @ S + Aqk @ v_i)
-        S = S * rearrange(g_i[:, :, -1].exp(), 'b h k -> b h k 1')
-        # Use out-of-place ``S = S + ...`` (not in-place ``S += ...``) so the
-        # state-update step is safe under future gradient-checkpointing. The
-        # in-place variant would raise "one of the variables needed for
-        # gradient computation has been modified by an inplace operation" if
-        # anyone ever wraps this loop with checkpoint(). Mirrors the
-        # out-of-place pattern in naive_recurrent_kda (line: S = S + einsum(...)).
-        S = S + rearrange((g_i[:, :, -1:] - g_i).exp() * k_i, 'b h c k -> b h k c') @ v_i
+    upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+
+    return {
+        'early': False,
+        'q': q, 'k': k, 'u': u, 'g': g, 'w': w, 'S': S,
+        'upper_mask': upper_mask, 'NT': NT,
+        'dtype': dtype, 'compute_dtype': compute_dtype,
+        'original_T': original_T,
+    }
+
+
+def _chunk_kda_finalize(
+    chunk_outs,
+    S: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    state_dtype: torch.dtype | None,
+    output_final_state: bool,
+    original_T: int,
+    fn_name: str,
+):
+    """Shared tail for the chunk-parallel KDA path (review-fix 1.2).
+
+    Stacks the per-chunk outputs, casts the returned state to
+    ``state_dtype`` (or ``compute_dtype`` by default — P1-2 fix), rearranges
+    back to ``[B, T, HV, V]``, trims off the right-padding, and emits the
+    review-fix 1.1 non-finite-output warning. Shared by ``naive_chunk_kda``
+    and ``scripted_chunk_kda`` so the two functions cannot silently diverge
+    on this bookkeeping.
+    """
     o = torch.stack(chunk_outs, dim=2)
     if not output_final_state:
         S = None
@@ -721,25 +837,114 @@ def naive_chunk_kda(
         target_state_dtype = state_dtype if state_dtype is not None else compute_dtype
         S = S.to(target_state_dtype)
     o = rearrange(o, 'b h n c d -> b (n c) h d').to(dtype)
-    return o[:, :original_T], S
+    o = o[:, :original_T]
+    # Review-fix 1.1: warn (do not raise) if the chunked recurrence
+    # diverged to non-finite values — see the "Input contract" note in
+    # the caller's docstring and ``_warn_if_nonfinite`` for the rationale.
+    _warn_if_nonfinite(o, fn_name, stacklevel=4)
+    return o, S
+
+
+def naive_chunk_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    *,
+    g_clamp_min: float = -10.0,
+    state_dtype: torch.dtype | None = None,
+):
+    """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error.
+
+    .. warning:: **Input contract — q/k should be unit-norm.**
+
+        Review-fix 1.1: see the identical warning in
+        :func:`naive_recurrent_kda`'s docstring — the same unit-norm
+        ``q``/``k`` contract applies here. This path is MORE sensitive to
+        the contract being violated than the recurrent path: the
+        chunk-internal Neumann series (``torch.linalg.solve_triangular``)
+        and the ``exp(g_diff.clamp(max=50))`` term can amplify large
+        intermediate values into ``Inf`` (not just ``NaN``) once ``q``/``k``
+        are not unit-norm, whereas the strictly-sequential recurrent path
+        tends to decay straight to ``NaN`` instead. **The two paths are
+        therefore not expected to agree, and this function is not expected
+        to match** :func:`naive_recurrent_kda` **once either output
+        contains non-finite values** — the "matches to fp tolerance"
+        guarantee below assumes finite, well-conditioned inputs (e.g.
+        L2-normalized ``q``/``k``, as used throughout
+        ``run_correctness.py``). If the returned output is non-finite, a
+        one-shot ``RuntimeWarning`` is emitted (see
+        :func:`_warn_if_nonfinite`).
+
+    The ``g_clamp_min`` parameter mirrors :func:`naive_recurrent_kda` — see
+    that function's docstring for the rationale. The chunk path applies the
+    clamp BEFORE the cumulative-sum (``g.cumsum(-2)``) so the bound on the
+    per-step gate also bounds the cumulative gate that appears in the
+    chunk-internal Neumann series.
+
+    The ``state_dtype`` parameter mirrors :func:`naive_recurrent_kda` (P1-2
+    fix): the returned state defaults to ``compute_dtype`` (fp32 for
+    fp16/bf16 inputs) instead of being downcast to ``v.dtype``, preventing
+    precision loss in streaming inference where the state is repeatedly
+    passed back as ``initial_state``.
+
+    .. note:: review-fix 1.2 — shares its setup/inner-loop/tail code with
+        :func:`scripted_chunk_kda` via :func:`_chunk_kda_prepare`,
+        :func:`_chunk_kda_inner_loop`, and :func:`_chunk_kda_finalize`
+        instead of maintaining two hand-duplicated copies. This function
+        runs :func:`_chunk_kda_inner_loop` EAGERLY (no ``torch.jit.script``)
+        so it always works regardless of TorchScript compatibility; use
+        :func:`scripted_chunk_kda` for the compiled variant.
+    """
+    prep = _chunk_kda_prepare(
+        q, k, v, g, beta, scale, initial_state, output_final_state,
+        chunk_size, g_clamp_min, state_dtype, fn_name='naive_chunk_kda',
+    )
+    if prep['early']:
+        return prep['o'], prep['S']
+    # P0 autograd-safety fix: ``_chunk_kda_inner_loop`` accumulates
+    # per-chunk outputs in a Python list and the caller (``_chunk_kda_finalize``)
+    # ``torch.stack``s them at the end, instead of in-place ``o[:, :, i] = ...``
+    # on a pre-allocated buffer. The in-place form saves a CopySlices node on
+    # ``o`` for backward, and under ``torch.utils.checkpoint`` the recompute
+    # mutates the saved tensor, raising ``RuntimeError: one of the variables
+    # needed for gradient computation has been modified by an inplace
+    # operation``. Running the SAME ``_chunk_kda_inner_loop`` that
+    # ``scripted_chunk_kda`` scripts (rather than a hand-duplicated eager
+    # loop) is the point of review-fix 1.2: any future numerical fix to the
+    # loop body only needs to be made once.
+    chunk_outs, S = _chunk_kda_inner_loop(
+        prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+        prep['upper_mask'], prep['NT'],
+    )
+    return _chunk_kda_finalize(
+        chunk_outs, S,
+        dtype=prep['dtype'], compute_dtype=prep['compute_dtype'],
+        state_dtype=state_dtype, output_final_state=output_final_state,
+        original_T=prep['original_T'], fn_name='naive_chunk_kda',
+    )
 
 
 # =============================================================================
 # TorchScript-compatible inner loop for ``naive_chunk_kda`` (issue 2.1 fix)
 # -----------------------------------------------------------------------------
-# ``naive_chunk_kda``'s inner ``for i in range(0, NT)`` loop (lines ~658-677
-# above) uses einops ``rearrange`` which is not TorchScript-compatible, so the
-# whole function cannot be ``torch.jit.script``'d directly. The inner loop
-# IS the hot path (Python dispatch overhead per chunk dominates at small
-# ``BT``), so we provide a script-compatible reimplementation below with the
-# exact same math expressed via pure ``torch`` ops (``permute``, ``reshape``,
-# ``unsqueeze``, ``matmul``). ``torch.jit.script`` fuses the loop into a
-# single kernel-launch sequence, eliminating the per-chunk Python dispatch
-# overhead.
+# ``naive_chunk_kda``'s inner per-chunk loop uses einops ``rearrange``-free,
+# pure ``torch`` ops (``permute``, ``unsqueeze``, ``matmul``) so it is
+# TorchScript-compatible, and (since review-fix 1.2) is the ONLY
+# implementation of the inner loop — ``naive_chunk_kda`` calls it eagerly and
+# ``scripted_chunk_kda`` calls it through ``torch.jit.script``. Previously
+# ``naive_chunk_kda`` had its OWN hand-duplicated eager loop (written with
+# ``einops.rearrange`` instead of ``permute``/``unsqueeze``) that had to be
+# kept in sync with this one by hand; that duplication has been removed.
 #
-# The ``scripted_chunk_kda`` wrapper below calls this inner function inside
-# a scripted outer graph, falling back to the eager path if scripting fails
-# (e.g. on a PyTorch version with stricter TorchScript support).
+# The ``scripted_chunk_kda`` wrapper below scripts this function, falling
+# back to the eager path if scripting fails (e.g. on a PyTorch version with
+# stricter TorchScript support).
 # ============================================================================
 
 
@@ -807,12 +1012,23 @@ def scripted_chunk_kda(
 
     Issue 2.1 fix: the README's *Limitations* section notes that
     ``naive_chunk_kda``'s inner per-chunk loop is unfused Python. This
-    wrapper extracts the inner loop into a TorchScript-compatible function
-    (``_chunk_kda_inner_loop``) and scripts it, eliminating the per-chunk
-    Python dispatch overhead. The OUTER setup (validation, padding, cumsum,
+    wrapper scripts the SAME :func:`_chunk_kda_inner_loop` that
+    :func:`naive_chunk_kda` runs eagerly, eliminating the per-chunk Python
+    dispatch overhead. The OUTER setup (validation, padding, cumsum,
     Neumann series, etc.) still runs in eager mode because it uses einops
     ``rearrange`` which is not TorchScript-compatible — only the hot inner
     loop is scripted.
+
+    .. note:: review-fix 1.2 — this function previously duplicated
+        ``naive_chunk_kda``'s entire setup and tail (~90 lines) by hand,
+        with a comment acknowledging the duplication was "regrettable but
+        unavoidable". It now calls the SAME :func:`_chunk_kda_prepare` /
+        :func:`_chunk_kda_finalize` helpers that :func:`naive_chunk_kda`
+        uses, and differs from it ONLY in scripting
+        :func:`_chunk_kda_inner_loop` before calling it. Any future
+        numerical-stability fix to the shared setup/tail code (e.g. the
+        ``g_clamp_min`` handling, or the review-fix 1.1 non-finite-output
+        warning) now automatically applies to both functions.
 
     Args:
         Same as :func:`naive_chunk_kda`, plus:
@@ -840,92 +1056,23 @@ def scripted_chunk_kda(
             state_dtype=state_dtype,
         )
 
-    # Re-implement ``naive_chunk_kda`` up to (but not including) the inner
-    # loop. We cannot simply call ``naive_chunk_kda`` and intercept the
-    # inner loop because the loop body is inlined into the function — there
-    # is no hook point. Instead we duplicate the setup here and call the
-    # scripted inner helper, then duplicate the tail.
-    #
-    # This duplication is regrettable but unavoidable: the alternative is
-    # to refactor ``naive_chunk_kda`` itself to take an ``inner_loop_fn``
-    # callback, which would change its public API. We keep the duplication
-    # local to this wrapper so ``naive_chunk_kda``'s contract stays stable.
-    dtype = v.dtype
-    _validate_kda_inputs(q, k, v, g, beta, fn_name='scripted_chunk_kda')
-    B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    # K2 fix: shape + chunk_size validation centralized in
-    # ``_validate_kda_shapes`` (mirrors naive_chunk_kda).
-    _validate_kda_shapes(
-        q, k, v, g, beta, fn_name='scripted_chunk_kda', chunk_size=chunk_size,
+    prep = _chunk_kda_prepare(
+        q, k, v, g, beta, scale, initial_state, output_final_state,
+        chunk_size, g_clamp_min, state_dtype, fn_name='scripted_chunk_kda',
     )
-    G = HV // H
-    BT = chunk_size
-    original_T = T
-    if T == 0:
-        # K4 fix: compute-dtype selection centralized in ``_compute_dtype``.
-        compute_dtype = _compute_dtype(dtype)
-        S = q.new_zeros(B, HV, K, V, dtype=compute_dtype, device=q.device)
-        if initial_state is not None:
-            S = S + initial_state.to(device=S.device, dtype=compute_dtype)
-        o = q.new_zeros(B, 0, HV, V, dtype=compute_dtype, device=q.device)
-        if not output_final_state:
-            S = None
-        else:
-            target_state_dtype = (state_dtype if state_dtype is not None
-                                  else compute_dtype)
-            S = S.to(target_state_dtype)
-        return o.to(dtype), S
-    pad = (-T) % BT
-    if pad:
-        q    = F.pad(q,    (0, 0, 0, 0, 0, pad))
-        k    = F.pad(k,    (0, 0, 0, 0, 0, pad))
-        v    = F.pad(v,    (0, 0, 0, 0, 0, pad))
-        g    = F.pad(g,    (0, 0, 0, 0, 0, pad))
-        beta = F.pad(beta, (0, 0, 0, pad))
-        T = T + pad
-    NT = T // BT
-    if scale is None:
-        scale = K ** -0.5
-
-    compute_dtype = _compute_dtype(dtype)
-    q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
-    v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
-    q = q.repeat_interleave(G, dim=1) * scale
-    k = k.repeat_interleave(G, dim=1)
-    if g_clamp_min > -float('inf'):
-        g = g.clamp(min=float(g_clamp_min))
-    g = g.cumsum(-2)
-
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
-    A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
-    for i in range(BT):
-        k_i = k[..., i, :]
-        g_i = g[..., i:i+1, :]
-        g_diff = (g - g_i).clamp(max=50.0)
-        A[..., i] = torch.einsum('... c d, ... d -> ... c', k * g_diff.exp(), k_i)
-    A = A * beta[..., None]
-    A = -A.masked_fill(mask, 0)
-    A = torch.linalg.solve_triangular(
-        torch.eye(BT, dtype=compute_dtype, device=q.device) - A, A, upper=False
-    )
-    A = (A + torch.eye(BT, dtype=compute_dtype, device=q.device)) * beta[..., None, :]
-
-    w = A @ (g.exp() * k)
-    u = A @ v
-
-    S = q.new_zeros(B, HV, K, V)
-    if initial_state is not None:
-        S = S + initial_state.to(device=S.device, dtype=compute_dtype)
-    upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    if prep['early']:
+        return prep['o'], prep['S']
 
     # --- scripted inner loop ---
     # Try to script the inner loop. If TorchScript rejects it (older PyTorch,
     # unusual dtype, etc.) fall back to the eager loop with a one-shot
     # warning. We do NOT swallow other exceptions — those indicate real bugs.
-    chunk_outs = None
     try:
         scripted_inner = torch.jit.script(_chunk_kda_inner_loop)
-        chunk_outs, S = scripted_inner(q, k, u, g, w, S, upper_mask, NT)
+        chunk_outs, S = scripted_inner(
+            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+            prep['upper_mask'], prep['NT'],
+        )
     except Exception as exc:
         _warnings.warn(
             f"scripted_chunk_kda: torch.jit.script failed ({type(exc).__name__}: "
@@ -934,13 +1081,14 @@ def scripted_chunk_kda(
             f"remains. Set use_script=False to silence this warning.",
             stacklevel=2,
         )
-        chunk_outs, S = _chunk_kda_inner_loop(q, k, u, g, w, S, upper_mask, NT)
+        chunk_outs, S = _chunk_kda_inner_loop(
+            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+            prep['upper_mask'], prep['NT'],
+        )
 
-    o = torch.stack(chunk_outs, dim=2)
-    if not output_final_state:
-        S = None
-    else:
-        target_state_dtype = state_dtype if state_dtype is not None else compute_dtype
-        S = S.to(target_state_dtype)
-    o = rearrange(o, 'b h n c d -> b (n c) h d').to(dtype)
-    return o[:, :original_T], S
+    return _chunk_kda_finalize(
+        chunk_outs, S,
+        dtype=prep['dtype'], compute_dtype=prep['compute_dtype'],
+        state_dtype=state_dtype, output_final_state=output_final_state,
+        original_T=prep['original_T'], fn_name='scripted_chunk_kda',
+    )

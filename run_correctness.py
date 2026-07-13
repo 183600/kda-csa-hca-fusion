@@ -44,7 +44,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
-from ops_kda import naive_recurrent_kda, naive_chunk_kda
+from ops_kda import naive_recurrent_kda, naive_chunk_kda, scripted_chunk_kda
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig, KDAHybridLayer
@@ -187,6 +187,95 @@ def test_kda_chunk_gva(device='cpu'):
         _ok('GVA chunk vs recurrent output', o_diff < 1e-4, f'{o_diff:.2e}'),
         _ok('GVA chunk vs recurrent state', s_diff < 1e-4, f'{s_diff:.2e}'),
     ]
+
+
+def test_scripted_chunk_kda_matches_naive(device='cpu'):
+    """Review-fix 1.2 regression: ``scripted_chunk_kda`` == ``naive_chunk_kda``.
+
+    Before review-fix 1.2, ``naive_chunk_kda`` and ``scripted_chunk_kda``
+    each had their OWN hand-duplicated copy of the chunk-path setup/tail
+    code (~90+20 lines), with the file's own comments acknowledging this
+    duplication was "regrettable but unavoidable". Nothing enforced that
+    the two copies stayed in sync — a fix applied to one could silently
+    fail to reach the other. The refactor extracted the shared logic into
+    ``_chunk_kda_prepare`` / ``_chunk_kda_finalize`` (used by both) and
+    ``_chunk_kda_inner_loop`` (run eagerly by ``naive_chunk_kda``, and
+    ``torch.jit.script``-compiled by ``scripted_chunk_kda``).
+
+    This test pins that the three call paths — eager recurrent, eager
+    chunk, and scripted chunk (both ``use_script=True`` and
+    ``use_script=False``) — all agree to fp tolerance, across:
+      * a normal T divisible by chunk_size,
+      * a non-divisible T (exercises the internal right-padding path),
+      * T == 0 (the degenerate early-return path),
+      * GVA (HV > H, exercises ``repeat_interleave``),
+      * ``output_final_state=True`` (state agreement, not just output).
+    """
+    logger.info("Test: scripted_chunk_kda matches naive_chunk_kda / naive_recurrent_kda")
+    torch.manual_seed(21)
+    results = []
+
+    def _check(name, T, H, K, V, HV, BT):
+        B = 2
+        q = F.normalize(torch.randn(B, T, H, K, dtype=torch.float32, device=device), dim=-1)
+        k = F.normalize(torch.randn(B, T, H, K, dtype=torch.float32, device=device), dim=-1)
+        v = torch.randn(B, T, HV, V, dtype=torch.float32, device=device) * 0.1
+        g = -torch.rand(B, T, HV, K, dtype=torch.float32, device=device) * 0.05
+        beta = torch.rand(B, T, HV, dtype=torch.float32, device=device) * 0.2
+
+        o_rec, s_rec = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+        o_chk, s_chk = naive_chunk_kda(q, k, v, g, beta, output_final_state=True, chunk_size=BT)
+        o_scr, s_scr = scripted_chunk_kda(q, k, v, g, beta, output_final_state=True,
+                                          chunk_size=BT, use_script=True)
+        o_scr_ns, s_scr_ns = scripted_chunk_kda(q, k, v, g, beta, output_final_state=True,
+                                                chunk_size=BT, use_script=False)
+
+        chk_vs_scr_o = (o_chk - o_scr).abs().max().item()
+        chk_vs_scr_s = 0.0 if (s_chk is None or s_scr is None) else (s_chk - s_scr).abs().max().item()
+        scr_vs_rec_o = (o_rec - o_scr).abs().max().item()
+        noscript_matches_chk = torch.equal(o_scr_ns, o_chk)
+
+        results.append(_ok(
+            f'{name}: scripted_chunk_kda output shape matches',
+            o_scr.shape == o_chk.shape == o_rec.shape,
+            f'scr={tuple(o_scr.shape)}, chk={tuple(o_chk.shape)}, rec={tuple(o_rec.shape)}'))
+        results.append(_ok(
+            f'{name}: scripted (use_script=True) output == eager chunk output',
+            chk_vs_scr_o < 1e-4, f'max|diff|={chk_vs_scr_o:.2e}'))
+        results.append(_ok(
+            f'{name}: scripted (use_script=True) state == eager chunk state',
+            chk_vs_scr_s < 1e-4, f'max|diff|={chk_vs_scr_s:.2e}'))
+        results.append(_ok(
+            f'{name}: scripted chunk output == recurrent output (fp tolerance)',
+            scr_vs_rec_o < 1e-4, f'max|diff|={scr_vs_rec_o:.2e}'))
+        results.append(_ok(
+            f'{name}: use_script=False delegates to naive_chunk_kda (bit-identical)',
+            noscript_matches_chk,
+            f'max|diff|={(o_scr_ns - o_chk).abs().max().item():.2e}'))
+
+    _check('normal (T divisible by BT)', T=128, H=2, K=16, V=16, HV=2, BT=64)
+    _check('non-divisible T', T=70, H=2, K=16, V=16, HV=2, BT=64)
+    _check('GVA (HV > H)', T=128, H=2, K=16, V=16, HV=4, BT=64)
+
+    # T == 0: the degenerate early-return path in ``_chunk_kda_prepare``.
+    B, H, K, V, HV = 2, 2, 16, 16, 2
+    q0 = torch.zeros(B, 0, H, K, dtype=torch.float32, device=device)
+    k0 = torch.zeros(B, 0, H, K, dtype=torch.float32, device=device)
+    v0 = torch.zeros(B, 0, HV, V, dtype=torch.float32, device=device)
+    g0 = torch.zeros(B, 0, HV, K, dtype=torch.float32, device=device)
+    beta0 = torch.zeros(B, 0, HV, dtype=torch.float32, device=device)
+    o0_chk, s0_chk = naive_chunk_kda(q0, k0, v0, g0, beta0, output_final_state=True, chunk_size=64)
+    o0_scr, s0_scr = scripted_chunk_kda(q0, k0, v0, g0, beta0, output_final_state=True, chunk_size=64)
+    results.append(_ok(
+        'T=0: scripted_chunk_kda shape matches naive_chunk_kda',
+        o0_scr.shape == o0_chk.shape == (B, 0, HV, V),
+        f'scr={tuple(o0_scr.shape)}, chk={tuple(o0_chk.shape)}'))
+    results.append(_ok(
+        'T=0: scripted_chunk_kda state matches naive_chunk_kda (bit-identical)',
+        torch.equal(s0_scr, s0_chk),
+        f'max|diff|={(s0_scr - s0_chk).abs().max().item():.2e}'))
+
+    return results
 
 
 def test_kda_chunk_nondivisible_T(device='cpu'):
@@ -693,6 +782,89 @@ def test_kda_g_clamp(device='cpu'):
     ]
 
 
+def test_kda_unnormalized_input_warns(device='cpu'):
+    """Review-fix 1.1 regression: non-finite KDA output triggers a warning.
+
+    Neither ``naive_recurrent_kda`` nor ``naive_chunk_kda`` enforces the
+    unit-norm ``q``/``k`` contract documented in their docstrings. Feeding
+    un-normalized (raw ``torch.randn``) ``q``/``k`` over a long sequence
+    makes the delta-rule recurrence diverge: the recurrent path's output
+    silently becomes ``NaN`` and the chunk path's output can become a mix
+    of ``NaN``/``Inf`` (the two paths amplify divergence differently once
+    either becomes non-finite — see the "Input contract" docstring note on
+    both functions). This test pins:
+
+      1. Un-normalized q/k over a long sequence (T=2048) produces a
+         non-finite ``naive_recurrent_kda`` output AND a one-shot
+         ``RuntimeWarning`` naming the function and the fix.
+      2. The same inputs through ``naive_chunk_kda`` also produce a
+         non-finite output AND trigger its own warning.
+      3. Well-behaved (L2-normalized q/k, small v) inputs over the SAME
+         sequence length do NOT warn and DO produce a fully finite
+         output — i.e. the warning is a real diagnostic, not spurious
+         noise on every call.
+    """
+    logger.info("Test: KDA warns (does not silently corrupt) on non-finite output")
+    torch.manual_seed(0)
+    B, T, H, K, V = 2, 2048, 4, 64, 64
+
+    # --- Part 1 & 2: un-normalized q/k, large-ish v -> expect divergence ---
+    q = torch.randn(B, T, H, K, device=device)
+    k = torch.randn(B, T, H, K, device=device)
+    v = torch.randn(B, T, H, V, device=device)
+    g = -torch.rand(B, T, H, K, device=device) * 0.05
+    beta = torch.rand(B, T, H, device=device) * 0.2
+
+    import warnings as _w
+    with _w.catch_warnings(record=True) as caught_rec:
+        _w.simplefilter('always')
+        o_rec, _ = naive_recurrent_kda(q, k, v, g, beta)
+    rec_nonfinite = not torch.isfinite(o_rec).all().item()
+    rec_warned = any(
+        'naive_recurrent_kda: output contains NaN/Inf' in str(rec.message)
+        for rec in caught_rec)
+
+    with _w.catch_warnings(record=True) as caught_chunk:
+        _w.simplefilter('always')
+        o_chunk, _ = naive_chunk_kda(q, k, v, g, beta)
+    chunk_nonfinite = not torch.isfinite(o_chunk).all().item()
+    chunk_warned = any(
+        'naive_chunk_kda: output contains NaN/Inf' in str(rec.message)
+        for rec in caught_chunk)
+
+    # --- Part 3: normalized q/k, same T -> expect no warning, all finite ---
+    q_n = F.normalize(q, dim=-1)
+    k_n = F.normalize(k, dim=-1)
+    v_n = v * 0.1
+    with _w.catch_warnings(record=True) as caught_norm:
+        _w.simplefilter('always')
+        o_norm, _ = naive_recurrent_kda(q_n, k_n, v_n, g, beta)
+    norm_finite = torch.isfinite(o_norm).all().item()
+    norm_no_warning = not any(
+        'output contains NaN/Inf' in str(rec.message) for rec in caught_norm)
+
+    return [
+        _ok('un-normalized recurrent KDA output is non-finite over long T',
+            rec_nonfinite,
+            f'isfinite.all()={not rec_nonfinite} (expected divergence at T={T})'),
+        _ok('naive_recurrent_kda warns on non-finite output',
+            rec_warned,
+            f'n_warnings_caught={len(caught_rec)}'),
+        _ok('un-normalized chunk KDA output is non-finite over long T',
+            chunk_nonfinite,
+            f'isfinite.all()={not chunk_nonfinite} (expected divergence at T={T})'),
+        _ok('naive_chunk_kda warns on non-finite output',
+            chunk_warned,
+            f'n_warnings_caught={len(caught_chunk)}'),
+        _ok('normalized q/k + small v: output stays finite over the same T',
+            norm_finite,
+            f'isfinite.all()={norm_finite} (well-conditioned input contract honored)'),
+        _ok('normalized q/k + small v: no non-finite-output warning fires',
+            norm_no_warning,
+            'the warning must not be spurious noise on well-behaved inputs'),
+    ]
+
+
 def test_kda_chunk_vs_recurrent_gradient(device='cpu'):
     """Gradient agreement between ``naive_recurrent_kda`` and ``naive_chunk_kda``.
 
@@ -1106,6 +1278,120 @@ def test_csa_indexer_ste_gradient(device='cpu'):
         _ok('no-STE: W_aKV (non-indexer) DOES get non-trivial grad (backward ran)',
             noste_wakv_has_grad,
             f'W_aKV.grad_norm={(_none_or_norm(p_noste["W_aKV"].grad))}'),
+    ]
+
+
+def test_csa_fuse_projections_grad_contract(device='cpu'):
+    """Review-fix 1.3 regression: ``fuse_projections`` forward/backward contract.
+
+    Issue 2.3 fused the 6 KV/indexer-compression projections
+    (``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx``) into a single
+    ``F.linear`` call for performance. This is forward-value-preserving,
+    but under ``use_ste=False`` it changes ``W_KV_idx``/``W_Z_idx``'s
+    ``.grad`` from ``None`` (untouched by autograd — the pre-fusion
+    behaviour) to a zero-but-non-None tensor (the fused behaviour),
+    because they now share a matmul with 4 other, differentiable weights.
+
+    ``naive_csa`` now exposes ``fuse_projections=True`` (default,
+    performance path) vs ``fuse_projections=False`` (restores the
+    original 6-separate-matmul path with the ``None``-grad convention).
+    This test pins:
+
+      1. The forward output is bit-identical between the two modes
+         (fp64 tolerance) — the fusion must never change the algorithm's
+         result.
+      2. Under ``use_ste=False`` + ``fuse_projections=True``,
+         ``W_KV_idx``/``W_Z_idx`` receive a non-None, all-zero gradient
+         (the "fused" contract).
+      3. Under ``use_ste=False`` + ``fuse_projections=False``,
+         ``W_KV_idx``/``W_Z_idx`` receive ``None`` gradient (the
+         "unfused" contract, matching the pre-issue-2.3 behaviour).
+      4. Under ``use_ste=True`` (STE enabled), BOTH modes give
+         ``W_KV_idx``/``W_Z_idx`` a real (non-zero) gradient — the STE
+         gradient path does not depend on ``fuse_projections`` at all.
+    """
+    logger.info("Test: naive_csa fuse_projections forward/backward contract (review-fix 1.3)")
+    torch.manual_seed(43)
+    B, T, d = 1, 32, 16
+    m, topk, nh, nIh, c, cI, dc = 4, 2, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device, dtype=torch.float64)
+
+    def _make_params():
+        return dict(
+            W_aKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_aZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            Ba=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            Bb=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            W_DQ=torch.randn(dc, d, dtype=torch.float64) * 0.1,
+            W_UQ=torch.randn(c * nh, dc, dtype=torch.float64) * 0.1,
+            W_IUQ=torch.randn(cI * nIh, dc, dtype=torch.float64) * 0.1,
+            W_w=torch.randn(nIh, d, dtype=torch.float64) * 0.1,
+            W_KV_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            W_Z_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            B_idx=torch.randn(m, cI, dtype=torch.float64) * 0.02,
+        )
+
+    common = dict(m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+                  sliding_window=0, sink_logits=None)
+
+    # --- Part 1: forward value is identical regardless of fuse_projections ---
+    import copy
+    p_a = _make_params()
+    p_b = copy.deepcopy(p_a)
+    with torch.no_grad():
+        o_fused = naive_csa(H, **p_a, use_ste=False, fuse_projections=True, **common)
+        o_unfused = naive_csa(H, **p_b, use_ste=False, fuse_projections=False, **common)
+    fwd_match = torch.allclose(o_fused, o_unfused, rtol=0, atol=1e-12)
+
+    indexer_names = ['W_KV_idx', 'W_Z_idx']
+
+    def _run_backward(fuse_projections, use_ste):
+        p = _make_params()
+        p['W_aKV'] = p['W_aKV'].clone().requires_grad_(True)
+        for name in indexer_names:
+            p[name] = p[name].clone().requires_grad_(True)
+        o = naive_csa(H, **p, use_ste=use_ste, fuse_projections=fuse_projections, **common)
+        o.sum().backward()
+        return {name: p[name].grad for name in indexer_names}
+
+    # --- Part 2: use_ste=False, fuse_projections=True -> zero, non-None grad ---
+    grads_fused_noste = _run_backward(fuse_projections=True, use_ste=False)
+    fused_noste_ok = all(
+        g is not None and g.abs().sum().item() < 1e-12
+        for g in grads_fused_noste.values())
+
+    # --- Part 3: use_ste=False, fuse_projections=False -> None grad ---
+    grads_unfused_noste = _run_backward(fuse_projections=False, use_ste=False)
+    unfused_noste_ok = all(g is None for g in grads_unfused_noste.values())
+
+    # --- Part 4: use_ste=True -> both modes give a REAL (non-zero) grad ---
+    grads_fused_ste = _run_backward(fuse_projections=True, use_ste=True)
+    grads_unfused_ste = _run_backward(fuse_projections=False, use_ste=True)
+    fused_ste_ok = all(
+        g is not None and torch.isfinite(g).all().item() and g.abs().sum().item() > 0
+        for g in grads_fused_ste.values())
+    unfused_ste_ok = all(
+        g is not None and torch.isfinite(g).all().item() and g.abs().sum().item() > 0
+        for g in grads_unfused_ste.values())
+
+    return [
+        _ok('fuse_projections=True/False: forward output bit-identical',
+            fwd_match,
+            f'max_abs_diff={(o_fused - o_unfused).abs().max().item() if not fwd_match else 0}'),
+        _ok('use_ste=False + fuse_projections=True: indexer weights get zero-but-non-None grad',
+            fused_noste_ok,
+            f'grads={[(_none_or_norm(g)) for g in grads_fused_noste.values()]}'),
+        _ok('use_ste=False + fuse_projections=False: indexer weights get None grad',
+            unfused_noste_ok,
+            f'grads={[(_none_or_norm(g)) for g in grads_unfused_noste.values()]}'),
+        _ok('use_ste=True + fuse_projections=True: indexer weights get real gradient',
+            fused_ste_ok,
+            f'grads={[(_none_or_norm(g)) for g in grads_fused_ste.values()]}'),
+        _ok('use_ste=True + fuse_projections=False: indexer weights get real gradient',
+            unfused_ste_ok,
+            f'grads={[(_none_or_norm(g)) for g in grads_unfused_ste.values()]}'),
     ]
 
 
@@ -4359,6 +4645,11 @@ def main():
     all_results += _run_safe(test_kda_chunk_vs_recurrent, device)
     all_results += _run_safe(test_kda_gva, device)
     all_results += _run_safe(test_kda_chunk_gva, device)
+    # Review-fix 1.2 regression: scripted_chunk_kda (both use_script=True
+    # and False) agrees with naive_chunk_kda / naive_recurrent_kda now
+    # that the two share _chunk_kda_prepare/_chunk_kda_finalize instead of
+    # hand-duplicated setup/tail code.
+    all_results += _run_safe(test_scripted_chunk_kda_matches_naive, device)
     all_results += _run_safe(test_csa_causality, device)
     all_results += _run_safe(test_hca_forward_smoke, device)
     all_results += _run_safe(test_fused_hybrid, device)
@@ -4367,6 +4658,9 @@ def main():
     all_results += _run_safe(test_kda_gradient, device)
     # P0 regression: g-clamp prevents catastrophic state decay.
     all_results += _run_safe(test_kda_g_clamp, device)
+    # Review-fix 1.1 regression: non-finite KDA output triggers a warning
+    # instead of silently propagating (see ops_kda._warn_if_nonfinite).
+    all_results += _run_safe(test_kda_unnormalized_input_warns, device)
     # Regression test for chunk-vs-recurrent gradient agreement (fp64).
     all_results += _run_safe(test_kda_chunk_vs_recurrent_gradient, device)
     all_results += _run_safe(test_csa_indexer_validity, device)
@@ -4376,6 +4670,10 @@ def main():
     all_results += _run_safe(test_csa_indexer_topk_zero, device)
     # P0-4 regression: STE must make the CSA indexer parameters trainable.
     all_results += _run_safe(test_csa_indexer_ste_gradient, device)
+    # Review-fix 1.3 regression: fuse_projections=True/False forward
+    # value is identical; only the use_ste=False gradient contract
+    # (None vs zero-but-non-None) differs, as documented in naive_csa.
+    all_results += _run_safe(test_csa_fuse_projections_grad_contract, device)
     # P0-2 regression: ste_mode='full_softmax' must be a distinct branch
     # (not silently aliased to 'topk_columns').
     all_results += _run_safe(test_csa_indexer_ste_full_softmax, device)
