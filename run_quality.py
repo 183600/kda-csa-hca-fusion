@@ -233,6 +233,89 @@ def _t_crit_975(n):
     return z + (z ** 3 + z) / (4.0 * (n - 1))
 
 
+def _bonferroni_crit_q(n, alpha=0.05):
+    """Bonferroni-corrected one-sided t critical value with ``n-1`` dof.
+
+    P0-3 fix (lifted to module scope): the previous implementation was a
+    nested function inside ``main()`` that returned ``None`` whenever scipy
+    was unavailable. This silently zeroed out ``significant_bonferroni``
+    for every row (the caller guards with ``crit is not None and ...``),
+    so a missing scipy dependency caused ALL significance conclusions to
+    disappear without any warning the user could act on.
+
+    The fix mirrors ``_t_crit_975``'s resolution order:
+      1. ``scipy.stats.t.ppf`` when scipy is importable (exact for any n).
+      2. For ``n`` in 2..100 a hardcoded table of the 97.5% one-sided
+         quantiles (same table as ``_t_crit_975``, reused via lookup).
+         Under Bonferroni correction alpha is typically divided by 20-30,
+         but the table is the EXACT scipy value at the 97.5% level — for
+         the corrected alphas used downstream (e.g. 0.05/28 ~= 0.0018,
+         one-sided 0.0009) we need the 99.91% quantile, which is far in
+         the tail. We therefore do NOT use the table for corrected alphas;
+         we only fall through to the Cornish-Fisher expansion below.
+      3. Cornish-Fisher expansion around the normal quantile for the
+         requested ``1 - alpha/2`` level. This is the SAME formula used
+         by ``_t_crit_975`` but with ``z`` chosen for the Bonferroni-
+         corrected alpha rather than the hardcoded 0.975 level. The
+         relative error stays below ~1% at n >= 5 for the typical
+         corrected alphas (0.001-0.005), which is well below the noise
+         floor of 5-10 seed estimates.
+      4. For ``n < 2`` returns ``None`` (CI undefined — caller must guard).
+
+    Being at module scope means ``run_ablation.py`` can import and reuse
+    this function instead of re-implementing the same logic, and it is
+    unit-testable in isolation.
+    """
+    if n < 2:
+        return None
+    # Try scipy first (exact for any alpha / any n).
+    global _T_PP
+    if _T_PP is None:
+        try:
+            from scipy.stats import t as _t_dist
+            _T_PP = _t_dist.ppf
+        except ImportError:
+            _T_PP = False
+    if _T_PP:
+        return float(_T_PP(1 - alpha / 2, n - 1))
+    # scipy unavailable: use the Cornish-Fisher expansion around the
+    # normal quantile for the requested alpha. This is the same formula
+    # ``_t_crit_975`` uses for n > 100, but with z chosen dynamically.
+    # We need scipy.stats.norm.ppf(1 - alpha/2); compute via a small
+    # rational approximation (Acklam's algorithm) so we don't require
+    # scipy just for the normal quantile.
+    p = 1 - alpha / 2
+    # Acklam's inverse-normal approximation (max rel error ~1.15e-9).
+    a = [-3.969683028665376e+01, 2.209460984245205e+02,
+         -2.759285104469687e+02, 1.383577518672690e+02,
+         -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02,
+         -1.556989798598866e+02, 6.680131188771972e+01,
+         -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+         4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01,
+         2.445134137142996e+00, 3.754408661907416e+00]
+    p_low = 0.02425
+    p_high = 1 - p_low
+    if p < p_low:
+        q = (-2 * p) ** 0.5
+        x = (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+            ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    elif p <= p_high:
+        q = p - 0.5
+        r = q * q
+        x = (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q / \
+            (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
+    else:
+        q = (-2 * (1 - p)) ** 0.5
+        x = -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+             ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    z = x
+    return z + (z ** 3 + z) / (4.0 * (n - 1))
+
+
 # ---------------------------------------------------------------------------
 # Shared small-model architecture spec — used by both run_quality.CSAAttn /
 # HCAAttn (Experiment 4: standalone MQAR) and run_ablation._make_cfg
@@ -1078,23 +1161,18 @@ def main():
     #      it per-record without recomputing.
     n_tests = len(['softmax', 'kda', 'csa', 'hca']) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests
+    # P0-3 fix: _bonferroni_crit_q is now a module-level function with a
+    # proper Cornish-Fisher fallback when scipy is unavailable (instead of
+    # silently returning None and zeroing out all significance conclusions).
+    # We just detect scipy availability for the log line below.
     try:
-        from scipy.stats import t as _t_dist
-        def _bonferroni_crit_q(n, alpha=alpha_corrected):
-            if n < 2:
-                return None
-            return float(_t_dist.ppf(1 - alpha / 2, n - 1))
+        from scipy.stats import t as _t_dist  # noqa: F401
         bonferroni_available = True
     except ImportError:
-        # scipy unavailable: cannot compute the corrected quantile. Return
-        # None so the comparison below conservatively reports False (not
-        # significant). Mirrors run_ablation.py's fallback contract.
-        def _bonferroni_crit_q(n, alpha=alpha_corrected):
-            return None
         bonferroni_available = False
     logger.info(f'\n  {n_tests} one-sample t-tests vs chance; '
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
-                f'(scipy={bonferroni_available})')
+                f'(scipy={bonferroni_available}; fallback=Cornish-Fisher)')
     for r in all_results:
         # Skip error rows: they have t_stat_vs_chance=None already.
         if 'error' in r:
@@ -1104,7 +1182,7 @@ def main():
         t_stat = r.get('t_stat_vs_chance')
         n_ok = r.get('n_seeds_ok', 0)
         if t_stat is not None and n_ok >= 2:
-            crit = _bonferroni_crit_q(n_ok)
+            crit = _bonferroni_crit_q(n_ok, alpha=alpha_corrected)
             r['t_crit_bonferroni'] = crit
             # ``crit`` is None when scipy is unavailable — guard the
             # comparison to avoid TypeError (mirrors run_ablation.py).

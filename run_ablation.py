@@ -43,7 +43,7 @@ from kaggle_setup import configure_torch_for_device, parse_int_env, sanitize_for
 from ops_fused import HybridKCHAttention, HybridConfig
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
-    _build_param_groups, SMALL_MODEL_SPEC,
+    _bonferroni_crit_q, _build_param_groups, SMALL_MODEL_SPEC,
 )
 
 logger = logging.getLogger(__name__)
@@ -476,49 +476,19 @@ def main():
     # are preserved in the JSON for transparency.
     n_tests = len(ratios) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests
-    # Bonferroni-corrected two-sided critical value: use the same _t_crit_975
-    # helper but at the corrected alpha. _t_crit_975 returns the two-sided
-    # 95% (alpha=0.05) critical value; for an arbitrary alpha we want the
-    # two-sided (1-alpha) critical value, i.e. the (1-alpha/2) quantile.
-    # scipy is available (the helper falls back to a table for n<=30 and
-    # 1.96 for n>30); for the small n (5) used here the corrected alpha is
-    # ~0.007, far below what the table covers, so we fall back to scipy if
-    # available, else use a conservative normal-approximation upper bound.
+    # P0-3 fix: use the module-level ``_bonferroni_crit_q`` from run_quality,
+    # which has a proper Cornish-Fisher fallback when scipy is unavailable
+    # (the previous nested implementation returned None and silently zeroed
+    # out all significance conclusions). We just detect scipy availability
+    # for the log line below.
     try:
-        from scipy.stats import t as _t_dist
-        def _bonferroni_crit(n, alpha=alpha_corrected):
-            if n < 2:
-                return None
-            return float(_t_dist.ppf(1 - alpha / 2, n - 1))
+        from scipy.stats import t as _t_dist  # noqa: F401
         bonferroni_available = True
     except ImportError:
-        # scipy unavailable: cannot compute the corrected quantile.
-        # Return ``None`` (NOT ``float('inf')``) so:
-        #   (a) the value is JSON-serializable under ``allow_nan=False``
-        #       (inf raises ``ValueError: Out of range float values are
-        #       not JSON compliant``, which previously triggered the
-        #       sanitize-fallback on EVERY ablation run when scipy was
-        #       missing — logging a misleading ERROR and silently
-        #       nuking the field to null anyway);
-        #   (b) ``significant_bonferroni`` is set to ``False`` (via the
-        #       ``crit is not None`` guard in the comparison below), so
-        #       we NEVER declare Bonferroni significance when scipy is
-        #       missing — the same conservative behaviour the previous
-        #       ``inf`` return value aimed for, but without the JSON
-        #       serialization crash.
-        # The previous-previous fallback returned the UNCORRECTED 95%
-        # critical value (``_t_crit_975(n)``), which is SMALLER than
-        # the corrected critical value — the OPPOSITE of "conservative".
-        # With that code, a t-statistic of 3.0 (which is significant at
-        # uncorrected alpha=0.05 but NOT at corrected alpha=0.007) would
-        # be flagged ``significant_bonferroni=True``, over-reporting
-        # significance despite the comment's claim.
-        def _bonferroni_crit(n, alpha=alpha_corrected):
-            return None
         bonferroni_available = False
     logger.info(f'  {n_tests} one-sample t-tests vs chance; '
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
-                f'(scipy={bonferroni_available})')
+                f'(scipy={bonferroni_available}; fallback=Cornish-Fisher)')
 
     all_results = []
     for n_kv in n_kv_list:
@@ -544,7 +514,7 @@ def main():
                 t_stat = res.get('t_stat_vs_chance')
                 n_ok = res.get('n_seeds_ok', 0)
                 if t_stat is not None and n_ok >= 2:
-                    crit = _bonferroni_crit(n_ok)
+                    crit = _bonferroni_crit_q(n_ok, alpha=alpha_corrected)
                     res['t_crit_bonferroni'] = crit
                     # ``crit`` is None when scipy is unavailable (see
                     # ``_bonferroni_crit``). ``t_stat > None`` raises

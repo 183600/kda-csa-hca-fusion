@@ -418,6 +418,12 @@ def compiled_recurrent_kda(
         mode, dynamic, fullgraph,
         bool(output_final_state),
         bool(initial_state is not None),
+        # P0-1 fix: state_dtype is baked into the compiled closure (line 443)
+        # rather than passed as a runtime argument. If two calls share every
+        # other key dimension but differ in state_dtype (e.g. None then fp16),
+        # the cache would silently return the wrong-dtype state. Include it
+        # in the key so a differing state_dtype forces a fresh compile.
+        str(state_dtype),
     )
     compiled_fn = _COMPILED_KDA_CACHE.get(cache_key)
     if compiled_fn is None:

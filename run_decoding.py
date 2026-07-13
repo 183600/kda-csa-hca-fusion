@@ -612,9 +612,25 @@ class HybridDecoding(nn.Module):
     CSA/HCA layers do NOT yet use the incremental cache — so the
     hybrid decode cost is an UPPER BOUND on what a cache-enabled
     hybrid would achieve.
+
+    P0-5 fix: ``csa_topk`` was previously hardcoded to 100 "to select
+    all valid blocks", which silently disabled CSA's sparse top-k
+    retrieval (the core mechanism that gives CSA its sub-quadratic
+    decode cost). With topk=100 the CSA sub-layer in the hybrid stack
+    degenerated into dense attention over ALL compressed blocks, making
+    the hybrid decode latency look artificially slow relative to a
+    real deployment. We now use ``csa_topk=2`` to match
+    ``run_ablation._make_cfg``'s setting (which is the value used by
+    every other experiment in the suite), so the hybrid row is
+    apples-to-apples with the standalone CSA decode row.
     """
 
-    def __init__(self, d_model=64, total_layers=5):
+    def __init__(self, d_model=64, total_layers=5, csa_topk: int = 2):
+        """``csa_topk`` is exposed as a constructor parameter (P0-5 fix) so
+        ablation runs can sweep it without monkey-patching. Default ``2``
+        matches ``run_ablation._make_cfg`` rather than the previous
+        ``100`` (which silently selected all blocks and made the CSA
+        sub-layer in the hybrid stack run as dense attention)."""
         super().__init__()
         from ops_fused import HybridConfig, HybridKCHAttention
         self.cfg = HybridConfig(
@@ -622,7 +638,7 @@ class HybridDecoding(nn.Module):
             n_heads_qk=2, n_heads_v=2,
             head_dim_k=16, head_dim_v=16,
             kda_chunk_size=0,  # force recurrent path for decode
-            csa_m=4, csa_topk=100,  # select all valid blocks
+            csa_m=4, csa_topk=csa_topk,  # P0-5: was 100 (silently dense)
             csa_nh=2, csa_c=8, csa_dc=8, csa_nIh=1, csa_cI=4,
             csa_sliding_window=4,
             hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
@@ -858,11 +874,25 @@ def main():
                                    repeats=N_REPEATS)
                 r['op'] = name
                 r['device'] = str(device)
+                # P0-5 fairness footnote: mark the hybrid row as an upper
+                # bound so readers of the JSON / printed table know the
+                # hybrid decode latency is NOT directly comparable to the
+                # standalone CSA/HCA rows (which use the incremental cache
+                # the hybrid stack has not yet wired up).
+                if name == 'hybrid':
+                    r['upper_bound'] = True
+                else:
+                    r['upper_bound'] = False
                 results.append(r)
                 peak_str = 'n/a' if r['peak_mem_MB'] is None else f"{r['peak_mem_MB']:.2f}MB"
-                print(f"  {name:10s}  prefill={r['prefill_ms']:8.2f}ms  "
+                marker = ' *' if r.get('upper_bound') else ''
+                print(f"  {name:10s}{marker}  prefill={r['prefill_ms']:8.2f}ms  "
                       f"decode/tok={r['median_decode_ms_per_token']:8.3f}ms  "
                       f"peak_mem={peak_str:>10}")
+                if name == 'hybrid':
+                    print('    * hybrid decode is an UPPER BOUND — CSA/HCA '
+                          'sub-layers recompute full attention (no incremental '
+                          'cache wired into the hybrid stack yet).')
             except Exception as e:
                 # Include null fields for the keys present on success rows so
                 # downstream JSON consumers can do ``r['prefill_ms']`` without
@@ -876,7 +906,8 @@ def main():
                                 'median_decode_ms_per_token': None,
                                 'peak_mem_MB': None,
                                 'n_decode': n_decode,
-                                'repeats': N_REPEATS})
+                                'repeats': N_REPEATS,
+                                'upper_bound': (name == 'hybrid')})
                 print(f"  {name:10s}  ERROR: {e}")
 
     # Summary: decode latency growth rate.
@@ -886,7 +917,8 @@ def main():
     print(f"{'op':>10} | " + " | ".join(f"{p:>8}" for p in prefill_lens))
     print('-' * 70)
     for name in models:
-        cells = [f"{name:>10}"]
+        marker = ' *' if name == 'hybrid' else ''
+        cells = [f"{name:>10}{marker}"]
         for plen in prefill_lens:
             vals = [r['median_decode_ms_per_token'] for r in results
                     if r.get('op') == name and r.get('prefill_len') == plen
@@ -896,6 +928,8 @@ def main():
             else:
                 cells.append(f"{'n/a':>8}")
         print(" | ".join(cells))
+    print('  * hybrid row is an UPPER BOUND (CSA/HCA sub-layers do not use '
+          'the incremental cache; see P0-5 note in HybridDecoding docstring).')
 
     if device.type == 'cpu':
         print('\nNote: CPU peak memory is not reported (torch tensors use native')

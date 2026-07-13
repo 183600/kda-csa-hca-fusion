@@ -672,9 +672,14 @@ class CSADecodingCache:
                 new_K_I = _indexer_compress_single(
                     K_idx_block, Z_idx_block, B_idx,
                 )                                                  # [B, c_I]
-                # Push to caches.
-                new_C_row = new_C.unsqueeze(1)                    # [B, 1, c]
-                new_K_I_row = new_K_I.unsqueeze(1)                # [B, 1, c_I]
+                # P0-4 fix: the compress helpers upcast to fp32/fp64
+                # internally (compute_dtype) and return that dtype. If we
+                # store the result as-is when ``self.dtype == fp16``, the
+                # next ``torch.cat`` with the existing fp16 ``_C_comp`` /
+                # ``_K_IComp`` rows would mix dtypes and crash. Cast back
+                # to the cache's storage dtype so all rows stay uniform.
+                new_C_row = new_C.unsqueeze(1).to(self.dtype)     # [B, 1, c]
+                new_K_I_row = new_K_I.unsqueeze(1).to(self.dtype) # [B, 1, c_I]
                 if self._C_comp is None:
                     self._C_comp = new_C_row
                     self._K_IComp = new_K_I_row
@@ -1064,7 +1069,10 @@ class HCADecodingCache:
                 C_block = torch.cat(self._acc_C, dim=1)              # [B, m2, c]
                 Z_block = torch.cat(self._acc_Z, dim=1)
                 new_C = _hca_compress_kv_single(C_block, Z_block, B_pos)  # [B, c]
-                new_C_row = new_C.unsqueeze(1)                       # [B, 1, c]
+                # P0-4 fix: ``_hca_compress_kv_single`` returns fp32/fp64
+                # (compute_dtype) even when the cache stores fp16. Cast back
+                # to ``self.dtype`` so ``torch.cat`` doesn't mix dtypes.
+                new_C_row = new_C.unsqueeze(1).to(self.dtype)        # [B, 1, c]
                 if self._C_comp is None:
                     self._C_comp = new_C_row
                 else:

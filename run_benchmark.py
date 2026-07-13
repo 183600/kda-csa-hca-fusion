@@ -31,6 +31,7 @@ import os
 import statistics
 import sys
 import time
+import zlib
 
 import torch
 
@@ -54,6 +55,23 @@ def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
     # keyed on (op, T) so the same T always sees the same inputs across runs.
     t = torch.randn(*shape, device=device, dtype=dtype, generator=generator)
     return t * scale
+
+
+def _make_op_gen(op_name, T, device):
+    """Build a seeded ``torch.Generator`` keyed on (op_name, T).
+
+    P0-2 fix: the previous implementation used ``hash(op_name)``, which
+    CPython randomizes per-process via PYTHONHASHSEED (default on since
+    Python 3.3). That made the "same (op, T) pair produces same inputs"
+    contract in the docstring silently false — two runs got different
+    seeds and therefore different inputs, defeating the determinism
+    goal. We switch to ``zlib.crc32`` which is a stable, process-
+    independent hash of the byte string, so the seed is reproducible
+    without any env-var cooperation.
+    """
+    name_hash = zlib.crc32(op_name.encode('utf-8')) & 0xFFFFFFFF
+    t_hash = (T * 2654435761) & 0xFFFFFFFF
+    return torch.Generator(device=device).manual_seed(name_hash ^ t_hash)
 
 
 def _clear_cache(device):
@@ -152,8 +170,7 @@ def bench_softmax_attn(B, T, H, K, V, device):
     # ``torch.randn`` made the median latency drift by a few percent between
     # runs, obscuring real regressions. The seed is deterministic (hash of
     # op name + T) so it is reproducible without needing an env var.
-    gen = torch.Generator(device=device).manual_seed(
-        (hash('softmax') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    gen = _make_op_gen('softmax', T, device)
     q = _rand(B, T, H, K, device=device, generator=gen)
     k = _rand(B, T, H, K, device=device, generator=gen)
     v = _rand(B, T, H, V, device=device, generator=gen)
@@ -181,8 +198,7 @@ def bench_softmax_attn(B, T, H, K, V, device):
 
 def bench_kda_recurrent(B, T, H, K, V, device):
     # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
-    gen = torch.Generator(device=device).manual_seed(
-        (hash('kda_rec') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    gen = _make_op_gen('kda_rec', T, device)
     q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
     k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
     v = _rand(B, T, H, V, device=device, generator=gen)
@@ -197,8 +213,7 @@ def bench_kda_recurrent(B, T, H, K, V, device):
 
 def bench_kda_chunk(B, T, H, K, V, device):
     # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
-    gen = torch.Generator(device=device).manual_seed(
-        (hash('kda_chunk') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    gen = _make_op_gen('kda_chunk', T, device)
     q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
     k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
     v = _rand(B, T, H, V, device=device, generator=gen)
@@ -241,8 +256,7 @@ def bench_csa(B, T, d, device):
     m, topk = 8, 4
     nh, c, dc, nIh, cI = 4, 16, 32, 2, 8
     # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
-    gen = torch.Generator(device=device).manual_seed(
-        (hash('csa') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    gen = _make_op_gen('csa', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
@@ -267,8 +281,7 @@ def bench_csa(B, T, d, device):
 def bench_hca(B, T, d, device):
     m2, nh, c, dc = 16, 4, 16, 32
     # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
-    gen = torch.Generator(device=device).manual_seed(
-        (hash('hca') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    gen = _make_op_gen('hca', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
         m2=m2, nh=nh, c=c, dc=dc,
@@ -288,8 +301,7 @@ def bench_hca(B, T, d, device):
 
 def bench_hybrid(B, T, d, device):
     # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
-    gen = torch.Generator(device=device).manual_seed(
-        (hash('hybrid') & 0xFFFFFFFF) ^ (T * 2654435761 & 0xFFFFFFFF))
+    gen = _make_op_gen('hybrid', T, device)
     cfg = HybridConfig(
         d_model=d, n_heads_qk=2, n_heads_v=2,
         head_dim_k=16, head_dim_v=16,
