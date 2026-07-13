@@ -31,7 +31,7 @@ What this runner does
 Environment knobs (set before importing / via ``os.environ``):
   * ``MQAR_SEEDS``      (default 5)   — seeds for the MQAR experiment.
   * ``MQAR_STEPS``      (default 200) — training steps for non-softmax ops.
-  * ``MQAR_SOFTMAX_STEPS`` (default 500) — extra steps for the softmax baseline.
+  * ``MQAR_SOFTMAX_STEPS`` (default: same as MQAR_STEPS) — optional explicitly labelled softmax long-training sensitivity run.
   * ``ABL_SEEDS``       (default 7)   — seeds for the ablation (run_all(seeds=...) overrides).
   * ``ABL_STEPS``       (default 100) — training steps for the ablation.
   * ``SKIP_SLOW``       (default 0)   — if "1", skip CSA-heavy experiments on CPU.
@@ -293,7 +293,10 @@ def run_all(seeds=None, steps=None):
             # defeating the whole point of SKIP_SLOW on CPU.
             os.environ['MQAR_SEEDS'] = '3'
             os.environ['MQAR_STEPS'] = '100'
-            os.environ['MQAR_SOFTMAX_STEPS'] = '200'
+            # Keep the primary comparison fair even in the reduced CPU run.
+            # A longer softmax-only sensitivity run must be requested
+            # explicitly by the caller, not silently enabled here.
+            os.environ['MQAR_SOFTMAX_STEPS'] = '100'
         summary['runs'].append(_run('exp4_mqar', run_quality.main))
 
         # 6. Ablation — multi-seed.

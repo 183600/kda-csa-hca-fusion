@@ -935,7 +935,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     }
 
 
-def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=500,
+def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                      device='cpu', **kw):
     """Train ``op_name`` over ``n_seeds`` seeds.
 
@@ -1129,9 +1129,11 @@ def main():
     # already used for BENCH_REPEATS / BENCH_LENGTHS in run_benchmark.py.
     n_seeds = parse_int_env('MQAR_SEEDS', 5, min_value=1, logger=logger)
     steps = parse_int_env('MQAR_STEPS', 200, min_value=1, logger=logger)
-    # Softmax gets more steps to actually converge (original paper's 100 left
-    # it at ~10%, barely above 6.25% chance — a useless upper bound).
-    softmax_steps = parse_int_env('MQAR_SOFTMAX_STEPS', 500, min_value=1,
+    # Fair primary comparison: every operator receives the same optimizer-step
+    # budget by default. MQAR_SOFTMAX_STEPS remains available for an explicitly
+    # labelled convergence/long-training sensitivity run, but no method is
+    # advantaged in the default result table.
+    softmax_steps = parse_int_env('MQAR_SOFTMAX_STEPS', steps, min_value=1,
                                   logger=logger)
     logger.info(f'  n_seeds       : {n_seeds}')
     logger.info(f'  steps         : {steps}  (softmax: {softmax_steps})')
@@ -1438,10 +1440,17 @@ def main():
     # summary on a fully-red experiment. Returning 1 forces the failure to
     # propagate to ``run_all``'s summary and exit code.
     n_errors = sum(1 for r in all_results if 'error' in r)
-    if n_errors:
+    n_incomplete = sum(
+        1 for r in all_results
+        if 'error' not in r
+        and r.get('n_seeds_ok', n_seeds) != r.get('n_seeds', n_seeds)
+    )
+    if n_errors or n_incomplete:
         logger.error(
-            f'\n[P0-2] {n_errors}/{len(all_results)} ops errored out. '
-            f'Returning non-zero so run_all records this experiment as failed.')
+            f'\n[P0-2] {n_errors}/{len(all_results)} ops errored and '
+            f'{n_incomplete}/{len(all_results)} have incomplete seed sets. '
+            'Returning non-zero to prevent survivor-only aggregates from '
+            'being treated as a successful experiment.')
         return 1
     return 0
 

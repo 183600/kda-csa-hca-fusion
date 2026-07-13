@@ -14,13 +14,12 @@ Kaggle / review-driven additions (address reviewer concerns):
     mean +/- CI95 reported. The original paper's single-seed table had
     3:1:1=0.078 vs chance=0.0625 — within noise. Multi-seed makes the
     comparison statistically meaningful (or honestly shows it is not).
-  * **More training steps.** The original 25 steps was far too few for the
-    deeper 4:1:1 (6-layer) model to converge, which likely explains its
-    anomalously low 0.031 score. We use 100+ steps and report convergence
-    curves.
-  * **Controlled parameter count.** We report ``n_params`` per ratio and add
-    a note when ratios have different depths (e.g. 4:1:1 = 6 layers vs
-    3:1:1 = 5 layers), so the comparison is honest about depth confounds.
+  * **More training steps.** The original 25 steps was too short for reliable
+    convergence. We use 100+ steps and report convergence curves.
+  * **Controlled depth.** Every ratio now contains exactly five layers, so
+    ratio effects are no longer confounded with 3/4/5/6-layer model depth.
+    ``n_params`` is still reported because operator types have different
+    parameter counts.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available.
 """
 
@@ -467,7 +466,19 @@ def main():
                 f"ABL_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} must be "
                 f"< SEQ_LEN={SEQ_LEN} (need room for the cue token at the end).")
     logger.info(f'  n_seeds={n_seeds}, steps={steps}, n_kv={n_kv_list}')
-    ratios = [(3, 1, 1), (4, 1, 1), (2, 1, 1), (1, 1, 1), (3, 0, 1), (3, 1, 0), (0, 1, 1)]
+    # Controlled-depth ablation: every layout has exactly five layers.
+    # The previous sweep mixed 3-, 4-, 5- and 6-layer models, so changes in
+    # accuracy/latency could not be attributed to the operator ratio rather
+    # than depth and parameter count. Parameter counts still differ slightly
+    # by operator type and remain reported, but the largest confound is gone.
+    ratios = [
+        (3, 1, 1),
+        (4, 1, 0), (4, 0, 1),
+        (2, 2, 1), (2, 1, 2),
+        (1, 3, 1), (1, 1, 3),
+    ]
+    if any(sum(r) != 5 for r in ratios):
+        raise AssertionError('ablation layouts must all have total depth 5')
     # Bonferroni correction: we run len(ratios) * len(n_kv_list) one-sample
     # t-tests vs chance at alpha=0.05 each. Without correction the
     # family-wise false-positive rate inflates to ~1-(1-0.05)^(n_tests)
@@ -623,12 +634,9 @@ def main():
     print(f"{'':>4} | {'chance':>8} | {'':>22} | {'':>6} | {'':>8} | "
           f"{1.0/VOCAB:>10.4f} | {'':>10} | {'':>12} | {'':>8}")
 
-    # Honest note about depth confound
-    logger.info('\nNote on the 4:1:1 anomaly:')
-    logger.info('  4:1:1 has 6 layers vs 3:1:1 has 5 layers. At a fixed step budget')
-    logger.info('  the deeper model needs more steps to converge, so a low 4:1:1')
-    logger.info('  score reflects under-training, not necessarily a worse structure.')
-    logger.info('  See the per-seed trajectories in the JSON for convergence evidence.')
+    logger.info('\nControlled-depth design: all reported ratios contain 5 layers.')
+    logger.info('  Parameter counts can still differ by operator type and are reported;')
+    logger.info('  interpret ratio effects together with n_params and paired seed data.')
 
     # P4 fix — statistical-validity summary. The issue flagged that the
     # ablation had (a) only 3 seeds, (b) accuracies near chance, and
@@ -719,10 +727,17 @@ def main():
     # ``status='fail'`` instead of silently treating a partial run as success.
     # Mirrors the fix in run_quality.py::main and run_benchmark.py::main.
     n_errors = sum(1 for r in all_results if 'error' in r)
-    if n_errors:
+    n_incomplete = sum(
+        1 for r in all_results
+        if 'error' not in r
+        and r.get('n_seeds_ok', n_seeds) != r.get('n_seeds', n_seeds)
+    )
+    if n_errors or n_incomplete:
         logger.error(
-            f'\n[P0-2] {n_errors}/{len(all_results)} layouts errored out. '
-            f'Returning non-zero so run_all records this experiment as failed.')
+            f'\n[P0-2] {n_errors}/{len(all_results)} layouts errored and '
+            f'{n_incomplete}/{len(all_results)} have incomplete seed sets. '
+            'Returning non-zero to prevent survivor-only aggregates from '
+            'being treated as a successful experiment.')
         return 1
     return 0
 

@@ -197,9 +197,14 @@ def _measure(fn, repeats, device):
         # libraries, but pinning via the torch APIs is the authoritative
         # step).
         _prev_threads = torch.get_num_threads()
-        _prev_interop = torch.get_num_interop_threads()
+        # Do NOT call set_num_interop_threads here. PyTorch permits changing
+        # the inter-op pool only once and only before parallel work starts;
+        # doing it for every operator made the second CPU measurement fail
+        # with "cannot set number of interop threads after parallel work has
+        # started". main() pins that process-global setting once, before any
+        # benchmark factory or warmup runs. Intra-op threads may be adjusted
+        # around each measurement and safely restored.
         torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
         try:
             times = []
             for _ in range(repeats):
@@ -209,7 +214,6 @@ def _measure(fn, repeats, device):
                 times.append(t1 - t0)
         finally:
             torch.set_num_threads(_prev_threads)
-            torch.set_num_interop_threads(_prev_interop)
         peak_mb = None  # CPU peak memory is not reliably measurable
         # BQ4 fix (CPU path): stash min/max/std too.
         _LAST_TIMING_STATS['times'] = list(times)
@@ -403,6 +407,8 @@ def bench_hybrid(B, T, d, device):
 
 
 def main():
+    # configure_torch_for_device() pins the process-global inter-op pool once,
+    # before benchmark work starts. _measure() must never change it per op.
     info = configure_torch_for_device()
     device = info.device
     logger.info('=' * 70)

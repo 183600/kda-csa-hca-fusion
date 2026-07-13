@@ -147,7 +147,7 @@ Environment knobs (set before launching):
 |---|---|---|
 | `MQAR_SEEDS` | `5` | seeds for Exp 4 |
 | `MQAR_STEPS` | `200` | training steps for non-softmax ops in Exp 4 |
-| `MQAR_SOFTMAX_STEPS` | `500` | extra steps for the softmax baseline (see *Fairness notes* below) |
+| `MQAR_SOFTMAX_STEPS` | same as `MQAR_STEPS` | optional explicitly labelled softmax long-training sensitivity run |
 | `ABL_SEEDS` | `7` | seeds for Exp 5 |
 | `ABL_STEPS` | `100` | training steps for Exp 5 |
 | `BENCH_LENGTHS` | `128,256,512,1024,2048` | sequence lengths for Exp 2 |
@@ -227,14 +227,12 @@ get the metadata, or rely on the `_OP_BOUNDARY_FALLBACK` mapping in
 
 ### 2. Softmax baseline training steps (Exp 4)
 
-The softmax-attention baseline is given **500 training steps** while the
-other operators get **200 steps**. This is intentional: with the original
-100 steps the softmax baseline plateaued at ~10% accuracy (barely above the
-6.25% chance level for vocab=16), making it a useless upper bound. The
-extra steps let softmax actually converge so the comparison is meaningful.
-The per-seed `steps` field in `results/exp4_mqar.json` records the actual
-step count used; the `softmax_steps` env var is also logged. Any summary
-table that reports cross-op accuracy must annotate this asymmetry.
+The primary comparison gives **every operator the same optimizer-step
+budget** (`MQAR_STEPS`, default 200). This avoids advantaging softmax with
+extra optimization. Because softmax may converge more slowly, an optional
+sensitivity run can explicitly set `MQAR_SOFTMAX_STEPS` to a larger value;
+such a run is not a fixed-budget comparison and must be labelled separately.
+The per-seed `steps` field records the actual budget used.
 
 ### 3. MQAR statistical power (Exp 4)
 
