@@ -442,20 +442,22 @@ def csa_lightning_indexer(
             "implementation of DeepSeek-V4's contrastive auxiliary loss "
             "on the indexer selection logits. Use 'topk_columns' (the "
             "default, simplified STE) or 'full_softmax' (dense STE) for now.")
+    # P0-2 fix (round 1): scale-selection policy.
+    #   * If the caller explicitly passed a scale, honour it (backward
+    #     compatibility with any external code pinning a temperature).
+    #   * Otherwise, when ``normalize_qk=True``, scores are cosine
+    #     similarities in [-1,1] and the canonical temperature is 1.0.
+    #     Using 1/sqrt(c_I) (the un-normalized default) over-shrinks ReLU
+    #     scores and makes the STE softmax nearly uniform, damping the
+    #     straight-through gradient by ~sqrt(c_I) and systematically
+    #     slowing indexer learning.
+    #   * Otherwise (normalize_qk=False, the historical default) fall
+    #     back to the classical 1/sqrt(c_I) dot-product scale.
     if scale is None:
-        scale = q_idx.shape[-1] ** -0.5
-    # P0-2 fix (round 1): when the caller has L2-normalized both q_idx and
-    # k_idx (normalize_qk=True), scores are cosine similarities in [-1, 1]
-    # and the ``1/sqrt(c_I)`` factor — a leftover from un-normalized
-    # dot-product attention — over-shrinks the ReLU scores and (critically
-    # for the STE training path) makes the softmax over-compressed blocks
-    # nearly uniform. That damps the straight-through gradient flowing
-    # back to W_IUQ / W_w / W_KV_idx / W_Z_idx / B_idx by a factor of
-    # ~sqrt(c_I), systematically slowing indexer learning. Use scale=1.0
-    # for the cosine case (matching naive_csa's core-attention scale
-    # convention, which already defaults to 1.0 for L2-normalized q/C).
-    if normalize_qk:
-        scale = 1.0
+        if normalize_qk:
+            scale = 1.0
+        else:
+            scale = q_idx.shape[-1] ** -0.5
     B_, T, HI, DI = q_idx.shape
     n_blocks = k_idx.shape[1]
     compute_dtype = torch.float64 if q_idx.dtype == torch.float64 else torch.float

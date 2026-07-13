@@ -4374,10 +4374,17 @@ def test_prefill_flops_kch_output_projections(device='cpu'):
           d * (2 * H * kda_k + kda_hv * kda_v + kda_k + kda_hv)
         + kda_k * kda_hv * kda_k
     )
+    # P0-1 fix (round 1): KDA prefill FLOPs now also include the depthwise
+    # short-conv (nn.Conv1d groups=d, ksize=3) applied before the q/k/v
+    # projections. The test's "proj_no_out + recurrent" baseline must include
+    # this term too, otherwise the subtraction below under-counts and the
+    # "output projection residual" test spuriously fails.
+    ksize = p.get('kda_conv_ksize', 3)
+    short_conv = 2 * T * d * ksize
     recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
     expected_kda_out = 2 * T * kda_hv * kda_v * d
     actual_kda = prefill_flops('kda', T)
-    kda_ok = (actual_kda - (proj_no_out + recurrent)) == expected_kda_out
+    kda_ok = (actual_kda - (proj_no_out + short_conv + recurrent)) == expected_kda_out
 
     # CSA/HCA are covered in the full formula tests above; here we also make
     # their totals explicitly sensitive to a positive output-projection term.
