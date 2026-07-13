@@ -639,18 +639,28 @@ def main():
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
     min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
                         if 'error' not in r), default=0)
-    # A result is "near chance" if mean_acc < 1.5x the chance level.
+    # P1-3 fix (round 4): split "near chance" from "far below chance".
+    # See run_quality.py for the rationale: a far-below-chance op indicates a
+    # broken recipe rather than weak statistical power.
+    _c = 1.0 / VOCAB
     near_chance = [r for r in all_results
                    if 'error' not in r
                    and r.get('mean_acc') is not None
-                   and r['mean_acc'] < 1.5 * (1.0 / VOCAB)]
+                   and 0.5 * _c < r['mean_acc'] < 1.5 * _c]
+    far_below = [r for r in all_results
+                 if 'error' not in r
+                 and r.get('mean_acc') is not None
+                 and r['mean_acc'] <= 0.5 * _c]
     conclusions_valid = (n_seeds >= 5 and min_seeds_ok >= 5
-                         and n_any_sig > 0 and len(near_chance) < len(all_results) // 2)
+                         and n_any_sig > 0
+                         and len(near_chance) < len(all_results) // 2
+                         and len(far_below) == 0)
     logger.info('\n' + '=' * 70)
-    logger.info('Statistical validity summary (P4 fix):')
+    logger.info('Statistical validity summary (P4 + P1-3 fix):')
     logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
     logger.info(f'  ratios with significant_bonferroni=True: {n_any_sig}/{len(all_results)}')
-    logger.info(f'  ratios near chance (<1.5x): {len(near_chance)}/{len(all_results)}')
+    logger.info(f'  ratios near chance (0.5x-1.5x): {len(near_chance)}/{len(all_results)}')
+    logger.info(f'  ratios far below chance (<=0.5x): {len(far_below)}/{len(all_results)}')
     logger.info(f'  conclusions_valid: {conclusions_valid}')
     if not conclusions_valid:
         logger.warning(

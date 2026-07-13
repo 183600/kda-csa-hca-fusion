@@ -1305,18 +1305,34 @@ def main():
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
     min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
                         if 'error' not in r), default=0)
-    # A result is "near chance" if mean_acc < 1.5x the chance level.
+    # P1-3 fix (round 4): split "near chance" (slightly above chance, not yet
+    # significant) from "far below chance" (training diverged / recipe broken).
+    # The previous single threshold ``< 1.5 * chance`` lumped 0-3% accuracy
+    # (systematically wrong) together with 7-9% accuracy (weakly above chance),
+    # which let a broken op pass as "just near chance" and only flipped
+    # conclusions_valid when >= half the rows were in that bucket.
+    #   * near_chance:   0.5*chance < acc < 1.5*chance  (statistically ~chance)
+    #   * far_below_chance: acc <= 0.5*chance           (training/recipe broken)
+    # Any far_below row forces conclusions_valid=False regardless of other
+    # counts, since it indicates a real problem rather than weak power.
     near_chance = [r for r in all_results
                    if 'error' not in r
                    and r.get('mean_acc') is not None
-                   and r['mean_acc'] < 1.5 * chance]
+                   and 0.5 * chance < r['mean_acc'] < 1.5 * chance]
+    far_below = [r for r in all_results
+                 if 'error' not in r
+                 and r.get('mean_acc') is not None
+                 and r['mean_acc'] <= 0.5 * chance]
     conclusions_valid = (n_seeds >= 5 and min_seeds_ok >= 5
-                         and n_any_sig > 0 and len(near_chance) < len(all_results) // 2)
+                         and n_any_sig > 0
+                         and len(near_chance) < len(all_results) // 2
+                         and len(far_below) == 0)
     logger.info('\n' + '=' * 70)
-    logger.info('Statistical validity summary (P1-1 fix):')
+    logger.info('Statistical validity summary (P1-1 + P1-3 fix):')
     logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
     logger.info(f'  ops with significant_bonferroni=True: {n_any_sig}/{len(all_results)}')
-    logger.info(f'  ops near chance (<1.5x): {len(near_chance)}/{len(all_results)}')
+    logger.info(f'  ops near chance (0.5x-1.5x): {len(near_chance)}/{len(all_results)}')
+    logger.info(f'  ops far below chance (<=0.5x): {len(far_below)}/{len(all_results)}')
     logger.info(f'  conclusions_valid: {conclusions_valid}')
     if not conclusions_valid:
         logger.warning(
