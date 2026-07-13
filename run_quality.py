@@ -560,7 +560,12 @@ class KDAAttn(nn.Module):
         self.q = nn.Linear(d_model, H * K, bias=False)
         self.k = nn.Linear(d_model, H * K, bias=False)
         self.v = nn.Linear(d_model, H * V, bias=False)
-        self.g = nn.Linear(d_model, H * K, bias=False)
+        # Match KDAHybridLayer's low-rank gate parameterization: d -> K -> H*K.
+        # The previous direct d -> H*K gate made standalone Exp4 KDA use a
+        # different operator boundary than the hybrid KDA layer and the Exp3
+        # FLOPs formula, silently confounding cross-experiment comparisons.
+        self.g_down = nn.Linear(d_model, K, bias=False)
+        self.g_up = nn.Linear(K, H * K, bias=False)
         self.beta = nn.Linear(d_model, H, bias=False)
         self.o = nn.Linear(H * V, d_model, bias=False)
         self.H, self.K, self.V = H, K, V
@@ -575,9 +580,11 @@ class KDAAttn(nn.Module):
         q = F.normalize(F.silu(self.q(x)).view(B, T, self.H, self.K), dim=-1)
         k = F.normalize(F.silu(self.k(x)).view(B, T, self.H, self.K), dim=-1)
         v = F.silu(self.v(x)).view(B, T, self.H, self.V)
-        # log-space gate: low-rank down/up with a softplus-style decay.
+        # Log-space gate: low-rank down/up with a softplus-style decay,
+        # matching ops_fused.KDAHybridLayer and run_kv_cache.prefill_flops.
         # Uses the named DECAY_SCALE constant so all KDA instantiations agree.
-        g = -F.softplus(self.g(x)).view(B, T, self.H, self.K) * self.DECAY_SCALE
+        g = -F.softplus(self.g_up(self.g_down(x))).view(
+            B, T, self.H, self.K) * self.DECAY_SCALE
         beta = torch.sigmoid(self.beta(x))
         out, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return self.o(out.reshape(B, T, self.H * self.V))

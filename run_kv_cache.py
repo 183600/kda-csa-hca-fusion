@@ -255,13 +255,16 @@ def prefill_flops(op: str, T: int, **kw):
     i.e. ~3 * HV*K*V MACs per step (the dominant terms), or
     ~6 * T * HV*K*V FLOPs total. The previous formula used
     ``2 * T * HV*K*V``, a ~3x underestimate. We also include the input
-    projection FLOPs (q/k/v/g/beta) for parity with CSA/HCA, whose
-    ``compress`` term already includes the input projection.
+    projection FLOPs (q/k/v/g/beta plus the grouped output projection) for
+    parity with CSA/HCA and the softmax baseline.
 
     For CSA, the ``compress`` term previously counted only ``W_aKV``
     (one ``T*d*c`` projection). The actual implementation
     (``ops_csa.py::naive_csa``) does SIX input projections:
     ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx``. We count all six.
+    We also count each operator's grouped output projection (KDA ``o_proj``,
+    CSA/HCA ``o_proj``), so Exp3's "single-layer FLOPs" boundary matches
+    Exp2's end-to-end standalone CSA/HCA boundary and the softmax baseline.
     """
     p = {**DEFAULTS, **kw}
     H, K, V, d = p['H'], p['K'], p['V'], p['d']
@@ -316,7 +319,10 @@ def prefill_flops(op: str, T: int, **kw):
         )
         # Recurrence: ~3 HV*K*V MACs per step (see docstring).
         recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
-        return proj + recurrent
+        # Grouped output projection: HV*V -> d (matches KDAHybridLayer.o_proj,
+        # run_quality.KDAAttn.o, and run_decoding.KDAAttnDecoding.o).
+        out_proj = 2 * T * kda_hv * kda_v * d
+        return proj + recurrent + out_proj
     if op == 'csa':
         # P1-4 fix: use ceil(T / m) for the logical block count. The
         # FLOPs path does NOT use the ``max(1, ...)`` floor because at
@@ -415,7 +421,11 @@ def prefill_flops(op: str, T: int, **kw):
         # ``csa_nh`` heads (the ``q`` tensor is shared with the sparse
         # branch), NOT ``H``.
         sw = 2 * sw_entries * csa_c * csa_nh * 2
-        return compress + query_proj + indexer + core + sw
+        # Grouped output projection: (csa_nh * csa_c) -> d.
+        # This is part of the standalone CSA layer boundary in run_benchmark.py
+        # and CSAHybridLayer.o_proj, so Exp3 must count it too.
+        out_proj = 2 * T * csa_nh * csa_c * d
+        return compress + query_proj + indexer + core + sw + out_proj
     if op == 'hca':
         # P1-4 fix: same ceil correction as the CSA branch above.
         # FLOPs use the logical block count (no ``max(1, ...)`` floor);
@@ -458,7 +468,10 @@ def prefill_flops(op: str, T: int, **kw):
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
         sw = 2 * sw_entries * hca_c * hca_nh * 2
-        return compress + query_proj + core + sw
+        # Grouped output projection: (hca_nh * hca_c) -> d.
+        # Mirrors HCAHybridLayer.o_proj and the standalone HCA benchmark.
+        out_proj = 2 * T * hca_nh * hca_c * d
+        return compress + query_proj + core + sw + out_proj
     if op == 'hybrid_kch':
         # Mirror the configurable ratio in kv_cache_elements.
         n_kda = p.get('hybrid_n_kda', 3)

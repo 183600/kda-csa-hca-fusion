@@ -300,10 +300,10 @@ just different tie-breaking. The regression tests
 
 `run_kv_cache.py` computes KV-bytes and FLOPs from closed-form formulas
 (derived from the operator definitions, with corrections for ceil-block
-counts, causal entries, projection terms, and the incremental CSA/HCA runtime
-state such as partial-token accumulators, fixed sliding-window ring-buffer
-capacity, and CSA overlap state). They are **not** measured from a real forward
-pass. The unit tests in `run_correctness.py`
+counts, causal entries, input **and grouped output** projection terms, and the
+incremental CSA/HCA runtime state such as partial-token accumulators, fixed
+sliding-window ring-buffer capacity, and CSA overlap state). They are **not**
+measured from a real forward pass. The unit tests in `run_correctness.py`
 (`test_prefill_flops_*`, `test_kv_cache_ceil_block_count`) verify the
 formulas against hand-computed expected values; for production claims,
 cross-check with `torch.cuda.memory_allocated` and a FLOP counter.

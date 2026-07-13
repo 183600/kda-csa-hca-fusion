@@ -4124,9 +4124,14 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
         sw = 2 * sw_entries * csa_c * csa_nh * 2
+        # Output projection: (csa_nh * csa_c) -> d, part of the
+        # end-to-end single-layer FLOPs boundary.
+        out_proj = 2 * T * csa_nh * csa_c * d
 
-        expected_correct = compress + query_proj + indexer_correct + core + sw
-        expected_broken = compress + query_proj + indexer_broken + core + sw
+        expected_correct = (
+            compress + query_proj + indexer_correct + core + sw + out_proj)
+        expected_broken = (
+            compress + query_proj + indexer_broken + core + sw + out_proj)
         actual = prefill_flops('csa', T)
 
         match = actual == expected_correct
@@ -4160,9 +4165,12 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
         sw = 2 * sw_entries * hca_c * hca_nh * 2
+        # Output projection: (hca_nh * hca_c) -> d, part of the
+        # end-to-end single-layer FLOPs boundary.
+        out_proj = 2 * T * hca_nh * hca_c * d
 
-        expected_correct = compress + query_proj + core_correct + sw
-        expected_broken = compress + query_proj + core_broken + sw
+        expected_correct = compress + query_proj + core_correct + sw + out_proj
+        expected_broken = compress + query_proj + core_broken + sw + out_proj
         actual = prefill_flops('hca', T)
 
         match = actual == expected_correct
@@ -4329,8 +4337,8 @@ def test_prefill_flops_softmax_gqa_projections(device='cpu'):
     expected_proj = 2 * T * d * (2 * H * K + H * V) + 2 * T * H * V * d
     diff_matches = (actual - core_only) == expected_proj
 
-    # Sanity: with the fix, KDA/GQA ratio at T=512 should be < 1.0 (KDA is
-    # cheaper). The broken version (core-only GQA) gave ~26x.
+    # Sanity: with the fix, KDA/GQA ratio at T=512 should be finite and not
+    # the pre-fix 26x core-only-denominator artifact.
     kda = prefill_flops('kda', T)
     ratio = kda / actual
     ratio_sane = ratio < 5.0  # definitely not the broken 26x
@@ -4338,8 +4346,105 @@ def test_prefill_flops_softmax_gqa_projections(device='cpu'):
     return [_ok(
         'softmax_gqa includes input/output projections',
         includes_proj and diff_matches and ratio_sane,
-        f'actual={actual}, core_only={core_only}, proj_diff={actual - core_only}, '
-        f'expected_proj={expected_proj}, kda/gqa_ratio={ratio:.4f}x')]
+        f'actual={actual}, core_only={core_only}, '
+        f'proj_diff={actual - core_only}, expected_proj={expected_proj}, '
+        f'kda/gqa_ratio={ratio:.4f}x')]
+
+
+def test_prefill_flops_kch_output_projections(device='cpu'):
+    """Regression: Exp3 KDA/CSA/HCA FLOPs must include output projections.
+
+    Exp3 advertises an end-to-end single-layer FLOPs boundary for the
+    standalone operators. ``run_benchmark.py`` already times CSA/HCA with the
+    grouped output projection, and KDA/CSA/HCA modules all apply an ``o`` /
+    ``o_proj`` after the attention core. Omitting these terms undercounts the
+    numerator of ``flops_ratio_vs_gqa_*`` (and, for the hybrid, multiplies the
+    omission by the layer ratio).
+    """
+    logger.info("Test: prefill_flops includes KDA/CSA/HCA output projections")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from run_kv_cache import prefill_flops, DEFAULTS
+
+    p = {**DEFAULTS}
+    H, d = p['H'], p['d']
+    kda_hv, kda_k, kda_v = p['kda_hv'], p['kda_k'], p['kda_v']
+    T = 512
+
+    proj_no_out = 2 * T * (
+          d * (2 * H * kda_k + kda_hv * kda_v + kda_k + kda_hv)
+        + kda_k * kda_hv * kda_k
+    )
+    recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
+    expected_kda_out = 2 * T * kda_hv * kda_v * d
+    actual_kda = prefill_flops('kda', T)
+    kda_ok = (actual_kda - (proj_no_out + recurrent)) == expected_kda_out
+
+    # CSA/HCA are covered in the full formula tests above; here we also make
+    # their totals explicitly sensitive to a positive output-projection term.
+    csa = prefill_flops('csa', T)
+    hca = prefill_flops('hca', T)
+    csa_out = 2 * T * p['csa_nh'] * p['csa_c'] * d
+    hca_out = 2 * T * p['hca_nh'] * p['hca_c'] * d
+    csa_ok = csa > csa_out and csa_out > 0
+    hca_ok = hca > hca_out and hca_out > 0
+
+    return [
+        _ok('KDA prefill_flops includes output projection', kda_ok,
+            f'actual={actual_kda}, expected_out_proj={expected_kda_out}'),
+        _ok('CSA prefill_flops contains positive output projection term', csa_ok,
+            f'total={csa}, out_proj={csa_out}'),
+        _ok('HCA prefill_flops contains positive output projection term', hca_ok,
+            f'total={hca}, out_proj={hca_out}'),
+    ]
+
+
+def test_standalone_kda_gate_matches_hybrid(device='cpu'):
+    """Standalone Exp4/Exp6 KDA wrappers must use the hybrid low-rank gate.
+
+    ``run_kv_cache.prefill_flops('kda')`` and ``ops_fused.KDAHybridLayer`` count
+    / implement the paper-style low-rank gate ``d -> K -> HV*K``. The standalone
+    MQAR and decoding wrappers used to instantiate a direct ``d -> H*K`` gate,
+    contradicting their own comments and making Exp4/Exp6 use a different KDA
+    operator boundary from Exp3 and the hybrid ablation.
+    """
+    logger.info("Test: standalone KDA gate parameterization matches hybrid")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from run_quality import KDAAttn
+    from run_decoding import KDAAttnDecoding
+
+    d_model, H, K, V = 32, 2, 16, 16
+    quality = KDAAttn(d_model, H=H, K=K, V=V).to(device)
+    decoding = KDAAttnDecoding(d_model, H=H, K=K, V=V).to(device)
+
+    def _gate_ok(m):
+        return (
+            hasattr(m, 'g_down') and hasattr(m, 'g_up')
+            and not hasattr(m, 'g')
+            and m.g_down.in_features == d_model
+            and m.g_down.out_features == K
+            and m.g_up.in_features == K
+            and m.g_up.out_features == H * K
+        )
+
+    x = torch.randn(2, 4, d_model, device=device) * 0.1
+    with torch.no_grad():
+        y_quality = quality(x)
+        decoding.reset()
+        y_decoding = decoding(x)
+    shape_ok = (y_quality.shape == x.shape and y_decoding.shape == x.shape)
+    finite_ok = (torch.isfinite(y_quality).all().item()
+                 and torch.isfinite(y_decoding).all().item())
+
+    return [
+        _ok('run_quality.KDAAttn uses low-rank gate', _gate_ok(quality),
+            f'attrs={list(dict(quality.named_children()).keys())}'),
+        _ok('run_decoding.KDAAttnDecoding uses low-rank gate', _gate_ok(decoding),
+            f'attrs={list(dict(decoding.named_children()).keys())}'),
+        _ok('standalone KDA wrappers still produce finite outputs',
+            shape_ok and finite_ok,
+            f'y_quality={tuple(y_quality.shape)}, '
+            f'y_decoding={tuple(y_decoding.shape)}'),
+    ]
 
 
 # =============================================================================
@@ -4911,6 +5016,8 @@ def main():
     all_results += _run_safe(test_kv_cache_ceil_block_count, device)
     all_results += _run_safe(test_kv_cache_full_accounting_runtime_state, device)
     all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
+    all_results += _run_safe(test_prefill_flops_kch_output_projections, device)
+    all_results += _run_safe(test_standalone_kda_gate_matches_hybrid, device)
     all_results += _run_safe(test_decoding_batch_size_change, device)
     # Incremental decoding cache tests (ops_decoding_cache.py).
     # These verify the new CSADecodingCache / HCADecodingCache that

@@ -268,7 +268,12 @@ class KDAAttnDecoding(nn.Module):
         self.q = nn.Linear(d_model, H * K, bias=False)
         self.k = nn.Linear(d_model, H * K, bias=False)
         self.v = nn.Linear(d_model, H * V, bias=False)
-        self.g = nn.Linear(d_model, H * K, bias=False)
+        # Match KDAHybridLayer's low-rank gate parameterization: d -> K -> H*K.
+        # The previous direct d -> H*K gate made standalone Exp6 KDA use a
+        # different projection boundary from the hybrid KDA layer and the Exp3
+        # FLOPs formula, biasing latency/FLOPs interpretation.
+        self.g_down = nn.Linear(d_model, K, bias=False)
+        self.g_up = nn.Linear(K, H * K, bias=False)
         self.beta = nn.Linear(d_model, H, bias=False)
         self.o = nn.Linear(H * V, d_model, bias=False)
         # Causal depthwise short-conv (kernel=3) — matches KDAHybridLayer.
@@ -338,10 +343,12 @@ class KDAAttnDecoding(nn.Module):
         q = F.normalize(F.silu(self.q(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
         k = F.normalize(F.silu(self.k(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
         v = F.silu(self.v(x_conv)).view(B, T_new, self.H, self.V)
-        # log-space gate: low-rank down/up with a softplus-style decay.
+        # Log-space gate: low-rank down/up with a softplus-style decay,
+        # matching ops_fused.KDAHybridLayer and run_kv_cache.prefill_flops.
         # Uses self.decay_scale (default 0.1, matching HybridConfig.kda_decay_scale)
         # so all KDA instantiations agree on the magic constant.
-        g = -F.softplus(self.g(x_conv)).view(B, T_new, self.H, self.K) * self.decay_scale
+        g = -F.softplus(self.g_up(self.g_down(x_conv))).view(
+            B, T_new, self.H, self.K) * self.decay_scale
         beta = torch.sigmoid(self.beta(x_conv))
         # Always detach the incoming state so the autograd graph from the
         # previous step is not retained. In training mode this prevents
