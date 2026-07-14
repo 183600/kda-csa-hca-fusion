@@ -149,7 +149,22 @@ def main():
     ds = TinyStoriesLM(tokenizer, seq_len=seq_len, max_samples=20000 if not is_kaggle else 5000)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
-    
+
+    # Mixed precision policy. Kaggle T4 (sm_75) does NOT support BF16; forcing
+    # ``dtype=torch.bfloat16`` there can crash or silently fall back to slow
+    # emulation, invalidating the advertised Kaggle/AutoDL training results.
+    # Use BF16 only when PyTorch reports support, otherwise use FP16 + GradScaler
+    # on CUDA. CPU runs stay in fp32 (autocast disabled).
+    use_amp = device.type == "cuda"
+    if use_amp and torch.cuda.is_bf16_supported():
+        autocast_dtype = torch.bfloat16
+    elif use_amp:
+        autocast_dtype = torch.float16
+    else:
+        autocast_dtype = torch.float32
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and autocast_dtype == torch.float16))
+    print(f"AMP enabled={use_amp}, dtype={autocast_dtype}, grad_scaler={scaler.is_enabled()}")
+
     os.makedirs(args.output_dir, exist_ok=True)
     model.train()
     it = iter(loader)
@@ -174,21 +189,31 @@ def main():
             # Reset recurrent state per micro-batch (fresh independent sequence).
             model.hybrid.reset_state()
 
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                enabled=(device.type == "cuda")):
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype,
+                                enabled=use_amp):
                 out = model(input_ids, labels=labels)
                 raw_loss = out["loss"]
             if raw_loss is None or not torch.isfinite(raw_loss):
                 raise RuntimeError(
                     f"non-finite LM loss at optimizer_step={optimizer_step}, "
                     f"micro_step={micro_step}: {raw_loss}")
-            (raw_loss / grad_accum).backward()
+            scaled_loss = raw_loss / grad_accum
+            if scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             accum_loss += float(raw_loss.detach().item())
             accum_batches += 1
             micro_step += 1
 
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         optimizer_step += 1
