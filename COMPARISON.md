@@ -23,7 +23,7 @@
 
 - 不删除 `ops_kda.py/ops_csa.py/ops_hca.py/ops_fused.py`
 - 新增 `train_lm_autodl.py` (使用HybridKCHAttention)
-- 新增 `run_autodl.sh` 简化脚本
+- 新增 `run_autodl_lm.sh` 简化脚本
 - 更新 README 增加AutoDL章节
 
 这样既保持论文可复现性，又满足<120元训练需求。

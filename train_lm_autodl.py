@@ -13,7 +13,7 @@ implements:
 Cost control: default 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024
 3090 ~1.8 CNY/h * 2h = 3.6 CNY << 120 CNY
 """
-import os, math, time, argparse
+import os, time, argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,17 +49,28 @@ class TinyStoriesLM(Dataset):
         self.tokenizer = tokenizer
 
     def __len__(self): return len(self.texts)
+
     def __getitem__(self, idx):
         text = self.texts[idx]
-        tokens = self.tokenizer.encode(text, truncation=True, max_length=self.seq_len+1)
-        if len(tokens) < self.seq_len+1:
-            tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len+1 - len(tokens))
+        tokens = self.tokenizer.encode(text, truncation=True, max_length=self.seq_len + 1)
+        # Keep the real encoded length BEFORE padding so the loss can ignore
+        # padded target positions. GPT-2 has no native pad token, so callers
+        # set pad_token=eos_token; checking token_id alone would also mask
+        # genuine EOS targets. Length-based masking avoids that bias.
+        real_len = min(len(tokens), self.seq_len + 1)
+        if real_len < self.seq_len + 1:
+            tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len + 1 - real_len)
         else:
-            tokens = tokens[:self.seq_len+1]
-        return {
-            "input_ids": torch.tensor(tokens[:-1], dtype=torch.long),
-            "labels": torch.tensor(tokens[1:], dtype=torch.long)
-        }
+            tokens = tokens[:self.seq_len + 1]
+        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+        labels = torch.tensor(tokens[1:], dtype=torch.long)
+        # labels[j] predicts original token j+1. Positions >= real_len-1 are
+        # padding targets and must not dominate the LM objective.
+        if real_len <= 1:
+            labels[:] = -100
+        elif real_len - 1 < labels.numel():
+            labels[real_len - 1:] = -100
+        return {"input_ids": input_ids, "labels": labels}
 
 class LMWithHybrid(nn.Module):
     def __init__(self, vocab_size, cfg: HybridConfig):
@@ -77,9 +88,15 @@ class LMWithHybrid(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits[:, :-1].contiguous().view(-1, logits.size(-1)),
-                                   labels[:, 1:].contiguous().view(-1),
-                                   ignore_index=-100)
+            # TinyStoriesLM already returns next-token labels aligned with each
+            # input position (input_ids=tokens[:-1], labels=tokens[1:]). The
+            # previous code sliced both tensors again (logits[:, :-1] vs
+            # labels[:, 1:]), causing an off-by-one target: logits at position
+            # t were trained to predict token t+2 instead of t+1, and the first
+            # next-token target was silently dropped. Use the full aligned
+            # tensors and let labels=-100 mask padded targets.
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   labels.reshape(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss}
 
 def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)

@@ -25,6 +25,9 @@ einops>=0.6,<0.9
 matplotlib>=3.5,<3.11
 numpy>=1.21,<2.3
 scipy>=1.7,<1.15
+transformers>=4.36,<5
+datasets>=2.14,<3
+tqdm>=4.60,<5
 # Dev tools (CT9 fix: were missing — only obtainable via ``pip install -e .[dev]``).
 pytest>=7.0,<9.0
 pytest-xdist>=3.0,<5.0

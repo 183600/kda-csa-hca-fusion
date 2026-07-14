@@ -55,6 +55,9 @@ dependencies = [
     # changed the default ``stats.t.ppf`` numerical precision in edge
     # cases.
     "scipy>=1.7,<1.15; python_version >= '3.10'",
+    "transformers>=4.36,<5",
+    "datasets>=2.14,<3",
+    "tqdm>=4.60,<5",
 ]
 
 [project.optional-dependencies]
