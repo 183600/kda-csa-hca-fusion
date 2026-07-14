@@ -13,7 +13,7 @@ implements:
 Cost control: default 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024
 3090/4090 cost remains well below 120 CNY for the default small run
 """
-import os, time, argparse
+import os, time, argparse, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,12 +113,24 @@ def main():
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints_lm")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for model init and DataLoader shuffle.")
     args = parser.parse_args()
 
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
     info = configure_torch_for_device()
     device = info.device
     print(f"Device: {device}, is_kaggle={is_kaggle}")
+
+    # Make LM training runs reproducible. Without an explicit seed, model
+    # initialization and DataLoader shuffling differed across invocations, so
+    # two runs with the same CLI budget could produce different loss curves
+    # and checkpoints. Seed before model construction and pass a dedicated
+    # generator to DataLoader below.
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2") if HAS_HF else None
     if tokenizer is None:
@@ -158,13 +170,16 @@ def main():
 
     print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}, d={cfg.d_model}")
     print(f"Training profile: batch_size={batch_size}, grad_accum={grad_accum}, "
-          f"seq_len={seq_len}, optimizer_steps={max_steps}")
+          f"seq_len={seq_len}, optimizer_steps={max_steps}, seed={args.seed}")
     model = LMWithHybrid(vocab_size, cfg).to(device)
     print(f"Params: {count_params(model)/1e6:.2f}M")
     print(f"Layout: {model.hybrid.layout_str()}")
 
     ds = TinyStoriesLM(tokenizer, seq_len=seq_len, max_samples=20000 if not is_kaggle else 5000)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(args.seed + 1_000_000)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
+                        generator=loader_gen)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
 
     # Mixed precision policy. Kaggle T4 (sm_75) does NOT support BF16; forcing
@@ -245,7 +260,8 @@ def main():
 
         if optimizer_step % 500 == 0:
             torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
-                        "optimizer_step": optimizer_step, "micro_step": micro_step},
+                        "optimizer_step": optimizer_step, "micro_step": micro_step,
+                        "seed": args.seed},
                        os.path.join(args.output_dir, f"step_{optimizer_step}.pt"))
 
     pbar.close()
@@ -255,7 +271,8 @@ def main():
     cost_4090 = elapsed/3600*2.8
     print(f"Cost estimate 3090: {cost_3090:.2f} CNY, 4090: {cost_4090:.2f} CNY << 120 CNY")
     torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
-                "optimizer_step": optimizer_step, "micro_step": micro_step},
+                "optimizer_step": optimizer_step, "micro_step": micro_step,
+                "seed": args.seed},
                os.path.join(args.output_dir, "final_lm.pt"))
 
 if __name__ == "__main__":
