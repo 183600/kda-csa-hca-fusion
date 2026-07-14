@@ -513,7 +513,7 @@ def main():
     n_tests = len(ratios) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests
     # P0-3 fix: use the module-level ``_bonferroni_crit_q`` from run_quality,
-    # which has a proper Cornish-Fisher fallback when scipy is unavailable
+    # which has an exact beta-CDF/bisection fallback when scipy is unavailable
     # (the previous nested implementation returned None and silently zeroed
     # out all significance conclusions). We just detect scipy availability
     # for the log line below.
@@ -524,7 +524,7 @@ def main():
         bonferroni_available = False
     logger.info(f'  {n_tests} one-sample t-tests vs chance; '
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
-                f'(scipy={bonferroni_available}; fallback=Cornish-Fisher)')
+                f'(scipy={bonferroni_available}; fallback=exact-beta-bisection)')
 
     all_results = []
     for n_kv in n_kv_list:
