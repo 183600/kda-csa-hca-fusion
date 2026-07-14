@@ -1,6 +1,6 @@
 #!/bin/bash
 # AutoDL one-click script for the supported LM training entry point.
-# Cost target: <120 CNY (typical 3090/4090 runs are far below this).
+# Cost target: <120 CNY (max_steps counts optimizer steps; typical 3090/4090 small runs are far below this).
 
 set -euo pipefail
 

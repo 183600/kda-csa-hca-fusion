@@ -19,7 +19,7 @@
 | 可训练性 | 仅MQAR小模型分类头训练，无真实LM训练 | 有TinyStories LM训练，支持bf16+compile，适合发论文快速验证 |
 
 ## 最终决策
-保留Gitee核心ops作为金标准，新增 `train_lm_autodl.py` 作为官方LM训练入口，兼顾科研严谨性和AutoDL低成本(实测2h≈3.6元)。
+保留Gitee核心ops作为金标准，新增 `train_lm_autodl.py` 作为官方LM训练入口，兼顾科研严谨性和AutoDL低成本(小模型默认配置通常数小时级)。
 
 - 不删除 `ops_kda.py/ops_csa.py/ops_hca.py/ops_fused.py`
 - 新增 `train_lm_autodl.py` (使用HybridKCHAttention)

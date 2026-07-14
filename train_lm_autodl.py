@@ -11,7 +11,7 @@ implements:
 - Decoding caches (ops_decoding_cache) for efficient long-context
 
 Cost control: default 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024
-3090 ~1.8 CNY/h * 2h = 3.6 CNY << 120 CNY
+3090/4090 cost remains well below 120 CNY for the default small run
 """
 import os, time, argparse
 import torch
@@ -154,47 +154,66 @@ def main():
     model.train()
     it = iter(loader)
     start = time.time()
-    running_loss = 0
-    global_step = 0
-    pbar = tqdm(total=max_steps)
-    for step in range(max_steps):
-        try:
-            batch = next(it)
-        except StopIteration:
-            it = iter(loader)
-            batch = next(it)
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
+    recent_step_losses = []
+    optimizer_step = 0
+    micro_step = 0
+    pbar = tqdm(total=max_steps, desc="optimizer steps")
+    optimizer.zero_grad(set_to_none=True)
+    while optimizer_step < max_steps:
+        accum_loss = 0.0
+        accum_batches = 0
+        for _ in range(grad_accum):
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(loader)
+                batch = next(it)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
 
-        # reset recurrent state per batch (fresh sequence)
-        model.hybrid.reset_state()
+            # Reset recurrent state per micro-batch (fresh independent sequence).
+            model.hybrid.reset_state()
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type=="cuda")):
-            out = model(input_ids, labels=labels)
-            loss = out["loss"] / grad_accum
-        loss.backward()
-        running_loss += loss.item()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=(device.type == "cuda")):
+                out = model(input_ids, labels=labels)
+                raw_loss = out["loss"]
+            if raw_loss is None or not torch.isfinite(raw_loss):
+                raise RuntimeError(
+                    f"non-finite LM loss at optimizer_step={optimizer_step}, "
+                    f"micro_step={micro_step}: {raw_loss}")
+            (raw_loss / grad_accum).backward()
+            accum_loss += float(raw_loss.detach().item())
+            accum_batches += 1
+            micro_step += 1
 
-        if (step+1) % grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            if (step+1)//grad_accum % 10 == 0:
-                print(f"step {step} loss {running_loss/10:.4f}")
-                running_loss = 0
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
+        optimizer_step += 1
+        step_loss = accum_loss / max(1, accum_batches)
+        recent_step_losses.append(step_loss)
         pbar.update(1)
-        if (step+1) % 500 == 0:
-            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size},
-                       os.path.join(args.output_dir, f"step_{step+1}.pt"))
-    
+        pbar.set_postfix({"loss": f"{step_loss:.4f}"})
+
+        if optimizer_step % 10 == 0:
+            print(f"step {optimizer_step} loss {sum(recent_step_losses) / len(recent_step_losses):.4f}")
+            recent_step_losses.clear()
+
+        if optimizer_step % 500 == 0:
+            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
+                        "optimizer_step": optimizer_step, "micro_step": micro_step},
+                       os.path.join(args.output_dir, f"step_{optimizer_step}.pt"))
+
     pbar.close()
     elapsed = time.time() - start
     print(f"Finished in {elapsed/60:.2f} min")
     cost_3090 = elapsed/3600*1.8
     cost_4090 = elapsed/3600*2.8
     print(f"Cost estimate 3090: {cost_3090:.2f} CNY, 4090: {cost_4090:.2f} CNY << 120 CNY")
-    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__},
+    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
+                "optimizer_step": optimizer_step, "micro_step": micro_step},
                os.path.join(args.output_dir, "final_lm.pt"))
 
 if __name__ == "__main__":

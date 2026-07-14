@@ -432,7 +432,7 @@ See `LICENSE`.
 
 ### AutoDL一键运行
 ```bash
-# 3090 1.8元/h 实测2h≈3.6元，4090约5.6元
+# max_steps 表示 optimizer steps；小模型默认配置在3090/4090上成本远低于120元
 pip install -r requirements.txt
 pip install transformers datasets accelerate
 python train_lm_autodl.py --autodl --max_steps 2000 --seq_len 1024 --batch_size 2
@@ -448,9 +448,9 @@ python train_lm_autodl.py --autodl --max_steps 2000 --seq_len 1024 --batch_size 
 ### 成本拆解
 | 阶段 | 时长 3090 | 成本 |
 |---|---|---|
-| Phase1 1024 ctx 2000 steps | 2h | 3.6元 |
-| Phase2 4096 ctx 500 steps | 0.5h | 0.9元 |
-| 总计 | 2.5h | 4.5元 <<120元 |
+| Phase1 1024 ctx 2000 optimizer steps | 数小时级 | 远低于120元 |
+| Phase2 4096 ctx 500 optimizer steps | 视GPU而定 | 远低于120元 |
+| 总计 | 视GPU而定 | <<120元 |
 
 即便放大到 d=512, 12层, 4000 steps，4090 4h ≈ 11元，仍在预算内。
 
