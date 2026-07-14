@@ -105,9 +105,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kaggle", action="store_true")
     parser.add_argument("--autodl", action="store_true")
-    parser.add_argument("--max_steps", type=int, default=2000)
-    parser.add_argument("--seq_len", type=int, default=1024)
-    parser.add_argument("--batch_size", type=int, default=2)
+    # None means "use the environment-specific default". The previous
+    # non-None parser defaults made it impossible to tell whether a user
+    # explicitly overrode a Kaggle setting, while Kaggle ignored the flags
+    # entirely. Apply overrides uniformly after choosing the profile below.
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--seq_len", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints_lm")
     args = parser.parse_args()
 
@@ -136,12 +140,25 @@ def main():
         cfg = HybridConfig(d_model=512, n_heads_qk=4, n_heads_v=4, head_dim_k=64, head_dim_v=64,
                            csa_m=16, csa_topk=8, hca_m2=64, n_kda=3, n_csa=1, n_hca=1,
                            kda_chunk_size=64)
-        batch_size = args.batch_size
+        batch_size = 2
         grad_accum = 4
+        seq_len = 1024
+        max_steps = 2000
+
+    # Apply CLI overrides for BOTH Kaggle and AutoDL/local profiles. Ignoring
+    # ``--max_steps``/``--seq_len`` under ``--kaggle`` silently changed the
+    # requested experiment budget and made reproduced results not match the
+    # command line shown in logs.
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    if args.seq_len is not None:
         seq_len = args.seq_len
+    if args.max_steps is not None:
         max_steps = args.max_steps
 
     print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}, d={cfg.d_model}")
+    print(f"Training profile: batch_size={batch_size}, grad_accum={grad_accum}, "
+          f"seq_len={seq_len}, optimizer_steps={max_steps}")
     model = LMWithHybrid(vocab_size, cfg).to(device)
     print(f"Params: {count_params(model)/1e6:.2f}M")
     print(f"Layout: {model.hybrid.layout_str()}")
