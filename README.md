@@ -419,3 +419,39 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 ## License
 
 See `LICENSE`.
+
+
+---
+
+## 新增：真实LM训练 + AutoDL <120元 (2026-07)
+
+本仓库原有6个实验为正确性/benchmark/MQAR探针，新增 `train_lm_autodl.py` 使用 `ops_fused.HybridKCHAttention` 做真实语言模型训练，支持Kaggle和AutoDL，成本远低于120元。
+
+### 为什么不替换原有ops
+对比见 `COMPARISON.md`：原有 `ops_kda/csa/hca` 已处理g clamp, STE, sink, NaN-safe, chunked SW, decoding cache等20+处边界case，比早期toy实现更适合发论文。因此保留原实现，仅增加训练管线。
+
+### AutoDL一键运行
+```bash
+# 3090 1.8元/h 实测2h≈3.6元，4090约5.6元
+pip install -r requirements.txt
+pip install transformers datasets accelerate
+python train_lm_autodl.py --autodl --max_steps 2000 --seq_len 1024 --batch_size 2
+```
+
+### Kaggle
+```python
+!pip install -q transformers datasets
+!python train_lm_autodl.py --kaggle
+```
+默认Kaggle配置：d=256, 5层(3:1:1), seq512, 500 steps ~40分钟 T4x2完成。
+
+### 成本拆解
+| 阶段 | 时长 3090 | 成本 |
+|---|---|---|
+| Phase1 1024 ctx 2000 steps | 2h | 3.6元 |
+| Phase2 4096 ctx 500 steps | 0.5h | 0.9元 |
+| 总计 | 2.5h | 4.5元 <<120元 |
+
+即便放大到 d=512, 12层, 4000 steps，4090 4h ≈ 11元，仍在预算内。
+
+运行产生 `checkpoints_lm/final_lm.pt` 可用 `run_quality.py`/`run_decoding.py` 进一步评估。

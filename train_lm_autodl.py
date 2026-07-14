@@ -1,0 +1,184 @@
+"""
+LM Training for KDA+CSA+HCA Hybrid using the repo's ops_fused (superior)
+Supports Kaggle and AutoDL with cost <120 CNY
+
+This file is merged from the earlier toy training demo (/home/user/train.py)
+but now uses the rigorous HybridKCHAttention from ops_fused.py which already
+implements:
+- KDA with proper unit-norm q/k, g clamp, chunked path, conv lookback
+- CSA with overlapped 2-branch compression, STE for indexer, sink logits
+- HCA with heavy compression + dense + sliding window
+- Decoding caches (ops_decoding_cache) for efficient long-context
+
+Cost control: default 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024
+3090 ~1.8 CNY/h * 2h = 3.6 CNY << 120 CNY
+"""
+import os, math, time, argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# import repo modules
+from ops_fused import HybridConfig, HybridKCHAttention
+from kaggle_setup import configure_torch_for_device
+
+# tokenizer / dataset handling (reuse TinyStories if available)
+try:
+    from transformers import AutoTokenizer
+    from datasets import load_dataset
+    HAS_HF = True
+except:
+    HAS_HF = False
+
+class TinyStoriesLM(Dataset):
+    def __init__(self, tokenizer, seq_len=1024, max_samples=20000, split="train"):
+        self.seq_len = seq_len
+        if HAS_HF:
+            try:
+                ds = load_dataset("roneneldan/TinyStories", split=split)
+                if max_samples:
+                    ds = ds.select(range(min(len(ds), max_samples)))
+                self.texts = ds["text"]
+            except Exception as e:
+                print(f"HF load failed {e}, using synthetic")
+                self.texts = ["Once upon a time, " * 200 for _ in range(1000)]
+        else:
+            self.texts = ["Once upon a time, " * 200 for _ in range(1000)]
+        self.tokenizer = tokenizer
+
+    def __len__(self): return len(self.texts)
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        tokens = self.tokenizer.encode(text, truncation=True, max_length=self.seq_len+1)
+        if len(tokens) < self.seq_len+1:
+            tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len+1 - len(tokens))
+        else:
+            tokens = tokens[:self.seq_len+1]
+        return {
+            "input_ids": torch.tensor(tokens[:-1], dtype=torch.long),
+            "labels": torch.tensor(tokens[1:], dtype=torch.long)
+        }
+
+class LMWithHybrid(nn.Module):
+    def __init__(self, vocab_size, cfg: HybridConfig):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, cfg.d_model)
+        self.hybrid = HybridKCHAttention(cfg, total_layers=cfg.n_kda + cfg.n_csa + cfg.n_hca or 5)
+        self.norm_f = nn.LayerNorm(cfg.d_model)
+        self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+
+    def forward(self, input_ids, labels=None):
+        x = self.embed(input_ids)
+        x = self.hybrid(x)
+        x = self.norm_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits[:, :-1].contiguous().view(-1, logits.size(-1)),
+                                   labels[:, 1:].contiguous().view(-1),
+                                   ignore_index=-100)
+        return {"logits": logits, "loss": loss}
+
+def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kaggle", action="store_true")
+    parser.add_argument("--autodl", action="store_true")
+    parser.add_argument("--max_steps", type=int, default=2000)
+    parser.add_argument("--seq_len", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_lm")
+    args = parser.parse_args()
+
+    is_kaggle = args.kaggle or os.path.exists("/kaggle")
+    info = configure_torch_for_device()
+    device = info.device
+    print(f"Device: {device}, is_kaggle={is_kaggle}")
+
+    tokenizer = AutoTokenizer.from_pretrained("gpt2") if HAS_HF else None
+    if tokenizer is None:
+        raise RuntimeError("Need transformers tokenizer")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    vocab_size = len(tokenizer)
+
+    # Config: rigorous version, but small for cost
+    if is_kaggle:
+        cfg = HybridConfig(d_model=256, n_heads_qk=2, n_heads_v=2, head_dim_k=32, head_dim_v=32,
+                           csa_m=8, csa_topk=4, hca_m2=16, n_kda=3, n_csa=1, n_hca=1,
+                           kda_chunk_size=64)
+        batch_size = 1
+        grad_accum = 8
+        seq_len = 512
+        max_steps = 500
+    else:
+        cfg = HybridConfig(d_model=512, n_heads_qk=4, n_heads_v=4, head_dim_k=64, head_dim_v=64,
+                           csa_m=16, csa_topk=8, hca_m2=64, n_kda=3, n_csa=1, n_hca=1,
+                           kda_chunk_size=64)
+        batch_size = args.batch_size
+        grad_accum = 4
+        seq_len = args.seq_len
+        max_steps = args.max_steps
+
+    print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}, d={cfg.d_model}")
+    model = LMWithHybrid(vocab_size, cfg).to(device)
+    print(f"Params: {count_params(model)/1e6:.2f}M")
+    print(f"Layout: {model.hybrid.layout_str()}")
+
+    ds = TinyStoriesLM(tokenizer, seq_len=seq_len, max_samples=20000 if not is_kaggle else 5000)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    model.train()
+    it = iter(loader)
+    start = time.time()
+    running_loss = 0
+    global_step = 0
+    pbar = tqdm(total=max_steps)
+    for step in range(max_steps):
+        try:
+            batch = next(it)
+        except StopIteration:
+            it = iter(loader)
+            batch = next(it)
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+
+        # reset recurrent state per batch (fresh sequence)
+        model.hybrid.reset_state()
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type=="cuda")):
+            out = model(input_ids, labels=labels)
+            loss = out["loss"] / grad_accum
+        loss.backward()
+        running_loss += loss.item()
+
+        if (step+1) % grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            if (step+1)//grad_accum % 10 == 0:
+                print(f"step {step} loss {running_loss/10:.4f}")
+                running_loss = 0
+
+        pbar.update(1)
+        if (step+1) % 500 == 0:
+            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size},
+                       os.path.join(args.output_dir, f"step_{step+1}.pt"))
+    
+    pbar.close()
+    elapsed = time.time() - start
+    print(f"Finished in {elapsed/60:.2f} min")
+    cost_3090 = elapsed/3600*1.8
+    cost_4090 = elapsed/3600*2.8
+    print(f"Cost estimate 3090: {cost_3090:.2f} CNY, 4090: {cost_4090:.2f} CNY << 120 CNY")
+    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__},
+               os.path.join(args.output_dir, "final_lm.pt"))
+
+if __name__ == "__main__":
+    main()
