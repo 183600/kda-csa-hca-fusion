@@ -952,14 +952,31 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     prefill_times = []
     all_decode_times = []
     # P1-1 fix (round 5): pin torch threads on CPU for stable measurement,
-    # mirroring run_benchmark._measure. Dynamic inter/intra-op thread
-    # resizing causes 2-3x run-to-run jitter on CPU that dominates the
-    # inter-op latency gap.
+    # mirroring run_benchmark._measure. Dynamic intra-op thread resizing
+    # causes 2-3x run-to-run jitter on CPU that dominates the inter-op
+    # latency gap.
+    #
+    # Round-10 fix: do NOT call ``set_num_interop_threads`` here. PyTorch
+    # permits changing the inter-op pool only ONCE per process and only
+    # BEFORE any parallel work starts. This function is called once per
+    # (op, prefill_len) cell — the second call would crash with
+    # ``RuntimeError: cannot set number of interop threads after parallel
+    # work has started or set_num_interop_threads called``. Worse, even the
+    # FIRST call fails because the warmup block above (lines 920-924) has
+    # already run ``model(x_prefill)`` / ``model(x_new)``, which is parallel
+    # work. The exception was silently swallowed by the try/except in
+    # main(), causing EVERY cell of Exp 6 to record an error result with
+    # null latency — Exp 6 produced zero usable data on CPU.
+    # ``configure_torch_for_device()`` (called from main()) already pins
+    # inter-op threads to 1 once at process start via the
+    # ``_interop_threads_set`` guard in kaggle_setup.py, so the per-cell
+    # call was both redundant AND broken. Intra-op threads may be adjusted
+    # around each measurement and safely restored. Mirrors the fix already
+    # applied to run_benchmark.py (commit d02cebd, "fix experimental
+    # fairness and benchmark reliability") which was missed here.
     _prev_thr = torch.get_num_threads()
-    _prev_interop = torch.get_num_interop_threads()
     if device.type != 'cuda':
         torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
     try:
         for _ in range(repeats):
             model.reset()
@@ -1008,7 +1025,14 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     finally:
         if device.type != 'cuda':
             torch.set_num_threads(_prev_thr)
-            torch.set_num_interop_threads(_prev_interop)
+            # Round-10 fix: do NOT restore ``set_num_interop_threads`` —
+            # we no longer set it here (see comment above). Restoring a
+            # value we never changed would either be a no-op (if the value
+            # matches) or crash with the same ``RuntimeError`` as the set
+            # call. The inter-op pool stays at 1 (set once by
+            # ``configure_torch_for_device`` in main()) for the rest of
+            # the process, which is the desired value for stable CPU
+            # latency measurement.
 
     # Aggregate across repeats: take the median across trials for each
     # summary statistic. ``statistics.median`` handles even-length lists
