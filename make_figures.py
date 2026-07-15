@@ -563,6 +563,16 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
         validity_note = (f' WARNING: conclusions_valid=False '
                          f'({_n_sig}/{_n_total} Bonferroni-sig). '
                          f'Treat as exploratory, not confirmatory.')
+    # Round-10 fix (R3-B): insert a newline before the warning suffix so
+    # the title wraps onto two lines instead of being clipped. fig_mqar
+    # is only 6 inches wide (~900 px @ dpi=150); the combined title with
+    # the warning is ~1294 px wide and was being clipped ~20% on each
+    # side, losing both the "Multi-Query Associative" prefix AND the
+    # "...not confirmatory." suffix — the exact warning meant to inform
+    # readers about underpowered MQAR data was rendered unreadable.
+    # fig_ablation (13 inches wide) doesn't need this; fig_mqar does.
+    if validity_note:
+        validity_note = '\n' + validity_note.lstrip()
     ax.set_title(f'Multi-Query Associative Recall (n_kv={n_kv}, '
                  f'{n_seeds} seeds, {title_steps} steps){validity_note}',
                  fontsize=8)

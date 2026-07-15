@@ -198,18 +198,16 @@ def run_all(seeds=None, steps=None):
                  'MQAR_SOFTMAX_STEPS', 'BENCH_LENGTHS', 'RESULTS_DIR',
                  'FIGURES_DIR', 'SKIP_SLOW')
     _orig_env = {k: os.environ.get(k) for k in _env_keys}
-    if seeds is not None:
-        os.environ['MQAR_SEEDS'] = str(seeds)
-        os.environ['ABL_SEEDS'] = str(seeds)
-    if steps is not None:
-        os.environ['MQAR_STEPS'] = str(steps)
-        # Ablation (Exp 5) sweeps multiple KDA:CSA:HCA ratios, each trained
-        # across ABL_SEEDS seeds. Total cost is n_ratios * n_seeds * steps,
-        # far larger than the single-track MQAR run, so halve the per-run
-        # step count (floored at 50 — the ablation doc's convergence minimum)
-        # to keep wall-clock tractable without regressing to the old 25-step
-        # under-trained regime.
-        os.environ['ABL_STEPS'] = str(max(50, steps // 2))
+    # Round-10 fix (R3-C bug 2): the env-var mutations below used to live
+    # BEFORE the try-finally block (lines 201-212 in the pre-fix version).
+    # If ``_ensure_deps()`` (line 214) or ``_setup()`` (line 215) raised,
+    # the finally block never ran and the mutated env vars leaked into the
+    # caller's process — a real problem for notebook callers who then see
+    # ``MQAR_SEEDS=5`` permanently set after a failed ``run_all()`` call.
+    # We now snapshot the originals here (so the finally block can restore
+    # them) but DEFER the actual mutations until we are inside the try
+    # block (after ``_ensure_deps`` / ``_setup`` succeed). The mutations
+    # now live just after ``os.chdir(out_root)`` below.
 
     _ensure_deps()
     info = _setup()
@@ -235,6 +233,24 @@ def run_all(seeds=None, steps=None):
     _orig_cwd = os.getcwd()
     os.chdir(out_root)
     try:
+        # Round-10 fix (R3-C bug 2): apply the seeds/steps env-var mutations
+        # INSIDE the try block (after _ensure_deps/_setup succeeded) so a
+        # failure in those functions does not leak the mutations to the
+        # caller's process. The finally block at the end of this function
+        # restores the originals.
+        if seeds is not None:
+            os.environ['MQAR_SEEDS'] = str(seeds)
+            os.environ['ABL_SEEDS'] = str(seeds)
+        if steps is not None:
+            os.environ['MQAR_STEPS'] = str(steps)
+            # Ablation (Exp 5) sweeps multiple KDA:CSA:HCA ratios, each trained
+            # across ABL_SEEDS seeds. Total cost is n_ratios * n_seeds * steps,
+            # far larger than the single-track MQAR run, so halve the per-run
+            # step count (floored at 50 — the ablation doc's convergence minimum)
+            # to keep wall-clock tractable without regressing to the old 25-step
+            # under-trained regime.
+            os.environ['ABL_STEPS'] = str(max(50, steps // 2))
+
         os.makedirs('results', exist_ok=True)
         os.makedirs('figures', exist_ok=True)
         # Tell make_figures.py where to read results and write figures. On Kaggle
@@ -275,24 +291,50 @@ def run_all(seeds=None, steps=None):
         #    Skip the largest lengths on CPU if SKIP_SLOW is set.
         if skip_slow and is_cpu:
             print('\n[run_all] SKIP_SLOW=1 on CPU: truncating benchmark lengths.')
-            # run_benchmark.main() reads BENCH_LENGTHS (comma-separated) and
-            # falls back to the full sweep {128,256,512,1024,2048} when unset.
-            os.environ['BENCH_LENGTHS'] = '128,256,512'
+            # Round-10 fix (R3-C bug 1): the previous code UNCONDITIONALLY
+            # set ``BENCH_LENGTHS='128,256,512'``, which EXPANDED the
+            # sweep when the user had explicitly set a smaller list (e.g.
+            # ``BENCH_LENGTHS=128,256`` got expanded to 128,256,512 — the
+            # opposite of "skip slow"). SKIP_SLOW should only TRUNCATE
+            # (filter out lengths > 512), never EXPAND. Parse the user's
+            # list (or the default {128,256,512,1024,2048} if unset),
+            # filter to <= 512, and re-join. If the user's list is
+            # already all <= 512, it is unchanged.
+            _bl_raw = os.environ.get('BENCH_LENGTHS', '128,256,512,1024,2048')
+            try:
+                _bl_vals = [int(x.strip()) for x in _bl_raw.split(',')]
+            except ValueError:
+                _bl_vals = [128, 256, 512, 1024, 2048]
+            _bl_truncated = [str(v) for v in _bl_vals if v <= 512]
+            if not _bl_truncated:
+                # User's list had nothing <= 512; fall back to the safe set.
+                _bl_truncated = ['128', '256', '512']
+            os.environ['BENCH_LENGTHS'] = ','.join(_bl_truncated)
             summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
         else:
             summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
 
         # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
         if skip_slow and is_cpu:
-            print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to 3 seeds / 100 steps.')
-            # NOTE: use direct assignment, NOT ``setdefault``. The earlier block at
-            # the top of ``run_all`` already set ``MQAR_SEEDS`` / ``MQAR_STEPS`` via
-            # direct assignment from the ``seeds`` / ``steps`` parameters, so
-            # ``setdefault`` here is a no-op and the reduction never happens —
-            # the log message lies and the full 5-seed / 200-step run is launched,
-            # defeating the whole point of SKIP_SLOW on CPU.
-            os.environ['MQAR_SEEDS'] = '3'
-            os.environ['MQAR_STEPS'] = '100'
+            print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to <=3 seeds / <=100 steps.')
+            # Round-10 fix (R3-C bug 1): the previous code UNCONDITIONALLY
+            # set ``MQAR_SEEDS='3'`` and ``MQAR_STEPS='100'``, which
+            # EXPANDED the run when the user had explicitly set smaller
+            # values (e.g. ``MQAR_SEEDS=1 MQAR_STEPS=10`` got overridden
+            # to 3 seeds / 100 steps — the opposite of "skip slow").
+            # SKIP_SLOW should only TRUNCATE (cap at the safe ceiling),
+            # never EXPAND. Use ``min(user_value, safe_ceiling)`` so a
+            # user who already set a smaller value keeps it.
+            try:
+                _mqar_seeds = int(os.environ.get('MQAR_SEEDS', '5'))
+            except ValueError:
+                _mqar_seeds = 5
+            try:
+                _mqar_steps = int(os.environ.get('MQAR_STEPS', '200'))
+            except ValueError:
+                _mqar_steps = 200
+            os.environ['MQAR_SEEDS'] = str(min(_mqar_seeds, 3))
+            os.environ['MQAR_STEPS'] = str(min(_mqar_steps, 100))
             # Keep the primary comparison fair even in the reduced CPU run.
             # A longer softmax-only sensitivity run must be requested
             # explicitly by the caller, not silently enabled here.
@@ -308,7 +350,7 @@ def run_all(seeds=None, steps=None):
             # request and only fall back to ``MQAR_STEPS`` (the reduced
             # budget) when the caller left it unset.
             if 'MQAR_SOFTMAX_STEPS' not in os.environ:
-                os.environ['MQAR_SOFTMAX_STEPS'] = '100'
+                os.environ['MQAR_SOFTMAX_STEPS'] = os.environ['MQAR_STEPS']
         summary['runs'].append(_run('exp4_mqar', run_quality.main))
 
         # 6. Ablation — multi-seed.
@@ -336,7 +378,18 @@ def run_all(seeds=None, steps=None):
             except ValueError:
                 _abl_seeds = 7
             os.environ['ABL_SEEDS'] = str(max(5, _abl_seeds))
-            os.environ['ABL_STEPS'] = '50'
+            # Round-10 fix (R3-C bug 1): use ``min(user_value, 50)`` so a
+            # user who explicitly set ``ABL_STEPS=10`` keeps their faster
+            # config. The previous unconditional ``= '50'`` EXPANDED the
+            # run when the user had set a smaller value — the opposite of
+            # "skip slow". 50 is the ceiling (the P4-documented minimum
+            # for showing the ablation trend); below that the user is
+            # explicitly opting into an under-trained run.
+            try:
+                _abl_steps = int(os.environ.get('ABL_STEPS', '100'))
+            except ValueError:
+                _abl_steps = 100
+            os.environ['ABL_STEPS'] = str(min(_abl_steps, 50))
         summary['runs'].append(_run('exp5_ablation', run_ablation.main))
 
         # 7. Decoding latency — fast (only softmax + KDA).
