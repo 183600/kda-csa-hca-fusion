@@ -5,14 +5,12 @@ Verification script for KDA-CSA-HCA Fusion paper (v2).
 Runs a fast, reproducible smoke test suite that:
 - Exercises core operators (KDA recurrent/chunk, CSA, HCA, Hybrid)
 - Checks basic training loop
-- Runs a minimal latency/KV smoke
 - Prints a machine-readable summary + PASS/FAIL
 
 Intended to be run by reviewers to confirm "code has no bugs and results are accurate".
 
 Usage:
     python verify_experiments.py --quick
-    python verify_experiments.py --full   # more steps, longer sequences
 """
 
 import argparse
@@ -20,7 +18,6 @@ import json
 import os
 import sys
 import time
-import traceback
 from dataclasses import dataclass, asdict
 from typing import Dict, Any
 
@@ -28,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Repo imports (after pip install -e .)
+# Repo imports
 from ops_kda import naive_recurrent_kda, naive_chunk_kda
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -40,7 +37,7 @@ class VerificationResult:
     passed: bool
     detail: str
     time_s: float
-    extra: dict = None
+    extra: Dict[str, Any] = None
 
 def _rand(shape, device, dtype=torch.float32, scale=0.1, generator=None):
     if generator is not None:
@@ -48,7 +45,6 @@ def _rand(shape, device, dtype=torch.float32, scale=0.1, generator=None):
     else:
         t = torch.randn(*shape, device=device, dtype=dtype)
     return (t * scale).requires_grad_(True)
-
 
 def verify_kda_recurrent(device):
     B, T, H, K, V = 2, 64, 4, 32, 32
@@ -65,7 +61,7 @@ def verify_kda_recurrent(device):
     dt = time.time() - t0
 
     ok = o.shape == (B, T, H, V) and state.shape == (B, H, K, V) and torch.isfinite(o).all()
-    return VerificationResult("kda_recurrent", ok, f"shape={o.shape}", dt)
+    return VerificationResult("kda_recurrent", ok, f"shape={tuple(o.shape)}", dt)
 
 def verify_kda_chunk(device):
     B, T, H, K, V = 2, 64, 4, 32, 32
@@ -82,7 +78,7 @@ def verify_kda_chunk(device):
     dt = time.time() - t0
 
     ok = o.shape == (B, T, H, V) and torch.isfinite(o).all()
-    return VerificationResult("kda_chunk", ok, f"shape={o.shape}", dt)
+    return VerificationResult("kda_chunk", ok, f"shape={tuple(o.shape)}", dt)
 
 def verify_csa(device):
     B, T, d = 2, 64, 64
@@ -115,7 +111,7 @@ def verify_csa(device):
         )
     dt = time.time() - t0
     ok = o.shape == (B, T, nh * c) and torch.isfinite(o).all()
-    return VerificationResult("csa", ok, f"shape={o.shape}", dt)
+    return VerificationResult("csa", ok, f"shape={tuple(o.shape)}", dt)
 
 def verify_hca(device):
     B, T, d = 2, 64, 64
@@ -138,7 +134,7 @@ def verify_hca(device):
         )
     dt = time.time() - t0
     ok = o.shape == (B, T, nh * c) and torch.isfinite(o).all()
-    return VerificationResult("hca", ok, f"shape={o.shape}", dt)
+    return VerificationResult("hca", ok, f"shape={tuple(o.shape)}", dt)
 
 def verify_hybrid(device):
     cfg = HybridConfig(
@@ -163,7 +159,6 @@ def verify_hybrid(device):
     return VerificationResult("hybrid", ok, f"layout={model.layout_str()}", dt, {"params": int(sum(p.numel() for p in model.parameters()))})
 
 def verify_training_smoke(device):
-    """Tiny forward + backward on the hybrid LM head."""
     cfg = HybridConfig(d_model=64, n_kda=2, n_csa=1, n_hca=1)
     model = nn.Sequential(
         nn.Embedding(100, 64),
@@ -176,7 +171,7 @@ def verify_training_smoke(device):
     labels = torch.randint(0, 100, (2, 32), device=device)
 
     t0 = time.time()
-    out = model[1](model[0](x))   # hybrid only for speed
+    out = model[1](model[0](x))
     logits = model[3](model[2](out))
     loss = F.cross_entropy(logits.reshape(-1, 100), labels.reshape(-1))
     loss.backward()
@@ -189,7 +184,6 @@ def verify_training_smoke(device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="Fast smoke (default)")
-    parser.add_argument("--full", action="store_true", help="Slightly longer sequences")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -198,15 +192,19 @@ def main():
 
     results = []
 
-    # Core operator checks
-    results.append(verify_kda_recurrent(device))
-    results.append(verify_kda_chunk(device))
-    results.append(verify_csa(device))
-    results.append(verify_hca(device))
-    results.append(verify_hybrid(device))
-    results.append(verify_training_smoke(device))
+    try:
+        results.append(verify_kda_recurrent(device))
+        results.append(verify_kda_chunk(device))
+        results.append(verify_csa(device))
+        results.append(verify_hca(device))
+        results.append(verify_hybrid(device))
+        results.append(verify_training_smoke(device))
+    except Exception as e:
+        print(f"ERROR during verification: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
-    # Summary
     print("\n=== VERIFICATION SUMMARY ===")
     all_pass = True
     for r in results:
@@ -215,20 +213,27 @@ def main():
         if not r.passed:
             all_pass = False
 
+    # Safe serialization
+    safe_results = []
+    for r in results:
+        safe_extra = None
+        if r.extra:
+            safe_extra = {k: (int(v) if isinstance(v, (int, float)) else str(v)[:100]) 
+                          for k, v in r.extra.items()}
+        safe_results.append({
+            "name": r.name,
+            "passed": bool(r.passed),
+            "detail": str(r.detail),
+            "time_s": float(r.time_s),
+            "extra": safe_extra
+        })
+
     summary = {
         "timestamp": time.time(),
         "device": str(device),
         "torch_version": torch.__version__,
         "all_pass": all_pass,
-        "results": [
-        {
-            "name": r.name,
-            "passed": r.passed,
-            "detail": r.detail,
-            "time_s": r.time_s,
-            "extra": {k: (int(v) if isinstance(v, (int, float)) or (hasattr(v, "item") and callable(v.item)) else str(v)) for k, v in (r.extra or {}).items()} if r.extra else None
-        } for r in results
-    ],
+        "results": safe_results,
     }
 
     os.makedirs("results", exist_ok=True)
