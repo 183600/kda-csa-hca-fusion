@@ -180,7 +180,38 @@ def main():
     loader_gen.manual_seed(args.seed + 1_000_000)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
                         generator=loader_gen)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    # Build parameter groups with proper weight-decay exclusion. Standard ML
+    # practice (mirrored from run_quality.py::_build_param_groups): embeddings,
+    # biases, LayerNorm parameters, and positional-bias tables (Ba/Bb/B_idx/
+    # B_pos) must NOT be weight-decayed. The previous version passed
+    # ``model.parameters()`` to AdamW with ``weight_decay=0.1`` uniformly,
+    # which decayed ALL 13.5M parameters — including the 12.87M-parameter
+    # tied embedding/lm_head matrix (95.4% of the model). With weight tying
+    # the embedding IS the output projection, so decaying it shrinks the logit
+    # scale every step, producing a loss curve and checkpoint that do not
+    # reflect the model's true potential. Only the 616K attention/FFN weight
+    # parameters (4.6%) should receive weight decay.
+    no_decay_ids = set()
+    for submod in model.modules():
+        if isinstance(submod, (nn.Embedding, nn.LayerNorm)):
+            for p in submod.parameters(recurse=False):
+                no_decay_ids.add(id(p))
+    _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'B_pos')
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        leaf_name = name.rsplit('.', 1)[-1]
+        if (id(p) in no_decay_ids or p.ndim <= 1
+                or leaf_name in _POSITIONAL_BIAS_SUFFIXES):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    param_groups = [
+        {'params': decay, 'weight_decay': 0.1},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=3e-4)
 
     # Mixed precision policy. Kaggle T4 (sm_75) does NOT support BF16; forcing
     # ``dtype=torch.bfloat16`` there can crash or silently fall back to slow
