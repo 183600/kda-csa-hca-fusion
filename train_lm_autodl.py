@@ -80,6 +80,23 @@ class LMWithHybrid(nn.Module):
         self.norm_f = nn.LayerNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+        # Weight-tying means ``embed.weight`` IS the output projection, so its
+        # init scale sets the logit scale at step 0. ``nn.Embedding`` defaults
+        # to ``N(0, 1)`` which, combined with a final LayerNorm of width
+        # ``d_model``, produces logits with std ~ sqrt(d_model) (~22.6 for
+        # d=512) and max ~500. Cross-entropy on those logits starts at ~500
+        # (46x the uniform-baseline log(V)=10.82) and stays flat for hundreds
+        # of steps because the gradient is dominated by shrinking the 25.7M
+        # tied embedding rather than learning the LM task. GPT-2 / nanoGPT /
+        # every modern transformer initializes the (tied) embedding with
+        # std=0.02 so initial logits are O(1) and the loss starts at the
+        # uniform baseline ~log(V). Without this the loss curve reported by
+        # the script and the quality of the final checkpoint are both
+        # meaningless: a 5-step run with default init showed loss 496.6 ->
+        # 498.5 (no decrease), while the same 5 steps with std=0.02 init
+        # showed loss 10.9 -> 10.9 (matching the uniform baseline, as
+        # expected for an untrained model).
+        nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids, labels=None):
         x = self.embed(input_ids)
@@ -301,7 +318,15 @@ def main():
     cost_3090 = elapsed/3600*1.8
     cost_4090 = elapsed/3600*2.8
     print(f"Cost estimate 3090: {cost_3090:.2f} CNY, 4090: {cost_4090:.2f} CNY << 120 CNY")
-    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
+    # Save the final checkpoint with the SAME key set as the intermediate
+    # ``step_{N}.pt`` checkpoints. The previous version omitted ``vocab``,
+    # so any downstream loader (e.g. an evaluator reconstructing the model
+    # from the checkpoint) had to recover vocab_size from
+    # ``model['embed.weight'].shape[0]`` — a fragile workaround that the
+    # intermediate checkpoints did not require. README.md advertises
+    # ``final_lm.pt`` as the canonical artifact for further evaluation, so
+    # it must be self-describing.
+    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
                 "optimizer_step": optimizer_step, "micro_step": micro_step,
                 "seed": args.seed},
                os.path.join(args.output_dir, "final_lm.pt"))
