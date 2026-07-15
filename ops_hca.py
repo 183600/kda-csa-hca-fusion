@@ -146,7 +146,19 @@ def naive_hca(
     # Return a zero-shaped output matching the contract. Mirrors the guard
     # in ``ops_csa.py::naive_csa``.
     if T == 0:
-        return torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
+        # Honor ``return_projections`` even in the degenerate T=0 case so
+        # callers that unpack ``o, (C, Z) = naive_hca(..., return_projections=True)``
+        # do not crash with ``ValueError: not enough values to unpack``. The
+        # projections are empty tensors of the correct feature dim (c) so any
+        # downstream cache-population code that iterates over the time axis
+        # is a no-op, matching the contract of the T>0 path. Mirrors the
+        # fix applied to ``ops_csa.py::naive_csa`` for the same edge case.
+        out_empty = torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
+        if return_projections:
+            C_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
+            Z_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
+            return out_empty, (C_empty, Z_empty)
+        return out_empty
     # Right-pad T up to a multiple of m2 so callers don't have to. Real
     # tokens keep their original positions; only the last partial block
     # contains padding zeros, and no real token attends to it (causal block

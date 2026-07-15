@@ -197,6 +197,21 @@ def setup_kaggle(verbose: bool = True) -> None:
         # Not a Kaggle+GPU environment; CPU is the expected config.
         # Do nothing — local CPU runs are still supported.
         return
+    # Honor ``SKIP_CUDA_CHECK=1`` so direct callers of ``setup_kaggle()``
+    # (e.g. ``python kaggle_setup.py`` from the command line, or a notebook
+    # cell that calls ``setup_kaggle()`` directly without going through
+    # ``run_all._setup()``) can bypass the CUDA-availability guard on a
+    # GPU machine to run CPU-only experiments. Previously the escape hatch
+    # was documented in the ``RuntimeError`` message below but only
+    # honored by ``run_all._setup()``, so direct callers were stuck despite
+    # the message telling them to set the env var. The README also
+    # documents ``SKIP_CUDA_CHECK=1`` as the official bypass, so this
+    # brings the implementation in line with the public documentation.
+    if os.environ.get('SKIP_CUDA_CHECK', '0') == '1':
+        if verbose:
+            print("[kaggle_setup] SKIP_CUDA_CHECK=1: bypassing CUDA "
+                  "availability guard.")
+        return
     # Kaggle + NVIDIA GPU detected, but torch.cuda.is_available() is False.
     # This is the P0-3 scenario: either the CUDA wheel was never installed,
     # or it was installed in a PREVIOUS process and the current process is
@@ -442,8 +457,20 @@ def configure_torch_for_device(
     info = detect_env()
     if device is None:
         device = info.device
+    # Apply ``torch.set_num_threads`` on BOTH CPU and GPU branches.
+    # Previously the GPU branch skipped this call, so on GPU the actual
+    # ``torch.get_num_threads()`` stayed at the process default
+    # (typically ``os.cpu_count()``), while ``detect_env()`` reported
+    # ``num_threads=1`` — making ``capture_provenance()`` emit inaccurate
+    # metadata in every experiment JSON. The mismatch also meant CPU-side
+    # ops (e.g. data loading, ``F.linear`` on small tensors that don't
+    # hit cuBLAS) could oversubscribe the host with ``cpu_count()``
+    # threads, perturbing latency measurements. Setting it explicitly to
+    # ``info.num_threads`` (1 on GPU, ``cpu_count()-1`` on CPU) makes the
+    # reported value match the actual value and keeps host-side work
+    # bounded on GPU.
+    torch.set_num_threads(info.num_threads)
     if device.type == "cpu":
-        torch.set_num_threads(info.num_threads)
         # ``set_num_interop_threads`` can only be called ONCE per process
         # (PyTorch raises ``RuntimeError`` on any subsequent call, even after
         # ``import torch`` alone has triggered inter-op init in some builds).
@@ -749,12 +776,37 @@ def write_results_json(payload, target_path, *, indent=2, logger=None):
     try:
         write_json_atomic(payload, target_path, indent=indent,
                           allow_nan=False)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
+        # ``ValueError`` is raised by ``json.dumps(allow_nan=False)`` when
+        # the payload contains NaN/Inf floats. ``TypeError`` is raised when
+        # the payload contains a non-JSON-serializable type (e.g. a
+        # ``torch.Tensor``, a ``numpy.float32`` scalar that is NOT a
+        # subclass of ``float``, or a custom object). Previously only
+        # ``ValueError`` was caught, so a single non-serializable value
+        # would propagate uncaught and lose the ENTIRE experiment's
+        # results. Catching both and falling back to ``sanitize_for_json``
+        # (which recursively walks containers and replaces non-finite
+        # floats with ``None``) at least lets the write succeed; any
+        # remaining non-serializable objects are passed through
+        # ``json.dumps(default=str)`` below for a best-effort string
+        # representation, mirroring the pattern already used by
+        # ``run_kv_cache._write_results`` (which catches the same two
+        # exception types with ``default=str``).
         if logger is not None:
             logger.error(
-                f'non-finite value in results; sanitizing to null: {exc}')
-        write_json_atomic(sanitize_for_json(payload), target_path,
-                          indent=indent, allow_nan=False)
+                f'non-finite or non-serializable value in results; '
+                f'sanitizing to null / string fallback: {exc}')
+        # First try sanitizing (handles NaN/Inf and recurses into
+        # containers). If a non-serializable type remains, fall back to
+        # ``default=str`` so the write still succeeds (the offending
+        # value becomes its ``str()`` representation, which is enough
+        # for debugging — the alternative is losing ALL results).
+        try:
+            write_json_atomic(sanitize_for_json(payload), target_path,
+                              indent=indent, allow_nan=False)
+        except (TypeError, ValueError):
+            write_json_atomic(sanitize_for_json(payload), target_path,
+                              indent=indent, allow_nan=False, default=str)
 
 
 if __name__ == "__main__":

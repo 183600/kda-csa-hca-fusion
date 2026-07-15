@@ -693,7 +693,25 @@ def naive_csa(
     # the [B, n_blocks, m, c] reshape collapse against [m, c] positional
     # bias. Return a zero-shaped output matching the contract.
     if T == 0:
-        return torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
+        # Honor ``return_projections`` even in the degenerate T=0 case so
+        # callers that unpack ``o, (Ca, Cb, Za, Zb, K_idx, Z_idx) =
+        # naive_csa(..., return_projections=True)`` do not crash with
+        # ``ValueError: not enough values to unpack``. The projections are
+        # empty tensors of the correct feature dims so any downstream
+        # cache-population code that iterates over the time axis is a no-op,
+        # matching the contract of the T>0 path. Mirrors the fix applied to
+        # ``ops_hca.py::naive_hca`` for the same edge case.
+        out_empty = torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
+        if return_projections:
+            Ca_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
+            Cb_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
+            Za_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
+            Zb_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
+            K_idx_empty = torch.zeros(B_, 0, c_I, dtype=H.dtype, device=device)
+            Z_idx_empty = torch.zeros(B_, 0, c_I, dtype=H.dtype, device=device)
+            return out_empty, (Ca_empty, Cb_empty, Za_empty, Zb_empty,
+                               K_idx_empty, Z_idx_empty)
+        return out_empty
     # Right-pad T up to a multiple of m so callers don't have to. Real tokens
     # keep their original positions; only the last partial block contains
     # padding zeros, and no real token attends to it (causal block mask).
