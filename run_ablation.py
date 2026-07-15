@@ -463,12 +463,12 @@ def main():
     # that most accuracies were near the chance level (0.0625), and that
     # ALL layouts had significant_bonferroni=False. With n=3 a one-sample
     # t-test has only 2 degrees of freedom — the Bonferroni-corrected
-    # critical t-value at alpha=0.05/7≈0.0071 is ~12.9, which is essentially
-    # unachievable in practice. The experiment as configured CANNOT reach
-    # significance regardless of the underlying effect size.
+    # critical t-value at alpha=0.05/7≈0.0071 (one-sided) is ~8.3, which is
+    # very hard to achieve in practice. The experiment as configured
+    # CANNOT reach significance regardless of the underlying effect size.
     #
     # Raising the default to 7 (6 dof) brings the corrected critical value
-    # down to ~4.9, which is achievable for a real effect. We also add an
+    # down to ~3.4, which is achievable for a real effect. We also add an
     # explicit ``conclusions_valid`` flag to the JSON and a prominent
     # warning in the log so downstream consumers (figures, reports) do not
     # draw strong structural conclusions from underpowered experiments.

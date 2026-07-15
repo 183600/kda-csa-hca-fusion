@@ -131,7 +131,15 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             # = 2*d elements of left-padding buffer for streaming — not just d.
             # This is negligible next to the recurrent state but a production
             # engine must retain it.
-            short_conv_state = 2 * p['d']
+            # Round 9 audit: parameterize via ``kda_conv_ksize`` instead of
+            # hardcoding 2. The FLOPs path (line ~331) already parameterizes
+            # correctly via ``p.get('kda_conv_ksize', 3)``; this KV-cache path
+            # did not, so a non-default ``kda_conv_ksize`` would produce the
+            # wrong element count. All current experiments use the default
+            # kda_conv_ksize=3 (where 2 == 3-1), so no current number is
+            # affected, but the latent bug is now fixed.
+            _conv_ksize = p.get('kda_conv_ksize', 3)
+            short_conv_state = (_conv_ksize - 1) * p['d']
             return recurrent_state + short_conv_state
         # compressed_kv_only: just the recurrent state.
         return recurrent_state

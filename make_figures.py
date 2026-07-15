@@ -548,8 +548,24 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
         title_steps = f'softmax={softmax_steps}, others={steps}'
     else:
         title_steps = str(steps)
+    # Round 9 audit: surface statistical validity in the title, mirroring
+    # the ablation figure's suptitle warning (lines ~794-802). The README's
+    # Fairness notes #3 explicitly says ``conclusions_valid`` is "the
+    # authoritative signal — ``mean_acc`` alone is misleading." Without this
+    # warning, a reader of fig_mqar could draw strong structural conclusions
+    # from underpowered near-chance data — the exact failure mode the
+    # ablation figure was patched to prevent.
+    _valid = all(r.get('conclusions_valid', True) for r in ok_records)
+    _n_sig = sum(1 for r in ok_records if r.get('significant_bonferroni'))
+    _n_total = len(ok_records)
+    validity_note = ''
+    if not _valid:
+        validity_note = (f' WARNING: conclusions_valid=False '
+                         f'({_n_sig}/{_n_total} Bonferroni-sig). '
+                         f'Treat as exploratory, not confirmatory.')
     ax.set_title(f'Multi-Query Associative Recall (n_kv={n_kv}, '
-                 f'{n_seeds} seeds, {title_steps} steps)')
+                 f'{n_seeds} seeds, {title_steps} steps){validity_note}',
+                 fontsize=8)
     # Defensive ``default=0.0`` on the inner ``max`` so an empty ``means``
     # list (e.g. all records were error rows but somehow bypassed the early
     # return) yields 0.0 instead of raising ``ValueError: max() iterable
