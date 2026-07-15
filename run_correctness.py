@@ -4623,10 +4623,17 @@ def test_csa_decoding_cache_correctness(device='cpu'):
     o_inc = torch.cat(outs, dim=1).to(o_full.dtype)
 
     max_diff = (o_full - o_inc).abs().max().item()
+    # Tolerance tightened from 1e-4 to 1e-5 (round 9 audit). The observed
+    # max_diff is ~1.8e-7; the previous 1e-4 tolerance was ~1000x looser than
+    # the actual error and 10x looser than the file's own TOL['match'][fp32]
+    # standard (1e-5). A real cache bug producing a 5e-5 error (wrong cache
+    # update, off-by-one causal mask, partial-accumulator bug) would have
+    # passed silently. 1e-5 is 100x tighter than 1e-4 while still 100x
+    # looser than the observed error, giving cross-platform headroom.
     return [_ok(
         'csa_decoding_cache_matches_naive',
-        max_diff < 1e-4,
-        f'max_diff={max_diff:.6e} (tol=1e-4), T={T}, m={m}, win={win}, '
+        max_diff < 1e-5,
+        f'max_diff={max_diff:.6e} (tol=1e-5), T={T}, m={m}, win={win}, '
         f'topk={topk} (select-all)')]
 
 
@@ -4662,10 +4669,14 @@ def test_hca_decoding_cache_correctness(device='cpu'):
     o_inc = torch.cat(outs, dim=1).to(o_full.dtype)
 
     max_diff = (o_full - o_inc).abs().max().item()
+    # Tolerance tightened from 1e-4 to 1e-5 (round 9 audit). The observed
+    # max_diff is ~1.2e-7; the previous 1e-4 tolerance was ~1000x looser than
+    # the actual error. See test_csa_decoding_cache_correctness for the full
+    # rationale.
     return [_ok(
         'hca_decoding_cache_matches_naive',
-        max_diff < 1e-4,
-        f'max_diff={max_diff:.6e} (tol=1e-4), T={T}, m2={m2}, win={win}')]
+        max_diff < 1e-5,
+        f'max_diff={max_diff:.6e} (tol=1e-5), T={T}, m2={m2}, win={win}')]
 
 
 def test_csa_decoding_cache_compressed_blocks_match(device='cpu'):
@@ -4942,9 +4953,13 @@ def test_hybrid_decoding_cache_matches_full_sequence(device='cpu'):
     max_diff = (ref_decode - y_inc_decode).abs().max().item()
     shape_ok = (y_prefill.shape == (1, prefill_len, d_model)
                 and y_inc_decode.shape == (1, n_decode, d_model))
+    # Tolerance tightened from 1e-4 to 1e-5 (round 9 audit). The observed
+    # max_diff is ~1.5e-7; the previous 1e-4 tolerance was ~1000x looser than
+    # the actual error. See test_csa_decoding_cache_correctness for the full
+    # rationale.
     return [_ok(
         'hybrid_decoding_cache_matches_full_sequence',
-        shape_ok and max_diff < 1e-4,
+        shape_ok and max_diff < 1e-5,
         f'max_diff={max_diff:.6e}, shape_ok={shape_ok}, '
         f'prefill_len={prefill_len}, n_decode={n_decode}, csa_topk=100')]
 
