@@ -133,11 +133,16 @@ def _sliding_window_attention(
 
 
 def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
-    """Return ``[T, n_blocks]`` mask: query t can attend to compressed block b
-    only if ``b < t // m`` (strictly preceding blocks)."""
+    """Return the DeepSeek-V4 block-causal mask ``[T, n_blocks]``.
+
+    A compressed block becomes available when its source window closes. Thus
+    query ``t`` may attend to blocks ``b < (t + 1) // m``. For example, with
+    ``m=8`` the block covering positions ``0..7`` is visible to query ``t=7``;
+    it is not future information because the whole source window is complete.
+    """
     i_t = torch.arange(T, device=device)
     i_b = torch.arange(n_blocks, device=device)
-    return i_t[:, None] // m > i_b[None, :]
+    return (i_t[:, None] + 1) // m > i_b[None, :]
 
 
 def csa_compress_kv(

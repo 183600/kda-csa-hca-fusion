@@ -72,6 +72,38 @@ DEFAULTS = dict(
 )
 
 
+def causal_block_entries(T: int, m: int) -> int:
+    """Count visible (query, compressed-block) pairs.
+
+    A compressed block becomes visible when its complete source window closes,
+    i.e. block ``b`` is available from query ``(b + 1) * m - 1`` onward.
+    """
+    if T <= 0:
+        return 0
+    n_full = T // m
+    remainder = T % m
+    return m * n_full * (n_full - 1) // 2 + n_full * (remainder + 1)
+
+
+def causal_selected_entries(T: int, m: int, topk: int) -> int:
+    """Count selected block slots after a top-k cap under block causality."""
+    if T <= 0 or topk <= 0:
+        return 0
+    n_full = T // m
+    remainder = T % m
+    if n_full == 0:
+        return 0
+    k_cap = min(topk, n_full)
+    if topk >= n_full:
+        sum_before_last = n_full * (n_full - 1) // 2
+    else:
+        sum_before_last = (
+            topk * (topk + 1) // 2
+            + topk * (n_full - 1 - topk)
+        )
+    return m * sum_before_last + (remainder + 1) * k_cap
+
+
 def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw):
     """Number of KV-cache *elements* retained for decoding token T+1.
 
@@ -357,7 +389,6 @@ def prefill_flops(op: str, T: int, **kw):
         # T = m + 1 (which actually compresses 2 blocks: one full +
         # one partial), undercounting the compression / indexer FLOPs
         # at non-divisible T. ``ceil(T / m)`` is the correct count.
-        n_blocks = (T + csa_m - 1) // csa_m if T > 0 else 0
         # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
         # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last
         # two are T*d*c_I.
@@ -379,54 +410,24 @@ def prefill_flops(op: str, T: int, **kw):
             + d * p['csa_nIh']
         )
         # Indexer: per-head similarities T * n_blocks * c_I * nIh, then
-        # weighted sum across heads T * n_blocks * nIh.
-        # The lightning indexer applies the causal block mask BEFORE top-k
-        # (csa_lightning_indexer masks non-causal blocks to -inf), so query t
-        # only scores floor(t / csa_m) valid (strictly preceding) blocks.
-        # Total causal (query, block) entries = sum_{t=0}^{T-1} floor(t / csa_m).
-        # For T = nb*m + r (nb = T // m, r = T % m), this equals
-        #   m * nb * (nb - 1) // 2 + r * nb
-        # (when T is a multiple of m, this simplifies to T*(nb-1)//2).
-        # The previous formula ``T*n_blocks - n_blocks*(n_blocks-1)//2`` was
-        # WRONG: it computed the full T*n_blocks product minus a small
-        # n_blocks-sized triangle, which is ~2x the correct count (verified:
-        # at T=512, m=16 it gave 15888 vs the correct 7936). This overcounted
-        # the indexer FLOPs by ~2x and biased flops_ratio_vs_gqa_*.
-        nb_raw = T // csa_m
-        r_rem = T - nb_raw * csa_m
-        causal_block_entries = csa_m * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
-        indexer = 2 * causal_block_entries * p['csa_cI'] * p['csa_nIh'] \
-                  + 2 * causal_block_entries * p['csa_nIh']
+        # weighted sum across heads T * n_blocks * nIh. The lightning
+        # indexer applies the window-close causal mask before top-k, so a
+        # block becomes visible at its final source token. Keep the exact
+        # count in one helper so the experiment accounting matches
+        # ops_csa._causal_block_mask and the decoding cache.
+        causal_entries = causal_block_entries(T, csa_m)
+        indexer = 2 * causal_entries * p['csa_cI'] * p['csa_nIh'] \
+                  + 2 * causal_entries * p['csa_nIh']
         # Core sparse attention: QK^T (c term) + softmax·V (c term).
         # ``csa_lightning_indexer`` clamps topk to ``min(topk, n_blocks)``
         # AND masks non-causal blocks to -inf before top-k, so the EFFECTIVE
-        # per-query topk is ``min(csa_topk, floor(t / csa_m))``. The AVERAGE
+        # per-query topk is ``min(csa_topk, (t + 1) // csa_m)``. The AVERAGE
         # effective topk over all queries is therefore
-        # ``sum_{t=0}^{T-1} min(csa_topk, t // csa_m) / T``.
-        #
-        # P0-4 fix (precise): the previous ``min(csa_topk, max(1, n_blocks // 2))``
-        # was a rough approximation that erred at short T. For example, at
-        # T = m = 16 (n_blocks = 1), every query has ZERO strictly-preceding
-        # blocks, so the true average effective topk is 0 — but the old
-        # formula returned ``min(topk, max(1, 0)) = min(topk, 1) = 1``,
-        # overcounting the core FLOPs by T*1*c*nh*4 = 16*1*16*8*4 = 8192
-        # FLOPs that don't actually happen. The precise closed form is:
-        #   Let k_cap = min(csa_topk, nb_raw).
-        #   total_sel = m * k_cap*(k_cap-1)/2       (k in [0, k_cap): each block contributes k*m)
-        #             + k_cap * m * (nb_raw - k_cap) (k in [k_cap, nb_raw): each contributes k_cap*m)
-        #             + k_cap * r_rem                (partial block: min(topk, nb_raw)*r_rem)
-        #   effective_topk = total_sel / T
-        # This is exact (no approximation) and O(1) (no Python loop).
-        if T > 0 and n_blocks > 0:
-            nb_raw = T // csa_m
-            r_rem = T - nb_raw * csa_m
-            k_cap = min(csa_topk, nb_raw)
-            total_sel = (csa_m * k_cap * (k_cap - 1) // 2
-                         + k_cap * csa_m * (nb_raw - k_cap)
-                         + k_cap * r_rem)
-            effective_topk = total_sel / T
-        else:
-            effective_topk = 0
+        # ``sum_t min(csa_topk, (t + 1) // csa_m) / T`` under the
+        # window-close mask. The helper counts the exact selected slots,
+        # including the final token of each complete source window.
+        total_sel = causal_selected_entries(T, csa_m, csa_topk)
+        effective_topk = total_sel / T if T > 0 else 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
@@ -451,7 +452,6 @@ def prefill_flops(op: str, T: int, **kw):
         # P1-4 fix: same ceil correction as the CSA branch above.
         # FLOPs use the logical block count (no ``max(1, ...)`` floor);
         # at T=0 there is no computation, so n_blocks=0 is correct.
-        n_blocks = (T + hca_m2 - 1) // hca_m2 if T > 0 else 0
         # KV-side compression: TWO input projections (W_KV, W_Z), each T*d*c.
         compress = 2 * T * d * hca_c * 2
         # Query-side projections (W_DQ, W_UQ) — previously OMITTED,
@@ -462,26 +462,12 @@ def prefill_flops(op: str, T: int, **kw):
         hca_nh = p.get('hca_nh', H)
         query_proj = 2 * T * (d * hca_dc + hca_dc * hca_c * hca_nh)
         # Core dense attention over the compressed blocks. The dense branch
-        # in naive_hca applies the causal block mask (query t attends only
-        # to blocks STRICTLY before floor(t / hca_m2)), so the actual number
-        # of (query, block) entries is sum_{t=0}^{T-1} floor(t / hca_m2).
-        # For T = nb*m2 + r (nb = T // m2, r = T % m2), this equals
-        #   m2 * nb * (nb - 1) // 2 + r * nb
-        # The previous formula ``T*n_blocks - n_blocks*(n_blocks-1)//2`` was
-        # WRONG (same bug as the CSA indexer branch): it gave ~2x the correct
-        # count (verified: at T=512, m2=64 it gave 4068 vs the correct 1792),
-        # overcounting HCA core FLOPs by ~2x and biasing flops_ratio_vs_gqa_*.
-        #
+        # uses the same window-close mask as ops_csa: a heavy-compression
+        # block becomes visible when its m2-token source window closes.
+        # Keep the exact (query, block) count shared with the test oracle.
+        causal_entries = causal_block_entries(T, hca_m2)
         # Head count: the HCA core attention uses ``hca_nh`` heads (NOT ``H``).
-        # The ``q`` tensor is shaped ``[B, T, hca_nh, c]`` (see
-        # ops_hca.py::naive_hca line 106), and both einsums iterate over the
-        # ``hca_nh`` axis. The previous formula used ``H`` here, which was
-        # correct only because the default config sets ``hca_nh == H == 8``.
-        # Use ``hca_nh`` so the formula matches the actual operator.
-        nb_raw = T // hca_m2
-        r_rem = T - nb_raw * hca_m2
-        causal_block_entries = hca_m2 * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
-        core = 2 * causal_block_entries * hca_c * hca_nh * 2
+        core = 2 * causal_entries * hca_c * hca_nh * 2
         # Sliding window: causal window (same fix as CSA above).
         # Same head-count fix as ``core`` above: the SW branch uses
         # ``hca_nh`` heads.

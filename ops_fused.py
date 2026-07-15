@@ -36,7 +36,7 @@ import torch.nn.functional as F
 
 from ops_csa import naive_csa
 from ops_hca import naive_hca
-from ops_kda import naive_recurrent_kda, naive_chunk_kda
+from ops_kda_backend import kda_forward, validate_kda_backend
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,11 @@ class HybridConfig:
     head_dim_k: int = 64        # K
     head_dim_v: int = 64        # V
     kda_chunk_size: int = 64
+    # KDA implementation backend. The default keeps the historical reference
+    # path so existing quality/ablation results do not change. ``fla`` is an
+    # optional flash-linear-attention backend; ``auto`` selects it only for
+    # CUDA tensors when it is installed and otherwise falls back to reference.
+    kda_backend: str = "reference"
     # CSA config
     csa_m: int = 16             # compression factor
     csa_topk: int = 8
@@ -128,6 +133,11 @@ class HybridConfig:
                 f"dropout in KDAHybridLayer / CSAHybridLayer / HCAHybridLayer "
                 f"before enabling it."
             )
+        # KDA backend selection is deliberately validated at config creation,
+        # while the optional FLA import remains lazy until a forward pass. This
+        # keeps the default reference experiments dependency-free and makes a
+        # typo fail before any model parameters are allocated.
+        validate_kda_backend(self.kda_backend)
         # GVA (Grouped Value Attention) constraint: KDA's recurrence requires
         # HV to be an integer multiple of H so that ``repeat_interleave(G, dim=2)``
         # can expand q/k from H heads to HV heads (G = HV // H). Without this
@@ -585,19 +595,18 @@ class KDAHybridLayer(nn.Module):
         # The chunk path is now wired in (previously ``kda_chunk_size`` was
         # a dead field — see the P1-4 fix in ``HybridConfig.__post_init__``).
         use_chunk = (cfg.kda_chunk_size >= 1 and T >= cfg.kda_chunk_size)
-        if use_chunk:
-            # F11 fix: ``naive_chunk_kda`` was imported inline on every
-            # ``use_chunk=True`` call; lift to the top of the module.
-            o, new_state = naive_chunk_kda(
-                q, k, v, g, beta, scale=self.scale,
-                initial_state=state, output_final_state=True,
-                chunk_size=cfg.kda_chunk_size,
-            )
-        else:
-            o, new_state = naive_recurrent_kda(
-                q, k, v, g, beta, scale=self.scale,
-                initial_state=state, output_final_state=True,
-            )
+        # Dispatch through the reference/FLA adapter. The adapter receives the
+        # already-normalized q/k, log-space g and post-sigmoid beta produced
+        # above, so an external backend must not activate them a second time.
+        o, new_state = kda_forward(
+            q, k, v, g, beta,
+            scale=self.scale,
+            initial_state=state,
+            output_final_state=True,
+            chunk_size=cfg.kda_chunk_size,
+            use_chunk=use_chunk,
+            backend=cfg.kda_backend,
+        )
         return self.o_proj(o.reshape(B, T, HV * V)), new_state, new_lookback
 
 

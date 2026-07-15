@@ -55,9 +55,9 @@ The bit-equivalence holds because:
     ``min(win, t+1)`` entries in causal order, so the softmax is over
     the same set of keys.
   * The indexer's top-k selection is over the same set of compressed
-    blocks (the causal block mask ``b < t // m`` excludes the block
-    containing ``t``, which is also the block we are currently
-    accumulating and have NOT yet pushed to the compressed block cache).
+    blocks (the causal block mask ``b < (t + 1) // m`` excludes a block
+    until its source window is complete; the partial block containing
+    ``t`` remains unavailable until it closes).
 
 Known limitation: torch.topk tie-breaking
 -----------------------------------------
@@ -421,8 +421,8 @@ class CSADecodingCache:
 
     The cache also tracks two counters: ``n_tokens_seen`` (total tokens
     appended) and ``n_blocks`` (compressed blocks produced). The former
-    is used to compute the causal block mask ``b < t // m`` for the
-    indexer; the latter is the length of the compressed block cache.
+    is used to compute the causal block mask ``b < (t + 1) // m`` for
+    the indexer; the latter is the length of the compressed block cache.
 
     Lifecycle
     ---------
@@ -808,26 +808,19 @@ class CSADecodingCache:
         )
         # The current query is at absolute position t = n_tokens_seen - 1
         # (we just appended it in ``append_step``). Its causal block
-        # mask is ``b < t // m``, i.e. it can attend to all completed
-        # blocks whose index is strictly less than ``t // m``. Blocks
-        # whose last token is at position >= t (i.e. the block
-        # containing t, or any future block) are excluded.
+        # mask is ``b < (t + 1) // m``: a block becomes visible when its
+        # source window closes. Blocks whose source window has not closed
+        # yet (including the partial block containing t) are excluded.
         t = self._n_tokens_seen - 1
-        # The block containing t is block ``t // m``. The currently-
-        # completed blocks are 0..(n_blocks - 1). If
-        # ``t // m <= n_blocks - 1`` (i.e. we just completed the block
-        # containing t in this same ``append_step`` call), that block
-        # is in the cache but must be EXCLUDED from the sparse attention
-        # for query t (the causal mask excludes the block containing t
-        # because its compressed representation aggregates t itself and
-        # any later tokens in the same block — attending to it would
-        # leak the current token's own value back into its query,
-        # which is fine for attention but does NOT match ``naive_csa``'s
-        # ``b < t // m`` mask).
+        # The block containing t is ``t // m``. It is visible only when
+        # its final source position has arrived, which is equivalent to
+        # ``b < (t + 1) // m``. A partial block is therefore kept out of
+        # the sparse path until it is complete.
         #
         # The causal_block_mask passed to ``csa_lightning_indexer`` is
-        # ``[T, n_blocks]`` (one row per query). With T=1, it's
-        # ``[1, n_blocks]`` with True for blocks whose index < t // m.
+        # ``[T, n_blocks]`` (one row per query). With T=1, it is
+        # ``[1, n_blocks]`` with True for blocks whose source windows have
+        # closed before or at the current query position.
         # Core-attention scale: compute ONCE here so it is available to
         # BOTH the sparse branch (below) and the sliding-window branch
         # (further down). Previously ``core_scale`` was assigned INSIDE the
@@ -852,9 +845,11 @@ class CSADecodingCache:
             )
         else:
             n_blocks = self._n_blocks
-            # Causal block mask: block b is valid iff b < t // m.
-            # With T=1, the mask is [1, n_blocks].
-            b_threshold = t // self.m
+            # Causal block mask: block b is valid iff
+            # b < (t + 1) // m. The block becomes visible when its
+            # source window closes, including the current token when it is
+            # the final token of that window.
+            b_threshold = (t + 1) // self.m
             cbm = torch.arange(n_blocks, device=device) < b_threshold   # [n_blocks]
             cbm = cbm[None, :]                                          # [1, n_blocks]
             # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
@@ -1231,7 +1226,9 @@ class HCADecodingCache:
             )
         else:
             n_blocks = self._n_blocks
-            b_threshold = t // self.m2
+            # A heavy-compression block is visible once its m2-token
+            # source window has closed.
+            b_threshold = (t + 1) // self.m2
             cbm = torch.arange(n_blocks, device=device) < b_threshold
             cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
             C_comp_n = F.normalize(

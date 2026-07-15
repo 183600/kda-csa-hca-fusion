@@ -1056,10 +1056,11 @@ def test_csa_indexer_validity(device='cpu'):
     t_grid = torch.arange(T, device=device).view(T, 1).expand(T, idx_safe.shape[-1])
     causal_per_slot = cbm[t_grid, idx_safe[0]] | (indices[0] < 0)  # [T, topk]
     causal_ok = causal_per_slot.all().item()
-    # For early queries (t < m), no preceding block exists, so all indices
-    # should be -1 (padded). Vectorized: (indices[0, :m] == -1).all().
-    early_ok = (indices[0, :m] == -1).all().item()
-    # Count check: every query t should have exactly min(topk, t // m)
+    # For early queries (t < m-1), the first source window is not closed,
+    # so all indices should be -1. At t=m-1 the first block is complete and
+    # becomes visible. Vectorized: (indices[0, :m-1] == -1).all().
+    early_ok = (indices[0, :max(0, m - 1)] == -1).all().item()
+    # Count check: every query t should have exactly min(topk, (t + 1) // m)
     # valid (non -1) indices. The docstring promises this check but the
     # original implementation never performed it; a bug where the indexer
     # returned e.g. only 2 of 4 valid indices (or 6 padded -1s with 2
@@ -1067,7 +1068,7 @@ def test_csa_indexer_validity(device='cpu'):
     # query, not just a sample, so an off-by-one or wrong-padding bug at
     # any t is caught.
     expected_counts = torch.tensor(
-        [min(topk, t // m) for t in range(T)], device=device)
+        [min(topk, (t + 1) // m) for t in range(T)], device=device)
     actual_counts = (indices[0] >= 0).sum(-1)                   # [T]
     count_ok = (actual_counts == expected_counts).all().item()
 
@@ -1075,9 +1076,30 @@ def test_csa_indexer_validity(device='cpu'):
         _ok('CSA indices in range', in_range, f'topk={topk}, n_blocks={n_blocks}'),
         _ok('CSA indices causal', causal_ok, 'all selected blocks precede query'),
         _ok('CSA early queries empty', early_ok,
-            f'queries t<{m} have no preceding block -> all -1'),
+            f'queries t<{m - 1} have no closed block -> all -1'),
         _ok('CSA index count per query', count_ok,
-            f'each query t has min(topk={topk}, t//m) valid indices'),
+            f'each query t has min(topk={topk}, (t+1)//m) valid indices'),
+    ]
+
+
+def test_causal_block_mask_window_close(device='cpu'):
+    """Boundary regression for the DeepSeek-V4 window-close contract."""
+    logger.info("Test: compressed block becomes visible when its source window closes")
+    T, m = 2 * 8 + 1, 8
+    mask = _causal_block_mask(T, T // m, m, device)
+    expected_counts = torch.tensor(
+        [(t + 1) // m for t in range(T)], device=device,
+    )
+    actual_counts = mask.sum(dim=-1)
+    boundary_ok = bool(torch.equal(actual_counts, expected_counts))
+    first_close_ok = bool(mask[7, 0].item()) if mask.shape[1] > 0 else False
+    first_before_close_ok = not bool(mask[6, 0].item())
+    return [
+        _ok("window-close mask counts", boundary_ok,
+            f"expected={expected_counts.tolist()}, actual={actual_counts.tolist()}"),
+        _ok("first block visible at t=m-1",
+            first_close_ok and first_before_close_ok,
+            "block 0 is hidden at t=m-2 and visible at t=m-1"),
     ]
 
 
@@ -1859,9 +1881,10 @@ def test_hca_sliding_window_causality(device='cpu'):
     For a perturbation at source position p, the query positions t whose
     output *may* legitimately change are:
       * Sliding-window branch: t in [p, p+win-1]  (p is in t's window)
-      * Dense MQA branch:      t >= (floor(p/m2)+1)*m2  (block-level causal)
+      * Dense MQA branch:      t >= (floor(p/m2)+1)*m2 - 1
+        (the heavy-compression window becomes visible when it closes)
     Everywhere else -- including all t < p (strict future) and the gap
-    [p+win, (floor(p/m2)+1)*m2) between the SW and dense regions --
+    [p+win, (floor(p/m2)+1)*m2 - 1) between the SW and dense regions --
     output[t] must be unchanged.  The gap check additionally verifies the
     SW window size is exactly ``win`` (a larger window would leak into the
     gap and be detected).
@@ -1905,11 +1928,11 @@ def test_hca_sliding_window_causality(device='cpu'):
 
     # Expected affected region for perturbing position p:
     #   SW branch:    p <= t < p + win
-    #   Dense branch: t >= (floor(p/m2) + 1) * m2
+    #   Dense branch: t >= (floor(p/m2) + 1) * m2 - 1
     p_grid = torch.arange(T, device=device)[:, None]
     t_grid = torch.arange(T, device=device)[None, :]
     sw_affected = (t_grid >= p_grid) & (t_grid < p_grid + win)
-    dense_affected = t_grid >= ((p_grid // m2) + 1) * m2
+    dense_affected = t_grid >= ((p_grid // m2) + 1) * m2 - 1
     expected_affected = sw_affected | dense_affected
 
     # Outside the expected region, diff must be ~0.  This covers both
@@ -1956,25 +1979,22 @@ def test_csa_full_pipeline_causality(device='cpu'):
     ``bp = p // m``):
       * Sliding-window branch: ``t in [p, p+win-1]``  (``p`` is in ``t``'s
         window).
-      * Sparse MQA branch: ``t >= (floor(p/m)+1)*m``.  Compressed block ``bp``
-        depends on ``p`` via the a-branch (``Ca[:, bp]`` reads position ``p``),
-        and is selectable by query ``t`` only when ``bp < t // m``, i.e.
-        ``t >= (bp+1)*m``.  Compressed block ``bp+1`` also depends on ``p`` via
-        the b-branch (``Cb[:, bp]``), but is only selectable when
-        ``t >= (bp+2)*m`` -- subsumed by the ``bp`` condition.
+      * Sparse MQA branch: ``t >= (floor(p/m)+1)*m - 1``. Compressed block
+        ``bp`` depends on ``p`` via the a-branch (``Ca[:, bp]`` reads position
+        ``p``), and is selectable once its source window closes. Compressed
+        block ``bp+1`` also depends on ``p`` via the b-branch, but becomes
+        visible one full window later.
     Everywhere else -- including all ``t < p`` (strict future must not affect
-    past) and the gap ``[p+win, (floor(p/m)+1)*m)`` between the SW and sparse
+    past) and the gap ``[p+win, (floor(p/m)+1)*m - 1)`` between the SW and sparse
     regions -- ``output[t]`` must be unchanged.  The gap check additionally
     verifies the SW window size is exactly ``win`` (a larger window would leak
     into the gap and be detected).
 
     Note on the lightning indexer: perturbing ``p`` also changes
     ``K_IComp`` (indexer keys) for blocks ``bp`` and ``bp+1``, and changes
-    ``q_idx``/``w_idx`` at position ``p`` only.  For any query ``t`` with
-    ``t // m <= bp``, blocks ``bp`` and ``bp+1`` are masked to ``-inf`` by the
-    causal block mask, so their key changes cannot alter the top-k selection;
-    consequently the sparse-branch affected region remains
-    ``t >= (bp+1)*m``.  The ``q_idx``/``w_idx`` perturbation only affects the
+    ``q_idx``/``w_idx`` at position ``p`` only.  A block is masked until its
+    source window closes, so the first affected compressed block becomes
+    selectable at ``t >= (bp+1)*m - 1``. The ``q_idx``/``w_idx`` perturbation only affects the
     selection (and thus output) at ``t == p``, which is already inside the SW
     affected region.
     """
@@ -2028,11 +2048,11 @@ def test_csa_full_pipeline_causality(device='cpu'):
 
     # Expected affected region for perturbing position p:
     #   SW branch:     p <= t < p + win
-    #   Sparse branch: t >= (floor(p/m) + 1) * m
+    #   Sparse branch: t >= (floor(p/m) + 1) * m - 1
     p_grid = torch.arange(T, device=device)[:, None]
     t_grid = torch.arange(T, device=device)[None, :]
     sw_affected = (t_grid >= p_grid) & (t_grid < p_grid + win)
-    sparse_affected = t_grid >= ((p_grid // m) + 1) * m
+    sparse_affected = t_grid >= ((p_grid // m) + 1) * m - 1
     expected_affected = sw_affected | sparse_affected
 
     # Outside the expected region, diff must be ~0.  This covers both
@@ -4096,13 +4116,12 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
     """Regression: ``prefill_flops`` must use the CORRECT causal block entry
     count for CSA/HCA, not the previous ~2x-overcounting formula.
 
-    The strict causal mask in ``ops_csa.py::_causal_block_mask`` is
-    ``b < t // m`` (query t attends only to STRICTLY preceding blocks). The
-    total number of valid (query, block) pairs is therefore
-    ``sum_{t=0}^{T-1} floor(t / m)``. For ``T = nb*m`` (the common case in
-    the benchmark sweep, where T is always a power of 2 and m is 16 or 64),
-    this equals ``m * nb * (nb - 1) // 2`` (which simplifies to
-    ``T * (nb - 1) // 2``).
+    The window-close causal mask in ``ops_csa.py::_causal_block_mask`` is
+    ``b < (t + 1) // m`` (query t can attend to a block once its source
+    window is complete). The total number of valid (query, block) pairs is
+    therefore ``sum_{t=0}^{T-1} floor((t + 1) / m)``. For ``T = nb*m`` this
+    equals ``m * nb * (nb - 1) // 2 + nb``; the final ``+nb`` term accounts
+    for the final token of each complete window.
 
     The previous formula ``T * n_blocks - n_blocks * (n_blocks - 1) // 2``
     was WRONG: it computed the full ``T * n_blocks`` product minus a small
@@ -4117,7 +4136,12 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
     """
     logger.info("Test: prefill_flops causal_block_entries correctness")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from run_kv_cache import prefill_flops, DEFAULTS
+    from run_kv_cache import (
+        DEFAULTS,
+        causal_block_entries,
+        causal_selected_entries,
+        prefill_flops,
+    )
 
     results = []
 
@@ -4136,11 +4160,9 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         # the test correct if non-divisible T values are added later.
         n_blocks = (T + csa_m - 1) // csa_m if T > 0 else 0
 
-        # Recompute each term with the CORRECT causal_block_entries.
-        nb_raw = T // csa_m
-        r_rem = T - nb_raw * csa_m
-        cbe_correct = csa_m * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
-        # The broken formula (for comparison):
+        # Recompute each term with the window-close causal oracle.
+        cbe_correct = causal_block_entries(T, csa_m)
+        # The old broken formula (for comparison):
         cbe_broken = T * n_blocks - n_blocks * (n_blocks - 1) // 2
 
         compress = 2 * T * d * (4 * csa_c + 2 * csa_cI)
@@ -4154,20 +4176,10 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
                           + 2 * cbe_correct * csa_nIh
         indexer_broken = 2 * cbe_broken * csa_cI * csa_nIh \
                          + 2 * cbe_broken * csa_nIh
-        # P0-4 fix (precise effective_topk): mirror the corrected formula in
-        # ``run_kv_cache.prefill_flops``. The previous test used the old
-        # approximate ``min(csa_topk, max(1, n_blocks // 2))`` which is what
-        # the production code used BEFORE the P0-4 fix; now that the
-        # production code uses the precise closed form
-        # ``sum_{t=0}^{T-1} min(topk, t // m) / T``, this test must match.
-        if T > 0 and n_blocks > 0:
-            k_cap = min(csa_topk, nb_raw)
-            total_sel = (csa_m * k_cap * (k_cap - 1) // 2
-                         + k_cap * csa_m * (nb_raw - k_cap)
-                         + k_cap * r_rem)
-            effective_topk = total_sel / T
-        else:
-            effective_topk = 0
+        # Mirror the exact window-close top-k count used by
+        # ``run_kv_cache.prefill_flops``.
+        total_sel = causal_selected_entries(T, csa_m, csa_topk)
+        effective_topk = total_sel / T if T > 0 else 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
@@ -4201,9 +4213,7 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         # P1-4 fix: same ceil correction as the CSA branch above.
         n_blocks = (T + hca_m2 - 1) // hca_m2 if T > 0 else 0
 
-        nb_raw = T // hca_m2
-        r_rem = T - nb_raw * hca_m2
-        cbe_correct = hca_m2 * nb_raw * (nb_raw - 1) // 2 + r_rem * nb_raw
+        cbe_correct = causal_block_entries(T, hca_m2)
         cbe_broken = T * n_blocks - n_blocks * (n_blocks - 1) // 2
 
         compress = 2 * T * d * hca_c * 2
@@ -5044,6 +5054,8 @@ def main():
     # Regression test for chunk-vs-recurrent gradient agreement (fp64).
     all_results += _run_safe(test_kda_chunk_vs_recurrent_gradient, device)
     all_results += _run_safe(test_csa_indexer_validity, device)
+    # Boundary regression: compressed blocks become visible when windows close.
+    all_results += _run_safe(test_causal_block_mask_window_close, device)
     # P0 regression: w_idx=None branch of csa_lightning_indexer.
     all_results += _run_safe(test_csa_indexer_w_idx_none, device)
     # P0 regression: topk=0 guard pushed down into csa_lightning_indexer.

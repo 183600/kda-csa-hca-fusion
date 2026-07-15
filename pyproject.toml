@@ -75,6 +75,13 @@ dev = [
     "mypy>=1.0,<2.0",          # type-check the annotations
     "ruff>=0.4,<0.10",         # linter + formatter (PEP 8 compliant)
 ]
+# Optional GPU KDA backend. It is intentionally not part of the default
+# dependency set: reference experiments must remain runnable without FLA, and
+# the adapter falls back to the reference implementation only when the caller
+# selects ``kda_backend='auto'``.
+fla = [
+    "flash-linear-attention>=0.5.0,<0.6",
+]
 
 [project.urls]
 "Source" = "https://gitee.com/qwe12345678/kda-csa-hca-fusion"
@@ -91,6 +98,7 @@ dev = [
 [tool.setuptools]
 py-modules = [
     "ops_kda",
+    "ops_kda_backend",
     "ops_csa",
     "ops_hca",
     "ops_fused",

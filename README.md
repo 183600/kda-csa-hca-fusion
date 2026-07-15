@@ -53,7 +53,8 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 
 ```
 .
-├── ops_kda.py             # KDA: naive_recurrent_kda, naive_chunk_kda
+├── ops_kda.py             # KDA reference: naive_recurrent_kda, naive_chunk_kda
+├── ops_kda_backend.py     # Optional KDA backend adapter: reference / FLA / auto
 ├── ops_csa.py             # CSA: compress_kv (overlapped), lightning indexer, naive_csa
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
 ├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache (incremental decode)
@@ -96,7 +97,26 @@ pip install -e .        # installs torch, einops, matplotlib, numpy, scipy
 
 # 3. (Optional) Install dev tooling (pytest, pytest-xdist, mypy, ruff):
 pip install -e .[dev]
+
+# 4. (Optional) Install the FLA KDA backend. This does not change the
+#    default reference experiments; it is selected explicitly in HybridConfig.
+pip install -e '.[fla]'
 ```
+
+The default `HybridConfig(kda_backend="reference")` preserves the original
+PyTorch KDA implementation. To opt into FLA for GPU experiments:
+
+```python
+from ops_fused import HybridConfig
+cfg = HybridConfig(kda_backend="fla")
+```
+
+Use `kda_backend="auto"` to try FLA only for CUDA tensors when it is installed
+and otherwise fall back to the reference path. The adapter passes the already
+normalized q/k, log-space gate, and post-sigmoid beta values without applying
+those transformations a second time. CSA/HCA remain on the repository
+reference path; no Hugging Face or vLLM dependency is required for the normal
+experiments.
 
 After `pip install -e .`, the experiment scripts can be run as modules:
 
@@ -348,6 +368,12 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   on GPU at `T≥1024`); `ops_kda.scripted_chunk_kda` wraps the chunked
   path's inner loop with `torch.jit.script` (bit-identical to the eager
   path). The naive paths remain the default for correctness / readability.
+  **Optional backend (added):** `HybridConfig(kda_backend="fla")` routes the
+  KDA recurrence through `flash-linear-attention` when the `[fla]` extra is
+  installed. `kda_backend="auto"` uses FLA only on CUDA and otherwise keeps
+  the reference path. The adapter is intentionally KDA-only; CSA/HCA continue
+  to use the local reference implementations so quality experiments retain
+  one consistent custom architecture.
 * **STE for CSA indexer.** The default straight-through estimator
   (`ste_mode='topk_columns'`) routes gradient through the top-k selected
   columns of `soft_weights` (see `ops_csa.py::naive_csa`). Non-selected
@@ -402,11 +428,13 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 * **Dropout unimplemented.** `HybridConfig.dropout != 0` raises
   `NotImplementedError` rather than silently no-op'ing. MQAR-scale models
   don't need dropout; larger runs should wire it in (or remove the field).
-* **Causal block mask is strict-prefix.** `_causal_block_mask` uses
-  `b < t // m` — the block containing `t` is never attended to (its
-  compressed representation aggregates future tokens). The sliding-window
-  branch handles intra-block / near-context attention. This is correct
-  but easy to misread; document it in any derivative work.
+* **Causal block mask is window-close based.** `_causal_block_mask` uses
+  `b < (t + 1) // m`: a compressed block becomes visible when its full
+  source window closes. For example, with `m=8`, the block covering
+  positions `0..7` is visible at query `t=7`; it is not future information
+  because the whole source window is complete. The decoding caches use the
+  same rule. This matches the DeepSeek-V4 cache/mask contract and is covered
+  by the boundary tests in `run_correctness.py`.
 * **Cosine scale is fixed at 1.0.** `naive_csa` / `naive_hca` L2-normalize
   `q` and `C_comp` and use `scale=1.0` (a deliberate fix — the old
   `c ** -0.5` flattened softmax). The repository experiments now also pass
