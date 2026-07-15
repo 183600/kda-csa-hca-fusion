@@ -580,24 +580,52 @@ class KDAAttn(nn.Module):
         self.g_up = nn.Linear(K, H * K, bias=False)
         self.beta = nn.Linear(d_model, H, bias=False)
         self.o = nn.Linear(H * V, d_model, bias=False)
+        # Round-10 fix (R2-A): add the causal depthwise short-conv (kernel=3)
+        # that KDAHybridLayer (ops_fused.py:307) and KDAAttnDecoding
+        # (run_decoding.py:283) both have. Without it, Exp 4 KDA accuracy
+        # is measured on a stripped-down KDA missing the short-conv mixing
+        # that the hybrid model and the decode benchmark both use — making
+        # cross-experiment KDA comparisons confounded and the run_kv_cache
+        # ``short_conv`` FLOPs term (line 340) inconsistent with the actual
+        # op measured here. The same bug was already fixed for
+        # KDAAttnDecoding in commit 2a23300 (P0-4) but the parallel fix
+        # was never applied here. Exp 4 runs on full sequences (not
+        # streaming), so we left-pad with zeros each call (causal, no
+        # future leakage) and do NOT carry a persistent ``_conv_lookback``
+        # buffer (unlike KDAHybridLayer / KDAAttnDecoding which need it
+        # for autoregressive decode).
+        self.short_conv = nn.Conv1d(
+            d_model, d_model, kernel_size=3, padding=0,
+            groups=d_model, bias=True,
+        )
         self.H, self.K, self.V = H, K, V
 
     def forward(self, x):
         B, T, d = x.shape
+        # Round-10 fix (R2-A): apply the causal depthwise short-conv before
+        # the q/k/v/g/beta projections, mirroring KDAHybridLayer.forward
+        # (ops_fused.py:501) and KDAAttnDecoding.forward
+        # (run_decoding.py:326). Left-pad by (ksize-1)=2 zeros so position
+        # t sees {t-2, t-1, t} and NEVER t+1 (future leakage). Conv1d
+        # padding=0; the F.pad does the causal left-pad explicitly.
+        ksize = self.short_conv.kernel_size[0]
+        x_conv = self.short_conv(
+            F.pad(x.transpose(1, 2), (ksize - 1, 0))
+        ).transpose(1, 2)
         # View BEFORE normalize: F.normalize(dim=-1) must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector. The
         # previous form normalized the full H*K vector, shrinking each
         # head's L2 norm to ~1/sqrt(H) and under-scaling q.k dot products
         # by 1/H. Mirrors the fix in ops_fused.py::KDAHybridLayer.
-        q = F.normalize(F.silu(self.q(x)).view(B, T, self.H, self.K), dim=-1)
-        k = F.normalize(F.silu(self.k(x)).view(B, T, self.H, self.K), dim=-1)
-        v = F.silu(self.v(x)).view(B, T, self.H, self.V)
+        q = F.normalize(F.silu(self.q(x_conv)).view(B, T, self.H, self.K), dim=-1)
+        k = F.normalize(F.silu(self.k(x_conv)).view(B, T, self.H, self.K), dim=-1)
+        v = F.silu(self.v(x_conv)).view(B, T, self.H, self.V)
         # Log-space gate: low-rank down/up with a softplus-style decay,
         # matching ops_fused.KDAHybridLayer and run_kv_cache.prefill_flops.
         # Uses the named DECAY_SCALE constant so all KDA instantiations agree.
-        g = -F.softplus(self.g_up(self.g_down(x))).view(
+        g = -F.softplus(self.g_up(self.g_down(x_conv))).view(
             B, T, self.H, self.K) * self.DECAY_SCALE
-        beta = torch.sigmoid(self.beta(x))
+        beta = torch.sigmoid(self.beta(x_conv))
         out, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return self.o(out.reshape(B, T, self.H * self.V))
 

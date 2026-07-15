@@ -4481,6 +4481,22 @@ def test_standalone_kda_gate_matches_hybrid(device='cpu'):
             and m.g_up.out_features == H * K
         )
 
+    # Round-10 fix (R2-A): both standalone KDA wrappers must also have the
+    # causal depthwise short-conv that KDAHybridLayer has, so Exp 4 KDA
+    # accuracy is measured on the same operator boundary as the hybrid
+    # model and the decode benchmark.
+    def _short_conv_ok(m):
+        if not hasattr(m, 'short_conv'):
+            return False
+        sc = m.short_conv
+        # Conv1d.kernel_size and .padding are tuples (e.g. (3,) / (0,))
+        return (
+            isinstance(sc, torch.nn.Conv1d)
+            and tuple(sc.kernel_size) == (3,)
+            and sc.groups == d_model
+            and tuple(sc.padding) == (0,)
+        )
+
     x = torch.randn(2, 4, d_model, device=device) * 0.1
     with torch.no_grad():
         y_quality = quality(x)
@@ -4495,6 +4511,12 @@ def test_standalone_kda_gate_matches_hybrid(device='cpu'):
             f'attrs={list(dict(quality.named_children()).keys())}'),
         _ok('run_decoding.KDAAttnDecoding uses low-rank gate', _gate_ok(decoding),
             f'attrs={list(dict(decoding.named_children()).keys())}'),
+        _ok('run_quality.KDAAttn has causal short_conv (R2-A)',
+            _short_conv_ok(quality),
+            f'short_conv={getattr(quality, "short_conv", None)}'),
+        _ok('run_decoding.KDAAttnDecoding has causal short_conv (R2-A)',
+            _short_conv_ok(decoding),
+            f'short_conv={getattr(decoding, "short_conv", None)}'),
         _ok('standalone KDA wrappers still produce finite outputs',
             shape_ok and finite_ok,
             f'y_quality={tuple(y_quality.shape)}, '
