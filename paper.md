@@ -173,6 +173,27 @@ All numbers below were obtained by running the official scripts on the `feat/...
 
 All 230+ tests in `run_correctness.py` pass on the branch (including STE gradient flow, causality under overlap, decoding cache equivalence, NaN-safe paths, and KDA chunk vs recurrent parity within fp32 tolerance).
 
+### 6.3 Independent Verification (Smoke Test)
+
+We provide `verify_experiments.py` that exercises the core paths used in the paper:
+
+```bash
+python verify_experiments.py --quick
+```
+
+**Smoke test results (CPU, 2026-07-15)**:
+
+- kda_recurrent: PASS (shape correct + finite)
+- kda_chunk:     PASS (shape correct + finite)
+- csa:           PASS (shape correct + finite)
+- hca:           PASS (shape correct + finite)
+- hybrid (3KDA+CSA+HCA): PASS (layout works)
+- training_smoke (forward+backward): PASS (loss finite, gradients present)
+
+All core operators execute without runtime errors or NaN/Inf outputs under the tested conditions. Full results are written to `results/verification_smoke.json` (or the safe summary when JSON edge cases appear with torch objects).
+
+This smoke test + the 230+ regression suite gives high confidence that the reference implementations are numerically sound for research use.
+
 ## 7. Limitations & Future Work
 
 **Current limitations**:
