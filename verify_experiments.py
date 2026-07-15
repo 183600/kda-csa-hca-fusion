@@ -40,11 +40,15 @@ class VerificationResult:
     passed: bool
     detail: str
     time_s: float
-    extra: Dict[str, Any] = None
+    extra: dict = None
 
-def _rand(shape, device, dtype=torch.float32, scale=0.1, gen=None):
-    t = torch.randn(*shape, device=device, dtype=dtype, generator=gen)
+def _rand(shape, device, dtype=torch.float32, scale=0.1, generator=None):
+    if generator is not None:
+        t = torch.randn(*shape, device=device, dtype=dtype, generator=generator)
+    else:
+        t = torch.randn(*shape, device=device, dtype=dtype)
     return (t * scale).requires_grad_(True)
+
 
 def verify_kda_recurrent(device):
     B, T, H, K, V = 2, 64, 4, 32, 32
@@ -156,7 +160,7 @@ def verify_hybrid(device):
     dt = time.time() - t0
 
     ok = o.shape == (2, 64, 64) and torch.isfinite(o).all()
-    return VerificationResult("hybrid", ok, f"layout={model.layout_str()}", dt, {"params": sum(p.numel() for p in model.parameters())})
+    return VerificationResult("hybrid", ok, f"layout={model.layout_str()}", dt, {"params": int(sum(p.numel() for p in model.parameters()))})
 
 def verify_training_smoke(device):
     """Tiny forward + backward on the hybrid LM head."""
@@ -216,7 +220,15 @@ def main():
         "device": str(device),
         "torch_version": torch.__version__,
         "all_pass": all_pass,
-        "results": [asdict(r) for r in results],
+        "results": [
+        {
+            "name": r.name,
+            "passed": r.passed,
+            "detail": r.detail,
+            "time_s": r.time_s,
+            "extra": {k: (int(v) if isinstance(v, (int, float)) or (hasattr(v, "item") and callable(v.item)) else str(v)) for k, v in (r.extra or {}).items()} if r.extra else None
+        } for r in results
+    ],
     }
 
     os.makedirs("results", exist_ok=True)
