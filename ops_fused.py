@@ -231,7 +231,7 @@ class HybridConfig:
             ('n_csa', self.n_csa),
             ('n_hca', self.n_hca),
         ]:
-            if not isinstance(val, int):
+            if not isinstance(val, int) or isinstance(val, bool):
                 raise ValueError(
                     f"HybridConfig.{name}={val!r} must be an int.")
             if val < 0:
@@ -250,24 +250,31 @@ class HybridConfig:
         # negative values would crash ``torch.topk``. nh must be >= 1
         # (it's a head count). sliding_window=0 disables the branch
         # (valid); negative would silently skip the branch.
-        if not isinstance(self.csa_topk, int) or self.csa_topk < 0:
+        if (not isinstance(self.csa_topk, int) or isinstance(self.csa_topk, bool)
+                or self.csa_topk < 0):
             raise ValueError(
                 f"csa_topk={self.csa_topk!r} must be a non-negative int "
                 f"(0 disables sparse selection; negative would crash "
                 f"torch.topk).")
-        if not isinstance(self.csa_nh, int) or self.csa_nh < 1:
+        if (not isinstance(self.csa_nh, int) or isinstance(self.csa_nh, bool)
+                or self.csa_nh < 1):
             raise ValueError(
                 f"csa_nh={self.csa_nh!r} must be a positive int (head count).")
-        if not isinstance(self.csa_sliding_window, int) or self.csa_sliding_window < 0:
+        if (not isinstance(self.csa_sliding_window, int)
+                or isinstance(self.csa_sliding_window, bool)
+                or self.csa_sliding_window < 0):
             raise ValueError(
                 f"csa_sliding_window={self.csa_sliding_window!r} must be a "
                 f"non-negative int (0 disables the branch; negative would "
                 f"silently skip the sliding-window code path).")
         # HCA-specific: mirrors CSA's checks for the HCA analogs.
-        if not isinstance(self.hca_nh, int) or self.hca_nh < 1:
+        if (not isinstance(self.hca_nh, int) or isinstance(self.hca_nh, bool)
+                or self.hca_nh < 1):
             raise ValueError(
                 f"hca_nh={self.hca_nh!r} must be a positive int (head count).")
-        if not isinstance(self.hca_sliding_window, int) or self.hca_sliding_window < 0:
+        if (not isinstance(self.hca_sliding_window, int)
+                or isinstance(self.hca_sliding_window, bool)
+                or self.hca_sliding_window < 0):
             raise ValueError(
                 f"hca_sliding_window={self.hca_sliding_window!r} must be a "
                 f"non-negative int (0 disables the branch; negative would "
