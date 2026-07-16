@@ -228,6 +228,12 @@ def fig_benchmark():
 
     device = next((r.get('device', 'cpu') for r in data if 'error' not in r),
                   'cpu')
+    backend_values = sorted({r.get('kda_backend') for r in data
+                             if r.get('kda_backend') is not None})
+    backend_note = (
+        f"KDA backend: {', '.join(backend_values)}"
+        if backend_values else "KDA backend: reference (legacy result schema)"
+    )
 
     n_subplots = len(ordered_boundaries)
     if n_subplots == 0:
@@ -267,7 +273,8 @@ def fig_benchmark():
     fig.suptitle(
         'Operator latency vs. sequence length — split by compute boundary\n'
         'WARNING: each subplot uses a DIFFERENT measurement boundary; '
-        'cross-subplot comparison is NOT apples-to-apples',
+        'cross-subplot comparison is NOT apples-to-apples\n'
+        + backend_note,
         fontsize=10, fontweight='bold')
 
     _ensure_figures_dir()
@@ -903,9 +910,15 @@ def fig_decoding():
         ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=7)
     device = next((r.get('device', 'cpu') for r in data if 'error' not in r),
                   'cpu')
+    backend_values = sorted({r.get('kda_backend') for r in data
+                             if r.get('kda_backend') is not None})
+    backend_note = (
+        f"KDA backend: {', '.join(backend_values)}"
+        if backend_values else "KDA backend: reference (legacy result schema)"
+    )
     ax.set_xlabel('Cached context length (tokens)')
     ax.set_ylabel(f'Per-token decode latency (ms, {device})')
-    ax.set_title('Decoding latency vs. cached context length')
+    ax.set_title('Decoding latency vs. cached context length\n' + backend_note)
     ax.set_xscale('log', base=2)
     ax.set_yscale('log')
     ax.legend(fontsize=9)
