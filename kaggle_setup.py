@@ -42,6 +42,7 @@ import re
 import shutil
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -734,16 +735,19 @@ def write_json_atomic(payload, target_path: str, *, indent: int = 2,
 
 
 def make_seeded_generator(seed: int, device=None):
-    """Create a seeded ``torch.Generator`` with a safe CPU fallback.
+    """Create a seeded generator compatible with the requested device.
 
-    P2-1 helper (round 3): older torch builds or CPU-only installs do not
-    support ``torch.Generator(device='cuda')`` (raises ``RuntimeError``).
-    A bare ``torch.Generator(device=device)`` in those environments crashes
-    experiment startup (Exp2/4/5/6). This helper tries the requested device
-    first and falls back to a CPU generator, which is still accepted by
-    ``torch.randn(..., device='cuda', generator=cpu_gen)`` (the RNG draws
-    happen on CPU, then tensors are materialized on the target device;
-    determinism is preserved).
+    CUDA random ops require a CUDA generator; passing a CPU generator to
+    ``torch.randn(..., device='cuda', generator=...)`` raises
+    ``Expected a 'cuda' device type for generator but found 'cpu'``. The old
+    fallback returned a CPU generator after CUDA-generator construction failed,
+    so Exp2/4/5/6 could crash exactly at their first GPU random draw.
+
+    For an old CUDA build that cannot construct a device-specific generator,
+    seed the global CUDA generator and return ``None``. Callers already pass
+    this value as ``generator=...``; ``None`` selects the correctly-typed global
+    CUDA generator and preserves deterministic execution within that process.
+    CPU callers still receive an independent CPU generator.
 
     Args:
         seed: integer seed (callers are responsible for choosing a
@@ -757,7 +761,20 @@ def make_seeded_generator(seed: int, device=None):
         device = torch.device(device)
     try:
         return torch.Generator(device=device).manual_seed(int(seed))
-    except Exception:
+    except Exception as exc:
+        if device.type == 'cuda':
+            # A CPU generator cannot be passed to CUDA random ops. Fall back
+            # to the device's global generator rather than returning an
+            # incompatible CPU object.
+            torch.cuda.manual_seed(int(seed))
+            warnings.warn(
+                "CUDA device-specific torch.Generator is unavailable; "
+                "using the seeded global CUDA generator. Per-generator RNG "
+                f"isolation is unavailable ({type(exc).__name__}: {exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
         g = torch.Generator()
         g.manual_seed(int(seed))
         return g
