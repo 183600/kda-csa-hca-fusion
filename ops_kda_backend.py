@@ -153,7 +153,8 @@ def kda_forward(
     repository dispatch. ``backend='fla'`` requires FLA and raises an
     actionable ImportError when it is not installed. ``backend='auto'`` uses
     FLA only for CUDA tensors when it is importable; unsupported FLA argument
-    combinations fall back to the reference implementation. ``g_clamp_min``
+    combinations (including assertion-based checks in older FLA releases)
+    fall back to the reference implementation. ``g_clamp_min``
     is applied before both backends so their gate contract matches.
     """
     global _fla_import_warning_emitted
@@ -182,7 +183,7 @@ def kda_forward(
                     use_chunk=use_chunk,
                     g_clamp_min=g_clamp_min,
                 )
-            except (ImportError, ValueError, NotImplementedError) as exc:
+            except (ImportError, ValueError, NotImplementedError, AssertionError) as exc:
                 if backend == "fla":
                     raise
                 warnings.warn(
