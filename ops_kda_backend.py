@@ -129,7 +129,17 @@ def _call_fla(
         raise RuntimeError(
             "The installed FLA KDA operator returned an unexpected result; "
             "expected (output, final_state).")
-    return result[0], result[1]
+    output, final_state = result[0], result[1]
+    # Match the repository reference contract: outputs retain the caller's
+    # value dtype, while recurrent state stays in compute precision (fp32 for
+    # fp16/bf16 inputs, fp64 for fp64 inputs). Without this normalization,
+    # FLA may return a low-precision state and long decode sessions accumulate
+    # avoidable quantization error compared with the reference path.
+    output = output.to(dtype=v.dtype)
+    if output_final_state and final_state is not None:
+        state_dtype = torch.float64 if v.dtype == torch.float64 else torch.float32
+        final_state = final_state.to(dtype=state_dtype)
+    return output, final_state
 
 
 def kda_forward(
