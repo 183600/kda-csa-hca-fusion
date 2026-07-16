@@ -23,6 +23,7 @@ import torch
 
 _VALID_BACKENDS = {"reference", "fla", "auto"}
 _fla_import_warning_emitted = False
+_FLA_OPS: tuple[Any, Any] | None = None
 
 
 def validate_kda_backend(backend: str) -> str:
@@ -35,7 +36,10 @@ def validate_kda_backend(backend: str) -> str:
 
 
 def _load_fla_ops():
-    """Import FLA lazily so it remains an optional dependency."""
+    """Import FLA lazily once so the decode hot path has no import lookup."""
+    global _FLA_OPS
+    if _FLA_OPS is not None:
+        return _FLA_OPS
     try:
         from fla.ops.kda import chunk_kda, fused_recurrent_kda
     except ImportError as exc:
@@ -44,7 +48,8 @@ def _load_fla_ops():
             "'flash-linear-attention'. Install it with "
             "pip install -e '.[fla]' or choose kda_backend='reference'."
         ) from exc
-    return chunk_kda, fused_recurrent_kda
+    _FLA_OPS = (chunk_kda, fused_recurrent_kda)
+    return _FLA_OPS
 
 
 def fla_available() -> bool:
