@@ -164,10 +164,52 @@ def test_kda_backend_reference_dispatch(device='cpu'):
         validate_kda_backend('not-a-backend')
     except ValueError:
         invalid_ok = True
+
+    # Optional GPU smoke/parity check. It is deliberately skipped when FLA is
+    # not installed, so the default reference test suite remains dependency-
+    # free. The K=V=128 shape also exercises the current FlashKDA-supported
+    # head dimension when the optional package is present.
+    fla_ok = True
+    fla_detail = 'not requested on CPU'
+    if torch.device(device).type == 'cuda':
+        if not fla_available():
+            fla_detail = 'FLA not installed; optional check skipped'
+        else:
+            try:
+                qf = F.normalize(torch.randn(1, 5, 1, 128, device=device), dim=-1)
+                kf = F.normalize(torch.randn(1, 5, 1, 128, device=device), dim=-1)
+                vf = torch.randn(1, 5, 1, 128, device=device) * 0.01
+                gf = -torch.rand(1, 5, 1, 128, device=device) * 0.05
+                bf = torch.rand(1, 5, 1, device=device) * 0.2
+                with torch.inference_mode():
+                    fo, fs = kda_forward(
+                        qf, kf, vf, gf, bf,
+                        output_final_state=True,
+                        use_chunk=False,
+                        backend='fla',
+                    )
+                    ro, rs = kda_forward(
+                        qf, kf, vf, gf, bf,
+                        output_final_state=True,
+                        use_chunk=False,
+                        backend='reference',
+                    )
+                fla_ok = (
+                    fo.shape == ro.shape
+                    and fs.shape == rs.shape
+                    and torch.isfinite(fo).all().item()
+                    and torch.isfinite(fs).all().item()
+                    and torch.allclose(fo.float(), ro.float(), atol=5e-2, rtol=5e-2)
+                )
+                fla_detail = f'max_output_diff={(fo.float() - ro.float()).abs().max().item():.3e}'
+            except Exception as exc:
+                fla_ok = False
+                fla_detail = f'{type(exc).__name__}: {exc}'
     return [
         _ok('KDA reference adapter output unchanged', output_ok, ''),
         _ok('KDA reference adapter state unchanged', state_ok, ''),
         _ok('KDA backend rejects invalid name', invalid_ok, ''),
+        _ok('optional FLA KDA smoke/parity', fla_ok, fla_detail),
     ]
 
 

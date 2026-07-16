@@ -219,7 +219,7 @@ runs during development.
 | `results/exp4_mqar.json` | `{metadata, results: [{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]}` | multi-seed with CI95 + Bonferroni |
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper |
 | `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches) |
-| `results/summary.json` | `{env, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
+| `results/summary.json` | `{env: {git_commit, torch_version, cuda_version, kda_backend, ...}, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
 
 > **Known schema inconsistency.** Exp 4 wraps its results in
 > `{metadata, results: [...]}`; the other experiments emit a bare list. We

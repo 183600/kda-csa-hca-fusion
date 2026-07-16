@@ -293,7 +293,12 @@ def run_all(seeds=None, steps=None):
         os.environ['RESULTS_DIR'] = os.path.join(out_root, 'results')
         os.environ['FIGURES_DIR'] = os.path.join(out_root, 'figures')
 
-        summary = {'env': repr(info), 'runs': []}
+        # Store structured provenance rather than only ``repr(EnvInfo)`` so
+        # the summary records git commit, torch/CUDA versions, thread count,
+        # and the selected KDA backend. This matters when comparing a
+        # reference run with a later FLA run.
+        from kaggle_setup import capture_provenance
+        summary = {'env': capture_provenance(), 'runs': []}
 
         # Import after deps are installed.
         import run_correctness
