@@ -1175,7 +1175,9 @@ def _parse_nkv_list(env_var, default='1'):
     if any(v < 1 for v in vals):
         raise ValueError(
             f'{env_var} values must be positive integers, got {vals!r}')
-    return vals
+    # Preserve user order while removing duplicates; duplicate task settings
+    # would repeat identical experiments and overweight them in summaries.
+    return list(dict.fromkeys(vals))
 
 
 def main():
