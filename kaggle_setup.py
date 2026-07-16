@@ -561,6 +561,7 @@ def capture_provenance() -> dict:
         'cuda_version': info.cuda_version,
         'device_name': info.device_name,
         'git_commit': git_commit,
+        'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
         'pythonhashseed': os.environ.get('PYTHONHASHSEED', '<unset>'),
         'num_threads': info.num_threads,
     }

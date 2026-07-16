@@ -51,6 +51,7 @@ from ops_kda import (
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig, KDAHybridLayer
+from ops_kda_backend import fla_available, kda_forward, validate_kda_backend
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,37 @@ def test_kda_chunk_vs_recurrent(device='cpu'):
         _ok('state max abs diff', s_diff < TOL['bit_match'][torch.float32], f'{s_diff:.2e}'),
     ]
     return results
+
+
+def test_kda_backend_reference_dispatch(device='cpu'):
+    """The backend adapter must preserve the reference KDA contract."""
+    logger.info("Test: KDA backend reference dispatch")
+    torch.manual_seed(101)
+    B, T, H, K, V = 1, 5, 2, 4, 4
+    q = F.normalize(torch.randn(B, T, H, K, device=device), dim=-1)
+    k = F.normalize(torch.randn(B, T, H, K, device=device), dim=-1)
+    v = torch.randn(B, T, H, V, device=device) * 0.1
+    g = -torch.rand(B, T, H, K, device=device) * 0.05
+    beta = torch.rand(B, T, H, device=device) * 0.2
+    direct_o, direct_s = naive_recurrent_kda(
+        q, k, v, g, beta, output_final_state=True,
+    )
+    routed_o, routed_s = kda_forward(
+        q, k, v, g, beta, output_final_state=True,
+        backend='reference', use_chunk=False,
+    )
+    output_ok = torch.allclose(routed_o, direct_o, atol=0.0, rtol=0.0)
+    state_ok = torch.allclose(routed_s, direct_s, atol=0.0, rtol=0.0)
+    invalid_ok = False
+    try:
+        validate_kda_backend('not-a-backend')
+    except ValueError:
+        invalid_ok = True
+    return [
+        _ok('KDA reference adapter output unchanged', output_ok, ''),
+        _ok('KDA reference adapter state unchanged', state_ok, ''),
+        _ok('KDA backend rejects invalid name', invalid_ok, ''),
+    ]
 
 
 def test_kda_gva(device='cpu'):
@@ -5028,6 +5060,7 @@ def main():
     logger.info('=' * 70)
     all_results = []
     all_results += _run_safe(test_kda_chunk_vs_recurrent, device)
+    all_results += _run_safe(test_kda_backend_reference_dispatch, device)
     all_results += _run_safe(test_kda_gva, device)
     all_results += _run_safe(test_kda_chunk_gva, device)
     # Review-fix 1.1-a regression: compiled_recurrent_kda(fullgraph=True)
