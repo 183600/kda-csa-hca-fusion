@@ -111,6 +111,16 @@ import torch.nn.functional as F
 from ops_csa import csa_lightning_indexer
 
 
+def _validate_cache_dtype(dtype) -> None:
+    """Reject integer/bool cache storage before normalize or matmul paths."""
+    try:
+        is_float = torch.empty((), dtype=dtype).is_floating_point()
+    except (TypeError, RuntimeError) as exc:
+        raise TypeError(f'cache dtype must be a floating torch.dtype, got {dtype!r}') from exc
+    if not is_float:
+        raise TypeError(f'cache dtype must be floating-point, got {dtype!r}')
+
+
 # =============================================================================
 # Internal helpers
 # =============================================================================
@@ -483,6 +493,7 @@ class CSADecodingCache:
         if win < 0:
             raise ValueError(f"win={win} must be >= 0 (0 disables SW)")
         self.B, self.c, self.c_I, self.m, self.win = B, c, c_I, m, win
+        _validate_cache_dtype(dtype)
         self.device, self.dtype = torch.device(device), dtype
         self.reset()
 
@@ -1084,6 +1095,7 @@ class HCADecodingCache:
         if win < 0:
             raise ValueError(f"win={win} must be >= 0 (0 disables SW)")
         self.B, self.c, self.m2, self.win = B, c, m2, win
+        _validate_cache_dtype(dtype)
         self.device, self.dtype = torch.device(device), dtype
         self.reset()
 
