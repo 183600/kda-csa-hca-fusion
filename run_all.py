@@ -44,10 +44,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import traceback
+from importlib import metadata as importlib_metadata
 
 # Ensure the experiments directory is on the path when run as a script.
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,35 +57,61 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 
-def _ensure_deps():
-    """Install einops and matplotlib if missing, using the SAME version
-    constraints as pyproject.toml.
+def _version_tuple(raw: str) -> tuple[int, ...]:
+    """Parse the numeric prefix of a package version for bound checks."""
+    parts = re.findall(r"\d+", raw)
+    return tuple(int(x) for x in parts[:3]) or (0,)
 
-    P1-4 fix: previously this function installed ``einops`` and
-    ``matplotlib`` with NO version constraints, which could pull breaking
-    releases (einops 0.8 changed error messages; matplotlib 3.10 dropped
-    deprecated APIs). The pyproject.toml pins ``einops>=0.6,<0.9`` and
-    ``matplotlib>=3.5,<3.11`` to match the versions used to generate the
-    committed historical results. We now mirror those bounds here so a
-    ``python run_all.py`` invocation produces the same environment as
-    ``pip install -e .`` — eliminating a silent reproduction drift.
+
+def _version_in_range(raw: str, lower: tuple[int, ...], upper: tuple[int, ...]) -> bool:
+    value = _version_tuple(raw)
+    return value >= lower and value < upper
+
+
+def _ensure_deps():
+    """Ensure runtime packages exist within the repository's tested bounds.
+
+    Checking only whether ``einops``/``matplotlib`` import was insufficient:
+    Kaggle images can already contain an incompatible version, and the runner
+    would silently produce different numerical/figure behavior than the
+    pinned environment. Torch is never replaced in-process; an incompatible
+    torch version fails loudly with an install/restart instruction.
     """
-    try:
-        import einops  # noqa: F401
-    except ImportError:
-        print('[run_all] installing einops (bounded to match pyproject.toml)...')
+    bounded = {
+        'einops': ('einops>=0.6,<0.9', (0, 6), (0, 9)),
+        'matplotlib': ('matplotlib>=3.5,<3.11', (3, 5), (3, 11)),
+    }
+    for package, (spec, lower, upper) in bounded.items():
+        try:
+            installed = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            installed = None
+        if installed is not None and _version_in_range(installed, lower, upper):
+            continue
+        if installed is not None:
+            print(f'[run_all] {package}=={installed} is outside the tested range; '
+                  f'installing {spec}...')
+        else:
+            print(f'[run_all] installing {spec}...')
         subprocess.check_call([
-            sys.executable, '-m', 'pip', 'install', '-q',
-            'einops>=0.6,<0.9',
+            sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', spec,
         ])
+
+    # Do not silently run experiments against an untested torch release. In
+    # particular, SDPA/kernel-selection changes can alter the benchmark and
+    # quality numbers. If torch is absent, importing kaggle_setup below will
+    # produce its own dependency error; report a clearer message here.
     try:
-        import matplotlib  # noqa: F401
-    except ImportError:
-        print('[run_all] installing matplotlib (bounded to match pyproject.toml)...')
-        subprocess.check_call([
-            sys.executable, '-m', 'pip', 'install', '-q',
-            'matplotlib>=3.5,<3.11',
-        ])
+        torch_version = importlib_metadata.version('torch')
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            'torch is not installed; install the project dependencies before '
+            'running run_all.py') from exc
+    if not _version_in_range(torch_version, (2, 2), (2, 7)):
+        raise RuntimeError(
+            f'torch=={torch_version} is outside the tested range >=2.2,<2.7. '
+            'Install a supported torch build and restart the process before '
+            'running experiments.')
 
 
 def _setup():
