@@ -495,6 +495,11 @@ class CSADecodingCache:
         self.B, self.c, self.c_I, self.m, self.win = B, c, c_I, m, win
         _validate_cache_dtype(dtype)
         self.device, self.dtype = torch.device(device), dtype
+        # normalize_qk flag: set by the caller after construction (or
+        # default True to match the repo-wide convention). The cache
+        # needs this to decide whether to L2-normalize keys before
+        # appending to the sliding-window ring buffer.
+        self._normalize_qk: bool = True
         self.reset()
 
     def reset(self) -> None:
@@ -715,10 +720,17 @@ class CSADecodingCache:
             self._acc_K_idx.append(k_i)
             self._acc_Z_idx.append(z_i)
             self._n_tokens_seen += 1
-            # Append (L2-normalized) Ca to the SW ring buffer.
+            # Append Ca to the SW ring buffer. When normalize_qk=True
+            # (the default), L2-normalize so the SW branch runs in cosine
+            # mode. When normalize_qk=False, store raw (unnormalized) Ca
+            # so the SW branch runs in dot-product mode, matching the
+            # sparse branch and the full-sequence naive_csa path.
             if self._sw is not None:
-                ca_norm_i = F.normalize(ca_i.squeeze(1).to(torch.float), dim=-1)
-                self._sw.append(ca_norm_i.unsqueeze(1).to(self.dtype))
+                if self._normalize_qk:
+                    ca_norm_i = F.normalize(ca_i.squeeze(1).to(torch.float), dim=-1)
+                    self._sw.append(ca_norm_i.unsqueeze(1).to(self.dtype))
+                else:
+                    self._sw.append(ca_i.to(self.dtype))
             # If the accumulator is full, compress and push.
             if len(self._acc_Ca) == self.m:
                 # Stack the accumulated projections into [B, m, c] / [B, m, c_I].
@@ -1017,16 +1029,11 @@ class CSADecodingCache:
             # add a correctness test. Avoid runtime asserts on this
             # decode hot path.
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            if not normalize_qk:
-                # The SW buffer stores normalized keys from append_step
-                # regardless of normalize_qk (that write is unconditional
-                # today). This means the SW branch ALWAYS runs in cosine
-                # mode. To keep normalize_qk=False honest for the sparse
-                # branch ONLY (an ablation rarely used) we do NOT add a
-                # denormalize pass here (it would require storing raw
-                # keys alongside normalized ones); document and continue
-                # using core_scale.
-                pass
+            # The SW buffer stores keys that match the normalize_qk flag
+            # (append_step normalizes only when self._normalize_qk is True).
+            # When normalize_qk=False the buffer holds raw keys and we use
+            # core_scale = 1/sqrt(c) (dot-product attention), matching the
+            # sparse branch and the full-sequence naive_csa path.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             # Single-query SW attention: scores = q[0] · C_local^T
             # => [B, nh, sw_len]. Softmax over sw_len. Out = p · C_local
@@ -1097,6 +1104,11 @@ class HCADecodingCache:
         self.B, self.c, self.m2, self.win = B, c, m2, win
         _validate_cache_dtype(dtype)
         self.device, self.dtype = torch.device(device), dtype
+        # normalize_qk flag: set by the caller after construction (or
+        # default True to match the repo-wide convention). The cache
+        # needs this to decide whether to L2-normalize keys before
+        # appending to the sliding-window ring buffer.
+        self._normalize_qk: bool = True
         self.reset()
 
     def reset(self) -> None:
@@ -1217,8 +1229,11 @@ class HCADecodingCache:
             self._acc_Z.append(z_i)
             self._n_tokens_seen += 1
             if self._sw is not None:
-                c_norm_i = F.normalize(c_i.squeeze(1).to(torch.float), dim=-1)
-                self._sw.append(c_norm_i.unsqueeze(1).to(self.dtype))
+                if self._normalize_qk:
+                    c_norm_i = F.normalize(c_i.squeeze(1).to(torch.float), dim=-1)
+                    self._sw.append(c_norm_i.unsqueeze(1).to(self.dtype))
+                else:
+                    self._sw.append(c_i.to(self.dtype))
             if len(self._acc_C) == self.m2:
                 C_block = torch.cat(self._acc_C, dim=1)              # [B, m2, c]
                 Z_block = torch.cat(self._acc_Z, dim=1)
@@ -1239,11 +1254,12 @@ class HCADecodingCache:
 
     def forward_step(
         self,
-        q: torch.Tensor,          # [B, 1, nh, c]   (L2-normalized)
+        q: torch.Tensor,          # [B, 1, nh, c]   (L2-normalized iff normalize_qk)
         *,
         nh: int,
-        scale: float = 1.0,
+        scale: float | None = None,
         sink_logits: torch.Tensor | None = None,  # [nh]
+        normalize_qk: bool = True,
     ) -> torch.Tensor:
         """Compute the HCA attention output for the CURRENT query.
 
@@ -1276,6 +1292,15 @@ class HCADecodingCache:
         compute_dtype = (
             torch.float64 if dtype == torch.float64 else torch.float
         )
+        # Core-attention scale: compute ONCE here so it is available to
+        # BOTH the dense branch (below) and the sliding-window branch
+        # (further down). When normalize_qk=True (default) we use cosine
+        # scale 1.0; when False we fall back to dot-product scale
+        # c ** -0.5, matching the full-sequence naive_hca path.
+        if scale is None:
+            core_scale = 1.0 if normalize_qk else self.c ** -0.5
+        else:
+            core_scale = scale
         t = self._n_tokens_seen - 1
         if self._C_comp is None or self._n_blocks == 0:
             dense_out = torch.zeros(
@@ -1288,14 +1313,25 @@ class HCADecodingCache:
             b_threshold = (t + 1) // self.m2
             cbm = torch.arange(n_blocks, device=device) < b_threshold
             cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
-            C_comp_n = F.normalize(
-                self._C_comp[:, :self._n_blocks].to(compute_dtype),
-                dim=-1)                                               # [B, n_blocks, c]
+            # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
+            # (mirrors the matching fix in naive_hca). When
+            # normalize_qk=True (default used by every runner in this
+            # repo) compressed KV are L2-normalized (cosine-similarity
+            # attention). When False, skip normalization and fall back
+            # to classical 1/sqrt(c) dot-product scale — this gives
+            # ablations a real off-switch rather than a silently-ignored
+            # flag.
+            if normalize_qk:
+                C_comp_n = F.normalize(
+                    self._C_comp[:, :self._n_blocks].to(compute_dtype),
+                    dim=-1)                                           # [B, n_blocks, c]
+            else:
+                C_comp_n = self._C_comp[:, :self._n_blocks].to(compute_dtype)
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             # scores: [B, nh, 1, n_blocks] -> [B, 1, nh, n_blocks]
             scores = torch.einsum(
                 'b t h d, b n d -> b t h n', q_compute, C_comp_n,
-            ) * scale                                                 # [B, 1, nh, n_blocks]
+            ) * core_scale                                            # [B, 1, nh, n_blocks]
             scores = scores.masked_fill(~cbm[:, :, None, :], float('-inf'))
             if sink_logits is not None:
                 log_sink = sink_logits.view(1, 1, nh, 1).to(scores)
@@ -1323,14 +1359,15 @@ class HCADecodingCache:
             )
         else:
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # D3 fix (HCA): SW buffer already stores L2-normalized keys
-            # (F.normalize applied at append time — see HCA.append_step).
-            # The previous defensive renormalize was not a no-op for fp32
-            # and the comment claiming "fp32→fp32 is a no-op" was wrong.
+            # The SW buffer stores keys that match the normalize_qk flag
+            # (append_step normalizes only when self._normalize_qk is True).
+            # When normalize_qk=False the buffer holds raw keys and we use
+            # core_scale = 1/sqrt(c) (dot-product attention), matching the
+            # dense branch and the full-sequence naive_hca path.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             scores = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
-            ) * scale                                                  # [B, nh, sw_len]
+            ) * core_scale                                            # [B, nh, sw_len]
             p = torch.softmax(scores, dim=-1)                          # [B, nh, sw_len]
             sw_out = torch.einsum(
                 'b h s, b s d -> b h d', p, C_local,

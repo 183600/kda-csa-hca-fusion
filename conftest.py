@@ -129,6 +129,7 @@ def pytest_collection_modifyitems(config, items):
         reason='Skipped because SKIP_SLOW=1 is set in the environment.')
 
     device = config.getoption('--device')
+    cuda_unavailable = False
     if device == 'cuda':
         try:
             import torch
@@ -136,6 +137,7 @@ def pytest_collection_modifyitems(config, items):
         except Exception:
             cuda_available = False
         if not cuda_available:
+            cuda_unavailable = True
             skip_cuda = pytest.mark.skip(
                 reason='--device cuda requested but torch.cuda.is_available() '
                        'is False; run on CPU (the default) or fix your CUDA '
@@ -146,12 +148,7 @@ def pytest_collection_modifyitems(config, items):
                 # should still run).
                 if 'device' in getattr(item, 'fixturenames', ()):
                     item.add_marker(skip_cuda)
-                elif skip_slow:
-                    for slow_name in _SLOW_TESTS:
-                        if item.name.startswith(slow_name):
-                            item.add_marker(slow_skip_marker)
-                            break
-            return  # CUDA unavailability dominates the rest.
+
     for item in items:
         # Mark slow tests by function name. If SKIP_SLOW is set, also
         # attach a skip marker so they are deselected automatically.

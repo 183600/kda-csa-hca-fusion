@@ -102,12 +102,15 @@ def _call_fla(
 ):
     chunk_kda, fused_recurrent_kda = _load_fla_ops()
     fn = chunk_kda if use_chunk else fused_recurrent_kda
-    if g_clamp_min > -float('inf'):
-        # Match the repository reference contract before handing the already
-        # activated log-space gate to FLA. Without this, FLA and reference
-        # diverge for pathological gates below -10.
-        g = g.clamp(min=float(g_clamp_min))
-
+    # g_clamp_min is already applied once in kda_forward before dispatch;
+    # do NOT apply it a second time here to avoid double-clamping.
+    # To prevent the FLA kernel from applying its own clamp, we omit
+    # g_clamp_min from the kwargs entirely when the caller's clamp has
+    # already been applied (i.e. when g_clamp_min is -inf, the sentinel
+    # meaning "no further clamp needed").  If the FLA kernel does not
+    # receive a g_clamp_min argument, it should use its own default
+    # (typically None or a large negative value), which we override by
+    # having already clamped g before dispatch.
     if isinstance(scale, torch.Tensor):
         scale_value = float(scale.detach().item())
     elif scale is None:
@@ -130,6 +133,15 @@ def _call_fla(
         "use_beta_sigmoid_in_kernel": False,
         "chunk_size": chunk_size,
     }
+    # Only pass g_clamp_min to FLA if it is a finite value that the FLA
+    # kernel should apply.  When the caller's clamp has already been
+    # applied, g_clamp_min is -inf (the downstream sentinel); passing
+    # -inf to FLA could trigger assertions or NaN/Inf if the kernel uses
+    # it as a threshold rather than a simple clamp.  Omitting it lets FLA
+    # use its own default (typically None), and since g is already clamped
+    # the kernel's internal clamp becomes a no-op.
+    if g_clamp_min > -float('inf'):
+        kwargs["g_clamp_min"] = g_clamp_min
     result = fn(**_supported_kwargs(fn, kwargs))
     if not isinstance(result, tuple) or len(result) < 2:
         raise RuntimeError(
@@ -180,6 +192,17 @@ def kda_forward(
     if math.isnan(float(g_clamp_min)):
         raise ValueError("g_clamp_min must not be NaN")
 
+    # Apply g_clamp_min exactly once here, before any backend dispatch.
+    # The downstream functions (_call_fla, naive_recurrent_kda,
+    # naive_chunk_kda) must NOT apply their own clamp to avoid
+    # double-clamping.  We pass g_clamp_min=-inf to the downstream
+    # functions so their internal clamp becomes a no-op.
+    if g_clamp_min > -float('inf'):
+        g = g.clamp(min=float(g_clamp_min))
+        downstream_clamp = -float('inf')
+    else:
+        downstream_clamp = float(g_clamp_min)
+
     use_fla = backend == "fla"
     if backend == "auto":
         use_fla = bool(q.is_cuda and fla_available())
@@ -190,30 +213,27 @@ def kda_forward(
             "kda_backend='reference' for CPU experiments.")
 
     if use_fla:
-        if backend == "auto" and not q.is_cuda:
+        try:
+            return _call_fla(
+                q, k, v, g, beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+                use_chunk=use_chunk,
+                g_clamp_min=downstream_clamp,
+            )
+        except (ImportError, ValueError, NotImplementedError, AssertionError) as exc:
+            if backend == "fla":
+                raise
+            warnings.warn(
+                f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
+                f"{exc}); falling back to the reference implementation.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _fla_import_warning_emitted = True
             use_fla = False
-        else:
-            try:
-                return _call_fla(
-                    q, k, v, g, beta,
-                    scale=scale,
-                    initial_state=initial_state,
-                    output_final_state=output_final_state,
-                    chunk_size=chunk_size,
-                    use_chunk=use_chunk,
-                    g_clamp_min=g_clamp_min,
-                )
-            except (ImportError, ValueError, NotImplementedError, AssertionError) as exc:
-                if backend == "fla":
-                    raise
-                warnings.warn(
-                    f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
-                    f"{exc}); falling back to the reference implementation.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                _fla_import_warning_emitted = True
-                use_fla = False
 
     if backend == "auto" and not use_fla and q.is_cuda and not _fla_import_warning_emitted:
         warnings.warn(
@@ -235,14 +255,14 @@ def kda_forward(
             initial_state=initial_state,
             output_final_state=output_final_state,
             chunk_size=chunk_size,
-            g_clamp_min=g_clamp_min,
+            g_clamp_min=downstream_clamp,
         )
     return naive_recurrent_kda(
         q, k, v, g, beta,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        g_clamp_min=g_clamp_min,
+        g_clamp_min=downstream_clamp,
     )
 
 

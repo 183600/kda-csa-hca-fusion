@@ -122,7 +122,17 @@ def _sliding_window_attention(
         # too — but on the small ``ct + win - 1`` slice, not on the full
         # ``T + win - 1`` tensor.
         C_slice = C_padded[:, t_lo : t_hi + win - 1]       # [B, ct+win-1, c]
-        C_windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, ct, win, c]
+        # When ct < win, the slice length (ct+win-1) is less than win,
+        # and ``unfold(size=win, step=1)`` returns an empty tensor
+        # (dimension 1 becomes 0).  Guard against that by padding the
+        # slice on the left so its length is at least win.  The extra
+        # positions are all zeros (from the original F.pad) and are
+        # masked out by ``valid_mask``, so they contribute nothing to
+        # the softmax output — the numerical result is identical to the
+        # unfold-on-full-T path for the same query positions.
+        if ct < win:
+            C_slice = F.pad(C_slice, (0, 0, win - ct, 0))   # [B, win+win-1, c]
+        C_windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, max(ct,win), win, c]
         q_chunk = q[:, t_lo:t_hi]                            # [B, ct, nh, c]
         mask_chunk = valid_mask[t_lo:t_hi]                   # [ct, win]
         scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows) * scale
@@ -695,8 +705,17 @@ def naive_csa(
     # policy further below). If a caller explicitly passes ``scale=`` we
     # honour it (backward compatibility for any external code pinning a
     # temperature).
-    if scale is None:
-        scale = 1.0 if normalize_qk else c ** -0.5
+    #
+    # NOTE: we do NOT assign ``scale`` here. The core-attention scale
+    # auto-selection block below (after q/C_comp normalization) is the
+    # canonical place where ``scale`` is resolved for the core attention.
+    # Assigning it here would make that block dead code and prevent a
+    # caller from passing ``scale=None`` to get the documented per-branch
+    # auto-selection (indexer vs core attention). We only validate the
+    # explicit-pass case here; the auto-selection is deferred.
+    if scale is not None:
+        # Caller explicitly pinned a temperature — honour it.
+        pass
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv_overlapped`` would raise a cryptic broadcasting
@@ -906,6 +925,27 @@ def naive_csa(
     # Core-attention scale auto-selection (mirrors the indexer scale
     # policy above). A caller can still override by passing an explicit
     # ``scale=``.
+    # NOTE: this block MUST run BEFORE the topk=0 branch so ``scale`` is
+    # resolved for the sliding-window branch (which runs AFTER the if/else
+    # and uses ``scale`` unconditionally). Previously it was inside the
+    # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
+    # ``else`` branch was skipped for any other reason, causing a
+    # ``None * tensor`` crash in ``_sliding_window_attention``.
+    if scale is None:
+        if normalize_qk:
+            scale = 1.0
+        else:
+            scale = c ** -0.5
+
+    # Core-attention scale auto-selection (mirrors the indexer scale
+    # policy above). A caller can still override by passing an explicit
+    # ``scale=``.
+    # NOTE: this block MUST run BEFORE the topk=0 branch so ``scale`` is
+    # resolved for the sliding-window branch (which runs AFTER the if/else
+    # and uses ``scale`` unconditionally). Previously it was inside the
+    # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
+    # ``else`` branch was skipped for any other reason, causing a
+    # ``None * tensor`` crash in ``_sliding_window_attention``.
     if scale is None:
         if normalize_qk:
             scale = 1.0

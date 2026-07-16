@@ -823,7 +823,7 @@ def _chunk_kda_prepare(
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
+    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]
@@ -835,7 +835,7 @@ def _chunk_kda_prepare(
         # With ``g_clamp_min=-10`` and ``BT=64`` this difference can reach ~630,
         # and ``exp(630) = inf`` in fp32 — which then propagates NaN through
         # ``solve_triangular``. The subsequent ``A.masked_fill(mask, 0)`` only
-        # zeroes the UPPER triangular (c >= i); the overflowing LOWER triangular
+        # zeroes the UPPER triangular (c > i); the overflowing LOWER triangular
         # entries are KEPT, so the inf/NaN reaches the solver. Clamping the
         # exponent to a safe upper bound (``exp(50) ~= 5e21``, finite in fp32)
         # prevents the overflow without changing the math for reasonable g

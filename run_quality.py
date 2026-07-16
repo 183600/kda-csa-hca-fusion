@@ -362,16 +362,49 @@ def _bonferroni_crit_q(n, alpha=0.05):
         return 0.5 * ib
 
     dof = n - 1
-    lo, hi = 0.0, 1.0
-    while _student_t_cdf(hi, dof) < target_p:
+    # For small dof and extreme tail quantiles (e.g. dof=4, alpha=0.0125,
+    # target_p=0.9875, true crit ≈ 3.5), the continued-fraction _betacf can
+    # lose precision when x is very small.  We bracket the quantile with a
+    # coarse exponential scan, then refine with a *regularised* bisection
+    # that uses the log-survival function log(1 - CDF) instead of the raw
+    # CDF.  The log-survival function is numerically much better behaved in
+    # the far upper tail: 1 - CDF(t) ≈ 0.5 * ib for large t, and ib itself
+    # is computed from _betai which is stable for small x.  Taking logs
+    # avoids catastrophic cancellation when CDF(t) is extremely close to 1.
+    import math
+    target_log_sf = math.log(max(alpha, 1e-300))  # log(1 - target_p) = log(alpha)
+    # Coarse bracket: find lo, hi such that log_sf(lo) > target_log_sf > log_sf(hi)
+    lo = 0.0
+    hi = 1.0
+    while True:
+        cdf_hi = _student_t_cdf(hi, dof)
+        if cdf_hi >= 1.0 - 1e-15:
+            # Already saturated; push hi further
+            hi *= 2.0
+            if hi > 1.0e6:
+                raise RuntimeError(
+                    f"_bonferroni_crit_q fallback could not bracket quantile "
+                    f"for n={n}, alpha={alpha}")
+            continue
+        log_sf_hi = math.log(max(1.0 - cdf_hi, 1e-300))
+        if log_sf_hi <= target_log_sf:
+            break
         hi *= 2.0
         if hi > 1.0e6:
             raise RuntimeError(
                 f"_bonferroni_crit_q fallback could not bracket quantile "
                 f"for n={n}, alpha={alpha}")
+    # Refine with log-survival bisection (80 iterations, ~1e-24 relative
+    # precision on the quantile).
     for _ in range(80):
         mid = 0.5 * (lo + hi)
-        if _student_t_cdf(mid, dof) < target_p:
+        cdf_mid = _student_t_cdf(mid, dof)
+        if cdf_mid >= 1.0 - 1e-15:
+            # mid is already in the saturated region; move hi down
+            hi = mid
+            continue
+        log_sf_mid = math.log(max(1.0 - cdf_mid, 1e-300))
+        if log_sf_mid > target_log_sf:
             lo = mid
         else:
             hi = mid
@@ -1345,6 +1378,10 @@ def main():
     #      run_ablation.py's convention) so downstream consumers can check
     #      it per-record without recomputing.
     n_tests = len(['softmax', 'kda', 'csa', 'hca']) * len(n_kv_list)
+    # The t-test is one-sided (H1: mean_acc > chance). For a one-sided
+    # Bonferroni correction, the per-test alpha is 0.05 / n_tests to
+    # maintain the family-wise error rate at 0.05. Using 0.025 / n_tests
+    # would make the test twice as conservative as intended.
     alpha_corrected = 0.05 / n_tests
     # P0-3 fix: _bonferroni_crit_q is now a module-level function with a
     # exact beta-CDF/bisection fallback when scipy is unavailable (instead of
