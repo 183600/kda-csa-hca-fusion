@@ -453,6 +453,9 @@ def main():
     if any(t < 1 for t in seq_lengths):
         raise ValueError(
             f'BENCH_LENGTHS must contain positive sequence lengths, got {seq_lengths!r}')
+    # Deduplicate while preserving user order; duplicate lengths would produce
+    # repeated rows and overweight those points in downstream summaries/plots.
+    seq_lengths = list(dict.fromkeys(seq_lengths))
     logger.info(f'[run_benchmark] seq_lengths = {seq_lengths}')
     B, H, K, V, d = 1, 4, 32, 32, 64
 
