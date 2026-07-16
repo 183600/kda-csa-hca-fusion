@@ -1172,6 +1172,9 @@ def _parse_nkv_list(env_var, default='1'):
             f'{env_var}={raw!r} must be comma-separated ints, e.g. "1,2,4"')
     if not vals:
         vals = [int(default)]
+    if any(v < 1 for v in vals):
+        raise ValueError(
+            f'{env_var} values must be positive integers, got {vals!r}')
     return vals
 
 
