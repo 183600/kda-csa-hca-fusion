@@ -157,8 +157,22 @@ def test_kda_backend_reference_dispatch(device='cpu'):
         q, k, v, g, beta, output_final_state=True,
         backend='reference', use_chunk=False,
     )
+    auto_o, auto_s = kda_forward(
+        q, k, v, g, beta, output_final_state=True,
+        backend='auto', use_chunk=False,
+    )
     output_ok = torch.allclose(routed_o, direct_o, atol=0.0, rtol=0.0)
     state_ok = torch.allclose(routed_s, direct_s, atol=0.0, rtol=0.0)
+    if torch.device(device).type == 'cuda' and fla_available():
+        auto_ok = (
+            auto_o.shape == direct_o.shape
+            and auto_s.shape == direct_s.shape
+            and torch.isfinite(auto_o).all().item()
+            and torch.isfinite(auto_s).all().item()
+        )
+    else:
+        auto_ok = torch.allclose(auto_o, direct_o, atol=0.0, rtol=0.0) and \
+            torch.allclose(auto_s, direct_s, atol=0.0, rtol=0.0)
     invalid_ok = False
     try:
         validate_kda_backend('not-a-backend')
@@ -208,6 +222,7 @@ def test_kda_backend_reference_dispatch(device='cpu'):
     return [
         _ok('KDA reference adapter output unchanged', output_ok, ''),
         _ok('KDA reference adapter state unchanged', state_ok, ''),
+        _ok('KDA auto backend preserves CPU reference', auto_ok, ''),
         _ok('KDA backend rejects invalid name', invalid_ok, ''),
         _ok('optional FLA KDA smoke/parity', fla_ok, fla_detail),
     ]
