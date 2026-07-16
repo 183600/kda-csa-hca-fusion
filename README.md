@@ -185,7 +185,7 @@ Environment knobs (set before launching):
 | `ABL_NKV` | `1` | comma-separated MQAR `n_kv` values for Exp 5 |
 | `SKIP_SLOW` | `0` | `1` truncates Exp 2/4/5 on CPU |
 | `SKIP_CUDA_CHECK` | `0` | `1` bypasses the CUDA-availability guard |
-| `KDA_BACKEND` | `reference` | `reference`, `fla`, or `auto`; applies to the hybrid layer, standalone KDA quality/decode, and KDA benchmark paths |
+| `KDA_BACKEND` | `reference` | `reference`, `fla`, or `auto`; applies to hybrid, standalone KDA quality/decode, ablation, and KDA benchmark paths |
 
 ---
 

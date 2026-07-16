@@ -44,6 +44,7 @@ from kaggle_setup import (
     make_seeded_generator,
 )
 from ops_fused import HybridKCHAttention, HybridConfig
+from ops_kda_backend import validate_kda_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, SMALL_MODEL_SPEC,
@@ -104,6 +105,9 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
         hca_c=spec['hca_c'], hca_dc=spec['hca_dc'],
         hca_sliding_window=spec['hca_sliding_window'],
         n_kda=n_kda, n_csa=n_csa, n_hca=n_hca,
+        kda_backend=validate_kda_backend(
+            os.environ.get('KDA_BACKEND', 'reference')
+        ),
     )
 
 
@@ -708,6 +712,7 @@ def main():
         r['conclusions_valid'] = conclusions_valid
         r['n_seeds_requested'] = n_seeds
         r['csa_indexer_normalize_qk'] = True
+        r['kda_backend'] = os.environ.get('KDA_BACKEND', 'reference')
         r['significance_scope'] = 'vs_chance_baseline_not_pairwise_between_layouts'
 
     os.makedirs('results', exist_ok=True)

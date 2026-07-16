@@ -406,6 +406,7 @@ def bench_hybrid(B, T, d, device):
         csa_sliding_window=8,
         hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
         n_kda=3, n_csa=1, n_hca=1,
+        kda_backend=_selected_kda_backend(),
     )
     model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
     x = _rand(B, T, d, device=device, generator=gen)
@@ -532,7 +533,7 @@ def main():
                 # wrong conclusions about operator efficiency.
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
-                if name in {'kda_rec', 'kda_chunk'}:
+                if name in {'kda_rec', 'kda_chunk', 'hybrid'}:
                     row['kda_backend'] = _selected_kda_backend()
                 if name in {'csa', 'hybrid'}:
                     row['csa_indexer_normalize_qk'] = True
@@ -560,7 +561,7 @@ def main():
                     'T': T, 'op': name, 'error': str(e),
                     'device': str(device),
                     'kda_backend': (os.environ.get('KDA_BACKEND', 'reference')
-                                    if name in {'kda_rec', 'kda_chunk'} else None),
+                                    if name in {'kda_rec', 'kda_chunk', 'hybrid'} else None),
                     'time_ms': None, 'peak_mem_MB': None,
                     'time_min_ms': None, 'time_max_ms': None,
                     'time_std_ms': None,

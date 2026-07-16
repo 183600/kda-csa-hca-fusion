@@ -410,9 +410,10 @@ class CSADecodingCache:
        after every ``m`` tokens; the just-consumed ``Cb`` and ``Zb`` are
        stashed as the "previous block" overlap partner for the next
        compression.
-    2. **Compressed block cache** (``[B, n_blocks, c]``) and **indexer
-       key cache** (``[B, n_blocks, c_I]``). Grows by one row each time
-       the accumulator fills. Read by the sparse-attention branch
+    2. **Compressed block cache** (valid prefix ``[B, n_blocks, c]``) and
+       **indexer key cache** (valid prefix ``[B, n_blocks, c_I]``). Their
+       backing storage grows geometrically as the accumulator fills, avoiding
+       a full historical copy on every new block. Read by the sparse-attention branch
        (compressed block cache) and the lightning indexer (indexer key
        cache) during ``forward_step``.
     3. **Sliding-window ring buffer** (:class:`_SlidingWindowRingBuffer`).
@@ -498,9 +499,11 @@ class CSADecodingCache:
         # NEXT block. ``None`` until the first block is completed.
         self._prev_Cb: torch.Tensor | None = None  # [B, m, c]
         self._prev_Zb: torch.Tensor | None = None  # [B, m, c]
-        # Compressed block cache (grows by appending rows).
-        self._C_comp: torch.Tensor | None = None   # [B, n_blocks, c]
-        self._K_IComp: torch.Tensor | None = None  # [B, n_blocks, c_I]
+        # Compressed block caches use geometrically-grown storage. Keeping
+        # capacity separate from the valid prefix avoids the O(n_blocks^2)
+        # copy cost of torch.cat on every completed block during long decode.
+        self._C_comp: torch.Tensor | None = None   # [B, capacity, c]
+        self._K_IComp: torch.Tensor | None = None  # [B, capacity, c_I]
         # SW ring buffer (None if win == 0).
         if self.win > 0:
             self._sw = _SlidingWindowRingBuffer(
@@ -511,6 +514,32 @@ class CSADecodingCache:
         # Counters.
         self._n_tokens_seen = 0
         self._n_blocks = 0
+
+    def _ensure_compressed_capacity(self, required: int) -> None:
+        """Ensure CSA compressed/indexer storage can hold ``required`` rows.
+
+        Capacity grows geometrically, so appending one completed block is
+        amortized O(1) in the number of previously cached blocks. Only the
+        valid prefix ``:self._n_blocks`` is copied; unused capacity is not
+        exposed through the public properties or attention path.
+        """
+        if self._C_comp is not None and required <= self._C_comp.shape[1]:
+            return
+        old_capacity = 0 if self._C_comp is None else self._C_comp.shape[1]
+        new_capacity = max(required, max(1, old_capacity * 2))
+        new_C = torch.empty(
+            self.B, new_capacity, self.c,
+            device=self.device, dtype=self.dtype,
+        )
+        new_K = torch.empty(
+            self.B, new_capacity, self.c_I,
+            device=self.device, dtype=self.dtype,
+        )
+        if self._n_blocks:
+            new_C[:, :self._n_blocks] = self._C_comp[:, :self._n_blocks]
+            new_K[:, :self._n_blocks] = self._K_IComp[:, :self._n_blocks]
+        self._C_comp = new_C
+        self._K_IComp = new_K
 
     # ----- properties ----------------------------------------------------
 
@@ -529,13 +558,17 @@ class CSADecodingCache:
 
     @property
     def C_comp(self) -> torch.Tensor | None:
-        """Current compressed KV block cache ``[B, n_blocks, c]`` (or None)."""
-        return self._C_comp
+        """Current valid compressed KV rows ``[B, n_blocks, c]`` (or None)."""
+        if self._C_comp is None:
+            return None
+        return self._C_comp[:, :self._n_blocks]
 
     @property
     def K_IComp(self) -> torch.Tensor | None:
-        """Current indexer key cache ``[B, n_blocks, c_I]`` (or None)."""
-        return self._K_IComp
+        """Current valid indexer key rows ``[B, n_blocks, c_I]`` (or None)."""
+        if self._K_IComp is None:
+            return None
+        return self._K_IComp[:, :self._n_blocks]
 
     @property
     def sw_buffer(self) -> _SlidingWindowRingBuffer | None:
@@ -695,21 +728,18 @@ class CSADecodingCache:
                     K_idx_block, Z_idx_block, B_idx,
                 )                                                  # [B, c_I]
                 # P0-4 fix: the compress helpers upcast to fp32/fp64
-                # internally (compute_dtype) and return that dtype. If we
-                # store the result as-is when ``self.dtype == fp16``, the
-                # next ``torch.cat`` with the existing fp16 ``_C_comp`` /
-                # ``_K_IComp`` rows would mix dtypes and crash. Cast back
-                # to the cache's storage dtype so all rows stay uniform.
+                # internally (compute_dtype) and return that dtype. Cast
+                # back to the cache's storage dtype before writing into the
+                # geometrically-grown storage so all rows stay uniform.
                 new_C_row = new_C.unsqueeze(1).to(self.dtype)     # [B, 1, c]
                 new_K_I_row = new_K_I.unsqueeze(1).to(self.dtype) # [B, 1, c_I]
-                if self._C_comp is None:
-                    self._C_comp = new_C_row
-                    self._K_IComp = new_K_I_row
-                else:
-                    self._C_comp = torch.cat(
-                        [self._C_comp, new_C_row], dim=1)
-                    self._K_IComp = torch.cat(
-                        [self._K_IComp, new_K_I_row], dim=1)
+                # Geometric growth avoids copying the complete compressed
+                # history on every block. The public cache exposes only the
+                # valid prefix, while the storage tensors retain spare
+                # capacity for future blocks.
+                self._ensure_compressed_capacity(self._n_blocks + 1)
+                self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
+                self._K_IComp[:, self._n_blocks:self._n_blocks + 1] = new_K_I_row
                 self._n_blocks += 1
                 new_block_indices.append(self._n_blocks - 1)
                 # Stash the just-consumed Cb / Zb as the previous
@@ -861,10 +891,11 @@ class CSADecodingCache:
             # ablations a real off-switch rather than a silently-ignored
             # flag.
             if normalize_qk:
+                C_comp_valid = self._C_comp[:, :self._n_blocks]
                 C_comp_n = F.normalize(
-                    self._C_comp.to(compute_dtype), dim=-1)           # [B, n_blocks, c]
+                    C_comp_valid.to(compute_dtype), dim=-1)           # [B, n_blocks, c]
             else:
-                C_comp_n = self._C_comp.to(compute_dtype)
+                C_comp_n = self._C_comp[:, :self._n_blocks].to(compute_dtype)
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in
@@ -873,7 +904,7 @@ class CSADecodingCache:
             effective_use_ste = use_ste and torch.is_grad_enabled()
             indexer_result = csa_lightning_indexer(
                 q_idx.to(compute_dtype),                               # [B, 1, nIh, c_I]
-                self._K_IComp.to(compute_dtype),                       # [B, n_blocks, c_I]
+                self._K_IComp[:, :self._n_blocks].to(compute_dtype),    # [B, n_blocks, c_I]
                 w_idx.to(compute_dtype),                               # [B, 1, nIh]
                 topk,
                 # P0-2 fix (round 1): defer scale selection to
@@ -1059,7 +1090,8 @@ class HCADecodingCache:
     def reset(self) -> None:
         self._acc_C: list[torch.Tensor] = []
         self._acc_Z: list[torch.Tensor] = []
-        self._C_comp: torch.Tensor | None = None   # [B, n_blocks, c]
+        # Geometrically-grown storage; only the valid prefix is exposed.
+        self._C_comp: torch.Tensor | None = None   # [B, capacity, c]
         if self.win > 0:
             self._sw = _SlidingWindowRingBuffer(
                 self.B, self.win, self.c, self.device, self.dtype,
@@ -1068,6 +1100,20 @@ class HCADecodingCache:
             self._sw = None
         self._n_tokens_seen = 0
         self._n_blocks = 0
+
+    def _ensure_compressed_capacity(self, required: int) -> None:
+        """Grow HCA compressed storage geometrically when needed."""
+        if self._C_comp is not None and required <= self._C_comp.shape[1]:
+            return
+        old_capacity = 0 if self._C_comp is None else self._C_comp.shape[1]
+        new_capacity = max(required, max(1, old_capacity * 2))
+        new_C = torch.empty(
+            self.B, new_capacity, self.c,
+            device=self.device, dtype=self.dtype,
+        )
+        if self._n_blocks:
+            new_C[:, :self._n_blocks] = self._C_comp[:, :self._n_blocks]
+        self._C_comp = new_C
 
     # ----- properties ----------------------------------------------------
 
@@ -1085,7 +1131,9 @@ class HCADecodingCache:
 
     @property
     def C_comp(self) -> torch.Tensor | None:
-        return self._C_comp
+        if self._C_comp is None:
+            return None
+        return self._C_comp[:, :self._n_blocks]
 
     @property
     def sw_buffer(self) -> _SlidingWindowRingBuffer | None:
@@ -1165,13 +1213,10 @@ class HCADecodingCache:
                 new_C = _hca_compress_kv_single(C_block, Z_block, B_pos)  # [B, c]
                 # P0-4 fix: ``_hca_compress_kv_single`` returns fp32/fp64
                 # (compute_dtype) even when the cache stores fp16. Cast back
-                # to ``self.dtype`` so ``torch.cat`` doesn't mix dtypes.
+                # to the storage dtype before writing the valid row.
                 new_C_row = new_C.unsqueeze(1).to(self.dtype)        # [B, 1, c]
-                if self._C_comp is None:
-                    self._C_comp = new_C_row
-                else:
-                    self._C_comp = torch.cat(
-                        [self._C_comp, new_C_row], dim=1)
+                self._ensure_compressed_capacity(self._n_blocks + 1)
+                self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
                 self._n_blocks += 1
                 new_block_indices.append(self._n_blocks - 1)
                 self._acc_C.clear()
@@ -1232,7 +1277,8 @@ class HCADecodingCache:
             cbm = torch.arange(n_blocks, device=device) < b_threshold
             cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
             C_comp_n = F.normalize(
-                self._C_comp.to(compute_dtype), dim=-1)               # [B, n_blocks, c]
+                self._C_comp[:, :self._n_blocks].to(compute_dtype),
+                dim=-1)                                               # [B, n_blocks, c]
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             # scores: [B, nh, 1, n_blocks] -> [B, 1, nh, n_blocks]
             scores = torch.einsum(

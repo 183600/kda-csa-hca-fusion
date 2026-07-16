@@ -449,7 +449,8 @@ HCA — Heavily Compressed Attention
 2. Dense shared-KV MQA (NOT sparse — all compressed blocks):
    q = (H @ W_DQ @ W_UQ).reshape(T, H, c), L2-normalized
    C_comp_n = F.normalize(C_comp, dim=-1)         # ALSO L2-normalized
-   Causal block mask: query t attends to blocks b where b < floor(t / m').
+   Causal block mask: query t attends to blocks b where b < (t + 1) // m'.
+   A block becomes visible when its full m'-token source window closes.
    scores[h, t, n] = q[t, h] . C_comp_n[n] * scale
    p = softmax(scores + causal_mask)
    out[t, h] = sum_n p[h, t, n] * C_comp_n[n]      # uses NORMALIZED C_comp_n
@@ -502,11 +503,11 @@ Proof:
     (b) By induction, no block j > i influences C_comp[i].
 
   The causal block mask _causal_block_mask(T, n_blocks, m, device) then
-  ensures that query at position t only attends to blocks b < floor(t / m).
+  ensures that query at position t only attends to blocks b < (t + 1) // m.
   Combined with the above, this means:
 
-    output[t] depends on C_comp[0 : floor(t/m)]
-              depends on tokens [0, floor(t/m) * m)
+    output[t] depends on C_comp[0 : (t+1)//m]
+              depends on tokens [0, ((t+1)//m) * m)
               which is a subset of [0, t+1)
 
   i.e. output[t] never depends on any token at position > t.  QED.

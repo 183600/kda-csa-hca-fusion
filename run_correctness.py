@@ -4317,29 +4317,31 @@ def test_kv_cache_full_accounting_runtime_state(device='cpu'):
     tensors undercounts non-divisible sequence lengths and small contexts.
     """
     logger.info("Test: KV full_accounting includes partial/overlap runtime state")
-    from run_kv_cache import kv_cache_elements, DEFAULTS
+    from run_kv_cache import geometric_capacity, kv_cache_elements, DEFAULTS
 
     p = {**DEFAULTS}
     csa_m, csa_c, csa_cI = p['csa_m'], p['csa_c'], p['csa_cI']
     hca_m2, hca_c = p['hca_m2'], p['hca_c']
 
-    T_csa = csa_m + 3
+    T_csa = 2 * csa_m + 3
     n_completed_csa = T_csa // csa_m
+    csa_capacity = geometric_capacity(n_completed_csa)
     expected_csa = (
-        n_completed_csa * csa_c                    # completed compressed KV rows
-        + p['csa_sliding_window'] * csa_c         # allocated SW ring buffer
-        + n_completed_csa * csa_cI                 # completed indexer key rows
+        csa_capacity * csa_c                       # geometrically-grown KV storage
+        + p['csa_sliding_window'] * csa_c           # allocated SW ring buffer
+        + csa_capacity * csa_cI                     # geometrically-grown indexer storage
         + (T_csa % csa_m) * (4 * csa_c + 2 * csa_cI)
         + 2 * csa_m * csa_c                        # previous Cb/Zb overlap
         + p['csa_nh']                              # sink
     )
     actual_csa = kv_cache_elements('csa', T_csa, mode='full_accounting', **p)
 
-    T_hca = hca_m2 + 5
+    T_hca = 2 * hca_m2 + 5
     n_completed_hca = T_hca // hca_m2
+    hca_capacity = geometric_capacity(n_completed_hca)
     expected_hca = (
-        n_completed_hca * hca_c
-        + p['hca_sliding_window'] * hca_c         # allocated SW ring buffer
+        hca_capacity * hca_c                         # geometrically-grown storage
+        + p['hca_sliding_window'] * hca_c             # allocated SW ring buffer
         + (T_hca % hca_m2) * (2 * hca_c)
         + p['hca_nh']
     )

@@ -92,9 +92,15 @@ def _call_fla(
     output_final_state: bool,
     chunk_size: int,
     use_chunk: bool,
+    g_clamp_min: float,
 ):
     chunk_kda, fused_recurrent_kda = _load_fla_ops()
     fn = chunk_kda if use_chunk else fused_recurrent_kda
+    if g_clamp_min > -float('inf'):
+        # Match the repository reference contract before handing the already
+        # activated log-space gate to FLA. Without this, FLA and reference
+        # diverge for pathological gates below -10.
+        g = g.clamp(min=float(g_clamp_min))
 
     if isinstance(scale, torch.Tensor):
         scale_value = float(scale.detach().item())
@@ -138,6 +144,7 @@ def kda_forward(
     output_final_state: bool = False,
     chunk_size: int = 64,
     use_chunk: bool = False,
+    g_clamp_min: float = -10.0,
     backend: str = "reference",
 ):
     """Run KDA through the selected reference or optional FLA backend.
@@ -145,8 +152,9 @@ def kda_forward(
     ``backend='reference'`` is bit-for-bit compatible with the existing
     repository dispatch. ``backend='fla'`` requires FLA and raises an
     actionable ImportError when it is not installed. ``backend='auto'`` uses
-    FLA only for CUDA tensors when it is importable; otherwise it falls back to
-    the reference implementation.
+    FLA only for CUDA tensors when it is importable; unsupported FLA argument
+    combinations fall back to the reference implementation. ``g_clamp_min``
+    is applied before both backends so their gate contract matches.
     """
     global _fla_import_warning_emitted
     backend = validate_kda_backend(backend)
@@ -172,10 +180,18 @@ def kda_forward(
                     output_final_state=output_final_state,
                     chunk_size=chunk_size,
                     use_chunk=use_chunk,
+                    g_clamp_min=g_clamp_min,
                 )
-            except ImportError:
+            except (ImportError, ValueError, NotImplementedError) as exc:
                 if backend == "fla":
                     raise
+                warnings.warn(
+                    f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
+                    f"{exc}); falling back to the reference implementation.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _fla_import_warning_emitted = True
                 use_fla = False
 
     if backend == "auto" and not use_fla and q.is_cuda and not _fla_import_warning_emitted:
@@ -198,12 +214,14 @@ def kda_forward(
             initial_state=initial_state,
             output_final_state=output_final_state,
             chunk_size=chunk_size,
+            g_clamp_min=g_clamp_min,
         )
     return naive_recurrent_kda(
         q, k, v, g, beta,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
+        g_clamp_min=g_clamp_min,
     )
 
 

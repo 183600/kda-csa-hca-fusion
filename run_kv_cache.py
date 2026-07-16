@@ -85,6 +85,13 @@ def causal_block_entries(T: int, m: int) -> int:
     return m * n_full * (n_full - 1) // 2 + n_full * (remainder + 1)
 
 
+def geometric_capacity(n_rows: int) -> int:
+    """Return the power-of-two storage capacity used by decode caches."""
+    if n_rows <= 0:
+        return 0
+    return 1 << (n_rows - 1).bit_length()
+
+
 def causal_selected_entries(T: int, m: int, topk: int) -> int:
     """Count selected block slots after a top-k cap under block causality."""
     if T <= 0 or topk <= 0:
@@ -202,12 +209,14 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         compressed = n_blocks * csa_c
         if mode == 'full_accounting':
             # Full-accounting mode tracks the *incremental decoding cache* state
-            # after T tokens have actually been appended. The reference cache only
-            # materializes compressed rows after a FULL block completes, so use
-            # floor(T/m) here (not the ceil capacity used above). The trailing
-            # partial block is represented by the partial accumulator below.
+            # after T tokens have actually been appended. Compressed rows are
+            # materialized after full blocks, and the runtime storage grows
+            # geometrically; count allocated capacity rather than only the
+            # valid prefix. The trailing partial block is represented by the
+            # partial accumulator below.
             n_completed = T // csa_m
-            compressed_runtime = n_completed * csa_c
+            compressed_capacity = geometric_capacity(n_completed)
+            compressed_runtime = compressed_capacity * csa_c
             # Sliding-window branch: the reference decoding cache pre-allocates
             # a fixed ring buffer of length csa_sw (when enabled), so memory
             # accounting should count capacity, not just the number of currently
@@ -215,7 +224,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             # allocated by _SlidingWindowRingBuffer.
             sw = csa_sw * csa_c
             # Indexer key cache: one compressed indexer key per completed block.
-            indexer = n_completed * csa_cI
+            indexer = compressed_capacity * csa_cI
             # Incremental decode also retains a partial-token accumulator until
             # a full block is available. CSA stores six per-token projections:
             # Ca/Cb/Za/Zb (4*c) plus indexer K/Z (2*c_I). The previous
@@ -243,11 +252,12 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         n_blocks = max(1, (T + hca_m2 - 1) // hca_m2)
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':
-            # Incremental HCA cache materializes compressed rows only for
-            # completed heavy-compression blocks; the trailing partial block is
-            # represented by the partial accumulator below.
+            # Incremental HCA cache materializes storage only for completed
+            # heavy-compression blocks and grows it geometrically; the trailing
+            # partial block is represented by the partial accumulator below.
             n_completed = T // hca_m2
-            compressed_runtime = n_completed * hca_c
+            compressed_capacity = geometric_capacity(n_completed)
+            compressed_runtime = compressed_capacity * hca_c
             # HCA uses the same fixed-capacity sliding-window ring buffer as
             # CSA, so count the allocated window capacity.
             sw = hca_sw * hca_c
