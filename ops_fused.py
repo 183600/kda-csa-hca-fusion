@@ -147,12 +147,12 @@ class HybridConfig:
         # — at the first forward pass, with no hint that the *config* (not
         # the call site) is the root cause. Validate here so the error fires
         # at construction time with a clear, actionable message.
-        if self.n_heads_qk < 1:
+        if not isinstance(self.n_heads_qk, int) or isinstance(self.n_heads_qk, bool) or self.n_heads_qk < 1:
             raise ValueError(
-                f"n_heads_qk={self.n_heads_qk} must be >= 1")
-        if self.n_heads_v < 1:
+                f"n_heads_qk={self.n_heads_qk!r} must be a positive int")
+        if not isinstance(self.n_heads_v, int) or isinstance(self.n_heads_v, bool) or self.n_heads_v < 1:
             raise ValueError(
-                f"n_heads_v={self.n_heads_v} must be >= 1")
+                f"n_heads_v={self.n_heads_v!r} must be a positive int")
         if self.n_heads_v % self.n_heads_qk != 0:
             raise ValueError(
                 f"n_heads_v={self.n_heads_v} must be divisible by "
@@ -179,6 +179,9 @@ class HybridConfig:
             ('hca_c', self.hca_c),
             ('hca_dc', self.hca_dc),
         ]:
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be a positive int.")
             if val < 1:
                 raise ValueError(
                     f"HybridConfig.{name}={val} must be >= 1. A zero or "
