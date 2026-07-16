@@ -15,6 +15,7 @@ Important contract:
 from __future__ import annotations
 
 import inspect
+import math
 import warnings
 from typing import Any
 
@@ -174,6 +175,10 @@ def kda_forward(
     """
     global _fla_import_warning_emitted
     backend = validate_kda_backend(backend)
+    if not isinstance(g_clamp_min, (int, float)) or isinstance(g_clamp_min, bool):
+        raise TypeError(f"g_clamp_min must be a real number, got {g_clamp_min!r}")
+    if math.isnan(float(g_clamp_min)):
+        raise ValueError("g_clamp_min must not be NaN")
 
     use_fla = backend == "fla"
     if backend == "auto":
