@@ -81,7 +81,6 @@ def _ensure_deps():
         'einops': ('einops>=0.6,<0.9', (0, 6), (0, 9)),
         'matplotlib': ('matplotlib>=3.5,<3.11', (3, 5), (3, 11)),
         'numpy': ('numpy>=1.21,<2.3', (1, 21), (2, 3)),
-        'scipy': ('scipy>=1.7,<1.15', (1, 7), (1, 15)),
     }
     for package, (spec, lower, upper) in bounded.items():
         try:
@@ -98,6 +97,20 @@ def _ensure_deps():
         subprocess.check_call([
             sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', spec,
         ])
+
+    # SciPy is optional: run_quality/run_ablation have a documented exact
+    # fallback for the required t-distribution calculations. Do not introduce
+    # a new network dependency on Kaggle just because SciPy is absent; only
+    # reject an installed SciPy version that is outside the tested range.
+    try:
+        scipy_version = importlib_metadata.version('scipy')
+    except importlib_metadata.PackageNotFoundError:
+        print('[run_all] scipy is not installed; using the repository statistical fallback.')
+    else:
+        if not _version_in_range(scipy_version, (1, 7), (1, 15)):
+            raise RuntimeError(
+                f'scipy=={scipy_version} is outside the tested range >=1.7,<1.15. '
+                'Install a supported version or remove it to use the exact fallback.')
 
     # Do not silently run experiments against an untested torch release. In
     # particular, SDPA/kernel-selection changes can alter the benchmark and
