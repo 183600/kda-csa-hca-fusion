@@ -140,6 +140,12 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     ``m=8`` the block covering positions ``0..7`` is visible to query ``t=7``;
     it is not future information because the whole source window is complete.
     """
+    if not isinstance(T, int) or T < 0:
+        raise ValueError(f"T must be a non-negative int, got {T!r}")
+    if not isinstance(n_blocks, int) or n_blocks < 0:
+        raise ValueError(f"n_blocks must be a non-negative int, got {n_blocks!r}")
+    if not isinstance(m, int) or m < 1:
+        raise ValueError(f"m must be a positive int, got {m!r}")
     i_t = torch.arange(T, device=device)
     i_b = torch.arange(n_blocks, device=device)
     return (i_t[:, None] + 1) // m > i_b[None, :]
