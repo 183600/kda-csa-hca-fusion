@@ -78,7 +78,11 @@ def causal_block_entries(T: int, m: int) -> int:
     A compressed block becomes visible when its complete source window closes,
     i.e. block ``b`` is available from query ``(b + 1) * m - 1`` onward.
     """
-    if T <= 0:
+    if not isinstance(T, int) or T < 0:
+        raise ValueError(f'T must be a non-negative int, got {T!r}')
+    if not isinstance(m, int) or m < 1:
+        raise ValueError(f'm must be a positive int, got {m!r}')
+    if T == 0:
         return 0
     n_full = T // m
     remainder = T % m
@@ -87,14 +91,22 @@ def causal_block_entries(T: int, m: int) -> int:
 
 def geometric_capacity(n_rows: int) -> int:
     """Return the power-of-two storage capacity used by decode caches."""
-    if n_rows <= 0:
+    if not isinstance(n_rows, int) or n_rows < 0:
+        raise ValueError(f'n_rows must be a non-negative int, got {n_rows!r}')
+    if n_rows == 0:
         return 0
     return 1 << (n_rows - 1).bit_length()
 
 
 def causal_selected_entries(T: int, m: int, topk: int) -> int:
     """Count selected block slots after a top-k cap under block causality."""
-    if T <= 0 or topk <= 0:
+    if not isinstance(T, int) or T < 0:
+        raise ValueError(f'T must be a non-negative int, got {T!r}')
+    if not isinstance(m, int) or m < 1:
+        raise ValueError(f'm must be a positive int, got {m!r}')
+    if not isinstance(topk, int) or topk < 0:
+        raise ValueError(f'topk must be a non-negative int, got {topk!r}')
+    if T == 0 or topk == 0:
         return 0
     n_full = T // m
     remainder = T % m
