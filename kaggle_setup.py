@@ -544,6 +544,11 @@ def capture_provenance() -> dict:
     import subprocess
     import sys
     import datetime
+    try:
+        from importlib import metadata as _importlib_metadata
+        fla_version = _importlib_metadata.version('flash-linear-attention')
+    except Exception:
+        fla_version = None
     info = detect_env()
     # Best-effort git commit; ignore errors (running from a tarball, etc).
     git_commit = None
@@ -563,6 +568,7 @@ def capture_provenance() -> dict:
         'device_name': info.device_name,
         'git_commit': git_commit,
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
+        'flash_linear_attention_version': fla_version,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED', '<unset>'),
         'num_threads': info.num_threads,
     }
