@@ -450,6 +450,9 @@ def main():
         seq_lengths = [int(x) for x in default_lengths.split(',')]
     if not seq_lengths:
         seq_lengths = [int(x) for x in default_lengths.split(',')]
+    if any(t < 1 for t in seq_lengths):
+        raise ValueError(
+            f'BENCH_LENGTHS must contain positive sequence lengths, got {seq_lengths!r}')
     logger.info(f'[run_benchmark] seq_lengths = {seq_lengths}')
     B, H, K, V, d = 1, 4, 32, 32, 64
 
