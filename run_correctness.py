@@ -4381,6 +4381,25 @@ def test_kv_cache_ceil_block_count(device='cpu'):
     return results
 
 
+def test_geometric_decode_cache_capacity(device='cpu'):
+    """Regression for the geometric compressed-cache storage contract."""
+    logger.info("Test: geometric decode-cache capacity")
+    from run_kv_cache import geometric_capacity
+    expected = [0, 1, 2, 4, 4, 8, 8, 8, 16]
+    actual = [geometric_capacity(n) for n in range(len(expected))]
+    valid = actual == expected
+    invalid_ok = False
+    try:
+        geometric_capacity(-1)
+    except ValueError:
+        invalid_ok = True
+    return [
+        _ok('geometric capacity sequence', valid,
+            f'expected={expected}, actual={actual}'),
+        _ok('geometric capacity rejects negative rows', invalid_ok, ''),
+    ]
+
+
 def test_kv_cache_full_accounting_runtime_state(device='cpu'):
     """KV-cache full_accounting must include incremental runtime state.
 
@@ -5196,6 +5215,7 @@ def main():
     all_results += _run_safe(test_prefill_flops_causal_block_entries, device)
     # P1-4 regression: ceil block count at non-divisible T.
     all_results += _run_safe(test_kv_cache_ceil_block_count, device)
+    all_results += _run_safe(test_geometric_decode_cache_capacity, device)
     all_results += _run_safe(test_kv_cache_full_accounting_runtime_state, device)
     all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
     all_results += _run_safe(test_prefill_flops_kch_output_projections, device)
