@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (configure_torch_for_device, sanitize_for_json,
                           write_json_atomic, make_seeded_generator)
-from ops_kda import naive_recurrent_kda
+from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_decoding_cache import CSADecodingCache, HCADecodingCache
@@ -287,6 +287,13 @@ class KDAAttnDecoding(nn.Module):
         # default (0.1) preserves the historical behaviour. We read it from
         # the constructor arg if provided; otherwise default to 0.1.
         self.decay_scale = 0.1
+        # The decode benchmark keeps the reference backend by default for
+        # reproducibility. Set KDA_BACKEND=fla or auto for an explicitly
+        # accelerated run; the shared adapter preserves the already-processed
+        # q/k/g/beta contract.
+        self.kda_backend = validate_kda_backend(
+            os.environ.get('KDA_BACKEND', 'reference')
+        )
         self.H, self.K, self.V = H, K, V
         # Register the recurrent state as a non-persistent buffer so
         # model.to(device) moves it along with the parameters. A plain
@@ -386,9 +393,13 @@ class KDAAttnDecoding(nn.Module):
                 state = state.to(device=x.device, dtype=x.dtype).detach()
             else:
                 state = state.detach()
-        o, self._state = naive_recurrent_kda(
-            q, k, v, g, beta, scale=self.K ** -0.5,
-            initial_state=state, output_final_state=True,
+        o, self._state = kda_forward(
+            q, k, v, g, beta,
+            scale=self.K ** -0.5,
+            initial_state=state,
+            output_final_state=True,
+            use_chunk=False,
+            backend=self.kda_backend,
         )
         return self.o(o.reshape(B, T_new, self.H * self.V))
 
@@ -664,6 +675,9 @@ class HybridDecoding(nn.Module):
             n_heads_qk=2, n_heads_v=2,
             head_dim_k=16, head_dim_v=16,
             kda_chunk_size=0,  # force recurrent path for decode
+            kda_backend=validate_kda_backend(
+                os.environ.get('KDA_BACKEND', 'reference')
+            ),
             csa_m=4, csa_topk=csa_topk,
             csa_nh=2, csa_c=8, csa_dc=8, csa_nIh=1, csa_cI=4,
             csa_sliding_window=4,
@@ -1127,6 +1141,10 @@ def main():
                                    repeats=N_REPEATS)
                 r['op'] = name
                 r['device'] = str(device)
+                r['kda_backend'] = (
+                    os.environ.get('KDA_BACKEND', 'reference')
+                    if name in {'kda', 'hybrid'} else None
+                )
                 # The hybrid wrapper now wires CSA/HCA incremental caches into
                 # the full stack, so the row is no longer an upper-bound
                 # placeholder. Keep explicit metadata for downstream figures.
@@ -1182,6 +1200,10 @@ def main():
                 # match the success-row schema.
                 results.append({'op': name, 'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
+                                'kda_backend': (
+                                    os.environ.get('KDA_BACKEND', 'reference')
+                                    if name in {'kda', 'hybrid'} else None
+                                ),
                                 'prefill_ms': None,
                                 'mean_decode_ms_per_token': None,
                                 'median_decode_ms_per_token': None,

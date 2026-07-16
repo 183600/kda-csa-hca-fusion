@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (configure_torch_for_device, parse_int_env,
                           sanitize_for_json, write_json_atomic,
                           make_seeded_generator)
-from ops_kda import naive_recurrent_kda
+from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 
@@ -598,6 +598,13 @@ class KDAAttn(nn.Module):
             d_model, d_model, kernel_size=3, padding=0,
             groups=d_model, bias=True,
         )
+        # Keep quality experiments on the reference backend by default so
+        # historical accuracy numbers remain comparable. Set KDA_BACKEND=fla
+        # (after installing the optional [fla] extra) only for an explicitly
+        # accelerated run; KDA_BACKEND=auto uses FLA on CUDA when available.
+        self.kda_backend = validate_kda_backend(
+            os.environ.get('KDA_BACKEND', 'reference')
+        )
         self.H, self.K, self.V = H, K, V
 
     def forward(self, x):
@@ -626,7 +633,12 @@ class KDAAttn(nn.Module):
         g = -F.softplus(self.g_up(self.g_down(x_conv))).view(
             B, T, self.H, self.K) * self.DECAY_SCALE
         beta = torch.sigmoid(self.beta(x_conv))
-        out, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
+        out, _ = kda_forward(
+            q, k, v, g, beta,
+            output_final_state=False,
+            use_chunk=False,
+            backend=self.kda_backend,
+        )
         return self.o(out.reshape(B, T, self.H * self.V))
 
 
@@ -1450,6 +1462,7 @@ def main():
     # eliminating the truncated-partial-JSON failure mode.
     payload = {
         'metadata': {
+            'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,

@@ -41,12 +41,21 @@ from kaggle_setup import (
     configure_torch_for_device, parse_int_env, sanitize_for_json,
     write_json_atomic, capture_provenance, make_seeded_generator,
 )
-from ops_kda import naive_recurrent_kda, naive_chunk_kda
+from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _selected_kda_backend() -> str:
+    """Return the explicitly requested benchmark KDA backend.
+
+    The benchmark remains reference-first; set ``KDA_BACKEND=fla`` or
+    ``KDA_BACKEND=auto`` to measure the optional FLA path separately.
+    """
+    return validate_kda_backend(os.environ.get('KDA_BACKEND', 'reference'))
 
 
 # BQ4 fix: side channel for variance stats (min/max/std). The ``_bench``
@@ -265,10 +274,16 @@ def bench_kda_recurrent(B, T, H, K, V, device):
     v = _rand(B, T, H, V, device=device, generator=gen)
     g = -torch.rand(B, T, H, K, device=device, generator=gen) * 0.05
     beta = torch.rand(B, T, H, device=device, generator=gen) * 0.2
+    backend = _selected_kda_backend()
 
     def fn():
         with torch.no_grad():
-            return naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+            return kda_forward(
+                q, k, v, g, beta,
+                output_final_state=True,
+                use_chunk=False,
+                backend=backend,
+            )
     return fn
 
 
@@ -280,6 +295,7 @@ def bench_kda_chunk(B, T, H, K, V, device):
     v = _rand(B, T, H, V, device=device, generator=gen)
     g = -torch.rand(B, T, H, K, device=device, generator=gen) * 0.05
     beta = torch.rand(B, T, H, device=device, generator=gen) * 0.2
+    backend = _selected_kda_backend()
     BT = 64
     # NOTE: ``naive_chunk_kda`` already right-pads T up to a multiple of
     # ``chunk_size`` internally and returns ``o[:, :original_T]``. The previous
@@ -293,7 +309,13 @@ def bench_kda_chunk(B, T, H, K, V, device):
     # padding end-to-end and just time it directly.
     def fn():
         with torch.no_grad():
-            o, s = naive_chunk_kda(q, k, v, g, beta, output_final_state=True, chunk_size=BT)
+            o, s = kda_forward(
+                q, k, v, g, beta,
+                output_final_state=True,
+                chunk_size=BT,
+                use_chunk=True,
+                backend=backend,
+            )
             # P1 fix: assert the output sequence dimension matches T. The
             # previous version had a slicing bug (``o[:T]`` sliced dim=0
             # batch instead of dim=1 sequence) that was fixed by letting
@@ -510,6 +532,8 @@ def main():
                 # wrong conclusions about operator efficiency.
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
+                if name in {'kda_rec', 'kda_chunk'}:
+                    row['kda_backend'] = _selected_kda_backend()
                 if name in {'csa', 'hybrid'}:
                     row['csa_indexer_normalize_qk'] = True
                     # ``torch.no_grad()`` gates off the STE surrogate in
@@ -535,6 +559,8 @@ def main():
                 err_row = {
                     'T': T, 'op': name, 'error': str(e),
                     'device': str(device),
+                    'kda_backend': (os.environ.get('KDA_BACKEND', 'reference')
+                                    if name in {'kda_rec', 'kda_chunk'} else None),
                     'time_ms': None, 'peak_mem_MB': None,
                     'time_min_ms': None, 'time_max_ms': None,
                     'time_std_ms': None,

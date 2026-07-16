@@ -112,11 +112,18 @@ cfg = HybridConfig(kda_backend="fla")
 ```
 
 Use `kda_backend="auto"` to try FLA only for CUDA tensors when it is installed
-and otherwise fall back to the reference path. The adapter passes the already
-normalized q/k, log-space gate, and post-sigmoid beta values without applying
-those transformations a second time. CSA/HCA remain on the repository
-reference path; no Hugging Face or vLLM dependency is required for the normal
-experiments.
+and otherwise fall back to the reference path. For the standalone quality,
+decoding, and benchmark runners, set the same choice before launching:
+
+```bash
+KDA_BACKEND=fla python run_benchmark.py
+KDA_BACKEND=auto python run_decoding.py
+```
+
+The adapter passes the already normalized q/k, log-space gate, and post-sigmoid
+beta values without applying those transformations a second time. CSA/HCA
+remain on the repository reference path; no Hugging Face or vLLM dependency is
+required for the normal experiments.
 
 After `pip install -e .`, the experiment scripts can be run as modules:
 
@@ -178,6 +185,7 @@ Environment knobs (set before launching):
 | `ABL_NKV` | `1` | comma-separated MQAR `n_kv` values for Exp 5 |
 | `SKIP_SLOW` | `0` | `1` truncates Exp 2/4/5 on CPU |
 | `SKIP_CUDA_CHECK` | `0` | `1` bypasses the CUDA-availability guard |
+| `KDA_BACKEND` | `reference` | `reference`, `fla`, or `auto`; applies to the hybrid layer, standalone KDA quality/decode, and KDA benchmark paths |
 
 ---
 

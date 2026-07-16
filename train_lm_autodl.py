@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 # import repo modules
 from ops_fused import HybridConfig, HybridKCHAttention
+from ops_kda_backend import validate_kda_backend
 from kaggle_setup import configure_torch_for_device
 
 # tokenizer / dataset handling (reuse TinyStories if available)
@@ -156,11 +157,16 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
-    # Config: rigorous version, but small for cost
+    # Config: rigorous version, but small for cost. The optional KDA backend
+    # is selected consistently across LM training and the experiment runners;
+    # the default remains the reference path for reproducibility.
+    kda_backend = validate_kda_backend(
+        os.environ.get('KDA_BACKEND', 'reference')
+    )
     if is_kaggle:
         cfg = HybridConfig(d_model=256, n_heads_qk=2, n_heads_v=2, head_dim_k=32, head_dim_v=32,
                            csa_m=8, csa_topk=4, hca_m2=16, n_kda=3, n_csa=1, n_hca=1,
-                           kda_chunk_size=64)
+                           kda_chunk_size=64, kda_backend=kda_backend)
         batch_size = 1
         grad_accum = 8
         seq_len = 512
@@ -168,7 +174,7 @@ def main():
     else:
         cfg = HybridConfig(d_model=512, n_heads_qk=4, n_heads_v=4, head_dim_k=64, head_dim_v=64,
                            csa_m=16, csa_topk=8, hca_m2=64, n_kda=3, n_csa=1, n_hca=1,
-                           kda_chunk_size=64)
+                           kda_chunk_size=64, kda_backend=kda_backend)
         batch_size = 2
         grad_accum = 4
         seq_len = 1024
