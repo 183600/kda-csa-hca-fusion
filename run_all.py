@@ -71,7 +71,7 @@ def _version_in_range(raw: str, lower: tuple[int, ...], upper: tuple[int, ...]) 
 def _ensure_deps():
     """Ensure runtime packages exist within the repository's tested bounds.
 
-    Checking only whether ``einops``/``matplotlib`` import was insufficient:
+    Checking only whether packages import was insufficient:
     Kaggle images can already contain an incompatible version, and the runner
     would silently produce different numerical/figure behavior than the
     pinned environment. Torch is never replaced in-process; an incompatible
@@ -80,6 +80,8 @@ def _ensure_deps():
     bounded = {
         'einops': ('einops>=0.6,<0.9', (0, 6), (0, 9)),
         'matplotlib': ('matplotlib>=3.5,<3.11', (3, 5), (3, 11)),
+        'numpy': ('numpy>=1.21,<2.3', (1, 21), (2, 3)),
+        'scipy': ('scipy>=1.7,<1.15', (1, 7), (1, 15)),
     }
     for package, (spec, lower, upper) in bounded.items():
         try:
