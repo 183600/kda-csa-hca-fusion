@@ -90,6 +90,11 @@ def _ensure_deps():
         if installed is not None and _version_in_range(installed, lower, upper):
             continue
         if installed is not None:
+            if package in sys.modules:
+                raise RuntimeError(
+                    f'{package}=={installed} is already loaded but outside the '
+                    f'tested range {spec}. Install the supported version and '
+                    'restart the Python process before running experiments.')
             print(f'[run_all] {package}=={installed} is outside the tested range; '
                   f'installing {spec}...')
         else:
