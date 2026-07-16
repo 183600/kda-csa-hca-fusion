@@ -1,0 +1,240 @@
+name: LLM Bug Check and Fix
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 0 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: llm-bug-fix
+  cancel-in-progress: false
+
+jobs:
+  llm-fix:
+    runs-on: ubuntu-latest
+    # 5 小时 + 5 分钟缓冲，让脚本内部能优雅退出并 push
+    timeout-minutes: 305
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install openai
+
+      - name: Run LLM Bug-Fix Loop
+        env:
+          # 改用 GitHub Secret
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
+          NVIDIA_MODEL: z-ai/glm-5.2
+          MAX_DURATION_SECONDS: "18000"   # 5 hours
+        run: |
+          python - <<'PYEOF'
+          import os, sys, time, glob, re, subprocess, traceback
+          from openai import OpenAI
+
+          API_KEY    = os.environ["NVIDIA_API_KEY"]
+          BASE_URL   = os.environ["NVIDIA_BASE_URL"]
+          MODEL      = os.environ["NVIDIA_MODEL"]
+          MAX_DUR    = int(os.environ["MAX_DURATION_SECONDS"])
+
+          client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+          START  = time.time()
+
+          # ---------- helpers ----------
+          def read_file(p):
+              try:
+                  with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                      return f.read()
+              except Exception:
+                  return None
+
+          def find_py_files():
+              out = []
+              for root, dirs, fnames in os.walk('.'):
+                  parts = root.split(os.sep)
+                  if '.git' in parts:
+                      continue
+                  dirs[:] = [d for d in dirs if d not in (
+                      '.git', '__pycache__', '.venv', 'venv', 'env',
+                      'node_modules', '.idea', '.vscode')]
+                  for f in fnames:
+                      if f.endswith('.py'):
+                          out.append(os.path.normpath(os.path.join(root, f)))
+              return sorted(set(out))
+
+          def call_llm(readme, file_path, file_content):
+              sys_prompt = (
+                  "You are a meticulous Python code reviewer for scientific / research codebases. "
+                  "You will be given (1) the project's README.md for context and (2) a single .py file. "
+                  "Your ONLY goal is to find bugs that could affect experimental results, including but "
+                  "not limited to: incorrect math/formulas, wrong variable names, off-by-one indexing, "
+                  "wrong axis/keepdims/dim arguments, incorrect reduction or aggregation, misused random "
+                  "seeds / non-determinism, data leakage between train/eval, incorrect metric computation, "
+                  "wrong tensor shapes, silent broadcasting bugs, swapped arguments, wrong dtype, missing "
+                  "detach()/no_grad, incorrect loss reduction, sign errors, integer vs float division, "
+                  "wrong device placement affecting numerics, etc. "
+                  "Do NOT report style issues, formatting, comments, naming convention, or anything that "
+                  "does not affect numerical/experimental results. "
+                  "Do NOT modify README.md. "
+                  "If you find NO such bugs, respond with EXACTLY this single line:\nNO_CHANGES\n"
+                  "If you find such bugs, respond with the FULL corrected file content inside a single "
+                  "Python fenced code block:\n```python\n<full file content here>\n```\n"
+                  "Output nothing else outside the block. Keep the overall structure intact; change only "
+                  "what is needed to fix the bugs. Preserve original indentation and encoding (UTF-8). "
+                  "Do not add or remove top-level imports unless strictly required by the fix."
+              )
+              user_msg = (
+                  f"=== README.md (project context) ===\n{readme}\n\n"
+                  f"=== File under review: {file_path} ===\n```python\n{file_content}\n```\n\n"
+                  "Review the file above for bugs that affect experimental results. "
+                  "Respond with 'NO_CHANGES' if there are none, or with the full corrected file "
+                  "in a single ```python``` block otherwise."
+              )
+              resp = client.chat.completions.create(
+                  model=MODEL,
+                  messages=[
+                      {"role": "system", "content": sys_prompt},
+                      {"role": "user",   "content": user_msg},
+                  ],
+                  temperature=0.2,
+                  max_tokens=8192,
+              )
+              return resp.choices[0].message.content.strip()
+
+          def extract_code(resp):
+              if not resp:
+                  return None
+              first_line = resp.strip().splitlines()[0].strip().upper()
+              if first_line == "NO_CHANGES" or resp.strip().upper() == "NO_CHANGES":
+                  return None
+              m = re.search(r"```python\s*\n(.*?)```", resp, re.DOTALL)
+              if not m:
+                  m = re.search(r"```[a-zA-Z0-9_]*\s*\n(.*?)```", resp, re.DOTALL)
+              if not m:
+                  m = re.search(r"```\s*\n(.*?)```", resp, re.DOTALL)
+              if not m:
+                  return None
+              return m.group(1)
+
+          def git_setup():
+              subprocess.run(["git", "config", "user.name",  "github-actions[bot]"], check=True)
+              subprocess.run(["git", "config", "user.email", "github-actions@github.com"], check=True)
+
+          def git_commit_push(msg):
+              subprocess.run(["git", "add", "-A"], check=True)
+              r = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True)
+              if r.returncode != 0:
+                  # nothing to commit
+                  return False
+              # push with retry
+              for attempt in range(3):
+                  pr = subprocess.run(["git", "push"], capture_output=True, text=True)
+                  if pr.returncode == 0:
+                      return True
+                  # try pull-rebase then push again
+                  subprocess.run(["git", "pull", "--rebase", "origin",
+                                  os.environ.get("GITHUB_REF_NAME", "HEAD")],
+                                  capture_output=True, text=True)
+                  time.sleep(3)
+              print("git push failed:", pr.stdout, pr.stderr)
+              return False
+
+          git_setup()
+
+          iteration = 0
+          stop_reason = None
+          while True:
+              elapsed = time.time() - START
+              if elapsed >= MAX_DUR:
+                  stop_reason = f"time limit reached ({elapsed:.0f}s)"
+                  break
+
+              iteration += 1
+              print(f"\n=========== Iteration {iteration} (elapsed {elapsed:.0f}s) ===========")
+              py_files = find_py_files()
+              if not py_files:
+                  print("No .py files found. Stopping.")
+                  stop_reason = "no .py files"
+                  break
+
+              readme = read_file("README.md") or ""
+              if not os.path.exists("README.md"):
+                  print("WARNING: README.md not found; using empty context.")
+
+              any_changes_this_iter = False
+
+              # 串行处理（API 并发 = 1）
+              for fp in py_files:
+                  if time.time() - START >= MAX_DUR:
+                      stop_reason = "time limit reached mid-iteration"
+                      break
+
+                  content = read_file(fp)
+                  if content is None:
+                      continue
+
+                  print(f"\n--- Checking {fp} ---")
+                  
+                  # API 调用重试逻辑
+                  resp = None
+                  while True:
+                      if time.time() - START >= MAX_DUR:
+                          stop_reason = "time limit reached during API call/retry"
+                          break
+                      try:
+                          resp = call_llm(readme, fp, content)
+                          break # 调用成功，跳出重试循环
+                      except Exception as e:
+                          print(f"  API error on {fp}: {e}")
+                          print("  Waiting 30 seconds before retrying...")
+                          traceback.print_exc()
+                          time.sleep(30)
+                  
+                  if stop_reason:
+                      break # 跳出 for fp in py_files 循环
+
+                  new_code = extract_code(resp)
+                  if new_code is None:
+                      print("  -> NO_CHANGES")
+                      continue
+
+                  # 规范化末尾换行
+                  if not new_code.endswith("\n"):
+                      new_code += "\n"
+
+                  if new_code == content:
+                      print("  -> LLM returned identical content; skipping.")
+                      continue
+
+                  # 写入修改
+                  with open(fp, 'w', encoding='utf-8') as f:
+                      f.write(new_code)
+                  print(f"  -> Applied patch to {fp}")
+                  any_changes_this_iter = True
+
+              # 本轮结束：如果有改动则 push；没改动则视为“全部无问题”，停止
+              if any_changes_this_iter:
+                  git_commit_push(f"llm: fix bugs affecting experimental results (iteration {iteration})")
+              else:
+                  print("\nNo changes in this iteration — all files clean. Stopping.")
+                  stop_reason = "all files clean"
+                  break
+
+          # 最终保险 push
+          print(f"\nStopping because: {stop_reason}")
+          git_commit_push(f"llm: final commit ({stop_reason})")
+          print("Done.")
+          PYEOF
