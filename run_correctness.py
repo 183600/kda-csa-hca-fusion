@@ -4439,6 +4439,11 @@ def test_kv_cache_full_accounting_runtime_state(device='cpu'):
         + p['hca_nh']
     )
     actual_hca = kv_cache_elements('hca', T_hca, mode='full_accounting', **p)
+    invalid_mode_ok = False
+    try:
+        kv_cache_elements('hca', T_hca, mode='not-a-mode', **p)
+    except ValueError:
+        invalid_mode_ok = True
 
     return [
         _ok('csa full_accounting includes partial + overlap state',
@@ -4447,6 +4452,7 @@ def test_kv_cache_full_accounting_runtime_state(device='cpu'):
         _ok('hca full_accounting includes partial accumulator',
             actual_hca == expected_hca,
             f'actual={actual_hca}, expected={expected_hca}, T={T_hca}'),
+        _ok('KV accounting rejects invalid mode', invalid_mode_ok, ''),
     ]
 
 

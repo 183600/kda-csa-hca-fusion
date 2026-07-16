@@ -157,6 +157,11 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         raise ValueError(
             f"kv_cache_elements: op={op!r} must be one of "
             f"{sorted(_valid_ops)}.")
+    _valid_modes = {'compressed_kv_only', 'full_accounting'}
+    if mode not in _valid_modes:
+        raise ValueError(
+            f"kv_cache_elements: mode={mode!r} must be one of "
+            f"{sorted(_valid_modes)}.")
     H, K, V = p['H'], p['K'], p['V']
     csa_m, csa_c = p['csa_m'], p['csa_c']
     hca_m2, hca_c = p['hca_m2'], p['hca_c']
