@@ -97,6 +97,15 @@ def _ensure_deps():
         subprocess.check_call([
             sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', spec,
         ])
+        try:
+            installed_after = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                f'{package} installation completed but metadata is still missing') from exc
+        if not _version_in_range(installed_after, lower, upper):
+            raise RuntimeError(
+                f'{package}=={installed_after} remains outside the tested range '
+                f'after installing {spec}')
 
     # SciPy is optional: run_quality/run_ablation have a documented exact
     # fallback for the required t-distribution calculations. Do not introduce
