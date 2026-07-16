@@ -4385,7 +4385,7 @@ def test_geometric_decode_cache_capacity(device='cpu'):
     """Regression for the geometric compressed-cache storage contract."""
     logger.info("Test: geometric decode-cache capacity")
     from run_kv_cache import geometric_capacity
-    expected = [0, 1, 2, 4, 4, 8, 8, 8, 16]
+    expected = [0, 1, 2, 4, 4, 8, 8, 8, 8]
     actual = [geometric_capacity(n) for n in range(len(expected))]
     valid = actual == expected
     invalid_ok = False
