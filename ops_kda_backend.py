@@ -233,6 +233,7 @@ def kda_forward(
                 stacklevel=2,
             )
             use_fla = False
+            _fla_import_warning_emitted = True
 
     if backend == "auto" and not use_fla and q.is_cuda and not _fla_import_warning_emitted:
         warnings.warn(
