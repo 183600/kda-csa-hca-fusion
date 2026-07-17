@@ -184,27 +184,35 @@ jobs:
               if not re.search(r'(^|\n|\s)diff\s', script):
                   return False, "missing 'diff' command"
 
+              # 忽略 here-doc 内部的 Python 代码，防止误杀 model.eval() 或 .find() 等正常代码
+              bash_only_script = re.sub(
+                  r"<<\s*['\"]?__FIXED_EOF__['\"]?\n(.*?)\n__FIXED_EOF__",
+                  "",
+                  script,
+                  flags=re.DOTALL
+              )
+
               for pat, name in FORBIDDEN_PATTERNS:
-                  if re.search(pat, script):
+                  if re.search(pat, bash_only_script):
                       return False, f"forbidden token: {name}"
 
               target_norm = os.path.normpath(target_file)
 
               # rm only allowed for /tmp/ paths
-              for m in re.finditer(r'\brm\s+(-[a-zA-Z]+\s+)?(\S+)', script):
+              for m in re.finditer(r'\brm\s+(-[a-zA-Z]+\s+)?(\S+)', bash_only_script):
                   p = m.group(2).strip('"').strip("'")
                   if not p.startswith('/tmp/'):
                       return False, f"rm targets non-tmp path: {p}"
 
               # > / >> only allowed to /tmp/ paths
-              for m in re.finditer(r'(>>?)\s*(\S+)', script):
+              for m in re.finditer(r'(>>?)\s*(\S+)', bash_only_script):
                   p = m.group(2).strip('"').strip("'")
                   if not p.startswith('/tmp/'):
                       return False, f"redirection to non-tmp path: {p}"
 
               # cp / mv destinations: must be /tmp/ or target_file
               has_cp_to_target = False
-              for m in re.finditer(r'\b(?:cp|mv)\s+(.+)', script):
+              for m in re.finditer(r'\b(?:cp|mv)\s+(.+)', bash_only_script):
                   line = m.group(1).strip()
                   try:
                       parts = shlex.split(line)
@@ -307,6 +315,8 @@ jobs:
                   print("WARNING: README.md not found; using empty context.")
 
               any_changes_this_iter = False
+              no_diff_count = 0
+              failed_count = 0
 
               # 串行处理（API 并发 = 1）：一次 LLM 调用只对应一个文件
               for fp in py_files:
@@ -341,6 +351,7 @@ jobs:
                   bash_script = extract_bash_script(resp)
                   if bash_script is None:
                       print("  -> NO_CHANGES")
+                      no_diff_count += 1
                       continue
 
                   # 校验 bash 脚本：必须含 diff，且只能改当前文件
@@ -348,6 +359,7 @@ jobs:
                   if not ok:
                       print(f"  -> Rejected bash script ({reason}):")
                       print("     " + "\n     ".join(bash_script.splitlines()))
+                      failed_count += 1
                       continue
 
                   # 执行前快照 git 状态
@@ -373,7 +385,7 @@ jobs:
                       print(f"  -> Reverting any partial changes to {fp}.")
                       subprocess.run(["git", "checkout", "--", fp],
                                      capture_output=True, text=True)
-                      # 同时回滚任何 /tmp 残留无关紧要
+                      failed_count += 1
                       continue
 
                   # 执行后再次快照，确保只有目标文件被改
@@ -388,6 +400,7 @@ jobs:
                       for f in list(unwanted) + [fp]:
                           subprocess.run(["git", "checkout", "--", f],
                                          capture_output=True, text=True)
+                      failed_count += 1
                       continue
 
                   # 验证内容确实变了
@@ -397,6 +410,7 @@ jobs:
                       # 仍然把它从 working tree 里恢复，避免空 commit
                       subprocess.run(["git", "checkout", "--", fp],
                                      capture_output=True, text=True)
+                      no_diff_count += 1
                       continue
 
                   print(f"  -> Applied fix to {fp}")
@@ -410,14 +424,20 @@ jobs:
                       any_changes_this_iter = True
                   else:
                       print("  -> Failed to commit/push this file; will continue.")
+                      failed_count += 1
 
               if stop_reason:
                   break
 
-              if not any_changes_this_iter:
+              # 修改停止逻辑：只有当所有文件都真正 NO_CHANGES 时才停
+              if no_diff_count == len(py_files):
                   print("\nNo changes in this iteration — all files clean. Stopping.")
                   stop_reason = "all files clean"
                   break
+
+              # 如果有失败的情况，但没超时，继续下一轮重试
+              if failed_count > 0 and not any_changes_this_iter:
+                  print(f"\n{failed_count} files failed to process in this iteration. Retrying in next iteration...")
 
           # 最终保险 push
           print(f"\nStopping because: {stop_reason}")
