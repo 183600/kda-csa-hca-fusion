@@ -248,7 +248,7 @@ def main():
         autocast_dtype = torch.float16
     else:
         autocast_dtype = torch.float32
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and autocast_dtype == torch.float16))
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and autocast_dtype == torch.float16))
     print(f"AMP enabled={use_amp}, dtype={autocast_dtype}, grad_scaler={scaler.is_enabled()}")
 
     os.makedirs(args.output_dir, exist_ok=True)
