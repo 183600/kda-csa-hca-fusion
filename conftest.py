@@ -129,7 +129,6 @@ def pytest_collection_modifyitems(config, items):
         reason='Skipped because SKIP_SLOW=1 is set in the environment.')
 
     device = config.getoption('--device')
-    cuda_unavailable = False
     if device == 'cuda':
         try:
             import torch
@@ -137,7 +136,6 @@ def pytest_collection_modifyitems(config, items):
         except Exception:
             cuda_available = False
         if not cuda_available:
-            cuda_unavailable = True
             skip_cuda = pytest.mark.skip(
                 reason='--device cuda requested but torch.cuda.is_available() '
                        'is False; run on CPU (the default) or fix your CUDA '
@@ -186,9 +184,12 @@ def pytest_collection_modifyitems(config, items):
 # inspects it for the ``_ok`` list-of-dict pattern, and (d) raises
 # ``AssertionError`` if any sub-check has ``status != 'PASS'``. The
 # ``tryfirst=True`` ensures our hook runs before pytest's default
-# implementation, and returning ``True`` stops the default from running.
-# Returning ``None`` (for async / generator tests we do not handle) lets the
-# default implementation run as usual.
+# implementation. ONLY return ``True`` (which stops the default impl) when we
+# actually handled the ``_ok`` list-of-dict pattern; for all other return
+# values (including ``None``), return ``None`` so pytest's default
+# implementation runs normally (preserving proper fixture finalization,
+# ``PytestReturnNotNoneWarning`` semantics, and support for ``test_figures.py``
+# tests that use plain ``assert`` and return ``None``).
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem):
     """Capture test function return values and convert list-of-dict FAIL
@@ -198,9 +199,11 @@ def pytest_pyfunc_call(pyfuncitem):
     see the test function's return value because ``outcome.get_result()``
     returns ``None`` for non-raising tests).
 
-    Only handles plain synchronous functions. Async tests, generator tests,
-    and any other exotic test types fall through to pytest's default
-    implementation (return ``None`` to yield to the next hook).
+    Only handles plain synchronous functions returning the ``_ok``
+    list-of-dict pattern. Async tests, generator tests, and any other exotic
+    test types — as well as normal tests returning ``None`` or a non-list
+    value — fall through to pytest's default implementation (return
+    ``None`` to yield to the next hook).
     """
     import inspect as _inspect
     testfunction = pyfuncitem.obj
@@ -239,4 +242,8 @@ def pytest_pyfunc_call(pyfuncitem):
                 f"{r.get('detail','')}" for r in failures)
             raise AssertionError(
                 f"{len(failures)} check(s) failed in {pyfuncitem.name}:\n{msgs}")
-    return True  # stop the default impl from running
+        return True  # handled: stop the default impl from running
+    # Not the ``_ok`` list-of-dict pattern — yield to pytest's default
+    # implementation so normal ``assert``-based tests (e.g. test_figures.py)
+    # and ``PytestReturnNotNoneWarning`` semantics are preserved.
+    return None
