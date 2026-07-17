@@ -343,7 +343,12 @@ def main():
         try:
             fn()
             results.append(True)
-        except AssertionError:
+        except AssertionError as e:
+            # Surface assertion failures loudly so the user can see which
+            # check failed and why. Previously this branch silently
+            # swallowed the message, making direct-run failures
+            # undiagnosable (only the pass count was printed).
+            print(f"  [FAIL] {fn.__name__}: AssertionError: {e}")
             results.append(False)
         except Exception as e:
             # Unexpected exception (not an assertion failure). Surface
