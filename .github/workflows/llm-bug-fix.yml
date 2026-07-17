@@ -2,11 +2,10 @@ name: LLM Bug Check and Fix
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 0 * * *"
 
 permissions:
   contents: write
+  actions: write          # 必须有此权限，GITHUB_TOKEN 才能触发下一个 workflow
 
 concurrency:
   group: llm-bug-fix
@@ -15,7 +14,6 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    # 5 小时 + 5 分钟缓冲，让脚本内部能优雅退出并 push
     timeout-minutes: 305
     steps:
       - name: Checkout
@@ -35,11 +33,10 @@ jobs:
 
       - name: Run LLM Bug-Fix Loop
         env:
-          # 改用 GitHub Secret
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
           NVIDIA_MODEL: z-ai/glm-5.2
-          MAX_DURATION_SECONDS: "18000"   # 5 hours
+          MAX_DURATION_SECONDS: "18000"
         run: |
           python - <<'PYEOF'
           import os, sys, time, glob, re, subprocess, traceback, shlex
@@ -53,7 +50,6 @@ jobs:
           client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
           START  = time.time()
 
-          # ---------- helpers ----------
           def read_file(p):
               try:
                   with open(p, 'r', encoding='utf-8', errors='replace') as f:
@@ -173,44 +169,28 @@ jobs:
           ]
 
           def validate_bash_script(script, target_file):
-              """Validate the bash script:
-                 - must call `diff`
-                 - must only modify target_file (and /tmp/__fixed_version.py)
-                 - must contain a `cp` to target_file
-              """
               if not script or not script.strip():
                   return False, "empty script"
-
               if not re.search(r'(^|\n|\s)diff\s', script):
                   return False, "missing 'diff' command"
-
-              # 忽略 here-doc 内部的 Python 代码，防止误杀 model.eval() 或 .find() 等正常代码
               bash_only_script = re.sub(
                   r"<<\s*['\"]?__FIXED_EOF__['\"]?\n(.*?)\n__FIXED_EOF__",
                   "",
                   script,
                   flags=re.DOTALL
               )
-
               for pat, name in FORBIDDEN_PATTERNS:
                   if re.search(pat, bash_only_script):
                       return False, f"forbidden token: {name}"
-
               target_norm = os.path.normpath(target_file)
-
-              # rm only allowed for /tmp/ paths
               for m in re.finditer(r'\brm\s+(-[a-zA-Z]+\s+)?(\S+)', bash_only_script):
                   p = m.group(2).strip('"').strip("'")
                   if not p.startswith('/tmp/'):
                       return False, f"rm targets non-tmp path: {p}"
-
-              # > / >> only allowed to /tmp/ paths
               for m in re.finditer(r'(>>?)\s*(\S+)', bash_only_script):
                   p = m.group(2).strip('"').strip("'")
                   if not p.startswith('/tmp/'):
                       return False, f"redirection to non-tmp path: {p}"
-
-              # cp / mv destinations: must be /tmp/ or target_file
               has_cp_to_target = False
               for m in re.finditer(r'\b(?:cp|mv)\s+(.+)', bash_only_script):
                   line = m.group(1).strip()
@@ -228,13 +208,10 @@ jobs:
                       has_cp_to_target = True
                       continue
                   return False, f"cp/mv destination is not target or /tmp/: {dst}"
-
               if not has_cp_to_target:
                   return False, "no cp/mv command targeting the file under review"
-
               if target_norm not in script and target_file not in script:
                   return False, "target file path not referenced in script"
-
               return True, "ok"
 
           def git_setup():
@@ -257,7 +234,6 @@ jobs:
               return files
 
           def git_commit_one_file(file_path, msg):
-              """Commit ONLY the given file (one LLM call => one file => one commit)."""
               subprocess.run(["git", "add", "--", file_path], check=False)
               r = subprocess.run(["git", "commit", "-m", msg, "--", file_path],
                                  capture_output=True, text=True)
@@ -318,7 +294,6 @@ jobs:
               no_diff_count = 0
               failed_count = 0
 
-              # 串行处理（API 并发 = 1）：一次 LLM 调用只对应一个文件
               for fp in py_files:
                   if time.time() - START >= MAX_DUR:
                       stop_reason = "time limit reached mid-iteration"
@@ -330,7 +305,6 @@ jobs:
 
                   print(f"\n--- Checking {fp} ---")
 
-                  # API 调用重试逻辑
                   resp = None
                   while True:
                       if time.time() - START >= MAX_DUR:
@@ -354,7 +328,6 @@ jobs:
                       no_diff_count += 1
                       continue
 
-                  # 校验 bash 脚本：必须含 diff，且只能改当前文件
                   ok, reason = validate_bash_script(bash_script, fp)
                   if not ok:
                       print(f"  -> Rejected bash script ({reason}):")
@@ -362,10 +335,8 @@ jobs:
                       failed_count += 1
                       continue
 
-                  # 执行前快照 git 状态
                   before_files = get_git_porcelain()
 
-                  # 准备脚本：强制 set -euo pipefail
                   full_script = "set -euo pipefail\n" + bash_script
                   if not full_script.endswith("\n"):
                       full_script += "\n"
@@ -388,7 +359,6 @@ jobs:
                       failed_count += 1
                       continue
 
-                  # 执行后再次快照，确保只有目标文件被改
                   after_files = get_git_porcelain()
                   newly_modified = after_files - before_files
                   target_norm = os.path.normpath(fp)
@@ -403,11 +373,9 @@ jobs:
                       failed_count += 1
                       continue
 
-                  # 验证内容确实变了
                   new_content = read_file(fp)
                   if new_content is None or new_content == content:
                       print("  -> File content unchanged after script; skipping.")
-                      # 仍然把它从 working tree 里恢复，避免空 commit
                       subprocess.run(["git", "checkout", "--", fp],
                                      capture_output=True, text=True)
                       no_diff_count += 1
@@ -415,7 +383,6 @@ jobs:
 
                   print(f"  -> Applied fix to {fp}")
 
-                  # 关键：一次 LLM 调用 -> 一个文件 -> 一次 commit -> 一次 push
                   if git_commit_one_file(
                       fp,
                       f"llm: fix bugs affecting experimental results in {fp} "
@@ -429,18 +396,62 @@ jobs:
               if stop_reason:
                   break
 
-              # 修改停止逻辑：只有当所有文件都真正 NO_CHANGES 时才停
               if no_diff_count == len(py_files):
                   print("\nNo changes in this iteration — all files clean. Stopping.")
                   stop_reason = "all files clean"
                   break
 
-              # 如果有失败的情况，但没超时，继续下一轮重试
               if failed_count > 0 and not any_changes_this_iter:
                   print(f"\n{failed_count} files failed to process in this iteration. Retrying in next iteration...")
 
-          # 最终保险 push
           print(f"\nStopping because: {stop_reason}")
           git_commit_push_all(f"llm: final commit ({stop_reason})")
           print("Done.")
           PYEOF
+
+  # ==========================================
+  # 自触发 Job：确保上一次执行完后自动触发下一次
+  # ==========================================
+  trigger-next:
+    needs: llm-fix
+    runs-on: ubuntu-latest
+    if: always() && !cancelled()
+    timeout-minutes: 5
+    steps:
+      - name: Trigger next workflow run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Previous job status: ${{ needs.llm-fix.result }}"
+          echo "Waiting 10 seconds for cleanup..."
+          sleep 10
+
+          # 1. 获取当前 Workflow 的 ID
+          WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
+          
+          if [ -z "$WF_ID" ]; then
+            echo "❌ Could not find workflow ID for '$WORKFLOW_NAME'. Loop will stop here."
+            exit 1
+          fi
+
+          echo "Found Workflow ID: $WF_ID"
+
+          # 2. 触发下一次运行
+          if gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/actions/workflows/$WF_ID/dispatches" \
+            -f "ref=$WORKFLOW_REF"; then
+            echo "✅ Successfully triggered next run of '$WORKFLOW_NAME' on ref '$WORKFLOW_REF'"
+          else
+            echo "❌ Failed to trigger next run."
+            exit 1
+          fi
+
+          # 3. 验证是否触发成功
+          sleep 5
+          echo "Recent workflow runs:"
+          gh run list --workflow "$WORKFLOW_NAME" --limit 3
