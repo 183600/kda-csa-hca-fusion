@@ -232,7 +232,7 @@ class HeadwiseFusedAttention(nn.Module):
         # HybridConfig.kda_decay_scale.
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
         # beta is per-head (H outputs), but naive_recurrent_kda expects it to
-        # broadcast against v [B, T, H, hd]. Unsqueeze the last dim so beta
+        # broadcast with v [B, T, H, hd]. Unsqueeze the last dim so beta
         # is [B, T, H, 1] and broadcasts correctly over hd. Without this,
         # a [B, T, H] beta would either crash (4D expected) or broadcast
         # incorrectly against the 4D q/k/v/g tensors.
