@@ -42,7 +42,7 @@ jobs:
           MAX_DURATION_SECONDS: "18000"   # 5 hours
         run: |
           python - <<'PYEOF'
-          import os, sys, time, glob, re, subprocess, traceback
+          import os, sys, time, glob, re, subprocess, traceback, shlex
           from openai import OpenAI
 
           API_KEY    = os.environ["NVIDIA_API_KEY"]
@@ -78,7 +78,7 @@ jobs:
           def call_llm(readme, file_path, file_content):
               sys_prompt = (
                   "You are a meticulous Python code reviewer for scientific / research codebases. "
-                  "You will be given (1) the project's README.md for context and (2) a single .py file. "
+                  "You will be given (1) the project's README.md for context and (2) a single .py file path with its content. "
                   "Your ONLY goal is to find bugs that could affect experimental results, including but "
                   "not limited to: incorrect math/formulas, wrong variable names, off-by-one indexing, "
                   "wrong axis/keepdims/dim arguments, incorrect reduction or aggregation, misused random "
@@ -89,19 +89,36 @@ jobs:
                   "Do NOT report style issues, formatting, comments, naming convention, or anything that "
                   "does not affect numerical/experimental results. "
                   "Do NOT modify README.md. "
+                  "CRITICAL CONSTRAINT: Each response may modify ONLY the single file under review. "
+                  "You must not touch, reference, or affect any other file in the repository.\n\n"
                   "If you find NO such bugs, respond with EXACTLY this single line:\nNO_CHANGES\n"
-                  "If you find such bugs, respond with the FULL corrected file content inside a single "
-                  "Python fenced code block:\n```python\n<full file content here>\n```\n"
-                  "Output nothing else outside the block. Keep the overall structure intact; change only "
-                  "what is needed to fix the bugs. Preserve original indentation and encoding (UTF-8). "
-                  "Do not add or remove top-level imports unless strictly required by the fix."
+                  "If you find such bugs, respond with a single bash script inside a ```bash``` fenced code block. "
+                  "The bash script MUST call the `diff` command and MUST follow this exact structure "
+                  "(replace <FILE_PATH> with the file path provided in the user message):\n\n"
+                  "```bash\n"
+                  "cat > /tmp/__fixed_version.py <<'__FIXED_EOF__'\n"
+                  "<the COMPLETE corrected file content, with all fixes applied>\n"
+                  "__FIXED_EOF__\n"
+                  'diff -u "<FILE_PATH>" /tmp/__fixed_version.py || true\n'
+                  'cp /tmp/__fixed_version.py "<FILE_PATH>"\n'
+                  "rm -f /tmp/__fixed_version.py\n"
+                  "```\n\n"
+                  "Rules:\n"
+                  "1. The bash script MUST contain a `diff` command (mandatory).\n"
+                  "2. The bash script MUST only modify the file under review via a single `cp` to the exact <FILE_PATH>.\n"
+                  "3. The bash script MUST NOT use sed, awk, perl, find, xargs, git, python, pip, eval, exec, source, backticks, or $(...).\n"
+                  "4. The bash script MUST NOT write to, delete, or rename any file other than the target file and /tmp/__fixed_version.py.\n"
+                  "5. Keep the overall file structure intact; change only what is needed to fix the bugs.\n"
+                  "6. Preserve original indentation and encoding (UTF-8).\n"
+                  "7. Do not add or remove top-level imports unless strictly required by the fix.\n"
+                  "8. Output nothing else outside the bash code block."
               )
               user_msg = (
                   f"=== README.md (project context) ===\n{readme}\n\n"
-                  f"=== File under review: {file_path} ===\n```python\n{file_content}\n```\n\n"
-                  "Review the file above for bugs that affect experimental results. "
-                  "Respond with 'NO_CHANGES' if there are none, or with the full corrected file "
-                  "in a single ```python``` block otherwise."
+                  f"=== File under review (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
+                  f"Review the file above for bugs that affect experimental results. "
+                  f"Respond with 'NO_CHANGES' if there are none, or with a bash script (using `diff`) that fixes the file `{file_path}` "
+                  f"following the exact template in the system prompt. Replace <FILE_PATH> with `{file_path}`."
               )
               resp = client.chat.completions.create(
                   model=MODEL,
@@ -114,13 +131,13 @@ jobs:
               )
               return resp.choices[0].message.content.strip()
 
-          def extract_code(resp):
+          def extract_bash_script(resp):
               if not resp:
                   return None
               first_line = resp.strip().splitlines()[0].strip().upper()
               if first_line == "NO_CHANGES" or resp.strip().upper() == "NO_CHANGES":
                   return None
-              m = re.search(r"```python\s*\n(.*?)```", resp, re.DOTALL)
+              m = re.search(r"```bash\s*\n(.*?)```", resp, re.DOTALL)
               if not m:
                   m = re.search(r"```[a-zA-Z0-9_]*\s*\n(.*?)```", resp, re.DOTALL)
               if not m:
@@ -129,27 +146,142 @@ jobs:
                   return None
               return m.group(1)
 
+          FORBIDDEN_PATTERNS = [
+              (r'\bgit\b',          'git'),
+              (r'\bsed\b',          'sed'),
+              (r'\bawk\b',          'awk'),
+              (r'\bperl\b',         'perl'),
+              (r'\bfind\b',         'find'),
+              (r'\bxargs\b',        'xargs'),
+              (r'\bsudo\b',         'sudo'),
+              (r'\bchmod\b',        'chmod'),
+              (r'\bchown\b',        'chown'),
+              (r'\bcurl\b',         'curl'),
+              (r'\bwget\b',         'wget'),
+              (r'\bssh\b',          'ssh'),
+              (r'\bscp\b',          'scp'),
+              (r'\brsync\b',        'rsync'),
+              (r'\brmdir\b',        'rmdir'),
+              (r'\btee\b',          'tee'),
+              (r'\beval\b',         'eval'),
+              (r'\bexec\b',         'exec'),
+              (r'\bsource\b',       'source'),
+              (r'\bpython[0-9]?\b', 'python'),
+              (r'\bpip\b',          'pip'),
+              (r'`',                'backtick'),
+              (r'\$\(',             '$('),
+          ]
+
+          def validate_bash_script(script, target_file):
+              """Validate the bash script:
+                 - must call `diff`
+                 - must only modify target_file (and /tmp/__fixed_version.py)
+                 - must contain a `cp` to target_file
+              """
+              if not script or not script.strip():
+                  return False, "empty script"
+
+              if not re.search(r'(^|\n|\s)diff\s', script):
+                  return False, "missing 'diff' command"
+
+              for pat, name in FORBIDDEN_PATTERNS:
+                  if re.search(pat, script):
+                      return False, f"forbidden token: {name}"
+
+              target_norm = os.path.normpath(target_file)
+
+              # rm only allowed for /tmp/ paths
+              for m in re.finditer(r'\brm\s+(-[a-zA-Z]+\s+)?(\S+)', script):
+                  p = m.group(2).strip('"').strip("'")
+                  if not p.startswith('/tmp/'):
+                      return False, f"rm targets non-tmp path: {p}"
+
+              # > / >> only allowed to /tmp/ paths
+              for m in re.finditer(r'(>>?)\s*(\S+)', script):
+                  p = m.group(2).strip('"').strip("'")
+                  if not p.startswith('/tmp/'):
+                      return False, f"redirection to non-tmp path: {p}"
+
+              # cp / mv destinations: must be /tmp/ or target_file
+              has_cp_to_target = False
+              for m in re.finditer(r'\b(?:cp|mv)\s+(.+)', script):
+                  line = m.group(1).strip()
+                  try:
+                      parts = shlex.split(line)
+                  except Exception:
+                      parts = line.split()
+                  parts = [p for p in parts if not p.startswith('-')]
+                  if len(parts) < 2:
+                      continue
+                  dst = parts[-1].strip('"').strip("'")
+                  if dst.startswith('/tmp/'):
+                      continue
+                  if os.path.normpath(dst) == target_norm:
+                      has_cp_to_target = True
+                      continue
+                  return False, f"cp/mv destination is not target or /tmp/: {dst}"
+
+              if not has_cp_to_target:
+                  return False, "no cp/mv command targeting the file under review"
+
+              if target_norm not in script and target_file not in script:
+                  return False, "target file path not referenced in script"
+
+              return True, "ok"
+
           def git_setup():
               subprocess.run(["git", "config", "user.name",  "github-actions[bot]"], check=True)
               subprocess.run(["git", "config", "user.email", "github-actions@github.com"], check=True)
 
-          def git_commit_push(msg):
-              subprocess.run(["git", "add", "-A"], check=True)
-              r = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True)
+          def get_git_porcelain():
+              r = subprocess.run(["git", "status", "--porcelain"],
+                                 capture_output=True, text=True)
+              files = set()
+              for line in r.stdout.splitlines():
+                  if not line.strip():
+                      continue
+                  if line[:2] in ("R ", "C ", "RM", "CM") or line[0] in ("R", "C"):
+                      path = line[3:].split(" -> ")[-1].strip().strip('"')
+                  else:
+                      path = line[3:].strip().strip('"')
+                  if path:
+                      files.add(os.path.normpath(path))
+              return files
+
+          def git_commit_one_file(file_path, msg):
+              """Commit ONLY the given file (one LLM call => one file => one commit)."""
+              subprocess.run(["git", "add", "--", file_path], check=False)
+              r = subprocess.run(["git", "commit", "-m", msg, "--", file_path],
+                                 capture_output=True, text=True)
               if r.returncode != 0:
-                  # nothing to commit
+                  print("  commit skipped (nothing to commit?):",
+                        r.stdout.strip(), r.stderr.strip())
                   return False
-              # push with retry
               for attempt in range(3):
                   pr = subprocess.run(["git", "push"], capture_output=True, text=True)
                   if pr.returncode == 0:
                       return True
-                  # try pull-rebase then push again
                   subprocess.run(["git", "pull", "--rebase", "origin",
                                   os.environ.get("GITHUB_REF_NAME", "HEAD")],
                                   capture_output=True, text=True)
                   time.sleep(3)
-              print("git push failed:", pr.stdout, pr.stderr)
+              print("  git push failed:", pr.stdout, pr.stderr)
+              return False
+
+          def git_commit_push_all(msg):
+              subprocess.run(["git", "add", "-A"], check=True)
+              r = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True)
+              if r.returncode != 0:
+                  return False
+              for attempt in range(3):
+                  pr = subprocess.run(["git", "push"], capture_output=True, text=True)
+                  if pr.returncode == 0:
+                      return True
+                  subprocess.run(["git", "pull", "--rebase", "origin",
+                                  os.environ.get("GITHUB_REF_NAME", "HEAD")],
+                                  capture_output=True, text=True)
+                  time.sleep(3)
+              print("  git push failed:", pr.stdout, pr.stderr)
               return False
 
           git_setup()
@@ -176,7 +308,7 @@ jobs:
 
               any_changes_this_iter = False
 
-              # 串行处理（API 并发 = 1）
+              # 串行处理（API 并发 = 1）：一次 LLM 调用只对应一个文件
               for fp in py_files:
                   if time.time() - START >= MAX_DUR:
                       stop_reason = "time limit reached mid-iteration"
@@ -187,7 +319,7 @@ jobs:
                       continue
 
                   print(f"\n--- Checking {fp} ---")
-                  
+
                   # API 调用重试逻辑
                   resp = None
                   while True:
@@ -196,45 +328,99 @@ jobs:
                           break
                       try:
                           resp = call_llm(readme, fp, content)
-                          break # 调用成功，跳出重试循环
+                          break
                       except Exception as e:
                           print(f"  API error on {fp}: {e}")
                           print("  Waiting 30 seconds before retrying...")
                           traceback.print_exc()
                           time.sleep(30)
-                  
-                  if stop_reason:
-                      break # 跳出 for fp in py_files 循环
 
-                  new_code = extract_code(resp)
-                  if new_code is None:
+                  if stop_reason:
+                      break
+
+                  bash_script = extract_bash_script(resp)
+                  if bash_script is None:
                       print("  -> NO_CHANGES")
                       continue
 
-                  # 规范化末尾换行
-                  if not new_code.endswith("\n"):
-                      new_code += "\n"
-
-                  if new_code == content:
-                      print("  -> LLM returned identical content; skipping.")
+                  # 校验 bash 脚本：必须含 diff，且只能改当前文件
+                  ok, reason = validate_bash_script(bash_script, fp)
+                  if not ok:
+                      print(f"  -> Rejected bash script ({reason}):")
+                      print("     " + "\n     ".join(bash_script.splitlines()))
                       continue
 
-                  # 写入修改
-                  with open(fp, 'w', encoding='utf-8') as f:
-                      f.write(new_code)
-                  print(f"  -> Applied patch to {fp}")
-                  any_changes_this_iter = True
+                  # 执行前快照 git 状态
+                  before_files = get_git_porcelain()
 
-              # 本轮结束：如果有改动则 push；没改动则视为“全部无问题”，停止
-              if any_changes_this_iter:
-                  git_commit_push(f"llm: fix bugs affecting experimental results (iteration {iteration})")
-              else:
+                  # 准备脚本：强制 set -euo pipefail
+                  full_script = "set -euo pipefail\n" + bash_script
+                  if not full_script.endswith("\n"):
+                      full_script += "\n"
+
+                  print("  -> Executing bash script:")
+                  for ln in bash_script.splitlines():
+                      print("     " + ln)
+
+                  result = subprocess.run(["bash", "-c", full_script],
+                                          capture_output=True, text=True)
+                  if result.stdout:
+                      print("  -> stdout:")
+                      print("     " + "\n     ".join(result.stdout.splitlines()))
+                  if result.returncode != 0:
+                      print(f"  -> Script failed (exit {result.returncode}); stderr:")
+                      print("     " + "\n     ".join(result.stderr.splitlines()))
+                      print(f"  -> Reverting any partial changes to {fp}.")
+                      subprocess.run(["git", "checkout", "--", fp],
+                                     capture_output=True, text=True)
+                      # 同时回滚任何 /tmp 残留无关紧要
+                      continue
+
+                  # 执行后再次快照，确保只有目标文件被改
+                  after_files = get_git_porcelain()
+                  newly_modified = after_files - before_files
+                  target_norm = os.path.normpath(fp)
+                  unwanted = {f for f in newly_modified
+                              if os.path.normpath(f) != target_norm}
+                  if unwanted:
+                      print(f"  -> Script modified other files besides {fp}: "
+                            f"{unwanted}; reverting ALL changes from this call.")
+                      for f in list(unwanted) + [fp]:
+                          subprocess.run(["git", "checkout", "--", f],
+                                         capture_output=True, text=True)
+                      continue
+
+                  # 验证内容确实变了
+                  new_content = read_file(fp)
+                  if new_content is None or new_content == content:
+                      print("  -> File content unchanged after script; skipping.")
+                      # 仍然把它从 working tree 里恢复，避免空 commit
+                      subprocess.run(["git", "checkout", "--", fp],
+                                     capture_output=True, text=True)
+                      continue
+
+                  print(f"  -> Applied fix to {fp}")
+
+                  # 关键：一次 LLM 调用 -> 一个文件 -> 一次 commit -> 一次 push
+                  if git_commit_one_file(
+                      fp,
+                      f"llm: fix bugs affecting experimental results in {fp} "
+                      f"(iteration {iteration})"
+                  ):
+                      any_changes_this_iter = True
+                  else:
+                      print("  -> Failed to commit/push this file; will continue.")
+
+              if stop_reason:
+                  break
+
+              if not any_changes_this_iter:
                   print("\nNo changes in this iteration — all files clean. Stopping.")
                   stop_reason = "all files clean"
                   break
 
           # 最终保险 push
           print(f"\nStopping because: {stop_reason}")
-          git_commit_push(f"llm: final commit ({stop_reason})")
+          git_commit_push_all(f"llm: final commit ({stop_reason})")
           print("Done.")
           PYEOF
