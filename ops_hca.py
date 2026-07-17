@@ -224,7 +224,15 @@ def naive_hca(
         # = NaN. The all_masked guard below zeros out such rows so the
         # downstream einsum produces 0 instead of NaN. Mirrors the guard
         # in the ``else`` branch and in ``ops_csa.py::naive_csa``.
-        row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, nh, T, 1]
+        # NOTE: do NOT clamp row_max to 0 — the true row maximum (which
+        # may be negative for cosine-attention scores, or -inf for fully
+        # causally-masked rows) must be used so the sink is shifted by
+        # exactly the same M as the scores. Clamping to 0 reintroduces
+        # the systematic sink over-weighting bias (exp(M) factor) that
+        # the log-space shift was specifically added to eliminate.
+        # Fully-masked rows (row_max = -inf) are handled by the
+        # all_masked guard below.
+        row_max = scores.amax(-1, keepdim=True)                    # [B, nh, T, 1]
         shifted = scores - row_max                                  # [B, nh, T, n_blocks]
         shifted_sink = log_sink - row_max                           # [B, nh, T, 1]
         lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
