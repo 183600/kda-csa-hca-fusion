@@ -77,7 +77,7 @@ class LMWithHybrid(nn.Module):
     def __init__(self, vocab_size, cfg: HybridConfig):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg.d_model)
-        self.hybrid = HybridKCHAttention(cfg, total_layers=cfg.n_kda + cfg.n_csa + cfg.n_hca or 5)
+        self.hybrid = HybridKCHAttention(cfg, total_layers=cfg.n_kda + cfg.n_csa + cfg.n_hca)
         self.norm_f = nn.LayerNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
