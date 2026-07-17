@@ -261,10 +261,16 @@ def test_fig_ablation_suptitle_not_clipped(tmp_path=None, monkeypatch=None):
         'mean_train_time_s': 1.0,
     }]
     with _redirect_dirs_for(tmp_path, monkeypatch) as (_, figures_dir):
-        # Capture mtime BEFORE the call so we can assert the figure was
-        # actually rewritten (not just read from a stale prior-run file).
+        # Delete the figure file BEFORE the call so the mtime check
+        # cannot pass on a stale file from a prior run, and so that
+        # mtime_before is 0 (robust against filesystem timestamp
+        # granularity — many filesystems have 1-second mtime
+        # resolution, so a stale file rewritten within the same second
+        # would not show mtime > mtime_before).
         fig_path = os.path.join(figures_dir, 'fig_ablation_nkv1.png')
-        mtime_before = os.path.getmtime(fig_path) if os.path.exists(fig_path) else 0
+        if os.path.exists(fig_path):
+            os.remove(fig_path)
+        mtime_before = 0
         make_figures._plot_ablation_group(records, 1, False)
         assert os.path.exists(fig_path), 'figure was not written'
         assert os.path.getmtime(fig_path) > mtime_before, \
