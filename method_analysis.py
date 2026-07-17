@@ -231,7 +231,12 @@ class HeadwiseFusedAttention(nn.Module):
         # instantiations share the same value; mirrors
         # HybridConfig.kda_decay_scale.
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
-        beta = torch.sigmoid(self.kda_beta(x))
+        # beta is per-head (H outputs), but naive_recurrent_kda expects it to
+        # broadcast against v [B, T, H, hd]. Unsqueeze the last dim so beta
+        # is [B, T, H, 1] and broadcasts correctly over hd. Without this,
+        # a [B, T, H] beta would either crash (4D expected) or broadcast
+        # incorrectly against the 4D q/k/v/g tensors.
+        beta = torch.sigmoid(self.kda_beta(x)).unsqueeze(-1)  # [B, T, H, 1]
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return o  # [B, T, H, hd]
 
