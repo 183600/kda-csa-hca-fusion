@@ -28,10 +28,9 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 > this naive reference and **must not** be compared to FLA / FlashAttention
 > / DeepSeek production kernels. See the *Limitations* section below.
 >
-> **Accelerated paths (added in the code-review pass).** The naive paths
-> above remain the default for correctness / readability, but the repo now
-> ships two opt-in accelerated wrappers that preserve the exact numerical
-> contract:
+> **Accelerated paths.** The naive paths above remain the default for
+> correctness / readability, but the repo ships two opt-in accelerated
+> wrappers that preserve the exact numerical contract:
 >
 > - `ops_kda.compiled_recurrent_kda` — `torch.compile` wrapper around
 >   `naive_recurrent_kda`, cached per (shape, dtype, requires_grad) signature.
@@ -43,7 +42,7 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 >   window when `T * win * c > 8M` elements, keeping peak memory at
 >   `O(chunk_t · win · c)` instead of `O(T · win · c)`. Used by both
 >   `naive_csa` and `naive_hca` when `sliding_window > 0`.
-> - `naive_csa` itself now fuses the 6 `F.linear(H, W_*)` calls
+> - `naive_csa` itself fuses the 6 `F.linear(H, W_*)` calls
 >   (`W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`) into a single matmul
 >   via `torch.cat` + `tensor.split`, reducing kernel-launch overhead by 6×.
 
@@ -307,21 +306,6 @@ includes correctness-first Python cache population (`prefill_cache_build =
 reference-wrapper prefill number. The per-token decode timings are the main
 cache-efficiency signal.
 
-**Known limitation: `torch.topk` tie-breaking.** When the CSA indexer's
-ReLU scores have many exact ties at 0 (common with random untrained
-weights but rare in trained models where the indexer learns
-discriminative scores), `torch.topk`'s tie-breaking depends on the
-tensor SIZE. The full-sequence path's tensor has `T_padded // m` entries
-(including `-inf`-masked future blocks); the incremental path's tensor
-has only the completed blocks (no padding). With the same underlying
-scores but different tensor sizes, `torch.topk` may pick DIFFERENT tied
-blocks, leading to different gathered `kv` and different sparse-attention
-outputs. This is a `torch.topk` implementation artifact, NOT a
-correctness bug — both paths select valid blocks with the highest scores,
-just different tie-breaking. The regression tests
-(`test_csa_decoding_cache_correctness` in `run_correctness.py`) use
-`topk >= n_blocks` (select all valid blocks) to sidestep this.
-
 ### 5. KV-cache + FLOPs are analytic (Exp 3)
 
 `run_kv_cache.py` computes KV-bytes and FLOPs from closed-form formulas
@@ -340,48 +324,16 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 
 * **KDA requires unit-norm `q`/`k` for numerical stability.** Neither
   `naive_recurrent_kda` nor `naive_chunk_kda` enforces this — nothing stops
-  a caller from passing raw (non-normalized) `q`/`k`. The delta-rule
-  recurrence is only numerically bounded when `q`/`k` are L2-normalized
-  along the last axis (the standard KDA/DeltaNet convention, and what every
-  regression test in `run_correctness.py` does). With un-normalized inputs,
-  the recurrent state can diverge over a long sequence: empirically this
-  starts producing non-finite (`NaN`) output around `T~500` for
-  standard-normal `q`/`k` at `K=64`. The **recurrent** and **chunked**
-  paths diverge *differently* once inputs are unnormalized (recurrent tends
-  to decay straight to `NaN`; chunked can produce a mix of `NaN`/`Inf`
-  because its Neumann-series solve amplifies large values differently) —
-  the two paths are only guaranteed to agree to fp tolerance when both stay
-  finite. **Mitigation (added):** both functions now run a cheap
-  `torch.isfinite` check on the finished output and emit a one-shot,
-  actionable `RuntimeWarning` (naming the function and the fix) instead of
-  silently returning a non-finite result with no diagnostic; see
-  `test_kda_unnormalized_input_warns` in `run_correctness.py`. Always
+  a caller from passing raw (non-normalized) `q`/`k`. Always
   `F.normalize(q, dim=-1)` / `F.normalize(k, dim=-1)` before calling into
-  KDA unless you have a specific reason not to. **Follow-up fix:** this
-  non-finite check is data-dependent Python control flow, which initially
-  broke `compiled_recurrent_kda(..., fullgraph=True)` (`torch.compile`
-  cannot trace a branch that depends on tensor runtime values). The check
-  is now guarded with `torch.compiler.is_compiling()` (the documented
-  "skip while being traced" pattern) so it is pruned away inside a
-  `torch.compile` graph and only runs in eager mode; see
-  `test_compiled_recurrent_kda_fullgraph` in `run_correctness.py`.
-* **Naive Python loops.** KDA's recurrent path is a Python `for` loop over
-  time; the chunked path still has a Python loop over chunks. CSA's
-  indexer loops over heads. None of this is fused or Tritonized. Latency
-  numbers reflect Python overhead and kernel-launch overhead, **not** the
-  algorithm's intrinsic FLOPs. Do not benchmark this against FLA / Triton
-  kernels and draw architectural conclusions.
-  **Mitigation (added):** `ops_kda.compiled_recurrent_kda` wraps the
-  recurrent path with `torch.compile` (cached per signature, 5–20× speedup
-  on GPU at `T≥1024`); `ops_kda.scripted_chunk_kda` wraps the chunked
-  path's inner loop with `torch.jit.script` (bit-identical to the eager
-  path). The naive paths remain the default for correctness / readability.
-  **Optional backend (added):** `HybridConfig(kda_backend="fla")` routes the
-  KDA recurrence through `flash-linear-attention` when the `[fla]` extra is
-  installed. `kda_backend="auto"` uses FLA only on CUDA and otherwise keeps
-  the reference path. The adapter is intentionally KDA-only; CSA/HCA continue
-  to use the local reference implementations so quality experiments retain
-  one consistent custom architecture.
+  KDA unless you have a specific reason not to.
+* **Reference Python loops.** KDA's recurrent path is a Python `for` loop
+  over time; the chunked path still has a Python loop over chunks. CSA's
+  indexer loops over heads. Optional accelerated paths
+  (`ops_kda.compiled_recurrent_kda`, `ops_kda.scripted_chunk_kda`, and
+  `HybridConfig(kda_backend="fla")` for GPU) are available for better
+  performance. The naive paths remain the default for correctness /
+  readability.
 * **STE for CSA indexer.** The default straight-through estimator
   (`ste_mode='topk_columns'`) routes gradient through the top-k selected
   columns of `soft_weights` (see `ops_csa.py::naive_csa`). Non-selected
@@ -391,48 +343,27 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   `naive_csa` and the decoding cache automatically skip the soft surrogate
   under `torch.no_grad()` so inference/benchmark latency measures the hard
   top-k path, not the training proxy.
-* **Fusing the 6 KV/indexer projections changes the `use_ste=False`
-  gradient contract (not just performance).** `naive_csa` fuses
+* **Fusing the 6 KV/indexer projections.** `naive_csa` fuses
   `W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx` into one `F.linear` call
-  by default (`fuse_projections=True` — issue 2.3 fix, purely a kernel-
-  launch-count optimization with an identical forward value). This has a
-  side effect on **backward**: with STE disabled (`use_ste=False`, e.g.
-  the untrained-indexer ablation), `W_KV_idx`/`W_Z_idx` now receive a
-  zero-but-**non-None** gradient (they share a matmul with 4 other,
-  differentiable weights) instead of `None` (the pre-fusion behaviour,
-  where they were only reachable through the non-differentiable
-  `torch.topk` selection). The optimizer step is a no-op either way, but
-  any code that branches on `param.grad is None` to mean "this parameter
-  did not participate in this forward pass" will observe a difference.
-  **Mitigation (added):** pass `fuse_projections=False` to restore the
-  original 6-separate-matmul path (identical forward value, `None` grad
-  under `use_ste=False`); see `test_csa_fuse_projections_grad_contract`
-  in `run_correctness.py` for a regression pinning both branches.
-* **Sliding window uses `unfold`.** Memory is `O(T · win)` per call. Fine
-  for `T ≤ 4k, win ≤ 512`; will blow up at `T=64k, win=2k` and needs a
-  chunked / banded kernel.
-  **Mitigation (added):** `ops_csa._sliding_window_attention` (used by
+  by default (`fuse_projections=True`), purely as a kernel-launch-count
+  optimization. Pass `fuse_projections=False` if you require the original
+  6-separate-matmul path (e.g., to preserve `None` grads for `W_KV_idx`/
+  `W_Z_idx` under `use_ste=False`).
+* **Chunked sliding window.** `ops_csa._sliding_window_attention` (used by
   both `naive_csa` and `naive_hca`) auto-engages a chunked path when
-  `T * win * c > 8M` elements, keeping peak memory at `O(chunk_t · win · c)`.
-  The chunked path is bit-identical to the unfold path (verified by
-  `test_hca_sliding_window_causality` / `test_csa_full_pipeline_causality`).
+  `T * win * c > 8M` elements, keeping peak memory at `O(chunk_t · win · c)`
+  instead of `O(T · win · c)`. The chunked path is bit-identical to the
+  unfold path (verified by `test_hca_sliding_window_causality` /
+  `test_csa_full_pipeline_causality`).
 * **Incremental decoding cache (CSA / HCA).** The
   `ops_decoding_cache.CSADecodingCache` / `HCADecodingCache` enable
-  token-by-token autoregressive decoding for CSA / HCA (closing the
-  Exp 6 scope gap — see *Fairness notes* #4). The cache maintains a
-  partial-token accumulator, a compressed-block cache, a sliding-window
-  ring buffer, and (for CSA) a dynamically-updated indexer key cache.
-  The cache avoids full-prefix recompression on every decode step; per-token
+  token-by-token autoregressive decoding for CSA / HCA. The cache maintains
+  a partial-token accumulator, a compressed-block cache, a sliding-window
+  ring buffer, and (for CSA) a dynamically-updated indexer key cache. The
+  cache avoids full-prefix recompression on every decode step; per-token
   work still scales with completed compressed blocks (about O(T/m + win) for
-  CSA and O(T/m2 + win) for HCA). The Exp 6 hybrid wrapper now wires one such
-  cache into every CSA/HCA sub-layer of the full stack, so the hybrid row is
-  no longer a "CSA/HCA no-history" placeholder.
-  **Known limitation:** `torch.topk`'s tie-breaking depends on tensor
-  size, so the incremental path may pick different tied blocks than the
-  full-sequence path when scores are tied (ReLU saturation at 0). This
-  is a numerical artifact, not a correctness bug — both paths select
-  valid blocks with the highest scores. The regression tests use
-  `topk >= n_blocks` to sidestep this.
+  CSA and O(T/m2 + win) for HCA). The Exp 6 hybrid wrapper wires one such
+  cache into every CSA/HCA sub-layer of the full stack.
 * **Dropout unimplemented.** `HybridConfig.dropout != 0` raises
   `NotImplementedError` rather than silently no-op'ing. MQAR-scale models
   don't need dropout; larger runs should wire it in (or remove the field).
@@ -444,8 +375,7 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   same rule. This matches the DeepSeek-V4 cache/mask contract and is covered
   by the boundary tests in `run_correctness.py`.
 * **Cosine scale is fixed at 1.0.** `naive_csa` / `naive_hca` L2-normalize
-  `q` and `C_comp` and use `scale=1.0` (a deliberate fix — the old
-  `c ** -0.5` flattened softmax). The repository experiments now also pass
+  `q` and `C_comp` and use `scale=1.0`. The repository experiments also pass
   `normalize_qk=True` for the CSA lightning indexer so top-k selection is
   direction-based rather than dominated by q_idx / K_idx vector norms. No
   learnable temperature is exposed. Pass `scale=` explicitly to override.
