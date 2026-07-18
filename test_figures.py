@@ -186,8 +186,8 @@ def test_fig_benchmark_empty_data(tmp_path=None, monkeypatch=None):
 
 
 def test_fig_benchmark_all_errors(tmp_path=None, monkeypatch=None):
-    """fig_benchmark with all-error data should not crash or warn."""
-    print("\nTest: fig_benchmark with all-error data")
+    """fig_benchmark with all-errors data should not crash or warn."""
+    print("\nTest: fig_benchmark with all-errors data")
     with _redirect_dirs_for(tmp_path, monkeypatch) as (results_dir, _):
         _write_results(results_dir, 'exp2_benchmark.json', [
             {'T': 128, 'op': 'softmax', 'error': 'OOM', 'device': 'cpu'},
