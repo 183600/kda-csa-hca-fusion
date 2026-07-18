@@ -26,29 +26,66 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install opencode
         run: |
-          python -m pip install --upgrade pip
-          pip install openai
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Run LLM Bug-Fix Loop
+      - name: Verify opencode
+        run: opencode --version
+
+      - name: Configure opencode (NVIDIA NIM provider)
+        run: |
+          cat > opencode.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "nvidia": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "NVIDIA NIM",
+                "options": {
+                  "baseURL": "https://integrate.api.nvidia.com/v1",
+                  "apiKey": "{env:NVIDIA_API_KEY}"
+                },
+                "models": {
+                  "z-ai/glm-5.2": {
+                    "name": "GLM 5.2"
+                  }
+                }
+              }
+            },
+            "model": "nvidia/z-ai/glm-5.2"
+          }
+          EOF
+          # 防止 opencode 会话文件被提交
+          grep -qxF '.opencode/' .gitignore 2>/dev/null || printf '\n.opencode/\n' >> .gitignore
+
+      - name: Run opencode Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
-          NVIDIA_MODEL: z-ai/glm-5.2
           MAX_DURATION_SECONDS: "18000"
+          OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
-          import os, sys, time, glob, re, subprocess, traceback, shlex
-          from openai import OpenAI
+          import os, sys, time, subprocess, traceback
 
-          API_KEY    = os.environ["NVIDIA_API_KEY"]
-          BASE_URL   = os.environ["NVIDIA_BASE_URL"]
-          MODEL      = os.environ["NVIDIA_MODEL"]
-          MAX_DUR    = int(os.environ["MAX_DURATION_SECONDS"])
+          MAX_DUR = int(os.environ["MAX_DURATION_SECONDS"])
+          MODEL   = os.environ["OPENCODE_MODEL"]
+          START   = time.time()
 
-          client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
-          START  = time.time()
+          # ------------------------------------------------------------------ #
+          #  工具函数
+          # ------------------------------------------------------------------ #
+          def run_cmd(cmd, timeout=120, **kw):
+              try:
+                  return subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=timeout, **kw)
+              except subprocess.TimeoutExpired:
+                  return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
+          def git_setup():
+              run_cmd(["git", "config", "user.name",  "github-actions[bot]"])
+              run_cmd(["git", "config", "user.email", "github-actions@github.com"])
 
           def read_file(p):
               try:
@@ -65,161 +102,14 @@ jobs:
                       continue
                   dirs[:] = [d for d in dirs if d not in (
                       '.git', '__pycache__', '.venv', 'venv', 'env',
-                      'node_modules', '.idea', '.vscode')]
+                      'node_modules', '.idea', '.vscode', '.opencode')]
                   for f in fnames:
                       if f.endswith('.py'):
                           out.append(os.path.normpath(os.path.join(root, f)))
               return sorted(set(out))
 
-          def call_llm(readme, file_path, file_content):
-              sys_prompt = (
-                  "你是一位严谨的科研/学术类 Python 代码审查员。"
-                  "你将收到 (1) 项目的 README.md 用于提供背景信息，以及 (2) 一个 .py 文件的路径及其内容。"
-                  "你的目标是确保代码可以在kaggle上运行，并找出可能影响实验结果的 Bug，包括但不限于："
-                  "错误的数学/公式、错误的变量名、差一错误、"
-                  "错误的 axis/keepdims/dim 参数、不正确的降维或聚合操作、"
-                  "误用随机种子/不确定性、训练与评估之间的数据泄露、不正确的指标计算、"
-                  "错误的张量形状、隐式广播引发的 Bug、参数顺序颠倒、错误的数据类型、"
-                  "缺失 detach()/no_grad、不正确的 loss 降维方式、符号错误、整数与浮点数除法混淆、"
-                  "影响数值计算的错误设备放置等。"
-                  "不要报告代码风格、格式、注释、命名规范或任何不影响数值/实验结果的问题。"
-                  "不要修改 README.md。"
-                  "关键约束：每次回复只能修改当前审查的单个文件。"
-                  "你绝不能触碰、引用或影响代码库中的任何其他文件。\n\n"
-                  "如果你没有发现此类 Bug，请回复这一行内容：\nNO_CHANGES\n"
-                  "如果你发现了此类 Bug，请在一个 ```bash``` 代码块中回复一个 bash 脚本。"
-                  "该 bash 脚本必须调用 `diff` 命令，并且必须严格遵循以下结构"
-                  "（将 <FILE_PATH> 替换为用户消息中提供的文件路径）：\n\n"
-                  "```bash\n"
-                  "cat > /tmp/__fixed_version.py <<'__FIXED_EOF__'\n"
-                  "<包含所有修复的完整文件内容>\n"
-                  "__FIXED_EOF__\n"
-                  'diff -u "<FILE_PATH>" /tmp/__fixed_version.py || true\n'
-                  'cp /tmp/__fixed_version.py "<FILE_PATH>"\n'
-                  "rm -f /tmp/__fixed_version.py\n"
-                  "```\n\n"
-                  "规则：\n"
-                  "1. bash 脚本必须包含 `diff` 命令（强制要求）。\n"
-                  "2. bash 脚本必须仅通过一次 `cp` 命令将临时文件复制到确切的 <FILE_PATH> 来修改当前审查的文件。\n"
-                  "3. bash 脚本绝不能使用 sed, awk, perl, find, xargs, git, python, pip, eval, exec, source, 反引号 或 $(...)。\n"
-                  "4. bash 脚本绝不能写入、删除或重命名目标文件和 /tmp/__fixed_version.py 以外的任何文件。\n"
-                  "5. 保持整体文件结构不变；仅修改修复 Bug 所需的部分。\n"
-                  "6. 保留原有的缩进和编码格式 (UTF-8)。\n"
-                  "7. 除非修复严格要求，否则不要添加或删除顶层导入。\n"
-                  "8. 在 bash 代码块之外不要输出任何内容。"
-              )
-              user_msg = (
-                  f"=== README.md (项目背景信息) ===\n{readme}\n\n"
-                  f"=== 待审查文件 (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
-                  f"请审查上述文件中影响实验结果的 Bug。"
-                  f"如果没有 Bug，请回复 'NO_CHANGES'；或者，请回复一个 bash 脚本（使用 `diff` 命令）来修复文件 `{file_path}`，"
-                  f"该脚本必须严格遵循系统提示词中给出的模板。请将 <FILE_PATH> 替换为 `{file_path}`。"
-              )
-              resp = client.chat.completions.create(
-                  model=MODEL,
-                  messages=[
-                      {"role": "system", "content": sys_prompt},
-                      {"role": "user",   "content": user_msg},
-                  ],
-                  temperature=0.2,
-                  max_tokens=8192,
-              )
-              return resp.choices[0].message.content.strip()
-
-          def extract_bash_script(resp):
-              if not resp:
-                  return None
-              first_line = resp.strip().splitlines()[0].strip().upper()
-              if first_line == "NO_CHANGES" or resp.strip().upper() == "NO_CHANGES":
-                  return None
-              m = re.search(r"```bash\s*\n(.*?)```", resp, re.DOTALL)
-              if not m:
-                  m = re.search(r"```[a-zA-Z0-9_]*\s*\n(.*?)```", resp, re.DOTALL)
-              if not m:
-                  m = re.search(r"```\s*\n(.*?)```", resp, re.DOTALL)
-              if not m:
-                  return None
-              return m.group(1)
-
-          FORBIDDEN_PATTERNS = [
-              (r'\bgit\b',          'git'),
-              (r'\bsed\b',          'sed'),
-              (r'\bawk\b',          'awk'),
-              (r'\bperl\b',         'perl'),
-              (r'\bfind\b',         'find'),
-              (r'\bxargs\b',        'xargs'),
-              (r'\bsudo\b',         'sudo'),
-              (r'\bchmod\b',        'chmod'),
-              (r'\bchown\b',        'chown'),
-              (r'\bcurl\b',         'curl'),
-              (r'\bwget\b',         'wget'),
-              (r'\bssh\b',          'ssh'),
-              (r'\bscp\b',          'scp'),
-              (r'\brsync\b',        'rsync'),
-              (r'\brmdir\b',        'rmdir'),
-              (r'\btee\b',          'tee'),
-              (r'\beval\b',         'eval'),
-              (r'\bexec\b',         'exec'),
-              (r'\bsource\b',       'source'),
-              (r'\bpython[0-9]?\b', 'python'),
-              (r'\bpip\b',          'pip'),
-              (r'`',                'backtick'),
-              (r'\$\(',             '$('),
-          ]
-
-          def validate_bash_script(script, target_file):
-              if not script or not script.strip():
-                  return False, "empty script"
-              if not re.search(r'(^|\n|\s)diff\s', script):
-                  return False, "missing 'diff' command"
-              bash_only_script = re.sub(
-                  r"<<\s*['\"]?__FIXED_EOF__['\"]?\n(.*?)\n__FIXED_EOF__",
-                  "",
-                  script,
-                  flags=re.DOTALL
-              )
-              for pat, name in FORBIDDEN_PATTERNS:
-                  if re.search(pat, bash_only_script):
-                      return False, f"forbidden token: {name}"
-              target_norm = os.path.normpath(target_file)
-              for m in re.finditer(r'\brm\s+(-[a-zA-Z]+\s+)?(\S+)', bash_only_script):
-                  p = m.group(2).strip('"').strip("'")
-                  if not p.startswith('/tmp/'):
-                      return False, f"rm targets non-tmp path: {p}"
-              for m in re.finditer(r'(>>?)\s*(\S+)', bash_only_script):
-                  p = m.group(2).strip('"').strip("'")
-                  if not p.startswith('/tmp/'):
-                      return False, f"redirection to non-tmp path: {p}"
-              has_cp_to_target = False
-              for m in re.finditer(r'\b(?:cp|mv)\s+(.+)', bash_only_script):
-                  line = m.group(1).strip()
-                  try:
-                      parts = shlex.split(line)
-                  except Exception:
-                      parts = line.split()
-                  parts = [p for p in parts if not p.startswith('-')]
-                  if len(parts) < 2:
-                      continue
-                  dst = parts[-1].strip('"').strip("'")
-                  if dst.startswith('/tmp/'):
-                      continue
-                  if os.path.normpath(dst) == target_norm:
-                      has_cp_to_target = True
-                      continue
-                  return False, f"cp/mv destination is not target or /tmp/: {dst}"
-              if not has_cp_to_target:
-                  return False, "no cp/mv command targeting the file under review"
-              if target_norm not in script and target_file not in script:
-                  return False, "target file path not referenced in script"
-              return True, "ok"
-
-          def git_setup():
-              subprocess.run(["git", "config", "user.name",  "github-actions[bot]"], check=True)
-              subprocess.run(["git", "config", "user.email", "github-actions@github.com"], check=True)
-
-          def get_git_porcelain():
-              r = subprocess.run(["git", "status", "--porcelain"],
-                                 capture_output=True, text=True)
+          def git_porcelain():
+              r = run_cmd(["git", "status", "--porcelain"])
               files = set()
               for line in r.stdout.splitlines():
                   if not line.strip():
@@ -233,40 +123,98 @@ jobs:
               return files
 
           def git_commit_one_file(file_path, msg):
-              subprocess.run(["git", "add", "--", file_path], check=False)
-              r = subprocess.run(["git", "commit", "-m", msg, "--", file_path],
-                                 capture_output=True, text=True)
+              run_cmd(["git", "add", "--", file_path])
+              r = run_cmd(["git", "commit", "-m", msg, "--", file_path])
               if r.returncode != 0:
                   print("  跳过提交 (无内容可提交?):",
                         r.stdout.strip(), r.stderr.strip())
                   return False
-              for attempt in range(3):
-                  pr = subprocess.run(["git", "push"], capture_output=True, text=True)
+              for _ in range(3):
+                  pr = run_cmd(["git", "push"], timeout=60)
                   if pr.returncode == 0:
                       return True
-                  subprocess.run(["git", "pull", "--rebase", "origin",
-                                  os.environ.get("GITHUB_REF_NAME", "HEAD")],
-                                  capture_output=True, text=True)
+                  run_cmd(["git", "pull", "--rebase", "origin",
+                           os.environ.get("GITHUB_REF_NAME", "HEAD")], timeout=60)
                   time.sleep(3)
               print("  git push 失败:", pr.stdout, pr.stderr)
               return False
 
           def git_commit_push_all(msg):
-              subprocess.run(["git", "add", "-A"], check=True)
-              r = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True)
+              # 提交前清理 opencode 产物
+              if os.path.exists("opencode.json"):
+                  os.remove("opencode.json")
+              if os.path.isdir(".opencode"):
+                  run_cmd(["rm", "-rf", ".opencode"])
+              run_cmd(["git", "add", "-A"])
+              r = run_cmd(["git", "commit", "-m", msg])
               if r.returncode != 0:
                   return False
-              for attempt in range(3):
-                  pr = subprocess.run(["git", "push"], capture_output=True, text=True)
+              for _ in range(3):
+                  pr = run_cmd(["git", "push"], timeout=60)
                   if pr.returncode == 0:
                       return True
-                  subprocess.run(["git", "pull", "--rebase", "origin",
-                                  os.environ.get("GITHUB_REF_NAME", "HEAD")],
-                                  capture_output=True, text=True)
+                  run_cmd(["git", "pull", "--rebase", "origin",
+                           os.environ.get("GITHUB_REF_NAME", "HEAD")], timeout=60)
                   time.sleep(3)
-              print("  git push 失败:", pr.stdout, pr.stderr)
               return False
 
+          def cleanup_unwanted(before_files, target_norm):
+              """还原 / 删除 opencode 对非目标文件的一切改动。"""
+              after = git_porcelain()
+              changed = after - before_files
+              for f in changed:
+                  fnorm = os.path.normpath(f)
+                  if fnorm == target_norm:
+                      continue
+                  run_cmd(["git", "checkout", "--", f])
+                  if os.path.exists(f):
+                      run_cmd(["rm", "-rf", f])
+
+          # ------------------------------------------------------------------ #
+          #  Prompt
+          # ------------------------------------------------------------------ #
+          REVIEW_PROMPT = (
+              "你是一位严谨的科研/学术类 Python 代码审查员。"
+              "你将收到项目的 README.md（背景信息）和一个待审查的 .py 文件路径及其内容。"
+              "你的目标是确保代码可以在 kaggle 上运行，并找出可能影响实验结果的 Bug，包括但不限于："
+              "错误的数学/公式、错误的变量名、差一错误、"
+              "错误的 axis/keepdims/dim 参数、不正确的降维或聚合操作、"
+              "误用随机种子/不确定性、训练与评估之间的数据泄露、不正确的指标计算、"
+              "错误的张量形状、隐式广播引发的 Bug、参数顺序颠倒、错误的数据类型、"
+              "缺失 detach()/no_grad、不正确的 loss 降维方式、符号错误、整数与浮点数除法混淆、"
+              "影响数值计算的错误设备放置等。\n"
+              "不要报告代码风格、格式、注释、命名规范或任何不影响数值/实验结果的问题。"
+              "不要修改 README.md。\n\n"
+              "关键约束：\n"
+              "1. 每次只能修改当前审查的单个文件。\n"
+              "2. 绝不能触碰、引用或影响代码库中的任何其他文件。\n"
+              "3. 如果没有发现此类 Bug，不要做任何修改。\n"
+              "4. 如果发现了 Bug，请直接使用你的文件编辑工具修改该文件，只改动修复 Bug 所需的部分。\n"
+              "5. 保持整体文件结构不变，保留原有的缩进和编码格式 (UTF-8)。\n"
+              "6. 除非修复严格要求，否则不要添加或删除顶层导入。\n"
+              "7. 不要创建新文件，不要删除文件，不要运行任何 shell 命令或脚本。\n"
+          )
+
+          def call_opencode(readme, file_path, file_content):
+              user_msg = (
+                  f"{REVIEW_PROMPT}\n\n"
+                  f"=== README.md (项目背景信息) ===\n{readme}\n\n"
+                  f"=== 待审查文件路径 ===\n{file_path}\n\n"
+                  f"=== 文件内容 ===\n```python\n{file_content}\n```\n\n"
+                  f"请审查文件 `{file_path}` 中影响实验结果的 Bug。"
+                  f"如果没有 Bug，不要做任何修改。"
+                  f"如果有 Bug，请直接编辑文件 `{file_path}` 来修复。"
+              )
+              return subprocess.run(
+                  ["opencode", "run", "--model", MODEL, user_msg],
+                  capture_output=True, text=True,
+                  env=os.environ.copy(),
+                  timeout=900,        # 单次调用最多 15 分钟
+              )
+
+          # ------------------------------------------------------------------ #
+          #  主循环
+          # ------------------------------------------------------------------ #
           git_setup()
 
           iteration = 0
@@ -304,87 +252,78 @@ jobs:
 
                   print(f"\n--- 正在检查 {fp} ---")
 
-                  resp = None
+                  before_files = git_porcelain()
+                  target_norm  = os.path.normpath(fp)
+
+                  # ---- 调用 opencode ----
+                  r = None
                   while True:
                       if time.time() - START >= MAX_DUR:
-                          stop_reason = "API 调用/重试期间达到时间限制"
+                          stop_reason = "opencode 调用期间达到时间限制"
                           break
                       try:
-                          resp = call_llm(readme, fp, content)
+                          r = call_opencode(readme, fp, content)
+                          break
+                      except subprocess.TimeoutExpired:
+                          print(f"  {fp} opencode 调用超时（15 分钟），跳过")
+                          failed_count += 1
+                          r = None
                           break
                       except Exception as e:
-                          print(f"  {fp} 发生 API 错误: {e}")
-                          print("  等待 30 秒后重试...")
+                          print(f"  {fp} opencode 错误: {e}")
                           traceback.print_exc()
                           time.sleep(30)
 
                   if stop_reason:
                       break
+                  if r is None:
+                      continue
 
-                  bash_script = extract_bash_script(resp)
-                  if bash_script is None:
-                      print("  -> 无需更改 (NO_CHANGES)")
+                  if r.returncode != 0:
+                      print(f"  -> opencode 退出码 {r.returncode}")
+                      if r.stderr:
+                          print("     stderr:", r.stderr[:500])
+                      cleanup_unwanted(before_files, target_norm)
+                      run_cmd(["git", "checkout", "--", fp])
+                      failed_count += 1
+                      continue
+
+                  if r.stdout:
+                      lines   = r.stdout.splitlines()
+                      preview = "\n     ".join(lines[-20:])
+                      print(f"  -> opencode 输出 (最后 20 行):\n     {preview}")
+
+                  # ---- 清理非目标文件改动 ----
+                  cleanup_unwanted(before_files, target_norm)
+
+                  # ---- 检查目标文件是否被修改 ----
+                  after_files = git_porcelain()
+                  if target_norm not in after_files:
+                      print("  -> 无需更改")
                       no_diff_count += 1
-                      continue
-
-                  ok, reason = validate_bash_script(bash_script, fp)
-                  if not ok:
-                      print(f"  -> 拒绝执行 bash 脚本 ({reason}):")
-                      print("     " + "\n     ".join(bash_script.splitlines()))
-                      failed_count += 1
-                      continue
-
-                  before_files = get_git_porcelain()
-
-                  full_script = "set -euo pipefail\n" + bash_script
-                  if not full_script.endswith("\n"):
-                      full_script += "\n"
-
-                  print("  -> 正在执行 bash 脚本:")
-                  for ln in bash_script.splitlines():
-                      print("     " + ln)
-
-                  result = subprocess.run(["bash", "-c", full_script],
-                                          capture_output=True, text=True)
-                  if result.stdout:
-                      print("  -> 标准输出:")
-                      print("     " + "\n     ".join(result.stdout.splitlines()))
-                  if result.returncode != 0:
-                      print(f"  -> 脚本执行失败 (退出码 {result.returncode}); 错误输出:")
-                      print("     " + "\n     ".join(result.stderr.splitlines()))
-                      print(f"  -> 正在还原 {fp} 的所有部分更改。")
-                      subprocess.run(["git", "checkout", "--", fp],
-                                     capture_output=True, text=True)
-                      failed_count += 1
-                      continue
-
-                  after_files = get_git_porcelain()
-                  newly_modified = after_files - before_files
-                  target_norm = os.path.normpath(fp)
-                  unwanted = {f for f in newly_modified
-                              if os.path.normpath(f) != target_norm}
-                  if unwanted:
-                      print(f"  -> 脚本修改了 {fp} 以外的其他文件: "
-                            f"{unwanted}；正在还原本次调用的所有更改。")
-                      for f in list(unwanted) + [fp]:
-                          subprocess.run(["git", "checkout", "--", f],
-                                         capture_output=True, text=True)
-                      failed_count += 1
                       continue
 
                   new_content = read_file(fp)
                   if new_content is None or new_content == content:
-                      print("  -> 脚本执行后文件内容未更改；跳过。")
-                      subprocess.run(["git", "checkout", "--", fp],
-                                     capture_output=True, text=True)
+                      print("  -> 文件内容未更改；跳过。")
+                      run_cmd(["git", "checkout", "--", fp])
                       no_diff_count += 1
+                      continue
+
+                  # ---- 语法检查 ----
+                  synth = run_cmd(["python3", "-m", "py_compile", fp], timeout=30)
+                  if synth.returncode != 0:
+                      print(f"  -> 修改后文件有语法错误，正在还原:")
+                      print("    ", synth.stderr[:500])
+                      run_cmd(["git", "checkout", "--", fp])
+                      failed_count += 1
                       continue
 
                   print(f"  -> 已将修复应用到 {fp}")
 
                   if git_commit_one_file(
                       fp,
-                      f"llm: 修复影响实验结果的 bug {fp} "
+                      f"opencode: 修复影响实验结果的 bug {fp} "
                       f"(第 {iteration} 次迭代)"
                   ):
                       any_changes_this_iter = True
@@ -404,7 +343,7 @@ jobs:
                   print(f"\n本次迭代中有 {failed_count} 个文件处理失败。将在下一次迭代中重试...")
 
           print(f"\n停止原因: {stop_reason}")
-          git_commit_push_all(f"llm: 最终提交 ({stop_reason})")
+          git_commit_push_all(f"opencode: 最终提交 ({stop_reason})")
           print("完成。")
           PYEOF
 
@@ -430,7 +369,7 @@ jobs:
 
           # 1. 获取当前 Workflow 的 ID
           WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
-          
+
           if [ -z "$WF_ID" ]; then
             echo "❌ 找不到 '$WORKFLOW_NAME' 的工作流 ID。循环将在此停止。"
             exit 1
