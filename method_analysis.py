@@ -282,15 +282,15 @@ class HeadwiseFusedAttention(nn.Module):
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        # Output einsum uses the NORMALIZED C_comp_n (cosine-attention
-        # contract): scores are cosine similarities, so the value vectors
-        # must also be the normalized compressed KV — matching the CSA/HCA
-        # formulas in CSA_HCA_FORMULAS and the reference implementations in
-        # ops_csa.py::naive_csa / ops_hca.py::naive_hca. Using the
-        # un-normalized C_comp here would mix cosine-weighted probabilities
-        # with magnitude-bearing values, breaking the cosine-attention
-        # semantics and diverging from the documented formulas.
-        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)
+        # Output einsum uses the UN-NORMALIZED C_comp (standard attention
+        # contract): scores are cosine similarities used as attention weights,
+        # but the value vectors must carry the actual compressed KV magnitude
+        # information — matching the CSA/HCA formulas in CSA_HCA_FORMULAS
+        # and the reference implementations in ops_csa.py::naive_csa /
+        # ops_hca.py::naive_hca. Using the normalized C_comp_n here would
+        # discard the magnitude of the compressed KV, breaking the standard
+        # attention semantics and diverging from the documented formulas.
+        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp)
         if pad:
             out = out[:, :T]
         return out  # [B, T, H, c]
@@ -325,15 +325,15 @@ class HeadwiseFusedAttention(nn.Module):
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        # Output einsum uses the NORMALIZED C_comp_n (cosine-attention
-        # contract): scores are cosine similarities, so the value vectors
-        # must also be the normalized compressed KV — matching the HCA
-        # formula in CSA_HCA_FORMULAS and the reference implementation in
-        # ops_hca.py::naive_hca. Using the un-normalized C_comp here would
-        # mix cosine-weighted probabilities with magnitude-bearing values,
-        # breaking the cosine-attention semantics and diverging from the
-        # documented formula.
-        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)
+        # Output einsum uses the UN-NORMALIZED C_comp (standard attention
+        # contract): scores are cosine similarities used as attention weights,
+        # but the value vectors must carry the actual compressed KV magnitude
+        # information — matching the HCA formula in CSA_HCA_FORMULAS and the
+        # reference implementation in ops_hca.py::naive_hca. Using the
+        # normalized C_comp_n here would discard the magnitude of the
+        # compressed KV, breaking the standard attention semantics and
+        # diverging from the documented formula.
+        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp)
         if pad:
             out = out[:, :T]
         return out
@@ -449,7 +449,8 @@ CSA — Compressed Sparse Attention
      denom[h] = sum_i exp(scores[h, i]) + exp(sink[h])
      p[h, i] = exp(scores[h, i]) / denom[h]         # sink is an extra denominator term
      out[t, h] = p[h] @ kv                          # [H, c]
-   (Note: both ``kv`` and the output einsum use the NORMALIZED C_comp_n.)
+   (Note: ``kv`` uses the NORMALIZED C_comp_n, but the output einsum uses the
+   UN-NORMALIZED C_comp to preserve compressed KV magnitudes.)
 
 4. Sliding window branch (local uncompressed KV):
    For each query t: attend to H[t-w+1 : t+1] @ W_aKV with causal masking.
