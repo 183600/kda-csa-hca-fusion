@@ -73,48 +73,47 @@ jobs:
 
           def call_llm(readme, file_path, file_content):
               sys_prompt = (
-                  "You are a meticulous Python code reviewer for scientific / research codebases. "
-                  "You will be given (1) the project's README.md for context and (2) a single .py file path with its content. "
-                  "Your ONLY goal is to find bugs that could affect experimental results, including but "
-                  "not limited to: incorrect math/formulas, wrong variable names, off-by-one indexing, "
-                  "wrong axis/keepdims/dim arguments, incorrect reduction or aggregation, misused random "
-                  "seeds / non-determinism, data leakage between train/eval, incorrect metric computation, "
-                  "wrong tensor shapes, silent broadcasting bugs, swapped arguments, wrong dtype, missing "
-                  "detach()/no_grad, incorrect loss reduction, sign errors, integer vs float division, "
-                  "wrong device placement affecting numerics, etc. "
-                  "Do NOT report style issues, formatting, comments, naming convention, or anything that "
-                  "does not affect numerical/experimental results. "
-                  "Do NOT modify README.md. "
-                  "CRITICAL CONSTRAINT: Each response may modify ONLY the single file under review. "
-                  "You must not touch, reference, or affect any other file in the repository.\n\n"
-                  "If you find NO such bugs, respond with EXACTLY this single line:\nNO_CHANGES\n"
-                  "If you find such bugs, respond with a single bash script inside a ```bash``` fenced code block. "
-                  "The bash script MUST call the `diff` command and MUST follow this exact structure "
-                  "(replace <FILE_PATH> with the file path provided in the user message):\n\n"
+                  "你是一位严谨的科研/学术类 Python 代码审查员。"
+                  "你将收到 (1) 项目的 README.md 用于提供背景信息，以及 (2) 一个 .py 文件的路径及其内容。"
+                  "你的目标是确保代码可以在kaggle上运行，并找出可能影响实验结果的 Bug，包括但不限于："
+                  "错误的数学/公式、错误的变量名、差一错误、"
+                  "错误的 axis/keepdims/dim 参数、不正确的降维或聚合操作、"
+                  "误用随机种子/不确定性、训练与评估之间的数据泄露、不正确的指标计算、"
+                  "错误的张量形状、隐式广播引发的 Bug、参数顺序颠倒、错误的数据类型、"
+                  "缺失 detach()/no_grad、不正确的 loss 降维方式、符号错误、整数与浮点数除法混淆、"
+                  "影响数值计算的错误设备放置等。"
+                  "不要报告代码风格、格式、注释、命名规范或任何不影响数值/实验结果的问题。"
+                  "不要修改 README.md。"
+                  "关键约束：每次回复只能修改当前审查的单个文件。"
+                  "你绝不能触碰、引用或影响代码库中的任何其他文件。\n\n"
+                  "如果你没有发现此类 Bug，请回复这一行内容：\nNO_CHANGES\n"
+                  "如果你发现了此类 Bug，请在一个 ```bash``` 代码块中回复一个 bash 脚本。"
+                  "该 bash 脚本必须调用 `diff` 命令，并且必须严格遵循以下结构"
+                  "（将 <FILE_PATH> 替换为用户消息中提供的文件路径）：\n\n"
                   "```bash\n"
                   "cat > /tmp/__fixed_version.py <<'__FIXED_EOF__'\n"
-                  "<the COMPLETE corrected file content, with all fixes applied>\n"
+                  "<包含所有修复的完整文件内容>\n"
                   "__FIXED_EOF__\n"
                   'diff -u "<FILE_PATH>" /tmp/__fixed_version.py || true\n'
                   'cp /tmp/__fixed_version.py "<FILE_PATH>"\n'
                   "rm -f /tmp/__fixed_version.py\n"
                   "```\n\n"
-                  "Rules:\n"
-                  "1. The bash script MUST contain a `diff` command (mandatory).\n"
-                  "2. The bash script MUST only modify the file under review via a single `cp` to the exact <FILE_PATH>.\n"
-                  "3. The bash script MUST NOT use sed, awk, perl, find, xargs, git, python, pip, eval, exec, source, backticks, or $(...).\n"
-                  "4. The bash script MUST NOT write to, delete, or rename any file other than the target file and /tmp/__fixed_version.py.\n"
-                  "5. Keep the overall file structure intact; change only what is needed to fix the bugs.\n"
-                  "6. Preserve original indentation and encoding (UTF-8).\n"
-                  "7. Do not add or remove top-level imports unless strictly required by the fix.\n"
-                  "8. Output nothing else outside the bash code block."
+                  "规则：\n"
+                  "1. bash 脚本必须包含 `diff` 命令（强制要求）。\n"
+                  "2. bash 脚本必须仅通过一次 `cp` 命令将临时文件复制到确切的 <FILE_PATH> 来修改当前审查的文件。\n"
+                  "3. bash 脚本绝不能使用 sed, awk, perl, find, xargs, git, python, pip, eval, exec, source, 反引号 或 $(...)。\n"
+                  "4. bash 脚本绝不能写入、删除或重命名目标文件和 /tmp/__fixed_version.py 以外的任何文件。\n"
+                  "5. 保持整体文件结构不变；仅修改修复 Bug 所需的部分。\n"
+                  "6. 保留原有的缩进和编码格式 (UTF-8)。\n"
+                  "7. 除非修复严格要求，否则不要添加或删除顶层导入。\n"
+                  "8. 在 bash 代码块之外不要输出任何内容。"
               )
               user_msg = (
-                  f"=== README.md (project context) ===\n{readme}\n\n"
-                  f"=== File under review (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
-                  f"Review the file above for bugs that affect experimental results. "
-                  f"Respond with 'NO_CHANGES' if there are none, or with a bash script (using `diff`) that fixes the file `{file_path}` "
-                  f"following the exact template in the system prompt. Replace <FILE_PATH> with `{file_path}`."
+                  f"=== README.md (项目背景信息) ===\n{readme}\n\n"
+                  f"=== 待审查文件 (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
+                  f"请审查上述文件中影响实验结果的 Bug。"
+                  f"如果没有 Bug，请回复 'NO_CHANGES'；或者，请回复一个 bash 脚本（使用 `diff` 命令）来修复文件 `{file_path}`，"
+                  f"该脚本必须严格遵循系统提示词中给出的模板。请将 <FILE_PATH> 替换为 `{file_path}`。"
               )
               resp = client.chat.completions.create(
                   model=MODEL,
@@ -238,7 +237,7 @@ jobs:
               r = subprocess.run(["git", "commit", "-m", msg, "--", file_path],
                                  capture_output=True, text=True)
               if r.returncode != 0:
-                  print("  commit skipped (nothing to commit?):",
+                  print("  跳过提交 (无内容可提交?):",
                         r.stdout.strip(), r.stderr.strip())
                   return False
               for attempt in range(3):
@@ -249,7 +248,7 @@ jobs:
                                   os.environ.get("GITHUB_REF_NAME", "HEAD")],
                                   capture_output=True, text=True)
                   time.sleep(3)
-              print("  git push failed:", pr.stdout, pr.stderr)
+              print("  git push 失败:", pr.stdout, pr.stderr)
               return False
 
           def git_commit_push_all(msg):
@@ -265,7 +264,7 @@ jobs:
                                   os.environ.get("GITHUB_REF_NAME", "HEAD")],
                                   capture_output=True, text=True)
                   time.sleep(3)
-              print("  git push failed:", pr.stdout, pr.stderr)
+              print("  git push 失败:", pr.stdout, pr.stderr)
               return False
 
           git_setup()
@@ -275,20 +274,20 @@ jobs:
           while True:
               elapsed = time.time() - START
               if elapsed >= MAX_DUR:
-                  stop_reason = f"time limit reached ({elapsed:.0f}s)"
+                  stop_reason = f"已达到时间限制 ({elapsed:.0f}s)"
                   break
 
               iteration += 1
-              print(f"\n=========== Iteration {iteration} (elapsed {elapsed:.0f}s) ===========")
+              print(f"\n=========== 第 {iteration} 次迭代 (已耗时 {elapsed:.0f}s) ===========")
               py_files = find_py_files()
               if not py_files:
-                  print("No .py files found. Stopping.")
+                  print("未找到 .py 文件。停止运行。")
                   stop_reason = "no .py files"
                   break
 
               readme = read_file("README.md") or ""
               if not os.path.exists("README.md"):
-                  print("WARNING: README.md not found; using empty context.")
+                  print("警告: 未找到 README.md；使用空上下文。")
 
               any_changes_this_iter = False
               no_diff_count = 0
@@ -296,26 +295,26 @@ jobs:
 
               for fp in py_files:
                   if time.time() - START >= MAX_DUR:
-                      stop_reason = "time limit reached mid-iteration"
+                      stop_reason = "迭代中途达到时间限制"
                       break
 
                   content = read_file(fp)
                   if content is None:
                       continue
 
-                  print(f"\n--- Checking {fp} ---")
+                  print(f"\n--- 正在检查 {fp} ---")
 
                   resp = None
                   while True:
                       if time.time() - START >= MAX_DUR:
-                          stop_reason = "time limit reached during API call/retry"
+                          stop_reason = "API 调用/重试期间达到时间限制"
                           break
                       try:
                           resp = call_llm(readme, fp, content)
                           break
                       except Exception as e:
-                          print(f"  API error on {fp}: {e}")
-                          print("  Waiting 30 seconds before retrying...")
+                          print(f"  {fp} 发生 API 错误: {e}")
+                          print("  等待 30 秒后重试...")
                           traceback.print_exc()
                           time.sleep(30)
 
@@ -324,13 +323,13 @@ jobs:
 
                   bash_script = extract_bash_script(resp)
                   if bash_script is None:
-                      print("  -> NO_CHANGES")
+                      print("  -> 无需更改 (NO_CHANGES)")
                       no_diff_count += 1
                       continue
 
                   ok, reason = validate_bash_script(bash_script, fp)
                   if not ok:
-                      print(f"  -> Rejected bash script ({reason}):")
+                      print(f"  -> 拒绝执行 bash 脚本 ({reason}):")
                       print("     " + "\n     ".join(bash_script.splitlines()))
                       failed_count += 1
                       continue
@@ -341,19 +340,19 @@ jobs:
                   if not full_script.endswith("\n"):
                       full_script += "\n"
 
-                  print("  -> Executing bash script:")
+                  print("  -> 正在执行 bash 脚本:")
                   for ln in bash_script.splitlines():
                       print("     " + ln)
 
                   result = subprocess.run(["bash", "-c", full_script],
                                           capture_output=True, text=True)
                   if result.stdout:
-                      print("  -> stdout:")
+                      print("  -> 标准输出:")
                       print("     " + "\n     ".join(result.stdout.splitlines()))
                   if result.returncode != 0:
-                      print(f"  -> Script failed (exit {result.returncode}); stderr:")
+                      print(f"  -> 脚本执行失败 (退出码 {result.returncode}); 错误输出:")
                       print("     " + "\n     ".join(result.stderr.splitlines()))
-                      print(f"  -> Reverting any partial changes to {fp}.")
+                      print(f"  -> 正在还原 {fp} 的所有部分更改。")
                       subprocess.run(["git", "checkout", "--", fp],
                                      capture_output=True, text=True)
                       failed_count += 1
@@ -365,8 +364,8 @@ jobs:
                   unwanted = {f for f in newly_modified
                               if os.path.normpath(f) != target_norm}
                   if unwanted:
-                      print(f"  -> Script modified other files besides {fp}: "
-                            f"{unwanted}; reverting ALL changes from this call.")
+                      print(f"  -> 脚本修改了 {fp} 以外的其他文件: "
+                            f"{unwanted}；正在还原本次调用的所有更改。")
                       for f in list(unwanted) + [fp]:
                           subprocess.run(["git", "checkout", "--", f],
                                          capture_output=True, text=True)
@@ -375,38 +374,38 @@ jobs:
 
                   new_content = read_file(fp)
                   if new_content is None or new_content == content:
-                      print("  -> File content unchanged after script; skipping.")
+                      print("  -> 脚本执行后文件内容未更改；跳过。")
                       subprocess.run(["git", "checkout", "--", fp],
                                      capture_output=True, text=True)
                       no_diff_count += 1
                       continue
 
-                  print(f"  -> Applied fix to {fp}")
+                  print(f"  -> 已将修复应用到 {fp}")
 
                   if git_commit_one_file(
                       fp,
-                      f"llm: fix bugs affecting experimental results in {fp} "
-                      f"(iteration {iteration})"
+                      f"llm: 修复影响实验结果的 bug {fp} "
+                      f"(第 {iteration} 次迭代)"
                   ):
                       any_changes_this_iter = True
                   else:
-                      print("  -> Failed to commit/push this file; will continue.")
+                      print("  -> 提交/推送此文件失败；将继续处理。")
                       failed_count += 1
 
               if stop_reason:
                   break
 
               if no_diff_count == len(py_files):
-                  print("\nNo changes in this iteration — all files clean. Stopping.")
+                  print("\n本次迭代无更改 — 所有文件均已检查完毕。停止运行。")
                   stop_reason = "all files clean"
                   break
 
               if failed_count > 0 and not any_changes_this_iter:
-                  print(f"\n{failed_count} files failed to process in this iteration. Retrying in next iteration...")
+                  print(f"\n本次迭代中有 {failed_count} 个文件处理失败。将在下一次迭代中重试...")
 
-          print(f"\nStopping because: {stop_reason}")
-          git_commit_push_all(f"llm: final commit ({stop_reason})")
-          print("Done.")
+          print(f"\n停止原因: {stop_reason}")
+          git_commit_push_all(f"llm: 最终提交 ({stop_reason})")
+          print("完成。")
           PYEOF
 
   # ==========================================
@@ -425,19 +424,19 @@ jobs:
           WORKFLOW_REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
         run: |
-          echo "Previous job status: ${{ needs.llm-fix.result }}"
-          echo "Waiting 10 seconds for cleanup..."
+          echo "上一个任务的状态: ${{ needs.llm-fix.result }}"
+          echo "等待 10 秒进行清理..."
           sleep 10
 
           # 1. 获取当前 Workflow 的 ID
           WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
           
           if [ -z "$WF_ID" ]; then
-            echo "❌ Could not find workflow ID for '$WORKFLOW_NAME'. Loop will stop here."
+            echo "❌ 找不到 '$WORKFLOW_NAME' 的工作流 ID。循环将在此停止。"
             exit 1
           fi
 
-          echo "Found Workflow ID: $WF_ID"
+          echo "找到工作流 ID: $WF_ID"
 
           # 2. 触发下一次运行
           if gh api \
@@ -445,13 +444,13 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "/repos/$REPO/actions/workflows/$WF_ID/dispatches" \
             -f "ref=$WORKFLOW_REF"; then
-            echo "✅ Successfully triggered next run of '$WORKFLOW_NAME' on ref '$WORKFLOW_REF'"
+            echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
           else
-            echo "❌ Failed to trigger next run."
+            echo "❌ 触发下一次运行失败。"
             exit 1
           fi
 
           # 3. 验证是否触发成功
           sleep 5
-          echo "Recent workflow runs:"
+          echo "最近的工作流运行记录:"
           gh run list --workflow "$WORKFLOW_NAME" --limit 3
