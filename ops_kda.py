@@ -823,7 +823,24 @@ def _chunk_kda_prepare(
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # P0 numerical-correctness fix: ``diagonal=0`` (NOT ``diagonal=1``) so the
+    # mask covers the main diagonal AND the strict upper triangle. The
+    # subsequent ``A.masked_fill(mask, 0)`` then zeroes BOTH, leaving ``A``
+    # STRICTLY lower triangular (diagonal zeroed) — which is what the
+    # chunk-internal Neumann series ``(I - A)^{-1}.A`` below mathematically
+    # requires: the diagonal of the gain matrix ``(A + I) * beta`` must end up
+    # as exactly ``beta`` (the bare per-step self-write); if the diagonal of
+    # the pre-Neumann ``A`` is NOT zeroed, the einsum leaves ``||k_i||^2`` on
+    # the diagonal (``exp(g_i - g_i) = 1``), and after the lower-triangular
+    # solve ``(I - A)^{-1} A`` the diagonal is contaminated, so ``(A + I) *
+    # beta`` becomes ``beta * (1 + ||k_i||^2)`` on the diagonal — twice the
+    # correct value for unit-norm ``k`` — and the chunk path diverges from the
+    # recurrent reference by O(1) per chunk (empirically confirmed: diagonal=1
+    # produces max-diff ~0.88 vs the recurrent path; diagonal=0 matches to fp32
+    # precision ~1e-7). Mirrors the upstream FLA reference
+    # (fla/ops/kda/naive.py, McIntyre/FLA team) which also uses
+    # ``diagonal=0`` here.
+    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]
@@ -834,13 +851,13 @@ def _chunk_kda_prepare(
         # cumulative decay from c+1 to i, and decay < 1 so its negation > 0).
         # With ``g_clamp_min=-10`` and ``BT=64`` this difference can reach ~630,
         # and ``exp(630) = inf`` in fp32 — which then propagates NaN through
-        # ``solve_triangular``. The subsequent ``A.masked_fill(mask, 0)`` only
-        # zeroes the UPPER triangular (c > i); the overflowing LOWER triangular
-        # entries are KEPT, so the inf/NaN reaches the solver. Clamping the
-        # exponent to a safe upper bound (``exp(50) ~= 5e21``, finite in fp32)
-        # prevents the overflow without changing the math for reasonable g
-        # values (typical g in [-1, 0] gives differences well below 50). The
-        # mask at line 451 still zeroes the upper triangle as before.
+        # ``solve_triangular``. The subsequent ``A.masked_fill(mask, 0)`` zeroes
+        # the UPPER triangular AND the diagonal (c >= i); the overflowing
+        # STRICT-lower-triangular entries are KEPT, so the inf/NaN reaches the
+        # solver. Clamping the exponent to a safe upper bound (``exp(50) ~= 5e21``,
+        # finite in fp32) prevents the overflow without changing the math for
+        # reasonable g values (typical g in [-1, 0] gives differences well below
+        # 50). The masked_fill still zeroes the upper triangle + diagonal.
         g_diff = (g - g_i).clamp(max=50.0)
         A[..., i] = torch.einsum('... c d, ... d -> ... c', k * g_diff.exp(), k_i)
     A = A * beta[..., None]

@@ -167,3 +167,5 @@ figures/
 *.lock
 poetry.lock
 uv.lock
+
+.opencode/
