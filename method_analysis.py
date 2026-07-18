@@ -231,12 +231,15 @@ class HeadwiseFusedAttention(nn.Module):
         # instantiations share the same value; mirrors
         # HybridConfig.kda_decay_scale.
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
-        # beta is per-head (H outputs), but naive_recurrent_kda expects it to
-        # broadcast with v [B, T, H, hd]. Unsqueeze the last dim so beta
-        # is [B, T, H, 1] and broadcasts correctly over hd. Without this,
-        # a [B, T, H] beta would either crash (4D expected) or broadcast
-        # incorrectly against the 4D q/k/v/g tensors.
-        beta = torch.sigmoid(self.kda_beta(x)).unsqueeze(-1)  # [B, T, H, 1]
+        # beta is per-head (H outputs): naive_recurrent_kda expects beta as
+        # a rank-3 tensor [B, T, HV] (HV == H here since v is [B, T, H, hd]),
+        # and the KDA input validator (_validate_kda_inputs / _validate_kda_shapes
+        # in ops_kda.py) enforces beta.dim() == 3 with beta.shape[2] == HV.
+        # The internal recurrence body indexes beta[:, i] -> [B, HV] and
+        # unsqueezes the last dim itself to broadcast over the V (=hd) axis.
+        # Passing a rank-4 [B, T, H, 1] beta (as a previous version did)
+        # raises ValueError at the rank check and the whole forward crashes.
+        beta = torch.sigmoid(self.kda_beta(x))  # [B, T, H]  (rank 3)
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return o  # [B, T, H, hd]
 
