@@ -122,23 +122,6 @@ jobs:
                       files.add(os.path.normpath(path))
               return files
 
-          def git_commit_one_file(file_path, msg):
-              run_cmd(["git", "add", "--", file_path])
-              r = run_cmd(["git", "commit", "-m", msg, "--", file_path])
-              if r.returncode != 0:
-                  print("  跳过提交 (无内容可提交?):",
-                        r.stdout.strip(), r.stderr.strip())
-                  return False
-              for _ in range(3):
-                  pr = run_cmd(["git", "push"], timeout=60)
-                  if pr.returncode == 0:
-                      return True
-                  run_cmd(["git", "pull", "--rebase", "origin",
-                           os.environ.get("GITHUB_REF_NAME", "HEAD")], timeout=60)
-                  time.sleep(3)
-              print("  git push 失败:", pr.stdout, pr.stderr)
-              return False
-
           def git_commit_push_all(msg):
               # 提交前清理 opencode 产物
               if os.path.exists("opencode.json"):
@@ -158,13 +141,13 @@ jobs:
                   time.sleep(3)
               return False
 
-          def cleanup_unwanted(before_files, target_norm):
-              """还原 / 删除 opencode 对非目标文件的一切改动。"""
+          def cleanup_non_py(before_files):
+              """还原 / 删除对非 .py 文件的改动以及新建的非 .py 文件。"""
               after = git_porcelain()
               changed = after - before_files
               for f in changed:
                   fnorm = os.path.normpath(f)
-                  if fnorm == target_norm:
+                  if fnorm.endswith('.py'):
                       continue
                   run_cmd(["git", "checkout", "--", f])
                   if os.path.exists(f):
@@ -175,7 +158,7 @@ jobs:
           # ------------------------------------------------------------------ #
           REVIEW_PROMPT = (
               "你是一位严谨的科研/学术类 Python 代码审查员。"
-              "你将收到项目的 README.md（背景信息）和一个待审查的 .py 文件路径及其内容。"
+              "你将收到项目的 README.md（背景信息）和项目中所有 .py 文件的路径及其内容。"
               "你的目标是确保代码可以在 kaggle 上运行，并找出可能影响实验结果的 Bug，包括但不限于："
               "错误的数学/公式、错误的变量名、差一错误、"
               "错误的 axis/keepdims/dim 参数、不正确的降维或聚合操作、"
@@ -186,30 +169,38 @@ jobs:
               "不要报告代码风格、格式、注释、命名规范或任何不影响数值/实验结果的问题。"
               "不要修改 README.md。\n\n"
               "关键约束：\n"
-              "1. 每次只能修改当前审查的单个文件。\n"
-              "2. 绝不能触碰、引用或影响代码库中的任何其他文件。\n"
+              "1. 你可以同时修改项目中任意多个 .py 文件来修复 Bug。\n"
+              "2. 只能修改已存在的 .py 文件，不要修改其他类型的文件。\n"
               "3. 如果没有发现此类 Bug，不要做任何修改。\n"
-              "4. 如果发现了 Bug，请直接使用你的文件编辑工具修改该文件，只改动修复 Bug 所需的部分。\n"
+              "4. 如果发现了 Bug，请直接使用你的文件编辑工具修改相应文件，只改动修复 Bug 所需的部分。\n"
               "5. 保持整体文件结构不变，保留原有的缩进和编码格式 (UTF-8)。\n"
               "6. 除非修复严格要求，否则不要添加或删除顶层导入。\n"
               "7. 不要创建新文件，不要删除文件，不要运行任何 shell 命令或脚本。\n"
           )
 
-          def call_opencode(readme, file_path, file_content):
+          def build_files_info(py_files):
+              parts = []
+              for fp in py_files:
+                  content = read_file(fp)
+                  if content is None:
+                      continue
+                  parts.append(f"--- 文件: {fp} ---\n```python\n{content}\n```")
+              return "\n\n".join(parts)
+
+          def call_opencode(readme, files_info):
               user_msg = (
                   f"{REVIEW_PROMPT}\n\n"
                   f"=== README.md (项目背景信息) ===\n{readme}\n\n"
-                  f"=== 待审查文件路径 ===\n{file_path}\n\n"
-                  f"=== 文件内容 ===\n```python\n{file_content}\n```\n\n"
-                  f"请审查文件 `{file_path}` 中影响实验结果的 Bug。"
+                  f"=== 项目所有 .py 文件列表及内容 ===\n{files_info}\n\n"
+                  f"请审查所有文件中影响实验结果的 Bug。"
                   f"如果没有 Bug，不要做任何修改。"
-                  f"如果有 Bug，请直接编辑文件 `{file_path}` 来修复。"
+                  f"如果有 Bug，请直接编辑相关文件来修复，可以同时修改多个文件。"
               )
               return subprocess.run(
                   ["opencode", "run", "--model", MODEL, user_msg],
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  timeout=900,        # 单次调用最多 15 分钟
+                  timeout=1800,       # 单次调用最多 30 分钟（处理多个文件）
               )
 
           # ------------------------------------------------------------------ #
@@ -237,110 +228,95 @@ jobs:
               if not os.path.exists("README.md"):
                   print("警告: 未找到 README.md；使用空上下文。")
 
-              any_changes_this_iter = False
-              no_diff_count = 0
-              failed_count = 0
+              files_info = build_files_info(py_files)
 
-              for fp in py_files:
+              before_files = git_porcelain()
+
+              print(f"\n--- 一次性审查全部 {len(py_files)} 个 .py 文件 ---")
+
+              # ---- 调用 opencode ----
+              r = None
+              while True:
                   if time.time() - START >= MAX_DUR:
-                      stop_reason = "迭代中途达到时间限制"
+                      stop_reason = "opencode 调用期间达到时间限制"
                       break
-
-                  content = read_file(fp)
-                  if content is None:
-                      continue
-
-                  print(f"\n--- 正在检查 {fp} ---")
-
-                  before_files = git_porcelain()
-                  target_norm  = os.path.normpath(fp)
-
-                  # ---- 调用 opencode ----
-                  r = None
-                  while True:
-                      if time.time() - START >= MAX_DUR:
-                          stop_reason = "opencode 调用期间达到时间限制"
-                          break
-                      try:
-                          r = call_opencode(readme, fp, content)
-                          break
-                      except subprocess.TimeoutExpired:
-                          print(f"  {fp} opencode 调用超时（15 分钟），跳过")
-                          failed_count += 1
-                          r = None
-                          break
-                      except Exception as e:
-                          print(f"  {fp} opencode 错误: {e}")
-                          traceback.print_exc()
-                          time.sleep(30)
-
-                  if stop_reason:
+                  try:
+                      r = call_opencode(readme, files_info)
                       break
-                  if r is None:
-                      continue
-
-                  if r.returncode != 0:
-                      print(f"  -> opencode 退出码 {r.returncode}")
-                      if r.stderr:
-                          print("     stderr:", r.stderr[:500])
-                      cleanup_unwanted(before_files, target_norm)
-                      run_cmd(["git", "checkout", "--", fp])
-                      failed_count += 1
-                      continue
-
-                  if r.stdout:
-                      lines   = r.stdout.splitlines()
-                      preview = "\n     ".join(lines[-20:])
-                      print(f"  -> opencode 输出 (最后 20 行):\n     {preview}")
-
-                  # ---- 清理非目标文件改动 ----
-                  cleanup_unwanted(before_files, target_norm)
-
-                  # ---- 检查目标文件是否被修改 ----
-                  after_files = git_porcelain()
-                  if target_norm not in after_files:
-                      print("  -> 无需更改")
-                      no_diff_count += 1
-                      continue
-
-                  new_content = read_file(fp)
-                  if new_content is None or new_content == content:
-                      print("  -> 文件内容未更改；跳过。")
-                      run_cmd(["git", "checkout", "--", fp])
-                      no_diff_count += 1
-                      continue
-
-                  # ---- 语法检查 ----
-                  synth = run_cmd(["python3", "-m", "py_compile", fp], timeout=30)
-                  if synth.returncode != 0:
-                      print(f"  -> 修改后文件有语法错误，正在还原:")
-                      print("    ", synth.stderr[:500])
-                      run_cmd(["git", "checkout", "--", fp])
-                      failed_count += 1
-                      continue
-
-                  print(f"  -> 已将修复应用到 {fp}")
-
-                  if git_commit_one_file(
-                      fp,
-                      f"opencode: 修复影响实验结果的 bug {fp} "
-                      f"(第 {iteration} 次迭代)"
-                  ):
-                      any_changes_this_iter = True
-                  else:
-                      print("  -> 提交/推送此文件失败；将继续处理。")
-                      failed_count += 1
+                  except subprocess.TimeoutExpired:
+                      print(f"  opencode 调用超时（30 分钟），跳过本次迭代")
+                      r = None
+                      break
+                  except Exception as e:
+                      print(f"  opencode 错误: {e}")
+                      traceback.print_exc()
+                      time.sleep(30)
 
               if stop_reason:
                   break
+              if r is None:
+                  continue
 
-              if no_diff_count == len(py_files):
-                  print("\n本次迭代无更改 — 所有文件均已检查完毕。停止运行。")
+              if r.returncode != 0:
+                  print(f"  -> opencode 退出码 {r.returncode}")
+                  if r.stderr:
+                      print("     stderr:", r.stderr[:500])
+                  run_cmd(["git", "checkout", "--", "."])
+                  continue
+
+              if r.stdout:
+                  lines   = r.stdout.splitlines()
+                  preview = "\n     ".join(lines[-20:])
+                  print(f"  -> opencode 输出 (最后 20 行):\n     {preview}")
+
+              # ---- 清理非 .py 文件改动 ----
+              cleanup_non_py(before_files)
+
+              # ---- 检查哪些 .py 文件被修改 ----
+              after_files = git_porcelain()
+              modified_files = {f for f in (after_files - before_files) if f.endswith('.py')}
+
+              if not modified_files:
+                  print("  -> 无需更改")
                   stop_reason = "all files clean"
                   break
 
-              if failed_count > 0 and not any_changes_this_iter:
-                  print(f"\n本次迭代中有 {failed_count} 个文件处理失败。将在下一次迭代中重试...")
+              # ---- 对所有修改过的 .py 文件做语法检查 ----
+              syntax_failed_files = []
+              for fp in sorted(modified_files):
+                  synth = run_cmd(["python3", "-m", "py_compile", fp], timeout=30)
+                  if synth.returncode != 0:
+                      print(f"  -> 修改后文件 {fp} 有语法错误，还原该文件:")
+                      print("    ", synth.stderr[:500])
+                      run_cmd(["git", "checkout", "--", fp])
+                      syntax_failed_files.append(fp)
+
+              # ---- 重新检查还有哪些文件被修改 ----
+              after_files = git_porcelain()
+              modified_files = {f for f in (after_files - before_files) if f.endswith('.py')}
+
+              if not modified_files:
+                  print("  -> 语法检查后无有效修改")
+                  if syntax_failed_files:
+                      print(f"     以下文件因语法错误被还原: {', '.join(syntax_failed_files)}")
+                      continue
+                  else:
+                      stop_reason = "all files clean"
+                      break
+
+              files_list = ", ".join(sorted(modified_files))
+              print(f"  -> 已将修复应用到以下文件: {files_list}")
+              if syntax_failed_files:
+                  print(f"     以下文件因语法错误被还原: {', '.join(syntax_failed_files)}")
+
+              # ---- 提交所有修改 ----
+              if git_commit_push_all(
+                  f"opencode: 修复影响实验结果的 bug ({files_list}) "
+                  f"(第 {iteration} 次迭代)"
+              ):
+                  print(f"  -> 已提交并推送")
+              else:
+                  print("  -> 提交/推送失败；将继续处理。")
 
           print(f"\n停止原因: {stop_reason}")
           git_commit_push_all(f"opencode: 最终提交 ({stop_reason})")
