@@ -475,7 +475,7 @@ HCA — Heavily Compressed Attention
    A block becomes visible when its full m'-token source window closes.
    scores[h, t, n] = q[t, h] . C_comp_n[n] * scale
    p = softmax(scores + causal_mask)
-   out[t, h] = sum_n p[h, t, n] * C_comp_n[n]      # uses NORMALIZED C_comp_n
+   out[t, h] = sum_n p[h, t, n] * C_comp[n]      # uses UN-NORMALIZED C_comp
 
 3. Sliding window branch: same structure as CSA's sliding window, but using
    HCA's single KV projection ``C = H @ W_KV`` (NOT CSA's two-branch
