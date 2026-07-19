@@ -5,7 +5,7 @@ on:
 
 permissions:
   contents: write
-  actions: write          # 必须有此权限，GITHUB_TOKEN 才能触发下一个 workflow
+  actions: write
 
 concurrency:
   group: llm-bug-fix
@@ -57,7 +57,6 @@ jobs:
             "model": "nvidia/z-ai/glm-5.2"
           }
           EOF
-          # 防止 opencode 会话文件被提交
           grep -qxF '.opencode/' .gitignore 2>/dev/null || printf '\n.opencode/\n' >> .gitignore
 
       - name: Run opencode Bug-Fix Loop
@@ -123,7 +122,6 @@ jobs:
               return files
 
           def git_commit_push_all(msg):
-              # 提交前清理 opencode 产物
               if os.path.exists("opencode.json"):
                   os.remove("opencode.json")
               if os.path.isdir(".opencode"):
@@ -187,6 +185,9 @@ jobs:
                   parts.append(f"--- 文件: {fp} ---\n```python\n{content}\n```")
               return "\n\n".join(parts)
 
+          # ================================================================== #
+          #  ★ 修复点 1: 通过 stdin 传递 prompt，避免 Argument list too long
+          # ================================================================== #
           def call_opencode(readme, files_info):
               user_msg = (
                   f"{REVIEW_PROMPT}\n\n"
@@ -196,11 +197,19 @@ jobs:
                   f"如果没有 Bug，不要做任何修改。"
                   f"如果有 Bug，请直接编辑相关文件来修复，可以同时修改多个文件。"
               )
+              prompt_size = len(user_msg.encode('utf-8'))
+              print(f"  -> Prompt 大小: {prompt_size:,} 字节")
+              if prompt_size > 200000:
+                  print(f"  ⚠️ 警告: Prompt 较大 ({prompt_size:,} 字节)，"
+                        f"可能超出模型上下文窗口")
+
+              # ★ 关键改动：input= 通过 stdin 传递，不再作为 CLI 参数
               return subprocess.run(
-                  ["opencode", "run", "--model", MODEL, user_msg],
+                  ["opencode", "run", "--model", MODEL],
+                  input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  timeout=1800,       # 单次调用最多 30 分钟（处理多个文件）
+                  timeout=1800,
               )
 
           # ------------------------------------------------------------------ #
@@ -234,8 +243,11 @@ jobs:
 
               print(f"\n--- 一次性审查全部 {len(py_files)} 个 .py 文件 ---")
 
-              # ---- 调用 opencode ----
+              # ================================================================ #
+              #  ★ 修复点 2: 重试逻辑加入连续错误计数，避免对不可恢复错误无限重试
+              # ================================================================ #
               r = None
+              consecutive_errors = 0
               while True:
                   if time.time() - START >= MAX_DUR:
                       stop_reason = "opencode 调用期间达到时间限制"
@@ -247,9 +259,20 @@ jobs:
                       print(f"  opencode 调用超时（30 分钟），跳过本次迭代")
                       r = None
                       break
+                  except OSError as e:
+                      consecutive_errors += 1
+                      print(f"  opencode OSError: {e}")
+                      if consecutive_errors >= 3:
+                          stop_reason = f"opencode 反复出现 OSError: {e}"
+                          break
+                      time.sleep(30)
                   except Exception as e:
+                      consecutive_errors += 1
                       print(f"  opencode 错误: {e}")
                       traceback.print_exc()
+                      if consecutive_errors >= 5:
+                          stop_reason = f"opencode 反复出错: {e}"
+                          break
                       time.sleep(30)
 
               if stop_reason:
@@ -324,7 +347,7 @@ jobs:
           PYEOF
 
   # ==========================================
-  # 自触发 Job：确保上一次执行完后自动触发下一次
+  # 自触发 Job
   # ==========================================
   trigger-next:
     needs: llm-fix
@@ -343,7 +366,6 @@ jobs:
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          # 1. 获取当前 Workflow 的 ID
           WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
 
           if [ -z "$WF_ID" ]; then
@@ -353,11 +375,10 @@ jobs:
 
           echo "找到工作流 ID: $WF_ID"
 
-          # 2. 触发下一次运行
           if gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
-            "/repos/$REPO/actions/workflows/$WF_ID/dispatches" \
+            "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
             -f "ref=$WORKFLOW_REF"; then
             echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
           else
@@ -365,7 +386,6 @@ jobs:
             exit 1
           fi
 
-          # 3. 验证是否触发成功
           sleep 5
           echo "最近的工作流运行记录:"
           gh run list --workflow "$WORKFLOW_NAME" --limit 3
