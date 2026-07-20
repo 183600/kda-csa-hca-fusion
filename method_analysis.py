@@ -364,7 +364,7 @@ class HeadwiseFusedAttention(nn.Module):
         all_heads = torch.cat([
             kda_o.to(x.dtype), csa_o.to(x.dtype), hca_o.to(x.dtype)
         ], dim=2)                                                   # [B, T, H_total, hd]
-        return x + self.o_proj(all_heads.reshape(B, T, self.cfg.H_total * hd))
+        return x + self.o_proj(all_heads.reshape(B, T, -1))
 
 
 def demo_headwise_fusion():
