@@ -138,39 +138,18 @@ jobs:
                       run_cmd(["rm", "-rf", f])
 
           # ------------------------------------------------------------------
-          # Prompt —— 已按你的要求改为中文
+          # Prompt —— 仅保留你指定的那句话
           # ------------------------------------------------------------------
           REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复"
 
-          def build_files_info(py_files):
-              parts = []
-              for fp in py_files:
-                  content = read_file(fp)
-                  if content is None:
-                      continue
-                  parts.append(f"--- 文件: {fp} ---\n```python\n{content}\n```")
-              return "\n\n".join(parts)
-
           # ==================================================================
-          # ★ 通过 stdin 传递 prompt，避免 Argument list too long
+          # 直接发送 prompt，不附加任何文件内容或额外指示
           # ==================================================================
-          def call_opencode(readme, files_info):
-              user_msg = (
-                  f"{REVIEW_PROMPT}\n\n"
-                  f"=== README.md (项目背景信息) ===\n{readme}\n\n"
-                  f"=== 项目所有 .py 文件列表及内容 ===\n{files_info}\n\n"
-                  f"请审查所有文件中影响实验结果的 Bug。"
-                  f"如果没有 Bug，不要做任何修改。"
-                  f"如果有 Bug，请直接编辑相关文件来修复，可以同时修改多个文件。"
-              )
-              prompt_size = len(user_msg.encode('utf-8'))
-              print(f" -> Prompt 大小: {prompt_size:,} 字节")
-              if prompt_size > 200000:
-                  print(f" ⚠️ 警告: Prompt 较大 ({prompt_size:,} 字节)，"
-                        f"可能超出模型上下文窗口")
+          def call_opencode():
+              print(f" -> Prompt: {REVIEW_PROMPT}")
               return subprocess.run(
                   ["opencode", "run", "--model", MODEL],
-                  input=user_msg,
+                  input=REVIEW_PROMPT,
                   capture_output=True,
                   text=True,
                   env=os.environ.copy(),
@@ -199,14 +178,7 @@ jobs:
                   stop_reason = "no .py files"
                   break
 
-              readme = read_file("README.md") or ""
-              if not os.path.exists("README.md"):
-                  print("警告: 未找到 README.md；使用空上下文。")
-
-              files_info = build_files_info(py_files)
               before_files = git_porcelain()
-
-              print(f"\n--- 一次性审查全部 {len(py_files)} 个 .py 文件 ---")
 
               r = None
               consecutive_errors = 0
@@ -215,7 +187,7 @@ jobs:
                       stop_reason = "opencode 调用期间达到时间限制"
                       break
                   try:
-                      r = call_opencode(readme, files_info)
+                      r = call_opencode()   # 不再传递 readme 和 files_info
                       break
                   except subprocess.TimeoutExpired:
                       print(f" opencode 调用超时（30 分钟），跳过本次迭代")
@@ -285,6 +257,7 @@ jobs:
                       print(f"   以下文件因语法错误被还原: {', '.join(syntax_failed_files)}")
                   continue
               else:
+                  # 注意：这里可能会错误地将有修改的文件当作 stop_reason 处理，保留原逻辑
                   stop_reason = "all files clean"
                   break
 
