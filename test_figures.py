@@ -347,7 +347,7 @@ def main():
         test_fig_ablation_suptitle_not_clipped,
     ]:
         try:
-            fn()
+            fn(tmp_path=None, monkeypatch=None)
             results.append(True)
         except AssertionError as e:
             # Surface assertion failures loudly so the user can see which
