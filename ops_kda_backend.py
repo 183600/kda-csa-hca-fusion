@@ -234,6 +234,11 @@ def kda_forward(
                     stacklevel=2,
                 )
                 _fla_import_warning_emitted = True
+            # Fall back to the reference implementation for this call only.
+            # The global warning flag suppresses duplicate log spam but must
+            # NOT permanently disable FLA for subsequent calls, otherwise a
+            # single transient edge case would silently degrade every later
+            # KDA computation in the process to the slow Python reference.
             use_fla = False
 
     # Lazy import avoids an import cycle and preserves the original public
