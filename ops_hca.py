@@ -241,7 +241,13 @@ def naive_hca(
         # NaN guard: zero out rows where every block is causally masked
         # (e.g. t < m2). Without this, a -inf log_sink would produce NaN
         # via (-inf - (-inf)) = NaN, and the einsum would propagate it.
-        all_masked = torch.isinf(scores).all(-1, keepdim=True)   # [B, nh, T, 1]
+        # Use ``torch.isneginf(row_max)`` instead of
+        # ``torch.isinf(scores).all(-1)`` so that a row is only flagged
+        # when its true maximum is -inf (i.e. every slot is -inf). The
+        # previous ``torch.isinf`` also matched +inf, so a row containing
+        # an overflowed +inf score alongside -inf masks would be wrongly
+        # zeroed, silently dropping attention and gradients.
+        all_masked = torch.isneginf(row_max)                     # [B, nh, T, 1]
         p = p.masked_fill(all_masked, 0.0)
     else:
         # H2 fix: delegate to shared _nan_safe_softmax helper (defined in
