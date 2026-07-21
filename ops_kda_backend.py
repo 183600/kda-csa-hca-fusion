@@ -158,10 +158,9 @@ def _call_fla(
     else:
         if isinstance(result, tuple):
             output = result[0]
-            final_state = result[1] if len(result) > 1 else None
         else:
             output = result
-            final_state = None
+        final_state = None
     output = output.to(dtype=v.dtype)
     if output_final_state and final_state is not None:
         state_dtype = torch.float64 if v.dtype == torch.float64 else torch.float32
@@ -208,9 +207,7 @@ def kda_forward(
     # functions so their internal clamp becomes a no-op.
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
-        downstream_clamp = -float('inf')
-    else:
-        downstream_clamp = float(g_clamp_min)
+    downstream_clamp = -float('inf')
 
     use_fla = backend == "fla"
     if backend == "auto":
