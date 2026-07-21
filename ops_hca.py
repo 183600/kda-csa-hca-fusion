@@ -309,9 +309,10 @@ def naive_hca(
         # ``c == nh`` (e.g. the default MQAR config) the shapes matched by
         # accident but the semantics were completely wrong; when ``c != nh``
         # the subsequent ``out + sw_out`` silently broadcast and corrupted
-        # the output. Expand ``C_local`` to [B, T, nh, c] so it acts as a
-        # proper shared Multi-Query key across all heads.
-        C_local = C_local.unsqueeze(2).expand(B_, T, nh, c)
+        # the output. Expand ``C_local`` to [B, T, 1, c] so it acts as a
+        # proper shared Multi-Query key across all heads, broadcasting
+        # correctly over the ``nh`` dimension inside the SW helper.
+        C_local = C_local.unsqueeze(2).expand(B_, T, 1, c)
         sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 
