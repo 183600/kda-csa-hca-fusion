@@ -44,6 +44,7 @@ def naive_hca(
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
     return_projections: bool = False,
+    W_KV_local: torch.Tensor | None = None,     # [c, d] local SW key/value projection
 ):
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
 
@@ -130,6 +131,10 @@ def naive_hca(
         raise ValueError(
             f"naive_hca: sink_logits.shape={tuple(sink_logits.shape)} must "
             f"equal (nh,)=({nh},)")
+    if W_KV_local is not None and W_KV_local.shape != (c, d):
+        raise ValueError(
+            f"naive_hca: W_KV_local.shape={tuple(W_KV_local.shape)} must "
+            f"equal (c, d)=({c}, {d})")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (see ``F.normalize`` calls below), their dot product is already a cosine
     # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
@@ -308,7 +313,23 @@ def naive_hca(
         # (e.g. fp16) while the dense softmax ran in compute_dtype (fp32) —
         # an asymmetric precision loss that silently degrades the SW branch's
         # contribution for fp16 inputs. Mirrors the fix in ops_csa.py.
-        C_local = F.normalize(C.to(compute_dtype), dim=-1)              # [B, T, c]
+        #
+        # Semantic fix: the SW branch must use a proper local Key/Value
+        # projection. Previously it reused ``C`` (the heavy-compression KV
+        # projection from ``W_KV``) as both the key and value for the SW
+        # attention. Because ``q`` lives in the ``W_UQ``-projected query
+        # space while ``C`` lives in the ``W_KV``-projected compressed-KV
+        # space, mixing them produced a semantically meaningless
+        # query-to-query attention whose output was added to the dense
+        # branch, corrupting the representation. We now use an explicit
+        # ``W_KV_local`` projection (falling back to ``C`` only when the
+        # caller does not supply one, preserving backward compatibility for
+        # callers that have not yet been updated).
+        if W_KV_local is not None:
+            C_local_raw = F.linear(H, W_KV_local)                   # [B, T, c]
+        else:
+            C_local_raw = C
+        C_local = F.normalize(C_local_raw.to(compute_dtype), dim=-1)  # [B, T, c]
         # MQA shape fix: ``q`` is [B, T, nh, c] but ``C_local`` is [B, T, c].
         # Passing them directly caused the SW helper to contract over the
         # ``nh`` axis of ``q`` and the ``c`` axis of ``C_local``, yielding
