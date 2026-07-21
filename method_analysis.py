@@ -189,13 +189,19 @@ class HeadwiseFusedAttention(nn.Module):
         self.csa_q = nn.Linear(d, cfg.H_csa * cfg.csa_c, bias=False)
         self.csa_kv = nn.Linear(d, cfg.csa_c, bias=False)
         self.csa_z = nn.Linear(d, cfg.csa_c, bias=False)
-        self.csa_B = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_c) * 0.02)
+        # Position bias shape must be [1, m, c] so it broadcasts correctly
+        # against the per-block chunked tensor [B, n_blocks, m, c] inside
+        # csa_compress_kv. A [m, c] tensor would misalign with n_blocks.
+        self.csa_B = nn.Parameter(torch.randn(1, cfg.csa_m, cfg.csa_c) * 0.02)
 
         # HCA branch (H_hca heads).
         self.hca_q = nn.Linear(d, cfg.H_hca * cfg.hca_c, bias=False)
         self.hca_kv = nn.Linear(d, cfg.hca_c, bias=False)
         self.hca_z = nn.Linear(d, cfg.hca_c, bias=False)
-        self.hca_B = nn.Parameter(torch.randn(cfg.hca_m2, cfg.hca_c) * 0.02)
+        # Position bias shape must be [1, m2, c] so it broadcasts correctly
+        # against the per-block chunked tensor [B, n_blocks, m2, c] inside
+        # csa_compress_kv. A [m2, c] tensor would misalign with n_blocks.
+        self.hca_B = nn.Parameter(torch.randn(1, cfg.hca_m2, cfg.hca_c) * 0.02)
 
         self.norm = nn.LayerNorm(d)
         self.o_proj = nn.Linear(cfg.H_total * hd, d, bias=False)
