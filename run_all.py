@@ -254,7 +254,14 @@ def run_all(seeds=None, steps=None):
     _env_keys = ('MQAR_SEEDS', 'ABL_SEEDS', 'MQAR_STEPS', 'ABL_STEPS',
                  'MQAR_SOFTMAX_STEPS', 'BENCH_LENGTHS', 'RESULTS_DIR',
                  'FIGURES_DIR', 'SKIP_SLOW')
-    _orig_env = {k: os.environ.get(k) for k in _env_keys}
+    # Snapshot the precise pre-call state of each env var: distinguish
+    # "unset" from "set to a value" so the finally block can restore the
+    # exact state. Using ``os.environ.get`` alone cannot tell the two apart
+    # (both yield ``None``), which previously caused an internally-injected
+    # ``MQAR_SOFTMAX_STEPS`` to be popped on exit, silently breaking a
+    # subsequent ``run_all()`` call in the same process that expected the
+    # variable to still be present.
+    _orig_env = {k: (os.environ[k] if k in os.environ else None) for k in _env_keys}
     # Round-10 fix (R3-C bug 2): the env-var mutations below used to live
     # BEFORE the try-finally block (lines 201-212 in the pre-fix version).
     # If ``_ensure_deps()`` (line 214) or ``_setup()`` (line 215) raised,
@@ -548,6 +555,16 @@ def run_all(seeds=None, steps=None):
         # caller does not find ``MQAR_SEEDS=5`` etc. permanently set after
         # run_all() returns. Matches the CWD-restore contract: run_all() is
         # a library function, not a process mutator.
+        #
+        # Bugfix: the snapshot above records ``None`` for vars that were
+        # UNSET before the call (distinct from vars that were set to the
+        # literal string ``"None"``). Restoring the precise pre-call state
+        # means an internally-injected var (e.g. ``MQAR_SOFTMAX_STEPS``
+        # added by the SKIP_SLOW branch when the caller had not set it) is
+        # popped, while a var the caller explicitly set is restored to its
+        # original value. This prevents a second ``run_all()`` call in the
+        # same process from seeing a stale injected value and silently
+        # diverging from the caller's intended configuration.
         for _k, _v in _orig_env.items():
             if _v is None:
                 os.environ.pop(_k, None)
