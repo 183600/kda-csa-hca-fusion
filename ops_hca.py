@@ -320,15 +320,17 @@ def naive_hca(
         # proper shared Multi-Query key across all heads, broadcasting
         # correctly over the ``nh`` dimension inside the SW helper.
         C_local = C_local.unsqueeze(2).expand(B_, T, nh, c)
-        # Scale fix: pass 1.0 to avoid double-scaling. The dense branch
-        # already applies ``scale`` to its ``scores``. The
-        # ``_sliding_window_attention`` helper internally multiplies the
-        # scores by the ``scale`` argument it receives, so passing the
-        # outer ``scale`` here would scale the SW branch twice whenever
-        # ``scale != 1.0`` (e.g. when a caller explicitly overrides it).
-        # Passing 1.0 keeps the SW branch consistent with the already-scaled
-        # dense branch.
-        sw_out = _sliding_window_attention(q, C_local, win, 1.0, device)
+        # Scale fix: pass the outer ``scale`` to keep the SW branch at the
+        # same temperature as the dense branch. Both branches operate on
+        # L2-normalized ``q`` and keys, so their raw dot products are cosine
+        # similarities in ``[-1, 1]``. Passing ``1.0`` here would leave the
+        # SW scores unscaled, collapsing its softmax to a near-uniform
+        # average-pooling distribution whenever ``scale`` is explicitly
+        # overridden to a value > 1.0. The ``_sliding_window_attention``
+        # helper internally multiplies the scores by the ``scale`` argument
+        # it receives, so passing the outer ``scale`` here applies the same
+        # temperature to the SW branch as the dense branch already uses.
+        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
