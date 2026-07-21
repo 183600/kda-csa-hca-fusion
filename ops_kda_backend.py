@@ -111,12 +111,13 @@ def _call_fla(
     # receive a g_clamp_min argument, it should use its own default
     # (typically None or a large negative value), which we override by
     # having already clamped g before dispatch.
+    # Preserve the original ``scale`` value (including torch.Tensor) so that
+    # gradients can flow back and device placement is retained.  Only convert
+    # plain Python numbers when needed; do NOT detach/item() a tensor scale.
     if isinstance(scale, torch.Tensor):
-        scale_value = float(scale.detach().item())
-    elif scale is None:
-        scale_value = None
+        scale_value = scale
     else:
-        scale_value = float(scale)
+        scale_value = scale
 
     kwargs: dict[str, Any] = {
         "q": q,
