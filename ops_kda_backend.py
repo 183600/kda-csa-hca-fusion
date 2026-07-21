@@ -226,22 +226,15 @@ def kda_forward(
         except (ImportError, ValueError, NotImplementedError, AssertionError) as exc:
             if backend == "fla":
                 raise
-            warnings.warn(
-                f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
-                f"{exc}); falling back to the reference implementation.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            if not _fla_import_warning_emitted:
+                warnings.warn(
+                    f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
+                    f"{exc}); falling back to the reference implementation.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _fla_import_warning_emitted = True
             use_fla = False
-
-    if backend == "auto" and not use_fla and q.is_cuda and not _fla_import_warning_emitted:
-        warnings.warn(
-            "kda_backend='auto' could not use FLA; falling back to the "
-            "repository reference implementation.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        _fla_import_warning_emitted = True
 
     # Lazy import avoids an import cycle and preserves the original public
     # ops_kda module as the single source of truth for correctness tests.
