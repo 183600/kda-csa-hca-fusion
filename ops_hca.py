@@ -34,7 +34,7 @@ def naive_hca(
     W_Z: torch.Tensor,             # [c, d]
     B_pos: torch.Tensor,           # [m2, c]
     W_DQ: torch.Tensor,            # [dc, d]
-    W_UQ: torch.Tensor,            # [c*nh, dc]
+    W_UQ: torch.Tensor,             # [c*nh, dc]
     *,
     m2: int,                       # heavy compression factor (m' in the paper)
     nh: int,
