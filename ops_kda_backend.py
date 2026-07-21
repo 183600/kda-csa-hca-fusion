@@ -104,13 +104,12 @@ def _call_fla(
     fn = chunk_kda if use_chunk else fused_recurrent_kda
     # g_clamp_min is already applied once in kda_forward before dispatch;
     # do NOT apply it a second time here to avoid double-clamping.
-    # To prevent the FLA kernel from applying its own clamp, we explicitly
-    # pass g_clamp_min=-inf (the downstream sentinel meaning "no further
-    # clamp needed") to override the FLA kernel's default.  If the FLA
-    # kernel does not accept g_clamp_min, _supported_kwargs will filter it
-    # out and the kernel will use its own default; but for versions that do
-    # accept it, passing -inf ensures the kernel's internal clamp becomes a
-    # no-op, matching the reference implementation exactly.
+    # We pass the original g_clamp_min to the FLA kernel.  Because g has
+    # already been clamped to [g_clamp_min, inf) in kda_forward, the FLA
+    # kernel's internal clamp with the same bound is a strict no-op, so
+    # there is no double-clamping side effect.  Passing -inf as a sentinel
+    # is unsafe because the FLA Triton kernel may compute exp(g_clamp_min),
+    # yielding 0.0 or NaN and corrupting the delta-rule state update.
     # Preserve the original ``scale`` value (including torch.Tensor) so that
     # gradients can flow back and device placement is retained.  Only convert
     # plain Python numbers when needed; do NOT detach/item() a tensor scale.
@@ -133,11 +132,11 @@ def _call_fla(
         "use_gate_in_kernel": False,
         "use_beta_sigmoid_in_kernel": False,
         "chunk_size": chunk_size,
-        # Always include g_clamp_min so that the FLA kernel uses the exact
-        # same clamp bound as the caller.  When the caller has already
-        # clamped g, g_clamp_min is -inf (the downstream sentinel); passing
-        # -inf to FLA overrides its default (typically -10.0) and makes the
-        # kernel's internal clamp a no-op, matching the reference path.
+        # Pass the original g_clamp_min so that the FLA kernel uses the
+        # exact same clamp bound as the caller.  Because g has already been
+        # clamped to [g_clamp_min, inf) in kda_forward, the FLA kernel's
+        # internal clamp with the same bound is a strict no-op, matching
+        # the reference path without risking exp(-inf) -> 0/NaN corruption.
         "g_clamp_min": g_clamp_min,
     }
     result = fn(**_supported_kwargs(fn, kwargs))
@@ -200,11 +199,15 @@ def kda_forward(
     # Apply g_clamp_min exactly once here, before any backend dispatch.
     # The downstream functions (_call_fla, naive_recurrent_kda,
     # naive_chunk_kda) must NOT apply their own clamp to avoid
-    # double-clamping.  We pass g_clamp_min=-inf to the downstream
-    # functions so their internal clamp becomes a no-op.
+    # double-clamping.  We pass the original g_clamp_min to the downstream
+    # functions; because g has already been clamped to [g_clamp_min, inf)
+    # here, the downstream internal clamp with the same bound is a strict
+    # no-op.  Do NOT pass -inf as a sentinel: the FLA Triton kernel may
+    # compute exp(g_clamp_min), yielding 0.0 or NaN and corrupting the
+    # delta-rule state update.
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
-    downstream_clamp = -float('inf')
+    downstream_clamp = g_clamp_min
 
     use_fla = backend == "fla"
     if backend == "auto":
