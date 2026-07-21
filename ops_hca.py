@@ -320,7 +320,15 @@ def naive_hca(
         # proper shared Multi-Query key across all heads, broadcasting
         # correctly over the ``nh`` dimension inside the SW helper.
         C_local = C_local.unsqueeze(2).expand(B_, T, nh, c)
-        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
+        # Scale fix: pass 1.0 to avoid double-scaling. The dense branch
+        # already applies ``scale`` to its ``scores``. The
+        # ``_sliding_window_attention`` helper internally multiplies the
+        # scores by the ``scale`` argument it receives, so passing the
+        # outer ``scale`` here would scale the SW branch twice whenever
+        # ``scale != 1.0`` (e.g. when a caller explicitly overrides it).
+        # Passing 1.0 keeps the SW branch consistent with the already-scaled
+        # dense branch.
+        sw_out = _sliding_window_attention(q, C_local, win, 1.0, device)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
