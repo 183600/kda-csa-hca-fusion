@@ -296,6 +296,16 @@ def naive_hca(
         # an asymmetric precision loss that silently degrades the SW branch's
         # contribution for fp16 inputs. Mirrors the fix in ops_csa.py.
         C_local = F.normalize(C.to(compute_dtype), dim=-1)              # [B, T, c]
+        # MQA shape fix: ``q`` is [B, T, nh, c] but ``C_local`` is [B, T, c].
+        # Passing them directly caused the SW helper to contract over the
+        # ``nh`` axis of ``q`` and the ``c`` axis of ``C_local``, yielding
+        # ``sw_out`` of shape [B, T, nh, nh] instead of [B, T, nh, c]. When
+        # ``c == nh`` (e.g. the default MQAR config) the shapes matched by
+        # accident but the semantics were completely wrong; when ``c != nh``
+        # the subsequent ``out + sw_out`` silently broadcast and corrupted
+        # the output. Expand ``C_local`` to [B, T, nh, c] so it acts as a
+        # proper shared Multi-Query key across all heads.
+        C_local = C_local.unsqueeze(2).expand(B_, T, nh, c)
         sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 
