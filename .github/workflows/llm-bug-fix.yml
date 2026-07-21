@@ -5,7 +5,7 @@ on:
 
 permissions:
   contents: write
-  actions: write          # 必须有此权限，GITHUB_TOKEN 才能触发下一个 workflow
+  actions: write
 
 concurrency:
   group: llm-bug-fix
@@ -71,7 +71,10 @@ jobs:
                           out.append(os.path.normpath(os.path.join(root, f)))
               return sorted(set(out))
 
-          def call_llm(readme, file_path, file_content):
+          # ============================================================
+          # 第一次 LLM 调用：分析代码中是否存在影响实验结果的 Bug
+          # ============================================================
+          def call_llm_analyze(readme, file_path, file_content):
               sys_prompt = (
                   "你是一位严谨的科研/学术类 Python 代码审查员。"
                   "你将收到 (1) 项目的 README.md 用于提供背景信息，以及 (2) 一个 .py 文件的路径及其内容。"
@@ -83,11 +86,45 @@ jobs:
                   "缺失 detach()/no_grad、不正确的 loss 降维方式、符号错误、整数与浮点数除法混淆、"
                   "影响数值计算的错误设备放置等。"
                   "不要报告代码风格、格式、注释、命名规范或任何不影响数值/实验结果的问题。"
-                  "不要修改 README.md。"
+                  "不要修改 README.md。\n\n"
+                  "如果你没有发现此类 Bug，请只回复这一行内容：\nNO_CHANGES\n\n"
+                  "如果你发现了此类 Bug，请详细描述每个 Bug，包括：\n"
+                  "1. Bug 所在的行号或代码片段（请引用原文）\n"
+                  "2. Bug 的类型（如：axis 参数错误、变量名拼写错误、符号错误等）\n"
+                  "3. 为什么它会影响实验结果\n"
+                  "4. 建议的修复方向（描述应如何修改，但不要直接给出完整的修复代码）\n\n"
+                  "注意：你只需要做分析，不需要生成任何 bash 脚本或 diff 补丁。"
+              )
+              user_msg = (
+                  f"=== README.md (项目背景信息) ===\n{readme}\n\n"
+                  f"=== 待审查文件 (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
+                  f"请审查上述文件中影响实验结果的 Bug。"
+                  f"如果没有 Bug，请只回复 'NO_CHANGES'；否则请详细描述每个发现的 Bug。"
+              )
+              resp = client.chat.completions.create(
+                  model=MODEL,
+                  messages=[
+                      {"role": "system", "content": sys_prompt},
+                      {"role": "user",   "content": user_msg},
+                  ],
+                  temperature=0.2,
+                  max_tokens=8192,
+              )
+              return resp.choices[0].message.content.strip()
+
+          # ============================================================
+          # 第二次 LLM 调用：根据分析结果生成 shell 命令形式的补丁
+          # ============================================================
+          def call_llm_generate_patch(readme, file_path, file_content, analysis):
+              sys_prompt = (
+                  "你是一位严谨的科研/学术类 Python 代码修复工程师。"
+                  "你将收到 (1) 项目的 README.md 用于提供背景信息，"
+                  "(2) 一个 .py 文件的路径及其完整内容，以及 "
+                  "(3) 前一轮分析中发现的 Bug 描述。\n"
+                  "你的任务是根据 Bug 分析结果，生成一个 bash 脚本来修复文件中所有已发现的 Bug。\n\n"
                   "关键约束：每次回复只能修改当前审查的单个文件。"
                   "你绝不能触碰、引用或影响代码库中的任何其他文件。\n\n"
-                  "如果你没有发现此类 Bug，请回复这一行内容：\nNO_CHANGES\n"
-                  "如果你发现了此类 Bug，请在一个 ```bash``` 代码块中回复一个 bash 脚本。"
+                  "请在一个 ```bash``` 代码块中回复一个 bash 脚本。"
                   "该 bash 脚本必须调用 `diff` 命令，并且必须严格遵循以下结构"
                   "（将 <FILE_PATH> 替换为用户消息中提供的文件路径）：\n\n"
                   "```bash\n"
@@ -110,9 +147,9 @@ jobs:
               )
               user_msg = (
                   f"=== README.md (项目背景信息) ===\n{readme}\n\n"
-                  f"=== 待审查文件 (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
-                  f"请审查上述文件中影响实验结果的 Bug。"
-                  f"如果没有 Bug，请回复 'NO_CHANGES'；或者，请回复一个 bash 脚本（使用 `diff` 命令）来修复文件 `{file_path}`，"
+                  f"=== 待修复文件 (FILE_PATH = {file_path}) ===\n```python\n{file_content}\n```\n\n"
+                  f"=== Bug 分析结果（来自前一轮审查） ===\n{analysis}\n\n"
+                  f"请根据上述 Bug 分析结果，生成一个 bash 脚本（使用 `diff` 命令）来修复文件 `{file_path}`，"
                   f"该脚本必须严格遵循系统提示词中给出的模板。请将 <FILE_PATH> 替换为 `{file_path}`。"
               )
               resp = client.chat.completions.create(
@@ -128,9 +165,6 @@ jobs:
 
           def extract_bash_script(resp):
               if not resp:
-                  return None
-              first_line = resp.strip().splitlines()[0].strip().upper()
-              if first_line == "NO_CHANGES" or resp.strip().upper() == "NO_CHANGES":
                   return None
               m = re.search(r"```bash\s*\n(.*?)```", resp, re.DOTALL)
               if not m:
@@ -304,16 +338,51 @@ jobs:
 
                   print(f"\n--- 正在检查 {fp} ---")
 
+                  # ====================================================
+                  # 第一次 LLM 调用：分析是否存在影响实验结果的 Bug
+                  # ====================================================
+                  print(f"  [第一步] 正在分析 {fp} 中的 Bug...")
+                  analysis = None
+                  while True:
+                      if time.time() - START >= MAX_DUR:
+                          stop_reason = "分析阶段达到时间限制"
+                          break
+                      try:
+                          analysis = call_llm_analyze(readme, fp, content)
+                          break
+                      except Exception as e:
+                          print(f"  {fp} 分析阶段发生 API 错误: {e}")
+                          print("  等待 30 秒后重试...")
+                          traceback.print_exc()
+                          time.sleep(30)
+
+                  if stop_reason:
+                      break
+
+                  # 检查分析结果是否为 NO_CHANGES
+                  if analysis.strip().upper() == "NO_CHANGES":
+                      print("  -> 分析完成：无需更改 (NO_CHANGES)")
+                      no_diff_count += 1
+                      continue
+
+                  print(f"  -> 分析完成：发现以下 Bug：")
+                  for ln in analysis.splitlines():
+                      print(f"     {ln}")
+
+                  # ====================================================
+                  # 第二次 LLM 调用：根据分析结果生成 shell 补丁
+                  # ====================================================
+                  print(f"  [第二步] 正在为 {fp} 生成修复补丁...")
                   resp = None
                   while True:
                       if time.time() - START >= MAX_DUR:
-                          stop_reason = "API 调用/重试期间达到时间限制"
+                          stop_reason = "补丁生成阶段达到时间限制"
                           break
                       try:
-                          resp = call_llm(readme, fp, content)
+                          resp = call_llm_generate_patch(readme, fp, content, analysis)
                           break
                       except Exception as e:
-                          print(f"  {fp} 发生 API 错误: {e}")
+                          print(f"  {fp} 补丁生成阶段发生 API 错误: {e}")
                           print("  等待 30 秒后重试...")
                           traceback.print_exc()
                           time.sleep(30)
@@ -323,8 +392,8 @@ jobs:
 
                   bash_script = extract_bash_script(resp)
                   if bash_script is None:
-                      print("  -> 无需更改 (NO_CHANGES)")
-                      no_diff_count += 1
+                      print("  -> 未能从 LLM 响应中提取 bash 脚本")
+                      failed_count += 1
                       continue
 
                   ok, reason = validate_bash_script(bash_script, fp)
@@ -428,9 +497,8 @@ jobs:
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          # 1. 获取当前 Workflow 的 ID
           WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
-          
+
           if [ -z "$WF_ID" ]; then
             echo "❌ 找不到 '$WORKFLOW_NAME' 的工作流 ID。循环将在此停止。"
             exit 1
@@ -438,7 +506,6 @@ jobs:
 
           echo "找到工作流 ID: $WF_ID"
 
-          # 2. 触发下一次运行
           if gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
@@ -450,7 +517,6 @@ jobs:
             exit 1
           fi
 
-          # 3. 验证是否触发成功
           sleep 5
           echo "最近的工作流运行记录:"
           gh run list --workflow "$WORKFLOW_NAME" --limit 3
