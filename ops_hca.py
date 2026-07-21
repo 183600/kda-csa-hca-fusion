@@ -337,10 +337,10 @@ def naive_hca(
         # ``c == nh`` (e.g. the default MQAR config) the shapes matched by
         # accident but the semantics were completely wrong; when ``c != nh``
         # the subsequent ``out + sw_out`` silently broadcast and corrupted
-        # the output. Expand ``C_local`` to [B, T, nh, c] so it acts as a
-        # proper shared Multi-Query key across all heads, broadcasting
-        # correctly over the ``nh`` dimension inside the SW helper.
-        C_local = C_local.unsqueeze(2).expand(B_, T, nh, c)
+        # the output. Keep ``C_local`` as [B, T, c] so it acts as a proper
+        # shared Multi-Query key across all heads; the
+        # ``_sliding_window_attention`` helper internally broadcasts it over
+        # the ``nh`` dimension of ``q``.
         # Scale fix: pass the outer ``scale`` to keep the SW branch at the
         # same temperature as the dense branch. Both branches operate on
         # L2-normalized ``q`` and keys, so their raw dot products are cosine
