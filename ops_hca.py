@@ -233,8 +233,16 @@ def naive_hca(
         # Fully-masked rows (row_max = -inf) are handled by the
         # all_masked guard below.
         row_max = scores.amax(-1, keepdim=True)                    # [B, nh, T, 1]
-        shifted = scores - row_max                                  # [B, nh, T, n_blocks]
-        shifted_sink = log_sink - row_max                           # [B, nh, T, 1]
+        all_masked = torch.isneginf(row_max)                     # [B, nh, T, 1]
+        # Replace -inf row_max with 0 for fully-masked rows so that
+        # ``scores - row_max_safe`` does not produce NaNs (-inf - (-inf)).
+        # The resulting ``shifted`` for these rows remains all -inf, which
+        # safely exponentiates to 0. The ``all_masked`` mask is applied
+        # later to guarantee exact zeros and block NaN gradients in
+        # backward (exp(NaN) is NaN even if the forward output is masked).
+        row_max_safe = torch.where(all_masked, torch.zeros_like(row_max), row_max)
+        shifted = scores - row_max_safe                            # [B, nh, T, n_blocks]
+        shifted_sink = log_sink - row_max_safe                      # [B, nh, T, 1]
         lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
         log_denom = torch.logaddexp(lse, shifted_sink)              # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
@@ -247,7 +255,6 @@ def naive_hca(
         # previous ``torch.isinf`` also matched +inf, so a row containing
         # an overflowed +inf score alongside -inf masks would be wrongly
         # zeroed, silently dropping attention and gradients.
-        all_masked = torch.isneginf(row_max)                     # [B, nh, T, 1]
         p = p.masked_fill(all_masked, 0.0)
     else:
         # H2 fix: delegate to shared _nan_safe_softmax helper (defined in
