@@ -104,13 +104,13 @@ def _call_fla(
     fn = chunk_kda if use_chunk else fused_recurrent_kda
     # g_clamp_min is already applied once in kda_forward before dispatch;
     # do NOT apply it a second time here to avoid double-clamping.
-    # To prevent the FLA kernel from applying its own clamp, we omit
-    # g_clamp_min from the kwargs entirely when the caller's clamp has
-    # already been applied (i.e. when g_clamp_min is -inf, the sentinel
-    # meaning "no further clamp needed").  If the FLA kernel does not
-    # receive a g_clamp_min argument, it should use its own default
-    # (typically None or a large negative value), which we override by
-    # having already clamped g before dispatch.
+    # To prevent the FLA kernel from applying its own clamp, we explicitly
+    # pass g_clamp_min=-inf (the downstream sentinel meaning "no further
+    # clamp needed") to override the FLA kernel's default.  If the FLA
+    # kernel does not accept g_clamp_min, _supported_kwargs will filter it
+    # out and the kernel will use its own default; but for versions that do
+    # accept it, passing -inf ensures the kernel's internal clamp becomes a
+    # no-op, matching the reference implementation exactly.
     # Preserve the original ``scale`` value (including torch.Tensor) so that
     # gradients can flow back and device placement is retained.  Only convert
     # plain Python numbers when needed; do NOT detach/item() a tensor scale.
@@ -133,16 +133,13 @@ def _call_fla(
         "use_gate_in_kernel": False,
         "use_beta_sigmoid_in_kernel": False,
         "chunk_size": chunk_size,
+        # Always include g_clamp_min so that the FLA kernel uses the exact
+        # same clamp bound as the caller.  When the caller has already
+        # clamped g, g_clamp_min is -inf (the downstream sentinel); passing
+        # -inf to FLA overrides its default (typically -10.0) and makes the
+        # kernel's internal clamp a no-op, matching the reference path.
+        "g_clamp_min": g_clamp_min,
     }
-    # Only pass g_clamp_min to FLA if it is a finite value that the FLA
-    # kernel should apply.  When the caller's clamp has already been
-    # applied, g_clamp_min is -inf (the downstream sentinel); passing
-    # -inf to FLA could trigger assertions or NaN/Inf if the kernel uses
-    # it as a threshold rather than a simple clamp.  Omitting it lets FLA
-    # use its own default (typically None), and since g is already clamped
-    # the kernel's internal clamp becomes a no-op.
-    if g_clamp_min > -float('inf'):
-        kwargs["g_clamp_min"] = g_clamp_min
     result = fn(**_supported_kwargs(fn, kwargs))
     # Match the repository reference contract: outputs retain the caller's
     # value dtype, while recurrent state stays in compute precision (fp32 for
