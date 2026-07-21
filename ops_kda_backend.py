@@ -213,12 +213,11 @@ def kda_forward(
     if backend == "auto":
         use_fla = bool(q.is_cuda and fla_available())
 
-    if use_fla and not q.is_cuda:
-        raise RuntimeError(
-            "KDA backend 'fla' requires CUDA tensors; use "
-            "kda_backend='reference' for CPU experiments.")
-
     if use_fla:
+        if not q.is_cuda:
+            raise RuntimeError(
+                "KDA backend 'fla' requires CUDA tensors; use "
+                "kda_backend='reference' for CPU experiments.")
         try:
             return _call_fla(
                 q, k, v, g, beta,
