@@ -472,7 +472,7 @@ CSA — Compressed Sparse Attention
    Final output = sparse branch + sliding window branch.
 
 HCA — Heavily Compressed Attention
------------------------------------
+----------------------------------
 
 1. Single-branch heavy compression (Eq. 20–23):
    C = H @ W_KV                                    # [T, c]
@@ -579,4 +579,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
