@@ -151,22 +151,11 @@ class HeadwiseFusedAttention(nn.Module):
     Forward: x -> [LN -> headwise KDA|CSA|HCA -> concat -> o_proj] + residual.
     """
 
-    # Class-level default for the per-channel log-decay scale. Historically a
-    # magic 0.1 was hardcoded in 4 independent KDA instantiations
-    # (KDAHybridLayer, KDAAttn, KDAAttnDecoding, _kda_heads). Lifted to a
-    # named constant so all KDA modules share the same value. Mirrors
-    # HybridConfig.kda_decay_scale and run_quality.KDAAttn.DECAY_SCALE.
     DECAY_SCALE = 0.1
 
     def __init__(self, cfg: HeadwiseConfig):
         super().__init__()
         self.cfg = cfg
-        # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
-        # survive ``python -O`` / ``PYTHONOPTIMIZE=1`` — ``assert`` statements
-        # are silently stripped under optimization, which would let a
-        # misconfigured cfg slip through and crash deep inside __init__ with
-        # an opaque shape-mismatch error. Mirrors the convention established
-        # in ops_kda.py.
         if cfg.H_kda + cfg.H_csa + cfg.H_hca != cfg.H_total:
             raise ValueError(
                 f"H_kda({cfg.H_kda}) + H_csa({cfg.H_csa}) + H_hca({cfg.H_hca}) "
@@ -178,144 +167,67 @@ class HeadwiseFusedAttention(nn.Module):
                 f"head_dim={cfg.head_dim})")
         d, hd = cfg.d_model, cfg.head_dim
 
-        # KDA branch (H_kda heads).
         self.kda_q = nn.Linear(d, cfg.H_kda * hd, bias=False)
         self.kda_k = nn.Linear(d, cfg.H_kda * hd, bias=False)
         self.kda_v = nn.Linear(d, cfg.H_kda * hd, bias=False)
         self.kda_g = nn.Linear(d, cfg.H_kda * hd, bias=False)
         self.kda_beta = nn.Linear(d, cfg.H_kda, bias=False)
 
-        # CSA branch (H_csa heads) — simplified single-branch compression.
         self.csa_q = nn.Linear(d, cfg.H_csa * cfg.csa_c, bias=False)
         self.csa_kv = nn.Linear(d, cfg.csa_c, bias=False)
         self.csa_z = nn.Linear(d, cfg.csa_c, bias=False)
-        # Position bias shape must be [1, m, c] so it broadcasts correctly
-        # against the per-block chunked tensor [B, n_blocks, m, c] inside
-        # csa_compress_kv. A [m, c] tensor would misalign with n_blocks.
         self.csa_B = nn.Parameter(torch.randn(1, cfg.csa_m, cfg.csa_c) * 0.02)
 
-        # HCA branch (H_hca heads).
         self.hca_q = nn.Linear(d, cfg.H_hca * cfg.hca_c, bias=False)
         self.hca_kv = nn.Linear(d, cfg.hca_c, bias=False)
         self.hca_z = nn.Linear(d, cfg.hca_c, bias=False)
-        # Position bias shape must be [1, m2, c] so it broadcasts correctly
-        # against the per-block chunked tensor [B, n_blocks, m2, c] inside
-        # csa_compress_kv. A [m2, c] tensor would misalign with n_blocks.
         self.hca_B = nn.Parameter(torch.randn(1, cfg.hca_m2, cfg.hca_c) * 0.02)
 
         self.norm = nn.LayerNorm(d)
         self.o_proj = nn.Linear(cfg.H_total * hd, d, bias=False)
-        # Cosine-attention scale: ``q`` and ``C_comp`` are both L2-normalized
-        # inside ``_csa_heads`` / ``_hca_heads``, so their dot product is
-        # already a cosine similarity in ``[-1, 1]``. Standard cosine-attention
-        # uses ``softmax(q·k / τ)`` with ``τ = 1``. The previous value
-        # ``csa_c ** -0.5`` (e.g. 0.125 for c=16) further shrunk the scores,
-        # flattening softmax over the compressed blocks and turning attention
-        # into near-uniform averaging — defeating the purpose of compression.
         self.scale = 1.0
 
     def _kda_heads(self, x):
         B, T, d = x.shape
         H, hd = self.cfg.H_kda, self.cfg.head_dim
-        # View BEFORE normalize: F.normalize(dim=-1) must operate on each
-        # per-head hd-vector, not on the concatenated H*hd vector. The
-        # previous form ``F.normalize(F.silu(self.kda_q(x)), dim=-1).view(...)``
-        # L2-normalized the full H*hd vector, so each head's L2 norm became
-        # ~1/sqrt(H) instead of 1. This silently shrinks q·k dot products
-        # by a factor of 1/H, which propagates into the KDA recurrence as
-        # under-scaled delta-rule updates. Mirrors the (correct) CSA/HCA
-        # branches in _csa_heads / _hca_heads which view-then-normalize.
         q = F.normalize(F.silu(self.kda_q(x)).view(B, T, H, hd), dim=-1)
         k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
-        # log-space gate: g in (-inf, 0] so exp(g) in (0, 1] (per-channel
-        # fine-grained forget gate). The form ``-F.softplus(...) * DECAY_SCALE``
-        # equals ``-DECAY_SCALE * softplus(...)`` regardless of parenthesization
-        # (unary minus binds tighter than ``*`` in Python), matching the
-        # pattern in ops_fused.py::KDAHybridLayer and run_quality.py::KDAAttn.
-        # DECAY_SCALE (default 0.1) is a class-level constant so all KDA
-        # instantiations share the same value; mirrors
-        # HybridConfig.kda_decay_scale.
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
-        # beta is per-head (H outputs): naive_recurrent_kda expects beta as
-        # a rank-3 tensor [B, T, HV] (HV == H here since v is [B, T, H, hd]),
-        # and the KDA input validator (_validate_kda_inputs / _validate_kda_shapes
-        # in ops_kda.py) enforces beta.dim() == 3 with beta.shape[2] == HV.
-        # The internal recurrence body indexes beta[:, i] -> [B, HV] and
-        # unsqueezes the last dim itself to broadcast over the V (=hd) axis.
-        # Passing a rank-4 [B, T, H, 1] beta (as a previous version did)
-        # raises ValueError at the rank check and the whole forward crashes.
-        beta = torch.sigmoid(self.kda_beta(x))  # [B, T, H]  (rank 3)
+        beta = torch.sigmoid(self.kda_beta(x))
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
-        return o  # [B, T, H, hd]
+        return o
 
     def _csa_heads(self, x):
-        """CSA-style heads with single-branch compression + DENSE attention.
-
-        NOTE: This prototype uses DENSE attention over all compressed blocks
-        (no top-k sparse selection). The full CSA operator (ops_csa.py) adds
-        a lightning indexer that selects top-k blocks per query — that is
-        CSA's defining feature. The ``csa_topk`` field in HeadwiseConfig is
-        accepted for API symmetry but is NOT used here. For the headwise
-        prototype, dense attention is simpler and sufficient to demonstrate
-        the fusion API; see ``naive_csa`` for the faithful sparse CSA.
-        """
         B, T, d = x.shape
         H, c, m = self.cfg.H_csa, self.cfg.csa_c, self.cfg.csa_m
         pad = (-T) % m
         if pad:
-            # RIGHT-pad: real tokens keep original positions; only the last
-            # partial block contains padding zeros, and no real token
-            # attends to it (causal block mask). Left-padding corrupted
-            # block 0's compressed KV and silently changed real-token outputs.
             x = F.pad(x, (0, 0, 0, pad))
         Tp = x.shape[1]
         n_blocks = Tp // m
         C = self.csa_kv(x)
         Z = self.csa_z(x)
-        C_comp = csa_compress_kv(C, Z, self.csa_B, m)           # [B, n_blocks, c] in compute_dtype
+        C_comp = csa_compress_kv(C, Z, self.csa_B, m)
         C_comp_n = F.normalize(C_comp, dim=-1)
-        # Dtype: cast q to C_comp_n's dtype so the einsum doesn't crash on
-        # fp16/bf16 inputs (C_comp is fp32 from the compression function).
-        # Mirrors the fix in ops_csa.py::naive_csa and ops_hca.py::naive_hca.
-        # Reshape q to [B, H, Tp, c] to follow the standard multi-head
-        # attention layout (batch, head, time, dim) so the einsum dimension
-        # mapping is semantically clear and avoids subtle layout mismatches.
         q = F.normalize(self.csa_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, m, n_blocks, x.device)
         scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
-        # Rows with no valid block to attend to (e.g. the first block's
-        # queries under the causal block mask) are entirely -inf; softmax
-        # over them would yield NaN. Detect such rows and force their
-        # weights to 0 so the contribution is 0 instead of NaN
-        # (mirrors ops_hca.py::naive_hca).
-        all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)   # [B, H, T, 1]
+        all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        # Output einsum uses the UN-NORMALIZED C_comp (standard attention
-        # contract): scores are cosine similarities used as attention weights,
-        # but the value vectors must carry the actual compressed KV magnitude
-        # information — matching the CSA/HCA formulas in CSA_HCA_FORMULAS
-        # and the reference implementations in ops_csa.py::naive_csa /
-        # ops_hca.py::naive_hca. Using the normalized C_comp_n here would
-        # discard the magnitude of the compressed KV, breaking the standard
-        # attention semantics and diverging from the documented formulas.
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp)
         if pad:
             out = out[:, :T]
-        return out  # [B, T, H, c]
+        return out
 
     def _hca_heads(self, x):
         B, T, d = x.shape
         H, c, m2 = self.cfg.H_hca, self.cfg.hca_c, self.cfg.hca_m2
         pad = (-T) % m2
         if pad:
-            # RIGHT-pad: real tokens keep original positions; only the last
-            # partial block contains padding zeros, and no real token
-            # attends to it (causal block mask). Left-padding corrupted
-            # block 0's compressed KV and silently changed real-token outputs.
             x = F.pad(x, (0, 0, 0, pad))
         Tp = x.shape[1]
         n_blocks = Tp // m2
@@ -323,31 +235,14 @@ class HeadwiseFusedAttention(nn.Module):
         Z = self.hca_z(x)
         C_comp = csa_compress_kv(C, Z, self.hca_B, m2)
         C_comp_n = F.normalize(C_comp, dim=-1)
-        # Dtype: cast q to C_comp_n's dtype so the einsum doesn't crash on
-        # fp16/bf16 inputs (C_comp is fp32 from the compression function).
-        # Mirrors the fix in ops_csa.py::naive_csa and ops_hca.py::naive_hca.
-        # Reshape q to [B, H, Tp, c] to follow the standard multi-head
-        # attention layout (batch, head, time, dim) so the einsum dimension
-        # mapping is semantically clear and avoids subtle layout mismatches.
         q = F.normalize(self.hca_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, m2, n_blocks, x.device)
         scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
-        # Same all-masked-row guard as _csa_heads / ops_hca.py::naive_hca:
-        # the first block's queries have no preceding block to attend to,
-        # so their score rows are entirely -inf and softmax would yield NaN.
-        all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)   # [B, H, T, 1]
+        all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        # Output einsum uses the UN-NORMALIZED C_comp (standard attention
-        # contract): scores are cosine similarities used as attention weights,
-        # but the value vectors must carry the actual compressed KV magnitude
-        # information — matching the HCA formula in CSA_HCA_FORMULAS and the
-        # reference implementation in ops_hca.py::naive_hca. Using the
-        # normalized C_comp_n here would discard the magnitude of the
-        # compressed KV, breaking the standard attention semantics and
-        # diverging from the documented formula.
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp)
         if pad:
             out = out[:, :T]
@@ -356,26 +251,13 @@ class HeadwiseFusedAttention(nn.Module):
     def forward(self, x):
         B, T, d = x.shape
         h = self.norm(x)
-        # Run all three head groups in parallel, then concat along head dim.
-        # NOTE: head dims differ (KDA=hd, CSA=c, HCA=c). We project each to hd.
         hd = self.cfg.head_dim
-        kda_o = self._kda_heads(h)                                  # [B, T, H_kda, hd]
-        csa_o = self._csa_heads(h)                                  # [B, T, H_csa, c]
-        hca_o = self._hca_heads(h)                                  # [B, T, H_hca, c]
-        # If c != hd, we need a per-head projection. For the prototype we
-        # assert c == hd so concat is direct (checked in __init__).
-        #
-        # Dtype: KDA output is in x.dtype (naive_recurrent_kda casts back),
-        # but CSA/HCA outputs are in compute_dtype (fp32 for fp16 inputs)
-        # because the compression functions return fp32. Concatenating mixed
-        # dtypes promotes to fp32, which then crashes o_proj (fp16 weights)
-        # with ``RuntimeError: expected m1 and m2 to have the same dtype``.
-        # Cast all heads to x.dtype before concat so the entire forward runs
-        # in the caller's dtype. The internal fp32 computation in CSA/HCA is
-        # already done — this only affects the stored output precision.
+        kda_o = self._kda_heads(h)
+        csa_o = self._csa_heads(h)
+        hca_o = self._hca_heads(h)
         all_heads = torch.cat([
             kda_o.to(x.dtype), csa_o.to(x.dtype), hca_o.to(x.dtype)
-        ], dim=2)                                                   # [B, T, H_total, hd]
+        ], dim=2)
         return x + self.o_proj(all_heads.reshape(B, T, -1))
 
 
@@ -390,12 +272,6 @@ def demo_headwise_fusion():
                          head_dim=16, csa_m=4, csa_topk=4, hca_m2=8,
                          csa_c=16, hca_c=16)
     model = HeadwiseFusedAttention(cfg).to(device)
-    # Use eval() + no_grad() for this demo: the demo only checks output
-    # shape/finiteness, so building the autograd graph is pure waste (the
-    # graph would be retained on ``y`` until it goes out of scope). eval()
-    # also disables any future dropout/BN that might be added to
-    # HeadwiseFusedAttention, future-proofing the finiteness check.
-    # Mirrors the pattern in run_correctness.py::test_fused_hybrid.
     model.eval()
     x = (torch.randn(2, 32, 64, device=device) * 0.1)
     with torch.no_grad():
