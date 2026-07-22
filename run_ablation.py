@@ -160,7 +160,7 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
                 f"non-finite gradient at step {step} in {len(bad_grads)} "
                 f"params (ratio={ratio}, seed={seed}); aborting this seed "
                 f"to prevent NaN propagation into parameters")
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        torch.nn.utils.clip_grad_norm_(param_groups, 1.0)
         opt.step()
         losses.append(loss.item())
 
