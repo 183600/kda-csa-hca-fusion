@@ -58,20 +58,10 @@ def _selected_kda_backend() -> str:
     return validate_kda_backend(os.environ.get('KDA_BACKEND', 'reference'))
 
 
-# BQ4 fix: side channel for variance stats (min/max/std). The ``_bench``
-# function returns only (median, peak_mb) for backwards compatibility;
-# we stash the full timing list + min/max/std here so callers can attach
-# them to the result JSON for variance-aware comparison.
 _LAST_TIMING_STATS: dict = {}
 
 
 def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
-    # P0 determinism fix: accept an optional ``generator`` so callers can
-    # seed the input construction. Without a generator, two runs of
-    # ``BENCH_REPEATS=5`` at the same T could produce medians that differ by
-    # a few percent purely from input noise — making the cross-run comparison
-    # unreliable. The bench factories below pass a seeded ``torch.Generator``
-    # keyed on (op, T) so the same T always sees the same inputs across runs.
     t = torch.randn(*shape, device=device, dtype=dtype, generator=generator)
     return t * scale
 
@@ -79,21 +69,13 @@ def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
 def _make_op_gen(op_name, T, device):
     """Build a seeded ``torch.Generator`` keyed on (op_name, T).
 
-    P0-2 fix: the previous implementation used ``hash(op_name)``, which
-    CPython randomizes per-process via PYTHONHASHSEED (default on since
-    Python 3.3). That made the "same (op, T) pair produces same inputs"
-    contract in the docstring silently false — two runs got different
-    seeds and therefore different inputs, defeating the determinism
-    goal. We switch to ``zlib.crc32`` which is a stable, process-
-    independent hash of the byte string, so the seed is reproducible
-    without any env-var cooperation.
+    Uses ``zlib.crc32`` which is a stable, process-independent hash of the
+    byte string, so the seed is reproducible without any env-var cooperation.
 
-    P2-1 fix (round 3): older torch / CPU-only builds don't support
-    ``torch.Generator(device='cuda')`` (raises RuntimeError). Fall back
-    to a CPU generator in that case; ``torch.randn(..., device='cuda',
-    generator=cpu_gen)`` is supported and still produces reproducible
-    (CPU-seeded, then GPU-materialized) draws. Without this fallback a
-    user on a CPU-only torch would crash Exp2 immediately.
+    Older torch / CPU-only builds don't support ``torch.Generator(device='cuda')``
+    (raises RuntimeError). Fall back to a CPU generator in that case;
+    ``torch.randn(..., device='cuda', generator=cpu_gen)`` is supported and
+    still produces reproducible (CPU-seeded, then GPU-materialized) draws.
     """
     name_hash = zlib.crc32(op_name.encode('utf-8')) & 0xFFFFFFFF
     t_hash = (T * 2654435761) & 0xFFFFFFFF
@@ -126,7 +108,8 @@ def _measure(fn, repeats, device):
     if device.type == 'cuda':
         # Warmup
         for _ in range(min(2, repeats)):
-            fn()
+            out = fn()
+            del out
         torch.cuda.synchronize()
         # Reset peak memory stats AFTER warmup so the reported peak reflects
         # only the timed region's activations, NOT the warmup allocations.
@@ -146,32 +129,21 @@ def _measure(fn, repeats, device):
         times = []
         for _ in range(repeats):
             start.record()
-            fn()
+            out = fn()
             end.record()
             end.synchronize()
             # elapsed_time returns milliseconds; convert to seconds to
             # preserve the (seconds, MB) contract of this function.
             times.append(start.elapsed_time(end) / 1000.0)
+            del out
         peak_bytes = torch.cuda.max_memory_allocated(device)
         peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
-        # BQ4 fix: also stash min / max / std so downstream consumers can
-        # judge the variance of the measurement. ``BENCH_REPEATS=5`` has
-        # non-trivial uncertainty on a median alone; reporting the spread
-        # makes regressions easier to distinguish from noise. We stash
-        # them on a module-level dict so the existing (median, peak_mb)
-        # return contract is unchanged; callers can read the extra stats
-        # via ``_LAST_TIMING_STATS`` after a ``_bench`` call.
         _LAST_TIMING_STATS['times'] = list(times)
         _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
         _LAST_TIMING_STATS['max_ms'] = (max(times) * 1000.0) if times else 0.0
         _LAST_TIMING_STATS['std_ms'] = (
             (statistics.stdev(times) * 1000.0) if len(times) >= 2 else 0.0
         )
-        # ``statistics.median`` averages the two middle values for even-length
-        # lists; the previous ``sorted(times)[len(times)//2]`` returned the
-        # upper-middle element, which biased the reported latency upward
-        # whenever ``repeats`` was even. (Currently masked because the caller
-        # uses repeats=3, but the bug would surface on any even-repeat run.)
         # Guard against repeats=0: ``statistics.median([])`` raises
         # ``StatisticsError``. Returns 0.0 so the JSON row is well-formed.
         return (statistics.median(times) if times else 0.0), peak_mb
@@ -194,37 +166,19 @@ def _measure(fn, repeats, device):
         # data") rather than a misleading 0.0. On GPU we report the real
         # ``torch.cuda.max_memory_allocated`` (with baseline subtraction).
         gc.collect()
-        # BQ7 fix + P1-1 fix (round 5): pin torch intra-op AND inter-op
-        # threads on CPU so the OpenMP/MKL pools don't dynamically resize
-        # between runs. PyTorch's default ``get_num_threads()`` adapts to
-        # load, which made the same op's measured latency drift by 2-3x
-        # between runs; pinning both to 1 gives a stable, conservative
-        # measurement (real multi-threaded production latency will be
-        # lower, not higher). We also set OMP/MKL env vars in case any
-        # underlying BLAS library reads them at launch (best-effort;
-        # setting them after torch import has no effect on already-loaded
-        # libraries, but pinning via the torch APIs is the authoritative
-        # step).
         _prev_threads = torch.get_num_threads()
-        # Do NOT call set_num_interop_threads here. PyTorch permits changing
-        # the inter-op pool only once and only before parallel work starts;
-        # doing it for every operator made the second CPU measurement fail
-        # with "cannot set number of interop threads after parallel work has
-        # started". main() pins that process-global setting once, before any
-        # benchmark factory or warmup runs. Intra-op threads may be adjusted
-        # around each measurement and safely restored.
         torch.set_num_threads(1)
         try:
             times = []
             for _ in range(repeats):
                 t0 = time.perf_counter()
-                fn()
+                out = fn()
                 t1 = time.perf_counter()
                 times.append(t1 - t0)
+                del out
         finally:
             torch.set_num_threads(_prev_threads)
         peak_mb = None  # CPU peak memory is not reliably measurable
-        # BQ4 fix (CPU path): stash min/max/std too.
         _LAST_TIMING_STATS['times'] = list(times)
         _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
         _LAST_TIMING_STATS['max_ms'] = (max(times) * 1000.0) if times else 0.0
@@ -235,11 +189,6 @@ def _measure(fn, repeats, device):
 
 
 def bench_softmax_attn(B, T, H, K, V, device):
-    # P0 determinism fix: seed the input generator so the same (op, T) pair
-    # produces the same inputs across runs. Previously the unseeded
-    # ``torch.randn`` made the median latency drift by a few percent between
-    # runs, obscuring real regressions. The seed is deterministic (hash of
-    # op name + T) so it is reproducible without needing an env var.
     gen = _make_op_gen('softmax', T, device)
     q = _rand(B, T, H, K, device=device, generator=gen)
     k = _rand(B, T, H, K, device=device, generator=gen)
@@ -267,7 +216,6 @@ def bench_softmax_attn(B, T, H, K, V, device):
 
 
 def bench_kda_recurrent(B, T, H, K, V, device):
-    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
     gen = _make_op_gen('kda_rec', T, device)
     q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
     k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
@@ -288,7 +236,6 @@ def bench_kda_recurrent(B, T, H, K, V, device):
 
 
 def bench_kda_chunk(B, T, H, K, V, device):
-    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
     gen = _make_op_gen('kda_chunk', T, device)
     q = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
     k = torch.nn.functional.normalize(_rand(B, T, H, K, device=device, generator=gen), dim=-1)
@@ -297,16 +244,7 @@ def bench_kda_chunk(B, T, H, K, V, device):
     beta = torch.rand(B, T, H, device=device, generator=gen) * 0.2
     backend = _selected_kda_backend()
     BT = 64
-    # NOTE: ``naive_chunk_kda`` already right-pads T up to a multiple of
-    # ``chunk_size`` internally and returns ``o[:, :original_T]``. The previous
-    # version of this bench duplicated that padding *and* then trimmed with
-    # ``o[:T]``, which slices dim=0 (batch) instead of dim=1 (sequence) — the
-    # same class of bug that was fixed in ``ops_fused.py`` and
-    # ``run_quality.py::CSAAttn.forward``. For B=1 the wrong slice happened to
-    # return the full tensor so the benchmark kept working, but for B>1 it
-    # silently corrupted results, and for any B the reported timing reflected
-    # the padded length rather than T. We now let ``naive_chunk_kda`` handle
-    # padding end-to-end and just time it directly.
+
     def fn():
         with torch.no_grad():
             o, s = kda_forward(
@@ -316,14 +254,6 @@ def bench_kda_chunk(B, T, H, K, V, device):
                 use_chunk=True,
                 backend=backend,
             )
-            # P1 fix: assert the output sequence dimension matches T. The
-            # previous version had a slicing bug (``o[:T]`` sliced dim=0
-            # batch instead of dim=1 sequence) that was fixed by letting
-            # ``naive_chunk_kda`` handle padding end-to-end. This assert
-            # pins the fix so a future regression (e.g. accidentally
-            # reintroducing the wrong slice, or a chunk-size change that
-            # breaks the padding contract) is caught immediately rather
-            # than silently corrupting the benchmark numbers.
             assert o.shape[1] == T, (
                 f"naive_chunk_kda output shape {tuple(o.shape)} does not "
                 f"match input T={T} on dim=1 (sequence). The chunk path "
@@ -338,17 +268,12 @@ def bench_kda_chunk(B, T, H, K, V, device):
 def bench_csa(B, T, d, device):
     m, topk = 8, 4
     nh, c, dc, nIh, cI = 4, 16, 32, 2, 8
-    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
     gen = _make_op_gen('csa', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
         m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
         sliding_window=8, sink_logits=torch.zeros(nh, device=device),
-        # Inference benchmark: STE is training-only and forward-equivalent;
-        # disabling it avoids measuring the extra soft surrogate path.
         use_ste=False,
-        # Match the cosine-style indexer contract used by the quality / hybrid
-        # experiments after the normalization fix.
         normalize_qk=True,
     )
     weights = dict(
@@ -365,15 +290,12 @@ def bench_csa(B, T, d, device):
     def fn():
         with torch.no_grad():
             out = naive_csa(H, **weights, **cfg)
-            # Count the grouped output projection so the benchmark boundary
-            # really is end-to-end single-layer (matching the JSON metadata).
             return torch.nn.functional.linear(out, W_O)
     return fn
 
 
 def bench_hca(B, T, d, device):
     m2, nh, c, dc = 16, 4, 16, 32
-    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
     gen = _make_op_gen('hca', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
@@ -390,14 +312,11 @@ def bench_hca(B, T, d, device):
     def fn():
         with torch.no_grad():
             out = naive_hca(H, **weights, **cfg)
-            # Count the grouped output projection so the benchmark boundary
-            # really is end-to-end single-layer (matching the JSON metadata).
             return torch.nn.functional.linear(out, W_O)
     return fn
 
 
 def bench_hybrid(B, T, d, device):
-    # P0 determinism fix: seed inputs (mirrors bench_softmax_attn).
     gen = _make_op_gen('hybrid', T, device)
     cfg = HybridConfig(
         d_model=d, n_heads_qk=2, n_heads_v=2,
@@ -410,18 +329,6 @@ def bench_hybrid(B, T, d, device):
     )
     model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
     x = _rand(B, T, d, device=device, generator=gen)
-    # Reset KDA recurrent state before each fn() call so that warmup and
-    # timed repeats start from the same fresh state. Without this, the KDA
-    # state grows across repeats — for latency this is O(1) per layer so
-    # the timing impact is negligible, but for peak-memory measurement the
-    # retained state tensors would be double-counted across repeats,
-    # inflating the reported memory footprint.
-    # NOTE: torch.no_grad() must live INSIDE fn(). A `with torch.no_grad():`
-    # block wrapping the `def fn():` only disables grad for the duration of
-    # the function definition, not for later calls — the context manager
-    # state is global and is restored as soon as the `with` block exits.
-    # Putting it outside (the previous form) silently built the autograd
-    # graph during benchmarking, inflating both latency and peak memory.
     def fn():
         with torch.no_grad():
             model.reset_state()
@@ -430,17 +337,11 @@ def bench_hybrid(B, T, d, device):
 
 
 def main():
-    # configure_torch_for_device() pins the process-global inter-op pool once,
-    # before benchmark work starts. _measure() must never change it per op.
     info = configure_torch_for_device()
     device = info.device
     logger.info('=' * 70)
     logger.info(f'Experiment 2: Latency & Memory Benchmark ({device})')
     logger.info('=' * 70)
-    # Original paper text mentioned {128, 256, 512, 1024, 2048} but the table
-    # omitted 256. We include all advertised lengths.
-    # Override via the BENCH_LENGTHS env var (comma-separated) — used by
-    # run_all.py's SKIP_SLOW path to truncate the sweep on CPU.
     default_lengths = '128,256,512,1024,2048'
     raw = os.environ.get('BENCH_LENGTHS', default_lengths)
     try:
@@ -453,8 +354,6 @@ def main():
     if any(t < 1 for t in seq_lengths):
         raise ValueError(
             f'BENCH_LENGTHS must contain positive sequence lengths, got {seq_lengths!r}')
-    # Deduplicate while preserving user order; duplicate lengths would produce
-    # repeated rows and overweight those points in downstream summaries/plots.
     seq_lengths = list(dict.fromkeys(seq_lengths))
     logger.info(f'[run_benchmark] seq_lengths = {seq_lengths}')
     B, H, K, V, d = 1, 4, 32, 32, 64
@@ -467,25 +366,6 @@ def main():
         ('hca',      lambda T: bench_hca(B, T, d, device)),
         ('hybrid',   lambda T: bench_hybrid(B, T, d, device)),
     ]
-    # P1-1 fix: record the compute boundary and layer count for each op
-    # so downstream consumers (figures, reports) can distinguish fair
-    # comparisons from unfair ones. The previous benchmark mixed:
-    #
-    #   * softmax / kda_rec / kda_chunk: "core" — only the attention /
-    #     recurrence kernel is timed, with q/k/v (and g/beta for KDA)
-    #     pre-projected outside the timed region.
-    #   * csa / hca: "end_to_end_single_layer" — timing starts from the
-    #     hidden state ``H`` and includes the input projections
-    #     (W_aKV, W_DQ, W_UQ, ...), compression, indexer, sparse
-    #     attention, and the output projection.
-    #   * hybrid: "end_to_end_multi_layer" — a full 5-layer stack with
-    #     LayerNorm, projections, attention, and state management.
-    #
-    # These numbers are NOT directly comparable as "operator latency"
-    # because the compute boundary differs. Recording the boundary
-    # explicitly lets the figure caption warn the reader and lets a
-    # future fair-comparison benchmark (same boundary for all ops) be
-    # added without breaking the historical data.
     op_boundary = {
         'softmax':   {'compute_boundary': 'core',
                       'n_layers': 1,
@@ -508,19 +388,6 @@ def main():
     }
 
     results = []
-    # Number of timed repeats per (T, op). The previous value of 3 gave a
-    # noisy single-point estimate; with median aggregation across 5 repeats
-    # (and min/max kept implicit in the underlying times list) the reported
-    # number is meaningfully more stable. We keep the count modest so the
-    # full sweep (5 seq_lengths x 6 ops x repeats) stays under a few minutes
-    # on a Kaggle T4. Override via the ``BENCH_REPEATS`` env var.
-    # Parse BENCH_REPEATS defensively: the sibling BENCH_LENGTHS env var is
-    # already wrapped in try/except with a graceful fallback, but BENCH_REPEATS
-    # was a bare ``int()`` that crashed the whole benchmark on malformed input
-    # like ``BENCH_REPEATS=abc`` or ``BENCH_REPEATS=5.0``. Use the shared
-    # ``parse_int_env`` helper so the robustness contract is identical across
-    # BENCH_REPEATS / BENCH_LENGTHS here AND MQAR_SEEDS / ABL_SEEDS / etc in
-    # the sibling experiment runners (single source of truth for the pattern).
     n_repeats = parse_int_env('BENCH_REPEATS', 5, min_value=1, logger=logger)
     for T in seq_lengths:
         logger.info(f'\n-- T = {T} --')
@@ -528,41 +395,24 @@ def main():
             try:
                 _clear_cache(device)
                 fn = factory(T)
-                # warmup (counted in _measure on GPU; explicit here for CPU)
                 if device.type != 'cuda':
                     fn()
                 t, mem = _measure(fn, repeats=n_repeats, device=device)
-                # P1-1 fix: include the compute boundary metadata so
-                # downstream consumers know which ops are comparable.
-                # Without this, a reader comparing softmax's "core" time
-                # to hybrid's "5-layer end-to-end" time would draw
-                # wrong conclusions about operator efficiency.
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
                 if name in {'kda_rec', 'kda_chunk', 'hybrid'}:
                     row['kda_backend'] = _selected_kda_backend()
                 if name in {'csa', 'hybrid'}:
                     row['csa_indexer_normalize_qk'] = True
-                    # ``torch.no_grad()`` gates off the STE surrogate in
-                    # naive_csa, so the timed region measures hard top-k
-                    # inference rather than the training proxy.
                     row['csa_ste_in_timed_region'] = False
-                # BQ4 fix: attach variance stats from the side channel.
                 row['time_min_ms'] = _LAST_TIMING_STATS.get('min_ms')
                 row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
                 row['time_std_ms'] = _LAST_TIMING_STATS.get('std_ms')
                 row.update(op_boundary[name])
                 results.append(row)
-                # mem may be None on CPU (unreliable RSS sampling); render
-                # as 'n/a' instead of crashing on ``f'{None:8.2f}'``.
                 mem_str = f'{mem:8.2f} MB' if mem is not None else '     n/a'
                 print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem_str}')
             except Exception as e:
-                # Include null fields for the keys present on success rows so
-                # downstream JSON consumers can do ``row['time_ms']`` without
-                # a KeyError on error rows. Missing keys vs explicit null
-                # matters: pandas read_json treats missing keys as NaN only
-                # if the column exists in at least one row.
                 err_row = {
                     'T': T, 'op': name, 'error': str(e),
                     'device': str(device),
@@ -576,32 +426,11 @@ def main():
                 if name in {'csa', 'hybrid'}:
                     err_row['csa_indexer_normalize_qk'] = True
                     err_row['csa_ste_in_timed_region'] = False
-                # P1-1 fix: also annotate error rows with the boundary
-                # metadata so the figure loader can still group them.
                 err_row.update(op_boundary[name])
                 results.append(err_row)
                 logger.error(f'  {name:12s}  ERROR: {e}')
 
     os.makedirs('results', exist_ok=True)
-    # Write strict JSON (allow_nan=False): if a benchmark row's ``time_ms``
-    # became non-finite (e.g. a CUDA event glitch producing inf, or a future
-    # code path that returns float('nan') on a degenerate input), Python's
-    # default json.dump would emit literal ``NaN``/``Infinity`` tokens that
-    # are INVALID JSON per RFC 8259 and break strict parsers (JS
-    # ``JSON.parse``, jq, pandas with ``orient='records'``). The sibling
-    # runners (run_kv_cache.py, run_decoding.py, run_quality.py,
-    # run_ablation.py) all already use this pattern; this closes the
-    # consistency gap.
-    #
-    # CRITICAL: serialize to a STRING first, then write the string. The
-    # previous ``json.dump(results, f, indent=2)`` (default allow_nan=True)
-    # wrote directly to the file, so a NaN mid-stream left a partial JSON
-    # document. Mirrors the atomicity fix in run_quality.py::main /
-    # run_ablation.py::main.
-    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
-    # os.replace) so a process kill or disk-full mid-write leaves the
-    # target file as the OLD version (or absent) rather than a truncated
-    # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
     try:
         write_json_atomic(results, 'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
@@ -610,8 +439,6 @@ def main():
         write_json_atomic(sanitize_for_json(results),
                           'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
-    # BQ8 fix: write a sibling provenance JSON so the result file is
-    # self-describing (torch version, GPU, git commit, env vars).
     try:
         write_json_atomic(capture_provenance(),
                           'results/exp2_benchmark_provenance.json',
@@ -619,13 +446,6 @@ def main():
     except Exception as e:
         logger.warning(f'failed to write provenance: {e}')
     logger.info('\nSaved: results/exp2_benchmark.json')
-    # P0-2 fix: return non-zero if any (T, op) cell errored out, so
-    # ``run_all._run`` records the experiment as ``status='fail'`` instead of
-    # silently treating a partial run as success. The previous ``main()``
-    # implicitly returned ``None`` even when every op at every T crashed,
-    # which combined with ``run_all._run``'s ``None == success`` contract
-    # produced a green summary on a fully-red experiment. Returning 1 forces
-    # the failure to propagate to ``run_all``'s summary and exit code.
     n_errors = sum(1 for r in results if 'error' in r)
     if n_errors:
         logger.error(
