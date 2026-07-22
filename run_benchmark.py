@@ -204,7 +204,7 @@ def bench_softmax_attn(B, T, H, K, V, device):
     # allocation overhead in their bench wrappers).
     causal_mask = torch.triu(
         torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
-    )
+    ).view(1, 1, T, T)
 
     def fn():
         with torch.no_grad():
