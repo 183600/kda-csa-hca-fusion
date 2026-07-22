@@ -171,8 +171,41 @@ def naive_hca(
             C_local_raw = F.linear(H, W_KV_local)                   # [B, T, c]
         else:
             C_local_raw = C
+        # P0 fix: pass a 3-D ``[B, T, c]`` tensor to ``_sliding_window_attention``,
+        # NOT a 4-D ``[B, T, nh, c]`` broadcast. The helper's signature
+        # documents ``C_local: [B, T, c]`` and it expands the per-head
+        # dimension inline via its einsum
+        # (``'b t h d, b t w d -> b t h w'``). The previous code did
+        # ``C_local.unsqueeze(2).expand(-1, -1, nh, -1)`` before calling,
+        # producing a 4-D tensor whose ``unfold``-slice became 5-D and made
+        # the subsequent ``.permute(0, 1, 3, 2)`` mismatch dimensions
+        # (``input.dim()=5``, ``len(dims)=4``) and raise ``RuntimeError``
+        # for every HCA forward that actually entered the sliding-window
+        # branch (sliding_window > 0):
+        #
+        #   RuntimeError: permute(sparse_coo): number of dimensions in the
+        #   tensor input does not match the length of the desired ordering
+        #   of dimensions i.e. input.dim() = 5 is not equal to len(dims) = 4
+        #
+        # This bug broke HCA's sliding-window branch entirely and therefore
+        # broke every downstream experiment that exercised it (`run_quality`
+        # ``HCAAttn`` with ``hca_sliding_window=4``, `run_benchmark`
+        # ``bench_hca`` with ``sliding_window=8``, the Exp 5 ablation's HCA
+        # sub-layers, the Exp 6 hybrid decoding stack, and the LM training
+        # pipeline), as well as the canonical regression test
+        # ``test_hca_sliding_window_causality`` in ``run_correctness.py``.
+        # Callers that previously guarded HCA behind ``sliding_window=0``
+        # (Exp 3's analytic-only path) happened not to enter the broken
+        # branch, which is why those experiments produced numbers at all —
+        # the silent regression was hidden by avoiding the crashing path.
+        #
+        # The matching CSA call site (``ops_csa.py::naive_csa``) already
+        # passes the 3-D ``[B, T, c]`` form to the same helper (it never
+        # had this bug), which is the canonical contract. The helper's
+        # einsum pattern is identical for both operators, so broadcasting
+        # per-head is redundant; passing the 3-D tensor restores numerical
+        # equivalence with the (working) pre-bug implementation.
         C_local = F.normalize(C_local_raw.to(compute_dtype), dim=-1)  # [B, T, c]
-        C_local = C_local.unsqueeze(2).expand(-1, -1, nh, -1)        # [B, T, nh, c]
         sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 

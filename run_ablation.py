@@ -160,7 +160,28 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
                 f"non-finite gradient at step {step} in {len(bad_grads)} "
                 f"params (ratio={ratio}, seed={seed}); aborting this seed "
                 f"to prevent NaN propagation into parameters")
-        torch.nn.utils.clip_grad_norm_(param_groups, 1.0)
+        # P0 fix: clip over the FLATTENED parameter list (``params``),
+        # NOT over ``param_groups`` (a list of dicts). ``clip_grad_norm_``
+        # expects an iterable of ``torch.Tensor`` parameters; passing the
+        # group-of-dicts raises ``AttributeError: 'dict' object has no
+        # attribute 'grad'`` because ``clip_grad_norm_`` does
+        # ``parameters = list(parameters)`` then iterates each element
+        # calling ``.grad`` on it. ``run_quality.py`` (line 967) already
+        # passes the flat list — this site was the lone outlier.
+        #
+        # The previous crash was masked behind the HCA sliding-window
+        # ``permute`` bug fixed above: the ablation training loop crashed
+        # inside ``HybridKCHAttention.forward`` -> ``naive_hca`` -> the
+        # sliding-window branch BEFORE execution ever reached this line,
+        # so the ``AttributeError`` was unreachable and silently hid. With
+        # the HCA SW crash fixed, this would raise on the first step —
+        # which is the moment to fix it too. Exp 5 (and any other caller
+        # of ``eval_layout``) now trains instead of silently erroring on
+        # every seed (the per-seed ``try/except`` in
+        # ``eval_layout_multi_seed`` would otherwise record a stub row
+        # with ``error='dict object has no attribute grad'`` and the whole
+        # ablation experiment would report zero usable accuracies).
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
 
