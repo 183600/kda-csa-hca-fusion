@@ -211,7 +211,7 @@ class HeadwiseFusedAttention(nn.Module):
         C_comp = csa_compress_kv(C, Z, self.csa_B, m)
         C_comp_n = F.normalize(C_comp, dim=-1)
         q = F.normalize(self.csa_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
-        cbm = _causal_block_mask(Tp, m, n_blocks, x.device)
+        cbm = _causal_block_mask(Tp, n_blocks, m, x.device)
         scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
@@ -236,7 +236,7 @@ class HeadwiseFusedAttention(nn.Module):
         C_comp = csa_compress_kv(C, Z, self.hca_B, m2)
         C_comp_n = F.normalize(C_comp, dim=-1)
         q = F.normalize(self.hca_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
-        cbm = _causal_block_mask(Tp, m2, n_blocks, x.device)
+        cbm = _causal_block_mask(Tp, n_blocks, m2, x.device)
         scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
@@ -256,7 +256,9 @@ class HeadwiseFusedAttention(nn.Module):
         csa_o = self._csa_heads(h)
         hca_o = self._hca_heads(h)
         all_heads = torch.cat([
-            kda_o.to(x.dtype), csa_o.to(x.dtype), hca_o.to(x.dtype)
+            kda_o.reshape(B, T, -1).to(x.dtype),
+            csa_o.reshape(B, T, -1).to(x.dtype),
+            hca_o.reshape(B, T, -1).to(x.dtype)
         ], dim=2)
         return x + self.o_proj(all_heads.reshape(B, T, -1))
 
@@ -455,4 +457,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
