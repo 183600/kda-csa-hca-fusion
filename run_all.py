@@ -308,12 +308,10 @@ def run_all(seeds=None, steps=None):
         if steps is not None:
             os.environ['MQAR_STEPS'] = str(steps)
             # Ablation (Exp 5) sweeps multiple KDA:CSA:HCA ratios, each trained
-            # across ABL_SEEDS seeds. Total cost is n_ratios * n_seeds * steps,
-            # far larger than the single-track MQAR run, so halve the per-run
-            # step count (floored at 50 — the ablation doc's convergence minimum)
-            # to keep wall-clock tractable without regressing to the old 25-step
-            # under-trained regime.
-            os.environ['ABL_STEPS'] = str(max(50, steps // 2))
+            # across ABL_SEEDS seeds. Keep the per-run step count synchronized
+            # with the MQAR run so the cross-experiment comparison remains fair
+            # and the caller's explicit ``steps`` budget is honored uniformly.
+            os.environ['ABL_STEPS'] = str(steps)
 
         os.makedirs('results', exist_ok=True)
         os.makedirs('figures', exist_ok=True)
