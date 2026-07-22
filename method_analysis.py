@@ -284,7 +284,7 @@ class HeadwiseFusedAttention(nn.Module):
         q = F.normalize(self.csa_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, m, n_blocks, x.device)
         scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
-        scores = scores.masked_fill(~cbm[None, None], float('-inf'))
+        scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         # Rows with no valid block to attend to (e.g. the first block's
         # queries under the causal block mask) are entirely -inf; softmax
         # over them would yield NaN. Detect such rows and force their
@@ -332,7 +332,7 @@ class HeadwiseFusedAttention(nn.Module):
         q = F.normalize(self.hca_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, m2, n_blocks, x.device)
         scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
-        scores = scores.masked_fill(~cbm[None, None], float('-inf'))
+        scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         # Same all-masked-row guard as _csa_heads / ops_hca.py::naive_hca:
         # the first block's queries have no preceding block to attend to,
         # so their score rows are entirely -inf and softmax would yield NaN.
@@ -579,3 +579,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
