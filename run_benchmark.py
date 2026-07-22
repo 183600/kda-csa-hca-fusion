@@ -310,7 +310,7 @@ def bench_hca(B, T, d, device):
     weights = dict(
         W_KV=_rand(c, d, device=device, generator=gen), W_Z=_rand(c, d, device=device, generator=gen),
         B_pos=_rand(m2, c, device=device, generator=gen),
-        W_DQ=_rand(dc, d, device=device, generator=gen), W_UQ=_rand(c * nh, dc, device=device, generator=gen),
+        W_DQ=_rand(dc, d, device=device, generator=gen), W_UQ=_rand(dc, c * nh, device=device, generator=gen),
     )
     W_O = _rand(d, nh * c, device=device, generator=gen)
 
