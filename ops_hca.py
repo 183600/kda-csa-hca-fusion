@@ -351,9 +351,7 @@ def naive_hca(
         # helper internally multiplies the scores by the ``scale`` argument
         # it receives, so passing the outer ``scale`` here applies the same
         # temperature to the SW branch as the dense branch already uses.
-        q_flat = q.reshape(B_, T, nh * c)
-        sw_out = _sliding_window_attention(q_flat, C_local, win, scale, device)
-        sw_out = sw_out.view(B_, T, nh, c)
+        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
         out = out + sw_out
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
