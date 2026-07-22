@@ -101,21 +101,10 @@ def _call_fla(
 ):
     chunk_kda, fused_recurrent_kda = _load_fla_ops()
     fn = chunk_kda if use_chunk else fused_recurrent_kda
-    # g_clamp_min is already applied once in kda_forward before dispatch;
-    # do NOT apply it a second time here to avoid double-clamping.
-    # We pass the original g_clamp_min to the FLA kernel.  Because g has
-    # already been clamped to [g_clamp_min, inf) in kda_forward, the FLA
-    # kernel's internal clamp with the same bound is a strict no-op, so
-    # there is no double-clamping side effect.  Passing -inf as a sentinel
-    # is unsafe because the FLA Triton kernel may compute exp(g_clamp_min),
-    # yielding 0.0 or NaN and corrupting the delta-rule state update.
     # Preserve the original ``scale`` value (including torch.Tensor) so that
     # gradients can flow back and device placement is retained.  Only convert
     # plain Python numbers when needed; do NOT detach/item() a tensor scale.
-    if isinstance(scale, torch.Tensor):
-        scale_value = scale
-    else:
-        scale_value = scale
+    scale_value = scale
 
     kwargs: dict[str, Any] = {
         "q": q,
