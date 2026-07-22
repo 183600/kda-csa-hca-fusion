@@ -159,7 +159,7 @@ def naive_hca(
         p_sink = (shifted_sink - log_denom).exp()                 # [B, nh, T, 1]
         p_sink = p_sink.masked_fill(all_masked, 0.0)
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
-        out = out + p_sink.permute(0, 2, 1, 3)
+        out = out + p_sink.permute(0, 2, 1, 3).expand_as(out)
     else:
         p = _nan_safe_softmax(scores, dim=-1)
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
