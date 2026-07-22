@@ -207,7 +207,10 @@ def main():
                 batch = next(it)
             except StopIteration:
                 it = iter(loader)
-                batch = next(it)
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    break
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
@@ -229,6 +232,12 @@ def main():
             accum_loss += float(raw_loss.detach().item())
             accum_batches += 1
             micro_step += 1
+
+        if accum_batches == 0:
+            break
+
+        if accum_batches < grad_accum:
+            continue
 
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
