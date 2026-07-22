@@ -194,7 +194,7 @@ class HeadwiseFusedAttention(nn.Module):
         k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
-        beta = torch.sigmoid(self.kda_beta(x))
+        beta = torch.sigmoid(self.kda_beta(x)).view(B, T, H, 1)
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return o
 
@@ -218,7 +218,7 @@ class HeadwiseFusedAttention(nn.Module):
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp)
+        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp_n)
         if pad:
             out = out[:, :, :T]
         return out
@@ -243,7 +243,7 @@ class HeadwiseFusedAttention(nn.Module):
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp)
+        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp_n)
         if pad:
             out = out[:, :, :T]
         return out
