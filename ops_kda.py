@@ -390,8 +390,8 @@ def _chunk_kda_prepare(
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]
-        g_i = g[..., i:i+1, :]
-        g_diff = (g - g_i).clamp(max=50.0)
+        g_i = g[..., i, :]
+        g_diff = (g - g_i.unsqueeze(-2)).clamp(max=50.0)
         A[..., i] = (k * g_diff.exp() * k_i.unsqueeze(-2)).sum(-1)
     A = A * beta[..., None]
     A = -A.masked_fill(mask, 0)
