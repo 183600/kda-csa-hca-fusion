@@ -386,7 +386,7 @@ def _chunk_kda_prepare(
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
+    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]
