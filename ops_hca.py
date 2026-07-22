@@ -158,12 +158,11 @@ def naive_hca(
         p = p.masked_fill(all_masked, 0.0)
         p_sink = (shifted_sink - log_denom).exp()                 # [B, nh, T, 1]
         p_sink = p_sink.masked_fill(all_masked, 0.0)
-        p_sink = p_sink.transpose(1, 2)                            # [B, T, nh, 1]
+        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
+        out = out + p_sink.transpose(1, 2)
     else:
         p = _nan_safe_softmax(scores, dim=-1)
-    out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
-    if sink_logits is not None:
-        out = out + p_sink
+        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
 
     # --- 3. Sliding window branch (uncompressed local KV) ---
     if sliding_window > 0:
