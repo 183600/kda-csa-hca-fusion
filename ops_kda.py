@@ -392,7 +392,7 @@ def _chunk_kda_prepare(
         k_i = k[..., i, :]
         g_i = g[..., i:i+1, :]
         g_diff = (g - g_i).clamp(max=50.0)
-        A[..., i] = torch.einsum('... c d, ... d -> ... c', k * g_diff.exp(), k_i)
+        A[..., i] = (k * g_diff.exp() * k_i.unsqueeze(-2)).sum(-1)
     A = A * beta[..., None]
     A = -A.masked_fill(mask, 0)
     A = torch.linalg.solve_triangular(
