@@ -218,7 +218,7 @@ class HeadwiseFusedAttention(nn.Module):
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp)
+        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp_n)
         if pad:
             out = out[:, :, :T]
         return out
@@ -243,7 +243,7 @@ class HeadwiseFusedAttention(nn.Module):
         safe_scores = scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp)
+        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp_n)
         if pad:
             out = out[:, :, :T]
         return out
@@ -457,5 +457,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
