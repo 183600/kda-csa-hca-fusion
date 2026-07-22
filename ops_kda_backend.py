@@ -23,7 +23,6 @@ import torch
 
 
 _VALID_BACKENDS = {"reference", "fla", "auto"}
-_fla_import_warning_emitted = False
 _FLA_OPS: tuple[Any, Any] | None = None
 
 
@@ -189,7 +188,6 @@ def kda_forward(
     fall back to the reference implementation. ``g_clamp_min``
     is applied before both backends so their gate contract matches.
     """
-    global _fla_import_warning_emitted
     backend = validate_kda_backend(backend)
     if not isinstance(g_clamp_min, (int, float)) or isinstance(g_clamp_min, bool):
         raise TypeError(f"g_clamp_min must be a real number, got {g_clamp_min!r}")
@@ -231,19 +229,12 @@ def kda_forward(
         except (ImportError, ValueError, NotImplementedError, AssertionError) as exc:
             if backend == "fla":
                 raise
-            if not _fla_import_warning_emitted:
-                warnings.warn(
-                    f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
-                    f"{exc}); falling back to the reference implementation.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                _fla_import_warning_emitted = True
-            # Fall back to the reference implementation for this call only.
-            # The global warning flag suppresses duplicate log spam but must
-            # NOT permanently disable FLA for subsequent calls, otherwise a
-            # single transient edge case would silently degrade every later
-            # KDA computation in the process to the slow Python reference.
+            warnings.warn(
+                f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
+                f"{exc}); falling back to the reference implementation.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             use_fla = False
 
     # Lazy import avoids an import cycle and preserves the original public
