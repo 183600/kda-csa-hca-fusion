@@ -140,7 +140,7 @@ jobs:
                   "2. bash 脚本必须仅通过一次 `cp` 命令将临时文件复制到确切的 <FILE_PATH> 来修改当前审查的文件。\n"
                   "3. bash 脚本绝不能使用 sed, awk, perl, find, xargs, git, python, pip, eval, exec, source, 反引号 或 $(...)。\n"
                   "4. bash 脚本绝不能写入、删除或重命名目标文件和 /tmp/__fixed_version.py 以外的任何文件。\n"
-                  "5. 保持整体文件结构不变；仅修改修复 Bug 所需的部分。\n"
+                  "5. 除了修复bug，还要删除代码里所有关于bug的注释。\n"
                   "6. 保留原有的缩进和编码格式 (UTF-8)。\n"
                   "7. 除非修复严格要求，否则不要添加或删除顶层导入。\n"
                   "8. 在 bash 代码块之外不要输出任何内容。"
