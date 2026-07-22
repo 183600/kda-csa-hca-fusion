@@ -166,6 +166,10 @@ def _measure(fn, repeats, device):
         # ``run_decoding.py``), so JSON serializes to ``null`` (clearly "no
         # data") rather than a misleading 0.0. On GPU we report the real
         # ``torch.cuda.max_memory_allocated`` (with baseline subtraction).
+        # Warmup
+        for _ in range(min(2, repeats)):
+            out = fn()
+            del out
         gc.collect()
         _prev_threads = torch.get_num_threads()
         torch.set_num_threads(1)
@@ -396,8 +400,6 @@ def main():
             try:
                 _clear_cache(device)
                 fn = factory(T)
-                if device.type != 'cuda':
-                    fn()
                 t, mem = _measure(fn, repeats=n_repeats, device=device)
                 row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                        'device': str(device), 'repeats': n_repeats}
