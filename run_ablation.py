@@ -84,7 +84,7 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
 
 
 def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
-                n_batches=4, batch=64):
+                n_batches=4, batch=64, seed=42):
     was_training = {m: m.training for m in (model, head, embed)}
     try:
         model.eval()
@@ -92,7 +92,7 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
         embed.eval()
         correct, total = 0, 0
         losses = []
-        eval_gen = make_seeded_generator(12345, device=device)
+        eval_gen = make_seeded_generator(seed + 1_000_001, device=device)
         with torch.no_grad():
             for _ in range(n_batches):
                 x_emb, target, cue_pos = make_mqar_batch(
@@ -166,7 +166,7 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
 
     final_acc, final_loss = _eval_model(
         model, head, embed, seq_len, n_kv, device,
-        n_batches=eval_batches, batch=eval_batch,
+        n_batches=eval_batches, batch=eval_batch, seed=seed,
     )
 
     lat_gen = make_seeded_generator(99, device=device)
