@@ -156,9 +156,13 @@ def naive_hca(
         log_denom = torch.logaddexp(lse, shifted_sink)              # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
         p = p.masked_fill(all_masked, 0.0)
+        p_sink = (shifted_sink - log_denom).exp()                 # [B, nh, T, 1]
+        p_sink = p_sink.masked_fill(all_masked, 0.0)
     else:
         p = _nan_safe_softmax(scores, dim=-1)
     out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
+    if sink_logits is not None:
+        out = out + p_sink
 
     # --- 3. Sliding window branch (uncompressed local KV) ---
     if sliding_window > 0:
