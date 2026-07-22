@@ -136,6 +136,7 @@ def _measure(fn, repeats, device):
             # preserve the (seconds, MB) contract of this function.
             times.append(start.elapsed_time(end) / 1000.0)
             del out
+            torch.cuda.synchronize()
         peak_bytes = torch.cuda.max_memory_allocated(device)
         peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
         _LAST_TIMING_STATS['times'] = list(times)
