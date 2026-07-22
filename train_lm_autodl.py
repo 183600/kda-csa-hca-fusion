@@ -54,10 +54,6 @@ class TinyStoriesLM(Dataset):
     def __getitem__(self, idx):
         text = self.texts[idx]
         tokens = self.tokenizer.encode(text, truncation=True, max_length=self.seq_len + 1)
-        # Keep the real encoded length BEFORE padding so the loss can ignore
-        # padded target positions. GPT-2 has no native pad token, so callers
-        # set pad_token=eos_token; checking token_id alone would also mask
-        # genuine EOS targets. Length-based masking avoids that bias.
         real_len = min(len(tokens), self.seq_len + 1)
         if real_len < self.seq_len + 1:
             tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len + 1 - real_len)
@@ -65,8 +61,6 @@ class TinyStoriesLM(Dataset):
             tokens = tokens[:self.seq_len + 1]
         input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
         labels = torch.tensor(tokens[1:], dtype=torch.long)
-        # labels[j] predicts original token j+1. Positions >= real_len-1 are
-        # padding targets and must not dominate the LM objective.
         if real_len <= 1:
             labels[:] = -100
         elif real_len - 1 < labels.numel():
@@ -81,22 +75,6 @@ class LMWithHybrid(nn.Module):
         self.norm_f = nn.LayerNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
-        # Weight-tying means ``embed.weight`` IS the output projection, so its
-        # init scale sets the logit scale at step 0. ``nn.Embedding`` defaults
-        # to ``N(0, 1)`` which, combined with a final LayerNorm of width
-        # ``d_model``, produces logits with std ~ sqrt(d_model) (~22.6 for
-        # d=512) and max ~500. Cross-entropy on those logits starts at ~500
-        # (46x the uniform-baseline log(V)=10.82) and stays flat for hundreds
-        # of steps because the gradient is dominated by shrinking the 25.7M
-        # tied embedding rather than learning the LM task. GPT-2 / nanoGPT /
-        # every modern transformer initializes the (tied) embedding with
-        # std=0.02 so initial logits are O(1) and the loss starts at the
-        # uniform baseline ~log(V). Without this the loss curve reported by
-        # the script and the quality of the final checkpoint are both
-        # meaningless: a 5-step run with default init showed loss 496.6 ->
-        # 498.5 (no decrease), while the same 5 steps with std=0.02 init
-        # showed loss 10.9 -> 10.9 (matching the uniform baseline, as
-        # expected for an untrained model).
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids, labels=None):
@@ -106,13 +84,6 @@ class LMWithHybrid(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if labels is not None:
-            # TinyStoriesLM already returns next-token labels aligned with each
-            # input position (input_ids=tokens[:-1], labels=tokens[1:]). The
-            # previous code sliced both tensors again (logits[:, :-1] vs
-            # labels[:, 1:]), causing an off-by-one target: logits at position
-            # t were trained to predict token t+2 instead of t+1, and the first
-            # next-token target was silently dropped. Use the full aligned
-            # tensors and let labels=-100 mask padded targets.
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                    labels.reshape(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss}
@@ -123,10 +94,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kaggle", action="store_true")
     parser.add_argument("--autodl", action="store_true")
-    # None means "use the environment-specific default". The previous
-    # non-None parser defaults made it impossible to tell whether a user
-    # explicitly overrode a Kaggle setting, while Kaggle ignored the flags
-    # entirely. Apply overrides uniformly after choosing the profile below.
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -140,11 +107,6 @@ def main():
     device = info.device
     print(f"Device: {device}, is_kaggle={is_kaggle}")
 
-    # Make LM training runs reproducible. Without an explicit seed, model
-    # initialization and DataLoader shuffling differed across invocations, so
-    # two runs with the same CLI budget could produce different loss curves
-    # and checkpoints. Seed before model construction and pass a dedicated
-    # generator to DataLoader below.
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -157,9 +119,6 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
-    # Config: rigorous version, but small for cost. The optional KDA backend
-    # is selected consistently across LM training and the experiment runners;
-    # the default remains the reference path for reproducibility.
     kda_backend = validate_kda_backend(
         os.environ.get('KDA_BACKEND', 'reference')
     )
@@ -180,10 +139,6 @@ def main():
         seq_len = 1024
         max_steps = 2000
 
-    # Apply CLI overrides for BOTH Kaggle and AutoDL/local profiles. Ignoring
-    # ``--max_steps``/``--seq_len`` under ``--kaggle`` silently changed the
-    # requested experiment budget and made reproduced results not match the
-    # command line shown in logs.
     if args.batch_size is not None:
         batch_size = args.batch_size
     if args.seq_len is not None:
@@ -203,17 +158,6 @@ def main():
     loader_gen.manual_seed(args.seed + 1_000_000)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
                         generator=loader_gen)
-    # Build parameter groups with proper weight-decay exclusion. Standard ML
-    # practice (mirrored from run_quality.py::_build_param_groups): embeddings,
-    # biases, LayerNorm parameters, and positional-bias tables (Ba/Bb/B_idx/
-    # B_pos) must NOT be weight-decayed. The previous version passed
-    # ``model.parameters()`` to AdamW with ``weight_decay=0.1`` uniformly,
-    # which decayed ALL 13.5M parameters — including the 12.87M-parameter
-    # tied embedding/lm_head matrix (95.4% of the model). With weight tying
-    # the embedding IS the output projection, so decaying it shrinks the logit
-    # scale every step, producing a loss curve and checkpoint that do not
-    # reflect the model's true potential. Only the 616K attention/FFN weight
-    # parameters (4.6%) should receive weight decay.
     no_decay_ids = set()
     for submod in model.modules():
         if isinstance(submod, (nn.Embedding, nn.LayerNorm)):
@@ -236,11 +180,6 @@ def main():
     ]
     optimizer = torch.optim.AdamW(param_groups, lr=3e-4)
 
-    # Mixed precision policy. Kaggle T4 (sm_75) does NOT support BF16; forcing
-    # ``dtype=torch.bfloat16`` there can crash or silently fall back to slow
-    # emulation, invalidating the advertised Kaggle/AutoDL training results.
-    # Use BF16 only when PyTorch reports support, otherwise use FP16 + GradScaler
-    # on CUDA. CPU runs stay in fp32 (autocast disabled).
     use_amp = device.type == "cuda"
     if use_amp and torch.cuda.is_bf16_supported():
         autocast_dtype = torch.bfloat16
@@ -272,7 +211,6 @@ def main():
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
-            # Reset recurrent state per micro-batch (fresh independent sequence).
             model.hybrid.reset_state()
 
             with torch.autocast(device_type=device.type, dtype=autocast_dtype,
@@ -324,14 +262,6 @@ def main():
     cost_3090 = elapsed/3600*1.8
     cost_4090 = elapsed/3600*2.8
     print(f"Cost estimate 3090: {cost_3090:.2f} CNY, 4090: {cost_4090:.2f} CNY << 120 CNY")
-    # Save the final checkpoint with the SAME key set as the intermediate
-    # ``step_{N}.pt`` checkpoints. The previous version omitted ``vocab``,
-    # so any downstream loader (e.g. an evaluator reconstructing the model
-    # from the checkpoint) had to recover vocab_size from
-    # ``model['embed.weight'].shape[0]`` — a fragile workaround that the
-    # intermediate checkpoints did not require. README.md advertises
-    # ``final_lm.pt`` as the canonical artifact for further evaluation, so
-    # it must be self-describing.
     torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
                 "optimizer_step": optimizer_step, "micro_step": micro_step,
                 "seed": args.seed},
