@@ -498,8 +498,8 @@ def _chunk_kda_inner_loop(
         v_i = u_i - w_i @ S
         chunk_outs.append((q_i * g_i.exp()) @ S + Aqk @ v_i)
         S = S * g_i[:, :, -1].exp().unsqueeze(-1)
-        update = ((g_i - g_i[:, :, -1:]).exp() * k_i).permute(0, 1, 2, 3)
-        S = S + update @ v_i
+        update = torch.einsum('bhnci,bhncj->bhncij', (g_i - g_i[:, :, -1:]).exp() * k_i, v_i)
+        S = S + update.sum(-3)
     return chunk_outs, S
 
 
