@@ -221,7 +221,7 @@ def main():
                 raise RuntimeError(
                     f"non-finite LM loss at optimizer_step={optimizer_step}, "
                     f"micro_step={micro_step}: {raw_loss}")
-            scaled_loss = raw_loss
+            scaled_loss = raw_loss / grad_accum
             if scaler.is_enabled():
                 scaler.scale(scaled_loss).backward()
             else:
