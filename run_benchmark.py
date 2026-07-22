@@ -111,9 +111,6 @@ def _measure(fn, repeats, device):
             out = fn()
             del out
         torch.cuda.synchronize()
-        # Reset peak memory stats AFTER warmup so the reported peak reflects
-        # only the timed region's activations, NOT the warmup allocations.
-        torch.cuda.reset_peak_memory_stats(device)
         # Capture the baseline allocation AFTER the reset. The model
         # parameters and any persistent state (e.g. KDA recurrent state)
         # are still in ``memory_allocated()`` at this point, so without
@@ -127,7 +124,9 @@ def _measure(fn, repeats, device):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = []
+        peak_bytes = 0
         for _ in range(repeats):
+            torch.cuda.reset_peak_memory_stats(device)
             start.record()
             out = fn()
             end.record()
@@ -135,9 +134,9 @@ def _measure(fn, repeats, device):
             # elapsed_time returns milliseconds; convert to seconds to
             # preserve the (seconds, MB) contract of this function.
             times.append(start.elapsed_time(end) / 1000.0)
+            peak_bytes = max(peak_bytes, torch.cuda.max_memory_allocated(device))
             del out
             torch.cuda.synchronize()
-        peak_bytes = torch.cuda.max_memory_allocated(device)
         peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
         _LAST_TIMING_STATS['times'] = list(times)
         _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
