@@ -147,7 +147,7 @@ jobs:
           # ------------------------------------------------------------------ #
           #  Prompt
           # ------------------------------------------------------------------ #
-          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，并且确保代码里没有任何说明修复了哪些bug的注释，README.md也没有"
+          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，并且确保代码里没有任何说明修复了哪些bug的注释，README.md也没有说明修复了哪些bug的内容，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复"
 
           def call_opencode():
               user_msg = REVIEW_PROMPT
