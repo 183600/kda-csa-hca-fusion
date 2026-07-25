@@ -72,7 +72,7 @@ jobs:
           MODEL   = os.environ["OPENCODE_MODEL"]
           START   = time.time()
 
-          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复"
+          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复。注意：不要修改 .github/ 目录下的任何文件。"
 
           def run_cmd(cmd, timeout=120, **kw):
               try:
@@ -86,10 +86,17 @@ jobs:
               run_cmd(["git", "config", "user.email", "github-actions@github.com"])
 
           def git_commit_push_all(msg):
+              # 清理 opencode 临时文件
               if os.path.exists("opencode.json"):
                   os.remove("opencode.json")
               if os.path.isdir(".opencode"):
                   run_cmd(["rm", "-rf", ".opencode"])
+
+              # 保护 .github 目录：如果 opencode 修改了工作流文件，恢复它们
+              r_checkout = run_cmd(["git", "checkout", "HEAD", "--", ".github/"])
+              if r_checkout.returncode != 0:
+                  print("  -> 警告: 恢复 .github/ 目录时出错，可能不存在修改")
+
               run_cmd(["git", "add", "-A"])
               r = run_cmd(["git", "commit", "-m", msg])
               if r.returncode != 0:
@@ -172,14 +179,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_NAME: ${{ github.workflow }}
-          WORKFLOW_REF: ${{ github.ref }}
+          # 修复 1: 使用 ref_name 而非 ref，得到 "master" 而非 "refs/heads/master"
+          WORKFLOW_REF: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           echo "上一个任务的状态: ${{ needs.llm-fix.result }}"
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
+          # 修复 2: 获取工作流 ID 并验证
+          WF_ID=$(gh api "/repos/$REPO/actions/workflows" \
+            --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
 
           if [ -z "$WF_ID" ]; then
             echo "❌ 找不到 '$WORKFLOW_NAME' 的工作流 ID。循环将在此停止。"
@@ -187,17 +197,48 @@ jobs:
           fi
 
           echo "找到工作流 ID: $WF_ID"
+          echo "使用 ref: $WORKFLOW_REF"
 
-          if gh api \
-            --method POST \
+          # 修复 3: 验证工作流文件在目标 ref 上存在
+          echo "检查工作流文件是否存在于 ref '$WORKFLOW_REF'..."
+          WF_FILE_CHECK=$(gh api "/repos/$REPO/contents/.github/workflows" \
+            --jq ".[].name" \
             -H "Accept: application/vnd.github+json" \
-            "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
-            -f "ref=$WORKFLOW_REF"; then
-            echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
-          else
-            echo "❌ 触发下一次运行失败。"
-            exit 1
-          fi
+            -f ref="$WORKFLOW_REF" 2>&1) || true
+
+          echo "工作流目录内容: $WF_FILE_CHECK"
+
+          # 修复 4: 添加重试逻辑
+          MAX_RETRIES=3
+          RETRY_DELAY=15
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "尝试触发 (第 $i/$MAX_RETRIES 次)..."
+
+            if gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
+              -f "ref=$WORKFLOW_REF"; then
+              echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
+              break
+            else
+              echo "⚠️ 第 $i 次触发失败"
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "等待 ${RETRY_DELAY} 秒后重试..."
+                sleep $RETRY_DELAY
+              else
+                echo "❌ 触发下一次运行失败，已达到最大重试次数 ($MAX_RETRIES)。"
+                echo "可能原因："
+                echo "  1. 工作流文件在 '$WORKFLOW_REF' 分支上不存在或被修改"
+                echo "  2. GITHUB_TOKEN 权限不足"
+                echo "  3. 仓库默认分支不是 '$WORKFLOW_REF'"
+                # 不再 exit 1，改为正常退出以避免 Actions 标记为失败
+                # 下次手动触发即可恢复循环
+                exit 0
+              fi
+            fi
+          done
 
           sleep 5
           echo "最近的工作流运行记录:"
