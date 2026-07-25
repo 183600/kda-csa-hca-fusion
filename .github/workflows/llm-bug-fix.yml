@@ -118,7 +118,7 @@ jobs:
                   input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  timeout=1800,
+                  timeout=14400,
               )
 
           git_setup()
@@ -136,7 +136,7 @@ jobs:
               try:
                   r = call_opencode()
               except subprocess.TimeoutExpired:
-                  print("  opencode 调用超时（30 分钟），跳过本次迭代")
+                  print("  opencode 调用超时（4 小时），跳过本次迭代")
                   continue
               except Exception as e:
                   print(f"  opencode 错误: {e}")
@@ -179,7 +179,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_NAME: ${{ github.workflow }}
-          # 修复 1: 使用 ref_name 而非 ref，得到 "master" 而非 "refs/heads/master"
           WORKFLOW_REF: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
@@ -187,7 +186,6 @@ jobs:
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          # 修复 2: 获取工作流 ID 并验证
           WF_ID=$(gh api "/repos/$REPO/actions/workflows" \
             --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
 
@@ -199,7 +197,6 @@ jobs:
           echo "找到工作流 ID: $WF_ID"
           echo "使用 ref: $WORKFLOW_REF"
 
-          # 修复 3: 验证工作流文件在目标 ref 上存在
           echo "检查工作流文件是否存在于 ref '$WORKFLOW_REF'..."
           WF_FILE_CHECK=$(gh api "/repos/$REPO/contents/.github/workflows" \
             --jq ".[].name" \
@@ -208,7 +205,6 @@ jobs:
 
           echo "工作流目录内容: $WF_FILE_CHECK"
 
-          # 修复 4: 添加重试逻辑
           MAX_RETRIES=3
           RETRY_DELAY=15
 
@@ -233,8 +229,6 @@ jobs:
                 echo "  1. 工作流文件在 '$WORKFLOW_REF' 分支上不存在或被修改"
                 echo "  2. GITHUB_TOKEN 权限不足"
                 echo "  3. 仓库默认分支不是 '$WORKFLOW_REF'"
-                # 不再 exit 1，改为正常退出以避免 Actions 标记为失败
-                # 下次手动触发即可恢复循环
                 exit 0
               fi
             fi
