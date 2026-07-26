@@ -14,7 +14,7 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 305
+    timeout-minutes: 350
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,15 +62,22 @@ jobs:
       - name: Run opencode Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_DURATION_SECONDS: "18000"
+          MAX_DURATION_SECONDS: "15600"
+          OPENCODE_TIMEOUT_SECONDS: "3600"
           OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
           import os, time, subprocess
 
-          MAX_DUR = int(os.environ["MAX_DURATION_SECONDS"])
-          MODEL   = os.environ["OPENCODE_MODEL"]
-          START   = time.time()
+          MAX_DUR           = int(os.environ["MAX_DURATION_SECONDS"])       # 15600s = 4h20m
+          OPENCODE_TIMEOUT  = int(os.environ["OPENCODE_TIMEOUT_SECONDS"])   # 3600s  = 1h
+          GIT_BUFFER        = 600   # 预留 10 分钟给 git 操作
+          SAFETY_BUFFER     = 300   # 额外安全缓冲 5 分钟
+          MODEL             = os.environ["OPENCODE_MODEL"]
+          START             = time.time()
+
+          # 一次迭代所需的最小时间：opencode 调用 + git 操作 + 安全缓冲
+          MIN_ITERATION_TIME = OPENCODE_TIMEOUT + GIT_BUFFER + SAFETY_BUFFER
 
           REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复。注意：不要修改 .github/ 目录下的任何文件。"
 
@@ -113,12 +120,13 @@ jobs:
           def call_opencode():
               user_msg = REVIEW_PROMPT
               print(f"  -> Prompt 大小: {len(user_msg.encode('utf-8')):,} 字节")
+              print(f"  -> opencode 超时设置: {OPENCODE_TIMEOUT}s ({OPENCODE_TIMEOUT // 60} 分钟)")
               return subprocess.run(
                   ["opencode", "run", "--model", MODEL],
                   input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  timeout=14400,
+                  timeout=OPENCODE_TIMEOUT,
               )
 
           git_setup()
@@ -126,17 +134,33 @@ jobs:
           iteration = 0
           while True:
               elapsed = time.time() - START
-              if elapsed >= MAX_DUR:
-                  print(f"\n已达到时间限制 ({elapsed:.0f}s)，停止。")
+              remaining = MAX_DUR - elapsed
+
+              # ============================================================
+              # 核心修复：在调用 opencode 之前检查剩余时间是否足够
+              # ============================================================
+              if remaining <= 0:
+                  print(f"\n已达到时间限制 ({elapsed:.0f}s / {MAX_DUR}s)，停止。")
+                  break
+
+              if remaining < MIN_ITERATION_TIME:
+                  print(f"\n剩余时间 {remaining:.0f}s ({remaining / 60:.1f} 分钟) 不足以完成"
+                        f"下一次完整迭代（需要至少 {MIN_ITERATION_TIME}s = "
+                        f"{MIN_ITERATION_TIME / 60:.0f} 分钟），停止以避免超时。")
                   break
 
               iteration += 1
-              print(f"\n=========== 第 {iteration} 次迭代 (已耗时 {elapsed:.0f}s) ===========")
+              print(f"\n=========== 第 {iteration} 次迭代 ===========")
+              print(f"  已耗时: {elapsed:.0f}s ({elapsed / 60:.1f} 分钟)")
+              print(f"  剩余:   {remaining:.0f}s ({remaining / 60:.1f} 分钟)")
+              print(f"  时间上限: {MAX_DUR}s ({MAX_DUR / 60:.0f} 分钟)")
 
               try:
                   r = call_opencode()
               except subprocess.TimeoutExpired:
-                  print("  opencode 调用超时（4 小时），跳过本次迭代")
+                  print(f"  opencode 调用超时（{OPENCODE_TIMEOUT // 60} 分钟），跳过本次迭代")
+                  # 超时后清理可能的部分修改
+                  run_cmd(["git", "checkout", "--", "."])
                   continue
               except Exception as e:
                   print(f"  opencode 错误: {e}")
@@ -163,7 +187,9 @@ jobs:
               else:
                   print("  -> 提交/推送失败；将继续处理。")
 
-          print("完成。")
+          total_elapsed = time.time() - START
+          print(f"\n完成。总耗时: {total_elapsed:.0f}s ({total_elapsed / 60:.1f} 分钟)，"
+                f"共 {iteration} 次迭代。")
           PYEOF
 
   # ==========================================
