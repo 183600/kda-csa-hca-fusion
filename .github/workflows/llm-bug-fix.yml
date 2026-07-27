@@ -14,7 +14,7 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 305
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,24 +62,17 @@ jobs:
       - name: Run opencode Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_DURATION_SECONDS: "15600"
-          OPENCODE_TIMEOUT_SECONDS: "3600"
+          MAX_DURATION_SECONDS: "18000"
           OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
           import os, time, subprocess
 
-          MAX_DUR           = int(os.environ["MAX_DURATION_SECONDS"])       # 15600s = 4h20m
-          OPENCODE_TIMEOUT  = int(os.environ["OPENCODE_TIMEOUT_SECONDS"])   # 3600s  = 1h
-          GIT_BUFFER        = 600   # 预留 10 分钟给 git 操作
-          SAFETY_BUFFER     = 300   # 额外安全缓冲 5 分钟
-          MODEL             = os.environ["OPENCODE_MODEL"]
-          START             = time.time()
+          MAX_DUR = int(os.environ["MAX_DURATION_SECONDS"])
+          MODEL   = os.environ["OPENCODE_MODEL"]
+          START   = time.time()
 
-          # 一次迭代所需的最小时间：opencode 调用 + git 操作 + 安全缓冲
-          MIN_ITERATION_TIME = OPENCODE_TIMEOUT + GIT_BUFFER + SAFETY_BUFFER
-
-          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复。注意：不要修改 .github/ 目录下的任何文件。"
+          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复"
 
           def run_cmd(cmd, timeout=120, **kw):
               try:
@@ -93,17 +86,10 @@ jobs:
               run_cmd(["git", "config", "user.email", "github-actions@github.com"])
 
           def git_commit_push_all(msg):
-              # 清理 opencode 临时文件
               if os.path.exists("opencode.json"):
                   os.remove("opencode.json")
               if os.path.isdir(".opencode"):
                   run_cmd(["rm", "-rf", ".opencode"])
-
-              # 保护 .github 目录：如果 opencode 修改了工作流文件，恢复它们
-              r_checkout = run_cmd(["git", "checkout", "HEAD", "--", ".github/"])
-              if r_checkout.returncode != 0:
-                  print("  -> 警告: 恢复 .github/ 目录时出错，可能不存在修改")
-
               run_cmd(["git", "add", "-A"])
               r = run_cmd(["git", "commit", "-m", msg])
               if r.returncode != 0:
@@ -120,13 +106,12 @@ jobs:
           def call_opencode():
               user_msg = REVIEW_PROMPT
               print(f"  -> Prompt 大小: {len(user_msg.encode('utf-8')):,} 字节")
-              print(f"  -> opencode 超时设置: {OPENCODE_TIMEOUT}s ({OPENCODE_TIMEOUT // 60} 分钟)")
               return subprocess.run(
                   ["opencode", "run", "--model", MODEL],
                   input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  timeout=OPENCODE_TIMEOUT,
+                  timeout=7200,  # 2 小时
               )
 
           git_setup()
@@ -134,33 +119,17 @@ jobs:
           iteration = 0
           while True:
               elapsed = time.time() - START
-              remaining = MAX_DUR - elapsed
-
-              # ============================================================
-              # 核心修复：在调用 opencode 之前检查剩余时间是否足够
-              # ============================================================
-              if remaining <= 0:
-                  print(f"\n已达到时间限制 ({elapsed:.0f}s / {MAX_DUR}s)，停止。")
-                  break
-
-              if remaining < MIN_ITERATION_TIME:
-                  print(f"\n剩余时间 {remaining:.0f}s ({remaining / 60:.1f} 分钟) 不足以完成"
-                        f"下一次完整迭代（需要至少 {MIN_ITERATION_TIME}s = "
-                        f"{MIN_ITERATION_TIME / 60:.0f} 分钟），停止以避免超时。")
+              if elapsed >= MAX_DUR:
+                  print(f"\n已达到时间限制 ({elapsed:.0f}s)，停止。")
                   break
 
               iteration += 1
-              print(f"\n=========== 第 {iteration} 次迭代 ===========")
-              print(f"  已耗时: {elapsed:.0f}s ({elapsed / 60:.1f} 分钟)")
-              print(f"  剩余:   {remaining:.0f}s ({remaining / 60:.1f} 分钟)")
-              print(f"  时间上限: {MAX_DUR}s ({MAX_DUR / 60:.0f} 分钟)")
+              print(f"\n=========== 第 {iteration} 次迭代 (已耗时 {elapsed:.0f}s) ===========")
 
               try:
                   r = call_opencode()
               except subprocess.TimeoutExpired:
-                  print(f"  opencode 调用超时（{OPENCODE_TIMEOUT // 60} 分钟），跳过本次迭代")
-                  # 超时后清理可能的部分修改
-                  run_cmd(["git", "checkout", "--", "."])
+                  print("  opencode 调用超时（2 小时），跳过本次迭代")
                   continue
               except Exception as e:
                   print(f"  opencode 错误: {e}")
@@ -187,9 +156,7 @@ jobs:
               else:
                   print("  -> 提交/推送失败；将继续处理。")
 
-          total_elapsed = time.time() - START
-          print(f"\n完成。总耗时: {total_elapsed:.0f}s ({total_elapsed / 60:.1f} 分钟)，"
-                f"共 {iteration} 次迭代。")
+          print("完成。")
           PYEOF
 
   # ==========================================
@@ -205,15 +172,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_NAME: ${{ github.workflow }}
-          WORKFLOW_REF: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
         run: |
           echo "上一个任务的状态: ${{ needs.llm-fix.result }}"
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          WF_ID=$(gh api "/repos/$REPO/actions/workflows" \
-            --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
+          WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
 
           if [ -z "$WF_ID" ]; then
             echo "❌ 找不到 '$WORKFLOW_NAME' 的工作流 ID。循环将在此停止。"
@@ -221,44 +187,17 @@ jobs:
           fi
 
           echo "找到工作流 ID: $WF_ID"
-          echo "使用 ref: $WORKFLOW_REF"
 
-          echo "检查工作流文件是否存在于 ref '$WORKFLOW_REF'..."
-          WF_FILE_CHECK=$(gh api "/repos/$REPO/contents/.github/workflows" \
-            --jq ".[].name" \
+          if gh api \
+            --method POST \
             -H "Accept: application/vnd.github+json" \
-            -f ref="$WORKFLOW_REF" 2>&1) || true
-
-          echo "工作流目录内容: $WF_FILE_CHECK"
-
-          MAX_RETRIES=3
-          RETRY_DELAY=15
-
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "尝试触发 (第 $i/$MAX_RETRIES 次)..."
-
-            if gh api \
-              --method POST \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
-              -f "ref=$WORKFLOW_REF"; then
-              echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
-              break
-            else
-              echo "⚠️ 第 $i 次触发失败"
-              if [ $i -lt $MAX_RETRIES ]; then
-                echo "等待 ${RETRY_DELAY} 秒后重试..."
-                sleep $RETRY_DELAY
-              else
-                echo "❌ 触发下一次运行失败，已达到最大重试次数 ($MAX_RETRIES)。"
-                echo "可能原因："
-                echo "  1. 工作流文件在 '$WORKFLOW_REF' 分支上不存在或被修改"
-                echo "  2. GITHUB_TOKEN 权限不足"
-                echo "  3. 仓库默认分支不是 '$WORKFLOW_REF'"
-                exit 0
-              fi
-            fi
-          done
+            "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
+            -f "ref=$WORKFLOW_REF"; then
+            echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
+          else
+            echo "❌ 触发下一次运行失败。"
+            exit 1
+          fi
 
           sleep 5
           echo "最近的工作流运行记录:"
