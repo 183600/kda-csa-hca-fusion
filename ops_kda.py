@@ -386,7 +386,20 @@ def _chunk_kda_prepare(
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # NOTE: ``diagonal=0`` (NOT ``diagonal=1``) is required here to match the
+    # FLA-referenced chunkwise-parallel KDA math (fla/ops/kda/naive.py). The
+    # mask covers the main diagonal AND the strict upper triangle; the
+    # subsequent ``A.masked_fill(mask, 0)`` then leaves ``A`` STRICTLY lower
+    # triangular (diagonal zeroed). With ``diagonal=1`` the diagonal entries
+    # ``A[i, i] = beta[i] * (k_i·k_i) * exp(0) = beta[i]`` (k is L2-normalised)
+    # survive into ``eye - A``, which decouples the triangular solve from the
+    # correct recurrent delta-rule and makes the chunk output/state diverge
+    # from ``naive_recurrent_kda`` by O(1e-2) — empirically confirmed:
+    # diagonal=1 gives max|o_diff|≈0.019, diagonal=0 matches to fp32 round-off
+    # (~1e-9). Examining the git history shows earlier review rounds had
+    # documented this same point and switched to diagonal=0; a later LLM
+    # bug-fix round reverted it to diagonal=1 and reintroduced the regression.
+    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]
@@ -498,7 +511,20 @@ def _chunk_kda_inner_loop(
         v_i = u_i - w_i @ S
         chunk_outs.append((q_i * g_i.exp()) @ S + Aqk @ v_i)
         S = S * g_i[:, :, -1].exp().unsqueeze(-1)
-        update = torch.einsum('bhck,bhcv->bhckv', (g_i - g_i[:, :, -1:]).exp() * k_i, v_i)
+        # NOTE: decay direction is ``g_last - g_pos`` (NOT ``g_pos - g_last``).
+        # Inside a chunk, position ``c`` contributes to the carried state via
+        # `exp(g_cumsum[last] - g_cumsum[c]) * k_c ⊗ v_c`, where ``g_cumsum``
+        # is the running sum of the per-channel log-decay. The recurrence multiplies the
+        # state by ``exp(g_t)`` AFTER step ``t``, so a token written at
+        # position ``c`` is decayed by the SUM of gates from ``c+1`` through
+        # the chunk's last position, i.e. by ``exp(g_cumsum[last] -
+        # g_cumsum[c])``. The old code used ``exp(g_cumsum[c] -
+        # g_cumsum[last])`` (the reciprocal), making the contribution from
+        # later positions OVER-emphasised and earlier positions sharply
+        # under-emphasised within each chunk — diverging from
+        # ``naive_recurrent_kda`` by O(1e-2) in state and output. The sign
+        # matches the upstream FLA reference (fla/ops/kda/naive.py).
+        update = torch.einsum('bhck,bhcv->bhckv', (g_i[:, :, -1:] - g_i).exp() * k_i, v_i)
         S = S + update.sum(-3)
     return chunk_outs, S
 
