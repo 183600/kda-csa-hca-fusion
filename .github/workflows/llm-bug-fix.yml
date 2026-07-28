@@ -14,7 +14,7 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 305
+    timeout-minutes: 359
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,11 +62,11 @@ jobs:
       - name: Run opencode Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_DURATION_SECONDS: "18000"
+          MAX_DURATION_SECONDS: "20400"
           OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
-          import os, time, subprocess
+          import os, time, subprocess, signal
 
           MAX_DUR = int(os.environ["MAX_DURATION_SECONDS"])
           MODEL   = os.environ["OPENCODE_MODEL"]
@@ -104,6 +104,7 @@ jobs:
               return False
 
           def call_opencode():
+              """单次 opencode 调用 —— 无超时限制，只有总时间限制。"""
               user_msg = REVIEW_PROMPT
               print(f"  -> Prompt 大小: {len(user_msg.encode('utf-8')):,} 字节")
               return subprocess.run(
@@ -119,11 +120,13 @@ jobs:
           while True:
               elapsed = time.time() - START
               if elapsed >= MAX_DUR:
-                  print(f"\n已达到时间限制 ({elapsed:.0f}s)，停止。")
+                  print(f"\n已达到总时间限制 ({elapsed:.0f}s / {MAX_DUR}s)，停止。")
                   break
 
               iteration += 1
-              print(f"\n=========== 第 {iteration} 次迭代 (已耗时 {elapsed:.0f}s) ===========")
+              remaining = MAX_DUR - elapsed
+              print(f"\n=========== 第 {iteration} 次迭代 "
+                    f"(已耗时 {elapsed:.0f}s, 剩余 {remaining:.0f}s) ===========")
 
               try:
                   r = call_opencode()
