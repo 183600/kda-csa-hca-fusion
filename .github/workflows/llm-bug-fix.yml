@@ -111,7 +111,6 @@ jobs:
                   input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  timeout=7200,  # 2 小时
               )
 
           git_setup()
@@ -128,9 +127,6 @@ jobs:
 
               try:
                   r = call_opencode()
-              except subprocess.TimeoutExpired:
-                  print("  opencode 调用超时（2 小时），跳过本次迭代")
-                  continue
               except Exception as e:
                   print(f"  opencode 错误: {e}")
                   time.sleep(30)
