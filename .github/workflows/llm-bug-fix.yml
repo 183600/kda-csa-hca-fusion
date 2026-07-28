@@ -14,7 +14,7 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 359
+    timeout-minutes: 359  # 5h59m — GitHub 总时间限制（单次 opencode 调用无超时）
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,11 +62,11 @@ jobs:
       - name: Run opencode Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_DURATION_SECONDS: "20400"
+          MAX_DURATION_SECONDS: "21540"  # 359×60，与 timeout-minutes 对齐
           OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
-          import os, time, subprocess, signal
+          import os, time, subprocess
 
           MAX_DUR = int(os.environ["MAX_DURATION_SECONDS"])
           MODEL   = os.environ["OPENCODE_MODEL"]
@@ -75,6 +75,7 @@ jobs:
           REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复"
 
           def run_cmd(cmd, timeout=120, **kw):
+              """仅用于 git 命令，有超时保护；opencode 调用不使用此函数"""
               try:
                   return subprocess.run(cmd, capture_output=True, text=True,
                                         timeout=timeout, **kw)
@@ -104,7 +105,7 @@ jobs:
               return False
 
           def call_opencode():
-              """单次 opencode 调用 —— 无超时限制，只有总时间限制。"""
+              """单次 opencode 调用——无 timeout，仅受 GitHub job 总时间限制约束"""
               user_msg = REVIEW_PROMPT
               print(f"  -> Prompt 大小: {len(user_msg.encode('utf-8')):,} 字节")
               return subprocess.run(
@@ -112,6 +113,7 @@ jobs:
                   input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
+                  # 注意：故意不设 timeout——单次调用无时间限制
               )
 
           git_setup()
@@ -124,9 +126,7 @@ jobs:
                   break
 
               iteration += 1
-              remaining = MAX_DUR - elapsed
-              print(f"\n=========== 第 {iteration} 次迭代 "
-                    f"(已耗时 {elapsed:.0f}s, 剩余 {remaining:.0f}s) ===========")
+              print(f"\n=========== 第 {iteration} 次迭代 (已耗时 {elapsed:.0f}s) ===========")
 
               try:
                   r = call_opencode()
