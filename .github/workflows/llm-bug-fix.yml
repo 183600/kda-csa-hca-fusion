@@ -199,10 +199,11 @@ jobs:
           for i in $(seq 1 $MAX_RETRIES); do
             echo "尝试触发下一次运行 (第 $i/$MAX_RETRIES 次)..."
 
+            # [修复] 将 dispatch 改为 dispatches (GitHub API 要求复数)
             if gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
+              "/repos/$REPO/actions/workflows/$WF_ID/dispatches" \
               -f "ref=$WORKFLOW_REF"; then
               echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
               sleep 5
