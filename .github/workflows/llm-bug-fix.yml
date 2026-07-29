@@ -14,7 +14,8 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 359  # 5h59m — GitHub 总时间限制（单次 opencode 调用无超时）
+    timeout-minutes: 350          # [改] 350min，留10min缓冲给 trigger-next
+    continue-on-error: true        # [新增] 失败也不阻塞 trigger-next
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,7 +63,7 @@ jobs:
       - name: Run opencode Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_DURATION_SECONDS: "21540"  # 359×60，与 timeout-minutes 对齐
+          MAX_DURATION_SECONDS: "20400"  # [改] 340min，留10min给清理+触发
           OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
@@ -91,6 +92,8 @@ jobs:
                   os.remove("opencode.json")
               if os.path.isdir(".opencode"):
                   run_cmd(["rm", "-rf", ".opencode"])
+              # [新增] 保护工作流文件，防止 opencode 修改后破坏循环
+              run_cmd(["git", "checkout", "--", ".github/workflows/"])
               run_cmd(["git", "add", "-A"])
               r = run_cmd(["git", "commit", "-m", msg])
               if r.returncode != 0:
@@ -113,7 +116,6 @@ jobs:
                   input=user_msg,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
-                  # 注意：故意不设 timeout——单次调用无时间限制
               )
 
           git_setup()
@@ -121,12 +123,15 @@ jobs:
           iteration = 0
           while True:
               elapsed = time.time() - START
-              if elapsed >= MAX_DUR:
-                  print(f"\n已达到总时间限制 ({elapsed:.0f}s / {MAX_DUR}s)，停止。")
+              remaining = MAX_DUR - elapsed
+              # [改] 留10分钟缓冲，确保有足够时间做最终提交+触发下一次
+              if remaining <= 600:
+                  print(f"\n剩余时间不足10分钟 ({remaining:.0f}s)，停止迭代。")
                   break
 
               iteration += 1
-              print(f"\n=========== 第 {iteration} 次迭代 (已耗时 {elapsed:.0f}s) ===========")
+              print(f"\n=========== 第 {iteration} 次迭代 "
+                    f"(已耗时 {elapsed:.0f}s, 剩余 {remaining:.0f}s) ===========")
 
               try:
                   r = call_opencode()
@@ -159,12 +164,12 @@ jobs:
           PYEOF
 
   # ==========================================
-  # 自触发 Job
+  # 自触发 Job — 无论 llm-fix 成功/失败/超时/取消都会执行
   # ==========================================
   trigger-next:
     needs: llm-fix
     runs-on: ubuntu-latest
-    if: always() && !cancelled()
+    if: always()                   # [改] 移除 && !cancelled()，确保即使超时取消也触发
     timeout-minutes: 5
     steps:
       - name: Trigger next workflow run
@@ -178,7 +183,9 @@ jobs:
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          WF_ID=$(gh api "/repos/$REPO/actions/workflows" --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
+          # 获取工作流 ID
+          WF_ID=$(gh api "/repos/$REPO/actions/workflows" \
+            --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
 
           if [ -z "$WF_ID" ]; then
             echo "❌ 找不到 '$WORKFLOW_NAME' 的工作流 ID。循环将在此停止。"
@@ -187,17 +194,26 @@ jobs:
 
           echo "找到工作流 ID: $WF_ID"
 
-          if gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
-            -f "ref=$WORKFLOW_REF"; then
-            echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
-          else
-            echo "❌ 触发下一次运行失败。"
-            exit 1
-          fi
+          # [新增] 重试触发，最多 5 次，应对 API 限流/网络抖动
+          MAX_RETRIES=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "尝试触发下一次运行 (第 $i/$MAX_RETRIES 次)..."
 
-          sleep 5
-          echo "最近的工作流运行记录:"
-          gh run list --workflow "$WORKFLOW_NAME" --limit 3
+            if gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/workflows/$WF_ID/dispatch" \
+              -f "ref=$WORKFLOW_REF"; then
+              echo "✅ 成功触发 '$WORKFLOW_NAME' 在分支 '$WORKFLOW_REF' 上的下一次运行"
+              sleep 5
+              echo "最近的工作流运行记录:"
+              gh run list --workflow "$WORKFLOW_NAME" --limit 3
+              exit 0
+            else
+              echo "⚠️ 第 $i 次触发失败，等待 15 秒后重试..."
+              sleep 15
+            fi
+          done
+
+          echo "❌ 触发下一次运行失败（已重试 $MAX_RETRIES 次）。"
+          exit 1
