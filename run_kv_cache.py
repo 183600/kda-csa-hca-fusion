@@ -61,8 +61,6 @@ DEFAULTS = dict(
     hca_nh=8, hca_dc=128,
     kda_hv=8, kda_k=128, kda_v=128,
     # KDA short-conv kernel size (depthwise Conv1d in KDAHybridLayer).
-    # P0-1 fix (round 1): the short-conv FLOPs were previously omitted;
-    # make kernel size configurable here so future changes propagate.
     kda_conv_ksize=3,
     # Hybrid layer-count ratio. Keeping these in DEFAULTS makes the documented
     # kwargs override path work (unknown-key validation below otherwise rejects
@@ -141,11 +139,6 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
                                  accumulators + CSA overlap state + sink.
     """
     p = {**DEFAULTS, **kw}
-    # AK12 fix: reject unknown kwargs so a typo (e.g. ``csa_topk_typo=64``)
-    # is surfaced immediately rather than silently absorbed into ``p`` and
-    # ignored. Also validate ``op`` up-front so an invalid op produces a
-    # clear error at entry rather than falling through every ``if op ==``
-    # branch to a generic ``raise ValueError(op)`` 100+ lines down.
     _valid_keys = set(DEFAULTS.keys())
     _unknown = set(kw.keys()) - _valid_keys
     if _unknown:
@@ -187,13 +180,6 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             # = 2*d elements of left-padding buffer for streaming — not just d.
             # This is negligible next to the recurrent state but a production
             # engine must retain it.
-            # Round 9 audit: parameterize via ``kda_conv_ksize`` instead of
-            # hardcoding 2. The FLOPs path (line ~331) already parameterizes
-            # correctly via ``p.get('kda_conv_ksize', 3)``; this KV-cache path
-            # did not, so a non-default ``kda_conv_ksize`` would produce the
-            # wrong element count. All current experiments use the default
-            # kda_conv_ksize=3 (where 2 == 3-1), so no current number is
-            # affected, but the latent bug is now fixed.
             _conv_ksize = p.get('kda_conv_ksize', 3)
             short_conv_state = (_conv_ksize - 1) * p['d']
             return recurrent_state + short_conv_state
@@ -201,24 +187,6 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return recurrent_state
 
     if op == 'csa':
-        # P1-4 fix: use ceil(T / m) for the LOGICAL block count, not
-        # floor. The previous ``max(1, T // csa_m)`` returned 1 block
-        # for T = m + 1 (which actually needs 2 blocks: one full + one
-        # partial), silently undercounting the compressed KV and
-        # indexer cache at non-divisible T. The correct count of
-        # ALLOCATED blocks (including a partial trailing block) is
-        # ``ceil(T / m) = (T + m - 1) // m``.
-        #
-        # The ``max(1, ...)`` wrapper is kept ONLY to preserve the
-        # "allocated capacity" semantics: a production engine reserves
-        # at least one block buffer upfront (even at T=0), so the
-        # KV/GQA ratio is well-defined at T=0 instead of 0/0 = NaN.
-        # This is the SAME semantics the old code intended (see the
-        # original comment below), but now with the correct ceil count
-        # for 0 < T not divisible by m.
-        #
-        # For the FLOPs path (``prefill_flops``), the LOGICAL count
-        # (without the max(1, ...)) is used instead — see that function.
         n_blocks = max(1, (T + csa_m - 1) // csa_m)
         # ``compressed_kv_only`` keeps the historical allocated-capacity / padded
         # prefill semantics: reserve enough compressed slots for the trailing
@@ -262,10 +230,6 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         return compressed
 
     if op == 'hca':
-        # P1-4 fix: same ceil correction as the 'csa' branch above.
-        # ``max(1, T // hca_m2)`` undercounted blocks at non-divisible T;
-        # the correct allocated-capacity count is ``ceil(T / m2)`` with
-        # a floor of 1 for the T=0 ratio convention.
         n_blocks = max(1, (T + hca_m2 - 1) // hca_m2)
         compressed = n_blocks * hca_c
         if mode == 'full_accounting':
@@ -393,8 +357,6 @@ def prefill_flops(op: str, T: int, **kw):
         # Depthwise: each output channel = 1 * ksize MACs per timestep,
         # for a total of ``T * d * ksize`` MACs -> 2*T*d*ksize FLOPs.
         # The bias adds T*d FLOPs, negligible vs 6*T*d for ksize=3.
-        # Previously omitted, systematically understating KDA FLOPs
-        # by ~3-6% depending on d (P0-1 fix, round 1).
         ksize = p.get('kda_conv_ksize', 3)
         short_conv = 2 * T * d * ksize
         # Recurrence: ~3 HV*K*V MACs per step (see docstring).
@@ -404,26 +366,11 @@ def prefill_flops(op: str, T: int, **kw):
         out_proj = 2 * T * kda_hv * kda_v * d
         return proj + short_conv + recurrent + out_proj
     if op == 'csa':
-        # P1-4 fix: use ceil(T / m) for the logical block count. The
-        # FLOPs path does NOT use the ``max(1, ...)`` floor because at
-        # T=0 there is genuinely no computation (no compression, no
-        # indexer scoring, no attention). The ``kv_cache_elements``
-        # function keeps the floor for "allocated capacity" semantics
-        # (a production engine reserves a block buffer even at T=0),
-        # but FLOPs measure actual work done, which is zero at T=0.
-        #
-        # The previous ``max(1, T // csa_m)`` returned 1 block for
-        # T = m + 1 (which actually compresses 2 blocks: one full +
-        # one partial), undercounting the compression / indexer FLOPs
-        # at non-divisible T. ``ceil(T / m)`` is the correct count.
         # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
         # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last
         # two are T*d*c_I.
         compress = 2 * T * d * (4 * csa_c + 2 * p['csa_cI'])
-        # Query-side projections (W_DQ, W_UQ, W_IUQ, W_w) — previously
-        # OMITTED, undercounting CSA's prefill FLOPs by ~8% at the default
-        # config. The parity comment ("compress term already includes the
-        # input projection") was wrong: compress only covers the KV side.
+        # Query-side projections (W_DQ, W_UQ, W_IUQ, W_w):
         #   W_DQ  : d -> dc       -> T*d*csa_dc MACs
         #   W_UQ  : dc -> c*nh    -> T*csa_dc*csa_c*H MACs
         #   W_IUQ : dc -> c_I*nIh -> T*csa_dc*csa_cI*csa_nIh MACs
@@ -466,9 +413,8 @@ def prefill_flops(op: str, T: int, **kw):
         sw_w = p['csa_sliding_window']
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
-        # Same head-count fix as ``core`` above: the SW branch uses
-        # ``csa_nh`` heads (the ``q`` tensor is shared with the sparse
-        # branch), NOT ``H``.
+        # The SW branch uses ``csa_nh`` heads (the ``q`` tensor is shared
+        # with the sparse branch), NOT ``H``.
         sw = 2 * sw_entries * csa_c * csa_nh * 2
         # Grouped output projection: (csa_nh * csa_c) -> d.
         # This is part of the standalone CSA layer boundary in run_benchmark.py
@@ -476,13 +422,9 @@ def prefill_flops(op: str, T: int, **kw):
         out_proj = 2 * T * csa_nh * csa_c * d
         return compress + query_proj + indexer + core + sw + out_proj
     if op == 'hca':
-        # P1-4 fix: same ceil correction as the CSA branch above.
-        # FLOPs use the logical block count (no ``max(1, ...)`` floor);
-        # at T=0 there is no computation, so n_blocks=0 is correct.
         # KV-side compression: TWO input projections (W_KV, W_Z), each T*d*c.
         compress = 2 * T * d * hca_c * 2
-        # Query-side projections (W_DQ, W_UQ) — previously OMITTED,
-        # undercounting HCA's prefill FLOPs by ~11% at the default config.
+        # Query-side projections (W_DQ, W_UQ):
         #   W_DQ : d -> dc    -> T*d*hca_dc MACs
         #   W_UQ : dc -> c*nh -> T*hca_dc*hca_c*H MACs
         hca_dc = p.get('hca_dc', 128)
@@ -495,9 +437,8 @@ def prefill_flops(op: str, T: int, **kw):
         causal_entries = causal_block_entries(T, hca_m2)
         # Head count: the HCA core attention uses ``hca_nh`` heads (NOT ``H``).
         core = 2 * causal_entries * hca_c * hca_nh * 2
-        # Sliding window: causal window (same fix as CSA above).
-        # Same head-count fix as ``core`` above: the SW branch uses
-        # ``hca_nh`` heads.
+        # Sliding window: causal window.
+        # The SW branch uses ``hca_nh`` heads.
         sw_w = p['hca_sliding_window']
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2
@@ -625,13 +566,8 @@ def main():
     #
     # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py
     # (was a local ``_sanitize`` closure; centralizing removes 5 copies of
-    # the same logic across run_*.py and ensures any future edge-case fix
-    # propagates everywhere).
+    # the same logic across run_*.py).
     sanitized = [sanitize_for_json(r) for r in rows]
-    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
-    # os.replace) so a process kill or disk-full mid-write leaves the
-    # target file as the OLD version (or absent) rather than a truncated
-    # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
     try:
         write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
                           indent=2, allow_nan=False)
@@ -644,11 +580,6 @@ def main():
         write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
                           indent=2, default=str)
     print('\nSaved: results/exp3_kv_cache.json')
-    # P0-2 fix: explicit return for consistency with the other runners
-    # (run_benchmark / run_quality / run_ablation / run_decoding). This
-    # experiment is pure arithmetic and does not have error rows, so it
-    # always returns 0 (success); the explicit return makes the contract
-    # visible to ``run_all._run``.
     return 0
 
 

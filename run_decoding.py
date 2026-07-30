@@ -53,23 +53,16 @@ from ops_fused import (
     HCAHybridLayer,
 )
 
-# P0 fix: emit a one-shot warning at import time so notebook / REPL
-# users do not silently misread the decoding results as a fair
+# One-shot warning emitted in ``main()`` (not at import time) so notebook /
+# REPL users do not silently misread the decoding results as a fair
 # three-way comparison. The README's "Fairness notes" #4 acknowledges
 # this gap, but a code-level warning is more visible to a user who
 # skips the README and goes straight to ``python run_decoding.py``.
-#
-# UPDATE: with the incremental decoding cache (CSADecodingCache /
+# With the incremental decoding cache (CSADecodingCache /
 # HCADecodingCache in ops_decoding_cache.py), CSA and HCA now
-# participate in the Exp 6 decode-latency benchmark. The warning is
-# kept for backward compatibility but updated to reflect the new
-# scope. The warning is emitted once per process (Python's default
+# participate in the Exp 6 decode-latency benchmark.
+# The warning is emitted once per process (Python's default
 # warning filter deduplicates by (message, category, module, lineno)).
-# AK11 fix: this warning was emitted at MODULE IMPORT TIME, which means
-# any ``from run_decoding import SoftmaxAttnDecoding`` (e.g. in tests or
-# downstream consumers) triggers it — polluting the output and potentially
-# tripping ``pytest -W error``. Move it to ``main()`` so it only fires
-# when the script is run directly, not when it is imported as a library.
 _DEFERRED_IMPORT_WARNING = (
     "run_decoding.py: now benchmarks softmax, KDA, CSA, HCA, and the "
     "hybrid stack. CSA and HCA use the incremental decoding cache "
@@ -965,29 +958,17 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
     prefill_times = []
     all_decode_times = []
-    # P1-1 fix (round 5): pin torch threads on CPU for stable measurement,
-    # mirroring run_benchmark._measure. Dynamic intra-op thread resizing
-    # causes 2-3x run-to-run jitter on CPU that dominates the inter-op
-    # latency gap.
-    #
-    # Round-10 fix: do NOT call ``set_num_interop_threads`` here. PyTorch
-    # permits changing the inter-op pool only ONCE per process and only
-    # BEFORE any parallel work starts. This function is called once per
-    # (op, prefill_len) cell — the second call would crash with
-    # ``RuntimeError: cannot set number of interop threads after parallel
-    # work has started or set_num_interop_threads called``. Worse, even the
-    # FIRST call fails because the warmup block above (lines 920-924) has
-    # already run ``model(x_prefill)`` / ``model(x_new)``, which is parallel
-    # work. The exception was silently swallowed by the try/except in
-    # main(), causing EVERY cell of Exp 6 to record an error result with
-    # null latency — Exp 6 produced zero usable data on CPU.
-    # ``configure_torch_for_device()`` (called from main()) already pins
-    # inter-op threads to 1 once at process start via the
-    # ``_interop_threads_set`` guard in kaggle_setup.py, so the per-cell
-    # call was both redundant AND broken. Intra-op threads may be adjusted
-    # around each measurement and safely restored. Mirrors the fix already
-    # applied to run_benchmark.py (commit d02cebd, "fix experimental
-    # fairness and benchmark reliability") which was missed here.
+    # Pin torch intra-op threads on CPU for stable measurement, mirroring
+    # run_benchmark._measure. Dynamic intra-op thread resizing causes 2-3x
+    # run-to-run jitter on CPU that dominates the inter-op latency gap.
+    # Do NOT call ``set_num_interop_threads`` here. PyTorch permits
+    # changing the inter-op pool only ONCE per process and only BEFORE any
+    # parallel work starts; this function is called once per
+    # (op, prefill_len) cell. ``configure_torch_for_device()`` (called from
+    # main()) already pins inter-op threads to 1 once at process start via
+    # the ``_interop_threads_set`` guard in kaggle_setup.py, so the
+    # per-cell call would be redundant. Intra-op threads may be adjusted
+    # around each measurement and safely restored.
     _prev_thr = torch.get_num_threads()
     if device.type != 'cuda':
         torch.set_num_threads(1)
@@ -1011,17 +992,12 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
             decode_times = []
             with torch.no_grad():
                 if device.type == 'cuda':
-                    # P0 timing-bias fix: use CUDA events instead of
+                    # Use CUDA events instead of
                     # ``torch.cuda.synchronize() + time.perf_counter()`` around
-                    # each token. The previous per-token sync pattern added
-                    # ~10-100 microseconds of driver-roundtrip overhead per
-                    # token. KDA's per-token compute is only ~10 microseconds,
-                    # so the sync overhead was 50-90% of the reported "KDA decode
-                    # latency" — systematically biasing the KDA-vs-softmax
-                    # comparison in softmax's favor. CUDA events record
-                    # asynchronously on the stream and add no host-side
-                    # synchronization per token; a single ``synchronize()`` at
-                    # the end drains the whole batch.
+                    # each token. CUDA events record asynchronously on the
+                    # stream and add no host-side synchronization per token;
+                    # a single ``synchronize()`` at the end drains the whole
+                    # batch.
                     starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
                     ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_decode)]
                     for i in range(n_decode):
@@ -1039,25 +1015,18 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     finally:
         if device.type != 'cuda':
             torch.set_num_threads(_prev_thr)
-            # Round-10 fix: do NOT restore ``set_num_interop_threads`` —
-            # we no longer set it here (see comment above). Restoring a
-            # value we never changed would either be a no-op (if the value
-            # matches) or crash with the same ``RuntimeError`` as the set
-            # call. The inter-op pool stays at 1 (set once by
-            # ``configure_torch_for_device`` in main()) for the rest of
-            # the process, which is the desired value for stable CPU
+            # Do NOT restore ``set_num_interop_threads`` — we do not set it
+            # here (see comment above). The inter-op pool stays at 1 (set
+            # once by ``configure_torch_for_device`` in main()) for the rest
+            # of the process, which is the desired value for stable CPU
             # latency measurement.
 
     # Aggregate across repeats: take the median across trials for each
     # summary statistic. ``statistics.median`` handles even-length lists
-    # correctly (averages the two middle values) — the previous
-    # ``sorted(times)[len(times)//2]`` returned the upper-middle for even n.
+    # correctly (averages the two middle values).
     # (statistics is imported at module top.)
-    # Guard against empty timing lists (n_decode=0 or repeats=0). Previously
-    # ``statistics.median([])`` raised ``StatisticsError: no median for empty
-    # data`` and ``sum([])/0`` raised ``ZeroDivisionError``. Both are
-    # degenerate configurations, but a defensive guard prevents a confusing
-    # crash and instead reports zeros so the JSON row is still well-formed.
+    # Guard against empty timing lists (n_decode=0 or repeats=0): report
+    # zeros so the JSON row is still well-formed.
     prefill_ms = statistics.median(prefill_times) if prefill_times else 0.0
     # Per-token: median across (trial, token-step) samples — flattens the
     # repeats x n_decode matrix into one list and takes its median.
