@@ -271,11 +271,6 @@ def csa_compress_kv_overlapped(
     return out
 
 
-# C5 fix: NaN-safe softmax helper, used by csa_lightning_indexer (twice)
-# and naive_csa (twice). The previous implementation copy-pasted the
-# 4-line ``all_masked / safe_logits / softmax / masked_fill_`` block in
-# four places. Any future numerical-stability fix must now be applied in
-# exactly one spot.
 def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     """Softmax that returns zeros on rows where every entry is ``-inf``.
 
@@ -445,12 +440,9 @@ def csa_lightning_indexer(
         raise ValueError(
             f"q_idx.shape[-1]={q_idx.shape[-1]} must be >= 1 "
             f"(indexer key dimension c_I must be positive)")
-    # C3 fix: ``ste_mode`` is accepted here only for backwards-compatible
-    # call-site ergonomics (``naive_csa`` passes it through unconditionally
-    # at line 745). The actual STE branching happens INSIDE ``naive_csa``
-    # (lines 869, 915) — this function only returns the indices + (optionally)
-    # the soft_weights, which are the SAME for every ste_mode. We still
-    # validate the value so a typo (``ste_mode='topk'``) doesn't silently
+    # ``ste_mode`` is accepted here only for backwards-compatible call-site
+    # ergonomics; the actual STE branching happens INSIDE ``naive_csa``. We
+    # validate the value so a typo doesn't silently
     # fall through, but callers should be aware the parameter has NO effect
     # in this function.
     if ste_mode not in ('topk_columns', 'full_softmax', 'aux_contrastive'):
@@ -463,7 +455,7 @@ def csa_lightning_indexer(
             "implementation of DeepSeek-V4's contrastive auxiliary loss "
             "on the indexer selection logits. Use 'topk_columns' (the "
             "default, simplified STE) or 'full_softmax' (dense STE) for now.")
-    # P0-2 fix (round 1): scale-selection policy.
+    # Scale-selection policy:
     #   * If the caller explicitly passed a scale, honour it (backward
     #     compatibility with any external code pinning a temperature).
     #   * Otherwise, when ``normalize_qk=True``, scores are cosine
@@ -487,14 +479,12 @@ def csa_lightning_indexer(
     if w_idx is not None:
         w_idx = w_idx.to(compute_dtype)
 
-    # P0 fix: L2-normalize indexer queries and keys so the top-k ranking
+    # L2-normalize indexer queries and keys so the top-k ranking
     # is magnitude-invariant (cosine-style scoring, as specified in the
     # DeepSeek-V4 paper Eq. 15). Without normalization, a high-norm
     # indexer query dominates the top-k ranking purely by magnitude
     # rather than by semantic relevance, making the sparse selection
-    # sensitive to upstream projection scaling. The historical scale
-    # ``DI ** -0.5`` partially mitigates this but does not eliminate it;
-    # explicit normalization is the standard fix. Set ``normalize_qk=False``
+    # sensitive to upstream projection scaling. Set ``normalize_qk=False``
     # to restore the un-normalized behaviour (e.g. for ablation).
     if normalize_qk:
         q_idx = F.normalize(q_idx, dim=-1)
@@ -519,7 +509,7 @@ def csa_lightning_indexer(
     if topk == 0:
         idx = q_idx.new_zeros(B_, T, 0, dtype=torch.long)
         if return_soft_weights:
-            # C5 fix: use shared _nan_safe_softmax helper.
+            # Use the shared _nan_safe_softmax helper.
             soft_weights = _nan_safe_softmax(logits, dim=-1)
             return idx, soft_weights
         return idx
@@ -528,7 +518,7 @@ def csa_lightning_indexer(
     idx = idx.masked_fill(torch.isinf(values), -1)
     if topk > S:
         idx = torch.cat([idx, idx.new_full((B_, T, topk - S), -1)], dim=-1)
-    # P0-4 fix: compute a differentiable soft distribution over ALL
+    # Compute a differentiable soft distribution over ALL
     # blocks for the straight-through estimator. ``logits`` still has
     # grad-fn back to the indexer parameters (W_IUQ, W_w, W_KV_idx,
     # W_Z_idx, B_idx) because it is a function of q_idx / k_idx / w_idx
@@ -543,7 +533,7 @@ def csa_lightning_indexer(
     # their -inf entries with 0 before the exp, then zeroing the result.
     # This mirrors the NaN-safe softmax in ``naive_csa``'s else-branch.
     if return_soft_weights:
-        # C5 fix: use shared _nan_safe_softmax helper.
+        # Use the shared _nan_safe_softmax helper.
         soft_weights = _nan_safe_softmax(logits, dim=-1)               # [B, T, n_blocks]
         return idx, soft_weights
     return idx
@@ -753,17 +743,9 @@ def naive_csa(
     n_blocks = T // m
 
     # --- 1. Compress KV (two-branch overlapped) ---
-    # P0 API fix: use F.linear (computes H @ W.T) with W in nn.Linear.weight
-    # layout [out, in] — avoids the non-contiguous .weight.T view that the
-    # previous ``H @ W_aKV`` form required at every call site.
-    #
-    # Issue 2.3 fix: previously this block did 6 SEPARATE ``F.linear(H, W_x)``
-    # calls — ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`` — each launching
-    # its own GEMM kernel. At ``B=1, T=2048, d=512`` this is 6 kernel launches
-    # and 6 separate ``[B, T, d] · [d, out]`` matmuls where a single fused
-    # matmul would do the same work in one launch with better arithmetic
-    # intensity (the concatenated weight tensor has more rows, giving cuBLAS
-    # a larger M dimension to tile over).
+    # Use F.linear (computes H @ W.T) with W in nn.Linear.weight
+    # layout [out, in] — avoids the non-contiguous .weight.T view that an
+    # ``H @ W_aKV`` form would require at every call site.
     #
     # We concatenate all 6 weights along their out_features axis (dim=0) and
     # do ONE ``F.linear`` call, then ``tensor.split`` the result back into
@@ -861,7 +843,7 @@ def naive_csa(
     q_idx = F.linear(cQ, W_IUQ).view(B_, T, nIh, c_I)              # [B, T, nIh, c_I]
     w_idx = F.linear(H, W_w)                                      # [B, T, nIh]
     cbm = _causal_block_mask(T, n_blocks, m, device)
-    # Inference / benchmark fix: STE is a TRAINING-only surrogate for the
+    # Inference / benchmark: STE is a TRAINING-only surrogate for the
     # non-differentiable top-k indexer. It is forward-equivalent to the hard
     # gather but costs an extra full softmax + soft gather. Under
     # ``torch.no_grad()`` there is no backward path to preserve, so computing
@@ -882,7 +864,7 @@ def naive_csa(
                                     return_soft_weights=effective_use_ste,
                                     ste_mode=ste_mode,
                                     normalize_qk=normalize_qk)     # [B, T, topk]
-    # P0-4 fix: when STE is active, the indexer also returns a differentiable
+    # When STE is active, the indexer also returns a differentiable
     # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
     # straight-through estimator. We keep it in a variable that is ``None``
     # when STE is disabled (or no-grad inference is active) so the gather code
@@ -905,18 +887,14 @@ def naive_csa(
     # entire attention core runs in one consistent precision.
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
-    # P0-6 (round 8) fix: honor ``normalize_qk`` for the CORE attention as
-    # well as the indexer. Previously q and C_comp were UNCONDITIONALLY
-    # L2-normalized a few lines below, so a caller passing
-    # ``normalize_qk=False`` (e.g. an ablation of the cosine-attention
-    # recipe) got cosine attention anyway — the flag was silently ignored
-    # for the core path while the indexer branch correctly honored it.
-    # When ``normalize_qk=True`` (the default used by every experiment
-    # runner — see run_quality, run_benchmark, run_decoding, ops_fused),
-    # q and C_comp are L2-normalized and ``scale`` defaults to 1.0
-    # (cosine attention). When ``normalize_qk=False``, we skip both
-    # normalizations and fall back to the classical ``c ** -0.5``
-    # dot-product scale (just like the indexer branch does for its DI).
+    # Honor ``normalize_qk`` for the CORE attention as
+    # well as the indexer. When ``normalize_qk=True`` (the default used by
+    # every experiment runner — see run_quality, run_benchmark,
+    # run_decoding, ops_fused), q and C_comp are L2-normalized and
+    # ``scale`` defaults to 1.0 (cosine attention). When
+    # ``normalize_qk=False``, we skip both normalizations and fall back to
+    # the classical ``c ** -0.5`` dot-product scale (just like the indexer
+    # branch does for its DI).
     # This makes the flag's semantics consistent across both branches and
     # gives ablations a genuine knob to turn off normalization.
     if normalize_qk:
@@ -970,7 +948,7 @@ def naive_csa(
         batch_idx = torch.arange(B_, device=device).view(B_, 1, 1)      # [B, 1, 1]
         kv = C_comp_n[batch_idx, idx_safe]                               # [B, T, topk, c]
 
-        # P0-4 fix — straight-through estimator (STE) for the indexer.
+        # Straight-through estimator (STE) for the indexer.
         # ``kv`` above is a hard gather: its value is correct (the
         # top-k compressed KV entries), but it has NO gradient path back
         # to the indexer parameters because ``indices`` is an integer
@@ -992,7 +970,7 @@ def naive_csa(
         # After ``backward()``, those parameters now have non-None
         # ``.grad`` and are updated by the optimizer.
         #
-        # P0-2 fix — implement ``ste_mode`` as two genuinely distinct
+        # ``ste_mode`` is implemented as two genuinely distinct
         # branches instead of silently aliasing ``'full_softmax'`` to
         # ``'topk_columns'``. Both modes share the same STE identity
         #
@@ -1074,7 +1052,7 @@ def naive_csa(
 
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
             #
-            # P0-5 fix: the previous form ``kv = soft_kv + (kv - soft_kv).detach()``
+            # The form ``kv = soft_kv + (kv - soft_kv).detach()``
             # is forward-equivalent to ``kv`` (hard gather) but in backward the
             # detach() ERASES the direct gradient from the hard gather path,
             # leaving only ``soft_weights * d_out`` as the gradient to the
@@ -1115,22 +1093,15 @@ def naive_csa(
             # For numerical stability we subtract row_max from every score
             # (and from the sink!) so the largest exp() argument is 0:
             #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
-            # where M = max(0, max_i s_i).  The previous code forgot to
-            # shift the sink, producing
-            #   p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink) * exp(M))
-            # i.e. the sink was over-weighted by a factor exp(M) — a
-            # systematic ~13% bias in the default c=64 config and up to 65%
-            # at c=4.  Shifting log_sink by -row_max restores the identity
+            # where M = max(0, max_i s_i). Shifting log_sink by -row_max
+            # restores the identity
             #   logaddexp(a - M, b - M) = logaddexp(a, b) - M
             # so the shifted computation is mathematically identical to the
             # unshifted (overflow-prone) one.
             log_sink = sink_logits.view(1, 1, nh, 1).to(scores)  # [1, 1, nh, 1]
             vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
             # NOTE: renamed from `m` to `row_max` to avoid shadowing the
-            # `m` parameter (compression factor). The previous `m = ...`
-            # silently clobbered the compression factor for the rest of the
-            # function; it happened not to be read again here, but the
-            # shadowing was a latent footgun for future edits.
+            # `m` parameter (compression factor).
             row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, T, nh, 1]
             shifted = scores - row_max                                  # [B, T, nh, topk]
             shifted_sink = log_sink - row_max                           # [B, T, nh, 1]
@@ -1160,16 +1131,12 @@ def naive_csa(
             # above for consistency: detect fully-masked rows, replace their
             # -inf entries with 0 so softmax is finite, then zero the result.
             #
-            # The previous implementation used a clamp(min=1e-20) trick on
-            # the denominator, which also produces p=0 for all-masked rows
-            # but relies on a magic epsilon. The explicit guard is clearer
-            # and avoids any theoretical concern about the epsilon being
-            # too small for fp16/bf16 inputs (where 1e-20 underflows to 0).
+            # Shape: valid_mask is [B, T, topk]; we reduce over topk to get
+            # [B, T, 1], then add a head axis [:, :, None] to broadcast over
+            # the nh dimension of p ([B, T, nh, topk]).
             all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
-            # C5 fix: delegate to shared _nan_safe_softmax helper. We pass
-            # the precomputed all_masked mask so we don't recompute it
-            # (the indexer-style ``logits.isinf().all`` would not match
-            # this branch's ``valid_mask``-based definition of "masked").
+            # Delegate to the shared _nan_safe_softmax helper, passing the
+            # precomputed all_masked mask so we don't recompute it.
             p = _nan_safe_softmax(scores, dim=-1, all_masked_mask=all_invalid)
 
         out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c] in compute_dtype
@@ -1180,21 +1147,9 @@ def naive_csa(
         # Precompute F.linear(H, W_aKV) once (reuse Ca from §1) instead of
         # redoing the matmul per (b, t).
         H_proj = Ca  # [B, T, c], already == F.linear(H, W_aKV)
-        # P5 fix — TRUE O(T·win) sliding-window attention (was O(T²)).
+        # TRUE O(T·win) sliding-window attention.
         #
-        # The previous implementation built a full ``[T, T]`` boolean mask and
-        # a full ``[B, nh, T, T]`` attention-scores tensor, then masked every
-        # entry outside the window to ``-inf`` before softmax. Even though
-        # only ``win`` entries per row were non-trivial, the dense matmul
-        # (``einsum('bthd,bnd->bhtn')``) and the dense softmax both did
-        # ``O(T²·nh·c)`` work — the window size ``win`` had NO effect on the
-        # compute cost, only on which entries survived the mask. This means
-        # the "sliding window" branch was NOT actually achieving the
-        # ``O(T·window)`` complexity that is the whole point of a local
-        # attention mechanism; at ``T=2048`` it allocated and filled a
-        # 4M-entry scores tensor per call regardless of ``win``.
-        #
-        # The P5 fix used a **banded / windowed-gather** approach:
+        # The implementation uses a **banded / windowed-gather** approach:
         #   1. Left-pad ``C_local`` with ``win-1`` zero columns so that the
         #      window for query ``t`` can be extracted as a contiguous slice.
         #   2. Use ``unfold`` to extract per-query windows of shape
@@ -1205,17 +1160,12 @@ def naive_csa(
         #      sequence whose window extends before position 0) to ``-inf``,
         #      softmax, and weighted-sum over the ``win`` dimension.
         #
-        # Issue 2.2 fix: the ``unfold`` call materialized a single ``[B, T,
-        # win, c]`` tensor — fine for ``T≤4k, win≤512`` (≤4M elements) but
-        # blowing up at ``T=64k, win=2k`` (≈8B elements / 32 GB). We now
-        # delegate to ``_sliding_window_attention`` which auto-engages a
-        # chunked path when ``T * win * c`` exceeds ``CHUNKED_SW_THRESHOLD``
-        # (default 8M elements), keeping peak memory at
-        # ``O(chunk_t · win · c)``. For the small-T / small-win case the
-        # helper still uses ``unfold`` on a single slice — same vectorized
-        # fast path as before.
+        # For large ``T * win * c`` (exceeding ``CHUNKED_SW_THRESHOLD``,
+        # default 8M elements), ``_sliding_window_attention`` auto-engages a
+        # chunked path keeping peak memory at ``O(chunk_t · win · c)``; the
+        # small-T / small-win case still uses ``unfold`` on a single slice.
         #
-        # The result is numerically identical to the old dense+mask approach
+        # The result is numerically identical to a dense+mask approach
         # (verified by ``test_hca_sliding_window_causality`` /
         # ``test_csa_full_pipeline_causality`` in run_correctness.py) because
         # softmax over the ``win`` non-masked entries of a row is the same
@@ -1231,12 +1181,11 @@ def naive_csa(
         # (fp32) — an asymmetric precision loss that silently degrades the
         # SW branch's contribution for fp16 inputs.
         #
-        # P0-6 (round 8): honor ``normalize_qk`` here too (mirrors the core
-        # attention block above). When normalize_qk=False we must NOT
-        # L2-normalize C_local either — that would give cosine attention in
-        # the SW branch while the sparse branch stays in dot-product mode,
-        # producing an inconsistent mixing of scales between the two
-        # branches.
+        # Honor ``normalize_qk`` here too (mirrors the core attention block
+        # above). When normalize_qk=False we must NOT L2-normalize C_local
+        # either — that would give cosine attention in the SW branch while
+        # the sparse branch stays in dot-product mode, producing an
+        # inconsistent mixing of scales between the two branches.
         if normalize_qk:
             C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
         else:
