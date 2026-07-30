@@ -89,7 +89,7 @@ jobs:
 
           # 修复 prompt：原有的 bug 检查与修复
           REVIEW_PROMPT = (
-              "分析代码是否有影响实验结果的问题，如果有就修复，"
+              "不要读取.git目录，分析代码是否有影响实验结果的问题，如果有就修复，"
               "dyn_csa_experiment.ipynb是另一个实验的代码，"
               "dyn_csa_experiment.ipynb的问题也要修复"
           )
