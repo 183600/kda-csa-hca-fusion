@@ -14,8 +14,8 @@ concurrency:
 jobs:
   llm-fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 350          # [改] 350min，留10min缓冲给 trigger-next
-    continue-on-error: true        # [新增] 失败也不阻塞 trigger-next
+    timeout-minutes: 350          # 350min，留10min缓冲给 trigger-next
+    continue-on-error: true        # 失败也不阻塞 trigger-next
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,10 +60,10 @@ jobs:
           EOF
           grep -qxF '.opencode/' .gitignore 2>/dev/null || printf '\n.opencode/\n' >> .gitignore
 
-      - name: Run opencode Bug-Fix Loop
+      - name: Run opencode Cleanup & Bug-Fix Loop
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_DURATION_SECONDS: "20400"  # [改] 340min，留10min给清理+触发
+          MAX_DURATION_SECONDS: "20400"  # 340min，留10min给清理+触发
           OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
         run: |
           python - <<'PYEOF'
@@ -73,7 +73,30 @@ jobs:
           MODEL   = os.environ["OPENCODE_MODEL"]
           START   = time.time()
 
-          REVIEW_PROMPT = "分析代码是否有影响实验结果的问题，如果有就修复，dyn_csa_experiment.ipynb是另一个实验的代码，dyn_csa_experiment.ipynb的问题也要修复"
+          # 清理 prompt：删除所有说明修复了什么 bug 的注释，以及文档里说明修复了什么 bug 的内容
+          CLEANUP_PROMPT = (
+              "扫描代码库中所有源代码文件与文档文件（包括 README、CHANGELOG、"
+              "以及 .md / .ipynb / .py / .js / .ts 等所有文本文件），"
+              "找出并删除所有说明「修复了什么 bug」「修了什么问题」「修正了什么错误」"
+              "「修复了什么缺陷」之类内容的注释和文档段落（例如形如 "
+              "'# 修复了 xxx 导致的崩溃'、'// fix: xxx'、'/* 修复了 xxx 问题 */'、"
+              "'## Bug Fixes / 修复内容'、'- 修复了 xxx' 等都应删除）。"
+              "删除这些说明性文字时不要改动实际的功能代码与实验逻辑，"
+              "只移除描述 bug 修复历史的注释和文档内容。"
+              "同样地，dyn_csa_experiment.ipynb 中的此类说明也要清理。"
+              "请直接修改文件，不要保留任何关于 bug 修复历史的说明性内容。"
+          )
+
+          # 修复 prompt：原有的 bug 检查与修复
+          REVIEW_PROMPT = (
+              "分析代码是否有影响实验结果的问题，如果有就修复，"
+              "dyn_csa_experiment.ipynb是另一个实验的代码，"
+              "dyn_csa_experiment.ipynb的问题也要修复"
+          )
+
+          # 两个 prompt 交替使用：奇数轮=CLEANUP，偶数轮=REVIEW
+          PROMPTS = [CLEANUP_PROMPT, REVIEW_PROMPT]
+          LABELS  = ["清理bug修复说明", "修复实验问题"]
 
           def run_cmd(cmd, timeout=120, **kw):
               """仅用于 git 命令，有超时保护；opencode 调用不使用此函数"""
@@ -92,7 +115,7 @@ jobs:
                   os.remove("opencode.json")
               if os.path.isdir(".opencode"):
                   run_cmd(["rm", "-rf", ".opencode"])
-              # [新增] 保护工作流文件，防止 opencode 修改后破坏循环
+              # 保护工作流文件，防止 opencode 修改后破坏循环
               run_cmd(["git", "checkout", "--", ".github/workflows/"])
               run_cmd(["git", "add", "-A"])
               r = run_cmd(["git", "commit", "-m", msg])
@@ -107,13 +130,12 @@ jobs:
                   time.sleep(3)
               return False
 
-          def call_opencode():
+          def call_opencode(prompt):
               """单次 opencode 调用——无 timeout，仅受 GitHub job 总时间限制约束"""
-              user_msg = REVIEW_PROMPT
-              print(f"  -> Prompt 大小: {len(user_msg.encode('utf-8')):,} 字节")
+              print(f"  -> Prompt 大小: {len(prompt.encode('utf-8')):,} 字节")
               return subprocess.run(
                   ["opencode", "run", "--model", MODEL],
-                  input=user_msg,
+                  input=prompt,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
               )
@@ -124,17 +146,22 @@ jobs:
           while True:
               elapsed = time.time() - START
               remaining = MAX_DUR - elapsed
-              # [改] 留10分钟缓冲，确保有足够时间做最终提交+触发下一次
+              # 留10分钟缓冲，确保有足够时间做最终提交+触发下一次
               if remaining <= 2000:
                   print(f"\n ({remaining:.0f}s)，停止迭代。")
                   break
 
               iteration += 1
-              print(f"\n=========== 第 {iteration} 次迭代 "
+              # 交替选择 prompt：奇数轮=CLEANUP，偶数轮=REVIEW
+              phase_idx = (iteration - 1) % 2
+              user_msg  = PROMPTS[phase_idx]
+              phase_lbl = LABELS[phase_idx]
+
+              print(f"\n=========== 第 {iteration} 次迭代 [{phase_lbl}] "
                     f"(已耗时 {elapsed:.0f}s, 剩余 {remaining:.0f}s) ===========")
 
               try:
-                  r = call_opencode()
+                  r = call_opencode(user_msg)
               except Exception as e:
                   print(f"  opencode 错误: {e}")
                   time.sleep(30)
@@ -152,10 +179,11 @@ jobs:
                   preview = "\n     ".join(lines[-20:])
                   print(f"  -> opencode 输出 (最后 20 行):\n     {preview}")
 
-              if git_commit_push_all(
-                  f"opencode: 修复影响实验结果的问题 "
+              commit_msg = (
+                  f"opencode: {phase_lbl} "
                   f"(第 {iteration} 次迭代)"
-              ):
+              )
+              if git_commit_push_all(commit_msg):
                   print("  -> 已提交并推送")
               else:
                   print("  -> 提交/推送失败；将继续处理。")
@@ -169,7 +197,7 @@ jobs:
   trigger-next:
     needs: llm-fix
     runs-on: ubuntu-latest
-    if: always()                   # [改] 移除 && !cancelled()，确保即使超时取消也触发
+    if: always()
     timeout-minutes: 5
     steps:
       - name: Trigger next workflow run
@@ -183,7 +211,6 @@ jobs:
           echo "等待 10 秒进行清理..."
           sleep 10
 
-          # 获取工作流 ID
           WF_ID=$(gh api "/repos/$REPO/actions/workflows" \
             --jq ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
 
@@ -194,12 +221,10 @@ jobs:
 
           echo "找到工作流 ID: $WF_ID"
 
-          # [新增] 重试触发，最多 5 次，应对 API 限流/网络抖动
           MAX_RETRIES=5
           for i in $(seq 1 $MAX_RETRIES); do
             echo "尝试触发下一次运行 (第 $i/$MAX_RETRIES 次)..."
 
-            # [修复] 将 dispatch 改为 dispatches (GitHub API 要求复数)
             if gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
