@@ -125,8 +125,8 @@ jobs:
               elapsed = time.time() - START
               remaining = MAX_DUR - elapsed
               # [改] 留10分钟缓冲，确保有足够时间做最终提交+触发下一次
-              if remaining <= 600:
-                  print(f"\n剩余时间不足10分钟 ({remaining:.0f}s)，停止迭代。")
+              if remaining <= 2000:
+                  print(f"\n ({remaining:.0f}s)，停止迭代。")
                   break
 
               iteration += 1
