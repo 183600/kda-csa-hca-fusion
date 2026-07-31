@@ -156,10 +156,21 @@ def naive_hca(
         log_denom = torch.logaddexp(lse, shifted_sink)              # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
         p = p.masked_fill(all_masked, 0.0)
-        p_sink = (shifted_sink - log_denom).exp()                 # [B, nh, T, 1]
-        p_sink = p_sink.masked_fill(all_masked, 0.0)
+        # Per DeepSeek-V4 §2.3.2 (and the repo's own CSA sink path in
+        # ops_csa.naive_csa) the attention sink is a *virtual* entry that
+        # appears ONLY in the softmax denominator, ``denom = sum_i exp(s_i) +
+        # exp(sink)``. It does NOT contribute a value to the output: the
+        # expected KV of a virtual entry with no source tokens is zero, not a
+        # constant 1 broadcast across the head dim. The previous code added
+        # ``p_sink * 1`` to the output, which silently injected a
+        # per-(batch,position,head) constant bias scaled by the sink
+        # probability into every HCA output — corrupting all HCA-based
+        # quality / ablation / hybrid-decoding numbers and making
+        # ``ops_hca``'s sink contract disagree with ``ops_csa``'s.
+        # Verified by ``test_hca_sink_matches_shifted_logsumexp_reference``
+        # and ``test_hybrid_decoding_cache_matches_full_sequence`` in
+        # run_correctness.py, which now both pass.
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
-        out = out + p_sink.permute(0, 2, 1, 3).expand_as(out)
     else:
         p = _nan_safe_softmax(scores, dim=-1)
         out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
