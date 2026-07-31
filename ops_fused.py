@@ -81,10 +81,9 @@ class HybridConfig:
     # instantiations consistent and makes the value tunable. The default
     # preserves the historical behaviour.
     kda_decay_scale: float = 0.1
-    # F13 fix: init_std for learnable positional biases (Ba, Bb, B_idx,
-    # B_pos). Previously the magic constant 0.02 appeared 4 times in the
-    # CSA/HCA layer constructors. Lifting to a config field makes it
-    # tunable and keeps the value consistent across instantiations.
+    # init_std for learnable positional biases (Ba, Bb, B_idx,
+    # B_pos). Lifting to a config field makes it tunable and keeps the
+    # value consistent across instantiations.
     init_std: float = 0.02
     # NOTE: ``dropout`` is accepted for API compatibility / future use but is
     # NOT yet implemented in any sub-layer (KDA/CSA/HCA). A non-zero value is
@@ -95,14 +94,12 @@ class HybridConfig:
     dropout: float = 0.0
 
     def __post_init__(self):
-        # P1-8 fix: validate dropout TYPE / finite / range BEFORE the
-        # ``NotImplementedError`` guard. The previous order (``if dropout != 0:
-        # raise NotImplementedError``) was the FIRST check, so a caller passing
-        # ``dropout=NaN``, ``dropout="abc"``, or ``dropout=-0.1`` all got the
-        # misleading ``NotImplementedError`` instead of a proper TypeError /
-        # ValueError pointing at the actual problem. Now we validate type and
-        # range first, and only raise ``NotImplementedError`` for values that
-        # ARE valid floats but non-zero (the "not yet wired in" case).
+        # Validate dropout TYPE / finite / range BEFORE the
+        # ``NotImplementedError`` guard, so a caller passing ``dropout=NaN``,
+        # ``dropout="abc"``, or ``dropout=-0.1`` gets a proper TypeError /
+        # ValueError pointing at the actual problem. The ``NotImplementedError``
+        # is raised only for valid floats in [0, 1] that are non-zero (the
+        # "not yet wired in" case).
         if not isinstance(self.dropout, (int, float)):
             raise TypeError(
                 f"HybridConfig.dropout={self.dropout!r} must be a float, "
@@ -113,8 +110,6 @@ class HybridConfig:
             raise TypeError(
                 f"HybridConfig.dropout={self.dropout!r} must be a float, "
                 f"got bool.")
-        # F2 fix: drop redundant ``import math as _math`` (math is already
-        # imported at module scope at line 30).
         if math.isnan(self.dropout) or math.isinf(self.dropout):
             raise ValueError(
                 f"HybridConfig.dropout={self.dropout} must be finite "
@@ -296,14 +291,6 @@ class HybridConfig:
                 f"kda_decay_scale={self.kda_decay_scale} must be >= 0 "
                 f"(negative would invert the decay sign and cause state "
                 f"explosion).")
-        # F1 fix: the second dropout validation block (type / NaN-Inf /
-        # range) was DEAD CODE — the first validation block at lines
-        # 96-124 already raises NotImplementedError for any non-zero
-        # dropout, so the only value that reaches this point is 0.0
-        # (which trivially passes all three checks). The redundant block
-        # was a maintenance footgun: a future reader might think the
-        # second block is the primary validation, when in fact it never
-        # fires for any input that survives the first block. Removed.
 
 
 class KDAHybridLayer(nn.Module):
@@ -325,14 +312,13 @@ class KDAHybridLayer(nn.Module):
         # position t sees {t-2, t-1, t} and NEVER t+1 (future leakage).
         # Conv1d padding=0; left-pad by (k-1) in forward via F.pad.
         self.short_conv = nn.Conv1d(d, d, kernel_size=3, padding=0, groups=d, bias=True)
-        # F3 fix: register ``scale`` as a non-persistent buffer so that
+        # Register ``scale`` as a non-persistent buffer so that
         # ``model.half()`` / ``model.bfloat16()`` cast it along with the
-        # rest of the module's parameters. Previously ``self.scale`` was a
-        # plain Python float attribute (always fp64), and got passed to
-        # ``naive_recurrent_kda`` / ``naive_chunk_kda`` as a Python float
-        # even after ``model.half()`` — a silent precision inconsistency
-        # between the scale used inside the KDA math (fp64 Python float)
-        # and the rest of the computation (fp16/bf16 tensor math).
+        # rest of the module's parameters. A plain Python float attribute
+        # would always stay fp64 and be passed to ``naive_recurrent_kda`` /
+        # ``naive_chunk_kda`` as a fp64 Python float even after
+        # ``model.half()`` — a precision inconsistency between the scale
+        # used inside the KDA math and the rest of the computation.
         self.register_buffer(
             'scale', torch.tensor(K ** -0.5), persistent=False,
         )
@@ -524,26 +510,16 @@ class KDAHybridLayer(nn.Module):
         # that is the caller's responsibility (or the stateful
         # ``forward()`` wrapper does it).
         #
-        # P0-3 fix: respect ``detach_lookback``. Previously ALL three
-        # branches unconditionally called ``.detach().clone()``, which
-        # meant ``detach_lookback=False`` had NO effect on the NEW
-        # lookback returned to the caller — only the INCOMING lookback
-        # was conditionally detached. That broke the documented
-        # cross-chunk BPTT contract: the docstring at the top of
-        # ``_kda_forward`` says ``detach_lookback=False`` lets gradients
-        # flow across chunks, but the next chunk's lookback (produced
-        # here) was always detached, so gradient flow stopped at the
-        # first chunk boundary.
-        #
-        # The fix: build the new lookback from the (possibly
-        # non-detached) ``x`` tensor first, then detach+clone it ONLY if
-        # ``detach_lookback=True``. When ``detach_lookback=False``, the
-        # caller receives a lookback that still carries the autograd
-        # graph from the current chunk's input, so the next chunk's
-        # forward can backprop into the current chunk's parameters
-        # (true cross-chunk BPTT). The ``.clone()`` is always applied
-        # so the caller can mutate the returned tensor without
-        # aliasing the source slice (a defensive copy).
+        # Respect ``detach_lookback``: build the new lookback from the
+        # (possibly non-detached) ``x`` tensor first, then detach it ONLY
+        # if ``detach_lookback=True``. When ``detach_lookback=False``, the
+        # caller receives a lookback that still carries the autograd graph
+        # from the current chunk's input, so the next chunk's forward can
+        # backprop into the current chunk's parameters (true cross-chunk
+        # BPTT, matching the docstring contract at the top of
+        # ``_kda_forward``). The ``.clone()`` is always applied so the
+        # caller can mutate the returned tensor without aliasing the
+        # source slice (a defensive copy).
         if T >= ksize - 1:
             new_lookback = x[:, -(ksize - 1):]
         else:
@@ -571,7 +547,7 @@ class KDAHybridLayer(nn.Module):
         # ~1/sqrt(H) instead of 1. This silently shrinks q.k dot products by
         # a factor of 1/H, which propagates into the KDA recurrence as
         # under-scaled delta-rule updates. Mirrors the (correct) CSA/HCA
-        # branches below and the fix in method_analysis.py.
+        # branches below.
         q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
         k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
         v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
@@ -580,13 +556,6 @@ class KDAHybridLayer(nn.Module):
         # all KDA instantiations (this layer, run_quality.KDAAttn,
         # run_decoding.KDAAttnDecoding, method_analysis._kda_heads) use the
         # same value. The default (0.1) preserves the historical behaviour.
-        # F6 fix: drop defensive ``getattr(cfg, 'kda_decay_scale', 0.1)``
-        # fallback. ``kda_decay_scale`` was promoted to a first-class
-        # ``HybridConfig`` field (with default 0.1) — see lines 71-78 — so
-        # the getattr default could never fire on a real HybridConfig.
-        # The fallback masked the case where a caller passes a non-
-        # HybridConfig object that happens to lack the field, which is a
-        # real bug we want to surface rather than paper over.
         decay_scale = cfg.kda_decay_scale
         g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * decay_scale
         beta = torch.sigmoid(self.beta(x_conv))                   # [B, T, HV]
@@ -623,31 +592,23 @@ class KDAHybridLayer(nn.Module):
 class CSAHybridLayer(nn.Module):
     """A single CSA sub-layer (compression + sparse selection + MQA).
 
-    .. note:: P0-4 fix — indexer is now trainable via straight-through estimator.
-
         The lightning indexer uses ``torch.topk`` which returns integer
-        indices that do NOT propagate gradients directly. The previous
-        implementation left the indexer parameters
-        (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx``) at
-        their random initialization after ``backward()`` (their ``.grad``
-        was ``None`` and AdamW silently skipped them), which made CSA's
-        sparse top-k selection effectively **random** over the learned
-        compressed KV entries.
-
-        The fix adds a straight-through estimator (STE) in
-        ``ops_csa.naive_csa``: the forward pass still uses the HARD
-        top-k indices (so the algorithm remains genuinely sparse), but
-        the backward pass routes gradients through a differentiable soft
+        indices that do NOT propagate gradients directly. To make the
+        indexer parameters (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``,
+        ``B_idx``) trainable, ``ops_csa.naive_csa`` uses a straight-through
+        estimator (STE): the forward pass still uses the HARD top-k
+        indices (so the algorithm remains genuinely sparse), but the
+        backward pass routes gradients through a differentiable soft
         distribution over all compressed blocks. After ``backward()``,
-        the indexer parameters now have non-None ``.grad`` and are
-        updated by the optimizer. The STE does NOT change the forward
-        semantics — CSA is still sparse retrieval — but it makes the
-        indexer *learnable*.
+        the indexer parameters have non-None ``.grad`` and are updated by
+        the optimizer. The STE does NOT change the forward semantics —
+        CSA is still sparse retrieval — but it makes the indexer
+        *learnable*.
 
-        ``indexer_is_trained`` is now ``True`` by default. The
-        ``_maybe_warn_indexer`` method is kept for backward
-        compatibility but only fires when an explicit caller disables
-        STE via ``use_ste=False`` (e.g. for ablation against the
+        ``indexer_is_trained`` is ``True`` by default. The
+        ``_maybe_warn_indexer`` method is kept for backward compatibility
+        but only fires when an explicit caller disables STE via
+        ``use_ste=False`` (e.g. for ablation against the
         untrained-indexer baseline).
     """
 
@@ -675,11 +636,6 @@ class CSAHybridLayer(nn.Module):
         self.B_idx = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_cI) * cfg.init_std)
         self.sink = nn.Parameter(torch.zeros(cfg.csa_nh))
         self.o_proj = nn.Linear(c * cfg.csa_nh, d, bias=False)
-        # P0-4 fix: the indexer is now trainable via the STE in
-        # ``naive_csa``. This flag is read by experiment runners to
-        # include the training status in result JSON metadata. Set to
-        # ``False`` only when ``use_ste=False`` is explicitly passed to
-        # ``naive_csa`` (e.g. for the untrained-indexer ablation).
         self.indexer_is_trained = True
         # Controls whether ``forward`` passes ``use_ste=True`` to
         # ``naive_csa``. Exposed as an instance attribute (not a config
@@ -697,9 +653,9 @@ class CSAHybridLayer(nn.Module):
         cls._indexer_warned = False
 
     def _maybe_warn_indexer(self):
-        # After the P0-4 fix the indexer IS trained (via STE) by default.
-        # The warning now only fires when STE is explicitly disabled,
-        # which is an opt-in ablation against the untrained baseline.
+        # The indexer IS trained (via STE) by default. This warning only
+        # fires when STE is explicitly disabled, which is an opt-in ablation
+        # against the untrained baseline.
         if not self.indexer_is_trained and not CSAHybridLayer._indexer_warned:
             import warnings
             warnings.warn(
@@ -870,11 +826,11 @@ class HybridKCHAttention(nn.Module):
         for layer in self.layers:
             if isinstance(layer, KDAHybridLayer):
                 layer.reset_conv_state()
-        # Batch-3 fix: reset the class-level warning flag so the next
-        # training run re-emits the stateful-forward warning. The flag is
-        # class-level (not instance-level) because the warning is about
-        # the API contract (stateful forward in training is dangerous
-        # regardless of which instance triggers it), but resetting it on
+        # Reset the class-level warning flag so the next training run
+        # re-emits the stateful-forward warning. The flag is class-level
+        # (not instance-level) because the warning is about the API
+        # contract (stateful forward in training is dangerous regardless
+        # of which instance triggers it), but resetting it on
         # ``reset_state()`` is the right place: ``reset_state()`` is
         # called at the start of every training run / eval sequence, so
         # the warning re-fires for each new "session" of use.
@@ -1047,22 +1003,22 @@ class HybridKCHAttention(nn.Module):
                 # Device mismatch (e.g. model moved to cuda, stale CPU state):
                 # move the state to x's device. Do NOT cast dtype here — the
                 # KDA op's ``initial_state.to(compute_dtype)`` handles any
-                # dtype mismatch internally (P1-2 fix: the state is now
-                # returned in ``compute_dtype`` by default, so casting it to
-                # ``x.dtype`` here would reintroduce the fp32→fp16→fp32
-                # round-trip that accumulates quantization error in long
-                # streaming inference).
+                # dtype mismatch internally (the state is returned in
+                # ``compute_dtype`` by default, so casting it to ``x.dtype``
+                # here would reintroduce the fp32→fp16→fp32 round-trip that
+                # accumulates quantization error in long streaming
+                # inference).
                 stacked = stacked.to(device=x.device)
                 if detach_state:
                     stacked = stacked.detach()
             elif detach_state:
                 stacked = stacked.detach()
         if stacked is not None:
-            # F8 fix: validate ``stacked.shape[0]`` matches ``n_kda_layers``.
-            # A length mismatch (e.g. caller loaded a stale state_dict from
-            # a different config) would previously cause an IndexError at
-            # ``states[kda_idx]`` with no useful message. Raise a clear
-            # error up-front instead.
+            # Validate ``stacked.shape[0]`` matches ``n_kda_layers``.
+            # A length mismatch (e.g. caller loaded a stale state_dict
+            # from a different config) would otherwise cause an
+            # IndexError at ``states[kda_idx]`` with no useful message.
+            # Raise a clear error up-front instead.
             if stacked.shape[0] != self.n_kda_layers:
                 raise ValueError(
                     f"HybridKCHAttention.forward_functional: stacked KDA "
@@ -1070,8 +1026,9 @@ class HybridKCHAttention(nn.Module):
                     f"{self.n_kda_layers} KDA layers. The state was likely "
                     f"persisted from a different config — reinitialize or "
                     f"resize before calling forward_functional.")
-            # F12 fix: use ``unbind`` instead of a Python list comprehension
-            # (avoids the explicit index loop; equivalent semantics).
+            # ``unbind`` the stacked KDA state into a list of per-layer
+            # states (equivalent to a Python list comprehension over
+            # indices, but avoids the explicit index loop).
             states = list(stacked.unbind(0))
         else:
             states = [None] * self.n_kda_layers
@@ -1079,12 +1036,12 @@ class HybridKCHAttention(nn.Module):
         # Build a mutable copy of the conv lookbacks so we can update per
         # layer without touching self.
         lookback_list = list(conv_lookbacks)
-        # F7 fix: a length mismatch between ``conv_lookbacks`` and
-        # ``n_kda_layers`` is a real bug — the caller is feeding state
-        # from a different config. Previously we silently padded with
-        # ``None`` or truncated, which masked the bug and produced
-        # confusing downstream errors (e.g. a layer receiving ``None``
-        # when it expected a real tensor). Raise a clear ValueError.
+        # A length mismatch between ``conv_lookbacks`` and
+        # ``n_kda_layers`` means the caller is feeding state from a
+        # different config. Raise a clear ValueError rather than
+        # silently padding with ``None`` or truncating, which would
+        # mask the bug and produce confusing downstream errors (e.g. a
+        # layer receiving ``None`` when it expects a real tensor).
         if len(lookback_list) != self.n_kda_layers:
             raise ValueError(
                 f"HybridKCHAttention.forward_functional: conv_lookbacks has "
@@ -1124,7 +1081,7 @@ class HybridKCHAttention(nn.Module):
                     "partial state stack (would silently drop other layers' "
                     "states). Check the KDA layer implementation."
                 )
-            # P0 fix: explicit shape-consistency check before torch.stack.
+            # Explicit shape-consistency check before torch.stack.
             # ``torch.stack`` requires all tensors to have the SAME shape;
             # a future per-layer config (e.g. per-layer head_dim) would
             # otherwise raise a cryptic ``RuntimeError: stack expects each

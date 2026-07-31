@@ -343,12 +343,9 @@ class _SlidingWindowRingBuffer:
     def _append_one(self, x_one: torch.Tensor) -> None:
         """Append a single ``[B, c]`` entry."""
         if self._sw_len < self.win:
-            # Buffer not yet full: write at the next free slot.
-            # D10 fix: drop the dead modulo — when the buffer is not yet
-            # full, ``_sw_head == 0`` and ``_sw_len < win``, so
-            # ``(0 + _sw_len) % win == _sw_len``. The modulo was a no-op
-            # that obscured the simple "append to the next free slot"
-            # semantics.
+            # Buffer not yet full: append at the next free slot.
+            # ``_sw_head == 0`` and ``_sw_len < win``, so the write
+            # position is simply ``_sw_head + _sw_len``.
             write_pos = self._sw_head + self._sw_len
             self._buf[:, write_pos] = x_one
             self._sw_len += 1
@@ -682,9 +679,9 @@ class CSADecodingCache:
             raise ValueError(
                 f"CSADecodingCache.append_step: c_I={K_idx_new.shape[-1]} "
                 f"does not match cache's c_I={self.c_I}.")
-        # D8 fix: validate T_new consistency across ALL inputs, not just
-        # ``Ca_new``. A mismatch (e.g. ``Ca_new`` has T_new=4 but
-        # ``Cb_new`` has T_new=3) would previously crash deep inside the
+        # Validate T_new consistency across ALL inputs, not just
+        # ``Ca_new``: a mismatch (e.g. ``Ca_new`` has T_new=4 but
+        # ``Cb_new`` has T_new=3) would otherwise crash deep inside the
         # per-token Python loop with a cryptic IndexError.
         for _name, _t in [
             ('Cb_new', Cb_new), ('Za_new', Za_new), ('Zb_new', Zb_new),
@@ -750,9 +747,9 @@ class CSADecodingCache:
                 new_K_I = _indexer_compress_single(
                     K_idx_block, Z_idx_block, B_idx,
                 )                                                  # [B, c_I]
-                # P0-4 fix: the compress helpers upcast to fp32/fp64
-                # internally (compute_dtype) and return that dtype. Cast
-                # back to the cache's storage dtype before writing into the
+                # The compress helpers upcast to fp32/fp64 internally
+                # (compute_dtype) and return that dtype. Cast back to the
+                # cache's storage dtype before writing into the
                 # geometrically-grown storage so all rows stay uniform.
                 new_C_row = new_C.unsqueeze(1).to(self.dtype)     # [B, 1, c]
                 new_K_I_row = new_K_I.unsqueeze(1).to(self.dtype) # [B, 1, c_I]

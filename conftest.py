@@ -158,46 +158,10 @@ def pytest_collection_modifyitems(config, items):
                 break
 
 
-# ----------------------------------------------------------------------------
-# P0-1 fix: convert "list-of-dict result" returns into real pytest failures.
-# ----------------------------------------------------------------------------
-# The test functions in ``run_correctness.py`` follow a custom-runner pattern:
-# each ``test_*`` function returns a list of ``_ok(name, cond, detail)`` dicts
-# instead of using ``assert``. The custom ``main()`` runner in that file
-# aggregates these dicts and writes a structured ``exp1_correctness.json``.
-#
-# The problem: pytest IGNORES non-None return values from test functions.
-# A ``cond=False`` recorded via ``_ok(name, False, ...)`` would therefore
-# be silently marked as PASS by pytest — a "false green" that hides real
-# regressions when contributors run ``pytest -q run_correctness.py``.
-#
-# The previous implementation used a ``pytest_runtest_call`` hookwrapper and
-# read ``outcome.get_result()``. That DOES NOT WORK: for ``pytest_runtest_call``
-# the outcome's result is the return value of ``item.runtest()``, which is
-# always ``None`` (the test function's return value is discarded by pytest's
-# default ``pytest_pyfunc_call`` implementation BEFORE ``runtest`` returns).
-# Verified: a test returning ``[{'status': 'FAIL'}]`` was still reported as
-# ``1 passed`` with only a ``PytestReturnNotNoneWarning``.
-#
-# The fix: replace the default ``pytest_pyfunc_call`` implementation with our
-# own that (a) calls the test function, (b) captures the return value, (c)
-# inspects it for the ``_ok`` list-of-dict pattern, and (d) raises
-# ``AssertionError`` if any sub-check has ``status != 'PASS'``. The
-# ``tryfirst=True`` ensures our hook runs before pytest's default
-# implementation. ONLY return ``True`` (which stops the default impl) when we
-# actually handled the ``_ok`` list-of-dict pattern; for all other return
-# values (including ``None``), return ``None`` so pytest's default
-# implementation runs normally (preserving proper fixture finalization,
-# ``PytestReturnNotNoneWarning`` semantics, and support for ``test_figures.py``
-# tests that use plain ``assert`` and return ``None``).
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem):
     """Capture test function return values and convert list-of-dict FAIL
     entries into real AssertionError failures.
-
-    Replaces the broken ``pytest_runtest_call`` hookwrapper (which could not
-    see the test function's return value because ``outcome.get_result()``
-    returns ``None`` for non-raising tests).
 
     Only handles plain synchronous functions returning the ``_ok``
     list-of-dict pattern. Async tests, generator tests, and any other exotic
@@ -209,7 +173,7 @@ def pytest_pyfunc_call(pyfuncitem):
     testfunction = pyfuncitem.obj
     # Let the default impl handle async / generator test functions — replacing
     # them would require duplicating pytest's async-runner logic, which is
-    # fragile and outside the scope of this fix.
+    # fragile and outside the scope of this hook.
     if _inspect.iscoroutinefunction(testfunction) or \
        _inspect.isasyncgenfunction(testfunction) or \
        _inspect.isgeneratorfunction(testfunction):
