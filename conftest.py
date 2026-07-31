@@ -103,19 +103,18 @@ def pytest_collection_modifyitems(config, items):
     runs where remembering to pass ``-m "not slow"`` every time is easy
     to forget).
 
-    P1-6 fix (Batch-3): when the user passes ``--device cuda`` but CUDA is
-    unavailable, previously the tests would run with ``device='cuda'`` and
-    crash deep inside torch with a cryptic ``RuntimeError: CUDA is not
-    available``. Now we detect this up-front and skip the CUDA-only tests
-    with a clear ``skip`` reason instead of letting them crash.
+    P1-6: when the user passes ``--device cuda`` but CUDA is
+    unavailable, the tests are skipped with a clear ``skip`` reason
+    instead of crashing deep inside torch with a cryptic
+    ``RuntimeError: CUDA is not available``.
 
-    P2-2 (round 7): honor ``SKIP_SLOW=1`` (or SKIP_SLOW=true/yes/on) by
+    P2-2: honor ``SKIP_SLOW=1`` (or SKIP_SLOW=true/yes/on) by
     automatically skipping any test marked ``slow``, regardless of the
     ``-m`` expression. This provides a single environment-driven knob that
     CI (e.g. Kaggle CPU smoke, GitHub Actions quick job) can flip without
     re-writing the pytest invocation line.
     """
-    # P2-2: pre-register the "slow" marker so pytest does not emit
+    # Pre-register the "slow" marker so pytest does not emit
     # PytestUnknownMarkWarning for our dynamically-applied markers. The
     # marker is already documented above, but registering it silences the
     # warning and makes it show up in ``pytest --markers``.

@@ -40,20 +40,17 @@ def load(name):
 
     Returns ``[]`` on FileNotFoundError or JSONDecodeError so the caller
     can degrade gracefully (skip the figure with a log line) rather than
-    crashing the entire figure-generation step. A truncated/malformed
-    JSON (common when an experiment is killed mid-write) used to crash
-    every subsequent figure too.
+    crashing the entire figure-generation step.
 
     Supports two on-disk schemas:
 
-    1. **Legacy bare array** ``[{...}, {...}]`` (the historical format;
-       still used by all result files except ``exp4_mqar.json`` after the
-       P0-1 fix).
+    1. **Legacy bare array** ``[{...}, {...}]`` (still used by all
+       result files except ``exp4_mqar.json``).
     2. **Envelope object** ``{"metadata": {...}, "results": [...]}``
-       introduced by the P0-1 fix so that a result file can carry
-       provenance / caveats alongside the data array without producing
-       the invalid concatenated-document form ``{...}\\n[...]`` that
-       ``json.load`` rejects with ``Extra data``.
+       so that a result file can carry provenance / caveats alongside
+       the data array without producing the invalid concatenated-document
+       form ``{...}\\n[...]`` that ``json.load`` rejects with
+       ``Extra data``.
 
     For the envelope form, this function returns the inner ``results``
     array so downstream figure code keeps working unchanged. The

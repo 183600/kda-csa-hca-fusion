@@ -208,14 +208,13 @@ class HybridConfig:
                 f"kda_chunk_size={self.kda_chunk_size!r} must be an int "
                 f"(>= 1 enables the chunk path; <= 0 forces the recurrent "
                 f"path; default 64).")
-        # P1-3 fix — validate the remaining structural params that were
-        # previously unchecked. Negative values for these fields would
-        # either silently produce an empty layer list (Python's
-        # ``[x] * -1 == []``), crash with a cryptic torch error inside
-        # the first forward pass, or silently disable a branch (looking
-        # like the caller intentionally turned it off). Validate them
-        # here so the error fires at config construction with a clear
-        # message pointing at the misconfigured field.
+        # Validate the remaining structural params. Negative values for
+        # these fields would either silently produce an empty layer list
+        # (Python's ``[x] * -1 == []``), crash with a cryptic torch error
+        # inside the first forward pass, or silently disable a branch
+        # (looking like the caller intentionally turned it off). Validate
+        # them here so the error fires at config construction with a
+        # clear message pointing at the misconfigured field.
         #
         # Layer counts: negative values silently produce empty lists via
         # Python's ``[layer] * n`` semantics (``[x] * -1 == []``), so a
@@ -571,8 +570,8 @@ class KDAHybridLayer(nn.Module):
         #   * ``kda_chunk_size >= 1`` AND ``T < kda_chunk_size`` -> recurrent
         #     path (the chunk path's per-chunk overhead exceeds the win at
         #     short T; also avoids the chunk path's right-padding cost).
-        # The chunk path is now wired in (previously ``kda_chunk_size`` was
-        # a dead field — see the P1-4 fix in ``HybridConfig.__post_init__``).
+        # The chunk path is wired in (``kda_chunk_size`` is consumed in
+        # ``HybridConfig.__post_init__`` to validate/select it).
         use_chunk = (cfg.kda_chunk_size >= 1 and T >= cfg.kda_chunk_size)
         # Dispatch through the reference/FLA adapter. The adapter receives the
         # already-normalized q/k, log-space g and post-sigmoid beta produced

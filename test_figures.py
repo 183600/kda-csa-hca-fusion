@@ -41,10 +41,9 @@ import make_figures  # noqa: E402
 def _ok(name, cond, detail=''):
     """Print a PASS/FAIL line AND assert, so pytest counts failures.
 
-    Previously this helper only returned the bool, so ``pytest`` silently
-    counted every test as passing even when ``cond`` was False (pytest
-    ignores return values). Now we both print (for the ``python3
-    test_figures.py`` direct-run path) and assert (for the pytest path).
+    Pytest ignores return values, so we both print (for the
+    ``python3 test_figures.py`` direct-run path) and assert (for the
+    pytest path).
     """
     status = 'PASS' if cond else 'FAIL'
     print(f"  [{status}] {name}: {detail}")
@@ -53,19 +52,12 @@ def _ok(name, cond, detail=''):
 
 
 # --- per-test temp-directory helpers ------------------------------------
-# P1-6 fix: every test must run against a per-test temp directory, NOT the
-# real ``results/`` / ``figures/`` directories. The previous backup/restore
-# mechanism was broken in two ways:
-#   1. ``_restore_results`` only copied old files back — it did NOT delete
-#      files that the test created and that didn't exist before. So a test
-#      that wrote ``_test_envelope.json`` would leave that file in the real
-#      ``results/`` dir forever.
-#   2. Multiple pytest-xdist workers would compete on the same real
-#      directory, corrupting each other's backup/restore cycles.
-# The fix uses pytest's ``tmp_path`` + ``monkeypatch`` (or a
-# ``tempfile.TemporaryDirectory`` for the direct-run path) to redirect
-# ``make_figures._RESULTS_DIR`` and ``make_figures._FIGURES_DIR`` to a
-# per-test temp dir. The real directories are never touched.
+# Every test runs against a per-test temp directory, NOT the real
+# ``results/`` / ``figures/`` directories. We use pytest's ``tmp_path``
+# + ``monkeypatch`` (or a ``tempfile.TemporaryDirectory`` for the
+# direct-run path) to redirect ``make_figures._RESULTS_DIR`` and
+# ``make_figures._FIGURES_DIR`` to a per-test temp dir. The real
+# directories are never touched.
 
 @contextlib.contextmanager
 def _redirect_dirs(tmpdir: str):
@@ -130,11 +122,9 @@ def test_load_envelope_format(tmp_path=None, monkeypatch=None):
     """``make_figures.load`` must accept the P0-1 envelope schema.
 
     The MQAR writer (``run_quality.main``) emits a single JSON object
-    ``{"metadata": {...}, "results": [...]}``. The previous writer
-    concatenated two top-level documents (``{...}\\n[...]``) which is
-    not valid JSON; ``make_figures.load`` then returned ``[]`` and the
-    MQAR figure was silently skipped. This test pins the contract that
-    the new envelope is parsed into the inner ``results`` array.
+    ``{"metadata": {...}, "results": [...]}``. This test pins the
+    contract that the envelope is parsed into the inner ``results``
+    array.
     """
     print("\nTest: load() unwraps the {metadata, results} envelope")
     with _redirect_dirs_for(tmp_path, monkeypatch) as (results_dir, _):
@@ -155,7 +145,7 @@ def test_load_legacy_bare_array(tmp_path=None, monkeypatch=None):
     """``make_figures.load`` must still accept the legacy bare-array schema.
 
     All non-MQAR result files (benchmark, kv_cache, ablation, decoding,
-    correctness) are bare arrays. The P0-1 envelope fix must not break
+    correctness) are bare arrays. The envelope schema must not break
     them.
     """
     print("\nTest: load() still accepts legacy bare-array schema")
@@ -204,12 +194,7 @@ def test_fig_benchmark_all_errors(tmp_path=None, monkeypatch=None):
 
 
 def test_plot_ablation_group_empty_data(tmp_path=None, monkeypatch=None):
-    """_plot_ablation_group with empty records should not crash.
-
-    Previously this raised ``ValueError: max() iterable argument is empty``
-    from ``max(max(a + c for a, c in zip(accs, acc_cis)) * 1.3, 0.2)``
-    when accs was empty.
-    """
+    """_plot_ablation_group with empty records should not crash."""
     print("\nTest: _plot_ablation_group with empty data")
     with _redirect_dirs_for(tmp_path, monkeypatch):
         make_figures._plot_ablation_group([], 1, False)
@@ -240,11 +225,8 @@ def test_plot_ablation_group_all_errors(tmp_path=None, monkeypatch=None):
 def test_fig_ablation_suptitle_not_clipped(tmp_path=None, monkeypatch=None):
     """The fig_ablation suptitle must not be clipped at the top of the image.
 
-    Previously the suptitle was positioned at y=1.02 (above the figure's
-    top edge y=1.0) AND savefig was called WITHOUT ``bbox_inches='tight'``,
-    causing the top half of the title text to be cut off in the saved
-    PNG/PDF. This test generates a figure and verifies that the topmost
-    rows of the image are NOT text (i.e. there is white space above the
+    This test generates a figure and verifies that the topmost rows of
+    the image are NOT text (i.e. there is white space above the
     suptitle).
     """
     print("\nTest: fig_ablation suptitle is not clipped")
@@ -350,10 +332,8 @@ def main():
             fn(tmp_path=None, monkeypatch=None)
             results.append(True)
         except AssertionError as e:
-            # Surface assertion failures loudly so the user can see which
-            # check failed and why. Previously this branch silently
-            # swallowed the message, making direct-run failures
-            # undiagnosable (only the pass count was printed).
+            # Surface assertion failures loudly so the user can see
+            # which check failed and why.
             print(f"  [FAIL] {fn.__name__}: AssertionError: {e}")
             results.append(False)
         except Exception as e:
