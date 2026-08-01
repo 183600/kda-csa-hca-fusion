@@ -35,16 +35,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # P0 fix: pin UPPER bounds. torch 2.3 vs 2.6 differ in
+    # Pin UPPER bounds. torch 2.3 vs 2.6 differ in
     # ``scaled_dot_product_attention`` behaviour (kernel selection,
     # padding handling) which affects the softmax baseline numbers in
     # ``run_benchmark`` / ``run_quality``. einops 0.8 changed the
     # default ``rearrange`` error message format. matplotlib 3.10
-    # dropped several deprecated APIs. Without upper bounds, a fresh
-    # ``pip install -e .`` on a new machine can silently pull a
-    # breaking release and produce numerically different results from
-    # the published ones. The bounded ranges below match the versions
-    # used to generate the committed historical results.
+    # dropped several deprecated APIs. The bounded ranges below match
+    # the versions used to generate the committed historical results.
     "torch>=2.2,<2.7",
     "einops>=0.6,<0.9",
     "matplotlib>=3.5,<3.11",
@@ -61,13 +58,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# P1 fix: declare the full dev toolchain so
-# ``pip install -e .[dev]`` brings in every tool a contributor needs.
-# Previously only ``pytest`` was listed, so contributors had to
-# discover scipy / mypy / ruff requirements by trial and error (the
-# test suite uses scipy.stats.t.ppf with a fallback table; the codebase
-# has typing annotations that mypy can check; the style is
-# black-isort-ruff compatible).
+# Declare the full dev toolchain so ``pip install -e .[dev]`` brings in
+# every tool a contributor needs (pytest, scipy.stats.t.ppf with a
+# fallback table, mypy for the typing annotations, ruff for the
+# black-isort-ruff compatible style).
 dev = [
     "pytest>=7.0,<9.0",
     "pytest-xdist>=3.0,<5.0",  # parallel test execution; -n auto
@@ -113,13 +107,6 @@ py-modules = [
     "make_figures",
     "method_analysis",
     "kaggle_setup",
-    # CT6 fix: removed ``test_figures`` from py-modules. Test files should
-    # NOT be installed as importable top-level modules — ``pip install -e .``
-    # would otherwise make ``import test_figures`` succeed in production
-    # environments, conflating test code with library code. ``run_correctness``
-    # is kept because it doubles as a pytest collection target AND a
-    # standalone script the README references; ``test_figures`` is purely a
-    # test file.
 ]
 
 [tool.pytest.ini_options]
@@ -131,11 +118,8 @@ py-modules = [
 python_files = ["run_correctness.py", "test_figures.py", "test_*.py"]
 python_functions = ["test_*"]
 testpaths = ["."]
-# CT8 fix: add ``--strict-markers`` and ``--strict-config`` to ``addopts``.
-# Without ``--strict-markers``, a typo like ``@pytest.mark.sloww`` silently
-# creates an unknown marker instead of raising — masking the typo. Without
-# ``--strict-config``, pyproject errors (e.g. bad ini value) are silently
-# swallowed. Both flags make pytest loud about configuration mistakes.
+# Use ``--strict-markers`` and ``--strict-config`` so a typo in a marker
+# (or a bad ini value) raises loudly instead of being silently ignored.
 addopts = "--strict-markers --strict-config"
 # Register the ``slow`` marker (used by conftest.py to tag long-running
 # tests so ``pytest -m "not slow"`` can skip them during fast CI loops).
@@ -143,9 +127,8 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
 
-# CT8 fix: add a coverage config so ``pytest --cov`` produces a meaningful
-# report. Without this, coverage defaults to skipping the ``ops_*`` modules
-# (the actual library code) and only covering the test files themselves.
+# Coverage config so ``pytest --cov`` covers the ``ops_*`` library
+# modules (the default would otherwise skip them and only cover tests).
 [tool.coverage.run]
 source = ["ops_kda", "ops_csa", "ops_hca", "ops_fused", "ops_decoding_cache"]
 branch = true
@@ -170,11 +153,11 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
-# Batch-3 fix: add Ruff config so ``ruff check .`` can be used as a CI gate.
-# The config is intentionally permissive about line length (the codebase
-# has many long docstring examples and URL comments that would be noisy
-# to wrap) but enforces the most impactful rules: undefined names,
-# unused imports, obvious bugs (F-class), and PEP 8 conventions (E/W).
+# Ruff config so ``ruff check .`` can be used as a CI gate. The config
+# is intentionally permissive about line length (the codebase has many
+# long docstring examples and URL comments that would be noisy to wrap)
+# but enforces the most impactful rules: undefined names, unused
+# imports, obvious bugs (F-class), and PEP 8 conventions (E/W).
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -214,9 +197,8 @@ python_version = "3.10"
 # (catches undefined names and obvious type errors, ignores missing
 # stubs for third-party libraries).
 ignore_missing_imports = true
-# CT7 fix: enable ``check_untyped_defs``. The previous ``false`` disabled
-# mypy's checks on untyped function bodies — exactly where most bugs hide.
-# Typing the existing functions is incremental; enabling this flag at
-# least catches NEW untyped functions that introduce type errors.
+# Enable ``check_untyped_defs`` so mypy checks untyped function bodies.
+# Typing the existing functions is incremental; this flag at least
+# catches NEW untyped functions that introduce type errors.
 check_untyped_defs = true
 warn_unused_ignores = true

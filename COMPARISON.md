@@ -14,7 +14,7 @@
 | HCA实现 | 完整：heavy压缩, dense MQA, causal block mask, 验证, sink, return_projections供decoding cache | 简化：同CSA简化 |
 | Decoding | 有 `ops_decoding_cache.py`: CSADecodingCache/HCADecodingCache 增量解码，避免每步全量重压缩，支持hybrid stack | 无，decode每次全量重算 |
 | 实验体系 | 6个实验：correctness/benchmark/kv_cache/mqar/ablation/decoding + method_analysis + make_figures + 统计学(多seed CI95, Bonferroni校正, conclusions_valid) | 只有ppl+needle玩具评估 |
-| Kaggle适配 | `run_all.py` 自动处理只读`/kaggle/input`, 原子JSON写入, CUDA校验, SKIP_SLOW, env变量隔离修复 | 早期demo有kaggle分支但无只读处理 |
+| Kaggle适配 | `run_all.py` 自动处理只读`/kaggle/input`, 原子JSON写入, CUDA校验, SKIP_SLOW, env变量隔离 | 早期demo有kaggle分支但无只读处理 |
 | AutoDL成本 | 无显式成本控制，但可通过BENCH_LENGTHS/MQAR_STEPS控制 | 有成本估算，<120元设计 |
 | 可训练性 | 仅MQAR小模型分类头训练，无真实LM训练 | 有TinyStories LM训练，支持bf16+compile，适合发论文快速验证 |
 
