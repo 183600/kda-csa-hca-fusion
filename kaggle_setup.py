@@ -11,10 +11,7 @@ It exposes:
 
   * ``detect_env()``        -> dict with flags (is_kaggle, has_gpu, device, ...)
   * ``get_device()``         -> ``torch.device``
-  * ``setup_kaggle()``       -> SM1 fix: previously documented as "installs
-                                the right torch wheel"; the implementation
-                                (see ``bootstrap_kaggle_cuda``) actually
-                                VALIDATES CUDA availability and raises
+  * ``setup_kaggle()``       -> validates CUDA availability and raises
                                 ``RuntimeError`` if a GPU was expected but
                                 not found. The wheel-install logic lives
                                 in ``bootstrap_kaggle_cuda``; this function
@@ -70,7 +67,7 @@ _PYTORCH_WHEEL_INDEX_URLS = {
 }
 
 # Fallback wheel when the driver-reported CUDA version cannot be probed.
-# Matches the previous hard-coded value, known to work on Kaggle T4 (sm_75).
+# Known to work on Kaggle T4 (sm_75).
 _DEFAULT_CUDA_WHEEL_KEY = "cu121"
 
 
@@ -222,7 +219,7 @@ def setup_kaggle(verbose: bool = True) -> None:
     # We deliberately DO NOT install the wheel here. Installing it in the
     # current process is a no-op for torch.cuda.is_available() (the binary
     # is already loaded), and continuing to the experiments would silently
-    # produce CPU results — exactly the bug we are fixing.
+    # produce CPU results.
     #
     # Instead, raise so the caller knows the environment is not ready.
     raise RuntimeError(
@@ -297,14 +294,10 @@ def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
         sys.executable, "-m", "pip", "install", "-q",
         "--upgrade",
         "--upgrade-strategy", "only-if-needed",
-        # P1-4 fix: pin the SAME upper bound as pyproject.toml's
-        # ``torch>=2.2,<2.7``. The previous ``torch>=2.1`` had no upper
-        # bound, so a fresh Kaggle bootstrap could pull torch 2.7+ which
-        # changes ``scaled_dot_product_attention`` kernel selection and
-        # padding handling — silently producing numerically different
-        # benchmark results from the committed ones. Bumping the lower
-        # bound to 2.2 matches pyproject.toml exactly; keeping the upper
-        # bound at <2.7 prevents breaking changes from sneaking in.
+        # Pin the SAME upper bound as pyproject.toml's
+        # ``torch>=2.2,<2.7`` so a fresh Kaggle bootstrap does not pull
+        # a wheel that changes ``scaled_dot_product_attention`` kernel
+        # selection and padding handling.
         "torch>=2.2,<2.7", "--extra-index-url", index_url,
     ])
     # The install succeeded, but the CURRENT process still has the old
@@ -400,27 +393,17 @@ def configure_logging(verbose: bool = True) -> None:
     Called from ``configure_torch_for_device`` so every experiment that calls
     ``configure_torch_for_device`` gets logging set up.
 
-    Batch-3 fix: previously this function UNCONDITIONALLY removed all
-    existing root handlers and replaced them with our own. When the host
-    application (Jupyter notebook, MLflow, a parent pipeline) had
-    configured its own root handlers, our call silently destroyed them
-    — breaking the host's logging. The report flagged this as a side
-    effect that "may break host notebook/application logs".
-
-    The fix: only configure the root logger if it has NO handlers yet
-    (``logging.getLogger().handlers == []``). If the host already
-    configured logging, we respect its configuration and only adjust
-    the LEVEL (downgrading WARNING→INFO is safe; the host's handlers
-    still see the records). This mirrors the standard library's
-    ``logging.basicConfig`` idempotency contract (basicConfig is a
-    no-op if the root already has handlers).
+    Only configure the root logger if it has NO handlers yet
+    (``logging.getLogger().handlers == []``). If the host already configured
+    logging, we respect its configuration and only adjust the LEVEL
+    (downgrading WARNING→INFO is safe; the host's handlers still see the
+    records). This mirrors the standard library's ``logging.basicConfig``
+    idempotency contract (basicConfig is a no-op if the root already has
+    handlers).
 
     The experiment scripts use ``logging.getLogger(__name__)`` which
     propagates to the root, so configuring root is the right level
-    (catches all module loggers uniformly). A future refactor could
-    move all loggers under a named project logger (``kch_fusion``)
-    for full isolation, but that requires touching every runner and
-    is tracked as Batch-3 "split large files" follow-up work.
+    (catches all module loggers uniformly).
     """
     root = logging.getLogger()
     if not root.handlers:
@@ -443,7 +426,7 @@ def configure_logging(verbose: bool = True) -> None:
 def configure_torch_for_device(
     device: torch.device | None = None,
     *,
-    verbose: bool = True,  # SM5 fix: was hardcoded True; now a kwarg.
+    verbose: bool = True,
 ) -> EnvInfo:
     """Set global thread count + cudnn flags appropriate for the device.
 
@@ -458,18 +441,8 @@ def configure_torch_for_device(
     info = detect_env()
     if device is None:
         device = info.device
-    # Apply ``torch.set_num_threads`` on BOTH CPU and GPU branches.
-    # Previously the GPU branch skipped this call, so on GPU the actual
-    # ``torch.get_num_threads()`` stayed at the process default
-    # (typically ``os.cpu_count()``), while ``detect_env()`` reported
-    # ``num_threads=1`` — making ``capture_provenance()`` emit inaccurate
-    # metadata in every experiment JSON. The mismatch also meant CPU-side
-    # ops (e.g. data loading, ``F.linear`` on small tensors that don't
-    # hit cuBLAS) could oversubscribe the host with ``cpu_count()``
-    # threads, perturbing latency measurements. Setting it explicitly to
-    # ``info.num_threads`` (1 on GPU, ``cpu_count()-1`` on CPU) makes the
-    # reported value match the actual value and keeps host-side work
-    # bounded on GPU.
+    # Apply ``torch.set_num_threads`` on BOTH CPU and GPU branches so the
+    # reported value matches the actual value and host-side work is bounded.
     torch.set_num_threads(info.num_threads)
     if device.type == "cpu":
         # ``set_num_interop_threads`` can only be called ONCE per process
@@ -530,14 +503,12 @@ def print_env_summary() -> EnvInfo:
 
 
 def capture_provenance() -> dict:
-    """BQ8 / AK10 fix: capture environment provenance for result JSON files.
+    """Capture environment provenance for result JSON files.
 
     Returns a dict with torch / CUDA / Python / git-commit / env-var
-    metadata so a result JSON is self-describing. Previously the four
-    experiment runners (benchmark, quality, ablation, decoding, kv_cache)
-    wrote rows with no environment metadata — a reader picking up a stale
-    JSON had no way to tell which torch version / GPU / commit produced
-    it, making cross-version comparisons meaningless.
+    metadata so a result JSON is self-describing. Without this, a reader
+    picking up a stale JSON has no way to tell which torch version / GPU
+    / commit produced it, making cross-version comparisons meaningless.
     """
     import os
     import platform
@@ -585,15 +556,11 @@ def parse_int_env(var_name: str, default: int, *, min_value: int = 1,
     was ignored rather than silently dropped.
 
     This mirrors the robust pattern already used for ``BENCH_REPEATS`` /
-    ``BENCH_LENGTHS`` in ``run_benchmark.py`` (which previously crashed
-    the whole benchmark on malformed input). Extending the same pattern
+    ``BENCH_LENGTHS`` in ``run_benchmark.py``. Extending the same pattern
     to ``MQAR_SEEDS`` / ``MQAR_STEPS`` / ``MQAR_SOFTMAX_STEPS`` /
     ``MQAR_TRAIN_BATCH`` / ``ABL_SEEDS`` / ``ABL_STEPS`` / ``ABL_TRAIN_BATCH``
-    prevents a single typo from crashing an entire multi-hour experiment
-    with no informative error message — previously the bare
-    ``int(os.environ.get(...))`` raised ``ValueError: invalid literal for
-    int() with base 10: 'abc'`` with no context about WHICH env var was
-    bad or what the default would have been.
+    surfaces an invalid setting with a warning naming the offending env var
+    and the default that was used instead.
 
     Args:
         var_name: environment variable name to read.
@@ -625,11 +592,11 @@ def parse_int_env(var_name: str, default: int, *, min_value: int = 1,
 def sanitize_for_json(obj):
     """Recursively replace non-finite floats with ``None`` for strict JSON.
 
-    Mirrors the inline ``_sanitize`` helpers previously duplicated across
+    Mirrors the inline ``_sanitize`` helpers duplicated across
     ``run_kv_cache.py`` / ``run_quality.py`` / ``run_ablation.py`` /
     ``run_decoding.py`` / ``run_all.py``. Centralizing here removes 5
-    copies of the same logic and ensures any future fix (e.g. handling a
-    new edge case) propagates everywhere.
+    copies of the same logic and ensures any future change (e.g. handling
+    a new edge case) propagates everywhere.
 
     Python's default ``json.dump`` emits non-standard ``NaN`` / ``Infinity``
     literals which most strict parsers (JS ``JSON.parse``, pandas
@@ -640,7 +607,7 @@ def sanitize_for_json(obj):
 
     Recurses into dicts, lists, AND tuples (``json.dumps`` serializes
     tuples as JSON arrays, so a tuple containing a NaN/Inf must also be
-    sanitized to avoid crashing the second ``allow_nan=False`` dump).
+    sanitized to keep the strict ``allow_nan=False`` write clean).
     """
     import math
     if isinstance(obj, float):
@@ -656,20 +623,7 @@ def write_json_atomic(payload, target_path: str, *, indent: int = 2,
                       allow_nan: bool = False, default=None) -> None:
     """Atomically write ``payload`` as JSON to ``target_path``.
 
-    P1-5 fix: the previous pattern across all runners was::
-
-        text = json.dumps(payload, indent=2, allow_nan=False)
-        with open('results/expN.json', 'w') as f:
-            f.write(text)
-
-    This is NOT atomic. If the process is killed (SIGKILL, OOM, Kaggle
-    session timeout) or the disk fills up mid-write, the target file is
-    left TRUNCATED — a partial JSON document that no parser can read.
-    Downstream code (``make_figures.load``) would then silently skip the
-    experiment, or worse, crash with a confusing ``JSONDecodeError`` that
-    doesn't point at the real cause.
-
-    The atomic fix uses the standard temp-file + ``os.replace`` pattern:
+    Uses the standard temp-file + ``os.replace`` pattern:
 
     1. Serialize to a string first (catches NaN/Inf via ``allow_nan=False``
        BEFORE touching the filesystem — the target file is never opened
@@ -745,9 +699,7 @@ def make_seeded_generator(seed: int, device=None):
 
     CUDA random ops require a CUDA generator; passing a CPU generator to
     ``torch.randn(..., device='cuda', generator=...)`` raises
-    ``Expected a 'cuda' device type for generator but found 'cpu'``. The old
-    fallback returned a CPU generator after CUDA-generator construction failed,
-    so Exp2/4/5/6 could crash exactly at their first GPU random draw.
+    ``Expected a 'cuda' device type for generator but found 'cpu'``.
 
     For an old CUDA build that cannot construct a device-specific generator,
     seed the global CUDA generator and return ``None``. Callers already pass
@@ -787,15 +739,11 @@ def make_seeded_generator(seed: int, device=None):
 
 
 def write_results_json(payload, target_path, *, indent=2, logger=None):
-    """AK1 fix: shared "atomic write + sanitize-fallback" helper.
+    """Shared "atomic write + sanitize-fallback" helper.
 
-    Previously the same ~10-line ``try: write_json_atomic(allow_nan=False)
+    Consolidates the ``try: write_json_atomic(allow_nan=False)
     except ValueError: write_json_atomic(sanitize_for_json(...))`` pattern
-    was copy-pasted in run_ablation.py, run_decoding.py, run_kv_cache.py,
-    run_benchmark.py, and run_quality.py. The copy-paste had already
-    drifted (e.g. some log the error, some don't; some use
-    ``logger.error``, some ``logger.warning``). This helper consolidates
-    the pattern so future fixes land in one place.
+    so future changes land in one place.
     """
     try:
         write_json_atomic(payload, target_path, indent=indent,
@@ -805,17 +753,12 @@ def write_results_json(payload, target_path, *, indent=2, logger=None):
         # the payload contains NaN/Inf floats. ``TypeError`` is raised when
         # the payload contains a non-JSON-serializable type (e.g. a
         # ``torch.Tensor``, a ``numpy.float32`` scalar that is NOT a
-        # subclass of ``float``, or a custom object). Previously only
-        # ``ValueError`` was caught, so a single non-serializable value
-        # would propagate uncaught and lose the ENTIRE experiment's
-        # results. Catching both and falling back to ``sanitize_for_json``
-        # (which recursively walks containers and replaces non-finite
-        # floats with ``None``) at least lets the write succeed; any
-        # remaining non-serializable objects are passed through
-        # ``json.dumps(default=str)`` below for a best-effort string
-        # representation, mirroring the pattern already used by
-        # ``run_kv_cache._write_results`` (which catches the same two
-        # exception types with ``default=str``).
+        # subclass of ``float``, or a custom object). Catching both and
+        # falling back to ``sanitize_for_json`` (which recursively walks
+        # containers and replaces non-finite floats with ``None``) at
+        # least lets the write succeed; any remaining non-serializable
+        # objects are passed through ``json.dumps(default=str)`` below for
+        # a best-effort string representation.
         if logger is not None:
             logger.error(
                 f'non-finite or non-serializable value in results; '

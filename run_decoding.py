@@ -86,21 +86,10 @@ def _clear_cache(device):
 class SoftmaxAttnDecoding(nn.Module):
     """Softmax attention that caches K/V for autoregressive decoding.
 
-    P3 fix — pre-allocated KV cache (was O(T) ``torch.cat`` per token).
+    Uses a **pre-allocated ring-style cache** so the per-token CACHE-UPDATE
+    cost is ``O(1)`` in the cache length (modulo amortized geometric
+    growth):
 
-    The previous implementation rebuilt the entire KV cache on every decode
-    step via ``torch.cat([self._cache_k, k], dim=1)``. Each ``torch.cat``
-    allocates a NEW tensor of shape ``[B, T_full, H, K]`` and copies ALL
-    existing cached keys into it — an ``O(T)`` memory copy per generated
-    token, giving ``O(T²)`` total copy cost over a ``T``-token generation
-    pass. This inflated softmax's measured per-token decode latency by a
-    factor that grows with the cached context length, systematically
-    amplifying softmax's disadvantage relative to KDA (whose recurrent state
-    is genuinely ``O(1)`` per token). The comparison was therefore not
-    measuring the attention kernel's decoding cost — it was measuring
-    softmax's cache-rebuild overhead.
-
-    The fix uses a **pre-allocated ring-style cache**:
       * On the first forward (prefill), allocate a cache buffer with some
         initial capacity (``max(T_new * 2, 64)``) and a write pointer
         ``_cache_len``.
@@ -111,12 +100,11 @@ class SoftmaxAttnDecoding(nn.Module):
       * Attention is computed over ``cache[:, :_cache_len]`` (a view, no
         copy).
 
-    This makes the per-token CACHE-UPDATE cost ``O(1)`` in the cache length
-    (modulo amortized geometric growth), so the benchmark measures the
-    attention kernel itself rather than cache-rebuild overhead. The total
-    softmax decode step is still ``O(T)`` per token because one query attends
-    to all cached keys — that is the irreducible cost we want to compare
-    against KDA's ``O(1)`` recurrent update.
+    This makes the benchmark measure the attention kernel itself rather
+    than cache-rebuild overhead. The total softmax decode step is still
+    ``O(T)`` per token because one query attends to all cached keys — that
+    is the irreducible cost we want to compare against KDA's ``O(1)``
+    recurrent update.
     """
 
     def __init__(self, d_model, H=2, K=16, V=16):
@@ -291,8 +279,7 @@ class KDAAttnDecoding(nn.Module):
         # Register the recurrent state as a non-persistent buffer so
         # model.to(device) moves it along with the parameters. A plain
         # attribute would be left on the source device, causing a
-        # device-mismatch crash on the next forward — the same class of
-        # bug that was fixed in ops_fused.py::HybridKCHAttention.
+        # device-mismatch crash on the next forward.
         self.register_buffer('_state', None, persistent=False)
         # Register the short-conv lookback ([B, k-1, d]) so .to(device) /
         # .half() move/cast it along with the parameters. Mirrors the
@@ -337,10 +324,9 @@ class KDAAttnDecoding(nn.Module):
                     [torch.zeros(B, pad_len, d, device=x.device, dtype=x.dtype),
                      x], dim=1).detach().clone()
         # View BEFORE normalize: F.normalize(dim=-1) must operate on each
-        # per-head K-dim vector, not on the concatenated H*K vector. The
-        # previous form normalized the full H*K vector, shrinking each
-        # head's L2 norm to ~1/sqrt(H) and under-scaling q.k dot products
-        # by 1/H. Mirrors the fix in ops_fused.py::KDAHybridLayer.
+        # per-head K-dim vector, not on the concatenated H*K vector.
+        # Normalizing the full H*K vector would shrink each head's L2 norm
+        # to ~1/sqrt(H) and under-scale q.k dot products by 1/H.
         q = F.normalize(F.silu(self.q(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
         k = F.normalize(F.silu(self.k(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
         v = F.silu(self.v(x_conv)).view(B, T_new, self.H, self.V)
@@ -360,7 +346,6 @@ class KDAAttnDecoding(nn.Module):
         # memory during long autoregressive decoding). Stateful generation
         # works fine with a detached state — the state is just a tensor of
         # numbers, not a graph node.
-        # Mirrors the fix in ops_fused.py::HybridKCHAttention.forward.
         #
         # Batch-size + dtype + device guards: if the caller switches batch
         # size (e.g. train B=16 -> eval B=8) or dtype/device (e.g. model.half()
@@ -400,10 +385,7 @@ class KDAAttnDecoding(nn.Module):
 class CSAAttnDecoding(nn.Module):
     """CSA attention with incremental decoding cache.
 
-    Closes the Exp 6 scope gap documented in the README's "Fairness
-    notes" #4: CSA previously had no incremental KV-block cache, so its
-    decode latency was not measured. This module wraps
-    :class:`ops_decoding_cache.CSADecodingCache` (partial-token
+    Wraps :class:`ops_decoding_cache.CSADecodingCache` (partial-token
     accumulator + compressed-block cache + sliding-window ring buffer
     + dynamically-updated indexer key cache) to enable token-by-token
     autoregressive decoding.
@@ -496,11 +478,9 @@ class CSAAttnDecoding(nn.Module):
         if T_new > 1:
             # Prefill: use the fast vectorized naive_csa for the output AND
             # reuse its internally-computed projections to populate the cache
-            # (return_projections=True). This eliminates a redundant fused
-            # matmul that previously recomputed the same 6 KV/indexer
-            # projections via _project(x), inflating CSA prefill latency by
-            # ~1.5-3x relative to softmax/KDA (whose prefill populates the
-            # cache as a side effect of the native forward call).
+            # (return_projections=True). This avoids a redundant fused matmul
+            # that would otherwise recompute the same 6 KV/indexer projections
+            # via _project(x).
             o, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
                 x, self.W_aKV.weight, self.W_bKV.weight,
                 self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
@@ -600,9 +580,8 @@ class HCAAttnDecoding(nn.Module):
         if T_new > 1:
             # Prefill: use naive_hca for the output AND reuse its
             # internally-computed C/Z projections to populate the cache
-            # (return_projections=True). Eliminates a redundant matmul that
-            # previously recomputed the same 2 projections via _project(x),
-            # inflating HCA prefill latency relative to softmax/KDA.
+            # (return_projections=True). Avoids a redundant matmul that
+            # would otherwise recompute the same 2 projections via _project(x).
             o, (C, Z) = naive_hca(
                 x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
                 self.W_DQ.weight, self.W_UQ.weight,
