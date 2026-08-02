@@ -56,13 +56,6 @@ from ops_kda_backend import fla_available, kda_forward, validate_kda_backend
 logger = logging.getLogger(__name__)
 
 
-# T7 fix: central tolerance table. Previously each test picked a magic
-# number (1e-4, 1e-8, 1e-9, 1e-10, 1e-12, 1e-5) ad-hoc, with no
-# documentation of why a particular value was chosen. This table
-# codifies the (dtype, check_kind) → tolerance mapping so future tests
-# can look up the right value instead of guessing. Tests that need a
-# tighter or looser tolerance can still override, but they should add a
-# comment explaining why.
 TOL = {
     # Default tolerance for "outputs match a reference" checks.
     'match': {
@@ -79,7 +72,7 @@ TOL = {
         torch.float16: 1e-3,
         torch.bfloat16: 1e-3,
     },
-    # Tolerance for "value is effectively zero" checks (T9 fix).
+    # Tolerance for "value is effectively zero" checks.
     'zero': 1e-12,
 }
 
@@ -256,10 +249,8 @@ def test_kda_chunk_gva(device='cpu'):
     """Verify naive_chunk_kda matches naive_recurrent_kda under GVA (HV > H).
 
     The chunk path uses ``repeat_interleave(G, dim=...)`` to expand q/k from
-    H heads to HV heads, mirroring the recurrent path. This was previously
-    only tested with HV == H (G=1, no GVA); the GVA chunk path was
-    unverified. This test closes that gap by checking chunk-vs-recurrent
-    agreement with HV=4, H=2 (G=2).
+    H heads to HV heads, mirroring the recurrent path. This test checks
+    chunk-vs-recurrent agreement with HV=4, H=2 (G=2).
     """
     logger.info("Test: KDA chunk vs recurrent with GVA (HV > H)")
     torch.manual_seed(13)
@@ -466,13 +457,9 @@ def test_kda_chunk_nondivisible_T(device='cpu'):
     divisible by chunk_size.
 
     The chunk path internally right-pads T up to a multiple of ``chunk_size``
-    and returns ``o[:, :original_T]``. This padding code path was previously
-    unverified — all existing tests used T divisible by chunk_size (e.g.
-    T=128, chunk_size=64). A bug in the padding logic (wrong trim axis,
-    incorrect cumsum handling of padded zeros, etc.) would go undetected.
-
-    We test multiple (T, chunk_size) combinations that trigger non-trivial
-    padding, including the edge case T=1 (single-token decode).
+    and returns ``o[:, :original_T]``. We test multiple (T, chunk_size)
+    combinations that trigger non-trivial padding, including the edge case
+    T=1 (single-token decode).
     """
     logger.info("Test: KDA chunk vs recurrent with non-divisible T (padding)")
     torch.manual_seed(15)
@@ -511,11 +498,8 @@ def test_csa_hca_fp16_dtype_consistency(device='cpu'):
     """Verify CSA and HCA run without dtype-mismatch crashes on fp16 inputs.
 
     The compression functions (csa_compress_kv, csa_compress_kv_overlapped)
-    return ``compute_dtype`` (fp32 for fp16 inputs). The attention query ``q``
-    was previously left in ``H.dtype`` (fp16), causing
-    ``torch.einsum`` to raise ``RuntimeError: Expected object of scalar type
-    Half but got scalar type Float`` for fp16 inputs. This test verifies the
-    dtype-consistency fix by running the full forward pass in fp16.
+    return ``compute_dtype`` (fp32 for fp16 inputs); the attention query
+    ``q`` is cast to match. This test runs the full forward pass in fp16.
 
     We only check shape and finiteness (not numerical correctness against a
     reference) because fp16 has ~3 decimal digits of precision — the existing
@@ -587,12 +571,8 @@ def test_csa_hca_fp16_dtype_consistency(device='cpu'):
 
 
 def test_kda_initial_state_dtype_mismatch(device='cpu'):
-    """Verify KDA handles initial_state with a different dtype than the inputs.
-
-    Previously, ``S += initial_state`` would raise ``RuntimeError: result type
-    Double can't be cast to the desired output type Float`` if initial_state
-    had a higher precision dtype than compute_dtype. This can happen when the
-    caller changes dtype between calls and reuses the returned state.
+    """Verify KDA handles initial_state with a different dtype than the inputs
+    (e.g. caller changes dtype between calls and reuses the returned state).
     """
     logger.info("Test: KDA initial_state dtype mismatch (fp64 state, fp32 inputs)")
     torch.manual_seed(17)
@@ -659,13 +639,8 @@ def test_csa_causality(device='cpu'):
 
 
 def test_hca_forward_smoke(device='cpu'):
-    """T5 fix: this test was misnamed ``test_hca_causality`` but only
-    checks the output shape and finiteness — it does NOT verify any
-    causal property. The real HCA causality test is
-    ``test_hca_sliding_window_causality`` (line ~1417). Renamed to
-    ``test_hca_forward_smoke`` so the test name reflects what it
-    actually checks. A future reader who needs a causality test should
-    look at ``test_hca_sliding_window_causality``, not here."""
+    """Forward-output shape + finiteness smoke test (does NOT verify
+    causality — see ``test_hca_sliding_window_causality``)."""
     logger.info("Test: HCA forward smoke (shape + finiteness only; "
                 "causality is tested in test_hca_sliding_window_causality)")
     torch.manual_seed(3)
@@ -711,12 +686,8 @@ def test_fused_hybrid(device='cpu'):
         y = model(x)
     n_params = sum(p.numel() for p in model.parameters())
     # Verify the layout matches the configured n_kda:n_csa:n_hca ratio.
-    # Previously this was a tautological ``_ok(..., True, ...)`` that always
-    # passed regardless of model state, providing zero test value. Replace
-    # with a real invariant: with n_kda=3, n_csa=1, n_hca=1, total_layers=5,
-    # the layout must be exactly 'KDA-KDA-KDA-CSA-HCA'. A bug in
-    # _build_layout (e.g. wrong ordering of the unit tuple, off-by-one in
-    # the truncation) would now be caught.
+    # With n_kda=3, n_csa=1, n_hca=1, total_layers=5, the layout must be
+    # exactly 'KDA-KDA-KDA-CSA-HCA'.
     expected_layout = 'KDA-KDA-KDA-CSA-HCA'
     layout_ok = model.layout_str() == expected_layout
     return [
@@ -1462,11 +1433,6 @@ def test_csa_indexer_ste_gradient(device='cpu'):
     def _no_useful_grad(g):
         if g is None:
             return True
-        # T9 fix: use ``< 1e-12`` instead of exact ``== 0``. Exact float
-        # equality is fragile — a future refactor that introduces a tiny
-        # but non-zero contribution (e.g. fp rounding through a different
-        # kernel path) would make this test spuriously fail even though
-        # the optimizer step is still effectively a no-op.
         return bool(g.abs().sum().item() < 1e-12)
     noste_grads_useless = all(_no_useful_grad(p_noste[name].grad)
                               for name in indexer_param_names)
@@ -1611,12 +1577,8 @@ def test_csa_fuse_projections_grad_contract(device='cpu'):
 
 
 def test_csa_indexer_ste_full_softmax(device='cpu'):
-    """P0-2 regression: ``ste_mode='full_softmax'`` must be distinct from
+    """``ste_mode='full_softmax'`` must be distinct from
     ``'topk_columns'`` and from the no-STE path.
-
-    Before the P0-2 fix, ``ste_mode='full_softmax'`` was silently aliased
-    to ``'topk_columns'`` — the docstring claimed a denser gradient
-    signal but the code path was identical. This test pins the fix:
 
     1. **Forward equivalence**: ``full_softmax`` and ``topk_columns``
        produce bit-identical forward outputs (the STE only changes the
@@ -1636,7 +1598,7 @@ def test_csa_indexer_ste_full_softmax(device='cpu'):
        check that the ``ste_mode`` branch is correctly guarded by
        ``use_ste``.
     """
-    logger.info("Test: CSA indexer STE full_softmax distinctness (P0-2 fix)")
+    logger.info("Test: CSA indexer STE full_softmax distinctness")
     torch.manual_seed(7)
     B, T, d = 1, 32, 16
     m, topk, nh, nIh, c, cI, dc = 4, 2, 2, 2, 8, 4, 8
@@ -1742,16 +1704,7 @@ def test_csa_indexer_ste_full_softmax(device='cpu'):
 
 
 def test_kda_cross_chunk_bptt(device='cpu'):
-    """P0-3 regression: ``detach_lookback=False`` enables cross-chunk BPTT.
-
-    Before the P0-3 fix, ``KDAHybridLayer.forward_functional`` unconditionally
-    called ``.detach().clone()`` on the new lookback returned to the caller.
-    This meant ``detach_lookback=False`` had NO effect on the OUTGOING
-    lookback — only the INCOMING lookback was conditionally detached. As a
-    result, gradient flow stopped at the first chunk boundary even when the
-    caller explicitly requested cross-chunk BPTT.
-
-    This test verifies the fix:
+    """``detach_lookback=False`` enables cross-chunk BPTT.
 
     1. **detach_lookback=True (default)**: gradients do NOT flow across
        chunks. Perturbing chunk-1's input does not affect chunk-2's
@@ -1766,9 +1719,9 @@ def test_kda_cross_chunk_bptt(device='cpu'):
     We test the KDA layer directly (not the full HybridKCHAttention) so
     the lookback path is isolated from the recurrent state path (which
     is controlled by a separate ``detach_state`` flag in the hybrid
-    layer and is NOT part of the P0-3 fix scope).
+    layer).
     """
-    logger.info("Test: KDA cross-chunk BPTT via detach_lookback=False (P0-3 fix)")
+    logger.info("Test: KDA cross-chunk BPTT via detach_lookback=False")
     torch.manual_seed(123)
     cfg = HybridConfig(
         d_model=16, n_heads_qk=2, n_heads_v=2,
@@ -1832,7 +1785,6 @@ def test_kda_cross_chunk_bptt(device='cpu'):
     o2_a, _, _ = layer_a.forward_functional(x2.clone(), st_a_det, lb_a,
                                              detach_lookback=True)
     o2_a.sum().backward()
-    # T9 fix: use ``< 1e-12`` instead of exact ``== 0.0`` (fragile).
     x1_grad_a_none = (x1_a.grad is None) or (x1_a.grad.abs().sum().item() < 1e-12)
 
     # --- Case B: detach_lookback=False (cross-chunk BPTT) ---
@@ -2182,16 +2134,9 @@ def test_hybrid_padding_no_crash(device='cpu'):
     """Regression: HybridKCHAttention must not crash when T is not divisible
     by csa_m / hca_m2.
 
-    Previously, the padding trim used ``o[pad:]`` which slices dim=0 (batch)
-    instead of dim=1 (sequence). This caused a shape-mismatch RuntimeError
-    on the residual add whenever T was not a multiple of the compression
-    factor. The tests happened not to trigger it because every test used
-    T divisible by m, but any real-world sequence length could hit it.
-
-    We now exercise T values that require non-trivial padding for BOTH the
+    We exercise T values that require non-trivial padding for BOTH the
     CSA layer (m=8) and the HCA layer (m2=16), for several batch sizes
-    including B=1 (which previously crashed with an empty-batch slice) and
-    B>pad (which previously silently corrupted results).
+    including B=1 and B>pad.
     """
     logger.info("Test: hybrid forward with non-divisible T (padding regression)")
     torch.manual_seed(10)
@@ -3366,7 +3311,7 @@ def test_csa_topk_zero(device='cpu'):
                         sliding_window=0, sink_logits=sink)
     no_sw_ok = (o_no_sw.shape == (B, T, nh * c)
                 and torch.isfinite(o_no_sw).all().item()
-                and o_no_sw.abs().max().item() < 1e-12)  # T9 fix: was == 0.0
+                and o_no_sw.abs().max().item() < 1e-12)
 
     # topk=0, with SW -> non-zero output (SW branch contributes).
     o_with_sw = naive_csa(H, W_aKV, W_bKV, W_aZ, W_bZ, Ba, Bb,
@@ -3413,7 +3358,7 @@ def test_hca_T_smaller_than_m2(device='cpu'):
                         sliding_window=0, sink_logits=sink)
     no_sw_ok = (o_no_sw.shape == (B, T, nh * c)
                 and torch.isfinite(o_no_sw).all().item()
-                and o_no_sw.abs().max().item() < 1e-12)  # T9 fix: was == 0.0
+                and o_no_sw.abs().max().item() < 1e-12)
 
     # With SW: SW branch contributes (each query attends to itself + past 3).
     o_with_sw = naive_hca(H, W_KV, W_Z, B_pos, W_DQ, W_UQ,
@@ -3952,22 +3897,10 @@ def test_csa_hca_input_validation(device='cpu'):
 
 
 def test_hybrid_kda_state_dtype_mismatch(device='cpu'):
-    """Regression: ``HybridKCHAttention`` must survive a dtype change between forwards.
+    """``HybridKCHAttention`` must survive a dtype change between forwards.
 
-    Previously, the cached ``_kda_state`` retained its original dtype when the
-    caller did ``model.half()`` (or any dtype change) between forward calls.
-    The downstream ``naive_recurrent_kda`` implicitly cast ``initial_state``
-    to ``compute_dtype``, so the recurrence itself did not crash — but the
-    returned ``new_state`` was in ``v.dtype`` (= new dtype), while any OTHER
-    KDA layer whose state had not yet been overwritten was still in the OLD
-    dtype. ``torch.stack(states, dim=0)`` at the end of forward then crashed
-    with ``RuntimeError: Expected object of scalar type Half but got scalar
-    type Float`` because the per-layer states had mixed dtypes.
-
-    The fix explicitly casts ``stacked`` to ``x.dtype`` alongside the device
-    move. This test verifies the fix: a fp32 forward followed by a fp16
-    forward (after ``model.half()``) must not crash, and the output must be
-    finite.
+    A fp32 forward followed by a fp16 forward (after ``model.half()``) must
+    not crash, and the output must be finite.
     """
     logger.info("Test: HybridKCHAttention survives dtype change between forwards")
     torch.manual_seed(220)
@@ -4068,19 +4001,11 @@ def test_hybrid_kda_state_batch_size_change(device='cpu'):
 
 
 def test_prefill_flops_head_count(device='cpu'):
-    """Regression: ``prefill_flops`` must use csa_nh/hca_nh (not H) for core/SW FLOPs.
+    """``prefill_flops`` must use csa_nh/hca_nh (not H) for core/SW FLOPs.
 
-    Previously, the CSA and HCA core attention and sliding-window FLOPs
-    formulas used ``H`` (the GQA head count) instead of ``csa_nh`` / ``hca_nh``
-    (the actual attention head count of those operators). The default config
-    sets them equal (csa_nh == hca_nh == H == 8), so the bug was silent —
-    but a user who overrode ``csa_nh`` (e.g. to ablate head count) would get
-    a silently wrong FLOPs number.
-
-    This test verifies the fix: with csa_nh=4 and H=8 (deliberately
-    different), the CSA core+SW FLOPs must be HALF of what they'd be with
-    csa_nh=8 (since FLOPs scale linearly with head count). The old formula
-    (using H) would produce the SAME number for both, failing the test.
+    With csa_nh=4 and H=8 (deliberately different), the CSA core+SW FLOPs
+    must be HALF of what they'd be with csa_nh=8 (since FLOPs scale
+    linearly with head count).
     """
     logger.info("Test: prefill_flops uses csa_nh/hca_nh (not H) for core/SW FLOPs")
     # Import lazily so this test does not add a hard dependency to the
@@ -4242,11 +4167,6 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         csa_nh, csa_dc = p['csa_nh'], p['csa_dc']
         csa_cI, csa_nIh = p['csa_cI'], p['csa_nIh']
         sw_w = p['csa_sliding_window']
-        # P1-4 fix: use ceil(T / m) (logical block count, no floor) to
-        # match the corrected ``prefill_flops``. The test sweep uses
-        # divisible T values (512, 1024, 4096) where ceil == floor, so
-        # this change is a no-op for the existing assertions but keeps
-        # the test correct if non-divisible T values are added later.
         n_blocks = (T + csa_m - 1) // csa_m if T > 0 else 0
 
         # Recompute each term with the window-close causal oracle.
@@ -4299,7 +4219,6 @@ def test_prefill_flops_causal_block_entries(device='cpu'):
         hca_m2, hca_c = p['hca_m2'], p['hca_c']
         hca_nh, hca_dc = p['hca_nh'], p['hca_dc']
         sw_w = p['hca_sliding_window']
-        # P1-4 fix: same ceil correction as the CSA branch above.
         n_blocks = (T + hca_m2 - 1) // hca_m2 if T > 0 else 0
 
         cbe_correct = causal_block_entries(T, hca_m2)
@@ -4344,7 +4263,7 @@ def test_kv_cache_ceil_block_count(device='cpu'):
     semantics) and ``prefill_flops`` (which uses the pure logical
     count, zero at T=0).
     """
-    logger.info("Test: KV cache ceil block count (P1-4 fix)")
+    logger.info("Test: KV cache ceil block count")
     from run_kv_cache import kv_cache_elements, prefill_flops, DEFAULTS
     p = {**DEFAULTS}
     csa_m = p['csa_m']
@@ -5267,21 +5186,10 @@ def main():
     # sink test), Python's default json.dump would emit literal ``NaN``/
     # ``Infinity`` tokens that are INVALID JSON per RFC 8259 and break strict
     # parsers (JS ``JSON.parse``, jq, pandas with ``orient='records'``). The
-    # sibling runners (run_kv_cache.py, run_decoding.py, run_quality.py,
-    # run_ablation.py) all already use this pattern; this closes the
-    # consistency gap.
-    #
-    # CRITICAL: serialize to a STRING first, then write the string. The
-    # previous ``json.dump(all_results, f, indent=2)`` (default
-    # allow_nan=True) wrote directly to the file, so a NaN mid-stream left
-    # a partial JSON document. Mirrors the atomicity fix in
-    # run_quality.py::main / run_ablation.py::main.
-    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
-    # os.replace) so a process kill or disk-full mid-write leaves the
-    # target file as the OLD version (or absent) rather than a truncated
-    # partial JSON document. The previous ``with open(...) as f: f.write(text)``
-    # pattern was NOT atomic — see kaggle_setup.write_json_atomic's
-    # docstring for the full rationale.
+    # writes go through ``kaggle_setup.write_json_atomic`` (temp file + fsync
+    # + os.replace), so a process kill or disk-full mid-write leaves the
+    # target file untouched rather than a truncated partial JSON document;
+    # see ``write_json_atomic``'s docstring for the full rationale.
     try:
         write_json_atomic(all_results, 'results/exp1_correctness.json',
                           indent=2, allow_nan=False)
