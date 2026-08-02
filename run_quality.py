@@ -184,12 +184,9 @@ def _t_crit_975(n):
     """
     global _T_PP
     if n < 2:
-        # P0 fix: return None instead of 0.0. The CI is undefined for n<2
-        # (zero degrees of freedom), and ``0.0`` was a load-bearing lie:
-        # callers doing ``abs(t_stat) > crit`` would get ``abs(anything) > 0``
-        # = True for any non-zero t_stat, falsely marking single-seed
-        # estimates as "significant". ``None`` propagates as "undefined",
-        # which the t-test guard already handles (``crit is not None and ...``).
+        # The CI is undefined for n<2 (zero degrees of freedom); ``None``
+        # propagates as "undefined" and the t-test guard already handles it
+        # (``crit is not None and ...``).
         return None
     if _T_PP is None:
         try:
@@ -418,17 +415,12 @@ def _bonferroni_crit_q(n, alpha=0.05):
 # ---------------------------------------------------------------------------
 # Shared small-model architecture spec — used by both run_quality.CSAAttn /
 # HCAAttn (Experiment 4: standalone MQAR) and run_ablation._make_cfg
-# (Experiment 5: hybrid layout ablation). Previously these two experiments
-# used INCONSISTENT CSA/HCA sub-layer widths:
-#   * run_quality.CSAAttn:      c=32, cI=16, m=4, nh=2, nIh=2, topk=4, dc=64
-#   * run_ablation._make_cfg:   c=16, cI=8,  m=4, nh=2, nIh=2, topk=4, dc=32
-# I.e. the ablation's CSA sub-layer was HALF the width of the standalone
-# MQAR experiment's CSA. Cross-experiment comparisons (e.g. "the hybrid
-# block's CSA contributes X to MQAR accuracy") were silently confounded by
-# this width difference. We lift the spec to a single module-level constant
-# so both experiments use the SAME widths, making cross-experiment
-# comparisons apples-to-apples. The values match the (wider) run_quality
-# spec since that is the more informative regime for CSA's sparse retrieval.
+# (Experiment 5: hybrid layout ablation). Lifting the spec to a single
+# module-level constant makes both experiments use the SAME CSA/HCA sub-layer
+# widths, so cross-experiment comparisons (e.g. "the hybrid block's CSA
+# contributes X to MQAR accuracy") are apples-to-apples. The values match the
+# wider run_quality spec since that is the more informative regime for CSA's
+# sparse retrieval.
 # ---------------------------------------------------------------------------
 SMALL_MODEL_SPEC = {
     # CSA sub-layer
@@ -680,9 +672,6 @@ class CSAAttn(nn.Module):
         super().__init__()
         # Use the shared small-model spec so Experiment 4 (standalone MQAR)
         # and Experiment 5 (ablation) test the SAME CSA sub-layer widths.
-        # Previously this used c=32, cI=16, dc=64 while run_ablation._make_cfg
-        # used c=16, cI=8, dc=32 — half the width — making cross-experiment
-        # comparisons silently confounded.
         spec = SMALL_MODEL_SPEC
         c, dc = spec['csa_c'], spec['csa_dc']
         m, nh, nIh, cI, topk = (
@@ -789,8 +778,8 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
                       # but we set it for symmetry with layer/head so future
                       # additions (e.g. embedding dropout) do not silently stay
                       # in train mode during evaluation.
-        # Fixed seed for the eval generator so every operator sees the SAME eval
-        # batches (apples-to-apples comparison at eval time too, not just train).
+        # Fixed generator seed so every operator sees the SAME eval batches
+        # (apples-to-apples comparison at eval time too, not just train).
         eval_gen = make_seeded_generator(12345, device=device)
         correct, total = 0, 0
         losses = []
@@ -827,8 +816,8 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     6.25% chance — a meaningless upper bound).
 
     ``train_batch`` overrides the per-step training batch size (default 32,
-    previously a hardcoded local magic number — now overridable for
-    memory-constrained or GPU runs via the ``MQAR_TRAIN_BATCH`` env var).
+    overridable for memory-constrained or GPU runs via the
+    ``MQAR_TRAIN_BATCH`` env var).
 
     RNG isolation: the model is initialized with ``torch.manual_seed(seed)``,
     but a SEPARATE per-step generator (also seeded with ``seed``) drives
@@ -853,12 +842,11 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     if softmax_steps is None:
         softmax_steps = steps
     if train_batch is None:
-        # Robust env var parsing: a malformed ``MQAR_TRAIN_BATCH=abc`` (or
-        # ``=0``, which would crash on the first batch with ZeroDivisionError)
-        # previously crashed the whole experiment with no informative error.
-        # ``parse_int_env`` logs a warning and falls back to the default,
-        # matching the robustness pattern already used for BENCH_REPEATS in
-        # run_benchmark.py.
+        # Robust env var parsing: ``parse_int_env`` logs a warning and falls
+        # back to the default on a malformed ``MQAR_TRAIN_BATCH=abc`` (or
+        # ``=0``, which would crash on the first batch with
+        # ZeroDivisionError), matching the robustness pattern already used
+        # for BENCH_REPEATS in run_benchmark.py.
         train_batch = parse_int_env('MQAR_TRAIN_BATCH', 32, min_value=1,
                                     logger=logger)
     actual_steps = softmax_steps if op_name == 'softmax' else steps
@@ -892,15 +880,12 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # IDENTICAL across operators for a given seed (the model init consumed a
     # different number of RNG draws per operator, which would otherwise
     # desync the global RNG and produce different training data per op).
-    # BQ9 fix: use a LARGE offset (1_000_000) instead of ``+ 1``. The
-    # previous offset collided with the next seed's model init: seed 42's
-    # batch used seed 43, which is the SAME RNG stream as seed 43's
-    # model initialization. The two RNG streams overlapped, weakening
-    # the t-test's independence assumption. A large offset puts the
-    # batch RNG stream in a completely different region of the seed
-    # space, eliminating the overlap.
-    # P2-1 fix (round 3): route through make_seeded_generator for
-    # CPU-fallback on older torch builds.
+    # A LARGE offset (1_000_000) instead of ``+ 1`` keeps the batch RNG
+    # stream in a completely different region of the seed space from the
+    # model initialization stream, eliminating any overlap that would weaken
+    # the t-test's independence assumption.
+    # Routed through make_seeded_generator for CPU-fallback on older torch
+    # builds.
     batch_gen = make_seeded_generator(seed + 1_000_000, device=device)
 
     losses, accs = [], []
@@ -946,16 +931,10 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         # without a clear root cause. Check here so the per-seed try/except
         # surfaces the real failure mode.
         #
-        # BQ6 fix: the previous check did ``torch.isfinite(p.grad).all()``
-        # PER PARAMETER, which forces a GPU→CPU sync per parameter
-        # (~15 params × 200 steps × 5 seeds × 4 ops = 60k syncs). The
-        # loss is already finite (checked above), and a finite loss with
-        # a NaN grad is extremely rare (would require an intermediate
-        # activation to overflow to inf then collapse back to a finite
-        # loss). We move the grad-finiteness check to run only every 50
-        # steps (still catches NaN propagation within ~50 steps, well
-        # before it can corrupt the final accuracy estimate), cutting
-        # the sync count by ~50x.
+        # The grad-finiteness check runs only every 50 steps to avoid a
+        # GPU→CPU sync per parameter on every step (still catches NaN
+        # propagation within ~50 steps, well before it can corrupt the
+        # final accuracy estimate).
         if step % 50 == 0:
             bad_grads = [p for p in params
                          if p.grad is not None and not torch.isfinite(p.grad).all()]
@@ -1021,9 +1000,6 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     computed over the surviving (successful) seeds. If ALL seeds fail, the
     function raises a ``RuntimeError`` so the caller can record a stub
     result for the operator (mirrors ``run_ablation.py::eval_layout_multi_seed``).
-    Previously, a single seed failure crashed the entire experiment, losing
-    all other operators' results — inconsistent with the ablation runner's
-    more robust pattern.
 
     ``device`` may be passed as a string or a ``torch.device``; string
     inputs are coerced for notebook callers.
@@ -1243,11 +1219,11 @@ def main():
                 f"< seq_len={seq_len} (need room for the cue token at the end).")
     logger.info(f'  vocab={vocab}, seq_len={seq_len}, n_kv={n_kv_list}')
     logger.info(f'  chance accuracy = {chance:.4f} (independent of n_kv; target is 1-of-vocab)')
-    # Robust env var parsing: a single malformed value (e.g. ``MQAR_SEEDS=abc``)
-    # previously crashed the whole multi-seed experiment with a bare
-    # ``ValueError: invalid literal for int()``. ``parse_int_env`` logs a
-    # warning and falls back to the default, matching the robustness pattern
-    # already used for BENCH_REPEATS / BENCH_LENGTHS in run_benchmark.py.
+    # Robust env var parsing: ``parse_int_env`` logs a warning and falls
+    # back to the default on a malformed value (e.g. ``MQAR_SEEDS=abc``
+    # that would otherwise raise ``ValueError: invalid literal for
+    # int()``), matching the robustness pattern already used for
+    # BENCH_REPEATS / BENCH_LENGTHS in run_benchmark.py.
     n_seeds = parse_int_env('MQAR_SEEDS', 5, min_value=1, logger=logger)
     steps = parse_int_env('MQAR_STEPS', 200, min_value=1, logger=logger)
     # Fair primary comparison: every operator receives the same optimizer-step
@@ -1353,17 +1329,12 @@ def main():
               f"other ops trained for {steps} steps. See MQAR_SOFTMAX_STEPS "
               f"env var / README 'Fairness notes' section for rationale.")
 
-    # P1-1 fix — add Bonferroni correction + ``conclusions_valid`` to Exp 4,
-    # mirroring the logic already present in run_ablation.py::main for Exp 5.
-    # The README documents Exp 4's JSON schema as including
-    # ``conclusions_valid`` and a Bonferroni-corrected t-test, but
-    # run_quality.py previously emitted only the raw ``t_stat_vs_chance``
-    # field. This made the README's "authoritative signal" claim false:
-    # consumers reading ``conclusions_valid`` from ``exp4_mqar.json`` would
-    # KeyError (the field was absent), and the Bonferroni correction was
-    # silently missing.
+    # Bonferroni correction + ``conclusions_valid`` for Exp 4, mirroring the
+    # logic already present in run_ablation.py::main for Exp 5. The README
+    # documents Exp 4's JSON schema as including ``conclusions_valid`` and a
+    # Bonferroni-corrected t-test.
     #
-    # The fix mirrors run_ablation.py's logic:
+    # Logic:
     #   1. Compute the number of one-sample t-tests vs chance we are running
     #      (4 ops * len(n_kv_list) = 4 by default).
     #   2. Compute the Bonferroni-corrected alpha (0.05 / n_tests) and the
@@ -1383,10 +1354,9 @@ def main():
     # maintain the family-wise error rate at 0.05. Using 0.025 / n_tests
     # would make the test twice as conservative as intended.
     alpha_corrected = 0.05 / n_tests
-    # P0-3 fix: _bonferroni_crit_q is now a module-level function with a
-    # exact beta-CDF/bisection fallback when scipy is unavailable (instead of
-    # silently returning None and zeroing out all significance conclusions).
-    # We just detect scipy availability for the log line below.
+    # ``_bonferroni_crit_q`` is a module-level function with an exact
+    # beta-CDF/bisection fallback when scipy is unavailable. We just detect
+    # scipy availability for the log line below.
     try:
         from scipy.stats import t as _t_dist  # noqa: F401
         bonferroni_available = True
@@ -1409,17 +1379,15 @@ def main():
             # ``crit`` is None when scipy is unavailable — guard the
             # comparison to avoid TypeError (mirrors run_ablation.py).
             #
-            # P0-3 fix: use a ONE-SIDED test (``t_stat > crit``) instead of
-            # ``abs(t_stat) > crit``. The research question is "does this op
-            # learn the task ABOVE chance", which is directional. The previous
-            # two-sided test flagged an op as "significant" even when its
-            # accuracy was significantly BELOW chance (large negative t_stat),
-            # which is the opposite of what "this op works" means. A below-chance
-            # result indicates the model is systematically wrong (e.g. a sign
-            # bug, a reversed label, or pure noise that happens to anti-correlate),
-            # NOT that the op "works". The Bonferroni-corrected critical value
-            # ``_bonferroni_crit_q`` is already the one-sided upper-tail quantile, so the
-            # one-sided comparison is the correct use of that quantile.
+            # The test is ONE-SIDED (``t_stat > crit``): the research question
+            # is "does this op learn the task ABOVE chance", which is
+            # directional. A below-chance result indicates the model is
+            # systematically wrong (e.g. a sign error, a reversed label, or
+            # pure noise that happens to anti-correlate), NOT that the op
+            # "works". The Bonferroni-corrected critical value
+            # ``_bonferroni_crit_q`` is already the one-sided upper-tail
+            # quantile, so the one-sided comparison is the correct use of
+            # that quantile.
             r['significant_bonferroni'] = (
                 crit is not None and t_stat > crit
             )
@@ -1432,12 +1400,8 @@ def main():
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
     min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
                         if 'error' not in r), default=0)
-    # P1-3 fix (round 4): split "near chance" (slightly above chance, not yet
-    # significant) from "far below chance" (training diverged / recipe broken).
-    # The previous single threshold ``< 1.5 * chance`` lumped 0-3% accuracy
-    # (systematically wrong) together with 7-9% accuracy (weakly above chance),
-    # which let a broken op pass as "just near chance" and only flipped
-    # conclusions_valid when >= half the rows were in that bucket.
+    # Split "near chance" (slightly above chance, not yet significant) from
+    # "far below chance" (training diverged / recipe broken):
     #   * near_chance:   0.5*chance < acc < 1.5*chance  (statistically ~chance)
     #   * far_below_chance: acc <= 0.5*chance           (training/recipe broken)
     # Any far_below row forces conclusions_valid=False regardless of other
@@ -1455,7 +1419,7 @@ def main():
                          and len(near_chance) < len(all_results) // 2
                          and len(far_below) == 0)
     logger.info('\n' + '=' * 70)
-    logger.info('Statistical validity summary (P1-1 + P1-3 fix):')
+    logger.info('Statistical validity summary:')
     logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
     logger.info(f'  ops with significant_bonferroni=True: {n_any_sig}/{len(all_results)}')
     logger.info(f'  ops near chance (0.5x-1.5x): {len(near_chance)}/{len(all_results)}')

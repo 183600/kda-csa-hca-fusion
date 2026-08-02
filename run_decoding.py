@@ -236,12 +236,9 @@ class KDAAttnDecoding(nn.Module):
 
     This benchmark module mirrors the parameterization of
     ``ops_fused.KDAHybridLayer`` so the decoding-cost comparison reflects the
-    SAME operator the fused model uses. Previously this module omitted the
-    causal depthwise short-conv (kernel=3) that ``KDAHybridLayer`` applies to
-    the input before the q/k/v/g/beta projections — i.e. the benchmark
-    compared a *stripped-down* KDA against softmax, making the comparison
-    unfair. The short-conv is now included and its lookback state is carried
-    across decode steps (mirroring the conv-lookback buffer in
+    SAME operator the fused model uses. The short-conv (kernel=3) is included
+    and its lookback state is carried across decode steps (mirroring the
+    conv-lookback buffer in
     ``KDAHybridLayer``), so the per-token decode cost includes the conv.
     """
 
@@ -745,9 +742,8 @@ class HybridDecoding(nn.Module):
             # Prefill: vectorized full-sequence operator for the output AND
             # reuse its internally-computed projections to populate the cache
             # (return_projections=True). Eliminates a redundant fused matmul
-            # that previously recomputed the same 6 KV/indexer projections
-            # via _project_csa, inflating hybrid prefill latency relative
-            # to softmax/KDA.
+            # via _project_csa that would otherwise inflate hybrid prefill
+            # latency relative to softmax/KDA.
             o_core, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
                 h, layer.W_aKV.weight, layer.W_bKV.weight,
                 layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
@@ -797,8 +793,8 @@ class HybridDecoding(nn.Module):
             # Prefill: vectorized full-sequence operator for the output AND
             # reuse its internally-computed C/Z projections to populate the
             # cache (return_projections=True). Eliminates a redundant matmul
-            # that previously recomputed the same 2 projections via
-            # _project_hca, inflating hybrid prefill latency.
+            # via _project_hca that would otherwise inflate hybrid prefill
+            # latency.
             o_core, (C, Z) = naive_hca(
                 h, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
                 layer.W_DQ.weight, layer.W_UQ.weight,
@@ -1053,7 +1049,6 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
 
 def main():
-    # AK11 fix: emit the scope warning HERE (in main), not at import time.
     warnings.warn(_DEFERRED_IMPORT_WARNING, stacklevel=2)
     info = configure_torch_for_device()
     device = info.device
@@ -1064,11 +1059,7 @@ def main():
     prefill_lens = [128, 512, 1024, 2048]
     n_decode = 20
     # Hoist n_repeats into a module-visible variable so the error path can
-    # record the same value as the success path. Previously success rows
-    # recorded ``repeats=3`` (the bench_decoding default) while error rows
-    # recorded ``repeats=None`` — a schema inconsistency that broke
-    # downstream consumers doing arithmetic on ``repeats`` (e.g.
-    # ``n_decode / repeats``) on error rows.
+    # record the same value as the success path.
     N_REPEATS = 3
 
     models = {
@@ -1203,15 +1194,8 @@ def main():
     # emit non-standard ``NaN`` / ``Infinity`` literals, breaking
     # downstream parsers (JS ``JSON.parse``, pandas, jq).
     #
-    # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py
-    # (was a local ``_sanitize`` closure; centralizing removes 5 copies of
-    # the same logic across run_*.py and ensures any future edge-case fix
-    # propagates everywhere).
+    # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py.
     sanitized = [sanitize_for_json(r) for r in results]
-    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
-    # os.replace) so a process kill or disk-full mid-write leaves the
-    # target file as the OLD version (or absent) rather than a truncated
-    # partial JSON document. See kaggle_setup.write_json_atomic's docstring.
     try:
         write_json_atomic(sanitized, 'results/exp6_decoding.json',
                           indent=2, allow_nan=False)
@@ -1220,14 +1204,13 @@ def main():
         write_json_atomic(sanitized, 'results/exp6_decoding.json',
                           indent=2, default=str)
     print('\nSaved: results/exp6_decoding.json')
-    # P0-2 fix: return non-zero if any (prefill_len, op) cell errored out,
-    # so ``run_all._run`` records the experiment as ``status='fail'`` instead
-    # of silently treating a partial run as success. Mirrors run_benchmark /
-    # run_quality / run_ablation.
+    # Return non-zero if any (prefill_len, op) cell errored out, so
+    # ``run_all._run`` records the experiment as ``status='fail'`` instead
+    # of silently treating a partial run as success.
     n_errors = sum(1 for r in results if 'error' in r)
     if n_errors:
         print(
-            f'\n[P0-2] {n_errors}/{len(results)} (prefill_len, op) cells '
+            f'\n[result] {n_errors}/{len(results)} (prefill_len, op) cells '
             f'errored out. Returning non-zero so run_all records this '
             f'experiment as failed.')
         return 1
