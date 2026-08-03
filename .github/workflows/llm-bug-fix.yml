@@ -95,8 +95,10 @@ jobs:
           )
 
           # 两个 prompt 交替使用：奇数轮=CLEANUP，偶数轮=REVIEW
-          PROMPTS = [CLEANUP_PROMPT, REVIEW_PROMPT]
-          LABELS  = ["清理bug修复说明", "修复实验问题"]
+          # PROMPTS = [CLEANUP_PROMPT, REVIEW_PROMPT]
+          # LABELS  = ["清理bug修复说明", "修复实验问题"]
+          PROMPTS = [REVIEW_PROMPT, REVIEW_PROMPT]
+          LABELS  = ["修复实验问题", "修复实验问题"]
 
           def run_cmd(cmd, timeout=120, **kw):
               """仅用于 git 命令，有超时保护；opencode 调用不使用此函数"""
