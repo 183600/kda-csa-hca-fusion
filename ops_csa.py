@@ -915,21 +915,6 @@ def naive_csa(
         else:
             scale = c ** -0.5
 
-    # Core-attention scale auto-selection (mirrors the indexer scale
-    # policy above). A caller can still override by passing an explicit
-    # ``scale=``.
-    # NOTE: this block MUST run BEFORE the topk=0 branch so ``scale`` is
-    # resolved for the sliding-window branch (which runs AFTER the if/else
-    # and uses ``scale`` unconditionally). Previously it was inside the
-    # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
-    # ``else`` branch was skipped for any other reason, causing a
-    # ``None * tensor`` crash in ``_sliding_window_attention``.
-    if scale is None:
-        if normalize_qk:
-            scale = 1.0
-        else:
-            scale = c ** -0.5
-
     # Handle topk=0 (degenerate but valid: caller asks for no sparse
     # selection). Without this guard the downstream ``scores.amax(-1)``
     # raises ``IndexError: Expected reduction dim -1 to have non-zero size``
