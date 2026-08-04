@@ -176,12 +176,12 @@ class HeadwiseFusedAttention(nn.Module):
         self.csa_q = nn.Linear(d, cfg.H_csa * cfg.csa_c, bias=False)
         self.csa_kv = nn.Linear(d, cfg.csa_c, bias=False)
         self.csa_z = nn.Linear(d, cfg.csa_c, bias=False)
-        self.csa_B = nn.Parameter(torch.randn(1, cfg.csa_m, cfg.csa_c) * 0.02)
+        self.csa_B = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_c) * 0.02)
 
         self.hca_q = nn.Linear(d, cfg.H_hca * cfg.hca_c, bias=False)
         self.hca_kv = nn.Linear(d, cfg.hca_c, bias=False)
         self.hca_z = nn.Linear(d, cfg.hca_c, bias=False)
-        self.hca_B = nn.Parameter(torch.randn(1, cfg.hca_m2, cfg.hca_c) * 0.02)
+        self.hca_B = nn.Parameter(torch.randn(cfg.hca_m2, cfg.hca_c) * 0.02)
 
         self.norm = nn.LayerNorm(d)
         self.o_proj = nn.Linear(cfg.H_total * hd, d, bias=False)
@@ -194,7 +194,7 @@ class HeadwiseFusedAttention(nn.Module):
         k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
-        beta = torch.sigmoid(self.kda_beta(x)).view(B, T, H, 1)
+        beta = torch.sigmoid(self.kda_beta(x)).view(B, T, H)
         o, _ = naive_recurrent_kda(q, k, v, g, beta, output_final_state=False)
         return o
 
