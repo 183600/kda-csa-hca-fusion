@@ -133,6 +133,14 @@ def _sliding_window_attention(
         if ct < win:
             C_slice = F.pad(C_slice, (0, 0, win - ct, 0))   # [B, win+win-1, c]
         C_windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, max(ct,win), win, c]
+        # When ct < win the left-padded slice unfolds into ``win`` windows;
+        # only the last ``ct`` of them are aligned with the ``ct`` query
+        # positions in this chunk (window ``j`` = padded position
+        # ``t_lo + j - (win - ct)``, so query ``t_lo + i`` needs window
+        # ``j = win - ct + i``).  Discard the leading ``win - ct``
+        # all-zero windows so the window axis has length ``ct`` and matches
+        # ``q_chunk`` in the einsum below.
+        C_windows = C_windows[:, -ct:]                       # [B, ct, win, c]
         q_chunk = q[:, t_lo:t_hi]                            # [B, ct, nh, c]
         mask_chunk = valid_mask[t_lo:t_hi]                   # [ct, win]
         scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows) * scale
