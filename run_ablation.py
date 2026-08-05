@@ -92,7 +92,15 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
         embed.eval()
         correct, total = 0, 0
         losses = []
-        eval_gen = make_seeded_generator(seed + 1_000_001, device=device)
+        # Use a distinct, far-separated offset (5_000_000) for the eval RNG so
+        # it never collides with the *next* seed's training stream
+        # (``seed + 1_000_000``). With the old ``seed + 1_000_001`` offset,
+        # seed s's eval batches were the EXACT stream seed s+1 trained on
+        # (e.g. seed 42 eval = seed 43 train = 1_000_043), correlating
+        # successive seeds and making the multi-seed t-test's independence
+        # assumption invalid / the eval set not fresh. This mirrors the
+        # documented RNG-isolation fix in ``run_quality.py``.
+        eval_gen = make_seeded_generator(seed + 5_000_000, device=device)
         with torch.no_grad():
             for _ in range(n_batches):
                 x_emb, target, cue_pos = make_mqar_batch(
