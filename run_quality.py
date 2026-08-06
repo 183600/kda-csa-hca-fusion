@@ -756,13 +756,26 @@ class HCAAttn(nn.Module):
 
 
 def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
-                n_batches=4, batch=64):
+                n_batches=4, batch=64, seed=42):
     """Evaluate accuracy over multiple fresh batches for a stable estimate.
 
     Uses a dedicated ``torch.Generator`` for batch generation so the eval
     batches are reproducible and independent of any global-RNG state left
     over by training. This also makes the eval pass deterministic across
     re-runs, which is useful for debugging.
+
+    The eval generator is derived from the training ``seed`` (not a fixed
+    constant), so each seed is evaluated on FRESH eval batches. This makes
+    the multi-seed ``std_acc`` / CI / t-test in ``train_multi_seed`` capture
+    BOTH training stochasticity and eval-sampling variance — i.e. the full
+    variance of repeating the experiment from scratch. With a fixed eval
+    seed the per-seed accuracies were all measured on the SAME eval batches,
+    so the reported CI silently excluded eval-sampling variance and
+    overstated the significance of the operator comparisons. Because the
+    generator depends only on ``seed``, all operators for a given seed still
+    see the SAME eval batches (apples-to-apples), and the far ``+ 5_000_000``
+    offset keeps the eval stream clear of every seed's ``+ 1_000_000``
+    training stream (mirrors ``run_ablation.py::_eval_model``).
 
     Restores each module's train/eval mode after evaluation so a future
     caller that evaluates mid-training does not silently resume training
@@ -778,9 +791,10 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
                       # but we set it for symmetry with layer/head so future
                       # additions (e.g. embedding dropout) do not silently stay
                       # in train mode during evaluation.
-        # Fixed generator seed so every operator sees the SAME eval batches
-        # (apples-to-apples comparison at eval time too, not just train).
-        eval_gen = make_seeded_generator(12345, device=device)
+        # Fresh eval batches per seed (see the docstring for the statistical
+        # rationale): seed+5_000_000 is far from every seed's training stream
+        # at seed+1_000_000 and from run_ablation's own eval offset usage.
+        eval_gen = make_seeded_generator(seed + 5_000_000, device=device)
         correct, total = 0, 0
         losses = []
         with torch.no_grad():
@@ -951,7 +965,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # Final eval on multiple fresh batches for a stable accuracy estimate.
     final_acc, final_loss = _eval_model(
         layer, head, embed, seq_len, n_kv, vocab, device,
-        n_batches=eval_batches, batch=eval_batch,
+        n_batches=eval_batches, batch=eval_batch, seed=seed,
     )
     chance = 1.0 / vocab
     # Guard against steps=0 (would crash on accs[-1] / sum([])/0 below).
