@@ -79,6 +79,41 @@ def _ensure_figures_dir():
     os.makedirs(_FIGURES_DIR, exist_ok=True)
 
 
+def _ratio_vs_gqa(row, kind, default_mode='5l'):
+    """Select the KV/FLOPs ratio to draw for one result row.
+
+    ``run_kv_cache.py`` emits three ratio families against the GQA8
+    baseline: ``*_vs_gqa_1l`` (denominator = ONE GQA8 layer) and
+    ``*_vs_gqa_5l`` (denominator = FIVE GQA8 layers) plus a legacy
+    ``*_vs_gqa``.
+
+    The 5-layer denominator is the apples-to-apples comparison for the
+    hybrid stack (5 sub-layers). Standalone single-layer ops (kda/csa/hca)
+    are drawn at their per-layer 5l ratio so they share the axis.
+
+    However, the ``softmax_gqa`` row is the BASELINE itself: a single
+    GQA8 layer, so its ``*_vs_gqa_5l`` field equals ``1/5 = 0.2``.
+    Drawing it from the 5l field places the full-softmax baseline at 20%
+    of the cost on an axis whose ``1.0`` reference line *is* the 5-layer
+    softmax model (and whose DeepSeek-V4 target line -- e.g. 27% of FLOPs
+    -- is meant to be judged against the FULL softmax cost). That silently
+    made the baseline look ~5x cheaper than it is (in ``fig_flops`` the
+    full softmax baseline even appeared BELOW the 27% target). For the
+    baseline rows we therefore use its 1-layer ratio (== 1.0) so it sits
+    on the ``1.0`` reference line, consistent with the target lines.
+    """
+    base = 'kv_ratio' if kind == 'kv' else 'flops_ratio'
+    if row.get('op') == 'softmax_gqa':
+        ratio = row.get(f'{base}_vs_gqa_1l',
+                        row.get(f'{base}_vs_gqa_5l',
+                                row.get(f'{base}_vs_gqa')))
+    else:
+        ratio = row.get(f'{base}_vs_gqa_5l',
+                        row.get(f'{base}_vs_gqa_1l',
+                                row.get(f'{base}_vs_gqa')))
+    return ratio if ratio is not None else None
+
+
 def _ratio_layers(ratio: str) -> int:
     """Return the total layer count encoded by a ratio string like '3:1:1'.
 
@@ -210,8 +245,7 @@ def fig_kv_cache():
     for r in data:
         if mode is not None and r.get('accounting_mode', mode) != mode:
             continue
-        ratio = r.get('kv_ratio_vs_gqa_5l', r.get('kv_ratio_vs_gqa_1l',
-                                                   r.get('kv_ratio_vs_gqa')))
+        ratio = _ratio_vs_gqa(r, 'kv')
         if ratio is None:
             continue
         ops.setdefault(r['op'], []).append((r['T'], ratio))
@@ -219,6 +253,9 @@ def fig_kv_cache():
         print('Skipping fig_kv_cache (no data to plot for the selected '
               f'accounting_mode={mode!r})')
         return
+    mode_note = {'full_accounting': 'full KV accounting',
+                 'compressed_kv_only': 'compressed-KV-only accounting'}.get(
+                     mode, f'accounting_mode={mode!r}')
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
@@ -231,10 +268,11 @@ def fig_kv_cache():
         ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=5)
     ax.set_xlabel('Sequence length T (tokens)')
     ax.set_ylabel('KV cache size / GQA8 (5-layer baseline)')
-    ax.set_title('KV cache compression vs. sequence length')
+    ax.set_title(f'KV cache compression vs. sequence length ({mode_note})')
     ax.set_xscale('log', base=2)
     ax.set_yscale('log')
-    ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5)
+    ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5,
+               label='Softmax GQA8 (5-layer) = 1.0')
     ax.axhline(0.02, color='red', linestyle=':', alpha=0.5,
                label='DeepSeek-V4 target (2%)')
     ax.legend(fontsize=8, loc='upper right')
@@ -262,8 +300,7 @@ def fig_flops():
     for r in data:
         if mode is not None and r.get('accounting_mode', mode) != mode:
             continue
-        ratio = r.get('flops_ratio_vs_gqa_5l', r.get('flops_ratio_vs_gqa_1l',
-                                                      r.get('flops_ratio_vs_gqa')))
+        ratio = _ratio_vs_gqa(r, 'flops')
         if ratio is None:
             continue
         ops.setdefault(r['op'], []).append((r['T'], ratio))
@@ -271,6 +308,9 @@ def fig_flops():
         print('Skipping fig_flops (no data to plot for the selected '
               f'accounting_mode={mode!r})')
         return
+    mode_note = {'full_accounting': 'full KV accounting',
+                 'compressed_kv_only': 'compressed-KV-only accounting'}.get(
+                     mode, f'accounting_mode={mode!r}')
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
@@ -283,10 +323,11 @@ def fig_flops():
         ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=5)
     ax.set_xlabel('Sequence length T (tokens)')
     ax.set_ylabel('Prefill FLOPs / GQA8 (5-layer baseline)')
-    ax.set_title('Prefill compute vs. sequence length')
+    ax.set_title(f'Prefill compute vs. sequence length ({mode_note})')
     ax.set_xscale('log', base=2)
     ax.set_yscale('log')
-    ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5)
+    ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5,
+               label='Softmax GQA8 (5-layer) = 1.0')
     ax.axhline(0.27, color='red', linestyle=':', alpha=0.5,
                label='DeepSeek-V4 target (27%)')
     ax.legend(fontsize=8, loc='upper right')
