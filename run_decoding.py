@@ -1069,6 +1069,10 @@ def main():
         'hca':     lambda: HCAAttnDecoding(d_model),
         'hybrid':  lambda: HybridDecoding(d_model),
     }
+    # Seed the global RNG before constructing any model so each operator's
+    # weights are deterministic across runs (the ``main()`` path otherwise
+    # consumes the unseeded process RNG; timing rows would not be reproducible).
+    torch.manual_seed(0)
 
     results = []
     for plen in prefill_lens:

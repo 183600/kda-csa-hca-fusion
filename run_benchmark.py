@@ -331,7 +331,13 @@ def bench_hybrid(B, T, d, device):
         n_kda=3, n_csa=1, n_hca=1,
         kda_backend=_selected_kda_backend(),
     )
-    model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
+    seed = zlib.crc32(b'hybrid_weights') & 0xFFFFFFFF
+    _prev_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
+    finally:
+        torch.random.set_rng_state(_prev_state)
     x = _rand(B, T, d, device=device, generator=gen)
     def fn():
         with torch.no_grad():

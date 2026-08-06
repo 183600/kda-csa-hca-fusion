@@ -181,6 +181,14 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
     x = torch.randn(1, seq_len, d_model, device=device, generator=lat_gen) * 0.1
     was_training = model.training
     model.eval()
+    # Pin intra-op threads to 1 during the latency probe so the reported
+    # ``fwd_ms`` is comparable across layouts and to run_benchmark (Exp2),
+    # which measures with ``torch.set_num_threads(1)``. Dynamic intra-op
+    # thread resizing on CPU causes large run-to-run jitter that would
+    # otherwise dominate (or hide) the layout-vs-layout latency gap.
+    _prev_thr = torch.get_num_threads()
+    if device.type != 'cuda':
+        torch.set_num_threads(1)
     try:
         with torch.no_grad():
             model.reset_state()
@@ -195,6 +203,8 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
                 torch.cuda.synchronize()
             fwd_ms = (time.perf_counter() - t0) / 5 * 1e3
     finally:
+        if device.type != 'cuda':
+            torch.set_num_threads(_prev_thr)
         model.train(was_training)
 
     last_loss = losses[-1] if losses else 0.0
