@@ -1017,7 +1017,7 @@ def naive_csa(
             # weighted by its soft probability. This is differentiable
             # w.r.t. soft_weights (and therefore the indexer params).
             # soft_kv[b, t, k, :] = soft_weights_selected[b, t, k] * kv[b, t, k, :]
-            soft_kv = soft_weights_selected.unsqueeze(-1) * kv       # [B, T, topk, c]
+            soft_kv = soft_weights_selected.unsqueeze(-1) * kv.detach()  # [B, T, topk, c]
 
             if ste_mode == 'full_softmax':
                 # Add a zero-in-forward term whose backward is the full
