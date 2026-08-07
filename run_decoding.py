@@ -509,7 +509,7 @@ class CSAAttnDecoding(nn.Module):
         cache.append_step(
             Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
             K_idx.detach(), Z_idx.detach(),
-            self.Ba, self.Bb, self.B_idx,
+            self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
         )
         compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
         q_n = F.normalize(q.to(compute_dtype), dim=-1)
@@ -589,7 +589,7 @@ class HCAAttnDecoding(nn.Module):
             cache.append_step(C.detach(), Z.detach(), self.B_pos.detach())
             return self.o_proj(o)
         C, Z, q = self._project(x)
-        cache.append_step(C.detach(), Z.detach(), self.B_pos)
+        cache.append_step(C.detach(), Z.detach(), self.B_pos.detach())
         compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
         q_n = F.normalize(q.to(compute_dtype), dim=-1)
         o = cache.forward_step(
