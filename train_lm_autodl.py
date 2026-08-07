@@ -237,6 +237,7 @@ def main():
             break
 
         if accum_batches < grad_accum:
+            optimizer.zero_grad(set_to_none=True)
             continue
 
         if scaler.is_enabled():
