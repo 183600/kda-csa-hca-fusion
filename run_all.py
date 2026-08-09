@@ -165,6 +165,31 @@ def _setup():
     return info
 
 
+# Result files written by each experiment's ``main()``. When an experiment
+# fails, its previous run's JSON must not survive to be plotted as if it were
+# fresh output (see the figure step below).
+_EXPERIMENT_OUTPUTS = {
+    'exp1_correctness': ['results/exp1_correctness.json'],
+    'exp2_benchmark': ['results/exp2_benchmark.json',
+                       'results/exp2_benchmark_provenance.json'],
+    'exp3_kv_cache': ['results/exp3_kv_cache.json'],
+    'exp4_mqar': ['results/exp4_mqar.json'],
+    'exp5_ablation': ['results/exp5_ablation.json',
+                      'results/exp5_ablation_provenance.json'],
+    'exp6_decoding': ['results/exp6_decoding.json'],
+}
+
+
+def _purge_stale_outputs(name):
+    """Remove result JSONs that a failed run would leave behind as stale."""
+    for rel in _EXPERIMENT_OUTPUTS.get(name, ()):
+        try:
+            if os.path.exists(rel):
+                os.remove(rel)
+        except OSError as e:
+            print(f'[run_all] WARNING: could not remove stale {rel}: {e}')
+
+
 def _run(name, fn):
     """Run one experiment with timing and error capture.
 
@@ -190,6 +215,7 @@ def _run(name, fn):
         dt = time.time() - t0
         print(f'\n[{name}] FAILED ({dt:.1f}s): {e}')
         traceback.print_exc()
+        _purge_stale_outputs(name)
         return {'name': name, 'status': 'fail', 'time_s': dt, 'error': str(e)}
     dt = time.time() - t0
     # Honor the explicit return-code contract. A non-zero / non-None
@@ -197,6 +223,7 @@ def _run(name, fn):
     if rc is not None and rc != 0:
         msg = f'{name} returned non-zero status: {rc!r}'
         print(f'\n[{name}] FAILED ({dt:.1f}s): {msg}')
+        _purge_stale_outputs(name)
         return {'name': name, 'status': 'fail', 'time_s': dt, 'error': msg,
                 'return_code': str(rc)}
     print(f'\n[{name}] OK ({dt:.1f}s)')
@@ -354,20 +381,27 @@ def run_all(seeds=None, steps=None):
 
         # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
         if skip_slow and is_cpu:
-            print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to <=3 seeds / <=100 steps.')
-            # SKIP_SLOW only TRUNCATES (caps at the safe ceiling), never
-            # EXPANDS. Use ``min(user_value, safe_ceiling)`` so a user
-            # who already set a smaller value keeps it.
-            try:
-                _mqar_seeds = int(os.environ.get('MQAR_SEEDS', '5'))
-            except ValueError:
-                _mqar_seeds = 5
+            print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to <=100 steps, '
+                  'seeds held at >=5 for a valid Bonferroni test.')
+            # SKIP_SLOW only TRUNCATES the step budget, never EXPANDS.
+            # Use ``min(user_value, safe_ceiling)`` so a user who already
+            # set a smaller value keeps it.
             try:
                 _mqar_steps = int(os.environ.get('MQAR_STEPS', '200'))
             except ValueError:
                 _mqar_steps = 200
-            os.environ['MQAR_SEEDS'] = str(min(_mqar_seeds, 3))
             os.environ['MQAR_STEPS'] = str(min(_mqar_steps, 100))
+            # Keep the seed count at the default (5) even under SKIP_SLOW.
+            # Below 5 seeds the Bonferroni-corrected t-test is essentially
+            # unachievable and the experiment cannot support any structural
+            # conclusion (the same policy run_ablation applies to ABL_SEEDS
+            # below). Preserve/raise the seed count to at least 5 even if the
+            # caller passed ``run_all(seeds=3)`` or exported ``MQAR_SEEDS=3``.
+            try:
+                _mqar_seeds = int(os.environ.get('MQAR_SEEDS', '5'))
+            except ValueError:
+                _mqar_seeds = 5
+            os.environ['MQAR_SEEDS'] = str(max(5, _mqar_seeds))
             # Keep the primary comparison fair even in the reduced CPU run.
             # A longer softmax-only sensitivity run must be requested
             # explicitly by the caller, not silently enabled here.
