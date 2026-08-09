@@ -143,6 +143,11 @@ cython_debug/
 results/
 figures/
 
+# HuggingFace datasets cache for the WikiText-103 experiment. These arrow
+# files are huge (GBs) and regenerated on demand by the notebook via
+# `load_wikitext(... cache_dir="./wt103_cache")`; they must never be committed.
+wt103_cache/
+
 # Lock files. `requirements.txt` / `pyproject.toml` pin upper bounds
 # (e.g. torch>=2.2,<2.7) but the lock files themselves are not committed.
 *.lock
