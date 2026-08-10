@@ -159,14 +159,13 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem):
-    """Capture test function return values and convert list-of-dict FAIL
-    entries into real AssertionError failures.
+    """Run a synchronous test function exactly once and convert the
+    ``run_correctness`` list-of-dict status pattern into real AssertionError
+    failures.
 
-    Only handles plain synchronous functions returning the ``_ok``
-    list-of-dict pattern. Async tests, generator tests, and any other exotic
-    test types — as well as normal tests returning ``None`` or a non-list
-    value — fall through to pytest's default implementation (return
-    ``None`` to yield to the next hook).
+    The function is executed here (once) and ``True`` is returned so pytest's
+    default implementation never re-runs it. Async / generator test functions
+    fall through to pytest's default implementation (return ``None``).
     """
     import inspect as _inspect
     testfunction = pyfuncitem.obj
@@ -192,12 +191,23 @@ def pytest_pyfunc_call(pyfuncitem):
         # fall back to passing all funcargs (the default impl's behaviour).
         testargs = dict(funcargs)
     res = testfunction(**testargs)
-    # Inspect the return value (the ``_ok`` pattern from run_correctness.py).
-    # Only list-of-dict-with-'status' returns are interpreted; everything
-    # else (None, scalar, etc.) is left to pytest's default behaviour (which
-    # is to issue a ``PytestReturnNotNoneWarning`` for non-None returns).
-    if isinstance(res, list) and res and all(
-            isinstance(r, dict) and 'status' in r for r in res):
+    # Interpret the ``_ok`` list-of-dict pattern from run_correctness.py.
+    # A returned status list is the contract for those tests: an empty list
+    # means no checks ran (a regression that stops emitting status rows would
+    # otherwise leave CI green while validating nothing) and every entry must
+    # carry a ``status`` key. Non-list returns (e.g. ``None`` from an
+    # assert-based test like test_figures.py) are already pass/fail via the
+    # assertion they execute, so they need no interpretation here.
+    if isinstance(res, list):
+        if not res:
+            raise AssertionError(
+                f'{pyfuncitem.name} returned an empty status list — '
+                f'no checks were performed; treating as a failure instead '
+                f'of a silent pass.')
+        if not all(isinstance(r, dict) and 'status' in r for r in res):
+            raise AssertionError(
+                f'{pyfuncitem.name} returned a malformed status list '
+                f'(every entry must be a dict with a \'status\' key).')
         failures = [r for r in res if r.get('status') != 'PASS']
         if failures:
             msgs = '\n'.join(
@@ -205,8 +215,6 @@ def pytest_pyfunc_call(pyfuncitem):
                 f"{r.get('detail','')}" for r in failures)
             raise AssertionError(
                 f"{len(failures)} check(s) failed in {pyfuncitem.name}:\n{msgs}")
-        return True  # handled: stop the default impl from running
-    # Not the ``_ok`` list-of-dict pattern — yield to pytest's default
-    # implementation so normal ``assert``-based tests (e.g. test_figures.py)
-    # and ``PytestReturnNotNoneWarning`` semantics are preserved.
-    return None
+    # The function already ran exactly once above. Returning ``True`` stops
+    # pytest's default implementation from running it a second time.
+    return True

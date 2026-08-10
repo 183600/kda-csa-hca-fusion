@@ -344,7 +344,7 @@ def run_all(seeds=None, steps=None):
         import method_analysis
         import make_figures
 
-        skip_slow = os.environ.get('SKIP_SLOW', '0') == '1'
+        skip_slow = os.environ.get('SKIP_SLOW', '0').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
         is_cpu = not info.has_gpu
 
         # 1. Correctness — always run (fast, ~seconds).
@@ -447,13 +447,13 @@ def run_all(seeds=None, steps=None):
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
 
         # 8. Figures — generate from whatever results exist.
-        # Distinguish two failure modes:
+        # Two failure modes:
         #
         # * ``FileNotFoundError`` / ``json.JSONDecodeError``: a result
-        #   file is missing or malformed. ``make_figures.load`` already
-        #   degrades gracefully for individual figures (returns ``[]``
-        #   and logs a skip), so a propagated instance of these means
-        #   the figure step as a whole could not even enumerate inputs.
+        #   file is missing or malformed. ``make_figures.load`` degrades
+        #   gracefully for individual figures (returns ``[]`` and logs a
+        #   skip), so ``make_figures.main()`` never propagates these —
+        #   the expected figure outputs are verified below instead.
         #   Treat as a soft warning: print and continue, but mark the
         #   step failed in the summary so the user knows the figures
         #   are incomplete.
@@ -463,22 +463,47 @@ def run_all(seeds=None, steps=None):
         #   in the summary.
         def _make_figs():
             try:
-                # Propagate the return value so a non-zero rc from
-                # ``make_figures.main()`` (signalling partial failure
-                # without raising) is honored by ``_run``.
-                return make_figures.main()
+                rc = make_figures.main()
             except (FileNotFoundError, json.JSONDecodeError) as e:
                 # Soft failure: a result file is missing or malformed.
-                # ``make_figures.load`` handles per-figure skips, but a
-                # top-level FileNotFoundError means the whole results
-                # dir is unreachable. Print a warning and return a
-                # non-zero status so ``_run`` records it as a failure
-                # (the figure step is incomplete, not "ok").
+                # Print a warning and return a non-zero status so ``_run``
+                # records it as a failure (the figure step is incomplete,
+                # not "ok").
                 print(f'[make_figures] incomplete: {e}')
                 traceback.print_exc()
                 return 1
             # Any other exception propagates to ``_run``'s except block
-            # and is recorded as status='fail'. No more silent swallow.
+            # and is recorded as status='fail'.
+            if rc:
+                return rc
+            # ``make_figures.main()`` skips (rather than crashes on) a
+            # result file that is missing or has empty/malformed data
+            # (``load()`` returns ``[]``), so it returns ``None`` even when
+            # figures were silently skipped. Verify the expected figure
+            # outputs — mirroring ``main()``'s own ``os.path.exists`` guards
+            # on the result files — so an incomplete figure set is still
+            # recorded as a failure in the summary.
+            res_dir = make_figures._RESULTS_DIR
+            fig_dir = make_figures._FIGURES_DIR
+            expected = []
+            if os.path.exists(os.path.join(res_dir, 'exp2_benchmark.json')):
+                expected.append('fig_benchmark.pdf')
+            if os.path.exists(os.path.join(res_dir, 'exp3_kv_cache.json')):
+                expected += ['fig_kv_cache.pdf', 'fig_flops.pdf']
+            if os.path.exists(os.path.join(res_dir, 'exp4_mqar.json')):
+                expected.append('fig_mqar_nkv1.pdf')
+            if os.path.exists(os.path.join(res_dir, 'exp5_ablation.json')):
+                expected.append('fig_ablation_nkv1.pdf')
+            if os.path.exists(os.path.join(res_dir, 'exp6_decoding.json')):
+                expected.append('fig_decoding.pdf')
+            expected.append('fig_architecture.pdf')
+            missing = [f for f in expected
+                       if not os.path.exists(os.path.join(fig_dir, f))]
+            if missing:
+                print('[make_figures] incomplete; missing figures: '
+                      + ', '.join(missing))
+                return 1
+            return 0
         summary['runs'].append(_run('make_figures', _make_figs))
 
         # Final summary.
