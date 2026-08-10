@@ -447,7 +447,9 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
 
     Layout per sequence (length ``seq_len``):
       positions [0, 2*n_kv): alternating (key, value) tokens
-      positions [2*n_kv, seq_len-1): random noise tokens
+      positions [2*n_kv, seq_len-1): distractor tokens (sampled from the
+        vocab ids that are neither a key nor a value, so the answer token
+        never appears redundantly in the filler)
       position  seq_len-1: a cue key (repeat of one of the keys)
     Target = the value that was paired with the cued key.
 
@@ -488,16 +490,37 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
         raise ValueError(
             f"2*n_kv={2*n_kv} must be < seq_len={seq_len} (need room for cue token)")
 
-    # Random noise base (covers noise positions; KV positions overwritten below).
-    x = torch.randint(0, vocab, (batch, seq_len), device=device, generator=generator)
     cue_pos = seq_len - 1
+    n_noise = seq_len - 2 * n_kv - 1       # filler slots between KV region and cue
 
     # One uniformly-random permutation of [0, vocab) per sequence, obtained
     # by argsort of iid uniform keys (ties have measure zero in float32).
     # Slicing the first 2*n_kv columns yields 2*n_kv distinct ids per row.
-    pair_ids = torch.rand(batch, vocab, device=device, generator=generator).argsort(dim=-1)[:, :2 * n_kv]
-    keys = pair_ids[:, 0::2]   # [batch, n_kv]
-    vals = pair_ids[:, 1::2]   # [batch, n_kv]
+    pair_ids = torch.rand(batch, vocab, device=device, generator=generator).argsort(dim=-1)
+    keys = pair_ids[:, 0:2 * n_kv:2]   # [batch, n_kv]
+    vals = pair_ids[:, 1:2 * n_kv:2]   # [batch, n_kv]
+
+    # Random noise base (covers noise positions; KV positions overwritten below).
+    # Noise MUST be drawn only from the distractor ids — the ids in [0, vocab)
+    # that are neither a key nor a value for that sequence. Drawing the filler
+    # from the full vocabulary lets the cued *answer* token reappear in the
+    # noise as a redundant copy that token-level operators (softmax/KDA) can
+    # copy without resolving the key-value association, while the block-
+    # compressed operators (CSA/HCA) only see it after compression/dilution —
+    # a structural difficulty mismatch that would bias the reported ranking.
+    distractor = pair_ids[:, 2 * n_kv:]          # [batch, vocab - 2*n_kv]
+    if n_noise > 0:
+        if 2 * n_kv >= vocab:
+            raise ValueError(
+                f"vocab={vocab} leaves no distractor ids for {n_noise} noise "
+                f"slots; need vocab > 2*n_kv={2 * n_kv}")
+        x = torch.empty(batch, seq_len, dtype=torch.long, device=device)
+        noise_draw = torch.randint(
+            0, distractor.shape[1], (batch, n_noise),
+            device=device, generator=generator)
+        x[:, 2 * n_kv:cue_pos] = distractor.gather(1, noise_draw)
+    else:
+        x = torch.empty(batch, seq_len, dtype=torch.long, device=device)
 
     # Place (key, value) pairs at positions [0, 2*n_kv) via broadcast
     # advanced indexing: x[b_idx, even_pos] has shape [batch, n_kv].

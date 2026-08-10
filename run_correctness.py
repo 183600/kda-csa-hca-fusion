@@ -5031,6 +5031,73 @@ def test_hybrid_decoding_cache_matches_full_sequence(device='cpu'):
         f'prefill_len={prefill_len}, n_decode={n_decode}, csa_topk=100')]
 
 
+def test_mqar_noise_excludes_keys_and_values(device='cpu'):
+    """MQAR filler noise must not leak key/value (or the cued answer) tokens.
+
+    Exp 4 (run_quality.py) and Exp 5 (run_ablation.py) both build MQAR
+    sequences through ``make_mqar_batch``. If the filler slots
+    ``[2*n_kv, seq_len-1)`` are drawn from the full vocabulary, the cued
+    *answer* token re-appears there as a redundant copy that token-level
+    operators (softmax/KDA) can copy without resolving the key-value
+    association, while block-compressed operators (CSA/HCA) only observe it
+    after compression/dilution — a structural difficulty mismatch that biases
+    the reported operator ranking. Assert that no noise slot ever contains a
+    key token, a value token, or in particular the cued answer.
+    """
+    from torch.nn import Embedding
+    from run_quality import make_mqar_batch
+
+    def _ids_of(x_emb):
+        # The embedding below is row-wise one-hot, so argmax recovers ids.
+        return x_emb.argmax(dim=-1)
+
+    leaks = []
+    for (seq_len, n_kv, vocab, batch) in [
+            (16, 1, 16, 8), (24, 2, 24, 8), (32, 3, 64, 6),
+            (64, 4, 64, 6), (48, 2, 100, 8), (40, 5, 200, 6)]:
+        for seed in range(4):
+            gen = torch.Generator(device=device).manual_seed(seed)
+            embed = Embedding(vocab, vocab).to(device)
+            with torch.no_grad():
+                embed.weight.copy_(torch.eye(vocab, device=device))
+            x_emb, target, cue_pos = make_mqar_batch(
+                batch, seq_len, n_kv, vocab, embed, device=device,
+                generator=gen)
+            ids = _ids_of(x_emb)                      # [batch, seq_len]
+            for b in range(ids.shape[0]):
+                mem = set(ids[b, :2 * n_kv].tolist())
+                noise = ids[b, 2 * n_kv:cue_pos].tolist()
+                if mem.intersection(noise):
+                    leaks.append(
+                        f'seed{seed} (seq={seq_len},n_kv={n_kv},vocab={vocab}) '
+                        f'row{b}: key/value {sorted(mem)} appears in noise')
+                if int(target[b].item()) in noise:
+                    leaks.append(
+                        f'seed{seed} (seq={seq_len},n_kv={n_kv},vocab={vocab}) '
+                        f'row{b}: answer token reappears in noise')
+                # Sanity: the cue is a key (must live in the memory region).
+                if int(ids[b, cue_pos].item()) not in mem:
+                    leaks.append(
+                        f'seed{seed} (seq={seq_len},n_kv={n_kv},vocab={vocab}) '
+                        f'row{b}: cue token misplaced')
+
+    # Config without enough distractor ids must raise, not silently re-leak.
+    raised = False
+    try:
+        gen = torch.Generator(device=device).manual_seed(0)
+        embed = Embedding(4, 4).to(device)
+        make_mqar_batch(1, 6, 2, 4, embed, device=device, generator=gen)
+    except ValueError:
+        raised = True
+
+    return [_ok(
+        'mqar_noise_excludes_keys_and_values',
+        not leaks and raised,
+        f'noise_leaks={len(leaks)}'
+        + (f' first={leaks[0]}' if leaks else '')
+        + f' no-distractor-ValueError={raised}')]
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -5174,6 +5241,9 @@ def main():
     all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
     # Integrated Exp6 hybrid decode-cache path (KDA state + CSA/HCA caches).
     all_results += _run_safe(test_hybrid_decoding_cache_matches_full_sequence, device)
+    # MQAR task construction shared by Exp 4 / Exp 5 (run_quality/run_ablation):
+    # filler noise must never leak key/value/answer tokens.
+    all_results += _run_safe(test_mqar_noise_excludes_keys_and_values, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)
