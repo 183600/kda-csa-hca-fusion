@@ -396,6 +396,35 @@ def main():
                       'n_layers': 5,
                       'note': '5-layer KDA+CSA+HCA stack with LayerNorm, projections, attention, state management (3:1:1 default ratio)'},
     }
+    # Workload-defining hyperparameters per operator. These are the values that
+    # determine how many keys each method actually attends to at a given T
+    # (e.g. CSA/HCA attend only to ``topk`` compressed blocks + a fixed
+    # ``sliding_window``, so their cost is ~flat in T while softmax attends to
+    # all T keys). Serializing them next to the timing rows lets a reviewer
+    # reconstruct the measured workload instead of having to guess it from
+    # source.
+    op_workload = {
+        'softmax':   {'heads': H, 'head_dim': K, 'attends_to_all_T': True,
+                      'causal_mask': True},
+        'kda_rec':   {'heads': H, 'head_dim': K,
+                      'note': 'recurrent delta-rule; O(1) state, attends to all T via recurrence'},
+        'kda_chunk': {'heads': H, 'head_dim': K, 'chunk_size': 64,
+                      'note': 'chunked recurrence; attends to all T via chunk-state passing'},
+        'csa':       {'m': 8, 'topk': 4, 'sliding_window': 8, 'heads': 4,
+                      'c': 16, 'dc': 32, 'nIh': 2, 'cI': 8,
+                      'attends_to_all_T': False,
+                      'note': 'attends to at most topk compressed blocks + sliding_window keys (~constant in T)'},
+        'hca':       {'m2': 16, 'sliding_window': 8, 'heads': 4,
+                      'c': 16, 'dc': 32,
+                      'attends_to_all_T': False,
+                      'note': 'attends to at most all compressed entries + sliding_window keys (~constant in T)'},
+        'hybrid':    {'n_layers': 5, 'n_kda': 3, 'n_csa': 1, 'n_hca': 1,
+                      'heads_qk': 2, 'heads_v': 2, 'head_dim_k': 16, 'head_dim_v': 16,
+                      'csa_m': 8, 'csa_topk': 4, 'csa_sliding_window': 8,
+                      'hca_m2': 16, 'hca_sliding_window': 8,
+                      'attends_to_all_T': False,
+                      'note': 'hybrid stack: KDA recurrence covers all T; CSA/HCA layers are sparse (~constant radius)'},
+    }
 
     results = []
     n_repeats = parse_int_env('BENCH_REPEATS', 5, min_value=1, logger=logger)
@@ -417,6 +446,7 @@ def main():
                 row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
                 row['time_std_ms'] = _LAST_TIMING_STATS.get('std_ms')
                 row.update(op_boundary[name])
+                row['workload'] = op_workload.get(name, {})
                 results.append(row)
                 mem_str = f'{mem:8.2f} MB' if mem is not None else '     n/a'
                 print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem_str}')
@@ -435,6 +465,7 @@ def main():
                     err_row['csa_indexer_normalize_qk'] = True
                     err_row['csa_ste_in_timed_region'] = False
                 err_row.update(op_boundary[name])
+                err_row['workload'] = op_workload.get(name, {})
                 results.append(err_row)
                 logger.error(f'  {name:12s}  ERROR: {e}')
 

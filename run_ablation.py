@@ -1,8 +1,10 @@
 """Experiment 5 — hybrid layout ablation (multi-seed, device-aware).
 
 Sweeps over different KDA:CSA:HCA ratios in the fused hybrid block and
-measures (a) end-to-end forward latency and (b) MQAR accuracy with the same
-training recipe as Experiment 4. This quantifies the design trade-off:
+measures (a) end-to-end forward latency and (b) MQAR accuracy, following
+the same task construction as Experiment 4 (``make_mqar_batch``) but with
+the ablation's own defaults for training budget (``ABL_STEPS``/``ABL_SEEDS``/
+``ABL_TRAIN_BATCH``, see README). This quantifies the design trade-off:
 
   * more KDA layers  -> faster, lower memory, but weaker long-range recall
   * more CSA layers   -> better sparse recall, but slower (top-k selection)

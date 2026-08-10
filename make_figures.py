@@ -643,6 +643,16 @@ def fig_decoding():
     ax.set_yscale('log')
     ax.legend(fontsize=9)
     ax.grid(True, which='both', alpha=0.3)
+    # CSA/HCA/hybrid rows are measured with incremental compressed-block /
+    # sliding-window caches, and their per-token cost includes interpreter
+    # control flow (top-k selection, block append) that softmax/KDA do not
+    # pay. The raw median is plotted as-is, so keep the caveat visible on the
+    # figure rather than only in the JSON metadata.
+    ax.text(0.02, 0.02,
+            'CSA/HCA/hybrid use incremental caches; their decode latency '
+            'includes per-token Python control flow',
+            transform=ax.transAxes, fontsize=7, color='0.4', ha='left',
+            va='bottom')
     _ensure_figures_dir()
     try:
         fig.savefig(os.path.join(_FIGURES_DIR, 'fig_decoding.pdf'), dpi=150)
