@@ -38,6 +38,27 @@ from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_kda_backend import kda_forward, validate_kda_backend
 
+
+class _Fp32LayerNorm(nn.LayerNorm):
+    """LayerNorm that computes in fp32 and returns the input dtype.
+
+    ``torch.nn.LayerNorm`` has no fp16/bf16 CPU kernel, so a ``model.half()``
+    followed by an fp16 forward crashes on CPU with ``LayerNormKernelImpl``.
+    This subclass upcasts the input (and the affine params) to fp32, runs the
+    norm, and casts the output back to the input dtype. For fp32 inputs every
+    cast is a no-op, so the numerically fast path is unchanged.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        if dtype in (torch.float16, torch.bfloat16):
+            weight = self.weight.detach().to(torch.float32)
+            bias = self.bias.detach().to(torch.float32)
+            out = F.layer_norm(
+                x.float(), self.normalized_shape, weight, bias, self.eps)
+            return out.to(dtype)
+        return super().forward(x)
+
 logger = logging.getLogger(__name__)
 
 
@@ -773,7 +794,7 @@ class HybridKCHAttention(nn.Module):
                 self.layers.append(HCAHybridLayer(cfg))
             else:
                 raise ValueError(kind)
-        self.norms = nn.ModuleList([nn.LayerNorm(cfg.d_model) for _ in self.layout])
+        self.norms = nn.ModuleList([_Fp32LayerNorm(cfg.d_model) for _ in self.layout])
         # Number of KDA layers in the stack (each one needs its OWN state).
         # Different KDA layers have different parameters (q_proj, k_proj, ...),
         # so they must not share recurrent state. Sharing state across layers
