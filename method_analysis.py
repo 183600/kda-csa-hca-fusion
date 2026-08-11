@@ -76,12 +76,15 @@ Proof sketch (by enumeration of the feasible frontier, B=5, n_csa>=1, n_hca>=1):
     KDA layer without a global-context branch (i.e. comparing (4,1,0) at
     5L vs (3,1,1) at 5L) loses HCA's global context for one more
     finite-state layer — a dominated trade.
-    Note: our ablation includes 4:1:1 (4 KDA + 1 CSA + 1 HCA = 6L), which
-    is NOT an equal-budget comparison to 3:1:1 (5L). The 4:1:1 result
-    *underperforms* 3:1:1, but this is confounded by depth (6L vs 5L at a
-    fixed step budget leaves 4:1:1 under-trained). The clean equal-budget
-    comparison (4,1,0) vs (3,1,1) is not in the ablation set; the
-    theoretical argument above is what supports the claim.
+    Note: the controlled-depth ablation (run_ablation.py) DOES include
+    (4,1,0) and (4,0,1) at 5L — these violate the n_csa>=1 / n_hca>=1
+    feasibility constraint used here, and empirically they are not
+    dominated at this scale: both reach slightly higher mean accuracy than
+    (3,1,1), though with only a few surviving seeds and near-chance
+    accuracies the run itself reports conclusions_valid=False. The (3,1,1)
+    default therefore rests on the structural argument above — the minimal
+    5L allocation with all three capabilities — not on an empirical
+    advantage measured at this scale.
   * (4,0,1): infeasible (violates n_csa>=1). Closest feasible is (3,1,1):
     one fewer KDA layer buys the recall branch. Dominated.
   * (3,1,1): recall + global context + 3 cheap mixing layers. This is the

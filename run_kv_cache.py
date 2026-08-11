@@ -12,9 +12,11 @@ inference engine must retain:
 
 We now report TWO accounting modes:
 
-  * ``compressed_kv_only``  — the optimistic number (matches the original
-    paper's "1.01% of GQA8" claim). This is what you get if you only count
-    the compressed KV entries.
+  * ``compressed_kv_only``  — the optimistic number: only the compressed
+    KV entries (shared-KV design — one c-vector per compressed block serves
+    as both key and value). At T=1,048,576 this is ~0.51% of the 1-layer
+    GQA8 KV cache (K+V per head) and ~0.10% of the 5-layer baseline. This
+    is what you get if you only count the compressed KV entries.
   * ``full_accounting``     — includes every auxiliary cache listed above plus
     incremental runtime state (partial-token accumulators and CSA's previous
     overlapped Cb/Zb block). This is the number a production inference engine
