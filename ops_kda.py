@@ -128,19 +128,22 @@ def _compute_dtype(dtype):
 def _is_compiling_safely() -> bool:
     """Return True if we are inside a torch.compile / torch.export trace."""
     try:
-        return torch.compiler.is_compiling()  # type: ignore[attr-defined]
-    except AttributeError:
+        # Probe torch._dynamo FIRST. ``torch._dynamo.is_compiling()`` is
+        # tracable inside a ``fullgraph=True`` compile on every supported
+        # torch release (2.2+), whereas attribute access on
+        # ``torch.compiler.is_compiling`` raises InternalTorchDynamoError on
+        # torch 2.2 (the attribute exists only from 2.3, and touching it in a
+        # traced function aborts the compile). Reordering the probes keeps the
+        # fullgraph compile on 2.2 from failing on the guard itself.
+        import torch._dynamo as _dm
+        if callable(_dm.is_compiling):
+            return bool(_dm.is_compiling())
+    except Exception:
         pass
+    try:
+        return torch.compiler.is_compiling()  # type: ignore[attr-defined]
     except Exception:
         return False
-    try:
-        import torch._dynamo as _dm
-        fn = getattr(_dm, "is_compiling", None)
-        if callable(fn):
-            return bool(fn())
-    except Exception:
-        pass
-    return False
 
 
 def _warn_if_nonfinite(o, fn_name, stacklevel=3):
