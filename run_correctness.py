@@ -1361,14 +1361,23 @@ def test_csa_indexer_ste_gradient(device='cpu'):
     # ``atol=1e-12`` is well below any meaningful accuracy threshold
     # for fp64 (machine epsilon ~2.2e-16) while still tolerating the
     # rounding from the extra add/subtract in the STE path.
+    #
+    # IMPORTANT: this comparison must run with GRAD ENABLED (i.e. NOT
+    # inside ``torch.no_grad()``). ``naive_csa`` gates the STE on
+    # ``use_ste and torch.is_grad_enabled()`` (see ops_csa.py): under
+    # ``no_grad`` both calls take the same lean hard-index path, so the
+    # assertion would compare the code path to itself and trivially pass
+    # even if the STE silently changed the forward value whenever grad is
+    # enabled. With grad enabled, ``use_ste=True`` executes the STE
+    # surrogate (``kv = kv + (soft_kv - soft_kv.detach())``) whose forward
+    # value is mathematically identical to the hard gather.
     import copy
     p_ref = _make_params()
     p_ste = copy.deepcopy(p_ref)
     common = dict(m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
                   sliding_window=0, sink_logits=None)
-    with torch.no_grad():
-        o_ref = naive_csa(H, **p_ref, use_ste=False, **common)
-        o_ste = naive_csa(H, **p_ste, use_ste=True, **common)
+    o_ref = naive_csa(H, **p_ref, use_ste=False, **common)
+    o_ste = naive_csa(H, **p_ste, use_ste=True, **common)
     fwd_invariant = torch.allclose(o_ref, o_ste, rtol=0, atol=1e-12)
 
     # --- Part 2: indexer parameters receive gradient under STE ---
@@ -1625,14 +1634,18 @@ def test_csa_indexer_ste_full_softmax(device='cpu'):
                   sliding_window=0, sink_logits=None)
 
     # --- Part 1: forward equivalence between the two STE modes ---
+    # Run with GRAD ENABLED (not ``torch.no_grad()``): ``naive_csa`` gates
+    # the STE on ``use_ste and torch.is_grad_enabled()``, so under
+    # ``no_grad`` neither ``ste_mode`` branch would execute and the
+    # assertion would compare two identical hard-index paths (vacuously
+    # true even if a STE mode corrupted the forward value).
     import copy
     p_ref = _make_params()
     p_fs = copy.deepcopy(p_ref)
-    with torch.no_grad():
-        o_tk = naive_csa(H, **p_ref, use_ste=True,
-                         ste_mode='topk_columns', **common)
-        o_fs = naive_csa(H, **p_fs, use_ste=True,
-                         ste_mode='full_softmax', **common)
+    o_tk = naive_csa(H, **p_ref, use_ste=True,
+                     ste_mode='topk_columns', **common)
+    o_fs = naive_csa(H, **p_fs, use_ste=True,
+                     ste_mode='full_softmax', **common)
     fwd_equiv = torch.allclose(o_tk, o_fs, rtol=0, atol=1e-12)
     fwd_diff = (o_tk - o_fs).abs().max().item() if not fwd_equiv else 0.0
 
@@ -1648,16 +1661,25 @@ def test_csa_indexer_ste_full_softmax(device='cpu'):
     # both STE paths).
     indexer_param_names = ['W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx']
 
-    def _run_backward(ste_mode):
-        p = _make_params()
+    # Controlled comparison: BOTH modes must start from the SAME
+    # parameter values so the gradient-norm difference isolates the
+    # ``ste_mode`` effect. (Previously each mode drew a fresh
+    # ``_make_params()``, so ``full_softmax`` vs ``topk_columns`` was
+    # confounded by random initialization.)
+    p_base = _make_params()
+    p_tk = copy.deepcopy(p_base)
+    p_fs = copy.deepcopy(p_base)
+    for p in (p_tk, p_fs):
         for name in indexer_param_names:
             p[name] = p[name].clone().requires_grad_(True)
+
+    def _run_backward(p, ste_mode):
         o = naive_csa(H, **p, use_ste=True, ste_mode=ste_mode, **common)
         o.sum().backward()
         return {name: p[name].grad for name in indexer_param_names}
 
-    grads_tk = _run_backward('topk_columns')
-    grads_fs = _run_backward('full_softmax')
+    grads_tk = _run_backward(p_tk, 'topk_columns')
+    grads_fs = _run_backward(p_fs, 'full_softmax')
 
     # All grads must be non-None and finite.
     tk_grads_finite = all(
@@ -1675,14 +1697,17 @@ def test_csa_indexer_ste_full_softmax(device='cpu'):
 
     # --- Part 3: no-STE invariance ---
     # ste_mode has no effect when use_ste=False. Both modes produce
-    # identical forward outputs.
+    # identical forward outputs. Run with GRAD ENABLED and
+    # ``use_ste=False`` so ``effective_use_ste`` is False: this verifies
+    # the ``ste_mode`` branch is guarded by ``use_ste`` (not merely by
+    # ``torch.is_grad_enabled()``, which would have made the old
+    # ``no_grad`` version of this check vacuous).
     p_noste_a = _make_params()
     p_noste_b = copy.deepcopy(p_noste_a)
-    with torch.no_grad():
-        o_noste_tk = naive_csa(H, **p_noste_a, use_ste=False,
-                               ste_mode='topk_columns', **common)
-        o_noste_fs = naive_csa(H, **p_noste_b, use_ste=False,
-                               ste_mode='full_softmax', **common)
+    o_noste_tk = naive_csa(H, **p_noste_a, use_ste=False,
+                           ste_mode='topk_columns', **common)
+    o_noste_fs = naive_csa(H, **p_noste_b, use_ste=False,
+                           ste_mode='full_softmax', **common)
     noste_equiv = torch.allclose(o_noste_tk, o_noste_fs, rtol=0, atol=0)
 
     return [
@@ -2743,10 +2768,12 @@ def test_hybrid_backward_produces_grads(device='cpu'):
 
     # Indexer parameters (CSA layer index 3 in the default 3:1:1 layout).
     # Under the P0-4 STE fix these ARE differentiable (gradient flows
-    # through the ``soft_weights`` path). The test passes whether the
-    # indexer params get a non-None grad (STE on, the default) or a None
-    # grad (STE off, ablation) — both are legitimate, but a non-finite
-    # or unexpectedly-zero grad on ANY differentiable param is a bug.
+    # through the ``soft_weights`` path), and the default model config
+    # uses ``use_ste=True`` — so a None grad on an indexer param is a
+    # regression (the STE path broke), not a legitimate case. We treat it
+    # as ``differentiable_no_grad`` so the test fails loudly instead of
+    # silently pinning the old un-trained-indexer behaviour. A non-finite
+    # or unexpectedly-zero grad on ANY differentiable param is also a bug.
     indexer_param_substrings = ('W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx')
     differentiable_no_grad = []
     differentiable_zero_grad = []
@@ -3695,10 +3722,12 @@ def test_csa_hca_input_validation(device='cpu'):
     w = _build_csa_weights()
     # Build separate weights with cI=0 (the W_IUQ/W_KV_idx/W_Z_idx/B_idx
     # must match the new cI=0 to avoid shape errors masking the assert).
+    # The shapes below use ``nn.Linear.weight`` convention ``[out, in]``:
+    # W_IUQ is [cI*nIh, dc], W_KV_idx/W_Z_idx are [cI, d], B_idx is [m, cI].
     w0 = dict(w)
-    w0['W_IUQ'] = torch.randn(dc, 0 * nIh, device=device)
-    w0['W_KV_idx'] = torch.randn(d, 0, device=device)
-    w0['W_Z_idx'] = torch.randn(d, 0, device=device)
+    w0['W_IUQ'] = torch.randn(0 * nIh, dc, device=device)
+    w0['W_KV_idx'] = torch.randn(0, d, device=device)
+    w0['W_Z_idx'] = torch.randn(0, d, device=device)
     w0['B_idx'] = torch.randn(m, 0, device=device)
     try:
         naive_csa(H, **w0, m=m, topk=2, nh=nh, nIh=nIh, c=c, c_I=0, dc=dc,
@@ -3717,8 +3746,8 @@ def test_csa_hca_input_validation(device='cpu'):
 
     # --- nIh=0 must raise ---
     w_n0 = dict(w)
-    w_n0['W_IUQ'] = torch.randn(dc, cI * 0, device=device)
-    w_n0['W_w'] = torch.randn(d, 0, device=device)
+    w_n0['W_IUQ'] = torch.randn(cI * 0, dc, device=device)
+    w_n0['W_w'] = torch.randn(0, d, device=device)
     try:
         naive_csa(H, **w_n0, m=m, topk=2, nh=nh, nIh=0, c=c, c_I=cI, dc=dc,
                   sliding_window=4, sink_logits=torch.zeros(nh, device=device))
@@ -4006,12 +4035,30 @@ def test_prefill_flops_head_count(device='cpu'):
     With csa_nh=4 and H=8 (deliberately different), the CSA core+SW FLOPs
     must be HALF of what they'd be with csa_nh=8 (since FLOPs scale
     linearly with head count).
+
+    The check isolates the head-count effect exactly: when only the
+    attention head count changes, ``prefill_flops`` may change only via
+    the terms that are linear in that head count (W_UQ up-projection,
+    core attention, sliding-window branch, and the output projection).
+    All other terms (compression, W_DQ, W_IUQ, W_w, indexer) are
+    head-count-independent. We therefore assert that the FLOP delta
+    between the two variants equals the analytic sum of the
+    head-scaled terms. If core+SW wrongly used ``H`` instead of
+    ``csa_nh``/``hca_nh``, their contribution would be IDENTICAL in both
+    variants and the measured delta would fall short of the expected one
+    by exactly the core+SW portion — failing the assertion. (The earlier
+    version only checked ``fl_4 < fl_8``; that is trivially satisfied
+    even with the H-bug because W_UQ and out_proj still scale with the
+    head count, so the test could not detect the regression it claims to
+    guard. The causal-entry helpers used as the oracle here are
+    independently verified by ``test_prefill_flops_causal_block_entries``
+    and the brute-force checks in ``test_kv_cache_ceil_block_count``.)
     """
     logger.info("Test: prefill_flops uses csa_nh/hca_nh (not H) for core/SW FLOPs")
     # Import lazily so this test does not add a hard dependency to the
     # top-level imports (run_correctness.py is the only consumer).
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from run_kv_cache import prefill_flops
+    from run_kv_cache import prefill_flops, causal_block_entries, causal_selected_entries
 
     T = 4096
     # Common base params with H=8.
@@ -4030,26 +4077,48 @@ def test_prefill_flops_head_count(device='cpu'):
     fl_8 = prefill_flops('csa', T, csa_nh=8, hca_nh=8, **base)
     fl_8_hca = prefill_flops('hca', T, csa_nh=8, hca_nh=8, **base)
 
-    # With the fix, the core+SW terms (which scale with head count) should
-    # be ~half when csa_nh=4 vs csa_nh=8. The compress/query_proj/indexer
-    # terms do NOT scale with csa_nh (except W_UQ which does), so the total
-    # ratio is NOT exactly 0.5 — but it must be strictly less than 1.0
-    # (proving csa_nh is used somewhere) and strictly greater than the
-    # ratio we'd get if H were used everywhere (which would be 1.0).
-    # A simpler check: the two variants must NOT be equal. With the old
-    # formula (H used for core+SW), both would be identical because H=8
-    # in both variants. With the fix (csa_nh used), they differ.
-    csa_differs = fl_4 != fl_8
-    hca_differs = fl_4_hca != fl_8_hca
-    # And the smaller-head variant must have FEWER FLOPs (since core+SW
-    # scale linearly with head count and the other terms are unchanged).
-    csa_smaller = fl_4 < fl_8
-    hca_smaller = fl_4_hca < fl_8_hca
+    # --- Analytic oracle for the head-count-scaled FLOP delta ---
+    # Terms linear in csa_nh (per unit head), from prefill_flops('csa'):
+    #   W_UQ up-projection : 2*T*csa_dc*csa_c
+    #   core sparse        : 2*total_sel*csa_c*2
+    #   sliding-window     : 2*sw_entries*csa_c*2
+    #   out_proj           : 2*T*csa_c*d
+    # Terms linear in hca_nh (per unit head), from prefill_flops('hca'):
+    #   W_UQ up-projection : 2*T*hca_dc*hca_c
+    #   core dense         : 2*causal_entries*hca_c*2
+    #   sliding-window     : 2*sw_entries*hca_c*2
+    #   out_proj           : 2*T*hca_c*d
+    total_sel = causal_selected_entries(T, base['csa_m'], base['csa_topk'])
+    csa_sw_w = base['csa_sliding_window']
+    csa_eff_sw = min(T, csa_sw_w)
+    csa_sw_entries = T * csa_eff_sw - csa_eff_sw * (csa_eff_sw - 1) // 2
+    csa_scale = (2 * T * base['csa_dc'] * base['csa_c']
+                 + 2 * total_sel * base['csa_c'] * 2
+                 + 2 * csa_sw_entries * base['csa_c'] * 2
+                 + 2 * T * base['csa_c'] * base['d'])
+
+    hca_entries = causal_block_entries(T, base['hca_m2'])
+    hca_sw_w = base['hca_sliding_window']
+    hca_eff_sw = min(T, hca_sw_w)
+    hca_sw_entries = T * hca_eff_sw - hca_eff_sw * (hca_eff_sw - 1) // 2
+    hca_scale = (2 * T * base['hca_dc'] * base['hca_c']
+                 + 2 * hca_entries * base['hca_c'] * 2
+                 + 2 * hca_sw_entries * base['hca_c'] * 2
+                 + 2 * T * base['hca_c'] * base['d'])
+
+    delta_nh = 8 - 4
+    csa_expected_delta = csa_scale * delta_nh
+    hca_expected_delta = hca_scale * delta_nh
+
+    csa_delta_matches = (fl_8 - fl_4) == csa_expected_delta
+    hca_delta_matches = (fl_8_hca - fl_4_hca) == hca_expected_delta
     return [
-        _ok('prefill_flops(csa) differs by csa_nh', csa_differs and csa_smaller,
-            f'csa_nh=4: {fl_4}, csa_nh=8: {fl_8}, ratio={fl_4/fl_8:.4f}'),
-        _ok('prefill_flops(hca) differs by hca_nh', hca_differs and hca_smaller,
-            f'hca_nh=4: {fl_4_hca}, hca_nh=8: {fl_8_hca}, ratio={fl_4_hca/fl_8_hca:.4f}'),
+        _ok('prefill_flops(csa) head-count delta matches the head-scaled terms',
+            csa_delta_matches,
+            f'actual_delta={fl_8 - fl_4}, expected_delta={csa_expected_delta}'),
+        _ok('prefill_flops(hca) head-count delta matches the head-scaled terms',
+            hca_delta_matches,
+            f'actual_delta={fl_8_hca - fl_4_hca}, expected_delta={hca_expected_delta}'),
     ]
 
 
