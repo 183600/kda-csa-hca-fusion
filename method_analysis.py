@@ -344,9 +344,9 @@ CSA — Compressed Sparse Attention
      scores[h] = q[t, h] . kv^T * scale             # [H, topk]
      denom[h] = sum_i exp(scores[h, i]) + exp(sink[h])
      p[h, i] = exp(scores[h, i]) / denom[h]         # sink is an extra denominator term
-     out[t, h] = p[h] @ kv                          # [H, c]
-   (Note: ``kv`` uses the NORMALIZED C_comp_n, but the output einsum uses the
-   UN-NORMALIZED C_comp to preserve compressed KV magnitudes.)
+out[t, h] = p[h] @ kv                          # [H, c]
+    (Note: both ``kv`` and the output einsum use the NORMALIZED C_comp_n, so
+    the sparse-branch output lives in normalized space.)
 
 4. Sliding window branch (local uncompressed KV):
    For each query t: attend to H[t-w+1 : t+1] @ W_aKV with causal masking.
@@ -371,7 +371,7 @@ HCA — Heavily Compressed Attention
    A block becomes visible when its full m'-token source window closes.
    scores[h, t, n] = q[t, h] . C_comp_n[n] * scale
    p = softmax(scores + causal_mask)
-   out[t, h] = sum_n p[h, t, n] * C_comp[n]      # uses UN-NORMALIZED C_comp
+   out[t, h] = sum_n p[h, t, n] * C_comp_n[n]   # uses NORMALIZED C_comp_n
 
 3. Sliding window branch: same structure as CSA's sliding window, but using
    HCA's single KV projection ``C = H @ W_KV`` (NOT CSA's two-branch
