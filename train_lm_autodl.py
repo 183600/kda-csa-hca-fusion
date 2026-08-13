@@ -88,7 +88,17 @@ class LMWithHybrid(nn.Module):
                                    labels.reshape(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss}
 
-def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
+def count_params(m):
+    seen = set()
+    total = 0
+    for p in m.parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
+        total += p.numel()
+    return total
 
 def main():
     parser = argparse.ArgumentParser()
@@ -165,9 +175,13 @@ def main():
                 no_decay_ids.add(id(p))
     _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'B_pos')
     decay, no_decay = [], []
+    seen = set()
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
         leaf_name = name.rsplit('.', 1)[-1]
         if (id(p) in no_decay_ids or p.ndim <= 1
                 or leaf_name in _POSITIONAL_BIAS_SUFFIXES):
@@ -242,7 +256,7 @@ def main():
 
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(decay + no_decay, 1.0)
         if scaler.is_enabled():
             scaler.step(optimizer)
             scaler.update()

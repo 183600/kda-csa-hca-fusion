@@ -398,9 +398,10 @@ def main():
     }
     # Workload-defining hyperparameters per operator. These are the values that
     # determine how many keys each method actually attends to at a given T
-    # (e.g. CSA/HCA attend only to ``topk`` compressed blocks + a fixed
-    # ``sliding_window``, so their cost is ~flat in T while softmax attends to
-    # all T keys). Serializing them next to the timing rows lets a reviewer
+    # (e.g. CSA attends only to ``topk`` compressed blocks + a fixed
+    # ``sliding_window``, so its cost is ~flat in T; HCA attends to all
+    # compressed blocks, growing linearly in T; softmax attends to all T
+    # keys). Serializing them next to the timing rows lets a reviewer
     # reconstruct the measured workload instead of having to guess it from
     # source.
     op_workload = {
@@ -417,13 +418,13 @@ def main():
         'hca':       {'m2': 16, 'sliding_window': 8, 'heads': 4,
                       'c': 16, 'dc': 32,
                       'attends_to_all_T': False,
-                      'note': 'attends to at most all compressed entries + sliding_window keys (~constant in T)'},
+                      'note': 'attends to all causally-visible compressed entries (O(T/m2), linear in T) + sliding_window keys'},
         'hybrid':    {'n_layers': 5, 'n_kda': 3, 'n_csa': 1, 'n_hca': 1,
                       'heads_qk': 2, 'heads_v': 2, 'head_dim_k': 16, 'head_dim_v': 16,
                       'csa_m': 8, 'csa_topk': 4, 'csa_sliding_window': 8,
                       'hca_m2': 16, 'hca_sliding_window': 8,
                       'attends_to_all_T': False,
-                      'note': 'hybrid stack: KDA recurrence covers all T; CSA/HCA layers are sparse (~constant radius)'},
+                      'note': 'hybrid stack: KDA recurrence covers all T; CSA layer is sparse (topk-capped, ~constant radius); HCA layer attends to all compressed blocks (linear in T)'},
     }
 
     results = []
