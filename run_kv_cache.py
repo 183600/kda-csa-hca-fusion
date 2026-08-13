@@ -64,6 +64,11 @@ DEFAULTS = dict(
     kda_hv=8, kda_k=128, kda_v=128,
     # KDA short-conv kernel size (depthwise Conv1d in KDAHybridLayer).
     kda_conv_ksize=3,
+    # KDA chunk size for the chunk-parallel prefill kernel. The paper's Eq 13
+    # (Kimi Linear §6.3) specifies a fixed chunk size C=64; the actual prefill
+    # path (ops_fused.KDAHybridLayer / ops_kda.naive_chunk_kda) uses this value
+    # for the inter-chunk A/u/w terms, so the FLOPs formula must match it.
+    kda_chunk_size=64,
     # Hybrid layer-count ratio. Keeping these in DEFAULTS makes the documented
     # kwargs override path work (unknown-key validation below otherwise rejects
     # hybrid_n_kda / hybrid_n_csa / hybrid_n_hca before the hybrid branch sees
@@ -290,10 +295,17 @@ def prefill_flops(op: str, T: int, **kw):
       4. ``q_i^T S``                       — HV*V dots of length K  -> HV*V*K MACs
 
     i.e. ~3 * HV*K*V MACs per step (the dominant terms), or
-    ~6 * T * HV*K*V FLOPs total. The previous formula used
-    ``2 * T * HV*K*V``, a ~3x underestimate. We also include the input
-    projection FLOPs (q/k/v/g/beta plus the grouped output projection) for
-    parity with CSA/HCA and the softmax baseline.
+    ~6 * T * HV*K*V FLOPs total. The paper's §6.3 Eq 13 counts the
+    chunk-parallel kernel (fixed chunk size ``C=64``) as
+    ``6T*dh^2 + 3T*C*dh + T*C^2`` per head; the prefill implementation
+    (``ops_fused.KDAHybridLayer``, ``kda_chunk_size=64`` default) actually
+    computes those inter-chunk terms (the block transfer matrix ``A`` and the
+    ``u``/``w`` inter-chunk outputs), so we add
+    ``HV * (3T*C*K + T*C^2)`` to the recurrent dominant term. The previous
+    formula used ``2 * T * HV*K*V``, a ~3x underestimate of the dominant
+    term alone. We also include the input projection FLOPs (q/k/v/g/beta
+    plus the grouped output projection) for parity with CSA/HCA and the
+    softmax baseline.
 
     For CSA, the ``compress`` term previously counted only ``W_aKV``
     (one ``T*d*c`` projection). The actual implementation
@@ -363,10 +375,18 @@ def prefill_flops(op: str, T: int, **kw):
         short_conv = 2 * T * d * ksize
         # Recurrence: ~3 HV*K*V MACs per step (see docstring).
         recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
+        # Chunk-parallel inter-chunk terms (paper §6.3 Eq 13):
+        # ``3T*C*dh + T*C^2`` per head, C = chunk size, dh = K = V. The
+        # prefill path (ops_fused.KDAHybridLayer, default
+        # ``kda_chunk_size=64``) computes these on top of the recurrent
+        # term. The terms are already FLOPs (2*MACs), matching the paper.
+        c = p['kda_chunk_size']
+        chunk_inter = 3 * T * kda_hv * c * kda_k
+        chunk_a = T * kda_hv * c * c
         # Grouped output projection: HV*V -> d (matches KDAHybridLayer.o_proj,
         # run_quality.KDAAttn.o, and run_decoding.KDAAttnDecoding.o).
         out_proj = 2 * T * kda_hv * kda_v * d
-        return proj + short_conv + recurrent + out_proj
+        return proj + short_conv + recurrent + chunk_inter + chunk_a + out_proj
     if op == 'csa':
         # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
         # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last

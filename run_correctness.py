@@ -4544,9 +4544,17 @@ def test_prefill_flops_kch_output_projections(device='cpu'):
     ksize = p.get('kda_conv_ksize', 3)
     short_conv = 2 * T * d * ksize
     recurrent = 2 * 3 * T * kda_hv * kda_k * kda_v
+    # Chunk-parallel inter-chunk terms (paper §6.3 Eq 13): ``3T*C*dh + T*C^2``
+    # per head with C = kda_chunk_size, dh = K = V. The prefill path uses the
+    # chunk kernel, so these must be part of the KDA FLOPs baseline the
+    # output-projection residual is measured against.
+    c = p['kda_chunk_size']
+    chunk_inter = 3 * T * kda_hv * c * kda_k
+    chunk_a = T * kda_hv * c * c
     expected_kda_out = 2 * T * kda_hv * kda_v * d
     actual_kda = prefill_flops('kda', T)
-    kda_ok = (actual_kda - (proj_no_out + short_conv + recurrent)) == expected_kda_out
+    kda_ok = (actual_kda - (proj_no_out + short_conv + recurrent
+                            + chunk_inter + chunk_a)) == expected_kda_out
 
     # CSA/HCA are covered in the full formula tests above; here we also make
     # their totals explicitly sensitive to a positive output-projection term.
