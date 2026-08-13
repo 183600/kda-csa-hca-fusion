@@ -213,9 +213,9 @@ class HeadwiseFusedAttention(nn.Module):
         Z = self.csa_z(x)
         C_comp = csa_compress_kv(C, Z, self.csa_B, m)
         C_comp_n = F.normalize(C_comp, dim=-1)
-        q = F.normalize(self.csa_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
+        q = F.normalize(self.csa_q(x).view(B, Tp, H, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, n_blocks, m, x.device)
-        scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
+        scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
         safe_scores = scores.masked_fill(all_masked, 0.0)
@@ -238,9 +238,9 @@ class HeadwiseFusedAttention(nn.Module):
         Z = self.hca_z(x)
         C_comp = csa_compress_kv(C, Z, self.hca_B, m2)
         C_comp_n = F.normalize(C_comp, dim=-1)
-        q = F.normalize(self.hca_q(x).view(B, H, Tp, c).to(C_comp_n.dtype), dim=-1)
+        q = F.normalize(self.hca_q(x).view(B, Tp, H, c).to(C_comp_n.dtype), dim=-1)
         cbm = _causal_block_mask(Tp, n_blocks, m2, x.device)
-        scores = torch.einsum('b h t d, b n d -> b h t n', q, C_comp_n) * self.scale
+        scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
         safe_scores = scores.masked_fill(all_masked, 0.0)
