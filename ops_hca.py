@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from ops_csa import (
     csa_compress_kv,
     _causal_block_mask,
-    _sliding_window_attention,
+    _sliding_window_scores,
     _nan_safe_softmax,
     CHUNKED_SW_THRESHOLD,
 )
@@ -145,53 +145,52 @@ def naive_hca(
 
     scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * scale
     scores = scores.masked_fill(~cbm[None, None], float('-inf'))
-    if sink_logits is not None:
-        log_sink = sink_logits.view(1, nh, 1, 1).to(scores)  # [1, nh, 1, 1]
-        row_max = scores.amax(-1, keepdim=True)                    # [B, nh, T, 1]
-        all_masked = torch.isneginf(row_max)                     # [B, nh, T, 1]
-        row_max_safe = torch.where(all_masked, torch.zeros_like(row_max), row_max)
-        shifted = scores - row_max_safe                            # [B, nh, T, n_blocks]
-        shifted_sink = log_sink - row_max_safe                      # [B, nh, T, 1]
-        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(lse, shifted_sink)              # [B, nh, T, 1]
-        p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
-        p = p.masked_fill(all_masked, 0.0)
-        # Per DeepSeek-V4 §2.3.2 (and the repo's own CSA sink path in
-        # ops_csa.naive_csa) the attention sink is a *virtual* entry that
-        # appears ONLY in the softmax denominator, ``denom = sum_i exp(s_i) +
-        # exp(sink)``. It does NOT contribute a value to the output: the
-        # expected KV of a virtual entry with no source tokens is zero, not a
-        # constant 1 broadcast across the head dim. The previous code added
-        # ``p_sink * 1`` to the output, which silently injected a
-        # per-(batch,position,head) constant bias scaled by the sink
-        # probability into every HCA output — corrupting all HCA-based
-        # quality / ablation / hybrid-decoding numbers and making
-        # ``ops_hca``'s sink contract disagree with ``ops_csa``'s.
-        # Verified by ``test_hca_sink_matches_shifted_logsumexp_reference``
-        # and ``test_hybrid_decoding_cache_matches_full_sequence`` in
-        # run_correctness.py, which now both pass.
-        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
-    else:
-        p = _nan_safe_softmax(scores, dim=-1)
-        out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
-
-    # --- 3. Sliding window branch (uncompressed local KV) ---
+        # --- 3. Sliding-window branch (uncompressed local KV) ---
     if sliding_window > 0:
         win = sliding_window
         if W_KV_local is not None:
             C_local_raw = F.linear(H, W_KV_local)                   # [B, T, c]
         else:
             C_local_raw = C
-        # Pass a 3-D ``[B, T, c]`` tensor to ``_sliding_window_attention``.
-        # The helper's signature documents ``C_local: [B, T, c]`` and it
-        # expands the per-head dimension inline via its einsum
-        # (``'b t h d, b t w d -> b t h w'``), so broadcasting a per-head
-        # dim ourselves would be redundant and incorrect. The matching CSA
-        # call site (``ops_csa.py::naive_csa``) uses the same 3-D contract
-        # with the same helper.
         C_local = F.normalize(C_local_raw.to(compute_dtype), dim=-1)  # [B, T, c]
-        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
-        out = out + sw_out
+        scores_w, C_windows, win_valid = _sliding_window_scores(
+            q, C_local, win, scale, device)
+        scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
+    else:
+        scores_w = torch.empty(B_, nh, T, 0, dtype=compute_dtype, device=device)
+        C_windows = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
+        win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
+
+    # --- 4. JOINT softmax over the union of compressed + window entries ---
+    # One softmax over the concatenated scores (DeepSeek-V4 §2.3.1 Eq. 27),
+    # with the attention sink in the single shared denominator. The sink is a
+    # *virtual* entry that appears ONLY in the denominator,
+    # ``denom = sum_i exp(s_i) + exp(sink)``. It does NOT contribute a value
+    # to the output: the expected KV of a virtual entry with no source tokens
+    # is zero, not a constant 1 broadcast across the head dim.
+    cat = torch.cat([scores, scores_w], dim=-1)                    # [B, nh, T, n_blocks+win]
+    if cat.shape[-1] == 0:
+        out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
+    elif sink_logits is not None:
+        log_sink = sink_logits.view(1, nh, 1, 1).to(cat)           # [1, nh, 1, 1]
+        row_max = cat.amax(-1, keepdim=True)                       # [B, nh, T, 1]
+        all_masked = torch.isneginf(row_max)                       # [B, nh, T, 1]
+        row_max_safe = torch.where(all_masked, torch.zeros_like(row_max), row_max)
+        shifted = cat - row_max_safe
+        shifted_sink = log_sink - row_max_safe
+        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+        log_denom = torch.logaddexp(lse, shifted_sink)             # [B, nh, T, 1]
+        p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks+win]
+        p = p.masked_fill(all_masked, 0.0)
+    else:
+        all_masked = cat.isinf().all(-1, keepdim=True)
+        p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_masked)
+
+    n_blk = scores.shape[-1]
+    p_dense = p[..., :n_blk]
+    p_w = p[..., n_blk:]
+    out = (torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
+           + torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
 
     out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
     if return_projections:

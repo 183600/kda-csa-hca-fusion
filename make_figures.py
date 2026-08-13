@@ -427,8 +427,8 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
     ax.set_title(f'Multi-Query Associative Recall (n_kv={n_kv}, '
                  f'{n_seeds} seeds, {title_steps} steps){validity_note}',
                  fontsize=8)
-    _finite_upper = [m + c for m, c in zip(means, cis)
-                     if math.isfinite(m + c)]
+    _finite_upper = [m + (c if math.isfinite(c) else 0.0)
+                     for m, c in zip(means, cis)]
     acc_upper = (max(_finite_upper, default=0.0)) * 1.3
     ax.set_ylim(0, max(acc_upper, 0.35))
     for bar, m, c in zip(bars, means, cis):
@@ -536,8 +536,8 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
                  label, ha='center', va='bottom', fontsize=9)
     ax1.legend(fontsize=8)
-    _finite_upper = [float(a) + float(c) for a, c in zip(accs, acc_cis)
-                     if math.isfinite(float(a) + float(c))]
+    _finite_upper = [float(a) + (float(c) if math.isfinite(float(c)) else 0.0)
+                     for a, c in zip(accs, acc_cis)]
     acc_upper = (max(_finite_upper, default=0.0)) * 1.3
     ax1.set_ylim(0, max(acc_upper, 0.2))
 

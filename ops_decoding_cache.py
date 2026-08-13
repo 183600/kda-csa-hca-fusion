@@ -889,9 +889,15 @@ class CSADecodingCache:
             core_scale = scale
 
         if self._C_comp is None or self._n_blocks == 0:
-            # No compressed blocks yet — sparse branch contributes zero.
-            sparse_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            # No compressed blocks yet — no block scores.
+            scores = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
+            )
+            valid_mask = torch.empty(
+                B, 1, 0, dtype=torch.bool, device=device,
+            )
+            kv = torch.empty(
+                B, 1, 0, self.c, dtype=compute_dtype, device=device,
             )
         else:
             n_blocks = self._n_blocks
@@ -946,9 +952,15 @@ class CSADecodingCache:
             # ``indices``: [B, 1, topk], padded with -1 for invalid slots.
             # ``soft_weights``: [B, 1, n_blocks] (differentiable).
             if indices.shape[-1] == 0:
-                # topk=0: sparse branch contributes zero.
-                sparse_out = torch.zeros(
-                    B, 1, nh, self.c, dtype=compute_dtype, device=device,
+                # topk=0: no block scores.
+                scores = torch.empty(
+                    B, 1, nh, 0, dtype=compute_dtype, device=device,
+                )
+                valid_mask = torch.empty(
+                    B, 1, 0, dtype=torch.bool, device=device,
+                )
+                kv = torch.empty(
+                    B, 1, 0, self.c, dtype=compute_dtype, device=device,
                 )
             else:
                 valid_mask = indices >= 0                              # [B, 1, topk]
@@ -988,31 +1000,13 @@ class CSADecodingCache:
                 ) * core_scale                                         # [B, 1, nh, topk]
                 scores = scores.masked_fill(
                     ~valid_mask[:, :, None, :], float('-inf'))
-                if sink_logits is not None:
-                    log_sink = sink_logits.view(1, 1, nh, 1).to(scores)
-                    vmask = valid_mask[:, :, None, :].to(scores.dtype)
-                    row_max = scores.amax(-1, keepdim=True).clamp(min=0)
-                    shifted = scores - row_max
-                    shifted_sink = log_sink - row_max
-                    log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-                    log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-                    p = (shifted - log_denom).exp() * vmask
-                    all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]
-                    p = p.masked_fill(all_invalid, 0.0)
-                else:
-                    all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]
-                    safe_scores = scores.masked_fill(all_invalid, 0.0)
-                    p = torch.softmax(safe_scores, dim=-1)
-                    p = p.masked_fill(all_invalid, 0.0)
-                sparse_out = torch.einsum(
-                    'b t h k, b t k d -> b t h d', p, kv,
-                )                                                      # [B, 1, nh, c]
 
-        # --- Sliding-window branch ---
+        # --- Sliding-window branch: window scores for the joint softmax ---
         if self._sw is None or self._sw.n_valid == 0:
-            sw_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            scores_w = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
             )
+            C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             # SW buffer contents in causal order: [B, sw_len, c]. When
             # normalize_qk=True (default), the buffer stores L2-normalized
@@ -1026,31 +1020,53 @@ class CSADecodingCache:
             # add a correctness test. Avoid runtime asserts on this
             # decode hot path.
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # The SW buffer stores keys that match the normalize_qk flag
-            # (append_step normalizes only when self._normalize_qk is True).
-            # When normalize_qk=False the buffer holds raw keys and we use
-            # core_scale = 1/sqrt(c) (dot-product attention), matching the
-            # sparse branch and the full-sequence naive_csa path.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
-            # Single-query SW attention: scores = q[0] · C_local^T
-            # => [B, nh, sw_len]. Softmax over sw_len. Out = p · C_local
-            # => [B, nh, c]. Reshape to [B, 1, nh, c].
-            scores = torch.einsum(
+            sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             ) * core_scale                                             # [B, nh, sw_len]
-            # No causal mask needed: the SW buffer's contents are
-            # EXACTLY the valid window for the newest query (positions
-            # [t - sw_len + 1, t], all of which are <= t). The naive
-            # path's left-edge masking (for queries near the start of
-            # the sequence whose window extends before position 0) is
-            # handled implicitly: when t < win-1, the buffer has fewer
-            # than win entries, so the softmax is over the actual
-            # entries present (no -inf padding required).
-            p = torch.softmax(scores, dim=-1)                          # [B, nh, sw_len]
-            sw_out = torch.einsum(
-                'b h s, b s d -> b h d', p, C_local,
-            ).unsqueeze(1)                                             # [B, 1, nh, c]
+            scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
+        # JOINT softmax over [blocks; window] with the sink in the single
+        # shared denominator (matches full-sequence naive_csa; DeepSeek-V4
+        # §2.3.1 Eq. 27). The SW buffer holds EXACTLY the valid window for
+        # the newest query, so no -inf padding is needed for the window part.
+        n_win = scores_w.shape[-1]
+        cat = torch.cat([scores, scores_w], dim=-1)                    # [B, 1, nh, topk+sw_len]
+        if n_win:
+            cat_valid = torch.cat(
+                [valid_mask[:, :, None, :],
+                 torch.ones(B, 1, 1, n_win, dtype=torch.bool, device=device)],
+                dim=-1)
+        else:
+            cat_valid = valid_mask[:, :, None, :]
+        if cat.shape[-1] == 0:
+            return torch.zeros(B, 1, nh, self.c, dtype=compute_dtype, device=device)
+        if sink_logits is not None:
+            log_sink = sink_logits.view(1, 1, nh, 1).to(cat)
+            vmask = cat_valid.to(cat.dtype)
+            row_max = cat.amax(-1, keepdim=True).clamp(min=0)
+            shifted = cat - row_max
+            shifted_sink = log_sink - row_max
+            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
+            p = (shifted - log_denom).exp() * vmask
+            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            p = p.masked_fill(all_invalid, 0.0)
+        else:
+            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            safe = cat.masked_fill(all_invalid, 0.0)
+            p = torch.softmax(safe, dim=-1)
+            p = p.masked_fill(all_invalid, 0.0)
+
+        topk_size = scores.shape[-1]
+        p_b = p[..., :topk_size]
+        p_w = p[..., topk_size:]
+        sparse_out = torch.einsum(
+            'b t h k, b t k d -> b t h d', p_b, kv,
+        )                                                              # [B, 1, nh, c]
+        sw_out = torch.einsum(
+            'b t h w, b w d -> b t h d', p_w, C_local,
+        )                                                              # [B, 1, nh, c]
         return sparse_out + sw_out                                     # [B, 1, nh, c]
 
 
@@ -1300,9 +1316,10 @@ class HCADecodingCache:
             core_scale = scale
         t = self._n_tokens_seen - 1
         if self._C_comp is None or self._n_blocks == 0:
-            dense_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            scores = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
             )
+            C_comp_n = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             n_blocks = self._n_blocks
             # A heavy-compression block is visible once its m2-token
@@ -1330,44 +1347,49 @@ class HCADecodingCache:
                 'b t h d, b n d -> b t h n', q_compute, C_comp_n,
             ) * core_scale                                            # [B, 1, nh, n_blocks]
             scores = scores.masked_fill(~cbm[:, :, None, :], float('-inf'))
-            if sink_logits is not None:
-                log_sink = sink_logits.view(1, 1, nh, 1).to(scores)
-                row_max = scores.amax(-1, keepdim=True).clamp(min=0)
-                shifted = scores - row_max
-                shifted_sink = log_sink - row_max
-                lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-                log_denom = torch.logaddexp(lse, shifted_sink)
-                p = (shifted - log_denom).exp()
-                all_masked = torch.isinf(scores).all(-1, keepdim=True)
-                p = p.masked_fill(all_masked, 0.0)
-            else:
-                all_masked = torch.isinf(scores).all(-1, keepdim=True)
-                safe = scores.masked_fill(all_masked, 0.0)
-                p = torch.softmax(safe, dim=-1)
-                p = p.masked_fill(all_masked, 0.0)
-            dense_out = torch.einsum(
-                'b t h n, b n d -> b t h d', p, C_comp_n,
-            )                                                          # [B, 1, nh, c]
 
-        # --- Sliding-window branch ---
+        # --- Sliding-window branch: window scores for the joint softmax ---
         if self._sw is None or self._sw.n_valid == 0:
-            sw_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            scores_w = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
             )
+            C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # The SW buffer stores keys that match the normalize_qk flag
-            # (append_step normalizes only when self._normalize_qk is True).
-            # When normalize_qk=False the buffer holds raw keys and we use
-            # core_scale = 1/sqrt(c) (dot-product attention), matching the
-            # dense branch and the full-sequence naive_hca path.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
-            scores = torch.einsum(
+            sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             ) * core_scale                                            # [B, nh, sw_len]
-            p = torch.softmax(scores, dim=-1)                          # [B, nh, sw_len]
-            sw_out = torch.einsum(
-                'b h s, b s d -> b h d', p, C_local,
-            ).unsqueeze(1)                                             # [B, 1, nh, c]
+            scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
+        # JOINT softmax over [compressed; window] with the sink in the single
+        # shared denominator (matches full-sequence naive_hca; DeepSeek-V4
+        # §2.3.1 Eq. 27).
+        cat = torch.cat([scores, scores_w], dim=-1)                    # [B, 1, nh, n_blocks+sw_len]
+        if cat.shape[-1] == 0:
+            return torch.zeros(B, 1, nh, self.c, dtype=compute_dtype, device=device)
+        if sink_logits is not None:
+            log_sink = sink_logits.view(1, 1, nh, 1).to(cat)
+            row_max = cat.amax(-1, keepdim=True).clamp(min=0)
+            shifted = cat - row_max
+            shifted_sink = log_sink - row_max
+            lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+            log_denom = torch.logaddexp(lse, shifted_sink)
+            p = (shifted - log_denom).exp()
+            all_masked = torch.isinf(cat).all(-1, keepdim=True)
+            p = p.masked_fill(all_masked, 0.0)
+        else:
+            all_masked = torch.isinf(cat).all(-1, keepdim=True)
+            safe = cat.masked_fill(all_masked, 0.0)
+            p = torch.softmax(safe, dim=-1)
+            p = p.masked_fill(all_masked, 0.0)
+        n_blk = scores.shape[-1]
+        p_dense = p[..., :n_blk]
+        p_w = p[..., n_blk:]
+        dense_out = torch.einsum(
+            'b t h n, b n d -> b t h d', p_dense, C_comp_n,
+        )                                                              # [B, 1, nh, c]
+        sw_out = torch.einsum(
+            'b t h w, b w d -> b t h d', p_w, C_local,
+        )                                                              # [B, 1, nh, c]
         return dense_out + sw_out

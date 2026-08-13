@@ -52,8 +52,8 @@ class _Fp32LayerNorm(nn.LayerNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
         if dtype in (torch.float16, torch.bfloat16):
-            weight = self.weight.detach().to(torch.float32)
-            bias = self.bias.detach().to(torch.float32)
+            weight = self.weight.to(torch.float32)
+            bias = self.bias.to(torch.float32)
             out = F.layer_norm(
                 x.float(), self.normalized_shape, weight, bias, self.eps)
             return out.to(dtype)
