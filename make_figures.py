@@ -490,20 +490,26 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
             accs.append(0.0)
             acc_cis.append(0.0)
             fwds.append(0.0)
-            n_params.append(r.get('n_params') or 0)
-            n_layers.append(r.get('n_layers')
-                            or _ratio_layers(ratio))
+            n_params.append(0 if r.get('n_params') is None else r['n_params'])
+            n_layers.append(_ratio_layers(ratio)
+                            if r.get('n_layers') is None else r['n_layers'])
             skipped += 1
         else:
             error_flags.append(False)
             ratios.append(ratio)
-            accs.append(r.get('mean_acc', r.get('final_acc', 0.0)) or 0.0)
+            _acc = r.get('mean_acc')
+            if _acc is None:
+                _acc = r.get('final_acc')
+            accs.append(0.0 if _acc is None else _acc)
             _ci = r.get('ci95_acc')
             acc_cis.append(float('nan') if _ci is None else float(_ci))
-            fwds.append(r.get('mean_fwd_ms', r.get('fwd_ms', 0.0)) or 0.0)
-            n_params.append(r.get('n_params') or 0)
-            n_layers.append(r.get('n_layers')
-                            or _ratio_layers(ratio))
+            _fwd = r.get('mean_fwd_ms')
+            if _fwd is None:
+                _fwd = r.get('fwd_ms')
+            fwds.append(0.0 if _fwd is None else _fwd)
+            n_params.append(0 if r.get('n_params') is None else r['n_params'])
+            n_layers.append(_ratio_layers(ratio)
+                            if r.get('n_layers') is None else r['n_layers'])
 
     if skipped:
         print(f'[fig_ablation] {skipped} ratio(s) had errors and are shown '

@@ -301,8 +301,10 @@ HCA (plus Python-reference overhead). The standalone CSA/HCA rows and
 the hybrid row use these caches during token decode; the hybrid wrapper
 threads one cache per CSA/HCA sub-layer through the full KDA+CSA+HCA
 stack, so CSA/HCA layers can see the prefill history instead of only the
-current token. The small decode benchmark uses `csa_topk=2`, matching the
-small ablation setting. The `prefill_ms` for cache-enabled CSA/HCA/hybrid rows
+current token. The small decode benchmark uses a lighter geometry than the
+Exp 4/5 models (`csa_topk=2`, `c=8`, `dc=8`, `m2=4` at `d_model=64`,
+preserving the sparse top-k path); its per-token decode numbers must not be
+compared head-to-head with Exp 4/5 quality results. The `prefill_ms` for cache-enabled CSA/HCA/hybrid rows
 includes correctness-first Python cache population (`prefill_cache_build` in
 the JSON is `"batched_append_from_naive_output"` for standalone CSA/HCA and
 `"batched_populate_layer_by_layer"` for the hybrid); it is therefore a

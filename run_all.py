@@ -485,15 +485,35 @@ def run_all(seeds=None, steps=None):
             # recorded as a failure in the summary.
             res_dir = make_figures._RESULTS_DIR
             fig_dir = make_figures._FIGURES_DIR
+            def _fig_group_names(rel_name: str, base: str) -> list[str]:
+                """Figure filenames produced for one result file's n_kv groups.
+
+                Mirrors ``make_figures.fig_mqar`` / ``fig_ablation``: when the
+                result contains exactly one ``n_kv`` group, both the legacy
+                ``<base>.pdf`` and ``<base>_nkv<n>.pdf`` are written; with
+                several groups only ``<base>_nkv<n>.pdf`` per group is
+                written. If the file yields no rows (malformed or all-error),
+                no figure is written at all and the legacy name is expected so
+                the orchestrator records the incomplete figure set as a
+                failure.
+                """
+                groups = sorted({r.get('n_kv', 1)
+                                 for r in make_figures.load(rel_name)})
+                if not groups:
+                    return [f'{base}.pdf']
+                names = [f'{base}_nkv{n}.pdf' for n in groups]
+                if len(groups) == 1:
+                    names.append(f'{base}.pdf')
+                return names
             expected = []
             if os.path.exists(os.path.join(res_dir, 'exp2_benchmark.json')):
                 expected.append('fig_benchmark.pdf')
             if os.path.exists(os.path.join(res_dir, 'exp3_kv_cache.json')):
                 expected += ['fig_kv_cache.pdf', 'fig_flops.pdf']
             if os.path.exists(os.path.join(res_dir, 'exp4_mqar.json')):
-                expected.append('fig_mqar_nkv1.pdf')
+                expected += _fig_group_names('exp4_mqar.json', 'fig_mqar')
             if os.path.exists(os.path.join(res_dir, 'exp5_ablation.json')):
-                expected.append('fig_ablation_nkv1.pdf')
+                expected += _fig_group_names('exp5_ablation.json', 'fig_ablation')
             if os.path.exists(os.path.join(res_dir, 'exp6_decoding.json')):
                 expected.append('fig_decoding.pdf')
             expected.append('fig_architecture.pdf')
