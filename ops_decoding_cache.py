@@ -974,7 +974,7 @@ class CSADecodingCache:
                     )                                                  # [B, 1, topk]
                     soft_weights_selected = soft_weights_selected * \
                         valid_mask.to(soft_weights_selected.dtype)
-                    soft_kv = soft_weights_selected.unsqueeze(-1) * kv
+                    soft_kv = soft_weights_selected.unsqueeze(-1) * kv.detach()
                     if ste_mode == 'full_softmax':
                         soft_full = torch.einsum(
                             'btn,bnc->btc', soft_weights, C_comp_n,
