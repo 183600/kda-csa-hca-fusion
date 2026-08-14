@@ -303,9 +303,10 @@ threads one cache per CSA/HCA sub-layer through the full KDA+CSA+HCA
 stack, so CSA/HCA layers can see the prefill history instead of only the
 current token. The small decode benchmark uses `csa_topk=2`, matching the
 small ablation setting. The `prefill_ms` for cache-enabled CSA/HCA/hybrid rows
-includes correctness-first Python cache population (`prefill_cache_build =
-"reference_python_append"` in the JSON); it is therefore a conservative
-reference-wrapper prefill number. The per-token decode timings are the main
+includes correctness-first Python cache population (`prefill_cache_build` in
+the JSON is `"batched_append_from_naive_output"` for standalone CSA/HCA and
+`"batched_populate_layer_by_layer"` for the hybrid); it is therefore a
+conservative reference-wrapper prefill number. The per-token decode timings are the main
 cache-efficiency signal.
 
 ### 5. KV-cache + FLOPs are analytic (Exp 3)
