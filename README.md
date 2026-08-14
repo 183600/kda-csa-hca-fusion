@@ -38,10 +38,12 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 > - `ops_kda.scripted_chunk_kda` — `torch.jit.script` wrapper around the
 >   inner per-chunk loop of `naive_chunk_kda`, with a graceful fallback to
 >   the eager path if TorchScript rejects the input.
-> - `ops_csa._sliding_window_attention` — auto-engages a chunked sliding
->   window when `T * win * c > 8M` elements, keeping peak memory at
->   `O(chunk_t · win · c)` instead of `O(T · win · c)`. Used by both
->   `naive_csa` and `naive_hca` when `sliding_window > 0`.
+> - `ops_csa._sliding_window_attention` — standalone memory-efficient
+>   sliding-window attention; it auto-chunks when `T * win * c > 8M`
+>   elements, keeping peak memory at `O(chunk_t · win · c)` instead of
+>   `O(T · win · c)`. `naive_csa` / `naive_hca` use the unfold-based
+>   `_sliding_window_scores` instead, so the window entries share one joint
+>   softmax with the compressed-branch scores and the attention sink.
 > - `naive_csa` itself fuses the 6 `F.linear(H, W_*)` calls
 >   (`W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`) into a single matmul
 >   via `torch.cat` + `tensor.split`, reducing kernel-launch overhead by 6×.
@@ -349,12 +351,15 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
   optimization. Pass `fuse_projections=False` if you require the original
   6-separate-matmul path (e.g., to preserve `None` grads for `W_KV_idx`/
   `W_Z_idx` under `use_ste=False`).
-* **Chunked sliding window.** `ops_csa._sliding_window_attention` (used by
-  both `naive_csa` and `naive_hca`) auto-engages a chunked path when
-  `T * win * c > 8M` elements, keeping peak memory at `O(chunk_t · win · c)`
-  instead of `O(T · win · c)`. The chunked path is bit-identical to the
-  unfold path (verified by `test_hca_sliding_window_causality` /
-  `test_csa_full_pipeline_causality`).
+* **Sliding window in the reference ops is unfold-based.** `naive_csa` and
+  `naive_hca` compute the window branch with `_sliding_window_scores`
+  (`unfold`, peak memory `O(T · win · c)`) because the window scores must
+  share ONE softmax with the compressed-branch scores and the attention
+  sink (DeepSeek-V4 Eq. 27). `ops_csa._sliding_window_attention` is a
+  standalone chunked helper (`O(chunk_t · win · c)` peak memory) for
+  callers that do not need the joint softmax; it is numerically identical
+  to the unfold softmax path. The long-context experiments that need the
+  memory bound (notebook `gathered_attention`) chunk explicitly.
 * **Incremental decoding cache (CSA / HCA).** The
   `ops_decoding_cache.CSADecodingCache` / `HCADecodingCache` enable
   token-by-token autoregressive decoding for CSA / HCA. The cache maintains

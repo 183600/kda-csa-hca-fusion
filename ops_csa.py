@@ -41,9 +41,7 @@ import torch.nn.functional as F
 # Numerical contract: IDENTICAL to the ``unfold``-based path. Softmax over
 # the ``win`` non-masked entries of a row is the same operation whether the
 # row was extracted as a slice of a ``[T, win]`` unfold view or as one chunk
-# of ``[chunk_t, win]`` slices. Verified by
-# ``test_hca_sliding_window_causality`` / ``test_csa_full_pipeline_causality``
-# in run_correctness.py.
+# of ``[chunk_t, win]`` slices.
 # ============================================================================
 
 # Auto-engage chunked path when the materialized unfold tensor would exceed

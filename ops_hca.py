@@ -24,7 +24,6 @@ from ops_csa import (
     _causal_block_mask,
     _sliding_window_scores,
     _nan_safe_softmax,
-    CHUNKED_SW_THRESHOLD,
 )
 
 
