@@ -328,8 +328,6 @@ def fig_flops():
     ax.set_yscale('log')
     ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5,
                label='Softmax GQA8 (5-layer) = 1.0')
-    ax.axhline(0.27, color='red', linestyle=':', alpha=0.5,
-               label='DeepSeek-V4 target (27%)')
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, which='both', alpha=0.3)
     _ensure_figures_dir()

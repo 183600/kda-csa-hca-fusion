@@ -48,12 +48,12 @@ GQA_H = 8
 GQA_HEAD_DIM = 128
 BF16_BYTES = 2
 
-# Default architecture parameters (matching the paper's §3.3).
+# Default architecture parameters (repo-chosen scale for the KV/FLOPs sweep).
 DEFAULTS = dict(
     H=8, K=128, V=128, d=4096,
     csa_m=16, csa_c=128, csa_topk=512, csa_nIh=4, csa_cI=32, csa_sliding_window=2048,
-    # Number of attention heads for CSA / HCA core. The paper's §3.3 uses 8
-    # heads (matching H); the sink has ``nh`` elements per layer. Previously
+    # Number of attention heads for CSA / HCA core. The default of 8 heads
+    # matches the repo's H=8; the sink has ``nh`` elements per layer. Previously
     # these keys were absent from DEFAULTS, so ``kv_cache_elements`` fell back
     # to ``p.get('csa_nh', H)`` and silently used H=8 — which happened to be
     # correct, but only by accident. Make the value explicit so the sink
