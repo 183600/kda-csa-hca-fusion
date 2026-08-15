@@ -1083,6 +1083,11 @@ def main():
                 r = bench_decoding(model, d_model, plen, n_decode, device,
                                    repeats=N_REPEATS)
                 r['op'] = name
+                r['n_layers'] = 5 if name == 'hybrid' else 1
+                r['compute_boundary'] = (
+                    'end_to_end_multi_layer' if name == 'hybrid'
+                    else ('end_to_end_single_layer'
+                          if name in {'csa', 'hca'} else 'core'))
                 r['device'] = str(device)
                 r['kda_backend'] = (
                     os.environ.get('KDA_BACKEND', 'reference')
@@ -1141,7 +1146,13 @@ def main():
                 # a KeyError on error rows (mirrors run_benchmark.py's pattern).
                 # ``repeats`` records N_REPEATS (not None) so error rows
                 # match the success-row schema.
-                results.append({'op': name, 'prefill_len': plen, 'error': str(e),
+                results.append({'op': name,
+                                'n_layers': 5 if name == 'hybrid' else 1,
+                                'compute_boundary': (
+                                    'end_to_end_multi_layer' if name == 'hybrid'
+                                    else ('end_to_end_single_layer'
+                                          if name in {'csa', 'hca'} else 'core')),
+                                'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
                                 'kda_backend': (
                                     os.environ.get('KDA_BACKEND', 'reference')

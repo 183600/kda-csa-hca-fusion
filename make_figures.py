@@ -631,7 +631,12 @@ def fig_decoding():
         pts.sort()
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
-        ax.plot(xs, ys, markers.get(op, 'o-'), label=labels.get(op, op), markersize=7)
+        nl = next((r.get('n_layers', 1) for r in data
+                   if r.get('op') == op and 'error' not in r), 1)
+        label = labels.get(op, op)
+        if nl and nl > 1:
+            label = f'{label} ({nl} layers)'
+        ax.plot(xs, ys, markers.get(op, 'o-'), label=label, markersize=7)
     device = next((r.get('device', 'cpu') for r in data if 'error' not in r),
                   'cpu')
     backend_values = sorted({r.get('kda_backend') for r in data
@@ -652,9 +657,16 @@ def fig_decoding():
     # control flow (top-k selection, block append) that softmax/KDA do not
     # pay. The raw median is plotted as-is, so keep the caveat visible on the
     # figure rather than only in the JSON metadata.
+    max_layers = max((r.get('n_layers', 1) for r in data if 'error' not in r),
+                     default=1)
+    layer_note = (
+        f'hybrid is a {max_layers}-layer stack; other methods are '
+        'single-layer. Compare latency ratios, not raw times across methods.'
+        if max_layers > 1 else
+        'all methods measured on a single layer.')
     ax.text(0.02, 0.02,
             'CSA/HCA/hybrid use incremental caches; their decode latency '
-            'includes per-token Python control flow',
+            'includes per-token Python control flow.\n' + layer_note,
             transform=ax.transAxes, fontsize=7, color='0.4', ha='left',
             va='bottom')
     _ensure_figures_dir()
