@@ -1087,8 +1087,7 @@ def main():
                 r['n_layers'] = 5 if name == 'hybrid' else 1
                 r['compute_boundary'] = (
                     'end_to_end_multi_layer' if name == 'hybrid'
-                    else ('end_to_end_single_layer'
-                          if name in {'csa', 'hca'} else 'core'))
+                    else 'end_to_end_single_layer')
                 r['device'] = str(device)
                 r['kda_backend'] = (
                     os.environ.get('KDA_BACKEND', 'reference')
@@ -1151,8 +1150,7 @@ def main():
                                 'n_layers': 5 if name == 'hybrid' else 1,
                                 'compute_boundary': (
                                     'end_to_end_multi_layer' if name == 'hybrid'
-                                    else ('end_to_end_single_layer'
-                                          if name in {'csa', 'hca'} else 'core')),
+                                    else 'end_to_end_single_layer'),
                                 'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
                                 'kda_backend': (
