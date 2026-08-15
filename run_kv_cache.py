@@ -313,7 +313,7 @@ def prefill_flops(op: str, T: int, **kw):
     ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx``. We count all six.
     We also count each operator's grouped output projection (KDA ``o_proj``,
     CSA/HCA ``o_proj``), so Exp3's "single-layer FLOPs" boundary matches
-    Exp2's end-to-end standalone CSA/HCA boundary and the softmax baseline.
+    Exp2's end-to-end standalone CSA/HCA boundary.
     """
     p = {**DEFAULTS, **kw}
     H, K, V, d = p['H'], p['K'], p['V'], p['d']

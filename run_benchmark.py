@@ -45,6 +45,7 @@ from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridKCHAttention, HybridConfig
+import ops_kda
 
 logger = logging.getLogger(__name__)
 
@@ -429,46 +430,51 @@ def main():
 
     results = []
     n_repeats = parse_int_env('BENCH_REPEATS', 5, min_value=1, logger=logger)
-    for T in seq_lengths:
-        logger.info(f'\n-- T = {T} --')
-        for name, factory in benches:
-            try:
-                _clear_cache(device)
-                fn = factory(T)
-                t, mem = _measure(fn, repeats=n_repeats, device=device)
-                row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
-                       'device': str(device), 'repeats': n_repeats}
-                if name in {'kda_rec', 'kda_chunk', 'hybrid'}:
-                    row['kda_backend'] = _selected_kda_backend()
-                if name in {'csa', 'hybrid'}:
-                    row['csa_indexer_normalize_qk'] = True
-                    row['csa_ste_in_timed_region'] = False
-                row['time_min_ms'] = _LAST_TIMING_STATS.get('min_ms')
-                row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
-                row['time_std_ms'] = _LAST_TIMING_STATS.get('std_ms')
-                row.update(op_boundary[name])
-                row['workload'] = op_workload.get(name, {})
-                results.append(row)
-                mem_str = f'{mem:8.2f} MB' if mem is not None else '     n/a'
-                print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem_str}')
-            except Exception as e:
-                err_row = {
-                    'T': T, 'op': name, 'error': str(e),
-                    'device': str(device),
-                    'kda_backend': (os.environ.get('KDA_BACKEND', 'reference')
-                                    if name in {'kda_rec', 'kda_chunk', 'hybrid'} else None),
-                    'time_ms': None, 'peak_mem_MB': None,
-                    'time_min_ms': None, 'time_max_ms': None,
-                    'time_std_ms': None,
-                    'repeats': n_repeats,
-                }
-                if name in {'csa', 'hybrid'}:
-                    err_row['csa_indexer_normalize_qk'] = True
-                    err_row['csa_ste_in_timed_region'] = False
-                err_row.update(op_boundary[name])
-                err_row['workload'] = op_workload.get(name, {})
-                results.append(err_row)
-                logger.error(f'  {name:12s}  ERROR: {e}')
+    prev_nonfinite_warn = ops_kda._KDA_NONFINITE_WARN
+    ops_kda._KDA_NONFINITE_WARN = False
+    try:
+        for T in seq_lengths:
+            logger.info(f'\n-- T = {T} --')
+            for name, factory in benches:
+                try:
+                    _clear_cache(device)
+                    fn = factory(T)
+                    t, mem = _measure(fn, repeats=n_repeats, device=device)
+                    row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
+                           'device': str(device), 'repeats': n_repeats}
+                    if name in {'kda_rec', 'kda_chunk', 'hybrid'}:
+                        row['kda_backend'] = _selected_kda_backend()
+                    if name in {'csa', 'hybrid'}:
+                        row['csa_indexer_normalize_qk'] = True
+                        row['csa_ste_in_timed_region'] = False
+                    row['time_min_ms'] = _LAST_TIMING_STATS.get('min_ms')
+                    row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
+                    row['time_std_ms'] = _LAST_TIMING_STATS.get('std_ms')
+                    row.update(op_boundary[name])
+                    row['workload'] = op_workload.get(name, {})
+                    results.append(row)
+                    mem_str = f'{mem:8.2f} MB' if mem is not None else '     n/a'
+                    print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem_str}')
+                except Exception as e:
+                    err_row = {
+                        'T': T, 'op': name, 'error': str(e),
+                        'device': str(device),
+                        'kda_backend': (os.environ.get('KDA_BACKEND', 'reference')
+                                        if name in {'kda_rec', 'kda_chunk', 'hybrid'} else None),
+                        'time_ms': None, 'peak_mem_MB': None,
+                        'time_min_ms': None, 'time_max_ms': None,
+                        'time_std_ms': None,
+                        'repeats': n_repeats,
+                    }
+                    if name in {'csa', 'hybrid'}:
+                        err_row['csa_indexer_normalize_qk'] = True
+                        err_row['csa_ste_in_timed_region'] = False
+                    err_row.update(op_boundary[name])
+                    err_row['workload'] = op_workload.get(name, {})
+                    results.append(err_row)
+                    logger.error(f'  {name:12s}  ERROR: {e}')
+    finally:
+        ops_kda._KDA_NONFINITE_WARN = prev_nonfinite_warn
 
     os.makedirs('results', exist_ok=True)
     try:

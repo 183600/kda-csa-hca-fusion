@@ -23,6 +23,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+_KDA_NONFINITE_WARN = True
+
 
 def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):
     """Centralized shape / device / dtype contract validation for KDA inputs.
@@ -148,6 +150,8 @@ def _is_compiling_safely() -> bool:
 
 def _warn_if_nonfinite(o, fn_name, stacklevel=3):
     """Surface non-finite KDA outputs with an actionable hint."""
+    if not _KDA_NONFINITE_WARN:
+        return
     if _is_compiling_safely():
         return
     if not torch.isfinite(o).all():
