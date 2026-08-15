@@ -332,8 +332,14 @@ def prefill_flops(op: str, T: int, **kw):
         # Since ``flops_ratio_vs_gqa_* = flops(op) / flops(softmax_gqa)``,
         # this 2x baseline bias made every other operator look ~2x
         # cheaper than it really is.
+        # GQA8: H=8 KV heads shared by a full-rank query side. With
+        # head_dim=128 and d=4096, the query side has n_q = d // head_dim = 32
+        # heads; the KV side has n_kv = 8. Query-side terms (core, q_proj,
+        # o_proj) scale with n_q; KV-side terms (k_proj, v_proj) with n_kv.
+        n_q = d // GQA_HEAD_DIM
+        n_kv = H
         causal_entries = T * (T + 1) // 2
-        core = 2 * causal_entries * H * (K + V)
+        core = 2 * causal_entries * n_q * (K + V)
         # Input/output projections — counted for PARITY with KDA / CSA / HCA,
         # whose ``proj`` / ``compress`` / ``query_proj`` terms already include
         # them. The previous version omitted them from softmax_gqa, making the
@@ -343,12 +349,12 @@ def prefill_flops(op: str, T: int, **kw):
         # expensive) — a ~33x error in the headline comparison. At long T the
         # core dominates and the asymmetry shrinks to <2%, but the swept table
         # includes short-T rows where the error is large.
-        #   q_proj : d -> H*K  -> T*d*H*K MACs
-        #   k_proj : d -> H*K  -> T*d*H*K MACs
-        #   v_proj : d -> H*V  -> T*d*H*V MACs
-        #   o_proj : H*V -> d  -> T*H*V*d MACs
-        proj = 2 * T * d * (2 * H * K + H * V)
-        out_proj = 2 * T * H * V * d
+        #   q_proj : d -> n_q*K  -> T*d*n_q*K MACs
+        #   k_proj : d -> n_kv*K -> T*d*n_kv*K MACs
+        #   v_proj : d -> n_kv*V -> T*d*n_kv*V MACs
+        #   o_proj : n_q*V -> d  -> T*n_q*V*d MACs
+        proj = 2 * T * d * (n_q * K + n_kv * K + n_kv * V)
+        out_proj = 2 * T * n_q * V * d
         return core + proj + out_proj
     if op == 'kda':
         # Input projections — count the ACTUAL matmul shapes from

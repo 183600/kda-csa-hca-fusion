@@ -4478,15 +4478,20 @@ def test_prefill_flops_softmax_gqa_projections(device='cpu'):
     """
     logger.info("Test: prefill_flops softmax_gqa includes projections")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from run_kv_cache import prefill_flops, DEFAULTS
+    from run_kv_cache import prefill_flops, DEFAULTS, GQA_HEAD_DIM
 
     p = {**DEFAULTS}
     H, K, V, d = p['H'], p['K'], p['V'], p['d']
     T = 512
 
+    # GQA8 baseline: H=8 KV heads, head_dim=128, d=4096 -> n_q = d/head_dim
+    # = 32 query heads on the query side; KV side keeps n_kv = H = 8.
+    n_q = d // GQA_HEAD_DIM
+    n_kv = H
+
     # Core-only FLOPs (the OLD, broken value).
     causal_entries = T * (T + 1) // 2
-    core_only = 2 * causal_entries * H * (K + V)
+    core_only = 2 * causal_entries * n_q * (K + V)
 
     actual = prefill_flops('softmax_gqa', T)
 
@@ -4495,8 +4500,10 @@ def test_prefill_flops_softmax_gqa_projections(device='cpu'):
     includes_proj = actual > core_only
 
     # Verify the projection magnitude: proj + out_proj should equal the
-    # difference. proj = 2*T*d*(2*H*K + H*V), out_proj = 2*T*H*V*d.
-    expected_proj = 2 * T * d * (2 * H * K + H * V) + 2 * T * H * V * d
+    # difference. proj = 2*T*d*(n_q*K + n_kv*K + n_kv*V),
+    # out_proj = 2*T*n_q*V*d.
+    expected_proj = (2 * T * d * (n_q * K + n_kv * K + n_kv * V)
+                     + 2 * T * n_q * V * d)
     diff_matches = (actual - core_only) == expected_proj
 
     # Sanity: with the fix, KDA/GQA ratio at T=512 should be finite and not
