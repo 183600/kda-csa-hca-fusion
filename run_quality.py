@@ -430,7 +430,10 @@ SMALL_MODEL_SPEC = {
     'csa_m':      4,    # compression factor
     'csa_nh':     2,    # number of attention heads
     'csa_nIh':    2,    # number of indexer heads
-    'csa_topk':   4,    # top-k blocks per query
+    'csa_topk':   2,    # top-k blocks per query (must be < n_blocks so the
+                        #   sparse selection is actually exercised; with
+                        #   seq_len=16 and csa_m=4 (n_blocks=4) a topk of 4
+                        #   would collapse CSA to dense attention)
     'csa_sliding_window': 4,
     # HCA sub-layer (m2 >> m so HCA produces fewer compressed blocks)
     'hca_c':      32,

@@ -902,7 +902,7 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     with torch.no_grad():
         model.reset()
         model(x_prefill)
-        for _ in range(min(3, n_decode)):
+        for _ in range(n_decode):
             model(x_new)
     if device.type == 'cuda':
         torch.cuda.synchronize()
