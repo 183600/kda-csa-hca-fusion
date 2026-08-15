@@ -166,14 +166,19 @@ def _measure(fn, repeats, device):
         # ``run_decoding.py``), so JSON serializes to ``null`` (clearly "no
         # data") rather than a misleading 0.0. On GPU we report the real
         # ``torch.cuda.max_memory_allocated`` (with baseline subtraction).
-        # Warmup
-        for _ in range(min(2, repeats)):
-            out = fn()
-            del out
-        gc.collect()
         _prev_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         try:
+            # Warmup runs under the same single-thread configuration as the
+            # timed loop. Previously the warmup executed at the default thread
+            # count and only the timed iterations forced torch.set_num_threads(1),
+            # so the first timed iteration absorbed the one-time cost of
+            # reconfiguring the internal thread pool / kernel dispatch, which
+            # biased the measured per-token latency.
+            for _ in range(min(2, repeats)):
+                out = fn()
+                del out
+            gc.collect()
             times = []
             for _ in range(repeats):
                 t0 = time.perf_counter()
