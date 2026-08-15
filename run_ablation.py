@@ -233,6 +233,10 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
     if isinstance(device, str):
         device = torch.device(device)
     seeds = [42 + i for i in range(n_seeds)]
+    stub_train_batch = kw.get('train_batch')
+    if stub_train_batch is None:
+        stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
+                                         logger=logger)
     per_seed = []
     for s in seeds:
         t0 = time.time()
@@ -256,7 +260,7 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
                 'n_layers': None,
                 'seed': s,
                 'steps': steps,
-                'train_batch': kw.get('train_batch'),
+                'train_batch': stub_train_batch,
                 'last_train_loss': None,
                 'mean_last10_loss': None,
                 'loss_curve': [],

@@ -1055,6 +1055,10 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     # silently mislabelling the figure title and any downstream
     # ``pd.DataFrame(per_seed)['steps']`` analysis).
     actual_steps_for_op = softmax_steps if op_name == 'softmax' else steps
+    stub_train_batch = kw.get('train_batch')
+    if stub_train_batch is None:
+        stub_train_batch = parse_int_env('MQAR_TRAIN_BATCH', 32, min_value=1,
+                                         logger=logger)
     per_seed = []
     for s in seeds:
         t0 = time.time()
@@ -1110,7 +1114,7 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 # silently hides the asymmetry.
                 'steps': actual_steps_for_op,
                 'seed': s,
-                'train_batch': kw.get('train_batch'),
+                'train_batch': stub_train_batch,
                 'train_time_s': time.time() - t0,
                 'error': str(e),
             })
