@@ -1079,6 +1079,7 @@ def main():
         print(f'\n-- prefill_len = {plen}, decode {n_decode} tokens --')
         for name, factory in models.items():
             try:
+                torch.manual_seed(0)
                 model = factory()
                 r = bench_decoding(model, d_model, plen, n_decode, device,
                                    repeats=N_REPEATS)
