@@ -512,10 +512,10 @@ def main():
                     'op': op,
                     'accounting_mode': mode,
                     'accounting_semantics': (
-                        'compressed_kv_only'
-                        if mode == 'compressed_kv_only'
-                        else 'full_gqa_kv_cache'
+                        'full_gqa_kv_cache'
                         if op == 'softmax_gqa'
+                        else 'compressed_kv_only'
+                        if mode == 'compressed_kv_only'
                         else 'recurrent_state_plus_short_conv'
                         if op == 'kda'
                         else 'compressed_rows_plus_runtime_decode_state'

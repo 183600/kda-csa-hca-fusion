@@ -893,6 +893,21 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     # from the model, not from input noise.
     x_prefill = torch.randn(1, prefill_len, d_model, device=device, generator=_seed_gen) * 0.1
 
+    # Pin torch intra-op threads on CPU for stable measurement, mirroring
+    # run_benchmark._measure. Dynamic intra-op thread resizing causes 2-3x
+    # run-to-run jitter on CPU that dominates the inter-op latency gap.
+    # Do NOT call ``set_num_interop_threads`` here. PyTorch permits
+    # changing the inter-op pool only ONCE per process and only BEFORE any
+    # parallel work starts; this function is called once per
+    # (op, prefill_len) cell. ``configure_torch_for_device()`` (called from
+    # main()) already pins inter-op threads to 1 once at process start via
+    # the ``_interop_threads_set`` guard in kaggle_setup.py, so the
+    # per-cell call would be redundant. Intra-op threads may be adjusted
+    # around each measurement and safely restored.
+    _prev_thr = torch.get_num_threads()
+    if device.type != 'cuda':
+        torch.set_num_threads(1)
+
     # Warmup: run prefill + a couple of decode steps once (untimed) so the
     # first timed trial is not paying one-time kernel compilation / autotune
     # / allocator-warmup costs. ``cudnn.benchmark=True`` (set in
@@ -933,20 +948,6 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
     prefill_times = []
     all_decode_times = []
-    # Pin torch intra-op threads on CPU for stable measurement, mirroring
-    # run_benchmark._measure. Dynamic intra-op thread resizing causes 2-3x
-    # run-to-run jitter on CPU that dominates the inter-op latency gap.
-    # Do NOT call ``set_num_interop_threads`` here. PyTorch permits
-    # changing the inter-op pool only ONCE per process and only BEFORE any
-    # parallel work starts; this function is called once per
-    # (op, prefill_len) cell. ``configure_torch_for_device()`` (called from
-    # main()) already pins inter-op threads to 1 once at process start via
-    # the ``_interop_threads_set`` guard in kaggle_setup.py, so the
-    # per-cell call would be redundant. Intra-op threads may be adjusted
-    # around each measurement and safely restored.
-    _prev_thr = torch.get_num_threads()
-    if device.type != 'cuda':
-        torch.set_num_threads(1)
     try:
         for _ in range(repeats):
             model.reset()
