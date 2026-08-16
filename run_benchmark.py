@@ -277,7 +277,7 @@ def bench_kda_chunk(B, T, H, K, V, device):
 
 def bench_csa(B, T, d, device):
     m, topk = 8, 4
-    nh, c, dc, nIh, cI = 4, 16, 32, 2, 8
+    nh, c, dc, nIh, cI = 2, 16, 32, 2, 8
     gen = _make_op_gen('csa', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
@@ -305,7 +305,7 @@ def bench_csa(B, T, d, device):
 
 
 def bench_hca(B, T, d, device):
-    m2, nh, c, dc = 16, 4, 16, 32
+    m2, nh, c, dc = 16, 2, 16, 32
     gen = _make_op_gen('hca', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
     cfg = dict(
@@ -417,11 +417,11 @@ def main():
                       'note': 'recurrent delta-rule; O(1) state, attends to all T via recurrence'},
         'kda_chunk': {'heads': H, 'head_dim': K, 'chunk_size': 64,
                       'note': 'chunked recurrence; attends to all T via chunk-state passing'},
-        'csa':       {'m': 8, 'topk': 4, 'sliding_window': 8, 'heads': 4,
+        'csa':       {'m': 8, 'topk': 4, 'sliding_window': 8, 'heads': 2,
                       'c': 16, 'dc': 32, 'nIh': 2, 'cI': 8,
                       'attends_to_all_T': False,
                       'note': 'attends to at most topk compressed blocks + sliding_window keys (~constant in T)'},
-        'hca':       {'m2': 16, 'sliding_window': 8, 'heads': 4,
+        'hca':       {'m2': 16, 'sliding_window': 8, 'heads': 2,
                       'c': 16, 'dc': 32,
                       'attends_to_all_T': False,
                       'note': 'attends to all causally-visible compressed entries (O(T/m2), linear in T) + sliding_window keys'},
