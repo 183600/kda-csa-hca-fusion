@@ -125,8 +125,11 @@ def _call_fla(
         # clamped to [g_clamp_min, inf) in kda_forward, the FLA kernel's
         # internal clamp with the same bound is a strict no-op, matching
         # the reference path without risking exp(-inf) -> 0/NaN corruption.
-        "g_clamp_min": g_clamp_min,
+        # A -inf sentinel (clamp disabled) is not forwarded: the reference
+        # path skips clamping for -inf, so the kernel must too.
     }
+    if g_clamp_min > -float('inf'):
+        kwargs["g_clamp_min"] = g_clamp_min
     result = fn(**_supported_kwargs(fn, kwargs))
     # Match the repository reference contract: outputs retain the caller's
     # value dtype, while recurrent state stays in compute precision (fp32 for

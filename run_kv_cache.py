@@ -173,6 +173,16 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
     if op == 'softmax_gqa':
         # GQA: 8 KV heads, each with K=V=128. Cache is T * H_kv * (K + V).
         # We count elements (not bytes); K and V are both retained.
+        if mode == 'full_accounting':
+            # Full-accounting mode counts the capacity the reference decode
+            # cache actually allocates: run_decoding.SoftmaxAttnDecoding
+            # fresh-allocates ``max(2*T, 64)`` token slots on prefill and
+            # grows geometrically from there, so after T tokens the engine
+            # has paid ``max(2*T, 64)`` slots, not just the T valid ones.
+            # Counting only the valid prefix would understate the GQA
+            # baseline and inflate the compressed ops' ``kv_ratio_vs_gqa_*``
+            # in this mode.
+            return max(2 * T, 64) * H * (K + V)
         return T * H * (K + V)
 
     if op == 'kda':
@@ -496,16 +506,18 @@ def main():
     ops = ['softmax_gqa', 'kda', 'csa', 'hca', 'hybrid_kch']
     rows = []
     for T in seq_lengths:
-        # Baseline: a single GQA8 layer (original paper's convention).
-        baseline_1l = kv_cache_elements('softmax_gqa', T)
-        # Baseline: a 5-layer GQA8 unit (apples-to-apples vs the 5-sub-layer hybrid).
-        baseline_5l = 5 * baseline_1l
         flops_base_1l = prefill_flops('softmax_gqa', T)
         flops_base_5l = 5 * flops_base_1l
 
         for op in ops:
             for mode in ['compressed_kv_only', 'full_accounting']:
                 kv = kv_cache_elements(op, T, mode=mode)
+                # The GQA baseline is itself mode-aware: in full_accounting
+                # mode it counts the geometric capacity the reference decode
+                # cache allocates (see kv_cache_elements), so the ratios
+                # below stay apples-to-apples within each accounting mode.
+                baseline_1l = kv_cache_elements('softmax_gqa', T, mode=mode)
+                baseline_5l = 5 * baseline_1l
                 fl = prefill_flops(op, T)
                 row = {
                     'T': T,
