@@ -379,9 +379,17 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
     if skipped:
         print(f'[fig_mqar] skipped {skipped} error row(s) for n_kv={n_kv}')
     fig, ax = plt.subplots(figsize=(6, 4))
-    colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B2']
+    # Consistent per-op colours matching fig_architecture (KDA blue, CSA red,
+    # HCA green); the softmax baseline gets the fourth palette colour. The
+    # previous positional ``colors[:len(ops)]`` assignment made an op's colour
+    # depend on the order/skipping of records, so the same op had different
+    # colours in fig_mqar than in fig_architecture.
+    _palette = ['#8172B2', '#4C72B0', '#C44E52', '#55A868']
+    op_colors = {'softmax': '#8172B2', 'kda': '#4C72B0',
+                 'csa': '#C44E52', 'hca': '#55A868'}
     bars = ax.bar(ops, means, yerr=cis, capsize=5,
-                  color=colors[:len(ops)],
+                  color=[op_colors.get(op, _palette[i % len(_palette)])
+                         for i, op in enumerate(ops)],
                   error_kw={'linewidth': 1.5, 'ecolor': '#333'})
     ax.axhline(chance, color='gray', linestyle='--', alpha=0.7,
                label=f'Chance ({chance:.3f})')
