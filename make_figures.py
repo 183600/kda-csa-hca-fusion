@@ -87,30 +87,15 @@ def _ratio_vs_gqa(row, kind, default_mode='5l'):
     ``*_vs_gqa_5l`` (denominator = FIVE GQA8 layers) plus a legacy
     ``*_vs_gqa``.
 
-    The 5-layer denominator is the apples-to-apples comparison for the
-    hybrid stack (5 sub-layers). Standalone single-layer ops (kda/csa/hca)
-    are drawn at their per-layer 5l ratio so they share the axis.
-
-    However, the ``softmax_gqa`` row is the BASELINE itself: a single
-    GQA8 layer, so its ``*_vs_gqa_5l`` field equals ``1/5 = 0.2``.
-    Drawing it from the 5l field places the full-softmax baseline at 20%
-    of the cost on an axis whose ``1.0`` reference line *is* the 5-layer
-    softmax model (and whose DeepSeek-V4 target line -- e.g. 27% of FLOPs
-    -- is meant to be judged against the FULL softmax cost). That silently
-    made the baseline look ~5x cheaper than it is (in ``fig_flops`` the
-    full softmax baseline even appeared BELOW the 27% target). For the
-    baseline rows we therefore use its 1-layer ratio (== 1.0) so it sits
-    on the ``1.0`` reference line, consistent with the target lines.
+    The figure axes are labelled against the 5-layer baseline, so every
+    row (including the single-layer ``softmax_gqa`` baseline, whose
+    5-layer-relative value is 0.2) is drawn from the 5l field so the
+    plotted values are consistent with the axis definition.
     """
     base = 'kv_ratio' if kind == 'kv' else 'flops_ratio'
-    if row.get('op') == 'softmax_gqa':
-        ratio = row.get(f'{base}_vs_gqa_1l',
-                        row.get(f'{base}_vs_gqa_5l',
-                                row.get(f'{base}_vs_gqa')))
-    else:
-        ratio = row.get(f'{base}_vs_gqa_5l',
-                        row.get(f'{base}_vs_gqa_1l',
-                                row.get(f'{base}_vs_gqa')))
+    ratio = row.get(f'{base}_vs_gqa_5l',
+                    row.get(f'{base}_vs_gqa_1l',
+                            row.get(f'{base}_vs_gqa')))
     return ratio if ratio is not None else None
 
 
