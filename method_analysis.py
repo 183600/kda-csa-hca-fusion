@@ -260,8 +260,8 @@ class HeadwiseFusedAttention(nn.Module):
         hca_o = self._hca_heads(h)
         all_heads = torch.cat([
             kda_o.reshape(B, T, -1).to(x.dtype),
-            csa_o.transpose(1, 2).contiguous().reshape(B, T, -1).to(x.dtype),
-            hca_o.transpose(1, 2).contiguous().reshape(B, T, -1).to(x.dtype)
+            csa_o.reshape(B, T, -1).to(x.dtype),
+            hca_o.reshape(B, T, -1).to(x.dtype)
         ], dim=2)
         return x + self.o_proj(all_heads.reshape(B, T, -1))
 
