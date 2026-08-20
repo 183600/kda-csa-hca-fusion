@@ -217,11 +217,15 @@ class HeadwiseFusedAttention(nn.Module):
         cbm = _causal_block_mask(Tp, n_blocks, m, x.device)
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
-        all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
-        safe_scores = scores.masked_fill(all_masked, 0.0)
+        topk = min(self.cfg.csa_topk, n_blocks)
+        topk_scores, topk_idx = torch.topk(scores, topk, dim=-1)
+        all_masked = torch.isinf(topk_scores).all(dim=-1, keepdim=True)
+        safe_scores = topk_scores.masked_fill(all_masked, 0.0)
         p = torch.softmax(safe_scores, dim=-1)
         p = p.masked_fill(all_masked, 0.0)
-        out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp_n)
+        b_idx = torch.arange(B, device=x.device).view(B, 1, 1, 1)
+        C_sel = C_comp_n[b_idx, topk_idx]
+        out = torch.einsum('b h t k, b h t k d -> b h t d', p, C_sel)
         if pad:
             out = out[:, :, :T]
         return out
@@ -260,8 +264,8 @@ class HeadwiseFusedAttention(nn.Module):
         hca_o = self._hca_heads(h)
         all_heads = torch.cat([
             kda_o.reshape(B, T, -1).to(x.dtype),
-            csa_o.reshape(B, T, -1).to(x.dtype),
-            hca_o.reshape(B, T, -1).to(x.dtype)
+            csa_o.transpose(1, 2).contiguous().reshape(B, T, -1).to(x.dtype),
+            hca_o.transpose(1, 2).contiguous().reshape(B, T, -1).to(x.dtype)
         ], dim=2)
         return x + self.o_proj(all_heads.reshape(B, T, -1))
 

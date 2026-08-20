@@ -148,9 +148,11 @@ def fig_benchmark():
         boundary_groups.setdefault(info['boundary'], []).append(op)
 
     markers = {'softmax': 'o-', 'kda_rec': 's-', 'kda_chunk': '^-',
+               'kda_rec_hybrid': 's--', 'kda_chunk_hybrid': '^--',
                'csa': 'D-', 'hca': 'v-', 'hybrid': 'p-'}
     labels = {'softmax': 'Softmax attention', 'kda_rec': 'KDA (recurrent)',
-              'kda_chunk': 'KDA (chunk)', 'csa': 'CSA', 'hca': 'HCA',
+              'kda_chunk': 'KDA (chunk)', 'kda_rec_hybrid': 'KDA (recurrent, hybrid-config)',
+              'kda_chunk_hybrid': 'KDA (chunk, hybrid-config)', 'csa': 'CSA', 'hca': 'HCA',
               'hybrid': 'Fused KDA+CSA+HCA'}
     boundary_titles = {
         'core': 'Core kernel only\n(q/k/v pre-projected; 1 layer)',

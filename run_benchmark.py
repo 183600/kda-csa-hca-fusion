@@ -373,11 +373,26 @@ def main():
     seq_lengths = list(dict.fromkeys(seq_lengths))
     logger.info(f'[run_benchmark] seq_lengths = {seq_lengths}')
     B, H, K, V, d = 1, 4, 32, 32, 64
+    # Standalone KDA is benchmarked at TWO configs:
+    #   * H/K/V matched to the softmax baseline (H=4, K=32, V=32): the
+    #     matched-capacity core comparison (kda_rec / kda_chunk).
+    #   * H2/K2/V2 matched to the hybrid stack's KDA sub-layers
+    #     (n_heads_qk=2, head_dim_k=16, head_dim_v=16): a standalone KDA
+    #     row that is directly comparable to the hybrid's per-KDA-layer
+    #     cost (kda_rec_hybrid / kda_chunk_hybrid).
+    # Without the hybrid-matched rows, a single standalone KDA layer runs at
+    # 8x the compute of the hybrid's KDA sub-layers (4*32*32 = 4096 vs
+    # 2*16*16 = 512 MACs/step), so the latency table would misleadingly show
+    # the 5-layer hybrid as faster than a single KDA layer purely due to the
+    # heavier config.
+    H2, K2, V2 = 2, 16, 16
 
     benches = [
         ('softmax',  lambda T: bench_softmax_attn(B, T, H, K, V, device)),
         ('kda_rec',  lambda T: bench_kda_recurrent(B, T, H, K, V, device)),
         ('kda_chunk', lambda T: bench_kda_chunk(B, T, H, K, V, device)),
+        ('kda_rec_hybrid', lambda T: bench_kda_recurrent(B, T, H2, K2, V2, device)),
+        ('kda_chunk_hybrid', lambda T: bench_kda_chunk(B, T, H2, K2, V2, device)),
         ('csa',      lambda T: bench_csa(B, T, d, device)),
         ('hca',      lambda T: bench_hca(B, T, d, device)),
         ('hybrid',   lambda T: bench_hybrid(B, T, d, device)),
@@ -388,10 +403,16 @@ def main():
                       'note': 'attention core only; q/k/v pre-projected'},
         'kda_rec':   {'compute_boundary': 'core',
                       'n_layers': 1,
-                      'note': 'recurrence core only; q/k/v/g/beta pre-projected'},
+                      'note': 'recurrence core only; q/k/v/g/beta pre-projected (H=4, K=V=32, matched to softmax capacity)'},
         'kda_chunk': {'compute_boundary': 'core',
                       'n_layers': 1,
-                      'note': 'chunked recurrence core only; q/k/v/g/beta pre-projected'},
+                      'note': 'chunked recurrence core only; q/k/v/g/beta pre-projected (H=4, K=V=32, matched to softmax capacity)'},
+        'kda_rec_hybrid': {'compute_boundary': 'core',
+                           'n_layers': 1,
+                           'note': 'recurrence core only; q/k/v/g/beta pre-projected (H=2, K=V=16, matched to hybrid KDA sub-layer config)'},
+        'kda_chunk_hybrid': {'compute_boundary': 'core',
+                             'n_layers': 1,
+                             'note': 'chunked recurrence core only; q/k/v/g/beta pre-projected (H=2, K=V=16, matched to hybrid KDA sub-layer config)'},
         'csa':       {'compute_boundary': 'end_to_end_single_layer',
                       'n_layers': 1,
                       'note': 'single CSA layer from hidden state H (includes all projections + compression + indexer + sparse attention + o_proj)'},
@@ -417,6 +438,10 @@ def main():
                       'note': 'recurrent delta-rule; O(1) state, attends to all T via recurrence'},
         'kda_chunk': {'heads': H, 'head_dim': K, 'chunk_size': 64,
                       'note': 'chunked recurrence; attends to all T via chunk-state passing'},
+        'kda_rec_hybrid': {'heads': H2, 'head_dim': K2,
+                           'note': 'recurrent delta-rule at hybrid KDA sub-layer config (H=2, K=V=16); directly comparable to the hybrid stack\'s per-KDA-layer cost'},
+        'kda_chunk_hybrid': {'heads': H2, 'head_dim': K2, 'chunk_size': 64,
+                             'note': 'chunked recurrence at hybrid KDA sub-layer config (H=2, K=V=16); directly comparable to the hybrid stack\'s per-KDA-layer cost'},
         'csa':       {'m': 8, 'topk': 4, 'sliding_window': 8, 'heads': 2,
                       'c': 16, 'dc': 32, 'nIh': 2, 'cI': 8,
                       'attends_to_all_T': False,
@@ -447,7 +472,8 @@ def main():
                     t, mem = _measure(fn, repeats=n_repeats, device=device)
                     row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                            'device': str(device), 'repeats': n_repeats}
-                    if name in {'kda_rec', 'kda_chunk', 'hybrid'}:
+                    if name in {'kda_rec', 'kda_chunk', 'kda_rec_hybrid',
+                                'kda_chunk_hybrid', 'hybrid'}:
                         row['kda_backend'] = _selected_kda_backend()
                     if name in {'csa', 'hybrid'}:
                         row['csa_indexer_normalize_qk'] = True
@@ -465,7 +491,9 @@ def main():
                         'T': T, 'op': name, 'error': str(e),
                         'device': str(device),
                         'kda_backend': (os.environ.get('KDA_BACKEND', 'reference')
-                                        if name in {'kda_rec', 'kda_chunk', 'hybrid'} else None),
+                                        if name in {'kda_rec', 'kda_chunk',
+                                                    'kda_rec_hybrid', 'kda_chunk_hybrid',
+                                                    'hybrid'} else None),
                         'time_ms': None, 'peak_mem_MB': None,
                         'time_min_ms': None, 'time_max_ms': None,
                         'time_std_ms': None,
