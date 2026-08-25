@@ -35,36 +35,14 @@ jobs:
       - name: Verify opencode
         run: opencode --version
 
-      - name: Configure opencode (NVIDIA NIM provider)
+      - name: Configure opencode
         run: |
-          cat > opencode.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "nvidia": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "NVIDIA NIM",
-                "options": {
-                  "baseURL": "https://integrate.api.nvidia.com/v1",
-                  "apiKey": "{env:NVIDIA_API_KEY}"
-                },
-                "models": {
-                  "z-ai/glm-5.2": {
-                    "name": "GLM 5.2"
-                  }
-                }
-              }
-            },
-            "model": "nvidia/z-ai/glm-5.2"
-          }
-          EOF
           grep -qxF '.opencode/' .gitignore 2>/dev/null || printf '\n.opencode/\n' >> .gitignore
 
       - name: Run opencode Cleanup & Bug-Fix Loop
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           MAX_DURATION_SECONDS: "20400"  # 340min，留10min给清理+触发
-          OPENCODE_MODEL: "nvidia/z-ai/glm-5.2"
+          OPENCODE_MODEL: "opencode/deepseek-v4-flash-free"
         run: |
           python - <<'PYEOF'
           import os, time, subprocess
@@ -89,8 +67,9 @@ jobs:
 
           # 修复 prompt：原有的 bug 检查与修复
           REVIEW_PROMPT = (
-              "不要读取.git目录，分析dyn_csa_experiment.ipynb是否有影响实验质量的问题，如果有就修复，不要添加关于修复bug的说明，忽略关于已经修复的bug的注释，同时要读取2510.26692v2.txt和2606.19348v1.txt"
-              "dyn_csa_experiment.ipynb和其他代码不是一个实验的"
+              "不要读取.git目录，分析代码是否有影响实验结果的问题，如果有就修复，不要添加关于修复bug的说明，忽略关于已经修复的bug的注释，同时要读取2510.26692v2.txt和2606.19348v1.txt"
+              "dyn_csa_experiment.ipynb是另一个实验的代码，"
+              "dyn_csa_experiment.ipynb的问题也要修复"
           )
 
           # 两个 prompt 交替使用：奇数轮=CLEANUP，偶数轮=REVIEW
@@ -135,7 +114,7 @@ jobs:
               """单次 opencode 调用——无 timeout，仅受 GitHub job 总时间限制约束"""
               print(f"  -> Prompt 大小: {len(prompt.encode('utf-8')):,} 字节")
               return subprocess.run(
-                  ["opencode", "run", "--model", MODEL],
+                  ["opencode", "run", "-m", MODEL],
                   input=prompt,
                   capture_output=True, text=True,
                   env=os.environ.copy(),
