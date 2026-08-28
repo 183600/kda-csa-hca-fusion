@@ -18,7 +18,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm is preinstalled on Kaggle/AutoDL but is
+    # optional for a minimal local run — fall back to a no-op wrapper.
+    def tqdm(*args, **kwargs):
+        class _NoOpBar:
+            def __init__(self, *a, **k):
+                self.total = k.get("total", None)
+                self.n = 0
+            def update(self, n=1):
+                self.n += n
+            def close(self):
+                pass
+            def set_description(self, *a, **k):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                self.close()
+        return _NoOpBar(*args, **kwargs)
 
 # import repo modules
 from ops_fused import HybridConfig, HybridKCHAttention
@@ -36,6 +55,37 @@ except Exception:
     # ``except:`` here would also swallow KeyboardInterrupt / SystemExit
     # during interpreter shutdown, so scope to Exception.
     HAS_HF = False
+
+
+class _FallbackCharTokenizer:
+    """Minimal char-level tokenizer used when ``transformers`` is absent.
+
+    Keeps the training pipeline runnable with ZERO network / HuggingFace
+    dependencies (e.g. a bare Kaggle CPU session without the optional
+    ``pip install transformers datasets`` step, or an offline machine):
+    the dataset falls back to synthetic text and this tokenizer maps
+    printable ASCII characters to ids. Quality is obviously worse than a
+    real BPE tokenizer — it exists only so the code path executes
+    end-to-end; install ``transformers`` for the real TinyStories runs.
+    """
+
+    _SPECIALS = ["<pad>", "<unk>"]
+
+    def __init__(self):
+        chars = [chr(i) for i in range(32, 127)]  # printable ASCII
+        self._itos = self._SPECIALS + chars
+        self._stoi = {c: i for i, c in enumerate(self._itos)}
+        self.pad_token_id = 0
+        self.unk_token_id = 1
+
+    def __len__(self):
+        return len(self._itos)
+
+    def encode(self, text, truncation=False, max_length=None):
+        ids = [self._stoi.get(ch, self.unk_token_id) for ch in text]
+        if truncation and max_length is not None:
+            ids = ids[:max_length]
+        return ids
 
 class TinyStoriesLM(Dataset):
     def __init__(self, tokenizer, seq_len=1024, max_samples=20000, split="train"):
@@ -126,10 +176,16 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2") if HAS_HF else None
+    if HAS_HF:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    else:
+        print("[train_lm_autodl] transformers not installed; using the "
+              "char-level fallback tokenizer over synthetic text "
+              "(install `transformers datasets` for real TinyStories runs)")
+        tokenizer = _FallbackCharTokenizer()
     if tokenizer is None:
         raise RuntimeError("Need transformers tokenizer")
-    if tokenizer.pad_token is None:
+    if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
         tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 

@@ -19,6 +19,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ops_rope import (
+    effective_rope_dim,
+    partial_rope,
+    token_positions,
+    block_positions,
+)
+
 
 # =============================================================================
 # Chunked sliding-window attention helper (issue 2.2 fix)
@@ -179,10 +186,30 @@ def _sliding_window_scores(
 def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     """Return the DeepSeek-V4 block-causal mask ``[T, n_blocks]``.
 
-    A compressed block becomes available when its source window closes. Thus
-    query ``t`` may attend to blocks ``b < (t + 1) // m``. For example, with
-    ``m=8`` the block covering positions ``0..7`` is visible to query ``t=7``;
-    it is not future information because the whole source window is complete.
+    Paper-exact contract (arXiv:2606.19348v1, Eq. 16 and §2.3.3): a query
+    token ``t`` attends only to STRICTLY PRECEDING compressed blocks,
+    i.e. block ``s`` is visible iff ``s < floor(t / m)``. The paper
+    motivates this explicitly: "each query attends to only preceding
+    compressed KV blocks. Consequently, a query cannot access information
+    from other tokens within its own compressed block" — the local
+    context inside the query's own block is instead served by the
+    sliding-window branch (§2.3.3 "Additional Branch of Sliding Window
+    Attention").
+
+    For example, with ``m=8`` the block covering positions ``0..7`` first
+    becomes visible to query ``t=8`` (the first token of the NEXT block);
+    queries ``t=0..7`` cannot see it through the sparse branch.
+
+    .. note:: Historical off-by-one (fixed). This repository previously
+        used the window-close variant ``b < (t + 1) // m`` (a block became
+        visible at its own final source token). That variant does not leak
+        future information either — at ``t = (b+1)*m - 1`` the whole source
+        window of block ``b`` is complete — but it deviates from the
+        paper's strictly-preceding rule by additionally exposing the
+        query's own block at one position per block. The window-close
+        variant was never attributed to the paper by Eq. 16; it is now
+        aligned to the paper-exact mask everywhere (naive operators,
+        decoding caches, and the FLOPs accounting in ``run_kv_cache``).
     """
     if not isinstance(T, int) or T < 0:
         raise ValueError(f"T must be a non-negative int, got {T!r}")
@@ -192,7 +219,7 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
         raise ValueError(f"m must be a positive int, got {m!r}")
     i_t = torch.arange(T, device=device)
     i_b = torch.arange(n_blocks, device=device)
-    return (i_t[:, None] + 1) // m > i_b[None, :]
+    return i_t[:, None] // m > i_b[None, :]
 
 
 def csa_compress_kv(
@@ -325,6 +352,39 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     safe_logits = logits.masked_fill(all_masked, 0.0)
     soft = torch.softmax(safe_logits, dim=dim)
     return soft.masked_fill(all_masked, 0.0)
+
+
+def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
+    """Normalize queries / compressed KV before the core attention.
+
+    DeepSeek-V4 §2.3.3 ("Query and Key-Value Entry Normalization") specifies
+    an RMSNorm on each head of the queries and on the single head of the
+    compressed KV entries. The historical repository behaviour is an
+    L2-normalization (cosine attention).
+
+    Modes
+    -----
+    * ``'l2'``  (default, historical): ``x / ||x||_2`` — unit-norm vectors;
+      callers use ``scale=1.0`` (cosine scores in [-1, 1]).
+    * ``'rms'`` (paper §2.3.3 form): ``x / sqrt(mean(x^2) + eps)`` — the
+      vectors keep norm ~sqrt(D). NOTE this is a genuine behaviour change,
+      not a no-op rename: (i) the attention VALUES are the normalized
+      entries themselves, so the core-attention output is ~sqrt(D) larger
+      than under 'l2'; (ii) the callers auto-select the STANDARD attention
+      temperature ``scale = 1/sqrt(D)`` for this mode (mirroring how
+      DeepSeek-V2/V3 combine per-head RMSNorm with standard scaling),
+      which makes the logits ~sqrt(D)·cosine — sharper than the 'l2' mode's
+      plain cosine. The paper does not pin the core-attention temperature,
+      so both choices are paper-compatible; pass an explicit ``scale=`` to
+      pin any other temperature.
+    """
+    if mode == 'l2':
+        return F.normalize(x, dim=-1)
+    if mode == 'rms':
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    raise ValueError(
+        f"qk_norm_mode={mode!r} must be 'l2' (cosine, historical) or "
+        f"'rms' (paper §2.3.3 RMSNorm form)")
 
 
 def csa_lightning_indexer(
@@ -514,12 +574,14 @@ def csa_lightning_indexer(
         w_idx = w_idx.to(compute_dtype)
 
     # L2-normalize indexer queries and keys so the top-k ranking
-    # is magnitude-invariant (cosine-style scoring, as specified in the
-    # DeepSeek-V4 paper Eq. 15). Without normalization, a high-norm
-    # indexer query dominates the top-k ranking purely by magnitude
-    # rather than by semantic relevance, making the sparse selection
-    # sensitive to upstream projection scaling. Set ``normalize_qk=False``
-    # to restore the un-normalized behaviour (e.g. for ablation).
+    # is magnitude-invariant (cosine-style scoring). NOTE: this is a
+    # REPOSITORY-SIDE choice — the DeepSeek-V4 paper Eq. (15)–(16) define
+    # the index score as a plain weighted ReLU dot product with no
+    # normalization. Without normalization, a high-norm indexer query
+    # dominates the top-k ranking purely by magnitude rather than by
+    # semantic relevance, making the sparse selection sensitive to upstream
+    # projection scaling. Set ``normalize_qk=False`` to restore the
+    # un-normalized (paper-literal) behaviour (e.g. for ablation).
     if normalize_qk:
         q_idx = F.normalize(q_idx, dim=-1)
         k_idx = F.normalize(k_idx, dim=-1)
@@ -604,11 +666,22 @@ def naive_csa(
     normalize_qk: bool = False,
     fuse_projections: bool = True,
     return_projections: bool = False,
+    rope_dim: int | None = None,
+    rope_base: float = 10000.0,
+    qk_norm_mode: str = 'l2',
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
-    Returns output ``[B, T, nh*c]`` (the caller performs the grouped output
-    projection ``[B, T, nh*c] -> d``).
+    Returns output ``[B, T, nh*c]``. NOTE (attribution fixed): the caller
+    performs a FULL output projection ``[B, T, nh*c] -> d`` — NOT the
+    paper's grouped output projection (§2.3.1, which first splits the
+    ``nh`` head outputs into ``g`` groups and projects each group to a
+    ``d_g < c*nh/g`` intermediate). The grouped strategy pays off only
+    when ``c*nh >> d`` (DeepSeek-V4's production geometry); at this
+    repository's experiment scales ``c*nh`` is small, so the full
+    projection is used and the FLOPs accounting in ``run_kv_cache``
+    counts the full-projection cost (``2*T*c*nh*d``) — formula and
+    implementation are consistent.
 
     When ``return_projections=True``, returns ``(output, projections)`` where
     ``projections`` is a tuple ``(Ca, Cb, Za, Zb, K_idx, Z_idx)`` of the 6
@@ -740,6 +813,19 @@ def naive_csa(
     if scale is not None:
         # Caller explicitly pinned a temperature — honour it.
         pass
+    if qk_norm_mode not in ('l2', 'rms'):
+        raise ValueError(
+            f"naive_csa: qk_norm_mode={qk_norm_mode!r} must be 'l2' (cosine, "
+            f"historical) or 'rms' (paper §2.3.3 RMSNorm form)")
+    # Partial RoPE (DeepSeek-V4 §2.3.3). ``rope_dim=None`` (default)
+    # disables RoPE and preserves the historical behaviour bit-exactly;
+    # the model-level wrappers (ops_fused / run_quality / run_decoding)
+    # default to the paper's 64-dim partial RoPE (clamped to the head
+    # dim for small geometries).
+    rope_dim_eff = effective_rope_dim(rope_dim, c)
+    if rope_base <= 0:
+        raise ValueError(
+            f"naive_csa: rope_base={rope_base!r} must be positive")
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv_overlapped`` would raise a cryptic broadcasting
@@ -867,9 +953,31 @@ def naive_csa(
         K_idx_raw = F.linear(H, W_KV_idx)
         Z_idx = F.linear(H, W_Z_idx)
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)   # [B, n_blocks, c]
+    # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
+    # rotated entry serves as BOTH the attention key and the attention
+    # value (shared-KV MQA). The anchor position of compressed entry ``s``
+    # is ``s * m`` (block start; for the overlapped two-branch compression
+    # this is also the a/b source-window boundary). Rotation happens
+    # BEFORE normalization — ``ops_decoding_cache`` applies the same order
+    # (rotate at append time, normalize at read time) so the incremental
+    # decode path stays bit-identical to this full-sequence path.
+    if rope_dim_eff > 0:
+        C_comp = partial_rope(
+            C_comp, block_positions(n_blocks, m, device),
+            rope_dim_eff, rope_base, dim=1)
 
     # --- 2. Lightning indexer ---
-    # compressed indexer keys via the same compression (single-branch here for simplicity)
+    # compressed indexer keys via the same compression operation, applied
+    # SINGLE-BRANCH (no a/b overlap). NOTE: the paper says CSA "performs
+    # the same compression operation used for CComp" — i.e. the overlapped
+    # two-branch compression — for the indexer keys as well; this reference
+    # implementation deliberately keeps a single branch (one W_KV_idx /
+    # W_Z_idx / B_idx instead of a/b pairs) as a documented simplification:
+    # the indexer only produces a top-k RANKING, which is robust to the
+    # compression variant. The RoPE is likewise NOT applied to the indexer
+    # queries/keys — §2.3.3 scopes RoPE to the core-attention queries /
+    # KV entries / outputs, not to the indexer scores (Eq. 15–16 have no
+    # positional term).
     # K_idx_raw and Z_idx were computed in the merged matmul above.
     K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)            # [B, n_blocks, c_I]
     # indexer queries (low-rank)
@@ -932,8 +1040,18 @@ def naive_csa(
     # This makes the flag's semantics consistent across both branches and
     # gives ablations a genuine knob to turn off normalization.
     if normalize_qk:
-        q = F.normalize(q, dim=-1)
-    C_comp_n = F.normalize(C_comp, dim=-1) if normalize_qk else C_comp.to(compute_dtype)
+        q = _qk_normalize(q, qk_norm_mode)
+    C_comp_n = (_qk_normalize(C_comp, qk_norm_mode) if normalize_qk
+                else C_comp.to(compute_dtype))
+    # Partial RoPE on the core-attention QUERIES (§2.3.3): rotate each
+    # query at its own token position AFTER normalization (the decoding
+    # cache applies the same order: the caller normalizes ``q``, the cache
+    # rotates it). RoPE is orthogonal, so normalize-then-rotate and
+    # rotate-then-normalize agree up to fp rounding; the order is pinned
+    # here only so the incremental decode path matches bit-exactly.
+    if rope_dim_eff > 0:
+        q = partial_rope(
+            q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
     # Core-attention scale auto-selection (mirrors the indexer scale
     # policy above). A caller can still override by passing an explicit
     # ``scale=``.
@@ -943,11 +1061,22 @@ def naive_csa(
     # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
     # ``else`` branch was skipped for any other reason, causing a
     # ``None * tensor`` crash in ``_sliding_window_attention``.
+    # (2026-08 port: an earlier LLM fix round accidentally pasted this
+    # block TWICE; the duplicate — a functional no-op — was removed.)
     if scale is None:
-        if normalize_qk:
-            scale = 1.0
-        else:
+        if not normalize_qk:
             scale = c ** -0.5
+        elif qk_norm_mode == 'rms':
+            # Paper §2.3.3 RMSNorm form: the normalized vectors keep norm
+            # ~sqrt(c), so the raw dot product is ~c * cosine. Use the
+            # STANDARD attention temperature 1/sqrt(c) (mirroring how
+            # DeepSeek-V2/V3 combine per-head RMSNorm with standard
+            # scaling), giving logits ~sqrt(c) * cosine. Pass an explicit
+            # ``scale=`` (e.g. 1.0) for any other temperature.
+            scale = c ** -0.5
+        else:
+            scale = 1.0
+
 
     # Handle topk=0 (degenerate but valid: caller asks for no sparse
     # selection). Without this guard the downstream ``scores.amax(-1)``
@@ -1109,9 +1238,18 @@ def naive_csa(
         win = sliding_window
         H_proj = Ca  # [B, T, c], already == F.linear(H, W_aKV)
         if normalize_qk:
-            C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
+            C_local = _qk_normalize(H_proj.to(compute_dtype), qk_norm_mode)  # [B, T, c]
         else:
             C_local = H_proj.to(compute_dtype)
+        # Partial RoPE on the sliding-window keys (§2.3.3: RoPE applies to
+        # the KV entry vectors used in CSA/HCA — the SW entries are such
+        # KV entries). Each key rotates at its own token position; the
+        # decoding cache's ring buffer applies the same
+        # normalize-then-rotate order at append time.
+        if rope_dim_eff > 0:
+            C_local = partial_rope(
+                C_local, token_positions(T, device), rope_dim_eff,
+                rope_base, dim=1)
         scores_w, C_windows, win_valid = _sliding_window_scores(
             q, C_local, win, scale, device)
     else:
@@ -1153,6 +1291,15 @@ def naive_csa(
         p_w = p[..., topk_size:]
         out = (torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
                + torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows))
+
+    # Partial RoPE output countermeasure (§2.3.3): because the compressed
+    # KV entries serve as both keys AND values, the naive output carries
+    # absolute-position rotations; inverse-rotating at the NEGATED query
+    # position makes each entry's contribution depend on the relative
+    # (entry − query) distance only.
+    if rope_dim_eff > 0:
+        out = partial_rope(
+            out, -token_positions(T, device), rope_dim_eff, rope_base, dim=1)
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
     # [B, T, nh*c]; the caller performs the grouped output projection.

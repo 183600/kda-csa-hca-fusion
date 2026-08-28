@@ -405,7 +405,7 @@ def _chunk_kda_prepare(
     # diagonal=1 gives max|o_diff|≈0.019, diagonal=0 matches to fp32 round-off
     # (~1e-9). Examining the git history shows earlier review rounds had
     # documented this same point and switched to diagonal=0; a later LLM
-    # bug-fix round reverted it to diagonal=1 and reintroduced the regression.
+    # bug-fix round reverted it to diagonal=1 and reintroduced the regression. Do not revert.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):

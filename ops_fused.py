@@ -90,6 +90,25 @@ class HybridConfig:
     hca_c: int = 64
     hca_dc: int = 128
     hca_sliding_window: int = 16
+    # Partial RoPE (DeepSeek-V4 §2.3.3) for the CSA/HCA core attention:
+    # queries, compressed KV entries (keys AND values), sliding-window keys
+    # are rotated on their last ``rope_dim`` dims, and the core-attention
+    # output is inverse-rotated at the negated query position so each KV
+    # entry's contribution carries the relative (entry − query) distance.
+    # The paper value is 64; ``None``/0 disables RoPE (the historical
+    # pre-fix behaviour). Small test geometries auto-clamp to the head dim
+    # (``min(rope_dim, c)`` rounded down to even).
+    csa_rope_dim: int | None = 64
+    hca_rope_dim: int | None = 64
+    rope_base: float = 10000.0
+    # Query/KV normalization form for the CSA/HCA core attention:
+    # 'l2'  — historical cosine attention (unit-norm vectors, scale 1.0);
+    # 'rms' — the paper §2.3.3 RMSNorm form (norm ~sqrt(D) vectors, standard
+    #         1/sqrt(D) temperature). The paper does not pin the core
+    #         temperature, so both are paper-compatible; 'l2' keeps the
+    #         repository's historical numbers reproducible.
+    csa_qk_norm_mode: str = 'l2'
+    hca_qk_norm_mode: str = 'l2'
     # Hybrid layout
     n_kda: int = 3
     n_csa: int = 1
@@ -311,6 +330,44 @@ class HybridConfig:
                 f"kda_decay_scale={self.kda_decay_scale} must be >= 0 "
                 f"(negative would invert the decay sign and cause state "
                 f"explosion).")
+        # --- Partial RoPE config (DeepSeek-V4 §2.3.3) -----------------
+        # rope dims: None or a non-negative int. None/0 disables RoPE; a
+        # positive value is clamped to the head dim (even) at use time, so
+        # over-sized requests on small geometries degrade gracefully
+        # instead of crashing.
+        for name, val in [
+            ('csa_rope_dim', self.csa_rope_dim),
+            ('hca_rope_dim', self.hca_rope_dim),
+        ]:
+            if val is None:
+                continue
+            if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be None or a "
+                    f"non-negative int (None/0 disables partial RoPE; the "
+                    f"paper value is 64).")
+        if not isinstance(self.rope_base, (int, float)) \
+                or isinstance(self.rope_base, bool) \
+                or not math.isfinite(self.rope_base) or self.rope_base <= 0:
+            raise ValueError(
+                f"HybridConfig.rope_base={self.rope_base!r} must be a "
+                f"finite positive float.")
+        # qk_norm_mode: 'l2' (historical cosine) or 'rms' (paper §2.3.3).
+        for name, val in [
+            ('csa_qk_norm_mode', self.csa_qk_norm_mode),
+            ('hca_qk_norm_mode', self.hca_qk_norm_mode),
+        ]:
+            if val not in ('l2', 'rms'):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be 'l2' or 'rms'.")
+        # F1 fix: the second dropout validation block (type / NaN-Inf /
+        # range) was DEAD CODE — the first validation block at lines
+        # 96-124 already raises NotImplementedError for any non-zero
+        # dropout, so the only value that reaches this point is 0.0
+        # (which trivially passes all three checks). The redundant block
+        # was a maintenance footgun: a future reader might think the
+        # second block is the primary validation, when in fact it never
+        # fires for any input that survives the first block. Removed.
 
 
 class KDAHybridLayer(nn.Module):
@@ -705,6 +762,11 @@ class CSAHybridLayer(nn.Module):
             m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
             c=cfg.csa_c, c_I=cfg.csa_cI, dc=cfg.csa_dc,
             sliding_window=cfg.csa_sliding_window, sink_logits=self.sink,
+            # Partial RoPE (DeepSeek-V4 §2.3.3): paper-faithful default
+            # (64 dims, clamped to the head dim for small geometries).
+            rope_dim=cfg.csa_rope_dim,
+            rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.csa_qk_norm_mode,
             use_ste=self.use_ste,
             # Match the cosine-style CSA indexer contract: rankings should be
             # driven by direction, not by arbitrary q_idx / K_idx magnitudes.
@@ -735,6 +797,11 @@ class HCAHybridLayer(nn.Module):
             self.W_DQ.weight, self.W_UQ.weight,
             m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
             sliding_window=cfg.hca_sliding_window, sink_logits=self.sink,
+            # Partial RoPE (DeepSeek-V4 §2.3.3): paper-faithful default
+            # (64 dims, clamped to the head dim for small geometries).
+            rope_dim=cfg.hca_rope_dim,
+            rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.hca_qk_norm_mode,
         )
         return self.o_proj(o), None
 

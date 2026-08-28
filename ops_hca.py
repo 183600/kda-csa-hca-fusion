@@ -24,6 +24,13 @@ from ops_csa import (
     _causal_block_mask,
     _sliding_window_scores,
     _nan_safe_softmax,
+    _qk_normalize,
+)
+from ops_rope import (
+    effective_rope_dim,
+    partial_rope,
+    token_positions,
+    block_positions,
 )
 
 
@@ -39,11 +46,14 @@ def naive_hca(
     nh: int,
     c: int,
     dc: int,
-    scale: float = 1.0,
+    scale: float | None = None,
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
     return_projections: bool = False,
     W_KV_local: torch.Tensor | None = None,     # [c, d] local SW key/value projection
+    rope_dim: int | None = None,
+    rope_base: float = 10000.0,
+    qk_norm_mode: str = 'l2',
 ):
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
 
@@ -113,6 +123,26 @@ def naive_hca(
         raise ValueError(
             f"naive_hca: W_KV_local.shape={tuple(W_KV_local.shape)} must "
             f"equal (c, d)=({c}, {d})")
+    if qk_norm_mode not in ('l2', 'rms'):
+        raise ValueError(
+            f"naive_hca: qk_norm_mode={qk_norm_mode!r} must be 'l2' (cosine, "
+            f"historical) or 'rms' (paper §2.3.3 RMSNorm form)")
+    # Partial RoPE (DeepSeek-V4 §2.3.3): ``rope_dim=None`` (default)
+    # disables it and preserves the historical behaviour; the model-level
+    # wrappers default to the paper's 64-dim partial RoPE (clamped to the
+    # head dim for small geometries).
+    rope_dim_eff = effective_rope_dim(rope_dim, c)
+    if rope_base <= 0:
+        raise ValueError(
+            f"naive_hca: rope_base={rope_base!r} must be positive")
+    # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
+    # (see ``F.normalize`` calls below), their dot product is already a cosine
+    # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
+    # further shrinks the scores into a narrow band, making softmax over the
+    # compressed blocks nearly uniform — effectively turning dense attention
+    # into average pooling. Standard cosine-attention uses ``τ = 1``. The extra
+    # ``1/sqrt(c)`` was a leftover from un-normalized softmax-attention.
+    # H7 fix: scale defaults to 1.0 in the signature; no None sentinel needed.
     device = H.device
     if T == 0:
         out_empty = torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
@@ -132,13 +162,38 @@ def naive_hca(
     C = F.linear(H, W_KV)                                          # [B, T, c]
     Z = F.linear(H, W_Z)                                           # [B, T, c]
     C_comp = csa_compress_kv(C, Z, B_pos, m2)                     # [B, n_blocks, c] in compute_dtype
-    C_comp_n = F.normalize(C_comp, dim=-1)
+    # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
+    # rotated entry serves as BOTH the attention key and the attention
+    # value (shared-KV MQA). The anchor position of heavy-compressed entry
+    # ``s`` is ``s * m2`` (block start). Rotation happens BEFORE
+    # normalization — ``ops_decoding_cache.HCADecodingCache`` applies the
+    # same order (rotate at append time, normalize at read time) so the
+    # incremental decode path stays bit-identical to this path.
+    if rope_dim_eff > 0:
+        C_comp = partial_rope(
+            C_comp, block_positions(n_blocks, m2, device),
+            rope_dim_eff, rope_base, dim=1)
+    C_comp_n = _qk_normalize(C_comp, qk_norm_mode)
 
     # --- 2. Dense shared-KV MQA ---
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     cQ = F.linear(H, W_DQ)                                         # [B, T, dc]
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
-    q = F.normalize(q, dim=-1)
+    q = _qk_normalize(q, qk_norm_mode)
+    # Partial RoPE on the core-attention queries (§2.3.3): rotate each
+    # query at its own token position AFTER normalization (the decoding
+    # cache applies the same order: the caller normalizes ``q``, the cache
+    # rotates it).
+    if rope_dim_eff > 0:
+        q = partial_rope(
+            q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+    # Core-attention scale auto-selection: ``scale=None`` (the default)
+    # resolves to 1.0 for the historical cosine 'l2' mode (identical to the
+    # previous hard-coded default of 1.0) and to the standard 1/sqrt(c)
+    # temperature for the paper-form 'rms' mode. An explicit ``scale=`` is
+    # always honoured.
+    if scale is None:
+        scale = c ** -0.5 if qk_norm_mode == 'rms' else 1.0
 
     cbm = _causal_block_mask(T, n_blocks, m2, device)
 
@@ -151,7 +206,15 @@ def naive_hca(
             C_local_raw = F.linear(H, W_KV_local)                   # [B, T, c]
         else:
             C_local_raw = C
-        C_local = F.normalize(C_local_raw.to(compute_dtype), dim=-1)  # [B, T, c]
+        C_local = _qk_normalize(C_local_raw.to(compute_dtype), qk_norm_mode)  # [B, T, c]
+        # Partial RoPE on the sliding-window keys (§2.3.3): each key
+        # rotates at its own token position; the decoding cache's ring
+        # buffer applies the same normalize-then-rotate order at append
+        # time.
+        if rope_dim_eff > 0:
+            C_local = partial_rope(
+                C_local, token_positions(T, device), rope_dim_eff,
+                rope_base, dim=1)
         scores_w, C_windows, win_valid = _sliding_window_scores(
             q, C_local, win, scale, device)
         scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
@@ -190,6 +253,15 @@ def naive_hca(
     p_w = p[..., n_blk:]
     out = (torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
            + torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
+
+    # Partial RoPE output countermeasure (§2.3.3): because the compressed
+    # KV entries serve as both keys AND values, the naive output carries
+    # absolute-position rotations; inverse-rotating at the NEGATED query
+    # position makes each entry's contribution depend on the relative
+    # (entry − query) distance only.
+    if rope_dim_eff > 0:
+        out = partial_rope(
+            out, -token_positions(T, device), rope_dim_eff, rope_base, dim=1)
 
     out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
     if return_projections:

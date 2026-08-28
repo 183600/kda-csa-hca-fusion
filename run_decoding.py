@@ -363,8 +363,20 @@ class KDAAttnDecoding(nn.Module):
                 # Batch size changed — drop the state (per-sequence, cannot
                 # be reused across different batch sizes).
                 state = None
-            elif state.device != x.device or state.dtype != x.dtype:
-                # Device or dtype changed — move/cast and keep detached.
+            elif state.dtype != (
+                    torch.float64 if x.dtype == torch.float64 else torch.float
+            ) or state.device != x.device:
+                # Keep the recurrent state in COMPUTE precision (fp32 for
+        # fp16/bf16 inputs, fp64 for fp64) across decode steps.
+        # "kda_forward" returns the final state in compute_dtype; the
+        # historical code cast it back DOWN to ``x.dtype`` on the next
+        # forward, so every fp16 decode step rounded the state through
+        # fp16 and back — accumulating error over long decodes.
+        # Casting UP to compute_dtype here (never down) keeps full
+        # precision; ``naive_recurrent_kda`` already upcasts
+        # ``initial_state`` internally, so a higher-precision state is
+        # always safe to pass.
+        # Device or dtype changed — move/cast and keep detached.
                 state = state.to(device=x.device, dtype=x.dtype).detach()
             else:
                 state = state.detach()
@@ -400,11 +412,18 @@ class CSAAttnDecoding(nn.Module):
     """
 
     def __init__(self, d_model, m=4, topk=2, nh=2, c=8, dc=8,
-                 nIh=1, c_I=4, sliding_window=4, use_ste=False):
+                 nIh=1, c_I=4, sliding_window=4, use_ste=False,
+                 rope_dim=64, rope_base=10000.0):
         super().__init__()
         self.d_model = d_model
         self.m, self.topk, self.nh, self.c = m, topk, nh, c
         self.dc, self.nIh, self.c_I = dc, nIh, c_I
+        # Partial RoPE (DeepSeek-V4 §2.3.3). Paper-faithful default 64,
+        # clamped to the head dim (``min(rope_dim, c)`` rounded down to
+        # even) so the small decode geometry (c=8) still exercises RoPE.
+        # Pass ``rope_dim=None`` (or 0) to disable.
+        self.rope_dim = rope_dim
+        self.rope_base = rope_base
         self.sliding_window = sliding_window
         self.use_ste = use_ste
         d = d_model
@@ -445,6 +464,7 @@ class CSAAttnDecoding(nn.Module):
             self._cache = CSADecodingCache(
                 B, self.c, self.c_I, self.m, self.sliding_window,
                 device, dtype,
+                rope_dim=self.rope_dim, rope_base=self.rope_base,
             )
 
     def _project(self, H):
@@ -489,6 +509,7 @@ class CSAAttnDecoding(nn.Module):
                 sliding_window=self.sliding_window, sink_logits=self.sink,
                 use_ste=self.use_ste,
                 normalize_qk=True,
+                rope_dim=self.rope_dim, rope_base=self.rope_base,
                 return_projections=True,
             )
             # Populate the cache from the projections returned by naive_csa
@@ -532,10 +553,15 @@ class HCAAttnDecoding(nn.Module):
     """
 
     def __init__(self, d_model, m2=4, nh=2, c=8, dc=8,
-                 sliding_window=4):
+                 sliding_window=4, rope_dim=64, rope_base=10000.0):
         super().__init__()
         self.d_model = d_model
         self.m2, self.nh, self.c, self.dc = m2, nh, c, dc
+        # Partial RoPE (DeepSeek-V4 §2.3.3): paper-faithful default 64,
+        # clamped to the head dim. Pass ``rope_dim=None`` (or 0) to
+        # disable.
+        self.rope_dim = rope_dim
+        self.rope_base = rope_base
         self.sliding_window = sliding_window
         d = d_model
         self.W_KV = nn.Linear(d, c, bias=False)
@@ -560,6 +586,7 @@ class HCAAttnDecoding(nn.Module):
                 or self._cache.dtype != dtype:
             self._cache = HCADecodingCache(
                 B, self.c, self.m2, self.sliding_window, device, dtype,
+                rope_dim=self.rope_dim, rope_base=self.rope_base,
             )
 
     def _project(self, H):
@@ -584,6 +611,7 @@ class HCAAttnDecoding(nn.Module):
                 self.W_DQ.weight, self.W_UQ.weight,
                 m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                 sliding_window=self.sliding_window, sink_logits=self.sink,
+                rope_dim=self.rope_dim, rope_base=self.rope_base,
                 return_projections=True,
             )
             cache.append_step(C.detach(), Z.detach(), self.B_pos.detach())
@@ -682,6 +710,7 @@ class HybridDecoding(nn.Module):
             cache = CSADecodingCache(
                 B, cfg.csa_c, cfg.csa_cI, cfg.csa_m,
                 cfg.csa_sliding_window, h.device, h.dtype,
+                rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
             )
             self._csa_caches[idx] = cache
         return cache
@@ -696,6 +725,7 @@ class HybridDecoding(nn.Module):
             cache = HCADecodingCache(
                 B, cfg.hca_c, cfg.hca_m2, cfg.hca_sliding_window,
                 h.device, h.dtype,
+                rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
             )
             self._hca_caches[idx] = cache
         return cache
@@ -754,6 +784,8 @@ class HybridDecoding(nn.Module):
                 nIh=cfg.csa_nIh, c=cfg.csa_c, c_I=cfg.csa_cI,
                 dc=cfg.csa_dc, sliding_window=cfg.csa_sliding_window,
                 sink_logits=layer.sink, use_ste=False, normalize_qk=True,
+                rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
+                qk_norm_mode=cfg.csa_qk_norm_mode,
                 return_projections=True,
             )
             # Cache state is runtime inference state; detach to avoid retaining
@@ -800,6 +832,8 @@ class HybridDecoding(nn.Module):
                 layer.W_DQ.weight, layer.W_UQ.weight,
                 m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
                 sliding_window=cfg.hca_sliding_window, sink_logits=layer.sink,
+                rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
+                qk_norm_mode=cfg.hca_qk_norm_mode,
                 return_projections=True,
             )
             cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())

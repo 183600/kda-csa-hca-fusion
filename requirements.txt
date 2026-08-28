@@ -14,12 +14,15 @@
 # pyproject.toml) for the canonical environment; this file is a
 # convenience for users who prefer the requirements.txt workflow.
 #
-# torch upper bound is `<3` (not `<2.7`): 2025-2026 Kaggle GPU images and
-# AutoDL base images preinstall CUDA torch >= 2.7. A `<2.7` pin forces pip
-# to DOWNGRADE the preinstalled CUDA build to the 2.6 CPU wheel from PyPI
-# (~800 MB download, silently breaks torch.cuda.is_available()). The full
-# 252-check correctness suite passes on torch 2.2-2.13; keep `<3` so
-# `pip install -r requirements.txt` is a no-op on preconfigured GPU hosts.
+# torch upper bound is `<3` (not `<2.7`, not unbounded): 2025-2026 Kaggle
+# GPU images and AutoDL base images preinstall CUDA torch >= 2.7. A `<2.7`
+# pin forces pip to DOWNGRADE the preinstalled CUDA build to the 2.6 CPU
+# wheel from PyPI (~800 MB download, silently breaks
+# torch.cuda.is_available()). An unbounded pin risks a future torch 3.x
+# breaking change; the full correctness suite passes on every torch release
+# from 2.2 through 2.13, so `<3` is validated, not speculative. Pin
+# `torch==2.6.*` yourself for a bit-reproducible rerun of the committed
+# historical numbers.
 torch>=2.2,<3
 einops>=0.6,<0.9
 matplotlib>=3.5,<3.11
