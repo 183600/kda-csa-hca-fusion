@@ -7,7 +7,7 @@ name = "kda-csa-hca-fusion"
 version = "0.1.0"
 description = "Naive PyTorch reference implementation and experimental harness for the KDA+CSA+HCA hybrid linear-attention architecture."
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 license = { file = "LICENSE" }
 authors = [
     { name = "kda-csa-hca-fusion contributors" },
@@ -32,17 +32,26 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # Pin UPPER bounds. torch 2.3 vs 2.6 differ in
-    # ``scaled_dot_product_attention`` behaviour (kernel selection,
-    # padding handling) which affects the softmax baseline numbers in
-    # ``run_benchmark`` / ``run_quality``. einops 0.8 changed the
-    # default ``rearrange`` error message format. matplotlib 3.10
-    # dropped several deprecated APIs. The bounded ranges below match
-    # the versions used to generate the committed historical results.
-    "torch>=2.2,<2.7",
+    # Pin UPPER bounds. torch upper bound is `<3` (not `<2.7`): 2025-2026
+    # Kaggle GPU images and AutoDL base images preinstall CUDA torch >= 2.7,
+    # and a `<2.7` pin forces pip to DOWNGRADE the preinstalled CUDA build to
+    # the 2.6 CPU wheel from PyPI (~800 MB download that silently breaks
+    # ``torch.cuda.is_available()``). The full 252-check correctness suite
+    # (``run_correctness.py``) passes on every torch release from 2.2 through
+    # 2.13, so the wide bound is validated, not speculative. The historical
+    # caveat remains: torch 2.3 vs 2.6+ differ in
+    # ``scaled_dot_product_attention`` behaviour (kernel selection, padding
+    # handling) which can shift the softmax baseline numbers in
+    # ``run_benchmark`` / ``run_quality`` by a few percent — treat cross-torch
+    # comparisons as indicative, and pin an exact torch version in a lock
+    # file when reproducibility matters. einops 0.8 changed the default
+    # ``rearrange`` error message format. matplotlib 3.10 dropped several
+    # deprecated APIs.
+    "torch>=2.2,<3",
     "einops>=0.6,<0.9",
     "matplotlib>=3.5,<3.11",
     "numpy>=1.21,<2.3",
@@ -107,6 +116,8 @@ py-modules = [
     "make_figures",
     "method_analysis",
     "kaggle_setup",
+    "train_lm_autodl",
+    "train_toy_reference",
 ]
 
 [tool.pytest.ini_options]

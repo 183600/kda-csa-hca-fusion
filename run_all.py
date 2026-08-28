@@ -2,13 +2,14 @@
 
 Usage on Kaggle
 ---------------
-1. Upload this whole ``experiments/`` directory as a Kaggle Dataset (or clone
-   the repo into the notebook working directory).
+1. Upload the repository root (this file sits at the top level, next to
+   ``ops_*.py``) as a Kaggle Dataset — or clone the repo into the notebook
+   working directory.
 2. In a notebook cell::
 
      !pip install -q einops matplotlib
-     import sys; sys.path.insert(0, '/kaggle/input/<your-dataset-name>/experiments')
-     %run /kaggle/input/<your-dataset-name>/experiments/run_all.py
+     import sys; sys.path.insert(0, '/kaggle/input/<your-dataset-name>')
+     %run /kaggle/input/<your-dataset-name>/run_all.py
 
    Or, to run individual experiments::
 
@@ -23,7 +24,9 @@ Usage on Kaggle
 What this runner does
 ---------------------
   * Installs the minimal deps (einops) if missing.
-  * Calls ``setup_kaggle()`` to install the CUDA torch wheel on Kaggle T4.
+  * Calls ``setup_kaggle()`` to VERIFY CUDA availability on Kaggle T4 (the
+    CUDA wheel install itself lives in ``kaggle_setup.bootstrap_kaggle_cuda``
+    and requires a kernel restart — see that module's docstring).
   * Prints an environment summary.
   * Runs all six experiments + method analysis + figure generation.
   * Saves a combined ``results/summary.json`` with pass/fail and key numbers.

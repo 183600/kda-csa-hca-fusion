@@ -30,7 +30,11 @@ try:
     from transformers import AutoTokenizer
     from datasets import load_dataset
     HAS_HF = True
-except:
+except Exception:
+    # ImportError on hosts without the HF stack; also catches transient
+    # import-time failures (e.g. a half-installed datasets). A bare
+    # ``except:`` here would also swallow KeyboardInterrupt / SystemExit
+    # during interpreter shutdown, so scope to Exception.
     HAS_HF = False
 
 class TinyStoriesLM(Dataset):

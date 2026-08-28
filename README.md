@@ -82,9 +82,9 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 
 ## Installation
 
-**Requires Python 3.10–3.12** (the source uses PEP 604 `X | None` union syntax,
-and the pinned torch/scipy ranges are validated for the 3.10–3.12 wheel matrix).
-The `pyproject.toml` declares `requires-python = ">=3.10,<3.13"`.
+**Requires Python 3.10–3.13** (the source uses PEP 604 `X | None` union syntax,
+and the full regression suite is validated on the 3.10–3.13 interpreter
+matrix). The `pyproject.toml` declares `requires-python = ">=3.10,<3.14"`.
 
 ```bash
 # 1. Clone
@@ -417,7 +417,14 @@ python train_lm_autodl.py --autodl --max_steps 2000 --seq_len 1024 --batch_size 
 !pip install -q transformers datasets
 !python train_lm_autodl.py --kaggle
 ```
-默认Kaggle配置：d=256, 5层(3:1:1), seq512, 500 steps ~40分钟 T4x2完成。
+默认Kaggle配置：d=256, 5层(3:1:1), seq512, 500 steps，T4 单卡约40分钟完成
+（脚本使用单 GPU，无需 DDP；在 T4x2 实例上只会用到其中一张卡）。
+
+> **注意（避免 torch 被降级）**：Kaggle GPU 镜像预装 CUDA 版 torch，直接
+> `!pip install -q transformers datasets` 即可，不要在 Kaggle 上执行
+> `pip install -r requirements.txt` / `pip install -e .` 之外的 torch 重装操作。
+> 本仓库的依赖区间是 `torch>=2.2,<3`，对预装版本是 no-op；若你手动 pin 了
+> `<2.7` 之类的旧上限，pip 会把 CUDA torch 降级成 CPU wheel，GPU 将不可用。
 
 ### 成本拆解
 | 阶段 | 时长 3090 | 成本 |

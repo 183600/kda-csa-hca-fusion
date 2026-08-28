@@ -59,28 +59,46 @@ _interop_threads_set = False
 
 
 # PyTorch CUDA wheel index URLs (see https://pytorch.org/get-started/locally/).
-# Ordered from newest to oldest; cu121 is the historical default for Kaggle T4.
+# Ordered from newest to oldest. cu121 is the historical default for Kaggle T4.
+# cu126/cu128 are required for torch >= 2.7 wheels (the last cu124 wheel is
+# torch 2.6.0), which matters when the preinstalled CPU-only torch on an
+# older Kaggle image is newer than 2.6 and the bootstrap must replace it.
 _PYTORCH_WHEEL_INDEX_URLS = {
+    "cu128": "https://download.pytorch.org/whl/cu128",
+    "cu126": "https://download.pytorch.org/whl/cu126",
     "cu124": "https://download.pytorch.org/whl/cu124",
     "cu121": "https://download.pytorch.org/whl/cu121",
     "cu118": "https://download.pytorch.org/whl/cu118",
 }
 
 # Fallback wheel when the driver-reported CUDA version cannot be probed.
-# Known to work on Kaggle T4 (sm_75).
-_DEFAULT_CUDA_WHEEL_KEY = "cu121"
+# Known to work on Kaggle T4 (sm_75): torch 2.6.0 ships cu118/cu121/cu124
+# wheels, and the driver on current GPU images is >= 12.4.
+_DEFAULT_CUDA_WHEEL_KEY = "cu124"
+
+# The exact torch version the bootstrap installs. 2.6.0 is the LAST release
+# with wheels on the cu121/cu124 indexes and is validated on Kaggle T4
+# (sm_75). Pinning an exact version (instead of a range) + --force-reinstall
+# guarantees the CPU-only build is actually REPLACED: with a range like
+# ``torch>=2.2,<2.7``, an image that already ships CPU-only torch 2.6.0
+# satisfies the requirement and pip would silently keep the CPU build.
+_BOOTSTRAP_TORCH_PIN = "torch==2.6.0"
 
 
 def _detect_cuda_wheel_index() -> str:
     """Probe ``nvidia-smi`` for the driver-reported CUDA version and return the
     best matching PyTorch wheel index URL.
 
-    Selection rules:
+    Selection rules (newest wheel index whose runtime does not exceed the
+    driver; a NEWER driver with an OLDER runtime is always compatible):
+
+        * CUDA >= 12.8 -> cu128
+        * CUDA >= 12.6 -> cu126
         * CUDA >= 12.4 -> cu124
         * CUDA >= 12.1 -> cu121
         * otherwise    -> cu118
 
-    Falls back to ``cu121`` if ``nvidia-smi`` is missing, exits non-zero, or
+    Falls back to ``cu124`` if ``nvidia-smi`` is missing, exits non-zero, or
     its output cannot be parsed (e.g. older drivers that don't print the
     ``CUDA Version:`` header).
     """
@@ -106,6 +124,10 @@ def _detect_cuda_wheel_index() -> str:
         major, minor = int(m.group(1)), int(m.group(2))
     except ValueError:
         return fallback
+    if (major, minor) >= (12, 8):
+        return _PYTORCH_WHEEL_INDEX_URLS["cu128"]
+    if (major, minor) >= (12, 6):
+        return _PYTORCH_WHEEL_INDEX_URLS["cu126"]
     if (major, minor) >= (12, 4):
         return _PYTORCH_WHEEL_INDEX_URLS["cu124"]
     if (major, minor) >= (12, 1):
@@ -286,19 +308,18 @@ def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
     # ``sympy``). ``--extra-index-url`` keeps PyPI as the primary
     # source and adds the PyTorch wheel index as a fallback.
     #
-    # CRITICAL: ``--upgrade`` is REQUIRED. Without it, pip treats the
-    # already-installed (CPU-only) torch as satisfying ``torch>=2.1``
-    # and does NOTHING. ``--upgrade-strategy=only-if-needed`` is a
-    # modifier of ``--upgrade`` and is meaningless on its own.
+    # CRITICAL: ``--force-reinstall`` with an EXACT version pin
+    # (``_BOOTSTRAP_TORCH_PIN``) is REQUIRED. Without it, pip treats the
+    # already-installed (CPU-only) torch as satisfying the requirement and
+    # does NOTHING — including when the installed CPU version numerically
+    # matches the pin. A range pin (e.g. ``torch>=2.2,<2.7``) has the same
+    # hole: an image that already ships CPU-only torch 2.6.0 satisfies it
+    # and the CUDA wheel is never installed.
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
-        "--upgrade",
+        "--force-reinstall",
         "--upgrade-strategy", "only-if-needed",
-        # Pin the SAME upper bound as pyproject.toml's
-        # ``torch>=2.2,<2.7`` so a fresh Kaggle bootstrap does not pull
-        # a wheel that changes ``scaled_dot_product_attention`` kernel
-        # selection and padding handling.
-        "torch>=2.2,<2.7", "--extra-index-url", index_url,
+        _BOOTSTRAP_TORCH_PIN, "--extra-index-url", index_url,
     ])
     # The install succeeded, but the CURRENT process still has the old
     # CPU-only torch loaded. Force the caller to restart.

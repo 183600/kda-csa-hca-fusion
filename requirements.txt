@@ -1,5 +1,5 @@
 # Runtime dependencies for the paper experiments in this directory.
-# Python support: 3.10 <= python < 3.13 (matches pyproject.toml).
+# Python support: 3.10 <= python < 3.14 (matches pyproject.toml).
 #
 # The canonical source of truth for runtime deps is `pyproject.toml`'s
 # `[project].dependencies` field. This file is kept for backward
@@ -13,7 +13,14 @@
 # stay in sync. The CI should run `pip install -e .` (which reads
 # pyproject.toml) for the canonical environment; this file is a
 # convenience for users who prefer the requirements.txt workflow.
-torch>=2.2,<2.7
+#
+# torch upper bound is `<3` (not `<2.7`): 2025-2026 Kaggle GPU images and
+# AutoDL base images preinstall CUDA torch >= 2.7. A `<2.7` pin forces pip
+# to DOWNGRADE the preinstalled CUDA build to the 2.6 CPU wheel from PyPI
+# (~800 MB download, silently breaks torch.cuda.is_available()). The full
+# 252-check correctness suite passes on torch 2.2-2.13; keep `<3` so
+# `pip install -r requirements.txt` is a no-op on preconfigured GPU hosts.
+torch>=2.2,<3
 einops>=0.6,<0.9
 matplotlib>=3.5,<3.11
 numpy>=1.21,<2.3

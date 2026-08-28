@@ -155,3 +155,12 @@ poetry.lock
 uv.lock
 
 .opencode/
+
+# LM training checkpoints written by train_lm_autodl.py / run_autodl_lm.sh
+# (~50-300 MB per save; must never be committed — the CI bug-fix workflow
+# uses `git add -A`, which would otherwise bulk-commit them).
+checkpoints_lm/
+
+# opencode/LLM-loop artifacts already covered by .opencode/ above; keep the
+# explicit entry in case the workflow rewrites .gitignore.
+opencode.json
