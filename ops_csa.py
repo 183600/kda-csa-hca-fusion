@@ -19,6 +19,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ops_rope import (
+    effective_rope_dim,
+    partial_rope,
+    token_positions,
+    block_positions,
+)
+
 
 # =============================================================================
 # Chunked sliding-window attention helper (issue 2.2 fix)
@@ -142,13 +149,61 @@ def _sliding_window_attention(
     return out
 
 
+def _sliding_window_scores(
+    q: torch.Tensor,           # [B, T, nh, c]   (L2-normalized)
+    C_local: torch.Tensor,     # [B, T, c]       (L2-normalized)
+    win: int,
+    scale: float,
+    device,
+) -> tuple:
+    """Compute per-query sliding-window attention SCORES for the joint softmax.
+
+    Returns ``(scores_w, C_windows, win_valid)`` where
+    ``scores_w`` is ``[B, T, nh, win]`` (already ``-inf``-masked for the
+    out-of-sequence left-padding), ``C_windows`` is ``[B, T, win, c]`` (the
+    per-query window keys), and ``win_valid`` is ``[T, win]`` (boolean, True =
+    real position). The caller concatenates ``scores_w`` with the sparse-block
+    scores and applies ONE softmax over the union (DeepSeek-V4 §2.3.1 Eq. 27),
+    so the window entries share the compressed entries' denominator and sink.
+    """
+    B, T, nh, c = q.shape
+    C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
+    C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
+    _j = torch.arange(win, device=device)
+    _t = torch.arange(T, device=device)
+    win_valid = _j[None, :] >= (win - 1 - _t[:, None])    # [T, win], True=real
+    scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows) * scale
+    scores_w = scores_w.masked_fill(~win_valid[None, :, None, :], float('-inf'))
+    return scores_w, C_windows, win_valid
+
+
 def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     """Return the DeepSeek-V4 block-causal mask ``[T, n_blocks]``.
 
-    A compressed block becomes available when its source window closes. Thus
-    query ``t`` may attend to blocks ``b < (t + 1) // m``. For example, with
-    ``m=8`` the block covering positions ``0..7`` is visible to query ``t=7``;
-    it is not future information because the whole source window is complete.
+    Paper-exact contract (arXiv:2606.19348v1, Eq. 16 and §2.3.3): a query
+    token ``t`` attends only to STRICTLY PRECEDING compressed blocks,
+    i.e. block ``s`` is visible iff ``s < floor(t / m)``. The paper
+    motivates this explicitly: "each query attends to only preceding
+    compressed KV blocks. Consequently, a query cannot access information
+    from other tokens within its own compressed block" — the local
+    context inside the query's own block is instead served by the
+    sliding-window branch (§2.3.3 "Additional Branch of Sliding Window
+    Attention").
+
+    For example, with ``m=8`` the block covering positions ``0..7`` first
+    becomes visible to query ``t=8`` (the first token of the NEXT block);
+    queries ``t=0..7`` cannot see it through the sparse branch.
+
+    .. note:: Historical off-by-one (fixed). This repository previously
+        used the window-close variant ``b < (t + 1) // m`` (a block became
+        visible at its own final source token). That variant does not leak
+        future information either — at ``t = (b+1)*m - 1`` the whole source
+        window of block ``b`` is complete — but it deviates from the
+        paper's strictly-preceding rule by additionally exposing the
+        query's own block at one position per block. The window-close
+        variant was never attributed to the paper by Eq. 16; it is now
+        aligned to the paper-exact mask everywhere (naive operators,
+        decoding caches, and the FLOPs accounting in ``run_kv_cache``).
     """
     if not isinstance(T, int) or T < 0:
         raise ValueError(f"T must be a non-negative int, got {T!r}")
@@ -158,7 +213,7 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
         raise ValueError(f"m must be a positive int, got {m!r}")
     i_t = torch.arange(T, device=device)
     i_b = torch.arange(n_blocks, device=device)
-    return (i_t[:, None] + 1) // m > i_b[None, :]
+    return i_t[:, None] // m > i_b[None, :]
 
 
 def csa_compress_kv(
@@ -296,6 +351,39 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     safe_logits = logits.masked_fill(all_masked, 0.0)
     soft = torch.softmax(safe_logits, dim=dim)
     return soft.masked_fill(all_masked, 0.0)
+
+
+def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
+    """Normalize queries / compressed KV before the core attention.
+
+    DeepSeek-V4 §2.3.3 ("Query and Key-Value Entry Normalization") specifies
+    an RMSNorm on each head of the queries and on the single head of the
+    compressed KV entries. The historical repository behaviour is an
+    L2-normalization (cosine attention).
+
+    Modes
+    -----
+    * ``'l2'``  (default, historical): ``x / ||x||_2`` — unit-norm vectors;
+      callers use ``scale=1.0`` (cosine scores in [-1, 1]).
+    * ``'rms'`` (paper §2.3.3 form): ``x / sqrt(mean(x^2) + eps)`` — the
+      vectors keep norm ~sqrt(D). NOTE this is a genuine behaviour change,
+      not a no-op rename: (i) the attention VALUES are the normalized
+      entries themselves, so the core-attention output is ~sqrt(D) larger
+      than under 'l2'; (ii) the callers auto-select the STANDARD attention
+      temperature ``scale = 1/sqrt(D)`` for this mode (mirroring how
+      DeepSeek-V2/V3 combine per-head RMSNorm with standard scaling),
+      which makes the logits ~sqrt(D)·cosine — sharper than the 'l2' mode's
+      plain cosine. The paper does not pin the core-attention temperature,
+      so both choices are paper-compatible; pass an explicit ``scale=`` to
+      pin any other temperature.
+    """
+    if mode == 'l2':
+        return F.normalize(x, dim=-1)
+    if mode == 'rms':
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    raise ValueError(
+        f"qk_norm_mode={mode!r} must be 'l2' (cosine, historical) or "
+        f"'rms' (paper §2.3.3 RMSNorm form)")
 
 
 def csa_lightning_indexer(
@@ -487,15 +575,15 @@ def csa_lightning_indexer(
     if w_idx is not None:
         w_idx = w_idx.to(compute_dtype)
 
-    # P0 fix: L2-normalize indexer queries and keys so the top-k ranking
-    # is magnitude-invariant (cosine-style scoring, as specified in the
-    # DeepSeek-V4 paper Eq. 15). Without normalization, a high-norm
-    # indexer query dominates the top-k ranking purely by magnitude
-    # rather than by semantic relevance, making the sparse selection
-    # sensitive to upstream projection scaling. The historical scale
-    # ``DI ** -0.5`` partially mitigates this but does not eliminate it;
-    # explicit normalization is the standard fix. Set ``normalize_qk=False``
-    # to restore the un-normalized behaviour (e.g. for ablation).
+    # L2-normalize indexer queries and keys so the top-k ranking
+    # is magnitude-invariant (cosine-style scoring). NOTE: this is a
+    # REPOSITORY-SIDE choice — the DeepSeek-V4 paper Eq. (15)–(16) define
+    # the index score as a plain weighted ReLU dot product with no
+    # normalization. Without normalization, a high-norm indexer query
+    # dominates the top-k ranking purely by magnitude rather than by
+    # semantic relevance, making the sparse selection sensitive to upstream
+    # projection scaling. Set ``normalize_qk=False`` to restore the
+    # un-normalized (paper-literal) behaviour (e.g. for ablation).
     if normalize_qk:
         q_idx = F.normalize(q_idx, dim=-1)
         k_idx = F.normalize(k_idx, dim=-1)
@@ -580,11 +668,22 @@ def naive_csa(
     normalize_qk: bool = False,
     fuse_projections: bool = True,
     return_projections: bool = False,
+    rope_dim: int | None = None,
+    rope_base: float = 10000.0,
+    qk_norm_mode: str = 'l2',
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
-    Returns output ``[B, T, nh*c]`` (the caller performs the grouped output
-    projection ``[B, T, nh*c] -> d``).
+    Returns output ``[B, T, nh*c]``. NOTE (attribution fixed): the caller
+    performs a FULL output projection ``[B, T, nh*c] -> d`` — NOT the
+    paper's grouped output projection (§2.3.1, which first splits the
+    ``nh`` head outputs into ``g`` groups and projects each group to a
+    ``d_g < c*nh/g`` intermediate). The grouped strategy pays off only
+    when ``c*nh >> d`` (DeepSeek-V4's production geometry); at this
+    repository's experiment scales ``c*nh`` is small, so the full
+    projection is used and the FLOPs accounting in ``run_kv_cache``
+    counts the full-projection cost (``2*T*c*nh*d``) — formula and
+    implementation are consistent.
 
     When ``return_projections=True``, returns ``(output, projections)`` where
     ``projections`` is a tuple ``(Ca, Cb, Za, Zb, K_idx, Z_idx)`` of the 6
@@ -716,6 +815,19 @@ def naive_csa(
     if scale is not None:
         # Caller explicitly pinned a temperature — honour it.
         pass
+    if qk_norm_mode not in ('l2', 'rms'):
+        raise ValueError(
+            f"naive_csa: qk_norm_mode={qk_norm_mode!r} must be 'l2' (cosine, "
+            f"historical) or 'rms' (paper §2.3.3 RMSNorm form)")
+    # Partial RoPE (DeepSeek-V4 §2.3.3). ``rope_dim=None`` (default)
+    # disables RoPE and preserves the historical behaviour bit-exactly;
+    # the model-level wrappers (ops_fused / run_quality / run_decoding)
+    # default to the paper's 64-dim partial RoPE (clamped to the head
+    # dim for small geometries).
+    rope_dim_eff = effective_rope_dim(rope_dim, c)
+    if rope_base <= 0:
+        raise ValueError(
+            f"naive_csa: rope_base={rope_base!r} must be positive")
     device = H.device
     # Degenerate case: empty sequence. Without this guard the downstream
     # ``csa_compress_kv_overlapped`` would raise a cryptic broadcasting
@@ -851,9 +963,31 @@ def naive_csa(
         K_idx_raw = F.linear(H, W_KV_idx)
         Z_idx = F.linear(H, W_Z_idx)
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)   # [B, n_blocks, c]
+    # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
+    # rotated entry serves as BOTH the attention key and the attention
+    # value (shared-KV MQA). The anchor position of compressed entry ``s``
+    # is ``s * m`` (block start; for the overlapped two-branch compression
+    # this is also the a/b source-window boundary). Rotation happens
+    # BEFORE normalization — ``ops_decoding_cache`` applies the same order
+    # (rotate at append time, normalize at read time) so the incremental
+    # decode path stays bit-identical to this full-sequence path.
+    if rope_dim_eff > 0:
+        C_comp = partial_rope(
+            C_comp, block_positions(n_blocks, m, device),
+            rope_dim_eff, rope_base, dim=1)
 
     # --- 2. Lightning indexer ---
-    # compressed indexer keys via the same compression (single-branch here for simplicity)
+    # compressed indexer keys via the same compression operation, applied
+    # SINGLE-BRANCH (no a/b overlap). NOTE: the paper says CSA "performs
+    # the same compression operation used for CComp" — i.e. the overlapped
+    # two-branch compression — for the indexer keys as well; this reference
+    # implementation deliberately keeps a single branch (one W_KV_idx /
+    # W_Z_idx / B_idx instead of a/b pairs) as a documented simplification:
+    # the indexer only produces a top-k RANKING, which is robust to the
+    # compression variant. The RoPE is likewise NOT applied to the indexer
+    # queries/keys — §2.3.3 scopes RoPE to the core-attention queries /
+    # KV entries / outputs, not to the indexer scores (Eq. 15–16 have no
+    # positional term).
     # K_idx_raw and Z_idx were computed in the merged matmul above.
     K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)            # [B, n_blocks, c_I]
     # indexer queries (low-rank)
@@ -920,8 +1054,18 @@ def naive_csa(
     # This makes the flag's semantics consistent across both branches and
     # gives ablations a genuine knob to turn off normalization.
     if normalize_qk:
-        q = F.normalize(q, dim=-1)
-    C_comp_n = F.normalize(C_comp, dim=-1) if normalize_qk else C_comp.to(compute_dtype)
+        q = _qk_normalize(q, qk_norm_mode)
+    C_comp_n = (_qk_normalize(C_comp, qk_norm_mode) if normalize_qk
+                else C_comp.to(compute_dtype))
+    # Partial RoPE on the core-attention QUERIES (§2.3.3): rotate each
+    # query at its own token position AFTER normalization (the decoding
+    # cache applies the same order: the caller normalizes ``q``, the cache
+    # rotates it). RoPE is orthogonal, so normalize-then-rotate and
+    # rotate-then-normalize agree up to fp rounding; the order is pinned
+    # here only so the incremental decode path matches bit-exactly.
+    if rope_dim_eff > 0:
+        q = partial_rope(
+            q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
     # Core-attention scale auto-selection (mirrors the indexer scale
     # policy above). A caller can still override by passing an explicit
     # ``scale=``.
@@ -931,26 +1075,22 @@ def naive_csa(
     # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
     # ``else`` branch was skipped for any other reason, causing a
     # ``None * tensor`` crash in ``_sliding_window_attention``.
+    # (2026-08 port: an earlier LLM fix round accidentally pasted this
+    # block TWICE; the duplicate — a functional no-op — was removed.)
     if scale is None:
-        if normalize_qk:
-            scale = 1.0
-        else:
+        if not normalize_qk:
             scale = c ** -0.5
+        elif qk_norm_mode == 'rms':
+            # Paper §2.3.3 RMSNorm form: the normalized vectors keep norm
+            # ~sqrt(c), so the raw dot product is ~c * cosine. Use the
+            # STANDARD attention temperature 1/sqrt(c) (mirroring how
+            # DeepSeek-V2/V3 combine per-head RMSNorm with standard
+            # scaling), giving logits ~sqrt(c) * cosine. Pass an explicit
+            # ``scale=`` (e.g. 1.0) for any other temperature.
+            scale = c ** -0.5
+        else:
+            scale = 1.0
 
-    # Core-attention scale auto-selection (mirrors the indexer scale
-    # policy above). A caller can still override by passing an explicit
-    # ``scale=``.
-    # NOTE: this block MUST run BEFORE the topk=0 branch so ``scale`` is
-    # resolved for the sliding-window branch (which runs AFTER the if/else
-    # and uses ``scale`` unconditionally). Previously it was inside the
-    # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
-    # ``else`` branch was skipped for any other reason, causing a
-    # ``None * tensor`` crash in ``_sliding_window_attention``.
-    if scale is None:
-        if normalize_qk:
-            scale = 1.0
-        else:
-            scale = c ** -0.5
 
     # Handle topk=0 (degenerate but valid: caller asks for no sparse
     # selection). Without this guard the downstream ``scores.amax(-1)``
@@ -960,7 +1100,9 @@ def naive_csa(
     # enabled) produces non-zero output. We still need ``q`` (for the SW
     # branch) so the early return is placed AFTER q is computed.
     if indices.shape[-1] == 0:
-        out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
+        scores = torch.empty(B_, T, nh, 0, dtype=compute_dtype, device=device)
+        valid_mask = torch.empty(B_, T, 0, dtype=torch.bool, device=device)
+        kv = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
     else:
         # --- Vectorized sparse MQA core attention ---
         # Gather selected compressed KV entries for every (b, t) in one shot.
@@ -970,7 +1112,7 @@ def naive_csa(
         batch_idx = torch.arange(B_, device=device).view(B_, 1, 1)      # [B, 1, 1]
         kv = C_comp_n[batch_idx, idx_safe]                               # [B, T, topk, c]
 
-        # P0-4 fix — straight-through estimator (STE) for the indexer.
+        # Straight-through estimator (STE) for the indexer.
         # ``kv`` above is a hard gather: its value is correct (the
         # top-k compressed KV entries), but it has NO gradient path back
         # to the indexer parameters because ``indices`` is an integer
@@ -992,7 +1134,7 @@ def naive_csa(
         # After ``backward()``, those parameters now have non-None
         # ``.grad`` and are updated by the optimizer.
         #
-        # P0-2 fix — implement ``ste_mode`` as two genuinely distinct
+        # ``ste_mode`` is implemented as two genuinely distinct
         # branches instead of silently aliasing ``'full_softmax'`` to
         # ``'topk_columns'``. Both modes share the same STE identity
         #
@@ -1046,7 +1188,7 @@ def naive_csa(
             # weighted by its soft probability. This is differentiable
             # w.r.t. soft_weights (and therefore the indexer params).
             # soft_kv[b, t, k, :] = soft_weights_selected[b, t, k] * kv[b, t, k, :]
-            soft_kv = soft_weights_selected.unsqueeze(-1) * kv       # [B, T, topk, c]
+            soft_kv = soft_weights_selected.unsqueeze(-1) * kv.detach()  # [B, T, topk, c]
 
             if ste_mode == 'full_softmax':
                 # Add a zero-in-forward term whose backward is the full
@@ -1074,7 +1216,7 @@ def naive_csa(
 
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
             #
-            # P0-5 fix: the previous form ``kv = soft_kv + (kv - soft_kv).detach()``
+            # The form ``kv = soft_kv + (kv - soft_kv).detach()``
             # is forward-equivalent to ``kv`` (hard gather) but in backward the
             # detach() ERASES the direct gradient from the hard gather path,
             # leaving only ``soft_weights * d_out`` as the gradient to the
@@ -1104,145 +1246,74 @@ def naive_csa(
         # Mask -1 padding so those slots get zero weight after softmax.
         scores = scores.masked_fill(~valid_mask[:, :, None, :], float('-inf'))
 
-        if sink_logits is not None:
-            # Attention sink: a per-head constant added to the denominator.
-            # Numerically stable logsumexp approach — keep sink_logits in
-            # log space (never exp it, which could overflow to inf when the
-            # learnable parameter grows during training and makes denom=inf,
-            # p=0/inf=nan or inf/inf=nan).
-            #
-            # Math: we want p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink)).
-            # For numerical stability we subtract row_max from every score
-            # (and from the sink!) so the largest exp() argument is 0:
-            #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
-            # where M = max(0, max_i s_i).  The previous code forgot to
-            # shift the sink, producing
-            #   p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink) * exp(M))
-            # i.e. the sink was over-weighted by a factor exp(M) — a
-            # systematic ~13% bias in the default c=64 config and up to 65%
-            # at c=4.  Shifting log_sink by -row_max restores the identity
-            #   logaddexp(a - M, b - M) = logaddexp(a, b) - M
-            # so the shifted computation is mathematically identical to the
-            # unshifted (overflow-prone) one.
-            log_sink = sink_logits.view(1, 1, nh, 1).to(scores)  # [1, 1, nh, 1]
-            vmask = valid_mask[:, :, None, :].to(scores.dtype)          # [B, T, 1, topk]
-            # NOTE: renamed from `m` to `row_max` to avoid shadowing the
-            # `m` parameter (compression factor). The previous `m = ...`
-            # silently clobbered the compression factor for the rest of the
-            # function; it happened not to be read again here, but the
-            # shadowing was a latent footgun for future edits.
-            row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, T, nh, 1]
-            shifted = scores - row_max                                  # [B, T, nh, topk]
-            shifted_sink = log_sink - row_max                           # [B, T, nh, 1]
-            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)      # [B, T, nh, 1]
-            p = ((shifted - log_denom).exp() * vmask)                   # [B, T, nh, topk]
-            # NaN guard for all-masked rows (early queries with no preceding
-            # causal block). When every slot in a row is -inf, log_sum_exp =
-            # -inf, log_denom = logaddexp(-inf, log_sink) = log_sink. If
-            # log_sink is also -inf (e.g. sink_logits diverged to -inf during
-            # training), then (shifted - log_denom) = (-inf - (-inf)) = NaN,
-            # and NaN * 0 (vmask) = NaN in IEEE 754. Zero out any row where
-            # all slots are invalid so the downstream einsum produces 0
-            # instead of NaN. This mirrors the all_masked guard in the
-            # ``else`` branch and in ``ops_hca.py::naive_hca``.
-            #
-            # Shape: valid_mask is [B, T, topk]; we reduce over topk to get
-            # [B, T, 1], then add a head axis [:, :, None] to broadcast over
-            # the nh dimension of p ([B, T, nh, topk]).
-            all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
-            p = p.masked_fill(all_invalid, 0.0)
-        else:
-            # NaN-safe softmax: rows that are entirely -inf (e.g. early
-            # queries with no preceding causal block, or all-topk slots
-            # padded with -1) yield all-zero p. We use the same explicit
-            # all_masked guard as ops_hca.py::naive_hca and the sink branch
-            # above for consistency: detect fully-masked rows, replace their
-            # -inf entries with 0 so softmax is finite, then zero the result.
-            #
-            # The previous implementation used a clamp(min=1e-20) trick on
-            # the denominator, which also produces p=0 for all-masked rows
-            # but relies on a magic epsilon. The explicit guard is clearer
-            # and avoids any theoretical concern about the epsilon being
-            # too small for fp16/bf16 inputs (where 1e-20 underflows to 0).
-            all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]  # [B, T, 1, 1]
-            # C5 fix: delegate to shared _nan_safe_softmax helper. We pass
-            # the precomputed all_masked mask so we don't recompute it
-            # (the indexer-style ``logits.isinf().all`` would not match
-            # this branch's ``valid_mask``-based definition of "masked").
-            p = _nan_safe_softmax(scores, dim=-1, all_masked_mask=all_invalid)
-
-        out = torch.einsum('b t h k, b t k d -> b t h d', p, kv)        # [B, T, nh, c] in compute_dtype
-
-    # optional sliding window branch (local uncompressed KV)
+    # Sliding-window branch: gather per-query window SCORES (uncompressed
+    # local KV) so they can share the compressed entries' softmax below.
     if sliding_window > 0:
         win = sliding_window
-        # Precompute F.linear(H, W_aKV) once (reuse Ca from §1) instead of
-        # redoing the matmul per (b, t).
         H_proj = Ca  # [B, T, c], already == F.linear(H, W_aKV)
-        # P5 fix — TRUE O(T·win) sliding-window attention (was O(T²)).
-        #
-        # The previous implementation built a full ``[T, T]`` boolean mask and
-        # a full ``[B, nh, T, T]`` attention-scores tensor, then masked every
-        # entry outside the window to ``-inf`` before softmax. Even though
-        # only ``win`` entries per row were non-trivial, the dense matmul
-        # (``einsum('bthd,bnd->bhtn')``) and the dense softmax both did
-        # ``O(T²·nh·c)`` work — the window size ``win`` had NO effect on the
-        # compute cost, only on which entries survived the mask. This means
-        # the "sliding window" branch was NOT actually achieving the
-        # ``O(T·window)`` complexity that is the whole point of a local
-        # attention mechanism; at ``T=2048`` it allocated and filled a
-        # 4M-entry scores tensor per call regardless of ``win``.
-        #
-        # The P5 fix used a **banded / windowed-gather** approach:
-        #   1. Left-pad ``C_local`` with ``win-1`` zero columns so that the
-        #      window for query ``t`` can be extracted as a contiguous slice.
-        #   2. Use ``unfold`` to extract per-query windows of shape
-        #      ``[B, T, win, c]`` in O(T·win·c) time.
-        #   3. Compute attention scores ONLY over the ``win`` entries:
-        #      ``[B, T, nh, win]`` — O(T·win·nh·c).
-        #   4. Mask the left-padding entries (queries near the start of the
-        #      sequence whose window extends before position 0) to ``-inf``,
-        #      softmax, and weighted-sum over the ``win`` dimension.
-        #
-        # Issue 2.2 fix: the ``unfold`` call materialized a single ``[B, T,
-        # win, c]`` tensor — fine for ``T≤4k, win≤512`` (≤4M elements) but
-        # blowing up at ``T=64k, win=2k`` (≈8B elements / 32 GB). We now
-        # delegate to ``_sliding_window_attention`` which auto-engages a
-        # chunked path when ``T * win * c`` exceeds ``CHUNKED_SW_THRESHOLD``
-        # (default 8M elements), keeping peak memory at
-        # ``O(chunk_t · win · c)``. For the small-T / small-win case the
-        # helper still uses ``unfold`` on a single slice — same vectorized
-        # fast path as before.
-        #
-        # The result is numerically identical to the old dense+mask approach
-        # (verified by ``test_hca_sliding_window_causality`` /
-        # ``test_csa_full_pipeline_causality`` in run_correctness.py) because
-        # softmax over the ``win`` non-masked entries of a row is the same
-        # operation whether the masked entries are materialized as ``-inf``
-        # in a ``[T,T]`` tensor or simply absent from a ``[T,win]`` tensor.
-        #
-        # q is already prepared above (L2-normalized if normalize_qk else
-        # raw), so the sliding-window branch reuses it directly.
-        #
-        # Dtype: cast H_proj to compute_dtype so the SW branch matches the
-        # sparse branch's precision. Without this, the SW softmax runs in
-        # H.dtype (e.g. fp16) while the sparse softmax ran in compute_dtype
-        # (fp32) — an asymmetric precision loss that silently degrades the
-        # SW branch's contribution for fp16 inputs.
-        #
-        # P0-6 (round 8): honor ``normalize_qk`` here too (mirrors the core
-        # attention block above). When normalize_qk=False we must NOT
-        # L2-normalize C_local either — that would give cosine attention in
-        # the SW branch while the sparse branch stays in dot-product mode,
-        # producing an inconsistent mixing of scales between the two
-        # branches.
         if normalize_qk:
-            C_local = F.normalize(H_proj.to(compute_dtype), dim=-1)  # [B, T, c]
+            C_local = _qk_normalize(H_proj.to(compute_dtype), qk_norm_mode)  # [B, T, c]
         else:
             C_local = H_proj.to(compute_dtype)
-        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
-        out = out + sw_out
+        # Partial RoPE on the sliding-window keys (§2.3.3: RoPE applies to
+        # the KV entry vectors used in CSA/HCA — the SW entries are such
+        # KV entries). Each key rotates at its own token position; the
+        # decoding cache's ring buffer applies the same
+        # normalize-then-rotate order at append time.
+        if rope_dim_eff > 0:
+            C_local = partial_rope(
+                C_local, token_positions(T, device), rope_dim_eff,
+                rope_base, dim=1)
+        scores_w, C_windows, win_valid = _sliding_window_scores(
+            q, C_local, win, scale, device)
+    else:
+        scores_w = torch.empty(B_, T, nh, 0, dtype=compute_dtype, device=device)
+        C_windows = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
+        win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
+
+    # JOINT softmax over the union of the top-k selected compressed
+    # blocks and the sliding-window tokens (DeepSeek-V4 §2.3.1 Eq. 27):
+    # one softmax over the concatenated scores, with the attention sink
+    # in the single shared denominator.
+    cat = torch.cat([scores, scores_w], dim=-1)                # [B, T, nh, topk+win]
+    cat_valid = torch.cat(
+        [valid_mask[:, :, None, :],
+         win_valid[None, :, None, :].expand(B_, -1, 1, -1)], dim=-1)
+    if cat.shape[-1] == 0:
+        out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
+    else:
+        if sink_logits is not None:
+            # Numerically stable logsumexp approach — keep sink_logits in log
+            # space (never exp it) and shift it by -row_max alongside every
+            # score so the largest exp() argument is 0.
+            log_sink = sink_logits.view(1, 1, nh, 1).to(cat)      # [1, 1, nh, 1]
+            vmask = cat_valid.to(cat.dtype)
+            row_max = cat.amax(-1, keepdim=True).clamp(min=0)     # [B, T, nh, 1]
+            shifted = cat - row_max
+            shifted_sink = log_sink - row_max
+            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
+            p = (shifted - log_denom).exp() * vmask
+            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            p = p.masked_fill(all_invalid, 0.0)
+        else:
+            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_invalid)
+
+        topk_size = scores.shape[-1]
+        p_b = p[..., :topk_size]
+        p_w = p[..., topk_size:]
+        out = (torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
+               + torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows))
+
+    # Partial RoPE output countermeasure (§2.3.3): because the compressed
+    # KV entries serve as both keys AND values, the naive output carries
+    # absolute-position rotations; inverse-rotating at the NEGATED query
+    # position makes each entry's contribution depend on the relative
+    # (entry − query) distance only.
+    if rope_dim_eff > 0:
+        out = partial_rope(
+            out, -token_positions(T, device), rope_dim_eff, rope_base, dim=1)
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
     # [B, T, nh*c]; the caller performs the grouped output projection.

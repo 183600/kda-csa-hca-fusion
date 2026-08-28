@@ -69,14 +69,28 @@ def _version_in_range(raw: str, lower: tuple[int, ...], upper: tuple[int, ...]) 
 
 
 def _ensure_deps():
-    """Ensure runtime packages exist within the repository's tested bounds.
+    """Ensure runtime packages exist; never fight a preinstalled environment.
 
-    Checking only whether packages import was insufficient:
-    Kaggle images can already contain an incompatible version, and the runner
-    would silently produce different numerical/figure behavior than the
-    pinned environment. Torch is never replaced in-process; an incompatible
-    torch version fails loudly with an install/restart instruction.
+    Kaggle notebook images ship recent, GPU-compatible builds of
+    torch / numpy / matplotlib. The historical behaviour — hard-rejecting
+    any version outside the originally-tested bounds and pip-installing
+    replacements in-place — made ``run_all.py`` CRASH on current Kaggle
+    images (e.g. a preloaded torch >= 2.7 or numpy >= 2.3 hit the
+    RuntimeError before a single experiment ran, and an in-place
+    downgrade of numpy can break the preinstalled torch stack).
+
+    Policy now:
+      * A MISSING package is still pip-installed (within the tested
+        bounds), because absent dependencies are always fatal.
+      * An INSTALLED package outside the historically-tested bounds only
+        triggers a WARNING: the repository's pure-PyTorch operator code
+        does not depend on version-sensitive APIs for CORRECTNESS. The
+        only expected variance is benchmark/softmax-baseline latency
+        (SDPA kernel selection changes across torch releases), which the
+        README already flags. Set ``STRICT_DEPS=1`` to restore the hard
+        version gate for bit-reproducible historical reruns.
     """
+    strict = os.environ.get('STRICT_DEPS', '0') == '1'
     bounded = {
         'einops': ('einops>=0.6,<0.9', (0, 6), (0, 9)),
         'matplotlib': ('matplotlib>=3.5,<3.11', (3, 5), (3, 11)),
@@ -90,15 +104,16 @@ def _ensure_deps():
         if installed is not None and _version_in_range(installed, lower, upper):
             continue
         if installed is not None:
-            if package in sys.modules:
+            if strict:
                 raise RuntimeError(
-                    f'{package}=={installed} is already loaded but outside the '
-                    f'tested range {spec}. Install the supported version and '
-                    'restart the Python process before running experiments.')
-            print(f'[run_all] {package}=={installed} is outside the tested range; '
-                  f'installing {spec}...')
-        else:
-            print(f'[run_all] installing {spec}...')
+                    f'{package}=={installed} is outside the tested range {spec} '
+                    'and STRICT_DEPS=1 is set. Install the supported version '
+                    'and restart the Python process before running experiments.')
+            print(f'[run_all] WARNING: {package}=={installed} is outside the '
+                  f'historically-tested range {spec}; continuing anyway. '
+                  '(Set STRICT_DEPS=1 to enforce the bounds.)')
+            continue
+        print(f'[run_all] installing {spec}...')
         subprocess.check_call([
             sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', spec,
         ])
@@ -114,33 +129,50 @@ def _ensure_deps():
 
     # SciPy is optional: run_quality/run_ablation have a documented exact
     # fallback for the required t-distribution calculations. Do not introduce
-    # a new network dependency on Kaggle just because SciPy is absent; only
-    # reject an installed SciPy version that is outside the tested range.
+    # a new network dependency on Kaggle just because SciPy is absent; an
+    # out-of-range installed SciPy only warns (see _ensure_deps docstring).
     try:
         scipy_version = importlib_metadata.version('scipy')
     except importlib_metadata.PackageNotFoundError:
         print('[run_all] scipy is not installed; using the repository statistical fallback.')
     else:
         if not _version_in_range(scipy_version, (1, 7), (1, 15)):
-            raise RuntimeError(
-                f'scipy=={scipy_version} is outside the tested range >=1.7,<1.15. '
-                'Install a supported version or remove it to use the exact fallback.')
+            if strict:
+                raise RuntimeError(
+                    f'scipy=={scipy_version} is outside the tested range >=1.7,<1.15 '
+                    'and STRICT_DEPS=1 is set. Install a supported version or '
+                    'remove it to use the exact fallback.')
+            print(f'[run_all] WARNING: scipy=={scipy_version} is outside the '
+                  'tested range >=1.7,<1.15; continuing with it (the exact '
+                  'fallback is used only when scipy is absent).')
 
-    # Do not silently run experiments against an untested torch release. In
-    # particular, SDPA/kernel-selection changes can alter the benchmark and
-    # quality numbers. If torch is absent, importing kaggle_setup below will
-    # produce its own dependency error; report a clearer message here.
+    # torch: only the LOWER bound is a hard requirement (the operator code
+    # uses no APIs newer than torch 2.2). A torch newer than the
+    # historically-tested 2.6 may change SDPA kernel selection and therefore
+    # softmax-baseline latency numbers; warn but proceed so current Kaggle
+    # images (torch >= 2.7 with CUDA) run out of the box. If torch is absent,
+    # importing kaggle_setup below will produce its own dependency error.
     try:
         torch_version = importlib_metadata.version('torch')
     except importlib_metadata.PackageNotFoundError as exc:
         raise RuntimeError(
             'torch is not installed; install the project dependencies before '
             'running run_all.py') from exc
-    if not _version_in_range(torch_version, (2, 2), (2, 7)):
+    if not _version_in_range(torch_version, (2, 2), (99, 0)):
         raise RuntimeError(
-            f'torch=={torch_version} is outside the tested range >=2.2,<2.7. '
-            'Install a supported torch build and restart the process before '
-            'running experiments.')
+            f'torch=={torch_version} is older than the required torch>=2.2. '
+            'Upgrade torch and restart the process before running experiments.')
+    if not _version_in_range(torch_version, (2, 2), (2, 7)):
+        if strict:
+            raise RuntimeError(
+                f'torch=={torch_version} is outside the tested range >=2.2,<2.7 '
+                'and STRICT_DEPS=1 is set. Install a supported torch build and '
+                'restart the process before running experiments.')
+        print(f'[run_all] WARNING: torch=={torch_version} is newer than the '
+              'historically-tested >=2.2,<2.7 range; correctness tests still '
+              'run, but softmax-baseline benchmark numbers may deviate from '
+              'the committed historical results (SDPA kernel-selection '
+              'changes across torch releases).')
 
 
 def _setup():

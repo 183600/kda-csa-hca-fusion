@@ -823,7 +823,21 @@ def _chunk_kda_prepare(
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # NOTE: ``diagonal=0`` (NOT ``diagonal=1``) is required here to match
+    # the FLA-referenced chunkwise-parallel KDA math (fla/ops/kda/naive.py)
+    # and the strictly-sequential recurrence. The mask covers the main
+    # diagonal AND the strict upper triangle; the subsequent
+    # ``A.masked_fill(mask, 0)`` then leaves ``A`` STRICTLY lower triangular
+    # (diagonal zeroed). With ``diagonal=1`` the diagonal entries
+    # ``A[i, i] = beta[i] * (k_i . k_i) * exp(0) = beta[i]`` (k is
+    # L2-normalised) survive into ``eye - A``, which decouples the
+    # triangular solve from the correct recurrent delta-rule and makes the
+    # chunk output/state diverge from ``naive_recurrent_kda`` by O(1e-2)
+    # (empirically max|o_diff| ~ 0.019; observed as 25 failing checks in
+    # run_correctness, including the fp64 gradient-agreement tests). This
+    # is a REGRESSION that an earlier review round had already fixed; the
+    # 2026-08 "LLM bug-fix pass" reverted it to diagonal=1. Do not revert.
+    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
     A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     for i in range(BT):
         k_i = k[..., i, :]

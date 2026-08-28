@@ -22,9 +22,15 @@ import torch.nn.functional as F
 from ops_csa import (
     csa_compress_kv,
     _causal_block_mask,
-    _sliding_window_attention,
+    _sliding_window_scores,
     _nan_safe_softmax,
-    CHUNKED_SW_THRESHOLD,
+    _qk_normalize,
+)
+from ops_rope import (
+    effective_rope_dim,
+    partial_rope,
+    token_positions,
+    block_positions,
 )
 
 
@@ -40,10 +46,14 @@ def naive_hca(
     nh: int,
     c: int,
     dc: int,
-    scale: float = 1.0,            # H7 fix: drop None sentinel (None → 1.0 anyway)
+    scale: float | None = None,
     sliding_window: int = 0,
     sink_logits: torch.Tensor | None = None,    # [nh]
     return_projections: bool = False,
+    W_KV_local: torch.Tensor | None = None,     # [c, d] local SW key/value projection
+    rope_dim: int | None = None,
+    rope_base: float = 10000.0,
+    qk_norm_mode: str = 'l2',
 ):
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
 
@@ -130,6 +140,22 @@ def naive_hca(
         raise ValueError(
             f"naive_hca: sink_logits.shape={tuple(sink_logits.shape)} must "
             f"equal (nh,)=({nh},)")
+    if W_KV_local is not None and W_KV_local.shape != (c, d):
+        raise ValueError(
+            f"naive_hca: W_KV_local.shape={tuple(W_KV_local.shape)} must "
+            f"equal (c, d)=({c}, {d})")
+    if qk_norm_mode not in ('l2', 'rms'):
+        raise ValueError(
+            f"naive_hca: qk_norm_mode={qk_norm_mode!r} must be 'l2' (cosine, "
+            f"historical) or 'rms' (paper §2.3.3 RMSNorm form)")
+    # Partial RoPE (DeepSeek-V4 §2.3.3): ``rope_dim=None`` (default)
+    # disables it and preserves the historical behaviour; the model-level
+    # wrappers default to the paper's 64-dim partial RoPE (clamped to the
+    # head dim for small geometries).
+    rope_dim_eff = effective_rope_dim(rope_dim, c)
+    if rope_base <= 0:
+        raise ValueError(
+            f"naive_hca: rope_base={rope_base!r} must be positive")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (see ``F.normalize`` calls below), their dot product is already a cosine
     # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
@@ -173,129 +199,110 @@ def naive_hca(
     n_blocks = T // m2
 
     # --- 1. Heavy KV compression (single branch, no overlap) ---
-    # P0 API fix: use F.linear with W in nn.Linear.weight layout [out, in].
     C = F.linear(H, W_KV)                                          # [B, T, c]
     Z = F.linear(H, W_Z)                                           # [B, T, c]
     C_comp = csa_compress_kv(C, Z, B_pos, m2)                     # [B, n_blocks, c] in compute_dtype
-    C_comp_n = F.normalize(C_comp, dim=-1)
+    # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
+    # rotated entry serves as BOTH the attention key and the attention
+    # value (shared-KV MQA). The anchor position of heavy-compressed entry
+    # ``s`` is ``s * m2`` (block start). Rotation happens BEFORE
+    # normalization — ``ops_decoding_cache.HCADecodingCache`` applies the
+    # same order (rotate at append time, normalize at read time) so the
+    # incremental decode path stays bit-identical to this path.
+    if rope_dim_eff > 0:
+        C_comp = partial_rope(
+            C_comp, block_positions(n_blocks, m2, device),
+            rope_dim_eff, rope_base, dim=1)
+    C_comp_n = _qk_normalize(C_comp, qk_norm_mode)
 
     # --- 2. Dense shared-KV MQA ---
-    # Dtype consistency: ``C_comp`` is returned by ``csa_compress_kv`` in
-    # ``compute_dtype`` (fp32 for fp16 inputs, fp64 for fp64 inputs). The
-    # downstream ``scores`` einsum mixes ``q`` (H.dtype) with ``C_comp_n``
-    # (compute_dtype); ``torch.einsum`` does NOT auto-promote mixed dtypes and
-    # raises ``RuntimeError`` for fp16/bf16 inputs. We cast ``q`` to
-    # ``compute_dtype`` before normalization so the entire attention core runs
-    # in one consistent precision. Mirrors the fix in ``ops_csa.py::naive_csa``.
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     cQ = F.linear(H, W_DQ)                                         # [B, T, dc]
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
-    q = F.normalize(q, dim=-1)
+    q = _qk_normalize(q, qk_norm_mode)
+    # Partial RoPE on the core-attention queries (§2.3.3): rotate each
+    # query at its own token position AFTER normalization (the decoding
+    # cache applies the same order: the caller normalizes ``q``, the cache
+    # rotates it).
+    if rope_dim_eff > 0:
+        q = partial_rope(
+            q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+    # Core-attention scale auto-selection: ``scale=None`` (the default)
+    # resolves to 1.0 for the historical cosine 'l2' mode (identical to the
+    # previous hard-coded default of 1.0) and to the standard 1/sqrt(c)
+    # temperature for the paper-form 'rms' mode. An explicit ``scale=`` is
+    # always honoured.
+    if scale is None:
+        scale = c ** -0.5 if qk_norm_mode == 'rms' else 1.0
 
-    # Causal block mask: query t attends to blocks whose full m2-token
-    # source windows have closed, i.e. b < (t + 1) // m2. The final token
-    # of a complete source window may attend to that compressed block because
-    # it contains no future positions. The sliding-window branch handles
-    # intra-block and near-context attention separately.
     cbm = _causal_block_mask(T, n_blocks, m2, device)
 
-    # Precompute all (B, T, n_blocks) attention logits at once (fully vectorized).
     scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * scale
     scores = scores.masked_fill(~cbm[None, None], float('-inf'))
-    if sink_logits is not None:
-        # Attention sink: a per-head constant added to the denominator.
-        # Numerically stable logsumexp approach — keep sink_logits in
-        # log space (never exp it, which could overflow to inf when the
-        # learnable parameter grows during training and makes denom=inf,
-        # p=0/inf=nan or inf/inf=nan). Mirrors the fix in ops_csa.py.
-        #
-        # The sink MUST be shifted by -row_max along with the scores:
-        #   p_i = exp(s_i - M) / (sum_j exp(s_j - M) + exp(sink - M))
-        # Without the shift the sink is over-weighted by exp(M), a
-        # systematic ~13% bias in the default c=64 config. See the
-        # detailed comment in ops_csa.py::naive_csa for the algebra.
-        log_sink = sink_logits.view(1, nh, 1, 1).to(scores)  # [1, nh, 1, 1]
-        # scores already carries -inf at causally-masked slots, so
-        # logsumexp/exp naturally yield 0 there; fully-masked rows also
-        # collapse to p=0 (logaddexp(-inf, log_sink) = log_sink,
-        # exp(-inf - log_sink) = 0) — PROVIDED log_sink is finite. If
-        # log_sink is also -inf (e.g. sink_logits diverged to -inf
-        # during training), then (shifted - log_denom) = (-inf - (-inf))
-        # = NaN. The all_masked guard below zeros out such rows so the
-        # downstream einsum produces 0 instead of NaN. Mirrors the guard
-        # in the ``else`` branch and in ``ops_csa.py::naive_csa``.
-        row_max = scores.amax(-1, keepdim=True).clamp(min=0)        # [B, nh, T, 1]
-        shifted = scores - row_max                                  # [B, nh, T, n_blocks]
-        shifted_sink = log_sink - row_max                           # [B, nh, T, 1]
-        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(lse, shifted_sink)              # [B, nh, T, 1]
-        p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks]
-        # NaN guard: zero out rows where every block is causally masked
-        # (e.g. t < m2). Without this, a -inf log_sink would produce NaN
-        # via (-inf - (-inf)) = NaN, and the einsum would propagate it.
-        all_masked = torch.isinf(scores).all(-1, keepdim=True)   # [B, nh, T, 1]
-        p = p.masked_fill(all_masked, 0.0)
-    else:
-        # H2 fix: delegate to shared _nan_safe_softmax helper (defined in
-        # ops_csa.py) instead of duplicating the 4-line all_masked /
-        # masked_fill / softmax / masked_fill block. Rows with no valid
-        # block to attend to (e.g. t < m2 under the causal block mask) are
-        # entirely -inf; the helper detects them and zeros their weights
-        # so the contribution is 0 instead of NaN.
-        p = _nan_safe_softmax(scores, dim=-1)
-    out = torch.einsum('b h t n, b n d -> b t h d', p, C_comp_n)   # [B, T, nh, c]
-
-    # --- 3. Sliding window branch (uncompressed local KV) ---
+        # --- 3. Sliding-window branch (uncompressed local KV) ---
     if sliding_window > 0:
         win = sliding_window
-        # P5 fix — TRUE O(T·win) sliding-window attention (was O(T²)).
-        #
-        # The previous implementation built a full ``[T, T]`` boolean mask
-        # (``win_mask``) and a full ``[B, nh, T, T]`` attention-scores tensor,
-        # then masked every entry outside the window to ``-inf`` before
-        # softmax. Even though only ``win`` entries per row were non-trivial,
-        # the dense matmul (``einsum('bthd,bnd->bhtn')``) and the dense
-        # softmax both did ``O(T²·nh·c)`` work — the window size ``win`` had
-        # NO effect on the compute cost. At ``T=2048`` this allocated and
-        # filled a 4M-entry scores tensor per call regardless of ``win``,
-        # defeating the whole purpose of a local-attention mechanism.
-        #
-        # The P5 fix used a banded / windowed-gather approach: left-pad
-        # ``C_local`` with ``win-1`` zero columns, use ``unfold`` to extract
-        # per-query windows of shape ``[B, T, win, c]``, compute scores ONLY
-        # over the ``win`` entries (``[B, T, nh, win]``), mask the left-edge
-        # padding slots to ``-inf``, softmax, and weighted-sum over the
-        # ``win`` dimension. This is ``O(T·win·nh·c)`` — the window size now
-        # genuinely controls the cost.
-        #
-        # Issue 2.2 fix: the ``unfold`` call still materialized a single
-        # ``[B, T, win, c]`` tensor — fine for ``T≤4k, win≤512`` but
-        # blowing up at ``T=64k, win=2k`` (≈32 GB). We now delegate to
-        # ``_sliding_window_attention`` (imported from ops_csa) which
-        # auto-engages a chunked path when ``T * win * c`` exceeds
-        # ``CHUNKED_SW_THRESHOLD`` (default 8M elements), keeping peak
-        # memory at ``O(chunk_t · win · c)``.
-        #
-        # Numerically identical to the old dense+mask approach (verified by
-        # ``test_hca_sliding_window_causality`` in run_correctness.py):
-        # softmax over the ``win`` non-masked entries of a row is the same
-        # whether the masked entries are materialized as ``-inf`` in a
-        # ``[T,T]`` tensor or absent from a ``[T,win]`` tensor.
-        #
-        # Dtype: cast C to compute_dtype so the SW branch matches the dense
-        # branch's precision. Without this, the SW softmax runs in H.dtype
-        # (e.g. fp16) while the dense softmax ran in compute_dtype (fp32) —
-        # an asymmetric precision loss that silently degrades the SW branch's
-        # contribution for fp16 inputs. Mirrors the fix in ops_csa.py.
-        C_local = F.normalize(C.to(compute_dtype), dim=-1)              # [B, T, c]
-        sw_out = _sliding_window_attention(q, C_local, win, scale, device)
-        out = out + sw_out
+        if W_KV_local is not None:
+            C_local_raw = F.linear(H, W_KV_local)                   # [B, T, c]
+        else:
+            C_local_raw = C
+        C_local = _qk_normalize(C_local_raw.to(compute_dtype), qk_norm_mode)  # [B, T, c]
+        # Partial RoPE on the sliding-window keys (§2.3.3): each key
+        # rotates at its own token position; the decoding cache's ring
+        # buffer applies the same normalize-then-rotate order at append
+        # time.
+        if rope_dim_eff > 0:
+            C_local = partial_rope(
+                C_local, token_positions(T, device), rope_dim_eff,
+                rope_base, dim=1)
+        scores_w, C_windows, win_valid = _sliding_window_scores(
+            q, C_local, win, scale, device)
+        scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
+    else:
+        scores_w = torch.empty(B_, nh, T, 0, dtype=compute_dtype, device=device)
+        C_windows = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
+        win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
 
-    # Return the raw per-head core-attention output [B, T, nh, c] flattened to
-    # [B, T, nh*c]; the caller performs the grouped output projection.
-    # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
-    # matches the input's original T (right-padding added zeros at the end,
-    # which never affect real-token outputs thanks to the causal block mask).
+    # --- 4. JOINT softmax over the union of compressed + window entries ---
+    # One softmax over the concatenated scores (DeepSeek-V4 §2.3.1 Eq. 27),
+    # with the attention sink in the single shared denominator. The sink is a
+    # *virtual* entry that appears ONLY in the denominator,
+    # ``denom = sum_i exp(s_i) + exp(sink)``. It does NOT contribute a value
+    # to the output: the expected KV of a virtual entry with no source tokens
+    # is zero, not a constant 1 broadcast across the head dim.
+    cat = torch.cat([scores, scores_w], dim=-1)                    # [B, nh, T, n_blocks+win]
+    if cat.shape[-1] == 0:
+        out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
+    elif sink_logits is not None:
+        log_sink = sink_logits.view(1, nh, 1, 1).to(cat)           # [1, nh, 1, 1]
+        row_max = cat.amax(-1, keepdim=True)                       # [B, nh, T, 1]
+        all_masked = torch.isneginf(row_max)                       # [B, nh, T, 1]
+        row_max_safe = torch.where(all_masked, torch.zeros_like(row_max), row_max)
+        shifted = cat - row_max_safe
+        shifted_sink = log_sink - row_max_safe
+        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+        log_denom = torch.logaddexp(lse, shifted_sink)             # [B, nh, T, 1]
+        p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks+win]
+        p = p.masked_fill(all_masked, 0.0)
+    else:
+        all_masked = cat.isinf().all(-1, keepdim=True)
+        p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_masked)
+
+    n_blk = scores.shape[-1]
+    p_dense = p[..., :n_blk]
+    p_w = p[..., n_blk:]
+    out = (torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
+           + torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
+
+    # Partial RoPE output countermeasure (§2.3.3): because the compressed
+    # KV entries serve as both keys AND values, the naive output carries
+    # absolute-position rotations; inverse-rotating at the NEGATED query
+    # position makes each entry's contribution depend on the relative
+    # (entry − query) distance only.
+    if rope_dim_eff > 0:
+        out = partial_rope(
+            out, -token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+
     out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
     if return_projections:
         # Return the 2 per-token KV compression projections (trimmed to

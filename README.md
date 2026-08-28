@@ -55,11 +55,12 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 .
 ├── ops_kda.py             # KDA reference: naive_recurrent_kda, naive_chunk_kda
 ├── ops_kda_backend.py     # Optional KDA backend adapter: reference / FLA / auto
+├── ops_rope.py            # Partial RoPE (DeepSeek-V4 §2.3.3) for CSA/HCA
 ├── ops_csa.py             # CSA: compress_kv (overlapped), lightning indexer, naive_csa
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
 ├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache (incremental decode)
 ├── ops_fused.py           # HybridConfig + KDAHybridLayer/CSAHybridLayer/HCAHybridLayer + HybridKCHAttention
-├── run_correctness.py     # 230+ regression checks (custom runner; pytest-importable)
+├── run_correctness.py     # 266 regression checks (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
 ├── run_quality.py         # Exp 4: MQAR associative-recall quality (multi-seed)
 ├── run_ablation.py        # Exp 5: KDA:CSA:HCA ratio ablation
@@ -146,7 +147,27 @@ import sys; sys.path.insert(0, '/kaggle/input/<your-dataset-name>')
 For GPU runs on Kaggle T4, follow the CUDA bootstrap procedure documented in
 `kaggle_setup.bootstrap_kaggle_cuda()` (install the CUDA wheel, then restart
 the kernel — `setup_kaggle()` only *verifies* CUDA availability, it does not
-install in-place).
+install in-place). On current Kaggle images torch ships WITH CUDA
+preinstalled, so the bootstrap is normally a no-op.
+
+Dependency policy for preinstalled environments: `run_all.py` no longer
+hard-rejects torch/numpy/matplotlib versions outside the historically-tested
+bounds — it WARNS and continues (the operator code has no version-sensitive
+API dependencies for correctness; only softmax-baseline benchmark latency may
+drift across torch releases). Missing packages are still installed. Set
+`STRICT_DEPS=1` to restore the hard version gate for bit-reproducible
+historical reruns. Correspondingly, `torch` has no upper bound in
+`requirements.txt` / `pyproject.toml` so `pip install -e .` never downgrades
+Kaggle's preinstalled CUDA torch; pin `torch==2.6.*` yourself to reproduce
+the committed historical numbers.
+
+Resource footprint on the Kaggle free tier (2×T4, 30h/week quota):
+`run_all.py` with the default knobs is CPU-scale (~10 minutes) — GPU is not
+required. The default `train_lm_autodl.py --kaggle` profile (d=256, 5 layers,
+seq 512, 500 optimizer steps) takes ~40 minutes on 2×T4 and a few GB of GPU
+memory — comfortably inside the free quota. `train_lm_autodl.py` also runs
+without `transformers`/`datasets` (char-level fallback tokenizer over
+synthetic text), so the pipeline executes even on a bare CPU session.
 
 ---
 
@@ -192,7 +213,7 @@ Environment knobs (set before launching):
 ## Tests
 
 ```bash
-# Custom runner (230+ checks, includes long-running correctness checks):
+# Custom runner (266 checks, includes long-running correctness checks):
 python run_correctness.py
 
 # pytest-compatible: the test functions use the standard `test_*` naming
@@ -436,19 +457,57 @@ cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
 * **Dropout unimplemented.** `HybridConfig.dropout != 0` raises
   `NotImplementedError` rather than silently no-op'ing. MQAR-scale models
   don't need dropout; larger runs should wire it in (or remove the field).
-* **Causal block mask is window-close based.** `_causal_block_mask` uses
-  `b < (t + 1) // m`: a compressed block becomes visible when its full
-  source window closes. For example, with `m=8`, the block covering
-  positions `0..7` is visible at query `t=7`; it is not future information
-  because the whole source window is complete. The decoding caches use the
-  same rule. This matches the DeepSeek-V4 cache/mask contract and is covered
-  by the boundary tests in `run_correctness.py`.
-* **Cosine scale is fixed at 1.0.** `naive_csa` / `naive_hca` L2-normalize
-  `q` and `C_comp` and use `scale=1.0` (a deliberate fix — the old
-  `c ** -0.5` flattened softmax). The repository experiments now also pass
-  `normalize_qk=True` for the CSA lightning indexer so top-k selection is
-  direction-based rather than dominated by q_idx / K_idx vector norms. No
-  learnable temperature is exposed. Pass `scale=` explicitly to override.
+* **Causal block mask is strictly preceding (paper-exact).**
+  `_causal_block_mask` uses `b < t // m` (DeepSeek-V4 Eq. 16: a query
+  attends only to blocks with index strictly below `floor(t/m)`).
+  A compressed block therefore first becomes visible at the first token
+  of the NEXT block; the query's own block — complete or not — is never
+  reachable through the sparse branch, and its local context is served
+  by the sliding-window branch instead (§2.3.3). The decoding caches and
+  the FLOPs accounting (`run_kv_cache.causal_block_entries`) use the
+  same rule. (Historical note: an earlier revision used the
+  window-close variant `b < (t + 1) // m`, which exposed the query's own
+  block at its final source token — causally safe but off-by-one against
+  the paper; aligned to the paper-exact mask in the 2026-08 fix pass
+  together with the partial-RoPE addition below.)
+* **Partial RoPE (DeepSeek-V4 §2.3.3) is implemented and ON by default at
+  the model level.** Queries, compressed KV entries (which serve as both
+  keys and values in the shared-KV MQA), and sliding-window keys are
+  rotated on their last `rope_dim` dims (paper value 64, auto-clamped to
+  the head dim `c` for the small experiment geometries), and the
+  core-attention output is inverse-rotated at the negated query position
+  so each KV entry's contribution carries the relative (entry − query)
+  distance. Interpretation choices the paper leaves open are documented
+  in `ops_rope.py`: compressed entry `s` is anchored at position `s·m`
+  (block start), and the output countermeasure rotates by −t (the query
+  position). `HybridConfig.csa_rope_dim` / `hca_rope_dim` default to 64;
+  set them to `None`/0 to disable (the pre-fix historical behaviour). The
+  raw operators (`naive_csa` / `naive_hca`) keep `rope_dim=None` as their
+  default for backward compatibility, and the incremental decoding
+  caches accept the same `rope_dim` / `rope_base` arguments — prefill and
+  token-by-token decoding agree to fp32 tolerance with RoPE enabled
+  (pinned by `test_csa_hca_rope_prefill_vs_cache`). The indexer is
+  intentionally NOT roped: §2.3.3 scopes RoPE to the core attention, and
+  Eq. 15–16 contain no positional term.
+* **Query/KV normalization: L2 by default, paper-form RMSNorm optional.**
+  §2.3.3 specifies an RMSNorm on each head of the queries and on the
+  compressed KV entries; the repository's historical behaviour L2-normalizes
+  both (cosine attention, `scale=1.0`). `naive_csa` / `naive_hca` accept
+  `qk_norm_mode='rms'` for the paper-form RMSNorm (values then keep norm
+  ~`sqrt(c)` and the standard `1/sqrt(c)` temperature is auto-selected,
+  mirroring how DeepSeek-V2/V3 combine per-head RMSNorm with standard
+  scaling). The paper does not pin the core-attention temperature, so
+  both forms are paper-compatible; `'l2'` remains the default so the
+  repository's historical experiment numbers stay reproducible.
+* **Cosine scale is fixed at 1.0 (default 'l2' mode).** `naive_csa` /
+  `naive_hca` L2-normalize `q` and `C_comp` and use `scale=1.0` (a
+  deliberate fix — the old `c ** -0.5` flattened softmax). The repository
+  experiments also pass `normalize_qk=True` for the CSA lightning indexer
+  so top-k selection is direction-based rather than dominated by
+  q_idx / K_idx vector norms — note this indexer normalization is a
+  repository-side choice, NOT a paper requirement (Eq. 15–16 define a
+  plain weighted ReLU dot product). No learnable temperature is exposed.
+  Pass `scale=` explicitly to override.
 
 ---
 
@@ -462,6 +521,30 @@ See `LICENSE`.
 ## 新增：真实LM训练 + AutoDL <120元 (2026-07)
 
 本仓库原有6个实验为正确性/benchmark/MQAR探针，新增 `train_lm_autodl.py` 使用 `ops_fused.HybridKCHAttention` 做真实语言模型训练，支持Kaggle和AutoDL，成本远低于120元。
+
+### 2026-08 论文对齐 + 回归修复（影响实验数值，请重新生成 results/）
+
+对照 arXiv:2510.26692 / arXiv:2606.19348 复审后修复：
+
+1. **KDA 分块路径回归修复（P0）**：此前一轮自动修复把 A 矩阵掩码从
+   `diagonal=0` 误改回 `diagonal=1`，导致 `naive_chunk_kda` /
+   `scripted_chunk_kda` 与递归路径偏差 O(1e-2)（25 项正确性检查失败，
+   含 fp64 梯度一致性）。已恢复 `diagonal=0` 并加注释防止再次回归。
+2. **因果块掩码 off-by-one（P2-1）**：`_causal_block_mask` 由窗口关闭式
+   `b < (t+1)//m` 改为论文 Eq. 16 的严格前置式 `b < t//m`。同步更新了
+   解码缓存、FLOPs 统计及对应测试。
+3. **补齐 §2.3.3 部分 RoPE 与输出逆旋转（P2-2）**：新增 `ops_rope.py`；
+   CSA/HCA 的 query、压缩 KV、滑窗 key 在末 `rope_dim` 维（论文值 64，
+   按头维钳位）旋转，输出按 −t 逆旋转。模型层默认开启；原始算子默认
+   关闭（向后兼容）；增量解码缓存同样支持。
+4. **滑窗分支改回 Eq. 27 联合 softmax**：压缩块与滑窗 token 共享单一
+   softmax 分母（含 sink），不再是两支路各自 softmax 后相加。
+5. 其他：`qk_norm_mode='rms'` 选项（论文 §2.3.3 RMSNorm 形式）；KDA 解码
+   fp16 状态往返精度修复；索引器 cosine 归一化归因注释修正；Kaggle
+   兼容（放宽 `run_all.py` 版本门禁为警告、取消 torch 上界）。
+
+正确性套件现为 266 项检查，全部通过。由于掩码与 RoPE 变更，CSA/HCA
+相关实验数值会有变化，请用 `python run_all.py` 重新生成 `results/`。
 
 ### 为什么不替换原有ops
 对比见 `COMPARISON.md`：原有 `ops_kda/csa/hca` 已处理g clamp, STE, sink, NaN-safe, chunked SW, decoding cache等20+处边界case，比早期toy实现更适合发论文。因此保留原实现，仅增加训练管线。

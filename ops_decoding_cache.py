@@ -108,6 +108,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import csa_lightning_indexer
 
 
@@ -477,6 +478,8 @@ class CSADecodingCache:
         win: int,
         device,
         dtype,
+        rope_dim: int | None = None,
+        rope_base: float = 10000.0,
     ):
         # Validate structural params up-front so a misconfigured cache
         # crashes at construction (not deep inside ``append_step``).
@@ -500,6 +503,20 @@ class CSADecodingCache:
         # needs this to decide whether to L2-normalize keys before
         # appending to the sliding-window ring buffer.
         self._normalize_qk: bool = True
+        # Partial RoPE (DeepSeek-V4 §2.3.3): the cache rotates the
+        # compressed KV entries at their block-anchor positions (``s*m``)
+        # when a block completes, rotates the sliding-window keys at
+        # their token positions when they are appended, rotates the query
+        # at the current token position inside ``forward_step``, and
+        # inverse-rotates the output at the negated query position — the
+        # same contract as the full-sequence ``naive_csa`` path, so the
+        # incremental decode stays equivalent to prefill. ``rope_dim=None``
+        # (default) disables RoPE and preserves the historical behaviour.
+        if rope_base <= 0:
+            raise ValueError(
+                f"CSADecodingCache: rope_base={rope_base!r} must be positive")
+        self.rope_dim_eff = effective_rope_dim(rope_dim, c)
+        self.rope_base = float(rope_base)
         self.reset()
 
     def reset(self) -> None:
@@ -728,9 +745,20 @@ class CSADecodingCache:
             if self._sw is not None:
                 if self._normalize_qk:
                     ca_norm_i = F.normalize(ca_i.squeeze(1).to(torch.float), dim=-1)
-                    self._sw.append(ca_norm_i.unsqueeze(1).to(self.dtype))
+                    ca_store_i = ca_norm_i.unsqueeze(1)
                 else:
-                    self._sw.append(ca_i.to(self.dtype))
+                    ca_store_i = ca_i
+                # Partial RoPE (§2.3.3): the SW key rotates at its own
+                # token position AFTER normalization — the same
+                # normalize-then-rotate order as ``naive_csa``'s
+                # sliding-window branch.
+                if self.rope_dim_eff > 0:
+                    pos_t = torch.tensor(
+                        [self._n_tokens_seen - 1], device=self.device)
+                    ca_store_i = partial_rope(
+                        ca_store_i.to(torch.float), pos_t,
+                        self.rope_dim_eff, self.rope_base, dim=1)
+                self._sw.append(ca_store_i.to(self.dtype))
             # If the accumulator is full, compress and push.
             if len(self._acc_Ca) == self.m:
                 # Stack the accumulated projections into [B, m, c] / [B, m, c_I].
@@ -750,6 +778,23 @@ class CSADecodingCache:
                 new_K_I = _indexer_compress_single(
                     K_idx_block, Z_idx_block, B_idx,
                 )                                                  # [B, c_I]
+                # Partial RoPE (§2.3.3): rotate the just-completed
+                # compressed KV entry at its block-anchor position
+                # ``block_idx * m`` (block_idx == self._n_blocks, the
+                # row this entry is about to occupy). The rotated entry
+                # serves as both key and value; rotation happens BEFORE
+                # storage — ``forward_step`` normalizes at read time,
+                # mirroring the rotate-then-normalize order of
+                # ``naive_csa``. The indexer key cache is NOT rotated
+                # (the paper scopes RoPE to the core attention, not
+                # the indexer scores).
+                if self.rope_dim_eff > 0:
+                    pos_b = torch.tensor(
+                        [self._n_blocks * self.m], device=self.device)
+                    new_C = partial_rope(
+                        new_C.unsqueeze(1), pos_b,
+                        self.rope_dim_eff, self.rope_base,
+                        dim=1).squeeze(1)                           # [B, c]
                 # P0-4 fix: the compress helpers upcast to fp32/fp64
                 # internally (compute_dtype) and return that dtype. Cast
                 # back to the cache's storage dtype before writing into the
@@ -861,19 +906,31 @@ class CSADecodingCache:
         )
         # The current query is at absolute position t = n_tokens_seen - 1
         # (we just appended it in ``append_step``). Its causal block
-        # mask is ``b < (t + 1) // m``: a block becomes visible when its
-        # source window closes. Blocks whose source window has not closed
-        # yet (including the partial block containing t) are excluded.
+        # mask is ``b < t // m`` (paper Eq. 16): a query attends only to
+        # STRICTLY PRECEDING compressed blocks — the query's own block
+        # (complete or not) is excluded; its local context is served by
+        # the sliding-window branch instead. This matches
+        # ``ops_csa._causal_block_mask`` exactly, so incremental decoding
+        # is equivalent to the full-sequence ``naive_csa`` path.
         t = self._n_tokens_seen - 1
-        # The block containing t is ``t // m``. It is visible only when
-        # its final source position has arrived, which is equivalent to
-        # ``b < (t + 1) // m``. A partial block is therefore kept out of
-        # the sparse path until it is complete.
+        # Partial RoPE (§2.3.3): rotate the query at its own token
+        # position AFTER the caller's normalization (the same
+        # normalize-then-rotate order as ``naive_csa``'s query path).
+        # The rotation applies to the last ``rope_dim_eff`` dims of each
+        # per-head vector; the head axis is untouched.
+        if self.rope_dim_eff > 0:
+            pos_t = torch.tensor([t], device=device)
+            q = partial_rope(
+                q.to(compute_dtype), pos_t,
+                self.rope_dim_eff, self.rope_base, dim=1)          # [B, 1, nh, c]
+        # The block containing t is ``t // m``. It is visible only from
+        # the NEXT block's queries onward (strictly-preceding rule), so a
+        # partial (or just-completed) block stays out of the sparse path
+        # for the queries inside it.
         #
         # The causal_block_mask passed to ``csa_lightning_indexer`` is
         # ``[T, n_blocks]`` (one row per query). With T=1, it is
-        # ``[1, n_blocks]`` with True for blocks whose source windows have
-        # closed before or at the current query position.
+        # ``[1, n_blocks]`` with True for the strictly-preceding blocks.
         # Core-attention scale: compute ONCE here so it is available to
         # BOTH the sparse branch (below) and the sliding-window branch
         # (further down). Previously ``core_scale`` was assigned INSIDE the
@@ -892,17 +949,24 @@ class CSADecodingCache:
             core_scale = scale
 
         if self._C_comp is None or self._n_blocks == 0:
-            # No compressed blocks yet — sparse branch contributes zero.
-            sparse_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            # No compressed blocks yet — no block scores.
+            scores = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
+            )
+            valid_mask = torch.empty(
+                B, 1, 0, dtype=torch.bool, device=device,
+            )
+            kv = torch.empty(
+                B, 1, 0, self.c, dtype=compute_dtype, device=device,
             )
         else:
             n_blocks = self._n_blocks
-            # Causal block mask: block b is valid iff
-            # b < (t + 1) // m. The block becomes visible when its
-            # source window closes, including the current token when it is
-            # the final token of that window.
-            b_threshold = (t + 1) // self.m
+            # Causal block mask (paper Eq. 16): block b is valid iff
+            # b < t // m — only STRICTLY PRECEDING blocks are visible to
+            # the query at position t. The block containing t (partial or
+            # just-completed) is excluded; its content is reachable via
+            # the sliding-window branch.
+            b_threshold = t // self.m
             cbm = torch.arange(n_blocks, device=device) < b_threshold   # [n_blocks]
             cbm = cbm[None, :]                                          # [1, n_blocks]
             # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
@@ -949,9 +1013,15 @@ class CSADecodingCache:
             # ``indices``: [B, 1, topk], padded with -1 for invalid slots.
             # ``soft_weights``: [B, 1, n_blocks] (differentiable).
             if indices.shape[-1] == 0:
-                # topk=0: sparse branch contributes zero.
-                sparse_out = torch.zeros(
-                    B, 1, nh, self.c, dtype=compute_dtype, device=device,
+                # topk=0: no block scores.
+                scores = torch.empty(
+                    B, 1, nh, 0, dtype=compute_dtype, device=device,
+                )
+                valid_mask = torch.empty(
+                    B, 1, 0, dtype=torch.bool, device=device,
+                )
+                kv = torch.empty(
+                    B, 1, 0, self.c, dtype=compute_dtype, device=device,
                 )
             else:
                 valid_mask = indices >= 0                              # [B, 1, topk]
@@ -965,7 +1035,7 @@ class CSADecodingCache:
                     )                                                  # [B, 1, topk]
                     soft_weights_selected = soft_weights_selected * \
                         valid_mask.to(soft_weights_selected.dtype)
-                    soft_kv = soft_weights_selected.unsqueeze(-1) * kv
+                    soft_kv = soft_weights_selected.unsqueeze(-1) * kv.detach()
                     if ste_mode == 'full_softmax':
                         soft_full = torch.einsum(
                             'btn,bnc->btc', soft_weights, C_comp_n,
@@ -991,31 +1061,13 @@ class CSADecodingCache:
                 ) * core_scale                                         # [B, 1, nh, topk]
                 scores = scores.masked_fill(
                     ~valid_mask[:, :, None, :], float('-inf'))
-                if sink_logits is not None:
-                    log_sink = sink_logits.view(1, 1, nh, 1).to(scores)
-                    vmask = valid_mask[:, :, None, :].to(scores.dtype)
-                    row_max = scores.amax(-1, keepdim=True).clamp(min=0)
-                    shifted = scores - row_max
-                    shifted_sink = log_sink - row_max
-                    log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-                    log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-                    p = (shifted - log_denom).exp() * vmask
-                    all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]
-                    p = p.masked_fill(all_invalid, 0.0)
-                else:
-                    all_invalid = ~valid_mask.any(-1, keepdim=True)[:, :, None]
-                    safe_scores = scores.masked_fill(all_invalid, 0.0)
-                    p = torch.softmax(safe_scores, dim=-1)
-                    p = p.masked_fill(all_invalid, 0.0)
-                sparse_out = torch.einsum(
-                    'b t h k, b t k d -> b t h d', p, kv,
-                )                                                      # [B, 1, nh, c]
 
-        # --- Sliding-window branch ---
+        # --- Sliding-window branch: window scores for the joint softmax ---
         if self._sw is None or self._sw.n_valid == 0:
-            sw_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            scores_w = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
             )
+            C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             # SW buffer contents in causal order: [B, sw_len, c]. When
             # normalize_qk=True (default), the buffer stores L2-normalized
@@ -1029,32 +1081,63 @@ class CSADecodingCache:
             # add a correctness test. Avoid runtime asserts on this
             # decode hot path.
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # The SW buffer stores keys that match the normalize_qk flag
-            # (append_step normalizes only when self._normalize_qk is True).
-            # When normalize_qk=False the buffer holds raw keys and we use
-            # core_scale = 1/sqrt(c) (dot-product attention), matching the
-            # sparse branch and the full-sequence naive_csa path.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
-            # Single-query SW attention: scores = q[0] · C_local^T
-            # => [B, nh, sw_len]. Softmax over sw_len. Out = p · C_local
-            # => [B, nh, c]. Reshape to [B, 1, nh, c].
-            scores = torch.einsum(
+            sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             ) * core_scale                                             # [B, nh, sw_len]
-            # No causal mask needed: the SW buffer's contents are
-            # EXACTLY the valid window for the newest query (positions
-            # [t - sw_len + 1, t], all of which are <= t). The naive
-            # path's left-edge masking (for queries near the start of
-            # the sequence whose window extends before position 0) is
-            # handled implicitly: when t < win-1, the buffer has fewer
-            # than win entries, so the softmax is over the actual
-            # entries present (no -inf padding required).
-            p = torch.softmax(scores, dim=-1)                          # [B, nh, sw_len]
-            sw_out = torch.einsum(
-                'b h s, b s d -> b h d', p, C_local,
-            ).unsqueeze(1)                                             # [B, 1, nh, c]
+            scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
-        return sparse_out + sw_out                                     # [B, 1, nh, c]
+        # JOINT softmax over [blocks; window] with the sink in the single
+        # shared denominator (matches full-sequence naive_csa; DeepSeek-V4
+        # §2.3.1 Eq. 27). The SW buffer holds EXACTLY the valid window for
+        # the newest query, so no -inf padding is needed for the window part.
+        n_win = scores_w.shape[-1]
+        cat = torch.cat([scores, scores_w], dim=-1)                    # [B, 1, nh, topk+sw_len]
+        if n_win:
+            cat_valid = torch.cat(
+                [valid_mask[:, :, None, :],
+                 torch.ones(B, 1, 1, n_win, dtype=torch.bool, device=device)],
+                dim=-1)
+        else:
+            cat_valid = valid_mask[:, :, None, :]
+        if cat.shape[-1] == 0:
+            return torch.zeros(B, 1, nh, self.c, dtype=compute_dtype, device=device)
+        if sink_logits is not None:
+            log_sink = sink_logits.view(1, 1, nh, 1).to(cat)
+            vmask = cat_valid.to(cat.dtype)
+            row_max = cat.amax(-1, keepdim=True).clamp(min=0)
+            shifted = cat - row_max
+            shifted_sink = log_sink - row_max
+            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
+            p = (shifted - log_denom).exp() * vmask
+            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            p = p.masked_fill(all_invalid, 0.0)
+        else:
+            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            safe = cat.masked_fill(all_invalid, 0.0)
+            p = torch.softmax(safe, dim=-1)
+            p = p.masked_fill(all_invalid, 0.0)
+
+        topk_size = scores.shape[-1]
+        p_b = p[..., :topk_size]
+        p_w = p[..., topk_size:]
+        sparse_out = torch.einsum(
+            'b t h k, b t k d -> b t h d', p_b, kv,
+        )                                                              # [B, 1, nh, c]
+        sw_out = torch.einsum(
+            'b t h w, b w d -> b t h d', p_w, C_local,
+        )                                                              # [B, 1, nh, c]
+        out = sparse_out + sw_out
+        # Partial RoPE output countermeasure (§2.3.3): inverse-rotate the
+        # core-attention output at the NEGATED query position so each KV
+        # entry's contribution carries the relative (entry − query)
+        # distance — mirroring ``naive_csa``'s output path.
+        if self.rope_dim_eff > 0:
+            pos_t = torch.tensor([t], device=device)
+            out = partial_rope(
+                out, -pos_t, self.rope_dim_eff, self.rope_base, dim=1)
+        return out                                                     # [B, 1, nh, c]
 
 
 # =============================================================================
@@ -1092,6 +1175,8 @@ class HCADecodingCache:
         win: int,
         device,
         dtype,
+        rope_dim: int | None = None,
+        rope_base: float = 10000.0,
     ):
         if B < 1:
             raise ValueError(f"B={B} must be >= 1")
@@ -1109,6 +1194,17 @@ class HCADecodingCache:
         # needs this to decide whether to L2-normalize keys before
         # appending to the sliding-window ring buffer.
         self._normalize_qk: bool = True
+        # Partial RoPE (DeepSeek-V4 §2.3.3) — same contract as
+        # CSADecodingCache / naive_hca: compressed entries rotate at their
+        # block-anchor positions (``s*m2``), SW keys at their token
+        # positions, the query at the current position, and the output is
+        # inverse-rotated at the negated query position. ``rope_dim=None``
+        # (default) disables RoPE and preserves the historical behaviour.
+        if rope_base <= 0:
+            raise ValueError(
+                f"HCADecodingCache: rope_base={rope_base!r} must be positive")
+        self.rope_dim_eff = effective_rope_dim(rope_dim, c)
+        self.rope_base = float(rope_base)
         self.reset()
 
     def reset(self) -> None:
@@ -1231,13 +1327,37 @@ class HCADecodingCache:
             if self._sw is not None:
                 if self._normalize_qk:
                     c_norm_i = F.normalize(c_i.squeeze(1).to(torch.float), dim=-1)
-                    self._sw.append(c_norm_i.unsqueeze(1).to(self.dtype))
+                    c_store_i = c_norm_i.unsqueeze(1)
                 else:
-                    self._sw.append(c_i.to(self.dtype))
+                    c_store_i = c_i
+                # Partial RoPE (§2.3.3): the SW key rotates at its own
+                # token position AFTER normalization — the same
+                # normalize-then-rotate order as ``naive_hca``'s SW
+                # branch.
+                if self.rope_dim_eff > 0:
+                    pos_t = torch.tensor(
+                        [self._n_tokens_seen - 1], device=self.device)
+                    c_store_i = partial_rope(
+                        c_store_i.to(torch.float), pos_t,
+                        self.rope_dim_eff, self.rope_base, dim=1)
+                self._sw.append(c_store_i.to(self.dtype))
             if len(self._acc_C) == self.m2:
                 C_block = torch.cat(self._acc_C, dim=1)              # [B, m2, c]
                 Z_block = torch.cat(self._acc_Z, dim=1)
                 new_C = _hca_compress_kv_single(C_block, Z_block, B_pos)  # [B, c]
+                # Partial RoPE (§2.3.3): rotate the just-completed heavy
+                # compressed entry at its block-anchor position
+                # ``block_idx * m2`` (block_idx == self._n_blocks).
+                # Rotation happens BEFORE storage; ``forward_step``
+                # normalizes at read time, mirroring the
+                # rotate-then-normalize order of ``naive_hca``.
+                if self.rope_dim_eff > 0:
+                    pos_b = torch.tensor(
+                        [self._n_blocks * self.m2], device=self.device)
+                    new_C = partial_rope(
+                        new_C.unsqueeze(1), pos_b,
+                        self.rope_dim_eff, self.rope_base,
+                        dim=1).squeeze(1)                           # [B, c]
                 # P0-4 fix: ``_hca_compress_kv_single`` returns fp32/fp64
                 # (compute_dtype) even when the cache stores fp16. Cast back
                 # to the storage dtype before writing the valid row.
@@ -1302,15 +1422,27 @@ class HCADecodingCache:
         else:
             core_scale = scale
         t = self._n_tokens_seen - 1
+        # Partial RoPE (§2.3.3): rotate the query at its own token
+        # position AFTER the caller's normalization (the same
+        # normalize-then-rotate order as ``naive_hca``'s query path).
+        if self.rope_dim_eff > 0:
+            pos_t = torch.tensor([t], device=device)
+            q = partial_rope(
+                q.to(compute_dtype), pos_t,
+                self.rope_dim_eff, self.rope_base, dim=1)          # [B, 1, nh, c]
         if self._C_comp is None or self._n_blocks == 0:
-            dense_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            scores = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
             )
+            C_comp_n = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             n_blocks = self._n_blocks
-            # A heavy-compression block is visible once its m2-token
-            # source window has closed.
-            b_threshold = (t + 1) // self.m2
+            # Causal block mask (paper Eq. 16, HCA variant): a
+            # heavy-compression block is visible iff ``b < t // m2`` —
+            # only strictly preceding blocks (the query's own block is
+            # excluded; its content is served by the SW branch). Matches
+            # ``ops_csa._causal_block_mask`` and ``naive_hca``.
+            b_threshold = t // self.m2
             cbm = torch.arange(n_blocks, device=device) < b_threshold
             cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
             # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
@@ -1333,44 +1465,58 @@ class HCADecodingCache:
                 'b t h d, b n d -> b t h n', q_compute, C_comp_n,
             ) * core_scale                                            # [B, 1, nh, n_blocks]
             scores = scores.masked_fill(~cbm[:, :, None, :], float('-inf'))
-            if sink_logits is not None:
-                log_sink = sink_logits.view(1, 1, nh, 1).to(scores)
-                row_max = scores.amax(-1, keepdim=True).clamp(min=0)
-                shifted = scores - row_max
-                shifted_sink = log_sink - row_max
-                lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-                log_denom = torch.logaddexp(lse, shifted_sink)
-                p = (shifted - log_denom).exp()
-                all_masked = torch.isinf(scores).all(-1, keepdim=True)
-                p = p.masked_fill(all_masked, 0.0)
-            else:
-                all_masked = torch.isinf(scores).all(-1, keepdim=True)
-                safe = scores.masked_fill(all_masked, 0.0)
-                p = torch.softmax(safe, dim=-1)
-                p = p.masked_fill(all_masked, 0.0)
-            dense_out = torch.einsum(
-                'b t h n, b n d -> b t h d', p, C_comp_n,
-            )                                                          # [B, 1, nh, c]
 
-        # --- Sliding-window branch ---
+        # --- Sliding-window branch: window scores for the joint softmax ---
         if self._sw is None or self._sw.n_valid == 0:
-            sw_out = torch.zeros(
-                B, 1, nh, self.c, dtype=compute_dtype, device=device,
+            scores_w = torch.empty(
+                B, 1, nh, 0, dtype=compute_dtype, device=device,
             )
+            C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            # The SW buffer stores keys that match the normalize_qk flag
-            # (append_step normalizes only when self._normalize_qk is True).
-            # When normalize_qk=False the buffer holds raw keys and we use
-            # core_scale = 1/sqrt(c) (dot-product attention), matching the
-            # dense branch and the full-sequence naive_hca path.
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
-            scores = torch.einsum(
+            sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             ) * core_scale                                            # [B, nh, sw_len]
-            p = torch.softmax(scores, dim=-1)                          # [B, nh, sw_len]
-            sw_out = torch.einsum(
-                'b h s, b s d -> b h d', p, C_local,
-            ).unsqueeze(1)                                             # [B, 1, nh, c]
+            scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
-        return dense_out + sw_out
+        # JOINT softmax over [compressed; window] with the sink in the single
+        # shared denominator (matches full-sequence naive_hca; DeepSeek-V4
+        # §2.3.1 Eq. 27).
+        cat = torch.cat([scores, scores_w], dim=-1)                    # [B, 1, nh, n_blocks+sw_len]
+        if cat.shape[-1] == 0:
+            return torch.zeros(B, 1, nh, self.c, dtype=compute_dtype, device=device)
+        if sink_logits is not None:
+            log_sink = sink_logits.view(1, 1, nh, 1).to(cat)
+            row_max = cat.amax(-1, keepdim=True).clamp(min=0)
+            shifted = cat - row_max
+            shifted_sink = log_sink - row_max
+            lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+            log_denom = torch.logaddexp(lse, shifted_sink)
+            p = (shifted - log_denom).exp()
+            all_masked = torch.isinf(cat).all(-1, keepdim=True)
+            p = p.masked_fill(all_masked, 0.0)
+        else:
+            all_masked = torch.isinf(cat).all(-1, keepdim=True)
+            safe = cat.masked_fill(all_masked, 0.0)
+            p = torch.softmax(safe, dim=-1)
+            p = p.masked_fill(all_masked, 0.0)
+        n_blk = scores.shape[-1]
+        p_dense = p[..., :n_blk]
+        p_w = p[..., n_blk:]
+        dense_out = torch.einsum(
+            'b t h n, b n d -> b t h d', p_dense, C_comp_n,
+        )                                                              # [B, 1, nh, c]
+        sw_out = torch.einsum(
+            'b t h w, b w d -> b t h d', p_w, C_local,
+        )                                                              # [B, 1, nh, c]
+        out = dense_out + sw_out
+        # Partial RoPE output countermeasure (§2.3.3): inverse-rotate the
+        # core-attention output at the NEGATED query position so each KV
+        # entry's contribution carries the relative (entry − query)
+        # distance — mirroring ``naive_hca``'s output path.
+        if self.rope_dim_eff > 0:
+            pos_t = torch.tensor([t], device=device)
+            out = partial_rope(
+                out, -pos_t, self.rope_dim_eff, self.rope_base, dim=1)
+        return out

@@ -75,8 +75,11 @@ DEFAULTS = dict(
 def causal_block_entries(T: int, m: int) -> int:
     """Count visible (query, compressed-block) pairs.
 
-    A compressed block becomes visible when its complete source window closes,
-    i.e. block ``b`` is available from query ``(b + 1) * m - 1`` onward.
+    Paper-exact strictly-preceding mask (Eq. 16): block ``s`` is visible
+    to query ``t`` iff ``s < floor(t / m)``. A block therefore first
+    becomes visible at query ``(s + 1) * m`` — the first token of the
+    NEXT block — and a query never sees its own block through the sparse
+    branch (the sliding-window branch serves that local context).
     """
     if not isinstance(T, int) or T < 0:
         raise ValueError(f'T must be a non-negative int, got {T!r}')
@@ -86,7 +89,13 @@ def causal_block_entries(T: int, m: int) -> int:
         return 0
     n_full = T // m
     remainder = T % m
-    return m * n_full * (n_full - 1) // 2 + n_full * (remainder + 1)
+    # sum_{t=0}^{T-1} floor(t/m): every complete block b < n_full
+    # contributes m queries that can see it (b*m .. (b+1)*m-1 all have
+    # floor(t/m) > b... i.e. floor(t/m) >= b+1 for t >= (b+1)*m).
+    # Direct derivation: sum floor(t/m) for t in [0, n_full*m + r):
+    #   = m * (0 + 1 + ... + (n_full-1)) + n_full * r
+    #   = m * n_full * (n_full - 1) // 2 + n_full * r.
+    return m * n_full * (n_full - 1) // 2 + n_full * remainder
 
 
 def geometric_capacity(n_rows: int) -> int:
@@ -99,7 +108,11 @@ def geometric_capacity(n_rows: int) -> int:
 
 
 def causal_selected_entries(T: int, m: int, topk: int) -> int:
-    """Count selected block slots after a top-k cap under block causality."""
+    """Count selected block slots after a top-k cap under block causality.
+
+    Uses the paper-exact strictly-preceding mask (Eq. 16): query ``t``
+    selects from ``floor(t / m)`` visible blocks, capped at ``topk``.
+    """
     if not isinstance(T, int) or T < 0:
         raise ValueError(f'T must be a non-negative int, got {T!r}')
     if not isinstance(m, int) or m < 1:
@@ -112,15 +125,18 @@ def causal_selected_entries(T: int, m: int, topk: int) -> int:
     remainder = T % m
     if n_full == 0:
         return 0
-    k_cap = min(topk, n_full)
-    if topk >= n_full:
+    # sum_{t=0}^{T-1} min(topk, floor(t/m)):
+    #   * queries in block b (b = 0..n_full-1, m queries each) see
+    #     min(topk, b) blocks (floor(t/m) = b for those queries).
+    #   * the trailing partial block's r queries see min(topk, n_full).
+    if topk >= n_full - 1:
         sum_before_last = n_full * (n_full - 1) // 2
     else:
         sum_before_last = (
             topk * (topk + 1) // 2
             + topk * (n_full - 1 - topk)
         )
-    return m * sum_before_last + (remainder + 1) * k_cap
+    return m * sum_before_last + remainder * min(topk, n_full)
 
 
 def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw):

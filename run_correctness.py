@@ -1145,10 +1145,10 @@ def test_csa_indexer_validity(device='cpu'):
     t_grid = torch.arange(T, device=device).view(T, 1).expand(T, idx_safe.shape[-1])
     causal_per_slot = cbm[t_grid, idx_safe[0]] | (indices[0] < 0)  # [T, topk]
     causal_ok = causal_per_slot.all().item()
-    # For early queries (t < m-1), the first source window is not closed,
-    # so all indices should be -1. At t=m-1 the first block is complete and
-    # becomes visible. Vectorized: (indices[0, :m-1] == -1).all().
-    early_ok = (indices[0, :max(0, m - 1)] == -1).all().item()
+    # For queries in the FIRST block (t < m), floor(t/m) = 0, so no
+    # strictly-preceding block exists and all indices should be -1.
+    # At t=m (first token of block 1) block 0 becomes visible.
+    early_ok = (indices[0, :m] == -1).all().item()
     # Count check: every query t should have exactly min(topk, (t + 1) // m)
     # valid (non -1) indices. The docstring promises this check but the
     # original implementation never performed it; a bug where the indexer
@@ -1157,7 +1157,7 @@ def test_csa_indexer_validity(device='cpu'):
     # query, not just a sample, so an off-by-one or wrong-padding bug at
     # any t is caught.
     expected_counts = torch.tensor(
-        [min(topk, (t + 1) // m) for t in range(T)], device=device)
+        [min(topk, t // m) for t in range(T)], device=device)
     actual_counts = (indices[0] >= 0).sum(-1)                   # [T]
     count_ok = (actual_counts == expected_counts).all().item()
 
@@ -1165,30 +1165,42 @@ def test_csa_indexer_validity(device='cpu'):
         _ok('CSA indices in range', in_range, f'topk={topk}, n_blocks={n_blocks}'),
         _ok('CSA indices causal', causal_ok, 'all selected blocks precede query'),
         _ok('CSA early queries empty', early_ok,
-            f'queries t<{m - 1} have no closed block -> all -1'),
+            f'queries t<{m} have no preceding block -> all -1'),
         _ok('CSA index count per query', count_ok,
-            f'each query t has min(topk={topk}, (t+1)//m) valid indices'),
+            f'each query t has min(topk={topk}, t//m) valid indices'),
     ]
 
 
 def test_causal_block_mask_window_close(device='cpu'):
-    """Boundary regression for the DeepSeek-V4 window-close contract."""
-    logger.info("Test: compressed block becomes visible when its source window closes")
+    """Boundary regression for the DeepSeek-V4 strictly-preceding mask.
+
+    Paper-exact contract (Eq. 16 + §2.3.3): a query attends only to
+    STRICTLY PRECEDING compressed blocks — ``s < floor(t / m)``. Block 0
+    (covering positions 0..m-1) is therefore hidden from every query in
+    its own block (t = 0..m-1) and first becomes visible at t = m, the
+    first token of the NEXT block. The historical window-close variant
+    ``b < (t + 1) // m`` wrongly exposed the block at t = m-1 (its own
+    last source token) — causally safe but off-by-one against the paper.
+    """
+    logger.info("Test: strictly-preceding block-causal mask boundary")
     T, m = 2 * 8 + 1, 8
     mask = _causal_block_mask(T, T // m, m, device)
     expected_counts = torch.tensor(
-        [(t + 1) // m for t in range(T)], device=device,
+        [t // m for t in range(T)], device=device,
     )
     actual_counts = mask.sum(dim=-1)
     boundary_ok = bool(torch.equal(actual_counts, expected_counts))
-    first_close_ok = bool(mask[7, 0].item()) if mask.shape[1] > 0 else False
-    first_before_close_ok = not bool(mask[6, 0].item())
+    # Block 0 must be hidden at t = m-1 (its own last source token) and
+    # visible at t = m (the first token of the next block).
+    hidden_before_ok = not bool(mask[m - 1, 0].item()) if mask.shape[1] > 0 else False
+    visible_at_ok = bool(mask[m, 0].item()) if mask.shape[1] > 0 else False
     return [
-        _ok("window-close mask counts", boundary_ok,
+        _ok("strictly-preceding mask counts", boundary_ok,
             f"expected={expected_counts.tolist()}, actual={actual_counts.tolist()}"),
-        _ok("first block visible at t=m-1",
-            first_close_ok and first_before_close_ok,
-            "block 0 is hidden at t=m-2 and visible at t=m-1"),
+        _ok("first block hidden at t=m-1, visible at t=m",
+            hidden_before_ok and visible_at_ok,
+            "block 0 serves only queries from the NEXT block onward "
+            "(paper Eq. 16: s < floor(t/m))"),
     ]
 
 
@@ -2021,7 +2033,9 @@ def test_hca_sliding_window_causality(device='cpu'):
     p_grid = torch.arange(T, device=device)[:, None]
     t_grid = torch.arange(T, device=device)[None, :]
     sw_affected = (t_grid >= p_grid) & (t_grid < p_grid + win)
-    dense_affected = t_grid >= ((p_grid // m2) + 1) * m2 - 1
+    #     (paper Eq. 16: the block containing p is visible only to
+    #      queries in strictly LATER blocks)
+    dense_affected = t_grid >= ((p_grid // m2) + 1) * m2
     expected_affected = sw_affected | dense_affected
 
     # Outside the expected region, diff must be ~0.  This covers both
@@ -2141,7 +2155,9 @@ def test_csa_full_pipeline_causality(device='cpu'):
     p_grid = torch.arange(T, device=device)[:, None]
     t_grid = torch.arange(T, device=device)[None, :]
     sw_affected = (t_grid >= p_grid) & (t_grid < p_grid + win)
-    sparse_affected = t_grid >= ((p_grid // m) + 1) * m - 1
+    #     (paper Eq. 16: the block containing p is visible only to
+    #      queries in strictly LATER blocks)
+    sparse_affected = t_grid >= ((p_grid // m) + 1) * m
     expected_affected = sw_affected | sparse_affected
 
     # Outside the expected region, diff must be ~0.  This covers both
@@ -5112,6 +5128,355 @@ def test_hybrid_decoding_cache_matches_full_sequence(device='cpu'):
         f'prefill_len={prefill_len}, n_decode={n_decode}, csa_topk=100')]
 
 
+def test_partial_rope_properties(device='cpu'):
+    """Unit properties of the partial RoPE (DeepSeek-V4 §2.3.3).
+
+    Verifies on ``ops_rope.partial_rope``:
+      1. Norm preservation (the rotation is orthogonal).
+      2. Inverse identity: rotating by negated positions undoes the
+         rotation (this is the core-attention OUTPUT countermeasure).
+      3. Relative property: <R(p1)x, R(p2)y> depends only on p1-p2 (the
+         RoPE score invariance the paper's queries/keys rely on).
+      4. The non-rotated leading dims are untouched (PARTIAL rope).
+      5. ``effective_rope_dim`` clamps to the head dim and to even values.
+    """
+    logger.info("Test: partial RoPE properties (§2.3.3)")
+    from ops_rope import partial_rope, effective_rope_dim, token_positions
+
+    torch.manual_seed(123)
+    results = []
+
+    # 1-2-4: norm preservation + inverse identity + partial-ness on a
+    # query-shaped tensor [B, T, nh, c] with the sequence axis at dim=1.
+    x = torch.randn(2, 7, 3, 16, dtype=torch.float64, device=device)
+    pos = token_positions(7, device)
+    xr = partial_rope(x, pos, 6, dim=1)
+    norm_ok = torch.allclose(
+        x.norm(dim=-1), xr.norm(dim=-1), atol=1e-12)
+    xi = partial_rope(xr, -pos, 6, dim=1)
+    inverse_ok = torch.allclose(x, xi, atol=1e-12)
+    # The leading (16 - 6) dims must be untouched.
+    partial_ok = torch.equal(x[..., :10], xr[..., :10])
+    results += [
+        _ok('partial_rope preserves norms', norm_ok, ''),
+        _ok('partial_rope inverse identity (negated positions)',
+            inverse_ok, f'max_err={(x - xi).abs().max().item():.2e}'),
+        _ok('partial_rope leaves non-rope dims untouched', partial_ok, ''),
+    ]
+
+    # 3: relative property.
+    xv = torch.randn(16, dtype=torch.float64, device=device)
+    yv = torch.randn(16, dtype=torch.float64, device=device)
+
+    def rot(v, p):
+        return partial_rope(
+            v.view(1, 1, 16), torch.tensor([p], device=device), 8, dim=1,
+        ).view(-1)
+
+    a = (rot(xv, 10) * rot(yv, 3)).sum()
+    b = (rot(xv, 20) * rot(yv, 13)).sum()
+    rel_ok = torch.allclose(a, b, atol=1e-12)
+    results.append(_ok(
+        'partial_rope relative property (score depends on p1-p2 only)',
+        rel_ok, f'a={a.item():.6f}, b={b.item():.6f}'))
+
+    # 5: effective_rope_dim clamping.
+    clamp_ok = (
+        effective_rope_dim(64, 32) == 32
+        and effective_rope_dim(64, 8) == 8
+        and effective_rope_dim(None, 32) == 0
+        and effective_rope_dim(0, 32) == 0
+        and effective_rope_dim(5, 8) == 4  # odd -> largest even below
+    )
+    results.append(_ok('effective_rope_dim clamping', clamp_ok, ''))
+    return results
+
+
+def test_csa_hca_rope_changes_output(device='cpu'):
+    """Sanity: the model-level partial-RoPE default actually engages.
+
+    The paper-faithful default (``HybridConfig.csa_rope_dim=64`` clamped
+    to the head dim) must change the CSA/HCA outputs relative to the
+    RoPE-disabled historical configuration — otherwise the wiring is
+    silently dead (e.g. a typo routing rope_dim=None everywhere).
+    """
+    logger.info("Test: partial RoPE default engages at module level")
+    from ops_fused import HybridConfig, CSAHybridLayer, HCAHybridLayer
+
+    torch.manual_seed(321)
+    results = []
+    for kind, layer_cls, m_field, c_field in [
+        ('CSA', CSAHybridLayer, 'csa_m', 'csa_c'),
+        ('HCA', HCAHybridLayer, 'hca_m2', 'hca_c'),
+    ]:
+        common = dict(
+            d_model=32, n_heads_qk=2, n_heads_v=2,
+            head_dim_k=8, head_dim_v=8,
+            csa_m=4, csa_topk=2, csa_nh=2, csa_c=8, csa_dc=16,
+            csa_nIh=2, csa_cI=4, csa_sliding_window=4,
+            hca_m2=8, hca_nh=2, hca_c=8, hca_dc=16, hca_sliding_window=4,
+            n_kda=0, n_csa=1, n_hca=1,
+        )
+        rope_kw = (
+            {'csa_rope_dim': 64} if kind == 'CSA' else {'hca_rope_dim': 64})
+        layer_on = layer_cls(HybridConfig(**common, **rope_kw)).to(device).eval()
+        layer_off = layer_cls(HybridConfig(
+            **common,
+            csa_rope_dim=None, hca_rope_dim=None)).to(device).eval()
+        # Copy the ON-model's weights into the OFF-model so the only
+        # difference is the RoPE.
+        layer_off.load_state_dict(layer_on.state_dict())
+        x = torch.randn(2, 16, 32, device=device) * 0.1
+        with torch.no_grad():
+            y_on, _ = layer_on(x)
+            y_off, _ = layer_off(x)
+        differs = not torch.allclose(y_on, y_off)
+        results.append(_ok(
+            f'{kind} partial RoPE changes output (default engaged)',
+            differs,
+            f'max_diff={(y_on - y_off).abs().max().item():.2e}'))
+    return results
+
+
+def test_csa_hca_rope_prefill_vs_cache(device='cpu'):
+    """Incremental decoding with partial RoPE == full-sequence naive path.
+
+    Mirrors ``test_csa_decoding_cache_correctness`` /
+    ``test_hca_decoding_cache_correctness`` but with ``rope_dim`` enabled
+    on BOTH the full-sequence operator and the decoding cache, pinning
+    the §2.3.3 contract end-to-end: compressed entries rotate at their
+    block-anchor positions, SW keys at their token positions, the query
+    at the current position, and the output is inverse-rotated.
+    """
+    logger.info("Test: RoPE decoding cache matches naive (CSA + HCA)")
+    import torch.nn.functional as F
+    from ops_decoding_cache import CSADecodingCache, HCADecodingCache
+
+    results = []
+
+    # --- CSA ---
+    torch.manual_seed(42)
+    d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8
+    topk, win = 100, 4
+    rope_dim = 8
+    p = _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=11)
+    T, B = 17, 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+    o_full = naive_csa(
+        H, p['W_aKV'], p['W_bKV'], p['W_aZ'], p['W_bZ'],
+        p['Ba'], p['Bb'], p['W_DQ'], p['W_UQ'], p['W_IUQ'],
+        p['W_w'], p['W_KV_idx'], p['W_Z_idx'], p['B_idx'],
+        m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+        sliding_window=win, sink_logits=None, use_ste=False,
+        normalize_qk=True, rope_dim=rope_dim,
+    )
+    cache = CSADecodingCache(
+        B, c, c_I, m, win, device, torch.float32, rope_dim=rope_dim)
+    outs = []
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = _project_csa_for_cache(
+            H_t, p, c, c_I, dc, nh, nIh)
+        cache.append_step(
+            Ca, Cb, Za, Zb, K_idx, Z_idx,
+            p['Ba'], p['Bb'], p['B_idx'])
+        q_n = F.normalize(q.to(torch.float), dim=-1)
+        o_t = cache.forward_step(
+            q_n, q_idx, w_idx, topk=topk, nh=nh, nIh=nIh, scale=1.0,
+            sink_logits=None, use_ste=False,
+        )
+        outs.append(o_t.reshape(B, 1, nh * c))
+    o_inc = torch.cat(outs, dim=1)
+    max_diff = (o_full - o_inc).abs().max().item()
+    results.append(_ok(
+        'csa_decoding_cache_matches_naive_rope',
+        max_diff < 1e-5,
+        f'max_diff={max_diff:.6e} (tol=1e-5), T={T}, m={m}, win={win}, '
+        f'topk={topk} (select-all), rope_dim={rope_dim}'))
+
+    # --- HCA ---
+    torch.manual_seed(42)
+    d, c, m2, nh, dc = 32, 8, 4, 2, 8
+    win = 4
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=12)
+    H = torch.randn(B, T, d, device=device) * 0.1
+    o_full = naive_hca(
+        H, p['W_KV'], p['W_Z'], p['B_pos'],
+        p['W_DQ'], p['W_UQ'],
+        m2=m2, nh=nh, c=c, dc=dc,
+        sliding_window=win, sink_logits=None, rope_dim=rope_dim,
+    )
+    cache = HCADecodingCache(
+        B, c, m2, win, device, torch.float32, rope_dim=rope_dim)
+    outs = []
+    for t in range(T):
+        H_t = H[:, t:t+1]
+        C, Z, q = _project_hca_for_cache(H_t, p, c, dc, nh)
+        cache.append_step(C, Z, p['B_pos'])
+        q_n = F.normalize(q.to(torch.float), dim=-1)
+        o_t = cache.forward_step(q_n, nh=nh, scale=1.0, sink_logits=None)
+        outs.append(o_t.reshape(B, 1, nh * c))
+    o_inc = torch.cat(outs, dim=1)
+    max_diff = (o_full - o_inc).abs().max().item()
+    results.append(_ok(
+        'hca_decoding_cache_matches_naive_rope',
+        max_diff < 1e-5,
+        f'max_diff={max_diff:.6e} (tol=1e-5), T={T}, m2={m2}, win={win}, '
+        f'rope_dim={rope_dim}'))
+    return results
+
+
+def test_csa_hca_rope_module_matches_naive(device='cpu'):
+    """CSAHybridLayer / HCAHybridLayer (rope cfg) == direct naive_* calls.
+
+    The module wrappers read ``HybridConfig.csa_rope_dim`` /
+    ``hca_rope_dim``; this test pins that the module path and an explicit
+    ``naive_csa`` / ``naive_hca`` call with the SAME rope parameters
+    produce identical outputs (guarding against config-wiring drift).
+    """
+    logger.info("Test: rope-enabled hybrid layers match direct naive calls")
+    from ops_fused import HybridConfig, CSAHybridLayer, HCAHybridLayer
+    from ops_csa import naive_csa as _naive_csa
+    from ops_hca import naive_hca as _naive_hca
+
+    torch.manual_seed(77)
+    d_model = 32
+    common = dict(
+        d_model=d_model, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        csa_m=4, csa_topk=2, csa_nh=2, csa_c=8, csa_dc=16,
+        csa_nIh=2, csa_cI=4, csa_sliding_window=4,
+        hca_m2=8, hca_nh=2, hca_c=8, hca_dc=16, hca_sliding_window=4,
+        n_kda=0, n_csa=1, n_hca=1,
+    )
+    results = []
+    B, T = 1, 18
+    x = torch.randn(B, T, d_model, device=device) * 0.1
+
+    # --- CSA ---
+    cfg = HybridConfig(**common)  # csa_rope_dim defaults to 64 -> clamp 8
+    layer = CSAHybridLayer(cfg).to(device).eval()
+    with torch.no_grad():
+        y_mod, _ = layer(x)
+        y_ref = layer.o_proj(_naive_csa(
+            x, layer.W_aKV.weight, layer.W_bKV.weight,
+            layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
+            layer.W_DQ.weight, layer.W_UQ.weight, layer.W_IUQ.weight,
+            layer.W_w.weight, layer.W_KV_idx.weight, layer.W_Z_idx.weight,
+            layer.B_idx,
+            m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh,
+            nIh=cfg.csa_nIh, c=cfg.csa_c, c_I=cfg.csa_cI, dc=cfg.csa_dc,
+            sliding_window=cfg.csa_sliding_window, sink_logits=layer.sink,
+            use_ste=layer.use_ste, normalize_qk=True,
+            rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.csa_qk_norm_mode,
+        ))
+    results.append(_ok(
+        'csa_hybrid_layer_rope_matches_naive',
+        torch.allclose(y_mod, y_ref, atol=1e-6),
+        f'max_diff={(y_mod - y_ref).abs().max().item():.2e}, '
+        f'effective rope_dim={min(64, cfg.csa_c)}'))
+
+    # --- HCA ---
+    layer = HCAHybridLayer(cfg).to(device).eval()
+    with torch.no_grad():
+        y_mod, _ = layer(x)
+        y_ref = layer.o_proj(_naive_hca(
+            x, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
+            layer.W_DQ.weight, layer.W_UQ.weight,
+            m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
+            sliding_window=cfg.hca_sliding_window, sink_logits=layer.sink,
+            rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.hca_qk_norm_mode,
+        ))
+    results.append(_ok(
+        'hca_hybrid_layer_rope_matches_naive',
+        torch.allclose(y_mod, y_ref, atol=1e-6),
+        f'max_diff={(y_mod - y_ref).abs().max().item():.2e}'))
+    return results
+
+
+def test_csa_hca_qk_norm_mode_rms(device='cpu'):
+    """``qk_norm_mode='rms'`` implements the paper §2.3.3 RMSNorm form.
+
+    Verifies against a MANUAL reference: RMSNorm(x) = x / sqrt(mean(x^2) + eps)
+    applied to the queries / compressed KV / SW keys, with the standard
+    1/sqrt(c) attention temperature the mode auto-selects. Also checks
+    that the mode VALIDATION rejects unknown values.
+    """
+    logger.info("Test: qk_norm_mode='rms' matches manual RMSNorm reference")
+    from ops_csa import _qk_normalize
+
+    torch.manual_seed(99)
+    results = []
+
+    # --- Unit: the RMSNorm form itself. ---
+    z = torch.randn(5, 16, dtype=torch.float64, device=device) * 3.0
+    ref = z / (z.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+    rms = _qk_normalize(z, 'rms')
+    l2 = _qk_normalize(z, 'l2')
+    form_ok = torch.allclose(rms, ref, atol=1e-12)
+    # RMSNorm keeps norm ~sqrt(D); L2-normalize makes it 1. The eps=1e-6
+    # inside the RMSNorm denominator perturbs the ratio slightly below
+    # sqrt(D), so use a 1e-4 relative tolerance (eps/mean(x^2) ~ 1e-7).
+    scale_rel = rms.norm(dim=-1).mean() / (l2.norm(dim=-1).mean() + 1e-12)
+    scale_ok = abs(scale_rel.item() - 4.0) < 1e-4  # sqrt(16)
+    results += [
+        _ok("rms mode matches x/sqrt(mean(x^2)+eps)", form_ok, ''),
+        _ok('rms norm ~ sqrt(D) vs l2 norm 1', scale_ok,
+            f'ratio={scale_rel.item():.4f} (expected ~4.0)'),
+    ]
+
+    # --- Integration: naive_hca('rms') == manual RMSNorm pipeline. ---
+    # Clean geometry: T divisible by m2, no sink, no SW — so the manual
+    # reference is a direct transcription of the paper pipeline:
+    # RMSNorm(q), RMSNorm(C_comp), logits = q.C_comp / sqrt(c), softmax
+    # over strictly-preceding blocks, values = the RMSNorm'd C_comp.
+    torch.manual_seed(100)
+    import torch.nn.functional as F
+    from ops_csa import csa_compress_kv, _causal_block_mask
+    d, c, m2, nh, dc = 32, 8, 4, 2, 8
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=13)
+    T, B = 16, 1
+    H = torch.randn(B, T, d, device=device) * 0.1
+    o_rms = naive_hca(
+        H, p['W_KV'], p['W_Z'], p['B_pos'], p['W_DQ'], p['W_UQ'],
+        m2=m2, nh=nh, c=c, dc=dc, sliding_window=0, sink_logits=None,
+        qk_norm_mode='rms',
+    )
+    C = F.linear(H, p['W_KV'])
+    Z = F.linear(H, p['W_Z'])
+    C_comp = csa_compress_kv(C, Z, p['B_pos'], m2)              # [B, nb, c]
+    q = F.linear(F.linear(H, p['W_DQ']), p['W_UQ']).view(B, T, nh, c)
+    rms = lambda v: v * torch.rsqrt(v.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    q_n = rms(q)
+    k_n = rms(C_comp)
+    cbm = _causal_block_mask(T, C_comp.shape[1], m2, device)
+    scores = torch.einsum('bthd,bnd->bhtn', q_n, k_n) * (c ** -0.5)
+    scores = scores.masked_fill(~cbm[None, None], float('-inf'))
+    p_attn = torch.softmax(scores, dim=-1)
+    p_attn = p_attn.masked_fill(p_attn.isnan(), 0.0)
+    out_ref = torch.einsum('bhtn,bnd->bthd', p_attn, k_n)
+    out_ref = out_ref.reshape(B, T, nh * c)
+    max_diff = (o_rms - out_ref).abs().max().item()
+    results.append(_ok(
+        'naive_hca rms mode matches manual RMSNorm reference',
+        max_diff < 1e-6,
+        f'max_diff={max_diff:.2e} (fp32, T={T}, m2={m2})'))
+
+    # --- Validation: unknown mode is rejected. ---
+    rejected = False
+    try:
+        naive_hca(H, p['W_KV'], p['W_Z'], p['B_pos'], p['W_DQ'], p['W_UQ'],
+                  m2=m2, nh=nh, c=c, dc=dc, sliding_window=0,
+                  qk_norm_mode='bogus')
+    except ValueError:
+        rejected = True
+    results.append(_ok("qk_norm_mode validation rejects unknown modes",
+                       rejected, ''))
+    return results
+
+
 def _run_safe(fn, device):
     """Run one test function with exception isolation.
 
@@ -5255,6 +5620,15 @@ def main():
     all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
     # Integrated Exp6 hybrid decode-cache path (KDA state + CSA/HCA caches).
     all_results += _run_safe(test_hybrid_decoding_cache_matches_full_sequence, device)
+    # Partial RoPE (DeepSeek-V4 §2.3.3) — paper-faithful positional
+    # embedding for CSA/HCA: unit properties, module wiring, and
+    # incremental-decode equivalence with the full-sequence operators.
+    all_results += _run_safe(test_partial_rope_properties, device)
+    all_results += _run_safe(test_csa_hca_rope_changes_output, device)
+    all_results += _run_safe(test_csa_hca_rope_prefill_vs_cache, device)
+    all_results += _run_safe(test_csa_hca_rope_module_matches_naive, device)
+    # qk_norm_mode='rms' — the paper §2.3.3 RMSNorm normalization form.
+    all_results += _run_safe(test_csa_hca_qk_norm_mode_rms, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

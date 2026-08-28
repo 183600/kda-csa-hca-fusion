@@ -20,7 +20,15 @@
 # both files should now agree. We also add the dev tools (pytest, mypy, ruff) so
 # ``pip install -r requirements.txt`` brings in the full dev toolchain
 # (matching ``pip install -e .[dev]``).
-torch>=2.2,<2.7
+# torch has NO upper bound: the historical results were generated with
+# torch 2.3-2.6, but Kaggle notebook images ship newer GPU builds
+# (torch >= 2.7 with CUDA). Pinning <2.7 here would force pip to
+# DOWNGRADE the preinstalled CUDA torch on `pip install -e .`, breaking
+# GPU availability. The operator code uses no APIs newer than torch 2.2;
+# the only cross-version variance is softmax-baseline benchmark latency
+# (SDPA kernel selection). Pin `torch==2.6.*` yourself for a
+# bit-reproducible rerun of the committed historical numbers.
+torch>=2.2
 einops>=0.6,<0.9
 matplotlib>=3.5,<3.11
 numpy>=1.21,<2.3

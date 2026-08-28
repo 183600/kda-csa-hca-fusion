@@ -446,6 +446,15 @@ SMALL_MODEL_SPEC = {
     'hca_m2':     8,    # heavy compression (2x CSA's m=4)
     'hca_nh':     2,
     'hca_sliding_window': 4,
+    # Partial RoPE (DeepSeek-V4 §2.3.3) for the CSA/HCA core attention —
+    # paper-faithful default: rotate the last 64 dims of the queries /
+    # compressed KV entries / sliding-window keys and inverse-rotate the
+    # core-attention output. Clamped to the head dim (c=32 -> rope_dim
+    # 32) for this small spec. Set to None/0 to disable (the historical
+    # pre-fix behaviour).
+    'csa_rope_dim': 64,
+    'hca_rope_dim': 64,
+    'rope_base':  10000.0,
 }
 
 
@@ -728,6 +737,9 @@ class CSAAttn(nn.Module):
             # Use cosine-style indexer scoring for the quality experiment so
             # top-k selection is not confounded by q_idx / K_idx vector norms.
             normalize_qk=True,
+            # Partial RoPE (DeepSeek-V4 §2.3.3), paper-faithful default.
+            rope_dim=SMALL_MODEL_SPEC.get('csa_rope_dim', 64),
+            rope_base=SMALL_MODEL_SPEC.get('rope_base', 10000.0),
         )
         return self.o(o)
 
@@ -762,7 +774,11 @@ class HCAAttn(nn.Module):
                       self.W_DQ.weight, self.W_UQ.weight,
                       m2=self.m2, nh=self.nh, c=self.c, dc=self.dc,
                       sliding_window=SMALL_MODEL_SPEC['hca_sliding_window'],
-                      sink_logits=self.sink)
+                      sink_logits=self.sink,
+                      # Partial RoPE (DeepSeek-V4 §2.3.3), paper-faithful
+                      # default.
+                      rope_dim=SMALL_MODEL_SPEC.get('hca_rope_dim', 64),
+                      rope_base=SMALL_MODEL_SPEC.get('rope_base', 10000.0))
         return self.o(o)
 
 

@@ -45,7 +45,9 @@ dependencies = [
     # breaking release and produce numerically different results from
     # the published ones. The bounded ranges below match the versions
     # used to generate the committed historical results.
-    "torch>=2.2,<2.7",
+    # torch has NO upper bound so `pip install -e .` never downgrades
+    # Kaggle's preinstalled CUDA torch (see requirements.txt).
+    "torch>=2.2",
     "einops>=0.6,<0.9",
     "matplotlib>=3.5,<3.11",
     "numpy>=1.21,<2.3",
@@ -99,6 +101,7 @@ fla = [
 py-modules = [
     "ops_kda",
     "ops_kda_backend",
+    "ops_rope",
     "ops_csa",
     "ops_hca",
     "ops_fused",
@@ -147,7 +150,7 @@ markers = [
 # report. Without this, coverage defaults to skipping the ``ops_*`` modules
 # (the actual library code) and only covering the test files themselves.
 [tool.coverage.run]
-source = ["ops_kda", "ops_csa", "ops_hca", "ops_fused", "ops_decoding_cache"]
+source = ["ops_kda", "ops_rope", "ops_csa", "ops_hca", "ops_fused", "ops_decoding_cache"]
 branch = true
 omit = [
     "run_*",       # experiment runners (not library code)
