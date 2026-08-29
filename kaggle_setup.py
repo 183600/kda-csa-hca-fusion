@@ -28,7 +28,9 @@ GPU we must install the CUDA wheel. We do this *only* when:
   2. ``torch.cuda.is_available()`` is False, AND
   3. an NVIDIA GPU is visible to ``nvidia-smi``.
 
-This keeps the local CPU workflow untouched.
+This keeps the local CPU workflow untouched. On current Kaggle GPU images
+torch already ships WITH CUDA, so the bootstrap is normally a no-op; it is
+the rescue path for the (rarer) CPU-only-torch images.
 """
 
 from __future__ import annotations
@@ -72,22 +74,42 @@ _PYTORCH_WHEEL_INDEX_URLS = {
 }
 
 # Fallback wheel when the driver-reported CUDA version cannot be probed.
-# Known to work on Kaggle T4 (sm_75): torch 2.6.0 ships cu118/cu121/cu124
+# Known to work on Kaggle T4 (sm_75): torch 2.6.0 ships cu118/cu124/cu126
 # wheels, and the driver on current GPU images is >= 12.4.
 _DEFAULT_CUDA_WHEEL_KEY = "cu124"
 
-# The exact torch version the bootstrap installs. 2.6.0 is the LAST release
-# with wheels on the cu121/cu124 indexes and is validated on Kaggle T4
-# (sm_75). Pinning an exact version (instead of a range) + --force-reinstall
-# guarantees the CPU-only build is actually REPLACED: with a range like
-# ``torch>=2.2,<2.7``, an image that already ships CPU-only torch 2.6.0
-# satisfies the requirement and pip would silently keep the CPU build.
-_BOOTSTRAP_TORCH_PIN = "torch==2.6.0"
+# Per-index EXACT torch pins for the CUDA bootstrap. The pin must satisfy TWO
+# constraints simultaneously:
+#
+#   (a) An exact pin + ``--force-reinstall`` is REQUIRED to guarantee the
+#       CPU-only build is actually REPLACED: with a range like
+#       ``torch>=2.2,<2.7``, an image that already ships CPU-only torch 2.6.0
+#       satisfies the requirement and pip would silently keep the CPU build.
+#
+#   (b) The pinned version MUST publish a ``+cuXXX`` wheel on the SELECTED
+#       index. Because the install uses ``--extra-index-url`` (PyPI stays the
+#       primary index), a pin with no wheel on the CUDA index makes pip fall
+#       back to PyPI — whose Linux torch wheels are CPU-ONLY — so the install
+#       "succeeds" while torch still has no CUDA, and the restart loop below
+#       never converges. Verified against download.pytorch.org/whl/<idx>/torch/:
+#         cu118: 2.6.0+cu118 exists
+#         cu121: last release is 2.5.1+cu121 (2.6.0 has NO cu121 wheel)
+#         cu124: 2.6.0+cu124 exists
+#         cu126: 2.6.0+cu126 exists
+#         cu128: wheels start at 2.7.0+cu128 (2.6.0 has NO cu128 wheel)
+#       All pinned versions support sm_75 (Kaggle T4).
+_BOOTSTRAP_TORCH_PINS = {
+    "cu118": "torch==2.6.0",
+    "cu121": "torch==2.5.1",
+    "cu124": "torch==2.6.0",
+    "cu126": "torch==2.6.0",
+    "cu128": "torch==2.7.1",
+}
 
 
-def _detect_cuda_wheel_index() -> str:
+def _detect_cuda_wheel_key() -> str:
     """Probe ``nvidia-smi`` for the driver-reported CUDA version and return the
-    best matching PyTorch wheel index URL.
+    best matching PyTorch wheel index KEY (``cu118`` .. ``cu128``).
 
     Selection rules (newest wheel index whose runtime does not exceed the
     driver; a NEWER driver with an OLDER runtime is always compatible):
@@ -102,7 +124,6 @@ def _detect_cuda_wheel_index() -> str:
     its output cannot be parsed (e.g. older drivers that don't print the
     ``CUDA Version:`` header).
     """
-    fallback = _PYTORCH_WHEEL_INDEX_URLS[_DEFAULT_CUDA_WHEEL_KEY]
     try:
         out = subprocess.run(
             ["nvidia-smi"],
@@ -112,27 +133,32 @@ def _detect_cuda_wheel_index() -> str:
             timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return fallback
+        return _DEFAULT_CUDA_WHEEL_KEY
     if out.returncode != 0:
-        return fallback
+        return _DEFAULT_CUDA_WHEEL_KEY
     # nvidia-smi prints a header line like:
     #   | NVIDIA-SMI 535.104.05  Driver Version: 535.104.05  CUDA Version: 12.2 |
     m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out.stdout)
     if m is None:
-        return fallback
+        return _DEFAULT_CUDA_WHEEL_KEY
     try:
         major, minor = int(m.group(1)), int(m.group(2))
     except ValueError:
-        return fallback
+        return _DEFAULT_CUDA_WHEEL_KEY
     if (major, minor) >= (12, 8):
-        return _PYTORCH_WHEEL_INDEX_URLS["cu128"]
+        return "cu128"
     if (major, minor) >= (12, 6):
-        return _PYTORCH_WHEEL_INDEX_URLS["cu126"]
+        return "cu126"
     if (major, minor) >= (12, 4):
-        return _PYTORCH_WHEEL_INDEX_URLS["cu124"]
+        return "cu124"
     if (major, minor) >= (12, 1):
-        return _PYTORCH_WHEEL_INDEX_URLS["cu121"]
-    return _PYTORCH_WHEEL_INDEX_URLS["cu118"]
+        return "cu121"
+    return "cu118"
+
+
+def _detect_cuda_wheel_index() -> str:
+    """Return the PyTorch wheel index URL for the detected CUDA runtime."""
+    return _PYTORCH_WHEEL_INDEX_URLS[_detect_cuda_wheel_key()]
 
 
 def is_kaggle() -> bool:
@@ -299,9 +325,19 @@ def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
     if verbose:
         print("[kaggle_setup] Kaggle + NVIDIA GPU detected but torch has no CUDA.")
         print("[kaggle_setup] Installing CUDA torch wheel (this happens once)...")
-    index_url = _detect_cuda_wheel_index()
+    index_key = _detect_cuda_wheel_key()
+    index_url = _PYTORCH_WHEEL_INDEX_URLS[index_key]
+    # Per-index exact pin (see the _BOOTSTRAP_TORCH_PINS comment block): the
+    # pinned version must actually publish a +cuXXX wheel on the SELECTED
+    # index, otherwise pip silently falls back to PyPI's CPU-only build of
+    # the same version and the bootstrap reports success while CUDA stays
+    # unavailable (restart loop that never converges).
+    torch_pin = _BOOTSTRAP_TORCH_PINS.get(
+        index_key, _BOOTSTRAP_TORCH_PINS[_DEFAULT_CUDA_WHEEL_KEY])
     if verbose:
         print(f"[kaggle_setup] Using PyTorch wheel index: {index_url}")
+        print(f"[kaggle_setup] Installing {torch_pin} (pin matched to the "
+              f"{index_key} index).")
     # Use ``--extra-index-url`` instead of ``--index-url``: the latter
     # REPLACES PyPI entirely, which breaks resolution of any non-torch
     # dependency that torch wheels pull in (e.g. ``typing-extensions``,
@@ -309,7 +345,7 @@ def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
     # source and adds the PyTorch wheel index as a fallback.
     #
     # CRITICAL: ``--force-reinstall`` with an EXACT version pin
-    # (``_BOOTSTRAP_TORCH_PIN``) is REQUIRED. Without it, pip treats the
+    # (``torch_pin``) is REQUIRED. Without it, pip treats the
     # already-installed (CPU-only) torch as satisfying the requirement and
     # does NOTHING — including when the installed CPU version numerically
     # matches the pin. A range pin (e.g. ``torch>=2.2,<2.7``) has the same
@@ -319,8 +355,33 @@ def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
         sys.executable, "-m", "pip", "install", "-q",
         "--force-reinstall",
         "--upgrade-strategy", "only-if-needed",
-        _BOOTSTRAP_TORCH_PIN, "--extra-index-url", index_url,
+        torch_pin, "--extra-index-url", index_url,
     ])
+    # Post-install sanity check: the wheel that landed on disk must be a
+    # CUDA build (version carries a ``+cuXXX`` local tag). Query pip in a
+    # FRESH subprocess — the current process already imported the old
+    # CPU-only torch, and in-process importlib.metadata may serve cached
+    # distribution metadata. If the tag is missing, pip fell back to the
+    # CPU-only PyPI wheel (pin has no wheel on the selected index) and
+    # telling the user to restart would loop forever.
+    show = subprocess.run(
+        [sys.executable, "-m", "pip", "show", "torch"],
+        capture_output=True, text=True, check=False, timeout=120,
+    )
+    m = re.search(r"^Version:\s*(\S+)\s*$", show.stdout, re.M)
+    installed_version = m.group(1) if m else "unknown"
+    if not re.search(r"\+cu\d+", installed_version):
+        raise RuntimeError(
+            f"[kaggle_setup] The bootstrap installed torch=={installed_version} "
+            f"from the {index_key} index, but it is NOT a CUDA build (the "
+            f"version string has no '+cuXXX' local tag — pip fell back to the "
+            f"CPU-only PyPI wheel). This means the exact pin "
+            f"{torch_pin!r} has no matching wheel on {index_url}. "
+            "The kernel restart below would NOT help; please report this "
+            "so the _BOOTSTRAP_TORCH_PINS entry for this index can be "
+            "updated to a version that actually publishes a CUDA wheel "
+            "there."
+        )
     # The install succeeded, but the CURRENT process still has the old
     # CPU-only torch loaded. Force the caller to restart.
     raise RuntimeError(

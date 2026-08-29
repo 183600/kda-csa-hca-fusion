@@ -16,7 +16,7 @@
 
 | 维度 | 早期 toy 实现 | 仓库 ops 实现（保留） |
 |---|---|---|
-| 可运行性 | 依赖缺失模块，import 即失败 | `run_correctness.py` 252 项回归检查全通过 |
+| 可运行性 | 依赖缺失模块，import 即失败 | `run_correctness.py` 267 项回归检查全通过 |
 | KDA 数值稳定性 | 未 clamp log 衰减门 `g` | `g_clamp_min=-10` 截断 + 非有限输出告警 + q/k 单位范数契约文档化 |
 | KDA 路径 | 仅朴素递归 | 递归 + chunkwise 双路径（互验至 fp32 舍入误差），可选 `torch.compile` / TorchScript / FLA 后端 |
 | CSA 索引器梯度 | top-k 整数索引截断梯度，索引器参数训不动 | 直通估计器（STE，`topk_columns` / `full_softmax` 两种模式），训练期可学、推理期自动跳过 soft 代理 |
@@ -26,7 +26,7 @@
 | 增量解码 | 无 | `CSADecodingCache` / `HCADecodingCache`：部分 token 累积器、压缩块缓存、滑动窗口环形缓冲、CSA 索引器键缓存（与全序列前向逐 token 对齐验证） |
 | 空序列 / 退化输入 | 未定义行为 | `T=0`、`topk=0`、`m=0`、空 batch、`k > n_blocks` 等边界均有显式契约与测试 |
 | 形状 / dtype / device | 无校验，错位输入静默广播 | 集中式 `_validate_*`：rank、GVA 整除、dtype 一致、device 一致，报错信息含期望形状 |
-| 因果性 | 仅 token 级 | token 级 + 块级（window-close 规则 `b < (t+1)//m`，边界测试覆盖） |
+| 因果性 | 仅 token 级 | token 级 + 块级（论文 Eq. 16 严格前置规则 `b < t//m`，边界测试覆盖） |
 | 状态管理 | 层间共享 / 泄漏 | 每层独立 KDA 递归态 + conv lookback，`reset_state()` 统一清理，非持久 buffer 不进 checkpoint |
 | 实验可解释性 | 无 | KV-cache/FLOPs 解析模型（含 ceil 块数、因果项、投影项修正）+ 手算单测 |
 

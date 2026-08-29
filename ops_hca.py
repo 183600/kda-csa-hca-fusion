@@ -215,13 +215,16 @@ def naive_hca(
             C_local = partial_rope(
                 C_local, token_positions(T, device), rope_dim_eff,
                 rope_base, dim=1)
-        scores_w, C_windows, win_valid = _sliding_window_scores(
+        # The third return value (per-window validity mask) is not needed
+        # here: unlike naive_csa, HCA's softmax consumes ``scores_w`` alone
+        # (already ``-inf``-masked for the left padding inside
+        # ``_sliding_window_scores``), so the mask is intentionally dropped.
+        scores_w, C_windows, _ = _sliding_window_scores(
             q, C_local, win, scale, device)
         scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
     else:
         scores_w = torch.empty(B_, nh, T, 0, dtype=compute_dtype, device=device)
         C_windows = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
-        win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
 
     # --- 4. JOINT softmax over the union of compressed + window entries ---
     # One softmax over the concatenated scores (DeepSeek-V4 §2.3.1 Eq. 27),

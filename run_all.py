@@ -94,10 +94,16 @@ def _ensure_deps():
         version gate for bit-reproducible historical reruns.
     """
     strict = os.environ.get('STRICT_DEPS', '0') == '1'
+    # Advisory "historically-tested" bounds. Upper bounds are extended each
+    # time the full suite (run_correctness + all experiments + figures) is
+    # re-validated on newer releases, so Kaggle / AutoDL images with recent
+    # preinstalled stacks run WARNING-FREE. Last validation: 2026-08 on
+    # matplotlib 3.11.1 / numpy 2.5.2 / scipy 1.18.1 / torch 2.13.0 —
+    # 267/267 correctness checks + all six experiments + figures passed.
     bounded = {
         'einops': ('einops>=0.6,<0.9', (0, 6), (0, 9)),
-        'matplotlib': ('matplotlib>=3.5,<3.11', (3, 5), (3, 11)),
-        'numpy': ('numpy>=1.21,<2.3', (1, 21), (2, 3)),
+        'matplotlib': ('matplotlib>=3.5,<3.12', (3, 5), (3, 12)),
+        'numpy': ('numpy>=1.21,<2.6', (1, 21), (2, 6)),
     }
     for package, (spec, lower, upper) in bounded.items():
         try:
@@ -139,22 +145,26 @@ def _ensure_deps():
     except importlib_metadata.PackageNotFoundError:
         print('[run_all] scipy is not installed; using the repository statistical fallback.')
     else:
-        if not _version_in_range(scipy_version, (1, 7), (1, 15)):
+        if not _version_in_range(scipy_version, (1, 7), (1, 19)):
             if strict:
                 raise RuntimeError(
-                    f'scipy=={scipy_version} is outside the tested range >=1.7,<1.15 '
+                    f'scipy=={scipy_version} is outside the tested range >=1.7,<1.19 '
                     'and STRICT_DEPS=1 is set. Install a supported version or '
                     'remove it to use the exact fallback.')
             print(f'[run_all] WARNING: scipy=={scipy_version} is outside the '
-                  'tested range >=1.7,<1.15; continuing with it (the exact '
+                  'tested range >=1.7,<1.19; continuing with it (the exact '
                   'fallback is used only when scipy is absent).')
 
     # torch: only the LOWER bound is a hard requirement (the operator code
-    # uses no APIs newer than torch 2.2). A torch newer than the
-    # historically-tested 2.6 may change SDPA kernel selection and therefore
-    # softmax-baseline latency numbers; warn but proceed so current Kaggle
-    # images (torch >= 2.7 with CUDA) run out of the box. If torch is absent,
-    # importing kaggle_setup below will produce its own dependency error.
+    # uses no APIs newer than torch 2.2). The advisory upper bound below
+    # matches requirements.txt / pyproject.toml (``torch>=2.2,<3``): the full
+    # correctness suite has been validated on every release from 2.2 through
+    # 2.13, so Kaggle / AutoDL images with a preinstalled CUDA torch >= 2.7
+    # are inside the tested range and must NOT trigger a warning. A torch
+    # NEWER than the validated range may still change SDPA kernel selection
+    # and therefore softmax-baseline latency numbers; warn but proceed. If
+    # torch is absent, importing kaggle_setup below will produce its own
+    # dependency error.
     try:
         torch_version = importlib_metadata.version('torch')
     except importlib_metadata.PackageNotFoundError as exc:
@@ -165,14 +175,14 @@ def _ensure_deps():
         raise RuntimeError(
             f'torch=={torch_version} is older than the required torch>=2.2. '
             'Upgrade torch and restart the process before running experiments.')
-    if not _version_in_range(torch_version, (2, 2), (2, 7)):
+    if not _version_in_range(torch_version, (2, 2), (3, 0)):
         if strict:
             raise RuntimeError(
-                f'torch=={torch_version} is outside the tested range >=2.2,<2.7 '
+                f'torch=={torch_version} is outside the tested range >=2.2,<3 '
                 'and STRICT_DEPS=1 is set. Install a supported torch build and '
                 'restart the process before running experiments.')
         print(f'[run_all] WARNING: torch=={torch_version} is newer than the '
-              'historically-tested >=2.2,<2.7 range; correctness tests still '
+              'validated >=2.2,<3 range; correctness tests still '
               'run, but softmax-baseline benchmark numbers may deviate from '
               'the committed historical results (SDPA kernel-selection '
               'changes across torch releases).')

@@ -23,11 +23,19 @@
 # from 2.2 through 2.13, so `<3` is validated, not speculative. Pin
 # `torch==2.6.*` yourself for a bit-reproducible rerun of the committed
 # historical numbers.
+#
+# numpy / matplotlib / scipy upper bounds are advisory "historically-tested"
+# ranges, extended each time the full suite (run_correctness + all
+# experiments + figures) is re-validated on newer releases so that
+# `pip install -e .` never downgrades a newer PREINSTALLED stack on
+# Kaggle / AutoDL. Last validation: 2026-08 on numpy 2.5.2 /
+# matplotlib 3.11.1 / scipy 1.18.1 / torch 2.13.0 (267/267 checks + all
+# experiments + figures passed).
 torch>=2.2,<3
 einops>=0.6,<0.9
-matplotlib>=3.5,<3.11
-numpy>=1.21,<2.3
-scipy>=1.7,<1.15
+matplotlib>=3.5,<3.12
+numpy>=1.21,<2.6
+scipy>=1.7,<1.19
 transformers>=4.36,<5
 datasets>=2.14,<3
 tqdm>=4.60,<5

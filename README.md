@@ -61,7 +61,7 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
 ├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache (incremental decode)
 ├── ops_fused.py           # HybridConfig + KDAHybridLayer/CSAHybridLayer/HCAHybridLayer + HybridKCHAttention
-├── run_correctness.py     # 266 regression checks (custom runner; pytest-importable)
+├── run_correctness.py     # 267 regression checks (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
 ├── run_quality.py         # Exp 4: MQAR associative-recall quality (multi-seed)
 ├── run_ablation.py        # Exp 5: KDA:CSA:HCA ratio ablation
@@ -149,7 +149,13 @@ For GPU runs on Kaggle T4, follow the CUDA bootstrap procedure documented in
 `kaggle_setup.bootstrap_kaggle_cuda()` (install the CUDA wheel, then restart
 the kernel — `setup_kaggle()` only *verifies* CUDA availability, it does not
 install in-place). On current Kaggle images torch ships WITH CUDA
-preinstalled, so the bootstrap is normally a no-op.
+preinstalled, so the bootstrap is normally a no-op. The bootstrap pins an
+exact torch version **matched to the detected CUDA wheel index**
+(`_BOOTSTRAP_TORCH_PINS` in `kaggle_setup.py`): e.g. `torch==2.6.0` for
+cu118/cu124/cu126, `torch==2.5.1` for cu121 (its last release), and
+`torch==2.7.1` for cu128 (where cu128 wheels start) — and it verifies the
+installed wheel actually carries a `+cuXXX` build tag before telling you to
+restart, so a CPU-only fallback install can no longer masquerade as success.
 
 Dependency policy for preinstalled environments: `run_all.py` no longer
 hard-rejects torch/numpy/matplotlib versions outside the historically-tested
@@ -157,10 +163,13 @@ bounds — it WARNS and continues (the operator code has no version-sensitive
 API dependencies for correctness; only softmax-baseline benchmark latency may
 drift across torch releases). Missing packages are still installed. Set
 `STRICT_DEPS=1` to restore the hard version gate for bit-reproducible
-historical reruns. Correspondingly, `torch` has no upper bound in
-`requirements.txt` / `pyproject.toml` so `pip install -e .` never downgrades
-Kaggle's preinstalled CUDA torch; pin `torch==2.6.*` yourself to reproduce
-the committed historical numbers.
+historical reruns. Correspondingly, `torch` keeps only a permissive upper
+bound (`<3`) in `requirements.txt` / `pyproject.toml` so `pip install -e .`
+never downgrades Kaggle's preinstalled CUDA torch; pin `torch==2.6.*`
+yourself to reproduce the committed historical numbers. The advisory ranges
+for numpy / matplotlib / scipy are extended whenever the full suite is
+re-validated on newer releases (last: 2026-08, numpy 2.5.2 / matplotlib
+3.11.1 / scipy 1.18.1 / torch 2.13.0).
 
 Resource footprint on the Kaggle free tier (2×T4, 30h/week quota):
 `run_all.py` with the default knobs is CPU-scale (~10 minutes) — GPU is not
@@ -214,7 +223,7 @@ Environment knobs (set before launching):
 ## Tests
 
 ```bash
-# Custom runner (266 checks, includes long-running correctness checks):
+# Custom runner (267 checks, includes long-running correctness checks):
 python run_correctness.py
 
 # pytest-compatible: the test functions use the standard `test_*` naming
@@ -482,7 +491,7 @@ See `LICENSE`.
    fp16 状态往返精度修复；索引器 cosine 归一化归因注释修正；Kaggle
    兼容（放宽 `run_all.py` 版本门禁为警告、取消 torch 上界）。
 
-正确性套件现为 266 项检查，全部通过。由于掩码与 RoPE 变更，CSA/HCA
+正确性套件现为 267 项检查，全部通过。由于掩码与 RoPE 变更，CSA/HCA
 相关实验数值会有变化，请用 `python run_all.py` 重新生成 `results/`。
 
 ### 为什么不替换原有ops
