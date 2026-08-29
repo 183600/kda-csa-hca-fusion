@@ -443,10 +443,15 @@ def csa_lightning_indexer(
         If True, L2-normalize ``q_idx`` and ``k_idx`` along the
         per-head key dimension (``DI``) before computing the ReLU
         dot-product scores. This makes the indexer's top-k selection
-        invariant to the magnitude of the indexer queries/keys (the
-        DeepSeek-V4 paper specifies cosine-style scoring), preventing
-        a high-norm indexer query from dominating the top-k ranking
-        purely by magnitude. Setting to ``False`` (the default)
+        invariant to the magnitude of the indexer queries/keys,
+        preventing a high-norm indexer query from dominating the
+        top-k ranking purely by magnitude. NOTE: this normalization
+        is a REPOSITORY-SIDE choice, NOT a paper requirement — the
+        DeepSeek-V4 paper Eq. (15)–(16) define the index score as a
+        plain weighted ReLU dot product with no normalization (see
+        the matching NOTE at the normalization site in the function
+        body, and the *Fairness notes* in the README). Setting to
+        ``False`` (the default)
         preserves the historical un-normalized behaviour for backward
         compatibility with existing benchmark results; **new use cases
         should pass ``normalize_qk=True``** to match the

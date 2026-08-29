@@ -46,7 +46,7 @@
 ## 验证入口
 
 ```bash
-python run_correctness.py      # 252 项算子回归检查（含上表各边界 case）
+python run_correctness.py      # 267 项算子回归检查（含上表各边界 case）
 python run_all.py              # 6 个实验 + 图表端到端
 python train_lm_autodl.py --kaggle   # 真实 LM 训练（TinyStories）
 ```
