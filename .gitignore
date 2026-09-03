@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+
+# 数据集 / 大文件缓存（可本地再生，禁止入库）
+wt103_cache/
+*.npy
+*.npz
+*.arrow
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+datasets/
+data/
+*.lmdb
+*.h5
+*.hdf5
+
+# 实验运行时状态（本地自动生成，频繁变动）
+autodl_budget_state.json
+.ipynb_checkpoints/autodl_budget_state-checkpoint.json
+
+# 临时 / 日志
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# HuggingFace / HF datasets 缓存
+.cache/
+.cache/huggingface/
+~/.cache/huggingface/
+
+# matplotlib / font cache
+.matplotlib/
+fontlist*.json
