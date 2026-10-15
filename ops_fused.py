@@ -70,6 +70,27 @@ class HybridConfig:
     head_dim_k: int = 64        # K
     head_dim_v: int = 64        # V
     kda_chunk_size: int = 64
+    # Recompute-vs-cache knob for the reference chunkwise KDA path. False
+    # (default) caches the q-weighted intra-chunk attention matrices for the
+    # whole sequence (O(T * chunk_size) extra elements per head); True drops
+    # that cache and recomputes each chunk's matrix inside the sequential
+    # loop (O(chunk_size^2) extra), trading extra pointwise work for a much
+    # smaller peak memory footprint at long T. Bit-identical values on the
+    # tested geometries; locked by ``test_recompute_attn.py``. Ignored when
+    # ``kda_backend`` selects FLA (its Triton kernels own their buffers) and
+    # when the recurrent path runs (T < kda_chunk_size).
+    kda_recompute_attn: bool = False
+    # Associative-scan knob for the reference chunkwise KDA path. False
+    # (default) resolves the per-chunk state recurrence with the NT-step
+    # sequential loop (bit-exact baseline). True selects the Hillis-Steele
+    # affine prefix scan over chunks (ceil(log2 NT) batched levels, no
+    # Python loop over the sequence), which trades extra [B,HV,NT,K,K]
+    # operator memory for parallel depth on GPU; numerically it matches the
+    # loop to fp round-off (~1e-8 fp32). Only takes effect when the chunk
+    # path runs (``kda_chunk_size >= 1`` and ``T >= kda_chunk_size``) and
+    # the reference backend is selected; mutually exclusive with
+    # ``kda_recompute_attn``. Locked by ``test_assoc_scan.py``.
+    kda_assoc_scan: bool = False
     # KDA implementation backend. The default keeps the historical reference
     # path so existing quality/ablation results do not change. ``fla`` is an
     # optional flash-linear-attention backend; ``auto`` selects it only for
@@ -248,6 +269,29 @@ class HybridConfig:
                 f"kda_chunk_size={self.kda_chunk_size!r} must be an int "
                 f"(>= 1 enables the chunk path; <= 0 forces the recurrent "
                 f"path; default 64).")
+        # ``kda_recompute_attn`` must be a real bool. ``bool`` is the only
+        # accepted type; ints are rejected explicitly (Python's ``1 == True``
+        # would otherwise silently enable the flag) so a config typo cannot
+        # flip the memory policy without the caller noticing.
+        if not isinstance(self.kda_recompute_attn, bool):
+            raise TypeError(
+                f"kda_recompute_attn={self.kda_recompute_attn!r} must be a "
+                f"bool (False caches the intra-chunk attention matrices; "
+                f"True recomputes them per chunk at lower peak memory).")
+        # ``kda_assoc_scan`` follows the same strict-bool contract. The two
+        # chunk-path strategy flags select different algorithms and cannot
+        # be combined (validated here so the error fires at config creation,
+        # not deep inside the first forward pass).
+        if not isinstance(self.kda_assoc_scan, bool):
+            raise TypeError(
+                f"kda_assoc_scan={self.kda_assoc_scan!r} must be a bool "
+                f"(False runs the sequential chunk loop; True resolves the "
+                f"chunk states with an associative prefix scan).")
+        if self.kda_assoc_scan and self.kda_recompute_attn:
+            raise ValueError(
+                "kda_assoc_scan=True needs the cached intra-chunk attention "
+                "matrix and conflicts with kda_recompute_attn=True; enable "
+                "exactly one chunk-path strategy.")
         # Validate the remaining structural params. Negative values for
         # these fields would either silently produce an empty layer list
         # (Python's ``[x] * -1 == []``), crash with a cryptic torch error
@@ -662,6 +706,8 @@ class KDAHybridLayer(nn.Module):
             chunk_size=cfg.kda_chunk_size,
             use_chunk=use_chunk,
             backend=cfg.kda_backend,
+            recompute_attn=cfg.kda_recompute_attn,
+            assoc_scan=cfg.kda_assoc_scan,
         )
         return self.o_proj(o.reshape(B, T, HV * V)), new_state, new_lookback
 

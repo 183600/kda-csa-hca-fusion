@@ -357,8 +357,16 @@ def _chunk_kda_prepare(
     g_clamp_min: float,
     state_dtype: torch.dtype | None,
     fn_name: str,
+    recompute_attn: bool = False,
 ):
-    """Shared setup for the chunk-parallel KDA path."""
+    """Shared setup for the chunk-parallel KDA path.
+
+    ``recompute_attn=True`` selects the low-memory *recompute* policy: the
+    q-weighted intra-chunk attention matrices are NOT cached for the whole
+    sequence here; :func:`_chunk_kda_inner_loop_recompute` rebuilds each
+    chunk's matrix from ``q`` / ``k`` / the cumsum gates inside the
+    sequential loop (see that function's docstring). The math is unchanged.
+    """
     dtype = v.dtype
     _validate_kda_inputs(q, k, v, g, beta, fn_name=fn_name)
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
@@ -428,13 +436,23 @@ def _chunk_kda_prepare(
     # per-element product order ``(x * exp) * k_i`` and the contiguous
     # last-dim reduction are unchanged, so both outputs are bit-identical to
     # the previous two-pass computation.
-    Aqk = torch.empty(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
+    #
+    # In ``recompute_attn`` mode this cache is intentionally DROPPED: the
+    # persistent ``Aqk`` tensor is O(NT * BT * BT) = O(T * BT) elements per
+    # head (e.g. ~33 MB for B=1, HV=8, T=8192, BT=64 in fp32, growing
+    # linearly in T). The inner loop then rebuilds each chunk's matrix from
+    # the already-returned ``q`` / ``k`` / cumsum ``g`` — same flops, but
+    # peak extra memory O(BT * BT) per head. This is the "recompute versus
+    # cache" dial for long-context prefill / inference.
+    Aqk = None if recompute_attn else torch.empty(
+        *g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     # ``clamp(max=50.0)`` below is provably an identity when the largest
     # positive pair difference ``max(g) - min(g)`` never exceeds 50: the
     # clamp then returns its input bit-for-bit, and its backward (an
     # elementwise ``lt`` + ``where`` per column) can be skipped as well.
     # NaN / +inf ranges fail this ``<=`` test (comparisons are False), so
-    # degenerate inputs keep the full clamp path.
+    # degenerate inputs keep the full clamp path. The recompute inner loop
+    # receives ``clamp_g_diff`` so it makes the exact same clamp decision.
     clamp_g_diff = not bool((g.amax(-2) - g.amin(-2)).max() <= 50.0)
     for i in range(BT):
         k_i = k[..., i, :]
@@ -444,8 +462,10 @@ def _chunk_kda_prepare(
             g_diff = g_diff.clamp(max=50.0)
         e = g_diff.exp()
         A[..., i] = (k * e * k_i.unsqueeze(-2)).sum(-1)
-        Aqk[..., i] = (q * e * k_i.unsqueeze(-2)).sum(-1)
-    Aqk = Aqk.masked_fill(upper_mask, 0)
+        if not recompute_attn:
+            Aqk[..., i] = (q * e * k_i.unsqueeze(-2)).sum(-1)
+    if not recompute_attn:
+        Aqk = Aqk.masked_fill(upper_mask, 0)
     A = A * beta[..., None]
     A = -A.masked_fill(mask, 0)
     A = torch.linalg.solve_triangular(
@@ -464,6 +484,10 @@ def _chunk_kda_prepare(
         'early': False,
         'q': q, 'k': k, 'u': u, 'g': g, 'w': w, 'S': S,
         'Aqk': Aqk, 'NT': NT,
+        # Needed by ``_chunk_kda_inner_loop_recompute`` when ``Aqk`` is None.
+        'upper_mask': upper_mask,
+        'clamp_g_diff': clamp_g_diff,
+        'recompute_attn': recompute_attn,
         'dtype': dtype, 'compute_dtype': compute_dtype,
         'original_T': original_T,
     }
@@ -506,18 +530,40 @@ def naive_chunk_kda(
     *,
     g_clamp_min: float = -10.0,
     state_dtype: torch.dtype | None = None,
+    recompute_attn: bool = False,
 ):
-    """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error."""
+    """Chunkwise-parallel KDA (reference). Matches ``naive_recurrent_kda`` up to fp error.
+
+    Args:
+        recompute_attn: when False (default) the q-weighted intra-chunk
+            attention matrices are cached for the whole sequence in
+            ``_chunk_kda_prepare`` (faster: the ``exp(g_j - g_i)`` pair grid
+            is shared with the ``A`` matrix). When True the cache is
+            dropped and each chunk's matrix is recomputed inside the
+            sequential loop, trading extra pointwise work for a peak
+            memory reduction from ``O(T * chunk_size)`` to
+            ``O(chunk_size ** 2)`` extra elements per head. Both settings
+            perform the same per-element operations in the same order and
+            are bit-identical on the tested CPU geometries (locked by
+            ``test_recompute_attn.py``).
+    """
     prep = _chunk_kda_prepare(
         q, k, v, g, beta, scale, initial_state, output_final_state,
         chunk_size, g_clamp_min, state_dtype, fn_name='naive_chunk_kda',
+        recompute_attn=recompute_attn,
     )
     if prep['early']:
         return prep['o'], prep['S']
-    chunk_outs, S = _chunk_kda_inner_loop(
-        prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
-        prep['Aqk'], prep['NT'],
-    )
+    if recompute_attn:
+        chunk_outs, S = _chunk_kda_inner_loop_recompute(
+            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+            prep['upper_mask'], prep['clamp_g_diff'], prep['NT'],
+        )
+    else:
+        chunk_outs, S = _chunk_kda_inner_loop(
+            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+            prep['Aqk'], prep['NT'],
+        )
     return _chunk_kda_finalize(
         chunk_outs, S,
         dtype=prep['dtype'], compute_dtype=prep['compute_dtype'],
@@ -570,6 +616,224 @@ def _chunk_kda_inner_loop(
     return chunk_outs, S
 
 
+def _chunk_kda_inner_loop_recompute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    w: torch.Tensor,
+    S: torch.Tensor,
+    upper_mask: torch.Tensor,
+    clamp_g_diff: bool,
+    NT: int,
+) -> tuple:
+    """TorchScript-compatible recompute variant of ``_chunk_kda_inner_loop``.
+
+    The default chunk path caches every chunk's q-weighted attention matrix
+    ``Aqk`` in ``_chunk_kda_prepare`` (shape ``[B, HV, NT, BT, BT]`` —
+    O(T * BT) extra elements per head). This variant rebuilds ``Aqk`` for
+    the current chunk only, from the already-materialized ``q`` / ``k`` and
+    the cumsum gates ``g``.
+
+    The column update is deliberately kept textually aligned with
+    ``_chunk_kda_prepare``'s loop body (``diff = g - g_col``,
+    ``(q * exp(diff)) * k_col`` reduced over the contiguous last dim), so
+    the two policies perform the *same* per-element operations in the same
+    order — the recompute output is bit-identical to the cache output for
+    the tested geometries (verified by ``test_recompute_attn.py``). The
+    per-column ``[B, HV, BT, K]`` slice also keeps the transient footprint
+    at O(BT * K) instead of materializing the full O(BT * BT * K) pair
+    grid, which is why this form is used rather than a single broadcast
+    expression.
+
+    ``clamp_g_diff`` must be the flag computed by ``_chunk_kda_prepare``
+    (``max(g) - min(g) > 50`` anywhere), so both policies clamp identically.
+    """
+    chunk_outs = []
+    B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
+    for i in range(NT):
+        q_i = q[:, :, i]
+        k_i = k[:, :, i]
+        u_i = u[:, :, i]
+        g_i = g[:, :, i]
+        w_i = w[:, :, i]
+        Aqk_i = q_i.new_empty(B, HV, BT, BT)
+        for j in range(BT):
+            diff = g_i - g_i[..., j:j + 1, :]
+            if clamp_g_diff:
+                diff = diff.clamp(max=50.0)
+            Aqk_i[..., j] = (q_i * diff.exp() * k_i[..., j:j + 1, :]).sum(-1)
+        Aqk_i = Aqk_i.masked_fill(upper_mask, 0)
+        v_i = u_i - w_i @ S
+        chunk_outs.append((q_i * g_i.exp()) @ S + Aqk_i @ v_i)
+        S = S * g_i[:, :, -1].exp().unsqueeze(-1)
+        update = torch.einsum('bhck,bhcv->bhckv', (g_i[:, :, -1:] - g_i).exp() * k_i, v_i)
+        S = S + update.sum(-3)
+    return chunk_outs, S
+
+
+def _assoc_scan_chunk_states(
+    M: torch.Tensor,
+    b: torch.Tensor,
+    S0: torch.Tensor,
+) -> tuple:
+    """TorchScript-compatible associative (prefix) scan of affine chunk maps.
+
+    Each chunk ``n`` carries an affine transition on the recurrent state::
+
+        S_{n+1} = M_n S_n + b_n
+
+    with ``M_n`` of shape ``[B, HV, K, K]`` and ``b_n`` of shape
+    ``[B, HV, K, V]``. Affine maps compose associatively::
+
+        (M_2, b_2) ∘ (M_1, b_1) = (M_2 M_1, M_2 b_1 + b_2)
+
+    so the per-chunk *incoming* states can be produced by a prefix scan
+    whose combine is a ``K×K`` matmul plus a ``K×V`` matmul, instead of the
+    sequential ``for n in range(NT)`` loop used by
+    :func:`_chunk_kda_inner_loop`. This implementation uses a Hillis–Steele
+    (doubling) scan: ``ceil(log2(NT))`` levels, each level one vectorized
+    ``matmul`` over ``[B, HV, NT, ...]`` — so the Python-level sequential
+    depth grows logarithmically in the sequence length and every level is a
+    single batched kernel, which is what GPU utilization wants. (The
+    reference CPU path deliberately keeps the sequential loop as the
+    default; see :func:`assoc_scan_chunk_kda`'s docstring for the trade.)
+
+    Returns:
+        ``(S_in, S_final, levels)`` where ``S_in`` has shape
+        ``[B, HV, NT, K, V]`` (the state entering each chunk, i.e.
+        ``S_in[:, :, 0] == S0``), ``S_final`` is the state after the last
+        chunk, and ``levels`` is the number of doubling steps performed
+        (``ceil(log2(NT))``, 0 for ``NT == 1``) — returned so regression
+        tests can lock the logarithmic depth contract.
+    """
+    B, HV, NT, K = M.shape[0], M.shape[1], M.shape[2], M.shape[3]
+    V = b.shape[-1]
+    # Inclusive prefix scan: E[:, :, n] / F[:, :, n] describe the composed
+    # map of chunks 0..n (applied to S0).
+    E = M
+    Fv = b
+    off = 1
+    levels = 0
+    while off < NT:
+        levels = levels + 1
+        E_shift = E[:, :, :-off]
+        F_shift = Fv[:, :, :-off]
+        E_tail = E[:, :, off:]
+        F_tail = Fv[:, :, off:]
+        # NOTE: compute the composed source from the OLD E_tail (chunk n's
+        # own map), then overwrite. Reusing one variable for both would
+        # apply the newly-composed transition to the source too.
+        new_E_tail = E_tail @ E_shift
+        new_F_tail = E_tail @ F_shift + F_tail
+        E = torch.cat([E[:, :, :off], new_E_tail], dim=2)
+        Fv = torch.cat([Fv[:, :, :off], new_F_tail], dim=2)
+        off = off * 2
+    # Exclusive form: S_in[:, :, 0] = S0 (identity map, zero source), while
+    # chunk n >= 1 consumes the inclusive prefix of chunks 0..n-1.
+    eye = torch.eye(K, dtype=M.dtype, device=M.device)
+    eye = eye.expand(B, HV, 1, K, K)
+    zero = torch.zeros(B, HV, 1, K, V, dtype=M.dtype, device=M.device)
+    E_pre = torch.cat([eye, E[:, :, :-1]], dim=2)
+    F_pre = torch.cat([zero, Fv[:, :, :-1]], dim=2)
+    S_in = E_pre @ S0.unsqueeze(2) + F_pre
+    # NOTE: keep both operands 4-D here. ``E[:, :, -1] @ S0.unsqueeze(2)``
+    # would broadcast the batch dims asymmetrically ((B,HV) vs (B,HV,1))
+    # and silently pair each head's matrix with the wrong initial state;
+    # with S0 == 0 (the common case) the error is invisible.
+    S_final = E[:, :, -1] @ S0 + Fv[:, :, -1]
+    return S_in, S_final, levels
+
+
+def assoc_scan_chunk_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    *,
+    g_clamp_min: float = -10.0,
+    state_dtype: torch.dtype | None = None,
+):
+    """Chunkwise KDA via an **associative scan over chunks** (reference).
+
+    Same math as :func:`naive_chunk_kda`, reorganized so that the state
+    recurrence is expressed as per-chunk *affine maps* and resolved by a
+    parallel prefix (associative) scan instead of the sequential inner
+    loop. For chunk ``n`` let ``gexp = exp(g_cumsum)`` and
+    ``kexp = k * exp(g_cumsum[last] - g_cumsum)`` (the per-channel log-decay
+    factors to the chunk end). The delta-rule/wY transform gives::
+
+        S_{n+1} = M_n S_n + b_n,     M_n = Diag(gexp[last]) - kexp^T w_n
+                                     b_n = kexp^T u_n
+        o_n     = C_n S_n + a_n,     C_n = q * gexp - Aqk_n w_n
+                                     a_n = Aqk_n u_n
+
+    where ``w_n`` / ``u_n`` / ``Aqk_n`` come from the standard triangular
+    solve in :func:`_chunk_kda_prepare`, exactly as in the sequential path.
+    The maps ``(M_n, b_n)`` compose associatively, so
+    :func:`_assoc_scan_chunk_states` recovers all incoming chunk states in
+    ``ceil(log2 NT)`` batched levels (Hillis–Steele) — no Python loop over
+    the sequence length. This is the *parallel-depth* complement of the
+    sequential reference loop: numerically it agrees with
+    ``naive_chunk_kda`` to fp round-off (~1e-8 fp32, ~1e-17 fp64 on the
+    locked test geometries) but is NOT bit-exact, because the composition
+    order of the chunk PREfix differs from the running multiplication in
+    the loop.
+
+    Memory: the scan materializes the per-chunk operators ``[B, HV, NT, K,
+    K]`` (+ two such levels during the doubling), on top of the cached
+    ``Aqk``/``A`` from ``_chunk_kda_prepare``. It is therefore NOT the
+    low-memory option — that is ``naive_chunk_kda(recompute_attn=True)``.
+    ``recompute_attn`` is incompatible here because the readout terms
+    ``C_n`` / ``a_n`` are computed from the full ``Aqk`` tensor in one
+    vectorized shot.
+
+    The scan core is TorchScript-compatible; the surrounding wrapper stays
+    eager. The output is assembled by :func:`_chunk_kda_finalize`, so
+    padding / dtype / final-state handling is shared with the sequential
+    paths.
+
+    Args:
+        Same as :func:`naive_chunk_kda`.
+    """
+    prep = _chunk_kda_prepare(
+        q, k, v, g, beta, scale, initial_state, output_final_state,
+        chunk_size, g_clamp_min, state_dtype, fn_name='assoc_scan_chunk_kda',
+        recompute_attn=False,
+    )
+    if prep['early']:
+        return prep['o'], prep['S']
+    qq, kk = prep['q'], prep['k']
+    u, gg, w = prep['u'], prep['g'], prep['w']
+    Aqk, S0 = prep['Aqk'], prep['S']
+    if Aqk is None:  # pragma: no cover - prepare(recompute_attn=False)
+        raise RuntimeError(
+            'assoc_scan_chunk_kda requires the cached Aqk matrix; '
+            'recompute_attn=True is not supported by the scan path.')
+    # kexp[c] = k_c * exp(g_last - g_c) with PER-CHANNEL log-decay, so the
+    # diagonal part of M_n is Diag(exp(g_last)) (anisotropic across K).
+    kexp = kk * (gg[..., -1:, :] - gg).exp()
+    kexp_t = kexp.transpose(-1, -2)
+    M = torch.diag_embed(gg[..., -1, :].exp()) - kexp_t @ w
+    b = kexp_t @ u
+    S_in, S_final, _levels = _assoc_scan_chunk_states(M, b, S0)
+    C = qq * gg.exp() - Aqk @ w
+    a = Aqk @ u
+    o_all = C @ S_in + a
+    chunk_outs = list(o_all.unbind(2))
+    return _chunk_kda_finalize(
+        chunk_outs, S_final,
+        dtype=prep['dtype'], compute_dtype=prep['compute_dtype'],
+        state_dtype=state_dtype, output_final_state=output_final_state,
+        original_T=prep['original_T'], fn_name='assoc_scan_chunk_kda',
+    )
+
+
 def scripted_chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -584,8 +848,14 @@ def scripted_chunk_kda(
     g_clamp_min: float = -10.0,
     state_dtype: torch.dtype | None = None,
     use_script: bool = True,
+    recompute_attn: bool = False,
 ):
-    """``naive_chunk_kda`` with a ``torch.jit.script``-compiled inner loop."""
+    """``naive_chunk_kda`` with a ``torch.jit.script``-compiled inner loop.
+
+    ``recompute_attn`` is forwarded to :func:`naive_chunk_kda`; the
+    recompute inner loop is TorchScript-compiled too (with the same
+    graceful fallback to eager).
+    """
     if not use_script:
         return naive_chunk_kda(
             q, k, v, g, beta,
@@ -595,31 +865,36 @@ def scripted_chunk_kda(
             chunk_size=chunk_size,
             g_clamp_min=g_clamp_min,
             state_dtype=state_dtype,
+            recompute_attn=recompute_attn,
         )
 
     prep = _chunk_kda_prepare(
         q, k, v, g, beta, scale, initial_state, output_final_state,
         chunk_size, g_clamp_min, state_dtype, fn_name='scripted_chunk_kda',
+        recompute_attn=recompute_attn,
     )
     if prep['early']:
         return prep['o'], prep['S']
 
+    inner_eager = (_chunk_kda_inner_loop_recompute if recompute_attn
+                   else _chunk_kda_inner_loop)
+    inner_args = (
+        (prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+         prep['upper_mask'], prep['clamp_g_diff'], prep['NT'])
+        if recompute_attn else
+        (prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+         prep['Aqk'], prep['NT'])
+    )
     try:
-        scripted_inner = torch.jit.script(_chunk_kda_inner_loop)
-        chunk_outs, S = scripted_inner(
-            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
-            prep['Aqk'], prep['NT'],
-        )
+        scripted_inner = torch.jit.script(inner_eager)
+        chunk_outs, S = scripted_inner(*inner_args)
     except Exception as exc:
         _warnings.warn(
             f"scripted_chunk_kda: torch.jit.script failed ({type(exc).__name__}: "
             f"{exc}); falling back to the eager inner loop.",
             stacklevel=2,
         )
-        chunk_outs, S = _chunk_kda_inner_loop(
-            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
-            prep['Aqk'], prep['NT'],
-        )
+        chunk_outs, S = inner_eager(*inner_args)
 
     return _chunk_kda_finalize(
         chunk_outs, S,

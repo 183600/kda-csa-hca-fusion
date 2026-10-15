@@ -169,6 +169,8 @@ def kda_forward(
     use_chunk: bool = False,
     g_clamp_min: float = -10.0,
     backend: str = "reference",
+    recompute_attn: bool = False,
+    assoc_scan: bool = False,
 ):
     """Run KDA through the selected reference or optional FLA backend.
 
@@ -179,6 +181,22 @@ def kda_forward(
     combinations (including assertion-based checks in older FLA releases)
     fall back to the reference implementation. ``g_clamp_min``
     is applied before both backends so their gate contract matches.
+
+    ``recompute_attn`` is a reference-path-only memory knob (see
+    :func:`ops_kda.naive_chunk_kda`): it only takes effect when
+    ``use_chunk=True`` and the reference backend runs. FLA's Triton
+    kernels manage their own internal buffers, so the flag is ignored
+    there (documented rather than silently reinterpreted).
+
+    ``assoc_scan`` is a reference-path-only *parallelism* knob: when
+    ``use_chunk=True`` it selects :func:`ops_kda.assoc_scan_chunk_kda`,
+    which resolves the per-chunk state recurrence with a Hillis-Steele
+    associative scan (``ceil(log2 NT)`` batched levels instead of an
+    ``NT``-step Python loop). Defaults to the sequential loop, whose
+    numerics remain the bit-exact baseline. ``assoc_scan`` and
+    ``recompute_attn`` are mutually exclusive (the scan needs the cached
+    ``Aqk`` readout matrices). Like ``recompute_attn``, the flag is ignored
+    by the FLA backend and by the recurrent path.
     """
     backend = validate_kda_backend(backend)
     if not isinstance(g_clamp_min, (int, float)) or isinstance(g_clamp_min, bool):
@@ -231,9 +249,23 @@ def kda_forward(
 
     # Lazy import avoids an import cycle and preserves the original public
     # ops_kda module as the single source of truth for correctness tests.
-    from ops_kda import naive_chunk_kda, naive_recurrent_kda
+    from ops_kda import assoc_scan_chunk_kda, naive_chunk_kda, naive_recurrent_kda
 
     if use_chunk:
+        if assoc_scan and recompute_attn:
+            raise ValueError(
+                "assoc_scan=True needs the cached intra-chunk attention "
+                "matrix and cannot be combined with recompute_attn=True on "
+                "the reference chunk path; choose one strategy.")
+        if assoc_scan:
+            return assoc_scan_chunk_kda(
+                q, k, v, g, beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+                g_clamp_min=downstream_clamp,
+            )
         return naive_chunk_kda(
             q, k, v, g, beta,
             scale=scale,
@@ -241,6 +273,7 @@ def kda_forward(
             output_final_state=output_final_state,
             chunk_size=chunk_size,
             g_clamp_min=downstream_clamp,
+            recompute_attn=recompute_attn,
         )
     return naive_recurrent_kda(
         q, k, v, g, beta,
