@@ -223,8 +223,14 @@ def naive_recurrent_kda(
     q, k, v, g, beta = map(lambda x: x.to(compute_dtype), [q, k, v, g, beta])
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
-    q = q.repeat_interleave(G, dim=2) * scale
-    k = k.repeat_interleave(G, dim=2)
+    # GVA expansion. With G == 1 (H == HV, the default geometry) the
+    # repeat_interleave is an identity copy, so skip it entirely — values
+    # are unchanged and one full q / k copy per call is avoided.
+    if G == 1:
+        q = q * scale
+    else:
+        q = q.repeat_interleave(G, dim=2) * scale
+        k = k.repeat_interleave(G, dim=2)
     if T > 8192:
         _warnings.warn(
             f"naive_recurrent_kda: T={T} > 8192; the Python for-loop is "
@@ -249,14 +255,15 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
-    outs = []
+    # Preallocate the output and write each step's result into its slice —
+    # avoids the extra full-sequence copy that ``torch.stack`` performs.
+    o = q.new_empty(B, T, HV, V)
     for i in range(0, T):
         q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
         S = S * g_i[..., None].exp()
         S = S + torch.einsum('b h k, b h v -> b h k v', b_i[..., None] * k_i,
                              v_i - (k_i[..., None] * S).sum(-2))
-        outs.append(torch.einsum('b h k, b h k v -> b h v', q_i, S))
-    o = torch.stack(outs, dim=1)
+        o[:, i] = torch.einsum('b h k, b h k v -> b h v', q_i, S)
     if not output_final_state:
         S = None
     else:
@@ -387,6 +394,9 @@ def _chunk_kda_prepare(
     compute_dtype = _compute_dtype(dtype)
     q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
+    # Note: ``repeat_interleave`` (even with G == 1) is kept because it also
+    # materializes contiguous q / k tensors; the rearranged views feed several
+    # downstream matmuls that regress when handed non-contiguous operands.
     q = q.repeat_interleave(G, dim=1) * scale
     k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
@@ -407,12 +417,35 @@ def _chunk_kda_prepare(
     # documented this same point and switched to diagonal=0; a later LLM
     # bug-fix round reverted it to diagonal=1 and reintroduced the regression. Do not revert.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
-    A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
+    upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # Every column is written exactly once below, so ``empty`` avoids the
+    # redundant zero-fill of the (potentially large) A tensors.
+    A = torch.empty(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
+    # ``Aqk`` (the q-weighted strictly-attention matrix consumed by the inner
+    # loop) shares the ``exp(clamp(g_j - g_i))`` pair grid with ``A``: the
+    # grid is materialized once here and folded into both column updates,
+    # instead of being recomputed inside the inner loop for every chunk. The
+    # per-element product order ``(x * exp) * k_i`` and the contiguous
+    # last-dim reduction are unchanged, so both outputs are bit-identical to
+    # the previous two-pass computation.
+    Aqk = torch.empty(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
+    # ``clamp(max=50.0)`` below is provably an identity when the largest
+    # positive pair difference ``max(g) - min(g)`` never exceeds 50: the
+    # clamp then returns its input bit-for-bit, and its backward (an
+    # elementwise ``lt`` + ``where`` per column) can be skipped as well.
+    # NaN / +inf ranges fail this ``<=`` test (comparisons are False), so
+    # degenerate inputs keep the full clamp path.
+    clamp_g_diff = not bool((g.amax(-2) - g.amin(-2)).max() <= 50.0)
     for i in range(BT):
         k_i = k[..., i, :]
         g_i = g[..., i, :]
-        g_diff = (g - g_i.unsqueeze(-2)).clamp(max=50.0)
-        A[..., i] = (k * g_diff.exp() * k_i.unsqueeze(-2)).sum(-1)
+        g_diff = g - g_i.unsqueeze(-2)
+        if clamp_g_diff:
+            g_diff = g_diff.clamp(max=50.0)
+        e = g_diff.exp()
+        A[..., i] = (k * e * k_i.unsqueeze(-2)).sum(-1)
+        Aqk[..., i] = (q * e * k_i.unsqueeze(-2)).sum(-1)
+    Aqk = Aqk.masked_fill(upper_mask, 0)
     A = A * beta[..., None]
     A = -A.masked_fill(mask, 0)
     A = torch.linalg.solve_triangular(
@@ -426,12 +459,11 @@ def _chunk_kda_prepare(
     S = q.new_zeros(B, HV, K, V)
     if initial_state is not None:
         S = S + initial_state.to(device=S.device, dtype=compute_dtype)
-    upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
 
     return {
         'early': False,
         'q': q, 'k': k, 'u': u, 'g': g, 'w': w, 'S': S,
-        'upper_mask': upper_mask, 'NT': NT,
+        'Aqk': Aqk, 'NT': NT,
         'dtype': dtype, 'compute_dtype': compute_dtype,
         'original_T': original_T,
     }
@@ -484,7 +516,7 @@ def naive_chunk_kda(
         return prep['o'], prep['S']
     chunk_outs, S = _chunk_kda_inner_loop(
         prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
-        prep['upper_mask'], prep['NT'],
+        prep['Aqk'], prep['NT'],
     )
     return _chunk_kda_finalize(
         chunk_outs, S,
@@ -501,10 +533,15 @@ def _chunk_kda_inner_loop(
     g: torch.Tensor,
     w: torch.Tensor,
     S: torch.Tensor,
-    mask: torch.Tensor,
+    Aqk: torch.Tensor,
     NT: int,
 ) -> tuple:
-    """TorchScript-compatible inner loop of ``naive_chunk_kda``."""
+    """TorchScript-compatible inner loop of ``naive_chunk_kda``.
+
+    ``Aqk`` (the masked q-weighted within-chunk attention matrix, precomputed
+    by :func:`_chunk_kda_prepare` from the shared ``exp(clamp(g_j - g_i))``
+    pair grid) is sliced per chunk below.
+    """
     chunk_outs = []
     for i in range(NT):
         q_i = q[:, :, i]
@@ -512,11 +549,8 @@ def _chunk_kda_inner_loop(
         u_i = u[:, :, i]
         g_i = g[:, :, i]
         w_i = w[:, :, i]
-        diff = g_i.unsqueeze(-2) - g_i.unsqueeze(-3)
-        Aqk = (q_i.unsqueeze(-2) * diff.clamp(max=50.0).exp() * k_i.unsqueeze(-3)).sum(-1)
-        Aqk = Aqk.masked_fill(mask, 0)
         v_i = u_i - w_i @ S
-        chunk_outs.append((q_i * g_i.exp()) @ S + Aqk @ v_i)
+        chunk_outs.append((q_i * g_i.exp()) @ S + Aqk[:, :, i] @ v_i)
         S = S * g_i[:, :, -1].exp().unsqueeze(-1)
         # NOTE: decay direction is ``g_last - g_pos`` (NOT ``g_pos - g_last``).
         # Inside a chunk, position ``c`` contributes to the carried state via
@@ -574,7 +608,7 @@ def scripted_chunk_kda(
         scripted_inner = torch.jit.script(_chunk_kda_inner_loop)
         chunk_outs, S = scripted_inner(
             prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
-            prep['upper_mask'], prep['NT'],
+            prep['Aqk'], prep['NT'],
         )
     except Exception as exc:
         _warnings.warn(
@@ -584,7 +618,7 @@ def scripted_chunk_kda(
         )
         chunk_outs, S = _chunk_kda_inner_loop(
             prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
-            prep['upper_mask'], prep['NT'],
+            prep['Aqk'], prep['NT'],
         )
 
     return _chunk_kda_finalize(
