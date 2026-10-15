@@ -172,6 +172,60 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
         )
 
 
+def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
+    """One sequential pass of the KDA recurrence (inner-loop body).
+
+    ``q`` is ``[B, T, HV, K]`` (already scaled), ``v`` is ``[B, T, HV, V]``,
+    and the three factor tensors are ``[B, HV, T, K, 1]`` so that ``unbind``
+    yields the exact ``[B, HV, K, 1]`` broadcast shape the loop consumes.
+    The op sequence per step is unchanged from the historical loop; the
+    layout pre-arrangement is value-preserving, hence bit-identical.
+    """
+    B, T, HV, V = v.shape
+    o = q.new_empty(B, T, HV, V)
+    for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
+            q.unbind(1), k_col.unbind(2), v.unbind(1),
+            g_exp_col.unbind(2), beta_k_col.unbind(2))):
+        S = S * g_exp_i
+        delta = v_i - (k_i * S).sum(-2)
+        # ``b_i * k_i`` is the same product precomputed by the caller. The
+        # outer product via broadcasting is bit-identical to the
+        # ``einsum('b h k, b h v -> b h k v')`` form (no reduction involved).
+        S = S + beta_k_i * delta[..., None, :]
+        # ``q_i @ S`` (batch matmul) is bit-identical to the historical
+        # ``einsum('b h k, b h k v -> b h v')`` — both lower to the same
+        # per-head bmm — while skipping the einsum dispatcher, which
+        # dominated the per-step cost at small head dims.
+        o[:, i] = (q_i.unsqueeze(-2) @ S).squeeze(-2)
+    return o, S
+
+
+_RECURRENT_LOOP_SCRIPTED = None
+_RECURRENT_LOOP_SCRIPTED_FAILED = False
+
+
+def _get_scripted_recurrent_loop():
+    """Lazily ``torch.jit.script`` the loop body, with eager fallback.
+
+    TorchScript removes the Python interpreter from the per-step dispatch
+    path of the sequential loop (the same technique used by
+    :func:`scripted_chunk_kda`). The scripted function executes the exact
+    same aten ops in the same order as :func:`_recurrent_kda_loop_eager`
+    (verified bit-identical), so this is a pure orchestration change. If
+    scripting fails on the installed torch build, the eager loop is used.
+    """
+    global _RECURRENT_LOOP_SCRIPTED, _RECURRENT_LOOP_SCRIPTED_FAILED
+    if _RECURRENT_LOOP_SCRIPTED is None and not _RECURRENT_LOOP_SCRIPTED_FAILED:
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _RECURRENT_LOOP_SCRIPTED = torch.jit.script(
+                    _recurrent_kda_loop_eager)
+        except Exception:
+            _RECURRENT_LOOP_SCRIPTED_FAILED = True
+    return _RECURRENT_LOOP_SCRIPTED
+
+
 def naive_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -209,7 +263,11 @@ def naive_recurrent_kda(
 
     .. note::
 
-        This is a **Python-loop reference implementation**.
+        This is a **Python-loop reference implementation**. The loop body is
+        run through ``torch.jit.script`` when available (falling back to the
+        identical eager loop otherwise) purely to remove Python interpreter
+        overhead from the per-step dispatch; the executed ops and their order
+        are unchanged, so results are bit-identical either way.
     """
     dtype = v.dtype
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
@@ -254,13 +312,25 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
-    o = q.new_empty(B, T, HV, V)
-    for i in range(0, T):
-        q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
-        S = S * g_i[..., None].exp()
-        S = S + torch.einsum('b h k, b h v -> b h k v', b_i[..., None] * k_i,
-                             v_i - (k_i[..., None] * S).sum(-2))
-        o[:, i] = torch.einsum('b h k, b h k v -> b h v', q_i, S)
+    # Hoist the per-step elementwise factors out of the sequential loop:
+    # ``exp(g_t)`` and ``beta_t * k_t`` depend only on the inputs, so computing
+    # them once for the whole sequence removes T exp/mul kernel launches from
+    # the hot loop. The products are the same elementwise operations on the
+    # same values as the previous per-step form, hence bit-identical.
+    #
+    # The three loop-only factors are additionally moved to a ``[B, H, T, K, 1]``
+    # layout (one ``movedim`` copy each) so that ``unbind(2)`` yields the exact
+    # broadcast shape ``[B, H, K, 1]`` the loop consumes, removing the per-step
+    # ``x[:, i]`` select + ``unsqueeze`` pairs. Rearranging is value-preserving,
+    # so every product below is bit-identical to the ``[B, T, H, K]`` layout.
+    g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
+    k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
+    beta_k_col = (beta[..., None] * k).movedim(1, 2).unsqueeze(-1).contiguous()
+    loop = _get_scripted_recurrent_loop()
+    if loop is not None:
+        o, S = loop(q, k_col, v, g_exp_col, beta_k_col, S)
+    else:
+        o, S = _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S)
     if not output_final_state:
         S = None
     else:
@@ -415,8 +485,12 @@ def _chunk_kda_prepare(
     # to the recurrent delta-rule.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
     upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
-    # Every column of ``A`` and ``Aqk`` is written exactly once below.
-    A = torch.empty(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
+    # ``A``'s columns are written only for rows ``c >= i`` below; the
+    # never-written upper triangle must be finite zeros (not ``empty``
+    # garbage), because ``A`` is multiplied by ``beta`` afterwards and
+    # autograd's backward through that multiply would turn uninitialized
+    # inf/NaN garbage into ``0 * inf = NaN`` gradients for ``beta``.
+    A = torch.zeros(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     # ``Aqk`` is the q-weighted within-chunk attention matrix consumed by
     # the inner loop. In ``recompute_attn`` mode the cache is dropped and
     # the inner loop rebuilds each chunk's matrix from the ``q`` / ``k``
@@ -428,16 +502,21 @@ def _chunk_kda_prepare(
     # take the clamp path. The recompute inner loop receives
     # ``clamp_g_diff`` so it makes the same clamp decision.
     clamp_g_diff = not bool((g.amax(-2) - g.amin(-2)).max() <= 50.0)
+    # Only the rows ``c >= i`` are materialized: the strictly-upper rows are
+    # zeroed by ``mask`` / ``upper_mask`` below, so computing (and even
+    # reading) them is wasted work. The surviving entries are produced by the
+    # same elementwise operations on the same values as the full-grid loop, so
+    # the result is bit-identical; the loop just does ~half the work.
     for i in range(BT):
         k_i = k[..., i, :]
         g_i = g[..., i, :]
-        g_diff = g - g_i.unsqueeze(-2)
+        g_diff = g[..., i:, :] - g_i.unsqueeze(-2)
         if clamp_g_diff:
             g_diff = g_diff.clamp(max=50.0)
         e = g_diff.exp()
-        A[..., i] = (k * e * k_i.unsqueeze(-2)).sum(-1)
+        A[..., i:, i] = (k[..., i:, :] * e * k_i.unsqueeze(-2)).sum(-1)
         if not recompute_attn:
-            Aqk[..., i] = (q * e * k_i.unsqueeze(-2)).sum(-1)
+            Aqk[..., i:, i] = (q[..., i:, :] * e * k_i.unsqueeze(-2)).sum(-1)
     if not recompute_attn:
         Aqk = Aqk.masked_fill(upper_mask, 0)
     A = A * beta[..., None]
@@ -574,7 +653,8 @@ def _chunk_kda_inner_loop(
         # so a token written at position ``c`` is decayed by the sum of the
         # gates from ``c + 1`` through the chunk's last position. The sign
         # matches the upstream FLA reference (fla/ops/kda/naive.py).
-        update = torch.einsum('bhck,bhcv->bhckv', (g_i[:, :, -1:] - g_i).exp() * k_i, v_i)
+        update = (g_i[:, :, -1:] - g_i).exp() * k_i
+        update = update[..., :, None] * v_i[..., None, :]
         S = S + update.sum(-3)
     return chunk_outs, S
 
@@ -616,16 +696,20 @@ def _chunk_kda_inner_loop_recompute(
         g_i = g[:, :, i]
         w_i = w[:, :, i]
         Aqk_i = q_i.new_empty(B, HV, BT, BT)
+        # Only the rows ``c >= j`` survive ``upper_mask``, so they are the
+        # only ones computed. Same values via the same elementwise ops as the
+        # full-grid form; the loop just does ~half the work.
         for j in range(BT):
-            diff = g_i - g_i[..., j:j + 1, :]
+            diff = g_i[..., j:, :] - g_i[..., j:j + 1, :]
             if clamp_g_diff:
                 diff = diff.clamp(max=50.0)
-            Aqk_i[..., j] = (q_i * diff.exp() * k_i[..., j:j + 1, :]).sum(-1)
+            Aqk_i[..., j:, j] = (q_i[..., j:, :] * diff.exp() * k_i[..., j:j + 1, :]).sum(-1)
         Aqk_i = Aqk_i.masked_fill(upper_mask, 0)
         v_i = u_i - w_i @ S
         chunk_outs.append((q_i * g_i.exp()) @ S + Aqk_i @ v_i)
         S = S * g_i[:, :, -1].exp().unsqueeze(-1)
-        update = torch.einsum('bhck,bhcv->bhckv', (g_i[:, :, -1:] - g_i).exp() * k_i, v_i)
+        update = (g_i[:, :, -1:] - g_i).exp() * k_i
+        update = update[..., :, None] * v_i[..., None, :]
         S = S + update.sum(-3)
     return chunk_outs, S
 

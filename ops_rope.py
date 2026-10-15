@@ -182,10 +182,15 @@ def partial_rope(
     x2 = x_rot[..., 1::2]                                    # [..., P, r/2]
     o1 = x1 * cos - x2 * sin
     o2 = x1 * sin + x2 * cos
-    rotated = torch.stack([o1, o2], dim=-1).flatten(-2)      # [..., P, r]
-    if rope_dim == D:
-        return rotated
-    return torch.cat([x[..., : D - rope_dim], rotated], dim=-1)
+    # Assemble the result in one allocation + strided writes instead of
+    # ``stack(...).flatten`` (+ ``cat`` for the partial case): the interleaved
+    # layout is identical and the arithmetic is unchanged.
+    out = torch.empty(x.shape, dtype=x.dtype, device=device)
+    if rope_dim < D:
+        out[..., : D - rope_dim] = x[..., : D - rope_dim]
+    out[..., D - rope_dim::2] = o1
+    out[..., D - rope_dim + 1::2] = o2
+    return out
 
 
 def token_positions(T: int, device, dtype=torch.long) -> torch.Tensor:

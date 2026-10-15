@@ -110,7 +110,7 @@ import torch
 import torch.nn.functional as F
 
 from ops_rope import effective_rope_dim, partial_rope
-from ops_csa import csa_lightning_indexer
+from ops_csa import csa_compress_kv, csa_compress_kv_overlapped, csa_lightning_indexer
 
 
 def _validate_cache_dtype(dtype) -> None:
@@ -341,6 +341,41 @@ class _SlidingWindowRingBuffer:
         _, T_new, _ = x.shape
         for i in range(T_new):
             self._append_one(x[:, i])
+
+    def append_bulk(self, x: torch.Tensor) -> None:
+        """Append ``[B, T_new, c]`` entries in arrival order (vectorized).
+
+        Equivalent to calling :meth:`append` once per token — the final
+        causal-order contents are exactly the last ``min(total, win)``
+        entries written — but without the per-token Python loop, so a
+        prefill of thousands of tokens does not pay thousands of tiny
+        ``copy_`` dispatches. Only the physical placement inside ``_buf``
+        may differ (any placement with the same causal-order view is
+        valid for :meth:`get`).
+        """
+        if x.dim() != 3 or x.shape[0] != self.B or x.shape[-1] != self.c:
+            raise ValueError(
+                f"_SlidingWindowRingBuffer.append_bulk: expected "
+                f"[{self.B}, T_new, {self.c}], got {tuple(x.shape)}.")
+        if x.device != self._buf.device or x.dtype != self._buf.dtype:
+            x = x.to(device=self._buf.device, dtype=self._buf.dtype)
+        if x.shape[1] == 0:
+            return
+        if x.shape[1] >= self.win:
+            # Every entry cached before this call (and every entry of ``x``
+            # except the newest ``win``) is evicted before it can be read,
+            # so the final content is simply the newest ``win`` entries.
+            self._buf[:, :self.win] = x[:, -self.win:]
+            self._sw_head = 0
+            self._sw_len = self.win
+            return
+        # Small append (T_new < win): keep the last
+        # ``min(_sw_len + T_new, win)`` entries of (previous + new).
+        combined = torch.cat([self.get(), x], dim=1)
+        keep = combined[:, -self.win:]
+        self._buf[:, :keep.shape[1]] = keep
+        self._sw_head = 0
+        self._sw_len = keep.shape[1]
 
     def _append_one(self, x_one: torch.Tensor) -> None:
         """Append a single ``[B, c]`` entry."""
@@ -718,6 +753,11 @@ class CSADecodingCache:
         K_idx_new = K_idx_new.to(device=self.device, dtype=self.dtype)
         Z_idx_new = Z_idx_new.to(device=self.device, dtype=self.dtype)
 
+        if T_new > 1:
+            return self._append_bulk(
+                Ca_new, Cb_new, Za_new, Zb_new, K_idx_new, Z_idx_new,
+                Ba, Bb, B_idx,
+            )
         new_block_indices: list[int] = []
         for i in range(T_new):
             # Slice out token i.
@@ -822,6 +862,163 @@ class CSADecodingCache:
                 self._acc_Zb.clear()
                 self._acc_K_idx.clear()
                 self._acc_Z_idx.clear()
+        return new_block_indices
+
+    def _append_bulk(
+        self,
+        Ca_new: torch.Tensor,
+        Cb_new: torch.Tensor,
+        Za_new: torch.Tensor,
+        Zb_new: torch.Tensor,
+        K_idx_new: torch.Tensor,
+        Z_idx_new: torch.Tensor,
+        Ba: torch.Tensor,
+        Bb: torch.Tensor,
+        B_idx: torch.Tensor,
+    ) -> list[int]:
+        """Vectorized ``append_step`` body for ``T_new > 1`` (prefill).
+
+        Splits the incoming tokens at exactly the same block boundaries as
+        the per-token loop (a new block completes every ``m`` tokens counted
+        from the very first token appended to this cache), reuses the same
+        compression helpers, and leaves the same accumulator / ring-buffer /
+        compressed-row state. Only the *grouping* of the calls changes:
+        whole sweeps of blocks go through the batched compression functions
+        instead of one block per Python iteration, removing the per-token
+        dispatch overhead from prefill cache population.
+        """
+        B, T_new, c = Ca_new.shape
+        m = self.m
+        dtype = self.dtype
+        # ----- sliding-window branch (batched) -----
+        if self._sw is not None:
+            if self._normalize_qk:
+                ca_store = F.normalize(Ca_new.to(torch.float), dim=-1)
+            else:
+                ca_store = Ca_new
+            if self.rope_dim_eff > 0:
+                pos = torch.arange(
+                    self._n_tokens_seen, self._n_tokens_seen + T_new,
+                    device=self.device)
+                ca_store = partial_rope(
+                    ca_store.to(torch.float), pos,
+                    self.rope_dim_eff, self.rope_base, dim=1)
+            self._sw.append_bulk(ca_store.to(dtype))
+        self._n_tokens_seen += T_new
+        # ----- accumulate / compress into blocks -----
+        acc = len(self._acc_Ca)
+        first_needed = m - acc
+        if T_new < first_needed:
+            # Still short of the next block boundary: stash every token.
+            self._acc_Ca += list(Ca_new.split(1, dim=1))
+            self._acc_Cb += list(Cb_new.split(1, dim=1))
+            self._acc_Za += list(Za_new.split(1, dim=1))
+            self._acc_Zb += list(Zb_new.split(1, dim=1))
+            self._acc_K_idx += list(K_idx_new.split(1, dim=1))
+            self._acc_Z_idx += list(Z_idx_new.split(1, dim=1))
+            return []
+        if acc:
+            Ca_first = torch.cat(
+                list(self._acc_Ca) + list(Ca_new[:, :first_needed].split(1, dim=1)), dim=1)
+            Cb_first = torch.cat(
+                list(self._acc_Cb) + list(Cb_new[:, :first_needed].split(1, dim=1)), dim=1)
+            Za_first = torch.cat(
+                list(self._acc_Za) + list(Za_new[:, :first_needed].split(1, dim=1)), dim=1)
+            Zb_first = torch.cat(
+                list(self._acc_Zb) + list(Zb_new[:, :first_needed].split(1, dim=1)), dim=1)
+            K_first = torch.cat(
+                list(self._acc_K_idx) + list(K_idx_new[:, :first_needed].split(1, dim=1)), dim=1)
+            Zk_first = torch.cat(
+                list(self._acc_Z_idx) + list(Z_idx_new[:, :first_needed].split(1, dim=1)), dim=1)
+        else:
+            Ca_first = Ca_new[:, :first_needed]
+            Cb_first = Cb_new[:, :first_needed]
+            Za_first = Za_new[:, :first_needed]
+            Zb_first = Zb_new[:, :first_needed]
+            K_first = K_idx_new[:, :first_needed]
+            Zk_first = Z_idx_new[:, :first_needed]
+        new_C_first = _csa_compress_kv_overlapped_single(
+            Ca_first, Cb_first, Za_first, Zb_first,
+            self._prev_Cb, self._prev_Zb, Ba, Bb,
+        )                                                          # [B, c]
+        new_K_first = _indexer_compress_single(
+            K_first, Zk_first, B_idx)                              # [B, c_I]
+        rest = T_new - first_needed
+        n_rest = rest // m
+        tail = rest % m
+        if n_rest:
+            rest_end = first_needed + n_rest * m
+            Ca_rest = Ca_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
+            Cb_rest = Cb_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
+            Za_rest = Za_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
+            Zb_rest = Zb_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
+            # Prepend the already-compressed first block so that the batched
+            # overlap shift gives the remaining blocks the correct partner
+            # (row 0 of the output is the first block itself and is dropped).
+            Ca_seq = torch.cat([Ca_first.unsqueeze(1), Ca_rest], dim=1)
+            Cb_seq = torch.cat([Cb_first.unsqueeze(1), Cb_rest], dim=1)
+            Za_seq = torch.cat([Za_first.unsqueeze(1), Za_rest], dim=1)
+            Zb_seq = torch.cat([Zb_first.unsqueeze(1), Zb_rest], dim=1)
+            new_C_rest = csa_compress_kv_overlapped(
+                Ca_seq.reshape(B, (n_rest + 1) * m, c),
+                Cb_seq.reshape(B, (n_rest + 1) * m, c),
+                Za_seq.reshape(B, (n_rest + 1) * m, c),
+                Zb_seq.reshape(B, (n_rest + 1) * m, c),
+                Ba, Bb, m,
+            )[:, 1:]                                               # [B, n_rest, c]
+            new_K_rest = csa_compress_kv(
+                K_idx_new[:, first_needed:rest_end].reshape(
+                    B, n_rest * m, self.c_I),
+                Z_idx_new[:, first_needed:rest_end].reshape(
+                    B, n_rest * m, self.c_I),
+                B_idx, m,
+            )                                                      # [B, n_rest, c_I]
+            new_C_all = torch.cat(
+                [new_C_first.unsqueeze(1), new_C_rest], dim=1)
+            new_K_all = torch.cat(
+                [new_K_first.unsqueeze(1), new_K_rest], dim=1)
+            last_Cb = Cb_rest[:, -1]
+            last_Zb = Zb_rest[:, -1]
+        else:
+            new_C_all = new_C_first.unsqueeze(1)
+            new_K_all = new_K_first.unsqueeze(1)
+            last_Cb = Cb_first
+            last_Zb = Zb_first
+        n_new = 1 + n_rest
+        # Partial RoPE: rotate the just-completed compressed entries at
+        # their block-anchor positions ``block_idx * m`` (same positions
+        # and normalize-then-rotate order as the per-token path).
+        if self.rope_dim_eff > 0:
+            pos_b = torch.arange(
+                self._n_blocks, self._n_blocks + n_new, device=self.device) * m
+            new_C_all = partial_rope(
+                new_C_all, pos_b,
+                self.rope_dim_eff, self.rope_base, dim=1)
+        block_idx0 = self._n_blocks
+        self._ensure_compressed_capacity(block_idx0 + n_new)
+        self._C_comp[:, block_idx0:block_idx0 + n_new] = new_C_all.to(dtype)
+        self._K_IComp[:, block_idx0:block_idx0 + n_new] = new_K_all.to(dtype)
+        self._n_blocks += n_new
+        new_block_indices = list(range(block_idx0, block_idx0 + n_new))
+        # Stash the LAST block's Cb / Zb as the overlap partner for the next
+        # compression (detached: decode must not retain the prefill graph).
+        self._prev_Cb = last_Cb.detach().clone()
+        self._prev_Zb = last_Zb.detach().clone()
+        # Leave the tokens past the last full block in the accumulator.
+        if tail:
+            self._acc_Ca = list(Ca_new[:, -tail:].split(1, dim=1))
+            self._acc_Cb = list(Cb_new[:, -tail:].split(1, dim=1))
+            self._acc_Za = list(Za_new[:, -tail:].split(1, dim=1))
+            self._acc_Zb = list(Zb_new[:, -tail:].split(1, dim=1))
+            self._acc_K_idx = list(K_idx_new[:, -tail:].split(1, dim=1))
+            self._acc_Z_idx = list(Z_idx_new[:, -tail:].split(1, dim=1))
+        else:
+            self._acc_Ca = []
+            self._acc_Cb = []
+            self._acc_Za = []
+            self._acc_Zb = []
+            self._acc_K_idx = []
+            self._acc_Z_idx = []
         return new_block_indices
 
     # ----- core: compute attention output for the current query ---------
@@ -1299,6 +1496,8 @@ class HCADecodingCache:
                 f"{Z_new.shape[1]} does not match C_new.shape[1]={T_new}.")
         C_new = C_new.to(device=self.device, dtype=self.dtype)
         Z_new = Z_new.to(device=self.device, dtype=self.dtype)
+        if T_new > 1:
+            return self._append_bulk(C_new, Z_new, B_pos)
 
         new_block_indices: list[int] = []
         for i in range(T_new):
@@ -1351,6 +1550,91 @@ class HCADecodingCache:
                 new_block_indices.append(self._n_blocks - 1)
                 self._acc_C.clear()
                 self._acc_Z.clear()
+        return new_block_indices
+
+    def _append_bulk(
+        self,
+        C_new: torch.Tensor,
+        Z_new: torch.Tensor,
+        B_pos: torch.Tensor,
+    ) -> list[int]:
+        """Vectorized ``append_step`` body for ``T_new > 1`` (prefill).
+
+        Mirrors :meth:`CSADecodingCache._append_bulk`: identical block
+        boundaries (every ``m2`` tokens from the first token ever appended)
+        and identical compression helpers, with whole sweeps of blocks
+        compressed in a single batched call instead of one call per token.
+        """
+        B, T_new, c = C_new.shape
+        m2 = self.m2
+        dtype = self.dtype
+        # ----- sliding-window branch (batched) -----
+        if self._sw is not None:
+            if self._normalize_qk:
+                c_store = F.normalize(C_new.to(torch.float), dim=-1)
+            else:
+                c_store = C_new
+            if self.rope_dim_eff > 0:
+                pos = torch.arange(
+                    self._n_tokens_seen, self._n_tokens_seen + T_new,
+                    device=self.device)
+                c_store = partial_rope(
+                    c_store.to(torch.float), pos,
+                    self.rope_dim_eff, self.rope_base, dim=1)
+            self._sw.append_bulk(c_store.to(dtype))
+        self._n_tokens_seen += T_new
+        # ----- accumulate / compress into blocks -----
+        acc = len(self._acc_C)
+        first_needed = m2 - acc
+        if T_new < first_needed:
+            self._acc_C += list(C_new.split(1, dim=1))
+            self._acc_Z += list(Z_new.split(1, dim=1))
+            return []
+        if acc:
+            C_first = torch.cat(
+                list(self._acc_C) + list(C_new[:, :first_needed].split(1, dim=1)), dim=1)
+            Z_first = torch.cat(
+                list(self._acc_Z) + list(Z_new[:, :first_needed].split(1, dim=1)), dim=1)
+        else:
+            C_first = C_new[:, :first_needed]
+            Z_first = Z_new[:, :first_needed]
+        new_C_first = _hca_compress_kv_single(C_first, Z_first, B_pos)  # [B, c]
+        rest = T_new - first_needed
+        n_rest = rest // m2
+        tail = rest % m2
+        if n_rest:
+            rest_end = first_needed + n_rest * m2
+            new_C_rest = csa_compress_kv(
+                C_new[:, first_needed:rest_end].reshape(B, n_rest * m2, c),
+                Z_new[:, first_needed:rest_end].reshape(B, n_rest * m2, c),
+                B_pos, m2,
+            )                                                      # [B, n_rest, c]
+            new_C_all = torch.cat(
+                [new_C_first.unsqueeze(1), new_C_rest], dim=1)
+        else:
+            new_C_all = new_C_first.unsqueeze(1)
+        n_new = 1 + n_rest
+        # Partial RoPE: rotate the just-completed heavy compressed entries
+        # at their block-anchor positions ``block_idx * m2`` (same positions
+        # and rotate-before-store order as the per-token path).
+        if self.rope_dim_eff > 0:
+            pos_b = torch.arange(
+                self._n_blocks, self._n_blocks + n_new, device=self.device) * m2
+            new_C_all = partial_rope(
+                new_C_all, pos_b,
+                self.rope_dim_eff, self.rope_base, dim=1)
+        block_idx0 = self._n_blocks
+        self._ensure_compressed_capacity(block_idx0 + n_new)
+        self._C_comp[:, block_idx0:block_idx0 + n_new] = new_C_all.to(dtype)
+        self._n_blocks += n_new
+        new_block_indices = list(range(block_idx0, block_idx0 + n_new))
+        # Leave the tokens past the last full block in the accumulator.
+        if tail:
+            self._acc_C = list(C_new[:, -tail:].split(1, dim=1))
+            self._acc_Z = list(Z_new[:, -tail:].split(1, dim=1))
+        else:
+            self._acc_C = []
+            self._acc_Z = []
         return new_block_indices
 
     # ----- core: compute attention output for the current query ---------
