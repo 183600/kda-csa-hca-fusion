@@ -85,10 +85,8 @@ def _angle_dtype(x: torch.Tensor) -> torch.dtype:
 
 
 # ``inv_freq = base ** (-arange(0, rope_dim, 2) / rope_dim)`` depends only on
-# (rope_dim, base, device, dtype) — never on the data — so it is computed once
-# per configuration instead of on every ``partial_rope`` call (the decode path
-# calls this function several times per token). The tensors are treated as
-# immutable by all callers.
+# (rope_dim, base, device, dtype) — never on the data. The tensors are treated
+# as immutable by all callers.
 _INV_FREQ_CACHE: dict = {}
 
 
@@ -165,8 +163,7 @@ def partial_rope(
         raise ValueError(f"partial_rope: base={base!r} must be positive.")
     device = x.device
     angle_dtype = _angle_dtype(x)
-    # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1 (cached;
-    # bit-identical table, see ``_inv_freq``).
+    # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1 (see ``_inv_freq``).
     inv_freq = _inv_freq(rope_dim, base, device, angle_dtype)  # [rope_dim/2]
     pos = positions.to(device=device, dtype=angle_dtype)     # [P]
     angles = pos[:, None] * inv_freq[None, :]                # [P, rope_dim/2]

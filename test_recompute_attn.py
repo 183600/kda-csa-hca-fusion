@@ -1,7 +1,5 @@
 """Regression tests for the chunkwise-KDA recompute-vs-cache knob.
 
-Round theme: **recompute versus cache / torch.compile / regression testing.**
-
 ``naive_chunk_kda(..., recompute_attn=True)`` (and
 ``scripted_chunk_kda(..., recompute_attn=True)``) switches the reference
 chunk path from the default *cache* policy — where every chunk's
@@ -22,11 +20,8 @@ How to run::
     pytest -q test_recompute_attn.py          # from the repo root
 
 The file is intentionally standalone (own ``device`` fixture, no
-conftest dependency) and is fast enough for the CI gate's fast loop; it
-is not listed in ``ci_gate.py``'s hardcoded two-file pytest invocation
-(``run_correctness.py`` / ``test_figures.py`` are protected by the
-continuous-loop policy), but ``pyproject.toml`` sets
-``testpaths = ["."]`` so any bare ``pytest`` run collects it.
+conftest dependency); ``pyproject.toml`` sets ``testpaths = ["."]`` so any
+bare ``pytest`` run collects it.
 """
 
 from __future__ import annotations
@@ -267,8 +262,8 @@ def test_compiled_recurrent_kda_fast_parity(device):
 
     The longer compile regression test in ``run_correctness.py`` is marked
     ``slow`` and therefore skipped by the CI gate's ``-m "not slow"`` loop.
-    This tiny-shape check keeps the dynamo tracing contract (the
-    review-fix 1.1-a failure mode) exercised in any fast run of this file.
+    This tiny-shape check keeps the dynamo tracing contract exercised in any
+    fast run of this file.
     """
     q, k, v, g, beta = _make_case(41, 1, 8, 1, 4, 4, device=device)
     o_ref, s_ref = naive_recurrent_kda(

@@ -39,7 +39,7 @@
 坑逐一处理并以测试锁定，更适合作为发论文的基础。因此本仓库的决策是：
 
 1. **保留** `ops_kda / ops_csa / ops_hca / ops_fused / ops_decoding_cache` 作为唯一算子实现；
-2. **新增** `train_lm_autodl.py` 训练管线（Kaggle / AutoDL，成本 <120 元），直接调用
+2. **新增** `train_lm_autodl.py` 训练管线（Kaggle / AutoDL），直接调用
    `ops_fused.HybridKCHAttention`；
 3. **废弃** toy 入口：`train_toy_reference.py` 仅保留文件名兼容，转发到受支持的训练管线。
 

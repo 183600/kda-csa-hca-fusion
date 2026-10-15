@@ -25,8 +25,7 @@ We now report TWO accounting modes:
 We also make the baseline explicit: the GQA8 baseline is a *5-layer* unit
 (5 full GQA8 attention layers) so that the comparison to the 3:1:1 hybrid
 (5 sub-layers) is apples-to-apples. The original paper compared a 5-sub-layer
-hybrid to a single GQA8 layer, which understated the ratio by ~5x; we report
-both for transparency.
+hybrid to a single GQA8 layer; we report both for transparency.
 
 The numbers mirror the efficiency discussion in DeepSeek-V4 §2.3.4 and Kimi
 Linear §3.2 / §7.
@@ -53,11 +52,8 @@ DEFAULTS = dict(
     H=8, K=128, V=128, d=4096,
     csa_m=16, csa_c=128, csa_topk=512, csa_nIh=4, csa_cI=32, csa_sliding_window=2048,
     # Number of attention heads for CSA / HCA core. The default of 8 heads
-    # matches the repo's H=8; the sink has ``nh`` elements per layer. Previously
-    # these keys were absent from DEFAULTS, so ``kv_cache_elements`` fell back
-    # to ``p.get('csa_nh', H)`` and silently used H=8 — which happened to be
-    # correct, but only by accident. Make the value explicit so the sink
-    # count is correct even if H is ever changed.
+    # matches the repo's H=8; the sink has ``nh`` elements per layer. The
+    # value is explicit so the sink count is correct even if H is changed.
     csa_nh=8, csa_dc=128,
     hca_m2=64, hca_c=128, hca_sliding_window=2048,
     hca_nh=8, hca_dc=128,
@@ -245,9 +241,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             indexer = compressed_capacity * csa_cI
             # Incremental decode also retains a partial-token accumulator until
             # a full block is available. CSA stores six per-token projections:
-            # Ca/Cb/Za/Zb (4*c) plus indexer K/Z (2*c_I). The previous
-            # ``full_accounting`` mode omitted this runtime state, so it was not
-            # truly full for non-divisible T.
+            # Ca/Cb/Za/Zb (4*c) plus indexer K/Z (2*c_I).
             partial_tokens = T % csa_m
             partial = partial_tokens * (4 * csa_c + 2 * csa_cI)
             # Overlapped CSA compression needs the previous block's Cb/Zb as
@@ -286,8 +280,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
     if op == 'hybrid_kch':
         # 3 KDA + 1 CSA + 1 HCA per 5-layer unit (default 3:1:1).
         # Allow override via kwargs so non-default ratios are accounted for
-        # correctly — previously the ratio was hardcoded, which silently
-        # produced wrong KV-cache numbers for any ablation ratio.
+        # correctly.
         n_kda = p.get('hybrid_n_kda', 3)
         n_csa = p.get('hybrid_n_csa', 1)
         n_hca = p.get('hybrid_n_hca', 1)
@@ -305,12 +298,9 @@ def prefill_flops(op: str, T: int, **kw):
     Accounting conventions
     ----------------------
     Every attention op has TWO matmuls in its core: ``QK^T`` (over the key
-    dim) and ``softmax(P) @ V`` (over the value dim). Both must be counted
-    for the comparison to be fair across operators. The previous version
-    counted BOTH for ``softmax_gqa`` (``2 * T * T * H * (K + V)``) but
-    ONLY the ``QK^T`` term for CSA / HCA — undercounting their core FLOPs
-    by ~2x and biasing the ``flops_ratio_vs_gqa_*`` columns roughly 2x in
-    the hybrid's favor.
+    dim) and ``softmax(P) @ V`` (over the value dim). Both are counted for
+    every operator so the ``flops_ratio_vs_gqa_*`` columns are comparable
+    across operators.
 
     For KDA, the recurrence (see ``ops_kda.py::naive_recurrent_kda``) has
     roughly 4 ``HV*K*V``-sized matvec operations per step:
@@ -327,16 +317,13 @@ def prefill_flops(op: str, T: int, **kw):
     (``ops_fused.KDAHybridLayer``, ``kda_chunk_size=64`` default) actually
     computes those inter-chunk terms (the block transfer matrix ``A`` and the
     ``u``/``w`` inter-chunk outputs), so we add
-    ``HV * (3T*C*K + T*C^2)`` to the recurrent dominant term. The previous
-    formula used ``2 * T * HV*K*V``, a ~3x underestimate of the dominant
-    term alone. We also include the input projection FLOPs (q/k/v/g/beta
-    plus the grouped output projection) for parity with CSA/HCA and the
-    softmax baseline.
+    ``HV * (3T*C*K + T*C^2)`` to the recurrent dominant term. We also
+    include the input projection FLOPs (q/k/v/g/beta plus the grouped
+    output projection) for parity with CSA/HCA and the softmax baseline.
 
-    For CSA, the ``compress`` term previously counted only ``W_aKV``
-    (one ``T*d*c`` projection). The actual implementation
-    (``ops_csa.py::naive_csa``) does SIX input projections:
-    ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx``. We count all six.
+    For CSA, the ``compress`` term counts the SIX input projections the
+    implementation (``ops_csa.py::naive_csa``) performs:
+    ``W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx``.
     We also count each operator's grouped output projection (KDA ``o_proj``,
     CSA/HCA ``o_proj``), so Exp3's "single-layer FLOPs" boundary matches
     Exp2's end-to-end standalone CSA/HCA boundary.
@@ -353,11 +340,6 @@ def prefill_flops(op: str, T: int, **kw):
         # apply a strictly-upper-triangular mask). Each query t attends
         # to keys [0, t], i.e. (t+1) keys. Total attention entries over
         # all queries = T*(T+1)/2 (the upper-triangular-inclusive count).
-        # The previous formula ``2 * T * T * H * (K + V)`` assumed a FULL
-        # T*T attention matrix (non-causal), overcounting FLOPs by ~2x.
-        # Since ``flops_ratio_vs_gqa_* = flops(op) / flops(softmax_gqa)``,
-        # this 2x baseline bias made every other operator look ~2x
-        # cheaper than it really is.
         # GQA8: H=8 KV heads shared by a full-rank query side. With
         # head_dim=128 and d=4096, the query side has n_q = d // head_dim = 32
         # heads; the KV side has n_kv = 8. Query-side terms (core, q_proj,
@@ -367,14 +349,7 @@ def prefill_flops(op: str, T: int, **kw):
         causal_entries = T * (T + 1) // 2
         core = 2 * causal_entries * n_q * (K + V)
         # Input/output projections — counted for PARITY with KDA / CSA / HCA,
-        # whose ``proj`` / ``compress`` / ``query_proj`` terms already include
-        # them. The previous version omitted them from softmax_gqa, making the
-        # denominator of ``flops_ratio_vs_gqa_*`` artificially small and the
-        # ratios artificially large. At short T (e.g. 512) this swung the KDA
-        # ratio from 0.79x (KDA is cheaper) to 26x (KDA looks 26x more
-        # expensive) — a ~33x error in the headline comparison. At long T the
-        # core dominates and the asymmetry shrinks to <2%, but the swept table
-        # includes short-T rows where the error is large.
+        # whose ``proj`` / ``compress`` / ``query_proj`` terms include them.
         #   q_proj : d -> n_q*K  -> T*d*n_q*K MACs
         #   k_proj : d -> n_kv*K -> T*d*n_kv*K MACs
         #   v_proj : d -> n_kv*V -> T*d*n_kv*V MACs
@@ -384,10 +359,7 @@ def prefill_flops(op: str, T: int, **kw):
         return core + proj + out_proj
     if op == 'kda':
         # Input projections — count the ACTUAL matmul shapes from
-        # ops_fused.py::KDAHybridLayer, not an approximation. The previous
-        # formula ``2 * T * d * kda_k * 5`` treated all 5 projections as
-        # ``T*d*K`` MACs, dropping the H/HV factor — a ~5x underestimate
-        # at the default H=8, K=128.
+        # ops_fused.py::KDAHybridLayer, not an approximation.
         #   q_proj  : d -> H*K    -> T*d*H*kda_k MACs
         #   k_proj  : d -> H*K    -> T*d*H*kda_k MACs
         #   v_proj  : d -> HV*V   -> T*d*kda_hv*kda_v MACs  (V==kda_v)
@@ -460,11 +432,8 @@ def prefill_flops(op: str, T: int, **kw):
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
-        # query). The previous formula ``T * w`` assumed every query
-        # attends to exactly w keys, which overcounts by ~8x at T=512
-        # (where w=2048 but only ~131K of the 1M claimed entries exist).
-        # Total causal-window entries = T*w - w*(w-1)/2 when T >= w,
-        # else T*(T+1)/2.
+        # query). Total causal-window entries = T*w - w*(w-1)/2 when
+        # T >= w, else T*(T+1)/2.
         sw_w = p['csa_sliding_window']
         eff_sw = min(T, sw_w)
         sw_entries = T * eff_sw - eff_sw * (eff_sw - 1) // 2

@@ -28,13 +28,12 @@ from ops_rope import (
 
 
 # =============================================================================
-# Chunked sliding-window attention helper (issue 2.2 fix)
+# Chunked sliding-window attention helper
 # -----------------------------------------------------------------------------
-# The previous sliding-window implementation used
-# ``C_padded.unfold(1, win, 1)`` which materializes a ``[B, T, win, c]`` tensor
-# in a single allocation. For ``T=64K, win=2K, c=64, B=1`` this is
-# ``64K × 2K × 64 × 4B = 32 GB`` — far beyond GPU memory. The README's
-# *Limitations* section acknowledges this but no fix was provided in-repo.
+# A plain ``C_padded.unfold(1, win, 1)`` implementation materializes a
+# ``[B, T, win, c]`` tensor in a single allocation. For
+# ``T=64K, win=2K, c=64, B=1`` this is
+# ``64K × 2K × 64 × 4B = 32 GB`` — far beyond GPU memory.
 #
 # This helper processes the window axis in chunks of ``chunk_t`` query
 # positions at a time, keeping peak memory at ``O(chunk_t · win · c)`` instead
@@ -200,16 +199,12 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     becomes visible to query ``t=8`` (the first token of the NEXT block);
     queries ``t=0..7`` cannot see it through the sparse branch.
 
-    .. note:: Historical off-by-one (fixed). This repository previously
-        used the window-close variant ``b < (t + 1) // m`` (a block became
-        visible at its own final source token). That variant does not leak
-        future information either — at ``t = (b+1)*m - 1`` the whole source
-        window of block ``b`` is complete — but it deviates from the
-        paper's strictly-preceding rule by additionally exposing the
-        query's own block at one position per block. The window-close
-        variant was never attributed to the paper by Eq. 16; it is now
-        aligned to the paper-exact mask everywhere (naive operators,
-        decoding caches, and the FLOPs accounting in ``run_kv_cache``).
+    .. note:: The query's own block is never visible through the sparse
+        branch, whether it is still partial or already complete; any
+        in-block context is served by the sliding-window branch instead.
+        This strictly-preceding rule is applied consistently (naive
+        operators, decoding caches, and the FLOPs accounting in
+        ``run_kv_cache``).
     """
     if not isinstance(T, int) or T < 0:
         raise ValueError(f"T must be a non-negative int, got {T!r}")
@@ -453,24 +448,23 @@ def csa_lightning_indexer(
         body, and the *Fairness notes* in the README). Setting to
         ``False`` (the default)
         preserves the historical un-normalized behaviour for backward
-        compatibility with existing benchmark results; **new use cases
-        should pass ``normalize_qk=True``** to match the
+        compatibility; **new use cases should pass
+        ``normalize_qk=True``** to match the
         magnitude-invariant contract of the CSA/HCA core attention
         (which L2-normalizes both ``q`` and ``C_comp``). The option
         is also exposed for ablation against the magnitude-sensitive
         baseline.
 
-    .. note:: P0-4 fix — straight-through estimator (STE) for the indexer.
+    .. note:: Straight-through estimator (STE) for the indexer.
 
         The returned ``idx`` tensor is an integer tensor produced by
         ``torch.topk``. Integer indices do NOT propagate gradients, so
-        without an auxiliary path autograd cannot flow back from the
+        an auxiliary path is needed for autograd to flow back from the
         loss through the selection to the indexer parameters
         (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` in
-        ``CSAHybridLayer``). After a backward pass these parameters had
-        ``.grad is None`` and were silently skipped by ``AdamW``.
+        ``CSAHybridLayer``).
 
-        The fix adds a **straight-through estimator**: when
+        When
         ``return_soft_weights=True`` (the default in ``naive_csa``),
         this function ALSO returns ``soft_weights`` of shape
         ``[B, T, n_blocks]`` — a differentiable probability
@@ -495,12 +489,12 @@ def csa_lightning_indexer(
         implementation that closes the gradient-flow gap without adding
         a separate auxiliary loss term.
 
-    .. note:: topk=0 guard (P0 API self-containment).
+    .. note:: topk=0 guard.
 
         ``topk=0`` is a valid degenerate configuration ("no sparse
         selection"). The downstream ``naive_csa`` guards against the
-        ``scores.amax(-1)`` crash on an empty dim, but historically
-        relied on its own early return. We now also guard here so a
+        ``scores.amax(-1)`` crash on an empty dim, and this function
+        also guards here so a
         direct caller of ``csa_lightning_indexer`` (it is a PUBLIC
         function imported by ``run_correctness.py`` and
         ``method_analysis.py``) does not crash with
@@ -601,7 +595,7 @@ def csa_lightning_indexer(
         logits = torch.einsum('b h t n, b t h -> b t n', score, w_idx)  # [B, T, n_blocks]
     if causal_block_mask is not None:
         logits = logits.masked_fill(~causal_block_mask, float('-inf'))
-    # P0 topk=0 guard: return shape-[B, T, 0] indices directly so the
+    # topk=0 guard: return shape-[B, T, 0] indices directly so the
     # function is self-contained (does not rely on ``naive_csa`` to guard
     # the ``scores.amax(-1)`` call). ``torch.topk(logits, 0, ...)`` would
     # itself succeed (returning an empty tensor), but the explicit branch
@@ -677,7 +671,7 @@ def naive_csa(
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
-    Returns output ``[B, T, nh*c]``. NOTE (attribution fixed): the caller
+    Returns output ``[B, T, nh*c]``. NOTE: the caller
     performs a FULL output projection ``[B, T, nh*c] -> d`` — NOT the
     paper's grouped output projection (§2.3.1, which first splits the
     ``nh`` head outputs into ``g`` groups and projects each group to a
@@ -695,17 +689,12 @@ def naive_csa(
     right-padding). This lets incremental-decoding callers (e.g.
     ``run_decoding.CSAAttnDecoding``) populate a
     :class:`ops_decoding_cache.CSADecodingCache` WITHOUT recomputing the 6
-    projections a second time — eliminating a redundant fused matmul that
-    previously inflated CSA/HCA/hybrid prefill latency by ~1.5-3x relative
-    to softmax/KDA (whose prefill populates the cache as a side effect of
-    the native forward call).
+    projections a second time.
 
-    **Weight layout** (P0 API fix): all ``W_*`` tensors follow the
+    **Weight layout**: all ``W_*`` tensors follow the
     ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
-    Internally we use ``F.linear(x, W)`` (which computes ``x @ W.T``) instead
-    of the previous ``x @ W`` form that required callers to pass
-    ``self.W_aKV.weight.T`` (a non-contiguous view materialized on every
-    forward). Callers now pass ``self.W_aKV.weight`` directly.
+    Internally we use ``F.linear(x, W)`` (which computes ``x @ W.T``).
+    Callers pass ``self.W_aKV.weight`` directly.
 
     ``T`` does NOT need to be divisible by ``m``: the function right-pads the
     sequence with zeros up to the next multiple of ``m`` and trims the output
@@ -716,14 +705,13 @@ def naive_csa(
     callers (without the external padding done by ``HybridKCHAttention`` or
     ``CSAAttn``) would hit a bare ``ValueError`` with no message.
 
-    .. warning:: **review-fix 1.3 — ``fuse_projections`` and the**
+    .. warning:: **``fuse_projections`` and the**
         ``use_ste=False`` **gradient contract.**
 
         By default (``fuse_projections=True``) this function concatenates
         the 6 KV/indexer-compression weights (``W_aKV, W_bKV, W_aZ, W_bZ,
-        W_KV_idx, W_Z_idx``) into a single matmul (issue 2.3 fix — see the
-        in-code comment above ``combined_weight`` for the performance
-        rationale). This is a pure **forward-value-preserving**
+        W_KV_idx, W_Z_idx``) into a single matmul (see the in-code comment
+        above ``combined_weight``). This is a pure **forward-value-preserving**
         optimization — the output is bit-identical (to fp32 tolerance) to
         doing the 6 ``F.linear`` calls separately — but it has an
         observable side effect on the **backward** pass when
@@ -762,9 +750,8 @@ def naive_csa(
     # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
     # are silently stripped under optimization, which would re-expose the
     # cryptic crashes these guards are specifically meant to prevent.
-    # ``raise ValueError`` is the standard exception for invalid user input (the previous
-    # tests in ``run_correctness.py::test_csa_hca_input_validation`` expect
-    # (they now catch ``ValueError``; the test was updated to accept both ValueError and AssertionError for backward compatibility with any external callers that may still catch AssertionError).
+    # ``raise ValueError`` is the standard exception for invalid user input
+    # (``run_correctness.py::test_csa_hca_input_validation`` expects it).
     if m < 1:
         raise ValueError(f"compression factor m={m} must be >= 1")
     if topk < 0:
@@ -844,8 +831,8 @@ def naive_csa(
         # ``ValueError: not enough values to unpack``. The projections are
         # empty tensors of the correct feature dims so any downstream
         # cache-population code that iterates over the time axis is a no-op,
-        # matching the contract of the T>0 path. Mirrors the fix applied to
-        # ``ops_hca.py::naive_hca`` for the same edge case.
+        # matching the contract of the T>0 path. Mirrors
+        # ``ops_hca.py::naive_hca``'s handling of the same edge case.
         out_empty = torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)
         if return_projections:
             Ca_empty = torch.zeros(B_, 0, c, dtype=H.dtype, device=device)
@@ -890,14 +877,11 @@ def naive_csa(
     # order (which may differ slightly when the kernel sees a larger M,
     # but well below the fp32 tolerance enforced by ``run_correctness.py``).
     #
-    # Autograd contract CHANGE (intentional): under ``use_ste=False`` the
-    # indexer weights ``W_KV_idx`` and ``W_Z_idx`` previously received
-    # ``None`` grad (because the indexer's top-k selection didn't propagate
-    # gradient, and the weights weren't tied to any other path). With the
-    # merged matmul they now receive a ZERO (but non-None) grad, because
-    # autograd flows backward through the single matmul into all 6 weight
-    # slices. The substantive contract — "indexer params don't learn
-    # without STE" — is preserved: the grad is zero, so the optimizer
+    # Autograd contract: under ``use_ste=False`` the indexer weights
+    # ``W_KV_idx`` and ``W_Z_idx`` receive a ZERO (but non-None) grad,
+    # because autograd flows backward through the single matmul into all
+    # 6 weight slices. The substantive contract — "indexer params don't
+    # learn without STE" — is preserved: the grad is zero, so the optimizer
     # step is a no-op. ``test_csa_indexer_ste_gradient`` was updated to
     # check for "no useful gradient" (None OR all-zero) instead of
     # requiring None specifically.
@@ -940,17 +924,17 @@ def naive_csa(
             [c, c, c, c, c_I, c_I], dim=-1,
         )
     else:
-        # Review-fix 1.3: ``fuse_projections=False`` restores the 6
-        # separate ``F.linear`` calls (the pre-issue-2.3 behaviour). The
-        # forward VALUE is identical to the fused path (up to GEMM
+        # ``fuse_projections=False`` uses the 6 separate ``F.linear`` calls.
+        # The forward VALUE is identical to the fused path (up to GEMM
         # reduction-order noise, well below the fp32 test tolerance), but
         # the BACKWARD path differs when ``use_ste=False``: here,
         # ``W_KV_idx``/``W_Z_idx`` are consumed ONLY by the (non-
         # differentiable-under-no-STE) indexer path, so they receive
         # ``None`` gradient instead of the fused path's zero-but-non-None
-        # gradient. See the "review-fix 1.3" docstring warning above for
-        # the full rationale and ``test_csa_fuse_projections_grad_contract``
-        # in run_correctness.py for the regression test.
+        # gradient. See the ``fuse_projections`` docstring warning above
+        # for the full rationale and
+        # ``test_csa_fuse_projections_grad_contract`` in run_correctness.py
+        # for the regression test.
         Ca = F.linear(H, W_aKV)
         Cb = F.linear(H, W_bKV)
         Za = F.linear(H, W_aZ)
@@ -999,12 +983,10 @@ def naive_csa(
     # while no-grad inference uses the lean hard-index path.
     effective_use_ste = use_ste and torch.is_grad_enabled()
     # The lightning indexer scores are dot products over DI = c_I (not c).
-    # Scale policy: csa_lightning_indexer now AUTO-SELECTS the scale —
-    #   * normalize_qk=True  -> scale=1.0 (cosine similarity; P0-2 fix round 1)
+    # Scale policy: csa_lightning_indexer AUTO-SELECTS the scale —
+    #   * normalize_qk=True  -> scale=1.0 (cosine similarity)
     #   * normalize_qk=False -> scale=c_I**-0.5 (classical dot-product attention)
-    # Callers pass scale=None to defer to that policy; previously we hard-coded
-    # ``c_I ** -0.5`` which, combined with normalize_qk=True, over-shrunk the
-    # logits and damped the STE gradient (systematically slowing indexer learning).
+    # Callers pass scale=None to defer to that policy.
     indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
                                     scale=None,
                                     causal_block_mask=cbm,
@@ -1062,12 +1044,9 @@ def naive_csa(
     # ``scale=``.
     # NOTE: this block MUST run BEFORE the topk=0 branch so ``scale`` is
     # resolved for the sliding-window branch (which runs AFTER the if/else
-    # and uses ``scale`` unconditionally). Previously it was inside the
-    # ``else`` branch, leaving ``scale=None`` when topk=0 or when the
-    # ``else`` branch was skipped for any other reason, causing a
-    # ``None * tensor`` crash in ``_sliding_window_attention``.
-    # (2026-08 port: an earlier LLM fix round accidentally pasted this
-    # block TWICE; the duplicate — a functional no-op — was removed.)
+    # and uses ``scale`` unconditionally); otherwise ``scale`` can be left
+    # as ``None``, causing a ``None * tensor`` crash in
+    # ``_sliding_window_attention``.
     if scale is None:
         if not normalize_qk:
             scale = c ** -0.5
@@ -1308,9 +1287,8 @@ def naive_csa(
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
     # [B, T, nh*c]; the caller performs the grouped output projection.
-    # Cast to H.dtype at the very end so all intermediate computation benefits
-    # from compute_dtype precision (previously the sparse branch output was
-    # cast to H.dtype *before* the SW branch, losing precision unnecessarily).
+    # Cast to H.dtype at the very end so all intermediate computation
+    # benefits from compute_dtype precision.
     # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
     # matches the input's original T (right-padding added zeros at the end,
     # which never affect real-token outputs thanks to the causal block mask).

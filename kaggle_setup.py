@@ -201,7 +201,7 @@ def setup_kaggle(verbose: bool = True) -> None:
     """Install the CUDA torch wheel if running on Kaggle with a GPU but a
     CPU-only torch build.
 
-    P0-3 fix — process-internal torch replacement does NOT work:
+    Process-internal torch replacement does NOT work:
 
     This module does ``import torch`` at the top of the file. Once a
     Python process has imported torch, the loaded ``libtorch.so`` binary
@@ -212,15 +212,7 @@ def setup_kaggle(verbose: bool = True) -> None:
     to ``torch.cuda.is_available()`` continue to return ``False`` even
     though ``pip show torch`` reports the CUDA build.
 
-    The previous implementation installed the CUDA wheel and then
-    printed "CUDA should now be available after a restart", but
-    ``run_all()`` immediately continued into ``detect_env()`` and the
-    experiments — without any restart — so the first run on Kaggle
-    silently used CPU. The "after a restart" caveat was effectively
-    unreachable from the documented entry point.
-
-    The correct fix is to split the bootstrap from the experiment
-    process:
+    The bootstrap is therefore split from the experiment process:
 
     1. **Bootstrap** (run once, in a throwaway process or a notebook
        first cell): install the CUDA wheel, then EXIT / restart the
@@ -247,22 +239,18 @@ def setup_kaggle(verbose: bool = True) -> None:
     # (e.g. ``python kaggle_setup.py`` from the command line, or a notebook
     # cell that calls ``setup_kaggle()`` directly without going through
     # ``run_all._setup()``) can bypass the CUDA-availability guard on a
-    # GPU machine to run CPU-only experiments. Previously the escape hatch
-    # was documented in the ``RuntimeError`` message below but only
-    # honored by ``run_all._setup()``, so direct callers were stuck despite
-    # the message telling them to set the env var. The README also
-    # documents ``SKIP_CUDA_CHECK=1`` as the official bypass, so this
-    # brings the implementation in line with the public documentation.
+    # GPU machine to run CPU-only experiments. The README documents
+    # ``SKIP_CUDA_CHECK=1`` as the official bypass.
     if os.environ.get('SKIP_CUDA_CHECK', '0') == '1':
         if verbose:
             print("[kaggle_setup] SKIP_CUDA_CHECK=1: bypassing CUDA "
                   "availability guard.")
         return
     # Kaggle + NVIDIA GPU detected, but torch.cuda.is_available() is False.
-    # This is the P0-3 scenario: either the CUDA wheel was never installed,
-    # or it was installed in a PREVIOUS process and the current process is
-    # still running the old CPU-only torch (the most common case when the
-    # user ran ``bootstrap_kaggle_cuda()`` but did not restart the kernel).
+    # Either the CUDA wheel was never installed, or it was installed in a
+    # previous process and the current process is still running the old
+    # CPU-only torch (the most common case when the user ran
+    # ``bootstrap_kaggle_cuda()`` but did not restart the kernel).
     #
     # We deliberately DO NOT install the wheel here. Installing it in the
     # current process is a no-op for torch.cuda.is_available() (the binary
@@ -292,8 +280,8 @@ def setup_kaggle(verbose: bool = True) -> None:
 def bootstrap_kaggle_cuda(verbose: bool = True) -> None:
     """Install the CUDA torch wheel for the NEXT Python process.
 
-    This is the bootstrap function that the P0-3 fix splits out of
-    ``setup_kaggle()``. It performs the pip install that puts the CUDA
+    This bootstrap function is split out of ``setup_kaggle()``. It performs
+    the pip install that puts the CUDA
     wheel on disk, then raises ``RuntimeError`` to remind the caller
     that the CURRENT process must exit before the new wheel takes
     effect.
@@ -545,16 +533,16 @@ def configure_torch_for_device(
                 pass
             _interop_threads_set = True
     else:
-        # cuDNN autotune is a big win on T4 for the fixed shapes we benchmark.
+        # Enable cuDNN autotune for the fixed input shapes used by the
+        # benchmarks.
         torch.backends.cudnn.benchmark = True
         # TF32 (TensorFloat-32) matmul is only supported on Ampere (sm_80)
         # and later. Kaggle's T4 is sm_75 (Turing), so allow_tf32=True is a
         # no-op there — harmless but misleading (it suggests TF32 acceleration
         # is active when it is not). Guard with a capability check so the
-        # flag is only set on GPUs that actually use it. On Ampere+ this
-        # gives a ~8x matmul speedup with ~3 decimal digits of precision
-        # (perfectly fine for our benchmarks); on Turing it correctly does
-        # nothing.
+        # flag is only set on GPUs that actually use it: on Ampere+ this
+        # enables TF32 matmul (reduced mantissa precision); on Turing it
+        # correctly does nothing.
         try:
             _cap = torch.cuda.get_device_capability(0)
             if _cap[0] >= 8:  # sm_80+ (Ampere, Ada, Hopper, ...)

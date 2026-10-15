@@ -63,14 +63,12 @@ def naive_hca(
     T before any right-padding). This lets incremental-decoding callers (e.g.
     ``run_decoding.HCAAttnDecoding``) populate an
     :class:`ops_decoding_cache.HCADecodingCache` WITHOUT recomputing the 2
-    projections a second time — eliminating a redundant matmul that previously
-    inflated HCA/hybrid prefill latency relative to softmax/KDA.
+    projections a second time.
 
-    **Weight layout** (P0 API fix): all ``W_*`` tensors follow the
+    **Weight layout**: all ``W_*`` tensors follow the
     ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
-    Internally we use ``F.linear(x, W)`` (which computes ``x @ W.T``) instead
-    of the previous ``x @ W`` form that required callers to pass
-    ``self.W_KV.weight.T``. Callers now pass ``self.W_KV.weight`` directly.
+    Internally we use ``F.linear(x, W)`` (which computes ``x @ W.T``).
+    Callers pass ``self.W_KV.weight`` directly.
 
     ``T`` does NOT need to be divisible by ``m2``: the function right-pads
     the sequence with zeros up to the next multiple of ``m2`` and trims the
@@ -137,12 +135,10 @@ def naive_hca(
             f"naive_hca: rope_base={rope_base!r} must be positive")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (see ``F.normalize`` calls below), their dot product is already a cosine
-    # similarity in ``[-1, 1]``. The previous default ``scale = c ** -0.5``
-    # further shrinks the scores into a narrow band, making softmax over the
-    # compressed blocks nearly uniform — effectively turning dense attention
-    # into average pooling. Standard cosine-attention uses ``τ = 1``. The extra
-    # ``1/sqrt(c)`` was a leftover from un-normalized softmax-attention.
-    # H7 fix: scale defaults to 1.0 in the signature; no None sentinel needed.
+    # similarity in ``[-1, 1]``. A ``1/sqrt(c)`` scale would further shrink the
+    # scores into a narrow band, making softmax over the compressed blocks
+    # nearly uniform — effectively turning dense attention into average
+    # pooling. Standard cosine attention uses ``τ = 1`` (the default).
     device = H.device
     if T == 0:
         out_empty = torch.zeros(B_, 0, nh * c, dtype=H.dtype, device=device)

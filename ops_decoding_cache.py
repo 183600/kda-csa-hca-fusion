@@ -422,7 +422,7 @@ class CSADecodingCache:
     2. **Compressed block cache** (valid prefix ``[B, n_blocks, c]``) and
        **indexer key cache** (valid prefix ``[B, n_blocks, c_I]``). Their
        backing storage grows geometrically as the accumulator fills, avoiding
-       a full historical copy on every new block. Read by the sparse-attention branch
+       a full copy on every new block. Read by the sparse-attention branch
        (compressed block cache) and the lightning indexer (indexer key
        cache) during ``forward_step``.
     3. **Sliding-window ring buffer** (:class:`_SlidingWindowRingBuffer`).
@@ -793,9 +793,9 @@ class CSADecodingCache:
                         new_C.unsqueeze(1), pos_b,
                         self.rope_dim_eff, self.rope_base,
                         dim=1).squeeze(1)                           # [B, c]
-                # P0-4 fix: the compress helpers upcast to fp32/fp64
-                # internally (compute_dtype) and return that dtype. Cast
-                # back to the cache's storage dtype before writing into the
+                # The compress helpers upcast to fp32/fp64 internally
+                # (compute_dtype) and return that dtype. Cast back to the
+                # cache's storage dtype before writing into the
                 # geometrically-grown storage so all rows stay uniform.
                 new_C_row = new_C.unsqueeze(1).to(self.dtype)     # [B, 1, c]
                 new_K_I_row = new_K_I.unsqueeze(1).to(self.dtype) # [B, 1, c_I]
@@ -931,16 +931,10 @@ class CSADecodingCache:
         # ``[1, n_blocks]`` with True for the strictly-preceding blocks.
         # Core-attention scale: compute ONCE here so it is available to
         # BOTH the sparse branch (below) and the sliding-window branch
-        # (further down). Previously ``core_scale`` was assigned INSIDE the
-        # sparse branch's ``else`` block, which meant it was left unbound
-        # when ``self._C_comp is None or self._n_blocks == 0`` (the first
-        # ``m`` decode steps before the first compressed block is formed).
-        # The SW branch then crashed with ``cannot access local variable
-        # 'core_scale'`` whenever the SW ring buffer had entries during
-        # those early steps — a real bug that broke incremental decoding
-        # from a cold cache (no prefill). Moving the assignment here
-        # guarantees ``core_scale`` is always bound before either branch
-        # can read it.
+        # (further down). The assignment must not live inside either
+        # branch: ``core_scale`` has to be bound even when
+        # ``self._C_comp is None or self._n_blocks == 0`` (the first ``m``
+        # decode steps before the first compressed block is formed).
         if scale is None:
             core_scale = 1.0 if normalize_qk else self.c ** -0.5
         else:
@@ -967,14 +961,11 @@ class CSADecodingCache:
             b_threshold = t // self.m
             cbm = torch.arange(n_blocks, device=device) < b_threshold   # [n_blocks]
             cbm = cbm[None, :]                                          # [1, n_blocks]
-            # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
-            # (mirrors the matching fix in naive_csa). When
-            # normalize_qk=True (default used by every runner in this
-            # repo) compressed KV are L2-normalized (cosine-similarity
-            # attention). When False, skip normalization and fall back
-            # to classical 1/sqrt(c) dot-product scale — this gives
-            # ablations a real off-switch rather than a silently-ignored
-            # flag.
+            # Honor ``normalize_qk`` for the CORE attention (as in
+            # ``naive_csa``). When normalize_qk=True compressed KV are
+            # L2-normalized (cosine-similarity attention). When False,
+            # skip normalization and fall back to the classical
+            # 1/sqrt(c) dot-product scale.
             if normalize_qk:
                 C_comp_valid = self._C_comp[:, :self._n_blocks]
                 C_comp_n = F.normalize(
@@ -992,11 +983,9 @@ class CSADecodingCache:
                 self._K_IComp[:, :self._n_blocks].to(compute_dtype),    # [B, n_blocks, c_I]
                 w_idx.to(compute_dtype),                               # [B, 1, nIh]
                 topk,
-                # P0-2 fix (round 1): defer scale selection to
-                # csa_lightning_indexer — it picks 1.0 when
-                # normalize_qk=True (cosine), 1/sqrt(c_I) otherwise.
-                # Previously hard-coding self.c_I**-0.5 over-shrunk
-                # normalized cosine scores and damped STE gradients.
+                # Defer scale selection to csa_lightning_indexer — it
+                # picks 1.0 when normalize_qk=True (cosine),
+                # 1/sqrt(c_I) otherwise.
                 scale=None,
                 causal_block_mask=cbm,
                 return_soft_weights=effective_use_ste,
@@ -1039,14 +1028,10 @@ class CSADecodingCache:
                             'btn,bnc->btc', soft_weights, C_comp_n,
                         )                                              # [B, 1, c]
                         topk_size = kv.shape[2]
-                        # D11 fix: cache the expansion once. The previous
-                        # code computed ``soft_full.unsqueeze(2).expand(...)``
-                        # twice (once for the value, once for the detached
-                        # value), which doubles the kernel launches and
-                        # allocates the expansion buffer twice. ``expand``
-                        # returns a view so it is cheap, but the duplicate
-                        # call still pays interpreter + view-creation cost
-                        # on every decode step.
+                        # Cache the expansion once: ``expand`` returns a
+                        # cheap view, but computing it twice per decode step
+                        # (once for the value, once for the detached value)
+                        # still pays the duplicate view-creation cost.
                         soft_full_exp = soft_full.unsqueeze(2).expand(
                             -1, -1, topk_size, -1)
                         aux = soft_full_exp - soft_full_exp.detach()
@@ -1307,7 +1292,7 @@ class HCADecodingCache:
             raise ValueError(
                 f"HCADecodingCache.append_step: c={c} does not match "
                 f"cache's c={self.c}.")
-        # D8 fix (HCA): validate T_new consistency between C_new and Z_new.
+        # Validate T_new consistency between C_new and Z_new.
         if Z_new.shape[1] != T_new:
             raise ValueError(
                 f"HCADecodingCache.append_step: Z_new.shape[1]="
@@ -1356,9 +1341,9 @@ class HCADecodingCache:
                         new_C.unsqueeze(1), pos_b,
                         self.rope_dim_eff, self.rope_base,
                         dim=1).squeeze(1)                           # [B, c]
-                # P0-4 fix: ``_hca_compress_kv_single`` returns fp32/fp64
-                # (compute_dtype) even when the cache stores fp16. Cast back
-                # to the storage dtype before writing the valid row.
+                # ``_hca_compress_kv_single`` returns fp32/fp64
+                # (compute_dtype) even when the cache stores fp16. Cast
+                # back to the storage dtype before writing the valid row.
                 new_C_row = new_C.unsqueeze(1).to(self.dtype)        # [B, 1, c]
                 self._ensure_compressed_capacity(self._n_blocks + 1)
                 self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
@@ -1400,7 +1385,7 @@ class HCADecodingCache:
         if q.shape[2] != nh:
             raise ValueError(
                 f"q.shape[2]={q.shape[2]} does not match nh={nh}.")
-        # D7 fix (HCA): validate device consistency (mirrors CSA cache).
+        # Validate device consistency (mirrors CSA cache).
         if q.device != self.device:
             raise ValueError(
                 f"HCADecodingCache.forward_step: q.device={q.device} does "
@@ -1443,11 +1428,10 @@ class HCADecodingCache:
             b_threshold = t // self.m2
             cbm = torch.arange(n_blocks, device=device) < b_threshold
             cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
-            # P0-6 (round 8): honor ``normalize_qk`` for the CORE attention
-            # (mirrors the matching fix in naive_hca). When
-            # normalize_qk=True (default used by every runner in this
-            # repo) compressed KV are L2-normalized (cosine-similarity
-            # attention). When False, skip normalization and fall back
+            # Honor ``normalize_qk`` for the CORE attention (as in
+            # ``naive_hca``). When normalize_qk=True compressed KV are
+            # L2-normalized (cosine-similarity attention). When False,
+            # skip normalization and fall back
             # to classical 1/sqrt(c) dot-product scale — this gives
             # ablations a real off-switch rather than a silently-ignored
             # flag.

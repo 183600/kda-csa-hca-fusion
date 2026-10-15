@@ -149,14 +149,13 @@ def _measure(fn, repeats, device):
         # ``StatisticsError``. Returns 0.0 so the JSON row is well-formed.
         return (statistics.median(times) if times else 0.0), peak_mb
     else:
-        # CPU path: we previously tried sampling VmRSS from /proc/self/status
-        # between ``fn()`` calls, but torch's native CPU allocator (like
+        # CPU path: VmRSS sampling from /proc/self/status between ``fn()``
+        # calls is not usable, because torch's native CPU allocator (like
         # malloc) retains freed blocks in its pool for reuse rather than
-        # returning them to the OS. So after the first operator pushes RSS
-        # to a new high, every subsequent operator reuses the pool and the
-        # sampled RSS delta is 0 — making every row after the first report
-        # ``0.00 MB``, which is misleading (it looks like a real measurement
-        # but is in fact "no new RSS growth detected").
+        # returning them to the OS. Once the first operator pushes RSS to a
+        # new high, every subsequent operator reuses the pool and the RSS
+        # delta reads 0 — which looks like a real measurement but only means
+        # "no new RSS growth detected".
         #
         # tracemalloc is even worse: it only traces the Python heap and
         # silently ignores native torch tensor allocations, so it reports
@@ -170,11 +169,9 @@ def _measure(fn, repeats, device):
         torch.set_num_threads(1)
         try:
             # Warmup runs under the same single-thread configuration as the
-            # timed loop. Previously the warmup executed at the default thread
-            # count and only the timed iterations forced torch.set_num_threads(1),
-            # so the first timed iteration absorbed the one-time cost of
-            # reconfiguring the internal thread pool / kernel dispatch, which
-            # biased the measured per-token latency.
+            # timed loop, so the first timed iteration does not absorb the
+            # one-time cost of reconfiguring the internal thread pool /
+            # kernel dispatch, which would bias the measured latency.
             for _ in range(min(2, repeats)):
                 out = fn()
                 del out
@@ -208,8 +205,8 @@ def bench_softmax_attn(B, T, H, K, V, device):
     # measures attention compute, not mask allocation. A production
     # implementation would cache this mask (it is the same every call) rather
     # than reconstructing a [T, T] tensor per forward. For T=2048 this avoids
-    # a 4M-element allocation + fill on every timed iteration, which previously
-    # inflated softmax's measured latency and made the cross-operator
+    # a 4M-element allocation + fill on every timed iteration, which would
+    # inflate softmax's measured latency and make the cross-operator
     # comparison unfair (KDA/CSA/HCA don't have this per-call [T, T]
     # allocation overhead in their bench wrappers).
     causal_mask = torch.triu(
@@ -528,7 +525,7 @@ def main():
     n_errors = sum(1 for r in results if 'error' in r)
     if n_errors:
         logger.error(
-            f'\n[P0-2] {n_errors}/{len(results)} (T, op) cells errored out. '
+            f'\n{n_errors}/{len(results)} (T, op) cells errored out. '
             f'Returning non-zero so run_all records this experiment as failed.')
         return 1
     return 0

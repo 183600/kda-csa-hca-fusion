@@ -182,18 +182,16 @@ def kda_forward(
     fall back to the reference implementation. ``g_clamp_min``
     is applied before both backends so their gate contract matches.
 
-    ``recompute_attn`` is a reference-path-only memory knob (see
+    ``recompute_attn`` is a reference-path-only knob (see
     :func:`ops_kda.naive_chunk_kda`): it only takes effect when
-    ``use_chunk=True`` and the reference backend runs. FLA's Triton
-    kernels manage their own internal buffers, so the flag is ignored
-    there (documented rather than silently reinterpreted).
+    ``use_chunk=True`` and the reference backend runs. It is ignored
+    by the FLA backend, which manages its own internal buffers.
 
-    ``assoc_scan`` is a reference-path-only *parallelism* knob: when
+    ``assoc_scan`` is a reference-path-only knob: when
     ``use_chunk=True`` it selects :func:`ops_kda.assoc_scan_chunk_kda`,
     which resolves the per-chunk state recurrence with a Hillis-Steele
     associative scan (``ceil(log2 NT)`` batched levels instead of an
-    ``NT``-step Python loop). Defaults to the sequential loop, whose
-    numerics remain the bit-exact baseline. ``assoc_scan`` and
+    ``NT``-step Python loop). ``assoc_scan`` and
     ``recompute_attn`` are mutually exclusive (the scan needs the cached
     ``Aqk`` readout matrices). Like ``recompute_attn``, the flag is ignored
     by the FLA backend and by the recurrent path.

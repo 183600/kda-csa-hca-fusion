@@ -189,7 +189,7 @@ class SoftmaxAttnDecoding(nn.Module):
         # in ``torch.no_grad()``. The cache is just a tensor of numbers
         # (keys/values); it does not need to carry gradients. Mirrors the
         # always-detach pattern in ops_fused.py::HybridKCHAttention.forward
-        # and the KDA state fix in KDAAttnDecoding.forward below.
+        # and KDAAttnDecoding.forward below.
         k = k.detach()
         v = v.detach()
 
@@ -247,10 +247,9 @@ class KDAAttnDecoding(nn.Module):
         self.q = nn.Linear(d_model, H * K, bias=False)
         self.k = nn.Linear(d_model, H * K, bias=False)
         self.v = nn.Linear(d_model, H * V, bias=False)
-        # Match KDAHybridLayer's low-rank gate parameterization: d -> K -> H*K.
-        # The previous direct d -> H*K gate made standalone Exp6 KDA use a
-        # different projection boundary from the hybrid KDA layer and the Exp3
-        # FLOPs formula, biasing latency/FLOPs interpretation.
+        # Match KDAHybridLayer's low-rank gate parameterization: d -> K -> H*K,
+        # so standalone Exp6 KDA shares the hybrid KDA layer's projection
+        # boundary and the Exp3 FLOPs formula.
         self.g_down = nn.Linear(d_model, K, bias=False)
         self.g_up = nn.Linear(K, H * K, bias=False)
         self.beta = nn.Linear(d_model, H, bias=False)
@@ -260,10 +259,9 @@ class KDAAttnDecoding(nn.Module):
         # buffer (or zeros for the first call).
         self.short_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=0,
                                     groups=d_model, bias=True)
-        # Magic constant 0.1 (decay scale) — lifted to a module attribute so
-        # all KDA instantiations share the same value via HybridConfig. The
-        # default (0.1) preserves the historical behaviour. We read it from
-        # the constructor arg if provided; otherwise default to 0.1.
+        # Decay-scale constant, lifted to a module attribute so all KDA
+        # instantiations share the same value via HybridConfig. Read from the
+        # constructor arg if provided; otherwise default to 0.1.
         self.decay_scale = 0.1
         # The decode benchmark keeps the reference backend by default for
         # reproducibility. Set KDA_BACKEND=fla or auto for an explicitly
@@ -368,12 +366,11 @@ class KDAAttnDecoding(nn.Module):
             ) or state.device != x.device:
                 # Keep the recurrent state in COMPUTE precision (fp32 for
                 # fp16/bf16 inputs, fp64 for fp64) across decode steps.
-                # "kda_forward" returns the final state in compute_dtype; the
-                # historical code cast it back DOWN to ``x.dtype`` on the next
-                # forward, so every fp16 decode step rounded the state through
-                # fp16 and back — accumulating error over long decodes.
-                # Casting UP to compute_dtype here (never down) keeps full
-                # precision; ``naive_recurrent_kda`` already upcasts
+                # "kda_forward" returns the final state in compute_dtype;
+                # casting UP to compute_dtype here (never down to ``x.dtype``)
+                # keeps full precision across decode steps and avoids
+                # accumulating rounding error over long decodes.
+                # ``naive_recurrent_kda`` already upcasts
                 # ``initial_state`` internally, so a higher-precision state is
                 # always safe to pass.
                 # Device or dtype changed — move/cast and keep detached.
@@ -665,9 +662,7 @@ class HybridDecoding(nn.Module):
         The default ``csa_topk=2`` (not 4) preserves CSA's sparse top-k
         retrieval property at this smaller block count, matching the
         decode benchmark's intent to measure the *sparse* CSA path rather
-        than the dense fallback. The previous hardcoded ``100`` effectively
-        turned CSA into dense attention, defeating the point of the
-        comparison.
+        than the dense fallback.
         """
         super().__init__()
         self.cfg = HybridConfig(
@@ -895,35 +890,29 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
 
     ``repeats`` controls how many independent (prefill + decode-loop) trials
     are run. The median prefill and per-token decode latency across trials is
-    reported, which is far more stable than the single-trial measurement the
-    previous implementation used (the ``repeats`` parameter existed in the
-    signature but was silently ignored — a clear bug).
+    reported, which is far more stable than a single-trial measurement.
     """
     # Move model to device FIRST, then clear cache and reset peak memory
-    # stats. The previous order (_clear_cache -> model.to(device)) meant
-    # max_memory_allocated captured the model parameter allocation too,
-    # inflating peak_mem_MB by the parameter count (a constant offset that
-    # varies per operator and makes the comparison less fair).
+    # stats, so max_memory_allocated does not capture the model parameter
+    # allocation too (a constant offset that varies per operator and makes
+    # the comparison less fair).
     model = model.to(device).eval()
     model.reset()
     _clear_cache(device)
 
     # Seed a dedicated generator (NOT the global RNG) so the input tensors
-    # are identical across operators, prefill lengths, and runs. The
-    # previous code called ``torch.randn(...)`` against the global RNG,
-    # which consumed different states per operator (because each model's
-    # ``nn.Linear`` init made a different number of RNG draws during
-    # construction). This made run-to-run latency variance confounded
-    # with input variance, and made the "median over repeats" noisier than
-    # the inter-operator gap being measured.
-    # P2-1 fix (round 3): route through make_seeded_generator for CPU-fallback.
+    # are identical across operators, prefill lengths, and runs. The global
+    # RNG would be consumed differently per operator (each model's
+    # ``nn.Linear`` init makes a different number of RNG draws during
+    # construction), confounding run-to-run latency variance with input
+    # variance and making the "median over repeats" noisier than the
+    # inter-operator gap being measured.
     _seed_gen = make_seeded_generator(0, device=device)
 
-    # Pre-allocate the per-step decode input ONCE outside the timed loop.
-    # The previous code allocated ``x_new = torch.randn(1, 1, d_model)`` inside
-    # the timed region, so per-token latency included the cost of randn + the
-    # scalar multiply — for KDA (tiny per-token compute) this overhead can
-    # dominate the measurement.
+    # Pre-allocate the per-step decode input ONCE outside the timed loop so
+    # per-token latency excludes the cost of randn + the scalar multiply —
+    # for KDA (tiny per-token compute) this overhead can dominate the
+    # measurement.
     x_new = torch.randn(1, 1, d_model, device=device, generator=_seed_gen) * 0.1
 
     # One fixed prefill input (same across trials) so timing variance comes

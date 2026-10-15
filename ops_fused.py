@@ -72,24 +72,20 @@ class HybridConfig:
     kda_chunk_size: int = 64
     # Recompute-vs-cache knob for the reference chunkwise KDA path. False
     # (default) caches the q-weighted intra-chunk attention matrices for the
-    # whole sequence (O(T * chunk_size) extra elements per head); True drops
-    # that cache and recomputes each chunk's matrix inside the sequential
-    # loop (O(chunk_size^2) extra), trading extra pointwise work for a much
-    # smaller peak memory footprint at long T. Bit-identical values on the
-    # tested geometries; locked by ``test_recompute_attn.py``. Ignored when
-    # ``kda_backend`` selects FLA (its Triton kernels own their buffers) and
-    # when the recurrent path runs (T < kda_chunk_size).
+    # whole sequence; True drops that cache and recomputes each chunk's
+    # matrix inside the sequential loop. Both settings produce the same
+    # values. Ignored when ``kda_backend`` selects FLA and when the
+    # recurrent path runs (T < kda_chunk_size).
     kda_recompute_attn: bool = False
     # Associative-scan knob for the reference chunkwise KDA path. False
     # (default) resolves the per-chunk state recurrence with the NT-step
-    # sequential loop (bit-exact baseline). True selects the Hillis-Steele
-    # affine prefix scan over chunks (ceil(log2 NT) batched levels, no
-    # Python loop over the sequence), which trades extra [B,HV,NT,K,K]
-    # operator memory for parallel depth on GPU; numerically it matches the
-    # loop to fp round-off (~1e-8 fp32). Only takes effect when the chunk
-    # path runs (``kda_chunk_size >= 1`` and ``T >= kda_chunk_size``) and
-    # the reference backend is selected; mutually exclusive with
-    # ``kda_recompute_attn``. Locked by ``test_assoc_scan.py``.
+    # sequential loop. True selects the Hillis-Steele affine prefix scan
+    # over chunks (ceil(log2 NT) batched levels, no Python loop over the
+    # sequence); its results match the sequential path to fp round-off.
+    # Only takes effect when the chunk path runs
+    # (``kda_chunk_size >= 1`` and ``T >= kda_chunk_size``) and the
+    # reference backend is selected; mutually exclusive with
+    # ``kda_recompute_attn``.
     kda_assoc_scan: bool = False
     # KDA implementation backend. The default keeps the historical reference
     # path so existing quality/ablation results do not change. ``fla`` is an
@@ -116,8 +112,8 @@ class HybridConfig:
     # are rotated on their last ``rope_dim`` dims, and the core-attention
     # output is inverse-rotated at the negated query position so each KV
     # entry's contribution carries the relative (entry − query) distance.
-    # The paper value is 64; ``None``/0 disables RoPE (the historical
-    # pre-fix behaviour). Small test geometries auto-clamp to the head dim
+    # The paper value is 64; ``None``/0 disables RoPE. Small test geometries
+    # auto-clamp to the head dim
     # (``min(rope_dim, c)`` rounded down to even).
     csa_rope_dim: int | None = 64
     hca_rope_dim: int | None = 64
@@ -135,12 +131,10 @@ class HybridConfig:
     n_csa: int = 1
     n_hca: int = 1
     # KDA decay scale: the per-channel log-decay gate is computed as
-    # ``g = -F.softplus(...) * kda_decay_scale``. The historical magic value
-    # 0.1 appeared in 4 independent KDA instantiations (KDAHybridLayer,
-    # run_quality.KDAAttn, run_decoding.KDAAttnDecoding,
-    # method_analysis._kda_heads); lifting it to a config field keeps all
-    # instantiations consistent and makes the value tunable. The default
-    # preserves the historical behaviour.
+    # ``g = -F.softplus(...) * kda_decay_scale``. The value 0.1 is shared by
+    # all KDA instantiations (KDAHybridLayer, run_quality.KDAAttn,
+    # run_decoding.KDAAttnDecoding, method_analysis._kda_heads); a config
+    # field keeps them consistent and makes the value tunable.
     kda_decay_scale: float = 0.1
     # init_std for learnable positional biases (Ba, Bb, B_idx,
     # B_pos). Lifting to a config field makes it tunable and keeps the
@@ -247,15 +241,13 @@ class HybridConfig:
         # step-by-step recurrent path (``naive_recurrent_kda``) or the
         # chunkwise-parallel path (``naive_chunk_kda``).
         #   * ``kda_chunk_size <= 0`` -> always use the recurrent path
-        #     (the historical default behaviour; also used during
-        #     autoregressive decoding where T is small).
+        #     (the default behaviour; also used during autoregressive
+        #     decoding where T is small).
         #   * ``kda_chunk_size >= 1`` -> use the chunk path when T is at
         #     least one full chunk (T >= kda_chunk_size), falling back to
         #     the recurrent path for short sequences (where the chunk
         #     path's overhead exceeds the parallelism win).
-        # Previously this field was unused (always recurrent) and emitted a
-        # "UNUSED" warning; the warning is now removed because the field IS
-        # wired in. The chunk path matches the recurrent path to fp tolerance
+        # The chunk path matches the recurrent path to fp tolerance
         # (verified by test_kda_chunk_vs_recurrent in run_correctness.py).
         # NOTE: the chunk path does not support carrying the short-conv
         # lookback across calls (naive_chunk_kda accepts an initial_state but
@@ -271,13 +263,12 @@ class HybridConfig:
                 f"path; default 64).")
         # ``kda_recompute_attn`` must be a real bool. ``bool`` is the only
         # accepted type; ints are rejected explicitly (Python's ``1 == True``
-        # would otherwise silently enable the flag) so a config typo cannot
-        # flip the memory policy without the caller noticing.
+        # would otherwise silently enable the flag).
         if not isinstance(self.kda_recompute_attn, bool):
             raise TypeError(
                 f"kda_recompute_attn={self.kda_recompute_attn!r} must be a "
                 f"bool (False caches the intra-chunk attention matrices; "
-                f"True recomputes them per chunk at lower peak memory).")
+                f"True recomputes them per chunk).")
         # ``kda_assoc_scan`` follows the same strict-bool contract. The two
         # chunk-path strategy flags select different algorithms and cannot
         # be combined (validated here so the error fires at config creation,
@@ -404,14 +395,6 @@ class HybridConfig:
             if val not in ('l2', 'rms'):
                 raise ValueError(
                     f"HybridConfig.{name}={val!r} must be 'l2' or 'rms'.")
-        # F1 fix: the second dropout validation block (type / NaN-Inf /
-        # range) was DEAD CODE — the first validation block at lines
-        # 96-124 already raises NotImplementedError for any non-zero
-        # dropout, so the only value that reaches this point is 0.0
-        # (which trivially passes all three checks). The redundant block
-        # was a maintenance footgun: a future reader might think the
-        # second block is the primary validation, when in fact it never
-        # fires for any input that survives the first block. Removed.
 
 
 class KDAHybridLayer(nn.Module):
@@ -499,9 +482,9 @@ class KDAHybridLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Pure functional forward — does NOT mutate ``self``.
 
-        P6 fix — side-effect-free state management.
+        Side-effect-free state management.
 
-        The previous ``forward()`` read from and wrote to ``self._conv_lookback``
+        ``forward()`` reads from and writes to ``self._conv_lookback``
         internally, which breaks:
           * **Concurrent inference** (multiple sequences sharing one module
             instance would clobber each other's lookback).
@@ -521,8 +504,8 @@ class KDAHybridLayer(nn.Module):
 
         This method takes ``conv_lookback`` as an EXPLICIT argument and
         returns the new lookback as part of the output tuple, leaving
-        ``self._conv_lookback`` untouched. Callers who want the old
-        stateful behavior use :meth:`forward`; callers who need the pure
+        ``self._conv_lookback`` untouched. Callers who want the stateful
+        behavior use :meth:`forward`; callers who need the pure
         path (DDP, checkpointing, ``torch.compile``, BPTT) use this method
         directly and manage the state externally.
 
@@ -534,9 +517,8 @@ class KDAHybridLayer(nn.Module):
                 the previous call, or ``None`` for a fresh sequence.
             detach_lookback: if True (the default), the incoming
                 ``conv_lookback`` is detached before use so the autograd
-                graph from the previous chunk is not retained — this is
-                the memory-safe default and matches the historical
-                behavior. Set to **False** to enable cross-chunk BPTT
+                graph from the previous chunk is not retained. Set to
+                **False** to enable cross-chunk BPTT
                 (the caller is then responsible for memory management:
                 without detaching, the graph retains activations across
                 chunks and memory grows linearly in the number of
@@ -662,21 +644,18 @@ class KDAHybridLayer(nn.Module):
             new_lookback = new_lookback.detach()
         new_lookback = new_lookback.clone()
         # View BEFORE normalize: ``F.normalize(dim=-1)`` must operate on each
-        # per-head K-dim vector, not on the concatenated H*K vector. The
-        # previous form ``F.normalize(F.silu(...), dim=-1).view(B, T, H, K)``
-        # L2-normalized the full H*K vector, so each head's L2 norm became
-        # ~1/sqrt(H) instead of 1. This silently shrinks q.k dot products by
-        # a factor of 1/H, which propagates into the KDA recurrence as
-        # under-scaled delta-rule updates. Mirrors the (correct) CSA/HCA
-        # branches below.
+        # per-head K-dim vector, not on the concatenated H*K vector —
+        # otherwise each head's L2 norm becomes ~1/sqrt(H) instead of 1 and
+        # the q.k dot products shrink by a factor of 1/H. Mirrors the
+        # CSA/HCA branches below.
         q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
         k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
         v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
         # log-space gate: low-rank down/up with a softplus-style decay. The
-        # magic constant 0.1 is exposed as ``HybridConfig.kda_decay_scale`` so
-        # all KDA instantiations (this layer, run_quality.KDAAttn,
+        # value 0.1 is exposed as ``HybridConfig.kda_decay_scale`` so all KDA
+        # instantiations (this layer, run_quality.KDAAttn,
         # run_decoding.KDAAttnDecoding, method_analysis._kda_heads) use the
-        # same value. The default (0.1) preserves the historical behaviour.
+        # same value.
         decay_scale = cfg.kda_decay_scale
         g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * decay_scale
         beta = torch.sigmoid(self.beta(x_conv))                   # [B, T, HV]
@@ -686,12 +665,9 @@ class KDAHybridLayer(nn.Module):
         #     behaviour; also the only option for streaming decode where
         #     T is small).
         #   * ``kda_chunk_size >= 1`` AND ``T >= kda_chunk_size`` -> chunk
-        #     path (faster on CPU/GPU for long training sequences; matches
-        #     the recurrent path to fp tolerance — verified by
-        #     ``test_kda_chunk_vs_recurrent`` in run_correctness.py).
+        #     path (matches the recurrent path to fp tolerance).
         #   * ``kda_chunk_size >= 1`` AND ``T < kda_chunk_size`` -> recurrent
-        #     path (the chunk path's per-chunk overhead exceeds the win at
-        #     short T; also avoids the chunk path's right-padding cost).
+        #     path (T is shorter than one chunk).
         # The chunk path is wired in (``kda_chunk_size`` is consumed in
         # ``HybridConfig.__post_init__`` to validate/select it).
         use_chunk = (cfg.kda_chunk_size >= 1 and T >= cfg.kda_chunk_size)
@@ -910,11 +886,10 @@ class HybridKCHAttention(nn.Module):
         self.norms = nn.ModuleList([_Fp32LayerNorm(cfg.d_model) for _ in self.layout])
         # Number of KDA layers in the stack (each one needs its OWN state).
         # Different KDA layers have different parameters (q_proj, k_proj, ...),
-        # so they must not share recurrent state. Sharing state across layers
-        # is a correctness bug that silently corrupts autoregressive decoding
-        # and training: layer 2 would be seeded with layer 0's state instead
-        # of its own, and on the next forward call layer 0 would be seeded
-        # with the last layer's state from the previous call.
+        # so they must not share recurrent state: layer 2 would otherwise be
+        # seeded with layer 0's state instead of its own, and on the next
+        # forward call layer 0 would be seeded with the last layer's state
+        # from the previous call.
         self.n_kda_layers = sum(1 for k in self.layout if k == 'kda')
         # Persistent KDA recurrent states, one per KDA layer. Survives across
         # forward calls so that KDA's O(1) per-head memory is preserved during
@@ -1006,7 +981,7 @@ class HybridKCHAttention(nn.Module):
 
         .. warning::
 
-            P0 fix — DDP / ``torch.compile`` warning.
+            DDP / ``torch.compile`` warning.
 
             This method mutates ``self._kda_state`` and each KDA layer's
             ``self._conv_lookback`` during forward, which is incompatible
@@ -1077,9 +1052,9 @@ class HybridKCHAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
         """Pure functional forward — does NOT mutate ``self``.
 
-        P6 fix — side-effect-free state management.
+        Side-effect-free state management.
 
-        The previous ``forward()`` mutated ``self._kda_state`` and each
+        ``forward()`` mutates ``self._kda_state`` and each
         KDA layer's ``self._conv_lookback`` internally, which breaks
         concurrent inference, DDP, gradient checkpointing,
         ``torch.compile``, and cross-chunk BPTT — see the rationale in
@@ -1087,7 +1062,7 @@ class HybridKCHAttention(nn.Module):
 
         This method takes the ENTIRE model state as explicit arguments
         and returns the new state without touching ``self``. Callers who
-        want the old stateful behavior use :meth:`forward`; callers who
+        want the stateful behavior use :meth:`forward`; callers who
         need the pure path use this method directly and manage the state
         externally.
 
@@ -1101,17 +1076,15 @@ class HybridKCHAttention(nn.Module):
                 context for each KDA layer.
             detach_state: if True (the default), the incoming
                 ``kda_state`` is detached before use so the autograd
-                graph from the previous chunk is not retained — this is
-                the memory-safe default and matches the historical
-                behavior. Set to **False** to enable cross-chunk BPTT
+                graph from the previous chunk is not retained. Set to
+                **False** to enable cross-chunk BPTT
                 through the recurrent state (the caller is then
                 responsible for memory management: without detaching,
                 the graph retains activations across chunks and memory
                 grows linearly in the number of chunks).
             detach_lookback: forwarded to each KDA layer's
                 :meth:`KDAHybridLayer.forward_functional`. See that
-                method's docstring for details. Default ``True``
-                (memory-safe).
+                method's docstring for details. Default ``True``.
 
         Returns:
             ``(output, new_kda_state, new_conv_lookbacks)`` where:
@@ -1173,8 +1146,8 @@ class HybridKCHAttention(nn.Module):
         # ``n_kda_layers`` means the caller is feeding state from a
         # different config. Raise a clear ValueError rather than
         # silently padding with ``None`` or truncating, which would
-        # mask the bug and produce confusing downstream errors (e.g. a
-        # layer receiving ``None`` when it expects a real tensor).
+        # hide the mismatch and produce confusing downstream errors
+        # (e.g. a layer receiving ``None`` when it expects a real tensor).
         if len(lookback_list) != self.n_kda_layers:
             raise ValueError(
                 f"HybridKCHAttention.forward_functional: conv_lookbacks has "

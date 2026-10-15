@@ -1,7 +1,5 @@
 """Regression tests for the associative-scan chunkwise-KDA path.
 
-Round theme: **associative scan / GPU utilization / per-channel log-decay.**
-
 ``assoc_scan_chunk_kda`` resolves the per-chunk KDA state recurrence with a
 Hillis-Steele affine prefix scan (``ceil(log2 NT)`` batched levels) instead
 of the ``NT``-step sequential inner loop used by ``naive_chunk_kda``. The
@@ -23,10 +21,9 @@ How to run::
 
     pytest -q test_assoc_scan.py          # from the repo root
 
-Standalone by design (own ``device`` fixture, no conftest dependency).
+Standalone by design (own ``device`` fixture, no conftest dependency);
 ``pyproject.toml``'s ``testpaths = ["."]`` makes a bare ``pytest`` collect
-it; it is not in ``ci_gate.py``'s hardcoded two-file invoke (those files
-are protected by the continuous-loop policy).
+it.
 """
 
 from __future__ import annotations

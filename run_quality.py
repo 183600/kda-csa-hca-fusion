@@ -157,27 +157,20 @@ def _t_crit_975(n):
 
     Resolution order:
       1. ``scipy.stats.t.ppf`` when scipy is importable (exact for any n).
-      2. A hardcoded table covering ``n = 2..100`` (df = 1..99). This fixes
-         the n = 11..100 range where the previous table (n=2..30 only) fell
-         back to the normal approximation 1.96 and lost up to ~8% accuracy
-         at n=11..30, and ~4% at n=31..100.
+      2. A hardcoded table covering ``n = 2..100`` (df = 1..99).
       3. For ``n > 100`` a first-order Cornish-Fisher expansion
-         ``1.96 + (1.96^3 + 1.96) / (4 * (n - 1))`` is used. The previous
-         fallback to the bare normal approximation ``1.96`` had ~0.4% relative
-         error at n=101 for the uncorrected 95% level — but under
+         ``1.96 + (1.96^3 + 1.96) / (4 * (n - 1))`` is used. Under
          Bonferroni correction (e.g. alpha=0.05/28 ~= 0.0018) the relevant
          critical value is the 99.9% quantile, where the normal approx's
          error balloons past 60% (``t.ppf(0.999, 100) ~= 3.17`` vs ``3.09``
          for the normal). The Cornish-Fisher expansion keeps the error
          below 0.1% at n=101 for the 97.5% level and is a much better
          approximation for the corrected alphas used downstream.
-      4. For ``n < 2`` the CI is undefined; returns ``None`` (NOT ``0.0``).
-         The previous ``return 0.0`` silently turned a 1-seed estimate into
-         a zero-width CI, which downstream consumers interpreted as "the
-         estimate is exact" — a false-green that hid the lack of
-         replication. Callers MUST handle ``None`` (the one-sample t-test
-         path in this file and ``run_ablation`` already guards with
-         ``crit is not None`` before comparing).
+      4. For ``n < 2`` the CI is undefined; returns ``None`` (NOT ``0.0``),
+         so a 1-seed estimate never becomes a zero-width CI that reads as
+         "the estimate is exact". Callers MUST handle ``None`` (the
+         one-sample t-test path in this file and ``run_ablation`` already
+         guard with ``crit is not None`` before comparing).
 
     The scipy availability check runs once and is cached in ``_T_PP`` so
     repeated calls are essentially free.
@@ -227,12 +220,9 @@ def _t_crit_975(n):
         return _TABLE[n]
     # n > 100: delegate to the exact Student-t inverse CDF used by
     # _bonferroni_crit_q (regularized incomplete beta + bisection). The
-    # previous Cornish-Fisher expansion was accurate for the 97.5% level
-    # (<0.1% error) but is still an approximation; using the exact path
-    # guarantees <1e-9 accuracy without scipy and keeps the CI consistent
-    # with the Bonferroni critical values (which already use the exact path).
-    # P2-1 fix (2026-07-13): n=200 seeds now gets an exact CI instead of
-    # an approximate one.
+    # exact path guarantees <1e-9 accuracy without scipy and keeps the CI
+    # consistent with the Bonferroni critical values (which already use the
+    # exact path).
     try:
         return _bonferroni_crit_q(n, alpha=0.025)
     except Exception:
@@ -245,14 +235,7 @@ def _t_crit_975(n):
 def _bonferroni_crit_q(n, alpha=0.05):
     """Bonferroni-corrected ONE-SIDED t critical value with ``n-1`` dof.
 
-    P0-3 fix (lifted to module scope): the previous implementation was a
-    nested function inside ``main()`` that returned ``None`` whenever scipy
-    was unavailable. This silently zeroed out ``significant_bonferroni``
-    for every row (the caller guards with ``crit is not None and ...``),
-    so a missing scipy dependency caused ALL significance conclusions to
-    disappear without any warning the user could act on.
-
-    The fix mirrors ``_t_crit_975``'s resolution order:
+    Resolution order (mirrors ``_t_crit_975``):
       1. ``scipy.stats.t.ppf`` when scipy is importable (exact for any n).
       2. For ``n`` in 2..100 a hardcoded table of the 97.5% one-sided
          quantiles (same table as ``_t_crit_975``, reused via lookup).
@@ -267,9 +250,7 @@ def _bonferroni_crit_q(n, alpha=0.05):
          incomplete beta function plus bisection for the requested
          ``1 - alpha`` level. This matches the one-sided ``t_stat > crit``
          comparisons in Exp4/Exp5; using ``1-alpha/2`` would be a two-sided
-         threshold and silently make the test too conservative. A previous
-         Cornish-Fisher approximation was finite but still too liberal for
-         small seed counts, so the fallback now computes the t CDF directly.
+         threshold and silently make the test too conservative.
       4. For ``n < 2`` returns ``None`` (CI undefined — caller must guard).
 
     Being at module scope means ``run_ablation.py`` can import and reuse
@@ -289,12 +270,9 @@ def _bonferroni_crit_q(n, alpha=0.05):
     if _T_PP:
         return float(_T_PP(1 - alpha, n - 1))
     # scipy unavailable: compute the Student-t quantile directly via the
-    # regularized incomplete beta function and bisection. Earlier fallback
-    # revisions used a Cornish-Fisher approximation; even the third-order
-    # form can be a few percent liberal at n=5 in Bonferroni-tail regimes,
-    # which is enough to flip borderline ``significant_bonferroni`` flags.
-    # The numerical integration below is dependency-free and accurate for
-    # the small seed counts used by Exp4/Exp5.
+    # regularized incomplete beta function and bisection. The numerical
+    # integration below is dependency-free and accurate for the small seed
+    # counts used by Exp4/Exp5.
     target_p = 1.0 - alpha
 
     def _betacf(a, b, x):
@@ -445,8 +423,7 @@ SMALL_MODEL_SPEC = {
     # paper-faithful default: rotate the last 64 dims of the queries /
     # compressed KV entries / sliding-window keys and inverse-rotate the
     # core-attention output. Clamped to the head dim (c=32 -> rope_dim
-    # 32) for this small spec. Set to None/0 to disable (the historical
-    # pre-fix behaviour).
+    # 32) for this small spec. Set to None/0 to disable.
     'csa_rope_dim': 64,
     'hca_rope_dim': 64,
     'rope_base':  10000.0,
@@ -618,13 +595,11 @@ class SoftmaxAttn(nn.Module):
 
 
 class KDAAttn(nn.Module):
-    # Module-level default for the per-channel log-decay scale. Historically
-    # a magic 0.1 was hardcoded in 4 independent KDA instantiations
-    # (KDAHybridLayer, KDAAttn, KDAAttnDecoding, _kda_heads). We lift it to
-    # a named constant here so all KDA modules share the same value via
-    # HybridConfig.kda_decay_scale (the fused model) or this attribute (the
-    # standalone KDAAttn). The default (0.1) preserves the historical
-    # behaviour. Mirrors run_decoding.KDAAttnDecoding.decay_scale.
+    # Named default for the per-channel log-decay scale, so all KDA modules
+    # (KDAHybridLayer, KDAAttn, KDAAttnDecoding, _kda_heads) share the same
+    # value via HybridConfig.kda_decay_scale (the fused model) or this
+    # attribute (the standalone KDAAttn).
+    # Mirrors run_decoding.KDAAttnDecoding.decay_scale.
     DECAY_SCALE = 0.1
 
     def __init__(self, d_model, H=2, K=16, V=16):
@@ -632,28 +607,21 @@ class KDAAttn(nn.Module):
         self.q = nn.Linear(d_model, H * K, bias=False)
         self.k = nn.Linear(d_model, H * K, bias=False)
         self.v = nn.Linear(d_model, H * V, bias=False)
-        # Match KDAHybridLayer's low-rank gate parameterization: d -> K -> H*K.
-        # The previous direct d -> H*K gate made standalone Exp4 KDA use a
-        # different operator boundary than the hybrid KDA layer and the Exp3
-        # FLOPs formula, silently confounding cross-experiment comparisons.
+        # Match KDAHybridLayer's low-rank gate parameterization: d -> K -> H*K,
+        # so standalone Exp4 KDA shares the hybrid KDA layer's operator
+        # boundary and the Exp3 FLOPs formula.
         self.g_down = nn.Linear(d_model, K, bias=False)
         self.g_up = nn.Linear(K, H * K, bias=False)
         self.beta = nn.Linear(d_model, H, bias=False)
         self.o = nn.Linear(H * V, d_model, bias=False)
-        # Round-10 fix (R2-A): add the causal depthwise short-conv (kernel=3)
-        # that KDAHybridLayer (ops_fused.py:307) and KDAAttnDecoding
-        # (run_decoding.py:283) both have. Without it, Exp 4 KDA accuracy
-        # is measured on a stripped-down KDA missing the short-conv mixing
-        # that the hybrid model and the decode benchmark both use — making
-        # cross-experiment KDA comparisons confounded and the run_kv_cache
-        # ``short_conv`` FLOPs term (line 340) inconsistent with the actual
-        # op measured here. The same bug was already fixed for
-        # KDAAttnDecoding in commit 2a23300 (P0-4) but the parallel fix
-        # was never applied here. Exp 4 runs on full sequences (not
-        # streaming), so we left-pad with zeros each call (causal, no
-        # future leakage) and do NOT carry a persistent ``_conv_lookback``
-        # buffer (unlike KDAHybridLayer / KDAAttnDecoding which need it
-        # for autoregressive decode).
+        # Causal depthwise short-conv (kernel=3) matching KDAHybridLayer
+        # (ops_fused.py:307) and KDAAttnDecoding (run_decoding.py:283), so
+        # cross-experiment KDA comparisons and the run_kv_cache
+        # ``short_conv`` FLOPs term (line 340) see the same operator.
+        # Exp 4 runs on full sequences (not streaming), so we left-pad with
+        # zeros each call (causal, no future leakage) and do NOT carry a
+        # persistent ``_conv_lookback`` buffer (unlike KDAHybridLayer /
+        # KDAAttnDecoding which need it for autoregressive decode).
         self.short_conv = nn.Conv1d(
             d_model, d_model, kernel_size=3, padding=0,
             groups=d_model, bias=True,
@@ -669,9 +637,9 @@ class KDAAttn(nn.Module):
 
     def forward(self, x):
         B, T, d = x.shape
-        # Round-10 fix (R2-A): apply the causal depthwise short-conv before
-        # the q/k/v/g/beta projections, mirroring KDAHybridLayer.forward
-        # (ops_fused.py:501) and KDAAttnDecoding.forward
+        # Apply the causal depthwise short-conv before the q/k/v/g/beta
+        # projections, mirroring KDAHybridLayer.forward (ops_fused.py:501)
+        # and KDAAttnDecoding.forward
         # (run_decoding.py:326). Left-pad by (ksize-1)=2 zeros so position
         # t sees {t-2, t-1, t} and NEVER t+1 (future leakage). Conv1d
         # padding=0; the F.pad does the causal left-pad explicitly.
@@ -680,10 +648,10 @@ class KDAAttn(nn.Module):
             F.pad(x.transpose(1, 2), (ksize - 1, 0))
         ).transpose(1, 2)
         # View BEFORE normalize: F.normalize(dim=-1) must operate on each
-        # per-head K-dim vector, not on the concatenated H*K vector. The
-        # previous form normalized the full H*K vector, shrinking each
-        # head's L2 norm to ~1/sqrt(H) and under-scaling q.k dot products
-        # by 1/H. Mirrors the fix in ops_fused.py::KDAHybridLayer.
+        # per-head K-dim vector, not on the concatenated H*K vector —
+        # otherwise each head's L2 norm becomes ~1/sqrt(H) instead of 1 and
+        # the q.k dot products shrink by a factor of 1/H. Mirrors
+        # ops_fused.py::KDAHybridLayer.
         q = F.normalize(F.silu(self.q(x_conv)).view(B, T, self.H, self.K), dim=-1)
         k = F.normalize(F.silu(self.k(x_conv)).view(B, T, self.H, self.K), dim=-1)
         v = F.silu(self.v(x_conv)).view(B, T, self.H, self.V)
@@ -733,12 +701,9 @@ class CSAAttn(nn.Module):
 
     def forward(self, x):
         # ``naive_csa`` handles non-divisible T via internal right-padding
-        # and trims its output back to the original T, so we no longer need
-        # to pad/trim here. The external padding was originally added to fix
-        # a LEFT-padding bug, but that fix now lives inside ``naive_csa``
-        # itself (see ``test_csa_hca_non_divisible_T``). Removing the
-        # redundant padding keeps this wrapper thin and avoids doing the
-        # pad/trim twice.
+        # and trims its output back to the original T, so no external
+        # pad/trim is needed (see ``test_csa_hca_non_divisible_T``). Keeping
+        # this wrapper thin avoids doing the pad/trim twice.
         o = naive_csa(
             x, self.W_aKV.weight, self.W_bKV.weight,
             self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
@@ -810,10 +775,10 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
     constant), so each seed is evaluated on FRESH eval batches. This makes
     the multi-seed ``std_acc`` / CI / t-test in ``train_multi_seed`` capture
     BOTH training stochasticity and eval-sampling variance — i.e. the full
-    variance of repeating the experiment from scratch. With a fixed eval
-    seed the per-seed accuracies were all measured on the SAME eval batches,
-    so the reported CI silently excluded eval-sampling variance and
-    overstated the significance of the operator comparisons. Because the
+    variance of repeating the experiment from scratch. A fixed eval seed
+    would measure every seed on the SAME eval batches, excluding
+    eval-sampling variance from the CI and overstating the significance of
+    the operator comparisons. Because the
     generator depends only on ``seed``, all operators for a given seed still
     see the SAME eval batches (apples-to-apples), and the far ``+ 5_000_000``
     offset keeps the eval stream clear of every seed's ``+ 1_000_000``
@@ -919,15 +884,12 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # Different operators have different parameter counts, so creating the
     # layer first would consume a different number of RNG draws and desync
     # the downstream head init — a silent confound in the multi-seed CI.
-    # (The previous order was embed -> layer -> head, which left the head's
-    # init operator-dependent.)
     embed = nn.Embedding(vocab, d_model).to(device)
     head = MQARHead(d_model, vocab).to(device)
     layer = ResidualAttnLayer(factories[op_name](), d_model).to(device)
     # Build parameter groups with proper weight-decay exclusion: embeddings,
     # biases, and LayerNorm parameters are NOT weight-decayed (standard ML
-    # practice — decaying these can hurt training quality). The previous
-    # version applied weight decay uniformly to all parameters.
+    # practice — decaying these can hurt training quality).
     param_groups = _build_param_groups(embed, layer, head, weight_decay=0.01)
     opt = torch.optim.AdamW(param_groups, lr=lr)
     params = [p for g in param_groups for p in g['params']]
@@ -945,9 +907,9 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     batch_gen = make_seeded_generator(seed + 1_000_000, device=device)
 
     losses, accs = [], []
-    # Set train mode ONCE before the loop, not per step (the previous code
-    # called layer.train()/head.train() inside the loop, which is a redundant
-    # O(steps) no-op once the modules are already in train mode).
+    # Set train mode ONCE before the loop, not per step (calling
+    # layer.train()/head.train() inside the loop is a redundant O(steps)
+    # no-op once the modules are already in train mode).
     layer.train()
     head.train()
     embed.train()
@@ -1088,12 +1050,9 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
             r = train_one(op_name, seed=s, steps=steps, device=device,
                           softmax_steps=softmax_steps, **kw)
             r['train_time_s'] = time.time() - t0
-            # Log BEFORE appending to per_seed. The previous order appended
-            # first, so if ``logger.info`` raised (e.g. a handler error, or
-            # a formatting error on an unexpected None field) the seed had
-            # already been recorded as a success and the except branch would
-            # append a second stub entry for the same seed — corrupting
-            # aggregate stats with a duplicate seed.
+            # Log BEFORE appending to per_seed, so a failure inside
+            # ``logger.info`` cannot record the seed as a success first and
+            # then append a duplicate error stub for the same seed.
             logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
                         f"steps={r['steps']}  time={r['train_time_s']:.1f}s")
             per_seed.append(r)
@@ -1102,17 +1061,10 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
             # Per-seed error stub: include ALL success-row fields (set to
             # None / 0 where not applicable) so downstream consumers using
             # ``pd.DataFrame(per_seed)`` or ``per_seed[0].get('steps', ...)``
-            # see a consistent schema. The previous stub only carried
-            # {seed, error, final_acc, final_loss}, which silently broke:
-            #   1. ``make_figures._plot_mqar_group`` — reads
-            #      ``per_seed[0].get('steps', 100)`` for the figure title;
-            #      if seed 42 failed, the title rendered "100 steps" instead
-            #      of the actual step count.
-            #   2. ``pd.DataFrame(per_seed)`` — uses the first record's keys
-            #      as columns, so all extra fields on success rows were
-            #      silently dropped, breaking any analyst doing
-            #      ``pd.DataFrame(per_seed)['steps']``.
-            # Mirrors the top-level error-stub fix (round 1, Task 1-f).
+            # see a consistent schema. ``pd.DataFrame(per_seed)`` uses the
+            # first record's keys as columns, and
+            # ``make_figures._plot_mqar_group`` reads
+            # ``per_seed[0].get('steps', 100)`` for the figure title.
             per_seed.append({
                 'op': op_name,
                 'n_kv': kw.get('n_kv', 1),
@@ -1124,13 +1076,8 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 'mean_last10_acc': None,
                 # Use the OP-SPECIFIC step count (softmax_steps for softmax,
                 # steps for others) so the stub matches what a success row
-                # would record. Critical for the long-training softmax
-                # sensitivity run (MQAR_SOFTMAX_STEPS != MQAR_STEPS): if
-                # softmax seed 42 fails, the stub must still record the
-                # softmax budget, not the other-ops budget, otherwise
-                # make_figures._plot_mqar_group's title (which reads
-                # ``per_seed[0].get('steps')`` for the softmax row)
-                # silently hides the asymmetry.
+                # would record, even when
+                # MQAR_SOFTMAX_STEPS != MQAR_STEPS.
                 'steps': actual_steps_for_op,
                 'seed': s,
                 'train_batch': stub_train_batch,
@@ -1185,8 +1132,7 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         # used in run_ablation.py::eval_layout_multi_seed: return None so
         # downstream consumers (summary table, make_figures.py) can render
         # 'n/a' instead of a misleading '0.0000' that implies perfect
-        # precision. The previous code returned ``0.0``, which lied about
-        # the precision of a single-seed mean.
+        # precision.
         std_acc = std_loss = 0.0
         ci_acc = ci_loss = None
 
@@ -1372,9 +1318,7 @@ def main():
         print(f"{r['n_kv']:>4} | {r['op']:>10} | {r['mean_acc']:>10.4f} | "
               f"{ci_str} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
-    # Chance row: fill ALL columns so the table renders as a clean grid
-    # (the previous version only filled 3 of 7 columns, leaving the right
-    # side of the row ragged with no trailing pipe separators).
+    # Chance row: fill ALL columns so the table renders as a clean grid.
     print(f"{'':>4} | {'chance':>10} | {chance:>10.4f} | "
           f"{'':>10} | {'':>8} | {'':>12} | {'':>10}")
     # Fairness annotation: the softmax baseline is trained for
@@ -1510,22 +1454,14 @@ def main():
     # corruption loudly rather than shipping a broken file.
     #
     # CRITICAL: serialize to a STRING first (json.dumps), then write the
-    # string to the file. The previous pattern called json.dump directly
-    # on the file object inside a try/except — when the first dump raised
-    # ValueError mid-write (on encountering a NaN), the file was left
-    # with a PARTIAL JSON document. The fallback json.dump then APPENDED
-    # to the partial content, producing invalid JSON (two concatenated
-    # fragments) that no parser could read. Serializing to a string first
+    # string to the file, so a mid-write ValueError (NaN) cannot leave a
+    # PARTIAL JSON document behind. Serializing to a string first
     # guarantees atomicity: either the complete JSON is written or nothing
-    # is, so the fallback can safely overwrite the (empty) file.
-    # P1-1 fix's payload structure: emit a single top-level object
-    # ``{"metadata": ..., "results": [...]}`` (NOT two concatenated
-    # documents). The previous implementation prepended a standalone
-    # metadata object to the results array, producing invalid JSON.
-    # ``make_figures.load`` accepts both the envelope and the legacy
-    # bare-array format. The P1-5 fix below uses ``write_json_atomic``
-    # so the file is written atomically (temp + fsync + os.replace),
-    # eliminating the truncated-partial-JSON failure mode.
+    # is.
+    # The payload is a single top-level object
+    # ``{"metadata": ..., "results": [...]}``; ``make_figures.load`` also
+    # accepts the legacy bare-array format. ``write_json_atomic`` below
+    # writes the file atomically (temp + fsync + os.replace).
     payload = {
         'metadata': {
             'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
@@ -1540,24 +1476,17 @@ def main():
                 "gradients through a differentiable soft distribution over "
                 "all compressed blocks. After backward(), the indexer "
                 "parameters (W_IUQ, W_w, W_KV_idx, W_Z_idx, B_idx) receive "
-                "non-None .grad and are updated by the optimizer. This "
-                "closes the P0-4 gap where the indexer stayed at random "
-                "initialization and CSA's sparse selection was effectively "
-                "random. The STE does NOT change the forward semantics — "
-                "CSA is still sparse retrieval — but makes the indexer "
-                "learnable."
+                "non-None .grad and are updated by the optimizer. The STE "
+                "does NOT change the forward semantics — CSA is still "
+                "sparse retrieval — but makes the indexer learnable."
             ),
             'training_steps_fairness': {
                 'softmax_steps': softmax_steps,
                 'other_ops_steps': steps,
                 # Make the note CONDITIONAL on the actual asymmetry,
-                # matching the summary-table note at lines 1230-1233.
-                # The previous unconditional note claimed "softmax is
-                # trained for more steps" even when softmax_steps ==
-                # steps (the default fair comparison since the P0-3
-                # fix), contradicting the numeric fields above and
-                # misleading any reader who consults the JSON metadata
-                # without re-deriving the comparison.
+                # matching the summary-table note at lines 1230-1233, so it
+                # never contradicts the numeric fields above when
+                # softmax_steps == steps.
                 'note': (
                     "The softmax baseline is trained for more steps than "
                     "the other operators so it actually converges (the "
@@ -1581,15 +1510,13 @@ def main():
         },
         'results': all_results,
     }
-    # P1-5 fix: use the shared atomic JSON writer (temp file + fsync +
+    # ``write_json_atomic`` writes atomically (temp file + fsync +
     # os.replace) so a process kill or disk-full mid-write leaves the
     # target file as the OLD version (or absent) rather than a truncated
-    # partial JSON document. The previous ``with open(...) as f: f.write(text)``
-    # pattern was NOT atomic — see kaggle_setup.write_json_atomic's
-    # docstring for the full rationale. The regression guard (re-parse
-    # the serialized text) is now inside write_json_atomic itself: it
-    # serializes to a string first, which raises ValueError on any
-    # non-serializable value BEFORE touching the filesystem.
+    # partial JSON document — see kaggle_setup.write_json_atomic's
+    # docstring for the full rationale. It serializes to a string first,
+    # raising ValueError on any non-serializable value BEFORE touching the
+    # filesystem.
     try:
         write_json_atomic(payload, 'results/exp4_mqar.json',
                           indent=2, allow_nan=False)
@@ -1599,12 +1526,10 @@ def main():
                           'results/exp4_mqar.json',
                           indent=2, allow_nan=False)
     logger.info('\nSaved: results/exp4_mqar.json')
-    # P0-2 fix: return non-zero if any op's training crashed (``'error' in r``),
-    # so ``run_all._run`` records the experiment as ``status='fail'`` instead of
-    # silently treating a partial run as success. The previous ``main()``
-    # implicitly returned ``None`` even when every op crashed, which combined
-    # with ``run_all._run``'s ``None == success`` contract produced a green
-    # summary on a fully-red experiment. Returning 1 forces the failure to
+    # Return non-zero if any op's training crashed (``'error' in r``), so
+    # ``run_all._run`` records the experiment as ``status='fail'`` instead
+    # of treating a partial run as success (``run_all._run``'s
+    # ``None == success`` contract). Returning 1 forces the failure to
     # propagate to ``run_all``'s summary and exit code.
     n_errors = sum(1 for r in all_results if 'error' in r)
     n_incomplete = sum(
@@ -1614,7 +1539,7 @@ def main():
     )
     if n_errors or n_incomplete:
         logger.error(
-            f'\n[P0-2] {n_errors}/{len(all_results)} ops errored and '
+            f'\n{n_errors}/{len(all_results)} ops errored and '
             f'{n_incomplete}/{len(all_results)} have incomplete seed sets. '
             'Returning non-zero to prevent survivor-only aggregates from '
             'being treated as a successful experiment.')

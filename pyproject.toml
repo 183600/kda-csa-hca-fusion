@@ -184,8 +184,7 @@ extend-exclude = [
 # often hide real bugs (e.g. E741 ambiguous variable names). We
 # intentionally do NOT enable the full B-class (bugbear) or C-class
 # (complexity) yet because the codebase has many long functions that
-# would require a larger refactor to pass; those are tracked as
-# Batch-3 "split large files" work in the code-review report.
+# would require a larger refactor to pass.
 select = ["E", "W", "F"]
 # Ignore E402 (module-level import not at top) because the scripts use
 # ``sys.path.insert`` before their local imports by design (mirroring

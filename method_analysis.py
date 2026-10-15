@@ -373,9 +373,8 @@ HCA — Heavily Compressed Attention
    C_comp_n = F.normalize(C_comp, dim=-1)         # ALSO L2-normalized
    Causal block mask: query t attends to blocks b where b < t // m'
    (paper-exact strictly-preceding rule, Eq. 16). A block first becomes
-   visible to queries in the NEXT block — NOT at its own final source
-   token (the historical window-close variant was an off-by-one against
-   the paper and has been removed).
+   visible to queries in the NEXT block, NOT at its own final source
+   token.
    scores[h, t, n] = q[t, h] . C_comp_n[n] * scale
    p = softmax(scores + causal_mask)
    out[t, h] = sum_n p[h, t, n] * C_comp_n[n]   # uses NORMALIZED C_comp_n

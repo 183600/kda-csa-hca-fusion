@@ -223,9 +223,8 @@ def naive_recurrent_kda(
     q, k, v, g, beta = map(lambda x: x.to(compute_dtype), [q, k, v, g, beta])
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
-    # GVA expansion. With G == 1 (H == HV, the default geometry) the
-    # repeat_interleave is an identity copy, so skip it entirely — values
-    # are unchanged and one full q / k copy per call is avoided.
+    # GVA expansion. With G == 1 (H == HV) the repeat_interleave is an
+    # identity copy, so it is skipped entirely; values are unchanged.
     if G == 1:
         q = q * scale
     else:
@@ -255,8 +254,6 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
-    # Preallocate the output and write each step's result into its slice —
-    # avoids the extra full-sequence copy that ``torch.stack`` performs.
     o = q.new_empty(B, T, HV, V)
     for i in range(0, T):
         q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
@@ -361,7 +358,7 @@ def _chunk_kda_prepare(
 ):
     """Shared setup for the chunk-parallel KDA path.
 
-    ``recompute_attn=True`` selects the low-memory *recompute* policy: the
+    ``recompute_attn=True`` selects the *recompute* policy: the
     q-weighted intra-chunk attention matrices are NOT cached for the whole
     sequence here; :func:`_chunk_kda_inner_loop_recompute` rebuilds each
     chunk's matrix from ``q`` / ``k`` / the cumsum gates inside the
@@ -402,9 +399,8 @@ def _chunk_kda_prepare(
     compute_dtype = _compute_dtype(dtype)
     q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
-    # Note: ``repeat_interleave`` (even with G == 1) is kept because it also
-    # materializes contiguous q / k tensors; the rearranged views feed several
-    # downstream matmuls that regress when handed non-contiguous operands.
+    # ``repeat_interleave`` (even with G == 1) also materializes contiguous
+    # q / k tensors; the rearranged views feed several downstream matmuls.
     q = q.repeat_interleave(G, dim=1) * scale
     k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
@@ -413,46 +409,24 @@ def _chunk_kda_prepare(
 
     # NOTE: ``diagonal=0`` (NOT ``diagonal=1``) is required here to match the
     # FLA-referenced chunkwise-parallel KDA math (fla/ops/kda/naive.py). The
-    # mask covers the main diagonal AND the strict upper triangle; the
-    # subsequent ``A.masked_fill(mask, 0)`` then leaves ``A`` STRICTLY lower
-    # triangular (diagonal zeroed). With ``diagonal=1`` the diagonal entries
-    # ``A[i, i] = beta[i] * (k_i·k_i) * exp(0) = beta[i]`` (k is L2-normalised)
-    # survive into ``eye - A``, which decouples the triangular solve from the
-    # correct recurrent delta-rule and makes the chunk output/state diverge
-    # from ``naive_recurrent_kda`` by O(1e-2) — empirically confirmed:
-    # diagonal=1 gives max|o_diff|≈0.019, diagonal=0 matches to fp32 round-off
-    # (~1e-9). Examining the git history shows earlier review rounds had
-    # documented this same point and switched to diagonal=0; a later LLM
-    # bug-fix round reverted it to diagonal=1 and reintroduced the regression. Do not revert.
+    # mask covers the main diagonal AND the strict upper triangle, so the
+    # subsequent ``A.masked_fill(mask, 0)`` leaves ``A`` STRICTLY lower
+    # triangular (diagonal zeroed), keeping the triangular solve equivalent
+    # to the recurrent delta-rule.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
     upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
-    # Every column is written exactly once below, so ``empty`` avoids the
-    # redundant zero-fill of the (potentially large) A tensors.
+    # Every column of ``A`` and ``Aqk`` is written exactly once below.
     A = torch.empty(*g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
-    # ``Aqk`` (the q-weighted strictly-attention matrix consumed by the inner
-    # loop) shares the ``exp(clamp(g_j - g_i))`` pair grid with ``A``: the
-    # grid is materialized once here and folded into both column updates,
-    # instead of being recomputed inside the inner loop for every chunk. The
-    # per-element product order ``(x * exp) * k_i`` and the contiguous
-    # last-dim reduction are unchanged, so both outputs are bit-identical to
-    # the previous two-pass computation.
-    #
-    # In ``recompute_attn`` mode this cache is intentionally DROPPED: the
-    # persistent ``Aqk`` tensor is O(NT * BT * BT) = O(T * BT) elements per
-    # head (e.g. ~33 MB for B=1, HV=8, T=8192, BT=64 in fp32, growing
-    # linearly in T). The inner loop then rebuilds each chunk's matrix from
-    # the already-returned ``q`` / ``k`` / cumsum ``g`` — same flops, but
-    # peak extra memory O(BT * BT) per head. This is the "recompute versus
-    # cache" dial for long-context prefill / inference.
+    # ``Aqk`` is the q-weighted within-chunk attention matrix consumed by
+    # the inner loop. In ``recompute_attn`` mode the cache is dropped and
+    # the inner loop rebuilds each chunk's matrix from the ``q`` / ``k``
+    # and cumsum ``g`` already returned above.
     Aqk = None if recompute_attn else torch.empty(
         *g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
-    # ``clamp(max=50.0)`` below is provably an identity when the largest
-    # positive pair difference ``max(g) - min(g)`` never exceeds 50: the
-    # clamp then returns its input bit-for-bit, and its backward (an
-    # elementwise ``lt`` + ``where`` per column) can be skipped as well.
-    # NaN / +inf ranges fail this ``<=`` test (comparisons are False), so
-    # degenerate inputs keep the full clamp path. The recompute inner loop
-    # receives ``clamp_g_diff`` so it makes the exact same clamp decision.
+    # ``clamp(max=50.0)`` is applied when the largest positive pair
+    # difference ``max(g) - min(g)`` exceeds 50; NaN / +inf ranges also
+    # take the clamp path. The recompute inner loop receives
+    # ``clamp_g_diff`` so it makes the same clamp decision.
     clamp_g_diff = not bool((g.amax(-2) - g.amin(-2)).max() <= 50.0)
     for i in range(BT):
         k_i = k[..., i, :]
@@ -537,15 +511,10 @@ def naive_chunk_kda(
     Args:
         recompute_attn: when False (default) the q-weighted intra-chunk
             attention matrices are cached for the whole sequence in
-            ``_chunk_kda_prepare`` (faster: the ``exp(g_j - g_i)`` pair grid
-            is shared with the ``A`` matrix). When True the cache is
-            dropped and each chunk's matrix is recomputed inside the
-            sequential loop, trading extra pointwise work for a peak
-            memory reduction from ``O(T * chunk_size)`` to
-            ``O(chunk_size ** 2)`` extra elements per head. Both settings
-            perform the same per-element operations in the same order and
-            are bit-identical on the tested CPU geometries (locked by
-            ``test_recompute_attn.py``).
+            ``_chunk_kda_prepare``. When True the cache is dropped and
+            each chunk's matrix is recomputed inside the sequential loop.
+            Both settings perform the same per-element operations in the
+            same order and produce the same values.
     """
     prep = _chunk_kda_prepare(
         q, k, v, g, beta, scale, initial_state, output_final_state,
@@ -584,9 +553,8 @@ def _chunk_kda_inner_loop(
 ) -> tuple:
     """TorchScript-compatible inner loop of ``naive_chunk_kda``.
 
-    ``Aqk`` (the masked q-weighted within-chunk attention matrix, precomputed
-    by :func:`_chunk_kda_prepare` from the shared ``exp(clamp(g_j - g_i))``
-    pair grid) is sliced per chunk below.
+    ``Aqk`` (the masked q-weighted within-chunk attention matrix precomputed
+    by :func:`_chunk_kda_prepare`) is sliced per chunk below.
     """
     chunk_outs = []
     for i in range(NT):
@@ -600,16 +568,11 @@ def _chunk_kda_inner_loop(
         S = S * g_i[:, :, -1].exp().unsqueeze(-1)
         # NOTE: decay direction is ``g_last - g_pos`` (NOT ``g_pos - g_last``).
         # Inside a chunk, position ``c`` contributes to the carried state via
-        # `exp(g_cumsum[last] - g_cumsum[c]) * k_c ⊗ v_c`, where ``g_cumsum``
-        # is the running sum of the per-channel log-decay. The recurrence multiplies the
-        # state by ``exp(g_t)`` AFTER step ``t``, so a token written at
-        # position ``c`` is decayed by the SUM of gates from ``c+1`` through
-        # the chunk's last position, i.e. by ``exp(g_cumsum[last] -
-        # g_cumsum[c])``. The old code used ``exp(g_cumsum[c] -
-        # g_cumsum[last])`` (the reciprocal), making the contribution from
-        # later positions OVER-emphasised and earlier positions sharply
-        # under-emphasised within each chunk — diverging from
-        # ``naive_recurrent_kda`` by O(1e-2) in state and output. The sign
+        # ``exp(g_cumsum[last] - g_cumsum[c]) * k_c ⊗ v_c``, where
+        # ``g_cumsum`` is the running sum of the per-channel log-decay: the
+        # recurrence multiplies the state by ``exp(g_t)`` AFTER step ``t``,
+        # so a token written at position ``c`` is decayed by the sum of the
+        # gates from ``c + 1`` through the chunk's last position. The sign
         # matches the upstream FLA reference (fla/ops/kda/naive.py).
         update = torch.einsum('bhck,bhcv->bhckv', (g_i[:, :, -1:] - g_i).exp() * k_i, v_i)
         S = S + update.sum(-3)
@@ -630,24 +593,19 @@ def _chunk_kda_inner_loop_recompute(
     """TorchScript-compatible recompute variant of ``_chunk_kda_inner_loop``.
 
     The default chunk path caches every chunk's q-weighted attention matrix
-    ``Aqk`` in ``_chunk_kda_prepare`` (shape ``[B, HV, NT, BT, BT]`` —
-    O(T * BT) extra elements per head). This variant rebuilds ``Aqk`` for
+    ``Aqk`` in ``_chunk_kda_prepare``. This variant rebuilds ``Aqk`` for
     the current chunk only, from the already-materialized ``q`` / ``k`` and
     the cumsum gates ``g``.
 
-    The column update is deliberately kept textually aligned with
+    The column update is kept textually aligned with
     ``_chunk_kda_prepare``'s loop body (``diff = g - g_col``,
     ``(q * exp(diff)) * k_col`` reduced over the contiguous last dim), so
-    the two policies perform the *same* per-element operations in the same
-    order — the recompute output is bit-identical to the cache output for
-    the tested geometries (verified by ``test_recompute_attn.py``). The
-    per-column ``[B, HV, BT, K]`` slice also keeps the transient footprint
-    at O(BT * K) instead of materializing the full O(BT * BT * K) pair
-    grid, which is why this form is used rather than a single broadcast
-    expression.
+    both variants perform the same per-element operations in the same
+    order. The per-column ``[B, HV, BT, K]`` slice keeps the transient
+    footprint at O(BT * K) rather than the full O(BT * BT * K) pair grid.
 
     ``clamp_g_diff`` must be the flag computed by ``_chunk_kda_prepare``
-    (``max(g) - min(g) > 50`` anywhere), so both policies clamp identically.
+    (``max(g) - min(g) > 50`` anywhere), so both variants clamp identically.
     """
     chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
@@ -692,20 +650,15 @@ def _assoc_scan_chunk_states(
     whose combine is a ``K×K`` matmul plus a ``K×V`` matmul, instead of the
     sequential ``for n in range(NT)`` loop used by
     :func:`_chunk_kda_inner_loop`. This implementation uses a Hillis–Steele
-    (doubling) scan: ``ceil(log2(NT))`` levels, each level one vectorized
-    ``matmul`` over ``[B, HV, NT, ...]`` — so the Python-level sequential
-    depth grows logarithmically in the sequence length and every level is a
-    single batched kernel, which is what GPU utilization wants. (The
-    reference CPU path deliberately keeps the sequential loop as the
-    default; see :func:`assoc_scan_chunk_kda`'s docstring for the trade.)
+    (doubling) scan: ``ceil(log2(NT))`` levels, each level one batched
+    ``matmul`` over ``[B, HV, NT, ...]``.
 
     Returns:
         ``(S_in, S_final, levels)`` where ``S_in`` has shape
         ``[B, HV, NT, K, V]`` (the state entering each chunk, i.e.
         ``S_in[:, :, 0] == S0``), ``S_final`` is the state after the last
         chunk, and ``levels`` is the number of doubling steps performed
-        (``ceil(log2(NT))``, 0 for ``NT == 1``) — returned so regression
-        tests can lock the logarithmic depth contract.
+        (``ceil(log2(NT))``, 0 for ``NT == 1``).
     """
     B, HV, NT, K = M.shape[0], M.shape[1], M.shape[2], M.shape[3]
     V = b.shape[-1]
@@ -737,10 +690,8 @@ def _assoc_scan_chunk_states(
     E_pre = torch.cat([eye, E[:, :, :-1]], dim=2)
     F_pre = torch.cat([zero, Fv[:, :, :-1]], dim=2)
     S_in = E_pre @ S0.unsqueeze(2) + F_pre
-    # NOTE: keep both operands 4-D here. ``E[:, :, -1] @ S0.unsqueeze(2)``
-    # would broadcast the batch dims asymmetrically ((B,HV) vs (B,HV,1))
-    # and silently pair each head's matrix with the wrong initial state;
-    # with S0 == 0 (the common case) the error is invisible.
+    # NOTE: keep both operands 4-D here: ``E[:, :, -1] @ S0.unsqueeze(2)``
+    # would broadcast the batch dims asymmetrically ((B,HV) vs (B,HV,1)).
     S_final = E[:, :, -1] @ S0 + Fv[:, :, -1]
     return S_in, S_final, levels
 
@@ -778,20 +729,14 @@ def assoc_scan_chunk_kda(
     The maps ``(M_n, b_n)`` compose associatively, so
     :func:`_assoc_scan_chunk_states` recovers all incoming chunk states in
     ``ceil(log2 NT)`` batched levels (Hillis–Steele) — no Python loop over
-    the sequence length. This is the *parallel-depth* complement of the
-    sequential reference loop: numerically it agrees with
-    ``naive_chunk_kda`` to fp round-off (~1e-8 fp32, ~1e-17 fp64 on the
-    locked test geometries) but is NOT bit-exact, because the composition
-    order of the chunk PREfix differs from the running multiplication in
-    the loop.
+    the sequence length. Numerically it agrees with ``naive_chunk_kda`` to
+    fp round-off; it is NOT bit-exact, because the composition order of the
+    chunk prefix differs from the running multiplication in the loop.
 
-    Memory: the scan materializes the per-chunk operators ``[B, HV, NT, K,
-    K]`` (+ two such levels during the doubling), on top of the cached
-    ``Aqk``/``A`` from ``_chunk_kda_prepare``. It is therefore NOT the
-    low-memory option — that is ``naive_chunk_kda(recompute_attn=True)``.
-    ``recompute_attn`` is incompatible here because the readout terms
-    ``C_n`` / ``a_n`` are computed from the full ``Aqk`` tensor in one
-    vectorized shot.
+    This path uses the cached ``Aqk`` matrices from
+    :func:`_chunk_kda_prepare`; ``recompute_attn`` is incompatible here
+    because the readout terms ``C_n`` / ``a_n`` are computed from the full
+    ``Aqk`` tensor in one vectorized shot.
 
     The scan core is TorchScript-compatible; the surrounding wrapper stays
     eager. The output is assembled by :func:`_chunk_kda_finalize`, so
