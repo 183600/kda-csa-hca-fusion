@@ -367,17 +367,20 @@ class KDAAttnDecoding(nn.Module):
                     torch.float64 if x.dtype == torch.float64 else torch.float
             ) or state.device != x.device:
                 # Keep the recurrent state in COMPUTE precision (fp32 for
-        # fp16/bf16 inputs, fp64 for fp64) across decode steps.
-        # "kda_forward" returns the final state in compute_dtype; the
-        # historical code cast it back DOWN to ``x.dtype`` on the next
-        # forward, so every fp16 decode step rounded the state through
-        # fp16 and back — accumulating error over long decodes.
-        # Casting UP to compute_dtype here (never down) keeps full
-        # precision; ``naive_recurrent_kda`` already upcasts
-        # ``initial_state`` internally, so a higher-precision state is
-        # always safe to pass.
-        # Device or dtype changed — move/cast and keep detached.
-                state = state.to(device=x.device, dtype=x.dtype).detach()
+                # fp16/bf16 inputs, fp64 for fp64) across decode steps.
+                # "kda_forward" returns the final state in compute_dtype; the
+                # historical code cast it back DOWN to ``x.dtype`` on the next
+                # forward, so every fp16 decode step rounded the state through
+                # fp16 and back — accumulating error over long decodes.
+                # Casting UP to compute_dtype here (never down) keeps full
+                # precision; ``naive_recurrent_kda`` already upcasts
+                # ``initial_state`` internally, so a higher-precision state is
+                # always safe to pass.
+                # Device or dtype changed — move/cast and keep detached.
+                state = state.to(
+                    device=x.device,
+                    dtype=torch.float64 if x.dtype == torch.float64 else torch.float,
+                ).detach()
             else:
                 state = state.detach()
         o, self._state = kda_forward(

@@ -439,21 +439,22 @@ def prefill_flops(op: str, T: int, **kw):
         )
         # Indexer: per-head similarities T * n_blocks * c_I * nIh, then
         # weighted sum across heads T * n_blocks * nIh. The lightning
-        # indexer applies the window-close causal mask before top-k, so a
-        # block becomes visible at its final source token. Keep the exact
-        # count in one helper so the experiment accounting matches
-        # ops_csa._causal_block_mask and the decoding cache.
+        # indexer applies the paper-exact strictly-preceding causal mask
+        # before top-k (block ``s`` is visible iff ``s < floor(t / m)``),
+        # so a block first becomes visible to the NEXT block's queries.
+        # Keep the exact count in one helper so the experiment accounting
+        # matches ops_csa._causal_block_mask and the decoding cache.
         causal_entries = causal_block_entries(T, csa_m)
         indexer = 2 * causal_entries * p['csa_cI'] * p['csa_nIh'] \
                   + 2 * causal_entries * p['csa_nIh']
         # Core sparse attention: QK^T (c term) + softmax·V (c term).
         # ``csa_lightning_indexer`` clamps topk to ``min(topk, n_blocks)``
         # AND masks non-causal blocks to -inf before top-k, so the EFFECTIVE
-        # per-query topk is ``min(csa_topk, (t + 1) // csa_m)``. The AVERAGE
+        # per-query topk is ``min(csa_topk, t // csa_m)``. The AVERAGE
         # effective topk over all queries is therefore
-        # ``sum_t min(csa_topk, (t + 1) // csa_m) / T`` under the
-        # window-close mask. The helper counts the exact selected slots,
-        # including the final token of each complete source window.
+        # ``sum_t min(csa_topk, t // csa_m) / T`` under the paper-exact
+        # strictly-preceding mask. The helper counts the exact selected
+        # slots.
         total_sel = causal_selected_entries(T, csa_m, csa_topk)
         effective_topk = total_sel / T if T > 0 else 0
         core = 2 * T * effective_topk * csa_c * csa_nh * 2
@@ -485,9 +486,11 @@ def prefill_flops(op: str, T: int, **kw):
         hca_nh = p.get('hca_nh', H)
         query_proj = 2 * T * (d * hca_dc + hca_dc * hca_c * hca_nh)
         # Core dense attention over the compressed blocks. The dense branch
-        # uses the same window-close mask as ops_csa: a heavy-compression
-        # block becomes visible when its m2-token source window closes.
-        # Keep the exact (query, block) count shared with the test oracle.
+        # uses the same strictly-preceding block mask as ops_csa: heavy-
+        # compression block ``s`` is visible iff ``s < floor(t / m2)``
+        # (its source window must be complete AND the query must lie in a
+        # later block). Keep the exact (query, block) count shared with
+        # the test oracle.
         causal_entries = causal_block_entries(T, hca_m2)
         # Head count: the HCA core attention uses ``hca_nh`` heads (NOT ``H``).
         core = 2 * causal_entries * hca_c * hca_nh * 2

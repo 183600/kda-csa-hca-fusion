@@ -55,9 +55,10 @@ The bit-equivalence holds because:
     ``min(win, t+1)`` entries in causal order, so the softmax is over
     the same set of keys.
   * The indexer's top-k selection is over the same set of compressed
-    blocks (the causal block mask ``b < (t + 1) // m`` excludes a block
-    until its source window is complete; the partial block containing
-    ``t`` remains unavailable until it closes).
+    blocks (the paper-exact causal block mask ``b < t // m`` admits only
+    STRICTLY PRECEDING blocks; the block containing ``t`` — partial or
+    just-completed — remains unavailable through the sparse branch and is
+    served by the sliding-window branch instead).
 
 Known limitation: torch.topk tie-breaking
 -----------------------------------------
@@ -430,7 +431,7 @@ class CSADecodingCache:
 
     The cache also tracks two counters: ``n_tokens_seen`` (total tokens
     appended) and ``n_blocks`` (compressed blocks produced). The former
-    is used to compute the causal block mask ``b < (t + 1) // m`` for
+    is used to compute the causal block mask ``b < t // m`` for
     the indexer; the latter is the length of the compressed block cache.
 
     Lifecycle
