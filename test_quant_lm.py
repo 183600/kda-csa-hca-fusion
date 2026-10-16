@@ -183,16 +183,28 @@ def test_ste_autograd_contract():
     spec = QuantSpec(bits=2, group_size=8)
     state = None
     pre = None
+    outs = []
     for t in range(T):
         o, state = naive_recurrent_kda(
             q[:, t:t + 1], k[:, t:t + 1], v[:, t:t + 1], g[:, t:t + 1],
             beta[:, t:t + 1], initial_state=state, output_final_state=True)
         pre = state
         pre.retain_grad()
+        outs.append(o)
         state = fake_quantize(state.reshape(B, -1), spec,
                               ste=True).reshape(B, H, K, V)
     w = _randn(B, H * K * V)
     loss = (w * state.reshape(B, -1)).sum()
+    # ``q`` only enters the recurrence through the outputs (the state update
+    # has no q term), so the state-only loss above leaves q disconnected:
+    # autograd may then legitimately report ``q.grad is None`` (dead-branch
+    # elision — whether it does depends on the TorchScript executor state,
+    # making the check order-dependent). Give q a real path by adding the
+    # EARLIER steps' outputs to the loss; the LAST step's output is excluded
+    # because it depends on ``pre`` and would perturb the exact STE identity
+    # asserted immediately below.
+    for o_t in outs[:-1]:
+        loss = loss + o_t.sum()
     loss.backward()
     _ok('last state write carries the exact STE identity',
         bool(torch.equal(pre.grad.reshape(B, -1), w)),
