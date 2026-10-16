@@ -66,7 +66,8 @@ _interop_threads_set = False
 
 
 # PyTorch CUDA wheel index URLs (see https://pytorch.org/get-started/locally/).
-# Ordered from newest to oldest. cu121 is the historical default for Kaggle T4.
+# Ordered from newest to oldest. cu121 covers drivers that report CUDA
+# 12.1-12.3 (older Kaggle T4 images).
 # cu126/cu128 are required for torch >= 2.7 wheels (the last cu124 wheel is
 # torch 2.6.0), which matters when the preinstalled CPU-only torch on an
 # older Kaggle image is newer than 2.6 and the bootstrap must replace it.
@@ -223,14 +224,13 @@ def setup_kaggle(verbose: bool = True) -> None:
        first cell): install the CUDA wheel, then EXIT / restart the
        kernel. ``bootstrap_kaggle_cuda()`` below performs the install
        and raises ``RuntimeError`` to force the caller to restart.
-    2. **Experiment**: after restart, call ``setup_kaggle()``. It now
-       only VERIFIES that CUDA is available; if the user forgot to
-       restart, it raises ``RuntimeError`` instead of silently
-       continuing on CPU.
+    2. **Experiment**: after restart, call ``setup_kaggle()``. It only
+       VERIFIES that CUDA is available; if the user forgot to restart,
+       it raises ``RuntimeError`` instead of silently continuing on CPU.
 
-    This makes the failure mode loud: a misconfigured Kaggle run now
-    raises immediately at startup, rather than producing CPU-only
-    results that look like GPU results in the summary.
+    This makes the failure mode loud: a misconfigured Kaggle run raises
+    immediately at startup, rather than producing CPU-only results
+    that look like GPU results in the summary.
     """
     if torch.cuda.is_available():
         if verbose:
@@ -659,9 +659,9 @@ def set_global_seed(seed: int, *, deterministic: bool = False) -> dict:
     ``benchmark = False``) and asks PyTorch for deterministic algorithm
     implementations (``torch.use_deterministic_algorithms(True,
     warn_only=True)`` — ``warn_only`` avoids hard failures for the few ops
-    that have no deterministic implementation). This trades a little
-    throughput for same-machine run-to-run reproducibility. It cannot make
-    runs bit-identical ACROSS hardware architectures; different GPUs/CPU
+    that have no deterministic implementation). This makes runs on the
+    same machine reproducible run-to-run. It cannot make runs
+    bit-identical ACROSS hardware architectures; different GPUs/CPU
     kernels legitimately differ in floating-point reduction order.
 
     Note ``PYTHONHASHSEED`` cannot be changed after interpreter start; set

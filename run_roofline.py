@@ -33,9 +33,9 @@ Variable                          Default  Effect
 The interpretation caveat matters and is recorded in the output metadata:
 the byte model is a **compulsory-traffic lower bound** (activation I/O +
 weights + compressed/recurrent state). It excludes library-internal traffic
-(unfold intermediates, allocator churn, Python interpreter overhead), so the
-naive reference paths legitimately land far below the roofline; that is the
-finding, not a bug in the accounting.
+(unfold intermediates), so the naive reference paths legitimately land far
+below the roofline; the model measures compulsory traffic, not the
+reference implementation's actual traffic.
 """
 
 from __future__ import annotations

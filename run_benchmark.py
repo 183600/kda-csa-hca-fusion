@@ -214,13 +214,10 @@ def bench_softmax_attn(B, T, H, K, V, device):
     v = _rand(B, T, H, V, device=device, generator=gen)
     scale = K ** -0.5
     # Precompute the causal mask OUTSIDE the timed region so the benchmark
-    # measures attention compute, not mask allocation. A production
-    # implementation would cache this mask (it is the same every call) rather
-    # than reconstructing a [T, T] tensor per forward. For T=2048 this avoids
-    # a 4M-element allocation + fill on every timed iteration, which would
-    # inflate softmax's measured latency and make the cross-operator
-    # comparison unfair (KDA/CSA/HCA don't have this per-call [T, T]
-    # allocation overhead in their bench wrappers).
+    # measures attention compute rather than mask construction. The mask is
+    # the same every call, and the timed region for the cross-operator
+    # comparison then covers comparable work: KDA/CSA/HCA bench wrappers
+    # have no per-call [T, T] mask to build.
     causal_mask = torch.triu(
         torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
     ).view(1, 1, T, T)
@@ -508,11 +505,10 @@ def main():
     #     (n_heads_qk=2, head_dim_k=16, head_dim_v=16): a standalone KDA
     #     row that is directly comparable to the hybrid's per-KDA-layer
     #     cost (kda_rec_hybrid / kda_chunk_hybrid).
-    # Without the hybrid-matched rows, a single standalone KDA layer runs at
-    # 8x the compute of the hybrid's KDA sub-layers (4*32*32 = 4096 vs
-    # 2*16*16 = 512 MACs/step), so the latency table would misleadingly show
-    # the 5-layer hybrid as faster than a single KDA layer purely due to the
-    # heavier config.
+    # The hybrid-matched rows keep the latency comparison fair: a single
+    # standalone KDA layer runs at 8x the compute of the hybrid's KDA
+    # sub-layers (4*32*32 = 4096 vs 2*16*16 = 512 MACs/step), so the two
+    # KDA configs are reported separately rather than in one row.
     H2, K2, V2 = 2, 16, 16
 
     benches = [

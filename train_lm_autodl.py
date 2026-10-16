@@ -106,9 +106,9 @@ def _synthetic_corpus(n=1000):
 
     The texts are unique (index suffix) so the cleaning step's exact-
     duplicate removal and the subsequent train/val/test split stay
-    meaningful even on the no-network path. The old fallback repeated the
-    SAME string 1000 times, which after dedup would collapse to a single
-    story and make a three-way split degenerate.
+    meaningful even on the no-network path: a corpus that repeated the
+    same string N times would collapse to a single story after dedup and
+    make a three-way split degenerate.
     """
     return [f"Once upon a time, story {i}. " * 40 for i in range(int(n))]
 
@@ -139,11 +139,10 @@ class TinyStoriesLM(Dataset):
         """Token-window dataset over a list of raw stories.
 
         When ``texts`` is None the corpus is loaded from HuggingFace (or
-        the synthetic fallback) exactly as before, capped at
-        ``max_samples``. The training entry point instead loads, cleans
-        and partitions the corpus explicitly and passes the pre-sliced
-        ``texts`` of ONE split here, so no dataset object ever spans the
-        train/val/test boundary.
+        the synthetic fallback), capped at ``max_samples``. The training
+        entry point instead loads, cleans and partitions the corpus
+        explicitly and passes the pre-sliced ``texts`` of ONE split here,
+        so no dataset object ever spans the train/val/test boundary.
         """
         self.seq_len = seq_len
         self.split = split
@@ -159,9 +158,8 @@ class TinyStoriesLM(Dataset):
         self.tokenizer = tokenizer
         # Content fingerprint so a run record can identify WHICH data was
         # trained on. Uses a bounded, deterministic sample (first
-        # ``n_probe`` texts truncated per-text) — hashing every byte of a
-        # 20k-story corpus on every start is wasteful, and the sample is
-        # enough to detect a swapped split / stale cache.
+        # ``n_probe`` texts truncated per-text); the sample is enough to
+        # detect a swapped split / stale cache.
         self.data_fingerprint = _texts_fingerprint(self.texts)
 
     def __len__(self): return len(self.texts)
@@ -513,7 +511,7 @@ class LMWithHybrid(nn.Module):
         # eight-group matrix pins 10-layer layouts whose length is NOT
         # expressible as n_kda+n_csa+n_hca — using the ratio fields there
         # would silently build a 5-layer model instead of the configured
-        # one). Ratio mode keeps the historical behaviour.
+        # one). Ratio mode derives depth from the ratio fields.
         if cfg.layout is not None:
             total_layers = len(cfg.layout)
         else:
@@ -598,8 +596,8 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
     applies no data augmentation — raw token windows only). If a model
     cannot drive the loss down on a handful of examples, something is
     fundamentally broken (gradients not flowing, detached loss, wrong
-    labels, optimizer not stepping) and starting a 2000-step run would just
-    burn compute.
+    labels, optimizer not stepping), and the gate catches it before a
+    full 2000-step run.
 
     Pass criterion: the mean loss over the last ``tail`` steps must be
     strictly below ``loss_ratio_threshold`` times the mean loss over the
@@ -1047,9 +1045,9 @@ def main():
     # ------------------------------------------------------------------
     # Data: load -> clean -> split (in this order) -> audit.
     #
-    # The corpus budget is scaled so the TRAIN split keeps the historical
-    # row budget (20000 local / 5000 Kaggle): holding out 10% val + 10%
-    # test must not silently shrink the training set.
+    # The corpus budget is scaled so the TRAIN split keeps its row budget
+    # (20000 local / 5000 Kaggle): holding out 10% val + 10% test must
+    # not silently shrink the training set.
     # ------------------------------------------------------------------
     train_budget = 20000 if not is_kaggle else 5000
     train_frac = 1.0 - args.val_frac - args.test_frac
@@ -1113,7 +1111,7 @@ def main():
     # the model on ONE fixed batch with regularization off. A model that
     # cannot memorize a handful of examples has a fundamental bug
     # (gradients not flowing, detached loss, wrong labels, optimizer not
-    # stepping) and a 500-2000 step run would be wasted. This is necessary
+    # stepping), caught before the full 500-2000 step run. This is necessary
     # but NOT sufficient — augmentation/alignment/label-map bugs can still
     # pass — so it complements, never replaces, intermediate-result checks.
     # ------------------------------------------------------------------

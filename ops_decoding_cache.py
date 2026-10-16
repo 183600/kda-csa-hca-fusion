@@ -22,15 +22,14 @@ The cache has three pieces of state, mirroring the spec in the issue:
      Grows by one row every time the accumulator fills. For CSA this also
      includes a parallel **indexer key cache** ``[B, n_blocks, c_I]`` so
      the lightning indexer can score the new block against the current
-     query without recomputing the full history.
+     query.
   3. **Sliding-window ring buffer** (``torch.Tensor`` ``[B, win, c]``).
      A fixed-size FIFO of the most recent ``win`` *uncompressed* local
      keys (the ``Ca`` projection for CSA, ``C`` for HCA, normalized with
      the cache's ``qk_norm_mode`` — 'l2' by default).
      Writes wrap around; reads return the contents in causal order
      (oldest first). This backs the sliding-window branch of
-     ``naive_csa`` / ``naive_hca`` during decoding without materializing
-     a ``[T, win, c]`` unfold per step.
+     ``naive_csa`` / ``naive_hca`` during decoding.
 
 Numerical contract
 ------------------
@@ -84,18 +83,15 @@ practice.
 For correctness testing, the regression tests use ``topk >= n_blocks``
 (so ALL valid blocks are selected, making the output
 permutation-invariant over the selected set and thus independent of
-tie-breaking). For production decoding (Exp 6 latency benchmark), the
-tie-breaking difference is irrelevant — we measure latency, not
-bit-exact outputs.
+tie-breaking).
 
 What this is NOT
 ----------------
 This is a *correctness-first* reference, not a production kernel. The
 ``forward_step`` path uses Python-level control flow (append-to-list,
-conditional compress, top-k gather) and is dominated by interpreter
-overhead at small ``T_new``. It is suitable for:
+conditional compress, top-k gather). It is suitable for:
 
-  * Closing the Exp 6 scope gap (CSA / HCA decode latency vs softmax /
+  * Closing the Exp 6 scope gap (CSA / HCA decode vs softmax /
     KDA, on the same Kaggle T4).
   * Correctness verification (incremental == full-prefill).
   * Small-scale autoregressive generation (a few hundred tokens).
@@ -152,10 +148,10 @@ def _geometric_capacity(n_rows: int) -> int:
 # =============================================================================
 
 def _to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """``x.to(dtype)`` with the dispatcher skipped when it is a no-op.
+    """``x.to(dtype)``, returning ``x`` unchanged when the dtype matches.
 
     ``Tensor.to`` returns the SAME tensor when the dtype already matches,
-    so guarding on a dtype comparison is value-identical.
+    so the guard is value-identical.
     """
     if x.dtype == dtype:
         return x
@@ -163,7 +159,7 @@ def _to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _to_cache(x: torch.Tensor, dtype: torch.dtype, device) -> torch.Tensor:
-    """``x.to(dtype=dtype, device=device)`` skipping the no-op case.
+    """``x.to(dtype=dtype, device=device)``, returning ``x`` when it matches.
 
     Value-identical to the unconditional call (a matching dtype/device
     ``.to`` returns ``x`` itself).
@@ -362,10 +358,9 @@ class _SlidingWindowRingBuffer:
 
     def reset(self) -> None:
         """Clear all state (does not deallocate the buffer)."""
-        # We zero the buffer defensively so a stale read after reset
+        # The buffer is zeroed defensively so a stale read after reset
         # returns zeros rather than the previous session's keys (which
-        # could leak across sequences). The cost is one ``win * c``
-        # element zeroing, negligible for the typical ``win=16``.
+        # could leak across sequences).
         self._buf.zero_()
         self._sw_len = 0
         self._sw_head = 0
@@ -385,21 +380,19 @@ class _SlidingWindowRingBuffer:
         if x.device != self._buf.device or x.dtype != self._buf.dtype:
             # Cast defensively — the caller is expected to pass
             # matching dtype/device, but a stale buffer after a
-            # ``model.to(cuda)`` could otherwise crash with a cryptic
-            # device-mismatch error inside ``self._buf[:, ...] = x``.
+            # ``model.to(cuda)`` would otherwise fail inside
+            # ``self._buf[:, ...] = x`` with a device-mismatch error.
             x = x.to(device=self._buf.device, dtype=self._buf.dtype)
         _, T_new, _ = x.shape
         for i in range(T_new):
             self._append_one(x[:, i])
 
     def append_bulk(self, x: torch.Tensor) -> None:
-        """Append ``[B, T_new, c]`` entries in arrival order (vectorized).
+        """Append ``[B, T_new, c]`` entries in arrival order.
 
         Equivalent to calling :meth:`append` once per token — the final
         causal-order contents are exactly the last ``min(total, win)``
-        entries written — but without the per-token Python loop, so a
-        prefill of thousands of tokens does not pay thousands of tiny
-        ``copy_`` dispatches. Only the physical placement inside ``_buf``
+        entries written. Only the physical placement inside ``_buf``
         may differ (any placement with the same causal-order view is
         valid for :meth:`get`).
         """
@@ -506,10 +499,9 @@ class CSADecodingCache:
        compression.
     2. **Compressed block cache** (valid prefix ``[B, n_blocks, c]``) and
        **indexer key cache** (valid prefix ``[B, n_blocks, c_I]``). Their
-       backing storage grows geometrically as the accumulator fills, avoiding
-       a full copy on every new block. Read by the sparse-attention branch
-       (compressed block cache) and the lightning indexer (indexer key
-       cache) during ``forward_step``.
+       backing storage grows geometrically as the accumulator fills.
+       Read by the sparse-attention branch (compressed block cache) and
+       the lightning indexer (indexer key cache) during ``forward_step``.
     3. **Sliding-window ring buffer** (:class:`_SlidingWindowRingBuffer`).
        Holds the most recent ``win`` ``qk_norm_mode``-normalized ``Ca``
        entries, in FIFO order. Read by the SW branch during
@@ -567,7 +559,7 @@ class CSADecodingCache:
         qk_norm_mode: str = 'l2',
     ):
         # Validate structural params up-front so a misconfigured cache
-        # crashes at construction (not deep inside ``append_step``).
+        # raises at construction (not deep inside ``append_step``).
         # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
         # survive ``python -O``.
         if B < 1:
@@ -597,7 +589,7 @@ class CSADecodingCache:
         # inverse-rotates the output at the negated query position — the
         # same contract as the full-sequence ``naive_csa`` path, so the
         # incremental decode stays equivalent to prefill. ``rope_dim=None``
-        # (default) disables RoPE and preserves the historical behaviour.
+        # (default) disables RoPE.
         if rope_base <= 0:
             raise ValueError(
                 f"CSADecodingCache: rope_base={rope_base!r} must be positive")
@@ -644,10 +636,9 @@ class CSADecodingCache:
     def _ensure_compressed_capacity(self, required: int) -> None:
         """Ensure CSA compressed/indexer storage can hold ``required`` rows.
 
-        Capacity grows geometrically, so appending one completed block is
-        amortized O(1) in the number of previously cached blocks. Only the
-        valid prefix ``:self._n_blocks`` is copied; unused capacity is not
-        exposed through the public properties or attention path.
+        Capacity grows geometrically with the completed-block count. Only
+        the valid prefix ``:self._n_blocks`` is copied; unused capacity is
+        not exposed through the public properties or attention path.
 
         ``required`` is ALWAYS rounded up to the geometric capacity even
         when a bulk prefill (``_append_bulk``) jumps across many block
@@ -802,7 +793,7 @@ class CSADecodingCache:
                 f"does not match cache's c_I={self.c_I}.")
         # Validate T_new consistency across ALL inputs, not just
         # ``Ca_new``: a mismatch (e.g. ``Ca_new`` has T_new=4 but
-        # ``Cb_new`` has T_new=3) would otherwise crash deep inside the
+        # ``Cb_new`` has T_new=3) would otherwise raise deep inside the
         # per-token Python loop with a cryptic IndexError.
         for _name, _t in [
             ('Cb_new', Cb_new), ('Za_new', Za_new), ('Zb_new', Zb_new),
@@ -911,10 +902,10 @@ class CSADecodingCache:
                 # geometrically-grown storage so all rows stay uniform.
                 new_C_row = _to_dtype(new_C.unsqueeze(1), self.dtype)  # [B, 1, c]
                 new_K_I_row = _to_dtype(new_K_I.unsqueeze(1), self.dtype)  # [B, 1, c_I]
-                # Geometric growth avoids copying the complete compressed
-                # history on every block. The public cache exposes only the
-                # valid prefix, while the storage tensors retain spare
-                # capacity for future blocks.
+                # Storage grows geometrically with the number of completed
+                # blocks. The public cache exposes only the valid prefix,
+                # while the storage tensors retain spare capacity for
+                # future blocks.
                 self._ensure_compressed_capacity(self._n_blocks + 1)
                 self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
                 self._K_IComp[:, self._n_blocks:self._n_blocks + 1] = new_K_I_row
@@ -948,7 +939,7 @@ class CSADecodingCache:
         Bb: torch.Tensor,
         B_idx: torch.Tensor,
     ) -> list[int]:
-        """Vectorized ``append_step`` body for ``T_new > 1`` (prefill).
+        """Batched ``append_step`` body for ``T_new > 1`` (prefill).
 
         Splits the incoming tokens at exactly the same block boundaries as
         the per-token loop (a new block completes every ``m`` tokens counted
@@ -1256,8 +1247,8 @@ class CSADecodingCache:
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in
-            # no-grad inference it is forward-equivalent but adds avoidable
-            # softmax/gather work, so gate it just like ``naive_csa``.
+            # no-grad inference the two forms are forward-equivalent, so
+            # gate it just like ``naive_csa``.
             effective_use_ste = use_ste and torch.is_grad_enabled()
             indexer_result = csa_lightning_indexer(
                 _to_dtype(q_idx, compute_dtype),                       # [B, 1, nIh, c_I]
@@ -1310,10 +1301,8 @@ class CSADecodingCache:
                             'btn,bnc->btc', soft_weights, C_comp_n,
                         )                                              # [B, 1, c]
                         topk_size = kv.shape[2]
-                        # Cache the expansion once: ``expand`` returns a
-                        # cheap view, but computing it twice per decode step
-                        # (once for the value, once for the detached value)
-                        # still pays the duplicate view-creation cost.
+                        # The same expansion serves the value and its
+                        # detached copy.
                         soft_full_exp = soft_full.unsqueeze(2).expand(
                             -1, -1, topk_size, -1)
                         aux = soft_full_exp - soft_full_exp.detach()
@@ -1324,8 +1313,8 @@ class CSADecodingCache:
                     'b t h d, b t k d -> b t h k', q_compute, kv,
                 )                                                      # [B, 1, nh, topk]
                 if core_scale != 1.0:
-                    # Multiplying by exactly 1.0 is an IEEE no-op; skipping
-                    # the multiply keeps values bit-for-bit identical.
+                    # Multiplying by exactly 1.0 is an IEEE no-op, so the
+                    # guarded multiply is value-identical.
                     scores = scores * core_scale
                 scores = scores.masked_fill(
                     ~valid_mask[:, :, None, :], float('-inf'))
@@ -1347,8 +1336,8 @@ class CSADecodingCache:
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             )                                                          # [B, nh, sw_len]
             if core_scale != 1.0:
-                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-                # multiply keeps values bit-for-bit identical.
+                # Multiplying by exactly 1.0 is an IEEE no-op, so the
+                # guarded multiply is value-identical.
                 sw = sw * core_scale
             scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
@@ -1467,7 +1456,7 @@ class HCADecodingCache:
         # block-anchor positions (``s*m2``), SW keys at their token
         # positions, the query at the current position, and the output is
         # inverse-rotated at the negated query position. ``rope_dim=None``
-        # (default) disables RoPE and preserves the historical behaviour.
+        # (default) disables RoPE.
         if rope_base <= 0:
             raise ValueError(
                 f"HCADecodingCache: rope_base={rope_base!r} must be positive")
@@ -1664,12 +1653,12 @@ class HCADecodingCache:
         Z_new: torch.Tensor,
         B_pos: torch.Tensor,
     ) -> list[int]:
-        """Vectorized ``append_step`` body for ``T_new > 1`` (prefill).
+        """Batched ``append_step`` body for ``T_new > 1`` (prefill).
 
         Mirrors :meth:`CSADecodingCache._append_bulk`: identical block
         boundaries (every ``m2`` tokens from the first token ever appended)
         and identical compression helpers, with whole sweeps of blocks
-        compressed in a single batched call instead of one call per token.
+        compressed in one batched call.
         """
         B, T_new, c = C_new.shape
         m2 = self.m2
@@ -1846,8 +1835,8 @@ class HCADecodingCache:
                 'b t h d, b n d -> b t h n', q_compute, C_comp_n,
             )                                                          # [B, 1, nh, n_blocks]
             if core_scale != 1.0:
-                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-                # multiply keeps values bit-for-bit identical.
+                # Multiplying by exactly 1.0 is an IEEE no-op, so the
+                # guarded multiply is value-identical.
                 scores = scores * core_scale
             scores = scores.masked_fill(~cbm[:, :, None, :], float('-inf'))
 
@@ -1863,8 +1852,8 @@ class HCADecodingCache:
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             )                                                          # [B, nh, sw_len]
             if core_scale != 1.0:
-                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-                # multiply keeps values bit-for-bit identical.
+                # Multiplying by exactly 1.0 is an IEEE no-op, so the
+                # guarded multiply is value-identical.
                 sw = sw * core_scale
             scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
@@ -1930,10 +1919,10 @@ class Mamba2DecodingState:
     own ``Mamba2DecodingState``; nothing is attached to the shared module.
 
     The KDA layers' state (recurrent matrix ``[B, HV, K, V]`` + short-conv
-    lookback) keeps its historical representation: the stacked
+    lookback) uses its own representation: the stacked
     ``HybridAttentionStack._kda_state`` buffer + per-layer
     ``_conv_lookback``. Wrapping KDA in this class would be a pure
-    refactor with no behavioural gain, so the mixed stack keeps both
+    refactor with no behavioural gain, so the mixed stack presents both
     representations side by side (documented in docs/mamba2-framework.md).
     """
 

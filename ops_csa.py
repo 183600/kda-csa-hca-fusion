@@ -31,18 +31,12 @@ from ops_rope import (
 # Chunked sliding-window attention helper
 # -----------------------------------------------------------------------------
 # A plain ``C_padded.unfold(1, win, 1)`` implementation materializes a
-# ``[B, T, win, c]`` tensor in a single allocation. For
-# ``T=64K, win=2K, c=64, B=1`` this is
-# ``64K × 2K × 64 × 4B = 32 GB`` — far beyond GPU memory.
+# ``[B, T, win, c]`` tensor in a single allocation.
 #
 # This helper processes the window axis in chunks of ``chunk_t`` query
-# positions at a time, keeping peak memory at ``O(chunk_t · win · c)`` instead
-# of ``O(T · win · c)``. The default threshold ``CHUNKED_SW_THRESHOLD``
-# auto-engages the chunked path when ``T * win * c`` exceeds 8M elements
-# (≈32MB in fp32) — small enough that the chunked path's Python overhead is
-# negligible relative to the matmul cost, but large enough that the
-# vectorized ``unfold`` path stays fast for the common ``T≤4k, win≤512``
-# case documented as safe in the README.
+# positions at a time. The default threshold ``CHUNKED_SW_THRESHOLD``
+# auto-engages the chunked path when ``T * win * c`` exceeds 8M elements;
+# the ``unfold`` path is used otherwise.
 #
 # Numerical contract: IDENTICAL to the ``unfold``-based path. Softmax over
 # the ``win`` non-masked entries of a row is the same operation whether the
@@ -50,9 +44,8 @@ from ops_rope import (
 # of ``[chunk_t, win]`` slices.
 # ============================================================================
 
-# Auto-engage chunked path when the materialized unfold tensor would exceed
-# 8M elements (≈32MB fp32). Below this threshold the unfold path's
-# vectorized CUDA kernel beats the chunked path's Python-loop overhead.
+# Auto-engage the chunked path when the materialized unfold tensor would
+# exceed 8M elements.
 CHUNKED_SW_THRESHOLD = 8_000_000
 
 # Shape-keyed cache for the static ``[T, win]`` sliding-window validity mask
@@ -86,7 +79,7 @@ def _sliding_window_attention(
     *,
     chunk_t: int | None = None,
 ) -> torch.Tensor:
-    """Memory-efficient sliding-window attention.
+    """Chunked sliding-window attention.
 
     Returns ``[B, T, nh, c]`` — the local-window contribution to the per-head
     output. Adds nothing to the global state; the caller adds it to the
@@ -102,7 +95,7 @@ def _sliding_window_attention(
         device: torch.device for any intermediates.
         chunk_t: number of query positions to process per chunk. ``None``
             auto-picks ``min(T, max(64, ceil(T * win / (CHUNKED_SW_THRESHOLD /
-            win))))`` so peak memory stays near the threshold.
+            win))))``.
 
     Numerical contract:
         Identical to the equivalent ``unfold``-based implementation, up to
@@ -110,16 +103,13 @@ def _sliding_window_attention(
         are well below the fp32 tolerance enforced by ``run_correctness.py``.
     """
     B, T, nh, c = q.shape
-    # Static validity mask (shape [T, win]) — this is
-    # O(T * win) booleans = ~T*win/8 bytes (e.g. 64K*2K/8 = 16MB at the
-    # worst case documented in the README), small relative to the [B, T,
-    # win, c] float tensor we avoid materializing. The mask depends only on
+    # Static validity mask (shape [T, win]). The mask depends only on
     # (T, win, device) and is cached across calls (read-only contract).
     valid_mask = _sliding_window_valid_mask(T, win, device)  # True=real
 
-    # Auto-pick chunk_t if not given. Goal: keep peak memory near
-    # CHUNKED_SW_THRESHOLD / win / c per chunk (in elements). Round up to a
-    # multiple of 64 for matmul efficiency.
+    # Auto-pick chunk_t if not given, targeting
+    # CHUNKED_SW_THRESHOLD / (win * c) positions per chunk; rounded up to a
+    # multiple of 64.
     if chunk_t is None:
         # Target: chunk_t * win * c <= CHUNKED_SW_THRESHOLD
         # => chunk_t <= CHUNKED_SW_THRESHOLD / (win * c)
@@ -134,8 +124,8 @@ def _sliding_window_attention(
     out = q.new_zeros(B, T, nh, c)
     # Process query positions [t_lo, t_hi) per chunk. For each chunk we
     # extract the per-query windows via unfold on a small slice of C_padded,
-    # compute scores/softmax/output, and accumulate into ``out``. The peak
-    # intermediate is ``[B, chunk_t, win, c]`` — bounded by chunk_t.
+    # compute scores/softmax/output, and accumulate into ``out``. The
+    # per-chunk intermediate is ``[B, chunk_t, win, c]``.
     for t_lo in range(0, T, chunk_t):
         t_hi = min(T, t_lo + chunk_t)
         ct = t_hi - t_lo
@@ -277,12 +267,11 @@ def csa_compress_kv(
         m: compression factor (T must be divisible by m).
     """
     B_, T, c = C.shape
-    # Validate m BEFORE ``T % m`` so a caller passing m=0 gets a clear
-    # ValueError instead of a bare ``ZeroDivisionError`` with no context.
+    # Validate m BEFORE ``T % m`` so that m=0 is rejected with a clear
+    # ValueError rather than a bare ``ZeroDivisionError``.
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
-    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
-    # are silently stripped under optimization, which would re-expose the
-    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
+    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
+    # are silently stripped under optimization.
     if m < 1:
         raise ValueError(f"compression factor m={m} must be >= 1")
     if T % m != 0:
@@ -313,11 +302,11 @@ def csa_compress_kv_overlapped(
     compressed entries share half of their source tokens.
     """
     B_, T, c = Ca.shape
-    # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv).
+    # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv): m=0 is rejected
+    # with a clear ValueError rather than a bare ``ZeroDivisionError``.
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
-    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
-    # are silently stripped under optimization, which would re-expose the
-    # cryptic ZeroDivisionError this guard is specifically meant to prevent.
+    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
+    # are silently stripped under optimization.
     if m < 1:
         raise ValueError(f"compression factor m={m} must be >= 1")
     if T % m != 0:
@@ -343,7 +332,7 @@ def csa_compress_kv_overlapped(
     Za = Za.to(compute_dtype).view(B_, n_blocks, m, c)
     Zb = Zb.to(compute_dtype).view(B_, n_blocks, m, c)
 
-    # Vectorized two-branch overlapped compression.
+    # Two-branch overlapped compression.
     # a-branch logits for ALL blocks: [B, n_blocks, m, c]
     A_logits = Za + Ba[None, None, :, :].to(Za)
     # b-branch logits shifted by one so block i uses block i-1.
@@ -386,8 +375,8 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     else:
         all_masked = all_masked_mask
     if not bool(all_masked.any()):
-        # No fully-masked rows: the two ``masked_fill`` passes are no-ops
-        # (they only copy), so the plain softmax is bit-identical.
+        # No fully-masked rows: the two ``masked_fill`` passes are no-ops,
+        # so the plain softmax is bit-identical.
         return torch.softmax(logits, dim=dim)
     safe_logits = logits.masked_fill(all_masked, 0.0)
     soft = torch.softmax(safe_logits, dim=dim)
@@ -399,22 +388,21 @@ def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
 
     DeepSeek-V4 §2.3.3 ("Query and Key-Value Entry Normalization") specifies
     an RMSNorm on each head of the queries and on the single head of the
-    compressed KV entries. The historical repository behaviour is an
-    L2-normalization (cosine attention).
+    compressed KV entries. The default is an L2-normalization (cosine
+    attention).
 
     Modes
     -----
-    * ``'l2'``  (default, historical): ``x / ||x||_2`` — unit-norm vectors;
-      callers use ``scale=1.0`` (cosine scores in [-1, 1]).
+    * ``'l2'``  (default): ``x / ||x||_2`` — unit-norm vectors; callers use
+      ``scale=1.0`` (cosine scores in [-1, 1]).
     * ``'rms'`` (paper §2.3.3 form): ``x / sqrt(mean(x^2) + eps)`` — the
-      vectors keep norm ~sqrt(D). NOTE this is a genuine behaviour change,
-      not a no-op rename: (i) the attention VALUES are the normalized
-      entries themselves, so the core-attention output is ~sqrt(D) larger
-      than under 'l2'; (ii) the callers auto-select the STANDARD attention
-      temperature ``scale = 1/sqrt(D)`` for this mode (mirroring how
-      DeepSeek-V2/V3 combine per-head RMSNorm with standard scaling),
-      which makes the logits ~sqrt(D)·cosine — sharper than the 'l2' mode's
-      plain cosine. The paper does not pin the core-attention temperature,
+      vectors keep norm ~sqrt(D). NOTE: (i) the attention VALUES are the
+      normalized entries themselves, so the core-attention output is
+      ~sqrt(D) larger than under 'l2'; (ii) the callers auto-select the
+      STANDARD attention temperature ``scale = 1/sqrt(D)`` for this mode
+      (mirroring how DeepSeek-V2/V3 combine per-head RMSNorm with standard
+      scaling), which makes the logits ~sqrt(D)·cosine — sharper than the
+      'l2' mode's plain cosine. The paper does not pin the core-attention temperature,
       so both choices are paper-compatible; pass an explicit ``scale=`` to
       pin any other temperature.
     """
@@ -475,9 +463,9 @@ def csa_lightning_indexer(
         ``soft_weights`` tensor (the full softmax over all blocks); the
         ``ste_mode`` parameter is consumed by ``naive_csa``'s STE gather
         block, which builds a different differentiable surrogate for each
-        mode. The default ``'topk_columns'`` matches the historical
-        behaviour and the published CSA reference implementation; the
-        other modes are documented for extensibility and ablation.
+        mode. The default ``'topk_columns'`` matches the published CSA
+        reference implementation; the other modes are documented for
+        extensibility and ablation.
 
     normalize_qk : bool, default ``False``
         If True, L2-normalize ``q_idx`` and ``k_idx`` along the
@@ -492,8 +480,7 @@ def csa_lightning_indexer(
         the matching NOTE at the normalization site in the function
         body, and the *Fairness notes* in the README). Setting to
         ``False`` (the default)
-        preserves the historical un-normalized behaviour for backward
-        compatibility; **new use cases should pass
+        selects the un-normalized behaviour; **new use cases should pass
         ``normalize_qk=True``** to match the
         magnitude-invariant contract of the CSA/HCA core attention
         (which L2-normalizes both ``q`` and ``C_comp``). The option
@@ -550,30 +537,27 @@ def csa_lightning_indexer(
         full differentiable distribution — still useful for an
         auxiliary loss even when no hard selection is made).
     """
-    # Validate topk BEFORE ``min(topk, n_blocks)`` so a caller passing
-    # topk=-1 gets a clear ValueError instead of a cryptic
-    # ``RuntimeError: selected index k out of range`` from ``torch.topk``
-    # (which receives ``S = min(-1, n_blocks) = -1`` and crashes with no
-    # diagnostic about WHICH parameter was bad). The caller ``naive_csa``
-    # already validates topk >= 0, but ``csa_lightning_indexer`` is a PUBLIC
-    # function (no underscore prefix) imported directly by
-    # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
-    # its own contract.
+    # Validate topk BEFORE ``min(topk, n_blocks)``: a negative ``topk``
+    # raises a clear ValueError here, whereas ``torch.topk`` with
+    # ``S = min(-1, n_blocks) = -1`` raises
+    # ``RuntimeError: selected index k out of range`` without naming the
+    # offending parameter. The caller ``naive_csa`` already validates
+    # topk >= 0, but ``csa_lightning_indexer`` is a PUBLIC function (no
+    # underscore prefix) imported directly by ``run_correctness.py`` and
+    # ``method_analysis.py``, so it must defend its own contract.
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
-    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
-    # are silently stripped under optimization, which would re-expose the
-    # cryptic torch.topk RuntimeError this guard is specifically meant to
-    # prevent.
+    # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
+    # are silently stripped under optimization.
     if topk < 0:
         raise ValueError(
             f"topk={topk} must be >= 0 (0 selects zero blocks)")
-    # Validate the indexer key dimension BEFORE computing ``scale = DI ** -0.5``,
-    # which would raise ``ZeroDivisionError: 0.0 cannot be raised to a
-    # negative power`` if ``DI == 0``. ``naive_csa`` already validates
-    # ``c_I >= 1``, but this is a PUBLIC function imported directly by
-    # ``run_correctness.py`` and ``method_analysis.py``, so it must defend
-    # its own contract. Use ``raise ValueError`` (NOT ``assert``) so the
-    # check survives ``python -O``.
+    # Validate the indexer key dimension BEFORE computing
+    # ``scale = DI ** -0.5``, which requires ``DI > 0``. ``naive_csa``
+    # already validates ``c_I >= 1``, but this is a PUBLIC function
+    # imported directly by ``run_correctness.py`` and
+    # ``method_analysis.py``, so it must defend its own contract. Use
+    # ``raise ValueError`` (NOT ``assert``) so the check survives
+    # ``python -O``.
     if q_idx.shape[-1] < 1:
         raise ValueError(
             f"q_idx.shape[-1]={q_idx.shape[-1]} must be >= 1 "
@@ -594,16 +578,15 @@ def csa_lightning_indexer(
             "on the indexer selection logits. Use 'topk_columns' (the "
             "default, simplified STE) or 'full_softmax' (dense STE) for now.")
     # Scale-selection policy:
-    #   * If the caller explicitly passed a scale, honour it (backward
-    #     compatibility with any external code pinning a temperature).
+    #   * If the caller explicitly passed a scale, honour it.
     #   * Otherwise, when ``normalize_qk=True``, scores are cosine
     #     similarities in [-1,1] and the canonical temperature is 1.0.
     #     Using 1/sqrt(c_I) (the un-normalized default) over-shrinks ReLU
     #     scores and makes the STE softmax nearly uniform, damping the
     #     straight-through gradient by ~sqrt(c_I) and systematically
     #     slowing indexer learning.
-    #   * Otherwise (normalize_qk=False, the historical default) fall
-    #     back to the classical 1/sqrt(c_I) dot-product scale.
+    #   * Otherwise (normalize_qk=False, the default) fall back to the
+    #     classical 1/sqrt(c_I) dot-product scale.
     if scale is None:
         if normalize_qk:
             scale = 1.0
@@ -634,10 +617,9 @@ def csa_lightning_indexer(
         q_idx = F.normalize(q_idx, dim=-1)
         k_idx = F.normalize(k_idx, dim=-1)
 
-    # Vectorized batched scoring (no per-batch loop).
-    # head-wise similarities [B, HI, T, n_blocks]. Multiplying by a
-    # scale of exactly 1.0 is an IEEE no-op (values and gradients are
-    # preserved bit-for-bit).
+    # Head-wise similarities [B, HI, T, n_blocks]. Multiplying by a scale of
+    # exactly 1.0 is an IEEE no-op (values and gradients are preserved
+    # bit-for-bit).
     score = torch.einsum('b t h d, b n d -> b h t n', q_idx, k_idx)
     if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
         score = score * scale
@@ -652,8 +634,7 @@ def csa_lightning_indexer(
     # function is self-contained (does not rely on ``naive_csa`` to guard
     # the ``scores.amax(-1)`` call). ``torch.topk(logits, 0, ...)`` would
     # itself succeed (returning an empty tensor), but the explicit branch
-    # documents the contract and skips the ``min(topk, n_blocks)``
-    # computation that would otherwise produce a misleading ``S=0`` value.
+    # documents the contract for the degenerate ``S = 0`` case.
     if topk == 0:
         idx = q_idx.new_zeros(B_, T, 0, dtype=torch.long)
         if return_soft_weights:
@@ -728,12 +709,10 @@ def naive_csa(
     performs a FULL output projection ``[B, T, nh*c] -> d`` — NOT the
     paper's grouped output projection (§2.3.1, which first splits the
     ``nh`` head outputs into ``g`` groups and projects each group to a
-    ``d_g < c*nh/g`` intermediate). The grouped strategy pays off only
-    when ``c*nh >> d`` (DeepSeek-V4's production geometry); at this
-    repository's experiment scales ``c*nh`` is small, so the full
-    projection is used and the FLOPs accounting in ``run_kv_cache``
-    counts the full-projection cost (``2*T*c*nh*d``) — formula and
-    implementation are consistent.
+    ``d_g < c*nh/g`` intermediate). At this repository's experiment scales
+    ``c*nh`` is small, so the full projection is used and the FLOPs
+    accounting in ``run_kv_cache`` counts the full-projection cost
+    (``2*T*c*nh*d``) — formula and implementation are consistent.
 
     When ``return_projections=True``, returns ``(output, projections)`` where
     ``projections`` is a tuple ``(Ca, Cb, Za, Zb, K_idx, Z_idx)`` of the 6
@@ -741,8 +720,7 @@ def naive_csa(
     ``[B, original_T, c_I]``, trimmed to the input's original T before any
     right-padding). This lets incremental-decoding callers (e.g.
     ``run_decoding.CSAAttnDecoding``) populate a
-    :class:`ops_decoding_cache.CSADecodingCache` WITHOUT recomputing the 6
-    projections a second time.
+    :class:`ops_decoding_cache.CSADecodingCache` directly from this call.
 
     **Weight layout**: all ``W_*`` tensors follow the
     ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
@@ -754,9 +732,7 @@ def naive_csa(
     back to the original length, mirroring the contract of
     ``naive_chunk_kda``. Real tokens keep their original positions; only the
     last partial block contains padding zeros, and the causal block mask
-    ensures no real token attends to it. This removes a footgun where direct
-    callers (without the external padding done by ``HybridKCHAttention`` or
-    ``CSAAttn``) would hit a bare ``ValueError`` with no message.
+    ensures no real token attends to it.
 
     .. warning:: **``fuse_projections`` and the**
         ``use_ste=False`` **gradient contract.**
@@ -792,16 +768,15 @@ def naive_csa(
         ``W_KV_idx``/``W_Z_idx`` under ``use_ste=False``) if your code
         depends on the ``None``-means-untouched convention. See
         ``test_csa_fuse_projections_grad_contract`` in
-        ``run_correctness.py`` for a regression pinning both branches.
+        ``run_correctness.py`` for a test pinning both branches.
     """
     B_, T, d = H.shape
-    # Validate structural params early so a caller passing m=0, topk=-1,
-    # etc. gets a clear ValueError instead of a cryptic ZeroDivisionError
-    # or IndexError deep inside the operator.
+    # Validate structural params up front so a caller passing m=0, topk=-1,
+    # etc. gets a clear ValueError rather than a ZeroDivisionError or
+    # IndexError deep inside the operator.
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
-    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``. ``assert`` statements
-    # are silently stripped under optimization, which would re-expose the
-    # cryptic crashes these guards are specifically meant to prevent.
+    # survive ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
+    # are silently stripped under optimization.
     # ``raise ValueError`` is the standard exception for invalid user input
     # (``run_correctness.py::test_csa_hca_input_validation`` expects it).
     if m < 1:
@@ -815,14 +790,12 @@ def naive_csa(
         raise ValueError(f"c={c} must be >= 1")
     if dc < 1:
         raise ValueError(f"dc={dc} must be >= 1")
-    # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) MUST be
+    # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) are
     # validated here, not inside ``csa_lightning_indexer``: the explicit
-    # ``scale=c_I ** -0.5`` below raises
-    # ``ZeroDivisionError: 0.0 cannot be raised to a negative power`` when
-    # c_I == 0, and ``nIh == 0`` makes the indexer produce an all-zero
-    # ``logits`` tensor (the ``sum(1)`` over an empty head dim is 0), so
-    # top-k silently selects the first k blocks for every query — a
-    # meaningless result with no diagnostic. Reject both up-front.
+    # ``scale=c_I ** -0.5`` below requires c_I > 0, and ``nIh == 0`` makes
+    # the indexer produce an all-zero ``logits`` tensor (the ``sum(1)``
+    # over an empty head dim is 0), so top-k selects the first k blocks for
+    # every query. Reject both up-front.
     if c_I < 1:
         raise ValueError(f"c_I={c_I} must be >= 1 (indexer key dim)")
     if nIh < 1:
@@ -844,8 +817,7 @@ def naive_csa(
     # sparse retrieval. When ``normalize_qk=False`` we fall back to the
     # classical 1/sqrt(c) dot-product scale (mirroring the indexer scale
     # policy further below). If a caller explicitly passes ``scale=`` we
-    # honour it (backward compatibility for any external code pinning a
-    # temperature).
+    # honour it.
     #
     # NOTE: we do NOT assign ``scale`` here. The core-attention scale
     # auto-selection block below (after q/C_comp normalization) is the
@@ -862,20 +834,18 @@ def naive_csa(
             f"naive_csa: qk_norm_mode={qk_norm_mode!r} must be 'l2' (cosine, "
             f"historical) or 'rms' (paper §2.3.3 RMSNorm form)")
     # Partial RoPE (DeepSeek-V4 §2.3.3). ``rope_dim=None`` (default)
-    # disables RoPE and preserves the historical behaviour bit-exactly;
-    # the model-level wrappers (ops_fused / run_quality / run_decoding)
-    # default to the paper's 64-dim partial RoPE (clamped to the head
-    # dim for small geometries).
+    # disables RoPE; the model-level wrappers (ops_fused / run_quality /
+    # run_decoding) default to the paper's 64-dim partial RoPE (clamped to
+    # the head dim for small geometries).
     rope_dim_eff = effective_rope_dim(rope_dim, c)
     if rope_base <= 0:
         raise ValueError(
             f"naive_csa: rope_base={rope_base!r} must be positive")
     device = H.device
-    # Degenerate case: empty sequence. Without this guard the downstream
-    # ``csa_compress_kv_overlapped`` would raise a cryptic broadcasting
-    # error (``Expected size 0 but got size 1``) because n_blocks=0 makes
-    # the [B, n_blocks, m, c] reshape collapse against [m, c] positional
-    # bias. Return a zero-shaped output matching the contract.
+    # Degenerate case: empty sequence. With n_blocks=0 the downstream
+    # ``csa_compress_kv_overlapped`` cannot broadcast the [B, n_blocks, m, c]
+    # reshape against the [m, c] positional bias (``Expected size 0 but got
+    # size 1``). Return a zero-shaped output matching the contract.
     if T == 0:
         # Honor ``return_projections`` even in the degenerate T=0 case so
         # callers that unpack ``o, (Ca, Cb, Za, Zb, K_idx, Z_idx) =
@@ -908,15 +878,14 @@ def naive_csa(
 
     # --- 1. Compress KV (two-branch overlapped) ---
     # Use F.linear (computes H @ W.T) with W in nn.Linear.weight
-    # layout [out, in] — avoids the non-contiguous .weight.T view that an
-    # ``H @ W_aKV`` form would require at every call site.
+    # layout [out, in].
     #
     # We concatenate all 6 weights along their out_features axis (dim=0) and
     # do ONE ``F.linear`` call, then ``tensor.split`` the result back into
-    # the 6 named projections. The split is a zero-copy view (``split``
-    # returns views into the concatenated tensor). We do NOT cache the
-    # concatenated weight because the optimizer may update the individual
-    # weights in-place between forward passes, invalidating any cache.
+    # the 6 named projections. ``split`` returns views into the concatenated
+    # tensor. We do NOT cache the concatenated weight because the optimizer
+    # may update the individual weights in-place between forward passes,
+    # invalidating any cache.
     #
     # Numerical contract: equivalent to the 6 separate calls. ``F.linear`` is
     # ``x @ W.T``; concatenating the W's along dim=0 (out_features) and then
@@ -962,7 +931,7 @@ def naive_csa(
             dim=0,
         )                                                          # [4c + 2*c_I, d]
         combined_out = F.linear(H, combined_weight)                # [B, T, 4c + 2*c_I]
-        # ``torch.split`` returns views into ``combined_out`` — no copy.
+        # ``torch.split`` returns views into ``combined_out``.
         # split_sizes MUST match the order of weights in ``torch.cat`` above.
         Ca, Cb, Za, Zb, K_idx_raw, Z_idx = combined_out.split(
             [c, c, c, c, c_I, c_I], dim=-1,
@@ -978,7 +947,7 @@ def naive_csa(
         # gradient. See the ``fuse_projections`` docstring warning above
         # for the full rationale and
         # ``test_csa_fuse_projections_grad_contract`` in run_correctness.py
-        # for the regression test.
+        # for a test pinning this behaviour.
         Ca = F.linear(H, W_aKV)
         Cb = F.linear(H, W_bKV)
         Za = F.linear(H, W_aZ)
@@ -1018,13 +987,11 @@ def naive_csa(
     q_idx = F.linear(cQ, W_IUQ).view(B_, T, nIh, c_I)              # [B, T, nIh, c_I]
     w_idx = F.linear(H, W_w)                                      # [B, T, nIh]
     cbm = _causal_block_mask(T, n_blocks, m, device)
-    # Inference / benchmark: STE is a TRAINING-only surrogate for the
-    # non-differentiable top-k indexer. It is forward-equivalent to the hard
-    # gather but costs an extra full softmax + soft gather. Under
-    # ``torch.no_grad()`` there is no backward path to preserve, so computing
-    # the STE surrogate only inflates inference latency (Exp2 / Exp6). Gate it
-    # on ``torch.is_grad_enabled()`` so training keeps the default behaviour,
-    # while no-grad inference uses the lean hard-index path.
+    # STE is a TRAINING-only surrogate for the non-differentiable top-k
+    # indexer. It is forward-equivalent to the hard gather. Under
+    # ``torch.no_grad()`` there is no backward path to preserve, so the STE
+    # surrogate is gated on ``torch.is_grad_enabled()``: training keeps the
+    # default behaviour, while no-grad inference uses the hard-index path.
     effective_use_ste = use_ste and torch.is_grad_enabled()
     # The lightning indexer scores are dot products over DI = c_I (not c).
     # Scale policy: csa_lightning_indexer AUTO-SELECTS the scale —
@@ -1086,11 +1053,9 @@ def naive_csa(
     # Core-attention scale auto-selection (mirrors the indexer scale
     # policy above). A caller can still override by passing an explicit
     # ``scale=``.
-    # NOTE: this block MUST run BEFORE the topk=0 branch so ``scale`` is
+    # NOTE: this block runs BEFORE the topk=0 branch so ``scale`` is
     # resolved for the sliding-window branch (which runs AFTER the if/else
-    # and uses ``scale`` unconditionally); otherwise ``scale`` can be left
-    # as ``None``, causing a ``None * tensor`` crash in
-    # ``_sliding_window_attention``.
+    # and uses ``scale`` unconditionally).
     if scale is None:
         if not normalize_qk:
             scale = c ** -0.5
@@ -1107,19 +1072,17 @@ def naive_csa(
 
 
     # Handle topk=0 (degenerate but valid: caller asks for no sparse
-    # selection). Without this guard the downstream ``scores.amax(-1)``
-    # raises ``IndexError: Expected reduction dim -1 to have non-zero size``
-    # because ``scores`` would have shape ``[B, T, nh, 0]``. With topk=0
-    # the sparse branch contributes exactly zero; only the SW branch (if
-    # enabled) produces non-zero output. We still need ``q`` (for the SW
-    # branch) so the early return is placed AFTER q is computed.
+    # selection). ``scores`` has shape ``[B, T, nh, 0]``, so the sparse
+    # branch contributes exactly zero; only the SW branch (if enabled)
+    # produces non-zero output. The early return is placed AFTER ``q`` is
+    # computed because the SW branch needs ``q``.
     if indices.shape[-1] == 0:
         scores = torch.empty(B_, T, nh, 0, dtype=compute_dtype, device=device)
         valid_mask = torch.empty(B_, T, 0, dtype=torch.bool, device=device)
         kv = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
     else:
-        # --- Vectorized sparse MQA core attention ---
-        # Gather selected compressed KV entries for every (b, t) in one shot.
+        # --- Sparse MQA core attention ---
+        # Gather the selected compressed KV entries for all (b, t).
         # indices: [B, T, topk], padded with -1 for invalid slots.
         valid_mask = indices >= 0                                        # [B, T, topk]
         idx_safe = indices.clamp(min=0)                                  # [B, T, topk]
@@ -1182,9 +1145,9 @@ def naive_csa(
         #
         # The two modes are forward-equivalent (same sparse top-k gather)
         # but backward-distinct (different gradient distributions), exactly
-        # as documented in the ``ste_mode`` docstring above. A regression
-        # test in ``run_correctness.py::test_csa_indexer_ste_full_softmax``
-        # verifies both the forward-equivalence and the backward-distinctness
+        # as documented in the ``ste_mode`` docstring above. A test in
+        # ``run_correctness.py::test_csa_indexer_ste_full_softmax`` verifies
+        # both the forward-equivalence and the backward-distinctness
         # (non-selected blocks receive non-zero gradient only under
         # ``full_softmax``).
         if effective_use_ste and soft_weights is not None:
@@ -1230,13 +1193,13 @@ def naive_csa(
 
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
             #
-            # The form ``kv = soft_kv + (kv - soft_kv).detach()``
-            # is forward-equivalent to ``kv`` (hard gather) but in backward the
-            # detach() ERASES the direct gradient from the hard gather path,
-            # leaving only ``soft_weights * d_out`` as the gradient to the
-            # selected ``C_comp_n`` entries — i.e. the selected KV receives a
-            # gradient shrunk by the soft probability (often < 1). The standard
-            # STE identity is the other way around:
+            # The form ``kv = soft_kv + (kv - soft_kv).detach()`` is
+            # forward-equivalent to ``kv`` (hard gather) but in backward its
+            # ``detach()`` ERASES the direct gradient from the hard gather
+            # path, leaving only ``soft_weights * d_out`` as the gradient to
+            # the selected ``C_comp_n`` entries — i.e. the selected KV would
+            # receive a gradient shrunk by the soft probability (often < 1).
+            # The identity used here is instead
             #
             #     kv_ste = hard_kv + (soft_surrogate - soft_surrogate.detach())
             #
@@ -1249,9 +1212,9 @@ def naive_csa(
             # is preserved, AND ``soft_weights`` receives a non-zero gradient
             # that flows back to the indexer parameters. The extra
             # ``soft_weights * d_out`` added to the hard path is the standard
-            # STE bias and is benign for training stability. This restores the
+            # STE bias and is benign for training stability. This matches the
             # contract documented in the ``ste_mode`` docstring: selected KV
-            # entries receive the SAME gradient they would under
+            # entries receive the SAME gradient they receive under
             # ``use_ste=False``, plus an indexer-learning signal.
             kv = kv + (soft_kv - soft_kv.detach())
 

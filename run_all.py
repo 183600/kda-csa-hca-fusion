@@ -81,8 +81,7 @@ if HERE not in sys.path:
 #     underpowered at 2 seeds) — the run only proves the plumbing works.
 #     Also executes a 1-seed, 5-layer, 5-step pass of the eight-group
 #     matrix (exp5b smoke) so the ABL_MODE=matrix path is CI-covered.
-#   * ``screen`` (default) — the historical budget: the small-scale
-#     screening tier. Identical to the pre-profile behaviour.
+#   * ``screen`` (default) — the small-scale screening tier.
 #   * ``full``   — the formal-validation tier: seed counts raised to 7 so
 #     the multi-seed statistics stabilise. Step budgets are NOT silently
 #     raised (scale those explicitly via MQAR_STEPS / ABL_STEPS / ... once
@@ -111,7 +110,7 @@ _RUN_PROFILES: dict[str, dict[str, str] | None] = {
         'QLM_SEQ_LEN': '32', 'QLM_BATCH': '4', 'QLM_EVAL_SEQS': '2',
         'QLM_CORPUS': '32',
     },
-    'screen': None,   # the historical defaults — no overrides
+    'screen': None,   # default — no preset overrides
     'full': {
         'MQAR_SEEDS': '7', 'ABL_SEEDS': '7', 'MECH_SEEDS': '7',
     },
@@ -155,31 +154,26 @@ def _ensure_deps():
     """Ensure runtime packages exist; never fight a preinstalled environment.
 
     Kaggle notebook images ship recent, GPU-compatible builds of
-    torch / numpy / matplotlib. The historical behaviour — hard-rejecting
-    any version outside the originally-tested bounds and pip-installing
-    replacements in-place — made ``run_all.py`` CRASH on current Kaggle
-    images (e.g. a preloaded torch >= 2.7 or numpy >= 2.3 hit the
-    RuntimeError before a single experiment ran, and an in-place
-    downgrade of numpy can break the preinstalled torch stack).
+    torch / numpy / matplotlib, and an in-place downgrade of numpy can
+    break the preinstalled torch stack, so this function never
+    hard-rejects a preinstalled package.
 
-    Policy now:
-      * A MISSING package is still pip-installed (within the tested
-        bounds), because absent dependencies are always fatal.
-      * An INSTALLED package outside the historically-tested bounds only
-        triggers a WARNING: the repository's pure-PyTorch operator code
-        does not depend on version-sensitive APIs for CORRECTNESS. The
-        only expected variance is benchmark/softmax-baseline latency
-        (SDPA kernel selection changes across torch releases), which the
-        README already flags. Set ``STRICT_DEPS=1`` to restore the hard
-        version gate for bit-reproducible historical reruns.
+    Policy:
+      * A MISSING package is pip-installed (within the tested bounds),
+        because absent dependencies are always fatal.
+      * An INSTALLED package outside the tested bounds only triggers a
+        WARNING: the repository's pure-PyTorch operator code does not
+        depend on version-sensitive APIs for CORRECTNESS. The only
+        expected variance is the SDPA kernel selected inside the softmax
+        baseline (torch releases differ here); benchmark comparisons
+        are read with that caveat. Set ``STRICT_DEPS=1`` to enable the
+        hard version gate for bit-reproducible reruns.
     """
     strict = os.environ.get('STRICT_DEPS', '0') == '1'
-    # Advisory "historically-tested" bounds. Upper bounds are extended each
-    # time the full suite (run_correctness + all experiments + figures) is
-    # re-validated on newer releases, so Kaggle / AutoDL images with recent
-    # preinstalled stacks run WARNING-FREE. Last validation: 2026-08 on
-    # matplotlib 3.11.1 / numpy 2.5.2 / scipy 1.18.1 / torch 2.13.0 —
-    # 267/267 correctness checks + all six experiments + figures passed.
+    # Advisory tested bounds. Upper bounds track the newest releases the
+    # full suite (run_correctness + all experiments + figures) is validated
+    # against, so Kaggle / AutoDL images with recent preinstalled stacks
+    # run WARNING-FREE.
     bounded = {
         'einops': ('einops>=0.6,<0.9', (0, 6), (0, 9)),
         'matplotlib': ('matplotlib>=3.5,<3.12', (3, 5), (3, 12)),
@@ -217,9 +211,9 @@ def _ensure_deps():
                 f'after installing {spec}')
 
     # SciPy is optional: run_quality/run_ablation have a documented exact
-    # fallback for the required t-distribution calculations. Do not introduce
-    # a new network dependency on Kaggle just because SciPy is absent; an
-    # out-of-range installed SciPy only warns (see _ensure_deps docstring).
+    # fallback for the required t-distribution calculations. Do not add a
+    # network dependency on Kaggle when SciPy is absent; an out-of-range
+    # installed SciPy only warns (see _ensure_deps docstring).
     try:
         scipy_version = importlib_metadata.version('scipy')
     except importlib_metadata.PackageNotFoundError:
@@ -237,12 +231,10 @@ def _ensure_deps():
 
     # torch: only the LOWER bound is a hard requirement (the operator code
     # uses no APIs newer than torch 2.2). The advisory upper bound below
-    # matches requirements.txt / pyproject.toml (``torch>=2.2,<3``): the full
-    # correctness suite has been validated on every release from 2.2 through
-    # 2.13, so Kaggle / AutoDL images with a preinstalled CUDA torch >= 2.7
-    # are inside the tested range and must NOT trigger a warning. A torch
-    # NEWER than the validated range may still change SDPA kernel selection
-    # and therefore softmax-baseline latency numbers; warn but proceed. If
+    # matches requirements.txt / pyproject.toml (``torch>=2.2,<3``); releases
+    # inside that range are tested and must NOT trigger a warning. A torch
+    # NEWER than the tested range may still change SDPA kernel selection
+    # and therefore the softmax-baseline comparison; warn but proceed. If
     # torch is absent, importing kaggle_setup below will produce its own
     # dependency error.
     try:
@@ -505,8 +497,8 @@ def run_all(seeds=None, steps=None):
     # mutated env vars to the caller's process. We snapshot the
     # originals here (so the finally block can restore them) but DEFER
     # the actual mutations until we are inside the try block (after
-    # ``_ensure_deps`` / ``_setup`` succeed). The mutations now live
-    # just after ``os.chdir(out_root)`` below.
+    # ``_ensure_deps`` / ``_setup`` succeed). The mutations run just
+    # after ``os.chdir(out_root)`` below.
 
     _ensure_deps()
     info = _setup()
@@ -644,8 +636,8 @@ def run_all(seeds=None, steps=None):
         # 3. Method analysis (formulas + headwise demo) — always run.
         summary['runs'].append(_run('method_analysis', method_analysis.main))
 
-        # 4. Latency benchmark — on CPU the CSA/HCA Python loops are slow at T=2048.
-        #    Skip the largest lengths on CPU if SKIP_SLOW is set.
+        # 4. Latency benchmark — SKIP_SLOW truncates the largest lengths on
+        #    CPU (the CSA/HCA per-token Python loops at T=2048).
         if skip_slow and is_cpu:
             print('\n[run_all] SKIP_SLOW=1 on CPU: truncating benchmark lengths.')
             # SKIP_SLOW only TRUNCATES (filters out lengths > 512),
@@ -672,7 +664,7 @@ def run_all(seeds=None, steps=None):
         #     microbenchmarks). Always run: cheap and CPU-friendly.
         summary['runs'].append(_run('exp7_roofline', run_roofline.main))
 
-        # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
+        # 5. MQAR quality — multi-seed.
         if skip_slow and is_cpu:
             print('\n[run_all] SKIP_SLOW=1 on CPU: reducing MQAR to <=100 steps, '
                   'seeds held at >=5 for a valid Bonferroni test.')
@@ -725,7 +717,7 @@ def run_all(seeds=None, steps=None):
                 _abl_seeds = 7
             os.environ['ABL_SEEDS'] = str(max(5, _abl_seeds))
             # Use ``min(user_value, 50)`` so a user who explicitly set
-            # ``ABL_STEPS=10`` keeps their faster config. 50 is the
+            # ``ABL_STEPS=10`` keeps their chosen budget. 50 is the
             # ceiling (the documented minimum for showing the ablation
             # trend); below that the user is explicitly opting into an
             # under-trained run.
@@ -781,7 +773,7 @@ def run_all(seeds=None, steps=None):
         summary['runs'].append(
             _run('exp8_mechanism_ablation', run_mechanism_ablation.main))
 
-        # 7. Decoding latency — fast (only softmax + KDA).
+        # 7. Decoding latency.
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
 
         # 7b. Budget frontier — analytic curves + measured top-k decode

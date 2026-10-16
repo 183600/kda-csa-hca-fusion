@@ -141,8 +141,7 @@ def _is_compiling_safely() -> bool:
             # torch release (2.2+), whereas attribute access on
             # ``torch.compiler.is_compiling`` raises InternalTorchDynamoError on
             # torch 2.2 (the attribute exists only from 2.3, and touching it in a
-            # traced function aborts the compile). Reordering the probes keeps the
-            # fullgraph compile on 2.2 from failing on the guard itself.
+            # traced function aborts the compile).
             if callable(_dm.is_compiling):
                 return bool(_dm.is_compiling())
         except Exception:
@@ -161,9 +160,8 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
         return
     if o.numel() == 0:
         return
-    # ``aminmax`` propagates NaN and +/-Inf into the two scalars, so this is
-    # equivalent to ``torch.isfinite(o).all()`` without materializing a
-    # full-size boolean tensor (the warning path is unchanged).
+    # ``aminmax`` propagates NaN and +/-Inf into the two scalars, so testing
+    # those scalars is equivalent to ``torch.isfinite(o).all()``.
     _lo, _hi = torch.aminmax(o)
     if not bool(torch.isfinite(_lo) & torch.isfinite(_hi)):
         _warnings.warn(
@@ -187,10 +185,9 @@ def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
     """One sequential pass of the KDA recurrence (inner-loop body).
 
     ``q`` is ``[B, T, HV, 1, K]`` (already scaled, with the singleton query
-    dim pre-applied so no per-step ``unsqueeze`` is needed), ``v`` is
-    ``[B, T, HV, V]``, and the three factor tensors are ``[B, HV, T, K, 1]``
-    so that ``unbind`` yields the exact ``[B, HV, K, 1]`` broadcast shape
-    the loop consumes.
+    dim pre-applied), ``v`` is ``[B, T, HV, V]``, and the three factor
+    tensors are ``[B, HV, T, K, 1]`` so that ``unbind`` yields the exact
+    ``[B, HV, K, 1]`` broadcast shape the loop consumes.
     """
     outs = []
     for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
@@ -285,7 +282,7 @@ def naive_recurrent_kda(
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
     # GVA expansion. With G == 1 (H == HV) the repeat_interleave is an
-    # identity copy, so it is skipped entirely; values are unchanged.
+    # identity operation; values are unchanged.
     if G == 1:
         q = q * scale
     else:
@@ -315,10 +312,9 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
-    # Per-step factors hoisted out of the loop and laid out so ``unbind(2)``
-    # yields the ``[B, H, K, 1]`` broadcast shape the loop consumes; ``q``
-    # carries its singleton query dim from the start so no per-step
-    # ``unsqueeze`` is needed (a view, so the values are unchanged).
+    # Per-step factors laid out so ``unbind(2)`` yields the ``[B, H, K, 1]``
+    # broadcast shape the loop consumes; ``q`` carries its singleton query
+    # dim from the start (a view, so the values are unchanged).
     q_col = q.unsqueeze(-2)
     g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
     k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
@@ -423,10 +419,9 @@ def _chunk_kda_attn_loop_eager(
 
     Computes, for every row ``c`` and column ``j <= c``,
     ``sum_k k[c,k] * exp(g[c,k] - g[j,k]) * k[j,k]`` (and the q-weighted
-    variant for ``Aqk``), writing each row's contiguous ``[:c+1]`` prefix.
-    The per-element operands and their order are unchanged from the inline
-    loop this replaces; only the Python-level iteration is (optionally)
-    TorchScript-compiled via :func:`_get_scripted_prep_attn_loop`.
+    variant for ``Aqk``), writing each row's ``[:c+1]`` prefix. The
+    Python-level iteration is optionally TorchScript-compiled via
+    :func:`_get_scripted_prep_attn_loop`.
     """
     for c in range(BT):
         # ``[..., c:c+1, :]`` broadcasts identically to
@@ -454,9 +449,8 @@ _PREP_ATTN_LOOP_SCRIPTED_FAILED = False
 def _get_scripted_prep_attn_loop():
     """Lazily ``torch.jit.script`` the ``A`` / ``Aqk`` build loop.
 
-    The compiled form is cached and reused across calls (the loop is
-    shape/dtype-generic); on builds where scripting fails, the eager loop is
-    used instead.
+    The loop is shape/dtype-generic; on builds where scripting fails, the
+    eager loop is used instead.
     """
     global _PREP_ATTN_LOOP_SCRIPTED, _PREP_ATTN_LOOP_SCRIPTED_FAILED
     if _PREP_ATTN_LOOP_SCRIPTED is None and not _PREP_ATTN_LOOP_SCRIPTED_FAILED:
@@ -475,7 +469,7 @@ def _get_scripted_prep_attn_loop():
 # (``eye - A`` / ``A + eye``) and the strict-upper triangular mask returned
 # to the recompute inner loop. Both depend only on (BT, dtype, device) and
 # are treated as immutable by every consumer (subtract / add / masked_fill
-# read-only), so they are built once per shape instead of per call.
+# read-only).
 _CHUNK_CONST_CACHE: dict = {}
 
 
@@ -592,12 +586,10 @@ def _chunk_kda_prepare(
     # Only the entries with row ``c >= j`` (column ``j``) are materialized;
     # the strict upper triangle stays at the zeros from the allocation above
     # and the diagonal is explicitly zeroed right after the loop. The loop
-    # walks rows (writing each row's contiguous ``[:c+1]`` prefix) instead
-    # of columns; the per-element operands and their order are unchanged
-    # (entry ``(c, j)`` still computes ``sum_k k[c,k] * exp(g[c,k]-g[j,k])
-    # * k[j,k]``), so the values are bit-identical.
-    # The row loop itself is shared with ``_chunk_kda_attn_loop_eager`` so it
-    # can be TorchScript-compiled once and cached (see
+    # walks rows rather than columns; entry ``(c, j)`` computes
+    # ``sum_k k[c,k] * exp(g[c,k]-g[j,k]) * k[j,k]``, so the values are
+    # bit-identical.
+    # The row loop itself is shared with ``_chunk_kda_attn_loop_eager`` (see
     # :func:`_get_scripted_prep_attn_loop`); the eager fallback runs the same
     # loop. In ``recompute_attn`` mode ``Aqk`` is None, and the loop receives
     # ``A`` as an unused placeholder tensor.
@@ -736,10 +728,9 @@ def _chunk_kda_inner_loop(
     chunk_outs = []
     # The per-chunk gate maps (``exp(g)``, the last-position decay, and the
     # decay-difference weighted keys) are pure elementwise functions of
-    # ``g`` / ``k``: hoisting them out of the sequential loop (evaluated
-    # vectorized over the chunk axis) computes the exact same fp values —
-    # each chunk then consumes its own slice — while removing several
-    # dispatches per chunk.
+    # ``g`` / ``k``, evaluated for all chunks up front; each chunk then
+    # consumes its own slice. The computed fp values are the same as
+    # evaluating each slice inside the loop.
     gexp_all = g.exp()
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     kexp_all = (g[..., -1:, :] - g).exp() * k
@@ -792,8 +783,8 @@ def _chunk_kda_inner_loop_recompute(
     """
     chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
-    # Same hoisting as ``_chunk_kda_inner_loop`` (pure elementwise gate
-    # maps, vectorized over the chunk axis; values unchanged).
+    # Same gate-map layout as ``_chunk_kda_inner_loop`` (pure elementwise
+    # functions of ``g`` / ``k``; values unchanged).
     gexp_all = g.exp()
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     kexp_all = (g[..., -1:, :] - g).exp() * k
@@ -835,12 +826,10 @@ def _assoc_scan_chunk_states(
 
         (M_2, b_2) ∘ (M_1, b_1) = (M_2 M_1, M_2 b_1 + b_2)
 
-    so the per-chunk *incoming* states can be produced by a prefix scan
-    whose combine is a ``K×K`` matmul plus a ``K×V`` matmul, instead of the
-    sequential ``for n in range(NT)`` loop used by
-    :func:`_chunk_kda_inner_loop`. This implementation uses a Hillis–Steele
-    (doubling) scan: ``ceil(log2(NT))`` levels, each level one batched
-    ``matmul`` over ``[B, HV, NT, ...]``.
+    so the per-chunk *incoming* states are produced by a prefix scan whose
+    combine is a ``K×K`` matmul plus a ``K×V`` matmul. This implementation
+    uses a Hillis–Steele (doubling) scan: ``ceil(log2(NT))`` levels, each
+    level one batched ``matmul`` over ``[B, HV, NT, ...]``.
 
     Returns:
         ``(S_in, S_final, levels)`` where ``S_in`` has shape
@@ -901,10 +890,9 @@ def assoc_scan_chunk_kda(
 ):
     """Chunkwise KDA via an **associative scan over chunks** (reference).
 
-    Same math as :func:`naive_chunk_kda`, reorganized so that the state
-    recurrence is expressed as per-chunk *affine maps* and resolved by a
-    parallel prefix (associative) scan instead of the sequential inner
-    loop. For chunk ``n`` let ``gexp = exp(g_cumsum)`` and
+    Same math as :func:`naive_chunk_kda`, with the state recurrence
+    expressed as per-chunk *affine maps* and resolved by a parallel prefix
+    (associative) scan. For chunk ``n`` let ``gexp = exp(g_cumsum)`` and
     ``kexp = k * exp(g_cumsum[last] - g_cumsum)`` (the per-channel log-decay
     factors to the chunk end). The delta-rule/wY transform gives::
 
@@ -917,15 +905,15 @@ def assoc_scan_chunk_kda(
     solve in :func:`_chunk_kda_prepare`, exactly as in the sequential path.
     The maps ``(M_n, b_n)`` compose associatively, so
     :func:`_assoc_scan_chunk_states` recovers all incoming chunk states in
-    ``ceil(log2 NT)`` batched levels (Hillis–Steele) — no Python loop over
-    the sequence length. Numerically it agrees with ``naive_chunk_kda`` to
-    fp round-off; it is NOT bit-exact, because the composition order of the
-    chunk prefix differs from the running multiplication in the loop.
+    ``ceil(log2 NT)`` batched levels (Hillis–Steele). Numerically it agrees
+    with ``naive_chunk_kda`` to fp round-off; it is NOT bit-exact, because
+    the composition order of the chunk prefix differs from the running
+    multiplication in the loop.
 
     This path uses the cached ``Aqk`` matrices from
     :func:`_chunk_kda_prepare`; ``recompute_attn`` is incompatible here
     because the readout terms ``C_n`` / ``a_n`` are computed from the full
-    ``Aqk`` tensor in one vectorized shot.
+    ``Aqk`` tensor.
 
     The scan core is TorchScript-compatible; the surrounding wrapper stays
     eager. The output is assembled by :func:`_chunk_kda_finalize`, so
@@ -973,13 +961,12 @@ _CHUNK_INNER_SCRIPT_FAILED: dict = {}
 
 
 def _get_scripted_chunk_inner(inner_eager, recompute_attn: bool):
-    """Lazily ``torch.jit.script`` the chunk-path inner loop, with caching.
+    """Lazily ``torch.jit.script`` the chunk-path inner loop.
 
     The inner loop is one of two module-level functions selected by
-    ``recompute_attn``; its compiled form is shape/dtype-generic, so it is
-    compiled once and reused on every subsequent call.
-    Returns ``(scripted_inner_or_None, error_str_or_None)``; the error string
-    is cached so a broken ``torch.jit`` build is not retried per call.
+    ``recompute_attn``; its compiled form is shape/dtype-generic.
+    Returns ``(scripted_inner_or_None, error_str_or_None)``; a cached error
+    string records a broken ``torch.jit`` build.
     """
     key = bool(recompute_attn)
     entry = _CHUNK_INNER_SCRIPTED.get(key)

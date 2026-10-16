@@ -14,23 +14,14 @@
 # pyproject.toml) for the canonical environment; this file is a
 # convenience for users who prefer the requirements.txt workflow.
 #
-# torch upper bound is `<3` (not `<2.7`, not unbounded): 2025-2026 Kaggle
-# GPU images and AutoDL base images preinstall CUDA torch >= 2.7. A `<2.7`
-# pin forces pip to DOWNGRADE the preinstalled CUDA build to the 2.6 CPU
-# wheel from PyPI (~800 MB download, silently breaks
-# torch.cuda.is_available()). An unbounded pin risks a future torch 3.x
-# breaking change; the full correctness suite passes on every torch release
-# from 2.2 through 2.13, so `<3` is validated, not speculative. Pin
-# `torch==2.6.*` yourself for a bit-reproducible rerun of the committed
-# historical numbers.
+# torch upper bound is `<3`: a newer preinstalled CUDA build (Kaggle /
+# AutoDL images) must not be replaced by an older CPU-only wheel from
+# PyPI, and a future torch major release may break compatibility. Pin
+# `torch==X.Y.*` yourself when bit-reproducible reruns are required.
 #
-# numpy / matplotlib / scipy upper bounds are advisory "historically-tested"
-# ranges, extended each time the full suite (run_correctness + all
-# experiments + figures) is re-validated on newer releases so that
-# `pip install -e .` never downgrades a newer PREINSTALLED stack on
-# Kaggle / AutoDL. Last validation: 2026-08 on numpy 2.5.2 /
-# matplotlib 3.11.1 / scipy 1.18.1 / torch 2.13.0 (267/267 checks + all
-# experiments + figures passed).
+# The numpy / matplotlib / scipy upper bounds keep `pip install -e .` from
+# downgrading a newer preinstalled stack on Kaggle / AutoDL; exact pins
+# belong in a lock file.
 torch>=2.2,<3
 einops>=0.6,<0.9
 matplotlib>=3.5,<3.12

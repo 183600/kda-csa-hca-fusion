@@ -193,15 +193,15 @@ fixed weights and path.
 
 ## CI gating for the quantization track
 
-`run_all.py` now (a) runs `test_quant_recall` / `test_quant_lm` alongside
-the other unit-test modules, (b) executes Exp 10 and Exp 11 with smoke /
-SKIP_SLOW CPU budget truncation, and (c) ends with a
-`results_schema_check` step asserting every schema-managed result file
-present in `results/` parses as a compatible `results_schema` payload
-(raw provenance side files and the Exp 4 overfit-gate report are
-explicitly exempt). `ci_gate.py` itself is frozen and only covers
-`run_correctness.py` / `test_figures.py`, so this wiring is where the
-quantization experiments get their pipeline coverage.
+`run_all.py` integrates the quantization track: it runs
+`test_quant_recall` / `test_quant_lm` alongside the other unit-test
+modules, executes Exp 10 and Exp 11 with smoke / SKIP_SLOW CPU budget
+truncation, and finishes with a `results_schema_check` step asserting
+every schema-managed result file present in `results/` parses as a
+compatible `results_schema` payload (raw provenance side files and the
+Exp 4 overfit-gate report are explicitly exempt). `ci_gate.py` covers
+`run_correctness.py` / `test_figures.py`, so this wiring provides the
+quantization experiments' pipeline coverage.
 
 ## Entry points
 

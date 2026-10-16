@@ -62,8 +62,7 @@ def naive_hca(
     projections (each ``[B, original_T, c]``, trimmed to the input's original
     T before any right-padding). This lets incremental-decoding callers (e.g.
     ``run_decoding.HCAAttnDecoding``) populate an
-    :class:`ops_decoding_cache.HCADecodingCache` WITHOUT recomputing the 2
-    projections a second time.
+    :class:`ops_decoding_cache.HCADecodingCache` directly from this call.
 
     **Weight layout**: all ``W_*`` tensors follow the
     ``nn.Linear.weight`` convention — shape ``[out_features, in_features]``.
@@ -126,9 +125,8 @@ def naive_hca(
             f"naive_hca: qk_norm_mode={qk_norm_mode!r} must be 'l2' (cosine, "
             f"historical) or 'rms' (paper §2.3.3 RMSNorm form)")
     # Partial RoPE (DeepSeek-V4 §2.3.3): ``rope_dim=None`` (default)
-    # disables it and preserves the historical behaviour; the model-level
-    # wrappers default to the paper's 64-dim partial RoPE (clamped to the
-    # head dim for small geometries).
+    # disables it; the model-level wrappers default to the paper's 64-dim
+    # partial RoPE (clamped to the head dim for small geometries).
     rope_dim_eff = effective_rope_dim(rope_dim, c)
     if rope_base <= 0:
         raise ValueError(
@@ -184,8 +182,7 @@ def naive_hca(
         q = partial_rope(
             q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
     # Core-attention scale auto-selection: ``scale=None`` (the default)
-    # resolves to 1.0 for the historical cosine 'l2' mode (identical to the
-    # previous hard-coded default of 1.0) and to the standard 1/sqrt(c)
+    # resolves to 1.0 for the cosine 'l2' mode and to the standard 1/sqrt(c)
     # temperature for the paper-form 'rms' mode. An explicit ``scale=`` is
     # always honoured.
     if scale is None:

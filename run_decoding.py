@@ -16,10 +16,9 @@ matters for long-context inference) in addition to prefill:
     H100/H20; they are a *relative* comparison of the operators' decoding
     cost growth.
 
-Note: KDA's ``naive_recurrent_kda`` is a Python loop, so its wall-clock on
-CPU is dominated by Python overhead. On GPU the per-step kernel launch
-overhead dominates. The *trend* (flat vs growing) is the signal, not the
-absolute microseconds.
+Note: the *trend* (flat vs growing with context) is the signal, not the
+absolute microseconds: the operator curves are interpreted by shape
+rather than by absolute value.
 """
 
 from __future__ import annotations
@@ -115,11 +114,11 @@ class SoftmaxAttnDecoding(nn.Module):
       * Attention is computed over ``cache[:, :_cache_len]`` (a view, no
         copy).
 
-    This makes the benchmark measure the attention kernel itself rather
-    than cache-rebuild overhead. The total softmax decode step is still
-    ``O(T)`` per token because one query attends to all cached keys — that
-    is the irreducible cost we want to compare against KDA's ``O(1)``
-    recurrent update.
+    The cache design keeps the benchmark focused on the attention kernel
+    itself. The total softmax decode step is still ``O(T)`` per token
+    because one query attends to all cached keys — that is the
+    irreducible cost we want to compare against KDA's ``O(1)`` recurrent
+    update.
     """
 
     def __init__(self, d_model, H=2, K=16, V=16):
@@ -144,8 +143,7 @@ class SoftmaxAttnDecoding(nn.Module):
         self.register_buffer('_cache_v', None, persistent=False)
         # ``_cache_len`` is a plain Python int (not a buffer) because it is
         # a scalar counter, not a tensor — there is nothing for ``.to()``
-        # to move. Storing it as a 0-dim tensor would add unnecessary
-        # overhead on every read/write.
+        # to move.
         self._cache_len = 0
 
     def reset(self):
@@ -214,9 +212,9 @@ class SoftmaxAttnDecoding(nn.Module):
         needed_len = self._cache_len + T_new
         self._ensure_cache_capacity(B, needed_len, k.dtype, x.device)
 
-        # Write the new k/v into the pre-allocated slots — O(T_new) write,
-        # NO copy of the existing cache (unlike the old torch.cat approach
-        # which copied ALL existing entries on every call).
+        # Write the new k/v into the pre-allocated slots — an O(T_new)
+        # in-place write into the valid prefix; existing entries are not
+        # copied.
         self._cache_k[:, self._cache_len:self._cache_len + T_new] = k
         self._cache_v[:, self._cache_len:self._cache_len + T_new] = v
         self._cache_len = self._cache_len + T_new
@@ -232,9 +230,8 @@ class SoftmaxAttnDecoding(nn.Module):
         # at absolute positions <= (T_full - T_new + t).
         # For prefill (T_new == T_full) this reduces to the standard
         # lower-triangular mask. For decoding (T_new == 1) the single query
-        # is at position T_full - 1, so it attends to all cached keys and the
-        # mask is all-False (we skip the masked_fill entirely to avoid the
-        # overhead of constructing a [1, T_full] mask per decode step).
+        # is at position T_full - 1, so it attends to all cached keys and
+        # the mask is all-False (no masked_fill needed for the decode step).
         if T_new > 1:
             q_offset = T_full - T_new
             q_pos = torch.arange(T_new, device=x.device) + q_offset     # [T_new]
@@ -555,11 +552,11 @@ class CSAAttnDecoding(nn.Module):
     autoregressive decoding.
 
     The first prefill chunk (``T_new > 1`` with an empty cache) calls
-    ``naive_csa`` on the full chunk (the fast vectorized path) and
-    populates the cache from the result. The decode path (``T_new == 1``)
-    uses the cache for incremental computation: it avoids full-prefix
-    recompression, while the indexer/attention work still scales with the
-    number of completed compressed blocks (roughly O(T/m + win)). A
+    ``naive_csa`` on the full chunk (the vectorized full-sequence path)
+    and populates the cache from the result. The decode path
+    (``T_new == 1``) uses the cache for incremental computation over the
+    retained prefix, while the indexer/attention work still scales with
+    the number of completed compressed blocks (roughly O(T/m + win)). A
     continuation chunk (``T_new > 1`` received after the cache already
     holds context) also goes through the incremental per-token path,
     because chunk-local ``naive_csa`` output would ignore the cached
@@ -610,10 +607,10 @@ class CSAAttnDecoding(nn.Module):
         self._cache: CSADecodingCache | None = None
 
     def reset(self):
-        # Drop (not just clear) the cache object so CUDA peak-memory accounting
-        # in bench_decoding counts the full runtime cache allocation in the
-        # timed region. Keeping an empty _SlidingWindowRingBuffer alive across
-        # reset would put that tensor in the baseline and under-report peak_mem.
+        # Drop (rather than clear) the cache object so CUDA peak-memory
+        # accounting in bench_decoding includes the full runtime cache
+        # allocation in the timed region: the baseline is captured after
+        # reset, so empty ring buffers never remain in it.
         self._cache = None
 
     def _ensure_cache(self, B, device, dtype):
@@ -674,8 +671,7 @@ class CSAAttnDecoding(nn.Module):
             # Populate the cache from the projections returned by naive_csa
             # (detached so cache state doesn't retain the prefill graph).
             # T_new > 1 routes through the batched ``_append_bulk``
-            # block-compression path, so the projection matmul and the
-            # block build are each paid once.
+            # block-compression path.
             cache.append_step(
                 Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
                 K_idx.detach(), Z_idx.detach(),
@@ -743,10 +739,10 @@ class HCAAttnDecoding(nn.Module):
         self._cache: HCADecodingCache | None = None
 
     def reset(self):
-        # Drop (not just clear) the cache object so CUDA peak-memory accounting
-        # in bench_decoding counts the full runtime cache allocation in the
-        # timed region. Keeping an empty _SlidingWindowRingBuffer alive across
-        # reset would put that tensor in the baseline and under-report peak_mem.
+        # Drop (rather than clear) the cache object so CUDA peak-memory
+        # accounting in bench_decoding includes the full runtime cache
+        # allocation in the timed region: the baseline is captured after
+        # reset, so empty ring buffers never remain in it.
         self._cache = None
 
     def _ensure_cache(self, B, device, dtype):
@@ -809,20 +805,16 @@ class HCAAttnDecoding(nn.Module):
 class HybridDecoding(nn.Module):
     """Hybrid KDA+CSA+HCA stack with real per-layer decode caches.
 
-    Earlier versions routed ``forward(x_new)`` through
-    :class:`ops_fused.HybridKCHAttention` directly. That preserved KDA's
-    recurrent state, but CSA/HCA are stateless in the fused module, so during
-    token-by-token decode they saw ONLY the current token and had no access to
-    the prefill context. The resulting "hybrid" row was neither a correct
-    autoregressive hybrid decode nor a safe upper bound.
-
-    This wrapper now executes the fused stack layer-by-layer and maintains a
-    decoding cache for every CSA/HCA sub-layer, alongside the fused model's KDA
-    recurrent states / short-conv lookbacks. Prefill uses the vectorized full
-    CSA/HCA operators for the output while also populating the caches from the
-    same normalized layer inputs. Decode uses ``CSADecodingCache`` /
-    ``HCADecodingCache`` for the CSA/HCA layers, so all three operator types
-    see the same history they would see in a full-sequence pass.
+    The wrapper executes the fused stack layer-by-layer and maintains a
+    decoding cache for every CSA/HCA sub-layer, alongside the fused model's
+    KDA recurrent states / short-conv lookbacks. CSA/HCA are stateless in
+    :class:`ops_fused.HybridKCHAttention`, so the per-layer caches are what
+    let them see the prefill context during token-by-token decode. Prefill
+    uses the vectorized full CSA/HCA operators for the output while also
+    populating the caches from the same normalized layer inputs. Decode uses
+    ``CSADecodingCache`` / ``HCADecodingCache`` for the CSA/HCA layers, so
+    all three operator types see the same history they would see in a
+    full-sequence pass.
     """
 
     def __init__(self, d_model=64, total_layers=5, csa_topk=None, cfg=None,
@@ -830,7 +822,7 @@ class HybridDecoding(nn.Module):
         """``csa_topk`` is exposed so decode ablations can sweep it.
 
         ``memory_type`` selects the recurrent memory operator filling the
-        stack's memory slots ('kda' default = the historical row;
+        stack's memory slots ('kda' default;
         'mamba2' = the Mamba-2 route with d_state=16 / headdim=32 /
         expand=2 / d_conv=4 at this decode-scale geometry). The CSA/HCA
         sub-layers and their incremental caches are IDENTICAL across the
@@ -842,9 +834,8 @@ class HybridDecoding(nn.Module):
         ``run_quality.SMALL_MODEL_SPEC``: ``c=32, dc=64, cI=16, nIh=2,
         topk=4, m2=8, d_model=32``). The decoding config here
         (``c=8, dc=8, cI=4, nIh=1, topk=2, m2=4, d_model=64``) is
-        intentionally lighter so per-token decode work stays small enough
-        to benchmark on CPU at the default ``prefill_lens`` (up to 2048)
-        without the cache-tensor allocation dominating the timed region.
+        intentionally lighter so per-token decode work stays CPU-
+        benchmarkable at the default ``prefill_lens`` (up to 2048).
         Decode numbers MUST NOT be compared head-to-head with Exp 4/5
         quality numbers — the model geometry is different by design.
 
@@ -853,7 +844,7 @@ class HybridDecoding(nn.Module):
         decode benchmark's intent to measure the *sparse* CSA path rather
         than the dense fallback.
 
-        ``cfg`` (new): wrap an EXISTING :class:`HybridConfig` instead of
+        ``cfg``: wrap an EXISTING :class:`HybridConfig` instead of
         the hardcoded benchmark geometry — used by
         ``lm_consistency.build_decoding_clone`` to give a pretraining LM
         (``train_lm_autodl.LMWithHybrid``) an incremental decode path with
@@ -943,9 +934,10 @@ class HybridDecoding(nn.Module):
 
     def reset(self):
         self.model.reset_state()
-        # Drop cache objects rather than leaving empty SW ring buffers alive.
-        # Otherwise CUDA memory baselines captured after reset would subtract
-        # those buffers and under-report the hybrid runtime cache footprint.
+        # Drop cache objects rather than leaving empty SW ring buffers
+        # alive: the CUDA baseline is captured after reset, so those
+        # buffers must not remain in it and the hybrid runtime cache
+        # footprint is counted in full.
         self._csa_caches = [None for _ in self._csa_caches]
         self._hca_caches = [None for _ in self._hca_caches]
 
@@ -1023,9 +1015,6 @@ class HybridDecoding(nn.Module):
             # First prefill chunk (empty cache): vectorized full-sequence
             # operator for the output AND reuse its internally-computed
             # projections to populate the cache (return_projections=True).
-            # Eliminates a redundant fused matmul via _project_csa that
-            # would otherwise inflate hybrid prefill latency relative to
-            # softmax/KDA.
             o_core, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
                 h, layer.W_aKV.weight, layer.W_bKV.weight,
                 layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
@@ -1065,7 +1054,7 @@ class HybridDecoding(nn.Module):
                 )
                 compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
                 # Normalize with the layer's configured qk_norm_mode ('l2'
-                # historical default, 'rms' paper §2.3.3 form) so both paths
+                # default, 'rms' paper §2.3.3 form) so both paths
                 # match the prefill path's naive_csa call. ``scale=None``
                 # lets the cache auto-select the matching temperature.
                 q_n = _qk_normalize(q.to(compute_dtype), cfg.csa_qk_norm_mode)
@@ -1090,8 +1079,6 @@ class HybridDecoding(nn.Module):
             # First prefill chunk (empty cache): vectorized full-sequence
             # operator for the output AND reuse its internally-computed C/Z
             # projections to populate the cache (return_projections=True).
-            # Eliminates a redundant matmul via _project_hca that would
-            # otherwise inflate hybrid prefill latency.
             o_core, (C, Z) = naive_hca(
                 h, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
                 layer.W_DQ.weight, layer.W_UQ.weight,
@@ -1201,9 +1188,8 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     _seed_gen = make_seeded_generator(0, device=device)
 
     # Pre-allocate the per-step decode input ONCE outside the timed loop so
-    # per-token latency excludes the cost of randn + the scalar multiply —
-    # for KDA (tiny per-token compute) this overhead can dominate the
-    # measurement.
+    # the timed region covers only the model forward, not input
+    # construction (randn + scalar multiply).
     x_new = torch.randn(1, 1, d_model, device=device, generator=_seed_gen) * 0.1
 
     # One fixed prefill input (same across trials) so timing variance comes
@@ -1211,8 +1197,7 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     x_prefill = torch.randn(1, prefill_len, d_model, device=device, generator=_seed_gen) * 0.1
 
     # Pin torch intra-op threads on CPU for stable measurement, mirroring
-    # run_benchmark._measure. Dynamic intra-op thread resizing causes 2-3x
-    # run-to-run jitter on CPU that dominates the inter-op latency gap.
+    # run_benchmark._measure.
     # Do NOT call ``set_num_interop_threads`` here. PyTorch permits
     # changing the inter-op pool only ONCE per process and only BEFORE any
     # parallel work starts; this function is called once per
@@ -1226,11 +1211,11 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         torch.set_num_threads(1)
 
     # Warmup: run prefill + a couple of decode steps once (untimed) so the
-    # first timed trial is not paying one-time kernel compilation / autotune
-    # / allocator-warmup costs. ``cudnn.benchmark=True`` (set in
-    # kaggle_setup.py) triggers autotuning on the first conv/matmul call,
-    # which can dominate the first prefill by 100x. Without warmup the
-    # reported prefill_ms is "compute + one-time setup", not steady-state.
+    # first timed trial excludes one-time kernel compilation / autotune /
+    # allocator-warmup costs. ``cudnn.benchmark=True`` (set in
+    # kaggle_setup.py) triggers autotuning on the first conv/matmul call;
+    # without warmup the reported prefill_ms would be "compute + one-time
+    # setup", not steady-state.
     with torch.no_grad():
         model.reset()
         model(x_prefill)
@@ -1240,15 +1225,13 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         torch.cuda.synchronize()
         # IMPORTANT: reset the model state BEFORE capturing the baseline.
         # The warmup above populated the KV cache (softmax) / recurrent
-        # state (KDA) with (prefill_len + 3) tokens of context. If we
-        # captured baseline_bytes WITHOUT resetting, the reported
-        # ``peak - baseline`` would only include the (n_decode - 3)-token
-        # cache GROWTH during the timed region, NOT the full cache that
-        # a serving engine pays for. For softmax with plen=2048, H=2,
-        # K=V=16, fp32, the omitted cache is ~524 KB — making softmax
-        # look artificially cheaper than KDA (whose state is ~2 KB).
-        # Resetting here drops baseline to (params + persistent state)
-        # so the reported peak reflects (params + full cache + activations).
+        # state (KDA) with (prefill_len + 3) tokens of context. The
+        # baseline is captured with the model reset so that the reported
+        # ``peak - baseline`` includes the full cache a serving engine
+        # pays for, not only the (n_decode - 3)-token cache GROWTH during
+        # the timed region. Resetting here drops baseline to (params +
+        # persistent state) so the reported peak reflects (params + full
+        # cache + activations).
         model.reset()
         # Re-capture baseline AFTER the reset: now it's just the model
         # parameters and any persistent buffers, NOT the warmup cache.
@@ -1257,8 +1240,8 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # reported peak reflects only the timed trials, not the warmup
         # allocations. Some reset() implementations intentionally drop cache
         # tensors (CSA/HCA/hybrid) so the timed prefill's cache allocation is
-        # counted in peak_mem; resetting stats after reset prevents the warmup
-        # deallocation/reallocation churn from leaking into the reported peak.
+        # counted in peak_mem; resetting stats after reset keeps the warmup
+        # allocations out of the reported peak.
         torch.cuda.reset_peak_memory_stats(device)
     else:
         baseline_bytes = 0
@@ -1377,7 +1360,7 @@ def main():
     # Prefill lengths / decode token count are env-tunable so the formal
     # efficiency protocol from the experiment design (prefill 128 / 512 /
     # 2048 / 8192, batch 1 and 8, decode 256 tokens) can be run WITHOUT
-    # changing the historical defaults that the committed figures use.
+    # changing the defaults that the committed figures use.
     #   DECODE_PREFILL_LENS='128,512,2048,8192' DECODE_N_TOKENS=256
     # (the batch dimension is set by bench_decoding's callers; the
     # default path benchmarks batch=1 here.)
@@ -1455,11 +1438,10 @@ def main():
                     # (one call with the full prefill projection tensor;
                     # append_step internally walks tokens to build blocks),
                     # but hybrid runs N sub-layers layer-by-layer and carries
-                    # the memory route's recurrent state, so its prefill-cache
-                    # overhead is structurally different from a standalone
-                    # CSA/HCA module. Tag separately so figures/README can
-                    # distinguish the two instead of implying hybrid pays the
-                    # same per-token Python overhead as standalone CSA/HCA.
+                    # the memory route's recurrent state, so its
+                    # prefill-cache-build path is structurally different from
+                    # a standalone CSA/HCA module. Tag separately so
+                    # figures/README can distinguish the two.
                     r['prefill_cache_build'] = (
                         'batched_populate_layer_by_layer'
                     )

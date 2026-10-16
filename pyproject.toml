@@ -36,21 +36,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # Pin UPPER bounds. torch upper bound is `<3` (not `<2.7`, not
-    # unbounded): 2025-2026 Kaggle GPU images and AutoDL base images
-    # preinstall CUDA torch >= 2.7, and a `<2.7` pin forces pip to DOWNGRADE
-    # the preinstalled CUDA build to the 2.6 CPU wheel from PyPI (~800 MB
-    # download that silently breaks ``torch.cuda.is_available()``). An
-    # unbounded pin risks a future torch 3.x breaking change. The full
-    # correctness suite (``run_correctness.py``) passes on every torch
-    # release from 2.2 through 2.13, so the wide bound is validated, not
-    # speculative. The historical caveat remains: torch 2.3 vs 2.6+ differ
-    # in ``scaled_dot_product_attention`` behaviour (kernel selection,
-    # padding handling) which can shift the softmax baseline numbers in
-    # ``run_benchmark`` / ``run_quality`` by a few percent — treat
-    # cross-torch comparisons as indicative, and pin an exact torch version
-    # in a lock file when reproducibility matters. einops 0.8 changed the
-    # default ``rearrange`` error message format. matplotlib 3.10 dropped
+    # Pin UPPER bounds. Version bounds are kept wide on the upper side so
+    # `pip install -e .` never replaces a newer preinstalled stack
+    # (notably CUDA torch on Kaggle / AutoDL images) with an older
+    # CPU-only wheel; the torch upper bound is `<3` to guard against a
+    # future major-version breaking change. torch releases differ in
+    # ``scaled_dot_product_attention`` behaviour (kernel selection,
+    # padding handling), which can shift the softmax baseline numbers in
+    # ``run_benchmark`` / ``run_quality``; treat cross-torch comparisons
+    # as indicative, and pin an exact torch version in a lock file when
+    # reproducibility matters. einops 0.8 changed the default
+    # ``rearrange`` error message format. matplotlib 3.10 dropped
     # several deprecated APIs.
     "torch>=2.2,<3",
     "einops>=0.6,<0.9",

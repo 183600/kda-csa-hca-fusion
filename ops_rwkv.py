@@ -50,7 +50,7 @@ The RWKV-7 **ChannelMix** is intentionally NOT implemented: the hybrid
 stack fixes the outer network structure (pre-norm residual, per-layer
 LayerNorm, no FFN in the current stack), and inserting RWKV's own FFN
 would change the outer network simultaneously with the mixer swap. The
-same rule was applied to the Mamba-2 route.
+same rule governs the Mamba-2 route.
 
 Recurrence (per head, ``K`` = key/head dim, ``V`` = value dim)
 ----------------------------------------------------------------
@@ -115,10 +115,10 @@ Token shift / state layout
   the KDA layer entirely (including its conv), and RWKV-7's own token
   shift provides the local mixing.
 
-Reference-path performance note: the recurrence loop is sequential over
-``T`` (inherent to an RNN state); the pure-PyTorch path is sized for
-correctness tests and small-scale experiments, not throughput. The
-optional FLA backend (``rwkv_backend='fla'``) is the accelerated path.
+Reference path: the recurrence loop is sequential over ``T`` (inherent
+to an RNN state); the pure-PyTorch path is the correctness reference used
+by the tests and small-scale experiments. The optional FLA backend
+(``rwkv_backend='fla'``) provides the fused-kernel path.
 """
 
 from __future__ import annotations
@@ -227,9 +227,9 @@ def validate_rwkv7_geometry(
 # Reference recurrence
 # ---------------------------------------------------------------------------
 # The sequential loop body is factored out so it can be TorchScript-compiled
-# once and cached (mirroring the Mamba-2 / KDA scan loops). The eager form
-# runs the same per-element operations in the same order; ``w_exp`` receives
-# the hoisted, already-exponentiated decay (see ``rwkv7_reference_scan``).
+# (mirroring the Mamba-2 / KDA scan loops). The eager form runs the same
+# per-element operations in the same order; ``w_exp`` receives the
+# already-exponentiated decay (see ``rwkv7_reference_scan``).
 _RWKV7_SCAN_LOOP_SCRIPTED = None
 _RWKV7_SCAN_LOOP_SCRIPTED_FAILED = False
 
@@ -237,13 +237,12 @@ _RWKV7_SCAN_LOOP_SCRIPTED_FAILED = False
 def _rwkv7_scan_loop_eager(r, w_exp, k, v, kk, kka, state):
     """One sequential pass of the RWKV-7 recurrence (inner-loop body).
 
-    The caller passes the per-step views ALREADY unsqueezed to their
+    The caller passes the per-step views already unsqueezed to their
     broadcast shapes (``[B, T, H, K, 1]`` for ``r`` / ``w_exp`` / ``k`` /
     ``kk`` / ``kka`` and ``[B, T, H, 1, V]`` for ``v``); ``unbind(1)`` then
-    yields the exact per-step operands the recurrence consumes, so no
-    per-step ``unsqueeze`` is needed inside the loop. ``kka`` carries
-    ``-(kk * a)``: negating the product is exact, and ``kka * (-c)`` is
-    bit-for-bit ``(-kka) * c``, so the folded sign does not change any
+    yields the exact per-step operands the recurrence consumes. ``kka``
+    carries ``-(kk * a)``: negating the product is exact, and ``kka * (-c)``
+    is bit-for-bit ``(-kka) * c``, so the folded sign does not change any
     value. ``state`` is the ``[B, H, K, V]`` key-by-value matrix. Returns
     ``(o, state)`` with ``o`` shaped ``[B, T, H, V]``.
     """
@@ -263,11 +262,11 @@ def _rwkv7_scan_loop_eager(r, w_exp, k, v, kk, kka, state):
 
 
 def _get_scripted_rwkv7_scan_loop():
-    """Lazily ``torch.jit.script`` the loop body, with eager fallback.
+    """Scripted loop body, with eager fallback.
 
-    The compiled form is cached and reused across calls (the loop is
-    shape/dtype-generic); on builds where scripting fails, the eager loop is
-    used instead.
+    The scripted form runs the same operations in the same order as
+    :func:`_rwkv7_scan_loop_eager`; on builds where scripting fails, the
+    eager loop is used instead.
     """
     global _RWKV7_SCAN_LOOP_SCRIPTED, _RWKV7_SCAN_LOOP_SCRIPTED_FAILED
     if _RWKV7_SCAN_LOOP_SCRIPTED is None and not _RWKV7_SCAN_LOOP_SCRIPTED_FAILED:
@@ -305,8 +304,8 @@ def rwkv7_reference_scan(
         kk:    ``[B, T, H, K]`` L2-normalized key direction.
         a:     ``[B, T, H, K]`` in-context learning rate (post-sigmoid).
         scale: query scale (RWKV-7 uses 1.0 — ``kk`` is already
-            unit-normalized; kept explicit so the accelerated backends
-            share the contract).
+            unit-normalized; explicit so all backends share the
+            contract).
         initial_state: ``[B, H, K, V]`` recurrent state in compute
             precision, or ``None`` for a fresh (zero) state.
         output_final_state: return the final state (``None`` otherwise).
@@ -322,7 +321,7 @@ def rwkv7_reference_scan(
     path). The state, ``contract`` and readout einsums run in compute
     precision: fp16/bf16 accumulation over ``T`` steps of a bounded
     (0.545, 1) decay still drifts, and the reference path is the
-    numerics anchor the accelerated backends are compared against.
+    numerics anchor the other backends are compared against.
     """
     if r.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
@@ -365,16 +364,16 @@ def rwkv7_reference_scan(
         state = initial_state.to(device=v.device, dtype=compute_dtype)
 
     r_c = r_c * scale
-    # (kk * a) is reused every step; hoist the product. The sign is folded
-    # into ``kka`` so the readout contract needs no in-loop negation (exact
-    # sign flips only — see ``_rwkv7_scan_loop_eager``).
+    # (kk * a) is used at every step. The sign is folded into ``kka`` so
+    # the readout contract needs no in-loop negation (exact sign flips
+    # only — see ``_rwkv7_scan_loop_eager``).
     kka_c = -(kk_c * a_c)
-    # ``exp(log_w)`` is an elementwise map, so evaluating it once vectorized
-    # over the time axis computes exactly the same fp values as the per-step
-    # ``w_t.exp()`` it replaces (each element rounds identically); only the
-    # dispatch count changes. The per-step update below keeps the original
-    # operand association ``(w*S + kka*contract) + k*v``. The singleton
-    # broadcast dims are pre-applied before ``unbind`` for the same reason.
+    # ``exp(log_w)`` is an elementwise map, so evaluating it over the whole
+    # time axis computes exactly the same fp values as per-step
+    # ``w_t.exp()`` (each element rounds identically). The per-step update
+    # below keeps the operand association ``(w*S + kka*contract) + k*v``.
+    # The singleton broadcast dims are pre-applied before ``unbind`` as
+    # well.
     w_exp_c = w_c.exp().unsqueeze(-1)
     r_c = r_c.unsqueeze(-1)
     k_c = k_c.unsqueeze(-1)
@@ -696,7 +695,7 @@ class Rwkv7Mixer(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor,
                 state: torch.Tensor | None = None):
-        """Stateful forward (backward-compatible wrapper).
+        """Stateful forward.
 
         Reads ``self._shift_state`` and writes the new shift state back
         to ``self``. Use :meth:`forward_functional` for the pure path

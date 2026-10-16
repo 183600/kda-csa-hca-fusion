@@ -28,26 +28,25 @@ operators studied in this repository:
         content-addressable long-context recall.
   * **HCA** (Heavily Compressed Attention, DeepSeek-V4):
         aggressive block-wise compression + dense attention + sliding window;
-        cheapest global context at extreme lengths.
+        global context at a cost independent of sequence length.
 
 The :class:`HybridAttentionStack` interleaves the operators in a layout
 driven by one of two modes:
 
-  * **Ratio mode (historical default).** ``(n_kda : n_csa : n_hca)``
-    (default ``3 : 1 : 1``) is repeated to ``total_layers`` — the exact
-    behaviour of the pre-Mamba ``HybridKCHAttention``.
+  * **Ratio mode (default).** ``(n_kda : n_csa : n_hca)``
+    (default ``3 : 1 : 1``) is repeated to ``total_layers`` — the
+    layout ``HybridKCHAttention`` uses.
   * **Explicit layout mode.** ``cfg.layout`` is an explicit tuple of layer
     kinds using the abstract token ``'memory'`` (resolved via
     ``cfg.memory_type``) plus ``'csa'`` / ``'hca'``. This is how the
     eight-group experiment matrix (KDA/Mamba2 x A/B/C/D, fixed total
     depth; see ``run_ablation.py``'s ``ABL_MODE=matrix``) is expressed.
 
-``HybridKCHAttention`` is kept as a backward-compatible subclass so every
-existing call site (runners, tests, checkpoints) keeps working unchanged;
-old configs reproduce the original KDA layout and numerics bit-for-bit.
+``HybridKCHAttention`` is a subclass of :class:`HybridAttentionStack` for
+call sites (runners, tests, checkpoints) using that name; with its default
+config it produces the KDA ratio layout and numerics.
 
-This is a research-oriented CPU-first implementation: correctness and
-small-scale behaviour, not throughput.
+This is a research-oriented CPU-first implementation.
 """
 
 from __future__ import annotations
@@ -112,9 +111,8 @@ def _resolve_layout_kinds(layout, memory_type: str) -> tuple[str, ...]:
     # Generalized memory-route purity check: a layout may contain memory
     # layers of ONE concrete kind only (kda, mamba2, or rwkv7 — including
     # via the 'memory' placeholder, which resolves to memory_type). The
-    # historical check only rejected the KDA/Mamba-2 pair because those
-    # were the only routes; with RWKV-7 the check is the set-difference
-    # over MEMORY_LAYER_KINDS so any future route is covered too.
+    # check is the set-difference over MEMORY_LAYER_KINDS, so every
+    # route is covered, including future ones.
     used_memory_kinds = sorted(
         {kind for kind in resolved if kind in MEMORY_LAYER_KINDS})
     if len(used_memory_kinds) > 1:
@@ -157,11 +155,10 @@ def _set_memory_layer_lookback(layer: nn.Module, lb: torch.Tensor | None) -> Non
 class _Fp32LayerNorm(nn.LayerNorm):
     """LayerNorm that computes in fp32 and returns the input dtype.
 
-    ``torch.nn.LayerNorm`` has no fp16/bf16 CPU kernel, so a ``model.half()``
-    followed by an fp16 forward crashes on CPU with ``LayerNormKernelImpl``.
-    This subclass upcasts the input (and the affine params) to fp32, runs the
-    norm, and casts the output back to the input dtype. For fp32 inputs every
-    cast is a no-op, so the numerically fast path is unchanged.
+    ``torch.nn.LayerNorm`` has no fp16/bf16 CPU kernel. This subclass
+    upcasts the input (and the affine params) to fp32, runs the norm, and
+    casts the output back to the input dtype; fp32 inputs take the
+    standard ``nn.LayerNorm`` path, so values are unchanged.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -195,8 +192,8 @@ class HybridConfig:
     # Associative-scan knob for the reference chunkwise KDA path. False
     # (default) resolves the per-chunk state recurrence with the NT-step
     # sequential loop. True selects the Hillis-Steele affine prefix scan
-    # over chunks (ceil(log2 NT) batched levels, no Python loop over the
-    # sequence); its results match the sequential path to fp round-off.
+    # over chunks (ceil(log2 NT) batched levels); its results match the
+    # sequential path to fp round-off.
     # Only takes effect when the chunk path runs
     # (``kda_chunk_size >= 1`` and ``T >= kda_chunk_size``) and the
     # reference backend is selected; mutually exclusive with
@@ -254,17 +251,16 @@ class HybridConfig:
     # B_pos). Lifting to a config field makes it tunable and keeps the
     # value consistent across instantiations.
     init_std: float = 0.02
-    # NOTE: ``dropout`` is accepted for API compatibility / future use but is
-    # NOT yet implemented in any sub-layer (KDA/CSA/HCA). A non-zero value is
-    # rejected here so a caller who sets it expecting dropout to be applied
-    # gets a clear error instead of silently running without dropout (which
-    # would be a silent correctness bug in their training recipe). Remove
-    # this guard once dropout is actually wired into the forward passes.
+    # NOTE: ``dropout`` is not implemented in any sub-layer (KDA/CSA/HCA).
+    # A non-zero value is rejected here so a caller who sets it expecting
+    # dropout to be applied gets a clear error instead of silently running
+    # without dropout. Remove this guard once dropout is wired into the
+    # forward passes.
     dropout: float = 0.0
     # ------------------------------------------------------------------
     # Memory route (KDA vs. Mamba-2) + explicit layout. These fields keep
     # the KDA mainline as the DEFAULT: memory_type='kda' and layout=None
-    # reproduce the historical ratio-mode behaviour bit-for-bit.
+    # select ratio mode.
     # ------------------------------------------------------------------
     # Which recurrent memory operator fills the 'memory' slots: 'kda',
     # 'mamba2', or 'rwkv7'. The CSA / HCA layers and every other field are
@@ -428,9 +424,8 @@ class HybridConfig:
         #     (the default behaviour; also used during autoregressive
         #     decoding where T is small).
         #   * ``kda_chunk_size >= 1`` -> use the chunk path when T is at
-        #     least one full chunk (T >= kda_chunk_size), falling back to
-        #     the recurrent path for short sequences (where the chunk
-        #     path's overhead exceeds the parallelism win).
+        #     least one full chunk (T >= kda_chunk_size), and the
+        #     recurrent path for shorter sequences.
         # The chunk path matches the recurrent path to fp tolerance
         # (verified by test_kda_chunk_vs_recurrent in run_correctness.py).
         # NOTE: the chunk path does not support carrying the short-conv
@@ -469,7 +464,7 @@ class HybridConfig:
                 "exactly one chunk-path strategy.")
         # Validate the remaining structural params. Negative values for
         # these fields would either silently produce an empty layer list
-        # (Python's ``[x] * -1 == []``), crash with a cryptic torch error
+        # (Python's ``[x] * -1 == []``), raise a cryptic torch error
         # inside the first forward pass, or silently disable a branch
         # (looking like the caller intentionally turned it off). Validate
         # them here so the error fires at config construction with a
@@ -478,7 +473,7 @@ class HybridConfig:
         # Layer counts: negative values silently produce empty lists via
         # Python's ``[layer] * n`` semantics (``[x] * -1 == []``), so a
         # typo like ``n_kda=-1`` would silently build a model with NO
-        # KDA layers instead of crashing. Reject negative values up-front.
+        # KDA layers instead of raising. Reject negative values up-front.
         for name, val in [
             ('n_kda', self.n_kda),
             ('n_csa', self.n_csa),
@@ -500,7 +495,7 @@ class HybridConfig:
                 f"have no attention layers at all. Set at least one of "
                 f"n_kda / n_csa / n_hca to a positive value.")
         # CSA-specific: topk=0 is valid (disables sparse selection) but
-        # negative values would crash ``torch.topk``. nh must be >= 1
+        # negative values would fail inside ``torch.topk``. nh must be >= 1
         # (it's a head count). sliding_window=0 disables the branch
         # (valid); negative would silently skip the branch.
         if (not isinstance(self.csa_topk, int) or isinstance(self.csa_topk, bool)
@@ -553,7 +548,7 @@ class HybridConfig:
         # rope dims: None or a non-negative int. None/0 disables RoPE; a
         # positive value is clamped to the head dim (even) at use time, so
         # over-sized requests on small geometries degrade gracefully
-        # instead of crashing.
+        # instead of raising.
         for name, val in [
             ('csa_rope_dim', self.csa_rope_dim),
             ('hca_rope_dim', self.hca_rope_dim),
@@ -571,7 +566,7 @@ class HybridConfig:
             raise ValueError(
                 f"HybridConfig.rope_base={self.rope_base!r} must be a "
                 f"finite positive float.")
-        # qk_norm_mode: 'l2' (historical cosine) or 'rms' (paper §2.3.3).
+        # qk_norm_mode: 'l2' (cosine) or 'rms' (paper §2.3.3).
         for name, val in [
             ('csa_qk_norm_mode', self.csa_qk_norm_mode),
             ('hca_qk_norm_mode', self.hca_qk_norm_mode),
@@ -623,7 +618,7 @@ class HybridConfig:
                                                     self.memory_type)
             self.layout = resolved_layout
         # Mamba-2 geometry is validated ONLY when a Mamba-2 layer will
-        # actually be built. KDA-only configs (the historical default)
+        # actually be built. KDA-only configs (the default)
         # must not be constrained by Mamba-2's headdim divisibility —
         # tiny test geometries like d_model=32 with the default
         # headdim=64 would otherwise be rejected for no KDA-relevant
@@ -707,7 +702,7 @@ class KDAHybridLayer(nn.Module):
         #
         # Registered as a non-persistent buffer so ``.to(device)`` /
         # ``.half()`` move/cast it automatically (a plain attribute would be
-        # left on the source device / dtype and crash the next forward).
+        # left on the source device / dtype and fail the next forward).
         self.register_buffer('_conv_lookback', None, persistent=False)
 
     def reset_conv_state(self) -> None:
@@ -720,7 +715,7 @@ class KDAHybridLayer(nn.Module):
         self._conv_lookback = None
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
-        """Stateful forward (backward-compatible wrapper).
+        """Stateful forward.
 
         Reads ``self._conv_lookback`` and writes the new lookback + new
         recurrent state back to ``self``. This is the API used by
@@ -828,7 +823,8 @@ class KDAHybridLayer(nn.Module):
         ksize = self.short_conv.kernel_size[0]
         # Build the conv input with proper LEFT context:
         #   * If ``conv_lookback`` is None (fresh sequence / first call),
-        #     left-pad with zeros — identical to the previous behaviour.
+        #     left-pad with zeros (the conv is causal; the first
+        #     ``ksize-1`` positions have no left context).
         #   * If ``conv_lookback`` is set (streaming / autoregressive decode),
         #     prepend the last ``ksize - 1`` time steps from the previous call
         #     so the conv at positions 0..ksize-2 of the new chunk sees the
@@ -926,9 +922,8 @@ class KDAHybridLayer(nn.Module):
         beta = torch.sigmoid(self.beta(x_conv))                   # [B, T, HV]
         # Choose between the step-by-step recurrent path and the
         # chunkwise-parallel path based on ``cfg.kda_chunk_size``:
-        #   * ``kda_chunk_size <= 0`` -> always recurrent (historical
-        #     behaviour; also the only option for streaming decode where
-        #     T is small).
+        #   * ``kda_chunk_size <= 0`` -> always recurrent (also the only
+        #     option for streaming decode where T is small).
         #   * ``kda_chunk_size >= 1`` AND ``T >= kda_chunk_size`` -> chunk
         #     path (matches the recurrent path to fp tolerance).
         #   * ``kda_chunk_size >= 1`` AND ``T < kda_chunk_size`` -> recurrent
@@ -970,9 +965,8 @@ class CSAHybridLayer(nn.Module):
         *learnable*.
 
         ``indexer_is_trained`` is ``True`` by default. The
-        ``_maybe_warn_indexer`` method is kept for backward compatibility
-        but only fires when an explicit caller disables STE via
-        ``use_ste=False`` (e.g. for ablation against the
+        ``_maybe_warn_indexer`` method only fires when an explicit caller
+        disables STE via ``use_ste=False`` (e.g. for ablation against the
         untrained-indexer baseline).
     """
 
@@ -1165,8 +1159,8 @@ class HybridAttentionStack(nn.Module):
       * **Ratio mode** (``cfg.layout is None``): the pattern
         ``[memory * n_kda, CSA * n_csa, HCA * n_hca]`` repeated to
         ``total_layers``, where ``memory`` is ``cfg.memory_type``. With the
-        default ``memory_type='kda'`` this is bit-identical to the
-        historical ``HybridKCHAttention`` behaviour, and
+        default ``memory_type='kda'`` the layout and numerics match
+        ``HybridKCHAttention``'s ratio mode, and
         ``memory_type='mamba2'`` yields the Mamba-2 route
         (``MAMBA2-MAMBA2-MAMBA2-CSA-HCA`` per 5-layer unit) while
         ``memory_type='rwkv7'`` yields the RWKV-7 route
@@ -1177,8 +1171,7 @@ class HybridAttentionStack(nn.Module):
     Every sub-layer shares the SAME outer structure — pre-norm residual
     ``x = x + mixer(norm(x))`` with identical LayerNorm placement, input /
     output dimensions, and residual wiring — so only the token mixer
-    differs. The unified measurement boundaries in ``run_benchmark.py``
-    rely on this contract. The memory layers (KDA, Mamba-2, or RWKV-7)
+    differs. The memory layers (KDA, Mamba-2, or RWKV-7)
     carry a stacked recurrent state plus per-layer shift/conv lookbacks;
     CSA/HCA remain stateless inside the stack (their incremental decode state
     lives in ``ops_decoding_cache``).
@@ -1256,13 +1249,12 @@ class HybridAttentionStack(nn.Module):
         # have different parameters, so they must not share recurrent
         # state: layer 2 would otherwise be seeded with layer 0's state.
         # (Computed above, before the build loop; the alias assignment
-        # below keeps the historical attribute name.)
-        # Backward-compatible alias: the historical name for the stacked
-        # memory-state count. With the default memory_type='kda' this is
-        # literally the number of KDA layers, so every existing reader
-        # (run_decoding.py, the correctness tests) keeps its semantics;
-        # for Mamba-2 stacks it counts the Mamba-2 layers filling the same
-        # state slots.
+        # below exposes it under the ``n_kda_layers`` name.)
+        # ``n_kda_layers`` is the stacked memory-state count. With the
+        # default memory_type='kda' this is literally the number of KDA
+        # layers (the name read by run_decoding.py and the correctness
+        # tests); for Mamba-2 stacks it counts the Mamba-2 layers filling
+        # the same state slots.
         self.n_kda_layers = self.n_memory_layers
         # Persistent memory-layer recurrent states, one per memory layer.
         # Survives across forward calls so the O(1) per-head memory is
@@ -1276,15 +1268,14 @@ class HybridAttentionStack(nn.Module):
         # freshly reset — and registered as a non-persistent buffer so
         # that model.to(device) moves the whole stack along with the
         # parameters (a plain Python list attribute would be left on the
-        # original device, causing a device-mismatch crash on the next
+        # original device, causing a device-mismatch error on the next
         # forward) and it is NOT saved into state_dict (persistent=False;
         # it is runtime state that should be reset between sequences /
         # sessions via reset_state(), not restored from a checkpoint).
-        # The ATTRIBUTE NAME ``_kda_state`` is kept from the historical
-        # implementation so run_decoding.py and the correctness tests
-        # continue to work unmodified; on Mamba-2 stacks it holds the
-        # Mamba-2 SSM states, and on RWKV-7 stacks the per-layer matrix
-        # states (``[B, H, K, V]`` per layer).
+        # The attribute is named ``_kda_state``; on Mamba-2 stacks it
+        # holds the Mamba-2 SSM states, and on RWKV-7 stacks the per-layer
+        # matrix states (``[B, H, K, V]`` per layer). run_decoding.py and
+        # the correctness tests read this attribute.
         self.register_buffer('_kda_state', None, persistent=False)
 
     def reset_state(self) -> None:
@@ -1299,7 +1290,7 @@ class HybridAttentionStack(nn.Module):
         ``forward_functional``. Without this reset, the warning would fire
         only once per PROCESS (the flag is class-level), so a second
         training run in the same process (e.g. a notebook re-execution)
-        would silently lose the warning even though the same footgun
+        would silently lose the warning even though the same risk
         applies.
         """
         # Assigning None to a registered buffer is supported by nn.Module
@@ -1342,7 +1333,7 @@ class HybridAttentionStack(nn.Module):
             return list(self.cfg.layout)
         # Ratio mode: one repeating unit = n_kda memory slots + n_csa CSA
         # + n_hca HCA. The memory slots are filled with cfg.memory_type
-        # ('kda' by default -> the historical bit-identical behaviour;
+        # ('kda' by default -> the KDA ratio layout;
         # 'mamba2' -> the MAMBA2-MAMBA2-MAMBA2-CSA-HCA route).
         unit = ([self.cfg.memory_type] * self.cfg.n_kda
                 + ['csa'] * self.cfg.n_csa
@@ -1363,7 +1354,7 @@ class HybridAttentionStack(nn.Module):
         return layout[:self.total_layers]
 
     def forward(self, x: torch.Tensor):
-        """Stateful forward (backward-compatible wrapper).
+        """Stateful forward.
 
         Reads ``self._kda_state`` and the per-KDA-layer
         ``_conv_lookback`` buffers, and writes the new states back to
@@ -1532,7 +1523,7 @@ class HybridAttentionStack(nn.Module):
                     f"forward_functional.")
             # ``unbind`` the stacked memory state into a list of per-layer
             # states (equivalent to a Python list comprehension over
-            # indices, but avoids the explicit index loop).
+            # indices).
             states = list(stacked.unbind(0))
         else:
             states = [None] * self.n_memory_layers
@@ -1622,22 +1613,19 @@ class HybridAttentionStack(nn.Module):
 
 
 class HybridKCHAttention(HybridAttentionStack):
-    """Backward-compatible entry point for :class:`HybridAttentionStack`.
+    """Alias class for :class:`HybridAttentionStack`.
 
-    The class was renamed when the stack gained the switchable KDA /
-    Mamba-2 memory route (``cfg.memory_type``) and explicit layouts
-    (``cfg.layout``). The historical name is kept as a subclass so every
-    existing call site — the experiment runners, the correctness suite,
-    saved notebooks — keeps working unchanged.
+    ``HybridKCHAttention`` and :class:`HybridAttentionStack` are the same
+    stack; this class subclasses it without changes. The name is used by
+    the experiment runners, the correctness suite, and saved notebooks.
 
-    Behaviour guarantees:
+    Behaviour:
 
-      * A config with the historical defaults (``memory_type='kda'``,
+      * A config with the default ratio mode (``memory_type='kda'``,
         ``layout=None``) produces the SAME layout strings, parameter
-        names, state-buffer names, and numerics as before the rename.
+        names, state-buffer names, and numerics as
+        :class:`HybridAttentionStack`.
       * Passing a ``memory_type='mamba2'`` / explicit-layout config to
-        this class works exactly like ``HybridAttentionStack`` — the
-        name is historical, not a constraint. New code (and the
-        Mamba-2 route) should prefer ``HybridAttentionStack`` for
-        clarity.
+        this class works exactly like ``HybridAttentionStack``;
+        ``HybridAttentionStack`` is the preferred name for new code.
     """

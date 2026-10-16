@@ -4,9 +4,9 @@
 set -euo pipefail
 
 echo "=== Setup env ==="
-# Install the project dependencies plus the LM-training extras. requirements.txt
-# is expected to succeed, so install the HF stack explicitly instead of hiding
-# it behind an ``||`` fallback that never runs on a healthy environment.
+# Install the project dependencies plus the LM-training extras.
+# requirements.txt must succeed first; the HF stack is then installed
+# explicitly from the pinned ranges below.
 pip install -r requirements.txt -q
 pip install 'transformers>=4.36,<5' 'datasets>=2.14,<3' 'accelerate>=0.24,<1' 'tqdm>=4.60,<5' -q
 

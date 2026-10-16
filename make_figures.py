@@ -56,7 +56,7 @@ def load(name):
 
     Schema handling is delegated to :mod:`results_schema`, which accepts:
 
-    1. **Legacy bare array** ``[{...}, {...}]`` (historical Exp 1/2/3/5/6).
+    1. **Legacy bare array** ``[{...}, {...}]`` (written by Exp 1/2/3/5/6).
     2. **Envelope object** ``{"metadata": {...}, "results": [...]}`` in any
        revision (Exp 4's informal ``schema_version: 1``, or the versioned
        ``"schema_version": "1.0"`` envelopes written by current tooling),
@@ -807,10 +807,10 @@ def fig_decoding():
     ax.legend(fontsize=9)
     ax.grid(True, which='both', alpha=0.3)
     # CSA/HCA/hybrid rows are measured with incremental compressed-block /
-    # sliding-window caches, and their per-token cost includes interpreter
-    # control flow (top-k selection, block append) that softmax/KDA do not
-    # pay. The raw median is plotted as-is, so keep the caveat visible on the
-    # figure rather than only in the JSON metadata.
+    # sliding-window caches, whose per-token path (top-k selection, block
+    # append) differs from softmax/KDA. The raw median is plotted as-is, so
+    # keep the caveat visible on the figure rather than only in the JSON
+    # metadata.
     max_layers = max((r.get('n_layers', 1) for r in data if 'error' not in r),
                      default=1)
     layer_note = (

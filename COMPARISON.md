@@ -1,21 +1,20 @@
 # COMPARISON.md — 算子实现选择说明
 
-本文件说明为什么本仓库在新增真实 LM 训练管线（`train_lm_autodl.py`）时**保留**了原有的
-`ops_kda / ops_csa / ops_hca / ops_fused` 参考实现，而不是替换成早期那份更简单的 toy
-训练代码。
+本文件说明本仓库的算子实现选择：`ops_kda / ops_csa / ops_hca / ops_fused`
+是唯一的算子实现，真实 LM 训练管线（`train_lm_autodl.py`）直接构建在其
+之上。
 
-## 背景
+## 实现入口
 
-仓库早期存在一个独立的 toy 训练入口（旧 `train.py`，现为
-`train_toy_reference.py` 兼容包装）。它依赖仓库中并不存在的模块
-（`config`、`model.hybrid_model`、`dataset`），无法直接运行。真实的 LM 训练入口
-`train_lm_autodl.py` 现在直接构建在 `ops_fused.HybridKCHAttention` 之上。
+真实 LM 训练入口 `train_lm_autodl.py` 直接构建在
+`ops_fused.HybridKCHAttention` 之上；`train_toy_reference.py` 仅保留文件名
+兼容，转发到受支持的训练管线。
 
 ## 仓库 ops 实现的能力
 
-| 维度 | 仓库 ops 实现（保留） |
+| 维度 | 仓库 ops 实现 |
 |---|---|
-| 可运行性 | `run_correctness.py` 回归检查全通过 |
+| 可运行性 | `run_correctness.py` 对拍检查全通过 |
 | KDA 数值稳定性 | `g_clamp_min=-10` 截断 + 非有限输出告警 + q/k 单位范数契约文档化 |
 | KDA 路径 | 递归 + chunkwise 双路径（互验至 fp32 舍入误差），可选 `torch.compile` / TorchScript / FLA 后端 |
 | CSA 索引器梯度 | 直通估计器（STE，`topk_columns` / `full_softmax` 两种模式），训练期可学、推理期自动跳过 soft 代理 |
@@ -31,17 +30,15 @@
 
 ## 结论
 
-本仓库的决策是：
-
-1. **保留** `ops_kda / ops_csa / ops_hca / ops_fused / ops_decoding_cache` 作为唯一算子实现；
-2. **新增** `train_lm_autodl.py` 训练管线（Kaggle / AutoDL），直接调用
+1. `ops_kda / ops_csa / ops_hca / ops_fused / ops_decoding_cache` 作为唯一算子实现；
+2. `train_lm_autodl.py` 训练管线（Kaggle / AutoDL）直接调用
    `ops_fused.HybridKCHAttention`；
-3. **废弃** toy 入口：`train_toy_reference.py` 仅保留文件名兼容，转发到受支持的训练管线。
+3. `train_toy_reference.py` 仅保留文件名兼容，转发到受支持的训练管线。
 
 ## 验证入口
 
 ```bash
-python run_correctness.py      # 算子回归检查
+python run_correctness.py      # 算子对拍检查
 python run_all.py              # 全部实验 + 图表端到端
 python train_lm_autodl.py --kaggle   # 真实 LM 训练（TinyStories）
 ```

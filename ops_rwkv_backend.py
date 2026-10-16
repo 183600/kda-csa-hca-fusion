@@ -157,16 +157,16 @@ def _fla_rwkv7_scan(
     * the fla state layout ``[B, H, K, V]`` matches the reference scan
       -> no transposes;
     * ``chunk_rwkv7`` (the differentiable training path) is used for
-      ``T > 1``; ``fused_mul_recurrent_rwkv7`` (faster single-step) for
-      ``T == 1`` — the same split the fla model layer itself uses.
+      ``T > 1``; ``fused_mul_recurrent_rwkv7`` (the single-step kernel)
+      for ``T == 1`` — the same split the fla model layer itself uses.
 
     The fla kernels return the final state in fp32 and the output in
     the input dtype, matching the reference scan's contract.
     """
     chunk_fn, recurrent_fn = _load_fla_rwkv7()
     if r.shape[1] == 1:
-        # Decode step: the fused recurrent kernel is faster for T == 1
-        # (no chunk-parallel overhead). Same math, same state contract.
+        # Decode step: the fused recurrent kernel is selected for T == 1.
+        # Same math, same state contract.
         o, state = recurrent_fn(
             r=r, w=log_w, k=k, v=v, kk=kk, a=a,
             scale=scale,

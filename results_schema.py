@@ -2,17 +2,17 @@
 
 Motivation
 ----------
-Historically the ``results/*.json`` files used two incompatible top-level
-shapes (README "Known schema inconsistency"):
+``results/*.json`` files appear in two top-level shapes
+(README "Known schema inconsistency"):
 
 * a **bare array** ``[{row}, ...]`` — Exp 1/2/3/5/6 plus ``summary.json``;
 * an **envelope object** ``{"metadata": {...}, "results": [...]}`` —
   Exp 4 only, with an informal integer ``metadata.schema_version``.
 
 Downstream consumers (``make_figures.load``, ``run_roofline``, ad-hoc
-analysis scripts) had to special-case both shapes, and nothing recorded
-*which* schema revision produced a file, so a future format change could
-silently corrupt analysis. This module makes the envelope the single
+analysis scripts) would otherwise have to special-case both shapes, and
+without a recorded schema revision a format change could silently
+corrupt analysis. This module defines the envelope as the single
 canonical on-disk shape, with an explicit semantic version:
 
     {
@@ -27,7 +27,7 @@ Per-kind row contracts
 ----------------------
 Structural shape (envelope + version) says nothing about whether the
 rows make sense. A partial matrix (7 of 8 groups), a contrast whose
-``mean_diff`` no longer matches the per-seed rows, or an Exp 6 row whose
+``mean_diff`` disagrees with the per-seed rows, or an Exp 6 row whose
 ``uses_incremental_cache`` flag contradicts its operator are all
 schema-valid yet silently corrupt downstream analysis. :func:`validate_rows`
 therefore applies a per-``kind`` *contract* (registered in
@@ -43,14 +43,15 @@ therefore applies a per-``kind`` *contract* (registered in
   regardless of the memory route).
 
 :func:`write_checked` validates before writing and raises
-:class:`RowContractError`, so a producer bug fails the experiment loudly
-instead of persisting a misleading result file. ``--check-rows`` extends
+:class:`RowContractError`, so a producer that violates the contract
+fails the experiment loudly instead of persisting a misleading result
+file. ``--check-rows`` extends
 the CLI ``--check`` mode to freshly written kind-tagged files; unknown
 kinds (and legacy version-0 files without a ``kind``) pass untouched.
 
 Backward compatibility
 ----------------------
-``parse`` accepts and classifies three historical shapes:
+``parse`` accepts and classifies three on-disk shapes:
 
 ===============  ==============================================  =======
 on-disk shape    example                                         version
@@ -112,8 +113,8 @@ class RowContractError(SchemaError):
 def parse_version(value) -> tuple[int, int]:
     """Parse ``"1.0"`` / ``"1"`` / ``1`` into a ``(major, minor)`` tuple.
 
-    Accepts the informal integer versions used historically by
-    ``run_quality.py`` (``metadata.schema_version: 1``). Raises
+    Accepts the informal integer versions written by ``run_quality.py``
+    (``metadata.schema_version: 1``). Raises
     :class:`SchemaVersionError` on anything that cannot be interpreted as
     a non-negative numeric version.
     """
@@ -592,8 +593,8 @@ def load(path: str) -> tuple[dict, list]:
 def load_or_empty(path: str, *, context: str = '') -> tuple[dict, list]:
     """Forgiving load: ``({}, [])`` on any failure, with stderr diagnostics.
 
-    Mirrors the historical ``make_figures.load`` contract (a broken file
-    must not crash the figure pipeline) while still surfacing the reason.
+    Mirrors the ``make_figures.load`` contract (a broken file must not
+    crash the figure pipeline) while still surfacing the reason.
     An incompatible FUTURE schema version is reported loudly because
     silently returning no data for a newer file risks silent data loss.
     """

@@ -197,10 +197,9 @@ def partial_rope(
         out[..., D - rope_dim::2] = o1
         out[..., D - rope_dim + 1::2] = o2
         return out
-    # Inference path. Assemble the result in one allocation + strided writes
-    # and write the rotated pairs directly into the output slices with
-    # ``out=`` kernels: the per-element operations (and their order) are
-    # unchanged. The intermediate products share one small scratch buffer.
+    # Inference path. Write the rotated pairs directly into the output slices
+    # with ``out=`` kernels: the per-element operations (and their order) are
+    # unchanged.
     out = torch.empty(x.shape, dtype=x.dtype, device=device)
     if rope_dim < D:
         out[..., : D - rope_dim] = x[..., : D - rope_dim]

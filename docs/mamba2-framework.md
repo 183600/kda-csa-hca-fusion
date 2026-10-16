@@ -15,19 +15,19 @@ benefit transfer across BOTH KDA and Mamba-2?
 
 ---
 
-## 1. What stayed, what was added
+## 1. Operator layout and routes
 
 ```
-Existing (unchanged default):       Added route:
+Default (3:1:1):                    Switchable memory route:
 
 KDA  KDA  KDA  CSA  HCA            Mamba2 Mamba2 Mamba2 CSA HCA
 ```
 
-* The three operators and the default 3:1:1 layout are untouched; every
-  historical config, checkpoint, and result reproduces bit-for-bit
+* The three operators and the default 3:1:1 layout are preserved; every
+  config, checkpoint, and result reproduces bit-for-bit
   (`test_hybrid_stack_memory_routes` pins the layout string, parameter
-  names, and numerics of `HybridKCHAttention` vs. the renamed
-  `HybridAttentionStack`).
+  names, and numerics of `HybridKCHAttention` and its
+  `HybridAttentionStack` alias).
 * `HybridConfig.memory_type` (`'kda'` | `'mamba2'`, default `'kda'`)
   selects the operator that fills the memory slots. In ratio mode the
   `n_kda` slots ARE memory slots; in explicit-layout mode the abstract
@@ -47,13 +47,12 @@ x = x + mixer(norm(x))
 ```
 
 identical LayerNorm placement (`_Fp32LayerNorm`), identical residual
-wiring, identical input/output dimensions (`d_model`). No outer MLP was
-added in this revision: the historical operators embed their projections
-inside the mixer, so adding an outer MLP would have changed every
-existing baseline's numerics. The fairness contract the benchmarks rely
-on ("same boundary, only the mixer differs") holds without it; if a
-future revision adds an outer MLP it must land behind a default-off
-config flag with the same backward-compatibility proof.
+wiring, identical input/output dimensions (`d_model`). No outer MLP is
+used: the operators embed their projections inside the mixer, so an
+outer MLP would change every baseline's numerics. The fairness contract
+the benchmarks rely on ("same boundary, only the mixer differs") holds
+without it; if an outer MLP is ever added it must land behind a
+default-off config flag with the same backward-compatibility proof.
 
 Mamba-2 keeps the official mixer module's structure (no RoPE — its
 recurrent state carries positions implicitly like KDA's), and the
@@ -88,8 +87,8 @@ State layouts (per layer):
 | HCA | — (compressed blocks in `HCADecodingCache`) | — |
 
 The stack threads the memory layers' recurrent states as ONE stacked
-tensor (axis 0 = layer index; the historical `_kda_state` buffer name is
-kept for source compatibility) plus a per-layer conv-state list. CSA/HCA
+tensor (axis 0 = layer index; the buffer is exposed under the
+`_kda_state` name) plus a per-layer conv-state list. CSA/HCA
 keep their existing incremental decoding caches — their state grows with
 context (compressed entries), which is why the hybrid's total cache is
 NOT sequence-independent even though the memory operators' states are
@@ -201,7 +200,7 @@ cheap and well-conditioned:
   `S_{n+1} = a_n S_n + b_n`, with the SCALAR per-head transition
   `a_n = exp(sum_chunk dt*A)` and the chunk source `b_n`, resolved by a
   Hillis-Steele associative prefix scan over chunks
-  (`ceil(log2 NT)` batched levels, no Python loop over chunks). This is the
+  (`ceil(log2 NT)` batched levels). This is the
   Mamba-2 analogue of `ops_kda._assoc_scan_chunk_states`; because the SSD
   decay is scalar-per-head, the scan combine is elementwise.
 
@@ -222,9 +221,6 @@ time). `Mamba2Mixer.scan_mode` records the resolved mode for provenance.
 views at fp64 machine precision, chunk-size invariance, huge-cumulative-
 decay stability (up to `|G| ~ 8e4`), the `ceil(log2 NT)` scan-depth
 contract, TorchScript parity of the scan core, and the mixer integration.
-On CPU, the chunked path measured ~8-12x faster than the sequential
-recurrence for `T = 512..4096` (H=4, headdim=64, d_state=64); as always,
-reference rows are correctness baselines, not architecture-intrinsic costs.
 
 ## 5. The eight-group main experiment
 
@@ -296,7 +292,7 @@ compressed / window / indexer / partial buckets, and the two new figures
 
 `RUN_ALL_PROFILE` = `smoke` (plumbing validation: tiny budgets + a
 1-seed 5-step pass over all eight matrix groups) | `screen` (default =
-historical budgets) | `full` (7 seeds across the multi-seed experiments).
+standard budgets) | `full` (7 seeds across the multi-seed experiments).
 Presets only touch env vars the caller did NOT export.
 
 Result recording follows the design's minimum provenance: git commit,
@@ -331,18 +327,13 @@ not to pre-empt the answer by changing the default route.
   parity test can only compare the transferable subset; the reference
   backend remains the weight-compatible baseline.
 * The reference Mamba-2 scan is a sequential Python loop (like the KDA
-  reference): correctness-first, not throughput. Speed conclusions must
-  use the official-backend rows. Its *semantics* are independently pinned
-  by the SSD dual-form oracle (section 4.1), so the CPU-only
-  official-backend gap does not leave the reference unverified. The
-  chunked path (section 4.2) is the throughput-oriented reference
-  evaluation for hosts without `mamba-ssm`; it is parity-pinned to both
-  other views but is not wired into the main experiment rows yet
-  (`mamba_chunk_size` defaults to 0).
+  reference). Its *semantics* are independently pinned by the SSD
+  dual-form oracle (section 4.1), so the CPU-only official-backend gap
+  does not leave the reference unverified. The chunked path (section
+  4.2) is an alternative reference evaluation for hosts without
+  `mamba-ssm`; it is parity-pinned to both other views but is not wired
+  into the main experiment rows yet (`mamba_chunk_size` defaults to 0).
 * Hybrid-decode equality uses the `csa_topk=100` protocol because of the
-  pre-existing `torch.topk` tie-breaking artifact documented in the
-  README (a numerical artifact, not a correctness bug; identical for
-  both memory routes).
-* No experiments were run as part of landing this framework — by design.
-  The smoke profile exists precisely so the next runner can validate the
-  whole pipeline cheaply before committing GPU time.
+  `torch.topk` tie-breaking artifact documented in the README (a
+  numerical artifact, identical for both memory routes).
+* The smoke profile validates the pipeline before a full run.

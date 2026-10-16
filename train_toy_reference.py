@@ -1,13 +1,7 @@
-"""Legacy compatibility wrapper for the old toy LM script.
+"""Filename-compatibility wrapper for ``train_toy_reference``.
 
-The original toy reference depended on modules that are not part of this
-repository (``config``, ``model.hybrid_model``, ``dataset``) and therefore
-failed at import/runtime. Keeping a broken training entry point is dangerous:
-users may run it and report results from an absent or mismatched implementation.
-
-Use the rigorous repository implementation in :mod:`train_lm_autodl` instead.
-This wrapper preserves the filename for old commands while routing to the
-supported training pipeline based on ``ops_fused.HybridKCHAttention``.
+Routes to the supported training pipeline in :mod:`train_lm_autodl`,
+which is built on ``ops_fused.HybridKCHAttention``.
 """
 
 from train_lm_autodl import main

@@ -4,15 +4,14 @@ Why this module?
 ----------------
 ``run_kv_cache`` (Exp 3) computes the *analytical* KV-cache footprint of the
 reference design: ``mode='full_accounting'`` is described as "the number a
-production inference engine would actually pay". Until now nothing checked
-that claim against the tensors a real decode session actually retains —
+production inference engine would actually pay". This module checks that
+claim against the tensors a real decode session actually retains —
 ``run_decoding.HybridDecoding`` plus ``ops_decoding_cache``. The two can
 drift in ways that are invisible to the operator-level tests:
 
 * allocation *history* (one bulk prefill ``append_step`` vs token-by-token
-  appends) can change the geometric growth sequence. This module is the
-  regression guard that keeps live and analytical accounting equal for
-  every fill history.
+  appends) can change the geometric growth sequence. This module keeps
+  live and analytical accounting equal for every fill history.
 * incremental decode caches can accidentally retain autograd graphs
   (``grad_fn``) when a caller forgets ``torch.no_grad()`` — the classic
   unbounded-memory leak during long generation. :func:`autograd_graph_probe`
@@ -112,7 +111,7 @@ def _layer_counts(cfg: HybridConfig) -> dict[str, int]:
     """Per-op layer counts, EXPLICIT-LAYOUT aware.
 
     Ratio mode: the memory-slot count is ``cfg.n_kda`` attributed to
-    ``cfg.memory_type`` (the historical semantics). Explicit-layout
+    ``cfg.memory_type`` (the ratio-mode semantics). Explicit-layout
     mode: count each kind directly from ``cfg.layout`` — the eight-group
     matrix pins 10-layer layouts whose memory/CSA/HCA counts are NOT the
     ratio fields (which are ignored in that mode), so using them here
@@ -242,8 +241,9 @@ def live_cache_components(decoder) -> dict:
 
     # --- memory-route recurrent state + shift/conv lookback -------------
     # Route by the layout's memory kind: the stacked ``_kda_state`` buffer
-    # holds whichever memory operator fills the slots (the attribute NAME
-    # is historical), and the per-layer streaming buffer is
+    # holds whichever memory operator fills the slots (the attribute keeps
+    # its ``_kda`` name for every route), and the per-layer streaming
+    # buffer is
     # ``_conv_lookback`` for KDA / Mamba-2 vs ``_shift_state`` for RWKV-7
     # (the token-shift history). Attributing them to route-specific
     # components keeps the live audit and the dtypes report exact per
@@ -395,8 +395,8 @@ def exp3_geometry(cfg: HybridConfig, *, conv_ksize: int = 3) -> dict:
         csa_cI=cfg.csa_cI, csa_sliding_window=cfg.csa_sliding_window,
         hca_m2=cfg.hca_m2, hca_nh=cfg.hca_nh, hca_c=cfg.hca_c,
         hca_dc=cfg.hca_dc, hca_sliding_window=cfg.hca_sliding_window,
-        # Memory-slot count (layout-aware; ratio mode keeps the historical
-        # cfg.n_kda value). run_kv_cache's hybrid_*_rows use this as the
+        # Memory-slot count (layout-aware; ratio mode uses the cfg.n_kda
+        # value). run_kv_cache's hybrid_*_rows use this as the
         # memory-layer count regardless of the concrete memory route.
         hybrid_n_kda=hybrid_n_mem, hybrid_n_csa=counts['csa'],
         hybrid_n_hca=counts['hca'],
@@ -496,8 +496,8 @@ def analytic_cache_components(cfg: HybridConfig, T: int, *,
         put('rwkv7_matrix_state', n_mem * matrix, n_mem * matrix)
         put('rwkv7_shift_state', n_mem * shift, n_mem * shift)
 
-    # CSA / HCA (layout-aware counts; identical to the historical values
-    # in ratio mode).
+    # CSA / HCA (layout-aware counts; in ratio mode these equal the
+    # ratio-field values).
     n_csa_l = counts['csa']
     n_hca_l = counts['hca']
     n_csa_blocks = T // cfg.csa_m
@@ -742,7 +742,7 @@ def autograd_graph_probe(cfg: HybridConfig, *, total_layers: int | None = None,
     """Check that decode retains a BOUNDED autograd graph as steps grow.
 
     Runs a fresh decoder with grad tracking enabled (deliberately WITHOUT
-    ``torch.no_grad()`` — the footgun a serving caller can hit) and counts
+    ``torch.no_grad()`` — a misuse a serving caller can hit) and counts
     the autograd nodes reachable from the retained cache tensors after
     each checkpoint in ``steps``. A detached-state decoder holds a
     constant node count (each step replaces the previous step's graph); a

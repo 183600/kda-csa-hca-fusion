@@ -33,12 +33,8 @@ module so state_dicts transfer between this reference and the optional
 official backend (see ``ops_mamba_backend.py``). The parity test in
 ``run_correctness.py`` relies on this.
 
-The sequential Python-loop scan is deliberately naive: this is the
-*correctness reference* used to validate the official backend and to run
-CPU/GPU-agnostic experiments, not a speed-optimized kernel. Speed comparisons
-against KDA must use the official backend rows in ``run_benchmark.py``
-(documented there as "current implementation" numbers, never as architecture
-intrinsic costs).
+The sequential Python-loop scan is the *correctness reference* used to
+validate the official backend and to run CPU/GPU-agnostic experiments.
 
 Correctness chain / SSD duality oracle
 --------------------------------------
@@ -170,19 +166,18 @@ def validate_mamba2_geometry(
 # ---------------------------------------------------------------------------
 # The scan loop below performs, per step, the decay multiply, the
 # ``dt * (x (x) B)`` state update, the ``C . S`` readout and the D skip.
-# Every step-varying factor is computed vectorized over the time axis and
-# hoisted out of the loop: the group-to-head expanded B/C, the outer
-# products ``x (x) B``, their ``dt`` scaling, the per-step decay
-# ``exp(dt * A)`` and the skip term ``D * x``. Each hoisted product is a
-# pure elementwise operation, so it rounds exactly like the per-step
-# evaluation it replaces and the forward values stay bit-identical. Only
-# the *accumulation order* of the autograd sums feeding the ``A`` / ``dt``
-# gradients changes (one slab-wide vectorized reduction instead of
-# per-step accumulation), which is fp round-off level and pinned by the
-# SSD-duality gradient tests in fp64. The loop itself then executes the
-# minimal kernel set per step (decay-multiply, state add, ``C . S``
-# contraction, skip add), with the batch/head axes merged so the readout is
-# a direct 3D ``bmm`` (same per-batch GEMM, fewer dispatch checks).
+# Every step-varying factor is computed over the whole time axis: the
+# group-to-head expanded B/C, the outer products ``x (x) B``, their
+# ``dt`` scaling, the per-step decay ``exp(dt * A)`` and the skip term
+# ``D * x``. Each such product is a pure elementwise operation, so it
+# rounds exactly like the per-step evaluation and the forward values stay
+# bit-identical. Only the *accumulation order* of the autograd sums
+# feeding the ``A`` / ``dt`` gradients changes (one slab-wide reduction
+# instead of per-step accumulation), which is fp round-off level and
+# pinned by the SSD-duality gradient tests in fp64. The loop itself
+# executes the per-step kernels (decay-multiply, state add, ``C . S``
+# contraction, skip add), with the batch/head axes merged so the readout
+# is a direct 3D ``bmm`` (the same per-batch GEMM).
 _SCAN_LOOP_SCRIPTED = None
 _SCAN_LOOP_SCRIPTED_FAILED = False
 # Cap on the number of elements in one slab of precomputed step-varying
@@ -190,8 +185,8 @@ _SCAN_LOOP_SCRIPTED_FAILED = False
 # and the ``dt``-scaled copy held alongside it); long sequences are processed
 # in several slabs, and the recurrent state carries across slab boundaries.
 # The slab size never changes the values (each step touches only its own
-# slice of the factors), so halving it to accommodate the paired arrays
-# keeps the peak factor memory identical to the single-array version.
+# slice of the factors); the element budget is split between the paired
+# arrays.
 _SCAN_XOUTER_SLAB_ELEMS = 8_000_000
 
 
@@ -200,9 +195,8 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
 
     The batch and head axes are pre-merged (``BH = batch * nheads``), which
     lets the readout use an explicit ``bmm`` of 3D operands instead of a 4D
-    ``matmul``: the two dispatch to the same per-batch GEMM, so the values
-    are bit-identical, but the direct ``bmm`` skips ``matmul``'s extra
-    shape/batch bookkeeping. ``x_dt`` is ``[BH, slab, D, N]`` (the
+    ``matmul``; the two compute the same per-batch GEMM, so the values are
+    bit-identical. ``x_dt`` is ``[BH, slab, D, N]`` (the
     ``dt * (x (x) B)`` state-update source), ``decay_slab`` is
     ``[BH, slab, 1, 1]`` (the per-step decay ``exp(dt * A)``), ``C_h`` is
     ``[BH, slab, 1, N]`` (the expanded readout factors) and ``Dx_slab`` is
@@ -212,9 +206,9 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     """
     ys: list[torch.Tensor] = []
     T = x_dt.shape[1]
-    # Per-step views are created once outside the loop (``unbind`` yields
-    # storage-sharing views equivalent to ``[:, t]`` indexing), and the
-    # slab tensors carry the singleton broadcast dims explicitly.
+    # ``unbind`` yields storage-sharing views equivalent to ``[:, t]``
+    # indexing; the slab tensors carry the singleton broadcast dims
+    # explicitly.
     x_steps = x_dt.unbind(1)
     decay_steps = decay_slab.unbind(1)
     C_steps = C_h.unbind(1)
@@ -230,10 +224,11 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
 
 
 def _get_scripted_scan_loop():
-    """Lazily ``torch.jit.script`` the scan loop body, with eager fallback.
+    """Scripted scan loop body, with eager fallback.
 
     The scripted function executes the same operations as
-    :func:`_mamba2_scan_loop_eager`; it is cached and reused across calls.
+    :func:`_mamba2_scan_loop_eager` (bit-identical values); scripting
+    unavailability is recorded so the caller uses the eager function.
     """
     global _SCAN_LOOP_SCRIPTED, _SCAN_LOOP_SCRIPTED_FAILED
     if _SCAN_LOOP_SCRIPTED is None and not _SCAN_LOOP_SCRIPTED_FAILED:
@@ -390,14 +385,14 @@ def naive_mamba2_scan(
         y = x.new_zeros(batch, 0, nheads, headdim)
         return y, (S if output_final_state else None)
 
-    # Step-varying factors hoisted out of the loop and computed vectorized
-    # over the time axis (elementwise-identical to the per-step evaluation):
+    # Step-varying factors computed over the whole time axis
+    # (elementwise-identical to the per-step evaluation):
     #   * B_h / C_h: the group-level B/C expanded to per-head B/C. Heads are
     #     assigned to groups in CONTIGUOUS blocks (head h -> group
-    #     h // heads_per_group); repeat_interleave reproduces the original
-    #     per-step ``[:, t].repeat_interleave(heads_per_group, dim=1)``.
+    #     h // heads_per_group); repeat_interleave matches the per-step
+    #     ``[:, t].repeat_interleave(heads_per_group, dim=1)``.
     #   * x_outer[bh, t, d, n] = x[b, t, h, d] * B_h[b, t, h, n], the
-    #     original per-step ``einsum('bhd,bhn->bhdn', x[:, t], B_h)``.
+    #     per-step ``einsum('bhd,bhn->bhdn', x[:, t], B_h)``.
     #   * x_dt = dt * x_outer, decay = exp(dt * A), Dx = D * x: the remaining
     #     per-step products/skip term. The scalar A is broadcast with an
     #     explicit singleton layout so the ``exp`` argument shape matches the
@@ -406,8 +401,8 @@ def naive_mamba2_scan(
     # the scan: every per-step factor is a pure elementwise map (or a
     # per-batch ``bmm``) over which the merge is exact, the merge is just a
     # permute-copy of the same values, and the per-step readout then runs as
-    # a direct 3D ``bmm`` sharing the same underlying GEMM call as the 4D
-    # ``matmul`` it replaces.
+    # a direct 3D ``bmm`` computing the same per-batch GEMM as the
+    # equivalent 4D ``matmul``.
     _bh = batch * nheads
     B_h_flat = (B_c.repeat_interleave(heads_per_group, dim=2)
                 .permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
@@ -419,11 +414,10 @@ def naive_mamba2_scan(
     D_col = D_c.repeat(batch).reshape(_bh, 1, 1)             # [bh, 1, 1]
     S_flat = S.reshape(_bh, headdim, d_state)
 
-    # Slab the precomputed factors so their memory stays bounded on long
-    # sequences; the recurrent state carries across slabs unchanged, so the
-    # values do not depend on the slab size. The outer product and its
-    # ``dt``-scaled copy coexist within one slab, so the element budget is
-    # split between the two.
+    # Slab the precomputed factors for long sequences; the recurrent state
+    # carries across slabs unchanged, so the values do not depend on the
+    # slab size. The outer product and its ``dt``-scaled copy coexist
+    # within one slab, so the element budget is split between the two.
     slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
                // (2 * max(1, batch * nheads * headdim * d_state)))
     loop = _get_scripted_scan_loop()
@@ -627,11 +621,11 @@ _CHUNK_TRANSITION_SCAN_FAILED = False
 
 
 def _get_scripted_chunk_transition_scan():
-    """Lazily ``torch.jit.script`` the chunk-transition scan core.
+    """Scripted chunk-transition scan core, with eager fallback.
 
     Mirrors :func:`_get_scripted_scan_loop`: the scripted function executes
-    the same operations in the same order (bit-identical values) and its
-    compile failure is cached, never retried per call.
+    the same operations in the same order (bit-identical values), and
+    scripting unavailability is recorded so the eager function is used.
     """
     global _CHUNK_TRANSITION_SCAN_SCRIPTED, _CHUNK_TRANSITION_SCAN_FAILED
     if (_CHUNK_TRANSITION_SCAN_SCRIPTED is None
@@ -664,7 +658,7 @@ def chunked_mamba2_scan(
     operator as :func:`naive_mamba2_scan` (sequential recurrence) and
     :func:`quadratic_mamba2_scan` (global O(T²) dual form). It splits the
     sequence into chunks and evaluates each term of the duality expansion
-    where it is both cheap and well-conditioned:
+    where it is numerically well-conditioned:
 
       * **intra-chunk outputs** with the masked quadratic form restricted to
         the chunk (``O(C²)`` per chunk instead of ``O(T²)`` globally),
@@ -673,7 +667,7 @@ def chunked_mamba2_scan(
         ``a_n = exp(Σ_chunk dt·A)`` and the chunk source ``b_n``, resolved
         by the Hillis–Steele associative scan in
         :func:`_assoc_scan_chunk_transitions` (``ceil(log2 NT)`` batched
-        levels, no Python loop over chunks).
+        levels).
 
     Log-space gating
     ----------------
@@ -995,7 +989,7 @@ class Mamba2Mixer(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor,
                 state: torch.Tensor | None = None):
-        """Stateful forward (backward-compatible wrapper).
+        """Stateful forward.
 
         Reads ``self._conv_lookback`` and writes the new conv state back to
         ``self``. Use :meth:`forward_functional` for the pure path (DDP,
@@ -1111,9 +1105,7 @@ class Mamba2Mixer(nn.Module):
         dt = self.dt_proj(dt)                          # [B, T, nheads]
         # softplus in compute precision: fp16 softplus of a moderately
         # negative pre-activation can overflow/underflow; the state
-        # trajectory must not inherit that noise. The scan internally
-        # upcasts everything to compute precision anyway, so passing the
-        # already-upcast dt is a no-op there.
+        # trajectory must not inherit that noise.
         dt = F.softplus(dt.to(compute_dtype))
         A = -torch.exp(self.A_log.float())             # [nheads], negative
 

@@ -124,8 +124,8 @@ def _build_official_mamba2(cfg) -> nn.Module:
     """Construct the official ``mamba_ssm`` Mamba2 mixer from a config.
 
     Keyword arguments are filtered against the installed constructor's
-    signature (mirroring ``ops_kda_backend._supported_kwargs``) so nearby
-    ``mamba_ssm`` revisions with renamed optional arguments stay usable.
+    signature (mirroring ``ops_kda_backend._supported_kwargs``), so only
+    arguments the installed ``mamba_ssm`` revision accepts are passed.
     """
     Mamba2, _ = _load_official_module()
     from ops_mamba import resolve_mamba_dt_rank

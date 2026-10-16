@@ -36,7 +36,7 @@ def validate_kda_backend(backend: str) -> str:
 
 
 def _load_fla_ops():
-    """Import FLA lazily once so the decode hot path has no import lookup."""
+    """Import the FLA KDA operators on first use and cache them."""
     global _FLA_OPS
     if _FLA_OPS is not None:
         return _FLA_OPS
@@ -90,7 +90,7 @@ def _warn_dropped_contract_flags(fn: Any, kept: dict[str, Any],
 def _supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Keep the adapter compatible with nearby FLA API revisions.
 
-    FLA has renamed a few optional KDA keyword arguments over time.  The
+    FLA revisions differ in their optional KDA keyword arguments.  The
     required tensors are passed by name, while optional arguments are filtered
     against the installed function signature.  This keeps the reference repo
     importable with an older/newer FLA release without vendoring FLA itself.
@@ -223,8 +223,7 @@ def kda_forward(
     ``assoc_scan`` is a reference-path-only knob: when
     ``use_chunk=True`` it selects :func:`ops_kda.assoc_scan_chunk_kda`,
     which resolves the per-chunk state recurrence with a Hillis-Steele
-    associative scan (``ceil(log2 NT)`` batched levels instead of an
-    ``NT``-step Python loop). ``assoc_scan`` and
+    associative scan (``ceil(log2 NT)`` batched levels). ``assoc_scan`` and
     ``recompute_attn`` are mutually exclusive (the scan needs the cached
     ``Aqk`` readout matrices). Like ``recompute_attn``, the flag is ignored
     by the FLA backend and by the recurrent path.
@@ -285,8 +284,8 @@ def kda_forward(
             )
             use_fla = False
 
-    # Lazy import avoids an import cycle and preserves the original public
-    # ops_kda module as the single source of truth for correctness tests.
+    # Lazy import avoids an import cycle; ops_kda remains the single source
+    # of truth for correctness tests.
     from ops_kda import (assoc_scan_chunk_kda, naive_recurrent_kda,
                          scripted_chunk_kda)
 
