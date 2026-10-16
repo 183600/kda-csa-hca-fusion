@@ -1,24 +1,41 @@
 """Experiment 5 — hybrid layout ablation (multi-seed, device-aware).
 
-Sweeps over different KDA:CSA:HCA ratios in the fused hybrid block and
-measures (a) end-to-end forward latency and (b) MQAR accuracy, following
-the same task construction as Experiment 4 (``make_mqar_batch``) but with
-the ablation's own defaults for training budget (``ABL_STEPS``/``ABL_SEEDS``/
-``ABL_TRAIN_BATCH``, see README). This quantifies the design trade-off:
+Two modes, selected by ``ABL_MODE``:
 
-  * more KDA layers  -> faster, lower memory, but weaker long-range recall
-  * more CSA layers   -> better sparse recall, but slower (top-k selection)
-  * more HCA layers   -> cheapest global context, but coarser compression
+* ``ratio`` (default — the historical behaviour): sweeps KDA:CSA:HCA
+  ratios in the fused hybrid block at fixed 5-layer depth and measures
+  (a) end-to-end forward latency and (b) MQAR accuracy.
+* ``matrix`` (the eight-group main experiment from the framework design):
+  a fixed-depth explicit-layout matrix crossing the memory route
+  (KDA vs. Mamba-2) with four layout groups —
 
-Methodology:
+        A: R R R R R     (pure recurrent baseline)
+        B: R R R CSA R   (CSA replaces a fixed recurrent slot)
+        C: R R R R HCA   (HCA replaces a fixed recurrent slot)
+        D: R R R CSA HCA (full hybrid)
 
-  * **Multi-seed runs.** Each ratio is trained over ``n_seeds`` seeds with
-    mean +/- CI95 reported, so the comparison is statistically meaningful.
+  where R is the recurrent memory operator selected by ``memory_type``.
+  All groups share the SAME total depth (``ABL_TOTAL_LAYERS``, default
+  10 = the 5-layer unit repeated twice), the same outer layer structure,
+  and the same training recipe, so CSA's and HCA's contributions are
+  ablated independently of the memory operator. Additional presets
+  (``ABL_MATRIX=csa_csa | position | budget``) cover the follow-up
+  ablations: HCA-vs-more-CSA, layer placement, and compression-budget
+  allocation at fixed cache bytes.
+
+Methodology (both modes):
+
+  * **Multi-seed runs.** Each configuration is trained over ``n_seeds``
+    seeds with mean +/- CI95 reported, so the comparison is statistically
+    meaningful.
   * **Training steps.** 100+ steps with convergence curves (a single-seed,
     25-step setting is too short for reliable convergence).
-  * **Controlled depth.** Every ratio contains exactly five layers, so
-    ratio effects are not confounded with model depth. ``n_params`` is
-    still reported because operator types have different parameter counts.
+  * **Controlled depth.** Every configuration contains exactly the same
+    number of layers, so layout effects are not confounded with model
+    depth. ``n_params`` is still reported because operator types have
+    different parameter counts — same d_model does NOT mean same
+    capacity, and the budget-matching experiment exists precisely to
+    close that gap.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available.
 """
 
@@ -42,8 +59,9 @@ from kaggle_setup import (
     write_json_atomic, write_results_json, capture_provenance,
     make_seeded_generator,
 )
-from ops_fused import HybridKCHAttention, HybridConfig
+from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
 from ops_kda_backend import validate_kda_backend
+from ops_mamba_backend import validate_mamba_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, SMALL_MODEL_SPEC,
@@ -318,6 +336,561 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
     }
 
 
+# ---------------------------------------------------------------------------
+# Eight-group experiment matrix (ABL_MODE=matrix).
+# ---------------------------------------------------------------------------
+# Per-5-layer layout units. 'memory' resolves via cfg.memory_type, so the
+# SAME matrix runs with R = KDA or R = Mamba-2 (the framework's core
+# question: do CSA/HCA help BOTH recurrent memory operators?).
+MATRIX_UNIT = {
+    'A': ('memory', 'memory', 'memory', 'memory', 'memory'),
+    'B': ('memory', 'memory', 'memory', 'csa', 'memory'),
+    'C': ('memory', 'memory', 'memory', 'memory', 'hca'),
+    'D': ('memory', 'memory', 'memory', 'csa', 'hca'),
+    # E is only used by the csa_csa preset (HCA vs. one-more-CSA).
+    'E': ('memory', 'memory', 'memory', 'csa', 'csa'),
+}
+
+
+def _matrix_mamba_dims(d_model: int) -> dict:
+    """Env-tunable Mamba-2 geometry for the matrix, auto-clamped.
+
+    Mirrors run_quality.Mamba2Attn's knobs (MAMBA2_D_STATE / HEADDIM /
+    EXPAND / D_CONV) so the standalone operator probes and the matrix
+    stacks test the same mixer geometry at a given d_model.
+    """
+    expand = parse_int_env('MAMBA2_EXPAND', 2, min_value=1, logger=logger)
+    d_state = parse_int_env('MAMBA2_D_STATE', 16, min_value=1, logger=logger)
+    headdim = parse_int_env('MAMBA2_HEADDIM', 16, min_value=1, logger=logger)
+    d_conv = parse_int_env('MAMBA2_D_CONV', 4, min_value=2, logger=logger)
+    d_inner = expand * d_model
+    headdim_eff = min(headdim, d_inner)
+    while d_inner % headdim_eff != 0:
+        headdim_eff //= 2
+    return {'mamba_d_state': d_state, 'mamba_d_conv': d_conv,
+            'mamba_expand': expand, 'mamba_headdim': headdim_eff}
+
+
+def build_experiment_matrix(preset='main8', total_layers=10,
+                            memory_types=('kda', 'mamba2')):
+    """Build the explicit experiment matrix.
+
+    Returns a list of ``(group_id, memory_type, layout, description)``
+    tuples where ``layout`` is the RESOLVED abstract layout (still carrying
+    the 'memory' token — HybridConfig resolves it via memory_type).
+
+    Presets:
+      * ``main8``   — A/B/C/D x {kda, mamba2}: the primary eight-group
+        design. Requires total_layers % 5 == 0 (the unit repeats).
+      * ``csa_csa`` — A/D/E x memories: is HCA actually better than a
+        second CSA layer at the same depth?
+      * ``position``— alternating (D-unit repeated) vs. back-loaded
+        (memory layers first, CSA+HCA concentrated at the end), same
+        operator counts, same depth.
+      * ``budget``  — the D layout at equal compressed-entry budgets:
+        (csa_m, hca_m2) pairs sharing 1/m + 1/m2. The cfg overrides are
+        returned via the description; callers apply them per group.
+    """
+    if not isinstance(total_layers, int) or total_layers < 1:
+        raise ValueError(
+            f"total_layers={total_layers!r} must be a positive int.")
+    if preset in ('main8', 'csa_csa', 'budget'):
+        if total_layers % 5 != 0:
+            raise ValueError(
+                f"ABL_MATRIX={preset!r} repeats a 5-layer unit, so "
+                f"ABL_TOTAL_LAYERS={total_layers} must be a multiple of 5.")
+        n_units = total_layers // 5
+        if preset == 'budget':
+            # Equal compressed-entry budgets: 1/csa_m + 1/hca_m2 equal
+            # within each budget family. The cfg overrides ride along as
+            # the group tuple's fifth element.
+            budget_pairs = [
+                (4, 8), (8, 4),            # 1/m + 1/m2 = 0.375
+                (4, 4), (3, 6), (6, 3),    # 1/m + 1/m2 = 0.500
+            ]
+            groups = []
+            for mem in memory_types:
+                for (m, m2) in budget_pairs:
+                    layout = MATRIX_UNIT['D'] * n_units
+                    budget = 1.0 / m + 1.0 / m2
+                    gid = f'{mem.upper()}-D-m{m}-m2_{m2}'
+                    desc = (f'D layout, csa_m={m}, hca_m2={m2} '
+                            f'(compressed entries/token={budget:.3f})')
+                    groups.append((gid, mem, layout, desc,
+                                   {'csa_m': m, 'hca_m2': m2}))
+            return groups
+        units = ['A', 'B', 'C', 'D'] if preset == 'main8' else ['A', 'D', 'E']
+        groups = []
+        for mem in memory_types:
+            for u in units:
+                layout = MATRIX_UNIT[u] * n_units
+                desc = (f'{u}-unit x{n_units}: '
+                        + ' '.join(k.upper() for k in MATRIX_UNIT[u]))
+                groups.append((f'{mem.upper()}-{u}', mem, layout, desc))
+        return groups
+    if preset == 'position':
+        if total_layers < 2:
+            raise ValueError(
+                f"ABL_MATRIX=position needs total_layers >= 2, got "
+                f"{total_layers}.")
+        if total_layers % 5 != 0:
+            raise ValueError(
+                f"ABL_MATRIX=position compares against the repeated D "
+                f"unit, so ABL_TOTAL_LAYERS={total_layers} must be a "
+                f"multiple of 5.")
+        n_units = total_layers // 5
+        # Same operator COUNTS as the alternating layout (3n memory + n CSA
+        # + n HCA — the spec: fix depth and ratio, vary ONLY the position);
+        # the back-loaded variant concentrates all CSA layers then all HCA
+        # layers at the end of the stack instead of spreading one of each
+        # per 5-layer unit.
+        alternating = MATRIX_UNIT['D'] * n_units
+        back_loaded = (('memory',) * (3 * n_units)
+                       + ('csa',) * n_units + ('hca',) * n_units)
+        groups = []
+        for mem in memory_types:
+            groups.append((f'{mem.upper()}-alternating', mem, alternating,
+                           f'D-unit x{n_units} (CSA/HCA spread evenly)'))
+            groups.append((f'{mem.upper()}-backloaded', mem, back_loaded,
+                           f'{3 * n_units} memory layers, then {n_units} CSA '
+                           f'and {n_units} HCA at the end (same counts, '
+                           f'different positions)'))
+        return groups
+    raise ValueError(
+        f"ABL_MATRIX={preset!r} must be one of "
+        f"['main8', 'csa_csa', 'position', 'budget'].")
+
+
+def _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides=None):
+    """HybridConfig for a matrix group (explicit layout + memory route)."""
+    spec = SMALL_MODEL_SPEC
+    kw = dict(
+        d_model=d_model, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        memory_type=memory_type, layout=tuple(layout),
+        csa_m=spec['csa_m'], csa_topk=spec['csa_topk'],
+        csa_nh=spec['csa_nh'], csa_c=spec['csa_c'],
+        csa_dc=spec['csa_dc'], csa_nIh=spec['csa_nIh'],
+        csa_cI=spec['csa_cI'],
+        csa_sliding_window=spec['csa_sliding_window'],
+        hca_m2=spec['hca_m2'], hca_nh=spec['hca_nh'],
+        hca_c=spec['hca_c'], hca_dc=spec['hca_dc'],
+        hca_sliding_window=spec['hca_sliding_window'],
+        kda_backend=validate_kda_backend(
+            os.environ.get('KDA_BACKEND', 'reference')
+        ),
+        mamba_backend=validate_mamba_backend(
+            os.environ.get('MAMBA_BACKEND', 'reference')
+        ),
+        **_matrix_mamba_dims(d_model),
+    )
+    if cfg_overrides:
+        kw.update(cfg_overrides)
+    return HybridConfig(**kw)
+
+
+def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
+               n_kv=1, steps=100, lr=3e-3, seed=42, device='cpu',
+               eval_batches=4, eval_batch=64, train_batch=None,
+               cfg_overrides=None, description=''):
+    """Train + evaluate ONE matrix group (mirrors eval_layout's protocol).
+
+    ``layout`` is the abstract layout (with 'memory' tokens); the returned
+    row records the RESOLVED layout string, the memory route, and the
+    actual parameter count (which differs between KDA and Mamba-2 at the
+    same d_model — that residual is exactly what the budget-matching
+    follow-up closes).
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    torch.manual_seed(seed)
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
+    cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
+    total = len(layout)
+    model = HybridAttentionStack(cfg, total_layers=total).to(device)
+    param_groups = _build_param_groups(model, head, embed, weight_decay=0.01)
+    opt = torch.optim.AdamW(param_groups, lr=lr)
+    params = [p for g in param_groups for p in g['params']]
+
+    layout_str = model.layout_str()
+    n_params = sum(p.numel() for p in model.parameters())
+
+    batch_gen = make_seeded_generator(seed + 1_000_000, device=device)
+
+    if train_batch is None:
+        train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
+                                    logger=logger)
+
+    model.train()
+    head.train()
+    embed.train()
+
+    losses = []
+    for step in range(steps):
+        x_emb, target, cue_pos = make_mqar_batch(
+            train_batch, seq_len, n_kv, VOCAB, embed, device, generator=batch_gen)
+        model.reset_state()
+        h = model(x_emb)
+        logits = head(h, cue_pos)
+        loss = F.cross_entropy(logits, target)
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"non-finite loss at step {step}: {loss.item()} "
+                f"(group={group_id}, seed={seed}); aborting this seed to "
+                f"prevent silent NaN propagation into aggregate stats")
+        opt.zero_grad()
+        loss.backward()
+        bad_grads = [p for p in params
+                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if bad_grads:
+            raise RuntimeError(
+                f"non-finite gradient at step {step} in {len(bad_grads)} "
+                f"params (group={group_id}, seed={seed}); aborting this "
+                f"seed to prevent NaN propagation into parameters")
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        losses.append(loss.item())
+
+    final_acc, final_loss = _eval_model(
+        model, head, embed, seq_len, n_kv, device,
+        n_batches=eval_batches, batch=eval_batch, seed=seed,
+    )
+
+    lat_gen = make_seeded_generator(99, device=device)
+    x = torch.randn(1, seq_len, d_model, device=device, generator=lat_gen) * 0.1
+    was_training = model.training
+    model.eval()
+    _prev_thr = torch.get_num_threads()
+    if device.type != 'cuda':
+        torch.set_num_threads(1)
+    try:
+        with torch.no_grad():
+            model.reset_state()
+            model(x)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(5):
+                model.reset_state()
+                model(x)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            fwd_ms = (time.perf_counter() - t0) / 5 * 1e3
+    finally:
+        if device.type != 'cuda':
+            torch.set_num_threads(_prev_thr)
+        model.train(was_training)
+
+    last_loss = losses[-1] if losses else 0.0
+    mean_last10 = sum(losses[-10:]) / min(10, len(losses)) if losses else 0.0
+    return {
+        'group': group_id,
+        'memory': memory_type,
+        'description': description,
+        'n_kv': n_kv,
+        'layout': layout_str,
+        'final_acc': final_acc,
+        'final_loss': final_loss,
+        'fwd_ms': fwd_ms,
+        'n_params': n_params,
+        'n_layers': total,
+        'seed': seed,
+        'steps': steps,
+        'train_batch': train_batch,
+        'last_train_loss': last_loss,
+        'mean_last10_loss': mean_last10,
+        'loss_curve': losses,
+    }
+
+
+def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
+                          **kw):
+    """Multi-seed wrapper for a matrix group (mirrors eval_layout_multi_seed).
+
+    ``group_spec`` is one tuple from :func:`build_experiment_matrix` —
+    either ``(group_id, memory, layout, description)`` or the budget
+    preset's 5-tuple ``(..., cfg_overrides)``.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    if len(group_spec) == 5:
+        group_id, memory_type, layout, description, cfg_overrides = group_spec
+    else:
+        group_id, memory_type, layout, description = group_spec
+        cfg_overrides = None
+    seeds = [42 + i for i in range(n_seeds)]
+    stub_train_batch = kw.get('train_batch')
+    if stub_train_batch is None:
+        stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
+                                         logger=logger)
+    per_seed = []
+    for s in seeds:
+        t0 = time.time()
+        try:
+            r = eval_group(group_id, memory_type, layout, seed=s, steps=steps,
+                           device=device, cfg_overrides=cfg_overrides,
+                           description=description, **kw)
+            r['train_time_s'] = time.time() - t0
+            logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  "
+                        f"loss={r['final_loss']:.4f}  fwd={r['fwd_ms']:.2f}ms"
+                        f"  time={r['train_time_s']:.1f}s")
+            per_seed.append(r)
+        except Exception as e:
+            logger.warning(f"    seed {s} FAILED: {e}")
+            per_seed.append({
+                'group': group_id, 'memory': memory_type,
+                'description': description,
+                'n_kv': kw.get('n_kv', 1), 'layout': None,
+                'final_acc': None, 'final_loss': None, 'fwd_ms': None,
+                'n_params': None, 'n_layers': None,
+                'seed': s, 'steps': steps,
+                'train_batch': stub_train_batch,
+                'last_train_loss': None, 'mean_last10_loss': None,
+                'loss_curve': [],
+                'train_time_s': time.time() - t0,
+                'error': str(e),
+            })
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    ok_per_seed = [
+        r for r in per_seed
+        if 'error' not in r
+        and r.get('final_acc') is not None
+        and math.isfinite(r['final_acc'])
+        and r.get('final_loss') is not None
+        and math.isfinite(r['final_loss'])
+    ]
+    if not ok_per_seed:
+        raise RuntimeError(
+            f"all {n_seeds} seeds failed for group {group_id}; "
+            f"first error: {per_seed[0].get('error')}")
+
+    accs = [r['final_acc'] for r in ok_per_seed]
+    fwds = [r['fwd_ms'] for r in ok_per_seed]
+    n = len(accs)
+    mean_acc = sum(accs) / n
+    mean_fwd = sum(fwds) / n
+    if n > 1:
+        var_acc = sum((a - mean_acc) ** 2 for a in accs) / (n - 1)
+        std_acc = math.sqrt(var_acc)
+        t = _t_crit_975(n)
+        ci_acc = t * std_acc / math.sqrt(n)
+    else:
+        std_acc = 0.0
+        ci_acc = None
+
+    chance = 1.0 / VOCAB
+    if n > 1 and std_acc > 0:
+        t_stat = (mean_acc - chance) / (std_acc / math.sqrt(n))
+    else:
+        t_stat = None
+
+    return {
+        'group': group_id,
+        'memory': memory_type,
+        'description': ok_per_seed[0].get('description', ''),
+        'n_kv': ok_per_seed[0]['n_kv'],
+        'layout': ok_per_seed[0]['layout'],
+        'n_seeds_ok': n,
+        'n_seeds_failed': len(per_seed) - n,
+        'n_seeds': len(per_seed),
+        'n_seeds_total': len(per_seed),
+        'seeds': seeds,
+        'per_seed': per_seed,
+        'mean_acc': mean_acc,
+        'std_acc': std_acc,
+        'ci95_acc': ci_acc,
+        'chance_acc': chance,
+        't_stat_vs_chance': t_stat,
+        'mean_fwd_ms': mean_fwd,
+        'n_params': ok_per_seed[0]['n_params'],
+        'n_layers': ok_per_seed[0]['n_layers'],
+        'mean_train_time_s': sum(r.get('train_time_s', 0.0)
+                                 for r in ok_per_seed) / n,
+    }
+
+
+def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
+    """ABL_MODE=matrix driver: build + run + report the explicit matrix."""
+    preset = os.environ.get('ABL_MATRIX', 'main8').strip().lower()
+    total_layers = parse_int_env('ABL_TOTAL_LAYERS', 10, min_value=1,
+                                 logger=logger)
+    d_model = parse_int_env('ABL_D_MODEL', 32, min_value=8, logger=logger)
+    raw_mem = os.environ.get('ABL_MEMORY', 'kda,mamba2')
+    memory_types = [m.strip() for m in raw_mem.split(',') if m.strip()]
+    valid_mem = {'kda', 'mamba2'}
+    unknown_mem = [m for m in memory_types if m not in valid_mem]
+    if unknown_mem:
+        raise ValueError(
+            f"ABL_MEMORY includes unknown memory route(s) {unknown_mem}; "
+            f"valid: {sorted(valid_mem)}.")
+    memory_types = list(dict.fromkeys(memory_types))
+    logger.info(f'  mode          : matrix (preset={preset})')
+    logger.info(f'  total_layers  : {total_layers}')
+    logger.info(f'  d_model       : {d_model}')
+    logger.info(f'  memory routes : {memory_types}')
+    groups = build_experiment_matrix(preset, total_layers, memory_types)
+
+    n_tests = len(groups) * len(n_kv_list)
+    alpha_corrected = 0.05 / n_tests
+    try:
+        from scipy.stats import t as _t_dist  # noqa: F401
+        bonferroni_available = True
+    except ImportError:
+        bonferroni_available = False
+    logger.info(f'  {n_tests} one-sample t-tests vs chance; '
+                f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
+                f'(scipy={bonferroni_available}; fallback=exact-beta-bisection)')
+
+    all_results = []
+    for n_kv in n_kv_list:
+        logger.info(f'\n{"=" * 70}')
+        logger.info(f'  n_kv = {n_kv}')
+        logger.info(f'{"=" * 70}')
+        for spec in groups:
+            gid = spec[0]
+            logger.info(f'\n-- group {gid} (n_kv={n_kv}, {n_seeds} seeds) --')
+            try:
+                res = eval_group_multi_seed(spec, n_seeds=n_seeds,
+                                            steps=steps, device=device,
+                                            n_kv=n_kv, d_model=d_model)
+                t_stat = res.get('t_stat_vs_chance')
+                n_ok = res.get('n_seeds_ok', 0)
+                if t_stat is not None and n_ok >= 2:
+                    crit = _bonferroni_crit_q(n_ok, alpha=alpha_corrected)
+                    res['t_crit_bonferroni'] = crit
+                    res['significant_bonferroni'] = (
+                        crit is not None and t_stat > crit)
+                else:
+                    res['t_crit_bonferroni'] = None
+                    res['significant_bonferroni'] = False
+                all_results.append(res)
+                logger.info(f"  layout={res['layout']}  "
+                            f"n_params={res['n_params']}  "
+                            f"n_layers={res['n_layers']}")
+                _ci = res['ci95_acc']
+                _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
+                logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {_ci_str} "
+                            f"(std={res['std_acc']:.4f}, "
+                            f"t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)}, "
+                            f"sig_bonferroni={res['significant_bonferroni']})")
+                logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")
+            except Exception as e:
+                import traceback as _tb
+                logger.error(f'  group {gid} FAILED: {e}')
+                _tb.print_exc()
+                all_results.append({
+                    'group': gid, 'memory': spec[1],
+                    'description': spec[3] if len(spec) > 3 else '',
+                    'n_kv': n_kv, 'n_seeds': n_seeds, 'n_seeds_ok': 0,
+                    'n_seeds_failed': n_seeds, 'n_seeds_total': n_seeds,
+                    'seeds': [], 'error': str(e), 'layout': None,
+                    'mean_acc': None, 'ci95_acc': None, 'std_acc': None,
+                    'mean_fwd_ms': None, 'n_params': None,
+                    'n_layers': total_layers, 'chance_acc': 1.0 / VOCAB,
+                    't_stat_vs_chance': None, 't_crit_bonferroni': None,
+                    'significant_bonferroni': False,
+                    'mean_train_time_s': None, 'per_seed': [],
+                })
+
+    print('\n' + '=' * 118)
+    print(f"{'n_kv':>4} | {'group':>16} | {'memory':>7} | {'layout':>28} | "
+          f"{'layers':>6} | {'params':>8} | {'mean_acc':>10} | {'+/- CI95':>10} | "
+          f"{'t_vs_chance':>12} | {'fwd_ms':>8}")
+    print('-' * 118)
+    for r in all_results:
+        if 'error' in r:
+            print(f"{r['n_kv']:>4} | {r['group']:>16} | {r.get('memory', ''):>7} | "
+                  f"{'(error)':>28} | {r['n_layers']:>6} | {'-':>8} | "
+                  f"{'-':>10} | {'-':>10} | {'-':>12} | {'-':>8}   ERROR: {r['error']}")
+            continue
+        layout_str = (r.get('layout', '') or '')[:28]
+        n_params = r['n_params'] if r.get('n_params') is not None else 0
+        mean_acc = r['mean_acc'] if r.get('mean_acc') is not None else 0.0
+        ci95 = r['ci95_acc']
+        fwd = r['mean_fwd_ms'] if r.get('mean_fwd_ms') is not None else 0.0
+        ci_str = f"{ci95:>10.4f}" if ci95 is not None else f"{'n/a':>10}"
+        print(f"{r['n_kv']:>4} | {r['group']:>16} | {r['memory']:>7} | "
+              f"{layout_str:>28} | {r['n_layers']:>6} | {n_params:>8} | "
+              f"{mean_acc:>10.4f} | {ci_str} | "
+              f"{_fmt_tstat(r.get('t_stat_vs_chance'), width=12, prec=2)} | {fwd:>8.2f}")
+    print(f"{'':>4} | {'chance':>16} | {'':>7} | {'':>28} | {'':>6} | {'':>8} | "
+          f"{1.0 / VOCAB:>10.4f} | {'':>10} | {'':>12} | {'':>8}")
+
+    logger.info(f'\nControlled-depth design: all matrix groups contain '
+                f'{total_layers} layers.')
+    logger.info('  Parameter counts differ across memory routes / presets and are')
+    logger.info('  reported per row; interpret layout effects together with')
+    logger.info('  n_params, and run the budget-matching follow-up before claiming')
+    logger.info('  capacity-neutral comparisons.')
+
+    n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
+    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results),
+                       default=0)
+    _c = 1.0 / VOCAB
+    near_chance = [r for r in all_results
+                   if 'error' not in r
+                   and r.get('mean_acc') is not None
+                   and 0.5 * _c < r['mean_acc'] < 1.5 * _c]
+    far_below = [r for r in all_results
+                 if 'error' not in r
+                 and r.get('mean_acc') is not None
+                 and r['mean_acc'] <= 0.5 * _c]
+    conclusions_valid = (n_seeds >= 5 and min_seeds_ok >= 5
+                         and n_any_sig > 0
+                         and len(near_chance) < len(all_results) // 2
+                         and len(far_below) == 0)
+    logger.info('\n' + '=' * 70)
+    logger.info('Statistical validity summary:')
+    logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
+    logger.info(f'  groups with significant_bonferroni=True: '
+                f'{n_any_sig}/{len(all_results)}')
+    logger.info(f'  groups near chance (0.5x-1.5x): '
+                f'{len(near_chance)}/{len(all_results)}')
+    logger.info(f'  groups far below chance (<=0.5x): '
+                f'{len(far_below)}/{len(all_results)}')
+    logger.info(f'  conclusions_valid: {conclusions_valid}')
+    logger.info('=' * 70)
+    for r in all_results:
+        r['conclusions_valid'] = conclusions_valid
+        r['n_seeds_requested'] = n_seeds
+        r['abl_mode'] = 'matrix'
+        r['abl_matrix_preset'] = preset
+        r['total_layers'] = total_layers
+        r['d_model'] = d_model
+        r['csa_indexer_normalize_qk'] = True
+        r['kda_backend'] = os.environ.get('KDA_BACKEND', 'reference')
+        r['mamba_backend'] = os.environ.get('MAMBA_BACKEND', 'reference')
+        r['significance_scope'] = 'vs_chance_baseline_not_pairwise_between_groups'
+
+    os.makedirs('results', exist_ok=True)
+    write_results_json(all_results, 'results/exp5b_ablation_matrix.json',
+                       logger=logger)
+    try:
+        write_results_json(capture_provenance(),
+                           'results/exp5b_ablation_matrix_provenance.json',
+                           logger=logger)
+    except Exception as e:
+        logger.warning(f'failed to write provenance: {e}')
+    logger.info('\nSaved: results/exp5b_ablation_matrix.json')
+    n_errors = sum(1 for r in all_results if 'error' in r)
+    n_incomplete = sum(
+        1 for r in all_results
+        if 'error' not in r
+        and r.get('n_seeds_ok', n_seeds) != r.get('n_seeds', n_seeds)
+    )
+    if n_errors or n_incomplete:
+        logger.error(
+            f'\n{n_errors}/{len(all_results)} groups errored and '
+            f'{n_incomplete}/{len(all_results)} have incomplete seed sets. '
+            'Returning non-zero to prevent survivor-only aggregates from '
+            'being treated as a successful experiment.')
+        return 1
+    return 0
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -325,6 +898,16 @@ def main():
     logger.info('Experiment 5: Hybrid Layout Ablation (multi-seed)')
     logger.info('=' * 70)
     logger.info(f'  device: {device}')
+    # ABL_MODE selects the ablation family:
+    #   * 'ratio'  (default) — the historical KDA:CSA:HCA ratio sweep at
+    #     fixed 5-layer depth. Output: results/exp5_ablation.json.
+    #   * 'matrix' — the explicit-layout eight-group design (memory route
+    #     x A/B/C/D), plus the csa_csa / position / budget follow-up
+    #     presets. Output: results/exp5b_ablation_matrix.json.
+    abl_mode = os.environ.get('ABL_MODE', 'ratio').strip().lower()
+    if abl_mode not in ('ratio', 'matrix'):
+        raise ValueError(
+            f"ABL_MODE={abl_mode!r} must be 'ratio' or 'matrix'.")
     n_seeds = parse_int_env('ABL_SEEDS', 7, min_value=1, logger=logger)
     steps = parse_int_env('ABL_STEPS', 100, min_value=1, logger=logger)
     n_kv_list = _parse_nkv_list('ABL_NKV', '1')
@@ -338,6 +921,10 @@ def main():
                 f"ABL_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} must be "
                 f"< SEQ_LEN={SEQ_LEN} (need room for the cue token at the end).")
     logger.info(f'  n_seeds={n_seeds}, steps={steps}, n_kv={n_kv_list}')
+
+    if abl_mode == 'matrix':
+        return _run_matrix_mode(device, n_seeds, steps, n_kv_list)
+
     ratios = [
         (3, 1, 1),
         (4, 1, 0), (4, 0, 1),
