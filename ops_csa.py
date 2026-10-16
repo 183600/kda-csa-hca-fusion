@@ -182,6 +182,13 @@ def _sliding_window_scores(
     return scores_w, C_windows, win_valid
 
 
+# ``_causal_block_mask`` depends only on (T, n_blocks, m, device) — never on
+# the data. The returned tensor is treated as immutable by every caller
+# (callers only negate / broadcast it), so the same mask is reused across
+# forward passes at a given shape.
+_CAUSAL_BLOCK_MASK_CACHE: dict = {}
+
+
 def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     """Return the DeepSeek-V4 block-causal mask ``[T, n_blocks]``.
 
@@ -212,9 +219,17 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
         raise ValueError(f"n_blocks must be a non-negative int, got {n_blocks!r}")
     if not isinstance(m, int) or m < 1:
         raise ValueError(f"m must be a positive int, got {m!r}")
+    key = (T, n_blocks, m, str(device))
+    cached = _CAUSAL_BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
     i_t = torch.arange(T, device=device)
     i_b = torch.arange(n_blocks, device=device)
-    return i_t[:, None] // m > i_b[None, :]
+    mask = i_t[:, None] // m > i_b[None, :]
+    if len(_CAUSAL_BLOCK_MASK_CACHE) >= 64:
+        _CAUSAL_BLOCK_MASK_CACHE.clear()
+    _CAUSAL_BLOCK_MASK_CACHE[key] = mask
+    return mask
 
 
 def csa_compress_kv(

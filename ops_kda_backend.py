@@ -247,7 +247,8 @@ def kda_forward(
 
     # Lazy import avoids an import cycle and preserves the original public
     # ops_kda module as the single source of truth for correctness tests.
-    from ops_kda import assoc_scan_chunk_kda, naive_chunk_kda, naive_recurrent_kda
+    from ops_kda import (assoc_scan_chunk_kda, naive_recurrent_kda,
+                         scripted_chunk_kda)
 
     if use_chunk:
         if assoc_scan and recompute_attn:
@@ -264,7 +265,12 @@ def kda_forward(
                 chunk_size=chunk_size,
                 g_clamp_min=downstream_clamp,
             )
-        return naive_chunk_kda(
+        # ``scripted_chunk_kda`` compiles the same inner loop
+        # (``ops_kda._chunk_kda_inner_loop``) with ``torch.jit.script``,
+        # which executes the identical aten operations in the identical
+        # order (bit-identical outputs; see the scripted-vs-eager parity
+        # tests) while dropping the per-chunk Python dispatch overhead.
+        return scripted_chunk_kda(
             q, k, v, g, beta,
             scale=scale,
             initial_state=initial_state,

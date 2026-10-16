@@ -479,7 +479,8 @@ def _chunk_kda_prepare(
     # difference ``max(g) - min(g)`` exceeds 50; NaN / +inf ranges also
     # take the clamp path. The recompute inner loop receives
     # ``clamp_g_diff`` so it makes the same clamp decision.
-    clamp_g_diff = not bool((g.amax(-2) - g.amin(-2)).max() <= 50.0)
+    _g_lo, _g_hi = torch.aminmax(g, dim=-2)
+    clamp_g_diff = not bool((_g_hi - _g_lo).max() <= 50.0)
     # Only the rows ``c >= i`` are materialized; the strictly-upper rows are
     # zeroed by ``mask`` / ``upper_mask`` below.
     for i in range(BT):
@@ -624,7 +625,6 @@ def _chunk_kda_inner_loop(
         v_i = u_i - w_i @ S
         gexp = g_i.exp()
         chunk_outs.append((q_i * gexp) @ S + Aqk[:, :, i] @ v_i)
-        S = S * gexp[:, :, -1].unsqueeze(-1)
         # NOTE: decay direction is ``g_last - g_pos`` (NOT ``g_pos - g_last``).
         # Inside a chunk, position ``c`` contributes to the carried state via
         # ``exp(g_cumsum[last] - g_cumsum[c]) * k_c ⊗ v_c``, where
@@ -633,9 +633,11 @@ def _chunk_kda_inner_loop(
         # so a token written at position ``c`` is decayed by the sum of the
         # gates from ``c + 1`` through the chunk's last position. The sign
         # matches the upstream FLA reference (fla/ops/kda/naive.py).
-        update = (g_i[:, :, -1:] - g_i).exp() * k_i
-        update = update[..., :, None] * v_i[..., None, :]
-        S = S + update.sum(-3)
+        # The contraction over positions is a matmul; it computes the same
+        # ``sum_c kexp[c, :] ⊗ v[c, :]`` without materializing the
+        # ``[BT, K, V]`` outer-product intermediate.
+        kexp = (g_i[:, :, -1:] - g_i).exp() * k_i
+        S = S * gexp[:, :, -1].unsqueeze(-1) + kexp.transpose(-1, -2) @ v_i
     return chunk_outs, S
 
 
@@ -685,10 +687,11 @@ def _chunk_kda_inner_loop_recompute(
         v_i = u_i - w_i @ S
         gexp = g_i.exp()
         chunk_outs.append((q_i * gexp) @ S + Aqk_i @ v_i)
-        S = S * gexp[:, :, -1].unsqueeze(-1)
-        update = (g_i[:, :, -1:] - g_i).exp() * k_i
-        update = update[..., :, None] * v_i[..., None, :]
-        S = S + update.sum(-3)
+        # State carry mirrors ``_chunk_kda_inner_loop`` (same per-element
+        # operations in the same order; the contraction over chunk positions
+        # is a matmul).
+        kexp = (g_i[:, :, -1:] - g_i).exp() * k_i
+        S = S * gexp[:, :, -1].unsqueeze(-1) + kexp.transpose(-1, -2) @ v_i
     return chunk_outs, S
 
 
