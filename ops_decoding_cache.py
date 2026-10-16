@@ -1910,3 +1910,76 @@ class HCADecodingCache:
             out = partial_rope(
                 out, -pos_t, self.rope_dim_eff, self.rope_base, dim=1)
         return out
+
+
+class Mamba2DecodingState:
+    """Runtime state container for a Mamba-2 memory layer during decoding.
+
+    Unlike CSA / HCA, whose incremental state is a structured cache
+    (partial-token accumulator + compressed blocks + sliding-window ring
+    buffer), a Mamba-2 layer carries exactly TWO flat tensors:
+
+      * ``ssm_state``  — ``[B, nheads, headdim, d_state]``, the per-head
+        SSD recurrent state (compute precision, fp32 by default);
+      * ``conv_state`` — ``[B, d_inner, d_conv - 1]``, the causal short
+        conv's left context (input dtype).
+
+    ``Mamba2Mixer.forward_functional`` / ``prefill`` / ``step`` already
+    thread these tensors directly, so this container is deliberately thin:
+    it exists to give decoding / accounting code one object with ``reset()``
+    + ``nbytes`` (mirroring the CSA/HCA caches' accounting surface) and to
+    make the per-request state ownership explicit — each request owns its
+    own ``Mamba2DecodingState``; nothing is attached to the shared module.
+
+    The KDA layers' state (recurrent matrix ``[B, HV, K, V]`` + short-conv
+    lookback) keeps its historical representation: the stacked
+    ``HybridAttentionStack._kda_state`` buffer + per-layer
+    ``_conv_lookback``. Wrapping KDA in this class would be a pure
+    refactor with no behavioural gain, so the mixed stack keeps both
+    representations side by side (documented in docs/mamba2-framework.md).
+    """
+
+    def __init__(self, ssm_state, conv_state):
+        self.ssm_state = ssm_state
+        self.conv_state = conv_state
+
+    @classmethod
+    def from_state_dict(cls, state: dict | None):
+        """Build from the dict returned by ``Mamba2Mixer.prefill``/``step``."""
+        if state is None:
+            return cls(None, None)
+        if not isinstance(state, dict):
+            raise TypeError(
+                f"Mamba2DecodingState.from_state_dict: expected the dict "
+                f"returned by Mamba2Mixer.prefill/step (or None), got "
+                f"{type(state).__name__}.")
+        return cls(state.get('ssm_state'), state.get('conv_state'))
+
+    def to_state_dict(self) -> dict:
+        """Return the dict consumed by ``Mamba2Mixer.step``."""
+        return {'ssm_state': self.ssm_state, 'conv_state': self.conv_state}
+
+    def reset(self) -> None:
+        """Drop both tensors (call between independent sequences)."""
+        self.ssm_state = None
+        self.conv_state = None
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes retained by this state (0 for the unset entries)."""
+        total = 0
+        for t in (self.ssm_state, self.conv_state):
+            if t is not None:
+                total += t.numel() * t.element_size()
+        return total
+
+    def nbytes_breakdown(self) -> dict:
+        """Component-wise byte accounting for ``run_kv_cache``'s
+        recursive-vs-conv-state split (fp32 state / input-dtype conv)."""
+        def _bytes(t):
+            return None if t is None else t.numel() * t.element_size()
+        return {
+            'ssm_state_bytes': _bytes(self.ssm_state),
+            'conv_state_bytes': _bytes(self.conv_state),
+            'total_bytes': self.nbytes,
+        }

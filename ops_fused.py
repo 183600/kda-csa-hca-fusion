@@ -1,11 +1,17 @@
-"""Fused KDA + CSA + HCA hybrid attention block.
+"""Fused KDA / Mamba-2 + CSA + HCA hybrid attention stack.
 
-This module defines a hybrid *layer-level* fusion of the three attention
-operators studied in this paper:
+This module defines a hybrid *layer-level* fusion of the attention
+operators studied in this repository:
 
   * **KDA** (Kimi Delta Attention, Kimi Linear arXiv:2510.26692):
         linear-time recurrent memory with fine-grained per-channel gating.
         O(1) state per head; ideal for streaming / decoding.
+  * **Mamba-2** (SSD, arXiv:2405.21060, ``ops_mamba.Mamba2Mixer``):
+        the second selectable *recurrent memory* route. ``memory_type``
+        switches the stack between KDA and Mamba-2 while CSA/HCA stay
+        untouched, so the sparse-retrieval (CSA) and global-aggregation
+        (HCA) contributions can be ablated independently of the memory
+        operator.
   * **CSA** (Compressed Sparse Attention, DeepSeek-V4 arXiv:2606.19348):
         block-wise KV compression + sparse top-k retrieval; good for
         content-addressable long-context recall.
@@ -13,15 +19,24 @@ operators studied in this paper:
         aggressive block-wise compression + dense attention + sliding window;
         cheapest global context at extreme lengths.
 
-The ``HybridKCHAttention`` class interleaves the three in a configurable ratio
-``(n_kda : n_csa : n_hca)`` (default ``3 : 1 : 1``, mirroring the
-literature's hybrid ratios — Kimi Linear uses 3:1 KDA:MLA, DeepSeek-V4
-alternates CSA/HCA). The forward pass runs a stack of sub-layers; KDA layers
-carry a recurrent state across the stack (and across calls), CSA/HCA layers
-operate on the raw hidden sequence.
+The :class:`HybridAttentionStack` interleaves the operators in a layout
+driven by one of two modes:
 
-This is a research-oriented CPU implementation: correctness and small-scale
-behaviour, not throughput.
+  * **Ratio mode (historical default).** ``(n_kda : n_csa : n_hca)``
+    (default ``3 : 1 : 1``) is repeated to ``total_layers`` — the exact
+    behaviour of the pre-Mamba ``HybridKCHAttention``.
+  * **Explicit layout mode.** ``cfg.layout`` is an explicit tuple of layer
+    kinds using the abstract token ``'memory'`` (resolved via
+    ``cfg.memory_type``) plus ``'csa'`` / ``'hca'``. This is how the
+    eight-group experiment matrix (KDA/Mamba2 x A/B/C/D, fixed total
+    depth; see ``run_ablation.py``'s ``ABL_MODE=matrix``) is expressed.
+
+``HybridKCHAttention`` is kept as a backward-compatible subclass so every
+existing call site (runners, tests, checkpoints) keeps working unchanged;
+old configs reproduce the original KDA layout and numerics bit-for-bit.
+
+This is a research-oriented CPU-first implementation: correctness and
+small-scale behaviour, not throughput.
 """
 
 from __future__ import annotations
@@ -37,6 +52,49 @@ import torch.nn.functional as F
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_kda_backend import kda_forward, validate_kda_backend
+from ops_mamba import Mamba2Mixer, build_mamba2_mixer, validate_mamba2_geometry
+
+
+# Layer kinds accepted in an explicit ``HybridConfig.layout``. ``'memory'``
+# is the abstract placeholder resolved to ``cfg.memory_type``; the concrete
+# ``'kda'`` / ``'mamba2'`` tokens are also accepted so a layout can pin a
+# specific memory operator regardless of the global ``memory_type`` (a
+# stack still refuses to MIX the two — one memory route per model, which is
+# what the KDA-vs-Mamba-2 comparison design requires).
+LAYOUT_KINDS = ('memory', 'kda', 'mamba2', 'csa', 'hca')
+
+
+def _resolve_layout_kinds(layout, memory_type: str) -> tuple[str, ...]:
+    """Validate an explicit layout and resolve ``'memory'`` tokens.
+
+    Returns the concrete kind tuple. Raises ``ValueError`` / ``TypeError``
+    with an actionable message on unknown kinds, an empty layout, or a
+    layout that mixes KDA and Mamba-2 memory layers in one stack.
+    """
+    if isinstance(layout, str) or not isinstance(layout, (list, tuple)):
+        raise TypeError(
+            f"HybridConfig.layout={layout!r} must be a list/tuple of layer "
+            f"kinds (e.g. ('memory', 'memory', 'memory', 'csa', 'hca')), "
+            f"not a {type(layout).__name__}.")
+    if len(layout) == 0:
+        raise ValueError(
+            "HybridConfig.layout must be non-empty when set explicitly; "
+            "use layout=None to fall back to the n_kda:n_csa:n_hca ratio "
+            "expansion.")
+    resolved = []
+    for i, kind in enumerate(layout):
+        if not isinstance(kind, str) or kind not in LAYOUT_KINDS:
+            raise ValueError(
+                f"HybridConfig.layout[{i}]={kind!r} is not a valid layer "
+                f"kind; expected one of {LAYOUT_KINDS}.")
+        resolved.append(memory_type if kind == 'memory' else kind)
+    if 'kda' in resolved and 'mamba2' in resolved:
+        raise ValueError(
+            "HybridConfig.layout mixes 'kda' and 'mamba2' memory layers in "
+            "one stack. The comparison framework treats the recurrent "
+            "memory operator as a per-model route (memory_type), not a "
+            "per-layer mix; build two stacks instead.")
+    return tuple(resolved)
 
 
 class _Fp32LayerNorm(nn.LayerNorm):
@@ -146,6 +204,41 @@ class HybridConfig:
     # would be a silent correctness bug in their training recipe). Remove
     # this guard once dropout is actually wired into the forward passes.
     dropout: float = 0.0
+    # ------------------------------------------------------------------
+    # Memory route (KDA vs. Mamba-2) + explicit layout. These fields keep
+    # the KDA mainline as the DEFAULT: memory_type='kda' and layout=None
+    # reproduce the historical ratio-mode behaviour bit-for-bit.
+    # ------------------------------------------------------------------
+    # Which recurrent memory operator fills the 'memory' slots: 'kda' or
+    # 'mamba2'. The CSA / HCA layers and every other field are shared, so
+    # switching this ONE value ablates the memory operator while holding
+    # the retrieval/global-aggregation operators fixed.
+    memory_type: str = "kda"
+    # Explicit layer layout. None (default) -> ratio mode (n_kda:n_csa:n_hca
+    # repeated to total_layers). A tuple/list pins the exact per-layer
+    # kinds, e.g. ('memory','memory','memory','csa','hca') * 2 for the
+    # 10-layer eight-group matrix. When set, its length MUST equal the
+    # stack's total_layers and the n_kda/n_csa/n_hca ratio fields are
+    # ignored (a debug log records the override).
+    layout: tuple[str, ...] | list[str] | None = None
+    # Mamba-2 implementation backend (mirrors kda_backend): 'reference'
+    # (pure PyTorch, default), 'official' (mamba_ssm kernels; CUDA + the
+    # optional dependency required — errors loudly when unavailable),
+    # 'auto' (official when possible, else reference; the resolved backend
+    # is recorded on the mixer's effective_backend attribute).
+    mamba_backend: str = "reference"
+    # Mamba-2 geometry. Defaults follow the official module; small-scale
+    # experiments override them (e.g. headdim=16 for d_model=32).
+    mamba_d_state: int = 64
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_headdim: int = 64
+    # Number of B/C groups shared across heads (official default 1 = every
+    # head sees the same B/C). Kept configurable for the official-backend
+    # parity tests; the reference path supports any divisor of nheads.
+    mamba_ngroups: int = 1
+    # dt low-rank dimension: 'auto' -> ceil(d_model / 16) (official rule).
+    mamba_dt_rank: int | str = "auto"
 
     def __post_init__(self):
         # Validate dropout TYPE / finite / range BEFORE the
@@ -394,6 +487,52 @@ class HybridConfig:
             if val not in ('l2', 'rms'):
                 raise ValueError(
                     f"HybridConfig.{name}={val!r} must be 'l2' or 'rms'.")
+        # --- Memory route (KDA / Mamba-2) + explicit layout -------------
+        # Validated at config creation (fail before any parameters are
+        # allocated), mirroring the kda_backend validation above. The
+        # optional mamba_ssm import stays lazy inside ops_mamba_backend.
+        if self.memory_type not in ('kda', 'mamba2'):
+            raise ValueError(
+                f"HybridConfig.memory_type={self.memory_type!r} must be "
+                f"'kda' or 'mamba2'. This field selects the recurrent "
+                f"memory operator that fills the memory slots; CSA/HCA are "
+                f"controlled by the layout / ratio fields.")
+        from ops_mamba_backend import validate_mamba_backend
+        validate_mamba_backend(self.mamba_backend)
+        # Validate + normalize the explicit layout. The RESOLVED tuple
+        # (with 'memory' replaced by the concrete memory_type) is stored
+        # back on the config so downstream consumers (stack, experiment
+        # runners, result rows) never re-resolve the abstraction.
+        resolved_layout: tuple[str, ...] | None = None
+        if self.layout is not None:
+            resolved_layout = _resolve_layout_kinds(self.layout,
+                                                    self.memory_type)
+            self.layout = resolved_layout
+        # Mamba-2 geometry is validated ONLY when a Mamba-2 layer will
+        # actually be built. KDA-only configs (the historical default)
+        # must not be constrained by Mamba-2's headdim divisibility —
+        # tiny test geometries like d_model=32 with the default
+        # headdim=64 would otherwise be rejected for no KDA-relevant
+        # reason.
+        uses_mamba2 = (
+            self.memory_type == 'mamba2'
+            or (resolved_layout is not None and 'mamba2' in resolved_layout)
+        )
+        if uses_mamba2:
+            validate_mamba2_geometry(
+                self.d_model, self.mamba_d_state, self.mamba_d_conv,
+                self.mamba_expand, self.mamba_headdim, self.mamba_ngroups,
+                self.mamba_dt_rank)
+        if resolved_layout is not None and self.n_kda + self.n_csa \
+                + self.n_hca != len(resolved_layout):
+            # Informational, not an error: an explicit layout overrides the
+            # ratio fields by design (the eight-group matrix's B/C/D groups
+            # are not expressible as a repeating n:n:n unit). Record it at
+            # debug level so a surprised reader of the logs finds the hint.
+            logger.debug(
+                "HybridConfig: explicit layout with %d layers overrides the "
+                "n_kda/n_csa/n_hca ratio fields (%d:%d:%d).",
+                len(resolved_layout), self.n_kda, self.n_csa, self.n_hca)
 
 
 class KDAHybridLayer(nn.Module):
@@ -827,17 +966,73 @@ class HCAHybridLayer(nn.Module):
         return self.o_proj(o), None
 
 
-class HybridKCHAttention(nn.Module):
-    """Stack of interleaved KDA / CSA / HCA sub-layers.
+def build_mixer(kind: str, cfg: HybridConfig) -> nn.Module:
+    """Unified mixer factory: map a layer kind to a mixer module.
 
-    The layout follows the pattern ``[KDA * n_kda, CSA, HCA]`` repeated to
-    reach ``total_layers``. This mirrors the layerwise hybrid approach of
-    Kimi Linear (3:1 KDA:full-attn) extended with the DeepSeek-V4 CSA/HCA
-    pair: KDA handles the bulk of token mixing, CSA adds sparse long-range
-    retrieval, HCA adds heavily-compressed global context.
+    This is the single construction point for every sub-layer in the
+    hybrid stack, so switching the memory route (KDA <-> Mamba-2) or
+    adding a future operator touches exactly one dispatch table.
+
+    Args:
+        kind: one of ``'memory'`` (resolved via ``cfg.memory_type``), the
+            concrete memory kinds ``'kda'`` / ``'mamba2'``, or
+            ``'csa'`` / ``'hca'``. The stack always passes an
+            already-resolved concrete kind; the abstract ``'memory'``
+            token is accepted for direct callers (matching the factory
+            interface in the framework design).
+        cfg: the shared :class:`HybridConfig`. All mixers read only the
+            fields relevant to their operator, and every mixer satisfies
+            the same outer contract: ``forward(x[, state]) ->
+            (out, new_state)``, ``forward_functional(x, state,
+            conv_state) -> (out, new_state, new_conv_state)`` (memory
+            layers), stateless ``forward(x) -> (out, None)`` (CSA/HCA).
+
+    Returns:
+        The mixer module. The returned class for ``'mamba2'`` depends on
+        ``cfg.mamba_backend`` (reference by default; the official
+        ``mamba_ssm`` wrapper when explicitly selected and available).
+    """
+    if kind == 'memory':
+        kind = cfg.memory_type
+    if kind == 'kda':
+        return KDAHybridLayer(cfg)
+    if kind == 'mamba2':
+        return build_mamba2_mixer(cfg)
+    if kind == 'csa':
+        return CSAHybridLayer(cfg)
+    if kind == 'hca':
+        return HCAHybridLayer(cfg)
+    raise ValueError(
+        f"build_mixer: unsupported mixer kind {kind!r}; expected one of "
+        f"{LAYOUT_KINDS}.")
+
+
+class HybridAttentionStack(nn.Module):
+    """Stack of interleaved memory (KDA / Mamba-2) / CSA / HCA sub-layers.
+
+    Two layout modes (see the module docstring):
+
+      * **Ratio mode** (``cfg.layout is None``): the pattern
+        ``[memory * n_kda, CSA * n_csa, HCA * n_hca]`` repeated to
+        ``total_layers``, where ``memory`` is ``cfg.memory_type``. With the
+        default ``memory_type='kda'`` this is bit-identical to the
+        historical ``HybridKCHAttention`` behaviour, and
+        ``memory_type='mamba2'`` yields the Mamba-2 route
+        (``MAMBA2-MAMBA2-MAMBA2-CSA-HCA`` per 5-layer unit).
+      * **Explicit layout mode** (``cfg.layout`` set): the resolved layout
+        pins every layer's kind; its length must equal ``total_layers``.
+
+    Every sub-layer shares the SAME outer structure — pre-norm residual
+    ``x = x + mixer(norm(x))`` with identical LayerNorm placement, input /
+    output dimensions, and residual wiring — so only the token mixer
+    differs. The unified measurement boundaries in ``run_benchmark.py``
+    rely on this contract. The memory layers (KDA or Mamba-2) carry a
+    stacked recurrent state plus per-layer short-conv lookbacks; CSA/HCA
+    remain stateless inside the stack (their incremental decode state
+    lives in ``ops_decoding_cache``).
     """
 
-    LAYER_TYPES = ('kda', 'csa', 'hca')
+    LAYER_TYPES = ('kda', 'mamba2', 'csa', 'hca')
 
     def __init__(self, cfg: HybridConfig, total_layers: int = 5):
         super().__init__()
@@ -857,57 +1052,78 @@ class HybridKCHAttention(nn.Module):
             )
         self.total_layers = total_layers
         # Guard against the all-zero-ratio infinite loop BEFORE calling
-        # _build_layout. If n_kda == n_csa == n_hca == 0 the repeating
-        # ``unit`` is empty and ``while len(layout) < total_layers`` never
-        # terminates (layout never grows). A user running a custom ablation
-        # with (0, 0, 0) would hang the interpreter with no diagnostic.
+        # _build_layout. Only applies to ratio mode — an explicit layout
+        # pins its own (non-empty, config-validated) layer list. If
+        # n_kda == n_csa == n_hca == 0 the repeating ``unit`` is empty and
+        # ``while len(layout) < total_layers`` never terminates (layout
+        # never grows). A user running a custom ablation with (0, 0, 0)
+        # would hang the interpreter with no diagnostic.
         # total_layers == 0 is a valid (if useless) no-op and is allowed:
         # _build_layout returns [] and the ModuleLists are empty.
-        if total_layers > 0 and cfg.n_kda == 0 and cfg.n_csa == 0 and cfg.n_hca == 0:
+        if (self.cfg.layout is None and total_layers > 0
+                and cfg.n_kda == 0 and cfg.n_csa == 0 and cfg.n_hca == 0):
             raise ValueError(
-                "HybridKCHAttention requires at least one non-zero layer "
-                f"count (n_kda, n_csa, n_hca); got "
+                "HybridAttentionStack requires at least one non-zero layer "
+                f"count (n_kda, n_csa, n_hca) in ratio mode; got "
                 f"({cfg.n_kda}, {cfg.n_csa}, {cfg.n_hca}) with "
                 f"total_layers={total_layers}, which would produce an "
-                f"empty repeating unit and an infinite loop in _build_layout."
+                f"empty repeating unit and an infinite loop in "
+                f"_build_layout. Set cfg.layout explicitly for a custom "
+                f"layout instead."
             )
         self.layout = self._build_layout()
         self.layers = nn.ModuleList()
         for kind in self.layout:
-            if kind == 'kda':
-                self.layers.append(KDAHybridLayer(cfg))
-            elif kind == 'csa':
-                self.layers.append(CSAHybridLayer(cfg))
-            elif kind == 'hca':
-                self.layers.append(HCAHybridLayer(cfg))
-            else:
-                raise ValueError(kind)
+            # Unified mixer construction: the factory is the single place
+            # that maps a (resolved) layer kind to a module, so adding a
+            # new operator or switching the memory route touches exactly
+            # one dispatch table.
+            self.layers.append(build_mixer(kind, cfg))
         self.norms = nn.ModuleList([_Fp32LayerNorm(cfg.d_model) for _ in self.layout])
-        # Number of KDA layers in the stack (each one needs its OWN state).
-        # Different KDA layers have different parameters (q_proj, k_proj, ...),
-        # so they must not share recurrent state: layer 2 would otherwise be
-        # seeded with layer 0's state instead of its own, and on the next
-        # forward call layer 0 would be seeded with the last layer's state
-        # from the previous call.
-        self.n_kda_layers = sum(1 for k in self.layout if k == 'kda')
-        # Persistent KDA recurrent states, one per KDA layer. Survives across
-        # forward calls so that KDA's O(1) per-head memory is preserved during
-        # autoregressive decoding (the whole point of KDA). CSA/HCA are
-        # stateless and must NOT touch this attribute.
+        # Memory layers (KDA and/or Mamba-2 — in practice exactly one kind
+        # per stack, enforced by the config validation), in layout order.
+        # Kept as an nn.ModuleList (not a plain list) so .to(device) /
+        # .half() / print(model) keep working on the submodule set.
+        self.memory_layers = nn.ModuleList(
+            [layer for layer, kind in zip(self.layers, self.layout)
+             if kind in ('kda', 'mamba2')])
+        # Number of memory layers in the stack (each one needs its OWN
+        # state slot in the stacked tensor below). Different memory layers
+        # have different parameters, so they must not share recurrent
+        # state: layer 2 would otherwise be seeded with layer 0's state.
+        self.n_memory_layers = sum(1 for k in self.layout
+                                   if k in ('kda', 'mamba2'))
+        # Backward-compatible alias: the historical name for the stacked
+        # memory-state count. With the default memory_type='kda' this is
+        # literally the number of KDA layers, so every existing reader
+        # (run_decoding.py, the correctness tests) keeps its semantics;
+        # for Mamba-2 stacks it counts the Mamba-2 layers filling the same
+        # state slots.
+        self.n_kda_layers = self.n_memory_layers
+        # Persistent memory-layer recurrent states, one per memory layer.
+        # Survives across forward calls so the O(1) per-head memory is
+        # preserved during autoregressive decoding (the whole point of a
+        # recurrent memory operator). CSA/HCA are stateless and must NOT
+        # touch this attribute.
         #
         # Stored as a single stacked tensor of shape
-        # ``[n_kda_layers, B, HV, K, V]`` (or ``None`` when freshly reset) and
-        # registered as a non-persistent buffer so that:
-        #   * model.to(device) moves the whole stack along with the parameters
-        #     (a plain Python list attribute would be left on the original
-        #     device, causing a device-mismatch crash on the next forward);
-        #   * it is NOT saved into state_dict (persistent=False), since it is
-        #     runtime state that should be reset between sequences / sessions
-        #     via reset_state(), not restored from a checkpoint.
+        # ``[n_memory_layers, B, ...]`` (KDA: ``[B, HV, K, V]`` per layer;
+        # Mamba-2: ``[B, nheads, headdim, d_state]``) — or ``None`` when
+        # freshly reset — and registered as a non-persistent buffer so
+        # that model.to(device) moves the whole stack along with the
+        # parameters (a plain Python list attribute would be left on the
+        # original device, causing a device-mismatch crash on the next
+        # forward) and it is NOT saved into state_dict (persistent=False;
+        # it is runtime state that should be reset between sequences /
+        # sessions via reset_state(), not restored from a checkpoint).
+        # The ATTRIBUTE NAME ``_kda_state`` is kept from the historical
+        # implementation so run_decoding.py and the correctness tests
+        # continue to work unmodified; on Mamba-2 stacks it holds the
+        # Mamba-2 SSM states.
         self.register_buffer('_kda_state', None, persistent=False)
 
     def reset_state(self) -> None:
-        """Clear the persistent KDA recurrent state AND short-conv lookback.
+        """Clear the persistent memory recurrent state AND short-conv lookbacks.
 
         Call this at the start of training, at the start of each sequence
         during evaluation, or between independent generation sessions.
@@ -925,14 +1141,14 @@ class HybridKCHAttention(nn.Module):
         # and keeps the buffer slot present (just empty) so a subsequent
         # model.to(device) / state_dict save still works correctly.
         self._kda_state = None
-        # Also clear the short-conv lookback on every KDA layer so the conv
+        # Also clear the short-conv lookback on every memory layer (KDA or
+        # Mamba-2 — both register a ``_conv_lookback`` buffer) so the conv
         # does not "see" tokens from the previous sequence as left context
-        # for the next one. Each KDA layer owns its own lookback buffer
-        # (registered in KDAHybridLayer.__init__); we clear them here in one
-        # place so callers only have to remember a single reset call.
-        for layer in self.layers:
-            if isinstance(layer, KDAHybridLayer):
-                layer.reset_conv_state()
+        # for the next one. Each memory layer owns its own lookback buffer
+        # (registered in its __init__); we clear them here in one place so
+        # callers only have to remember a single reset call.
+        for layer in self.memory_layers:
+            layer.reset_conv_state()
         # Reset the class-level warning flag so the next training run
         # re-emits the stateful-forward warning. The flag is class-level
         # (not instance-level) because the warning is about the API
@@ -941,11 +1157,29 @@ class HybridKCHAttention(nn.Module):
         # ``reset_state()`` is the right place: ``reset_state()`` is
         # called at the start of every training run / eval sequence, so
         # the warning re-fires for each new "session" of use.
-        HybridKCHAttention._stateful_warned = False
+        HybridAttentionStack._stateful_warned = False
 
     def _build_layout(self) -> list[str]:
-        # One repeating unit = n_kda KDA + n_csa CSA + n_hca HCA.
-        unit = (['kda'] * self.cfg.n_kda
+        # Explicit layout mode: cfg.layout was validated and the 'memory'
+        # tokens were resolved to cfg.memory_type in
+        # HybridConfig.__post_init__. An explicit layout pins the exact
+        # depth, so a mismatch with total_layers is a configuration error
+        # (not silently truncated / padded — that would rebuild a model
+        # other than the one the caller thinks they specified).
+        if self.cfg.layout is not None:
+            if len(self.cfg.layout) != self.total_layers:
+                raise ValueError(
+                    f"HybridAttentionStack: cfg.layout has "
+                    f"{len(self.cfg.layout)} layers but "
+                    f"total_layers={self.total_layers}. An explicit layout "
+                    f"is exact: pass total_layers=len(cfg.layout) or adjust "
+                    f"the layout tuple.")
+            return list(self.cfg.layout)
+        # Ratio mode: one repeating unit = n_kda memory slots + n_csa CSA
+        # + n_hca HCA. The memory slots are filled with cfg.memory_type
+        # ('kda' by default -> the historical bit-identical behaviour;
+        # 'mamba2' -> the MAMBA2-MAMBA2-MAMBA2-CSA-HCA route).
+        unit = ([self.cfg.memory_type] * self.cfg.n_kda
                 + ['csa'] * self.cfg.n_csa
                 + ['hca'] * self.cfg.n_hca)
         # Defensive guard: if the unit is empty (all ratios zero) AND
@@ -1005,10 +1239,10 @@ class HybridKCHAttention(nn.Module):
             warning explicitly, set ``HybridKCHAttention._stateful_warned = True``
             after the first forward (or use :meth:`forward_functional`).
         """
-        if self.training and not HybridKCHAttention._stateful_warned:
+        if self.training and not HybridAttentionStack._stateful_warned:
             import warnings as _warnings
             _warnings.warn(
-                "HybridKCHAttention.forward() mutates self._kda_state "
+                "HybridAttentionStack.forward() mutates self._kda_state "
                 "and per-layer _conv_lookback buffers during forward, "
                 "which is incompatible with DDP, torch.compile, "
                 "gradient checkpointing, and concurrent inference. "
@@ -1017,20 +1251,17 @@ class HybridKCHAttention(nn.Module):
                 "use cases. This warning fires once per process per "
                 "class. To silence it for legitimate stateful use "
                 "(e.g. the experiment runners), set "
-                "HybridKCHAttention._stateful_warned = True after the "
+                "HybridAttentionStack._stateful_warned = True after the "
                 "first forward call.",
                 stacklevel=2,
             )
-            HybridKCHAttention._stateful_warned = True
+            HybridAttentionStack._stateful_warned = True
         o, new_kda_state, new_conv_lookbacks = self.forward_functional(
             x, self._kda_state,
-            [layer._conv_lookback for layer in self.layers
-             if isinstance(layer, KDAHybridLayer)])
+            [layer._conv_lookback for layer in self.memory_layers])
         self._kda_state = new_kda_state
-        # Persist the per-layer conv lookbacks back to the KDA layers.
-        for layer, lb in zip(
-            [l for l in self.layers if isinstance(l, KDAHybridLayer)],
-            new_conv_lookbacks):
+        # Persist the per-layer conv lookbacks back to the memory layers.
+        for layer, lb in zip(self.memory_layers, new_conv_lookbacks):
             layer._conv_lookback = lb
         return o
 
@@ -1124,19 +1355,20 @@ class HybridKCHAttention(nn.Module):
             # from a different config) would otherwise cause an
             # IndexError at ``states[kda_idx]`` with no useful message.
             # Raise a clear error up-front instead.
-            if stacked.shape[0] != self.n_kda_layers:
+            if stacked.shape[0] != self.n_memory_layers:
                 raise ValueError(
-                    f"HybridKCHAttention.forward_functional: stacked KDA "
-                    f"state has {stacked.shape[0]} layers but the model has "
-                    f"{self.n_kda_layers} KDA layers. The state was likely "
-                    f"persisted from a different config — reinitialize or "
-                    f"resize before calling forward_functional.")
-            # ``unbind`` the stacked KDA state into a list of per-layer
+                    f"HybridAttentionStack.forward_functional: stacked "
+                    f"memory state has {stacked.shape[0]} layers but the "
+                    f"model has {self.n_memory_layers} memory layers. The "
+                    f"state was likely persisted from a different config — "
+                    f"reinitialize or resize before calling "
+                    f"forward_functional.")
+            # ``unbind`` the stacked memory state into a list of per-layer
             # states (equivalent to a Python list comprehension over
             # indices, but avoids the explicit index loop).
             states = list(stacked.unbind(0))
         else:
-            states = [None] * self.n_kda_layers
+            states = [None] * self.n_memory_layers
 
         # Build a mutable copy of the conv lookbacks so we can update per
         # layer without touching self.
@@ -1147,44 +1379,49 @@ class HybridKCHAttention(nn.Module):
         # silently padding with ``None`` or truncating, which would
         # hide the mismatch and produce confusing downstream errors
         # (e.g. a layer receiving ``None`` when it expects a real tensor).
-        if len(lookback_list) != self.n_kda_layers:
+        if len(lookback_list) != self.n_memory_layers:
             raise ValueError(
-                f"HybridKCHAttention.forward_functional: conv_lookbacks has "
-                f"length {len(lookback_list)} but the model has "
-                f"{self.n_kda_layers} KDA layers. The lookbacks were likely "
-                f"persisted from a different config — reinitialize before "
-                f"calling forward_functional.")
+                f"HybridAttentionStack.forward_functional: conv_lookbacks "
+                f"has length {len(lookback_list)} but the model has "
+                f"{self.n_memory_layers} memory layers. The lookbacks were "
+                f"likely persisted from a different config — reinitialize "
+                f"before calling forward_functional.")
 
-        kda_idx = 0
+        mem_idx = 0
         new_lookbacks: list[torch.Tensor | None] = []
         for layer, norm, kind in zip(self.layers, self.norms, self.layout):
             residual = x
             x = norm(x)
-            if kind == 'kda':
-                # Use the FUNCTIONAL KDA path so we do NOT mutate the
+            if kind in ('kda', 'mamba2'):
+                # Use the FUNCTIONAL memory path so we do NOT mutate the
                 # layer's ``_conv_lookback``. The new lookback is
-                # collected into ``new_lookbacks`` for the caller.
+                # collected into ``new_lookbacks`` for the caller. KDA and
+                # Mamba-2 implement the SAME functional contract
+                # ((x, state, conv_state) -> (out, new_state,
+                # new_conv_state)), so the dispatch is uniform.
                 o, new_state, new_lb = layer.forward_functional(
-                    x, states[kda_idx], lookback_list[kda_idx],
+                    x, states[mem_idx], lookback_list[mem_idx],
                     detach_lookback=detach_lookback)
-                states[kda_idx] = new_state
+                states[mem_idx] = new_state
                 new_lookbacks.append(new_lb)
-                kda_idx += 1
+                mem_idx += 1
             else:
                 # Stateless CSA/HCA — no state to thread.
                 o, _ = layer(x, None)
             x = residual + o
 
-        # Restack the per-layer states for the caller. All KDA layers share
-        # the same config (HV, K, V), so every entry has the same shape and
-        # torch.stack is safe.
-        if self.n_kda_layers > 0:
+        # Restack the per-layer states for the caller. All memory layers
+        # share the same config (KDA: HV/K/V; Mamba-2: nheads/headdim/
+        # d_state), so every entry has the same shape and torch.stack is
+        # safe.
+        if self.n_memory_layers > 0:
             if any(s is None for s in states):
                 raise RuntimeError(
-                    "HybridKCHAttention: a KDA layer returned new_state=None "
-                    "despite output_final_state=True. Refusing to persist a "
-                    "partial state stack (would silently drop other layers' "
-                    "states). Check the KDA layer implementation."
+                    "HybridAttentionStack: a memory layer returned "
+                    "new_state=None despite output_final_state=True. "
+                    "Refusing to persist a partial state stack (would "
+                    "silently drop other layers' states). Check the memory "
+                    "layer implementation."
                 )
             # Explicit shape-consistency check before torch.stack.
             # ``torch.stack`` requires all tensors to have the SAME shape;
@@ -1197,15 +1434,16 @@ class HybridKCHAttention(nn.Module):
             for i, s in enumerate(states):
                 if tuple(s.shape) != ref_shape:
                     raise RuntimeError(
-                        f"HybridKCHAttention: KDA layer {i} returned "
+                        f"HybridAttentionStack: memory layer {i} returned "
                         f"new_state with shape {tuple(s.shape)} but layer 0 "
                         f"returned shape {ref_shape}. torch.stack requires "
                         f"all per-layer states to have the same shape — "
-                        f"the current HybridConfig shares HV/K/V across all "
-                        f"KDA layers, so a shape mismatch indicates either "
-                        f"a bug in the KDA layer's state computation or a "
-                        f"future per-layer config (e.g. per-layer head_dim) "
-                        f"that needs separate state management."
+                        f"the current HybridConfig shares the memory "
+                        f"geometry across all memory layers, so a shape "
+                        f"mismatch indicates either a bug in the memory "
+                        f"layer's state computation or a future per-layer "
+                        f"config (e.g. per-layer head_dim) that needs "
+                        f"separate state management."
                     )
             new_kda_state = torch.stack(states, dim=0)
         else:
@@ -1214,3 +1452,25 @@ class HybridKCHAttention(nn.Module):
 
     def layout_str(self) -> str:
         return '-'.join(s.upper() for s in self.layout)
+
+
+class HybridKCHAttention(HybridAttentionStack):
+    """Backward-compatible entry point for :class:`HybridAttentionStack`.
+
+    The class was renamed when the stack gained the switchable KDA /
+    Mamba-2 memory route (``cfg.memory_type``) and explicit layouts
+    (``cfg.layout``). The historical name is kept as a subclass so every
+    existing call site — the experiment runners, the correctness suite,
+    saved notebooks — keeps working unchanged.
+
+    Behaviour guarantees:
+
+      * A config with the historical defaults (``memory_type='kda'``,
+        ``layout=None``) produces the SAME layout strings, parameter
+        names, state-buffer names, and numerics as before the rename.
+      * Passing a ``memory_type='mamba2'`` / explicit-layout config to
+        this class works exactly like ``HybridAttentionStack`` — the
+        name is historical, not a constraint. New code (and the
+        Mamba-2 route) should prefer ``HybridAttentionStack`` for
+        clarity.
+    """
