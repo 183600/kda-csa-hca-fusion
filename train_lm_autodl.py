@@ -11,7 +11,7 @@ implements:
 Defaults: 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024 — sized for a
 small single-GPU run.
 """
-import os, time, argparse, random
+import os, time, argparse, random, json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -156,6 +156,98 @@ def count_params(m):
         total += p.numel()
     return total
 
+
+def run_decode_consistency_probe(model, device, seq_len, output_dir=None,
+                                 seed=1234):
+    """Prefill-decode consistency + decode-roofline probe of the trained LM.
+
+    A trained checkpoint is only useful for generation if token-by-token
+    decoding (KDA recurrent state + per-layer CSA/HCA incremental caches,
+    ``run_decoding.HybridDecoding``) reproduces the full-sequence training
+    forward. This runs both paths through the same weights on one synthetic
+    batch (random token ids — the check is about numerical path equivalence,
+    not language quality) and writes a JSON report next to the checkpoint.
+    See ``lm_consistency`` for the accounting conventions.
+    """
+    import lm_consistency
+    import cache_accounting
+
+    T = max(8, min(int(seq_len), 64))
+    prefill_len = max(4, T // 2)
+    gen = torch.Generator(device='cpu').manual_seed(seed)
+    ids = torch.randint(0, model.embed.num_embeddings, (1, T),
+                        generator=gen).to(device)
+    report = lm_consistency.run_lm_consistency_check(
+        model, ids, prefill_len=prefill_len, device=device)
+    # Reconcile the clone's live decode caches against the analytical
+    # accounting (component-wise, both modelled and capacity-grown totals).
+    report['cache_audit'] = cache_accounting.run_cache_audit_for_model(
+        model, context_len=prefill_len, decode_steps=T - prefill_len,
+        device=device, seed=seed)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, 'decode_consistency.json')
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, allow_nan=False)
+        os.replace(tmp, path)
+        report['report_path'] = path
+    return report
+
+
+def _print_consistency_report(report, title=''):
+    roof = report.get('roofline') or {}
+    print(f"[consistency]{' ' + title if title else ''} "
+          f"max|dlogit|={report['max_abs_logit_diff']:.3e} "
+          f"(decode-only {report['decode_max_abs_logit_diff']:.3e}), "
+          f"top1_agreement={report['top1_agreement']:.4f}, "
+          f"consistent={report['consistent']} "
+          f"(tol={report['tolerance']:.1e}), "
+          f"diagnosis={report.get('diagnosis', '?')}")
+    selection = report.get('selection') or {}
+    if selection.get('agreement') is not None:
+        print(f"[consistency] CSA top-k selection agreement: "
+              f"{selection['agreement']:.4f} "
+              f"(decode {selection['decode_agreement']:.4f}, "
+              f"{selection.get('n_compared', 0)} positions compared)")
+        if report.get('diagnosis') == 'topk_selection_divergence':
+            print("[consistency] NOTE: drift is explained by torch.topk "
+                  "tie-breaking (see ops_decoding_cache docstring), not by "
+                  "cache state corruption")
+    if roof:
+        print(f"[roofline] decode at T={roof['context_len']}: "
+              f"AI={roof['arithmetic_intensity_flops_per_byte']:.3f} "
+              f"FLOPs/byte, bound={roof.get('roofline_bound', '?')}, "
+              f"decode={report['decode_ms_per_token']:.3f} ms/token, "
+              f"{roof['bytes_per_token']:.0f} B/token")
+    audit = report.get('cache_audit') or {}
+    comp = audit.get('comparison')
+    if comp:
+        b = audit['bytes']
+        print(f"[cache-audit] live==analytical at T={comp['context_len']}: "
+              f"consistent={comp['consistent']} "
+              f"(autograd clean={audit['autograd_hygiene']['clean']}, "
+              f"bytes[{b['policy']}]={b['total_bytes']:.0f} vs "
+              f"bf16={b['pure_bf16_total_bytes']:.0f})")
+    if report.get('report_path'):
+        print(f"[consistency] report saved: {report['report_path']}")
+
+
+def run_checkpoint_consistency(path, device, seed=1234):
+    """Load a ``train_lm_autodl`` checkpoint and probe prefill-decode."""
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=True)
+    except TypeError:
+        # torch < 2.0 has no ``weights_only`` kwarg.
+        ckpt = torch.load(path, map_location='cpu')
+    cfg = HybridConfig(**ckpt['cfg'])
+    model = LMWithHybrid(int(ckpt['vocab']), cfg)
+    model.load_state_dict(ckpt['model'])
+    model.to(device).eval()
+    return run_decode_consistency_probe(
+        model, device, seq_len=64, output_dir=os.path.dirname(path) or '.',
+        seed=seed)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kaggle", action="store_true")
@@ -166,6 +258,16 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints_lm")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for model init and DataLoader shuffle.")
+    parser.add_argument("--consistency_check", action="store_true",
+                        help="Load --checkpoint, run the prefill-decode "
+                             "consistency + decode-roofline probe, then exit "
+                             "without training.")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Checkpoint path for --consistency_check "
+                             "(default: <output_dir>/final_lm.pt).")
+    parser.add_argument("--skip_consistency_check", action="store_true",
+                        help="Skip the automatic prefill-decode consistency "
+                             "probe run after training finishes.")
     args = parser.parse_args()
 
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
@@ -177,6 +279,15 @@ def main():
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
+
+    if args.consistency_check:
+        ckpt_path = args.checkpoint or os.path.join(
+            args.output_dir, "final_lm.pt")
+        if not os.path.exists(ckpt_path):
+            raise SystemExit(f"checkpoint not found: {ckpt_path}")
+        report = run_checkpoint_consistency(ckpt_path, device, seed=args.seed)
+        _print_consistency_report(report, title=os.path.basename(ckpt_path))
+        return
 
     if HAS_HF:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -349,6 +460,11 @@ def main():
                 "optimizer_step": optimizer_step, "micro_step": micro_step,
                 "seed": args.seed},
                os.path.join(args.output_dir, "final_lm.pt"))
+
+    if not args.skip_consistency_check:
+        report = run_decode_consistency_probe(
+            model, device, seq_len, args.output_dir, seed=args.seed)
+        _print_consistency_report(report, title="final_lm.pt")
 
 if __name__ == "__main__":
     main()

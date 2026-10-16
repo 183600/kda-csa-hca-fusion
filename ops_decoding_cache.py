@@ -125,6 +125,28 @@ def _validate_cache_dtype(dtype) -> None:
         raise TypeError(f'cache dtype must be floating-point, got {dtype!r}')
 
 
+def _geometric_capacity(n_rows: int) -> int:
+    """Round ``n_rows`` up to the next power of two (0 stays 0).
+
+    This is the single growth step used by every compressed-cache
+    allocation so the RETAINED capacity depends only on the number of
+    completed blocks, not on the fill history (one bulk prefill append vs
+    token-by-token appends). ``run_kv_cache.geometric_capacity`` is the
+    analytical twin used by the Exp 3 accounting; keeping the two
+    formulas identical is what makes the live-vs-analytic audit
+    (``cache_accounting``) exact instead of history-dependent.
+    """
+    if not isinstance(n_rows, int) or isinstance(n_rows, bool):
+        raise TypeError(
+            f'_geometric_capacity: n_rows must be an int, got {n_rows!r}')
+    if n_rows < 0:
+        raise ValueError(
+            f'_geometric_capacity: n_rows must be >= 0, got {n_rows}')
+    if n_rows == 0:
+        return 0
+    return 1 << (n_rows - 1).bit_length()
+
+
 # =============================================================================
 # Internal helpers
 # =============================================================================
@@ -600,11 +622,21 @@ class CSADecodingCache:
         amortized O(1) in the number of previously cached blocks. Only the
         valid prefix ``:self._n_blocks`` is copied; unused capacity is not
         exposed through the public properties or attention path.
+
+        ``required`` is ALWAYS rounded up to the geometric capacity even
+        when a bulk prefill (``_append_bulk``) jumps across many block
+        boundaries in one call. Without the round-up, a single
+        ``append_step`` of ``T`` tokens allocated exactly ``T // m`` rows,
+        so the retained capacity depended on the fill history (bulk
+        prefill: not a power of two; token-by-token: power of two) and the
+        Exp 3 ``full_accounting`` model (``run_kv_cache``,
+        ``geometric_capacity``) overstated the true allocation. Keep the
+        two formulas identical — see ``cache_accounting``.
         """
         if self._C_comp is not None and required <= self._C_comp.shape[1]:
             return
         old_capacity = 0 if self._C_comp is None else self._C_comp.shape[1]
-        new_capacity = max(required, max(1, old_capacity * 2))
+        new_capacity = max(_geometric_capacity(required), old_capacity * 2)
         new_C = torch.empty(
             self.B, new_capacity, self.c,
             device=self.device, dtype=self.dtype,
@@ -1431,11 +1463,18 @@ class HCADecodingCache:
         self._n_blocks = 0
 
     def _ensure_compressed_capacity(self, required: int) -> None:
-        """Grow HCA compressed storage geometrically when needed."""
+        """Grow HCA compressed storage geometrically when needed.
+
+        Same contract as :meth:`CSADecodingCache._ensure_compressed_capacity`:
+        ``required`` is rounded up to the geometric capacity so the
+        retained capacity is a function of the completed-block count only
+        (bulk prefill and token-by-token fills allocate identically), which
+        keeps the Exp 3 ``full_accounting`` model exact.
+        """
         if self._C_comp is not None and required <= self._C_comp.shape[1]:
             return
         old_capacity = 0 if self._C_comp is None else self._C_comp.shape[1]
-        new_capacity = max(required, max(1, old_capacity * 2))
+        new_capacity = max(_geometric_capacity(required), old_capacity * 2)
         new_C = torch.empty(
             self.B, new_capacity, self.c,
             device=self.device, dtype=self.dtype,

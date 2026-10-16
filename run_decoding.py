@@ -670,7 +670,7 @@ class HybridDecoding(nn.Module):
     see the same history they would see in a full-sequence pass.
     """
 
-    def __init__(self, d_model=64, total_layers=5, csa_topk: int = 2):
+    def __init__(self, d_model=64, total_layers=5, csa_topk=None, cfg=None):
         """``csa_topk`` is exposed so decode ablations can sweep it.
 
         The standalone decode-latency benchmark uses a SMALLER config than
@@ -688,23 +688,50 @@ class HybridDecoding(nn.Module):
         retrieval property at this smaller block count, matching the
         decode benchmark's intent to measure the *sparse* CSA path rather
         than the dense fallback.
+
+        ``cfg`` (new): wrap an EXISTING :class:`HybridConfig` instead of
+        the hardcoded benchmark geometry — used by
+        ``lm_consistency.build_decoding_clone`` to give a pretraining LM
+        (``train_lm_autodl.LMWithHybrid``) an incremental decode path with
+        the same tower geometry and weights. Unlike the default geometry,
+        a caller-supplied config is used AS-IS (``kda_chunk_size`` is not
+        forced to 0): its prefill chunk then runs the same chunked KDA path
+        as the training forward while per-token decode automatically falls
+        back to the recurrent path (``T < kda_chunk_size``), so a
+        successful consistency check also exercises the chunked-vs-recurrent
+        KDA boundary inside the full LM stack. When ``cfg`` is given,
+        ``total_layers`` must match the model being mirrored and
+        ``csa_topk``/``d_model`` are ignored (raise on a conflicting
+        explicit ``csa_topk`` rather than silently dropping it).
         """
         super().__init__()
-        self.cfg = HybridConfig(
-            d_model=d_model,
-            n_heads_qk=2, n_heads_v=2,
-            head_dim_k=16, head_dim_v=16,
-            kda_chunk_size=0,  # force recurrent path for decode
-            kda_backend=validate_kda_backend(
-                os.environ.get('KDA_BACKEND', 'reference')
-            ),
-            csa_m=4, csa_topk=csa_topk,
-            csa_nh=2, csa_c=8, csa_dc=8, csa_nIh=1, csa_cI=4,
-            csa_sliding_window=4,
-            hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
-            hca_sliding_window=4,
-            n_kda=3, n_csa=1, n_hca=1,
-        )
+        if cfg is not None:
+            if not isinstance(cfg, HybridConfig):
+                raise TypeError(
+                    f'HybridDecoding: cfg must be a HybridConfig, got '
+                    f'{type(cfg).__name__}.')
+            if csa_topk is not None and int(csa_topk) != cfg.csa_topk:
+                raise ValueError(
+                    f'HybridDecoding: csa_topk={csa_topk} conflicts with '
+                    f'cfg.csa_topk={cfg.csa_topk}; pass cfg alone (it is '
+                    f'authoritative) or drop csa_topk.')
+            self.cfg = cfg
+        else:
+            self.cfg = HybridConfig(
+                d_model=d_model,
+                n_heads_qk=2, n_heads_v=2,
+                head_dim_k=16, head_dim_v=16,
+                kda_chunk_size=0,  # force recurrent path for decode
+                kda_backend=validate_kda_backend(
+                    os.environ.get('KDA_BACKEND', 'reference')
+                ),
+                csa_m=4, csa_topk=2 if csa_topk is None else csa_topk,
+                csa_nh=2, csa_c=8, csa_dc=8, csa_nIh=1, csa_cI=4,
+                csa_sliding_window=4,
+                hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
+                hca_sliding_window=4,
+                n_kda=3, n_csa=1, n_hca=1,
+            )
         self.model = HybridKCHAttention(self.cfg, total_layers=total_layers)
         # One cache slot per CSA/HCA layer in layout order. The cache tensors
         # are allocated lazily once B/device/dtype are known.
@@ -903,7 +930,19 @@ class HybridDecoding(nn.Module):
         # at the matching layer positions.
         stacked = self.model._kda_state
         if stacked is not None and stacked.shape[1] == B:
-            states = list(stacked.unbind(0))
+            # Detach the incoming KDA states before threading them through
+            # the stack. Decoding is inference: without the detach, a caller
+            # who runs generation WITHOUT ``torch.no_grad()`` accumulates
+            # one autograd graph per decoded token (the state returned by
+            # step N is an input to step N+1), so retained memory grows
+            # linearly in generation length. This mirrors the explicit
+            # always-detach contract in ``KDAAttnDecoding`` (the standalone
+            # KDA decoder) and the self-detaching CSA/HCA caches, and makes
+            # ``cache_accounting.autograd_graph_probe`` bounded. A
+            # successful detach still leaves a single-step graph on the
+            # OUTGOING state, exactly like ``KDAAttnDecoding``; the caller
+            # owns the decode outputs either way.
+            states = [s.detach() for s in stacked.unbind(0)]
         else:
             states = [None] * self.model.n_kda_layers
 
