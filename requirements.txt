@@ -44,3 +44,8 @@ pytest>=7.0,<9.0
 pytest-xdist>=3.0,<5.0
 mypy>=1.0,<2.0
 ruff>=0.4,<0.10
+# Optional GPU backends are intentionally NOT listed here (they would force
+# CUDA builds on CPU-only installs). Use the pyproject extras instead:
+#   pip install -e '.[fla]'    -> flash-linear-attention (KDA 'fla' backend)
+#   pip install -e '.[mamba]'  -> mamba-ssm + causal-conv1d (Mamba-2
+#                                 'official' backend; CUDA only)

@@ -84,6 +84,16 @@ dev = [
 fla = [
     "flash-linear-attention>=0.5.0,<0.6",
 ]
+# Optional official Mamba-2 backend (mamba_ssm's Triton kernels; CUDA only).
+# Kept optional for the same reason as FLA: the reference path
+# (ops_mamba.Mamba2Mixer) must stay runnable everywhere, and requesting
+# ``mamba_backend='official'`` without this extra errors loudly instead of
+# silently falling back. Install with ``pip install -e '.[mamba]'`` on a
+# CUDA box; the reference-vs-official parity test self-skips without it.
+mamba = [
+    "mamba-ssm>=2.2,<3",
+    "causal-conv1d>=1.4,<2",
+]
 
 [project.urls]
 "Source" = "https://gitee.com/qwe12345678/kda-csa-hca-fusion"
@@ -105,6 +115,8 @@ py-modules = [
     "ops_csa",
     "ops_hca",
     "ops_fused",
+    "ops_mamba",
+    "ops_mamba_backend",
     "ops_decoding_cache",
     "run_correctness",
     "run_benchmark",
@@ -141,7 +153,7 @@ markers = [
 # Coverage config so ``pytest --cov`` covers the ``ops_*`` library
 # modules (the default would otherwise skip them and only cover tests).
 [tool.coverage.run]
-source = ["ops_kda", "ops_rope", "ops_csa", "ops_hca", "ops_fused", "ops_decoding_cache"]
+source = ["ops_kda", "ops_rope", "ops_csa", "ops_hca", "ops_fused", "ops_mamba", "ops_mamba_backend", "ops_decoding_cache"]
 branch = true
 omit = [
     "run_*",       # experiment runners (not library code)

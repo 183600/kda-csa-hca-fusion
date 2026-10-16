@@ -6,6 +6,9 @@ long-context / efficient-attention literature:
 
 * **KDA** — Kimi-style Delta Attention (recurrent delta-rule with per-channel
   log-decay). Bulk token mixing, O(1) state per head.
+* **Mamba-2** — SSD (arXiv:2405.21060) mixer with per-head matrix state;
+  the second selectable recurrent-memory route (`memory_type='mamba2'`),
+  same O(1)-state decoding contract as KDA.
 * **CSA** — DeepSeek-V4 Compressed Sparse Attention (overlapped two-branch KV
   compression + lightning indexer that selects top-k compressed blocks per
   query). Sparse long-range retrieval.
@@ -13,8 +16,12 @@ long-context / efficient-attention literature:
   compression, dense MQA over a tiny set of compressed entries, optional
   sliding window). Cheap global context.
 
-The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
-(see `ops_fused.HybridKCHAttention`).
+The hybrid stack interleaves them in a `3:1:1` memory:CSA:HCA ratio by default
+(see `ops_fused.HybridAttentionStack`; `HybridKCHAttention` is kept as the
+backward-compatible name). The recurrent memory slots are switchable between
+KDA and Mamba-2 via ONE config field — see
+[docs/mamba2-framework.md](docs/mamba2-framework.md) for the design and the
+eight-group experiment matrix.
 
 > **What this is.** A research-grade, correctness-first reference
 > implementation. Numerical edge cases (causality, dtype, empty sequences,
@@ -56,20 +63,24 @@ The hybrid stack interleaves them in a `3:1:1` KDA:CSA:HCA ratio by default
 .
 ├── ops_kda.py             # KDA reference: naive_recurrent_kda, naive_chunk_kda
 ├── ops_kda_backend.py     # Optional KDA backend adapter: reference / FLA / auto
+├── ops_mamba.py           # Mamba-2 (SSD) reference mixer: scan + unified prefill/step
+├── ops_mamba_backend.py   # Optional Mamba-2 backend adapter: reference / mamba_ssm / auto
 ├── ops_rope.py            # Partial RoPE (DeepSeek-V4 §2.3.3) for CSA/HCA
 ├── ops_csa.py             # CSA: compress_kv (overlapped), lightning indexer, naive_csa
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
-├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache (incremental decode)
-├── ops_fused.py           # HybridConfig + KDAHybridLayer/CSAHybridLayer/HCAHybridLayer + HybridKCHAttention
-├── run_correctness.py     # 267 regression checks (custom runner; pytest-importable)
+├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache / Mamba2DecodingState
+├── ops_fused.py           # HybridConfig + build_mixer factory + HybridAttentionStack
+│                          #   (HybridKCHAttention kept as the compat name)
+├── docs/mamba2-framework.md # Switchable KDA/Mamba-2 framework design document
+├── run_correctness.py     # 290+ regression checks (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
-├── run_quality.py         # Exp 4: MQAR associative-recall quality (multi-seed)
-├── run_ablation.py        # Exp 5: KDA:CSA:HCA ratio ablation
-├── run_decoding.py        # Exp 6: prefill + per-token decode latency (softmax/KDA/CSA/HCA/hybrid)
-├── run_kv_cache.py        # Exp 3: analytic KV-cache + FLOPs accounting
+├── run_quality.py         # Exp 4: MQAR + kv-update/long-range/multi-agg probes (multi-seed)
+├── run_ablation.py        # Exp 5: ratio sweep (ABL_MODE=ratio) | eight-group matrix (matrix)
+├── run_decoding.py        # Exp 6: prefill + per-token decode latency (both memory routes)
+├── run_kv_cache.py        # Exp 3: analytic KV-cache + FLOPs accounting (+ state breakdown)
 ├── method_analysis.py     # Headwise prototype (CSA simplified to dense for the demo)
-├── make_figures.py        # Generate figures/* from results/*
-├── run_all.py             # Single-entry runner (Kaggle-friendly)
+├── make_figures.py        # Generate figures/* from results/* (incl. quality-vs-cost)
+├── run_all.py             # Single-entry runner (RUN_ALL_PROFILE=smoke|screen|full)
 ├── kaggle_setup.py        # CUDA bootstrap + shared utilities (sanitize_for_json, parse_int_env)
 ├── test_figures.py        # Tests for the figure generation pipeline
 ├── results/               # Generated JSON outputs (gitignored; regenerate via run_all.py)
@@ -188,15 +199,45 @@ synthetic text), so the pipeline executes even on a bare CPU session.
 | 1. Correctness | `run_correctness.py` | `results/exp1_correctness.json` | ~10 s |
 | 2. Latency benchmark | `run_benchmark.py` | `results/exp2_benchmark.json` | ~30 s |
 | 3. KV-cache + FLOPs | `run_kv_cache.py` | `results/exp3_kv_cache.json` | ~1 s |
-| 4. MQAR quality | `run_quality.py` | `results/exp4_mqar.json` | ~3 min (5 seeds × 200 steps) |
-| 5. Ratio ablation | `run_ablation.py` | `results/exp5_ablation.json` | ~5 min (7 seeds × 7 layouts) |
+| 4. Quality probes | `run_quality.py` | `results/exp4_mqar.json` (+ `exp4b_quality_tasks.json`) | ~3 min (5 seeds × 200 steps) |
+| 5. Ratio ablation | `ABL_MODE=ratio python run_ablation.py` | `results/exp5_ablation.json` | ~5 min (7 seeds × 7 layouts) |
+| 5b. Eight-group matrix | `ABL_MODE=matrix python run_ablation.py` | `results/exp5b_ablation_matrix.json` | see below |
 | 6. Decode latency | `run_decoding.py` | `results/exp6_decoding.json` | ~30 s |
-| Figures | `make_figures.py` | `figures/fig_*.{pdf,png}` | ~5 s |
+| Figures | `make_figures.py` | `figures/fig_*.{pdf,png}` + `quality_vs_*.png` | ~5 s |
 
 Run everything end-to-end:
 
 ```bash
-python run_all.py
+python run_all.py                        # historical screening budget (default)
+RUN_ALL_PROFILE=smoke python run_all.py  # minutes: plumbing validation only
+RUN_ALL_PROFILE=full python run_all.py   # 7 seeds for the multi-seed statistics
+```
+
+### Switchable KDA / Mamba-2 memory route (quick start)
+
+```python
+from ops_fused import HybridConfig, HybridAttentionStack
+
+# Historical KDA route (default; bit-identical to the old behaviour):
+cfg = HybridConfig(d_model=256)                  # memory_type='kda'
+model = HybridAttentionStack(cfg, total_layers=5)
+
+# Mamba-2 route: ONE field switches the memory operator, CSA/HCA untouched:
+cfg = HybridConfig(d_model=256, memory_type='mamba2',
+                   mamba_d_state=64, mamba_headdim=64)
+model = HybridAttentionStack(cfg, total_layers=5)
+
+# Explicit layout (e.g. the eight-group matrix's D group, 10 layers):
+cfg = HybridConfig(d_model=256, memory_type='mamba2',
+                   layout=('memory', 'memory', 'memory', 'csa', 'hca') * 2)
+model = HybridAttentionStack(cfg, total_layers=10)
+```
+
+The eight-group main experiment (KDA/Mamba2 × A/B/C/D at fixed depth):
+
+```bash
+ABL_MODE=matrix ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
+# Follow-up presets: ABL_MATRIX=csa_csa | position | budget
 ```
 
 Environment knobs (set before launching):
@@ -206,8 +247,15 @@ Environment knobs (set before launching):
 | `MQAR_SEEDS` | `5` | seeds for Exp 4 |
 | `MQAR_STEPS` | `200` | training steps for non-softmax ops in Exp 4 |
 | `MQAR_SOFTMAX_STEPS` | same as `MQAR_STEPS` | optional explicitly labelled softmax long-training sensitivity run |
+| `MQAR_OPS` | `softmax,kda,mamba2,csa,hca` | operator list for Exp 4 (set `softmax,kda,csa,hca` to reproduce the historical 4-op table) |
+| `MQAR_TASKS` | `mqar` | task list for Exp 4: `mqar`, `kv_update`, `long_range`, `multi_agg`, or `all` |
 | `ABL_SEEDS` | `7` | seeds for Exp 5 |
 | `ABL_STEPS` | `100` | training steps for Exp 5 |
+| `ABL_MODE` | `ratio` | `ratio` (historical sweep) or `matrix` (eight-group design) |
+| `ABL_MATRIX` | `main8` | matrix preset: `main8`, `csa_csa`, `position`, `budget` |
+| `ABL_TOTAL_LAYERS` | `10` | fixed depth for all matrix groups (multiple of 5) |
+| `ABL_MEMORY` | `kda,mamba2` | memory routes crossed in the matrix |
+| `ABL_D_MODEL` | `32` | matrix model width (raise for the screening→formal stages) |
 | `BENCH_LENGTHS` | `128,256,512,1024,2048` | sequence lengths for Exp 2 |
 | `BENCH_REPEATS` | `5` | timed repeats per (T, op) in Exp 2 |
 | `MQAR_TRAIN_BATCH` | `32` | training batch size for Exp 4 |
@@ -217,13 +265,16 @@ Environment knobs (set before launching):
 | `SKIP_SLOW` | `0` | `1` truncates Exp 2/4/5 on CPU |
 | `SKIP_CUDA_CHECK` | `0` | `1` bypasses the CUDA-availability guard |
 | `KDA_BACKEND` | `reference` | `reference`, `fla`, or `auto`; applies to hybrid, standalone KDA quality/decode, ablation, and KDA benchmark paths |
+| `MAMBA_BACKEND` | `reference` | `reference`, `official` (needs CUDA + `pip install -e '.[mamba]'`; errors loudly when unavailable), or `auto`; the resolved backend is recorded per result row |
+| `MAMBA2_D_STATE` / `MAMBA2_HEADDIM` / `MAMBA2_EXPAND` / `MAMBA2_D_CONV` | `16` / `16` / `2` / `4` | small-model Mamba-2 geometry for the quality/ablation/matrix runners (headdim auto-clamped to divide `expand × d_model`) |
+| `RUN_ALL_PROFILE` | `screen` | `smoke` / `screen` / `full` budget tiers for `run_all.py` (presets only touch env vars you did NOT export) |
 
 ---
 
 ## Tests
 
 ```bash
-# Custom runner (267 checks, includes long-running correctness checks):
+# Custom runner (290+ checks, includes long-running correctness checks):
 python run_correctness.py
 
 # pytest-compatible: the test functions use the standard `test_*` naming
@@ -247,8 +298,10 @@ runs during development.
 | `results/exp1_correctness.json` | `[{name, status, detail}, ...]` | per-check rows from the custom runner |
 | `results/exp2_benchmark.json` | `[{T, op, time_ms, peak_mem_MB, device, repeats, compute_boundary, n_layers, note}, ...]` | **`compute_boundary` differs per op** — see *Fairness notes* |
 | `results/exp3_kv_cache.json` | `[{T, op, accounting_mode, accounting_semantics, kv_bytes, kv_elements, ...}, ...]` | analytic model, not profiled |
-| `results/exp4_mqar.json` | `{metadata, results: [{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]}` | multi-seed with CI95 + Bonferroni |
-| `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper |
+| `results/exp4_mqar.json` | `{metadata, results: [{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]}` | multi-seed with CI95 + Bonferroni; rows now carry `task` + `n_params` and include the `mamba2` operator by default |
+| `results/exp4b_quality_tasks.json` | `{metadata, results: [...]}` | same envelope for the kv-update / long-range / multi-agg probes (`MQAR_TASKS`) |
+| `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper (`ABL_MODE=ratio`) |
+| `results/exp5b_ablation_matrix.json` | `[{group, memory, layout, n_kv, per_seed, mean_acc, n_params, total_layers, d_model, ...}, ...]` | the eight-group matrix and its presets (`ABL_MODE=matrix`) |
 | `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, compute_boundary, n_layers, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches; `n_layers` marks hybrid as a 5-layer stack vs single-layer methods) |
 | `results/summary.json` | `{env: {git_commit, torch_version, cuda_version, kda_backend, ...}, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
 
@@ -267,14 +320,14 @@ JSON outputs annotate these where possible, but they are easy to miss:
 
 ### 1. Benchmark compute boundary (Exp 2)
 
-The six operators in `run_benchmark.py` are timed under **different
+The operators in `run_benchmark.py` are timed under **different
 boundaries**:
 
 | Op | Boundary | What's included |
 |---|---|---|
-| `softmax`, `kda_rec`, `kda_chunk` | `core` | only the attention / recurrence kernel; q/k/v (and g/beta) are pre-projected outside the timed region |
-| `csa`, `hca` | `end_to_end_single_layer` | a single layer end-to-end: input projection + compression + indexer + sparse attention + output projection |
-| `hybrid` | `end_to_end_multi_layer` | a 5-layer stack with LayerNorm, projections, attention, state management |
+| `softmax`, `kda_rec`, `kda_chunk`, `mamba2_scan` | `core` | only the attention / recurrence kernel; q/k/v (and g/beta, x/dt/B/C) are pre-projected outside the timed region. `mamba2_scan` is capacity-matched to `kda_rec` (4 heads × 32×32 state) |
+| `csa`, `hca`, `mamba2_layer` | `end_to_end_single_layer` | a single layer end-to-end: input projection + compression / conv + indexer / scan + attention + output projection |
+| `hybrid`, `hybrid_mamba2` | `end_to_end_multi_layer` | a 5-layer stack with LayerNorm, projections, attention, state management; the two rows share identical CSA/HCA geometry so the pair isolates the memory-operator swap |
 
 These numbers are **not directly comparable** as "operator latency".
 `make_figures.fig_benchmark` splits them into separate subplots by
@@ -307,11 +360,11 @@ and report an explicit pairwise test.
 
 ### 4. Decoding experiment scope (Exp 6)
 
-`run_decoding.py` benchmarks **softmax, KDA, CSA, HCA, and the hybrid
-stack** for both prefill and per-token decode latency. CSA and HCA use
-the incremental decoding cache implemented in
-`ops_decoding_cache.py` (`CSADecodingCache` / `HCADecodingCache`),
-which maintains:
+`run_decoding.py` benchmarks **softmax, KDA, Mamba-2, CSA, HCA, and the
+hybrid stacks (both memory routes)** for both prefill and per-token
+decode latency. CSA and HCA use the incremental decoding cache
+implemented in `ops_decoding_cache.py` (`CSADecodingCache` /
+`HCADecodingCache`), which maintains:
 
 * a **partial-token accumulator** (Python `list`) — buffers 0..m-1 new
   tokens until a compressed block can be formed;
