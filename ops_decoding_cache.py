@@ -625,13 +625,10 @@ class CSADecodingCache:
 
         ``required`` is ALWAYS rounded up to the geometric capacity even
         when a bulk prefill (``_append_bulk``) jumps across many block
-        boundaries in one call. Without the round-up, a single
-        ``append_step`` of ``T`` tokens allocated exactly ``T // m`` rows,
-        so the retained capacity depended on the fill history (bulk
-        prefill: not a power of two; token-by-token: power of two) and the
-        Exp 3 ``full_accounting`` model (``run_kv_cache``,
-        ``geometric_capacity``) overstated the true allocation. Keep the
-        two formulas identical — see ``cache_accounting``.
+        boundaries in one call, so the retained capacity is a function of
+        the completed-block count only (bulk prefill and token-by-token
+        fills allocate identically). Keep the two formulas identical — see
+        ``cache_accounting``.
         """
         if self._C_comp is not None and required <= self._C_comp.shape[1]:
             return

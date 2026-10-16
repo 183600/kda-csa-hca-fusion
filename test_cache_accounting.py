@@ -12,17 +12,14 @@ What is pinned here
    must retain exactly the analytical element counts (allocated AND valid
    prefix), including geometric spare capacity, ring buffers, partial
    tails and CSA overlap state — batch>1 included.
-3. **Geometric capacity contract (round-2 regression).** The bulk-prefill
-   path used to allocate exactly the required row count, so a 100-token
-   prefill retained 25 compressed rows instead of the documented
-   geometric 32 and Exp 3's ``full_accounting`` overstated the runtime
-   cost. Both caches must now round every allocation up to the geometric
-   capacity regardless of fill history; ``ops_decoding_cache``'s local
-   helper must equal ``run_kv_cache.geometric_capacity``.
-4. **Autograd hygiene (round-2 regression).** ``HybridDecoding`` used to
-   thread KDA recurrent states without detaching, retaining one autograd
-   graph per decoded token (O(N) memory growth without ``no_grad()``).
-   The graph-growth probe must report a bounded node count; CSA/HCA cache
+3. **Geometric capacity contract.** Both caches must round every
+   allocation up to the geometric capacity regardless of fill history;
+   ``ops_decoding_cache``'s local helper must equal
+   ``run_kv_cache.geometric_capacity``.
+4. **Autograd hygiene.** ``HybridDecoding`` must not thread KDA recurrent
+   states without detaching, or it would retain one autograd graph per
+   decoded token (O(N) memory growth without ``no_grad()``). The
+   graph-growth probe must report a bounded node count; CSA/HCA cache
    tensors must be detached; the graph-node counter itself is pinned with
    a positive control.
 5. **Paper-aligned byte model.** The DeepSeek-V4 §2.3.4 mixed storage
@@ -144,9 +141,9 @@ def test_analytic_decomposition_matches_exp3():
 def test_live_equals_analytic_for_every_fill_history():
     """Live tensors match the analytical model for bulk and incremental runs.
 
-    The critical round-2 property: the retained capacity is a function of
+    The critical property: the retained capacity is a function of
     the completed-block count only, so both fill histories produce exactly
-    the same counts (previously bulk prefill did not).
+    the same counts.
     """
     print("\nTest: live cache accounting == analytical (fill histories)")
     cfg = _cfg()

@@ -302,7 +302,7 @@ def kda_forward(
         # (``ops_kda._chunk_kda_inner_loop``) with ``torch.jit.script``,
         # which executes the identical aten operations in the identical
         # order (bit-identical outputs; see the scripted-vs-eager parity
-        # tests) while dropping the per-chunk Python dispatch overhead.
+        # tests).
         return scripted_chunk_kda(
             q, k, v, g, beta,
             scale=scale,

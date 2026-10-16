@@ -10,19 +10,13 @@ that claim against the tensors a real decode session actually retains —
 drift in ways that are invisible to the operator-level tests:
 
 * allocation *history* (one bulk prefill ``append_step`` vs token-by-token
-  appends) can change the geometric growth sequence — this module caught
-  exactly that: the bulk path used to allocate ``required`` rows exactly,
-  so a 100-token prefill retained 25 compressed rows where the documented
-  geometric contract (and Exp 3) says 32. Fixed in ``ops_decoding_cache``;
-  this module is the regression guard that keeps live and analytical
-  accounting equal for every fill history.
+  appends) can change the geometric growth sequence. This module is the
+  regression guard that keeps live and analytical accounting equal for
+  every fill history.
 * incremental decode caches can accidentally retain autograd graphs
   (``grad_fn``) when a caller forgets ``torch.no_grad()`` — the classic
-  unbounded-memory leak during long generation. The same probe caught that
-  ``HybridDecoding`` used to thread KDA recurrent states without detaching
-  them (the standalone ``KDAAttnDecoding`` always detached; the hybrid stack
-  did not), growing the retained graph by ~224 nodes per decoded token.
-  Fixed in ``run_decoding``; :func:`autograd_graph_probe` pins the fix.
+  unbounded-memory leak during long generation. :func:`autograd_graph_probe`
+  pins the graph-growth contract for the decode stack.
 
 Paper alignment
 ---------------

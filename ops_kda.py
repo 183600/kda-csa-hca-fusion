@@ -449,8 +449,6 @@ def _chunk_kda_prepare(
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     # ``repeat_interleave`` (even with G == 1) also materializes contiguous
     # q / k tensors; the rearranged views feed several downstream matmuls.
-    # Skipping it for G == 1 measured slower on CPU (non-contiguous operands
-    # in the per-chunk bmm), so keep the copy.
     q = q.repeat_interleave(G, dim=1) * scale
     k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
@@ -474,9 +472,8 @@ def _chunk_kda_prepare(
     # the inner loop. In ``recompute_attn`` mode the cache is dropped and
     # the inner loop rebuilds each chunk's matrix from the ``q`` / ``k``
     # and cumsum ``g`` already returned above.
-    # ``torch.zeros`` (not ``empty`` + a trailing ``masked_fill``) keeps the
-    # never-written strictly-upper triangle at exactly zero, skipping one
-    # full ``[NT, BT, BT]`` pass; the lower triangle is written below.
+    # ``torch.zeros`` (not ``empty``) keeps the never-written strictly-upper
+    # triangle at exactly zero; the lower triangle is written below.
     Aqk = None if recompute_attn else torch.zeros(
         *g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     # ``clamp(max=50.0)`` is applied when the largest positive pair
@@ -489,17 +486,16 @@ def _chunk_kda_prepare(
     # the strict upper triangle stays at the zeros from the allocation above
     # and the diagonal is explicitly zeroed right after the loop.
     for i in range(BT):
-        # ``[..., i:i+1, :]`` (a slice view) broadcasts identically to
-        # ``[..., i, :].unsqueeze(-2)`` but skips the select+unsqueeze pair.
+        # ``[..., i:i+1, :]`` broadcasts identically to
+        # ``[..., i, :].unsqueeze(-2)``.
         g_i = g[..., i:i + 1, :]
         g_diff = g[..., i:, :] - g_i
         if clamp_g_diff:
             g_diff = g_diff.clamp(max=50.0)
         # ``t = exp(g_diff) * k_i`` is shared by both intra-chunk matrices.
-        # The sub/clamp produce fresh tensors, so the exp runs in place on
-        # them: same per-element op in the same order, one less full-size
-        # intermediate. The product stays out-of-place because autograd
-        # saves the exp output for the multiply's backward.
+        # The sub/clamp produce fresh tensors, so the exp may run in place;
+        # the product stays out-of-place because autograd saves the exp
+        # output for the multiply's backward.
         g_diff.exp_()
         t = g_diff * k[..., i:i + 1, :]
         A[..., i:, i] = (k[..., i:, :] * t).sum(-1)
@@ -509,8 +505,7 @@ def _chunk_kda_prepare(
     # Only the diagonal needs zeroing: ``A`` was allocated with
     # ``torch.zeros`` and the loop above wrote exactly its lower triangle
     # (including the diagonal), so the strict upper triangle is already
-    # +0.0. Zeroing the diagonal VIEW touches BT values per chunk instead
-    # of the full BT x BT matrix.
+    # +0.0.
     A.diagonal(dim1=-2, dim2=-1).zero_()
     A.neg_()
     eye = torch.eye(BT, dtype=compute_dtype, device=q.device)
@@ -649,9 +644,8 @@ def _chunk_kda_inner_loop(
         # so a token written at position ``c`` is decayed by the sum of the
         # gates from ``c + 1`` through the chunk's last position. The sign
         # matches the upstream FLA reference (fla/ops/kda/naive.py).
-        # The contraction over positions is a matmul; it computes the same
-        # ``sum_c kexp[c, :] ⊗ v[c, :]`` without materializing the
-        # ``[BT, K, V]`` outer-product intermediate.
+        # The contraction over positions computes ``sum_c kexp[c, :] ⊗
+        # v[c, :]`` as a matmul.
         kexp = (g_i[:, :, -1:] - g_i).exp() * k_i
         S = S * gexp[:, :, -1].unsqueeze(-1) + kexp.transpose(-1, -2) @ v_i
     return chunk_outs, S
@@ -704,8 +698,7 @@ def _chunk_kda_inner_loop_recompute(
         gexp = g_i.exp()
         chunk_outs.append((q_i * gexp) @ S + Aqk_i @ v_i)
         # State carry mirrors ``_chunk_kda_inner_loop`` (same per-element
-        # operations in the same order; the contraction over chunk positions
-        # is a matmul).
+        # operations in the same order).
         kexp = (g_i[:, :, -1:] - g_i).exp() * k_i
         S = S * gexp[:, :, -1].unsqueeze(-1) + kexp.transpose(-1, -2) @ v_i
     return chunk_outs, S

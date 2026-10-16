@@ -471,7 +471,7 @@ class CSAAttnDecoding(nn.Module):
         """Compute the 6 CSA projections + queries from H.
 
         Returns ``(Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx)``.
-        Mirrors the merged-matmul optimization in ``naive_csa``.
+        Mirrors the merged projection matmul in ``naive_csa``.
         """
         B, T, _ = H.shape
         combined_weight = torch.cat(
@@ -498,8 +498,6 @@ class CSAAttnDecoding(nn.Module):
             # First prefill chunk (empty cache): use the fast vectorized
             # naive_csa for the output AND reuse its internally-computed
             # projections to populate the cache (return_projections=True).
-            # This avoids a redundant fused matmul that would otherwise
-            # recompute the same 6 KV/indexer projections via _project(x).
             o, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
                 x, self.W_aKV.weight, self.W_bKV.weight,
                 self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
@@ -618,9 +616,7 @@ class HCAAttnDecoding(nn.Module):
         if T_new > 1 and cache.n_tokens_seen == 0:
             # First prefill chunk (empty cache): use naive_hca for the output
             # AND reuse its internally-computed C/Z projections to populate
-            # the cache (return_projections=True). Avoids a redundant matmul
-            # that would otherwise recompute the same 2 projections via
-            # _project(x).
+            # the cache (return_projections=True).
             o, (C, Z) = naive_hca(
                 x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
                 self.W_DQ.weight, self.W_UQ.weight,

@@ -182,10 +182,9 @@ def _sliding_window_scores(
     return scores_w, C_windows, win_valid
 
 
-# ``_causal_block_mask`` depends only on (T, n_blocks, m, device) — never on
-# the data. The returned tensor is treated as immutable by every caller
-# (callers only negate / broadcast it), so the same mask is reused across
-# forward passes at a given shape.
+# Shape-keyed cache for ``_causal_block_mask``, which depends only on
+# (T, n_blocks, m, device) and never on the data. The returned tensor is
+# treated as immutable by every caller (callers only negate / broadcast it).
 _CAUSAL_BLOCK_MASK_CACHE: dict = {}
 
 
@@ -603,8 +602,7 @@ def csa_lightning_indexer(
     # Vectorized batched scoring (no per-batch loop).
     # head-wise similarities [B, HI, T, n_blocks]. Multiplying by a
     # scale of exactly 1.0 is an IEEE no-op (values and gradients are
-    # preserved bit-for-bit), so the cosine-attention configuration skips
-    # the full-size multiply entirely.
+    # preserved bit-for-bit).
     score = torch.einsum('b t h d, b n d -> b h t n', q_idx, k_idx)
     if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
         score = score * scale
