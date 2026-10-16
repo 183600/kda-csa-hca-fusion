@@ -10,8 +10,16 @@ implements:
 
 Defaults: 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024 — sized for a
 small single-GPU run.
+
+Data protocol (leakage-safe): the corpus is cleaned (empty / exact-
+duplicate / unsupervised documents dropped) and then partitioned into
+train / validation / test BEFORE any model runs. Training only touches
+train; validation drives model selection and early stopping; the test
+split stays sealed and is opened exactly once at the end, on the frozen
+val-selected checkpoint. See ``clean_lm_texts`` / ``split_clean_texts``
+and ``SealedTestSet``.
 """
-import os, time, argparse, random, json, gc, hashlib, datetime
+import os, time, argparse, random, json, gc, hashlib, datetime, math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,7 +54,8 @@ from ops_fused import HybridConfig, HybridKCHAttention
 from ops_kda_backend import validate_kda_backend
 from kaggle_setup import (configure_torch_for_device, set_global_seed,
                           seed_worker, capture_provenance,
-                          write_json_atomic, write_results_json)
+                          write_json_atomic, write_results_json,
+                          split_train_val_test, audit_split)
 
 # tokenizer / dataset handling (reuse TinyStories if available)
 try:
@@ -91,25 +100,61 @@ class _FallbackCharTokenizer:
             ids = ids[:max_length]
         return ids
 
+def _synthetic_corpus(n=1000):
+    """Deterministic synthetic fallback corpus (unique texts).
+
+    The texts are unique (index suffix) so the cleaning step's exact-
+    duplicate removal and the subsequent train/val/test split stay
+    meaningful even on the no-network path. The old fallback repeated the
+    SAME string 1000 times, which after dedup would collapse to a single
+    story and make a three-way split degenerate.
+    """
+    return [f"Once upon a time, story {i}. " * 40 for i in range(int(n))]
+
+
+def _load_raw_texts(max_samples, split="train"):
+    """Load the raw text corpus (HF TinyStories or the synthetic fallback).
+
+    Returns ``(texts, data_source)``. Cleaning and splitting happen
+    AFTER this call and BEFORE any model sees a token (see
+    ``clean_lm_texts`` / ``split_clean_texts``).
+    """
+    if HAS_HF:
+        try:
+            ds = load_dataset("roneneldan/TinyStories", split=split)
+            if max_samples:
+                ds = ds.select(range(min(len(ds), int(max_samples))))
+            return list(ds["text"]), "hf:roneneldan/TinyStories"
+        except Exception as e:
+            print(f"HF load failed {e}, using synthetic")
+            return (_synthetic_corpus(),
+                    "synthetic:once_upon_a_time (HF load failed)")
+    return _synthetic_corpus(), "synthetic:once_upon_a_time (no transformers)"
+
+
 class TinyStoriesLM(Dataset):
-    def __init__(self, tokenizer, seq_len=1024, max_samples=20000, split="train"):
+    def __init__(self, tokenizer, seq_len=1024, max_samples=20000, split="train",
+                 texts=None, name=None):
+        """Token-window dataset over a list of raw stories.
+
+        When ``texts`` is None the corpus is loaded from HuggingFace (or
+        the synthetic fallback) exactly as before, capped at
+        ``max_samples``. The training entry point instead loads, cleans
+        and partitions the corpus explicitly and passes the pre-sliced
+        ``texts`` of ONE split here, so no dataset object ever spans the
+        train/val/test boundary.
+        """
         self.seq_len = seq_len
         self.split = split
-        self.max_samples = max_samples
-        if HAS_HF:
-            try:
-                ds = load_dataset("roneneldan/TinyStories", split=split)
-                if max_samples:
-                    ds = ds.select(range(min(len(ds), max_samples)))
-                self.texts = ds["text"]
-                self.data_source = "hf:roneneldan/TinyStories"
-            except Exception as e:
-                print(f"HF load failed {e}, using synthetic")
-                self.texts = ["Once upon a time, " * 200 for _ in range(1000)]
-                self.data_source = "synthetic:once_upon_a_time (HF load failed)"
+        if texts is None:
+            texts, source = _load_raw_texts(max_samples, split)
+            self.max_samples = max_samples
         else:
-            self.texts = ["Once upon a time, " * 200 for _ in range(1000)]
-            self.data_source = "synthetic:once_upon_a_time (no transformers)"
+            texts = list(texts)
+            source = f"provided:{name or split}"
+            self.max_samples = len(texts)
+        self.texts = texts
+        self.data_source = source
         self.tokenizer = tokenizer
         # Content fingerprint so a run record can identify WHICH data was
         # trained on. Uses a bounded, deterministic sample (first
@@ -135,6 +180,316 @@ class TinyStoriesLM(Dataset):
         elif real_len - 1 < labels.numel():
             labels[real_len - 1:] = -100
         return {"input_ids": input_ids, "labels": labels}
+
+# --------------------------------------------------------------------------
+# Data cleaning + leakage-safe splitting
+# --------------------------------------------------------------------------
+#
+# Order of operations in ``main`` (matters for leakage):
+#
+#   1. load the raw corpus;
+#   2. clean it (drop empty / exactly duplicated / unsupervised texts);
+#   3. draw the deterministic train/val/test split;
+#   4. verify the split (``audit_split`` + cross-split text-digest check);
+#   5. train on TRAIN only, monitor/select on VAL only;
+#   6. after the model is frozen, open the sealed TEST set exactly once.
+#
+# No statistic used to transform features may be fitted on val/test. This
+# pipeline fits no preprocessing transform at all (the tokenizer is the
+# pretrained GPT-2 tokenizer, not fitted here), but the split is still
+# drawn first so that any future fitted transform (e.g. a learned
+# vocabulary or token-length normalizer) is forced to use train indices
+# only. Per-split summary statistics below are computed for REPORTING
+# distribution shift, never fed back into training or model selection.
+
+def _text_digests(texts):
+    """Content digests of a list of texts (exact-duplicate identity)."""
+    return {hashlib.sha256(str(t).encode('utf-8', 'replace')).digest()
+            for t in texts}
+
+
+def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2):
+    """Clean the raw corpus BEFORE any split is drawn.
+
+    Cleaning steps (all recorded in the returned stats):
+
+      * drop empty / whitespace-only documents;
+      * drop exact duplicates (content hash) so the same story can never
+        end up on both sides of the split — dedup BEFORE splitting is
+        what makes the cross-split disjointness guarantee possible;
+      * drop documents that tokenize to fewer than ``min_tokens`` ids:
+        they produce no supervised label at all (every target is masked
+        with -100), i.e. they are pure label noise for a next-token
+        objective;
+      * drop documents the tokenizer cannot encode (counted separately).
+
+    Returns ``{'texts': [...], 'stats': {...}}``. The stats are
+    JSON-serializable and go straight into the run record.
+    """
+    texts = list(texts)
+    clean, seen = [], set()
+    n_empty = n_duplicates = n_too_short = n_tokenize_errors = 0
+    for text in texts:
+        s = str(text)
+        if not s.strip():
+            n_empty += 1
+            continue
+        if dedup:
+            key = hashlib.sha256(s.encode('utf-8', 'replace')).digest()
+            if key in seen:
+                n_duplicates += 1
+                continue
+            seen.add(key)
+        try:
+            ids = tokenizer.encode(s, truncation=True,
+                                   max_length=seq_len + 1)
+        except Exception:
+            n_tokenize_errors += 1
+            continue
+        if len(ids) < int(min_tokens):
+            n_too_short += 1
+            continue
+        clean.append(s)
+    n_raw = len(texts)
+    stats = {
+        'n_raw': n_raw,
+        'n_kept': len(clean),
+        'n_empty': n_empty,
+        'n_duplicates': n_duplicates,
+        'n_too_short_to_supervise': n_too_short,
+        'n_tokenize_errors': n_tokenize_errors,
+        'dedup': bool(dedup),
+        'min_tokens': int(min_tokens),
+        'kept_fraction': (len(clean) / n_raw) if n_raw else 0.0,
+    }
+    return {'texts': clean, 'stats': stats}
+
+
+def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0):
+    """Draw and audit the train/val/test split over CLEANED texts.
+
+    The split itself is deterministic (see
+    ``kaggle_setup.split_train_val_test``). On top of the structural
+    audit this verifies that the three text partitions share no exact
+    duplicate — a defense-in-depth check against a future refactor that
+    moves dedup after the split.
+
+    Returns ``(split, report)`` where ``split`` maps split names to index
+    lists and ``report`` is the JSON-serializable audit + overlap report.
+    Raises ``RuntimeError`` on any leakage violation.
+    """
+    split = split_train_val_test(len(texts), val_frac=val_frac,
+                                 test_frac=test_frac, seed=seed)
+    audit = audit_split(split, len(texts))
+    by_split = {k: [texts[i] for i in split[k]]
+                for k in ('train', 'val', 'test')}
+    digests = {k: _text_digests(v) for k, v in by_split.items()}
+    overlaps = {
+        'train_val': len(digests['train'] & digests['val']),
+        'train_test': len(digests['train'] & digests['test']),
+        'val_test': len(digests['val'] & digests['test']),
+    }
+    report = {
+        'seed': int(seed),
+        'val_frac': float(val_frac),
+        'test_frac': float(test_frac),
+        'audit': audit,
+        'exact_text_overlaps': overlaps,
+    }
+    problems = list(audit['problems'])
+    for pair, n_overlap in overlaps.items():
+        if n_overlap:
+            problems.append(
+                f'{pair}: {n_overlap} identical text(s) shared across splits')
+    if problems:
+        raise RuntimeError(
+            'train/val/test split failed its leakage audit: '
+            + '; '.join(problems))
+    return split, report
+
+
+def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
+    """Descriptive token-length stats for ONE split (reporting only).
+
+    Computed on a bounded, evenly spaced probe so it stays cheap on a
+    20k-story corpus. This is a distribution-shift DIAGNOSTIC: it is
+    reported in the run record and never used to fit a transformation or
+    to select a model.
+    """
+    n = len(texts)
+    if n == 0:
+        return {'n': 0, 'n_probe': 0, 'mean_tokens': None,
+                'std_tokens': None, 'min_tokens': None, 'max_tokens': None,
+                'cap_frac': None, 'unk_rate': None}
+    if n <= n_probe:
+        probe = list(texts)
+    else:
+        stride = max(1, n // n_probe)
+        probe = [texts[i] for i in range(0, n, stride)][:n_probe]
+    lengths, unk, total = [], 0, 0
+    unk_id = getattr(tokenizer, 'unk_token_id', None)
+    for text in probe:
+        try:
+            ids = tokenizer.encode(text, truncation=True,
+                                   max_length=seq_len + 1)
+        except Exception:
+            continue
+        lengths.append(len(ids))
+        if unk_id is not None:
+            unk += sum(1 for i in ids if i == unk_id)
+            total += len(ids)
+    if not lengths:
+        return {'n': n, 'n_probe': 0, 'mean_tokens': None,
+                'std_tokens': None, 'min_tokens': None, 'max_tokens': None,
+                'cap_frac': None, 'unk_rate': None}
+    mean = sum(lengths) / len(lengths)
+    var = sum((x - mean) ** 2 for x in lengths) / len(lengths)
+    return {
+        'n': n,
+        'n_probe': len(lengths),
+        'mean_tokens': mean,
+        'std_tokens': math.sqrt(var),
+        'min_tokens': min(lengths),
+        'max_tokens': max(lengths),
+        # Proxy for "truncated at the model context": a text encoded with
+        # max_length=seq_len+1 that comes back at the cap may be longer.
+        'cap_frac': sum(1 for x in lengths if x >= seq_len + 1) / len(lengths),
+        'unk_rate': (unk / total) if total else 0.0,
+    }
+
+
+def _distribution_shift(train_stats, other_stats, *, threshold=0.5):
+    """Standardized mean difference (Cohen's d) of token lengths vs train.
+
+    Reports (does not act): a large |d| is a warning that the held-out
+    split is not exchangeable with train, which would make the reported
+    held-out loss hard to interpret. The threshold only sets the
+    ``flag`` field.
+    """
+    m_t, m_o = train_stats.get('mean_tokens'), other_stats.get('mean_tokens')
+    if m_t is None or m_o is None:
+        return {'reference': 'train', 'cohen_d': None, 'abs_cohen_d': None,
+                'flag': None, 'threshold': float(threshold)}
+    s_t = train_stats.get('std_tokens') or 0.0
+    s_o = other_stats.get('std_tokens') or 0.0
+    pooled = math.sqrt((s_t ** 2 + s_o ** 2) / 2.0)
+    d = (m_o - m_t) / pooled if pooled > 0 else 0.0
+    return {
+        'reference': 'train',
+        'cohen_d': d,
+        'abs_cohen_d': abs(d),
+        'flag': abs(d) >= threshold,
+        'threshold': float(threshold),
+    }
+
+
+class SealedTestSet:
+    """One-shot accessor for the held-out test split.
+
+    The test set must stay untouched until the final model (selected on
+    validation) is frozen, then be evaluated exactly once: each extra
+    look turns it into an implicit training signal. ``open()`` enforces
+    the contract mechanically — a second call raises instead of quietly
+    re-evaluating.
+    """
+
+    def __init__(self, factory):
+        if not callable(factory):
+            raise TypeError('SealedTestSet needs a zero-arg factory')
+        self._factory = factory
+        self._opened = False
+
+    @property
+    def opened(self):
+        return self._opened
+
+    def open(self):
+        if self._opened:
+            raise RuntimeError(
+                'the test split has already been opened; it must be '
+                'evaluated exactly once, after validation-based model '
+                'selection and early stopping are finished')
+        self._opened = True
+        return self._factory()
+
+
+@torch.no_grad()
+def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
+                     max_batches=None, use_amp=False, autocast_dtype=None):
+    """Token-weighted mean cross-entropy loss of ``model`` on ``dataset``.
+
+    Deterministic, read-only evaluation used for validation monitoring,
+    early stopping and the single final test evaluation:
+
+      * ``shuffle=False``: the same items in the same order every call,
+        so a validation-loss curve across checkpoints is comparable and
+        the result is reproducible;
+      * ``torch.no_grad()`` + ``model.eval()``: no gradient, no weight
+        update, no optimizer step — evaluation can never fit anything;
+      * the DataLoader is given a DEDICATED generator: PyTorch draws one
+        base-seed number per iterator construction even with
+        ``shuffle=False``/``num_workers=0``, and without this it would
+        come from the global torch RNG and perturb the training stream.
+        The dedicated generator is created fresh from a fixed seed each
+        call, so evaluation is deterministic AND RNG-neutral;
+      * ``max_batches`` caps the token budget; the mean is weighted by
+        the number of UNMASKED tokens, so a capped pass is still an
+        unbiased token-level estimate of the full split.
+
+    Returns a JSON-serializable report. ``loss`` / ``perplexity`` are
+    ``None`` when the dataset has no supervised tokens.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    eval_gen = torch.Generator()
+    eval_gen.manual_seed(0)
+    loader = DataLoader(dataset, batch_size=int(batch_size), shuffle=False,
+                        num_workers=0, generator=eval_gen)
+    was_training = model.training
+    model.eval()
+    total_nll, total_tokens = 0.0, 0
+    n_batches = n_sequences = 0
+    try:
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            n_tok = int((labels != -100).sum())
+            if n_tok == 0:
+                continue
+            model.hybrid.reset_state()
+            with torch.autocast(device_type=device.type,
+                                dtype=autocast_dtype or torch.float32,
+                                enabled=bool(use_amp)):
+                out = model(input_ids, labels=labels)
+            loss = out["loss"]
+            if loss is None or not torch.isfinite(loss):
+                raise RuntimeError(
+                    f'non-finite held-out LM loss ({loss}) during '
+                    f'evaluation; refusing to report a corrupted metric')
+            total_nll += float(loss.detach()) * n_tok
+            total_tokens += n_tok
+            n_batches += 1
+            n_sequences += int(input_ids.shape[0])
+            if max_batches is not None and n_batches >= int(max_batches):
+                break
+    finally:
+        model.train(was_training)
+    mean_loss = (total_nll / total_tokens) if total_tokens else None
+    return {
+        'loss': mean_loss,
+        'perplexity': (math.exp(min(mean_loss, 700.0))
+                       if mean_loss is not None else None),
+        'n_batches': n_batches,
+        'n_sequences': n_sequences,
+        'n_tokens': total_tokens,
+        'max_batches': (None if max_batches is None else int(max_batches)),
+        'batch_size': int(batch_size),
+        # Read-only contract: spelled out so an artifact reader can verify
+        # the metric's provenance.
+        'shuffle': False,
+        'grad_enabled': False,
+    }
+
 
 class LMWithHybrid(nn.Module):
     def __init__(self, vocab_size, cfg: HybridConfig):
@@ -417,6 +772,28 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints_lm")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for model init and DataLoader shuffle.")
+    parser.add_argument("--val_frac", type=float, default=0.1,
+                        help="Fraction of the cleaned corpus held out as the "
+                             "validation split (model selection + early "
+                             "stopping). Default 0.1.")
+    parser.add_argument("--test_frac", type=float, default=0.1,
+                        help="Fraction of the cleaned corpus sealed as the "
+                             "test split (opened exactly once, after the "
+                             "model is frozen). Default 0.1.")
+    parser.add_argument("--val_every", type=int, default=100,
+                        help="Run a validation pass every N optimizer steps "
+                             "(default 100); a validation pass also runs at "
+                             "step 0 and after the final step.")
+    parser.add_argument("--eval_max_batches", type=int, default=64,
+                        help="Cap the number of batches per validation/test "
+                             "pass for a bounded compute budget (default 64; "
+                             "0 = evaluate the full split).")
+    parser.add_argument("--early_stop_patience", type=int, default=5,
+                        help="Stop training after this many consecutive "
+                             "validation checks without improvement "
+                             "(default 5; 0 disables early stopping). The "
+                             "best validation checkpoint is always kept and "
+                             "used for the single final test evaluation.")
     parser.add_argument("--consistency_check", action="store_true",
                         help="Load --checkpoint, run the prefill-decode "
                              "consistency + decode-roofline probe, then exit "
@@ -446,6 +823,21 @@ def main():
                         help="Run ONLY the overfit sanity gate (no full "
                              "training); useful as a fast smoke test.")
     args = parser.parse_args()
+
+    # All three splits are mandatory: without validation there is no
+    # leakage-safe model selection / early stopping, and without a sealed
+    # test split the reported generalization number is not held out.
+    if not 0.0 < args.val_frac < 1.0 or not 0.0 < args.test_frac < 1.0:
+        raise SystemExit("--val_frac and --test_frac must be in (0, 1)")
+    if args.val_frac + args.test_frac >= 1.0:
+        raise SystemExit("--val_frac + --test_frac must leave a positive "
+                         "train fraction")
+    if args.val_every < 0:
+        raise SystemExit("--val_every must be >= 0")
+    if args.eval_max_batches < 0:
+        raise SystemExit("--eval_max_batches must be >= 0")
+    if args.early_stop_patience < 0:
+        raise SystemExit("--early_stop_patience must be >= 0")
 
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
     info = configure_torch_for_device()
@@ -513,11 +905,65 @@ def main():
     print(f"Training profile: batch_size={batch_size}, grad_accum={grad_accum}, "
           f"seq_len={seq_len}, optimizer_steps={max_steps}, seed={args.seed}")
 
-    max_train_samples = 20000 if not is_kaggle else 5000
-    ds = TinyStoriesLM(tokenizer, seq_len=seq_len,
-                       max_samples=max_train_samples)
-    print(f"Data: {ds.data_source}, n={len(ds)}, "
-          f"fingerprint={ds.data_fingerprint[:16]}...")
+    # ------------------------------------------------------------------
+    # Data: load -> clean -> split (in this order) -> audit.
+    #
+    # The corpus budget is scaled so the TRAIN split keeps the historical
+    # row budget (20000 local / 5000 Kaggle): holding out 10% val + 10%
+    # test must not silently shrink the training set.
+    # ------------------------------------------------------------------
+    train_budget = 20000 if not is_kaggle else 5000
+    train_frac = 1.0 - args.val_frac - args.test_frac
+    corpus_budget = int(math.ceil(train_budget / train_frac))
+    raw_texts, data_source = _load_raw_texts(corpus_budget, split="train")
+    cleaning = clean_lm_texts(raw_texts, tokenizer, seq_len)
+    clean_texts = cleaning['texts']
+    if len(clean_texts) < 10:
+        raise SystemExit(
+            f"only {len(clean_texts)} usable documents after cleaning "
+            f"(raw={len(raw_texts)}); refusing to train on a degenerate "
+            f"corpus")
+    split, split_report = split_clean_texts(
+        clean_texts, val_frac=args.val_frac, test_frac=args.test_frac,
+        seed=args.seed)
+    train_texts = [clean_texts[i] for i in split['train']]
+    val_texts = [clean_texts[i] for i in split['val']]
+    test_indices = list(split['test'])
+
+    # Per-split length/unk statistics. Descriptive distribution-shift
+    # diagnostics ONLY; they are never fitted or applied to features. The
+    # test split's stats are computed with its single evaluation at the
+    # very end (see below) — not here.
+    stats_train = _text_length_stats(train_texts, tokenizer, seq_len)
+    stats_val = _text_length_stats(val_texts, tokenizer, seq_len)
+    shift_val = _distribution_shift(stats_train, stats_val)
+
+    ds = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=train_texts,
+                       split="train", name="train")
+    val_ds = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=val_texts,
+                           split="validation", name="val")
+    # The test split stays unopened until the model is frozen. Only a
+    # factory (plus the index list) exists during training.
+    sealed_test = SealedTestSet(
+        lambda: TinyStoriesLM(
+            tokenizer, seq_len=seq_len,
+            texts=[clean_texts[i] for i in test_indices],
+            split="test", name="test"))
+
+    print(f"Data: {data_source}, raw={len(raw_texts)}, "
+          f"cleaned={len(clean_texts)} "
+          f"(empty={cleaning['stats']['n_empty']}, "
+          f"dup={cleaning['stats']['n_duplicates']}, "
+          f"too_short={cleaning['stats']['n_too_short_to_supervise']})")
+    print(f"Split (seed={args.seed}): train={len(train_texts)} "
+          f"val={len(val_texts)} test={len(test_indices)} "
+          f"[val/test sealed until final evaluation]")
+    print(f"Fingerprints: train={ds.data_fingerprint[:16]}... "
+          f"val={val_ds.data_fingerprint[:16]}...")
+    if shift_val['flag']:
+        print(f"[data] WARNING: val token-length distribution differs from "
+              f"train (Cohen's d={shift_val['cohen_d']:.3f}); the held-out "
+              f"loss may not be exchangeable with train")
     loader_gen = torch.Generator()
     loader_gen.manual_seed(args.seed + 1_000_000)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
@@ -631,12 +1077,58 @@ def main():
         'autocast_dtype': str(autocast_dtype),
         'kda_backend': kda_backend,
         'model_config': dict(cfg.__dict__),
+        # Held-out protocol (recorded with the recipe so a reader knows
+        # exactly how model selection and the final number were obtained).
+        'val_every': int(args.val_every),
+        'eval_max_batches': int(args.eval_max_batches),
+        'early_stop_patience': int(args.early_stop_patience),
+        'model_selection': 'min token-weighted validation loss',
     }
     data_record = {
-        'source': ds.data_source,
-        'split': ds.split,
-        'max_samples_budget': max_train_samples,
-        'n_samples': len(ds),
+        'source': data_source,
+        'split': 'train (carved from the raw train split after cleaning)',
+        'cleaning': cleaning['stats'],
+        'raw_corpus_budget': corpus_budget,
+        'train_row_budget': train_budget,
+        'split_protocol': {
+            'order': ('load -> clean (dedup) -> split -> audit -> train; '
+                      'test stays sealed until the model is frozen'),
+            'seed': args.seed,
+            'val_frac': float(args.val_frac),
+            'test_frac': float(args.test_frac),
+            'chronological': False,
+            'group_ids': None,
+            'note': ('Story-level deterministic split drawn with a '
+                     'dedicated random.Random(seed), so the global RNG '
+                     'streams driving model init / training batches are '
+                     'untouched. No fitted preprocessing transform exists '
+                     'in this pipeline; were one added (e.g. a tokenizer '
+                     'or length normalizer), it must be fitted on train '
+                     'indices only.'),
+        },
+        'splits': {
+            'train': {
+                'n': len(train_texts),
+                'content_fingerprint_sha256': ds.data_fingerprint,
+                'token_length_stats': stats_train,
+            },
+            'val': {
+                'n': len(val_texts),
+                'content_fingerprint_sha256': val_ds.data_fingerprint,
+                'token_length_stats': stats_val,
+            },
+            'test': {
+                'n': len(test_indices),
+                'content_fingerprint_sha256': None,
+                'token_length_stats': None,
+                'sealed_until_final_evaluation': True,
+            },
+        },
+        'split_audit': split_report,
+        'distribution_shift': {
+            'val_vs_train': shift_val,
+            'test_vs_train': None,
+        },
         'tokenizer': type(tokenizer).__name__,
         'vocab_size': vocab_size,
         'content_fingerprint_sha256': ds.data_fingerprint,
@@ -657,15 +1149,16 @@ def main():
     optimizer_step = 0
     micro_step = 0
 
-    def _checkpoint_payload():
+    def _checkpoint_payload(extra=None):
         """Self-describing checkpoint: weights + recipe + provenance + curve.
 
         Recording the hyperparameters, git revision (and dirty flag), seed
         and the loss history INSIDE each checkpoint means even a crashed run's
         partial checkpoint can be traced back to the exact code/data/recipe
-        that produced it.
+        that produced it. ``extra`` adds per-checkpoint metadata (e.g. the
+        validation loss that selected it).
         """
-        return {
+        payload = {
             "model": model.state_dict(),
             "cfg": cfg.__dict__,
             "vocab": vocab_size,
@@ -680,6 +1173,77 @@ def main():
             "data": data_record,
             "loss_history": list(curve_losses),
         }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    # ------------------------------------------------------------------
+    # Validation-based model selection + early stopping.
+    #
+    # The validation split is used ONLY here and (optionally) to stop
+    # training; the test split is untouched until after this block. The
+    # evaluation is read-only (no optimizer step, no shuffling, no RNG),
+    # so enabling/disabling validation cannot change the training math.
+    # ------------------------------------------------------------------
+    eval_batch_cap = (None if args.eval_max_batches == 0
+                      else int(args.eval_max_batches))
+    best_val = {'loss': float('inf'), 'step': None, 'state': None}
+    val_history = []
+    checks_without_improvement = 0
+    stopped_early = False
+
+    def _run_validation(step):
+        nonlocal checks_without_improvement, stopped_early
+        report = evaluate_lm_loss(
+            model, val_ds, batch_size=batch_size, device=device,
+            max_batches=eval_batch_cap, use_amp=use_amp,
+            autocast_dtype=autocast_dtype)
+        if report['loss'] is None:
+            raise RuntimeError(
+                f'validation split produced no supervised tokens at step '
+                f'{step}; cannot select a model')
+        val_history.append({
+            'step': int(step),
+            'loss': report['loss'],
+            'perplexity': report['perplexity'],
+            'n_batches': report['n_batches'],
+            'n_sequences': report['n_sequences'],
+            'n_tokens': report['n_tokens'],
+        })
+        if report['loss'] < best_val['loss']:
+            best_val['loss'] = report['loss']
+            best_val['step'] = int(step)
+            best_val['state'] = {
+                k: v.detach().to('cpu').clone()
+                for k, v in model.state_dict().items()
+            }
+            checks_without_improvement = 0
+            torch.save(
+                _checkpoint_payload({
+                    'selected_by': 'min_validation_loss',
+                    'val_loss': report['loss'],
+                    'val_perplexity': report['perplexity'],
+                    'val_step': int(step),
+                }),
+                os.path.join(args.output_dir, 'best_val_lm.pt'))
+            print(f"[val] step {step}: loss {report['loss']:.4f}, "
+                  f"ppl {report['perplexity']:.2f} (new best -> "
+                  f"best_val_lm.pt)")
+        else:
+            checks_without_improvement += 1
+            print(f"[val] step {step}: loss {report['loss']:.4f} "
+                  f"(best {best_val['loss']:.4f} @ step {best_val['step']}; "
+                  f"{checks_without_improvement} check(s) without "
+                  f"improvement)")
+            if (args.early_stop_patience
+                    and checks_without_improvement >= args.early_stop_patience):
+                stopped_early = True
+                print(f"[val] early stopping: no improvement for "
+                      f"{checks_without_improvement} consecutive validation "
+                      f"checks (patience {args.early_stop_patience}); "
+                      f"the best validation checkpoint is kept")
+
+    _run_validation(0)
 
     pbar = tqdm(total=max_steps, desc="optimizer steps")
     optimizer.zero_grad(set_to_none=True)
@@ -751,11 +1315,51 @@ def main():
             torch.save(_checkpoint_payload(),
                        os.path.join(args.output_dir, f"step_{optimizer_step}.pt"))
 
+        if args.val_every and optimizer_step % args.val_every == 0:
+            _run_validation(optimizer_step)
+            if stopped_early:
+                break
+
     pbar.close()
     elapsed = time.time() - start
+    if not stopped_early and (not args.val_every
+                              or optimizer_step % args.val_every != 0):
+        _run_validation(optimizer_step)
     print(f"Finished in {elapsed/60:.2f} min")
     torch.save(_checkpoint_payload(),
                os.path.join(args.output_dir, "final_lm.pt"))
+
+    # ------------------------------------------------------------------
+    # The model is now frozen: selection (and any early stopping) used
+    # validation only. Load the val-selected checkpoint and open the
+    # sealed test split EXACTLY ONCE for the final held-out evaluation.
+    # Nothing downstream may use this number to change the model: that is
+    # what keeps the test set a test set.
+    # ------------------------------------------------------------------
+    if best_val['state'] is None:
+        raise RuntimeError(
+            'no validation checkpoint was recorded; refusing to open the '
+            'test split')
+    model.load_state_dict(best_val['state'])
+    model.to(device)
+    model.eval()
+    test_dataset = sealed_test.open()
+    stats_test = _text_length_stats(test_dataset.texts, tokenizer, seq_len)
+    shift_test = _distribution_shift(stats_train, stats_test)
+    test_report = evaluate_lm_loss(
+        model, test_dataset, batch_size=batch_size, device=device,
+        max_batches=eval_batch_cap, use_amp=use_amp,
+        autocast_dtype=autocast_dtype)
+    model.train()
+    print(f"[test] single evaluation of the sealed test split at the "
+          f"val-selected checkpoint (step {best_val['step']}): loss "
+          f"{test_report['loss']:.4f}, ppl {test_report['perplexity']:.2f} "
+          f"over {test_report['n_tokens']} tokens")
+    data_record['splits']['test']['content_fingerprint_sha256'] = \
+        test_dataset.data_fingerprint
+    data_record['splits']['test']['token_length_stats'] = stats_test
+    data_record['splits']['test']['sealed_until_final_evaluation'] = False
+    data_record['distribution_shift']['test_vs_train'] = shift_test
 
     # Persist the full run record (code version + hyperparameters + seed +
     # data version + training curve + final result) next to the checkpoint.
@@ -777,13 +1381,46 @@ def main():
             "loss": curve_losses,
             "elapsed_s": curve_elapsed_s,
         },
+        "validation": {
+            "criterion": "min token-weighted validation loss",
+            "history": val_history,
+            "best": {
+                "loss": best_val['loss'] if best_val['step'] is not None
+                        else None,
+                "step": best_val['step'],
+                "checkpoint": os.path.join(args.output_dir, "best_val_lm.pt"),
+            },
+            "early_stopping": {
+                "enabled": bool(args.early_stop_patience),
+                "patience": int(args.early_stop_patience),
+                "stopped_early": bool(stopped_early),
+                "checks_without_improvement": int(checks_without_improvement),
+            },
+        },
+        "test": {
+            # The single evaluation of the sealed test split, on the model
+            # selected by validation. Recorded under its own key so it can
+            # never be confused with a training or validation metric.
+            "evaluated_once": True,
+            "selection": "min validation loss",
+            "selected_step": best_val['step'],
+            "selected_checkpoint": os.path.join(args.output_dir,
+                                                "best_val_lm.pt"),
+            "report": test_report,
+            "note": ("The test split was opened exactly once, after model "
+                     "selection and early stopping were finished; its "
+                     "metric must not be used for any further tuning."),
+        },
         "final": {
             "optimizer_step": optimizer_step,
             "micro_step": micro_step,
             "last_loss": curve_losses[-1] if curve_losses else None,
             "mean_last10_loss": mean_last10,
             "checkpoint": os.path.join(args.output_dir, "final_lm.pt"),
+            "checkpoint_best_val": os.path.join(args.output_dir,
+                                                "best_val_lm.pt"),
             "completed": optimizer_step >= max_steps,
+            "stopped_early": bool(stopped_early),
         },
     }
     record_path = os.path.join(args.output_dir, "run_record.json")
@@ -791,9 +1428,12 @@ def main():
     print(f"[run-record] wrote {record_path}")
 
     if not args.skip_consistency_check:
+        # Probing the val-selected weights (the model currently in memory
+        # for the test evaluation), so the audit matches the checkpoint
+        # the test number was produced with.
         report = run_decode_consistency_probe(
             model, device, seq_len, args.output_dir, seed=args.seed)
-        _print_consistency_report(report, title="final_lm.pt")
+        _print_consistency_report(report, title="best_val_lm.pt")
 
 if __name__ == "__main__":
     main()

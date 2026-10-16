@@ -28,16 +28,28 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    audit_split,
     make_seeded_generator,
     seed_worker,
     set_global_seed,
+    split_train_val_test,
 )
 from ops_fused import HybridConfig  # noqa: E402
 from run_quality import (  # noqa: E402
     train_one,
     run_overfit_sanity_check as run_mqar_overfit_sanity_check,
 )
-from train_lm_autodl import LMWithHybrid, run_overfit_sanity_check  # noqa: E402
+import train_lm_autodl  # noqa: E402
+from train_lm_autodl import (  # noqa: E402
+    LMWithHybrid,
+    SealedTestSet,
+    TinyStoriesLM,
+    _FallbackCharTokenizer,
+    clean_lm_texts,
+    evaluate_lm_loss,
+    run_overfit_sanity_check,
+    split_clean_texts,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -270,3 +282,223 @@ def test_lm_overfit_gate_does_not_perturb_model_init():
     after = construct()
     assert baseline.keys() == after.keys()
     assert all(torch.equal(baseline[k], after[k]) for k in baseline)
+
+
+# ---------------------------------------------------------------------------
+# Leakage-safe train/val/test splitting and data cleaning
+# ---------------------------------------------------------------------------
+
+def test_split_train_val_test_is_disjoint_complete_and_deterministic():
+    split = split_train_val_test(100, val_frac=0.2, test_frac=0.1, seed=3)
+    assert {k: len(v) for k, v in split.items()} == {
+        'train': 70, 'val': 20, 'test': 10}
+    report = audit_split(split, 100)
+    assert report['ok'], report['problems']
+    assert report['pairwise_disjoint'] and report['complete']
+    assert report['non_empty']
+    # Deterministic for the same seed, different for another seed.
+    again = split_train_val_test(100, val_frac=0.2, test_frac=0.1, seed=3)
+    assert split == again
+    other = split_train_val_test(100, val_frac=0.2, test_frac=0.1, seed=4)
+    assert other != split
+    # Drawing a split must not touch the global torch RNG stream.
+    state = torch.get_rng_state()
+    try:
+        split_train_val_test(50, seed=11)
+        assert torch.equal(state, torch.get_rng_state())
+    finally:
+        torch.set_rng_state(state)
+
+
+def test_split_chronological_never_shuffles():
+    split = split_train_val_test(100, val_frac=0.2, test_frac=0.1, seed=0,
+                                 chronological=True)
+    # Past -> train, next block -> val, most recent block -> test.
+    assert split['train'] == list(range(70))
+    assert split['val'] == list(range(70, 90))
+    assert split['test'] == list(range(90, 100))
+    # Changing the seed must not reorder a chronological split.
+    assert split_train_val_test(100, val_frac=0.2, test_frac=0.1, seed=99,
+                                chronological=True) == split
+
+
+def test_split_keeps_groups_whole():
+    # 12 groups of varying sizes, interleaved in the row order.
+    group_sizes = [1, 5, 2, 8, 3, 1, 4, 2, 6, 1, 3, 9]
+    group_ids = []
+    for g, size in enumerate(group_sizes):
+        group_ids.extend([f'user{g}'] * size)
+    n = len(group_ids)
+    split = split_train_val_test(n, val_frac=0.2, test_frac=0.2, seed=5,
+                                 group_ids=group_ids)
+    report = audit_split(split, n, group_ids=group_ids)
+    assert report['ok'], report['problems']
+    assert report['group_integrity']
+    # Explicit re-check: every group lives entirely on one side.
+    for g in set(group_ids):
+        members = {i for i, gg in enumerate(group_ids) if gg == g}
+        assert all(members <= set(split[k]) for k in ('train', 'val', 'test')
+                   if members & set(split[k]))
+
+
+def test_audit_split_detects_overlap_and_missing_rows():
+    bad = {'train': [0, 1, 2, 2], 'val': [2, 3], 'test': [4]}
+    report = audit_split(bad, 6)
+    assert not report['ok']
+    assert not report['pairwise_disjoint']
+    assert any('overlap' in p for p in report['problems'])
+    assert any('duplicate' in p for p in report['problems'])
+    assert any('not assigned' in p for p in report['problems'])
+    # A group straddling two splits is flagged too.
+    straddling = {'train': [0, 1], 'val': [2], 'test': [3]}
+    report = audit_split(straddling, 4, group_ids=['a', 'a', 'b', 'b'])
+    assert not report['ok'] and not report['group_integrity']
+
+
+def test_clean_lm_texts_drops_empty_duplicates_and_unlearnable():
+    tok = _FallbackCharTokenizer()
+    texts = ['hello world', 'hello world', '   ', '', 'x', 'abc def']
+    result = clean_lm_texts(texts, tok, seq_len=16)
+    assert result['texts'] == ['hello world', 'abc def']
+    stats = result['stats']
+    assert stats['n_raw'] == 6
+    assert stats['n_kept'] == 2
+    assert stats['n_empty'] == 2
+    assert stats['n_duplicates'] == 1
+    assert stats['n_too_short_to_supervise'] == 1
+    json.dumps(stats, allow_nan=False)
+
+
+def test_split_clean_texts_has_no_cross_split_overlap():
+    tok = _FallbackCharTokenizer()
+    texts = [f'unique story number {i}' for i in range(200)]
+    # Inject exact duplicates in the raw list; cleaning must remove them
+    # BEFORE the split, otherwise the same text could land on two sides.
+    texts.extend(texts[:50])
+    cleaned = clean_lm_texts(texts, tok, seq_len=32)['texts']
+    assert len(cleaned) == 200
+    split, report = split_clean_texts(cleaned, val_frac=0.2, test_frac=0.2,
+                                      seed=1)
+    assert report['audit']['ok'], report['audit']['problems']
+    assert report['exact_text_overlaps'] == {
+        'train_val': 0, 'train_test': 0, 'val_test': 0}
+    # The three text partitions are disjoint by construction.
+    by_split = {k: {cleaned[i] for i in split[k]} for k in split}
+    assert not (by_split['train'] & by_split['val'])
+    assert not (by_split['train'] & by_split['test'])
+    assert not (by_split['val'] & by_split['test'])
+
+
+def test_sealed_test_set_opens_exactly_once():
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return 'test-dataset'
+
+    sealed = SealedTestSet(factory)
+    assert sealed.opened is False
+    assert sealed.open() == 'test-dataset'
+    assert sealed.opened is True
+    with pytest.raises(RuntimeError):
+        sealed.open()
+    assert calls == [1]
+
+
+def test_lm_dataset_masks_padding_labels():
+    tok = _FallbackCharTokenizer()
+    ds = TinyStoriesLM(tok, seq_len=16, texts=['abc'], name='train')
+    item = ds[0]
+    assert item['input_ids'].shape == (16,)
+    assert item['labels'].shape == (16,)
+    # 'abc' -> 3 real tokens, so exactly 2 supervised next-token targets;
+    # everything after (padding) is masked out of the loss.
+    supervised = (item['labels'] != -100)
+    assert int(supervised.sum()) == 2
+    assert bool(supervised[:2].all()) and bool((~supervised[2:]).all())
+    # Labels never contain an unsupervised input token id by accident.
+    assert int(item['labels'][-1]) == -100
+
+
+def _tiny_lm_dataset(tokenizer, seq_len=8, n=8):
+    texts = [f'hello world token {i}' for i in range(n)]
+    return TinyStoriesLM(tokenizer, seq_len=seq_len, texts=texts, name='test')
+
+
+def test_evaluate_lm_loss_is_read_only_rng_neutral_and_deterministic():
+    torch.manual_seed(0)
+    tok = _FallbackCharTokenizer()
+    model = LMWithHybrid(len(tok), _tiny_cfg())
+    dataset = _tiny_lm_dataset(tok)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    rng_state = torch.get_rng_state()
+    try:
+        first = evaluate_lm_loss(model, dataset, batch_size=4, device='cpu',
+                                 max_batches=2)
+        assert torch.equal(rng_state, torch.get_rng_state())
+    finally:
+        torch.set_rng_state(rng_state)
+    # Read-only: no optimizer step / no weight update can happen here.
+    assert all(torch.equal(before[k], model.state_dict()[k])
+               for k in before)
+    assert first['shuffle'] is False and first['grad_enabled'] is False
+    assert first['n_tokens'] > 0
+    assert first['loss'] is not None and first['loss'] == first['loss']
+    assert first['perplexity'] is not None and first['perplexity'] > 0
+    # Deterministic across calls (fixed order, fixed generator).
+    second = evaluate_lm_loss(model, dataset, batch_size=4, device='cpu',
+                              max_batches=2)
+    assert first == second
+    # The model's train/eval flag is restored.
+    assert model.training is True
+
+
+def test_main_requires_nonzero_val_and_test_fractions(monkeypatch):
+    for flag in ('--val_frac', '--test_frac'):
+        monkeypatch.setattr(sys, 'argv',
+                            ['train_lm_autodl.py', flag, '0'])
+        with pytest.raises(SystemExit):
+            train_lm_autodl.main()
+
+
+def test_main_early_stops_on_validation_and_tests_once(monkeypatch, tmp_path):
+    # Full training entry point on the offline path, with the validation
+    # loss forced constant: after the (unbeatable) step-0 check, patience
+    # must stop training, the step-0 checkpoint must be kept, and the
+    # sealed test split must still be evaluated exactly once on it.
+    import json as _json
+
+    def fake_eval(model, dataset, **kwargs):
+        return {'loss': 5.0, 'perplexity': 148.4, 'n_batches': 1,
+                'n_sequences': 2, 'n_tokens': 30, 'max_batches': 1,
+                'batch_size': 2, 'shuffle': False, 'grad_enabled': False}
+
+    monkeypatch.setattr(train_lm_autodl, 'evaluate_lm_loss', fake_eval)
+    monkeypatch.setattr(
+        train_lm_autodl, '_load_raw_texts',
+        lambda max_samples, split='train': (
+            [f'unique story number {i} for training' for i in range(60)],
+            'synthetic:test'))
+    monkeypatch.setattr(sys, 'argv', [
+        'train_lm_autodl.py', '--kaggle', '--max_steps', '10',
+        '--seq_len', '8', '--batch_size', '2', '--val_every', '1',
+        '--eval_max_batches', '1', '--early_stop_patience', '2',
+        '--skip_overfit_check', '--skip_consistency_check',
+        '--output_dir', str(tmp_path), '--seed', '3',
+    ])
+    train_lm_autodl.main()
+
+    record = _json.loads((tmp_path / 'run_record.json').read_text())
+    assert record['final']['stopped_early'] is True
+    assert record['final']['completed'] is False
+    assert record['final']['optimizer_step'] == 2
+    assert record['validation']['early_stopping']['stopped_early'] is True
+    assert record['validation']['best']['step'] == 0
+    assert record['test']['evaluated_once'] is True
+    assert record['test']['selected_step'] == 0
+    assert record['test']['report']['loss'] == 5.0
+    # The split itself was audited and the cleaning step ran before it.
+    assert record['data']['split_audit']['audit']['ok'] is True
+    assert record['data']['cleaning']['n_kept'] == 60
+    assert record['data']['splits']['test']['sealed_until_final_evaluation'] \
+        is False

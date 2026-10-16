@@ -964,6 +964,253 @@ def make_seeded_generator(seed: int, device=None):
         return g
 
 
+# --------------------------------------------------------------------------
+# Leakage-safe train / validation / test splitting
+# --------------------------------------------------------------------------
+#
+# Scientific-methodology contract enforced by these helpers:
+#
+#   * The split is drawn BEFORE any fitted preprocessing. Any statistic
+#     used to transform features (mean/std for standardization, min/max
+#     for scaling, median for imputation, ...) must be computed on the
+#     TRAIN indices only and then applied to val/test. These helpers only
+#     partition indices, so there is nothing to fit here; the contract is
+#     written down so callers apply it downstream.
+#   * ``chronological=True`` partitions by position (past -> train,
+#     then val, then the most recent data as test) and NEVER shuffles.
+#     Within-training batch shuffling of the train partition is still
+#     allowed and expected (it does not move information across splits).
+#   * ``group_ids=...`` keeps every group entirely inside one split:
+#     no individual/entity may straddle train/val/test, otherwise
+#     group-level information (user style, recording session, ...)
+#     leaks across the boundary.
+#   * The split is deterministic for a given ``(n_samples, fractions,
+#     seed, group_ids, chronological)`` and uses its own
+#     ``random.Random(seed)`` instance, so drawing a split never perturbs
+#     the global Python/NumPy/torch RNG streams that drive model init or
+#     training batches.
+#   * ``audit_split`` is the independent verifier: disjointness,
+#     completeness, size sanity and group integrity. Callers should run
+#     it on the returned assignment and abort when it fails.
+
+
+def largest_remainder_sizes(n_units: int, fractions) -> list:
+    """Allocate ``n_units`` units proportionally to ``fractions``.
+
+    Uses the largest-remainder (Hamilton) method: each bucket gets the
+    floor of its exact share, then remaining units go to the buckets with
+    the largest fractional parts (ties broken by bucket order). The
+    returned list sums to exactly ``n_units`` and is deterministic, so a
+    split's sizes are reproducible without any RNG.
+
+    ``fractions`` are normalized to sum to 1 first, so callers may pass
+    any non-negative weights.
+    """
+    import math
+    n_units = int(n_units)
+    if n_units < 0:
+        raise ValueError(f'n_units must be >= 0, got {n_units}')
+    fractions = [float(f) for f in fractions]
+    if not fractions:
+        raise ValueError('fractions must be non-empty')
+    if any(f < 0 for f in fractions):
+        raise ValueError(f'fractions must be non-negative, got {fractions}')
+    total = sum(fractions)
+    if total <= 0:
+        raise ValueError(f'fractions must have a positive sum, got {fractions}')
+    fractions = [f / total for f in fractions]
+    raw = [n_units * f for f in fractions]
+    sizes = [int(math.floor(x)) for x in raw]
+    remainder = n_units - sum(sizes)
+    order = sorted(range(len(fractions)),
+                   key=lambda i: (-(raw[i] - sizes[i]), i))
+    for i in order[:remainder]:
+        sizes[i] += 1
+    return sizes
+
+
+def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
+                         test_frac: float = 0.1, seed: int = 0,
+                         group_ids=None, chronological: bool = False) -> dict:
+    """Partition ``range(n_samples)`` into disjoint train / val / test sets.
+
+    Args:
+        n_samples: number of rows (or, with ``group_ids``, rows total).
+        val_frac: target fraction of rows for validation.
+        test_frac: target fraction for the sealed test set.
+        seed: deterministic seed for the split. A dedicated
+            ``random.Random(seed)`` instance is used, so the global
+            Python/NumPy/torch RNG streams are NOT advanced.
+        group_ids: optional length-``n_samples`` sequence of group labels
+            (user id, document id, recording session, ...). All rows of a
+            group land in the SAME split. With groups, ``val_frac`` /
+            ``test_frac`` are targets at row granularity; the achieved
+            sizes may deviate because whole groups are indivisible.
+        chronological: if True, do not shuffle; earlier rows form the
+            train set, then val, then the most recent rows form the test
+            set. Use this for time series / any data with meaningful
+            order, so the model never sees the future of the data it is
+            validating or testing on.
+
+    Returns:
+        ``{'train': [...], 'val': [...], 'test': [...]}`` with sorted
+        Python-int index lists. The lists are pairwise disjoint and their
+        union is exactly ``range(n_samples)``.
+    """
+    import random
+    n = int(n_samples)
+    if n < 1:
+        raise ValueError(f'n_samples must be >= 1, got {n}')
+    val_frac = float(val_frac)
+    test_frac = float(test_frac)
+    if not 0.0 <= val_frac < 1.0:
+        raise ValueError(f'val_frac must be in [0, 1), got {val_frac}')
+    if not 0.0 <= test_frac < 1.0:
+        raise ValueError(f'test_frac must be in [0, 1), got {test_frac}')
+    train_frac = 1.0 - val_frac - test_frac
+    if train_frac <= 0.0:
+        raise ValueError(
+            f'val_frac + test_frac must leave a positive train fraction, '
+            f'got val={val_frac}, test={test_frac}')
+
+    if group_ids is not None:
+        if len(group_ids) != n:
+            raise ValueError(
+                f'group_ids has length {len(group_ids)} but n_samples={n}')
+        # Stable order of first appearance; chronological mode treats it
+        # as the natural (time) order.
+        order, seen = [], set()
+        members = {}
+        for i, g in enumerate(group_ids):
+            g = str(g)
+            if g not in seen:
+                seen.add(g)
+                order.append(g)
+                members[g] = []
+            members[g].append(i)
+    else:
+        order = list(range(n))
+        members = None
+
+    if not chronological:
+        random.Random(int(seed)).shuffle(order)
+
+    # Target sizes in row units.
+    target_train, target_val, target_test = largest_remainder_sizes(
+        n, [train_frac, val_frac, test_frac])
+
+    # Active buckets = requested buckets (train always active). The last
+    # active bucket absorbs the remainder, so with fractions that round
+    # to zero the empty buckets are skipped entirely instead of stealing
+    # the whole dataset.
+    targets = [target_train, target_val, target_test]
+    buckets = ['train', 'val', 'test']
+    active = [i for i, t in enumerate(targets) if t > 0]
+    result = {'train': [], 'val': [], 'test': []}
+    if not active:
+        # Only possible when n < 1 (guarded above); keep the invariant.
+        result['train'] = list(range(n))
+        return result
+    counts = [0, 0, 0]
+    bucket_ptr = 0
+    for unit in order:
+        while (bucket_ptr < len(active) - 1
+               and counts[active[bucket_ptr]] >=
+               targets[active[bucket_ptr]]):
+            bucket_ptr += 1
+        idx = active[bucket_ptr]
+        if members is None:
+            result[buckets[idx]].append(unit)
+            counts[idx] += 1
+        else:
+            result[buckets[idx]].extend(members[unit])
+            counts[idx] += len(members[unit])
+    for key in result:
+        result[key].sort()
+    return result
+
+
+def audit_split(split: dict, n_samples: int, group_ids=None) -> dict:
+    """Independently verify a train/val/test assignment has no leakage.
+
+    Checks, in order:
+
+      * the three keys exist and hold integer indices in range;
+      * no index is duplicated WITHIN a split, and no index appears in
+        two different splits (cross-split leakage);
+      * every index of ``range(n_samples)`` appears exactly once
+        (silent row loss would bias the evaluation);
+      * train/val/test are non-empty;
+      * if ``group_ids`` is given, no group straddles two splits.
+
+    Returns a JSON-serializable report with ``ok`` plus the individual
+    booleans and a ``problems`` list. Callers should abort on
+    ``ok == False`` instead of training on a compromised split.
+    """
+    problems = []
+    n = int(n_samples)
+    expected_keys = {'train', 'val', 'test'}
+    if set(split) != expected_keys:
+        problems.append(
+            f'split keys must be {sorted(expected_keys)}, got {sorted(split)}')
+    index_sets = {}
+    for key in ('train', 'val', 'test'):
+        idx = list(split.get(key) or [])
+        index_sets[key] = idx
+        if any(not isinstance(i, int) for i in idx):
+            problems.append(f'{key}: non-integer index present')
+        if len(set(idx)) != len(idx):
+            problems.append(f'{key}: duplicate indices within the split')
+        if idx and (min(idx) < 0 or max(idx) >= n):
+            problems.append(f'{key}: index out of range [0, {n})')
+    paired_disjoint = True
+    for a, b in (('train', 'val'), ('train', 'test'), ('val', 'test')):
+        overlap = set(index_sets[a]) & set(index_sets[b])
+        if overlap:
+            paired_disjoint = False
+            problems.append(
+                f'{a}/{b} overlap on {len(overlap)} row(s), '
+                f'first={sorted(overlap)[0]}')
+    union = set()
+    for idx in index_sets.values():
+        union.update(idx)
+    complete = union == set(range(n))
+    if not complete:
+        missing = len(set(range(n)) - union)
+        problems.append(f'{missing} row(s) not assigned to any split')
+    non_empty = all(len(v) > 0 for v in index_sets.values())
+    if not non_empty:
+        empty = [k for k, v in index_sets.items() if not v]
+        problems.append(f'empty split(s): {empty}')
+    groups_ok = True
+    if group_ids is not None:
+        if len(group_ids) != n:
+            groups_ok = False
+            problems.append('group_ids length does not match n_samples')
+        else:
+            group_to_split = {}
+            for key in ('train', 'val', 'test'):
+                for i in index_sets[key]:
+                    g = str(group_ids[i])
+                    prev = group_to_split.get(g)
+                    if prev is not None and prev != key:
+                        groups_ok = False
+                        problems.append(
+                            f'group {g!r} straddles {prev} and {key}')
+                        break
+                    group_to_split[g] = key
+    return {
+        'ok': not problems,
+        'pairwise_disjoint': paired_disjoint,
+        'complete': complete,
+        'non_empty': non_empty,
+        'group_integrity': groups_ok,
+        'n_samples': n,
+        'sizes': {k: len(v) for k, v in index_sets.items()},
+        'problems': problems,
+    }
+
+
 def write_results_json(payload, target_path, *, indent=2, logger=None):
     """Shared "atomic write + sanitize-fallback" helper.
 
