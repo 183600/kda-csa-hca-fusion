@@ -186,9 +186,11 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
 def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
     """One sequential pass of the KDA recurrence (inner-loop body).
 
-    ``q`` is ``[B, T, HV, K]`` (already scaled), ``v`` is ``[B, T, HV, V]``,
-    and the three factor tensors are ``[B, HV, T, K, 1]`` so that ``unbind``
-    yields the exact ``[B, HV, K, 1]`` broadcast shape the loop consumes.
+    ``q`` is ``[B, T, HV, 1, K]`` (already scaled, with the singleton query
+    dim pre-applied so no per-step ``unsqueeze`` is needed), ``v`` is
+    ``[B, T, HV, V]``, and the three factor tensors are ``[B, HV, T, K, 1]``
+    so that ``unbind`` yields the exact ``[B, HV, K, 1]`` broadcast shape
+    the loop consumes.
     """
     outs = []
     for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
@@ -202,7 +204,7 @@ def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
         # Keep the singleton head dim until the single post-loop squeeze:
         # append-and-stack as ``[B, H, 1, V]`` then squeeze(-2) is
         # elementwise-identical to squeezing each step before the stack.
-        outs.append(q_i.unsqueeze(-2) @ S)
+        outs.append(q_i @ S)
     return torch.stack(outs, 1).squeeze(-2), S
 
 
@@ -314,15 +316,19 @@ def naive_recurrent_kda(
             S = S.to(target_state_dtype)
         return o.to(dtype), S
     # Per-step factors hoisted out of the loop and laid out so ``unbind(2)``
-    # yields the ``[B, H, K, 1]`` broadcast shape the loop consumes.
+    # yields the ``[B, H, K, 1]`` broadcast shape the loop consumes; ``q``
+    # carries its singleton query dim from the start so no per-step
+    # ``unsqueeze`` is needed (a view, so the values are unchanged).
+    q_col = q.unsqueeze(-2)
     g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
     k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
     beta_k_col = (beta[..., None] * k).movedim(1, 2).unsqueeze(-1).contiguous()
     loop = _get_scripted_recurrent_loop()
     if loop is not None:
-        o, S = loop(q, k_col, v, g_exp_col, beta_k_col, S)
+        o, S = loop(q_col, k_col, v, g_exp_col, beta_k_col, S)
     else:
-        o, S = _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S)
+        o, S = _recurrent_kda_loop_eager(
+            q_col, k_col, v, g_exp_col, beta_k_col, S)
     if not output_final_state:
         S = None
     else:
@@ -728,15 +734,21 @@ def _chunk_kda_inner_loop(
     by :func:`_chunk_kda_prepare`) is sliced per chunk below.
     """
     chunk_outs = []
+    # The per-chunk gate maps (``exp(g)``, the last-position decay, and the
+    # decay-difference weighted keys) are pure elementwise functions of
+    # ``g`` / ``k``: hoisting them out of the sequential loop (evaluated
+    # vectorized over the chunk axis) computes the exact same fp values —
+    # each chunk then consumes its own slice — while removing several
+    # dispatches per chunk.
+    gexp_all = g.exp()
+    glast_all = gexp_all[..., -1, :].unsqueeze(-1)
+    kexp_all = (g[..., -1:, :] - g).exp() * k
     for i in range(NT):
         q_i = q[:, :, i]
-        k_i = k[:, :, i]
         u_i = u[:, :, i]
-        g_i = g[:, :, i]
         w_i = w[:, :, i]
         v_i = u_i - w_i @ S
-        gexp = g_i.exp()
-        chunk_outs.append((q_i * gexp) @ S + Aqk[:, :, i] @ v_i)
+        chunk_outs.append((q_i * gexp_all[:, :, i]) @ S + Aqk[:, :, i] @ v_i)
         # NOTE: decay direction is ``g_last - g_pos`` (NOT ``g_pos - g_last``).
         # Inside a chunk, position ``c`` contributes to the carried state via
         # ``exp(g_cumsum[last] - g_cumsum[c]) * k_c ⊗ v_c``, where
@@ -747,8 +759,7 @@ def _chunk_kda_inner_loop(
         # matches the upstream FLA reference (fla/ops/kda/naive.py).
         # The contraction over positions computes ``sum_c kexp[c, :] ⊗
         # v[c, :]`` as a matmul.
-        kexp = (g_i[:, :, -1:] - g_i).exp() * k_i
-        S = S * gexp[:, :, -1].unsqueeze(-1) + kexp.transpose(-1, -2) @ v_i
+        S = S * glast_all[:, :, i] + kexp_all[:, :, i].transpose(-1, -2) @ v_i
     return chunk_outs, S
 
 
@@ -781,6 +792,11 @@ def _chunk_kda_inner_loop_recompute(
     """
     chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
+    # Same hoisting as ``_chunk_kda_inner_loop`` (pure elementwise gate
+    # maps, vectorized over the chunk axis; values unchanged).
+    gexp_all = g.exp()
+    glast_all = gexp_all[..., -1, :].unsqueeze(-1)
+    kexp_all = (g[..., -1:, :] - g).exp() * k
     for i in range(NT):
         q_i = q[:, :, i]
         k_i = k[:, :, i]
@@ -796,12 +812,10 @@ def _chunk_kda_inner_loop_recompute(
             Aqk_i[..., j:, j] = (q_i[..., j:, :] * diff.exp() * k_i[..., j:j + 1, :]).sum(-1)
         Aqk_i = Aqk_i.masked_fill(upper_mask, 0)
         v_i = u_i - w_i @ S
-        gexp = g_i.exp()
-        chunk_outs.append((q_i * gexp) @ S + Aqk_i @ v_i)
+        chunk_outs.append((q_i * gexp_all[:, :, i]) @ S + Aqk_i @ v_i)
         # State carry mirrors ``_chunk_kda_inner_loop`` (same per-element
         # operations in the same order).
-        kexp = (g_i[:, :, -1:] - g_i).exp() * k_i
-        S = S * gexp[:, :, -1].unsqueeze(-1) + kexp.transpose(-1, -2) @ v_i
+        S = S * glast_all[:, :, i] + kexp_all[:, :, i].transpose(-1, -2) @ v_i
     return chunk_outs, S
 
 

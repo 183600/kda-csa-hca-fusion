@@ -124,6 +124,7 @@ optional FLA backend (``rwkv_backend='fla'``) is the accelerated path.
 from __future__ import annotations
 
 import math
+import warnings as _warnings
 
 import torch
 import torch.nn as nn
@@ -225,6 +226,61 @@ def validate_rwkv7_geometry(
 # ---------------------------------------------------------------------------
 # Reference recurrence
 # ---------------------------------------------------------------------------
+# The sequential loop body is factored out so it can be TorchScript-compiled
+# once and cached (mirroring the Mamba-2 / KDA scan loops). The eager form
+# runs the same per-element operations in the same order; ``w_exp`` receives
+# the hoisted, already-exponentiated decay (see ``rwkv7_reference_scan``).
+_RWKV7_SCAN_LOOP_SCRIPTED = None
+_RWKV7_SCAN_LOOP_SCRIPTED_FAILED = False
+
+
+def _rwkv7_scan_loop_eager(r, w_exp, k, v, kk, kka, state):
+    """One sequential pass of the RWKV-7 recurrence (inner-loop body).
+
+    The caller passes the per-step views ALREADY unsqueezed to their
+    broadcast shapes (``[B, T, H, K, 1]`` for ``r`` / ``w_exp`` / ``k`` /
+    ``kk`` / ``kka`` and ``[B, T, H, 1, V]`` for ``v``); ``unbind(1)`` then
+    yields the exact per-step operands the recurrence consumes, so no
+    per-step ``unsqueeze`` is needed inside the loop. ``kka`` carries
+    ``-(kk * a)``: negating the product is exact, and ``kka * (-c)`` is
+    bit-for-bit ``(-kka) * c``, so the folded sign does not change any
+    value. ``state`` is the ``[B, H, K, V]`` key-by-value matrix. Returns
+    ``(o, state)`` with ``o`` shaped ``[B, T, H, V]``.
+    """
+    outs = []
+    for r_t, w_t, k_t, v_t, kk_t, kka_t in zip(
+            r.unbind(1), w_exp.unbind(1), k.unbind(1), v.unbind(1),
+            kk.unbind(1), kka.unbind(1)):
+        # contract[v] = -sum_k kk[k] * S[k, v]   (== -(kk^T S))
+        contract = (kk_t * state).sum(dim=-2)                      # [B, H, V]
+        # S = exp(log_w)[k] * S[k, v] + (kk*a)[k] * contract[v] + k[k] * v[v]
+        state = (w_t * state
+                 + kka_t * contract.unsqueeze(-2)
+                 + k_t * v_t)
+        # y[v] = sum_k r[k] * S[k, v]            (== S^T r)
+        outs.append((r_t * state).sum(dim=-2))                     # [B, H, V]
+    return torch.stack(outs, dim=1), state
+
+
+def _get_scripted_rwkv7_scan_loop():
+    """Lazily ``torch.jit.script`` the loop body, with eager fallback.
+
+    The compiled form is cached and reused across calls (the loop is
+    shape/dtype-generic); on builds where scripting fails, the eager loop is
+    used instead.
+    """
+    global _RWKV7_SCAN_LOOP_SCRIPTED, _RWKV7_SCAN_LOOP_SCRIPTED_FAILED
+    if _RWKV7_SCAN_LOOP_SCRIPTED is None and not _RWKV7_SCAN_LOOP_SCRIPTED_FAILED:
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _RWKV7_SCAN_LOOP_SCRIPTED = torch.jit.script(
+                    _rwkv7_scan_loop_eager)
+        except Exception:
+            _RWKV7_SCAN_LOOP_SCRIPTED_FAILED = True
+    return _RWKV7_SCAN_LOOP_SCRIPTED
+
+
 def rwkv7_reference_scan(
     r: torch.Tensor,
     log_w: torch.Tensor,
@@ -309,29 +365,32 @@ def rwkv7_reference_scan(
         state = initial_state.to(device=v.device, dtype=compute_dtype)
 
     r_c = r_c * scale
-    # (kk * a) is reused every step; hoist the product.
-    kka_c = kk_c * a_c
+    # (kk * a) is reused every step; hoist the product. The sign is folded
+    # into ``kka`` so the readout contract needs no in-loop negation (exact
+    # sign flips only — see ``_rwkv7_scan_loop_eager``).
+    kka_c = -(kk_c * a_c)
+    # ``exp(log_w)`` is an elementwise map, so evaluating it once vectorized
+    # over the time axis computes exactly the same fp values as the per-step
+    # ``w_t.exp()`` it replaces (each element rounds identically); only the
+    # dispatch count changes. The per-step update below keeps the original
+    # operand association ``(w*S + kka*contract) + k*v``. The singleton
+    # broadcast dims are pre-applied before ``unbind`` for the same reason.
+    w_exp_c = w_c.exp().unsqueeze(-1)
+    r_c = r_c.unsqueeze(-1)
+    k_c = k_c.unsqueeze(-1)
+    v_c = v_c.unsqueeze(-2)
+    kk_c = kk_c.unsqueeze(-1)
+    kka_c = kka_c.unsqueeze(-1)
 
-    outputs = []
-    for t in range(T):
-        r_t = r_c[:, t]            # [B, H, K]
-        k_t = k_c[:, t]            # [B, H, K]
-        v_t = v_c[:, t]            # [B, H, V]
-        kk_t = kk_c[:, t]          # [B, H, K]
-        kka_t = kka_c[:, t]        # [B, H, K]
-        w_t = w_c[:, t]            # [B, H, K]  (log decay)
-
-        # contract[v] = -sum_k kk[k] * S[k, v]   (== -(kk^T S))
-        contract = -(kk_t.unsqueeze(-1) * state).sum(dim=-2)       # [B, H, V]
-        # S = exp(log_w)[k] * S[k, v] + (kk*a)[k] * contract[v] + k[k] * v[v]
-        state = (w_t.exp().unsqueeze(-1) * state
-                 + kka_t.unsqueeze(-1) * contract.unsqueeze(-2)
-                 + k_t.unsqueeze(-1) * v_t.unsqueeze(-2))
-        # y[v] = sum_k r[k] * S[k, v]            (== S^T r)
-        y_t = (r_t.unsqueeze(-1) * state).sum(dim=-2)              # [B, H, V]
-        outputs.append(y_t)
-
-    o = torch.stack(outputs, dim=1) if T > 0 else v.new_zeros(B, 0, H, V)
+    if T == 0:
+        o = v.new_zeros(B, 0, H, V)
+        return o.to(out_dtype), state if output_final_state else None
+    loop = _get_scripted_rwkv7_scan_loop()
+    if loop is not None:
+        o, state = loop(r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
+    else:
+        o, state = _rwkv7_scan_loop_eager(
+            r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
     return o.to(out_dtype), state if output_final_state else None
 
 
