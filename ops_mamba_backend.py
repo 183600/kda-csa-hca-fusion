@@ -330,11 +330,19 @@ class OfficialMamba2Mixer(nn.Module):
                     B, self.nheads, self.headdim, self.d_state,
                     device=x.device, dtype=compute_dtype)
             new_conv = conv_state
-            if new_conv is not None and new_conv.shape[0] == B:
-                new_conv = new_conv.to(device=x.device, dtype=x.dtype)
-                if detach_lookback:
-                    new_conv = new_conv.detach()
-                new_conv = new_conv.clone()
+            if new_conv is not None:
+                if new_conv.shape[0] != B:
+                    # A different batch cannot be resumed; the reference
+                    # Mixer / KDAHybridLayer contract nulls the lookback
+                    # (the T > 1 path below also starts fresh on a batch
+                    # change) instead of returning a state of the wrong
+                    # batch size.
+                    new_conv = None
+                else:
+                    new_conv = new_conv.to(device=x.device, dtype=x.dtype)
+                    if detach_lookback:
+                        new_conv = new_conv.detach()
+                    new_conv = new_conv.clone()
             return x.new_zeros(B, 0, d), new_state, new_conv
 
         if T > 1 and (state is not None or conv_state is not None):
