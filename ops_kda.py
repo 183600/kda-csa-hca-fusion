@@ -17,6 +17,7 @@ forget gate per head).
 
 from __future__ import annotations
 
+import sys
 import warnings as _warnings
 
 import torch
@@ -129,19 +130,26 @@ def _compute_dtype(dtype):
 
 def _is_compiling_safely() -> bool:
     """Return True if we are inside a torch.compile / torch.export trace."""
-    try:
-        # Probe torch._dynamo FIRST. ``torch._dynamo.is_compiling()`` is
-        # tracable inside a ``fullgraph=True`` compile on every supported
-        # torch release (2.2+), whereas attribute access on
-        # ``torch.compiler.is_compiling`` raises InternalTorchDynamoError on
-        # torch 2.2 (the attribute exists only from 2.3, and touching it in a
-        # traced function aborts the compile). Reordering the probes keeps the
-        # fullgraph compile on 2.2 from failing on the guard itself.
-        import torch._dynamo as _dm
-        if callable(_dm.is_compiling):
-            return bool(_dm.is_compiling())
-    except Exception:
-        pass
+    # Only probe ``torch._dynamo`` when it has ALREADY been imported:
+    # outside a dynamo trace the module is not needed, and importing it
+    # eagerly costs ~0.9s on the first call (it pulls in the
+    # distributed/sympy dependency tree). A live dynamo trace implies the
+    # module is present in ``sys.modules``, so the semantics below are
+    # unchanged.
+    _dm = sys.modules.get('torch._dynamo')
+    if _dm is not None:
+        try:
+            # Probe torch._dynamo FIRST. ``torch._dynamo.is_compiling()`` is
+            # tracable inside a ``fullgraph=True`` compile on every supported
+            # torch release (2.2+), whereas attribute access on
+            # ``torch.compiler.is_compiling`` raises InternalTorchDynamoError on
+            # torch 2.2 (the attribute exists only from 2.3, and touching it in a
+            # traced function aborts the compile). Reordering the probes keeps the
+            # fullgraph compile on 2.2 from failing on the guard itself.
+            if callable(_dm.is_compiling):
+                return bool(_dm.is_compiling())
+        except Exception:
+            pass
     try:
         return torch.compiler.is_compiling()  # type: ignore[attr-defined]
     except Exception:

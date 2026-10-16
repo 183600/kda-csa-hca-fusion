@@ -189,13 +189,26 @@ def _mamba2_scan_loop_eager(x_outer, dt_slab, A_c, C_h, D_c, x_slab, S):
     """
     ys: list[torch.Tensor] = []
     T = x_outer.shape[1]
+    # Per-step views are created once outside the loop (``unbind`` yields
+    # the same views as the former in-loop ``[:, t]`` indexing, sharing the
+    # storage), so the loop body only dispatches the arithmetic. ``dt_col``
+    # / ``D_col`` / ``A_col`` carry the singleton broadcast dims, hoisting
+    # the per-step ``[:, :, None, None]`` / ``[:, None]`` views too.
+    x_outer_steps = x_outer.unbind(1)
+    dt_col_steps = dt_slab.unsqueeze(-1).unsqueeze(-1).unbind(1)
+    C_steps = C_h.unsqueeze(-2).unbind(1)
+    x_steps = x_slab.unbind(1)
+    D_col = D_c[:, None]
+    A_col = A_c.reshape(1, A_c.shape[0], 1, 1)
     for t in range(T):
-        # Per-head decay exp(dt * A) in (0, 1): [batch, nheads]
-        decay = torch.exp(dt_slab[:, t] * A_c)
-        S = (decay[:, :, None, None] * S
-             + dt_slab[:, t, :, None, None] * x_outer[:, t])
-        y_t = (torch.einsum('bhdn,bhn->bhd', S, C_h[:, t])
-               + D_c[:, None] * x_slab[:, t])
+        # Per-head decay exp(dt * A) in (0, 1): [batch, nheads, 1, 1]
+        decay = torch.exp(dt_col_steps[t] * A_col)
+        S = decay * S + dt_col_steps[t] * x_outer_steps[t]
+        # ``einsum('bhdn,bhn->bhd', S, C)`` written as the equivalent
+        # explicit matmul (the same ``bmm`` contraction over ``n``, without
+        # einsum's per-step dispatch overhead).
+        y_t = ((C_steps[t] @ S.transpose(-1, -2)).squeeze(-2)
+               + D_col * x_steps[t])
         ys.append(y_t)
     return torch.stack(ys, dim=1), S
 
