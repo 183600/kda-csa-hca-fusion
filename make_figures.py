@@ -1060,6 +1060,154 @@ def fig_budget_frontier():
     print('Saved figures/fig_budget_frontier.pdf')
 
 
+def fig_quality_latency():
+    """Quality-vs-latency scatter (framework design: the cost side of the
+    quality/cost frontier).
+
+    Joins Exp 4's per-operator MQAR accuracy with the matching Exp 2
+    prefill latency (at the largest measured T, end-to-end single-layer
+    rows where available) and Exp 6's per-token decode latency (at the
+    largest prefill length). Each panel degrades independently when its
+    results file is absent. The point is the FRONTIER (does the extra
+    accuracy of operator X cost more latency than operator Y's?), not the
+    individual dots, so both axes are annotated with their measurement
+    boundary caveats from the README's fairness notes.
+    """
+    quality = [r for r in load('exp4_mqar.json')
+               if isinstance(r, dict) and 'error' not in r]
+    if not quality:
+        print('[fig_quality_latency] no exp4 quality rows; skipping.')
+        return
+    bench = [r for r in load('exp2_benchmark.json')
+             if isinstance(r, dict) and 'error' not in r]
+    decoding = [r for r in load('exp6_decoding.json')
+                if isinstance(r, dict) and 'error' not in r]
+
+    # exp4 op name -> exp2 row name (single-layer end-to-end boundary
+    # preferred; kda's reference recurrence row stands in for the kda op).
+    bench_name = {'softmax': 'softmax', 'kda': 'kda_rec',
+                  'mamba2': 'mamba2_layer', 'csa': 'csa', 'hca': 'hca'}
+    decode_name = {'softmax': 'softmax', 'kda': 'kda', 'mamba2': 'mamba2',
+                   'csa': 'csa', 'hca': 'hca'}
+
+    # Accuracy per op (n_kv=1 rows; the canonical probe setting).
+    acc_by_op = {}
+    for r in quality:
+        if r.get('n_kv') == 1 and r.get('mean_acc') is not None:
+            acc_by_op.setdefault(r['op'], r['mean_acc'])
+
+    panels = []
+    if bench:
+        max_t = max(r['T'] for r in bench)
+        lat_by_op = {}
+        for r in bench:
+            if r['T'] == max_t and r.get('time_ms') is not None:
+                lat_by_op.setdefault(r['op'], r['time_ms'])
+        panels.append(('prefill', lat_by_op, bench_name,
+                       f'prefill latency @ T={max_t} (ms, Exp 2)'))
+    if decoding:
+        max_plen = max(r['prefill_len'] for r in decoding)
+        dec_by_op = {}
+        for r in decoding:
+            if (r['prefill_len'] == max_plen
+                    and r.get('median_decode_ms_per_token') is not None):
+                dec_by_op.setdefault(r['op'],
+                                     r['median_decode_ms_per_token'])
+        panels.append(('decode', dec_by_op, decode_name,
+                       f'decode latency per token @ prefill={max_plen} '
+                       f'(ms, Exp 6)'))
+    if not panels:
+        print('[fig_quality_latency] no latency rows; skipping.')
+        return
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.0 * len(panels), 4.6),
+                             squeeze=False, constrained_layout=True)
+    colors = {'softmax': '#767676', 'kda': '#1f77b4', 'mamba2': '#d62728',
+              'csa': '#2ca02c', 'hca': '#9467bd'}
+    for ax, (kind, lat, name_map, xlabel) in zip(axes[0], panels):
+        plotted = False
+        for op, acc in acc_by_op.items():
+            row_name = name_map.get(op)
+            lat_ms = lat.get(row_name)
+            if lat_ms is None:
+                continue
+            ax.scatter(lat_ms, acc, s=70, color=colors.get(op, '#000000'),
+                       zorder=3)
+            ax.annotate(op, (lat_ms, acc), textcoords='offset points',
+                        xytext=(6, 4), fontsize=9)
+            plotted = True
+        if not plotted:
+            ax.text(0.5, 0.5, 'no joinable rows', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=10, color='#767676')
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel('MQAR mean accuracy (n_kv=1)')
+        ax.set_title(f'quality vs {kind} latency')
+        ax.grid(True, alpha=0.3)
+    _ensure_figures_dir()
+    out = os.path.join(_FIGURES_DIR, 'quality_vs_latency.png')
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f'[fig_quality_latency] saved {out}')
+
+
+def fig_quality_cache():
+    """Quality-vs-cache scatter (framework design: the memory-budget side).
+
+    Joins Exp 4's per-operator accuracy with Exp 3's full-accounting cache
+    bytes at the largest measured T (single-layer rows; the hybrid rows
+    have no single-op quality counterpart and are skipped). Annotates that
+    the cache axis is ANALYTIC (Exp 3's model, not a profiled number).
+    """
+    quality = [r for r in load('exp4_mqar.json')
+               if isinstance(r, dict) and 'error' not in r]
+    cache_rows = [r for r in load('exp3_kv_cache.json')
+                  if isinstance(r, dict)]
+    if not quality or not cache_rows:
+        print('[fig_quality_cache] missing exp4/exp3 rows; skipping.')
+        return
+    acc_by_op = {}
+    for r in quality:
+        if r.get('n_kv') == 1 and r.get('mean_acc') is not None:
+            acc_by_op.setdefault(r['op'], r['mean_acc'])
+
+    cache_name = {'softmax': 'softmax_gqa', 'kda': 'kda',
+                  'mamba2': 'mamba2', 'csa': 'csa', 'hca': 'hca'}
+    max_t = max(r['T'] for r in cache_rows)
+    bytes_by_op = {}
+    for r in cache_rows:
+        if (r['T'] == max_t and r.get('accounting_mode') == 'full_accounting'
+                and r.get('kv_bytes') is not None):
+            bytes_by_op.setdefault(r['op'], r['kv_bytes'])
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.6), constrained_layout=True)
+    colors = {'softmax': '#767676', 'kda': '#1f77b4', 'mamba2': '#d62728',
+              'csa': '#2ca02c', 'hca': '#9467bd'}
+    plotted = False
+    for op, acc in acc_by_op.items():
+        row_name = cache_name.get(op)
+        kv_bytes = bytes_by_op.get(row_name)
+        if kv_bytes is None:
+            continue
+        ax.scatter(kv_bytes / 1e6, acc, s=70,
+                   color=colors.get(op, '#000000'), zorder=3)
+        ax.annotate(op, (kv_bytes / 1e6, acc), textcoords='offset points',
+                    xytext=(6, 4), fontsize=9)
+        plotted = True
+    if not plotted:
+        ax.text(0.5, 0.5, 'no joinable rows', ha='center', va='center',
+                transform=ax.transAxes, fontsize=10, color='#767676')
+    ax.set_xlabel(f'runtime cache at T={max_t} (MB, full accounting, '
+                  f'analytic)')
+    ax.set_ylabel('MQAR mean accuracy (n_kv=1)')
+    ax.set_title('quality vs cache budget')
+    ax.grid(True, alpha=0.3)
+    _ensure_figures_dir()
+    out = os.path.join(_FIGURES_DIR, 'quality_vs_cache.png')
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f'[fig_quality_cache] saved {out}')
+
+
 def main():
     _ensure_figures_dir()
     os.makedirs(_RESULTS_DIR, exist_ok=True)
@@ -1071,6 +1219,8 @@ def main():
         fig_flops()
     if os.path.exists(os.path.join(_RESULTS_DIR, 'exp4_mqar.json')):
         fig_mqar()
+        fig_quality_latency()
+        fig_quality_cache()
     if os.path.exists(os.path.join(_RESULTS_DIR, 'exp5_ablation.json')):
         fig_ablation()
     if os.path.exists(os.path.join(_RESULTS_DIR, 'exp6_decoding.json')):

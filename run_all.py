@@ -69,6 +69,67 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 
+# ---------------------------------------------------------------------------
+# Run profiles (framework design: smoke / screening / formal tiers).
+#
+# RUN_ALL_PROFILE selects the budget tier for a full pipeline run:
+#
+#   * ``smoke``  — pipeline VALIDATION only: tiny seeds/steps/lengths so
+#     forward, backward, caches, result files, and figures all get
+#     exercised end-to-end in minutes. Numbers from a smoke run are NOT
+#     comparable to anything (the Bonferroni machinery is knowingly
+#     underpowered at 2 seeds) — the run only proves the plumbing works.
+#     Also executes a 1-seed, 5-layer, 5-step pass of the eight-group
+#     matrix (exp5b smoke) so the ABL_MODE=matrix path is CI-covered.
+#   * ``screen`` (default) — the historical budget: the small-scale
+#     screening tier. Identical to the pre-profile behaviour.
+#   * ``full``   — the formal-validation tier: seed counts raised to 7 so
+#     the multi-seed statistics stabilise. Step budgets are NOT silently
+#     raised (scale those explicitly via MQAR_STEPS / ABL_STEPS / ... once
+#     the screening curves say where the plateau sits).
+#
+# Application rule: a preset only sets variables the caller did NOT
+# export — an explicit env var always wins over the profile, so
+# ``RUN_ALL_PROFILE=smoke MQAR_SEEDS=5`` really runs 5 seeds.
+# ---------------------------------------------------------------------------
+_RUN_PROFILES: dict[str, dict[str, str] | None] = {
+    'smoke': {
+        'MQAR_SEEDS': '2', 'MQAR_STEPS': '30',
+        'ABL_SEEDS': '2', 'ABL_STEPS': '30',
+        'MECH_SEEDS': '2', 'MECH_STEPS': '30',
+        'BENCH_LENGTHS': '128,256', 'BENCH_REPEATS': '3',
+        'BUDGET_PREFILL_LENS': '256', 'BUDGET_DECODE_TOKENS': '3',
+        'BUDGET_REPEATS': '1', 'SKIP_SLOW': '1',
+    },
+    'screen': None,   # the historical defaults — no overrides
+    'full': {
+        'MQAR_SEEDS': '7', 'ABL_SEEDS': '7', 'MECH_SEEDS': '7',
+    },
+}
+
+
+def _apply_run_profile() -> str:
+    """Apply the RUN_ALL_PROFILE preset to unset env vars; return the name."""
+    profile = os.environ.get('RUN_ALL_PROFILE', 'screen').strip().lower()
+    if profile not in _RUN_PROFILES:
+        raise ValueError(
+            f"RUN_ALL_PROFILE={profile!r} must be one of "
+            f"{sorted(_RUN_PROFILES)}.")
+    preset = _RUN_PROFILES[profile]
+    applied = []
+    if preset:
+        for key, value in preset.items():
+            if key not in os.environ:
+                os.environ[key] = value
+                applied.append(key)
+    if applied:
+        print(f'[run_all] profile {profile!r}: set '
+              f'{", ".join(sorted(applied))} (unset-vars only)')
+    else:
+        print(f'[run_all] profile {profile!r}: no overrides needed')
+    return profile
+
+
 def _version_tuple(raw: str) -> tuple[int, ...]:
     """Parse the numeric prefix of a package version for bound checks."""
     parts = re.findall(r"\d+", raw)
@@ -346,7 +407,14 @@ def run_all(seeds=None, steps=None):
                  'FIGURES_DIR', 'SKIP_SLOW', 'MECH_SEEDS', 'MECH_STEPS',
                  'MECH_TRAIN_BATCH', 'MECH_NKV', 'MECH_VARIANTS',
                  'BUDGET_T_GRID', 'BUDGET_TOPK', 'BUDGET_PREFILL_LENS',
-                 'BUDGET_DECODE_TOKENS', 'BUDGET_REPEATS')
+                 'BUDGET_DECODE_TOKENS', 'BUDGET_REPEATS',
+                 # Run-profile + matrix-mode variables: run_all itself may
+                 # set these (profile presets, the matrix smoke pass), so
+                 # the finally block has to restore the caller's state.
+                 'RUN_ALL_PROFILE', 'BENCH_REPEATS', 'MQAR_OPS',
+                 'MQAR_TASKS', 'MAMBA_BACKEND', 'ABL_MODE', 'ABL_MATRIX',
+                 'ABL_TOTAL_LAYERS', 'ABL_MEMORY', 'ABL_D_MODEL',
+                 'ABL_TRAIN_BATCH')
     # Snapshot the precise pre-call state of each env var: distinguish
     # "unset" from "set to a value" so the finally block can restore the
     # exact state.
@@ -382,6 +450,9 @@ def run_all(seeds=None, steps=None):
     # well-behaved library function rather than a process mutator.
     _orig_cwd = os.getcwd()
     os.chdir(out_root)
+    # Apply the smoke / screen / full budget tier BEFORE any experiment
+    # reads its env knobs (unset-vars only; explicit user requests win).
+    profile = _apply_run_profile()
     try:
         # Apply the seeds/steps env-var mutations INSIDE the try block
         # (after _ensure_deps/_setup succeeded) so a failure in those
@@ -420,7 +491,8 @@ def run_all(seeds=None, steps=None):
         # and the selected KDA backend. This matters when comparing a
         # reference run with a later FLA run.
         from kaggle_setup import capture_provenance
-        summary = {'env': capture_provenance(), 'runs': []}
+        summary = {'env': capture_provenance(), 'runs': [],
+                   'run_profile': profile}
 
         # Import after deps are installed.
         import run_correctness
@@ -557,6 +629,30 @@ def run_all(seeds=None, steps=None):
                 _abl_steps = 100
             os.environ['ABL_STEPS'] = str(min(_abl_steps, 50))
         summary['runs'].append(_run('exp5_ablation', run_ablation.main))
+
+        # 5b. Eight-group matrix smoke — ONLY in the smoke profile. A
+        #     1-seed, 5-layer, 5-step pass over all eight groups proves
+        #     the ABL_MODE=matrix plumbing (explicit layouts, both memory
+        #     routes, result file) without any meaningful training budget.
+        #     Numbers from this step are pipeline-validation only.
+        if profile == 'smoke':
+            _matrix_saved = {k: os.environ.get(k) for k in
+                             ('ABL_MODE', 'ABL_MATRIX', 'ABL_SEEDS',
+                              'ABL_STEPS', 'ABL_TOTAL_LAYERS', 'ABL_MEMORY',
+                              'ABL_TRAIN_BATCH', 'ABL_D_MODEL')}
+            os.environ.update(
+                ABL_MODE='matrix', ABL_MATRIX='main8', ABL_SEEDS='1',
+                ABL_STEPS='5', ABL_TOTAL_LAYERS='5',
+                ABL_MEMORY='kda,mamba2', ABL_TRAIN_BATCH='8')
+            try:
+                summary['runs'].append(
+                    _run('exp5b_ablation_matrix_smoke', run_ablation.main))
+            finally:
+                for k, v in _matrix_saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
 
         # 6b. Mechanism ablation — multi-seed. Same SKIP_SLOW policy as
         #     Exp 5: keep the seed count >= 5 for a usable paired test,
