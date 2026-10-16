@@ -282,16 +282,25 @@ def _setup():
 
 # Result files written by each experiment's ``main()``. When an experiment
 # fails, its previous run's JSON must not survive to be plotted as if it were
-# fresh output (see the figure step below).
+# fresh output (see the figure step below). Every file an experiment can
+# write must be listed here, including provenance side files and the
+# auxiliary outputs (``exp4b`` quality-task rows, the ``exp5b`` matrix
+# smoke) — a missing entry would leave a stale file to be misread next to
+# this run's fresh ones.
 _EXPERIMENT_OUTPUTS = {
     'exp1_correctness': ['results/exp1_correctness.json'],
     'exp2_benchmark': ['results/exp2_benchmark.json',
                        'results/exp2_benchmark_provenance.json'],
     'exp3_kv_cache': ['results/exp3_kv_cache.json'],
-    'exp4_mqar': ['results/exp4_mqar.json'],
+    'exp4_mqar': ['results/exp4_mqar.json',
+                  'results/exp4b_quality_tasks.json'],
     'exp5_ablation': ['results/exp5_ablation.json',
                       'results/exp5_ablation_provenance.json'],
-    'exp6_decoding': ['results/exp6_decoding.json'],
+    'exp5b_ablation_matrix_smoke': [
+        'results/exp5b_ablation_matrix.json',
+        'results/exp5b_ablation_matrix_provenance.json'],
+    'exp6_decoding': ['results/exp6_decoding.json',
+                      'results/exp6_decoding_provenance.json'],
     'exp7_roofline': ['results/exp7_roofline.json'],
     'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
     'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
