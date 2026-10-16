@@ -12,6 +12,17 @@ operators studied in this repository:
         untouched, so the sparse-retrieval (CSA) and global-aggregation
         (HCA) contributions can be ablated independently of the memory
         operator.
+  * **RWKV-7** ("Goose", ``ops_rwkv.Rwkv7Mixer``): the third
+        selectable *recurrent memory* route (``memory_type='rwkv7'``).
+        Parameterization + initialization are bound to
+        RWKV-Vibe/rwkv-fla @ ``074deaf``; the recurrence is
+        cross-checked against BlinkDL/RWKV-LM @ ``a963e4a`` (see
+        ``ops_rwkv.py`` for the bindings and the clearly-labelled
+        ``rwkv7-nofirst`` variant). The same one-knob contract applies:
+        the RWKV-7 TimeMix (token shift, dynamic bounded decay, matrix
+        state update, readout, group norm, gated output projection)
+        fills the memory slots while CSA/HCA stay untouched, so the
+        KDA→RWKV-7 replacement ablation isolates the memory operator.
   * **CSA** (Compressed Sparse Attention, DeepSeek-V4 arXiv:2606.19348):
         block-wise KV compression + sparse top-k retrieval; good for
         content-addressable long-context recall.
@@ -53,15 +64,25 @@ from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_mamba import Mamba2Mixer, build_mamba2_mixer, validate_mamba2_geometry
+from ops_rwkv import Rwkv7Mixer, build_rwkv7_mixer, validate_rwkv7_geometry
+from ops_rwkv_backend import validate_rwkv_backend
 
 
 # Layer kinds accepted in an explicit ``HybridConfig.layout``. ``'memory'``
 # is the abstract placeholder resolved to ``cfg.memory_type``; the concrete
-# ``'kda'`` / ``'mamba2'`` tokens are also accepted so a layout can pin a
-# specific memory operator regardless of the global ``memory_type`` (a
-# stack still refuses to MIX the two — one memory route per model, which is
-# what the KDA-vs-Mamba-2 comparison design requires).
-LAYOUT_KINDS = ('memory', 'kda', 'mamba2', 'csa', 'hca')
+# ``'kda'`` / ``'mamba2'`` / ``'rwkv7'`` tokens are also accepted so a
+# layout can pin a specific memory operator regardless of the global
+# ``memory_type`` (a stack still refuses to MIX two of them — one memory
+# route per model, which is what the KDA-vs-Mamba-2-vs-RWKV-7 comparison
+# design requires).
+LAYOUT_KINDS = ('memory', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca')
+
+# The concrete kinds that fill the stack's *memory* slots (the recurrent
+# routes). Every kind here must satisfy the memory-layer contract:
+# ``forward(x, state) -> (out, new_state)``,
+# ``forward_functional(x, state, conv_state) -> (out, new_state,
+# new_conv_state)``, ``reset_conv_state()``. CSA/HCA are stateless.
+MEMORY_LAYER_KINDS = ('kda', 'mamba2', 'rwkv7')
 
 
 def _resolve_layout_kinds(layout, memory_type: str) -> tuple[str, ...]:
@@ -88,13 +109,49 @@ def _resolve_layout_kinds(layout, memory_type: str) -> tuple[str, ...]:
                 f"HybridConfig.layout[{i}]={kind!r} is not a valid layer "
                 f"kind; expected one of {LAYOUT_KINDS}.")
         resolved.append(memory_type if kind == 'memory' else kind)
-    if 'kda' in resolved and 'mamba2' in resolved:
+    # Generalized memory-route purity check: a layout may contain memory
+    # layers of ONE concrete kind only (kda, mamba2, or rwkv7 — including
+    # via the 'memory' placeholder, which resolves to memory_type). The
+    # historical check only rejected the KDA/Mamba-2 pair because those
+    # were the only routes; with RWKV-7 the check is the set-difference
+    # over MEMORY_LAYER_KINDS so any future route is covered too.
+    used_memory_kinds = sorted(
+        {kind for kind in resolved if kind in MEMORY_LAYER_KINDS})
+    if len(used_memory_kinds) > 1:
         raise ValueError(
-            "HybridConfig.layout mixes 'kda' and 'mamba2' memory layers in "
-            "one stack. The comparison framework treats the recurrent "
-            "memory operator as a per-model route (memory_type), not a "
-            "per-layer mix; build two stacks instead.")
+            f"HybridConfig.layout mixes multiple memory layer kinds "
+            f"({used_memory_kinds}) in one stack. The comparison "
+            f"framework treats the recurrent memory operator as a "
+            f"per-model route (memory_type), not a per-layer mix; build "
+            f"one stack per memory route instead.")
     return tuple(resolved)
+
+
+def _memory_layer_lookback(layer: nn.Module) -> torch.Tensor | None:
+    """Read a memory layer's streaming lookback buffer.
+
+    KDA / Mamba-2 register ``_conv_lookback`` (the short-conv left
+    context); RWKV-7 registers ``_shift_state`` (the token-shift
+    history). The stack treats the channel opaquely — this helper is the
+    single place that knows the per-route attribute name.
+    """
+    if isinstance(layer, Rwkv7Mixer):
+        return layer._shift_state
+    return getattr(layer, '_conv_lookback', None)
+
+
+def _set_memory_layer_lookback(layer: nn.Module, lb: torch.Tensor | None) -> None:
+    """Write a memory layer's streaming lookback buffer (see above).
+
+    Writing the WRONG attribute (e.g. ``_conv_lookback`` on an RWKV-7
+    mixer) would create a plain attribute while the REGISTERED buffer
+    stayed stale — ``.to(device)`` / ``.half()`` would then move a
+    different tensor than the one being threaded through forwards.
+    """
+    if isinstance(layer, Rwkv7Mixer):
+        layer._shift_state = lb
+    else:
+        layer._conv_lookback = lb
 
 
 class _Fp32LayerNorm(nn.LayerNorm):
@@ -209,10 +266,10 @@ class HybridConfig:
     # the KDA mainline as the DEFAULT: memory_type='kda' and layout=None
     # reproduce the historical ratio-mode behaviour bit-for-bit.
     # ------------------------------------------------------------------
-    # Which recurrent memory operator fills the 'memory' slots: 'kda' or
-    # 'mamba2'. The CSA / HCA layers and every other field are shared, so
-    # switching this ONE value ablates the memory operator while holding
-    # the retrieval/global-aggregation operators fixed.
+    # Which recurrent memory operator fills the 'memory' slots: 'kda',
+    # 'mamba2', or 'rwkv7'. The CSA / HCA layers and every other field are
+    # shared, so switching this ONE value ablates the memory operator while
+    # holding the retrieval/global-aggregation operators fixed.
     memory_type: str = "kda"
     # Explicit layer layout. None (default) -> ratio mode (n_kda:n_csa:n_hca
     # repeated to total_layers). A tuple/list pins the exact per-layer
@@ -239,6 +296,31 @@ class HybridConfig:
     mamba_ngroups: int = 1
     # dt low-rank dimension: 'auto' -> ceil(d_model / 16) (official rule).
     mamba_dt_rank: int | str = "auto"
+    # ------------------------------------------------------------------
+    # RWKV-7 route (memory_type='rwkv7'). Defaults follow the fla layer
+    # recipe evaluated at the main-table geometry (d_model=256):
+    # head_dim=64 -> H=4 heads; decay/a LoRA=32, gate LoRA=64 (fla's
+    # ``max(32, round(coeff * sqrt(d) / 32) * 32)`` with coefficients
+    # 2.5 / 2.5 / 5). Small-scale runs override (e.g. run_ablation passes
+    # head_dim clamped to a divisor of d_model).
+    # ------------------------------------------------------------------
+    # RWKV-7 implementation backend (mirrors kda_backend / mamba_backend):
+    # 'reference' (pure PyTorch, default), 'fla' (flash-linear-attention's
+    # fla.ops.rwkv7 kernels; CUDA + the optional dependency required —
+    # errors loudly when unavailable), 'auto' (fla when possible, else
+    # reference; the resolution is recorded on the mixer's
+    # effective_backend attribute).
+    rwkv_backend: str = "reference"
+    # RWKV-7 head dimension (upstream: 64, "don't change"). H =
+    # d_model // rwkv_head_dim heads; the recurrent matrix state is
+    # H x head_dim x head_dim per layer.
+    rwkv_head_dim: int = 64
+    # LoRA widths of the decay / a / gate branches (see the comment
+    # block above; the v_lora of upstream is absent — this is the
+    # 'rwkv7-nofirst' variant, see ops_rwkv.py).
+    rwkv_decay_lora: int = 32
+    rwkv_a_lora: int = 32
+    rwkv_gate_lora: int = 64
 
     def __post_init__(self):
         # Validate dropout TYPE / finite / range BEFORE the
@@ -491,14 +573,17 @@ class HybridConfig:
         # Validated at config creation (fail before any parameters are
         # allocated), mirroring the kda_backend validation above. The
         # optional mamba_ssm import stays lazy inside ops_mamba_backend.
-        if self.memory_type not in ('kda', 'mamba2'):
+        if self.memory_type not in MEMORY_LAYER_KINDS:
             raise ValueError(
                 f"HybridConfig.memory_type={self.memory_type!r} must be "
-                f"'kda' or 'mamba2'. This field selects the recurrent "
-                f"memory operator that fills the memory slots; CSA/HCA are "
-                f"controlled by the layout / ratio fields.")
+                f"one of {MEMORY_LAYER_KINDS}. This field selects the "
+                f"recurrent memory operator that fills the memory slots; "
+                f"CSA/HCA are controlled by the layout / ratio fields.")
         from ops_mamba_backend import validate_mamba_backend
         validate_mamba_backend(self.mamba_backend)
+        # RWKV backend validation mirrors the mamba one: eager at config
+        # creation, lazy optional import inside ops_rwkv_backend.
+        validate_rwkv_backend(self.rwkv_backend)
         # Validate + normalize the explicit layout. The RESOLVED tuple
         # (with 'memory' replaced by the concrete memory_type) is stored
         # back on the config so downstream consumers (stack, experiment
@@ -523,6 +608,19 @@ class HybridConfig:
                 self.d_model, self.mamba_d_state, self.mamba_d_conv,
                 self.mamba_expand, self.mamba_headdim, self.mamba_ngroups,
                 self.mamba_dt_rank)
+        # RWKV-7 geometry is validated ONLY when an RWKV-7 layer will
+        # actually be built (mirrors the Mamba-2 guard: KDA-only configs
+        # must not be constrained by another route's divisibility — tiny
+        # test geometries like d_model=32 with the default head_dim=64
+        # would otherwise be rejected for no KDA-relevant reason).
+        uses_rwkv7 = (
+            self.memory_type == 'rwkv7'
+            or (resolved_layout is not None and 'rwkv7' in resolved_layout)
+        )
+        if uses_rwkv7:
+            validate_rwkv7_geometry(
+                self.d_model, self.rwkv_head_dim, self.rwkv_decay_lora,
+                self.rwkv_a_lora, self.rwkv_gate_lora)
         if resolved_layout is not None and self.n_kda + self.n_csa \
                 + self.n_hca != len(resolved_layout):
             # Informational, not an error: an explicit layout overrides the
@@ -966,17 +1064,20 @@ class HCAHybridLayer(nn.Module):
         return self.o_proj(o), None
 
 
-def build_mixer(kind: str, cfg: HybridConfig) -> nn.Module:
+def build_mixer(kind: str, cfg: HybridConfig, *,
+                memory_layer_idx: int | None = None,
+                n_memory_layers: int | None = None) -> nn.Module:
     """Unified mixer factory: map a layer kind to a mixer module.
 
     This is the single construction point for every sub-layer in the
-    hybrid stack, so switching the memory route (KDA <-> Mamba-2) or
-    adding a future operator touches exactly one dispatch table.
+    hybrid stack, so switching the memory route (KDA <-> Mamba-2 <->
+    RWKV-7) or adding a future operator touches exactly one dispatch
+    table.
 
     Args:
         kind: one of ``'memory'`` (resolved via ``cfg.memory_type``), the
-            concrete memory kinds ``'kda'`` / ``'mamba2'``, or
-            ``'csa'`` / ``'hca'``. The stack always passes an
+            concrete memory kinds ``'kda'`` / ``'mamba2'`` / ``'rwkv7'``,
+            or ``'csa'`` / ``'hca'``. The stack always passes an
             already-resolved concrete kind; the abstract ``'memory'``
             token is accepted for direct callers (matching the factory
             interface in the framework design).
@@ -986,11 +1087,23 @@ def build_mixer(kind: str, cfg: HybridConfig) -> nn.Module:
             (out, new_state)``, ``forward_functional(x, state,
             conv_state) -> (out, new_state, new_conv_state)`` (memory
             layers), stateless ``forward(x) -> (out, None)`` (CSA/HCA).
+        memory_layer_idx: 0-based index of this layer among the model's
+            *memory* layers (None -> 0). Only the RWKV-7 route consumes
+            it: its upstream initialization is depth-dependent
+            (per-layer decay slope / lerp powers / group-norm gain via
+            ``layer_idx / n_layer``), so the stack passes each RWKV
+            layer's index among the RWKV layers. KDA / Mamba-2 / CSA /
+            HCA have depth-independent parameterizations and ignore it.
+        n_memory_layers: total memory layers in the model (None -> 1);
+            RWKV-7's init ratios use it exactly as upstream uses
+            ``n_layer``.
 
     Returns:
         The mixer module. The returned class for ``'mamba2'`` depends on
         ``cfg.mamba_backend`` (reference by default; the official
-        ``mamba_ssm`` wrapper when explicitly selected and available).
+        ``mamba_ssm`` wrapper when explicitly selected and available),
+        and ``'rwkv7'`` on ``cfg.rwkv_backend`` (reference by default;
+        the FLA kernels when explicitly selected and available).
     """
     if kind == 'memory':
         kind = cfg.memory_type
@@ -998,6 +1111,14 @@ def build_mixer(kind: str, cfg: HybridConfig) -> nn.Module:
         return KDAHybridLayer(cfg)
     if kind == 'mamba2':
         return build_mamba2_mixer(cfg)
+    if kind == 'rwkv7':
+        # The stack supplies the depth position; direct single-layer
+        # callers get the layer-0-of-1 defaults (guarded upstream).
+        return build_rwkv7_mixer(
+            cfg,
+            rwkv_layer_idx=0 if memory_layer_idx is None else memory_layer_idx,
+            n_rwkv_layers=1 if n_memory_layers is None else max(1, n_memory_layers),
+        )
     if kind == 'csa':
         return CSAHybridLayer(cfg)
     if kind == 'hca':
@@ -1008,7 +1129,7 @@ def build_mixer(kind: str, cfg: HybridConfig) -> nn.Module:
 
 
 class HybridAttentionStack(nn.Module):
-    """Stack of interleaved memory (KDA / Mamba-2) / CSA / HCA sub-layers.
+    """Stack of interleaved memory (KDA / Mamba-2 / RWKV-7) / CSA / HCA sub-layers.
 
     Two layout modes (see the module docstring):
 
@@ -1018,7 +1139,9 @@ class HybridAttentionStack(nn.Module):
         default ``memory_type='kda'`` this is bit-identical to the
         historical ``HybridKCHAttention`` behaviour, and
         ``memory_type='mamba2'`` yields the Mamba-2 route
-        (``MAMBA2-MAMBA2-MAMBA2-CSA-HCA`` per 5-layer unit).
+        (``MAMBA2-MAMBA2-MAMBA2-CSA-HCA`` per 5-layer unit) while
+        ``memory_type='rwkv7'`` yields the RWKV-7 route
+        (``RWKV7-RWKV7-RWKV7-CSA-HCA``).
       * **Explicit layout mode** (``cfg.layout`` set): the resolved layout
         pins every layer's kind; its length must equal ``total_layers``.
 
@@ -1026,13 +1149,13 @@ class HybridAttentionStack(nn.Module):
     ``x = x + mixer(norm(x))`` with identical LayerNorm placement, input /
     output dimensions, and residual wiring — so only the token mixer
     differs. The unified measurement boundaries in ``run_benchmark.py``
-    rely on this contract. The memory layers (KDA or Mamba-2) carry a
-    stacked recurrent state plus per-layer short-conv lookbacks; CSA/HCA
-    remain stateless inside the stack (their incremental decode state
+    rely on this contract. The memory layers (KDA, Mamba-2, or RWKV-7)
+    carry a stacked recurrent state plus per-layer shift/conv lookbacks;
+    CSA/HCA remain stateless inside the stack (their incremental decode state
     lives in ``ops_decoding_cache``).
     """
 
-    LAYER_TYPES = ('kda', 'mamba2', 'csa', 'hca')
+    LAYER_TYPES = ('kda', 'mamba2', 'rwkv7', 'csa', 'hca')
 
     def __init__(self, cfg: HybridConfig, total_layers: int = 5):
         super().__init__()
@@ -1073,26 +1196,38 @@ class HybridAttentionStack(nn.Module):
             )
         self.layout = self._build_layout()
         self.layers = nn.ModuleList()
+        # Number of memory layers is computed BEFORE the build loop so
+        # build_mixer can hand each RWKV-7 layer its depth position (the
+        # RWKV-7 init is depth-dependent; KDA/Mamba-2/CSA/HCA ignore the
+        # extra kwargs).
+        self.n_memory_layers = sum(1 for k in self.layout
+                                   if k in MEMORY_LAYER_KINDS)
+        memory_seen = 0
         for kind in self.layout:
             # Unified mixer construction: the factory is the single place
             # that maps a (resolved) layer kind to a module, so adding a
             # new operator or switching the memory route touches exactly
             # one dispatch table.
-            self.layers.append(build_mixer(kind, cfg))
+            self.layers.append(build_mixer(
+                kind, cfg,
+                memory_layer_idx=memory_seen,
+                n_memory_layers=self.n_memory_layers))
+            if kind in MEMORY_LAYER_KINDS:
+                memory_seen += 1
         self.norms = nn.ModuleList([_Fp32LayerNorm(cfg.d_model) for _ in self.layout])
-        # Memory layers (KDA and/or Mamba-2 — in practice exactly one kind
-        # per stack, enforced by the config validation), in layout order.
-        # Kept as an nn.ModuleList (not a plain list) so .to(device) /
-        # .half() / print(model) keep working on the submodule set.
+        # Memory layers (KDA, Mamba-2, or RWKV-7 — in practice exactly one
+        # kind per stack, enforced by the config validation), in layout
+        # order. Kept as an nn.ModuleList (not a plain list) so .to(device)
+        # / .half() / print(model) keep working on the submodule set.
         self.memory_layers = nn.ModuleList(
             [layer for layer, kind in zip(self.layers, self.layout)
-             if kind in ('kda', 'mamba2')])
+             if kind in MEMORY_LAYER_KINDS])
         # Number of memory layers in the stack (each one needs its OWN
         # state slot in the stacked tensor below). Different memory layers
         # have different parameters, so they must not share recurrent
         # state: layer 2 would otherwise be seeded with layer 0's state.
-        self.n_memory_layers = sum(1 for k in self.layout
-                                   if k in ('kda', 'mamba2'))
+        # (Computed above, before the build loop; the alias assignment
+        # below keeps the historical attribute name.)
         # Backward-compatible alias: the historical name for the stacked
         # memory-state count. With the default memory_type='kda' this is
         # literally the number of KDA layers, so every existing reader
@@ -1119,7 +1254,8 @@ class HybridAttentionStack(nn.Module):
         # The ATTRIBUTE NAME ``_kda_state`` is kept from the historical
         # implementation so run_decoding.py and the correctness tests
         # continue to work unmodified; on Mamba-2 stacks it holds the
-        # Mamba-2 SSM states.
+        # Mamba-2 SSM states, and on RWKV-7 stacks the per-layer matrix
+        # states (``[B, H, K, V]`` per layer).
         self.register_buffer('_kda_state', None, persistent=False)
 
     def reset_state(self) -> None:
@@ -1258,11 +1394,13 @@ class HybridAttentionStack(nn.Module):
             HybridAttentionStack._stateful_warned = True
         o, new_kda_state, new_conv_lookbacks = self.forward_functional(
             x, self._kda_state,
-            [layer._conv_lookback for layer in self.memory_layers])
+            [_memory_layer_lookback(layer) for layer in self.memory_layers])
         self._kda_state = new_kda_state
-        # Persist the per-layer conv lookbacks back to the memory layers.
+        # Persist the per-layer lookbacks back to the memory layers
+        # (route-aware: KDA/Mamba-2 ``_conv_lookback`` vs RWKV-7
+        # ``_shift_state``).
         for layer, lb in zip(self.memory_layers, new_conv_lookbacks):
-            layer._conv_lookback = lb
+            _set_memory_layer_lookback(layer, lb)
         return o
 
     # Class-level one-shot warning flag for the stateful-forward DDP /
@@ -1392,12 +1530,12 @@ class HybridAttentionStack(nn.Module):
         for layer, norm, kind in zip(self.layers, self.norms, self.layout):
             residual = x
             x = norm(x)
-            if kind in ('kda', 'mamba2'):
+            if kind in MEMORY_LAYER_KINDS:
                 # Use the FUNCTIONAL memory path so we do NOT mutate the
-                # layer's ``_conv_lookback``. The new lookback is
-                # collected into ``new_lookbacks`` for the caller. KDA and
-                # Mamba-2 implement the SAME functional contract
-                # ((x, state, conv_state) -> (out, new_state,
+                # layer's shift/conv state. The new lookback is
+                # collected into ``new_lookbacks`` for the caller. KDA,
+                # Mamba-2, and RWKV-7 implement the SAME functional
+                # contract ((x, state, conv_state) -> (out, new_state,
                 # new_conv_state)), so the dispatch is uniform.
                 o, new_state, new_lb = layer.forward_functional(
                     x, states[mem_idx], lookback_list[mem_idx],
@@ -1412,8 +1550,8 @@ class HybridAttentionStack(nn.Module):
 
         # Restack the per-layer states for the caller. All memory layers
         # share the same config (KDA: HV/K/V; Mamba-2: nheads/headdim/
-        # d_state), so every entry has the same shape and torch.stack is
-        # safe.
+        # d_state; RWKV-7: n_heads/head_dim/head_dim), so every entry has
+        # the same shape and torch.stack is safe.
         if self.n_memory_layers > 0:
             if any(s is None for s in states):
                 raise RuntimeError(

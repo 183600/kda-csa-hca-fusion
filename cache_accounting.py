@@ -75,6 +75,10 @@ PARAMETER = 'parameter'
 COMPONENT_SPECS = {
     'kda_recurrent_state': ('kda', STATE_CACHE),
     'kda_conv_lookback': ('kda', STATE_CACHE),
+    'mamba2_ssm_state': ('mamba2', STATE_CACHE),
+    'mamba2_conv_state': ('mamba2', STATE_CACHE),
+    'rwkv7_matrix_state': ('rwkv7', STATE_CACHE),
+    'rwkv7_shift_state': ('rwkv7', STATE_CACHE),
     'csa_compressed_kv': ('csa', CLASSICAL_KV_CACHE),
     'csa_indexer_kv': ('csa', CLASSICAL_KV_CACHE),
     'csa_sliding_window': ('csa', STATE_CACHE),
@@ -97,7 +101,34 @@ _ROPE_ROTATED = {
 #: so their per-sequence element count equals their raw element count.
 _BATCH_SHARED = {'sink_logits'}
 
-_DTYPES_BY_OP = ('csa', 'hca', 'kda')
+_DTYPES_BY_OP = ('csa', 'hca', 'kda', 'mamba2', 'rwkv7')
+
+#: The concrete layer kinds that fill the stack's memory slots (mirrors
+#: ops_fused.MEMORY_LAYER_KINDS; kept local to avoid an import cycle).
+_MEMORY_KINDS = ('kda', 'mamba2', 'rwkv7')
+
+
+def _layer_counts(cfg: HybridConfig) -> dict[str, int]:
+    """Per-op layer counts, EXPLICIT-LAYOUT aware.
+
+    Ratio mode: the memory-slot count is ``cfg.n_kda`` attributed to
+    ``cfg.memory_type`` (the historical semantics). Explicit-layout
+    mode: count each kind directly from ``cfg.layout`` — the eight-group
+    matrix pins 10-layer layouts whose memory/CSA/HCA counts are NOT the
+    ratio fields (which are ignored in that mode), so using them here
+    would mis-audit every matrix-configured model.
+    """
+    if cfg.layout is not None:
+        counts = {op: 0 for op in _DTYPES_BY_OP}
+        for kind in cfg.layout:
+            if kind in counts:
+                counts[kind] += 1
+        return counts
+    counts = {op: 0 for op in _DTYPES_BY_OP}
+    counts[cfg.memory_type] = cfg.n_kda
+    counts['csa'] = cfg.n_csa
+    counts['hca'] = cfg.n_hca
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +240,33 @@ def live_cache_components(decoder) -> dict:
     layers, layout = _model_layers(decoder)
     comps = _empty_components()
 
-    # --- KDA recurrent state + short-conv lookback ---------------------
+    # --- memory-route recurrent state + shift/conv lookback -------------
+    # Route by the layout's memory kind: the stacked ``_kda_state`` buffer
+    # holds whichever memory operator fills the slots (the attribute NAME
+    # is historical), and the per-layer streaming buffer is
+    # ``_conv_lookback`` for KDA / Mamba-2 vs ``_shift_state`` for RWKV-7
+    # (the token-shift history). Attributing them to route-specific
+    # components keeps the live audit and the dtypes report exact per
+    # operator.
     model = decoder.model
-    comps['kda_recurrent_state'].add(getattr(model, '_kda_state', None))
-    for layer in layers:
-        lookback = getattr(layer, '_conv_lookback', None)
-        comps['kda_conv_lookback'].add(lookback)
+    memory_kinds = [k for k in layout if k in _MEMORY_KINDS]
+    route = memory_kinds[0] if memory_kinds else 'kda'
+    if route == 'rwkv7':
+        comps['rwkv7_matrix_state'].add(getattr(model, '_kda_state', None))
+        for layer, kind in zip(layers, layout):
+            if kind == 'rwkv7':
+                comps['rwkv7_shift_state'].add(
+                    getattr(layer, '_shift_state', None))
+    elif route == 'mamba2':
+        comps['mamba2_ssm_state'].add(getattr(model, '_kda_state', None))
+        for layer, kind in zip(layers, layout):
+            if kind == 'mamba2':
+                comps['mamba2_conv_state'].add(
+                    getattr(layer, '_conv_lookback', None))
+    else:
+        comps['kda_recurrent_state'].add(getattr(model, '_kda_state', None))
+        for layer in layers:
+            comps['kda_conv_lookback'].add(getattr(layer, '_conv_lookback', None))
 
     # --- CSA incremental caches ----------------------------------------
     for cache in getattr(decoder, '_csa_caches', []) or []:
@@ -332,6 +384,8 @@ def exp3_geometry(cfg: HybridConfig, *, conv_ksize: int = 3) -> dict:
         raise TypeError(
             f'exp3_geometry: cfg must be a HybridConfig, got '
             f'{type(cfg).__name__}.')
+    counts = _layer_counts(cfg)
+    hybrid_n_mem = sum(counts[k] for k in _MEMORY_KINDS)
     return dict(
         d=cfg.d_model, H=cfg.n_heads_qk, K=cfg.head_dim_k, V=cfg.head_dim_v,
         kda_hv=cfg.n_heads_v, kda_k=cfg.head_dim_k, kda_v=cfg.head_dim_v,
@@ -341,8 +395,19 @@ def exp3_geometry(cfg: HybridConfig, *, conv_ksize: int = 3) -> dict:
         csa_cI=cfg.csa_cI, csa_sliding_window=cfg.csa_sliding_window,
         hca_m2=cfg.hca_m2, hca_nh=cfg.hca_nh, hca_c=cfg.hca_c,
         hca_dc=cfg.hca_dc, hca_sliding_window=cfg.hca_sliding_window,
-        hybrid_n_kda=cfg.n_kda, hybrid_n_csa=cfg.n_csa,
-        hybrid_n_hca=cfg.n_hca,
+        # Memory-slot count (layout-aware; ratio mode keeps the historical
+        # cfg.n_kda value). run_kv_cache's hybrid_*_rows use this as the
+        # memory-layer count regardless of the concrete memory route.
+        hybrid_n_kda=hybrid_n_mem, hybrid_n_csa=counts['csa'],
+        hybrid_n_hca=counts['hca'],
+        # Mamba-2 / RWKV-7 geometry (used by the route-aware rows of
+        # kv_cache_elements / prefill_flops when the model's memory route
+        # is mamba2 / rwkv7).
+        mamba_d_state=cfg.mamba_d_state, mamba_d_conv=cfg.mamba_d_conv,
+        mamba_expand=cfg.mamba_expand, mamba_headdim=cfg.mamba_headdim,
+        mamba_ngroups=cfg.mamba_ngroups, mamba_dt_rank=cfg.mamba_dt_rank,
+        rwkv_head_dim=cfg.rwkv_head_dim, rwkv_decay_lora=cfg.rwkv_decay_lora,
+        rwkv_a_lora=cfg.rwkv_a_lora, rwkv_gate_lora=cfg.rwkv_gate_lora,
     )
 
 
@@ -399,45 +464,74 @@ def analytic_cache_components(cfg: HybridConfig, T: int, *,
             'elements_valid': int(valid),
         }
 
-    # KDA: constant recurrent state + short-conv lookback.
-    hvkv = cfg.n_heads_v * cfg.head_dim_k * cfg.head_dim_v
-    put('kda_recurrent_state', cfg.n_kda * hvkv, cfg.n_kda * hvkv)
-    lookback = (conv_ksize - 1) * cfg.d_model
-    put('kda_conv_lookback', cfg.n_kda * lookback, cfg.n_kda * lookback)
+    # Memory route: constant recurrent state + per-layer streaming
+    # buffer, attributed by the ACTUAL route (ratio mode: memory_type;
+    # explicit layout: the memory kind present). All three routes keep
+    # an O(1) sequence-independent state; only the shapes differ.
+    counts = _layer_counts(cfg)
+    if cfg.layout is not None:
+        memory_kinds = [k for k in cfg.layout if k in _MEMORY_KINDS]
+        route = memory_kinds[0] if memory_kinds else cfg.memory_type
+    else:
+        route = cfg.memory_type
+    n_mem = counts.get(route, 0)
+    if route == 'kda':
+        hvkv = cfg.n_heads_v * cfg.head_dim_k * cfg.head_dim_v
+        put('kda_recurrent_state', n_mem * hvkv, n_mem * hvkv)
+        lookback = (conv_ksize - 1) * cfg.d_model
+        put('kda_conv_lookback', n_mem * lookback, n_mem * lookback)
+    elif route == 'mamba2':
+        d_inner = cfg.mamba_expand * cfg.d_model
+        mamba_heads = (d_inner // cfg.mamba_headdim
+                       if cfg.mamba_headdim > 0 else 1)
+        ssm = mamba_heads * cfg.mamba_headdim * cfg.mamba_d_state
+        conv = d_inner * (cfg.mamba_d_conv - 1)
+        put('mamba2_ssm_state', n_mem * ssm, n_mem * ssm)
+        put('mamba2_conv_state', n_mem * conv, n_mem * conv)
+    elif route == 'rwkv7':
+        rwkv_heads = (cfg.d_model // cfg.rwkv_head_dim
+                      if cfg.rwkv_head_dim > 0 else 1)
+        matrix = rwkv_heads * cfg.rwkv_head_dim * cfg.rwkv_head_dim
+        shift = cfg.d_model
+        put('rwkv7_matrix_state', n_mem * matrix, n_mem * matrix)
+        put('rwkv7_shift_state', n_mem * shift, n_mem * shift)
 
-    # CSA.
+    # CSA / HCA (layout-aware counts; identical to the historical values
+    # in ratio mode).
+    n_csa_l = counts['csa']
+    n_hca_l = counts['hca']
     n_csa_blocks = T // cfg.csa_m
     csa_cap = geometric_capacity(n_csa_blocks)
     put('csa_compressed_kv',
-        cfg.n_csa * csa_cap * cfg.csa_c,
-        cfg.n_csa * n_csa_blocks * cfg.csa_c)
+        n_csa_l * csa_cap * cfg.csa_c,
+        n_csa_l * n_csa_blocks * cfg.csa_c)
     put('csa_indexer_kv',
-        cfg.n_csa * csa_cap * cfg.csa_cI,
-        cfg.n_csa * n_csa_blocks * cfg.csa_cI)
+        n_csa_l * csa_cap * cfg.csa_cI,
+        n_csa_l * n_csa_blocks * cfg.csa_cI)
     put('csa_sliding_window',
-        cfg.n_csa * cfg.csa_sliding_window * cfg.csa_c,
-        cfg.n_csa * min(T, cfg.csa_sliding_window) * cfg.csa_c)
+        n_csa_l * cfg.csa_sliding_window * cfg.csa_c,
+        n_csa_l * min(T, cfg.csa_sliding_window) * cfg.csa_c)
     put('csa_partial_tail',
-        cfg.n_csa * (T % cfg.csa_m) * (4 * cfg.csa_c + 2 * cfg.csa_cI),
-        cfg.n_csa * (T % cfg.csa_m) * (4 * cfg.csa_c + 2 * cfg.csa_cI))
+        n_csa_l * (T % cfg.csa_m) * (4 * cfg.csa_c + 2 * cfg.csa_cI),
+        n_csa_l * (T % cfg.csa_m) * (4 * cfg.csa_c + 2 * cfg.csa_cI))
     overlap = (2 * cfg.csa_m * cfg.csa_c) if n_csa_blocks >= 1 else 0
-    put('csa_overlap_blocks', cfg.n_csa * overlap, cfg.n_csa * overlap)
+    put('csa_overlap_blocks', n_csa_l * overlap, n_csa_l * overlap)
 
     # HCA.
     n_hca_blocks = T // cfg.hca_m2
     hca_cap = geometric_capacity(n_hca_blocks)
     put('hca_compressed_kv',
-        cfg.n_hca * hca_cap * cfg.hca_c,
-        cfg.n_hca * n_hca_blocks * cfg.hca_c)
+        n_hca_l * hca_cap * cfg.hca_c,
+        n_hca_l * n_hca_blocks * cfg.hca_c)
     put('hca_sliding_window',
-        cfg.n_hca * cfg.hca_sliding_window * cfg.hca_c,
-        cfg.n_hca * min(T, cfg.hca_sliding_window) * cfg.hca_c)
+        n_hca_l * cfg.hca_sliding_window * cfg.hca_c,
+        n_hca_l * min(T, cfg.hca_sliding_window) * cfg.hca_c)
     put('hca_partial_tail',
-        cfg.n_hca * (T % cfg.hca_m2) * 2 * cfg.hca_c,
-        cfg.n_hca * (T % cfg.hca_m2) * 2 * cfg.hca_c)
+        n_hca_l * (T % cfg.hca_m2) * 2 * cfg.hca_c,
+        n_hca_l * (T % cfg.hca_m2) * 2 * cfg.hca_c)
 
     # Sinks (parameters, kept for one-to-one reconciliation with Exp 3).
-    sink = cfg.n_csa * cfg.csa_nh + cfg.n_hca * cfg.hca_nh
+    sink = n_csa_l * cfg.csa_nh + n_hca_l * cfg.hca_nh
     put('sink_logits', sink, sink)
 
     return comps
@@ -540,7 +634,7 @@ def audit_cache_accounting(decoder, cfg: HybridConfig, *, T: int | None = None,
             if sink is not None:
                 # Sinks are batch-shared parameters (no batch axis).
                 sink_per_seq[kind] += sink.numel()
-    n_layers = {'kda': cfg.n_kda, 'csa': cfg.n_csa, 'hca': cfg.n_hca}
+    n_layers = _layer_counts(cfg)
     op_totals = {}
     hybrid_live = 0.0
     for op in _DTYPES_BY_OP:
@@ -575,21 +669,34 @@ def audit_cache_accounting(decoder, cfg: HybridConfig, *, T: int | None = None,
                                'live': live_per_layer,
                                'analytic': committed})
 
+    # The hybrid committed total follows the model's memory ROUTE (the
+    # hybrid_kch row assumes KDA memory slots; auditing an mamba2 / rwkv7
+    # model against it would miscount the memory-op total).
+    if cfg.layout is not None:
+        memory_route = next(
+            (k for k in cfg.layout if k in _MEMORY_KINDS), cfg.memory_type)
+    else:
+        memory_route = cfg.memory_type
+    hybrid_op = {'kda': 'hybrid_kch', 'mamba2': 'hybrid_mamba2',
+                 'rwkv7': 'hybrid_rwkv7'}[memory_route]
     hybrid_committed = float(kv_cache_elements(
-        'hybrid_kch', T, mode='full_accounting', **geo))
-    op_totals['hybrid_kch'] = {
+        hybrid_op, T, mode='full_accounting', **geo))
+    op_totals[hybrid_op] = {
         'live_layout': hybrid_live,
         'committed_full_accounting_per_layer': hybrid_committed,
         'match': hybrid_live == hybrid_committed,
     }
     if hybrid_live != hybrid_committed:
-        mismatches.append({'component': 'hybrid_kch_total', 'live': hybrid_live,
+        mismatches.append({'component': f'{hybrid_op}_total',
+                           'live': hybrid_live,
                            'analytic': hybrid_committed})
 
     return {
         'context_len': T,
         'batch_size': live['batch_size'],
         'layout': [cfg.n_kda, cfg.n_csa, cfg.n_hca],
+        'memory_type': memory_route,
+        'resolved_layout': list(cfg.layout) if cfg.layout is not None else None,
         'per_component': per_component,
         'per_operator': op_totals,
         'mismatches': mismatches,
@@ -650,7 +757,8 @@ def autograd_graph_probe(cfg: HybridConfig, *, total_layers: int | None = None,
             f'got {steps!r}')
     steps = sorted(int(s) for s in steps)
     if total_layers is None:
-        total_layers = max(1, cfg.n_kda + cfg.n_csa + cfg.n_hca)
+        total_layers = (len(cfg.layout) if cfg.layout is not None
+                        else max(1, cfg.n_kda + cfg.n_csa + cfg.n_hca))
 
     torch.manual_seed(seed)
     decoder = HybridDecoding(cfg=cfg, total_layers=total_layers).to(device)
@@ -806,6 +914,10 @@ def run_cache_audit(decoder, cfg: HybridConfig, *, T: int | None = None,
                                          'compute) / Kimi Linear (2510.26692'
                                          'v2) §7.1 (FP8 indexer)',
                 'kda_constant_state': 'Kimi Linear §3.2 / Eq. (15)',
+                'rwkv7_constant_state': (
+                    'RWKV-7 (Goose) recurrent matrix state — O(1) '
+                    'sequence-independent per layer; see ops_rwkv.py for '
+                    'the upstream binding'),
             },
         },
     }

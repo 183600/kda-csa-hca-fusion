@@ -1115,10 +1115,13 @@ def fig_quality_latency():
 
     # exp4 op name -> exp2 row name (single-layer end-to-end boundary
     # preferred; kda's reference recurrence row stands in for the kda op).
+    # rwkv7 joins only when an Exp 2 rwkv7 row exists (run_benchmark has
+    # not gained an rwkv7 row yet; the join is skipped gracefully).
     bench_name = {'softmax': 'softmax', 'kda': 'kda_rec',
-                  'mamba2': 'mamba2_layer', 'csa': 'csa', 'hca': 'hca'}
+                  'mamba2': 'mamba2_layer', 'rwkv7': 'rwkv7_layer',
+                  'csa': 'csa', 'hca': 'hca'}
     decode_name = {'softmax': 'softmax', 'kda': 'kda', 'mamba2': 'mamba2',
-                   'csa': 'csa', 'hca': 'hca'}
+                   'rwkv7': 'rwkv7', 'csa': 'csa', 'hca': 'hca'}
 
     # Accuracy per op (n_kv=1 rows; the canonical probe setting).
     acc_by_op = {}
@@ -1153,7 +1156,7 @@ def fig_quality_latency():
     fig, axes = plt.subplots(1, len(panels), figsize=(6.0 * len(panels), 4.6),
                              squeeze=False, constrained_layout=True)
     colors = {'softmax': '#767676', 'kda': '#1f77b4', 'mamba2': '#d62728',
-              'csa': '#2ca02c', 'hca': '#9467bd'}
+              'rwkv7': '#ff7f0e', 'csa': '#2ca02c', 'hca': '#9467bd'}
     for ax, (kind, lat, name_map, xlabel) in zip(axes[0], panels):
         plotted = False
         for op, acc in acc_by_op.items():
@@ -1201,7 +1204,8 @@ def fig_quality_cache():
             acc_by_op.setdefault(r['op'], r['mean_acc'])
 
     cache_name = {'softmax': 'softmax_gqa', 'kda': 'kda',
-                  'mamba2': 'mamba2', 'csa': 'csa', 'hca': 'hca'}
+                  'mamba2': 'mamba2', 'rwkv7': 'rwkv7', 'csa': 'csa',
+                  'hca': 'hca'}
     max_t = max(r['T'] for r in cache_rows)
     bytes_by_op = {}
     for r in cache_rows:
@@ -1211,7 +1215,7 @@ def fig_quality_cache():
 
     fig, ax = plt.subplots(figsize=(6.4, 4.6), constrained_layout=True)
     colors = {'softmax': '#767676', 'kda': '#1f77b4', 'mamba2': '#d62728',
-              'csa': '#2ca02c', 'hca': '#9467bd'}
+              'rwkv7': '#ff7f0e', 'csa': '#2ca02c', 'hca': '#9467bd'}
     plotted = False
     for op, acc in acc_by_op.items():
         row_name = cache_name.get(op)

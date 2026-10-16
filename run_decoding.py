@@ -51,6 +51,8 @@ from ops_fused import (
 )
 from ops_mamba import build_mamba2_mixer
 from ops_mamba_backend import validate_mamba_backend
+from ops_rwkv import build_rwkv7_mixer
+from ops_rwkv_backend import validate_rwkv_backend
 
 # One-shot warning emitted in ``main()`` (not at import time) so notebook /
 # REPL users do not silently misread the decoding results as a fair
@@ -458,6 +460,80 @@ class Mamba2AttnDecoding(nn.Module):
         return out
 
 
+class Rwkv7AttnDecoding(nn.Module):
+    """RWKV-7 attention with incremental decode state.
+
+    Wraps :class:`ops_rwkv.Rwkv7Mixer` (via the backend factory). The
+    mixer already implements prefill (T > 1) and single-token steps
+    through :meth:`forward_functional`; this wrapper owns the per-request
+    state buffers so the module matches the SoftmaxAttnDecoding /
+    KDAAttnDecoding / Mamba2AttnDecoding reset/forward contract used by
+    ``bench_decoding``.
+
+    Like KDA / Mamba-2, RWKV-7's decode cost is O(1) per token with a
+    FIXED state (matrix state [B, H, K, V] + token-shift state
+    [B, 1, d_model]) — the decode-latency curve stays flat in the
+    cached context length, mirroring the KDA/Mamba-2 rows rather than
+    the growing softmax row.
+
+    Decode-scale geometry: d_model=64 with head_dim=16 (H=4), matching
+    the benchmark's other memory operators' decode geometry scale.
+    """
+
+    def __init__(self, d_model, head_dim=16):
+        super().__init__()
+        head_dim_eff = min(head_dim, d_model)
+        while d_model % head_dim_eff != 0:
+            head_dim_eff //= 2
+        cfg = HybridConfig(
+            d_model=d_model, memory_type='rwkv7',
+            rwkv_head_dim=head_dim_eff,
+            rwkv_backend=validate_rwkv_backend(
+                os.environ.get('RWKV_BACKEND', 'reference')),
+        )
+        self.mixer = build_rwkv7_mixer(cfg)
+        # Per-request runtime state, registered as non-persistent buffers
+        # so .to(device)/.half() move them and state_dict saves skip them.
+        # The matrix state lives in COMPUTE precision (fp32 for fp16/bf16
+        # inputs) across decode steps, mirroring the other memory
+        # operators' state contract; the shift state lives in the input
+        # dtype.
+        self.register_buffer('_matrix_state', None, persistent=False)
+        self.register_buffer('_shift_state', None, persistent=False)
+
+    @property
+    def effective_backend(self):
+        return getattr(self.mixer, 'effective_backend', 'reference')
+
+    def reset(self):
+        # Drop both tensors so peak-memory accounting counts the full
+        # runtime cache allocation inside the timed region (mirrors the
+        # CSA/HCA/KDA/Mamba-2 cache-drop rationale).
+        self._matrix_state = None
+        self._shift_state = None
+
+    def forward(self, x):
+        B, T_new, _ = x.shape
+        matrix = self._matrix_state
+        if matrix is not None and matrix.shape[0] != B:
+            # Batch size changed — drop the state (per-sequence, cannot
+            # be reused across batch sizes).
+            matrix = None
+        compute_dtype = (torch.float64 if x.dtype == torch.float64
+                         else torch.float32)
+        if matrix is not None and (matrix.device != x.device
+                                   or matrix.dtype != compute_dtype):
+            matrix = matrix.to(device=x.device, dtype=compute_dtype)
+        out, new_matrix, new_shift = self.mixer.forward_functional(
+            x, matrix, self._shift_state)
+        # Persist detached state (decode state must not retain the
+        # autograd graph across steps).
+        self._matrix_state = (new_matrix.detach()
+                              if new_matrix is not None else None)
+        self._shift_state = new_shift
+        return out
+
+
 class CSAAttnDecoding(nn.Module):
     """CSA attention with incremental decoding cache.
 
@@ -780,10 +856,10 @@ class HybridDecoding(nn.Module):
         ``csa_topk``/``d_model`` are ignored (raise on a conflicting
         explicit ``csa_topk`` rather than silently dropping it).
         """
-        if memory_type not in ('kda', 'mamba2'):
+        if memory_type not in ('kda', 'mamba2', 'rwkv7'):
             raise ValueError(
                 f"HybridDecoding: memory_type={memory_type!r} must be "
-                f"'kda' or 'mamba2'.")
+                f"'kda', 'mamba2', or 'rwkv7'.")
         super().__init__()
         if cfg is not None:
             if not isinstance(cfg, HybridConfig):
@@ -807,6 +883,8 @@ class HybridDecoding(nn.Module):
                 memory_type=memory_type,
                 mamba_backend=validate_mamba_backend(
                     os.environ.get('MAMBA_BACKEND', 'reference')),
+                rwkv_backend=validate_rwkv_backend(
+                    os.environ.get('RWKV_BACKEND', 'reference')),
             )
             if memory_type == 'mamba2':
                 # Decode-scale Mamba-2 geometry: d_model=64, expand=2 ->
@@ -815,6 +893,15 @@ class HybridDecoding(nn.Module):
                 # benchmark.
                 extra.update(mamba_d_state=16, mamba_d_conv=4,
                              mamba_expand=2, mamba_headdim=32)
+            if memory_type == 'rwkv7':
+                # Decode-scale RWKV-7 geometry: d_model=64, head_dim=16
+                # -> H=4 heads; the matrix state is H x K x K per layer,
+                # the same order as Mamba-2's (H x headdim x d_state).
+                # The LoRA widths are the small-scale values (the HybridConfig
+                # defaults 32/32/64 are the d_model=256 main-table widths
+                # and exceed this decode geometry's hidden size).
+                extra.update(rwkv_head_dim=16, rwkv_decay_lora=4,
+                             rwkv_a_lora=4, rwkv_gate_lora=8)
             self.cfg = HybridConfig(
                 d_model=d_model,
                 n_heads_qk=2, n_heads_v=2,
@@ -1051,10 +1138,10 @@ class HybridDecoding(nn.Module):
                 self.model.layers, self.model.norms, self.model.layout):
             residual = x
             h = norm(x)
-            if kind in ('kda', 'mamba2'):
-                # Memory layer (KDA or Mamba-2 — both satisfy the same
-                # stateful layer contract forward(h, state) -> (o, state)
-                # with an internal conv-lookback buffer).
+            if kind in ('kda', 'mamba2', 'rwkv7'):
+                # Memory layer (KDA, Mamba-2, or RWKV-7 — all satisfy the
+                # same stateful layer contract forward(h, state) -> (o, state)
+                # with an internal shift/conv-lookback buffer).
                 o, new_state = layer(h, states[kda_idx])
                 states[kda_idx] = new_state
                 kda_idx += 1
@@ -1275,8 +1362,25 @@ def main():
     print(f'Experiment 6: Decoding Latency Benchmark ({device})')
     print('=' * 70)
     d_model = 64
-    prefill_lens = [128, 512, 1024, 2048]
-    n_decode = 20
+    # Prefill lengths / decode token count are env-tunable so the formal
+    # efficiency protocol from the experiment design (prefill 128 / 512 /
+    # 2048 / 8192, batch 1 and 8, decode 256 tokens) can be run WITHOUT
+    # changing the historical defaults that the committed figures use.
+    #   DECODE_PREFILL_LENS='128,512,2048,8192' DECODE_N_TOKENS=256
+    # (the batch dimension is set by bench_decoding's callers; the
+    # default path benchmarks batch=1 here.)
+    _plen_raw = os.environ.get('DECODE_PREFILL_LENS',
+                               '128,512,1024,2048')
+    prefill_lens = [int(x.strip()) for x in _plen_raw.split(',')
+                    if x.strip().strip()]
+    if not prefill_lens or any(p < 1 for p in prefill_lens):
+        raise ValueError(
+            f"DECODE_PREFILL_LENS={_plen_raw!r} must be a comma-separated "
+            f"list of positive ints.")
+    n_decode = int(os.environ.get('DECODE_N_TOKENS', '20') or 20)
+    if n_decode < 1:
+        raise ValueError(
+            f"DECODE_N_TOKENS={n_decode!r} must be a positive int.")
     # Hoist n_repeats into a module-visible variable so the error path can
     # record the same value as the success path.
     N_REPEATS = 3
@@ -1285,10 +1389,12 @@ def main():
         'softmax': lambda: SoftmaxAttnDecoding(d_model),
         'kda':     lambda: KDAAttnDecoding(d_model),
         'mamba2':  lambda: Mamba2AttnDecoding(d_model),
+        'rwkv7':   lambda: Rwkv7AttnDecoding(d_model),
         'csa':     lambda: CSAAttnDecoding(d_model),
         'hca':     lambda: HCAAttnDecoding(d_model),
         'hybrid':  lambda: HybridDecoding(d_model),
         'hybrid_mamba2': lambda: HybridDecoding(d_model, memory_type='mamba2'),
+        'hybrid_rwkv7': lambda: HybridDecoding(d_model, memory_type='rwkv7'),
     }
     # Seed the global RNG before constructing any model so each operator's
     # weights are deterministic across runs (the ``main()`` path otherwise
@@ -1305,9 +1411,10 @@ def main():
                 r = bench_decoding(model, d_model, plen, n_decode, device,
                                    repeats=N_REPEATS)
                 r['op'] = name
-                r['n_layers'] = 5 if name in ('hybrid', 'hybrid_mamba2') else 1
+                hybrid_names = ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7')
+                r['n_layers'] = 5 if name in hybrid_names else 1
                 r['compute_boundary'] = (
-                    'end_to_end_multi_layer' if name in ('hybrid', 'hybrid_mamba2')
+                    'end_to_end_multi_layer' if name in hybrid_names
                     else 'end_to_end_single_layer')
                 r['device'] = str(device)
                 r['kda_backend'] = (
@@ -1317,6 +1424,10 @@ def main():
                 r['mamba_backend'] = (
                     os.environ.get('MAMBA_BACKEND', 'reference')
                     if name in {'mamba2', 'hybrid_mamba2'} else None
+                )
+                r['rwkv_backend'] = (
+                    os.environ.get('RWKV_BACKEND', 'reference')
+                    if name in {'rwkv7', 'hybrid_rwkv7'} else None
                 )
                 # The hybrid wrapper wires CSA/HCA incremental caches into
                 # the full stack, so the row measures the real decode path.
@@ -1375,9 +1486,9 @@ def main():
                 # ``repeats`` records N_REPEATS (not None) so error rows
                 # match the success-row schema.
                 results.append({'op': name,
-                                'n_layers': 5 if name in ('hybrid', 'hybrid_mamba2') else 1,
+                                'n_layers': 5 if name in ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7') else 1,
                                 'compute_boundary': (
-                                    'end_to_end_multi_layer' if name in ('hybrid', 'hybrid_mamba2')
+                                    'end_to_end_multi_layer' if name in ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7')
                                     else 'end_to_end_single_layer'),
                                 'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
@@ -1388,6 +1499,10 @@ def main():
                                 'mamba_backend': (
                                     os.environ.get('MAMBA_BACKEND', 'reference')
                                     if name in {'mamba2', 'hybrid_mamba2'} else None
+                                ),
+                                'rwkv_backend': (
+                                    os.environ.get('RWKV_BACKEND', 'reference')
+                                    if name in {'rwkv7', 'hybrid_rwkv7'} else None
                                 ),
                                 'prefill_ms': None,
                                 'mean_decode_ms_per_token': None,

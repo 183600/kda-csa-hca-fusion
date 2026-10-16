@@ -73,6 +73,13 @@ DEFAULTS = dict(
     # (official-module defaults; d_inner = expand*d, nheads = d_inner/headdim).
     mamba_d_state=64, mamba_d_conv=4, mamba_expand=2, mamba_headdim=64,
     mamba_ngroups=1, mamba_dt_rank='auto',
+    # RWKV-7 geometry for the 'rwkv7' / 'hybrid_rwkv7' accounting rows.
+    # head_dim=64 (upstream's "don't change" value; H = d/head_dim);
+    # the LoRA widths follow the fla formula at this paper-scale d=4096:
+    # max(32, round(coeff*sqrt(d)/32)*32) with coefficients 2.5 (decay),
+    # 2.5 (a), 5 (gate) -> 160 / 160 / 320.
+    rwkv_head_dim=64, rwkv_decay_lora=160, rwkv_a_lora=160,
+    rwkv_gate_lora=320,
 )
 
 
@@ -167,8 +174,8 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         raise ValueError(
             f"kv_cache_elements: unknown keyword argument(s) "
             f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
-    _valid_ops = {'softmax_gqa', 'kda', 'mamba2', 'csa', 'hca', 'hybrid_kch',
-                  'hybrid_mamba2'}
+    _valid_ops = {'softmax_gqa', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca',
+                  'hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7'}
     if op not in _valid_ops:
         raise ValueError(
             f"kv_cache_elements: op={op!r} must be one of "
@@ -235,6 +242,28 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             conv_state = d_inner * (p['mamba_d_conv'] - 1)
             return ssm_state + conv_state
         return ssm_state
+
+    if op == 'rwkv7':
+        # RWKV-7 keeps a FIXED per-layer state — sequence-INDEPENDENT,
+        # the same O(1) property as KDA / Mamba-2:
+        #   * matrix state: [H, K, V] per layer in compute precision
+        #     (K = V = rwkv_head_dim; H = d // rwkv_head_dim), i.e.
+        #     ``d * rwkv_head_dim`` elements — the M_matrix of the
+        #     cache-budget model;
+        #   * shift state: [1, d] (the previous token's input, for the
+        #     token shift), input dtype.
+        # ``compressed_kv_only`` reports just the matrix state (the
+        # analogue of KDA's recurrent state / Mamba-2's SSM state);
+        # ``full_accounting`` adds the shift state. NOTE: within a hybrid
+        # STACK the CSA/HCA compressed entries still grow with T — the
+        # hybrid rows below carry that, so only the RWKV-7 BRANCH of the
+        # hybrid cache is fixed-size.
+        nheads = p['d'] // p['rwkv_head_dim'] if p['rwkv_head_dim'] > 0 else 1
+        matrix_state = nheads * p['rwkv_head_dim'] * p['rwkv_head_dim']
+        if mode == 'full_accounting':
+            shift_state = p['d']
+            return matrix_state + shift_state
+        return matrix_state
 
     if op == 'csa':
         n_blocks = max(1, (T + csa_m - 1) // csa_m)
@@ -323,6 +352,20 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         hca_part = n_hca * kv_cache_elements('hca', T, mode=mode, **p)
         return mem_part + csa_part + hca_part
 
+    if op == 'hybrid_rwkv7':
+        # The RWKV-7-route hybrid: the SAME ratio slots as hybrid_kch but
+        # the memory layers are RWKV-7 mixers (the KDA-replacement
+        # ablation's cache row). The CSA/HCA parts are IDENTICAL to
+        # hybrid_kch, so the row-pair difference isolates the memory
+        # operator's state cost.
+        n_mem = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
+        mem_part = n_mem * kv_cache_elements('rwkv7', T, mode=mode, **p)
+        csa_part = n_csa * kv_cache_elements('csa', T, mode=mode, **p)
+        hca_part = n_hca * kv_cache_elements('hca', T, mode=mode, **p)
+        return mem_part + csa_part + hca_part
+
     raise ValueError(op)
 
 
@@ -353,6 +396,12 @@ def kv_cache_breakdown(op: str, T: int, **kw):
             'recurrent_state': nheads * p['mamba_headdim'] * p['mamba_d_state'],
             'conv_state': d_inner * (p['mamba_d_conv'] - 1),
         }
+    if op == 'rwkv7':
+        nheads = p['d'] // p['rwkv_head_dim'] if p['rwkv_head_dim'] > 0 else 1
+        return {
+            'recurrent_state': nheads * p['rwkv_head_dim'] * p['rwkv_head_dim'],
+            'shift_state': p['d'],
+        }
     if op == 'csa':
         n_blocks = max(1, (T + p['csa_m'] - 1) // p['csa_m'])
         n_completed = T // p['csa_m']
@@ -380,8 +429,9 @@ def kv_cache_breakdown(op: str, T: int, **kw):
             'partial_accumulator': partial_tokens * (2 * p['hca_c']),
             'compressed_kv_only_total': n_blocks * p['hca_c'],
         }
-    if op in ('hybrid_kch', 'hybrid_mamba2'):
-        mem_op = 'kda' if op == 'hybrid_kch' else 'mamba2'
+    if op in ('hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7'):
+        mem_op = {'hybrid_kch': 'kda', 'hybrid_mamba2': 'mamba2',
+                  'hybrid_rwkv7': 'rwkv7'}[op]
         n_mem = p.get('hybrid_n_kda', 3)
         n_csa = p.get('hybrid_n_csa', 1)
         n_hca = p.get('hybrid_n_hca', 1)
@@ -389,9 +439,9 @@ def kv_cache_breakdown(op: str, T: int, **kw):
         csa = kv_cache_breakdown('csa', T, **p)
         hca = kv_cache_breakdown('hca', T, **p)
         out = {}
-        for bucket in ('recurrent_state', 'conv_state', 'compressed_cache',
-                       'window_cache', 'indexer_cache', 'partial_accumulator',
-                       'overlap_state'):
+        for bucket in ('recurrent_state', 'conv_state', 'shift_state',
+                       'compressed_cache', 'window_cache', 'indexer_cache',
+                       'partial_accumulator', 'overlap_state'):
             total = 0
             for count, comp in ((n_mem, mem), (n_csa, csa), (n_hca, hca)):
                 v = comp.get(bucket)
@@ -402,8 +452,8 @@ def kv_cache_breakdown(op: str, T: int, **kw):
         return out
     raise ValueError(
         f"kv_cache_breakdown: op={op!r} must be one of "
-        f"['softmax_gqa', 'kda', 'mamba2', 'csa', 'hca', 'hybrid_kch', "
-        f"'hybrid_mamba2'].")
+        f"['softmax_gqa', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca', "
+        f"'hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7'].")
 
 
 def prefill_flops(op: str, T: int, **kw):
@@ -533,6 +583,31 @@ def prefill_flops(op: str, T: int, **kw):
         scan = 2 * 3 * T * nheads * headdim * d_state
         out_proj = 2 * T * d_inner * d
         return in_proj + conv + x_proj + dt_proj + scan + out_proj
+    if op == 'rwkv7':
+        # Full mixer FLOPs, matching ops_rwkv.Rwkv7Mixer's actual matmul
+        # shapes (K = V = rwkv_head_dim; H = d // rwkv_head_dim; r_w/r_a/
+        # r_g = the three LoRA widths):
+        #   r/k/v/o_proj : d -> d (four of them)      4 * 2*T*d*d
+        #   w_lora       : d -> r_w -> d               2*T*d*r_w*2
+        #   a_lora       : d -> r_a -> d               2*T*d*r_a*2
+        #   g_lora       : d -> r_g -> d               2*T*d*r_g*2
+        #   token shift / k_k / k_a / r_k / l2norm:   O(T*d) — negligible,
+        #                                               counted as 5*2*T*d
+        #   recurrence   : ~6 K×V-sized passes per head per step (decay
+        #                  multiply, kk^T·S contract dot, outer update,
+        #                  k⊗v outer, elementwise add, S^T·r readout)
+        #                  -> 2*6*T*H*K*V
+        #   shortcut+gate: (r·k·r_k).sum + ⊗v + ⊙g    ~2*T*(H*(K+V) + 2*d)
+        #                  (groupnorm ~3*T*H*V folded in)
+        nheads = p['d'] // p['rwkv_head_dim'] if p['rwkv_head_dim'] > 0 else 1
+        kk_dim = p['rwkv_head_dim']
+        proj = 4 * 2 * T * d * d
+        loras = 2 * 2 * T * d * (p['rwkv_decay_lora'] + p['rwkv_a_lora']
+                                 + p['rwkv_gate_lora'])
+        misc = 5 * 2 * T * d
+        scan = 2 * 6 * T * nheads * kk_dim * kk_dim
+        shortcut = 2 * T * (nheads * (kk_dim + kk_dim) + 2 * d + 3 * nheads * kk_dim)
+        return proj + loras + misc + scan + shortcut
     if op == 'csa':
         # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
         # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last
@@ -633,6 +708,15 @@ def prefill_flops(op: str, T: int, **kw):
         return (n_mem * prefill_flops('mamba2', T, **p)
                 + n_csa * prefill_flops('csa', T, **p)
                 + n_hca * prefill_flops('hca', T, **p))
+    if op == 'hybrid_rwkv7':
+        # RWKV-7-route hybrid at the same ratio slots (the KDA-replacement
+        # ablation's compute row); CSA/HCA FLOPs identical to hybrid_kch.
+        n_mem = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
+        return (n_mem * prefill_flops('rwkv7', T, **p)
+                + n_csa * prefill_flops('csa', T, **p)
+                + n_hca * prefill_flops('hca', T, **p))
     raise ValueError(op)
 
 
@@ -643,8 +727,8 @@ def main():
     seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
                    131072, 262144, 524288, 1048576]
 
-    ops = ['softmax_gqa', 'kda', 'mamba2', 'csa', 'hca', 'hybrid_kch',
-           'hybrid_mamba2']
+    ops = ['softmax_gqa', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca',
+           'hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7']
     rows = []
     for T in seq_lengths:
         flops_base_1l = prefill_flops('softmax_gqa', T)
@@ -673,6 +757,8 @@ def main():
                         if op == 'kda'
                         else 'fixed_ssm_state_plus_conv_state'
                         if op == 'mamba2'
+                        else 'fixed_matrix_state_plus_shift_state'
+                        if op == 'rwkv7'
                         else 'compressed_rows_plus_runtime_decode_state'
                         if op in ('csa', 'hca')
                         else 'hybrid_full_runtime_decode_state'

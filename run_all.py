@@ -731,20 +731,24 @@ def run_all(seeds=None, steps=None):
             os.environ['ABL_STEPS'] = str(min(_abl_steps, 50))
         summary['runs'].append(_run('exp5_ablation', run_ablation.main))
 
-        # 5b. Eight-group matrix smoke — ONLY in the smoke profile. A
-        #     1-seed, 5-layer, 5-step pass over all eight groups proves
-        #     the ABL_MODE=matrix plumbing (explicit layouts, both memory
-        #     routes, result file) without any meaningful training budget.
-        #     Numbers from this step are pipeline-validation only.
+        # 5b. Matrix smoke — ONLY in the smoke profile. A 1-seed,
+        #     5-layer, 5-step pass over all TWELVE groups (A/B/C/D x
+        #     kda/mamba2/rwkv7) proves the ABL_MODE=matrix plumbing
+        #     (explicit layouts, ALL THREE memory routes — including the
+        #     RWKV-7 route's geometry clamping, state stacking, and result
+        #     rows — and the contrast side file) without any meaningful
+        #     training budget. Numbers from this step are
+        #     pipeline-validation only.
         if profile == 'smoke':
             _matrix_saved = {k: os.environ.get(k) for k in
                              ('ABL_MODE', 'ABL_MATRIX', 'ABL_SEEDS',
                               'ABL_STEPS', 'ABL_TOTAL_LAYERS', 'ABL_MEMORY',
-                              'ABL_TRAIN_BATCH', 'ABL_D_MODEL')}
+                              'ABL_TRAIN_BATCH', 'ABL_D_MODEL',
+                              'RWKV_HEAD_DIM')}
             os.environ.update(
                 ABL_MODE='matrix', ABL_MATRIX='main8', ABL_SEEDS='1',
                 ABL_STEPS='5', ABL_TOTAL_LAYERS='5',
-                ABL_MEMORY='kda,mamba2', ABL_TRAIN_BATCH='8')
+                ABL_MEMORY='kda,mamba2,rwkv7', ABL_TRAIN_BATCH='8')
             try:
                 summary['runs'].append(
                     _run('exp5b_ablation_matrix_smoke', run_ablation.main))

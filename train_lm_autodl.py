@@ -495,7 +495,16 @@ class LMWithHybrid(nn.Module):
     def __init__(self, vocab_size, cfg: HybridConfig):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg.d_model)
-        self.hybrid = HybridKCHAttention(cfg, total_layers=cfg.n_kda + cfg.n_csa + cfg.n_hca)
+        # Total depth: the EXPLICIT layout is authoritative when set (the
+        # eight-group matrix pins 10-layer layouts whose length is NOT
+        # expressible as n_kda+n_csa+n_hca — using the ratio fields there
+        # would silently build a 5-layer model instead of the configured
+        # one). Ratio mode keeps the historical behaviour.
+        if cfg.layout is not None:
+            total_layers = len(cfg.layout)
+        else:
+            total_layers = cfg.n_kda + cfg.n_csa + cfg.n_hca
+        self.hybrid = HybridKCHAttention(cfg, total_layers=total_layers)
         self.norm_f = nn.LayerNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
@@ -762,6 +771,64 @@ def run_checkpoint_consistency(path, device, seed=1234):
         model, device, seq_len=64, output_dir=os.path.dirname(path) or '.',
         seed=seed)
 
+def _parse_lm_layout(spec: str, repeat: int = 2) -> tuple[str, ...]:
+    """Parse the --layout / LM_LAYOUT spec into a concrete layout tuple.
+
+    Two forms (mirroring ``run_ablation``'s experiment matrix so the LM
+    and the MQAR ablation speak the same layout language):
+
+      * a single preset letter ``A``/``B``/``C``/``D``/``E`` — the 5-layer
+        matrix unit from ``run_ablation.MATRIX_UNIT``, repeated ``repeat``
+        times (default 2 -> the 10-layer formal configuration);
+      * a comma-separated kind list — ``memory`` tokens allowed (resolved
+        via the memory route) alongside the concrete kinds.
+    """
+    if not isinstance(spec, str) or not spec.strip():
+        raise ValueError(f"--layout={spec!r} must be a non-empty string.")
+    spec = spec.strip()
+    if spec.upper() in ('A', 'B', 'C', 'D', 'E') and len(spec) == 1:
+        if not isinstance(repeat, int) or repeat < 1:
+            raise ValueError(
+                f"layout repeat={repeat!r} must be a positive int.")
+        from run_ablation import MATRIX_UNIT
+        return tuple(MATRIX_UNIT[spec.upper()] * repeat)
+    kinds = [k.strip().lower() for k in spec.split(',') if k.strip()]
+    if not kinds:
+        raise ValueError(
+            f"--layout={spec!r} parsed to an empty kind list.")
+    valid = ('memory', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca')
+    for i, k in enumerate(kinds):
+        if k not in valid:
+            raise ValueError(
+                f"--layout kind {i}={k!r} is not one of {valid}.")
+    return tuple(kinds)
+
+
+def _lm_rwkv_dims() -> dict:
+    """Env-tunable RWKV-7 geometry overrides for the LM entry (optional).
+
+    Reuses the SAME env knobs as run_ablation / run_quality
+    (RWKV_HEAD_DIM / RWKV_DECAY_LORA / RWKV_A_LORA / RWKV_GATE_LORA)
+    so one environment pins one geometry across all entries. Only set
+    knobs are returned — unset fields keep the HybridConfig defaults
+    (the main-table geometry: head_dim=64, loras 32/32/64).
+    """
+    out = {}
+    for env, field in (('RWKV_HEAD_DIM', 'rwkv_head_dim'),
+                       ('RWKV_DECAY_LORA', 'rwkv_decay_lora'),
+                       ('RWKV_A_LORA', 'rwkv_a_lora'),
+                       ('RWKV_GATE_LORA', 'rwkv_gate_lora')):
+        raw = os.environ.get(env)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            out[field] = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{env}={raw!r} must be an int (got {exc}).") from exc
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kaggle", action="store_true")
@@ -822,6 +889,31 @@ def main():
     parser.add_argument("--overfit_check_only", action="store_true",
                         help="Run ONLY the overfit sanity gate (no full "
                              "training); useful as a fast smoke test.")
+    # --- memory route / explicit layout (the LM entry joins the ablation
+    # framework's memory-route matrix: same KDA / Mamba-2 / RWKV-7
+    # operators, same layout language, same env knobs). ---
+    parser.add_argument("--memory", choices=("kda", "mamba2", "rwkv7"),
+                        default=None,
+                        help="Recurrent memory operator filling the memory "
+                             "slots (default: env LM_MEMORY or 'kda'). The "
+                             "CSA/HCA layers and all other fields are "
+                             "shared, so this single knob is the "
+                             "KDA-replacement ablation at LM scale.")
+    parser.add_argument("--layout", type=str, default=None,
+                        help="Explicit hybrid layout. Either a matrix "
+                             "preset letter A/B/C/D/E (the 5-layer units "
+                             "from run_ablation.MATRIX_UNIT, repeated "
+                             "--layout_repeat times; default repeat 2 -> "
+                             "the 10-layer formal setting), or a "
+                             "comma-separated kind list "
+                             "(memory/kda/mamba2/rwkv7/csa/hca). Default: "
+                             "env LM_LAYOUT, or the historical "
+                             "n_kda:n_csa:n_hca ratio mode.")
+    parser.add_argument("--layout_repeat", type=int, default=None,
+                        help="Repetitions of the A/B/C/D preset unit "
+                             "(default: env LM_LAYOUT_REPEAT or 2 = the "
+                             "10-layer formal configuration). Ignored for "
+                             "comma-separated layouts.")
     args = parser.parse_args()
 
     # All three splits are mandatory: without validation there is no
@@ -877,10 +969,36 @@ def main():
     kda_backend = validate_kda_backend(
         os.environ.get('KDA_BACKEND', 'reference')
     )
+    # Memory route + explicit layout (the KDA→Mamba-2/RWKV-7 replacement
+    # knob at LM scale). Validated here so a typo fails before the model
+    # is built; the RWKV geometry env knobs are shared with the other
+    # entries (see _lm_rwkv_dims).
+    from ops_mamba_backend import validate_mamba_backend
+    from ops_rwkv_backend import validate_rwkv_backend
+    mamba_backend = validate_mamba_backend(
+        os.environ.get('MAMBA_BACKEND', 'reference'))
+    rwkv_backend = validate_rwkv_backend(
+        os.environ.get('RWKV_BACKEND', 'reference'))
+    memory_route = args.memory or os.environ.get('LM_MEMORY', 'kda')
+    if memory_route not in ('kda', 'mamba2', 'rwkv7'):
+        raise ValueError(
+            f"memory route {memory_route!r} must be one of "
+            f"('kda', 'mamba2', 'rwkv7').")
+    layout_spec = args.layout or os.environ.get('LM_LAYOUT')
+    layout_repeat = (args.layout_repeat if args.layout_repeat is not None
+                     else int(os.environ.get('LM_LAYOUT_REPEAT', '2') or 2))
+    route_kw = dict(
+        memory_type=memory_route,
+        mamba_backend=mamba_backend,
+        rwkv_backend=rwkv_backend,
+    )
+    route_kw.update(_lm_rwkv_dims())
+    if layout_spec is not None:
+        route_kw['layout'] = _parse_lm_layout(layout_spec, layout_repeat)
     if is_kaggle:
         cfg = HybridConfig(d_model=256, n_heads_qk=2, n_heads_v=2, head_dim_k=32, head_dim_v=32,
                            csa_m=8, csa_topk=4, hca_m2=16, n_kda=3, n_csa=1, n_hca=1,
-                           kda_chunk_size=64, kda_backend=kda_backend)
+                           kda_chunk_size=64, kda_backend=kda_backend, **route_kw)
         batch_size = 1
         grad_accum = 8
         seq_len = 512
@@ -888,7 +1006,7 @@ def main():
     else:
         cfg = HybridConfig(d_model=512, n_heads_qk=4, n_heads_v=4, head_dim_k=64, head_dim_v=64,
                            csa_m=16, csa_topk=8, hca_m2=64, n_kda=3, n_csa=1, n_hca=1,
-                           kda_chunk_size=64, kda_backend=kda_backend)
+                           kda_chunk_size=64, kda_backend=kda_backend, **route_kw)
         batch_size = 2
         grad_accum = 4
         seq_len = 1024
@@ -901,7 +1019,14 @@ def main():
     if args.max_steps is not None:
         max_steps = args.max_steps
 
-    print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}, d={cfg.d_model}")
+    if cfg.layout is not None:
+        layout_str = '-'.join(k.upper() for k in cfg.layout)
+        print(f"Hybrid layout: explicit {len(cfg.layout)} layers "
+              f"[{layout_str}], d={cfg.d_model}, "
+              f"memory={cfg.memory_type}")
+    else:
+        print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca} "
+              f"(memory={cfg.memory_type}), d={cfg.d_model}")
     print(f"Training profile: batch_size={batch_size}, grad_accum={grad_accum}, "
           f"seq_len={seq_len}, optimizer_steps={max_steps}, seed={args.seed}")
 
