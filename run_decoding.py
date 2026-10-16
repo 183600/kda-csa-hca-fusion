@@ -48,6 +48,8 @@ from ops_fused import (
     HybridConfig, HybridKCHAttention, KDAHybridLayer, CSAHybridLayer,
     HCAHybridLayer,
 )
+from ops_mamba import build_mamba2_mixer
+from ops_mamba_backend import validate_mamba_backend
 
 # One-shot warning emitted in ``main()`` (not at import time) so notebook /
 # REPL users do not silently misread the decoding results as a fair
@@ -60,15 +62,17 @@ from ops_fused import (
 # The warning is emitted once per process (Python's default
 # warning filter deduplicates by (message, category, module, lineno)).
 _DEFERRED_IMPORT_WARNING = (
-    "run_decoding.py: now benchmarks softmax, KDA, CSA, HCA, and the "
-    "hybrid stack. CSA and HCA use the incremental decoding cache "
-    "(ops_decoding_cache.CSADecodingCache / HCADecodingCache) which "
-    "maintains a partial-token accumulator, a compressed-block cache, "
-    "a sliding-window ring buffer, and (for CSA) a dynamically-updated "
-    "indexer key cache. The hybrid row now wires the same CSA/HCA caches "
-    "into the full KDA+CSA+HCA stack. See README 'Fairness notes' #4 for "
-    "the ``torch.topk`` tie-breaking caveat for CSA's incremental indexer "
-    "(a numerical artifact, not a correctness bug)."
+    "run_decoding.py: now benchmarks softmax, KDA, Mamba-2, CSA, HCA, and "
+    "the hybrid stacks (KDA-route and Mamba-2-route). CSA and HCA use the "
+    "incremental decoding cache (ops_decoding_cache.CSADecodingCache / "
+    "HCADecodingCache) which maintains a partial-token accumulator, a "
+    "compressed-block cache, a sliding-window ring buffer, and (for CSA) a "
+    "dynamically-updated indexer key cache. KDA and Mamba-2 carry their "
+    "fixed O(1) recurrent states (KDA: stacked per-layer state + conv "
+    "lookbacks; Mamba-2: SSM state + conv state). The hybrid rows wire "
+    "the CSA/HCA caches into the full stacks. See README 'Fairness "
+    "notes' #4 for the ``torch.topk`` tie-breaking caveat for CSA's "
+    "incremental indexer (a numerical artifact, not a correctness bug)."
 )
 
 
@@ -387,6 +391,72 @@ class KDAAttnDecoding(nn.Module):
         return self.o(o.reshape(B, T_new, self.H * self.V))
 
 
+class Mamba2AttnDecoding(nn.Module):
+    """Mamba-2 attention with incremental decode state.
+
+    The mixer (:class:`ops_mamba.Mamba2Mixer` via the backend factory)
+    already implements prefill (T > 1, parallel path) and single-token
+    steps through :meth:`forward_functional`; this wrapper owns the
+    per-request state buffers so the module matches the
+    SoftmaxAttnDecoding / KDAAttnDecoding reset/forward contract used by
+    ``bench_decoding``.
+
+    Like KDA, Mamba-2's decode cost is O(1) per token with a FIXED state
+    (SSM state + conv state) — the decode-latency curve should stay flat
+    in the cached context length, mirroring the KDA row rather than the
+    growing softmax row.
+    """
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, headdim=32):
+        super().__init__()
+        cfg = HybridConfig(
+            d_model=d_model, memory_type='mamba2',
+            mamba_d_state=d_state, mamba_d_conv=d_conv,
+            mamba_expand=expand, mamba_headdim=headdim,
+            mamba_backend=validate_mamba_backend(
+                os.environ.get('MAMBA_BACKEND', 'reference')),
+        )
+        self.mixer = build_mamba2_mixer(cfg)
+        # Per-request runtime state, registered as non-persistent buffers
+        # so .to(device)/.half() move them and state_dict saves skip them.
+        # The SSM state lives in COMPUTE precision (fp32 for fp16/bf16
+        # inputs) across decode steps, mirroring KDAAttnDecoding's state
+        # contract; the conv state lives in the input dtype.
+        self.register_buffer('_ssm_state', None, persistent=False)
+        self.register_buffer('_conv_state', None, persistent=False)
+
+    @property
+    def effective_backend(self):
+        return getattr(self.mixer, 'effective_backend', 'reference')
+
+    def reset(self):
+        # Drop both tensors so peak-memory accounting counts the full
+        # runtime cache allocation inside the timed region (mirrors the
+        # CSA/HCA cache-drop rationale).
+        self._ssm_state = None
+        self._conv_state = None
+
+    def forward(self, x):
+        B, T_new, _ = x.shape
+        ssm = self._ssm_state
+        if ssm is not None and ssm.shape[0] != B:
+            # Batch size changed — drop the state (per-sequence, cannot be
+            # reused across batch sizes).
+            ssm = None
+        compute_dtype = (torch.float64 if x.dtype == torch.float64
+                         else torch.float32)
+        if ssm is not None and (ssm.device != x.device
+                                or ssm.dtype != compute_dtype):
+            ssm = ssm.to(device=x.device, dtype=compute_dtype)
+        out, new_ssm, new_conv = self.mixer.forward_functional(
+            x, ssm, self._conv_state)
+        # Persist detached state (decode state must not retain the
+        # autograd graph across steps).
+        self._ssm_state = new_ssm.detach() if new_ssm is not None else None
+        self._conv_state = new_conv
+        return out
+
+
 class CSAAttnDecoding(nn.Module):
     """CSA attention with incremental decoding cache.
 
@@ -666,8 +736,17 @@ class HybridDecoding(nn.Module):
     see the same history they would see in a full-sequence pass.
     """
 
-    def __init__(self, d_model=64, total_layers=5, csa_topk=None, cfg=None):
+    def __init__(self, d_model=64, total_layers=5, csa_topk=None, cfg=None,
+                 memory_type: str = 'kda'):
         """``csa_topk`` is exposed so decode ablations can sweep it.
+
+        ``memory_type`` selects the recurrent memory operator filling the
+        stack's memory slots ('kda' default = the historical row;
+        'mamba2' = the Mamba-2 route with d_state=16 / headdim=32 /
+        expand=2 / d_conv=4 at this decode-scale geometry). The CSA/HCA
+        sub-layers and their incremental caches are IDENTICAL across the
+        two routes, so the hybrid row pair isolates the memory operator's
+        decode cost.
 
         The standalone decode-latency benchmark uses a SMALLER config than
         the Exp 5 ablation / Exp 4 quality models (which use
@@ -700,6 +779,10 @@ class HybridDecoding(nn.Module):
         ``csa_topk``/``d_model`` are ignored (raise on a conflicting
         explicit ``csa_topk`` rather than silently dropping it).
         """
+        if memory_type not in ('kda', 'mamba2'):
+            raise ValueError(
+                f"HybridDecoding: memory_type={memory_type!r} must be "
+                f"'kda' or 'mamba2'.")
         super().__init__()
         if cfg is not None:
             if not isinstance(cfg, HybridConfig):
@@ -711,8 +794,26 @@ class HybridDecoding(nn.Module):
                     f'HybridDecoding: csa_topk={csa_topk} conflicts with '
                     f'cfg.csa_topk={cfg.csa_topk}; pass cfg alone (it is '
                     f'authoritative) or drop csa_topk.')
+            if cfg.memory_type != memory_type:
+                raise ValueError(
+                    f'HybridDecoding: memory_type={memory_type!r} conflicts '
+                    f'with cfg.memory_type={cfg.memory_type!r}; a '
+                    f'caller-supplied config is authoritative for the memory '
+                    f'route — pass the matching memory_type or omit it.')
             self.cfg = cfg
         else:
+            extra = dict(
+                memory_type=memory_type,
+                mamba_backend=validate_mamba_backend(
+                    os.environ.get('MAMBA_BACKEND', 'reference')),
+            )
+            if memory_type == 'mamba2':
+                # Decode-scale Mamba-2 geometry: d_model=64, expand=2 ->
+                # d_inner=128; headdim=32 -> 4 heads; d_state=16 keeps
+                # the per-step state small enough for a fair CPU decode
+                # benchmark.
+                extra.update(mamba_d_state=16, mamba_d_conv=4,
+                             mamba_expand=2, mamba_headdim=32)
             self.cfg = HybridConfig(
                 d_model=d_model,
                 n_heads_qk=2, n_heads_v=2,
@@ -727,7 +828,9 @@ class HybridDecoding(nn.Module):
                 hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
                 hca_sliding_window=4,
                 n_kda=3, n_csa=1, n_hca=1,
+                **extra,
             )
+        self.memory_type = memory_type
         self.model = HybridKCHAttention(self.cfg, total_layers=total_layers)
         # One cache slot per CSA/HCA layer in layout order. The cache tensors
         # are allocated lazily once B/device/dtype are known.
@@ -947,7 +1050,10 @@ class HybridDecoding(nn.Module):
                 self.model.layers, self.model.norms, self.model.layout):
             residual = x
             h = norm(x)
-            if kind == 'kda':
+            if kind in ('kda', 'mamba2'):
+                # Memory layer (KDA or Mamba-2 — both satisfy the same
+                # stateful layer contract forward(h, state) -> (o, state)
+                # with an internal conv-lookback buffer).
                 o, new_state = layer(h, states[kda_idx])
                 states[kda_idx] = new_state
                 kda_idx += 1
@@ -1177,9 +1283,11 @@ def main():
     models = {
         'softmax': lambda: SoftmaxAttnDecoding(d_model),
         'kda':     lambda: KDAAttnDecoding(d_model),
+        'mamba2':  lambda: Mamba2AttnDecoding(d_model),
         'csa':     lambda: CSAAttnDecoding(d_model),
         'hca':     lambda: HCAAttnDecoding(d_model),
         'hybrid':  lambda: HybridDecoding(d_model),
+        'hybrid_mamba2': lambda: HybridDecoding(d_model, memory_type='mamba2'),
     }
     # Seed the global RNG before constructing any model so each operator's
     # weights are deterministic across runs (the ``main()`` path otherwise
@@ -1196,14 +1304,18 @@ def main():
                 r = bench_decoding(model, d_model, plen, n_decode, device,
                                    repeats=N_REPEATS)
                 r['op'] = name
-                r['n_layers'] = 5 if name == 'hybrid' else 1
+                r['n_layers'] = 5 if name in ('hybrid', 'hybrid_mamba2') else 1
                 r['compute_boundary'] = (
-                    'end_to_end_multi_layer' if name == 'hybrid'
+                    'end_to_end_multi_layer' if name in ('hybrid', 'hybrid_mamba2')
                     else 'end_to_end_single_layer')
                 r['device'] = str(device)
                 r['kda_backend'] = (
                     os.environ.get('KDA_BACKEND', 'reference')
                     if name in {'kda', 'hybrid'} else None
+                )
+                r['mamba_backend'] = (
+                    os.environ.get('MAMBA_BACKEND', 'reference')
+                    if name in {'mamba2', 'hybrid_mamba2'} else None
                 )
                 # The hybrid wrapper now wires CSA/HCA incremental caches into
                 # the full stack, so the row is no longer an upper-bound
@@ -1259,15 +1371,19 @@ def main():
                 # ``repeats`` records N_REPEATS (not None) so error rows
                 # match the success-row schema.
                 results.append({'op': name,
-                                'n_layers': 5 if name == 'hybrid' else 1,
+                                'n_layers': 5 if name in ('hybrid', 'hybrid_mamba2') else 1,
                                 'compute_boundary': (
-                                    'end_to_end_multi_layer' if name == 'hybrid'
+                                    'end_to_end_multi_layer' if name in ('hybrid', 'hybrid_mamba2')
                                     else 'end_to_end_single_layer'),
                                 'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
                                 'kda_backend': (
                                     os.environ.get('KDA_BACKEND', 'reference')
                                     if name in {'kda', 'hybrid'} else None
+                                ),
+                                'mamba_backend': (
+                                    os.environ.get('MAMBA_BACKEND', 'reference')
+                                    if name in {'mamba2', 'hybrid_mamba2'} else None
                                 ),
                                 'prefill_ms': None,
                                 'mean_decode_ms_per_token': None,

@@ -5137,6 +5137,55 @@ def test_hybrid_decoding_cache_matches_full_sequence(device='cpu'):
         f'prefill_len={prefill_len}, n_decode={n_decode}, csa_topk=100')]
 
 
+def test_hybrid_decoding_mamba2_route(device='cpu'):
+    """HybridDecoding prefill+decode matches full sequence on the Mamba-2 route.
+
+    Mirrors ``test_hybrid_decoding_cache_matches_full_sequence`` but with
+    ``memory_type='mamba2'``: the Mamba-2 layers' stacked SSM states + conv
+    lookbacks have to stay aligned with the CSA/HCA incremental caches,
+    residuals, and LayerNorm across the stack — the same high-risk
+    state-threading path, now exercised through the second memory route.
+    Uses ``csa_topk=100`` for the same tie-breaking reason as the KDA-route
+    test (documented numerical artifact of torch.topk, not a bug).
+    """
+    logger.info("Test: HybridDecoding (mamba2 route) matches full sequence")
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(707)
+    d_model = 32
+    prefill_len = 8
+    n_decode = 4
+    total_len = prefill_len + n_decode
+    model = HybridDecoding(d_model=d_model, total_layers=5, csa_topk=100,
+                           memory_type='mamba2').to(device).eval()
+    x = torch.randn(1, total_len, d_model, device=device) * 0.1
+
+    with torch.no_grad():
+        model.reset()
+        y_full = model.model(x)
+        model.reset()
+        y_prefill = model(x[:, :prefill_len])
+        ys = []
+        for t in range(prefill_len, total_len):
+            ys.append(model(x[:, t:t+1]))
+        y_inc_decode = torch.cat(ys, dim=1)
+
+    ref_decode = y_full[:, prefill_len:]
+    max_diff = (ref_decode - y_inc_decode).abs().max().item()
+    prefill_diff = (y_full[:, :prefill_len] - y_prefill).abs().max().item()
+    shape_ok = (y_prefill.shape == (1, prefill_len, d_model)
+                and y_inc_decode.shape == (1, n_decode, d_model))
+    return [
+        _ok('hybrid_decoding_mamba2_route_matches_full_sequence',
+            shape_ok and max_diff < 1e-5,
+            f'shape_ok={shape_ok}, decode max_diff={max_diff:.2e} '
+            f'(tol 1e-5)'),
+        _ok('hybrid_decoding_mamba2_route_prefill_prefix_matches',
+            prefill_diff < 1e-5,
+            f'prefill-prefix max_diff={prefill_diff:.2e} (tol 1e-5)'),
+    ]
+
+
 def test_mqar_noise_excludes_keys_and_values(device='cpu'):
     """MQAR filler noise must not leak key/value (or the cued answer) tokens.
 
@@ -6227,6 +6276,9 @@ def main():
     all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
     # Integrated Exp6 hybrid decode-cache path (KDA state + CSA/HCA caches).
     all_results += _run_safe(test_hybrid_decoding_cache_matches_full_sequence, device)
+    # The same integration on the Mamba-2 route (SSM state + conv
+    # lookbacks + CSA/HCA caches).
+    all_results += _run_safe(test_hybrid_decoding_mamba2_route, device)
     # MQAR task construction shared by Exp 4 / Exp 5 (run_quality/run_ablation):
     # filler noise must never leak key/value/answer tokens.
     all_results += _run_safe(test_mqar_noise_excludes_keys_and_values, device)

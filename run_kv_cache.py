@@ -68,6 +68,10 @@ DEFAULTS = dict(
     # hybrid_n_kda / hybrid_n_csa / hybrid_n_hca before the hybrid branch sees
     # them).
     hybrid_n_kda=3, hybrid_n_csa=1, hybrid_n_hca=1,
+    # Mamba-2 geometry for the 'mamba2' / 'hybrid_mamba2' accounting rows
+    # (official-module defaults; d_inner = expand*d, nheads = d_inner/headdim).
+    mamba_d_state=64, mamba_d_conv=4, mamba_expand=2, mamba_headdim=64,
+    mamba_ngroups=1, mamba_dt_rank='auto',
 )
 
 
@@ -162,7 +166,8 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         raise ValueError(
             f"kv_cache_elements: unknown keyword argument(s) "
             f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
-    _valid_ops = {'softmax_gqa', 'kda', 'csa', 'hca', 'hybrid_kch'}
+    _valid_ops = {'softmax_gqa', 'kda', 'mamba2', 'csa', 'hca', 'hybrid_kch',
+                  'hybrid_mamba2'}
     if op not in _valid_ops:
         raise ValueError(
             f"kv_cache_elements: op={op!r} must be one of "
@@ -212,6 +217,23 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
             return recurrent_state + short_conv_state
         # compressed_kv_only: just the recurrent state.
         return recurrent_state
+
+    if op == 'mamba2':
+        # Mamba-2 keeps a FIXED per-layer state — sequence-INDEPENDENT,
+        # the same O(1) property as KDA:
+        #   * SSM state: [nheads, headdim, d_state] (compute precision);
+        #   * conv state: [d_inner, d_conv - 1] (input dtype).
+        # ``compressed_kv_only`` reports just the SSM state (the analogue
+        # of KDA's recurrent state); ``full_accounting`` adds the conv
+        # state. NOTE: within a hybrid STACK the CSA/HCA compressed
+        # entries still grow with T — the hybrid rows below carry that.
+        d_inner = p['mamba_expand'] * p['d']
+        nheads = d_inner // p['mamba_headdim'] if p['mamba_headdim'] > 0 else 1
+        ssm_state = nheads * p['mamba_headdim'] * p['mamba_d_state']
+        if mode == 'full_accounting':
+            conv_state = d_inner * (p['mamba_d_conv'] - 1)
+            return ssm_state + conv_state
+        return ssm_state
 
     if op == 'csa':
         n_blocks = max(1, (T + csa_m - 1) // csa_m)
@@ -287,7 +309,100 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         hca_part = n_hca * kv_cache_elements('hca', T, mode=mode, **p)
         return kda_part + csa_part + hca_part
 
+    if op == 'hybrid_mamba2':
+        # The Mamba-2-route hybrid: the SAME ratio slots as hybrid_kch but
+        # the memory layers are Mamba-2 mixers. The CSA/HCA parts are
+        # IDENTICAL to hybrid_kch (same operators, same geometry), so the
+        # row-pair difference isolates the memory operator's state cost.
+        n_mem = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
+        mem_part = n_mem * kv_cache_elements('mamba2', T, mode=mode, **p)
+        csa_part = n_csa * kv_cache_elements('csa', T, mode=mode, **p)
+        hca_part = n_hca * kv_cache_elements('hca', T, mode=mode, **p)
+        return mem_part + csa_part + hca_part
+
     raise ValueError(op)
+
+
+def kv_cache_breakdown(op: str, T: int, **kw):
+    """Component-wise state accounting (elements, per single layer).
+
+    Splits each operator's retained state into the framework's canonical
+    buckets — recurrent state, convolution state, compressed cache,
+    sliding-window cache, and miscellaneous runtime state — so the
+    quality-vs-cache figures and the budget-matching design can reason
+    about WHERE the bytes go, not just the total. Values are ELEMENT
+    counts (multiply by the dtype size for bytes). Buckets the operator
+    does not retain are omitted from the returned dict.
+    """
+    p = {**DEFAULTS, **kw}
+    if op == 'softmax_gqa':
+        return {'kv_cache': T * p['H'] * (p['K'] + p['V'])}
+    if op == 'kda':
+        _conv_ksize = p.get('kda_conv_ksize', 3)
+        return {
+            'recurrent_state': p['kda_hv'] * p['kda_k'] * p['kda_v'],
+            'conv_state': p['d'] * (_conv_ksize - 1),
+        }
+    if op == 'mamba2':
+        d_inner = p['mamba_expand'] * p['d']
+        nheads = d_inner // p['mamba_headdim'] if p['mamba_headdim'] > 0 else 1
+        return {
+            'recurrent_state': nheads * p['mamba_headdim'] * p['mamba_d_state'],
+            'conv_state': d_inner * (p['mamba_d_conv'] - 1),
+        }
+    if op == 'csa':
+        n_blocks = max(1, (T + p['csa_m'] - 1) // p['csa_m'])
+        n_completed = T // p['csa_m']
+        capacity = geometric_capacity(n_completed)
+        partial_tokens = T % p['csa_m']
+        return {
+            'compressed_cache': capacity * p['csa_c'],
+            'window_cache': p['csa_sliding_window'] * p['csa_c'],
+            'indexer_cache': capacity * p['csa_cI'],
+            'partial_accumulator': partial_tokens * (4 * p['csa_c']
+                                                     + 2 * p['csa_cI']),
+            'overlap_state': (2 * p['csa_m'] * p['csa_c'])
+            if n_completed >= 1 else 0,
+            # Optimistic-mode total kept for reference in the row.
+            'compressed_kv_only_total': n_blocks * p['csa_c'],
+        }
+    if op == 'hca':
+        n_blocks = max(1, (T + p['hca_m2'] - 1) // p['hca_m2'])
+        n_completed = T // p['hca_m2']
+        capacity = geometric_capacity(n_completed)
+        partial_tokens = T % p['hca_m2']
+        return {
+            'compressed_cache': capacity * p['hca_c'],
+            'window_cache': p['hca_sliding_window'] * p['hca_c'],
+            'partial_accumulator': partial_tokens * (2 * p['hca_c']),
+            'compressed_kv_only_total': n_blocks * p['hca_c'],
+        }
+    if op in ('hybrid_kch', 'hybrid_mamba2'):
+        mem_op = 'kda' if op == 'hybrid_kch' else 'mamba2'
+        n_mem = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
+        mem = kv_cache_breakdown(mem_op, T, **p)
+        csa = kv_cache_breakdown('csa', T, **p)
+        hca = kv_cache_breakdown('hca', T, **p)
+        out = {}
+        for bucket in ('recurrent_state', 'conv_state', 'compressed_cache',
+                       'window_cache', 'indexer_cache', 'partial_accumulator',
+                       'overlap_state'):
+            total = 0
+            for count, comp in ((n_mem, mem), (n_csa, csa), (n_hca, hca)):
+                v = comp.get(bucket)
+                if v is not None:
+                    total += count * v
+            if total:
+                out[bucket] = total
+        return out
+    raise ValueError(
+        f"kv_cache_breakdown: op={op!r} must be one of "
+        f"['softmax_gqa', 'kda', 'mamba2', 'csa', 'hca', 'hybrid_kch', "
+        f"'hybrid_mamba2'].")
 
 
 def prefill_flops(op: str, T: int, **kw):
@@ -389,6 +504,34 @@ def prefill_flops(op: str, T: int, **kw):
         # run_quality.KDAAttn.o, and run_decoding.KDAAttnDecoding.o).
         out_proj = 2 * T * kda_hv * kda_v * d
         return proj + short_conv + recurrent + chunk_inter + chunk_a + out_proj
+    if op == 'mamba2':
+        # Full mixer FLOPs, matching ops_mamba.Mamba2Mixer's actual matmul
+        # shapes (headdim/expand/d_state from p; dt_rank auto = ceil(d/16)):
+        #   in_proj : d -> 2*d_inner                     2*T*d*2*d_inner
+        #   conv    : depthwise d_inner x d_conv         2*T*d_inner*d_conv
+        #   x_proj  : d_inner -> dt_rank + 2*G*N         2*T*d_inner*(dt_rank+2GN)
+        #   dt_proj : dt_rank -> nheads                   2*T*dt_rank*nheads
+        #   scan    : ~3 MACs of headdim*d_state per head per step
+        #             (decay mul + x(x)B outer + C.S readout)
+        #             -> 2*3*T*nheads*headdim*d_state
+        #   out_proj: d_inner -> d                        2*T*d_inner*d
+        d_inner = p['mamba_expand'] * d
+        nheads = d_inner // p['mamba_headdim'] if p['mamba_headdim'] > 0 else 1
+        headdim = p['mamba_headdim']
+        d_state = p['mamba_d_state']
+        ngroups = p.get('mamba_ngroups', 1)
+        dt_rank_cfg = p.get('mamba_dt_rank', 'auto')
+        if isinstance(dt_rank_cfg, str):
+            dt_rank = max(1, (d + 15) // 16)
+        else:
+            dt_rank = int(dt_rank_cfg)
+        in_proj = 2 * T * d * 2 * d_inner
+        conv = 2 * T * d_inner * p['mamba_d_conv']
+        x_proj = 2 * T * d_inner * (dt_rank + 2 * ngroups * d_state)
+        dt_proj = 2 * T * dt_rank * nheads
+        scan = 2 * 3 * T * nheads * headdim * d_state
+        out_proj = 2 * T * d_inner * d
+        return in_proj + conv + x_proj + dt_proj + scan + out_proj
     if op == 'csa':
         # KV-side compression: SIX input projections (W_aKV, W_bKV, W_aZ,
         # W_bZ, W_KV_idx, W_Z_idx). The first four are T*d*c; the last
@@ -479,6 +622,16 @@ def prefill_flops(op: str, T: int, **kw):
         return (n_kda * prefill_flops('kda', T, **p)
                 + n_csa * prefill_flops('csa', T, **p)
                 + n_hca * prefill_flops('hca', T, **p))
+    if op == 'hybrid_mamba2':
+        # Mamba-2-route hybrid at the same ratio slots; the CSA/HCA FLOPs
+        # are identical to hybrid_kch, so the row pair isolates the memory
+        # operator's compute cost.
+        n_mem = p.get('hybrid_n_kda', 3)
+        n_csa = p.get('hybrid_n_csa', 1)
+        n_hca = p.get('hybrid_n_hca', 1)
+        return (n_mem * prefill_flops('mamba2', T, **p)
+                + n_csa * prefill_flops('csa', T, **p)
+                + n_hca * prefill_flops('hca', T, **p))
     raise ValueError(op)
 
 
@@ -489,7 +642,8 @@ def main():
     seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
                    131072, 262144, 524288, 1048576]
 
-    ops = ['softmax_gqa', 'kda', 'csa', 'hca', 'hybrid_kch']
+    ops = ['softmax_gqa', 'kda', 'mamba2', 'csa', 'hca', 'hybrid_kch',
+           'hybrid_mamba2']
     rows = []
     for T in seq_lengths:
         flops_base_1l = prefill_flops('softmax_gqa', T)
@@ -516,11 +670,17 @@ def main():
                         if mode == 'compressed_kv_only'
                         else 'recurrent_state_plus_short_conv'
                         if op == 'kda'
+                        else 'fixed_ssm_state_plus_conv_state'
+                        if op == 'mamba2'
                         else 'compressed_rows_plus_runtime_decode_state'
                         if op in ('csa', 'hca')
                         else 'hybrid_full_runtime_decode_state'
                     ),
                     'kv_elements': kv,
+                    # Component-wise split (recurrent state vs conv state vs
+                    # compressed/window caches) for the quality-vs-cache
+                    # figures and the budget-matching design.
+                    'state_components': kv_cache_breakdown(op, T),
                     # Explicit byte count under the BF16 accounting convention used
                     # throughout the cache analysis. README has long documented a
                     # ``kv_bytes`` field; writing it here keeps the JSON schema

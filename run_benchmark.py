@@ -42,7 +42,9 @@ from kaggle_setup import (
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
-from ops_fused import HybridKCHAttention, HybridConfig
+from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
+from ops_mamba import Mamba2Mixer, build_mamba2_mixer, naive_mamba2_scan
+from ops_mamba_backend import validate_mamba_backend
 import ops_kda
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,18 @@ def _selected_kda_backend() -> str:
     ``KDA_BACKEND=auto`` to measure the optional FLA path separately.
     """
     return validate_kda_backend(os.environ.get('KDA_BACKEND', 'reference'))
+
+
+def _selected_mamba_backend() -> str:
+    """Return the explicitly requested benchmark Mamba-2 backend.
+
+    Mirrors the KDA contract: reference-first by default;
+    ``MAMBA_BACKEND=official`` measures the mamba_ssm kernels (errors
+    loudly when the optional dependency or CUDA is missing — an explicit
+    accelerated-backend request never silently falls back);
+    ``MAMBA_BACKEND=auto`` uses them when available.
+    """
+    return validate_mamba_backend(os.environ.get('MAMBA_BACKEND', 'reference'))
 
 
 _LAST_TIMING_STATS: dict = {}
@@ -331,6 +345,71 @@ def bench_hca(B, T, d, device, meta=None):
     return fn
 
 
+def bench_mamba2_scan(B, T, d, device, meta=None):
+    """Mamba-2 SSD scan at the CORE boundary (mirrors bench_kda_recurrent).
+
+    Inputs (x, dt, B, C) are pre-projected OUTSIDE the timed region, so
+    the row measures only the recurrence — the same boundary as the
+    softmax / kda_rec / kda_chunk rows. Geometry is capacity-matched to
+    the KDA core bench (H=4, K=V=32 -> 4 heads x 32x32 state): 4 heads x
+    (headdim=32 x d_state=32) = the same per-model recurrent-state size,
+    so the scan-cost comparison is not confounded by state size.
+    """
+    H, headdim, d_state = 4, 32, 32
+    gen = _make_op_gen('mamba2_scan', T, device)
+    x = _rand(B, T, H, headdim, device=device, generator=gen)
+    # dt: post-softplus-like positive values in the official init range.
+    dt = torch.rand(B, T, H, device=device, generator=gen) * 0.1 + 1e-3
+    Bm = _rand(B, T, 1, d_state, device=device, generator=gen)
+    Cm = _rand(B, T, 1, d_state, device=device, generator=gen)
+    A = -torch.exp(torch.log(torch.arange(1, H + 1, device=device,
+                                           dtype=torch.float32)))
+    D = torch.ones(H, device=device)
+    if meta is not None:
+        meta['param_elements'] = 0  # the core boundary carries no weights
+
+    def fn():
+        with torch.no_grad():
+            return naive_mamba2_scan(
+                x, dt, Bm, Cm, A, D,
+                output_final_state=True)
+    return fn
+
+
+def bench_mamba2_layer(B, T, d, device, meta=None):
+    """Full Mamba-2 mixer at the end_to_end_single_layer boundary.
+
+    Mirrors bench_csa / bench_hca: hidden state in, projected output out
+    (in_proj -> causal conv -> SiLU -> x_proj -> scan -> gate ->
+    out_proj). The backend follows MAMBA_BACKEND (reference default).
+    """
+    gen = _make_op_gen('mamba2_layer', T, device)
+    cfg = HybridConfig(
+        d_model=d, memory_type='mamba2',
+        mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+        mamba_headdim=32,
+        mamba_backend=_selected_mamba_backend(),
+    )
+    seed = zlib.crc32(b'mamba2_layer_weights') & 0xFFFFFFFF
+    _prev_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        mixer = build_mamba2_mixer(cfg).to(device).eval()
+    finally:
+        torch.random.set_rng_state(_prev_state)
+    if meta is not None:
+        meta['param_elements'] = sum(p.numel() for p in mixer.parameters())
+        meta['mamba_effective_backend'] = getattr(
+            mixer, 'effective_backend', 'reference')
+    x = _rand(B, T, d, device=device, generator=gen)
+
+    def fn():
+        with torch.no_grad():
+            out, _, _ = mixer.forward_functional(x, None, None)
+            return out
+    return fn
+
+
 def bench_hybrid(B, T, d, device, meta=None):
     gen = _make_op_gen('hybrid', T, device)
     cfg = HybridConfig(
@@ -351,6 +430,48 @@ def bench_hybrid(B, T, d, device, meta=None):
         torch.random.set_rng_state(_prev_state)
     if meta is not None:
         meta['param_elements'] = sum(p.numel() for p in model.parameters())
+    x = _rand(B, T, d, device=device, generator=gen)
+    def fn():
+        with torch.no_grad():
+            model.reset_state()
+            return model(x)
+    return fn
+
+
+def bench_hybrid_mamba2(B, T, d, device, meta=None):
+    """5-layer Mamba-2-route hybrid stack at the SAME boundary as the
+    KDA hybrid row (end_to_end_multi_layer: LayerNorm + mixer + state
+    management, 3:1:1 memory:CSA:HCA ratio).
+
+    Same CSA/HCA sub-layer geometry as ``bench_hybrid`` so the row pair
+    isolates the memory-operator swap. The mamba geometry mirrors
+    ``bench_mamba2_layer`` (d_state=16, headdim=32 -> d_inner/32 heads).
+    """
+    gen = _make_op_gen('hybrid_mamba2', T, device)
+    cfg = HybridConfig(
+        d_model=d, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+        memory_type='mamba2',
+        mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+        mamba_headdim=32,
+        kda_backend=_selected_kda_backend(),
+        mamba_backend=_selected_mamba_backend(),
+    )
+    seed = zlib.crc32(b'hybrid_mamba2_weights') & 0xFFFFFFFF
+    _prev_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        model = HybridAttentionStack(cfg, total_layers=5).to(device).eval()
+    finally:
+        torch.random.set_rng_state(_prev_state)
+    if meta is not None:
+        meta['param_elements'] = sum(p.numel() for p in model.parameters())
+        meta['mamba_effective_backend'] = getattr(
+            model.memory_layers[0], 'effective_backend', 'reference')
     x = _rand(B, T, d, device=device, generator=gen)
     def fn():
         with torch.no_grad():
@@ -400,9 +521,12 @@ def main():
         ('kda_chunk', lambda T, meta=None: bench_kda_chunk(B, T, H, K, V, device)),
         ('kda_rec_hybrid', lambda T, meta=None: bench_kda_recurrent(B, T, H2, K2, V2, device)),
         ('kda_chunk_hybrid', lambda T, meta=None: bench_kda_chunk(B, T, H2, K2, V2, device)),
+        ('mamba2_scan', lambda T, meta=None: bench_mamba2_scan(B, T, d, device, meta=meta)),
+        ('mamba2_layer', lambda T, meta=None: bench_mamba2_layer(B, T, d, device, meta=meta)),
         ('csa',      lambda T, meta=None: bench_csa(B, T, d, device, meta=meta)),
         ('hca',      lambda T, meta=None: bench_hca(B, T, d, device, meta=meta)),
         ('hybrid',   lambda T, meta=None: bench_hybrid(B, T, d, device, meta=meta)),
+        ('hybrid_mamba2', lambda T, meta=None: bench_hybrid_mamba2(B, T, d, device, meta=meta)),
     ]
     op_boundary = {
         'softmax':   {'compute_boundary': 'core',
@@ -429,6 +553,15 @@ def main():
         'hybrid':    {'compute_boundary': 'end_to_end_multi_layer',
                       'n_layers': 5,
                       'note': '5-layer KDA+CSA+HCA stack with LayerNorm, projections, attention, state management (3:1:1 default ratio)'},
+        'mamba2_scan': {'compute_boundary': 'core',
+                        'n_layers': 1,
+                        'note': 'SSD recurrence core only; x/dt/B/C pre-projected (4 heads x 32x32 state, capacity-matched to kda_rec)'},
+        'mamba2_layer': {'compute_boundary': 'end_to_end_single_layer',
+                         'n_layers': 1,
+                         'note': 'single Mamba-2 mixer from hidden state (in_proj + causal conv + x_proj + scan + gate + out_proj)'},
+        'hybrid_mamba2': {'compute_boundary': 'end_to_end_multi_layer',
+                          'n_layers': 5,
+                          'note': '5-layer Mamba-2+CSA+HCA stack at the same boundary as the hybrid row (3:1:1 memory:CSA:HCA)'},
     }
     # Workload-defining hyperparameters per operator. These are the values that
     # determine how many keys each method actually attends to at a given T
@@ -472,6 +605,21 @@ def main():
                       'kda_chunk_size': 64, 'kda_conv_ksize': 3,
                       'attends_to_all_T': False,
                       'note': 'hybrid stack: KDA recurrence covers all T; CSA layer is sparse (topk-capped, ~constant radius); HCA layer attends to all compressed blocks (linear in T)'},
+        'mamba2_scan': {'heads': 4, 'headdim': 32, 'd_state': 32,
+                        'note': 'SSD scan core only; x/dt/B/C pre-projected (4 heads x 32x32 state, capacity-matched to the kda_rec core row)'},
+        'mamba2_layer': {'d': d, 'expand': 2, 'd_state': 16, 'd_conv': 4,
+                         'headdim': 32, 'backend_env': 'MAMBA_BACKEND',
+                         'note': 'full Mamba-2 mixer from hidden state (in_proj + causal conv + x_proj + scan + gate + out_proj)'},
+        'hybrid_mamba2': {'n_layers': 5, 'memory': 'mamba2', 'n_memory': 3,
+                          'n_csa': 1, 'n_hca': 1, 'd': d,
+                          'csa_c': 16, 'csa_dc': 32, 'csa_nh': 2, 'csa_m': 8,
+                          'csa_topk': 4, 'csa_sliding_window': 8,
+                          'hca_c': 16, 'hca_dc': 32, 'hca_nh': 2, 'hca_m2': 16,
+                          'hca_sliding_window': 8,
+                          'mamba_expand': 2, 'mamba_d_state': 16,
+                          'mamba_d_conv': 4, 'mamba_headdim': 32,
+                          'attends_to_all_T': False,
+                          'note': 'same stack/boundary as the hybrid row with the memory slots filled by Mamba-2 instead of KDA (3:1:1)'},
     }
 
     results = []
@@ -493,6 +641,11 @@ def main():
                     if name in {'kda_rec', 'kda_chunk', 'kda_rec_hybrid',
                                 'kda_chunk_hybrid', 'hybrid'}:
                         row['kda_backend'] = _selected_kda_backend()
+                    if name in {'mamba2_scan', 'mamba2_layer',
+                                'hybrid_mamba2'}:
+                        row['mamba_backend'] = _selected_mamba_backend()
+                        row['mamba_effective_backend'] = meta.get(
+                            'mamba_effective_backend', 'reference')
                     if name in {'csa', 'hybrid'}:
                         row['csa_indexer_normalize_qk'] = True
                         row['csa_ste_in_timed_region'] = False
@@ -512,6 +665,9 @@ def main():
                                         if name in {'kda_rec', 'kda_chunk',
                                                     'kda_rec_hybrid', 'kda_chunk_hybrid',
                                                     'hybrid'} else None),
+                        'mamba_backend': (os.environ.get('MAMBA_BACKEND', 'reference')
+                                          if name in {'mamba2_scan', 'mamba2_layer',
+                                                      'hybrid_mamba2'} else None),
                         'time_ms': None, 'peak_mem_MB': None,
                         'time_min_ms': None, 'time_max_ms': None,
                         'time_std_ms': None,
