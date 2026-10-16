@@ -119,15 +119,28 @@ back, and the resolution is recorded on the mixer
 (`effective_backend`) and in every result row
 (`mamba_effective_backend`), so provenance is auditable.
 
-The reference Mamba-2 names its parameters exactly like the official
-module (`in_proj`, `conv1d`, `x_proj`, `dt_proj`, `A_log`, `D`,
-`out_proj`), so weights transfer between backends;
-`transfer_reference_state` tolerates the `dt_proj.bias` vs. `dt_bias`
-layout drift across `mamba_ssm` revisions. The parity test
-(`test_mamba2_official_backend_parity`) copies reference weights into
-the official module and requires output/state agreement within
+The reference Mamba-2 shares part of its parameter layout with the
+official module (`A_log`, `D`, `out_proj`, and the dt bias, which
+`transfer_reference_state` maps between the `dt_proj.bias` and `dt_bias`
+spellings across `mamba_ssm` revisions). The official module fuses
+`[z, x, B, C, dt]` into `in_proj` and convolves `xBC` jointly, whereas the
+reference keeps the Mamba-1-style `x_proj` + `dt_proj` head and an x-only
+short conv, so those tensors are structurally incompatible;
+`transfer_reference_state` raises a `ValueError` listing them rather than
+silently producing wrong outputs. The parity test
+(`test_mamba2_official_backend_parity`) copies the transferable weights
+into the official module and requires output/state agreement within
 dtype-scaled tolerance (reduction orders differ; bit-equality is not the
 contract). It self-skips with a recorded note on CPU-only boxes.
+
+The two backends also expose different runtime state layouts: the SSM
+state is identical (`[B, nheads, headdim, d_state]`), but the official
+conv state spans the joint xBC channels over `d_conv` steps
+(`[B, d_inner + 2 * ngroups * d_state, d_conv]`) and cannot be continued
+from the reference's x-only `[B, d_inner, d_conv - 1]` buffer. The
+official parallel path always starts from a fresh prefix, so chunked
+prefill continuation is reference-only; the official wrapper rejects
+`T > 1` with an incoming state with an actionable error.
 
 Benchmark interpretation follows the two-set rule: reference rows are
 correctness baselines, never speed rankings; accelerated rows are
@@ -230,9 +243,14 @@ not to pre-empt the answer by changing the default route.
 ## 8. Known limitations
 
 * The official Mamba-2 backend could not be executed in this sandbox (no
-  CUDA); its adapter and parity test are written defensively against
-  `mamba_ssm >= 2.2` and self-skip with a recorded note until they run on
-  a CUDA box. The reference path is fully tested.
+  CUDA); its adapter targets the released `mamba_ssm` API
+  (`InferenceParams` in `mamba_ssm.utils.generation`, states threaded via
+  `inference_params.key_value_memory_dict[layer_idx]`) and its parity test
+  self-skips with a recorded note until it runs on a CUDA box. The
+  reference path is fully tested. Because the official module's parameter
+  and conv-state layouts are structurally different (see section 4), the
+  parity test can only compare the transferable subset; the reference
+  backend remains the weight-compatible baseline.
 * The reference Mamba-2 scan is a sequential Python loop (like the KDA
   reference): correctness-first, not throughput. Speed conclusions must
   use the official-backend rows.

@@ -21,15 +21,16 @@ Backend contract
 
 Weight transfer
 ---------------
-The reference mixer names its parameters exactly like the official module
-(``in_proj``, ``conv1d``, ``x_proj``, ``dt_proj``, ``A_log``, ``D``,
-``out_proj``), so a state_dict can be copied between the two. The parity
-test in ``run_correctness.py`` uses this to verify that both backends
-compute the same function (discretization, conv, gating, and output
-projection included — not a simplified SSM stand-in). Some ``mamba_ssm``
-revisions replaced ``dt_proj`` + bias with a separate ``dt_bias``
-parameter; :func:`transfer_reference_state` maps both layouts and raises a
-clear error for genuinely incompatible revisions.
+The reference mixer and the official ``Mamba2`` share only part of their
+parameter layout: ``A_log``, ``D``, ``out_proj`` and the dt bias are
+shape-compatible (``dt_proj.bias`` maps onto the official ``dt_bias`` on
+revisions that use it). The official module, however, fuses
+``[z, x, B, C, dt]`` into ``in_proj`` and convolves ``xBC`` jointly, while
+the reference keeps the Mamba-1-style ``x_proj`` + ``dt_proj`` head and an
+x-only short conv — so a full state_dict copy is impossible for those
+tensors. :func:`transfer_reference_state` copies the compatible tensors
+and raises a clear ``ValueError`` listing the structurally incompatible
+fused-layout parameters instead of silently producing wrong outputs.
 
 Tested against ``mamba-ssm >= 2.2`` (the revision that ships the Mamba-2
 SSD kernels). The adapter filters kwargs against the installed signature
@@ -70,10 +71,18 @@ def _load_official_module():
     try:
         from mamba_ssm.modules.mamba2 import Mamba2 as _Mamba2
         try:
-            # Canonical location across mamba-ssm revisions.
-            from mamba_ssm.ops.triton.layer import InferenceParams
+            # Canonical location across released mamba-ssm revisions
+            # (2.0.x - 2.2.x and current main): a plain dataclass in
+            # ``mamba_ssm.utils.generation``.
+            from mamba_ssm.utils.generation import InferenceParams
         except ImportError:  # pragma: no cover - revision drift fallback
-            from mamba_ssm.utils import InferenceParams  # type: ignore
+            # Older / relocated copies (the package root never re-exports
+            # it in released revisions; keep both paths importable).
+            try:
+                from mamba_ssm.ops.triton.layer import (  # type: ignore
+                    InferenceParams)
+            except ImportError:
+                from mamba_ssm.utils import InferenceParams  # type: ignore
     except ImportError as exc:
         _IMPORT_ERROR = exc
         raise ImportError(
@@ -165,9 +174,11 @@ def transfer_reference_state(official_module: nn.Module,
         reference's ``dt_proj.bias`` maps onto ``dt_bias``.
 
     Raises ``ValueError`` listing any official parameter that could not be
-    sourced from the reference state dict (e.g. a revision that computes dt
-    directly in ``x_proj`` — its ``x_proj.weight`` shape differs from the
-    reference's low-rank layout and weights are NOT transferable).
+    sourced from the reference state dict. The released ``mamba_ssm``
+    Mamba2 modules fuse ``[z, x, B, C, dt]`` into ``in_proj`` and convolve
+    ``xBC`` jointly, so their ``in_proj`` / ``conv1d`` / ``norm`` tensors
+    have no counterpart in the Mamba-1-style reference head and are NOT
+    transferable; only ``A_log`` / ``D`` / ``out_proj`` / the dt bias are.
     """
     ref_sd = reference_module.state_dict()
     target_sd = official_module.state_dict()
@@ -185,10 +196,12 @@ def transfer_reference_state(official_module: nn.Module,
                 missing.append(name)
     if missing:
         raise ValueError(
-            f"transfer_reference_state: the installed mamba_ssm revision "
-            f"has parameter(s) {missing} that cannot be sourced from the "
-            f"reference mixer (incompatible dt parameterization). Copy "
-            f"weights manually or pin mamba-ssm >= 2.2.")
+            f"transfer_reference_state: parameter(s) {missing} cannot be "
+            f"sourced from the reference mixer: the installed mamba_ssm "
+            f"Mamba2 fuses [z, x, B, C, dt] into in_proj and convolves xBC "
+            f"jointly, so only A_log / D / out_proj / the dt bias are "
+            f"shape-compatible. Use mamba_backend='reference' for "
+            f"weight-compatible runs.")
     return None
 
 
@@ -201,14 +214,24 @@ class OfficialMamba2Mixer(nn.Module):
     ``InferenceParams`` state cache:
 
       * ``forward_functional(x, state, conv_state)`` builds a per-call
-        ``InferenceParams``, seeds it with the incoming (cloned) states,
-        runs the official module with ``seqlen_offset=0`` (T > 1: the
-        parallel prefill path, which writes the final states back into the
-        cache) or ``seqlen_offset>0`` (T == 1: the recurrent step path,
-        which updates the cache in place), and returns the new states.
-      * The state layouts match the reference contract: SSM state
-        ``[B, nheads, headdim, d_state]`` (fp32), conv state
-        ``[B, d_inner, d_conv - 1]`` (input dtype).
+        ``InferenceParams``, seeds ``key_value_memory_dict[0]`` with the
+        incoming (cloned) states, runs the official module with
+        ``seqlen_offset=0`` (T > 1: the parallel prefill path, which writes
+        the final states back into the cache) or ``seqlen_offset>0``
+        (T == 1: the recurrent step path, which updates the cache in
+        place), and returns the new states.
+      * SSM state ``[B, nheads, headdim, d_state]`` (fp32) matches the
+        reference contract. The conv state is the OFFICIAL layout
+        ``[B, d_inner + 2 * ngroups * d_state, d_conv]`` (input dtype):
+        the official short conv runs over ``xBC`` jointly and keeps
+        ``d_conv`` time steps, so it is NOT interchangeable with the
+        reference's x-only ``[B, d_inner, d_conv - 1]`` buffer.
+      * The official parallel path starts from a FRESH prefix and ignores
+        any incoming state, so chunked prefill continuation is not
+        supported: ``forward_functional`` rejects ``T > 1`` with a
+        non-``None`` state up front (feed the whole prefix in one call,
+        then decode with ``step``). The reference backend has no such
+        restriction.
 
     The official kernels are CUDA-only. Feeding CPU tensors raises a clear
     ``RuntimeError`` (use the reference backend on CPU).
@@ -228,9 +251,16 @@ class OfficialMamba2Mixer(nn.Module):
         self.d_model = cfg.d_model
         self.d_state = int(getattr(cfg, 'mamba_d_state', 64))
         self.d_conv = int(getattr(cfg, 'mamba_d_conv', 4))
+        self.ngroups = int(getattr(cfg, 'mamba_ngroups', 1))
         self.d_inner = geo['d_inner']
         self.nheads = geo['nheads']
-        self.headdim = geo['headdim']
+        # ``validate_mamba2_geometry`` returns the derived sizes, not the
+        # configured headdim; read it from the config exactly like the
+        # reference mixer does (the geometry check already proved it
+        # divides d_inner).
+        self.headdim = int(getattr(cfg, 'mamba_headdim', 64))
+        # Official conv channels: xBC = x + the B/C projections.
+        self.conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         self.backend = 'official'
         self.effective_backend = 'official'
         self.mamba = _build_official_mamba2(cfg)
@@ -258,8 +288,9 @@ class OfficialMamba2Mixer(nn.Module):
         self._conv_lookback = None
 
     def state_nbytes(self, batch: int = 1) -> dict:
+        # Official conv state: xBC channels over the full d_conv window.
         ssm_elems = batch * self.nheads * self.headdim * self.d_state
-        conv_elems = batch * self.d_inner * (self.d_conv - 1)
+        conv_elems = batch * self.conv_dim * self.d_conv
         return {
             'ssm_state_bytes': ssm_elems * 4,
             'conv_state_bytes': conv_elems * 4,
@@ -306,30 +337,54 @@ class OfficialMamba2Mixer(nn.Module):
                 new_conv = new_conv.clone()
             return x.new_zeros(B, 0, d), new_state, new_conv
 
+        if T > 1 and (state is not None or conv_state is not None):
+            raise ValueError(
+                "OfficialMamba2Mixer: the official mamba_ssm parallel "
+                "prefill path always starts from a fresh prefix and "
+                "ignores incoming conv/SSM states, so a T > 1 call cannot "
+                "resume from saved state. Feed the whole prefix in one "
+                "prefill() call and continue with step(), or use "
+                "mamba_backend='reference' for chunked prefill.")
         ip = self._make_inference_params(B, T, x.device)
-        # Seed the caches. The official module reads and updates these
-        # tensors IN PLACE, so seed with clones of the caller's tensors to
-        # avoid mutating state the caller still owns.
-        if conv_state is not None:
+        # Seed the official state cache. The official module reads and
+        # updates these tensors IN PLACE through its InferenceParams
+        # protocol (``key_value_memory_dict[layer_idx] = (conv, ssm)``),
+        # so seed with clones of the caller's tensors to avoid mutating
+        # state the caller still owns.
+        if conv_state is not None and tuple(conv_state.shape) != (
+                B, self.conv_dim, self.d_conv):
             if conv_state.shape[0] != B:
+                # A different batch cannot be resumed; start fresh (the
+                # official module would allocate the same zeros itself).
                 conv_state = None
-        ip.conv_states[0] = (conv_state.clone()
-                             if conv_state is not None else
-                             torch.zeros(B, self.d_inner, self.d_conv - 1,
-                                         device=x.device, dtype=x.dtype))
+            else:
+                raise ValueError(
+                    f"OfficialMamba2Mixer: conv_state shape "
+                    f"{tuple(conv_state.shape)} is not the official conv "
+                    f"layout {(B, self.conv_dim, self.d_conv)} "
+                    f"(xBC channels over d_conv steps). A reference-backend "
+                    f"conv state [B, {self.d_inner}, {self.d_conv - 1}] "
+                    f"cannot be resumed on the official backend — the two "
+                    f"conv layouts are not interchangeable.")
+        conv_seed = (conv_state.clone()
+                     if conv_state is not None else
+                     torch.zeros(B, self.conv_dim, self.d_conv,
+                                 device=x.device, dtype=x.dtype))
         if state is not None and state.shape[0] == B:
-            ip.ssm_states[0] = state.clone().to(compute_dtype)
+            ssm_seed = state.clone().to(compute_dtype)
         else:
-            ip.ssm_states[0] = torch.zeros(
+            ssm_seed = torch.zeros(
                 B, self.nheads, self.headdim, self.d_state,
                 device=x.device, dtype=compute_dtype)
+        ip.key_value_memory_dict[0] = (conv_seed, ssm_seed)
         # seqlen_offset > 0 selects the official recurrent STEP path;
         # seqlen_offset == 0 runs the parallel path and copies the final
         # states back into the cache.
         ip.seqlen_offset = 1 if T == 1 else 0
         out = self.mamba(x, inference_params=ip)
-        new_state = ip.ssm_states[0].to(compute_dtype).clone()
-        new_conv = ip.conv_states[0].to(x.dtype)
+        new_conv, new_state = ip.key_value_memory_dict[0]
+        new_state = new_state.to(compute_dtype).clone()
+        new_conv = new_conv.to(x.dtype)
         if detach_lookback:
             new_conv = new_conv.detach()
         new_conv = new_conv.clone()
