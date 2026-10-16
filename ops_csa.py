@@ -601,8 +601,13 @@ def csa_lightning_indexer(
         k_idx = F.normalize(k_idx, dim=-1)
 
     # Vectorized batched scoring (no per-batch loop).
-    # head-wise similarities [B, HI, T, n_blocks]
-    score = torch.einsum('b t h d, b n d -> b h t n', q_idx, k_idx) * scale
+    # head-wise similarities [B, HI, T, n_blocks]. Multiplying by a
+    # scale of exactly 1.0 is an IEEE no-op (values and gradients are
+    # preserved bit-for-bit), so the cosine-attention configuration skips
+    # the full-size multiply entirely.
+    score = torch.einsum('b t h d, b n d -> b h t n', q_idx, k_idx)
+    if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
+        score = score * scale
     score = F.relu(score)
     if w_idx is None:
         logits = score.sum(1)                                          # [B, T, n_blocks]

@@ -449,19 +449,20 @@ def _chunk_kda_prepare(
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     # ``repeat_interleave`` (even with G == 1) also materializes contiguous
     # q / k tensors; the rearranged views feed several downstream matmuls.
+    # Skipping it for G == 1 measured slower on CPU (non-contiguous operands
+    # in the per-chunk bmm), so keep the copy.
     q = q.repeat_interleave(G, dim=1) * scale
     k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
-    # NOTE: ``diagonal=0`` (NOT ``diagonal=1``) is required here to match the
-    # FLA-referenced chunkwise-parallel KDA math (fla/ops/kda/naive.py). The
-    # mask covers the main diagonal AND the strict upper triangle, so the
-    # subsequent ``A.masked_fill(mask, 0)`` leaves ``A`` STRICTLY lower
-    # triangular (diagonal zeroed), keeping the triangular solve equivalent
-    # to the recurrent delta-rule.
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
+    # NOTE: the main diagonal AND the strict upper triangle of the raw
+    # ``A`` must be zeroed (``diagonal=0`` semantics, NOT ``diagonal=1``) to
+    # match the FLA-referenced chunkwise-parallel KDA math
+    # (fla/ops/kda/naive.py). Because the loop below writes exactly the lower
+    # triangle of a zero-initialized ``A``, only the written diagonal needs
+    # an explicit zero afterwards; the strict upper triangle is already zero.
     upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
     # ``A``'s columns are written only for rows ``c >= i`` below; the
     # never-written upper triangle must be finite zeros (not ``empty``
@@ -473,7 +474,10 @@ def _chunk_kda_prepare(
     # the inner loop. In ``recompute_attn`` mode the cache is dropped and
     # the inner loop rebuilds each chunk's matrix from the ``q`` / ``k``
     # and cumsum ``g`` already returned above.
-    Aqk = None if recompute_attn else torch.empty(
+    # ``torch.zeros`` (not ``empty`` + a trailing ``masked_fill``) keeps the
+    # never-written strictly-upper triangle at exactly zero, skipping one
+    # full ``[NT, BT, BT]`` pass; the lower triangle is written below.
+    Aqk = None if recompute_attn else torch.zeros(
         *g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
     # ``clamp(max=50.0)`` is applied when the largest positive pair
     # difference ``max(g) - min(g)`` exceeds 50; NaN / +inf ranges also
@@ -481,26 +485,38 @@ def _chunk_kda_prepare(
     # ``clamp_g_diff`` so it makes the same clamp decision.
     _g_lo, _g_hi = torch.aminmax(g, dim=-2)
     clamp_g_diff = not bool((_g_hi - _g_lo).max() <= 50.0)
-    # Only the rows ``c >= i`` are materialized; the strictly-upper rows are
-    # zeroed by ``mask`` / ``upper_mask`` below.
+    # Only the entries with row ``c >= i`` (column ``i``) are materialized;
+    # the strict upper triangle stays at the zeros from the allocation above
+    # and the diagonal is explicitly zeroed right after the loop.
     for i in range(BT):
-        k_i = k[..., i, :]
-        g_i = g[..., i, :]
-        g_diff = g[..., i:, :] - g_i.unsqueeze(-2)
+        # ``[..., i:i+1, :]`` (a slice view) broadcasts identically to
+        # ``[..., i, :].unsqueeze(-2)`` but skips the select+unsqueeze pair.
+        g_i = g[..., i:i + 1, :]
+        g_diff = g[..., i:, :] - g_i
         if clamp_g_diff:
             g_diff = g_diff.clamp(max=50.0)
         # ``t = exp(g_diff) * k_i`` is shared by both intra-chunk matrices.
-        t = g_diff.exp() * k_i.unsqueeze(-2)
+        # The sub/clamp produce fresh tensors, so the exp runs in place on
+        # them: same per-element op in the same order, one less full-size
+        # intermediate. The product stays out-of-place because autograd
+        # saves the exp output for the multiply's backward.
+        g_diff.exp_()
+        t = g_diff * k[..., i:i + 1, :]
         A[..., i:, i] = (k[..., i:, :] * t).sum(-1)
         if not recompute_attn:
             Aqk[..., i:, i] = (q[..., i:, :] * t).sum(-1)
-    if not recompute_attn:
-        Aqk = Aqk.masked_fill(upper_mask, 0)
-    A = A * beta[..., None]
-    A = -A.masked_fill(mask, 0)
+    A.mul_(beta[..., None])
+    # Only the diagonal needs zeroing: ``A`` was allocated with
+    # ``torch.zeros`` and the loop above wrote exactly its lower triangle
+    # (including the diagonal), so the strict upper triangle is already
+    # +0.0. Zeroing the diagonal VIEW touches BT values per chunk instead
+    # of the full BT x BT matrix.
+    A.diagonal(dim1=-2, dim2=-1).zero_()
+    A.neg_()
     eye = torch.eye(BT, dtype=compute_dtype, device=q.device)
-    # ``eye - A`` is unit lower triangular (``mask`` above zeroed A's
-    # diagonal), so the triangular solve uses ``unitriangular=True``.
+    # ``eye - A`` is unit lower triangular (the diagonal zeroing above left
+    # A's diagonal at 0), so the triangular solve uses
+    # ``unitriangular=True``.
     A = torch.linalg.solve_triangular(
         eye - A, A, upper=False, unitriangular=True
     )
