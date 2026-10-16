@@ -634,6 +634,13 @@ def capture_provenance() -> dict:
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
         'flash_linear_attention_version': fla_version,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED', '<unset>'),
+        # Deterministic-cuBLAS workspace config (set by
+        # ``set_global_seed(deterministic=True)``; ``<unset>`` when the run
+        # did not request deterministic algorithms). Recorded so a reader
+        # can tell whether cuBLAS GEMMs were pinned to deterministic
+        # algorithms for this run.
+        'cublas_workspace_config': os.environ.get(
+            'CUBLAS_WORKSPACE_CONFIG', '<unset>'),
         'num_threads': info.num_threads,
     }
 
@@ -661,6 +668,16 @@ def set_global_seed(seed: int, *, deterministic: bool = False) -> dict:
     it in the environment before launching if string-hash order matters.
     ``capture_provenance`` records its value so runs can be compared.
 
+    ``deterministic=True`` also exports ``CUBLAS_WORKSPACE_CONFIG=:4096:8``
+    when the variable is unset. PyTorch's deterministic-algorithms mode
+    requires this workspace configuration for cuBLAS GEMMs; without it,
+    those GEMMs either raise a ``RuntimeError`` (strict mode) or warn and
+    fall back to a nondeterministic algorithm (``warn_only=True``, the mode
+    used here). The variable must be set BEFORE the first cuBLAS handle is
+    created, which is why this function is the right place: every training
+    entry point calls it before constructing models or running GPU work.
+    A user-supplied value is never overwritten.
+
     Returns a JSON-serializable dict describing what was seeded, suitable
     for embedding in a run record.
     """
@@ -668,6 +685,16 @@ def set_global_seed(seed: int, *, deterministic: bool = False) -> dict:
 
     seed = int(seed)
     _random.seed(seed)
+
+    # Export the cuBLAS deterministic workspace config BEFORE any CUDA /
+    # cuBLAS work in this process (see the docstring). Set even when
+    # ``torch.cuda.is_available()`` is False: a later CUDA initialization
+    # (e.g. a DataLoader worker or a lazily-built CUDA tensor) would still
+    # read it, and the variable is harmless on CPU-only hosts.
+    cublas_workspace_config = os.environ.get('CUBLAS_WORKSPACE_CONFIG')
+    if deterministic and cublas_workspace_config is None:
+        cublas_workspace_config = ':4096:8'
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = cublas_workspace_config
 
     numpy_seeded = False
     try:
@@ -716,6 +743,7 @@ def set_global_seed(seed: int, *, deterministic: bool = False) -> dict:
         'deterministic_requested': bool(deterministic),
         'cudnn_deterministic': cudnn_deterministic,
         'deterministic_algorithms': deterministic_algorithms,
+        'cublas_workspace_config': cublas_workspace_config,
     }
 
 

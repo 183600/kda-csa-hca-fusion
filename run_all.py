@@ -293,7 +293,8 @@ _EXPERIMENT_OUTPUTS = {
                        'results/exp2_benchmark_provenance.json'],
     'exp3_kv_cache': ['results/exp3_kv_cache.json'],
     'exp4_mqar': ['results/exp4_mqar.json',
-                  'results/exp4b_quality_tasks.json'],
+                  'results/exp4b_quality_tasks.json',
+                  'results/exp4_overfit_gate.json'],
     'exp5_ablation': ['results/exp5_ablation.json',
                       'results/exp5_ablation_provenance.json'],
     'exp5b_ablation_matrix_smoke': [

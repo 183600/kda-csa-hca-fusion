@@ -2,9 +2,9 @@
 
 Covers the shared RNG helpers in ``kaggle_setup``
 (:func:`set_global_seed`, :func:`seed_worker`,
-:func:`make_seeded_generator`), the pre-training overfit sanity gate in
-``train_lm_autodl``, and the seed-recording contract of the experiment
-runners.
+:func:`make_seeded_generator`), the pre-training overfit sanity gates in
+``train_lm_autodl`` (LM) and ``run_quality`` (classification / MQAR), and
+the seed-recording contract of the experiment runners.
 
 How to run::
 
@@ -33,6 +33,10 @@ from kaggle_setup import (  # noqa: E402
     set_global_seed,
 )
 from ops_fused import HybridConfig  # noqa: E402
+from run_quality import (  # noqa: E402
+    train_one,
+    run_overfit_sanity_check as run_mqar_overfit_sanity_check,
+)
 from train_lm_autodl import LMWithHybrid, run_overfit_sanity_check  # noqa: E402
 
 
@@ -168,3 +172,101 @@ def test_cache_audit_records_seed():
     report = run_cache_audit(decoder, decoder.cfg, T=8, seed=7)
     assert report['seed'] == 7
     json.dumps(report, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# CUDA deterministic-algorithm environment (set_global_seed)
+# ---------------------------------------------------------------------------
+
+def test_set_global_seed_exports_cublas_workspace_config():
+    """deterministic=True must export CUBLAS_WORKSPACE_CONFIG.
+
+    PyTorch's ``use_deterministic_algorithms`` requires the config for
+    deterministic cuBLAS GEMMs; without it, GEMMs warn and fall back to a
+    nondeterministic algorithm (or raise, depending on strictness).
+    """
+    saved = os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
+    try:
+        info = set_global_seed(11, deterministic=True)
+        assert info['cublas_workspace_config'] == ':4096:8'
+        assert os.environ.get('CUBLAS_WORKSPACE_CONFIG') == ':4096:8'
+        # A second call must not clobber an already-present value.
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+        info2 = set_global_seed(11, deterministic=True)
+        assert info2['cublas_workspace_config'] == ':16:8'
+        assert os.environ['CUBLAS_WORKSPACE_CONFIG'] == ':16:8'
+    finally:
+        if saved is None:
+            os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
+        else:
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = saved
+
+
+# ---------------------------------------------------------------------------
+# Classification (MQAR) overfit sanity gate in run_quality
+# ---------------------------------------------------------------------------
+
+def test_mqar_overfit_check_rejects_too_few_steps():
+    with pytest.raises(ValueError):
+        run_mqar_overfit_sanity_check('kda', steps=9)
+
+
+def test_mqar_overfit_check_passes_on_healthy_training():
+    report = run_mqar_overfit_sanity_check(
+        'kda', steps=200, lr=3e-3, seed=2026, train_batch=32)
+    assert report['passed'] is True
+    # The canonical MQAR config is chosen so every operator memorizes the
+    # fixed batch completely; require near-100% train accuracy.
+    assert report['final_train_acc'] >= 0.99
+    assert report['final_loss'] < report['initial_loss'] * 0.1
+    # The report is the tracked artifact for this gate; it must serialize.
+    json.dumps(report, allow_nan=False)
+
+
+def test_mqar_overfit_check_detects_frozen_training():
+    # lr=0 freezes the weights: the loss is flat and the gate must FAIL
+    # rather than let a broken optimizer (or detached loss) start the sweep.
+    report = run_mqar_overfit_sanity_check('kda', steps=15, lr=0.0)
+    assert report['passed'] is False
+    # Frozen weights => identical token accuracy on the identical batch.
+    assert report['acc_curve'][0] == report['acc_curve'][-1]
+
+
+def test_mqar_overfit_check_is_deterministic():
+    kw = dict(steps=12, lr=3e-3, seed=123)
+    first = run_mqar_overfit_sanity_check('csa', **kw)
+    second = run_mqar_overfit_sanity_check('csa', **kw)
+    assert first['fixed_batch_sha256'] == second['fixed_batch_sha256']
+    assert first['loss_curve'] == second['loss_curve']
+    assert first['acc_curve'] == second['acc_curve']
+
+
+def test_mqar_overfit_gate_does_not_perturb_training_results():
+    # The gate re-seeds internally and train_one re-seeds per op/seed, so a
+    # gate run must leave train_one's curves bit-identical. This guards the
+    # "gate is diagnostic-only" contract the sweep relies on.
+    kwargs = dict(seed=7, steps=15, device='cpu')
+    before = train_one('kda', **kwargs)
+    run_mqar_overfit_sanity_check('kda', steps=10, seed=999)
+    after = train_one('kda', **kwargs)
+    assert before['loss_curve'] == after['loss_curve']
+    assert before['acc_curve'] == after['acc_curve']
+    assert before['final_acc'] == after['final_acc']
+
+
+def test_lm_overfit_gate_does_not_perturb_model_init():
+    # train_lm_autodl re-seeds right before constructing the real model so
+    # its init is identical to a run where the gate never ran. Guard that
+    # contract: construct the model with the same seeding recipe used by
+    # main(), with and without a preceding gate run, and compare weights.
+    def construct():
+        set_global_seed(42, deterministic=True)
+        return LMWithHybrid(33, _tiny_cfg()).state_dict()
+
+    baseline = {k: v.clone() for k, v in construct().items()}
+    run_overfit_sanity_check(
+        lambda: LMWithHybrid(33, _tiny_cfg()), _fixed_batch(), 'cpu',
+        steps=10, lr=3e-3, seed=5, log_every=0)
+    after = construct()
+    assert baseline.keys() == after.keys()
+    assert all(torch.equal(baseline[k], after[k]) for k in baseline)

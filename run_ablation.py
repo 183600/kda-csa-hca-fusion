@@ -117,6 +117,19 @@ def _run_provenance(n_seeds, steps):
         'grad_clip_norm': 1.0,
         'steps': int(steps),
     }
+    # Data version block: MQAR batches are synthetic and fully determined by
+    # (generator function, task spec, seed + offset). Recording them makes
+    # the data version explicit instead of implicit in the code revision.
+    prov['data'] = {
+        'kind': 'synthetic',
+        'generator_function': make_mqar_batch.__name__,
+        'task_spec': {'seq_len': SEQ_LEN, 'vocab': VOCAB},
+        'seed_offsets': {'train': 1_000_000, 'eval': 5_000_000},
+        'note': ('Synthetic batches are a deterministic function of '
+                 '(generator, task spec, seed + offset); no external dataset '
+                 'version applies. Code revision in this provenance pins the '
+                 'generator implementation.'),
+    }
     return prov
 
 
