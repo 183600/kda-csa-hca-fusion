@@ -49,6 +49,7 @@ from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
+from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
 
 logger = logging.getLogger(__name__)
 
@@ -970,6 +971,61 @@ class Mamba2Attn(nn.Module):
         return out
 
 
+class Rwkv7Attn(nn.Module):
+    """Standalone single-layer RWKV-7 operator for the quality probes.
+
+    Wraps the reference :class:`ops_rwkv.Rwkv7Mixer` (via the backend
+    factory, so ``RWKV_BACKEND=fla`` selects the flash-linear-attention
+    kernels where available). The geometry knobs are sized for the tiny
+    quality models and are env-overridable: ``RWKV_HEAD_DIM`` (default
+    16; clamped down to the largest divisor of ``d_model``),
+    ``RWKV_DECAY_LORA`` / ``RWKV_A_LORA`` (default 4),
+    ``RWKV_GATE_LORA`` (default 8) — the same env knobs run_ablation's
+    matrix uses, so the standalone probes and the matrix stacks test
+    the same mixer geometry at a given d_model.
+
+    Like :class:`Mamba2Attn`, the operator is STATELESS per call: the
+    MQAR training loop feeds an independent random batch each step, so
+    any shift state carried across calls would be cross-batch leakage.
+    ``forward`` therefore always starts from a fresh shift state and a
+    fresh matrix state.
+    """
+
+    def __init__(self, d_model):
+        super().__init__()
+        head_dim = parse_int_env('RWKV_HEAD_DIM', 16, min_value=1,
+                                 logger=logger)
+        decay_lora = parse_int_env('RWKV_DECAY_LORA', 4, min_value=1,
+                                   logger=logger)
+        a_lora = parse_int_env('RWKV_A_LORA', 4, min_value=1, logger=logger)
+        gate_lora = parse_int_env('RWKV_GATE_LORA', 8, min_value=1,
+                                  logger=logger)
+        head_dim_eff = min(head_dim, d_model)
+        while d_model % head_dim_eff != 0:
+            head_dim_eff //= 2
+        cfg = HybridConfig(
+            d_model=d_model, memory_type='rwkv7',
+            rwkv_head_dim=head_dim_eff,
+            rwkv_decay_lora=min(decay_lora, d_model),
+            rwkv_a_lora=min(a_lora, d_model),
+            rwkv_gate_lora=min(gate_lora, d_model),
+            rwkv_backend=os.environ.get('RWKV_BACKEND', 'reference'),
+        )
+        # A standalone single-layer probe: this layer is RWKV layer 0 of
+        # 1 (the depth-dependent init constants degenerate gracefully —
+        # see Rwkv7Mixer._initialize_weights).
+        self.mixer = build_rwkv7_mixer(cfg, rwkv_layer_idx=0,
+                                        n_rwkv_layers=1)
+
+    @property
+    def effective_backend(self):
+        return getattr(self.mixer, 'effective_backend', 'reference')
+
+    def forward(self, x):
+        out, _, _ = self.mixer.forward_functional(x, None, None)
+        return out
+
+
 class CSAAttn(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -1144,6 +1200,7 @@ def _op_factory(op_name, d_model):
         'softmax': lambda: SoftmaxAttn(d_model),
         'kda':     lambda: KDAAttn(d_model),
         'mamba2':  lambda: Mamba2Attn(d_model),
+        'rwkv7':   lambda: Rwkv7Attn(d_model),
         'csa':     lambda: CSAAttn(d_model),
         'hca':     lambda: HCAAttn(d_model),
     }
@@ -1776,15 +1833,17 @@ def _parse_task_list(env_var, default='mqar'):
     return list(dict.fromkeys(vals))
 
 
-def _parse_op_list(env_var, default='softmax,kda,mamba2,csa,hca'):
+def _parse_op_list(env_var, default='softmax,kda,mamba2,rwkv7,csa,hca'):
     """Parse the operator list for the quality sweep.
 
     ``MQAR_OPS`` selects which single-layer operators run. The default
-    includes the Mamba-2 route (the framework's second memory operator);
-    set ``MQAR_OPS=softmax,kda,csa,hca`` to reproduce the historical
+    includes the Mamba-2 AND RWKV-7 routes (the framework's second and
+    third memory operators — the RWKV-7 row is the pure-mixer quality
+    baseline for the KDA-replacement ablation); set
+    ``MQAR_OPS=softmax,kda,csa,hca`` to reproduce the historical
     four-operator table exactly.
     """
-    valid = ['softmax', 'kda', 'mamba2', 'csa', 'hca']
+    valid = ['softmax', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca']
     raw = os.environ.get(env_var, default)
     vals = [x.strip() for x in raw.split(',') if x.strip()]
     if not vals:
@@ -1809,7 +1868,7 @@ def main():
     # historical table stays reproducible with MQAR_TASKS=mqar +
     # MQAR_OPS=softmax,kda,csa,hca.
     task_list = _parse_task_list('MQAR_TASKS', 'mqar')
-    ops_list = _parse_op_list('MQAR_OPS', 'softmax,kda,mamba2,csa,hca')
+    ops_list = _parse_op_list('MQAR_OPS', 'softmax,kda,mamba2,rwkv7,csa,hca')
     logger.info(f'  tasks         : {task_list}')
     logger.info(f'  ops           : {ops_list}')
     # MQAR's task hyperparameters. Lifted to named constants so the
@@ -1850,6 +1909,10 @@ def main():
     logger.info(f'  n_seeds       : {n_seeds}')
     logger.info(f'  steps         : {steps}  (softmax: {softmax_steps})')
     logger.info(f"  mamba_backend : {os.environ.get('MAMBA_BACKEND', 'reference')}")
+    logger.info(f"  rwkv_backend  : {os.environ.get('RWKV_BACKEND', 'reference')}")
+    logger.info(f"  rwkv7_binding : {RWKV7_UPSTREAM_BINDING['parameterization_init']['repo']}"
+                f"@{RWKV7_UPSTREAM_BINDING['parameterization_init']['commit'][:12]}"
+                f" ({RWKV7_UPSTREAM_BINDING['variant']})")
 
     # Pre-compute the (task, n_kv) sweep cells so every downstream count
     # (Bonferroni family size, log lines, result grouping) matches what
@@ -1945,6 +2008,8 @@ def main():
             'metadata': {
                 'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
                 'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
+                'rwkv_backend': os.environ.get('RWKV_BACKEND', 'reference'),
+                'rwkv7_upstream_binding': RWKV7_UPSTREAM_BINDING,
                 'provenance': capture_provenance(),
                 'settings': {
                     'enabled': True,
@@ -2256,6 +2321,8 @@ def main():
         return {
             'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
             'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
+            'rwkv_backend': os.environ.get('RWKV_BACKEND', 'reference'),
+            'rwkv7_upstream_binding': RWKV7_UPSTREAM_BINDING,
             'ops': list(ops_list),
             'tasks': list(task_list),
             # Reproducibility block: code version, environment, seeds, and

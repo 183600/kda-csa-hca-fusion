@@ -118,11 +118,21 @@ def lm_tower_geometry(cfg: HybridConfig) -> dict:
     instead of an Exp 2 ``workload`` record. ``kda_conv_ksize`` is the
     depthwise short-conv kernel size hardcoded in
     ``ops_fused.KDAHybridLayer`` (``nn.Conv1d(..., kernel_size=3)``).
+    The hybrid layer counts and the memory-route geometry are
+    EXPLICIT-LAYOUT aware (an explicit 10-layer matrix layout overrides
+    the n_kda:n_csa:n_hca ratio fields), and the mamba2 / rwkv7 geometry
+    keys let ``prefill_flops`` evaluate the route-aware hybrid row.
     """
     if not isinstance(cfg, HybridConfig):
         raise TypeError(
             f'lm_tower_geometry: cfg must be a HybridConfig, got '
             f'{type(cfg).__name__}.')
+    if cfg.layout is not None:
+        n_mem = sum(1 for k in cfg.layout if k in ('kda', 'mamba2', 'rwkv7'))
+        n_csa = sum(1 for k in cfg.layout if k == 'csa')
+        n_hca = sum(1 for k in cfg.layout if k == 'hca')
+    else:
+        n_mem, n_csa, n_hca = cfg.n_kda, cfg.n_csa, cfg.n_hca
     return dict(
         d=cfg.d_model, H=cfg.n_heads_qk, K=cfg.head_dim_k, V=cfg.head_dim_v,
         kda_hv=cfg.n_heads_v, kda_k=cfg.head_dim_k, kda_v=cfg.head_dim_v,
@@ -132,9 +142,23 @@ def lm_tower_geometry(cfg: HybridConfig) -> dict:
         csa_cI=cfg.csa_cI, csa_sliding_window=cfg.csa_sliding_window,
         hca_m2=cfg.hca_m2, hca_nh=cfg.hca_nh, hca_c=cfg.hca_c,
         hca_dc=cfg.hca_dc, hca_sliding_window=cfg.hca_sliding_window,
-        hybrid_n_kda=cfg.n_kda, hybrid_n_csa=cfg.n_csa,
-        hybrid_n_hca=cfg.n_hca,
+        hybrid_n_kda=n_mem, hybrid_n_csa=n_csa,
+        hybrid_n_hca=n_hca,
+        mamba_d_state=cfg.mamba_d_state, mamba_d_conv=cfg.mamba_d_conv,
+        mamba_expand=cfg.mamba_expand, mamba_headdim=cfg.mamba_headdim,
+        mamba_ngroups=cfg.mamba_ngroups, mamba_dt_rank=cfg.mamba_dt_rank,
+        rwkv_head_dim=cfg.rwkv_head_dim, rwkv_decay_lora=cfg.rwkv_decay_lora,
+        rwkv_a_lora=cfg.rwkv_a_lora, rwkv_gate_lora=cfg.rwkv_gate_lora,
     )
+
+
+def _lm_memory_route(cfg: HybridConfig) -> str:
+    """The concrete memory route of an LM tower (layout-aware)."""
+    if cfg.layout is not None:
+        return next(
+            (k for k in cfg.layout if k in ('kda', 'mamba2', 'rwkv7')),
+            cfg.memory_type)
+    return cfg.memory_type
 
 
 def decode_read_spec(cfg: HybridConfig) -> dict:
@@ -166,20 +190,48 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
     spec = decode_read_spec(cfg)
     reads = 0.0
     writes = 0.0
-    if cfg.n_kda > 0:
+    route = _lm_memory_route(cfg)
+    if cfg.layout is not None:
+        n_mem = sum(1 for k in cfg.layout if k in ('kda', 'mamba2', 'rwkv7'))
+        n_csa = sum(1 for k in cfg.layout if k == 'csa')
+        n_hca = sum(1 for k in cfg.layout if k == 'hca')
+    else:
+        n_mem, n_csa, n_hca = cfg.n_kda, cfg.n_csa, cfg.n_hca
+    if route == 'kda' and n_mem > 0:
         kda = kv_budget.op_read_elements('kda', T, spec)
-        reads += cfg.n_kda * kda['total_read_elements']
-        writes += cfg.n_kda * (kda['state_elements'] or 0)
-    if cfg.n_csa > 0:
+        reads += n_mem * kda['total_read_elements']
+        writes += n_mem * (kda['state_elements'] or 0)
+    elif route == 'mamba2' and n_mem > 0:
+        # Mamba-2: the SSM state is fully read and rewritten per step
+        # (nheads * headdim * d_state per layer); the conv state
+        # (d_inner * (d_conv - 1)) is read too but is second-order and
+        # amortized — excluded, mirroring the KDA write-side convention.
+        d_inner = cfg.mamba_expand * cfg.d_model
+        mamba_heads = (d_inner // cfg.mamba_headdim
+                       if cfg.mamba_headdim > 0 else 1)
+        ssm = mamba_heads * cfg.mamba_headdim * cfg.mamba_d_state
+        reads += n_mem * ssm
+        writes += n_mem * ssm
+    elif route == 'rwkv7' and n_mem > 0:
+        # RWKV-7: the matrix state is fully read and rewritten per step
+        # (H * K * V per layer); the token-shift state (d) is read too
+        # but is second-order — excluded, mirroring the KDA convention.
+        rwkv_heads = (cfg.d_model // cfg.rwkv_head_dim
+                      if cfg.rwkv_head_dim > 0 else 1)
+        matrix = rwkv_heads * cfg.rwkv_head_dim * cfg.rwkv_head_dim
+        reads += n_mem * matrix
+        writes += n_mem * matrix
+    if n_csa > 0:
         csa = kv_budget.op_read_elements('csa', T, spec)
-        reads += cfg.n_csa * csa['total_read_elements']
-    if cfg.n_hca > 0:
+        reads += n_csa * csa['total_read_elements']
+    if n_hca > 0:
         hca = kv_budget.op_read_elements('hca', T, spec)
-        reads += cfg.n_hca * hca['total_read_elements']
+        reads += n_hca * hca['total_read_elements']
     return {'read_elements_per_token': reads,
             'write_elements_per_token': float(writes),
             'total_elements_per_token': reads + writes,
-            'layout': [cfg.n_kda, cfg.n_csa, cfg.n_hca]}
+            'memory_route': route,
+            'layout': [n_mem, n_csa, n_hca]}
 
 
 def decode_roofline(cfg: HybridConfig, T: int, *, device: str = 'cpu',
@@ -204,7 +256,9 @@ def decode_roofline(cfg: HybridConfig, T: int, *, device: str = 'cpu',
             f'decode_roofline: cfg must be a HybridConfig, got '
             f'{type(cfg).__name__}.')
     geo = lm_tower_geometry(cfg)
-    flops_total = float(prefill_flops('hybrid_kch', T, **geo))
+    hybrid_op = {'kda': 'hybrid_kch', 'mamba2': 'hybrid_mamba2',
+                 'rwkv7': 'hybrid_rwkv7'}[_lm_memory_route(cfg)]
+    flops_total = float(prefill_flops(hybrid_op, T, **geo))
     flops_per_token = flops_total / T
     elems = decode_elements_per_token(cfg, T)
     bytes_per_token = elems['total_elements_per_token'] * itemsize
@@ -394,8 +448,13 @@ def build_decoding_clone(model, device=None):
     from run_decoding import HybridDecoding
 
     _cfg, hybrid = _tower(model)
+    # Pass the tower's memory route explicitly: HybridDecoding validates
+    # that a caller-supplied config's memory_type matches (a KDA-defaulted
+    # clone of an mamba2 / rwkv7 tower would raise, and silently running
+    # the wrong memory operator would be worse).
     clone = HybridDecoding(cfg=hybrid.cfg,
-                           total_layers=hybrid.total_layers)
+                           total_layers=hybrid.total_layers,
+                           memory_type=hybrid.cfg.memory_type)
     clone.model.load_state_dict(hybrid.state_dict())
     clone.eval()
     if device is not None:

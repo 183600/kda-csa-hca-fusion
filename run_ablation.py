@@ -7,7 +7,7 @@ Two modes, selected by ``ABL_MODE``:
   (a) end-to-end forward latency and (b) MQAR accuracy.
 * ``matrix`` (the eight-group main experiment from the framework design):
   a fixed-depth explicit-layout matrix crossing the memory route
-  (KDA vs. Mamba-2) with four layout groups —
+  (KDA vs. Mamba-2 vs. RWKV-7) with four layout groups —
 
         A: R R R R R     (pure recurrent baseline)
         B: R R R CSA R   (CSA replaces a fixed recurrent slot)
@@ -15,13 +15,21 @@ Two modes, selected by ``ABL_MODE``:
         D: R R R CSA HCA (full hybrid)
 
   where R is the recurrent memory operator selected by ``memory_type``.
-  All groups share the SAME total depth (``ABL_TOTAL_LAYERS``, default
-  10 = the 5-layer unit repeated twice), the same outer layer structure,
-  and the same training recipe, so CSA's and HCA's contributions are
-  ablated independently of the memory operator. Additional presets
-  (``ABL_MATRIX=csa_csa | position | budget``) cover the follow-up
-  ablations: HCA-vs-more-CSA, layer placement, and compression-budget
-  allocation at fixed cache bytes.
+  The default ``ABL_MEMORY=kda,mamba2,rwkv7`` yields the TWELVE-group
+  total table (the RWKV-7 route is the KDA-replacement ablation:
+  same depth/width/layout/training, only the memory mixer swapped);
+  ``ABL_MEMORY=kda,rwkv7`` restricts to the eight-group main
+  experiment. All groups share the SAME total depth
+  (``ABL_TOTAL_LAYERS``, default 10 = the 5-layer unit repeated
+  twice), the same outer layer structure, and the same training
+  recipe, so CSA's and HCA's contributions are ablated independently
+  of the memory operator. Paired seed-matched contrasts
+  (B-A / C-A / D-B / D-C, the I=D-B-C+A interaction per route, and
+  the cross-route A/D replacement differences) are computed and
+  written to ``results/exp5b_ablation_matrix_contrasts.json``.
+  Additional presets (``ABL_MATRIX=csa_csa | position | budget``)
+  cover the follow-up ablations: HCA-vs-more-CSA, layer placement,
+  and compression-budget allocation at fixed cache bytes.
 
 Methodology (both modes):
 
@@ -62,6 +70,8 @@ from kaggle_setup import (
 from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
 from ops_kda_backend import validate_kda_backend
 from ops_mamba_backend import validate_mamba_backend
+from ops_rwkv import RWKV7_UPSTREAM_BINDING
+from ops_rwkv_backend import validate_rwkv_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, SMALL_MODEL_SPEC,
@@ -117,6 +127,17 @@ def _run_provenance(n_seeds, steps):
         'grad_clip_norm': 1.0,
         'steps': int(steps),
     }
+    # Memory-route implementation provenance: which backends were
+    # REQUESTED for this run (the effective backend is recorded per
+    # result row / on each mixer's effective_backend attribute), plus
+    # the RWKV-7 upstream binding (implementation commits) so every run
+    # record answers 'which RWKV-7 implementation produced this'.
+    prov['memory_backends_requested'] = {
+        'kda': os.environ.get('KDA_BACKEND', 'reference'),
+        'mamba2': os.environ.get('MAMBA_BACKEND', 'reference'),
+        'rwkv7': os.environ.get('RWKV_BACKEND', 'reference'),
+    }
+    prov['rwkv7_upstream_binding'] = RWKV7_UPSTREAM_BINDING
     # Data version block: MQAR batches are synthetic and fully determined by
     # (generator function, task spec, seed + offset). Recording them makes
     # the data version explicit instead of implicit in the code revision.
@@ -406,8 +427,37 @@ def _matrix_mamba_dims(d_model: int) -> dict:
             'mamba_expand': expand, 'mamba_headdim': headdim_eff}
 
 
+def _matrix_rwkv_dims(d_model: int) -> dict:
+    """Env-tunable RWKV-7 geometry for the matrix, auto-clamped.
+
+    Mirrors run_quality.Rwkv7Attn's knobs (RWKV_HEAD_DIM / lora widths)
+    so the standalone operator probes and the matrix stacks test the
+    same mixer geometry at a given d_model. ``RWKV_HEAD_DIM`` (default
+    16 for the small matrix models, mirroring MAMBA2_HEADDIM) is clamped
+    down to the largest divisor of d_model; the LoRA widths default to
+    small-scale values (fla-formula floored at 4/8) and are clamped to
+    d_model. The MAIN-table geometry (d_model=256, head_dim=64, loras
+    32/32/64) is applied by the formal runs via the same env knobs.
+    """
+    head_dim = parse_int_env('RWKV_HEAD_DIM', 16, min_value=1, logger=logger)
+    decay_lora = parse_int_env('RWKV_DECAY_LORA', 4, min_value=1,
+                               logger=logger)
+    a_lora = parse_int_env('RWKV_A_LORA', 4, min_value=1, logger=logger)
+    gate_lora = parse_int_env('RWKV_GATE_LORA', 8, min_value=1,
+                              logger=logger)
+    head_dim_eff = min(head_dim, d_model)
+    while d_model % head_dim_eff != 0:
+        head_dim_eff //= 2
+    return {
+        'rwkv_head_dim': head_dim_eff,
+        'rwkv_decay_lora': min(decay_lora, d_model),
+        'rwkv_a_lora': min(a_lora, d_model),
+        'rwkv_gate_lora': min(gate_lora, d_model),
+    }
+
+
 def build_experiment_matrix(preset='main8', total_layers=10,
-                            memory_types=('kda', 'mamba2')):
+                            memory_types=('kda', 'mamba2', 'rwkv7')):
     """Build the explicit experiment matrix.
 
     Returns a list of ``(group_id, memory_type, layout, description)``
@@ -415,8 +465,13 @@ def build_experiment_matrix(preset='main8', total_layers=10,
     the 'memory' token — HybridConfig resolves it via memory_type).
 
     Presets:
-      * ``main8``   — A/B/C/D x {kda, mamba2}: the primary eight-group
-        design. Requires total_layers % 5 == 0 (the unit repeats).
+      * ``main8``   — A/B/C/D x memories: the primary eight-group design
+        at two memory routes; the DEFAULT ``memory_types`` now covers
+        all three routes (kda / mamba2 / rwkv7) so a bare run yields the
+        TWELVE-group total table when the Mamba-2 results share the
+        configuration. Restrict via ABL_MEMORY (e.g.
+        ``ABL_MEMORY=kda,rwkv7`` for the eight-group KDA-vs-RWKV main
+        experiment). Requires total_layers % 5 == 0 (the unit repeats).
       * ``csa_csa`` — A/D/E x memories: is HCA actually better than a
         second CSA layer at the same depth?
       * ``position``— alternating (D-unit repeated) vs. back-loaded
@@ -517,7 +572,11 @@ def _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides=None):
         mamba_backend=validate_mamba_backend(
             os.environ.get('MAMBA_BACKEND', 'reference')
         ),
+        rwkv_backend=validate_rwkv_backend(
+            os.environ.get('RWKV_BACKEND', 'reference')
+        ),
         **_matrix_mamba_dims(d_model),
+        **_matrix_rwkv_dims(d_model),
     )
     if cfg_overrides:
         kw.update(cfg_overrides)
@@ -747,15 +806,174 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     }
 
 
+def _seed_accuracy_map(result: dict) -> dict[int, float]:
+    """Map seed -> final_acc from a group's per-seed rows (missing = skip)."""
+    out = {}
+    for row in result.get('per_seed', []):
+        acc = row.get('final_acc')
+        seed = row.get('seed')
+        if acc is None or seed is None or not math.isfinite(acc):
+            continue
+        out[int(seed)] = float(acc)
+    return out
+
+
+def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
+    """Paired mean diff + t-stat over the COMMON seeds of two groups.
+
+    Returns ``(mean_diff, t_stat, n)``, or ``(None, None, 0)`` when fewer
+    than two common seeds exist. Positive diff = a better than b for a
+    higher-is-better metric (final_acc); loss-direction metrics must be
+    sign-flipped BEFORE calling this.
+    """
+    common = sorted(set(accs_a) & set(accs_b))
+    if len(common) < 2:
+        return None, None, 0
+    diffs = [accs_a[s] - accs_b[s] for s in common]
+    n = len(diffs)
+    mean_diff = sum(diffs) / n
+    var = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
+    std = math.sqrt(var)
+    t_stat = (mean_diff / (std / math.sqrt(n))) if std > 0 else None
+    return mean_diff, t_stat, n
+
+
+def _matrix_contrast_report(all_results: list) -> list:
+    """Paired CSA/HCA contrasts per memory route (the matrix's key reads).
+
+    For each ``n_kv`` and each memory route R present with the A/B/C/D
+    groups, compute paired seed-matched differences on ``final_acc``
+    (higher-is-better; loss metrics must be sign-flipped before reuse):
+
+      * ``B_R - A_R``  — CSA replacing a fixed memory slot's benefit.
+      * ``C_R - A_R``  — HCA replacing a fixed memory slot's benefit.
+      * ``D_R - B_R``  — adding HCA on top of an existing CSA.
+      * ``D_R - C_R``  — adding CSA on top of an existing HCA.
+      * ``I_R = D_R - B_R - C_R + A_R`` — the CSA/HCA interaction
+        (complementarity) under this layout; interpret only with
+        statistical evidence.
+
+    and, for every PAIR of memory routes (R, R') sharing the A/D groups
+    (e.g. the KDA-vs-RWKV-7 replacement question), the full-model
+    replacement difference ``D_R - D_R'`` plus the pure-baseline
+    replacement difference ``A_R - A_R'``.
+
+    Only rows with >= 2 common seeds produce a t-stat. The returned
+    list is written to ``results/exp5b_ablation_matrix_contrasts.json``
+    and logged as a table by ``_run_matrix_mode``.
+    """
+    ok_results = [r for r in all_results if 'error' not in r]
+    by_key = {}
+    for r in ok_results:
+        by_key[(r.get('n_kv'), r.get('memory'), r.get('group'))] = r
+
+    contrasts = []
+    n_kvs = sorted({r.get('n_kv') for r in ok_results})
+    routes = sorted({r.get('memory') for r in ok_results})
+    for n_kv in n_kvs:
+        # --- per-route layout contrasts --------------------------------
+        for route in routes:
+            groups = {g: by_key.get((n_kv, route, f'{route.upper()}-{g}'))
+                      for g in 'ABCD'}
+            accs = {g: _seed_accuracy_map(r) if r is not None else {}
+                    for g, r in groups.items()}
+            for name, ga, gb in [
+                ('B-A (CSA replaces memory)', 'B', 'A'),
+                ('C-A (HCA replaces memory)', 'C', 'A'),
+                ('D-B (add HCA to CSA)', 'D', 'B'),
+                ('D-C (add CSA to HCA)', 'D', 'C'),
+            ]:
+                if groups[ga] is None or groups[gb] is None:
+                    continue
+                diff, t_stat, n = _paired_contrast(accs[ga], accs[gb])
+                if diff is None:
+                    continue
+                contrasts.append({
+                    'n_kv': n_kv, 'memory': route, 'contrast': name,
+                    'mean_diff': diff, 't_stat': t_stat,
+                    'n_common_seeds': n,
+                    'metric': 'final_acc',
+                    'direction': 'higher_is_better',
+                })
+            # Interaction I_R = D - B - C + A on the COMMON seeds of all
+            # four groups.
+            if all(groups[g] is not None for g in 'ABCD'):
+                common = (set(accs['A']) & set(accs['B'])
+                          & set(accs['C']) & set(accs['D']))
+                if len(common) >= 2:
+                    inter = [accs['D'][s] - accs['B'][s] - accs['C'][s]
+                             + accs['A'][s] for s in sorted(common)]
+                    n = len(inter)
+                    mean_i = sum(inter) / n
+                    var = sum((x - mean_i) ** 2 for x in inter) / (n - 1)
+                    t_i = (mean_i / (math.sqrt(var) / math.sqrt(n))) \
+                        if var > 0 else None
+                    contrasts.append({
+                        'n_kv': n_kv, 'memory': route,
+                        'contrast': 'I=D-B-C+A (CSA/HCA interaction)',
+                        'mean_diff': mean_i, 't_stat': t_i,
+                        'n_common_seeds': n,
+                        'metric': 'final_acc',
+                        'direction': 'higher_is_better',
+                    })
+        # --- cross-route replacement contrasts ---------------------------
+        for i, ra in enumerate(routes):
+            for rb in routes[i + 1:]:
+                for g, question in (('A', 'pure memory-baseline replacement'),
+                                    ('D', 'full hybrid model replacement')):
+                    res_a = by_key.get((n_kv, ra, f'{ra.upper()}-{g}'))
+                    res_b = by_key.get((n_kv, rb, f'{rb.upper()}-{g}'))
+                    if res_a is None or res_b is None:
+                        continue
+                    diff, t_stat, n = _paired_contrast(
+                        _seed_accuracy_map(res_a), _seed_accuracy_map(res_b))
+                    if diff is None:
+                        continue
+                    contrasts.append({
+                        'n_kv': n_kv,
+                        'memory': f'{ra} vs {rb}',
+                        'contrast': f'{g}_{ra.upper()} - {g}_{rb.upper()}',
+                        'mean_diff': diff, 't_stat': t_stat,
+                        'n_common_seeds': n,
+                        'metric': 'final_acc',
+                        'direction': 'higher_is_better',
+                        'question': question,
+                    })
+    return contrasts
+
+
+def _log_contrast_table(contrasts: list) -> None:
+    """Log the paired-contrast rows as a readable table."""
+    if not contrasts:
+        logger.info('  (no paired contrasts computable: need >= 2 common '
+                    'seeds across the compared groups)')
+        return
+    logger.info('\n' + '=' * 92)
+    logger.info('Paired memory-route contrasts (seed-matched; final_acc; '
+                'positive = first operand better):')
+    logger.info('=' * 92)
+    for c in contrasts:
+        t_str = _fmt_tstat(c.get('t_stat'), width=8, prec=2)
+        logger.info(
+            f"  n_kv={c['n_kv']:<3} {c['memory']:<12} {c['contrast']:<34} "
+            f"diff={c['mean_diff']:+.4f}  t={t_str}  n={c['n_common_seeds']}")
+    logger.info(
+        '  NOTE: interaction rows (I=D-B-C+A) support complementarity '
+        'claims ONLY with statistical evidence;')
+    logger.info(
+        '  sign-flip loss/PPL metrics before reusing this helper.')
+    logger.info('=' * 92)
+
+
 def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
     """ABL_MODE=matrix driver: build + run + report the explicit matrix."""
     preset = os.environ.get('ABL_MATRIX', 'main8').strip().lower()
     total_layers = parse_int_env('ABL_TOTAL_LAYERS', 10, min_value=1,
                                  logger=logger)
     d_model = parse_int_env('ABL_D_MODEL', 32, min_value=8, logger=logger)
-    raw_mem = os.environ.get('ABL_MEMORY', 'kda,mamba2')
+    raw_mem = os.environ.get('ABL_MEMORY', 'kda,mamba2,rwkv7')
     memory_types = [m.strip() for m in raw_mem.split(',') if m.strip()]
-    valid_mem = {'kda', 'mamba2'}
+    valid_mem = {'kda', 'mamba2', 'rwkv7'}
     unknown_mem = [m for m in memory_types if m not in valid_mem]
     if unknown_mem:
         raise ValueError(
@@ -898,11 +1116,23 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         r['csa_indexer_normalize_qk'] = True
         r['kda_backend'] = os.environ.get('KDA_BACKEND', 'reference')
         r['mamba_backend'] = os.environ.get('MAMBA_BACKEND', 'reference')
+        r['rwkv_backend'] = os.environ.get('RWKV_BACKEND', 'reference')
+        r['rwkv7_upstream_binding'] = RWKV7_UPSTREAM_BINDING
         r['significance_scope'] = 'vs_chance_baseline_not_pairwise_between_groups'
+
+    # Paired seed-matched contrasts (B-A / C-A / D-B / D-C / interaction
+    # per route; A/D replacement across routes — the KDA-vs-RWKV-7
+    # replacement question) — written to their own side file so the
+    # per-group rows' schema stays unchanged for existing consumers.
+    contrasts = _matrix_contrast_report(all_results)
+    _log_contrast_table(contrasts)
 
     os.makedirs('results', exist_ok=True)
     write_results_json(all_results, 'results/exp5b_ablation_matrix.json',
                        logger=logger)
+    write_results_json(contrasts,
+                        'results/exp5b_ablation_matrix_contrasts.json',
+                        logger=logger)
     try:
         write_results_json(_run_provenance(n_seeds, steps),
                            'results/exp5b_ablation_matrix_provenance.json',
