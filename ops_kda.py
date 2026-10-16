@@ -199,8 +199,11 @@ def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
         # ``beta_k_i`` is ``beta_i * k_i`` (precomputed by the caller); the
         # update is the delta-rule ``S + beta_i ⊗ delta`` in fp association.
         S = torch.addcmul(S, beta_k_i, delta[..., None, :])
-        outs.append((q_i.unsqueeze(-2) @ S).squeeze(-2))
-    return torch.stack(outs, 1), S
+        # Keep the singleton head dim until the single post-loop squeeze:
+        # append-and-stack as ``[B, H, 1, V]`` then squeeze(-2) is
+        # elementwise-identical to squeezing each step before the stack.
+        outs.append(q_i.unsqueeze(-2) @ S)
+    return torch.stack(outs, 1).squeeze(-2), S
 
 
 _RECURRENT_LOOP_SCRIPTED = None
