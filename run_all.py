@@ -28,7 +28,7 @@ What this runner does
     CUDA wheel install itself lives in ``kaggle_setup.bootstrap_kaggle_cuda``
     and requires a kernel restart — see that module's docstring).
   * Prints an environment summary.
-  * Runs all six experiments + method analysis + figure generation.
+  * Runs all experiments (Exp 1-8) + method analysis + figure generation.
   * Saves a combined ``results/summary.json`` with pass/fail and key numbers.
 
 Environment knobs (set before importing / via ``os.environ``):
@@ -37,6 +37,9 @@ Environment knobs (set before importing / via ``os.environ``):
   * ``MQAR_SOFTMAX_STEPS`` (default: same as MQAR_STEPS) — optional explicitly labelled softmax long-training sensitivity run.
   * ``ABL_SEEDS``       (default 7)   — seeds for the ablation (run_all(seeds=...) overrides).
   * ``ABL_STEPS``       (default 100) — training steps for the ablation.
+  * ``MECH_SEEDS``      (default 5)   — seeds for the mechanism ablation (Exp 8).
+  * ``MECH_STEPS``      (default 200) — training steps for Exp 8.
+  * ``MECH_VARIANTS``   (default "")  — optional comma-separated Exp 8 variant subset.
   * ``SKIP_SLOW``       (default 0)   — if "1", skip CSA-heavy experiments on CPU.
 
 This script is the reproducibility anchor referenced by the paper's
@@ -222,6 +225,8 @@ _EXPERIMENT_OUTPUTS = {
     'exp5_ablation': ['results/exp5_ablation.json',
                       'results/exp5_ablation_provenance.json'],
     'exp6_decoding': ['results/exp6_decoding.json'],
+    'exp7_roofline': ['results/exp7_roofline.json'],
+    'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
 }
 
 
@@ -307,7 +312,8 @@ def run_all(seeds=None, steps=None):
     # in place.
     _env_keys = ('MQAR_SEEDS', 'ABL_SEEDS', 'MQAR_STEPS', 'ABL_STEPS',
                  'MQAR_SOFTMAX_STEPS', 'BENCH_LENGTHS', 'RESULTS_DIR',
-                 'FIGURES_DIR', 'SKIP_SLOW')
+                 'FIGURES_DIR', 'SKIP_SLOW', 'MECH_SEEDS', 'MECH_STEPS',
+                 'MECH_TRAIN_BATCH', 'MECH_NKV', 'MECH_VARIANTS')
     # Snapshot the precise pre-call state of each env var: distinguish
     # "unset" from "set to a value" so the finally block can restore the
     # exact state.
@@ -352,6 +358,7 @@ def run_all(seeds=None, steps=None):
         if seeds is not None:
             os.environ['MQAR_SEEDS'] = str(seeds)
             os.environ['ABL_SEEDS'] = str(seeds)
+            os.environ['MECH_SEEDS'] = str(seeds)
         if steps is not None:
             os.environ['MQAR_STEPS'] = str(steps)
             # Ablation (Exp 5) sweeps multiple KDA:CSA:HCA ratios, each trained
@@ -359,6 +366,9 @@ def run_all(seeds=None, steps=None):
             # with the MQAR run so the cross-experiment comparison remains fair
             # and the caller's explicit ``steps`` budget is honored uniformly.
             os.environ['ABL_STEPS'] = str(steps)
+            # The mechanism ablation (Exp 8) trains several variants on the
+            # same MQAR task; synchronize its budget for the same reason.
+            os.environ['MECH_STEPS'] = str(steps)
 
         os.makedirs('results', exist_ok=True)
         os.makedirs('figures', exist_ok=True)
@@ -385,7 +395,11 @@ def run_all(seeds=None, steps=None):
         import run_benchmark
         import run_quality
         import run_ablation
+        import run_mechanism_ablation
         import run_decoding
+        import run_roofline
+        import test_roofline_schema
+        import test_mechanism_ablation
         import method_analysis
         import make_figures
 
@@ -394,6 +408,20 @@ def run_all(seeds=None, steps=None):
 
         # 1. Correctness — always run (fast, ~seconds).
         summary['runs'].append(_run('exp1_correctness', run_correctness.main))
+
+        # 1b. Schema/roofline unit tests — the canonical suites are
+        #     design-pinned, so the new results_schema / roofline modules
+        #     carry their own test module; run it here so the full pipeline
+        #     covers it even though ci_gate's fast pytest layer only names
+        #     run_correctness.py + test_figures.py.
+        summary['runs'].append(
+            _run('test_roofline_schema', test_roofline_schema.main))
+
+        # 1c. Mechanism-ablation unit tests — Exp 8's diagnostic and
+        #     paired-statistics helpers carry their own test module (same
+        #     rationale as 1b: the canonical suites are pinned).
+        summary['runs'].append(
+            _run('test_mechanism_ablation', test_mechanism_ablation.main))
 
         # 2. KV cache analysis — pure arithmetic, always run.
         summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))
@@ -423,6 +451,11 @@ def run_all(seeds=None, steps=None):
             summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
         else:
             summary['runs'].append(_run('exp2_benchmark', run_benchmark.main))
+
+        # 4b. Roofline analysis — pure post-processing over the Exp 2 rows
+        #     just written (analytic FLOPs/bytes + on-host peak
+        #     microbenchmarks). Always run: cheap and CPU-friendly.
+        summary['runs'].append(_run('exp7_roofline', run_roofline.main))
 
         # 5. MQAR quality — multi-seed. On CPU with CSA this is the slowest.
         if skip_slow and is_cpu:
@@ -487,6 +520,23 @@ def run_all(seeds=None, steps=None):
                 _abl_steps = 100
             os.environ['ABL_STEPS'] = str(min(_abl_steps, 50))
         summary['runs'].append(_run('exp5_ablation', run_ablation.main))
+
+        # 6b. Mechanism ablation — multi-seed. Same SKIP_SLOW policy as
+        #     Exp 5: keep the seed count >= 5 for a usable paired test,
+        #     truncate the step budget only.
+        if skip_slow and is_cpu:
+            try:
+                _mech_seeds = int(os.environ.get('MECH_SEEDS', '5'))
+            except ValueError:
+                _mech_seeds = 5
+            os.environ['MECH_SEEDS'] = str(max(5, _mech_seeds))
+            try:
+                _mech_steps = int(os.environ.get('MECH_STEPS', '200'))
+            except ValueError:
+                _mech_steps = 200
+            os.environ['MECH_STEPS'] = str(min(_mech_steps, 50))
+        summary['runs'].append(
+            _run('exp8_mechanism_ablation', run_mechanism_ablation.main))
 
         # 7. Decoding latency — fast (only softmax + KDA).
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
@@ -561,6 +611,12 @@ def run_all(seeds=None, steps=None):
                 expected += _fig_group_names('exp5_ablation.json', 'fig_ablation')
             if os.path.exists(os.path.join(res_dir, 'exp6_decoding.json')):
                 expected.append('fig_decoding.pdf')
+            if os.path.exists(os.path.join(res_dir, 'exp7_roofline.json')):
+                expected.append('fig_roofline.pdf')
+            if os.path.exists(os.path.join(
+                    res_dir, 'exp8_mechanism_ablation.json')):
+                expected += _fig_group_names('exp8_mechanism_ablation.json',
+                                             'fig_mechanism_ablation')
             expected.append('fig_architecture.pdf')
             missing = [f for f in expected
                        if not os.path.exists(os.path.join(fig_dir, f))]

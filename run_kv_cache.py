@@ -33,13 +33,13 @@ Linear §3.2 / §7.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import sanitize_for_json, write_json_atomic
+from results_schema import envelope, write as write_results
 
 
 # Reference GQA8, head_dim=128, BF16 baseline (as in DeepSeek-V4 §2.3.4).
@@ -595,18 +595,31 @@ def main():
     # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py
     # (was a local ``_sanitize`` closure; centralizing removes 5 copies of
     # the same logic across run_*.py).
-    sanitized = [sanitize_for_json(r) for r in rows]
+    #
+    # The payload is written as a versioned envelope via ``results_schema``
+    # (schema_version "1.0") so the file carries its accounting semantics
+    # and byte convention alongside the rows. Legacy bare-array files remain
+    # readable — see results_schema.parse / make_figures.load.
+    metadata = {
+        'model': 'analytic (closed-form formulas; NOT profiled from a forward pass)',
+        'bytes_convention': 'kv_bytes = kv_elements * BF16_BYTES (2 bytes), '
+                            'matching the DeepSeek-V4 §2.3.4 comparison',
+        'accounting_modes': ['compressed_kv_only', 'full_accounting'],
+    }
     try:
-        write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
-                          indent=2, allow_nan=False)
+        write_results('results/exp3_kv_cache.json', rows,
+                      kind='exp3_kv_cache', metadata=metadata)
     except (TypeError, ValueError) as e:
-        # Fallback: log the corruption and write without allow_nan=False
-        # so results are not lost entirely. Non-finite values would have
-        # been converted to None by sanitize_for_json above, so this branch
-        # only fires on truly unexpected types (e.g. a tensor slipped in).
-        print(f'[run_kv_cache] WARNING: JSON serialization failed: {e}')
-        write_json_atomic(sanitized, 'results/exp3_kv_cache.json',
-                          indent=2, default=str)
+        # Fallback: log the corruption and write with a string coercion so
+        # results are not lost entirely. Non-finite floats have already been
+        # converted to None by results_schema's internal sanitizer, so this
+        # branch only fires on truly unexpected types (e.g. a tensor slipped
+        # into a row).
+        print(f'[run_kv_cache] WARNING: envelope serialization failed: {e}')
+        write_json_atomic(
+            sanitize_for_json(envelope(rows, kind='exp3_kv_cache',
+                                       metadata=metadata)),
+            'results/exp3_kv_cache.json', indent=2, default=str)
     print('\nSaved: results/exp3_kv_cache.json')
     return 0
 

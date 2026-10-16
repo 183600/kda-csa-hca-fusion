@@ -431,7 +431,8 @@ SMALL_MODEL_SPEC = {
 
 
 def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
-                    embed: nn.Embedding, device=None, generator=None):
+                    embed: nn.Embedding, device=None, generator=None,
+                    return_meta: bool = False):
     """Build an MQAR batch with *learnable* embeddings.
 
     Layout per sequence (length ``seq_len``):
@@ -455,6 +456,15 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     *different* training batches across operators — a silent confound in
     the multi-seed CI. Pass a per-seed generator to guarantee that, for a
     given seed, all operators see the same training data.
+
+    ``return_meta`` (keyword-only, default False) preserves the historical
+    3-tuple return ``(x_emb, target, cue_pos)``. When True, a fourth element
+    is returned: ``{'key_idx': j}`` where ``j`` is the ``[batch]`` tensor of
+    which KV pair (0..n_kv-1) was cued for each sequence. Downstream
+    mechanism diagnostics (e.g. ``run_mechanism_ablation``'s indexer
+    gold-block recall) need to localize the cued pair WITHOUT re-deriving
+    the task layout, so the index is surfaced here rather than duplicated
+    in the caller.
     """
     if device is None:
         device = embed.weight.device
@@ -526,7 +536,10 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     target = vals[row, j]
 
     # Apply embedding (gradients flow to the embedding table).
-    return embed(x), target, cue_pos
+    x_emb = embed(x)
+    if return_meta:
+        return x_emb, target, cue_pos, {'key_idx': j}
+    return x_emb, target, cue_pos
 
 
 class MQARHead(nn.Module):

@@ -8,7 +8,6 @@ are drawn with error bars showing the 95% CI half-width.
 from __future__ import annotations
 
 import collections
-import json
 import math
 import os
 import sys
@@ -30,48 +29,47 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from results_schema import load_or_empty  # noqa: E402
+
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _RESULTS_DIR = os.environ.get('RESULTS_DIR', os.path.join(_ROOT, 'results'))
 _FIGURES_DIR = os.environ.get('FIGURES_DIR', os.path.join(_ROOT, 'figures'))
 
 
-def load(name):
-    """Load a results JSON file.
+def load_with_metadata(name):
+    """Load a results JSON file, returning ``(metadata, rows)``.
 
-    Returns ``[]`` on FileNotFoundError or JSONDecodeError so the caller
-    can degrade gracefully (skip the figure with a log line) rather than
-    crashing the entire figure-generation step.
-
-    Supports two on-disk schemas:
-
-    1. **Legacy bare array** ``[{...}, {...}]`` (still used by all
-       result files except ``exp4_mqar.json``).
-    2. **Envelope object** ``{"metadata": {...}, "results": [...]}``
-       so that a result file can carry provenance / caveats alongside
-       the data array without producing the invalid concatenated-document
-       form ``{...}\\n[...]`` that ``json.load`` rejects with
-       ``Extra data``.
-
-    For the envelope form, this function returns the inner ``results``
-    array so downstream figure code keeps working unchanged. The
-    ``metadata`` block is intentionally discarded here because no current
-    figure consumes it; if a future figure needs provenance, add a
-    sibling ``load_with_metadata()`` that returns ``(metadata, results)``.
+    Thin wrapper over :func:`results_schema.load_or_empty` so figure code
+    never crashes on a missing / malformed / future-version file (it logs
+    the reason to stderr and yields ``({}, [])``).
     """
     path = os.path.join(_RESULTS_DIR, name)
-    try:
-        with open(path, encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f'[load] {path} not found; skipping', file=sys.stderr)
-        return []
-    except json.JSONDecodeError as e:
-        print(f'[load] {path} is malformed: {e}; skipping', file=sys.stderr)
-        return []
-    if isinstance(data, dict) and 'results' in data and isinstance(
-            data['results'], list):
-        return data['results']
-    return data
+    return load_or_empty(path, context='make_figures')
+
+
+def load(name):
+    """Load a results JSON file and return its row list.
+
+    Returns ``[]`` on FileNotFoundError / JSONDecodeError / incompatible
+    schema version so the caller can degrade gracefully (skip the figure
+    with a log line) rather than crashing the entire figure-generation step.
+
+    Schema handling is delegated to :mod:`results_schema`, which accepts:
+
+    1. **Legacy bare array** ``[{...}, {...}]`` (historical Exp 1/2/3/5/6).
+    2. **Envelope object** ``{"metadata": {...}, "results": [...]}`` in any
+       revision (Exp 4's informal ``schema_version: 1``, or the versioned
+       ``"schema_version": "1.0"`` envelopes written by current tooling),
+       returning the inner ``results`` array so downstream figure code
+       keeps working unchanged. A file declaring a FUTURE major version is
+       refused loudly (stderr) instead of being misread — see
+       ``results_schema.SchemaVersionError``.
+
+    Use :func:`load_with_metadata` when the provenance block is needed
+    (e.g. the roofline figure reads machine peaks from it).
+    """
+    _meta, rows = load_with_metadata(name)
+    return rows
 
 
 def _ensure_figures_dir():
@@ -596,6 +594,165 @@ def _plot_ablation_group(records, n_kv, write_legacy_name):
     print(msg)
 
 
+def fig_mechanism_ablation():
+    """Figure: CSA mechanism ablation (Exp 8, multi-seed with error bars).
+
+    Two panels: MQAR accuracy per mechanism variant and the lightning
+    indexer's gold-block recall@k at the cue position. Recall is a
+    diagnostic of *selection quality*; its per-variant chance level
+    (``min(k, available)/available``) is drawn alongside so a curve that
+    fails to beat chance is visible as such.
+    """
+    path = os.path.join(_RESULTS_DIR, 'exp8_mechanism_ablation.json')
+    if not os.path.exists(path):
+        print('Skipping mechanism-ablation figure (no results yet)')
+        return
+    meta, data = load_with_metadata('exp8_mechanism_ablation.json')
+    if not data:
+        print('Skipping mechanism-ablation figure (no data)')
+        return
+    groups = collections.defaultdict(list)
+    for r in data:
+        groups[r.get('n_kv', 1)].append(r)
+    single = len(groups) == 1
+    for n_kv in sorted(groups):
+        _plot_mechanism_group(groups[n_kv], n_kv, single, meta)
+
+
+def _plot_mechanism_group(records, n_kv, write_legacy_name, meta):
+    """Plot accuracy + gold-block recall bars for one ``n_kv`` group."""
+    labels = []
+    accs = []
+    acc_cis = []
+    recalls = []
+    recall_cis = []
+    recall_na = []
+    chances = []
+    error_flags = []
+    skipped = 0
+    for r in records:
+        name = str(r.get('variant', '?'))
+        label = (f"{name}\nrope={'on' if r.get('rope') else 'off'}, "
+                 f"k={r.get('topk')}\n"
+                 f"STE={'on' if r.get('use_ste', True) else 'off'}")
+        labels.append(label)
+        is_error = 'error' in r or (
+            r.get('mean_acc') is None and r.get('final_acc') is None)
+        if is_error:
+            error_flags.append(True)
+            accs.append(0.0)
+            acc_cis.append(0.0)
+            recalls.append(0.0)
+            recall_cis.append(0.0)
+            recall_na.append(True)
+            chances.append(None)
+            skipped += 1
+            continue
+        error_flags.append(False)
+        accs.append(0.0 if r.get('mean_acc') is None else r['mean_acc'])
+        _ci = r.get('ci95_acc')
+        acc_cis.append(float('nan') if _ci is None else float(_ci))
+        _rec = r.get('mean_gold_recall')
+        has_recall = _rec is not None
+        recalls.append(0.0 if not has_recall else float(_rec))
+        _rci = r.get('ci95_gold_recall')
+        recall_cis.append(float('nan') if _rci is None else float(_rci))
+        recall_na.append(not has_recall)
+        chances.append(None if r.get('chance_gold_recall') is None
+                       else float(r['chance_gold_recall']))
+        if not has_recall:
+            skipped += 1
+    if not labels:
+        print(f'Skipping mechanism-ablation figure for n_kv={n_kv} '
+              f'(no records to plot)')
+        return
+    if skipped:
+        print(f'[fig_mechanism_ablation] {skipped} variant(s) errored or had '
+              f'no recall diagnostic (shown as ERR/n-a) for n_kv={n_kv}')
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.2))
+    x = np.arange(len(labels))
+
+    bar_colors = ['#C44E52' if e else '#4C72B0' for e in error_flags]
+    bars1 = ax1.bar(x, accs, yerr=acc_cis, capsize=4, color=bar_colors,
+                    error_kw={'linewidth': 1.3, 'ecolor': '#333'})
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, rotation=0, fontsize=6.5)
+    ax1.set_ylabel('MQAR accuracy (mean +/- CI95)')
+    ax1.set_title('Mechanism effect on accuracy')
+    chance_acc = next((r.get('chance_acc') for r in records
+                       if r.get('chance_acc') is not None), 1 / 16)
+    ax1.axhline(chance_acc, color='gray', linestyle='--', alpha=0.5,
+                label=f'chance ({chance_acc:.4f})')
+    for bar, acc, is_err in zip(bars1, accs, error_flags):
+        ax1.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + 0.003,
+                 'ERR' if is_err else f'{acc:.3f}',
+                 ha='center', va='bottom', fontsize=8)
+    ax1.legend(fontsize=8)
+    upper = max((a + (c if math.isfinite(c) else 0.0)
+                 for a, c in zip(accs, acc_cis)), default=0.0)
+    ax1.set_ylim(0, max(upper * 1.3, 0.2))
+
+    bar_colors2 = ['#C44E52' if e else ('#BBBBBB' if na else '#55A868')
+                   for e, na in zip(error_flags, recall_na)]
+    w = 0.38
+    bars2 = ax2.bar(x - w / 2, recalls, width=w, yerr=recall_cis, capsize=3,
+                    color=bar_colors2,
+                    error_kw={'linewidth': 1.3, 'ecolor': '#333'},
+                    label='model recall@k')
+    chance_plot = [0.0 if c is None else c for c in chances]
+    bars_c = ax2.bar(x + w / 2, chance_plot, width=w,
+                     color=['#FFFFFF' if c is None else '#999999'
+                            for c in chances],
+                     edgecolor='#555', linewidth=0.6,
+                     label='chance = min(k, n_avail) / n_avail')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, rotation=0, fontsize=6.5)
+    ax2.set_ylabel('Gold-block recall@k (mean +/- CI95)')
+    ax2.set_title('Lightning-indexer selection quality at the cue token')
+    for bar, rec, is_err, na in zip(bars2, recalls, error_flags, recall_na):
+        ax2.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + 0.02,
+                 'ERR' if is_err else ('n/a' if na else f'{rec:.3f}'),
+                 ha='center', va='bottom', fontsize=7)
+    for bar, c in zip(bars_c, chances):
+        if c is None:
+            continue
+        ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                 f'{c:.3f}', ha='center', va='bottom', fontsize=6,
+                 color='#555')
+    ax2.legend(fontsize=8, loc='lower right')
+    ax2.set_ylim(0, 1.25)
+
+    valid = bool(meta.get('conclusions_valid', False))
+    note = ('' if valid else
+            ' WARNING: conclusions_valid=False (underpowered or no '
+            'Bonferroni-significant effect) — treat as exploratory.')
+    fig.suptitle(f'CSA mechanism ablation: partial RoPE / top-k block '
+                 f'selection / indexer STE (n_kv={n_kv}, multi-seed).{note}',
+                 fontsize=8, y=0.98)
+    fig.subplots_adjust(top=0.86, bottom=0.20, left=0.07, right=0.98,
+                        wspace=0.28)
+    _ensure_figures_dir()
+    try:
+        fig.savefig(os.path.join(
+            _FIGURES_DIR, f'fig_mechanism_ablation_nkv{n_kv}.pdf'), dpi=150)
+        fig.savefig(os.path.join(
+            _FIGURES_DIR, f'fig_mechanism_ablation_nkv{n_kv}.png'), dpi=150)
+        if write_legacy_name:
+            fig.savefig(os.path.join(
+                _FIGURES_DIR, 'fig_mechanism_ablation.pdf'), dpi=150)
+            fig.savefig(os.path.join(
+                _FIGURES_DIR, 'fig_mechanism_ablation.png'), dpi=150)
+    finally:
+        plt.close(fig)
+    msg = f'Saved figures/fig_mechanism_ablation_nkv{n_kv}.pdf'
+    if write_legacy_name:
+        msg += ' (and fig_mechanism_ablation.pdf)'
+    print(msg)
+
+
 def fig_decoding():
     """Figure: per-token decoding latency vs cached context length."""
     path = os.path.join(_RESULTS_DIR, 'exp6_decoding.json')
@@ -717,6 +874,91 @@ def fig_architecture():
     print('Saved figures/fig_architecture.pdf')
 
 
+def fig_roofline():
+    """Figure: arithmetic intensity vs achieved throughput (roofline, Exp 7).
+
+    Reads the machine peaks from the Exp 7 metadata so the ceiling line is
+    drawn for the host that actually produced the timings (measured or
+    preset; see ``run_roofline._resolve_peaks``). Points are the per-(T, op)
+    Exp 2 measurements joined with analytic FLOPs / compulsory bytes.
+    """
+    meta, data = load_with_metadata('exp7_roofline.json')
+    pts = [r for r in data
+           if r.get('achieved_tflops') and
+           r.get('arithmetic_intensity_flops_per_byte')]
+    if not pts:
+        print('Skipping fig_roofline (no data to plot)')
+        return
+    peak_t = meta.get('peak_tflops')
+    peak_b = meta.get('peak_bw_gbps')
+    fig, ax = plt.subplots(figsize=(7.5, 5.2), constrained_layout=True)
+    ais = [p['arithmetic_intensity_flops_per_byte'] for p in pts]
+    xmin = max(min(ais) * 0.5, 1e-3)
+    xmax = max(max(ais) * 2.0, xmin * 10.0)
+    if peak_t and peak_b:
+        ridge = peak_t * 1e12 / (peak_b * 1e9)
+        xmax = max(xmax, ridge * 2.0)
+        line_x = np.logspace(math.log10(xmin), math.log10(xmax), 256)
+        line_y = np.minimum(peak_t, peak_b * line_x / 1000.0)
+        ax.plot(line_x, line_y, 'k--', lw=1.6,
+                label=f'roofline: {peak_t:.3g} TFLOP/s, '
+                      f'{peak_b:.0f} GB/s')
+        ax.axvline(ridge, color='gray', ls=':', lw=1.0)
+        ax.text(ridge, 0.06, f'  ridge {ridge:.2f} FLOP/B', fontsize=7,
+                color='gray', va='bottom',
+                transform=ax.get_xaxis_transform())
+    markers = {'softmax': 'o', 'kda_rec': 's', 'kda_chunk': '^',
+               'kda_rec_hybrid': 's', 'kda_chunk_hybrid': '^',
+               'csa': 'D', 'hca': 'v', 'hybrid': 'P'}
+    labels = {'softmax': 'Softmax attention', 'kda_rec': 'KDA (recurrent)',
+              'kda_chunk': 'KDA (chunk)',
+              'kda_rec_hybrid': 'KDA (rec., hybrid cfg)',
+              'kda_chunk_hybrid': 'KDA (chunk, hybrid cfg)',
+              'csa': 'CSA', 'hca': 'HCA', 'hybrid': 'Fused KDA+CSA+HCA'}
+    ops = sorted({p['op'] for p in pts})
+    for op in ops:
+        rows_op = [p for p in pts if p['op'] == op]
+        ax.scatter([p['arithmetic_intensity_flops_per_byte']
+                    for p in rows_op],
+                   [p['achieved_tflops'] for p in rows_op],
+                   marker=markers.get(op, 'o'), s=34,
+                   label=labels.get(op, op))
+        # Label only the smallest and largest T per op: annotating every
+        # point makes the dense middle of the plot unreadable.
+        ts = sorted(p['T'] for p in rows_op)
+        labeled = set(ts) if len(ts) <= 4 else {ts[0], ts[-1]}
+        for p in rows_op:
+            if p['T'] not in labeled:
+                continue
+            ax.annotate(f"T={p['T']}",
+                        (p['arithmetic_intensity_flops_per_byte'],
+                         p['achieved_tflops']),
+                        fontsize=5.5, xytext=(3, 3),
+                        textcoords='offset points', color='0.35')
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Arithmetic intensity (FLOPs / byte)')
+    ax.set_ylabel('Achieved throughput (TFLOP/s)')
+    device = meta.get('device_name') or meta.get('device') or 'cpu'
+    ax.set_title('Roofline of the reference implementation '
+                 f'({device})', fontsize=11)
+    ax.grid(True, which='both', alpha=0.25)
+    ax.legend(fontsize=7, loc='upper left', ncol=2)
+    ax.text(0.98, 0.02,
+            'Boundaries differ per op (core vs end-to-end); bytes are a\n'
+            'compulsory-traffic lower bound with no unfold/library traffic.\n'
+            'Reference PyTorch is expected to sit far below the roofline.',
+            transform=ax.transAxes, fontsize=6.5, color='0.4',
+            ha='right', va='bottom')
+    _ensure_figures_dir()
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_roofline.pdf'), dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_roofline.png'), dpi=150)
+    finally:
+        plt.close(fig)
+    print('Saved figures/fig_roofline.pdf')
+
+
 def main():
     _ensure_figures_dir()
     os.makedirs(_RESULTS_DIR, exist_ok=True)
@@ -732,6 +974,11 @@ def main():
         fig_ablation()
     if os.path.exists(os.path.join(_RESULTS_DIR, 'exp6_decoding.json')):
         fig_decoding()
+    if os.path.exists(os.path.join(_RESULTS_DIR, 'exp7_roofline.json')):
+        fig_roofline()
+    if os.path.exists(os.path.join(
+            _RESULTS_DIR, 'exp8_mechanism_ablation.json')):
+        fig_mechanism_ablation()
     print('\nAll figures generated.')
 
 

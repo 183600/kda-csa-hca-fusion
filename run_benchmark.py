@@ -272,7 +272,7 @@ def bench_kda_chunk(B, T, H, K, V, device):
     return fn
 
 
-def bench_csa(B, T, d, device):
+def bench_csa(B, T, d, device, meta=None):
     m, topk = 8, 4
     nh, c, dc, nIh, cI = 2, 16, 32, 2, 8
     gen = _make_op_gen('csa', T, device)
@@ -293,6 +293,13 @@ def bench_csa(B, T, d, device):
         B_idx=_rand(m, cI, device=device, generator=gen),
     )
     W_O = _rand(d, nh * c, device=device, generator=gen)
+    if meta is not None:
+        # Exact element count of every weight tensor in the timed region.
+        # Consumed by run_roofline for the weights-traffic term; measured
+        # here instead of re-derived from formulas so it can never drift
+        # from the actual benchmark weights.
+        meta['param_elements'] = sum(w.numel() for w in weights.values()) \
+            + W_O.numel()
 
     def fn():
         with torch.no_grad():
@@ -301,7 +308,7 @@ def bench_csa(B, T, d, device):
     return fn
 
 
-def bench_hca(B, T, d, device):
+def bench_hca(B, T, d, device, meta=None):
     m2, nh, c, dc = 16, 2, 16, 32
     gen = _make_op_gen('hca', T, device)
     H = _rand(B, T, d, device=device, generator=gen)
@@ -315,6 +322,9 @@ def bench_hca(B, T, d, device):
         W_DQ=_rand(dc, d, device=device, generator=gen), W_UQ=_rand(c * nh, dc, device=device, generator=gen),
     )
     W_O = _rand(d, nh * c, device=device, generator=gen)
+    if meta is not None:
+        meta['param_elements'] = sum(w.numel() for w in weights.values()) \
+            + W_O.numel()
 
     def fn():
         with torch.no_grad():
@@ -323,7 +333,7 @@ def bench_hca(B, T, d, device):
     return fn
 
 
-def bench_hybrid(B, T, d, device):
+def bench_hybrid(B, T, d, device, meta=None):
     gen = _make_op_gen('hybrid', T, device)
     cfg = HybridConfig(
         d_model=d, n_heads_qk=2, n_heads_v=2,
@@ -341,6 +351,8 @@ def bench_hybrid(B, T, d, device):
         model = HybridKCHAttention(cfg, total_layers=5).to(device).eval()
     finally:
         torch.random.set_rng_state(_prev_state)
+    if meta is not None:
+        meta['param_elements'] = sum(p.numel() for p in model.parameters())
     x = _rand(B, T, d, device=device, generator=gen)
     def fn():
         with torch.no_grad():
@@ -385,14 +397,14 @@ def main():
     H2, K2, V2 = 2, 16, 16
 
     benches = [
-        ('softmax',  lambda T: bench_softmax_attn(B, T, H, K, V, device)),
-        ('kda_rec',  lambda T: bench_kda_recurrent(B, T, H, K, V, device)),
-        ('kda_chunk', lambda T: bench_kda_chunk(B, T, H, K, V, device)),
-        ('kda_rec_hybrid', lambda T: bench_kda_recurrent(B, T, H2, K2, V2, device)),
-        ('kda_chunk_hybrid', lambda T: bench_kda_chunk(B, T, H2, K2, V2, device)),
-        ('csa',      lambda T: bench_csa(B, T, d, device)),
-        ('hca',      lambda T: bench_hca(B, T, d, device)),
-        ('hybrid',   lambda T: bench_hybrid(B, T, d, device)),
+        ('softmax',  lambda T, meta=None: bench_softmax_attn(B, T, H, K, V, device)),
+        ('kda_rec',  lambda T, meta=None: bench_kda_recurrent(B, T, H, K, V, device)),
+        ('kda_chunk', lambda T, meta=None: bench_kda_chunk(B, T, H, K, V, device)),
+        ('kda_rec_hybrid', lambda T, meta=None: bench_kda_recurrent(B, T, H2, K2, V2, device)),
+        ('kda_chunk_hybrid', lambda T, meta=None: bench_kda_chunk(B, T, H2, K2, V2, device)),
+        ('csa',      lambda T, meta=None: bench_csa(B, T, d, device, meta=meta)),
+        ('hca',      lambda T, meta=None: bench_hca(B, T, d, device, meta=meta)),
+        ('hybrid',   lambda T, meta=None: bench_hybrid(B, T, d, device, meta=meta)),
     ]
     op_boundary = {
         'softmax':   {'compute_boundary': 'core',
@@ -440,17 +452,26 @@ def main():
         'kda_chunk_hybrid': {'heads': H2, 'head_dim': K2, 'chunk_size': 64,
                              'note': 'chunked recurrence at hybrid KDA sub-layer config (H=2, K=V=16); directly comparable to the hybrid stack\'s per-KDA-layer cost'},
         'csa':       {'m': 8, 'topk': 4, 'sliding_window': 8, 'heads': 2,
-                      'c': 16, 'dc': 32, 'nIh': 2, 'cI': 8,
+                      'c': 16, 'dc': 32, 'nIh': 2, 'cI': 8, 'd': d,
                       'attends_to_all_T': False,
                       'note': 'attends to at most topk compressed blocks + sliding_window keys (~constant in T)'},
         'hca':       {'m2': 16, 'sliding_window': 8, 'heads': 2,
-                      'c': 16, 'dc': 32,
+                      'c': 16, 'dc': 32, 'd': d,
                       'attends_to_all_T': False,
                       'note': 'attends to all causally-visible compressed entries (O(T/m2), linear in T) + sliding_window keys'},
-        'hybrid':    {'n_layers': 5, 'n_kda': 3, 'n_csa': 1, 'n_hca': 1,
+        'hybrid':    {'n_layers': 5, 'n_kda': 3, 'n_csa': 1, 'n_hca': 1, 'd': d,
                       'heads_qk': 2, 'heads_v': 2, 'head_dim_k': 16, 'head_dim_v': 16,
                       'csa_m': 8, 'csa_topk': 4, 'csa_sliding_window': 8,
                       'hca_m2': 16, 'hca_sliding_window': 8,
+                      # Full per-sublayer geometry, so downstream analytic
+                      # accounting (run_roofline / run_kv_cache) can
+                      # reconstruct FLOPs and byte traffic for the EXACT
+                      # benchmarked stack instead of assuming paper-scale
+                      # defaults.
+                      'csa_c': 16, 'csa_dc': 32, 'csa_nIh': 2, 'csa_cI': 8,
+                      'csa_nh': 2,
+                      'hca_c': 16, 'hca_dc': 32, 'hca_nh': 2,
+                      'kda_chunk_size': 64, 'kda_conv_ksize': 3,
                       'attends_to_all_T': False,
                       'note': 'hybrid stack: KDA recurrence covers all T; CSA layer is sparse (topk-capped, ~constant radius); HCA layer attends to all compressed blocks (linear in T)'},
     }
@@ -465,10 +486,12 @@ def main():
             for name, factory in benches:
                 try:
                     _clear_cache(device)
-                    fn = factory(T)
+                    meta = {}
+                    fn = factory(T, meta=meta)
                     t, mem = _measure(fn, repeats=n_repeats, device=device)
                     row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
-                           'device': str(device), 'repeats': n_repeats}
+                           'device': str(device), 'repeats': n_repeats,
+                           'param_elements': meta.get('param_elements')}
                     if name in {'kda_rec', 'kda_chunk', 'kda_rec_hybrid',
                                 'kda_chunk_hybrid', 'hybrid'}:
                         row['kda_backend'] = _selected_kda_backend()
@@ -495,6 +518,7 @@ def main():
                         'time_min_ms': None, 'time_max_ms': None,
                         'time_std_ms': None,
                         'repeats': n_repeats,
+                        'param_elements': None,
                     }
                     if name in {'csa', 'hybrid'}:
                         err_row['csa_indexer_normalize_qk'] = True
