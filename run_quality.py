@@ -46,6 +46,8 @@ from kaggle_setup import (configure_torch_for_device, parse_int_env,
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
+from ops_fused import HybridConfig
+from ops_mamba import build_mamba2_mixer
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +540,247 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     return x_emb, target, cue_pos
 
 
+# ---------------------------------------------------------------------------
+# Additional synthetic quality probes (framework design §8).
+#
+# MQAR stays the canonical associative-recall probe; the three tasks below
+# cover the other capability axes the hybrid-operator comparison needs:
+# memory UPDATE under interference, LONG-RANGE retrieval at controlled
+# distance, and MULTI-SITE aggregation that no single-position retrieval
+# can solve. All generators share make_mqar_batch's signature and
+# generator-isolation contract (same seed -> same batches for every
+# operator), so they plug into train_one/_eval_model unchanged.
+# ---------------------------------------------------------------------------
+def make_kv_update_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
+                         embed: nn.Embedding, device=None, generator=None,
+                         return_meta: bool = False):
+    """Key-value UPDATE task: same key re-presented with a NEW value.
+
+    Layout per sequence (length ``seq_len``):
+      positions [0, 2*n_kv):          (key, value_old) pairs
+      positions [2*n_kv, 4*n_kv):     the SAME keys in a shuffled order,
+                                       each paired with value_new
+      positions [4*n_kv, seq_len-1):  distractor tokens (never a key or
+                                       any old/new value)
+      position  seq_len-1:            a cue key (repeat of one key)
+    Target = the NEWEST value paired with the cued key. The model must
+    overwrite the earlier association, i.e. memory UPDATE + interference
+    handling, rather than plain recall.
+
+    Constraints: ``3*n_kv <= vocab`` (keys + old/new values must be
+    distinct) and ``4*n_kv < seq_len`` (room for the cue). ``return_meta``
+    additionally returns ``{'key_idx': j}`` like ``make_mqar_batch``.
+    """
+    if device is None:
+        device = embed.weight.device
+    if n_kv < 1:
+        raise ValueError(f"n_kv={n_kv} must be >= 1")
+    if 3 * n_kv > vocab:
+        raise ValueError(
+            f"3*n_kv={3 * n_kv} must be <= vocab={vocab} (need n_kv keys "
+            f"plus 2*n_kv distinct old/new values)")
+    if 4 * n_kv >= seq_len:
+        raise ValueError(
+            f"4*n_kv={4 * n_kv} must be < seq_len={seq_len} (old pairs + "
+            f"updated pairs + cue token)")
+
+    cue_pos = seq_len - 1
+    n_noise = seq_len - 4 * n_kv - 1
+
+    perm = torch.rand(batch, vocab, device=device,
+                      generator=generator).argsort(dim=-1)
+    keys = perm[:, 0:n_kv]                    # [batch, n_kv]
+    vals_old = perm[:, n_kv:2 * n_kv]         # [batch, n_kv]
+    vals_new = perm[:, 2 * n_kv:3 * n_kv]     # [batch, n_kv]
+    distractor = perm[:, 3 * n_kv:]           # excludes keys and ALL values
+
+    # Shuffled second presentation: the cued key must be found by CONTENT,
+    # not by position alignment with the first presentation.
+    order2 = torch.rand(batch, n_kv, device=device,
+                        generator=generator).argsort(dim=-1)
+    keys2 = keys.gather(1, order2)
+    vals2 = vals_new.gather(1, order2)
+
+    x = torch.empty(batch, seq_len, dtype=torch.long, device=device)
+    if n_noise > 0:
+        noise_draw = torch.randint(
+            0, distractor.shape[1], (batch, n_noise),
+            device=device, generator=generator)
+        x[:, 4 * n_kv:cue_pos] = distractor.gather(1, noise_draw)
+
+    b_idx = torch.arange(batch, device=device).unsqueeze(-1)
+    x[b_idx, torch.arange(0, 2 * n_kv, 2, device=device)] = keys
+    x[b_idx, torch.arange(1, 2 * n_kv, 2, device=device)] = vals_old
+    x[b_idx, torch.arange(2 * n_kv, 4 * n_kv, 2, device=device)] = keys2
+    x[b_idx, torch.arange(2 * n_kv + 1, 4 * n_kv, 2, device=device)] = vals2
+
+    j = torch.randint(0, n_kv, (batch,), device=device, generator=generator)
+    row = torch.arange(batch, device=device)
+    x[:, cue_pos] = keys[row, j]
+    # Position of the cued key inside the (shuffled) second presentation.
+    new_pos = order2[row, j]
+    target = vals_new[row, new_pos]
+
+    x_emb = embed(x)
+    if return_meta:
+        return x_emb, target, cue_pos, {'key_idx': j}
+    return x_emb, target, cue_pos
+
+
+def make_long_range_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
+                          embed: nn.Embedding, device=None, generator=None,
+                          return_meta: bool = False):
+    """Long-range retrieval: ONE (key, value) pair at a random distance.
+
+    Layout per sequence: a single (key, value) pair at a uniformly random
+    position ``p in [0, seq_len-3]``, distractors everywhere else, and the
+    cue key at the final position. Target = the paired value.
+    ``distance = (seq_len-1) - p`` spans ``[2, seq_len-2]`` per sequence,
+    so accuracy-vs-distance curves (binned from ``return_meta``'s
+    ``distance`` field) measure long-range LOCALISATION, not just recall.
+
+    ``n_kv`` is accepted for signature compatibility and ignored (the
+    distance is the controlled variable, not the pair count).
+    """
+    if device is None:
+        device = embed.weight.device
+    if vocab < 3:
+        raise ValueError(
+            f"vocab={vocab} must be >= 3 (one key, one value, and at least "
+            f"one distractor id)")
+    if seq_len < 4:
+        raise ValueError(
+            f"seq_len={seq_len} must be >= 4 (key + value + at least one "
+            f"distractor + cue)")
+
+    cue_pos = seq_len - 1
+    perm = torch.rand(batch, vocab, device=device,
+                      generator=generator).argsort(dim=-1)
+    key = perm[:, 0]                # [batch]
+    val = perm[:, 1]                # [batch]
+    distractor = perm[:, 2:]
+
+    # Distractor base everywhere, then overwrite the pair + cue.
+    noise_draw = torch.randint(
+        0, distractor.shape[1], (batch, seq_len - 1),
+        device=device, generator=generator)
+    x = torch.empty(batch, seq_len, dtype=torch.long, device=device)
+    x[:, :cue_pos] = distractor.gather(1, noise_draw)
+
+    p = torch.randint(0, seq_len - 2, (batch,),
+                      device=device, generator=generator)
+    row = torch.arange(batch, device=device)
+    x[row, p] = key
+    x[row, p + 1] = val
+    x[:, cue_pos] = key
+    target = val
+
+    x_emb = embed(x)
+    if return_meta:
+        return x_emb, target, cue_pos, {
+            'distance': (cue_pos - p), 'key_pos': p}
+    return x_emb, target, cue_pos
+
+
+def make_multi_agg_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
+                         embed: nn.Embedding, device=None, generator=None,
+                         return_meta: bool = False):
+    """Multi-site aggregation: predict the MAJORITY category.
+
+    The sequence is a bag of ``vocab``-category tokens (length
+    ``seq_len``); the target is the majority category. The answer depends
+    on MANY distant positions simultaneously — no single-position
+    retrieval solves it, which is exactly the capability HCA's dense
+    global aggregation (and to a lesser degree any recurrent accumulator)
+    is hypothesised to provide. The readout position is the final token
+    (itself a category token and part of the count).
+
+    Ties for the majority are resolved deterministically: the
+    smallest-index tied class wins one flipped token from the next tied
+    class, so the target is always UNIQUE and the chance level is exactly
+    ``1 / vocab``.
+
+    ``n_kv`` is accepted for signature compatibility and ignored
+    (``vocab`` doubles as the class count).
+    """
+    if device is None:
+        device = embed.weight.device
+    n_classes = vocab
+    if n_classes < 2:
+        raise ValueError(f"vocab(=n_classes)={vocab} must be >= 2")
+    if seq_len < 3:
+        raise ValueError(f"seq_len={seq_len} must be >= 3")
+
+    cue_pos = seq_len - 1
+    x = torch.randint(0, n_classes, (batch, seq_len),
+                      device=device, generator=generator)
+    counts = torch.zeros(batch, n_classes, device=device, dtype=torch.long)
+    counts.scatter_add_(1, x, torch.ones_like(x))
+
+    max_count = counts.max(dim=1, keepdim=True).values
+    tied = counts == max_count
+    needs_fix = tied.sum(dim=1) > 1
+    fix_rows = needs_fix.nonzero(as_tuple=True)[0]
+    if fix_rows.numel() > 0:
+        # winner = smallest tied class index; loser = the next tied class.
+        winner = tied[fix_rows].float().argmax(dim=1)
+        non_winner_tied = tied[fix_rows].clone()
+        non_winner_tied[torch.arange(fix_rows.numel(), device=device),
+                        winner] = False
+        loser = non_winner_tied.float().argmax(dim=1)
+        # Flip ONE token of the loser class to the winner: the winner then
+        # leads by 2 and is the strict majority.
+        match = x[fix_rows] == loser.unsqueeze(1)
+        first_pos = match.float().argmax(dim=1)
+        x[fix_rows, first_pos] = winner
+        counts = torch.zeros(batch, n_classes, device=device,
+                             dtype=torch.long)
+        counts.scatter_add_(1, x, torch.ones_like(x))
+    target = counts.argmax(dim=1)
+
+    x_emb = embed(x)
+    if return_meta:
+        return x_emb, target, cue_pos, {
+            'counts': counts.tolist(),
+            'n_distinct': (counts > 0).sum(dim=1).tolist(),
+        }
+    return x_emb, target, cue_pos
+
+
+# Task registry consumed by train_one / _eval_model / main. ``n_kv`` marks
+# whether the task is swept over the MQAR_NKV list (mqar, kv_update) or
+# uses a fixed default (long_range: distance is the variable; multi_agg:
+# vocab is the class count). ``default_n_kv`` is the fixed value used for
+# the non-swept tasks.
+SYNTHETIC_TASKS = {
+    'mqar': {
+        'make': make_mqar_batch, 'seq_len': 16, 'vocab': 16,
+        'n_kv_swept': True,
+        'description': 'associative recall of one of n_kv KV pairs '
+                       '(canonical probe)',
+    },
+    'kv_update': {
+        'make': make_kv_update_batch, 'seq_len': 16, 'vocab': 32,
+        'n_kv_swept': True, 'default_n_kv': 2,
+        'description': 'same key re-presented with a NEW value; retrieve '
+                       'the LATEST value (memory update + interference)',
+    },
+    'long_range': {
+        'make': make_long_range_batch, 'seq_len': 64, 'vocab': 16,
+        'n_kv_swept': False, 'default_n_kv': 1,
+        'description': 'single KV pair at a uniformly random distance '
+                       '(accuracy-vs-distance curves from the meta field)',
+    },
+    'multi_agg': {
+        'make': make_multi_agg_batch, 'seq_len': 33, 'vocab': 4,
+        'n_kv_swept': False, 'default_n_kv': 1,
+        'description': 'majority category over the whole sequence '
+                       '(multi-site aggregation; no single-position '
+                       'retrieval shortcut)',
+    },
+}
+
+
 class MQARHead(nn.Module):
     def __init__(self, d_model: int, vocab: int):
         super().__init__()
@@ -679,6 +922,53 @@ class KDAAttn(nn.Module):
         return self.o(out.reshape(B, T, self.H * self.V))
 
 
+class Mamba2Attn(nn.Module):
+    """Standalone single-layer Mamba-2 operator for the quality probes.
+
+    Wraps the reference :class:`ops_mamba.Mamba2Mixer` (via the backend
+    factory, so ``MAMBA_BACKEND=official`` selects the mamba_ssm kernels
+    where available). The geometry knobs are sized for the tiny quality
+    models and are env-overridable: ``MAMBA2_D_STATE`` (default 16),
+    ``MAMBA2_HEADDIM`` (default 16; clamped down to the largest divisor
+    of ``expand * d_model``), ``MAMBA2_EXPAND`` (default 2),
+    ``MAMBA2_D_CONV`` (default 4).
+
+    Like :class:`KDAAttn`, the operator is STATELESS per call: the MQAR
+    training loop feeds an independent random batch each step, so any
+    conv context carried across calls would be cross-batch leakage.
+    ``forward`` therefore always starts from a fresh conv state and a
+    fresh SSM state.
+    """
+
+    def __init__(self, d_model):
+        super().__init__()
+        expand = parse_int_env('MAMBA2_EXPAND', 2, min_value=1, logger=logger)
+        d_state = parse_int_env('MAMBA2_D_STATE', 16, min_value=1,
+                                logger=logger)
+        headdim = parse_int_env('MAMBA2_HEADDIM', 16, min_value=1,
+                                logger=logger)
+        d_conv = parse_int_env('MAMBA2_D_CONV', 4, min_value=2, logger=logger)
+        d_inner = expand * d_model
+        # Clamp headdim down to the largest divisor of d_inner (a
+        # misconfigured headdim would otherwise abort the whole sweep with
+        # a geometry error; the env knobs are convenience, not precision
+        # instruments).
+        headdim_eff = min(headdim, d_inner)
+        while d_inner % headdim_eff != 0:
+            headdim_eff //= 2
+        cfg = HybridConfig(
+            d_model=d_model, memory_type='mamba2',
+            mamba_d_state=d_state, mamba_d_conv=d_conv,
+            mamba_expand=expand, mamba_headdim=headdim_eff,
+            mamba_backend=os.environ.get('MAMBA_BACKEND', 'reference'),
+        )
+        self.mixer = build_mamba2_mixer(cfg)
+
+    def forward(self, x):
+        out, _, _ = self.mixer.forward_functional(x, None, None)
+        return out
+
+
 class CSAAttn(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -772,8 +1062,11 @@ class HCAAttn(nn.Module):
 
 
 def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
-                n_batches=4, batch=64, seed=42):
+                n_batches=4, batch=64, seed=42, task='mqar'):
     """Evaluate accuracy over multiple fresh batches for a stable estimate.
+
+    ``task`` selects the synthetic-task generator from ``SYNTHETIC_TASKS``
+    (default ``'mqar'`` keeps the historical behaviour).
 
     Uses a dedicated ``torch.Generator`` for batch generation so the eval
     batches are reproducible and independent of any global-RNG state left
@@ -811,12 +1104,14 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
         # rationale): seed+5_000_000 is far from every seed's training stream
         # at seed+1_000_000 and from run_ablation's own eval offset usage.
         eval_gen = make_seeded_generator(seed + 5_000_000, device=device)
+        make_batch = SYNTHETIC_TASKS[task]['make']
         correct, total = 0, 0
         losses = []
         with torch.no_grad():
             for _ in range(n_batches):
-                x_emb, target, cue_pos = make_mqar_batch(
-                    batch, seq_len, n_kv, vocab, embed, device, generator=eval_gen)
+                x_emb, target, cue_pos = make_batch(
+                    batch, seq_len, n_kv, vocab, embed, device,
+                    generator=eval_gen)
                 h = layer(x_emb)
                 logits = head(h, cue_pos)
                 correct += (logits.argmax(-1) == target).sum().item()
@@ -838,8 +1133,13 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
 def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
               steps=100, lr=3e-3, seed=42, device='cpu',
               softmax_steps=None, eval_batches=4, eval_batch=64,
-              train_batch=None):
-    """Train a single operator on MQAR for ``steps`` steps.
+              train_batch=None, task='mqar'):
+    """Train a single operator on a synthetic task for ``steps`` steps.
+
+    ``task`` selects the batch generator from ``SYNTHETIC_TASKS``
+    (default ``'mqar'``: the historical Multi-Query Associative Recall
+    probe; see the registry above for the update / long-range /
+    multi-aggregation probes).
 
     ``softmax_steps`` lets the softmax baseline train longer to reach
     convergence (the original 100 steps left softmax at ~10%, barely above the
@@ -869,6 +1169,10 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # cheap and idempotent.
     if isinstance(device, str):
         device = torch.device(device)
+    if task not in SYNTHETIC_TASKS:
+        raise ValueError(
+            f"task={task!r} must be one of {sorted(SYNTHETIC_TASKS)}.")
+    make_batch = SYNTHETIC_TASKS[task]['make']
     if softmax_steps is None:
         softmax_steps = steps
     if train_batch is None:
@@ -885,9 +1189,13 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     factories = {
         'softmax': lambda: SoftmaxAttn(d_model),
         'kda':     lambda: KDAAttn(d_model),
+        'mamba2':  lambda: Mamba2Attn(d_model),
         'csa':     lambda: CSAAttn(d_model),
         'hca':     lambda: HCAAttn(d_model),
     }
+    if op_name not in factories:
+        raise ValueError(
+            f"op_name={op_name!r} must be one of {sorted(factories)}.")
     # Create embed and head BEFORE the operator-specific layer so their
     # initial weights are IDENTICAL across operators for a given seed.
     # Different operators have different parameter counts, so creating the
@@ -896,6 +1204,12 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     embed = nn.Embedding(vocab, d_model).to(device)
     head = MQARHead(d_model, vocab).to(device)
     layer = ResidualAttnLayer(factories[op_name](), d_model).to(device)
+    # Record the operator's ACTUAL parameter count: same d_model does NOT
+    # mean same capacity across operators (Mamba-2's internal expansion /
+    # state dimensions differ from KDA's head geometry), and the quality
+    # comparison must annotate the residual difference rather than assume
+    # parity.
+    n_params = sum(p.numel() for p in layer.parameters())
     # Build parameter groups with proper weight-decay exclusion: embeddings,
     # biases, and LayerNorm parameters are NOT weight-decayed (standard ML
     # practice — decaying these can hurt training quality).
@@ -923,7 +1237,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     head.train()
     embed.train()
     for step in range(actual_steps):
-        x_emb, target, cue_pos = make_mqar_batch(
+        x_emb, target, cue_pos = make_batch(
             train_batch, seq_len, n_kv, vocab, embed, device, generator=batch_gen)
         h = layer(x_emb)
         logits = head(h, cue_pos)
@@ -978,7 +1292,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # Final eval on multiple fresh batches for a stable accuracy estimate.
     final_acc, final_loss = _eval_model(
         layer, head, embed, seq_len, n_kv, vocab, device,
-        n_batches=eval_batches, batch=eval_batch, seed=seed,
+        n_batches=eval_batches, batch=eval_batch, seed=seed, task=task,
     )
     chance = 1.0 / vocab
     # Guard against steps=0 (would crash on accs[-1] / sum([])/0 below).
@@ -988,7 +1302,9 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     if not losses:
         return {
             'op': op_name,
+            'task': task,
             'n_kv': n_kv,
+            'n_params': n_params,
             'final_acc': final_acc,
             'final_loss': final_loss,
             'chance_acc': chance,
@@ -1001,7 +1317,9 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         }
     return {
         'op': op_name,
+        'task': task,
         'n_kv': n_kv,
+        'n_params': n_params,
         'final_acc': final_acc,
         'final_loss': final_loss,
         'chance_acc': chance,
@@ -1019,7 +1337,8 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     """Train ``op_name`` over ``n_seeds`` seeds.
 
     Returns a dict with per-seed results plus aggregate stats (mean, std,
-    95% CI half-width via t-distribution).
+    95% CI half-width via t-distribution). Any ``task=...`` keyword is
+    forwarded to :func:`train_one` (default ``'mqar'``).
 
     Per-seed error handling: a single divergent seed (NaN loss, OOM, etc.)
     is caught and recorded as a stub entry in ``per_seed`` rather than
@@ -1072,7 +1391,9 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
             # ``per_seed[0].get('steps', 100)`` for the figure title.
             per_seed.append({
                 'op': op_name,
+                'task': kw.get('task', 'mqar'),
                 'n_kv': kw.get('n_kv', 1),
+                'n_params': None,
                 'final_acc': None,
                 'final_loss': None,
                 'chance_acc': 1.0 / kw.get('vocab', 16) if 'vocab' in kw else None,
@@ -1153,7 +1474,9 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
 
     return {
         'op': op_name,
+        'task': ok_per_seed[0].get('task', 'mqar'),
         'n_kv': ok_per_seed[0]['n_kv'],
+        'n_params': ok_per_seed[0].get('n_params'),
         # Report the REQUESTED seed count (len(per_seed)), not the surviving
         # count (n), so the figure title and downstream consumers reflect
         # how many seeds were actually run. ``n_seeds_ok`` / ``n_seeds_failed``
@@ -1200,19 +1523,67 @@ def _parse_nkv_list(env_var, default='1'):
     return list(dict.fromkeys(vals))
 
 
+def _parse_task_list(env_var, default='mqar'):
+    """Parse a comma-separated task list (or 'all') from an env var.
+
+    ``MQAR_TASKS=all``            -> every task in SYNTHETIC_TASKS
+    ``MQAR_TASKS=mqar,kv_update`` -> [mqar, kv_update]
+    """
+    raw = os.environ.get(env_var, default)
+    if raw.strip().lower() == 'all':
+        return list(SYNTHETIC_TASKS.keys())
+    vals = [x.strip() for x in raw.split(',') if x.strip()]
+    if not vals:
+        vals = [default]
+    unknown = [v for v in vals if v not in SYNTHETIC_TASKS]
+    if unknown:
+        raise ValueError(
+            f'{env_var} includes unknown task(s) {unknown}; '
+            f'valid tasks: {sorted(SYNTHETIC_TASKS)} (or "all").')
+    return list(dict.fromkeys(vals))
+
+
+def _parse_op_list(env_var, default='softmax,kda,mamba2,csa,hca'):
+    """Parse the operator list for the quality sweep.
+
+    ``MQAR_OPS`` selects which single-layer operators run. The default
+    includes the Mamba-2 route (the framework's second memory operator);
+    set ``MQAR_OPS=softmax,kda,csa,hca`` to reproduce the historical
+    four-operator table exactly.
+    """
+    valid = ['softmax', 'kda', 'mamba2', 'csa', 'hca']
+    raw = os.environ.get(env_var, default)
+    vals = [x.strip() for x in raw.split(',') if x.strip()]
+    if not vals:
+        vals = list(valid)
+    unknown = [v for v in vals if v not in valid]
+    if unknown:
+        raise ValueError(
+            f'{env_var} includes unknown op(s) {unknown}; valid ops: {valid}.')
+    return list(dict.fromkeys(vals))
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
     logger.info('=' * 70)
-    logger.info('Experiment 4: MQAR Synthetic Quality Probe (multi-seed)')
+    logger.info('Experiment 4: Synthetic Quality Probes (multi-seed)')
     logger.info('=' * 70)
     logger.info(f'  device        : {device}')
-    # These are the task hyperparameters. Lifted to named constants so the
+    # Task and operator selection. Defaults keep the historical MQAR-only
+    # output file (results/exp4_mqar.json) while ADDING the mamba2 operator
+    # to the sweep; the additional probes are opt-in via MQAR_TASKS so the
+    # historical table stays reproducible with MQAR_TASKS=mqar +
+    # MQAR_OPS=softmax,kda,csa,hca.
+    task_list = _parse_task_list('MQAR_TASKS', 'mqar')
+    ops_list = _parse_op_list('MQAR_OPS', 'softmax,kda,mamba2,csa,hca')
+    logger.info(f'  tasks         : {task_list}')
+    logger.info(f'  ops           : {ops_list}')
+    # MQAR's task hyperparameters. Lifted to named constants so the
     # chance-accuracy log line below uses the SAME value as the per-seed
     # ``chance = 1.0 / vocab`` computation in ``train_one``.
     vocab = 16
     seq_len = 16
-    chance = 1.0 / vocab
     n_kv_list = _parse_nkv_list('MQAR_NKV', '1')
     # Pre-validate n_kv against vocab and seq_len so the user gets a clear
     # error message instead of an opaque AssertionError from deep inside
@@ -1226,8 +1597,10 @@ def main():
             raise ValueError(
                 f"MQAR_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} must be "
                 f"< seq_len={seq_len} (need room for the cue token at the end).")
-    logger.info(f'  vocab={vocab}, seq_len={seq_len}, n_kv={n_kv_list}')
-    logger.info(f'  chance accuracy = {chance:.4f} (independent of n_kv; target is 1-of-vocab)')
+    logger.info(f'  mqar: vocab={vocab}, seq_len={seq_len}, n_kv={n_kv_list}')
+    logger.info('  per-task defaults: ' + '; '.join(
+        f"{t}: seq_len={s['seq_len']}, vocab={s['vocab']}"
+        for t, s in SYNTHETIC_TASKS.items() if t != 'mqar'))
     # Robust env var parsing: ``parse_int_env`` logs a warning and falls
     # back to the default on a malformed value (e.g. ``MQAR_SEEDS=abc``
     # that would otherwise raise ``ValueError: invalid literal for
@@ -1243,14 +1616,31 @@ def main():
                                   logger=logger)
     logger.info(f'  n_seeds       : {n_seeds}')
     logger.info(f'  steps         : {steps}  (softmax: {softmax_steps})')
+    logger.info(f"  mamba_backend : {os.environ.get('MAMBA_BACKEND', 'reference')}")
+
+    # Pre-compute the (task, n_kv) sweep cells so every downstream count
+    # (Bonferroni family size, log lines, result grouping) matches what
+    # actually runs.
+    sweep = []
+    for task in task_list:
+        spec = SYNTHETIC_TASKS[task]
+        kv_values = n_kv_list if spec.get('n_kv_swept') \
+            else [spec.get('default_n_kv', 1)]
+        for n_kv in kv_values:
+            sweep.append((task, n_kv, spec['seq_len'], spec['vocab']))
 
     all_results = []
-    for n_kv in n_kv_list:
+    for task, n_kv, task_seq_len, task_vocab in sweep:
+        spec = SYNTHETIC_TASKS[task]
+        chance = 1.0 / task_vocab
         logger.info(f'\n{"=" * 70}')
-        logger.info(f'  n_kv = {n_kv}   (harder: {n_kv} KV pairs to disambiguate)')
+        logger.info(f'  task = {task} (n_kv={n_kv}, seq_len={task_seq_len}, '
+                    f'vocab={task_vocab}) — {spec["description"]}')
+        logger.info(f'  chance accuracy = {chance:.4f}')
         logger.info(f'{"=" * 70}')
-        for op in ['softmax', 'kda', 'csa', 'hca']:
-            logger.info(f'\nTraining {op} (n_kv={n_kv}, {n_seeds} seeds)...')
+        for op in ops_list:
+            logger.info(f'\nTraining {op} (task={task}, n_kv={n_kv}, '
+                        f'{n_seeds} seeds)...')
             # Per-operator try/except so ONE failing operator (all seeds
             # diverged / OOMed) does not crash the whole experiment and
             # lose the other operators' results. The error is logged and
@@ -1260,7 +1650,8 @@ def main():
             try:
                 r = train_multi_seed(op, n_seeds=n_seeds, steps=steps,
                                      softmax_steps=softmax_steps, device=device,
-                                     n_kv=n_kv, vocab=vocab, seq_len=seq_len)
+                                     n_kv=n_kv, vocab=task_vocab,
+                                     seq_len=task_seq_len, task=task)
                 all_results.append(r)
                 # ci95_acc may be None when only one seed survived (see
                 # train_multi_seed). Render as 'n/a' instead of crashing on
@@ -1280,6 +1671,7 @@ def main():
                 # train_multi_seed's return dict — mirror it exactly.
                 all_results.append({
                     'op': op,
+                    'task': task,
                     'n_kv': n_kv,
                     'n_seeds': n_seeds,
                     'n_seeds_ok': 0,
@@ -1293,37 +1685,35 @@ def main():
                     'mean_loss': None,
                     'std_loss': None,
                     'ci95_loss': None,
-                    'chance_acc': 1.0 / vocab,
+                    'chance_acc': 1.0 / task_vocab,
                     't_stat_vs_chance': None,
                     'mean_train_time_s': None,
                     'per_seed': [],
                 })
 
-    # Summary table (grouped by n_kv). Header is 82 chars wide:
-    # 4+3+10+3+10+3+10+3+8+3+12+3+10 = 82. Use the same width for the rules.
-    print('\n' + '=' * 82)
-    print(f"{'n_kv':>4} | {'op':>10} | {'mean_acc':>10} | {'+/- CI95':>10} | "
-          f"{'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
-    print('-' * 82)
+    # Summary table (grouped by task + n_kv). Header is 89 chars wide.
+    print('\n' + '=' * 89)
+    print(f"{'task':>10} | {'n_kv':>4} | {'op':>10} | {'chance':>7} | {'mean_acc':>10} | "
+          f"{'+/- CI95':>10} | {'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
+    print('-' * 89)
     for r in all_results:
         # Error rows have None for all numeric fields; render them as
         # dashes instead of crashing on ``f'{None:.4f}'``.
         if 'error' in r:
             err_msg = (r.get('error') or '')[:40]
-            print(f"{r['n_kv']:>4} | {r['op']:>10} | {'-':>10} | "
-                  f"{'-':>10} | {'-':>8} | {'-':>12} | {'-':>10}   ERROR: {err_msg}")
+            print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
+                  f"{'-':>7} | {'-':>10} | {'-':>10} | {'-':>8} | {'-':>12} | "
+                  f"{'-':>10}   ERROR: {err_msg}")
             continue
         # ci95_acc may be None when only one seed survived; render 'n/a'.
         if r['ci95_acc'] is not None:
             ci_str = f"{r['ci95_acc']:>10.4f}"
         else:
             ci_str = f"{'n/a':>10}"
-        print(f"{r['n_kv']:>4} | {r['op']:>10} | {r['mean_acc']:>10.4f} | "
+        print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
+              f"{r['chance_acc']:>7.4f} | {r['mean_acc']:>10.4f} | "
               f"{ci_str} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
-    # Chance row: fill ALL columns so the table renders as a clean grid.
-    print(f"{'':>4} | {'chance':>10} | {chance:>10.4f} | "
-          f"{'':>10} | {'':>8} | {'':>12} | {'':>10}")
     # Fairness annotation: the softmax baseline is trained for
     # ``softmax_steps`` steps while the other ops get ``steps`` steps. This
     # is intentional (softmax needs more steps to converge above chance —
@@ -1355,7 +1745,7 @@ def main():
     #   5. Attach ``conclusions_valid`` to every result record (matching
     #      run_ablation.py's convention) so downstream consumers can check
     #      it per-record without recomputing.
-    n_tests = len(['softmax', 'kda', 'csa', 'hca']) * len(n_kv_list)
+    n_tests = len(ops_list) * len(sweep)
     # The t-test is one-sided (H1: mean_acc > chance). For a one-sided
     # Bonferroni correction, the per-test alpha is 0.05 / n_tests to
     # maintain the family-wise error rate at 0.05. Using 0.025 / n_tests
@@ -1411,7 +1801,8 @@ def main():
     min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results),
                        default=0)
     # Split "near chance" (slightly above chance, not yet significant) from
-    # "far below chance" (training diverged / recipe broken):
+    # "far below chance" (training diverged / recipe broken). Chance is
+    # PER-ROW (each task has its own vocab), so use r['chance_acc']:
     #   * near_chance:   0.5*chance < acc < 1.5*chance  (statistically ~chance)
     #   * far_below_chance: acc <= 0.5*chance           (training/recipe broken)
     # Any far_below row forces conclusions_valid=False regardless of other
@@ -1419,11 +1810,14 @@ def main():
     near_chance = [r for r in all_results
                    if 'error' not in r
                    and r.get('mean_acc') is not None
-                   and 0.5 * chance < r['mean_acc'] < 1.5 * chance]
+                   and r.get('chance_acc') is not None
+                   and 0.5 * r['chance_acc'] < r['mean_acc']
+                   < 1.5 * r['chance_acc']]
     far_below = [r for r in all_results
                  if 'error' not in r
                  and r.get('mean_acc') is not None
-                 and r['mean_acc'] <= 0.5 * chance]
+                 and r.get('chance_acc') is not None
+                 and r['mean_acc'] <= 0.5 * r['chance_acc']]
     conclusions_valid = (n_seeds >= 5 and min_seeds_ok >= 5
                          and n_any_sig > 0
                          and len(near_chance) < len(all_results) // 2
@@ -1468,9 +1862,27 @@ def main():
     # ``{"metadata": ..., "results": [...]}``; ``make_figures.load`` also
     # accepts the legacy bare-array format. ``write_json_atomic`` below
     # writes the file atomically (temp + fsync + os.replace).
-    payload = {
-        'metadata': {
+    # ``write_json_atomic`` writes atomically (temp file + fsync +
+    # os.replace) so a process kill or disk-full mid-write leaves the
+    # target file as the OLD version (or absent) rather than a truncated
+    # partial JSON document — see kaggle_setup.write_json_atomic's
+    # docstring for the full rationale. It serializes to a string first,
+    # raising ValueError on any non-serializable value BEFORE touching the
+    # filesystem.
+    #
+    # Output split: the canonical MQAR rows keep the historical
+    # results/exp4_mqar.json file (name, schema, and figure consumers
+    # unchanged); rows from the additional probes go to a separate
+    # results/exp4b_quality_tasks.json so the two result families never
+    # blur together. When MQAR is not in the task list, the historical
+    # file is left untouched rather than overwritten with an empty result
+    # set (a stale-but-valid file beats a silently emptied one).
+    def _base_metadata():
+        return {
             'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
+            'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
+            'ops': list(ops_list),
+            'tasks': list(task_list),
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,
@@ -1490,9 +1902,8 @@ def main():
                 'softmax_steps': softmax_steps,
                 'other_ops_steps': steps,
                 # Make the note CONDITIONAL on the actual asymmetry,
-                # matching the summary-table note at lines 1230-1233, so it
-                # never contradicts the numeric fields above when
-                # softmax_steps == steps.
+                # matching the summary-table note, so it never contradicts
+                # the numeric fields above when softmax_steps == steps.
                 'note': (
                     "The softmax baseline is trained for more steps than "
                     "the other operators so it actually converges (the "
@@ -1513,25 +1924,41 @@ def main():
                 ),
             },
             'schema_version': 1,
-        },
-        'results': all_results,
-    }
-    # ``write_json_atomic`` writes atomically (temp file + fsync +
-    # os.replace) so a process kill or disk-full mid-write leaves the
-    # target file as the OLD version (or absent) rather than a truncated
-    # partial JSON document — see kaggle_setup.write_json_atomic's
-    # docstring for the full rationale. It serializes to a string first,
-    # raising ValueError on any non-serializable value BEFORE touching the
-    # filesystem.
-    try:
-        write_json_atomic(payload, 'results/exp4_mqar.json',
-                          indent=2, allow_nan=False)
-    except ValueError as e:
-        logger.error(f'non-finite value in payload; sanitizing to null: {e}')
-        write_json_atomic(sanitize_for_json(payload),
-                          'results/exp4_mqar.json',
-                          indent=2, allow_nan=False)
-    logger.info('\nSaved: results/exp4_mqar.json')
+        }
+
+    mqar_rows = [r for r in all_results if r.get('task', 'mqar') == 'mqar']
+    other_rows = [r for r in all_results if r.get('task', 'mqar') != 'mqar']
+    if 'mqar' in task_list:
+        payload = {'metadata': _base_metadata(), 'results': mqar_rows}
+        try:
+            write_json_atomic(payload, 'results/exp4_mqar.json',
+                              indent=2, allow_nan=False)
+        except ValueError as e:
+            logger.error(f'non-finite value in payload; sanitizing to null: {e}')
+            write_json_atomic(sanitize_for_json(payload),
+                              'results/exp4_mqar.json',
+                              indent=2, allow_nan=False)
+        logger.info('\nSaved: results/exp4_mqar.json')
+    if other_rows:
+        payload_b = {
+            'metadata': {
+                **_base_metadata(),
+                'task_descriptions': {
+                    t: SYNTHETIC_TASKS[t]['description']
+                    for t in task_list if t in SYNTHETIC_TASKS
+                },
+            },
+            'results': other_rows,
+        }
+        try:
+            write_json_atomic(payload_b, 'results/exp4b_quality_tasks.json',
+                              indent=2, allow_nan=False)
+        except ValueError as e:
+            logger.error(f'non-finite value in payload; sanitizing to null: {e}')
+            write_json_atomic(sanitize_for_json(payload_b),
+                              'results/exp4b_quality_tasks.json',
+                              indent=2, allow_nan=False)
+        logger.info('Saved: results/exp4b_quality_tasks.json')
     # Return non-zero if any op's training crashed (``'error' in r``), so
     # ``run_all._run`` records the experiment as ``status='fail'`` instead
     # of treating a partial run as success (``run_all._run``'s
