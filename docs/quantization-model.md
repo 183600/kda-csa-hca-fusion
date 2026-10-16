@@ -1,8 +1,8 @@
 # Quantized-state recall / cost model (Exp 10)
 
-`kv_quant.py` adds the **quantization axis** the rest of the repository was
-missing: every cost here used to be priced in fp16 *elements*, and nothing
-could express "the same association at 4 bits per element". Exp 10
+`kv_quant.py` adds the **quantization axis** the rest of the repository is
+missing: costs are otherwise priced in fp16 *elements*, which cannot express
+"the same association at 4 bits per element". Exp 10
 (`run_quant_recall.py`) crosses the Exp 5 eight-group matrix's
 **memory-route axis** (KDA vs Mamba-2) with a **state-bits axis** and
 measures where planted associative recall survives as the state shrinks.

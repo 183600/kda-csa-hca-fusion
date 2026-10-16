@@ -239,22 +239,20 @@ def kda_forward(
     # The downstream functions (_call_fla, naive_recurrent_kda,
     # naive_chunk_kda) must NOT apply their own clamp a second time to
     # avoid double-clamping. The clamp above already used the requested
-    # bound, so the downstream internal clamp with the same bound is a
-    # strict no-op (clamp is an exact, idempotent min/max selection) that
-    # only costs an extra pass over ``g``.  Do NOT pass a -inf sentinel to
-    # the FLA path: the FLA Triton kernel may compute exp(g_clamp_min),
-    # yielding 0.0 or NaN and corrupting the delta-rule state update.
+    # bound, and clamp is an exact, idempotent min/max selection, so the
+    # downstream internal clamp with the same bound is a strict no-op.
+    # Do NOT pass a -inf sentinel to the FLA path: the FLA Triton kernel
+    # may compute exp(g_clamp_min), yielding 0.0 or NaN and corrupting the
+    # delta-rule state update.
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
     downstream_clamp = g_clamp_min
     # The reference operators (naive_recurrent_kda / the chunk paths) apply
-    # their own ``g_clamp_min`` clamp to ``g``. The clamp above already used
-    # the same bound and clamp is idempotent (an exact min/max selection),
-    # so re-applying it downstream is a full extra pass over ``g`` with
-    # bit-identical values. Signal "already clamped" with -inf so the
-    # reference paths skip the no-op pass; the FLA path still receives the
-    # REAL bound because its kernel needs the value internally (see the
-    # ``_call_fla`` note about not forwarding a -inf sentinel).
+    # their own ``g_clamp_min`` clamp to ``g``; with the same bound that
+    # clamp is a no-op, so signal "already clamped" with -inf. The FLA path
+    # still receives the REAL bound because its kernel needs the value
+    # internally (see the ``_call_fla`` note about not forwarding a -inf
+    # sentinel).
     ref_clamp = float('-inf')
 
     use_fla = backend == "fla"

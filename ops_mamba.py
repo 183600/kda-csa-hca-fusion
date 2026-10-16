@@ -190,10 +190,9 @@ def _mamba2_scan_loop_eager(x_outer, dt_slab, A_c, C_h, D_c, x_slab, S):
     ys: list[torch.Tensor] = []
     T = x_outer.shape[1]
     # Per-step views are created once outside the loop (``unbind`` yields
-    # the same views as the former in-loop ``[:, t]`` indexing, sharing the
-    # storage), so the loop body only dispatches the arithmetic. ``dt_col``
-    # / ``D_col`` / ``A_col`` carry the singleton broadcast dims, hoisting
-    # the per-step ``[:, :, None, None]`` / ``[:, None]`` views too.
+    # storage-sharing views equivalent to ``[:, t]`` indexing), and
+    # ``dt_col`` / ``D_col`` / ``A_col`` carry the singleton broadcast
+    # dims explicitly.
     x_outer_steps = x_outer.unbind(1)
     dt_col_steps = dt_slab.unsqueeze(-1).unsqueeze(-1).unbind(1)
     C_steps = C_h.unsqueeze(-2).unbind(1)
@@ -205,8 +204,7 @@ def _mamba2_scan_loop_eager(x_outer, dt_slab, A_c, C_h, D_c, x_slab, S):
         decay = torch.exp(dt_col_steps[t] * A_col)
         S = decay * S + dt_col_steps[t] * x_outer_steps[t]
         # ``einsum('bhdn,bhn->bhd', S, C)`` written as the equivalent
-        # explicit matmul (the same ``bmm`` contraction over ``n``, without
-        # einsum's per-step dispatch overhead).
+        # explicit matmul (the same ``bmm`` contraction over ``n``).
         y_t = ((C_steps[t] @ S.transpose(-1, -2)).squeeze(-2)
                + D_col * x_steps[t])
         ys.append(y_t)

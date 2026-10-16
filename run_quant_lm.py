@@ -445,8 +445,7 @@ def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
 def _decode_state_snr(model, clone, windows, pad_id, spec):
     """Aggregate state-write SNR (dB) for one (seed, spec) cell.
 
-    Separate pass from :func:`evaluate_decode_ppl` so the ppl path stays
-    allocation-lean; the extra pass is cheap (no logits/ml_head work).
+    Separate pass from :func:`evaluate_decode_ppl`.
     """
     if spec is None:
         return math.inf

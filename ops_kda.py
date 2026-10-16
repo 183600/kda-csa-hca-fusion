@@ -130,12 +130,9 @@ def _compute_dtype(dtype):
 
 def _is_compiling_safely() -> bool:
     """Return True if we are inside a torch.compile / torch.export trace."""
-    # Only probe ``torch._dynamo`` when it has ALREADY been imported:
-    # outside a dynamo trace the module is not needed, and importing it
-    # eagerly costs ~0.9s on the first call (it pulls in the
-    # distributed/sympy dependency tree). A live dynamo trace implies the
-    # module is present in ``sys.modules``, so the semantics below are
-    # unchanged.
+    # Only probe ``torch._dynamo`` when it has ALREADY been imported: a
+    # live dynamo trace implies the module is present in ``sys.modules``,
+    # so the semantics below are unchanged.
     _dm = sys.modules.get('torch._dynamo')
     if _dm is not None:
         try:
