@@ -44,6 +44,7 @@ intrinsic costs).
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -142,6 +143,65 @@ def validate_mamba2_geometry(
 # ---------------------------------------------------------------------------
 # Core SSD scan (the analogue of ops_kda.naive_recurrent_kda)
 # ---------------------------------------------------------------------------
+# The scan loop below performs, per step, exactly the same operations as the
+# original inline loop (decay multiply, dt * (x (x) B) state update, C . S
+# readout plus the D skip), but the step-invariant factors (the group-to-head
+# expanded B/C and the outer products ``x (x) B``) are hoisted out of the time
+# loop and computed in one vectorized shot. Every per-element operation is
+# unchanged, so the result is bit-identical to evaluating them inside the
+# loop. The per-step decay and ``dt * (x (x) B)`` product stay inside the
+# loop because hoisting them would reorder autograd's reductions over time,
+# shifting the ``A`` / ``dt`` gradients by rounding noise.
+_SCAN_LOOP_SCRIPTED = None
+_SCAN_LOOP_SCRIPTED_FAILED = False
+# Cap on the number of elements in one slab of precomputed outer products
+# (``[B, slab, nheads, headdim, d_state]``): bounds the extra memory to a few
+# tens of MB while keeping the common small/medium sequence a single slab.
+_SCAN_XOUTER_SLAB_ELEMS = 8_000_000
+
+
+def _mamba2_scan_loop_eager(x_outer, dt_slab, A_c, C_h, D_c, x_slab, S):
+    """Sequential scan body over one slab of precomputed factors.
+
+    ``x_outer`` is ``[B, slab, H, D, N]`` (the ``x (x) B`` outer product),
+    ``dt_slab`` is ``[B, slab, H]``, ``A_c`` is ``[H]`` (negative decay) and
+    ``C_h`` is ``[B, slab, H, N]``. The per-step decay ``exp(dt * A)`` and
+    the ``dt * x_outer`` product are kept inside the loop (not hoisted) so
+    that autograd's per-element reduction order — and therefore the
+    gradients w.r.t. ``A`` and ``dt`` — are unchanged. Returns
+    ``(y_slab, S)`` with ``y_slab`` shaped ``[B, slab, H, D]``.
+    """
+    ys: list[torch.Tensor] = []
+    T = x_outer.shape[1]
+    for t in range(T):
+        # Per-head decay exp(dt * A) in (0, 1): [batch, nheads]
+        decay = torch.exp(dt_slab[:, t] * A_c)
+        S = (decay[:, :, None, None] * S
+             + dt_slab[:, t, :, None, None] * x_outer[:, t])
+        y_t = (torch.einsum('bhdn,bhn->bhd', S, C_h[:, t])
+               + D_c[:, None] * x_slab[:, t])
+        ys.append(y_t)
+    return torch.stack(ys, dim=1), S
+
+
+def _get_scripted_scan_loop():
+    """Lazily ``torch.jit.script`` the scan loop body, with eager fallback.
+
+    The scripted function executes the same operations as
+    :func:`_mamba2_scan_loop_eager`; it is cached and reused across calls.
+    """
+    global _SCAN_LOOP_SCRIPTED, _SCAN_LOOP_SCRIPTED_FAILED
+    if _SCAN_LOOP_SCRIPTED is None and not _SCAN_LOOP_SCRIPTED_FAILED:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', FutureWarning)
+                _SCAN_LOOP_SCRIPTED = torch.jit.script(
+                    _mamba2_scan_loop_eager)
+        except Exception:
+            _SCAN_LOOP_SCRIPTED_FAILED = True
+    return _SCAN_LOOP_SCRIPTED
+
+
 def naive_mamba2_scan(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -234,30 +294,44 @@ def naive_mamba2_scan(
         S = torch.zeros(batch, nheads, headdim, d_state,
                         device=x.device, dtype=compute_dtype)
 
-    ys: list[torch.Tensor] = []
-    for t in range(seqlen):
-        # Per-head decay exp(dt * A) in (0, 1): [batch, nheads]
-        decay = torch.exp(dt_c[:, t] * A_c)
-        # Expand the group-level B/C to per-head B/C: heads are assigned to
-        # groups in CONTIGUOUS blocks (head h -> group h // heads_per_group).
-        # einsum with the shared head index h (NOT a summed group index g)
-        # keeps each head locked to its own group's B/C — summing over g
-        # would instead mix all groups into every head.
-        B_h = B_c[:, t].repeat_interleave(heads_per_group, dim=1)
-        C_h = C_c[:, t].repeat_interleave(heads_per_group, dim=1)
-        # State update: S = decay * S + dt * (x (x) B)
-        S = (decay[:, :, None, None] * S
-             + dt_c[:, t, :, None, None]
-             * torch.einsum('bhd,bhn->bhdn', x_c[:, t], B_h))
-        # Readout: y = C . S + D * x   (D broadcasts over the headdim)
-        y_t = (torch.einsum('bhdn,bhn->bhd', S, C_h)
-               + D_c[:, None] * x_c[:, t])
-        ys.append(y_t)
-
     if seqlen == 0:
         y = x.new_zeros(batch, 0, nheads, headdim)
-    else:
-        y = torch.stack(ys, dim=1).to(x.dtype)
+        return y, (S if output_final_state else None)
+
+    # Step-invariant factors hoisted out of the loop and computed vectorized
+    # over the time axis (elementwise-identical to the per-step evaluation):
+    #   * B_h / C_h: the group-level B/C expanded to per-head B/C. Heads are
+    #     assigned to groups in CONTIGUOUS blocks (head h -> group
+    #     h // heads_per_group); repeat_interleave reproduces the original
+    #     per-step ``[:, t].repeat_interleave(heads_per_group, dim=1)``.
+    #   * x_outer[b, t, h, d, n] = x[b, t, h, d] * B_h[b, t, h, n], the
+    #     original per-step ``einsum('bhd,bhn->bhdn', x[:, t], B_h)``.
+    # The per-step decay ``exp(dt * A)`` stays inside the loop so its
+    # autograd accumulation order (and thus the A gradient) is unchanged.
+    B_h_all = B_c.repeat_interleave(heads_per_group, dim=2)  # [B, T, H, N]
+    C_h_all = C_c.repeat_interleave(heads_per_group, dim=2)  # [B, T, H, N]
+
+    # Slab the outer products so their memory stays bounded on long
+    # sequences; the recurrent state carries across slabs unchanged, so the
+    # values do not depend on the slab size.
+    slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
+               // max(1, batch * nheads * headdim * d_state))
+    loop = _get_scripted_scan_loop()
+    y_slabs: list[torch.Tensor] = []
+    for lo in range(0, seqlen, slab):
+        hi = min(seqlen, lo + slab)
+        x_outer = (x_c[:, lo:hi].unsqueeze(-1)
+                   * B_h_all[:, lo:hi].unsqueeze(-2))       # [B, slab, H, D, N]
+        if loop is not None:
+            y_slab, S = loop(x_outer, dt_c[:, lo:hi], A_c,
+                             C_h_all[:, lo:hi], D_c, x_c[:, lo:hi], S)
+        else:
+            y_slab, S = _mamba2_scan_loop_eager(
+                x_outer, dt_c[:, lo:hi], A_c,
+                C_h_all[:, lo:hi], D_c, x_c[:, lo:hi], S)
+        y_slabs.append(y_slab)
+    y = (y_slabs[0] if len(y_slabs) == 1
+         else torch.cat(y_slabs, dim=1)).to(x.dtype)
     return y, (S if output_final_state else None)
 
 

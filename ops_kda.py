@@ -395,6 +395,67 @@ def compiled_recurrent_kda(
     )
 
 
+def _chunk_kda_attn_loop_eager(
+    g: torch.Tensor,
+    k: torch.Tensor,
+    q: torch.Tensor,
+    A: torch.Tensor,
+    Aqk: torch.Tensor,
+    BT: int,
+    clamp_g_diff: bool,
+    recompute_attn: bool,
+):
+    """Row-wise build of the intra-chunk attention matrices ``A`` / ``Aqk``.
+
+    Computes, for every row ``c`` and column ``j <= c``,
+    ``sum_k k[c,k] * exp(g[c,k] - g[j,k]) * k[j,k]`` (and the q-weighted
+    variant for ``Aqk``), writing each row's contiguous ``[:c+1]`` prefix.
+    The per-element operands and their order are unchanged from the inline
+    loop this replaces; only the Python-level iteration is (optionally)
+    TorchScript-compiled via :func:`_get_scripted_prep_attn_loop`.
+    """
+    for c in range(BT):
+        # ``[..., c:c+1, :]`` broadcasts identically to
+        # ``[..., c, :].unsqueeze(-2)``.
+        g_c = g[..., c:c + 1, :]
+        g_diff = g_c - g[..., :c + 1, :]
+        if clamp_g_diff:
+            g_diff = g_diff.clamp(max=50.0)
+        # ``t = exp(g_diff) * k`` is shared by both intra-chunk matrices.
+        # The sub/clamp produce fresh tensors, so the exp may run in place;
+        # the product stays out-of-place because autograd saves the exp
+        # output for the multiply's backward.
+        g_diff.exp_()
+        t = g_diff * k[..., :c + 1, :]
+        A[..., c, :c + 1] = (k[..., c:c + 1, :] * t).sum(-1)
+        if not recompute_attn:
+            Aqk[..., c, :c + 1] = (q[..., c:c + 1, :] * t).sum(-1)
+    return A, Aqk
+
+
+_PREP_ATTN_LOOP_SCRIPTED = None
+_PREP_ATTN_LOOP_SCRIPTED_FAILED = False
+
+
+def _get_scripted_prep_attn_loop():
+    """Lazily ``torch.jit.script`` the ``A`` / ``Aqk`` build loop.
+
+    The compiled form is cached and reused across calls (the loop is
+    shape/dtype-generic); on builds where scripting fails, the eager loop is
+    used instead.
+    """
+    global _PREP_ATTN_LOOP_SCRIPTED, _PREP_ATTN_LOOP_SCRIPTED_FAILED
+    if _PREP_ATTN_LOOP_SCRIPTED is None and not _PREP_ATTN_LOOP_SCRIPTED_FAILED:
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _PREP_ATTN_LOOP_SCRIPTED = torch.jit.script(
+                    _chunk_kda_attn_loop_eager)
+        except Exception:
+            _PREP_ATTN_LOOP_SCRIPTED_FAILED = True
+    return _PREP_ATTN_LOOP_SCRIPTED
+
+
 def _chunk_kda_prepare(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -495,22 +556,19 @@ def _chunk_kda_prepare(
     # of columns; the per-element operands and their order are unchanged
     # (entry ``(c, j)`` still computes ``sum_k k[c,k] * exp(g[c,k]-g[j,k])
     # * k[j,k]``), so the values are bit-identical.
-    for c in range(BT):
-        # ``[..., c:c+1, :]`` broadcasts identically to
-        # ``[..., c, :].unsqueeze(-2)``.
-        g_c = g[..., c:c + 1, :]
-        g_diff = g_c - g[..., :c + 1, :]
-        if clamp_g_diff:
-            g_diff = g_diff.clamp(max=50.0)
-        # ``t = exp(g_diff) * k`` is shared by both intra-chunk matrices.
-        # The sub/clamp produce fresh tensors, so the exp may run in place;
-        # the product stays out-of-place because autograd saves the exp
-        # output for the multiply's backward.
-        g_diff.exp_()
-        t = g_diff * k[..., :c + 1, :]
-        A[..., c, :c + 1] = (k[..., c:c + 1, :] * t).sum(-1)
-        if not recompute_attn:
-            Aqk[..., c, :c + 1] = (q[..., c:c + 1, :] * t).sum(-1)
+    # The row loop itself is shared with ``_chunk_kda_attn_loop_eager`` so it
+    # can be TorchScript-compiled once and cached (see
+    # :func:`_get_scripted_prep_attn_loop`); the eager fallback runs the same
+    # loop. In ``recompute_attn`` mode ``Aqk`` is None, and the loop receives
+    # ``A`` as an unused placeholder tensor.
+    _attn_loop = _get_scripted_prep_attn_loop()
+    _Aqk_arg = A if Aqk is None else Aqk
+    if _attn_loop is not None:
+        A, _ = _attn_loop(g, k, q, A, _Aqk_arg, BT,
+                          clamp_g_diff, recompute_attn)
+    else:
+        A, _ = _chunk_kda_attn_loop_eager(
+            g, k, q, A, _Aqk_arg, BT, clamp_g_diff, recompute_attn)
     A.mul_(beta[..., None])
     # Only the diagonal needs zeroing: ``A`` was allocated with
     # ``torch.zeros`` and the loop above wrote exactly its lower triangle
@@ -863,6 +921,39 @@ def assoc_scan_chunk_kda(
     )
 
 
+_CHUNK_INNER_SCRIPTED: dict = {}
+_CHUNK_INNER_SCRIPT_FAILED: dict = {}
+
+
+def _get_scripted_chunk_inner(inner_eager, recompute_attn: bool):
+    """Lazily ``torch.jit.script`` the chunk-path inner loop, with caching.
+
+    The inner loop is one of two module-level functions selected by
+    ``recompute_attn``; its compiled form is shape/dtype-generic, so it is
+    compiled once and reused on every subsequent call (compiling on each
+    forward costs several milliseconds and dominated the hybrid forward).
+    Returns ``(scripted_inner_or_None, error_str_or_None)``; the error string
+    is cached so a broken ``torch.jit`` build is not retried per call.
+    """
+    key = bool(recompute_attn)
+    entry = _CHUNK_INNER_SCRIPTED.get(key)
+    if entry is not None:
+        return entry
+    failed = _CHUNK_INNER_SCRIPT_FAILED.get(key)
+    if failed is not None:
+        return None, failed
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter('ignore', FutureWarning)
+            fn = torch.jit.script(inner_eager)
+        _CHUNK_INNER_SCRIPTED[key] = (fn, None)
+        return fn, None
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        _CHUNK_INNER_SCRIPT_FAILED[key] = err
+        return None, err
+
+
 def scripted_chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -914,13 +1005,14 @@ def scripted_chunk_kda(
         (prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
          prep['Aqk'], prep['NT'])
     )
-    try:
-        scripted_inner = torch.jit.script(inner_eager)
+    scripted_inner, script_err = _get_scripted_chunk_inner(
+        inner_eager, recompute_attn)
+    if scripted_inner is not None:
         chunk_outs, S = scripted_inner(*inner_args)
-    except Exception as exc:
+    else:
         _warnings.warn(
-            f"scripted_chunk_kda: torch.jit.script failed ({type(exc).__name__}: "
-            f"{exc}); falling back to the eager inner loop.",
+            f"scripted_chunk_kda: torch.jit.script failed ({script_err}); "
+            f"falling back to the eager inner loop.",
             stacklevel=2,
         )
         chunk_outs, S = inner_eager(*inner_args)
