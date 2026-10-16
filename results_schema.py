@@ -56,6 +56,7 @@ from __future__ import annotations
 import datetime as _dt
 import glob
 import json
+import math
 import os
 import sys
 
@@ -89,9 +90,15 @@ def parse_version(value) -> tuple[int, int]:
     if isinstance(value, bool) or value is None:
         raise SchemaVersionError(f'unrecognized schema_version: {value!r}')
     if isinstance(value, int):
+        if value < 0:
+            raise SchemaVersionError(f'unrecognized schema_version: {value!r}')
         return (value, 0)
     if isinstance(value, float):
-        if value != int(value):
+        # JSON permits NaN/Infinity literals; math.isfinite guards both the
+        # int(value) conversions (NaN -> ValueError, inf -> OverflowError)
+        # and any non-numeric edge, so the documented SchemaVersionError
+        # contract holds.
+        if not math.isfinite(value) or value < 0 or value != int(value):
             raise SchemaVersionError(f'unrecognized schema_version: {value!r}')
         return (int(value), 0)
     if isinstance(value, str):

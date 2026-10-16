@@ -121,6 +121,8 @@ def fig_benchmark():
         'softmax': 'core',
         'kda_rec': 'core',
         'kda_chunk': 'core',
+        'kda_rec_hybrid': 'core',
+        'kda_chunk_hybrid': 'core',
         'csa': 'end_to_end_single_layer',
         'hca': 'end_to_end_single_layer',
         'hybrid': 'end_to_end_multi_layer',

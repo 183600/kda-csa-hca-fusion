@@ -1405,8 +1405,11 @@ def main():
     # Experiment-level statistical validity summary. Mirrors run_ablation.py
     # but with the appropriate thresholds for the 4-op MQAR sweep.
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
-    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
-                        if 'error' not in r), default=0)
+    # Include error rows: they carry n_seeds_ok=0, so a fully-failed op
+    # forces min_seeds_ok=0 and thus conclusions_valid=False (mirrors the
+    # run_mechanism_ablation.py convention of taking the min over ALL rows).
+    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results),
+                       default=0)
     # Split "near chance" (slightly above chance, not yet significant) from
     # "far below chance" (training diverged / recipe broken):
     #   * near_chance:   0.5*chance < acc < 1.5*chance  (statistically ~chance)

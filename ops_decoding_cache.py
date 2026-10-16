@@ -25,7 +25,8 @@ The cache has three pieces of state, mirroring the spec in the issue:
      query without recomputing the full history.
   3. **Sliding-window ring buffer** (``torch.Tensor`` ``[B, win, c]``).
      A fixed-size FIFO of the most recent ``win`` *uncompressed* local
-     keys (the ``Ca`` projection for CSA, ``C`` for HCA, L2-normalized).
+     keys (the ``Ca`` projection for CSA, ``C`` for HCA, normalized with
+     the cache's ``qk_norm_mode`` — 'l2' by default).
      Writes wrap around; reads return the contents in causal order
      (oldest first). This backs the sliding-window branch of
      ``naive_csa`` / ``naive_hca`` during decoding without materializing
@@ -110,7 +111,8 @@ import torch
 import torch.nn.functional as F
 
 from ops_rope import effective_rope_dim, partial_rope
-from ops_csa import csa_compress_kv, csa_compress_kv_overlapped, csa_lightning_indexer
+from ops_csa import (csa_compress_kv, csa_compress_kv_overlapped,
+                     csa_lightning_indexer, _qk_normalize)
 
 
 def _validate_cache_dtype(dtype) -> None:
@@ -461,8 +463,9 @@ class CSADecodingCache:
        (compressed block cache) and the lightning indexer (indexer key
        cache) during ``forward_step``.
     3. **Sliding-window ring buffer** (:class:`_SlidingWindowRingBuffer`).
-       Holds the most recent ``win`` L2-normalized ``Ca`` entries, in
-       FIFO order. Read by the SW branch during ``forward_step``.
+       Holds the most recent ``win`` ``qk_norm_mode``-normalized ``Ca``
+       entries, in FIFO order. Read by the SW branch during
+       ``forward_step``.
 
     The cache also tracks two counters: ``n_tokens_seen`` (total tokens
     appended) and ``n_blocks`` (compressed blocks produced). The former
@@ -513,6 +516,7 @@ class CSADecodingCache:
         dtype,
         rope_dim: int | None = None,
         rope_base: float = 10000.0,
+        qk_norm_mode: str = 'l2',
     ):
         # Validate structural params up-front so a misconfigured cache
         # crashes at construction (not deep inside ``append_step``).
@@ -533,8 +537,9 @@ class CSADecodingCache:
         self.device, self.dtype = torch.device(device), dtype
         # normalize_qk flag: set by the caller after construction (or
         # default True to match the repo-wide convention). The cache
-        # needs this to decide whether to L2-normalize keys before
-        # appending to the sliding-window ring buffer.
+        # needs this to decide whether to apply the ``qk_norm_mode``
+        # normalization to keys before appending to the sliding-window
+        # ring buffer.
         self._normalize_qk: bool = True
         # Partial RoPE (DeepSeek-V4 §2.3.3): the cache rotates the
         # compressed KV entries at their block-anchor positions (``s*m``)
@@ -548,6 +553,14 @@ class CSADecodingCache:
         if rope_base <= 0:
             raise ValueError(
                 f"CSADecodingCache: rope_base={rope_base!r} must be positive")
+        # qk_norm_mode must match the mode the full-sequence ``naive_csa``
+        # call uses; otherwise the incremental decode would normalize keys
+        # differently from prefill and silently disagree with it.
+        if qk_norm_mode not in ('l2', 'rms'):
+            raise ValueError(
+                f"CSADecodingCache: qk_norm_mode={qk_norm_mode!r} must be "
+                f"'l2' (cosine, historical) or 'rms' (paper §2.3.3)")
+        self.qk_norm_mode = qk_norm_mode
         self.rope_dim_eff = effective_rope_dim(rope_dim, c)
         self.rope_base = float(rope_base)
         self.reset()
@@ -696,7 +709,8 @@ class CSADecodingCache:
 
         For each new token:
           1. Append its 6 projections to the partial accumulator.
-          2. Append its (L2-normalized) ``Ca`` to the SW ring buffer.
+          2. Append its (``qk_norm_mode``-normalized) ``Ca`` to the SW
+             ring buffer.
           3. If the accumulator now has ``m`` tokens, compress them
              into one new block (using the previous block's ``Cb`` /
              ``Zb`` for the overlapped b-branch), push the result to
@@ -775,13 +789,16 @@ class CSADecodingCache:
             self._acc_Z_idx.append(z_i)
             self._n_tokens_seen += 1
             # Append Ca to the SW ring buffer. When normalize_qk=True
-            # (the default), L2-normalize so the SW branch runs in cosine
-            # mode. When normalize_qk=False, store raw (unnormalized) Ca
-            # so the SW branch runs in dot-product mode, matching the
-            # sparse branch and the full-sequence naive_csa path.
+            # (the default), normalize with ``qk_norm_mode`` (L2 by
+            # default, RMS under the paper §2.3.3 mode) so the SW branch
+            # matches the full-sequence naive_csa path. When
+            # normalize_qk=False, store raw (unnormalized) Ca so the SW
+            # branch runs in dot-product mode, matching the sparse branch
+            # and the full-sequence naive_csa path.
             if self._sw is not None:
                 if self._normalize_qk:
-                    ca_norm_i = F.normalize(ca_i.squeeze(1).to(torch.float), dim=-1)
+                    ca_norm_i = _qk_normalize(
+                        ca_i.squeeze(1).to(torch.float), self.qk_norm_mode)
                     ca_store_i = ca_norm_i.unsqueeze(1)
                 else:
                     ca_store_i = ca_i
@@ -889,7 +906,8 @@ class CSADecodingCache:
         # ----- sliding-window branch (batched) -----
         if self._sw is not None:
             if self._normalize_qk:
-                ca_store = F.normalize(Ca_new.to(torch.float), dim=-1)
+                ca_store = _qk_normalize(
+                    Ca_new.to(torch.float), self.qk_norm_mode)
             else:
                 ca_store = Ca_new
             if self.rope_dim_eff > 0:
@@ -1021,7 +1039,7 @@ class CSADecodingCache:
 
     def forward_step(
         self,
-        q: torch.Tensor,          # [B, 1, nh, c]   (L2-normalized iff normalize_qk)
+        q: torch.Tensor,          # [B, 1, nh, c]  (qk_norm_mode-normalized iff normalize_qk)
         q_idx: torch.Tensor,      # [B, 1, nIh, c_I]
         w_idx: torch.Tensor,      # [B, 1, nIh]
         *,
@@ -1044,10 +1062,11 @@ class CSADecodingCache:
 
         Args:
             q: ``[B, 1, nh, c]`` per-head attention queries. When
-                ``normalize_qk=True`` the caller MUST pass L2-normalized
-                queries (the contract used by every runner in this repo);
-                when ``normalize_qk=False`` raw queries are expected and
-                we fall back to dot-product scale ``c ** -0.5``.
+                ``normalize_qk=True`` the caller MUST pass queries
+                normalized with the cache's ``qk_norm_mode`` ('l2' for
+                every runner in this repo); when ``normalize_qk=False``
+                raw queries are expected and we fall back to dot-product
+                scale ``c ** -0.5``.
             q_idx: ``[B, 1, nIh, c_I]`` indexer queries (low-rank).
             w_idx: ``[B, 1, nIh]`` indexer head weights.
             topk: number of compressed blocks to select per query.
@@ -1128,8 +1147,15 @@ class CSADecodingCache:
         # branch: ``core_scale`` has to be bound even when
         # ``self._C_comp is None or self._n_blocks == 0`` (the first ``m``
         # decode steps before the first compressed block is formed).
+        # Auto-selection mirrors ``naive_csa``: cosine scale 1.0 for 'l2',
+        # the standard 1/sqrt(c) temperature for the RMS form (whose
+        # normalized vectors keep norm ~sqrt(c)), and the classical
+        # dot-product scale when normalization is off.
         if scale is None:
-            core_scale = 1.0 if normalize_qk else self.c ** -0.5
+            if not normalize_qk or self.qk_norm_mode == 'rms':
+                core_scale = self.c ** -0.5
+            else:
+                core_scale = 1.0
         else:
             core_scale = scale
 
@@ -1156,13 +1182,15 @@ class CSADecodingCache:
             cbm = cbm[None, :]                                          # [1, n_blocks]
             # Honor ``normalize_qk`` for the CORE attention (as in
             # ``naive_csa``). When normalize_qk=True compressed KV are
-            # L2-normalized (cosine-similarity attention). When False,
-            # skip normalization and fall back to the classical
-            # 1/sqrt(c) dot-product scale.
+            # normalized with ``qk_norm_mode`` (cosine-similarity
+            # attention for 'l2', the paper §2.3.3 RMSNorm form for
+            # 'rms'). When False, skip normalization and fall back to the
+            # classical 1/sqrt(c) dot-product scale.
             if normalize_qk:
                 C_comp_valid = self._C_comp[:, :self._n_blocks]
-                C_comp_n = F.normalize(
-                    C_comp_valid.to(compute_dtype), dim=-1)           # [B, n_blocks, c]
+                C_comp_n = _qk_normalize(
+                    C_comp_valid.to(compute_dtype),
+                    self.qk_norm_mode)                                # [B, n_blocks, c]
             else:
                 C_comp_n = self._C_comp[:, :self._n_blocks].to(compute_dtype)
             # Lightning indexer: score the current query against ALL
@@ -1246,10 +1274,10 @@ class CSADecodingCache:
             C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             # SW buffer contents in causal order: [B, sw_len, c]. When
-            # normalize_qk=True (default), the buffer stores L2-normalized
-            # keys (F.normalize applied at append time). When
-            # normalize_qk=False the caller should have appended raw
-            # (unnormalized) keys; we read whatever is stored.
+            # normalize_qk=True (default), the buffer stores keys
+            # normalized with ``qk_norm_mode`` (applied at append time).
+            # When normalize_qk=False the caller should have appended
+            # raw (unnormalized) keys; we read whatever is stored.
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             sw = torch.einsum(
@@ -1330,7 +1358,8 @@ class HCADecodingCache:
        row each time the accumulator fills. Read by the dense-attention
        branch during ``forward_step``.
     3. **Sliding-window ring buffer** (:class:`_SlidingWindowRingBuffer`).
-       Holds the most recent ``win`` L2-normalized ``C`` entries.
+       Holds the most recent ``win`` ``qk_norm_mode``-normalized ``C``
+       entries.
 
     See :class:`CSADecodingCache` for the lifecycle and numerical
     contract. The same bit-equivalence guarantee applies (verified by
@@ -1347,6 +1376,7 @@ class HCADecodingCache:
         dtype,
         rope_dim: int | None = None,
         rope_base: float = 10000.0,
+        qk_norm_mode: str = 'l2',
     ):
         if B < 1:
             raise ValueError(f"B={B} must be >= 1")
@@ -1361,8 +1391,9 @@ class HCADecodingCache:
         self.device, self.dtype = torch.device(device), dtype
         # normalize_qk flag: set by the caller after construction (or
         # default True to match the repo-wide convention). The cache
-        # needs this to decide whether to L2-normalize keys before
-        # appending to the sliding-window ring buffer.
+        # needs this to decide whether to apply the ``qk_norm_mode``
+        # normalization to keys before appending to the sliding-window
+        # ring buffer.
         self._normalize_qk: bool = True
         # Partial RoPE (DeepSeek-V4 §2.3.3) — same contract as
         # CSADecodingCache / naive_hca: compressed entries rotate at their
@@ -1373,6 +1404,14 @@ class HCADecodingCache:
         if rope_base <= 0:
             raise ValueError(
                 f"HCADecodingCache: rope_base={rope_base!r} must be positive")
+        # qk_norm_mode must match the mode the full-sequence ``naive_hca``
+        # call uses; otherwise the incremental decode would normalize keys
+        # differently from prefill and silently disagree with it.
+        if qk_norm_mode not in ('l2', 'rms'):
+            raise ValueError(
+                f"HCADecodingCache: qk_norm_mode={qk_norm_mode!r} must be "
+                f"'l2' (cosine, historical) or 'rms' (paper §2.3.3)")
+        self.qk_norm_mode = qk_norm_mode
         self.rope_dim_eff = effective_rope_dim(rope_dim, c)
         self.rope_base = float(rope_base)
         self.reset()
@@ -1460,7 +1499,8 @@ class HCADecodingCache:
 
         For each new token:
           1. Append its ``C`` and ``Z`` projections to the accumulator.
-          2. Append its (L2-normalized) ``C`` to the SW ring buffer.
+          2. Append its (``qk_norm_mode``-normalized) ``C`` to the SW
+             ring buffer.
           3. If the accumulator now has ``m2`` tokens, compress them
              into one new block, push to the compressed block cache,
              clear the accumulator.
@@ -1498,7 +1538,8 @@ class HCADecodingCache:
             self._n_tokens_seen += 1
             if self._sw is not None:
                 if self._normalize_qk:
-                    c_norm_i = F.normalize(c_i.squeeze(1).to(torch.float), dim=-1)
+                    c_norm_i = _qk_normalize(
+                        c_i.squeeze(1).to(torch.float), self.qk_norm_mode)
                     c_store_i = c_norm_i.unsqueeze(1)
                 else:
                     c_store_i = c_i
@@ -1561,7 +1602,8 @@ class HCADecodingCache:
         # ----- sliding-window branch (batched) -----
         if self._sw is not None:
             if self._normalize_qk:
-                c_store = F.normalize(C_new.to(torch.float), dim=-1)
+                c_store = _qk_normalize(
+                    C_new.to(torch.float), self.qk_norm_mode)
             else:
                 c_store = C_new
             if self.rope_dim_eff > 0:
@@ -1631,7 +1673,7 @@ class HCADecodingCache:
 
     def forward_step(
         self,
-        q: torch.Tensor,          # [B, 1, nh, c]   (L2-normalized iff normalize_qk)
+        q: torch.Tensor,          # [B, 1, nh, c]  (qk_norm_mode-normalized iff normalize_qk)
         *,
         nh: int,
         scale: float | None = None,
@@ -1671,11 +1713,15 @@ class HCADecodingCache:
         )
         # Core-attention scale: compute ONCE here so it is available to
         # BOTH the dense branch (below) and the sliding-window branch
-        # (further down). When normalize_qk=True (default) we use cosine
-        # scale 1.0; when False we fall back to dot-product scale
-        # c ** -0.5, matching the full-sequence naive_hca path.
+        # (further down). Auto-selection mirrors ``naive_hca``: cosine
+        # scale 1.0 for 'l2', the standard 1/sqrt(c) temperature for the
+        # RMS form (whose normalized vectors keep norm ~sqrt(c)), and the
+        # classical dot-product scale when normalization is off.
         if scale is None:
-            core_scale = 1.0 if normalize_qk else self.c ** -0.5
+            if not normalize_qk or self.qk_norm_mode == 'rms':
+                core_scale = self.c ** -0.5
+            else:
+                core_scale = 1.0
         else:
             core_scale = scale
         t = self._n_tokens_seen - 1
@@ -1704,15 +1750,16 @@ class HCADecodingCache:
             cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
             # Honor ``normalize_qk`` for the CORE attention (as in
             # ``naive_hca``). When normalize_qk=True compressed KV are
-            # L2-normalized (cosine-similarity attention). When False,
-            # skip normalization and fall back
+            # normalized with ``qk_norm_mode`` (cosine-similarity
+            # attention for 'l2', the paper §2.3.3 RMSNorm form for
+            # 'rms'). When False, skip normalization and fall back
             # to classical 1/sqrt(c) dot-product scale — this gives
             # ablations a real off-switch rather than a silently-ignored
             # flag.
             if normalize_qk:
-                C_comp_n = F.normalize(
+                C_comp_n = _qk_normalize(
                     self._C_comp[:, :self._n_blocks].to(compute_dtype),
-                    dim=-1)                                           # [B, n_blocks, c]
+                    self.qk_norm_mode)                                # [B, n_blocks, c]
             else:
                 C_comp_n = self._C_comp[:, :self._n_blocks].to(compute_dtype)
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]

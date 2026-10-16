@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (configure_torch_for_device, sanitize_for_json,
                           write_json_atomic, make_seeded_generator)
 from ops_kda_backend import kda_forward, validate_kda_backend
-from ops_csa import naive_csa
+from ops_csa import naive_csa, _qk_normalize
 from ops_hca import naive_hca
 from ops_decoding_cache import CSADecodingCache, HCADecodingCache
 from ops_fused import (
@@ -238,7 +238,7 @@ class KDAAttnDecoding(nn.Module):
     ``KDAHybridLayer``), so the per-token decode cost includes the conv.
     """
 
-    def __init__(self, d_model, H=2, K=16, V=16):
+    def __init__(self, d_model, H=2, K=16, V=16, decay_scale=0.1):
         super().__init__()
         self.q = nn.Linear(d_model, H * K, bias=False)
         self.k = nn.Linear(d_model, H * K, bias=False)
@@ -258,7 +258,7 @@ class KDAAttnDecoding(nn.Module):
         # Decay-scale constant, lifted to a module attribute so all KDA
         # instantiations share the same value via HybridConfig. Read from the
         # constructor arg if provided; otherwise default to 0.1.
-        self.decay_scale = 0.1
+        self.decay_scale = decay_scale
         # The decode benchmark keeps the reference backend by default for
         # reproducibility. Set KDA_BACKEND=fla or auto for an explicitly
         # accelerated run; the shared adapter preserves the already-processed
@@ -705,6 +705,7 @@ class HybridDecoding(nn.Module):
                 B, cfg.csa_c, cfg.csa_cI, cfg.csa_m,
                 cfg.csa_sliding_window, h.device, h.dtype,
                 rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
+                qk_norm_mode=cfg.csa_qk_norm_mode,
             )
             self._csa_caches[idx] = cache
         return cache
@@ -720,6 +721,7 @@ class HybridDecoding(nn.Module):
                 B, cfg.hca_c, cfg.hca_m2, cfg.hca_sliding_window,
                 h.device, h.dtype,
                 rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
+                qk_norm_mode=cfg.hca_qk_norm_mode,
             )
             self._hca_caches[idx] = cache
         return cache
@@ -798,11 +800,15 @@ class HybridDecoding(nn.Module):
                 layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
             )
             compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
-            q_n = F.normalize(q.to(compute_dtype), dim=-1)
+            # Normalize with the layer's configured qk_norm_mode ('l2'
+            # historical default, 'rms' paper §2.3.3 form) so the decode
+            # path matches the prefill path's naive_csa call. ``scale=None``
+            # lets the cache auto-select the matching temperature.
+            q_n = _qk_normalize(q.to(compute_dtype), cfg.csa_qk_norm_mode)
             o = cache.forward_step(
                 q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
                 topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
-                scale=1.0, sink_logits=layer.sink, use_ste=False,
+                scale=None, sink_logits=layer.sink, use_ste=False,
                 normalize_qk=True,
             )
             o_core = o.reshape(B, T_new, cfg.csa_nh * cfg.csa_c).to(h.dtype)
@@ -835,9 +841,11 @@ class HybridDecoding(nn.Module):
             C, Z, q = self._project_hca(layer, h)
             cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
             compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
-            q_n = F.normalize(q.to(compute_dtype), dim=-1)
+            # Match the prefill path's naive_hca normalization mode; see
+            # the CSA branch above for the rationale.
+            q_n = _qk_normalize(q.to(compute_dtype), cfg.hca_qk_norm_mode)
             o = cache.forward_step(
-                q_n, nh=cfg.hca_nh, scale=1.0, sink_logits=layer.sink,
+                q_n, nh=cfg.hca_nh, scale=None, sink_logits=layer.sink,
             )
             o_core = o.reshape(B, T_new, cfg.hca_nh * cfg.hca_c).to(h.dtype)
         return layer.o_proj(o_core)

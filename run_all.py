@@ -48,6 +48,7 @@ This script is the reproducibility anchor referenced by the paper's
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -230,14 +231,37 @@ _EXPERIMENT_OUTPUTS = {
 }
 
 
+# Figures each experiment's ``main()`` feeds. Purged alongside the stale
+# result JSONs on failure: otherwise a failed run leaves last session's
+# PDFs in ``figures/`` and they can be mistaken for fresh output (the
+# figure step only regenerates figures whose result files exist).
+# Glob patterns cover make_figures.py's per-n_kv suffixed names
+# (``fig_mqar_nkv2.pdf``) together with the legacy unsuffixed name.
+_EXPERIMENT_FIGURES = {
+    'exp2_benchmark': ['figures/fig_benchmark.pdf'],
+    'exp3_kv_cache': ['figures/fig_kv_cache.pdf', 'figures/fig_flops.pdf'],
+    'exp4_mqar': ['figures/fig_mqar*.pdf'],
+    'exp5_ablation': ['figures/fig_ablation*.pdf'],
+    'exp6_decoding': ['figures/fig_decoding.pdf'],
+    'exp7_roofline': ['figures/fig_roofline.pdf'],
+    'exp8_mechanism_ablation': ['figures/fig_mechanism_ablation*.pdf'],
+}
+
+
 def _purge_stale_outputs(name):
-    """Remove result JSONs that a failed run would leave behind as stale."""
+    """Remove result JSONs / figures that a failed run would leave stale."""
     for rel in _EXPERIMENT_OUTPUTS.get(name, ()):
         try:
             if os.path.exists(rel):
                 os.remove(rel)
         except OSError as e:
             print(f'[run_all] WARNING: could not remove stale {rel}: {e}')
+    for pattern in _EXPERIMENT_FIGURES.get(name, ()):
+        for rel in glob.glob(pattern):
+            try:
+                os.remove(rel)
+            except OSError as e:
+                print(f'[run_all] WARNING: could not remove stale {rel}: {e}')
 
 
 def _run(name, fn):

@@ -441,8 +441,11 @@ def main():
     logger.info('  interpret ratio effects together with n_params and paired seed data.')
 
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
-    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results
-                        if 'error' not in r), default=0)
+    # Include error rows: they carry n_seeds_ok=0, so a fully-failed ratio
+    # forces min_seeds_ok=0 and thus conclusions_valid=False (mirrors the
+    # run_mechanism_ablation.py convention of taking the min over ALL rows).
+    min_seeds_ok = min((r.get('n_seeds_ok', 0) for r in all_results),
+                       default=0)
     _c = 1.0 / VOCAB
     near_chance = [r for r in all_results
                    if 'error' not in r

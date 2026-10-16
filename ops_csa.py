@@ -306,8 +306,8 @@ def csa_compress_kv_overlapped(
     # block). The public ``naive_csa`` guards T=0 with an early return, so this
     # path is unreachable through that API — but ``csa_compress_kv_overlapped``
     # is also a public function (no underscore prefix) imported directly by
-    # ``run_correctness.py::test_overlap_causality`` and
-    # ``method_analysis.py``, so a defensive guard here makes the contract
+    # ``run_correctness.py`` (e.g. ``test_overlap_causality`` and the
+    # T=0 contract tests), so a defensive guard here makes the contract
     # match ``csa_compress_kv`` (which already handles T=0 correctly via the
     # view operation returning an empty [B, 0, m, c] tensor).
     if T == 0:

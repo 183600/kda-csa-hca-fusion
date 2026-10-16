@@ -31,6 +31,10 @@ except ImportError:  # tqdm is preinstalled on Kaggle/AutoDL but is
                 pass
             def set_description(self, *a, **k):
                 pass
+            def set_postfix(self, *a, **k):
+                # Called every optimizer step (``pbar.set_postfix``); must
+                # exist or the no-tqdm fallback crashes the training loop.
+                pass
             def __enter__(self):
                 return self
             def __exit__(self, *a):

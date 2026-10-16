@@ -61,6 +61,32 @@ def fla_available() -> bool:
     return True
 
 
+# ``_call_fla`` passes these flags as False because the caller has ALREADY
+# applied the corresponding transformations (q/k L2-norm, gate activation,
+# beta sigmoid). If the installed FLA revision does not accept a flag, the
+# kernel falls back to its own default for that transformation, which may
+# differ from False — silently breaking the "transform exactly once"
+# contract. Warn rather than drop silently.
+_CONTRACT_FLAGS = (
+    "use_qk_l2norm_in_kernel",
+    "use_gate_in_kernel",
+    "use_beta_sigmoid_in_kernel",
+)
+
+
+def _warn_dropped_contract_flags(fn: Any, kept: dict[str, Any],
+                                 kwargs: dict[str, Any]) -> None:
+    dropped = [k for k in _CONTRACT_FLAGS if k in kwargs and k not in kept]
+    if dropped:
+        warnings.warn(
+            f"The installed FLA KDA operator "
+            f"{getattr(fn, '__name__', fn)!r} does not accept {dropped}; "
+            f"its in-kernel default for those transformations may apply "
+            f"them a second time on top of the already pre-processed "
+            f"q/k/g/beta, changing the numerical contract versus the "
+            f"reference backend.", RuntimeWarning, stacklevel=3)
+
+
 def _supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Keep the adapter compatible with nearby FLA API revisions.
 
@@ -68,6 +94,9 @@ def _supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     required tensors are passed by name, while optional arguments are filtered
     against the installed function signature.  This keeps the reference repo
     importable with an older/newer FLA release without vendoring FLA itself.
+    Transformation-contract flags that cannot be forwarded emit a
+    ``RuntimeWarning`` (see :func:`_warn_dropped_contract_flags`) instead of
+    being dropped silently.
     """
     try:
         signature = inspect.signature(fn)
@@ -76,13 +105,17 @@ def _supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
         # not, pass the conservative core API only.
         core = {"q", "k", "v", "g", "beta", "scale",
                 "initial_state", "output_final_state"}
-        return {k: v for k, v in kwargs.items() if k in core}
+        kept = {k: v for k, v in kwargs.items() if k in core}
+        _warn_dropped_contract_flags(fn, kept, kwargs)
+        return kept
 
     params = signature.parameters
     if any(p.kind == inspect.Parameter.VAR_KEYWORD
            for p in params.values()):
         return kwargs
-    return {k: v for k, v in kwargs.items() if k in params}
+    kept = {k: v for k, v in kwargs.items() if k in params}
+    _warn_dropped_contract_flags(fn, kept, kwargs)
+    return kept
 
 
 def _call_fla(

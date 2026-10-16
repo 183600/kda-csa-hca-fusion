@@ -588,7 +588,14 @@ def main():
     logger.info(f'  variants: {[v["name"] for v in variants]} '
                 f'(baseline present: {has_baseline})')
 
-    n_tests = max(len(variants) - 1, 0)
+    # Shared Bonferroni family: one paired accuracy test vs baseline per
+    # non-baseline variant (only when the baseline variant is present) PLUS
+    # one one-sided recall-vs-chance test per variant (baseline included).
+    # Both use alpha_corrected below, so both must be counted; each test is
+    # repeated for every n_kv group.
+    n_paired_tests = ((len(variants) - 1) * len(n_kv_list)
+                      if has_baseline else 0)
+    n_tests = n_paired_tests + len(variants) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests if n_tests else None
 
     seeds = [42 + i for i in range(n_seeds)]
@@ -754,8 +761,11 @@ def main():
             "chance_gold_recall = min(k, n_available_blocks) / "
             "n_available_blocks."),
         'paired_test': (
-            'two-sided paired t over seeds vs baseline; Bonferroni alpha = '
-            '0.05/n_compared_variants; undefined statistics are null.'),
+            'two-sided paired t over seeds vs baseline; one-sided recall '
+            't vs chance; both share one Bonferroni family of n_tests = '
+            '(n_variants - 1 + n_variants) * n_kv when the baseline variant '
+            'is present; alpha = 0.05/n_tests; undefined statistics are '
+            'null.'),
         'n_seeds': n_seeds,
         'steps': steps,
         'train_batch': train_batch,

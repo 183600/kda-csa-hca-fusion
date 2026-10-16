@@ -150,6 +150,12 @@ class HeadwiseFusedAttention(nn.Module):
     lower. The expected cost is a more complex kernel (three code paths per
     layer) and potentially worse memory locality.
 
+    Scope note: the CSA path here is a *simplification* of the full operator —
+    single-branch compression (``csa_compress_kv``) with block top-k on the
+    same query projections — and omits the lightning indexer, overlapped
+    two-branch compression, sliding window and sink. The full operator lives
+    in ``ops_csa.py`` and its formulas are in section 3 below.
+
     Forward: x -> [LN -> headwise KDA|CSA|HCA -> concat -> o_proj] + residual.
     """
 
@@ -353,7 +359,11 @@ out[t, h] = p[h] @ kv                          # [H, c]
 
 4. Sliding window branch (local uncompressed KV):
    For each query t: attend to H[t-w+1 : t+1] @ W_aKV with causal masking.
-   Final output = sparse branch + sliding window branch.
+   Final output: ONE joint softmax over [top-k compressed blocks ; window
+   entries], with the optional sink term in the single shared denominator
+   (DeepSeek-V4 §2.3.1 Eq. 27) — NOT a sum of two independent softmaxes.
+   See ``naive_csa`` in ops_csa.py (joint softmax at the ``cat =
+   torch.cat([scores, scores_w], dim=-1)`` step).
 
 HCA — Heavily Compressed Attention
 ----------------------------------
@@ -381,8 +391,10 @@ HCA — Heavily Compressed Attention
 3. Sliding window branch: same structure as CSA's sliding window, but using
    HCA's single KV projection ``C = H @ W_KV`` (NOT CSA's two-branch
    ``Ca = H @ W_aKV``). For each query t: attend to H[t-w+1 : t+1] @ W_KV
-   (L2-normalized) with causal masking.
-4. Attention sink (optional, per-head learnable logit in the softmax denom).
+   (L2-normalized) with causal masking. As in CSA, the final output is ONE
+   joint softmax over compressed + window entries (Eq. 27), not a sum.
+4. Attention sink (optional, per-head learnable logit added to the single
+   shared softmax denominator).
 """
 
 
