@@ -961,6 +961,105 @@ def fig_roofline():
     print('Saved figures/fig_roofline.pdf')
 
 
+def fig_budget_frontier():
+    """Figure: KV read-budget curves and the top-k decode sweep (Exp 9).
+
+    Left: analytical KV-side elements read per query per layer vs context
+    length for the four operators in both geometries (solid = paper-scale,
+    dashed = MQAR probe). KDA is flat (delta-rule O(1) state); CSA and HCA
+    grow through the window/scan terms. Right: measured per-token decode
+    latency of the fused hybrid vs its analytical budget for swept
+    ``csa_topk`` values (annotated).
+    """
+    rows = load('exp9_budget_frontier.json')
+    curves = [r for r in rows if r.get('section') == 'budget_curve'
+              and r.get('row_kind') == 'op' and r.get('T')]
+    decode = [r for r in rows if r.get('section') == 'decode_sweep'
+              and r.get('error') is None
+              and r.get('mean_decode_ms_per_token')]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8),
+                             constrained_layout=True)
+    ax = axes[0]
+    colors = {'softmax': 'tab:blue', 'kda': 'tab:red',
+              'csa': 'tab:green', 'hca': 'tab:orange'}
+    markers = {'softmax': 'o', 'kda': 's', 'csa': 'D', 'hca': 'v'}
+    any_curve = False
+    for geom, ls in (('paper', '-'), ('mqar', '--')):
+        for op in ('softmax', 'kda', 'csa', 'hca'):
+            pts = sorted([r for r in curves
+                          if r.get('geometry') == geom and r['name'] == op],
+                         key=lambda r: r['T'])
+            if not pts:
+                continue
+            any_curve = True
+            ax.plot([p['T'] for p in pts],
+                    [p['total_read_elements'] for p in pts],
+                    ls, color=colors[op], marker=markers[op], ms=4.5,
+                    lw=1.4, label=f'{op} ({geom})')
+    if any_curve:
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel('Context length T (tokens)')
+        ax.set_ylabel('KV elements read per query per layer')
+        ax.set_title('Analytical read budget (lower bound)', fontsize=11)
+        ax.grid(True, which='both', alpha=0.25)
+        ax.legend(fontsize=7, ncol=2, loc='upper left')
+        ax.text(0.98, 0.03,
+                'KDA: flat (delta-rule O(1) state)\n'
+                'CSA: selected gather (capped) + O(T) indexer scan\n'
+                'Not profiled traffic; q-side projections excluded.',
+                transform=ax.transAxes, fontsize=6.5, color='0.4',
+                ha='right', va='bottom')
+    else:
+        ax.text(0.5, 0.5, 'no budget-curve rows', ha='center', va='center',
+                transform=ax.transAxes, fontsize=10, color='0.4')
+        ax.set_axis_off()
+    ax = axes[1]
+    if decode:
+        prefill_vals = sorted({r['prefill_len'] for r in decode})
+        cmap = plt.get_cmap('viridis')
+        for i, plen in enumerate(prefill_vals):
+            pts = [r for r in decode if r['prefill_len'] == plen]
+            pts.sort(key=lambda r: r['csa_topk'])
+            ax.plot([p['total_read_elements_per_query'] for p in pts],
+                    [p['mean_decode_ms_per_token'] for p in pts],
+                    'o-', color=cmap(0.15 + 0.7 * i / max(1, len(prefill_vals) - 1)),
+                    ms=5, lw=1.2, label=f'prefill L={plen}')
+            for p in pts:
+                ax.annotate(f"k={p['csa_topk']}",
+                            (p['total_read_elements_per_query'],
+                             p['mean_decode_ms_per_token']),
+                            fontsize=6, xytext=(3, 3),
+                            textcoords='offset points', color='0.35')
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel('Analytical budget (elements/query/layer)')
+        ax.set_ylabel('Measured decode ms per token')
+        ax.set_title('Top-k budget vs measured decode latency', fontsize=11)
+        ax.grid(True, which='both', alpha=0.25)
+        ax.legend(fontsize=7)
+        ax.text(0.02, 0.96,
+                'Budget is indexer-scan dominated;\n'
+                'cutting top-k alone moves little.',
+                transform=ax.transAxes, fontsize=6.5, color='0.4',
+                ha='left', va='top')
+    else:
+        ax.text(0.5, 0.5, 'no decode-sweep rows', ha='center', va='center',
+                transform=ax.transAxes, fontsize=10, color='0.4')
+        ax.set_axis_off()
+    fig.suptitle('Exp 9: KV read-budget frontier (top-k budget, delta-rule '
+                 'O(1) state, hybrid ratio)', fontsize=12)
+    _ensure_figures_dir()
+    try:
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_budget_frontier.pdf'),
+                    dpi=150)
+        fig.savefig(os.path.join(_FIGURES_DIR, 'fig_budget_frontier.png'),
+                    dpi=150)
+    finally:
+        plt.close(fig)
+    print('Saved figures/fig_budget_frontier.pdf')
+
+
 def main():
     _ensure_figures_dir()
     os.makedirs(_RESULTS_DIR, exist_ok=True)
@@ -981,6 +1080,9 @@ def main():
     if os.path.exists(os.path.join(
             _RESULTS_DIR, 'exp8_mechanism_ablation.json')):
         fig_mechanism_ablation()
+    if os.path.exists(os.path.join(
+            _RESULTS_DIR, 'exp9_budget_frontier.json')):
+        fig_budget_frontier()
     print('\nAll figures generated.')
 
 

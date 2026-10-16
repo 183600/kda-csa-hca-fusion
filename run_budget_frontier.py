@@ -1,0 +1,545 @@
+"""Experiment 9 — KV read-budget frontier.
+
+Motivation
+----------
+Experiments 4/5/8 measure MQAR quality of the operators and hybrid layouts;
+Experiments 3/7 account for retained state and roofline distance. None of
+them answers the *budget* question that drives the top-k knob and the hybrid
+ratio: **how many KV-side elements does one query read, and which term
+dominates as context grows?**
+
+This experiment unifies three questions under one currency (average KV-side
+elements read per query per layer; see ``kv_budget`` for the exact contract):
+
+1. **Analytic budget curves** over context length for the four core
+   operators and the seven Exp 5 hybrid layouts, in two geometries (the
+   small MQAR probe and the paper-scale ``run_kv_cache.DEFAULTS``). The
+   curves expose the two terms of CSA: the O(topk) selected gather AND the
+   O(T) lightning-indexer scan, which the reference implementation performs
+   over every visible compressed block before selecting the top-k. They also
+   expose the delta-rule extreme: KDA's state read is O(1) in T.
+2. **Measured top-k decode sweep**: per-token decode latency of the fused
+   3:1:1 hybrid as ``csa_topk`` varies (0 = sparse branch off, then 1/2/4/8),
+   joined with the analytic read budget at the same geometry. This tests
+   whether shrinking the top-k budget actually buys latency in the
+   reference implementation.
+3. **Quality-budget join**: if Exp 4/5/8 result files exist, each measured
+   configuration is annotated with its analytic budget at the MQAR context
+   (T=16), and the Exp 5 layout ranking is compared against the budget
+   ranking at T=16 and at a long-context extrapolation (T=8192, paper
+   geometry). Exp 5 controls depth but not budget; the join makes that
+   distinction explicit and exploratory (Spearman over 7 layouts).
+
+Honesty / scope
+---------------
+* The budget model is an analytical read count, not profiled traffic:
+  library-internal materialization (unfold, temporaries) is out of scope.
+* The indexer scan is charged on every query because the reference
+  implementation scores all visible blocks before top-k (including
+  ``topk=0``).
+* The decode-sweep geometry is intentionally smaller than the Exp 4/5/8
+  quality geometry (see ``run_decoding.HybridDecoding``); budgets are
+  reported per geometry and never silently mixed.
+* The long-context ranking is an extrapolation of the same layout budgets;
+  the measured accuracies are T=16 only. Spearman over 7 layouts is
+  exploratory, not confirmatory.
+
+Environment variables
+---------------------
+* ``BUDGET_T_GRID``         (default '16,64,256,1024,4096,16384').
+* ``BUDGET_TOPK``           (default '0,1,2,4,8')  decode sweep values.
+* ``BUDGET_PREFILL_LENS``   (default '256,512').
+* ``BUDGET_DECODE_TOKENS``  (default 10).
+* ``BUDGET_REPEATS``        (default 2).
+
+Output
+------
+``results/exp9_budget_frontier.json`` — v1.0 envelope
+(``kind='exp9_budget_frontier'``) with a flat row list; every row carries
+``section`` in {'budget_curve', 'decode_sweep', 'quality_join',
+'ranking_summary'}.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import sys
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from kaggle_setup import (
+    capture_provenance,
+    configure_torch_for_device,
+    parse_int_env,
+)
+from kv_budget import layout_read_elements, op_read_elements, spearman
+from results_schema import load as load_schema
+from results_schema import write as write_schema
+from run_ablation import _make_cfg
+from run_decoding import HybridDecoding, bench_decoding
+from run_kv_cache import DEFAULTS as PAPER_DEFAULTS
+from run_kv_cache import GQA_H, GQA_HEAD_DIM
+from run_quality import SoftmaxAttn
+
+logger = logging.getLogger(__name__)
+
+RESULTS_PATH = os.path.join('results', 'exp9_budget_frontier.json')
+MQAR_SEQ_LEN = 16
+DECODE_D_MODEL = 64
+DECODE_TOTAL_LAYERS = 5
+DEFAULT_T_GRID = '16,64,256,1024,4096,16384'
+DEFAULT_TOPK = '0,1,2,4,8'
+DEFAULT_PREFILL_LENS = '256,512'
+DEFAULT_DECODE_TOKENS = 10
+DEFAULT_REPEATS = 2
+LAYOUTS = (
+    (3, 1, 1),
+    (4, 1, 0), (4, 0, 1),
+    (2, 2, 1), (2, 1, 2),
+    (1, 3, 1), (1, 1, 3),
+)
+JOIN_SOURCES = (
+    ('exp4_mqar', os.path.join('results', 'exp4_mqar.json')),
+    ('exp5_ablation', os.path.join('results', 'exp5_ablation.json')),
+    ('exp8_mechanism_ablation',
+     os.path.join('results', 'exp8_mechanism_ablation.json')),
+)
+
+
+def _parse_int_list(raw, name, min_value=0):
+    values = []
+    for part in str(raw).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            raise ValueError(
+                f'{name} contains a non-integer entry: {part!r}')
+    if not values:
+        raise ValueError(f'{name} has no integer entries: {raw!r}')
+    if any(v < min_value for v in values):
+        raise ValueError(
+            f'{name} entries must be >= {min_value}, got {values}')
+    return values
+
+
+def _spec_from_hybrid_cfg(cfg, *, softmax_geo):
+    """Build a kv_budget geometry dict from a ``HybridConfig``."""
+    return {
+        'softmax': dict(softmax_geo),
+        'kda': {'hv': cfg.n_heads_v, 'd_k': cfg.head_dim_k,
+                'd_v': cfg.head_dim_v},
+        'csa': {'m': cfg.csa_m, 'topk': cfg.csa_topk, 'c': cfg.csa_c,
+                'c_i': cfg.csa_cI, 'n_idx_heads': cfg.csa_nIh,
+                'sliding_window': cfg.csa_sliding_window},
+        'hca': {'m2': cfg.hca_m2, 'c': cfg.hca_c,
+                'sliding_window': cfg.hca_sliding_window},
+    }
+
+
+def mqar_spec():
+    """MQAR probe geometry (Exp 4/5/8): d_model=32 3:1:1 hybrid + softmax."""
+    cfg = _make_cfg(32, (3, 1, 1))
+    softmax = SoftmaxAttn(8)
+    return _spec_from_hybrid_cfg(
+        cfg, softmax_geo={'n_kv_heads': softmax.H, 'd_k': softmax.K,
+                          'd_v': softmax.V})
+
+
+def paper_spec():
+    """Paper-scale geometry (Exp 3 defaults): H=8, K=V=128, c=128."""
+    p = PAPER_DEFAULTS
+    return {
+        'softmax': {'n_kv_heads': GQA_H, 'd_k': GQA_HEAD_DIM,
+                    'd_v': GQA_HEAD_DIM},
+        'kda': {'hv': p['kda_hv'], 'd_k': p['kda_k'], 'd_v': p['kda_v']},
+        'csa': {'m': p['csa_m'], 'topk': p['csa_topk'], 'c': p['csa_c'],
+                'c_i': p['csa_cI'], 'n_idx_heads': p['csa_nIh'],
+                'sliding_window': p['csa_sliding_window']},
+        'hca': {'m2': p['hca_m2'], 'c': p['hca_c'],
+                'sliding_window': p['hca_sliding_window']},
+    }
+
+
+def build_budget_curves(t_grid, specs):
+    """Analytic budget rows for every (geometry, T, op/layout) cell."""
+    rows = []
+    for geom, spec in specs.items():
+        for T in t_grid:
+            for op in ('softmax', 'kda', 'csa', 'hca'):
+                r = op_read_elements(op, T, spec)
+                rows.append({
+                    'section': 'budget_curve',
+                    'row_kind': 'op',
+                    'geometry': geom,
+                    'name': op,
+                    **r,
+                })
+            for ratio in LAYOUTS:
+                r = layout_read_elements(T, ratio, spec)
+                rows.append({
+                    'section': 'budget_curve',
+                    'row_kind': 'layout',
+                    'geometry': geom,
+                    'name': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
+                    'ratio': list(ratio),
+                    **r,
+                })
+    return rows
+
+
+def _decode_row(cfg, bench, topk, prefill_len, n_decode, repeats):
+    softmax_geo = {'n_kv_heads': 2, 'd_k': 16, 'd_v': 16}
+    spec = _spec_from_hybrid_cfg(cfg, softmax_geo=softmax_geo)
+    budget = layout_read_elements(
+        prefill_len, (cfg.n_kda, cfg.n_csa, cfg.n_hca), spec)
+    csa_op = op_read_elements('csa', prefill_len, spec)
+    return {
+        'section': 'decode_sweep',
+        'csa_topk': topk,
+        'prefill_len': prefill_len,
+        'n_decode': n_decode,
+        'repeats': repeats,
+        'layout': f'{cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}',
+        'prefill_ms': bench['prefill_ms'],
+        'mean_decode_ms_per_token': bench['mean_decode_ms_per_token'],
+        'median_decode_ms_per_token': bench['median_decode_ms_per_token'],
+        'peak_mem_MB': bench['peak_mem_MB'],
+        'budget_context_T': prefill_len,
+        'total_read_elements_per_query': budget['total_read_elements'],
+        'csa_indexer_read_elements_per_query':
+            csa_op['indexer_read_elements'],
+        'csa_core_read_elements_per_query':
+            csa_op['core_read_elements'],
+    }
+
+
+def run_decode_sweep(device, topk_values, prefill_lens, n_decode, repeats):
+    """Measure decode latency of the fused hybrid vs the top-k budget."""
+    rows = []
+    for prefill_len in prefill_lens:
+        for topk in topk_values:
+            try:
+                torch.manual_seed(0)
+                model = HybridDecoding(
+                    d_model=DECODE_D_MODEL, total_layers=DECODE_TOTAL_LAYERS,
+                    csa_topk=topk)
+                bench = bench_decoding(
+                    model, DECODE_D_MODEL, prefill_len, n_decode, device,
+                    repeats=repeats)
+                rows.append(_decode_row(
+                    model.cfg, bench, topk, prefill_len, n_decode, repeats))
+                logger.info(
+                    f'  decode sweep topk={topk} L={prefill_len}: '
+                    f'prefill={bench["prefill_ms"]:.2f}ms '
+                    f'decode/token={bench["mean_decode_ms_per_token"]:.3f}ms')
+            except Exception as e:
+                logger.warning(
+                    f'  decode sweep topk={topk} L={prefill_len} FAILED: {e}')
+                rows.append({
+                    'section': 'decode_sweep',
+                    'csa_topk': topk,
+                    'prefill_len': prefill_len,
+                    'n_decode': n_decode,
+                    'repeats': repeats,
+                    'error': str(e),
+                })
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+    return rows
+
+
+def _parse_ratio(label):
+    try:
+        parts = [int(x) for x in str(label).replace(' ', '').split(':')]
+    except (TypeError, ValueError):
+        return None
+    return tuple(parts) if len(parts) == 3 else None
+
+
+def _try_load(path):
+    if not os.path.exists(path):
+        return None, f'{path} not found; join skipped (run the experiment)'
+    try:
+        _meta, rows = load_schema(path)
+    except Exception as e:
+        return None, f'{path} unreadable: {type(e).__name__}: {e}'
+    if not isinstance(rows, list):
+        return None, f'{path} did not yield a row list'
+    return rows, None
+
+
+def build_quality_join(spec, context_T=MQAR_SEQ_LEN):
+    """Join existing Exp 4/5/8 measured rows with their analytic budget.
+
+    Returns ``(rows, skipped)`` where ``skipped`` lists per-source reasons;
+    a missing source is a documented skip, never a silent zero.
+    """
+    rows = []
+    skipped = []
+    for source, path in JOIN_SOURCES:
+        data, reason = _try_load(path)
+        if data is None:
+            skipped.append(reason)
+            continue
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            acc = r.get('mean_acc')
+            if acc is None or not isinstance(acc, (int, float)) \
+                    or not math.isfinite(acc):
+                continue
+            budget = None
+            label = None
+            if source == 'exp4_mqar':
+                op = r.get('op')
+                if op in ('softmax', 'kda', 'csa', 'hca'):
+                    budget = op_read_elements(op, context_T,
+                                              spec)['total_read_elements']
+                    label = str(op)
+            elif source == 'exp5_ablation':
+                ratio = _parse_ratio(r.get('ratio'))
+                if ratio is not None and sum(ratio) > 0:
+                    budget = layout_read_elements(
+                        context_T, ratio, spec)['total_read_elements']
+                    label = ':'.join(str(x) for x in ratio)
+            else:  # exp8
+                topk = r.get('topk')
+                variant = r.get('variant')
+                if isinstance(topk, int) and variant is not None:
+                    local = {k: dict(v) if isinstance(v, dict) else v
+                             for k, v in spec.items()}
+                    local['csa']['topk'] = topk
+                    budget = layout_read_elements(
+                        context_T, (3, 1, 1), local)['total_read_elements']
+                    label = f'{variant} (k={topk})'
+            if budget is None:
+                continue
+            rows.append({
+                'section': 'quality_join',
+                'source': source,
+                'label': label,
+                'context_T': context_T,
+                'mean_acc': float(acc),
+                'ci95_acc': r.get('ci95_acc'),
+                'n_seeds_ok': r.get('n_seeds_ok'),
+                'mean_fwd_ms': r.get('mean_fwd_ms'),
+                'total_read_elements_per_query': budget,
+            })
+    return rows, skipped
+
+
+def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192):
+    """Compare the Exp 5 layout accuracy ranking with budget rankings.
+
+    Only ``exp5_ablation`` rows are used (one row per layout, its own
+    controlled-depth measurement). The comparison at ``aT`` is the measured
+    context; at ``bT`` it extrapolates the same layouts' budgets to long
+    context in each geometry. Over 7 layouts this is exploratory.
+    """
+    exp5 = [r for r in join_rows if r.get('source') == 'exp5_ablation']
+    if len(exp5) < 3:
+        return [{
+            'section': 'ranking_summary',
+            'skipped_reason': (
+                'fewer than 3 exp5_ablation rows were joined; ranking '
+                'summary skipped'),
+        }]
+    labels = [r['label'] for r in exp5]
+    accs = [r['mean_acc'] for r in exp5]
+    out = []
+    for geom, spec in specs.items():
+        budgets = [layout_read_elements(aT, _parse_ratio(lbl),
+                                        spec)['total_read_elements']
+                   for lbl in labels]
+        order = [lbl for _b, lbl in
+                 sorted(zip(budgets, labels), key=lambda t: t[0])]
+        out.append({
+            'section': 'ranking_summary',
+            'geometry': geom,
+            'context_T': aT,
+            'n_layouts': len(labels),
+            'labels': labels,
+            'layout_order_by_budget_ascending': order,
+            'spearman_acc_vs_budget': spearman(budgets, accs),
+        })
+        long_budgets = [layout_read_elements(bT, _parse_ratio(lbl),
+                                             spec)['total_read_elements']
+                        for lbl in labels]
+        out.append({
+            'section': 'ranking_summary',
+            'geometry': geom,
+            'context_T': bT,
+            'n_layouts': len(labels),
+            'labels': labels,
+            'layout_order_by_budget_ascending': [
+                lbl for _b, lbl in
+                sorted(zip(long_budgets, labels), key=lambda t: t[0])],
+            'spearman_acc_vs_budget': spearman(long_budgets, accs),
+            'note': 'long-context budget is an extrapolation of the same '
+                    'layouts; accuracies were measured at T=16 only',
+            'interpretation_caveat': (
+                'A positive rho here does NOT establish that budget buys '
+                'accuracy: the long-context budget ordering is largely set '
+                'by operator composition (CSA-heavy layouts carry the O(T) '
+                'indexer term), and composition also drives the measured '
+                'short-context accuracy. The rank correlation detects the '
+                'composition confound, not a causal budget effect.'),
+        })
+    return out
+
+
+def _print_curves(rows, t_grid):
+    print('\n' + '=' * 96)
+    print('Analytic read budget (avg elements per query per layer)')
+    print('=' * 96)
+    for geom in ('mqar', 'paper'):
+        print(f'\ngeometry={geom}')
+        header = f"{'kind':>8} | " + ' | '.join(
+            f'T={T:>6}' for T in t_grid)
+        print(header)
+        print('-' * len(header))
+        for name in ('softmax', 'kda', 'csa', 'hca'):
+            vals = []
+            for T in t_grid:
+                r = next(r for r in rows if r['section'] == 'budget_curve'
+                         and r['geometry'] == geom and r['row_kind'] == 'op'
+                         and r['name'] == name and r['T'] == T)
+                vals.append(f"{r['total_read_elements']:>8.1f}")
+            print(f'{name:>8} | ' + ' | '.join(vals))
+        for ratio in LAYOUTS:
+            label = f'{ratio[0]}:{ratio[1]}:{ratio[2]}'
+            vals = []
+            for T in t_grid:
+                r = next(r for r in rows if r['section'] == 'budget_curve'
+                         and r['geometry'] == geom
+                         and r['row_kind'] == 'layout'
+                         and r['name'] == label and r['T'] == T)
+                vals.append(f"{r['total_read_elements']:>8.1f}")
+            print(f'{label:>8} | ' + ' | '.join(vals))
+
+
+def main():
+    info = configure_torch_for_device()
+    device = info.device
+    logging.basicConfig(
+        level=logging.INFO, format='%(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)])
+    logger.info('=' * 70)
+    logger.info('Experiment 9: KV Read-Budget Frontier '
+                '(top-k budget / delta-rule O(1) / hybrid ratio)')
+    logger.info('=' * 70)
+    logger.info(f'  device: {device}')
+
+    t_grid = _parse_int_list(
+        os.environ.get('BUDGET_T_GRID', DEFAULT_T_GRID),
+        'BUDGET_T_GRID', min_value=1)
+    topk_values = _parse_int_list(
+        os.environ.get('BUDGET_TOPK', DEFAULT_TOPK),
+        'BUDGET_TOPK', min_value=0)
+    prefill_lens = _parse_int_list(
+        os.environ.get('BUDGET_PREFILL_LENS', DEFAULT_PREFILL_LENS),
+        'BUDGET_PREFILL_LENS', min_value=1)
+    n_decode = parse_int_env(
+        'BUDGET_DECODE_TOKENS', DEFAULT_DECODE_TOKENS, min_value=1,
+        logger=logger)
+    repeats = parse_int_env(
+        'BUDGET_REPEATS', DEFAULT_REPEATS, min_value=1, logger=logger)
+    logger.info(f'  T grid: {t_grid}')
+    logger.info(f'  decode: topk={topk_values}, prefill={prefill_lens}, '
+                f'n_decode={n_decode}, repeats={repeats}')
+
+    specs = {'mqar': mqar_spec(), 'paper': paper_spec()}
+    rows = build_budget_curves(t_grid, specs)
+    _print_curves(rows, t_grid)
+
+    logger.info('\n-- decode top-k sweep (fused 3:1:1 hybrid) --')
+    decode_rows = run_decode_sweep(
+        device, topk_values, prefill_lens, n_decode, repeats)
+    rows.extend(decode_rows)
+
+    join_rows, join_skipped = build_quality_join(specs['mqar'])
+    rows.extend(join_rows)
+    for reason in join_skipped:
+        logger.info(f'  join skipped: {reason}')
+    rows.extend(build_ranking_summary(join_rows, specs))
+
+    metadata = {
+        'experiment': 'exp9_budget_frontier',
+        'design': (
+            'One currency for top-k budget / delta-rule state / hybrid '
+            'ratio: analytical KV-side elements read per query per layer, '
+            'averaged over positions. Curves cover the 4 core operators '
+            'and the 7 Exp 5 layouts in MQAR and paper geometries; a '
+            'measured decode-latency sweep over csa_topk joins the '
+            'analytic budget; Exp 4/5/8 rows (if present) are joined with '
+            'their measured-context budget.'),
+        'currency_definition': (
+            'element = one scalar of the KV-side representation (compressed '
+            'shared-KV vector counts once; window token contributes c; KDA '
+            'state contributes hv*d_k*d_v). Causal masks match the '
+            'implementations (inclusive own-token for softmax/window, '
+            'strictly preceding compressed blocks). KDA reads its state '
+            'twice per step (delta masked read + output read). CSA charges '
+            'the lightning-indexer scan over ALL visible compressed blocks '
+            '(it runs before top-k in the reference implementation, '
+            'including topk=0). Query-side projections excluded.'),
+        'model_scope': (
+            'analytical read counts, NOT profiled traffic; library-internal '
+            'materialization (unfold, temporaries) is out of scope, as in '
+            'the Exp 7 compulsory-traffic caveat.'),
+        'geometries': specs,
+        'decode_geometry': (
+            'run_decoding.HybridDecoding defaults (d_model=64, c=8, dc=8, '
+            'cI=4, nIh=1, m=4, m2=4, sw=4, 3:1:1); decode numbers must not '
+            'be compared head-to-head with Exp 4/5/8 quality geometry.'),
+        't_grid': t_grid,
+        'decode_sweep': {
+            'csa_topk': topk_values,
+            'prefill_lens': prefill_lens,
+            'n_decode': n_decode,
+            'repeats': repeats,
+        },
+        'join_sources': [name for name, _ in JOIN_SOURCES],
+        'join_skipped': join_skipped,
+        'caveats': [
+            'The budget is an analytical lower bound on KV-side reads; '
+            'matching latency to budget is confounded by Python-loop '
+            'overhead in the reference implementation.',
+            'Exp 5 layouts are depth-controlled, not budget-controlled; '
+            'the ranking summary is exploratory (7 layouts, Spearman). '
+            'Correlations between the measured T=16 accuracy and the '
+            'long-context budget ranking confound operator composition '
+            'with budget: they do not identify a causal budget effect.',
+            'Long-context layout budgets (T>16) are extrapolations; no '
+            'quality was measured at those contexts.',
+            'topk=0 still charges the indexer scan because the reference '
+            'operator scores all blocks before skipping the gather; a '
+            'production engine could skip selection entirely.',
+        ],
+        'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
+        'provenance': capture_provenance(),
+    }
+
+    os.makedirs(os.path.dirname(RESULTS_PATH) or '.', exist_ok=True)
+    write_schema(RESULTS_PATH, rows, kind='exp9_budget_frontier',
+                 metadata=metadata)
+    logger.info(f'\nSaved: {RESULTS_PATH}')
+
+    errors = sum(1 for r in decode_rows if 'error' in r)
+    if not any(r['section'] == 'budget_curve' for r in rows) or errors:
+        logger.error(
+            f'\nexp9 incomplete: {errors} decode-sweep cells errored; '
+            f'returning non-zero.')
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

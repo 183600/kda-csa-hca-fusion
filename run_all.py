@@ -28,7 +28,7 @@ What this runner does
     CUDA wheel install itself lives in ``kaggle_setup.bootstrap_kaggle_cuda``
     and requires a kernel restart — see that module's docstring).
   * Prints an environment summary.
-  * Runs all experiments (Exp 1-8) + method analysis + figure generation.
+  * Runs all experiments (Exp 1-9) + method analysis + figure generation.
   * Saves a combined ``results/summary.json`` with pass/fail and key numbers.
 
 Environment knobs (set before importing / via ``os.environ``):
@@ -40,6 +40,11 @@ Environment knobs (set before importing / via ``os.environ``):
   * ``MECH_SEEDS``      (default 5)   — seeds for the mechanism ablation (Exp 8).
   * ``MECH_STEPS``      (default 200) — training steps for Exp 8.
   * ``MECH_VARIANTS``   (default "")  — optional comma-separated Exp 8 variant subset.
+  * ``BUDGET_T_GRID``   (default '16,64,256,1024,4096,16384') — Exp 9 context grid.
+  * ``BUDGET_TOPK``     (default '0,1,2,4,8') — Exp 9 decode top-k sweep values.
+  * ``BUDGET_PREFILL_LENS`` (default '256,512') — Exp 9 decode prefill lengths.
+  * ``BUDGET_DECODE_TOKENS`` (default 10) — Exp 9 decode tokens per cell.
+  * ``BUDGET_REPEATS``  (default 2) — Exp 9 decode timing repeats.
   * ``SKIP_SLOW``       (default 0)   — if "1", skip CSA-heavy experiments on CPU.
 
 This script is the reproducibility anchor referenced by the paper's
@@ -228,6 +233,7 @@ _EXPERIMENT_OUTPUTS = {
     'exp6_decoding': ['results/exp6_decoding.json'],
     'exp7_roofline': ['results/exp7_roofline.json'],
     'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
+    'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
 }
 
 
@@ -245,6 +251,7 @@ _EXPERIMENT_FIGURES = {
     'exp6_decoding': ['figures/fig_decoding.pdf'],
     'exp7_roofline': ['figures/fig_roofline.pdf'],
     'exp8_mechanism_ablation': ['figures/fig_mechanism_ablation*.pdf'],
+    'exp9_budget_frontier': ['figures/fig_budget_frontier.pdf'],
 }
 
 
@@ -337,7 +344,9 @@ def run_all(seeds=None, steps=None):
     _env_keys = ('MQAR_SEEDS', 'ABL_SEEDS', 'MQAR_STEPS', 'ABL_STEPS',
                  'MQAR_SOFTMAX_STEPS', 'BENCH_LENGTHS', 'RESULTS_DIR',
                  'FIGURES_DIR', 'SKIP_SLOW', 'MECH_SEEDS', 'MECH_STEPS',
-                 'MECH_TRAIN_BATCH', 'MECH_NKV', 'MECH_VARIANTS')
+                 'MECH_TRAIN_BATCH', 'MECH_NKV', 'MECH_VARIANTS',
+                 'BUDGET_T_GRID', 'BUDGET_TOPK', 'BUDGET_PREFILL_LENS',
+                 'BUDGET_DECODE_TOKENS', 'BUDGET_REPEATS')
     # Snapshot the precise pre-call state of each env var: distinguish
     # "unset" from "set to a value" so the finally block can restore the
     # exact state.
@@ -422,8 +431,10 @@ def run_all(seeds=None, steps=None):
         import run_mechanism_ablation
         import run_decoding
         import run_roofline
+        import run_budget_frontier
         import test_roofline_schema
         import test_mechanism_ablation
+        import test_budget_frontier
         import method_analysis
         import make_figures
 
@@ -443,6 +454,11 @@ def run_all(seeds=None, steps=None):
         #     paired-statistics helpers carry their own test module.
         summary['runs'].append(
             _run('test_mechanism_ablation', test_mechanism_ablation.main))
+
+        # 1d. Budget-frontier unit tests — the kv_budget formulas and the
+        #     delta-rule O(1) identities carry their own test module.
+        summary['runs'].append(
+            _run('test_budget_frontier', test_budget_frontier.main))
 
         # 2. KV cache analysis — pure arithmetic, always run.
         summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))
@@ -562,6 +578,32 @@ def run_all(seeds=None, steps=None):
         # 7. Decoding latency — fast (only softmax + KDA).
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
 
+        # 7b. Budget frontier — analytic curves + measured top-k decode
+        #     sweep + joins over Exp 4/5/8 results. On CPU with SKIP_SLOW,
+        #     truncate the measured sweep (prefill, decode tokens, repeats);
+        #     the analytic curves are always kept.
+        if skip_slow and is_cpu:
+            try:
+                _bp = [int(x.strip()) for x in
+                       os.environ.get('BUDGET_PREFILL_LENS',
+                                      '256,512').split(',') if x.strip()]
+            except ValueError:
+                _bp = [256, 512]
+            _bp = [v for v in _bp if v <= 256] or [256]
+            os.environ['BUDGET_PREFILL_LENS'] = ','.join(str(v) for v in _bp)
+            try:
+                _bd = int(os.environ.get('BUDGET_DECODE_TOKENS', '10'))
+            except ValueError:
+                _bd = 10
+            os.environ['BUDGET_DECODE_TOKENS'] = str(max(1, min(_bd, 5)))
+            try:
+                _br = int(os.environ.get('BUDGET_REPEATS', '2'))
+            except ValueError:
+                _br = 2
+            os.environ['BUDGET_REPEATS'] = str(max(1, min(_br, 1)))
+        summary['runs'].append(
+            _run('exp9_budget_frontier', run_budget_frontier.main))
+
         # 8. Figures — generate from whatever results exist.
         # Two failure modes:
         #
@@ -638,6 +680,9 @@ def run_all(seeds=None, steps=None):
                     res_dir, 'exp8_mechanism_ablation.json')):
                 expected += _fig_group_names('exp8_mechanism_ablation.json',
                                              'fig_mechanism_ablation')
+            if os.path.exists(os.path.join(
+                    res_dir, 'exp9_budget_frontier.json')):
+                expected.append('fig_budget_frontier.pdf')
             expected.append('fig_architecture.pdf')
             missing = [f for f in expected
                        if not os.path.exists(os.path.join(fig_dir, f))]
