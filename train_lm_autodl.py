@@ -56,6 +56,7 @@ from kaggle_setup import (configure_torch_for_device, set_global_seed,
                           seed_worker, capture_provenance,
                           write_json_atomic, write_results_json,
                           split_train_val_test, audit_split)
+from results_analysis import diagnose_nonfinite, diagnose_training_curves
 
 # tokenizer / dataset handling (reuse TinyStories if available)
 try:
@@ -463,9 +464,22 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
                 out = model(input_ids, labels=labels)
             loss = out["loss"]
             if loss is None or not torch.isfinite(loss):
+                # Held-out evaluation diverged: name the first failing stage
+                # (data ids -> loss -> parameters) so the refusal to report
+                # a metric is actionable.
+                diag = diagnose_nonfinite(
+                    loss=(loss if loss is not None else float('nan')),
+                    token_ids={'input_ids': input_ids},
+                    id_range=(0, int(getattr(
+                        getattr(model, 'embed', None),
+                        'num_embeddings', input_ids.max().item() + 1))),
+                    params=model.parameters(),
+                    amp_enabled=bool(use_amp),
+                    context='held-out evaluation')
                 raise RuntimeError(
                     f'non-finite held-out LM loss ({loss}) during '
-                    f'evaluation; refusing to report a corrupted metric')
+                    f'evaluation; refusing to report a corrupted metric. '
+                    f'Diagnosis [{diag["verdict"]}]: {diag["summary"]}')
             total_nll += float(loss.detach()) * n_tok
             total_tokens += n_tok
             n_batches += 1
@@ -1394,9 +1408,37 @@ def main():
                 out = model(input_ids, labels=labels)
                 raw_loss = out["loss"]
             if raw_loss is None or not torch.isfinite(raw_loss):
+                # Systematic NaN/Inf triage (results_analysis.diagnose_nonfinite):
+                # token-id range (data), parameter finiteness, AMP scaler state,
+                # and — when AMP is on — a same-batch fp32 forward comparison,
+                # which separates a mixed-precision overflow from a math bug.
+                # The report is embedded in the exception so the failure names
+                # its first failing stage.
+                fp32_loss = None
+                if use_amp and raw_loss is not None:
+                    try:
+                        with torch.no_grad():
+                            model.hybrid.reset_state()
+                            fp32_loss = model(input_ids,
+                                              labels=labels)["loss"]
+                        model.hybrid.reset_state()
+                    except Exception:
+                        fp32_loss = None
+                diag = diagnose_nonfinite(
+                    loss=(raw_loss if raw_loss is not None
+                          else float('nan')),
+                    token_ids={'input_ids': input_ids},
+                    id_range=(0, vocab_size),
+                    params=model.parameters(),
+                    amp_enabled=bool(use_amp),
+                    amp_scaler=(scaler if scaler.is_enabled() else None),
+                    fp32_forward_loss=fp32_loss,
+                    context=(f'optimizer_step={optimizer_step}, '
+                             f'micro_step={micro_step}'))
                 raise RuntimeError(
                     f"non-finite LM loss at optimizer_step={optimizer_step}, "
-                    f"micro_step={micro_step}: {raw_loss}")
+                    f"micro_step={micro_step}: {raw_loss}; diagnosis "
+                    f"[{diag['verdict']}]: {diag['summary']}")
             scaled_loss = raw_loss / grad_accum
             if scaler.is_enabled():
                 scaler.scale(scaled_loss).backward()
@@ -1491,6 +1533,17 @@ def main():
     # The file is the experiment log — no manual bookkeeping.
     mean_last10 = (sum(curve_losses[-10:]) / min(10, len(curve_losses))
                    if curve_losses else None)
+
+    # Curve-shape diagnosis: overfitting / underfitting is a property of the
+    # monitored train-vs-validation curves, not of the final numbers. The
+    # verdict and its recommendations are recorded so a reader of the run
+    # record sees whether the best validation checkpoint (used above) was
+    # picked because of overfitting, and what to try next.
+    curve_diagnosis = diagnose_training_curves(
+        curve_losses, [h['loss'] for h in val_history])
+    print(f"[diagnosis] train/val curves: {curve_diagnosis['verdict']}")
+    for _rec in curve_diagnosis['recommendations']:
+        print(f"[diagnosis]   - {_rec}")
     run_record = {
         "kind": "train_lm_autodl",
         "created_utc": created_utc,
@@ -1506,6 +1559,10 @@ def main():
             "loss": curve_losses,
             "elapsed_s": curve_elapsed_s,
         },
+        # Shape-based verdict over the train and validation curves
+        # (overfitting / underfitting / healthy / diverged) with the
+        # numeric evidence and next actions.
+        "curve_diagnosis": curve_diagnosis,
         "validation": {
             "criterion": "min token-weighted validation loss",
             "history": val_history,

@@ -33,6 +33,7 @@ import math
 import os
 import sys
 import time
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -50,8 +51,22 @@ from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
+from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
+                              diagnose_training_curves)
 
 logger = logging.getLogger(__name__)
+
+# Dedicated synthetic-data stream for the held-out validation monitoring
+# curve. Kept distinct from the training stream (seed + 1_000_000) and from
+# the final headline eval stream (seed + 5_000_000) so that (a) the
+# validation curve can never leak into the reported eval metric, and
+# (b) enabling monitoring cannot change any reported number (monitoring is
+# read-only and RNG-isolated).
+_VAL_MONITOR_SEED_OFFSET = 6_000_000
+# Dedicated stream for bad-case / error analysis. Never reused for
+# training, validation monitoring, or the headline eval, so the examples
+# examined are not the samples any metric was computed on.
+_ERROR_ANALYSIS_SEED_OFFSET = 7_000_000
 
 
 def _build_param_groups(*modules, weight_decay=0.01):
@@ -538,7 +553,10 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     # Apply embedding (gradients flow to the embedding table).
     x_emb = embed(x)
     if return_meta:
-        return x_emb, target, cue_pos, {'key_idx': j}
+        # ``input_ids`` is included so downstream bad-case analysis can
+        # decode an error in task terms (which key was cued, what the
+        # other values were) without re-deriving the layout.
+        return x_emb, target, cue_pos, {'key_idx': j, 'input_ids': x}
     return x_emb, target, cue_pos
 
 
@@ -625,7 +643,7 @@ def make_kv_update_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
 
     x_emb = embed(x)
     if return_meta:
-        return x_emb, target, cue_pos, {'key_idx': j}
+        return x_emb, target, cue_pos, {'key_idx': j, 'input_ids': x}
     return x_emb, target, cue_pos
 
 
@@ -680,7 +698,7 @@ def make_long_range_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     x_emb = embed(x)
     if return_meta:
         return x_emb, target, cue_pos, {
-            'distance': (cue_pos - p), 'key_pos': p}
+            'distance': (cue_pos - p), 'key_pos': p, 'input_ids': x}
     return x_emb, target, cue_pos
 
 
@@ -745,6 +763,7 @@ def make_multi_agg_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
         return x_emb, target, cue_pos, {
             'counts': counts.tolist(),
             'n_distinct': (counts > 0).sum(dim=1).tolist(),
+            'input_ids': x,
         }
     return x_emb, target, cue_pos
 
@@ -1119,7 +1138,8 @@ class HCAAttn(nn.Module):
 
 
 def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
-                n_batches=4, batch=64, seed=42, task='mqar'):
+                n_batches=4, batch=64, seed=42, task='mqar',
+                gen_offset=5_000_000):
     """Evaluate accuracy over multiple fresh batches for a stable estimate.
 
     ``task`` selects the synthetic-task generator from ``SYNTHETIC_TASKS``
@@ -1143,6 +1163,14 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
     offset keeps the eval stream clear of every seed's ``+ 1_000_000``
     training stream (mirrors ``run_ablation.py::_eval_model``).
 
+    ``gen_offset`` selects which seed offset defines this eval stream. The
+    default (5_000_000) is the headline eval the reported accuracy comes
+    from. The held-out validation-monitoring curve uses
+    ``_VAL_MONITOR_SEED_OFFSET`` (6_000_000) instead, so monitored examples
+    are never the examples the headline metric was computed on, and (with
+    the error-analysis stream at 7_000_000) monitoring cannot leak into the
+    reported result.
+
     Restores each module's train/eval mode after evaluation so a future
     caller that evaluates mid-training does not silently resume training
     in eval mode (no dropout, BN using running stats).
@@ -1160,7 +1188,7 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
         # Fresh eval batches per seed (see the docstring for the statistical
         # rationale): seed+5_000_000 is far from every seed's training stream
         # at seed+1_000_000 and from run_ablation's own eval offset usage.
-        eval_gen = make_seeded_generator(seed + 5_000_000, device=device)
+        eval_gen = make_seeded_generator(seed + gen_offset, device=device)
         make_batch = SYNTHETIC_TASKS[task]['make']
         correct, total = 0, 0
         losses = []
@@ -1233,7 +1261,9 @@ def _build_task_model(op_name, d_model, vocab, device):
 def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
               steps=100, lr=3e-3, seed=42, device='cpu',
               softmax_steps=None, eval_batches=4, eval_batch=64,
-              train_batch=None, task='mqar'):
+              train_batch=None, task='mqar',
+              val_every=0, val_batches=2, val_batch=32,
+              error_batches=0, error_batch=64, max_error_examples=2):
     """Train a single operator on a synthetic task for ``steps`` steps.
 
     ``task`` selects the batch generator from ``SYNTHETIC_TASKS``
@@ -1248,6 +1278,21 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     ``train_batch`` overrides the per-step training batch size (default 32,
     overridable for memory-constrained or GPU runs via the
     ``MQAR_TRAIN_BATCH`` env var).
+
+    Results-analysis hooks (all OFF by default through the zero/None
+    defaults, so direct callers get the historical behaviour bit-for-bit):
+
+      * ``val_every > 0`` records a held-out validation loss/accuracy curve
+        every ``val_every`` steps (plus at step 0), drawn from the dedicated
+        ``_VAL_MONITOR_SEED_OFFSET`` stream — a DIFFERENT stream from the
+        headline eval, so monitoring cannot leak into the reported metric.
+        The train-vs-val curves feed ``diagnose_training_curves``.
+      * ``error_batches > 0`` runs a bad-case analysis on
+        ``error_batches`` x ``error_batch`` held-out samples from the
+        dedicated ``_ERROR_ANALYSIS_SEED_OFFSET`` stream: misclassified
+        samples are printed / stored with their task-level structure
+        (which key was cued, which value was predicted) so the failure
+        mode can be classified rather than guessed.
 
     RNG isolation: the model is initialized with ``torch.manual_seed(seed)``,
     but a SEPARATE per-step generator (also seeded with ``seed``) drives
@@ -1318,6 +1363,25 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # builds.
     batch_gen = make_seeded_generator(seed + 1_000_000, device=device)
 
+    # Held-out validation monitoring (off when val_every <= 0). The monitor
+    # stream is seed + 6_000_000 — distinct from training (+1_000_000) and
+    # from the headline eval (+5_000_000) — so the curve is a genuine
+    # held-out signal and enabling it cannot change any reported metric
+    # (read-only eval, dedicated RNG). See _VAL_MONITOR_SEED_OFFSET.
+    val_every = int(val_every or 0)
+    val_history = []
+
+    def _monitor_validation(step):
+        acc_v, loss_v = _eval_model(
+            layer, head, embed, seq_len, n_kv, vocab, device,
+            n_batches=val_batches, batch=val_batch, seed=seed, task=task,
+            gen_offset=_VAL_MONITOR_SEED_OFFSET)
+        val_history.append({'step': int(step), 'loss': float(loss_v),
+                            'acc': float(acc_v)})
+
+    if val_every > 0:
+        _monitor_validation(0)
+
     losses, accs = [], []
     # Set train mode ONCE before the loop, not per step (calling
     # layer.train()/head.train() inside the loop is a redundant O(steps)
@@ -1344,10 +1408,17 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         # corrupt the aggregate mean/CI. Raise here so the per-seed
         # try/except catches it as a failed seed.
         if not torch.isfinite(loss):
+            # Systematic triage before raising: the report names the first
+            # failing stage (data -> loss -> params -> logits) so the
+            # per-seed failure message is actionable, not just "NaN".
+            _diag = diagnose_nonfinite(
+                loss=loss, inputs={'x_emb': x_emb}, params=params,
+                logits=logits,
+                context=f'{op_name}/task={task}/seed={seed}/step={step}')
             raise RuntimeError(
                 f"non-finite loss at step {step}: {loss.item()} "
-                f"(op={op_name}, seed={seed}); aborting this seed to "
-                f"prevent silent NaN propagation into aggregate stats")
+                f"(op={op_name}, seed={seed}); diagnosis "
+                f"[{_diag['verdict']}]: {_diag['summary']}")
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad()
         loss.backward()
@@ -1369,21 +1440,66 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
             bad_grads = [p for p in params
                          if p.grad is not None and not torch.isfinite(p.grad).all()]
             if bad_grads:
+                _diag = diagnose_nonfinite(
+                    grads=bad_grads,
+                    context=f'{op_name}/task={task}/seed={seed}/step={step}')
                 raise RuntimeError(
                     f"non-finite gradient at step {step} in {len(bad_grads)} "
-                    f"params (op={op_name}, seed={seed}); aborting this seed "
-                    f"to prevent NaN propagation into parameters")
+                    f"params (op={op_name}, seed={seed}); diagnosis "
+                    f"[{_diag['verdict']}]: {_diag['summary']}")
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
         accs.append(acc)
+        if val_every > 0 and (step + 1) % val_every == 0:
+            _monitor_validation(step + 1)
+
+    # Ensure the monitored curve ends at the final trained state (e.g.
+    # steps=25 with val_every=10 would otherwise stop at step 20).
+    if val_every > 0 and (not val_history
+                          or val_history[-1]['step'] != actual_steps):
+        _monitor_validation(actual_steps)
 
     # Final eval on multiple fresh batches for a stable accuracy estimate.
+    # Timed so the results carry an in-experiment inference-cost proxy,
+    # used by the efficiency-vs-accuracy (Pareto) annotation in main().
+    eval_t0 = time.time()
     final_acc, final_loss = _eval_model(
         layer, head, embed, seq_len, n_kv, vocab, device,
         n_batches=eval_batches, batch=eval_batch, seed=seed, task=task,
     )
+    final_eval_time_s = time.time() - eval_t0
     chance = 1.0 / vocab
+
+    # Post-training results analysis, all from streams the training never
+    # saw: the held-out validation curve (monitor stream), its
+    # over/underfitting verdict, and the bad-case analysis (error stream).
+    val_losses = [v['loss'] for v in val_history]
+    curve_diagnosis = diagnose_training_curves(losses, val_losses or None)
+    error_analysis = None
+    if int(error_batches or 0) > 0:
+        error_analysis = analyze_errors(
+            layer, head, embed, op_name=op_name, task=task, seq_len=seq_len,
+            n_kv=n_kv, vocab=vocab, device=device,
+            n_batches=int(error_batches), batch=int(error_batch), seed=seed,
+            max_examples=int(max_error_examples))
+        logger.info(
+            f"  [bad-case] {op_name}/{task} n_kv={n_kv} seed={seed}: "
+            f"{error_analysis['n_wrong']}/{error_analysis['n_samples']} "
+            f"wrong; categories: "
+            f"{ {c: v['count'] for c, v in error_analysis['categories'].items() if v['count']} }")
+
+    analysis_fields = {
+        'val_history': val_history,
+        'curve_diagnosis': curve_diagnosis,
+        'error_analysis': error_analysis,
+        'final_eval_time_s': final_eval_time_s,
+        'final_eval_ms_per_sample': (
+            1000.0 * final_eval_time_s / max(1, int(eval_batches) * int(eval_batch))),
+        'generalization_gap': (
+            val_losses[-1] - sum(losses[-10:]) / min(10, len(losses))
+            if val_losses and losses else None),
+    }
     # Guard against steps=0 (would crash on accs[-1] / sum([])/0 below).
     # Returns a stub with the eval result and zeros for the training
     # trajectory fields. ``actual_steps`` is reported as 0 so downstream
@@ -1406,6 +1522,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
             'lr': lr,
             'loss_curve': [],
             'acc_curve': [],
+            **analysis_fields,
         }
     return {
         'op': op_name,
@@ -1426,6 +1543,314 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         'lr': lr,
         'loss_curve': losses,
         'acc_curve': accs,
+        **analysis_fields,
+    }
+
+
+# Error categories a task-aware bad-case analysis can distinguish. Labels
+# on these synthetic tasks are exact (the generator computes the target),
+# so a wrong prediction cannot be label noise: it is either a mechanism
+# blind spot (e.g. KDA overwriting instead of accumulating), an incorrect
+# association (choosing another key's value), or a positional shortcut
+# (copying the cue / a distractor). Recording WHICH category dominates is
+# the raw material for the next architecture idea.
+_ERROR_CATEGORY_DEFINITIONS = {
+    'mqar': OrderedDict([
+        ('confused_with_other_value',
+         'predicted the value paired with a DIFFERENT key (association '
+         'mix-up between the n_kv pairs; grows with n_kv)'),
+        ('echoed_key',
+         'predicted a key token instead of its value (retrieval stopped at '
+         'the key; positional copy of the cue region)'),
+        ('copied_distractor_token',
+         'predicted a filler token from the noise region (attention/state '
+         'dilution instead of retrieval)'),
+        ('other', 'none of the above'),
+    ]),
+    'kv_update': OrderedDict([
+        ('used_stale_value',
+         'predicted the OLD value for the cued key (delta-rule update failed '
+         'to overwrite; classic interference failure)'),
+        ('confused_with_other_new_value',
+         'predicted another key\'s new value (update happened, association '
+         'mix-up)'),
+        ('echoed_key',
+         'predicted a key token instead of its latest value'),
+        ('other', 'none of the above'),
+    ]),
+    'long_range': OrderedDict([
+        ('echoed_key',
+         'predicted the key itself instead of its value'),
+        ('copied_adjacent_token',
+         'predicted the distractor immediately after the pair (local copy '
+         'instead of long-range retrieval)'),
+        ('other', 'none of the above'),
+    ]),
+    'multi_agg': OrderedDict([
+        ('runner_up_category',
+         'predicted the second-most-frequent category (off-by-one count; '
+         'aggregation is close but not exact)'),
+        ('echoed_last_token',
+         'predicted the final token itself (recency copy rather than '
+         'majority aggregation)'),
+        ('other', 'none of the above'),
+    ]),
+}
+
+
+def _classify_task_errors(task, meta, target, pred, cue_pos, n_kv):
+    """Classify every sample in a batch into a wrong-answer category.
+
+    Returns a list of category names (``'correct'`` for correct rows).
+    Vectorized masks decide the category; the per-sample loop is only over
+    the batch dimension and uses the task's known layout, not heuristics
+    on the raw ids.
+    """
+    ids = meta['input_ids']
+    b = int(ids.shape[0])
+    device = ids.device
+    correct = (pred == target)
+    cat = ['correct'] * b
+    extras = {}
+    if task == 'mqar':
+        keys = ids[:, 0:2 * n_kv:2]
+        vals = ids[:, 1:2 * n_kv:2]
+        is_other_val = (vals == pred[:, None]).any(dim=1)
+        is_key = (keys == pred[:, None]).any(dim=1)
+        noise = ids[:, 2 * n_kv:cue_pos]
+        is_noise = ((noise == pred[:, None]).any(dim=1)
+                    if noise.shape[1] else torch.zeros(
+                        b, dtype=torch.bool, device=device))
+        for i in range(b):
+            if bool(correct[i]):
+                continue
+            if bool(is_other_val[i]):
+                cat[i] = 'confused_with_other_value'
+            elif bool(is_key[i]):
+                cat[i] = 'echoed_key'
+            elif bool(is_noise[i]):
+                cat[i] = 'copied_distractor_token'
+            else:
+                cat[i] = 'other'
+    elif task == 'kv_update':
+        vals_old = ids[:, 1:2 * n_kv:2]
+        keys2 = ids[:, 2 * n_kv:4 * n_kv:2]
+        vals2 = ids[:, 2 * n_kv + 1:4 * n_kv:2]
+        j = meta['key_idx']
+        cue_key = ids[:, cue_pos]
+        old_for_cue = vals_old.gather(1, j[:, None]).squeeze(1)
+        is_stale = (pred == old_for_cue)
+        is_other_new = (vals2 == pred[:, None]).any(dim=1)
+        is_key2 = (keys2 == pred[:, None]).any(dim=1)
+        extras['cue_key'] = cue_key
+        extras['stale_value'] = old_for_cue
+        for i in range(b):
+            if bool(correct[i]):
+                continue
+            if bool(is_stale[i]):
+                cat[i] = 'used_stale_value'
+            elif bool(is_other_new[i]):
+                cat[i] = 'confused_with_other_new_value'
+            elif bool(is_key2[i]):
+                cat[i] = 'echoed_key'
+            else:
+                cat[i] = 'other'
+    elif task == 'long_range':
+        p = meta['key_pos']
+        key = ids.gather(1, p[:, None]).squeeze(1)
+        is_key = (pred == key)
+        adj_pos = torch.clamp(p + 2, max=max(0, cue_pos - 1))
+        adj = ids.gather(1, adj_pos[:, None]).squeeze(1)
+        is_adj = (pred == adj)
+        for i in range(b):
+            if bool(correct[i]):
+                continue
+            if bool(is_key[i]):
+                cat[i] = 'echoed_key'
+            elif bool(is_adj[i]):
+                cat[i] = 'copied_adjacent_token'
+            else:
+                cat[i] = 'other'
+    elif task == 'multi_agg':
+        counts = torch.as_tensor(meta['counts'], device=device)
+        top2 = counts.topk(2, dim=1).values
+        pred_count = counts.gather(1, pred[:, None]).squeeze(1)
+        is_runner_up = (pred_count == top2[:, 1])
+        is_last = (pred == ids[:, -1])
+        extras['counts'] = counts
+        for i in range(b):
+            if bool(correct[i]):
+                continue
+            if bool(is_runner_up[i]):
+                cat[i] = 'runner_up_category'
+            elif bool(is_last[i]):
+                cat[i] = 'echoed_last_token'
+            else:
+                cat[i] = 'other'
+    return cat, extras
+
+
+def _error_example(task, meta, target, pred, i, cue_pos, extras):
+    """Decode one misclassified sample into human-readable task terms."""
+    ids = meta['input_ids']
+    ex = {
+        'input_ids': [int(v) for v in ids[i].tolist()],
+        'target': int(target[i]),
+        'pred': int(pred[i]),
+        'cue_pos': int(cue_pos),
+    }
+    if task in ('mqar', 'kv_update'):
+        ex['key_idx'] = int(meta['key_idx'][i])
+    if task == 'kv_update':
+        ex['cued_key'] = int(extras['cue_key'][i])
+        ex['stale_value'] = int(extras['stale_value'][i])
+    elif task == 'long_range':
+        ex['key_pos'] = int(meta['key_pos'][i])
+        ex['distance'] = int(meta['distance'][i])
+    elif task == 'multi_agg':
+        ex['counts'] = [int(c) for c in meta['counts'][i]]
+        ex['pred_count'] = int(extras['counts'][i, int(pred[i])])
+    return ex
+
+
+def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
+                   n_kv=1, vocab=16, device='cpu', n_batches=2, batch=64,
+                   seed=42, max_examples=2):
+    """Bad-case analysis: classify and print held-out misclassifications.
+
+    Runs the trained model (read-only) on ``n_batches`` x ``batch`` samples
+    from the dedicated ``_ERROR_ANALYSIS_SEED_OFFSET`` stream, classifies
+    every wrong prediction into a task-level category (see
+    ``_ERROR_CATEGORY_DEFINITIONS``), keeps up to ``max_examples`` decoded
+    examples per category, and prints a compact per-category summary with
+    the first example. Synthetic labels are exact, so a wrong answer
+    cannot be label noise: the category distribution localizes the
+    mechanism blind spot (association mix-up, failed update, positional
+    copy, ...) that the aggregate accuracy hides.
+
+    The report is JSON-serializable and records the stream/seed so an
+    example can be regenerated exactly.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    if task not in SYNTHETIC_TASKS:
+        raise ValueError(
+            f"task={task!r} must be one of {sorted(SYNTHETIC_TASKS)}.")
+    make_batch = SYNTHETIC_TASKS[task]['make']
+    gen = make_seeded_generator(seed + _ERROR_ANALYSIS_SEED_OFFSET,
+                                device=device)
+    was_training = {m: m.training for m in (layer, head, embed)}
+    counts: dict = OrderedDict()
+    examples: dict = OrderedDict()
+    n_total = n_wrong = 0
+    dist_correct: dict = {}
+    dist_total: dict = {}
+    try:
+        layer.eval()
+        head.eval()
+        embed.eval()
+        with torch.no_grad():
+            for _ in range(int(n_batches)):
+                x_emb, target, cue_pos, meta = make_batch(
+                    batch, seq_len, n_kv, vocab, embed, device,
+                    generator=gen, return_meta=True)
+                h = layer(x_emb)
+                logits = head(h, cue_pos)
+                pred = logits.argmax(-1)
+                cats, extras = _classify_task_errors(
+                    task, meta, target, pred, cue_pos, n_kv)
+                n_total += int(target.numel())
+                for i, c in enumerate(cats):
+                    if c == 'correct':
+                        continue
+                    n_wrong += 1
+                    counts[c] = counts.get(c, 0) + 1
+                    bucket = examples.setdefault(c, [])
+                    if len(bucket) < int(max_examples):
+                        bucket.append(_error_example(
+                            task, meta, target, pred, i, cue_pos, extras))
+                if task == 'long_range':
+                    ok = (pred == target)
+                    d = meta['distance']
+                    for i in range(int(target.numel())):
+                        di = int(d[i])
+                        dist_total[di] = dist_total.get(di, 0) + 1
+                        dist_correct[di] = dist_correct.get(di, 0) + int(ok[i])
+    finally:
+        for m, was in was_training.items():
+            m.train(was)
+
+    categories = OrderedDict()
+    for name, definition in _ERROR_CATEGORY_DEFINITIONS[task].items():
+        n = counts.get(name, 0)
+        categories[name] = {
+            'count': int(n),
+            'rate_of_wrong': (n / n_wrong) if n_wrong else 0.0,
+            'rate_of_all': (n / n_total) if n_total else 0.0,
+            'definition': definition,
+        }
+    for name in counts:
+        if name not in categories:
+            categories[name] = {
+                'count': int(counts[name]),
+                'rate_of_wrong': counts[name] / n_wrong if n_wrong else 0.0,
+                'rate_of_all': (counts[name] / n_total) if n_total else 0.0,
+                'definition': 'category not covered by the task layout',
+            }
+
+    by_distance = None
+    if dist_total:
+        by_distance = []
+        for lo in sorted(dist_total):
+            by_distance.append({
+                'distance': int(lo),
+                'n': int(dist_total[lo]),
+                'accuracy': (dist_correct[lo] / dist_total[lo]
+                             if dist_total[lo] else None),
+            })
+
+    if n_wrong:
+        top = sorted(categories.items(), key=lambda kv: -kv[1]['count'])
+        summary = ', '.join(f"{c}={v['count']}" for c, v in top if v['count'])
+        logger.info(f"  [bad-case] {op_name}/{task} seed={seed}: "
+                    f"{n_wrong}/{n_total} wrong ({100.0 * n_wrong / max(1, n_total):.1f}%); "
+                    f"{summary}")
+        shown = 0
+        for c, v in top:
+            if not v['count'] or c not in examples or not examples[c]:
+                continue
+            ex = examples[c][0]
+            logger.info(f"  [bad-case] e.g. {c}: target={ex['target']} "
+                        f"pred={ex['pred']} cue_pos={ex['cue_pos']} "
+                        f"meta={ {k: v2 for k, v2 in ex.items() if k not in ('input_ids', 'target', 'pred', 'cue_pos')} }")
+            logger.info(f"  [bad-case]   input_ids={ex['input_ids']}")
+            shown += 1
+            if shown >= 2:
+                break
+    else:
+        logger.info(f"  [bad-case] {op_name}/{task} seed={seed}: no errors "
+                    f"in {n_total} held-out samples")
+
+    return {
+        'op': op_name,
+        'task': task,
+        'n_kv': int(n_kv),
+        'seed': int(seed),
+        'stream': 'held-out error-analysis stream',
+        'generator_seed': int(seed + _ERROR_ANALYSIS_SEED_OFFSET),
+        'n_batches': int(n_batches),
+        'batch': int(batch),
+        'n_samples': int(n_total),
+        'n_wrong': int(n_wrong),
+        'error_rate': (n_wrong / n_total) if n_total else None,
+        'categories': categories,
+        'examples': examples,
+        'accuracy_by_distance_bin': by_distance,
+        'note': ('Errors are inspected on a stream never used for training, '
+                 'validation monitoring, or the headline eval. Synthetic '
+                 'labels are exact, so wrong answers are mechanism blind '
+                 'spots / positional shortcuts, not label noise; use the '
+                 'category mix to pick the next architecture experiment.'),
     }
 
 
@@ -1699,6 +2124,14 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 'lr': kw.get('lr', 3e-3),
                 'loss_curve': [],
                 'acc_curve': [],
+                # Mirror the results-analysis keys so a DataFrame over
+                # per_seed has one schema for success and error rows.
+                'val_history': [],
+                'curve_diagnosis': None,
+                'error_analysis': None,
+                'final_eval_time_s': None,
+                'final_eval_ms_per_sample': None,
+                'generalization_gap': None,
             })
         # On GPU, clear the CUDA cache between seeds so the allocator does
         # not accumulate freed-but-unreleased blocks across seeds.
@@ -1762,6 +2195,54 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     else:
         t_stat = None
 
+    # Curve-diagnosis verdict tally over the surviving seeds: the experiment
+    # record says HOW MANY seeds showed overfitting / underfitting, instead
+    # of leaving the reader to infer it from the per-seed curves.
+    verdicts: dict = OrderedDict()
+    for r in ok_per_seed:
+        v = (r.get('curve_diagnosis') or {}).get('verdict', 'unknown')
+        verdicts[v] = verdicts.get(v, 0) + 1
+
+    # Pooled bad-case analysis across seeds: counts add up over every
+    # analyzed sample, while the EXAMPLES come from the worst seed (lowest
+    # final accuracy) so the artifact shows the most informative failures
+    # rather than a lucky seed's.
+    error_aggregate = None
+    ea_seeds = [r for r in ok_per_seed if r.get('error_analysis')]
+    if ea_seeds:
+        pooled: dict = OrderedDict()
+        n_samples = n_wrong = 0
+        for r in ea_seeds:
+            ea = r['error_analysis']
+            n_samples += ea['n_samples']
+            n_wrong += ea['n_wrong']
+            for c, v in ea['categories'].items():
+                acc = pooled.setdefault(
+                    c, {'count': 0, 'definition': v.get('definition')})
+                acc['count'] += int(v['count'])
+        for v in pooled.values():
+            v['rate_of_wrong'] = v['count'] / n_wrong if n_wrong else 0.0
+            v['rate_of_all'] = v['count'] / n_samples if n_samples else 0.0
+        worst = min(ea_seeds, key=lambda r: r['final_acc'])
+        error_aggregate = {
+            'n_seeds': len(ea_seeds),
+            'n_samples': n_samples,
+            'n_wrong': n_wrong,
+            'error_rate': (n_wrong / n_samples) if n_samples else None,
+            'pooled_categories': pooled,
+            'representative_seed': worst['seed'],
+            'representative_examples': worst['error_analysis']['examples'],
+            'accuracy_by_distance_bin': worst['error_analysis'].get(
+                'accuracy_by_distance_bin'),
+            'note': ('Pooled over seeds; examples come from the worst seed '
+                     '(lowest final accuracy) so the artifact shows the '
+                     'most informative failures. See the per-seed '
+                     'error_analysis for each seed.'),
+        }
+
+    gaps = [r['generalization_gap'] for r in ok_per_seed
+            if r.get('generalization_gap') is not None]
+
     return {
         'op': op_name,
         'task': ok_per_seed[0].get('task', 'mqar'),
@@ -1788,6 +2269,15 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         't_stat_vs_chance': t_stat,
         'mean_train_time_s': sum(r.get('train_time_s', 0.0)
                                  for r in ok_per_seed) / n,
+        'mean_eval_ms_per_sample': sum(
+            r.get('final_eval_ms_per_sample', 0.0)
+            for r in ok_per_seed) / n,
+        'curve_diagnosis_summary': {
+            'verdicts': dict(verdicts),
+            'n_seeds_summarized': len(ok_per_seed),
+        },
+        'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        'error_analysis': error_aggregate,
     }
 
 
@@ -1906,8 +2396,26 @@ def main():
     # advantaged in the default result table.
     softmax_steps = parse_int_env('MQAR_SOFTMAX_STEPS', steps, min_value=1,
                                   logger=logger)
+    # Results-analysis controls (monitoring + bad cases). Defaults are
+    # cheap enough for every run: 5 held-out validation points and 2
+    # held-out analysis batches per seed, both on dedicated RNG streams.
+    # Set MQAR_VAL_EVERY=0 / MQAR_ERROR_BATCHES=0 to disable.
+    val_every = parse_int_env('MQAR_VAL_EVERY', max(1, steps // 4),
+                              min_value=0, logger=logger)
+    val_batches = parse_int_env('MQAR_VAL_BATCHES', 2, min_value=1,
+                                logger=logger)
+    val_batch = parse_int_env('MQAR_VAL_BATCH', 32, min_value=1,
+                              logger=logger)
+    error_batches = parse_int_env('MQAR_ERROR_BATCHES', 2, min_value=0,
+                                  logger=logger)
+    error_batch = parse_int_env('MQAR_ERROR_BATCH', 64, min_value=1,
+                                logger=logger)
     logger.info(f'  n_seeds       : {n_seeds}')
     logger.info(f'  steps         : {steps}  (softmax: {softmax_steps})')
+    logger.info(f'  val monitor   : every {val_every} steps '
+                f'({val_batches}x{val_batch}; stream +{_VAL_MONITOR_SEED_OFFSET})')
+    logger.info(f'  bad-case      : {error_batches}x{error_batch} held-out '
+                f'samples per seed (stream +{_ERROR_ANALYSIS_SEED_OFFSET})')
     logger.info(f"  mamba_backend : {os.environ.get('MAMBA_BACKEND', 'reference')}")
     logger.info(f"  rwkv_backend  : {os.environ.get('RWKV_BACKEND', 'reference')}")
     logger.info(f"  rwkv7_binding : {RWKV7_UPSTREAM_BINDING['parameterization_init']['repo']}"
@@ -2091,7 +2599,12 @@ def main():
                 r = train_multi_seed(op, n_seeds=n_seeds, steps=steps,
                                      softmax_steps=softmax_steps, device=device,
                                      n_kv=n_kv, vocab=task_vocab,
-                                     seq_len=task_seq_len, task=task)
+                                     seq_len=task_seq_len, task=task,
+                                     val_every=val_every,
+                                     val_batches=val_batches,
+                                     val_batch=val_batch,
+                                     error_batches=error_batches,
+                                     error_batch=error_batch)
                 all_results.append(r)
                 # ci95_acc may be None when only one seed survived (see
                 # train_multi_seed). Render as 'n/a' instead of crashing on
@@ -2099,6 +2612,17 @@ def main():
                 ci_str = f"{r['ci95_acc']:.4f}" if r['ci95_acc'] is not None else 'n/a'
                 logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {ci_str} "
                             f"(std={r['std_acc']:.4f}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
+                # Curve verdicts: over/underfitting is a property of the
+                # training CURVE, reported per op so a good mean accuracy
+                # from an overfit best-epoch cannot go unnoticed.
+                cd = r.get('curve_diagnosis_summary') or {}
+                ea = r.get('error_analysis')
+                logger.info(
+                    f"  -> curves: {cd.get('verdicts', {})}; "
+                    f"bad-case error rate: "
+                    f"{(ea or {}).get('error_rate') if ea else 'n/a'}"
+                    + (f" ({ {c: v['count'] for c, v in (ea or {}).get('pooled_categories', {}).items() if v['count']} })"
+                       if ea else ''))
             except Exception as e:
                 import traceback as _tb
                 logger.error(f"  op '{op}' FAILED: {e}")
@@ -2128,6 +2652,11 @@ def main():
                     'chance_acc': 1.0 / task_vocab,
                     't_stat_vs_chance': None,
                     'mean_train_time_s': None,
+                    'mean_eval_ms_per_sample': None,
+                    'curve_diagnosis_summary': None,
+                    'mean_generalization_gap': None,
+                    'error_analysis': None,
+                    'pareto': None,
                     'per_seed': [],
                 })
 
@@ -2284,6 +2813,95 @@ def main():
         r['conclusions_valid'] = conclusions_valid
         r['n_seeds_requested'] = n_seeds
 
+    # ------------------------------------------------------------------
+    # Efficiency-vs-accuracy annotation (per task/n_kv group).
+    #
+    # "Report the gain WITH its cost": for every sweep cell, mark each op
+    # as Pareto-optimal or dominated on (mean_acc maximise; parameters and
+    # wall-clock train time minimise). A 0.5% accuracy gain at 10x cost is
+    # now visible in the record instead of requiring a cross-reference to
+    # the latency/cache experiments.
+    #
+    # The cross-op claim check answers "is the winner actually better?":
+    # when the best op's 95% CI overlaps another op's CI, the ranking
+    # between them is not statistically supported at this seed count, and
+    # the record says so explicitly (microscopic, non-significant gains
+    # must not be over-claimed).
+    # ------------------------------------------------------------------
+    groups: dict = OrderedDict()
+    for r in all_results:
+        groups.setdefault((r.get('task', 'mqar'), r['n_kv']), []).append(r)
+
+    pareto_reports = {}
+    cross_op_checks = {}
+    for (task_name, n_kv_key), rows in groups.items():
+        live = [r for r in rows if 'error' not in r
+                and r.get('mean_acc') is not None
+                and r.get('mean_train_time_s') is not None
+                and r.get('n_params') is not None]
+        if live:
+            rep = annotate_rows_with_pareto(
+                live, accuracy_key='mean_acc',
+                cost_keys=('mean_train_time_s', 'n_params'),
+                name_key='op')
+            pareto_reports[f'{task_name}/n_kv={n_kv_key}'] = {
+                'frontier': rep['frontier'],
+                'dominated_by': rep['dominated_by'],
+                'cost_keys': rep['cost_keys'],
+                'points': {
+                    op: {'accuracy': p['accuracy'], **p['costs'],
+                         'acc_per_train_second': p['acc_per_train_second'],
+                         'acc_per_1k_params': p['acc_per_1k_params'],
+                         'acc_per_eval_ms': p.get('acc_per_eval_ms')}
+                    for op, p in rep['points'].items()
+                },
+                'skipped': rep['skipped'],
+            }
+            best = max(live, key=lambda r: r['mean_acc'])
+            overlaps = []
+            for r in live:
+                if r is best:
+                    r['ci95_overlaps_best'] = False
+                    continue
+                ci_b, ci_r = best.get('ci95_acc'), r.get('ci95_acc')
+                if ci_b is None or ci_r is None:
+                    r['ci95_overlaps_best'] = None
+                    continue
+                overlap = abs(best['mean_acc'] - r['mean_acc']) <= (ci_b + ci_r)
+                r['ci95_overlaps_best'] = bool(overlap)
+                if overlap:
+                    overlaps.append(r['op'])
+            best['ci95_overlaps_best'] = False
+            cross_op_checks[f'{task_name}/n_kv={n_kv_key}'] = {
+                'best_op': best['op'],
+                'best_mean_acc': best['mean_acc'],
+                'best_ci95_acc': best.get('ci95_acc'),
+                'ops_with_overlapping_ci95': overlaps,
+                'claim': (
+                    f"{best['op']} has the highest mean accuracy, but its "
+                    f"95% CI overlaps {overlaps}; the ranking against those "
+                    f"ops is not statistically supported at this seed count. "
+                    f"Increase seeds/steps before claiming a win."
+                    if overlaps else
+                    f"{best['op']} leads with a 95% CI disjoint from every "
+                    f"other op: the ranking is supported at this seed count."),
+            }
+            if overlaps:
+                logger.warning(
+                    f'  [cost/claim] {task_name}/n_kv={n_kv_key}: best='
+                    f"{best['op']} (acc={best['mean_acc']:.4f}) but its CI95 "
+                    f"overlaps {overlaps} — treat the ranking as inconclusive.")
+            dominated = rep['dominated_by']
+            if dominated:
+                logger.info(
+                    f'  [cost/claim] {task_name}/n_kv={n_kv_key}: Pareto '
+                    f'dominated: '
+                    + ', '.join(f'{a}<-{b}' for a, b in dominated.items()))
+            else:
+                logger.info(
+                    f'  [cost/claim] {task_name}/n_kv={n_kv_key}: all live '
+                    f'ops on the accuracy/cost Pareto frontier')
+
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped
     # past the NaN guard and the per_seed filter, Python's default
@@ -2352,12 +2970,34 @@ def main():
                 'seed_offsets': {
                     'train': 1_000_000,
                     'eval': 5_000_000,
+                    'val_monitor': _VAL_MONITOR_SEED_OFFSET,
+                    'error_analysis': _ERROR_ANALYSIS_SEED_OFFSET,
                     'overfit_gate': _OVERFIT_BATCH_SEED_OFFSET,
                 },
                 'note': ('Synthetic batches are a deterministic function of '
                          '(task generator, task spec, seed + offset); no '
                          'external dataset version applies. Code revision in '
                          'provenance pins the generator implementation.'),
+            },
+            # Train/validation/test separation, spelled out because the
+            # monitoring and bad-case analysis must not contaminate the
+            # reported metric:
+            #   train (+1M)          -> fits the model
+            #   val monitor (+6M)    -> held-out curve for the over/underfit
+            #                           diagnosis and error analysis; read-only
+            #   headline eval (+5M)  -> the reported final_acc/final_loss
+            #   bad cases (+7M)      -> error categorization examples
+            'monitoring': {
+                'val_every': val_every,
+                'val_batches': val_batches,
+                'val_batch': val_batch,
+                'error_batches': error_batches,
+                'error_batch': error_batch,
+                'note': ('The validation-monitoring and error-analysis '
+                         'streams are disjoint from both the training and '
+                         'the headline-eval streams, and all passes are '
+                         'read-only with dedicated generators: enabling '
+                         'monitoring cannot change any reported metric.'),
             },
             # Overfit sanity gate verdicts (compact; full curves with the
             # per-step history live in results/exp4_overfit_gate.json).
@@ -2385,10 +3025,28 @@ def main():
                 'batch_gen_seed_offset': 1_000_000,
                 'eval_gen_seed_offset': 5_000_000,
             },
+            # Efficiency-vs-accuracy: per sweep cell, which ops are Pareto
+            # optimal / dominated on (accuracy, params, train time), plus
+            # the cost-normalized accuracies. Wall-clock timing is a
+            # same-run proxy (shared CI hardware), not a kernel benchmark:
+            # the dedicated latency experiment (Exp 2/6) remains the
+            # authority for latency claims.
+            'efficiency_accuracy': {
+                'pareto': pareto_reports,
+                'cost_note': ('cost axes are within-run wall-clock train '
+                              'time and parameter count; timing is noisy '
+                              'on shared hardware and is a screening proxy, '
+                              'not a latency benchmark (use Exp 2/6 for '
+                              'latency claims).'),
+                'accessor': ('per-row `pareto` = {optimal, dominated_by, '
+                             'acc_per_train_second, acc_per_1k_params, '
+                             'acc_per_eval_ms}'),
+            },
+            'cross_op_claim_check': cross_op_checks,
+            'significance_scope': 'vs_chance_baseline_not_pairwise_between_ops',
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,
-            'significance_scope': 'vs_chance_baseline_not_pairwise_between_ops',
             'csa_caveat': (
                 "CSA's lightning indexer is trained via a straight-through "
                 "estimator (STE): the forward pass uses hard top-k indices "
