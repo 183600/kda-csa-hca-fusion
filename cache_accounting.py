@@ -879,12 +879,12 @@ def _print_audit_summary(report: dict) -> None:
             print(f"  [MISMATCH] {name}: live={rec['live_allocated']} vs "
                   f"analytic={rec['analytic_allocated']}")
     for op, tot in comp['per_operator'].items():
-        if tot.get('live_per_layer') is None:
-            print(f"  [{op}] absent from layout")
-        elif op == 'hybrid_kch':
+        if op == 'hybrid_kch':
             print(f"  [{op}] live={tot['live_layout']:.0f} "
                   f"committed={tot['committed_full_accounting_per_layer']:.0f} "
                   f"match={tot['match']}")
+        elif tot.get('live_per_layer') is None:
+            print(f"  [{op}] absent from layout")
         else:
             print(f"  [{op}] live/layer={tot['live_per_layer']:.0f} "
                   f"committed/layer="
