@@ -1,17 +1,15 @@
 """
-LM Training for KDA+CSA+HCA Hybrid using the repo's ops_fused (superior)
-Supports Kaggle and AutoDL with cost <120 CNY
+LM training for the KDA+CSA+HCA hybrid, built on ``ops_fused``.
 
-This file is merged from the earlier toy training demo (/home/user/train.py)
-but now uses the rigorous HybridKCHAttention from ops_fused.py which already
+The model uses ``HybridKCHAttention`` from ``ops_fused.py``, which already
 implements:
 - KDA with proper unit-norm q/k, g clamp, chunked path, conv lookback
 - CSA with overlapped 2-branch compression, STE for indexer, sink logits
 - HCA with heavy compression + dense + sliding window
 - Decoding caches (ops_decoding_cache) for efficient long-context
 
-Cost control: default 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024
-3090/4090 cost remains well below 120 CNY for the default small run
+Defaults: 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024 — sized for a
+small single-GPU run.
 """
 import os, time, argparse, random
 import torch
@@ -343,9 +341,6 @@ def main():
     pbar.close()
     elapsed = time.time() - start
     print(f"Finished in {elapsed/60:.2f} min")
-    cost_3090 = elapsed/3600*1.8
-    cost_4090 = elapsed/3600*2.8
-    print(f"Cost estimate 3090: {cost_3090:.2f} CNY, 4090: {cost_4090:.2f} CNY << 120 CNY")
     torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
                 "optimizer_step": optimizer_step, "micro_step": micro_step,
                 "seed": args.seed},

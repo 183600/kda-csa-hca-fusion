@@ -1,11 +1,7 @@
 """Experiment 6 — autoregressive decoding latency benchmark.
 
-The original paper only reported *prefill* latency on CPU. A reviewer flagged
-that decoding latency (token-by-token generation) is the more relevant number
-for long-context inference, and that CPU single-thread numbers cannot be
-extrapolated to real serving hardware.
-
-This benchmark addresses both points within the Kaggle-feasible envelope:
+This benchmark measures token-by-token decoding latency (the number that
+matters for long-context inference) in addition to prefill:
 
   * **Decoding latency.** For each operator we run a fixed-length prefill
     (build the full context once) and then decode ``n_new`` tokens one at a
@@ -18,7 +14,7 @@ This benchmark addresses both points within the Kaggle-feasible envelope:
   * **Honest scope.** We only measure the attention operator itself (not a
     full LM), on a Kaggle T4. We do not claim these numbers extrapolate to
     H100/H20; they are a *relative* comparison of the operators' decoding
-    cost growth, which is exactly what the reviewer asked for.
+    cost growth.
 
 Note: KDA's ``naive_recurrent_kda`` is a Python loop, so its wall-clock on
 CPU is dominated by Python overhead. On GPU the per-step kernel launch
@@ -1061,7 +1057,7 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # CPU: tracemalloc doesn't capture torch tensors (native memory), and
         # RSS-based approximations are unreliable across platforms. Report
         # None so JSON serializes to null (clearly "no data") rather than 0.0
-        # (which would look like a real measured value and mislead reviewers).
+        # (indistinguishable from a real measured value).
         peak_mb = None
 
     return {

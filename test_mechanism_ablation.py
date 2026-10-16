@@ -1,9 +1,7 @@
 """Regression tests for ``run_mechanism_ablation.py`` (Exp 8).
 
-The canonical suites (``run_correctness.py`` / ``test_figures.py``) are
-design-pinned and must not be modified; like ``test_roofline_schema.py``,
-Exp 8 carries its own test module. The tests never touch the real
-``results/`` directory: the end-to-end smoke writes to a per-test temp path.
+The tests never touch the real ``results/`` directory: the end-to-end smoke
+writes to a per-test temp path.
 
 Run via pytest::
 

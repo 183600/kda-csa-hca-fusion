@@ -1,7 +1,6 @@
 """Method analysis module.
 
-This module provides the theoretical backing that the reviewer flagged as
-missing from the original paper:
+This module provides the theoretical backing for the method choices:
 
   1. **3:1:1 ratio rationale.** A capacity/recall/global-context budget
      argument for why 3 KDA : 1 CSA : 1 HCA is a principled default, not just

@@ -10,18 +10,15 @@ the ablation's own defaults for training budget (``ABL_STEPS``/``ABL_SEEDS``/
   * more CSA layers   -> better sparse recall, but slower (top-k selection)
   * more HCA layers   -> cheapest global context, but coarser compression
 
-Kaggle / review-driven additions (address reviewer concerns):
+Methodology:
 
   * **Multi-seed runs.** Each ratio is trained over ``n_seeds`` seeds with
-    mean +/- CI95 reported. The original paper's single-seed table had
-    3:1:1=0.078 vs chance=0.0625 — within noise. Multi-seed makes the
-    comparison statistically meaningful (or honestly shows it is not).
-  * **More training steps.** The original 25 steps was too short for reliable
-    convergence. We use 100+ steps and report convergence curves.
-  * **Controlled depth.** Every ratio now contains exactly five layers, so
-    ratio effects are no longer confounded with 3/4/5/6-layer model depth.
-    ``n_params`` is still reported because operator types have different
-    parameter counts.
+    mean +/- CI95 reported, so the comparison is statistically meaningful.
+  * **Training steps.** 100+ steps with convergence curves (a single-seed,
+    25-step setting is too short for reliable convergence).
+  * **Controlled depth.** Every ratio contains exactly five layers, so
+    ratio effects are not confounded with model depth. ``n_params`` is
+    still reported because operator types have different parameter counts.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available.
 """
 
@@ -96,12 +93,9 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
         losses = []
         # Use a distinct, far-separated offset (5_000_000) for the eval RNG so
         # it never collides with the *next* seed's training stream
-        # (``seed + 1_000_000``). With the old ``seed + 1_000_001`` offset,
-        # seed s's eval batches were the EXACT stream seed s+1 trained on
-        # (e.g. seed 42 eval = seed 43 train = 1_000_043), correlating
-        # successive seeds and making the multi-seed t-test's independence
-        # assumption invalid / the eval set not fresh. This mirrors the
-        # documented RNG-isolation fix in ``run_quality.py``.
+        # (``seed + 1_000_000``), keeping the eval batches fresh and the
+        # seeds independent for the multi-seed t-test. This mirrors the
+        # RNG isolation in ``run_quality.py``.
         eval_gen = make_seeded_generator(seed + 5_000_000, device=device)
         with torch.no_grad():
             for _ in range(n_batches):

@@ -1,10 +1,7 @@
 """Regression tests for ``results_schema.py`` and ``roofline.py`` (Exp 7).
 
-These modules are new in this round, so they live in their own test module
-(the canonical suites ``run_correctness.py`` / ``test_figures.py`` are
-design-pinned and must not be modified). The tests are self-contained and
-never touch the real ``results/`` directory: roundtrip tests write to a
-per-test temp directory.
+The tests are self-contained and never touch the real ``results/``
+directory: roundtrip tests write to a per-test temp directory.
 
 Run via pytest::
 

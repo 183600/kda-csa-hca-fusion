@@ -1,9 +1,7 @@
-"""Experiment 3 — KV cache and FLOPs analysis (improved accounting).
+"""Experiment 3 — KV cache and FLOPs analysis.
 
-This is a rewritten, more rigorous version of the original KV-cache analysis.
-It addresses the reviewer concern that the original accounting only counted
-the *compressed* KV and ignored several auxiliary caches that a real
-inference engine must retain:
+The accounting covers every cache a real inference engine must retain, not
+only the compressed KV entries:
 
   * the sliding-window KV (uncompressed, per-layer);
   * the lightning-indexer key cache (for CSA);

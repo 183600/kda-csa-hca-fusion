@@ -261,8 +261,8 @@ def test_compiled_recurrent_kda_fast_parity(device):
     """Fast ``torch.compile`` (fullgraph) parity smoke test.
 
     The longer compile regression test in ``run_correctness.py`` is marked
-    ``slow`` and therefore skipped by the CI gate's ``-m "not slow"`` loop.
-    This tiny-shape check keeps the dynamo tracing contract exercised in any
+    ``slow`` and therefore skipped in the default fast test run. This
+    tiny-shape check keeps the dynamo tracing contract exercised in any
     fast run of this file.
     """
     q, k, v, g, beta = _make_case(41, 1, 8, 1, 4, 4, device=device)

@@ -11,19 +11,16 @@ We train a tiny single-layer classifier on top of each attention operator for
 a fixed number of steps and report final accuracy. Absolute accuracy is not
 meaningful at this scale, but the *relative ranking* across operators is.
 
-Kaggle / review-driven additions (address reviewer concerns):
+Methodology:
 
   * **Multi-seed runs with confidence intervals.** Every operator is trained
     over ``n_seeds`` (default 5) seeds; we report mean +/- std and a
-    one-sample t-test vs the chance baseline. This addresses the concern
-    that the original single-seed numbers were within random noise of
-    chance.
+    one-sample t-test vs the chance baseline.
   * **Softmax baseline convergence.** The softmax-attention baseline is given
-    more steps (``softmax_steps``) so it actually converges — the original
-    paper's softmax only reached 10.2% (barely above 6.25% chance), making the
-    comparison meaningless. A converged softmax is the *right* upper bound.
+    more steps (``softmax_steps``) so it actually converges; a converged
+    softmax is the right upper bound.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available, falling back
-    to CPU. The T4 makes the CSA per-token Python loop bearable.
+    to CPU.
   * **Controlled evaluation.** A larger final eval batch (256) and multiple
     eval batches for a more stable accuracy estimate.
 """
@@ -189,9 +186,8 @@ def _t_crit_975(n):
             _T_PP = False
     if _T_PP:
         return _T_PP(0.975, n - 1)
-    # Hardcoded two-sided 95% critical values, n = 2..100 (df = 1..99).
-    # Extended from the previous n=2..30 table to cover the common
-    # multi-seed CI range up to n=100 without falling back to the
+    # Hardcoded two-sided 95% critical values, n = 2..100 (df = 1..99),
+    # covering the common multi-seed CI range without falling back to the
     # normal approximation (which has ~4% relative error at n=31..100).
     # Values are scipy.stats.t.ppf(0.975, df) rounded to 3 decimals.
     _TABLE = {
@@ -481,7 +477,7 @@ def make_mqar_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     # mismatched shapes ([batch, vocab//2] vs the expected [batch, n_kv]).
     # If 2*n_kv >= seq_len, the cue at position seq_len-1 would overwrite a
     # KV pair (or fall inside the KV region), making the task trivially
-    # solvable or unsolvable. Both used to fail silently.
+    # solvable or unsolvable.
     if 2 * n_kv > vocab:
         raise ValueError(
             f"2*n_kv={2*n_kv} must be <= vocab={vocab} (need 2*n_kv distinct ids)")
@@ -1042,12 +1038,8 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     seeds = [42 + i for i in range(n_seeds)]
     # Compute the actual training-step count for THIS op once, mirroring
     # ``train_one``'s ``actual_steps = softmax_steps if op_name == 'softmax'
-    # else steps`` logic. Used in the per-seed error stub below so the
-    # recorded ``steps`` field matches what a SUCCESS row would have
-    # recorded (the previous stub used ``steps`` unconditionally, which
-    # is wrong for the softmax op when ``softmax_steps != steps`` —
-    # silently mislabelling the figure title and any downstream
-    # ``pd.DataFrame(per_seed)['steps']`` analysis).
+    # else steps`` logic, so the recorded ``steps`` field in the per-seed
+    # error stub matches what a SUCCESS row would have recorded.
     actual_steps_for_op = softmax_steps if op_name == 'softmax' else steps
     stub_train_batch = kw.get('train_batch')
     if stub_train_batch is None:
@@ -1217,9 +1209,7 @@ def main():
     logger.info(f'  device        : {device}')
     # These are the task hyperparameters. Lifted to named constants so the
     # chance-accuracy log line below uses the SAME value as the per-seed
-    # ``chance = 1.0 / vocab`` computation in ``train_one`` (the previous
-    # code hardcoded 1/16 in three print/log lines, which would have silently
-    # lied if vocab were ever changed).
+    # ``chance = 1.0 / vocab`` computation in ``train_one``.
     vocab = 16
     seq_len = 16
     chance = 1.0 / vocab

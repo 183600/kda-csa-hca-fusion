@@ -409,17 +409,14 @@ def run_all(seeds=None, steps=None):
         # 1. Correctness — always run (fast, ~seconds).
         summary['runs'].append(_run('exp1_correctness', run_correctness.main))
 
-        # 1b. Schema/roofline unit tests — the canonical suites are
-        #     design-pinned, so the new results_schema / roofline modules
-        #     carry their own test module; run it here so the full pipeline
-        #     covers it even though ci_gate's fast pytest layer only names
-        #     run_correctness.py + test_figures.py.
+        # 1b. Schema/roofline unit tests — the results_schema / roofline
+        #     modules carry their own test module; run it here so the full
+        #     pipeline covers it.
         summary['runs'].append(
             _run('test_roofline_schema', test_roofline_schema.main))
 
         # 1c. Mechanism-ablation unit tests — Exp 8's diagnostic and
-        #     paired-statistics helpers carry their own test module (same
-        #     rationale as 1b: the canonical suites are pinned).
+        #     paired-statistics helpers carry their own test module.
         summary['runs'].append(
             _run('test_mechanism_ablation', test_mechanism_ablation.main))
 

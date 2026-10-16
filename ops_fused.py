@@ -87,10 +87,10 @@ class HybridConfig:
     # reference backend is selected; mutually exclusive with
     # ``kda_recompute_attn``.
     kda_assoc_scan: bool = False
-    # KDA implementation backend. The default keeps the historical reference
-    # path so existing quality/ablation results do not change. ``fla`` is an
-    # optional flash-linear-attention backend; ``auto`` selects it only for
-    # CUDA tensors when it is installed and otherwise falls back to reference.
+    # KDA implementation backend. The default is the reference path; ``fla``
+    # selects the optional flash-linear-attention backend; ``auto`` selects it
+    # only for CUDA tensors when it is installed and otherwise falls back to
+    # the reference path.
     kda_backend: str = "reference"
     # CSA config
     csa_m: int = 16             # compression factor
@@ -119,11 +119,10 @@ class HybridConfig:
     hca_rope_dim: int | None = 64
     rope_base: float = 10000.0
     # Query/KV normalization form for the CSA/HCA core attention:
-    # 'l2'  — historical cosine attention (unit-norm vectors, scale 1.0);
+    # 'l2'  — cosine attention (unit-norm vectors, scale 1.0);
     # 'rms' — the paper §2.3.3 RMSNorm form (norm ~sqrt(D) vectors, standard
     #         1/sqrt(D) temperature). The paper does not pin the core
-    #         temperature, so both are paper-compatible; 'l2' keeps the
-    #         repository's historical numbers reproducible.
+    #         temperature, so both are paper-compatible.
     csa_qk_norm_mode: str = 'l2'
     hca_qk_norm_mode: str = 'l2'
     # Hybrid layout

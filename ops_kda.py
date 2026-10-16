@@ -178,36 +178,16 @@ def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
     ``q`` is ``[B, T, HV, K]`` (already scaled), ``v`` is ``[B, T, HV, V]``,
     and the three factor tensors are ``[B, HV, T, K, 1]`` so that ``unbind``
     yields the exact ``[B, HV, K, 1]`` broadcast shape the loop consumes.
-    The layout pre-arrangement and the per-step output stack in place of the
-    historical strided buffer writes are value-preserving; the
-    ``addcmul``-based state update differs from the historical
-    ``S + beta * delta`` form only in fp association (round-off level).
     """
-    # The per-step outputs are accumulated in a list and stacked once at the
-    # end instead of being written into a pre-allocated ``[B, T, HV, V]``
-    # buffer with ``o[:, i] = ...``. Both forms produce the same tensor (the
-    # stack writes the same values into a fresh contiguous buffer), but the
-    # stack replaces T per-step strided-copy kernel launches with a single
-    # kernel — the per-step copy was pure launch overhead at head sizes 32/16.
     outs = []
     for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
             q.unbind(1), k_col.unbind(2), v.unbind(1),
             g_exp_col.unbind(2), beta_k_col.unbind(2))):
         S = S * g_exp_i
         delta = v_i - (k_i * S).sum(-2)
-        # ``b_i * k_i`` is the same product precomputed by the caller. The
-        # outer product via broadcasting matches the historical
-        # ``einsum('b h k, b h v -> b h k v')`` form (no reduction involved);
-        # ``addcmul`` computes the same ``S + b_i ⊗ delta`` update in one
-        # kernel instead of two (the broadcast multiply + add), at the cost
-        # of a possibly-fused rounding of the product into the add (fp32
-        # diffs ~1e-9 over a 2048-step recurrence, far inside the 1e-6
-        # chunk-vs-recurrent tolerance).
+        # ``beta_k_i`` is ``beta_i * k_i`` (precomputed by the caller); the
+        # update is the delta-rule ``S + beta_i ⊗ delta`` in fp association.
         S = torch.addcmul(S, beta_k_i, delta[..., None, :])
-        # ``q_i @ S`` (batch matmul) is bit-identical to the historical
-        # ``einsum('b h k, b h k v -> b h v')`` — both lower to the same
-        # per-head bmm — while skipping the einsum dispatcher, which
-        # dominated the per-step cost at small head dims.
         outs.append((q_i.unsqueeze(-2) @ S).squeeze(-2))
     return torch.stack(outs, 1), S
 
@@ -219,12 +199,9 @@ _RECURRENT_LOOP_SCRIPTED_FAILED = False
 def _get_scripted_recurrent_loop():
     """Lazily ``torch.jit.script`` the loop body, with eager fallback.
 
-    TorchScript removes the Python interpreter from the per-step dispatch
-    path of the sequential loop (the same technique used by
-    :func:`scripted_chunk_kda`). The scripted function executes the exact
-    same aten ops in the same order as :func:`_recurrent_kda_loop_eager`
-    (verified bit-identical), so this is a pure orchestration change. If
-    scripting fails on the installed torch build, the eager loop is used.
+    The scripted function executes the same operations as
+    :func:`_recurrent_kda_loop_eager`. If scripting fails on the installed
+    torch build, the eager loop is used.
     """
     global _RECURRENT_LOOP_SCRIPTED, _RECURRENT_LOOP_SCRIPTED_FAILED
     if _RECURRENT_LOOP_SCRIPTED is None and not _RECURRENT_LOOP_SCRIPTED_FAILED:
@@ -276,10 +253,8 @@ def naive_recurrent_kda(
     .. note::
 
         This is a **Python-loop reference implementation**. The loop body is
-        run through ``torch.jit.script`` when available (falling back to the
-        identical eager loop otherwise) purely to remove Python interpreter
-        overhead from the per-step dispatch; the executed ops and their order
-        are unchanged, so results are bit-identical either way.
+        run through ``torch.jit.script`` when available, with an eager
+        fallback that computes the same result.
     """
     dtype = v.dtype
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
@@ -324,17 +299,8 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
-    # Hoist the per-step elementwise factors out of the sequential loop:
-    # ``exp(g_t)`` and ``beta_t * k_t`` depend only on the inputs, so computing
-    # them once for the whole sequence removes T exp/mul kernel launches from
-    # the hot loop. The products are the same elementwise operations on the
-    # same values as the previous per-step form, hence bit-identical.
-    #
-    # The three loop-only factors are additionally moved to a ``[B, H, T, K, 1]``
-    # layout (one ``movedim`` copy each) so that ``unbind(2)`` yields the exact
-    # broadcast shape ``[B, H, K, 1]`` the loop consumes, removing the per-step
-    # ``x[:, i]`` select + ``unsqueeze`` pairs. Rearranging is value-preserving,
-    # so every product below is bit-identical to the ``[B, T, H, K]`` layout.
+    # Per-step factors hoisted out of the loop and laid out so ``unbind(2)``
+    # yields the ``[B, H, K, 1]`` broadcast shape the loop consumes.
     g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
     k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
     beta_k_col = (beta[..., None] * k).movedim(1, 2).unsqueeze(-1).contiguous()
@@ -514,24 +480,15 @@ def _chunk_kda_prepare(
     # take the clamp path. The recompute inner loop receives
     # ``clamp_g_diff`` so it makes the same clamp decision.
     clamp_g_diff = not bool((g.amax(-2) - g.amin(-2)).max() <= 50.0)
-    # Only the rows ``c >= i`` are materialized: the strictly-upper rows are
-    # zeroed by ``mask`` / ``upper_mask`` below, so computing (and even
-    # reading) them is wasted work. The loop just does ~half the work of a
-    # full-grid formulation.
+    # Only the rows ``c >= i`` are materialized; the strictly-upper rows are
+    # zeroed by ``mask`` / ``upper_mask`` below.
     for i in range(BT):
         k_i = k[..., i, :]
         g_i = g[..., i, :]
         g_diff = g[..., i:, :] - g_i.unsqueeze(-2)
         if clamp_g_diff:
             g_diff = g_diff.clamp(max=50.0)
-        # ``t = exp(g_diff) * k_i`` is shared by both intra-chunk matrices,
-        # which drops one elementwise multiply per column versus the
-        # ``(k * e * k_i)`` / ``(q * e * k_i)`` form and never materializes
-        # the exp-sized intermediate twice. This regroups the product from
-        # ``(x * e) * k_i`` to ``x * (e * k_i)``; the surviving entries are
-        # the same values with a different fp association, agreeing to
-        # round-off (measured max |dA| ~9e-8 fp32, ~1e-16 fp64), far inside
-        # the 1e-6 chunk-vs-recurrent tolerance.
+        # ``t = exp(g_diff) * k_i`` is shared by both intra-chunk matrices.
         t = g_diff.exp() * k_i.unsqueeze(-2)
         A[..., i:, i] = (k[..., i:, :] * t).sum(-1)
         if not recompute_attn:
@@ -542,9 +499,7 @@ def _chunk_kda_prepare(
     A = -A.masked_fill(mask, 0)
     eye = torch.eye(BT, dtype=compute_dtype, device=q.device)
     # ``eye - A`` is unit lower triangular (``mask`` above zeroed A's
-    # diagonal), so the triangular solve divides by an exact 1.0 on every
-    # diagonal entry; ``unitriangular=True`` tells LAPACK to skip those
-    # divisions and only round-off-level differences (~4e-9) remain.
+    # diagonal), so the triangular solve uses ``unitriangular=True``.
     A = torch.linalg.solve_triangular(
         eye - A, A, upper=False, unitriangular=True
     )
@@ -667,9 +622,6 @@ def _chunk_kda_inner_loop(
         g_i = g[:, :, i]
         w_i = w[:, :, i]
         v_i = u_i - w_i @ S
-        # ``gexp = exp(g_i)`` feeds both the q-weighting and the state decay
-        # below; recomputing ``exp`` for the last row (the historical form)
-        # produces the same values but costs one extra exp launch per chunk.
         gexp = g_i.exp()
         chunk_outs.append((q_i * gexp) @ S + Aqk[:, :, i] @ v_i)
         S = S * gexp[:, :, -1].unsqueeze(-1)
@@ -709,8 +661,7 @@ def _chunk_kda_inner_loop_recompute(
     ``_chunk_kda_prepare``'s loop body (``diff = g - g_col``,
     ``(q * exp(diff)) * k_col`` reduced over the contiguous last dim), so
     both variants perform the same per-element operations in the same
-    order. The per-column ``[B, HV, BT, K]`` slice keeps the transient
-    footprint at O(BT * K) rather than the full O(BT * BT * K) pair grid.
+    order.
 
     ``clamp_g_diff`` must be the flag computed by ``_chunk_kda_prepare``
     (``max(g) - min(g) > 50`` anywhere), so both variants clamp identically.
@@ -724,9 +675,7 @@ def _chunk_kda_inner_loop_recompute(
         g_i = g[:, :, i]
         w_i = w[:, :, i]
         Aqk_i = q_i.new_empty(B, HV, BT, BT)
-        # Only the rows ``c >= j`` survive ``upper_mask``, so they are the
-        # only ones computed. Same values via the same elementwise ops as the
-        # full-grid form; the loop just does ~half the work.
+        # Only the rows ``c >= j`` survive ``upper_mask``.
         for j in range(BT):
             diff = g_i[..., j:, :] - g_i[..., j:j + 1, :]
             if clamp_g_diff:

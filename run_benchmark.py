@@ -4,7 +4,7 @@ Measures wall-clock latency and peak memory of each attention operator
 (softmax attention baseline, KDA, CSA, HCA, and the fused hybrid) across a
 range of sequence lengths.
 
-Kaggle / review-driven additions (address reviewer concerns):
+Methodology:
 
   * **Device awareness.** Runs on GPU (Kaggle T4) when available, falling
     back to CPU. On GPU we use CUDA events for accurate timing and
@@ -13,9 +13,7 @@ Kaggle / review-driven additions (address reviewer concerns):
     ``torch.cuda.max_memory_allocated`` (the number a production inference
     engine would pay), not just the Python-traced allocation. On CPU we keep
     ``tracemalloc`` for the resident Python heap.
-  * **All advertised sequence lengths.** The original paper's text mentioned
-    T in {128, 256, 512, 1024, 2048} but the table omitted T=256. We include
-    every length.
+  * **All advertised sequence lengths.** T in {128, 256, 512, 1024, 2048}.
   * **CUDA-event timing.** On GPU we synchronize and use CUDA events so the
     timing reflects actual kernel execution, not host-side launch overhead.
   * **Memory cleared between runs.** ``gc.collect()`` + ``torch.cuda.empty_cache()``
@@ -437,9 +435,9 @@ def main():
     # (e.g. CSA attends only to ``topk`` compressed blocks + a fixed
     # ``sliding_window``, so its cost is ~flat in T; HCA attends to all
     # compressed blocks, growing linearly in T; softmax attends to all T
-    # keys). Serializing them next to the timing rows lets a reviewer
-    # reconstruct the measured workload instead of having to guess it from
-    # source.
+    # keys). Serializing them next to the timing rows lets downstream
+    # analysis reconstruct the measured workload instead of having to guess
+    # it from source.
     op_workload = {
         'softmax':   {'heads': H, 'head_dim': K, 'attends_to_all_T': True,
                       'causal_mask': True},

@@ -565,9 +565,8 @@ class CSADecodingCache:
         # NEXT block. ``None`` until the first block is completed.
         self._prev_Cb: torch.Tensor | None = None  # [B, m, c]
         self._prev_Zb: torch.Tensor | None = None  # [B, m, c]
-        # Compressed block caches use geometrically-grown storage. Keeping
-        # capacity separate from the valid prefix avoids the O(n_blocks^2)
-        # copy cost of torch.cat on every completed block during long decode.
+        # Compressed block caches use geometrically-grown storage. Only the
+        # valid prefix is exposed through the public properties.
         self._C_comp: torch.Tensor | None = None   # [B, capacity, c]
         self._K_IComp: torch.Tensor | None = None  # [B, capacity, c_I]
         # SW ring buffer (None if win == 0).
@@ -882,10 +881,7 @@ class CSADecodingCache:
         the per-token loop (a new block completes every ``m`` tokens counted
         from the very first token appended to this cache), reuses the same
         compression helpers, and leaves the same accumulator / ring-buffer /
-        compressed-row state. Only the *grouping* of the calls changes:
-        whole sweeps of blocks go through the batched compression functions
-        instead of one block per Python iteration, removing the per-token
-        dispatch overhead from prefill cache population.
+        compressed-row state.
         """
         B, T_new, c = Ca_new.shape
         m = self.m
@@ -1087,9 +1083,9 @@ class CSADecodingCache:
         if q_idx.shape[2] != nIh:
             raise ValueError(
                 f"q_idx.shape[2]={q_idx.shape[2]} does not match nIh={nIh}.")
-        # D7 fix: validate ``q.device == self.device`` so a caller passing
-        # a GPU query to a CPU cache (or vice versa) gets a clear error
-        # instead of a cryptic cross-device einsum error deep inside.
+        # Validate ``q.device == self.device`` so a caller passing a GPU
+        # query to a CPU cache (or vice versa) gets a clear error instead
+        # of a cryptic cross-device einsum error deep inside.
         if q.device != self.device:
             raise ValueError(
                 f"CSADecodingCache.forward_step: q.device={q.device} does "
@@ -1253,13 +1249,7 @@ class CSADecodingCache:
             # normalize_qk=True (default), the buffer stores L2-normalized
             # keys (F.normalize applied at append time). When
             # normalize_qk=False the caller should have appended raw
-            # (unnormalized) keys; we read whatever is stored. D3 fix:
-            # skip the redundant defensive renormalize that used to live
-            # here — it was NOT a no-op even in fp32 (it paid norm +
-            # divide) and perturbed fp16 inputs. If a future code path
-            # stores differently-normed keys, adjust append_step and
-            # add a correctness test. Avoid runtime asserts on this
-            # decode hot path.
+            # (unnormalized) keys; we read whatever is stored.
             C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
             q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
             sw = torch.einsum(

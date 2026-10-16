@@ -711,9 +711,8 @@ def naive_csa(
         By default (``fuse_projections=True``) this function concatenates
         the 6 KV/indexer-compression weights (``W_aKV, W_bKV, W_aZ, W_bZ,
         W_KV_idx, W_Z_idx``) into a single matmul (see the in-code comment
-        above ``combined_weight``). This is a pure **forward-value-preserving**
-        optimization — the output is bit-identical (to fp32 tolerance) to
-        doing the 6 ``F.linear`` calls separately — but it has an
+        above ``combined_weight``). The fused call preserves the forward
+        values of the 6 separate ``F.linear`` calls, but it has an
         observable side effect on the **backward** pass when
         ``use_ste=False`` (STE disabled, e.g. for the untrained-indexer
         ablation): the indexer weights ``W_KV_idx`` / ``W_Z_idx`` receive a
@@ -862,29 +861,21 @@ def naive_csa(
     # We concatenate all 6 weights along their out_features axis (dim=0) and
     # do ONE ``F.linear`` call, then ``tensor.split`` the result back into
     # the 6 named projections. The split is a zero-copy view (``split``
-    # returns views into the concatenated tensor), so the only additional
-    # cost is the one-time ``torch.cat`` on the weight tensors. We do NOT
-    # cache the concatenated weight because (a) the optimizer may update
-    # the individual weights in-place between forward passes, invalidating
-    # any cache, and (b) the cat cost on small weight tensors
-    # (e.g. ``6 × [64, 512] = 196K elements``) is <<1ms — negligible
-    # relative to the matmul cost.
+    # returns views into the concatenated tensor). We do NOT cache the
+    # concatenated weight because the optimizer may update the individual
+    # weights in-place between forward passes, invalidating any cache.
     #
-    # Numerical contract: IDENTICAL to the 6 separate calls. ``F.linear`` is
+    # Numerical contract: equivalent to the 6 separate calls. ``F.linear`` is
     # ``x @ W.T``; concatenating the W's along dim=0 (out_features) and then
     # slicing the result along dim=-1 is mathematically identical to doing
-    # each matmul independently. Bit-identical up to GEMM kernel reduction
-    # order (which may differ slightly when the kernel sees a larger M,
-    # but well below the fp32 tolerance enforced by ``run_correctness.py``).
+    # each matmul independently, up to GEMM kernel reduction order.
     #
     # Autograd contract: under ``use_ste=False`` the indexer weights
     # ``W_KV_idx`` and ``W_Z_idx`` receive a ZERO (but non-None) grad,
     # because autograd flows backward through the single matmul into all
     # 6 weight slices. The substantive contract — "indexer params don't
-    # learn without STE" — is preserved: the grad is zero, so the optimizer
-    # step is a no-op. ``test_csa_indexer_ste_gradient`` was updated to
-    # check for "no useful gradient" (None OR all-zero) instead of
-    # requiring None specifically.
+    # learn without STE" — is preserved (the grad is zero, so the optimizer
+    # step is a no-op).
     #
     # All 6 weights must share dtype & device with H (they come from the
     # same ``nn.Linear`` module hierarchy, so this is true by construction).
