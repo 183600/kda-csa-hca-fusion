@@ -42,7 +42,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (configure_torch_for_device, parse_int_env,
                           sanitize_for_json, write_json_atomic,
-                          make_seeded_generator)
+                          make_seeded_generator, set_global_seed,
+                          capture_provenance)
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -1185,7 +1186,11 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
                                     logger=logger)
     actual_steps = softmax_steps if op_name == 'softmax' else steps
 
-    torch.manual_seed(seed)
+    # Seed Python random / NumPy / torch / CUDA from one value with
+    # deterministic cuDNN+algorithm selection. torch.manual_seed alone left
+    # Python/NumPy streams unseeded and cuDNN free to pick non-reproducible
+    # kernels on GPU.
+    set_global_seed(seed, deterministic=True)
     factories = {
         'softmax': lambda: SoftmaxAttn(d_model),
         'kda':     lambda: KDAAttn(d_model),
@@ -1314,6 +1319,9 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
             'steps': actual_steps,
             'seed': seed,
             'train_batch': train_batch,
+            'lr': lr,
+            'loss_curve': [],
+            'acc_curve': [],
         }
     return {
         'op': op_name,
@@ -1329,6 +1337,11 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         'steps': actual_steps,
         'seed': seed,
         'train_batch': train_batch,
+        # Full per-step training curves (the experiment log, not just the
+        # endpoints) so a run can be audited/plotted without re-training.
+        'lr': lr,
+        'loss_curve': losses,
+        'acc_curve': accs,
     }
 
 
@@ -1409,6 +1422,11 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 'train_batch': stub_train_batch,
                 'train_time_s': time.time() - t0,
                 'error': str(e),
+                # Mirror the success-row training-curve keys (empty) so the
+                # per_seed schema is uniform across success/error records.
+                'lr': kw.get('lr', 3e-3),
+                'loss_curve': [],
+                'acc_curve': [],
             })
         # On GPU, clear the CUDA cache between seeds so the allocator does
         # not accumulate freed-but-unreleased blocks across seeds.
@@ -1883,6 +1901,23 @@ def main():
             'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
             'ops': list(ops_list),
             'tasks': list(task_list),
+            # Reproducibility block: code version, environment, seeds, and
+            # the exact training recipe. Without these a results file cannot
+            # be traced back to the run that produced it.
+            'provenance': capture_provenance(),
+            'seeds': [42 + i for i in range(n_seeds)],
+            'n_seeds': n_seeds,
+            'training': {
+                'optimizer': 'AdamW',
+                'lr': 3e-3,
+                'weight_decay_decay_group': 0.01,
+                'weight_decay_no_decay_group': 0.0,
+                'grad_clip_norm': 1.0,
+                'steps': steps,
+                'softmax_steps': softmax_steps,
+                'batch_gen_seed_offset': 1_000_000,
+                'eval_gen_seed_offset': 5_000_000,
+            },
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,

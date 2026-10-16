@@ -57,7 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (
     configure_torch_for_device, parse_int_env, sanitize_for_json,
     write_json_atomic, write_results_json, capture_provenance,
-    make_seeded_generator,
+    make_seeded_generator, set_global_seed,
 )
 from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
 from ops_kda_backend import validate_kda_backend
@@ -100,6 +100,27 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     )
 
 
+def _run_provenance(n_seeds, steps):
+    """Environment provenance + seed list + training recipe for side files.
+
+    The provenance side files were previously a bare ``capture_provenance()``
+    dict: they recorded the code/environment but NOT which seeds or recipe
+    produced the adjacent results file, which made the pair only half a run
+    record.
+    """
+    prov = capture_provenance()
+    prov['seeds'] = [42 + i for i in range(int(n_seeds))]
+    prov['training'] = {
+        'optimizer': 'AdamW',
+        'lr': 3e-3,
+        'weight_decay_decay_group': 0.01,
+        'weight_decay_no_decay_group': 0.0,
+        'grad_clip_norm': 1.0,
+        'steps': int(steps),
+    }
+    return prov
+
+
 def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
                 n_batches=4, batch=64, seed=42):
     was_training = {m: m.training for m in (model, head, embed)}
@@ -137,7 +158,9 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
                 device='cpu', eval_batches=4, eval_batch=64, train_batch=None):
     if isinstance(device, str):
         device = torch.device(device)
-    torch.manual_seed(seed)
+    # Seed Python/NumPy/torch/CUDA + deterministic cuDNN/algorithm selection
+    # so the layout comparison is reproducible on the same machine.
+    set_global_seed(seed, deterministic=True)
     embed = nn.Embedding(VOCAB, d_model).to(device)
     head = MQARHead(d_model, VOCAB).to(device)
     cfg = _make_cfg(d_model, ratio)
@@ -503,7 +526,7 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
     """
     if isinstance(device, str):
         device = torch.device(device)
-    torch.manual_seed(seed)
+    set_global_seed(seed, deterministic=True)
     embed = nn.Embedding(VOCAB, d_model).to(device)
     head = MQARHead(d_model, VOCAB).to(device)
     cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
@@ -869,7 +892,7 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
     write_results_json(all_results, 'results/exp5b_ablation_matrix.json',
                        logger=logger)
     try:
-        write_results_json(capture_provenance(),
+        write_results_json(_run_provenance(n_seeds, steps),
                            'results/exp5b_ablation_matrix_provenance.json',
                            logger=logger)
     except Exception as e:
@@ -1073,7 +1096,7 @@ def main():
     write_results_json(all_results, 'results/exp5_ablation.json',
                        logger=logger)
     try:
-        write_results_json(capture_provenance(),
+        write_results_json(_run_provenance(n_seeds, steps),
                            'results/exp5_ablation_provenance.json',
                            logger=logger)
     except Exception as e:

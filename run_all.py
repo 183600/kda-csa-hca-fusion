@@ -491,8 +491,11 @@ def run_all(seeds=None, steps=None):
         # and the selected KDA backend. This matters when comparing a
         # reference run with a later FLA run.
         from kaggle_setup import capture_provenance
-        summary = {'env': capture_provenance(), 'runs': [],
-                   'run_profile': profile}
+        summary = {
+            'env': capture_provenance(),
+            'runs': [],
+            'run_profile': profile,
+        }
 
         # Import after deps are installed.
         import run_correctness
@@ -789,7 +792,22 @@ def run_all(seeds=None, steps=None):
             return 0
         summary['runs'].append(_run('make_figures', _make_figs))
 
-        # Final summary.
+        # Final summary. The seed-budget block is captured HERE (not at
+        # startup) because the run_profile and the SKIP_SLOW CPU path may
+        # raise the seed counts mid-run (e.g. smoke's MQAR_SEEDS=2 is
+        # floored to 5 on CPU) — the summary must record what actually ran.
+        # All multi-seed experiments use the same scheme: base seed 42,
+        # per-run seed = 42 + i.
+        summary['seeds'] = {
+            'MQAR_SEEDS': os.environ.get('MQAR_SEEDS'),
+            'ABL_SEEDS': os.environ.get('ABL_SEEDS'),
+            'MECH_SEEDS': os.environ.get('MECH_SEEDS'),
+            'base_seed': 42,
+            'scheme': ('per-run seed = base_seed + i (MQAR/ABL/MECH); '
+                       'benchmark input RNG is seeded per-(op, T) via '
+                       'crc32; decoding/roofline use seed 0. See each '
+                       'result file\'s provenance.'),
+        }
         n_ok = sum(1 for r in summary['runs'] if r['status'] == 'ok')
         n_fail = sum(1 for r in summary['runs'] if r['status'] == 'fail')
         total_t = sum(r['time_s'] for r in summary['runs'])

@@ -91,10 +91,12 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    capture_provenance,
     configure_torch_for_device,
     make_seeded_generator,
     parse_int_env,
     sanitize_for_json,
+    set_global_seed,
     write_results_json,
 )
 from ops_fused import (  # noqa: E402
@@ -654,7 +656,9 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
     """
     if isinstance(device, str):
         device = torch.device(device)
-    torch.manual_seed(seed)
+    # Seed Python/NumPy/torch/CUDA + deterministic cuDNN/algorithm selection
+    # so the reachability grid is reproducible on the same machine.
+    set_global_seed(seed, deterministic=True)
     embed = nn.Embedding(vocab, d_model).to(device)
     head = MQARHead(d_model, vocab).to(device)
     cfg = make_grid_cfg(m, m2, layout, d_model=d_model)
@@ -820,6 +824,8 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                         'mean_last10_loss': (
                             sum(losses[-10:]) / min(10, len(losses))
                             if losses else None),
+                        # Full per-step curve (the run log, not just endpoints).
+                        'loss_curve': [float(x) for x in losses],
                         'accuracy': ev['accuracy'],
                         'buckets': ev['buckets'],
                         'indexer_recall_per_layer': [
@@ -855,6 +861,19 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
             'csa_topk': (int(csa_topk) if csa_topk is not None
                          else SMALL_MODEL_SPEC['csa_topk']),
             'trained': bool(train),
+            'training': {
+                'optimizer': 'AdamW',
+                'lr': 3e-3,
+                'weight_decay_decay_group': 0.01,
+                'weight_decay_no_decay_group': 0.0,
+                'grad_clip_norm': 1.0,
+                'train_batch': int(train_batch),
+                'eval_batches': int(eval_batches),
+                'eval_batch': int(eval_batch),
+                'batch_gen_seed_offset': 1_000_000,
+                'eval_gen_seed_offset': 5_000_000,
+            },
+            'provenance': capture_provenance(),
             'note': ('structural = exact placement reachability at the cue; '
                      'indexer recall = gold compressed block among the '
                      'selected top-k on a real eval batch'),

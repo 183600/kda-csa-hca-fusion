@@ -88,6 +88,7 @@ from kaggle_setup import (
     configure_torch_for_device,
     make_seeded_generator,
     parse_int_env,
+    set_global_seed,
 )
 from ops_csa import _causal_block_mask, csa_compress_kv, csa_lightning_indexer
 from ops_fused import CSAHybridLayer, HybridKCHAttention
@@ -323,7 +324,9 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
     """
     if isinstance(device, str):
         device = torch.device(device)
-    torch.manual_seed(seed)
+    # Seed Python/NumPy/torch/CUDA + deterministic cuDNN/algorithm selection
+    # so the paired-variant comparison is reproducible on the same machine.
+    set_global_seed(seed, deterministic=True)
     embed = nn.Embedding(VOCAB, d_model).to(device)
     head = MQARHead(d_model, VOCAB).to(device)
     cfg = make_variant_cfg(variant, d_model)
@@ -771,6 +774,15 @@ def main():
         'train_batch': train_batch,
         'n_kv': n_kv_list,
         'seeds': seeds,
+        'training': {
+            'optimizer': 'AdamW',
+            'lr': 3e-3,
+            'weight_decay_decay_group': 0.01,
+            'weight_decay_no_decay_group': 0.0,
+            'grad_clip_norm': 1.0,
+            'batch_gen_seed_offset': 1_000_000,
+            'eval_gen_seed_offset': 5_000_000,
+        },
         'seq_len': SEQ_LEN,
         'ratio': list(RATIO),
         'csa_m': SMALL_MODEL_SPEC['csa_m'],

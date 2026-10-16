@@ -39,7 +39,8 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (configure_torch_for_device, sanitize_for_json,
-                          write_json_atomic, make_seeded_generator)
+                          write_json_atomic, make_seeded_generator,
+                          capture_provenance)
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa, _qk_normalize
 from ops_hca import naive_hca
@@ -1322,6 +1323,9 @@ def main():
                 # placeholder. Keep explicit metadata for downstream figures.
                 r['upper_bound'] = False
                 r['uses_incremental_cache'] = (name in {'csa', 'hca', 'hybrid'})
+                # The benchmark's RNG seed (model init + prefill/decode input
+                # generation are all seeded with 0; see main()/bench_decoding).
+                r['seed'] = 0
                 if name == 'hybrid':
                     # Hybrid's CSA/HCA sub-layers also use batched ``append_step``
                     # (one call with the full prefill projection tensor;
@@ -1393,6 +1397,7 @@ def main():
                                 'repeats': N_REPEATS,
                                 'upper_bound': False,
                                 'uses_incremental_cache': (name in {'csa', 'hca', 'hybrid'}),
+                                'seed': 0,
                                 'prefill_cache_build': (
                                     'batched_populate_layer_by_layer' if name == 'hybrid'
                                     else ('batched_append_from_naive_output'
@@ -1446,6 +1451,22 @@ def main():
         write_json_atomic(sanitized, 'results/exp6_decoding.json',
                           indent=2, default=str)
     print('\nSaved: results/exp6_decoding.json')
+    # Provenance side file (matches the run_benchmark.py pattern): the main
+    # results file stays a bare array for backward compatibility, while the
+    # code version / environment / seed scheme is recorded next to it.
+    try:
+        prov = capture_provenance()
+        prov['seeds'] = {
+            'value': 0,
+            'scheme': ('torch.manual_seed(0) before every model '
+                       'construction and make_seeded_generator(0) for the '
+                       'prefill/decode inputs; see run_decoding.main / '
+                       'bench_decoding'),
+        }
+        write_json_atomic(prov, 'results/exp6_decoding_provenance.json',
+                          indent=2, allow_nan=False)
+    except Exception as e:
+        print(f'[run_decoding] WARNING: failed to write provenance: {e}')
     # Return non-zero if any (prefill_len, op) cell errored out, so
     # ``run_all._run`` records the experiment as ``status='fail'`` instead
     # of silently treating a partial run as success.

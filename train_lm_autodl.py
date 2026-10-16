@@ -11,7 +11,7 @@ implements:
 Defaults: 2000 steps, d_model=256, 5 layers (3:1:1), seq 1024 — sized for a
 small single-GPU run.
 """
-import os, time, argparse, random, json
+import os, time, argparse, random, json, gc, hashlib, datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +44,9 @@ except ImportError:  # tqdm is preinstalled on Kaggle/AutoDL but is
 # import repo modules
 from ops_fused import HybridConfig, HybridKCHAttention
 from ops_kda_backend import validate_kda_backend
-from kaggle_setup import configure_torch_for_device
+from kaggle_setup import (configure_torch_for_device, set_global_seed,
+                          seed_worker, capture_provenance,
+                          write_json_atomic, write_results_json)
 
 # tokenizer / dataset handling (reuse TinyStories if available)
 try:
@@ -92,18 +94,29 @@ class _FallbackCharTokenizer:
 class TinyStoriesLM(Dataset):
     def __init__(self, tokenizer, seq_len=1024, max_samples=20000, split="train"):
         self.seq_len = seq_len
+        self.split = split
+        self.max_samples = max_samples
         if HAS_HF:
             try:
                 ds = load_dataset("roneneldan/TinyStories", split=split)
                 if max_samples:
                     ds = ds.select(range(min(len(ds), max_samples)))
                 self.texts = ds["text"]
+                self.data_source = "hf:roneneldan/TinyStories"
             except Exception as e:
                 print(f"HF load failed {e}, using synthetic")
                 self.texts = ["Once upon a time, " * 200 for _ in range(1000)]
+                self.data_source = "synthetic:once_upon_a_time (HF load failed)"
         else:
             self.texts = ["Once upon a time, " * 200 for _ in range(1000)]
+            self.data_source = "synthetic:once_upon_a_time (no transformers)"
         self.tokenizer = tokenizer
+        # Content fingerprint so a run record can identify WHICH data was
+        # trained on. Uses a bounded, deterministic sample (first
+        # ``n_probe`` texts truncated per-text) — hashing every byte of a
+        # 20k-story corpus on every start is wasteful, and the sample is
+        # enough to detect a swapped split / stale cache.
+        self.data_fingerprint = _texts_fingerprint(self.texts)
 
     def __len__(self): return len(self.texts)
 
@@ -157,6 +170,152 @@ def count_params(m):
     return total
 
 
+def _texts_fingerprint(texts, n_probe=64, max_chars_per_text=4096):
+    """Bounded content fingerprint of the training texts (data version id).
+
+    Hashes a deterministic sample of at most ``n_probe`` evenly spaced
+    texts (each truncated to ``max_chars_per_text``) plus the corpus size,
+    so a run record can detect a swapped split / stale dataset cache
+    without hashing gigabytes on every launch.
+    """
+    n = len(texts)
+    h = hashlib.sha256()
+    h.update(
+        f"n={n};probe={min(n, n_probe)};max_chars={max_chars_per_text}".encode())
+    if n:
+        stride = max(1, n // max(1, n_probe))
+        seen = 0
+        for i in range(0, n, stride):
+            if seen >= n_probe:
+                break
+            h.update(str(texts[i])[:max_chars_per_text].encode(
+                'utf-8', 'replace'))
+            seen += 1
+        # Always include the last sample so a truncation of the corpus (e.g.
+        # a shorter stale cache) changes the fingerprint even if the stride
+        # sample happens to coincide.
+        h.update(str(texts[-1])[:max_chars_per_text].encode(
+            'utf-8', 'replace'))
+    return h.hexdigest()
+
+
+def _batch_fingerprint(batch):
+    """sha256 over the fixed overfit batch (ids + labels + shapes)."""
+    h = hashlib.sha256()
+    for name in ("input_ids", "labels"):
+        t = batch[name].detach().to('cpu')
+        h.update(f"{name}:{tuple(t.shape)}:".encode())
+        h.update(str(t.contiguous().view(-1).tolist()).encode())
+    return h.hexdigest()
+
+
+def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
+                             lr=3e-3, seed=42, grad_clip=1.0,
+                             loss_ratio_threshold=0.5, log_every=10):
+    """Overfit ONE fixed batch as a gradient-flow sanity gate.
+
+    Runs before full training and trains a FRESH model (``model_factory()``)
+    on a single fixed batch with all regularization disabled
+    (``weight_decay=0``; the hybrid stack has no dropout and this pipeline
+    applies no data augmentation — raw token windows only). If a model
+    cannot drive the loss down on a handful of examples, something is
+    fundamentally broken (gradients not flowing, detached loss, wrong
+    labels, optimizer not stepping) and starting a 2000-step run would just
+    burn compute.
+
+    Pass criterion: the mean loss over the last ``tail`` steps must be
+    strictly below ``loss_ratio_threshold`` times the mean loss over the
+    first ``warmup`` steps (default: at least a 50% reduction). The token
+    accuracy trajectory is reported for inspection but is informative
+    only: this is a NECESSARY, NOT SUFFICIENT check — data-augmentation,
+    feature-alignment and label-mapping bugs can still pass it, so it must
+    be complemented by inspecting intermediate results.
+
+    Returns a JSON-serializable report dict with the loss/accuracy curves.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    steps = int(steps)
+    if steps < 10:
+        # A handful of steps is dominated by early-loss noise (the loss can
+        # even rise for a few steps before collapsing); requiring >= 10
+        # avoids a misleading FAIL on a healthy model.
+        raise ValueError(
+            f"overfit check needs steps >= 10 to be meaningful, got {steps}")
+    warmup = max(1, min(5, steps // 10))
+    tail = max(1, min(5, steps // 10))
+
+    # Deterministic, regularization-free recipe. Re-seeding here makes the
+    # probe model's init independent of any RNG consumption before the call.
+    seed_info = set_global_seed(seed, deterministic=True)
+    model = model_factory().to(device)
+    model.train()
+    input_ids = batch["input_ids"].to(device)
+    labels = batch["labels"].to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+
+    losses, accs, elapsed_s = [], [], []
+    t0 = time.time()
+    for step in range(steps):
+        model.hybrid.reset_state()
+        out = model(input_ids, labels=labels)
+        loss = out["loss"]
+        if loss is None or not torch.isfinite(loss):
+            raise RuntimeError(
+                f"overfit sanity check: non-finite LM loss at step {step} "
+                f"({loss}); aborting before full training.")
+        with torch.no_grad():
+            mask = labels.ne(-100)
+            correct = ((out["logits"].argmax(-1) == labels) & mask).sum()
+            acc = float(correct) / max(1, int(mask.sum()))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        opt.step()
+        losses.append(float(loss.detach()))
+        accs.append(acc)
+        elapsed_s.append(time.time() - t0)
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f"[overfit-check] step {step:4d} loss {losses[-1]:.4f} "
+                  f"token_acc {acc:.4f} ({elapsed_s[-1]:.1f}s)", flush=True)
+
+    initial_loss = sum(losses[:warmup]) / warmup
+    final_loss = sum(losses[-tail:]) / tail
+    best_loss = min(losses)
+    loss_reduction = (initial_loss - final_loss) / initial_loss
+    final_acc = sum(accs[-tail:]) / tail
+    passed = final_loss < loss_ratio_threshold * initial_loss
+    report = {
+        "passed": bool(passed),
+        "steps": steps,
+        "lr": float(lr),
+        "weight_decay": 0.0,
+        "grad_clip_norm": float(grad_clip),
+        "dropout": 0.0,
+        "data_augmentation": "none",
+        "seed": int(seed),
+        "seed_info": seed_info,
+        "fixed_batch_sha256": _batch_fingerprint(batch),
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
+        "best_loss": best_loss,
+        "loss_reduction": loss_reduction,
+        "loss_ratio_threshold": float(loss_ratio_threshold),
+        "final_train_token_acc": final_acc,
+        "losses": losses,
+        "accs": accs,
+        "elapsed_s": elapsed_s,
+        "note": ("Necessary but NOT sufficient: passing proves gradients flow "
+                 "and the loss responds on a fixed batch; it cannot rule out "
+                 "data-augmentation / feature-alignment / label-mapping bugs."),
+    }
+    del model, opt
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return report
+
+
 def run_decode_consistency_probe(model, device, seq_len, output_dir=None,
                                  seed=1234):
     """Prefill-decode consistency + decode-roofline probe of the trained LM.
@@ -184,13 +343,13 @@ def run_decode_consistency_probe(model, device, seq_len, output_dir=None,
     report['cache_audit'] = cache_accounting.run_cache_audit_for_model(
         model, context_len=prefill_len, decode_steps=T - prefill_len,
         device=device, seed=seed)
+    # Provenance so a saved report identifies the code/env/seed that made it.
+    report['seed'] = int(seed)
+    report['provenance'] = capture_provenance()
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, 'decode_consistency.json')
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, allow_nan=False)
-        os.replace(tmp, path)
+        write_json_atomic(report, path, indent=2, allow_nan=False)
         report['report_path'] = path
     return report
 
@@ -268,6 +427,24 @@ def main():
     parser.add_argument("--skip_consistency_check", action="store_true",
                         help="Skip the automatic prefill-decode consistency "
                              "probe run after training finishes.")
+    parser.add_argument("--skip_overfit_check", action="store_true",
+                        help="Skip the small-batch overfit sanity gate before "
+                             "training (NOT recommended: the gate catches "
+                             "broken gradient flow / loss wiring cheaply).")
+    parser.add_argument("--overfit_steps", type=int, default=100,
+                        help="Optimizer steps for the fixed-batch overfit "
+                             "sanity gate (default: 100).")
+    parser.add_argument("--overfit_lr", type=float, default=3e-3,
+                        help="LR for the overfit gate. Deliberately higher "
+                             "than the 3e-4 training LR so a healthy model "
+                             "memorizes the batch quickly (default: 3e-3).")
+    parser.add_argument("--overfit_loss_ratio", type=float, default=0.5,
+                        help="Gate passes when the tail-mean loss is strictly "
+                             "below this fraction of the head-mean loss "
+                             "(default: 0.5).")
+    parser.add_argument("--overfit_check_only", action="store_true",
+                        help="Run ONLY the overfit sanity gate (no full "
+                             "training); useful as a fast smoke test.")
     args = parser.parse_args()
 
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
@@ -275,10 +452,13 @@ def main():
     device = info.device
     print(f"Device: {device}, is_kaggle={is_kaggle}")
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+    # Seed Python random / NumPy / torch / CUDA together; deterministic
+    # cuDNN + algorithm selection for same-machine reproducibility.
+    seed_info = set_global_seed(args.seed, deterministic=True)
+    # Provenance (git commit / dirty flag / torch+cuda versions / device) is
+    # captured ONCE at run start and embedded in every artifact this script
+    # writes (checkpoints, run record, consistency report).
+    provenance = capture_provenance()
 
     if args.consistency_check:
         ckpt_path = args.checkpoint or os.path.join(
@@ -332,15 +512,72 @@ def main():
     print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}, d={cfg.d_model}")
     print(f"Training profile: batch_size={batch_size}, grad_accum={grad_accum}, "
           f"seq_len={seq_len}, optimizer_steps={max_steps}, seed={args.seed}")
+
+    max_train_samples = 20000 if not is_kaggle else 5000
+    ds = TinyStoriesLM(tokenizer, seq_len=seq_len,
+                       max_samples=max_train_samples)
+    print(f"Data: {ds.data_source}, n={len(ds)}, "
+          f"fingerprint={ds.data_fingerprint[:16]}...")
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(args.seed + 1_000_000)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
+                        generator=loader_gen, worker_init_fn=seed_worker)
+
+    # ------------------------------------------------------------------
+    # Overfit sanity gate (before any full training): train a FRESH copy of
+    # the model on ONE fixed batch with regularization off. A model that
+    # cannot memorize a handful of examples has a fundamental bug
+    # (gradients not flowing, detached loss, wrong labels, optimizer not
+    # stepping) and a 500-2000 step run would be wasted. This is necessary
+    # but NOT sufficient — augmentation/alignment/label-map bugs can still
+    # pass — so it complements, never replaces, intermediate-result checks.
+    # ------------------------------------------------------------------
+    overfit_report = None
+    overfit_batch = None
+    if not args.skip_overfit_check:
+        # Separate generator + loader: the probe batch is fixed across runs
+        # and consuming it does NOT advance the training loader's stream, so
+        # training stays bit-identical to a run with the gate skipped.
+        probe_gen = torch.Generator()
+        probe_gen.manual_seed(args.seed + 2_000_000)
+        probe_loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                                  num_workers=0, generator=probe_gen)
+        overfit_batch = next(iter(probe_loader))
+        print(f"[overfit-check] training {args.overfit_steps} steps on one "
+              f"fixed batch of {int(overfit_batch['input_ids'].shape[0])} "
+              f"sequence(s) (weight_decay=0, no dropout/augmentation)...")
+        overfit_report = run_overfit_sanity_check(
+            lambda: LMWithHybrid(vocab_size, cfg), overfit_batch, device,
+            steps=args.overfit_steps, lr=args.overfit_lr, seed=args.seed,
+            loss_ratio_threshold=args.overfit_loss_ratio)
+        print(f"[overfit-check] result: {'PASS' if overfit_report['passed'] else 'FAIL'} "
+              f"loss {overfit_report['initial_loss']:.3f} -> "
+              f"{overfit_report['final_loss']:.3f} "
+              f"(best {overfit_report['best_loss']:.3f}), "
+              f"token_acc -> {overfit_report['final_train_token_acc']:.3f}")
+        if not overfit_report['passed']:
+            raise SystemExit(
+                "[overfit-check] FAILED: the model could not overfit a single "
+                f"fixed batch in {args.overfit_steps} steps "
+                f"(loss {overfit_report['initial_loss']:.3f} -> "
+                f"{overfit_report['final_loss']:.3f}; required < "
+                f"{args.overfit_loss_ratio:.2f}x the initial loss). This "
+                "usually means gradients are not flowing, the loss is "
+                "mis-wired, or labels are wrong — refusing to start the full "
+                "run. Debug with --overfit_check_only, or bypass (NOT "
+                "recommended) with --skip_overfit_check.")
+        if args.overfit_check_only:
+            print("[overfit-check] --overfit_check_only set; exiting without "
+                  "full training.")
+            return
+
+    # Re-seed right before the real model is constructed so its init is
+    # identical to a run where the gate never ran.
+    set_global_seed(args.seed, deterministic=True)
     model = LMWithHybrid(vocab_size, cfg).to(device)
     print(f"Params: {count_params(model)/1e6:.2f}M")
     print(f"Layout: {model.hybrid.layout_str()}")
 
-    ds = TinyStoriesLM(tokenizer, seq_len=seq_len, max_samples=20000 if not is_kaggle else 5000)
-    loader_gen = torch.Generator()
-    loader_gen.manual_seed(args.seed + 1_000_000)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
-                        generator=loader_gen)
     no_decay_ids = set()
     for submod in model.modules():
         if isinstance(submod, (nn.Embedding, nn.LayerNorm)):
@@ -377,13 +614,73 @@ def main():
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and autocast_dtype == torch.float16))
     print(f"AMP enabled={use_amp}, dtype={autocast_dtype}, grad_scaler={scaler.is_enabled()}")
 
+    # Hyperparameters are captured ONCE here and embedded in every
+    # checkpoint / run record so no artifact is ambiguous about its recipe.
+    hyperparams = {
+        'optimizer': 'AdamW',
+        'lr': 3e-4,
+        'weight_decay_decay_group': 0.1,
+        'weight_decay_no_decay_group': 0.0,
+        'grad_clip_norm': 1.0,
+        'batch_size': batch_size,
+        'grad_accum': grad_accum,
+        'effective_batch_sequences': batch_size * grad_accum,
+        'seq_len': seq_len,
+        'max_optimizer_steps': max_steps,
+        'amp_enabled': use_amp,
+        'autocast_dtype': str(autocast_dtype),
+        'kda_backend': kda_backend,
+        'model_config': dict(cfg.__dict__),
+    }
+    data_record = {
+        'source': ds.data_source,
+        'split': ds.split,
+        'max_samples_budget': max_train_samples,
+        'n_samples': len(ds),
+        'tokenizer': type(tokenizer).__name__,
+        'vocab_size': vocab_size,
+        'content_fingerprint_sha256': ds.data_fingerprint,
+        'fingerprint_scheme': ('sha256 of <=64 evenly spaced texts truncated '
+                               'to 4096 chars + corpus size'),
+    }
+    created_utc = datetime.datetime.now(
+        datetime.timezone.utc).isoformat()
+
     os.makedirs(args.output_dir, exist_ok=True)
     model.train()
     it = iter(loader)
     start = time.time()
     recent_step_losses = []
+    # Full per-optimizer-step training curve (recorded in checkpoints and in
+    # the run record; "don't log experiments by hand" — the files ARE the log).
+    curve_steps, curve_losses, curve_elapsed_s = [], [], []
     optimizer_step = 0
     micro_step = 0
+
+    def _checkpoint_payload():
+        """Self-describing checkpoint: weights + recipe + provenance + curve.
+
+        Recording the hyperparameters, git revision (and dirty flag), seed
+        and the loss history INSIDE each checkpoint means even a crashed run's
+        partial checkpoint can be traced back to the exact code/data/recipe
+        that produced it.
+        """
+        return {
+            "model": model.state_dict(),
+            "cfg": cfg.__dict__,
+            "vocab": vocab_size,
+            "optimizer_step": optimizer_step,
+            "micro_step": micro_step,
+            "seed": args.seed,
+            "seed_info": seed_info,
+            "created_utc": created_utc,
+            "git_commit": provenance.get("git_commit"),
+            "git_dirty": provenance.get("git_dirty"),
+            "hyperparams": hyperparams,
+            "data": data_record,
+            "loss_history": list(curve_losses),
+        }
+
     pbar = tqdm(total=max_steps, desc="optimizer steps")
     optimizer.zero_grad(set_to_none=True)
     while optimizer_step < max_steps:
@@ -440,6 +737,9 @@ def main():
         optimizer_step += 1
         step_loss = accum_loss / max(1, accum_batches)
         recent_step_losses.append(step_loss)
+        curve_steps.append(optimizer_step)
+        curve_losses.append(step_loss)
+        curve_elapsed_s.append(time.time() - start)
         pbar.update(1)
         pbar.set_postfix({"loss": f"{step_loss:.4f}"})
 
@@ -448,18 +748,47 @@ def main():
             recent_step_losses.clear()
 
         if optimizer_step % 500 == 0:
-            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
-                        "optimizer_step": optimizer_step, "micro_step": micro_step,
-                        "seed": args.seed},
+            torch.save(_checkpoint_payload(),
                        os.path.join(args.output_dir, f"step_{optimizer_step}.pt"))
 
     pbar.close()
     elapsed = time.time() - start
     print(f"Finished in {elapsed/60:.2f} min")
-    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "vocab": vocab_size,
-                "optimizer_step": optimizer_step, "micro_step": micro_step,
-                "seed": args.seed},
+    torch.save(_checkpoint_payload(),
                os.path.join(args.output_dir, "final_lm.pt"))
+
+    # Persist the full run record (code version + hyperparameters + seed +
+    # data version + training curve + final result) next to the checkpoint.
+    # The file is the experiment log — no manual bookkeeping.
+    mean_last10 = (sum(curve_losses[-10:]) / min(10, len(curve_losses))
+                   if curve_losses else None)
+    run_record = {
+        "kind": "train_lm_autodl",
+        "created_utc": created_utc,
+        "elapsed_s": elapsed,
+        "seed": args.seed,
+        "seed_info": seed_info,
+        "provenance": provenance,
+        "hyperparameters": hyperparams,
+        "data": data_record,
+        "overfit_sanity_check": overfit_report,
+        "training_curve": {
+            "optimizer_step": curve_steps,
+            "loss": curve_losses,
+            "elapsed_s": curve_elapsed_s,
+        },
+        "final": {
+            "optimizer_step": optimizer_step,
+            "micro_step": micro_step,
+            "last_loss": curve_losses[-1] if curve_losses else None,
+            "mean_last10_loss": mean_last10,
+            "checkpoint": os.path.join(args.output_dir, "final_lm.pt"),
+            "completed": optimizer_step >= max_steps,
+        },
+    }
+    record_path = os.path.join(args.output_dir, "run_record.json")
+    write_results_json(run_record, record_path)
+    print(f"[run-record] wrote {record_path}")
 
     if not args.skip_consistency_check:
         report = run_decode_consistency_probe(

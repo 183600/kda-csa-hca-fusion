@@ -36,7 +36,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import sanitize_for_json, write_json_atomic
+from kaggle_setup import (sanitize_for_json, write_json_atomic,
+                          capture_provenance)
 from results_schema import envelope, write as write_results
 
 
@@ -763,6 +764,9 @@ def main():
         'bytes_convention': 'kv_bytes = kv_elements * BF16_BYTES (2 bytes), '
                             'matching the DeepSeek-V4 §2.3.4 comparison',
         'accounting_modes': ['compressed_kv_only', 'full_accounting'],
+        # Code/environment provenance; this experiment has no RNG (analytic
+        # closed-form accounting), so no seed block is recorded.
+        'provenance': capture_provenance(),
     }
     try:
         write_results('results/exp3_kv_cache.json', rows,

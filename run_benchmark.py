@@ -694,7 +694,17 @@ def main():
                           'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
     try:
-        write_json_atomic(capture_provenance(),
+        prov = capture_provenance()
+        # This benchmark seeds per-(op, T) generators rather than a global
+        # RNG; record the scheme explicitly so the numbers are traceable
+        # instead of "which random weights was this?".
+        prov['seeds'] = {
+            'scheme': ('per-(op, T) seed = zlib.crc32(op_name) XOR '
+                       '(T * 2654435761), used by _make_op_gen for inputs and '
+                       'by the scoped weight-init seeding (torch.manual_seed '
+                       'wrapped in get/set_rng_state); no global seed needed'),
+        }
+        write_json_atomic(prov,
                           'results/exp2_benchmark_provenance.json',
                           indent=2, allow_nan=False)
     except Exception as e:

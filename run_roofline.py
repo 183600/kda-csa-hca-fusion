@@ -48,12 +48,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, parse_int_env
+from kaggle_setup import (configure_torch_for_device, parse_int_env,
+                          set_global_seed, capture_provenance)
 from results_schema import SchemaError, parse, write as write_results
 from run_kv_cache import kv_cache_elements, prefill_flops
 import roofline
 
 logger = logging.getLogger(__name__)
+
+# Seed for the on-host peak microbenchmarks (torch.randn inputs in
+# roofline.measure_gemm_tflops). Recorded in the result metadata so the
+# measured peaks are reproducible on the same machine.
+ROOFLINE_SEED = 0
 
 _BYTE_MODEL_NOTE = (
     'compulsory-traffic lower bound: activation I/O (input read + output '
@@ -240,6 +246,10 @@ def main() -> int:
                            logger=logger)
     device = next((r.get('device') for r in rows if r.get('time_ms')),
                   'cpu')
+    # Seed the host-peak microbenchmark inputs (previously unseeded
+    # torch.randn, so the recorded "measured_copy_bw_gbps" /
+    # "measured_gemm_tflops" metadata changed run to run).
+    seed_info = set_global_seed(ROOFLINE_SEED)
     peaks = _resolve_peaks(device, size_mb=size_mb, repeats=repeats,
                            gemm_n=gemm_n)
     logger.info(
@@ -309,6 +319,9 @@ def main() -> int:
     metadata = {
         'device': device,
         **peaks,
+        'seed': ROOFLINE_SEED,
+        'seed_info': seed_info,
+        'provenance': capture_provenance(),
         'source': {'exp2_benchmark': {'path': src, 'schema_version': src_version,
                                       'n_rows': len(rows)}},
         'flops_model': (

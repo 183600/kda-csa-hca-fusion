@@ -18,6 +18,11 @@ It exposes:
                                 is the validation entry point.
   * ``to_device(x, device)`` -> moves tensors / modules recursively.
   * ``num_workers()``        -> sensible DataLoader worker count.
+  * ``set_global_seed(seed)`` -> seeds Python/NumPy/torch/CUDA (and
+                                optionally cuDNN determinism) from one seed.
+  * ``seed_worker``          -> deterministic DataLoader ``worker_init_fn``.
+  * ``capture_provenance()`` -> environment + git metadata for run records.
+  * ``write_json_atomic()``  -> atomic, strict-JSON result writer.
 
 Design notes
 ------------
@@ -579,6 +584,11 @@ def capture_provenance() -> dict:
     metadata so a result JSON is self-describing. Without this, a reader
     picking up a stale JSON has no way to tell which torch version / GPU
     / commit produced it, making cross-version comparisons meaningless.
+
+    ``git_dirty`` records whether the working tree had uncommitted changes
+    when the run started: a bare commit hash is not enough to reproduce a
+    run whose code differs from HEAD, and silently reporting only the hash
+    would make such a run look reproducible when it is not.
     """
     import os
     import platform
@@ -590,14 +600,25 @@ def capture_provenance() -> dict:
         fla_version = _importlib_metadata.version('flash-linear-attention')
     except Exception:
         fla_version = None
+    try:
+        import numpy as _np
+        numpy_version = _np.__version__
+    except Exception:
+        numpy_version = None
     info = detect_env()
     # Best-effort git commit; ignore errors (running from a tarball, etc).
     git_commit = None
+    git_dirty = None
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         git_commit = subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'], cwd=here, stderr=subprocess.DEVNULL,
         ).decode().strip()
+        dirty = subprocess.check_output(
+            ['git', 'status', '--porcelain'], cwd=here,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        git_dirty = bool(dirty)
     except Exception:
         pass
     return {
@@ -606,13 +627,118 @@ def capture_provenance() -> dict:
         'platform': platform.platform(),
         'torch_version': info.torch_version,
         'cuda_version': info.cuda_version,
+        'numpy_version': numpy_version,
         'device_name': info.device_name,
         'git_commit': git_commit,
+        'git_dirty': git_dirty,
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
         'flash_linear_attention_version': fla_version,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED', '<unset>'),
         'num_threads': info.num_threads,
     }
+
+
+def set_global_seed(seed: int, *, deterministic: bool = False) -> dict:
+    """Seed every RNG that can affect a training run from one integer.
+
+    Seeds Python ``random``, NumPy (when importable), PyTorch's global CPU
+    generator and every CUDA device generator. Call this once per training
+    entry point (and again before any model construction that must be
+    reproducible independently of earlier RNG consumption).
+
+    ``deterministic=True`` additionally switches cuDNN to deterministic
+    kernels and disables the autotuner
+    (``torch.backends.cudnn.deterministic = True`` /
+    ``benchmark = False``) and asks PyTorch for deterministic algorithm
+    implementations (``torch.use_deterministic_algorithms(True,
+    warn_only=True)`` — ``warn_only`` avoids hard failures for the few ops
+    that have no deterministic implementation). This trades a little
+    throughput for same-machine run-to-run reproducibility. It cannot make
+    runs bit-identical ACROSS hardware architectures; different GPUs/CPU
+    kernels legitimately differ in floating-point reduction order.
+
+    Note ``PYTHONHASHSEED`` cannot be changed after interpreter start; set
+    it in the environment before launching if string-hash order matters.
+    ``capture_provenance`` records its value so runs can be compared.
+
+    Returns a JSON-serializable dict describing what was seeded, suitable
+    for embedding in a run record.
+    """
+    import random as _random
+
+    seed = int(seed)
+    _random.seed(seed)
+
+    numpy_seeded = False
+    try:
+        import numpy as _np
+        _np.random.seed(seed % (2 ** 32))
+        numpy_seeded = True
+    except Exception:
+        # NumPy is optional in minimal environments; Python+torch seeding
+        # is still complete for this repo's code paths.
+        pass
+
+    torch.manual_seed(seed)
+    cuda_seeded = False
+    try:
+        if torch.cuda.is_available():
+            # torch.manual_seed already seeds all devices in modern torch,
+            # but this is explicit and harmless on old builds.
+            torch.cuda.manual_seed_all(seed)
+            cuda_seeded = True
+    except Exception:
+        pass
+
+    cudnn_deterministic = False
+    deterministic_algorithms = False
+    if deterministic:
+        try:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            cudnn_deterministic = True
+        except Exception:
+            pass
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            deterministic_algorithms = True
+        except Exception:
+            # Very old torch builds lack the kwarg; cudnn.deterministic above
+            # still covers the convolution/cuDNN paths.
+            pass
+
+    return {
+        'seed': seed,
+        'python_random': True,
+        'numpy': numpy_seeded,
+        'torch': True,
+        'cuda': cuda_seeded,
+        'deterministic_requested': bool(deterministic),
+        'cudnn_deterministic': cudnn_deterministic,
+        'deterministic_algorithms': deterministic_algorithms,
+    }
+
+
+def seed_worker(worker_id: int) -> None:
+    """Deterministic ``DataLoader(worker_init_fn=...)`` for Python/NumPy/torch.
+
+    A DataLoader with ``num_workers > 0`` does NOT inherit the parent
+    process's Python/NumPy RNG state in its workers, and PyTorch only seeds
+    the torch RNG in each worker. Passing this function as
+    ``worker_init_fn`` derives one seed per worker from
+    ``torch.initial_seed()`` — which is itself deterministic only when the
+    DataLoader is constructed with a seeded base ``generator=`` — and
+    applies it to ``random`` and NumPy too.
+    """
+    import random as _random
+
+    worker_seed = int(torch.initial_seed()) % (2 ** 32)
+    _random.seed(worker_seed)
+    try:
+        import numpy as _np
+        _np.random.seed(worker_seed)
+    except Exception:
+        pass
 
 
 def parse_int_env(var_name: str, default: int, *, min_value: int = 1,

@@ -60,6 +60,7 @@ import torch
 
 from ops_fused import HybridConfig  # noqa: F401  (public re-export / typing)
 from ops_rope import effective_rope_dim
+from kaggle_setup import set_global_seed
 from run_kv_cache import geometric_capacity, kv_cache_elements
 
 # ---------------------------------------------------------------------------
@@ -764,11 +765,14 @@ def paper_aligned_bytes(cfg: HybridConfig, components: dict, *,
 def run_cache_audit(decoder, cfg: HybridConfig, *, T: int | None = None,
                     with_graph_probe: bool = False,
                     graph_probe_kwargs: dict | None = None,
-                    bytes_policy: str = 'mixed_fp8') -> dict:
+                    bytes_policy: str = 'mixed_fp8',
+                    seed: int | None = None) -> dict:
     """One full audit: live vs analytical accounting + hygiene + bytes.
 
     The result is JSON-strict and intended to be written next to a
     checkpoint (see ``train_lm_autodl.run_decode_consistency_probe``).
+    ``seed`` is recorded in the report when given (the audit itself is
+    seed-independent; it documents the caller's RNG state).
     """
     live = live_cache_components(decoder)
     comparison = audit_cache_accounting(decoder, cfg, T=T, live=live)
@@ -808,6 +812,8 @@ def run_cache_audit(decoder, cfg: HybridConfig, *, T: int | None = None,
     if with_graph_probe:
         kwargs = dict(graph_probe_kwargs or {})
         report['autograd_graph_probe'] = autograd_graph_probe(cfg, **kwargs)
+    if seed is not None:
+        report['seed'] = seed
     return report
 
 
@@ -860,7 +866,7 @@ def run_cache_audit_for_model(model, context_len: int, *,
             T = context_len + decode_steps
             return run_cache_audit(
                 decoder, cfg, T=T, with_graph_probe=with_graph_probe,
-                graph_probe_kwargs=graph_probe_kwargs)
+                graph_probe_kwargs=graph_probe_kwargs, seed=seed)
     finally:
         decoder.reset()
 
@@ -920,6 +926,8 @@ def main(argv=None) -> int:
                         help='write the full JSON-strict report here')
     args = parser.parse_args(argv)
 
+    # Deterministic probe inputs (previously an unseeded torch.randn).
+    set_global_seed(0)
     from run_decoding import HybridDecoding
     decoder = HybridDecoding().to(args.device).eval()
     cfg = decoder.cfg
@@ -931,7 +939,7 @@ def main(argv=None) -> int:
             decoder(x[:, :1])
         report = run_cache_audit(
             decoder, cfg, T=args.T + args.decode_steps,
-            with_graph_probe=not args.no_graph_probe)
+            with_graph_probe=not args.no_graph_probe, seed=0)
     _print_audit_summary(report)
     if args.json:
         with open(args.json, 'w', encoding='utf-8') as f:
