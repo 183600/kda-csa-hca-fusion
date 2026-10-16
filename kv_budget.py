@@ -38,6 +38,27 @@ Currency definition (the honesty contract)
   materialization (``unfold``, temporaries) is out of scope, mirroring the
   compulsory-traffic caveat of Exp 7.
 
+Prefill / decode unification
+----------------------------
+The averaged prefill functions (:func:`op_read_elements`,
+:func:`layout_read_elements`) and the decode path share ONE primitive: the
+*marginal* budget :func:`instant_read_elements` charges exactly the elements
+the query at position ``t`` reads (compressed blocks strictly preceding,
+window inclusive of the own token — the same masks the implementations use).
+Two identities hold by construction and are pinned by tests:
+
+* ``op_read_elements(op, T, spec)`` equals the mean of
+  ``instant_read_elements(op, t, spec)`` over ``t = 0..T-1`` (the prefill
+  average is the rolling mean of the decode marginal), and
+* ``instant_read_elements(op, T, spec)`` is the analytical budget of the
+  FIRST token decoded after a prefill of ``T`` tokens.
+
+:func:`windowed_read_elements` exposes the mean marginal over an arbitrary
+decode window ``[t0, t1)`` in O(1) (closed-form subtraction of the averaged
+functions), which is what a measured per-token decode latency should be
+compared against — the prefill average at ``T`` understates the cost of the
+last decoded positions because it mixes in the cheap early ones.
+
 The low-level visible-pair counters are imported from :mod:`run_kv_cache`
 (``causal_block_entries`` / ``causal_selected_entries``) so the budget model
 and the Exp 3 KV/FLOPs accounting can never disagree on causality.
@@ -208,6 +229,7 @@ def op_read_elements(op: str, T: int, spec: dict) -> dict:
             f"op_read_elements: spec is missing the {op!r} geometry block "
             f"(keys present: {sorted(spec)}).")
     geo = spec[op]
+    components = {}
     if op == 'softmax':
         core = softmax_read_elements(T, geo['n_kv_heads'], geo['d_k'],
                                      geo['d_v'])
@@ -225,6 +247,10 @@ def op_read_elements(op: str, T: int, spec: dict) -> dict:
         core = parts['core_read_elements']
         indexer = parts['indexer_read_elements']
         state = None
+        components = {
+            'selected_read_elements': parts['selected_read_elements'],
+            'window_read_elements': parts['window_read_elements'],
+        }
     else:  # hca
         parts = hca_read_elements(
             T, m2=geo['m2'], c=geo['c'],
@@ -232,6 +258,10 @@ def op_read_elements(op: str, T: int, spec: dict) -> dict:
         core = parts['core_read_elements']
         indexer = parts['indexer_read_elements']
         state = None
+        components = {
+            'dense_read_elements': parts['dense_read_elements'],
+            'window_read_elements': parts['window_read_elements'],
+        }
     return {
         'op': op,
         'T': int(T),
@@ -239,6 +269,149 @@ def op_read_elements(op: str, T: int, spec: dict) -> dict:
         'indexer_read_elements': indexer,
         'state_elements': state,
         'total_read_elements': core + indexer,
+        **components,
+    }
+
+
+def _validate_t(t, fn_name: str) -> None:
+    if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+        raise ValueError(f'{fn_name}: t must be a non-negative int, got {t!r}')
+
+
+def _instant_op_components(op: str, t: int, geo: dict) -> dict:
+    """Per-position (marginal) read components for one operator.
+
+    Called only after :func:`op_read_elements` has validated the geometry
+    (at ``T = max(t, 1)``), so the raw ``geo`` lookups below cannot hit an
+    unvalidated value.
+    """
+    if op == 'softmax':
+        core = (t + 1) * geo['n_kv_heads'] * (geo['d_k'] + geo['d_v'])
+        return {'core_read_elements': float(core),
+                'indexer_read_elements': 0.0,
+                'total_read_elements': float(core)}
+    if op == 'kda':
+        # Every recurrent step reads the state twice (masked delta read +
+        # output read); the delta-rule extreme is position-independent.
+        core = 2.0 * kda_state_elements(geo['hv'], geo['d_k'], geo['d_v'])
+        return {'core_read_elements': core,
+                'indexer_read_elements': 0.0,
+                'total_read_elements': core}
+    if op == 'csa':
+        selected = min(geo['topk'], t // geo['m']) * float(geo['c'])
+        window = (min(t + 1, geo['sliding_window']) * float(geo['c'])
+                  if geo.get('sliding_window', 0) > 0 else 0.0)
+        indexer = (t // geo['m']) * float(geo['c_i']) \
+            * geo.get('n_idx_heads', 1)
+        return {
+            'selected_read_elements': selected,
+            'window_read_elements': window,
+            'core_read_elements': selected + window,
+            'indexer_read_elements': indexer,
+            'total_read_elements': selected + window + indexer,
+        }
+    # hca
+    dense = (t // geo['m2']) * float(geo['c'])
+    window = (min(t + 1, geo['sliding_window']) * float(geo['c'])
+              if geo.get('sliding_window', 0) > 0 else 0.0)
+    return {
+        'dense_read_elements': dense,
+        'window_read_elements': window,
+        'core_read_elements': dense + window,
+        'indexer_read_elements': 0.0,
+        'total_read_elements': dense + window,
+    }
+
+
+def instant_read_elements(op: str, t: int, spec: dict) -> dict:
+    """KV-side reads charged to the query at position ``t`` (marginal form).
+
+    This is the decode-side primitive of the budget model: the query at
+    position ``t`` sees ``t // m`` strictly-preceding compressed blocks
+    (``t // m2`` for HCA), ``min(t + 1, sliding_window)`` window entries,
+    and — for CSA — scores every visible block with the lightning indexer.
+    Averaging over ``t = 0..T-1`` reproduces :func:`op_read_elements`
+    exactly (prefill/decode unification), and evaluating at ``t = T`` is the
+    budget of the first token decoded after a prefill of ``T`` tokens.
+
+    Geometry validation is delegated to :func:`op_read_elements` (the
+    checks are position-independent), so invalid specs raise the same
+    ``ValueError`` here as in the averaged path.
+    """
+    if op not in _OP_FUNCS:
+        raise ValueError(
+            f"instant_read_elements: op={op!r} must be one of "
+            f"{list(_OP_FUNCS)}.")
+    if op not in spec:
+        raise ValueError(
+            f"instant_read_elements: spec is missing the {op!r} geometry "
+            f"block (keys present: {sorted(spec)}).")
+    _validate_t(t, 'instant_read_elements')
+    ref = op_read_elements(op, t if t > 0 else 1, spec)
+    return {'op': op, 't': int(t), 'state_elements': ref['state_elements'],
+            **_instant_op_components(op, t, spec[op])}
+
+
+def windowed_read_elements(op: str, t0: int, t1: int, spec: dict) -> dict:
+    """Mean marginal budget over decode positions ``t0 <= t < t1``.
+
+    ``windowed_read_elements(op, 0, T, spec)`` is component-wise equal to
+    :func:`op_read_elements` — the prefill average IS the rolling mean of
+    the decode marginal. For ``t0 = T`` (a decode window after a prefill of
+    ``T`` tokens) it gives the budget the measured per-token decode latency
+    should be compared against.
+
+    Computed in O(1) as ``(t1 * avg(t1) - t0 * avg(t0)) / (t1 - t0)`` from
+    the closed-form averaged functions, which is exact because every
+    component is additive over positions.
+    """
+    _validate_t(t0, 'windowed_read_elements')
+    _validate_t(t1, 'windowed_read_elements')
+    if t1 <= t0:
+        raise ValueError(
+            f'windowed_read_elements: need 0 <= t0 < t1, got '
+            f't0={t0!r}, t1={t1!r}')
+    row0 = op_read_elements(op, t0, spec)
+    row1 = op_read_elements(op, t1, spec)
+    out = {'op': op, 't0': int(t0), 't1': int(t1),
+           'state_elements': row1['state_elements']}
+    for key, v1 in row1.items():
+        if key in ('op', 'T', 'state_elements'):
+            continue
+        out[key] = (t1 * float(v1) - t0 * float(row0[key])) / (t1 - t0)
+    return out
+
+
+def _validate_ratio(ratio, fn_name: str) -> tuple:
+    if not (isinstance(ratio, (tuple, list)) and len(ratio) == 3):
+        raise ValueError(
+            f'{fn_name}: ratio must be a 3-sequence, got {ratio!r}')
+    if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0
+               for n in ratio):
+        raise ValueError(
+            f'{fn_name}: ratio components must be non-negative ints, '
+            f'got {ratio!r}')
+    n_kda, n_csa, n_hca = (int(n) for n in ratio)
+    if n_kda + n_csa + n_hca == 0:
+        raise ValueError(f'{fn_name}: empty layout')
+    return n_kda, n_csa, n_hca
+
+
+def _layout_row(time_key: str, time_value, n_kda: int, n_csa: int,
+                n_hca: int, per_layer: dict) -> dict:
+    """Shared row shape for the averaged / marginal / windowed layout views."""
+    kda = n_kda * per_layer['kda']
+    csa = n_csa * per_layer['csa']
+    hca = n_hca * per_layer['hca']
+    return {
+        time_key: time_value,
+        'n_kda': n_kda,
+        'n_csa': n_csa,
+        'n_hca': n_hca,
+        'kda_read_elements': kda,
+        'csa_read_elements': csa,
+        'hca_read_elements': hca,
+        'total_read_elements': kda + csa + hca,
     }
 
 
@@ -248,32 +421,47 @@ def layout_read_elements(T: int, ratio, spec: dict) -> dict:
     The layout budget is the per-layer sum because layers execute
     sequentially and each query passes through every layer once.
     """
-    if not (isinstance(ratio, (tuple, list)) and len(ratio) == 3):
-        raise ValueError(
-            f'layout_read_elements: ratio must be a 3-sequence, got {ratio!r}')
-    if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0
-               for n in ratio):
-        raise ValueError(
-            f'layout_read_elements: ratio components must be non-negative '
-            f'ints, got {ratio!r}')
-    n_kda, n_csa, n_hca = (int(n) for n in ratio)
-    if n_kda + n_csa + n_hca == 0:
-        raise ValueError('layout_read_elements: empty layout')
+    n_kda, n_csa, n_hca = _validate_ratio(ratio, 'layout_read_elements')
     per_layer = {op: op_read_elements(op, T, spec)['total_read_elements']
                  for op in _OP_FUNCS}
-    kda = n_kda * per_layer['kda']
-    csa = n_csa * per_layer['csa']
-    hca = n_hca * per_layer['hca']
-    return {
-        'T': int(T),
-        'n_kda': n_kda,
-        'n_csa': n_csa,
-        'n_hca': n_hca,
-        'kda_read_elements': kda,
-        'csa_read_elements': csa,
-        'hca_read_elements': hca,
-        'total_read_elements': kda + csa + hca,
-    }
+    return _layout_row('T', int(T), n_kda, n_csa, n_hca, per_layer)
+
+
+def instant_layout_read_elements(ratio, t: int, spec: dict) -> dict:
+    """Marginal layout budget at position ``t`` (the first decode step after
+    a ``t``-token prefill). Layers execute sequentially, so per-layer
+    marginal budgets add.
+    """
+    _validate_t(t, 'instant_layout_read_elements')
+    n_kda, n_csa, n_hca = _validate_ratio(
+        ratio, 'instant_layout_read_elements')
+    per_layer = {op: instant_read_elements(op, t, spec)
+                 ['total_read_elements'] for op in _OP_FUNCS}
+    return _layout_row('t', int(t), n_kda, n_csa, n_hca, per_layer)
+
+
+def windowed_layout_read_elements(ratio, t0: int, t1: int,
+                                  spec: dict) -> dict:
+    """Mean marginal layout budget over decode positions ``[t0, t1)``.
+
+    Component-wise ``windowed_layout_read_elements(ratio, 0, T, spec)``
+    equals :func:`layout_read_elements`, and ``t0 = T`` gives the budget of
+    a decode window after a ``T``-token prefill.
+    """
+    _validate_t(t0, 'windowed_layout_read_elements')
+    _validate_t(t1, 'windowed_layout_read_elements')
+    if t1 <= t0:
+        raise ValueError(
+            f'windowed_layout_read_elements: need 0 <= t0 < t1, got '
+            f't0={t0!r}, t1={t1!r}')
+    row0 = layout_read_elements(t0, ratio, spec)
+    row1 = layout_read_elements(t1, ratio, spec)
+    out = {'t0': int(t0), 't1': int(t1), 'n_kda': row1['n_kda'],
+           'n_csa': row1['n_csa'], 'n_hca': row1['n_hca']}
+    for key in ('kda_read_elements', 'csa_read_elements',
+                'hca_read_elements', 'total_read_elements'):
+        out[key] = (t1 * row1[key] - t0 * row0[key]) / (t1 - t0)
+    return out
 
 
 def _average_ranks(values) -> list:

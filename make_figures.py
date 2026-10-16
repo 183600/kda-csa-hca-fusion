@@ -961,79 +961,108 @@ def fig_roofline():
     print('Saved figures/fig_roofline.pdf')
 
 
-def fig_budget_frontier():
-    """Figure: KV read-budget curves and the top-k decode sweep (Exp 9).
+_BUDGET_COLORS = {'softmax': 'tab:blue', 'kda': 'tab:red',
+                  'csa': 'tab:green', 'hca': 'tab:orange'}
+_BUDGET_MARKERS = {'softmax': 'o', 'kda': 's', 'csa': 'D', 'hca': 'v'}
 
-    Left: analytical KV-side elements read per query per layer vs context
-    length for the four operators in both geometries (solid = paper-scale,
-    dashed = MQAR probe). KDA is flat (delta-rule O(1) state); CSA and HCA
-    grow through the window/scan terms. Right: measured per-token decode
-    latency of the fused hybrid vs its analytical budget for swept
-    ``csa_topk`` values (annotated).
-    """
-    rows = load('exp9_budget_frontier.json')
-    curves = [r for r in rows if r.get('section') == 'budget_curve'
-              and r.get('row_kind') == 'op' and r.get('T')]
-    decode = [r for r in rows if r.get('section') == 'decode_sweep'
-              and r.get('error') is None
-              and r.get('mean_decode_ms_per_token')]
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8),
-                             constrained_layout=True)
-    ax = axes[0]
-    colors = {'softmax': 'tab:blue', 'kda': 'tab:red',
-              'csa': 'tab:green', 'hca': 'tab:orange'}
-    markers = {'softmax': 'o', 'kda': 's', 'csa': 'D', 'hca': 'v'}
+
+def _budget_curve_panel(ax, curve_rows, xkey, xlabel, title, note):
+    """Draw the 4 operators x 2 geometries on one log-log budget panel."""
     any_curve = False
     for geom, ls in (('paper', '-'), ('mqar', '--')):
         for op in ('softmax', 'kda', 'csa', 'hca'):
-            pts = sorted([r for r in curves
-                          if r.get('geometry') == geom and r['name'] == op],
-                         key=lambda r: r['T'])
+            pts = sorted([r for r in curve_rows
+                          if r.get('geometry') == geom and r['name'] == op
+                          and xkey in r], key=lambda r: r[xkey])
             if not pts:
                 continue
             any_curve = True
-            ax.plot([p['T'] for p in pts],
+            ax.plot([p[xkey] for p in pts],
                     [p['total_read_elements'] for p in pts],
-                    ls, color=colors[op], marker=markers[op], ms=4.5,
-                    lw=1.4, label=f'{op} ({geom})')
+                    ls, color=_BUDGET_COLORS[op],
+                    marker=_BUDGET_MARKERS[op], ms=4.5, lw=1.4,
+                    label=f'{op} ({geom})')
     if any_curve:
         ax.set_xscale('log')
         ax.set_yscale('log')
-        ax.set_xlabel('Context length T (tokens)')
+        ax.set_xlabel(xlabel)
         ax.set_ylabel('KV elements read per query per layer')
-        ax.set_title('Analytical read budget (lower bound)', fontsize=11)
+        ax.set_title(title, fontsize=11)
         ax.grid(True, which='both', alpha=0.25)
         ax.legend(fontsize=7, ncol=2, loc='upper left')
-        ax.text(0.98, 0.03,
-                'KDA: flat (delta-rule O(1) state)\n'
-                'CSA: selected gather (capped) + O(T) indexer scan\n'
-                'Not profiled traffic; q-side projections excluded.',
-                transform=ax.transAxes, fontsize=6.5, color='0.4',
-                ha='right', va='bottom')
+        ax.text(0.98, 0.03, note, transform=ax.transAxes, fontsize=6.5,
+                color='0.4', ha='right', va='bottom')
     else:
         ax.text(0.5, 0.5, 'no budget-curve rows', ha='center', va='center',
                 transform=ax.transAxes, fontsize=10, color='0.4')
         ax.set_axis_off()
-    ax = axes[1]
+    return any_curve
+
+
+def fig_budget_frontier():
+    """Figure: KV read-budget curves, the decode-step frontier, and the
+    top-k decode sweep (Exp 9).
+
+    Left: analytical prefill-average budget vs context length for the four
+    operators in both geometries (solid = paper-scale, dashed = MQAR
+    probe). KDA is flat (delta-rule O(1) state); CSA and HCA grow through
+    the window/scan terms. Middle: the marginal (per-position) view — the
+    elements ONE query reads at decode position t; averaging this curve
+    over the prefill reproduces the left panel exactly. Right: measured
+    per-token decode latency of the fused hybrid vs its analytical
+    decode-step budget for swept ``csa_topk`` values (annotated); stale
+    result files without the decode-step fields fall back to the prefill
+    average.
+    """
+    rows = load('exp9_budget_frontier.json')
+    curves = [r for r in rows if r.get('section') == 'budget_curve'
+              and r.get('row_kind') == 'op' and r.get('T')]
+    marginal = [r for r in rows
+                if r.get('section') == 'decode_budget_curve'
+                and r.get('row_kind') == 'op' and 't' in r]
+    decode = [r for r in rows if r.get('section') == 'decode_sweep'
+              and r.get('error') is None
+              and r.get('mean_decode_ms_per_token')]
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8),
+                             constrained_layout=True)
+    _budget_curve_panel(
+        axes[0], curves, 'T', 'Context length T (tokens)',
+        'Prefill-average read budget (lower bound)',
+        'KDA: flat (delta-rule O(1) state)\n'
+        'CSA: selected gather (capped) + O(T) indexer scan\n'
+        'Not profiled traffic; q-side projections excluded.')
+    _budget_curve_panel(
+        axes[1], marginal, 't', 'Decode position t (context already seen)',
+        'Decode-step marginal budget (one query)',
+        'Same model as the left panel, evaluated at ONE position:\n'
+        't = T is the first token decoded after a T-token prefill.\n'
+        'Mean over t < T equals the prefill average.')
+    ax = axes[2]
     if decode:
+        def _budget_key(r):
+            return ('decode_step_read_elements_per_query'
+                    if 'decode_step_read_elements_per_query' in r
+                    else 'total_read_elements_per_query')
+
         prefill_vals = sorted({r['prefill_len'] for r in decode})
         cmap = plt.get_cmap('viridis')
         for i, plen in enumerate(prefill_vals):
             pts = [r for r in decode if r['prefill_len'] == plen]
             pts.sort(key=lambda r: r['csa_topk'])
-            ax.plot([p['total_read_elements_per_query'] for p in pts],
+            ax.plot([p[_budget_key(p)] for p in pts],
                     [p['mean_decode_ms_per_token'] for p in pts],
                     'o-', color=cmap(0.15 + 0.7 * i / max(1, len(prefill_vals) - 1)),
                     ms=5, lw=1.2, label=f'prefill L={plen}')
             for p in pts:
                 ax.annotate(f"k={p['csa_topk']}",
-                            (p['total_read_elements_per_query'],
+                            (p[_budget_key(p)],
                              p['mean_decode_ms_per_token']),
                             fontsize=6, xytext=(3, 3),
                             textcoords='offset points', color='0.35')
         ax.set_xscale('log')
         ax.set_yscale('log')
-        ax.set_xlabel('Analytical budget (elements/query/layer)')
+        ax.set_xlabel('Analytical decode-step budget '
+                      '(elements/query/layer)')
         ax.set_ylabel('Measured decode ms per token')
         ax.set_title('Top-k budget vs measured decode latency', fontsize=11)
         ax.grid(True, which='both', alpha=0.25)
@@ -1047,8 +1076,9 @@ def fig_budget_frontier():
         ax.text(0.5, 0.5, 'no decode-sweep rows', ha='center', va='center',
                 transform=ax.transAxes, fontsize=10, color='0.4')
         ax.set_axis_off()
-    fig.suptitle('Exp 9: KV read-budget frontier (top-k budget, delta-rule '
-                 'O(1) state, hybrid ratio)', fontsize=12)
+    fig.suptitle('Exp 9: KV read-budget frontier (prefill average | '
+                 'decode marginal | top-k sweep; delta-rule O(1) state, '
+                 'hybrid ratio)', fontsize=12)
     _ensure_figures_dir()
     try:
         fig.savefig(os.path.join(_FIGURES_DIR, 'fig_budget_frontier.pdf'),

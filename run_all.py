@@ -510,6 +510,7 @@ def run_all(seeds=None, steps=None):
         import test_roofline_schema
         import test_mechanism_ablation
         import test_budget_frontier
+        import test_ssd_duality
         import method_analysis
         import make_figures
 
@@ -534,6 +535,12 @@ def run_all(seeds=None, steps=None):
         #     delta-rule O(1) identities carry their own test module.
         summary['runs'].append(
             _run('test_budget_frontier', test_budget_frontier.main))
+
+        # 1e. SSD-duality unit tests — the Mamba-2 reference scan pinned
+        #     against the independent dual (masked-attention) form, with
+        #     forward/gradient/contract parity.
+        summary['runs'].append(
+            _run('test_ssd_duality', test_ssd_duality.main))
 
         # 2. KV cache analysis — pure arithmetic, always run.
         summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))

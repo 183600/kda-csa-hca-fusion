@@ -8,8 +8,19 @@ them answers the *budget* question that drives the top-k knob and the hybrid
 ratio: **how many KV-side elements does one query read, and which term
 dominates as context grows?**
 
-This experiment unifies three questions under one currency (average KV-side
-elements read per query per layer; see ``kv_budget`` for the exact contract):
+This experiment unifies three questions under one currency (KV-side
+elements read per query per layer; see ``kv_budget`` for the exact
+contract). The currency has TWO views that ``kv_budget`` keeps unified:
+
+* the **prefill average** over positions ``0..T-1`` (``op_read_elements`` /
+  ``layout_read_elements``), and
+* the **marginal / decode-step** view at a single position ``t``
+  (``instant_read_elements`` / ``instant_layout_read_elements``), whose
+  rolling mean is exactly the prefill average and whose value at
+  ``t = T`` is the budget of the first token decoded after a ``T``-token
+  prefill. ``windowed_*`` gives the O(1) mean over any decode window.
+
+Questions:
 
 1. **Analytic budget curves** over context length for the four core
    operators and the seven Exp 5 hybrid layouts, in two geometries (the
@@ -17,18 +28,25 @@ elements read per query per layer; see ``kv_budget`` for the exact contract):
    curves expose the two terms of CSA: the O(topk) selected gather AND the
    O(T) lightning-indexer scan, which the reference implementation performs
    over every visible compressed block before selecting the top-k. They also
-   expose the delta-rule extreme: KDA's state read is O(1) in T.
+   expose the delta-rule extreme: KDA's state read is O(1) in T. A second
+   `decode_budget_curve` section reports the MARGINAL (per-position) view
+   for the same operators and layouts: the true per-token budget during
+   decoding, not the prefill average (the decode average understates the
+   cost of late positions).
 2. **Measured top-k decode sweep**: per-token decode latency of the fused
    3:1:1 hybrid as ``csa_topk`` varies (0 = sparse branch off, then 1/2/4/8),
-   joined with the analytic read budget at the same geometry. This tests
+   joined with BOTH analytic views at the same geometry: the prefill
+   average (backward-compatible ``total_read_elements_per_query``) and the
+   decode-window budget over the actually decoded positions. This tests
    whether shrinking the top-k budget actually buys latency in the
    reference implementation.
 3. **Quality-budget join**: if Exp 4/5/8 result files exist, each measured
    configuration is annotated with its analytic budget at the MQAR context
    (T=16), and the Exp 5 layout ranking is compared against the budget
    ranking at T=16 and at a long-context extrapolation (T=8192, paper
-   geometry). Exp 5 controls depth but not budget; the join makes that
-   distinction explicit and exploratory (Spearman over 7 layouts).
+   geometry) in both views. Exp 5 controls depth but not budget; the join
+   makes that distinction explicit and exploratory (Spearman over 7
+   layouts).
 
 Honesty / scope
 ---------------
@@ -76,7 +94,14 @@ from kaggle_setup import (
     configure_torch_for_device,
     parse_int_env,
 )
-from kv_budget import layout_read_elements, op_read_elements, spearman
+from kv_budget import (
+    instant_layout_read_elements,
+    instant_read_elements,
+    layout_read_elements,
+    op_read_elements,
+    spearman,
+    windowed_layout_read_elements,
+)
 from results_schema import load as load_schema
 from results_schema import write as write_schema
 from run_ablation import _make_cfg
@@ -194,12 +219,53 @@ def build_budget_curves(t_grid, specs):
     return rows
 
 
+def build_decode_budget_curves(t_grid, specs):
+    """Marginal budget rows — the decode-side view of the frontier.
+
+    Row ``t`` is the budget charged to the query at position ``t`` (i.e.
+    the first token decoded after a ``t``-token prefill), NOT the prefill
+    average over ``0..t-1``. The two views agree under averaging by
+    construction (``kv_budget`` pins the identity); at long context the
+    marginal view shows the true per-token decode cost, which the prefill
+    average understates.
+    """
+    rows = []
+    for geom, spec in specs.items():
+        for t in t_grid:
+            for op in ('softmax', 'kda', 'csa', 'hca'):
+                r = instant_read_elements(op, t, spec)
+                rows.append({
+                    'section': 'decode_budget_curve',
+                    'row_kind': 'op',
+                    'geometry': geom,
+                    'name': op,
+                    **r,
+                })
+            for ratio in LAYOUTS:
+                r = instant_layout_read_elements(ratio, t, spec)
+                rows.append({
+                    'section': 'decode_budget_curve',
+                    'row_kind': 'layout',
+                    'geometry': geom,
+                    'name': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
+                    'ratio': list(ratio),
+                    **r,
+                })
+    return rows
+
+
 def _decode_row(cfg, bench, topk, prefill_len, n_decode, repeats):
     softmax_geo = {'n_kv_heads': 2, 'd_k': 16, 'd_v': 16}
     spec = _spec_from_hybrid_cfg(cfg, softmax_geo=softmax_geo)
-    budget = layout_read_elements(
-        prefill_len, (cfg.n_kda, cfg.n_csa, cfg.n_hca), spec)
+    ratio = (cfg.n_kda, cfg.n_csa, cfg.n_hca)
+    budget = layout_read_elements(prefill_len, ratio, spec)
     csa_op = op_read_elements('csa', prefill_len, spec)
+    # Decode-side (marginal) budgets: the first decoded token sits at
+    # position prefill_len, and the n_decode measured tokens span the
+    # window [prefill_len, prefill_len + n_decode).
+    step = instant_layout_read_elements(ratio, prefill_len, spec)
+    window = windowed_layout_read_elements(
+        ratio, prefill_len, prefill_len + n_decode, spec)
     return {
         'section': 'decode_sweep',
         'csa_topk': topk,
@@ -217,6 +283,13 @@ def _decode_row(cfg, bench, topk, prefill_len, n_decode, repeats):
             csa_op['indexer_read_elements'],
         'csa_core_read_elements_per_query':
             csa_op['core_read_elements'],
+        'decode_step_read_elements_per_query':
+            step['total_read_elements'],
+        'decode_window_read_elements_per_query':
+            window['total_read_elements'],
+        'decode_step_kda_read_elements': step['kda_read_elements'],
+        'decode_step_csa_read_elements': step['csa_read_elements'],
+        'decode_step_hca_read_elements': step['hca_read_elements'],
     }
 
 
@@ -353,35 +426,52 @@ def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192):
         }]
     labels = [r['label'] for r in exp5]
     accs = [r['mean_acc'] for r in exp5]
-    out = []
-    for geom, spec in specs.items():
-        budgets = [layout_read_elements(aT, _parse_ratio(lbl),
-                                        spec)['total_read_elements']
-                   for lbl in labels]
+
+    def _order_and_spearman(budgets):
         order = [lbl for _b, lbl in
                  sorted(zip(budgets, labels), key=lambda t: t[0])]
+        return order, spearman(budgets, accs)
+
+    out = []
+    for geom, spec in specs.items():
+        ratios = [_parse_ratio(lbl) for lbl in labels]
+        budgets = [layout_read_elements(aT, r, spec)['total_read_elements']
+                   for r in ratios]
+        order, rho = _order_and_spearman(budgets)
+        # Decode-step view: budget of the first token decoded after a
+        # aT-token prefill (t = aT), not the aT-prefill average.
+        dec_budgets = [instant_layout_read_elements(r, aT, spec)
+                       ['total_read_elements'] for r in ratios]
+        dec_order, dec_rho = _order_and_spearman(dec_budgets)
         out.append({
             'section': 'ranking_summary',
             'geometry': geom,
             'context_T': aT,
+            'decode_budget_position': aT,
             'n_layouts': len(labels),
             'labels': labels,
             'layout_order_by_budget_ascending': order,
-            'spearman_acc_vs_budget': spearman(budgets, accs),
+            'spearman_acc_vs_budget': rho,
+            'layout_order_by_decode_budget_ascending': dec_order,
+            'spearman_acc_vs_decode_budget': dec_rho,
         })
-        long_budgets = [layout_read_elements(bT, _parse_ratio(lbl),
-                                             spec)['total_read_elements']
-                        for lbl in labels]
+        long_budgets = [layout_read_elements(bT, r, spec)
+                        ['total_read_elements'] for r in ratios]
+        long_order, long_rho = _order_and_spearman(long_budgets)
+        long_dec_budgets = [instant_layout_read_elements(r, bT, spec)
+                            ['total_read_elements'] for r in ratios]
+        long_dec_order, long_dec_rho = _order_and_spearman(long_dec_budgets)
         out.append({
             'section': 'ranking_summary',
             'geometry': geom,
             'context_T': bT,
+            'decode_budget_position': bT,
             'n_layouts': len(labels),
             'labels': labels,
-            'layout_order_by_budget_ascending': [
-                lbl for _b, lbl in
-                sorted(zip(long_budgets, labels), key=lambda t: t[0])],
-            'spearman_acc_vs_budget': spearman(long_budgets, accs),
+            'layout_order_by_budget_ascending': long_order,
+            'spearman_acc_vs_budget': long_rho,
+            'layout_order_by_decode_budget_ascending': long_dec_order,
+            'spearman_acc_vs_decode_budget': long_dec_rho,
             'note': 'long-context budget is an extrapolation of the same '
                     'layouts; accuracies were measured at T=16 only',
             'interpretation_caveat': (
@@ -425,6 +515,28 @@ def _print_curves(rows, t_grid):
             print(f'{label:>8} | ' + ' | '.join(vals))
 
 
+def _print_decode_frontier(rows, t_grid):
+    """Marginal (decode-step) budget: one query at position t, not averaged."""
+    print('\n' + '=' * 96)
+    print('Decode-step marginal budget (elements read by ONE query at t)')
+    print('=' * 96)
+    for geom in ('mqar', 'paper'):
+        print(f'\ngeometry={geom}')
+        header = f"{'kind':>8} | " + ' | '.join(
+            f't={t:>6}' for t in t_grid)
+        print(header)
+        print('-' * len(header))
+        for name in ('softmax', 'kda', 'csa', 'hca'):
+            vals = []
+            for t in t_grid:
+                r = next(r for r in rows
+                         if r['section'] == 'decode_budget_curve'
+                         and r['geometry'] == geom and r['row_kind'] == 'op'
+                         and r['name'] == name and r['t'] == t)
+                vals.append(f"{r['total_read_elements']:>8.1f}")
+            print(f'{name:>8} | ' + ' | '.join(vals))
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -458,6 +570,9 @@ def main():
     specs = {'mqar': mqar_spec(), 'paper': paper_spec()}
     rows = build_budget_curves(t_grid, specs)
     _print_curves(rows, t_grid)
+    decode_curve_rows = build_decode_budget_curves(t_grid, specs)
+    rows.extend(decode_curve_rows)
+    _print_decode_frontier(decode_curve_rows, t_grid)
 
     logger.info('\n-- decode top-k sweep (fused 3:1:1 hybrid) --')
     decode_rows = run_decode_sweep(
@@ -475,11 +590,28 @@ def main():
         'design': (
             'One currency for top-k budget / delta-rule state / hybrid '
             'ratio: analytical KV-side elements read per query per layer, '
-            'averaged over positions. Curves cover the 4 core operators '
-            'and the 7 Exp 5 layouts in MQAR and paper geometries; a '
-            'measured decode-latency sweep over csa_topk joins the '
-            'analytic budget; Exp 4/5/8 rows (if present) are joined with '
-            'their measured-context budget.'),
+            'in two unified views. budget_curve rows are the prefill '
+            'average over positions 0..T-1; decode_budget_curve rows are '
+            'the marginal view at position t (the first token decoded '
+            'after a t-token prefill); the rolling mean of the marginal '
+            'view is exactly the prefill average (pinned by '
+            'test_budget_frontier). Curves cover the 4 core operators and '
+            'the 7 Exp 5 layouts in MQAR and paper geometries; a measured '
+            'decode-latency sweep over csa_topk joins BOTH views; Exp 4/5/8 '
+            'rows (if present) are joined with their measured-context '
+            'budget, and the layout ranking is reported under both views.'),
+        'prefill_decode_unification': (
+            'kv_budget.instant_read_elements(op, t) charges exactly the '
+            'elements read by the query at position t under the same causal '
+            'conventions as the averaged model; mean_{t<T} instant == '
+            'op_read_elements(op, T) by construction (identity tests in '
+            'test_budget_frontier). A decode sweep that '
+            'measures per-token latency should therefore be compared '
+            'against the decode_window_* fields (mean marginal over the '
+            'actually decoded positions [prefill_len, prefill_len + n)) '
+            'rather than the prefill average, which mixes in cheap early '
+            'positions. The prefill average is kept in '
+            'total_read_elements_per_query for backward compatibility.'),
         'currency_definition': (
             'element = one scalar of the KV-side representation (compressed '
             'shared-KV vector counts once; window token contributes c; KDA '
@@ -522,6 +654,10 @@ def main():
             'topk=0 still charges the indexer scan because the reference '
             'operator scores all blocks before skipping the gather; a '
             'production engine could skip selection entirely.',
+            'The decode-step (marginal) view is the same analytical model '
+            'evaluated at one position; it excludes Python-loop and '
+            'cache-management overhead, so it is the right shape of the '
+            'decode cost, not a latency prediction.',
         ],
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
         'provenance': capture_provenance(),
@@ -533,7 +669,9 @@ def main():
     logger.info(f'\nSaved: {RESULTS_PATH}')
 
     errors = sum(1 for r in decode_rows if 'error' in r)
-    if not any(r['section'] == 'budget_curve' for r in rows) or errors:
+    if (not any(r['section'] == 'budget_curve' for r in rows)
+            or not any(r['section'] == 'decode_budget_curve' for r in rows)
+            or errors):
         logger.error(
             f'\nexp9 incomplete: {errors} decode-sweep cells errored; '
             f'returning non-zero.')

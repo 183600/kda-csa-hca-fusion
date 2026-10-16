@@ -147,6 +147,48 @@ correctness baselines, never speed rankings; accelerated rows are
 "current implementation" system numbers, not architecture-intrinsic
 costs.
 
+### 4.1 The SSD duality oracle (reference-scan correctness)
+
+The reference recurrence's other correctness chains share its code path
+or self-skip on CPU: prefill/step/segmented-prefill all run the same
+scan, and the official-backend parity test needs CUDA + `mamba-ssm`. A
+semantic error in the recurrence (wrong decay convention, wrong causal
+alignment, wrong group-to-head mapping) could therefore survive CI
+unnoticed. The **state-space duality** gives an independent check.
+
+`ops_mamba.quadratic_mamba2_scan` evaluates the same operator as causally
+masked quadratic attention with a semi-separable decay
+(arXiv:2405.21060 Sections 3-4). With per-head cumulative log-decays
+`G_t = sum_{r<=t} dt_r * A`:
+
+```
+y_t = sum_{s<=t} exp(G_t - G_s) * dt_s * (C_t . B_s) * x_s
+      + exp(G_t) * (C_t . S_0) + D * x_t
+S_T = exp(G_{T-1}) * S_0 + sum_s exp(G_{T-1} - G_s) * dt_s * (x_s (x) B_s)
+```
+
+It is implemented from `cumsum` + matmuls + one elementwise `exp` — no
+sequential recurrence — and shares the input contract with the reference
+through ONE validator (`_validate_mamba2_scan_inputs`), so the two views
+cannot drift apart in what they accept. Non-causal pairwise entries are
+masked **before** the `exp` (a positive exponent would overflow and
+`inf * 0 = NaN` would poison the mask). It is O(T^2) by design: a test
+oracle and the semantic reference for future chunked/parallel SSD
+kernels, never a production path.
+
+`test_ssd_duality.py` pins, to fp64 machine precision:
+
+* hand-computed closed forms (two-step y/state, initial-state decay),
+* forward parity across group counts 1/2/4, with/without initial state,
+  at T=13 and T=64,
+* contract parity: T=0, `output_final_state=False`, fp32/fp16 dtype
+  passthrough, and identical rejection of malformed inputs,
+* gradient parity for every input (x, dt, B, C, A, D, S0).
+
+The same validator now also rejects `B`/`C` batch or seqlen shapes that
+differ from `x` (previously they could silently broadcast/index wrongly
+instead of erroring).
+
 ## 5. The eight-group main experiment
 
 `ABL_MODE=matrix` (run_ablation.py) crosses the memory route with four
@@ -253,7 +295,9 @@ not to pre-empt the answer by changing the default route.
   backend remains the weight-compatible baseline.
 * The reference Mamba-2 scan is a sequential Python loop (like the KDA
   reference): correctness-first, not throughput. Speed conclusions must
-  use the official-backend rows.
+  use the official-backend rows. Its *semantics* are independently pinned
+  by the SSD dual-form oracle (section 4.1), so the CPU-only
+  official-backend gap does not leave the reference unverified.
 * Hybrid-decode equality uses the `csa_topk=100` protocol because of the
   pre-existing `torch.topk` tie-breaking artifact documented in the
   README (a numerical artifact, not a correctness bug; identical for

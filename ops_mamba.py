@@ -39,6 +39,21 @@ CPU/GPU-agnostic experiments, not a speed-optimized kernel. Speed comparisons
 against KDA must use the official backend rows in ``run_benchmark.py``
 (documented there as "current implementation" numbers, never as architecture
 intrinsic costs).
+
+Correctness chain / SSD duality oracle
+--------------------------------------
+The recurrent scan above is validated by self-consistency checks (prefill +
+decode == full forward) and by the optional official-backend parity test,
+which self-skips without CUDA + ``mamba-ssm``. Both chains run the SAME
+recurrence, so a shared semantic error (e.g. a decay/indexing convention
+mistake) could survive them. :func:`quadratic_mamba2_scan` closes that hole
+with a mathematically independent evaluation: the SSD dual form — the same
+operator as a masked quadratic "attention" with a semi-separable pairwise
+decay (arXiv:2405.21060 Sections 3-4), computed from cumulative log-decays
+instead of a sequential state recurrence. It shares the shape/validation
+contract by construction (one validator) and is pinned by forward AND
+gradient parity tests in
+``test_ssd_duality.py``. It is an oracle, never a production path.
 """
 
 from __future__ import annotations
@@ -54,6 +69,7 @@ __all__ = [
     "Mamba2Mixer",
     "build_mamba2_mixer",
     "naive_mamba2_scan",
+    "quadratic_mamba2_scan",
     "resolve_mamba_dt_rank",
     "validate_mamba2_geometry",
 ]
@@ -202,6 +218,93 @@ def _get_scripted_scan_loop():
     return _SCAN_LOOP_SCRIPTED
 
 
+def _validate_mamba2_scan_inputs(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    fn_name: str,
+) -> dict:
+    """Shared shape/dtype contract for both Mamba-2 scan views.
+
+    The recurrent (:func:`naive_mamba2_scan`) and dual
+    (:func:`quadratic_mamba2_scan`) evaluations validate through this ONE
+    function, so the oracle cannot silently accept inputs the reference
+    path would reject (or vice versa). ``fn_name`` is only used to keep the
+    error messages attributable to the caller.
+
+    Returns the derived geometry plus ``initial_state`` normalized to a
+    compute-precision tensor (zeros when ``None``).
+    """
+    if x.dim() != 4:
+        raise ValueError(
+            f"{fn_name}: x must be [batch, seqlen, nheads, headdim] "
+            f"(rank 4), got rank {x.dim()} (shape={tuple(x.shape)}).")
+    batch, seqlen, nheads, headdim = x.shape
+    for name, t, rank, shape_desc in [
+            ('dt', dt, 3, '[batch, seqlen, nheads]'),
+            ('B', B, 4, '[batch, seqlen, ngroups, d_state]'),
+            ('C', C, 4, '[batch, seqlen, ngroups, d_state]'),
+            ('A', A, 1, '[nheads]'),
+            ('D', D, 1, '[nheads]')]:
+        if t.dim() != rank:
+            raise ValueError(
+                f"{fn_name}: {name} must have rank {rank} "
+                f"({shape_desc}), got rank {t.dim()} (shape={tuple(t.shape)}).")
+    if dt.shape[0] != batch or dt.shape[1] != seqlen or dt.shape[2] != nheads:
+        raise ValueError(
+            f"{fn_name}: dt.shape={tuple(dt.shape)} does not match "
+            f"x[:3]={(batch, seqlen, nheads)}.")
+    # B/C time and batch dims must match x as well: the scan indexes them
+    # per step, so a silent broadcast would produce wrong outputs instead
+    # of an error (the dual's einsum would fail with a cryptic message).
+    if B.shape[0] != batch or B.shape[1] != seqlen:
+        raise ValueError(
+            f"{fn_name}: B.shape={tuple(B.shape)} does not match the x "
+            f"batch/seqlen dims {(batch, seqlen)}.")
+    ngroups, d_state = B.shape[2], B.shape[3]
+    if C.shape != B.shape:
+        raise ValueError(
+            f"{fn_name}: C.shape={tuple(C.shape)} must equal "
+            f"B.shape={tuple(B.shape)}.")
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"{fn_name}: nheads={nheads} must be divisible by "
+            f"ngroups={ngroups}.")
+    if A.shape[0] != nheads or D.shape[0] != nheads:
+        raise ValueError(
+            f"{fn_name}: A/D must have {nheads} entries "
+            f"(one per head), got A={tuple(A.shape)}, D={tuple(D.shape)}.")
+
+    compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    if initial_state is not None:
+        if initial_state.dim() != 4:
+            raise ValueError(
+                f"{fn_name}: initial_state must be "
+                f"[batch, nheads, headdim, d_state] (rank 4), got rank "
+                f"{initial_state.dim()} (shape={tuple(initial_state.shape)}).")
+        expected = (batch, nheads, headdim, d_state)
+        if tuple(initial_state.shape) != expected:
+            raise ValueError(
+                f"{fn_name}: initial_state.shape="
+                f"{tuple(initial_state.shape)} does not match the expected "
+                f"{expected} implied by x/B (a state persisted from a "
+                f"different config?).")
+        state = initial_state.to(device=x.device, dtype=compute_dtype)
+    else:
+        state = torch.zeros(batch, nheads, headdim, d_state,
+                            device=x.device, dtype=compute_dtype)
+    return {
+        'batch': batch, 'seqlen': seqlen, 'nheads': nheads,
+        'headdim': headdim, 'ngroups': ngroups, 'd_state': d_state,
+        'heads_per_group': nheads // ngroups,
+        'compute_dtype': compute_dtype, 'state': state,
+    }
+
+
 def naive_mamba2_scan(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -233,66 +336,26 @@ def naive_mamba2_scan(
     blocks — head ``h`` uses group ``h // heads_per_group`` — matching the
     ``repeat(..., 'g h')`` expansion in the official chunked kernels. With
     the default ``ngroups=1`` every head shares the same B/C.
-    """
-    if x.dim() != 4:
-        raise ValueError(
-            f"naive_mamba2_scan: x must be [batch, seqlen, nheads, headdim] "
-            f"(rank 4), got rank {x.dim()} (shape={tuple(x.shape)}).")
-    batch, seqlen, nheads, headdim = x.shape
-    for name, t, rank, shape_desc in [
-            ('dt', dt, 3, '[batch, seqlen, nheads]'),
-            ('B', B, 4, '[batch, seqlen, ngroups, d_state]'),
-            ('C', C, 4, '[batch, seqlen, ngroups, d_state]'),
-            ('A', A, 1, '[nheads]'),
-            ('D', D, 1, '[nheads]')]:
-        if t.dim() != rank:
-            raise ValueError(
-                f"naive_mamba2_scan: {name} must have rank {rank} "
-                f"({shape_desc}), got rank {t.dim()} (shape={tuple(t.shape)}).")
-    if dt.shape[0] != batch or dt.shape[1] != seqlen or dt.shape[2] != nheads:
-        raise ValueError(
-            f"naive_mamba2_scan: dt.shape={tuple(dt.shape)} does not match "
-            f"x[:3]={(batch, seqlen, nheads)}.")
-    ngroups, d_state = B.shape[2], B.shape[3]
-    if C.shape != B.shape:
-        raise ValueError(
-            f"naive_mamba2_scan: C.shape={tuple(C.shape)} must equal "
-            f"B.shape={tuple(B.shape)}.")
-    if nheads % ngroups != 0:
-        raise ValueError(
-            f"naive_mamba2_scan: nheads={nheads} must be divisible by "
-            f"ngroups={ngroups}.")
-    if A.shape[0] != nheads or D.shape[0] != nheads:
-        raise ValueError(
-            f"naive_mamba2_scan: A/D must have {nheads} entries "
-            f"(one per head), got A={tuple(A.shape)}, D={tuple(D.shape)}.")
-    heads_per_group = nheads // ngroups
 
-    compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    The dual (masked-attention) view of this same computation is
+    :func:`quadratic_mamba2_scan`; the two must agree bit-for-bit up to
+    reduction-order rounding (pinned by ``test_ssd_duality.py``).
+    """
+    v = _validate_mamba2_scan_inputs(
+        x, dt, B, C, A, D, initial_state, 'naive_mamba2_scan')
+    batch, seqlen = v['batch'], v['seqlen']
+    nheads, headdim = v['nheads'], v['headdim']
+    ngroups, d_state = v['ngroups'], v['d_state']
+    heads_per_group = v['heads_per_group']
+    compute_dtype = v['compute_dtype']
+    S = v['state']
+
     x_c = x.to(compute_dtype)
     dt_c = dt.to(compute_dtype)
     B_c = B.to(compute_dtype)
     C_c = C.to(compute_dtype)
     A_c = A.to(compute_dtype)
     D_c = D.to(compute_dtype)
-
-    if initial_state is not None:
-        if initial_state.dim() != 4:
-            raise ValueError(
-                f"naive_mamba2_scan: initial_state must be "
-                f"[batch, nheads, headdim, d_state] (rank 4), got rank "
-                f"{initial_state.dim()} (shape={tuple(initial_state.shape)}).")
-        expected = (batch, nheads, headdim, d_state)
-        if tuple(initial_state.shape) != expected:
-            raise ValueError(
-                f"naive_mamba2_scan: initial_state.shape="
-                f"{tuple(initial_state.shape)} does not match the expected "
-                f"{expected} implied by x/B (a state persisted from a "
-                f"different config?).")
-        S = initial_state.to(device=x.device, dtype=compute_dtype)
-    else:
-        S = torch.zeros(batch, nheads, headdim, d_state,
-                        device=x.device, dtype=compute_dtype)
 
     if seqlen == 0:
         y = x.new_zeros(batch, 0, nheads, headdim)
@@ -333,6 +396,110 @@ def naive_mamba2_scan(
     y = (y_slabs[0] if len(y_slabs) == 1
          else torch.cat(y_slabs, dim=1)).to(x.dtype)
     return y, (S if output_final_state else None)
+
+
+def quadratic_mamba2_scan(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    *,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Dual (masked-attention) evaluation of the same Mamba-2 (SSD) operator.
+
+    State-space duality (arXiv:2405.21060 Sections 3-4): the diagonal-SSM
+    recurrence computed by :func:`naive_mamba2_scan`,
+
+        ``a_t = exp(dt_t * A)``, ``S_t = a_t * S_{t-1} + dt_t * (x_t (x) B_t)``,
+        ``y_t = C_t . S_t + D * x_t``,
+
+    is mathematically identical to a *causal masked attention* over the
+    input with a semi-separable decay mask. With per-head cumulative
+    log-decays ``G_t = sum_{r<=t} dt_r * A`` the unrolled output is::
+
+        y_t = sum_{s<=t} exp(G_t - G_s) * dt_s * (C_t . B_s) * x_s
+              + exp(G_t) * (C_t . S_0)            [initial-state term]
+              + D * x_t                           [skip connection]
+
+    and the final state follows from the same pairwise weights at the
+    final position::
+
+        S_T = exp(G_{T-1}) * S_0
+              + sum_s exp(G_{T-1} - G_s) * dt_s * (x_s (x) B_s)
+
+    This function evaluates those closed forms directly (cumsum, matmuls,
+    one elementwise ``exp``) — a mathematically INDEPENDENT code path from
+    the sequential recurrence, sharing only the input contract (the same
+    validator). It exists to pin the recurrence's semantics as the
+    SSD-duality oracle in ``test_ssd_duality.py`` and as a reference for
+    future chunked/parallel implementations; it is
+    O(T^2) in both time and memory and is NOT a production path.
+
+    Shapes, validation, dtype contract, and return values are identical to
+    :func:`naive_mamba2_scan`; with ``initial_state=None`` the initial
+    term is skipped (the state starts at zeros).
+    """
+    v = _validate_mamba2_scan_inputs(
+        x, dt, B, C, A, D, initial_state, 'quadratic_mamba2_scan')
+    batch, seqlen = v['batch'], v['seqlen']
+    nheads, headdim = v['nheads'], v['headdim']
+    heads_per_group = v['heads_per_group']
+    compute_dtype = v['compute_dtype']
+    S0 = v['state']
+
+    if seqlen == 0:
+        y = x.new_zeros(batch, 0, nheads, headdim)
+        return y, (S0 if output_final_state else None)
+
+    x_c = x.to(compute_dtype)
+    dt_c = dt.to(compute_dtype)
+    B_c = B.to(compute_dtype)
+    C_c = C.to(compute_dtype)
+    A_c = A.to(compute_dtype)
+    D_c = D.to(compute_dtype)
+
+    B_h = B_c.repeat_interleave(heads_per_group, dim=2)  # [B, T, H, N]
+    C_h = C_c.repeat_interleave(heads_per_group, dim=2)  # [B, T, H, N]
+
+    # Per-head cumulative log-decay: G[b, t, h] = sum_{r<=t} dt_r * A_h.
+    # A < 0 and dt >= 0 make G non-increasing, so every exponent used
+    # below is <= 0 and the exponentials cannot overflow.
+    log_a = dt_c * A_c                                   # [B, T, H]
+    G = torch.cumsum(log_a, dim=1)                       # [B, T, H]
+
+    # Pairwise semi-separable decay for s <= t: exp(G_t - G_s). The
+    # non-causal entries are masked BEFORE the exp (a positive exponent
+    # would overflow to inf and inf * 0 = NaN could then poison the masked
+    # entries). Below-diagonal entries become exactly 0.
+    diff = G.unsqueeze(2) - G.unsqueeze(1)               # [B, T, T, H]
+    causal = torch.tril(torch.ones(
+        seqlen, seqlen, dtype=torch.bool, device=x.device))
+    decay = torch.exp(
+        diff.masked_fill(~causal[None, :, :, None], float('-inf')))
+
+    # [b, t, s, h] = (C_t . B_s) * dt_s; broadcast dt over the readout
+    # position t via an extra singleton dim (dim 1).
+    cb = torch.einsum('bthn,bshn->btsh', C_h, B_h)
+    weights = decay * cb * dt_c.unsqueeze(1)
+    y = torch.einsum('btsh,bshd->bthd', weights, x_c)
+    if initial_state is not None:
+        y = y + torch.exp(G).unsqueeze(-1) * torch.einsum(
+            'bthn,bhdn->bthd', C_h, S0)
+    y = (y + x_c * D_c.view(1, 1, -1, 1)).to(x.dtype)
+    if not output_final_state:
+        return y, None
+
+    # Final state: the same pairwise weights evaluated at t = T-1 (the
+    # last row of ``decay``), accumulated into the per-head outer products.
+    w_final = torch.exp(G[:, -1].unsqueeze(1) - G) * dt_c  # [B, T, H]
+    S = torch.einsum('bsh,bshd,bshn->bhdn', w_final, x_c, B_h)
+    if initial_state is not None:
+        S = S + torch.exp(G[:, -1]).unsqueeze(-1).unsqueeze(-1) * S0
+    return y, S
 
 
 # ---------------------------------------------------------------------------
