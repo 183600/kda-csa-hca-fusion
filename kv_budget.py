@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import math
 
+from kv_quant import quantized_row_bytes
 from run_kv_cache import causal_block_entries, causal_selected_entries
 
 
@@ -462,6 +463,38 @@ def windowed_layout_read_elements(ratio, t0: int, t1: int,
                 'hca_read_elements', 'total_read_elements'):
         out[key] = (t1 * row1[key] - t0 * row0[key]) / (t1 - t0)
     return out
+
+
+def op_read_bytes(op: str, T: int, spec: dict, quant=None) -> dict:
+    """Byte view of :func:`op_read_elements` under a quantization policy.
+
+    Element counts are converted with :func:`kv_quant.quantized_row_bytes`:
+    each ``<stem>_read_elements`` gains a ``<stem>_read_bytes`` sibling,
+    ``state_elements`` (KDA) gains ``state_bytes``, and
+    ``total_read_bytes`` sums the read components (retained state
+    excluded). ``quant=None`` prices every component at fp16 (2 bytes /
+    element); a :class:`kv_quant.QuantSpec` applies to all components; a
+    mapping prices per component stem (``'core'``, ``'indexer'``,
+    ``'selected'``, ``'window'``, ``'state'``, ...) with an optional
+    ``'*'`` default. Component names that do not exist for ``op`` raise
+    ``ValueError`` (typo protection).
+    """
+    row = dict(op_read_elements(op, T, spec))
+    row.update(quantized_row_bytes(row, quant))
+    return row
+
+
+def layout_read_bytes(T: int, ratio, spec: dict, quant=None) -> dict:
+    """Byte view of :func:`layout_read_elements` under a quantization policy.
+
+    Layout rows aggregate by operator, so the policy stems are the memory
+    routes (``'kda'``, ``'csa'``, ``'hca'``) — for a component-level
+    (selected / indexer / window) treatment use :func:`op_read_bytes` per
+    operator. Same ``quant`` semantics as :func:`op_read_bytes`.
+    """
+    row = dict(layout_read_elements(T, ratio, spec))
+    row.update(quantized_row_bytes(row, quant))
+    return row
 
 
 def _average_ranks(values) -> list:

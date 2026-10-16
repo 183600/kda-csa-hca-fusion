@@ -1,0 +1,443 @@
+"""Grouped low-bit KV quantization primitives + byte accounting.
+
+Motivation
+----------
+Every cost in this repository is priced in KV-side *elements*
+(``kv_budget`` / ``run_kv_cache``): fp16/fp32 scalars. Real long-context
+serving stores that state **quantized** (int8 / 4-bit grouped) to trade
+recall for bytes, and nothing in the repo could express that trade. This
+module adds the missing second axis:
+
+* :class:`QuantSpec` — a validated storage contract: payload bits per
+  element, group size, symmetric/asymmetric, metadata bits.
+* :func:`fake_quantize` — exact grouped round-to-grid + dequantize with a
+  straight-through gradient, so a decoder's quantize/dequantize kernels can
+  be simulated in the full-precision graph without low-bit kernels.
+* :func:`fake_quantize_` — the in-place, inference-only variant for
+  re-quantizing a state/cache buffer after every decode write (same
+  numerics, no second tensor, rejects autograd-tracked inputs).
+* :func:`quantization_error` — observed max/RMS error and SNR (dB).
+* byte accounting — :func:`bits_per_element` / :func:`bytes_per_element` /
+  :func:`storage_bytes` / :func:`compression_ratio`, charging the
+  per-group scale (and optional zero point) metadata exactly as a real
+  cache layout would.
+* :func:`quantized_row_bytes` — converts any element row produced by
+  ``kv_budget`` (operator-level or layout-level) into component-wise byte
+  columns under a component→:class:`QuantSpec` policy.
+
+Contract / honesty
+------------------
+* ``bits`` are **payload** bits per element. ``group_size`` elements share
+  one scale (and one zero point when asymmetric). Metadata is charged per
+  group: ``(scale_bits + zero_bits) / group_size`` extra bits per element.
+  ``scale_bits=0`` / ``zero_bits=0`` give the idealized "free metadata"
+  lower bound; the defaults charge fp16 scales and same-width zero points.
+* Grouping is along the **last tensor axis** (the flattened KV/state inner
+  dimension), matching grouped per-channel quantization layouts where
+  ``group_size`` contiguous elements share a scale.
+* Symmetric quantization uses ``qmax = 2**(bits-1) - 1`` and an absmax
+  scale, so the grid is ``{-qmax..qmax} * scale``. Asymmetric uses
+  ``qmax = 2**bits - 1``, a min/max scale and an integer zero point.
+* ``fake_quantize`` computes scales in fp32 under ``no_grad`` and applies
+  the straight-through estimator by default: gradients w.r.t. the input
+  are exactly 1 almost everywhere (pinned by tests). This is the standard
+  QAT contract; inference-only callers can pass ``ste=False``.
+* Non-finite inputs are rejected (a quantizer must never silently turn
+  NaN/Inf into a plausible-looking grid value), mirroring the repo-wide
+  non-finite handling of the KDA operators.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+
+FP16_BITS = 16.0
+FP16_BYTES_PER_ELEMENT = FP16_BITS / 8.0
+
+
+def _require_int(value, name: str, lo: int, hi: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f'{name} must be an int, got {value!r}')
+    if not (lo <= value <= hi):
+        raise ValueError(f'{name} must be in [{lo}, {hi}], got {value!r}')
+    return value
+
+
+@dataclass(frozen=True)
+class QuantSpec:
+    """Storage contract for one grouped-quantized tensor.
+
+    Args:
+        bits: payload bits per element (int in ``[2, 16]``).
+        group_size: elements sharing one scale / zero point (``>= 1``).
+        symmetric: ``True`` → absmax-scaled signed grid
+            ``{-qmax..qmax} * scale`` with ``qmax = 2**(bits-1) - 1``;
+            ``False`` → min/max-scaled unsigned grid with a zero point.
+        scale_bits: bits charged per stored scale (default 16, i.e. fp16).
+        zero_bits: bits charged per stored zero point. Meaningful only for
+            ``symmetric=False``; defaults to ``bits`` when omitted. A value
+            of ``0`` means "not stored" for either mode.
+    """
+
+    bits: int
+    group_size: int = 64
+    symmetric: bool = True
+    scale_bits: int = 16
+    zero_bits: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_int(self.bits, 'QuantSpec.bits', 2, 16)
+        _require_int(self.group_size, 'QuantSpec.group_size', 1, 2 ** 30)
+        _require_int(self.scale_bits, 'QuantSpec.scale_bits', 0, 64)
+        if not isinstance(self.symmetric, bool):
+            raise ValueError(
+                f'QuantSpec.symmetric must be a bool, got {self.symmetric!r}')
+        if self.zero_bits is not None:
+            _require_int(self.zero_bits, 'QuantSpec.zero_bits', 0, 64)
+        if self.symmetric and self.zero_bits not in (None, 0):
+            raise ValueError(
+                'QuantSpec: symmetric quantization has no zero point, so '
+                f'zero_bits must be None or 0, got {self.zero_bits!r}.')
+        if not self.symmetric and self.zero_bits is None:
+            # Default: store the zero point at the same width as the codes.
+            object.__setattr__(self, 'zero_bits', self.bits)
+
+    @property
+    def qmax(self) -> int:
+        """Largest quantized code magnitude (symmetric) / code (asymmetric)."""
+        if self.symmetric:
+            return 2 ** (self.bits - 1) - 1
+        return 2 ** self.bits - 1
+
+    @property
+    def metadata_bits(self) -> float:
+        """Metadata bits charged per element (scale + optional zero point)."""
+        return (self.scale_bits + (self.zero_bits or 0)) / self.group_size
+
+
+def bits_per_element(spec: QuantSpec) -> float:
+    """Payload + metadata bits per stored element."""
+    if not isinstance(spec, QuantSpec):
+        raise TypeError(f'bits_per_element: expected QuantSpec, got {spec!r}')
+    return float(spec.bits) + spec.metadata_bits
+
+
+def bytes_per_element(spec: QuantSpec) -> float:
+    """Effective bytes per stored element (payload + metadata)."""
+    return bits_per_element(spec) / 8.0
+
+
+def storage_bytes(n_elements, spec: QuantSpec) -> float:
+    """Bytes required to store ``n_elements`` under ``spec`` (fractional ok)."""
+    if not isinstance(n_elements, (int, float)) or isinstance(n_elements, bool):
+        raise ValueError(
+            f'storage_bytes: n_elements must be a number, got {n_elements!r}')
+    if n_elements < 0:
+        raise ValueError(
+            f'storage_bytes: n_elements must be >= 0, got {n_elements!r}')
+    return float(n_elements) * bytes_per_element(spec)
+
+
+def compression_ratio(spec: QuantSpec,
+                      baseline_bits: float = FP16_BITS) -> float:
+    """Byte reduction factor vs an un-quantized ``baseline_bits`` layout.
+
+    ``> 1`` means quantized storage is smaller. Undefined (raises) for a
+    non-positive baseline.
+    """
+    if not isinstance(baseline_bits, (int, float)) or isinstance(
+            baseline_bits, bool) or baseline_bits <= 0:
+        raise ValueError(
+            f'compression_ratio: baseline_bits must be positive, got '
+            f'{baseline_bits!r}')
+    return float(baseline_bits) / bits_per_element(spec)
+
+
+def spec_summary(spec: QuantSpec,
+                 baseline_bits: float = FP16_BITS) -> dict:
+    """Flat, JSON-safe description of a spec (for provenance metadata)."""
+    return {
+        'bits': spec.bits,
+        'group_size': spec.group_size,
+        'symmetric': spec.symmetric,
+        'scale_bits': spec.scale_bits,
+        'zero_bits': spec.zero_bits,
+        'bits_per_element': bits_per_element(spec),
+        'bytes_per_element': bytes_per_element(spec),
+        'compression_vs_fp16': compression_ratio(spec, baseline_bits),
+    }
+
+
+def _pad_last_dim(x: torch.Tensor, group_size: int):
+    """Pad the last dim up to a multiple of ``group_size``; return (padded, n)."""
+    n = x.shape[-1]
+    pad = (-n) % group_size
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad))
+    return x, n
+
+
+def fake_quantize(x: torch.Tensor, spec: QuantSpec,
+                  *, ste: bool = True) -> torch.Tensor:
+    """Quantize ``x`` to ``spec``'s grid and dequantize, in full precision.
+
+    Groups run along the last axis; the grid is per-group. The output has
+    the same shape/dtype/device as ``x``. With ``ste=True`` (default) the
+    straight-through gradient is applied, so autograd sees
+    ``d(output)/d(input) == 1`` almost everywhere.
+
+    Raises:
+        ValueError: if ``x`` is not a floating-point tensor or contains
+            non-finite values (a quantizer must not launder NaN/Inf into
+            the grid).
+    """
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f'fake_quantize: expected a tensor, got {type(x)!r}')
+    if not torch.is_floating_point(x):
+        raise ValueError(
+            f'fake_quantize: expected a floating-point tensor, got dtype '
+            f'{x.dtype}')
+    if x.dim() == 0:
+        raise ValueError('fake_quantize: expected a tensor of rank >= 1')
+    if not isinstance(spec, QuantSpec):
+        raise TypeError(f'fake_quantize: expected QuantSpec, got {spec!r}')
+    if x.numel() == 0:
+        return x.clone()
+    if not bool(torch.isfinite(x).all()):
+        raise ValueError(
+            'fake_quantize: input contains NaN/Inf; refusing to quantize '
+            'non-finite values (they would map to an arbitrary grid point).')
+
+    orig_dtype = x.dtype
+    compute_dtype = (torch.float64 if orig_dtype == torch.float64
+                     else torch.float32)
+    work = x.to(compute_dtype)
+    padded, n = _pad_last_dim(work, spec.group_size)
+    lead = padded.shape[:-1]
+    groups = padded.reshape(*lead, -1, spec.group_size)
+    qmax = spec.qmax
+
+    if spec.symmetric:
+        # absmax scale per group. Zero groups get scale 1 so the codes and
+        # the reconstruction are exactly zero.
+        with torch.no_grad():
+            amax = groups.abs().amax(dim=-1, keepdim=True)
+            scale = torch.where(amax > 0, amax / qmax,
+                                torch.ones_like(amax))
+        codes = torch.round(groups / scale).clamp(-qmax, qmax)
+        deq = codes * scale
+    else:
+        # min/max scale + integer zero point per group. Constant groups
+        # reconstruct their value exactly (span == 0 is special-cased).
+        with torch.no_grad():
+            lo = groups.amin(dim=-1, keepdim=True)
+            hi = groups.amax(dim=-1, keepdim=True)
+            span = hi - lo
+            degenerate = span <= 0
+            scale = torch.where(degenerate, torch.ones_like(span),
+                                span / qmax)
+            zero = torch.where(
+                degenerate, torch.zeros_like(lo),
+                torch.round(-lo / scale).clamp(0, qmax))
+        codes = torch.round(groups / scale) + zero
+        codes = codes.clamp(0, qmax)
+        deq = (codes - zero) * scale
+        deq = torch.where(degenerate, hi, deq)
+
+    deq = deq.reshape(*lead, -1)[..., :n].to(orig_dtype)
+    if ste and x.requires_grad:
+        # Straight-through: forward value from the grid, identity gradient.
+        deq = x + (deq - x).detach()
+    return deq
+
+
+def fake_quantize_(x: torch.Tensor, spec: QuantSpec) -> torch.Tensor:
+    """In-place :func:`fake_quantize` for inference-time cache writes.
+
+    Overwrites ``x`` with its quantize→dequantize image and returns ``x``,
+    so a decode loop can re-quantize a state buffer after every write
+    without allocating (and retaining) a second tensor:
+
+        state = fake_quantize_(state, spec)   # inference, no grad
+
+    Contract / honesty:
+
+    * **Inference-only.** ``x.requires_grad=True`` is rejected: in-place
+      writes to an autograd-tracked tensor either error or silently corrupt
+      the graph, and the STE (QAT) path must go through the functional
+      :func:`fake_quantize`, which returns a new tensor and keeps gradients.
+    * The quantizer itself is computed out-of-place and then copied back
+      under ``torch.no_grad()``, so the numerical result is EXACTLY
+      :func:`fake_quantize` with ``ste=False`` (pinned by tests).
+    * Non-finite inputs raise (via :func:`fake_quantize`) instead of
+      writing a plausible-looking grid value into the buffer.
+    """
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f'fake_quantize_: expected a tensor, got {type(x)!r}')
+    if x.requires_grad:
+        raise ValueError(
+            'fake_quantize_: x.requires_grad=True — the in-place quantizer '
+            'is inference-only. Use fake_quantize(x, spec, ste=True) for '
+            'QAT / straight-through gradients.')
+    deq = fake_quantize(x, spec, ste=False)
+    with torch.no_grad():
+        x.copy_(deq)
+    return x
+
+
+def quantization_error(x: torch.Tensor, spec: QuantSpec) -> dict:
+    """Observed error of ``fake_quantize(x, spec)`` vs ``x``.
+
+    Returns ``max_abs_error``, ``rms_error``, ``signal_rms`` and ``snr_db``
+    (``inf`` for an exactly representable input). Errors are measured in
+    the input's compute precision (fp32/fp64).
+    """
+    if not isinstance(x, torch.Tensor) or x.numel() == 0:
+        raise ValueError('quantization_error: x must be a non-empty tensor')
+    deq = fake_quantize(x, spec, ste=False)
+    compute_dtype = (torch.float64 if x.dtype == torch.float64
+                     else torch.float32)
+    xf, df = x.to(compute_dtype), deq.to(compute_dtype)
+    err = xf - df
+    rms_err = float(err.pow(2).mean().sqrt())
+    signal_rms = float(xf.pow(2).mean().sqrt())
+    if rms_err == 0.0:
+        snr_db = math.inf
+    elif signal_rms == 0.0:
+        snr_db = -math.inf
+    else:
+        snr_db = 20.0 * math.log10(signal_rms / rms_err)
+    return {
+        'max_abs_error': float(err.abs().max()),
+        'rms_error': rms_err,
+        'signal_rms': signal_rms,
+        'snr_db': snr_db,
+        'bits_per_element': bits_per_element(spec),
+    }
+
+
+# --------------------------------------------------------------------------
+# Budget-row byte accounting (the kv_budget bridge)
+# --------------------------------------------------------------------------
+
+_READ_SUFFIX = '_read_elements'
+_STATE_KEY = 'state_elements'
+_TOTAL_KEY = 'total_read_elements'
+
+
+def _row_component_stems(row: dict) -> list[str]:
+    """Stems of the per-component element fields of a kv_budget row.
+
+    ``foo_read_elements`` → ``foo``; ``state_elements`` → ``state``.
+    The aggregate ``total_read_elements`` is not a component.
+    """
+    stems = []
+    for key in row:
+        if key == _TOTAL_KEY:
+            continue
+        if key.endswith(_READ_SUFFIX):
+            stems.append(key[:-len(_READ_SUFFIX)])
+        elif key == _STATE_KEY:
+            stems.append('state')
+    return sorted(set(stems))
+
+
+def _normalize_policy(row: dict, quant) -> dict:
+    """Resolve ``quant`` into a ``{stem: QuantSpec | None}`` policy.
+
+    ``quant`` may be ``None`` (fp16 baseline for every component), a single
+    :class:`QuantSpec` (applied to every component), or a mapping from row
+    field stem (e.g. ``'core'``, ``'indexer'``, ``'state'``, ``'kda'``) to
+    a :class:`QuantSpec`/``None``. A ``'*'`` key sets the default for
+    stems not listed. Stems that do not exist in ``row`` raise
+    ``ValueError`` (typo protection: applying a policy to a field the row
+    does not carry would silently not happen).
+    """
+    stems = _row_component_stems(row)
+    if quant is None:
+        return {stem: None for stem in stems}
+    if isinstance(quant, QuantSpec):
+        return {stem: quant for stem in stems}
+    if not isinstance(quant, dict):
+        raise TypeError(
+            f'quantized_row_bytes: quant must be None, a QuantSpec or a '
+            f'dict, got {type(quant)!r}')
+    unknown = sorted(set(quant) - set(stems) - {'*'})
+    if unknown:
+        raise ValueError(
+            f'quantized_row_bytes: policy names unknown component(s) '
+            f'{unknown}; this row has {stems}.')
+    default = quant.get('*')
+    if default is not None and not isinstance(default, QuantSpec):
+        raise TypeError(
+            f'quantized_row_bytes: policy["*"] must be a QuantSpec or '
+            f'None, got {default!r}')
+    resolved = {}
+    for stem in stems:
+        spec = quant.get(stem, default)
+        if spec is not None and not isinstance(spec, QuantSpec):
+            raise TypeError(
+                f'quantized_row_bytes: policy[{stem!r}] must be a '
+                f'QuantSpec or None, got {spec!r}')
+        resolved[stem] = spec
+    return resolved
+
+
+def quantized_row_bytes(row: dict, quant=None) -> dict:
+    """Component-wise byte columns for a ``kv_budget`` element row.
+
+    ``row`` is any element row produced by ``kv_budget`` (operator-level
+    ``op_read_elements`` or layout-level ``layout_read_elements``). Every
+    ``<stem>_read_elements`` field becomes ``<stem>_read_bytes`` and the
+    KDA ``state_elements`` becomes ``state_bytes``.
+
+    The per-query aggregate ``total_read_bytes`` sums the *read* components
+    only: the retained state is storage, not a per-query read, matching
+    ``total_read_elements`` (which counts reads; the KDA state size is
+    exposed separately as ``state_elements``). The returned dict also
+    carries ``quant_bytes_per_element`` (stem → bytes/element) so a reader
+    can see which policy priced which component.
+
+    ``quant`` follows :func:`_normalize_policy`: ``None`` prices every
+    component at fp16 (2.0 bytes/element); a :class:`QuantSpec` applies to
+    all; a mapping prices per stem with an optional ``'*'`` fallback.
+    """
+    if not isinstance(row, dict):
+        raise TypeError(f'quantized_row_bytes: row must be a dict, got '
+                        f'{type(row)!r}')
+    stems = _row_component_stems(row)
+    if not stems:
+        raise ValueError(
+            'quantized_row_bytes: row carries no element fields (expected '
+            f'keys like "<op>_read_elements" or "state_elements"); got '
+            f'{sorted(row)}.')
+    policy = _normalize_policy(row, quant)
+    out: dict = {}
+    bytes_per_element_map: dict = {}
+    total = 0.0
+    for stem in stems:
+        spec = policy[stem]
+        bpe = (FP16_BYTES_PER_ELEMENT if spec is None
+               else bytes_per_element(spec))
+        bytes_per_element_map[stem] = bpe
+        if stem == 'state':
+            value = row.get(_STATE_KEY)
+            key = 'state_bytes'
+        else:
+            value = row.get(f'{stem}{_READ_SUFFIX}')
+            key = f'{stem}_read_bytes'
+        if value is None:
+            out[key] = None
+            continue
+        b = float(value) * bpe
+        out[key] = b
+        if stem != 'state':
+            # The retained state is storage, not a per-query read; it is
+            # exposed as state_bytes but never folded into total.
+            total += b
+    out[_TOTAL_KEY.replace('_elements', '_bytes')] = total
+    out['quant_bytes_per_element'] = bytes_per_element_map
+    return out

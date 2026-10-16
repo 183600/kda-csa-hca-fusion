@@ -1,0 +1,933 @@
+"""Experiment 11 — state-quantized decode perplexity + STE/QAT recovery.
+
+Motivation
+----------
+Experiment 10 (``run_quant_recall``) measures intrinsic damage: with the
+KDA/Mamba-2 state fake-quantized after every write, how often can the
+route still decode a planted association? That probe uses planted
+orthonormal keys and no training, so it says nothing about the quantity
+language-model deployment is actually scored on: **held-out perplexity**.
+
+This experiment closes the loop with an end-task **perplexity evaluation**
+and a QAT (**autograd / straight-through**) recovery probe:
+
+* **Part A — PTQ (post-training quantization) perplexity.** A tiny hybrid
+  LM (``train_lm_autodl.LMWithHybrid``: 2 KDA + 1 CSA + 1 HCA, the repo's
+  canonical layout, chunked-KDA prefill) is trained on the deterministic
+  offline synthetic fallback corpus. Held-out token-level NLL is then
+  scored through the REAL incremental decode path
+  (``run_decoding.HybridDecoding``, one token per call), with the stacked
+  KDA state fake-quantized after every write. The spec grid is exactly
+  Exp 10's grid, so the two experiments share a byte axis.
+* **Part B — QAT recovery.** A standalone single-layer KDA LM with an
+  explicit per-token state loop (``run_quality.KDAAttn``'s parameterization,
+  recurrence called through ``ops_kda.naive_recurrent_kda`` with
+  ``initial_state``) is trained twice from the SAME initialization: once
+  with fp16 state writes, once with 2-bit state writes through the
+  straight-through estimator (``kv_quant.fake_quantize(..., ste=True)``).
+  Scoring the fp16 model with PTQ state vs scoring the QAT model shows
+  whether autograd through the quantizer recovers the perplexity damage —
+  i.e. that the STE contract is usable for QAT, not just formula-correct.
+
+Reference points are reported, not hidden:
+
+* ``prefill_ppl`` is the chunked full-sequence path
+  (``train_lm_autodl.evaluate_lm_loss``); ``decode_fp16_ppl`` is the same
+  model scored token-by-token with an fp16 state. The two paths agree only
+  up to kernel/reduction order (this is the ``lm_consistency`` contract),
+  so every quantization delta is measured **against decode_fp16_ppl** on
+  the same path. The prefill/decode gap is recorded per seed.
+* A cell is flagged ``ppl_preserving`` when the min-over-seeds ratio
+  ``decode_ppl / decode_fp16_ppl`` stays within ``QLM_PPL_TOL`` (default
+  1%); the tolerance is explicit and conservative (min over seeds), not
+  an "exact" claim.
+
+Honesty / scope
+---------------
+* Corpus: the repo's deterministic ``_synthetic_corpus`` (no network, no
+  HuggingFace tokenizer). Absolute perplexities are toy-scale and NOT
+  comparable to real-corpus LM numbers; the measured quantity is the
+  RELATIVE damage of state quantization at fixed weights and path.
+* Only the KDA recurrent state is quantized. The CSA/HCA incremental
+  caches, the KDA short-conv lookback, activations, weights and logits
+  are fp16/fp32; the byte axis prices only the quantized state (see
+  ``kv_budget`` for the full component split).
+* Grouping runs along a per-layer flattened state buffer
+  (``state.reshape(n_layers, -1)``), the same contiguous-buffer convention
+  as Exp 10.
+* Part B's QAT trains from scratch (no pre-trained checkpoint), 1 layer,
+  and on the synthetic corpus: it demonstrates the autograd/STE contract
+  end-to-end, not a production QAT recipe. QAT does not always fully
+  recover the PTQ damage (seed variance is reported).
+
+Output
+------
+``results/exp11_quant_lm.json`` (versioned envelope via ``results_schema``)
+with ``row_kind`` in {``ptq_per_seed``, ``ptq_ppl``, ``ptq_summary``,
+``qat_per_seed``, ``qat_recovery``}; CLI::
+
+    python3 run_quant_lm.py
+    QLM_SEEDS=0 QLM_STEPS=50 QLM_QAT_STEPS=50 python3 run_quant_lm.py
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import sys
+
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from kaggle_setup import (  # noqa: E402
+    capture_provenance,
+    configure_torch_for_device,
+    make_seeded_generator,
+    set_global_seed,
+)
+from kv_quant import (  # noqa: E402
+    FP16_BITS,
+    QuantSpec,
+    bits_per_element,
+    compression_ratio,
+    fake_quantize,
+    spec_summary,
+    storage_bytes,
+)
+from lm_consistency import build_decoding_clone  # noqa: E402
+from ops_fused import HybridConfig  # noqa: E402
+from ops_kda import naive_recurrent_kda  # noqa: E402
+from results_schema import write as write_schema  # noqa: E402
+from run_quant_recall import (  # noqa: E402
+    DEFAULT_BITS,
+    DEFAULT_GROUP_SIZES,
+    default_sweep_specs,
+)
+from run_quality import KDAAttn  # noqa: E402
+from train_lm_autodl import (  # noqa: E402
+    LMWithHybrid,
+    TinyStoriesLM,
+    _FallbackCharTokenizer,
+    _synthetic_corpus,
+    clean_lm_texts,
+    evaluate_lm_loss,
+    split_clean_texts,
+)
+
+logger = logging.getLogger(__name__)
+
+RESULTS_PATH = os.path.join('results', 'exp11_quant_lm.json')
+
+DEFAULT_SEEDS = (0, 1, 2)
+DEFAULT_STEPS = 400
+# The fp16 control and the QAT model MUST see the same training budget for
+# the A/B to be an isolation of the quantizer; keep the two knobs equal by
+# default (QLM_QAT_STEPS exists only so a smoke run can shrink both).
+DEFAULT_QAT_STEPS = DEFAULT_STEPS
+DEFAULT_SEQ_LEN = 64
+DEFAULT_BATCH = 8
+DEFAULT_EVAL_SEQS = 13
+DEFAULT_CORPUS = 64
+DEFAULT_TOLERANCE = 0.01
+
+# 2-bit/g16 is where Exp 10 loses recall for KDA; it is the PTQ cell QAT
+# is asked to recover.
+QAT_SPEC = QuantSpec(bits=2, group_size=16)
+
+
+# --------------------------------------------------------------------------
+# Data + model construction (deterministic, offline)
+# --------------------------------------------------------------------------
+def build_corpus(seq_len: int = DEFAULT_SEQ_LEN,
+                 n_texts: int = DEFAULT_CORPUS,
+                 seed: int = 0) -> tuple:
+    """Deterministic offline corpus -> (tokenizer, split_texts, split_report).
+
+    Uses the repository's synthetic fallback corpus and char tokenizer, so
+    the experiment needs no network. Cleaning + the leakage-audited
+    train/val/test split are the same code paths the real LM pipeline uses.
+    """
+    tokenizer = _FallbackCharTokenizer()
+    clean = clean_lm_texts(_synthetic_corpus(n_texts), tokenizer,
+                           seq_len)['texts']
+    split, report = split_clean_texts(clean, val_frac=0.2, test_frac=0.1,
+                                      seed=seed)
+    split_texts = {name: [clean[i] for i in split[name]]
+                   for name in ('train', 'val', 'test')}
+    return tokenizer, split_texts, report
+
+
+def small_hybrid_config() -> HybridConfig:
+    """The tiny 2 KDA + 1 CSA + 1 HCA geometry used by Part A.
+
+    ``kda_chunk_size=32`` keeps the chunked prefill path active at
+    ``T=64`` while per-token decode automatically uses the recurrent path
+    (``T < kda_chunk_size``), so the prefill/decode boundary is exercised.
+    """
+    return HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        kda_chunk_size=32,
+        csa_m=8, csa_topk=2, csa_nh=2, csa_c=16, csa_dc=16,
+        csa_nIh=1, csa_cI=8, csa_sliding_window=4,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=16, hca_sliding_window=4,
+        n_kda=2, n_csa=1, n_hca=1,
+    )
+
+
+def _cfg_summary(cfg: HybridConfig) -> dict:
+    fields = ('d_model', 'n_heads_qk', 'n_heads_v', 'head_dim_k',
+              'head_dim_v', 'kda_chunk_size', 'csa_m', 'csa_topk',
+              'hca_m2', 'n_kda', 'n_csa', 'n_hca', 'memory_type')
+    return {name: getattr(cfg, name) for name in fields}
+
+
+def encode_windows(tokenizer, texts, seq_len: int, device) -> list:
+    """Right-pad each text to ``seq_len + 1`` tokens (for NLL scoring)."""
+    pad = getattr(tokenizer, 'pad_token_id', 0)
+    windows = []
+    for text in texts:
+        ids = tokenizer.encode(text, truncation=True, max_length=seq_len + 1)
+        ids = ids + [pad] * (seq_len + 1 - len(ids))
+        windows.append(torch.tensor([ids[:seq_len + 1]], dtype=torch.long,
+                                    device=device))
+    return windows
+
+
+def pad_token_id(tokenizer) -> int:
+    return int(getattr(tokenizer, 'pad_token_id', 0) or 0)
+
+
+# --------------------------------------------------------------------------
+# Training (deterministic; full train split, seeded loader)
+# --------------------------------------------------------------------------
+def _make_loader(tokenizer, texts, seq_len, batch_size, seed):
+    dataset = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=texts,
+                            name='train')
+    return torch.utils.data.DataLoader(
+        dataset, batch_size=int(batch_size), shuffle=True,
+        generator=make_seeded_generator(int(seed)))
+
+
+def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
+                    seq_len: int, batch_size: int, device, lr: float = 3e-3
+                    ) -> tuple:
+    """Train the tiny hybrid LM for ``steps`` steps; deterministic per seed."""
+    set_global_seed(seed, deterministic=True)
+    cfg = small_hybrid_config()
+    model = LMWithHybrid(len(tokenizer), cfg).to(device)
+    loader = _make_loader(tokenizer, train_texts, seq_len, batch_size, seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr),
+                            weight_decay=0.0)
+    first_loss = last_loss = None
+    model.train()
+    step = 0
+    while step < int(steps):
+        for batch in loader:
+            if step >= int(steps):
+                break
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            model.hybrid.reset_state()
+            out = model(input_ids, labels=labels)
+            loss = out['loss']
+            if loss is None or not torch.isfinite(loss):
+                raise RuntimeError(
+                    f'train_hybrid_lm: non-finite loss ({loss}) at step '
+                    f'{step}; refusing to continue')
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            last_loss = float(loss.detach())
+            if first_loss is None:
+                first_loss = last_loss
+            step += 1
+    return model, {'cfg': cfg, 'loss_first': first_loss,
+                   'loss_last': last_loss, 'steps': int(steps)}
+
+
+def train_stepwise_lm(*, seed: int, tokenizer, train_texts, steps: int,
+                      seq_len: int, batch_size: int, device,
+                      spec: QuantSpec | None = None, ste: bool = False,
+                      lr: float = 3e-3) -> tuple:
+    """Train the standalone per-token KDA LM, optionally QAT (STE) at ``spec``."""
+    set_global_seed(seed, deterministic=True)
+    model = StepwiseKDALM(len(tokenizer)).to(device)
+    loader = _make_loader(tokenizer, train_texts, seq_len, batch_size, seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr),
+                            weight_decay=0.0)
+    report = {'loss_first': None, 'loss_last': None,
+              'grad_norm_first': None, 'grad_norm_last': None,
+              'all_grads_finite': True, 'steps': int(steps)}
+    model.train()
+    step = 0
+    while step < int(steps):
+        for batch in loader:
+            if step >= int(steps):
+                break
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            logits = model(input_ids, spec=spec, ste=ste)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
+                ignore_index=-100)
+            if loss is None or not torch.isfinite(loss):
+                raise RuntimeError(
+                    f'train_stepwise_lm: non-finite loss ({loss}) at step '
+                    f'{step}; refusing to continue')
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = 0.0
+            finite = True
+            for p in model.parameters():
+                if p.grad is not None:
+                    if not bool(torch.isfinite(p.grad).all()):
+                        finite = False
+                    grad_norm += float(p.grad.detach().pow(2).sum())
+            grad_norm = math.sqrt(grad_norm)
+            report['all_grads_finite'] = report['all_grads_finite'] and finite
+            opt.step()
+            report['loss_last'] = float(loss.detach())
+            report['grad_norm_last'] = grad_norm
+            if report['loss_first'] is None:
+                report['loss_first'] = report['loss_last']
+                report['grad_norm_first'] = grad_norm
+            step += 1
+    return model, report
+
+
+class StepwiseKDALM(KDAAttn):
+    """Single-layer KDA LM with an explicit per-token recurrent state loop.
+
+    Reuses ``run_quality.KDAAttn``'s parameterization (projections, low-rank
+    gate, short conv, output projection) but drives the delta-rule
+    recurrence one token at a time through ``naive_recurrent_kda`` with
+    ``initial_state``, so the state is VISIBLE and can be fake-quantized
+    after every write — exactly the write path Exp 10 probes, but wrapped
+    in a differentiable LM loss for QAT.
+    """
+
+    def __init__(self, vocab_size: int, d_model: int = 32, H: int = 2,
+                 K: int = 16, V: int = 16):
+        super().__init__(d_model, H=H, K=K, V=V)
+        self.embed = torch.nn.Embedding(vocab_size, d_model)
+        self.lm_head = torch.nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+
+    @staticmethod
+    def quantize_state(state: torch.Tensor, spec: QuantSpec,
+                       ste: bool) -> torch.Tensor:
+        """Grouped fake-quant of one step's state (flat buffer per batch row)."""
+        flat = state.reshape(state.shape[0], -1)
+        return fake_quantize(flat, spec, ste=ste).reshape_as(state)
+
+    def forward(self, input_ids: torch.Tensor,
+                spec: QuantSpec | None = None,
+                ste: bool = False) -> torch.Tensor:
+        if input_ids.dim() != 2:
+            raise ValueError(
+                f'StepwiseKDALM: expected [B, T] input_ids, got '
+                f'{tuple(input_ids.shape)}')
+        B, T = input_ids.shape
+        x = self.embed(input_ids)
+        ksize = self.short_conv.kernel_size[0]
+        x_conv = self.short_conv(
+            F.pad(x.transpose(1, 2), (ksize - 1, 0))).transpose(1, 2)
+        q = F.normalize(F.silu(self.q(x_conv)).view(B, T, self.H, self.K),
+                        dim=-1)
+        k = F.normalize(F.silu(self.k(x_conv)).view(B, T, self.H, self.K),
+                        dim=-1)
+        v = F.silu(self.v(x_conv)).view(B, T, self.H, self.V)
+        g = -F.softplus(
+            self.g_up(F.silu(self.g_down(x_conv))).view(B, T, self.H, self.K)
+        ) * self.DECAY_SCALE
+        beta = torch.sigmoid(self.beta(x_conv)).view(B, T, self.H)
+        state = None
+        outs = []
+        for t in range(T):
+            o, state = naive_recurrent_kda(
+                q[:, t:t + 1], k[:, t:t + 1], v[:, t:t + 1],
+                g[:, t:t + 1], beta[:, t:t + 1],
+                initial_state=state, output_final_state=True)
+            if spec is not None:
+                state = self.quantize_state(state, spec, ste)
+            outs.append(self.o(o[:, 0].reshape(B, -1)))
+        return self.lm_head(torch.stack(outs, dim=1))
+
+
+# --------------------------------------------------------------------------
+# Scoring
+# --------------------------------------------------------------------------
+def _ppl_from_nll(total_nll: float, n_tokens: int) -> float:
+    if n_tokens <= 0:
+        raise ValueError('no supervised tokens: cannot compute perplexity')
+    return math.exp(min(total_nll / n_tokens, 700.0))
+
+
+def quantize_stacked_state(clone, spec: QuantSpec | None) -> tuple:
+    """Fake-quantize ``clone.model._kda_state`` in place; return (state, snr).
+
+    ``state`` is the (possibly quantized) stacked state and ``snr`` the
+    signal-to-quantization-noise ratio of this write (dB), or ``inf`` when
+    no quantization was requested. Groups run along the flattened per-layer
+    buffer, mirroring Exp 10.
+    """
+    state = clone.model._kda_state
+    if state is None:
+        raise RuntimeError(
+            'quantize_stacked_state: the decode clone has no KDA state yet; '
+            'run at least one forward step first')
+    if spec is None:
+        return state, math.inf
+    flat = state.reshape(state.shape[0], -1)
+    deq = fake_quantize(flat, spec, ste=False)
+    err = deq - flat
+    snr_num = float(flat.detach().pow(2).sum())
+    snr_den = float(err.pow(2).sum())
+    snr = (10.0 * math.log10(snr_num / snr_den)
+           if snr_den > 0.0 and snr_num > 0.0 else math.inf)
+    clone.model._kda_state = deq.reshape_as(state)
+    return clone.model._kda_state, snr
+
+
+@torch.no_grad()
+def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
+                        spec: QuantSpec | None = None) -> dict:
+    """Held-out NLL/perplexity through the incremental decode path.
+
+    Scores token-by-token from an empty state; after every write the
+    stacked KDA state is fake-quantized at ``spec`` (``None`` = fp16
+    baseline). Returns the perplexity, token-weighted mean NLL, token
+    count, per-position argmax (for top-1 agreement) and the state element
+    count. State-write SNR is measured separately by
+    :func:`_decode_state_snr` so this scoring path stays lean.
+    """
+    model.eval()
+    total_nll, n_tokens = 0.0, 0
+    argmaxes = []
+    state_elements = None
+    for ids in windows:
+        clone.reset()
+        x = model.embed(ids)
+        T = ids.shape[1]
+        step_logits = []
+        for t in range(T - 1):
+            h = clone(x[:, t:t + 1])
+            state, _ = quantize_stacked_state(clone, spec)
+            if state_elements is None:
+                state_elements = int(state.numel())
+            elif state_elements != int(state.numel()):
+                raise AssertionError(
+                    'state element count changed across decode steps: '
+                    f'{state_elements} vs {state.numel()}')
+            step_logits.append(model.lm_head(model.norm_f(h)))
+        logits = torch.cat(step_logits, dim=1)  # [1, T-1, V]
+        targets = ids[:, 1:1 + logits.shape[1]]
+        mask = targets.ne(pad_id) & targets.ne(-100)
+        nll = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+            reduction='none')
+        total_nll += float((nll * mask.reshape(-1)).sum())
+        n_tokens += int(mask.sum())
+        argmaxes.append(logits.argmax(-1)[mask])
+    return {
+        'ppl': _ppl_from_nll(total_nll, n_tokens),
+        'mean_nll': total_nll / max(1, n_tokens),
+        'n_tokens': n_tokens,
+        'argmax': argmaxes,
+        'state_elements': state_elements,
+    }
+
+
+def _decode_state_snr(model, clone, windows, pad_id, spec):
+    """Aggregate state-write SNR (dB) for one (seed, spec) cell.
+
+    Separate pass from :func:`evaluate_decode_ppl` so the ppl path stays
+    allocation-lean; the extra pass is cheap (no logits/ml_head work).
+    """
+    if spec is None:
+        return math.inf
+    num = den = 0.0
+    for ids in windows:
+        clone.reset()
+        x = model.embed(ids)
+        for t in range(ids.shape[1] - 1):
+            with torch.no_grad():
+                clone(x[:, t:t + 1])
+                state = clone.model._kda_state
+                flat = state.reshape(state.shape[0], -1)
+                deq = fake_quantize(flat, spec, ste=False)
+                num += float(flat.pow(2).sum())
+                den += float((deq - flat).pow(2).sum())
+        clone.reset()
+    return 10.0 * math.log10(num / den) if den > 0.0 and num > 0.0 \
+        else math.inf
+
+
+def evaluate_stepwise_ppl(model, windows: list, pad_id: int,
+                          spec: QuantSpec | None = None) -> dict:
+    """Held-out perplexity of the standalone stepwise KDA LM."""
+    model.eval()
+    total_nll, n_tokens = 0.0, 0
+    with torch.no_grad():
+        for ids in windows:
+            logits = model(ids, spec=spec, ste=False)[:, :-1]
+            targets = ids[:, 1:1 + logits.shape[1]]
+            mask = targets.ne(pad_id) & targets.ne(-100)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+                reduction='none')
+            total_nll += float((nll * mask.reshape(-1)).sum())
+            n_tokens += int(mask.sum())
+    return {'ppl': _ppl_from_nll(total_nll, n_tokens),
+            'mean_nll': total_nll / max(1, n_tokens), 'n_tokens': n_tokens}
+
+
+# --------------------------------------------------------------------------
+# Aggregation
+# --------------------------------------------------------------------------
+def _aggregate(values: list) -> dict:
+    values = [v for v in values if v is not None]
+    if not values:
+        return {'mean': None, 'min': None, 'max': None}
+    return {'mean': sum(values) / len(values), 'min': min(values),
+            'max': max(values)}
+
+
+def _spec_fields(spec: QuantSpec | None) -> dict:
+    if spec is None:
+        return {
+            'quantized': False, 'bits': None, 'group_size': None,
+            'symmetric': None, 'bits_per_element': FP16_BITS,
+            'compression_vs_fp16': 1.0,
+        }
+    return {
+        'quantized': True, 'bits': spec.bits, 'group_size': spec.group_size,
+        'symmetric': spec.symmetric,
+        'bits_per_element': bits_per_element(spec),
+        'compression_vs_fp16': compression_ratio(spec),
+    }
+
+
+def build_ptq_rows(per_seed: list, specs: list, tolerance: float) -> tuple:
+    """Aggregate Part A per-seed cells into rows (cells + summary)."""
+    seeds = [cell['seed'] for cell in per_seed]
+    # fp16 decode ppl per seed for ratio normalization.
+    fp16_by_seed = {cell['seed']: cell['decode_ppl']
+                    for cell in per_seed if cell['spec'] is None}
+    rows = []
+    cells = []
+    for spec in specs:
+        # Value equality (QuantSpec is a frozen dataclass): a caller may
+        # pass an equal-but-distinct spec object.
+        cells.append([c for c in per_seed if c['spec'] == spec])
+    for spec, group in zip(specs, cells):
+        if not group:
+            continue
+        ppl = _aggregate([c['decode_ppl'] for c in group])
+        ratio = _aggregate([
+            c['decode_ppl'] / fp16_by_seed[c['seed']] for c in group])
+        top1 = _aggregate([c['top1_agreement'] for c in group])
+        snr = _aggregate([c['state_snr_db'] for c in group])
+        state_elements = group[0]['state_elements']
+        row = {
+            'row_kind': 'ptq_ppl',
+            'model': 'hybrid_lm',
+            'seeds': [int(s) for s in seeds],
+            'state_elements': int(state_elements),
+            'state_bytes': (
+                storage_bytes(state_elements, spec) if spec is not None
+                else state_elements * FP16_BITS / 8.0),
+            'prefill_ppl_mean': _aggregate(
+                [c['prefill_ppl'] for c in group])['mean'],
+            'decode_ppl_mean': ppl['mean'],
+            'decode_ppl_min': ppl['min'],
+            'decode_ppl_max': ppl['max'],
+            'ppl_ratio_mean': ratio['mean'],
+            'ppl_ratio_min': ratio['min'],
+            'ppl_ratio_max': ratio['max'],
+            'top1_agreement_mean': top1['mean'],
+            'top1_agreement_min': top1['min'],
+            'state_snr_db_mean': snr['mean'],
+            'ppl_preserving': bool(
+                ratio['min'] is not None and ratio['min'] <= 1.0 + tolerance),
+            'tolerance': float(tolerance),
+        }
+        row.update(_spec_fields(spec))
+        rows.append(row)
+
+    quantized = [r for r in rows if r['quantized']]
+    fp16_row = next(r for r in rows if not r['quantized'])
+    preserving = [r for r in quantized if r['ppl_preserving']]
+    worst = (max(quantized, key=lambda r: r['ppl_ratio_mean'])
+             if quantized else None)
+    rows.append({
+        'row_kind': 'ptq_summary',
+        'model': 'hybrid_lm',
+        'seeds': [int(s) for s in seeds],
+        'tolerance': float(tolerance),
+        'n_cells': len(quantized),
+        'fp16_decode_ppl_mean': fp16_row['decode_ppl_mean'],
+        'fp16_state_bytes': fp16_row['state_bytes'],
+        'prefill_ppl_mean': fp16_row['prefill_ppl_mean'],
+        'prefill_decode_ppl_ratio': (
+            fp16_row['prefill_ppl_mean'] / fp16_row['decode_ppl_mean']),
+        'cheapest_ppl_preserving_cell': (
+            min(preserving, key=lambda r: r['state_bytes'])
+            if preserving else None),
+        'worst_cell': worst,
+    })
+    return rows
+
+
+def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
+    """Aggregate Part B per-seed QAT cells + the recovery summary row."""
+    rows = []
+    for cell in per_seed:
+        row = dict(cell)
+        row['row_kind'] = 'qat_per_seed'
+        row.pop('spec', None)
+        rows.append(row)
+    fp16 = _aggregate([c['fp16_ppl'] for c in per_seed])
+    ptq = _aggregate([c['ptq_ppl'] for c in per_seed])
+    qat = _aggregate([c['qat_ppl'] for c in per_seed])
+    qat_fp16 = _aggregate([c['qat_model_fp16_state_ppl'] for c in per_seed])
+    recovery = _aggregate([c['recovery_fraction'] for c in per_seed])
+    row = {
+        'row_kind': 'qat_recovery',
+        'model': 'stepwise_kda_lm',
+        'seeds': [int(c['seed']) for c in per_seed],
+        'spec': spec_summary(spec),
+        'steps': per_seed[0]['steps'],
+        'qat_steps': per_seed[0]['qat_steps'],
+        'fp16_ppl_mean': fp16['mean'], 'fp16_ppl_min': fp16['min'],
+        'fp16_ppl_max': fp16['max'],
+        'ptq_ppl_mean': ptq['mean'], 'ptq_ppl_min': ptq['min'],
+        'ptq_ppl_max': ptq['max'],
+        'qat_ppl_mean': qat['mean'], 'qat_ppl_min': qat['min'],
+        'qat_ppl_max': qat['max'],
+        'qat_model_fp16_state_ppl_mean': qat_fp16['mean'],
+        'recovery_fraction_mean': recovery['mean'],
+        'recovery_fraction_min': recovery['min'],
+        'recovery_fraction_max': recovery['max'],
+        'grad_norm_first_mean': _aggregate(
+            [c['grad_norm_first'] for c in per_seed])['mean'],
+        'grad_norm_last_mean': _aggregate(
+            [c['grad_norm_last'] for c in per_seed])['mean'],
+        'all_grads_finite': bool(
+            all(c['all_grads_finite'] for c in per_seed)),
+        'recovery_definition': (
+            '1 - residual/ptq_damage where residual = qat_ppl/fp16_ppl - 1 '
+            'and damage = ptq_ppl/fp16_ppl - 1 per seed; None when the '
+            'seed shows no PTQ damage (damage <= 0).'),
+    }
+    rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Experiment driver
+# --------------------------------------------------------------------------
+def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
+               seq_len, batch_size, eval_seqs, tolerance, lr=3e-3) -> tuple:
+    """Train + PTQ-score the hybrid LM; return (per_seed_cells, train_report)."""
+    pad = pad_token_id(tokenizer)
+    val_windows = encode_windows(tokenizer, split_texts['val'][:eval_seqs],
+                                 seq_len, device)
+    if not val_windows:
+        raise RuntimeError('Part A: the val split produced no windows')
+    val_dataset = TinyStoriesLM(tokenizer, seq_len=seq_len,
+                                texts=split_texts['val'][:eval_seqs],
+                                name='val')
+    per_seed, train_reports = [], []
+    for seed in seeds:
+        model, report = train_hybrid_lm(
+            seed=seed, tokenizer=tokenizer, train_texts=split_texts['train'],
+            steps=steps, seq_len=seq_len, batch_size=batch_size,
+            device=device, lr=lr)
+        prefill = evaluate_lm_loss(model, val_dataset, batch_size=1,
+                                   device=device)
+        if prefill['perplexity'] is None:
+            raise RuntimeError('Part A: prefill evaluation had no tokens')
+        clone = build_decoding_clone(model, device=device)
+        base = evaluate_decode_ppl(model, clone, val_windows, pad, spec=None)
+        cells = [None] + list(specs)
+        for spec in cells:
+            scored = (base if spec is None
+                      else evaluate_decode_ppl(model, clone, val_windows,
+                                               pad, spec=spec))
+            snr = math.inf if spec is None else _decode_state_snr(
+                model, clone, val_windows, pad, spec)
+            agreement = 1.0
+            if spec is not None:
+                a = torch.cat(base['argmax'])
+                b = torch.cat(scored['argmax'])
+                agreement = float((a == b).to(torch.float32).mean())
+            per_seed.append({
+                'seed': int(seed),
+                'spec': spec,
+                'prefill_ppl': float(prefill['perplexity']),
+                'decode_ppl': scored['ppl'],
+                'mean_nll': scored['mean_nll'],
+                'n_tokens': scored['n_tokens'],
+                'top1_agreement': agreement,
+                'state_elements': scored['state_elements'],
+                'state_snr_db': snr,
+            })
+        train_reports.append(report)
+        logger.info(
+            'Part A seed %d: prefill ppl %.4f, decode fp16 ppl %.4f '
+            '(train loss %.4f -> %.4f)', seed, prefill['perplexity'],
+            base['ppl'], report['loss_first'], report['loss_last'])
+    return per_seed, train_reports
+
+
+def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
+               seq_len, batch_size, eval_seqs, spec, steps, lr=3e-3) -> list:
+    """fp16-vs-QAT A/B training + scoring for the stepwise KDA LM."""
+    pad = pad_token_id(tokenizer)
+    val_windows = encode_windows(tokenizer, split_texts['val'][:eval_seqs],
+                                 seq_len, device)
+    if not val_windows:
+        raise RuntimeError('Part B: the val split produced no windows')
+    per_seed = []
+    for seed in seeds:
+        fp16_model, fp16_rep = train_stepwise_lm(
+            seed=seed, tokenizer=tokenizer, train_texts=split_texts['train'],
+            steps=steps, seq_len=seq_len, batch_size=batch_size,
+            device=device, spec=None, ste=False, lr=lr)
+        qat_model, qat_rep = train_stepwise_lm(
+            seed=seed, tokenizer=tokenizer, train_texts=split_texts['train'],
+            steps=qat_steps, seq_len=seq_len, batch_size=batch_size,
+            device=device, spec=spec, ste=True, lr=lr)
+        fp16_ppl = evaluate_stepwise_ppl(fp16_model, val_windows, pad)['ppl']
+        ptq_ppl = evaluate_stepwise_ppl(fp16_model, val_windows, pad,
+                                        spec=spec)['ppl']
+        qat_ppl = evaluate_stepwise_ppl(qat_model, val_windows, pad,
+                                        spec=spec)['ppl']
+        qat_fp16 = evaluate_stepwise_ppl(qat_model, val_windows, pad)['ppl']
+        damage = ptq_ppl / fp16_ppl - 1.0
+        residual = qat_ppl / fp16_ppl - 1.0
+        recovery = (1.0 - residual / damage) if damage > 0.0 else None
+        per_seed.append({
+            'seed': int(seed),
+            'steps': int(steps),
+            'qat_steps': int(qat_steps),
+            'fp16_ppl': fp16_ppl,
+            'ptq_ppl': ptq_ppl,
+            'qat_ppl': qat_ppl,
+            'qat_model_fp16_state_ppl': qat_fp16,
+            'recovery_fraction': recovery,
+            'grad_norm_first': qat_rep['grad_norm_first'],
+            'grad_norm_last': qat_rep['grad_norm_last'],
+            'all_grads_finite': bool(
+                qat_rep['all_grads_finite'] and fp16_rep['all_grads_finite']),
+        })
+        logger.info(
+            'Part B seed %d: fp16 %.4f | PTQ %s %.4f | QAT %.4f '
+            '(recovery %s)', seed, fp16_ppl,
+            spec_summary(spec)['bits'], ptq_ppl, qat_ppl,
+            'n/a' if recovery is None else f'{recovery:.2%}')
+    return per_seed
+
+
+def _ints(raw, name, min_value=1):
+    values = []
+    for part in str(raw).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError as e:
+            raise ValueError(f'{name}: {part!r} is not an int') from e
+        if value < min_value:
+            raise ValueError(f'{name}: {value} < {min_value}')
+        values.append(value)
+    if not values:
+        raise ValueError(f'{name}: empty list')
+    return tuple(dict.fromkeys(values))
+
+
+def _print_ptq(rows):
+    logger.info('\n-- Part A: held-out decode perplexity vs state bits '
+                '(mean [min..max] over seeds) --')
+    header = (f"{'cell':>12} | {'bits/el':>7} | {'bytes':>7} | "
+              f"{'xfp16':>6} | ppl (min..max) | ratio | top1 | snr dB")
+    logger.info(header)
+    logger.info('-' * len(header))
+    for row in rows:
+        if row['row_kind'] != 'ptq_ppl':
+            continue
+        label = ('fp16' if not row['quantized']
+                 else f"{row['bits']}b/g{row['group_size']}")
+        logger.info(
+            f"{label:>12} | {row['bits_per_element']:>7.2f} | "
+            f"{row['state_bytes']:>7.1f} | "
+            f"{row['compression_vs_fp16']:>5.2f}x | "
+            f"{row['decode_ppl_mean']:.4f} "
+            f"[{row['decode_ppl_min']:.4f}..{row['decode_ppl_max']:.4f}] | "
+            f"{row['ppl_ratio_mean']:.4f} | "
+            f"{row['top1_agreement_mean']:.3f} | "
+            f"{row['state_snr_db_mean']:.1f}")
+
+
+def _print_qat(rows):
+    logger.info('\n-- Part B: QAT recovery (2-bit state writes, STE) --')
+    for row in rows:
+        if row['row_kind'] != 'qat_recovery':
+            continue
+        logger.info(
+            f"  fp16 {row['fp16_ppl_mean']:.4f} | PTQ {row['ptq_ppl_mean']:.4f} "
+            f"| QAT {row['qat_ppl_mean']:.4f} | "
+            f"recovery {row['recovery_fraction_mean']:.2%} "
+            f"(min {row['recovery_fraction_min']:.2%})")
+
+
+def main():
+    info = configure_torch_for_device()
+    device = info.device
+    logging.basicConfig(
+        level=logging.INFO, format='%(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)])
+    logger.info('=' * 70)
+    logger.info('Experiment 11: state-quantized decode perplexity + QAT '
+                'recovery')
+    logger.info('=' * 70)
+    logger.info(f'  device: {device}')
+
+    seeds = _ints(os.environ.get(
+        'QLM_SEEDS', ','.join(map(str, DEFAULT_SEEDS))), 'QLM_SEEDS', 0)
+    steps = int(os.environ.get('QLM_STEPS', DEFAULT_STEPS))
+    qat_steps = int(os.environ.get('QLM_QAT_STEPS', DEFAULT_QAT_STEPS))
+    seq_len = int(os.environ.get('QLM_SEQ_LEN', DEFAULT_SEQ_LEN))
+    batch_size = int(os.environ.get('QLM_BATCH', DEFAULT_BATCH))
+    eval_seqs = int(os.environ.get('QLM_EVAL_SEQS', DEFAULT_EVAL_SEQS))
+    n_corpus = int(os.environ.get('QLM_CORPUS', DEFAULT_CORPUS))
+    skip_qat = os.environ.get('QLM_SKIP_QAT', '0').strip().lower() in (
+        '1', 'true', 'yes', 'y', 'on')
+    tolerance = float(os.environ.get('QLM_PPL_TOL', DEFAULT_TOLERANCE))
+    if min(steps, qat_steps, seq_len, batch_size, eval_seqs, n_corpus) < 1:
+        raise ValueError('QLM_* step/geometry knobs must be >= 1')
+    bits = _ints(os.environ.get(
+        'QLM_BITS', ','.join(map(str, DEFAULT_BITS))), 'QLM_BITS', 2)
+    groups = _ints(os.environ.get(
+        'QLM_GROUP_SIZES', ','.join(map(str, DEFAULT_GROUP_SIZES))),
+        'QLM_GROUP_SIZES', 1)
+    specs = [s for s in default_sweep_specs(bits, groups,
+                                            include_asymmetric=True)
+             if s is not None]
+    logger.info(f'  seeds: {list(seeds)}, steps: {steps}, '
+                f'qat_steps: {qat_steps}, seq_len: {seq_len}, '
+                f'batch: {batch_size}, eval_seqs: {eval_seqs}')
+    logger.info(f'  specs: {len(specs)} quantized cells + fp16')
+
+    tokenizer, split_texts, split_report = build_corpus(
+        seq_len=seq_len, n_texts=n_corpus, seed=0)
+    logger.info(f'  corpus: synthetic fallback, '
+                f'splits={ {k: len(v) for k, v in split_texts.items()} }')
+
+    ptq_per_seed, train_reports = run_part_a(
+        device=device, tokenizer=tokenizer, split_texts=split_texts,
+        seeds=seeds, specs=specs, steps=steps, seq_len=seq_len,
+        batch_size=batch_size, eval_seqs=eval_seqs, tolerance=tolerance)
+    ptq_rows = build_ptq_rows(ptq_per_seed, [None] + specs, tolerance)
+    _print_ptq(ptq_rows)
+
+    qat_rows: list = []
+    if not skip_qat:
+        qat_per_seed = run_part_b(
+            device=device, tokenizer=tokenizer, split_texts=split_texts,
+            seeds=seeds, qat_steps=qat_steps, seq_len=seq_len,
+            batch_size=batch_size, eval_seqs=eval_seqs, spec=QAT_SPEC,
+            steps=steps)
+        qat_rows = build_qat_rows(qat_per_seed, QAT_SPEC)
+        _print_qat(qat_rows)
+
+    plt_rows = []
+    for cell in ptq_per_seed:
+        row = {k: v for k, v in cell.items() if k != 'spec'}
+        row['row_kind'] = 'ptq_per_seed'
+        row.update(_spec_fields(cell['spec']))
+        plt_rows.append(row)
+
+    metadata = {
+        'experiment': 'exp11_quant_lm',
+        'design': (
+            'End-task perplexity evaluation of state quantization: Part A '
+            'trains the tiny hybrid LM (2 KDA + 1 CSA + 1 HCA) on the '
+            'deterministic offline synthetic corpus and scores held-out '
+            'token NLL token-by-token through run_decoding.HybridDecoding '
+            'with the stacked KDA state fake-quantized after every write '
+            '(Exp 10 grid, flat per-layer grouping); Part B trains a '
+            'standalone per-token KDA LM twice from the same init '
+            '(fp16 vs 2-bit STE state writes) to measure whether QAT '
+            'recovers the PTQ perplexity damage through the quantizer.'),
+        'model': _cfg_summary(small_hybrid_config()),
+        'corpus': {
+            'source': 'synthetic fallback (deterministic, offline; no '
+                      'network / HuggingFace tokenizer)',
+            'tokenizer': '_FallbackCharTokenizer (printable ASCII)',
+            'split': split_report,
+        },
+        'protocol': {
+            'decode_path': 'run_decoding.HybridDecoding, one token per '
+                           'call from an empty state (prefill chunk path '
+                           'only used for the prefill_ppl reference)',
+            'quantized_tensor': 'clone.model._kda_state (stacked KDA '
+                                'state), grouped along the flattened '
+                                'per-layer buffer',
+            'delta_normalization': 'ppl_ratio = decode_ppl(spec) / '
+                                   'decode_ppl(fp16) on the SAME path and '
+                                   'seed; min-over-seeds for the '
+                                   'ppl_preserving flag',
+            'tolerance': tolerance,
+            'qat': 'straight-through fake_quantize (ste=True) on every '
+                   'state write during training; inference scoring uses '
+                   'ste=False on the same spec',
+        },
+        'train_reports': [
+            {k: v for k, v in rep.items() if k != 'cfg'}
+            for rep in train_reports],
+        'seeds': [int(s) for s in seeds],
+        'steps': steps,
+        'qat_steps': qat_steps,
+        'seq_len': seq_len,
+        'batch_size': batch_size,
+        'eval_sequences': eval_seqs,
+        'specs': [spec_summary(s) for s in specs],
+        'qat_spec': spec_summary(QAT_SPEC),
+        'caveats': [
+            'Toy corpus and model: absolute perplexities are not '
+            'comparable to real-corpus LM numbers; the measured quantity '
+            'is the relative damage of state quantization at fixed '
+            'weights and path.',
+            'Only the KDA recurrent state is quantized; CSA/HCA '
+            'incremental caches, short-conv lookback, activations, '
+            'weights and logits stay fp16/fp32.',
+            'The fp16 prefill path (chunked KDA) and the fp16 decode path '
+            '(recurrent KDA) differ by kernel/reduction order; all '
+            'quantization deltas are measured against decode fp16 on the '
+            'same path.',
+            'Part B demonstrates the autograd/STE contract end-to-end on '
+            'a 1-layer from-scratch model; it is not a production QAT '
+            'recipe and recovery is seed-dependent.',
+            'ppl_preserving is a tolerance flag (min-over-seeds ratio <= '
+            f'1 + {tolerance:.2%}), not an exactness claim.',
+        ],
+        'provenance': capture_provenance(),
+    }
+
+    rows = plt_rows + ptq_rows + qat_rows
+    os.makedirs(os.path.dirname(RESULTS_PATH) or '.', exist_ok=True)
+    write_schema(RESULTS_PATH, rows, kind='exp11_quant_lm',
+                 metadata=metadata)
+    logger.info(f'\nSaved: {RESULTS_PATH}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

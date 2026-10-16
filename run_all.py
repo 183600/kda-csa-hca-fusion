@@ -100,6 +100,16 @@ _RUN_PROFILES: dict[str, dict[str, str] | None] = {
         'BENCH_LENGTHS': '128,256', 'BENCH_REPEATS': '3',
         'BUDGET_PREFILL_LENS': '256', 'BUDGET_DECODE_TOKENS': '3',
         'BUDGET_REPEATS': '1', 'SKIP_SLOW': '1',
+        # Quantization experiments (Exp 10 / Exp 11): keep the plumbing
+        # (every spec/mode exercised) but shrink the geometry and the
+        # training budgets to the smallest values that still exercise
+        # multi-seed aggregation and both recovery metrics.
+        'QUANT_SEEDS': '1', 'QUANT_BITS': '2,4',
+        'QUANT_GROUP_SIZES': '16,64', 'QUANT_N_KEYS': '8',
+        'QUANT_VALUE_DIM': '4',
+        'QLM_SEEDS': '1', 'QLM_STEPS': '20', 'QLM_QAT_STEPS': '20',
+        'QLM_SEQ_LEN': '32', 'QLM_BATCH': '4', 'QLM_EVAL_SEQS': '2',
+        'QLM_CORPUS': '32',
     },
     'screen': None,   # the historical defaults — no overrides
     'full': {
@@ -305,6 +315,22 @@ _EXPERIMENT_OUTPUTS = {
     'exp7_roofline': ['results/exp7_roofline.json'],
     'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
     'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
+    'exp10_quant_recall': ['results/exp10_quant_recall.json'],
+    'exp11_quant_lm': ['results/exp11_quant_lm.json'],
+}
+
+# Result files listed in ``_EXPERIMENT_OUTPUTS`` that are NOT results_schema
+# envelopes: provenance side files (plain ``capture_provenance()`` dicts)
+# and Exp 4's overfit-gate report payload (a raw report dict with no
+# ``results`` list). The schema integrity gate below skips exactly these;
+# anything else an experiment writes MUST parse as a compatible
+# ``results_schema`` payload or the gate fails the pipeline.
+_RAW_SIDE_FILES = {
+    'results/exp2_benchmark_provenance.json',
+    'results/exp5_ablation_provenance.json',
+    'results/exp5b_ablation_matrix_provenance.json',
+    'results/exp6_decoding_provenance.json',
+    'results/exp4_overfit_gate.json',
 }
 
 
@@ -340,6 +366,39 @@ def _purge_stale_outputs(name):
                 os.remove(rel)
             except OSError as e:
                 print(f'[run_all] WARNING: could not remove stale {rel}: {e}')
+
+
+def _check_results_schema():
+    """Schema integrity gate over the result files present in ``results/``.
+
+    Wired into the pipeline here because ``ci_gate.py`` is frozen: every
+    schema-managed file named in ``_EXPERIMENT_OUTPUTS`` (i.e. everything
+    except ``_RAW_SIDE_FILES``) must parse as a compatible
+    ``results_schema`` payload. Returns 0 on success and a non-zero exit
+    code otherwise, honoring ``_run``'s return-code contract.
+    """
+    import results_schema
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for outputs in _EXPERIMENT_OUTPUTS.values():
+        for rel in outputs:
+            if rel in _RAW_SIDE_FILES or rel in seen:
+                continue
+            seen.add(rel)
+            candidates.append(rel)
+    present = [p for p in candidates if os.path.exists(p)]
+    if not present:
+        print('[results_schema] no schema-managed result files present')
+        return 1
+    missing = [p for p in candidates if p not in present]
+    if missing:
+        # A missing file belongs to an experiment that did not write its
+        # output (its own step is already recorded as failed above, or the
+        # run profile legitimately skipped it, e.g. exp5b in non-smoke
+        # profiles). Report it for visibility without double-counting.
+        print('[results_schema] not written this run (skipped): '
+              + ', '.join(missing))
+    return results_schema.main(['--check'] + present)
 
 
 def _run(name, fn):
@@ -424,7 +483,14 @@ def run_all(seeds=None, steps=None):
                  'RUN_ALL_PROFILE', 'BENCH_REPEATS', 'MQAR_OPS',
                  'MQAR_TASKS', 'MAMBA_BACKEND', 'ABL_MODE', 'ABL_MATRIX',
                  'ABL_TOTAL_LAYERS', 'ABL_MEMORY', 'ABL_D_MODEL',
-                 'ABL_TRAIN_BATCH')
+                 'ABL_TRAIN_BATCH',
+                 # Quantization experiments (Exp 10 / Exp 11): the smoke
+                 # profile and SKIP_SLOW CPU path truncate these.
+                 'QUANT_BITS', 'QUANT_GROUP_SIZES', 'QUANT_SEEDS',
+                 'QUANT_N_KEYS', 'QUANT_VALUE_DIM',
+                 'QLM_SEEDS', 'QLM_STEPS', 'QLM_QAT_STEPS', 'QLM_SEQ_LEN',
+                 'QLM_BATCH', 'QLM_EVAL_SEQS', 'QLM_CORPUS', 'QLM_SKIP_QAT',
+                 'QLM_PPL_TOL', 'QLM_BITS', 'QLM_GROUP_SIZES')
     # Snapshot the precise pre-call state of each env var: distinguish
     # "unset" from "set to a value" so the finally block can restore the
     # exact state.
@@ -521,6 +587,10 @@ def run_all(seeds=None, steps=None):
         import test_mechanism_ablation
         import test_budget_frontier
         import test_ssd_duality
+        import test_quant_recall
+        import test_quant_lm
+        import run_quant_recall
+        import run_quant_lm
         import method_analysis
         import make_figures
 
@@ -551,6 +621,17 @@ def run_all(seeds=None, steps=None):
         #     forward/gradient/contract parity.
         summary['runs'].append(
             _run('test_ssd_duality', test_ssd_duality.main))
+
+        # 1f. Quantized-state codec tests (Exp 10) — kv_quant codec
+        #     contract, grouped packing, and report aggregation.
+        summary['runs'].append(
+            _run('test_quant_recall', test_quant_recall.main))
+
+        # 1g. State-quantized LM tests (Exp 11) — in-place
+        #     ``fake_quantize_`` contract, STE gradient identity, stepwise
+        #     KDA QAT smoke, and report-row aggregation.
+        summary['runs'].append(
+            _run('test_quant_lm', test_quant_lm.main))
 
         # 2. KV cache analysis — pure arithmetic, always run.
         summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))
@@ -720,6 +801,58 @@ def run_all(seeds=None, steps=None):
         summary['runs'].append(
             _run('exp9_budget_frontier', run_budget_frontier.main))
 
+        # 7c. Quantized-state recall / cost probe (Exp 10) — pure-torch
+        #     numeric sweep, CPU-friendly. Under SKIP_SLOW on CPU only the
+        #     seed count and probe geometry are truncated (never expanded);
+        #     the runner's own defaults are the committed protocol.
+        if skip_slow and is_cpu:
+            try:
+                _qs = [int(x) for x in os.environ.get(
+                    'QUANT_SEEDS', '0,1,2').split(',') if x.strip()]
+            except ValueError:
+                _qs = [0, 1, 2]
+            _qs = _qs[:1] or [0]
+            os.environ['QUANT_SEEDS'] = ','.join(str(s) for s in _qs)
+            try:
+                _qnk = int(os.environ.get('QUANT_N_KEYS', '16'))
+            except ValueError:
+                _qnk = 16
+            os.environ['QUANT_N_KEYS'] = str(max(1, min(_qnk, 8)))
+        summary['runs'].append(
+            _run('exp10_quant_recall', run_quant_recall.main))
+
+        # 7d. State-quantized decode perplexity + QAT recovery (Exp 11) —
+        #     LM training dominates the cost. Under SKIP_SLOW on CPU
+        #     truncate every budget (one seed, <=50 train/QAT steps,
+        #     short sequences, few eval sequences); the fp16 baseline and
+        #     the QAT comparison always run so both metrics are covered.
+        if skip_slow and is_cpu:
+            try:
+                _qlm_seeds = [int(x) for x in os.environ.get(
+                    'QLM_SEEDS', '0,1,2').split(',') if x.strip()]
+            except ValueError:
+                _qlm_seeds = [0, 1, 2]
+            _qlm_seeds = _qlm_seeds[:1] or [0]
+            os.environ['QLM_SEEDS'] = ','.join(str(s) for s in _qlm_seeds)
+            for _key, _default, _cap in (
+                    ('QLM_STEPS', 400, 50), ('QLM_QAT_STEPS', 400, 50),
+                    ('QLM_SEQ_LEN', 64, 32), ('QLM_BATCH', 8, 4),
+                    ('QLM_EVAL_SEQS', 13, 4), ('QLM_CORPUS', 64, 32)):
+                try:
+                    _val = int(os.environ.get(_key, str(_default)))
+                except ValueError:
+                    _val = _default
+                os.environ[_key] = str(max(1, min(_val, _cap)))
+        summary['runs'].append(
+            _run('exp11_quant_lm', run_quant_lm.main))
+
+        # 7e. Schema integrity gate — every schema-managed result file
+        #     written above must parse as a compatible ``results_schema``
+        #     payload. This is the pipeline's structural CI check for the
+        #     results contract (``ci_gate.py`` itself is frozen).
+        summary['runs'].append(
+            _run('results_schema_check', _check_results_schema))
+
         # 8. Figures — generate from whatever results exist.
         # Two failure modes:
         #
@@ -819,11 +952,15 @@ def run_all(seeds=None, steps=None):
             'MQAR_SEEDS': os.environ.get('MQAR_SEEDS'),
             'ABL_SEEDS': os.environ.get('ABL_SEEDS'),
             'MECH_SEEDS': os.environ.get('MECH_SEEDS'),
+            'QUANT_SEEDS': os.environ.get('QUANT_SEEDS'),
+            'QLM_SEEDS': os.environ.get('QLM_SEEDS'),
             'base_seed': 42,
             'scheme': ('per-run seed = base_seed + i (MQAR/ABL/MECH); '
                        'benchmark input RNG is seeded per-(op, T) via '
-                       'crc32; decoding/roofline use seed 0. See each '
-                       'result file\'s provenance.'),
+                       'crc32; decoding/roofline use seed 0; the '
+                       'quantization runners use their explicit seed lists '
+                       '(QUANT_SEEDS/QLM_SEEDS). See each result file\'s '
+                       'provenance/metadata.'),
         }
         n_ok = sum(1 for r in summary['runs'] if r['status'] == 'ok')
         n_fail = sum(1 for r in summary['runs'] if r['status'] == 'fail')

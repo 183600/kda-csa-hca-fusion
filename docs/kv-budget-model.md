@@ -58,6 +58,15 @@ latter mixes in cheap early positions and understates late-context cost.
 | `quality_join` | measured | Exp 4/5/8 accuracy rows annotated with their analytic budget |
 | `ranking_summary` | derived | layout orders and Spearman correlations against accuracy under both views |
 
+## Quantization / bytes
+
+The element counts above assume fp16. `kv_quant.py` adds a byte view:
+`op_read_bytes` / `layout_read_bytes` price the same rows under a
+component→`QuantSpec` policy (payload bits + per-group scale/zero-point
+metadata), and `run_quant_recall.py` (Exp 10) measures the recall side of
+the trade-off on planted associations for both recurrent routes. See
+[quantization-model.md](quantization-model.md).
+
 ## Scope / honesty
 
 This is an **analytical read count, not profiled traffic**: library-internal
@@ -67,3 +76,5 @@ the decode cost, not a latency prediction. Hybrid layouts are
 depth-controlled, not budget-controlled, so the ranking summaries are
 exploratory; a positive correlation between accuracy and budget confounds
 operator composition with budget and does not establish a causal effect.
+The byte view inherits the same analytical caveat: it prices the *model*
+under a quantization policy, not a profiled quantized kernel.
