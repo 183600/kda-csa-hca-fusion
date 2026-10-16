@@ -67,6 +67,8 @@ from kaggle_setup import (
     write_json_atomic, write_results_json, capture_provenance,
     make_seeded_generator, set_global_seed,
 )
+from results_schema import (RowContractError,
+                            write_checked as write_results_checked)
 from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
 from ops_kda_backend import validate_kda_backend
 from ops_mamba_backend import validate_mamba_backend
@@ -965,6 +967,103 @@ def _log_contrast_table(contrasts: list) -> None:
     logger.info('=' * 92)
 
 
+_LAYOUT_CONTRAST_PAIRS = {
+    'B-A (CSA replaces memory)': ('B', 'A'),
+    'C-A (HCA replaces memory)': ('C', 'A'),
+    'D-B (add HCA to CSA)': ('D', 'B'),
+    'D-C (add CSA to HCA)': ('D', 'C'),
+}
+
+
+def _contrast_consistency_violations(all_results: list,
+                                     contrasts: list) -> list[str]:
+    """Re-derive every reported contrast from the raw per-seed rows.
+
+    ``_matrix_contrast_report`` produces the contrast table; this function
+    checks each reported number against an INDEPENDENT computation from
+    the per-seed ``final_acc`` values (recomputed stable-interaction
+    arithmetic, separately implemented pair resolution). A report bug —
+    wrong group pair, stale aggregate, interaction computed over
+    mismatched seed sets, a renamed contrast that no longer corresponds to
+    any group combination — is caught before the side file is written
+    next to a correct matrix.
+
+    Only REPORTED rows are checked: a partial matrix (missing groups)
+    legitimately reports fewer contrasts. Returns human-readable
+    violation strings ([] = consistent).
+    """
+    accs: dict = {}
+    for r in all_results:
+        if 'error' in r:
+            continue
+        key = (r.get('n_kv'), r.get('memory'), r.get('group'))
+        seed_map = _seed_accuracy_map(r)
+        if seed_map:
+            accs[key] = seed_map
+
+    def paired_mean(a_map: dict, b_map: dict):
+        common = sorted(set(a_map) & set(b_map))
+        if len(common) < 2:
+            return None, len(common)
+        diffs = [a_map[s] - b_map[s] for s in common]
+        return sum(diffs) / len(diffs), len(common)
+
+    out: list[str] = []
+    for c in contrasts:
+        n_kv = c.get('n_kv')
+        memory = c.get('memory', '')
+        name = c.get('contrast', '')
+        reported = c.get('mean_diff')
+        if not (isinstance(reported, (int, float))
+                and not isinstance(reported, bool)
+                and math.isfinite(float(reported))):
+            continue  # the row contract reports non-finite means
+        where = f'{name!r} ({memory}, n_kv={n_kv})'
+        if isinstance(memory, str) and ' vs ' in memory:
+            route_a, route_b = (p.strip() for p in memory.split(' vs ', 1))
+            # name is 'A_KDA - A_MAMBA2' -> the ablated group letter 'A'.
+            group = name.split(' ', 1)[0].split('_', 1)[0]
+            a_map = accs.get((n_kv, route_a, f'{route_a.upper()}-{group}'))
+            b_map = accs.get((n_kv, route_b, f'{route_b.upper()}-{group}'))
+            expected, n_common = paired_mean(a_map, b_map) \
+                if a_map is not None and b_map is not None else (None, 0)
+        elif name.startswith('I='):
+            members = [accs.get((n_kv, memory, f'{memory.upper()}-{g}'))
+                       for g in 'ABCD']
+            if any(m is None for m in members):
+                out.append(f'{where}: references a missing group')
+                continue
+            common = sorted(set.intersection(*(set(m) for m in members)))
+            if len(common) < 2:
+                out.append(f'{where}: fewer than 2 common seeds in the rows')
+                continue
+            diffs = [members[3][s] - members[1][s] - members[2][s]
+                     + members[0][s] for s in common]
+            expected, n_common = sum(diffs) / len(diffs), len(common)
+        else:
+            pair = _LAYOUT_CONTRAST_PAIRS.get(name)
+            if pair is None:
+                out.append(f'{where}: unrecognized contrast name')
+                continue
+            ga, gb = pair
+            a_map = accs.get((n_kv, memory, f'{memory.upper()}-{ga}'))
+            b_map = accs.get((n_kv, memory, f'{memory.upper()}-{gb}'))
+            expected, n_common = paired_mean(a_map, b_map) \
+                if a_map is not None and b_map is not None else (None, 0)
+        if expected is None:
+            out.append(f'{where}: rows imply < 2 common seeds but the '
+                       f'contrast was reported')
+            continue
+        tol = 1e-9 * max(1.0, abs(expected))
+        if abs(float(reported) - expected) > tol:
+            out.append(f'{where}: mean_diff={reported!r} but the per-seed '
+                       f'rows imply {expected!r}')
+        if c.get('n_common_seeds') != n_common:
+            out.append(f'{where}: n_common_seeds={c.get("n_common_seeds")!r} '
+                       f'but the rows share {n_common} seed(s)')
+    return out
+
+
 def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
     """ABL_MODE=matrix driver: build + run + report the explicit matrix."""
     preset = os.environ.get('ABL_MATRIX', 'main8').strip().lower()
@@ -1128,18 +1227,47 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
     _log_contrast_table(contrasts)
 
     os.makedirs('results', exist_ok=True)
-    write_results_json(all_results, 'results/exp5b_ablation_matrix.json',
-                       logger=logger)
-    write_results_json(contrasts,
-                        'results/exp5b_ablation_matrix_contrasts.json',
-                        logger=logger)
+    run_meta = {
+        'preset': preset,
+        'memory_routes': list(memory_types),
+        'n_kv_list': list(n_kv_list),
+        'n_seeds': n_seeds,
+        'steps': steps,
+        'total_layers': total_layers,
+        'd_model': d_model,
+        'device': str(device),
+        # The preset's promised group ids; the row contract refuses to
+        # write a survivor-only matrix (a crash mid-sweep) as if complete.
+        'expected_groups': [spec[0] for spec in groups],
+    }
+    # Independent re-derivation of every reported contrast from the raw
+    # per-seed rows: the analysis side file must not contradict the matrix
+    # it is derived from.
+    violations = _contrast_consistency_violations(all_results, contrasts)
+    if violations:
+        raise RowContractError(
+            'matrix contrast report is inconsistent with the per-seed rows: '
+            + '; '.join(violations[:5])
+            + (f' (+{len(violations) - 5} more)' if len(violations) > 5
+               else ''))
+    try:
+        write_results_checked('results/exp5b_ablation_matrix.json',
+                              all_results, kind='exp5b_ablation_matrix',
+                              metadata=run_meta)
+        write_results_checked(
+            'results/exp5b_ablation_matrix_contrasts.json', contrasts,
+            kind='exp5b_ablation_matrix_contrasts', metadata=run_meta)
+    except RowContractError as e:
+        logger.error(f'result rows failed their contract: {e}')
+        return 1
     try:
         write_results_json(_run_provenance(n_seeds, steps),
                            'results/exp5b_ablation_matrix_provenance.json',
                            logger=logger)
     except Exception as e:
         logger.warning(f'failed to write provenance: {e}')
-    logger.info('\nSaved: results/exp5b_ablation_matrix.json')
+    logger.info('\nSaved: results/exp5b_ablation_matrix.json '
+                '(schema kind=exp5b_ablation_matrix)')
     n_errors = sum(1 for r in all_results if 'error' in r)
     n_incomplete = sum(
         1 for r in all_results

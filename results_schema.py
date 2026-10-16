@@ -23,6 +23,31 @@ canonical on-disk shape, with an explicit semantic version:
       "results": [{...}, ...]            # the per-row records
     }
 
+Per-kind row contracts
+----------------------
+Structural shape (envelope + version) says nothing about whether the
+rows make sense. A partial matrix (7 of 8 groups), a contrast whose
+``mean_diff`` no longer matches the per-seed rows, or an Exp 6 row whose
+``uses_incremental_cache`` flag contradicts its operator are all
+schema-valid yet silently corrupt downstream analysis. :func:`validate_rows`
+therefore applies a per-``kind`` *contract* (registered in
+:data:`ROW_CONTRACTS`) that checks:
+
+* required fields and their types;
+* uniqueness of the natural key ((group, n_kv), (op, prefill_len), ...);
+* internal arithmetic (``mean_acc`` recomputed from ``per_seed``);
+* run-level completeness (the group set recorded in the envelope's
+  ``metadata.expected_groups`` must all be present);
+* metadata invariants (Exp 6's hybrid rows MUST be flagged as using the
+  incremental cache — the caches are wired in every hybrid stack
+  regardless of the memory route).
+
+:func:`write_checked` validates before writing and raises
+:class:`RowContractError`, so a producer bug fails the experiment loudly
+instead of persisting a misleading result file. ``--check-rows`` extends
+the CLI ``--check`` mode to freshly written kind-tagged files; unknown
+kinds (and legacy version-0 files without a ``kind``) pass untouched.
+
 Backward compatibility
 ----------------------
 ``parse`` accepts and classifies three historical shapes:
@@ -49,7 +74,8 @@ CLI
 ``python results_schema.py results/exp2_benchmark.json`` prints a
 version report per file. ``--check`` exits non-zero if any file is
 incompatible (future major version) or malformed, so a CI job can gate on
-it. With no arguments it scans ``results/*.json``.
+it; ``--check-rows`` additionally enforces the per-kind row contracts on
+kind-tagged files. With no arguments it scans ``results/*.json``.
 """
 from __future__ import annotations
 
@@ -77,6 +103,10 @@ class SchemaVersionError(SchemaError):
 
 class SchemaFormatError(SchemaError):
     """The file has neither a bare-array nor an envelope shape."""
+
+
+class RowContractError(SchemaError):
+    """The payload's rows violate the registered contract for their kind."""
 
 
 def parse_version(value) -> tuple[int, int]:
@@ -219,6 +249,333 @@ def normalize(data, *, kind: str, metadata: dict | None = None) -> dict:
     return envelope(rows, kind=kind, metadata=merged)
 
 
+# ---------------------------------------------------------------------------
+# Per-kind row contracts
+# ---------------------------------------------------------------------------
+# A contract is a pure ``fn(rows, metadata) -> list[str]`` returning
+# human-readable violations (empty = conforming). Register one per
+# ``kind`` with the decorator; unknown kinds are left unvalidated so a
+# new experiment can start writing envelopes before its contract exists.
+
+ROW_CONTRACTS: dict = {}
+
+# Hybrid rows record the RESOLVED layout as a hyphen-joined uppercase
+# string (e.g. 'KDA-KDA-KDA-CSA-HCA'; see ops_fused.HybridAttentionStack
+# .layout_str and LAYOUT_KINDS).
+_LAYOUT_TOKENS = frozenset({'KDA', 'MAMBA2', 'RWKV7', 'CSA', 'HCA'})
+_MEMORY_TOKENS = frozenset({'KDA', 'MAMBA2', 'RWKV7'})
+_EXP6_HYBRID_OPS = frozenset({'hybrid', 'hybrid_mamba2', 'hybrid_rwkv7'})
+_EXP6_CACHE_OPS = frozenset({'csa', 'hca'}) | _EXP6_HYBRID_OPS
+_EXP6_PREFILL_BUILDS = frozenset({
+    'batched_populate_layer_by_layer',
+    'batched_append_from_naive_output',
+    'native_operator_state',
+})
+
+
+def register_row_contract(kind: str):
+    """Decorator registering ``fn(rows, metadata) -> list[str]`` for ``kind``."""
+    def _decorator(fn):
+        ROW_CONTRACTS[kind] = fn
+        return fn
+    return _decorator
+
+
+def _finite_number(value) -> bool:
+    """True for a real (non-bool) finite int/float."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
+
+def _positive_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _recomputed_mean(per_seed: list) -> tuple[float | None, int]:
+    """Mean over the per-seed rows that qualify for aggregation.
+
+    Mirrors ``run_ablation.eval_group_multi_seed``'s ``ok_per_seed``
+    filter: a seed contributes iff it has no ``error`` and BOTH
+    ``final_acc`` and ``final_loss`` are finite.
+    """
+    accs = []
+    for s in per_seed:
+        if not isinstance(s, dict) or 'error' in s:
+            continue
+        acc, loss = s.get('final_acc'), s.get('final_loss')
+        if _finite_number(acc) and _finite_number(loss):
+            accs.append(float(acc))
+    if not accs:
+        return None, 0
+    return sum(accs) / len(accs), len(accs)
+
+
+@register_row_contract('exp5b_ablation_matrix')
+def _validate_matrix_rows(rows: list, metadata: dict) -> list[str]:
+    """Eight-group matrix: unique (group, n_kv), self-consistent aggregates.
+
+    Also enforces run-level completeness when the writer recorded
+    ``metadata['expected_groups']`` (the group ids the preset promised):
+    every expected group id must appear in the rows. A crash that writes
+    a survivor-only matrix is exactly the failure this catches.
+    """
+    out: list[str] = []
+    seen: set = set()
+    present: set = set()
+    meta = metadata if isinstance(metadata, dict) else {}
+    expected = meta.get('expected_groups')
+    total_layers = meta.get('total_layers')
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        group, memory, n_kv = row.get('group'), row.get('memory'), row.get('n_kv')
+        if not isinstance(group, str) or not group:
+            out.append(f"{where}: 'group' must be a non-empty string, got {group!r}")
+        if not isinstance(memory, str) or not memory:
+            out.append(f"{where}: 'memory' must be a non-empty string, got {memory!r}")
+        if not _positive_int(n_kv):
+            out.append(f"{where}: 'n_kv' must be a positive int, got {n_kv!r}")
+        if isinstance(group, str) and _positive_int(n_kv):
+            key = (group, n_kv)
+            if key in seen:
+                out.append(f'{where}: duplicate (group, n_kv)={key!r}')
+            seen.add(key)
+            present.add(group)
+        if 'error' in row:
+            # A failed group still carries its identity fields; the numeric
+            # checks below only apply to successful rows.
+            continue
+        per_seed = row.get('per_seed')
+        if not isinstance(per_seed, list):
+            out.append(f"{where}: 'per_seed' must be a list, got {type(per_seed).__name__}")
+            continue
+        recomputed, n_finite = _recomputed_mean(per_seed)
+        mean = row.get('mean_acc')
+        if not _finite_number(mean):
+            out.append(f"{where}: 'mean_acc' must be finite, got {mean!r}")
+        elif recomputed is not None:
+            tol = 1e-9 * max(1.0, abs(float(mean)))
+            if abs(recomputed - float(mean)) > tol:
+                out.append(
+                    f"{where}: mean_acc={mean!r} != mean(per_seed final_acc)="
+                    f'{recomputed!r}')
+        n_ok = row.get('n_seeds_ok')
+        if isinstance(n_ok, int) and not isinstance(n_ok, bool) \
+                and n_ok != n_finite:
+            out.append(
+                f'{where}: n_seeds_ok={n_ok} but {n_finite} finite '
+                f'per-seed final_acc value(s)')
+        layout = row.get('layout')
+        if not isinstance(layout, str) or not layout:
+            out.append(
+                f'{where}: layout must be the non-empty resolved layout '
+                f'string (e.g. KDA-KDA-KDA-CSA-HCA), got {layout!r}')
+        else:
+            tokens = layout.split('-')
+            bad_tokens = sorted({t for t in tokens if t not in _LAYOUT_TOKENS})
+            if bad_tokens:
+                out.append(
+                    f'{where}: layout has unknown token(s) {bad_tokens}; '
+                    f'expected tokens from {sorted(_LAYOUT_TOKENS)}')
+            elif isinstance(memory, str):
+                stray_memory = sorted(
+                    {t.lower() for t in tokens
+                     if t in _MEMORY_TOKENS and t.lower() != memory})
+                if stray_memory:
+                    out.append(
+                        f'{where}: layout carries memory token(s) '
+                        f'{stray_memory} but memory={memory!r} '
+                        f'(one memory route per stack)')
+        n_params, n_layers = row.get('n_params'), row.get('n_layers')
+        if not _positive_int(n_params):
+            out.append(f"{where}: 'n_params' must be a positive int, got {n_params!r}")
+        if not _positive_int(n_layers):
+            out.append(f"{where}: 'n_layers' must be a positive int, got {n_layers!r}")
+        elif total_layers is not None and n_layers != total_layers:
+            out.append(
+                f'{where}: n_layers={n_layers} != metadata.total_layers='
+                f'{total_layers} (the design is depth-controlled)')
+    if isinstance(expected, list) and expected:
+        missing = sorted(set(expected) - present)
+        if missing:
+            out.append(
+                f'matrix incomplete: expected group(s) {missing} are absent '
+                f'from the {len(present)} group(s) present')
+    return out
+
+
+@register_row_contract('exp5b_ablation_matrix_contrasts')
+def _validate_contrast_rows(rows: list, metadata: dict) -> list[str]:
+    """Paired contrasts: finite effects, >= 2 common seeds, unique keys."""
+    out: list[str] = []
+    seen: set = set()
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        n_kv = row.get('n_kv')
+        if not _positive_int(n_kv):
+            out.append(f"{where}: 'n_kv' must be a positive int, got {n_kv!r}")
+        for key in ('memory', 'contrast'):
+            if not isinstance(row.get(key), str) or not row.get(key):
+                out.append(f"{where}: '{key}' must be a non-empty string, "
+                           f'got {row.get(key)!r}')
+        if not _finite_number(row.get('mean_diff')):
+            out.append(f"{where}: 'mean_diff' must be finite, got {row.get('mean_diff')!r}")
+        t_stat = row.get('t_stat')
+        if t_stat is not None and not _finite_number(t_stat):
+            out.append(f"{where}: 't_stat' must be null or finite, got {t_stat!r}")
+        n_common = row.get('n_common_seeds')
+        if not (isinstance(n_common, int) and not isinstance(n_common, bool)
+                and n_common >= 2):
+            out.append(
+                f"{where}: 'n_common_seeds' must be >= 2 for a paired "
+                f'contrast, got {n_common!r}')
+        if row.get('metric') != 'final_acc':
+            out.append(f"{where}: metric must be 'final_acc', got {row.get('metric')!r}")
+        if row.get('direction') != 'higher_is_better':
+            out.append(
+                f"{where}: direction must be 'higher_is_better', got "
+                f"{row.get('direction')!r}")
+        key = (n_kv, row.get('memory'), row.get('contrast'))
+        if all(part is not None for part in key):
+            if key in seen:
+                out.append(f'{where}: duplicate contrast key {key!r}')
+            seen.add(key)
+    return out
+
+
+@register_row_contract('exp6_decoding')
+def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
+    """Incremental-decoding benchmark: complete cells + honest cache flags.
+
+    The cache flags are not cosmetic: every ``hybrid*`` row runs the
+    CSA/HCA incremental caches in each sub-layer (regardless of memory
+    route), and every standalone ``csa``/``hca`` row routes prefill
+    through the batched cache population. A row that says otherwise is a
+    metadata bug that would mislead the fairness discussion.
+    """
+    out: list[str] = []
+    seen: set = set()
+    meta = metadata if isinstance(metadata, dict) else {}
+    prefill_lens = meta.get('prefill_lens')
+    ops_expected = meta.get('ops')
+    cells: set = set()
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        op, plen = row.get('op'), row.get('prefill_len')
+        if not isinstance(op, str) or not op:
+            out.append(f"{where}: 'op' must be a non-empty string, got {op!r}")
+        if not _positive_int(plen):
+            out.append(f"{where}: 'prefill_len' must be a positive int, got {plen!r}")
+        if not _positive_int(row.get('n_layers')):
+            out.append(f"{where}: 'n_layers' must be a positive int, "
+                       f"got {row.get('n_layers')!r}")
+        if isinstance(op, str) and _positive_int(plen):
+            key = (op, plen)
+            if key in seen:
+                out.append(f'{where}: duplicate (op, prefill_len)={key!r}')
+            seen.add(key)
+            cells.add(key)
+        if 'error' in row:
+            continue
+        for key in ('prefill_ms', 'mean_decode_ms_per_token',
+                    'median_decode_ms_per_token'):
+            value = row.get(key)
+            if not (_finite_number(value) and float(value) > 0):
+                out.append(f'{where}: {key!r} must be finite and > 0, got {value!r}')
+        for key in ('n_decode', 'repeats'):
+            if not _positive_int(row.get(key)):
+                out.append(f"{where}: '{key}' must be a positive int, "
+                           f"got {row.get(key)!r}")
+        peak = row.get('peak_mem_MB')
+        if peak is not None and not (_finite_number(peak) and float(peak) >= 0):
+            out.append(f"{where}: 'peak_mem_MB' must be null or finite >= 0, "
+                       f'got {peak!r}')
+        flag = row.get('uses_incremental_cache')
+        build = row.get('prefill_cache_build')
+        if not isinstance(flag, bool):
+            out.append(f"{where}: 'uses_incremental_cache' must be a bool, "
+                       f'got {flag!r}')
+        if build not in _EXP6_PREFILL_BUILDS:
+            out.append(f"{where}: 'prefill_cache_build'={build!r} not in "
+                       f'{sorted(_EXP6_PREFILL_BUILDS)}')
+        if isinstance(op, str) and isinstance(flag, bool):
+            if op in _EXP6_CACHE_OPS and not flag:
+                out.append(
+                    f'{where}: op={op!r} runs the incremental cache but '
+                    f'uses_incremental_cache=False')
+            if op not in _EXP6_CACHE_OPS and flag:
+                out.append(
+                    f'{where}: op={op!r} carries fixed native state but '
+                    f'uses_incremental_cache=True')
+            if op in _EXP6_HYBRID_OPS \
+                    and build != 'batched_populate_layer_by_layer':
+                out.append(
+                    f'{where}: hybrid op {op!r} populates per-layer caches '
+                    f'during prefill but prefill_cache_build={build!r}')
+            if op in ('csa', 'hca') \
+                    and build != 'batched_append_from_naive_output':
+                out.append(
+                    f'{where}: standalone {op!r} prefill builds the cache '
+                    f'from naive projections but prefill_cache_build={build!r}')
+            if op not in _EXP6_CACHE_OPS and build != 'native_operator_state':
+                out.append(
+                    f'{where}: op {op!r} uses its native state path but '
+                    f'prefill_cache_build={build!r}')
+    if isinstance(prefill_lens, list) and prefill_lens:
+        stray = sorted({plen for _op, plen in cells} - set(prefill_lens))
+        if stray:
+            out.append(f'prefill_len value(s) {stray} not in metadata.prefill_lens')
+    if isinstance(ops_expected, list) and ops_expected:
+        stray_ops = sorted({op for op, _plen in cells} - set(ops_expected))
+        if stray_ops:
+            out.append(f'op value(s) {stray_ops} not in metadata.ops')
+        missing_cells = sorted(
+            (op, plen) for op in ops_expected for plen in (prefill_lens or [])
+            if (op, plen) not in cells
+        )
+        if missing_cells:
+            out.append(f'missing (op, prefill_len) cell(s): {missing_cells[:6]}')
+    return out
+
+
+def validate_rows(kind: str, rows, metadata: dict | None = None) -> list[str]:
+    """Return the contract violations for ``kind``'s rows ([] = conforming).
+
+    Unknown kinds and unregistered contracts return an empty list, so a
+    new experiment can write a versioned envelope (and pass ``--check``)
+    before its row contract exists.
+    """
+    if not isinstance(rows, list):
+        return [f'{kind}: rows must be a list, got {type(rows).__name__}']
+    contract = ROW_CONTRACTS.get(kind)
+    if contract is None:
+        return []
+    return contract(rows, metadata if isinstance(metadata, dict) else {})
+
+
+def validate_payload(data) -> list[str]:
+    """Contract violations of a parsed payload ([] when inapplicable).
+
+    Applies only to dict envelopes carrying a registered top-level
+    ``kind``; bare legacy arrays and unregistered kinds pass untouched.
+    """
+    if not isinstance(data, dict):
+        return []
+    kind = data.get('kind')
+    if not isinstance(kind, str) or kind not in ROW_CONTRACTS:
+        return []
+    meta, rows, _version = parse(data)
+    return validate_rows(kind, rows, meta)
+
+
 def load(path: str) -> tuple[dict, list]:
     """Strict load: ``(metadata, rows)``.
 
@@ -266,6 +623,25 @@ def write(path: str, rows: list, *, kind: str, metadata: dict | None = None,
                       allow_nan=False)
 
 
+def write_checked(path: str, rows: list, *, kind: str,
+                  metadata: dict | None = None, indent: int = 2) -> None:
+    """:func:`write` after :func:`validate_rows`; raises on violations.
+
+    A producer bug that would persist a misleading result file (partial
+    matrix, arithmetic-inconsistent aggregate, contradictory Exp 6 cache
+    flags) fails the experiment loudly instead of being silently
+    archived. Unknown kinds pass (see :func:`validate_rows`).
+    """
+    violations = validate_rows(kind, rows, metadata)
+    if violations:
+        shown = '; '.join(violations[:5])
+        more = f' (+{len(violations) - 5} more)' if len(violations) > 5 else ''
+        raise RowContractError(
+            f'{path}: {len(violations)} row-contract violation(s) for '
+            f'kind={kind!r}: {shown}{more}')
+    write(path, rows, kind=kind, metadata=metadata, indent=indent)
+
+
 def _describe(path: str) -> tuple[str, int, str]:
     """Return ``(version, n_rows, status)`` for the CLI report."""
     try:
@@ -288,10 +664,24 @@ def _describe(path: str) -> tuple[str, int, str]:
     return version, len(rows), status
 
 
+def _row_violations(path: str) -> list[str]:
+    """Contract violations of a kind-tagged file ([] when inapplicable)."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    try:
+        return validate_payload(data)
+    except SchemaError:
+        return []
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    check = '--check' in argv
-    argv = [a for a in argv if a != '--check']
+    check = '--check' in argv or '--check-rows' in argv
+    check_rows = '--check-rows' in argv
+    argv = [a for a in argv if a not in ('--check', '--check-rows')]
     paths = argv or sorted(glob.glob(os.path.join('results', '*.json')))
     if not paths:
         print('[results_schema] no result files found')
@@ -299,11 +689,19 @@ def main(argv: list[str] | None = None) -> int:
     bad = 0
     for p in paths:
         version, n_rows, status = _describe(p)
+        violations: list[str] = []
+        if check_rows and status == 'ok':
+            violations = _row_violations(p)
+            if violations:
+                status = f'contract ({len(violations)})'
         print(f'{version:>5}  {n_rows:>6} rows  {status:<12}  {p}')
+        for v in violations[:5]:
+            print(f'          - {v}')
         if status != 'ok':
             bad += 1
     if check and bad:
-        print(f'[results_schema] {bad} file(s) failed the schema check')
+        mode = 'schema+row-contract' if check_rows else 'schema'
+        print(f'[results_schema] {bad} file(s) failed the {mode} check')
         return 1
     return 0
 

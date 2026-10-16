@@ -54,6 +54,14 @@ instead of a sequential state recurrence. It shares the shape/validation
 contract by construction (one validator) and is pinned by forward AND
 gradient parity tests in
 ``test_ssd_duality.py``. It is an oracle, never a production path.
+
+:func:`chunked_mamba2_scan` adds a third view: the chunked-SSD
+decomposition (quadratic intra-chunk + an associative scan over the
+scalar-affine chunk transitions), with every exponent anchored at the
+chunk boundary for log-space gating stability. It is a drop-in replacement
+for the recurrence inside ``Mamba2Mixer`` (selected by
+``HybridConfig.mamba_chunk_size``) and is pinned against both views above
+by ``test_chunked_ssd.py``.
 """
 
 from __future__ import annotations
@@ -68,6 +76,7 @@ import torch.nn.functional as F
 __all__ = [
     "Mamba2Mixer",
     "build_mamba2_mixer",
+    "chunked_mamba2_scan",
     "naive_mamba2_scan",
     "quadratic_mamba2_scan",
     "resolve_mamba_dt_rank",
@@ -548,6 +557,272 @@ def quadratic_mamba2_scan(
 
 
 # ---------------------------------------------------------------------------
+# Chunked SSD path: quadratic intra-chunk + associative scan over chunks
+# ---------------------------------------------------------------------------
+def _assoc_scan_chunk_transitions(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    S0: torch.Tensor,
+) -> tuple:
+    """TorchScript-compatible associative scan of scalar chunk transitions.
+
+    Each chunk ``n`` carries an affine transition on the recurrent state::
+
+        S_{n+1} = a_n S_n + b_n
+
+    with a SCALAR ``a_n`` of shape ``[BH, NT]`` (the product of the per-step
+    decays ``exp(dt_t * A_h)`` over the chunk) and ``b_n`` of shape
+    ``[BH, NT, D, N]`` (the chunk's own source contribution). Scalar-affine
+    maps compose associatively::
+
+        (a_2, b_2) ∘ (a_1, b_1) = (a_2 a_1, a_2 b_1 + b_2)
+
+    so the incoming state of every chunk is recovered by a Hillis–Steele
+    (doubling) prefix scan: ``ceil(log2 NT)`` levels, each level one
+    elementwise multiply plus one fused multiply-add over
+    ``[BH, NT, D, N]``-sized tensors. This is the Mamba-2 analogue of
+    ``ops_kda._assoc_scan_chunk_states`` (there the transition is a dense
+    ``K×K`` matrix; here the SSD decay is scalar-per-head, so the combine
+    stays elementwise).
+
+    Returns:
+        ``(S_in, S_end, levels)`` with ``S_in`` shaped ``[BH, NT, D, N]``
+        (the state entering each chunk, i.e. ``S_in[:, 0] == S0``),
+        ``S_end`` the state after the last chunk, and ``levels`` the number
+        of doubling steps (``ceil(log2 NT)``, 0 for ``NT == 1``).
+    """
+    A = a
+    BB = b
+    off = 1
+    levels = 0
+    NT = a.shape[1]
+    while off < NT:
+        levels = levels + 1
+        A_tail = A[:, off:]
+        A_shift = A[:, :-off]
+        BB_tail = BB[:, off:]
+        BB_shift = BB[:, :-off]
+        # NOTE: compose from the OLD slices, then overwrite (mirrors
+        # ``ops_kda._assoc_scan_chunk_states``).
+        new_A_tail = A_tail * A_shift
+        new_BB_tail = (A_tail.unsqueeze(-1).unsqueeze(-1) * BB_shift
+                       + BB_tail)
+        A = torch.cat([A[:, :off], new_A_tail], dim=1)
+        BB = torch.cat([BB[:, :off], new_BB_tail], dim=1)
+        off = off * 2
+    # Inclusive prefixes after the scan: A[:, n] / BB[:, n] describe the
+    # composed map of chunks 0..n. Exclusive form for S_in: chunk 0 sees S0
+    # exactly, chunk n >= 1 consumes the prefix of chunks 0..n-1.
+    S_end = A[:, -1].unsqueeze(-1).unsqueeze(-1) * S0 + BB[:, -1]
+    S_in = torch.cat(
+        [S0.unsqueeze(1),
+         A[:, :-1].unsqueeze(-1).unsqueeze(-1) * S0.unsqueeze(1)
+         + BB[:, :-1]],
+        dim=1)
+    return S_in, S_end, levels
+
+
+_CHUNK_TRANSITION_SCAN_SCRIPTED = None
+_CHUNK_TRANSITION_SCAN_FAILED = False
+
+
+def _get_scripted_chunk_transition_scan():
+    """Lazily ``torch.jit.script`` the chunk-transition scan core.
+
+    Mirrors :func:`_get_scripted_scan_loop`: the scripted function executes
+    the same operations in the same order (bit-identical values) and its
+    compile failure is cached, never retried per call.
+    """
+    global _CHUNK_TRANSITION_SCAN_SCRIPTED, _CHUNK_TRANSITION_SCAN_FAILED
+    if (_CHUNK_TRANSITION_SCAN_SCRIPTED is None
+            and not _CHUNK_TRANSITION_SCAN_FAILED):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', FutureWarning)
+                _CHUNK_TRANSITION_SCAN_SCRIPTED = torch.jit.script(
+                    _assoc_scan_chunk_transitions)
+        except Exception:
+            _CHUNK_TRANSITION_SCAN_FAILED = True
+    return _CHUNK_TRANSITION_SCAN_SCRIPTED
+
+
+def chunked_mamba2_scan(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    *,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = True,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Chunked SSD evaluation: quadratic intra-chunk + scanned inter-chunk.
+
+    A THIRD numerically independent path for the same Mamba-2 (SSD)
+    operator as :func:`naive_mamba2_scan` (sequential recurrence) and
+    :func:`quadratic_mamba2_scan` (global O(T²) dual form). It splits the
+    sequence into chunks and evaluates each term of the duality expansion
+    where it is both cheap and well-conditioned:
+
+      * **intra-chunk outputs** with the masked quadratic form restricted to
+        the chunk (``O(C²)`` per chunk instead of ``O(T²)`` globally),
+      * **inter-chunk state** via the affine chunk recurrence
+        ``S_{n+1} = a_n S_n + b_n`` with the SCALAR per-head transition
+        ``a_n = exp(Σ_chunk dt·A)`` and the chunk source ``b_n``, resolved
+        by the Hillis–Steele associative scan in
+        :func:`_assoc_scan_chunk_transitions` (``ceil(log2 NT)`` batched
+        levels, no Python loop over chunks).
+
+    Log-space gating
+    ----------------
+    All exponents are anchored at the *state before the chunk starts*:
+    with ``G_t = Σ_{r≤t} dt_r A_h`` (non-increasing because ``A < 0`` and
+    ``dt ≥ 0``) the code forms ``g_c = G_{t₀+c} - G_{t₀-1}`` per chunk, so
+
+      * every intra-chunk exponent ``g_c - g_s`` (``s ≤ c``) is ``≤ 0``,
+      * the chunk transition is a single ``exp(g_last)``, and
+      * the inter-chunk state readout is ``exp(g_c)``.
+
+    Anchoring at the chunk boundary avoids differencing two large negative
+    cumulative log-decays (the global dual form computes ``G_t - G_s`` over
+    the whole sequence), keeping the absolute magnitude of every ``exp``
+    argument bounded by the chunk's own decay budget.
+
+    Equivalence / contract
+    ----------------------
+    The result matches :func:`naive_mamba2_scan` and
+    :func:`quadratic_mamba2_scan` to fp round-off (different summation
+    order; pinned at fp64 machine precision by ``test_chunked_ssd.py``).
+    Shapes, validation, dtype contract, and return values are identical to
+    the other two views (one shared validator). ``T`` not divisible by
+    ``chunk_size`` is padded with zero ``dt``/``x`` on the right; the
+    padded steps leave the final state unchanged and are sliced off the
+    output. The non-increasing-``G`` assumption (``A < 0``, ``dt ≥ 0``) is
+    the same contract the dual form documents.
+
+    Args:
+        chunk_size: positions per chunk (must be a positive int). ``1``
+            degenerates to a per-token associative scan; ``>= T`` runs one
+            quadratic chunk (a numerically reorganized dual form).
+    """
+    if (not isinstance(chunk_size, int) or isinstance(chunk_size, bool)
+            or chunk_size < 1):
+        raise ValueError(
+            f"chunked_mamba2_scan: chunk_size={chunk_size!r} must be a "
+            f"positive int.")
+    v = _validate_mamba2_scan_inputs(
+        x, dt, B, C, A, D, initial_state, 'chunked_mamba2_scan')
+    batch, seqlen = v['batch'], v['seqlen']
+    nheads, headdim = v['nheads'], v['headdim']
+    ngroups, d_state = v['ngroups'], v['d_state']
+    heads_per_group = v['heads_per_group']
+    compute_dtype = v['compute_dtype']
+    S0 = v['state']
+
+    if seqlen == 0:
+        y = x.new_zeros(batch, 0, nheads, headdim)
+        return y, (S0 if output_final_state else None)
+
+    x_c = x.to(compute_dtype)
+    dt_c = dt.to(compute_dtype)
+    B_c = B.to(compute_dtype)
+    C_c = C.to(compute_dtype)
+    A_c = A.to(compute_dtype)
+    D_c = D.to(compute_dtype)
+
+    B_h = B_c.repeat_interleave(heads_per_group, dim=2)   # [B, T, H, N]
+    C_h = C_c.repeat_interleave(heads_per_group, dim=2)
+
+    # Cumulative log-decay G_t = Σ_{r≤t} dt_r A_h (non-increasing).
+    log_a = dt_c * A_c                                    # [B, T, H]
+    G = torch.cumsum(log_a, dim=1)
+
+    BT = chunk_size
+    pad = (-seqlen) % BT
+    Tp = seqlen + pad
+    NT = Tp // BT
+    if pad:
+        # A padded step has dt=0, so the cumulative log-decay must stay
+        # CONSTANT (not jump to 0): extend G with a copy of its last value.
+        G = torch.cat([G, G[:, -1:].expand(batch, pad, nheads)], dim=1)
+        x_c = F.pad(x_c, (0, 0, 0, 0, 0, pad))
+        dt_c = F.pad(dt_c, (0, 0, 0, pad))
+        B_h = F.pad(B_h, (0, 0, 0, 0, 0, pad))
+        C_h = F.pad(C_h, (0, 0, 0, 0, 0, pad))
+    # Cumulative log-decay BEFORE each position (so ``G_prev[:, t0]`` is the
+    # state level at which chunk t0 begins).
+    G_prev = torch.cat(
+        [torch.zeros(batch, 1, nheads, device=x.device, dtype=compute_dtype),
+         G[:, :-1]], dim=1)
+
+    # Chunk-major views: [B, H, NT, C, ...] / [B, H, NT, C].
+    G_r = G.reshape(batch, NT, BT, nheads).permute(0, 3, 1, 2)
+    Gp_r = G_prev.reshape(batch, NT, BT, nheads).permute(0, 3, 1, 2)
+    x_r = x_c.reshape(batch, NT, BT, nheads, headdim).permute(0, 3, 1, 2, 4)
+    dt_r = dt_c.reshape(batch, NT, BT, nheads).permute(0, 3, 1, 2)
+    Bh_r = B_h.reshape(batch, NT, BT, nheads, d_state).permute(0, 3, 1, 2, 4)
+    Ch_r = C_h.reshape(batch, NT, BT, nheads, d_state).permute(0, 3, 1, 2, 4)
+
+    # Chunk-local log-gating: g_c = G_{t0+c} - G_{t0-1} <= 0.
+    g = G_r - Gp_r[:, :, :, :1]                           # [B, H, NT, C]
+
+    # --- intra-chunk quadratic term -----------------------------------
+    # decay[t, s] = exp(G_t - G_s) for s <= t inside the chunk. The strict
+    # upper triangle is masked to -inf BEFORE the exp (a positive exponent
+    # would overflow and inf * 0 = NaN), exactly like the dual form.
+    diff = g.unsqueeze(-1) - g.unsqueeze(-2)              # [B,H,NT,C,C]
+    causal = torch.tril(torch.ones(BT, BT, dtype=torch.bool,
+                                   device=x.device))
+    diff = diff.masked_fill(~causal, float('-inf'))
+    decay = torch.exp(diff)
+    # cb[c, s] = C_c · B_s (per chunk); the readout is contracted with the
+    # source x_s scaled by dt_s (dt at the SOURCE position).
+    cb = torch.einsum('bhncN,bhnsN->bhncs', Ch_r, Bh_r)
+    weights = decay * cb * dt_r.unsqueeze(-2)
+    if pad:
+        valid = (torch.arange(Tp, device=x.device) < seqlen).reshape(NT, BT)
+        weights = weights * valid[None, None, :, None, :]
+    y_intra = torch.einsum('bhncs,bhnsd->bhncd', weights, x_r)
+
+    # --- chunk transition (a_n) and source (b_n) ----------------------
+    # b_n[d, N] = Σ_s exp(g_last - g_s) dt_s x_s[d] B_h[s, N]
+    w_src = torch.exp(g[:, :, :, -1:] - g) * dt_r
+    if pad:
+        w_src = w_src * valid[None, None]
+    b_chunk = torch.einsum('bhnc,bhncd,bhncN->bhndN', w_src, x_r, Bh_r)
+    # a_n = Π exp(dt·A) over the chunk = exp(G_last - G_prev[chunk start]).
+    a_chunk = torch.exp(g[:, :, :, -1])                   # [B, H, NT]
+
+    BH = batch * nheads
+    scan = _get_scripted_chunk_transition_scan()
+    scan_args = (a_chunk.reshape(BH, NT),
+                 b_chunk.reshape(BH, NT, headdim, d_state),
+                 S0.reshape(BH, headdim, d_state))
+    if scan is not None:
+        S_in, S_end, _levels = scan(*scan_args)
+    else:
+        S_in, S_end, _levels = _assoc_scan_chunk_transitions(*scan_args)
+    S_in_r = S_in.reshape(batch, nheads, NT, headdim, d_state)
+
+    # --- inter-chunk readout ------------------------------------------
+    # y_inter[t] = exp(g_c) * (C_t · S_in_n): the state entering the chunk
+    # (including the initial state and all earlier chunks) decayed to the
+    # current position.
+    y_inter = torch.exp(g).unsqueeze(-1) * torch.einsum(
+        'bhncN,bhndN->bhncd', Ch_r, S_in_r)
+
+    y_r = (y_intra + y_inter
+           + x_r * D_c.reshape(1, nheads, 1, 1, 1))
+    y = (y_r.permute(0, 2, 3, 1, 4)
+         .reshape(batch, Tp, nheads, headdim)[:, :seqlen])
+    y = y.to(x.dtype)
+    S = S_end.reshape(batch, nheads, headdim, d_state)
+    return y, (S if output_final_state else None)
+
+
+# ---------------------------------------------------------------------------
 # Unified mixer module
 # ---------------------------------------------------------------------------
 class Mamba2Mixer(nn.Module):
@@ -579,7 +854,9 @@ class Mamba2Mixer(nn.Module):
             ``d_model``; optional (with defaults shown):
             ``mamba_d_state=64``, ``mamba_d_conv=4``, ``mamba_expand=2``,
             ``mamba_headdim=64``, ``mamba_ngroups=1``,
-            ``mamba_dt_rank='auto'``, ``mamba_backend='reference'``.
+            ``mamba_dt_rank='auto'``, ``mamba_backend='reference'``,
+            ``mamba_chunk_size=0`` (0 = sequential reference scan;
+            positive selects :func:`chunked_mamba2_scan`).
             Duck-typing (instead of importing ``HybridConfig``) avoids an
             import cycle: ``ops_fused`` imports this module for the mixer
             factory, so this module must not import ``ops_fused``.
@@ -605,6 +882,20 @@ class Mamba2Mixer(nn.Module):
         from ops_mamba_backend import validate_mamba_backend
         self.backend = validate_mamba_backend(
             getattr(cfg, 'mamba_backend', 'reference'))
+        # Chunked-SSD scan knob (analogue of KDA's ``kda_assoc_scan``):
+        # 0 (default) keeps the sequential reference recurrence; a positive
+        # value selects :func:`chunked_mamba2_scan` with that chunk size
+        # (chunk-local log-space gating + a Hillis-Steele scan over the
+        # scalar chunk transitions). Both paths match to fp round-off;
+        # ``scan_mode`` records which one produced the outputs.
+        raw_chunk = getattr(cfg, 'mamba_chunk_size', 0)
+        if isinstance(raw_chunk, bool) or not isinstance(raw_chunk, int) \
+                or raw_chunk < 0:
+            raise ValueError(
+                f"Mamba2Mixer: mamba_chunk_size={raw_chunk!r} must be a "
+                f"non-negative int (0 = sequential reference scan).")
+        self.chunk_size = raw_chunk
+        self.scan_mode = 'chunked' if raw_chunk > 0 else 'sequential'
 
         geo = validate_mamba2_geometry(
             d_model, self.d_state, self.d_conv, self.expand,
@@ -826,15 +1117,26 @@ class Mamba2Mixer(nn.Module):
         dt = F.softplus(dt.to(compute_dtype))
         A = -torch.exp(self.A_log.float())             # [nheads], negative
 
-        y, new_state = naive_mamba2_scan(
+        scan_args = (
             x_act.view(B, T, self.nheads, self.headdim),
             dt,
             Bm.view(B, T, self.ngroups, self.d_state),
             Cm.view(B, T, self.ngroups, self.d_state),
             A, self.D,
-            initial_state=state,
-            output_final_state=True,
         )
+        if self.chunk_size > 0:
+            y, new_state = chunked_mamba2_scan(
+                *scan_args,
+                initial_state=state,
+                output_final_state=True,
+                chunk_size=self.chunk_size,
+            )
+        else:
+            y, new_state = naive_mamba2_scan(
+                *scan_args,
+                initial_state=state,
+                output_final_state=True,
+            )
         # Gate with SiLU(z) and project back to d_model. The scan returns
         # y in x.dtype; the gating + out_proj run in the input dtype so the
         # mixer's output dtype always matches its input dtype.

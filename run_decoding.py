@@ -38,9 +38,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import (configure_torch_for_device, sanitize_for_json,
-                          write_json_atomic, make_seeded_generator,
-                          capture_provenance)
+from kaggle_setup import (configure_torch_for_device, write_json_atomic,
+                          make_seeded_generator, capture_provenance)
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa, _qk_normalize
 from ops_hca import naive_hca
@@ -53,6 +52,19 @@ from ops_mamba import build_mamba2_mixer
 from ops_mamba_backend import validate_mamba_backend
 from ops_rwkv import build_rwkv7_mixer
 from ops_rwkv_backend import validate_rwkv_backend
+from results_schema import (SchemaError, write_checked as
+                            write_results_checked)
+
+# Operator groups shared by the result rows and their contracts
+# (``results_schema``'s exp6_decoding contract mirrors the cache-flag
+# invariant encoded here):
+#   * every ``hybrid*`` wrapper threads one incremental CSA/HCA cache per
+#     CSA/HCA sub-layer REGARDLESS of the memory route (kda / mamba2 /
+#     rwkv7) — the memory route only swaps the recurrent sub-layer;
+#   * standalone ``csa`` / ``hca`` rows use the incremental caches too.
+# ``uses_incremental_cache`` must therefore be True for all of them.
+HYBRID_OPS = ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7')
+INCREMENTAL_CACHE_OPS = ('csa', 'hca') + HYBRID_OPS
 
 # One-shot warning emitted in ``main()`` (not at import time) so notebook /
 # REPL users do not silently misread the decoding results as a fair
@@ -1411,10 +1423,9 @@ def main():
                 r = bench_decoding(model, d_model, plen, n_decode, device,
                                    repeats=N_REPEATS)
                 r['op'] = name
-                hybrid_names = ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7')
-                r['n_layers'] = 5 if name in hybrid_names else 1
+                r['n_layers'] = 5 if name in HYBRID_OPS else 1
                 r['compute_boundary'] = (
-                    'end_to_end_multi_layer' if name in hybrid_names
+                    'end_to_end_multi_layer' if name in HYBRID_OPS
                     else 'end_to_end_single_layer')
                 r['device'] = str(device)
                 r['kda_backend'] = (
@@ -1431,22 +1442,24 @@ def main():
                 )
                 # The hybrid wrapper wires CSA/HCA incremental caches into
                 # the full stack, so the row measures the real decode path.
-                # Keep explicit metadata for downstream figures.
+                # Keep explicit metadata for downstream figures. ALL hybrid
+                # routes use the per-layer caches; the memory route only
+                # swaps the recurrent sub-layer.
                 r['upper_bound'] = False
-                r['uses_incremental_cache'] = (name in {'csa', 'hca', 'hybrid'})
+                r['uses_incremental_cache'] = name in INCREMENTAL_CACHE_OPS
                 # The benchmark's RNG seed (model init + prefill/decode input
                 # generation are all seeded with 0; see main()/bench_decoding).
                 r['seed'] = 0
-                if name == 'hybrid':
+                if name in HYBRID_OPS:
                     # Hybrid's CSA/HCA sub-layers also use batched ``append_step``
                     # (one call with the full prefill projection tensor;
                     # append_step internally walks tokens to build blocks),
-                    # but hybrid runs N sub-layers layer-by-layer and shares
-                    # KDA's recurrent state, so its prefill-cache overhead is
-                    # structurally different from a standalone CSA/HCA module.
-                    # Tag separately so figures/README can distinguish the two
-                    # instead of implying hybrid pays the same per-token
-                    # Python overhead as standalone CSA/HCA.
+                    # but hybrid runs N sub-layers layer-by-layer and carries
+                    # the memory route's recurrent state, so its prefill-cache
+                    # overhead is structurally different from a standalone
+                    # CSA/HCA module. Tag separately so figures/README can
+                    # distinguish the two instead of implying hybrid pays the
+                    # same per-token Python overhead as standalone CSA/HCA.
                     r['prefill_cache_build'] = (
                         'batched_populate_layer_by_layer'
                     )
@@ -1454,13 +1467,14 @@ def main():
                     r['prefill_cache_build'] = 'batched_append_from_naive_output'
                 else:
                     r['prefill_cache_build'] = 'native_operator_state'
-                if name == 'hybrid':
+                if name in HYBRID_OPS:
                     r['prefill_latency_note'] = (
-                        'Hybrid row wires KDA recurrent state + per-layer CSA/HCA '
-                        'incremental caches. CSA/HCA sub-layer caches are populated '
-                        'from batched prefill projections during prefill (one '
-                        'append_step call per sub-layer); decode/token timings use '
-                        'the incremental caches alongside KDA recurrence.'
+                        'Hybrid row wires the memory route\'s recurrent state '
+                        '+ per-layer CSA/HCA incremental caches. CSA/HCA '
+                        'sub-layer caches are populated from batched prefill '
+                        'projections during prefill (one append_step call per '
+                        'sub-layer); decode/token timings use the incremental '
+                        'caches alongside the recurrence.'
                     )
                 elif r['uses_incremental_cache']:
                     r['prefill_latency_note'] = (
@@ -1486,9 +1500,9 @@ def main():
                 # ``repeats`` records N_REPEATS (not None) so error rows
                 # match the success-row schema.
                 results.append({'op': name,
-                                'n_layers': 5 if name in ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7') else 1,
+                                'n_layers': 5 if name in HYBRID_OPS else 1,
                                 'compute_boundary': (
-                                    'end_to_end_multi_layer' if name in ('hybrid', 'hybrid_mamba2', 'hybrid_rwkv7')
+                                    'end_to_end_multi_layer' if name in HYBRID_OPS
                                     else 'end_to_end_single_layer'),
                                 'prefill_len': plen, 'error': str(e),
                                 'device': str(device),
@@ -1511,10 +1525,11 @@ def main():
                                 'n_decode': n_decode,
                                 'repeats': N_REPEATS,
                                 'upper_bound': False,
-                                'uses_incremental_cache': (name in {'csa', 'hca', 'hybrid'}),
+                                'uses_incremental_cache': name in INCREMENTAL_CACHE_OPS,
                                 'seed': 0,
                                 'prefill_cache_build': (
-                                    'batched_populate_layer_by_layer' if name == 'hybrid'
+                                    'batched_populate_layer_by_layer'
+                                    if name in HYBRID_OPS
                                     else ('batched_append_from_naive_output'
                                           if name in {'csa', 'hca'}
                                           else 'native_operator_state')),
@@ -1548,27 +1563,40 @@ def main():
 
     os.makedirs('results', exist_ok=True)
 
-    # Sanitize non-finite floats to null before serializing (mirrors
-    # run_kv_cache.py). Without this, a single NaN/Inf in
-    # ``prefill_ms`` / ``decode_ms_per_token`` / ``peak_mem_MB`` (e.g. from
-    # KDA recurrence overflow, or from ``statistics.median`` propagating
-    # a NaN in the underlying times list) would cause ``json.dump`` to
-    # emit non-standard ``NaN`` / ``Infinity`` literals, breaking
-    # downstream parsers (JS ``JSON.parse``, pandas, jq).
-    #
-    # Uses the centralized ``sanitize_for_json`` helper from kaggle_setup.py.
-    sanitized = [sanitize_for_json(r) for r in results]
+    # Write the main results file as a versioned ``results_schema``
+    # envelope (kind='exp6_decoding'). ``write_checked`` sanitizes
+    # non-finite floats to null (a NaN/Inf in ``prefill_ms`` /
+    # ``decode_ms_per_token`` / ``peak_mem_MB`` would otherwise emit
+    # non-standard NaN/Infinity literals that break strict JSON parsers)
+    # AND validates the exp6 row contract before the file is persisted:
+    # duplicate (op, prefill_len) cells, non-positive latencies, or cache
+    # flags contradicting the operator's real wiring fail the experiment
+    # instead of being archived as plausible-looking data.
+    metadata = {
+        'device': str(device),
+        'prefill_lens': list(prefill_lens),
+        'n_decode': n_decode,
+        'n_repeats': N_REPEATS,
+        'ops': list(models),
+        'seeds': {
+            'value': 0,
+            'scheme': ('torch.manual_seed(0) before every model '
+                       'construction and make_seeded_generator(0) for the '
+                       'prefill/decode inputs; see run_decoding.main / '
+                       'bench_decoding'),
+        },
+    }
     try:
-        write_json_atomic(sanitized, 'results/exp6_decoding.json',
-                          indent=2, allow_nan=False)
-    except (TypeError, ValueError) as e:
-        print(f'[run_decoding] WARNING: JSON serialization failed: {e}')
-        write_json_atomic(sanitized, 'results/exp6_decoding.json',
-                          indent=2, default=str)
-    print('\nSaved: results/exp6_decoding.json')
-    # Provenance side file (matches the run_benchmark.py pattern): the main
-    # results file stays a bare array for backward compatibility, while the
-    # code version / environment / seed scheme is recorded next to it.
+        write_results_checked('results/exp6_decoding.json', results,
+                              kind='exp6_decoding', metadata=metadata)
+    except SchemaError as e:
+        print(f'[run_decoding] ERROR: refusing to write a '
+              f'contract-violating result file: {e}')
+        return 1
+    print('\nSaved: results/exp6_decoding.json '
+          '(schema kind=exp6_decoding)')
+    # Provenance side file: the code version / environment / seed scheme
+    # is recorded next to the main results envelope.
     try:
         prov = capture_provenance()
         prov['seeds'] = {

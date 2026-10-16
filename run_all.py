@@ -309,6 +309,7 @@ _EXPERIMENT_OUTPUTS = {
                       'results/exp5_ablation_provenance.json'],
     'exp5b_ablation_matrix_smoke': [
         'results/exp5b_ablation_matrix.json',
+        'results/exp5b_ablation_matrix_contrasts.json',
         'results/exp5b_ablation_matrix_provenance.json'],
     'exp6_decoding': ['results/exp6_decoding.json',
                       'results/exp6_decoding_provenance.json'],
@@ -374,8 +375,12 @@ def _check_results_schema():
     Wired into the pipeline here because ``ci_gate.py`` is frozen: every
     schema-managed file named in ``_EXPERIMENT_OUTPUTS`` (i.e. everything
     except ``_RAW_SIDE_FILES``) must parse as a compatible
-    ``results_schema`` payload. Returns 0 on success and a non-zero exit
-    code otherwise, honoring ``_run``'s return-code contract.
+    ``results_schema`` payload, AND — for kind-tagged files with a
+    registered row contract (exp5b matrix + contrasts, exp6 decoding) —
+    its rows must satisfy that contract: complete group sets, aggregates
+    consistent with the per-seed rows, honest incremental-cache flags.
+    Returns 0 on success and a non-zero exit code otherwise, honoring
+    ``_run``'s return-code contract.
     """
     import results_schema
     candidates: list[str] = []
@@ -398,7 +403,7 @@ def _check_results_schema():
         # profiles). Report it for visibility without double-counting.
         print('[results_schema] not written this run (skipped): '
               + ', '.join(missing))
-    return results_schema.main(['--check'] + present)
+    return results_schema.main(['--check', '--check-rows'] + present)
 
 
 def _run(name, fn):

@@ -296,6 +296,16 @@ class HybridConfig:
     mamba_ngroups: int = 1
     # dt low-rank dimension: 'auto' -> ceil(d_model / 16) (official rule).
     mamba_dt_rank: int | str = "auto"
+    # Chunked-SSD scan knob for the REFERENCE Mamba-2 path (mirrors
+    # kda_assoc_scan): 0 (default) runs the sequential reference recurrence;
+    # a positive value selects ops_mamba.chunked_mamba2_scan with that chunk
+    # size (quadratic intra-chunk + an associative scan over the scalar
+    # chunk transitions, with chunk-local log-space gating). Both paths
+    # match to fp round-off and satisfy the same state/dtype contract. The
+    # official backend ignores it (its kernels do their own internal
+    # chunking), so requesting the official backend with a chunked scan is
+    # rejected instead of silently dropping the knob.
+    mamba_chunk_size: int = 0
     # ------------------------------------------------------------------
     # RWKV-7 route (memory_type='rwkv7'). Defaults follow the fla layer
     # recipe evaluated at the main-table geometry (d_model=256):
@@ -581,6 +591,25 @@ class HybridConfig:
                 f"CSA/HCA are controlled by the layout / ratio fields.")
         from ops_mamba_backend import validate_mamba_backend
         validate_mamba_backend(self.mamba_backend)
+        # ``mamba_chunk_size`` selects the reference chunked-SSD scan. It is
+        # a no-op for the official backend (whose kernels chunk internally),
+        # so an explicit 'official' request combined with a positive value
+        # is a contradiction — fail loudly rather than silently dropping the
+        # knob. 'auto' is allowed: it may resolve to either backend and the
+        # mixer records the resolved ``scan_mode`` for provenance.
+        if isinstance(self.mamba_chunk_size, bool) \
+                or not isinstance(self.mamba_chunk_size, int) \
+                or self.mamba_chunk_size < 0:
+            raise ValueError(
+                f"HybridConfig.mamba_chunk_size={self.mamba_chunk_size!r} "
+                f"must be a non-negative int (0 = sequential reference "
+                f"scan).")
+        if self.mamba_chunk_size > 0 and self.mamba_backend == 'official':
+            raise ValueError(
+                "HybridConfig.mamba_chunk_size is a reference-backend-only "
+                "knob (the official mamba_ssm kernels use their own internal "
+                "chunking). Set mamba_backend='reference' (or 'auto') or "
+                "mamba_chunk_size=0.")
         # RWKV backend validation mirrors the mamba one: eager at config
         # creation, lazy optional import inside ops_rwkv_backend.
         validate_rwkv_backend(self.rwkv_backend)

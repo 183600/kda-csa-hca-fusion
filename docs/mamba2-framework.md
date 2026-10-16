@@ -188,6 +188,44 @@ kernels, never a production path.
 The same validator also rejects `B`/`C` batch or seqlen shapes that
 differ from `x`, instead of silently broadcasting/indexing them.
 
+### 4.2 The chunked SSD path (associative scan over chunks)
+
+`ops_mamba.chunked_mamba2_scan` is a third evaluation of the same operator
+(not an oracle — a drop-in for the recurrence). It splits the sequence into
+chunks of `chunk_size` and evaluates the duality expansion where it is
+cheap and well-conditioned:
+
+* **intra-chunk outputs** with the masked quadratic form restricted to the
+  chunk (`O(C^2)` per chunk instead of `O(T^2)` globally),
+* **inter-chunk state** via the affine chunk recurrence
+  `S_{n+1} = a_n S_n + b_n`, with the SCALAR per-head transition
+  `a_n = exp(sum_chunk dt*A)` and the chunk source `b_n`, resolved by a
+  Hillis-Steele associative prefix scan over chunks
+  (`ceil(log2 NT)` batched levels, no Python loop over chunks). This is the
+  Mamba-2 analogue of `ops_kda._assoc_scan_chunk_states`; because the SSD
+  decay is scalar-per-head, the scan combine is elementwise.
+
+**Log-space gating.** All exponents are anchored at the *state before the
+chunk starts*: with `G_t = sum_{r<=t} dt_r A` (non-increasing because
+`A < 0`, `dt >= 0`), the code forms `g_c = G_{t0+c} - G_{t0-1}` per chunk,
+so every intra-chunk exponent `g_c - g_s` (`s <= c`) is `<= 0`, the chunk
+transition is one `exp(g_last)`, and the inter-chunk readout is
+`exp(g_c)`. The global dual form differences two large cumulative
+log-decays; the chunk anchor keeps every exponent's magnitude bounded by
+the chunk's own decay budget.
+
+The path is selected by `HybridConfig.mamba_chunk_size` (`0` = sequential
+default; positive = chunked; reference backend only — the official kernels
+chunk internally, and the contradictory combination is rejected at config
+time). `Mamba2Mixer.scan_mode` records the resolved mode for provenance.
+`test_chunked_ssd.py` pins forward/gradient parity against BOTH existing
+views at fp64 machine precision, chunk-size invariance, huge-cumulative-
+decay stability (up to `|G| ~ 8e4`), the `ceil(log2 NT)` scan-depth
+contract, TorchScript parity of the scan core, and the mixer integration.
+On CPU, the chunked path measured ~8-12x faster than the sequential
+recurrence for `T = 512..4096` (H=4, headdim=64, d_state=64); as always,
+reference rows are correctness baselines, not architecture-intrinsic costs.
+
 ## 5. The eight-group main experiment
 
 `ABL_MODE=matrix` (run_ablation.py) crosses the memory route with four
@@ -296,7 +334,11 @@ not to pre-empt the answer by changing the default route.
   reference): correctness-first, not throughput. Speed conclusions must
   use the official-backend rows. Its *semantics* are independently pinned
   by the SSD dual-form oracle (section 4.1), so the CPU-only
-  official-backend gap does not leave the reference unverified.
+  official-backend gap does not leave the reference unverified. The
+  chunked path (section 4.2) is the throughput-oriented reference
+  evaluation for hosts without `mamba-ssm`; it is parity-pinned to both
+  other views but is not wired into the main experiment rows yet
+  (`mamba_chunk_size` defaults to 0).
 * Hybrid-decode equality uses the `csa_topk=100` protocol because of the
   pre-existing `torch.topk` tie-breaking artifact documented in the
   README (a numerical artifact, not a correctness bug; identical for

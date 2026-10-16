@@ -263,6 +263,11 @@ class OfficialMamba2Mixer(nn.Module):
         self.conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         self.backend = 'official'
         self.effective_backend = 'official'
+        # Provenance counterpart of the reference mixer's ``scan_mode``:
+        # the official kernels always run their own internal chunked SSD,
+        # and the reference-only ``mamba_chunk_size`` knob does not apply
+        # (HybridConfig rejects that combination for an explicit request).
+        self.scan_mode = 'official-internal'
         self.mamba = _build_official_mamba2(cfg)
         # Runtime conv-state buffer for the stateful forward() wrapper.
         self.register_buffer('_conv_lookback', None, persistent=False)
