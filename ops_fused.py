@@ -868,7 +868,12 @@ class KDAHybridLayer(nn.Module):
             # (dim=2 after transpose to [B, d, T]).
             x_conv_in = torch.cat(
                 [lookback.transpose(1, 2), x.transpose(1, 2)], dim=2)
-        x_conv = self.short_conv(x_conv_in).transpose(1, 2)        # [B, T, d]
+        # ``.contiguous()`` after the transpose: the conv returns
+        # ``[B, d, T]`` while every downstream projection consumes
+        # ``[B, T, d]``. Materializing the transposed layout ONCE here is
+        # ~2x faster than letting each of the 5+ linears materialize its
+        # own internal copy of the same non-contiguous input.
+        x_conv = self.short_conv(x_conv_in).transpose(1, 2).contiguous()  # [B, T, d]
         # Compute the new lookback (the last ksize-1 time steps of THIS
         # chunk) to RETURN to the caller. We do NOT write it to self —
         # that is the caller's responsibility (or the stateful

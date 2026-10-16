@@ -1085,7 +1085,13 @@ class Mamba2Mixer(nn.Module):
         # conv_in has length (d_conv - 1) + T, so the padding-0 conv returns
         # exactly T positions — the causal window [t-d_conv+1, t] per step.
         conv_out = self.conv1d(conv_in)                # [B, d_inner, T]
-        x_act = F.silu(conv_out).transpose(1, 2)       # [B, T, d_inner]
+        # ``.contiguous()`` after the transpose: the conv returns
+        # ``[B, d_inner, T]`` while every downstream consumer (``x_proj``,
+        # the scan's per-head view) expects ``[B, T, d_inner]``. Materializing
+        # the transposed layout ONCE here is cheaper than letting each
+        # consumer make its own internal copy of the same non-contiguous
+        # input (values identical — a pure layout change).
+        x_act = F.silu(conv_out).transpose(1, 2).contiguous()  # [B, T, d_inner]
 
         # New conv state: the last (d_conv - 1) conv INPUTS. Deriving it
         # from conv_in (not from xt) automatically handles T < d_conv - 1:

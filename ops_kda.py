@@ -405,6 +405,36 @@ def compiled_recurrent_kda(
     )
 
 
+# Number of query rows whose intra-chunk attention entries are built per
+# vectorized step. The per-row elementwise/reduction math is unchanged (each
+# ``(c, j)`` entry applies the exact same sub/clamp/exp/multiply/sum chain);
+# only the loop granularity changes, which bounds the transient
+# ``[..., R, c1, K]`` block and avoids one tiny-kernel launch per row. The
+# best row count depends on the per-op thread-split behaviour of the
+# elementwise kernels on the CPU backend and is *not* monotone in the block
+# size (measured: some multi-row blocks cross a parallelization threshold and
+# run several times slower than a single row), so the count is selected from
+# measured-good values for the head-dim / chunk-count regimes used by the
+# benchmarks; the flat fallbacks stay conservative.
+_ATTN_BLOCK_ROWS_MAX = 8
+
+
+def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
+    """Rows per vectorized attention-block step (>= 1, <= the cap)."""
+    if K <= 16:
+        rows = _ATTN_BLOCK_ROWS_MAX
+    elif K <= 32:
+        if NT <= 8:
+            rows = 4
+        elif NT <= 16:
+            rows = 2
+        else:
+            rows = 1
+    else:
+        rows = 2 if NT <= 16 else 1
+    return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
+
+
 def _chunk_kda_attn_loop_eager(
     g: torch.Tensor,
     k: torch.Tensor,
@@ -414,20 +444,29 @@ def _chunk_kda_attn_loop_eager(
     BT: int,
     clamp_g_diff: bool,
     recompute_attn: bool,
+    upper_mask: torch.Tensor,
+    block_rows: int = 1,
 ):
-    """Row-wise build of the intra-chunk attention matrices ``A`` / ``Aqk``.
+    """Block-wise build of the intra-chunk attention matrices ``A`` / ``Aqk``.
 
     Computes, for every row ``c`` and column ``j <= c``,
     ``sum_k k[c,k] * exp(g[c,k] - g[j,k]) * k[j,k]`` (and the q-weighted
-    variant for ``Aqk``), writing each row's ``[:c+1]`` prefix. The
-    Python-level iteration is optionally TorchScript-compiled via
+    variant for ``Aqk``), writing each row's ``[:c+1]`` prefix. Rows are
+    processed in blocks of ``block_rows``: entry ``(c, j)`` evaluates the
+    identical elementwise sub/clamp/exp/multiply chain followed by the same
+    last-dim ``sum`` as the one-row-at-a-time form, so the values are
+    bit-identical. Entries with ``j > c`` are computed by the block write and
+    then zeroed with ``upper_mask`` (the one-row form left them at their
+    ``torch.zeros`` contents, i.e. exactly ``+0.0``). The Python-level
+    iteration is optionally TorchScript-compiled via
     :func:`_get_scripted_prep_attn_loop`.
     """
-    for c in range(BT):
-        # ``[..., c:c+1, :]`` broadcasts identically to
-        # ``[..., c, :].unsqueeze(-2)``.
-        g_c = g[..., c:c + 1, :]
-        g_diff = g_c - g[..., :c + 1, :]
+    for c0 in range(0, BT, block_rows):
+        c1 = min(BT, c0 + block_rows)
+        # ``[..., c0:c1, :].unsqueeze(-2)`` broadcasts identically to
+        # ``[..., c, :].unsqueeze(-2)`` for each row ``c`` in the block.
+        g_c = g[..., c0:c1, :].unsqueeze(-2)
+        g_diff = g_c - g[..., :c1, :].unsqueeze(-3)
         if clamp_g_diff:
             g_diff = g_diff.clamp(max=50.0)
         # ``t = exp(g_diff) * k`` is shared by both intra-chunk matrices.
@@ -435,10 +474,21 @@ def _chunk_kda_attn_loop_eager(
         # the product stays out-of-place because autograd saves the exp
         # output for the multiply's backward.
         g_diff.exp_()
-        t = g_diff * k[..., :c + 1, :]
-        A[..., c, :c + 1] = (k[..., c:c + 1, :] * t).sum(-1)
+        t = g_diff * k[..., :c1, :].unsqueeze(-3)
+        A[..., c0:c1, :c1] = (k[..., c0:c1, :].unsqueeze(-2) * t).sum(-1)
         if not recompute_attn:
-            Aqk[..., c, :c + 1] = (q[..., c:c + 1, :] * t).sum(-1)
+            Aqk[..., c0:c1, :c1] = (
+                q[..., c0:c1, :].unsqueeze(-2) * t).sum(-1)
+    if block_rows > 1:
+        # Multi-row blocks write within-block entries with ``j > c`` as well,
+        # which must be zeroed. With ``block_rows == 1`` every row writes
+        # exactly its ``[:c+1]`` prefix, so the strict upper triangle keeps
+        # the ``+0.0`` from the ``torch.zeros`` allocation and only the
+        # diagonal (zeroed by the caller) overlaps the writes — the
+        # ``masked_fill_`` passes would be no-ops and are skipped.
+        A.masked_fill_(upper_mask, 0.0)
+        if not recompute_attn:
+            Aqk.masked_fill_(upper_mask, 0.0)
     return A, Aqk
 
 
@@ -595,12 +645,15 @@ def _chunk_kda_prepare(
     # ``A`` as an unused placeholder tensor.
     _attn_loop = _get_scripted_prep_attn_loop()
     _Aqk_arg = A if Aqk is None else Aqk
+    _block_rows = _attn_block_rows(*g.shape[:-2], BT, g.shape[-1])
     if _attn_loop is not None:
         A, _ = _attn_loop(g, k, q, A, _Aqk_arg, BT,
-                          clamp_g_diff, recompute_attn)
+                          clamp_g_diff, recompute_attn, upper_mask,
+                          _block_rows)
     else:
         A, _ = _chunk_kda_attn_loop_eager(
-            g, k, q, A, _Aqk_arg, BT, clamp_g_diff, recompute_attn)
+            g, k, q, A, _Aqk_arg, BT, clamp_g_diff, recompute_attn,
+            upper_mask, _block_rows)
     A.mul_(beta[..., None])
     # Only the diagonal needs zeroing: ``A`` was allocated with
     # ``torch.zeros`` and the loop above wrote exactly its lower triangle
