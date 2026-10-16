@@ -464,6 +464,30 @@ def _get_scripted_prep_attn_loop():
     return _PREP_ATTN_LOOP_SCRIPTED
 
 
+# Shape-keyed cache for the two constant ``[BT, BT]`` matrices consumed by
+# ``_chunk_kda_prepare``: the identity used by the unitriangular solve
+# (``eye - A`` / ``A + eye``) and the strict-upper triangular mask returned
+# to the recompute inner loop. Both depend only on (BT, dtype, device) and
+# are treated as immutable by every consumer (subtract / add / masked_fill
+# read-only), so they are built once per shape instead of per call.
+_CHUNK_CONST_CACHE: dict = {}
+
+
+def _chunk_constants(BT: int, dtype: torch.dtype, device):
+    """Cached ``(eye, upper_mask)`` pair for the chunk-size ``BT``."""
+    key = (BT, dtype, str(device))
+    entry = _CHUNK_CONST_CACHE.get(key)
+    if entry is None:
+        eye = torch.eye(BT, dtype=dtype, device=device)
+        upper_mask = torch.triu(
+            torch.ones(BT, BT, dtype=torch.bool, device=device), diagonal=1)
+        if len(_CHUNK_CONST_CACHE) >= 64:
+            _CHUNK_CONST_CACHE.clear()
+        entry = (eye, upper_mask)
+        _CHUNK_CONST_CACHE[key] = entry
+    return entry
+
+
 def _chunk_kda_prepare(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -536,7 +560,9 @@ def _chunk_kda_prepare(
     # (fla/ops/kda/naive.py). Because the loop below writes exactly the lower
     # triangle of a zero-initialized ``A``, only the written diagonal needs
     # an explicit zero afterwards; the strict upper triangle is already zero.
-    upper_mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # ``eye`` / ``upper_mask`` are cached per (BT, dtype, device) — both are
+    # read-only constants (see :func:`_chunk_constants`).
+    eye, upper_mask = _chunk_constants(BT, compute_dtype, q.device)
     # ``A``'s columns are written only for rows ``c >= i`` below; the
     # never-written upper triangle must be finite zeros (not ``empty``
     # garbage), because ``A`` is multiplied by ``beta`` afterwards and
@@ -584,7 +610,6 @@ def _chunk_kda_prepare(
     # +0.0.
     A.diagonal(dim1=-2, dim2=-1).zero_()
     A.neg_()
-    eye = torch.eye(BT, dtype=compute_dtype, device=q.device)
     # ``eye - A`` is unit lower triangular (the diagonal zeroing above left
     # A's diagonal at 0), so the triangular solve uses
     # ``unitriangular=True``.

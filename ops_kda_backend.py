@@ -237,16 +237,25 @@ def kda_forward(
 
     # Apply g_clamp_min exactly once here, before any backend dispatch.
     # The downstream functions (_call_fla, naive_recurrent_kda,
-    # naive_chunk_kda) must NOT apply their own clamp to avoid
-    # double-clamping.  We pass the original g_clamp_min to the downstream
-    # functions; because g has already been clamped to [g_clamp_min, inf)
-    # here, the downstream internal clamp with the same bound is a strict
-    # no-op.  Do NOT pass -inf as a sentinel: the FLA Triton kernel may
-    # compute exp(g_clamp_min), yielding 0.0 or NaN and corrupting the
-    # delta-rule state update.
+    # naive_chunk_kda) must NOT apply their own clamp a second time to
+    # avoid double-clamping. The clamp above already used the requested
+    # bound, so the downstream internal clamp with the same bound is a
+    # strict no-op (clamp is an exact, idempotent min/max selection) that
+    # only costs an extra pass over ``g``.  Do NOT pass a -inf sentinel to
+    # the FLA path: the FLA Triton kernel may compute exp(g_clamp_min),
+    # yielding 0.0 or NaN and corrupting the delta-rule state update.
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
     downstream_clamp = g_clamp_min
+    # The reference operators (naive_recurrent_kda / the chunk paths) apply
+    # their own ``g_clamp_min`` clamp to ``g``. The clamp above already used
+    # the same bound and clamp is idempotent (an exact min/max selection),
+    # so re-applying it downstream is a full extra pass over ``g`` with
+    # bit-identical values. Signal "already clamped" with -inf so the
+    # reference paths skip the no-op pass; the FLA path still receives the
+    # REAL bound because its kernel needs the value internally (see the
+    # ``_call_fla`` note about not forwarding a -inf sentinel).
+    ref_clamp = float('-inf')
 
     use_fla = backend == "fla"
     if backend == "auto":
@@ -296,7 +305,7 @@ def kda_forward(
                 initial_state=initial_state,
                 output_final_state=output_final_state,
                 chunk_size=chunk_size,
-                g_clamp_min=downstream_clamp,
+                g_clamp_min=ref_clamp,
             )
         # ``scripted_chunk_kda`` compiles the same inner loop
         # (``ops_kda._chunk_kda_inner_loop``) with ``torch.jit.script``,
@@ -309,7 +318,7 @@ def kda_forward(
             initial_state=initial_state,
             output_final_state=output_final_state,
             chunk_size=chunk_size,
-            g_clamp_min=downstream_clamp,
+            g_clamp_min=ref_clamp,
             recompute_attn=recompute_attn,
         )
     return naive_recurrent_kda(
@@ -317,7 +326,7 @@ def kda_forward(
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        g_clamp_min=downstream_clamp,
+        g_clamp_min=ref_clamp,
     )
 
 

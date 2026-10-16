@@ -55,6 +55,27 @@ from ops_rope import (
 # vectorized CUDA kernel beats the chunked path's Python-loop overhead.
 CHUNKED_SW_THRESHOLD = 8_000_000
 
+# Shape-keyed cache for the static ``[T, win]`` sliding-window validity mask
+# (True = real, non-padding position). The mask depends only on
+# (T, win, device) and never on the data. Every consumer treats the returned
+# tensor as immutable: callers only negate it, ``.expand`` it, or ``cat`` it
+# into a larger mask — none of which mutate the cached tensor.
+_SLIDING_WINDOW_MASK_CACHE: dict = {}
+
+
+def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:
+    """Cached ``[T, win]`` boolean mask (True = real position)."""
+    key = (T, win, str(device))
+    mask = _SLIDING_WINDOW_MASK_CACHE.get(key)
+    if mask is None:
+        _j = torch.arange(win, device=device)
+        _t = torch.arange(T, device=device)
+        mask = _j[None, :] >= (win - 1 - _t[:, None])
+        if len(_SLIDING_WINDOW_MASK_CACHE) >= 64:
+            _SLIDING_WINDOW_MASK_CACHE.clear()
+        _SLIDING_WINDOW_MASK_CACHE[key] = mask
+    return mask
+
 
 def _sliding_window_attention(
     q: torch.Tensor,           # [B, T, nh, c]   (L2-normalized)
@@ -89,13 +110,12 @@ def _sliding_window_attention(
         are well below the fp32 tolerance enforced by ``run_correctness.py``.
     """
     B, T, nh, c = q.shape
-    # Pre-build the static validity mask once (shape [T, win]) — this is
+    # Static validity mask (shape [T, win]) — this is
     # O(T * win) booleans = ~T*win/8 bytes (e.g. 64K*2K/8 = 16MB at the
     # worst case documented in the README), small relative to the [B, T,
-    # win, c] float tensor we avoid materializing.
-    _j = torch.arange(win, device=device)
-    _t = torch.arange(T, device=device)
-    valid_mask = _j[None, :] >= (win - 1 - _t[:, None])    # [T, win], True=real
+    # win, c] float tensor we avoid materializing. The mask depends only on
+    # (T, win, device) and is cached across calls (read-only contract).
+    valid_mask = _sliding_window_valid_mask(T, win, device)  # True=real
 
     # Auto-pick chunk_t if not given. Goal: keep peak memory near
     # CHUNKED_SW_THRESHOLD / win / c per chunk (in elements). Round up to a
@@ -178,9 +198,8 @@ def _sliding_window_scores(
     B, T, nh, c = q.shape
     C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
     C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
-    _j = torch.arange(win, device=device)
-    _t = torch.arange(T, device=device)
-    win_valid = _j[None, :] >= (win - 1 - _t[:, None])    # [T, win], True=real
+    # Cached [T, win] mask (read-only contract, see the helper).
+    win_valid = _sliding_window_valid_mask(T, win, device)  # True=real
     scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
     if scale != 1.0:
         # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
