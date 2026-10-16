@@ -185,9 +185,8 @@ kernels, never a production path.
   passthrough, and identical rejection of malformed inputs,
 * gradient parity for every input (x, dt, B, C, A, D, S0).
 
-The same validator now also rejects `B`/`C` batch or seqlen shapes that
-differ from `x` (previously they could silently broadcast/index wrongly
-instead of erroring).
+The same validator also rejects `B`/`C` batch or seqlen shapes that
+differ from `x`, instead of silently broadcasting/indexing them.
 
 ## 5. The eight-group main experiment
 

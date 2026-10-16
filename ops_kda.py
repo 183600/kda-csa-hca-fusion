@@ -930,8 +930,7 @@ def _get_scripted_chunk_inner(inner_eager, recompute_attn: bool):
 
     The inner loop is one of two module-level functions selected by
     ``recompute_attn``; its compiled form is shape/dtype-generic, so it is
-    compiled once and reused on every subsequent call (compiling on each
-    forward costs several milliseconds and dominated the hybrid forward).
+    compiled once and reused on every subsequent call.
     Returns ``(scripted_inner_or_None, error_str_or_None)``; the error string
     is cached so a broken ``torch.jit`` build is not retried per call.
     """

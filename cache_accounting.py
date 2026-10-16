@@ -926,7 +926,7 @@ def main(argv=None) -> int:
                         help='write the full JSON-strict report here')
     args = parser.parse_args(argv)
 
-    # Deterministic probe inputs (previously an unseeded torch.randn).
+    # Deterministic probe inputs.
     set_global_seed(0)
     from run_decoding import HybridDecoding
     decoder = HybridDecoding().to(args.device).eval()

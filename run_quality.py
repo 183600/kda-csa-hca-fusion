@@ -1047,8 +1047,8 @@ class HCAAttn(nn.Module):
 
     def forward(self, x):
         # ``naive_hca`` handles non-divisible T via internal right-padding
-        # and trims its output back to the original T, so we no longer need
-        # to pad/trim here. See the comment in ``CSAAttn.forward`` for the
+        # and trims its output back to the original T, so no pad/trim is
+        # needed here. See the comment in ``CSAAttn.forward`` for the
         # full rationale.
         o = naive_hca(x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
                       self.W_DQ.weight, self.W_UQ.weight,

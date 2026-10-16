@@ -1318,9 +1318,9 @@ def main():
                     os.environ.get('MAMBA_BACKEND', 'reference')
                     if name in {'mamba2', 'hybrid_mamba2'} else None
                 )
-                # The hybrid wrapper now wires CSA/HCA incremental caches into
-                # the full stack, so the row is no longer an upper-bound
-                # placeholder. Keep explicit metadata for downstream figures.
+                # The hybrid wrapper wires CSA/HCA incremental caches into
+                # the full stack, so the row measures the real decode path.
+                # Keep explicit metadata for downstream figures.
                 r['upper_bound'] = False
                 r['uses_incremental_cache'] = (name in {'csa', 'hca', 'hybrid'})
                 # The benchmark's RNG seed (model init + prefill/decode input

@@ -166,8 +166,7 @@ def partial_rope(
     # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1 (see ``_inv_freq``).
     inv_freq = _inv_freq(rope_dim, base, device, angle_dtype)  # [rope_dim/2]
     # ``.to`` returns the tensor itself when dtype AND device already
-    # match; guarding skips the dispatcher on the decode hot path (the
-    # positions are rebuilt with the same dtype/device every step).
+    # match, so this guard is value-identical.
     if positions.dtype != angle_dtype or positions.device != device:
         positions = positions.to(device=device, dtype=angle_dtype)
     angles = positions[:, None] * inv_freq[None, :]          # [P, rope_dim/2]
@@ -199,11 +198,9 @@ def partial_rope(
         out[..., D - rope_dim + 1::2] = o2
         return out
     # Inference path. Assemble the result in one allocation + strided writes
-    # instead of ``stack(...).flatten`` (+ ``cat`` for the partial case), and
-    # write the rotated pairs directly into the output slices with ``out=``
-    # kernels: the per-element operations (and their order) are unchanged,
-    # but only ONE small scratch buffer is allocated for the intermediate
-    # products instead of two full ``o1`` / ``o2`` temporaries.
+    # and write the rotated pairs directly into the output slices with
+    # ``out=`` kernels: the per-element operations (and their order) are
+    # unchanged. The intermediate products share one small scratch buffer.
     out = torch.empty(x.shape, dtype=x.dtype, device=device)
     if rope_dim < D:
         out[..., : D - rope_dim] = x[..., : D - rope_dim]

@@ -159,20 +159,20 @@ def validate_mamba2_geometry(
 # ---------------------------------------------------------------------------
 # Core SSD scan (the analogue of ops_kda.naive_recurrent_kda)
 # ---------------------------------------------------------------------------
-# The scan loop below performs, per step, exactly the same operations as the
-# original inline loop (decay multiply, dt * (x (x) B) state update, C . S
-# readout plus the D skip), but the step-invariant factors (the group-to-head
-# expanded B/C and the outer products ``x (x) B``) are hoisted out of the time
-# loop and computed in one vectorized shot. Every per-element operation is
-# unchanged, so the result is bit-identical to evaluating them inside the
-# loop. The per-step decay and ``dt * (x (x) B)`` product stay inside the
-# loop because hoisting them would reorder autograd's reductions over time,
-# shifting the ``A`` / ``dt`` gradients by rounding noise.
+# The scan loop below performs, per step, the decay multiply, the
+# ``dt * (x (x) B)`` state update, the ``C . S`` readout and the D skip.
+# The step-invariant factors (the group-to-head expanded B/C and the outer
+# products ``x (x) B``) are computed vectorized over the time axis. Every
+# per-element operation is unchanged, so the result is bit-identical to the
+# equivalent per-step evaluation. The per-step decay and
+# ``dt * (x (x) B)`` product stay inside the loop because evaluating them
+# there keeps autograd's reductions over time in order, leaving the
+# ``A`` / ``dt`` gradients unchanged.
 _SCAN_LOOP_SCRIPTED = None
 _SCAN_LOOP_SCRIPTED_FAILED = False
 # Cap on the number of elements in one slab of precomputed outer products
-# (``[B, slab, nheads, headdim, d_state]``): bounds the extra memory to a few
-# tens of MB while keeping the common small/medium sequence a single slab.
+# (``[B, slab, nheads, headdim, d_state]``); long sequences are processed in
+# several slabs, and the recurrent state carries across slab boundaries.
 _SCAN_XOUTER_SLAB_ELEMS = 8_000_000
 
 

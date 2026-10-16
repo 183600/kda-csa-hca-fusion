@@ -103,10 +103,9 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
 def _run_provenance(n_seeds, steps):
     """Environment provenance + seed list + training recipe for side files.
 
-    The provenance side files were previously a bare ``capture_provenance()``
-    dict: they recorded the code/environment but NOT which seeds or recipe
-    produced the adjacent results file, which made the pair only half a run
-    record.
+    Each side file records the code/environment alongside the seeds and the
+    training recipe that produced the adjacent results file, so the pair is
+    a complete run record.
     """
     prov = capture_provenance()
     prov['seeds'] = [42 + i for i in range(int(n_seeds))]

@@ -155,9 +155,7 @@ def _to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """``x.to(dtype)`` with the dispatcher skipped when it is a no-op.
 
     ``Tensor.to`` returns the SAME tensor when the dtype already matches,
-    so guarding on a dtype comparison is value-identical — it only avoids
-    the per-call dispatch overhead, which accumulates on the decode hot
-    path (thousands of no-op conversions per benchmark).
+    so guarding on a dtype comparison is value-identical.
     """
     if x.dtype == dtype:
         return x
@@ -168,7 +166,7 @@ def _to_cache(x: torch.Tensor, dtype: torch.dtype, device) -> torch.Tensor:
     """``x.to(dtype=dtype, device=device)`` skipping the no-op case.
 
     Value-identical to the unconditional call (a matching dtype/device
-    ``.to`` returns ``x`` itself); the guard only removes the dispatch.
+    ``.to`` returns ``x`` itself).
     """
     if x.dtype == dtype and x.device == device:
         return x

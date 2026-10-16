@@ -594,8 +594,7 @@ def csa_lightning_indexer(
     n_blocks = k_idx.shape[1]
     compute_dtype = torch.float64 if q_idx.dtype == torch.float64 else torch.float
     # ``Tensor.to`` returns the tensor itself when the dtype already
-    # matches; guarding on a dtype comparison is value-identical and skips
-    # the dispatcher on the decode hot path (3 no-op conversions per step).
+    # matches, so guarding on a dtype comparison is value-identical.
     if q_idx.dtype != compute_dtype:
         q_idx = q_idx.to(compute_dtype)
     if k_idx.dtype != compute_dtype:

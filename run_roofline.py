@@ -246,9 +246,9 @@ def main() -> int:
                            logger=logger)
     device = next((r.get('device') for r in rows if r.get('time_ms')),
                   'cpu')
-    # Seed the host-peak microbenchmark inputs (previously unseeded
-    # torch.randn, so the recorded "measured_copy_bw_gbps" /
-    # "measured_gemm_tflops" metadata changed run to run).
+    # Seed the host-peak microbenchmark inputs so the recorded
+    # "measured_copy_bw_gbps" / "measured_gemm_tflops" metadata is
+    # reproducible run to run.
     seed_info = set_global_seed(ROOFLINE_SEED)
     peaks = _resolve_peaks(device, size_mb=size_mb, repeats=repeats,
                            gemm_n=gemm_n)
