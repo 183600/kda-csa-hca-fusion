@@ -151,6 +151,30 @@ def _geometric_capacity(n_rows: int) -> int:
 # Internal helpers
 # =============================================================================
 
+def _to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``x.to(dtype)`` with the dispatcher skipped when it is a no-op.
+
+    ``Tensor.to`` returns the SAME tensor when the dtype already matches,
+    so guarding on a dtype comparison is value-identical — it only avoids
+    the per-call dispatch overhead, which accumulates on the decode hot
+    path (thousands of no-op conversions per benchmark).
+    """
+    if x.dtype == dtype:
+        return x
+    return x.to(dtype)
+
+
+def _to_cache(x: torch.Tensor, dtype: torch.dtype, device) -> torch.Tensor:
+    """``x.to(dtype=dtype, device=device)`` skipping the no-op case.
+
+    Value-identical to the unconditional call (a matching dtype/device
+    ``.to`` returns ``x`` itself); the guard only removes the dispatch.
+    """
+    if x.dtype == dtype and x.device == device:
+        return x
+    return x.to(dtype=dtype, device=device)
+
+
 def _csa_compress_kv_overlapped_single(
     Ca_new: torch.Tensor,   # [B, m, c]
     Cb_new: torch.Tensor,   # [B, m, c]
@@ -191,11 +215,12 @@ def _csa_compress_kv_overlapped_single(
     """
     B, m, c = Ca_new.shape
     compute_dtype = torch.float64 if Ca_new.dtype == torch.float64 else torch.float
-    Ca_new = Ca_new.to(compute_dtype)
-    Cb_new = Cb_new.to(compute_dtype)
-    Za_new = Za_new.to(compute_dtype)
-    Zb_new = Zb_new.to(compute_dtype)
-    A_logits = Za_new + Ba[None, :, :].to(Za_new)               # [B, m, c]
+    Ca_new = _to_dtype(Ca_new, compute_dtype)
+    Cb_new = _to_dtype(Cb_new, compute_dtype)
+    Za_new = _to_dtype(Za_new, compute_dtype)
+    Zb_new = _to_dtype(Zb_new, compute_dtype)
+    A_logits = Za_new + _to_cache(
+        Ba[None, :, :], Za_new.dtype, Za_new.device)            # [B, m, c]
     if Cb_prev is None:
         # First block: no overlap partner. Pad b-branch logits with -inf
         # so softmax assigns 0 weight to the (non-existent) previous
@@ -206,9 +231,10 @@ def _csa_compress_kv_overlapped_single(
         )
         Cb_prev_eff = torch.zeros_like(Cb_new)
     else:
-        Cb_prev = Cb_prev.to(compute_dtype)
-        Zb_prev = Zb_prev.to(compute_dtype)
-        Bb_logits = Zb_prev + Bb[None, :, :].to(Zb_prev)        # [B, m, c]
+        Cb_prev = _to_dtype(Cb_prev, compute_dtype)
+        Zb_prev = _to_dtype(Zb_prev, compute_dtype)
+        Bb_logits = Zb_prev + _to_cache(
+            Bb[None, :, :], Zb_prev.dtype, Zb_prev.device)      # [B, m, c]
         Cb_prev_eff = Cb_prev
     # Joint softmax over the concatenated 2m entries (matches the batch
     # function's ``torch.cat([A_logits, Bb_logits], dim=2)`` then
@@ -238,9 +264,10 @@ def _hca_compress_kv_single(
     """
     B, m2, c = C_new.shape
     compute_dtype = torch.float64 if C_new.dtype == torch.float64 else torch.float
-    C_new = C_new.to(compute_dtype)
-    Z_new = Z_new.to(compute_dtype)
-    logits = Z_new + B_pos[None, :, :].to(Z_new)                # [B, m2, c]
+    C_new = _to_dtype(C_new, compute_dtype)
+    Z_new = _to_dtype(Z_new, compute_dtype)
+    logits = Z_new + _to_cache(
+        B_pos[None, :, :], Z_new.dtype, Z_new.device)           # [B, m2, c]
     S = torch.softmax(logits, dim=1)                            # [B, m2, c]
     return (S * C_new).sum(1)                                   # [B, c]
 
@@ -263,9 +290,10 @@ def _indexer_compress_single(
     compute_dtype = (
         torch.float64 if K_idx_new.dtype == torch.float64 else torch.float
     )
-    K_idx_new = K_idx_new.to(compute_dtype)
-    Z_idx_new = Z_idx_new.to(compute_dtype)
-    logits = Z_idx_new + B_idx[None, :, :].to(Z_idx_new)        # [B, m, c_I]
+    K_idx_new = _to_dtype(K_idx_new, compute_dtype)
+    Z_idx_new = _to_dtype(Z_idx_new, compute_dtype)
+    logits = Z_idx_new + _to_cache(
+        B_idx[None, :, :], Z_idx_new.dtype, Z_idx_new.device)   # [B, m, c_I]
     S = torch.softmax(logits, dim=1)                            # [B, m, c_I]
     return (S * K_idx_new).sum(1)                               # [B, c_I]
 
@@ -788,12 +816,12 @@ class CSADecodingCache:
                     f"{_t.shape[1]} does not match Ca_new.shape[1]="
                     f"{T_new}. All inputs must share the same T_new.")
         # Cast to cache dtype/device defensively.
-        Ca_new = Ca_new.to(device=self.device, dtype=self.dtype)
-        Cb_new = Cb_new.to(device=self.device, dtype=self.dtype)
-        Za_new = Za_new.to(device=self.device, dtype=self.dtype)
-        Zb_new = Zb_new.to(device=self.device, dtype=self.dtype)
-        K_idx_new = K_idx_new.to(device=self.device, dtype=self.dtype)
-        Z_idx_new = Z_idx_new.to(device=self.device, dtype=self.dtype)
+        Ca_new = _to_cache(Ca_new, self.dtype, self.device)
+        Cb_new = _to_cache(Cb_new, self.dtype, self.device)
+        Za_new = _to_cache(Za_new, self.dtype, self.device)
+        Zb_new = _to_cache(Zb_new, self.dtype, self.device)
+        K_idx_new = _to_cache(K_idx_new, self.dtype, self.device)
+        Z_idx_new = _to_cache(Z_idx_new, self.dtype, self.device)
 
         if T_new > 1:
             return self._append_bulk(
@@ -827,7 +855,8 @@ class CSADecodingCache:
             if self._sw is not None:
                 if self._normalize_qk:
                     ca_norm_i = _qk_normalize(
-                        ca_i.squeeze(1).to(torch.float), self.qk_norm_mode)
+                        _to_dtype(ca_i.squeeze(1), torch.float),
+                        self.qk_norm_mode)
                     ca_store_i = ca_norm_i.unsqueeze(1)
                 else:
                     ca_store_i = ca_i
@@ -839,9 +868,9 @@ class CSADecodingCache:
                     pos_t = torch.tensor(
                         [self._n_tokens_seen - 1], device=self.device)
                     ca_store_i = partial_rope(
-                        ca_store_i.to(torch.float), pos_t,
+                        _to_dtype(ca_store_i, torch.float), pos_t,
                         self.rope_dim_eff, self.rope_base, dim=1)
-                self._sw.append(ca_store_i.to(self.dtype))
+                self._sw.append(_to_dtype(ca_store_i, self.dtype))
             # If the accumulator is full, compress and push.
             if len(self._acc_Ca) == self.m:
                 # Stack the accumulated projections into [B, m, c] / [B, m, c_I].
@@ -882,8 +911,8 @@ class CSADecodingCache:
                 # (compute_dtype) and return that dtype. Cast back to the
                 # cache's storage dtype before writing into the
                 # geometrically-grown storage so all rows stay uniform.
-                new_C_row = new_C.unsqueeze(1).to(self.dtype)     # [B, 1, c]
-                new_K_I_row = new_K_I.unsqueeze(1).to(self.dtype) # [B, 1, c_I]
+                new_C_row = _to_dtype(new_C.unsqueeze(1), self.dtype)  # [B, 1, c]
+                new_K_I_row = _to_dtype(new_K_I.unsqueeze(1), self.dtype)  # [B, 1, c_I]
                 # Geometric growth avoids copying the complete compressed
                 # history on every block. The public cache exposes only the
                 # valid prefix, while the storage tensors retain spare
@@ -936,7 +965,7 @@ class CSADecodingCache:
         if self._sw is not None:
             if self._normalize_qk:
                 ca_store = _qk_normalize(
-                    Ca_new.to(torch.float), self.qk_norm_mode)
+                    _to_dtype(Ca_new, torch.float), self.qk_norm_mode)
             else:
                 ca_store = Ca_new
             if self.rope_dim_eff > 0:
@@ -944,9 +973,9 @@ class CSADecodingCache:
                     self._n_tokens_seen, self._n_tokens_seen + T_new,
                     device=self.device)
                 ca_store = partial_rope(
-                    ca_store.to(torch.float), pos,
+                    _to_dtype(ca_store, torch.float), pos,
                     self.rope_dim_eff, self.rope_base, dim=1)
-            self._sw.append_bulk(ca_store.to(dtype))
+            self._sw.append_bulk(_to_dtype(ca_store, dtype))
         self._n_tokens_seen += T_new
         # ----- accumulate / compress into blocks -----
         acc = len(self._acc_Ca)
@@ -1039,8 +1068,8 @@ class CSADecodingCache:
                 self.rope_dim_eff, self.rope_base, dim=1)
         block_idx0 = self._n_blocks
         self._ensure_compressed_capacity(block_idx0 + n_new)
-        self._C_comp[:, block_idx0:block_idx0 + n_new] = new_C_all.to(dtype)
-        self._K_IComp[:, block_idx0:block_idx0 + n_new] = new_K_all.to(dtype)
+        self._C_comp[:, block_idx0:block_idx0 + n_new] = _to_dtype(new_C_all, dtype)
+        self._K_IComp[:, block_idx0:block_idx0 + n_new] = _to_dtype(new_K_all, dtype)
         self._n_blocks += n_new
         new_block_indices = list(range(block_idx0, block_idx0 + n_new))
         # Stash the LAST block's Cb / Zb as the overlap partner for the next
@@ -1160,7 +1189,7 @@ class CSADecodingCache:
         if self.rope_dim_eff > 0:
             pos_t = torch.tensor([t], device=device)
             q = partial_rope(
-                q.to(compute_dtype), pos_t,
+                _to_dtype(q, compute_dtype), pos_t,
                 self.rope_dim_eff, self.rope_base, dim=1)          # [B, 1, nh, c]
         # The block containing t is ``t // m``. It is visible only from
         # the NEXT block's queries onward (strictly-preceding rule), so a
@@ -1187,6 +1216,8 @@ class CSADecodingCache:
                 core_scale = 1.0
         else:
             core_scale = scale
+        # Shared by the sparse-block and sliding-window branches.
+        q_compute = _to_dtype(q, compute_dtype)                        # [B, 1, nh, c]
 
         if self._C_comp is None or self._n_blocks == 0:
             # No compressed blocks yet — no block scores.
@@ -1216,12 +1247,14 @@ class CSADecodingCache:
             # 'rms'). When False, skip normalization and fall back to the
             # classical 1/sqrt(c) dot-product scale.
             if normalize_qk:
-                C_comp_valid = self._C_comp[:, :self._n_blocks]
+                C_comp_valid = _to_dtype(
+                    self._C_comp[:, :self._n_blocks], compute_dtype)
                 C_comp_n = _qk_normalize(
-                    C_comp_valid.to(compute_dtype),
+                    C_comp_valid,
                     self.qk_norm_mode)                                # [B, n_blocks, c]
             else:
-                C_comp_n = self._C_comp[:, :self._n_blocks].to(compute_dtype)
+                C_comp_n = _to_dtype(
+                    self._C_comp[:, :self._n_blocks], compute_dtype)
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in
@@ -1229,9 +1262,10 @@ class CSADecodingCache:
             # softmax/gather work, so gate it just like ``naive_csa``.
             effective_use_ste = use_ste and torch.is_grad_enabled()
             indexer_result = csa_lightning_indexer(
-                q_idx.to(compute_dtype),                               # [B, 1, nIh, c_I]
-                self._K_IComp[:, :self._n_blocks].to(compute_dtype),    # [B, n_blocks, c_I]
-                w_idx.to(compute_dtype),                               # [B, 1, nIh]
+                _to_dtype(q_idx, compute_dtype),                       # [B, 1, nIh, c_I]
+                _to_dtype(self._K_IComp[:, :self._n_blocks],
+                          compute_dtype),                              # [B, n_blocks, c_I]
+                _to_dtype(w_idx, compute_dtype),                       # [B, 1, nIh]
                 topk,
                 # Defer scale selection to csa_lightning_indexer — it
                 # picks 1.0 when normalize_qk=True (cosine),
@@ -1288,10 +1322,13 @@ class CSADecodingCache:
                         soft_kv = soft_kv + aux
                     kv = kv + (soft_kv - soft_kv.detach())
                 # Per-head attention scores over the topk selected blocks.
-                q_compute = q.to(compute_dtype)                        # [B, 1, nh, c]
                 scores = torch.einsum(
                     'b t h d, b t k d -> b t h k', q_compute, kv,
-                ) * core_scale                                         # [B, 1, nh, topk]
+                )                                                      # [B, 1, nh, topk]
+                if core_scale != 1.0:
+                    # Multiplying by exactly 1.0 is an IEEE no-op; skipping
+                    # the multiply keeps values bit-for-bit identical.
+                    scores = scores * core_scale
                 scores = scores.masked_fill(
                     ~valid_mask[:, :, None, :], float('-inf'))
 
@@ -1307,11 +1344,14 @@ class CSADecodingCache:
             # normalized with ``qk_norm_mode`` (applied at append time).
             # When normalize_qk=False the caller should have appended
             # raw (unnormalized) keys; we read whatever is stored.
-            C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
+            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
-            ) * core_scale                                             # [B, nh, sw_len]
+            )                                                          # [B, nh, sw_len]
+            if core_scale != 1.0:
+                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+                # multiply keeps values bit-for-bit identical.
+                sw = sw * core_scale
             scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
         # JOINT softmax over [blocks; window] with the sink in the single
@@ -1560,8 +1600,8 @@ class HCADecodingCache:
             raise ValueError(
                 f"HCADecodingCache.append_step: Z_new.shape[1]="
                 f"{Z_new.shape[1]} does not match C_new.shape[1]={T_new}.")
-        C_new = C_new.to(device=self.device, dtype=self.dtype)
-        Z_new = Z_new.to(device=self.device, dtype=self.dtype)
+        C_new = _to_cache(C_new, self.dtype, self.device)
+        Z_new = _to_cache(Z_new, self.dtype, self.device)
         if T_new > 1:
             return self._append_bulk(C_new, Z_new, B_pos)
 
@@ -1575,7 +1615,8 @@ class HCADecodingCache:
             if self._sw is not None:
                 if self._normalize_qk:
                     c_norm_i = _qk_normalize(
-                        c_i.squeeze(1).to(torch.float), self.qk_norm_mode)
+                        _to_dtype(c_i.squeeze(1), torch.float),
+                        self.qk_norm_mode)
                     c_store_i = c_norm_i.unsqueeze(1)
                 else:
                     c_store_i = c_i
@@ -1587,9 +1628,9 @@ class HCADecodingCache:
                     pos_t = torch.tensor(
                         [self._n_tokens_seen - 1], device=self.device)
                     c_store_i = partial_rope(
-                        c_store_i.to(torch.float), pos_t,
+                        _to_dtype(c_store_i, torch.float), pos_t,
                         self.rope_dim_eff, self.rope_base, dim=1)
-                self._sw.append(c_store_i.to(self.dtype))
+                self._sw.append(_to_dtype(c_store_i, self.dtype))
             if len(self._acc_C) == self.m2:
                 C_block = torch.cat(self._acc_C, dim=1)              # [B, m2, c]
                 Z_block = torch.cat(self._acc_Z, dim=1)
@@ -1610,7 +1651,7 @@ class HCADecodingCache:
                 # ``_hca_compress_kv_single`` returns fp32/fp64
                 # (compute_dtype) even when the cache stores fp16. Cast
                 # back to the storage dtype before writing the valid row.
-                new_C_row = new_C.unsqueeze(1).to(self.dtype)        # [B, 1, c]
+                new_C_row = _to_dtype(new_C.unsqueeze(1), self.dtype)  # [B, 1, c]
                 self._ensure_compressed_capacity(self._n_blocks + 1)
                 self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
                 self._n_blocks += 1
@@ -1639,7 +1680,7 @@ class HCADecodingCache:
         if self._sw is not None:
             if self._normalize_qk:
                 c_store = _qk_normalize(
-                    C_new.to(torch.float), self.qk_norm_mode)
+                    _to_dtype(C_new, torch.float), self.qk_norm_mode)
             else:
                 c_store = C_new
             if self.rope_dim_eff > 0:
@@ -1647,9 +1688,9 @@ class HCADecodingCache:
                     self._n_tokens_seen, self._n_tokens_seen + T_new,
                     device=self.device)
                 c_store = partial_rope(
-                    c_store.to(torch.float), pos,
+                    _to_dtype(c_store, torch.float), pos,
                     self.rope_dim_eff, self.rope_base, dim=1)
-            self._sw.append_bulk(c_store.to(dtype))
+            self._sw.append_bulk(_to_dtype(c_store, dtype))
         self._n_tokens_seen += T_new
         # ----- accumulate / compress into blocks -----
         acc = len(self._acc_C)
@@ -1693,7 +1734,7 @@ class HCADecodingCache:
                 self.rope_dim_eff, self.rope_base, dim=1)
         block_idx0 = self._n_blocks
         self._ensure_compressed_capacity(block_idx0 + n_new)
-        self._C_comp[:, block_idx0:block_idx0 + n_new] = new_C_all.to(dtype)
+        self._C_comp[:, block_idx0:block_idx0 + n_new] = _to_dtype(new_C_all, dtype)
         self._n_blocks += n_new
         new_block_indices = list(range(block_idx0, block_idx0 + n_new))
         # Leave the tokens past the last full block in the accumulator.
@@ -1767,8 +1808,10 @@ class HCADecodingCache:
         if self.rope_dim_eff > 0:
             pos_t = torch.tensor([t], device=device)
             q = partial_rope(
-                q.to(compute_dtype), pos_t,
+                _to_dtype(q, compute_dtype), pos_t,
                 self.rope_dim_eff, self.rope_base, dim=1)          # [B, 1, nh, c]
+        # Shared by the dense-block and sliding-window branches.
+        q_compute = _to_dtype(q, compute_dtype)                    # [B, 1, nh, c]
         if self._C_comp is None or self._n_blocks == 0:
             scores = torch.empty(
                 B, 1, nh, 0, dtype=compute_dtype, device=device,
@@ -1794,15 +1837,20 @@ class HCADecodingCache:
             # flag.
             if normalize_qk:
                 C_comp_n = _qk_normalize(
-                    self._C_comp[:, :self._n_blocks].to(compute_dtype),
+                    _to_dtype(self._C_comp[:, :self._n_blocks],
+                              compute_dtype),
                     self.qk_norm_mode)                                # [B, n_blocks, c]
             else:
-                C_comp_n = self._C_comp[:, :self._n_blocks].to(compute_dtype)
-            q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
+                C_comp_n = _to_dtype(
+                    self._C_comp[:, :self._n_blocks], compute_dtype)
             # scores: [B, nh, 1, n_blocks] -> [B, 1, nh, n_blocks]
             scores = torch.einsum(
                 'b t h d, b n d -> b t h n', q_compute, C_comp_n,
-            ) * core_scale                                            # [B, 1, nh, n_blocks]
+            )                                                          # [B, 1, nh, n_blocks]
+            if core_scale != 1.0:
+                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+                # multiply keeps values bit-for-bit identical.
+                scores = scores * core_scale
             scores = scores.masked_fill(~cbm[:, :, None, :], float('-inf'))
 
         # --- Sliding-window branch: window scores for the joint softmax ---
@@ -1812,11 +1860,14 @@ class HCADecodingCache:
             )
             C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
-            C_local = self._sw.get().to(compute_dtype)                 # [B, sw_len, c]
-            q_compute = q.to(compute_dtype)                            # [B, 1, nh, c]
+            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
-            ) * core_scale                                            # [B, nh, sw_len]
+            )                                                          # [B, nh, sw_len]
+            if core_scale != 1.0:
+                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+                # multiply keeps values bit-for-bit identical.
+                sw = sw * core_scale
             scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
         # JOINT softmax over [compressed; window] with the sink in the single

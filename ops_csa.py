@@ -147,7 +147,11 @@ def _sliding_window_attention(
         C_windows = C_windows[:, -ct:]                       # [B, ct, win, c]
         q_chunk = q[:, t_lo:t_hi]                            # [B, ct, nh, c]
         mask_chunk = valid_mask[t_lo:t_hi]                   # [ct, win]
-        scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows) * scale
+        scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows)
+        if scale != 1.0:
+            # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+            # multiply keeps values/gradients bit-for-bit identical.
+            scores = scores * scale
         scores = scores.masked_fill(~mask_chunk[None, :, None, :], float('-inf'))
         p = torch.softmax(scores, dim=-1)                   # [B, ct, nh, win]
         out[:, t_lo:t_hi] = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
@@ -177,7 +181,11 @@ def _sliding_window_scores(
     _j = torch.arange(win, device=device)
     _t = torch.arange(T, device=device)
     win_valid = _j[None, :] >= (win - 1 - _t[:, None])    # [T, win], True=real
-    scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows) * scale
+    scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
+    if scale != 1.0:
+        # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+        # multiply keeps values/gradients bit-for-bit identical.
+        scores_w = scores_w * scale
     scores_w = scores_w.masked_fill(~win_valid[None, :, None, :], float('-inf'))
     return scores_w, C_windows, win_valid
 
@@ -358,6 +366,10 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
         all_masked = logits.isinf().all(dim=dim, keepdim=True)
     else:
         all_masked = all_masked_mask
+    if not bool(all_masked.any()):
+        # No fully-masked rows: the two ``masked_fill`` passes are no-ops
+        # (they only copy), so the plain softmax is bit-identical.
+        return torch.softmax(logits, dim=dim)
     safe_logits = logits.masked_fill(all_masked, 0.0)
     soft = torch.softmax(safe_logits, dim=dim)
     return soft.masked_fill(all_masked, 0.0)
@@ -581,9 +593,14 @@ def csa_lightning_indexer(
     B_, T, HI, DI = q_idx.shape
     n_blocks = k_idx.shape[1]
     compute_dtype = torch.float64 if q_idx.dtype == torch.float64 else torch.float
-    q_idx = q_idx.to(compute_dtype)
-    k_idx = k_idx.to(compute_dtype)
-    if w_idx is not None:
+    # ``Tensor.to`` returns the tensor itself when the dtype already
+    # matches; guarding on a dtype comparison is value-identical and skips
+    # the dispatcher on the decode hot path (3 no-op conversions per step).
+    if q_idx.dtype != compute_dtype:
+        q_idx = q_idx.to(compute_dtype)
+    if k_idx.dtype != compute_dtype:
+        k_idx = k_idx.to(compute_dtype)
+    if w_idx is not None and w_idx.dtype != compute_dtype:
         w_idx = w_idx.to(compute_dtype)
 
     # L2-normalize indexer queries and keys so the top-k ranking
@@ -1221,7 +1238,11 @@ def naive_csa(
             kv = kv + (soft_kv - soft_kv.detach())
 
         # Per-head attention scores over the topk selected blocks.
-        scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv) * scale  # [B, T, nh, topk]
+        scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv)  # [B, T, nh, topk]
+        if scale != 1.0:
+            # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+            # multiply keeps values/gradients bit-for-bit identical.
+            scores = scores * scale
         # Mask -1 padding so those slots get zero weight after softmax.
         scores = scores.masked_fill(~valid_mask[:, :, None, :], float('-inf'))
 

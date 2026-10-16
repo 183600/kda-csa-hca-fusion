@@ -154,7 +154,13 @@ def _warn_if_nonfinite(o, fn_name, stacklevel=3):
         return
     if _is_compiling_safely():
         return
-    if not torch.isfinite(o).all():
+    if o.numel() == 0:
+        return
+    # ``aminmax`` propagates NaN and +/-Inf into the two scalars, so this is
+    # equivalent to ``torch.isfinite(o).all()`` without materializing a
+    # full-size boolean tensor (the warning path is unchanged).
+    _lo, _hi = torch.aminmax(o)
+    if not bool(torch.isfinite(_lo) & torch.isfinite(_hi)):
         _warnings.warn(
             f"{fn_name}: output contains NaN/Inf. The KDA delta-rule "
             f"recurrence is only numerically bounded for unit-norm "
@@ -482,25 +488,29 @@ def _chunk_kda_prepare(
     # ``clamp_g_diff`` so it makes the same clamp decision.
     _g_lo, _g_hi = torch.aminmax(g, dim=-2)
     clamp_g_diff = not bool((_g_hi - _g_lo).max() <= 50.0)
-    # Only the entries with row ``c >= i`` (column ``i``) are materialized;
+    # Only the entries with row ``c >= j`` (column ``j``) are materialized;
     # the strict upper triangle stays at the zeros from the allocation above
-    # and the diagonal is explicitly zeroed right after the loop.
-    for i in range(BT):
-        # ``[..., i:i+1, :]`` broadcasts identically to
-        # ``[..., i, :].unsqueeze(-2)``.
-        g_i = g[..., i:i + 1, :]
-        g_diff = g[..., i:, :] - g_i
+    # and the diagonal is explicitly zeroed right after the loop. The loop
+    # walks rows (writing each row's contiguous ``[:c+1]`` prefix) instead
+    # of columns; the per-element operands and their order are unchanged
+    # (entry ``(c, j)`` still computes ``sum_k k[c,k] * exp(g[c,k]-g[j,k])
+    # * k[j,k]``), so the values are bit-identical.
+    for c in range(BT):
+        # ``[..., c:c+1, :]`` broadcasts identically to
+        # ``[..., c, :].unsqueeze(-2)``.
+        g_c = g[..., c:c + 1, :]
+        g_diff = g_c - g[..., :c + 1, :]
         if clamp_g_diff:
             g_diff = g_diff.clamp(max=50.0)
-        # ``t = exp(g_diff) * k_i`` is shared by both intra-chunk matrices.
+        # ``t = exp(g_diff) * k`` is shared by both intra-chunk matrices.
         # The sub/clamp produce fresh tensors, so the exp may run in place;
         # the product stays out-of-place because autograd saves the exp
         # output for the multiply's backward.
         g_diff.exp_()
-        t = g_diff * k[..., i:i + 1, :]
-        A[..., i:, i] = (k[..., i:, :] * t).sum(-1)
+        t = g_diff * k[..., :c + 1, :]
+        A[..., c, :c + 1] = (k[..., c:c + 1, :] * t).sum(-1)
         if not recompute_attn:
-            Aqk[..., i:, i] = (q[..., i:, :] * t).sum(-1)
+            Aqk[..., c, :c + 1] = (q[..., c:c + 1, :] * t).sum(-1)
     A.mul_(beta[..., None])
     # Only the diagonal needs zeroing: ``A`` was allocated with
     # ``torch.zeros`` and the loop above wrote exactly its lower triangle

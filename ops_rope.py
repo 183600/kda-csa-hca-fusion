@@ -165,10 +165,17 @@ def partial_rope(
     angle_dtype = _angle_dtype(x)
     # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1 (see ``_inv_freq``).
     inv_freq = _inv_freq(rope_dim, base, device, angle_dtype)  # [rope_dim/2]
-    pos = positions.to(device=device, dtype=angle_dtype)     # [P]
-    angles = pos[:, None] * inv_freq[None, :]                # [P, rope_dim/2]
-    cos = angles.cos().to(x.dtype)
-    sin = angles.sin().to(x.dtype)
+    # ``.to`` returns the tensor itself when dtype AND device already
+    # match; guarding skips the dispatcher on the decode hot path (the
+    # positions are rebuilt with the same dtype/device every step).
+    if positions.dtype != angle_dtype or positions.device != device:
+        positions = positions.to(device=device, dtype=angle_dtype)
+    angles = positions[:, None] * inv_freq[None, :]          # [P, rope_dim/2]
+    cos = angles.cos()
+    sin = angles.sin()
+    if angle_dtype != x.dtype:
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
     # Broadcast cos/sin so that the position axis lands on ``dim`` and the
     # pair axis lands on the last axis: shape [1, ..., P, ..., 1, r/2].
     bc_shape = [1] * x.dim()
@@ -180,16 +187,35 @@ def partial_rope(
     x_rot = x[..., D - rope_dim:]                            # [..., P, r]
     x1 = x_rot[..., 0::2]                                    # [..., P, r/2]
     x2 = x_rot[..., 1::2]                                    # [..., P, r/2]
-    o1 = x1 * cos - x2 * sin
-    o2 = x1 * sin + x2 * cos
-    # Assemble the result in one allocation + strided writes instead of
-    # ``stack(...).flatten`` (+ ``cat`` for the partial case): the interleaved
-    # layout is identical and the arithmetic is unchanged.
+    if x.requires_grad and torch.is_grad_enabled():
+        # Differentiable path: ``out=`` kernels do not record autograd, so
+        # build the rotated pairs as plain expressions (identical values).
+        o1 = x1 * cos - x2 * sin
+        o2 = x1 * sin + x2 * cos
+        out = torch.empty(x.shape, dtype=x.dtype, device=device)
+        if rope_dim < D:
+            out[..., : D - rope_dim] = x[..., : D - rope_dim]
+        out[..., D - rope_dim::2] = o1
+        out[..., D - rope_dim + 1::2] = o2
+        return out
+    # Inference path. Assemble the result in one allocation + strided writes
+    # instead of ``stack(...).flatten`` (+ ``cat`` for the partial case), and
+    # write the rotated pairs directly into the output slices with ``out=``
+    # kernels: the per-element operations (and their order) are unchanged,
+    # but only ONE small scratch buffer is allocated for the intermediate
+    # products instead of two full ``o1`` / ``o2`` temporaries.
     out = torch.empty(x.shape, dtype=x.dtype, device=device)
     if rope_dim < D:
         out[..., : D - rope_dim] = x[..., : D - rope_dim]
-    out[..., D - rope_dim::2] = o1
-    out[..., D - rope_dim + 1::2] = o2
+    o1 = out[..., D - rope_dim::2]                           # [..., P, r/2]
+    o2 = out[..., D - rope_dim + 1::2]                       # [..., P, r/2]
+    tmp = torch.empty(x1.shape, dtype=x.dtype, device=device)
+    torch.mul(x2, sin, out=tmp)
+    torch.mul(x1, cos, out=o1)
+    o1.sub_(tmp)
+    torch.mul(x2, cos, out=tmp)
+    torch.mul(x1, sin, out=o2)
+    o2.add_(tmp)
     return out
 
 

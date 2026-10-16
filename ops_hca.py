@@ -193,7 +193,11 @@ def naive_hca(
 
     cbm = _causal_block_mask(T, n_blocks, m2, device)
 
-    scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * scale
+    scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n)
+    if scale != 1.0:
+        # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+        # multiply keeps values/gradients bit-for-bit identical.
+        scores = scores * scale
     scores = scores.masked_fill(~cbm[None, None], float('-inf'))
         # --- 3. Sliding-window branch (uncompressed local KV) ---
     if sliding_window > 0:
