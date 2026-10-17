@@ -482,11 +482,21 @@ def _chunk_kda_attn_loop_eager(
         # which must be zeroed. With ``block_rows == 1`` every row writes
         # exactly its ``[:c+1]`` prefix, so the strict upper triangle keeps
         # the ``+0.0`` from the ``torch.zeros`` allocation and only the
-        # diagonal (zeroed by the caller) overlaps the writes — the
-        # ``masked_fill_`` passes would be no-ops and are skipped.
-        A.masked_fill_(upper_mask, 0.0)
-        if not recompute_attn:
-            Aqk.masked_fill_(upper_mask, 0.0)
+        # diagonal (zeroed by the caller) overlaps the writes.
+        #
+        # The only invalid entries a block writes are its own strict upper
+        # triangle, i.e. the diagonals at offsets 1..block_rows-1: for row
+        # ``c`` in ``[c0, c1)`` the written columns stop at ``c1 - 1``, so a
+        # written ``j > c`` satisfies ``j - c <= c1 - 1 - c0 = rows - 1``,
+        # while any diagonal entry outside a block was never written and is
+        # already ``+0.0``/untouched (zeroing it is a no-op). Zeroing those
+        # few diagonals replaces a full ``[..., BT, BT]`` masked write per
+        # matrix. ``Aqk`` is untouched in ``recompute_attn`` mode (it is
+        # rebuilt per chunk by the inner loop).
+        for off in range(1, block_rows):
+            A.diagonal(offset=off, dim1=-2, dim2=-1).zero_()
+            if not recompute_attn:
+                Aqk.diagonal(offset=off, dim1=-2, dim2=-1).zero_()
     return A, Aqk
 
 
@@ -596,8 +606,14 @@ def _chunk_kda_prepare(
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     # ``repeat_interleave`` (even with G == 1) also materializes contiguous
     # q / k tensors; the rearranged views feed several downstream matmuls.
-    q = q.repeat_interleave(G, dim=1) * scale
-    k = k.repeat_interleave(G, dim=1)
+    # With G == 1 it is a pure identity, so a direct ``contiguous()`` makes
+    # the same copy without the generic repeat machinery.
+    if G == 1:
+        q = q.contiguous() * scale
+        k = k.contiguous()
+    else:
+        q = q.repeat_interleave(G, dim=1) * scale
+        k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)

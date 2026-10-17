@@ -329,6 +329,22 @@ def _validate_mamba2_scan_inputs(
     }
 
 
+def _expand_heads(x: torch.Tensor, heads_per_group: int) -> torch.Tensor:
+    """Per-head B/C with the ``repeat_interleave(hpg, dim=2)`` value layout.
+
+    Heads map to groups in contiguous blocks (head ``h`` -> group
+    ``h // heads_per_group``), which is exactly a reshape of the
+    ``(ngroups, heads_per_group)`` pair, so one reshape copy (or a plain
+    view when the GVA factor is 1) replaces the generic repeat machinery.
+    """
+    if heads_per_group == 1:
+        return x
+    batch, seqlen, ngroups, d_state = x.shape
+    return (x.unsqueeze(3)
+            .expand(batch, seqlen, ngroups, heads_per_group, d_state)
+            .reshape(batch, seqlen, ngroups * heads_per_group, d_state))
+
+
 def naive_mamba2_scan(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -404,10 +420,18 @@ def naive_mamba2_scan(
     # a direct 3D ``bmm`` computing the same per-batch GEMM as the
     # equivalent 4D ``matmul``.
     _bh = batch * nheads
-    B_h_flat = (B_c.repeat_interleave(heads_per_group, dim=2)
-                .permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
-    C_h_flat = (C_c.repeat_interleave(heads_per_group, dim=2)
-                .permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
+    if heads_per_group == 1:
+        # No head expansion to do: the group C/B tensors ARE the per-head
+        # ones, so the flat layout below is a single permute-copy.
+        B_h_flat = (B_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
+        C_h_flat = (C_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
+    else:
+        B_h_flat = (B_c.permute(0, 2, 1, 3).unsqueeze(2)
+                    .expand(batch, ngroups, heads_per_group, seqlen, d_state)
+                    .reshape(_bh, seqlen, d_state))
+        C_h_flat = (C_c.permute(0, 2, 1, 3).unsqueeze(2)
+                    .expand(batch, ngroups, heads_per_group, seqlen, d_state)
+                    .reshape(_bh, seqlen, d_state))
     x_flat = x_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, headdim)
     dt_flat = dt_c.permute(0, 2, 1).reshape(_bh, seqlen, 1, 1)
     A_col = A_c.repeat(batch).reshape(_bh, 1, 1, 1)          # [bh, 1, 1, 1]
@@ -510,8 +534,8 @@ def quadratic_mamba2_scan(
     A_c = A.to(compute_dtype)
     D_c = D.to(compute_dtype)
 
-    B_h = B_c.repeat_interleave(heads_per_group, dim=2)  # [B, T, H, N]
-    C_h = C_c.repeat_interleave(heads_per_group, dim=2)  # [B, T, H, N]
+    B_h = _expand_heads(B_c, heads_per_group)  # [B, T, H, N]
+    C_h = _expand_heads(C_c, heads_per_group)  # [B, T, H, N]
 
     # Per-head cumulative log-decay: G[b, t, h] = sum_{r<=t} dt_r * A_h.
     # A < 0 and dt >= 0 make G non-increasing, so every exponent used
@@ -733,8 +757,8 @@ def chunked_mamba2_scan(
     A_c = A.to(compute_dtype)
     D_c = D.to(compute_dtype)
 
-    B_h = B_c.repeat_interleave(heads_per_group, dim=2)   # [B, T, H, N]
-    C_h = C_c.repeat_interleave(heads_per_group, dim=2)
+    B_h = _expand_heads(B_c, heads_per_group)             # [B, T, H, N]
+    C_h = _expand_heads(C_c, heads_per_group)
 
     # Cumulative log-decay G_t = Σ_{r≤t} dt_r A_h (non-increasing).
     log_a = dt_c * A_c                                    # [B, T, H]

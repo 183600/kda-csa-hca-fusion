@@ -187,7 +187,7 @@ def _sliding_window_scores(
     """
     B, T, nh, c = q.shape
     C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
-    C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
+    C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2).contiguous()  # [B, T, win, c]
     # Cached [T, win] mask (read-only contract, see the helper).
     win_valid = _sliding_window_valid_mask(T, win, device)  # True=real
     scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
