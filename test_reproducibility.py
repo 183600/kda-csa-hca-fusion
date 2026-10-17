@@ -28,8 +28,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    append_run_manifest,
     audit_split,
+    grad_flow_report,
+    make_run_manifest_entry,
     make_seeded_generator,
+    recipe_sha256,
     seed_worker,
     set_global_seed,
     split_train_val_test,
@@ -564,6 +568,7 @@ def test_main_early_stops_on_validation_and_tests_once(monkeypatch, tmp_path):
         '--eval_max_batches', '1', '--early_stop_patience', '2',
         '--skip_overfit_check', '--skip_consistency_check',
         '--output_dir', str(tmp_path), '--seed', '3',
+        '--manifest', str(tmp_path / 'run_manifest.jsonl'),
     ])
     train_lm_autodl.main()
 
@@ -581,3 +586,180 @@ def test_main_early_stops_on_validation_and_tests_once(monkeypatch, tmp_path):
     assert record['data']['cleaning']['n_kept'] == 60
     assert record['data']['splits']['test']['sealed_until_final_evaluation'] \
         is False
+    # The run also landed in the manifest ledger with seed / status / curve
+    # digest, linking the record to its artifacts.
+    lines = (tmp_path / 'run_manifest.jsonl').read_text().splitlines()
+    assert len(lines) == 1
+    entry = _json.loads(lines[0])
+    assert entry['experiment'] == 'train_lm_autodl'
+    assert entry['status'] == 'completed'
+    assert entry['seeds'] == 3
+    assert entry['results']['stopped_early'] is True
+    assert entry['results']['selected_step'] == 0
+    assert entry['results']['test_loss'] == 5.0
+    assert len(entry['results']['training_curve_sha256']) == 64
+    assert entry['recipe_sha256'] == recipe_sha256(entry['hyperparameters'])
+
+
+# ---------------------------------------------------------------------------
+# Run manifest (experiment ledger) and gradient-flow audit
+# ---------------------------------------------------------------------------
+
+def test_recipe_sha256_ignores_key_order_and_nan():
+    a = {'lr': 0.1, 'batch': 32, 'drop': float('nan')}
+    b = {'drop': float('nan'), 'batch': 32, 'lr': 0.1}
+    assert recipe_sha256(a) == recipe_sha256(b)
+    assert recipe_sha256(a) != recipe_sha256({'lr': 0.1, 'batch': 33})
+    assert len(recipe_sha256({})) == 64
+
+
+def test_manifest_entry_requires_seeds_and_carries_identity():
+    with pytest.raises(ValueError):
+        make_run_manifest_entry(experiment='x', seeds=None)
+    entry = make_run_manifest_entry(
+        experiment='unit', seeds=[1, 2], hyperparameters={'lr': 0.1})
+    assert entry['experiment'] == 'unit'
+    assert entry['seeds'] == [1, 2]
+    assert entry['manifest_version'] == 1
+    assert entry['recipe_sha256'] == recipe_sha256({'lr': 0.1})
+    # Strict JSON: no NaN/Inf leaks into the ledger.
+    json.dumps(entry, allow_nan=False)
+
+
+def test_manifest_append_is_strict_jsonl_and_env_resolved(monkeypatch,
+                                                          tmp_path):
+    path = tmp_path / 'nested' / 'run_manifest.jsonl'
+    e1 = make_run_manifest_entry(experiment='a', seeds=1,
+                                 hyperparameters={'lr': 0.1,
+                                                  'bad': float('inf')})
+    e2 = make_run_manifest_entry(experiment='b', seeds=2)
+    assert append_run_manifest(e1, str(path)) == str(path)
+    assert append_run_manifest(e2, str(path)) == str(path)
+    lines = path.read_text().splitlines()
+    assert len(lines) == 2
+    entries = [json.loads(line) for line in lines]
+    assert [e['experiment'] for e in entries] == ['a', 'b']
+    # Non-finite hyperparameters are sanitized to null, not written raw.
+    assert entries[0]['hyperparameters']['bad'] is None
+    # Env fallback is used when no explicit path is given.
+    env_path = tmp_path / 'env_manifest.jsonl'
+    monkeypatch.setenv('RUN_MANIFEST_PATH', str(env_path))
+    append_run_manifest(e1)
+    assert json.loads(
+        env_path.read_text().splitlines()[0])['experiment'] == 'a'
+
+
+def test_grad_flow_report_distinguishes_missing_and_zero_grads():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 4), torch.nn.ReLU(), torch.nn.Linear(4, 2))
+    names = list(model.named_parameters())
+
+    before = grad_flow_report(names)
+    assert before['n_trainable_tensors'] == 4
+    assert before['n_missing_grad'] == 4
+    assert before['n_zero_grad'] == 0
+    assert before['global_grad_norm'] == 0.0
+    assert len(before['missing_grad_names']) == 4
+
+    loss = model(torch.arange(12).reshape(3, 4).float()).sum()
+    loss.backward()
+    after = grad_flow_report(names)
+    assert after['n_missing_grad'] == 0
+    assert after['n_zero_grad'] == 0
+    assert after['global_grad_norm'] > 0.0
+    json.dumps(after, allow_nan=False)
+
+    # A detached branch keeps its parameters grad-less while the rest flow.
+    for p in model.parameters():
+        p.grad = None
+    model[2].weight.grad = torch.zeros_like(model[2].weight)
+    mixed = grad_flow_report(names)
+    assert mixed['n_missing_grad'] == 3
+    assert mixed['n_zero_grad'] == 1
+    assert mixed['zero_grad_names'] == ['2.weight']
+    assert mixed['names_truncated_at'] == 10
+
+
+def test_ablation_manifest_entry_resolves_env_path(monkeypatch, tmp_path):
+    # The ablation runner must land in the same shared ledger with the mode
+    # / recipe / seed information, so run_quality + run_ablation + LM runs
+    # form one campaign index.
+    import run_ablation
+
+    manifest = tmp_path / 'run_manifest.jsonl'
+    monkeypatch.setenv('RUN_MANIFEST_PATH', str(manifest))
+    run_ablation._append_ablation_manifest('ratio', 0, 3, 5, [1, 2])
+    lines = manifest.read_text().splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry['experiment'] == 'exp5_ratio_ablation'
+    assert entry['seeds'] == [42, 43, 44]
+    assert entry['status'] == 'completed'
+    assert entry['results']['mode'] == 'ratio'
+    assert entry['results']['n_kv'] == [1, 2]
+    assert entry['results']['return_code'] == 0
+    assert entry['artifacts']['results'] == 'results/exp5_ablation.json'
+
+
+def test_train_lm_main_is_deterministic_across_runs(monkeypatch, tmp_path):
+    # End-to-end determinism contract: two full main() runs with the same
+    # seed must produce bit-identical training curves, checkpoints, and
+    # manifest curve digests (catches unseeded ops / RNG-order leaks).
+    def fake_eval(model, dataset, **kwargs):
+        return {'loss': 5.0, 'perplexity': 148.4, 'n_batches': 1,
+                'n_sequences': 2, 'n_tokens': 30, 'max_batches': 1,
+                'batch_size': 2, 'shuffle': False, 'grad_enabled': False}
+
+    monkeypatch.setattr(train_lm_autodl, 'evaluate_lm_loss', fake_eval)
+    monkeypatch.setattr(
+        train_lm_autodl, '_load_raw_texts',
+        lambda max_samples, split='train': (
+            [f'unique story number {i} for training' for i in range(60)],
+            'synthetic:test'))
+
+    def run_once(tag):
+        out = tmp_path / tag
+        manifest = out / 'run_manifest.jsonl'
+        monkeypatch.setattr(sys, 'argv', [
+            'train_lm_autodl.py', '--kaggle', '--max_steps', '4',
+            '--seq_len', '8', '--batch_size', '2', '--val_every', '2',
+            '--eval_max_batches', '1', '--early_stop_patience', '0',
+            '--ppl_bootstrap_nboot', '0',
+            '--skip_overfit_check', '--skip_consistency_check',
+            '--output_dir', str(out), '--seed', '11',
+            '--manifest', str(manifest),
+        ])
+        train_lm_autodl.main()
+        record = json.loads((out / 'run_record.json').read_text())
+        entry = json.loads(manifest.read_text().splitlines()[-1])
+        return record, entry
+
+    rec_a, man_a = run_once('run_a')
+    rec_b, man_b = run_once('run_b')
+
+    def _deterministic_bits(rec):
+        # Wall-clock fields (elapsed_s / timing blocks) and run-local
+        # artifact paths differ by construction; everything else must match
+        # bit-for-bit.
+        def strip(obj):
+            if isinstance(obj, dict):
+                return {k: strip(v) for k, v in obj.items()
+                        if k not in ('timing', 'elapsed_s', 'tokens_per_second',
+                                     'sequences_per_second', 'ms_per_sequence')}
+            if isinstance(obj, list):
+                return [strip(v) for v in obj]
+            return obj
+
+        return strip({
+            'optimizer_step': rec['training_curve']['optimizer_step'],
+            'train_loss': rec['training_curve']['loss'],
+            'val_history': rec['validation']['history'],
+            'best': {k: v for k, v in rec['validation']['best'].items()
+                     if k != 'checkpoint'},
+            'last_loss': rec['final']['last_loss'],
+            'test_report': rec['test']['report'],
+        })
+
+    assert _deterministic_bits(rec_a) == _deterministic_bits(rec_b)
+    assert (man_a['results']['training_curve_sha256']
+            == man_b['results']['training_curve_sha256'])

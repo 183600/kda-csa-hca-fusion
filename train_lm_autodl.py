@@ -37,6 +37,7 @@ import argparse
 import gc
 import hashlib
 import datetime
+import json
 import math
 from collections import OrderedDict
 import torch
@@ -74,7 +75,9 @@ from ops_kda_backend import validate_kda_backend
 from kaggle_setup import (configure_torch_for_device, set_global_seed,
                           seed_worker, capture_provenance,
                           write_json_atomic, write_results_json,
-                          split_train_val_test, audit_split)
+                          split_train_val_test, audit_split,
+                          grad_flow_report, make_run_manifest_entry,
+                          append_run_manifest)
 from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
                               diagnose_training_curves, lm_token_diagnostics,
                               summarize_lm_diagnostics)
@@ -915,6 +918,7 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
 
     losses, accs, elapsed_s = [], [], []
+    grad_flow = None
     t0 = time.time()
     for step in range(steps):
         model.hybrid.reset_state()
@@ -930,6 +934,12 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
             acc = float(correct) / max(1, int(mask.sum()))
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_flow is None:
+            # One-shot gradient-flow audit on the first backward: turns the
+            # pass/fail verdict into a diagnostic for a detached / dead
+            # branch (a model can still memorize through the layers that DO
+            # receive gradients while another operator silently gets none).
+            grad_flow = grad_flow_report(model.named_parameters())
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
         losses.append(float(loss.detach()))
@@ -965,6 +975,10 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
         "losses": losses,
         "accs": accs,
         "elapsed_s": elapsed_s,
+        # Gradient-flow audit (first step): which trainable tensors the
+        # loss actually reached. A missing / zero gradient names a detached
+        # or dead branch that the loss-based pass criterion could mask.
+        "grad_flow": grad_flow,
         "note": ("Necessary but NOT sufficient: passing proves gradients flow "
                  "and the loss responds on a fixed batch; it cannot rule out "
                  "data-augmentation / feature-alignment / label-mapping bugs."),
@@ -973,6 +987,13 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    if grad_flow and grad_flow["n_missing_grad"]:
+        print(f"[overfit-check] WARNING: {grad_flow['n_missing_grad']}/"
+              f"{grad_flow['n_trainable_tensors']} trainable tensor(s) "
+              f"received NO gradient on the fixed batch "
+              f"(e.g. {grad_flow['missing_grad_names'][:3]}); a detached or "
+              f"unused branch can hide behind a passing loss curve.",
+              flush=True)
     return report
 
 
@@ -1133,6 +1154,13 @@ def main():
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints_lm")
+    parser.add_argument("--manifest", type=str, default=None,
+                        help="Append-only run-manifest (JSONL) path. Default: "
+                             "env RUN_MANIFEST_PATH, else "
+                             "results/run_manifest.jsonl. One line per run "
+                             "links code revision, hyperparameters, seeds, "
+                             "data fingerprints, artifacts and final "
+                             "results — the machine-readable experiment log.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for model init and DataLoader shuffle.")
     parser.add_argument("--val_frac", type=float, default=0.1,
@@ -2085,6 +2113,12 @@ def main():
     write_results_json(run_record, record_path)
     print(f"[run-record] wrote {record_path}")
 
+    # Append this run to the shared experiment manifest (append-only JSONL
+    # ledger): the compact index that makes every run traceable — code
+    # revision, hyperparameters (full + recipe sha256), seed(s), data
+    # fingerprints, artifact paths and final results, plus a training-curve
+    # digest. Recording is automatic; nothing is tracked by hand.
+    consistency_path = None
     if not args.skip_consistency_check:
         # Probing the val-selected weights (the model currently in memory
         # for the test evaluation), so the audit matches the checkpoint
@@ -2092,6 +2126,54 @@ def main():
         report = run_decode_consistency_probe(
             model, device, seq_len, args.output_dir, seed=args.seed)
         _print_consistency_report(report, title="best_val_lm.pt")
+        consistency_path = os.path.join(args.output_dir,
+                                        "decode_consistency.json")
+    manifest_entry = make_run_manifest_entry(
+        experiment='train_lm_autodl',
+        seeds=int(args.seed),
+        provenance=provenance,
+        hyperparameters=hyperparams,
+        data={
+            'source': data_source,
+            'tokenizer': type(tokenizer).__name__,
+            'vocab_size': vocab_size,
+            'cleaning': cleaning['stats'],
+            'split_protocol': data_record['split_protocol'],
+            'split_audit': split_report,
+            'splits': {
+                split: {
+                    'n': rec['n'],
+                    'content_fingerprint_sha256':
+                        rec['content_fingerprint_sha256'],
+                }
+                for split, rec in data_record['splits'].items()
+            },
+        },
+        artifacts={
+            'run_record': record_path,
+            'checkpoint_best_val': os.path.join(args.output_dir,
+                                                "best_val_lm.pt"),
+            'checkpoint_final': os.path.join(args.output_dir, "final_lm.pt"),
+            'decode_consistency': consistency_path,
+        },
+        results={
+            'optimizer_step': int(optimizer_step),
+            'completed': bool(optimizer_step >= max_steps),
+            'stopped_early': bool(stopped_early),
+            'selected_step': best_val['step'],
+            'val_best_loss': best_val['loss'],
+            'final_train_loss': (curve_losses[-1] if curve_losses
+                                 else None),
+            'test_loss': test_report['loss'],
+            'test_perplexity': test_report['perplexity'],
+            'curve_diagnosis': curve_diagnosis['verdict'],
+            'training_curve_sha256': hashlib.sha256(
+                json.dumps([curve_steps, curve_losses],
+                           separators=(',', ':')).encode()).hexdigest(),
+        },
+    )
+    manifest_path = append_run_manifest(manifest_entry, args.manifest)
+    print(f"[manifest] appended run to {manifest_path}")
 
 if __name__ == "__main__":
     main()

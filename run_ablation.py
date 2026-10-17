@@ -70,7 +70,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (
     configure_torch_for_device, parse_int_env, sanitize_for_json,
     write_json_atomic, write_results_json, capture_provenance,
-    make_seeded_generator, set_global_seed,
+    make_seeded_generator, set_global_seed, grad_flow_report,
+    make_run_manifest_entry, append_run_manifest,
 )
 from results_schema import (RowContractError,
                             write_checked as write_results_checked)
@@ -169,6 +170,46 @@ def _run_provenance(n_seeds, steps, overfit_gate=None):
     if overfit_gate is not None:
         prov['overfit_sanity_check'] = overfit_gate
     return prov
+
+
+def _append_ablation_manifest(mode, return_code, n_seeds, steps,
+                              n_kv_list):
+    """Append one entry for this ablation run to the shared JSONL manifest.
+
+    Turns the per-mode provenance side file into a campaign-level index
+    line (seeds, recipe, data version, artifact paths, status), so the
+    ablation is findable without opening its result file first.
+    """
+    prov = _run_provenance(n_seeds, steps)
+    if mode == 'matrix':
+        experiment = 'exp5b_ablation_matrix'
+        artifacts = {
+            'results': 'results/exp5b_ablation_matrix.json',
+            'provenance': 'results/exp5b_ablation_matrix_provenance.json',
+            'contrasts': 'results/exp5b_ablation_matrix_contrasts.json',
+            'overfit_gate_results': 'results/exp5b_overfit_gate.json',
+        }
+    else:
+        experiment = 'exp5_ratio_ablation'
+        artifacts = {
+            'results': 'results/exp5_ablation.json',
+            'provenance': 'results/exp5_ablation_provenance.json',
+            'overfit_gate_results': 'results/exp5_overfit_gate.json',
+        }
+    append_run_manifest(make_run_manifest_entry(
+        experiment=experiment,
+        seeds=prov['seeds'],
+        provenance=prov,
+        hyperparameters=prov['training'],
+        data=prov['data'],
+        artifacts=artifacts,
+        results={
+            'mode': mode,
+            'n_kv': list(n_kv_list),
+            'return_code': return_code,
+        },
+        status='completed' if not return_code else 'partial',
+    ), logger=logger)
 
 
 def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
@@ -289,6 +330,7 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
 
     losses, accs, elapsed_s = [], [], []
     first_batch = None
+    grad_flow = None
     t0 = time.time()
     for step in range(steps):
         gen = make_seeded_generator(seed + _OVERFIT_BATCH_SEED_OFFSET,
@@ -307,6 +349,14 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_flow is None:
+            # One-shot audit on the first backward: names the parameters the
+            # loss never reached, so a hidden detached branch is visible even
+            # when the loss criterion passes (mirrors the LM gate).
+            grad_flow = grad_flow_report(
+                list(model.named_parameters())
+                + [(f'head.{n}', p) for n, p in head.named_parameters()]
+                + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
         bad_grads = [p for p in params
                      if p.grad is not None and not torch.isfinite(p.grad).all()]
         if bad_grads:
@@ -358,6 +408,9 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
         'loss_curve': losses,
         'acc_curve': accs,
         'elapsed_s': elapsed_s,
+        # Gradient-flow audit (first step): which trainable tensors the loss
+        # actually reached, recorded next to the pass verdict.
+        'grad_flow': grad_flow,
         'note': ('Necessary but NOT sufficient: passing proves gradients '
                  'flow and the loss responds on a fixed batch; it cannot '
                  'rule out data-augmentation / feature-alignment / '
@@ -367,6 +420,11 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+    if grad_flow and grad_flow['n_missing_grad']:
+        print(f"[overfit-check] WARNING: {grad_flow['n_missing_grad']}/"
+              f"{grad_flow['n_trainable_tensors']} trainable tensor(s) "
+              f"received NO gradient on the fixed batch for {label} "
+              f"(e.g. {grad_flow['missing_grad_names'][:3]})", flush=True)
     return report
 
 
@@ -2110,7 +2168,9 @@ def main():
     logger.info(f'  n_seeds={n_seeds}, steps={steps}, n_kv={n_kv_list}')
 
     if abl_mode == 'matrix':
-        return _run_matrix_mode(device, n_seeds, steps, n_kv_list)
+        rc = _run_matrix_mode(device, n_seeds, steps, n_kv_list)
+        _append_ablation_manifest('matrix', rc, n_seeds, steps, n_kv_list)
+        return rc
 
     # Pre-sweep overfit sanity gate on the reference layout: if the shared
     # training path cannot drive one fixed MQAR batch to ~100% train
@@ -2344,6 +2404,8 @@ def main():
         if 'error' not in r
         and r.get('n_seeds_ok', n_seeds) != r.get('n_seeds', n_seeds)
     )
+    rc = 1 if (n_errors or n_incomplete) else 0
+    _append_ablation_manifest('ratio', rc, n_seeds, steps, n_kv_list)
     if n_errors or n_incomplete:
         logger.error(
             f'\n{n_errors}/{len(all_results)} layouts errored and '

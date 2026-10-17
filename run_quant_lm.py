@@ -86,6 +86,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (  # noqa: E402
     capture_provenance,
     configure_torch_for_device,
+    grad_flow_report,
     make_seeded_generator,
     parse_int_env,
     seed_worker,
@@ -778,6 +779,7 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
 
     losses, accs, elapsed_s = [], [], []
     all_grads_finite = True
+    grad_flow = None
     t0 = time.time()
     for step in range(steps):
         logits = model(input_ids, spec=QAT_SPEC, ste=True)
@@ -794,6 +796,11 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
             acc = float(correct) / max(1, int(mask.sum()))
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_flow is None:
+            # One-shot gradient-flow audit right after the first backward:
+            # on the STE path a detached or unused tensor would silently
+            # keep receiving no gradient while the loss still falls.
+            grad_flow = grad_flow_report(model.named_parameters())
         for p in model.parameters():
             if p.grad is not None and not bool(torch.isfinite(p.grad).all()):
                 all_grads_finite = False
@@ -826,6 +833,7 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
         'spec': spec_summary(QAT_SPEC),
         'ste': True,
         'all_grads_finite': bool(all_grads_finite),
+        'grad_flow': grad_flow,
         'initial_loss': initial_loss,
         'final_loss': final_loss,
         'best_loss': min(losses),
@@ -840,6 +848,11 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
                  'propagates a usable gradient signal on a fixed batch; it '
                  'does not prove the quantizer matches the deployment path.'),
     }
+    if grad_flow and grad_flow['n_missing_grad']:
+        print(f"[overfit-check] WARNING: {grad_flow['n_missing_grad']}/"
+              f"{grad_flow['n_trainable_tensors']} trainable tensor(s) "
+              f"received NO gradient on the first backward "
+              f"(e.g. {grad_flow['missing_grad_names'][:3]})", flush=True)
     del model, opt
     gc.collect()
     if device.type == 'cuda':

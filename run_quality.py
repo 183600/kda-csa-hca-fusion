@@ -67,7 +67,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (configure_torch_for_device, parse_int_env,
                           sanitize_for_json, write_json_atomic,
                           make_seeded_generator, set_global_seed,
-                          capture_provenance)
+                          capture_provenance, grad_flow_report,
+                          make_run_manifest_entry, append_run_manifest)
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
@@ -2378,6 +2379,7 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
 
     losses, accs, elapsed_s = [], [], []
     first_batch = None
+    grad_flow = None
     t0 = time.time()
     for step in range(steps):
         gen = make_seeded_generator(seed + _OVERFIT_BATCH_SEED_OFFSET,
@@ -2398,6 +2400,14 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_flow is None:
+            # One-shot gradient-flow audit on the first backward: names the
+            # parameters the loss never reached (a detached / dead branch
+            # can hide behind a passing accuracy or loss criterion).
+            grad_flow = grad_flow_report(
+                [(f'layer.{n}', p) for n, p in layer.named_parameters()]
+                + [(f'head.{n}', p) for n, p in head.named_parameters()]
+                + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
         torch.nn.utils.clip_grad_norm_(params, grad_clip)
         opt.step()
         losses.append(float(loss.detach()))
@@ -2445,6 +2455,9 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
         'loss_curve': losses,
         'acc_curve': accs,
         'elapsed_s': elapsed_s,
+        # Gradient-flow audit (first step): which trainable tensors the loss
+        # actually reached, recorded next to the pass verdict.
+        'grad_flow': grad_flow,
         'note': ('Necessary but NOT sufficient: passing proves gradients '
                  'flow and the loss responds on a fixed batch; it cannot '
                  'rule out data-augmentation / feature-alignment / '
@@ -2454,6 +2467,12 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+    if grad_flow and grad_flow['n_missing_grad']:
+        print(f"[overfit-check] WARNING: {grad_flow['n_missing_grad']}/"
+              f"{grad_flow['n_trainable_tensors']} trainable tensor(s) "
+              f"received NO gradient on the fixed batch for "
+              f"{op_name}/{task} (e.g. "
+              f"{grad_flow['missing_grad_names'][:3]})", flush=True)
     return report
 
 
@@ -3323,6 +3342,8 @@ def main():
         'MQAR_OVERFIT_STEPS', 200, min_value=10, logger=logger)
     overfit_seed = parse_int_env(
         'MQAR_OVERFIT_SEED', 2026, min_value=0, logger=logger)
+    # Counts recorded in the run manifest even when the gate is disabled.
+    n_gate_failed = 0
     # Cap the gate batch so a large MQAR_TRAIN_BATCH does not make the
     # memorization target unnecessarily hard / slow: "a fixed batch of a few
     # dozen examples" is the probe; 64 sequences still exercises every
@@ -4389,6 +4410,36 @@ def main():
         if 'error' not in r
         and r.get('n_seeds_ok', n_seeds) != r.get('n_seeds', n_seeds)
     )
+    # Append the experiment to the shared run manifest (JSONL ledger) so a
+    # campaign-level index links this run's seeds / recipe / data version to
+    # its result files — automatic bookkeeping, never manual.
+    quality_meta = _base_metadata()
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp4_quality',
+        seeds=quality_meta['seeds'],
+        provenance=quality_meta['provenance'],
+        hyperparameters=quality_meta['training'],
+        data=quality_meta['data'],
+        artifacts={
+            'mqar_results': ('results/exp4_mqar.json'
+                             if 'mqar' in task_list else None),
+            'quality_tasks_results': ('results/exp4b_quality_tasks.json'
+                                      if other_rows else None),
+            'overfit_gate_results': (
+                'results/exp4_overfit_gate.json'
+                if overfit_check_enabled else None),
+        },
+        results={
+            'n_ops': len(all_results),
+            'n_seeds': int(n_seeds),
+            'errors': int(n_errors),
+            'incomplete_seed_sets': int(n_incomplete),
+            'overfit_gate_enabled': bool(overfit_check_enabled),
+            'overfit_gate_failures': int(n_gate_failed),
+        },
+        status=('completed' if not (n_errors or n_incomplete)
+                else 'partial'),
+    ), logger=logger)
     if n_errors or n_incomplete:
         logger.error(
             f'\n{n_errors}/{len(all_results)} ops errored and '

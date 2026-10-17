@@ -964,6 +964,73 @@ def make_seeded_generator(seed: int, device=None):
         return g
 
 
+def grad_flow_report(named_parameters, *, zero_tol: float = 0.0,
+                     max_names: int = 10) -> dict:
+    """Audit which trainable tensors received a gradient on the last backward.
+
+    Call AFTER ``loss.backward()`` and BEFORE ``optimizer.step()`` (which
+    zeroes/consumes nothing, but ``zero_grad(set_to_none=True)`` clears the
+    gradients). The overfit sanity gates use this to turn their pass/fail
+    verdict into an actionable diagnostic: a model can still drive a fixed
+    batch loss down through the layers that DO get gradients while a
+    detached / dead branch silently receives none — exactly the class of
+    "gradients not flowing" bug the fixed-batch gate exists to catch.
+
+    ``named_parameters`` is any iterable of ``(name, Parameter)`` pairs
+    (e.g. ``model.named_parameters()``).
+
+    ``zero_tol`` is the gradient norm at or below which a tensor counts as
+    "zero gradient" (default 0.0: only exactly-zero norms). Returns a
+    JSON-serializable dict:
+
+      * ``n_trainable_tensors`` / ``n_with_grad`` / ``n_missing_grad`` /
+        ``n_zero_grad`` counts,
+      * ``missing_grad_names`` / ``zero_grad_names`` (capped at
+        ``max_names``; the caps are recorded so a truncated list is not
+        mistaken for the full set),
+      * ``global_grad_norm`` (L2 over all parameter gradients).
+    """
+    import math
+
+    n_total = 0
+    n_missing = 0
+    n_zero = 0
+    missing: list[str] = []
+    zero: list[str] = []
+    total_sq = 0.0
+    for name, p in named_parameters:
+        if not getattr(p, 'requires_grad', False):
+            continue
+        n_total += 1
+        g = p.grad
+        if g is None:
+            n_missing += 1
+            if len(missing) < max_names:
+                missing.append(str(name))
+            continue
+        norm = float(g.detach().float().norm())
+        total_sq += norm * norm
+        if norm <= zero_tol:
+            n_zero += 1
+            if len(zero) < max_names:
+                zero.append(str(name))
+    return {
+        'n_trainable_tensors': n_total,
+        'n_with_grad': n_total - n_missing,
+        'n_missing_grad': n_missing,
+        'n_zero_grad': n_zero,
+        'zero_tol': float(zero_tol),
+        'missing_grad_names': missing,
+        'zero_grad_names': zero,
+        'names_truncated_at': int(max_names),
+        'global_grad_norm': math.sqrt(total_sq),
+        'note': ('Missing-gradient tensors were not reached by the loss '
+                 '(detached or unused branch); zero-gradient tensors are '
+                 'reached but contribute nothing on this batch. Both are '
+                 'diagnostic evidence for the fixed-batch gate.'),
+    }
+
+
 # --------------------------------------------------------------------------
 # Leakage-safe train / validation / test splitting
 # --------------------------------------------------------------------------
@@ -1247,6 +1314,117 @@ def write_results_json(payload, target_path, *, indent=2, logger=None):
         except (TypeError, ValueError):
             write_json_atomic(sanitize_for_json(payload), target_path,
                               indent=indent, allow_nan=False, default=str)
+
+
+# --------------------------------------------------------------------------
+# Experiment tracking: append-only run manifest (the machine-readable log)
+# --------------------------------------------------------------------------
+#
+# Every experiment already writes a self-describing result file
+# (provenance + hyperparameters + seeds + data version + curves + final
+# results). What those per-experiment files cannot answer is "which runs
+# exist and where are their artifacts?" across a whole campaign. The run
+# manifest is that index: one strict-JSON line per completed run, appended
+# to a single ledger, linking the run's identity (experiment, seeds, code
+# revision, recipe hash, data fingerprints) to its artifacts and headline
+# results. Recording is automatic — no hand-written experiment log.
+
+#: Environment override for the default manifest location (used by tests
+#: and by launchers that keep experiment outputs on a scratch volume).
+RUN_MANIFEST_PATH_ENV = 'RUN_MANIFEST_PATH'
+DEFAULT_RUN_MANIFEST_PATH = os.path.join('results', 'run_manifest.jsonl')
+
+
+def recipe_sha256(hyperparameters) -> str:
+    """Stable sha256 identity of a hyperparameter/config mapping.
+
+    Two runs with the same recipe hash are the SAME configuration; a
+    different hash means some hyperparameter changed. Canonicalized as
+    sorted-key compact JSON over the NaN-sanitized mapping, so dict
+    insertion order and NaN/Inf values cannot change the identity.
+    """
+    import hashlib
+    import json
+
+    canonical = json.dumps(sanitize_for_json(hyperparameters or {}),
+                           sort_keys=True, separators=(',', ':'),
+                           allow_nan=False)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def make_run_manifest_entry(*, experiment: str, seeds, provenance=None,
+                            hyperparameters=None, data=None, artifacts=None,
+                            results=None, status: str = 'completed',
+                            manifest_version: int = 1) -> dict:
+    """Build one run-manifest entry (JSON-serializable, RFC-8259 strict).
+
+    Args:
+        experiment: stable experiment name (e.g. ``'train_lm_autodl'``).
+        seeds: the run's random seed(s) — int, or list of ints for
+            multi-seed sweeps. Required: a run without its seed recorded
+            is not reproducible.
+        provenance: ``capture_provenance()`` dict; captured here when None
+            so the entry always carries the code revision / env.
+        hyperparameters: the recipe (full mapping is stored; the compact
+            ``recipe_sha256`` identity is added alongside).
+        data: data-version block (corpus fingerprints, split sizes, ...).
+        artifacts: mapping of role -> path so every artifact is findable.
+        results: final numbers (loss/perplexity/accuracy/verdict, ...).
+        status: ``'completed'`` / ``'failed'`` / ``'partial'``.
+        manifest_version: schema version for forward compatibility.
+    """
+    import datetime
+
+    if seeds is None:
+        raise ValueError('run manifest entry requires the run seed(s)')
+    if provenance is None:
+        provenance = capture_provenance()
+    hyperparameters = sanitize_for_json(hyperparameters or {})
+    entry = {
+        'manifest_version': int(manifest_version),
+        'experiment': str(experiment),
+        'created_utc': datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
+        'status': str(status),
+        'seeds': seeds,
+        'recipe_sha256': recipe_sha256(hyperparameters),
+        'hyperparameters': hyperparameters,
+        'data': sanitize_for_json(data or {}),
+        'artifacts': sanitize_for_json(artifacts or {}),
+        'results': sanitize_for_json(results or {}),
+        'provenance': provenance,
+    }
+    return entry
+
+
+def append_run_manifest(entry, path: str | None = None,
+                        logger=None) -> str:
+    """Append one run-manifest entry as a strict-JSON line; return the path.
+
+    The line is written with a single ``write`` in append mode (atomic for
+    lines up to ``PIPE_BUF`` on POSIX), then flushed and fsynced so the
+    ledger survives a crash immediately after the call. Path resolution:
+    explicit ``path`` argument, else ``$RUN_MANIFEST_PATH``, else
+    ``results/run_manifest.jsonl``. Parent directories are created.
+    """
+    import json
+
+    if path is None:
+        path = os.environ.get(RUN_MANIFEST_PATH_ENV,
+                              DEFAULT_RUN_MANIFEST_PATH)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    line = json.dumps(sanitize_for_json(entry), sort_keys=True,
+                      allow_nan=False)
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(line + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    if logger is not None:
+        logger.info(f'  [manifest] appended {entry.get("experiment", "?")} '
+                    f'run to {path}')
+    return path
 
 
 if __name__ == "__main__":

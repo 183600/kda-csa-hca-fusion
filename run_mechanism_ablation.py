@@ -93,8 +93,10 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
+    make_run_manifest_entry,
     make_seeded_generator,
     parse_int_env,
     set_global_seed,
@@ -1152,6 +1154,26 @@ def main():
     n_errors = sum(1 for r in all_rows if r.get('n_seeds_ok', 0) == 0)
     n_incomplete = sum(1 for r in all_rows
                        if 0 < r.get('n_seeds_ok', 0) < r.get('n_seeds_total'))
+    rc = 1 if (n_errors or n_incomplete) else 0
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp8_mechanism_ablation',
+        seeds=metadata['seeds'],
+        provenance=metadata['provenance'],
+        hyperparameters=metadata['training'],
+        data=metadata.get('data'),
+        artifacts={
+            'results': RESULTS_PATH,
+            'overfit_gate_results': 'results/exp8_overfit_gate.json',
+        },
+        results={
+            'n_variants': len(all_rows),
+            'n_seeds': int(n_seeds),
+            'errors': int(n_errors),
+            'incomplete_seed_sets': int(n_incomplete),
+            'return_code': rc,
+        },
+        status='completed' if not rc else 'partial',
+    ), logger=logger)
     if n_errors or n_incomplete:
         logger.error(
             f'\n{n_errors}/{len(all_rows)} variants errored and '
