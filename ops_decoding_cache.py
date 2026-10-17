@@ -1339,6 +1339,11 @@ class CSADecodingCache:
             # instead of rescanning the whole compressed cache.
             C_comp_valid = _to_dtype(
                 self._C_comp[:, :self._n_blocks], compute_dtype)
+            K_IComp_valid = _to_dtype(
+                self._K_IComp[:, :self._n_blocks], compute_dtype)
+            if torch.is_grad_enabled() and not normalize_qk:
+                C_comp_valid = C_comp_valid.clone()
+                K_IComp_valid = K_IComp_valid.clone()
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in
@@ -1347,8 +1352,7 @@ class CSADecodingCache:
             effective_use_ste = use_ste and torch.is_grad_enabled()
             indexer_result = csa_lightning_indexer(
                 _to_dtype(q_idx, compute_dtype),                       # [B, 1, nIh, c_I]
-                _to_dtype(self._K_IComp[:, :self._n_blocks],
-                          compute_dtype),                              # [B, n_blocks, c_I]
+                K_IComp_valid,                                         # [B, n_blocks, c_I]
                 _to_dtype(w_idx, compute_dtype),                       # [B, 1, nIh]
                 topk,
                 # Defer scale selection to csa_lightning_indexer — it
@@ -2015,6 +2019,8 @@ class HCADecodingCache:
             else:
                 C_comp_n = _to_dtype(
                     self._C_comp[:, :self._n_blocks], compute_dtype)
+                if torch.is_grad_enabled():
+                    C_comp_n = C_comp_n.clone()
             # scores: [B, nh, 1, n_blocks] -> [B, 1, nh, n_blocks]
             scores = torch.einsum(
                 'b t h d, b n d -> b t h n', q_compute, C_comp_n,

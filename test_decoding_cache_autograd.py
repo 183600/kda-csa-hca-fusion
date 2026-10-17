@@ -179,9 +179,92 @@ def test_hca_cache_backward_sink_only_spans_decode_steps(device='cpu'):
         f'q grads absent={g_dq is None and g_uq is None}')
 
 
+def test_csa_cache_backward_normalize_qk_off(device='cpu'):
+    """CSA: normalize_qk=False must not save live compressed-cache views.
+
+    Without normalization the compressed rows and indexer keys are read
+    straight from the cache's backing buffers, so a later ``append_step``
+    can overwrite storage saved for backward. Both STE modes must span
+    several block completions and still backpropagate.
+    """
+    B, d, c, c_I, m, nh, nIh, dc = 1, 16, 8, 4, 4, 2, 1, 8
+    win, topk, T = 3, 2, 20
+    torch.manual_seed(13)
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_aKV = torch.randn(c, d, device=device) * 0.1
+    W_KV_idx = torch.randn(c_I, d, device=device) * 0.1
+    W_Z_idx = torch.randn(c_I, d, device=device) * 0.1
+    Ba = torch.randn(m, c, device=device) * 0.02
+    Bb = torch.randn(m, c, device=device) * 0.02
+    B_idx = torch.randn(m, c_I, device=device) * 0.02
+    for ste_mode in ('topk_columns', 'full_softmax'):
+        torch.manual_seed(17)
+        W_DQ = (torch.randn(dc, d, device=device) * 0.1).requires_grad_(True)
+        W_UQ = (torch.randn(c * nh, dc, device=device)
+                * 0.1).requires_grad_(True)
+        W_IUQ = (torch.randn(c_I * nIh, d, device=device)
+                 * 0.1).requires_grad_(True)
+        W_w = (torch.randn(nIh, d, device=device)
+               * 0.1).requires_grad_(True)
+        cache = CSADecodingCache(
+            B, c, c_I, m, win, device, torch.float32)
+        outs = []
+        for t in range(T):
+            H_t = H[:, t:t + 1]
+            Ca = F.linear(H_t, W_aKV).detach()
+            K_i = F.linear(H_t, W_KV_idx).detach()
+            Z_i = F.linear(H_t, W_Z_idx).detach()
+            cache.append_step(
+                Ca, Ca, Ca, Ca, K_i, Z_i,
+                Ba.detach(), Bb.detach(), B_idx.detach())
+            q = F.linear(F.linear(H_t, W_DQ), W_UQ).view(B, 1, nh, c)
+            q_idx = F.linear(H_t, W_IUQ).view(B, 1, nIh, c_I)
+            w_idx = F.linear(H_t, W_w).view(B, 1, nIh)
+            outs.append(cache.forward_step(
+                q, q_idx, w_idx, topk=topk, nh=nh, nIh=nIh,
+                scale=None, sink_logits=None, use_ste=True,
+                ste_mode=ste_mode, normalize_qk=False))
+        torch.cat(outs, dim=1).sum().backward()
+        grads = [W_DQ.grad, W_UQ.grad, W_IUQ.grad, W_w.grad]
+        _ok(
+            f'csa_cache_backward_normalize_qk_off ste_mode={ste_mode}',
+            all(g is not None and torch.isfinite(g).all() for g in grads),
+            f'grads present={[g is not None for g in grads]}')
+
+
+def test_hca_cache_backward_normalize_qk_off(device='cpu'):
+    """HCA: normalize_qk=False must not save live compressed-cache views."""
+    B, d, c, m2, nh, dc = 1, 16, 8, 4, 2, 8
+    win, T = 3, 20
+    torch.manual_seed(19)
+    H = torch.randn(B, T, d, device=device) * 0.1
+    W_KV = torch.randn(c, d, device=device) * 0.1
+    B_pos = torch.randn(m2, c, device=device) * 0.02
+    W_DQ = (torch.randn(dc, d, device=device) * 0.1).requires_grad_(True)
+    W_UQ = (torch.randn(c * nh, dc, device=device)
+            * 0.1).requires_grad_(True)
+    cache = HCADecodingCache(B, c, m2, win, device, torch.float32)
+    outs = []
+    for t in range(T):
+        H_t = H[:, t:t + 1]
+        C = F.linear(H_t, W_KV).detach()
+        cache.append_step(C, C, B_pos.detach())
+        q = F.linear(F.linear(H_t, W_DQ), W_UQ).view(B, 1, nh, c)
+        outs.append(cache.forward_step(
+            q, nh=nh, scale=None, sink_logits=None, normalize_qk=False))
+    torch.cat(outs, dim=1).sum().backward()
+    grads = [W_DQ.grad, W_UQ.grad]
+    _ok(
+        'hca_cache_backward_normalize_qk_off',
+        all(g is not None and torch.isfinite(g).all() for g in grads),
+        f'grads present={[g is not None for g in grads]}')
+
+
 if __name__ == '__main__':
     test_csa_cache_backward_spans_decode_steps()
     test_hca_cache_backward_spans_decode_steps()
     test_csa_cache_backward_sink_only_spans_decode_steps()
     test_hca_cache_backward_sink_only_spans_decode_steps()
+    test_csa_cache_backward_normalize_qk_off()
+    test_hca_cache_backward_normalize_qk_off()
     print('all decoding-cache autograd tests passed')
