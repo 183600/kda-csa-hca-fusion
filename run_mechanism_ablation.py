@@ -50,6 +50,15 @@ key/value pair is among the selected top-k blocks at the cue position.
 closed-form chance level under uniform selection. This isolates *selection
 quality* from end-task accuracy.
 
+``gold_recall`` is thresholded (top-k hit or miss) and hides how well the
+gold block is RANKED. The diagnostic therefore also reports threshold-free
+metrics over the indexer's full soft distribution: ``gold_pr_auc``
+(average precision; PRIMARY, because one gold block among ``n_available``
+candidates is an extreme-imbalance retrieval problem), ``gold_roc_auc``
+(tie-corrected), ``gold_mrr`` (mean per-sequence reciprocal rank) and
+``gold_top1_recall``, each with its geometry-derived chance reference
+(``1/n_available`` and ``H(n)/n``).
+
 Budget / configuration (environment variables)
 ----------------------------------------------
 * ``MECH_SEEDS``       (default 5)   — seeds per variant.
@@ -92,6 +101,7 @@ from kaggle_setup import (
 )
 from ops_csa import _causal_block_mask, csa_compress_kv, csa_lightning_indexer
 from ops_fused import CSAHybridLayer, HybridKCHAttention
+from results_analysis import binary_ranking_metrics
 from results_schema import write as write_schema
 from run_ablation import _eval_model, _make_cfg
 from run_quality import (
@@ -179,7 +189,8 @@ def set_indexer_ste(model, use_ste: bool) -> int:
     return n
 
 
-def indexer_topk_from_layer(layer: CSAHybridLayer, x: torch.Tensor) -> torch.Tensor:
+def indexer_topk_from_layer(layer: CSAHybridLayer, x: torch.Tensor,
+                            return_scores: bool = False):
     """Recompute the lightning-indexer top-k of ``layer`` on input ``x``.
 
     ``x`` must be the tensor that reaches ``CSAHybridLayer.forward`` — i.e.
@@ -192,6 +203,12 @@ def indexer_topk_from_layer(layer: CSAHybridLayer, x: torch.Tensor) -> torch.Ten
 
     Returns integer indices ``[B, T_padded, topk]`` (invalid slots ``-1``),
     matching ``csa_lightning_indexer``'s contract.
+
+    ``return_scores=True`` additionally returns the full differentiable
+    block distribution ``soft_weights`` ``[B, T_padded, n_blocks]`` (the
+    softmax of the indexer logits over causally available blocks) so the
+    caller can compute ranking metrics over ALL blocks, not just the hard
+    top-k. Default False preserves the historical single-tensor return.
     """
     cfg = layer.cfg
     B, T, _d = x.shape
@@ -210,6 +227,15 @@ def indexer_topk_from_layer(layer: CSAHybridLayer, x: torch.Tensor) -> torch.Ten
         B, T_padded, cfg.csa_nIh, cfg.csa_cI)
     w_idx = F.linear(x, layer.W_w.weight)
     cbm = _causal_block_mask(T_padded, n_blocks, m, x.device)
+    if return_scores:
+        idx, soft = csa_lightning_indexer(
+            q_idx, K_IComp, w_idx, cfg.csa_topk,
+            scale=None,
+            causal_block_mask=cbm,
+            return_soft_weights=True,
+            normalize_qk=True,
+        )
+        return idx, soft
     return csa_lightning_indexer(
         q_idx, K_IComp, w_idx, cfg.csa_topk,
         scale=None,
@@ -232,19 +258,43 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
     is ambiguous and the diagnostic is skipped with a reason (rather than
     silently reporting a distorted number).
 
+    ``gold_recall`` (top-k) is a THRESHOLDED metric: it says whether the
+    gold block cleared the cut but not HOW WELL the indexer RANKS it. The
+    same run also reports threshold-free RANKING metrics over the full
+    block distribution (from the differentiable soft weights), because the
+    gold block is a single rare positive among ``n_available`` blocks:
+
+      * ``gold_pr_auc`` / ``gold_roc_auc`` — pooled average precision and
+        tie-corrected ROC-AUC of the gold block vs all other causally
+        available blocks (PR-AUC is the primary metric: 1 positive among
+        n_available candidates is an extreme-imbalance retrieval problem
+        where ROC-AUC flatters the indexer).
+      * ``gold_mrr`` — mean per-sequence reciprocal rank of the gold block
+        (average-rank tie handling); ``chance_gold_mrr`` = H(n)/n.
+      * ``gold_top1_recall`` — fraction of sequences where the gold block
+        is ranked first.
+
     Returns a dict with ``gold_recall`` (``None`` when skipped),
     ``n_samples``, ``gold_topk_effective``, ``gold_n_available_blocks``,
-    ``chance_gold_recall`` and ``skipped_reason``.
+    ``chance_gold_recall``, the ranking metrics above (all ``None`` when
+    skipped), and ``skipped_reason``.
     """
+    empty = {
+        'gold_recall': None, 'n_samples': 0,
+        'gold_topk_effective': None, 'gold_n_available_blocks': None,
+        'chance_gold_recall': None,
+        'gold_pr_auc': None, 'gold_roc_auc': None, 'gold_mrr': None,
+        'gold_top1_recall': None,
+        'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
+        'skipped_reason': None,
+    }
     if m is None:
         m = SMALL_MODEL_SPEC['csa_m']
     csa_layers = [layer for layer in model.layers
                   if isinstance(layer, CSAHybridLayer)]
     if len(csa_layers) != 1:
         return {
-            'gold_recall': None, 'n_samples': 0,
-            'gold_topk_effective': None, 'gold_n_available_blocks': None,
-            'chance_gold_recall': None,
+            **empty,
             'skipped_reason': (f'expected exactly 1 CSA layer in the '
                                f'{RATIO} layout, found {len(csa_layers)}'),
         }
@@ -254,13 +304,21 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
     def _capture(_module, args):
         captured['x'] = args[0].detach()
 
+    # Causally available blocks at the cue position: fixed by the geometry,
+    # so compute once BEFORE the loop (the score slice needs it too).
+    n_blocks = -(-seq_len // m)
+    n_cue = seq_len - 1
+    n_available = min(n_cue // m, n_blocks)
+
     handle = layer.register_forward_pre_hook(_capture)
     gen = make_seeded_generator(seed + 6_000_000, device=device)
     was_training = model.training
     hits = 0
+    top1_hits = 0
+    rr_sum = 0.0
     total = 0
+    score_chunks, label_chunks = [], []
     skipped_reason = None
-    cue_pos = seq_len - 1
     try:
         model.eval()
         with torch.no_grad():
@@ -282,25 +340,50 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
                         'cued key and value land in different compressed '
                         'blocks; gold block undefined for this geometry')
                     break
-                indices = indexer_topk_from_layer(layer, x_norm)
+                indices, soft = indexer_topk_from_layer(
+                    layer, x_norm, return_scores=True)
                 selected = indices[:, cue_pos, :]
                 hits += int((selected == key_block[:, None])
                             .any(dim=1).sum().item())
                 total += int(key_block.numel())
+
+                # Ranking metrics at the cue position over causally
+                # available blocks only (later blocks are masked to
+                # probability 0 and would trivially inflate ROC-AUC). The
+                # n_available==0 guard is for degenerate geometries only
+                # (seq_len <= block size); it cannot trigger for the real
+                # MQAR specs.
+                if n_available <= 0:
+                    continue
+                scores_cue = soft[:, cue_pos, :n_available]
+                labels_cue = (
+                    torch.arange(n_available, device=scores_cue.device)
+                    [None, :] == key_block[:, None])
+                gold_scores = scores_cue.gather(
+                    1, key_block[:, None]).squeeze(1)
+                greater = (scores_cue > gold_scores[:, None]).sum(dim=1)
+                equal = (scores_cue == gold_scores[:, None]).sum(dim=1)
+                # Average-rank tie handling (matches binary_ranking_metrics'
+                # ROC-AUC convention).
+                avg_rank = (1.0 + greater.to(scores_cue.dtype)
+                            + (equal.to(scores_cue.dtype) - 1.0) / 2.0)
+                rr_sum += float((1.0 / avg_rank).sum().item())
+                top1_hits += int((scores_cue.argmax(dim=1)
+                                  == key_block).sum().item())
+                score_chunks.append(scores_cue.reshape(-1))
+                label_chunks.append(labels_cue.reshape(-1))
     finally:
         handle.remove()
         model.train(was_training)
 
     if skipped_reason is not None:
-        return {
-            'gold_recall': None, 'n_samples': 0,
-            'gold_topk_effective': None, 'gold_n_available_blocks': None,
-            'chance_gold_recall': None,
-            'skipped_reason': skipped_reason,
-        }
-    n_blocks = -(-seq_len // m)
-    n_available = min(cue_pos // m, n_blocks)
+        return {**empty, 'skipped_reason': skipped_reason}
     topk_effective = min(int(layer.cfg.csa_topk), n_available)
+    pooled = (binary_ranking_metrics(torch.cat(score_chunks),
+                                     torch.cat(label_chunks))
+              if score_chunks else None)
+    chance_mrr = (sum(1.0 / i for i in range(1, n_available + 1))
+                  / n_available) if n_available else None
     return {
         'gold_recall': hits / total if total else None,
         'n_samples': total,
@@ -308,6 +391,12 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
         'gold_n_available_blocks': n_available,
         'chance_gold_recall': (topk_effective / n_available
                                if n_available else None),
+        'gold_pr_auc': (pooled or {}).get('pr_auc'),
+        'gold_roc_auc': (pooled or {}).get('roc_auc'),
+        'gold_mrr': (rr_sum / total) if total else None,
+        'gold_top1_recall': (top1_hits / total) if total else None,
+        'chance_gold_pr_auc': (1.0 / n_available) if n_available else None,
+        'chance_gold_mrr': chance_mrr,
         'skipped_reason': None,
     }
 
@@ -416,6 +505,9 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
                 'gold_topk_effective': None,
                 'gold_n_available_blocks': None,
                 'chance_gold_recall': None,
+                'gold_pr_auc': None, 'gold_roc_auc': None,
+                'gold_mrr': None, 'gold_top1_recall': None,
+                'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
                 'skipped_reason': 'diagnostic disabled by caller'}
 
     return {
@@ -441,6 +533,15 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         'gold_topk_effective': diag['gold_topk_effective'],
         'gold_n_available_blocks': diag['gold_n_available_blocks'],
         'chance_gold_recall': diag['chance_gold_recall'],
+        # Threshold-free ranking quality of the gold block (see
+        # diagnose_gold_recall): PR-AUC is primary under the 1-of-N
+        # extreme-imbalance geometry.
+        'gold_pr_auc': diag.get('gold_pr_auc'),
+        'gold_roc_auc': diag.get('gold_roc_auc'),
+        'gold_mrr': diag.get('gold_mrr'),
+        'gold_top1_recall': diag.get('gold_top1_recall'),
+        'chance_gold_pr_auc': diag.get('chance_gold_pr_auc'),
+        'chance_gold_mrr': diag.get('chance_gold_mrr'),
         'gold_recall_skipped_reason': diag['skipped_reason'],
         'layout': model.layout_str(),
     }
@@ -509,6 +610,25 @@ def summarize_variant(per_seed, variant):
     skip_reason = next((r['gold_recall_skipped_reason'] for r in per_seed
                         if r.get('gold_recall_skipped_reason')), None)
 
+    # Seed-aggregated ranking quality of the gold block (threshold-free).
+    # Chance references are geometry constants (1/n_available for PR-AUC,
+    # H(n)/n for MRR), identical across seeds of a variant.
+    def _agg_optional(key):
+        vals = [r[key] for r in ok if r.get(key) is not None]
+        return _mean_ci(vals) + (len(vals),)
+
+    (mean_gold_pr_auc, std_gold_pr_auc,
+     ci95_gold_pr_auc, n_gold_ranking) = _agg_optional('gold_pr_auc')
+    mean_gold_roc_auc = _agg_optional('gold_roc_auc')[0]
+    mean_gold_mrr, std_gold_mrr, ci95_gold_mrr, _ = _agg_optional('gold_mrr')
+    mean_gold_top1 = _agg_optional('gold_top1_recall')[0]
+    chance_gold_pr_auc = next(
+        (r['chance_gold_pr_auc'] for r in ok
+         if r.get('chance_gold_pr_auc') is not None), None)
+    chance_gold_mrr = next(
+        (r['chance_gold_mrr'] for r in ok
+         if r.get('chance_gold_mrr') is not None), None)
+
     chance = 1.0 / VOCAB
     if len(accs) > 1 and std_acc and std_acc > 0:
         t_vs_chance = (mean_acc - chance) / (std_acc / math.sqrt(len(accs)))
@@ -538,6 +658,22 @@ def summarize_variant(per_seed, variant):
         'n_gold_recall_seeds': len(recalls),
         'chance_gold_recall': chance_recall,
         'gold_recall_t_vs_chance': recall_t,
+        # Threshold-free gold-block ranking (see diagnose_gold_recall).
+        # gold_pr_auc is the primary metric: 1 gold block among
+        # n_available candidates is an extreme-imbalance retrieval
+        # problem, where ROC-AUC is optimistic and recall@k hides
+        # near-misses just below the top-k cut.
+        'mean_gold_pr_auc': mean_gold_pr_auc,
+        'std_gold_pr_auc': std_gold_pr_auc,
+        'ci95_gold_pr_auc': ci95_gold_pr_auc,
+        'mean_gold_roc_auc': mean_gold_roc_auc,
+        'mean_gold_mrr': mean_gold_mrr,
+        'std_gold_mrr': std_gold_mrr,
+        'ci95_gold_mrr': ci95_gold_mrr,
+        'mean_gold_top1_recall': mean_gold_top1,
+        'n_gold_ranking_seeds': n_gold_ranking,
+        'chance_gold_pr_auc': chance_gold_pr_auc,
+        'chance_gold_mrr': chance_gold_mrr,
         'gold_recall_skipped_reason': skip_reason,
         'mean_fwd_ms': mean_fwd,
         'n_params': ok[0]['n_params'] if ok else None,
@@ -639,6 +775,17 @@ def main():
                         'final_acc': None, 'final_loss': None,
                         'fwd_ms': None, 'n_params': None, 'n_layers': None,
                         'loss_curve': [], 'gold_recall': None,
+                        # Mirror the success-row diagnostic schema so
+                        # pd.DataFrame(per_seed) has uniform columns.
+                        'gold_recall_n_samples': 0,
+                        'gold_topk_effective': None,
+                        'gold_n_available_blocks': None,
+                        'chance_gold_recall': None,
+                        'gold_pr_auc': None, 'gold_roc_auc': None,
+                        'gold_mrr': None, 'gold_top1_recall': None,
+                        'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
+                        'gold_recall_skipped_reason': None,
+                        'layout': None,
                         'error': str(e),
                         'train_time_s': time.time() - t0,
                     })
@@ -658,6 +805,9 @@ def main():
                 f"  -> mean_acc={_fmt_num(row['mean_acc'])} +/- {_ci_str}  "
                 f"recall={_fmt_recall(row['mean_gold_recall'])} "
                 f"(chance={_fmt_recall(row['chance_gold_recall'])})  "
+                f"pr_auc={_fmt_recall(row['mean_gold_pr_auc'])} "
+                f"(chance={_fmt_recall(row['chance_gold_pr_auc'])})  "
+                f"mrr={_fmt_recall(row['mean_gold_mrr'])}  "
                 f"fwd={_fmt_num(row['mean_fwd_ms'])}ms")
 
         # Pairwise (paired-by-seed) comparisons against the baseline.
@@ -763,6 +913,19 @@ def main():
             "with the same normalization / causal mask as naive_csa. "
             "chance_gold_recall = min(k, n_available_blocks) / "
             "n_available_blocks."),
+        'gold_ranking_definition': (
+            "Threshold-free ranking quality of the gold block over the "
+            "causally available compressed blocks at the cue position, "
+            "from the indexer's full soft block distribution (not only the "
+            "hard top-k): gold_pr_auc = average precision (primary metric: "
+            "one gold block among n_available candidates is an extreme-"
+            "imbalance retrieval problem where ROC-AUC is optimistic), "
+            "gold_roc_auc = tie-corrected ROC-AUC, gold_mrr = mean "
+            "per-sequence reciprocal rank of the gold block, "
+            "gold_top1_recall = fraction ranked first. Chance references: "
+            "chance_gold_pr_auc = 1/n_available, chance_gold_mrr = "
+            "H(n_available)/n_available. recall@k is thresholded and hides "
+            "near-misses just below the cut; the ranking metrics do not."),
         'paired_test': (
             'two-sided paired t over seeds vs baseline; one-sided recall '
             't vs chance; both share one Bonferroni family of n_tests = '

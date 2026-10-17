@@ -148,6 +148,24 @@ def test_indexer_topk_matches_operator():
     _ok('diagnostic selections respect the strictly-preceding mask',
         bool(inside.all()), 'causal mask')
 
+    # Score path contract: return_scores=True must not change the hard
+    # indices and must return the full block distribution used by the
+    # ranking metrics.
+    diag_s, soft = M.indexer_topk_from_layer(csa_layer, captured['x'],
+                                             return_scores=True)
+    _ok('return_scores keeps the hard indices bit-identical',
+        torch.equal(diag_s, diag), 'scores path')
+    _ok('soft weights shape [B, T, n_blocks]',
+        soft.shape[0] == diag.shape[0] and soft.shape[1] == T
+        and soft.shape[2] == M._N_BLOCKS, f'shape={tuple(soft.shape)}')
+    cue = M.SEQ_LEN - 1
+    cue_row_sum = float(soft.detach()[:, cue, :].sum(-1)[0])
+    _ok('cue-row block distribution is normalised',
+        abs(cue_row_sum - 1.0) < 1e-6, f'sum={cue_row_sum}')
+    n_available = min(cue // cfg.csa_m, M._N_BLOCKS)
+    _ok('masked (future) blocks get exactly zero probability',
+        bool((soft[:, cue, n_available:] == 0).all()), 'mask zeros')
+
 
 def test_make_mqar_batch_meta_backward_compatible():
     """``return_meta`` is opt-in and reports the cued pair index."""
@@ -230,6 +248,23 @@ def test_dense_variant_recall_is_one():
         diag['chance_gold_recall'] == 1.0,
         f"chance={diag['chance_gold_recall']}, "
         f"k={diag['gold_topk_effective']}/{diag['gold_n_available_blocks']}")
+    # Threshold-free ranking metrics must be well-formed even when the
+    # hard top-k recall is trivially 1.0 (the ranking can still be poor).
+    _ok('gold ranking metrics well-formed',
+        diag['gold_pr_auc'] is not None
+        and 0.0 <= diag['gold_pr_auc'] <= 1.0
+        and diag['gold_roc_auc'] is not None
+        and 0.0 <= diag['gold_roc_auc'] <= 1.0
+        and diag['gold_mrr'] is not None
+        and 0.0 < diag['gold_mrr'] <= 1.0
+        and diag['gold_top1_recall'] is not None
+        and 0.0 <= diag['gold_top1_recall'] <= 1.0,
+        f"pr_auc={diag['gold_pr_auc']} mrr={diag['gold_mrr']}")
+    _ok('ranking chance references match the 1-of-N geometry',
+        abs(diag['chance_gold_pr_auc'] - 1 / 3) < 1e-9
+        and abs(diag['chance_gold_mrr'] - (1 + 0.5 + 1 / 3) / 3) < 1e-9,
+        f"chance_pr={diag['chance_gold_pr_auc']} "
+        f"chance_mrr={diag['chance_gold_mrr']}")
 
 
 def test_sparse_variant_recall_is_below_one_or_none():
@@ -251,6 +286,12 @@ def test_sparse_variant_recall_is_below_one_or_none():
     _ok('chance recall == 1/3 for k=1 of 3 blocks',
         abs(diag['chance_gold_recall'] - 1 / 3) < 1e-9,
         f"chance={diag['chance_gold_recall']}")
+    _ok('sparse probe reports threshold-free ranking metrics',
+        diag['gold_pr_auc'] is not None
+        and 0.0 <= diag['gold_pr_auc'] <= 1.0
+        and diag['gold_mrr'] is not None
+        and abs(diag['chance_gold_pr_auc'] - 1 / 3) < 1e-9,
+        f"pr_auc={diag['gold_pr_auc']} mrr={diag['gold_mrr']}")
 
 
 def test_paired_stats_math():
@@ -304,6 +345,14 @@ def test_exp8_smoke_envelope():
                 and 0 <= baseline['mean_gold_recall'] <= 1,
                 f"acc={baseline['mean_acc']}, "
                 f"recall={baseline['mean_gold_recall']}")
+            _ok('baseline row carries aggregated gold ranking metrics',
+                baseline.get('mean_gold_pr_auc') is not None
+                and 0 <= baseline['mean_gold_pr_auc'] <= 1
+                and baseline.get('mean_gold_mrr') is not None
+                and 0 < baseline['mean_gold_mrr'] <= 1
+                and baseline.get('chance_gold_pr_auc') is not None,
+                f"pr_auc={baseline.get('mean_gold_pr_auc')}, "
+                f"mrr={baseline.get('mean_gold_mrr')}")
             _ok('paired stats present for the non-baseline variant',
                 next(r for r in rows if r['variant'] == 'no_rope')
                 ['paired_vs_baseline_mean_acc_diff'] is not None, '')

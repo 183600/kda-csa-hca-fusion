@@ -11,18 +11,41 @@ We train a tiny single-layer classifier on top of each attention operator for
 a fixed number of steps and report final accuracy. Absolute accuracy is not
 meaningful at this scale, but the *relative ranking* across operators is.
 
-Methodology:
+Methodology (experiment-design contract — see also TASK_HYPOTHESES and
+OPERATOR_HYPOTHESES below, which pre-register what each cell tests):
 
+  * **Baseline ladder, tuned.** The sweep includes the SIMPLEST baselines —
+    ``linear`` (no token mixing at all; a memoryless control that must stay
+    at chance on a memory task) and ``softmax`` (the simplest real mixer).
+    Baseline learning rates are selected on the held-out validation stream
+    (``MQAR_BASELINE_TUNE=1``, default), and every complex operator is
+    additionally tested against the tuned reference baseline with a
+    SEED-PAIRED one-sided t-test, Bonferroni-corrected over the comparison
+    family (``beats_tuned_baseline``). A complex model must clear that bar
+    before "better than the baseline" may be claimed.
   * **Multi-seed runs with confidence intervals.** Every operator is trained
-    over ``n_seeds`` (default 5) seeds; we report mean +/- std and a
-    one-sample t-test vs the chance baseline.
-  * **Softmax baseline convergence.** The softmax-attention baseline is given
-    more steps (``softmax_steps``) so it actually converges; a converged
-    softmax is the right upper bound.
+    over ``n_seeds`` (default 5) seeds; we report mean +/- std, a
+    one-sample t-test vs the chance baseline, and — for the multi-class
+    probes — accuracy PLUS the confusion-derived metrics: macro / micro /
+    weighted F1 (explicitly labelled), balanced accuracy, per-class
+    precision/recall/support, and one-vs-rest PR-AUC / ROC-AUC. The
+    synthetic MQAR targets are class-balanced by construction, so the
+    metric record also VERIFIES the class balance (``class_balance``)
+    instead of assuming it, and a collapsed predictor cannot hide behind
+    accuracy. PR-AUC is the primary ranking metric when positives are rare;
+    these probes are 1-of-vocab ranked decisions, so the same convention
+    applies.
+  * **Softmax baseline convergence.** The softmax-attention baseline can be
+    given more steps (``softmax_steps``) so it actually converges; a
+    converged softmax is the right upper bound.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available, falling back
     to CPU.
   * **Controlled evaluation.** A larger final eval batch (256) and multiple
     eval batches for a more stable accuracy estimate.
+  * **Hypothesis-driven, not exploratory.** Each task row carries a
+    pre-registered mechanism hypothesis with its predicted signature and
+    falsification criterion (TASK_HYPOTHESES / OPERATOR_HYPOTHESES); the
+    flags and metadata record which predictions the data supported.
 """
 
 from __future__ import annotations
@@ -52,7 +75,8 @@ from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
-                              diagnose_training_curves)
+                              diagnose_training_curves,
+                              multiclass_classification_metrics)
 
 logger = logging.getLogger(__name__)
 
@@ -807,6 +831,161 @@ SYNTHETIC_TASKS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Explicit scientific hypotheses (experiment-design requirement).
+#
+# Each task/operator row in the results is annotated with the mechanism
+# hypothesis it is meant to test, the predicted signature, and what would
+# FALSIFY the prediction. This keeps the sweep hypothesis-driven: a row is
+# not "op X on task Y" but "operator X's memory mechanism should show THIS
+# signature, and HERE is the evidence that would count against it".
+# Multiple-comparison hygiene: the sweep runs many (task, op) cells, so the
+# per-row significance flags are Bonferroni-corrected and the hypotheses
+# below are pre-registered (fixed before the numbers are read).
+# ---------------------------------------------------------------------------
+TASK_HYPOTHESES = OrderedDict([
+    ('mqar', {
+        'hypothesis': (
+            'Associative recall requires an in-context memory that binds '
+            'each key token to a later value token and retrieves it from '
+            'the cue, independent of distance and of interference from '
+            'other pairs.'),
+        'prediction': (
+            'Memoryless models stay at chance; mixers with content-based '
+            'addressing (softmax, KDA delta rule, sparse CSA retrieval) '
+            'rise above chance; accuracy degrades with n_kv (more '
+            'interference).'),
+        'falsified_if': (
+            'The memoryless ``linear`` baseline beats chance (task is '
+            'solvable without token mixing => confounded), or no memory '
+            'operator exceeds the tuned baseline.'),
+    }),
+    ('kv_update', {
+        'hypothesis': (
+            'When the same key is re-presented with a new value, the '
+            'memory must OVERWRITE the old association (delta-rule '
+            'update), not merely accumulate it.'),
+        'prediction': (
+            'Operators with an explicit delta/erase rule (KDA) keep one '
+            'value per key and answer with the latest; pure accumulators '
+            'mix old and new values and lose accuracy as interference '
+            'grows.'),
+        'falsified_if': (
+            'An operator with no overwrite mechanism matches or beats the '
+            'delta-rule operator, or the error mix is dominated by '
+            '``used_stale_value`` for the delta-rule operator.'),
+    }),
+    ('long_range', {
+        'hypothesis': (
+            'Long-context retrieval is a LOCALISATION problem: the model '
+            'must keep early (key, value) pairs addressable as the '
+            'distance grows, not only aggregate them.'),
+        'prediction': (
+            'O(1)-state recurrent operators (KDA / Mamba-2 / RWKV-7) show '
+            'accuracy that degrades with the key-cue distance; CSA/HCA '
+            'compression + sparse selection should flatten the far-distance '
+            'curve because old blocks remain individually addressable.'),
+        'falsified_if': (
+            'Accuracy is flat or distance-independent for every operator '
+            '(the probe does not exercise long-range memory), or the '
+            'accuracy-vs-distance curve is non-monotone in a way the '
+            'mechanism cannot explain.'),
+    }),
+    ('multi_agg', {
+        'hypothesis': (
+            'Majority-counting is a MULTI-SITE aggregation problem: no '
+            'single-position retrieval solves it; the model must combine '
+            'evidence from all tokens.'),
+        'prediction': (
+            'Dense global aggregation (HCA compressed MQA, any recurrent '
+            'accumulator with slow decay) beats operators whose memory is '
+            'read at one location; ``linear`` stays at chance.'),
+        'falsified_if': (
+            'A no-mixing or single-retrieval-only model matches the '
+            'aggregation-capable operators (the task has a positional '
+            'shortcut), or errors concentrate in ``echoed_last_token`` '
+            '(recency copy rather than aggregation).'),
+    }),
+])
+
+OPERATOR_HYPOTHESES = OrderedDict([
+    ('linear', {
+        'mechanism': 'no token mixing (position-wise MLP only)',
+        'hypothesis': (
+            'CONTROL: without inter-token information flow the target of a '
+            'memory task cannot be computed.'),
+        'predicted_signature': 'chance accuracy on all four probes',
+    }),
+    ('softmax', {
+        'mechanism': 'dense causal attention (exact retrieval over all '
+                     'past tokens)',
+        'hypothesis': (
+            'The simplest mixer is the right upper-bound baseline: full '
+            'attention can represent any past-token lookup exactly, so it '
+            'should win MQAR / kv_update / long_range once trained.'),
+        'predicted_signature': (
+            'highest or near-highest accuracy on recall probes; cost grows '
+            'with T (the trade-off the efficient operators are trying to '
+            'beat).'),
+    }),
+    ('kda', {
+        'mechanism': 'recurrent delta rule with per-channel log-decay '
+                     '(O(1) state)',
+        'hypothesis': (
+            'A delta-rule state implements key-value binding with '
+            'overwrite, saturating its capacity as the number of pairs '
+            'grows.'),
+        'predicted_signature': (
+            'strong on mqar/kv_update at small n_kv, degrading with n_kv; '
+            'no distance-dependent collapse while state capacity suffices.'),
+    }),
+    ('mamba2', {
+        'mechanism': 'selective state-space (SSD) recurrence, O(1) matrix '
+                     'state',
+        'hypothesis': (
+            'A time-varying linear recurrence provides the same O(1)-state '
+            'route with a different (input-selective, non-delta) update '
+            'rule, so it should trade recall precision for stability.'),
+        'predicted_signature': (
+            'competitive with KDA at small n_kv; different failure mix '
+            '(dilution vs overwrite) in the bad-case categories.'),
+    }),
+    ('rwkv7', {
+        'mechanism': 'RWKV-7 delta-style recurrence (third memory route)',
+        'hypothesis': (
+            'An independent delta-style memory implementation should track '
+            'KDA on recall probes; the trio KDA/Mamba-2/RWKV-7 separates '
+            '"delta-style binding" from "the specific KDA implementation".'),
+        'predicted_signature': (
+            'accuracy within the KDA/Mamba-2 band at matched budget.'),
+    }),
+    ('csa', {
+        'mechanism': 'compressed sparse attention: overlapped block KV '
+                     'compression + learned top-k indexer',
+        'hypothesis': (
+            'Sparse per-block retrieval keeps old associations individually '
+            'addressable at bounded cost, so far-distance recall should not '
+            'collapse the way a fixed-size recurrent state does.'),
+        'predicted_signature': (
+            'flat-ish accuracy-vs-distance curve on long_range; errors '
+            'concentrated in indexer selection misses (gold-block recall '
+            'below 1.0) rather than in value dilution.'),
+    }),
+    ('hca', {
+        'mechanism': 'heavy compression + dense MQA over few entries '
+                     '(global aggregation)',
+        'hypothesis': (
+            'Global summarisation should help aggregate tasks (multi_agg) '
+            'and can substitute for exact retrieval when compression is '
+            'fine enough.'),
+        'predicted_signature': (
+            'best or near-best on multi_agg; sharper degradation than CSA '
+            'on mqar/long_range because per-block detail is compressed '
+            'further.'),
+    }),
+])
+
+
 class MQARHead(nn.Module):
     def __init__(self, d_model: int, vocab: int):
         super().__init__()
@@ -870,6 +1049,38 @@ class SoftmaxAttn(nn.Module):
         p = torch.softmax(s, dim=-1)
         out = torch.einsum('bhts,bshv->bthv', p, v)
         return self.o(out.reshape(B, T, self.H * self.V))
+
+
+class NoMixAttn(nn.Module):
+    """Trivial memoryless baseline: an identity token mixer.
+
+    Hypothesis (baseline ladder, experiment-design requirement): a
+    multi-query associative-recall target is a function of the cued key
+    AND of the earlier (key, value) pair, so a model with NO token mixing
+    cannot recover it and must stay at chance. This operator makes that
+    prediction testable with the SAME training recipe as every complex
+    mixer: wrapped in ``ResidualAttnLayer`` it computes
+    ``x + LayerNorm(x)`` per position (a position-wise MLP with no
+    information flow across time), and the head reads only the cue
+    position.
+
+    Role in the comparison
+    ----------------------
+    * ``linear`` is the simplest rung of the baseline ladder. A complex
+      operator that does not beat it is not doing anything useful.
+    * It is NOT a strawman: it gets the same data streams, optimizer, and
+      budget as every other operator, and the tuned-baseline protocol
+      gives it its own learning-rate sweep, so "beats the simple
+      baseline" means beating a properly tuned simple model.
+    * On tasks where it DOES beat chance (e.g. if the target is predictable
+      from the current token alone), the task is confounded and the
+      operator ranking on it is not evidence about memory mechanisms.
+
+    Zero parameters and zero inter-token communication by construction.
+    """
+
+    def forward(self, x):
+        return x
 
 
 class KDAAttn(nn.Module):
@@ -1144,7 +1355,7 @@ class HCAAttn(nn.Module):
 
 def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
                 n_batches=4, batch=64, seed=42, task='mqar',
-                gen_offset=5_000_000):
+                gen_offset=5_000_000, collect_predictions=False):
     """Evaluate accuracy over multiple fresh batches for a stable estimate.
 
     ``task`` selects the synthetic-task generator from ``SYNTHETIC_TASKS``
@@ -1176,6 +1387,14 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
     the error-analysis stream at 7_000_000) monitoring cannot leak into the
     reported result.
 
+    ``collect_predictions`` (default False, historical 2-tuple return)
+    additionally returns the concatenated per-sample ``pred`` / ``target``
+    and per-class ``scores`` tensors (on CPU) so the caller can compute
+    confusion-matrix metrics (macro/micro/weighted F1, per-class
+    precision/recall, PR-AUC / ROC-AUC one-vs-rest) without a second
+    forward pass. The accumulated tensors are detached, so collecting them
+    can never change gradients or global RNG state.
+
     Restores each module's train/eval mode after evaluation so a future
     caller that evaluates mid-training does not silently resume training
     in eval mode (no dropout, BN using running stats).
@@ -1197,6 +1416,7 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
         make_batch = SYNTHETIC_TASKS[task]['make']
         correct, total = 0, 0
         losses = []
+        pred_chunks, target_chunks, score_chunks = [], [], []
         with torch.no_grad():
             for _ in range(n_batches):
                 x_emb, target, cue_pos = make_batch(
@@ -1207,17 +1427,45 @@ def _eval_model(layer, head, embed, seq_len, n_kv, vocab, device,
                 correct += (logits.argmax(-1) == target).sum().item()
                 total += target.numel()
                 losses.append(F.cross_entropy(logits, target).item())
+                if collect_predictions:
+                    pred_chunks.append(logits.argmax(-1).detach().to('cpu'))
+                    target_chunks.append(target.detach().to('cpu'))
+                    score_chunks.append(logits.detach().float().to('cpu'))
         # Guard against n_batches=0 (or batch=0): without this the function
         # raises ZeroDivisionError on ``correct / total`` and
         # ``sum([]) / len([])``. Returns 0.0 for both metrics so the caller
         # gets a finite (if meaningless) value rather than a crash. Mirrors
         # the steps=0 guard in train_one.
         if total == 0 or not losses:
+            if collect_predictions:
+                return 0.0, 0.0, {
+                    'pred': torch.zeros(0, dtype=torch.long),
+                    'target': torch.zeros(0, dtype=torch.long),
+                    'scores': torch.zeros(0, 0),
+                }
             return 0.0, 0.0
-        return correct / total, sum(losses) / len(losses)
+        acc = correct / total
+        mean_loss = sum(losses) / len(losses)
+        if collect_predictions:
+            return acc, mean_loss, {
+                'pred': torch.cat(pred_chunks),
+                'target': torch.cat(target_chunks),
+                'scores': torch.cat(score_chunks),
+            }
+        return acc, mean_loss
     finally:
         for m, was in was_training.items():
             m.train(was)
+
+
+# Operators with NO inter-token communication. They are valid scientific
+# CONTROLS (the chance-accuracy prediction is the point), but the
+# fixed-batch memorization gate does not apply to them: with no cross-token
+# pathway the target is not a deterministic function of the cue, so even a
+# FIXED batch is not memorizable by construction. The gate skips them
+# (recorded as ``skipped``, not passed and not failed) instead of flagging a
+# healthy control as a broken training recipe.
+_MEMORYLESS_OPS = frozenset({'linear'})
 
 
 def _op_factory(op_name, d_model):
@@ -1230,6 +1478,10 @@ def _op_factory(op_name, d_model):
     initialization stream.
     """
     factories = {
+        # Simplest rung of the baseline ladder: no token mixing at all.
+        # Any operator that cannot beat this on a memory task is not
+        # demonstrating a memory mechanism.
+        'linear':  lambda: NoMixAttn(),
         'softmax': lambda: SoftmaxAttn(d_model),
         'kda':     lambda: KDAAttn(d_model),
         'mamba2':  lambda: Mamba2Attn(d_model),
@@ -1468,13 +1720,32 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # Final eval on multiple fresh batches for a stable accuracy estimate.
     # Timed so the results carry an in-experiment inference-cost proxy,
     # used by the efficiency-vs-accuracy (Pareto) annotation in main().
+    # Predictions are collected in the SAME pass (collect_predictions=True)
+    # to compute imbalance-aware metrics (macro/micro/weighted F1,
+    # balanced accuracy, per-class support, one-vs-rest PR-AUC/ROC-AUC)
+    # without a second forward pass.
     eval_t0 = time.time()
-    final_acc, final_loss = _eval_model(
+    final_acc, final_loss, final_eval = _eval_model(
         layer, head, embed, seq_len, n_kv, vocab, device,
         n_batches=eval_batches, batch=eval_batch, seed=seed, task=task,
+        collect_predictions=True,
     )
     final_eval_time_s = time.time() - eval_t0
     chance = 1.0 / vocab
+
+    # Confusion-derived metrics. The MULTI-CLASS synthetic probes are
+    # class-balanced BY CONSTRUCTION (targets uniform over the task's
+    # vocab), but the metrics are reported anyway so (a) the class-balance
+    # assumption is VERIFIED in the record (``class_balance``) instead of
+    # assumed, (b) a collapsed predictor cannot hide behind accuracy, and
+    # (c) the averaging convention of every F1 is explicit. If a future
+    # task variant becomes imbalanced, the same record already carries the
+    # imbalance-robust metrics.
+    final_metrics = None
+    if final_eval['pred'].numel() > 0:
+        final_metrics = multiclass_classification_metrics(
+            final_eval['pred'], final_eval['target'], num_classes=vocab,
+            scores=final_eval['scores'])
 
     # Post-training results analysis, all from streams the training never
     # saw: the held-out validation curve (monitor stream), its
@@ -1504,6 +1775,16 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         'generalization_gap': (
             val_losses[-1] - sum(losses[-10:]) / min(10, len(losses))
             if val_losses and losses else None),
+        # Full confusion-derived metric block (each key names its averaging
+        # convention — see results_analysis.multiclass_classification_metrics)
+        # plus flat convenience keys so a table/DataFrame does not need to
+        # reach into the nested dict.
+        'final_metrics': final_metrics,
+        'final_f1_macro': (final_metrics or {}).get('f1_macro'),
+        'final_f1_weighted': (final_metrics or {}).get('f1_weighted'),
+        'final_balanced_accuracy': (final_metrics or {}).get('balanced_accuracy'),
+        'final_pr_auc_macro_ovr': (final_metrics or {}).get('pr_auc_macro_ovr'),
+        'final_roc_auc_macro_ovr': (final_metrics or {}).get('roc_auc_macro_ovr'),
     }
     # Guard against steps=0 (would crash on accs[-1] / sum([])/0 below).
     # Returns a stub with the eval result and zeros for the training
@@ -2137,6 +2418,12 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 'final_eval_time_s': None,
                 'final_eval_ms_per_sample': None,
                 'generalization_gap': None,
+                'final_metrics': None,
+                'final_f1_macro': None,
+                'final_f1_weighted': None,
+                'final_balanced_accuracy': None,
+                'final_pr_auc_macro_ovr': None,
+                'final_roc_auc_macro_ovr': None,
             })
         # On GPU, clear the CUDA cache between seeds so the allocator does
         # not accumulate freed-but-unreleased blocks across seeds.
@@ -2248,6 +2535,43 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     gaps = [r['generalization_gap'] for r in ok_per_seed
             if r.get('generalization_gap') is not None]
 
+    # Seed-aggregated confusion metrics. Macro and weighted F1 are kept
+    # SEPARATE (they differ under imbalance); micro is omitted here because
+    # for single-label multi-class it is identical to accuracy, which the
+    # row already carries (the per-seed metrics dict records it explicitly).
+    def _seed_metric_mean(key):
+        vals = [r['final_metrics'][key] for r in ok_per_seed
+                if r.get('final_metrics')
+                and r['final_metrics'].get(key) is not None]
+        return float(sum(vals) / len(vals)) if vals else None
+
+    def _seed_metric_std(key):
+        vals = [r['final_metrics'][key] for r in ok_per_seed
+                if r.get('final_metrics')
+                and r['final_metrics'].get(key) is not None]
+        if len(vals) < 2:
+            return None
+        m = sum(vals) / len(vals)
+        var = sum((v - m) ** 2 for v in vals) / (len(vals) - 1)
+        return math.sqrt(var)
+
+    mean_final_metrics = {
+        'f1_macro_mean': _seed_metric_mean('f1_macro'),
+        'f1_macro_std': _seed_metric_std('f1_macro'),
+        'f1_weighted_mean': _seed_metric_mean('f1_weighted'),
+        'f1_weighted_std': _seed_metric_std('f1_weighted'),
+        'balanced_accuracy_mean': _seed_metric_mean('balanced_accuracy'),
+        'pr_auc_macro_ovr_mean': _seed_metric_mean('pr_auc_macro_ovr'),
+        'roc_auc_macro_ovr_mean': _seed_metric_mean('roc_auc_macro_ovr'),
+        'class_balance': ((ok_per_seed[0].get('final_metrics') or {})
+                          .get('class_balance')),
+        'averaging_note': (
+            'F1 variants are labelled explicitly: f1_macro = unweighted '
+            'per-class mean, f1_weighted = support-weighted mean. Micro F1 '
+            'equals accuracy for single-label multi-class and is recorded '
+            'per seed in per_seed[i].final_metrics.f1_micro.'),
+    }
+
     return {
         'op': op_name,
         'task': ok_per_seed[0].get('task', 'mqar'),
@@ -2272,6 +2596,10 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         'ci95_loss': ci_loss,
         'chance_acc': chance,
         't_stat_vs_chance': t_stat,
+        # The lr actually used for every seed of this row (tuned for the
+        # baseline ops, 3e-3 otherwise). Per-seed values live in
+        # per_seed[i]['lr']; they are identical across seeds.
+        'lr': ok_per_seed[0].get('lr', 3e-3),
         'mean_train_time_s': sum(r.get('train_time_s', 0.0)
                                  for r in ok_per_seed) / n,
         'mean_eval_ms_per_sample': sum(
@@ -2283,6 +2611,7 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         },
         'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
         'error_analysis': error_aggregate,
+        'mean_final_metrics': mean_final_metrics,
     }
 
 
@@ -2328,17 +2657,20 @@ def _parse_task_list(env_var, default='mqar'):
     return list(dict.fromkeys(vals))
 
 
-def _parse_op_list(env_var, default='softmax,kda,mamba2,rwkv7,csa,hca'):
+def _parse_op_list(env_var, default='linear,softmax,kda,mamba2,rwkv7,csa,hca'):
     """Parse the operator list for the quality sweep.
 
-    ``MQAR_OPS`` selects which single-layer operators run. The default
-    includes the Mamba-2 AND RWKV-7 routes (the framework's second and
-    third memory operators — the RWKV-7 row is the pure-mixer quality
-    baseline for the KDA-replacement ablation); set
-    ``MQAR_OPS=softmax,kda,csa,hca`` to reproduce the historical
-    four-operator table exactly.
+    ``MQAR_OPS`` selects which single-layer operators run. The default now
+    starts with the SIMPLE-BASELINE LADDER — ``linear`` (no token mixing
+    at all) and ``softmax`` (the simplest mixer) — followed by the
+    complex operators (KDA / Mamba-2 / RWKV-7 / CSA / HCA). Every complex
+    row is compared against the tuned reference baseline, not only
+    against chance; see ``MQAR_BASELINE_*`` below. Set
+    ``MQAR_OPS=softmax,kda,mamba2,rwkv7,csa,hca`` to reproduce the
+    pre-baseline table exactly (or ``MQAR_OPS=softmax,kda,csa,hca`` for
+    the historical four-operator table).
     """
-    valid = ['softmax', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca']
+    valid = ['linear', 'softmax', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca']
     raw = os.environ.get(env_var, default)
     vals = [x.strip() for x in raw.split(',') if x.strip()]
     if not vals:
@@ -2348,6 +2680,142 @@ def _parse_op_list(env_var, default='softmax,kda,mamba2,rwkv7,csa,hca'):
         raise ValueError(
             f'{env_var} includes unknown op(s) {unknown}; valid ops: {valid}.')
     return list(dict.fromkeys(vals))
+
+
+def _parse_lr_list(env_var, default='1e-3,3e-3,1e-2'):
+    """Parse a comma-separated list of positive learning rates from an env var.
+
+    Raises on a malformed / empty list (a silently empty tuning grid would
+    turn the tuning protocol into a no-op).
+    """
+    raw = os.environ.get(env_var, default)
+    vals = []
+    for x in raw.split(','):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            v = float(x)
+        except ValueError:
+            raise ValueError(
+                f'{env_var}={raw!r} must be comma-separated floats, '
+                f'e.g. "1e-3,3e-3,1e-2"')
+        if not (v > 0):
+            raise ValueError(f'{env_var} values must be > 0, got {v!r}')
+        vals.append(v)
+    if not vals:
+        raise ValueError(
+            f'{env_var}={raw!r} must contain at least one learning rate')
+    return list(dict.fromkeys(vals))
+
+
+def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
+                     device, val_every, val_batches, val_batch):
+    """Select a baseline operator's learning rate on the VALIDATION stream.
+
+    Experiment-design requirement: "implement the simplest baseline and TUNE
+    IT WELL" before any complex model is declared better. This runs the
+    baseline over ``lrs`` and picks the rate maximizing the final held-out
+    VALIDATION accuracy (seed + ``_VAL_MONITOR_SEED_OFFSET`` stream), never
+    the headline eval stream (seed + 5M), so selection cannot leak into any
+    reported number. A single lr is selected per operator across all sweep
+    cells (the row schema stays one-lr-per-op); the record keeps the full
+    per-lr grid so the choice is auditable.
+
+    Ties break toward the EARLIER entry in ``lrs`` (keep the more stable /
+    smaller lr by convention, and keep the default 3e-3 grid order).
+
+    Returns ``(best_lr, record)``. ``record`` is JSON-serializable and
+    embedded in the run metadata.
+    """
+    actual_steps = softmax_steps if op_name == 'softmax' else steps
+    # Ensure a validation signal exists even when the sweep disabled the
+    # val monitor (MQAR_VAL_EVERY=0): the tuning runs then use a private
+    # quarter-grid. This cannot change the headline metric — the monitor
+    # stream is disjoint from the eval stream.
+    tune_val_every = int(val_every) if int(val_every or 0) > 0 \
+        else max(1, actual_steps // 4)
+
+    per_lr = OrderedDict()
+    best_lr = lrs[0]
+    best_score = None
+    for lr in lrs:
+        scores = []
+        n_cell_runs_failed = 0
+        for task, n_kv, task_seq_len, task_vocab in sweep:
+            try:
+                r = train_multi_seed(
+                    op_name, n_seeds=n_seeds, steps=steps,
+                    softmax_steps=softmax_steps, device=device,
+                    lr=lr, task=task, n_kv=n_kv, vocab=task_vocab,
+                    seq_len=task_seq_len, val_every=tune_val_every,
+                    val_batches=val_batches, val_batch=val_batch,
+                    error_batches=0)
+            except Exception as e:
+                n_cell_runs_failed += 1
+                logger.warning(
+                    f'    [tune] {op_name} lr={lr:g} {task}/n_kv={n_kv} '
+                    f'FAILED: {e}')
+                continue
+            for seed_row in r.get('per_seed', []):
+                vh = seed_row.get('val_history') or []
+                if vh:
+                    scores.append(float(vh[-1]['acc']))
+        mean_score = (sum(scores) / len(scores)) if scores else None
+        per_lr[f'{lr:g}'] = {
+            'mean_final_val_acc': mean_score,
+            'n_val_points': len(scores),
+            'n_cell_runs_failed': n_cell_runs_failed,
+        }
+        logger.info(
+            f'    [tune] {op_name:8s} lr={lr:g}  '
+            f'val_acc={mean_score if mean_score is None else f"{mean_score:.4f}"} '
+            f'({len(scores)} points, {n_cell_runs_failed} failed cells)')
+        # Strictly-greater: ties keep the earlier (user-order) lr.
+        if mean_score is not None and (best_score is None
+                                       or mean_score > best_score):
+            best_score = mean_score
+            best_lr = lr
+
+    return best_lr, {
+        'op': op_name,
+        'selected_lr': best_lr,
+        'selected_lr_mean_val_acc': best_score,
+        'selection_stream': f'val_monitor_seed+{_VAL_MONITOR_SEED_OFFSET}',
+        'tune_seeds': n_seeds,
+        'tune_val_every': tune_val_every,
+        'lr_grid': per_lr,
+        'note': ('Learning rate selected by held-out validation accuracy '
+                 '(final monitor point), NOT by the headline eval stream; '
+                 'the winning lr is then re-trained with the full seed '
+                 'count. Ties keep the earlier/lower lr.'),
+    }
+
+
+def _paired_one_sided_t(diffs):
+    """One-sided paired t-test statistics for an array of paired differences.
+
+    H1: mean(diffs) > 0 (the candidate beats the reference). Returns a
+    JSON-safe dict. ``t_stat`` is None when undefined (n < 2, or zero
+    variance); in the zero-variance case ``all_positive`` records whether
+    every seed difference was strictly positive so the caller can still
+    treat a unanimous sweep as evidence.
+    """
+    n = len(diffs)
+    if n == 0:
+        return {'n_pairs': 0, 'mean_diff': None, 't_stat': None,
+                'all_positive': False}
+    mean_diff = sum(diffs) / n
+    if n < 2:
+        return {'n_pairs': n, 'mean_diff': mean_diff, 't_stat': None,
+                'all_positive': all(d > 0 for d in diffs)}
+    var = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
+    if var <= 0.0:
+        return {'n_pairs': n, 'mean_diff': mean_diff, 't_stat': None,
+                'all_positive': all(d > 0 for d in diffs)}
+    return {'n_pairs': n, 'mean_diff': mean_diff,
+            't_stat': mean_diff / math.sqrt(var / n),
+            'all_positive': all(d > 0 for d in diffs)}
 
 
 def main():
@@ -2363,9 +2831,45 @@ def main():
     # historical table stays reproducible with MQAR_TASKS=mqar +
     # MQAR_OPS=softmax,kda,csa,hca.
     task_list = _parse_task_list('MQAR_TASKS', 'mqar')
-    ops_list = _parse_op_list('MQAR_OPS', 'softmax,kda,mamba2,rwkv7,csa,hca')
+    # Default ops now include the baseline ladder (linear, softmax) followed
+    # by the complex mixers; see _parse_op_list. The historical table is
+    # reproducible with MQAR_OPS=softmax,kda,mamba2,rwkv7,csa,hca.
+    ops_list = _parse_op_list('MQAR_OPS')
     logger.info(f'  tasks         : {task_list}')
     logger.info(f'  ops           : {ops_list}')
+    # Tuned-baseline protocol (experiment-design requirement). The simple
+    # baselines get their own learning-rate sweep, selected on the held-out
+    # VALIDATION stream, and every complex op is tested against the tuned
+    # reference baseline — not only against chance. MQAR_BASELINE_TUNE=0
+    # restores the historical fixed lr=3e-3 for every op.
+    baseline_tune_enabled = parse_int_env(
+        'MQAR_BASELINE_TUNE', 1, min_value=0, logger=logger) != 0
+    baseline_ops = [x.strip() for x in
+                    os.environ.get('MQAR_BASELINE_OPS', 'linear,softmax')
+                    .split(',') if x.strip()]
+    # Silently intersect with the sweep's op list: naming a baseline op that
+    # is not being swept (e.g. MQAR_OPS without 'linear') is not an error.
+    baseline_ops = [op for op in baseline_ops if op in ops_list]
+    baseline_lrs = _parse_lr_list('MQAR_BASELINE_LRS')
+    # Reference baseline for the paired comparisons. Defaults to softmax
+    # (the simplest mixer); if it is not in the sweep, fall back to the
+    # first swept baseline op. None => no pairwise test possible.
+    _baseline_ref_env = os.environ.get('MQAR_BASELINE_REF')
+    baseline_ref = (_baseline_ref_env or 'softmax').strip()
+    if baseline_ref not in ops_list:
+        if _baseline_ref_env is not None:
+            logger.warning(
+                f'  MQAR_BASELINE_REF={baseline_ref!r} is not in the op '
+                f'list {ops_list}; falling back to the first swept '
+                f'baseline op.')
+        baseline_ref = baseline_ops[0] if baseline_ops else None
+    if baseline_tune_enabled and baseline_ops:
+        logger.info(f'  baseline tune : ops={baseline_ops} '
+                    f'lrs={baseline_lrs} (validation-stream selection); '
+                    f'reference={baseline_ref}')
+    elif not baseline_tune_enabled:
+        logger.info('  baseline tune : OFF (MQAR_BASELINE_TUNE=0; '
+                    'historical fixed lr=3e-3 for every op)')
     # MQAR's task hyperparameters. Lifted to named constants so the
     # chance-accuracy log line below uses the SAME value as the per-seed
     # ``chance = 1.0 / vocab`` computation in ``train_one``.
@@ -2478,6 +2982,27 @@ def main():
         logger.info('=' * 70)
         for task, n_kv, task_seq_len, task_vocab in sweep:
             for op in ops_list:
+                # Memoryless controls cannot memorize a fixed batch BY
+                # CONSTRUCTION (no cross-token pathway; the cue->value map is
+                # not a function of the cue alone), so the gate is skipped
+                # for them — recorded explicitly instead of counted as a
+                # failure. See _MEMORYLESS_OPS.
+                if op in _MEMORYLESS_OPS:
+                    overfit_reports.append({
+                        'passed': None,
+                        'skipped': True,
+                        'op': op, 'task': task, 'n_kv': n_kv,
+                        'steps': overfit_steps, 'seed': overfit_seed,
+                        'lr': 3e-3, 'train_batch': gate_train_batch,
+                        'note': ('Memoryless control: the fixed-batch '
+                                 'memorization criterion does not apply '
+                                 '(no inter-token pathway). Skipped, not '
+                                 'passed.'),
+                    })
+                    logger.info(
+                        f'  [overfit] {op:8s} task={task} n_kv={n_kv}: '
+                        'SKIP (memoryless control; gate not applicable)')
+                    continue
                 try:
                     rep = run_overfit_sanity_check(
                         op, task=task, seq_len=task_seq_len, n_kv=n_kv,
@@ -2560,8 +3085,14 @@ def main():
                               'results/exp4_overfit_gate.json',
                               indent=2, allow_nan=False)
         logger.info('Saved: results/exp4_overfit_gate.json')
+        # Failed = checked cells (not skipped memoryless controls) that did
+        # not pass the memorization criterion.
+        n_gate_checked = sum(1 for r in overfit_reports
+                             if not r.get('skipped'))
+        n_gate_skipped = sum(1 for r in overfit_reports
+                             if r.get('skipped'))
         n_gate_failed = sum(1 for r in overfit_reports
-                            if not r.get('passed'))
+                            if not r.get('passed') and not r.get('skipped'))
         if n_gate_failed:
             logger.error(
                 f'  {n_gate_failed}/{len(overfit_reports)} overfit gate '
@@ -2580,7 +3111,41 @@ def main():
                     'continue (diagnostic-only mode).')
                 return 1
         else:
-            logger.info('  all overfit gate cells PASSED')
+            logger.info(
+                f'  all {n_gate_checked} checked overfit gate cells PASSED'
+                + (f' ({n_gate_skipped} memoryless control cell(s) skipped)'
+                   if n_gate_skipped else ''))
+
+    # ------------------------------------------------------------------
+    # Tuned-baseline protocol (runs BEFORE the sweep): select each baseline
+    # operator's lr on the validation stream, then use it for that op's
+    # rows in the sweep. The selection runs use the shared train_multi_seed
+    # path, so "tuned" means "same recipe, more lr candidates", not a
+    # bespoke pipeline. Disabled with MQAR_BASELINE_TUNE=0 (historical
+    # behavior: fixed lr=3e-3 for every op).
+    # ------------------------------------------------------------------
+    tuned_lrs = {}
+    baseline_tuning = {}
+    if baseline_tune_enabled and baseline_ops:
+        tune_seeds = parse_int_env('MQAR_BASELINE_TUNE_SEEDS',
+                                   min(n_seeds, 2),
+                                   min_value=1, logger=logger)
+        logger.info('\n' + '=' * 70)
+        logger.info('Tuned-baseline protocol: selecting baseline lr on the '
+                    f'validation stream (candidates={baseline_lrs}, '
+                    f'seeds={tune_seeds})')
+        logger.info('=' * 70)
+        for op in baseline_ops:
+            best_lr, rec = tune_baseline_lr(
+                op, baseline_lrs, sweep, steps=steps,
+                softmax_steps=softmax_steps, n_seeds=tune_seeds,
+                device=device, val_every=val_every, val_batches=val_batches,
+                val_batch=val_batch)
+            tuned_lrs[op] = best_lr
+            rec['grid_size'] = len(baseline_lrs)
+            baseline_tuning[op] = rec
+            logger.info(f'  [tune] {op}: selected lr={best_lr:g}')
+        logger.info('=' * 70)
 
     all_results = []
     for task, n_kv, task_seq_len, task_vocab in sweep:
@@ -2605,6 +3170,7 @@ def main():
                                      softmax_steps=softmax_steps, device=device,
                                      n_kv=n_kv, vocab=task_vocab,
                                      seq_len=task_seq_len, task=task,
+                                     lr=tuned_lrs.get(op, 3e-3),
                                      val_every=val_every,
                                      val_batches=val_batches,
                                      val_batch=val_batch,
@@ -2656,27 +3222,31 @@ def main():
                     'ci95_loss': None,
                     'chance_acc': 1.0 / task_vocab,
                     't_stat_vs_chance': None,
+                    'lr': tuned_lrs.get(op, 3e-3),
                     'mean_train_time_s': None,
                     'mean_eval_ms_per_sample': None,
                     'curve_diagnosis_summary': None,
                     'mean_generalization_gap': None,
                     'error_analysis': None,
+                    'mean_final_metrics': None,
                     'pareto': None,
                     'per_seed': [],
                 })
 
-    # Summary table (grouped by task + n_kv). Header is 89 chars wide.
-    print('\n' + '=' * 89)
-    print(f"{'task':>10} | {'n_kv':>4} | {'op':>10} | {'chance':>7} | {'mean_acc':>10} | "
+    # Summary table (grouped by task + n_kv). The lr column makes the
+    # tuned-baseline protocol visible in the headline table: baseline ops
+    # may show a non-default lr selected on the validation stream.
+    print('\n' + '=' * 99)
+    print(f"{'task':>10} | {'n_kv':>4} | {'op':>10} | {'lr':>7} | {'chance':>7} | {'mean_acc':>10} | "
           f"{'+/- CI95':>10} | {'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
-    print('-' * 89)
+    print('-' * 99)
     for r in all_results:
         # Error rows have None for all numeric fields; render them as
         # dashes instead of crashing on ``f'{None:.4f}'``.
         if 'error' in r:
             err_msg = (r.get('error') or '')[:40]
             print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
-                  f"{'-':>7} | {'-':>10} | {'-':>10} | {'-':>8} | {'-':>12} | "
+                  f"{'-':>7} | {'-':>7} | {'-':>10} | {'-':>10} | {'-':>8} | {'-':>12} | "
                   f"{'-':>10}   ERROR: {err_msg}")
             continue
         # ci95_acc may be None when only one seed survived; render 'n/a'.
@@ -2684,8 +3254,9 @@ def main():
             ci_str = f"{r['ci95_acc']:>10.4f}"
         else:
             ci_str = f"{'n/a':>10}"
+        lr_str = f"{r.get('lr', 3e-3):>7.1e}"
         print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
-              f"{r['chance_acc']:>7.4f} | {r['mean_acc']:>10.4f} | "
+              f"{lr_str} | {r['chance_acc']:>7.4f} | {r['mean_acc']:>10.4f} | "
               f"{ci_str} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
     # Fairness annotation: the softmax baseline is trained for
@@ -2766,6 +3337,162 @@ def main():
             r['t_crit_bonferroni'] = None
             r['significant_bonferroni'] = False
 
+    # ------------------------------------------------------------------
+    # Paired comparison vs the tuned reference baseline.
+    #
+    # The vs-chance test above only says "the op learned the task at all".
+    # It does NOT support "the complex op is better than a properly tuned
+    # simple one" — with enough seeds, a tiny difference can be
+    # significant, and the complex model could still lose to a well-tuned
+    # baseline. So every non-baseline op is additionally tested against
+    # the reference baseline on the SAME (task, n_kv) cell with a
+    # SEED-PAIRED one-sided t-test (same seed list => paired). The
+    # family of comparisons is Bonferroni-corrected.
+    #
+    # Flags per row:
+    #   is_baseline          op is a baseline rung (no pairwise test)
+    #   vs_tuned_baseline    {reference_op, n_pairs, mean_diff, t_stat,
+    #                         t_crit_bonferroni, significant, verdict}
+    #   beats_tuned_baseline bool (True only when the paired test is
+    #                        significant in the positive direction);
+    #                        None when not testable (baseline row itself,
+    #                        missing reference row, < 2 paired seeds).
+    # The scientific claim "complex op X is better" requires
+    # beats_tuned_baseline=True; a row significant vs chance but not vs
+    # the tuned baseline is only evidence that the task is learnable.
+    # ------------------------------------------------------------------
+    for r in all_results:
+        r['is_baseline'] = r.get('op') in baseline_ops
+        r['vs_tuned_baseline'] = None
+        r['beats_tuned_baseline'] = None
+        # Attach the pre-registered mechanism hypothesis for this
+        # (task, operator) cell, so every row carries what it was TESTING
+        # (and what would falsify it) next to the number it produced.
+        th = TASK_HYPOTHESES.get(r.get('task', 'mqar'))
+        oh = OPERATOR_HYPOTHESES.get(r.get('op'))
+        r['hypothesis'] = ({'task': th, 'operator': oh}
+                           if (th or oh) else None)
+    baseline_pairwise = {
+        'reference_op': baseline_ref,
+        'baseline_ops': list(baseline_ops),
+        'n_tests': 0,
+        'alpha_bonferroni': None,
+        'comparisons': {},
+        'note': ('Seed-paired one-sided t-test of each non-baseline op vs '
+                 'the reference baseline on the same (task, n_kv) cell '
+                 '(H1: mean per-seed accuracy difference > 0), '
+                 'Bonferroni-corrected over all comparisons. '
+                 'beats_tuned_baseline=True is required before claiming '
+                 'a complex operator is better than the simple baseline.'),
+    }
+    if baseline_ref is not None:
+        ref_by_cell = {
+            (r.get('task', 'mqar'), r['n_kv']): r
+            for r in all_results
+            if r.get('op') == baseline_ref and 'error' not in r
+            and r.get('mean_acc') is not None
+        }
+        comparisons = []
+        for r in all_results:
+            if 'error' in r or r.get('op') == baseline_ref:
+                continue
+            ref = ref_by_cell.get((r.get('task', 'mqar'), r['n_kv']))
+            if ref is None:
+                r['vs_tuned_baseline'] = {
+                    'reference_op': baseline_ref,
+                    'n_pairs': 0,
+                    'mean_diff': None,
+                    't_stat': None,
+                    'significant': False,
+                    'verdict': 'reference_row_unavailable',
+                }
+                continue
+            cand = {s['seed']: s['final_acc']
+                    for s in r.get('per_seed', [])
+                    if 'error' not in s and s.get('final_acc') is not None}
+            base = {s['seed']: s['final_acc']
+                    for s in ref.get('per_seed', [])
+                    if 'error' not in s and s.get('final_acc') is not None}
+            common = sorted(set(cand) & set(base))
+            if len(common) < 2:
+                r['vs_tuned_baseline'] = {
+                    'reference_op': baseline_ref,
+                    'n_pairs': len(common),
+                    'mean_diff': None,
+                    't_stat': None,
+                    'significant': False,
+                    'verdict': 'insufficient_paired_seeds',
+                }
+                continue
+            stats = _paired_one_sided_t([cand[s] - base[s]
+                                         for s in common])
+            stats['reference_op'] = baseline_ref
+            comparisons.append((r, stats))
+        n_pair_tests = len(comparisons)
+        # One-sided family-wise alpha 0.05 over the comparison family.
+        crit_pair = (_bonferroni_crit_q(n_pair_tests, alpha=0.05)
+                     if n_pair_tests else None)
+        for r, stats in comparisons:
+            t = stats.get('t_stat')
+            sig = False
+            if stats.get('mean_diff') is not None and stats['mean_diff'] > 0:
+                if t is not None and crit_pair is not None and t > crit_pair:
+                    sig = True
+                elif (t is None and stats.get('all_positive')
+                      and stats.get('n_pairs', 0) >= 2):
+                    # Zero-variance unanimous improvement (every seed
+                    # strictly better): treat as significant, worst case
+                    # the exact paired test would need a distribution-free
+                    # argument; recorded via t_stat=None.
+                    sig = True
+            stats['t_crit_bonferroni'] = crit_pair
+            stats['significant'] = bool(sig)
+            stats['verdict'] = ('beats_tuned_baseline' if sig
+                                else 'not_significantly_better')
+            r['vs_tuned_baseline'] = stats
+            r['beats_tuned_baseline'] = bool(sig)
+            baseline_pairwise['comparisons'][
+                f"{r.get('task', 'mqar')}/n_kv={r['n_kv']}/{r['op']}"] = stats
+        baseline_pairwise['n_tests'] = n_pair_tests
+        baseline_pairwise['alpha_bonferroni'] = (
+            (0.05 / n_pair_tests) if n_pair_tests else None)
+        if n_pair_tests:
+            n_beat = sum(1 for r in all_results
+                         if r.get('beats_tuned_baseline'))
+            logger.info(f'\n  paired vs tuned baseline ({baseline_ref}): '
+                        f'{n_beat}/{n_pair_tests} comparisons significant '
+                        f'(Bonferroni alpha='
+                        f'{baseline_pairwise["alpha_bonferroni"]:.4f})')
+            for key, stats in baseline_pairwise['comparisons'].items():
+                logger.info(
+                    f"    {key}: d_acc={stats['mean_diff']:+.4f} "
+                    f"(n={stats['n_pairs']}, "
+                    f"t={_fmt_tstat(stats['t_stat'], width=0, prec=2)}) "
+                    f"-> {stats['verdict']}")
+            if n_beat == 0:
+                logger.warning(
+                    '  WARNING: no operator significantly beats the TUNED '
+                    'baseline. Complex-operator superiority is NOT '
+                    'supported on this cell; treat any raw ranking as '
+                    'inconclusive (the baseline may simply be strong '
+                    'enough here).')
+        # Printed baseline-comparison table (stdout, not just logs).
+        print('\nPaired vs tuned baseline (one-sided, Bonferroni-corrected):')
+        print(f"{'task':>10} | {'n_kv':>4} | {'op':>10} | {'ref':>8} | "
+              f"{'d_acc':>8} | {'n':>3} | {'t':>7} | verdict")
+        for r in all_results:
+            st = r.get('vs_tuned_baseline')
+            if 'error' in r or not st:
+                continue
+            d = st.get('mean_diff')
+            d_str = f"{d:+.4f}" if d is not None else 'n/a'
+            print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | "
+                  f"{r['op']:>10} | {st.get('reference_op') or '-':>8} | "
+                  f"{d_str:>8} | {st.get('n_pairs', 0):>3} | "
+                  f"{_fmt_tstat(st.get('t_stat'), width=7, prec=2)} | "
+                  f"{'YES' if st.get('significant') else 'no'}"
+                  f" ({st.get('verdict')})")
+
     # Experiment-level statistical validity summary. Mirrors run_ablation.py
     # but with the appropriate thresholds for the 4-op MQAR sweep.
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
@@ -2803,6 +3530,23 @@ def main():
     logger.info(f'  ops near chance (0.5x-1.5x): {len(near_chance)}/{len(all_results)}')
     logger.info(f'  ops far below chance (<=0.5x): {len(far_below)}/{len(all_results)}')
     logger.info(f'  conclusions_valid: {conclusions_valid}')
+    # Baseline-ladder verdict: how many complex ops actually clear the
+    # tuned reference baseline (the claim-supporting test), separate from
+    # the vs-chance validity above.
+    n_beat_baseline = sum(1 for r in all_results
+                          if r.get('beats_tuned_baseline'))
+    n_complex_rows = sum(1 for r in all_results
+                         if 'error' not in r and not r.get('is_baseline'))
+    if baseline_pairwise.get('n_tests'):
+        logger.info(
+            f'  complex ops beating tuned baseline '
+            f'({baseline_pairwise["reference_op"]}): {n_beat_baseline}/'
+            f'{n_complex_rows} rows '
+            f'({baseline_pairwise["n_tests"]} Bonferroni-corrected paired '
+            f'tests)')
+    else:
+        logger.info('  paired vs tuned baseline: not run '
+                    '(no reference baseline row)')
     if not conclusions_valid:
         logger.warning(
             '  WARNING: The MQAR results do NOT support strong structural\n'
@@ -3021,7 +3765,12 @@ def main():
             },
             'training': {
                 'optimizer': 'AdamW',
+                # Historical fixed lr; the per-op EFFECTIVE lr is in
+                # lr_by_op (baseline ops use their lr selected on the
+                # validation stream when MQAR_BASELINE_TUNE=1).
                 'lr': 3e-3,
+                'lr_by_op': {op: tuned_lrs.get(op, 3e-3)
+                             for op in ops_list},
                 'weight_decay_decay_group': 0.01,
                 'weight_decay_no_decay_group': 0.0,
                 'grad_clip_norm': 1.0,
@@ -3048,7 +3797,62 @@ def main():
                              'acc_per_eval_ms}'),
             },
             'cross_op_claim_check': cross_op_checks,
-            'significance_scope': 'vs_chance_baseline_not_pairwise_between_ops',
+            # Tuned-baseline protocol record: how the simple-baseline lrs
+            # were selected (validation stream, full grid), what they were,
+            # and the seed-paired comparison of every complex op against
+            # the tuned reference baseline. This is the metadata that
+            # supports (or refutes) "the complex model is better".
+            'baseline_protocol': {
+                'enabled': bool(baseline_tune_enabled and baseline_ops),
+                'baseline_ops': list(baseline_ops),
+                'reference_op': baseline_ref,
+                'lr_grid': baseline_lrs,
+                'tune_seeds': (
+                    baseline_tuning[baseline_ops[0]]['tune_seeds']
+                    if baseline_tuning else None),
+                'selection_stream': f'val_monitor_seed+{_VAL_MONITOR_SEED_OFFSET}',
+                'selected_lrs': {op: lr for op, lr in tuned_lrs.items()},
+                'selection_records': baseline_tuning,
+                'pairwise_vs_reference': baseline_pairwise,
+                'headline_required_for_claims': (
+                    'beats_tuned_baseline=True on the paired one-sided '
+                    'Bonferroni-corrected test. A row only significant vs '
+                    'chance may be a learnable task, not evidence that the '
+                    'complex operator is better than a tuned simple one.'),
+                'note': ('Model selection (lr) used ONLY the held-out '
+                         'validation stream (seed +6M), never the headline '
+                         'eval stream (seed +5M); the winning lr is then '
+                         're-trained from scratch with the full seed count. '
+                         'MQAR_BASELINE_TUNE=0 restores the historical '
+                         'fixed lr=3e-3 recipe. The complex operators keep '
+                         'the historical lr=3e-3: the baseline deliberately '
+                         'gets the benefit of tuning, so a complex-operator '
+                         'win over the tuned baseline is conservative '
+                         '(against the complex op).'),
+            },
+            # Pre-registered mechanism hypotheses (fixed in code BEFORE the
+            # numbers were read): what each task probes and what signature
+            # each operator is predicted to show, with the falsification
+            # criterion. The sweep is hypothesis-driven, not a fishing
+            # expedition; each result row carries its own copy.
+            'hypotheses': {
+                'tasks': {t: dict(TASK_HYPOTHESES[t])
+                          for t in task_list if t in TASK_HYPOTHESES},
+                'operators': {op: dict(OPERATOR_HYPOTHESES[op])
+                              for op in ops_list
+                              if op in OPERATOR_HYPOTHESES},
+                'note': ('Pre-registered in run_quality.TASK_HYPOTHESES / '
+                         'OPERATOR_HYPOTHESES. Statistical claims: a complex '
+                         'op "beats" the baseline only if '
+                         'beats_tuned_baseline=True (paired, Bonferroni); '
+                         'a row significant vs chance but not vs the tuned '
+                         'baseline only shows the task is learnable.'),
+            },
+            'significance_scope': (
+                'vs_chance_baseline_and_seed_paired_vs_tuned_reference_'
+                'baseline'
+                if baseline_pairwise.get('n_tests')
+                else 'vs_chance_baseline_not_pairwise_between_ops'),
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,

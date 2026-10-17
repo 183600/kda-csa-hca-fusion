@@ -26,12 +26,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from results_analysis import (  # noqa: E402
     lm_token_diagnostics,
     annotate_rows_with_pareto,
+    binary_ranking_metrics,
     diagnose_nonfinite,
     diagnose_training_curves,
+    multiclass_classification_metrics,
     pareto_frontier,
     summarize_lm_diagnostics,
 )
-from run_quality import _classify_task_errors, train_one  # noqa: E402
+from run_quality import (  # noqa: E402
+    _classify_task_errors,
+    _paired_one_sided_t,
+    train_one,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +201,133 @@ def test_pareto_frontier_skips_missing_costs():
 
 
 # ---------------------------------------------------------------------------
+# Imbalance-aware classification / ranking metrics
+# ---------------------------------------------------------------------------
+
+def test_multiclass_metrics_expose_accuracy_hiding_collapse():
+    """90% accuracy from a collapsed predictor must not look good.
+
+    The metric block exists so an imbalanced / collapsed result cannot
+    hide behind accuracy: macro F1 and balanced accuracy must expose it,
+    and every F1 variant must be labelled with its averaging convention.
+    """
+    # 90 samples of class 0 + one sample of each class 1..10; the model
+    # always predicts class 0. 90% accuracy, but only 1 of 11 classes is
+    # ever recalled.
+    target = torch.cat([torch.zeros(90, dtype=torch.long),
+                        torch.arange(1, 11)])
+    pred = torch.zeros(100, dtype=torch.long)
+    m = multiclass_classification_metrics(pred, target, num_classes=11)
+    assert m['accuracy'] == pytest.approx(0.9)
+    assert m['f1_micro'] == pytest.approx(m['accuracy'])
+    # Macro averaging (unweighted over classes) exposes the collapse:
+    # class 0 recall is 1.0 (balanced accuracy = 1/11), its precision is
+    # 90/100 (the predictor also claims the 10 minority samples), so
+    # F1_class0 = 2*0.9/1.9 = 0.947...; the other 10 classes have F1 0.0.
+    assert m['balanced_accuracy'] == pytest.approx(1 / 11)
+    assert m['f1_macro'] == pytest.approx((2 * 0.9 / 1.9) / 11)
+    # Support-weighted averaging mostly shows the dominant class.
+    assert m['f1_weighted'] == pytest.approx(0.9 * (2 * 0.9 / 1.9))
+    # Explicit averaging labels and per-class support are recorded.
+    assert 'macro' in m['averaging_note'] and 'micro' in m['averaging_note']
+    assert sum(c['support'] for c in m['per_class']) == m['n_samples']
+    # class_balance = max support / min support (90 / 1 here).
+    assert m['class_balance'] == pytest.approx(90.0)
+
+
+def test_multiclass_metrics_perfect_and_single_class():
+    target = torch.tensor([0, 1, 2, 0, 1, 2])
+    pred = target.clone()
+    m = multiclass_classification_metrics(pred, target, num_classes=3,
+                                          scores=torch.nn.functional.one_hot(
+                                              target, 3).double())
+    assert m['accuracy'] == 1.0
+    assert m['f1_macro'] == pytest.approx(1.0)
+    assert m['f1_weighted'] == pytest.approx(1.0)
+    assert m['pr_auc_macro_ovr'] == pytest.approx(1.0)
+    assert m['roc_auc_macro_ovr'] == pytest.approx(1.0)
+    # A single class present: accuracy is defined, one-vs-rest AUCs are
+    # undefined for every class (no negatives / no positives) -> reported
+    # as None, never 0.0 or NaN.
+    one = multiclass_classification_metrics(
+        torch.zeros(4, dtype=torch.long), torch.zeros(4, dtype=torch.long),
+        num_classes=3, scores=torch.zeros(4, 3))
+    assert one['accuracy'] == 1.0
+    assert one['pr_auc_macro_ovr'] is None
+    assert one['roc_auc_macro_ovr'] is None
+    assert one['balanced_accuracy'] == pytest.approx(1.0)
+
+
+def test_binary_ranking_metrics_rare_positive_and_ties():
+    # 1 positive among 100 candidates: PR-AUC is the informative metric.
+    labels = torch.zeros(100, dtype=torch.long)
+    labels[7] = 1
+    perfect = torch.zeros(100)
+    perfect[7] = 1.0
+    m = binary_ranking_metrics(perfect, labels)
+    assert m['pr_auc'] == pytest.approx(1.0)
+    assert m['roc_auc'] == pytest.approx(1.0)
+    assert m['mrr'] == pytest.approx(1.0)
+    assert m['recall_at_1'] == pytest.approx(1.0)
+    assert m['chance_pr_auc'] == pytest.approx(0.01)
+    # All-equal (for example quantized) scores: ROC-AUC is the exact chance
+    # value 0.5 thanks to average-rank tie handling. PR-AUC breaks ties by
+    # candidate order (stable sort): the positive sits at index 7, so the
+    # first 8 ranked slots contain exactly one hit -> AP = 1/8, and MRR
+    # follows the same deterministic tie order.
+    tied = binary_ranking_metrics(torch.zeros(100), labels)
+    assert tied['roc_auc'] == pytest.approx(0.5)
+    assert tied['pr_auc'] == pytest.approx(1 / 8)
+    assert tied['mrr'] == pytest.approx(1 / 8)
+    assert tied['recall_at_1'] is False
+    # No positives at all: ranking metrics are undefined (None).
+    none_pos = binary_ranking_metrics(torch.rand(10), torch.zeros(10,
+                                                                  dtype=torch.long))
+    assert none_pos['pr_auc'] is None and none_pos['roc_auc'] is None
+    # valid mask removes causally unavailable candidates.
+    scores = torch.tensor([0.9, 0.1, 0.1])
+    labels = torch.tensor([0, 1, 0])
+    masked = binary_ranking_metrics(scores, labels,
+                                    valid=torch.tensor([False, True, True]))
+    assert masked['n'] == 2 and masked['n_pos'] == 1
+
+
+def test_tune_baseline_lr_selects_on_validation_stream():
+    """Baseline lr selection must run on the held-out monitor stream."""
+    from run_quality import tune_baseline_lr
+
+    sweep = [('mqar', 1, 16, 16)]
+    best, rec = tune_baseline_lr(
+        'linear', [1e-3, 1e-2], sweep, steps=10, softmax_steps=10,
+        n_seeds=1, device='cpu', val_every=5, val_batches=1, val_batch=16)
+    assert best in (1e-3, 1e-2)
+    assert rec['selected_lr'] == best
+    assert rec['selection_stream'] == 'val_monitor_seed+6000000'
+    assert set(rec['lr_grid']) == {'0.001', '0.01'}
+    for entry in rec['lr_grid'].values():
+        assert entry['n_val_points'] == 1
+        assert entry['mean_final_val_acc'] is not None
+        assert entry['n_cell_runs_failed'] == 0
+
+
+def test_paired_one_sided_t_math_and_degenerate_cases():
+    stats = _paired_one_sided_t([0.1, 0.2, 0.3])
+    assert stats['n_pairs'] == 3
+    assert stats['mean_diff'] == pytest.approx(0.2)
+    # mean 0.2, sample std 0.1, n 3 -> t = 0.2 / (0.1 / sqrt(3)).
+    assert stats['t_stat'] == pytest.approx(0.2 / (0.1 / (3 ** 0.5)))
+    assert stats['all_positive'] is True
+    # Zero-variance unanimous improvement: t undefined, but the caller
+    # still has ``all_positive`` as evidence.
+    flat = _paired_one_sided_t([0.5, 0.5, 0.5])
+    assert flat['t_stat'] is None and flat['all_positive'] is True
+    neg = _paired_one_sided_t([-0.1, -0.2])
+    assert neg['all_positive'] is False
+    assert _paired_one_sided_t([])['n_pairs'] == 0
+    assert _paired_one_sided_t([0.3])['t_stat'] is None
+
+
+# ---------------------------------------------------------------------------
 # run_quality wiring
 # ---------------------------------------------------------------------------
 
@@ -212,6 +345,30 @@ def test_monitoring_does_not_change_training_results():
     assert len(monitored['val_history']) == 4  # steps 0, 10, 20 + final 25
     assert monitored['curve_diagnosis']['verdict'] in {
         'healthy', 'overfitting', 'underfitting', 'diverged'}
+
+
+def test_train_one_records_confusion_and_ranking_metrics():
+    """Every per-seed record must carry the imbalance-aware metric block.
+
+    Exercises the new simplest baseline ('linear', no token mixing) so the
+    metric wiring is also pinned on the identity-mixer path.
+    """
+    r = train_one('linear', seed=3, steps=10, device='cpu',
+                  eval_batches=1, eval_batch=32)
+    fm = r['final_metrics']
+    assert fm is not None
+    assert fm['n_samples'] == 32
+    # Averaging conventions are explicit in the key names.
+    for key in ('accuracy', 'balanced_accuracy', 'f1_macro', 'f1_micro',
+                'f1_weighted', 'precision_macro', 'recall_macro',
+                'precision_weighted', 'recall_weighted',
+                'pr_auc_macro_ovr', 'roc_auc_macro_ovr', 'per_class',
+                'class_balance', 'averaging_note'):
+        assert key in fm, key
+    # Same pass, same batches: the metric accuracy equals the headline acc.
+    assert fm['accuracy'] == pytest.approx(r['final_acc'])
+    assert fm['f1_micro'] == pytest.approx(fm['accuracy'])
+    assert sum(c['support'] for c in fm['per_class']) == fm['n_samples']
 
 
 def test_error_classification_mqar_layout():

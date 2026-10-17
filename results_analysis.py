@@ -16,6 +16,16 @@ number and move on":
    operators are dominated once parameter count and train time are taken
    into account, so a small accuracy gain at a large cost is visible in
    the results rather than buried in a separate latency experiment.
+4. :func:`multiclass_classification_metrics` — confusion-matrix metrics
+   with the averaging convention EXPLICIT in every key name (macro /
+   micro / weighted), plus balanced accuracy and per-class support, so a
+   multi-class result can never be read as "some F1" without knowing
+   which F1 it is (the three differ substantially under imbalance).
+5. :func:`binary_ranking_metrics` — threshold-free ranking metrics
+   (PR-AUC / average precision, ROC-AUC with tie correction, MRR,
+   recall@1) for binary retrieval-style decisions whose positives are
+   rare. PR-AUC is the primary metric in that regime: with a huge
+   negative base, FPR grows slowly and ROC-AUC stays optimistic.
 
 All functions are pure (no RNG, no global state) so they can be called
 from training loops, tests, and notebooks without perturbing an
@@ -888,3 +898,354 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
                  'failures / novel tokens, and the repeat-distance curve '
                  'localizes long-range retrieval failures.'),
     }
+
+
+# ---------------------------------------------------------------------------
+# Classification / ranking metrics
+# ---------------------------------------------------------------------------
+#
+# Design rules (scientific-methodology contract):
+#
+#   * The averaging convention is part of the metric NAME. ``f1_macro`` is
+#     NOT comparable to ``f1_weighted`` under class imbalance, and a bare
+#     "F1" is ambiguous — callers must pick one and the JSON says which.
+#   * Undefined values are ``None`` (never 0.0 / NaN): a class with no
+#     support has undefined recall, and a ranking with only positives (or
+#     only negatives) has undefined AUC. Emitting 0.0 would silently drag
+#     an average down; emitting NaN would break strict JSON.
+#   * Accuracy is reported alongside the F1 variants but is never the only
+#     metric: under imbalance it hides a collapsed predictor that always
+#     predicts the majority class (high accuracy, near-zero minority F1).
+
+
+def confusion_matrix(pred, target, *, num_classes: int | None = None):
+    """Integer confusion matrix ``C[i, j] = #(target == i, pred == j)``.
+
+    Returns a ``[num_classes, num_classes]`` ``torch.long`` tensor on CPU.
+    ``num_classes`` defaults to ``max(observed class ids) + 1``; pass it
+    explicitly to include classes that never appear in this sample (their
+    rows/columns stay zero, which is exactly the evidence needed to detect
+    a class that is never predicted).
+    """
+    pred = torch.as_tensor(pred, dtype=torch.long).reshape(-1)
+    target = torch.as_tensor(target, dtype=torch.long).reshape(-1)
+    if pred.numel() != target.numel():
+        raise ValueError(
+            f'pred/target length mismatch: {pred.numel()} vs {target.numel()}')
+    if target.numel() and int(target.min()) < 0:
+        raise ValueError('target contains negative class ids')
+    if pred.numel() and int(pred.min()) < 0:
+        raise ValueError('pred contains negative class ids')
+    if num_classes is None:
+        max_id = int(max(pred.max(), target.max()).item()) if pred.numel() else -1
+        num_classes = max_id + 1
+    num_classes = int(num_classes)
+    if num_classes < 0:
+        raise ValueError(f'num_classes={num_classes} must be >= 0')
+    if num_classes == 0:
+        return torch.zeros(0, 0, dtype=torch.long)
+    flat = target * num_classes + pred
+    counts = torch.bincount(flat, minlength=num_classes * num_classes)
+    return counts.reshape(num_classes, num_classes).to(dtype=torch.long)
+
+
+def _prf(tp: float, fp: float, fn: float):
+    """(precision, recall, f1) with the standard zero_division=0 convention.
+
+    A class that OCCURS in the targets but is never predicted gets
+    precision/recall/f1 = 0.0 (the degenerate predictor is exactly what
+    these metrics must expose, not hide behind ``None``). ``None`` is
+    reserved for a class absent from both the targets and the
+    predictions, where the metric is genuinely undefined.
+    """
+    if (tp + fp) > 0:
+        precision = tp / (tp + fp)
+    else:
+        precision = 0.0 if fn > 0 else None
+    if (tp + fn) > 0:
+        recall = tp / (tp + fn)
+    else:
+        recall = 0.0 if fp > 0 else None
+    if precision is None or recall is None:
+        f1 = None
+    elif (precision + recall) > 0:
+        f1 = 2.0 * precision * recall / (precision + recall)
+    else:
+        f1 = 0.0
+    return precision, recall, f1
+
+
+_AVERAGING_NOTE = (
+    'macro = unweighted mean over classes with support > 0; micro = global '
+    'tp/fp/fn counts (equals accuracy for single-label multi-class); '
+    'weighted = support-weighted per-class mean. Under class imbalance the '
+    'three can disagree substantially; prefer macro/balanced accuracy for '
+    'minority-class behaviour, and PR-AUC over ROC-AUC when positives are '
+    'rare.')
+
+
+def _mean_defined(values: Sequence[float | None]) -> float | None:
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    return float(sum(present) / len(present))
+
+
+def multiclass_classification_metrics(pred, target, *, num_classes: int | None = None,
+                                      scores=None) -> dict:
+    """Confusion-derived metrics with EXPLICIT averaging conventions.
+
+    Parameters
+    ----------
+    pred, target : array-like[int], shape [N]
+        Hard predictions and ground-truth labels (single-label
+        multi-class; ``ignore_index`` positions must be filtered by the
+        caller).
+    num_classes : int, optional
+        Class count; defaults to ``max(observed) + 1``.
+    scores : array-like[float], shape [N, C], optional
+        Per-class scores/probabilities. When given, one-vs-rest PR-AUC and
+        ROC-AUC are computed per class and macro-averaged over classes
+        with support > 0 (that is the imbalance-robust summary).
+
+    Returns
+    -------
+    dict with, among others (all keys carry their averaging rule):
+
+      * ``accuracy`` and ``balanced_accuracy`` (macro recall);
+      * ``precision_macro`` / ``recall_macro`` / ``f1_macro`` — unweighted
+        mean over classes that actually occur (support > 0);
+      * ``micro_*`` — global tp/fp/fn counts. For single-label multi-class
+        micro precision/recall/F1 all equal ``accuracy``; kept explicit so
+        the JSON cannot be misread;
+      * ``weighted_*`` — support-weighted mean (equivalent to micro for
+        single-label multi-class but computed per class, so per-class
+        degenerate classes with support 0 are excluded rather than
+        counted as 0);
+      * ``per_class`` — support / precision / recall / f1 per class;
+      * ``class_balance`` — max/min per-class support ratio (1.0 = balanced;
+        large values flag the imbalance that makes accuracy misleading);
+      * ``pr_auc_macro_ovr`` / ``roc_auc_macro_ovr`` — only with
+        ``scores``; PR-AUC is the preferred summary under imbalance.
+    """
+    cm = confusion_matrix(pred, target, num_classes=num_classes)
+    num_classes = int(cm.shape[0])
+    n = int(cm.sum().item())
+    if n == 0:
+        return {
+            'n_samples': 0, 'num_classes': num_classes,
+            'accuracy': None, 'balanced_accuracy': None,
+            'precision_macro': None, 'recall_macro': None, 'f1_macro': None,
+            'precision_micro': None, 'recall_micro': None, 'f1_micro': None,
+            'precision_weighted': None, 'recall_weighted': None,
+            'f1_weighted': None,
+            'per_class': [], 'class_balance': None,
+            'averaging_note': _AVERAGING_NOTE,
+        }
+
+    tp = cm.diag()
+    fp = cm.sum(0) - tp
+    fn = cm.sum(1) - tp
+    support = cm.sum(1)
+
+    per_class = []
+    precisions, recalls, f1s = [], [], []
+    for c in range(num_classes):
+        p, r, f = _prf(float(tp[c]), float(fp[c]), float(fn[c]))
+        per_class.append({
+            'class': c,
+            'support': int(support[c]),
+            'predicted': int(tp[c] + fp[c]),
+            'precision': p,
+            'recall': r,
+            'f1': f,
+        })
+        # Macro averages only over classes that actually occur in the
+        # targets (support > 0): a class absent from this held-out sample
+        # has an undefined metric, and folding a 0.0 in would fabricate a
+        # penalty. This is the convention named in the key ``_macro``.
+        if int(support[c]) > 0:
+            precisions.append(p)
+            recalls.append(r)
+            f1s.append(f)
+
+    accuracy = float(tp.sum().item()) / n
+    balanced_accuracy = _mean_defined(recalls)
+
+    sum_tp = float(tp.sum())
+    sum_fp = float(fp.sum())
+    sum_fn = float(fn.sum())
+    p_micro, r_micro, f_micro = _prf(sum_tp, sum_fp, sum_fn)
+
+    total_support = float(support.sum().item())
+
+    def _weighted(values):
+        # ``values`` must be indexed by CLASS ID (e.g. the per-class
+        # precision/recall/f1 pulled out of ``per_class``), not a compact
+        # support>0 list — the weights below are per-class supports.
+        if total_support <= 0:
+            return None
+        num = 0.0
+        present = False
+        for c in range(num_classes):
+            v = values[c]
+            if v is None or int(support[c]) <= 0:
+                continue
+            present = True
+            num += (float(support[c]) / total_support) * v
+        # The weights over support>0 classes sum to 1 by construction; a
+        # None entry means that class never appeared in targets or
+        # predictions and was excluded from the average entirely.
+        return float(num) if present else None
+
+    nonzero_support = [int(s) for s in support.tolist() if s > 0]
+    class_balance = None
+    if nonzero_support:
+        class_balance = (max(nonzero_support) / min(nonzero_support)
+                         if min(nonzero_support) > 0 else None)
+
+    report = {
+        'n_samples': n,
+        'num_classes': num_classes,
+        'accuracy': accuracy,
+        'balanced_accuracy': balanced_accuracy,
+        'precision_macro': _mean_defined(precisions),
+        'recall_macro': _mean_defined(recalls),
+        'f1_macro': _mean_defined(f1s),
+        'precision_micro': p_micro,
+        'recall_micro': r_micro,
+        'f1_micro': f_micro,
+        'precision_weighted': _weighted(
+            [pc['precision'] for pc in per_class]),
+        'recall_weighted': _weighted([pc['recall'] for pc in per_class]),
+        'f1_weighted': _weighted([pc['f1'] for pc in per_class]),
+        'per_class': per_class,
+        'class_balance': class_balance,
+        'averaging_note': _AVERAGING_NOTE,
+    }
+
+    if scores is not None:
+        scores_t = torch.as_tensor(scores, dtype=torch.float32)
+        if scores_t.ndim != 2 or scores_t.shape[1] != num_classes:
+            raise ValueError(
+                f'scores must be [N, {num_classes}], got '
+                f'{tuple(scores_t.shape)}')
+        target_t = torch.as_tensor(target, dtype=torch.long).reshape(-1)
+        pr_aucs, roc_aucs = [], []
+        for c in range(num_classes):
+            if int(support[c]) <= 0:
+                continue
+            labels = (target_t == c)
+            sub = binary_ranking_metrics(scores_t[:, c], labels)
+            pr_aucs.append(sub['pr_auc'])
+            roc_aucs.append(sub['roc_auc'])
+        report['pr_auc_macro_ovr'] = _mean_defined(pr_aucs)
+        report['roc_auc_macro_ovr'] = _mean_defined(roc_aucs)
+    return report
+
+
+def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
+    """Threshold-free ranking metrics for a binary decision / retrieval.
+
+    ``scores`` is a 1-D score per candidate (higher = more likely
+    positive), ``labels`` the 0/1 ground truth. ``valid`` optionally masks
+    candidates (e.g. causally unavailable blocks) out of the ranking.
+
+    Metrics
+    -------
+    pr_auc
+        Average precision (area under the precision-recall curve, step
+        interpolation). PRIMARY metric when positives are rare: ROC-AUC
+        stays high because FPR grows slowly over a huge negative base,
+        while PR-AUC drops toward prevalence as the ranking degrades.
+    roc_auc
+        Mann-Whitney U / rank statistic with average ranks for ties.
+    mrr
+        Reciprocal rank of the highest-scored positive (1.0 = best).
+    recall_at_1 / precision_at_1
+        Same number for a single relevant item: is the top-ranked
+        candidate positive.
+    chance_pr_auc / chance_roc_auc
+        Chance references (prevalence / 0.5) so a number can be judged.
+
+    Returns ``None`` for pr_auc / roc_auc / mrr when the sample has only
+    one class (undefined), never 0.0 or NaN. Equal scores are handled
+    deterministically: ROC-AUC uses average ranks (tie-corrected);
+    PR-AUC breaks ties by candidate order — document/track that when
+    scores come from a quantized model.
+    """
+    scores_t = torch.as_tensor(scores, dtype=torch.float64).reshape(-1)
+    labels_t = torch.as_tensor(labels).reshape(-1).to(dtype=torch.bool)
+    if scores_t.numel() != labels_t.numel():
+        raise ValueError(
+            f'scores/labels length mismatch: {scores_t.numel()} vs '
+            f'{labels_t.numel()}')
+    if valid is not None:
+        valid_t = torch.as_tensor(valid).reshape(-1).to(dtype=torch.bool)
+        if valid_t.numel() != scores_t.numel():
+            raise ValueError('valid mask length mismatch')
+        scores_t = scores_t[valid_t]
+        labels_t = labels_t[valid_t]
+
+    n = int(scores_t.numel())
+    n_pos = int(labels_t.sum().item())
+    n_neg = n - n_pos
+    prevalence = (n_pos / n) if n else None
+    report = {
+        'n': n,
+        'n_pos': n_pos,
+        'n_neg': n_neg,
+        'prevalence': prevalence,
+        'pr_auc': None,
+        'roc_auc': None,
+        'mrr': None,
+        'recall_at_1': None,
+        'precision_at_1': None,
+        'chance_pr_auc': prevalence,
+        'chance_roc_auc': 0.5 if n else None,
+        'note': ('PR-AUC is the primary metric when positives are rare; '
+                 'ROC-AUC is optimistic under a large negative base.'),
+    }
+    if n_pos == 0 or n_neg == 0:
+        return report
+
+    # ---- ROC-AUC via average ranks (tie-corrected) -------------------
+    order = torch.argsort(scores_t)
+    sorted_scores = scores_t[order]
+    diff = torch.ones(n, dtype=torch.bool)
+    diff[1:] = sorted_scores[1:] != sorted_scores[:-1]
+    group_id = diff.cumsum(0) - 1
+    group_sizes = torch.bincount(group_id)
+    group_starts = torch.cat([
+        torch.zeros(1, dtype=torch.long),
+        group_sizes.cumsum(0)[:-1],
+    ]).to(dtype=torch.float64)
+    avg_rank_sorted = (group_starts[group_id]
+                       + (group_sizes[group_id].to(dtype=torch.float64) + 1.0) / 2.0)
+    avg_rank = torch.empty(n, dtype=torch.float64)
+    avg_rank[order] = avg_rank_sorted
+    rank_sum_pos = float(avg_rank[labels_t].sum().item())
+    roc_auc = ((rank_sum_pos - n_pos * (n_pos + 1) / 2.0)
+               / (n_pos * n_neg))
+    report['roc_auc'] = float(roc_auc)
+
+    # ---- PR-AUC (average precision, step interpolation) --------------
+    # Descending score order; ties broken by candidate index so the
+    # result is deterministic across runs (torch.sort is not guaranteed
+    # stable for all backends).
+    order_desc = torch.argsort(scores_t, descending=True, stable=True)
+    labels_desc = labels_t[order_desc].to(dtype=torch.float64)
+    tp_cum = torch.cumsum(labels_desc, dim=0)
+    k = torch.arange(1, n + 1, dtype=torch.float64)
+    precision_k = tp_cum / k
+    recall_k = tp_cum / n_pos
+    recall_prev = torch.cat([torch.zeros(1, dtype=torch.float64),
+                             recall_k[:-1]])
+    report['pr_auc'] = float(((recall_k - recall_prev) * precision_k).sum().item())
+
+    # ---- MRR / recall@1 ---------------------------------------------
+    first_pos_rank = int(torch.nonzero(labels_desc, as_tuple=False)[0].item()) + 1
+    report['mrr'] = 1.0 / first_pos_rank
+    report['recall_at_1'] = bool(labels_desc[0].item())
+    report['precision_at_1'] = float(labels_desc[0].item())
+    return report
