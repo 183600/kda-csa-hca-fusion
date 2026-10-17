@@ -19,6 +19,14 @@ matters for long-context inference) in addition to prefill:
 Note: the *trend* (flat vs growing with context) is the signal, not the
 absolute microseconds: the operator curves are interpreted by shape
 rather than by absolute value.
+
+Each row additionally carries a **decode-state certificate** measured
+from the live tensors after the decode loop (``decode_state_bytes`` /
+``decode_state_allocated_bytes`` / ``decode_state_breakdown``), and the
+run envelope records a per-op ``metadata.decode_state_certificate``
+classifying each operator's state as constant (KDA / Mamba-2 / RWKV-7)
+or growing (softmax KV / CSA-HCA compressed caches). See
+``docs/decoding-state-certificate.md``.
 """
 
 from __future__ import annotations
@@ -97,6 +105,89 @@ def _clear_cache(device):
         torch.cuda.reset_peak_memory_stats(device)
 
 
+def _tensor_nbytes(t):
+    """Bytes retained by a tensor (0 for ``None``)."""
+    return 0 if t is None else int(t.numel() * t.element_size())
+
+
+def _fixed_state_breakdown(components):
+    """JSON-safe breakdown for a fixed-shape decode state.
+
+    ``components`` maps a component name to an optional tensor. Every
+    component is fully live (fixed recurrent state / lookback), so
+    allocated == valid. Mirrors the ``nbytes_breakdown()`` shape of the
+    incremental caches and ``Mamba2DecodingState``.
+    """
+    out = {}
+    total = 0
+    for name, tensor in components.items():
+        nb = _tensor_nbytes(tensor)
+        out[name] = {'allocated_bytes': nb, 'valid_bytes': nb}
+        total += nb
+    return {
+        'components': out,
+        'allocated_bytes': total,
+        'valid_bytes': total,
+    }
+
+
+def _cache_state_breakdown(cache):
+    """Translate an incremental cache's ``nbytes_breakdown()`` into the
+    uniform ``{'components', 'allocated_bytes', 'valid_bytes'}`` shape."""
+    if cache is None:
+        return {'components': {}, 'allocated_bytes': 0, 'valid_bytes': 0}
+    bd = cache.nbytes_breakdown()
+    components = {}
+    for key in ('compressed_kv', 'indexer_kv', 'sliding_window',
+                'partial_tail', 'overlap'):
+        alloc = bd.get(f'{key}_allocated_bytes')
+        if alloc is None:
+            continue
+        components[key] = {
+            'allocated_bytes': alloc,
+            'valid_bytes': bd[f'{key}_valid_bytes'],
+        }
+    return {
+        'components': components,
+        'allocated_bytes': bd['total_allocated_bytes'],
+        'valid_bytes': bd['total_valid_bytes'],
+    }
+
+
+def _decode_state_certificate(results, prefill_lens):
+    """Per-op state-size growth certificate from the measured rows.
+
+    Classifies each operator as ``'constant'`` (valid decode-state bytes
+    identical at every prefill length — the recurrent-state claim) or
+    ``'growing'`` (the softmax KV cache and the CSA/HCA compressed-block
+    caches), recording the per-length byte counts so the classification
+    is auditable rather than asserted.
+    """
+    ops = []
+    for r in results:
+        op = r.get('op')
+        if 'error' not in r and isinstance(op, str) and op not in ops:
+            ops.append(op)
+    cert = {}
+    for op in ops:
+        rows = {r.get('prefill_len'): r for r in results
+                if r.get('op') == op and 'error' not in r
+                and r.get('decode_state_bytes') is not None}
+        by_len = {str(p): rows[p]['decode_state_bytes']
+                  for p in prefill_lens if p in rows}
+        if not by_len:
+            continue
+        values = list(by_len.values())
+        constant = len(set(values)) == 1
+        cert[op] = {
+            'bytes_by_prefill_len': by_len,
+            'classification': 'constant' if constant else 'growing',
+            'max_over_min': (
+                max(values) / min(values) if min(values) > 0 else None),
+        }
+    return cert
+
+
 class SoftmaxAttnDecoding(nn.Module):
     """Softmax attention that caches K/V for autoregressive decoding.
 
@@ -150,6 +241,26 @@ class SoftmaxAttnDecoding(nn.Module):
         self._cache_k = None
         self._cache_v = None
         self._cache_len = 0
+
+    def state_nbytes(self):
+        """Live KV-cache bytes: Grows linearly with the cached context."""
+        k, v = self._cache_k, self._cache_v
+        if k is None or v is None:
+            return {'components': {}, 'allocated_bytes': 0, 'valid_bytes': 0}
+        esize = k.element_size()
+        valid_len = min(self._cache_len, k.shape[1])
+        valid_k = int(valid_len * k.shape[0] * self.H * self.K * esize)
+        valid_v = int(valid_len * v.shape[0] * self.H * self.V * esize)
+        return {
+            'components': {
+                'cache_k': {'allocated_bytes': _tensor_nbytes(k),
+                            'valid_bytes': valid_k},
+                'cache_v': {'allocated_bytes': _tensor_nbytes(v),
+                            'valid_bytes': valid_v},
+            },
+            'allocated_bytes': _tensor_nbytes(k) + _tensor_nbytes(v),
+            'valid_bytes': valid_k + valid_v,
+        }
 
     def _ensure_cache_capacity(self, B, needed_len, dtype, device):
         """Ensure the pre-allocated cache can hold ``needed_len`` entries.
@@ -296,6 +407,18 @@ class KDAAttnDecoding(nn.Module):
     def reset(self):
         self._state = None
         self._conv_lookback = None
+
+    def state_nbytes(self):
+        """Live decode-state bytes.
+
+        KDA carries a constant-size state (the ``[B, H, K, V]`` delta-rule
+        matrix in compute precision + the short-conv lookback), so this
+        number is independent of the decoded context length.
+        """
+        return _fixed_state_breakdown({
+            'recurrent_state': self._state,
+            'conv_lookback': self._conv_lookback,
+        })
 
     def forward(self, x):
         B, T_new, d = x.shape
@@ -448,6 +571,18 @@ class Mamba2AttnDecoding(nn.Module):
         self._ssm_state = None
         self._conv_state = None
 
+    def state_nbytes(self):
+        """Live decode-state bytes.
+
+        Mamba-2 carries the SSD recurrent state (``[B, heads, headdim,
+        d_state]``) plus the causal-conv left context — both fixed shape,
+        independent of the decoded context length.
+        """
+        return _fixed_state_breakdown({
+            'ssm_state': self._ssm_state,
+            'conv_state': self._conv_state,
+        })
+
     def forward(self, x):
         B, T_new, _ = x.shape
         ssm = self._ssm_state
@@ -520,6 +655,17 @@ class Rwkv7AttnDecoding(nn.Module):
         # CSA/HCA/KDA/Mamba-2 cache-drop rationale).
         self._matrix_state = None
         self._shift_state = None
+
+    def state_nbytes(self):
+        """Live decode-state bytes.
+
+        RWKV-7 carries the matrix state ``[B, H, K, V]`` + token-shift
+        state — fixed shape, independent of the decoded context length.
+        """
+        return _fixed_state_breakdown({
+            'matrix_state': self._matrix_state,
+            'shift_state': self._shift_state,
+        })
 
     def forward(self, x):
         B, T_new, _ = x.shape
@@ -612,6 +758,16 @@ class CSAAttnDecoding(nn.Module):
         # allocation in the timed region: the baseline is captured after
         # reset, so empty ring buffers never remain in it.
         self._cache = None
+
+    def state_nbytes(self):
+        """Live incremental-cache bytes (allocated + valid).
+
+        CSA's decode state is a structured cache (compressed blocks +
+        indexer keys + sliding window + partial accumulator + overlap),
+        so its size grows with the completed-block count (``~T/m``) but
+        stays bounded by the compression factor.
+        """
+        return _cache_state_breakdown(self._cache)
 
     def _ensure_cache(self, B, device, dtype):
         if self._cache is None or self._cache.B != B \
@@ -744,6 +900,15 @@ class HCAAttnDecoding(nn.Module):
         # allocation in the timed region: the baseline is captured after
         # reset, so empty ring buffers never remain in it.
         self._cache = None
+
+    def state_nbytes(self):
+        """Live incremental-cache bytes (allocated + valid).
+
+        HCA keeps every completed compressed block (no indexer), so its
+        decode state grows with ``~T/m2`` compressed rows plus a fixed
+        sliding-window ring and a partial accumulator.
+        """
+        return _cache_state_breakdown(self._cache)
 
     def _ensure_cache(self, B, device, dtype):
         if self._cache is None or self._cache.B != B \
@@ -940,6 +1105,53 @@ class HybridDecoding(nn.Module):
         # footprint is counted in full.
         self._csa_caches = [None for _ in self._csa_caches]
         self._hca_caches = [None for _ in self._hca_caches]
+
+    def state_nbytes(self):
+        """Live hybrid decode-state bytes.
+
+        Aggregates the stack's memory-route recurrent state + per-layer
+        streaming lookback (constant, sequence-independent) and every
+        CSA/HCA sub-layer's incremental cache (grown by ``~T/m``).
+        Mirrors ``cache_accounting.live_cache_components``' attribution,
+        but returns plain ints for the Exp 6 certificate.
+        """
+        components = {}
+        memory_state = getattr(self.model, '_kda_state', None)
+        if memory_state is not None:
+            components['memory_state'] = {
+                'allocated_bytes': _tensor_nbytes(memory_state),
+                'valid_bytes': _tensor_nbytes(memory_state),
+            }
+        lookback_bytes = 0
+        for layer in getattr(self.model, 'layers', []) or []:
+            tensor = getattr(layer, '_conv_lookback', None)
+            if tensor is None:
+                tensor = getattr(layer, '_shift_state', None)
+            lookback_bytes += _tensor_nbytes(tensor)
+        if lookback_bytes:
+            components['memory_lookback'] = {
+                'allocated_bytes': lookback_bytes,
+                'valid_bytes': lookback_bytes,
+            }
+        for name, caches in (('csa_cache', self._csa_caches),
+                             ('hca_cache', self._hca_caches)):
+            alloc = valid = 0
+            for cache in caches:
+                if cache is None:
+                    continue
+                bd = cache.nbytes_breakdown()
+                alloc += bd['total_allocated_bytes']
+                valid += bd['total_valid_bytes']
+            if alloc or valid:
+                components[name] = {'allocated_bytes': alloc,
+                                    'valid_bytes': valid}
+        return {
+            'components': components,
+            'allocated_bytes': sum(c['allocated_bytes']
+                                   for c in components.values()),
+            'valid_bytes': sum(c['valid_bytes']
+                               for c in components.values()),
+        }
 
     def _ensure_csa_cache(self, idx: int, layer: CSAHybridLayer,
                           h: torch.Tensor) -> CSADecodingCache:
@@ -1338,11 +1550,31 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         # (indistinguishable from a real measured value).
         peak_mb = None
 
+    # Decode-state certificate: the bytes the model RETAINS after the
+    # full prefill + decode loop (measured from the live tensors, outside
+    # the timed region so it cannot perturb the latency numbers). Unlike
+    # ``peak_mem_MB`` (which is CUDA-only and prefill-dominated), this is
+    # the quantity the "constant-size decoding state" claim is about:
+    # flat across prefill lengths for KDA / Mamba-2 / RWKV-7, linear for
+    # softmax, ~T/m for CSA/HCA.
+    try:
+        state = model.state_nbytes()
+    except Exception as e:  # never fail a benchmark row over accounting
+        state = {'components': {}, 'allocated_bytes': None,
+                 'valid_bytes': None, 'error': str(e)}
+
     return {
         'prefill_ms': prefill_ms,
         'mean_decode_ms_per_token': mean_decode,
         'median_decode_ms_per_token': median_decode,
         'peak_mem_MB': peak_mb,
+        'decode_state_bytes': state['valid_bytes'],
+        'decode_state_allocated_bytes': state['allocated_bytes'],
+        'decode_state_breakdown': state['components'],
+        'decode_state_note': (
+            'Live tensor bytes retained after prefill + decode '
+            '(valid = logically live entries; allocated = physical '
+            'storage including geometric cache slack).'),
         'prefill_len': prefill_len,
         'n_decode': n_decode,
         'repeats': repeats,
@@ -1472,9 +1704,12 @@ def main():
                     )
                 results.append(r)
                 peak_str = 'n/a' if r['peak_mem_MB'] is None else f"{r['peak_mem_MB']:.2f}MB"
+                state_str = ('n/a' if r['decode_state_bytes'] is None
+                             else f"{r['decode_state_bytes'] / 1024:.1f}KiB")
                 print(f"  {name:10s}  prefill={r['prefill_ms']:8.2f}ms  "
                       f"decode/tok={r['median_decode_ms_per_token']:8.3f}ms  "
-                      f"peak_mem={peak_str:>10}")
+                      f"peak_mem={peak_str:>10}  "
+                      f"state={state_str:>10}")
             except Exception as e:
                 # Include null fields for the keys present on success rows so
                 # downstream JSON consumers can do ``r['prefill_ms']`` without
@@ -1504,6 +1739,10 @@ def main():
                                 'mean_decode_ms_per_token': None,
                                 'median_decode_ms_per_token': None,
                                 'peak_mem_MB': None,
+                                'decode_state_bytes': None,
+                                'decode_state_allocated_bytes': None,
+                                'decode_state_breakdown': {},
+                                'decode_state_note': None,
                                 'n_decode': n_decode,
                                 'repeats': N_REPEATS,
                                 'upper_bound': False,
@@ -1538,6 +1777,30 @@ def main():
     print('  CSA, HCA, and hybrid rows use incremental compressed-block / '
           'sliding-window caches during token decode.')
 
+    # Decode-state certificate: measured retained bytes per op per context
+    # length. KDA / Mamba-2 / RWKV-7 must stay constant; softmax grows
+    # linearly; CSA / HCA grow with the compressed-block count (~T/m).
+    certificate = _decode_state_certificate(results, prefill_lens)
+    if certificate:
+        print('\n' + '=' * 70)
+        print('Decode-state certificate (live valid bytes retained after decode)')
+        print('=' * 70)
+        header = f"{'op':>10} | " + " | ".join(
+            f"{p:>9}" for p in prefill_lens) + " | class"
+        print(header)
+        print('-' * len(header))
+        for name, info in certificate.items():
+            by_len = info['bytes_by_prefill_len']
+            cells = []
+            for p in prefill_lens:
+                b = by_len.get(str(p))
+                cells.append(f"{'n/a':>9}" if b is None
+                             else f"{b / 1024:>7.1f}K")
+            print(f"{name:>10} | " + " | ".join(cells)
+                  + f" | {info['classification']}")
+        print('  constant = valid state size independent of context length; '
+              'growing = sequence-dependent state.')
+
     if device.type == 'cpu':
         print('\nNote: CPU peak memory is not reported (torch tensors use native')
         print('memory not visible to tracemalloc). On GPU (Kaggle T4) we report')
@@ -1567,6 +1830,17 @@ def main():
                        'prefill/decode inputs; see run_decoding.main / '
                        'bench_decoding'),
         },
+        # Machine-readable constant-state certificate derived from the
+        # measured ``decode_state_bytes`` rows (see
+        # ``_decode_state_certificate``). ``classification`` is per op.
+        'decode_state_certificate': certificate,
+        'decode_state_note': (
+            'decode_state_bytes counts logically live state tensors after '
+            'the full prefill + decode loop, measured outside the timed '
+            'region; decode_state_allocated_bytes adds geometric cache '
+            'spare capacity. The certificate classifies each op as '
+            'constant (recurrent state) or growing (softmax KV / '
+            'compressed-block caches).'),
         # Code/environment provenance in the main envelope itself (the side
         # file below duplicates it), so a single archived result file is a
         # complete run record.

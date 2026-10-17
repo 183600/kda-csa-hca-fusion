@@ -147,6 +147,16 @@ def _geometric_capacity(n_rows: int) -> int:
 # Internal helpers
 # =============================================================================
 
+def _tensor_nbytes(t: torch.Tensor | None) -> int:
+    """Bytes retained by a tensor (0 for ``None``)."""
+    return 0 if t is None else int(t.numel() * t.element_size())
+
+
+def _valid_nbytes(t: torch.Tensor | None, valid_elems: int) -> int:
+    """Bytes of the logically live prefix of a capacity-grown tensor."""
+    return 0 if t is None else int(valid_elems) * t.element_size()
+
+
 def _to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """``x.to(dtype)``, returning ``x`` unchanged when the dtype matches.
 
@@ -698,6 +708,85 @@ class CSADecodingCache:
     def sw_buffer(self) -> _SlidingWindowRingBuffer | None:
         """The sliding-window ring buffer (or None if ``win == 0``)."""
         return self._sw
+
+    # ----- state accounting ----------------------------------------------
+
+    @property
+    def nbytes(self) -> int:
+        """Physical bytes retained by the cache's backing tensors.
+
+        Counts ALLOCATED storage (including geometric spare capacity and
+        the full sliding-window ring buffer), i.e. what the process holds.
+        ``nbytes_valid`` counts only the logically live entries. Mirrors
+        :class:`Mamba2DecodingState`'s accounting surface.
+        """
+        return self.nbytes_breakdown()['total_allocated_bytes']
+
+    @property
+    def nbytes_valid(self) -> int:
+        """Bytes of logically live state (valid prefix + accumulator)."""
+        return self.nbytes_breakdown()['total_valid_bytes']
+
+    def nbytes_breakdown(self) -> dict:
+        """Component-wise decode-state byte accounting (JSON-safe ints).
+
+        Components (allocated / valid):
+
+        * ``compressed_kv`` — the compressed block cache ``[B, cap, c]``
+          (valid prefix ``n_blocks``);
+        * ``indexer_kv`` — the CSA indexer key cache ``[B, cap, c_I]``;
+        * ``sliding_window`` — the fixed ``[B, win, c]`` ring buffer;
+        * ``partial_tail`` — the ``n_tokens_seen % m`` partial-token
+          accumulator rows (allocated == valid);
+        * ``overlap`` — the previous block's ``Cb``/``Zb`` stashed for the
+          next overlapped compression.
+
+        The allocated totals are exactly ``run_kv_cache``'s
+        ``full_accounting`` components for one CSA layer at the same
+        ``(T, m, c, c_I, win)``, so the live and analytical models can be
+        cross-checked (see ``cache_accounting``).
+        """
+        B, c, c_I = self.B, self.c, self.c_I
+        cap = 0 if self._C_comp is None else self._C_comp.shape[1]
+        compressed_valid_elems = self._n_blocks * c * B
+        indexer_valid_elems = self._n_blocks * c_I * B
+        compressed_alloc = _tensor_nbytes(self._C_comp)
+        indexer_alloc = _tensor_nbytes(self._K_IComp)
+        compressed_valid = _valid_nbytes(self._C_comp, compressed_valid_elems)
+        indexer_valid = _valid_nbytes(self._K_IComp, indexer_valid_elems)
+        sw_alloc = _tensor_nbytes(self._sw._buf) if self._sw is not None else 0
+        sw_valid = (_valid_nbytes(self._sw._buf, self._sw._sw_len * c * B)
+                    if self._sw is not None else 0)
+        partial_alloc = sum(
+            _tensor_nbytes(t)
+            for group in (self._acc_Ca, self._acc_Cb, self._acc_Za,
+                          self._acc_Zb, self._acc_K_idx, self._acc_Z_idx)
+            for t in group)
+        partial_valid = partial_alloc
+        overlap_alloc = _tensor_nbytes(self._prev_Cb) + \
+            _tensor_nbytes(self._prev_Zb)
+        overlap_valid = overlap_alloc
+        total_alloc = (compressed_alloc + indexer_alloc + sw_alloc
+                       + partial_alloc + overlap_alloc)
+        total_valid = (compressed_valid + indexer_valid + sw_valid
+                       + partial_valid + overlap_valid)
+        return {
+            'compressed_kv_allocated_bytes': compressed_alloc,
+            'compressed_kv_valid_bytes': compressed_valid,
+            'indexer_kv_allocated_bytes': indexer_alloc,
+            'indexer_kv_valid_bytes': indexer_valid,
+            'sliding_window_allocated_bytes': sw_alloc,
+            'sliding_window_valid_bytes': sw_valid,
+            'partial_tail_allocated_bytes': partial_alloc,
+            'partial_tail_valid_bytes': partial_valid,
+            'overlap_allocated_bytes': overlap_alloc,
+            'overlap_valid_bytes': overlap_valid,
+            'total_allocated_bytes': total_alloc,
+            'total_valid_bytes': total_valid,
+            'capacity_rows': int(cap),
+            'n_blocks': int(self._n_blocks),
+            'n_tokens_seen': int(self._n_tokens_seen),
+        }
 
     # ----- state migration -----------------------------------------------
 
@@ -1556,6 +1645,62 @@ class HCADecodingCache:
     @property
     def sw_buffer(self) -> _SlidingWindowRingBuffer | None:
         return self._sw
+
+    # ----- state accounting ----------------------------------------------
+
+    @property
+    def nbytes(self) -> int:
+        """Physical bytes retained by the cache's backing tensors.
+
+        Counts ALLOCATED storage (geometric spare capacity + the full
+        sliding-window ring buffer); ``nbytes_valid`` counts the live
+        entries only. Mirrors :class:`Mamba2DecodingState`'s surface.
+        """
+        return self.nbytes_breakdown()['total_allocated_bytes']
+
+    @property
+    def nbytes_valid(self) -> int:
+        """Bytes of logically live state (valid prefix + accumulator)."""
+        return self.nbytes_breakdown()['total_valid_bytes']
+
+    def nbytes_breakdown(self) -> dict:
+        """Component-wise decode-state byte accounting (JSON-safe ints).
+
+        Components (allocated / valid): ``compressed_kv`` (the heavy
+        ``[B, cap, c]`` block cache), ``sliding_window`` (fixed ring
+        buffer), and ``partial_tail`` (the ``n_tokens_seen % m2``
+        accumulator rows). The allocated totals match ``run_kv_cache``'s
+        ``full_accounting`` components for one HCA layer at the same
+        ``(T, m2, c, win)``.
+        """
+        B, c = self.B, self.c
+        cap = 0 if self._C_comp is None else self._C_comp.shape[1]
+        compressed_valid_elems = self._n_blocks * c * B
+        compressed_alloc = _tensor_nbytes(self._C_comp)
+        compressed_valid = _valid_nbytes(self._C_comp, compressed_valid_elems)
+        sw_alloc = _tensor_nbytes(self._sw._buf) if self._sw is not None else 0
+        sw_valid = (_valid_nbytes(self._sw._buf, self._sw._sw_len * c * B)
+                    if self._sw is not None else 0)
+        partial_alloc = sum(
+            _tensor_nbytes(t)
+            for group in (self._acc_C, self._acc_Z)
+            for t in group)
+        partial_valid = partial_alloc
+        total_alloc = compressed_alloc + sw_alloc + partial_alloc
+        total_valid = compressed_valid + sw_valid + partial_valid
+        return {
+            'compressed_kv_allocated_bytes': compressed_alloc,
+            'compressed_kv_valid_bytes': compressed_valid,
+            'sliding_window_allocated_bytes': sw_alloc,
+            'sliding_window_valid_bytes': sw_valid,
+            'partial_tail_allocated_bytes': partial_alloc,
+            'partial_tail_valid_bytes': partial_valid,
+            'total_allocated_bytes': total_alloc,
+            'total_valid_bytes': total_valid,
+            'capacity_rows': int(cap),
+            'n_blocks': int(self._n_blocks),
+            'n_tokens_seen': int(self._n_tokens_seen),
+        }
 
     # ----- state migration -----------------------------------------------
 

@@ -74,6 +74,7 @@ from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
+from multi_seed_stats import holm_adjust, summarize_paired
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
@@ -2819,6 +2820,196 @@ def _paired_one_sided_t(diffs):
             'all_positive': all(d > 0 for d in diffs)}
 
 
+def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
+                             n_boot=2000, n_permutations=10000,
+                             max_exact=16):
+    """Seed-paired, Holm-corrected operator-vs-operator comparisons.
+
+    The per-row ``significant_bonferroni`` flag only says "this operator
+    learned the task" and the ``vs_tuned_baseline`` test says "this
+    operator beat the SIMPLE baseline". Neither answers the question the
+    paper reader actually asks: *is operator A better than operator B,
+    and is that ordering reproducible across seeds?* Comparing mean
+    accuracies (or, worse, CI overlap) across two independently trained
+    operators is not a valid test: the seeds are shared, so the correct
+    statistic is the SEED-PAIRED difference.
+
+    For every unordered operator pair inside a ``(task, n_kv)`` cell this
+    function computes the per-seed differences ``acc(op_a) - acc(op_b)``
+    on the COMMON seed set and runs:
+
+    * the exact sign-flip permutation test (``multi_seed_stats``) as the
+      PRIMARY statistic (two-sided, assumption-free for the 5-7-seed
+      regime; exact enumeration below ``max_exact`` pairs, deterministic
+      Monte-Carlo above);
+    * the paired t-test as a secondary, normality-dependent view;
+    * the exact binomial sign test, Cohen's ``d_z``, win rate, and two
+      bootstrap/t CIs for the mean difference;
+    * ``seeds_required_80pct_power`` — how many seeds a follow-up run
+      would need at the observed |d_z|. This converts an inconclusive
+      comparison into an actionable multi-seed budget.
+
+    Multiple-comparison control: Holm-Bonferroni step-down within each
+    cell (family = all testable unordered pairs of that cell), which
+    controls FWER <= alpha per experimental question and is uniformly
+    more powerful than plain Bonferroni at this seed count. p-values are
+    adjusted for BOTH the permutation and the t-test; the ``verdict``
+    field is driven by the permutation p-value.
+
+    Side effect: every row participating in >= 1 testable pair gets
+    ``pairwise_tests``, ``pairwise_significant_wins`` and
+    ``pairwise_significant_losses`` (operator-name lists) so downstream
+    consumers can read a row's pairwise standing without re-deriving it.
+
+    Returns a JSON-safe report (also stored in the exp4 metadata under
+    ``op_pairwise_comparisons``).
+    """
+    groups: dict = OrderedDict()
+    for r in all_results:
+        if 'error' in r or r.get('mean_acc') is None:
+            continue
+        groups.setdefault((r.get('task', 'mqar'), r['n_kv']), []).append(r)
+
+    report = {
+        'alpha': alpha,
+        'correction': 'holm_bonferroni',
+        'family_scope': (
+            'one family per (task, n_kv) cell: all unordered operator '
+            'pairs with >= 2 common seeds'),
+        'primary_test': (
+            'two-sided exact sign-flip permutation test on the seed-paired '
+            'accuracy differences; the paired t-test is reported as a '
+            'secondary normality-dependent view'),
+        'direction_convention': (
+            'mean_diff = acc(op_a) - acc(op_b) on the common seed set'),
+        'bootstrap': {'n_boot': n_boot, 'seed': seed},
+        'ci95_overlap_note': (
+            'CI overlap between two operators is a heuristic only and is '
+            'neither necessary nor sufficient for a difference; the '
+            'seed-paired permutation test here is the authoritative '
+            'pairwise statistic.'),
+        'n_tests': 0,
+        'n_significant': 0,
+        'n_skipped': 0,
+        'cells': {},
+    }
+
+    for (task_name, n_kv_key), rows in groups.items():
+        cell_key = f'{task_name}/n_kv={n_kv_key}'
+        rows_sorted = sorted(rows, key=lambda r: str(r.get('op')))
+        cell = {'n_tests': 0, 'n_significant': 0, 'n_skipped': 0,
+                'pairs': OrderedDict()}
+        records = []
+        for i in range(len(rows_sorted)):
+            for j in range(i + 1, len(rows_sorted)):
+                a, b = rows_sorted[i], rows_sorted[j]
+                pair_key = f"{a.get('op')}~{b.get('op')}"
+                a_seed = {s['seed']: s['final_acc']
+                          for s in a.get('per_seed', [])
+                          if 'error' not in s and s.get('final_acc') is not None}
+                b_seed = {s['seed']: s['final_acc']
+                          for s in b.get('per_seed', [])
+                          if 'error' not in s and s.get('final_acc') is not None}
+                common = sorted(set(a_seed) & set(b_seed))
+                if len(common) < 2:
+                    cell['pairs'][pair_key] = {
+                        'op_a': a.get('op'), 'op_b': b.get('op'),
+                        'common_seeds': common, 'n_pairs': len(common),
+                        'verdict': 'insufficient_paired_seeds',
+                    }
+                    cell['n_skipped'] += 1
+                    continue
+                diffs = [a_seed[s] - b_seed[s] for s in common]
+                stats = summarize_paired(
+                    diffs, seed=seed, n_boot=n_boot,
+                    n_permutations=n_permutations,
+                    max_exact=max_exact, alpha=alpha)
+                rec = {'op_a': a.get('op'), 'op_b': b.get('op'),
+                       'common_seeds': common, **stats}
+                records.append((rec, a, b))
+                cell['pairs'][pair_key] = rec
+
+        p_perm = [rec['permutation_test']['p_value_two_sided']
+                  for rec, _, _ in records]
+        p_t_raw = [rec['t_test']['p_value_two_sided']
+                   for rec, _, _ in records]
+        holm_perm = holm_adjust(p_perm, alpha=alpha)
+        # The t-test is undefined for a zero-variance difference vector
+        # (t = +-inf); those pairs stay in the family with p=1.0 so the
+        # family size (and therefore the correction strength) matches the
+        # number of comparisons actually run, but they can never reject.
+        holm_t = holm_adjust([1.0 if p is None else p for p in p_t_raw],
+                             alpha=alpha)
+        for idx, (rec, a, b) in enumerate(records):
+            rec['holm_adjusted_p_permutation'] = holm_perm['adjusted'][idx]
+            rec['significant_holm_permutation'] = bool(
+                holm_perm['rejected'][idx])
+            if p_t_raw[idx] is None:
+                rec['holm_adjusted_p_t'] = None
+                rec['significant_holm_t'] = False
+            else:
+                rec['holm_adjusted_p_t'] = holm_t['adjusted'][idx]
+                rec['significant_holm_t'] = bool(holm_t['rejected'][idx])
+            mean = rec.get('mean_diff')
+            if rec['significant_holm_permutation'] and mean:
+                rec['verdict'] = 'op_a_better' if mean > 0 else 'op_b_better'
+            else:
+                rec['verdict'] = 'not_significant'
+            for r in (a, b):
+                r['pairwise_tests'] = r.get('pairwise_tests', 0) + 1
+                r.setdefault('pairwise_significant_wins', [])
+                r.setdefault('pairwise_significant_losses', [])
+            if rec['verdict'] == 'op_a_better':
+                a['pairwise_significant_wins'].append(b.get('op'))
+                b['pairwise_significant_losses'].append(a.get('op'))
+            elif rec['verdict'] == 'op_b_better':
+                b['pairwise_significant_wins'].append(a.get('op'))
+                a['pairwise_significant_losses'].append(b.get('op'))
+        cell['n_tests'] = len(records)
+        cell['n_significant'] = sum(
+            1 for rec, _, _ in records if rec['verdict'] != 'not_significant')
+        report['cells'][cell_key] = cell
+        report['n_tests'] += cell['n_tests']
+        report['n_significant'] += cell['n_significant']
+        report['n_skipped'] += cell['n_skipped']
+
+    report['note'] = (
+        'Pairwise claims must cite these tests, not raw mean rankings or '
+        'CI overlap. When a comparison is inconclusive, '
+        'seeds_required_80pct_power estimates the seed budget the next '
+        'run would need at the observed effect size.')
+    return report
+
+
+def _print_pairwise_report(op_pairwise):
+    """Print the per-cell paired-comparison table (stdout, not just logs)."""
+    if not op_pairwise.get('n_tests'):
+        print('\nSeed-paired op-vs-op comparisons: no testable pairs '
+              '(need >= 2 common seeds per pair).')
+        return
+    print('\nSeed-paired op-vs-op comparisons '
+          '(permutation two-sided; Holm-corrected within cell):')
+    print(f"{'cell':>28} | {'op_a':>10} | {'op_b':>10} | {'d_acc':>8} | "
+          f"{'n':>3} | {'p_perm':>9} | {'p_holm':>9} | {'seeds@80%':>9} | "
+          f"verdict")
+    for cell_key, cell in op_pairwise['cells'].items():
+        for rec in cell['pairs'].values():
+            if rec.get('verdict') in (None, 'insufficient_paired_seeds'):
+                continue
+            d = rec.get('mean_diff')
+            d_str = f'{d:+.4f}' if d is not None else 'n/a'
+            p = rec['permutation_test']['p_value_two_sided']
+            p_str = f'{p:.4f}' if p is not None else 'n/a'
+            ph = rec.get('holm_adjusted_p_permutation')
+            ph_str = f'{ph:.4f}' if ph is not None else 'n/a'
+            need = rec.get('seeds_required_80pct_power')
+            need_str = str(need) if need is not None else 'n/a'
+            print(f"{cell_key:>28} | {str(rec.get('op_a')):>10} | "
+                  f"{str(rec.get('op_b')):>10} | {d_str:>8} | "
+                  f"{rec.get('n_pairs', 0):>3} | {p_str:>9} | "
+                  f"{ph_str:>9} | {need_str:>9} | {rec['verdict']}")
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -3496,6 +3687,29 @@ def main():
                   f"{'YES' if st.get('significant') else 'no'}"
                   f" ({st.get('verdict')})")
 
+    # ------------------------------------------------------------------
+    # Seed-paired ALL-PAIRS operator comparisons (Holm-corrected).
+    #
+    # Completes the statistical claim ladder:
+    #   1. significant_bonferroni          -> the op learned the task;
+    #   2. beats_tuned_baseline            -> it beats a tuned simple model;
+    #   3. pairwise_significant_wins       -> it beats a SPECIFIC complex
+    #      operator on the same seeds, robust to multiplicity.
+    # The old CI-overlap check below is demoted to a heuristic companion:
+    # overlapping CIs do not imply "no difference", so only the paired
+    # tests here support an A-vs-B claim.
+    # ------------------------------------------------------------------
+    op_pairwise = _pairwise_op_comparisons(
+        all_results,
+        alpha=float(os.environ.get('MQAR_PAIRWISE_ALPHA', '0.05')))
+    _print_pairwise_report(op_pairwise)
+    if op_pairwise['n_tests']:
+        logger.info(
+            f'\n  seed-paired op-vs-op comparisons: '
+            f"{op_pairwise['n_significant']}/{op_pairwise['n_tests']} "
+            f"significant at Holm alpha={op_pairwise['alpha']} "
+            f"({op_pairwise['n_skipped']} pair(s) skipped: <2 common seeds)")
+
     # Experiment-level statistical validity summary. Mirrors run_ablation.py
     # but with the appropriate thresholds for the 4-op MQAR sweep.
     n_any_sig = sum(1 for r in all_results if r.get('significant_bonferroni'))
@@ -3624,25 +3838,46 @@ def main():
                 if overlap:
                     overlaps.append(r['op'])
             best['ci95_overlaps_best'] = False
+            # Seed-paired, Holm-corrected standing of the best op (from
+            # _pairwise_op_comparisons, computed above). This — not the CI
+            # overlap list — is what may be claimed.
+            best_sig_wins = [
+                op for op in best.get('pairwise_significant_wins', [])
+                if any(r.get('op') == op for r in live)]
+            best_sig_wins = sorted(best_sig_wins, key=str)
+            if best_sig_wins:
+                paired_claim = (
+                    f"Seed-paired Holm-corrected tests support {best['op']} "
+                    f"over: {', '.join(best_sig_wins)}.")
+            else:
+                paired_claim = (
+                    f"No seed-paired Holm-corrected test separates "
+                    f"{best['op']} from any other op at this seed count.")
             cross_op_checks[f'{task_name}/n_kv={n_kv_key}'] = {
                 'best_op': best['op'],
                 'best_mean_acc': best['mean_acc'],
                 'best_ci95_acc': best.get('ci95_acc'),
                 'ops_with_overlapping_ci95': overlaps,
+                'best_op_pairwise_significant_wins': best_sig_wins,
+                'paired_test_note': (
+                    'CI overlap is a continuity heuristic, not a test: '
+                    'overlapping CIs do not imply a non-significant '
+                    'difference. The authoritative pairwise evidence is '
+                    'metadata.op_pairwise_comparisons (seed-paired '
+                    'permutation tests, Holm-corrected per cell).'),
                 'claim': (
-                    f"{best['op']} has the highest mean accuracy, but its "
-                    f"95% CI overlaps {overlaps}; the ranking against those "
-                    f"ops is not statistically supported at this seed count. "
-                    f"Increase seeds/steps before claiming a win."
-                    if overlaps else
-                    f"{best['op']} leads with a 95% CI disjoint from every "
-                    f"other op: the ranking is supported at this seed count."),
+                    f"{best['op']} has the highest mean accuracy. "
+                    f"{paired_claim} "
+                    + (f"Its 95% CI overlaps {overlaps}."
+                       if overlaps else
+                       "Its 95% CI is disjoint from every other op.")),
             }
-            if overlaps:
+            if not best_sig_wins:
                 logger.warning(
                     f'  [cost/claim] {task_name}/n_kv={n_kv_key}: best='
-                    f"{best['op']} (acc={best['mean_acc']:.4f}) but its CI95 "
-                    f"overlaps {overlaps} — treat the ranking as inconclusive.")
+                    f"{best['op']} (acc={best['mean_acc']:.4f}) has no "
+                    f"significant seed-paired win (Holm) — treat the "
+                    f"ranking as inconclusive.")
             dominated = rep['dominated_by']
             if dominated:
                 logger.info(
@@ -3800,6 +4035,14 @@ def main():
                              'acc_per_eval_ms}'),
             },
             'cross_op_claim_check': cross_op_checks,
+            # Seed-paired ALL-PAIRS operator comparison: per (task, n_kv)
+            # cell, every unordered operator pair tested on the common
+            # seeds with an exact sign-flip permutation test (primary), the
+            # paired t-test (secondary), the exact sign test, bootstrap CI
+            # and Cohen's d_z; p-values Holm-corrected within the cell.
+            # `seeds_required_80pct_power` turns inconclusive pairs into an
+            # actionable seed budget for the next multi-seed run.
+            'op_pairwise_comparisons': op_pairwise,
             # Tuned-baseline protocol record: how the simple-baseline lrs
             # were selected (validation stream, full grid), what they were,
             # and the seed-paired comparison of every complex op against
@@ -3853,9 +4096,11 @@ def main():
             },
             'significance_scope': (
                 'vs_chance_baseline_and_seed_paired_vs_tuned_reference_'
-                'baseline'
+                'baseline_and_seed_paired_op_vs_op_holm'
                 if baseline_pairwise.get('n_tests')
-                else 'vs_chance_baseline_not_pairwise_between_ops'),
+                else ('vs_chance_baseline_and_seed_paired_op_vs_op_holm'
+                      if op_pairwise.get('n_tests')
+                      else 'vs_chance_baseline_not_pairwise_between_ops')),
             'csa_indexer_trained': True,
             'csa_ste_enabled': True,
             'csa_indexer_normalize_qk': True,

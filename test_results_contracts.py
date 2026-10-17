@@ -169,6 +169,40 @@ def test_row_contract_exp6_cache_flags_are_honest():
     assert rs.validate_rows('exp6_decoding', rows[:-1], meta)
 
 
+def test_row_contract_exp6_decode_state_certificate_fields():
+    """Certificate fields are optional (legacy rows) but validated when present."""
+    ops = ('softmax', 'kda', 'csa')
+    base = [_exp6_row(op) for op in ops]
+    meta = {'prefill_lens': [128], 'ops': list(ops)}
+    # Legacy rows without the fields stay valid.
+    assert rs.validate_rows('exp6_decoding', base, meta) == []
+
+    good = [dict(r, decode_state_bytes=2048, decode_state_allocated_bytes=4096,
+                 decode_state_breakdown={'recurrent_state': {
+                     'allocated_bytes': 4096, 'valid_bytes': 2048}})
+            for r in base]
+    assert rs.validate_rows('exp6_decoding', good, meta) == []
+
+    # valid bytes must be a positive int.
+    assert rs.validate_rows(
+        'exp6_decoding',
+        [dict(r, decode_state_bytes=0, decode_state_allocated_bytes=4096)
+         if r['op'] == 'kda' else r for r in good],
+        meta)
+    # allocated >= valid.
+    assert rs.validate_rows(
+        'exp6_decoding',
+        [dict(r, decode_state_bytes=8192, decode_state_allocated_bytes=4096)
+         if r['op'] == 'csa' else r for r in good],
+        meta)
+    # breakdown must be an object.
+    assert rs.validate_rows(
+        'exp6_decoding',
+        [dict(r, decode_state_breakdown=[1, 2, 3])
+         if r['op'] == 'softmax' else r for r in good],
+        meta)
+
+
 def test_unknown_kinds_and_legacy_payloads_pass():
     assert rs.validate_rows('no_such_kind', [{'anything': 1}], {}) == []
     assert rs.validate_payload([{'legacy': True}]) == []

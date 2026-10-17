@@ -503,6 +503,25 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
         if peak is not None and not (_finite_number(peak) and float(peak) >= 0):
             out.append(f"{where}: 'peak_mem_MB' must be null or finite >= 0, "
                        f'got {peak!r}')
+        # Decode-state certificate fields (optional for legacy rows, but
+        # checked when present): valid bytes must be a positive int,
+        # allocated >= valid, and the breakdown must be a mapping.
+        state_valid = row.get('decode_state_bytes')
+        state_alloc = row.get('decode_state_allocated_bytes')
+        for key, value in (('decode_state_bytes', state_valid),
+                           ('decode_state_allocated_bytes', state_alloc)):
+            if value is not None and not _positive_int(value):
+                out.append(f"{where}: {key!r} must be null or a positive int, "
+                           f'got {value!r}')
+        if _positive_int(state_valid) and _positive_int(state_alloc) \
+                and state_alloc < state_valid:
+            out.append(
+                f"{where}: decode_state_allocated_bytes={state_alloc} < "
+                f'decode_state_bytes={state_valid}')
+        breakdown = row.get('decode_state_breakdown')
+        if breakdown is not None and not isinstance(breakdown, dict):
+            out.append(f"{where}: 'decode_state_breakdown' must be an object, "
+                       f'got {type(breakdown).__name__}')
         flag = row.get('uses_incremental_cache')
         build = row.get('prefill_cache_build')
         if not isinstance(flag, bool):
