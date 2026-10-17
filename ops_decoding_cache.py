@@ -1344,17 +1344,19 @@ class CSADecodingCache:
             # When normalize_qk=False the caller should have appended
             # raw (unnormalized) keys; we read whatever is stored.
             # ``clone()``: ``get()`` returns a view into the ring buffer,
-            # and the scores einsum below saves it to compute the query
-            # gradient. A later ``append_step`` overwrites the buffer in
-            # place, which would invalidate that saved view (backward
-            # would raise "modified by an inplace operation"). Materialize
-            # a stable copy so one backward pass can span several decode
-            # steps; values are unchanged. The copy is only needed when a
-            # backward graph can actually save the view (grad enabled AND
-            # one of the einsum operands requires grad).
+            # and the einsum's below save it to compute gradients. A later
+            # ``append_step`` overwrites the buffer in place, which would
+            # invalidate that saved view (backward would raise "modified by
+            # an inplace operation"). Materialize a stable copy so one
+            # backward pass can span several decode steps; values are
+            # unchanged. The copy is needed whenever grad is enabled: the
+            # ``sw_out`` einsum saves the view for the gradient w.r.t. the
+            # softmax weights ``p_w``, which can require grad even when
+            # neither ``q_compute`` nor the buffer entries do (e.g. a
+            # learnable attention sink). Outside grad mode nothing can
+            # save the view, so the copy is skipped.
             C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
-            if torch.is_grad_enabled() and (
-                    q_compute.requires_grad or C_local.requires_grad):
+            if torch.is_grad_enabled():
                 C_local = C_local.clone()
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
@@ -1873,14 +1875,17 @@ class HCADecodingCache:
         else:
             # ``clone()``: same autograd version guard as the CSA cache —
             # ``get()`` returns a live view into the ring buffer, and the
-            # scores einsum below saves it to compute the query gradient;
-            # a later ``append_step`` overwrites the buffer in place and
-            # would invalidate that saved view. Values are unchanged. The
-            # copy is only needed when a backward graph can actually save
-            # the view (grad enabled AND an einsum operand requires grad).
+            # einsum's below save it to compute gradients; a later
+            # ``append_step`` overwrites the buffer in place and would
+            # invalidate that saved view. Values are unchanged. The copy
+            # is needed whenever grad is enabled: the ``sw_out`` einsum
+            # saves the view for the gradient w.r.t. the softmax weights
+            # ``p_w``, which can require grad even when neither
+            # ``q_compute`` nor the buffer entries do (e.g. a learnable
+            # attention sink). Outside grad mode nothing can save the
+            # view, so the copy is skipped.
             C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
-            if torch.is_grad_enabled() and (
-                    q_compute.requires_grad or C_local.requires_grad):
+            if torch.is_grad_enabled():
                 C_local = C_local.clone()
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,

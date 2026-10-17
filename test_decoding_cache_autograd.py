@@ -5,11 +5,13 @@ What is pinned here
 A single backward pass may span SEVERAL ``forward_step`` calls of
 ``CSADecodingCache`` / ``HCADecodingCache`` (e.g. a loss over the whole
 decoded continuation, or any teacher-forced decode under autograd). The
-query gradient makes the sliding-window scores einsum save the window
-keys, and ``_SlidingWindowRingBuffer.get()`` returns a VIEW into the ring
-buffer; a later ``append_step`` overwrites that buffer in place, which
-would invalidate the saved view. Both caches materialize a stable copy of
-the window keys before the einsum, so these tests keep the multi-step
+window-scores einsums save the window keys for the query gradient AND for
+the gradient w.r.t. the softmax weights (which can require grad on their
+own, e.g. through a learnable attention sink), and
+``_SlidingWindowRingBuffer.get()`` returns a VIEW into the ring buffer; a
+later ``append_step`` overwrites that buffer in place, which would
+invalidate the saved view. Both caches materialize a stable copy of the
+window keys before the einsums, so these tests keep the multi-step
 backward contract green.
 
 Run via pytest::
@@ -22,6 +24,7 @@ Or directly::
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -44,7 +47,7 @@ def _ok(name, cond, detail=''):
     return cond
 
 
-def _csa_backward(device='cpu', rope_dim=None, sink=None):
+def _csa_backward(device='cpu', rope_dim=None, sink=None, q_grad=True):
     B, d, c, c_I, m, nh, nIh, dc = 1, 32, 8, 4, 4, 2, 1, 8
     win, topk, T = 4, 100, 6
     torch.manual_seed(11)
@@ -55,6 +58,12 @@ def _csa_backward(device='cpu', rope_dim=None, sink=None):
     W_UQ = (torch.randn(c * nh, dc, device=device) * 0.1).requires_grad_(True)
     Ba = (torch.randn(m, c, device=device) * 0.02).requires_grad_(True)
     sink_par = None if sink is None else torch.full((nh,), sink, device=device)
+    if not q_grad:
+        # The only grad-carrying operand is the sink: the window-scores
+        # einsum still puts ``p_w`` on the graph, so the saved ring-buffer
+        # view must have been materialized independently of q.
+        assert sink_par is not None
+        sink_par.requires_grad_(True)
 
     cache = CSADecodingCache(
         B, c, c_I, m, win, device, torch.float32, rope_dim=rope_dim)
@@ -69,7 +78,8 @@ def _csa_backward(device='cpu', rope_dim=None, sink=None):
             torch.zeros(B, 1, c_I, device=device),
             torch.zeros(B, 1, c_I, device=device),
             Ba.detach(), Ba.detach(), torch.zeros(m, c_I, device=device))
-        q = F.linear(F.linear(H_t, W_DQ), W_UQ).view(B, 1, nh, c)
+        with torch.no_grad() if not q_grad else contextlib.nullcontext():
+            q = F.linear(F.linear(H_t, W_DQ), W_UQ).view(B, 1, nh, c)
         q_n = F.normalize(q, dim=-1)
         outs.append(cache.forward_step(
             q_n, torch.zeros(B, 1, nIh, c_I, device=device),
@@ -78,10 +88,11 @@ def _csa_backward(device='cpu', rope_dim=None, sink=None):
             sink_logits=sink_par, use_ste=False))
     loss = torch.cat(outs, dim=1).sum()
     loss.backward()  # multi-step backward must succeed
-    return W_DQ.grad, W_UQ.grad
+    return W_DQ.grad, W_UQ.grad, (
+        None if sink_par is None else sink_par.grad)
 
 
-def _hca_backward(device='cpu', rope_dim=None, sink=None):
+def _hca_backward(device='cpu', rope_dim=None, sink=None, q_grad=True):
     B, d, c, m2, nh, dc = 1, 32, 8, 4, 2, 8
     win, T = 4, 6
     torch.manual_seed(11)
@@ -92,6 +103,10 @@ def _hca_backward(device='cpu', rope_dim=None, sink=None):
     W_UQ = (torch.randn(c * nh, dc, device=device) * 0.1).requires_grad_(True)
     B_pos = (torch.randn(m2, c, device=device) * 0.02).requires_grad_(True)
     sink_par = None if sink is None else torch.full((nh,), sink, device=device)
+    if not q_grad:
+        # Sink-only gradient: see the CSA helper above.
+        assert sink_par is not None
+        sink_par.requires_grad_(True)
 
     cache = HCADecodingCache(
         B, c, m2, win, device, torch.float32, rope_dim=rope_dim)
@@ -100,20 +115,22 @@ def _hca_backward(device='cpu', rope_dim=None, sink=None):
         H_t = H[:, t:t + 1]
         C = F.linear(H_t, W_KV).detach()
         cache.append_step(C, C, B_pos.detach())
-        q = F.linear(F.linear(H_t, W_DQ), W_UQ).view(B, 1, nh, c)
+        with torch.no_grad() if not q_grad else contextlib.nullcontext():
+            q = F.linear(F.linear(H_t, W_DQ), W_UQ).view(B, 1, nh, c)
         q_n = F.normalize(q, dim=-1)
         outs.append(cache.forward_step(
             q_n, nh=nh, scale=1.0, sink_logits=sink_par))
     loss = torch.cat(outs, dim=1).sum()
     loss.backward()  # multi-step backward must succeed
-    return W_DQ.grad, W_UQ.grad
+    return W_DQ.grad, W_UQ.grad, (
+        None if sink_par is None else sink_par.grad)
 
 
 def test_csa_cache_backward_spans_decode_steps(device='cpu'):
     """CSA: one backward over many decode steps must not raise."""
     for rope_dim in (None, 4):
         for sink in (None, 0.5):
-            g_dq, g_uq = _csa_backward(device, rope_dim, sink)
+            g_dq, g_uq, _ = _csa_backward(device, rope_dim, sink)
             _ok(
                 f'csa_cache_backward rope={rope_dim} sink={sink}',
                 g_dq is not None and g_uq is not None
@@ -127,7 +144,7 @@ def test_hca_cache_backward_spans_decode_steps(device='cpu'):
     """HCA: one backward over many decode steps must not raise."""
     for rope_dim in (None, 4):
         for sink in (None, 0.5):
-            g_dq, g_uq = _hca_backward(device, rope_dim, sink)
+            g_dq, g_uq, _ = _hca_backward(device, rope_dim, sink)
             _ok(
                 f'hca_cache_backward rope={rope_dim} sink={sink}',
                 g_dq is not None and g_uq is not None
@@ -137,7 +154,34 @@ def test_hca_cache_backward_spans_decode_steps(device='cpu'):
                 f'W_UQ.grad nonzero={float(g_uq.abs().sum()) > 0}')
 
 
+def test_csa_cache_backward_sink_only_spans_decode_steps(device='cpu'):
+    """CSA: grad flows only through the sink; the window-scores einsum still
+    saves the ring-buffer view, so the copy must not be tied to q.requires_grad."""
+    g_dq, g_uq, g_sink = _csa_backward(device, rope_dim=None, sink=0.5,
+                                       q_grad=False)
+    _ok(
+        'csa_cache_backward_sink_only',
+        g_sink is not None and torch.isfinite(g_sink).all()
+        and g_sink.abs().sum() > 0 and g_dq is None and g_uq is None,
+        f'sink.grad nonzero={g_sink is not None and float(g_sink.abs().sum()) > 0}, '
+        f'q grads absent={g_dq is None and g_uq is None}')
+
+
+def test_hca_cache_backward_sink_only_spans_decode_steps(device='cpu'):
+    """HCA: same sink-only multi-step backward contract as CSA."""
+    g_dq, g_uq, g_sink = _hca_backward(device, rope_dim=None, sink=0.5,
+                                       q_grad=False)
+    _ok(
+        'hca_cache_backward_sink_only',
+        g_sink is not None and torch.isfinite(g_sink).all()
+        and g_sink.abs().sum() > 0 and g_dq is None and g_uq is None,
+        f'sink.grad nonzero={g_sink is not None and float(g_sink.abs().sum()) > 0}, '
+        f'q grads absent={g_dq is None and g_uq is None}')
+
+
 if __name__ == '__main__':
     test_csa_cache_backward_spans_decode_steps()
     test_hca_cache_backward_spans_decode_steps()
+    test_csa_cache_backward_sink_only_spans_decode_steps()
+    test_hca_cache_backward_sink_only_spans_decode_steps()
     print('all decoding-cache autograd tests passed')
