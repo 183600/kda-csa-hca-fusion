@@ -25,8 +25,13 @@ Two modes, selected by ``ABL_MODE``:
   recipe, so CSA's and HCA's contributions are ablated independently
   of the memory operator. Paired seed-matched contrasts
   (B-A / C-A / D-B / D-C, the I=D-B-C+A interaction per route, and
-  the cross-route A/D replacement differences) are computed and
-  written to ``results/exp5b_ablation_matrix_contrasts.json``.
+  the cross-route A/D replacement differences) are computed, tested
+  with a Bonferroni-corrected seed-paired t-test against their
+  PRE-REGISTERED hypotheses (``MATRIX_CONTRAST_HYPOTHESES``), and
+  written to ``results/exp5b_ablation_matrix_contrasts.json``. A raw
+  t-statistic is not evidence: only rows with
+  ``significant_bonferroni=true`` support their prediction (or, for
+  the two-sided cross-route rows, show a significant difference).
   Additional presets (``ABL_MATRIX=csa_csa | position | budget``)
   cover the follow-up ablations: HCA-vs-more-CSA, layer placement,
   and compression-budget allocation at fixed cache bytes.
@@ -672,6 +677,220 @@ MATRIX_UNIT = {
     'E': ('memory', 'memory', 'memory', 'csa', 'csa'),
 }
 
+# Role of each layout group in the design (mirrors the module docstring;
+# machine-readable so the result metadata carries the design intent).
+MATRIX_GROUP_ROLES = {
+    'A': 'pure recurrent baseline (all memory slots)',
+    'B': 'CSA replaces one fixed recurrent slot',
+    'C': 'HCA replaces one fixed recurrent slot',
+    'D': 'full hybrid (CSA + HCA replace two recurrent slots)',
+    'E': 'two CSA layers (csa_csa preset only: HCA vs another CSA)',
+}
+
+# ---------------------------------------------------------------------------
+# Pre-registered hypotheses for the matrix's paired contrasts
+# (experiment-design requirement: fix the prediction and the falsification
+# criterion BEFORE reading the numbers). The layout contrasts and the
+# interaction are DIRECTIONAL (predicted positive: the added operator
+# helps); the cross-route replacement contrasts ask a two-sided question
+# (does the layout benefit transfer across memory operators?) and have no
+# pre-registered direction. The statistical test is the seed-paired
+# t-statistic from ``_matrix_contrast_report``; significance is assigned by
+# ``_annotate_contrast_significance`` under one Bonferroni family over all
+# contrast rows of a run.
+# ---------------------------------------------------------------------------
+MATRIX_CONTRAST_HYPOTHESES = {
+    'B-A (CSA replaces memory)': {
+        'hypothesis': ('Sparse compressed retrieval (CSA) replacing one '
+                       'recurrent memory slot improves MQAR accuracy.'),
+        'prediction': 'B > A on the seed-paired accuracy difference.',
+        'falsified_if': ('the corrected one-sided test is significant in '
+                         'the NEGATIVE direction (CSA hurts), or the '
+                         'positive effect does not clear the corrected '
+                         'threshold (prediction unsupported).'),
+        'direction': 'greater',
+    },
+    'C-A (HCA replaces memory)': {
+        'hypothesis': ('Heavily compressed global attention (HCA) replacing '
+                       'one recurrent memory slot improves MQAR accuracy.'),
+        'prediction': 'C > A on the seed-paired accuracy difference.',
+        'falsified_if': ('the corrected one-sided test is significant in '
+                         'the NEGATIVE direction (HCA hurts), or the '
+                         'positive effect does not clear the corrected '
+                         'threshold (prediction unsupported).'),
+        'direction': 'greater',
+    },
+    'D-B (add HCA to CSA)': {
+        'hypothesis': ('Adding HCA on top of an existing CSA layer improves '
+                       'MQAR accuracy (the two sparse operators are '
+                       'complementary at this budget).'),
+        'prediction': 'D > B on the seed-paired accuracy difference.',
+        'falsified_if': ('the corrected one-sided test is significant in '
+                         'the NEGATIVE direction (HCA hurts on top of '
+                         'CSA), or the positive effect does not clear the '
+                         'corrected threshold (prediction unsupported).'),
+        'direction': 'greater',
+    },
+    'D-C (add CSA to HCA)': {
+        'hypothesis': ('Adding CSA on top of an existing HCA layer improves '
+                       'MQAR accuracy (the two sparse operators are '
+                       'complementary at this budget).'),
+        'prediction': 'D > C on the seed-paired accuracy difference.',
+        'falsified_if': ('the corrected one-sided test is significant in '
+                         'the NEGATIVE direction (CSA hurts on top of '
+                         'HCA), or the positive effect does not clear the '
+                         'corrected threshold (prediction unsupported).'),
+        'direction': 'greater',
+    },
+    'I=D-B-C+A (CSA/HCA interaction)': {
+        'hypothesis': ('CSA and HCA are complementary: the benefit of the '
+                       'two together exceeds the sum of their individual '
+                       'replacements (super-additive interaction).'),
+        'prediction': 'I = D - B - C + A > 0 on the seed-paired differences.',
+        'falsified_if': ('the corrected one-sided test rejects the '
+                         'sub-additive side (I significantly < 0), or the '
+                         'positive estimate does not clear the corrected '
+                         'threshold (complementarity unsupported).'),
+        'direction': 'greater',
+    },
+}
+
+# Fallback hypothesis for the dynamic cross-route contrast names
+# (``{A|D}_{ROUTE_A} - {A|D}_{ROUTE_B}``): the memory-operator transfer
+# question. No direction is pre-registered; the test is two-sided.
+CROSS_ROUTE_CONTRAST_HYPOTHESIS = {
+    'hypothesis': ('Swapping the recurrent memory operator (KDA vs Mamba-2 '
+                   'vs RWKV-7) changes the layout\'s MQAR performance (the '
+                   'transfer question: does a layout conclusion hold under '
+                   'BOTH memory routes?).'),
+    'prediction': ('no pre-registered direction: the two memory routes '
+                   'differ on the paired accuracy difference.'),
+    'falsified_if': ('the two-sided corrected test is not significant: no '
+                     'evidence the operator swap changes MQAR at this '
+                     'budget/geometry (the layout result then transfers '
+                     'without a detected route-dependence).'),
+    'direction': 'two_sided',
+}
+
+
+def _contrast_hypothesis(name: str) -> dict:
+    """Return the pre-registered hypothesis for a contrast row name."""
+    if name in MATRIX_CONTRAST_HYPOTHESES:
+        return MATRIX_CONTRAST_HYPOTHESES[name]
+    return CROSS_ROUTE_CONTRAST_HYPOTHESIS
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered decision rule for the historical RATIO sweep (ABL_MODE=
+# ratio). The sweep is an allocation EXPLORATION, not a directional
+# experiment: the default 3:1:1 hybrid is the reference, and each
+# alternative ratio is tested against it with a TWO-SIDED corrected
+# paired test. An alternative may be called better/worse only when that
+# test clears the family-wise threshold; otherwise it is statistically
+# indistinguishable from the default at this seed budget and must not be
+# ranked by raw mean accuracy. Fixed BEFORE the numbers are read.
+# ---------------------------------------------------------------------------
+RATIO_REFERENCE_LABEL = '3:1:1'
+RATIO_SWEEP_HYPOTHESES = {
+    'reference': {
+        'hypothesis': ('The default KDA:CSA:HCA=3:1:1 allocation is the '
+                       'accuracy reference at fixed depth; alternatives '
+                       'must clear a corrected paired test before being '
+                       'called different.'),
+        'prediction': 'no directional prior (allocation exploration).',
+        'falsified_if': ('an alternative ratio shows a significant '
+                         'corrected paired difference (two-sided) from the '
+                         'default: the default is then not the unique '
+                         'accuracy point at this budget.'),
+        'direction': 'two_sided',
+    },
+    'alternatives': {
+        '4:1:0': {
+            'question': ('does dropping HCA (pure memory + CSA) change MQAR '
+                         'accuracy vs the default 3:1:1?'),
+            'prediction': ('no directional prior: the estimand is the '
+                           'two-sided seed-paired accuracy difference vs '
+                           'the default 3:1:1 (allocation exploration).'),
+            'falsified_if': ('not applicable: an exploratory two-sided '
+                             'contrast has no directional prediction to '
+                             'falsify; a significant difference is reported '
+                             'with its sign, and non-significance is '
+                             'inconclusive at this seed budget (not '
+                             'evidence of no difference).'),
+        },
+        '4:0:1': {
+            'question': ('does dropping CSA (pure memory + HCA) change MQAR '
+                         'accuracy vs the default 3:1:1?'),
+            'prediction': ('no directional prior: the estimand is the '
+                           'two-sided seed-paired accuracy difference vs '
+                           'the default 3:1:1 (allocation exploration).'),
+            'falsified_if': ('not applicable: an exploratory two-sided '
+                             'contrast has no directional prediction to '
+                             'falsify; a significant difference is reported '
+                             'with its sign, and non-significance is '
+                             'inconclusive at this seed budget (not '
+                             'evidence of no difference).'),
+        },
+        '2:2:1': {
+            'question': ('does more CSA (CSA:memory 1:1) change accuracy vs '
+                         'the default 3:1:1?'),
+            'prediction': ('no directional prior: the estimand is the '
+                           'two-sided seed-paired accuracy difference vs '
+                           'the default 3:1:1 (allocation exploration).'),
+            'falsified_if': ('not applicable: an exploratory two-sided '
+                             'contrast has no directional prediction to '
+                             'falsify; a significant difference is reported '
+                             'with its sign, and non-significance is '
+                             'inconclusive at this seed budget (not '
+                             'evidence of no difference).'),
+        },
+        '2:1:2': {
+            'question': ('does more HCA (HCA:memory 1:1) change accuracy vs '
+                         'the default 3:1:1?'),
+            'prediction': ('no directional prior: the estimand is the '
+                           'two-sided seed-paired accuracy difference vs '
+                           'the default 3:1:1 (allocation exploration).'),
+            'falsified_if': ('not applicable: an exploratory two-sided '
+                             'contrast has no directional prediction to '
+                             'falsify; a significant difference is reported '
+                             'with its sign, and non-significance is '
+                             'inconclusive at this seed budget (not '
+                             'evidence of no difference).'),
+        },
+        '1:3:1': {
+            'question': ('does a CSA-heavy allocation change accuracy vs '
+                         'the default 3:1:1?'),
+            'prediction': ('no directional prior: the estimand is the '
+                           'two-sided seed-paired accuracy difference vs '
+                           'the default 3:1:1 (allocation exploration).'),
+            'falsified_if': ('not applicable: an exploratory two-sided '
+                             'contrast has no directional prediction to '
+                             'falsify; a significant difference is reported '
+                             'with its sign, and non-significance is '
+                             'inconclusive at this seed budget (not '
+                             'evidence of no difference).'),
+        },
+        '1:1:3': {
+            'question': ('does an HCA-heavy allocation change accuracy vs '
+                         'the default 3:1:1?'),
+            'prediction': ('no directional prior: the estimand is the '
+                           'two-sided seed-paired accuracy difference vs '
+                           'the default 3:1:1 (allocation exploration).'),
+            'falsified_if': ('not applicable: an exploratory two-sided '
+                             'contrast has no directional prediction to '
+                             'falsify; a significant difference is reported '
+                             'with its sign, and non-significance is '
+                             'inconclusive at this seed budget (not '
+                             'evidence of no difference).'),
+        },
+    },
+    'note': ('Pre-registered in run_ablation.RATIO_SWEEP_HYPOTHESES. Only '
+             'rows with vs_reference_ratio.significant_bonferroni=True may '
+             'be called different from the default; non-significant rows '
+             'are statistically indistinguishable at this seed budget '
+             '(not evidence of equivalence either).'),
+}
+
 
 def _matrix_mamba_dims(d_model: int) -> dict:
     """Env-tunable Mamba-2 geometry for the matrix, auto-clamped.
@@ -1086,21 +1305,32 @@ def _seed_accuracy_map(result: dict) -> dict[int, float]:
 def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
     """Paired mean diff + t-stat over the COMMON seeds of two groups.
 
-    Returns ``(mean_diff, t_stat, n)``, or ``(None, None, 0)`` when fewer
-    than two common seeds exist. Positive diff = a better than b for a
-    higher-is-better metric (final_acc); loss-direction metrics must be
-    sign-flipped BEFORE calling this.
+    Returns ``(mean_diff, t_stat, n, unanimous)``, or
+    ``(None, None, 0, None)`` when fewer than two common seeds exist.
+    Positive diff = a better than b for a higher-is-better metric
+    (final_acc); loss-direction metrics must be sign-flipped BEFORE
+    calling this. ``unanimous`` is ``'positive'`` when every per-seed
+    difference is strictly > 0, ``'negative'`` when every difference is
+    strictly < 0, and ``'mixed'`` otherwise. It lets the caller keep
+    zero-variance (t undefined) UNANIMOUS evidence, mirroring the
+    convention in ``run_quality._paired_one_sided_t``.
     """
     common = sorted(set(accs_a) & set(accs_b))
     if len(common) < 2:
-        return None, None, 0
+        return None, None, 0, None
     diffs = [accs_a[s] - accs_b[s] for s in common]
     n = len(diffs)
     mean_diff = sum(diffs) / n
     var = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
     std = math.sqrt(var)
     t_stat = (mean_diff / (std / math.sqrt(n))) if std > 0 else None
-    return mean_diff, t_stat, n
+    if all(d > 0 for d in diffs):
+        unanimous = 'positive'
+    elif all(d < 0 for d in diffs):
+        unanimous = 'negative'
+    else:
+        unanimous = 'mixed'
+    return mean_diff, t_stat, n, unanimous
 
 
 def _matrix_contrast_report(all_results: list) -> list:
@@ -1150,13 +1380,20 @@ def _matrix_contrast_report(all_results: list) -> list:
             ]:
                 if groups[ga] is None or groups[gb] is None:
                     continue
-                diff, t_stat, n = _paired_contrast(accs[ga], accs[gb])
+                diff, t_stat, n, unanimous = _paired_contrast(
+                    accs[ga], accs[gb])
                 if diff is None:
                     continue
+                hyp = _contrast_hypothesis(name)
                 contrasts.append({
                     'n_kv': n_kv, 'memory': route, 'contrast': name,
                     'mean_diff': diff, 't_stat': t_stat,
                     'n_common_seeds': n,
+                    'unanimous': unanimous,
+                    'predicted_direction': hyp['direction'],
+                    'hypothesis': hyp['hypothesis'],
+                    'prediction': hyp['prediction'],
+                    'falsified_if': hyp['falsified_if'],
                     'metric': 'final_acc',
                     'direction': 'higher_is_better',
                 })
@@ -1173,11 +1410,24 @@ def _matrix_contrast_report(all_results: list) -> list:
                     var = sum((x - mean_i) ** 2 for x in inter) / (n - 1)
                     t_i = (mean_i / (math.sqrt(var) / math.sqrt(n))) \
                         if var > 0 else None
+                    if all(x > 0 for x in inter):
+                        unanimous_i = 'positive'
+                    elif all(x < 0 for x in inter):
+                        unanimous_i = 'negative'
+                    else:
+                        unanimous_i = 'mixed'
+                    hyp = _contrast_hypothesis(
+                        'I=D-B-C+A (CSA/HCA interaction)')
                     contrasts.append({
                         'n_kv': n_kv, 'memory': route,
                         'contrast': 'I=D-B-C+A (CSA/HCA interaction)',
                         'mean_diff': mean_i, 't_stat': t_i,
                         'n_common_seeds': n,
+                        'unanimous': unanimous_i,
+                        'predicted_direction': hyp['direction'],
+                        'hypothesis': hyp['hypothesis'],
+                        'prediction': hyp['prediction'],
+                        'falsified_if': hyp['falsified_if'],
                         'metric': 'final_acc',
                         'direction': 'higher_is_better',
                     })
@@ -1190,7 +1440,7 @@ def _matrix_contrast_report(all_results: list) -> list:
                     res_b = by_key.get((n_kv, rb, f'{rb.upper()}-{g}'))
                     if res_a is None or res_b is None:
                         continue
-                    diff, t_stat, n = _paired_contrast(
+                    diff, t_stat, n, unanimous = _paired_contrast(
                         _seed_accuracy_map(res_a), _seed_accuracy_map(res_b))
                     if diff is None:
                         continue
@@ -1200,11 +1450,135 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'contrast': f'{g}_{ra.upper()} - {g}_{rb.upper()}',
                         'mean_diff': diff, 't_stat': t_stat,
                         'n_common_seeds': n,
+                        'unanimous': unanimous,
+                        'predicted_direction':
+                            CROSS_ROUTE_CONTRAST_HYPOTHESIS['direction'],
+                        'hypothesis':
+                            CROSS_ROUTE_CONTRAST_HYPOTHESIS['hypothesis'],
+                        'prediction':
+                            CROSS_ROUTE_CONTRAST_HYPOTHESIS['prediction'],
+                        'falsified_if':
+                            CROSS_ROUTE_CONTRAST_HYPOTHESIS['falsified_if'],
                         'metric': 'final_acc',
                         'direction': 'higher_is_better',
                         'question': question,
                     })
     return contrasts
+
+
+def _annotate_contrast_significance(contrasts: list,
+                                    alpha: float = 0.05,
+                                    hypotheses: dict | None = None) -> dict:
+    """Attach Bonferroni-corrected significance to the paired contrasts.
+
+    Raw t-statistics invite post-hoc storytelling: with ~10-30 contrasts
+    per run, some |t| > 2. We therefore declare ONE family — every
+    contrast row of the run across all memory routes / layouts and n_kv
+    cells — and assign each row a corrected threshold. Directional
+    contrasts (predicted ``> 0``) use the one-sided upper-tail quantile
+    at ``alpha / n`` (``_bonferroni_crit_q`` is one-sided); two-sided
+    contrasts (no pre-registered direction) use the upper-tail quantile
+    at ``alpha / (2n)``. Zero-variance differences: a unanimous
+    all-positive sweep of a DIRECTIONAL contrast counts as significant
+    (with ``t_stat=None`` recorded) only if the exact one-sided sign-flip
+    p-value ``2^{-(n-1)}`` clears the corrected alpha; any other
+    undefined row can never reject. ``hypotheses`` overrides the
+    hypothesis block recorded in the summary (matrix vs ratio sweep).
+
+    Mutates the contrast rows (additive keys) and returns a JSON-safe
+    summary for the result metadata:
+
+      * ``test``                  'paired_one_sided_t' | 'paired_two_sided_t'
+      * ``alpha_bonferroni``      per-test alpha (family-wise / n_family)
+      * ``t_crit_bonferroni``     corrected critical value (None if undefined)
+      * ``significant_bonferroni``bool
+      * ``hypothesis_status``     directional: 'supported' | 'contradicted'
+                                  | 'not_supported'; two-sided:
+                                  'difference_supported' | 'not_supported'
+      * ``family_size`` etc. on the returned summary
+    """
+    n_family = len(contrasts)
+    summary = {
+        'alpha_family_wise': alpha,
+        'n_contrasts': n_family,
+        'family_scope': ('all contrast rows of this run (every memory '
+                         'route x n_kv x contrast)'),
+        'correction': 'bonferroni',
+        'test': ('seed-paired t-test on per-seed final_acc differences; '
+                 'one-sided for the pre-registered directional layout '
+                 'contrasts, two-sided for the cross-route replacement '
+                 'contrasts'),
+        'null_hypothesis': ('H0: the mean seed-paired accuracy difference '
+                            'is zero (for directional contrasts, against '
+                            'the pre-registered positive direction)'),
+        'zero_variance_rule': ('a UNANIMOUS all-positive sweep of a '
+                               'directional contrast (t_stat=None) counts '
+                               'as significant only if the exact one-sided '
+                               'sign-flip p-value 2^{-(n-1)} clears the '
+                               'corrected alpha; all other zero-variance '
+                               'rows can never reject'),
+        'n_significant': 0,
+        'n_supported': 0,
+        'n_contradicted': 0,
+        'verdict_scope': (
+            'Only significant_bonferroni=True rows may be cited as '
+            'evidence for (or against) the pre-registered prediction; '
+            'non-significant rows are inconclusive at this seed budget, '
+            'not evidence of no effect.'),
+    }
+    for c in contrasts:
+        direction = c.get('predicted_direction', 'two_sided')
+        n = c.get('n_common_seeds', 0)
+        t_stat = c.get('t_stat')
+        mean_diff = c.get('mean_diff')
+        if direction == 'greater':
+            c['test'] = 'paired_one_sided_t'
+            alpha_test = alpha / n_family if n_family else None
+            crit = (_bonferroni_crit_q(n, alpha=alpha_test)
+                    if (alpha_test is not None and n >= 2) else None)
+            sig = bool(crit is not None and t_stat is not None
+                       and t_stat > crit)
+            if t_stat is None and c.get('unanimous') == 'positive' \
+                    and n >= 2 and mean_diff is not None and mean_diff > 0:
+                # Zero-variance unanimous improvement: the exact
+                # one-sided sign-flip permutation p-value of the
+                # all-positive pattern is 2^{-(n-1)}; it counts as
+                # significant only when that clears the corrected alpha
+                # (e.g. n >= 9 at a 10-contrast family with alpha=0.05).
+                # Never claim a degenerate 2-seed sweep as evidence.
+                exact_p = 2.0 ** (-(n - 1))
+                sig = bool(alpha_test is not None and exact_p <= alpha_test)
+        else:
+            c['test'] = 'paired_two_sided_t'
+            alpha_test = alpha / (2 * n_family) if n_family else None
+            crit = (_bonferroni_crit_q(n, alpha=alpha_test)
+                    if (alpha_test is not None and n >= 2) else None)
+            sig = bool(crit is not None and t_stat is not None
+                       and abs(t_stat) > crit)
+        c['alpha_bonferroni'] = alpha_test
+        c['t_crit_bonferroni'] = crit
+        c['significant_bonferroni'] = sig
+        if direction == 'greater':
+            if sig and mean_diff is not None and mean_diff > 0:
+                c['hypothesis_status'] = 'supported'
+            elif sig and mean_diff is not None and mean_diff < 0:
+                c['hypothesis_status'] = 'contradicted'
+            else:
+                c['hypothesis_status'] = 'not_supported'
+        else:
+            c['hypothesis_status'] = ('difference_supported' if sig
+                                      else 'not_supported')
+        summary['n_significant'] += int(sig)
+        summary['n_supported'] += int(
+            c['hypothesis_status'] == 'supported')
+        summary['n_contradicted'] += int(
+            c['hypothesis_status'] == 'contradicted')
+    summary['hypotheses'] = hypotheses if hypotheses is not None else {
+        **MATRIX_CONTRAST_HYPOTHESES,
+        'cross_route (dynamic names A_KDA - A_MAMBA2, ...)':
+            CROSS_ROUTE_CONTRAST_HYPOTHESIS,
+    }
+    return summary
 
 
 def _log_contrast_table(contrasts: list) -> None:
@@ -1213,21 +1587,33 @@ def _log_contrast_table(contrasts: list) -> None:
         logger.info('  (no paired contrasts computable: need >= 2 common '
                     'seeds across the compared groups)')
         return
-    logger.info('\n' + '=' * 92)
+    annotated = any('significant_bonferroni' in c for c in contrasts)
+    logger.info('\n' + '=' * 104)
     logger.info('Paired memory-route contrasts (seed-matched; final_acc; '
                 'positive = first operand better):')
-    logger.info('=' * 92)
+    logger.info('=' * 104)
     for c in contrasts:
         t_str = _fmt_tstat(c.get('t_stat'), width=8, prec=2)
+        line = (f"  n_kv={c['n_kv']:<3} {c['memory']:<12} "
+                f"{c['contrast']:<34} "
+                f"diff={c['mean_diff']:+.4f}  t={t_str}  "
+                f"n={c['n_common_seeds']}")
+        if annotated:
+            sig = 'YES' if c.get('significant_bonferroni') else 'no'
+            line += f"  sig={sig:<3} ({c.get('hypothesis_status', 'n/a')})"
+        logger.info(line)
+    if annotated:
         logger.info(
-            f"  n_kv={c['n_kv']:<3} {c['memory']:<12} {c['contrast']:<34} "
-            f"diff={c['mean_diff']:+.4f}  t={t_str}  n={c['n_common_seeds']}")
+            '  Significance = Bonferroni-corrected paired t-test within the '
+            'run-wide contrast family (one-sided for the pre-registered '
+            'directional contrasts, two-sided for the cross-route rows); '
+            'non-significant rows are inconclusive, not "no effect".')
     logger.info(
         '  NOTE: interaction rows (I=D-B-C+A) support complementarity '
         'claims ONLY with statistical evidence;')
     logger.info(
         '  sign-flip loss/PPL metrics before reusing this helper.')
-    logger.info('=' * 92)
+    logger.info('=' * 104)
 
 
 _LAYOUT_CONTRAST_PAIRS = {
@@ -1325,6 +1711,92 @@ def _contrast_consistency_violations(all_results: list,
             out.append(f'{where}: n_common_seeds={c.get("n_common_seeds")!r} '
                        f'but the rows share {n_common} seed(s)')
     return out
+
+
+def _ratio_reference_contrasts(all_results: list,
+                               reference_label: str = RATIO_REFERENCE_LABEL):
+    """Paired seed-matched differences of every ratio vs the reference.
+
+    Mirrors the matrix contrast report for ``ABL_MODE=ratio``: the default
+    3:1:1 allocation is the reference, and every other ratio is compared
+    on the COMMON seeds inside each n_kv cell (paired design; the ratio
+    rows share the seed list). The sweep is exploratory, so the
+    pre-registered test (``RATIO_SWEEP_HYPOTHESES``) is two-sided; the
+    corrected verdict is attached by ``_annotate_contrast_significance``
+    with ``hypotheses=RATIO_SWEEP_HYPOTHESES``.
+
+    Returns JSON-safe contrast rows; [] when the reference row is absent
+    or no alternative shares >= 2 seeds with it.
+    """
+    rows = [r for r in all_results if 'error' not in r
+            and r.get('ratio') is not None]
+    by_key = {(r.get('n_kv'), str(r.get('ratio'))): r for r in rows}
+    contrasts = []
+    for n_kv in sorted({r.get('n_kv') for r in rows}):
+        ref = by_key.get((n_kv, reference_label))
+        if ref is None:
+            continue
+        ref_accs = _seed_accuracy_map(ref)
+        for label in sorted({str(r.get('ratio')) for r in rows}):
+            if label == reference_label:
+                continue
+            cand = by_key.get((n_kv, label))
+            if cand is None:
+                continue
+            diff, t_stat, n, unanimous = _paired_contrast(
+                _seed_accuracy_map(cand), ref_accs)
+            if diff is None:
+                continue
+            hyp = RATIO_SWEEP_HYPOTHESES['alternatives'].get(label, {})
+            contrasts.append({
+                'n_kv': n_kv,
+                'reference_ratio': reference_label,
+                'ratio': label,
+                'contrast': f'{label} - {reference_label}',
+                'mean_diff': diff, 't_stat': t_stat,
+                'n_common_seeds': n,
+                'unanimous': unanimous,
+                'predicted_direction': 'two_sided',
+                'question': hyp.get(
+                    'question',
+                    f'does ratio {label} differ from {reference_label}?'),
+                'hypothesis': RATIO_SWEEP_HYPOTHESES['reference']['hypothesis'],
+                'prediction': hyp.get(
+                    'prediction', 'two-sided paired difference vs the '
+                                  'reference ratio.'),
+                'falsified_if': hyp.get(
+                    'falsified_if',
+                    'not applicable: exploratory two-sided contrast.'),
+                'metric': 'final_acc',
+                'direction': 'higher_is_better',
+            })
+    return contrasts
+
+
+def _log_ratio_contrast_table(contrasts: list) -> None:
+    """Log the ratio-vs-reference paired contrasts as a readable table."""
+    if not contrasts:
+        logger.info('  (no ratio-vs-reference contrasts computable: the '
+                    'reference ratio row is absent or shares < 2 seeds)')
+        return
+    logger.info('\n' + '=' * 104)
+    logger.info('Paired ratio contrasts vs the reference layout '
+                '(seed-matched; final_acc; positive = alternative better):')
+    logger.info('=' * 104)
+    for c in contrasts:
+        sig = 'YES' if c.get('significant_bonferroni') else 'no'
+        t_str = _fmt_tstat(c.get('t_stat'), width=8, prec=2)
+        logger.info(
+            f"  n_kv={c['n_kv']:<3} {c['contrast']:<14} "
+            f"diff={c['mean_diff']:+.4f}  t={t_str}  "
+            f"n={c['n_common_seeds']}  sig={sig:<3} "
+            f"({c.get('hypothesis_status', 'n/a')})")
+    logger.info(
+        '  Significance = Bonferroni-corrected TWO-SIDED paired t-test '
+        'over the run-wide ratio-contrast family; non-significant ratios '
+        'are statistically indistinguishable from the default 3:1:1 at '
+        'this seed budget (not proof of equivalence).')
+    logger.info('=' * 104)
 
 
 def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
@@ -1507,13 +1979,19 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         r['mamba_backend'] = os.environ.get('MAMBA_BACKEND', 'reference')
         r['rwkv_backend'] = os.environ.get('RWKV_BACKEND', 'reference')
         r['rwkv7_upstream_binding'] = RWKV7_UPSTREAM_BINDING
-        r['significance_scope'] = 'vs_chance_baseline_not_pairwise_between_groups'
+        r['significance_scope'] = (
+            'vs_chance_bonferroni_and_seed_paired_layout_contrasts_'
+            'bonferroni')
 
     # Paired seed-matched contrasts (B-A / C-A / D-B / D-C / interaction
     # per route; A/D replacement across routes — the KDA-vs-RWKV-7
     # replacement question) — written to their own side file so the
-    # per-group rows' schema stays unchanged for existing consumers.
+    # per-group rows' schema stays unchanged for existing consumers. Each
+    # row is tested against its PRE-REGISTERED hypothesis under one
+    # Bonferroni family over the run's contrast rows; only
+    # significant_bonferroni=True rows may be cited as evidence.
     contrasts = _matrix_contrast_report(all_results)
+    contrast_tests = _annotate_contrast_significance(contrasts)
     _log_contrast_table(contrasts)
 
     os.makedirs('results', exist_ok=True)
@@ -1529,6 +2007,23 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         # The preset's promised group ids; the row contract refuses to
         # write a survivor-only matrix (a crash mid-sweep) as if complete.
         'expected_groups': [spec[0] for spec in groups],
+        # Pre-registered design intent (fixed before the numbers were
+        # read): what each layout group is for, and the prediction +
+        # falsification criterion for every paired contrast family. The
+        # per-row copies ride with each contrast row; this block is the
+        # single readable registration for the whole experiment.
+        'hypotheses': {
+            'groups': MATRIX_GROUP_ROLES,
+            'contrasts': MATRIX_CONTRAST_HYPOTHESES,
+            'cross_route': CROSS_ROUTE_CONTRAST_HYPOTHESIS,
+            'note': ('Pre-registered in run_ablation.MATRIX_CONTRAST_'
+                     'HYPOTHESES / CROSS_ROUTE_CONTRAST_HYPOTHESIS. A '
+                     'contrast supports its prediction only when '
+                     'significant_bonferroni=True in the contrasts side '
+                     'file; non-significant rows are inconclusive.'),
+        },
+        # Corrected significance verdict for the contrast family.
+        'contrast_tests': contrast_tests,
         'overfit_sanity_check': {
             'enabled': gate_record['enabled'],
             'strict': gate_record['strict'],
@@ -1728,6 +2223,21 @@ def main():
     print(f"{'':>4} | {'chance':>8} | {'':>22} | {'':>6} | {'':>8} | "
           f"{1.0/VOCAB:>10.4f} | {'':>10} | {'':>12} | {'':>8}")
 
+    # ------------------------------------------------------------------
+    # Paired ratio-vs-reference contrasts. The vs-chance tests above only
+    # establish that a layout learns the task; they do NOT support
+    # "ratio X is better than the default". Since every ratio shares the
+    # seed list, the correct comparison is the seed-paired difference vs
+    # the 3:1:1 reference under a Bonferroni family over all
+    # (alternative ratio, n_kv) comparisons. The sweep is exploratory, so
+    # the tests are two-sided against the pre-registered decision rule in
+    # RATIO_SWEEP_HYPOTHESES; raw mean ranking is not evidence.
+    # ------------------------------------------------------------------
+    ratio_contrasts = _ratio_reference_contrasts(all_results)
+    ratio_contrast_tests = _annotate_contrast_significance(
+        ratio_contrasts, hypotheses=RATIO_SWEEP_HYPOTHESES)
+    _log_ratio_contrast_table(ratio_contrasts)
+
     logger.info('\nControlled-depth design: all reported ratios contain 5 layers.')
     logger.info('  Parameter counts can still differ by operator type and are reported;')
     logger.info('  interpret ratio effects together with n_params and paired seed data.')
@@ -1754,7 +2264,9 @@ def main():
     logger.info('\n' + '=' * 70)
     logger.info('Statistical validity summary:')
     logger.info(f'  seeds requested: {n_seeds}  (min survived: {min_seeds_ok})')
-    logger.info(f'  ratios with significant_bonferroni=True: {n_any_sig}/{len(all_results)}')
+    logger.info(f'  ratios with vs-chance significant_bonferroni=True: '
+                f'{n_any_sig}/{len(all_results)}  (paired-vs-reference '
+                f'verdicts are in each row\'s vs_reference_ratio)')
     logger.info(f'  ratios near chance (0.5x-1.5x): {len(near_chance)}/{len(all_results)}')
     logger.info(f'  ratios far below chance (<=0.5x): {len(far_below)}/{len(all_results)}')
     logger.info(f'  conclusions_valid: {conclusions_valid}')
@@ -1767,18 +2279,60 @@ def main():
             '  To improve power: increase ABL_SEEDS (>=7), increase ABL_STEPS,\n'
             '  or use a simpler task where the signal is stronger.')
     logger.info('=' * 70)
+    contrast_by_key = {(c['n_kv'], c['ratio']): c for c in ratio_contrasts}
     for r in all_results:
         r['conclusions_valid'] = conclusions_valid
         r['n_seeds_requested'] = n_seeds
         r['csa_indexer_normalize_qk'] = True
         r['kda_backend'] = os.environ.get('KDA_BACKEND', 'reference')
-        r['significance_scope'] = 'vs_chance_baseline_not_pairwise_between_layouts'
+        r['is_reference_ratio'] = (str(r.get('ratio'))
+                                   == RATIO_REFERENCE_LABEL)
+        # Per-row paired standing vs the default ratio (None for the
+        # reference row itself and for error stubs).
+        if 'error' in r or r['is_reference_ratio']:
+            r['vs_reference_ratio'] = None
+        else:
+            c = contrast_by_key.get((r.get('n_kv'), str(r.get('ratio'))))
+            if c is None:
+                r['vs_reference_ratio'] = None
+            else:
+                if c.get('significant_bonferroni') and \
+                        c.get('mean_diff') is not None:
+                    verdict = ('better_than_reference'
+                               if c['mean_diff'] > 0
+                               else 'worse_than_reference')
+                else:
+                    verdict = 'not_significantly_different'
+                r['vs_reference_ratio'] = {
+                    'reference_ratio': c['reference_ratio'],
+                    'n_common_seeds': c['n_common_seeds'],
+                    'mean_diff': c['mean_diff'],
+                    't_stat': c['t_stat'],
+                    'test': c.get('test'),
+                    'alpha_bonferroni': c.get('alpha_bonferroni'),
+                    't_crit_bonferroni': c.get('t_crit_bonferroni'),
+                    'significant_bonferroni':
+                        bool(c.get('significant_bonferroni')),
+                    'hypothesis_status': c.get('hypothesis_status'),
+                    'question': c.get('question'),
+                    'verdict': verdict,
+                }
+        r['significance_scope'] = (
+            'vs_chance_bonferroni_and_seed_paired_vs_reference_ratio_'
+            'bonferroni')
 
     os.makedirs('results', exist_ok=True)
     write_results_json(all_results, 'results/exp5_ablation.json',
                        logger=logger)
     try:
-        write_results_json(_run_provenance(n_seeds, steps, gate_record),
+        provenance = _run_provenance(n_seeds, steps, gate_record)
+        # The paired ratio contrasts + the pre-registered decision rule
+        # travel with the run record (the historical rows stay a bare
+        # list for backward compatibility with existing consumers).
+        provenance['ratio_contrasts'] = ratio_contrasts
+        provenance['contrast_tests'] = ratio_contrast_tests
+        provenance['hypotheses'] = RATIO_SWEEP_HYPOTHESES
+        write_results_json(provenance,
                            'results/exp5_ablation_provenance.json',
                            logger=logger)
     except Exception as e:

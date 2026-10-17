@@ -139,23 +139,87 @@ if SEQ_LEN % SMALL_MODEL_SPEC['csa_m'] != 0:
 # compressed blocks (no sparse selection). ``rope`` toggles partial RoPE on
 # BOTH CSA and HCA (the paired core-attention stack) — ``no_rope`` therefore
 # isolates "partial RoPE in the CSA/HCA pair", not RoPE-in-CSA alone.
+#
+# Each variant carries a PRE-REGISTERED directional prediction and an
+# explicit falsification criterion (experiment-design requirement: a
+# mechanism claim must state in advance what would refute it, not just ask
+# an open question). ``predicted_acc_sign`` fixes the expected sign of the
+# paired accuracy difference vs the baseline for the automated
+# ``prediction_status`` verdict ('negative' = variant expected WORSE than
+# baseline; 'nonpositive' = expected not-better, a null-style claim that
+# only a significant POSITIVE difference would falsify; None for the
+# reference variant). The falsifiers are written so that a Bonferroni-
+# significant paired contrast in the opposite direction contradicts the
+# prediction; non-significance is always reported as 'not_supported'
+# (inconclusive, not evidence of equivalence).
 VARIANTS: tuple[dict, ...] = (
     {'name': 'baseline', 'rope': True, 'topk': SMALL_MODEL_SPEC['csa_topk'],
      'use_ste': True,
-     'question': 'reference: RoPE on, sparse top-k, learned indexer'},
+     'question': 'reference: RoPE on, sparse top-k, learned indexer',
+     'prediction': ('Reference variant (Exp 5 default 3:1:1): anchors every '
+                    'paired contrast. No directional prediction of its own.'),
+     'falsified_if': ('not applicable: the reference cannot falsify itself; '
+                      'a broken baseline shows up as a failed seed or a '
+                      'failed overfit gate, not as a contrast.'),
+     'predicted_acc_sign': None},
     {'name': 'no_rope', 'rope': False, 'topk': SMALL_MODEL_SPEC['csa_topk'],
      'use_ste': True,
-     'question': 'does partial RoPE (CSA+HCA) help MQAR?'},
+     'question': 'does partial RoPE (CSA+HCA) help MQAR?',
+     'prediction': ('partial RoPE encodes relative order, which MQAR '
+                    'associative recall exploits: removing it degrades '
+                    'end-task accuracy (mean_acc(no_rope) < '
+                    'mean_acc(baseline)) and/or the CSA gold-block recall.'),
+     'falsified_if': ('no_rope is significantly BETTER than baseline on the '
+                      'paired Bonferroni-corrected contrast; positional '
+                      'rotation would then hurt this task rather than help.'),
+     'predicted_acc_sign': 'negative'},
     {'name': 'topk1', 'rope': True, 'topk': 1, 'use_ste': True,
-     'question': 'does extreme selection sparsity (k=1) hurt?'},
+     'question': 'does extreme selection sparsity (k=1) hurt?',
+     'prediction': ('k=1 removes the indexer\'s margin for selection error '
+                    '(no hedge when the gold block is ranked 2nd): accuracy '
+                    'and gold_recall fall below baseline, recall near the '
+                    'chance level min(1, n_available)/n_available.'),
+     'falsified_if': ('topk1 significantly BEATS baseline on the paired '
+                      'Bonferroni-corrected contrast; extreme sparsity '
+                      'would then be an advantage, not a cost.'),
+     'predicted_acc_sign': 'negative'},
     {'name': 'dense', 'rope': True, 'topk': _N_BLOCKS, 'use_ste': True,
-     'question': 'is sparse selection better than dense compressed attention?'},
+     'question': 'is sparse selection better than dense compressed attention?',
+     'prediction': ('dense compressed attention sees every block but MQAR '
+                    'needs exactly one: no significant end-task gain over '
+                    'the sparse baseline, with distractor dilution a '
+                    'plausible cause of a drop.'),
+     'falsified_if': ('dense is significantly BETTER than baseline on the '
+                      'paired Bonferroni-corrected contrast; selection '
+                      'would then be a bottleneck rather than a feature. '
+                      'A non-significant difference is INCONCLUSIVE at this '
+                      'seed budget, not equivalence.'),
+     'predicted_acc_sign': 'nonpositive'},
     {'name': 'frozen_indexer', 'rope': True,
      'topk': SMALL_MODEL_SPEC['csa_topk'], 'use_ste': False,
-     'question': 'does LEARNING the top-k selection (STE) matter?'},
+     'question': 'does LEARNING the top-k selection (STE) matter?',
+     'prediction': ('STE training improves selection quality: baseline > '
+                    'frozen_indexer on accuracy and/or gold ranking '
+                    '(gold_pr_auc), with the frozen indexer\'s gold_recall '
+                    'not above chance.'),
+     'falsified_if': ('frozen_indexer is not significantly worse than '
+                      'baseline AND its gold_recall significantly exceeds '
+                      'chance; indexer learning would then not be required '
+                      'for selection quality.'),
+     'predicted_acc_sign': 'negative'},
     {'name': 'no_rope_dense', 'rope': False, 'topk': _N_BLOCKS,
      'use_ste': True,
-     'question': 'interaction: dense attention without positional rotation'},
+     'question': 'interaction: dense attention without positional rotation',
+     'prediction': ('interaction of the two ablations: with no relative-'
+                    'order signal the dense indexer cannot exploit block '
+                    'geometry, so the variant does not beat baseline '
+                    '(recall at or below the no_rope level).'),
+     'falsified_if': ('no_rope_dense significantly BEATS baseline on the '
+                      'paired Bonferroni-corrected contrast; the two '
+                      'ablations would then be super-additive (each alone '
+                      'hurts but together they help), contradicting both '
+                      'single-factor predictions.'),
+     'predicted_acc_sign': 'nonpositive'},
 )
 VARIANT_NAMES = tuple(v['name'] for v in VARIANTS)
 
@@ -674,6 +738,13 @@ def summarize_variant(per_seed, variant):
     return {
         'variant': variant['name'],
         'question': variant['question'],
+        # Pre-registered directional prediction + falsification criterion
+        # (fixed in code before the numbers were read); prediction_status
+        # is filled by main() once the paired contrast is computed.
+        'prediction': variant['prediction'],
+        'falsified_if': variant['falsified_if'],
+        'predicted_acc_sign': variant['predicted_acc_sign'],
+        'prediction_status': None,
         'rope': bool(variant['rope']),
         'topk': int(variant['topk']),
         'use_ste': bool(variant['use_ste']),
@@ -898,6 +969,26 @@ def main():
             row['paired_significant_bonferroni'] = (
                 crit is not None and stats['t_stat'] is not None
                 and abs(stats['t_stat']) > crit)
+            # Verdict against the PRE-REGISTERED prediction: only a
+            # Bonferroni-significant paired contrast can support or
+            # contradict a directional claim; anything else is
+            # 'not_supported' (inconclusive), never confirmation of the
+            # null-style 'nonpositive' predictions.
+            sign_pred = row.get('predicted_acc_sign')
+            if sign_pred is None or stats['mean'] is None:
+                row['prediction_status'] = None
+            elif not row['paired_significant_bonferroni']:
+                row['prediction_status'] = 'not_supported'
+            elif sign_pred == 'negative':
+                row['prediction_status'] = (
+                    'supported' if stats['mean'] < 0 else 'contradicted')
+            elif sign_pred == 'nonpositive':
+                row['prediction_status'] = (
+                    'contradicted' if stats['mean'] > 0 else 'supported')
+            else:
+                raise ValueError(
+                    f'unknown predicted_acc_sign {sign_pred!r} for variant '
+                    f'{row["variant"]!r}')
             recall_t = row['gold_recall_t_vs_chance']
             recall_n = row['n_gold_recall_seeds']
             if recall_t is not None and alpha_corrected is not None:
@@ -916,6 +1007,12 @@ def main():
     n_sig_recall = sum(1 for r in all_rows
                        if r.get('gold_recall_significant_bonferroni'))
     n_compared = sum(1 for r in all_rows if r.get('variant') != 'baseline')
+    n_hyp_supported = sum(1 for r in all_rows
+                          if r.get('prediction_status') == 'supported')
+    n_hyp_contradicted = sum(1 for r in all_rows
+                             if r.get('prediction_status') == 'contradicted')
+    n_hyp_not_supported = sum(1 for r in all_rows
+                              if r.get('prediction_status') == 'not_supported')
     conclusions_valid = bool(
         n_seeds >= 5 and min_seeds_ok >= 5 and len(ok_rows) == len(all_rows)
         and (n_sig_paired > 0 or n_sig_recall > 0))
@@ -934,6 +1031,10 @@ def main():
                 f'{alpha_corrected if alpha_corrected is not None else "n/a"})')
     logger.info(f'  variants with recall above chance (Bonferroni): '
                 f'{n_sig_recall}/{len(all_rows)}')
+    logger.info(f'  pre-registered predictions: {n_hyp_supported} supported '
+                f'/ {n_hyp_contradicted} contradicted / '
+                f'{n_hyp_not_supported} not_supported (inconclusive at this '
+                f'budget)')
     logger.info(f'  conclusions_valid: {conclusions_valid}')
     if not conclusions_valid:
         logger.warning(
@@ -953,8 +1054,32 @@ def main():
         'variants': [
             {'name': v['name'], 'rope': bool(v['rope']),
              'topk': int(v['topk']), 'use_ste': bool(v['use_ste']),
-             'question': v['question']}
+             'question': v['question'],
+             # Pre-registered before the numbers were read (see the
+             # VARIANTS table): directional prediction, falsification
+             # criterion, and the automated outcome counts below.
+             'prediction': v['prediction'],
+             'falsified_if': v['falsified_if'],
+             'predicted_acc_sign': v['predicted_acc_sign']}
             for v in variants],
+        'prediction_status_definition': (
+            'Per-row verdict of the pre-registered prediction against the '
+            'paired Bonferroni-corrected accuracy contrast vs baseline: '
+            'supported = significant AND matching the predicted sign; '
+            'contradicted = significant AND opposite to the predicted sign; '
+            'not_supported = not significant (INCONCLUSIVE at this seed '
+            'budget, never evidence for the null-style nonpositive '
+            'predictions); None = reference variant.'),
+        'hypothesis_outcomes': {
+            'supported': n_hyp_supported,
+            'contradicted': n_hyp_contradicted,
+            'not_supported': n_hyp_not_supported,
+            'note': ('Counts over all reported (variant, n_kv) rows. A '
+                     'prediction is only "supported" under a Bonferroni-'
+                     'significant paired contrast in the predicted '
+                     'direction; the two-sided design can contradict a '
+                     'prediction but cannot confirm a null.'),
+        },
         'gold_recall_definition': (
             "fraction of sequences where the compressed block containing "
             "the cued key/value pair is among the top-k blocks the CSA "
@@ -1048,8 +1173,11 @@ def _print_table(rows):
     print('\n' + '=' * 108)
     print(f"{'variant':>16} | {'rope':>4} | {'k':>2} | {'STE':>3} | "
           f"{'mean_acc':>8} | {'+/-CI95':>7} | {'recall':>6} | "
-          f"{'chance':>6} | {'paired_d':>9} | {'sig':>3} | {'fwd_ms':>7}")
+          f"{'chance':>6} | {'paired_d':>9} | {'sig':>3} | {'pred':>4} | "
+          f"{'fwd_ms':>7}")
     print('-' * 108)
+    pred_tags = {'supported': 'ok', 'contradicted': 'X',
+                 'not_supported': '~'}
     for r in rows:
         track = r.get('variant', '?')
         paired = r.get('paired_vs_baseline_mean_acc_diff')
@@ -1057,6 +1185,7 @@ def _print_table(rows):
         sig_r = r.get('gold_recall_significant_bonferroni')
         sig = 'both' if (sig_p and sig_r) else ('acc' if sig_p
                                                 else ('rec' if sig_r else '-'))
+        pred = pred_tags.get(r.get('prediction_status'), '-')
         print(f"{track:>16} | {str(r.get('rope')):>4} | {r.get('topk'):>2} | "
               f"{str(r.get('use_ste')):>3} | "
               f"{_fmt_num(r.get('mean_acc')):>8} | "
@@ -1064,7 +1193,7 @@ def _print_table(rows):
               f"{_fmt_recall(r.get('mean_gold_recall')):>6} | "
               f"{_fmt_recall(r.get('chance_gold_recall')):>6} | "
               f"{('n/a' if paired is None else format(paired, '+.4f')):>9} | "
-              f"{sig:>3} | {_fmt_num(r.get('mean_fwd_ms'), 2):>7}")
+              f"{sig:>3} | {pred:>4} | {_fmt_num(r.get('mean_fwd_ms'), 2):>7}")
 
 
 if __name__ == '__main__':

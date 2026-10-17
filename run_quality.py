@@ -93,6 +93,11 @@ _VAL_MONITOR_SEED_OFFSET = 6_000_000
 # training, validation monitoring, or the headline eval, so the examples
 # examined are not the samples any metric was computed on.
 _ERROR_ANALYSIS_SEED_OFFSET = 7_000_000
+# Dedicated stream for the non-learned rule-based reference baselines
+# (key lookup / majority count). Disjoint from training (+1M), headline
+# eval (+5M), validation monitoring (+6M), and error analysis (+7M), so
+# computing the rule reference can never perturb any reported metric.
+_RULE_BASELINE_SEED_OFFSET = 8_000_000
 
 
 def _build_param_groups(*modules, weight_decay=0.01):
@@ -831,6 +836,139 @@ SYNTHETIC_TASKS = {
                        'retrieval shortcut)',
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Non-learned rule-based reference baselines (experiment-design
+# requirement: the baseline ladder starts with the SIMPLEST baseline — a
+# rule system — before any learned or complex model).
+#
+# Deterministic SYMBOLIC rules over the raw token ids, no parameters and
+# nothing to tune:
+#   * ``recency_key_lookup``: at the cue position, find the most recent
+#     EARLIER occurrence of the cue token and predict the token that
+#     follows it. This is the exact associative-lookup algorithm MQAR /
+#     kv_update / long_range are built around.
+#   * ``majority_count``: predict the most frequent token in the sequence
+#     (multi_agg's exact target rule).
+#
+# ROLE: a task-ceiling / learnability reference, NOT a competitive tuned
+# baseline. A rule that reads the raw sequence perfectly solves the
+# synthetic task by construction (its accuracy is the ceiling a
+# fixed-budget probe is measured against); the scientific claim "complex
+# operator beats the baseline" still requires ``beats_tuned_baseline=True``
+# against the TUNED LEARNED baseline (softmax), never the rule. The rule
+# answers a different question: is the task symbolically solvable at all,
+# and how much of it does the trained probe recover?
+# ---------------------------------------------------------------------------
+_RULE_NAMES = {
+    'mqar': 'recency_key_lookup',
+    'kv_update': 'recency_key_lookup',
+    'long_range': 'recency_key_lookup',
+    'multi_agg': 'majority_count',
+}
+
+
+def _rule_recency_key_lookup(input_ids, cue_pos):
+    """Symbolic recency lookup over raw token ids.
+
+    For each row: scan ``input_ids[b, :cue_pos]`` for the cue token, take
+    its LAST occurrence, and predict the immediately following token.
+    Falls back to token id 0 when the cue never occurs before the cue
+    position (impossible for the generated tasks, kept as a total-
+    function guard).
+    """
+    batch = input_ids.shape[0]
+    preds = torch.zeros(batch, dtype=input_ids.dtype, device=input_ids.device)
+    for b in range(batch):
+        cue = input_ids[b, cue_pos]
+        history = input_ids[b, :cue_pos]
+        matches = (history == cue).nonzero(as_tuple=False)
+        if matches.numel():
+            i = int(matches[-1].item())
+            preds[b] = input_ids[b, i + 1]
+            # The token following the last cue occurrence must itself be
+            # in-sequence (i + 1 <= cue_pos); for the generated layouts
+            # the pair precedes the cue, so this always holds.
+    return preds
+
+
+def _rule_majority_count(input_ids):
+    """Symbolic majority-count rule (multi_agg's exact target rule).
+
+    Counts every token in the sequence (the readout position is part of
+    the bag) and predicts the argmax class. The generator breaks ties so
+    the target is always a unique strict majority; the rule therefore
+    cannot be ambiguous on generated batches.
+    """
+    vocab = int(input_ids.max().item()) + 1
+    counts = torch.zeros(input_ids.shape[0], vocab,
+                         dtype=torch.long, device=input_ids.device)
+    counts.scatter_add_(1, input_ids,
+                        torch.ones_like(input_ids, dtype=torch.long))
+    return counts.argmax(dim=1)
+
+
+def evaluate_rule_baseline(task, n_kv, seq_len, vocab, device,
+                           n_batches=4, batch=64):
+    """Evaluate the task's non-learned rule on a dedicated RNG stream.
+
+    Returns a JSON-safe record with the rule accuracy, the chance level,
+    the stream provenance, and an explicit ROLE note. The stream seed
+    offset (+8M) is disjoint from training / eval / monitoring / error
+    analysis, so enabling this reference cannot change any reported
+    metric. No parameters are trained and nothing is tuned: the rule is
+    evaluated once on fresh batches.
+    """
+    make_fn = SYNTHETIC_TASKS[task]['make']
+    rule = _RULE_NAMES.get(task)
+    if rule is None:
+        raise ValueError(f'no rule-based reference registered for task '
+                         f'{task!r}')
+    # Zero-initialized throwaway embedding (the rule never reads it). The
+    # construction is RNG-forked so probing the reference cannot perturb
+    # the global stream the sweep seeds itself from.
+    with torch.random.fork_rng():
+        embed = nn.Embedding(vocab, 1)
+        with torch.no_grad():
+            embed.weight.zero_()
+    embed = embed.to(device)
+    generator = make_seeded_generator(_RULE_BASELINE_SEED_OFFSET,
+                                      device=device)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for _ in range(n_batches):
+            _x_emb, target, cue_pos, meta = make_fn(
+                batch, seq_len, n_kv, vocab, embed, device,
+                generator=generator, return_meta=True)
+            input_ids = meta['input_ids']
+            if rule == 'majority_count':
+                preds = _rule_majority_count(input_ids)
+            else:
+                preds = _rule_recency_key_lookup(input_ids, cue_pos)
+            correct += int((preds == target).sum().item())
+            total += int(target.numel())
+    accuracy = (correct / total) if total else None
+    return {
+        'task': task,
+        'n_kv': n_kv,
+        'rule': rule,
+        'accuracy': accuracy,
+        'n_sequences': total,
+        'n_batches': n_batches,
+        'batch': batch,
+        'chance_acc': 1.0 / vocab,
+        'seed_offset': _RULE_BASELINE_SEED_OFFSET,
+        'role': 'non_learned_rule_reference',
+        'tunable_hyperparameters': [],
+        'note': ('Task-ceiling / learnability reference only: a symbolic '
+                 'rule with no parameters, evaluated once on a dedicated '
+                 'RNG stream. It is NOT the comparison baseline for '
+                 'superiority claims (those require beats_tuned_baseline '
+                 'against the tuned learned baseline); it establishes '
+                 'that the synthetic task is solvable by an exact rule '
+                 'and how much of it the fixed-budget probe recovers.'),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3135,6 +3273,34 @@ def main():
             sweep.append((task, n_kv, spec['seq_len'], spec['vocab']))
 
     # ------------------------------------------------------------------
+    # Non-learned rule-based reference (baseline-ladder rung 0): the
+    # simplest possible "model" is not a network at all but the exact
+    # symbolic rule the synthetic task is built around. Evaluated once on
+    # a dedicated stream (+8M), before any training, so it cannot perturb
+    # the sweep; disabled with MQAR_RULE_BASELINE=0. See evaluate_rule_
+    # baseline's docstring for why this is a ceiling reference, NOT the
+    # comparison baseline for superiority claims.
+    # ------------------------------------------------------------------
+    rule_baselines: dict = OrderedDict()
+    rule_baseline_enabled = parse_int_env(
+        'MQAR_RULE_BASELINE', 1, min_value=0, logger=logger) != 0
+    if rule_baseline_enabled:
+        logger.info('\n' + '=' * 70)
+        logger.info('Non-learned rule-based reference (task ceiling; '
+                    'dedicated stream +8M)')
+        logger.info('=' * 70)
+        for task, n_kv, task_seq_len, task_vocab in sweep:
+            rec = evaluate_rule_baseline(
+                task, n_kv, task_seq_len, task_vocab, device)
+            rule_baselines[(task, n_kv)] = rec
+            logger.info(
+                f"  [rule] {task:10s} n_kv={n_kv}: {rec['rule']:20s} "
+                f"acc={rec['accuracy']:.4f} "
+                f"(chance={rec['chance_acc']:.4f}, "
+                f"n={rec['n_sequences']})")
+        logger.info('=' * 70)
+
+    # ------------------------------------------------------------------
     # Pre-training overfit sanity gate (before any multi-seed training):
     # for every (task cell, operator), train a FRESH model on ONE fixed
     # batch with regularization off and check it memorizes the batch
@@ -3370,6 +3536,10 @@ def main():
                                      val_batch=val_batch,
                                      error_batches=error_batches,
                                      error_batch=error_batch)
+                # Attach the non-learned rule reference for this cell next
+                # to the row it contextualizes (see evaluate_rule_baseline:
+                # ceiling reference, not the tuned comparison baseline).
+                r['rule_baseline'] = rule_baselines.get((task, n_kv))
                 all_results.append(r)
                 # ci95_acc may be None when only one seed survived (see
                 # train_multi_seed). Render as 'n/a' instead of crashing on
@@ -3424,6 +3594,7 @@ def main():
                     'error_analysis': None,
                     'mean_final_metrics': None,
                     'pareto': None,
+                    'rule_baseline': rule_baselines.get((task, n_kv)),
                     'per_seed': [],
                 })
 
@@ -3960,6 +4131,7 @@ def main():
                     'val_monitor': _VAL_MONITOR_SEED_OFFSET,
                     'error_analysis': _ERROR_ANALYSIS_SEED_OFFSET,
                     'overfit_gate': _OVERFIT_BATCH_SEED_OFFSET,
+                    'rule_baseline': _RULE_BASELINE_SEED_OFFSET,
                 },
                 'note': ('Synthetic batches are a deterministic function of '
                          '(task generator, task spec, seed + offset); no '
@@ -4075,6 +4247,36 @@ def main():
                          'gets the benefit of tuning, so a complex-operator '
                          'win over the tuned baseline is conservative '
                          '(against the complex op).'),
+            },
+            # Baseline-ladder rung 0: the non-learned symbolic rule the
+            # synthetic tasks are built around (see evaluate_rule_baseline).
+            # This is a task-ceiling / learnability reference, NOT a
+            # competitive tuned baseline — superiority claims still require
+            # beats_tuned_baseline=True against the tuned LEARNED baseline.
+            'rule_baseline_reference': {
+                'enabled': bool(rule_baseline_enabled),
+                'seed_offset': _RULE_BASELINE_SEED_OFFSET,
+                'cells': {
+                    f'{task}/n_kv={n_kv}': dict(rec)
+                    for (task, n_kv), rec in rule_baselines.items()
+                },
+                'accessor': ('per-row `rule_baseline` = the cell record '
+                             '(rule name, accuracy, chance, seed stream) or '
+                             'None for error stubs'),
+                'role': ('non_learned_task_ceiling_reference: a '
+                         'parameter-free symbolic rule evaluated once on a '
+                         'dedicated RNG stream. NOT the comparison baseline '
+                         'for superiority claims (those require '
+                         'beats_tuned_baseline against the tuned learned '
+                         'baseline); it establishes that the task is '
+                         'solvable by an exact rule and quantifies how much '
+                         'of it the fixed-budget trained probe recovers.'),
+                'note': ('The baseline ladder is therefore: rule reference '
+                         '(0 params) -> tuned learned baseline (softmax, lr '
+                         'selected on the held-out stream) -> complex '
+                         'operators, which must beat the TUNED baseline '
+                         '(paired, Bonferroni-corrected) to support a '
+                         'superiority claim.'),
             },
             # Pre-registered mechanism hypotheses (fixed in code BEFORE the
             # numbers were read): what each task probes and what signature
