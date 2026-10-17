@@ -931,9 +931,17 @@ class CSADecodingCache:
             # branch runs in dot-product mode, matching the sparse branch
             # and the full-sequence naive_csa path.
             if self._sw is not None:
+                # The SW key normalize/rotate path runs in the cache's
+                # compute dtype (fp64 for float64 caches) so a float64 cache
+                # stays faithful to the float64 full-sequence path; for
+                # float32 caches this is the same ``torch.float`` it always
+                # was. (An unconditional fp32 round-trip here would silently
+                # quantize float64 SW entries to fp32 precision.)
+                compute_dtype = (
+                    torch.float64 if self.dtype == torch.float64 else torch.float)
                 if self._normalize_qk:
                     ca_norm_i = _qk_normalize(
-                        _to_dtype(ca_i.squeeze(1), torch.float),
+                        _to_dtype(ca_i.squeeze(1), compute_dtype),
                         self.qk_norm_mode)
                     ca_store_i = ca_norm_i.unsqueeze(1)
                 else:
@@ -946,7 +954,7 @@ class CSADecodingCache:
                     pos_t = torch.tensor(
                         [self._n_tokens_seen - 1], device=self.device)
                     ca_store_i = partial_rope(
-                        _to_dtype(ca_store_i, torch.float), pos_t,
+                        _to_dtype(ca_store_i, compute_dtype), pos_t,
                         self.rope_dim_eff, self.rope_base, dim=1)
                 self._sw.append(_to_dtype(ca_store_i, self.dtype))
             # If the accumulator is full, compress and push.
@@ -1045,9 +1053,13 @@ class CSADecodingCache:
         dtype = self.dtype
         # ----- sliding-window branch (batched) -----
         if self._sw is not None:
+            # Compute dtype, not storage dtype: a float64 cache must not be
+            # silently rounded through fp32 (see the matching note in
+            # ``append_step``); fp32 caches are unchanged.
+            compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
             if self._normalize_qk:
                 ca_store = _qk_normalize(
-                    _to_dtype(Ca_new, torch.float), self.qk_norm_mode)
+                    _to_dtype(Ca_new, compute_dtype), self.qk_norm_mode)
             else:
                 ca_store = Ca_new
             if self.rope_dim_eff > 0:
@@ -1055,7 +1067,7 @@ class CSADecodingCache:
                     self._n_tokens_seen, self._n_tokens_seen + T_new,
                     device=self.device)
                 ca_store = partial_rope(
-                    _to_dtype(ca_store, torch.float), pos,
+                    _to_dtype(ca_store, compute_dtype), pos,
                     self.rope_dim_eff, self.rope_base, dim=1)
             self._sw.append_bulk(_to_dtype(ca_store, dtype))
         self._n_tokens_seen += T_new
@@ -1771,9 +1783,17 @@ class HCADecodingCache:
             self._acc_Z.append(z_i)
             self._n_tokens_seen += 1
             if self._sw is not None:
+                # Run the SW key normalize/rotate path in the cache's
+                # compute dtype (fp64 for float64 caches), matching the
+                # compressed-entry path and the full-sequence naive_hca;
+                # an unconditional fp32 round-trip would silently quantize
+                # float64 SW entries to fp32 precision. For float32 caches
+                # this is the same ``torch.float`` it always was.
+                compute_dtype = (
+                    torch.float64 if self.dtype == torch.float64 else torch.float)
                 if self._normalize_qk:
                     c_norm_i = _qk_normalize(
-                        _to_dtype(c_i.squeeze(1), torch.float),
+                        _to_dtype(c_i.squeeze(1), compute_dtype),
                         self.qk_norm_mode)
                     c_store_i = c_norm_i.unsqueeze(1)
                 else:
@@ -1786,7 +1806,7 @@ class HCADecodingCache:
                     pos_t = torch.tensor(
                         [self._n_tokens_seen - 1], device=self.device)
                     c_store_i = partial_rope(
-                        _to_dtype(c_store_i, torch.float), pos_t,
+                        _to_dtype(c_store_i, compute_dtype), pos_t,
                         self.rope_dim_eff, self.rope_base, dim=1)
                 self._sw.append(_to_dtype(c_store_i, self.dtype))
             if len(self._acc_C) == self.m2:
@@ -1836,9 +1856,12 @@ class HCADecodingCache:
         dtype = self.dtype
         # ----- sliding-window branch (batched) -----
         if self._sw is not None:
+            # Compute dtype, not storage dtype (see the matching note in
+            # ``append_step``); fp32 caches are unchanged.
+            compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
             if self._normalize_qk:
                 c_store = _qk_normalize(
-                    _to_dtype(C_new, torch.float), self.qk_norm_mode)
+                    _to_dtype(C_new, compute_dtype), self.qk_norm_mode)
             else:
                 c_store = C_new
             if self.rope_dim_eff > 0:
@@ -1846,7 +1869,7 @@ class HCADecodingCache:
                     self._n_tokens_seen, self._n_tokens_seen + T_new,
                     device=self.device)
                 c_store = partial_rope(
-                    _to_dtype(c_store, torch.float), pos,
+                    _to_dtype(c_store, compute_dtype), pos,
                     self.rope_dim_eff, self.rope_base, dim=1)
             self._sw.append_bulk(_to_dtype(c_store, dtype))
         self._n_tokens_seen += T_new
