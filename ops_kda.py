@@ -429,7 +429,7 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
         else:
             rows = 1
     else:
-        rows = 2 if NT <= 16 else 1
+        rows = 4 if NT <= 16 else 1
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
