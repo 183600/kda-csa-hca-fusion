@@ -102,6 +102,7 @@ from kv_quant import (  # noqa: E402
 )
 from lm_consistency import build_decoding_clone  # noqa: E402
 from ops_fused import HybridConfig  # noqa: E402
+from ppl_bootstrap import paired_bootstrap_ppl  # noqa: E402
 from ops_kda import naive_recurrent_kda  # noqa: E402
 from results_schema import write as write_schema  # noqa: E402
 from run_quant_recall import (  # noqa: E402
@@ -406,13 +407,18 @@ def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
     Scores token-by-token from an empty state; after every write the
     stacked KDA state is fake-quantized at ``spec`` (``None`` = fp16
     baseline). Returns the perplexity, token-weighted mean NLL, token
-    count, per-position argmax (for top-1 agreement) and the state element
-    count. State-write SNR is measured separately by
-    :func:`_decode_state_snr` so this scoring path stays lean.
+    count, per-position argmax (for top-1 agreement), the state element
+    count, and ``per_window`` — the ``(nll_sum, n_tokens)`` sufficient
+    statistic per scored window, in window order, so any two specs on the
+    SAME windows can be compared with the paired unit-level bootstrap
+    (``ppl_bootstrap.paired_bootstrap_ppl``, feeding ``build_ptq_rows``).
+    State-write SNR is measured separately by :func:`_decode_state_snr`
+    so this scoring path stays lean.
     """
     model.eval()
     total_nll, n_tokens = 0.0, 0
     argmaxes = []
+    per_window = []
     state_elements = None
     for ids in windows:
         clone.reset()
@@ -435,8 +441,12 @@ def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
         nll = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
             reduction='none')
-        total_nll += float((nll * mask.reshape(-1)).sum())
-        n_tokens += int(mask.sum())
+        window_nll_sum = float((nll * mask.reshape(-1)).sum())
+        window_n_tokens = int(mask.sum())
+        total_nll += window_nll_sum
+        n_tokens += window_n_tokens
+        per_window.append({'nll_sum': window_nll_sum,
+                           'n_tokens': window_n_tokens})
         argmaxes.append(logits.argmax(-1)[mask])
     return {
         'ppl': _ppl_from_nll(total_nll, n_tokens),
@@ -444,6 +454,7 @@ def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
         'n_tokens': n_tokens,
         'argmax': argmaxes,
         'state_elements': state_elements,
+        'per_window': per_window,
     }
 
 
@@ -516,12 +527,74 @@ def _spec_fields(spec: QuantSpec | None) -> dict:
     }
 
 
-def build_ptq_rows(per_seed: list, specs: list, tolerance: float) -> tuple:
+def _paired_vs_fp16(group: list, fp16_cells_by_seed: dict,
+                    n_boot: int) -> dict | None:
+    """Per-seed paired bootstrap of one spec vs the fp16 baseline.
+
+    Every spec is scored on the SAME held-out windows as the fp16 cell of
+    its seed (``per_window``, window-aligned), so the comparison is
+    paired: the window-difficulty variance cancels and only the
+    quantization effect (plus its interaction with window content)
+    remains. ``ppl_bootstrap.paired_bootstrap_ppl`` supplies the CI for
+    ``delta_mean_nll = quantized - fp16`` and the two-sided centered
+    bootstrap p-value per seed.
+
+    Returns a JSON-safe aggregate over seeds, or ``None`` when no cell
+    carries ``per_window`` units (e.g. legacy/hand-built cells): the
+    paired test is then simply not reported rather than faked.
+    """
+    records = []
+    for cell in group:
+        ref = fp16_cells_by_seed.get(cell['seed'])
+        a_units = cell.get('per_window')
+        b_units = ref.get('per_window') if ref else None
+        if not a_units or not b_units:
+            continue
+        records.append(paired_bootstrap_ppl(
+            a_units, b_units, n_boot=int(n_boot), seed=int(cell['seed'])))
+    if not records:
+        return None
+    deltas = _aggregate([r['delta_mean_nll'] for r in records])
+    p_values = [r['p_value'] for r in records if r['p_value'] is not None]
+    n_sig = sum(1 for r in records if r['significant'])
+    n_worse = sum(1 for r in records
+                  if r['significant'] and r['worse_model'] == 'a')
+    n_better = sum(1 for r in records
+                   if r['significant'] and r['worse_model'] == 'b')
+    keep = ('p_value', 'p_value_resolution', 'significant', 'worse_model',
+            'delta_mean_nll', 'ci_delta_mean_nll', 'ppl_ratio_a_over_b',
+            'ci_ppl_ratio', 'n_units', 'n_tokens_a')
+    return {
+        'n_seeds_tested': len(records),
+        'n_seeds_significant': n_sig,
+        'n_seeds_significant_worse': n_worse,
+        'n_seeds_significant_better': n_better,
+        'all_tested_seeds_significant_worse': bool(
+            records and n_worse == len(records)),
+        'delta_mean_nll_mean': deltas['mean'],
+        'delta_mean_nll_min': deltas['min'],
+        'delta_mean_nll_max': deltas['max'],
+        'p_value_min': min(p_values) if p_values else None,
+        'per_seed': [{k: r[k] for k in keep} for r in records],
+        'alpha': records[0]['alpha'],
+        'n_boot': records[0]['n_boot'],
+        'direction': ('delta_mean_nll = mean_nll(quantized) - '
+                      'mean_nll(fp16) per seed; positive => quantization '
+                      'damage (higher NLL); p-value = two-sided centered '
+                      'paired bootstrap over the shared windows'),
+        'method': records[0]['method'],
+    }
+
+
+def build_ptq_rows(per_seed: list, specs: list, tolerance: float,
+                   n_boot: int = 2000) -> tuple:
     """Aggregate Part A per-seed cells into rows (cells + summary)."""
     seeds = [cell['seed'] for cell in per_seed]
     # fp16 decode ppl per seed for ratio normalization.
     fp16_by_seed = {cell['seed']: cell['decode_ppl']
                     for cell in per_seed if cell['spec'] is None}
+    fp16_cells_by_seed = {cell['seed']: cell
+                          for cell in per_seed if cell['spec'] is None}
     rows = []
     cells = []
     for spec in specs:
@@ -559,6 +632,14 @@ def build_ptq_rows(per_seed: list, specs: list, tolerance: float) -> tuple:
             'ppl_preserving': bool(
                 ratio['min'] is not None and ratio['min'] <= 1.0 + tolerance),
             'tolerance': float(tolerance),
+            # Significance view of the same comparison the tolerance flag
+            # summarizes: is the per-seed quantization damage larger than
+            # the window-sampling noise of this held-out set? (None for the
+            # fp16 reference itself, or when per-window units are
+            # unavailable.)
+            'paired_vs_fp16': (
+                _paired_vs_fp16(group, fp16_cells_by_seed, n_boot)
+                if spec is not None else None),
         }
         row.update(_spec_fields(spec))
         rows.append(row)
@@ -568,6 +649,10 @@ def build_ptq_rows(per_seed: list, specs: list, tolerance: float) -> tuple:
     preserving = [r for r in quantized if r['ppl_preserving']]
     worst = (max(quantized, key=lambda r: r['ppl_ratio_mean'])
              if quantized else None)
+    significant_damage = [
+        r for r in quantized
+        if (r.get('paired_vs_fp16') or {}).get(
+            'all_tested_seeds_significant_worse')]
     rows.append({
         'row_kind': 'ptq_summary',
         'model': 'hybrid_lm',
@@ -583,6 +668,14 @@ def build_ptq_rows(per_seed: list, specs: list, tolerance: float) -> tuple:
             min(preserving, key=lambda r: r['state_bytes'])
             if preserving else None),
         'worst_cell': worst,
+        'n_cells_significant_damage_all_seeds': len(significant_damage),
+        'significant_damage_note': (
+            'cells whose quantized-vs-fp16 paired bootstrap over the '
+            'shared held-out windows was significant (alpha=0.05) and '
+            'worse for EVERY tested seed; the tolerance flag '
+            'ppl_preserving answers "is the ratio small", this answers '
+            '"is it distinguishable from window-sampling noise" — a cell '
+            'can pass one and fail the other at these corpus sizes'),
     })
     return rows
 
@@ -893,6 +986,11 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
                 'top1_agreement': agreement,
                 'state_elements': scored['state_elements'],
                 'state_snr_db': snr,
+                # Per-window (nll_sum, n_tokens) sufficient statistic: the
+                # inputs of the paired quantized-vs-fp16 bootstrap in
+                # build_ptq_rows. Same window order for every spec, so the
+                # pairing is exact by construction.
+                'per_window': scored['per_window'],
             })
         train_reports.append(report)
         logger.info(
@@ -990,6 +1088,17 @@ def _print_ptq(rows):
             f"{row['ppl_ratio_mean']:.4f} | "
             f"{row['top1_agreement_mean']:.3f} | "
             f"{row['state_snr_db_mean']:.1f}")
+        paired = row.get('paired_vs_fp16')
+        if paired:
+            _d = paired['delta_mean_nll_mean']
+            _p = paired['p_value_min']
+            logger.info(
+                f"{'':>12}   paired vs fp16: "
+                f"{paired['n_seeds_significant_worse']}/"
+                f"{paired['n_seeds_tested']} seeds significant worse, "
+                f"delta NLL mean "
+                f"{'n/a' if _d is None else f'{_d:+.4f}'} "
+                f"(p_min {'n/a' if _p is None else f'{_p:.4g}'})")
 
 
 def _print_qat(rows):
@@ -1037,10 +1146,14 @@ def main():
     specs = [s for s in default_sweep_specs(bits, groups,
                                             include_asymmetric=True)
              if s is not None]
+    # Bootstrap replicates for the paired quantized-vs-fp16 test over the
+    # shared held-out windows (pure Python, no extra forwards).
+    pp_boot = parse_int_env('QLM_PPL_BOOT', 2000, min_value=1)
     logger.info(f'  seeds: {list(seeds)}, steps: {steps}, '
                 f'qat_steps: {qat_steps}, seq_len: {seq_len}, '
                 f'batch: {batch_size}, eval_seqs: {eval_seqs}')
-    logger.info(f'  specs: {len(specs)} quantized cells + fp16')
+    logger.info(f'  specs: {len(specs)} quantized cells + fp16 '
+                f'(paired bootstrap n_boot={pp_boot})')
 
     tokenizer, split_texts, split_report = build_corpus(
         seq_len=seq_len, n_texts=n_corpus, seed=0)
@@ -1060,7 +1173,8 @@ def main():
         device=device, tokenizer=tokenizer, split_texts=split_texts,
         seeds=seeds, specs=specs, steps=steps, seq_len=seq_len,
         batch_size=batch_size, eval_seqs=eval_seqs, tolerance=tolerance)
-    ptq_rows = build_ptq_rows(ptq_per_seed, [None] + specs, tolerance)
+    ptq_rows = build_ptq_rows(ptq_per_seed, [None] + specs, tolerance,
+                              n_boot=pp_boot)
     _print_ptq(ptq_rows)
 
     qat_rows: list = []
@@ -1110,6 +1224,15 @@ def main():
                                    'decode_ppl(fp16) on the SAME path and '
                                    'seed; min-over-seeds for the '
                                    'ppl_preserving flag',
+            'paired_bootstrap': (
+                'quantized vs fp16 scored on the SAME held-out windows, '
+                'so the paired unit-level bootstrap '
+                '(ppl_bootstrap.paired_bootstrap_ppl) separates the '
+                'quantization effect from window-sampling noise: CI for '
+                'delta_mean_nll = quantized - fp16 and a two-sided '
+                'centered bootstrap p-value, per seed; the seed-level '
+                'aggregate is in each ptq_ppl row as paired_vs_fp16. '
+                f'n_boot={pp_boot} (env QLM_PPL_BOOT)'),
             'tolerance': tolerance,
             'qat': 'straight-through fake_quantize (ste=True) on every '
                    'state write during training; inference scoring uses '

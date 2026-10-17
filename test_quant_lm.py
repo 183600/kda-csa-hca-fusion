@@ -268,6 +268,17 @@ def test_stepwise_kda_lm_qat_smoke():
 
 # --- 4. report self-consistency -------------------------------------------
 
+def _fake_window_units(total_nll, counts, profile):
+    """Window units whose token-weighted mean reproduces the cell's NLL."""
+    assert abs(sum(profile) - 1.0) < 1e-12
+    return [{'nll_sum': total_nll * w, 'n_tokens': c}
+            for w, c in zip(profile, counts)]
+
+
+_FP16_PROFILE = [0.24, 0.30, 0.22, 0.24]
+_QUANT_PROFILE = [0.20, 0.36, 0.20, 0.24]
+
+
 def _fake_cells():
     """Minimal per-seed cells accepted by the row builders."""
     spec = QuantSpec(bits=2, group_size=16)
@@ -278,12 +289,18 @@ def _fake_cells():
             'decode_ppl': fp16_ppl, 'mean_nll': math.log(fp16_ppl),
             'n_tokens': 100, 'top1_agreement': 1.0,
             'state_elements': 512, 'state_snr_db': math.inf,
+            'per_window': _fake_window_units(math.log(fp16_ppl) * 100,
+                                             [25, 25, 25, 25],
+                                             _FP16_PROFILE),
         })
         cells.append({
             'seed': seed, 'spec': spec, 'prefill_ppl': fp16_ppl * 1.001,
             'decode_ppl': quant_ppl, 'mean_nll': math.log(quant_ppl),
             'n_tokens': 100, 'top1_agreement': 0.9,
             'state_elements': 512, 'state_snr_db': 10.0,
+            'per_window': _fake_window_units(math.log(quant_ppl) * 100,
+                                             [25, 25, 25, 25],
+                                             _QUANT_PROFILE),
         })
     return cells
 
@@ -323,6 +340,33 @@ def test_quant_lm_report_rows():
         math.isfinite(s['prefill_decode_ppl_ratio'])
         and s['prefill_decode_ppl_ratio'] > 0.0,
         f"{s['prefill_decode_ppl_ratio']:.6f}")
+
+    # Paired quantized-vs-fp16 bootstrap (per-window units are supplied by
+    # _fake_cells, so the paired path must be populated and self-consistent).
+    paired = q['paired_vs_fp16']
+    _ok('paired_vs_fp16 is populated when per-window units exist',
+        paired is not None and paired['n_seeds_tested'] == 2,
+        f"{None if paired is None else paired['n_seeds_tested']}")
+    _ok('paired deltas are positive (quantized has higher NLL) for both '
+        'seeds',
+        paired is not None
+        and all(r['delta_mean_nll'] > 0.0 for r in paired['per_seed'])
+        and paired['delta_mean_nll_min'] > 0.0,
+        '' if paired is None else
+        f"{[round(r['delta_mean_nll'], 4) for r in paired['per_seed']]}")
+    _ok('paired CI bounds are ordered and the ratio CI is positive',
+        paired is not None and all(
+            r['ci_delta_mean_nll'][0] <= r['ci_delta_mean_nll'][1]
+            and 0.0 < r['ci_ppl_ratio'][0] <= r['ci_ppl_ratio'][1]
+            for r in paired['per_seed']),
+        '')
+    _ok('fp16 reference row carries no paired comparison',
+        next(r for r in ptq if not r['quantized'])['paired_vs_fp16'] is None,
+        '')
+    _ok('summary counts cells whose damage is significant for all seeds',
+        isinstance(s['n_cells_significant_damage_all_seeds'], int)
+        and 0 <= s['n_cells_significant_damage_all_seeds'] <= len(ptq),
+        f"{s['n_cells_significant_damage_all_seeds']}")
 
     qat_cells = [
         {'seed': 0, 'steps': 10, 'qat_steps': 10, 'fp16_ppl': 2.0,

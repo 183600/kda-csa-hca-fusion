@@ -430,9 +430,10 @@ def _summarize_selection(captured: dict, cfg: HybridConfig, *,
         'n_compared': n_total,
         'mismatches': mismatches,
         'note': ('set equality of selected block indices per (layer, query '
-                 'position); torch.topk tie-breaking may split ties '
-                 'differently between the batched prefill and per-token '
-                 'decode tensors — see ops_decoding_cache module docstring'),
+                 'position); the indexer breaks score ties on ascending '
+                 'block index (canonical, size-independent), so a mismatch '
+                 'indicates genuine state/math divergence rather than '
+                 'torch.topk tie-breaking'),
     })
     return base
 
@@ -480,8 +481,10 @@ def prefill_decode_tower_outputs(model, input_ids, prefill_len: int | None = Non
     With ``capture_selection=True`` the CSA lightning-indexer index tensors
     of BOTH paths are recorded (via a temporary module-level patch of
     ``csa_lightning_indexer``) and returned under ``selection_records`` so
-    the caller can separate top-k tie-breaking divergence from genuine
-    state/math divergence.
+    the caller can separate selection divergence from genuine state/math
+    divergence. Exact score ties cannot split the paths (the indexer
+    breaks ties on ascending block index), so a mismatch here indicates
+    near-tied logits with differing fp ordering or a real selection bug.
     """
     cfg, hybrid = _tower(model)
     T = int(input_ids.shape[1])
@@ -610,11 +613,13 @@ def run_lm_consistency_check(model, input_ids, *, prefill_len: int | None = None
 
     * ``'consistent'``: drift is within tolerance;
     * ``'topk_selection_divergence'``: the causal logit drift coincides
-      with prefill/decode indexer selections differing — expected when
-      the indexer logits are tied/near-tied and ``torch.topk`` breaks the
-      tie differently in the batched vs per-token tensors (documented in
-      ``ops_decoding_cache``); typically a benign artifact of a sparse,
-      untrained/loosely-trained indexer, NOT a cache state bug;
+      with prefill/decode indexer selections differing. Exact ties no
+      longer split the two paths (the indexer breaks ties on ascending
+      block index via ``ops_csa._canonical_topk_indices``), so this now
+      points at NEAR-tied logits whose fp ordering differs between the
+      batched and per-token tables — still typically an artifact of a
+      sparse, untrained/loosely-trained indexer, NOT a cache state bug,
+      but worth inspecting the recorded mismatches;
     * ``'state_or_math_divergence'``: drift above tolerance while the
       selections still agree — investigate the incremental caches.
     """

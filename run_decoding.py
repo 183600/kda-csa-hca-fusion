@@ -32,7 +32,6 @@ or growing (softmax KV / CSA-HCA compressed caches). See
 from __future__ import annotations
 
 import gc
-import json
 import os
 import statistics
 import sys
@@ -52,7 +51,7 @@ from ops_csa import naive_csa, _qk_normalize
 from ops_hca import naive_hca
 from ops_decoding_cache import CSADecodingCache, HCADecodingCache
 from ops_fused import (
-    HybridConfig, HybridKCHAttention, KDAHybridLayer, CSAHybridLayer,
+    HybridConfig, HybridKCHAttention, CSAHybridLayer,
     HCAHybridLayer,
 )
 from ops_mamba import build_mamba2_mixer
@@ -92,9 +91,11 @@ _DEFERRED_IMPORT_WARNING = (
     "dynamically-updated indexer key cache. KDA and Mamba-2 carry their "
     "fixed O(1) recurrent states (KDA: stacked per-layer state + conv "
     "lookbacks; Mamba-2: SSM state + conv state). The hybrid rows wire "
-    "the CSA/HCA caches into the full stacks. See README 'Fairness "
-    "notes' #4 for the ``torch.topk`` tie-breaking caveat for CSA's "
-    "incremental indexer (a numerical artifact, not a correctness bug)."
+    "the CSA/HCA caches into the full stacks. The CSA indexer's hard "
+    "top-k is deterministic and size-independent (ties break on "
+    "ascending block index; see ops_csa._canonical_topk_indices), so "
+    "full-prefill and incremental-decode selections agree exactly. See "
+    "README 'Fairness notes' #4 for the decoding-cache scope."
 )
 
 

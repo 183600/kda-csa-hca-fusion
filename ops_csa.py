@@ -415,6 +415,64 @@ def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
         f"'rms' (paper §2.3.3 RMSNorm form)")
 
 
+def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Top-k indices with a deterministic, shape-independent tie-break.
+
+    ``torch.topk`` leaves the order of equal values unspecified, and its
+    choice depends on the input's SIZE (verified on CPU: ``torch.zeros(3)``
+    and ``torch.zeros(4)`` with one larger entry return different positions
+    for the tied runner-up) and on the backend. That matters for CSA: the
+    batched-prefill indexer scores ``n_blocks_full`` entries (causally
+    invalid blocks masked to ``-inf``) while the per-token decode path
+    scores only the already-completed ``n_blocks_inc`` blocks whose number
+    grows with the position. With tied ReLU scores (common when the dot
+    products are negative and the scores saturate at 0) the two paths
+    could select DIFFERENT equal-valued blocks, so the incremental decode
+    output stopped being a function of the model's scores alone.
+
+    This selector makes the selection a pure function of the score vector
+    by breaking ties on ASCENDING block index. Cost stays O(n), like
+    ``torch.topk``: one ``topk`` call supplies the S-th largest score
+    (the boundary value), then boolean/comparison masks pick the entries
+    strictly above the boundary plus the smallest-index boundary ties
+    needed to fill the S slots. No full sort is performed.
+
+    The returned slots reproduce ``torch.topk``'s score-descending order
+    (stable, so ties keep the ascending-index rule) and entries selected
+    at ``-inf`` (fewer than ``k`` finite scores available) are reported as
+    ``-1`` (invalid slot), matching the historical contract. ``k`` may
+    exceed the score count; the caller pads the result.
+    """
+    n = scores.shape[-1]
+    s = min(k, n)
+    if s == 0:
+        return scores.new_zeros(*scores.shape[:-1], 0, dtype=torch.long)
+    # S-th largest score; ties exactly at this boundary are resolved below.
+    boundary = torch.topk(scores, s, dim=-1).values[..., -1:]
+    strictly_above = scores > boundary
+    n_above = strictly_above.sum(dim=-1, keepdim=True)
+    at_boundary = scores == boundary
+    # Fill the remaining slots with the SMALLEST indices tied at the
+    # boundary (the canonical rule). Exactly `s` entries are selected per
+    # row (n_above + boundary ties >= s by the definition of the boundary).
+    # Explicit ``dtype=torch.int32``: a bool cumsum promotes to int64 and
+    # costs ~15x more on a [., T, n_blocks] tensor (measured CPU, torch
+    # 2.14: 3.3 ms -> 0.2 ms per call at T=2048, n_blocks=256).
+    tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
+    fill_ties = at_boundary & (tie_rank <= (s - n_above))
+    selected = strictly_above | fill_ties
+    # With exactly `s` selected entries per row, the row-major nonzero
+    # coordinates group into [..., s] with ascending indices per row.
+    indices = selected.nonzero()[:, -1].view(*scores.shape[:-1], s)
+    values = scores.gather(-1, indices)
+    # Restore the score-descending slot order (stable: boundary ties keep
+    # the canonical ascending-index order).
+    order = torch.argsort(values, dim=-1, descending=True, stable=True)
+    indices = torch.gather(indices, -1, order)
+    values = torch.gather(values, -1, order)
+    return indices.masked_fill(torch.isinf(values), -1)
+
+
 def csa_lightning_indexer(
     q_idx: torch.Tensor,            # [B, T, HI, DI]
     k_idx: torch.Tensor,            # [B, n_blocks, DI]
@@ -430,6 +488,18 @@ def csa_lightning_indexer(
     """Top-k selection over compressed indexer keys (Eq. 13–17).
 
     Returns indices of shape ``[B, T, topk]`` (padded with -1).
+
+    Selection contract — deterministic, size-independent tie-break
+    ---------------------------------------------------------------
+    The hard selection is computed by :func:`_canonical_topk_indices`,
+    NOT by a bare ``torch.topk`` call: equal scores are ordered by
+    ASCENDING block index, so the selected SET is a pure function of the
+    score vector. This is what lets the batched-prefill and per-token
+    incremental-decode paths agree index-for-index (previously their
+    differently-sized score tensors made ``torch.topk`` split ReLU zero
+    ties differently — see ``ops_decoding_cache``'s module docstring).
+    Selected slots are ordered by descending score (ascending index among
+    ties); entries selected at ``-inf`` are reported as ``-1``.
 
     Parameters
     ----------
@@ -489,10 +559,11 @@ def csa_lightning_indexer(
 
     .. note:: Straight-through estimator (STE) for the indexer.
 
-        The returned ``idx`` tensor is an integer tensor produced by
-        ``torch.topk``. Integer indices do NOT propagate gradients, so
-        an auxiliary path is needed for autograd to flow back from the
-        loss through the selection to the indexer parameters
+        The returned ``idx`` tensor is an integer tensor produced by the
+        deterministic top-k selector (``_canonical_topk_indices``).
+        Integer indices do NOT propagate gradients, so an auxiliary path
+        is needed for autograd to flow back from the loss through the
+        selection to the indexer parameters
         (``W_IUQ``, ``W_w``, ``W_KV_idx``, ``W_Z_idx``, ``B_idx`` in
         ``CSAHybridLayer``).
 
@@ -529,9 +600,8 @@ def csa_lightning_indexer(
         also guards here so a
         direct caller of ``csa_lightning_indexer`` (it is a PUBLIC
         function imported by ``run_correctness.py`` and
-        ``method_analysis.py``) does not crash with
-        ``RuntimeError: selected index k out of range`` from
-        ``torch.topk``. With ``topk=0`` we return an indices tensor
+        ``method_analysis.py``) does not hit the underlying selector's
+        empty-selection edge. With ``topk=0`` we return an indices tensor
         of shape ``[B, T, 0]`` (no valid slots) and, if requested, a
         ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` (the
         full differentiable distribution — still useful for an
@@ -643,8 +713,10 @@ def csa_lightning_indexer(
             return idx, soft_weights
         return idx
     S = min(topk, n_blocks)
-    values, idx = torch.topk(logits, S, dim=-1)                        # [B, T, S]
-    idx = idx.masked_fill(torch.isinf(values), -1)
+    # Deterministic, size-independent top-k (ties by ascending block
+    # index) — see ``_canonical_topk_indices``. This is what keeps the
+    # batched-prefill and incremental-decode selections identical.
+    idx = _canonical_topk_indices(logits, S)
     if topk > S:
         idx = torch.cat([idx, idx.new_full((B_, T, topk - S), -1)], dim=-1)
     # Compute a differentiable soft distribution over ALL

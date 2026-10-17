@@ -99,9 +99,12 @@ single-token decode; one-shot == segmented prefill (outputs AND final
 states); future-token perturbation leaves past outputs unchanged;
 sub-conv-kernel chunks and T=0; interleaved requests with different batch
 sizes keep unpolluted state; weight save/load roundtrip; both hybrid
-routes' prefill+decode == full-sequence equivalence (~1e-7, with the
-documented `torch.topk` tie-breaking caveat handled by the `csa_topk=100`
-test protocol).
+routes' prefill+decode == full-sequence equivalence (~1e-7). The CSA
+indexer's hard top-k is deterministic and size-independent (ties break on
+ascending block index, `ops_csa._canonical_topk_indices`), so the
+prefill/decode selection agreement no longer depends on the score-tensor
+size; the `csa_topk=100` select-all protocol is retained as
+defense-in-depth in the legacy decoding-cache tests.
 
 ## 4. Backends
 
@@ -412,9 +415,11 @@ not to pre-empt the answer by changing the default route.
   Its device-level latency is measured by `latency_profile.py` (section
   4.3); those numbers are host- and torch-build-specific and must not be
   compared across machines.
-* Hybrid-decode equality uses the `csa_topk=100` protocol because of the
-  `torch.topk` tie-breaking artifact documented in the README (a
-  numerical artifact, identical for both memory routes).
+* Hybrid-decode equality tests use the `csa_topk=100` protocol (select
+  every visible block); with the deterministic ascending-index tie-break
+  in `ops_csa._canonical_topk_indices` this is defense-in-depth, not a
+  workaround for a tie-breaking artifact (a numerical artifact, identical
+  for both memory routes).
 * The smoke profile validates the pipeline before a full run.
 * The precision sweep's budgets are smoke-level regression envelopes, not
   numerical-error theorems, and its autocast numbers are torch-build- and

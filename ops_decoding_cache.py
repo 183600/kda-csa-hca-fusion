@@ -37,8 +37,8 @@ For a sequence of ``T`` tokens fed ONE AT A TIME through ``append_step``,
 the per-token outputs produced by :meth:`CSADecodingCache.forward_step`
 / :meth:`HCADecodingCache.forward_step` are **bit-identical (to fp32
 tolerance) to the corresponding rows of ``naive_csa`` / ``naive_hca``
-called once on the full ``[B, T, d]`` sequence**, PROVIDED that the
-CSA indexer's top-k selection is unambiguous (no tied scores).
+called once on the full ``[B, T, d]`` sequence** — including when the
+CSA indexer's scores tie (see "Deterministic tie-breaking" below).
 
 The bit-equivalence holds because:
 
@@ -60,30 +60,21 @@ The bit-equivalence holds because:
     just-completed — remains unavailable through the sparse branch and is
     served by the sliding-window branch instead).
 
-Known limitation: torch.topk tie-breaking
------------------------------------------
-When the CSA indexer's ReLU scores have many exact ties at 0 (which
-happens when the dot products are negative — common with random
-untrained weights but rare in trained models where the indexer learns
-discriminative scores), ``torch.topk``'s tie-breaking depends on the
-tensor SIZE. The full path's tensor has ``n_blocks_full = T_padded // m``
-entries (including -inf-masked future blocks); the incremental path's
-tensor has only ``n_blocks_inc`` entries (no padding). With the same
-underlying scores but different tensor sizes, ``torch.topk`` may pick
-DIFFERENT tied blocks, leading to different gathered ``kv`` and
-different sparse-attention outputs.
-
-This is a ``torch.topk`` implementation artifact, NOT a correctness bug
-in the cache — both paths select valid blocks with the highest scores,
-just different tie-breaking. In a trained model the indexer's scores
-are discriminative (the whole point of the indexer is to learn which
-blocks to select), so ties are rare and the issue does not arise in
-practice.
-
-For correctness testing, the regression tests use ``topk >= n_blocks``
-(so ALL valid blocks are selected, making the output
-permutation-invariant over the selected set and thus independent of
-tie-breaking).
+Deterministic tie-breaking
+--------------------------
+The hard selection is computed by ``ops_csa._canonical_topk_indices``,
+which breaks equal indexer scores on ASCENDING block index instead of
+delegating to a bare ``torch.topk``. ``torch.topk``'s tie choice depends
+on the tensor's size: the full path scores ``n_blocks_full = T_padded //
+m`` entries (including ``-inf``-masked future blocks) while the
+incremental path scores only the ``n_blocks_inc`` completed blocks, so
+with tied ReLU scores (e.g. dot products saturating at 0) the two paths
+used to be able to pick DIFFERENT equal-valued blocks and diverge. With
+the canonical selector the selected SET is a pure function of the score
+vector, so prefill and incremental decode agree index-for-index even
+under ties; ``run_correctness.py`` pins this with
+``test_csa_indexer_canonical_tiebreak`` and
+``test_csa_decoding_cache_sparse_topk_ties``.
 
 What this is NOT
 ----------------
@@ -104,7 +95,6 @@ spec they would be validated against.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import (csa_compress_kv, csa_compress_kv_overlapped,
@@ -548,11 +538,12 @@ class CSADecodingCache:
     ``append_step`` + ``forward_step``, the per-token outputs are bit-
     identical (to fp32 tolerance) to the corresponding rows of
     ``naive_csa`` called once on the full ``[B, T, d]`` sequence,
-    PROVIDED the indexer's top-k selection is unambiguous. See the
-    module-level docstring for the ``torch.topk`` tie-breaking caveat
-    and the regression test ``test_csa_decoding_cache_correctness`` in
-    ``run_correctness.py`` for the verification (which uses
-    ``topk >= n_blocks`` to sidestep the tie-breaking issue).
+    including under tied indexer scores. See the module-level docstring
+    ("Deterministic tie-breaking") and the regression tests
+    ``test_csa_decoding_cache_correctness`` /
+    ``test_csa_decoding_cache_sparse_topk_ties`` in ``run_correctness.py``
+    for the verification (the latter exercises sparse ``topk < n_blocks``
+    with maximally tied scores).
     """
 
     def __init__(

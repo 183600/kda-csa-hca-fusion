@@ -30,7 +30,14 @@ accuracy by position and by copy distance, with decoded examples); and
 memory next to the quality numbers, so a gain can never be claimed
 without its cost.
 """
-import os, sys, time, argparse, random, json, gc, hashlib, datetime, math
+import os
+import sys
+import time
+import argparse
+import gc
+import hashlib
+import datetime
+import math
 from collections import OrderedDict
 import torch
 import torch.nn as nn
@@ -71,6 +78,7 @@ from kaggle_setup import (configure_torch_for_device, set_global_seed,
 from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
                               diagnose_training_curves, lm_token_diagnostics,
                               summarize_lm_diagnostics)
+from ppl_bootstrap import bootstrap_ppl_ci, throughput_summary
 
 # tokenizer / dataset handling (reuse TinyStories if available)
 try:
@@ -442,7 +450,8 @@ class SealedTestSet:
 
 @torch.no_grad()
 def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
-                     max_batches=None, use_amp=False, autocast_dtype=None):
+                     max_batches=None, use_amp=False, autocast_dtype=None,
+                     return_units=False):
     """Token-weighted mean cross-entropy loss of ``model`` on ``dataset``.
 
     Deterministic, read-only evaluation used for validation monitoring,
@@ -463,6 +472,17 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
         the number of UNMASKED tokens, so a capped pass is still an
         unbiased token-level estimate of the full split.
 
+    ``return_units=True`` additionally attaches ``per_unit`` — one
+    ``{index, nll_sum, n_tokens}`` record per scored dataset item, in
+    dataset order — the sufficient statistic for the unit-level
+    bootstrap inference in ``ppl_bootstrap`` (CI / paired tests for
+    perplexity comparisons). In that mode the reported ``loss`` is
+    rebuilt by summing the unit NLL sums (per-token cross-entropy from
+    ``out['logits']``, ignore_index=-100), so the point estimate and the
+    bootstrap inputs are the SAME arithmetic; the two paths agree within
+    float rounding. Batches with no supervised tokens contribute no
+    units (they also contributed nothing before).
+
     Returns a JSON-serializable report. ``loss`` / ``perplexity`` are
     ``None`` when the dataset has no supervised tokens.
     """
@@ -476,12 +496,15 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
     model.eval()
     total_nll, total_tokens = 0.0, 0
     n_batches = n_sequences = 0
+    per_unit: list[dict] = []
+    unit_offset = 0
     try:
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             n_tok = int((labels != -100).sum())
             if n_tok == 0:
+                unit_offset += int(labels.shape[0])
                 continue
             model.hybrid.reset_state()
             with torch.autocast(device_type=device.type,
@@ -506,8 +529,32 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
                     f'non-finite held-out LM loss ({loss}) during '
                     f'evaluation; refusing to report a corrupted metric. '
                     f'Diagnosis [{diag["verdict"]}]: {diag["summary"]}')
-            total_nll += float(loss.detach()) * n_tok
+            if return_units:
+                # Per-item NLL sums for the unit-level bootstrap. The
+                # logits are recomputed through the SAME ignore_index
+                # cross-entropy the model uses internally; positions with
+                # label -100 contribute exactly 0 to both the sum and
+                # (via the mask) the token count.
+                logits = out["logits"]
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                tok_nll = F.cross_entropy(
+                    flat_logits.float(), labels.reshape(-1),
+                    ignore_index=-100, reduction='none').view(labels.shape)
+                row_sums = tok_nll.sum(dim=1)
+                row_counts = (labels != -100).sum(dim=1)
+                for b in range(int(labels.shape[0])):
+                    per_unit.append({
+                        'index': unit_offset + b,
+                        'nll_sum': float(row_sums[b]),
+                        'n_tokens': int(row_counts[b]),
+                    })
+                # Rebuild the total from the units so the point estimate
+                # and the bootstrap inputs are the same arithmetic.
+                total_nll += float(row_sums.sum())
+            else:
+                total_nll += float(loss.detach()) * n_tok
             total_tokens += n_tok
+            unit_offset += int(labels.shape[0])
             n_batches += 1
             n_sequences += int(input_ids.shape[0])
             if max_batches is not None and n_batches >= int(max_batches):
@@ -515,7 +562,7 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
     finally:
         model.train(was_training)
     mean_loss = (total_nll / total_tokens) if total_tokens else None
-    return {
+    report = {
         'loss': mean_loss,
         'perplexity': (math.exp(min(mean_loss, 700.0))
                        if mean_loss is not None else None),
@@ -529,6 +576,14 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
         'shuffle': False,
         'grad_enabled': False,
     }
+    if return_units:
+        report['per_unit'] = per_unit
+        report['per_unit_contract'] = (
+            'one record per scored dataset item in dataset order: '
+            '{index, nll_sum, n_tokens}; consumed by '
+            'ppl_bootstrap.bootstrap_ppl_ci / paired_bootstrap_ppl; '
+            'records with n_tokens == 0 are dropped by normalize_units')
+    return report
 
 
 def _decode_tokens(tokenizer, ids):
@@ -975,9 +1030,9 @@ def _print_consistency_report(report, title=''):
               f"(decode {selection['decode_agreement']:.4f}, "
               f"{selection.get('n_compared', 0)} positions compared)")
         if report.get('diagnosis') == 'topk_selection_divergence':
-            print("[consistency] NOTE: drift is explained by torch.topk "
-                  "tie-breaking (see ops_decoding_cache docstring), not by "
-                  "cache state corruption")
+            print("[consistency] NOTE: selections differ while exact ties "
+                  "cannot split the paths (ascending-index tie-break); "
+                  "inspect the recorded near-tie mismatches")
     if roof:
         print(f"[roofline] decode at T={roof['context_len']}: "
               f"AI={roof['arithmetic_intensity_flops_per_byte']:.3f} "
@@ -1096,6 +1151,14 @@ def main():
                         help="Cap the number of batches per validation/test "
                              "pass for a bounded compute budget (default 64; "
                              "0 = evaluate the full split).")
+    parser.add_argument("--ppl_bootstrap_nboot", type=int, default=2000,
+                        help="Bootstrap replicates for the unit-level "
+                             "perplexity CI on the sealed test split "
+                             "(default 2000; 0 disables the CI). The "
+                             "bootstrap resamples whole evaluation "
+                             "sequences, reusing the SAME single test pass "
+                             "(no extra forward), so the CI adds no compute "
+                             "beyond pure-Python resampling.")
     parser.add_argument("--early_stop_patience", type=int, default=5,
                         help="Stop training after this many consecutive "
                              "validation checks without improvement "
@@ -1184,6 +1247,8 @@ def main():
         raise SystemExit("--error_analysis_batches must be >= 0")
     if args.error_analysis_examples < 0:
         raise SystemExit("--error_analysis_examples must be >= 0")
+    if args.ppl_bootstrap_nboot < 0:
+        raise SystemExit("--ppl_bootstrap_nboot must be >= 0 (0 disables)")
 
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
     info = configure_torch_for_device()
@@ -1765,7 +1830,8 @@ def main():
         pbar.set_postfix({"loss": f"{step_loss:.4f}"})
 
         if optimizer_step % 10 == 0:
-            print(f"step {optimizer_step} loss {sum(recent_step_losses) / len(recent_step_losses):.4f}")
+            mean_recent = sum(recent_step_losses) / len(recent_step_losses)
+            print(f"step {optimizer_step} loss {mean_recent:.4f}")
             recent_step_losses.clear()
 
         if optimizer_step % 500 == 0:
@@ -1824,13 +1890,40 @@ def main():
     test_report = evaluate_lm_loss(
         model, test_dataset, batch_size=batch_size, device=device,
         max_batches=eval_batch_cap, use_amp=use_amp,
-        autocast_dtype=autocast_dtype)
+        autocast_dtype=autocast_dtype, return_units=True)
     test_report['elapsed_s'] = time.time() - test_t0
+    test_units = test_report.pop('per_unit', [])
+    test_report.pop('per_unit_contract', None)
+    # The evaluation pass is a pure-prefill workload: record its throughput
+    # next to the quality number, from the SAME single pass (no second
+    # forward). End-to-end loop timing, same-machine comparisons only.
+    test_report['prefill_throughput'] = throughput_summary(
+        n_tokens=test_report['n_tokens'],
+        elapsed_s=test_report['elapsed_s'],
+        n_sequences=test_report['n_sequences'])
+    # Unit-level bootstrap CI for the final perplexity: quantifies the
+    # sampling uncertainty of THIS held-out corpus (resampling whole
+    # sequences, not tokens). Cheap (pure-Python, same single pass).
+    n_boot = int(getattr(args, 'ppl_bootstrap_nboot', 0) or 0)
+    if test_units and n_boot > 0:
+        test_report['ppl_bootstrap'] = bootstrap_ppl_ci(
+            test_units, n_boot=n_boot, seed=args.seed)
+    else:
+        test_report['ppl_bootstrap'] = {
+            'skipped': True,
+            'reason': ('--ppl_bootstrap_nboot=0' if n_boot <= 0
+                       else 'no supervised test tokens'),
+        }
     model.train()
+    _ci = (test_report['ppl_bootstrap'].get('ci_perplexity')
+           if not test_report['ppl_bootstrap'].get('skipped') else None)
+    _tps = test_report['prefill_throughput']['tokens_per_second']
     print(f"[test] single evaluation of the sealed test split at the "
           f"val-selected checkpoint (step {best_val['step']}): loss "
           f"{test_report['loss']:.4f}, ppl {test_report['perplexity']:.2f} "
-          f"over {test_report['n_tokens']} tokens")
+          f"{'' if _ci is None else f'[{_ci[0]:.2f}, {_ci[1]:.2f}] '}"
+          f"over {test_report['n_tokens']} tokens, "
+          f"prefill {_tps:,.0f} tok/s")
     data_record['splits']['test']['content_fingerprint_sha256'] = \
         test_dataset.data_fingerprint
     data_record['splits']['test']['token_length_stats'] = stats_test

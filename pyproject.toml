@@ -124,6 +124,7 @@ py-modules = [
     "make_figures",
     "method_analysis",
     "kaggle_setup",
+    "ppl_bootstrap",
     "train_lm_autodl",
     "train_toy_reference",
 ]
