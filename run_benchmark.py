@@ -610,6 +610,11 @@ def main():
                           'n_csa': 1, 'n_hca': 1, 'd': d,
                           'csa_c': 16, 'csa_dc': 32, 'csa_nh': 2, 'csa_m': 8,
                           'csa_topk': 4, 'csa_sliding_window': 8,
+                          # Full CSA geometry, mirroring the hybrid row: the
+                          # indexer widths are needed by prefill_flops('csa')
+                          # in the roofline join, and the config above sets
+                          # them explicitly (csa_nIh=2, csa_cI=8).
+                          'csa_nIh': 2, 'csa_cI': 8,
                           'hca_c': 16, 'hca_dc': 32, 'hca_nh': 2, 'hca_m2': 16,
                           'hca_sliding_window': 8,
                           'mamba_expand': 2, 'mamba_d_state': 16,

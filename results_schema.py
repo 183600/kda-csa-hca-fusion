@@ -272,6 +272,10 @@ _EXP6_PREFILL_BUILDS = frozenset({
     'batched_append_from_naive_output',
     'native_operator_state',
 })
+# ``precision_sweep.py`` aggregate rows.
+_PRECISION_MODES = frozenset({'explicit', 'autocast'})
+_PRECISION_DTYPES = frozenset({'float16', 'bfloat16', 'float32', 'float64'})
+_PRECISION_VERDICTS = frozenset({'pass', 'fail'})
 
 
 def register_row_contract(kind: str):
@@ -544,6 +548,113 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
         )
         if missing_cells:
             out.append(f'missing (op, prefill_len) cell(s): {missing_cells[:6]}')
+    return out
+
+
+@register_row_contract('precision_sweep')
+def _validate_precision_sweep_rows(rows: list, metadata: dict) -> list[str]:
+    """Mixed-precision sweep aggregates: self-consistent verdicts only.
+
+    Every group is one (case, path, dtype, mode) cell with per-seed
+    statistics. The contract checks the arithmetic a downstream reader
+    relies on (max >= median, n_ok <= n_seeds, worst_seed present iff
+    there is a finite seed) and, most importantly, that ``verdict`` is
+    CONSISTENT with the recorded flags: a 'pass' whose budget flag is
+    False (or whose n_ok < n_seeds) is a producer bug that would let a
+    broken precision claim be archived.
+    """
+    out: list[str] = []
+    seen: set = set()
+    meta = metadata if isinstance(metadata, dict) else {}
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        for key in ('case', 'path'):
+            value = row.get(key)
+            if not isinstance(value, str) or not value:
+                out.append(f"{where}: '{key}' must be a non-empty string, got {value!r}")
+        dtype, mode = row.get('dtype'), row.get('mode')
+        if dtype not in _PRECISION_DTYPES:
+            out.append(f"{where}: 'dtype'={dtype!r} not in "
+                       f'{sorted(_PRECISION_DTYPES)}')
+        if mode not in _PRECISION_MODES:
+            out.append(f"{where}: 'mode'={mode!r} not in "
+                       f'{sorted(_PRECISION_MODES)}')
+        if not _positive_int(row.get('seq_len')):
+            out.append(f"{where}: 'seq_len' must be a positive int, "
+                       f"got {row.get('seq_len')!r}")
+        n_seeds, n_ok = row.get('n_seeds'), row.get('n_ok')
+        if not _positive_int(n_seeds):
+            out.append(f"{where}: 'n_seeds' must be a positive int, "
+                       f"got {n_seeds!r}")
+        if not isinstance(n_ok, int) or isinstance(n_ok, bool) \
+                or n_ok < 0 or (isinstance(n_seeds, int) and n_ok > n_seeds):
+            out.append(f"{where}: 'n_ok'={n_ok!r} must be an int in "
+                       f'[0, n_seeds={n_seeds!r}]')
+        budget = row.get('budget_eps')
+        if not (_finite_number(budget) and float(budget) > 0):
+            out.append(f"{where}: 'budget_eps' must be finite and > 0, "
+                       f'got {budget!r}')
+        for key in ('out_eps_max', 'out_eps_median', 'state_eps_max',
+                    'state_eps_median'):
+            value = row.get(key)
+            if value is not None and not (_finite_number(value)
+                                          and float(value) >= 0):
+                out.append(f'{where}: {key!r} must be null or finite >= 0, '
+                           f'got {value!r}')
+        for hi, lo in (('out_eps_max', 'out_eps_median'),
+                       ('state_eps_max', 'state_eps_median')):
+            if _finite_number(row.get(hi)) and _finite_number(row.get(lo)) \
+                    and float(row[hi]) + 1e-12 < float(row[lo]):
+                out.append(f'{where}: {hi!r} < {lo!r}')
+        seed = row.get('worst_seed')
+        if seed is not None and (isinstance(seed, bool)
+                                 or not isinstance(seed, int) or seed < 0):
+            out.append(f"{where}: 'worst_seed' must be null or a "
+                       f'non-negative int, got {seed!r}')
+        if n_ok == 0 and seed is not None:
+            out.append(f'{where}: worst_seed set but n_ok=0 (no finite seed)')
+        flags = {}
+        for key in ('out_budget_ok', 'state_budget_ok', 'dtype_contract_ok',
+                    'finite_ok'):
+            value = row.get(key)
+            flags[key] = value
+            if not isinstance(value, bool):
+                out.append(f"{where}: {key!r} must be a bool, got {value!r}")
+        verdict = row.get('verdict')
+        if verdict not in _PRECISION_VERDICTS:
+            out.append(f"{where}: 'verdict'={verdict!r} not in "
+                       f'{sorted(_PRECISION_VERDICTS)}')
+        if verdict == 'pass':
+            if n_ok != n_seeds:
+                out.append(f'{where}: verdict=pass but n_ok={n_ok!r} != '
+                           f'n_seeds={n_seeds!r}')
+            if all(isinstance(v, bool) for v in flags.values()) \
+                    and not all(flags.values()):
+                out.append(f'{where}: verdict=pass but flags {flags!r} '
+                           f'are not all True')
+            if row.get('out_eps_max') is None or row.get('state_eps_max') is None:
+                out.append(f'{where}: verdict=pass requires finite '
+                           f'out_eps_max/state_eps_max')
+        elif verdict == 'fail' and n_ok == n_seeds \
+                and all(isinstance(v, bool) and v for v in flags.values()) \
+                and row.get('out_eps_max') is not None \
+                and row.get('state_eps_max') is not None:
+            out.append(f'{where}: verdict=fail but every recorded check '
+                       f'passed')
+        if isinstance(dtype, str) and mode in _PRECISION_MODES \
+                and isinstance(row.get('case'), str) \
+                and isinstance(row.get('path'), str):
+            key = (row['case'], row['path'], dtype, mode)
+            if key in seen:
+                out.append(f'{where}: duplicate group key {key!r}')
+            seen.add(key)
+    expected = meta.get('n_groups')
+    if _positive_int(expected) and expected != len(rows):
+        out.append(f'metadata.n_groups={expected} but payload has '
+                   f'{len(rows)} row(s)')
     return out
 
 

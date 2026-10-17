@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Experiment 7 — roofline / memory-bandwidth analysis of the Exp 2 operators.
 
-This runner joins two existing artifacts:
+This runner joins three existing artifacts:
 
 * ``results/exp2_benchmark.json`` — measured latency per (T, op) row, with the
   per-op ``workload`` geometry and (since this round) ``param_elements``;
 * ``run_kv_cache.prefill_flops`` / ``kv_cache_elements`` — closed-form FLOPs
   and state-size formulas, evaluated at the EXACT Exp 2 geometry read from
-  each row's ``workload`` metadata.
+  each row's ``workload`` metadata;
+* ``roofline.ssd_core_flops`` / ``core_bytes('ssd', ...)`` for the
+  ``mamba2_scan`` core row (sequential or chunked per the workload's
+  recorded ``mamba_chunk_size``); ``mamba2_layer`` and ``hybrid_mamba2``
+  end-to-end rows are joined through ``run_kv_cache`` at their recorded
+  realization geometry. The whole Mamba-2 route used to be skipped here —
+  the hybrid_mamba2 workload lacked the KDA-hybrid schema key names and the
+  Mamba geometry was silently defaulted to paper scale.
 
 For every (T, op) cell it computes arithmetic intensity (FLOPs/byte), the
 achieved throughput, the machine's roofline ceiling, and whether the cell is
@@ -114,6 +121,70 @@ def _hybrid_geometry(w: dict) -> dict:
     )
 
 
+def _mamba2_layer_geometry(w: dict) -> dict:
+    """Map an Exp 2 ``mamba2_layer`` workload onto run_kv_cache kwargs.
+
+    The row records the realization geometry of the benchmarked mixer
+    (``d``, ``expand``, ``d_state``, ``d_conv``, ``headdim``); forwarding it
+    matters — run_kv_cache's defaults are paper-scale (d_state=64,
+    headdim=64) and would over-account this row.
+    """
+    return dict(
+        d=w['d'], mamba_expand=w['expand'], mamba_d_state=w['d_state'],
+        mamba_d_conv=w['d_conv'], mamba_headdim=w['headdim'],
+    )
+
+
+def _hybrid_mamba2_geometry(w: dict) -> dict:
+    """Map an Exp 2 ``hybrid_mamba2`` workload onto run_kv_cache kwargs.
+
+    The Mamba-2-route row stores a different schema from the KDA hybrid
+    row: memory slots are ``n_memory`` (not ``n_kda``), there are no
+    KDA-specific fields, and the Mamba-2 realization geometry
+    (``mamba_expand/d_state/d_conv/headdim``) IS recorded. All of it must
+    be forwarded: run_kv_cache's paper-scale Mamba defaults (d_state=64,
+    headdim=64) over-account the memory part by ~1.7x at the benchmarked
+    16/32 geometry.
+    """
+    return dict(
+        d=w['d'],
+        csa_m=w['csa_m'], csa_topk=w['csa_topk'], csa_nh=w['csa_nh'],
+        csa_c=w['csa_c'], csa_dc=w['csa_dc'], csa_nIh=w['csa_nIh'],
+        csa_cI=w['csa_cI'], csa_sliding_window=w['csa_sliding_window'],
+        hca_m2=w['hca_m2'], hca_nh=w['hca_nh'], hca_c=w['hca_c'],
+        hca_dc=w['hca_dc'], hca_sliding_window=w['hca_sliding_window'],
+        hybrid_n_kda=w['n_memory'], hybrid_n_csa=w['n_csa'],
+        hybrid_n_hca=w['n_hca'],
+        mamba_expand=w['mamba_expand'], mamba_d_state=w['mamba_d_state'],
+        mamba_d_conv=w['mamba_d_conv'], mamba_headdim=w['mamba_headdim'],
+    )
+
+
+def _mamba2_scan_accounting(T: int, w: dict) -> dict:
+    """Core-boundary (flops, bytes) for a ``mamba2_scan`` benchmark row.
+
+    Uses :func:`roofline.ssd_core_flops` / ``core_bytes('ssd', ...)`` —
+    the sequential recurrence when the row was benchmarked that way, the
+    chunked SSD decomposition when the workload records
+    ``mamba_chunk_size > 0`` (so a future chunked benchmark row is
+    accounted correctly without touching this function).
+    """
+    heads, headdim, d_state = w['heads'], w['headdim'], w['d_state']
+    raw_cs = w.get('mamba_chunk_size', 0)
+    chunked = isinstance(raw_cs, int) and not isinstance(raw_cs, bool) \
+        and raw_cs > 0
+    cs = int(raw_cs) if chunked else 64
+    return {
+        'flops': roofline.ssd_core_flops(
+            T, heads, headdim, d_state, chunked=chunked, chunk_size=cs),
+        'bytes': roofline.core_bytes(
+            'ssd', T, heads=heads, head_dim=headdim, d_state=d_state,
+            ngroups=w.get('ngroups', 1), chunked=chunked, chunk_size=cs),
+        'weights_included': False,
+        'analytic_boundary': 'core',
+    }
+
+
 def _core_accounting(op: str, T: int, w: dict) -> tuple[float, float]:
     """(flops, bytes) for the core-boundary ops (softmax / KDA variants)."""
     heads, kd = w['heads'], w['head_dim']
@@ -146,6 +217,10 @@ def _e2e_accounting(op: str, T: int, w: dict,
         geo, kv_op = _csa_geometry(w), 'csa'
     elif op == 'hca':
         geo, kv_op = _hca_geometry(w), 'hca'
+    elif op == 'mamba2_layer':
+        geo, kv_op = _mamba2_layer_geometry(w), 'mamba2'
+    elif op == 'hybrid_mamba2':
+        geo, kv_op = _hybrid_mamba2_geometry(w), 'hybrid_mamba2'
     else:
         geo, kv_op = _hybrid_geometry(w), 'hybrid_kch'
     flops = float(prefill_flops(kv_op, T, **geo))
@@ -166,6 +241,11 @@ def _account_row(row: dict) -> dict:
         flops, nbytes = _core_accounting(op, T, w)
         return {'flops': flops, 'bytes': nbytes, 'weights_included': False,
                 'analytic_boundary': 'core'}
+    if op == 'mamba2_scan':
+        # Core-boundary Mamba-2 (SSD) scan: accounted by the roofline SSD
+        # model (sequential or chunked, per the workload's knob), NOT by
+        # the end-to-end run_kv_cache path used for the layer rows.
+        return _mamba2_scan_accounting(T, w)
     flops, nbytes, weights_included = _e2e_accounting(
         op, T, w, row.get('param_elements'))
     return {'flops': flops, 'bytes': nbytes,
@@ -326,9 +406,11 @@ def main() -> int:
                                       'n_rows': len(rows)}},
         'flops_model': (
             'analytic prefill FLOPs at the Exp 2 geometry: core-only '
-            '(causal QK^T + AV, or the KDA recurrence + chunk terms) for '
+            '(causal QK^T + AV, the KDA recurrence + chunk terms, or the '
+            'SSD scan model roofline.ssd_core_flops for mamba2_scan) for '
             'core-boundary rows; run_kv_cache.prefill_flops end-to-end '
-            'accounting for csa/hca/hybrid rows.'),
+            'accounting for csa/hca/hybrid/mamba2_layer/hybrid_mamba2 rows, '
+            'at their recorded realization geometry.'),
         'byte_model': _BYTE_MODEL_NOTE,
         'interpretation': (
             'Compare pct_of_roofline ACROSS rows with the same boundary only; '

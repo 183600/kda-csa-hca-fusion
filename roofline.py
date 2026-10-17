@@ -38,6 +38,18 @@ included, so an operator's "achieved bandwidth" computed against this model
 is a lower bound that can legitimately exceed the machine's measured copy
 bandwidth when the real implementation moves more bytes than compulsory.
 ``run_roofline.py`` records that caveat in the output metadata.
+
+Mamba-2 (SSD) scan model
+------------------------
+:func:`ssd_core_flops` / :func:`ssd_core_flops_breakdown` extend the
+analytic accounting to the Mamba-2 scan in BOTH shipped modes: the
+sequential recurrence and the chunked-SSD decomposition
+(``ops_mamba.chunked_mamba2_scan``). The chunked breakdown names the
+four phases — intra-chunk masked quadratic "attention" operator, chunk
+source, inter-chunk readout, and the associative-scan passes — so the
+dominant term can be identified per geometry. ``latency_profile.py``
+uses these functions to compare the model's optimal chunk size against
+the measured one.
 """
 from __future__ import annotations
 
@@ -255,8 +267,114 @@ def kda_core_flops(T: int, heads: int, k_dim: int, v_dim: int, *,
     return flops
 
 
+def ssd_core_flops_breakdown(
+    T: int,
+    heads: int,
+    headdim: int,
+    d_state: int,
+    *,
+    chunk_size: int = 64,
+) -> dict:
+    """Chunked-SSD scan FLOPs split into its four computational phases.
+
+    Matches ``ops_mamba.chunked_mamba2_scan``'s chunked decomposition at a
+    per-batch-element granularity (multiply and add each count as one FLOP,
+    i.e. an ``n``-term MAC dot product costs ``2n``):
+
+    * ``intra_chunk_attention`` — the causal masked quadratic operator
+      restricted to each chunk. Per ``(t, s)`` pair inside a chunk:
+      ``C_t . B_s`` (``2*d_state``) plus the ``weights @ x`` contraction
+      (``2*headdim``). Over ``NT`` chunks of ``C`` positions each:
+      ``2*Tp*C*heads*(headdim + d_state)`` with ``Tp = NT*C`` the padded
+      length.
+    * ``chunk_source`` — the per-chunk source ``b_n`` (an outer-product
+      accumulation over the chunk, ``2*C*headdim*d_state`` per chunk):
+      ``2*Tp*heads*headdim*d_state``.
+    * ``inter_chunk_readout`` — ``C_t . S_in`` for every position:
+      ``2*Tp*heads*headdim*d_state``.
+    * ``assoc_scan`` — the Hillis-Steele prefix scan over chunk
+      transitions: ``ceil(log2 NT)`` levels, each one elementwise multiply
+      plus one fused multiply-add over ``[BH, NT, headdim, d_state]``:
+      ``2*levels*Tp*heads*headdim*d_state / C``.
+
+    Excluded (all ``O(1)``-FLOP-per-element lower-order terms): the
+    ``exp``/``cumsum``/mask elementwise work inside a chunk and the
+    ``D * x`` skip connection. The model is a *work* estimate for
+    crossover/phase analysis — it is NOT a latency prediction (see
+    ``latency_profile.py`` for the measured counterpart).
+
+    ``chunk_size >= T`` degenerates to one chunk (``levels = 0``) and the
+    intra term becomes the global O(T^2) dual form, matching
+    ``ops_mamba.quadratic_mamba2_scan``'s dominant cost.
+    """
+    _validate_ssd_flops_args(T, heads, headdim, d_state, chunk_size)
+    n_chunks = math.ceil(T / chunk_size) if T > 0 else 0
+    padded_len = n_chunks * chunk_size
+    levels = math.ceil(math.log2(n_chunks)) if n_chunks > 1 else 0
+    intra = 2.0 * padded_len * chunk_size * heads * (headdim + d_state)
+    source = 2.0 * padded_len * heads * headdim * d_state
+    readout = 2.0 * padded_len * heads * headdim * d_state
+    scan = (2.0 * levels * padded_len * heads * headdim * d_state
+            / chunk_size)
+    return {
+        'intra_chunk_attention': intra,
+        'chunk_source': source,
+        'inter_chunk_readout': readout,
+        'assoc_scan': scan,
+        'total': intra + source + readout + scan,
+        'n_chunks': n_chunks,
+        'padded_len': padded_len,
+        'scan_levels': levels,
+    }
+
+
+def _validate_ssd_flops_args(T, heads, headdim, d_state, chunk_size) -> None:
+    """Shared validation for the SSD FLOPs model (fail loudly, never guess)."""
+    for name, val in (('T', T), ('heads', heads), ('headdim', headdim),
+                      ('d_state', d_state)):
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0 \
+                or (name != 'T' and val < 1):
+            raise ValueError(
+                f"ssd_core_flops: {name}={val!r} must be "
+                f"{'a non-negative' if name == 'T' else 'a positive'} int.")
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) \
+            or chunk_size < 1:
+        raise ValueError(
+            f"ssd_core_flops: chunk_size={chunk_size!r} must be a positive "
+            f"int.")
+
+
+def ssd_core_flops(
+    T: int,
+    heads: int,
+    headdim: int,
+    d_state: int,
+    *,
+    chunked: bool = False,
+    chunk_size: int = 64,
+) -> float:
+    """Mamba-2 (SSD) scan-core FLOPs, sequential or chunked.
+
+    ``chunked=False`` is the sequential recurrence: per step and head the
+    operator does two pointwise products (source outer product ``x (x) B``
+    and its ``dt`` scaling), one state decay multiply, one state
+    accumulate, and the readout dot ``C_t . S`` — ``3`` MACs over the
+    ``headdim x d_state`` state, so ``6*T*heads*headdim*d_state`` FLOPs
+    (the same ``6*T*H*K*V`` shape as :func:`kda_core_flops`).
+
+    ``chunked=True`` returns
+    :func:`ssd_core_flops_breakdown`'s ``total``.
+    """
+    if chunked:
+        return ssd_core_flops_breakdown(
+            T, heads, headdim, d_state, chunk_size=chunk_size)['total']
+    _validate_ssd_flops_args(T, heads, headdim, d_state, chunk_size)
+    return 6.0 * T * heads * headdim * d_state
+
+
 def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
-               value_dim: int | None = None, chunked: bool = False,
+               value_dim: int | None = None, d_state: int | None = None,
+               ngroups: int = 1, chunked: bool = False,
                chunk_size: int = 64, itemsize: int = FP32_BYTES) -> float:
     """Compulsory-traffic lower bound (bytes) for a *core* timed region.
 
@@ -265,6 +383,15 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
     recurrent state read+write per step (``2*H*K*V`` elements), or per chunk
     in the chunked path. The state term dominates at the benchmark geometry
     and is exactly why the naive recurrent path is memory-traffic limited.
+    ``ssd``: read ``x``, ``dt``, ``B``, ``C``; write ``y``; plus the
+    ``H x headdim x d_state`` recurrent state read+write per step
+    (sequential) or per chunk (chunked). ``d_state`` is required for
+    ``ssd``; ``ngroups`` sizes the shared ``B``/``C`` tensors.
+
+    As with the other ops this is a compulsory lower bound: the chunked
+    scan's materialized ``[C, C]`` intra-chunk weight matrices are
+    library-internal intermediates and are NOT counted (same policy as the
+    softmax operator's score matrix).
     """
     V = value_dim if value_dim is not None else head_dim
     if op == 'softmax':
@@ -278,7 +405,20 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
         else:
             state = 2 * T * heads * head_dim * V
         return float((activation + state) * itemsize)
-    raise ValueError(f"core_bytes: op must be 'softmax' or 'kda', got {op!r}")
+    if op == 'ssd':
+        if d_state is None:
+            raise ValueError("core_bytes: op='ssd' requires d_state.")
+        if chunked:
+            n_chunks = math.ceil(T / chunk_size)
+            state = 2 * n_chunks * heads * head_dim * d_state
+        else:
+            state = 2 * T * heads * head_dim * d_state
+        # x + dt + B + C (read) + y (write).
+        activation = (2 * T * heads * head_dim + T * heads
+                      + 2 * T * ngroups * d_state)
+        return float((activation + state) * itemsize)
+    raise ValueError(
+        f"core_bytes: op must be 'softmax', 'kda' or 'ssd', got {op!r}")
 
 
 def elements_to_bytes(elements: float, *, itemsize: int = FP32_BYTES) -> float:

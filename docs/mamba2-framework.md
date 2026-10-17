@@ -222,6 +222,74 @@ views at fp64 machine precision, chunk-size invariance, huge-cumulative-
 decay stability (up to `|G| ~ 8e4`), the `ceil(log2 NT)` scan-depth
 contract, TorchScript parity of the scan core, and the mixer integration.
 
+### 4.3 Latency profiling the scan: model vs measurement
+
+The chunked path was added for speed, but the experiment framework
+(`run_benchmark.py`) still measured only the sequential recurrence, and the
+prototype timings lived outside the repository. `latency_profile.py`
+closes that gap with an operator-level profiler:
+
+* **Analytic side** (`roofline.ssd_core_flops_breakdown`): dominant-MAC
+  FLOPs for the four chunked phases, at a per-batch-element granularity —
+  `intra_chunk_attention` (the causal masked quadratic attention operator
+  restricted to a chunk, `2*Tp*C*H*(headdim + d_state)`),
+  `chunk_source` and `inter_chunk_readout` (each
+  `2*Tp*H*headdim*d_state`), and `assoc_scan`
+  (`2*ceil(log2 NT)*Tp*H*headdim*d_state/C`), with `Tp = NT*C` the padded
+  length. The sequential mode is the flat `6*T*H*D*N` state work, the same
+  shape as `kda_core_flops`. `core_bytes('ssd', ...)` adds the
+  compulsory-traffic counterpart (activation I/O + per-step or per-chunk
+  state read/write).
+* **Measured side** (`latency_profile.profile_scan_modes`): seeded inputs at
+  the `mamba2_scan` core geometry (4 heads × 32×32 state), warmup +
+  repeated timing with median/min/max/std, an injectable clock/runner, and a
+  **parity gate on every row** (max deviation from the sequential reference
+  at the same T — a profile can never silently measure a divergent
+  operator). `--quadratic` adds the global dual-form oracle as the
+  full-attention reference point; `--json` writes a versioned
+  `results_schema` envelope (`kind="mamba2_scan_latency_profile"`).
+
+```
+python3 latency_profile.py --lengths 128,256,512,1024,2048 \
+    --chunk-sizes 16,32,64,128 [--quadratic] [--json results/scan_latency.json]
+```
+
+**Representative single-thread CPU run** (1×4×32×32 geometry, fp32,
+`--repeats 3`; host-specific, not a portable claim):
+
+| T | sequential ms | best chunked C | chunked ms | speedup | model argmin C |
+|---|---|---|---|---|---|
+| 128 | 3.10 | 32 | 0.97 | 3.2× | 16 |
+| 256 | 8.23 | 32 | 0.96 | 8.6× | 16 |
+| 512 | 11.82 | 32 | 1.55 | 7.6× | 16 |
+| 1024 | 24.84 | 32 | 2.43 | 10.2× | 16 |
+| 2048 | 48.97 | 32 | 4.79 | 10.2× | 16 |
+
+Two honest observations. First, the sequential recurrence runs at a nearly
+constant ~1.0 GFLOP/s regardless of T (Python-loop/launch-bound), while the
+chunked path reaches 14–17 GFLOP/s at the optimum. Second, the measured
+optimum (C=32) sits **above** the work-model argmin (C=16): the model has no
+per-call overhead and no BLAS-efficiency term, so it under-prices small
+chunks. That gap is exactly what the profiler exists to quantify, and it is
+why the profiler prints both numbers rather than trusting the model.
+
+`test_latency_profile.py` pins the model formulas (hand-computed phases,
+chunk-size monotonicity, tie-breaking), the harness mechanics (fake clock /
+fake runner: exact median/min/max/std, sync bracketing, parity-gate
+detection of an injected divergence), and one real-torch end-to-end profile
+including the JSON round-trip.
+
+**Roofline join.** `run_roofline.py` (Exp 7) had been silently SKIPPING
+every Mamba-2 route row: `mamba2_scan` fell through to the hybrid geometry
+lookup, and `hybrid_mamba2` recorded a different workload schema
+(`n_memory` + `mamba_*` instead of `n_kda` + `heads_qk`) so the join raised
+`KeyError`; even with that repaired, run_kv_cache's paper-scale Mamba
+defaults (d_state/headdim = 64) would have over-accounted the benchmarked
+16/32 geometry by ~1.7x. The row is now: `mamba2_scan` → the SSD core
+model above; `mamba2_layer` / `hybrid_mamba2` → `run_kv_cache` at the
+recorded realization geometry (the benchmark now records `csa_nIh`/`csa_cI`
+on the hybrid_mamba2 workload so the join is exact).
+
 ## 5. The eight-group main experiment
 
 `ABL_MODE=matrix` (run_ablation.py) crosses the memory route with four
@@ -279,6 +347,40 @@ keep `results/exp4_mqar.json`; the other tasks write
 probes are screening instruments, and length extrapolation (train
 length ≠ test length) is reported separately per the design.
 
+### 6.1 Mixed-precision parity sweep (`precision_sweep.py`)
+
+The correctness tests pin the operators in fp32; `train_lm_autodl.py`
+deploys them under bf16/fp16 autocast. `precision_sweep.py` closes that
+gap with a dedicated evaluation harness over the seven core paths
+(KDA `rec`/`chunk`/`assoc`, Mamba-2 `naive`/`quad`/`chunk`, RWKV-7):
+
+* every (path, dtype, seed) is compared against an **fp64 oracle of the
+  same path** on the same generator draw (the tested input is that draw
+  rounded to the dtype), and errors are reported in units of the dtype's
+  unit roundoff `u` — fp16's grid is ~150x finer than bf16's, so an
+  absolute number means nothing without it;
+* a **seed sweep** (default 3) reports max/median/spread and the
+  `worst_seed`, so a budget failure is reproducible and a lucky single
+  seed cannot green-light a regression;
+* the **dtype contract** is checked on every row (output in the input
+  dtype; state in compute precision — fp32 for fp16/bf16/fp32 inputs);
+* two modes: `explicit` (inputs cast to the dtype; ops upcast to fp32) and
+  `autocast` (fp32 storage + `torch.autocast`, the real AMP path);
+* budgets: T-independent `factor*u` for storage dtypes (observed ~2u on
+  the shipped cores), and the textbook `accum_factor*T*u` round-off
+  envelope for compute dtypes (the quadratic/chunked SSD state measured
+  0.87*T*u at T=1024).
+
+`--json` writes a versioned envelope (`kind='precision_sweep'`) whose
+aggregate rows are checked by a registered `results_schema` contract
+(verdict/flag consistency, max ≥ median, unique groups). The harness
+already earned its keep: it found that under autocast
+`quadratic_mamba2_scan` returned its final state in the autocast dtype
+(the state einsum is autocast-eligible) while the naive/chunked paths
+accumulated in fp32 — a silent precision leak on the state handed across
+prefill/decode boundaries, now fixed and pinned by
+`test_precision_sweep.py`.
+
 Latency (`run_benchmark.py`) / decode (`run_decoding.py`) / cache
 (`run_kv_cache.py`) rows exist for both routes at matched boundaries:
 `mamba2_scan` is capacity-matched to `kda_rec` (4 heads × 32×32 state);
@@ -333,7 +435,16 @@ not to pre-empt the answer by changing the default route.
   4.2) is an alternative reference evaluation for hosts without
   `mamba-ssm`; it is parity-pinned to both other views but is not wired
   into the main experiment rows yet (`mamba_chunk_size` defaults to 0).
+  Its device-level latency is measured by `latency_profile.py` (section
+  4.3); those numbers are host- and torch-build-specific and must not be
+  compared across machines.
 * Hybrid-decode equality uses the `csa_topk=100` protocol because of the
   `torch.topk` tie-breaking artifact documented in the README (a
   numerical artifact, identical for both memory routes).
 * The smoke profile validates the pipeline before a full run.
+* The precision sweep's budgets are smoke-level regression envelopes, not
+  numerical-error theorems, and its autocast numbers are torch-build- and
+  host-specific: CPU AMP is bf16 in practice (CPU fp16 autocast is
+  emulated and excluded by default), and the harness does not run on
+  CUDA in this sandbox. The fp64 oracle pins semantics, not the deployed
+  kernel stack.

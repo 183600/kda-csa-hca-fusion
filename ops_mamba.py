@@ -547,6 +547,13 @@ def quadratic_mamba2_scan(
     S = torch.einsum('bsh,bshd,bshn->bhdn', w_final, x_c, B_h)
     if initial_state is not None:
         S = S + torch.exp(G[:, -1]).unsqueeze(-1).unsqueeze(-1) * S0
+    # ``torch.autocast`` intercepts the einsum above (matmul-family ops are
+    # autocast-eligible) and would return the state on the reduced-precision
+    # grid, while the sequential and chunked paths accumulate the state in
+    # compute precision. Cast back so all three views honor the SAME
+    # documented state-precision contract (fp32 for fp16/bf16/fp32 inputs,
+    # fp64 for fp64 inputs) under explicit dtypes AND under AMP autocast.
+    S = S.to(compute_dtype)
     return y, S
 
 
