@@ -701,7 +701,15 @@ def csa_lightning_indexer(
     else:
         logits = torch.einsum('b h t n, b t h -> b t n', score, w_idx)  # [B, T, n_blocks]
     if causal_block_mask is not None:
-        logits = logits.masked_fill(~causal_block_mask, float('-inf'))
+        # ``logits`` is fresh (einsum/sum output) and both consumers
+        # (the selector and the softmax) read only the masked values, so
+        # the fill can be written in place when no backward needs the
+        # pre-fill tensor (inference / no-grad). Autograd-tracked logits
+        # keep the out-of-place form.
+        if logits.requires_grad:
+            logits = logits.masked_fill(~causal_block_mask, float('-inf'))
+        else:
+            logits.masked_fill_(~causal_block_mask, float('-inf'))
     # topk=0 guard: return shape-[B, T, 0] indices directly so the
     # function is self-contained (does not rely on ``naive_csa`` to guard
     # the ``scores.amax(-1)`` call). ``torch.topk(logits, 0, ...)`` would
