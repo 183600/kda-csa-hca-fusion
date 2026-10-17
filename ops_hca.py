@@ -254,9 +254,17 @@ def naive_hca(
         row_max_safe = torch.where(all_masked, torch.zeros_like(row_max), row_max)
         shifted = cat - row_max_safe
         shifted_sink = log_sink - row_max_safe
-        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+        # ``shifted``'s row max is exactly 0.0 by construction
+        # (``cat - cat.amax``), so logsumexp's internal max-shift subtracts
+        # zero; writing the same decomposition (exp, sum, log) directly is
+        # bit-identical for fp16/bf16/fp32/fp64 (including all-``-inf`` rows,
+        # where both forms yield ``-inf``) and avoids a redundant full-size
+        # amax/sub/exp pass over ``[..., n_blocks+win]``.
+        lse = shifted.exp().sum(-1, keepdim=True).log()
         log_denom = torch.logaddexp(lse, shifted_sink)             # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks+win]
+        # Out-of-place: autograd's ExpBackward saves this ``exp`` output, so
+        # an in-place fill here would trip the version-counter check.
         p = p.masked_fill(all_masked, 0.0)
     else:
         all_masked = cat.isinf().all(-1, keepdim=True)

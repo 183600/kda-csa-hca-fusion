@@ -162,7 +162,9 @@ def _sliding_window_attention(
             # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
             # multiply keeps values/gradients bit-for-bit identical.
             scores = scores * scale
-        scores = scores.masked_fill(~mask_chunk[None, :, None, :], float('-inf'))
+        # ``scores`` is a fresh einsum (or freshly scaled) tensor that no
+        # other consumer reads, so the mask can be written in place.
+        scores.masked_fill_(~mask_chunk[None, :, None, :], float('-inf'))
         p = torch.softmax(scores, dim=-1)                   # [B, ct, nh, win]
         out[:, t_lo:t_hi] = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
     return out
@@ -195,7 +197,9 @@ def _sliding_window_scores(
         # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
         # multiply keeps values/gradients bit-for-bit identical.
         scores_w = scores_w * scale
-    scores_w = scores_w.masked_fill(~win_valid[None, :, None, :], float('-inf'))
+    # ``scores_w`` is a fresh einsum (or freshly scaled) tensor that no
+    # other consumer reads, so the mask can be written in place.
+    scores_w.masked_fill_(~win_valid[None, :, None, :], float('-inf'))
     return scores_w, C_windows, win_valid
 
 

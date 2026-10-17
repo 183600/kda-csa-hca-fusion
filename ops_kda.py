@@ -422,34 +422,36 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
 
     The best count is a trade-off between fewer kernel launches (larger
     ``rows``) and keeping the transient ``[..., rows, c1, K]`` block small
-    enough for the thread-split / cache behaviour of the elementwise
-    kernels (smaller ``rows``). On the CPU backend the latency landscape
-    is dominated by the *outer* size ``B * HV * NT``: the elementwise
-    broadcast + reduction kernels flip into a poorly-split parallel path
-    once that product (scaled by the chunk size) crosses a cache-line
-    accounting threshold, at which point the wide blocks become 2-5x
-    slower. The measured optimum tracks roughly one row per 64 bytes of
-    the per-chunk outer stride, so the rule keys on
+    enough for the allocator / cache behaviour of the elementwise
+    kernels (smaller ``rows``). On the CPU backend the latency is
+    dominated by the *outer* size ``B * HV * NT`` and is not monotone in
+    ``rows``: once the per-iteration block crosses the allocator's
+    large-chunk threshold the elementwise broadcast + reduction kernels
+    lose their thread split and wide blocks become up to ~1.8x slower
+    than narrow ones. At ``eff == 128`` the wider counts additionally
+    oscillate between slow and allocator-luck ties across processes, so
+    beyond ``eff == 64`` the narrow single-row loop is the safe choice.
+    The rule keys on
 
         ``eff = B * HV * NT * BT // 64``
 
-    (measured with ``torch.set_num_threads(1)``, the thread count used by
-    the benchmark harnesses): ``eff <= 16`` gets 8 rows, ``eff <= 64`` gets
-    2, beyond that a single row. Wide blocks stop paying off once the
-    outer dim is large because the transient ``[..., rows, c1, K]``
-    allocations cross the allocator's mmap threshold and every iteration
-    pays page-fault + ``munmap`` costs that dwarf the saved kernel
-    launches (at ``eff == 128`` two rows are ~2x slower than one).
+    (measured with ``torch.set_num_threads(1)``, the thread count the
+    benchmark harness pins, after the same-T softmax benchmark has warmed
+    the allocator): ``eff <= 8`` gets the full 8 rows, ``eff <= 64`` gets
+    4, and larger outer sizes fall back to a single row. The wide blocks
+    win in the small/medium regimes (up to ~13% at ``eff == 32`` and ~5%
+    at ``eff == 64``), while ``eff == 16`` already shows 8 rows ~60%
+    slower than 4.
 
     The per-row elementwise/reduction math is identical for every count
     (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
     loop granularity.
     """
     eff = max(1, (B * HV * NT * BT) // 64)
-    if eff <= 16:
+    if eff <= 8:
         rows = _ATTN_BLOCK_ROWS_MAX
     elif eff <= 64:
-        rows = 2
+        rows = 4
     else:
         rows = 1
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
@@ -837,7 +839,12 @@ def _chunk_kda_inner_loop(
     # evaluating each slice inside the loop.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
-    kexp_all = (g[..., -1:, :] - g).exp() * k
+    # The subtraction yields a fresh tensor, so ``exp`` may run in place;
+    # the multiply stays out of place because ``exp`` backward saves its
+    # output. Per-element values are unchanged.
+    kexp_all = g[..., -1:, :] - g
+    kexp_all.exp_()
+    kexp_all = kexp_all * k
     for i in range(NT):
         q_i = q[:, :, i]
         u_i = u[:, :, i]
@@ -914,7 +921,11 @@ def _chunk_kda_inner_loop_recompute(
     # ``exp`` map precomputed by ``_chunk_kda_prepare``.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
-    kexp_all = (g[..., -1:, :] - g).exp() * k
+    # Same in-place ``exp`` on the fresh subtraction result as
+    # ``_chunk_kda_inner_loop``; values unchanged.
+    kexp_all = g[..., -1:, :] - g
+    kexp_all.exp_()
+    kexp_all = kexp_all * k
     _block_rows = block_rows
     for i in range(NT):
         q_i = q[:, :, i]
@@ -1075,7 +1086,11 @@ def assoc_scan_chunk_kda(
     # ``ggx`` is the ``exp`` of the cumsum gate map precomputed by
     # ``_chunk_kda_prepare``; ``ggx[..., -1, :]`` is elementwise-identical
     # to ``gg[..., -1, :].exp()`` and ``ggx`` to ``gg.exp()``.
-    kexp = kk * (gg[..., -1:, :] - gg).exp()
+    # The subtraction is fresh, so its ``exp`` runs in place; the multiply
+    # order (``k`` on the left) and per-element values are unchanged.
+    kexp = gg[..., -1:, :] - gg
+    kexp.exp_()
+    kexp = kk * kexp
     kexp_t = kexp.transpose(-1, -2)
     M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
     b = kexp_t @ u
