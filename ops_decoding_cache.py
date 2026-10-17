@@ -1331,7 +1331,14 @@ class CSADecodingCache:
             # normalized with ``qk_norm_mode`` (applied at append time).
             # When normalize_qk=False the caller should have appended
             # raw (unnormalized) keys; we read whatever is stored.
-            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
+            # ``clone()``: ``get()`` returns a view into the ring buffer,
+            # and the scores einsum below saves it to compute the query
+            # gradient. A later ``append_step`` overwrites the buffer in
+            # place, which would invalidate that saved view (backward
+            # would raise "modified by an inplace operation"). Materialize
+            # a stable copy so one backward pass can span several decode
+            # steps; values are unchanged.
+            C_local = _to_dtype(self._sw.get(), compute_dtype).clone()  # [B, sw_len, c]
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             )                                                          # [B, nh, sw_len]
@@ -1847,7 +1854,12 @@ class HCADecodingCache:
             )
             C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
-            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
+            # ``clone()``: same autograd version guard as the CSA cache —
+            # ``get()`` returns a live view into the ring buffer, and the
+            # scores einsum below saves it to compute the query gradient;
+            # a later ``append_step`` overwrites the buffer in place and
+            # would invalidate that saved view. Values are unchanged.
+            C_local = _to_dtype(self._sw.get(), compute_dtype).clone()  # [B, sw_len, c]
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             )                                                          # [B, nh, sw_len]
