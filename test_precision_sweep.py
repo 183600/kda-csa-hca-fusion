@@ -397,9 +397,9 @@ def test_real_autocast_mode_bf16():
 
 def test_autocast_state_contract_all_paths():
     print('\nTest: regression — every core path returns fp32 state under autocast')
-    # ``quadratic_mamba2_scan`` used to leak the autocast dtype into its
-    # final state (the einsum is autocast-eligible); the sequential and
-    # chunked views always accumulated in fp32. Pin the shared contract.
+    # The state einsum is autocast-eligible, so ``quadratic_mamba2_scan``
+    # must cast its final state back to compute precision like the
+    # sequential and chunked views. Pin the shared contract on every path.
     for case, paths in ps.CASES.items():
         for path in paths:
             row = ps.evaluate_seed(case, path, torch.bfloat16, seed=0,

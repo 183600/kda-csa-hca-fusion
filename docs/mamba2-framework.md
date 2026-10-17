@@ -224,10 +224,7 @@ contract, TorchScript parity of the scan core, and the mixer integration.
 
 ### 4.3 Latency profiling the scan: model vs measurement
 
-The chunked path was added for speed, but the experiment framework
-(`run_benchmark.py`) still measured only the sequential recurrence, and the
-prototype timings lived outside the repository. `latency_profile.py`
-closes that gap with an operator-level profiler:
+`latency_profile.py` provides an operator-level profiler for the scan:
 
 * **Analytic side** (`roofline.ssd_core_flops_breakdown`): dominant-MAC
   FLOPs for the four chunked phases, at a per-batch-element granularity —
@@ -254,24 +251,9 @@ python3 latency_profile.py --lengths 128,256,512,1024,2048 \
     --chunk-sizes 16,32,64,128 [--quadratic] [--json results/scan_latency.json]
 ```
 
-**Representative single-thread CPU run** (1×4×32×32 geometry, fp32,
-`--repeats 3`; host-specific, not a portable claim):
-
-| T | sequential ms | best chunked C | chunked ms | speedup | model argmin C |
-|---|---|---|---|---|---|
-| 128 | 3.10 | 32 | 0.97 | 3.2× | 16 |
-| 256 | 8.23 | 32 | 0.96 | 8.6× | 16 |
-| 512 | 11.82 | 32 | 1.55 | 7.6× | 16 |
-| 1024 | 24.84 | 32 | 2.43 | 10.2× | 16 |
-| 2048 | 48.97 | 32 | 4.79 | 10.2× | 16 |
-
-Two honest observations. First, the sequential recurrence runs at a nearly
-constant ~1.0 GFLOP/s regardless of T (Python-loop/launch-bound), while the
-chunked path reaches 14–17 GFLOP/s at the optimum. Second, the measured
-optimum (C=32) sits **above** the work-model argmin (C=16): the model has no
-per-call overhead and no BLAS-efficiency term, so it under-prices small
-chunks. That gap is exactly what the profiler exists to quantify, and it is
-why the profiler prints both numbers rather than trusting the model.
+The profiler prints the work-model argmin next to the measured optimum
+rather than trusting the model: the analytic model has no per-call
+overhead and no BLAS-efficiency term, so the two can differ.
 
 `test_latency_profile.py` pins the model formulas (hand-computed phases,
 chunk-size monotonicity, tie-breaking), the harness mechanics (fake clock /
@@ -279,16 +261,11 @@ fake runner: exact median/min/max/std, sync bracketing, parity-gate
 detection of an injected divergence), and one real-torch end-to-end profile
 including the JSON round-trip.
 
-**Roofline join.** `run_roofline.py` (Exp 7) had been silently SKIPPING
-every Mamba-2 route row: `mamba2_scan` fell through to the hybrid geometry
-lookup, and `hybrid_mamba2` recorded a different workload schema
-(`n_memory` + `mamba_*` instead of `n_kda` + `heads_qk`) so the join raised
-`KeyError`; even with that repaired, run_kv_cache's paper-scale Mamba
-defaults (d_state/headdim = 64) would have over-accounted the benchmarked
-16/32 geometry by ~1.7x. The row is now: `mamba2_scan` → the SSD core
-model above; `mamba2_layer` / `hybrid_mamba2` → `run_kv_cache` at the
-recorded realization geometry (the benchmark now records `csa_nIh`/`csa_cI`
-on the hybrid_mamba2 workload so the join is exact).
+**Roofline join.** `run_roofline.py` (Exp 7) joins the Mamba-2 route as
+`mamba2_scan` → the SSD core model above; `mamba2_layer` /
+`hybrid_mamba2` → `run_kv_cache` at the recorded realization geometry
+(the benchmark records `csa_nIh`/`csa_cI` on the hybrid_mamba2 workload
+so the join is exact).
 
 ## 5. The eight-group main experiment
 
@@ -373,13 +350,10 @@ gap with a dedicated evaluation harness over the seven core paths
 
 `--json` writes a versioned envelope (`kind='precision_sweep'`) whose
 aggregate rows are checked by a registered `results_schema` contract
-(verdict/flag consistency, max ≥ median, unique groups). The harness
-already earned its keep: it found that under autocast
-`quadratic_mamba2_scan` returned its final state in the autocast dtype
-(the state einsum is autocast-eligible) while the naive/chunked paths
-accumulated in fp32 — a silent precision leak on the state handed across
-prefill/decode boundaries, now fixed and pinned by
-`test_precision_sweep.py`.
+(verdict/flag consistency, max ≥ median, unique groups). The shared dtype
+contract — every core path returns its state in compute precision, never
+the autocast dtype of the state einsum, which is autocast-eligible — is
+pinned across all paths by `test_precision_sweep.py`.
 
 Latency (`run_benchmark.py`) / decode (`run_decoding.py`) / cache
 (`run_kv_cache.py`) rows exist for both routes at matched boundaries:

@@ -1,6 +1,6 @@
 """Regression tests for the SSD-scan latency profiler and FLOPs model.
 
-Covers two additions from this round:
+Covers:
 
 * ``roofline.ssd_core_flops`` / ``ssd_core_flops_breakdown`` /
   ``core_bytes('ssd', ...)`` — analytic accounting for the Mamba-2 scan in
@@ -213,9 +213,9 @@ def test_run_roofline_accounts_mamba_route():
                 'mamba2', T, mode='compressed_kv_only', **geo_l) + layer_params)
         and acct_l['weights_included'], f"{acct_l['bytes']}")
 
-    # hybrid_mamba2: previously SKIPPED (the row's schema has n_memory and
-    # no heads_qk/n_kda). It must now be accounted, and with the recorded
-    # Mamba geometry — paper-scale defaults over-account by ~1.7x.
+    # hybrid_mamba2: accounted at the recorded Mamba geometry (its schema
+    # has n_memory and no heads_qk/n_kda, so the join must not fall back to
+    # paper-scale defaults).
     hybrid_w = {
         'n_layers': 5, 'memory': 'mamba2', 'n_memory': 3, 'n_csa': 1,
         'n_hca': 1, 'd': 64, 'csa_c': 16, 'csa_dc': 32, 'csa_nh': 2,

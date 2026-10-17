@@ -412,10 +412,8 @@ def compiled_recurrent_kda(
 # ``[..., R, c1, K]`` block and avoids one tiny-kernel launch per row. The
 # best row count depends on the per-op thread-split behaviour of the
 # elementwise kernels on the CPU backend and is *not* monotone in the block
-# size (measured: some multi-row blocks cross a parallelization threshold and
-# run several times slower than a single row), so the count is selected from
-# measured-good values for the head-dim / chunk-count regimes used by the
-# benchmarks; the flat fallbacks stay conservative.
+# size, so the count is selected per head-dim / chunk-count regime and the
+# flat fallbacks stay conservative.
 _ATTN_BLOCK_ROWS_MAX = 8
 
 

@@ -4,7 +4,7 @@
 This runner joins three existing artifacts:
 
 * ``results/exp2_benchmark.json`` — measured latency per (T, op) row, with the
-  per-op ``workload`` geometry and (since this round) ``param_elements``;
+  per-op ``workload`` geometry and ``param_elements``;
 * ``run_kv_cache.prefill_flops`` / ``kv_cache_elements`` — closed-form FLOPs
   and state-size formulas, evaluated at the EXACT Exp 2 geometry read from
   each row's ``workload`` metadata;
@@ -12,9 +12,8 @@ This runner joins three existing artifacts:
   ``mamba2_scan`` core row (sequential or chunked per the workload's
   recorded ``mamba_chunk_size``); ``mamba2_layer`` and ``hybrid_mamba2``
   end-to-end rows are joined through ``run_kv_cache`` at their recorded
-  realization geometry. The whole Mamba-2 route used to be skipped here —
-  the hybrid_mamba2 workload lacked the KDA-hybrid schema key names and the
-  Mamba geometry was silently defaulted to paper scale.
+  realization geometry, so the join uses the benchmarked Mamba settings
+  instead of paper-scale defaults.
 
 For every (T, op) cell it computes arithmetic intensity (FLOPs/byte), the
 achieved throughput, the machine's roofline ceiling, and whether the cell is

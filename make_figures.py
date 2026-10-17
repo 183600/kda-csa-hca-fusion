@@ -366,11 +366,9 @@ def _plot_mqar_group(records, n_kv, write_legacy_name):
     if skipped:
         print(f'[fig_mqar] skipped {skipped} error row(s) for n_kv={n_kv}')
     fig, ax = plt.subplots(figsize=(6, 4))
-    # Consistent per-op colours matching fig_architecture (KDA blue, CSA red,
-    # HCA green); the softmax baseline gets the fourth palette colour. The
-    # previous positional ``colors[:len(ops)]`` assignment made an op's colour
-    # depend on the order/skipping of records, so the same op had different
-    # colours in fig_mqar than in fig_architecture.
+    # Per-op colours by name, matching fig_architecture (KDA blue, CSA red,
+    # HCA green); the softmax baseline gets the fourth palette colour, so an
+    # op's colour never depends on the order/skipping of records.
     _palette = ['#8172B2', '#4C72B0', '#C44E52', '#55A868']
     op_colors = {'softmax': '#8172B2', 'kda': '#4C72B0',
                  'csa': '#C44E52', 'hca': '#55A868'}

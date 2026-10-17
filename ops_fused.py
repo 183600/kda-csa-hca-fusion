@@ -870,9 +870,8 @@ class KDAHybridLayer(nn.Module):
                 [lookback.transpose(1, 2), x.transpose(1, 2)], dim=2)
         # ``.contiguous()`` after the transpose: the conv returns
         # ``[B, d, T]`` while every downstream projection consumes
-        # ``[B, T, d]``. Materializing the transposed layout ONCE here is
-        # ~2x faster than letting each of the 5+ linears materialize its
-        # own internal copy of the same non-contiguous input.
+        # ``[B, T, d]``; materializing the transposed layout ONCE keeps the
+        # 5+ linears from each copying the same non-contiguous input.
         x_conv = self.short_conv(x_conv_in).transpose(1, 2).contiguous()  # [B, T, d]
         # Compute the new lookback (the last ksize-1 time steps of THIS
         # chunk) to RETURN to the caller. We do NOT write it to self —

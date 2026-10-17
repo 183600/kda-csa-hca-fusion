@@ -1,6 +1,6 @@
 """Regression tests for ``lm_consistency.py`` (LM prefill-decode + roofline).
 
-These pin the pretraining-LM decode path added this round:
+These pin the pretraining-LM decode path:
 
 1. ``LMWithHybrid`` full-sequence (prefill) logits == token-by-token decode
    through ``run_decoding.HybridDecoding`` (KDA recurrent state + per-layer

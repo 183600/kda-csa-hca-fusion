@@ -7,14 +7,10 @@ A single backward pass may span SEVERAL ``forward_step`` calls of
 decoded continuation, or any teacher-forced decode under autograd). The
 query gradient makes the sliding-window scores einsum save the window
 keys, and ``_SlidingWindowRingBuffer.get()`` returns a VIEW into the ring
-buffer — a later ``append_step`` overwrites that buffer in place, so the
-saved view used to be invalidated and ``backward()`` raised::
-
-    RuntimeError: one of the variables needed for gradient computation
-    has been modified by an inplace operation
-
-Both caches now materialize a stable copy of the window keys before the
-einsum. These tests keep the multi-step backward contract green.
+buffer; a later ``append_step`` overwrites that buffer in place, which
+would invalidate the saved view. Both caches materialize a stable copy of
+the window keys before the einsum, so these tests keep the multi-step
+backward contract green.
 
 Run via pytest::
 
@@ -81,7 +77,7 @@ def _csa_backward(device='cpu', rope_dim=None, sink=None):
             topk=topk, nh=nh, nIh=nIh, scale=1.0,
             sink_logits=sink_par, use_ste=False))
     loss = torch.cat(outs, dim=1).sum()
-    loss.backward()  # raises before the fix
+    loss.backward()  # multi-step backward must succeed
     return W_DQ.grad, W_UQ.grad
 
 
@@ -109,7 +105,7 @@ def _hca_backward(device='cpu', rope_dim=None, sink=None):
         outs.append(cache.forward_step(
             q_n, nh=nh, scale=1.0, sink_logits=sink_par))
     loss = torch.cat(outs, dim=1).sum()
-    loss.backward()  # raises before the fix
+    loss.backward()  # multi-step backward must succeed
     return W_DQ.grad, W_UQ.grad
 
 

@@ -152,8 +152,8 @@ def test_row_contract_exp6_cache_flags_are_honest():
     meta = {'prefill_lens': [128], 'ops': list(ops)}
     assert rs.validate_rows('exp6_decoding', rows, meta) == []
 
-    # The historical metadata bug: hybrid routes DO run the incremental
-    # caches on every memory route, so False is a contradiction.
+    # Hybrid routes run the incremental caches on every memory route, so
+    # False is a contradiction.
     bug = [dict(r, uses_incremental_cache=False)
            if r['op'] == 'hybrid_mamba2' else r for r in rows]
     violations = rs.validate_rows('exp6_decoding', bug, meta)
