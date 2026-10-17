@@ -77,6 +77,7 @@ from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
+from results_schema import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -3043,7 +3044,9 @@ def main():
         os.makedirs('results', exist_ok=True)
         gate_payload = {
             'kind': 'exp4_overfit_gate',
+            'schema_version': CURRENT_SCHEMA_VERSION,
             'metadata': {
+                'schema_version': CURRENT_SCHEMA_VERSION,
                 'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
                 'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
                 'rwkv_backend': os.environ.get('RWKV_BACKEND', 'reference'),

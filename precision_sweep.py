@@ -70,6 +70,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
 
+from kaggle_setup import capture_provenance  # noqa: E402
 from ops_kda import (assoc_scan_chunk_kda, naive_chunk_kda,  # noqa: E402
                      naive_recurrent_kda)
 from ops_mamba import (chunked_mamba2_scan, naive_mamba2_scan,  # noqa: E402
@@ -678,6 +679,7 @@ def main(argv=None) -> int:
                       'generator draw; the tested input is that draw rounded '
                       'to the tested dtype (explicit) or the fp32 cast '
                       '(autocast)',
+            'provenance': capture_provenance(),
             'warnings': [
                 'budgets are smoke-level regression envelopes (factor x unit '
                 'roundoff), not numerical-error theorems',

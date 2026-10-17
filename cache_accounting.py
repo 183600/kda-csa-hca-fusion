@@ -59,7 +59,7 @@ import torch
 
 from ops_fused import HybridConfig  # noqa: F401  (public re-export / typing)
 from ops_rope import effective_rope_dim
-from kaggle_setup import set_global_seed
+from kaggle_setup import capture_provenance, set_global_seed
 from run_kv_cache import geometric_capacity, kv_cache_elements
 
 # ---------------------------------------------------------------------------
@@ -1038,8 +1038,10 @@ def main(argv=None) -> int:
                         help='write the full JSON-strict report here')
     args = parser.parse_args(argv)
 
-    # Deterministic probe inputs.
-    set_global_seed(0)
+    # Deterministic probe inputs: seed Python/NumPy/torch/CUDA and request
+    # deterministic kernels so the audit report is reproducible run-to-run
+    # on the same machine.
+    seed_info = set_global_seed(0, deterministic=True)
     from run_decoding import HybridDecoding
     decoder = HybridDecoding().to(args.device).eval()
     cfg = decoder.cfg
@@ -1052,6 +1054,11 @@ def main(argv=None) -> int:
         report = run_cache_audit(
             decoder, cfg, T=args.T + args.decode_steps,
             with_graph_probe=not args.no_graph_probe, seed=0)
+    # Record the seed scheme and code/environment provenance alongside the
+    # audit numbers so an archived --json report is a complete run record.
+    report['seed'] = 0
+    report['seed_info'] = seed_info
+    report['provenance'] = capture_provenance()
     _print_audit_summary(report)
     if args.json:
         with open(args.json, 'w', encoding='utf-8') as f:

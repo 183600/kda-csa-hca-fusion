@@ -76,6 +76,7 @@ import logging
 import math
 import os
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
@@ -86,6 +87,8 @@ from kaggle_setup import (  # noqa: E402
     capture_provenance,
     configure_torch_for_device,
     make_seeded_generator,
+    parse_int_env,
+    seed_worker,
     set_global_seed,
 )
 from kv_quant import (  # noqa: E402
@@ -114,6 +117,7 @@ from train_lm_autodl import (  # noqa: E402
     _synthetic_corpus,
     clean_lm_texts,
     evaluate_lm_loss,
+    run_overfit_sanity_check as run_lm_overfit_sanity_check,
     split_clean_texts,
 )
 
@@ -209,7 +213,8 @@ def _make_loader(tokenizer, texts, seq_len, batch_size, seed):
                             name='train')
     return torch.utils.data.DataLoader(
         dataset, batch_size=int(batch_size), shuffle=True,
-        generator=make_seeded_generator(int(seed)))
+        generator=make_seeded_generator(int(seed)),
+        worker_init_fn=seed_worker)
 
 
 def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
@@ -628,6 +633,219 @@ def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
 
 
 # --------------------------------------------------------------------------
+# Pre-training overfit sanity gates (one fixed batch per part)
+# --------------------------------------------------------------------------
+def _fixed_lm_batch(tokenizer, train_texts, seq_len, batch_size, seed):
+    """One fixed (input_ids, labels) batch from the seeded training loader.
+
+    Deterministic given ``seed``: the DataLoader shuffle uses the seeded
+    generator + ``seed_worker`` and the dataset order is fixed. The gate
+    trains on THIS single batch for all steps (data held constant).
+    """
+    loader = _make_loader(tokenizer, train_texts, seq_len, batch_size, seed)
+    batch = next(iter(loader))
+    return {'input_ids': batch['input_ids'].clone(),
+            'labels': batch['labels'].clone()}
+
+
+def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
+                                   lr=3e-3, grad_clip=1.0,
+                                   loss_ratio_threshold=0.5, log_every=0):
+    """Overfit one fixed batch through the QAT (STE) path of StepwiseKDALM.
+
+    ``train_lm_autodl.run_overfit_sanity_check`` cannot cover Part B:
+    ``StepwiseKDALM`` is a single KDA layer with no ``hybrid`` attribute and
+    a logits-only forward, so the straight-through gradient contract in the
+    fake-quantized state write path needs its own gate. Trains a FRESH
+    model on a fixed batch with regularization disabled and passes when
+    every gradient is finite AND the tail-mean loss drops below
+    ``loss_ratio_threshold`` times the head-mean loss.
+
+    NECESSARY, NOT SUFFICIENT: passing proves the STE path propagates a
+    usable gradient signal on a fixed batch; it does not prove the
+    quantizer matches the deployment path.
+    """
+    import gc
+
+    if isinstance(device, str):
+        device = torch.device(device)
+    steps = int(steps)
+    if steps < 10:
+        raise ValueError(
+            f'overfit check needs steps >= 10 to be meaningful, got {steps}')
+    warmup = max(1, min(5, steps // 10))
+    tail = max(1, min(5, steps // 10))
+
+    seed_info = set_global_seed(seed, deterministic=True)
+    model = StepwiseKDALM(len(tokenizer)).to(device)
+    model.train()
+    input_ids = batch['input_ids'].to(device)
+    labels = batch['labels'].to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+
+    losses, accs, elapsed_s = [], [], []
+    all_grads_finite = True
+    t0 = time.time()
+    for step in range(steps):
+        logits = model(input_ids, spec=QAT_SPEC, ste=True)
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                               labels.reshape(-1), ignore_index=-100)
+        if loss is None or not torch.isfinite(loss):
+            raise RuntimeError(
+                f'overfit sanity check (Part B STE): non-finite LM loss at '
+                f'step {step} ({loss}); aborting before full training.')
+        with torch.no_grad():
+            mask = labels.reshape(-1).ne(-100)
+            correct = ((logits.argmax(-1).reshape(-1) == labels.reshape(-1))
+                       & mask).sum()
+            acc = float(correct) / max(1, int(mask.sum()))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        for p in model.parameters():
+            if p.grad is not None and not bool(torch.isfinite(p.grad).all()):
+                all_grads_finite = False
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        opt.step()
+        losses.append(float(loss.detach()))
+        accs.append(acc)
+        elapsed_s.append(time.time() - t0)
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f'[overfit-check] partB-stepwise-ste step {step:4d} '
+                  f'loss {losses[-1]:.4f} token_acc {acc:.4f} '
+                  f'({elapsed_s[-1]:.1f}s)', flush=True)
+
+    initial_loss = sum(losses[:warmup]) / warmup
+    final_loss = sum(losses[-tail:]) / tail
+    final_acc = sum(accs[-tail:]) / tail
+    passed = (all_grads_finite
+              and final_loss < loss_ratio_threshold * initial_loss)
+    report = {
+        'passed': bool(passed),
+        'label': 'partB-stepwise-ste',
+        'steps': steps,
+        'lr': float(lr),
+        'weight_decay': 0.0,
+        'dropout': 0.0,
+        'data_augmentation': 'none',
+        'grad_clip_norm': float(grad_clip),
+        'seed': int(seed),
+        'seed_info': seed_info,
+        'spec': spec_summary(QAT_SPEC),
+        'ste': True,
+        'all_grads_finite': bool(all_grads_finite),
+        'initial_loss': initial_loss,
+        'final_loss': final_loss,
+        'best_loss': min(losses),
+        'loss_reduction': ((initial_loss - final_loss) / initial_loss
+                           if initial_loss > 0 else None),
+        'final_train_token_acc': final_acc,
+        'loss_ratio_threshold': float(loss_ratio_threshold),
+        'losses': losses,
+        'accs': accs,
+        'elapsed_s': elapsed_s,
+        'note': ('Necessary but NOT sufficient: passing proves the STE path '
+                 'propagates a usable gradient signal on a fixed batch; it '
+                 'does not prove the quantizer matches the deployment path.'),
+    }
+    del model, opt
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    return report
+
+
+def _compact_qlm_gate_report(report):
+    """Strip per-step curves for compact metadata embedding."""
+    return {k: v for k, v in report.items()
+            if k not in ('losses', 'accs', 'elapsed_s', 'seed_info')}
+
+
+def run_overfit_gates(*, device, tokenizer, split_texts, seq_len,
+                      batch_size, skip_qat, lr=3e-3):
+    """Pre-training overfit gates for both QLM parts; (record, proceed).
+
+    Environment controls:
+      * ``QLM_OVERFIT_CHECK=1|0``  (default 1: run the gates)
+      * ``QLM_OVERFIT_STRICT=1|0`` (default 1: refuse to start training
+        when any gate cell fails)
+      * ``QLM_OVERFIT_STEPS=N``    (default 100 optimizer steps per cell)
+      * ``QLM_OVERFIT_SEED=N``     (default 2026: model + fixed batch)
+      * ``QLM_OVERFIT_BATCH=N``    (default 8 sequences)
+    """
+    enabled = parse_int_env('QLM_OVERFIT_CHECK', 1, min_value=0,
+                            logger=logger) != 0
+    strict = parse_int_env('QLM_OVERFIT_STRICT', 1, min_value=0,
+                           logger=logger) != 0
+    if not enabled:
+        logger.info('  overfit sanity gates disabled '
+                    '(QLM_OVERFIT_CHECK=0)')
+        return {'enabled': False, 'strict': bool(strict), 'reports': []}, True
+    steps = parse_int_env('QLM_OVERFIT_STEPS', 100, min_value=10,
+                          logger=logger)
+    seed = parse_int_env('QLM_OVERFIT_SEED', 2026, min_value=0,
+                         logger=logger)
+    gate_batch = parse_int_env('QLM_OVERFIT_BATCH', 8, min_value=1,
+                               logger=logger)
+    batch = _fixed_lm_batch(tokenizer, split_texts['train'], seq_len,
+                            gate_batch, seed)
+    logger.info(f'  overfit sanity gates: {steps} steps on one fixed batch '
+                f'each (batch={gate_batch}, seed={seed}, '
+                f'strict={bool(strict)})')
+
+    reports = []
+    # Part A: hybrid LM through the canonical train_lm_autodl gate.
+    try:
+        rep_a = run_lm_overfit_sanity_check(
+            lambda: LMWithHybrid(len(tokenizer), small_hybrid_config()),
+            batch, device, steps=steps, lr=lr, seed=seed,
+            log_every=max(10, steps // 5))
+        rep_a['label'] = 'partA-hybrid-lm'
+    except Exception as e:
+        logger.error(f'  [overfit] partA-hybrid-lm: gate crashed: {e}')
+        rep_a = {'passed': False, 'label': 'partA-hybrid-lm',
+                 'error': str(e), 'steps': steps, 'seed': seed,
+                 'train_batch': gate_batch}
+    reports.append(rep_a)
+
+    # Part B: STE QAT path (skipped with the rest of Part B).
+    if not skip_qat:
+        try:
+            rep_b = _run_stepwise_ste_overfit_gate(
+                batch, device=device, tokenizer=tokenizer, steps=steps,
+                seed=seed, lr=lr, log_every=max(10, steps // 5))
+        except Exception as e:
+            logger.error(f'  [overfit] partB-stepwise-ste: gate crashed: {e}')
+            rep_b = {'passed': False, 'label': 'partB-stepwise-ste',
+                     'error': str(e), 'steps': steps, 'seed': seed,
+                     'train_batch': gate_batch}
+        reports.append(rep_b)
+
+    all_passed = True
+    for rep in reports:
+        if rep.get('passed'):
+            logger.info(
+                f"  [overfit] {rep['label']}: PASS "
+                f"(loss {rep.get('initial_loss'):.4f}->"
+                f"{rep.get('final_loss'):.4f})")
+        else:
+            all_passed = False
+            logger.error(
+                f"  [overfit] {rep['label']}: FAIL "
+                f"(loss={rep.get('final_loss')}, "
+                f"error={rep.get('error')})")
+    record = {'enabled': True, 'strict': bool(strict), 'steps': steps,
+              'seed': seed, 'train_batch': gate_batch, 'reports': reports}
+    if not all_passed and strict:
+        logger.error(
+            '  QLM_OVERFIT_STRICT=1: refusing to start training on a '
+            'recipe that cannot overfit a fixed batch. Fix the training '
+            'path, or set QLM_OVERFIT_STRICT=0 to record the failure and '
+            'continue (not recommended).')
+        return record, False
+    return record, True
+
+
+# --------------------------------------------------------------------------
 # Experiment driver
 # --------------------------------------------------------------------------
 def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
@@ -829,6 +1047,15 @@ def main():
     logger.info(f'  corpus: synthetic fallback, '
                 f'splits={ {k: len(v) for k, v in split_texts.items()} }')
 
+    # Pre-training overfit sanity gates: each part must be able to drive a
+    # fixed small batch to a collapsing loss (Part B additionally requires
+    # finite STE gradients) before the seed sweep burns compute.
+    gate_record, proceed = run_overfit_gates(
+        device=device, tokenizer=tokenizer, split_texts=split_texts,
+        seq_len=seq_len, batch_size=batch_size, skip_qat=skip_qat)
+    if not proceed:
+        return 1
+
     ptq_per_seed, train_reports = run_part_a(
         device=device, tokenizer=tokenizer, split_texts=split_texts,
         seeds=seeds, specs=specs, steps=steps, seq_len=seq_len,
@@ -892,6 +1119,11 @@ def main():
             {k: v for k, v in rep.items() if k != 'cfg'}
             for rep in train_reports],
         'seeds': [int(s) for s in seeds],
+        'seed_scheme': (
+            'set_global_seed(seed, deterministic=True) at the top of both '
+            'train_hybrid_lm and train_stepwise_lm; the training DataLoader '
+            'is seeded with generator=make_seeded_generator(seed) and '
+            'worker_init_fn=seed_worker; the corpus build uses seed=0'),
         'steps': steps,
         'qat_steps': qat_steps,
         'seq_len': seq_len,
@@ -919,6 +1151,18 @@ def main():
         ],
         'provenance': capture_provenance(),
     }
+    # Overfit-gate verdict: compact form in the metadata next to the rows,
+    # full record (per-step curves, batch fingerprint) in provenance.
+    metadata['overfit_sanity_check'] = {
+        'enabled': gate_record['enabled'],
+        'strict': gate_record.get('strict'),
+        'steps': gate_record.get('steps'),
+        'seed': gate_record.get('seed'),
+        'train_batch': gate_record.get('train_batch'),
+        'reports': [_compact_qlm_gate_report(r)
+                    for r in gate_record.get('reports', [])],
+    }
+    metadata['provenance']['overfit_sanity_check'] = gate_record
 
     rows = plt_rows + ptq_rows + qat_rows
     os.makedirs(os.path.dirname(RESULTS_PATH) or '.', exist_ok=True)

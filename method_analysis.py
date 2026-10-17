@@ -275,6 +275,14 @@ class HeadwiseFusedAttention(nn.Module):
         return x + self.o_proj(all_heads.reshape(B, T, -1))
 
 
+# Fixed seed for the headwise-fusion demo. The demo is a standalone forward
+# pass, but a fixed seed makes its printed shapes/values (and the model init)
+# reproducible. The global RNG state is saved and restored around the demo so
+# calling it in-process (e.g. from run_all) cannot perturb any experiment that
+# follows it.
+DEMO_SEED = 0
+
+
 def demo_headwise_fusion():
     """Run a tiny forward pass of the headwise-fused layer to confirm it works."""
     info = configure_torch_for_device()
@@ -282,14 +290,23 @@ def demo_headwise_fusion():
     print("\n" + "=" * 70)
     print(f"Headwise fusion demo (prototype, {device})")
     print("=" * 70)
-    cfg = HeadwiseConfig(d_model=64, H_total=6, H_kda=3, H_csa=2, H_hca=1,
-                         head_dim=16, csa_m=4, csa_topk=4, hca_m2=8,
-                         csa_c=16, hca_c=16)
-    model = HeadwiseFusedAttention(cfg).to(device)
-    model.eval()
-    x = (torch.randn(2, 32, 64, device=device) * 0.1)
-    with torch.no_grad():
-        y = model(x)
+    rng_state = torch.random.get_rng_state()
+    cuda_states = (torch.cuda.get_rng_state_all()
+                   if torch.cuda.is_available() else None)
+    try:
+        torch.manual_seed(DEMO_SEED)
+        cfg = HeadwiseConfig(d_model=64, H_total=6, H_kda=3, H_csa=2, H_hca=1,
+                             head_dim=16, csa_m=4, csa_topk=4, hca_m2=8,
+                             csa_c=16, hca_c=16)
+        model = HeadwiseFusedAttention(cfg).to(device)
+        model.eval()
+        x = (torch.randn(2, 32, 64, device=device) * 0.1)
+        with torch.no_grad():
+            y = model(x)
+    finally:
+        torch.random.set_rng_state(rng_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  input shape  : {tuple(x.shape)}")
     print(f"  output shape : {tuple(y.shape)}")

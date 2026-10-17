@@ -103,7 +103,12 @@ from ops_csa import _causal_block_mask, csa_compress_kv, csa_lightning_indexer
 from ops_fused import CSAHybridLayer, HybridKCHAttention
 from results_analysis import binary_ranking_metrics
 from results_schema import write as write_schema
-from run_ablation import _eval_model, _make_cfg
+from run_ablation import (
+    _compact_overfit_report,
+    _eval_model,
+    _make_cfg,
+    _run_ablation_overfit_gate,
+)
 from run_quality import (
     MQARHead,
     SMALL_MODEL_SPEC,
@@ -187,6 +192,37 @@ def set_indexer_ste(model, use_ste: bool) -> int:
             layer.indexer_is_trained = bool(use_ste)
             n += 1
     return n
+
+
+def _build_variant_model(variant: dict, d_model, device):
+    """Construct (model, head, embed) exactly as ``train_variant`` does.
+
+    Factored out so the overfit gate builds each mechanism variant through
+    the same construction path (config, STE switches, init distribution)
+    as the sweep it guards.
+    """
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
+    cfg = make_variant_cfg(variant, d_model)
+    model = HybridKCHAttention(cfg, total_layers=sum(RATIO)).to(device)
+    n_csa = set_indexer_ste(model, variant['use_ste'])
+    if n_csa != 1:
+        raise RuntimeError(
+            f"variant {variant['name']}: expected 1 CSA layer, found {n_csa}")
+    return model, head, embed
+
+
+def _compact_gate_record(record):
+    """Verdict + headline numbers per gate cell (curves stay in provenance)."""
+    return {
+        'enabled': record['enabled'],
+        'strict': record.get('strict'),
+        'steps': record.get('steps'),
+        'seed': record.get('seed'),
+        'train_batch': record.get('train_batch'),
+        'reports': [_compact_overfit_report(r)
+                    for r in record.get('reports', [])],
+    }
 
 
 def indexer_topk_from_layer(layer: CSAHybridLayer, x: torch.Tensor,
@@ -727,6 +763,20 @@ def main():
     logger.info(f'  variants: {[v["name"] for v in variants]} '
                 f'(baseline present: {has_baseline})')
 
+    # Pre-sweep overfit gate: every selected variant must be able to drive
+    # one fixed MQAR batch to near-100% train accuracy through its own
+    # forward path (RoPE on/off, top-k width, STE on/off) before the paired
+    # sweep burns compute on a broken gradient path.
+    gate_cells = [
+        (f'variant {v["name"]}',
+         lambda v=v: _build_variant_model(v, 32, device))
+        for v in variants
+    ]
+    gate_record, proceed = _run_ablation_overfit_gate(
+        gate_cells, device, n_kv=n_kv_list[0], env_prefix='MECH')
+    if not proceed:
+        return 1
+
     # Shared Bonferroni family: one paired accuracy test vs baseline per
     # non-baseline variant (only when the baseline variant is present) PLUS
     # one one-sided recall-vs-chance test per variant (baseline included).
@@ -964,6 +1014,10 @@ def main():
         ],
         'provenance': capture_provenance(),
     }
+    # Overfit-gate verdict: compact form in the metadata next to the rows,
+    # full record (per-step curves, batch fingerprint) in provenance.
+    metadata['overfit_sanity_check'] = _compact_gate_record(gate_record)
+    metadata['provenance']['overfit_sanity_check'] = gate_record
 
     os.makedirs(os.path.dirname(RESULTS_PATH) or '.', exist_ok=True)
     write_schema(RESULTS_PATH, all_rows, kind='exp8_mechanism_ablation',

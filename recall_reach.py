@@ -105,6 +105,7 @@ from ops_fused import (  # noqa: E402
     HybridConfig,
     HybridKCHAttention,
 )
+from run_ablation import _run_ablation_overfit_gate  # noqa: E402
 from run_quality import (  # noqa: E402
     MQARHead,
     SMALL_MODEL_SPEC,
@@ -643,6 +644,20 @@ def make_grid_cfg(m: int, m2: int, layout, *, d_model: int = D_MODEL,
     )
 
 
+def _build_recall_model(m: int, m2: int, layout, d_model, device):
+    """Construct (model, head, embed) exactly as ``train_recall_model`` does.
+
+    Factored out so the overfit gate builds the probe model through the
+    same construction path (config, layout, init distribution) as the grid
+    sweep it guards.
+    """
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
+    cfg = make_grid_cfg(m, m2, layout, d_model=d_model)
+    model = HybridKCHAttention(cfg, total_layers=len(cfg.layout)).to(device)
+    return model, head, embed
+
+
 def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
                        seq_len: int = SEQ_LEN, d_model: int = D_MODEL,
                        train_batch: int = 16, lr: float = 3e-3,
@@ -946,6 +961,31 @@ def main(argv=None) -> int:
         pairs = BUDGET_PAIRS
         layouts = list(LAYOUT_PRESETS)
 
+    if args.no_train:
+        gate_record = {'enabled': False, 'strict': None, 'reports': [],
+                       'reason': 'structural-only run (--no-train)'}
+    else:
+        # Pre-sweep overfit gate on the first grid cell, through the exact
+        # training construction path. The per-cell sweep surfaces
+        # cell-level errors; this gate catches a globally broken recipe
+        # before the grid burns compute.
+        gate_m, gate_m2 = pairs[0]
+        gate_layout_name = layouts[0]
+        gate_layout = (LAYOUT_PRESETS[gate_layout_name]
+                       if isinstance(gate_layout_name, str)
+                       else tuple(gate_layout_name))
+        gate_record, proceed = _run_ablation_overfit_gate(
+            [(f'long-range m={gate_m} m2={gate_m2} '
+              f'layout={gate_layout_name}',
+              lambda: _build_recall_model(gate_m, gate_m2, gate_layout,
+                                          args.d_model, device))],
+            device, env_prefix='RECALL',
+            make_task_batch=lambda b, embed, gen: make_long_range_batch(
+                b, args.seq_len, 1, VOCAB, embed, device, generator=gen),
+            seq_len=args.seq_len)
+        if not proceed:
+            return 1
+
     report = run_recall_report(
         pairs=pairs, layouts=layouts, steps=steps, seeds=seeds,
         seq_len=args.seq_len, d_model=args.d_model,
@@ -953,6 +993,9 @@ def main(argv=None) -> int:
         eval_batch=args.eval_batch, device=device,
         train=not args.no_train)
 
+    # Attach the pre-sweep gate verdict so the report is a complete run
+    # record (the full per-step curves + fixed-batch fingerprint).
+    report['overfit_sanity_check'] = gate_record
     payload = sanitize_for_json(report)
     json.dumps(payload, allow_nan=False)
     out_path = args.json or RESULTS_PATH

@@ -328,7 +328,7 @@ def main() -> int:
     # Seed the host-peak microbenchmark inputs so the recorded
     # "measured_copy_bw_gbps" / "measured_gemm_tflops" metadata is
     # reproducible run to run.
-    seed_info = set_global_seed(ROOFLINE_SEED)
+    seed_info = set_global_seed(ROOFLINE_SEED, deterministic=True)
     peaks = _resolve_peaks(device, size_mb=size_mb, repeats=repeats,
                            gemm_n=gemm_n)
     logger.info(

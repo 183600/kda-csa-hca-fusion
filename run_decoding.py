@@ -1567,6 +1567,10 @@ def main():
                        'prefill/decode inputs; see run_decoding.main / '
                        'bench_decoding'),
         },
+        # Code/environment provenance in the main envelope itself (the side
+        # file below duplicates it), so a single archived result file is a
+        # complete run record.
+        'provenance': capture_provenance(),
     }
     try:
         write_results_checked('results/exp6_decoding.json', results,

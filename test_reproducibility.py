@@ -35,7 +35,16 @@ from kaggle_setup import (  # noqa: E402
     split_train_val_test,
 )
 from ops_fused import HybridConfig  # noqa: E402
+from run_ablation import (  # noqa: E402
+    _build_layout_model,
+    _run_ablation_overfit_gate,
+    eval_layout,
+)
+from run_ablation import (  # noqa: E402
+    run_overfit_sanity_check as run_hybrid_overfit_sanity_check,
+)
 from run_quality import (  # noqa: E402
+    make_mqar_batch,
     train_one,
     run_overfit_sanity_check as run_mqar_overfit_sanity_check,
 )
@@ -282,6 +291,76 @@ def test_lm_overfit_gate_does_not_perturb_model_init():
     after = construct()
     assert baseline.keys() == after.keys()
     assert all(torch.equal(baseline[k], after[k]) for k in baseline)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid-sweep (Exp 5 / 8 / 9) classification overfit gate in run_ablation
+# ---------------------------------------------------------------------------
+
+def _hybrid_gate(steps, *, lr=3e-3, seed=123, batch=8):
+    return run_hybrid_overfit_sanity_check(
+        lambda: _build_layout_model((3, 1, 1), 32, 'cpu'),
+        lambda b, embed, gen: make_mqar_batch(
+            b, 16, 1, 16, embed, 'cpu', generator=gen),
+        label='layout KDA:CSA:HCA=3:1:1', steps=steps, lr=lr, seed=seed,
+        train_batch=batch, device='cpu')
+
+
+def test_hybrid_overfit_check_rejects_too_few_steps():
+    with pytest.raises(ValueError):
+        _hybrid_gate(steps=9)
+
+
+def test_hybrid_overfit_check_passes_on_healthy_training():
+    report = _hybrid_gate(steps=25)
+    assert report['passed'] is True
+    # The hybrid layout contains only one retrieval layer, so the gate
+    # relies on the fixed batch being fully memorized.
+    assert report['final_train_acc'] >= 0.99
+    # The report is the tracked artifact for this gate; it must serialize.
+    json.dumps(report, allow_nan=False)
+
+
+def test_hybrid_overfit_check_detects_frozen_training():
+    # lr=0 freezes the weights: the loss is flat and the gate must FAIL
+    # rather than let a broken optimizer (or a detached CSA/HCA path) start
+    # the multi-seed sweep.
+    report = _hybrid_gate(steps=15, lr=0.0)
+    assert report['passed'] is False
+    assert report['acc_curve'][0] == report['acc_curve'][-1]
+
+
+def test_hybrid_overfit_check_is_deterministic():
+    first = _hybrid_gate(steps=12, seed=321)
+    second = _hybrid_gate(steps=12, seed=321)
+    assert first['fixed_batch_sha256'] == second['fixed_batch_sha256']
+    assert first['loss_curve'] == second['loss_curve']
+    assert first['acc_curve'] == second['acc_curve']
+
+
+def test_hybrid_overfit_gate_does_not_perturb_layout_results():
+    # The gate re-seeds internally and eval_layout re-seeds per cell, so a
+    # gate run must leave the sweep's curves bit-identical. This guards the
+    # "gate is diagnostic-only" contract the runners rely on.
+    kwargs = dict(seed=7, steps=5, device='cpu')
+    before = eval_layout((3, 1, 1), **kwargs)
+    _hybrid_gate(steps=10)
+    after = eval_layout((3, 1, 1), **kwargs)
+    assert before['loss_curve'] == after['loss_curve']
+    assert before['final_acc'] == after['final_acc']
+
+
+def test_hybrid_overfit_gate_can_be_disabled(monkeypatch):
+    def _unexpected_build():
+        raise AssertionError(
+            'gate builder must not run when the gate is disabled')
+
+    monkeypatch.setenv('TESTABL_OVERFIT_CHECK', '0')
+    record, proceed = _run_ablation_overfit_gate(
+        [('never-run', _unexpected_build)], 'cpu', env_prefix='TESTABL')
+    assert proceed is True
+    assert record['enabled'] is False
+    assert record['reports'] == []
 
 
 # ---------------------------------------------------------------------------

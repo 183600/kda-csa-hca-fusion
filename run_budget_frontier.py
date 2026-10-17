@@ -93,6 +93,7 @@ from kaggle_setup import (
     capture_provenance,
     configure_torch_for_device,
     parse_int_env,
+    set_global_seed,
 )
 from kv_budget import (
     instant_layout_read_elements,
@@ -121,6 +122,9 @@ DEFAULT_TOPK = '0,1,2,4,8'
 DEFAULT_PREFILL_LENS = '256,512'
 DEFAULT_DECODE_TOKENS = 10
 DEFAULT_REPEATS = 2
+# Seed for the measured decode sweep's model construction / benchmark inputs
+# (recorded in the result metadata so the latency rows are reproducible).
+DECODE_SWEEP_SEED = 0
 LAYOUTS = (
     (3, 1, 1),
     (4, 1, 0), (4, 0, 1),
@@ -299,7 +303,7 @@ def run_decode_sweep(device, topk_values, prefill_lens, n_decode, repeats):
     for prefill_len in prefill_lens:
         for topk in topk_values:
             try:
-                torch.manual_seed(0)
+                set_global_seed(DECODE_SWEEP_SEED, deterministic=True)
                 model = HybridDecoding(
                     d_model=DECODE_D_MODEL, total_layers=DECODE_TOTAL_LAYERS,
                     csa_topk=topk)
@@ -660,6 +664,10 @@ def main():
             'decode cost, not a latency prediction.',
         ],
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
+        'seed': DECODE_SWEEP_SEED,
+        'seed_scheme': (
+            'set_global_seed(0, deterministic=True) before every decode-sweep '
+            'model construction; analytical budget rows are seed-free'),
         'provenance': capture_provenance(),
     }
 

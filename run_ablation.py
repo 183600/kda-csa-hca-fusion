@@ -76,13 +76,19 @@ from ops_rwkv import RWKV7_UPSTREAM_BINDING
 from ops_rwkv_backend import validate_rwkv_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
-    _bonferroni_crit_q, _build_param_groups, SMALL_MODEL_SPEC,
+    _bonferroni_crit_q, _build_param_groups, _task_batch_fingerprint,
+    SMALL_MODEL_SPEC,
 )
 
 logger = logging.getLogger(__name__)
 
 VOCAB = 16
 SEQ_LEN = 16
+
+# Fixed seed offset for the overfit gate's batch generator. Far away from
+# the training offset (1_000_000) and the eval offset (5_000_000) so the
+# gate's data stream can never collide with either.
+_OVERFIT_BATCH_SEED_OFFSET = 3_000_000
 
 
 def _make_cfg(d_model=32, ratio=(3, 1, 1)):
@@ -112,12 +118,14 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     )
 
 
-def _run_provenance(n_seeds, steps):
+def _run_provenance(n_seeds, steps, overfit_gate=None):
     """Environment provenance + seed list + training recipe for side files.
 
     Each side file records the code/environment alongside the seeds and the
     training recipe that produced the adjacent results file, so the pair is
-    a complete run record.
+    a complete run record. ``overfit_gate`` (the record returned by
+    ``_run_ablation_overfit_gate``) is embedded so the sanity-gate verdict
+    travels with the run record.
     """
     prov = capture_provenance()
     prov['seeds'] = [42 + i for i in range(int(n_seeds))]
@@ -153,6 +161,8 @@ def _run_provenance(n_seeds, steps):
                  'version applies. Code revision in this provenance pins the '
                  'generator implementation.'),
     }
+    if overfit_gate is not None:
+        prov['overfit_sanity_check'] = overfit_gate
     return prov
 
 
@@ -187,6 +197,259 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
     finally:
         for m, was in was_training.items():
             m.train(was)
+
+
+def _build_layout_model(ratio, d_model, device):
+    """Construct (model, head, embed) exactly as ``eval_layout`` does.
+
+    Factored out so the overfit gate builds models through the same
+    construction path (and therefore the same init distribution) as the
+    sweep it guards.
+    """
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
+    cfg = _make_cfg(d_model, ratio)
+    model = HybridKCHAttention(cfg, total_layers=sum(ratio)).to(device)
+    return model, head, embed
+
+
+def _build_matrix_model(spec, d_model, device):
+    """Construct (model, head, embed) exactly as ``eval_group`` does."""
+    memory_type, layout = spec[1], spec[2]
+    cfg_overrides = spec[4] if len(spec) > 4 else None
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
+    cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
+    model = HybridAttentionStack(cfg, total_layers=len(layout)).to(device)
+    return model, head, embed
+
+
+def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
+                             steps=100, train_batch=32, device='cpu',
+                             lr=3e-3, grad_clip=1.0, acc_threshold=0.99,
+                             loss_ratio_threshold=0.5, log_every=0,
+                             seq_len=SEQ_LEN):
+    """Overfit ONE fixed batch as a pre-sweep gradient-flow gate.
+
+    Trains a FRESH model (built by ``build_model`` immediately after a
+    ``set_global_seed(seed, deterministic=True)`` call, so the init is
+    reproducible) on a single fixed synthetic batch with all
+    regularization disabled (``weight_decay=0``, no dropout anywhere in
+    these operators, no data augmentation). The batch is regenerated
+    deterministically every step from ``seed +
+    _OVERFIT_BATCH_SEED_OFFSET``, so the autograd graph — including the
+    embedding's gradient path — is fresh each step while the DATA is held
+    constant (mirrors ``run_quality.run_overfit_sanity_check``).
+
+    ``build_model()`` must return ``(model, head, embed)`` and
+    ``make_batch(batch, embed, generator)`` must return
+    ``(x_emb, target, cue_pos)``; both callables let this single gate
+    guard the layout sweep, the mechanism ablation, and the recall-reach
+    probe without duplicating the loop.
+
+    Pass criterion (either): tail-mean train accuracy >= ``acc_threshold``
+    (default 0.99), OR tail-mean loss < ``loss_ratio_threshold`` times the
+    head-mean loss.
+
+    This is a NECESSARY, NOT SUFFICIENT check: passing proves gradients
+    flow and the loss responds on a fixed batch; augmentation,
+    feature-alignment and label-mapping bugs can still pass it.
+
+    The caller re-seeds per sweep cell anyway, so the gate cannot perturb
+    the experiment's numbers.
+    """
+    import gc
+
+    if isinstance(device, str):
+        device = torch.device(device)
+    steps = int(steps)
+    if steps < 10:
+        raise ValueError(
+            f"overfit check needs steps >= 10 to be meaningful, got {steps}")
+    train_batch = int(train_batch)
+    if train_batch < 1:
+        raise ValueError(f"train_batch must be >= 1, got {train_batch}")
+    warmup = max(1, min(5, steps // 10))
+    tail = max(1, min(5, steps // 10))
+
+    seed_info = set_global_seed(seed, deterministic=True)
+    model, head, embed = build_model()
+    param_groups = _build_param_groups(model, head, embed, weight_decay=0.0)
+    opt = torch.optim.AdamW(param_groups, lr=lr)
+    params = [p for g in param_groups for p in g['params']]
+
+    model.train()
+    head.train()
+    embed.train()
+
+    losses, accs, elapsed_s = [], [], []
+    first_batch = None
+    t0 = time.time()
+    for step in range(steps):
+        gen = make_seeded_generator(seed + _OVERFIT_BATCH_SEED_OFFSET,
+                                    device=device)
+        x_emb, target, cue_pos = make_batch(train_batch, embed, gen)
+        if first_batch is None:
+            first_batch = (x_emb.detach(), target.detach(), cue_pos)
+        model.reset_state()
+        h = model(x_emb)
+        logits = head(h, cue_pos)
+        loss = F.cross_entropy(logits, target)
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"overfit sanity check: non-finite loss at step {step} "
+                f"({loss.item()}) for {label}; aborting before the sweep.")
+        acc = (logits.argmax(-1) == target).float().mean().item()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        bad_grads = [p for p in params
+                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if bad_grads:
+            raise RuntimeError(
+                f"overfit sanity check: non-finite gradient at step {step} "
+                f"in {len(bad_grads)} params for {label}; aborting before "
+                f"the sweep.")
+        torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        opt.step()
+        losses.append(float(loss.detach()))
+        accs.append(float(acc))
+        elapsed_s.append(time.time() - t0)
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f"[overfit-check] {label} step {step:4d} "
+                  f"loss {losses[-1]:.4f} acc {acc:.4f} "
+                  f"({elapsed_s[-1]:.1f}s)", flush=True)
+
+    initial_loss = sum(losses[:warmup]) / warmup
+    final_loss = sum(losses[-tail:]) / tail
+    final_acc = sum(accs[-tail:]) / tail
+    loss_reduction = ((initial_loss - final_loss) / initial_loss
+                      if initial_loss > 0 else None)
+    passed = ((final_acc >= acc_threshold)
+              or (final_loss < loss_ratio_threshold * initial_loss))
+    report = {
+        'passed': bool(passed),
+        'label': label,
+        'seq_len': int(seq_len),
+        'vocab': VOCAB,
+        'steps': steps,
+        'train_batch': train_batch,
+        'lr': float(lr),
+        'weight_decay': 0.0,
+        'dropout': 0.0,
+        'data_augmentation': 'none',
+        'grad_clip_norm': float(grad_clip),
+        'seed': int(seed),
+        'batch_generator_seed': int(seed + _OVERFIT_BATCH_SEED_OFFSET),
+        'seed_info': seed_info,
+        'fixed_batch_sha256': _task_batch_fingerprint(*first_batch),
+        'initial_loss': initial_loss,
+        'final_loss': final_loss,
+        'best_loss': min(losses),
+        'loss_reduction': loss_reduction,
+        'final_train_acc': final_acc,
+        'best_train_acc': max(accs),
+        'acc_threshold': float(acc_threshold),
+        'loss_ratio_threshold': float(loss_ratio_threshold),
+        'loss_curve': losses,
+        'acc_curve': accs,
+        'elapsed_s': elapsed_s,
+        'note': ('Necessary but NOT sufficient: passing proves gradients '
+                 'flow and the loss responds on a fixed batch; it cannot '
+                 'rule out data-augmentation / feature-alignment / '
+                 'label-mapping bugs.'),
+    }
+    del model, head, embed, opt
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    return report
+
+
+def _compact_overfit_report(report):
+    """Strip per-step curves for compact metadata embedding."""
+    return {k: v for k, v in report.items()
+            if k not in ('loss_curve', 'acc_curve', 'elapsed_s', 'seed_info')}
+
+
+def _run_ablation_overfit_gate(build_models, device, *, n_kv=1,
+                               env_prefix='ABL', make_task_batch=None,
+                               seq_len=SEQ_LEN):
+    """Run the pre-sweep overfit gate(s) and return ``(record, proceed)``.
+
+    ``build_models`` is a list of ``(label, build_model)`` pairs; the gate
+    runs once per entry so every distinct layout/mechanism that will be
+    swept gets its own verdict (a broken CSA/HCA gradient path must not be
+    hidden behind a passing pure-recurrent layout).
+
+    Environment controls (mirroring ``run_quality``'s MQAR gate); the
+    ``{env_prefix}`` is ``ABL`` for the Exp 5 sweep and reused with the
+    experiment's own prefix by the other hybrid runners:
+      * ``{env_prefix}_OVERFIT_CHECK=1|0``  (default 1: run the gate)
+      * ``{env_prefix}_OVERFIT_STRICT=1|0`` (default 1: refuse to start the
+        sweep when any gate cell fails)
+      * ``{env_prefix}_OVERFIT_STEPS=N``    (default 100 optimizer steps)
+      * ``{env_prefix}_OVERFIT_SEED=N``     (default 2026: model + batch)
+      * ``{env_prefix}_OVERFIT_BATCH=N``    (default 32 sequences)
+    """
+    enabled = parse_int_env(f'{env_prefix}_OVERFIT_CHECK', 1, min_value=0,
+                            logger=logger) != 0
+    strict = parse_int_env(f'{env_prefix}_OVERFIT_STRICT', 1, min_value=0,
+                           logger=logger) != 0
+    if not enabled:
+        logger.info(f'  overfit sanity gate disabled '
+                    f'({env_prefix}_OVERFIT_CHECK=0)')
+        return {'enabled': False, 'strict': bool(strict), 'reports': []}, True
+    steps = parse_int_env(f'{env_prefix}_OVERFIT_STEPS', 100, min_value=10,
+                          logger=logger)
+    seed = parse_int_env(f'{env_prefix}_OVERFIT_SEED', 2026, min_value=0,
+                         logger=logger)
+    batch = parse_int_env(f'{env_prefix}_OVERFIT_BATCH', 32, min_value=1,
+                          logger=logger)
+    if make_task_batch is None:
+        def make_task_batch(b, embed, gen):
+            return make_mqar_batch(b, SEQ_LEN, n_kv, VOCAB, embed, device,
+                                   generator=gen)
+    logger.info(f'  overfit sanity gate: {len(build_models)} cell(s), '
+                f'{steps} steps on one fixed batch each '
+                f'(batch={batch}, seed={seed}, strict={bool(strict)})')
+    reports = []
+    all_passed = True
+    for label, build_model in build_models:
+        try:
+            report = run_overfit_sanity_check(
+                build_model, make_task_batch,
+                label=label, seed=seed, steps=steps, train_batch=batch,
+                device=device, log_every=max(10, steps // 5),
+                seq_len=seq_len)
+        except Exception as e:
+            logger.error(f'  [overfit] {label}: gate crashed: {e}')
+            report = {'passed': False, 'label': label, 'error': str(e),
+                      'steps': steps, 'seed': seed, 'train_batch': batch}
+        reports.append(report)
+        if report.get('passed'):
+            logger.info(
+                f"  [overfit] {label}: PASS "
+                f"(acc={report['final_train_acc']:.4f}, "
+                f"loss {report['initial_loss']:.4f}->"
+                f"{report['final_loss']:.4f})")
+        else:
+            all_passed = False
+            logger.error(
+                f"  [overfit] {label}: FAIL "
+                f"(acc={report.get('final_train_acc')}, "
+                f"loss={report.get('final_loss')}, "
+                f"error={report.get('error')})")
+    record = {'enabled': True, 'strict': bool(strict),
+              'steps': steps, 'seed': seed, 'train_batch': batch,
+              'reports': reports}
+    if not all_passed and strict:
+        logger.error(
+            f'  {env_prefix}_OVERFIT_STRICT=1: refusing to start the sweep '
+            f'on a recipe that cannot overfit a fixed batch. Fix the '
+            f'training path, or set {env_prefix}_OVERFIT_STRICT=0 to '
+            f'record the failure and continue (not recommended).')
+        return record, False
+    return record, True
 
 
 def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, seed=42,
@@ -1085,6 +1348,33 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
     logger.info(f'  memory routes : {memory_types}')
     groups = build_experiment_matrix(preset, total_layers, memory_types)
 
+    # Pre-sweep overfit sanity gate: one cell per DISTINCT layout on the
+    # first memory route (the memory operators themselves already have
+    # their own exp4 gradient gates). Gating every layout catches a broken
+    # CSA/HCA gradient path that a pure-recurrent group would hide; the
+    # route-level check is deliberately not repeated for every memory
+    # operator to keep the gate cheap.
+    gate_cells = []
+    _seen_layouts = set()
+    _first_memory = groups[0][1]
+    for spec in groups:
+        if spec[1] != _first_memory:
+            continue
+        _overrides = spec[4] if len(spec) > 4 else None
+        _layout_key = (tuple(spec[2]),
+                       tuple(sorted((_overrides or {}).items())))
+        if _layout_key in _seen_layouts:
+            continue
+        _seen_layouts.add(_layout_key)
+        _gid = spec[0]
+        gate_cells.append(
+            (f'group {_gid}',
+             lambda spec=spec: _build_matrix_model(spec, d_model, device)))
+    gate_record, proceed = _run_ablation_overfit_gate(
+        gate_cells, device, n_kv=n_kv_list[0])
+    if not proceed:
+        return 1
+
     n_tests = len(groups) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests
     try:
@@ -1239,6 +1529,15 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         # The preset's promised group ids; the row contract refuses to
         # write a survivor-only matrix (a crash mid-sweep) as if complete.
         'expected_groups': [spec[0] for spec in groups],
+        'overfit_sanity_check': {
+            'enabled': gate_record['enabled'],
+            'strict': gate_record['strict'],
+            'steps': gate_record.get('steps'),
+            'seed': gate_record.get('seed'),
+            'train_batch': gate_record.get('train_batch'),
+            'reports': [_compact_overfit_report(r)
+                        for r in gate_record['reports']],
+        },
     }
     # Independent re-derivation of every reported contrast from the raw
     # per-seed rows: the analysis side file must not contradict the matrix
@@ -1261,7 +1560,7 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         logger.error(f'result rows failed their contract: {e}')
         return 1
     try:
-        write_results_json(_run_provenance(n_seeds, steps),
+        write_results_json(_run_provenance(n_seeds, steps, gate_record),
                            'results/exp5b_ablation_matrix_provenance.json',
                            logger=logger)
     except Exception as e:
@@ -1317,6 +1616,19 @@ def main():
 
     if abl_mode == 'matrix':
         return _run_matrix_mode(device, n_seeds, steps, n_kv_list)
+
+    # Pre-sweep overfit sanity gate on the reference layout: if the shared
+    # training path cannot drive one fixed MQAR batch to ~100% train
+    # accuracy, every sweep row below would be measuring a broken recipe.
+    gate_ratio = (3, 1, 1)
+    _gate_label = (f'layout KDA:CSA:HCA='
+                   f'{gate_ratio[0]}:{gate_ratio[1]}:{gate_ratio[2]}')
+    gate_record, proceed = _run_ablation_overfit_gate(
+        [(_gate_label,
+          lambda: _build_layout_model(gate_ratio, 32, device))],
+        device, n_kv=n_kv_list[0])
+    if not proceed:
+        return 1
 
     ratios = [
         (3, 1, 1),
@@ -1466,7 +1778,7 @@ def main():
     write_results_json(all_results, 'results/exp5_ablation.json',
                        logger=logger)
     try:
-        write_results_json(_run_provenance(n_seeds, steps),
+        write_results_json(_run_provenance(n_seeds, steps, gate_record),
                            'results/exp5_ablation_provenance.json',
                            logger=logger)
     except Exception as e:
