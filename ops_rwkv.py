@@ -363,7 +363,11 @@ def rwkv7_reference_scan(
     else:
         state = initial_state.to(device=v.device, dtype=compute_dtype)
 
-    r_c = r_c * scale
+    if scale != 1.0:
+        # Multiplying by exactly 1.0 is an IEEE no-op (pinned by the
+        # bit-exactness of every prior test), so the default RWKV-7 scale
+        # skips the full [B, T, H, K] multiply.
+        r_c = r_c * scale
     # (kk * a) is used at every step. The sign is folded into ``kka`` so
     # the readout contract needs no in-loop negation (exact sign flips
     # only — see ``_rwkv7_scan_loop_eager``).

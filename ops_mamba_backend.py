@@ -384,7 +384,9 @@ class OfficialMamba2Mixer(nn.Module):
                      torch.zeros(B, self.conv_dim, self.d_conv,
                                  device=x.device, dtype=x.dtype))
         if state is not None and state.shape[0] == B:
-            ssm_seed = state.clone().to(compute_dtype)
+            # ``to(copy=True)`` = cast-if-needed plus unconditional copy,
+            # the same contents as ``clone().to()`` with one temporary less.
+            ssm_seed = state.to(compute_dtype, copy=True)
         else:
             ssm_seed = torch.zeros(
                 B, self.nheads, self.headdim, self.d_state,
@@ -396,7 +398,8 @@ class OfficialMamba2Mixer(nn.Module):
         ip.seqlen_offset = 1 if T == 1 else 0
         out = self.mamba(x, inference_params=ip)
         new_conv, new_state = ip.key_value_memory_dict[0]
-        new_state = new_state.to(compute_dtype).clone()
+        # Same single-shot cast+copy as ``to().clone()`` above.
+        new_state = new_state.to(compute_dtype, copy=True)
         new_conv = new_conv.to(x.dtype)
         if detach_lookback:
             new_conv = new_conv.detach()

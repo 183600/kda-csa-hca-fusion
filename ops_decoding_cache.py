@@ -915,9 +915,13 @@ class CSADecodingCache:
                 # block's overlap partner for the NEXT compression.
                 # Detach so we don't retain the autograd graph across
                 # decode steps (mirrors the KDA state detach pattern in
-                # ops_fused.py::KDAHybridLayer.forward_functional).
-                self._prev_Cb = Cb_block.detach().clone()
-                self._prev_Zb = Zb_block.detach().clone()
+                # ops_fused.py::KDAHybridLayer.forward_functional). The
+                # ``cat`` above already produced freshly-owned storage
+                # that nothing else aliases or mutates, so ``detach()``
+                # alone is enough here (the bulk path keeps its clone:
+                # there the source is a view into the caller's tensor).
+                self._prev_Cb = Cb_block.detach()
+                self._prev_Zb = Zb_block.detach()
                 # Clear the accumulator for the next block.
                 self._acc_Ca.clear()
                 self._acc_Cb.clear()
@@ -1235,15 +1239,14 @@ class CSADecodingCache:
             # attention for 'l2', the paper §2.3.3 RMSNorm form for
             # 'rms'). When False, skip normalization and fall back to the
             # classical 1/sqrt(c) dot-product scale.
-            if normalize_qk:
-                C_comp_valid = _to_dtype(
-                    self._C_comp[:, :self._n_blocks], compute_dtype)
-                C_comp_n = _qk_normalize(
-                    C_comp_valid,
-                    self.qk_norm_mode)                                # [B, n_blocks, c]
-            else:
-                C_comp_n = _to_dtype(
-                    self._C_comp[:, :self._n_blocks], compute_dtype)
+            #
+            # ``_qk_normalize`` is a per-row map, so normalizing only the
+            # ``topk`` gathered rows (below) is bit-identical to
+            # normalizing all ``n_blocks`` rows first and gathering after;
+            # it keeps the per-step cost independent of the context length
+            # instead of rescanning the whole compressed cache.
+            C_comp_valid = _to_dtype(
+                self._C_comp[:, :self._n_blocks], compute_dtype)
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
             # block mask). STE is only useful when autograd is enabled; in
@@ -1287,7 +1290,11 @@ class CSADecodingCache:
                 valid_mask = indices >= 0                              # [B, 1, topk]
                 idx_safe = indices.clamp(min=0)                        # [B, 1, topk]
                 batch_idx = torch.arange(B, device=device).view(B, 1, 1)
-                kv = C_comp_n[batch_idx, idx_safe]                     # [B, 1, topk, c]
+                kv = C_comp_valid[batch_idx, idx_safe]                 # [B, 1, topk, c]
+                if normalize_qk:
+                    # Per-row normalization after the gather (see the note
+                    # at ``C_comp_valid`` above).
+                    kv = _qk_normalize(kv, self.qk_norm_mode)
                 # STE for the indexer (mirrors ``naive_csa``).
                 if effective_use_ste and soft_weights is not None:
                     soft_weights_selected = torch.gather(
@@ -1297,6 +1304,11 @@ class CSADecodingCache:
                         valid_mask.to(soft_weights_selected.dtype)
                     soft_kv = soft_weights_selected.unsqueeze(-1) * kv.detach()
                     if ste_mode == 'full_softmax':
+                        # The full-softmax expected KV reads every block,
+                        # so only this branch needs the fully normalized
+                        # compressed rows (identical per-row values).
+                        C_comp_n = (_qk_normalize(C_comp_valid, self.qk_norm_mode)
+                                    if normalize_qk else C_comp_valid)
                         soft_full = torch.einsum(
                             'btn,bnc->btc', soft_weights, C_comp_n,
                         )                                              # [B, 1, c]
@@ -1337,8 +1349,13 @@ class CSADecodingCache:
             # place, which would invalidate that saved view (backward
             # would raise "modified by an inplace operation"). Materialize
             # a stable copy so one backward pass can span several decode
-            # steps; values are unchanged.
-            C_local = _to_dtype(self._sw.get(), compute_dtype).clone()  # [B, sw_len, c]
+            # steps; values are unchanged. The copy is only needed when a
+            # backward graph can actually save the view (grad enabled AND
+            # one of the einsum operands requires grad).
+            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
+            if torch.is_grad_enabled() and (
+                    q_compute.requires_grad or C_local.requires_grad):
+                C_local = C_local.clone()
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             )                                                          # [B, nh, sw_len]
@@ -1858,8 +1875,13 @@ class HCADecodingCache:
             # ``get()`` returns a live view into the ring buffer, and the
             # scores einsum below saves it to compute the query gradient;
             # a later ``append_step`` overwrites the buffer in place and
-            # would invalidate that saved view. Values are unchanged.
-            C_local = _to_dtype(self._sw.get(), compute_dtype).clone()  # [B, sw_len, c]
+            # would invalidate that saved view. Values are unchanged. The
+            # copy is only needed when a backward graph can actually save
+            # the view (grad enabled AND an einsum operand requires grad).
+            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
+            if torch.is_grad_enabled() and (
+                    q_compute.requires_grad or C_local.requires_grad):
+                C_local = C_local.clone()
             sw = torch.einsum(
                 'b h d, b s d -> b h s', q_compute[:, 0], C_local,
             )                                                          # [B, nh, sw_len]

@@ -103,6 +103,54 @@ def _inv_freq(rope_dim: int, base: float, device, dtype: torch.dtype) -> torch.T
     return inv_freq
 
 
+# ``(cos, sin)`` tables for INTEGER position vectors, keyed by the exact
+# position values plus (rope_dim, base, device, angle_dtype, position dtype).
+# The decode path calls ``partial_rope`` several times per token with the
+# same one-element position vector (query + sliding-window key), and the
+# full-sequence paths re-rotate several tensors at the same positions; the
+# tables are pure functions of the key, so reusing them is bit-identical.
+# The entries are treated as immutable (only ``view``/read by consumers).
+_TABLE_CACHE: dict = {}
+_TABLE_CACHE_MAX_ENTRIES = 128
+_TABLE_CACHE_MAX_ELEMS = 1 << 21
+
+# Integer position dtypes eligible for the table cache (float positions can
+# carry signed zeros / NaN payloads that a value-keyed cache would merge).
+_INT_POS_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
+
+
+def _cos_sin_cached(
+    positions: torch.Tensor,
+    rope_dim: int,
+    base: float,
+    angle_dtype: torch.dtype,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached ``(cos, sin)`` tables for an integer ``positions`` vector.
+
+    Only integer position dtypes (the ones every in-repo caller uses:
+    ``torch.arange`` / ``torch.tensor([t])``) take this path; float
+    positions — where ``-0.0`` vs ``+0.0`` or NaN payloads could make a
+    value-keyed cache ambiguous — keep the direct computation. The two
+    computations are otherwise textually identical, so a cache hit returns
+    the exact bits the uncached path would produce.
+    """
+    key = (rope_dim, float(base), str(device), angle_dtype,
+           positions.dtype, tuple(positions.tolist()))
+    entry = _TABLE_CACHE.get(key)
+    if entry is not None:
+        return entry
+    pos_f = positions.to(device=device, dtype=angle_dtype)
+    angles = pos_f[:, None] * _inv_freq(rope_dim, base, device, angle_dtype)[None, :]
+    cos = angles.cos()
+    sin = angles.sin()
+    if positions.numel() * (rope_dim // 2) <= _TABLE_CACHE_MAX_ELEMS:
+        if len(_TABLE_CACHE) >= _TABLE_CACHE_MAX_ENTRIES:
+            _TABLE_CACHE.clear()
+        _TABLE_CACHE[key] = (cos, sin)
+    return cos, sin
+
+
 def partial_rope(
     x: torch.Tensor,
     positions: torch.Tensor,
@@ -163,15 +211,22 @@ def partial_rope(
         raise ValueError(f"partial_rope: base={base!r} must be positive.")
     device = x.device
     angle_dtype = _angle_dtype(x)
-    # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1 (see ``_inv_freq``).
-    inv_freq = _inv_freq(rope_dim, base, device, angle_dtype)  # [rope_dim/2]
-    # ``.to`` returns the tensor itself when dtype AND device already
-    # match, so this guard is value-identical.
-    if positions.dtype != angle_dtype or positions.device != device:
-        positions = positions.to(device=device, dtype=angle_dtype)
-    angles = positions[:, None] * inv_freq[None, :]          # [P, rope_dim/2]
-    cos = angles.cos()
-    sin = angles.sin()
+    if positions.dtype in _INT_POS_DTYPES and not positions.requires_grad:
+        # Exact-value table cache (see ``_cos_sin_cached``); the uncached
+        # branch below performs the identical computation.
+        cos, sin = _cos_sin_cached(
+            positions, rope_dim, base, angle_dtype, device)
+    else:
+        # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1
+        # (see ``_inv_freq``).
+        inv_freq = _inv_freq(rope_dim, base, device, angle_dtype)  # [rope_dim/2]
+        # ``.to`` returns the tensor itself when dtype AND device already
+        # match, so this guard is value-identical.
+        if positions.dtype != angle_dtype or positions.device != device:
+            positions = positions.to(device=device, dtype=angle_dtype)
+        angles = positions[:, None] * inv_freq[None, :]      # [P, rope_dim/2]
+        cos = angles.cos()
+        sin = angles.sin()
     if angle_dtype != x.dtype:
         cos = cos.to(x.dtype)
         sin = sin.to(x.dtype)

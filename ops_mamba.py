@@ -181,12 +181,12 @@ def validate_mamba2_geometry(
 _SCAN_LOOP_SCRIPTED = None
 _SCAN_LOOP_SCRIPTED_FAILED = False
 # Cap on the number of elements in one slab of precomputed step-varying
-# factors (``[batch * nheads, slab, headdim, d_state]`` for the outer product
-# and the ``dt``-scaled copy held alongside it); long sequences are processed
-# in several slabs, and the recurrent state carries across slab boundaries.
-# The slab size never changes the values (each step touches only its own
-# slice of the factors); the element budget is split between the paired
-# arrays.
+# factors (``[batch * nheads, slab, headdim, d_state]`` for the outer product,
+# which is dt-scaled in place); long sequences are processed in several
+# slabs, and the recurrent state carries across slab boundaries. The slab
+# size never changes the values (each step touches only its own slice of
+# the factors). The outer product is the only slab-sized factor array held
+# at once, so the cap bounds that single array.
 _SCAN_XOUTER_SLAB_ELEMS = 8_000_000
 
 
@@ -440,10 +440,11 @@ def naive_mamba2_scan(
 
     # Slab the precomputed factors for long sequences; the recurrent state
     # carries across slabs unchanged, so the values do not depend on the
-    # slab size. The outer product and its ``dt``-scaled copy coexist
-    # within one slab, so the element budget is split between the two.
+    # slab size. Only the outer product is held at slab size (the
+    # ``dt``-scaled form reuses its storage), so the whole element budget
+    # applies to it.
     slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
-               // (2 * max(1, batch * nheads * headdim * d_state)))
+               // max(1, batch * nheads * headdim * d_state))
     loop = _get_scripted_scan_loop()
     y_slabs: list[torch.Tensor] = []
     for lo in range(0, seqlen, slab):
@@ -451,7 +452,10 @@ def naive_mamba2_scan(
         x_outer = (x_flat[:, lo:hi].unsqueeze(-1)
                    * B_h_flat[:, lo:hi].unsqueeze(-2))       # [bh, slab, D, N]
         dt_slab = dt_flat[:, lo:hi]                          # [bh, slab, 1, 1]
-        x_dt = dt_slab * x_outer                             # [bh, slab, D, N]
+        # ``dt * x_outer`` computed in place: ``x_outer`` was allocated
+        # just above and has no other readers, so the elementwise product
+        # is bit-identical while one slab-sized temporary is dropped.
+        x_dt = x_outer.mul_(dt_slab)                         # [bh, slab, D, N]
         decay_slab = torch.exp(dt_slab * A_col)              # [bh, slab, 1, 1]
         C_slab = C_h_flat[:, lo:hi].unsqueeze(-2)            # [bh, slab, 1, N]
         Dx_slab = (D_col * x_flat[:, lo:hi]).unsqueeze(-2)   # [bh, slab, 1, D]

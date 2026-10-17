@@ -177,10 +177,14 @@ def naive_hca(
     # Partial RoPE on the core-attention queries (§2.3.3): rotate each
     # query at its own token position AFTER normalization (the decoding
     # cache applies the same order: the caller normalizes ``q``, the cache
-    # rotates it).
+    # rotates it). One position vector is shared by every RoPE call below
+    # (query, sliding-window keys, negated output rotation); the values
+    # are identical to the freshly-built ``token_positions`` each call
+    # used, and the integer-position table cache in ``ops_rope`` can only
+    # hit when the position values repeat.
+    tpos = token_positions(T, device) if rope_dim_eff > 0 else None
     if rope_dim_eff > 0:
-        q = partial_rope(
-            q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+        q = partial_rope(q, tpos, rope_dim_eff, rope_base, dim=1)
     # Core-attention scale auto-selection: ``scale=None`` (the default)
     # resolves to 1.0 for the cosine 'l2' mode and to the standard 1/sqrt(c)
     # temperature for the paper-form 'rms' mode. An explicit ``scale=`` is
@@ -210,8 +214,7 @@ def naive_hca(
         # time.
         if rope_dim_eff > 0:
             C_local = partial_rope(
-                C_local, token_positions(T, device), rope_dim_eff,
-                rope_base, dim=1)
+                C_local, tpos, rope_dim_eff, rope_base, dim=1)
         # The third return value (per-window validity mask) is not needed
         # here: unlike naive_csa, HCA's softmax consumes ``scores_w`` alone
         # (already ``-inf``-masked for the left padding inside
@@ -230,7 +233,14 @@ def naive_hca(
     # ``denom = sum_i exp(s_i) + exp(sink)``. It does NOT contribute a value
     # to the output: the expected KV of a virtual entry with no source tokens
     # is zero, not a constant 1 broadcast across the head dim.
-    cat = torch.cat([scores, scores_w], dim=-1)                    # [B, nh, T, n_blocks+win]
+    # ``torch.cat`` with a zero-width side is a pure copy of the other
+    # side; feeding the non-empty tensor directly gives identical values.
+    if scores.shape[-1] and scores_w.shape[-1]:
+        cat = torch.cat([scores, scores_w], dim=-1)                # [B, nh, T, n_blocks+win]
+    elif scores_w.shape[-1]:
+        cat = scores_w
+    else:
+        cat = scores
     if cat.shape[-1] == 0:
         out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
     elif sink_logits is not None:
@@ -261,7 +271,7 @@ def naive_hca(
     # (entry − query) distance only.
     if rope_dim_eff > 0:
         out = partial_rope(
-            out, -token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+            out, -tpos, rope_dim_eff, rope_base, dim=1)
 
     out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
     if return_projections:

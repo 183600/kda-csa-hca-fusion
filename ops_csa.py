@@ -1047,9 +1047,14 @@ def naive_csa(
     # rotates it). RoPE is orthogonal, so normalize-then-rotate and
     # rotate-then-normalize agree up to fp rounding; the order is pinned
     # here only so the incremental decode path matches bit-exactly.
+    # One shared position vector for every RoPE call in this forward pass
+    # (queries, sliding-window keys, output inverse-rotation): the values
+    # are identical to the freshly-built ``token_positions(T, device)``
+    # each call used, and ``partial_rope``'s integer-position table cache
+    # can only hit when the position values repeat.
+    tpos = token_positions(T, device) if rope_dim_eff > 0 else None
     if rope_dim_eff > 0:
-        q = partial_rope(
-            q, token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+        q = partial_rope(q, tpos, rope_dim_eff, rope_base, dim=1)
     # Core-attention scale auto-selection (mirrors the indexer scale
     # policy above). A caller can still override by passing an explicit
     # ``scale=``.
@@ -1225,7 +1230,10 @@ def naive_csa(
             # multiply keeps values/gradients bit-for-bit identical.
             scores = scores * scale
         # Mask -1 padding so those slots get zero weight after softmax.
-        scores = scores.masked_fill(~valid_mask[:, :, None, :], float('-inf'))
+        # The einsum output is freshly allocated and only consumed by the
+        # joint softmax below, so the in-place fill computes the identical
+        # elementwise write without an extra [B, T, nh, topk] temporary.
+        scores.masked_fill_(~valid_mask[:, :, None, :], float('-inf'))
 
     # Sliding-window branch: gather per-query window SCORES (uncompressed
     # local KV) so they can share the compressed entries' softmax below.
@@ -1243,8 +1251,7 @@ def naive_csa(
         # normalize-then-rotate order at append time.
         if rope_dim_eff > 0:
             C_local = partial_rope(
-                C_local, token_positions(T, device), rope_dim_eff,
-                rope_base, dim=1)
+                C_local, tpos, rope_dim_eff, rope_base, dim=1)
         scores_w, C_windows, win_valid = _sliding_window_scores(
             q, C_local, win, scale, device)
     else:
@@ -1256,29 +1263,40 @@ def naive_csa(
     # blocks and the sliding-window tokens (DeepSeek-V4 §2.3.1 Eq. 27):
     # one softmax over the concatenated scores, with the attention sink
     # in the single shared denominator.
-    cat = torch.cat([scores, scores_w], dim=-1)                # [B, T, nh, topk+win]
-    cat_valid = torch.cat(
-        [valid_mask[:, :, None, :],
-         win_valid[None, :, None, :].expand(B_, -1, 1, -1)], dim=-1)
+    # ``torch.cat`` with a zero-width side is a pure copy of the other side;
+    # using the non-empty tensor directly feeds the identical values into
+    # the softmax below (every later op reads the same elements).
+    if scores.shape[-1] and scores_w.shape[-1]:
+        cat = torch.cat([scores, scores_w], dim=-1)             # [B, T, nh, topk+win]
+    elif scores_w.shape[-1]:
+        cat = scores_w
+    else:
+        cat = scores
+    # Per-row "no valid entry in either branch" flag. The concatenated
+    # valid mask's per-row ``any`` is the OR of the per-branch ``any``s, so
+    # the mask can be computed without materializing the concatenation.
+    all_invalid = ~(valid_mask.any(-1, keepdim=True).unsqueeze(2)
+                    | win_valid.any(-1).view(1, T, 1, 1))
     if cat.shape[-1] == 0:
         out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
     else:
         if sink_logits is not None:
             # Numerically stable logsumexp approach — keep sink_logits in log
             # space (never exp it) and shift it by -row_max alongside every
-            # score so the largest exp() argument is 0.
+            # score so the largest exp() argument is 0. Invalid slots hold
+            # ``-inf`` from the masked fills above, so their ``exp`` is
+            # exactly ``+0.0``; the old explicit ``* vmask`` (0.0 at invalid
+            # slots, 1.0 at valid ones, where ``x * 1.0`` is an IEEE no-op)
+            # therefore changed no bit.
             log_sink = sink_logits.view(1, 1, nh, 1).to(cat)      # [1, 1, nh, 1]
-            vmask = cat_valid.to(cat.dtype)
             row_max = cat.amax(-1, keepdim=True).clamp(min=0)     # [B, T, nh, 1]
             shifted = cat - row_max
             shifted_sink = log_sink - row_max
             log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
             log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-            p = (shifted - log_denom).exp() * vmask
-            all_invalid = ~cat_valid.any(-1, keepdim=True)
+            p = (shifted - log_denom).exp()
             p = p.masked_fill(all_invalid, 0.0)
         else:
-            all_invalid = ~cat_valid.any(-1, keepdim=True)
             p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_invalid)
 
         topk_size = scores.shape[-1]
@@ -1294,7 +1312,7 @@ def naive_csa(
     # (entry − query) distance only.
     if rope_dim_eff > 0:
         out = partial_rope(
-            out, -token_positions(T, device), rope_dim_eff, rope_base, dim=1)
+            out, -tpos, rope_dim_eff, rope_base, dim=1)
 
     # Return the raw per-head core-attention output [B, T, nh, c] flattened to
     # [B, T, nh*c]; the caller performs the grouped output projection.
