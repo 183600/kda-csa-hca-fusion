@@ -1,9 +1,11 @@
 """Tests for the results-analysis tooling.
 
 Covers ``results_analysis`` (curve-shape diagnosis, systematic NaN/Inf
-triage, efficiency/accuracy Pareto annotation) and the ``run_quality``
-wiring (held-out monitoring is RNG-inert; bad-case classification is
-task-correct and recordable).
+triage, efficiency/accuracy Pareto annotation, token-level LM bad-case
+diagnostics) and the wiring: held-out monitoring in ``run_quality`` is
+RNG-inert, bad-case classification is task-correct and recordable, and the
+LM training path's ``analyze_lm_errors`` is read-only, deterministic and
+JSON-serializable.
 
 How to run::
 
@@ -22,10 +24,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from results_analysis import (  # noqa: E402
+    lm_token_diagnostics,
     annotate_rows_with_pareto,
     diagnose_nonfinite,
     diagnose_training_curves,
     pareto_frontier,
+    summarize_lm_diagnostics,
 )
 from run_quality import _classify_task_errors, train_one  # noqa: E402
 
@@ -75,6 +79,16 @@ def test_curve_diagnosis_train_improving_only():
     rep = diagnose_training_curves([3.0 - 0.05 * i for i in range(40)])
     assert rep['verdict'] == 'train_improving_only'
     assert any('validation' in r for r in rep['recommendations'])
+
+
+def test_curve_diagnosis_single_validation_point_is_insufficient():
+    """One val point has no SHAPE: no over/under verdict is supported."""
+    rep = diagnose_training_curves([3.0 - 0.05 * i for i in range(30)],
+                                   [2.5])
+    assert rep['verdict'] == 'insufficient_validation_curve'
+    assert rep['signals']['val_n_points'] == 1
+    assert rep['signals']['train_improved'] is True
+    json.dumps(rep, allow_nan=False)
 
 
 # ---------------------------------------------------------------------------
@@ -282,3 +296,152 @@ def test_error_analysis_report_is_json_serializable():
     assert ea['n_samples'] == 8
     assert sum(v['count'] for v in ea['categories'].values()) == ea['n_wrong']
     json.dumps(r, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# Token-level LM bad-case diagnostics (train_lm_autodl wiring)
+# ---------------------------------------------------------------------------
+
+def _row_logits(vocab, target, rank, top1=None):
+    """Logits where the target has exactly ``rank - 1`` larger entries."""
+    logits = torch.full((vocab,), -1.0)
+    logits[target] = 0.0
+    others = [i for i in range(vocab) if i != target]
+    for i in others[:rank - 1]:
+        logits[i] = 1.0
+    if top1 is not None:
+        logits[others[0]] = top1
+    return logits
+
+
+def _toy_diagnostics():
+    """Five positions covering every error category in the partition."""
+    vocab = 8
+    # Prefix at t: input_ids[:t]; target seen earlier drives copy distance.
+    input_ids = torch.tensor([[1, 2, 1, 4, 2]])
+    labels = torch.tensor([[2, 1, 4, 5, 2]])
+    rows = [
+        _row_logits(vocab, 2, 1),              # correct
+        _row_logits(vocab, 1, 2),              # near_miss (seen, dist 1)
+        _row_logits(vocab, 4, 6),              # novel_token
+        _row_logits(vocab, 5, 6, top1=8.0),    # confident_wrong
+        _row_logits(vocab, 2, 6),              # copyable_missed (dist 3)
+    ]
+    logits = torch.stack(rows).unsqueeze(0)
+    return lm_token_diagnostics(logits, labels, input_ids,
+                                top_k=5, confidence=0.5)
+
+
+def test_lm_token_diagnostics_categories_and_copy_distance():
+    d = _toy_diagnostics()
+    assert d['category'][0] == ['correct', 'near_miss', 'novel_token',
+                                'confident_wrong', 'copyable_missed']
+    assert d['pred'].tolist() == [[2, 0, 0, 0, 0]]
+    assert d['target_rank'].tolist() == [[1, 2, 6, 6, 6]]
+    assert d['seen_earlier'].tolist() == [[False, True, False, False, True]]
+    assert d['last_seen_distance'].tolist() == [[-1, 1, -1, -1, 3]]
+    # Confident wrong really is confident; the copy miss is not.
+    assert float(d['top1_prob'][0, 3]) > 0.9
+    assert float(d['top1_prob'][0, 4]) < 0.5
+
+
+def test_summarize_lm_diagnostics_reports_both_axes():
+    s = summarize_lm_diagnostics([_toy_diagnostics(), _toy_diagnostics()])
+    assert s['n_tokens'] == 10 and s['n_wrong'] == 8
+    assert s['token_accuracy'] == pytest.approx(0.2)
+    counts = {k: v['count'] for k, v in s['categories'].items()}
+    assert counts == {'correct': 2, 'near_miss': 2, 'confident_wrong': 2,
+                      'copyable_missed': 2, 'novel_token': 2, 'ignored': 0}
+    dist = {b['bucket']: b for b in s['accuracy_by_repeat_distance']}
+    assert dist['d01_08']['n'] == 4 and dist['d01_08']['accuracy'] == 0.0
+    assert dist['not_in_context']['n'] == 6
+    assert dist['not_in_context']['accuracy'] == pytest.approx(1 / 3)
+    pos = {b['quartile']: b for b in s['accuracy_by_position_quartile']}
+    assert pos['q1_of_4']['n'] == 4
+    assert pos['q1_of_4']['accuracy'] == pytest.approx(0.5)
+    assert s['target_rank_on_errors']['median'] == pytest.approx(6.0)
+    json.dumps(s, allow_nan=False)
+
+
+def test_lm_token_diagnostics_masked_and_empty():
+    vocab = 4
+    logits = torch.stack([_row_logits(vocab, 2, 1),
+                          _row_logits(vocab, 1, 1),
+                          _row_logits(vocab, 3, 1)]).unsqueeze(0)
+    d = lm_token_diagnostics(logits, torch.tensor([[2, -100, 3]]),
+                             torch.tensor([[1, 2, 3]]))
+    assert d['category'][0] == ['correct', 'ignored', 'correct']
+    s = summarize_lm_diagnostics(d)
+    assert s['n_tokens'] == 2 and s['n_wrong'] == 0
+    assert s['target_rank_on_errors']['mean'] is None
+    json.dumps(s, allow_nan=False)
+
+    d0 = lm_token_diagnostics(torch.zeros(2, 0, 5),
+                              torch.zeros(2, 0, dtype=torch.long),
+                              torch.zeros(2, 0, dtype=torch.long))
+    s0 = summarize_lm_diagnostics(d0)
+    assert s0['n_tokens'] == 0
+    json.dumps(s0, allow_nan=False)
+
+
+class _FixedLogitModel(torch.nn.Module):
+    """Deterministic LM stand-in: logits depend only on the input ids."""
+
+    def __init__(self, vocab):
+        super().__init__()
+        self.vocab = vocab
+        self.hybrid = torch.nn.Module()
+        self.hybrid.reset_state = lambda: None
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, input_ids, labels=None):
+        eye = torch.eye(self.vocab)
+        return {'logits': eye[input_ids.clamp(0, self.vocab - 1)]}
+
+
+class _IdsDataset(torch.utils.data.Dataset):
+    def __init__(self, n=4, seq_len=6, vocab=8):
+        self.items = []
+        for i in range(n):
+            ids = [(i + j) % vocab for j in range(seq_len + 1)]
+            self.items.append((torch.tensor(ids[:-1]), torch.tensor(ids[1:])))
+        self.split = 'validation'
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        return {'input_ids': self.items[i][0], 'labels': self.items[i][1]}
+
+
+def test_analyze_lm_errors_read_only_deterministic_json(capsys):
+    from train_lm_autodl import _FallbackCharTokenizer, analyze_lm_errors
+
+    model = _FixedLogitModel(8)
+    model.train()
+    dataset = _IdsDataset()
+    rng_before = torch.get_rng_state()
+    rep1 = analyze_lm_errors(model, dataset, batch_size=2, max_batches=1,
+                             seed=0, max_examples=1)
+    rep2 = analyze_lm_errors(model, dataset, batch_size=2, max_batches=1,
+                             seed=0, max_examples=1)
+    # Read-only contract: eval mode restored and the global RNG untouched
+    # (dedicated DataLoader generator), so the analysis cannot perturb
+    # training or the sealed test evaluation.
+    assert model.training is True
+    assert torch.equal(rng_before, torch.get_rng_state())
+    assert json.dumps(rep1, allow_nan=False) == json.dumps(rep2, allow_nan=False)
+    assert rep1['split'] == 'validation'
+    assert rep1['n_batches_analyzed'] == 1
+    assert rep1['n_tokens'] == 12
+    assert rep1['n_wrong'] == 12
+    assert rep1['stream'].startswith('held-out split')
+    out = capsys.readouterr().out
+    assert '[bad-case] LM held-out' in out
+    # max_batches=0 must analyze nothing (the training script's disable path).
+    rep0 = analyze_lm_errors(model, dataset, batch_size=2, max_batches=0,
+                             seed=0)
+    assert rep0['n_batches_analyzed'] == 0
+
+    tok = _FallbackCharTokenizer()
+    assert tok.decode(tok.encode('hello world')) == 'hello world'

@@ -18,8 +18,20 @@ train; validation drives model selection and early stopping; the test
 split stays sealed and is opened exactly once at the end, on the frozen
 val-selected checkpoint. See ``clean_lm_texts`` / ``split_clean_texts``
 and ``SealedTestSet``.
+
+Results analysis (what the run record answers beyond "final loss"):
+``training_curve`` + per-check validation history feed a streaming
+curve-shape verdict (overfitting / underfitting / healthy / diverged) and
+a final ``curve_diagnosis`` with next actions; ``error_analysis`` is a
+token-level bad-case report on the held-out validation split (near-miss /
+confident blind spot / copyable-missed / novel-token categories plus
+accuracy by position and by copy distance, with decoded examples); and
+``efficiency`` records params, throughput, evaluation latency and peak
+memory next to the quality numbers, so a gain can never be claimed
+without its cost.
 """
-import os, time, argparse, random, json, gc, hashlib, datetime, math
+import os, sys, time, argparse, random, json, gc, hashlib, datetime, math
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,7 +68,9 @@ from kaggle_setup import (configure_torch_for_device, set_global_seed,
                           seed_worker, capture_provenance,
                           write_json_atomic, write_results_json,
                           split_train_val_test, audit_split)
-from results_analysis import diagnose_nonfinite, diagnose_training_curves
+from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
+                              diagnose_training_curves, lm_token_diagnostics,
+                              summarize_lm_diagnostics)
 
 # tokenizer / dataset handling (reuse TinyStories if available)
 try:
@@ -100,6 +114,20 @@ class _FallbackCharTokenizer:
         if truncation and max_length is not None:
             ids = ids[:max_length]
         return ids
+
+    def decode(self, ids, skip_special_tokens=False):
+        """Inverse of :meth:`encode` (bad-case analysis needs readable text).
+
+        Analysis-only: training never calls this, so adding it cannot change
+        any numeric result.
+        """
+        out = []
+        for i in ids:
+            i = int(i)
+            if skip_special_tokens and 0 <= i < len(self._SPECIALS):
+                continue
+            out.append(self._itos[i] if 0 <= i < len(self._itos) else '')
+        return ''.join(out)
 
 def _synthetic_corpus(n=1000):
     """Deterministic synthetic fallback corpus (unique texts).
@@ -503,6 +531,207 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
     }
 
 
+def _decode_tokens(tokenizer, ids):
+    """Best-effort token-id -> text for bad-case example display.
+
+    Returns ``None`` when the tokenizer has no usable ``decode``; the example
+    record then still carries the raw ids.
+    """
+    if tokenizer is None or not hasattr(tokenizer, 'decode'):
+        return None
+    try:
+        return tokenizer.decode([int(i) for i in ids],
+                                skip_special_tokens=False)
+    except Exception:
+        return None
+
+
+def _peak_memory_bytes():
+    """Best-effort peak memory of the current process.
+
+    CUDA runs report the allocator high-water mark. CPU runs report OS RSS
+    (``ru_maxrss``), which is an UPPER BOUND on the model's footprint: it
+    includes the interpreter, imported libraries and data. The measurement
+    is labelled in the run record so it is never compared as if it were a
+    pure model-size number.
+    """
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+            return int(torch.cuda.max_memory_allocated())
+        except Exception:
+            pass
+    try:
+        import resource
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux/most Unices report KiB; macOS reports bytes.
+        return rss if sys.platform == 'darwin' else rss * 1024
+    except Exception:
+        return None
+
+
+@torch.no_grad()
+def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
+                      max_batches=2, seed=0, tokenizer=None, max_examples=3,
+                      top_k=5, confidence=0.5, context_tokens=24):
+    """Bad-case analysis: inspect mispredicted tokens on a held-out split.
+
+    This is the LM-scale counterpart of ``run_quality.analyze_errors``:
+    natural text has no exact task labels, so every wrong next-token
+    prediction is categorized by WHAT INFORMATION the model failed to use
+    (see ``results_analysis.LM_ERROR_CATEGORIES``):
+
+      * ``near_miss`` — target in the top-k, top-1 disagreed;
+      * ``confident_wrong`` — wrong top-1 with high confidence (bias/blind
+        spot);
+      * ``copyable_missed`` — target DID appear earlier in the context but
+        ranked outside the top-k (retrieval/copy failure — the actionable
+        class for a long-context memory architecture);
+      * ``novel_token`` — target never appeared in the context (intrinsic
+        prediction difficulty).
+
+    The report also slices accuracy by relative position (cold start vs
+    steady state) and by distance to the target's last earlier occurrence
+    (1-8 / 9-32 / 33-128 / 129+ tokens, plus never-seen), which turns "the
+    model is 30% wrong" into "it copies at distance 8 but not at 128" — the
+    evidence an architecture change needs.
+
+    Contract (same discipline as ``evaluate_lm_loss``): read-only
+    (``no_grad`` + eval mode restored), deterministic (fixed generator;
+    ``shuffle=False``), and RNG-neutral (dedicated DataLoader generator, no
+    global RNG draws), so running it cannot change training or the sealed
+    test metric. It must be called on a held-out split (validation), never
+    on the sealed test set or on data the model memorized.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    if int(max_batches) < 0:
+        raise ValueError('max_batches must be >= 0')
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+    loader = DataLoader(dataset, batch_size=int(batch_size), shuffle=False,
+                        num_workers=0, generator=gen)
+    was_training = model.training
+    model.eval()
+    diags = []
+    examples = OrderedDict((name, []) for name in LM_ERROR_CATEGORIES)
+    n_batches = n_nonfinite = 0
+    try:
+        for batch in loader:
+            if max_batches is not None and n_batches >= int(max_batches):
+                break
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            if labels.numel() == 0 or not (labels != -100).any():
+                continue
+            model.hybrid.reset_state()
+            logits = model(input_ids)["logits"]
+            if not torch.isfinite(logits).all():
+                n_nonfinite += 1
+                continue
+            d = lm_token_diagnostics(logits, labels, input_ids,
+                                     top_k=top_k, confidence=confidence)
+            diags.append(d)
+            sample_base = n_batches * int(batch_size)
+            for bi in range(int(input_ids.shape[0])):
+                for t, cat in enumerate(d['category'][bi]):
+                    if cat in ('correct', 'ignored'):
+                        continue
+                    bucket = examples[cat]
+                    if len(bucket) >= int(max_examples):
+                        continue
+                    lo = max(0, t - int(context_tokens))
+                    ctx_ids = [int(v) for v in input_ids[bi, lo:t].tolist()]
+                    bucket.append({
+                        'sample': sample_base + bi,
+                        'position': int(t),
+                        'seq_len': int(input_ids.shape[1]),
+                        'target': int(labels[bi, t]),
+                        'pred': int(d['pred'][bi, t]),
+                        'target_rank': int(d['target_rank'][bi, t]),
+                        'top1_prob': float(d['top1_prob'][bi, t]),
+                        'repeat_distance': (
+                            int(d['last_seen_distance'][bi, t])
+                            if bool(d['seen_earlier'][bi, t]) else None),
+                        'context_token_ids': ctx_ids,
+                        'context_text': _decode_tokens(tokenizer, ctx_ids),
+                        'target_text': _decode_tokens(
+                            tokenizer, [int(labels[bi, t])]),
+                        'pred_text': _decode_tokens(
+                            tokenizer, [int(d['pred'][bi, t])]),
+                    })
+                    if len(bucket) > 0 and all(
+                            len(examples[c]) >= int(max_examples)
+                            for c in LM_ERROR_CATEGORIES
+                            if c not in ('correct', 'ignored')):
+                        break
+            n_batches += 1
+            if max_batches is not None and n_batches >= int(max_batches):
+                break
+    finally:
+        if hasattr(model, 'hybrid') and hasattr(model.hybrid, 'reset_state'):
+            model.hybrid.reset_state()
+        model.train(was_training)
+
+    report = summarize_lm_diagnostics(diags)
+    report.update({
+        'seed': int(seed),
+        'generator_seed': int(seed),
+        'split': getattr(dataset, 'split', 'held-out'),
+        'n_batches_analyzed': int(n_batches),
+        'n_batches_skipped_nonfinite': int(n_nonfinite),
+        'batch_size': int(batch_size),
+        'stream': ('held-out split, fixed order (shuffle=False, dedicated '
+                   'DataLoader generator); never the sealed test set'),
+        'top_k': int(top_k),
+        'confidence': float(confidence),
+        'examples': {k: v for k, v in examples.items() if v},
+    })
+    if n_nonfinite:
+        report['note'] += (' Non-finite logits were found in '
+                           f'{n_nonfinite} batch(es); run '
+                           'diagnose_nonfinite() on that batch before '
+                           'trusting any metric.')
+    if diags:
+        acc = report['token_accuracy']
+        print(f"[bad-case] LM held-out ({report['split']}): "
+              f"{report['n_wrong']}/{report['n_tokens']} tokens wrong "
+              f"({100.0 * report['n_wrong'] / max(1, report['n_tokens']):.1f}%), "
+              f"token_acc={acc:.4f}")
+        mix = {c: v['count'] for c, v in report['categories'].items()
+               if v['count']}
+        print(f"[bad-case] categories: {mix}")
+        print('[bad-case] accuracy by position quartile: ' + ', '.join(
+            f"{b['quartile']}={b['accuracy']:.3f}(n={b['n']})"
+            for b in report['accuracy_by_position_quartile']))
+        print('[bad-case] accuracy by repeat distance: ' + ', '.join(
+            f"{b['bucket']}="
+            f"{'n/a' if b['accuracy'] is None else format(b['accuracy'], '.3f')}"
+            f"(n={b['n']})"
+            for b in report['accuracy_by_repeat_distance']))
+        shown = 0
+        for cat, bucket in report['examples'].items():
+            if shown >= 3:
+                break
+            ex = bucket[0]
+            ctx = ex['context_text']
+            ctx_show = (f'...{ctx[-120:]}' if isinstance(ctx, str) and
+                        len(ctx) > 120 else ctx)
+            print(f"[bad-case] e.g. {cat}: pos={ex['position']} "
+                  f"target={ex['target_text']!r} (id {ex['target']}) "
+                  f"pred={ex['pred_text']!r} (id {ex['pred']}) "
+                  f"rank={ex['target_rank']} top1p={ex['top1_prob']:.3f} "
+                  f"repeat_distance={ex['repeat_distance']}")
+            print(f"[bad-case]   context={ctx_show!r}"
+                  if ctx_show is not None
+                  else f"[bad-case]   context_ids={ex['context_token_ids']}")
+            shown += 1
+    else:
+        print(f"[bad-case] no analyzable held-out batches "
+              f"(analyzed={n_batches}, skipped_nonfinite={n_nonfinite})")
+    return report
+
+
 class LMWithHybrid(nn.Module):
     def __init__(self, vocab_size, cfg: HybridConfig):
         super().__init__()
@@ -873,6 +1102,15 @@ def main():
                              "(default 5; 0 disables early stopping). The "
                              "best validation checkpoint is always kept and "
                              "used for the single final test evaluation.")
+    parser.add_argument("--error_analysis_batches", type=int, default=2,
+                        help="Held-out validation batches inspected by the "
+                             "token-level bad-case analysis at the "
+                             "val-selected checkpoint (default 2; 0 "
+                             "disables). Runs ONLY on the validation split — "
+                             "never on train or the sealed test set.")
+    parser.add_argument("--error_analysis_examples", type=int, default=3,
+                        help="Max decoded examples stored/printed per error "
+                             "category (default 3).")
     parser.add_argument("--consistency_check", action="store_true",
                         help="Load --checkpoint, run the prefill-decode "
                              "consistency + decode-roofline probe, then exit "
@@ -942,6 +1180,10 @@ def main():
         raise SystemExit("--eval_max_batches must be >= 0")
     if args.early_stop_patience < 0:
         raise SystemExit("--early_stop_patience must be >= 0")
+    if args.error_analysis_batches < 0:
+        raise SystemExit("--error_analysis_batches must be >= 0")
+    if args.error_analysis_examples < 0:
+        raise SystemExit("--error_analysis_examples must be >= 0")
 
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
     info = configure_torch_for_device()
@@ -1158,7 +1400,8 @@ def main():
     # identical to a run where the gate never ran.
     set_global_seed(args.seed, deterministic=True)
     model = LMWithHybrid(vocab_size, cfg).to(device)
-    print(f"Params: {count_params(model)/1e6:.2f}M")
+    params_count = count_params(model)
+    print(f"Params: {params_count/1e6:.2f}M")
     print(f"Layout: {model.hybrid.layout_str()}")
 
     no_decay_ids = set()
@@ -1220,6 +1463,8 @@ def main():
         'eval_max_batches': int(args.eval_max_batches),
         'early_stop_patience': int(args.early_stop_patience),
         'model_selection': 'min token-weighted validation loss',
+        'error_analysis_batches': int(args.error_analysis_batches),
+        'error_analysis_examples': int(args.error_analysis_examples),
     }
     data_record = {
         'source': data_source,
@@ -1285,6 +1530,14 @@ def main():
     curve_steps, curve_losses, curve_elapsed_s = [], [], []
     optimizer_step = 0
     micro_step = 0
+    # Cost telemetry (efficiency-vs-accuracy): tokens actually pushed through
+    # the model, so throughput is measured, not inferred from the recipe.
+    train_tokens = 0
+    # Per-step total gradient norm (pre-clip). Recorded, never kept: it is
+    # the "did the optimizer stay healthy" signal that loss alone hides.
+    grad_norms = []
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     def _checkpoint_payload(extra=None):
         """Self-describing checkpoint: weights + recipe + provenance + curve.
@@ -1331,6 +1584,7 @@ def main():
 
     def _run_validation(step):
         nonlocal checks_without_improvement, stopped_early
+        t0 = time.time()
         report = evaluate_lm_loss(
             model, val_ds, batch_size=batch_size, device=device,
             max_batches=eval_batch_cap, use_amp=use_amp,
@@ -1346,7 +1600,18 @@ def main():
             'n_batches': report['n_batches'],
             'n_sequences': report['n_sequences'],
             'n_tokens': report['n_tokens'],
+            'elapsed_s': time.time() - t0,
         })
+        # Streaming curve-shape verdict: the over/underfitting diagnosis is
+        # recomputed at every validation check (including the point just
+        # appended), so a decaying-train / rising-val run is visible DURING
+        # training, not only in the final artifact. It is read-only and does
+        # not influence the loop (early stopping keeps its own
+        # improves/patience rule).
+        _curve_verdict = diagnose_training_curves(
+            curve_losses, [h['loss'] for h in val_history])['verdict']
+        val_history[-1]['curve_verdict'] = _curve_verdict
+        print(f"[monitor] step {step}: curve verdict={_curve_verdict}")
         if report['loss'] < best_val['loss']:
             best_val['loss'] = report['loss']
             best_val['step'] = int(step)
@@ -1398,6 +1663,7 @@ def main():
                     break
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
+            train_tokens += int(input_ids.numel())
 
             model.hybrid.reset_state()
 
@@ -1428,6 +1694,7 @@ def main():
                     token_ids={'input_ids': input_ids},
                     id_range=(0, vocab_size),
                     params=model.parameters(),
+                    logits=out.get("logits"),
                     amp_enabled=bool(use_amp),
                     amp_scaler=(scaler if scaler.is_enabled() else None),
                     fp32_forward_loss=fp32_loss,
@@ -1455,7 +1722,32 @@ def main():
 
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(decay + no_decay, 1.0)
+        # clip_grad_norm_ RETURNS the total norm BEFORE clipping: keeping it
+        # turns "loss was fine" into "gradients stayed bounded", and a
+        # non-finite norm is the gradient-explosion stage of the NaN triage
+        # (checked BEFORE the optimizer writes anything into the weights).
+        grad_norm = torch.nn.utils.clip_grad_norm_(decay + no_decay, 1.0)
+        if not torch.isfinite(grad_norm):
+            bad_grads = {name: p.grad for name, p in model.named_parameters()
+                         if p.grad is not None
+                         and not torch.isfinite(p.grad).all()}
+            diag = diagnose_nonfinite(
+                loss=accum_loss / max(1, accum_batches),
+                token_ids={'input_ids': input_ids},
+                id_range=(0, vocab_size),
+                params=model.parameters(),
+                logits=out.get("logits"),
+                grads=bad_grads or None,
+                grad_norm=float('nan'),
+                amp_enabled=bool(use_amp),
+                amp_scaler=(scaler if scaler.is_enabled() else None),
+                context=(f'optimizer_step={optimizer_step}, non-finite '
+                         f'grad norm before the step'))
+            raise RuntimeError(
+                f"non-finite gradient norm at optimizer_step={optimizer_step} "
+                f"({grad_norm}); diagnosis [{diag['verdict']}]: "
+                f"{diag['summary']}")
+        grad_norms.append(grad_norm.detach())
         if scaler.is_enabled():
             scaler.step(optimizer)
             scaler.update()
@@ -1487,6 +1779,9 @@ def main():
 
     pbar.close()
     elapsed = time.time() - start
+    # Capture the TRAINING peak before evaluation/analysis forwards run, so
+    # the recorded footprint is the training recipe's, not the diagnostics'.
+    peak_train_memory = _peak_memory_bytes()
     if not stopped_early and (not args.val_every
                               or optimizer_step % args.val_every != 0):
         _run_validation(optimizer_step)
@@ -1508,13 +1803,29 @@ def main():
     model.load_state_dict(best_val['state'])
     model.to(device)
     model.eval()
+    # Bad-case analysis on the VALIDATION split (held out from training, but
+    # the legitimate diagnostic set): print and record which tokens the
+    # val-selected model misses and why. Runs before the sealed test set is
+    # opened, is read-only/RNG-inert, and never inspects test samples.
+    error_analysis = None
+    if int(args.error_analysis_batches or 0) > 0:
+        print(f"[bad-case] analyzing up to {int(args.error_analysis_batches)} "
+              f"held-out validation batch(es) at the val-selected checkpoint "
+              f"(step {best_val['step']})...")
+        error_analysis = analyze_lm_errors(
+            model, val_ds, batch_size=batch_size, device=device,
+            max_batches=int(args.error_analysis_batches), seed=args.seed,
+            tokenizer=tokenizer,
+            max_examples=int(args.error_analysis_examples))
     test_dataset = sealed_test.open()
     stats_test = _text_length_stats(test_dataset.texts, tokenizer, seq_len)
     shift_test = _distribution_shift(stats_train, stats_test)
+    test_t0 = time.time()
     test_report = evaluate_lm_loss(
         model, test_dataset, batch_size=batch_size, device=device,
         max_batches=eval_batch_cap, use_amp=use_amp,
         autocast_dtype=autocast_dtype)
+    test_report['elapsed_s'] = time.time() - test_t0
     model.train()
     print(f"[test] single evaluation of the sealed test split at the "
           f"val-selected checkpoint (step {best_val['step']}): loss "
@@ -1542,6 +1853,69 @@ def main():
     print(f"[diagnosis] train/val curves: {curve_diagnosis['verdict']}")
     for _rec in curve_diagnosis['recommendations']:
         print(f"[diagnosis]   - {_rec}")
+
+    # Efficiency-vs-accuracy record: the recipe's measured cost next to its
+    # quality, so a future "improvement" can be checked against params,
+    # throughput, evaluation latency and memory in the SAME artifact — a
+    # +0.5% loss improvement that triples step time is visible here instead
+    # of being silently rewarded in a leaderboard of final numbers.
+    val_eval_samples = [h for h in val_history
+                        if h.get('elapsed_s') and h.get('n_sequences')]
+    efficiency = {
+        'n_params': int(params_count),
+        'train_tokens': int(train_tokens),
+        'train_seconds': float(elapsed),
+        'train_tokens_per_second': (
+            float(train_tokens / elapsed) if elapsed > 0 else None),
+        'optimizer_steps': int(optimizer_step),
+        'seconds_per_optimizer_step': (
+            float(elapsed / optimizer_step) if optimizer_step else None),
+        'peak_memory_bytes': peak_train_memory,
+        'peak_memory_measurement': (
+            'cuda_max_memory_allocated' if torch.cuda.is_available()
+            else 'process_ru_maxrss_upper_bound'),
+        'validation_eval': {
+            'n_checks': len(val_history),
+            'mean_forward_ms_per_sequence': (
+                float(1000.0 * sum(h['elapsed_s'] / h['n_sequences']
+                                   for h in val_eval_samples)
+                      / len(val_eval_samples))
+                if val_eval_samples else None),
+        },
+        'test_eval_ms_per_sequence': (
+            float(1000.0 * test_report['elapsed_s'] / test_report['n_sequences'])
+            if test_report.get('elapsed_s') and test_report['n_sequences']
+            else None),
+        'note': ('Cost is measured for THIS recipe (hardware-dependent, so '
+                 'compare runs on the same machine). Peak memory on CPU is '
+                 'the process RSS upper bound, not the model footprint. '
+                 'Quality claims must be reported together with this block.'),
+    }
+    _tps = efficiency['train_tokens_per_second']
+    print(f"[efficiency] params={params_count/1e6:.2f}M, "
+          f"train={'n/a' if _tps is None else format(_tps, ',.0f')} tok/s, "
+          f"peak_mem={efficiency['peak_memory_bytes']} B")
+
+    # Optimizer-health record: the pre-clip gradient norm distribution is the
+    # last stage of the NaN/explosion triage and the first sign of an LR
+    # that is too large (long tail of huge norms even while the loss looks
+    # finite). Kept as a compact summary, not a per-step series.
+    gradient_norms = None
+    if grad_norms:
+        gn = torch.stack(grad_norms).float()
+        gradient_norms = {
+            'n_steps': int(gn.numel()),
+            'max': float(gn.max()),
+            'mean': float(gn.mean()),
+            'last': float(gn[-1]),
+            'clip_norm': 1.0,
+            'note': ('norm BEFORE clipping (clip_grad_norm_ return value); '
+                     'a max much larger than clip_norm means the raw '
+                     'gradients were exploding and clipping is masking it.'),
+        }
+        print(f"[gradients] pre-clip norm max={gradient_norms['max']:.3f}, "
+              f"mean={gradient_norms['mean']:.3f} "
+              f"(clip at {gradient_norms['clip_norm']})")
     run_record = {
         "kind": "train_lm_autodl",
         "created_utc": created_utc,
@@ -1561,6 +1935,17 @@ def main():
         # (overfitting / underfitting / healthy / diverged) with the
         # numeric evidence and next actions.
         "curve_diagnosis": curve_diagnosis,
+        # Token-level bad cases on the held-out validation split: category
+        # mix (near-miss / confident wrong / copyable missed / novel) plus
+        # accuracy by position and by copy distance, with decoded examples.
+        # None when disabled via --error_analysis_batches 0.
+        "error_analysis": error_analysis,
+        # Measured cost of this recipe (params / throughput / eval latency /
+        # peak memory) so quality and efficiency stay reported together.
+        "efficiency": efficiency,
+        # Pre-clip gradient-norm summary: optimizer-health evidence that the
+        # loss curve alone cannot provide.
+        "gradient_norms": gradient_norms,
         "validation": {
             "criterion": "min token-weighted validation loss",
             "history": val_history,

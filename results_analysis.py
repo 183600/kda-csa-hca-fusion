@@ -25,6 +25,7 @@ experiment.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Iterable, Mapping, Sequence
 
 import torch
@@ -92,6 +93,9 @@ def diagnose_training_curves(train_losses: Sequence[float],
       * ``train_improving_only`` — train improved but no validation curve
         was recorded; generalization cannot be judged, so monitoring is
         recommended before trusting the run.
+      * ``insufficient_validation_curve`` — a validation curve was recorded,
+        but with fewer than 2 points it has no shape, so no over/under
+        verdict is claimed.
 
     Returns a JSON-serializable report with the numeric evidence
     (head/tail/best means, gap) and a list of concrete recommendations.
@@ -155,6 +159,22 @@ def diagnose_training_curves(train_losses: Sequence[float],
     if val is not None and val:
         va = _curve_stats(val)
         report['val'] = va
+        signals['val_n_points'] = va['n_points']
+        if len(val) < 2:
+            # A single validation point has no shape: it can neither show a
+            # turning point nor a flat curve, so "overfitting" / "healthy"
+            # would be an over-claim. Say what is missing instead.
+            report['verdict'] = 'insufficient_validation_curve'
+            report['signals'] = signals
+            report['recommendations'] = [
+                'only one validation point was recorded: the curve has no '
+                'shape, so no over/underfitting verdict is supported. Lower '
+                'the validation interval (or raise the step budget) so the '
+                'validation curve has at least 2-3 points, then re-diagnose; '
+                'until then the run is only known to be '
+                '"train_improving_only".',
+            ]
+            return report
         val_head, val_tail, val_best = va['head_mean'], va['tail_mean'], va['best']
         val_rose_from_best = val_tail > val_best * (1.0 + val_rise_fraction)
         val_improved = (val_head > 0
@@ -586,3 +606,270 @@ def annotate_rows_with_pareto(rows: Sequence[dict], **kwargs) -> dict:
             'acc_per_eval_ms': p.get('acc_per_eval_ms'),
         }
     return report
+
+
+# Error categories for token-level LM bad-case analysis. A natural-language
+# model has no exact labels to check against (unlike the synthetic probes),
+# so a wrong next-token prediction is categorized by WHAT INFORMATION the
+# model failed to use, not by which task layout the sample came from:
+#
+#   * ``near_miss``        — the target was in the top-k but top-1 disagreed:
+#                            a ranking/calibration miss, the cheapest to fix
+#                            and the most likely to be sample noise;
+#   * ``confident_wrong``  — the model strongly preferred a wrong token:
+#                            a systematic bias / blind spot, not ambiguity;
+#   * ``copyable_missed``  — the target token DID occur earlier in the
+#                            context but ranked outside the top-k: a
+#                            retrieval/copy failure (the actionable class for
+#                            a recurrent / compressed-attention hybrid, whose
+#                            whole selling point is long-range memory);
+#   * ``novel_token``      — the target never occurred in the context and
+#                            the model was not confident: an intrinsic
+#                            prediction error (ambiguity / capacity).
+#
+# ``correct`` and the masked ``ignored`` positions complete the partition.
+LM_ERROR_CATEGORIES = OrderedDict([
+    ('correct', 'top-1 prediction equals the target'),
+    ('near_miss', 'target ranked 2..top_k: ranking/calibration miss'),
+    ('confident_wrong', 'wrong top-1 with top-1 probability >= confidence '
+                        'threshold: systematic bias / blind spot'),
+    ('copyable_missed', 'target occurred earlier in the context but ranked '
+                        'outside the top-k and was predicted without '
+                        'confidence: retrieval/copy failure'),
+    ('novel_token', 'target never occurred in the context and was predicted '
+                    'without confidence: intrinsic prediction difficulty'),
+    ('ignored', 'position masked out (ignore_index label)'),
+])
+
+_LM_ERROR_CATEGORY_ORDER = tuple(LM_ERROR_CATEGORIES)
+
+
+def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
+                         input_ids: torch.Tensor, *, top_k: int = 5,
+                         confidence: float = 0.5,
+                         ignore_index: int = -100) -> dict:
+    """Per-token bad-case diagnostics for next-token prediction.
+
+    Pure tensor math (no RNG, no global state). ``logits`` is
+    ``(B, T, V)``, ``labels`` / ``input_ids`` are ``(B, T)``. For every
+    position the function computes:
+
+      * ``category`` — one of :data:`LM_ERROR_CATEGORIES` (see there for the
+        definition of each class; the model's own output decides, so this
+        works for any tokenizer and any corpus);
+      * ``target_rank`` — 1-based rank of the target among the logits
+        (rank 1 = the target is (one of) the argmax token(s));
+      * ``top1_prob`` — softmax probability of the predicted token, computed
+        with the max-shift (logsumexp) stable form;
+      * ``seen_earlier`` / ``last_seen_distance`` — whether (and how long
+        ago) the target token occurred earlier in the same input. Distance
+        buckets turn "the model can't copy" into "the model can copy at
+        distance d but not at distance d'", which is exactly the evidence a
+        long-context architecture change needs.
+
+    Tensors are returned with the same ``(B, T)`` shape as the inputs; the
+    category is also returned as JSON-ready nested lists.
+    """
+    if logits.ndim != 3:
+        raise ValueError(f'logits must be (B, T, V), got shape '
+                         f'{tuple(logits.shape)}')
+    if labels.shape != logits.shape[:2] or input_ids.shape != labels.shape:
+        raise ValueError(
+            f'labels/input_ids must be {tuple(logits.shape[:2])}, got '
+            f'{tuple(labels.shape)} / {tuple(input_ids.shape)}')
+    b, t, v = logits.shape
+    if t == 0:
+        empty = torch.zeros(b, 0, dtype=torch.long, device=logits.device)
+        return {
+            'valid': torch.zeros(b, 0, dtype=torch.bool,
+                                 device=logits.device),
+            'correct': torch.zeros(b, 0, dtype=torch.bool,
+                                   device=logits.device),
+            'pred': empty,
+            'target_rank': empty,
+            'top1_prob': torch.zeros(b, 0, device=logits.device),
+            'seen_earlier': torch.zeros(b, 0, dtype=torch.bool,
+                                        device=logits.device),
+            'last_seen_distance': torch.full((b, 0), -1, dtype=torch.long,
+                                             device=logits.device),
+            'position': empty,
+            'category': [[] for _ in range(b)],
+            'top_k': int(top_k),
+            'confidence': float(confidence),
+        }
+
+    valid = labels != int(ignore_index)
+    pred = logits.argmax(dim=-1)
+    correct = valid & (pred == labels)
+
+    safe_labels = labels.clamp(min=0, max=v - 1).unsqueeze(-1)
+    target_logit = logits.gather(-1, safe_labels).squeeze(-1)
+    target_rank = (logits > target_logit.unsqueeze(-1)).sum(dim=-1) + 1
+    target_rank = torch.where(valid, target_rank, torch.zeros_like(target_rank))
+
+    # Stable top-1 probability: max-shift by the row max via logsumexp, so a
+    # manual softmax overflow can never fabricate a "confident" verdict.
+    log_norm = torch.logsumexp(logits, dim=-1)
+    top1_prob = torch.exp(logits.max(dim=-1).values - log_norm)
+
+    # seen[b, t, s] = labels[b, t] == input_ids[b, s] (s < t): the target
+    # token occurred earlier in the same sample. B*T*T bool is small for the
+    # analysis batch sizes (a 1k-token sequence is ~1M entries).
+    seen = input_ids.unsqueeze(1) == labels.unsqueeze(2)
+    lower = torch.ones(t, t, dtype=torch.bool, device=logits.device)
+    lower = lower.tril(diagonal=-1)
+    seen = seen & lower.unsqueeze(0)
+    seen_earlier = seen.any(dim=-1) & valid
+    idx = torch.arange(t, device=logits.device)
+    no_pos = torch.full(seen.shape, -1, dtype=torch.long,
+                        device=logits.device)
+    last_pos = torch.where(seen, idx.view(1, 1, t).expand_as(seen),
+                           no_pos).max(dim=-1).values
+    last_seen_distance = torch.where(
+        last_pos >= 0, idx.view(1, t) - last_pos,
+        torch.full_like(last_pos, -1))
+
+    k = max(1, int(top_k))
+    conf = float(confidence)
+    cat_idx = torch.zeros(b, t, dtype=torch.long, device=logits.device)
+    cat_idx = torch.where(~valid, torch.full_like(cat_idx, 5), cat_idx)
+    wrong = valid & ~correct
+    cat_idx = torch.where(wrong & (target_rank <= k),
+                          torch.full_like(cat_idx, 1), cat_idx)
+    cat_idx = torch.where(wrong & (target_rank > k) & (top1_prob >= conf),
+                          torch.full_like(cat_idx, 2), cat_idx)
+    cat_idx = torch.where(wrong & (target_rank > k) & (top1_prob < conf)
+                          & seen_earlier,
+                          torch.full_like(cat_idx, 3), cat_idx)
+    cat_idx = torch.where(wrong & (target_rank > k) & (top1_prob < conf)
+                          & ~seen_earlier,
+                          torch.full_like(cat_idx, 4), cat_idx)
+    names = _LM_ERROR_CATEGORY_ORDER
+    category = [[names[i] for i in row] for row in cat_idx.tolist()]
+
+    return {
+        'valid': valid,
+        'correct': correct,
+        'pred': pred,
+        'target_rank': target_rank,
+        'top1_prob': top1_prob,
+        'seen_earlier': seen_earlier,
+        'last_seen_distance': last_seen_distance,
+        'position': idx.view(1, t).expand(b, t).clone(),
+        'category': category,
+        'top_k': k,
+        'confidence': conf,
+    }
+
+
+def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
+    """Aggregate token diagnostics into a JSON-safe bad-case report.
+
+    Accepts one diagnostics dict or a sequence of them (e.g. one per
+    analysis batch); computes the token accuracy, the category mix, the
+    target-rank / confidence profile of the errors, and accuracy sliced by
+    (a) relative position in the sequence and (b) distance to the target
+    token's last earlier occurrence — the two axes that turn "the model is
+    wrong 30% of the time" into "it is wrong at long copy distances / early
+    positions".
+    """
+    items = ([diags] if isinstance(diags, Mapping)
+             else list(diags))
+    if not items:
+        return {'n_tokens': 0, 'n_wrong': 0, 'token_accuracy': None,
+                'categories': {}, 'accuracy_by_position_quartile': [],
+                'accuracy_by_repeat_distance': [],
+                'note': 'no diagnostics supplied'}
+
+    valid = torch.cat([d['valid'].reshape(-1) for d in items])
+    correct = torch.cat([d['correct'].reshape(-1) for d in items])
+    target_rank = torch.cat([d['target_rank'].reshape(-1) for d in items])
+    top1_prob = torch.cat([d['top1_prob'].reshape(-1) for d in items])
+    seen_earlier = torch.cat([d['seen_earlier'].reshape(-1) for d in items])
+    distance = torch.cat([d['last_seen_distance'].reshape(-1) for d in items])
+    position = torch.cat([d['position'].reshape(-1) for d in items])
+    categories = [c for d in items for row in d['category'] for c in row]
+
+    n_tokens = int(valid.sum())
+    n_wrong = int((valid & ~correct).sum())
+    counts: dict = OrderedDict((name, 0) for name in LM_ERROR_CATEGORIES)
+    for c in categories:
+        counts[c] = counts.get(c, 0) + 1
+    cat_report = OrderedDict()
+    for name, definition in LM_ERROR_CATEGORIES.items():
+        c = counts.get(name, 0)
+        cat_report[name] = {
+            'count': int(c),
+            'rate_of_all': (c / n_tokens) if n_tokens else 0.0,
+            'rate_of_wrong': (c / n_wrong) if n_wrong else 0.0,
+            'definition': definition,
+        }
+
+    err = valid & ~correct
+    rank_on_err = target_rank[err].float()
+    prob_err = top1_prob[err].float()
+    prob_ok = top1_prob[valid & correct].float()
+
+    def _acc(mask: torch.Tensor) -> dict:
+        n = int(mask.sum())
+        return {
+            'n': n,
+            'accuracy': (float(correct[mask].float().mean()) if n else None),
+        }
+
+    # (a) Relative position quartiles: a recurrent state early in the
+    # sequence has seen less context, so this separates cold-start errors
+    # from steady-state errors.
+    pos = position[valid]
+    width = int(pos.max().item()) + 1 if pos.numel() else 1
+    pos_buckets = []
+    if pos.numel():
+        for qi in range(4):
+            mask = valid & ((position * 4) // max(1, width) == qi)
+            entry = _acc(mask)
+            entry['quartile'] = f'q{qi + 1}_of_4'
+            entry['position_range'] = [int(qi * width / 4), int((qi + 1) * width / 4)]
+            pos_buckets.append(entry)
+
+    # (b) Distance to the target's last earlier occurrence: copy accuracy is
+    # the retrieval curve of a memory architecture.
+    dist_steps = [(1, 8, 'd01_08'), (9, 32, 'd09_32'),
+                  (33, 128, 'd33_128'), (129, None, 'd129_plus')]
+    dist_buckets = []
+    for lo, hi, label in dist_steps:
+        mask = valid & seen_earlier & (distance >= lo)
+        if hi is not None:
+            mask = mask & (distance <= hi)
+        entry = _acc(mask)
+        entry['bucket'] = label
+        entry['distance_range'] = [lo, hi]
+        dist_buckets.append(entry)
+    entry = _acc(valid & ~seen_earlier)
+    entry['bucket'] = 'not_in_context'
+    entry['distance_range'] = None
+    dist_buckets.append(entry)
+
+    return {
+        'n_tokens': n_tokens,
+        'n_wrong': n_wrong,
+        'token_accuracy': (float(correct[valid].float().mean())
+                           if n_tokens else None),
+        'categories': cat_report,
+        'target_rank_on_errors': {
+            'mean': float(rank_on_err.mean()) if rank_on_err.numel() else None,
+            'median': (float(rank_on_err.median())
+                       if rank_on_err.numel() else None),
+        },
+        'top1_prob_on_errors': {
+            'mean': float(prob_err.mean()) if prob_err.numel() else None,
+        },
+        'top1_prob_on_correct': {
+            'mean': float(prob_ok.mean()) if prob_ok.numel() else None,
+        },
+        'accuracy_by_position_quartile': pos_buckets,
+        'accuracy_by_repeat_distance': dist_buckets,
+        'note': ('Token-level bad cases on a held-out split: category mix '
+                 'separates near-misses / confident blind spots / copy '
+                 'failures / novel tokens, and the repeat-distance curve '
+                 'localizes long-range retrieval failures.'),
+    }
