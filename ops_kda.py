@@ -418,18 +418,52 @@ _ATTN_BLOCK_ROWS_MAX = 8
 
 
 def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
-    """Rows per vectorized attention-block step (>= 1, <= the cap)."""
+    """Rows per vectorized attention-block step (>= 1, <= the cap).
+
+    The best count is a flat trade-off between fewer kernel launches
+    (larger ``rows``) and keeping the transient ``[..., rows, c1, K]``
+    block small enough for the thread-split / cache behaviour of the
+    elementwise kernels (smaller ``rows``). It tracks the measured
+    latency landscape of the CPU backend:
+
+      * ``K <= 16``: 8 rows for chunk sizes up to 32 (transient stays
+        small in absolute terms); 4 rows at ``BT = 64``.
+      * ``K <= 32``: 4 rows through ``NT = 32``; 2 rows through
+        ``NT = 64``; 1 row beyond (the transient no longer fits the
+        cache).
+      * ``K <= 64`` / ``K <= 128``: 4 rows for the short chunk counts,
+        2 rows for mid counts, 1 row beyond.
+      * ``K > 128``: 2 rows for very short sequences, else 1.
+
+    The per-row elementwise/reduction math is identical for every count
+    (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
+    loop granularity.
+    """
     if K <= 16:
-        rows = _ATTN_BLOCK_ROWS_MAX
+        rows = _ATTN_BLOCK_ROWS_MAX if BT <= 32 else 4
     elif K <= 32:
-        if NT <= 8:
+        if NT <= 32:
             rows = 4
-        elif NT <= 16:
+        elif NT <= 64:
+            rows = 2
+        else:
+            rows = 1
+    elif K <= 64:
+        if NT <= 16:
+            rows = 4
+        elif NT <= 32:
+            rows = 2
+        else:
+            rows = 1
+    elif K <= 128:
+        if NT <= 16:
+            rows = 4
+        elif NT <= 32:
             rows = 2
         else:
             rows = 1
     else:
-        rows = 4 if NT <= 16 else 1
+        rows = 2 if NT <= 8 else 1
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
@@ -683,7 +717,13 @@ def _chunk_kda_prepare(
     )
     A = (A + eye) * beta[..., None, :]
 
-    w = A @ (g.exp() * k)
+    # ``exp(g)`` is consumed here (the ``w`` map) and again by the inner
+    # loops (the per-chunk gate map and the last-position decay); compute
+    # it once on the shared, already-clamped cumsum gate and hand it to
+    # both. ``exp`` is a pure elementwise function, so the values are
+    # bit-identical to evaluating it separately in each consumer.
+    gexp = g.exp()
+    w = A @ (gexp * k)
     u = A @ v
 
     S = q.new_zeros(B, HV, K, V)
@@ -692,7 +732,7 @@ def _chunk_kda_prepare(
 
     return {
         'early': False,
-        'q': q, 'k': k, 'u': u, 'g': g, 'w': w, 'S': S,
+        'q': q, 'k': k, 'u': u, 'g': g, 'gexp': gexp, 'w': w, 'S': S,
         'Aqk': Aqk, 'NT': NT,
         # Needed by ``_chunk_kda_inner_loop_recompute`` when ``Aqk`` is None.
         'upper_mask': upper_mask,
@@ -761,12 +801,14 @@ def naive_chunk_kda(
         return prep['o'], prep['S']
     if recompute_attn:
         chunk_outs, S = _chunk_kda_inner_loop_recompute(
-            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+            prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
+            prep['w'], prep['S'],
             prep['upper_mask'], prep['clamp_g_diff'], prep['NT'],
         )
     else:
         chunk_outs, S = _chunk_kda_inner_loop(
-            prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+            prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
+            prep['w'], prep['S'],
             prep['Aqk'], prep['NT'],
         )
     return _chunk_kda_finalize(
@@ -782,6 +824,7 @@ def _chunk_kda_inner_loop(
     k: torch.Tensor,
     u: torch.Tensor,
     g: torch.Tensor,
+    gexp: torch.Tensor,
     w: torch.Tensor,
     S: torch.Tensor,
     Aqk: torch.Tensor,
@@ -790,7 +833,10 @@ def _chunk_kda_inner_loop(
     """TorchScript-compatible inner loop of ``naive_chunk_kda``.
 
     ``Aqk`` (the masked q-weighted within-chunk attention matrix precomputed
-    by :func:`_chunk_kda_prepare`) is sliced per chunk below.
+    by :func:`_chunk_kda_prepare`) is sliced per chunk below, and
+    ``gexp`` is the ``exp`` of the cumsum gate map (also precomputed by
+    :func:`_chunk_kda_prepare`, which consumes the same tensor for the
+    ``w`` map).
     """
     chunk_outs = []
     # The per-chunk gate maps (``exp(g)``, the last-position decay, and the
@@ -798,7 +844,7 @@ def _chunk_kda_inner_loop(
     # ``g`` / ``k``, evaluated for all chunks up front; each chunk then
     # consumes its own slice. The computed fp values are the same as
     # evaluating each slice inside the loop.
-    gexp_all = g.exp()
+    gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     kexp_all = (g[..., -1:, :] - g).exp() * k
     for i in range(NT):
@@ -826,6 +872,7 @@ def _chunk_kda_inner_loop_recompute(
     k: torch.Tensor,
     u: torch.Tensor,
     g: torch.Tensor,
+    gexp: torch.Tensor,
     w: torch.Tensor,
     S: torch.Tensor,
     upper_mask: torch.Tensor,
@@ -851,8 +898,9 @@ def _chunk_kda_inner_loop_recompute(
     chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
     # Same gate-map layout as ``_chunk_kda_inner_loop`` (pure elementwise
-    # functions of ``g`` / ``k``; values unchanged).
-    gexp_all = g.exp()
+    # functions of ``g`` / ``k``; values unchanged); ``gexp`` is the
+    # ``exp`` map precomputed by ``_chunk_kda_prepare``.
+    gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     kexp_all = (g[..., -1:, :] - g).exp() * k
     for i in range(NT):
@@ -998,7 +1046,7 @@ def assoc_scan_chunk_kda(
     if prep['early']:
         return prep['o'], prep['S']
     qq, kk = prep['q'], prep['k']
-    u, gg, w = prep['u'], prep['g'], prep['w']
+    u, gg, ggx, w = prep['u'], prep['g'], prep['gexp'], prep['w']
     Aqk, S0 = prep['Aqk'], prep['S']
     if Aqk is None:  # pragma: no cover - prepare(recompute_attn=False)
         raise RuntimeError(
@@ -1006,12 +1054,15 @@ def assoc_scan_chunk_kda(
             'recompute_attn=True is not supported by the scan path.')
     # kexp[c] = k_c * exp(g_last - g_c) with PER-CHANNEL log-decay, so the
     # diagonal part of M_n is Diag(exp(g_last)) (anisotropic across K).
+    # ``ggx`` is the ``exp`` of the cumsum gate map precomputed by
+    # ``_chunk_kda_prepare``; ``ggx[..., -1, :]`` is elementwise-identical
+    # to ``gg[..., -1, :].exp()`` and ``ggx`` to ``gg.exp()``.
     kexp = kk * (gg[..., -1:, :] - gg).exp()
     kexp_t = kexp.transpose(-1, -2)
-    M = torch.diag_embed(gg[..., -1, :].exp()) - kexp_t @ w
+    M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
     b = kexp_t @ u
     S_in, S_final, _levels = _assoc_scan_chunk_states(M, b, S0)
-    C = qq * gg.exp() - Aqk @ w
+    C = qq * ggx - Aqk @ w
     a = Aqk @ u
     o_all = C @ S_in + a
     chunk_outs = list(o_all.unbind(2))
@@ -1099,10 +1150,12 @@ def scripted_chunk_kda(
     inner_eager = (_chunk_kda_inner_loop_recompute if recompute_attn
                    else _chunk_kda_inner_loop)
     inner_args = (
-        (prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+        (prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
+         prep['w'], prep['S'],
          prep['upper_mask'], prep['clamp_g_diff'], prep['NT'])
         if recompute_attn else
-        (prep['q'], prep['k'], prep['u'], prep['g'], prep['w'], prep['S'],
+        (prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
+         prep['w'], prep['S'],
          prep['Aqk'], prep['NT'])
     )
     scripted_inner, script_err = _get_scripted_chunk_inner(
