@@ -199,7 +199,11 @@ def naive_hca(
         # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
         # multiply keeps values/gradients bit-for-bit identical.
         scores = scores * scale
-    scores = scores.masked_fill(~cbm[None, None], float('-inf'))
+    # The einsum output (or its scaled copy) is freshly allocated and only
+    # consumed by the joint softmax below, so the in-place fill computes the
+    # identical elementwise write without an extra [B, nh, T, n_blocks]
+    # temporary (mirrors ``naive_csa``).
+    scores.masked_fill_(~cbm[None, None], float('-inf'))
         # --- 3. Sliding-window branch (uncompressed local KV) ---
     if sliding_window > 0:
         win = sliding_window

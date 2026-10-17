@@ -118,6 +118,45 @@ _TABLE_CACHE_MAX_ELEMS = 1 << 21
 # carry signed zeros / NaN payloads that a value-keyed cache would merge).
 _INT_POS_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
 
+# Element floor for materializing the broadcast ``(cos, sin)`` tables in
+# ``partial_rope`` (see :func:`_materialize_pair_table`). Below this size the
+# table is passed as a stride-0 broadcast view: the elementwise kernels fall
+# onto a scalar path, but at these sizes the saved kernel launches dominate
+# and the view is faster (measured crossover at the repo's [..., nh, c]
+# / [..., c] geometries: ~1e3 elements with the default table width).
+_ROPE_MATERIALIZE_MIN_ELEMS = 1024
+
+
+def _materialize_pair_table(
+    tbl: torch.Tensor,
+    target_shape,
+    dim: int,
+) -> torch.Tensor:
+    """Expand a cached ``[P, r/2]`` table for a rotated pair slice.
+
+    ``target_shape`` is the shape of the pair slice ``x[..., 0::2]``: ``P``
+    along ``dim``, ``r/2`` last. Broadcasting the per-position table across
+    an inner axis (the head axis of ``[B, T, nh, c]`` queries / outputs) adds
+    a stride-0 axis directly above the feature axis, which drops the
+    elementwise kernels onto a non-vectorized scalar loop (~10x slower per
+    element than contiguous operands at the benchmark sizes). The inner
+    broadcast axes are therefore materialized with ``cat``, which copies each
+    contiguous source row at full speed. A leading stride-0 axis (batch) is
+    left broadcast: it collapses into the outer loop there and stays on the
+    vectorized path. The elementwise values are unchanged either way (the
+    products and sums see the same per-position values, just through a dense
+    layout).
+    """
+    view_shape = [1] * len(target_shape)
+    view_shape[dim] = tbl.shape[0]
+    view_shape[-1] = tbl.shape[-1]
+    out = tbl.view(view_shape)
+    for ax in range(1, len(target_shape) - 1):
+        n = target_shape[ax]
+        if ax != dim and n != 1:
+            out = torch.cat([out] * n, dim=ax)
+    return out
+
 
 def _cos_sin_cached(
     positions: torch.Tensor,
@@ -235,12 +274,30 @@ def partial_rope(
     bc_shape = [1] * x.dim()
     bc_shape[dim] = P
     bc_shape[-1] = rope_dim // 2
-    cos = cos.view(bc_shape)
-    sin = sin.view(bc_shape)
 
     x_rot = x[..., D - rope_dim:]                            # [..., P, r]
     x1 = x_rot[..., 0::2]                                    # [..., P, r/2]
     x2 = x_rot[..., 1::2]                                    # [..., P, r/2]
+    if x1.numel() >= _ROPE_MATERIALIZE_MIN_ELEMS:
+        # Broadcast-heavy path (per-head q / out rotations, and every long
+        # sequence): dense tables + contiguous pair copies keep the
+        # elementwise kernels vectorized (identical per-element math, see
+        # :func:`_materialize_pair_table`). ``o1`` / ``o2`` are plain
+        # expressions, so this path is valid with and without autograd.
+        cos = _materialize_pair_table(cos, x1.shape, dim)
+        sin = _materialize_pair_table(sin, x1.shape, dim)
+        x1 = x1.contiguous()
+        x2 = x2.contiguous()
+        o1 = x1 * cos - x2 * sin
+        o2 = x1 * sin + x2 * cos
+        out = torch.empty(x.shape, dtype=x.dtype, device=device)
+        if rope_dim < D:
+            out[..., : D - rope_dim] = x[..., : D - rope_dim]
+        out[..., D - rope_dim::2] = o1
+        out[..., D - rope_dim + 1::2] = o2
+        return out
+    cos = cos.view(bc_shape)
+    sin = sin.view(bc_shape)
     if x.requires_grad and torch.is_grad_enabled():
         # Differentiable path: ``out=`` kernels do not record autograd, so
         # build the rotated pairs as plain expressions (identical values).
