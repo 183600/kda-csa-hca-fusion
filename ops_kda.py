@@ -420,50 +420,36 @@ _ATTN_BLOCK_ROWS_MAX = 8
 def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     """Rows per vectorized attention-block step (>= 1, <= the cap).
 
-    The best count is a flat trade-off between fewer kernel launches
-    (larger ``rows``) and keeping the transient ``[..., rows, c1, K]``
-    block small enough for the thread-split / cache behaviour of the
-    elementwise kernels (smaller ``rows``). It tracks the measured
-    latency landscape of the CPU backend:
+    The best count is a trade-off between fewer kernel launches (larger
+    ``rows``) and keeping the transient ``[..., rows, c1, K]`` block small
+    enough for the thread-split / cache behaviour of the elementwise
+    kernels (smaller ``rows``). On the CPU backend the latency landscape
+    is dominated by the *outer* size ``B * HV * NT``: the elementwise
+    broadcast + reduction kernels flip into a poorly-split parallel path
+    once that product (scaled by the chunk size) crosses a cache-line
+    accounting threshold, at which point the wide blocks become 2-5x
+    slower. The measured optimum tracks roughly one row per 64 bytes of
+    the per-chunk outer stride, so the rule keys on
 
-      * ``K <= 16``: 8 rows for chunk sizes up to 32 (transient stays
-        small in absolute terms); 4 rows at ``BT = 64``.
-      * ``K <= 32``: 4 rows through ``NT = 32``; 2 rows through
-        ``NT = 64``; 1 row beyond (the transient no longer fits the
-        cache).
-      * ``K <= 64`` / ``K <= 128``: 4 rows for the short chunk counts,
-        2 rows for mid counts, 1 row beyond.
-      * ``K > 128``: 2 rows for very short sequences, else 1.
+        ``eff = B * HV * NT * BT // 64``
+
+    (measured with ``torch.set_num_threads(2)``): ``eff <= 32`` gets 8
+    rows, ``eff <= 64`` gets 4 for ``K <= 64`` else 2, beyond that 2 rows
+    (1 for the widest heads).
 
     The per-row elementwise/reduction math is identical for every count
     (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
     loop granularity.
     """
-    if K <= 16:
-        rows = _ATTN_BLOCK_ROWS_MAX if BT <= 32 else 4
-    elif K <= 32:
-        if NT <= 32:
-            rows = 4
-        elif NT <= 64:
-            rows = 2
-        else:
-            rows = 1
-    elif K <= 64:
-        if NT <= 16:
-            rows = 4
-        elif NT <= 32:
-            rows = 2
-        else:
-            rows = 1
-    elif K <= 128:
-        if NT <= 16:
-            rows = 4
-        elif NT <= 32:
-            rows = 2
-        else:
-            rows = 1
+    eff = max(1, (B * HV * NT * BT) // 64)
+    if eff <= 32:
+        rows = _ATTN_BLOCK_ROWS_MAX
+    elif eff <= 64:
+        rows = 4 if K <= 64 else 2
+    elif eff <= 256:
+        rows = 2
     else:
-        rows = 2 if NT <= 8 else 1
+        rows = 1 if K > 128 else 2
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
@@ -804,6 +790,9 @@ def naive_chunk_kda(
             prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
             prep['w'], prep['S'],
             prep['upper_mask'], prep['clamp_g_diff'], prep['NT'],
+            _recompute_block_rows(prep['q'].shape[0], prep['q'].shape[1],
+                                  prep['NT'], prep['q'].shape[3],
+                                  prep['q'].shape[-1]),
         )
     else:
         chunk_outs, S = _chunk_kda_inner_loop(
@@ -867,6 +856,19 @@ def _chunk_kda_inner_loop(
     return chunk_outs, S
 
 
+def _recompute_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
+    """Column-block size for the recompute variant's ``Aqk`` rebuild.
+
+    Independent of ``_attn_block_rows`` (which is tuned for the
+    ``prepare`` loop that materializes BOTH ``A`` and ``Aqk``): the
+    recompute path writes a single matrix per chunk and prefers wider
+    blocks. The measured optimum is 16-32 columns across the tested
+    geometries — the values do not depend on the block size at all, only
+    the Python loop granularity does.
+    """
+    return max(1, min(32 if K <= 32 else 16, BT))
+
+
 def _chunk_kda_inner_loop_recompute(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -878,6 +880,7 @@ def _chunk_kda_inner_loop_recompute(
     upper_mask: torch.Tensor,
     clamp_g_diff: bool,
     NT: int,
+    block_rows: int,
 ) -> tuple:
     """TorchScript-compatible recompute variant of ``_chunk_kda_inner_loop``.
 
@@ -894,6 +897,13 @@ def _chunk_kda_inner_loop_recompute(
 
     ``clamp_g_diff`` must be the flag computed by ``_chunk_kda_prepare``
     (``max(g) - min(g) > 50`` anywhere), so both variants clamp identically.
+
+    ``block_rows`` sets the column-block granularity of the rebuild
+    (see :func:`_recompute_block_rows`): entry ``(c, j)`` still evaluates
+    the identical elementwise sub / clamp / exp / multiply chain in the same
+    association (``(q * exp(diff)) * k``, reduced over the contiguous last
+    dim), so the values are unchanged; only the Python loop granularity
+    differs. Entries with ``j > c`` are zeroed by ``upper_mask``.
     """
     chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
@@ -903,6 +913,7 @@ def _chunk_kda_inner_loop_recompute(
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     kexp_all = (g[..., -1:, :] - g).exp() * k
+    _block_rows = block_rows
     for i in range(NT):
         q_i = q[:, :, i]
         k_i = k[:, :, i]
@@ -911,11 +922,16 @@ def _chunk_kda_inner_loop_recompute(
         w_i = w[:, :, i]
         Aqk_i = q_i.new_empty(B, HV, BT, BT)
         # Only the rows ``c >= j`` survive ``upper_mask``.
-        for j in range(BT):
-            diff = g_i[..., j:, :] - g_i[..., j:j + 1, :]
+        for j0 in range(0, BT, _block_rows):
+            j1 = min(BT, j0 + _block_rows)
+            diff = (g_i[..., j0:, :].unsqueeze(-2)
+                    - g_i[..., j0:j1, :].unsqueeze(-3))
             if clamp_g_diff:
                 diff = diff.clamp(max=50.0)
-            Aqk_i[..., j:, j] = (q_i[..., j:, :] * diff.exp() * k_i[..., j:j + 1, :]).sum(-1)
+            diff.exp_()
+            qe = q_i[..., j0:, :].unsqueeze(-2) * diff
+            Aqk_i[..., j0:, j0:j1] = (
+                qe * k_i[..., j0:j1, :].unsqueeze(-3)).sum(-1)
         Aqk_i = Aqk_i.masked_fill(upper_mask, 0)
         v_i = u_i - w_i @ S
         chunk_outs.append((q_i * gexp_all[:, :, i]) @ S + Aqk_i @ v_i)
@@ -1152,7 +1168,10 @@ def scripted_chunk_kda(
     inner_args = (
         (prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
          prep['w'], prep['S'],
-         prep['upper_mask'], prep['clamp_g_diff'], prep['NT'])
+         prep['upper_mask'], prep['clamp_g_diff'], prep['NT'],
+         _recompute_block_rows(prep['q'].shape[0], prep['q'].shape[1],
+                               prep['NT'], prep['q'].shape[3],
+                               prep['q'].shape[-1]))
         if recompute_attn else
         (prep['q'], prep['k'], prep['u'], prep['g'], prep['gexp'],
          prep['w'], prep['S'],
