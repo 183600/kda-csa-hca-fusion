@@ -412,8 +412,8 @@ def compiled_recurrent_kda(
 # ``[..., R, c1, K]`` block and avoids one tiny-kernel launch per row. The
 # best row count depends on the per-op thread-split behaviour of the
 # elementwise kernels on the CPU backend and is *not* monotone in the block
-# size, so the count is selected per head-dim / chunk-count regime and the
-# flat fallbacks stay conservative.
+# size, so the count is selected per outer-size regime and the flat
+# fallbacks stay conservative.
 _ATTN_BLOCK_ROWS_MAX = 8
 
 
@@ -433,23 +433,25 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
 
         ``eff = B * HV * NT * BT // 64``
 
-    (measured with ``torch.set_num_threads(2)``): ``eff <= 32`` gets 8
-    rows, ``eff <= 64`` gets 4 for ``K <= 64`` else 2, beyond that 2 rows
-    (1 for the widest heads).
+    (measured with ``torch.set_num_threads(1)``, the thread count used by
+    the benchmark harnesses): ``eff <= 16`` gets 8 rows, ``eff <= 64`` gets
+    2, beyond that a single row. Wide blocks stop paying off once the
+    outer dim is large because the transient ``[..., rows, c1, K]``
+    allocations cross the allocator's mmap threshold and every iteration
+    pays page-fault + ``munmap`` costs that dwarf the saved kernel
+    launches (at ``eff == 128`` two rows are ~2x slower than one).
 
     The per-row elementwise/reduction math is identical for every count
     (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
     loop granularity.
     """
     eff = max(1, (B * HV * NT * BT) // 64)
-    if eff <= 32:
+    if eff <= 16:
         rows = _ATTN_BLOCK_ROWS_MAX
     elif eff <= 64:
-        rows = 4 if K <= 64 else 2
-    elif eff <= 256:
         rows = 2
     else:
-        rows = 1 if K > 128 else 2
+        rows = 1
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
