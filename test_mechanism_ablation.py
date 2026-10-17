@@ -27,7 +27,7 @@ sys.path.insert(0, HERE)
 import ops_csa  # noqa: E402
 import run_mechanism_ablation as M  # noqa: E402
 from ops_fused import CSAHybridLayer, HybridKCHAttention  # noqa: E402
-from run_quality import make_mqar_batch  # noqa: E402
+from run_quality import make_kv_update_batch, make_mqar_batch  # noqa: E402
 
 
 def _ok(name, cond, detail=''):
@@ -175,6 +175,42 @@ def test_make_mqar_batch_meta_backward_compatible():
         torch.equal(x_emb, x_emb2) and torch.equal(target, target2), '')
 
 
+def test_make_kv_update_batch_targets_latest_value():
+    """The kv_update label is the NEW value of the key repeated at the cue."""
+    print("\nTest: make_kv_update_batch target contract")
+    device = torch.device('cpu')
+    embed = nn.Embedding(32, 32)
+    for n_kv in (1, 2, 4):
+        x_emb, target, cue_pos, meta = make_kv_update_batch(
+            16, 32, n_kv, 32, embed, device,
+            generator=torch.Generator(device).manual_seed(n_kv),
+            return_meta=True)
+        ids = meta['input_ids']
+        j = meta['key_idx']
+        b = ids.shape[0]
+        keys = ids[:, 0:2 * n_kv:2]
+        vals_old = ids[:, 1:2 * n_kv:2]
+        keys2 = ids[:, 2 * n_kv:4 * n_kv:2]
+        vals2 = ids[:, 2 * n_kv + 1:4 * n_kv:2]
+        ok = True
+        for r in range(b):
+            cue = ids[r, cue_pos]
+            if int(cue) != int(keys[r, j[r]]):
+                ok = False
+                break
+            slot = int((keys2[r] == cue).nonzero()[0, 0])
+            if int(target[r]) != int(vals2[r, slot]):
+                ok = False
+                break
+            if int(target[r]) == int(vals_old[r, j[r]]):
+                ok = False
+                break
+        _ok(f'n_kv={n_kv}: target is the cued key\'s newest value',
+            ok, f'target={target.tolist()[:4]}')
+    _ok('cue_pos is the last position',
+        cue_pos == 31, f'cue_pos={cue_pos}')
+
+
 def test_dense_variant_recall_is_one():
     """With topk = n_blocks the diagnostic must hit every gold block."""
     print("\nTest: dense variant gold recall == 1.0")
@@ -283,6 +319,7 @@ _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
     test_make_mqar_batch_meta_backward_compatible,
+    test_make_kv_update_batch_targets_latest_value,
     test_dense_variant_recall_is_one,
     test_sparse_variant_recall_is_below_one_or_none,
     test_paired_stats_math,

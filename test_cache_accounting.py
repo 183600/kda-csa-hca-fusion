@@ -52,7 +52,8 @@ import torch  # noqa: E402
 
 import cache_accounting  # noqa: E402
 from ops_fused import HybridConfig  # noqa: E402
-from run_kv_cache import geometric_capacity, kv_cache_elements  # noqa: E402
+from run_kv_cache import (geometric_capacity, kv_cache_breakdown,
+                          kv_cache_elements)  # noqa: E402
 
 
 def _ok(name, cond, detail=''):
@@ -136,6 +137,31 @@ def test_analytic_decomposition_matches_exp3():
     except Exception:
         raised += 1
     _ok('analytic validation (T<0 rejected)', raised == 1, f'raised={raised}')
+
+
+def test_kv_cache_breakdown_reconciles_in_both_modes():
+    """``state_components`` sum to ``kv_elements`` in BOTH modes."""
+    print("\nTest: kv_cache_breakdown vs kv_cache_elements invariant")
+    ops = ('softmax_gqa', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca',
+           'hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7')
+    failures = []
+    for T in (0, 1, 2, 3, 7, 8, 9, 16, 17, 31, 512):
+        for op in ops:
+            for mode in ('compressed_kv_only', 'full_accounting'):
+                comps = kv_cache_breakdown(op, T, mode=mode)
+                total = sum(v for k, v in comps.items()
+                            if k != 'compressed_kv_only_total')
+                committed = kv_cache_elements(op, T, mode=mode)
+                if total != committed:
+                    failures.append((T, op, mode, total, committed))
+    _ok('components reconcile with kv_elements in both modes',
+        not failures, f'failures={failures[:3]}')
+    raised = 0
+    try:
+        kv_cache_breakdown('kda', 8, mode='bogus')
+    except ValueError:
+        raised += 1
+    _ok('unknown mode rejected', raised == 1, f'raised={raised}')
 
 
 def test_live_equals_analytic_for_every_fill_history():
@@ -474,6 +500,7 @@ def test_lcm_packing_and_full_report():
 
 _TEST_FUNCS = [
     test_analytic_decomposition_matches_exp3,
+    test_kv_cache_breakdown_reconciles_in_both_modes,
     test_live_equals_analytic_for_every_fill_history,
     test_geometric_capacity_contract,
     test_autograd_hygiene_and_bounded_graph,

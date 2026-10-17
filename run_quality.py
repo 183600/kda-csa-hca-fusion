@@ -637,9 +637,14 @@ def make_kv_update_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     j = torch.randint(0, n_kv, (batch,), device=device, generator=generator)
     row = torch.arange(batch, device=device)
     x[:, cue_pos] = keys[row, j]
-    # Position of the cued key inside the (shuffled) second presentation.
-    new_pos = order2[row, j]
-    target = vals_new[row, new_pos]
+    # Target = the NEWEST value paired with the cued key. ``vals_new`` is
+    # indexed by the ORIGINAL key index (the same index space as ``keys``
+    # and ``j``), so the answer is directly ``vals_new[row, j]``. Note that
+    # ``order2`` maps second-presentation slots -> original key indices, so
+    # ``order2[row, j]`` would instead select the new value of whichever
+    # *other* key happens to occupy slot ``j`` (the inverse permutation
+    # ``order2.argsort(-1)`` is what locates the cued key's slot).
+    target = vals_new[row, j]
 
     x_emb = embed(x)
     if return_meta:

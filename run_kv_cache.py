@@ -369,7 +369,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
     raise ValueError(op)
 
 
-def kv_cache_breakdown(op: str, T: int, **kw):
+def kv_cache_breakdown(op: str, T: int, mode: str = 'full_accounting', **kw):
     """Component-wise state accounting (elements, per single layer).
 
     Splits each operator's retained state into the framework's canonical
@@ -379,31 +379,54 @@ def kv_cache_breakdown(op: str, T: int, **kw):
     about WHERE the bytes go, not just the total. Values are ELEMENT
     counts (multiply by the dtype size for bytes). Buckets the operator
     does not retain are omitted from the returned dict.
+
+    ``mode`` mirrors :func:`kv_cache_elements`: the reported components
+    are the ones retained under that accounting mode, so they sum to
+    ``kv_cache_elements(op, T, mode=mode, **kw)`` — except for the
+    explicitly-labelled ``compressed_kv_only_total`` reference annotation,
+    which is informational and never part of the total.
     """
     p = {**DEFAULTS, **kw}
+    if mode not in ('compressed_kv_only', 'full_accounting'):
+        raise ValueError(
+            f"kv_cache_breakdown: mode={mode!r} must be one of "
+            f"['compressed_kv_only', 'full_accounting'].")
+    full = mode == 'full_accounting'
     if op == 'softmax_gqa':
+        if full:
+            # Capacity the reference decode cache allocates after T tokens
+            # (see kv_cache_elements): max(2*T, 64) slots, not just T.
+            return {'kv_cache': max(2 * T, 64) * p['H'] * (p['K'] + p['V'])}
         return {'kv_cache': T * p['H'] * (p['K'] + p['V'])}
     if op == 'kda':
-        _conv_ksize = p.get('kda_conv_ksize', 3)
-        return {
-            'recurrent_state': p['kda_hv'] * p['kda_k'] * p['kda_v'],
-            'conv_state': p['d'] * (_conv_ksize - 1),
-        }
+        out = {'recurrent_state': p['kda_hv'] * p['kda_k'] * p['kda_v']}
+        if full:
+            _conv_ksize = p.get('kda_conv_ksize', 3)
+            out['conv_state'] = p['d'] * (_conv_ksize - 1)
+        return out
     if op == 'mamba2':
         d_inner = p['mamba_expand'] * p['d']
         nheads = d_inner // p['mamba_headdim'] if p['mamba_headdim'] > 0 else 1
-        return {
-            'recurrent_state': nheads * p['mamba_headdim'] * p['mamba_d_state'],
-            'conv_state': d_inner * (p['mamba_d_conv'] - 1),
-        }
+        out = {'recurrent_state':
+               nheads * p['mamba_headdim'] * p['mamba_d_state']}
+        if full:
+            out['conv_state'] = d_inner * (p['mamba_d_conv'] - 1)
+        return out
     if op == 'rwkv7':
         nheads = p['d'] // p['rwkv_head_dim'] if p['rwkv_head_dim'] > 0 else 1
-        return {
-            'recurrent_state': nheads * p['rwkv_head_dim'] * p['rwkv_head_dim'],
-            'shift_state': p['d'],
-        }
+        out = {'recurrent_state':
+               nheads * p['rwkv_head_dim'] * p['rwkv_head_dim']}
+        if full:
+            out['shift_state'] = p['d']
+        return out
     if op == 'csa':
         n_blocks = max(1, (T + p['csa_m'] - 1) // p['csa_m'])
+        # Optimistic-mode total kept for reference in the row (never part of
+        # the summed components).
+        ref = n_blocks * p['csa_c']
+        if not full:
+            return {'compressed_cache': ref,
+                    'compressed_kv_only_total': ref}
         n_completed = T // p['csa_m']
         capacity = geometric_capacity(n_completed)
         partial_tokens = T % p['csa_m']
@@ -415,11 +438,15 @@ def kv_cache_breakdown(op: str, T: int, **kw):
                                                      + 2 * p['csa_cI']),
             'overlap_state': (2 * p['csa_m'] * p['csa_c'])
             if n_completed >= 1 else 0,
-            # Optimistic-mode total kept for reference in the row.
-            'compressed_kv_only_total': n_blocks * p['csa_c'],
+            'sink': p.get('csa_nh', p['H']),
+            'compressed_kv_only_total': ref,
         }
     if op == 'hca':
         n_blocks = max(1, (T + p['hca_m2'] - 1) // p['hca_m2'])
+        ref = n_blocks * p['hca_c']
+        if not full:
+            return {'compressed_cache': ref,
+                    'compressed_kv_only_total': ref}
         n_completed = T // p['hca_m2']
         capacity = geometric_capacity(n_completed)
         partial_tokens = T % p['hca_m2']
@@ -427,7 +454,8 @@ def kv_cache_breakdown(op: str, T: int, **kw):
             'compressed_cache': capacity * p['hca_c'],
             'window_cache': p['hca_sliding_window'] * p['hca_c'],
             'partial_accumulator': partial_tokens * (2 * p['hca_c']),
-            'compressed_kv_only_total': n_blocks * p['hca_c'],
+            'sink': p.get('hca_nh', p['H']),
+            'compressed_kv_only_total': ref,
         }
     if op in ('hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7'):
         mem_op = {'hybrid_kch': 'kda', 'hybrid_mamba2': 'mamba2',
@@ -435,13 +463,13 @@ def kv_cache_breakdown(op: str, T: int, **kw):
         n_mem = p.get('hybrid_n_kda', 3)
         n_csa = p.get('hybrid_n_csa', 1)
         n_hca = p.get('hybrid_n_hca', 1)
-        mem = kv_cache_breakdown(mem_op, T, **p)
-        csa = kv_cache_breakdown('csa', T, **p)
-        hca = kv_cache_breakdown('hca', T, **p)
+        mem = kv_cache_breakdown(mem_op, T, mode=mode, **p)
+        csa = kv_cache_breakdown('csa', T, mode=mode, **p)
+        hca = kv_cache_breakdown('hca', T, mode=mode, **p)
         out = {}
         for bucket in ('recurrent_state', 'conv_state', 'shift_state',
                        'compressed_cache', 'window_cache', 'indexer_cache',
-                       'partial_accumulator', 'overlap_state'):
+                       'partial_accumulator', 'overlap_state', 'sink'):
             total = 0
             for count, comp in ((n_mem, mem), (n_csa, csa), (n_hca, hca)):
                 v = comp.get(bucket)
@@ -766,8 +794,10 @@ def main():
                     'kv_elements': kv,
                     # Component-wise split (recurrent state vs conv state vs
                     # compressed/window caches) for the quality-vs-cache
-                    # figures and the budget-matching design.
-                    'state_components': kv_cache_breakdown(op, T),
+                    # figures and the budget-matching design. Mode-aware, so
+                    # the components reconcile with ``kv_elements`` above in
+                    # BOTH accounting modes.
+                    'state_components': kv_cache_breakdown(op, T, mode=mode),
                     # Explicit byte count under the BF16 accounting convention used
                     # throughout the cache analysis. README has long documented a
                     # ``kv_bytes`` field; writing it here keeps the JSON schema

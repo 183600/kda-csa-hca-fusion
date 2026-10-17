@@ -523,10 +523,13 @@ def run_all(seeds=None, steps=None):
     # well-behaved library function rather than a process mutator.
     _orig_cwd = os.getcwd()
     os.chdir(out_root)
-    # Apply the smoke / screen / full budget tier BEFORE any experiment
-    # reads its env knobs (unset-vars only; explicit user requests win).
-    profile = _apply_run_profile()
     try:
+        # Apply the smoke / screen / full budget tier BEFORE any experiment
+        # reads its env knobs (unset-vars only; explicit user requests win).
+        # This lives INSIDE the try so an unknown RUN_ALL_PROFILE value
+        # still restores the caller's CWD / env via the finally block
+        # instead of leaking the ``os.chdir(out_root)`` above.
+        profile = _apply_run_profile()
         # Apply the seeds/steps env-var mutations INSIDE the try block
         # (after _ensure_deps/_setup succeeded) so a failure in those
         # functions does not leak the mutations to the caller's

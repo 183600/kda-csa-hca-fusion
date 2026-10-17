@@ -25,6 +25,7 @@ experiment.
 from __future__ import annotations
 
 import math
+import statistics
 from collections import OrderedDict
 from typing import Iterable, Mapping, Sequence
 
@@ -795,12 +796,18 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
     counts: dict = OrderedDict((name, 0) for name in LM_ERROR_CATEGORIES)
     for c in categories:
         counts[c] = counts.get(c, 0) + 1
+    # Every position (valid or ignored) receives exactly one category, so
+    # the category counts sum to the TOTAL number of positions. Using
+    # ``n_tokens`` (valid only) understated the denominator for categories
+    # that can include masked positions — ``ignored`` then reported a
+    # "rate of all" above 1.0 whenever padding outnumbered real tokens.
+    n_all = sum(counts.values())
     cat_report = OrderedDict()
     for name, definition in LM_ERROR_CATEGORIES.items():
         c = counts.get(name, 0)
         cat_report[name] = {
             'count': int(c),
-            'rate_of_all': (c / n_tokens) if n_tokens else 0.0,
+            'rate_of_all': (c / n_all) if n_all else 0.0,
             'rate_of_wrong': (c / n_wrong) if n_wrong else 0.0,
             'definition': definition,
         }
@@ -828,7 +835,11 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
             mask = valid & ((position * 4) // max(1, width) == qi)
             entry = _acc(mask)
             entry['quartile'] = f'q{qi + 1}_of_4'
-            entry['position_range'] = [int(qi * width / 4), int((qi + 1) * width / 4)]
+            # Half-open interval of the SAME mask condition
+            # ``(position*4)//width == qi``  <=>
+            # ceil(qi*width/4) <= position < ceil((qi+1)*width/4).
+            entry['position_range'] = [
+                -(-qi * width // 4), -(-(qi + 1) * width // 4)]
             pos_buckets.append(entry)
 
     # (b) Distance to the target's last earlier occurrence: copy accuracy is
@@ -857,7 +868,11 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
         'categories': cat_report,
         'target_rank_on_errors': {
             'mean': float(rank_on_err.mean()) if rank_on_err.numel() else None,
-            'median': (float(rank_on_err.median())
+            # ``statistics.median`` (not ``torch.median``, which returns the
+            # LOWER of the two middle values for even-sized samples): error
+            # counts are typically even, and the lower-middle convention
+            # biases the reported headline rank downward.
+            'median': (float(statistics.median(rank_on_err.tolist()))
                        if rank_on_err.numel() else None),
         },
         'top1_prob_on_errors': {
