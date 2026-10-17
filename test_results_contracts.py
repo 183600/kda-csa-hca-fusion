@@ -117,7 +117,7 @@ def test_row_contract_matrix_accepts_valid_and_flags_defects():
     # Duplicate (group, n_kv) key.
     assert rs.validate_rows('exp5b_ablation_matrix',
                             rows + [dict(rows[0])], meta)
-    # Aggregate no longer equals the per-seed mean.
+    # mean_acc inconsistent with the per-seed accuracies.
     tampered = [dict(rows[0], mean_acc=rows[0]['mean_acc'] + 0.01)] + rows[1:]
     assert rs.validate_rows('exp5b_ablation_matrix', tampered, meta)
     # A crashed run that silently drops groups.

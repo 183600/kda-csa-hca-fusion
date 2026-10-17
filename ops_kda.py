@@ -420,28 +420,15 @@ _ATTN_BLOCK_ROWS_MAX = 8
 def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     """Rows per vectorized attention-block step (>= 1, <= the cap).
 
-    The best count is a trade-off between fewer kernel launches (larger
-    ``rows``) and keeping the transient ``[..., rows, c1, K]`` block small
-    enough for the allocator / cache behaviour of the elementwise
-    kernels (smaller ``rows``). On the CPU backend the latency is
-    dominated by the *outer* size ``B * HV * NT`` and is not monotone in
-    ``rows``: once the per-iteration block crosses the allocator's
-    large-chunk threshold the elementwise broadcast + reduction kernels
-    lose their thread split and wide blocks become up to ~1.8x slower
-    than narrow ones. At ``eff == 128`` the wider counts additionally
-    oscillate between slow and allocator-luck ties across processes, so
-    beyond ``eff == 64`` the narrow single-row loop is the safe choice.
-    The rule keys on
+    The count trades fewer loop iterations (larger ``rows``) against
+    keeping the transient ``[..., rows, c1, K]`` block small (smaller
+    ``rows``). The rule keys on
 
         ``eff = B * HV * NT * BT // 64``
 
-    (measured with ``torch.set_num_threads(1)``, the thread count the
-    benchmark harness pins, after the same-T softmax benchmark has warmed
-    the allocator): ``eff <= 8`` gets the full 8 rows, ``eff <= 64`` gets
-    4, and larger outer sizes fall back to a single row. The wide blocks
-    win in the small/medium regimes (up to ~13% at ``eff == 32`` and ~5%
-    at ``eff == 64``), while ``eff == 16`` already shows 8 rows ~60%
-    slower than 4.
+    with ``eff <= 8`` at the full 8 rows, ``eff <= 64`` at 4, and larger
+    outer sizes falling back to a single row (capped by
+    ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``).
 
     The per-row elementwise/reduction math is identical for every count
     (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
@@ -513,10 +500,9 @@ def _chunk_kda_attn_loop_eager(
         # ``c`` in ``[c0, c1)`` the written columns stop at ``c1 - 1``, so a
         # written ``j > c`` satisfies ``j - c <= c1 - 1 - c0 = rows - 1``,
         # while any diagonal entry outside a block was never written and is
-        # already ``+0.0``/untouched (zeroing it is a no-op). Zeroing those
-        # few diagonals replaces a full ``[..., BT, BT]`` masked write per
-        # matrix. ``Aqk`` is untouched in ``recompute_attn`` mode (it is
-        # rebuilt per chunk by the inner loop).
+        # already ``+0.0``/untouched (zeroing it is a no-op). ``Aqk`` is
+        # untouched in ``recompute_attn`` mode (it is rebuilt per chunk by
+        # the inner loop).
         for off in range(1, block_rows):
             A.diagonal(offset=off, dim1=-2, dim2=-1).zero_()
             if not recompute_attn:
@@ -628,10 +614,9 @@ def _chunk_kda_prepare(
     compute_dtype = _compute_dtype(dtype)
     q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
-    # ``repeat_interleave`` (even with G == 1) also materializes contiguous
-    # q / k tensors; the rearranged views feed several downstream matmuls.
-    # With G == 1 it is a pure identity, so a direct ``contiguous()`` makes
-    # the same copy without the generic repeat machinery.
+    # The rearranged views feed several downstream matmuls, which need
+    # contiguous q / k tensors; with G == 1 the GVA expansion is a pure
+    # identity.
     if G == 1:
         q = q.contiguous() * scale
         k = k.contiguous()
@@ -710,8 +695,7 @@ def _chunk_kda_prepare(
     # ``exp(g)`` is consumed here (the ``w`` map) and again by the inner
     # loops (the per-chunk gate map and the last-position decay); compute
     # it once on the shared, already-clamped cumsum gate and hand it to
-    # both. ``exp`` is a pure elementwise function, so the values are
-    # bit-identical to evaluating it separately in each consumer.
+    # both.
     gexp = g.exp()
     w = A @ (gexp * k)
     u = A @ v
@@ -835,13 +819,12 @@ def _chunk_kda_inner_loop(
     # The per-chunk gate maps (``exp(g)``, the last-position decay, and the
     # decay-difference weighted keys) are pure elementwise functions of
     # ``g`` / ``k``, evaluated for all chunks up front; each chunk then
-    # consumes its own slice. The computed fp values are the same as
-    # evaluating each slice inside the loop.
+    # consumes its own slice.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     # The subtraction yields a fresh tensor, so ``exp`` may run in place;
     # the multiply stays out of place because ``exp`` backward saves its
-    # output. Per-element values are unchanged.
+    # output.
     kexp_all = g[..., -1:, :] - g
     kexp_all.exp_()
     kexp_all = kexp_all * k
@@ -868,12 +851,11 @@ def _chunk_kda_inner_loop(
 def _recompute_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     """Column-block size for the recompute variant's ``Aqk`` rebuild.
 
-    Independent of ``_attn_block_rows`` (which is tuned for the
-    ``prepare`` loop that materializes BOTH ``A`` and ``Aqk``): the
-    recompute path writes a single matrix per chunk and prefers wider
-    blocks. The measured optimum is 16-32 columns across the tested
-    geometries — the values do not depend on the block size at all, only
-    the Python loop granularity does.
+    Independent of ``_attn_block_rows`` (which serves the ``prepare``
+    loop that materializes BOTH ``A`` and ``Aqk``): the recompute path
+    writes a single matrix per chunk and uses wider blocks. The values do
+    not depend on the block size at all, only the Python loop granularity
+    does.
     """
     return max(1, min(32 if K <= 32 else 16, BT))
 
@@ -917,12 +899,12 @@ def _chunk_kda_inner_loop_recompute(
     chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
     # Same gate-map layout as ``_chunk_kda_inner_loop`` (pure elementwise
-    # functions of ``g`` / ``k``; values unchanged); ``gexp`` is the
-    # ``exp`` map precomputed by ``_chunk_kda_prepare``.
+    # functions of ``g`` / ``k``); ``gexp`` is the ``exp`` map precomputed
+    # by ``_chunk_kda_prepare``.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
-    # Same in-place ``exp`` on the fresh subtraction result as
-    # ``_chunk_kda_inner_loop``; values unchanged.
+    # The subtraction is fresh, so its ``exp`` runs in place; the multiply
+    # stays out of place because ``exp`` backward saves its output.
     kexp_all = g[..., -1:, :] - g
     kexp_all.exp_()
     kexp_all = kexp_all * k
@@ -1086,8 +1068,7 @@ def assoc_scan_chunk_kda(
     # ``ggx`` is the ``exp`` of the cumsum gate map precomputed by
     # ``_chunk_kda_prepare``; ``ggx[..., -1, :]`` is elementwise-identical
     # to ``gg[..., -1, :].exp()`` and ``ggx`` to ``gg.exp()``.
-    # The subtraction is fresh, so its ``exp`` runs in place; the multiply
-    # order (``k`` on the left) and per-element values are unchanged.
+    # The subtraction is fresh, so its ``exp`` runs in place.
     kexp = gg[..., -1:, :] - gg
     kexp.exp_()
     kexp = kk * kexp

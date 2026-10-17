@@ -102,7 +102,7 @@ sizes keep unpolluted state; weight save/load roundtrip; both hybrid
 routes' prefill+decode == full-sequence equivalence (~1e-7). The CSA
 indexer's hard top-k is deterministic and size-independent (ties break on
 ascending block index, `ops_csa._canonical_topk_indices`), so the
-prefill/decode selection agreement no longer depends on the score-tensor
+prefill/decode selection agreement is independent of the score-tensor
 size; the `csa_topk=100` select-all protocol is retained as
 defense-in-depth in the legacy decoding-cache tests.
 

@@ -178,10 +178,7 @@ def naive_hca(
     # query at its own token position AFTER normalization (the decoding
     # cache applies the same order: the caller normalizes ``q``, the cache
     # rotates it). One position vector is shared by every RoPE call below
-    # (query, sliding-window keys, negated output rotation); the values
-    # are identical to the freshly-built ``token_positions`` each call
-    # used, and the integer-position table cache in ``ops_rope`` can only
-    # hit when the position values repeat.
+    # (query, sliding-window keys, negated output rotation).
     tpos = token_positions(T, device) if rope_dim_eff > 0 else None
     if rope_dim_eff > 0:
         q = partial_rope(q, tpos, rope_dim_eff, rope_base, dim=1)
@@ -200,9 +197,8 @@ def naive_hca(
         # multiply keeps values/gradients bit-for-bit identical.
         scores = scores * scale
     # The einsum output (or its scaled copy) is freshly allocated and only
-    # consumed by the joint softmax below, so the in-place fill computes the
-    # identical elementwise write without an extra [B, nh, T, n_blocks]
-    # temporary (mirrors ``naive_csa``).
+    # consumed by the joint softmax below, so the mask can be written in
+    # place.
     scores.masked_fill_(~cbm[None, None], float('-inf'))
         # --- 3. Sliding-window branch (uncompressed local KV) ---
     if sliding_window > 0:
@@ -238,7 +234,7 @@ def naive_hca(
     # to the output: the expected KV of a virtual entry with no source tokens
     # is zero, not a constant 1 broadcast across the head dim.
     # ``torch.cat`` with a zero-width side is a pure copy of the other
-    # side; feeding the non-empty tensor directly gives identical values.
+    # side; the non-empty tensor is used directly instead.
     if scores.shape[-1] and scores_w.shape[-1]:
         cat = torch.cat([scores, scores_w], dim=-1)                # [B, nh, T, n_blocks+win]
     elif scores_w.shape[-1]:
@@ -256,10 +252,9 @@ def naive_hca(
         shifted_sink = log_sink - row_max_safe
         # ``shifted``'s row max is exactly 0.0 by construction
         # (``cat - cat.amax``), so logsumexp's internal max-shift subtracts
-        # zero; writing the same decomposition (exp, sum, log) directly is
-        # bit-identical for fp16/bf16/fp32/fp64 (including all-``-inf`` rows,
-        # where both forms yield ``-inf``) and avoids a redundant full-size
-        # amax/sub/exp pass over ``[..., n_blocks+win]``.
+        # zero; writing the decomposition (exp, sum, log) directly yields the
+        # same values for fp16/bf16/fp32/fp64 (including all-``-inf`` rows,
+        # where both forms give ``-inf``).
         lse = shifted.exp().sum(-1, keepdim=True).log()
         log_denom = torch.logaddexp(lse, shifted_sink)             # [B, nh, T, 1]
         p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks+win]

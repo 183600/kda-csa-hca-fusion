@@ -459,9 +459,8 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     # Fill the remaining slots with the SMALLEST indices tied at the
     # boundary (the canonical rule). Exactly `s` entries are selected per
     # row (n_above + boundary ties >= s by the definition of the boundary).
-    # Explicit ``dtype=torch.int32``: a bool cumsum promotes to int64 and
-    # costs ~15x more on a [., T, n_blocks] tensor (measured CPU, torch
-    # 2.14: 3.3 ms -> 0.2 ms per call at T=2048, n_blocks=256).
+    # Explicit ``dtype=torch.int32``: a bool cumsum would promote to
+    # int64 on a [., T, n_blocks] tensor.
     tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
     fill_ties = at_boundary & (tie_rank <= (s - n_above))
     selected = strictly_above | fill_ties
@@ -499,11 +498,10 @@ def csa_lightning_indexer(
     NOT by a bare ``torch.topk`` call: equal scores are ordered by
     ASCENDING block index, so the selected SET is a pure function of the
     score vector. This is what lets the batched-prefill and per-token
-    incremental-decode paths agree index-for-index (previously their
-    differently-sized score tensors made ``torch.topk`` split ReLU zero
-    ties differently — see ``ops_decoding_cache``'s module docstring).
-    Selected slots are ordered by descending score (ascending index among
-    ties); entries selected at ``-inf`` are reported as ``-1``.
+    incremental-decode paths agree index-for-index despite their
+    differently-sized score tensors (see ``ops_decoding_cache``'s module
+    docstring). Selected slots are ordered by descending score (ascending
+    index among ties); entries selected at ``-inf`` are reported as ``-1``.
 
     Parameters
     ----------
@@ -1124,10 +1122,7 @@ def naive_csa(
     # rotate-then-normalize agree up to fp rounding; the order is pinned
     # here only so the incremental decode path matches bit-exactly.
     # One shared position vector for every RoPE call in this forward pass
-    # (queries, sliding-window keys, output inverse-rotation): the values
-    # are identical to the freshly-built ``token_positions(T, device)``
-    # each call used, and ``partial_rope``'s integer-position table cache
-    # can only hit when the position values repeat.
+    # (queries, sliding-window keys, output inverse-rotation).
     tpos = token_positions(T, device) if rope_dim_eff > 0 else None
     if rope_dim_eff > 0:
         q = partial_rope(q, tpos, rope_dim_eff, rope_base, dim=1)
@@ -1307,8 +1302,7 @@ def naive_csa(
             scores = scores * scale
         # Mask -1 padding so those slots get zero weight after softmax.
         # The einsum output is freshly allocated and only consumed by the
-        # joint softmax below, so the in-place fill computes the identical
-        # elementwise write without an extra [B, T, nh, topk] temporary.
+        # joint softmax below, so the mask can be written in place.
         scores.masked_fill_(~valid_mask[:, :, None, :], float('-inf'))
 
     # Sliding-window branch: gather per-query window SCORES (uncompressed
@@ -1340,17 +1334,15 @@ def naive_csa(
     # one softmax over the concatenated scores, with the attention sink
     # in the single shared denominator.
     # ``torch.cat`` with a zero-width side is a pure copy of the other side;
-    # using the non-empty tensor directly feeds the identical values into
-    # the softmax below (every later op reads the same elements).
+    # the non-empty tensor is used directly instead.
     if scores.shape[-1] and scores_w.shape[-1]:
         cat = torch.cat([scores, scores_w], dim=-1)             # [B, T, nh, topk+win]
     elif scores_w.shape[-1]:
         cat = scores_w
     else:
         cat = scores
-    # Per-row "no valid entry in either branch" flag. The concatenated
-    # valid mask's per-row ``any`` is the OR of the per-branch ``any``s, so
-    # the mask can be computed without materializing the concatenation.
+    # Per-row "no valid entry in either branch" flag: the OR of the
+    # per-branch row ``any``s.
     all_invalid = ~(valid_mask.any(-1, keepdim=True).unsqueeze(2)
                     | win_valid.any(-1).view(1, T, 1, 1))
     if cat.shape[-1] == 0:
@@ -1361,9 +1353,7 @@ def naive_csa(
             # space (never exp it) and shift it by -row_max alongside every
             # score so the largest exp() argument is 0. Invalid slots hold
             # ``-inf`` from the masked fills above, so their ``exp`` is
-            # exactly ``+0.0``; the old explicit ``* vmask`` (0.0 at invalid
-            # slots, 1.0 at valid ones, where ``x * 1.0`` is an IEEE no-op)
-            # therefore changed no bit.
+            # exactly ``+0.0``.
             log_sink = sink_logits.view(1, 1, nh, 1).to(cat)      # [1, 1, nh, 1]
             row_max = cat.amax(-1, keepdim=True).clamp(min=0)     # [B, T, nh, 1]
             shifted = cat - row_max

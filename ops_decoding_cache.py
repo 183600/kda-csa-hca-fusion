@@ -64,15 +64,15 @@ Deterministic tie-breaking
 --------------------------
 The hard selection is computed by ``ops_csa._canonical_topk_indices``,
 which breaks equal indexer scores on ASCENDING block index instead of
-delegating to a bare ``torch.topk``. ``torch.topk``'s tie choice depends
-on the tensor's size: the full path scores ``n_blocks_full = T_padded //
-m`` entries (including ``-inf``-masked future blocks) while the
-incremental path scores only the ``n_blocks_inc`` completed blocks, so
-with tied ReLU scores (e.g. dot products saturating at 0) the two paths
-used to be able to pick DIFFERENT equal-valued blocks and diverge. With
-the canonical selector the selected SET is a pure function of the score
-vector, so prefill and incremental decode agree index-for-index even
-under ties; ``run_correctness.py`` pins this with
+delegating to a bare ``torch.topk`` (whose tie choice depends on the
+tensor's size). The full path scores ``n_blocks_full = T_padded // m``
+entries (including ``-inf``-masked future blocks) while the incremental
+path scores only the ``n_blocks_inc`` completed blocks, so with tied
+ReLU scores (e.g. dot products saturating at 0) only a canonical
+selector keeps the two paths on the same equal-valued blocks: the
+selected SET is a pure function of the score vector, so prefill and
+incremental decode agree index-for-index even under ties.
+``run_correctness.py`` pins this with
 ``test_csa_indexer_canonical_tiebreak`` and
 ``test_csa_decoding_cache_sparse_topk_ties``.
 
@@ -924,9 +924,8 @@ class CSADecodingCache:
             if self._sw is not None:
                 # The SW key normalize/rotate path runs in the cache's
                 # compute dtype (fp64 for float64 caches) so a float64 cache
-                # stays faithful to the float64 full-sequence path; for
-                # float32 caches this is the same ``torch.float`` it always
-                # was. (An unconditional fp32 round-trip here would silently
+                # stays faithful to the float64 full-sequence path. (An
+                # unconditional fp32 round-trip here would silently
                 # quantize float64 SW entries to fp32 precision.)
                 compute_dtype = (
                     torch.float64 if self.dtype == torch.float64 else torch.float)
@@ -1046,7 +1045,7 @@ class CSADecodingCache:
         if self._sw is not None:
             # Compute dtype, not storage dtype: a float64 cache must not be
             # silently rounded through fp32 (see the matching note in
-            # ``append_step``); fp32 caches are unchanged.
+            # ``append_step``).
             compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
             if self._normalize_qk:
                 ca_store = _qk_normalize(
@@ -1334,9 +1333,7 @@ class CSADecodingCache:
             #
             # ``_qk_normalize`` is a per-row map, so normalizing only the
             # ``topk`` gathered rows (below) is bit-identical to
-            # normalizing all ``n_blocks`` rows first and gathering after;
-            # it keeps the per-step cost independent of the context length
-            # instead of rescanning the whole compressed cache.
+            # normalizing all ``n_blocks`` rows first and gathering after.
             C_comp_valid = _to_dtype(
                 self._C_comp[:, :self._n_blocks], compute_dtype)
             K_IComp_valid = _to_dtype(
@@ -1444,8 +1441,8 @@ class CSADecodingCache:
             # ``append_step`` overwrites the buffer in place, which would
             # invalidate that saved view (backward would raise "modified by
             # an inplace operation"). Materialize a stable copy so one
-            # backward pass can span several decode steps; values are
-            # unchanged. The copy is needed whenever grad is enabled: the
+            # backward pass can span several decode steps.
+            # The copy is needed whenever grad is enabled: the
             # ``sw_out`` einsum saves the view for the gradient w.r.t. the
             # softmax weights ``p_w``, which can require grad even when
             # neither ``q_compute`` nor the buffer entries do (e.g. a
@@ -1782,8 +1779,7 @@ class HCADecodingCache:
                 # compute dtype (fp64 for float64 caches), matching the
                 # compressed-entry path and the full-sequence naive_hca;
                 # an unconditional fp32 round-trip would silently quantize
-                # float64 SW entries to fp32 precision. For float32 caches
-                # this is the same ``torch.float`` it always was.
+                # float64 SW entries to fp32 precision.
                 compute_dtype = (
                     torch.float64 if self.dtype == torch.float64 else torch.float)
                 if self._normalize_qk:
@@ -1852,7 +1848,7 @@ class HCADecodingCache:
         # ----- sliding-window branch (batched) -----
         if self._sw is not None:
             # Compute dtype, not storage dtype (see the matching note in
-            # ``append_step``); fp32 caches are unchanged.
+            # ``append_step``).
             compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
             if self._normalize_qk:
                 c_store = _qk_normalize(
@@ -2042,8 +2038,8 @@ class HCADecodingCache:
             # ``get()`` returns a live view into the ring buffer, and the
             # einsum's below save it to compute gradients; a later
             # ``append_step`` overwrites the buffer in place and would
-            # invalidate that saved view. Values are unchanged. The copy
-            # is needed whenever grad is enabled: the ``sw_out`` einsum
+            # invalidate that saved view. The copy is needed whenever grad
+            # is enabled: the ``sw_out`` einsum
             # saves the view for the gradient w.r.t. the softmax weights
             # ``p_w``, which can require grad even when neither
             # ``q_compute`` nor the buffer entries do (e.g. a learnable

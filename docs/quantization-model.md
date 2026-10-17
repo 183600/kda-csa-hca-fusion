@@ -166,7 +166,7 @@ perplexity, and can QAT buy it back?** Two complementary parts:
   `[0, 1]` and aggregated mean/min over seeds; inference scoring always
   re-quantizes with `ste=False` on the same spec.
 
-`kv_quant.fake_quantize_` (new) is the in-place inference-only variant of
+`kv_quant.fake_quantize_` is the in-place inference-only variant of
 the codec: it mutates the state buffer without cloning, preserves dtype,
 is idempotent, and **refuses tensors that require grad** so it can never
 silently detach a training graph. The autograd contract of the STE path

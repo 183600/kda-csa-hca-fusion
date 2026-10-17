@@ -3180,7 +3180,7 @@ def main():
     # historical table stays reproducible with MQAR_TASKS=mqar +
     # MQAR_OPS=softmax,kda,csa,hca.
     task_list = _parse_task_list('MQAR_TASKS', 'mqar')
-    # Default ops now include the baseline ladder (linear, softmax) followed
+    # Default ops include the baseline ladder (linear, softmax) followed
     # by the complex mixers; see _parse_op_list. The historical table is
     # reproducible with MQAR_OPS=softmax,kda,mamba2,rwkv7,csa,hca.
     ops_list = _parse_op_list('MQAR_OPS')
@@ -3887,9 +3887,9 @@ def main():
     #   2. beats_tuned_baseline            -> it beats a tuned simple model;
     #   3. pairwise_significant_wins       -> it beats a SPECIFIC complex
     #      operator on the same seeds, robust to multiplicity.
-    # The old CI-overlap check below is demoted to a heuristic companion:
-    # overlapping CIs do not imply "no difference", so only the paired
-    # tests here support an A-vs-B claim.
+    # The CI-overlap check below is a heuristic companion: overlapping
+    # CIs do not imply "no difference", so only the paired tests here
+    # support an A-vs-B claim.
     # ------------------------------------------------------------------
     op_pairwise = _pairwise_op_comparisons(
         all_results,

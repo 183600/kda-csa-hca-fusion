@@ -7,11 +7,11 @@ its tie choice depends on the tensor's SIZE: ``torch.zeros(3)`` and
 ``torch.zeros(4)`` (one larger entry) pick different runner-up positions.
 CSA's batched prefill scores ``n_blocks_full`` entries (including
 ``-inf``-masked future blocks) while the incremental decode path scores
-only the completed ``n_blocks_inc`` ones, so with tied ReLU scores the
-two paths used to select DIFFERENT equal-valued blocks and the
-incremental output stopped matching the full-prefill output.
+only the completed ``n_blocks_inc`` ones, so tied ReLU scores require a
+size-independent selection rule for the incremental output to match the
+full-prefill output.
 
-``ops_csa._canonical_topk_indices`` now resolves ties on ascending block
+``ops_csa._canonical_topk_indices`` resolves ties on ascending block
 index (a pure function of the score vector). These tests pin:
 
 * the canonical tie rule (smallest indices win) and the ``-inf -> -1``
@@ -121,8 +121,7 @@ def test_canonical_topk_tie_rule_and_size_independence():
 def test_indexer_selection_agrees_full_vs_prefix_under_ties():
     """Masked full score tensor and its valid prefix select identically.
 
-    Two configurations whose tie resolution provably differed under a
-    bare ``torch.topk`` (verified while developing the fix):
+    Two tie-heavy configurations:
     (n_blocks=6, n_valid=4, topk=2) — scores ``[1,0,0,0]`` pick the
     runner-up from a 3-way zero tie; and (6, 5, 3) — scores
     ``[1,0,0,0,2]`` add a second tie slot. The canonical selector must
@@ -162,9 +161,9 @@ def test_csa_decoding_cache_sparse_topk_ties(device='cpu'):
 
     The indexer weights (``W_IUQ``, ``W_w``) are zeroed so every valid
     block has the identical score 0 (maximal ties), and
-    ``topk=2 < n_blocks=4`` forces a genuinely sparse selection. Before
-    the canonical tie-break the full and incremental paths picked
-    different tied blocks and their outputs diverged.
+    ``topk=2 < n_blocks=4`` forces a genuinely sparse selection; the
+    canonical tie-break is what keeps the full and incremental paths on
+    the same tied blocks.
     """
     torch.manual_seed(42)
     d, c, c_I, m, nh, nIh, dc = 32, 8, 4, 4, 2, 1, 8

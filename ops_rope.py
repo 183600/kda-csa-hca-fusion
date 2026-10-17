@@ -108,8 +108,8 @@ def _inv_freq(rope_dim: int, base: float, device, dtype: torch.dtype) -> torch.T
 # The decode path calls ``partial_rope`` several times per token with the
 # same one-element position vector (query + sliding-window key), and the
 # full-sequence paths re-rotate several tensors at the same positions; the
-# tables are pure functions of the key, so reusing them is bit-identical.
-# The entries are treated as immutable (only ``view``/read by consumers).
+# tables are pure functions of the key. The entries are treated as
+# immutable (only ``view``/read by consumers).
 _TABLE_CACHE: dict = {}
 _TABLE_CACHE_MAX_ENTRIES = 128
 _TABLE_CACHE_MAX_ELEMS = 1 << 21
@@ -120,10 +120,7 @@ _INT_POS_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
 
 # Element floor for materializing the broadcast ``(cos, sin)`` tables in
 # ``partial_rope`` (see :func:`_materialize_pair_table`). Below this size the
-# table is passed as a stride-0 broadcast view: the elementwise kernels fall
-# onto a scalar path, but at these sizes the saved kernel launches dominate
-# and the view is faster (measured crossover at the repo's [..., nh, c]
-# / [..., c] geometries: ~1e3 elements with the default table width).
+# table is passed as a stride-0 broadcast view.
 _ROPE_MATERIALIZE_MIN_ELEMS = 1024
 
 
@@ -138,14 +135,11 @@ def _materialize_pair_table(
     along ``dim``, ``r/2`` last. Broadcasting the per-position table across
     an inner axis (the head axis of ``[B, T, nh, c]`` queries / outputs) adds
     a stride-0 axis directly above the feature axis, which drops the
-    elementwise kernels onto a non-vectorized scalar loop (~10x slower per
-    element than contiguous operands at the benchmark sizes). The inner
-    broadcast axes are therefore materialized with ``cat``, which copies each
-    contiguous source row at full speed. A leading stride-0 axis (batch) is
-    left broadcast: it collapses into the outer loop there and stays on the
-    vectorized path. The elementwise values are unchanged either way (the
-    products and sums see the same per-position values, just through a dense
-    layout).
+    elementwise kernels onto a non-vectorized scalar loop. The inner
+    broadcast axes are therefore materialized with ``cat``. A leading
+    stride-0 axis (batch) is left broadcast: it collapses into the outer
+    loop there and stays on the vectorized path. Both layouts present the
+    same per-position values to the products and sums.
     """
     view_shape = [1] * len(target_shape)
     view_shape[dim] = tbl.shape[0]
@@ -280,10 +274,10 @@ def partial_rope(
     x2 = x_rot[..., 1::2]                                    # [..., P, r/2]
     if x1.numel() >= _ROPE_MATERIALIZE_MIN_ELEMS:
         # Broadcast-heavy path (per-head q / out rotations, and every long
-        # sequence): dense tables + contiguous pair copies keep the
-        # elementwise kernels vectorized (identical per-element math, see
-        # :func:`_materialize_pair_table`). ``o1`` / ``o2`` are plain
-        # expressions, so this path is valid with and without autograd.
+        # sequence): dense tables + contiguous pair copies (identical
+        # per-element math, see :func:`_materialize_pair_table`). ``o1`` /
+        # ``o2`` are plain expressions, so this path is valid with and
+        # without autograd.
         cos = _materialize_pair_table(cos, x1.shape, dim)
         sin = _materialize_pair_table(sin, x1.shape, dim)
         x1 = x1.contiguous()

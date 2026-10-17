@@ -334,8 +334,8 @@ def _expand_heads(x: torch.Tensor, heads_per_group: int) -> torch.Tensor:
 
     Heads map to groups in contiguous blocks (head ``h`` -> group
     ``h // heads_per_group``), which is exactly a reshape of the
-    ``(ngroups, heads_per_group)`` pair, so one reshape copy (or a plain
-    view when the GVA factor is 1) replaces the generic repeat machinery.
+    ``(ngroups, heads_per_group)`` pair (or a plain view when the GVA
+    factor is 1).
     """
     if heads_per_group == 1:
         return x
@@ -422,7 +422,7 @@ def naive_mamba2_scan(
     _bh = batch * nheads
     if heads_per_group == 1:
         # No head expansion to do: the group C/B tensors ARE the per-head
-        # ones, so the flat layout below is a single permute-copy.
+        # ones.
         B_h_flat = (B_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
         C_h_flat = (C_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
     else:
@@ -439,10 +439,9 @@ def naive_mamba2_scan(
     S_flat = S.reshape(_bh, headdim, d_state)
 
     # Slab the precomputed factors for long sequences; the recurrent state
-    # carries across slabs unchanged, so the values do not depend on the
-    # slab size. Only the outer product is held at slab size (the
-    # ``dt``-scaled form reuses its storage), so the whole element budget
-    # applies to it.
+    # carries across slabs, so the values do not depend on the slab size.
+    # Only the outer product is held at slab size, so the whole element
+    # budget applies to it.
     slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
                // max(1, batch * nheads * headdim * d_state))
     loop = _get_scripted_scan_loop()
@@ -452,9 +451,8 @@ def naive_mamba2_scan(
         x_outer = (x_flat[:, lo:hi].unsqueeze(-1)
                    * B_h_flat[:, lo:hi].unsqueeze(-2))       # [bh, slab, D, N]
         dt_slab = dt_flat[:, lo:hi]                          # [bh, slab, 1, 1]
-        # ``dt * x_outer`` computed in place: ``x_outer`` was allocated
-        # just above and has no other readers, so the elementwise product
-        # is bit-identical while one slab-sized temporary is dropped.
+        # ``dt * x_outer`` in place: ``x_outer`` was allocated just above
+        # and has no other readers.
         x_dt = x_outer.mul_(dt_slab)                         # [bh, slab, D, N]
         decay_slab = torch.exp(dt_slab * A_col)              # [bh, slab, 1, 1]
         C_slab = C_h_flat[:, lo:hi].unsqueeze(-2)            # [bh, slab, 1, N]
