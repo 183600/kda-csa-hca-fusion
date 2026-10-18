@@ -465,7 +465,8 @@ def compiled_recurrent_kda(
 # vectorized step. The per-row elementwise/reduction math is unchanged (each
 # ``(c, j)`` entry applies the exact same sub/clamp/exp/multiply/sum chain);
 # only the loop granularity changes, which bounds the transient
-# ``[..., R, c1, K]`` block. The count is selected per outer-size regime.
+# ``[..., R, c1, K]`` block. The count is selected per work/key-width regime
+# by :func:`_attn_block_rows`.
 _ATTN_BLOCK_ROWS_MAX = 8
 
 
@@ -474,25 +475,57 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
 
     The count trades fewer loop iterations (larger ``rows``) against
     keeping the transient ``[..., rows, c1, K]`` block small (smaller
-    ``rows``). The rule keys on
+    ``rows``): the per-iteration temporary is proportional to
+    ``B * HV * NT * rows * BT * K`` elements, so both the total work
+    ``eff = B * HV * NT * BT * K`` and the key width ``K`` (which sets the
+    per-element reduction length) determine which granularity keeps the
+    loop memory-bandwidth friendly. The thresholds below were tuned on
+    the reference CPU harness over a grid of ``(eff, K)`` cells; a wider
+    ``K`` reaches the bandwidth-bound regime at a smaller ``eff``, hence
+    the piecewise bands:
 
-        ``eff = B * HV * NT * BT // 64``
+    * ``K <= 16``: 8 rows up to ``eff <= 65536``, then 4 up to 262144,
+      then 2 up to 1048576, else 1.
+    * ``K <= 32``: 8 rows up to ``eff <= 32768``, then 4 up to 131072,
+      then 2 up to 524288, else 1.
+    * ``K <= 64``: 4 rows up to ``eff <= 65536``, then 2 up to 524288,
+      else 1.
+    * ``K > 64``: 2 rows up to ``eff <= 131072``, else 1.
 
-    with ``eff <= 8`` at the full 8 rows, ``eff <= 64`` at 4, and larger
-    outer sizes falling back to a single row (capped by
-    ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``).
+    The result is capped by ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``.
 
     The per-row elementwise/reduction math is identical for every count
     (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
     loop granularity.
     """
-    eff = max(1, (B * HV * NT * BT) // 64)
-    if eff <= 8:
-        rows = _ATTN_BLOCK_ROWS_MAX
-    elif eff <= 64:
-        rows = 4
+    eff = B * HV * NT * BT * K
+    if K <= 16:
+        if eff <= 65536:
+            rows = 8
+        elif eff <= 262144:
+            rows = 4
+        elif eff <= 1048576:
+            rows = 2
+        else:
+            rows = 1
+    elif K <= 32:
+        if eff <= 32768:
+            rows = 8
+        elif eff <= 131072:
+            rows = 4
+        elif eff <= 524288:
+            rows = 2
+        else:
+            rows = 1
+    elif K <= 64:
+        if eff <= 65536:
+            rows = 4
+        elif eff <= 524288:
+            rows = 2
+        else:
+            rows = 1
     else:
-        rows = 1
+        rows = 2 if eff <= 131072 else 1
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
