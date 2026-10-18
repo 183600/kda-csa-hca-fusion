@@ -269,8 +269,8 @@ def naive_hca(
     p_dense = p[..., :n_blk]
     p_w = p[..., n_blk:]
     # Accumulate the window contribution IN PLACE into the dense einsum
-    # output (same values as ``a + b``, one fewer full ``[B, T, nh, c]``
-    # allocation). See ``naive_csa`` for the gradient-safety note.
+    # output (same values as ``a + b``). See ``naive_csa`` for the
+    # gradient-safety note.
     out = torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
     out.add_(torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
 

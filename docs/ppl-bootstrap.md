@@ -75,7 +75,7 @@ pb.throughput_summary(n_tokens=report['n_tokens'],
 
 ## Where it is used
 
-* `train_lm_autodl.py` — the single sealed-test evaluation now collects
+* `train_lm_autodl.py` — the single sealed-test evaluation collects
   per-unit NLLs in the same pass and reports
   `test_report['ppl_bootstrap']` (CI for the final perplexity) plus
   `test_report['prefill_throughput']` (tokens/s of the evaluation loop).

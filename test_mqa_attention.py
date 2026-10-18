@@ -2,8 +2,8 @@
 
 What is pinned here
 -------------------
-``mqa_attention`` supplies the softmax ladder's KV-sharing rung that the
-repo previously lacked. Its correctness rests on two independent
+``mqa_attention`` supplies the softmax ladder's KV-sharing rung. Its
+correctness rests on two independent
 certificates, and both are tested:
 
 * **grouped execution == expanded MHA.** :meth:`MQAAttn.to_mha` expands

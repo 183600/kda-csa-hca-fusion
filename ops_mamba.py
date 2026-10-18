@@ -230,12 +230,11 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
 
     ``S = decay * S + x`` is evaluated as ``S.mul_(decay).add_(x)``: the
     same products and sums with the same roundings (bit-identical
-    values), but no per-step ``[BH, D, N]`` temporary. The caller must
-    pass a dedicated copy of the state (this function mutates its ``S``
-    argument) and autograd must be disabled — an in-place update of a
-    graph-tracked state would trip the version counter. See
-    :func:`_mamba2_scan_loop_eager` for the (autograd-safe) out-of-place
-    form.
+    values). The caller must pass a dedicated copy of the state (this
+    function mutates its ``S`` argument) and autograd must be disabled —
+    an in-place update of a graph-tracked state would trip the version
+    counter. See :func:`_mamba2_scan_loop_eager` for the (autograd-safe)
+    out-of-place form.
     """
     ys: list[torch.Tensor] = []
     T = x_dt.shape[1]
@@ -487,9 +486,9 @@ def naive_mamba2_scan(
     slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
                // max(1, batch * nheads * headdim * d_state))
     # Autograd-safe out-of-place loop while a graph is being recorded; the
-    # in-place loop (same values, one fewer state-sized temporary per step)
-    # otherwise. The in-place loop mutates its state argument, so it gets a
-    # dedicated copy and the caller's ``initial_state`` stays untouched.
+    # in-place loop (same values) otherwise. The in-place loop mutates its
+    # state argument, so it gets a dedicated copy and the caller's
+    # ``initial_state`` stays untouched.
     use_inplace = not torch.is_grad_enabled()
     loop = None if use_inplace else _get_scripted_scan_loop()
     loop_inplace = _get_scripted_scan_loop_inplace() if use_inplace else None

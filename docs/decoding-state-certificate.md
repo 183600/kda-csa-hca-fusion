@@ -5,13 +5,13 @@ The repository's central efficiency claim is that the memory operators
 recurrent state is a sufficient statistic of the prefix, so the
 per-request footprint does not grow with context. Softmax attention grows
 linearly (KV cache), and CSA/HCA grow with the compressed-block count
-(~`T/m` + fixed window). Until this certificate, that claim lived in the
-analytical accounting (`run_kv_cache.py`, `cache_accounting.py`) and in
-per-op tests — no single Exp 6 artifact MEASURED it across all operators.
+(~`T/m` + fixed window). The claim is backed by the analytical accounting
+(`run_kv_cache.py`, `cache_accounting.py`) and per-op tests; the Exp 6
+certificate additionally MEASURES it across all operators.
 
-## What Exp 6 now records
+## What Exp 6 records
 
-Every `run_decoding.py` row carries three new fields, measured from the
+Every `run_decoding.py` row carries three fields, measured from the
 live tensors **after** the full prefill + decode loop and **outside** the
 timed region (so they cannot perturb the latency numbers):
 
@@ -21,7 +21,7 @@ timed region (so they cannot perturb the latency numbers):
 | `decode_state_allocated_bytes` | Physical storage, including geometric cache slack and the full ring buffer |
 | `decode_state_breakdown` | Per-component `{allocated_bytes, valid_bytes}` |
 
-The run envelope adds `metadata.decode_state_certificate`: per operator,
+The run envelope includes `metadata.decode_state_certificate`: per operator,
 the valid bytes at each `prefill_len`, a `classification`
 (`constant` when identical at every length, else `growing`), and
 `max_over_min` (the observed growth ratio). This turns the claim into a
@@ -49,7 +49,7 @@ The certificate reads one API across the three kinds of decode state:
 
 * `CSADecodingCache.nbytes` / `.nbytes_valid` / `.nbytes_breakdown()`
 * `HCADecodingCache.nbytes` / `.nbytes_valid` / `.nbytes_breakdown()`
-* `Mamba2DecodingState.nbytes` / `.nbytes_breakdown()` (already existed)
+* `Mamba2DecodingState.nbytes` / `.nbytes_breakdown()`
 * per-wrapper `state_nbytes()` on the `run_decoding` model classes
   (`SoftmaxAttnDecoding`, `KDAAttnDecoding`, `Mamba2AttnDecoding`,
   `Rwkv7AttnDecoding`, `CSAAttnDecoding`, `HCAAttnDecoding`,
@@ -82,8 +82,7 @@ model. The allocated capacity follows the same geometric rule
 `results_schema`'s `exp6_decoding` contract additionally rejects
 malformed certificate fields on write (`decode_state_bytes` must be a
 positive int, `decode_state_allocated_bytes >= decode_state_bytes`,
-`decode_state_breakdown` must be an object) — optional for legacy rows so
-older result files stay valid.
+`decode_state_breakdown` must be an object).
 
 ## How to regenerate
 

@@ -249,8 +249,8 @@ def kda_forward(
     exception surface covers API drift (``ValueError`` / ``TypeError`` /
     ``NotImplementedError`` / ``AssertionError``) and runtime kernel
     failures (``RuntimeError``, e.g. a Triton compile/launch failure), but
-    NOT CUDA out-of-memory: an OOM is re-raised instead of silently
-    re-running the workload on the (much slower) reference loop. ``g_clamp_min``
+    NOT CUDA out-of-memory: an OOM is re-raised rather than silently
+    falling back to the reference loop. ``g_clamp_min``
     is applied before both backends so their gate contract matches.
 
     ``recompute_attn`` is a reference-path-only knob (see
@@ -317,9 +317,9 @@ def kda_forward(
                 raise
             # A CUDA out-of-memory error is a RESOURCE failure, not a
             # kernel/API incompatibility: silently re-running the same
-            # workload on the Python reference loop would turn an explicit
-            # OOM into an hours-long hang. Re-raise it so the user sees the
-            # real problem (and can reduce the batch / sequence length).
+            # workload on the Python reference loop would hide it.
+            # Re-raise it so the user sees the real problem (and can
+            # reduce the batch / sequence length).
             if isinstance(exc, RuntimeError) and \
                     'out of memory' in str(exc).lower():
                 raise

@@ -211,11 +211,10 @@ def _recurrent_kda_loop_inplace_eager(q, k_col, v, g_exp_col, beta_k_col, S):
 
     ``S * g_exp`` and ``addcmul(S, beta_k, delta)`` are evaluated as
     ``S.mul_(g_exp)`` and ``S.addcmul_(beta_k, delta)`` — the same
-    products/sums in the same order (bit-identical values) with no
-    ``[B, HV, K, V]`` state-sized temporary per step. The caller must pass
-    a freshly allocated state (this function mutates its ``S`` argument)
-    and autograd must be disabled — an in-place update of a graph-tracked
-    state would trip the version counter.
+    products/sums in the same order (bit-identical values). The caller
+    must pass a freshly allocated state (this function mutates its ``S``
+    argument) and autograd must be disabled — an in-place update of a
+    graph-tracked state would trip the version counter.
     """
     outs = []
     for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
@@ -367,10 +366,9 @@ def naive_recurrent_kda(
     k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
     beta_k_col = (beta[..., None] * k).movedim(1, 2).unsqueeze(-1).contiguous()
     # Autograd-safe out-of-place loop while a graph is being recorded; the
-    # in-place loop (same values, no state-sized temporary per step)
-    # otherwise. ``S`` is always freshly allocated above (``new_zeros`` or
-    # the ``+ initial_state`` sum), so mutating it never touches caller
-    # tensors.
+    # in-place loop (same values) otherwise. ``S`` is always freshly
+    # allocated above (``new_zeros`` or the ``+ initial_state`` sum), so
+    # mutating it never touches caller tensors.
     if not torch.is_grad_enabled():
         loop_i = _get_scripted_recurrent_loop_inplace()
         fn = (loop_i if loop_i is not None
@@ -467,11 +465,7 @@ def compiled_recurrent_kda(
 # vectorized step. The per-row elementwise/reduction math is unchanged (each
 # ``(c, j)`` entry applies the exact same sub/clamp/exp/multiply/sum chain);
 # only the loop granularity changes, which bounds the transient
-# ``[..., R, c1, K]`` block and avoids one tiny-kernel launch per row. The
-# best row count depends on the per-op thread-split behaviour of the
-# elementwise kernels on the CPU backend and is *not* monotone in the block
-# size, so the count is selected per outer-size regime and the flat
-# fallbacks stay conservative.
+# ``[..., R, c1, K]`` block. The count is selected per outer-size regime.
 _ATTN_BLOCK_ROWS_MAX = 8
 
 

@@ -453,10 +453,10 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
         return scores.new_zeros(*scores.shape[:-1], 0, dtype=torch.long)
     # Fast path where one stable descending sort IS the canonical rule: the
     # sort emits entries score-descending, ties ascending-index, and masking
-    # ``-inf`` selections to ``-1`` matches the contract. It is cheaper than
-    # the topk + nonzero + gather pipeline for the per-step decode shape
-    # (a single score row per batch element) and for dense selections
-    # (``s >= n/2``); elsewhere the O(n) boundary path below wins.
+    # ``-inf`` selections to ``-1`` matches the contract. It is used for the
+    # per-step decode shape (a single score row per batch element) and for
+    # dense selections (``s >= n/2``); otherwise the O(n) boundary path
+    # below applies.
     if (scores.dim() >= 2 and scores.shape[-2] == 1) or 2 * s >= n:
         order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :s]
         values = scores.gather(-1, order)
@@ -1291,11 +1291,11 @@ def naive_csa(
         # indices: [B, T, topk], padded with -1 for invalid slots.
         valid_mask = indices >= 0                                        # [B, T, topk]
         idx_safe = indices.clamp(min=0)                                  # [B, T, topk]
-        # Row gather via a flattened ``index_select``: ~8x faster than
-        # ``C_comp_n[batch_idx, idx_safe]`` advanced indexing on CPU and
-        # value-identical (each output element is a copy of the same
-        # source element; the selector picks DISTINCT blocks per row, so
-        # the backward scatter/accumulation is unaffected).
+        # Row gather via a flattened ``index_select`` (equivalent to
+        # ``C_comp_n[batch_idx, idx_safe]`` advanced indexing: each output
+        # element is a copy of the same source element; the selector picks
+        # DISTINCT blocks per row, so the backward scatter/accumulation is
+        # unaffected).
         nblk = C_comp_n.shape[1]
         flat_idx = (
             idx_safe + torch.arange(B_, device=device).view(B_, 1, 1) * nblk
@@ -1508,10 +1508,9 @@ def naive_csa(
         p_b = p[..., :topk_size]
         p_w = p[..., topk_size:]
         # Accumulate the window contribution IN PLACE into the sparse
-        # einsum output: same values as ``a + b`` but one fewer full
-        # ``[B, T, nh, c]`` allocation. The sparse output is not saved by
-        # any autograd node (the add's backward needs neither operand), so
-        # the in-place add is gradient-safe.
+        # einsum output (same values as ``a + b``). The sparse output is
+        # not saved by any autograd node (the add's backward needs neither
+        # operand), so the in-place add is gradient-safe.
         out = torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
         out.add_(torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows))
 

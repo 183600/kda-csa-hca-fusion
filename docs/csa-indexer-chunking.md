@@ -8,7 +8,7 @@ Sparse Attention without changing a single selection.*
 CSA first compresses every `m` tokens into one KV entry and then runs the
 lightning indexer (DeepSeek-V4 §2.3.1, Eq. 13–17) to choose the top-`k`
 compressed blocks per query. The indexer is cheap in FLOPs (`O(T · n_blocks ·
-nIh · c_I)` with `n_blocks = T/m`) but the reference implementation scored the
+nIh · c_I)` with `n_blocks = T/m`) but the untiled formulation scores the
 whole sequence at once, materializing a per-head similarity tensor of shape
 
 ```
@@ -26,13 +26,11 @@ parallel and tiling it changes memory, not math.
 
 ## The design
 
-`ops_csa.csa_lightning_indexer` gained a keyword-only `query_chunk: int`
-parameter (default `0` = disabled, i.e. the historical full-sequence score
-tensor):
+`ops_csa.csa_lightning_indexer` accepts a keyword-only `query_chunk: int`
+parameter (default `0` = disabled, i.e. the full-sequence score tensor):
 
 * `query_chunk = 0` or `query_chunk >= T`: one call to the shared
-  `_lightning_indexer_chunk` helper over the full sequence (the historical
-  code path, now shared);
+  `_lightning_indexer_chunk` helper over the full sequence;
 * `0 < query_chunk < T`: the query axis is cut into tiles of at most
   `query_chunk` rows; each tile computes its own scores → logits → causal
   mask → canonical top-`k` → NaN-safe softmax, and the per-tile results are
@@ -66,7 +64,7 @@ The tie-break deserves the emphasis: the indexer's deterministic rule
 (equal scores → ascending block index, see `test_csa_tiebreak.py`) is a pure
 function of each query's score *row*, so it cannot depend on how many rows
 were scored together. That is exactly why the incremental-decoding path
-already agrees with batched prefill, and the same argument makes tiling
+agrees with batched prefill, and the same argument makes tiling
 transparent.
 
 The only differences the tests can observe are fp round-off from batched-GEMM

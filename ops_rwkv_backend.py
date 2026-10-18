@@ -87,12 +87,8 @@ def _load_fla_rwkv7():
     package. A failed attempt ALWAYS stores an actionable
     ``ImportError`` in ``_FLA_IMPORT_ERROR`` before re-raising —
     including non-``ImportError`` failures such as a Triton version
-    mismatch raising ``RuntimeError`` at import time. Previously the
-    error was only cached for ``ImportError``: a broken install then
-    left ``_FLA_PROBED=True`` with ``_FLA_IMPORT_ERROR=None`` and the
-    kernel callables ``None``, so the SECOND probe took the success
-    branch, reported ``True``, and dispatch crashed on
-    ``NoneType(...)``. The failure is now a definite, cached answer.
+    mismatch raising ``RuntimeError`` at import time — so a broken
+    install is a definite, repeatable "not available".
     """
     global _FLA_CHUNK_FN, _FLA_RECURRENT_FN, _FLA_IMPORT_ERROR, _FLA_PROBED
     if _FLA_PROBED:
@@ -233,8 +229,8 @@ def rwkv7_forward(
     surface mirrors ``ops_kda_backend.kda_forward``: ``ImportError`` /
     ``ValueError`` / ``TypeError`` / ``NotImplementedError`` /
     ``AssertionError`` / ``RuntimeError``, but NOT CUDA out-of-memory
-    (re-raised: a resource failure must stay loud instead of becoming
-    an hours-long reference-loop run).
+    (re-raised: a resource failure must stay loud instead of silently
+    re-running the reference scan).
     """
     backend = validate_rwkv_backend(backend)
     if backend == 'reference':
@@ -262,7 +258,7 @@ def rwkv7_forward(
             # — the same exception surface ops_kda_backend uses. CUDA
             # out-of-memory does NOT: it is a resource failure, and
             # silently re-running the workload on the Python reference
-            # loop would turn an explicit OOM into an hours-long hang.
+            # loop would hide it.
             if isinstance(exc, RuntimeError) and \
                     'out of memory' in str(exc).lower():
                 raise

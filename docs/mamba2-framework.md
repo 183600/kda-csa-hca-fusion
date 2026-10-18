@@ -322,7 +322,7 @@ operator sees identical batches per seed):
 compatibility; `'all'` or a comma list enables the probes). MQAR rows
 keep `results/exp4_mqar.json`; the other tasks write
 `results/exp4b_quality_tasks.json`. `MQAR_OPS` selects operators
-(default now includes `mamba2`).
+(default includes `mamba2`).
 **Language-model NLL stays the decisive quality metric** — the synthetic
 probes are screening instruments, and length extrapolation (train
 length ≠ test length) is reported separately per the design.
@@ -364,7 +364,7 @@ Latency (`run_benchmark.py`) / decode (`run_decoding.py`) / cache
 `mamba2_layer` mirrors the csa/hca single-layer boundary;
 `hybrid_mamba2` mirrors the hybrid stack boundary with identical CSA/HCA
 geometry. `kv_cache_breakdown` splits every row into recurrent / conv /
-compressed / window / indexer / partial buckets, and the two new figures
+compressed / window / indexer / partial buckets, and the two figures
 (`quality_vs_latency.png`, `quality_vs_cache.png`) draw the frontier.
 
 ## 7. Run tiers and decision rules

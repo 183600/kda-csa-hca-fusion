@@ -413,8 +413,7 @@ class OfficialMamba2Mixer(nn.Module):
                      torch.zeros(B, self.conv_dim, self.d_conv,
                                  device=x.device, dtype=x.dtype))
         if state is not None and state.shape[0] == B:
-            # ``to(copy=True)`` = cast-if-needed plus unconditional copy,
-            # the same contents as ``clone().to()`` with one temporary less.
+            # ``to(copy=True)`` = cast-if-needed plus unconditional copy.
             ssm_seed = state.to(compute_dtype, copy=True)
         else:
             ssm_seed = torch.zeros(

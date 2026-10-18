@@ -1,13 +1,9 @@
-"""Regression tests for the round-2 improvements: trustworthy backend
-resolution for (retrieval-recall) experiments.
+"""Regression tests: trustworthy backend resolution for
+(retrieval-recall) experiments.
 
 1. ``ops_rwkv_backend`` — the availability probe must never raise, and a
    BROKEN ``fla.ops.rwkv7`` install must never be cached as "available".
-   The pre-fix loader only cached ``ImportError``; a Triton-mismatch
-   ``RuntimeError`` on the first probe left ``_FLA_PROBED=True`` with
-   ``_FLA_IMPORT_ERROR=None`` and ``None`` kernel callables, so the SECOND
-   probe reported ``True`` and dispatch crashed on ``NoneType(...)``.
-   These tests pin the poisoned-state regression (probe 1 and probe 2 both
+   These tests pin the probe-state contract (probe 1 and probe 2 both
    ``False``), the actionable explicit-``'fla'`` error, the broadened
    'auto' fallback surface (TypeError -> warning + reference; CUDA OOM ->
    re-raise), and the adapter's kernel-call contract (``a=-kk`` /
@@ -189,15 +185,15 @@ def _fake_mamba_ssm(mamba2_cls, inference_params_cls):
 def test_rwkv_broken_install_probe_never_raises_or_poisons():
     """A broken fla install reads as unavailable on EVERY probe.
 
-    Regression for the poisoned-cache bug: the pre-fix second probe
-    reported True with None kernel callables.
+    Pins probe-state consistency: probe 2 must not report True with
+    None kernel callables.
     """
     with _reset_rwkv_cache() as rb, _injected_modules(
             _broken_fla_ops_rwkv7()):
         first_raised = None
         try:
             available_1 = rb.rwkv7_fla_available()
-        except Exception as exc:  # pragma: no cover - the bug itself
+        except Exception as exc:  # pragma: no cover - defensive
             first_raised = exc
             available_1 = None
         _ok('broken-install probe 1 returns False without raising',
@@ -205,7 +201,7 @@ def test_rwkv_broken_install_probe_never_raises_or_poisons():
             f'raised={first_raised!r}, available={available_1!r}')
 
         available_2 = rb.rwkv7_fla_available()
-        _ok('broken-install probe 2 still returns False (no poisoned cache)',
+        _ok('broken-install probe 2 still returns False (no stale success)',
             available_2 is False, f'available={available_2!r}')
         _ok('failed load cached an actionable error, never None callables',
             rb._FLA_IMPORT_ERROR is not None

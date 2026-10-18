@@ -1382,9 +1382,9 @@ class CSADecodingCache:
             else:
                 valid_mask = indices >= 0                              # [B, 1, topk]
                 idx_safe = indices.clamp(min=0)                        # [B, 1, topk]
-                # Flat ``index_select`` row gather (same trick as
-                # ``naive_csa``): faster than advanced indexing on CPU and
-                # value-identical (distinct blocks per row).
+                # Flat ``index_select`` row gather (same as ``naive_csa``);
+                # value-identical to advanced indexing (distinct blocks
+                # per row).
                 nblk = C_comp_valid.shape[1]
                 flat_idx = (
                     idx_safe

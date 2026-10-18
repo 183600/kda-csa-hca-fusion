@@ -1,4 +1,4 @@
-"""Regression tests for the round-1 improvements:
+"""Regression tests for the indexer chunking and FLA-adapter paths:
 
 1. ``ops_csa`` — query-axis chunking of the lightning indexer
    (``query_chunk`` / ``naive_csa(indexer_chunk=...)``). The tiled path

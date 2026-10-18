@@ -269,10 +269,9 @@ def _rwkv7_scan_loop_inplace_eager(r, w_exp, k, v, kk, kka, state):
 
     The state update is evaluated as ``state.mul_(w).add_(kka*contract)
     .add_(k*v)`` — the same products/sums in the same association order
-    as the out-of-place expression (bit-identical values) with two fewer
-    ``[B, H, K, V]`` temporaries per step. The caller must pass a
-    dedicated copy of the state (this function mutates its ``state``
-    argument) and autograd must be disabled.
+    as the out-of-place expression (bit-identical values). The caller
+    must pass a dedicated copy of the state (this function mutates its
+    ``state`` argument) and autograd must be disabled.
     """
     outs = []
     for r_t, w_t, k_t, v_t, kk_t, kka_t in zip(
@@ -433,9 +432,9 @@ def rwkv7_reference_scan(
         o = v.new_zeros(B, 0, H, V)
         return o.to(out_dtype), state if output_final_state else None
     # Autograd-safe out-of-place loop while a graph is being recorded; the
-    # in-place loop (same values, fewer state-sized temporaries per step)
-    # otherwise. The in-place loop mutates its state argument, so it gets a
-    # dedicated copy and the caller's ``initial_state`` stays untouched.
+    # in-place loop (same values) otherwise. The in-place loop mutates its
+    # state argument, so it gets a dedicated copy and the caller's
+    # ``initial_state`` stays untouched.
     if not torch.is_grad_enabled():
         loop_i = _get_scripted_rwkv7_scan_loop_inplace()
         fn = (loop_i if loop_i is not None
