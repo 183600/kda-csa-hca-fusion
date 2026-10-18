@@ -63,6 +63,14 @@ Block-size x interleaving sweep
     the point is the *structure* of the recall-reachability trade-off and
     its regression pinning, not a state-of-the-art number.
 
+    Statistical design: every (m, m2, layout) cell trains the SAME seed
+    list (default 3 seeds: 42, 43, 44; ``RECALL_SEEDS`` overrides the
+    count), so cells are seed-paired and each row reports mean +/- sample
+    std and the 95% t-CI of end-task accuracy and indexer union recall.
+    Single- or two-seed runs are flagged as exploratory in the report
+    metadata: with fewer than 3 seeds, cell-to-cell differences must not
+    be read as effects.
+
 Output
 ------
 ``results/exp9_recall_reach.json`` (strict JSON) via the CLI::
@@ -70,6 +78,7 @@ Output
     python3 recall_reach.py --json results/exp9_recall_reach.json
     python3 recall_reach.py --quick --json /tmp/recall.json
     python3 recall_reach.py --no-train --json /tmp/structural.json
+    RECALL_SEEDS=5 python3 recall_reach.py --seeds 42,43,44,45,46
 
 Tests: ``python3 test_recall_reach.py``.
 """
@@ -759,22 +768,29 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
     return out
 
 
-def _mean_ci95(values: list[float]) -> tuple[float | None, float | None]:
+def _mean_std_ci95(values: list[float]
+                   ) -> tuple[float | None, float | None, float | None]:
+    """Sample mean, sample std (ddof=1) and 95% t-CI half-width.
+
+    ``(None, None, None)`` for an empty list; std/CI are ``None`` with a
+    single observation (a sample std of one point is undefined, not 0).
+    """
     n = len(values)
     if n == 0:
-        return None, None
+        return None, None, None
     mean = sum(values) / n
     if n == 1:
-        return mean, None
+        return mean, None, None
     var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    se = math.sqrt(var / n)
+    std = math.sqrt(var)
+    se = std / math.sqrt(n)
     t = _t_crit_975(n)
     ci = (se * t) if t is not None else None
-    return mean, ci
+    return mean, std, ci
 
 
 def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
-                      steps: int = 80, seeds=(42,), seq_len: int = SEQ_LEN,
+                      steps: int = 80, seeds=(42, 43, 44), seq_len: int = SEQ_LEN,
                       d_model: int = D_MODEL, train_batch: int = 16,
                       eval_batches: int = 4, eval_batch: int = 64,
                       device='cpu', train: bool = True,
@@ -787,6 +803,13 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
     first eval batch, the analytic structural summary, and the
     compressed-entry budget. Returns a strict-JSON dict with one row per
     cell plus the design metadata.
+
+    Statistical design: all cells share the SAME ``seeds`` list, so cells
+    are seed-paired; each row reports ``accuracy_mean`` /
+    ``accuracy_std`` / ``accuracy_ci95`` and the indexer union-recall
+    mean/std over the seeds, with the per-seed records retained. The
+    default is 3 seeds; a shorter seed list is recorded as exploratory in
+    ``design['statistical_design']['warning']``.
     """
     if layouts is None:
         layouts = list(LAYOUT_PRESETS)
@@ -852,13 +875,20 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                     })
                 accs = [s['accuracy'] for s in row['per_seed']
                         if s['accuracy'] is not None]
-                mean, ci = _mean_ci95(accs)
+                mean, std, ci = _mean_std_ci95(accs)
                 row['accuracy_mean'] = mean
+                row['accuracy_std'] = std
                 row['accuracy_ci95'] = ci
+                row['accuracy_n_seeds'] = len(accs)
                 union = [s['indexer_union_recall'] for s in row['per_seed']
                          if s['indexer_union_recall'] is not None]
-                row['indexer_union_recall_mean'] = (
-                    sum(union) / len(union) if union else None)
+                union_mean, union_std, union_ci = _mean_std_ci95(union)
+                row['indexer_union_recall_mean'] = union_mean
+                row['indexer_union_recall_std'] = union_std
+                row['indexer_union_recall_ci95'] = union_ci
+                hca = [s['hca_resolved_fraction'] for s in row['per_seed']
+                       if s['hca_resolved_fraction'] is not None]
+                row['hca_resolved_fraction_mean'] = _mean_std_ci95(hca)[0]
             rows.append(row)
 
     return {
@@ -871,6 +901,24 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
             'd_model': int(d_model),
             'steps': int(steps) if train else 0,
             'seeds': [int(s) for s in seeds],
+            'n_seeds': len(seeds),
+            'statistical_design': {
+                'seeds_per_cell': len(seeds),
+                'minimum_seeds_for_claims': 3,
+                'shared_seed_list': True,
+                'seed_policy': ('every (m, m2, layout) cell trains the SAME '
+                                'seed list, so cells are seed-paired and '
+                                'cell differences can be compared pairwise'),
+                'reported_statistics': ('per-cell mean, sample std (ddof=1) '
+                                        'and 95% t-CI of accuracy / indexer '
+                                        'union recall over the seeds; '
+                                        'per-seed records are retained'),
+                'warning': (
+                    f'only {len(seeds)} seed(s) in a trained run: results '
+                    f'are exploratory; do not read cell-to-cell differences '
+                    f'as effects at this seed budget'
+                    if train and len(seeds) < 3 else None),
+            },
             'pairs': [[int(a), int(b)] for a, b in pairs],
             'layouts': [name for name, _ in layouts],
             'csa_topk': (int(csa_topk) if csa_topk is not None
@@ -902,21 +950,34 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
 # ===========================================================================
 
 def _print_table(report: dict) -> None:
-    print(f"{'group':>34} | {'cost':>5} | {'acc':>7} | "
-          f"{'struct':>7} | {'idx-union':>9} | layer recalls")
+    print(f"{'group':>34} | {'cost':>5} | {'acc mean±std':>12} | "
+          f"{'struct':>7} | {'idx-union mean±std':>17} | layer recalls")
     for r in report['rows']:
         acc = r.get('accuracy_mean')
-        acc_s = f'{acc:.3f}' if acc is not None else '  n/a'
+        acc_std = r.get('accuracy_std')
+        if acc is None:
+            acc_s = 'n/a'
+        elif acc_std is None:
+            acc_s = f'{acc:.3f}'
+        else:
+            acc_s = f'{acc:.3f}±{acc_std:.3f}'
         iu = r.get('indexer_union_recall_mean')
-        iu_s = f'{iu:.3f}' if iu is not None else '  n/a'
+        iu_std = r.get('indexer_union_recall_std')
+        if iu is None:
+            iu_s = 'n/a'
+        elif iu_std is None:
+            iu_s = f'{iu:.3f}'
+        else:
+            iu_s = f'{iu:.3f}±{iu_std:.3f}'
         recalls = [s.get('indexer_recall_per_layer') for s in r['per_seed']]
         rec_s = ('n/a' if not recalls
                  else '/'.join('n/a' if v is None else f'{v:.2f}'
                                for v in recalls[0]))
         print(f"{r['group']:>34} | "
-              f"{r['compressed_entries_per_token']:>5.3f} | {acc_s} | "
-              f"{r['structural']['any_exact_fraction']:>7.3f} | {iu_s} | "
-              f"{rec_s}")
+              f"{r['compressed_entries_per_token']:>5.3f} | "
+              f"{acc_s:>12} | "
+              f"{r['structural']['any_exact_fraction']:>7.3f} | "
+              f"{iu_s:>17} | {rec_s}")
 
 
 def main(argv=None) -> int:
@@ -932,7 +993,9 @@ def main(argv=None) -> int:
                         help='small grid (2 pairs x 2 layouts, short run)')
     parser.add_argument('--steps', type=int, default=None)
     parser.add_argument('--seeds', default=None,
-                        help='comma-separated seeds (default: 42)')
+                        help='comma-separated seeds (default: RECALL_SEEDS '
+                             'count, 3 -> 42,43,44; >=3 seeds per cell is '
+                             'the policy, fewer is flagged exploratory)')
     parser.add_argument('--seq-len', type=int, default=SEQ_LEN)
     parser.add_argument('--d-model', type=int, default=D_MODEL)
     parser.add_argument('--train-batch', type=int, default=16)
@@ -951,7 +1014,12 @@ def main(argv=None) -> int:
         if not seeds:
             raise SystemExit('--seeds must contain at least one integer.')
     else:
-        seeds = (42,)
+        n_seeds = parse_int_env('RECALL_SEEDS', 3, min_value=1, logger=logger)
+        seeds = tuple(42 + i for i in range(n_seeds))
+    if not args.no_train and len(seeds) < 3:
+        logger.warning(
+            'only %d seed(s) requested: per-cell differences are '
+            'exploratory at this seed budget (policy: >= 3)', len(seeds))
 
     if args.quick:
         pairs = ((4, 8), (8, 4))

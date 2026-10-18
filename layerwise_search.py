@@ -53,6 +53,22 @@ is retained in the result (not just the accepted path), which makes the
 quality-vs-cost **Pareto frontier** of the explored neighborhood available
 for analysis even when the search rejects a move.
 
+Statistical design
+------------------
+Every candidate is evaluated on the SAME seed list (default 3 seeds: 42,
+43, 44; ``SEARCH_SEEDS`` overrides the count), so candidate-vs-candidate
+differences are seed-paired. The objective reports mean +/- sample std /
+95% CI, and the greedy acceptance rule additionally requires an
+improvement to be *reproducible across seeds*: when both records carry
+per-seed accuracies, a move is accepted only if the seed-paired one-sided
+t-test on the differences clears alpha=0.05 (a unanimous zero-variance
+sweep needs ``n >= 6`` for the exact sign-flip bound to clear it). The
+raw score rule stays as ``improvement`` in each round record; the final
+``best_vs_start`` block reports the paired test of the recommended
+candidate against the start. With a single seed the paired test is
+undefined and the search falls back to the raw rule — the report flags
+that as exploratory.
+
 Honesty / scope
 ---------------
 * The probe model is the frozen ``run_quality.SMALL_MODEL_SPEC`` geometry
@@ -504,11 +520,62 @@ def pareto_frontier(records: Iterable[dict], *,
     return frontier
 
 
+def _paired_seed_diffs(rec_a: dict, rec_b: dict):
+    """Common-seed paired accuracy differences ``a - b`` from metrics.
+
+    Returns ``(seeds, diffs)`` when BOTH records carry aligned
+    ``metrics['seeds']`` / ``metrics['per_seed_accuracy']`` lists with at
+    least one common seed, else ``None``. The objective evaluates every
+    candidate on the same seed list, so the common-seed intersection is
+    the paired sample.
+    """
+    ma = rec_a.get('metrics') or {}
+    mb = rec_b.get('metrics') or {}
+    seeds_a = ma.get('seeds')
+    seeds_b = mb.get('seeds')
+    acc_a = ma.get('per_seed_accuracy')
+    acc_b = mb.get('per_seed_accuracy')
+    if not (isinstance(seeds_a, list) and isinstance(seeds_b, list)
+            and isinstance(acc_a, list) and isinstance(acc_b, list)):
+        return None
+    if len(seeds_a) != len(acc_a) or len(seeds_b) != len(acc_b):
+        return None
+    map_a = {int(s): a for s, a in zip(seeds_a, acc_a) if a is not None}
+    map_b = {int(s): a for s, a in zip(seeds_b, acc_b) if a is not None}
+    common = sorted(set(map_a) & set(map_b))
+    if not common:
+        return None
+    return common, [float(map_a[s]) - float(map_b[s]) for s in common]
+
+
+def _paired_support(diffs: list[float], *, alpha: float = 0.05):
+    """Seed-paired one-sided support test for ``mean(diffs) > 0``.
+
+    Reuses ``run_quality``'s ``_paired_one_sided_t`` (one implementation
+    of the paired statistic across the repository). Zero-variance
+    unanimous sweeps count only when the exact one-sided sign-flip
+    p-value ``2^{-(n-1)}`` clears ``alpha`` (n >= 6 at alpha=0.05) — the
+    same evidence rule Exp 5 applies. Returns ``(stats, supported)``.
+    """
+    from run_quality import _bonferroni_crit_q, _paired_one_sided_t
+
+    stats = _paired_one_sided_t(diffs)
+    n = int(stats['n_pairs'])
+    crit = _bonferroni_crit_q(n, alpha=alpha) if n >= 2 else None
+    supported = bool(crit is not None and stats['t_stat'] is not None
+                     and stats['t_stat'] > crit)
+    if stats['t_stat'] is None and stats['all_positive'] and n >= 2:
+        supported = bool(2.0 ** (-(n - 1)) <= alpha)
+    return stats, supported
+
+
 def greedy_search(problem: SearchProblem, start: Candidate, *,
                   max_rounds: int = 3,
                   topk_grid: Sequence[int] = DEFAULT_TOPK_GRID,
                   include_swaps: bool = True,
                   min_delta: float = 0.0,
+                  require_supported: bool = True,
+                  alpha: float = 0.05,
                   logger: logging.Logger | None = None) -> dict:
     """Greedy best-improvement layerwise search.
 
@@ -521,11 +588,24 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     candidate is returned in ``records`` (with the frontier in ``pareto``),
     not just the accepted path.
 
+    With ``require_supported`` (default) the raw improvement is ALSO
+    checked against the seed-paired one-sided t-test at ``alpha`` whenever
+    both records carry per-seed metrics: a move whose mean gain is not
+    reproducible across seeds is recorded (``improvement=True``,
+    ``improvement_supported=False``) but NOT accepted. Problems whose
+    metrics lack per-seed accuracies (injected synthetic landscapes) fall
+    back to the raw rule, as does a bootstrap move from ``score=None``.
+
     The reported ``best`` closes the quality plateau: among the feasible
-    candidates within ``min_delta`` of the greedy endpoint's score, the
-    cheapest one wins (so a state-neutral top-k reduction is recommended
-    even though the strict-improvement rule would not move to it). The raw
-    endpoint is kept as ``greedy_endpoint`` for the trace.
+    candidates within ``min_delta`` of the greedy endpoint's score, a
+    strictly resource-cheaper one wins (so a state-neutral top-k reduction
+    is recommended even though the strict-improvement rule would not move
+    to it); without a strictly cheaper tie the endpoint itself is
+    reported, so an unsupported noise-sized score bump can never promote a
+    candidate. The raw endpoint is kept as ``greedy_endpoint`` for the
+    trace. The returned ``best_vs_start`` block is the paired test of the
+    recommended candidate against the start (``None`` when the metrics do
+    not carry per-seed data).
     """
     if not isinstance(problem, SearchProblem):
         raise TypeError(
@@ -540,6 +620,9 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
         raise ValueError(
             f'greedy_search: max_rounds must be a non-negative int, got '
             f'{max_rounds!r}.')
+    if not 0.0 < float(alpha) < 1.0:
+        raise ValueError(
+            f'greedy_search: alpha must be in (0, 1), got {alpha!r}.')
 
     records: dict[Candidate, dict] = {}
 
@@ -572,6 +655,22 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
         current_score = current_record['score']
         improved = (current_score is None
                     or best_rec['score'] > current_score + float(min_delta))
+        paired = None
+        supported = None
+        if improved and current_score is not None and require_supported:
+            pair = _paired_seed_diffs(best_rec, current_record)
+            if pair is not None:
+                pair_stats, supported = _paired_support(pair[1], alpha=alpha)
+                paired = {'seeds': [int(s) for s in pair[0]], **pair_stats}
+        accepted = bool(improved and supported is not False)
+        if not improved:
+            reason = 'no strict improvement over current'
+        elif accepted:
+            reason = ('improved' if paired is None
+                      else 'improved (seed-paired supported)')
+        else:
+            reason = (f'mean score improved but not reproducible across '
+                      f'seeds (paired one-sided t, alpha={float(alpha):g})')
         rounds.append({
             'round': round_index,
             'from': current.label,
@@ -581,19 +680,21 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
             'best_neighbor_state_bytes': best_rec['state_bytes_allocated'],
             'best_neighbor_decode_reads': best_rec[
                 'decode_marginal_read_elements'],
-            'accepted': bool(improved),
-            'reason': ('improved' if improved
-                       else 'no strict improvement over current'),
+            'improvement': bool(improved),
+            'improvement_supported': supported,
+            'paired': paired,
+            'accepted': accepted,
+            'reason': reason,
             'candidates': [rec['label'] for _, rec in fresh],
         })
         if logger is not None:
             logger.info(
                 'round %d: %s -> %s (%s, %.4f -> %.4f)', round_index,
                 current.label, best_rec['label'],
-                'accept' if improved else 'stop',
+                'accept' if accepted else 'stop',
                 -1.0 if current_score is None else current_score,
                 best_rec['score'])
-        if not improved:
+        if not accepted:
             break
         current, current_record = best_cand, best_rec
 
@@ -603,6 +704,9 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     # feasible candidate within ``min_delta`` of the endpoint's score, so
     # the recommended configuration is never Pareto-dominated on its own
     # plateau. The raw endpoint stays available as ``greedy_endpoint``.
+    # The closure only ever recommends a STRICTLY resource-cheaper tie:
+    # with equal resources the endpoint itself wins, so an unsupported
+    # (noise-sized) score bump can never promote a non-endpoint candidate.
     endpoint = current_record
     plateau = [r for r in records.values()
                if r['feasible'] and r['score'] is not None
@@ -610,11 +714,29 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
                and r['score'] >= endpoint['score'] - float(min_delta)]
     best = endpoint
     if plateau:
-        best = min(plateau, key=lambda r: (
+        candidate = min(plateau, key=lambda r: (
             r['state_bytes_allocated'], r['decode_marginal_read_elements'],
             r['label']))
+        endpoint_cost = (endpoint['state_bytes_allocated'],
+                         endpoint['decode_marginal_read_elements'])
+        candidate_cost = (candidate['state_bytes_allocated'],
+                          candidate['decode_marginal_read_elements'])
+        if candidate_cost < endpoint_cost:
+            best = candidate
     ordered = sorted(records.values(),
                      key=lambda r: (r['state_bytes_allocated'], r['label']))
+    best_vs_start = None
+    pair = _paired_seed_diffs(best, get(start))
+    if pair is not None:
+        pair_stats, supported = _paired_support(pair[1], alpha=alpha)
+        best_vs_start = {
+            'test': ('seed-paired one-sided t on per-seed accuracy '
+                     '(best - start); H1: best > start'),
+            'alpha': float(alpha),
+            'seeds': [int(s) for s in pair[0]],
+            'significant': bool(supported),
+            **pair_stats,
+        }
     return {
         'start': get(start),
         'best': best,
@@ -622,6 +744,18 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
         'rounds': rounds,
         'records': ordered,
         'pareto': pareto_frontier(ordered),
+        'best_vs_start': best_vs_start,
+        'acceptance_policy': {
+            'raw_rule': 'best feasible neighbor score > current + min_delta',
+            'min_delta': float(min_delta),
+            'require_supported': bool(require_supported),
+            'alpha': float(alpha),
+            'seed_support_rule': (
+                'seed-paired one-sided t on per-candidate common-seed '
+                'accuracies; zero-variance unanimous sweeps need '
+                '2^{-(n-1)} <= alpha; falls back to the raw rule when '
+                'per-seed metrics are absent'),
+        },
     }
 
 
@@ -629,7 +763,7 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
 # 4. MQAR objective (the trained probe)
 # ===========================================================================
 
-def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42,),
+def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
                         steps: int = 100, seq_len: int = 16,
                         d_model: int = 32, train_batch: int = 16,
                         eval_batches: int = 4, eval_batch: int = 64,
@@ -640,10 +774,13 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42,),
     Trains one probe per candidate per seed through Exp 9's
     ``recall_reach.train_recall_model`` (same data stream per seed for
     every candidate, so comparisons are paired) and returns the mean
-    accuracy as the score. Per-seed accuracies, losses' final value, and
-    the geometry are recorded in ``metrics`` for the trace.
+    accuracy as the score. Per-seed accuracies, the mean's sample std /
+    standard error / 95% t-CI, losses' final value, and the geometry are
+    recorded in ``metrics`` for the trace — the greedy acceptance rule in
+    :func:`greedy_search` reads the per-seed pairings from there.
     """
     from recall_reach import evaluate_recall, train_recall_model
+    from run_quality import _t_crit_975
 
     if not seeds:
         raise ValueError('make_mqar_objective: seeds must be non-empty.')
@@ -667,10 +804,22 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42,),
                             candidate.label, seed, result['accuracy'])
         finite = [a for a in accuracies if a is not None]
         score = sum(finite) / len(finite) if finite else None
+        if len(finite) >= 2 and score is not None:
+            var = sum((a - score) ** 2 for a in finite) / (len(finite) - 1)
+            score_std = math.sqrt(var)
+            score_se = score_std / math.sqrt(len(finite))
+            t_crit = _t_crit_975(len(finite))
+            score_ci95 = (score_se * t_crit) if t_crit is not None else None
+        else:
+            score_std = score_se = score_ci95 = None
         return {
             'score': score,
             'metrics': {
                 'accuracy': score,
+                'accuracy_std': score_std,
+                'accuracy_se': score_se,
+                'accuracy_ci95': score_ci95,
+                'n_seeds': len(finite),
                 'per_seed_accuracy': [None if a is None else float(a)
                                       for a in accuracies],
                 'seeds': [int(s) for s in seeds],
@@ -731,6 +880,15 @@ def _fmt_bytes(n: int) -> str:
     return f'{n} B'
 
 
+def _fmt_score(rec: dict) -> str:
+    """``mean±std`` when the record carries a seed spread, else the mean."""
+    score = rec.get('score')
+    if score is None:
+        return 'n/a'
+    std = (rec.get('metrics') or {}).get('accuracy_std')
+    return f'{score:.4f}' if std is None else f'{score:.4f}±{std:.4f}'
+
+
 def _print_report(report: dict) -> None:
     cfg = report['config']
     print('=' * 100)
@@ -748,23 +906,30 @@ def _print_report(report: dict) -> None:
               f"elements/token")
     print('-' * 100)
     print(f"{'layout':<28}{'topk':>5}{'state B':>12}{'const':>7}"
-          f"{'reads/tok':>12}{'ok':>4}{'score':>9}")
+          f"{'reads/tok':>12}{'ok':>4}{'score mean±std':>19}")
     for rec in report['records']:
-        score = rec['score']
         print(f"{','.join(rec['layout']):<28}{rec['csa_topk']:>5}"
               f"{rec['state_bytes_allocated']:>12}"
               f"{str(rec['state_constant']):>7}"
               f"{rec['decode_marginal_read_elements']:>12.1f}"
               f"{str(rec['feasible']):>5}"
-              f"{('  n/a' if score is None else f'{score:>9.4f}')}")
+              f"{('  n/a' if rec['score'] is None else f'{_fmt_score(rec):>19}')}")
     print('-' * 100)
     best = report['best']
-    print(f"BEST: {best['label']}  score={best['score']}  "
+    print(f"BEST: {best['label']}  score={_fmt_score(best)}  "
           f"state={_fmt_bytes(best['state_bytes_allocated'])}  "
           f"reads/token={best['decode_marginal_read_elements']:.1f}")
+    bvs = report.get('best_vs_start')
+    if bvs is not None:
+        t_stat = bvs['t_stat']
+        print(f"BEST vs START (seed-paired): mean_diff={bvs['mean_diff']:+.4f}  "
+              f"t={t_stat:.3f}  n={bvs['n_pairs']}  "
+              f"significant={bvs['significant']}")
+    else:
+        print('BEST vs START: no per-seed metrics (paired test unavailable)')
     print(f"PARETO FRONT ({len(report['pareto'])} points):")
     for rec in report['pareto']:
-        print(f"  {rec['label']:<30} score={rec['score']:.4f}  "
+        print(f"  {rec['label']:<30} score={_fmt_score(rec)}  "
               f"state={_fmt_bytes(rec['state_bytes_allocated'])}  "
               f"reads={rec['decode_marginal_read_elements']:.1f}")
     print('=' * 100)
@@ -790,7 +955,9 @@ def main(argv=None) -> int:
     parser.add_argument('--steps', type=int, default=None,
                         help='probe training steps per candidate')
     parser.add_argument('--seeds', default=None,
-                        help='comma-separated probe seeds (default: 42)')
+                        help='comma-separated probe seeds (default: '
+                             'SEARCH_SEEDS count, 3 -> 42,43,44; >=3 seeds '
+                             'is the policy, fewer is flagged exploratory)')
     parser.add_argument('--train-batch', type=int, default=16)
     parser.add_argument('--eval-batches', type=int, default=4)
     parser.add_argument('--eval-batch', type=int, default=64)
@@ -833,7 +1000,14 @@ def main(argv=None) -> int:
         seeds = _parse_int_tuple(args.seeds, field_name='--seeds',
                                  min_value=0)
     else:
-        seeds = (42,)
+        n_seeds = parse_int_env('SEARCH_SEEDS', 3, min_value=1,
+                                logger=logger)
+        seeds = tuple(42 + i for i in range(n_seeds))
+    if len(seeds) < 3:
+        logger.warning(
+            'only %d probe seed(s): the seed-paired acceptance test is '
+            'undefined and candidate differences are exploratory '
+            '(policy: >= 3)', len(seeds))
     start_topk = 2
     if 'csa' not in start_layout:
         start_topk = 0
@@ -891,6 +1065,24 @@ def main(argv=None) -> int:
             'seq_len': int(args.seq_len),
             'steps': int(steps),
             'seeds': [int(s) for s in seeds],
+            'n_seeds': len(seeds),
+            'statistical_design': {
+                'seeds_per_candidate': len(seeds),
+                'minimum_seeds_for_claims': 3,
+                'shared_seed_list': True,
+                'seed_policy': ('every candidate is evaluated on the SAME '
+                                'seed list, so candidate differences are '
+                                'seed-paired'),
+                'reported_statistics': ('per-candidate mean, sample std '
+                                        '(ddof=1), standard error and 95% '
+                                        't-CI of MQAR accuracy; per-seed '
+                                        'accuracies retained'),
+                'warning': (
+                    f'only {len(seeds)} probe seed(s): the seed-paired '
+                    f'acceptance test is undefined and candidate '
+                    f'differences are exploratory at this seed budget'
+                    if len(seeds) < 3 else None),
+            },
             'train_batch': int(args.train_batch),
             'eval_batches': int(args.eval_batches),
             'eval_batch': int(args.eval_batch),
@@ -910,6 +1102,8 @@ def main(argv=None) -> int:
         'rounds': result['rounds'],
         'records': result['records'],
         'pareto': result['pareto'],
+        'best_vs_start': result['best_vs_start'],
+        'acceptance_policy': result['acceptance_policy'],
         'provenance': capture_provenance(),
     }
     payload = sanitize_for_json(report)

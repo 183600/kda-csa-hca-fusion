@@ -26,6 +26,10 @@ What is pinned here
    report round-trips through ``json.dumps(allow_nan=False)``, carries
    one record per cell and seed, and keeps per-layer recall list lengths
    equal to the CSA count; the structural-only path skips training.
+6. **Statistical design.** The mean/std/CI helper is exact, the default
+   seed list has >= 3 seeds (the repo's claim policy), and a multi-seed
+   report carries per-row mean +/- sample std for accuracy and indexer
+   union recall plus the exploratory warning for short seed lists.
 
 Run via pytest::
 
@@ -386,6 +390,64 @@ def test_report_strict_json_and_budget():
             for l in layouts), 'fixed-depth position ablation')
 
 
+def test_seed_statistics_contract():
+    """Mean/std/CI math + the >= 3-seed default policy (regression pin)."""
+    import inspect
+
+    mean, std, ci = R._mean_std_ci95([])
+    _ok('empty values -> all None', (mean, std, ci) == (None, None, None), '')
+    mean, std, ci = R._mean_std_ci95([0.5])
+    _ok('single value -> mean, undefined std/CI',
+        (mean, std, ci) == (0.5, None, None), f'{mean}/{std}/{ci}')
+    mean, std, ci = R._mean_std_ci95([1.0, 2.0, 3.0])
+    t_crit = R._t_crit_975(3)
+    _ok('sample mean', mean == 2.0, str(mean))
+    _ok('sample std (ddof=1)', abs(std - 1.0) < 1e-12, str(std))
+    _ok('95% CI half-width = se * t_{n-1}',
+        abs(ci - (1.0 / (3 ** 0.5)) * t_crit) < 1e-12, str(ci))
+
+    default = inspect.signature(R.run_recall_report).parameters['seeds'].default
+    _ok('run_recall_report defaults to >= 3 seeds',
+        tuple(default) == (42, 43, 44), str(default))
+
+
+def test_report_multi_seed_statistics():
+    """A 2-seed report carries mean/std and flags the short seed budget."""
+    report = R.run_recall_report(
+        pairs=((4, 8),), layouts=['alternating'], steps=1, seeds=(42, 43),
+        seq_len=16, train_batch=8, eval_batches=1, eval_batch=8)
+    json.dumps(report, allow_nan=False)
+    row = report['rows'][0]
+    _ok('two per-seed records', len(row['per_seed']) == 2, '')
+    _ok('accuracy mean/std/n populated',
+        row['accuracy_mean'] is not None and row['accuracy_std'] is not None
+        and row['accuracy_std'] >= 0.0 and row['accuracy_n_seeds'] == 2,
+        f"mean={row['accuracy_mean']} std={row['accuracy_std']}")
+    if row['indexer_union_recall_mean'] is not None:
+        _ok('indexer union recall std populated',
+            row['indexer_union_recall_std'] is not None,
+            f"std={row['indexer_union_recall_std']}")
+    _ok('HCA resolved fraction aggregated',
+        row['hca_resolved_fraction_mean'] is not None, '')
+    design = report['design']
+    stats = design['statistical_design']
+    _ok('shared seed list recorded', stats['shared_seed_list'] is True, '')
+    _ok('per-cell seed count recorded', stats['seeds_per_cell'] == 2, '')
+    _ok('short seed budget flagged exploratory',
+        stats['warning'] is not None and 'exploratory' in stats['warning'],
+        str(stats['warning']))
+
+    single = R.run_recall_report(
+        pairs=((4, 8),), layouts=['alternating'], steps=1, seeds=(42,),
+        seq_len=16, train_batch=8, eval_batches=1, eval_batch=8)
+    row1 = single['rows'][0]
+    _ok('single-seed row has mean but no std/CI',
+        row1['accuracy_mean'] is not None and row1['accuracy_std'] is None
+        and row1['accuracy_ci95'] is None, '')
+    _ok('single-seed design warns',
+        single['design']['statistical_design']['warning'] is not None, '')
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -395,6 +457,8 @@ def main() -> int:
     test_indexer_recall_error_paths_and_no_csa()
     test_hca_coverage_matches_structural()
     test_report_strict_json_and_budget()
+    test_seed_statistics_contract()
+    test_report_multi_seed_statistics()
     print('\nAll recall-reach tests passed.')
     return 0
 

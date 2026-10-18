@@ -34,6 +34,15 @@ accuracy difference against the baseline (Bonferroni-corrected across the
 compared variants). This is a stronger design than an independent-samples
 comparison and directly follows the Exp 5 validity policy.
 
+The selected variant set is audited as an ablation design and the verdict
+is recorded in the ``ablation_design`` metadata: a single-factor
+(leave-one-out) claim for a factor requires the baseline plus a variant
+that differs from it in EXACTLY that factor; ``no_rope_dense`` is an
+interaction cell. A ``MECH_VARIANTS`` subset that drops a one-factor
+counterpart is flagged (``status='incomplete'`` + the missing factors),
+never silently treated as a complete ablation; the audit also cross-checks
+the observed parameter-count / depth parity across variants.
+
 Mechanistic diagnostic: indexer gold-block recall
 -------------------------------------------------
 Accuracy alone cannot tell whether CSA contributes retrieval or the KDA
@@ -792,6 +801,126 @@ def summarize_variant(per_seed, variant):
     }
 
 
+def _variant_factor_diffs(variant, baseline):
+    """Names of the mechanism factors in which ``variant`` differs.
+
+    Factor order is fixed (rope, topk, ste) so the audit output is
+    deterministic. A variant differing in exactly one factor is a
+    single-factor (leave-one-out) cell; two or more is an interaction.
+    """
+    diffs = []
+    if bool(variant['rope']) != bool(baseline['rope']):
+        diffs.append('rope')
+    if int(variant['topk']) != int(baseline['topk']):
+        diffs.append('topk')
+    if bool(variant['use_ste']) != bool(baseline['use_ste']):
+        diffs.append('ste')
+    return diffs
+
+
+def ablation_design_audit(variants, rows=None, requested=None):
+    """Audit the selected variant set as a controlled ablation design.
+
+    Exp 8 toggles three CSA mechanism factors — partial RoPE, the top-k
+    sparse selection width, and indexer STE learning. A single-factor
+    (leave-one-out) claim for a factor requires the baseline PLUS a variant
+    that differs from the baseline in EXACTLY that factor; a variant that
+    changes two or more factors is an interaction cell and cannot support a
+    single-factor claim on its own. A ``MECH_VARIANTS`` subset can silently
+    drop the one-factor counterpart of a factor while still producing a
+    paired-vs-baseline table, so the coverage is audited and recorded.
+
+    When ``rows`` (the summarized result rows) are given, the audit also
+    cross-checks the controlled-variable claim empirically: the observed
+    parameter counts and depths must match across variants (the mechanism
+    switches must not have changed model size).
+
+    Returns a JSON-safe dict with ``status`` one of
+    ``'leave_one_out_complete'`` / ``'incomplete'`` / ``'no_baseline'``.
+    """
+    names = [v['name'] for v in variants]
+    baseline = next((v for v in variants if v['name'] == 'baseline'), None)
+    factor_questions = {
+        'rope': 'partial RoPE on the CSA/HCA core-attention stack',
+        'topk': 'CSA top-k selection width (sparse vs dense)',
+        'ste': 'lightning-indexer STE learning',
+    }
+    one_factor: dict[str, list[str]] = {f: [] for f in factor_questions}
+    interactions: dict[str, list[str]] = {}
+    for v in variants:
+        if baseline is None or v is baseline:
+            continue
+        diffs = _variant_factor_diffs(v, baseline)
+        if len(diffs) == 1:
+            one_factor[diffs[0]].append(v['name'])
+        elif diffs:
+            interactions[v['name']] = diffs
+
+    def _level(v, factor):
+        if factor == 'topk':
+            return int(v['topk'])
+        if factor == 'ste':
+            return bool(v['use_ste'])
+        return bool(v['rope'])
+
+    factors = {
+        f: {
+            'question': factor_questions[f],
+            'baseline_level': (None if baseline is None
+                               else _level(baseline, f)),
+            'levels_seen': sorted({_level(v, f) for v in variants}),
+            'one_factor_variants': sorted(set(one_factor[f])),
+            'covered': bool(one_factor[f]),
+        }
+        for f in factor_questions
+    }
+    missing = [f for f in factor_questions if not one_factor[f]]
+    if baseline is None:
+        status = 'no_baseline'
+    elif not missing:
+        status = 'leave_one_out_complete'
+    else:
+        status = 'incomplete'
+
+    audit = {
+        'status': status,
+        'selected_variants': names,
+        'selection': ('all pre-registered variants' if requested is None
+                      else f'MECH_VARIANTS subset: {sorted(requested)}'),
+        'baseline_present': baseline is not None,
+        'factors': factors,
+        'interaction_variants': interactions,
+        'missing_single_factor_variants': missing,
+        'note': (
+            'A single-factor (leave-one-out) claim for a factor needs the '
+            'baseline plus a variant differing from it in exactly that '
+            'factor; interaction variants (>= 2 factors changed) support '
+            'only interaction claims. Missing single-factor variants mean '
+            'the corresponding mechanism claim is NOT supported by this '
+            'run, regardless of any paired contrast that still computes.'),
+    }
+    if rows is not None:
+        n_params: dict = {}
+        n_layers: dict = {}
+        for r in rows:
+            name = r.get('variant')
+            if name is None:
+                continue
+            if r.get('n_params') is not None:
+                n_params.setdefault(name, r['n_params'])
+            if r.get('n_layers') is not None:
+                n_layers.setdefault(name, r['n_layers'])
+        audit['controlled_variables'] = {
+            'parameter_count_by_variant': n_params,
+            'parameter_count_parity': (len(set(n_params.values())) <= 1
+                                       if n_params else None),
+            'depth_by_variant': n_layers,
+            'depth_parity': (len(set(n_layers.values())) <= 1
+                             if n_layers else None),
+        }
+    return audit
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1045,6 +1174,30 @@ def main():
             '  significant effect). Treat the ranking as exploratory.')
     logger.info('=' * 70)
 
+    # Ablation-design audit: verify the selected variant set actually
+    # supports the single-factor claims it reports (baseline + exactly-one-
+    # factor counterparts), and cross-check the controlled-variable claim
+    # against the observed parameter counts / depths.
+    design_audit = ablation_design_audit(
+        variants, rows=all_rows,
+        requested=requested if requested else None)
+    if design_audit['status'] != 'leave_one_out_complete':
+        logger.warning(
+            '  WARNING: selected variant set is not a complete leave-one-out '
+            'design (%s); missing single-factor variants: %s. The '
+            'corresponding mechanism claims are NOT supported by this run.',
+            design_audit['status'],
+            design_audit['missing_single_factor_variants'])
+    cv = design_audit.get('controlled_variables') or {}
+    if cv.get('parameter_count_parity') is False:
+        logger.warning(
+            '  WARNING: observed parameter counts differ across variants: %s',
+            cv.get('parameter_count_by_variant'))
+    if cv.get('depth_parity') is False:
+        logger.warning(
+            '  WARNING: observed depths differ across variants: %s',
+            cv.get('depth_by_variant'))
+
     metadata = {
         'experiment': 'exp8_mechanism_ablation',
         'design': (
@@ -1064,6 +1217,7 @@ def main():
              'falsified_if': v['falsified_if'],
              'predicted_acc_sign': v['predicted_acc_sign']}
             for v in variants],
+        'ablation_design': design_audit,
         'prediction_status_definition': (
             'Per-row verdict of the pre-registered prediction against the '
             'paired Bonferroni-corrected accuracy contrast vs baseline: '

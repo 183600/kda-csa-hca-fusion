@@ -317,6 +317,62 @@ def test_paired_stats_math():
         f"t={stats['t_stat']}")
 
 
+def test_ablation_design_audit():
+    """The audit distinguishes complete leave-one-out from partial subsets."""
+    print("\nTest: Exp 8 ablation-design audit")
+    full = M.ablation_design_audit(M.VARIANTS)
+    _ok('full variant table is leave-one-out complete',
+        full['status'] == 'leave_one_out_complete'
+        and full['missing_single_factor_variants'] == [],
+        f"status={full['status']}")
+    _ok('every factor has a one-factor counterpart',
+        all(f['covered'] for f in full['factors'].values()),
+        str({k: v['one_factor_variants']
+             for k, v in full['factors'].items()}))
+    _ok('no_rope is the rope one-factor variant',
+        full['factors']['rope']['one_factor_variants'] == ['no_rope'], '')
+    _ok('dense and topk1 cover the topk factor',
+        set(full['factors']['topk']['one_factor_variants'])
+        == {'dense', 'topk1'}, '')
+    _ok('frozen_indexer is the ste one-factor variant',
+        full['factors']['ste']['one_factor_variants'] == ['frozen_indexer'], '')
+    _ok('no_rope_dense is an interaction cell',
+        full['interaction_variants'] ==
+        {'no_rope_dense': ['rope', 'topk']},
+        str(full['interaction_variants']))
+
+    subset = [v for v in M.VARIANTS
+              if v['name'] in ('baseline', 'no_rope')]
+    partial = M.ablation_design_audit(subset, requested=['baseline',
+                                                         'no_rope'])
+    _ok('subset missing one-factor counterparts is flagged incomplete',
+        partial['status'] == 'incomplete'
+        and partial['missing_single_factor_variants'] == ['topk', 'ste'],
+        f"status={partial['status']} "
+        f"missing={partial['missing_single_factor_variants']}")
+    _ok('subset records the selection provenance',
+        'MECH_VARIANTS subset' in partial['selection'], '')
+
+    no_base = [v for v in M.VARIANTS if v['name'] in ('no_rope', 'topk1')]
+    _ok('variant set without baseline is flagged',
+        M.ablation_design_audit(no_base)['status'] == 'no_baseline', '')
+
+    rows = [{'variant': 'baseline', 'n_params': 100, 'n_layers': 5},
+            {'variant': 'no_rope', 'n_params': 100, 'n_layers': 5}]
+    audit = M.ablation_design_audit(subset, rows=rows)
+    cv = audit['controlled_variables']
+    _ok('observed parameter / depth parity cross-checked',
+        cv['parameter_count_parity'] is True and cv['depth_parity'] is True,
+        str(cv))
+    bad = M.ablation_design_audit(
+        subset, rows=[{'variant': 'baseline', 'n_params': 100,
+                       'n_layers': 5},
+                      {'variant': 'no_rope', 'n_params': 101,
+                       'n_layers': 5}])
+    _ok('parameter-count drift detected',
+        bad['controlled_variables']['parameter_count_parity'] is False, '')
+
+
 def test_exp8_smoke_envelope():
     """End-to-end smoke: tiny run writes a v1.0 envelope with the right kind."""
     print("\nTest: Exp 8 end-to-end smoke (1 seed x 1 step)")
@@ -359,6 +415,15 @@ def test_exp8_smoke_envelope():
             _ok('design metadata documents the diagnostic',
                 'gold_recall_definition' in payload.get('metadata', {})
                 and 'caveats' in payload.get('metadata', {}), '')
+            audit = payload.get('metadata', {}).get('ablation_design', {})
+            _ok('ablation-design audit embedded in metadata',
+                audit.get('status') == 'incomplete'
+                and audit.get('missing_single_factor_variants')
+                == ['topk', 'ste']
+                and audit.get('controlled_variables', {})
+                .get('parameter_count_parity') is True,
+                f"status={audit.get('status')} "
+                f"missing={audit.get('missing_single_factor_variants')}")
     finally:
         M.RESULTS_PATH = saved_path
         restore()
@@ -372,6 +437,7 @@ _TEST_FUNCS = [
     test_dense_variant_recall_is_one,
     test_sparse_variant_recall_is_below_one_or_none,
     test_paired_stats_math,
+    test_ablation_design_audit,
     test_exp8_smoke_envelope,
 ]
 

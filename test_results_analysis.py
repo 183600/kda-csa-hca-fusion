@@ -321,6 +321,12 @@ def test_paired_one_sided_t_math_and_degenerate_cases():
     # still has ``all_positive`` as evidence.
     flat = _paired_one_sided_t([0.5, 0.5, 0.5])
     assert flat['t_stat'] is None and flat['all_positive'] is True
+    # Floating-point zero variance: a constant sweep of a value without an
+    # exact binary representation (0.1) leaves a ~1e-17 residue in the
+    # naive variance; without the numerical-zero clamp that becomes a fake
+    # t ~ 1e16 and silently bypasses the sign-flip evidence rule.
+    fp_flat = _paired_one_sided_t([0.1, 0.1, 0.1])
+    assert fp_flat['t_stat'] is None and fp_flat['all_positive'] is True
     neg = _paired_one_sided_t([-0.1, -0.2])
     assert neg['all_positive'] is False
     assert _paired_one_sided_t([])['n_pairs'] == 0

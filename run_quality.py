@@ -75,7 +75,7 @@ from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
-from multi_seed_stats import holm_adjust, summarize_paired
+from multi_seed_stats import _sample_sd, holm_adjust, summarize_paired
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
@@ -2959,6 +2959,13 @@ def _paired_one_sided_t(diffs):
     variance); in the zero-variance case ``all_positive`` records whether
     every seed difference was strictly positive so the caller can still
     treat a unanimous sweep as evidence.
+
+    Zero variance is detected with ``multi_seed_stats._sample_sd``'s
+    relative-tolerance rule: a perfectly constant difference vector (e.g.
+    every seed improved by exactly 0.1) leaves a ~1e-17 floating-point
+    residue in the naive variance, which produces a fake ``t ~ 1e16`` and
+    would bypass the exact sign-flip evidence rule. The same numerical-zero
+    clamp is used repo-wide.
     """
     n = len(diffs)
     if n == 0:
@@ -2968,12 +2975,12 @@ def _paired_one_sided_t(diffs):
     if n < 2:
         return {'n_pairs': n, 'mean_diff': mean_diff, 't_stat': None,
                 'all_positive': all(d > 0 for d in diffs)}
-    var = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
-    if var <= 0.0:
+    sd = _sample_sd(diffs, mean_diff)
+    if sd is None or sd <= 0.0:
         return {'n_pairs': n, 'mean_diff': mean_diff, 't_stat': None,
                 'all_positive': all(d > 0 for d in diffs)}
     return {'n_pairs': n, 'mean_diff': mean_diff,
-            't_stat': mean_diff / math.sqrt(var / n),
+            't_stat': mean_diff / (sd / math.sqrt(n)),
             'all_positive': all(d > 0 for d in diffs)}
 
 

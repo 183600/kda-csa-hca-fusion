@@ -18,7 +18,13 @@ bytes (Exp 3 / ``cache_accounting``) and KV read budget (Exp 9b /
 * read-budget monotonicity in ``csa_topk`` (the top-k selection knob);
 * the search loop — greedy best-improvement on injected landscapes
   (target recovery, budget exclusion, error records, determinism,
-  Pareto-frontier correctness);
+  Pareto-frontier correctness), including the uncertainty-aware
+  acceptance rule (a mean gain that is not seed-paired supported is
+  recorded but not accepted);
+* the probe statistics — ``make_mqar_objective`` reports mean / sample
+  std / SE / 95% CI over >= 3 seeds by default, and the paired support
+  rule matches the closed-form t threshold and the zero-variance
+  sign-flip bound;
 * integration — searched candidates build through
   ``recall_reach.make_grid_cfg`` / ``HybridKCHAttention`` and run a
   forward; the MQAR objective wiring produces a finite score.
@@ -352,6 +358,95 @@ def test_search_result_is_json_safe():
     result = greedy_search(_fake_problem(score), START, max_rounds=1)
     json.dumps(result, allow_nan=False)  # must not raise
     assert result['pareto'], 'frontier must be non-empty'
+    assert result['best_vs_start'] is None, \
+        'no per-seed metrics -> paired test must be reported unavailable'
+    assert result['acceptance_policy']['require_supported'] is True
+
+
+def test_paired_support_rule_matches_closed_forms():
+    import layerwise_search as L
+
+    stats, supported = L._paired_support([0.05, 0.10, 0.15])
+    assert stats['n_pairs'] == 3 and stats['t_stat'] == pytest.approx(
+        3.4641, rel=1e-3)
+    assert supported, 't=3.46 must clear the one-sided 95% crit at df=2'
+    _, not_supported = L._paired_support([0.10, -0.05, 0.02])
+    assert not not_supported, 'mean gain within noise must not be supported'
+    _, zero_var3 = L._paired_support([0.05] * 3)
+    assert not zero_var3, '2^{-2}=0.25 > 0.05: n=3 cannot clear the bound'
+    _, zero_var6 = L._paired_support([0.05] * 6)
+    assert zero_var6, '2^{-5}=0.03125 <= 0.05'
+    _, single = L._paired_support([0.30])
+    assert not single, 'a single seed cannot support a paired claim'
+
+
+def test_greedy_search_requires_seed_reproducibility():
+    """A mean gain must be seed-paired supported to be ACCEPTED."""
+    target_layout = ('csa', 'kda', 'kda', 'csa', 'hca')
+    target_label = Candidate(target_layout).label
+
+    def problem_with(per_seed_for_target):
+        def evaluate(cand):
+            per_seed = (list(per_seed_for_target)
+                        if tuple(cand.layout) == target_layout
+                        else [0.0, 0.0, 0.0])
+            return {'score': sum(per_seed) / len(per_seed),
+                    'metrics': {'seeds': [42, 43, 44],
+                                'per_seed_accuracy': per_seed}}
+
+        return SearchProblem(
+            evaluate=evaluate,
+            cost=lambda cand: {'state_bytes_allocated': 100,
+                               'decode_marginal_read_elements': 1.0})
+
+    # Reproducible gain: per-seed diffs [0.05, 0.10, 0.15] -> t=3.46.
+    result = greedy_search(problem_with([0.05, 0.10, 0.15]), START,
+                           max_rounds=1)
+    round0 = result['rounds'][0]
+    assert round0['improvement'] is True
+    assert round0['improvement_supported'] is True
+    assert round0['accepted'] is True
+    assert round0['paired']['n_pairs'] == 3
+    assert result['greedy_endpoint']['label'] == target_label
+    assert result['best_vs_start']['significant'] is True
+    json.dumps(result, allow_nan=False)
+
+    # Same mean gain with zero spread across only 3 seeds: the exact
+    # sign-flip bound cannot clear alpha, so the move is recorded but
+    # rejected (single-seed-style noise promotion is not accepted).
+    result = greedy_search(problem_with([0.10, 0.10, 0.10]), START,
+                           max_rounds=1)
+    round0 = result['rounds'][0]
+    assert round0['improvement'] is True
+    assert round0['improvement_supported'] is False
+    assert round0['accepted'] is False
+    assert 'not reproducible' in round0['reason']
+    assert result['greedy_endpoint']['label'] == START.label
+    assert result['best']['label'] == START.label, \
+        'an unsupported noise-sized gain must not promote a candidate'
+    assert result['best_vs_start']['significant'] is False
+
+
+def test_mqar_objective_seed_statistics():
+    import inspect
+    import layerwise_search as L
+
+    default = inspect.signature(
+        L.make_mqar_objective).parameters['seeds'].default
+    assert tuple(default) == (42, 43, 44), \
+        f'probe must default to >= 3 seeds, got {default}'
+
+    objective = make_mqar_objective(
+        m=4, m2=8, seeds=(0, 1), steps=1, seq_len=8, d_model=32,
+        train_batch=4, eval_batches=1, eval_batch=8, device='cpu')
+    result = objective(Candidate(('kda', 'kda', 'kda', 'csa', 'hca')))
+    metrics = result['metrics']
+    assert metrics['n_seeds'] == 2
+    assert metrics['accuracy_std'] is not None and metrics['accuracy_std'] >= 0
+    assert metrics['accuracy_se'] is not None and metrics['accuracy_se'] >= 0
+    assert metrics['accuracy_ci95'] is not None
+    assert len(metrics['per_seed_accuracy']) == 2
+    json.dumps(result, allow_nan=False)
 
 
 # ---------------------------------------------------------------------------
