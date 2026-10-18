@@ -260,6 +260,16 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     an in-place update of a graph-tracked state would trip the version
     counter. See :func:`_mamba2_scan_loop_eager` for the (autograd-safe)
     out-of-place form.
+
+    The in-place updates keep the state's storage (and therefore every
+    view of it) fixed for the whole loop, so for a contiguous state the
+    transposed readout view ``S^T`` is built once instead of once per
+    step, and the readout ``C @ S^T + Dx`` runs as the single
+    ``baddbmm`` whose GEMM epilogue folds the skip add into the matmul.
+    ``baddbmm`` and ``bmm(...) + Dx`` perform the same contraction and
+    sum for a contiguous state operand; a non-contiguous state keeps the
+    explicit two-step form so both layouts produce the exact bits they
+    produced before the readout was fused.
     """
     ys: list[torch.Tensor] = []
     T = x_dt.shape[1]
@@ -267,9 +277,16 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     decay_steps = decay_slab.unbind(1)
     C_steps = C_h.unbind(1)
     Dx_steps = Dx_slab.unbind(1)
-    for t in range(T):
-        S = S.mul_(decay_steps[t]).add_(x_steps[t])
-        ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2)) + Dx_steps[t])
+    if S.is_contiguous():
+        S_T = S.transpose(-1, -2)
+        for t in range(T):
+            S = S.mul_(decay_steps[t]).add_(x_steps[t])
+            ys.append(torch.baddbmm(Dx_steps[t], C_steps[t], S_T))
+    else:
+        for t in range(T):
+            S = S.mul_(decay_steps[t]).add_(x_steps[t])
+            ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2))
+                      + Dx_steps[t])
     return torch.stack(ys, dim=1).squeeze(-2), S
 
 
