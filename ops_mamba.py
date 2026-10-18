@@ -191,6 +191,31 @@ _SCAN_LOOP_INPLACE_SCRIPTED_FAILED = False
 # at once, so the cap bounds that single array.
 _SCAN_XOUTER_SLAB_ELEMS = 8_000_000
 
+# Cap on the number of elements in one slab of the chunked path's
+# ``[batch, nheads, slab, chunk, chunk]`` intra-chunk intermediates. The
+# per-chunk intra-chunk outputs are independent of every other chunk, so
+# evaluating a slab of chunks yields exactly the values the all-chunks
+# evaluation would (only the transient peak size changes).
+_SCAN_INTRA_SLAB_ELEMS = 8_000_000
+
+# Shape-keyed cache for the strict-lower-triangular causal mask consumed by
+# ``chunked_mamba2_scan``. It depends only on (chunk_size, device) and is
+# read-only at every use site (``masked_fill(~causal, ...)``).
+_CAUSAL_CHUNK_MASK_CACHE: dict = {}
+
+
+def _causal_chunk_mask(BT: int, device) -> torch.Tensor:
+    """Cached ``[BT, BT]`` lower-triangular boolean mask (True = s <= c)."""
+    key = (BT, str(device))
+    mask = _CAUSAL_CHUNK_MASK_CACHE.get(key)
+    if mask is None:
+        mask = torch.tril(
+            torch.ones(BT, BT, dtype=torch.bool, device=device))
+        if len(_CAUSAL_CHUNK_MASK_CACHE) >= 64:
+            _CAUSAL_CHUNK_MASK_CACHE.clear()
+        _CAUSAL_CHUNK_MASK_CACHE[key] = mask
+    return mask
+
 
 def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     """Sequential scan body over one slab of precomputed factors.
@@ -853,19 +878,38 @@ def chunked_mamba2_scan(
     # decay[t, s] = exp(G_t - G_s) for s <= t inside the chunk. The strict
     # upper triangle is masked to -inf BEFORE the exp (a positive exponent
     # would overflow and inf * 0 = NaN), exactly like the dual form.
-    diff = g.unsqueeze(-1) - g.unsqueeze(-2)              # [B,H,NT,C,C]
-    causal = torch.tril(torch.ones(BT, BT, dtype=torch.bool,
-                                   device=x.device))
-    diff = diff.masked_fill(~causal, float('-inf'))
-    decay = torch.exp(diff)
-    # cb[c, s] = C_c · B_s (per chunk); the readout is contracted with the
-    # source x_s scaled by dt_s (dt at the SOURCE position).
-    cb = torch.einsum('bhncN,bhnsN->bhncs', Ch_r, Bh_r)
-    weights = decay * cb * dt_r.unsqueeze(-2)
+    # The [B,H,NT,C,C] intermediates are evaluated in chunk slabs: every
+    # chunk's intra-chunk term is independent (the inter-chunk state is
+    # applied separately below), so the slab size changes only the transient
+    # peak memory, never the values.
+    causal = _causal_chunk_mask(BT, x.device)
+    valid = None
     if pad:
         valid = (torch.arange(Tp, device=x.device) < seqlen).reshape(NT, BT)
-        weights = weights * valid[None, None, :, None, :]
-    y_intra = torch.einsum('bhncs,bhnsd->bhncd', weights, x_r)
+    slab_n = max(1, _SCAN_INTRA_SLAB_ELEMS
+                 // max(1, batch * nheads * BT * BT))
+    y_intra_slabs: list[torch.Tensor] = []
+    for lo in range(0, NT, slab_n):
+        hi = min(NT, lo + slab_n)
+        g_slab = g[:, :, lo:hi]
+        diff = g_slab.unsqueeze(-1) - g_slab.unsqueeze(-2)  # [B,H,slab,C,C]
+        diff = diff.masked_fill(~causal, float('-inf'))
+        decay = torch.exp(diff)
+        # cb[c, s] = C_c · B_s (per chunk); the readout is contracted with
+        # the source x_s scaled by dt_s (dt at the SOURCE position).
+        cb = torch.einsum(
+            'bhncN,bhnsN->bhncs', Ch_r[:, :, lo:hi], Bh_r[:, :, lo:hi])
+        # ``decay`` / ``cb`` have no other readers; the same products in the
+        # same association are evaluated in place to avoid a second
+        # slab-sized temporary.
+        weights = decay * cb
+        if pad:
+            weights = weights * valid[None, None, lo:hi, None, :]
+        weights = weights * dt_r[:, :, lo:hi].unsqueeze(-2)
+        y_intra_slabs.append(torch.einsum(
+            'bhncs,bhnsd->bhncd', weights, x_r[:, :, lo:hi]))
+    y_intra = (y_intra_slabs[0] if len(y_intra_slabs) == 1
+               else torch.cat(y_intra_slabs, dim=2))       # [B,H,NT,C,D]
 
     # --- chunk transition (a_n) and source (b_n) ----------------------
     # b_n[d, N] = Σ_s exp(g_last - g_s) dt_s x_s[d] B_h[s, N]

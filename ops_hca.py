@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from ops_csa import (
     csa_compress_kv,
     _causal_block_mask,
+    _sliding_window_output,
     _sliding_window_scores,
     _nan_safe_softmax,
     _qk_normalize,
@@ -219,12 +220,14 @@ def naive_hca(
         # here: unlike naive_csa, HCA's softmax consumes ``scores_w`` alone
         # (already ``-inf``-masked for the left padding inside
         # ``_sliding_window_scores``), so the mask is intentionally dropped.
-        scores_w, C_windows, _ = _sliding_window_scores(
-            q, C_local, win, scale, device)
+        # ``return_windows=False`` bounds the transient [B, T, win, c]
+        # window tensor; the window value output is rebuilt tile-by-tile
+        # from ``C_local`` after the joint softmax (same per-row values).
+        scores_w, _, _ = _sliding_window_scores(
+            q, C_local, win, scale, device, return_windows=False)
         scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
     else:
         scores_w = torch.empty(B_, nh, T, 0, dtype=compute_dtype, device=device)
-        C_windows = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
 
     # --- 4. JOINT softmax over the union of compressed + window entries ---
     # One softmax over the concatenated scores (DeepSeek-V4 §2.3.1 Eq. 27),
@@ -272,7 +275,11 @@ def naive_hca(
     # output (same values as ``a + b``). See ``naive_csa`` for the
     # gradient-safety note.
     out = torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
-    out.add_(torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
+    if sliding_window > 0:
+        # The joint-softmax weights are [B, nh, T, win]; move the query axis
+        # back to dim 1 for the tiled value contraction (a pure permute).
+        out.add_(_sliding_window_output(
+            p_w.permute(0, 2, 1, 3), C_local, win, device))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries

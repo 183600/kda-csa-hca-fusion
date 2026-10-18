@@ -742,7 +742,14 @@ def _chunk_kda_prepare(
     A = torch.linalg.solve_triangular(
         eye - A, A, upper=False, unitriangular=True
     )
-    A = (A + eye) * beta[..., None, :]
+    if torch.is_grad_enabled():
+        # Autograd keeps the out-of-place form (the two broadcasts are saved
+        # graph nodes).
+        A = (A + eye) * beta[..., None, :]
+    else:
+        # Same elementwise add-then-multiply per entry; in place it needs no
+        # second [B, HV, NT, BT, BT] temporary.
+        A = A.add_(eye).mul_(beta[..., None, :])
 
     # ``exp(g)`` is consumed here (the ``w`` map) and again by the inner
     # loops (the per-chunk gate map and the last-position decay); compute

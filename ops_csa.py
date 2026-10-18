@@ -70,6 +70,25 @@ def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:
     return mask
 
 
+def _windows_contiguous(windows: torch.Tensor) -> torch.Tensor:
+    """Densify a possibly sliding-strided window view without changing values.
+
+    The ``unfold(...).permute(...)`` window view has overlapping strides
+    (consecutive window rows start only ``c`` elements apart). For such
+    tensors ``.contiguous()`` / ``.clone()`` fall back to a slow copy path,
+    while an explicit ``copy_`` into a fresh contiguous buffer is exact and
+    several times faster. ``einsum`` on the strided view is likewise much
+    slower than on the dense buffer. Returning the input unchanged when it
+    is already contiguous keeps the function allocation-free for the plain
+    ``win == 1``/full-slice cases; consumers treat the result as read-only.
+    """
+    if windows.is_contiguous():
+        return windows
+    out = windows.new_empty(windows.shape)
+    out.copy_(windows)
+    return out
+
+
 def _sliding_window_attention(
     q: torch.Tensor,           # [B, T, nh, c]   (L2-normalized)
     C_local: torch.Tensor,     # [B, T, c]       (L2-normalized)
@@ -154,7 +173,7 @@ def _sliding_window_attention(
         # ``j = win - ct + i``).  Discard the leading ``win - ct``
         # all-zero windows so the window axis has length ``ct`` and matches
         # ``q_chunk`` in the einsum below.
-        C_windows = C_windows[:, -ct:]                       # [B, ct, win, c]
+        C_windows = _windows_contiguous(C_windows[:, -ct:])   # [B, ct, win, c]
         q_chunk = q[:, t_lo:t_hi]                            # [B, ct, nh, c]
         mask_chunk = valid_mask[t_lo:t_hi]                   # [ct, win]
         scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows)
@@ -170,12 +189,51 @@ def _sliding_window_attention(
     return out
 
 
+def _sw_query_chunk(T: int, win: int, c: int, chunk_t: int | None = None) -> int:
+    """Query-axis tile size for the chunked sliding-window helpers.
+
+    ``None`` targets ``CHUNKED_SW_THRESHOLD`` elements per ``[ct, win, c]``
+    window slab (rounded up to a multiple of 64), mirroring
+    :func:`_sliding_window_attention`. The tiling is row-wise: it changes
+    only the transient buffer size, never any per-row value.
+    """
+    if chunk_t is None:
+        target = max(64, CHUNKED_SW_THRESHOLD // max(1, win * c))
+        chunk_t = min(T, ((target + 63) // 64) * 64)
+    return max(1, min(chunk_t, T)) if T > 0 else 0
+
+
+def _sliding_window_chunk_windows(
+    C_padded: torch.Tensor,
+    t_lo: int,
+    t_hi: int,
+    win: int,
+) -> torch.Tensor:
+    """Windows for queries ``[t_lo, t_hi)`` as a ``[B, ct, win, c]`` view.
+
+    Row ``i`` is exactly ``C_padded[:, t_lo + i : t_lo + i + win]`` — the
+    same slice the full-sequence ``unfold`` produces — so the per-row
+    values are unchanged. The short-chunk branch mirrors
+    :func:`_sliding_window_attention` (left-pad, unfold, drop the leading
+    all-zero windows).
+    """
+    ct = t_hi - t_lo
+    C_slice = C_padded[:, t_lo : t_hi + win - 1]           # [B, ct+win-1, c]
+    if ct < win:
+        C_slice = F.pad(C_slice, (0, 0, win - ct, 0))
+    windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)
+    return _windows_contiguous(windows[:, -ct:])
+
+
 def _sliding_window_scores(
     q: torch.Tensor,           # [B, T, nh, c]   (L2-normalized)
     C_local: torch.Tensor,     # [B, T, c]       (L2-normalized)
     win: int,
     scale: float,
     device,
+    *,
+    return_windows: bool = True,
+    chunk_t: int | None = None,
 ) -> tuple:
     """Compute per-query sliding-window attention SCORES for the joint softmax.
 
@@ -186,21 +244,73 @@ def _sliding_window_scores(
     real position). The caller concatenates ``scores_w`` with the sparse-block
     scores and applies ONE softmax over the union (DeepSeek-V4 §2.3.1 Eq. 27),
     so the window entries share the compressed entries' denominator and sink.
+
+    ``return_windows=False`` computes the SAME ``scores_w`` with a bounded
+    query-axis tiling and returns ``None`` instead of materializing the
+    ``[B, T, win, c]`` window tensor; callers that need the window output
+    then use :func:`_sliding_window_output`, which re-derives each query
+    tile's windows from ``C_local``. Every entry is evaluated by the same
+    per-row dot product either way, so the values are unchanged; only the
+    peak intermediate size is bounded.
     """
     B, T, nh, c = q.shape
     C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
-    C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2).contiguous()  # [B, T, win, c]
     # Cached [T, win] mask (read-only contract, see the helper).
     win_valid = _sliding_window_valid_mask(T, win, device)  # True=real
-    scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
-    if scale != 1.0:
-        # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-        # multiply keeps values/gradients bit-for-bit identical.
-        scores_w = scores_w * scale
-    # ``scores_w`` is a fresh einsum (or freshly scaled) tensor that no
-    # other consumer reads, so the mask can be written in place.
+    if return_windows:
+        C_windows = _windows_contiguous(
+            C_padded.unfold(1, win, 1).permute(0, 1, 3, 2))  # [B, T, win, c]
+        scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
+        if scale != 1.0:
+            # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+            # multiply keeps values/gradients bit-for-bit identical.
+            scores_w = scores_w * scale
+        # ``scores_w`` is a fresh einsum (or freshly scaled) tensor that no
+        # other consumer reads, so the mask can be written in place.
+        scores_w.masked_fill_(~win_valid[None, :, None, :], float('-inf'))
+        return scores_w, C_windows, win_valid
+    scores_w = q.new_empty(B, T, nh, win)
+    tile = _sw_query_chunk(T, win, c, chunk_t)
+    for t_lo in range(0, T, tile):
+        t_hi = min(T, t_lo + tile)
+        windows = _sliding_window_chunk_windows(C_padded, t_lo, t_hi, win)
+        chunk = torch.einsum(
+            'b t h d, b t w d -> b t h w', q[:, t_lo:t_hi], windows)
+        if scale != 1.0:
+            chunk = chunk * scale
+        scores_w[:, t_lo:t_hi] = chunk
     scores_w.masked_fill_(~win_valid[None, :, None, :], float('-inf'))
-    return scores_w, C_windows, win_valid
+    return scores_w, None, win_valid
+
+
+def _sliding_window_output(
+    p_w: torch.Tensor,         # [B, T, nh, win] joint-softmax window weights
+    C_local: torch.Tensor,     # [B, T, c]       (L2-normalized)
+    win: int,
+    device,
+    *,
+    chunk_t: int | None = None,
+) -> torch.Tensor:
+    """Window value output ``sum_w p_w[t, h, w] * C_local[t+w-win+1]``.
+
+    Eager equivalent of the ``einsum`` against the full
+    ``[B, T, win, c]`` window tensor, evaluated in bounded query tiles.
+    Each output row is the same per-row contraction, so the values are
+    unchanged; only the transient window slab is bounded.
+    """
+    B, T, nh, _ = p_w.shape
+    c = C_local.shape[-1]
+    if T == 0:
+        return p_w.new_zeros(B, T, nh, c)
+    C_padded = F.pad(C_local, (0, 0, win - 1, 0))
+    tile = _sw_query_chunk(T, win, c, chunk_t)
+    out = p_w.new_empty(B, T, nh, c)
+    for t_lo in range(0, T, tile):
+        t_hi = min(T, t_lo + tile)
+        windows = _sliding_window_chunk_windows(C_padded, t_lo, t_hi, win)
+        out[:, t_lo:t_hi] = torch.einsum(
+            'b t h w, b t w d -> b t h d', p_w[:, t_lo:t_hi], windows)
+    return out
 
 
 # Shape-keyed cache for ``_causal_block_mask``, which depends only on
@@ -476,7 +586,11 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     selected = strictly_above | fill_ties
     # With exactly `s` selected entries per row, the row-major nonzero
     # coordinates group into [..., s] with ascending indices per row.
-    indices = selected.nonzero()[:, -1].view(*scores.shape[:-1], s)
+    # ``as_tuple=True`` returns just the coordinate vectors, so the last
+    # (block-index) column is taken without materializing the full
+    # [N, rank] coordinate matrix.
+    indices = selected.nonzero(as_tuple=True)[-1].view(
+        *scores.shape[:-1], s)
     values = scores.gather(-1, indices)
     # Restore the score-descending slot order (stable: boundary ties keep
     # the canonical ascending-index order).
@@ -1461,11 +1575,13 @@ def naive_csa(
         if rope_dim_eff > 0:
             C_local = partial_rope(
                 C_local, tpos, rope_dim_eff, rope_base, dim=1)
-        scores_w, C_windows, win_valid = _sliding_window_scores(
-            q, C_local, win, scale, device)
+        # ``return_windows=False`` bounds the transient [B, T, win, c]
+        # window tensor; the window value output is rebuilt tile-by-tile
+        # from ``C_local`` after the joint softmax (same per-row values).
+        scores_w, _, win_valid = _sliding_window_scores(
+            q, C_local, win, scale, device, return_windows=False)
     else:
         scores_w = torch.empty(B_, T, nh, 0, dtype=compute_dtype, device=device)
-        C_windows = torch.empty(B_, T, 0, c, dtype=compute_dtype, device=device)
         win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
 
     # JOINT softmax over the union of the top-k selected compressed
@@ -1512,7 +1628,8 @@ def naive_csa(
         # not saved by any autograd node (the add's backward needs neither
         # operand), so the in-place add is gradient-safe.
         out = torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
-        out.add_(torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows))
+        if sliding_window > 0:
+            out.add_(_sliding_window_output(p_w, C_local, win, device))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries
