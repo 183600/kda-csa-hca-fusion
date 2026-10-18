@@ -358,6 +358,43 @@ def naive_recurrent_kda(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return o.to(dtype), S
+    if T == 1:
+        # Single-step fast path: the exact same per-step op chain as the
+        # scripted loop body (``S.mul_(g_exp)`` / ``v - (k * S).sum(-2)`` /
+        # ``addcmul_(beta_k, delta)`` / ``q_i @ S``) with the same operand
+        # association, just without materializing the ``[B, HV, 1, K, 1]``
+        # factor columns and without the single-element ``unbind``/``stack``
+        # round trip — the values are bit-identical. The ``transpose`` +
+        # ``contiguous`` reproduces the loop's ``[B, T, HV, V]`` shape and
+        # contiguity (the stack inserts the time dim at position 1).
+        # ``contiguous()`` mirrors the loop's factor-column layout: the
+        # ``(k_i * S).sum(-2)`` reduction then sees the same strides and
+        # reduces in the same order, keeping the result bit-identical for
+        # non-contiguous inputs too.
+        g_exp_i = g.exp()[:, 0].unsqueeze(-1).contiguous()
+        k_i = k[:, 0].unsqueeze(-1).contiguous()
+        beta_k_i = (beta[:, 0].unsqueeze(-1) * k[:, 0]).unsqueeze(
+            -1).contiguous()
+        v_i = v[:, 0]
+        q_i = q[:, 0].unsqueeze(-2)
+        if not torch.is_grad_enabled():
+            S = S.mul_(g_exp_i)
+            delta = v_i - (k_i * S).sum(-2)
+            S = S.addcmul_(beta_k_i, delta[..., None, :])
+        else:
+            S = S * g_exp_i
+            delta = v_i - (k_i * S).sum(-2)
+            S = torch.addcmul(S, beta_k_i, delta[..., None, :])
+        o = (q_i @ S).transpose(1, 2).contiguous()
+        if not output_final_state:
+            S = None
+        else:
+            target_state_dtype = (
+                state_dtype if state_dtype is not None else compute_dtype)
+            S = S.to(target_state_dtype)
+        o = o.to(dtype)
+        _warn_if_nonfinite(o, 'naive_recurrent_kda')
+        return o, S
     # Per-step factors laid out so ``unbind(2)`` yields the ``[B, H, K, 1]``
     # broadcast shape the loop consumes; ``q`` carries its singleton query
     # dim from the start (a view, so the values are unchanged).
@@ -476,21 +513,22 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     The count trades fewer loop iterations (larger ``rows``) against
     keeping the transient ``[..., rows, c1, K]`` block small (smaller
     ``rows``): the per-iteration temporary is proportional to
-    ``B * HV * NT * rows * BT * K`` elements, so both the total work
-    ``eff = B * HV * NT * BT * K`` and the key width ``K`` (which sets the
-    per-element reduction length) determine which granularity keeps the
-    loop memory-bandwidth friendly. The thresholds below were tuned on
-    the reference CPU harness over a grid of ``(eff, K)`` cells; a wider
-    ``K`` reaches the bandwidth-bound regime at a smaller ``eff``, hence
+    ``B * HV * NT * rows * BT * K`` elements, so the total work
+    ``eff = B * HV * NT * BT * K`` sets the block-write bandwidth and the
+    loop's working-set pressure. The thresholds below were tuned on the
+    reference CPU harness over a grid of ``(eff, K, BT)`` cells measured
+    end-to-end: within every key width tried (``K`` from 8 to 128) the
+    optimum is a function of ``eff``, and the transient stays last-level-
+    cache resident while the sequential loop overhead is negligible, hence
     the piecewise bands:
 
-    * ``K <= 16``: 8 rows up to ``eff <= 65536``, then 4 up to 262144,
-      then 2 up to 1048576, else 1.
-    * ``K <= 32``: 8 rows up to ``eff <= 32768``, then 4 up to 131072,
-      then 2 up to 524288, else 1.
-    * ``K <= 64``: 4 rows up to ``eff <= 65536``, then 2 up to 524288,
-      else 1.
-    * ``K > 64``: 2 rows up to ``eff <= 131072``, else 1.
+    * ``eff <= 16384``: 8 rows.
+    * ``eff <= 32768``: 4 rows.
+    * ``eff <= 131072``: 2 rows.
+    * ``eff <= 262144``: 1 row.
+    * ``eff <= 524288``: 2 rows (the block write saturates the loop's
+      working set again, and paired rows vectorize better here).
+    * larger ``eff``: 1 row.
 
     The result is capped by ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``.
 
@@ -499,33 +537,18 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     loop granularity.
     """
     eff = B * HV * NT * BT * K
-    if K <= 16:
-        if eff <= 65536:
-            rows = 8
-        elif eff <= 262144:
-            rows = 4
-        elif eff <= 1048576:
-            rows = 2
-        else:
-            rows = 1
-    elif K <= 32:
-        if eff <= 32768:
-            rows = 8
-        elif eff <= 131072:
-            rows = 4
-        elif eff <= 524288:
-            rows = 2
-        else:
-            rows = 1
-    elif K <= 64:
-        if eff <= 65536:
-            rows = 4
-        elif eff <= 524288:
-            rows = 2
-        else:
-            rows = 1
+    if eff <= 16384:
+        rows = 8
+    elif eff <= 32768:
+        rows = 4
+    elif eff <= 131072:
+        rows = 2
+    elif eff <= 262144:
+        rows = 1
+    elif eff <= 524288:
+        rows = 2
     else:
-        rows = 2 if eff <= 131072 else 1
+        rows = 1
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
