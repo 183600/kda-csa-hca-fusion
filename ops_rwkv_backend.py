@@ -50,6 +50,7 @@ requirement). :func:`rwkv7_fla_available` therefore checks for the
 
 from __future__ import annotations
 
+import sys
 import warnings
 
 import torch
@@ -62,6 +63,7 @@ _FLA_CHUNK_FN = None
 _FLA_RECURRENT_FN = None
 _FLA_IMPORT_ERROR: Exception | None = None
 _FLA_PROBED = False
+_FLA_MODULE = None
 
 
 def validate_rwkv_backend(backend: str) -> str:
@@ -90,11 +92,24 @@ def _load_fla_rwkv7():
     mismatch raising ``RuntimeError`` at import time — so a broken
     install is a definite, repeatable "not available".
     """
-    global _FLA_CHUNK_FN, _FLA_RECURRENT_FN, _FLA_IMPORT_ERROR, _FLA_PROBED
+    global _FLA_CHUNK_FN, _FLA_RECURRENT_FN, _FLA_IMPORT_ERROR, _FLA_PROBED, _FLA_MODULE
+    # A cached outcome is only valid for the SAME fla.ops.rwkv7 module
+    # object. Tests (and environments) inject a different module under that
+    # name, which must trigger a fresh probe instead of reusing a stale
+    # cached answer — otherwise a broken install could be cached as
+    # "available" (or vice versa) across injected modules.
     if _FLA_PROBED:
-        if _FLA_IMPORT_ERROR is not None:
-            raise ImportError(_FLA_IMPORT_ERROR)
-        return _FLA_CHUNK_FN, _FLA_RECURRENT_FN
+        current_module = sys.modules.get('fla.ops.rwkv7')
+        if current_module is not _FLA_MODULE:
+            _FLA_PROBED = False
+            _FLA_CHUNK_FN = None
+            _FLA_RECURRENT_FN = None
+            _FLA_IMPORT_ERROR = None
+            _FLA_MODULE = None
+        else:
+            if _FLA_IMPORT_ERROR is not None:
+                raise ImportError(_FLA_IMPORT_ERROR)
+            return _FLA_CHUNK_FN, _FLA_RECURRENT_FN
     try:
         from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
     except Exception as exc:  # noqa: BLE001 - broken installs raise anything
@@ -107,10 +122,12 @@ def _load_fla_rwkv7():
             f"(import error: {type(exc).__name__}: {exc})"
         )
         _FLA_PROBED = True
+        _FLA_MODULE = sys.modules.get('fla.ops.rwkv7')
         raise _FLA_IMPORT_ERROR from exc
     _FLA_CHUNK_FN = chunk_rwkv7
     _FLA_RECURRENT_FN = fused_mul_recurrent_rwkv7
     _FLA_PROBED = True
+    _FLA_MODULE = sys.modules.get('fla.ops.rwkv7')
     return _FLA_CHUNK_FN, _FLA_RECURRENT_FN
 
 

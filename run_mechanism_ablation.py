@@ -115,10 +115,16 @@ from ops_fused import CSAHybridLayer, HybridKCHAttention
 from results_analysis import binary_ranking_metrics
 from results_schema import write as write_schema
 from run_ablation import (
+    _aggregate_curve_diagnosis,
+    _attach_curve_diagnostics,
     _compact_overfit_report,
     _eval_model,
     _make_cfg,
     _run_ablation_overfit_gate,
+)
+from train_diagnostics import (
+    VAL_MONITOR_SEED_OFFSET, ValPoint, ValidationCurve, raise_non_finite,
+    triage_gradient,
 )
 from run_quality import (
     MQARHead,
@@ -515,12 +521,21 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
 def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
                   n_kv=1, d_model=32, eval_batches=4, eval_batch=64,
                   train_batch=None, diagnose=True, diag_batches=2,
-                  diag_batch=64, lr=3e-3):
+                  diag_batch=64, lr=3e-3, val_every=0, val_batches=2,
+                  val_batch=32, error_batches=0, error_batch=64,
+                  max_error_examples=2):
     """Train one variant for one seed and return its per-seed record.
 
     The training and evaluation protocol (optimizer, losses, RNG stream
     offsets, latency probe) mirrors ``run_ablation.eval_layout`` so the
     accuracy numbers are directly comparable to Exp 5 at the same budget.
+
+    It now also mirrors Exp 5's *diagnostics*: the same held-out
+    validation curve, the same staged NaN triage and the same bad-case
+    pass. Without them a mechanism variant that scored 0.62 and one that
+    scored 0.62 by saturating a 0.61 model were indistinguishable, so
+    "removing RoPE did not help" could not be separated from "removing
+    RoPE was never trained long enough to show anything".
     """
     if isinstance(device, str):
         device = torch.device(device)
@@ -550,7 +565,25 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
     model.train()
     head.train()
     embed.train()
+
+    # Held-out monitor on the same protocol (and the same stream offsets)
+    # as run_ablation.eval_layout; additive, so final_acc is unchanged.
+    def _val_eval(_step):
+        acc, loss = _eval_model(
+            model, head, embed, seq_len, n_kv, device,
+            n_batches=int(val_batches or 2), batch=int(val_batch or 32),
+            seed=seed, seed_offset=VAL_MONITOR_SEED_OFFSET)
+        return ValPoint(loss=loss, acc=acc)
+
+    curve = ValidationCurve(
+        _val_eval, steps=steps,
+        val_every=int(val_every or 0) or max(1, steps // 4),
+        label=f'variant {variant["name"]} n_kv={n_kv} seed={seed}',
+        ceiling=1.0)
+    curve.record(0)
+
     losses = []
+    train_accs = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
             train_batch, seq_len, n_kv, VOCAB, embed, device,
@@ -560,20 +593,27 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
         if not torch.isfinite(loss):
-            raise RuntimeError(
-                f"non-finite loss at step {step}: {loss.item()} "
-                f"(variant={variant['name']}, seed={seed})")
+            raise_non_finite(
+                'loss', loss=float(loss.detach()),
+                params=params, logits=logits,
+                context=f'step={step}, variant={variant["name"]}, '
+                        f'seed={seed}')
         opt.zero_grad()
         loss.backward()
-        bad_grads = [p for p in params
-                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        bad_grads = triage_gradient(params)
         if bad_grads:
-            raise RuntimeError(
-                f"non-finite gradient at step {step} in {len(bad_grads)} "
-                f"params (variant={variant['name']}, seed={seed})")
+            raise_non_finite(
+                'gradient', loss=float(loss.detach()),
+                params=params,
+                grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                context=f'step={step}, variant={variant["name"]}, '
+                        f'seed={seed}')
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
+        train_accs.append(float((logits.argmax(-1) == target).float().mean()))
+        if curve.enabled and (step + 1) % curve.val_every == 0:
+            curve.record(step + 1)
 
     final_acc, final_loss = _eval_model(
         model, head, embed, seq_len, n_kv, device,
@@ -621,6 +661,14 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
                 'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
                 'skipped_reason': 'diagnostic disabled by caller'}
 
+    curve_block = _attach_curve_diagnostics(
+        curve=curve, model=model, head=head, embed=embed,
+        train_losses=losses, train_accs=train_accs,
+        op_name=f'variant:{variant["name"]}', seq_len=seq_len, n_kv=n_kv,
+        device=device, steps=steps, error_batches=error_batches,
+        error_batch=error_batch, max_error_examples=max_error_examples,
+        seed=seed, label=f'variant {variant["name"]} n_kv={n_kv}')
+
     return {
         'variant': variant['name'],
         'n_kv': n_kv,
@@ -639,6 +687,10 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         'mean_last10_loss': (sum(losses[-10:]) / min(10, len(losses))
                              if losses else None),
         'loss_curve': losses,
+        'acc_curve': train_accs,
+        # Additive results-analysis block (held-out curve + verdict +
+        # generalization gap + bad cases); see run_ablation.eval_layout.
+        **curve_block,
         'gold_recall': diag['gold_recall'],
         'gold_recall_n_samples': diag['n_samples'],
         'gold_topk_effective': diag['gold_topk_effective'],
@@ -798,6 +850,10 @@ def summarize_variant(per_seed, variant):
         'n_layers': ok[0]['n_layers'] if ok else None,
         'mean_train_time_s': (sum(r.get('train_time_s', 0.0) for r in ok)
                               / len(ok)) if ok else None,
+        # Sweep-level view of the held-out curves (same definition as
+        # run_ablation.eval_layout_multi_seed), so a mechanism row carries
+        # the same curve vocabulary as a layout row.
+        **_aggregate_curve_diagnosis(ok),
     }
 
 

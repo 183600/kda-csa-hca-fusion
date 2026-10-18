@@ -89,7 +89,13 @@ from ops_rwkv_backend import validate_rwkv_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, _task_batch_fingerprint,
-    _parse_equivalence_margin, SMALL_MODEL_SPEC,
+    _parse_equivalence_margin, SMALL_MODEL_SPEC, analyze_errors,
+)
+from train_diagnostics import (
+    DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
+    ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
+    ValidationCurve, accuracy_cost_tradeoff, log_tradeoff, raise_non_finite,
+    triage_gradient,
 )
 from multi_seed_stats import tost_from_summary, _ZERO_VAR_REL_EPS
 
@@ -233,7 +239,7 @@ def _append_ablation_manifest(mode, return_code, n_seeds, steps,
 
 
 def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
-                n_batches=4, batch=64, seed=42):
+                n_batches=4, batch=64, seed=42, seed_offset=5_000_000):
     was_training = {m: m.training for m in (model, head, embed)}
     try:
         model.eval()
@@ -241,12 +247,17 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
         embed.eval()
         correct, total = 0, 0
         losses = []
-        # Use a distinct, far-separated offset (5_000_000) for the eval RNG so
-        # it never collides with the *next* seed's training stream
+        # Use a distinct, far-separated offset (5_000_000 by default) for the
+        # eval RNG so it never collides with the *next* seed's training stream
         # (``seed + 1_000_000``), keeping the eval batches fresh and the
         # seeds independent for the multi-seed t-test. This mirrors the
         # RNG isolation in ``run_quality.py``.
-        eval_gen = make_seeded_generator(seed + 5_000_000, device=device)
+        # ``seed_offset`` is parameterized so the held-out VALIDATION monitor
+        # (train_diagnostics.VAL_MONITOR_SEED_OFFSET = 6_000_000) draws from
+        # its own stream instead of re-using the batches the headline
+        # ``final_acc`` is measured on — otherwise "generalization gap"
+        # would compare a model against its own training stream.
+        eval_gen = make_seeded_generator(seed + seed_offset, device=device)
         with torch.no_grad():
             for _ in range(n_batches):
                 x_emb, target, cue_pos = make_mqar_batch(
@@ -535,8 +546,41 @@ def _run_ablation_overfit_gate(build_models, device, *, n_kv=1,
     return record, True
 
 
+def _attach_curve_diagnostics(*, curve, model, head, embed, train_losses,
+                              train_accs, op_name, seq_len, n_kv, device,
+                              steps, error_batches, error_batch,
+                              max_error_examples, seed, label):
+    """Close the held-out curve and run the bad-case pass for one row.
+
+    Factored out so ``eval_layout`` and ``eval_group`` record *identical*
+    diagnostic blocks (same keys, same streams, same definitions), the way
+    they already share ``_eval_model`` and the latency probe. Keeping the
+    protocol in one place is what makes an Exp-5 row and an Exp-8 row
+    directly comparable.
+    """
+    block = curve.finalize(train_losses, train_accs)
+    curve.log_verdict(block)
+    block['error_analysis'] = None
+    if int(error_batches or 0) > 0:
+        # Bad cases come from the dedicated error stream
+        # (seed + ERROR_ANALYSIS_SEED_OFFSET), never from the stream the
+        # reported accuracy was measured on, so the printed examples are
+        # evidence about generalization rather than a re-read of the
+        # headline number.
+        block['error_analysis'] = analyze_errors(
+            model, head, embed, op_name=op_name, task='mqar',
+            seq_len=seq_len, n_kv=n_kv, vocab=VOCAB, device=device,
+            n_batches=int(error_batches), batch=int(error_batch), seed=seed,
+            max_examples=int(max_error_examples))
+    block['error_analysis_seed_offset'] = ERROR_ANALYSIS_SEED_OFFSET
+    block['val_monitor_seed_offset'] = VAL_MONITOR_SEED_OFFSET
+    return block
+
+
 def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, seed=42,
-                device='cpu', eval_batches=4, eval_batch=64, train_batch=None):
+                device='cpu', eval_batches=4, eval_batch=64, train_batch=None,
+                val_every=0, val_batches=2, val_batch=32,
+                error_batches=0, error_batch=64, max_error_examples=2):
     if isinstance(device, str):
         device = torch.device(device)
     # Seed Python/NumPy/torch/CUDA + deterministic cuDNN/algorithm selection
@@ -564,7 +608,33 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
     head.train()
     embed.train()
 
+    # Held-out monitoring curve. READ-ONLY with respect to the optimization:
+    # it changes no loss, no hyper-parameter and no step count, so the
+    # headline ``final_acc`` below keeps its exact meaning and every
+    # existing statistic/schema check is unaffected. What it buys is the
+    # ability to say WHY a layout scored what it scored — overfitting,
+    # underfitting, saturated or healthy — instead of only quoting the
+    # endpoint. The curve is drawn from ``seed + VAL_MONITOR_SEED_OFFSET``,
+    # a stream disjoint from training (1_000_000) and from the headline
+    # eval (5_000_000).
+    def _val_eval(_step):
+        acc, loss = _eval_model(
+            model, head, embed, seq_len, n_kv, device,
+            n_batches=int(val_batches or 2), batch=int(val_batch or 32),
+            seed=seed, seed_offset=VAL_MONITOR_SEED_OFFSET)
+        # ``_eval_model`` returns (accuracy, loss); the monitor's order is
+        # named, so this is checked rather than assumed.
+        return ValPoint(loss=loss, acc=acc)
+
+    curve = ValidationCurve(
+        _val_eval, steps=steps,
+        val_every=int(val_every or 0) or max(1, steps // 4),
+        label=f'layout {ratio[0]}:{ratio[1]}:{ratio[2]} n_kv={n_kv} '
+              f'seed={seed}', ceiling=1.0)
+    curve.record(0)
+
     losses = []
+    train_accs = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
             train_batch, seq_len, n_kv, VOCAB, embed, device, generator=batch_gen)
@@ -573,22 +643,31 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
         if not torch.isfinite(loss):
-            raise RuntimeError(
-                f"non-finite loss at step {step}: {loss.item()} "
-                f"(ratio={ratio}, seed={seed}); aborting this seed to "
-                f"prevent silent NaN propagation into aggregate stats")
+            # Staged triage instead of a bare message: name the FIRST stage
+            # that can explain the NaN (data -> log(0)/div-by-zero ->
+            # softmax overflow -> AMP fp16 -> gradient explosion / LR too
+            # large), so a diverged seed names its cause instead of costing
+            # a blind debugging cycle. Same abort semantics as before: this
+            # seed is dropped, never silently averaged in.
+            raise_non_finite(
+                'loss', loss=float(loss.detach()),
+                token_ids=None, params=params, logits=logits,
+                context=f'step={step}, ratio={ratio}, seed={seed}')
         opt.zero_grad()
         loss.backward()
-        bad_grads = [p for p in params
-                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        bad_grads = triage_gradient(params)
         if bad_grads:
-            raise RuntimeError(
-                f"non-finite gradient at step {step} in {len(bad_grads)} "
-                f"params (ratio={ratio}, seed={seed}); aborting this seed "
-                f"to prevent NaN propagation into parameters")
+            raise_non_finite(
+                'gradient', loss=float(loss.detach()),
+                params=params,
+                grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                context=f'step={step}, ratio={ratio}, seed={seed}')
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
+        train_accs.append(float((logits.argmax(-1) == target).float().mean()))
+        if curve.enabled and (step + 1) % curve.val_every == 0:
+            curve.record(step + 1)
 
     final_acc, final_loss = _eval_model(
         model, head, embed, seq_len, n_kv, device,
@@ -627,6 +706,13 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
 
     last_loss = losses[-1] if losses else 0.0
     mean_last10 = sum(losses[-10:]) / min(10, len(losses)) if losses else 0.0
+    curve_block = _attach_curve_diagnostics(
+        curve=curve, model=model, head=head, embed=embed,
+        train_losses=losses, train_accs=train_accs, op_name='layout',
+        seq_len=seq_len, n_kv=n_kv, device=device, steps=steps,
+        error_batches=error_batches, error_batch=error_batch,
+        max_error_examples=max_error_examples, seed=seed,
+        label=f'layout {ratio[0]}:{ratio[1]}:{ratio[2]} n_kv={n_kv}')
     return {
         'ratio': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
         'n_kv': n_kv,
@@ -642,6 +728,14 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
         'last_train_loss': last_loss,
         'mean_last10_loss': mean_last10,
         'loss_curve': losses,
+        'acc_curve': train_accs,
+        # Additive results-analysis block: the held-out curve, its
+        # over/under/saturation verdict, the generalization gap, the
+        # best-validation point and the bad-case report. Additive on
+        # purpose — ``final_acc`` above still means "accuracy at the fixed
+        # step budget", so the aggregate statistics, the schema checks and
+        # the figures keep their exact meaning.
+        **curve_block,
     }
 
 
@@ -680,6 +774,15 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
                 'last_train_loss': None,
                 'mean_last10_loss': None,
                 'loss_curve': [],
+                'acc_curve': [],
+                # Same keys as a live row, so a consumer can read every
+                # per_seed entry with one code path (mirrors run_quality's
+                # failed-seed stub).
+                'val_history': [],
+                'curve_diagnosis': None,
+                'generalization_gap': None,
+                'best_val': None,
+                'error_analysis': None,
                 'train_time_s': time.time() - t0,
                 'error': str(e),
             })
@@ -736,6 +839,14 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         'mean_fwd_ms': mean_fwd,
         'n_params': ok_per_seed[0]['n_params'],
         'n_layers': ok_per_seed[0]['n_layers'],
+        # Sweep-level view of the held-out curves: the modal verdict across
+        # the surviving seeds, plus how often the seeds AGREE. Seeds that
+        # disagree are the important signal — identical configurations
+        # cannot really be underfitting on one seed and overfitting on
+        # another, so a split verdict means the curve is too short/flat to
+        # carry information at this budget, and the label should not be
+        # quoted as if it were a property of the layout.
+        **_aggregate_curve_diagnosis(ok_per_seed),
         'mean_train_time_s': sum(r.get('train_time_s', 0.0) for r in ok_per_seed) / n,
     }
 
@@ -1148,7 +1259,9 @@ def _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides=None):
 def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
                n_kv=1, steps=100, lr=3e-3, seed=42, device='cpu',
                eval_batches=4, eval_batch=64, train_batch=None,
-               cfg_overrides=None, description=''):
+               cfg_overrides=None, description='', val_every=0,
+               val_batches=2, val_batch=32, error_batches=0,
+               error_batch=64, max_error_examples=2):
     """Train + evaluate ONE matrix group (mirrors eval_layout's protocol).
 
     ``layout`` is the abstract layout (with 'memory' tokens); the returned
@@ -1156,6 +1269,10 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
     actual parameter count (which differs between KDA and Mamba-2 at the
     same d_model — that residual is exactly what the budget-matching
     follow-up closes).
+
+    The held-out curve, the NaN triage and the bad-case pass are the SAME
+    protocol as :func:`eval_layout` (shared helpers, shared RNG stream
+    offsets), so a matrix row and a ratio row are directly comparable.
     """
     if isinstance(device, str):
         device = torch.device(device)
@@ -1182,7 +1299,23 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
     head.train()
     embed.train()
 
+    # Same held-out monitor as eval_layout; see _attach_curve_diagnostics
+    # for why this is additive (final_acc keeps its exact meaning).
+    def _val_eval(_step):
+        acc, loss = _eval_model(
+            model, head, embed, seq_len, n_kv, device,
+            n_batches=int(val_batches or 2), batch=int(val_batch or 32),
+            seed=seed, seed_offset=VAL_MONITOR_SEED_OFFSET)
+        return ValPoint(loss=loss, acc=acc)
+
+    curve = ValidationCurve(
+        _val_eval, steps=steps,
+        val_every=int(val_every or 0) or max(1, steps // 4),
+        label=f'group {group_id} n_kv={n_kv} seed={seed}', ceiling=1.0)
+    curve.record(0)
+
     losses = []
+    train_accs = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
             train_batch, seq_len, n_kv, VOCAB, embed, device, generator=batch_gen)
@@ -1191,22 +1324,25 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
         if not torch.isfinite(loss):
-            raise RuntimeError(
-                f"non-finite loss at step {step}: {loss.item()} "
-                f"(group={group_id}, seed={seed}); aborting this seed to "
-                f"prevent silent NaN propagation into aggregate stats")
+            raise_non_finite(
+                'loss', loss=float(loss.detach()),
+                params=params, logits=logits,
+                context=f'step={step}, group={group_id}, seed={seed}')
         opt.zero_grad()
         loss.backward()
-        bad_grads = [p for p in params
-                     if p.grad is not None and not torch.isfinite(p.grad).all()]
+        bad_grads = triage_gradient(params)
         if bad_grads:
-            raise RuntimeError(
-                f"non-finite gradient at step {step} in {len(bad_grads)} "
-                f"params (group={group_id}, seed={seed}); aborting this "
-                f"seed to prevent NaN propagation into parameters")
+            raise_non_finite(
+                'gradient', loss=float(loss.detach()),
+                params=params,
+                grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                context=f'step={step}, group={group_id}, seed={seed}')
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
+        train_accs.append(float((logits.argmax(-1) == target).float().mean()))
+        if curve.enabled and (step + 1) % curve.val_every == 0:
+            curve.record(step + 1)
 
     final_acc, final_loss = _eval_model(
         model, head, embed, seq_len, n_kv, device,
@@ -1240,6 +1376,13 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
 
     last_loss = losses[-1] if losses else 0.0
     mean_last10 = sum(losses[-10:]) / min(10, len(losses)) if losses else 0.0
+    curve_block = _attach_curve_diagnostics(
+        curve=curve, model=model, head=head, embed=embed,
+        train_losses=losses, train_accs=train_accs, op_name='group',
+        seq_len=seq_len, n_kv=n_kv, device=device, steps=steps,
+        error_batches=error_batches, error_batch=error_batch,
+        max_error_examples=max_error_examples, seed=seed,
+        label=f'group {group_id} n_kv={n_kv}')
     return {
         'group': group_id,
         'memory': memory_type,
@@ -1257,6 +1400,9 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         'last_train_loss': last_loss,
         'mean_last10_loss': mean_last10,
         'loss_curve': losses,
+        'acc_curve': train_accs,
+        # Additive results-analysis block (see eval_layout).
+        **curve_block,
     }
 
 
@@ -1304,6 +1450,12 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                 'train_batch': stub_train_batch,
                 'last_train_loss': None, 'mean_last10_loss': None,
                 'loss_curve': [],
+                'acc_curve': [],
+                'val_history': [],
+                'curve_diagnosis': None,
+                'generalization_gap': None,
+                'best_val': None,
+                'error_analysis': None,
                 'train_time_s': time.time() - t0,
                 'error': str(e),
             })
@@ -1365,6 +1517,8 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
         'n_layers': ok_per_seed[0]['n_layers'],
         'mean_train_time_s': sum(r.get('train_time_s', 0.0)
                                  for r in ok_per_seed) / n,
+        # Same sweep-level curve rollup as the ratio mode.
+        **_aggregate_curve_diagnosis(ok_per_seed),
     }
 
 
@@ -1952,6 +2106,224 @@ def _contrast_consistency_violations(all_results: list,
     return out
 
 
+def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
+    """Roll the per-seed held-out verdicts up to one row-level summary.
+
+    Two things a final-number-only comparison cannot show, and that this
+    makes visible:
+
+    * ``curve_verdict`` / ``curve_verdict_counts`` — the modal verdict, so a
+      row can be read without walking its ``per_seed`` list;
+    * ``curve_verdict_stable`` — whether the surviving seeds AGREE. They
+      cannot legitimately disagree about one configuration: the same layout
+      at the same budget is not underfitting on seed 42 and overfitting on
+      seed 44. A split verdict therefore means the curve is too short or too
+      flat to carry information at this step budget, i.e. the monitor needs
+      more points before its label can be trusted — a fact about the
+      MEASUREMENT, which has to be reported rather than averaged away.
+
+    Also reports the mean generalization gap and the best-validation step
+    seen across seeds, so a row can be re-read at the checkpoint it would
+    have selected instead of at the last step.
+    """
+    verdicts = [v for r in ok_per_seed
+                for v in [(r.get('curve_diagnosis') or {}).get('verdict')] if v]
+    counts: dict = {}
+    for v in verdicts:
+        counts[v] = counts.get(v, 0) + 1
+    gaps = [float(r['generalization_gap']) for r in ok_per_seed
+            if r.get('generalization_gap') is not None
+            and math.isfinite(float(r['generalization_gap']))]
+    best_vals = [r['best_val'] for r in ok_per_seed if r.get('best_val')]
+    best_step = None
+    if best_vals:
+        best_step = min(int(b['step']) for b in best_vals)
+    saturated = sum(1 for r in ok_per_seed
+                    if (r.get('accuracy_regime') or {}).get('saturated'))
+    modal = (max(counts, key=lambda k: counts[k])
+             if len(set(counts.values())) == 1 or counts else None)
+    return {
+        'curve_verdict_counts': counts,
+        'curve_verdict': modal,
+        'curve_verdict_stable': (len(set(counts)) <= 1 if counts else None),
+        'curve_verdict_note': (
+            None if not counts or len(set(counts)) <= 1 else
+            f'the surviving seeds disagree on the curve verdict ({counts}); '
+            f'one configuration cannot be both underfitting and '
+            f'overfitting, so the held-out curve is too short/flat to label '
+            f'this row at the current step budget — raise the step count (or '
+            f'the validation frequency) before quoting the verdict.'),
+        'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        'best_val_step_any_seed': best_step,
+        'n_seeds_at_ceiling': saturated,
+    }
+
+
+def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
+    """Tally the held-out curve verdict across every row of the sweep.
+
+    A sweep that prints "mean_acc=0.62" for ten layouts hides *why* it got
+    there, and the three reasons imply opposite next actions:
+
+    * ``underfitting`` everywhere — the budget, not the layout, is the
+      binding constraint; raising the step count may REORDER the ratios, so
+      the present ranking is not converged and must not be reported as the
+      final answer;
+    * ``overfitting`` everywhere — the layouts are memorizing; more steps
+      will not help, and the fix is regularization / more data / early
+      stopping at the recorded best-validation step;
+    * ``saturated`` everywhere — the probe is too easy and the ceiling, not
+      the architecture, is what is being measured, so differences between
+      rows are compressions of nothing.
+
+    Reporting the tally makes the regime of the WHOLE sweep visible instead
+    of leaving it to be guessed from a single row, and keeps the accuracy
+    claim honest about what it is measuring.
+    """
+    rows = [r for r in all_results if 'error' not in r]
+    counted = [r for r in rows if r.get('curve_verdict')]
+    counts: dict = {}
+    gaps = []
+    for r in counted:
+        counts[r['curve_verdict']] = counts.get(r['curve_verdict'], 0) + 1
+        g = r.get('mean_generalization_gap')
+        if g is not None and math.isfinite(float(g)):
+            gaps.append(float(g))
+    saturated = sorted(
+        str(r.get(label_key))
+        for r in counted if r.get('n_seeds_at_ceiling'))
+    unstable = sorted(
+        str(r.get(label_key))
+        for r in counted if r.get('curve_verdict_stable') is False)
+
+    summary = {
+        'rows_total': len(rows),
+        'rows_with_curve': len(counted),
+        'rows_without_curve': len(rows) - len(counted),
+        'verdict_counts': counts,
+        'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        'max_generalization_gap': max(gaps) if gaps else None,
+        'saturated_at_ceiling': saturated,
+        'rows_with_unstable_verdict': unstable,
+        'regime': None,
+        'interpretation': '',
+        'recommended_action': '',
+    }
+    n = len(counted)
+    if n == 0:
+        summary['interpretation'] = (
+            'no row carries a held-out validation curve, so this sweep '
+            'reports final numbers only and cannot distinguish '
+            'overfitting from underfitting from saturation.')
+        summary['recommended_action'] = (
+            'enable the validation monitor so the sweep can be labelled '
+            'before its ranking is interpreted.')
+        return summary
+
+    def _frac(v):
+        return counts.get(v, 0) / n
+
+    if _frac('underfitting') >= 0.5:
+        summary['regime'] = 'budget_limited'
+        summary['interpretation'] = (
+            f"{_frac('underfitting'):.0%} of rows are still underfitting at "
+            f'the fixed step budget, so the sweep is comparing under-trained '
+            f'models: the ranking is budget-dependent and may reorder with '
+            f'a larger ABL_STEPS.')
+        summary['recommended_action'] = (
+            'raise the step budget (and re-run the paired contrasts) before '
+            'treating the ordering as a structural result.')
+    elif _frac('overfitting') >= 0.5:
+        summary['regime'] = 'overfitting'
+        summary['interpretation'] = (
+            f"{_frac('overfitting'):.0%} of rows overfit: training loss kept "
+            f'falling while held-out loss regressed, so the final-step '
+            f'weights are past the turning point.')
+        summary['recommended_action'] = (
+            'select on the recorded best-validation step instead of the last '
+            'step, and/or add regularization or more data.')
+    elif len(saturated) == n:
+        summary['regime'] = 'saturated'
+        summary['interpretation'] = (
+            'every row reached the task ceiling: the probe is too easy to '
+            'discriminate these layouts and the measured gaps are '
+            'compressions of near-ceiling behaviour.')
+        summary['recommended_action'] = (
+            'raise the difficulty (more keys, more distractors, a longer '
+            'context) so the metric has headroom before the architecture '
+            'is ranked.')
+    else:
+        summary['regime'] = 'mixed'
+        summary['interpretation'] = (
+            f"curve verdicts are mixed ({counts}); a single aggregate "
+            f"accuracy hides per-row differences in what is being measured, "
+            f"so read each row's curve_diagnosis before ranking.")
+        summary['recommended_action'] = (
+            'inspect the per-row curve_diagnosis / best_val fields and '
+            're-run any row whose verdict is underfitting or overfitting '
+            'before quoting an aggregate ranking.')
+
+    if saturated:
+        summary['interpretation'] += (
+            f" {len(saturated)}/{n} rows are additionally pinned at the "
+            f"task ceiling (saturated at ceiling={saturated}), which "
+            f"compresses any accuracy gap between them.")
+
+    # The measurement's own validity. Seeds of ONE configuration cannot
+    # genuinely disagree about being under- or overfitting, so a split
+    # verdict is evidence that the held-out curve is too short/flat to carry
+    # information at this budget — and a label that unstable must not be
+    # quoted as a property of the layout.
+    if unstable:
+        summary['interpretation'] += (
+            f" {len(unstable)}/{n} rows have seeds that DISAGREE on the "
+            f"curve verdict ({unstable}); at this step budget the held-out "
+            f"curve is too short to label those rows reliably.")
+        summary['recommended_action'] = (
+            (summary['recommended_action'] + ' ' if
+             summary['recommended_action'] else '')
+            + 'raise ABL_STEPS (or the validation frequency) until the '
+              'per-seed verdicts agree before quoting them.')
+    return summary
+
+
+def _attach_cost_tradeoffs(contrasts: list, all_results: list,
+                           label_key: str = 'ratio') -> list:
+    """Attach an accuracy-vs-cost verdict to each paired contrast row.
+
+    The paired contrast answers "is the accuracy difference real?"; it does
+    NOT answer "is it worth adopting?". A layout that gains 0.5 points while
+    doubling parameters and inference latency, or a gain that survives no
+    significance test, must not be quoted as an improvement. Each contrast
+    therefore also carries the cost ratios and an explicit verdict (see
+    ``train_diagnostics.accuracy_cost_tradeoff``).
+
+    Significance is taken from the contrast's OWN corrected test, so the
+    cost screen and the statistical screen judge the same evidence.
+    """
+    by_key = {(r.get('n_kv'), str(r.get(label_key))): r
+              for r in all_results if 'error' not in r}
+    for c in contrasts:
+        cand = by_key.get((c.get('n_kv'), str(c.get('ratio'))))
+        ref = by_key.get((c.get('n_kv'), str(c.get('reference_ratio'))))
+        if cand is None or ref is None:
+            c['cost_tradeoff'] = None
+            c['cost_tradeoff_note'] = (
+                'no comparable cost row on one side; the accuracy '
+                'difference is reported without a cost verdict.')
+            continue
+        verdict = accuracy_cost_tradeoff(
+            cand, ref,
+            significant=(bool(c.get('significant_bonferroni'))
+                         if c.get('significant_bonferroni') is not None
+                         else None))
+        c['cost_tradeoff'] = verdict
+        label = (f"{c.get('contrast')} (n_kv={c.get('n_kv')})")
+        log_tradeoff(verdict, label=label)
+        c['cost_tradeoff_note'] = verdict.get('recommendation', '')
+    return contrasts
+
+
 def _ratio_reference_contrasts(all_results: list,
                                reference_label: str = RATIO_REFERENCE_LABEL):
     """Paired seed-matched differences of every ratio vs the reference.
@@ -2504,7 +2876,32 @@ def main():
     ratio_contrast_tests = _annotate_contrast_significance(
         ratio_contrasts, hypotheses=RATIO_SWEEP_HYPOTHESES,
         equivalence_margin=ratio_equiv_margin)
+    # Accuracy-vs-cost screen on the SAME contrasts: a real accuracy
+    # difference that costs a disproportionate amount of parameters, train
+    # time or inference latency is a different operating point, not a
+    # better one. Runs after _annotate_contrast_significance so the
+    # significance screen and the cost screen judge the same corrected test.
+    _attach_cost_tradeoffs(ratio_contrasts, all_results)
     _log_ratio_contrast_table(ratio_contrasts)
+
+    # Regime of the sweep as a whole. Individual rows already carry their
+    # own verdict; this is the one-line answer to "can this ranking be
+    # trusted, or is it a budget artifact?".
+    ratio_curve_summary = _curve_diagnosis_summary(all_results, 'ratio')
+    logger.info('\n' + '=' * 70)
+    logger.info('Training-curve regime (held-out monitor, not final numbers):')
+    logger.info(f'  rows with a curve: {ratio_curve_summary["rows_with_curve"]}'
+                f'/{ratio_curve_summary["rows_total"]}   '
+                f'verdicts={ratio_curve_summary["verdict_counts"]}')
+    if ratio_curve_summary['mean_generalization_gap'] is not None:
+        logger.info(f'  mean generalization gap: '
+                    f"{ratio_curve_summary['mean_generalization_gap']:.4f} "
+                    f"(max {ratio_curve_summary['max_generalization_gap']:.4f})")
+    logger.info(f'  regime: {ratio_curve_summary["regime"]}')
+    logger.info(f'  {ratio_curve_summary["interpretation"]}')
+    if ratio_curve_summary['recommended_action']:
+        logger.info(f'  ACTION: {ratio_curve_summary["recommended_action"]}')
+    logger.info('=' * 70)
 
     logger.info('\nControlled-depth design: all reported ratios contain 5 layers.')
     logger.info('  Parameter counts can still differ by operator type and are reported;')
@@ -2608,6 +3005,21 @@ def main():
         provenance['ratio_contrasts'] = ratio_contrasts
         provenance['contrast_tests'] = ratio_contrast_tests
         provenance['hypotheses'] = RATIO_SWEEP_HYPOTHESES
+        # Sweep-wide training regime + the accuracy-vs-cost screen, so the
+        # artifact records not only which layout won but whether the win
+        # survives the curve diagnosis and what it cost.
+        provenance['curve_diagnosis_summary'] = ratio_curve_summary
+        provenance['cost_tradeoff_policy'] = {
+            'min_effect': DEFAULT_MIN_EFFECT,
+            'max_cost_ratio': DEFAULT_MAX_COST_RATIO,
+            'cost_keys': list(DEFAULT_COST_KEYS),
+            'note': (
+                'A paired contrast is only an adoptable improvement if its '
+                'corrected test is significant AND the accuracy gain clears '
+                'min_effect AND no cost axis exceeds max_cost_ratio. The '
+                'accuracy difference and the cost ratios are reported '
+                'separately so either can be quoted on its own.'),
+        }
         write_results_json(provenance,
                            'results/exp5_ablation_provenance.json',
                            logger=logger)
