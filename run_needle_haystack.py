@@ -431,12 +431,27 @@ def evaluate_needle_recall(
         if hasattr(model, 'hybrid'):
             # NeedleHybridLM path
             model.hybrid.reset_state()
-            logits = model(input_ids.to(device))
+            if quant_spec is None:
+                logits = model(input_ids.to(device))
+            else:
+                # PTQ contract: the recurrent state is fake-quantized after
+                # every write, so the prefill must run token-by-token through
+                # ``forward_step`` (the vectorized ``model(...)`` path has no
+                # state-quantization hook). Only the prefix up to the last
+                # scoring position is needed; the logits returned at step
+                # ``t`` predict token ``t + 1``.
+                last_pred_pos = max(answer_positions) - 1
+                step_logits = [
+                    model.forward_step(
+                        input_ids[:, t:t+1].to(device), quant_spec)
+                    for t in range(last_pred_pos + 1)
+                ]
+                logits = torch.stack(step_logits, dim=1)   # [B, T', vocab]
             # The answer token is predicted at position answer_start - 1
             # (since the model predicts next token)
             for i, ans_pos in enumerate(answer_positions):
                 pred_pos = ans_pos - 1
-                if pred_pos >= 0 and pred_pos < context_len:
+                if pred_pos >= 0 and pred_pos < logits.shape[1]:
                     pred = logits[i, pred_pos].argmax().item()
                     if pred == targets[i].item():
                         correct += 1
@@ -494,28 +509,44 @@ def evaluate_needle_recall_autoregressive(
         input_ids, targets, answer_positions = build_needle_batch(
             batch_size, context_len, needle_pos, tokenizer, seeds=seeds, device=device
         )
-        # Feed context up to the answer position, then generate
+        # Feed context up to the question, then generate the answer tokens
+        # autoregressively.
+        expected = tokenizer.encode(_NEEDLE_ANSWER)
+        n_gen = len(expected)
         for i in range(batch_size):
             seq = input_ids[i:i+1]  # [1, context_len]
             ans_pos = answer_positions[i]
-            # Prefill up to answer position (exclusive)
-            prefill = seq[:, :ans_pos]
-            model.reset_state() if hasattr(model, 'reset_state') else None
+            generated: list[int] = []
             if hasattr(model, 'hybrid'):
+                # Prefill up to (and including) the last question token; the
+                # last prefill logits predict the FIRST answer token. The
+                # previous implementation discarded these logits and re-fed
+                # ``prefill[:, -1:]`` through ``forward_step``, consuming the
+                # last token twice and corrupting the recurrent state.
+                prefill = seq[:, :ans_pos]
                 model.hybrid.reset_state()
-                _ = model(prefill.to(device))
-                # Now generate one token at a time
-                for _ in range(len(_NEEDLE_ANSWER)):  # generate answer length
-                    next_logits = model.forward_step(prefill[:, -1:].to(device), quant_spec)
+                logits = model(prefill.to(device))
+                next_logits = logits[:, -1]
+                for _ in range(n_gen):
                     next_token = next_logits.argmax(dim=-1)
-                    prefill = torch.cat([prefill, next_token.unsqueeze(0)], dim=1)
-                # Check if generated answer matches
-                generated = prefill[0, ans_pos:ans_pos+len(_NEEDLE_ANSWER)].tolist()
-                expected = tokenizer.encode(_NEEDLE_ANSWER)
-                if generated[:len(expected)] == expected:
-                    correct += 1
-                total += 1
-            # ... (similar for stepwise)
+                    generated.append(next_token.item())
+                    next_logits = model.forward_step(
+                        next_token.unsqueeze(-1).to(device), quant_spec)
+            else:
+                # Stepwise model keeps no cross-call state: re-run the
+                # growing prefix and take the last-position logits.
+                prefill = seq[:, :ans_pos]
+                model.reset_state() if hasattr(model, 'reset_state') else None
+                logits = model(prefill, spec=quant_spec, ste=False)
+                for _ in range(n_gen):
+                    next_token = logits[:, -1].argmax(dim=-1)
+                    generated.append(next_token.item())
+                    prefill = torch.cat(
+                        [prefill, next_token.unsqueeze(0)], dim=1)
+                    logits = model(prefill, spec=quant_spec, ste=False)
+            if generated == expected:
+                correct += 1
+            total += 1
 
     accuracy = correct / total if total > 0 else 0.0
     return {
@@ -554,9 +585,18 @@ def train_needle_model(
 
     losses = []
     for step in range(steps):
+        # Draw fresh data seeds for every step from the seeded generator.
+        # Previously the generator was created and never used, so
+        # ``build_needle_batch`` fell back to its default ``range(batch_size)``
+        # seeds and re-created the IDENTICAL batch every step (memorization,
+        # plus the training sequences coincided with the evaluation ones).
+        step_seeds = torch.randint(
+            0, 2**31 - 1, (batch_size,), generator=gen,
+            device=gen.device).cpu().tolist()
         # Build training batch
         input_ids, targets, answer_positions = build_needle_batch(
-            batch_size, train_context_len, train_needle_pos, tokenizer, device=device
+            batch_size, train_context_len, train_needle_pos, tokenizer,
+            seeds=step_seeds, device=device
         )
         # Simple next-token prediction loss on the answer position
         if hasattr(model, 'hybrid'):
@@ -630,9 +670,16 @@ def make_default_configs() -> list[NeedleConfig]:
 
 
 def make_quant_configs(base_configs: list[NeedleConfig], specs: list[QuantSpec]) -> list[NeedleConfig]:
-    """Extend configs with quantization specs for PTQ sweep."""
+    """Extend configs with quantization specs for PTQ sweep.
+
+    The unquantized base row is KEPT for every config so the sweep has a
+    same-seed fp16/fp32 anchor to read the PTQ damage off directly. Previously
+    the base row was dropped for all recurrent memory types (i.e. always),
+    which left the sweep with quantized rows only and no baseline.
+    """
     configs = []
     for base in base_configs:
+        configs.append(base)
         # Only quantize recurrent memory types (KDA, Mamba-2, RWKV-7)
         if base.memory_type in ('kda', 'mamba2', 'rwkv7'):
             for spec in specs:
@@ -647,8 +694,6 @@ def make_quant_configs(base_configs: list[NeedleConfig], specs: list[QuantSpec])
                     dtype=base.dtype,
                     quant_spec=spec,
                 ))
-        else:
-            configs.append(base)
     return configs
 
 
@@ -675,6 +720,11 @@ def run_needle_sweep(
 
         per_seed_results = []
         for seed in seeds:
+            # Re-seed before model construction so the ``seed`` recorded in
+            # the row actually controls the model initialization (previously
+            # the RNG stream kept advancing across configs, making runs
+            # non-reproducible and the multi-seed spread uninterpretable).
+            set_global_seed(seed, deterministic=True)
             # Build model
             model = NeedleHybridLM(
                 vocab_size=tokenizer.vocab_size,
@@ -759,6 +809,11 @@ def run_qat_needle_probe(
     """
     rows = []
     for seed in seeds:
+        # Re-seed before model construction so the ``seed`` recorded in the
+        # row actually controls the model initialization (same rationale as
+        # ``run_needle_sweep``; without it the constructions consumed the
+        # global RNG stream wherever it happened to be).
+        set_global_seed(seed, deterministic=True)
         # Train fp16 baseline
         fp16_model = NeedleStepwiseKDA(tokenizer.vocab_size, d_model=64, H=2, K=16, V=16)
         fp16_model, fp16_rep = train_needle_model(
@@ -855,12 +910,18 @@ def _print_qat_rows(rows: list[dict]):
     for r in rows:
         if r['row_kind'] != 'qat_needle_summary':
             continue
+        # ``recovery_fraction_mean`` / ``_min`` are None when no seed had a
+        # positive PTQ damage baseline (e.g. an all-zero fp16 accuracy), so
+        # format them defensively instead of crashing on ``None:.1%``.
+        rec = r['recovery_fraction_mean']
+        rec_min = r['recovery_fraction_min']
+        rec_str = f'{rec:.1%}' if rec is not None else 'n/a'
+        rec_min_str = f'{rec_min:.1%}' if rec_min is not None else 'n/a'
         logger.info(
             f"  fp16 {r['fp16_accuracy_mean']:.3f} | "
             f"PTQ {r['ptq_accuracy_mean']:.3f} | "
             f"QAT {r['qat_accuracy_mean']:.3f} | "
-            f"recovery {r['recovery_fraction_mean']:.1%} "
-            f"(min {r['recovery_fraction_min']:.1%})")
+            f"recovery {rec_str} (min {rec_min_str})")
 
 
 def main():
@@ -874,8 +935,8 @@ def main():
     parser.add_argument('--context-lens', default=None, help='comma-separated context lengths')
     parser.add_argument('--memory-types', default=None, help='comma-separated memory types')
     parser.add_argument('--dtypes', default=None, help='comma-separated dtypes (fp32,fp16,bf16)')
-    parser.add_argument('--quant-bits', default='2,3,4', help='quantization bits for PTQ')
-    parser.add_argument('--quant-groups', default='16,64', help='quantization group sizes')
+    parser.add_argument('--quant-bits', default=None, help='quantization bits for PTQ')
+    parser.add_argument('--quant-groups', default=None, help='quantization group sizes')
     args = parser.parse_args()
 
     info = configure_torch_for_device()
@@ -889,30 +950,53 @@ def main():
     seeds = tuple(int(s) for s in args.seeds.split(',') if s.strip())
     tokenizer = _NeedleCharTokenizer()
 
+    # Explicit CLI filters override the phase defaults in BOTH modes: the
+    # ``--quick`` branch used to overwrite them unconditionally, silently
+    # ignoring ``--context-lens`` / ``--memory-types`` / ``--dtypes`` /
+    # ``--quant-*`` (so a filtered quick run evaluated unrelated configs).
+    context_lens = ([int(x) for x in args.context_lens.split(',')]
+                    if args.context_lens else None)
+    memory_types = args.memory_types.split(',') if args.memory_types else None
+    dtypes = args.dtypes.split(',') if args.dtypes else None
+    quant_bits = ([int(x) for x in args.quant_bits.split(',')]
+                  if args.quant_bits else None)
+    quant_groups = ([int(x) for x in args.quant_groups.split(',')]
+                    if args.quant_groups else None)
+
     if args.quick:
-        context_lens = [256, 512]
+        context_lens = context_lens or [256, 512]
         needle_ratios = [0.25, 0.75]
-        memory_types = ['kda', 'mamba2']
-        dtypes = ['fp32', 'bf16']
-        quant_bits = [2, 4]
-        quant_groups = [16]
+        memory_types = memory_types or ['kda', 'mamba2']
+        dtypes = dtypes or ['fp32', 'bf16']
+        quant_bits = quant_bits or [2, 4]
+        quant_groups = quant_groups or [16]
         qat_seeds = (0,)
         qat_steps = 20
     else:
-        context_lens = [int(x) for x in args.context_lens.split(',')] if args.context_lens else [256, 512, 1024, 2048]
+        context_lens = context_lens or [256, 512, 1024, 2048]
         needle_ratios = [0.1, 0.25, 0.5, 0.75]
-        memory_types = args.memory_types.split(',') if args.memory_types else ['kda', 'mamba2', 'rwkv7']
-        dtypes = args.dtypes.split(',') if args.dtypes else ['fp32', 'fp16', 'bf16']
-        quant_bits = [int(x) for x in args.quant_bits.split(',')]
-        quant_groups = [int(x) for x in args.quant_groups.split(',')]
+        memory_types = memory_types or ['kda', 'mamba2', 'rwkv7']
+        dtypes = dtypes or ['fp32', 'fp16', 'bf16']
+        quant_bits = quant_bits or [2, 3, 4]
+        quant_groups = quant_groups or [16, 64]
         qat_seeds = (0, 1)
         qat_steps = 100
 
-    # Build base configs
+    # Build base configs. Skip (context_len, ratio) cells where the needle
+    # would not fit: ``build_needle_haystack`` raises when
+    # ``needle_pos + needle_len >= context_len`` (an explicit CLI
+    # ``--context-lens`` can be small enough for the 0.75 cell to overflow).
+    needle_len = (len(tokenizer.encode(_NEEDLE_QUESTION))
+                  + len(tokenizer.encode(_NEEDLE_ANSWER)))
     base_configs = []
     for cl in context_lens:
         for nr in needle_ratios:
             needle_pos = int(cl * nr)
+            if needle_pos + needle_len >= cl:
+                logger.info(f'  skipping ctx={cl}, ratio={nr}: needle '
+                            f'(len={needle_len}) does not fit at '
+                            f'pos={needle_pos}')
+                continue
             for mt in memory_types:
                 for dt in dtypes:
                     base_configs.append(NeedleConfig(

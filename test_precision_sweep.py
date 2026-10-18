@@ -426,13 +426,15 @@ def test_cli_json_roundtrip_and_contract():
             raw = json.load(f)
         _ok('JSON kind tagged', raw['kind'] == ps.SWEEP_KIND, raw.get('kind'))
         _meta, rows, _version = results_schema.parse(raw)
-        _ok('6 groups written (3 paths x 2 dtypes)', len(rows) == 6,
-            f'{len(rows)}')
+        n_case_paths = len(ps.CASES['kda'])
+        n_expected = n_case_paths * 2
+        _ok(f'{n_expected} groups written ({n_case_paths} paths x 2 dtypes)',
+            len(rows) == n_expected, f'{len(rows)}')
         _ok('metadata records the sweep configuration',
             raw['metadata'].get('seeds') == [0]
             and raw['metadata'].get('dtypes', {}).get('explicit')
             == ['float32', 'float16']
-            and raw['metadata'].get('n_groups') == 6, '')
+            and raw['metadata'].get('n_groups') == n_expected, '')
         violations = results_schema.validate_payload(raw)
         _ok('payload passes the registered row contract', violations == [],
             '; '.join(violations[:3]))

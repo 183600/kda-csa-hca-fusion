@@ -245,6 +245,15 @@ class GatedDeltaRule(nn.Module):
         else:
             S = initial_state
 
+        # Empty sequence: no steps to take, return an empty output and the
+        # (unchanged) initial state. ``torch.stack([])`` below would raise
+        # ``RuntimeError: stack expects a non-empty TensorList``; the
+        # reference ``ops_kda.naive_recurrent_kda`` short-circuits T=0 in
+        # the same way.
+        if T == 0:
+            return (torch.zeros(B, 0, H, V, dtype=dtype, device=device),
+                    S)
+
         outputs = []
         for t in range(T):
             # S = S * gate
