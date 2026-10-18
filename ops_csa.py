@@ -486,6 +486,71 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     return indices.masked_fill(torch.isinf(values), -1)
 
 
+def _lightning_indexer_chunk(
+    q_idx_chunk: torch.Tensor,      # [B, T_c, HI, DI]  query slice
+    k_idx: torch.Tensor,            # [B, n_blocks, DI]
+    w_idx_chunk: torch.Tensor | None,   # [B, T_c, HI]
+    topk: int,                      # >= 1 (topk=0 is handled by the caller)
+    scale: float,
+    causal_block_mask_chunk: torch.Tensor | None,   # [T_c, n_blocks]
+    return_soft_weights: bool,
+):
+    """Score + select ONE query slice of the lightning indexer.
+
+    This is the body of :func:`csa_lightning_indexer`, factored out so the
+    public function can tile the query axis without duplicating the scoring,
+    masking, canonical top-k and NaN-safe softmax logic. Every operation in
+    here is row-wise along the query axis (the einsums reduce over ``DI`` /
+    ``HI``; softmax and top-k are per query row), so evaluating a query
+    slice yields results identical to evaluating the same rows inside the
+    full tensor up to batched-GEMM reduction order. That identity is what
+    makes ``query_chunk`` a pure memory optimization with no algorithmic
+    effect — pinned by ``test_csa_indexer_query_chunk_equivalence`` in
+    ``test_csa_chunk_fla_adapter.py``.
+
+    ``topk`` must be >= 1; the ``topk=0`` contract (empty indices plus an
+    optional full soft distribution) is handled by the caller, which also
+    owns the query-chunk loop and the final concatenation.
+    """
+    score = torch.einsum('b t h d, b n d -> b h t n', q_idx_chunk, k_idx)
+    # Multiplying by exactly 1.0 is an IEEE no-op (values and gradients
+    # preserved bit-for-bit); skip it to avoid an allocation.
+    if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
+        score = score * scale
+    score = F.relu(score)
+    if w_idx_chunk is None:
+        logits = score.sum(1)                                       # [B, T_c, n_blocks]
+    else:
+        logits = torch.einsum(
+            'b h t n, b t h -> b t n', score, w_idx_chunk)          # [B, T_c, n_blocks]
+    if causal_block_mask_chunk is not None:
+        # ``logits`` is fresh (einsum/sum output) and both consumers
+        # (the selector and the softmax) read only the masked values, so
+        # the fill can be written in place when no backward needs the
+        # pre-fill tensor (inference / no-grad). Autograd-tracked logits
+        # keep the out-of-place form.
+        if logits.requires_grad:
+            logits = logits.masked_fill(
+                ~causal_block_mask_chunk, float('-inf'))
+        else:
+            logits.masked_fill_(~causal_block_mask_chunk, float('-inf'))
+    B_, T_c, n_blocks = logits.shape
+    S = min(topk, n_blocks)
+    # Deterministic, size-independent top-k (ties by ascending block
+    # index) — see ``_canonical_topk_indices``. This is what keeps the
+    # batched-prefill and incremental-decode selections identical.
+    idx = _canonical_topk_indices(logits, S)
+    if topk > S:
+        idx = torch.cat([idx, idx.new_full((B_, T_c, topk - S), -1)], dim=-1)
+    if return_soft_weights:
+        # The differentiable soft distribution over ALL blocks for the
+        # straight-through estimator. Softmax is row-wise, so computing it
+        # per query chunk and concatenating is value-identical to one
+        # softmax over the full batch.
+        return idx, _nan_safe_softmax(logits, dim=-1)
+    return idx
+
+
 def csa_lightning_indexer(
     q_idx: torch.Tensor,            # [B, T, HI, DI]
     k_idx: torch.Tensor,            # [B, n_blocks, DI]
@@ -497,6 +562,7 @@ def csa_lightning_indexer(
     *,
     ste_mode: str = 'topk_columns',
     normalize_qk: bool = False,
+    query_chunk: int = 0,
 ):
     """Top-k selection over compressed indexer keys (Eq. 13–17).
 
@@ -569,6 +635,27 @@ def csa_lightning_indexer(
         is also exposed for ablation against the magnitude-sensitive
         baseline.
 
+    query_chunk : int, default ``0``
+        Optional query-axis tile size for the indexer scoring. ``0``
+        (default) evaluates all ``T`` queries in one shot, exactly as the
+        historical implementation did. A positive value scores at most
+        ``query_chunk`` queries at a time and concatenates the per-tile
+        selections, which bounds the peak size of the per-head score
+        tensor from ``O(B · HI · T · n_blocks)`` to
+        ``O(B · HI · query_chunk · n_blocks)``. This matters for
+        long-context prefill: at ``T = 1M`` with ``m = 16``,
+        ``HI = 2`` the untiled score tensor holds ~1.25e11 floats
+        (~500 GB in fp32), while a 4096-token tile needs ~1.6M floats per
+        head pair. The selection is unchanged: every operation in the
+        indexer is row-wise along the query axis and the canonical
+        tie-break (:func:`_canonical_topk_indices`) is
+        shape-independent, so the tiled and untiled paths return the same
+        indices (bit-compared in the regression suite) and the same soft
+        weights (up to batched-GEMM reduction order). The ``soft_weights``
+        OUTPUT is still ``[B, T, n_blocks]`` when requested — the tile
+        bound applies to the intermediate per-head scores/logits, not to
+        the STE distribution, which the caller may need in full.
+
     .. note:: Straight-through estimator (STE) for the indexer.
 
         The returned ``idx`` tensor is an integer tensor produced by the
@@ -633,6 +720,18 @@ def csa_lightning_indexer(
     if topk < 0:
         raise ValueError(
             f"topk={topk} must be >= 0 (0 selects zero blocks)")
+    # ``query_chunk`` tiles the QUERY axis (see the docstring section of the
+    # same name). Negative values are rejected rather than silently treated
+    # as "disabled": a typo like ``query_chunk=-4096`` would otherwise run
+    # the untiled path while looking like a memory bound was set.
+    if not isinstance(query_chunk, int) or isinstance(query_chunk, bool):
+        raise ValueError(
+            f"query_chunk={query_chunk!r} must be an int (0 disables "
+            f"query-axis tiling; a positive value is the tile size).")
+    if query_chunk < 0:
+        raise ValueError(
+            f"query_chunk={query_chunk} must be >= 0 (0 disables "
+            f"query-axis tiling).")
     # Validate the indexer key dimension BEFORE computing
     # ``scale = DI ** -0.5``, which requires ``DI > 0``. ``naive_csa``
     # already validates ``c_I >= 1``, but this is a PUBLIC function
@@ -699,64 +798,49 @@ def csa_lightning_indexer(
         q_idx = F.normalize(q_idx, dim=-1)
         k_idx = F.normalize(k_idx, dim=-1)
 
-    # Head-wise similarities [B, HI, T, n_blocks]. Multiplying by a scale of
-    # exactly 1.0 is an IEEE no-op (values and gradients are preserved
-    # bit-for-bit).
-    score = torch.einsum('b t h d, b n d -> b h t n', q_idx, k_idx)
-    if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
-        score = score * scale
-    score = F.relu(score)
-    if w_idx is None:
-        logits = score.sum(1)                                          # [B, T, n_blocks]
-    else:
-        logits = torch.einsum('b h t n, b t h -> b t n', score, w_idx)  # [B, T, n_blocks]
-    if causal_block_mask is not None:
-        # ``logits`` is fresh (einsum/sum output) and both consumers
-        # (the selector and the softmax) read only the masked values, so
-        # the fill can be written in place when no backward needs the
-        # pre-fill tensor (inference / no-grad). Autograd-tracked logits
-        # keep the out-of-place form.
-        if logits.requires_grad:
-            logits = logits.masked_fill(~causal_block_mask, float('-inf'))
-        else:
-            logits.masked_fill_(~causal_block_mask, float('-inf'))
-    # topk=0 guard: return shape-[B, T, 0] indices directly so the
-    # function is self-contained (does not rely on ``naive_csa`` to guard
-    # the ``scores.amax(-1)`` call). ``torch.topk(logits, 0, ...)`` would
-    # itself succeed (returning an empty tensor), but the explicit branch
-    # documents the contract for the degenerate ``S = 0`` case.
-    if topk == 0:
-        idx = q_idx.new_zeros(B_, T, 0, dtype=torch.long)
+    # Query-axis tiling dispatch. ``query_chunk <= 0`` (the default) or a
+    # tile at least as large as T evaluates everything in ONE call to
+    # ``_lightning_indexer_chunk`` — the historical code path, just moved
+    # into the shared helper (the operations inside are unchanged, so the
+    # disabled path stays bit-identical). A positive tile smaller than T
+    # loops over query slices and concatenates the per-tile results; every
+    # indexer operation is row-wise along the query axis and the canonical
+    # tie-break is shape-independent, so the result is the same while the
+    # peak size of the per-head score tensor shrinks from
+    # ``B·HI·T·n_blocks`` to ``B·HI·query_chunk·n_blocks``.
+    tile = T if query_chunk <= 0 else min(query_chunk, T)
+
+    def _run_chunk(start: int, end: int):
+        mask_chunk = (None if causal_block_mask is None
+                      else causal_block_mask[start:end])
+        w_chunk = None if w_idx is None else w_idx[:, start:end]
+        return _lightning_indexer_chunk(
+            q_idx[:, start:end], k_idx, w_chunk, topk, scale,
+            mask_chunk, return_soft_weights)
+
+    if tile >= T:
+        # ``topk=0`` is handled inside ``_lightning_indexer_chunk``: the
+        # canonical selector returns shape-[B, T, 0] indices for ``S = 0``
+        # and the softmax still produces the full differentiable
+        # distribution when requested, preserving the historical contract.
+        return _run_chunk(0, T)
+
+    # Tiled path: accumulate per-tile selections, then concatenate along the
+    # query axis.
+    idx_tiles: list[torch.Tensor] = []
+    soft_tiles: list[torch.Tensor] = []
+    for start in range(0, T, tile):
+        end = min(start + tile, T)
+        result = _run_chunk(start, end)
         if return_soft_weights:
-            # Use the shared _nan_safe_softmax helper.
-            soft_weights = _nan_safe_softmax(logits, dim=-1)
-            return idx, soft_weights
-        return idx
-    S = min(topk, n_blocks)
-    # Deterministic, size-independent top-k (ties by ascending block
-    # index) — see ``_canonical_topk_indices``. This is what keeps the
-    # batched-prefill and incremental-decode selections identical.
-    idx = _canonical_topk_indices(logits, S)
-    if topk > S:
-        idx = torch.cat([idx, idx.new_full((B_, T, topk - S), -1)], dim=-1)
-    # Compute a differentiable soft distribution over ALL
-    # blocks for the straight-through estimator. ``logits`` still has
-    # grad-fn back to the indexer parameters (W_IUQ, W_w, W_KV_idx,
-    # W_Z_idx, B_idx) because it is a function of q_idx / k_idx / w_idx
-    # which are themselves functions of those parameters. The softmax
-    # here is over the full n_blocks dimension (not just the top-k), so
-    # gradients flow to every block's logit — the indexer learns which
-    # blocks SHOULD have been selected, even for blocks not in the
-    # current hard top-k.
-    #
-    # We use a numerically stable softmax that handles all-masked rows
-    # (early query tokens with no preceding causal block) by replacing
-    # their -inf entries with 0 before the exp, then zeroing the result.
-    # This mirrors the NaN-safe softmax in ``naive_csa``'s else-branch.
+            idx_t, soft_t = result
+            soft_tiles.append(soft_t)
+        else:
+            idx_t = result
+        idx_tiles.append(idx_t)
+    idx = torch.cat(idx_tiles, dim=1)
     if return_soft_weights:
-        # Use the shared _nan_safe_softmax helper.
-        soft_weights = _nan_safe_softmax(logits, dim=-1)               # [B, T, n_blocks]
-        return idx, soft_weights
+        return idx, torch.cat(soft_tiles, dim=1)
     return idx
 
 
@@ -794,6 +878,7 @@ def naive_csa(
     rope_dim: int | None = None,
     rope_base: float = 10000.0,
     qk_norm_mode: str = 'l2',
+    indexer_chunk: int = 0,
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -825,6 +910,17 @@ def naive_csa(
     ``naive_chunk_kda``. Real tokens keep their original positions; only the
     last partial block contains padding zeros, and the causal block mask
     ensures no real token attends to it.
+
+    ``indexer_chunk`` (default 0 = disabled) forwards a query-axis tile size
+    to :func:`csa_lightning_indexer`'s ``query_chunk``: the lightning-indexer
+    scores are then computed for at most ``indexer_chunk`` queries at a time,
+    bounding the peak per-head score tensor to
+    ``O(B · nIh · indexer_chunk · n_blocks)`` instead of
+    ``O(B · nIh · T · n_blocks)``. The selection and STE soft weights are
+    unchanged (pinned by ``test_csa_naive_indexer_chunk_end_to_end`` in
+    ``test_csa_chunk_fla_adapter.py``); only the
+    intermediate memory footprint changes. Useful for long-context prefill and
+    for `torch.compile`'d call sites that need bounded intermediate buffers.
 
     .. warning:: **``fuse_projections`` and the**
         ``use_ste=False`` **gradient contract.**
@@ -901,6 +997,20 @@ def naive_csa(
         raise ValueError(
             f"sliding_window={sliding_window} must be >= 0 "
             f"(0 disables the branch)")
+    # ``indexer_chunk`` tiles the indexer's QUERY axis (see
+    # ``csa_lightning_indexer``'s ``query_chunk``). 0 = disabled (the
+    # historical full-sequence scoring); a positive value bounds the peak
+    # per-head score tensor to ``B · nIh · indexer_chunk · n_blocks``.
+    # Negative values would silently run the untiled path (looking like a
+    # memory bound was applied) — reject them.
+    if not isinstance(indexer_chunk, int) or isinstance(indexer_chunk, bool):
+        raise ValueError(
+            f"indexer_chunk={indexer_chunk!r} must be an int (0 disables "
+            f"query-axis tiling of the lightning indexer).")
+    if indexer_chunk < 0:
+        raise ValueError(
+            f"indexer_chunk={indexer_chunk} must be >= 0 "
+            f"(0 disables query-axis tiling).")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (i.e. when ``normalize_qk=True``, see the normalization block below),
     # their dot product is a cosine similarity in ``[-1, 1]`` and the natural
@@ -1095,7 +1205,8 @@ def naive_csa(
                                     causal_block_mask=cbm,
                                     return_soft_weights=effective_use_ste,
                                     ste_mode=ste_mode,
-                                    normalize_qk=normalize_qk)     # [B, T, topk]
+                                    normalize_qk=normalize_qk,
+                                    query_chunk=indexer_chunk)     # [B, T, topk]
     # When STE is active, the indexer also returns a differentiable
     # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
     # straight-through estimator. We keep it in a variable that is ``None``

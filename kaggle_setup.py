@@ -21,7 +21,9 @@ It exposes:
   * ``set_global_seed(seed)`` -> seeds Python/NumPy/torch/CUDA (and
                                 optionally cuDNN determinism) from one seed.
   * ``seed_worker``          -> deterministic DataLoader ``worker_init_fn``.
-  * ``capture_provenance()`` -> environment + git metadata for run records.
+  * ``capture_provenance()`` -> environment + git metadata for run records,
+    including requested vs. resolved accelerator backends
+    (``backend_resolution_provenance()``).
   * ``write_json_atomic()``  -> atomic, strict-JSON result writer.
 
 Design notes
@@ -577,6 +579,92 @@ def print_env_summary() -> EnvInfo:
     return info
 
 
+def backend_resolution_provenance() -> dict:
+    """Requested vs. RESOLVED accelerator backends, best-effort.
+
+    A recall/quality table must be attributable to the kernels that
+    actually ran, not the ones the environment requested: with
+    ``KDA_BACKEND=auto`` / ``MAMBA_BACKEND=auto`` / ``RWKV_BACKEND=auto``
+    a CPU-only box (or one with a broken optional package) silently
+    produces reference-implementation numbers while a GPU box runs the
+    Triton kernels — same command, same result filename, different
+    experiment. The ``*_backend`` keys record the env request; the
+    ``*_backend_resolved`` keys record what dispatch will actually do
+    (the same ``resolve_*_backend`` helpers the runners use); the
+    ``*_available`` booleans distinguish "package absent" from "package
+    installed but unusable"; the version keys pin the optional wheels.
+
+    Every probe here runs through the never-raising availability checks,
+    and any unexpected failure degrades to ``None`` — provenance capture
+    must never be the reason an experiment dies. All values are strict
+    JSON (str / bool / None).
+    """
+    import os
+    from importlib import metadata as _importlib_metadata
+
+    requested_kda = os.environ.get('KDA_BACKEND', 'reference')
+    requested_mamba = os.environ.get('MAMBA_BACKEND', 'reference')
+    requested_rwkv = os.environ.get('RWKV_BACKEND', 'reference')
+    out = {
+        'mamba_backend': requested_mamba,
+        'rwkv_backend': requested_rwkv,
+        'kda_backend_resolved': None,
+        'mamba_backend_resolved': None,
+        'rwkv_backend_resolved': None,
+        'fla_available': None,
+        'fla_rwkv7_available': None,
+        'mamba_ssm_available': None,
+        'mamba_ssm_version': None,
+    }
+    try:
+        out['mamba_ssm_version'] = _importlib_metadata.version('mamba-ssm')
+    except Exception:
+        pass
+    # Each backend is probed independently: a failure in one resolver must
+    # not erase another backend's record.
+    try:
+        from ops_kda_backend import fla_available, resolve_kda_backend
+        try:
+            out['fla_available'] = bool(fla_available())
+        except Exception:
+            pass
+        try:
+            out['kda_backend_resolved'] = resolve_kda_backend(requested_kda)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        from ops_mamba_backend import (mamba2_official_available,
+                                       resolve_mamba_backend)
+        try:
+            out['mamba_ssm_available'] = bool(mamba2_official_available())
+        except Exception:
+            pass
+        try:
+            out['mamba_backend_resolved'] = resolve_mamba_backend(
+                requested_mamba)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        from ops_rwkv_backend import (resolve_rwkv_backend,
+                                      rwkv7_fla_available)
+        try:
+            out['fla_rwkv7_available'] = bool(rwkv7_fla_available())
+        except Exception:
+            pass
+        try:
+            out['rwkv_backend_resolved'] = resolve_rwkv_backend(
+                requested_rwkv)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return out
+
+
 def capture_provenance() -> dict:
     """Capture environment provenance for result JSON files.
 
@@ -589,6 +677,11 @@ def capture_provenance() -> dict:
     when the run started: a bare commit hash is not enough to reproduce a
     run whose code differs from HEAD, and silently reporting only the hash
     would make such a run look reproducible when it is not.
+
+    Also merges :func:`backend_resolution_provenance`: requested backend
+    env vars alone are misleading when ``'auto'`` silently resolves to
+    the reference path, so the resolved backends / optional-package
+    availability / versions are recorded alongside.
     """
     import os
     import platform
@@ -621,6 +714,12 @@ def capture_provenance() -> dict:
         git_dirty = bool(dirty)
     except Exception:
         pass
+    try:
+        backend_info = backend_resolution_provenance()
+    except Exception:
+        # Even the never-raising helper is guarded here: provenance must
+        # never take a run down, whatever happens in an exotic env.
+        backend_info = {}
     return {
         'captured_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'python_version': sys.version.split()[0],
@@ -642,6 +741,7 @@ def capture_provenance() -> dict:
         'cublas_workspace_config': os.environ.get(
             'CUBLAS_WORKSPACE_CONFIG', '<unset>'),
         'num_threads': info.num_threads,
+        **backend_info,
     }
 
 

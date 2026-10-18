@@ -53,12 +53,44 @@ def _load_fla_ops():
 
 
 def fla_available() -> bool:
-    """Return whether FLA can be imported without changing global state."""
+    """Return whether FLA can be imported without changing global state.
+
+    This is an availability PROBE used by ``backend='auto'`` dispatch and by
+    provenance helpers, so it must never raise: a *broken* installation
+    (e.g. an FLA revision whose import chain fails with a ``RuntimeError``
+    because its Triton dependency is missing or version-mismatched, or an
+    ``OSError`` from a half-installed wheel) must read as "not available"
+    rather than crash the caller before the reference fallback can run.
+    ``backend='fla'`` still surfaces the original import error with the
+    actionable message from :func:`_load_fla_ops`.
+    """
     try:
         _load_fla_ops()
     except ImportError:
         return False
+    except Exception:  # noqa: BLE001 - a probe must never raise
+        return False
     return True
+
+
+def resolve_kda_backend(requested: str) -> str:
+    """Resolve the KDA backend that WOULD be used, for provenance recording.
+
+    Mirrors :func:`ops_mamba_backend.resolve_mamba_backend` and
+    :func:`ops_rwkv_backend.resolve_rwkv_backend`: returns ``'fla'`` only
+    when the request is compatible with the environment (CUDA present +
+    package importable); otherwise ``'reference'``. Never raises on an
+    environment mismatch (an invalid backend NAME still raises via
+    :func:`validate_kda_backend`), so experiment runners can record the
+    requested backend and the actually-resolved one separately — the
+    requested value alone is misleading when ``'auto'`` silently falls back.
+    """
+    validate_kda_backend(requested)
+    if requested == 'reference':
+        return 'reference'
+    if torch.cuda.is_available() and fla_available():
+        return 'fla'
+    return 'reference'
 
 
 # ``_call_fla`` passes these flags as False because the caller has ALREADY
@@ -212,7 +244,13 @@ def kda_forward(
     actionable ImportError when it is not installed. ``backend='auto'`` uses
     FLA only for CUDA tensors when it is importable; unsupported FLA argument
     combinations (including assertion-based checks in older FLA releases)
-    fall back to the reference implementation. ``g_clamp_min``
+    fall back to the reference implementation, and a WARNING is emitted with
+    the original exception so the fallback is never silent. The fallback
+    exception surface covers API drift (``ValueError`` / ``TypeError`` /
+    ``NotImplementedError`` / ``AssertionError``) and runtime kernel
+    failures (``RuntimeError``, e.g. a Triton compile/launch failure), but
+    NOT CUDA out-of-memory: an OOM is re-raised instead of silently
+    re-running the workload on the (much slower) reference loop. ``g_clamp_min``
     is applied before both backends so their gate contract matches.
 
     ``recompute_attn`` is a reference-path-only knob (see
@@ -273,8 +311,17 @@ def kda_forward(
                 use_chunk=use_chunk,
                 g_clamp_min=downstream_clamp,
             )
-        except (ImportError, ValueError, NotImplementedError, AssertionError) as exc:
+        except (ImportError, ValueError, TypeError, NotImplementedError,
+                AssertionError, RuntimeError) as exc:
             if backend == "fla":
+                raise
+            # A CUDA out-of-memory error is a RESOURCE failure, not a
+            # kernel/API incompatibility: silently re-running the same
+            # workload on the Python reference loop would turn an explicit
+            # OOM into an hours-long hang. Re-raise it so the user sees the
+            # real problem (and can reduce the batch / sequence length).
+            if isinstance(exc, RuntimeError) and \
+                    'out of memory' in str(exc).lower():
                 raise
             warnings.warn(
                 f"kda_backend='auto' could not use FLA ({type(exc).__name__}: "
@@ -327,4 +374,5 @@ def kda_forward(
     )
 
 
-__all__ = ["fla_available", "kda_forward", "validate_kda_backend"]
+__all__ = ["fla_available", "kda_forward", "resolve_kda_backend",
+           "validate_kda_backend"]

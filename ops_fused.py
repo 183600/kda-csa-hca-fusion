@@ -213,6 +213,14 @@ class HybridConfig:
     csa_nIh: int = 2
     csa_cI: int = 32
     csa_sliding_window: int = 16
+    # Query-axis tile size for the CSA lightning indexer (0 = disabled,
+    # the historical full-sequence scoring). A positive value caps the
+    # peak per-head indexer score tensor at
+    # ``B · nIh · csa_indexer_chunk · n_blocks`` instead of
+    # ``B · nIh · T · n_blocks`` — the selection is unchanged
+    # (row-wise ops + canonical tie-break), only the intermediate
+    # memory footprint. Relevant for long-context prefill.
+    csa_indexer_chunk: int = 0
     # HCA config
     hca_m2: int = 64            # heavy compression (>> csa_m)
     hca_nh: int = 4
@@ -515,6 +523,18 @@ class HybridConfig:
                 f"csa_sliding_window={self.csa_sliding_window!r} must be a "
                 f"non-negative int (0 disables the branch; negative would "
                 f"silently skip the sliding-window code path).")
+        # ``csa_indexer_chunk`` tiles the indexer's query axis. 0 is valid
+        # (disabled, historical behaviour); a negative value must not
+        # silently run the untiled path, because that would look like a
+        # memory bound was applied while the full ``[B, nIh, T, n_blocks]``
+        # score tensor is still materialized.
+        if (not isinstance(self.csa_indexer_chunk, int)
+                or isinstance(self.csa_indexer_chunk, bool)
+                or self.csa_indexer_chunk < 0):
+            raise ValueError(
+                f"csa_indexer_chunk={self.csa_indexer_chunk!r} must be a "
+                f"non-negative int (0 disables query-axis tiling of the "
+                f"CSA lightning indexer).")
         # HCA-specific: mirrors CSA's checks for the HCA analogs.
         if (not isinstance(self.hca_nh, int) or isinstance(self.hca_nh, bool)
                 or self.hca_nh < 1):
@@ -1056,6 +1076,8 @@ class CSAHybridLayer(nn.Module):
             # Match the cosine-style CSA indexer contract: rankings should be
             # driven by direction, not by arbitrary q_idx / K_idx magnitudes.
             normalize_qk=True,
+            # Bounded-memory indexer scoring (0 = full-sequence scoring).
+            indexer_chunk=cfg.csa_indexer_chunk,
         )
         return self.o_proj(o), None
 

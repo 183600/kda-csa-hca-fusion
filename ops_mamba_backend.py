@@ -64,7 +64,18 @@ def validate_mamba_backend(backend: str) -> str:
 
 
 def _load_official_module():
-    """Import the official Mamba-2 mixer + InferenceParams lazily once."""
+    """Import the official Mamba-2 mixer + InferenceParams lazily once.
+
+    Failure contract: an *absent* package raises the install-hint
+    ``ImportError``; a package that is installed but BROKEN (e.g. its
+    Triton dependency fails at import time with ``RuntimeError``, or a
+    half-extracted wheel raises ``OSError``) is wrapped into an equally
+    actionable ``ImportError`` that names the original exception. Both
+    failures are surfaced by an explicit ``backend='official'`` request;
+    the availability probe catches them and reports "not available" so
+    ``backend='auto'`` can fall back (see
+    :func:`mamba2_official_available`).
+    """
     global _MAMBA2_CLS, _INFERENCE_PARAMS_CLS, _IMPORT_ERROR
     if _MAMBA2_CLS is not None:
         return _MAMBA2_CLS, _INFERENCE_PARAMS_CLS
@@ -90,16 +101,34 @@ def _load_official_module():
             "'mamba-ssm' (pip install -e '.[mamba]'). Install it, or use "
             "mamba_backend='reference' / 'auto'."
         ) from exc
+    except Exception as exc:  # noqa: BLE001 - broken installs raise anything
+        _IMPORT_ERROR = exc
+        raise ImportError(
+            "Mamba-2 backend 'official' found 'mamba-ssm' installed but "
+            "its import chain failed "
+            f"({type(exc).__name__}: {exc}); the installation looks "
+            "broken (Triton/torch version mismatch or an incomplete "
+            "wheel). Reinstall mamba-ssm, or use mamba_backend="
+            "'reference' / 'auto'."
+        ) from exc
     _MAMBA2_CLS = _Mamba2
     _INFERENCE_PARAMS_CLS = InferenceParams
     return _MAMBA2_CLS, _INFERENCE_PARAMS_CLS
 
 
 def mamba2_official_available() -> bool:
-    """Return whether the official Mamba-2 module can be imported."""
+    """Return whether the official Mamba-2 module can be imported.
+
+    Availability PROBE: never raises (mirrors
+    ``ops_kda_backend.fla_available`` / ``ops_rwkv_backend.
+    rwkv7_fla_available``). A broken install reads as unavailable so
+    ``resolve_mamba_backend('auto')`` stays honest and can fall back;
+    an explicit ``backend='official'`` request still surfaces the
+    actionable ``ImportError`` from :func:`_load_official_module`.
+    """
     try:
         _load_official_module()
-    except ImportError:
+    except Exception:  # noqa: BLE001 - a probe must never raise
         return False
     return True
 

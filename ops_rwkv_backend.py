@@ -80,35 +80,59 @@ def _load_fla_rwkv7():
     flash-linear-attention that predates the RWKV-7 ops would satisfy
     ``import fla`` but cannot serve this backend, and silently mapping
     it to the reference path would misreport provenance.
+
+    Outcome caching contract: the first import ATTEMPT is the only one
+    (``_FLA_PROBED``). Whether it succeeds OR fails, the outcome is
+    cached so repeated probes / dispatches never re-import a broken
+    package. A failed attempt ALWAYS stores an actionable
+    ``ImportError`` in ``_FLA_IMPORT_ERROR`` before re-raising —
+    including non-``ImportError`` failures such as a Triton version
+    mismatch raising ``RuntimeError`` at import time. Previously the
+    error was only cached for ``ImportError``: a broken install then
+    left ``_FLA_PROBED=True`` with ``_FLA_IMPORT_ERROR=None`` and the
+    kernel callables ``None``, so the SECOND probe took the success
+    branch, reported ``True``, and dispatch crashed on
+    ``NoneType(...)``. The failure is now a definite, cached answer.
     """
     global _FLA_CHUNK_FN, _FLA_RECURRENT_FN, _FLA_IMPORT_ERROR, _FLA_PROBED
     if _FLA_PROBED:
         if _FLA_IMPORT_ERROR is not None:
             raise ImportError(_FLA_IMPORT_ERROR)
         return _FLA_CHUNK_FN, _FLA_RECURRENT_FN
-    _FLA_PROBED = True
     try:
         from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
-    except ImportError as exc:
+    except Exception as exc:  # noqa: BLE001 - broken installs raise anything
         _FLA_IMPORT_ERROR = ImportError(
             "The RWKV-7 'fla' backend requires flash-linear-attention "
             "with fla.ops.rwkv7 (pip install flash-linear-attention, or "
             "the RWKV-FLA fork). Note the KDA route may pin an older "
             "'fla' without rwkv7 ops — if so, isolate the RWKV "
             "environment instead of overwriting the KDA pin. "
-            f"(import error: {exc})"
+            f"(import error: {type(exc).__name__}: {exc})"
         )
+        _FLA_PROBED = True
         raise _FLA_IMPORT_ERROR from exc
     _FLA_CHUNK_FN = chunk_rwkv7
     _FLA_RECURRENT_FN = fused_mul_recurrent_rwkv7
+    _FLA_PROBED = True
     return _FLA_CHUNK_FN, _FLA_RECURRENT_FN
 
 
 def rwkv7_fla_available() -> bool:
-    """Return whether the fla RWKV-7 kernels can be imported."""
+    """Return whether the fla RWKV-7 kernels can be imported.
+
+    Availability PROBE: never raises (mirrors
+    ``ops_kda_backend.fla_available``). A *broken* installation (import
+    chain failing with ``RuntimeError`` from a Triton mismatch,
+    ``OSError`` from a half-extracted wheel, ...) reads as "not
+    available" so ``'auto'`` can fall back and provenance helpers stay
+    honest; an explicitly requested ``'fla'`` dispatch still surfaces
+    the actionable cached ``ImportError`` from
+    :func:`_load_fla_rwkv7`.
+    """
     try:
         _load_fla_rwkv7()
-    except ImportError:
+    except Exception:  # noqa: BLE001 - a probe must never raise
         return False
     return True
 
@@ -204,8 +228,13 @@ def rwkv7_forward(
     loudly when unavailable (an explicitly requested accelerated
     backend must never silently fall back — mirrors
     ``ops_mamba_backend``); ``'auto'`` resolves to fla when possible
-    and falls back with a warning; ``'reference'`` always uses the
-    in-module scan.
+    and falls back with a ``RuntimeWarning`` naming the cause;
+    ``'reference'`` always uses the in-module scan. The 'auto' fallback
+    surface mirrors ``ops_kda_backend.kda_forward``: ``ImportError`` /
+    ``ValueError`` / ``TypeError`` / ``NotImplementedError`` /
+    ``AssertionError`` / ``RuntimeError``, but NOT CUDA out-of-memory
+    (re-raised: a resource failure must stay loud instead of becoming
+    an hours-long reference-loop run).
     """
     backend = validate_rwkv_backend(backend)
     if backend == 'reference':
@@ -225,15 +254,25 @@ def rwkv7_forward(
                 r, log_w, k, v, kk, a,
                 scale=scale, initial_state=initial_state,
                 output_final_state=output_final_state)
-        except (ImportError, RuntimeError):
-            # Importable but broken at runtime (e.g. a triton mismatch):
-            # fall back with a warning so the resolution is visible.
+        except (ImportError, ValueError, TypeError, NotImplementedError,
+                AssertionError, RuntimeError) as exc:
+            # API drift (renamed/missing kwargs -> TypeError/ValueError)
+            # and runtime kernel failures (a Triton compile/launch failure
+            # -> RuntimeError) both justify the documented 'auto' fallback
+            # — the same exception surface ops_kda_backend uses. CUDA
+            # out-of-memory does NOT: it is a resource failure, and
+            # silently re-running the workload on the Python reference
+            # loop would turn an explicit OOM into an hours-long hang.
+            if isinstance(exc, RuntimeError) and \
+                    'out of memory' in str(exc).lower():
+                raise
+            # Fall back with a warning so the resolution is visible.
             warnings.warn(
-                "rwkv7_forward: backend 'auto' fell back to the reference "
-                "scan (the fla kernels failed at runtime). The resolved "
-                "backend must still be recorded via "
-                "resolve_rwkv_backend / effective_backend.",
-                stacklevel=2)
+                f"rwkv7_forward: backend 'auto' fell back to the reference "
+                f"scan ({type(exc).__name__}: {exc}). The resolved backend "
+                f"must still be recorded via resolve_rwkv_backend / "
+                f"effective_backend.",
+                RuntimeWarning, stacklevel=2)
     return rwkv7_reference_scan(
         r, log_w, k, v, kk, a,
         scale=scale, initial_state=initial_state,
