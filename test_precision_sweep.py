@@ -354,8 +354,9 @@ def test_real_tiny_sweep_all_pass_and_error_ordering():
                         dtypes=[torch.float32, torch.float16, torch.bfloat16],
                         seeds=[0, 1], seq_len=16, chunk_size=8)
     summary = ps.summarize(rows)
-    _ok('7 case-paths x 3 dtypes = 21 groups',
-        len(summary) == 7 * 3, f'{len(summary)}')
+    n_case_paths = sum(len(paths) for paths in ps.CASES.values())
+    _ok(f'{n_case_paths} case-paths x 3 dtypes = {n_case_paths * 3} groups',
+        len(summary) == n_case_paths * 3, f'{len(summary)}')
     _ok('every real group passes its budget',
         all(r['verdict'] == 'pass' for r in summary),
         '; '.join(ps.failures(summary))[:300])

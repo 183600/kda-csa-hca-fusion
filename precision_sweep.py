@@ -73,6 +73,7 @@ import torch  # noqa: E402
 from kaggle_setup import capture_provenance  # noqa: E402
 from ops_kda import (assoc_scan_chunk_kda, naive_chunk_kda,  # noqa: E402
                      naive_recurrent_kda)
+from ops_kda_autograd import custom_recurrent_kda  # noqa: E402
 from ops_mamba import (chunked_mamba2_scan, naive_mamba2_scan,  # noqa: E402
                        quadratic_mamba2_scan)
 from ops_rwkv import rwkv7_reference_scan  # noqa: E402
@@ -106,9 +107,11 @@ DEFAULT_ACCUM_FACTOR = 2.0
 DEFAULT_N_SEEDS = 3
 DEFAULT_SEEDS = tuple(range(DEFAULT_N_SEEDS))
 
-#: Case registry: family -> numerically independent paths of the same op.
+#: Case registry: family -> paths of the same op (independent reduction
+#: orders, or — for ``custom`` — the same forward differentiated by a
+#: hand-written adjoint instead of per-step autograd).
 CASES = {
-    'kda': ('rec', 'chunk', 'assoc'),
+    'kda': ('rec', 'chunk', 'assoc', 'custom'),
     'mamba2': ('naive', 'quad', 'chunk'),
     'rwkv7': ('rwkv',),
 }
@@ -294,6 +297,7 @@ def call_case(case: str, path: str, inputs: dict, *, chunk_size: int = 16):
               'chunk': lambda **kw: naive_chunk_kda(**kw, chunk_size=chunk_size),
               'assoc': lambda **kw: assoc_scan_chunk_kda(**kw,
                                                         chunk_size=chunk_size),
+              'custom': custom_recurrent_kda,
               }[path]
         return fn(**inputs, output_final_state=True)
     if case == 'mamba2':

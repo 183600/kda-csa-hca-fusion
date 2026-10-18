@@ -35,6 +35,34 @@ from ops_rope import (
 )
 
 
+# ---------------------------------------------------------------------------
+# bfloat16 numerical stability helpers (mirrors ops_kda_autograd.py / ops_csa.py)
+# ---------------------------------------------------------------------------
+def _bf16_safe_softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Safe softmax for bfloat16: clamp logits before softmax to prevent Inf."""
+    if logits.dtype == torch.bfloat16:
+        logits = logits.clamp(min=-50.0, max=50.0)
+    return torch.softmax(logits, dim=dim)
+
+
+def _bf16_safe_exp(x: torch.Tensor, clamp_max: float = 50.0) -> torch.Tensor:
+    """Safe exp for bfloat16: clamp before exp to prevent overflow."""
+    if x.dtype == torch.bfloat16:
+        x = x.clamp(max=clamp_max)
+    return x.exp()
+
+
+def _bf16_scale_if_needed(
+    x: torch.Tensor, max_norm: float = 1e4
+) -> torch.Tensor:
+    """Scale tensor down if its norm exceeds max_norm (bf16 only)."""
+    if x.dtype != torch.bfloat16:
+        return x
+    norms = x.norm(p=2, dim=-1, keepdim=True)
+    scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
+    return x * scale
+
+
 def naive_hca(
     H: torch.Tensor,               # [B, T, d]
     W_KV: torch.Tensor,            # [c, d]   (nn.Linear.weight layout: [out, in])

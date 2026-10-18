@@ -203,6 +203,190 @@ Exp 4 overfit-gate report are explicitly exempt). `ci_gate.py` covers
 `run_correctness.py` / `test_figures.py`, so this wiring provides the
 quantization experiments' pipeline coverage.
 
+## bfloat16 delta-rule numerical stability
+
+The KDA delta-rule recurrence is sensitive to reduced precision because it
+repeatedly applies `exp(g_t)` (per-channel log-decay) and accumulates the
+state `S` over T steps. In bfloat16 the 8-bit exponent range makes both
+overflow (large positive `g_t` → `exp(g_t) → Inf`) and underflow (large
+negative `g_t` → `exp(g_t) → 0`) more likely than in fp32, and the
+T-step accumulation can amplify small errors.
+
+`ops_kda_autograd.py` (the custom-autograd KDA path) includes three
+bfloat16-specific stabilizers that activate **only when the compute dtype
+is bfloat16**:
+
+1. **`_bf16_safe_exp(g, clamp_min=-10.0, clamp_max=50.0)`** — clamps the
+   log-gate before `exp()` and clamps the result to `[1e-5, 1e5]`. This
+   prevents Inf/0 from a single channel's gate while preserving the
+   effective decay range for normal values.
+
+2. **`_state_scale_correction(S, max_norm=1e4)`** — after each state
+   update, computes the Frobenius norm of `S` per head and scales it down
+   if `||S||_F > max_norm`. This bounds the recurrent state magnitude and
+   prevents gradual overflow over long sequences (T > 1024).
+
+3. **`_bf16_safe_addcmul(S, beta_k, delta, max_val=1e4)`** — clamps the
+   per-step update `beta_k * delta` before adding to the state. This
+   limits single-step blowup from a large residual.
+
+These patches are **no-ops for fp32/fp64** (the compute dtypes for
+non-bfloat16 inputs per `ops_kda._compute_dtype`), so they do not affect
+the bit-identical fp32/fp64 reference paths.
+
+The precision sweep (`precision_sweep.py`, case `'kda'`, path `'custom'`)
+verifies that with these stabilizers the bfloat16 explicit/autocast error
+stays within the storage-dtype budget (`~2 u`, where `u = 2^-8` for
+bfloat16) up to T=256. For longer sequences the state-scale correction
+keeps the recurrence stable (tested up to T=2048 in
+`test_bf16_gated_kda.py::test_bf16_long_sequence_stability`).
+
+## GatedAttentionMixin — unified gating for KDA/CSA/HCA
+
+`ops_gated_attention.py` provides a reusable `GatedAttentionMixin` that
+adds optional per-head or per-channel gating to any attention operator:
+
+```python
+from ops_gated_attention import GatedAttentionMixin
+
+class MyAttention(GatedAttentionMixin, nn.Module):
+    def __init__(self, ..., gate_type='per_channel', gate_dim=64, num_heads=4):
+        super().__init__()
+        self._init_gate(gate_type, gate_dim, num_heads)
+
+    def forward(self, q, k, v, ...):
+        k = self.apply_gate(k, dim=-1)  # gate keys
+        v = self.apply_gate(v, dim=-1)  # gate values
+        ...
+```
+
+Gate types:
+- `'none'` — identity (no parameters)
+- `'per_head'` — one scalar gate per head `[H]`, broadcast over channels
+- `'per_channel'` — full `[H, D]` gate matrix per head
+
+The mixin initializes gates near 1.0 (`nn.Parameter(torch.ones(...))`) so
+the initial forward is an identity mapping. This makes it safe to add
+gating to existing operators without changing their initialization
+semantics.
+
+`GatedDeltaRule` is a standalone fused layer that combines per-channel
+gating with the delta-rule recurrence, usable as a drop-in gated memory
+module or as a building block for gated CSA/HCA variants.
+
+## Exp 12: needle-in-a-haystack retrieval with quantization-aware evaluation
+
+Exp 10/11 measure intrinsic state-quantization damage (planted recall) and
+end-task perplexity (LM). Exp 12 (`run_needle_haystack.py`) adds the
+canonical **needle-in-a-haystack** long-context benchmark: a fixed Q&A pair
+("needle") is embedded in a long distractor context ("haystack"), and the
+model must retrieve the answer when prompted at the end. This directly
+measures long-context retrieval capability — the primary motivation for
+hybrid architectures like Kimi-Linear and DeepSeek-V4.
+
+Three integrated evaluation axes:
+
+1. **bf16-native evaluation** — uses the bfloat16 numerical stability patches
+   from ``ops_kda_autograd.py`` (for KDA) and extends them to CSA/HCA
+   (``ops_csa.py``, ``ops_hca.py``) for a unified low-precision decode path
+   across all operators.
+
+2. **Quantization-aware PTQ evaluation** — reuses ``kv_quant.QuantSpec`` and
+   ``fake_quantize_`` to fake-quantize the recurrent state (KDA/Mamba-2/RWKV-7)
+   and compressed caches (CSA/HCA) after every decode write, measuring the
+   recall-cost curve on the *same* needle task (not a planted proxy).
+
+3. **QAT recovery probe** — trains a small hybrid LM from scratch with 2-bit
+   STE state writes (mirroring Exp 11 Part B) and evaluates needle retrieval
+   on the QAT model vs the fp16 baseline, reporting a recovery fraction.
+
+The evaluation uses a **deterministic, offline haystack generator** (no
+network, no external tokenizer) so it runs in CI. The haystack is constructed
+from a fixed vocabulary of distractor sentences; the needle is a fixed Q&A
+pair inserted at a controlled position. Retrieval is measured by exact-match
+of the answer token(s) at the final position.
+
+Output: ``results/exp12_needle_haystack.json`` (versioned envelope via
+``results_schema``) with ``row_kind`` in {``needle_config``,
+``needle_recall``, ``needle_summary``, ``qat_needle``,
+``qat_needle_summary``}.
+
+Entry points:
+```bash
+python3 run_needle_haystack.py                 # writes results/exp12_needle_haystack.json
+python3 test_needle_haystack.py                # or: pytest -q test_needle_haystack.py
+python3 run_needle_haystack.py --quick --no-qat # CI smoke run
+```
+
+## bfloat16 numerical stability (extended to CSA/HCA)
+
+The KDA delta-rule recurrence (Exp 10/11) includes three bfloat16-specific
+stabilizers in ``ops_kda_autograd.py``. This round extends the same pattern
+to CSA and HCA operators (``ops_csa.py``, ``ops_hca.py``), which also
+perform repeated softmax and attention score computations sensitive to
+bfloat16's 8-bit exponent range.
+
+Added to ``ops_csa.py`` and ``ops_hca.py`` (activate **only for bfloat16**):
+
+1. **`_bf16_safe_softmax(logits, dim=-1)`** — clamps logits to `[-50, 50]`
+   before softmax to prevent exp overflow (exp(50) ~ 5e21, well below
+   bf16 max ~3e38) while preserving relative probabilities for normal values.
+
+2. **`_bf16_safe_exp(x, clamp_max=50.0)`** — clamps before exp to prevent
+   overflow in any exponential computation.
+
+3. **`_bf16_scale_if_needed(x, max_norm=1e4)`** — scales tensor down if its
+   L2 norm exceeds ``max_norm`` per head/channel, bounding recurrent state
+   magnitude and preventing gradual overflow over long sequences.
+
+4. **`_bf16_safe_einsum_sum(x, dim, max_val=1e4)`** — clamps before summing
+   to limit single-step blowup from large residuals.
+
+Applied at critical points:
+- KV compression softmax (``csa_compress_kv``, ``csa_compress_kv_overlapped``)
+- Sliding-window attention softmax (``_sliding_window_attention``)
+- Lightning indexer STE softmax (``_nan_safe_softmax`` → ``_bf16_safe_softmax``)
+- Joint core-attention softmax (``naive_csa``, ``naive_hca``)
+
+These patches are **no-ops for fp32/fp64**, so they do not affect the
+bit-identical reference paths. The precision sweep and
+``test_bf16_gated_kda.py`` verify bfloat16 stability up to T=2048 for KDA;
+``test_needle_haystack.py::test_bf16_csa_hca_no_nan_inf`` pins the CSA/HCA
+bf16 path.
+
+## GatedAttentionMixin — unified gating for KDA/CSA/HCA
+
+`ops_gated_attention.py` provides a reusable `GatedAttentionMixin` that
+adds optional per-head or per-channel gating to any attention operator:
+
+```python
+from ops_gated_attention import GatedAttentionMixin
+
+class MyAttention(GatedAttentionMixin, nn.Module):
+    def __init__(self, ..., gate_type='per_channel', gate_dim=64, num_heads=4):
+        super().__init__()
+        self._init_gate(gate_type, gate_dim, num_heads)
+
+    def forward(self, q, k, v, ...):
+        k = self.apply_gate(k, dim=-1)  # gate keys
+        v = self.apply_gate(v, dim=-1)  # gate values
+        ...
+```
+
+Gate types:
+- `'none'` — identity (no parameters)
+- `'per_head'` — one scalar gate per head `[H]`, broadcast over channels
+- `'per_channel'` — full `[H, D]` gate matrix per head
+
+The mixin initializes gates near 1.0 (`nn.Parameter(torch.ones(...))`) so
+the initial forward is an identity mapping. This makes it safe to add
+gating to existing operators without changing their initialization
+semantics.
+
+`GatedDeltaRule` is a standalone fused layer that combines per-channel
+gating with the delta-rule recurrence, usable as a drop-in gated memory
+module or as a building block for gated CSA/HCA variants.
+
 ## Entry points
 
 ```bash
@@ -214,4 +398,8 @@ python3 run_quant_lm.py                     # writes results/exp11_quant_lm.json
 python3 test_quant_lm.py                    # or: pytest -q test_quant_lm.py
 QLM_STEPS=100 QLM_QAT_STEPS=100 QLM_SEEDS=0 python3 run_quant_lm.py
 QLM_SKIP_QAT=1 python3 run_quant_lm.py      # Part A only (fast)
+
+python3 run_needle_haystack.py                 # writes results/exp12_needle_haystack.json
+python3 test_needle_haystack.py                # or: pytest -q test_needle_haystack.py
+python3 run_needle_haystack.py --quick --no-qat # CI smoke run
 ```

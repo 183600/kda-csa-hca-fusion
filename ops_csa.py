@@ -27,6 +27,53 @@ from ops_rope import (
 )
 
 
+# ---------------------------------------------------------------------------
+# bfloat16 numerical stability helpers (mirrors ops_kda_autograd.py)
+# ---------------------------------------------------------------------------
+def _bf16_safe_softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Safe softmax for bfloat16: clamp logits before softmax to prevent Inf.
+
+    bfloat16's 8-bit exponent can overflow on large positive logits. Clamping
+    to a safe range (e.g., [-50, 50]) before softmax prevents this while
+    preserving the relative probabilities for normal values.
+    """
+    if logits.dtype == torch.bfloat16:
+        # Clamp to prevent exp overflow (exp(50) ~ 5e21, well below bf16 max ~3e38)
+        # but large enough to not affect normal probability distributions.
+        logits = logits.clamp(min=-50.0, max=50.0)
+    return torch.softmax(logits, dim=dim)
+
+
+def _bf16_safe_exp(x: torch.Tensor, clamp_max: float = 50.0) -> torch.Tensor:
+    """Safe exp for bfloat16: clamp before exp to prevent overflow."""
+    if x.dtype == torch.bfloat16:
+        x = x.clamp(max=clamp_max)
+    return x.exp()
+
+
+def _bf16_scale_if_needed(
+    x: torch.Tensor, max_norm: float = 1e4
+) -> torch.Tensor:
+    """Scale tensor down if its norm exceeds max_norm (bf16 only).
+
+    Prevents gradual accumulation of large values over long sequences.
+    """
+    if x.dtype != torch.bfloat16:
+        return x
+    norms = x.norm(p=2, dim=-1, keepdim=True)
+    scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
+    return x * scale
+
+
+def _bf16_safe_einsum_sum(
+    x: torch.Tensor, dim: int, max_val: float = 1e4
+) -> torch.Tensor:
+    """Safe sum reduction for bfloat16: clamp before summing."""
+    if x.dtype != torch.bfloat16:
+        return x.sum(dim=dim)
+    return x.clamp(min=-max_val, max=max_val).sum(dim=dim)
+
+
 # =============================================================================
 # Chunked sliding-window attention helper
 # -----------------------------------------------------------------------------
@@ -184,7 +231,7 @@ def _sliding_window_attention(
         # ``scores`` is a fresh einsum (or freshly scaled) tensor that no
         # other consumer reads, so the mask can be written in place.
         scores.masked_fill_(~mask_chunk[None, :, None, :], float('-inf'))
-        p = torch.softmax(scores, dim=-1)                   # [B, ct, nh, win]
+        p = _bf16_safe_softmax(scores, dim=-1)                   # [B, ct, nh, win]
         out[:, t_lo:t_hi] = torch.einsum('b t h w, b t w d -> b t h d', p, C_windows)
     return out
 
@@ -396,8 +443,9 @@ def csa_compress_kv(
     C = C.to(compute_dtype).view(B_, n_blocks, m, c)
     Z = Z.to(compute_dtype).view(B_, n_blocks, m, c)
     logits = Z + B_pos[None, None, :, :].to(Z)
-    S = torch.softmax(logits, dim=2)                      # [B, n_blocks, m, c]
-    return (S * C).sum(dim=2)                             # [B, n_blocks, c]
+    S = _bf16_safe_softmax(logits, dim=2)                 # [B, n_blocks, m, c]
+    out = (S * C).sum(dim=2)                              # [B, n_blocks, c]
+    return _bf16_scale_if_needed(out)
 
 
 def csa_compress_kv_overlapped(
@@ -458,7 +506,7 @@ def csa_compress_kv_overlapped(
 
     # cat along the m axis -> [B, n_blocks, 2m, c]
     all_logits = torch.cat([A_logits, Bb_logits], dim=2)
-    S = torch.softmax(all_logits, dim=2)                          # [B, n_blocks, 2m, c]
+    S = _bf16_safe_softmax(all_logits, dim=2)                          # [B, n_blocks, 2m, c]
     Sa = S[:, :, :m]                                              # [B, n_blocks, m, c]
     Sb = S[:, :, m:]                                              # [B, n_blocks, m, c]
 
@@ -468,7 +516,7 @@ def csa_compress_kv_overlapped(
     Cb_prev = torch.cat([zero_pad, Cb[:, :-1]], dim=1)            # [B, n_blocks, m, c]
 
     out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)                # [B, n_blocks, c]
-    return out
+    return _bf16_scale_if_needed(out)
 
 
 def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
@@ -489,11 +537,10 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     else:
         all_masked = all_masked_mask
     if not bool(all_masked.any()):
-        # No fully-masked rows: the two ``masked_fill`` passes are no-ops,
-        # so the plain softmax is bit-identical.
-        return torch.softmax(logits, dim=dim)
+        # No fully-masked rows: use bf16-safe softmax.
+        return _bf16_safe_softmax(logits, dim=dim)
     safe_logits = logits.masked_fill(all_masked, 0.0)
-    soft = torch.softmax(safe_logits, dim=dim)
+    soft = _bf16_safe_softmax(safe_logits, dim=dim)
     return soft.masked_fill(all_masked, 0.0)
 
 
