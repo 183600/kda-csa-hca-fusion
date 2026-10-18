@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import statistics
 import sys
 
 import pytest
@@ -219,6 +220,138 @@ def test_bootstrap_ci_undefined_for_single_pair():
 
 
 # ---------------------------------------------------------------------------
+# TOST equivalence test
+# ---------------------------------------------------------------------------
+
+def _t_pdf_dof4(x):
+    """Student-t(4) density, used only by the independent TOST check."""
+    return (math.gamma(2.5) / (math.sqrt(4 * math.pi) * math.gamma(2.0))
+            * (1.0 + x * x / 4.0) ** (-2.5))
+
+
+def _simpson_prefix(t):
+    """``int_0^t f(x) dx`` for the t(4) density via composite Simpson.
+
+    ``x >= 0`` only. Combined with the density's symmetry, ``0.5 -
+    int_0^t`` gives the one-sided tail probability ``P(T > t)`` without
+    relying on ``multi_seed_stats``' own incomplete-beta CDF, so the TOST
+    p-values can be cross-checked against an independent numerical
+    computation (the same verification strategy as the paired-t test
+    above).
+    """
+    n, h = 40000, t / 40000.0
+    s = _t_pdf_dof4(0.0) + _t_pdf_dof4(t)
+    for i in range(1, n):
+        s += (4 if i % 2 else 2) * _t_pdf_dof4(i * h)
+    return s * h / 3.0
+
+
+def test_tost_paired_hand_values_and_numerical_cross_check():
+    # diffs [0.1..0.5]: mean 0.3, sd 0.15811388, se 0.07071068, df=4.
+    # margin 0.5: t_upper = (0.3-0.5)/se = -2.82842712 ->
+    # p_upper = P(T <= -2.82842712) = 0.0237103277921598 (verified with
+    # mpmath.betainc at 40 digits and by direct density integration);
+    # t_lower = (0.3+0.5)/se = 11.31370850 -> p_lower = 0.0001739457...
+    # TOST p = max = 0.0237103277921598 < 0.05 -> equivalent.
+    r = M.tost_paired([0.1, 0.2, 0.3, 0.4, 0.5], margin=0.5)
+    assert r['n_pairs'] == 5 and r['dof'] == 4
+    assert math.isclose(r['t_upper'], -2.8284271247461903, rel_tol=1e-12)
+    assert math.isclose(r['t_lower'], 11.313708498984761, rel_tol=1e-12)
+    assert math.isclose(r['p_upper'], 0.02371032779215981, rel_tol=1e-9)
+    assert math.isclose(r['p_lower'], 0.00017394572028528454, rel_tol=1e-9)
+    assert math.isclose(r['p_value'], r['p_upper'], rel_tol=1e-15)
+    assert r['equivalent'] is True
+    # Independent numerical check via density symmetry: P(T <= t) =
+    # 0.5 - int_0^{-t} f for t < 0, and P(T >= t) = 0.5 - int_0^t f.
+    p_upper_num = 0.5 - _simpson_prefix(-r['t_upper'])
+    p_lower_num = 0.5 - _simpson_prefix(r['t_lower'])
+    assert abs(r['p_upper'] - p_upper_num) < 1e-9
+    assert abs(r['p_lower'] - p_lower_num) < 1e-9
+    # (1 - 2*alpha) CI is centred on the mean and agrees with the verdict.
+    assert math.isclose(r['ci_equiv_lo'], 0.14925566809376792, rel_tol=1e-9)
+    assert math.isclose(r['ci_equiv_hi'], 0.4507443319062321, rel_tol=1e-9)
+    assert r['ci_equiv_lo'] > -0.5 and r['ci_equiv_hi'] < 0.5
+    # A tighter margin flips the verdict without changing the data.
+    tight = M.tost_paired([0.1, 0.2, 0.3, 0.4, 0.5], margin=0.2)
+    assert tight['equivalent'] is False
+    assert math.isclose(tight['p_value'], 0.8849001794597504, rel_tol=1e-9)
+
+
+def test_tost_paired_degenerate_and_error_cases():
+    single = M.tost_paired([0.1], margin=0.2)
+    assert single['p_value'] is None and single['equivalent'] is None
+    empty = M.tost_paired([], margin=0.2)
+    assert empty['p_value'] is None and empty['equivalent'] is None
+    # Zero variance: point CI, exact 0 / 0.5 / 1 p at inside / boundary /
+    # outside, and the verdict must follow |mean| vs margin exactly.
+    inside = M.tost_paired([0.1] * 5, margin=0.2)
+    assert inside['p_value'] == 0.0 and inside['equivalent'] is True
+    boundary = M.tost_paired([0.2] * 5, margin=0.2)
+    assert boundary['p_value'] == 0.5 and boundary['equivalent'] is False
+    outside = M.tost_paired([0.3] * 5, margin=0.2)
+    assert outside['p_value'] == 1.0 and outside['equivalent'] is False
+    for bad_margin in (0.0, -0.1, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            M.tost_paired([0.1, 0.2], margin=bad_margin)
+    for bad_alpha in (0.0, 0.5, 0.9, 1.0):
+        with pytest.raises(ValueError):
+            M.tost_paired([0.1, 0.2], margin=0.2, alpha=bad_alpha)
+    with pytest.raises(ValueError):
+        M.tost_paired([0.1, float('nan')], margin=0.2)
+
+
+def test_tost_from_summary_matches_vector_entry_point():
+    d = [0.1, 0.2, 0.3, 0.4, 0.5]
+    summary = M.tost_from_summary(sum(d) / len(d), statistics.stdev(d),
+                                  len(d), margin=0.5)
+    assert summary == pytest.approx(M.tost_paired(d, margin=0.5))
+    # Degenerate branches mirror the vector entry point exactly.
+    assert M.tost_from_summary(0.1, None, 1, margin=0.2) == \
+        M.tost_paired([0.1], margin=0.2)
+    assert M.tost_from_summary(None, None, 0, margin=0.2) == \
+        M.tost_paired([], margin=0.2)
+    assert M.tost_from_summary(0.3, 0.0, 5, margin=0.2) == \
+        M.tost_paired([0.3] * 5, margin=0.2)
+    for bad_n in (-1, 2.0, True):
+        with pytest.raises(ValueError):
+            M.tost_from_summary(0.1, 0.05, bad_n, margin=0.2)
+    with pytest.raises(ValueError):
+        M.tost_from_summary(None, 0.05, 3, margin=0.2)
+    with pytest.raises(ValueError):
+        M.tost_from_summary(float('nan'), 0.05, 3, margin=0.2)
+    with pytest.raises(ValueError):
+        M.tost_from_summary(0.1, None, 3, margin=0.2)
+    with pytest.raises(ValueError):
+        M.tost_from_summary(0.1, -0.05, 3, margin=0.2)
+
+
+def test_equivalence_margin_supported_matches_ci_half_width():
+    d = [0.1, 0.2, 0.3, 0.4, 0.5]
+    supported = M.equivalence_margin_supported(d)
+    # |mean| + t_{1-alpha,4} * se = the upper CI endpoint, computed by the
+    # module's own tost CI for the same data.
+    r = M.tost_paired(d, margin=0.5)
+    assert math.isclose(supported, r['ci_equiv_hi'], rel_tol=1e-12)
+    assert math.isclose(supported, 0.4507443319062321, rel_tol=1e-9)
+    # Cross-checked on a second vector with an independent SD (statistics)
+    # and the tabulated t_{0.95,5} = 2.0150483733.
+    d2 = [-0.2, 0.05, 0.3, 0.15, -0.05, 0.1]
+    sup2 = M.equivalence_margin_supported(d2)
+    mean2 = sum(d2) / len(d2)
+    se2 = statistics.stdev(d2) / math.sqrt(len(d2))
+    assert math.isclose(sup2, abs(mean2) + 2.0150483733 * se2, rel_tol=1e-9)
+    # A margin a hair above the supported infimum declares equivalence;
+    # a hair below must not.
+    assert M.tost_paired(d2, margin=sup2 + 1e-9)['equivalent'] is True
+    assert M.tost_paired(d2, margin=sup2 - 1e-9)['equivalent'] is False
+    assert M.equivalence_margin_supported([0.1]) is None
+    # Zero variance: infimum is |mean| (strict inequality documented).
+    assert M.equivalence_margin_supported([0.4] * 5) == pytest.approx(0.4)
+    with pytest.raises(ValueError):
+        M.equivalence_margin_supported(d, alpha=0.5)
+
+
+# ---------------------------------------------------------------------------
 # Power planning
 # ---------------------------------------------------------------------------
 
@@ -277,6 +410,36 @@ def test_summarize_paired_rejects_nonfinite_inputs():
         M.summarize_paired([1.0, float('nan')])
     with pytest.raises(ValueError):
         M.summarize_paired([1.0, float('inf')])
+
+
+def test_summarize_paired_without_margin_has_no_equivalence_claim():
+    # Backward compatibility: without a pre-specified margin there must be
+    # no TOST block and no equivalence verdict -- a non-significant test
+    # can never silently become a "same" claim.
+    s = M.summarize_paired([0.4, -0.2, 0.1], n_boot=200, seed=0)
+    assert 'tost' not in s
+    assert s['practically_equivalent'] is None
+    assert s['equivalence_note']
+
+
+def test_summarize_paired_with_margin_reports_tost_block():
+    diffs = [0.004, -0.002, 0.003, 0.001, -0.003, 0.002]
+    s = M.summarize_paired(diffs, n_boot=200, seed=0,
+                           equivalence_margin=0.05)
+    json.dumps(s, allow_nan=False)
+    assert s['practically_equivalent'] is True
+    assert s['tost']['margin'] == 0.05
+    assert s['tost']['equivalent'] is True
+    assert s['tost']['p_value'] < 0.05
+    assert s['tost']['ci_equiv_level'] == pytest.approx(0.90)
+    assert s['equivalence_margin_supported'] is not None
+    # The nested TOST record is exactly the standalone function's output.
+    assert s['tost'] == M.tost_paired(diffs, margin=0.05)
+    far = M.summarize_paired([0.9, 0.1, 0.5], n_boot=200, seed=0,
+                             equivalence_margin=0.05)
+    assert far['practically_equivalent'] is False
+    assert far['tost']['p_value'] > 0.05
+    assert far['tost']['p_value'] == far['tost']['p_upper']
 
 
 # ---------------------------------------------------------------------------
@@ -356,3 +519,45 @@ def test_pairwise_op_comparisons_holm_family_spans_the_cell():
     # enumeration p-value is finite and in (0,1].
     rec_bc = recs['op_b~op_c']
     assert 0.0 < rec_bc['permutation_test']['p_value_two_sided'] <= 1.0
+
+
+def test_pairwise_op_comparisons_equivalence_separates_same_from_different():
+    # a1/a2 differ by <= 0.005 on every seed: practically the same at the
+    # 0.05 margin. a1/c differs by ~0.8: definitely not equivalent. The
+    # near-identical pair's superiority test is non-significant, which is
+    # exactly the case that must NOT be misread as equivalence without
+    # the TOST.
+    rows = [_row('op_a1', [0.900, 0.905, 0.895, 0.901, 0.899, 0.903]),
+            _row('op_a2', [0.904, 0.902, 0.894, 0.903, 0.897, 0.900]),
+            _row('op_c', [0.100, 0.105, 0.095, 0.101, 0.099, 0.103])]
+    report = _pairwise_op_comparisons(
+        rows, alpha=0.05, seed=0, n_boot=200, n_permutations=200,
+        equivalence_margin=0.05)
+    json.dumps(report, allow_nan=False)
+    assert report['equivalence']['enabled'] is True
+    cell = report['cells']['mqar/n_kv=1']
+    rec = cell['pairs']['op_a1~op_a2']
+    assert rec['verdict'] == 'not_significant'
+    assert rec['equivalence_verdict'] == 'equivalent'
+    assert rec['significant_equivalence_holm'] is True
+    assert rec['holm_adjusted_p_tost'] >= rec['tost']['p_value']
+    assert rec['holm_adjusted_p_tost'] <= 0.05
+    assert rec['equivalence_margin_supported'] < 0.05
+    rec_far = cell['pairs']['op_a1~op_c']
+    assert rec_far['equivalence_verdict'] == 'not_equivalent'
+    assert rec_far['significant_equivalence_holm'] is False
+    assert report['n_equivalent'] == 1
+    assert 'op_a2' in rows[0]['pairwise_equivalent_to']
+    assert 'op_c' not in rows[0]['pairwise_equivalent_to']
+
+
+def test_pairwise_op_comparisons_equivalence_disabled_by_default():
+    rows = [_row('op_a', [0.90] * 6), _row('op_b', [0.905] * 6)]
+    report = _pairwise_op_comparisons(rows, alpha=0.05, seed=0,
+                                      n_boot=200, n_permutations=200)
+    rec = report['cells']['mqar/n_kv=1']['pairs']['op_a~op_b']
+    assert 'tost' not in rec
+    assert 'equivalence_verdict' not in rec
+    assert 'pairwise_equivalent_to' not in rows[0]
+    assert report['n_equivalent'] == 0
+    assert report['equivalence']['enabled'] is False

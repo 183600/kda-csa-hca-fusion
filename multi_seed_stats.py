@@ -21,6 +21,10 @@ The standard mistakes this module exists to prevent:
 * reporting a "significant" result from **n = 2-3 seeds** without any
   indication of the realized power (the same effect can flip sign on the
   next seed draw);
+* interpreting a **non-significant superiority test as evidence of no
+  difference** — absence of evidence is not evidence of absence. Only a
+  pre-specified equivalence test (TOST) licenses a "practically the same"
+  claim, and only against a margin fixed BEFORE the data were seen;
 * **non-reproducible resampling statistics** — if the bootstrap /
   permutation test draws from the global RNG, re-running the experiment
   changes the reported p-values.
@@ -49,7 +53,17 @@ the whole pipeline for a list of seed-paired differences:
    side of multi-seed evaluation: with the observed standardized effect
    from this run, how many seeds would the next run need for 80% power?
    (Normal approximation, documented as such.)
-7. :func:`summarize_paired` — one call that runs the whole panel and
+7. :func:`tost_paired` — the two one-sided paired t-tests (TOST) for
+   PRACTICAL EQUIVALENCE against a pre-specified margin. This is the only
+   test here that can positively support "A and B are the same, for
+   practical purposes"; a non-significant superiority test can never do
+   that. The margin must be fixed by the analysis plan, never chosen after
+   seeing the data.
+8. :func:`equivalence_margin_supported` — the planning companion: given
+   the observed per-seed differences, the smallest margin at which a TOST
+   would declare equivalence. It makes "inconclusive at this seed budget"
+   actionable (widen the margin you can defend or run more seeds).
+9. :func:`summarize_paired` — one call that runs the whole panel and
    returns a single JSON-safe record for the results file.
 
 Design constraints
@@ -89,6 +103,9 @@ __all__ = [
     'permutation_test',
     'bootstrap_paired_ci',
     'cohens_dz',
+    'tost_paired',
+    'tost_from_summary',
+    'equivalence_margin_supported',
     'holm_adjust',
     'min_detectable_effect',
     'seeds_required',
@@ -421,6 +438,161 @@ def cohens_dz(diffs) -> float | None:
     return mean / sd
 
 
+def tost_paired(diffs, margin: float, alpha: float = 0.05) -> dict:
+    """Two one-sided paired t-tests (TOST) for practical equivalence.
+
+    Tests ``H0: |mean(d)| >= margin`` against ``H1: |mean(d)| < margin`` on
+    the seed-paired differences, at level ``alpha``. ``p_value`` is the
+    maximum of the two one-sided p-values:
+
+    * lower test: ``H0: mean(d) <= -margin`` vs ``mean(d) > -margin``;
+    * upper test: ``H0: mean(d) >= +margin`` vs ``mean(d) < +margin``.
+
+    ``equivalent`` is ``True`` iff ``p_value < alpha`` (equivalently, the
+    two-sided ``(1 - 2*alpha)`` t confidence interval lies strictly inside
+    ``(-margin, +margin)``; both views are returned and agree by
+    construction).
+
+    The margin is a SCIENTIFIC choice (the smallest effect that would
+    matter), not a statistical one: it must be pre-specified in the
+    analysis plan before the data are inspected. Choosing it from the
+    observed CI would make ``p_value`` meaningless. For the same reason a
+    non-significant superiority test is NOT evidence of equivalence, but
+    a significant TOST is (subject to the usual paired-t assumptions).
+
+    ``margin`` must be finite and strictly positive. Degenerate inputs
+    follow the repo-wide convention: ``n < 2`` gives ``p_value=None`` /
+    ``equivalent=None`` rather than a fabricated verdict; a zero-variance
+    difference vector (every seed identical) has a point CI, so it is
+    equivalent iff ``|mean| < margin`` and the exact p is reported as
+    ``0.0`` (inside), ``0.5`` (exactly on the boundary) or ``1.0``
+    (outside) instead of a NaN.
+
+    The statistics are delegated to :func:`tost_from_summary`; runners
+    that store only per-contrast summary rows (n, mean, sd) can call that
+    directly, so both entry points can never drift apart.
+    """
+    d = _as_clean_diffs(diffs)
+    n = len(d)
+    mean = (sum(d) / n) if n else None
+    sd = _sample_sd(d, mean) if n >= 2 else None
+    return tost_from_summary(mean, sd, n, margin, alpha=alpha)
+
+
+def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
+                      alpha: float = 0.05) -> dict:
+    """TOST from summary statistics of the seed-paired differences.
+
+    Same contract and result shape as :func:`tost_paired` (which delegates
+    here), for callers that keep only ``n``, ``mean`` and sample ``sd`` of
+    the per-seed differences rather than the raw vector (e.g. the
+    ablation-runner contrast rows). ``mean_diff`` must be finite when
+    ``n_pairs >= 1``; ``sd_diff`` must be finite and non-negative and is
+    required when ``n_pairs >= 2`` (pass ``0.0`` for a numerically
+    identical-difference vector). ``dof`` is recorded for the t branches.
+    """
+    if not (0.0 < alpha < 0.5):
+        raise ValueError(
+            f'alpha must be in (0, 0.5) for an equivalence CI to exist, '
+            f'got {alpha!r}')
+    margin = float(margin)
+    if not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(
+            f'margin must be finite and > 0, got {margin!r}')
+    if not (isinstance(n_pairs, int) and not isinstance(n_pairs, bool)
+            and n_pairs >= 0):
+        raise ValueError(
+            f'n_pairs must be a non-negative int, got {n_pairs!r}')
+    mean = None
+    if n_pairs >= 1:
+        if mean_diff is None:
+            raise ValueError('mean_diff is required when n_pairs >= 1')
+        mean = float(mean_diff)
+        if not math.isfinite(mean):
+            raise ValueError(f'mean_diff must be finite, got {mean_diff!r}')
+    sd = None
+    if n_pairs >= 2:
+        if sd_diff is None:
+            raise ValueError('sd_diff is required when n_pairs >= 2')
+        sd = float(sd_diff)
+        if not math.isfinite(sd) or sd < 0.0:
+            raise ValueError(
+                f'sd_diff must be finite and >= 0, got {sd_diff!r}')
+    out = {'n_pairs': n_pairs, 'margin': margin, 'alpha': alpha,
+           'mean_diff': mean, 'sd_diff': sd, 'dof': None,
+           't_lower': None, 't_upper': None,
+           'p_lower': None, 'p_upper': None, 'p_value': None,
+           'equivalent': None,
+           'ci_equiv_level': 1.0 - 2.0 * alpha,
+           'ci_equiv_lo': None, 'ci_equiv_hi': None,
+           'method': 'two_one_sided_paired_t'}
+    if n_pairs < 2:
+        return out
+    dof = n_pairs - 1
+    out['dof'] = dof
+    if sd <= 0.0:
+        # Every per-seed difference is identical (numerically): the
+        # (1-2*alpha) CI degenerates to the point [mean, mean], so the
+        # verdict is decided by where that point sits relative to the
+        # margin. The exact p is 0 / 0.5 / 1 at inside / boundary /
+        # outside.
+        if abs(mean) < margin:
+            p = 0.0
+        elif abs(mean) == margin:
+            p = 0.5
+        else:
+            p = 1.0
+        out.update(t_lower=None, t_upper=None,
+                   p_lower=p, p_upper=p, p_value=p,
+                   equivalent=bool(abs(mean) < margin),
+                   ci_equiv_lo=mean, ci_equiv_hi=mean)
+        return out
+    se = sd / math.sqrt(n_pairs)
+    t_lower = (mean + margin) / se
+    t_upper = (mean - margin) / se
+    p_lower = student_t_sf(t_lower, dof)
+    p_upper = student_t_cdf(t_upper, dof)
+    p = min(1.0, max(0.0, max(p_lower, p_upper)))
+    half = _t_quantile(1.0 - alpha, dof) * se
+    out.update(t_lower=t_lower, t_upper=t_upper,
+               p_lower=p_lower, p_upper=p_upper, p_value=p,
+               equivalent=bool(p < alpha),
+               ci_equiv_lo=mean - half, ci_equiv_hi=mean + half)
+    return out
+
+
+def equivalence_margin_supported(diffs, alpha: float = 0.05) -> float | None:
+    """Smallest pre-specifiable margin at which TOST would declare equivalence.
+
+    The largest defensible claim from one run is ``|mean| + t_{1-alpha} *
+    se`` (the half-width of the ``(1 - 2*alpha)`` t CI around the observed
+    mean difference), i.e. the margin must strictly exceed this number for
+    the same data to reject non-equivalence. Returning it next to a
+    non-significant AND non-equivalent comparison turns "inconclusive"
+    into an actionable choice: either commit to a margin at least this
+    wide before the next run, or spend the seeds needed to shrink it.
+
+    ``None`` when undefined (``n < 2``). For a zero-variance difference
+    vector the infimum is ``|mean|`` (strict inequality, documented as
+    such). This is a data-dependent PLANNING quantity; the margin used in
+    a confirmatory ``tost_paired`` call must still be pre-specified.
+    """
+    if not (0.0 < alpha < 0.5):
+        raise ValueError(
+            f'alpha must be in (0, 0.5) for an equivalence CI to exist, '
+            f'got {alpha!r}')
+    d = _as_clean_diffs(diffs)
+    n = len(d)
+    if n < 2:
+        return None
+    mean = sum(d) / n
+    sd = _sample_sd(d, mean)
+    if sd is None or sd <= 0.0:
+        return abs(mean)
+    se = sd / math.sqrt(n)
+    return abs(mean) + _t_quantile(1.0 - alpha, n - 1) * se
+
+
 def holm_adjust(p_values, alpha: float = 0.05) -> dict:
     """Holm-Bonferroni step-down adjustment for a family of p-values.
 
@@ -527,7 +699,8 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                      n_permutations: int = 10000,
                      max_exact: int = 16,
                      alpha: float = 0.05,
-                     power: float = 0.8) -> dict:
+                     power: float = 0.8,
+                     equivalence_margin: float | None = None) -> dict:
     """Run the full multi-seed inference panel on paired differences.
 
     Returns a single JSON-safe record containing the effect estimate,
@@ -537,6 +710,14 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     the observed effect. ``direction`` is ``'greater'`` when the mean
     difference is positive, ``'less'`` when negative, ``'none'`` when
     exactly zero.
+
+    When ``equivalence_margin`` is given (a PRE-SPECIFIED smallest effect
+    of interest, on the same scale as the differences), the record
+    additionally carries a ``tost`` block and a top-level
+    ``practically_equivalent`` flag from :func:`tost_paired`. Without it
+    the record is unchanged (``practically_equivalent=None`` and no
+    ``tost`` key), so a non-significant result can never be silently
+    upgraded to an equivalence claim.
 
     The record deliberately reports three p-values for the same
     comparison: if they disagree materially at n = 5, the per-seed
@@ -575,7 +756,9 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
         ci_lo, ci_hi = mean - half, mean + half
     direction = ('none' if mean is None or mean == 0.0
                  else ('greater' if mean > 0 else 'less'))
-    return {
+    tost = (tost_paired(d, equivalence_margin, alpha=alpha)
+            if equivalence_margin is not None else None)
+    record = {
         'n_pairs': n,
         'mean_diff': mean,
         'median_diff': median,
@@ -605,7 +788,19 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                        'planning estimate for a FUTURE run at the observed '
                        '|d_z| (two-sided alpha, 80% power), not a guarantee '
                        'for this one.'),
+        'practically_equivalent': (tost['equivalent'] if tost else None),
+        'equivalence_note': (
+            'practically_equivalent is None unless a PRE-SPECIFIED '
+            'equivalence_margin was supplied: a non-significant superiority '
+            'test is not evidence of equivalence. When a TOST is present, '
+            'it tests |mean_diff| < margin and can positively support a '
+            '"practically the same" claim.'),
     }
+    if tost is not None:
+        record['tost'] = tost
+        record['equivalence_margin_supported'] = equivalence_margin_supported(
+            d, alpha=alpha)
+    return record
 
 
 def _t_quantile(p: float, dof: int) -> float:

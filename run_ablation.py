@@ -50,6 +50,12 @@ Methodology (both modes):
     capacity, and the budget-matching experiment exists precisely to
     close that gap.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available.
+  * **Equivalence, not just significance.** Every paired contrast also
+    gets a TOST equivalence verdict against the PRE-SPECIFIED margin
+    ``CONTRAST_EQUIVALENCE_MARGIN`` (env override ``ABL_EQUIV_MARGIN``;
+    ``0`` disables it). A non-significant contrast is inconclusive on
+    both questions; only ``tost_equivalent=True`` supports "no practical
+    difference" (see ``docs/equivalence-testing.md``).
 """
 
 from __future__ import annotations
@@ -83,8 +89,9 @@ from ops_rwkv_backend import validate_rwkv_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, _task_batch_fingerprint,
-    SMALL_MODEL_SPEC,
+    _parse_equivalence_margin, SMALL_MODEL_SPEC,
 )
+from multi_seed_stats import tost_from_summary, _ZERO_VAR_REL_EPS
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +102,19 @@ SEQ_LEN = 16
 # the training offset (1_000_000) and the eval offset (5_000_000) so the
 # gate's data stream can never collide with either.
 _OVERFIT_BATCH_SEED_OFFSET = 3_000_000
+
+# Pre-specified TOST equivalence margin for the paired contrast families,
+# in absolute ``final_acc`` units (the scale of every ``mean_diff``). The
+# task chance rate is 1/16 = 0.0625, so a five-accuracy-point difference
+# is a substantial fraction of the whole learnable range: differences
+# below it are treated as the smallest effect that would NOT change any
+# practical conclusion (e.g. for the KDA-vs-RWKV-7 replacement question).
+# Chosen BEFORE the numbers are read; the only legitimate override is the
+# run-start environment variable ``ABL_EQUIV_MARGIN`` (``0`` disables
+# equivalence testing, leaving every non-significant contrast
+# inconclusive). Registering it here keeps superiority and equivalence
+# verdicts on one pre-declared family.
+CONTRAST_EQUIVALENCE_MARGIN = 0.05
 
 
 def _make_cfg(d_model=32, ratio=(3, 1, 1)):
@@ -1363,8 +1383,13 @@ def _seed_accuracy_map(result: dict) -> dict[int, float]:
 def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
     """Paired mean diff + t-stat over the COMMON seeds of two groups.
 
-    Returns ``(mean_diff, t_stat, n, unanimous)``, or
-    ``(None, None, 0, None)`` when fewer than two common seeds exist.
+    Returns ``(mean_diff, t_stat, n, unanimous, sd_diff)``, or
+    ``(None, None, 0, None, None)`` when fewer than two common seeds
+    exist. ``sd_diff`` is the sample SD of the per-seed differences
+    (``0.0`` when every difference is numerically identical — the
+    zero-variance convention of ``multi_seed_stats``); it rides in the
+    contrast rows so the TOST equivalence test can be re-run from the
+    stored summary statistics without keeping the raw vectors.
     Positive diff = a better than b for a higher-is-better metric
     (final_acc); loss-direction metrics must be sign-flipped BEFORE
     calling this. ``unanimous`` is ``'positive'`` when every per-seed
@@ -1375,12 +1400,20 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
     """
     common = sorted(set(accs_a) & set(accs_b))
     if len(common) < 2:
-        return None, None, 0, None
+        return None, None, 0, None, None
     diffs = [accs_a[s] - accs_b[s] for s in common]
     n = len(diffs)
     mean_diff = sum(diffs) / n
     var = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
-    std = math.sqrt(var)
+    # Same zero-variance convention as multi_seed_stats._sample_sd: a
+    # variance below the relative epsilon is floating-point noise, not
+    # spread. Without this a "flat" sweep that differs in the last ulp
+    # would report an astronomical t-stat and a spurious significance.
+    scale = max(abs(mean_diff), max(abs(d) for d in diffs), 1.0e-300)
+    if var <= (_ZERO_VAR_REL_EPS * scale) ** 2:
+        std = 0.0
+    else:
+        std = math.sqrt(var)
     t_stat = (mean_diff / (std / math.sqrt(n))) if std > 0 else None
     if all(d > 0 for d in diffs):
         unanimous = 'positive'
@@ -1388,7 +1421,7 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
         unanimous = 'negative'
     else:
         unanimous = 'mixed'
-    return mean_diff, t_stat, n, unanimous
+    return mean_diff, t_stat, n, unanimous, std
 
 
 def _matrix_contrast_report(all_results: list) -> list:
@@ -1438,7 +1471,7 @@ def _matrix_contrast_report(all_results: list) -> list:
             ]:
                 if groups[ga] is None or groups[gb] is None:
                     continue
-                diff, t_stat, n, unanimous = _paired_contrast(
+                diff, t_stat, n, unanimous, sd = _paired_contrast(
                     accs[ga], accs[gb])
                 if diff is None:
                     continue
@@ -1446,6 +1479,7 @@ def _matrix_contrast_report(all_results: list) -> list:
                 contrasts.append({
                     'n_kv': n_kv, 'memory': route, 'contrast': name,
                     'mean_diff': diff, 't_stat': t_stat,
+                    'sd_diff': sd,
                     'n_common_seeds': n,
                     'unanimous': unanimous,
                     'predicted_direction': hyp['direction'],
@@ -1466,8 +1500,14 @@ def _matrix_contrast_report(all_results: list) -> list:
                     n = len(inter)
                     mean_i = sum(inter) / n
                     var = sum((x - mean_i) ** 2 for x in inter) / (n - 1)
-                    t_i = (mean_i / (math.sqrt(var) / math.sqrt(n))) \
-                        if var > 0 else None
+                    scale_i = max(abs(mean_i),
+                                  max(abs(x) for x in inter), 1.0e-300)
+                    if var <= (_ZERO_VAR_REL_EPS * scale_i) ** 2:
+                        sd_i = 0.0
+                    else:
+                        sd_i = math.sqrt(var)
+                    t_i = (mean_i / (sd_i / math.sqrt(n))) \
+                        if sd_i > 0 else None
                     if all(x > 0 for x in inter):
                         unanimous_i = 'positive'
                     elif all(x < 0 for x in inter):
@@ -1480,6 +1520,7 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'n_kv': n_kv, 'memory': route,
                         'contrast': 'I=D-B-C+A (CSA/HCA interaction)',
                         'mean_diff': mean_i, 't_stat': t_i,
+                        'sd_diff': sd_i,
                         'n_common_seeds': n,
                         'unanimous': unanimous_i,
                         'predicted_direction': hyp['direction'],
@@ -1498,7 +1539,7 @@ def _matrix_contrast_report(all_results: list) -> list:
                     res_b = by_key.get((n_kv, rb, f'{rb.upper()}-{g}'))
                     if res_a is None or res_b is None:
                         continue
-                    diff, t_stat, n, unanimous = _paired_contrast(
+                    diff, t_stat, n, unanimous, sd = _paired_contrast(
                         _seed_accuracy_map(res_a), _seed_accuracy_map(res_b))
                     if diff is None:
                         continue
@@ -1507,6 +1548,7 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'memory': f'{ra} vs {rb}',
                         'contrast': f'{g}_{ra.upper()} - {g}_{rb.upper()}',
                         'mean_diff': diff, 't_stat': t_stat,
+                        'sd_diff': sd,
                         'n_common_seeds': n,
                         'unanimous': unanimous,
                         'predicted_direction':
@@ -1526,7 +1568,9 @@ def _matrix_contrast_report(all_results: list) -> list:
 
 def _annotate_contrast_significance(contrasts: list,
                                     alpha: float = 0.05,
-                                    hypotheses: dict | None = None) -> dict:
+                                    hypotheses: dict | None = None,
+                                    equivalence_margin: float | None = None
+                                    ) -> dict:
     """Attach Bonferroni-corrected significance to the paired contrasts.
 
     Raw t-statistics invite post-hoc storytelling: with ~10-30 contrasts
@@ -1543,6 +1587,18 @@ def _annotate_contrast_significance(contrasts: list,
     undefined row can never reject. ``hypotheses`` overrides the
     hypothesis block recorded in the summary (matrix vs ratio sweep).
 
+    ``equivalence_margin`` (absolute final_acc units) additionally runs
+    the TOST equivalence test on every row over the SAME family, using
+    the row's stored ``sd_diff`` (``multi_seed_stats.tost_from_summary``)
+    and the Bonferroni-corrected per-test alpha. This is what turns a
+    non-significant contrast into a *decidable* statement: without TOST,
+    "not significant" means only "inconclusive at this seed budget" — it
+    is NEVER evidence that the compared groups are equivalent; with a
+    pre-specified margin in hand, ``tost_equivalent=True`` IS positive
+    evidence of practical equivalence (and ``not_equivalent`` remains
+    inconclusive, not proof of a difference). The margin must be fixed
+    before the numbers are read and is NOT derived from the observed CI.
+
     Mutates the contrast rows (additive keys) and returns a JSON-safe
     summary for the result metadata:
 
@@ -1553,8 +1609,17 @@ def _annotate_contrast_significance(contrasts: list,
       * ``hypothesis_status``     directional: 'supported' | 'contradicted'
                                   | 'not_supported'; two-sided:
                                   'difference_supported' | 'not_supported'
+      * ``equivalence_margin``    the pre-specified TOST margin (None if off)
+      * ``tost_p_value`` etc.     per-row equivalence verdict (margin on)
       * ``family_size`` etc. on the returned summary
     """
+    if equivalence_margin is not None:
+        equivalence_margin = float(equivalence_margin)
+        if not math.isfinite(equivalence_margin) \
+                or equivalence_margin <= 0.0:
+            raise ValueError(
+                'equivalence_margin must be finite and > 0, got '
+                f'{equivalence_margin!r}')
     n_family = len(contrasts)
     summary = {
         'alpha_family_wise': alpha,
@@ -1578,6 +1643,9 @@ def _annotate_contrast_significance(contrasts: list,
         'n_significant': 0,
         'n_supported': 0,
         'n_contradicted': 0,
+        'equivalence_margin': equivalence_margin,
+        'n_equivalent': 0,
+        'tost': None,
         'verdict_scope': (
             'Only significant_bonferroni=True rows may be cited as '
             'evidence for (or against) the pre-registered prediction; '
@@ -1631,6 +1699,76 @@ def _annotate_contrast_significance(contrasts: list,
             c['hypothesis_status'] == 'supported')
         summary['n_contradicted'] += int(
             c['hypothesis_status'] == 'contradicted')
+    if equivalence_margin is not None:
+        # TOST over the SAME run-wide family: a non-significant
+        # superiority row says nothing about equivalence, so each row
+        # additionally gets the two-one-sided-tests verdict computed from
+        # its stored summary statistics (n, mean, sd of the seed-paired
+        # differences) at the Bonferroni-corrected alpha. Note the
+        # asymmetry the summary records: equivalent=True is positive
+        # evidence; equivalent=False is still inconclusive (TOST failed
+        # to reject, it did not accept the null).
+        alpha_tost = alpha / n_family if n_family else None
+        n_equiv = 0
+        for c in contrasts:
+            n = c.get('n_common_seeds', 0)
+            mean_diff = c.get('mean_diff')
+            sd = c.get('sd_diff')
+            if (alpha_tost is None or n < 2
+                    or not isinstance(mean_diff, (int, float))
+                    or isinstance(mean_diff, bool)
+                    or not isinstance(sd, (int, float))
+                    or isinstance(sd, bool)
+                    or not math.isfinite(float(sd))):
+                c['equivalence_margin'] = equivalence_margin
+                c['tost_alpha_bonferroni'] = alpha_tost
+                c['tost_p_value'] = None
+                c['tost_equivalent'] = None
+                c['tost_ci_equiv_lo'] = None
+                c['tost_ci_equiv_hi'] = None
+                c['equivalence_verdict'] = 'not_computed'
+                continue
+            tost = tost_from_summary(mean_diff, sd, n, equivalence_margin,
+                                     alpha=alpha_tost)
+            c['equivalence_margin'] = equivalence_margin
+            c['tost_alpha_bonferroni'] = alpha_tost
+            c['tost_p_value'] = tost['p_value']
+            c['tost_equivalent'] = tost['equivalent']
+            c['tost_ci_equiv_lo'] = tost['ci_equiv_lo']
+            c['tost_ci_equiv_hi'] = tost['ci_equiv_hi']
+            c['equivalence_verdict'] = ('equivalent'
+                                        if tost['equivalent']
+                                        else 'not_equivalent')
+            n_equiv += int(bool(tost['equivalent']))
+        summary['n_equivalent'] = n_equiv
+        summary['tost'] = {
+            'margin': equivalence_margin,
+            'alpha_family_wise': alpha,
+            'alpha_bonferroni': alpha_tost,
+            'correction': 'bonferroni',
+            'ci_equiv_level': (1.0 - 2.0 * alpha_tost
+                               if alpha_tost is not None else None),
+            'n_equivalent': n_equiv,
+            'method': 'two_one_sided_paired_t',
+            'null_hypothesis': (
+                'H0: |mean seed-paired final_acc difference| >= margin '
+                '(per contrast, from the stored n / mean / sd of the '
+                'differences)'),
+            'equivalence_rule': (
+                'equivalent=True (tost_p_value < corrected alpha) is '
+                'positive evidence of practical equivalence within the '
+                'pre-specified margin; equivalent=False is inconclusive '
+                '(TOST failed to reject), NOT evidence of a difference.'),
+        }
+        summary['verdict_scope'] = (
+            'Only significant_bonferroni=True rows may be cited as '
+            'evidence for (or against) the pre-registered prediction; '
+            'non-significant rows are inconclusive at this seed budget, '
+            'not evidence of no effect. ADDITIONALLY: rows with '
+            'tost_equivalent=True may be cited as evidence of practical '
+            'equivalence within the pre-specified margin '
+            f'{equivalence_margin}; rows with tost_equivalent=False '
+            'remain inconclusive on both questions.')
     summary['hypotheses'] = hypotheses if hypotheses is not None else {
         **MATRIX_CONTRAST_HYPOTHESES,
         'cross_route (dynamic names A_KDA - A_MAMBA2, ...)':
@@ -1646,6 +1784,7 @@ def _log_contrast_table(contrasts: list) -> None:
                     'seeds across the compared groups)')
         return
     annotated = any('significant_bonferroni' in c for c in contrasts)
+    equiv_annotated = any('tost_equivalent' in c for c in contrasts)
     logger.info('\n' + '=' * 104)
     logger.info('Paired memory-route contrasts (seed-matched; final_acc; '
                 'positive = first operand better):')
@@ -1659,6 +1798,10 @@ def _log_contrast_table(contrasts: list) -> None:
         if annotated:
             sig = 'YES' if c.get('significant_bonferroni') else 'no'
             line += f"  sig={sig:<3} ({c.get('hypothesis_status', 'n/a')})"
+        if equiv_annotated:
+            eq = c.get('tost_equivalent')
+            eq_str = 'YES' if eq else ('no' if eq is False else 'n/a')
+            line += f"  equiv={eq_str}"
         logger.info(line)
     if annotated:
         logger.info(
@@ -1666,6 +1809,13 @@ def _log_contrast_table(contrasts: list) -> None:
             'run-wide contrast family (one-sided for the pre-registered '
             'directional contrasts, two-sided for the cross-route rows); '
             'non-significant rows are inconclusive, not "no effect".')
+    if equiv_annotated:
+        margin = contrasts[0].get('equivalence_margin')
+        logger.info(
+            f'  Equivalence = Bonferroni-corrected TOST within the same '
+            f'family against the pre-specified margin {margin} accuracy '
+            'points; equiv=YES is positive evidence of practical '
+            'equivalence, equiv=no is inconclusive (not a difference).')
     logger.info(
         '  NOTE: interaction rows (I=D-B-C+A) support complementarity '
         'claims ONLY with statistical evidence;')
@@ -1708,12 +1858,28 @@ def _contrast_consistency_violations(all_results: list,
         if seed_map:
             accs[key] = seed_map
 
+    def paired_stats(diffs: list):
+        """Mean and sample SD of per-seed differences.
+
+        Mirrors ``_paired_contrast``'s zero-variance convention (relative
+        epsilon): a "flat" sweep with last-ulp noise reports SD 0.0, not
+        a tiny positive spread.
+        """
+        n = len(diffs)
+        mean = sum(diffs) / n
+        var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+        scale = max(abs(mean), max(abs(d) for d in diffs), 1.0e-300)
+        if var <= (_ZERO_VAR_REL_EPS * scale) ** 2:
+            return mean, 0.0
+        return mean, math.sqrt(var)
+
     def paired_mean(a_map: dict, b_map: dict):
         common = sorted(set(a_map) & set(b_map))
         if len(common) < 2:
-            return None, len(common)
+            return None, len(common), None
         diffs = [a_map[s] - b_map[s] for s in common]
-        return sum(diffs) / len(diffs), len(common)
+        mean, sd = paired_stats(diffs)
+        return mean, len(common), sd
 
     out: list[str] = []
     for c in contrasts:
@@ -1732,8 +1898,9 @@ def _contrast_consistency_violations(all_results: list,
             group = name.split(' ', 1)[0].split('_', 1)[0]
             a_map = accs.get((n_kv, route_a, f'{route_a.upper()}-{group}'))
             b_map = accs.get((n_kv, route_b, f'{route_b.upper()}-{group}'))
-            expected, n_common = paired_mean(a_map, b_map) \
-                if a_map is not None and b_map is not None else (None, 0)
+            expected, n_common, expected_sd = paired_mean(a_map, b_map) \
+                if a_map is not None and b_map is not None \
+                else (None, 0, None)
         elif name.startswith('I='):
             members = [accs.get((n_kv, memory, f'{memory.upper()}-{g}'))
                        for g in 'ABCD']
@@ -1746,7 +1913,8 @@ def _contrast_consistency_violations(all_results: list,
                 continue
             diffs = [members[3][s] - members[1][s] - members[2][s]
                      + members[0][s] for s in common]
-            expected, n_common = sum(diffs) / len(diffs), len(common)
+            expected, expected_sd = paired_stats(diffs)
+            n_common = len(common)
         else:
             pair = _LAYOUT_CONTRAST_PAIRS.get(name)
             if pair is None:
@@ -1755,8 +1923,9 @@ def _contrast_consistency_violations(all_results: list,
             ga, gb = pair
             a_map = accs.get((n_kv, memory, f'{memory.upper()}-{ga}'))
             b_map = accs.get((n_kv, memory, f'{memory.upper()}-{gb}'))
-            expected, n_common = paired_mean(a_map, b_map) \
-                if a_map is not None and b_map is not None else (None, 0)
+            expected, n_common, expected_sd = paired_mean(a_map, b_map) \
+                if a_map is not None and b_map is not None \
+                else (None, 0, None)
         if expected is None:
             out.append(f'{where}: rows imply < 2 common seeds but the '
                        f'contrast was reported')
@@ -1768,6 +1937,18 @@ def _contrast_consistency_violations(all_results: list,
         if c.get('n_common_seeds') != n_common:
             out.append(f'{where}: n_common_seeds={c.get("n_common_seeds")!r} '
                        f'but the rows share {n_common} seed(s)')
+        reported_sd = c.get('sd_diff')
+        if (isinstance(reported_sd, (int, float))
+                and not isinstance(reported_sd, bool)
+                and math.isfinite(float(reported_sd))):
+            # The stored SD feeds the TOST equivalence verdict; drift
+            # between it and the raw rows would silently move the
+            # equivalence CI.
+            sd_tol = 1e-9 * max(1.0, abs(expected_sd))
+            if abs(float(reported_sd) - expected_sd) > sd_tol:
+                out.append(
+                    f'{where}: sd_diff={reported_sd!r} but the per-seed '
+                    f'rows imply {expected_sd!r}')
     return out
 
 
@@ -1801,7 +1982,7 @@ def _ratio_reference_contrasts(all_results: list,
             cand = by_key.get((n_kv, label))
             if cand is None:
                 continue
-            diff, t_stat, n, unanimous = _paired_contrast(
+            diff, t_stat, n, unanimous, sd = _paired_contrast(
                 _seed_accuracy_map(cand), ref_accs)
             if diff is None:
                 continue
@@ -1812,6 +1993,7 @@ def _ratio_reference_contrasts(all_results: list,
                 'ratio': label,
                 'contrast': f'{label} - {reference_label}',
                 'mean_diff': diff, 't_stat': t_stat,
+                'sd_diff': sd,
                 'n_common_seeds': n,
                 'unanimous': unanimous,
                 'predicted_direction': 'two_sided',
@@ -1841,19 +2023,32 @@ def _log_ratio_contrast_table(contrasts: list) -> None:
     logger.info('Paired ratio contrasts vs the reference layout '
                 '(seed-matched; final_acc; positive = alternative better):')
     logger.info('=' * 104)
+    equiv_annotated = any('tost_equivalent' in c for c in contrasts)
     for c in contrasts:
         sig = 'YES' if c.get('significant_bonferroni') else 'no'
         t_str = _fmt_tstat(c.get('t_stat'), width=8, prec=2)
-        logger.info(
-            f"  n_kv={c['n_kv']:<3} {c['contrast']:<14} "
-            f"diff={c['mean_diff']:+.4f}  t={t_str}  "
-            f"n={c['n_common_seeds']}  sig={sig:<3} "
-            f"({c.get('hypothesis_status', 'n/a')})")
+        line = (f"  n_kv={c['n_kv']:<3} {c['contrast']:<14} "
+                f"diff={c['mean_diff']:+.4f}  t={t_str}  "
+                f"n={c['n_common_seeds']}  sig={sig:<3} "
+                f"({c.get('hypothesis_status', 'n/a')})")
+        if equiv_annotated:
+            eq = c.get('tost_equivalent')
+            eq_str = 'YES' if eq else ('no' if eq is False else 'n/a')
+            line += f"  equiv={eq_str}"
+        logger.info(line)
     logger.info(
         '  Significance = Bonferroni-corrected TWO-SIDED paired t-test '
         'over the run-wide ratio-contrast family; non-significant ratios '
         'are statistically indistinguishable from the default 3:1:1 at '
         'this seed budget (not proof of equivalence).')
+    if equiv_annotated:
+        margin = contrasts[0].get('equivalence_margin')
+        logger.info(
+            f'  Equivalence = Bonferroni-corrected TOST over the same '
+            f'family against the pre-specified margin {margin} accuracy '
+            'points; equiv=YES is positive evidence that the ratio is '
+            'practically equivalent to the default, equiv=no is '
+            'inconclusive.')
     logger.info('=' * 104)
 
 
@@ -2039,7 +2234,7 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         r['rwkv7_upstream_binding'] = RWKV7_UPSTREAM_BINDING
         r['significance_scope'] = (
             'vs_chance_bonferroni_and_seed_paired_layout_contrasts_'
-            'bonferroni')
+            'bonferroni_and_tost_equivalence')
 
     # Paired seed-matched contrasts (B-A / C-A / D-B / D-C / interaction
     # per route; A/D replacement across routes — the KDA-vs-RWKV-7
@@ -2049,7 +2244,10 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
     # Bonferroni family over the run's contrast rows; only
     # significant_bonferroni=True rows may be cited as evidence.
     contrasts = _matrix_contrast_report(all_results)
-    contrast_tests = _annotate_contrast_significance(contrasts)
+    equiv_margin = _parse_equivalence_margin(
+        'ABL_EQUIV_MARGIN', CONTRAST_EQUIVALENCE_MARGIN)
+    contrast_tests = _annotate_contrast_significance(
+        contrasts, equivalence_margin=equiv_margin)
     _log_contrast_table(contrasts)
 
     os.makedirs('results', exist_ok=True)
@@ -2078,10 +2276,17 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
                      'HYPOTHESES / CROSS_ROUTE_CONTRAST_HYPOTHESIS. A '
                      'contrast supports its prediction only when '
                      'significant_bonferroni=True in the contrasts side '
-                     'file; non-significant rows are inconclusive.'),
+                     'file; non-significant rows are inconclusive. '
+                     'PRACTICAL EQUIVALENCE must be read from the TOST '
+                     'fields (tost_equivalent=True), not from a '
+                     'non-significant superiority test; the margin was '
+                     'pre-specified before the run.'),
         },
-        # Corrected significance verdict for the contrast family.
+        # Corrected significance + equivalence verdicts for the contrast
+        # family (TOST margin is inside this block, so the registration
+        # travels with the results).
         'contrast_tests': contrast_tests,
+        'contrast_equivalence_margin': equiv_margin,
         'overfit_sanity_check': {
             'enabled': gate_record['enabled'],
             'strict': gate_record['strict'],
@@ -2294,8 +2499,11 @@ def main():
     # RATIO_SWEEP_HYPOTHESES; raw mean ranking is not evidence.
     # ------------------------------------------------------------------
     ratio_contrasts = _ratio_reference_contrasts(all_results)
+    ratio_equiv_margin = _parse_equivalence_margin(
+        'ABL_EQUIV_MARGIN', CONTRAST_EQUIVALENCE_MARGIN)
     ratio_contrast_tests = _annotate_contrast_significance(
-        ratio_contrasts, hypotheses=RATIO_SWEEP_HYPOTHESES)
+        ratio_contrasts, hypotheses=RATIO_SWEEP_HYPOTHESES,
+        equivalence_margin=ratio_equiv_margin)
     _log_ratio_contrast_table(ratio_contrasts)
 
     logger.info('\nControlled-depth design: all reported ratios contain 5 layers.')
@@ -2361,6 +2569,11 @@ def main():
                     verdict = ('better_than_reference'
                                if c['mean_diff'] > 0
                                else 'worse_than_reference')
+                elif c.get('tost_equivalent') is True:
+                    # TOST rejected non-equivalence at the pre-specified
+                    # margin: the ratio is practically equivalent to the
+                    # default, which "not significant" alone cannot say.
+                    verdict = 'equivalent_to_reference'
                 else:
                     verdict = 'not_significantly_different'
                 r['vs_reference_ratio'] = {
@@ -2374,12 +2587,15 @@ def main():
                     'significant_bonferroni':
                         bool(c.get('significant_bonferroni')),
                     'hypothesis_status': c.get('hypothesis_status'),
+                    'equivalence_margin': c.get('equivalence_margin'),
+                    'tost_p_value': c.get('tost_p_value'),
+                    'tost_equivalent': c.get('tost_equivalent'),
                     'question': c.get('question'),
                     'verdict': verdict,
                 }
         r['significance_scope'] = (
             'vs_chance_bonferroni_and_seed_paired_vs_reference_ratio_'
-            'bonferroni')
+            'bonferroni_and_tost_equivalence')
 
     os.makedirs('results', exist_ok=True)
     write_results_json(all_results, 'results/exp5_ablation.json',

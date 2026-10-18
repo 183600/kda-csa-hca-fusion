@@ -45,7 +45,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import results_schema as rs  # noqa: E402
 from run_ablation import (  # noqa: E402
+    CONTRAST_EQUIVALENCE_MARGIN,
     MATRIX_UNIT,
+    _annotate_contrast_significance,
     _contrast_consistency_violations,
     _matrix_contrast_report,
     build_experiment_matrix,
@@ -312,11 +314,19 @@ def test_matrix_contrast_report_seed_matched_arithmetic():
         'mean_diff'] == pytest.approx(expected_d)
     assert all(c['n_common_seeds'] == 2 for c in contrasts)
 
+    # Every reported row now also carries the sd of the per-seed
+    # differences (the input to the TOST equivalence verdict).
+    assert all(c['sd_diff'] is not None and c['sd_diff'] >= 0.0
+               for c in contrasts)
+
     # Independent audit accepts the report and rejects tampering.
     assert _contrast_consistency_violations(rows, contrasts) == []
     tampered = [dict(contrasts[0],
                      mean_diff=contrasts[0]['mean_diff'] + 0.5)] + contrasts[1:]
     assert _contrast_consistency_violations(rows, tampered)
+    tampered_sd = [dict(contrasts[0],
+                        sd_diff=contrasts[0]['sd_diff'] + 0.5)] + contrasts[1:]
+    assert _contrast_consistency_violations(rows, tampered_sd)
 
     # Fewer than two common seeds -> no paired contrast is reported.
     disjoint = [
@@ -324,6 +334,63 @@ def test_matrix_contrast_report_seed_matched_arithmetic():
         _matrix_row('KDA-B', 'kda', (0.5, 0.8), seeds=[100, 101]),
     ]
     assert _matrix_contrast_report(disjoint) == []
+
+
+def test_contrast_tost_separates_equivalent_from_different():
+    """A non-significant contrast is not equivalence; TOST decides it.
+
+    One route with only A/B present yields a single-contrast family, so
+    the Bonferroni correction is the identity and the verdicts are exact.
+    """
+    rows = [
+        _matrix_row('KDA-A', 'kda', (0.30, 0.31)),
+        _matrix_row('KDA-B', 'kda', (0.30, 0.30)),
+    ]
+    contrasts = _matrix_contrast_report(rows)
+    assert len(contrasts) == 1 and contrasts[0]['contrast'] == (
+        'B-A (CSA replaces memory)')
+    assert contrasts[0]['sd_diff'] > 0.0
+    summary = _annotate_contrast_significance(
+        contrasts, equivalence_margin=CONTRAST_EQUIVALENCE_MARGIN)
+    c = contrasts[0]
+    assert c['tost_equivalent'] is True
+    assert c['equivalence_verdict'] == 'equivalent'
+    assert c['tost_p_value'] < c['tost_alpha_bonferroni']
+    assert c['tost_ci_equiv_lo'] > -CONTRAST_EQUIVALENCE_MARGIN
+    assert c['tost_ci_equiv_hi'] < CONTRAST_EQUIVALENCE_MARGIN
+    assert summary['n_equivalent'] == 1
+    assert summary['tost']['margin'] == CONTRAST_EQUIVALENCE_MARGIN
+    assert summary['tost']['n_equivalent'] == 1
+
+    # Same layout, a large unanimous difference (zero-variance diffs):
+    # clearly NOT equivalent, even though the row is also significant.
+    far_rows = [
+        _matrix_row('KDA-A', 'kda', (0.20, 0.22)),
+        _matrix_row('KDA-B', 'kda', (0.80, 0.82)),
+    ]
+    far = _matrix_contrast_report(far_rows)
+    _annotate_contrast_significance(
+        far, equivalence_margin=CONTRAST_EQUIVALENCE_MARGIN)
+    assert far[0]['sd_diff'] == 0.0
+    assert far[0]['tost_equivalent'] is False
+    assert far[0]['equivalence_verdict'] == 'not_equivalent'
+    assert far[0]['tost_p_value'] == 1.0
+
+
+def test_contrast_annotation_without_margin_makes_no_equivalence_claim():
+    rows = [
+        _matrix_row('KDA-A', 'kda', (0.30, 0.31)),
+        _matrix_row('KDA-B', 'kda', (0.30, 0.30)),
+    ]
+    contrasts = _matrix_contrast_report(rows)
+    summary = _annotate_contrast_significance(contrasts)
+    assert summary['tost'] is None
+    assert summary['equivalence_margin'] is None
+    assert summary['n_equivalent'] == 0
+    assert 'tost_equivalent' not in contrasts[0]
+    assert 'not evidence of no effect' in summary['verdict_scope']
+    with pytest.raises(ValueError):
+        _annotate_contrast_significance(contrasts, equivalence_margin=0.0)
 
 
 # ---------------------------------------------------------------------------

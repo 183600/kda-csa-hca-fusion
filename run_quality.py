@@ -35,6 +35,13 @@ OPERATOR_HYPOTHESES below, which pre-register what each cell tests):
     accuracy. PR-AUC is the primary ranking metric when positives are rare;
     these probes are 1-of-vocab ranked decisions, so the same convention
     applies.
+  * **Equivalence, not just significance.** Pairwise operator comparisons
+    additionally run a TOST against a PRE-SPECIFIED smallest effect of
+    interest (``PAIRWISE_EQUIVALENCE_MARGIN`` / ``MQAR_EQUIV_MARGIN``).
+    A non-significant superiority test is never read as "no difference";
+    only the TOST can positively support a "practically the same" claim,
+    and each pair records the smallest margin the current seed budget
+    could have supported.
   * **Softmax baseline convergence.** The softmax-attention baseline can be
     given more steps (``softmax_steps``) so it actually converges; a
     converged softmax is the right upper bound.
@@ -99,6 +106,52 @@ _ERROR_ANALYSIS_SEED_OFFSET = 7_000_000
 # eval (+5M), validation monitoring (+6M), and error analysis (+7M), so
 # computing the rule reference can never perturb any reported metric.
 _RULE_BASELINE_SEED_OFFSET = 8_000_000
+
+# Pre-specified smallest effect of interest (SESOI) for the seed-paired
+# operator comparisons, in ABSOLUTE accuracy units. This is the margin
+# parameter of the TOST equivalence test in ``multi_seed_stats``: two
+# operators separated by less than this are declared practically
+# equivalent (at the corrected alpha), and a non-significant superiority
+# test alone NEVER licenses a "same" claim (absence of evidence is not
+# evidence of absence — see ``_pairwise_op_comparisons``).
+#
+# Rationale for 0.05: the MQAR probe's chance level is 1/16 = 0.0625, and
+# the README fairness note warns that several ablations land within a few
+# percentage points of chance, so differences below 5 accuracy points are
+# not practically meaningful at this model/task scale. The margin is
+# fixed HERE, and overridable only via the pre-run ``MQAR_EQUIV_MARGIN``
+# environment variable (``0`` disables equivalence testing). It must not
+# be tuned against the observed CIs: choosing the margin after seeing the
+# data would invalidate the TOST p-value.
+PAIRWISE_EQUIVALENCE_MARGIN = 0.05
+
+
+def _parse_equivalence_margin(env_var, default):
+    """Parse the pre-specified TOST margin from an env var.
+
+    ``None`` / unset -> ``default``; ``0`` -> ``None`` (disable TOST);
+    a malformed or non-positive value falls back to ``default`` with a
+    warning. Returning ``None`` is the explicit "no equivalence testing"
+    signal consumed by ``_pairwise_op_comparisons``.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        logger.warning(
+            f'{env_var}={raw!r} is not a float; using the pre-specified '
+            f'default margin {default!r}')
+        return default
+    if val == 0.0:
+        return None
+    if not math.isfinite(val) or val < 0.0:
+        logger.warning(
+            f'{env_var}={raw!r} must be finite and >= 0; using the '
+            f'pre-specified default margin {default!r}')
+        return default
+    return val
 
 
 def _build_param_groups(*modules, weight_decay=0.01):
@@ -2986,7 +3039,7 @@ def _paired_one_sided_t(diffs):
 
 def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                              n_boot=2000, n_permutations=10000,
-                             max_exact=16):
+                             max_exact=16, equivalence_margin=None):
     """Seed-paired, Holm-corrected operator-vs-operator comparisons.
 
     The per-row ``significant_bonferroni`` flag only says "this operator
@@ -3013,17 +3066,40 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
       would need at the observed |d_z|. This converts an inconclusive
       comparison into an actionable multi-seed budget.
 
+    When ``equivalence_margin`` is not None, every testable pair ALSO
+    gets a TOST equivalence test against that PRE-SPECIFIED margin
+    (``multi_seed_stats.tost_paired``), with its p-values Holm-corrected
+    in a second family over the same pairs. This separates two claims
+    that are routinely conflated:
+
+    * ``verdict`` — a significant seed-paired difference (superiority);
+    * ``equivalence_verdict`` — the ``(1 - 2*alpha)`` CI for the mean
+      paired difference lies strictly inside +-margin (practical
+      equivalence).
+
+    A pair can be non-significant AND non-equivalent ("inconclusive at
+    this seed budget"), and — for tiny-but-consistent differences — even
+    significant AND practically equivalent; both are reported separately.
+    A non-significant pair is NEVER labelled 'equivalent' by default:
+    the margin comes from ``PAIRWISE_EQUIVALENCE_MARGIN`` /
+    ``MQAR_EQUIV_MARGIN`` before the run, not from the observed CI.
+    Each equivalence record also carries the smallest margin this run
+    could have supported (``equivalence_margin_supported``) so an
+    inconclusive pair is actionable.
+
     Multiple-comparison control: Holm-Bonferroni step-down within each
     cell (family = all testable unordered pairs of that cell), which
     controls FWER <= alpha per experimental question and is uniformly
     more powerful than plain Bonferroni at this seed count. p-values are
-    adjusted for BOTH the permutation and the t-test; the ``verdict``
-    field is driven by the permutation p-value.
+    adjusted for the permutation, the t-test, AND (when enabled) the TOST
+    equivalence test — each in its own family.
 
     Side effect: every row participating in >= 1 testable pair gets
     ``pairwise_tests``, ``pairwise_significant_wins`` and
     ``pairwise_significant_losses`` (operator-name lists) so downstream
     consumers can read a row's pairwise standing without re-deriving it.
+    With equivalence enabled they also get
+    ``pairwise_equivalent_to``.
 
     Returns a JSON-safe report (also stored in the exp4 metadata under
     ``op_pairwise_comparisons``).
@@ -3055,6 +3131,29 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         'n_tests': 0,
         'n_significant': 0,
         'n_skipped': 0,
+        'n_equivalent': 0,
+        'equivalence': {
+            'enabled': equivalence_margin is not None,
+            'margin': equivalence_margin,
+            'margin_source': (
+                'pre_specified_config (PAIRWISE_EQUIVALENCE_MARGIN, '
+                'overridable via the pre-run env MQAR_EQUIV_MARGIN; '
+                '0 disables)'),
+            'method': 'two one-sided paired t-tests (TOST)',
+            'ci_level': (1.0 - 2.0 * alpha) if equivalence_margin is not None
+            else None,
+            'correction': ('holm_bonferroni over the same per-cell pairs '
+                           'family (separate family from the superiority '
+                           'tests)'),
+            'note': (
+                'equivalence_verdict=equivalent means the (1-2*alpha) CI '
+                'of the mean paired difference lies strictly inside '
+                '+-margin: the two operators are practically the same '
+                'WITHIN the pre-specified margin. not_equivalent covers '
+                'both "real difference" and "inconclusive"; use the '
+                'superiority verdict and equivalence_margin_supported to '
+                'tell those apart.'),
+        },
         'cells': {},
     }
 
@@ -3062,7 +3161,7 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         cell_key = f'{task_name}/n_kv={n_kv_key}'
         rows_sorted = sorted(rows, key=lambda r: str(r.get('op')))
         cell = {'n_tests': 0, 'n_significant': 0, 'n_skipped': 0,
-                'pairs': OrderedDict()}
+                'n_equivalent': 0, 'pairs': OrderedDict()}
         records = []
         for i in range(len(rows_sorted)):
             for j in range(i + 1, len(rows_sorted)):
@@ -3087,7 +3186,8 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                 stats = summarize_paired(
                     diffs, seed=seed, n_boot=n_boot,
                     n_permutations=n_permutations,
-                    max_exact=max_exact, alpha=alpha)
+                    max_exact=max_exact, alpha=alpha,
+                    equivalence_margin=equivalence_margin)
                 rec = {'op_a': a.get('op'), 'op_b': b.get('op'),
                        'common_seeds': common, **stats}
                 records.append((rec, a, b))
@@ -3104,6 +3204,14 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         # number of comparisons actually run, but they can never reject.
         holm_t = holm_adjust([1.0 if p is None else p for p in p_t_raw],
                              alpha=alpha)
+        # TOST equivalence family (same pairs, separate question). Pairs
+        # never have < 2 common seeds here (they were skipped above), so
+        # the TOST p-value is always defined; the None guard is defensive.
+        holm_tost = None
+        if equivalence_margin is not None:
+            p_tost = [rec['tost']['p_value'] for rec, _, _ in records]
+            holm_tost = holm_adjust(
+                [1.0 if p is None else p for p in p_tost], alpha=alpha)
         for idx, (rec, a, b) in enumerate(records):
             rec['holm_adjusted_p_permutation'] = holm_perm['adjusted'][idx]
             rec['significant_holm_permutation'] = bool(
@@ -3114,6 +3222,18 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
             else:
                 rec['holm_adjusted_p_t'] = holm_t['adjusted'][idx]
                 rec['significant_holm_t'] = bool(holm_t['rejected'][idx])
+            if equivalence_margin is not None:
+                p_tost = rec.get('tost', {}).get('p_value')
+                if p_tost is None:
+                    rec['holm_adjusted_p_tost'] = None
+                    rec['significant_equivalence_holm'] = False
+                else:
+                    rec['holm_adjusted_p_tost'] = holm_tost['adjusted'][idx]
+                    rec['significant_equivalence_holm'] = bool(
+                        holm_tost['rejected'][idx])
+                rec['equivalence_verdict'] = (
+                    'equivalent' if rec['significant_equivalence_holm']
+                    else 'not_equivalent')
             mean = rec.get('mean_diff')
             if rec['significant_holm_permutation'] and mean:
                 rec['verdict'] = 'op_a_better' if mean > 0 else 'op_b_better'
@@ -3123,25 +3243,38 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                 r['pairwise_tests'] = r.get('pairwise_tests', 0) + 1
                 r.setdefault('pairwise_significant_wins', [])
                 r.setdefault('pairwise_significant_losses', [])
+                if equivalence_margin is not None:
+                    r.setdefault('pairwise_equivalent_to', [])
             if rec['verdict'] == 'op_a_better':
                 a['pairwise_significant_wins'].append(b.get('op'))
                 b['pairwise_significant_losses'].append(a.get('op'))
             elif rec['verdict'] == 'op_b_better':
                 b['pairwise_significant_wins'].append(a.get('op'))
                 a['pairwise_significant_losses'].append(b.get('op'))
+            if equivalence_margin is not None and \
+                    rec['equivalence_verdict'] == 'equivalent':
+                a['pairwise_equivalent_to'].append(b.get('op'))
+                b['pairwise_equivalent_to'].append(a.get('op'))
         cell['n_tests'] = len(records)
         cell['n_significant'] = sum(
             1 for rec, _, _ in records if rec['verdict'] != 'not_significant')
+        cell['n_equivalent'] = sum(
+            1 for rec, _, _ in records
+            if rec.get('equivalence_verdict') == 'equivalent')
         report['cells'][cell_key] = cell
         report['n_tests'] += cell['n_tests']
         report['n_significant'] += cell['n_significant']
+        report['n_equivalent'] += cell['n_equivalent']
         report['n_skipped'] += cell['n_skipped']
 
     report['note'] = (
         'Pairwise claims must cite these tests, not raw mean rankings or '
         'CI overlap. When a comparison is inconclusive, '
         'seeds_required_80pct_power estimates the seed budget the next '
-        'run would need at the observed effect size.')
+        'run would need at the observed effect size. A "same/practically '
+        'equivalent" claim requires equivalence_verdict=equivalent from '
+        'the pre-specified-margin TOST; a non-significant superiority test '
+        'alone never supports it.')
     return report
 
 
@@ -3151,11 +3284,18 @@ def _print_pairwise_report(op_pairwise):
         print('\nSeed-paired op-vs-op comparisons: no testable pairs '
               '(need >= 2 common seeds per pair).')
         return
-    print('\nSeed-paired op-vs-op comparisons '
-          '(permutation two-sided; Holm-corrected within cell):')
-    print(f"{'cell':>28} | {'op_a':>10} | {'op_b':>10} | {'d_acc':>8} | "
-          f"{'n':>3} | {'p_perm':>9} | {'p_holm':>9} | {'seeds@80%':>9} | "
-          f"verdict")
+    eq = op_pairwise.get('equivalence', {})
+    eq_on = bool(eq.get('enabled'))
+    title = ('(permutation two-sided; Holm-corrected within cell'
+             + (f"; TOST equivalence margin={eq.get('margin')!r}"
+                if eq_on else '') + '):')
+    print(f'\nSeed-paired op-vs-op comparisons {title}')
+    header = (f"{'cell':>28} | {'op_a':>10} | {'op_b':>10} | {'d_acc':>8} | "
+              f"{'n':>3} | {'p_perm':>9} | {'p_holm':>9} | {'seeds@80%':>9} | "
+              f"verdict")
+    if eq_on:
+        header += f" | {'p_tost':>9} | equivalence"
+    print(header)
     for cell_key, cell in op_pairwise['cells'].items():
         for rec in cell['pairs'].values():
             if rec.get('verdict') in (None, 'insufficient_paired_seeds'):
@@ -3168,10 +3308,16 @@ def _print_pairwise_report(op_pairwise):
             ph_str = f'{ph:.4f}' if ph is not None else 'n/a'
             need = rec.get('seeds_required_80pct_power')
             need_str = str(need) if need is not None else 'n/a'
-            print(f"{cell_key:>28} | {str(rec.get('op_a')):>10} | "
-                  f"{str(rec.get('op_b')):>10} | {d_str:>8} | "
-                  f"{rec.get('n_pairs', 0):>3} | {p_str:>9} | "
-                  f"{ph_str:>9} | {need_str:>9} | {rec['verdict']}")
+            row = (f"{cell_key:>28} | {str(rec.get('op_a')):>10} | "
+                   f"{str(rec.get('op_b')):>10} | {d_str:>8} | "
+                   f"{rec.get('n_pairs', 0):>3} | {p_str:>9} | "
+                   f"{ph_str:>9} | {need_str:>9} | {rec['verdict']}")
+            if eq_on:
+                pt = rec.get('holm_adjusted_p_tost')
+                pt_str = f'{pt:.4f}' if pt is not None else 'n/a'
+                row += (f" | {pt_str:>9} | "
+                        f"{rec.get('equivalence_verdict', 'n/a')}")
+            print(row)
 
 
 def main():
@@ -3893,14 +4039,23 @@ def main():
     #   1. significant_bonferroni          -> the op learned the task;
     #   2. beats_tuned_baseline            -> it beats a tuned simple model;
     #   3. pairwise_significant_wins       -> it beats a SPECIFIC complex
-    #      operator on the same seeds, robust to multiplicity.
+    #      operator on the same seeds, robust to multiplicity;
+    #   4. pairwise_equivalent_to          -> the pre-specified-margin TOST
+    #      says it is practically the SAME as that operator (a positive
+    #      equivalence claim; non-significance alone never licenses it).
     # The CI-overlap check below is a heuristic companion: overlapping
     # CIs do not imply "no difference", so only the paired tests here
     # support an A-vs-B claim.
     # ------------------------------------------------------------------
+    # Pre-specified SESOI for the TOST; MQAR_EQUIV_MARGIN=0 disables
+    # equivalence testing. The margin is consumed BEFORE the reported
+    # statistics are computed and is recorded in the metadata.
+    equivalence_margin = _parse_equivalence_margin(
+        'MQAR_EQUIV_MARGIN', PAIRWISE_EQUIVALENCE_MARGIN)
     op_pairwise = _pairwise_op_comparisons(
         all_results,
-        alpha=float(os.environ.get('MQAR_PAIRWISE_ALPHA', '0.05')))
+        alpha=float(os.environ.get('MQAR_PAIRWISE_ALPHA', '0.05')),
+        equivalence_margin=equivalence_margin)
     _print_pairwise_report(op_pairwise)
     if op_pairwise['n_tests']:
         logger.info(
@@ -3908,6 +4063,15 @@ def main():
             f"{op_pairwise['n_significant']}/{op_pairwise['n_tests']} "
             f"significant at Holm alpha={op_pairwise['alpha']} "
             f"({op_pairwise['n_skipped']} pair(s) skipped: <2 common seeds)")
+        if equivalence_margin is not None:
+            logger.info(
+                f"  TOST equivalence (pre-specified margin="
+                f"{equivalence_margin:g}): "
+                f"{op_pairwise['n_equivalent']}/{op_pairwise['n_tests']} "
+                f"pair(s) practically equivalent at Holm "
+                f"alpha={op_pairwise['alpha']}")
+        else:
+            logger.info('  TOST equivalence: disabled (MQAR_EQUIV_MARGIN=0)')
 
     # Experiment-level statistical validity summary. Mirrors run_ablation.py
     # but with the appropriate thresholds for the 4-op MQAR sweep.
@@ -4052,24 +4216,49 @@ def main():
                 paired_claim = (
                     f"No seed-paired Holm-corrected test separates "
                     f"{best['op']} from any other op at this seed count.")
+            # Positive equivalence standing (only when TOST is enabled):
+            # ops the best op is PRACTICALLY THE SAME as, within the
+            # pre-specified margin. This is the allowed counterpart of
+            # "no significant difference".
+            best_equiv_to = [
+                op for op in best.get('pairwise_equivalent_to', [])
+                if any(r.get('op') == op for r in live)]
+            best_equiv_to = sorted(best_equiv_to, key=str)
+            equiv_claim = ''
+            if equivalence_margin is not None:
+                if best_equiv_to:
+                    equiv_claim = (
+                        f"Within the pre-specified margin "
+                        f"{equivalence_margin:g}, the TOST declares it "
+                        f"practically equivalent to: "
+                        f"{', '.join(best_equiv_to)}.")
+                else:
+                    equiv_claim = (
+                        'No op is declared practically equivalent to it at '
+                        'the pre-specified margin.')
             cross_op_checks[f'{task_name}/n_kv={n_kv_key}'] = {
                 'best_op': best['op'],
                 'best_mean_acc': best['mean_acc'],
                 'best_ci95_acc': best.get('ci95_acc'),
                 'ops_with_overlapping_ci95': overlaps,
                 'best_op_pairwise_significant_wins': best_sig_wins,
+                'best_op_practically_equivalent_to': (
+                    best_equiv_to if equivalence_margin is not None
+                    else None),
                 'paired_test_note': (
                     'CI overlap is a continuity heuristic, not a test: '
                     'overlapping CIs do not imply a non-significant '
                     'difference. The authoritative pairwise evidence is '
                     'metadata.op_pairwise_comparisons (seed-paired '
-                    'permutation tests, Holm-corrected per cell).'),
+                    'permutation tests AND pre-specified-margin TOST, '
+                    'Holm-corrected per cell).'),
                 'claim': (
                     f"{best['op']} has the highest mean accuracy. "
                     f"{paired_claim} "
                     + (f"Its 95% CI overlaps {overlaps}."
                        if overlaps else
-                       "Its 95% CI is disjoint from every other op.")),
+                       "Its 95% CI is disjoint from every other op.")
+                    + (f" {equiv_claim}" if equiv_claim else '')),
             }
             if not best_sig_wins:
                 logger.warning(
@@ -4241,8 +4430,32 @@ def main():
             # paired t-test (secondary), the exact sign test, bootstrap CI
             # and Cohen's d_z; p-values Holm-corrected within the cell.
             # `seeds_required_80pct_power` turns inconclusive pairs into an
-            # actionable seed budget for the next multi-seed run.
+            # actionable seed budget for the next multi-seed run. When the
+            # equivalence margin is enabled (default), each pair ALSO
+            # carries a TOST against the pre-specified margin, so "no
+            # significant difference" can be separated from a positive
+            # "practically equivalent" claim (and from a genuinely
+            # inconclusive comparison).
             'op_pairwise_comparisons': op_pairwise,
+            'equivalence_testing': {
+                'enabled': equivalence_margin is not None,
+                'margin': equivalence_margin,
+                'margin_source': (
+                    'pre_specified (PAIRWISE_EQUIVALENCE_MARGIN constant, '
+                    'MQAR_EQUIV_MARGIN env override; 0 disables); never '
+                    'derived from the observed CIs'),
+                'method': ('two one-sided paired t-tests (TOST) per operator '
+                           'pair on the common seeds; Holm-Bonferroni '
+                           'within each (task, n_kv) cell'),
+                'alpha': float(os.environ.get('MQAR_PAIRWISE_ALPHA', '0.05')),
+                'ci_level': ((1.0 - 2.0 * float(
+                    os.environ.get('MQAR_PAIRWISE_ALPHA', '0.05')))
+                    if equivalence_margin is not None else None),
+                'accessor': ('per-pair `tost`, `holm_adjusted_p_tost`, '
+                             '`significant_equivalence_holm` and '
+                             '`equivalence_verdict`; per-row '
+                             '`pairwise_equivalent_to`'),
+            },
             # Tuned-baseline protocol record: how the simple-baseline lrs
             # were selected (validation stream, full grid), what they were,
             # and the seed-paired comparison of every complex op against
