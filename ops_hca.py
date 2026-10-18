@@ -26,6 +26,7 @@ from ops_csa import (
     _sliding_window_scores,
     _nan_safe_softmax,
     _qk_normalize,
+    CHUNKED_SW_THRESHOLD,
 )
 from ops_rope import (
     effective_rope_dim,
@@ -248,14 +249,23 @@ def naive_hca(
         # here: unlike naive_csa, HCA's softmax consumes ``scores_w`` alone
         # (already ``-inf``-masked for the left padding inside
         # ``_sliding_window_scores``), so the mask is intentionally dropped.
-        # ``return_windows=False`` bounds the transient [B, T, win, c]
-        # window tensor; the window value output is rebuilt tile-by-tile
-        # from ``C_local`` after the joint softmax (same per-row values).
-        scores_w, _, _ = _sliding_window_scores(
-            q, C_local, win, scale, device, return_windows=False)
+        # Inference fast path: materialize the full [B, T, win, c] window
+        # tensor ONCE when it fits the same per-tile element budget the
+        # tiled path already uses; the window value output then reuses it
+        # instead of re-deriving it tile-by-tile. Same per-row contraction
+        # either way (forward values bit-identical); only one densification
+        # copy is dropped. GATED ON no_grad so backward keeps the original
+        # per-tile graph exactly (see ``ops_csa.naive_csa``). Larger
+        # sequences keep the bounded-memory tiled path.
+        use_full_windows = ((not torch.is_grad_enabled())
+                            and (B_ * T * win * c) <= CHUNKED_SW_THRESHOLD)
+        scores_w, C_windows_full, _ = _sliding_window_scores(
+            q, C_local, win, scale, device,
+            return_windows=use_full_windows)
         scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
     else:
         scores_w = torch.empty(B_, nh, T, 0, dtype=compute_dtype, device=device)
+        C_windows_full = None
 
     # --- 4. JOINT softmax over the union of compressed + window entries ---
     # One softmax over the concatenated scores (DeepSeek-V4 §2.3.1 Eq. 27),
@@ -307,8 +317,14 @@ def naive_hca(
     if sliding_window > 0:
         # The joint-softmax weights are [B, nh, T, win]; move the query axis
         # back to dim 1 for the tiled value contraction (a pure permute).
-        out.add_(_sliding_window_output(
-            p_w.permute(0, 2, 1, 3), C_local, win, device))
+        p_w_t = p_w.permute(0, 2, 1, 3)
+        if C_windows_full is not None:
+            # Reuse the window slab materialized by the scoring pass above
+            # (same per-row contraction as the tiled rebuild).
+            out.add_(torch.einsum(
+                'b t h w, b t w d -> b t h d', p_w_t, C_windows_full))
+        else:
+            out.add_(_sliding_window_output(p_w_t, C_local, win, device))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries

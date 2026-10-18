@@ -1622,14 +1622,29 @@ def naive_csa(
         if rope_dim_eff > 0:
             C_local = partial_rope(
                 C_local, tpos, rope_dim_eff, rope_base, dim=1)
-        # ``return_windows=False`` bounds the transient [B, T, win, c]
-        # window tensor; the window value output is rebuilt tile-by-tile
-        # from ``C_local`` after the joint softmax (same per-row values).
-        scores_w, _, win_valid = _sliding_window_scores(
-            q, C_local, win, scale, device, return_windows=False)
+        # Inference fast path: materialize the full [B, T, win, c] window
+        # tensor ONCE when it fits the same per-tile element budget the
+        # tiled path already uses (in its single-tile case the tiled
+        # scoring path builds exactly this slab anyway); the window value
+        # output then reuses it instead of re-deriving it tile-by-tile.
+        # The per-row dot products are the same contraction, so the forward
+        # values are bit-identical; only one densification copy is dropped.
+        # GATED ON no_grad: under autograd the two-einsum-per-tile structure
+        # is kept exactly as before so backward sees the identical graph
+        # (the reuse path would sum the two window-gradient contributions
+        # through one shared node, changing backward rounding by ~1 ulp).
+        # Larger sequences keep the bounded-memory tiled path
+        # (``return_windows=False``, window slab re-derived per tile under
+        # ``CHUNKED_SW_THRESHOLD`` elements).
+        use_full_windows = ((not torch.is_grad_enabled())
+                            and (B_ * T * win * c) <= CHUNKED_SW_THRESHOLD)
+        scores_w, C_windows_full, win_valid = _sliding_window_scores(
+            q, C_local, win, scale, device,
+            return_windows=use_full_windows)
     else:
         scores_w = torch.empty(B_, T, nh, 0, dtype=compute_dtype, device=device)
         win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
+        C_windows_full = None
 
     # JOINT softmax over the union of the top-k selected compressed
     # blocks and the sliding-window tokens (DeepSeek-V4 §2.3.1 Eq. 27):
@@ -1676,7 +1691,13 @@ def naive_csa(
         # operand), so the in-place add is gradient-safe.
         out = torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
         if sliding_window > 0:
-            out.add_(_sliding_window_output(p_w, C_local, win, device))
+            if C_windows_full is not None:
+                # Reuse the window slab materialized by the scoring pass
+                # above (same per-row contraction as the tiled rebuild).
+                out.add_(torch.einsum(
+                    'b t h w, b t w d -> b t h d', p_w, C_windows_full))
+            else:
+                out.add_(_sliding_window_output(p_w, C_local, win, device))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries
