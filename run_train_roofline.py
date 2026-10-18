@@ -171,7 +171,10 @@ def training_flops_model(cfg, policy: str, *, T: int) -> dict:
     fwd_by_kind: dict[str, float] = {}
     for kind in layout:
         fwd_by_kind[kind] = float(prefill_flops(kind, T, **geo))
-    forward_total = float(sum(fwd_by_kind.values()))
+    # Sum over the LAYOUT (one term per layer), not over the deduplicated
+    # kind dictionary: repeated memory layers (e.g. the default 3xKDA)
+    # each contribute their own forward FLOPs.
+    forward_total = float(sum(fwd_by_kind[kind] for kind in layout))
     checked = [k for k in layout if gc.should_checkpoint(k, policy)]
     recompute = float(sum(fwd_by_kind[k] for k in checked))
     backward = 2.0 * forward_total

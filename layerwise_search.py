@@ -922,8 +922,9 @@ def _print_report(report: dict) -> None:
     bvs = report.get('best_vs_start')
     if bvs is not None:
         t_stat = bvs['t_stat']
+        t_s = 'n/a' if t_stat is None else f'{t_stat:.3f}'
         print(f"BEST vs START (seed-paired): mean_diff={bvs['mean_diff']:+.4f}  "
-              f"t={t_stat:.3f}  n={bvs['n_pairs']}  "
+              f"t={t_s}  n={bvs['n_pairs']}  "
               f"significant={bvs['significant']}")
     else:
         print('BEST vs START: no per-seed metrics (paired test unavailable)')
