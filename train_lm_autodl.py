@@ -82,6 +82,7 @@ from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
                               diagnose_training_curves, lm_token_diagnostics,
                               summarize_lm_diagnostics)
 from ppl_bootstrap import bootstrap_ppl_ci, throughput_summary
+import grad_checkpointing as grad_ckpt
 
 # tokenizer / dataset handling (reuse TinyStories if available)
 try:
@@ -791,7 +792,53 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
 
 
 class LMWithHybrid(nn.Module):
-    def __init__(self, vocab_size, cfg: HybridConfig):
+    """Causal LM wrapper: token embedding -> hybrid stack -> final norm -> head.
+
+    The token embedding and the output head are WEIGHT-TIED
+    (``lm_head.weight is embed.weight``), so the embedding matrix plays two
+    roles: the input representation and the unembedding projection.
+
+    ``embed_scale`` is the GPT-2-style embedding scaling factor. The raw
+    embedding lookup is initialised with ``std=0.02``; fed straight into the
+    first hybrid layer that gives the value/gate projections pre-activations
+    of magnitude ~0.02, which under-trains those paths early in training.
+    Multiplying the looked-up embedding by ``sqrt(d_model)`` restores a
+    healthy input scale (~0.16-0.32) for the CSA/HCA branches (which do NOT
+    renormalise their inputs) and for the value/gate paths, while leaving
+    the KDA ``q``/``k`` branches (L2-normalised) essentially unchanged.
+
+    Hardware-aware notes (why this is a fused scalar multiply, not a
+    separate op or a re-init):
+
+      * ONE vectorised kernel: the scale is a Python ``float`` broadcast
+        over the ``[B, T, d]`` gather output — no second materialised
+        tensor, no extra allocation, no per-forward host->device copy.
+      * ZERO new parameters / buffers: the scale is a plain attribute, so
+        ``state_dict`` keys, ``count_params`` and the reproducibility
+        contract are all unchanged.
+      * Autocast / dtype-safe: a Python-float scalar never promotes the
+        tensor dtype, so bf16/fp16 autocast behaviour is identical to the
+        unscaled path.
+
+    The scale is applied on EVERY forward — training, validation and the
+    pure-prefill evaluation path all call :meth:`forward` — so prefill
+    throughput/quality measurements reflect the scaled embeddings.
+
+    ``ckpt_policy`` selects the gradient-checkpointing policy
+    (``grad_checkpointing.CHECKPOINT_POLICIES``) applied to the hybrid
+    attention stack during the forward. ``'none'`` (the default) keeps the
+    legacy stateful ``self.hybrid(x)`` call bit-for-bit; the other policies
+    route the stack through ``grad_checkpointing.forward_with_policy``,
+    which wraps the selected layers in ``torch.utils.checkpoint`` (pure
+    functional recompute — the RoPE'd CSA/HCA layers and the KDA/Mamba-2/
+    RWKV-7 layers recompute identically because their forwards are
+    side-effect-free w.r.t. module state when the recurrent state is
+    threaded externally, which the training loop guarantees via
+    ``model.hybrid.reset_state()`` before every micro-step).
+    """
+
+    def __init__(self, vocab_size, cfg: HybridConfig, embed_scale=None,
+                 ckpt_policy=None):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg.d_model)
         # Total depth: the EXPLICIT layout is authoritative when set (the
@@ -808,10 +855,37 @@ class LMWithHybrid(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
+        # Embedding scaling factor (GPT-2 style). ``None`` selects the
+        # standard ``sqrt(d_model)`` default; pass ``1.0`` to recover the
+        # legacy unscaled behaviour exactly.
+        if embed_scale is None:
+            embed_scale = math.sqrt(cfg.d_model)
+        if (not isinstance(embed_scale, (int, float))
+                or not math.isfinite(embed_scale) or embed_scale <= 0):
+            raise ValueError(
+                f"embed_scale must be a positive finite number, got "
+                f"{embed_scale!r}.")
+        self.embed_scale = float(embed_scale)
+        # Gradient-checkpointing policy for the hybrid stack. Validated via
+        # ``grad_checkpointing.parse_policy`` so a typo fails at
+        # construction, not mid-training.
+        self.ckpt_policy = grad_ckpt.parse_policy(
+            'none' if ckpt_policy is None else ckpt_policy)
 
     def forward(self, input_ids, labels=None):
-        x = self.embed(input_ids)
-        x = self.hybrid(x)
+        x = self.embed(input_ids) * self.embed_scale
+        if self.ckpt_policy != 'none':
+            # Pure-functional checkpointed stack forward (see
+            # ``grad_checkpointing.forward_with_policy``): identical
+            # residual/norm plumbing and value parity with the stateful
+            # forward, but the selected layers' activations are recomputed
+            # during backward instead of retained. The training loop resets
+            # the stack state before every micro-step, so the externally
+            # threaded state is always None here.
+            x, _, _ = grad_ckpt.forward_with_policy(
+                self.hybrid, x, policy=self.ckpt_policy)
+        else:
+            x = self.hybrid(x)
         x = self.norm_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -1255,6 +1329,18 @@ def main():
                              "(default: env LM_LAYOUT_REPEAT or 2 = the "
                              "10-layer formal configuration). Ignored for "
                              "comma-separated layouts.")
+    parser.add_argument("--ckpt_policy",
+                        choices=grad_ckpt.CHECKPOINT_POLICIES, default="none",
+                        help="Gradient-checkpointing policy for the hybrid "
+                             "stack: 'none' (default; legacy stateful "
+                             "forward, no recompute), 'all' (checkpoint every "
+                             "layer), 'memory' (only the kda/mamba2/rwkv7 "
+                             "layers), 'retrieval' (only the csa/hca "
+                             "layers). Trades one extra recompute forward "
+                             "per checkpointed layer for lower retained-"
+                             "activation memory; outputs and parameter "
+                             "gradients are value-identical to 'none' (see "
+                             "test_lm_ckpt_policy.py).")
     args = parser.parse_args()
 
     # All three splits are mandatory: without validation there is no
@@ -1375,7 +1461,8 @@ def main():
         print(f"Hybrid layout: {cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca} "
               f"(memory={cfg.memory_type}), d={cfg.d_model}")
     print(f"Training profile: batch_size={batch_size}, grad_accum={grad_accum}, "
-          f"seq_len={seq_len}, optimizer_steps={max_steps}, seed={args.seed}")
+          f"seq_len={seq_len}, optimizer_steps={max_steps}, seed={args.seed}, "
+          f"ckpt_policy={args.ckpt_policy}")
 
     # ------------------------------------------------------------------
     # Data: load -> clean -> split (in this order) -> audit.
@@ -1465,7 +1552,9 @@ def main():
               f"fixed batch of {int(overfit_batch['input_ids'].shape[0])} "
               f"sequence(s) (weight_decay=0, no dropout/augmentation)...")
         overfit_report = run_overfit_sanity_check(
-            lambda: LMWithHybrid(vocab_size, cfg), overfit_batch, device,
+            lambda: LMWithHybrid(vocab_size, cfg,
+                                 ckpt_policy=args.ckpt_policy),
+            overfit_batch, device,
             steps=args.overfit_steps, lr=args.overfit_lr, seed=args.seed,
             loss_ratio_threshold=args.overfit_loss_ratio)
         print(f"[overfit-check] result: {'PASS' if overfit_report['passed'] else 'FAIL'} "
@@ -1492,7 +1581,8 @@ def main():
     # Re-seed right before the real model is constructed so its init is
     # identical to a run where the gate never ran.
     set_global_seed(args.seed, deterministic=True)
-    model = LMWithHybrid(vocab_size, cfg).to(device)
+    model = LMWithHybrid(vocab_size, cfg,
+                         ckpt_policy=args.ckpt_policy).to(device)
     params_count = count_params(model)
     print(f"Params: {params_count/1e6:.2f}M")
     print(f"Layout: {model.hybrid.layout_str()}")
@@ -1549,6 +1639,7 @@ def main():
         'amp_enabled': use_amp,
         'autocast_dtype': str(autocast_dtype),
         'kda_backend': kda_backend,
+        'ckpt_policy': model.ckpt_policy,
         'model_config': dict(cfg.__dict__),
         # Held-out protocol (recorded with the recipe so a reader knows
         # exactly how model selection and the final number were obtained).
