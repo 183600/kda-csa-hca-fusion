@@ -56,6 +56,16 @@ Methodology (both modes):
     ``0`` disables it). A non-significant contrast is inconclusive on
     both questions; only ``tost_equivalent=True`` supports "no practical
     difference" (see ``docs/equivalence-testing.md``).
+  * **Results analysis is part of the run, not an afterthought.** Every
+    seed records a held-out validation curve (read-only; the headline
+    ``final_acc`` keeps its exact fixed-budget meaning) which is labelled
+    overfitting / underfitting / healthy / saturated; every row pools the
+    per-seed bad-case reports (which mistake dominates); every paired
+    contrast carries an accuracy-vs-cost verdict next to its corrected
+    significance. The bad-case pass is ON by default (2 batches x 64
+    held-out samples per seed, dedicated RNG stream) and can be tuned or
+    disabled with ``ABL_ERROR_BATCHES`` / ``ABL_ERROR_BATCH`` /
+    ``ABL_ERROR_EXAMPLES``.
 """
 
 from __future__ import annotations
@@ -94,8 +104,8 @@ from run_quality import (
 from train_diagnostics import (
     DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
     ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
-    ValidationCurve, accuracy_cost_tradeoff, log_tradeoff, raise_non_finite,
-    triage_gradient,
+    ValidationCurve, accuracy_cost_tradeoff, log_pooled_errors, log_tradeoff,
+    pool_error_analyses, raise_non_finite, triage_gradient,
 )
 from multi_seed_stats import tost_from_summary, _ZERO_VAR_REL_EPS
 
@@ -821,6 +831,14 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
     else:
         t_stat = None
 
+    # Row-level rollup of the per-seed bad-case reports (None when the pass
+    # is disabled). Counts pool over every analyzed sample; examples come
+    # from the worst seed, so the row answers "which mistake dominates this
+    # ratio" without walking per_seed.
+    error_aggregate = pool_error_analyses(ok_per_seed)
+    log_pooled_errors(error_aggregate,
+                      label=f'ratio {ratio} n_kv={ok_per_seed[0]["n_kv"]}')
+
     return {
         'ratio': ok_per_seed[0]['ratio'],
         'n_kv': ok_per_seed[0]['n_kv'],
@@ -848,6 +866,8 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         # quoted as if it were a property of the layout.
         **_aggregate_curve_diagnosis(ok_per_seed),
         'mean_train_time_s': sum(r.get('train_time_s', 0.0) for r in ok_per_seed) / n,
+        # Pooled bad-case rollup for this ratio (None when disabled).
+        'error_analysis': error_aggregate,
     }
 
 
@@ -1495,6 +1515,12 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     else:
         t_stat = None
 
+    # Pooled bad-case rollup for this group (None when the pass is
+    # disabled); same definition as eval_layout_multi_seed.
+    error_aggregate = pool_error_analyses(ok_per_seed)
+    log_pooled_errors(error_aggregate,
+                      label=f'group {group_id} n_kv={ok_per_seed[0]["n_kv"]}')
+
     return {
         'group': group_id,
         'memory': memory_type,
@@ -1519,6 +1545,8 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                                  for r in ok_per_seed) / n,
         # Same sweep-level curve rollup as the ratio mode.
         **_aggregate_curve_diagnosis(ok_per_seed),
+        # Pooled bad-case rollup for this group (None when disabled).
+        'error_analysis': error_aggregate,
     }
 
 
@@ -1642,6 +1670,14 @@ def _matrix_contrast_report(all_results: list) -> list:
                     'falsified_if': hyp['falsified_if'],
                     'metric': 'final_acc',
                     'direction': 'higher_is_better',
+                    # Row identity of the two sides, so the accuracy-vs-cost
+                    # screen (and any consumer) can join the contrast back to
+                    # the group rows it was computed from without parsing the
+                    # display strings.
+                    'candidate_memory': route,
+                    'candidate_group': f'{route.upper()}-{ga}',
+                    'reference_memory': route,
+                    'reference_group': f'{route.upper()}-{gb}',
                 })
             # Interaction I_R = D - B - C + A on the COMMON seeds of all
             # four groups.
@@ -1683,6 +1719,12 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'falsified_if': hyp['falsified_if'],
                         'metric': 'final_acc',
                         'direction': 'higher_is_better',
+                        # A four-cell functional, not a two-row difference:
+                        # no single candidate/reference pair to cost-screen.
+                        'candidate_memory': None,
+                        'candidate_group': None,
+                        'reference_memory': None,
+                        'reference_group': None,
                     })
         # --- cross-route replacement contrasts ---------------------------
         for i, ra in enumerate(routes):
@@ -1716,6 +1758,12 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'metric': 'final_acc',
                         'direction': 'higher_is_better',
                         'question': question,
+                        # Row identity: the two sides live on DIFFERENT
+                        # memory routes (the replacement question).
+                        'candidate_memory': ra,
+                        'candidate_group': f'{ra.upper()}-{g}',
+                        'reference_memory': rb,
+                        'reference_group': f'{rb.upper()}-{g}',
                     })
     return contrasts
 
@@ -2324,6 +2372,60 @@ def _attach_cost_tradeoffs(contrasts: list, all_results: list,
     return contrasts
 
 
+def _attach_matrix_cost_tradeoffs(contrasts: list, all_results: list) -> list:
+    """Accuracy-vs-cost screen for the matrix contrasts (ratio-mode parity).
+
+    The matrix's paired tests answer "is the accuracy difference real?";
+    they do not answer "is it worth adopting?". A group that gains half an
+    accuracy point while doubling parameters or inference latency, or a
+    difference that survives no significance test, must not be quoted as an
+    improvement — the same rule the ratio sweep already enforces through
+    :func:`_attach_cost_tradeoffs`.
+
+    Each contrast row carries the identity of its two sides
+    (``candidate_memory`` / ``candidate_group`` and the reference pair), so
+    the underlying aggregate rows are looked up exactly; the functional
+    interaction contrast (``I=D-B-C+A``) has no single candidate/reference
+    pair and records ``cost_tradeoff=None`` with an explanatory note.
+    Significance is taken from the row's OWN corrected test, so the cost
+    screen and the statistical screen judge the same evidence.
+    """
+    by_key = {(r.get('n_kv'), r.get('memory'), r.get('group')): r
+              for r in all_results if 'error' not in r}
+    for c in contrasts:
+        c_mem = c.get('candidate_memory')
+        c_grp = c.get('candidate_group')
+        r_mem = c.get('reference_memory')
+        r_grp = c.get('reference_group')
+        if not (c_mem and c_grp and r_mem and r_grp):
+            c['cost_tradeoff'] = None
+            c['cost_tradeoff_note'] = (
+                'not a two-row contrast (functional interaction); no '
+                'accuracy-vs-cost verdict is defined for it.')
+            continue
+        cand = by_key.get((c.get('n_kv'), c_mem, c_grp))
+        ref = by_key.get((c.get('n_kv'), r_mem, r_grp))
+        if cand is None or ref is None:
+            c['cost_tradeoff'] = None
+            c['cost_tradeoff_note'] = (
+                f'missing group row for '
+                f'candidate={c_mem}/{c_grp} or reference={r_mem}/{r_grp}; '
+                f'the accuracy difference is reported without a cost '
+                f'verdict.')
+            continue
+        verdict = accuracy_cost_tradeoff(
+            cand, ref,
+            significant=(bool(c.get('significant_bonferroni'))
+                         if c.get('significant_bonferroni') is not None
+                         else None))
+        c['cost_tradeoff'] = verdict
+        label = (f"{c.get('contrast')} @ {c.get('memory')} "
+                 f"(n_kv={c.get('n_kv')})")
+        log_tradeoff(verdict, label=label)
+        c['cost_tradeoff_note'] = verdict.get('recommendation', '')
+    return contrasts
+
+
 def _ratio_reference_contrasts(all_results: list,
                                reference_label: str = RATIO_REFERENCE_LABEL):
     """Paired seed-matched differences of every ratio vs the reference.
@@ -2424,7 +2526,8 @@ def _log_ratio_contrast_table(contrasts: list) -> None:
     logger.info('=' * 104)
 
 
-def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
+def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
+                     error_batches=0, error_batch=64, error_examples=2):
     """ABL_MODE=matrix driver: build + run + report the explicit matrix."""
     preset = os.environ.get('ABL_MATRIX', 'main8').strip().lower()
     total_layers = parse_int_env('ABL_TOTAL_LAYERS', 10, min_value=1,
@@ -2494,7 +2597,10 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
             try:
                 res = eval_group_multi_seed(spec, n_seeds=n_seeds,
                                             steps=steps, device=device,
-                                            n_kv=n_kv, d_model=d_model)
+                                            n_kv=n_kv, d_model=d_model,
+                                            error_batches=error_batches,
+                                            error_batch=error_batch,
+                                            max_error_examples=error_examples)
                 t_stat = res.get('t_stat_vs_chance')
                 n_ok = res.get('n_seeds_ok', 0)
                 if t_stat is not None and n_ok >= 2:
@@ -2620,7 +2726,32 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         'ABL_EQUIV_MARGIN', CONTRAST_EQUIVALENCE_MARGIN)
     contrast_tests = _annotate_contrast_significance(
         contrasts, equivalence_margin=equiv_margin)
+    # Accuracy-vs-cost screen on the SAME contrasts (ratio-mode parity):
+    # run after the corrected significance is attached so both screens
+    # judge the same evidence.
+    _attach_matrix_cost_tradeoffs(contrasts, all_results)
     _log_contrast_table(contrasts)
+
+    # Regime of the matrix as a whole (same vocabulary as the ratio sweep):
+    # are the rows saturated / underfitting / overfitting, and do the seeds
+    # agree on the verdict? Without this, a final-number-only table cannot
+    # say whether a group's score is a converged property or a budget
+    # artifact.
+    matrix_curve_summary = _curve_diagnosis_summary(all_results, 'group')
+    logger.info('\n' + '=' * 70)
+    logger.info('Training-curve regime (held-out monitor, not final numbers):')
+    logger.info(f'  rows with a curve: {matrix_curve_summary["rows_with_curve"]}'
+                f'/{matrix_curve_summary["rows_total"]}   '
+                f'verdicts={matrix_curve_summary["verdict_counts"]}')
+    if matrix_curve_summary['mean_generalization_gap'] is not None:
+        logger.info(f'  mean generalization gap: '
+                    f"{matrix_curve_summary['mean_generalization_gap']:.4f} "
+                    f"(max {matrix_curve_summary['max_generalization_gap']:.4f})")
+    logger.info(f'  regime: {matrix_curve_summary["regime"]}')
+    logger.info(f'  {matrix_curve_summary["interpretation"]}')
+    if matrix_curve_summary['recommended_action']:
+        logger.info(f'  ACTION: {matrix_curve_summary["recommended_action"]}')
+    logger.info('=' * 70)
 
     os.makedirs('results', exist_ok=True)
     run_meta = {
@@ -2659,6 +2790,21 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list):
         # travels with the results).
         'contrast_tests': contrast_tests,
         'contrast_equivalence_margin': equiv_margin,
+        # Sweep-wide training regime + the accuracy-vs-cost screen, so the
+        # artifact records not only which group won but whether the win
+        # survives the curve diagnosis and what it cost.
+        'curve_diagnosis_summary': matrix_curve_summary,
+        'cost_tradeoff_policy': {
+            'min_effect': DEFAULT_MIN_EFFECT,
+            'max_cost_ratio': DEFAULT_MAX_COST_RATIO,
+            'cost_keys': list(DEFAULT_COST_KEYS),
+            'note': (
+                'A paired contrast is only an adoptable improvement if its '
+                'corrected test is significant AND the accuracy gain clears '
+                'min_effect AND no cost axis exceeds max_cost_ratio. The '
+                'accuracy difference and the cost ratios are reported '
+                'separately so either can be quoted on its own.'),
+        },
         'overfit_sanity_check': {
             'enabled': gate_record['enabled'],
             'strict': gate_record['strict'],
@@ -2742,10 +2888,27 @@ def main():
             raise ValueError(
                 f"ABL_NKV includes n_kv={n_kv} but 2*n_kv={2*n_kv} must be "
                 f"< SEQ_LEN={SEQ_LEN} (need room for the cue token at the end).")
+    # Results-analysis controls. The held-out validation curve is always
+    # recorded (every steps//4); the bad-case pass is ON by default with
+    # Exp 4's budget (2 batches x 64 held-out samples per seed, dedicated
+    # RNG stream) so the sweep's artifact carries WHY each layout fails.
+    # Set ABL_ERROR_BATCHES=0 to disable it.
+    error_batches = parse_int_env('ABL_ERROR_BATCHES', 2, min_value=0,
+                                  logger=logger)
+    error_batch = parse_int_env('ABL_ERROR_BATCH', 64, min_value=1,
+                                logger=logger)
+    error_examples = parse_int_env('ABL_ERROR_EXAMPLES', 2, min_value=0,
+                                   logger=logger)
     logger.info(f'  n_seeds={n_seeds}, steps={steps}, n_kv={n_kv_list}')
+    logger.info(f'  bad-case      : {error_batches}x{error_batch} held-out '
+                f'samples per seed '
+                f'(stream +{ERROR_ANALYSIS_SEED_OFFSET})')
 
     if abl_mode == 'matrix':
-        rc = _run_matrix_mode(device, n_seeds, steps, n_kv_list)
+        rc = _run_matrix_mode(device, n_seeds, steps, n_kv_list,
+                              error_batches=error_batches,
+                              error_batch=error_batch,
+                              error_examples=error_examples)
         _append_ablation_manifest('matrix', rc, n_seeds, steps, n_kv_list)
         return rc
 
@@ -2791,7 +2954,10 @@ def main():
                         f'(n_kv={n_kv}, {n_seeds} seeds) --')
             try:
                 res = eval_layout_multi_seed(r, n_seeds=n_seeds, steps=steps,
-                                             device=device, n_kv=n_kv)
+                                             device=device, n_kv=n_kv,
+                                             error_batches=error_batches,
+                                             error_batch=error_batch,
+                                             max_error_examples=error_examples)
                 t_stat = res.get('t_stat_vs_chance')
                 n_ok = res.get('n_seeds_ok', 0)
                 if t_stat is not None and n_ok >= 2:

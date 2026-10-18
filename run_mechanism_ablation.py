@@ -77,6 +77,12 @@ Budget / configuration (environment variables)
 * ``MECH_NKV``         (default '1') — comma-separated MQAR n_kv values.
 * ``MECH_VARIANTS``    (default '')  — optional comma-separated subset of
   variant names (must include ``baseline`` for the paired comparisons).
+* ``MECH_ERROR_BATCHES`` (default 2)  — held-out bad-case batches per seed
+  (0 disables the pass). Every seed also records a held-out validation
+  curve, labelled overfitting / underfitting / healthy / saturated by
+  ``results_analysis.diagnose_training_curves``.
+* ``MECH_ERROR_BATCH``   (default 64) — samples per bad-case batch.
+* ``MECH_ERROR_EXAMPLES`` (default 2) — decoded examples kept per category.
 
 Output
 ------
@@ -123,8 +129,10 @@ from run_ablation import (
     _run_ablation_overfit_gate,
 )
 from train_diagnostics import (
-    VAL_MONITOR_SEED_OFFSET, ValPoint, ValidationCurve, raise_non_finite,
-    triage_gradient,
+    DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
+    ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
+    ValidationCurve, accuracy_cost_tradeoff, log_pooled_errors, log_tradeoff,
+    pool_error_analyses, raise_non_finite, triage_gradient,
 )
 from run_quality import (
     MQARHead,
@@ -798,6 +806,12 @@ def summarize_variant(per_seed, variant):
     else:
         t_vs_chance = None
 
+    # Pooled bad-case rollup for this variant (None when the pass is
+    # disabled): which mistake dominates the variant's errors, with the
+    # worst seed's decoded examples. Same definition as Exp 4/5.
+    error_aggregate = pool_error_analyses(ok)
+    log_pooled_errors(error_aggregate, label=f'variant {variant["name"]}')
+
     return {
         'variant': variant['name'],
         'question': variant['question'],
@@ -854,6 +868,8 @@ def summarize_variant(per_seed, variant):
         # run_ablation.eval_layout_multi_seed), so a mechanism row carries
         # the same curve vocabulary as a layout row.
         **_aggregate_curve_diagnosis(ok),
+        # Pooled bad-case rollup for this variant (None when disabled).
+        'error_analysis': error_aggregate,
     }
 
 
@@ -993,6 +1009,17 @@ def main():
     steps = parse_int_env('MECH_STEPS', 200, min_value=1, logger=logger)
     train_batch = parse_int_env('MECH_TRAIN_BATCH', 16, min_value=1,
                                 logger=logger)
+    # Results-analysis controls: the held-out validation curve is always
+    # recorded (read-only), and the bad-case pass is ON by default with the
+    # Exp 4 budget (2 batches x 64 held-out samples per seed, dedicated RNG
+    # stream). Without it, "removing RoPE did not help" could not be
+    # separated from "the errors are all association mix-ups either way".
+    error_batches = parse_int_env('MECH_ERROR_BATCHES', 2, min_value=0,
+                                  logger=logger)
+    error_batch = parse_int_env('MECH_ERROR_BATCH', 64, min_value=1,
+                                logger=logger)
+    error_examples = parse_int_env('MECH_ERROR_EXAMPLES', 2, min_value=0,
+                                   logger=logger)
     n_kv_list = _parse_nkv_list('MECH_NKV', '1')
     for n_kv in n_kv_list:
         if 2 * n_kv > VOCAB:
@@ -1018,6 +1045,8 @@ def main():
     has_baseline = any(v['name'] == 'baseline' for v in variants)
     logger.info(f'  n_seeds={n_seeds}, steps={steps}, n_kv={n_kv_list}, '
                 f'train_batch={train_batch}')
+    logger.info(f'  bad-case: {error_batches}x{error_batch} held-out samples '
+                f'per seed (stream +{ERROR_ANALYSIS_SEED_OFFSET})')
     logger.info(f'  variants: {[v["name"] for v in variants]} '
                 f'(baseline present: {has_baseline})')
 
@@ -1062,7 +1091,10 @@ def main():
                 try:
                     record = train_variant(
                         variant, seed=seed, steps=steps, device=device,
-                        n_kv=n_kv, train_batch=train_batch)
+                        n_kv=n_kv, train_batch=train_batch,
+                        error_batches=error_batches,
+                        error_batch=error_batch,
+                        max_error_examples=error_examples)
                     record['train_time_s'] = time.time() - t0
                     logger.info(
                         f'    seed {seed}: acc={record["final_acc"]:.4f}  '
@@ -1082,7 +1114,24 @@ def main():
                         'use_ste': bool(variant['use_ste']),
                         'final_acc': None, 'final_loss': None,
                         'fwd_ms': None, 'n_params': None, 'n_layers': None,
-                        'loss_curve': [], 'gold_recall': None,
+                        'last_train_loss': None, 'mean_last10_loss': None,
+                        'loss_curve': [], 'acc_curve': [],
+                        # Mirror the success-row diagnostic schema
+                        # (held-out curve + bad cases) so
+                        # pd.DataFrame(per_seed) has uniform columns.
+                        'val_every': None,
+                        'val_history': [],
+                        'curve_diagnosis': None,
+                        'generalization_gap': None,
+                        'best_val': None,
+                        'val_loss_first': None, 'val_loss_last': None,
+                        'val_acc_first': None, 'val_acc_last': None,
+                        'val_acc_peak': None,
+                        'error_analysis': None,
+                        'error_analysis_seed_offset':
+                            ERROR_ANALYSIS_SEED_OFFSET,
+                        'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
+                        'gold_recall': None,
                         # Mirror the success-row diagnostic schema so
                         # pd.DataFrame(per_seed) has uniform columns.
                         'gold_recall_n_samples': 0,
@@ -1186,6 +1235,36 @@ def main():
                 row['gold_recall_t_crit_bonferroni'] = recall_crit
                 row['gold_recall_significant_bonferroni'] = (
                     recall_crit is not None and recall_t > recall_crit)
+
+    # Accuracy-vs-cost screen for every non-baseline variant. The paired
+    # test answers "is the accuracy difference real?"; it does not answer
+    # "is the variant worth adopting?". A significant gain that costs twice
+    # the parameters / train time / inference latency (or a sub-minimum
+    # effect that no test separates from noise) must not be quoted as an
+    # improvement. Significance comes from the row's OWN Bonferroni test.
+    for n_kv in n_kv_list:
+        base_row = next(
+            (r for r in all_rows
+             if r['n_kv'] == n_kv and r.get('variant') == 'baseline'), None)
+        for row in all_rows:
+            if row['n_kv'] != n_kv or row.get('variant') == 'baseline':
+                continue
+            if base_row is None or row.get('mean_acc') is None \
+                    or base_row.get('mean_acc') is None:
+                row['cost_tradeoff'] = None
+                row['cost_tradeoff_note'] = (
+                    'no baseline row / comparable accuracy on one side; '
+                    'refusing to call this an improvement.')
+                continue
+            verdict = accuracy_cost_tradeoff(
+                row, base_row,
+                significant=(bool(row.get('paired_significant_bonferroni'))
+                             if row.get('paired_significant_bonferroni')
+                             is not None else None))
+            row['cost_tradeoff'] = verdict
+            log_tradeoff(verdict,
+                         label=f"variant {row['variant']} (n_kv={n_kv})")
+            row['cost_tradeoff_note'] = verdict.get('recommendation', '')
 
     ok_rows = [r for r in all_rows if r.get('mean_acc') is not None]
     min_seeds_ok = min((r['n_seeds_ok'] for r in all_rows), default=0)
@@ -1319,6 +1398,38 @@ def main():
             '(n_variants - 1 + n_variants) * n_kv when the baseline variant '
             'is present; alpha = 0.05/n_tests; undefined statistics are '
             'null.'),
+        'cost_tradeoff_policy': {
+            'min_effect': DEFAULT_MIN_EFFECT,
+            'max_cost_ratio': DEFAULT_MAX_COST_RATIO,
+            'cost_keys': list(DEFAULT_COST_KEYS),
+            'note': (
+                'Each non-baseline row carries cost_tradeoff: a variant is '
+                'only an adoptable improvement if its corrected paired test '
+                'is significant AND the accuracy gain clears min_effect AND '
+                'no cost axis exceeds max_cost_ratio. The accuracy '
+                'difference and the cost ratios are reported separately so '
+                'either can be quoted on its own.'),
+        },
+        'results_analysis': {
+            'validation_curve': (
+                'every seed records a held-out (loss, accuracy) curve every '
+                'steps//4 on seed + MECH val-monitor stream, diagnosed as '
+                'overfitting / underfitting / healthy / saturated by '
+                'results_analysis.diagnose_training_curves; row-level '
+                'rollups are curve_verdict / curve_verdict_counts.'),
+            'bad_case': (
+                'every seed classifies its held-out misclassifications into '
+                'task-level categories on a dedicated error stream '
+                f'(seed + {ERROR_ANALYSIS_SEED_OFFSET}); the row-level '
+                'error_analysis block pools the counts and keeps the worst '
+                "seed's decoded examples."),
+            'seed_offsets': {
+                'training': 1_000_000,
+                'headline_eval': 5_000_000,
+                'val_monitor': VAL_MONITOR_SEED_OFFSET,
+                'error_analysis': ERROR_ANALYSIS_SEED_OFFSET,
+            },
+        },
         'n_seeds': n_seeds,
         'steps': steps,
         'train_batch': train_batch,

@@ -4156,10 +4156,10 @@ def main():
     # Efficiency-vs-accuracy annotation (per task/n_kv group).
     #
     # "Report the gain WITH its cost": for every sweep cell, mark each op
-    # as Pareto-optimal or dominated on (mean_acc maximise; parameters and
-    # wall-clock train time minimise). A 0.5% accuracy gain at 10x cost is
-    # now visible in the record instead of requiring a cross-reference to
-    # the latency/cache experiments.
+    # as Pareto-optimal or dominated on (mean_acc maximise; parameters,
+    # wall-clock train time and per-sample inference latency minimise). A
+    # 0.5% accuracy gain at 10x cost is now visible in the record instead
+    # of requiring a cross-reference to the latency/cache experiments.
     #
     # The cross-op claim check answers "is the winner actually better?":
     # when the best op's 95% CI overlaps another op's CI, the ranking
@@ -4181,7 +4181,8 @@ def main():
         if live:
             rep = annotate_rows_with_pareto(
                 live, accuracy_key='mean_acc',
-                cost_keys=('mean_train_time_s', 'n_params'),
+                cost_keys=('mean_train_time_s', 'n_params',
+                           'mean_eval_ms_per_sample'),
                 name_key='op')
             pareto_reports[f'{task_name}/n_kv={n_kv_key}'] = {
                 'frontier': rep['frontier'],
@@ -4417,18 +4418,18 @@ def main():
                 'eval_gen_seed_offset': 5_000_000,
             },
             # Efficiency-vs-accuracy: per sweep cell, which ops are Pareto
-            # optimal / dominated on (accuracy, params, train time), plus
-            # the cost-normalized accuracies. Wall-clock timing is a
-            # same-run proxy (shared CI hardware), not a kernel benchmark:
-            # the dedicated latency experiment (Exp 2/6) remains the
-            # authority for latency claims.
+            # optimal / dominated on (accuracy, params, train time, eval
+            # latency), plus the cost-normalized accuracies. Wall-clock
+            # timing is a same-run proxy (shared CI hardware), not a kernel
+            # benchmark: the dedicated latency experiment (Exp 2/6) remains
+            # the authority for latency claims.
             'efficiency_accuracy': {
                 'pareto': pareto_reports,
                 'cost_note': ('cost axes are within-run wall-clock train '
-                              'time and parameter count; timing is noisy '
-                              'on shared hardware and is a screening proxy, '
-                              'not a latency benchmark (use Exp 2/6 for '
-                              'latency claims).'),
+                              'time, parameter count and per-sample eval '
+                              'latency; timing is noisy on shared hardware '
+                              'and is a screening proxy, not a latency '
+                              'benchmark (use Exp 2/6 for latency claims).'),
                 'accessor': ('per-row `pareto` = {optimal, dominated_by, '
                              'acc_per_train_second, acc_per_1k_params, '
                              'acc_per_eval_ms}'),

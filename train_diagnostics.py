@@ -41,6 +41,10 @@ Three things live here:
    when the accuracy gain is below a pre-specified minimum effect or is not
    separable from noise, or when it buys a disproportionate amount of
    parameters / train time / inference latency / peak memory.
+4. :func:`pool_error_analyses` — rolls the per-seed bad-case reports up to
+   one row-level category distribution (with the worst seed's examples), so
+   "which mistake dominates this configuration" is visible without walking
+   the per-seed list.
 
 RNG isolation
 -------------
@@ -500,3 +504,77 @@ def log_tradeoff(verdict: Mapping, *, label: str = '') -> None:
               'no_gain') else logger.info)
     prefix = f'  [cost/claim] {label}: ' if label else '  [cost/claim] '
     level(f'{prefix}{verdict["verdict"]}: {verdict.get("recommendation", "")}')
+
+
+# --------------------------------------------------------------------------
+# 4. Row-level pooling of the per-seed bad-case reports
+# --------------------------------------------------------------------------
+def pool_error_analyses(per_seed: Sequence[Mapping], *,
+                        accuracy_key: str = 'final_acc') -> dict | None:
+    """Pool per-seed bad-case reports into one row-level aggregate.
+
+    ``run_quality.analyze_errors`` writes a per-sample classification into
+    every per-seed record; a multi-seed row without this rollup hides which
+    mistake DOMINATES the configuration behind a list of per-seed dicts.
+    The pooled category counts answer "is this layout failing by retrieving
+    a different key's value, by echoing the key, or by copying a
+    distractor?", which is the raw material for the next architecture idea
+    (see the brief's bad-case step).
+
+    Counts add up over every analyzed sample; the EXAMPLES come from the
+    worst seed (lowest accuracy) so the artifact shows the most informative
+    failures rather than a lucky seed's. Returns ``None`` when no per-seed
+    record carries an ``error_analysis`` block, so a disabled bad-case pass
+    stays ``None`` instead of fabricating an empty report.
+    """
+    rows = [r for r in per_seed if r.get('error_analysis')]
+    if not rows:
+        return None
+    pooled: dict = {}
+    n_samples = n_wrong = 0
+    for r in rows:
+        ea = r['error_analysis']
+        n_samples += int(ea.get('n_samples', 0) or 0)
+        n_wrong += int(ea.get('n_wrong', 0) or 0)
+        for c, v in (ea.get('categories') or {}).items():
+            acc = pooled.setdefault(
+                c, {'count': 0, 'definition': v.get('definition')})
+            acc['count'] += int(v.get('count', 0) or 0)
+    for v in pooled.values():
+        v['rate_of_wrong'] = (v['count'] / n_wrong) if n_wrong else 0.0
+        v['rate_of_all'] = (v['count'] / n_samples) if n_samples else 0.0
+
+    def _acc(r):
+        value = r.get(accuracy_key)
+        if value is None or not math.isfinite(float(value)):
+            return float('inf')
+        return float(value)
+
+    worst = min(rows, key=_acc)
+    worst_ea = worst['error_analysis']
+    return {
+        'n_seeds': len(rows),
+        'n_samples': n_samples,
+        'n_wrong': n_wrong,
+        'error_rate': (n_wrong / n_samples) if n_samples else None,
+        'pooled_categories': pooled,
+        'representative_seed': worst.get('seed'),
+        'representative_examples': worst_ea.get('examples'),
+        'accuracy_by_distance_bin': worst_ea.get('accuracy_by_distance_bin'),
+        'note': ('Pooled over seeds; examples come from the worst seed '
+                 '(lowest accuracy) so the artifact shows the most '
+                 'informative failures. See the per-seed error_analysis for '
+                 'each seed.'),
+    }
+
+
+def log_pooled_errors(pooled: Mapping | None, *, label: str = '') -> None:
+    """One compact log line for a pooled bad-case report."""
+    if not pooled or not pooled.get('n_samples'):
+        return
+    counts = {c: v['count'] for c, v in
+              (pooled.get('pooled_categories') or {}).items() if v['count']}
+    logger.info(
+        f'  [bad-case] {label}: {pooled["n_wrong"]}/{pooled["n_samples"]} '
+        f"wrong ({100.0 * (pooled.get('error_rate') or 0.0):.1f}%); "
+        f'categories={counts}')
