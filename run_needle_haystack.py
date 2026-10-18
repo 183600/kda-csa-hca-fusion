@@ -121,6 +121,80 @@ _DISTRACTOR_SENTENCES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Data protocol: held-out evaluation vs training streams
+# ---------------------------------------------------------------------------
+#
+# A needle/haystack sequence is a DETERMINISTIC function of its seed (plus
+# the context length / needle position). Two sequences therefore collide
+# exactly when their seeds do (for the same geometry), so the train/test
+# disjointness guarantee is enforced at the seed level:
+#
+#   * evaluation draws seeds from the reserved held-out band
+#     ``[0, EVAL_SEED_RESERVE)`` (the historical 0..N seed values, kept
+#     unchanged so reported accuracies stay comparable);
+#   * training draws seeds from ``[EVAL_SEED_RESERVE, 2**31)``, so a
+#     training batch can never re-generate an evaluation sequence.
+#
+# ``audit_train_eval_seed_disjointness`` verifies the two sets after the
+# fact and the QAT probe records the verdict with its results.
+
+EVAL_SEED_RESERVE = 4096
+TRAIN_SEED_STREAM = 1_000_000  # generator offset for the training seed draws
+SEED_CEILING = 2 ** 31 - 1
+
+
+def eval_batch_seeds(batch_index: int, batch_size: int) -> list[int]:
+    """Seeds of evaluation batch ``batch_index`` (the held-out band).
+
+    Deterministic and identical across configs, so every (memory_type,
+    dtype, quantization) cell is scored on the SAME evaluation sequences
+    (paired comparison) and none of them can have been trained on.
+    """
+    if batch_index < 0 or batch_size < 1:
+        raise ValueError(
+            f'eval_batch_seeds needs batch_index >= 0 and batch_size >= 1, '
+            f'got batch_index={batch_index}, batch_size={batch_size}')
+    lo = batch_index * batch_size
+    hi = lo + batch_size
+    if hi > EVAL_SEED_RESERVE:
+        raise ValueError(
+            f'the evaluation seed band [0, {EVAL_SEED_RESERVE}) is exhausted '
+            f'(requested seeds [{lo}, {hi})); raise EVAL_SEED_RESERVE or '
+            f'lower batch_size/n_batches')
+    return list(range(lo, hi))
+
+
+def draw_train_seeds(generator, batch_size: int) -> list[int]:
+    """Draw one training batch's data seeds OUTSIDE the eval band.
+
+    Training seeds are random per step (fresh data every optimizer step),
+    but restricted to ``[EVAL_SEED_RESERVE, 2**31)`` so no drawn seed can
+    reproduce an evaluation sequence.
+    """
+    seeds = torch.randint(EVAL_SEED_RESERVE, SEED_CEILING,
+                          (int(batch_size),), generator=generator,
+                          device=generator.device)
+    return seeds.cpu().tolist()
+
+
+def audit_train_eval_seed_disjointness(train_seeds, eval_seeds) -> dict:
+    """Independent check that no training seed is an evaluation seed."""
+    train = {int(s) for s in train_seeds}
+    ev = {int(s) for s in eval_seeds}
+    overlap = sorted(train & ev)
+    return {
+        'train_seed_min': min(train) if train else None,
+        'train_seed_max': max(train) if train else None,
+        'n_train_seeds': len(train),
+        'n_eval_seeds': len(ev),
+        'eval_seed_band': [0, EVAL_SEED_RESERVE],
+        'overlap_count': len(overlap),
+        'disjoint': not overlap,
+        'overlap_examples': overlap[:8],
+    }
+
+
 class _NeedleCharTokenizer:
     """Character-level tokenizer matching train_lm_autodl's fallback.
 
@@ -423,7 +497,7 @@ def evaluate_needle_recall(
     correct = 0
     total = 0
     for b in range(n_batches):
-        seeds = list(range(b * batch_size, (b + 1) * batch_size))
+        seeds = eval_batch_seeds(b, batch_size)
         input_ids, targets, answer_positions = build_needle_batch(
             batch_size, context_len, needle_pos, tokenizer, seeds=seeds, device=device
         )
@@ -505,7 +579,7 @@ def evaluate_needle_recall_autoregressive(
     correct = 0
     total = 0
     for b in range(n_batches):
-        seeds = list(range(b * batch_size, (b + 1) * batch_size))
+        seeds = eval_batch_seeds(b, batch_size)
         input_ids, targets, answer_positions = build_needle_batch(
             batch_size, context_len, needle_pos, tokenizer, seeds=seeds, device=device
         )
@@ -581,18 +655,20 @@ def train_needle_model(
     model.to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    gen = make_seeded_generator(seed + 1_000_000, device=device)
+    gen = make_seeded_generator(seed + TRAIN_SEED_STREAM, device=device)
 
     losses = []
+    data_seeds: list[int] = []
     for step in range(steps):
         # Draw fresh data seeds for every step from the seeded generator.
         # Previously the generator was created and never used, so
         # ``build_needle_batch`` fell back to its default ``range(batch_size)``
         # seeds and re-created the IDENTICAL batch every step (memorization,
         # plus the training sequences coincided with the evaluation ones).
-        step_seeds = torch.randint(
-            0, 2**31 - 1, (batch_size,), generator=gen,
-            device=gen.device).cpu().tolist()
+        # The draw is restricted to the training band (>= EVAL_SEED_RESERVE)
+        # so no training batch can reproduce a held-out evaluation sequence.
+        step_seeds = draw_train_seeds(gen, batch_size)
+        data_seeds.extend(step_seeds)
         # Build training batch
         input_ids, targets, answer_positions = build_needle_batch(
             batch_size, train_context_len, train_needle_pos, tokenizer,
@@ -627,7 +703,13 @@ def train_needle_model(
         opt.step()
         losses.append(float(loss.item()))
 
-    return model, {'losses': losses, 'final_loss': losses[-1] if losses else None}
+    return model, {
+        'losses': losses,
+        'final_loss': losses[-1] if losses else None,
+        # Every data seed used to build a training batch, so the caller can
+        # independently audit disjointness from the held-out eval stream.
+        'data_seeds': data_seeds,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +910,9 @@ def run_qat_needle_probe(
             qat_model, tokenizer, train_context_len, train_needle_pos,
             qat_steps, batch_size, lr, device, seed, quant_spec=qat_spec, ste=True)
 
-        # Evaluate both on needle task
+        # Evaluate both on needle task (held-out seed band; the SAME
+        # evaluation sequences are used for every model so the fp16/PTQ/QAT
+        # comparison is paired).
         fp16_acc = evaluate_needle_recall(
             fp16_model, tokenizer, eval_context_len, eval_needle_pos,
             batch_size=8, n_batches=2, device=device, quant_spec=None, dtype=torch.float16)
@@ -841,6 +925,19 @@ def run_qat_needle_probe(
         qat_fp16_acc = evaluate_needle_recall(
             qat_model, tokenizer, eval_context_len, eval_needle_pos,
             batch_size=8, n_batches=2, device=device, quant_spec=None, dtype=torch.float16)
+
+        # Leakage audit: every sequence fed to either training run (fp16
+        # baseline and QAT) must be disjoint from the evaluation sequences.
+        eval_seeds = (eval_batch_seeds(0, 8) + eval_batch_seeds(1, 8))
+        stream_audit = audit_train_eval_seed_disjointness(
+            list(fp16_rep.get('data_seeds') or [])
+            + list(qat_rep.get('data_seeds') or []),
+            eval_seeds)
+        if not stream_audit['disjoint']:
+            raise RuntimeError(
+                'needle train/eval seed audit failed: training saw evaluation '
+                f'seeds {stream_audit["overlap_examples"]}; refusing to report '
+                'leaked numbers')
 
         # Recovery fraction: 1 - (QAT_damage / PTQ_damage)
         # where damage = (acc_fp16 - acc_quantized) / acc_fp16
@@ -866,6 +963,7 @@ def run_qat_needle_probe(
             'eval_context_len': eval_context_len,
             'eval_needle_pos': eval_needle_pos,
             'spec': spec_summary(qat_spec),
+            'data_protocol': stream_audit,
         })
 
     # Summary
@@ -885,6 +983,13 @@ def run_qat_needle_probe(
         'recovery_fraction_mean': rec_mean,
         'recovery_fraction_min': rec_min,
         'spec': spec_summary(qat_spec),
+        # Every per-seed row carries its own audit; the summary states the
+        # conjunction so a consumer does not have to walk the rows.
+        'train_eval_disjoint_all_seeds': all(
+            r.get('data_protocol', {}).get('disjoint', False)
+            for r in rows if r['row_kind'] == 'qat_needle'),
+        'eval_seed_band': [0, EVAL_SEED_RESERVE],
+        'train_seed_band': [EVAL_SEED_RESERVE, SEED_CEILING],
     })
     return rows
 
@@ -1041,6 +1146,24 @@ def main():
             'seeds': list(seeds),
             'quantization': 'PTQ sweep over bits x group_size + asymmetric probe; QAT with STE on stepwise KDA',
             'bf16_support': 'uses ops_kda_autograd bf16 stabilizers; CSA/HCA run in bf16 via fp32 LayerNorm',
+            # Data protocol: sequences are deterministic in their seed, so
+            # train/test disjointness is enforced (and audited) at the seed
+            # level. The QAT probe trains on (256, 64) geometry and scores
+            # on the disjoint (512, 128) evaluation geometry.
+            'data_protocol': {
+                'generator': 'build_needle_haystack (deterministic per seed)',
+                'eval_seed_band': [0, EVAL_SEED_RESERVE],
+                'train_seed_band': [EVAL_SEED_RESERVE, SEED_CEILING],
+                'train_seed_stream_offset': TRAIN_SEED_STREAM,
+                'test_sealed': False,
+                'note': ('The evaluation band is reserved: every training '
+                         'step draws its seeds strictly above it, and the '
+                         'QAT probe records an independent disjointness '
+                         'audit per seed. A second held-out geometry '
+                         '(higher context / later needle) is used for the '
+                         'QAT probe so memorising the training contexts '
+                         'does not transfer.'),
+            },
         },
         'provenance': capture_provenance(),
         'rows': all_rows,

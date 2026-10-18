@@ -247,15 +247,53 @@ def _text_digests(texts):
             for t in texts}
 
 
-def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2):
+def _is_nonfinite_document(text):
+    """True for a null / non-finite VALUE (not a legitimate string).
+
+    A raw corpus assembled from a dataframe or a JSON feed can carry
+    ``None`` / ``NaN`` / ``Inf`` entries. ``str(value)`` would turn those
+    into the strings ``'None'`` / ``'nan'`` / ``'inf'`` — i.e. pure label
+    noise that no cleaning step downstream would ever notice. Strings and
+    finite numbers are NOT non-finite documents (``5`` is legitimate text).
+    """
+    if text is None:
+        return True
+    if isinstance(text, bool):
+        return False
+    if isinstance(text, (int, float)):
+        try:
+            return not math.isfinite(float(text))
+        except (OverflowError, ValueError):
+            return True
+    # NaN-like objects whose ``x != x`` (e.g. numpy floats) are caught by
+    # the comparison; guard against types whose __ne__ raises.
+    try:
+        return bool(text != text)
+    except Exception:
+        return False
+
+
+def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
+                   dedup_windows=False):
     """Clean the raw corpus BEFORE any split is drawn.
 
     Cleaning steps (all recorded in the returned stats):
 
+      * drop null / non-finite documents (``None``, NaN, +-Inf) instead of
+        stringifying them into ``'None'``/``'nan'`` label noise;
       * drop empty / whitespace-only documents;
       * drop exact duplicates (content hash) so the same story can never
         end up on both sides of the split — dedup BEFORE splitting is
         what makes the cross-split disjointness guarantee possible;
+      * count documents whose MODEL WINDOW (the ``seq_len + 1`` tokens
+        ``TinyStoriesLM`` actually consumes) was already seen: two
+        different strings sharing that token prefix are the same training
+        sample, and if one landed in train and the other in val/test the
+        shared sample would be memorized rather than generalized. With
+        ``dedup_windows=True`` they are dropped; by default they are only
+        counted (``n_window_duplicates``) so the reference corpus
+        composition is unchanged for a short-``seq_len`` corpus where
+        many distinct documents share a prefix;
       * drop documents that tokenize to fewer than ``min_tokens`` ids:
         they produce no supervised label at all (every target is masked
         with -100), i.e. they are pure label noise for a next-token
@@ -266,19 +304,23 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2):
     JSON-serializable and go straight into the run record.
     """
     texts = list(texts)
-    clean, seen = [], set()
-    n_empty = n_duplicates = n_too_short = n_tokenize_errors = 0
+    clean, seen_texts, seen_windows = [], set(), set()
+    n_nonfinite = n_empty = n_duplicates = 0
+    n_window_duplicates = n_too_short = n_tokenize_errors = 0
     for text in texts:
+        if _is_nonfinite_document(text):
+            n_nonfinite += 1
+            continue
         s = str(text)
         if not s.strip():
             n_empty += 1
             continue
+        key = hashlib.sha256(s.encode('utf-8', 'replace')).digest()
         if dedup:
-            key = hashlib.sha256(s.encode('utf-8', 'replace')).digest()
-            if key in seen:
+            if key in seen_texts:
                 n_duplicates += 1
                 continue
-            seen.add(key)
+            seen_texts.add(key)
         try:
             ids = tokenizer.encode(s, truncation=True,
                                    max_length=seq_len + 1)
@@ -288,38 +330,69 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2):
         if len(ids) < int(min_tokens):
             n_too_short += 1
             continue
+        # Identity of the actual model input: the truncated token window.
+        # Catches whitespace/unicode variants and long documents collapsed
+        # onto the same context by truncation. Always counted (leak
+        # diagnostic); only dropped when ``dedup_windows`` opts in.
+        window_key = tuple(ids)
+        if window_key in seen_windows:
+            n_window_duplicates += 1
+            if dedup_windows:
+                continue
+        else:
+            seen_windows.add(window_key)
         clean.append(s)
     n_raw = len(texts)
     stats = {
         'n_raw': n_raw,
         'n_kept': len(clean),
         'n_empty': n_empty,
+        'n_nonfinite': n_nonfinite,
         'n_duplicates': n_duplicates,
+        'n_window_duplicates': n_window_duplicates,
         'n_too_short_to_supervise': n_too_short,
         'n_tokenize_errors': n_tokenize_errors,
         'dedup': bool(dedup),
+        'dedup_windows': bool(dedup_windows),
         'min_tokens': int(min_tokens),
         'kept_fraction': (len(clean) / n_raw) if n_raw else 0.0,
     }
     return {'texts': clean, 'stats': stats}
 
 
-def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0):
+def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
+                      group_ids=None, chronological=False):
     """Draw and audit the train/val/test split over CLEANED texts.
 
     The split itself is deterministic (see
-    ``kaggle_setup.split_train_val_test``). On top of the structural
-    audit this verifies that the three text partitions share no exact
-    duplicate — a defense-in-depth check against a future refactor that
-    moves dedup after the split.
+    ``kaggle_setup.split_train_val_test``). It supports the two
+    structured-data regimes that a plain i.i.d. shuffle would leak on:
+
+      * ``chronological=True`` — time series / ordered corpora: earlier
+        documents form train, the next block validation, the most recent
+        block test. Nothing is shuffled, so no future document is ever
+        used to fit or select anything that predicts the past;
+      * ``group_ids`` — one label per document (user / author / session /
+        source id): all documents of a group land on the SAME side, so
+        no group straddles train/val/test.
+
+    On top of the structural audit this verifies that the three text
+    partitions share no exact duplicate — a defense-in-depth check against
+    a future refactor that moves dedup after the split.
 
     Returns ``(split, report)`` where ``split`` maps split names to index
     lists and ``report`` is the JSON-serializable audit + overlap report.
     Raises ``RuntimeError`` on any leakage violation.
     """
+    if group_ids is not None and len(group_ids) != len(texts):
+        raise ValueError(
+            f'group_ids has length {len(group_ids)} but there are '
+            f'{len(texts)} texts')
     split = split_train_val_test(len(texts), val_frac=val_frac,
-                                 test_frac=test_frac, seed=seed)
-    audit = audit_split(split, len(texts))
+                                 test_frac=test_frac, seed=seed,
+                                 group_ids=group_ids,
+                                 chronological=chronological)
+    audit = audit_split(split, len(texts), group_ids=group_ids)
     by_split = {k: [texts[i] for i in split[k]]
                 for k in ('train', 'val', 'test')}
     digests = {k: _text_digests(v) for k, v in by_split.items()}
@@ -328,10 +401,24 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0):
         'train_test': len(digests['train'] & digests['test']),
         'val_test': len(digests['val'] & digests['test']),
     }
+    order_verified = None
+    if chronological:
+        # Past -> train -> val -> test. With groups the row indices of a
+        # later group may interleave, so the containment check is only
+        # defined without groups; the group audit covers the rest.
+        if group_ids is None:
+            order_verified = bool(
+                max(split['train']) < min(split['val'])
+                < max(split['val']) < min(split['test']))
     report = {
         'seed': int(seed),
         'val_frac': float(val_frac),
         'test_frac': float(test_frac),
+        'chronological': bool(chronological),
+        'group_aware': group_ids is not None,
+        'n_groups': (len(set(map(str, group_ids)))
+                     if group_ids is not None else None),
+        'chronological_order_verified': order_verified,
         'audit': audit,
         'exact_text_overlaps': overlaps,
     }
@@ -340,6 +427,10 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0):
         if n_overlap:
             problems.append(
                 f'{pair}: {n_overlap} identical text(s) shared across splits')
+    if order_verified is False:
+        problems.append(
+            'chronological split is not ordered past -> future '
+            '(train before val before test)')
     if problems:
         raise RuntimeError(
             'train/val/test split failed its leakage audit: '
@@ -1245,6 +1336,21 @@ def main():
                         help="Fraction of the cleaned corpus sealed as the "
                              "test split (opened exactly once, after the "
                              "model is frozen). Default 0.1.")
+    parser.add_argument("--chronological_split", action="store_true",
+                        help="Split WITHOUT shuffling: the earliest documents "
+                             "form train, the next block validation, the most "
+                             "recent block test. Use this for time-ordered "
+                             "corpora (prevent future->past leakage). "
+                             "Default: off (i.i.d. story split via a seeded "
+                             "shuffle).")
+    parser.add_argument("--dedup_windows", action="store_true",
+                        help="Additionally drop documents whose truncated "
+                             "seq_len+1 token window was already seen (the "
+                             "sample TinyStoriesLM actually trains on), not "
+                             "just exact string duplicates. Off by default: "
+                             "with a small seq_len many distinct long "
+                             "documents share a prefix, so enable it only "
+                             "when prefix repetition is genuine leakage.")
     parser.add_argument("--val_every", type=int, default=100,
                         help="Run a validation pass every N optimizer steps "
                              "(default 100); a validation pass also runs at "
@@ -1475,7 +1581,8 @@ def main():
     train_frac = 1.0 - args.val_frac - args.test_frac
     corpus_budget = int(math.ceil(train_budget / train_frac))
     raw_texts, data_source = _load_raw_texts(corpus_budget, split="train")
-    cleaning = clean_lm_texts(raw_texts, tokenizer, seq_len)
+    cleaning = clean_lm_texts(raw_texts, tokenizer, seq_len,
+                              dedup_windows=bool(args.dedup_windows))
     clean_texts = cleaning['texts']
     if len(clean_texts) < 10:
         raise SystemExit(
@@ -1484,7 +1591,7 @@ def main():
             f"corpus")
     split, split_report = split_clean_texts(
         clean_texts, val_frac=args.val_frac, test_frac=args.test_frac,
-        seed=args.seed)
+        seed=args.seed, chronological=bool(args.chronological_split))
     train_texts = [clean_texts[i] for i in split['train']]
     val_texts = [clean_texts[i] for i in split['val']]
     test_indices = list(split['test'])
@@ -1512,9 +1619,13 @@ def main():
     print(f"Data: {data_source}, raw={len(raw_texts)}, "
           f"cleaned={len(clean_texts)} "
           f"(empty={cleaning['stats']['n_empty']}, "
+          f"nonfinite={cleaning['stats']['n_nonfinite']}, "
           f"dup={cleaning['stats']['n_duplicates']}, "
+          f"window_dup={cleaning['stats']['n_window_duplicates']}, "
           f"too_short={cleaning['stats']['n_too_short_to_supervise']})")
-    print(f"Split (seed={args.seed}): train={len(train_texts)} "
+    print(f"Split (seed={args.seed}, "
+          f"chronological={bool(args.chronological_split)}): "
+          f"train={len(train_texts)} "
           f"val={len(val_texts)} test={len(test_indices)} "
           f"[val/test sealed until final evaluation]")
     print(f"Fingerprints: train={ds.data_fingerprint[:16]}... "
@@ -1662,15 +1773,24 @@ def main():
             'seed': args.seed,
             'val_frac': float(args.val_frac),
             'test_frac': float(args.test_frac),
-            'chronological': False,
+            'chronological': bool(args.chronological_split),
             'group_ids': None,
+            'chronological_order_verified':
+                split_report['chronological_order_verified'],
             'note': ('Story-level deterministic split drawn with a '
                      'dedicated random.Random(seed), so the global RNG '
                      'streams driving model init / training batches are '
-                     'untouched. No fitted preprocessing transform exists '
-                     'in this pipeline; were one added (e.g. a tokenizer '
-                     'or length normalizer), it must be fitted on train '
-                     'indices only.'),
+                     'untouched. With --chronological_split the corpus '
+                     'order is preserved (past -> train, next -> val, '
+                     'most recent -> test) so no future document leaks '
+                     'into fitting or selection. Cleaning before the split '
+                     'also removes exact duplicates; documents whose '
+                     'truncated model window repeats are counted '
+                     '(n_window_duplicates) and dropped only with '
+                     '--dedup_windows. No fitted preprocessing '
+                     'transform exists in this pipeline; were one added '
+                     '(e.g. a tokenizer or length normalizer), it must '
+                     'be fitted on train indices only.'),
         },
         'splits': {
             'train': {

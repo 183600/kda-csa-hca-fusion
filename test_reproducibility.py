@@ -472,6 +472,132 @@ def test_split_clean_texts_has_no_cross_split_overlap():
     assert not (by_split['val'] & by_split['test'])
 
 
+def test_clean_lm_texts_drops_null_and_nonfinite_documents():
+    tok = _FallbackCharTokenizer()
+    texts = [
+        None, float('nan'), float('inf'), float('-inf'),  # label noise
+        '', '   ',                                        # empty
+        12345,                                            # legitimate number
+        'a real story about a cat',
+    ]
+    result = clean_lm_texts(texts, tok, seq_len=32)
+    stats = result['stats']
+    assert stats['n_nonfinite'] == 4
+    assert stats['n_empty'] == 2
+    assert result['texts'] == ['12345', 'a real story about a cat']
+    # A finite number is text, not a null value.
+    assert '12345' in result['texts']
+    json.dumps(stats, allow_nan=False)
+
+
+def test_clean_lm_texts_counts_and_optionally_drops_window_duplicates():
+    """Distinct strings that truncate to the same model input are duplicates.
+
+    ``TinyStoriesLM`` only ever sees the first ``seq_len + 1`` tokens, so
+    two long documents sharing that prefix are the SAME training sample;
+    keeping both would let one split's sample be memorized from the other.
+    The drop is opt-in (``dedup_windows``) because with a short ``seq_len``
+    many genuinely distinct documents share a prefix; the count is always
+    reported as a leak diagnostic.
+    """
+    tok = _FallbackCharTokenizer()
+    seq_len = 8
+    a = 'x' * 20 + ' tail one'
+    b = 'x' * 20 + ' tail two'   # same first 9 tokens as ``a``
+    # Default: reported, but the reference corpus composition is kept.
+    diag = clean_lm_texts([a, b], tok, seq_len=seq_len)
+    assert diag['texts'] == [a, b]
+    assert diag['stats']['n_window_duplicates'] == 1
+    assert diag['stats']['dedup_windows'] is False
+    # Opt-in: the shared training sample is removed before the split.
+    result = clean_lm_texts([a, b], tok, seq_len=seq_len, dedup_windows=True)
+    assert result['texts'] == [a]
+    stats = result['stats']
+    assert stats['n_duplicates'] == 0
+    assert stats['n_window_duplicates'] == 1
+    assert stats['dedup_windows'] is True
+    # Exact duplicates are still reported under ``n_duplicates``.
+    exact = clean_lm_texts([a, a], tok, seq_len=seq_len, dedup_windows=True)
+    assert exact['stats']['n_duplicates'] == 1
+    assert exact['stats']['n_window_duplicates'] == 0
+
+
+def test_split_clean_texts_chronological_is_ordered_and_group_aware():
+    tok = _FallbackCharTokenizer()
+    texts = [f'unique story number {i}' for i in range(100)]
+    split, report = split_clean_texts(texts, val_frac=0.2, test_frac=0.1,
+                                      seed=7, chronological=True)
+    # Past -> train, next block -> val, most recent block -> test.
+    assert split['train'] == list(range(70))
+    assert split['val'] == list(range(70, 90))
+    assert split['test'] == list(range(90, 100))
+    assert report['chronological'] is True
+    assert report['chronological_order_verified'] is True
+    assert report['group_aware'] is False
+    assert report['audit']['ok'], report['audit']['problems']
+    # The seed cannot reorder a chronological split.
+    again, _ = split_clean_texts(texts, val_frac=0.2, test_frac=0.1, seed=99,
+                                 chronological=True)
+    assert again == split
+
+
+def test_split_clean_texts_groups_stay_on_one_side():
+    tok = _FallbackCharTokenizer()
+    # 20 users, 4 interleaved documents each (group != row order).
+    group_ids = [f'user{i % 20}' for i in range(80)]
+    texts = [f'story {i} by {g}' for i, g in enumerate(group_ids)]
+    split, report = split_clean_texts(texts, val_frac=0.25, test_frac=0.25,
+                                      seed=3, group_ids=group_ids)
+    assert report['group_aware'] is True
+    assert report['n_groups'] == 20
+    assert report['audit']['ok'], report['audit']['problems']
+    assert report['audit']['group_integrity'] is True
+    side = {}
+    for name in ('train', 'val', 'test'):
+        for i in split[name]:
+            g = group_ids[i]
+            assert g not in side or side[g] == name
+            side[g] = name
+    assert len(side) == 20
+    # A mismatched group list is rejected before any split is drawn.
+    with pytest.raises(ValueError):
+        split_clean_texts(texts, group_ids=group_ids[:-1])
+
+
+def test_needle_train_eval_seed_streams_are_reserved_and_disjoint():
+    from run_needle_haystack import (
+        EVAL_SEED_RESERVE,
+        SEED_CEILING,
+        audit_train_eval_seed_disjointness,
+        draw_train_seeds,
+        eval_batch_seeds,
+    )
+    # The held-out evaluation band keeps its historical 0..N values ...
+    assert eval_batch_seeds(0, 4) == [0, 1, 2, 3]
+    assert eval_batch_seeds(2, 4) == [8, 9, 10, 11]
+    # ... and cannot silently overflow into the training band.
+    with pytest.raises(ValueError):
+        eval_batch_seeds(EVAL_SEED_RESERVE, 1)
+    # Training seeds are drawn strictly outside the evaluation band.
+    gen = torch.Generator().manual_seed(0)
+    train_seeds = draw_train_seeds(gen, 512)
+    assert train_seeds and all(EVAL_SEED_RESERVE <= s < SEED_CEILING
+                               for s in train_seeds)
+    # Same generator state -> same draw; next step -> fresh data.
+    gen2 = torch.Generator().manual_seed(0)
+    assert draw_train_seeds(gen2, 512) == train_seeds
+    assert draw_train_seeds(gen2, 512) != train_seeds
+    eval_seeds = eval_batch_seeds(0, 8) + eval_batch_seeds(1, 8)
+    audit = audit_train_eval_seed_disjointness(train_seeds, eval_seeds)
+    assert audit['disjoint'] is True
+    assert audit['overlap_count'] == 0
+    assert audit['eval_seed_band'] == [0, EVAL_SEED_RESERVE]
+    # The audit actually detects a leak instead of rubber-stamping.
+    leaked = audit_train_eval_seed_disjointness([5, 100], [5, 6])
+    assert leaked['disjoint'] is False
+    assert leaked['overlap_examples'] == [5]
+
+
 def test_sealed_test_set_opens_exactly_once():
     calls = []
 
@@ -584,6 +710,11 @@ def test_main_early_stops_on_validation_and_tests_once(monkeypatch, tmp_path):
     # The split itself was audited and the cleaning step ran before it.
     assert record['data']['split_audit']['audit']['ok'] is True
     assert record['data']['cleaning']['n_kept'] == 60
+    # The split protocol records the two new structural-data regimes.
+    assert record['data']['split_protocol']['chronological'] is False
+    assert record['data']['split_protocol']['group_ids'] is None
+    assert record['data']['split_audit']['chronological'] is False
+    assert 'n_window_duplicates' in record['data']['cleaning']
     assert record['data']['splits']['test']['sealed_until_final_evaluation'] \
         is False
     # The run also landed in the manifest ledger with seed / status / curve
@@ -599,6 +730,45 @@ def test_main_early_stops_on_validation_and_tests_once(monkeypatch, tmp_path):
     assert entry['results']['test_loss'] == 5.0
     assert len(entry['results']['training_curve_sha256']) == 64
     assert entry['recipe_sha256'] == recipe_sha256(entry['hyperparameters'])
+
+
+def test_main_chronological_split_stays_past_to_future(monkeypatch,
+                                                       tmp_path):
+    # Same offline entry point, but with --chronological_split: the split
+    # must not shuffle, must be recorded as ordered, and the sealed test
+    # evaluation still happens exactly once.
+    import json as _json
+
+    def fake_eval(model, dataset, **kwargs):
+        return {'loss': 5.0, 'perplexity': 148.4, 'n_batches': 1,
+                'n_sequences': 2, 'n_tokens': 30, 'max_batches': 1,
+                'batch_size': 2, 'shuffle': False, 'grad_enabled': False}
+
+    monkeypatch.setattr(train_lm_autodl, 'evaluate_lm_loss', fake_eval)
+    monkeypatch.setattr(
+        train_lm_autodl, '_load_raw_texts',
+        lambda max_samples, split='train': (
+            [f'unique chronological story {i}' for i in range(60)],
+            'synthetic:test'))
+    monkeypatch.setattr(sys, 'argv', [
+        'train_lm_autodl.py', '--kaggle', '--max_steps', '10',
+        '--seq_len', '8', '--batch_size', '2', '--val_every', '1',
+        '--eval_max_batches', '1', '--early_stop_patience', '2',
+        '--skip_overfit_check', '--skip_consistency_check',
+        '--chronological_split',
+        '--output_dir', str(tmp_path), '--seed', '3',
+        '--manifest', str(tmp_path / 'run_manifest.jsonl'),
+    ])
+    train_lm_autodl.main()
+
+    record = _json.loads((tmp_path / 'run_record.json').read_text())
+    protocol = record['data']['split_protocol']
+    assert protocol['chronological'] is True
+    audit = record['data']['split_audit']
+    assert audit['chronological'] is True
+    assert audit['chronological_order_verified'] is True
+    assert audit['audit']['ok'], audit['audit']['problems']
+    assert record['test']['evaluated_once'] is True
 
 
 # ---------------------------------------------------------------------------
