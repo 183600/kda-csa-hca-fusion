@@ -250,7 +250,8 @@ def naive_hca(
         log_sink = sink_logits.view(1, nh, 1, 1).to(cat)           # [1, nh, 1, 1]
         row_max = cat.amax(-1, keepdim=True)                       # [B, nh, T, 1]
         all_masked = torch.isneginf(row_max)                       # [B, nh, T, 1]
-        row_max_safe = torch.where(all_masked, torch.zeros_like(row_max), row_max)
+        row_max_safe = torch.where(
+            all_masked, torch.zeros_like(row_max), row_max.clamp(min=0))
         shifted = cat - row_max_safe
         shifted_sink = log_sink - row_max_safe
         # ``shifted``'s row max is exactly 0.0 by construction

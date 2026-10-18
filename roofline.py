@@ -395,7 +395,9 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
     """
     V = value_dim if value_dim is not None else head_dim
     if op == 'softmax':
-        elements = 3 * T * heads * head_dim + T * heads * V
+        # q + k read at head_dim, v read at value_dim, o written at
+        # value_dim (the softmax operator's value/output dimension).
+        elements = 2 * T * heads * head_dim + 2 * T * heads * V
         return float(elements * itemsize)
     if op == 'kda':
         activation = T * heads * (3 * head_dim + 2 * V + 1)

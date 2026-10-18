@@ -118,7 +118,10 @@ def diagnose_training_curves(train_losses: Sequence[float],
         'signals': {},
         'recommendations': [],
     }
-    train = [float(v) for v in train_losses]
+    # Preserve ``None`` entries (JSON ``null``, e.g. a non-finite loss that
+    # was sanitized before being persisted) so the non-finite branch below
+    # can report *where* the curve broke instead of crashing on float(None).
+    train = [None if v is None else float(v) for v in train_losses]
     if not train:
         report['recommendations'].append(
             'no training curve was recorded; log the per-step loss so the '
@@ -141,7 +144,7 @@ def diagnose_training_curves(train_losses: Sequence[float],
 
     val = None
     if val_losses is not None:
-        val = [float(v) for v in val_losses]
+        val = [None if v is None else float(v) for v in val_losses]
     if val is not None and val and not _finite(val):
         report['val'] = {
             'n_points': len(val),

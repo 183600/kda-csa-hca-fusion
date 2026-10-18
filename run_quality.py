@@ -3968,22 +3968,32 @@ def main():
             stats['reference_op'] = baseline_ref
             comparisons.append((r, stats))
         n_pair_tests = len(comparisons)
-        # One-sided family-wise alpha 0.05 over the comparison family.
-        crit_pair = (_bonferroni_crit_q(n_pair_tests, alpha=0.05)
-                     if n_pair_tests else None)
+        # One-sided family-wise alpha 0.05 over the comparison family: the
+        # per-test alpha is 0.05 / n_pair_tests. The critical value is then
+        # the one-sided upper-tail quantile at that corrected alpha with the
+        # COMPARISON's own dof (n_pairs - 1) — mirroring
+        # ``run_ablation._annotate_contrast_significance``.
+        alpha_pair = (0.05 / n_pair_tests) if n_pair_tests else None
         for r, stats in comparisons:
             t = stats.get('t_stat')
+            n_pairs = stats.get('n_pairs', 0)
+            crit_pair = (
+                _bonferroni_crit_q(n_pairs, alpha=alpha_pair)
+                if (alpha_pair is not None and n_pairs >= 2) else None)
             sig = False
             if stats.get('mean_diff') is not None and stats['mean_diff'] > 0:
                 if t is not None and crit_pair is not None and t > crit_pair:
                     sig = True
                 elif (t is None and stats.get('all_positive')
-                      and stats.get('n_pairs', 0) >= 2):
+                      and n_pairs >= 2):
                     # Zero-variance unanimous improvement (every seed
-                    # strictly better): treat as significant, worst case
-                    # the exact paired test would need a distribution-free
-                    # argument; recorded via t_stat=None.
-                    sig = True
+                    # strictly better): the exact one-sided sign-flip
+                    # p-value of the all-positive pattern is 2^{-(n-1)}; it
+                    # counts as significant only when that clears the
+                    # Bonferroni-corrected alpha (recorded via t_stat=None).
+                    exact_p = 2.0 ** (-(n_pairs - 1))
+                    sig = bool(alpha_pair is not None
+                               and exact_p <= alpha_pair)
             stats['t_crit_bonferroni'] = crit_pair
             stats['significant'] = bool(sig)
             stats['verdict'] = ('beats_tuned_baseline' if sig

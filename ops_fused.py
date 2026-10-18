@@ -1036,9 +1036,12 @@ class CSAHybridLayer(nn.Module):
 
     def _maybe_warn_indexer(self):
         # The indexer IS trained (via STE) by default. This warning only
-        # fires when STE is explicitly disabled, which is an opt-in ablation
-        # against the untrained baseline.
-        if not self.indexer_is_trained and not CSAHybridLayer._indexer_warned:
+        # fires when STE is explicitly disabled (``use_ste=False``), which
+        # is an opt-in ablation against the untrained baseline. The trigger
+        # is ``use_ste`` itself — gating on ``indexer_is_trained`` too would
+        # suppress the warning for a caller who disables STE without also
+        # updating the (informational) trained flag.
+        if not self.use_ste and not CSAHybridLayer._indexer_warned:
             import warnings
             warnings.warn(
                 "CSAHybridLayer: STE is disabled (use_ste=False), so the "
