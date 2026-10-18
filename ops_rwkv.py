@@ -232,6 +232,8 @@ def validate_rwkv7_geometry(
 # already-exponentiated decay (see ``rwkv7_reference_scan``).
 _RWKV7_SCAN_LOOP_SCRIPTED = None
 _RWKV7_SCAN_LOOP_SCRIPTED_FAILED = False
+_RWKV7_SCAN_LOOP_INPLACE_SCRIPTED = None
+_RWKV7_SCAN_LOOP_INPLACE_SCRIPTED_FAILED = False
 
 
 def _rwkv7_scan_loop_eager(r, w_exp, k, v, kk, kka, state):
@@ -261,6 +263,31 @@ def _rwkv7_scan_loop_eager(r, w_exp, k, v, kk, kka, state):
     return torch.stack(outs, dim=1), state
 
 
+def _rwkv7_scan_loop_inplace_eager(r, w_exp, k, v, kk, kka, state):
+    """No-grad variant of :func:`_rwkv7_scan_loop_eager` updating ``state``
+    in place.
+
+    The state update is evaluated as ``state.mul_(w).add_(kka*contract)
+    .add_(k*v)`` — the same products/sums in the same association order
+    as the out-of-place expression (bit-identical values) with two fewer
+    ``[B, H, K, V]`` temporaries per step. The caller must pass a
+    dedicated copy of the state (this function mutates its ``state``
+    argument) and autograd must be disabled.
+    """
+    outs = []
+    for r_t, w_t, k_t, v_t, kk_t, kka_t in zip(
+            r.unbind(1), w_exp.unbind(1), k.unbind(1), v.unbind(1),
+            kk.unbind(1), kka.unbind(1)):
+        # contract[v] = -sum_k kk[k] * S[k, v]   (== -(kk^T S))
+        contract = (kk_t * state).sum(dim=-2)                      # [B, H, V]
+        # S = exp(log_w)[k] * S[k, v] + (kk*a)[k] * contract[v] + k[k] * v[v]
+        state = (state.mul_(w_t)
+                 .add_(kka_t * contract.unsqueeze(-2))
+                 .add_(k_t * v_t))
+        outs.append((r_t * state).sum(dim=-2))                     # [B, H, V]
+    return torch.stack(outs, dim=1), state
+
+
 def _get_scripted_rwkv7_scan_loop():
     """Scripted loop body, with eager fallback.
 
@@ -278,6 +305,23 @@ def _get_scripted_rwkv7_scan_loop():
         except Exception:
             _RWKV7_SCAN_LOOP_SCRIPTED_FAILED = True
     return _RWKV7_SCAN_LOOP_SCRIPTED
+
+
+def _get_scripted_rwkv7_scan_loop_inplace():
+    """Scripted no-grad loop body, with eager fallback (see
+    :func:`_rwkv7_scan_loop_inplace_eager`)."""
+    global _RWKV7_SCAN_LOOP_INPLACE_SCRIPTED
+    global _RWKV7_SCAN_LOOP_INPLACE_SCRIPTED_FAILED
+    if (_RWKV7_SCAN_LOOP_INPLACE_SCRIPTED is None
+            and not _RWKV7_SCAN_LOOP_INPLACE_SCRIPTED_FAILED):
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _RWKV7_SCAN_LOOP_INPLACE_SCRIPTED = torch.jit.script(
+                    _rwkv7_scan_loop_inplace_eager)
+        except Exception:
+            _RWKV7_SCAN_LOOP_INPLACE_SCRIPTED_FAILED = True
+    return _RWKV7_SCAN_LOOP_INPLACE_SCRIPTED
 
 
 def rwkv7_reference_scan(
@@ -388,12 +432,22 @@ def rwkv7_reference_scan(
     if T == 0:
         o = v.new_zeros(B, 0, H, V)
         return o.to(out_dtype), state if output_final_state else None
-    loop = _get_scripted_rwkv7_scan_loop()
-    if loop is not None:
-        o, state = loop(r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
+    # Autograd-safe out-of-place loop while a graph is being recorded; the
+    # in-place loop (same values, fewer state-sized temporaries per step)
+    # otherwise. The in-place loop mutates its state argument, so it gets a
+    # dedicated copy and the caller's ``initial_state`` stays untouched.
+    if not torch.is_grad_enabled():
+        loop_i = _get_scripted_rwkv7_scan_loop_inplace()
+        fn = (loop_i if loop_i is not None
+              else _rwkv7_scan_loop_inplace_eager)
+        o, state = fn(r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state.clone())
     else:
-        o, state = _rwkv7_scan_loop_eager(
-            r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
+        loop = _get_scripted_rwkv7_scan_loop()
+        if loop is not None:
+            o, state = loop(r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
+        else:
+            o, state = _rwkv7_scan_loop_eager(
+                r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
     return o.to(out_dtype), state if output_final_state else None
 
 

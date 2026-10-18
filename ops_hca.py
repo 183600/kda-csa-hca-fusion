@@ -268,8 +268,11 @@ def naive_hca(
     n_blk = scores.shape[-1]
     p_dense = p[..., :n_blk]
     p_w = p[..., n_blk:]
-    out = (torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
-           + torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
+    # Accumulate the window contribution IN PLACE into the dense einsum
+    # output (same values as ``a + b``, one fewer full ``[B, T, nh, c]``
+    # allocation). See ``naive_csa`` for the gradient-safety note.
+    out = torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
+    out.add_(torch.einsum('b h t w, b t w d -> b t h d', p_w, C_windows))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries

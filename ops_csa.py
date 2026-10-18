@@ -451,6 +451,16 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     s = min(k, n)
     if s == 0:
         return scores.new_zeros(*scores.shape[:-1], 0, dtype=torch.long)
+    # Fast path where one stable descending sort IS the canonical rule: the
+    # sort emits entries score-descending, ties ascending-index, and masking
+    # ``-inf`` selections to ``-1`` matches the contract. It is cheaper than
+    # the topk + nonzero + gather pipeline for the per-step decode shape
+    # (a single score row per batch element) and for dense selections
+    # (``s >= n/2``); elsewhere the O(n) boundary path below wins.
+    if (scores.dim() >= 2 and scores.shape[-2] == 1) or 2 * s >= n:
+        order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :s]
+        values = scores.gather(-1, order)
+        return order.masked_fill(torch.isinf(values), -1)
     # S-th largest score; ties exactly at this boundary are resolved below.
     boundary = torch.topk(scores, s, dim=-1).values[..., -1:]
     strictly_above = scores > boundary
@@ -1170,8 +1180,18 @@ def naive_csa(
         # indices: [B, T, topk], padded with -1 for invalid slots.
         valid_mask = indices >= 0                                        # [B, T, topk]
         idx_safe = indices.clamp(min=0)                                  # [B, T, topk]
-        batch_idx = torch.arange(B_, device=device).view(B_, 1, 1)      # [B, 1, 1]
-        kv = C_comp_n[batch_idx, idx_safe]                               # [B, T, topk, c]
+        # Row gather via a flattened ``index_select``: ~8x faster than
+        # ``C_comp_n[batch_idx, idx_safe]`` advanced indexing on CPU and
+        # value-identical (each output element is a copy of the same
+        # source element; the selector picks DISTINCT blocks per row, so
+        # the backward scatter/accumulation is unaffected).
+        nblk = C_comp_n.shape[1]
+        flat_idx = (
+            idx_safe + torch.arange(B_, device=device).view(B_, 1, 1) * nblk
+        ).reshape(-1)
+        kv = torch.index_select(
+            C_comp_n.reshape(B_ * nblk, C_comp_n.shape[-1]), 0, flat_idx,
+        ).view(B_, T, idx_safe.shape[-1], C_comp_n.shape[-1])           # [B, T, topk, c]
 
         # Straight-through estimator (STE) for the indexer.
         # ``kv`` above is a hard gather: its value is correct (the
@@ -1376,8 +1396,13 @@ def naive_csa(
         topk_size = scores.shape[-1]
         p_b = p[..., :topk_size]
         p_w = p[..., topk_size:]
-        out = (torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
-               + torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows))
+        # Accumulate the window contribution IN PLACE into the sparse
+        # einsum output: same values as ``a + b`` but one fewer full
+        # ``[B, T, nh, c]`` allocation. The sparse output is not saved by
+        # any autograd node (the add's backward needs neither operand), so
+        # the in-place add is gradient-safe.
+        out = torch.einsum('b t h k, b t k d -> b t h d', p_b, kv)
+        out.add_(torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries

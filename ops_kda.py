@@ -205,8 +205,38 @@ def _recurrent_kda_loop_eager(q, k_col, v, g_exp_col, beta_k_col, S):
     return torch.stack(outs, 1).squeeze(-2), S
 
 
+def _recurrent_kda_loop_inplace_eager(q, k_col, v, g_exp_col, beta_k_col, S):
+    """No-grad variant of :func:`_recurrent_kda_loop_eager` updating the
+    recurrent state IN PLACE.
+
+    ``S * g_exp`` and ``addcmul(S, beta_k, delta)`` are evaluated as
+    ``S.mul_(g_exp)`` and ``S.addcmul_(beta_k, delta)`` — the same
+    products/sums in the same order (bit-identical values) with no
+    ``[B, HV, K, V]`` state-sized temporary per step. The caller must pass
+    a freshly allocated state (this function mutates its ``S`` argument)
+    and autograd must be disabled — an in-place update of a graph-tracked
+    state would trip the version counter.
+    """
+    outs = []
+    for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
+            q.unbind(1), k_col.unbind(2), v.unbind(1),
+            g_exp_col.unbind(2), beta_k_col.unbind(2))):
+        S = S.mul_(g_exp_i)
+        delta = v_i - (k_i * S).sum(-2)
+        # ``beta_k_i`` is ``beta_i * k_i`` (precomputed by the caller); the
+        # update is the delta-rule ``S + beta_i ⊗ delta`` in fp association.
+        S = S.addcmul_(beta_k_i, delta[..., None, :])
+        # Keep the singleton head dim until the single post-loop squeeze:
+        # append-and-stack as ``[B, H, 1, V]`` then squeeze(-2) is
+        # elementwise-identical to squeezing each step before the stack.
+        outs.append(q_i @ S)
+    return torch.stack(outs, 1).squeeze(-2), S
+
+
 _RECURRENT_LOOP_SCRIPTED = None
 _RECURRENT_LOOP_SCRIPTED_FAILED = False
+_RECURRENT_LOOP_INPLACE_SCRIPTED = None
+_RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED = False
 
 
 def _get_scripted_recurrent_loop():
@@ -226,6 +256,23 @@ def _get_scripted_recurrent_loop():
         except Exception:
             _RECURRENT_LOOP_SCRIPTED_FAILED = True
     return _RECURRENT_LOOP_SCRIPTED
+
+
+def _get_scripted_recurrent_loop_inplace():
+    """Scripted no-grad loop body, with eager fallback (see
+    :func:`_recurrent_kda_loop_inplace_eager`)."""
+    global _RECURRENT_LOOP_INPLACE_SCRIPTED
+    global _RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED
+    if (_RECURRENT_LOOP_INPLACE_SCRIPTED is None
+            and not _RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED):
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _RECURRENT_LOOP_INPLACE_SCRIPTED = torch.jit.script(
+                    _recurrent_kda_loop_inplace_eager)
+        except Exception:
+            _RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED = True
+    return _RECURRENT_LOOP_INPLACE_SCRIPTED
 
 
 def naive_recurrent_kda(
@@ -319,12 +366,23 @@ def naive_recurrent_kda(
     g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
     k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
     beta_k_col = (beta[..., None] * k).movedim(1, 2).unsqueeze(-1).contiguous()
-    loop = _get_scripted_recurrent_loop()
-    if loop is not None:
-        o, S = loop(q_col, k_col, v, g_exp_col, beta_k_col, S)
+    # Autograd-safe out-of-place loop while a graph is being recorded; the
+    # in-place loop (same values, no state-sized temporary per step)
+    # otherwise. ``S`` is always freshly allocated above (``new_zeros`` or
+    # the ``+ initial_state`` sum), so mutating it never touches caller
+    # tensors.
+    if not torch.is_grad_enabled():
+        loop_i = _get_scripted_recurrent_loop_inplace()
+        fn = (loop_i if loop_i is not None
+              else _recurrent_kda_loop_inplace_eager)
+        o, S = fn(q_col, k_col, v, g_exp_col, beta_k_col, S)
     else:
-        o, S = _recurrent_kda_loop_eager(
-            q_col, k_col, v, g_exp_col, beta_k_col, S)
+        loop = _get_scripted_recurrent_loop()
+        if loop is not None:
+            o, S = loop(q_col, k_col, v, g_exp_col, beta_k_col, S)
+        else:
+            o, S = _recurrent_kda_loop_eager(
+                q_col, k_col, v, g_exp_col, beta_k_col, S)
     if not output_final_state:
         S = None
     else:

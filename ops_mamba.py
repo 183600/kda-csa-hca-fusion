@@ -180,6 +180,8 @@ def validate_mamba2_geometry(
 # is a direct 3D ``bmm`` (the same per-batch GEMM).
 _SCAN_LOOP_SCRIPTED = None
 _SCAN_LOOP_SCRIPTED_FAILED = False
+_SCAN_LOOP_INPLACE_SCRIPTED = None
+_SCAN_LOOP_INPLACE_SCRIPTED_FAILED = False
 # Cap on the number of elements in one slab of precomputed step-varying
 # factors (``[batch * nheads, slab, headdim, d_state]`` for the outer product,
 # which is dt-scaled in place); long sequences are processed in several
@@ -223,6 +225,30 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     return torch.stack(ys, dim=1).squeeze(-2), S
 
 
+def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
+    """No-grad scan body that updates the recurrent state IN PLACE.
+
+    ``S = decay * S + x`` is evaluated as ``S.mul_(decay).add_(x)``: the
+    same products and sums with the same roundings (bit-identical
+    values), but no per-step ``[BH, D, N]`` temporary. The caller must
+    pass a dedicated copy of the state (this function mutates its ``S``
+    argument) and autograd must be disabled — an in-place update of a
+    graph-tracked state would trip the version counter. See
+    :func:`_mamba2_scan_loop_eager` for the (autograd-safe) out-of-place
+    form.
+    """
+    ys: list[torch.Tensor] = []
+    T = x_dt.shape[1]
+    x_steps = x_dt.unbind(1)
+    decay_steps = decay_slab.unbind(1)
+    C_steps = C_h.unbind(1)
+    Dx_steps = Dx_slab.unbind(1)
+    for t in range(T):
+        S = S.mul_(decay_steps[t]).add_(x_steps[t])
+        ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2)) + Dx_steps[t])
+    return torch.stack(ys, dim=1).squeeze(-2), S
+
+
 def _get_scripted_scan_loop():
     """Scripted scan loop body, with eager fallback.
 
@@ -240,6 +266,22 @@ def _get_scripted_scan_loop():
         except Exception:
             _SCAN_LOOP_SCRIPTED_FAILED = True
     return _SCAN_LOOP_SCRIPTED
+
+
+def _get_scripted_scan_loop_inplace():
+    """Scripted no-grad scan body, with eager fallback (see
+    :func:`_mamba2_scan_loop_inplace_eager`)."""
+    global _SCAN_LOOP_INPLACE_SCRIPTED, _SCAN_LOOP_INPLACE_SCRIPTED_FAILED
+    if (_SCAN_LOOP_INPLACE_SCRIPTED is None
+            and not _SCAN_LOOP_INPLACE_SCRIPTED_FAILED):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', FutureWarning)
+                _SCAN_LOOP_INPLACE_SCRIPTED = torch.jit.script(
+                    _mamba2_scan_loop_inplace_eager)
+        except Exception:
+            _SCAN_LOOP_INPLACE_SCRIPTED_FAILED = True
+    return _SCAN_LOOP_INPLACE_SCRIPTED
 
 
 def _validate_mamba2_scan_inputs(
@@ -444,7 +486,16 @@ def naive_mamba2_scan(
     # budget applies to it.
     slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
                // max(1, batch * nheads * headdim * d_state))
-    loop = _get_scripted_scan_loop()
+    # Autograd-safe out-of-place loop while a graph is being recorded; the
+    # in-place loop (same values, one fewer state-sized temporary per step)
+    # otherwise. The in-place loop mutates its state argument, so it gets a
+    # dedicated copy and the caller's ``initial_state`` stays untouched.
+    use_inplace = not torch.is_grad_enabled()
+    loop = None if use_inplace else _get_scripted_scan_loop()
+    loop_inplace = _get_scripted_scan_loop_inplace() if use_inplace else None
+    if use_inplace:
+        S_flat = S_flat.clone()
+
     y_slabs: list[torch.Tensor] = []
     for lo in range(0, seqlen, slab):
         hi = min(seqlen, lo + slab)
@@ -457,7 +508,11 @@ def naive_mamba2_scan(
         decay_slab = torch.exp(dt_slab * A_col)              # [bh, slab, 1, 1]
         C_slab = C_h_flat[:, lo:hi].unsqueeze(-2)            # [bh, slab, 1, N]
         Dx_slab = (D_col * x_flat[:, lo:hi]).unsqueeze(-2)   # [bh, slab, 1, D]
-        if loop is not None:
+        if use_inplace:
+            fn = (loop_inplace if loop_inplace is not None
+                  else _mamba2_scan_loop_inplace_eager)
+            y_slab, S_flat = fn(x_dt, decay_slab, C_slab, Dx_slab, S_flat)
+        elif loop is not None:
             y_slab, S_flat = loop(x_dt, decay_slab, C_slab, Dx_slab, S_flat)
         else:
             y_slab, S_flat = _mamba2_scan_loop_eager(

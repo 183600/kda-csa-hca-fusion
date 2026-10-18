@@ -1382,8 +1382,18 @@ class CSADecodingCache:
             else:
                 valid_mask = indices >= 0                              # [B, 1, topk]
                 idx_safe = indices.clamp(min=0)                        # [B, 1, topk]
-                batch_idx = torch.arange(B, device=device).view(B, 1, 1)
-                kv = C_comp_valid[batch_idx, idx_safe]                 # [B, 1, topk, c]
+                # Flat ``index_select`` row gather (same trick as
+                # ``naive_csa``): faster than advanced indexing on CPU and
+                # value-identical (distinct blocks per row).
+                nblk = C_comp_valid.shape[1]
+                flat_idx = (
+                    idx_safe
+                    + torch.arange(B, device=device).view(B, 1, 1) * nblk
+                ).reshape(-1)
+                kv = torch.index_select(
+                    C_comp_valid.reshape(B * nblk, C_comp_valid.shape[-1]),
+                    0, flat_idx,
+                ).view(B, 1, idx_safe.shape[-1], C_comp_valid.shape[-1])  # [B, 1, topk, c]
                 if normalize_qk:
                     # Per-row normalization after the gather (see the note
                     # at ``C_comp_valid`` above).
@@ -1421,7 +1431,10 @@ class CSADecodingCache:
                     # Multiplying by exactly 1.0 is an IEEE no-op, so the
                     # guarded multiply is value-identical.
                     scores = scores * core_scale
-                scores = scores.masked_fill(
+                # The einsum output (or its freshly scaled copy) is not
+                # saved by any autograd node, so the mask can be written
+                # in place (mirrors ``naive_csa``).
+                scores.masked_fill_(
                     ~valid_mask[:, :, None, :], float('-inf'))
 
         # --- Sliding-window branch: window scores for the joint softmax ---
@@ -1498,10 +1511,12 @@ class CSADecodingCache:
         sparse_out = torch.einsum(
             'b t h k, b t k d -> b t h d', p_b, kv,
         )                                                              # [B, 1, nh, c]
-        sw_out = torch.einsum(
+        # Accumulate the window contribution in place (same values as
+        # ``a + b``; the add's backward saves neither operand).
+        sparse_out.add_(torch.einsum(
             'b t h w, b w d -> b t h d', p_w, C_local,
-        )                                                              # [B, 1, nh, c]
-        out = sparse_out + sw_out
+        ))                                                             # [B, 1, nh, c]
+        out = sparse_out
         # Partial RoPE output countermeasure (§2.3.3): inverse-rotate the
         # core-attention output at the NEGATED query position so each KV
         # entry's contribution carries the relative (entry − query)
@@ -2025,7 +2040,9 @@ class HCADecodingCache:
                 # Multiplying by exactly 1.0 is an IEEE no-op, so the
                 # guarded multiply is value-identical.
                 scores = scores * core_scale
-            scores = scores.masked_fill(~cbm[:, :, None, :], float('-inf'))
+            # In place: the einsum output is freshly allocated and not
+            # saved by any autograd node (mirrors ``naive_hca``).
+            scores.masked_fill_(~cbm[:, :, None, :], float('-inf'))
 
         # --- Sliding-window branch: window scores for the joint softmax ---
         if self._sw is None or self._sw.n_valid == 0:
@@ -2084,10 +2101,12 @@ class HCADecodingCache:
         dense_out = torch.einsum(
             'b t h n, b n d -> b t h d', p_dense, C_comp_n,
         )                                                              # [B, 1, nh, c]
-        sw_out = torch.einsum(
+        # Accumulate the window contribution in place (same values as
+        # ``a + b``; the add's backward saves neither operand).
+        dense_out.add_(torch.einsum(
             'b t h w, b w d -> b t h d', p_w, C_local,
-        )                                                              # [B, 1, nh, c]
-        out = dense_out + sw_out
+        ))                                                             # [B, 1, nh, c]
+        out = dense_out
         # Partial RoPE output countermeasure (§2.3.3): inverse-rotate the
         # core-attention output at the NEGATED query position so each KV
         # entry's contribution carries the relative (entry − query)
