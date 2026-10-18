@@ -263,7 +263,8 @@ ROW_CONTRACTS: dict = {}
 # Hybrid rows record the RESOLVED layout as a hyphen-joined uppercase
 # string (e.g. 'KDA-KDA-KDA-CSA-HCA'; see ops_fused.HybridAttentionStack
 # .layout_str and LAYOUT_KINDS).
-_LAYOUT_TOKENS = frozenset({'KDA', 'MAMBA2', 'RWKV7', 'CSA', 'HCA'})
+_LAYOUT_TOKENS = frozenset({'KDA', 'MAMBA2', 'RWKV7', 'CSA', 'HCA',
+                            'LINEAR', 'SOFTMAX'})
 _MEMORY_TOKENS = frozenset({'KDA', 'MAMBA2', 'RWKV7'})
 _EXP6_HYBRID_OPS = frozenset({'hybrid', 'hybrid_mamba2', 'hybrid_rwkv7'})
 _EXP6_CACHE_OPS = frozenset({'csa', 'hca'}) | _EXP6_HYBRID_OPS

@@ -75,24 +75,26 @@ def test_haystack_generation_deterministic():
 
 
 def test_haystack_needle_position():
-    """Needle question/answer appear at expected positions."""
+    """The fact sits at needle_pos and the question is the final tokens."""
     print('\nTest: needle position correctness')
     tok = _NeedleCharTokenizer()
     q_ids = tok.encode("What is the secret code? ")
     a_ids = tok.encode("The secret code is 42-alpha-7.")
-    needle_len = len(q_ids) + len(a_ids)
 
     for ctx_len in (128, 256):
         for needle_pos in (16, 32, 64):
             ids, tgt, ans_start = build_needle_haystack(tok, ctx_len, needle_pos, seed=0)
             _ok(f'ctx={ctx_len} pos={needle_pos} answer_start={ans_start}',
-                ans_start == needle_pos + len(q_ids))
-            # Check the needle question is at needle_pos
-            _ok(f'needle question at pos',
-                torch.equal(ids[needle_pos:needle_pos+len(q_ids)], torch.tensor(q_ids)))
-            # Check the needle answer starts at ans_start
-            _ok(f'needle answer at ans_start',
-                torch.equal(ids[ans_start:ans_start+len(a_ids)], torch.tensor(a_ids)))
+                ans_start == ctx_len)
+            # The FACT (answer sentence) is planted at needle_pos ...
+            _ok(f'needle fact at pos',
+                torch.equal(ids[needle_pos:needle_pos+len(a_ids)], torch.tensor(a_ids)))
+            # ... and the QUESTION is appended at the very end, so it is
+            # not adjacent to the fact.
+            _ok(f'question at end',
+                torch.equal(ids[ctx_len-len(q_ids):], torch.tensor(q_ids)))
+            _ok(f'target is first answer token',
+                tgt.tolist() == [a_ids[0]])
 
 
 def test_batch_generation():
@@ -259,7 +261,19 @@ def test_needle_experiment_json_output():
 
     row_kinds = {r['row_kind'] for r in payload['rows']}
     _ok('has needle_recall rows', 'needle_recall' in row_kinds)
-    _ok('has needle_config rows or similar', True)  # config info in design
+    _ok('has untrained control rows',
+        'needle_untrained_control' in row_kinds, f'kinds={sorted(row_kinds)}')
+    recall = [r for r in payload['rows'] if r['row_kind'] == 'needle_recall']
+    _ok('every recall row is trained',
+        all(r.get('is_trained') is True for r in recall))
+    _ok('recall rows carry full-answer metric',
+        all(r.get('per_seed', [{}])[0].get('answer_match')
+            == 'full_answer_exact_match' for r in recall))
+    _ok('recall rows carry CI fields',
+        all('accuracy_ci95' in r and 'accuracy_std' in r for r in recall))
+    _ok('untrained rows carry is_trained=False',
+        all(r.get('is_trained') is False for r in payload['rows']
+            if r['row_kind'] == 'needle_untrained_control'))
 
     # Validate JSON round-trips strictly
     json.dumps(payload, allow_nan=False)

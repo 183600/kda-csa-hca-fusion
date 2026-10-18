@@ -31,15 +31,28 @@ This experiment adds that missing evaluation axis, with three key integrations:
 
 The evaluation uses a **deterministic, offline haystack generator** (no network,
 no external tokenizer) so it runs in CI. The haystack is constructed from a
-fixed vocabulary of distractor sentences; the needle is a fixed Q&A pair
-inserted at a controlled position. Retrieval is measured by exact-match of the
-answer token(s) at the final position.
+fixed vocabulary of distractor sentences, the needle FACT (the answer sentence)
+is inserted at a controlled position, and the fixed QUESTION is appended as the
+last tokens of the sequence. The model therefore has to retrieve the fact from
+the haystack rather than answer from the local question context. Retrieval is
+measured by **full-answer exact match** under greedy autoregressive decoding
+(every token of the answer must match), not by the first character alone.
+
+Every reported cell is produced by a model **trained from scratch** on a fixed
+training budget and a disjoint seed band (``train_context_len`` /
+``train_needle_pos``; evaluation uses the held-out ``[0, EVAL_SEED_RESERVE)``
+band). An explicit **untrained control** row (random initialisation, same
+architecture and evaluation sequences) is written for every base geometry so
+the trained numbers can be read against their actual chance floor. Aggregate
+rows carry seed-level standard deviations, 95% t-intervals and a paired
+significance test of the trained model's gain over its untrained control.
 
 Output
 ------
 ``results/exp12_needle_haystack.json`` (versioned envelope via ``results_schema``)
-with ``row_kind`` in {``needle_config``, ``needle_recall``, ``needle_summary``,
-``qat_needle``, ``qat_needle_summary``}.
+with ``row_kind`` in {``needle_config``, ``needle_recall``,
+``needle_untrained_control``, ``needle_summary``, ``qat_needle``,
+``qat_needle_summary``}.
 """
 
 from __future__ import annotations
@@ -76,7 +89,8 @@ from kv_quant import (
     spec_summary,
     storage_bytes,
 )
-from ops_fused import HybridConfig, HybridKCHAttention
+from ops_fused import HybridConfig, HybridKCHAttention, _memory_layer_lookback
+from multi_seed_stats import summarize_paired
 from run_decoding import HybridDecoding
 from results_schema import write as write_schema
 
@@ -101,10 +115,14 @@ _HAYSTACK_VOCAB_CHARS = (
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
-# The needle: a fixed Q&A pair. The question is the "cue", the answer is the
-# target. We construct this as a token sequence.
+# The needle: the FACT sentence is planted in the haystack and the QUESTION is
+# appended at the very end. The answer is the fact sentence itself (the model
+# must reproduce every one of its tokens). Keeping the question at the end is
+# what makes this a retrieval task: answering only requires the local question
+# context when the question is adjacent to the fact.
 _NEEDLE_QUESTION = "What is the secret code? "
 _NEEDLE_ANSWER = "The secret code is 42-alpha-7."
+_NEEDLE_FACT = _NEEDLE_ANSWER
 
 # Distractor sentences (char-level, will be tokenized by the char tokenizer)
 _DISTRACTOR_SENTENCES = [
@@ -224,41 +242,51 @@ def build_needle_haystack(
     needle_pos: int,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Build a single needle-in-haystack sequence.
+    """Build a single needle-in-haystack sequence (canonical NIAH layout).
+
+    The FACT sentence (the needle) is inserted at ``needle_pos``; the fixed
+    QUESTION is appended as the final ``len(q_ids)`` tokens. The model must
+    retrieve the fact from that position to answer, so ``needle_pos`` really
+    controls the retrieval distance (the earlier Q&A-adjacent layout made the
+    task answerable from local context alone).
 
     Args:
         tokenizer: character tokenizer
-        context_len: total sequence length (including needle + haystack)
-        needle_pos: position (0-indexed) where the needle QUESTION starts.
-                    The answer follows immediately after.
+        context_len: total sequence length (haystack + fact + question)
+        needle_pos: position (0-indexed) where the needle FACT starts.
         seed: RNG seed for distractor selection
 
     Returns:
         input_ids: [context_len] token ids
-        target_ids: [1] answer token id(s) — we use the FIRST token of the answer
-        answer_start: position where the answer begins (for verification)
+        target_ids: [1] the FIRST answer token (full-answer matching lives in
+            the evaluator; this keeps the historical return shape)
+        answer_start: ``context_len`` — the answer is generated AFTER the last
+            question token (so the last context position predicts target 0)
     """
     gen = torch.Generator()
     gen.manual_seed(seed)
 
     # Tokenize needle components
     q_ids = tokenizer.encode(_NEEDLE_QUESTION)
-    a_ids = tokenizer.encode(_NEEDLE_ANSWER)
-    needle_ids = q_ids + a_ids
-    needle_len = len(needle_ids)
+    fact_ids = tokenizer.encode(_NEEDLE_FACT)
+    needle_len = len(fact_ids) + len(q_ids)
 
-    if needle_pos + needle_len >= context_len:
-        raise ValueError(f"needle_pos={needle_pos} + needle_len={needle_len} >= context_len={context_len}")
+    haystack_len = context_len - needle_len
+    if haystack_len < 0:
+        raise ValueError(
+            f"context_len={context_len} is shorter than the needle "
+            f"(fact_len={len(fact_ids)} + question_len={len(q_ids)})")
+    if needle_pos < 0 or needle_pos > haystack_len:
+        raise ValueError(
+            f"needle_pos={needle_pos} must be in [0, {haystack_len}] for "
+            f"context_len={context_len} (haystack length excluding the "
+            f"fact and the final question)")
 
     # Build haystack from distractor sentences - use RNG to shuffle and sample
     distractor_sentences = list(_DISTRACTOR_SENTENCES)
     # Shuffle distractors per seed
     perm = torch.randperm(len(distractor_sentences), generator=gen).tolist()
     distractor_sentences = [distractor_sentences[i] for i in perm]
-
-    distractor_ids = []
-    for sent in distractor_sentences:
-        distractor_ids.extend(tokenizer.encode(sent))
 
     # We need context_len - needle_len tokens of haystack
     haystack_needed = context_len - needle_len
@@ -274,18 +302,16 @@ def build_needle_haystack(
                 break
     full_haystack = full_haystack[:haystack_needed]
 
-    # Insert needle at needle_pos
-    # haystack is split: [0:needle_pos] + needle + [needle_pos:]
+    # Insert the FACT at needle_pos; append the QUESTION at the end.
     before = full_haystack[:needle_pos]
     after = full_haystack[needle_pos:]
+    input_ids = before + fact_ids + after + q_ids
+    input_ids = input_ids[:context_len]  # exact by construction
 
-    input_ids = before + needle_ids + after
-    input_ids = input_ids[:context_len]  # truncate if slight overflow
-
-    # Target is the first token of the answer (the model predicts next token)
-    # The answer starts at needle_pos + len(q_ids)
-    answer_start = needle_pos + len(q_ids)
-    target_id = a_ids[0] if a_ids else tokenizer.char_to_id.get('T', 0)
+    # The model predicts the first answer token at the last context position,
+    # then the remaining answer tokens autoregressively.
+    answer_start = context_len
+    target_id = fact_ids[0] if fact_ids else tokenizer.char_to_id.get('T', 0)
 
     return (
         torch.tensor(input_ids, dtype=torch.long),
@@ -481,77 +507,97 @@ def evaluate_needle_recall(
     quant_spec: QuantSpec | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> dict:
-    """Evaluate needle retrieval accuracy.
+    """Evaluate needle retrieval by greedy decoding of the FULL answer.
 
-    Runs the model in eval mode, feeds the full context (prefill), then checks
-    if the next-token prediction at the answer position matches the target.
+    The metric is exact match: every token of ``_NEEDLE_ANSWER`` must be
+    produced. The previous implementation compared only the first answer
+    token, which is not the documented "answer token(s)" exact match and is
+    easy to inflate (one frequent character can dominate). Token-level and
+    first-token accuracies are still reported for continuity.
 
-    With quant_spec, the KDA state is fake-quantized after every layer write
-    during the forward pass (mirroring the PTQ path in run_quant_lm).
+    With ``quant_spec`` the memory state is fake-quantized after every write
+    during the prefill as well as during decoding (the PTQ contract), so the
+    prefill runs token-by-token through ``forward_step``.
     """
     model.eval()
     model.to(device)
     if dtype in (torch.float16, torch.bfloat16):
         model = model.to(dtype=dtype)
 
+    expected = tokenizer.encode(_NEEDLE_ANSWER)
+    n_gen = len(expected)
+    expected_t = torch.tensor(expected, dtype=torch.long, device=device)
+
     correct = 0
     total = 0
+    token_correct = 0
+    token_total = 0
+    first_correct = 0
+
     for b in range(n_batches):
         seeds = eval_batch_seeds(b, batch_size)
-        input_ids, targets, answer_positions = build_needle_batch(
-            batch_size, context_len, needle_pos, tokenizer, seeds=seeds, device=device
-        )
-        # Full prefill forward
+        input_ids, _targets, _answer_positions = build_needle_batch(
+            batch_size, context_len, needle_pos, tokenizer, seeds=seeds,
+            device=device)
+        input_ids = input_ids.to(device)
+
         if hasattr(model, 'hybrid'):
-            # NeedleHybridLM path
+            # --- Hybrid model: batch-level prefill + stateful decode -------
+            decode_mode = 'greedy_autoregressive'
             model.hybrid.reset_state()
             if quant_spec is None:
-                logits = model(input_ids.to(device))
+                logits = model(input_ids)
+                next_logits = logits[:, -1]
             else:
-                # PTQ contract: the recurrent state is fake-quantized after
-                # every write, so the prefill must run token-by-token through
-                # ``forward_step`` (the vectorized ``model(...)`` path has no
-                # state-quantization hook). Only the prefix up to the last
-                # scoring position is needed; the logits returned at step
-                # ``t`` predict token ``t + 1``.
-                last_pred_pos = max(answer_positions) - 1
-                step_logits = [
-                    model.forward_step(
-                        input_ids[:, t:t+1].to(device), quant_spec)
-                    for t in range(last_pred_pos + 1)
-                ]
-                logits = torch.stack(step_logits, dim=1)   # [B, T', vocab]
-            # The answer token is predicted at position answer_start - 1
-            # (since the model predicts next token)
-            for i, ans_pos in enumerate(answer_positions):
-                pred_pos = ans_pos - 1
-                if pred_pos >= 0 and pred_pos < logits.shape[1]:
-                    pred = logits[i, pred_pos].argmax().item()
-                    if pred == targets[i].item():
-                        correct += 1
-                    total += 1
+                # Quantize after every state write: no vectorized shortcut.
+                next_logits = None
+                for t in range(context_len):
+                    next_logits = model.forward_step(
+                        input_ids[:, t:t + 1], quant_spec)
+            generated = []
+            cur = next_logits.argmax(dim=-1)
+            for _ in range(n_gen):
+                generated.append(cur)
+                cur = model.forward_step(
+                    cur.unsqueeze(-1), quant_spec).argmax(dim=-1)
+            preds = torch.stack(generated, dim=1)  # [B, n_gen]
         else:
-            # StepwiseKDALM or other: run step by step
+            # --- Stepwise model has no persistent cross-call state: score the
+            # full answer teacher-forced in ONE pass instead of re-running the
+            # growing prefix n_gen times. Every answer token must still be
+            # correct; only the previous-token source differs (gold vs
+            # generated), which is recorded as ``decode_mode``.
+            decode_mode = 'teacher_forced_full_answer'
             model.reset_state() if hasattr(model, 'reset_state') else None
-            for i in range(batch_size):
-                seq_ids = input_ids[i:i+1]
-                model.reset_state() if hasattr(model, 'reset_state') else None
-                logits = model(seq_ids, spec=quant_spec, ste=False)[:, :-1]
-                ans_pos = answer_positions[i]
-                pred_pos = ans_pos - 1
-                if pred_pos >= 0 and pred_pos < logits.shape[1]:
-                    pred = logits[0, pred_pos].argmax().item()
-                    if pred == targets[i].item():
-                        correct += 1
-                    total += 1
+            full = torch.cat(
+                [input_ids,
+                 expected_t[:-1].unsqueeze(0).expand(batch_size, -1)], dim=1)
+            logits = model(full, spec=quant_spec, ste=False)
+            start = context_len - 1
+            preds = logits[:, start:start + n_gen].argmax(dim=-1)
 
-    accuracy = correct / total if total > 0 else 0.0
+        match = preds.eq(expected_t.unsqueeze(0))
+        correct += int(match.all(dim=1).sum().item())
+        token_correct += int(match.sum().item())
+        token_total += batch_size * n_gen
+        first_correct += int(match[:, 0].sum().item())
+        total += batch_size
+
+    accuracy = correct / total if total else 0.0
     return {
+        # Full-answer exact match (the headline metric).
         'accuracy': accuracy,
         'correct': correct,
         'total': total,
+        # Secondary metrics kept for continuity / diagnostics.
+        'first_token_accuracy': first_correct / total if total else 0.0,
+        'token_accuracy': token_correct / token_total if token_total else 0.0,
+        'n_answer_tokens': n_gen,
+        'answer_match': 'full_answer_exact_match',
+        'decode_mode': decode_mode,
         'context_len': context_len,
         'needle_pos': needle_pos,
+        'answer_start': context_len,
     }
 
 
@@ -566,70 +612,11 @@ def evaluate_needle_recall_autoregressive(
     quant_spec: QuantSpec | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> dict:
-    """Evaluate needle retrieval via autoregressive decode.
-
-    Feeds the context up to the question, then generates tokens and checks
-    if the answer is produced. More realistic but slower.
-    """
-    model.eval()
-    model.to(device)
-    if dtype in (torch.float16, torch.bfloat16):
-        model = model.to(dtype=dtype)
-
-    correct = 0
-    total = 0
-    for b in range(n_batches):
-        seeds = eval_batch_seeds(b, batch_size)
-        input_ids, targets, answer_positions = build_needle_batch(
-            batch_size, context_len, needle_pos, tokenizer, seeds=seeds, device=device
-        )
-        # Feed context up to the question, then generate the answer tokens
-        # autoregressively.
-        expected = tokenizer.encode(_NEEDLE_ANSWER)
-        n_gen = len(expected)
-        for i in range(batch_size):
-            seq = input_ids[i:i+1]  # [1, context_len]
-            ans_pos = answer_positions[i]
-            generated: list[int] = []
-            if hasattr(model, 'hybrid'):
-                # Prefill up to (and including) the last question token; the
-                # last prefill logits predict the FIRST answer token. The
-                # previous implementation discarded these logits and re-fed
-                # ``prefill[:, -1:]`` through ``forward_step``, consuming the
-                # last token twice and corrupting the recurrent state.
-                prefill = seq[:, :ans_pos]
-                model.hybrid.reset_state()
-                logits = model(prefill.to(device))
-                next_logits = logits[:, -1]
-                for _ in range(n_gen):
-                    next_token = next_logits.argmax(dim=-1)
-                    generated.append(next_token.item())
-                    next_logits = model.forward_step(
-                        next_token.unsqueeze(-1).to(device), quant_spec)
-            else:
-                # Stepwise model keeps no cross-call state: re-run the
-                # growing prefix and take the last-position logits.
-                prefill = seq[:, :ans_pos]
-                model.reset_state() if hasattr(model, 'reset_state') else None
-                logits = model(prefill, spec=quant_spec, ste=False)
-                for _ in range(n_gen):
-                    next_token = logits[:, -1].argmax(dim=-1)
-                    generated.append(next_token.item())
-                    prefill = torch.cat(
-                        [prefill, next_token.unsqueeze(0)], dim=1)
-                    logits = model(prefill, spec=quant_spec, ste=False)
-            if generated == expected:
-                correct += 1
-            total += 1
-
-    accuracy = correct / total if total > 0 else 0.0
-    return {
-        'accuracy': accuracy,
-        'correct': correct,
-        'total': total,
-        'context_len': context_len,
-        'needle_pos': needle_pos,
-    }
+    """Backwards-compatible alias: the default evaluator is autoregressive."""
+    return evaluate_needle_recall(
+        model, tokenizer, context_len, needle_pos, batch_size=batch_size,
+        n_batches=n_batches, device=device, quant_spec=quant_spec,
+        dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -657,44 +644,42 @@ def train_needle_model(
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     gen = make_seeded_generator(seed + TRAIN_SEED_STREAM, device=device)
 
+    answer_ids = tokenizer.encode(_NEEDLE_ANSWER)
+    n_answer = len(answer_ids)
+    answer_t = torch.tensor(answer_ids, dtype=torch.long, device=device)
+
     losses = []
     data_seeds: list[int] = []
     for step in range(steps):
         # Draw fresh data seeds for every step from the seeded generator.
-        # Previously the generator was created and never used, so
-        # ``build_needle_batch`` fell back to its default ``range(batch_size)``
-        # seeds and re-created the IDENTICAL batch every step (memorization,
-        # plus the training sequences coincided with the evaluation ones).
-        # The draw is restricted to the training band (>= EVAL_SEED_RESERVE)
-        # so no training batch can reproduce a held-out evaluation sequence.
+        # Training seeds live in [EVAL_SEED_RESERVE, 2**31) so no training
+        # batch can reproduce a held-out evaluation sequence.
         step_seeds = draw_train_seeds(gen, batch_size)
         data_seeds.extend(step_seeds)
         # Build training batch
-        input_ids, targets, answer_positions = build_needle_batch(
+        input_ids, _targets, answer_positions = build_needle_batch(
             batch_size, train_context_len, train_needle_pos, tokenizer,
             seeds=step_seeds, device=device
         )
-        # Simple next-token prediction loss on the answer position
+        # The question is the final context token; append the answer tokens
+        # (except the last) so teacher forcing supervises EVERY answer token,
+        # not just the first one. The earlier loss only scored the first
+        # answer token, which cannot teach a model to reproduce the answer.
+        answer_tail = answer_t[:-1].unsqueeze(0).expand(batch_size, -1)
+        train_ids = torch.cat([input_ids, answer_tail], dim=1)
+        start = answer_positions[0] - 1
+        if any(p - 1 != start for p in answer_positions):
+            raise RuntimeError('needle answer positions differ within a batch')
         if hasattr(model, 'hybrid'):
             model.hybrid.reset_state()
-            logits = model(input_ids)
-            # Loss on answer token position
-            loss = 0
-            for i, ans_pos in enumerate(answer_positions):
-                pred_pos = ans_pos - 1
-                if pred_pos >= 0:
-                    loss = loss + F.cross_entropy(
-                        logits[i:i+1, pred_pos], targets[i:i+1])
-            loss = loss / batch_size
+            logits = model(train_ids)
         else:
-            # Stepwise
-            model.reset_state()
-            logits = model(input_ids, spec=quant_spec, ste=ste)  # [B, T, vocab]
-            # Next-token prediction loss: predict token t+1 from token t
-            loss = F.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                input_ids[:, 1:].reshape(-1),
-                ignore_index=-100)
+            model.reset_state() if hasattr(model, 'reset_state') else None
+            logits = model(train_ids, spec=quant_spec, ste=ste)
+        pred = logits[:, start:start + n_answer, :]
+        target = answer_t.unsqueeze(0).expand(batch_size, -1)
+        loss = F.cross_entropy(
+            pred.reshape(-1, pred.size(-1)), target.reshape(-1))
         if not torch.isfinite(loss):
             raise RuntimeError(f'Non-finite loss at step {step}: {loss}')
         opt.zero_grad()
@@ -703,9 +688,19 @@ def train_needle_model(
         opt.step()
         losses.append(float(loss.item()))
 
+    tail = losses[-min(10, len(losses)):]
     return model, {
         'losses': losses,
         'final_loss': losses[-1] if losses else None,
+        'initial_loss': losses[0] if losses else None,
+        'min_loss': min(losses) if losses else None,
+        'last10_mean_loss': (sum(tail) / len(tail)) if tail else None,
+        'steps': steps,
+        'batch_size': batch_size,
+        'lr': lr,
+        'train_context_len': train_context_len,
+        'train_needle_pos': train_needle_pos,
+        'n_answer_tokens': n_answer,
         # Every data seed used to build a training batch, so the caller can
         # independently audit disjointness from the held-out eval stream.
         'data_seeds': data_seeds,
@@ -783,6 +778,78 @@ def make_quant_configs(base_configs: list[NeedleConfig], specs: list[QuantSpec])
 # Main experiment driver
 # ---------------------------------------------------------------------------
 
+_DTYPE_BITS = {'fp32': 32.0, 'fp16': 16.0, 'bf16': 16.0}
+
+
+def _arch_key(cfg: NeedleConfig) -> tuple:
+    """Everything that determines the weights, minus the seed."""
+    return (cfg.memory_type, cfg.n_layers, cfg.n_kda, cfg.n_csa, cfg.n_hca)
+
+
+def _build_needle_model(cfg: NeedleConfig, tokenizer: _NeedleCharTokenizer) -> NeedleHybridLM:
+    return NeedleHybridLM(
+        vocab_size=tokenizer.vocab_size,
+        d_model=128,
+        n_layers=cfg.n_layers,
+        memory_type=cfg.memory_type,
+        n_kda=cfg.n_kda,
+        n_csa=cfg.n_csa,
+        n_hca=cfg.n_hca,
+    )
+
+
+def _mean_ci95(values: list[float]) -> list[float] | None:
+    """Two-sided 95% t-interval of the mean (None for n < 2)."""
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    sd = math.sqrt(var)
+    if sd == 0.0:
+        return [mean, mean]
+    from run_quality import _t_crit_975
+    crit = _t_crit_975(n)
+    if crit is None:
+        return None
+    half = crit * sd / math.sqrt(n)
+    return [mean - half, mean + half]
+
+
+def _measure_needle_state(model: NeedleHybridLM,
+                          tokenizer: _NeedleCharTokenizer,
+                          device: str | torch.device) -> dict:
+    """Measure the ACTUAL per-sequence streaming state of a trained model.
+
+    The old ``state_bytes`` was a hardcoded ``128*2*32*32`` guess that did
+    not depend on the model (wrong layer count, wrong dtype bits) and the
+    dtype column always charged the quantizer's bits even for fp16/bf16
+    rows. This helper reads the live buffers after a forward pass:
+    ``_kda_state`` (the stacked recurrent memory) plus each memory layer's
+    short-conv / token-shift lookback.
+    """
+    model.eval()
+    with torch.no_grad():
+        ids, _, _ = build_needle_batch(
+            1, 64, 0, tokenizer, seeds=[eval_batch_seeds(0, 1)[0]],
+            device=device)
+        model(ids)
+        state = getattr(model.hybrid, '_kda_state', None)
+        mem_elements = int(state.numel() // state.shape[1]) if state is not None else 0
+        lookback_elements = 0
+        for layer in model.hybrid.memory_layers:
+            lb = _memory_layer_lookback(layer)
+            if lb is not None and lb.numel():
+                lookback_elements += int(lb.numel() // lb.shape[0])
+    model.hybrid.reset_state()
+    return {
+        'memory_state_elements': mem_elements,
+        'lookback_elements': lookback_elements,
+        'total_state_elements': mem_elements + lookback_elements,
+        'n_memory_layers': int(model.hybrid.n_memory_layers),
+    }
+
+
 def run_needle_sweep(
     configs: list[NeedleConfig],
     tokenizer: _NeedleCharTokenizer,
@@ -790,34 +857,67 @@ def run_needle_sweep(
     batch_size: int = 4,
     n_batches: int = 2,
     device: str | torch.device = 'cpu',
+    train_context_len: int | None = None,
+    train_needle_pos: int | None = None,
+    train_steps: int = 100,
+    train_batch_size: int = 4,
+    train_lr: float = 3e-3,
 ) -> list[dict]:
-    """Run the needle sweep over configs and seeds."""
+    """Train + evaluate every needle config, with untrained controls.
+
+    By default a separate model is trained for each EVALUATION CONTEXT LENGTH
+    (at needle position ``ctx // 4``), so the context sweep measures retrieval
+    and quantization damage rather than length extrapolation. Passing
+    ``train_context_len`` pins one training geometry for every cell.
+
+    Training is cached per ``(architecture, train_geometry, seed)``: dtype and
+    quantization do not change the weights (PTQ/QAT is inference-time here;
+    the QAT probe covers quantized training), so the 1000+ PTQ cells share a
+    handful of trained models instead of evaluating random initialisations.
+    Each cache entry is trained once from scratch on a disjoint seed band and
+    its actual training loss/seed audit is recorded on every row that uses it.
+    """
     rows = []
+    trained: dict[tuple, tuple[dict, dict]] = {}
+    untrained_acc: dict[tuple, dict] = {}
+    state_meas: dict[tuple, dict] = {}
+
     for cfg in configs:
         logger.info(f'  Running: ctx={cfg.context_len}, pos={cfg.needle_pos}, '
                     f'mem={cfg.memory_type}, dtype={cfg.dtype}, '
                     f'quant={cfg.quant_spec is not None}')
         dtype_map = {'fp32': torch.float32, 'fp16': torch.float16, 'bf16': torch.bfloat16}
         torch_dtype = dtype_map[cfg.dtype]
+        eval_seed_band = eval_batch_seeds(0, batch_size * n_batches)
 
+        train_ctx = train_context_len or cfg.context_len
+        train_pos = (train_needle_pos if train_needle_pos is not None
+                     else train_ctx // 4)
         per_seed_results = []
+        control_results = []
         for seed in seeds:
-            # Re-seed before model construction so the ``seed`` recorded in
-            # the row actually controls the model initialization (previously
-            # the RNG stream kept advancing across configs, making runs
-            # non-reproducible and the multi-seed spread uninterpretable).
-            set_global_seed(seed, deterministic=True)
-            # Build model
-            model = NeedleHybridLM(
-                vocab_size=tokenizer.vocab_size,
-                d_model=128,
-                n_layers=cfg.n_layers,
-                memory_type=cfg.memory_type,
-                n_kda=cfg.n_kda,
-                n_csa=cfg.n_csa,
-                n_hca=cfg.n_hca,
-            )
-            # Evaluate
+            key = (_arch_key(cfg), train_ctx, train_pos, seed)
+            if key not in trained:
+                # Re-seed before model construction so ``seed`` controls the
+                # initialization AND the training data stream.
+                set_global_seed(seed, deterministic=True)
+                model = _build_needle_model(cfg, tokenizer)
+                model, rep = train_needle_model(
+                    model, tokenizer, train_ctx, train_pos,
+                    train_steps, train_batch_size, train_lr, device, seed)
+                audit = audit_train_eval_seed_disjointness(
+                    rep['data_seeds'], eval_seed_band)
+                if not audit['disjoint']:
+                    raise RuntimeError(
+                        'needle train/eval seed audit failed for '
+                        f'{key}: overlap {audit["overlap_examples"]}')
+                rep['data_protocol'] = audit
+                trained[key] = ({k: v.detach().clone()
+                                 for k, v in model.state_dict().items()}, rep)
+
+            state_dict, rep = trained[key]
+            model = _build_needle_model(cfg, tokenizer)
+            model.load_state_dict(state_dict)
             res = evaluate_needle_recall(
                 model, tokenizer,
                 context_len=cfg.context_len,
@@ -831,11 +931,52 @@ def run_needle_sweep(
             res['seed'] = seed
             per_seed_results.append(res)
 
-        # Aggregate
+            # Untrained control: the SAME architecture/seed with random
+            # initialisation, scored on the SAME evaluation sequences.
+            ckey = (_arch_key(cfg), cfg.context_len, cfg.needle_pos,
+                    cfg.dtype, seed)
+            if ckey not in untrained_acc:
+                set_global_seed(seed, deterministic=True)
+                ctrl = _build_needle_model(cfg, tokenizer)
+                untrained_acc[ckey] = evaluate_needle_recall(
+                    ctrl, tokenizer,
+                    context_len=cfg.context_len,
+                    needle_pos=cfg.needle_pos,
+                    batch_size=batch_size,
+                    n_batches=n_batches,
+                    device=device,
+                    quant_spec=None,
+                    dtype=torch_dtype,
+                )
+            control_results.append(untrained_acc[ckey])
+
+        # Aggregate trained accuracy
         accs = [r['accuracy'] for r in per_seed_results]
         mean_acc = sum(accs) / len(accs) if accs else 0.0
-        min_acc = min(accs) if accs else 0.0
-        max_acc = max(accs) if accs else 0.0
+        sd_acc = (math.sqrt(sum((a - mean_acc) ** 2 for a in accs) / (len(accs) - 1))
+                  if len(accs) > 1 else None)
+        ctrl_accs = [r['accuracy'] for r in control_results]
+        ctrl_mean = sum(ctrl_accs) / len(ctrl_accs) if ctrl_accs else 0.0
+        diffs = [a - c for a, c in zip(accs, ctrl_accs)]
+        paired = summarize_paired(diffs) if len(diffs) >= 2 else None
+
+        state = state_meas.get(_arch_key(cfg))
+        if state is None:
+            state = _measure_needle_state(model, tokenizer, device)
+            state_meas[_arch_key(cfg)] = state
+
+        total_elems = state['total_state_elements']
+        dtype_bits = _DTYPE_BITS[cfg.dtype]
+        fp16_bytes = total_elems * 2.0
+        if cfg.quant_spec is not None:
+            mem_bytes = storage_bytes(state['memory_state_elements'], cfg.quant_spec)
+            look_bytes = state['lookback_elements'] * dtype_bits / 8.0
+            state_bytes = mem_bytes + look_bytes
+        else:
+            mem_bytes = state['memory_state_elements'] * dtype_bits / 8.0
+            look_bytes = state['lookback_elements'] * dtype_bits / 8.0
+            state_bytes = mem_bytes + look_bytes
+        effective_bits = (state_bytes * 8.0 / total_elems) if total_elems else None
 
         row = {
             'row_kind': 'needle_recall',
@@ -848,22 +989,95 @@ def run_needle_sweep(
             'n_csa': cfg.n_csa,
             'n_hca': cfg.n_hca,
             'dtype': cfg.dtype,
+            'dtype_bits': dtype_bits,
             'quantized': cfg.quant_spec is not None,
             'bits': cfg.quant_spec.bits if cfg.quant_spec else None,
             'group_size': cfg.quant_spec.group_size if cfg.quant_spec else None,
             'symmetric': cfg.quant_spec.symmetric if cfg.quant_spec else None,
-            'bits_per_element': bits_per_element(cfg.quant_spec) if cfg.quant_spec else 32.0,
-            'state_bytes': 0,  # TODO: compute from model
+            'bits_per_element': (bits_per_element(cfg.quant_spec)
+                                 if cfg.quant_spec else dtype_bits),
+            'effective_state_bits_per_element': effective_bits,
+            'state_bytes': state_bytes,
+            'memory_state_bytes': mem_bytes,
+            'lookback_bytes': look_bytes,
+            'state_elements': total_elems,
+            'memory_state_elements': state['memory_state_elements'],
+            'lookback_elements': state['lookback_elements'],
+            'compression_vs_fp16': (fp16_bytes / state_bytes
+                                    if state_bytes > 0 else None),
+            # Training provenance: every row is a TRAINED model.
+            'is_trained': True,
+            'train_steps': rep['steps'],
+            'train_context_len': rep['train_context_len'],
+            'train_needle_pos': rep['train_needle_pos'],
+            'train_batch_size': rep['batch_size'],
+            'train_lr': rep['lr'],
+            'train_initial_loss': rep['initial_loss'],
+            'train_final_loss': rep['final_loss'],
+            'train_min_loss': rep['min_loss'],
+            'train_last10_mean_loss': rep['last10_mean_loss'],
+            'train_data_protocol': rep['data_protocol'],
+            # Full-answer metric + dispersion/significance vs the control.
             'accuracy_mean': mean_acc,
-            'accuracy_min': min_acc,
-            'accuracy_max': max_acc,
+            'accuracy_std': sd_acc,
+            'accuracy_min': min(accs) if accs else 0.0,
+            'accuracy_max': max(accs) if accs else 0.0,
+            'accuracy_ci95': _mean_ci95(accs),
+            'accuracy_per_seed': accs,
+            'token_accuracy_mean': (sum(r['token_accuracy'] for r in per_seed_results)
+                                    / len(per_seed_results)),
+            'first_token_accuracy_mean': (sum(r['first_token_accuracy']
+                                              for r in per_seed_results)
+                                          / len(per_seed_results)),
+            'untrained_accuracy_mean': ctrl_mean,
+            'untrained_accuracy_per_seed': ctrl_accs,
+            'untrained_accuracy_ci95': _mean_ci95(ctrl_accs),
+            'accuracy_gain_over_untrained_mean': (
+                sum(diffs) / len(diffs) if diffs else None),
+            'accuracy_gain_paired': paired,
+            'chance_uniform_exact_match': (1.0 / tokenizer.vocab_size) **
+                                          per_seed_results[0]['n_answer_tokens'],
+            'chance_first_token': 1.0 / tokenizer.vocab_size,
             'seeds': list(seeds),
             'per_seed': per_seed_results,
         }
-        if cfg.quant_spec:
-            row['state_bytes'] = storage_bytes(128 * 2 * 32 * 32, cfg.quant_spec)  # approximate
-            row['compression_vs_fp16'] = compression_ratio(cfg.quant_spec)
         rows.append(row)
+
+        # One untrained-control row per base geometry (dtype/quant
+        # independent), written once so it is not duplicated per quant spec.
+        base_key = ('control_row', _arch_key(cfg), cfg.context_len,
+                    cfg.needle_pos)
+        if not any(r.get('control_key') == base_key for r in rows):
+            rows.append({
+                'row_kind': 'needle_untrained_control',
+                'control_key': base_key,
+                'context_len': cfg.context_len,
+                'needle_pos': cfg.needle_pos,
+                'memory_type': cfg.memory_type,
+                'n_layers': cfg.n_layers,
+                'n_kda': cfg.n_kda,
+                'n_csa': cfg.n_csa,
+                'n_hca': cfg.n_hca,
+                'is_trained': False,
+                'train_steps': 0,
+                'accuracy_mean': ctrl_mean,
+                'accuracy_std': (math.sqrt(sum((a - ctrl_mean) ** 2
+                                               for a in ctrl_accs) /
+                                           (len(ctrl_accs) - 1))
+                                 if len(ctrl_accs) > 1 else None),
+                'accuracy_min': min(ctrl_accs) if ctrl_accs else 0.0,
+                'accuracy_max': max(ctrl_accs) if ctrl_accs else 0.0,
+                'accuracy_ci95': _mean_ci95(ctrl_accs),
+                'accuracy_per_seed': ctrl_accs,
+                'chance_uniform_exact_match': (1.0 / tokenizer.vocab_size) **
+                                              control_results[0]['n_answer_tokens'],
+                'chance_first_token': 1.0 / tokenizer.vocab_size,
+                'seeds': list(seeds),
+                'per_seed': control_results,
+                'note': ('random-initialisation floor; every reported '
+                         'needle_recall row is trained and its gain over '
+                         'this control is tested with summarize_paired'),
+            })
 
     return rows
 
@@ -995,19 +1209,27 @@ def run_qat_needle_probe(
 
 
 def _print_needle_rows(rows: list[dict]):
-    logger.info('\n-- Needle-in-haystack recall --')
+    logger.info('\n-- Needle-in-haystack recall (full-answer exact match) --')
     header = (f"{'ctx':>5} | {'pos':>5} | {'mem':>7} | {'dtype':>5} | "
-              f"{'quant':>10} | {'acc mean':>8} | {'acc min':>7} | {'acc max':>7}")
+              f"{'state':>9} | {'acc mean':>8} | {'ci95':>15} | "
+              f"{'ctrl':>6} | {'gain':>6} | {'st':>5}")
     logger.info(header)
     logger.info('-' * len(header))
     for r in rows:
         if r['row_kind'] != 'needle_recall':
             continue
-        quant_str = (f"{r['bits']}b/g{r['group_size']}" if r['quantized'] else 'fp16')
+        state_str = (f"{r['bits']}b/g{r['group_size']}"
+                     if r['quantized'] else r['dtype'])
+        ci = r.get('accuracy_ci95')
+        ci_str = f"[{ci[0]:.3f},{ci[1]:.3f}]" if ci else 'n/a'
+        st = r.get('accuracy_std')
+        st_str = f'{st:.3f}' if st is not None else 'n/a'
         logger.info(
             f"{r['context_len']:>5} | {r['needle_pos']:>5} | {r['memory_type']:>7} | "
-            f"{r['dtype']:>5} | {quant_str:>10} | "
-            f"{r['accuracy_mean']:>8.3f} | {r['accuracy_min']:>7.3f} | {r['accuracy_max']:>7.3f}")
+            f"{r['dtype']:>5} | {state_str:>9} | "
+            f"{r['accuracy_mean']:>8.3f} | {ci_str:>15} | "
+            f"{r['untrained_accuracy_mean']:>6.3f} | "
+            f"{r['accuracy_gain_over_untrained_mean']:>+6.3f} | {st_str:>5}")
 
 
 def _print_qat_rows(rows: list[dict]):
@@ -1042,6 +1264,17 @@ def main():
     parser.add_argument('--dtypes', default=None, help='comma-separated dtypes (fp32,fp16,bf16)')
     parser.add_argument('--quant-bits', default=None, help='quantization bits for PTQ')
     parser.add_argument('--quant-groups', default=None, help='quantization group sizes')
+    parser.add_argument('--train-steps', type=int, default=None,
+                        help='optimizer steps per trained model')
+    parser.add_argument('--train-context-len', type=int, default=None,
+                        help='training geometry: context length')
+    parser.add_argument('--train-needle-pos', type=int, default=None,
+                        help='training geometry: needle position')
+    parser.add_argument('--train-batch-size', type=int, default=4)
+    parser.add_argument('--train-lr', type=float, default=3e-3)
+    parser.add_argument('--eval-batch-size', type=int, default=4)
+    parser.add_argument('--eval-batches', type=int, default=None,
+                        help='held-out evaluation batches per cell')
     args = parser.parse_args()
 
     info = configure_torch_for_device()
@@ -1077,6 +1310,8 @@ def main():
         quant_groups = quant_groups or [16]
         qat_seeds = (0,)
         qat_steps = 20
+        train_steps = 100
+        eval_batches = 2
     else:
         context_lens = context_lens or [256, 512, 1024, 2048]
         needle_ratios = [0.1, 0.25, 0.5, 0.75]
@@ -1086,21 +1321,28 @@ def main():
         quant_groups = quant_groups or [16, 64]
         qat_seeds = (0, 1)
         qat_steps = 100
+        train_steps = 100
+        eval_batches = 4
 
-    # Build base configs. Skip (context_len, ratio) cells where the needle
-    # would not fit: ``build_needle_haystack`` raises when
-    # ``needle_pos + needle_len >= context_len`` (an explicit CLI
-    # ``--context-lens`` can be small enough for the 0.75 cell to overflow).
-    needle_len = (len(tokenizer.encode(_NEEDLE_QUESTION))
-                  + len(tokenizer.encode(_NEEDLE_ANSWER)))
+    train_steps = args.train_steps or train_steps
+    train_context_len = args.train_context_len
+    train_needle_pos = args.train_needle_pos
+    eval_batches = args.eval_batches or eval_batches
+
+    # Build base configs. Skip (context_len, ratio) cells where the fact or
+    # the final question would not fit.
+    fact_len = len(tokenizer.encode(_NEEDLE_FACT))
+    question_len = len(tokenizer.encode(_NEEDLE_QUESTION))
     base_configs = []
     for cl in context_lens:
         for nr in needle_ratios:
             needle_pos = int(cl * nr)
-            if needle_pos + needle_len >= cl:
-                logger.info(f'  skipping ctx={cl}, ratio={nr}: needle '
-                            f'(len={needle_len}) does not fit at '
-                            f'pos={needle_pos}')
+            haystack_len = cl - fact_len - question_len
+            if haystack_len < 0 or needle_pos > haystack_len:
+                logger.info(f'  skipping ctx={cl}, ratio={nr}: fact '
+                            f'(len={fact_len}) + final question '
+                            f'(len={question_len}) leaves a haystack of '
+                            f'{haystack_len}, needle_pos={needle_pos}')
                 continue
             for mt in memory_types:
                 for dt in dtypes:
@@ -1117,11 +1359,27 @@ def main():
     all_configs = make_quant_configs(base_configs, quant_specs)
 
     logger.info(f'  {len(base_configs)} base configs x {len(quant_specs)} quant specs = {len(all_configs)} total')
-    logger.info(f'  seeds: {seeds}, batch_size: {4}, n_batches: {2}')
+    logger.info(f'  seeds: {seeds}, eval batch_size: {args.eval_batch_size}, '
+                f'eval n_batches: {eval_batches}')
+    if train_context_len is None:
+        train_geom = 'one model per eval context (pos=ctx//4)'
+    else:
+        pos = train_needle_pos if train_needle_pos is not None else train_context_len // 4
+        train_geom = f'ctx={train_context_len}, pos={pos}'
+    logger.info(f'  training: every cell uses a model trained from scratch '
+                f'({train_steps} steps, {train_geom}); untrained controls '
+                f'reported alongside')
 
     # Run sweep
     needle_rows = run_needle_sweep(
-        all_configs, tokenizer, seeds=seeds, batch_size=4, n_batches=2, device=device)
+        all_configs, tokenizer, seeds=seeds,
+        batch_size=args.eval_batch_size, n_batches=eval_batches,
+        device=device,
+        train_context_len=train_context_len,
+        train_needle_pos=train_needle_pos,
+        train_steps=train_steps,
+        train_batch_size=args.train_batch_size,
+        train_lr=args.train_lr)
 
     # QAT probe
     qat_rows = []

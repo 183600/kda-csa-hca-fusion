@@ -2894,7 +2894,7 @@ def _parse_op_list(env_var, default='linear,softmax,kda,mamba2,rwkv7,csa,hca'):
     return list(dict.fromkeys(vals))
 
 
-def _parse_lr_list(env_var, default='1e-3,3e-3,1e-2'):
+def _parse_lr_list(env_var, default='3e-4,1e-3,3e-3,1e-2,3e-2'):
     """Parse a comma-separated list of positive learning rates from an env var.
 
     Raises on a malformed / empty list (a silently empty tuning grid would
@@ -2927,10 +2927,11 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
 
     Experiment-design requirement: "implement the simplest baseline and TUNE
     IT WELL" before any complex model is declared better. This runs the
-    baseline over ``lrs`` and picks the rate maximizing the final held-out
-    VALIDATION accuracy (seed + ``_VAL_MONITOR_SEED_OFFSET`` stream), never
-    the headline eval stream (seed + 5M), so selection cannot leak into any
-    reported number. A single lr is selected per operator across all sweep
+    baseline over ``lrs`` and picks the rate maximizing the held-out
+    VALIDATION accuracy PLATEAU (mean of the last up-to-3 monitor points per
+    seed; seed + ``_VAL_MONITOR_SEED_OFFSET`` stream), never the headline
+    eval stream (seed + 5M), so selection cannot leak into any reported
+    number. A single lr is selected per operator across all sweep
     cells (the row schema stays one-lr-per-op); the record keeps the full
     per-lr grid so the choice is auditable.
 
@@ -2948,11 +2949,21 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
     tune_val_every = int(val_every) if int(val_every or 0) > 0 \
         else max(1, actual_steps // 4)
 
+    # Selection statistic: mean of the LAST (up to) ``_TUNE_TAIL_K``
+    # validation points per seed, averaged over seeds. The final point
+    # alone is noisy (one unlucky monitor batch can flip the lr choice),
+    # while the full curve would favour lrs that are still improving.
+    # A tail window measures the converged plateau, which is what "tuned
+    # well" should mean. The final-point mean is still recorded for
+    # backward compatibility.
+    _TUNE_TAIL_K = 3
     per_lr = OrderedDict()
     best_lr = lrs[0]
     best_score = None
     for lr in lrs:
-        scores = []
+        tail_scores = []
+        final_scores = []
+        tail_ks = []
         n_cell_runs_failed = 0
         for task, n_kv, task_seq_len, task_vocab in sweep:
             try:
@@ -2971,36 +2982,59 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
                 continue
             for seed_row in r.get('per_seed', []):
                 vh = seed_row.get('val_history') or []
-                if vh:
-                    scores.append(float(vh[-1]['acc']))
-        mean_score = (sum(scores) / len(scores)) if scores else None
+                if not vh:
+                    continue
+                final_scores.append(float(vh[-1]['acc']))
+                k = min(_TUNE_TAIL_K, len(vh))
+                tail_ks.append(k)
+                tail_vals = [float(p['acc']) for p in vh[-k:]
+                             if p.get('acc') is not None]
+                if tail_vals:
+                    tail_scores.append(sum(tail_vals) / len(tail_vals))
+        mean_score = ((sum(tail_scores) / len(tail_scores))
+                      if tail_scores else None)
+        mean_final = ((sum(final_scores) / len(final_scores))
+                      if final_scores else None)
         per_lr[f'{lr:g}'] = {
-            'mean_final_val_acc': mean_score,
-            'n_val_points': len(scores),
+            'mean_val_tail_acc': mean_score,
+            'mean_final_val_acc': mean_final,
+            'val_tail_k': min(tail_ks) if tail_ks else 0,
+            'n_val_points': len(tail_scores),
             'n_cell_runs_failed': n_cell_runs_failed,
         }
         logger.info(
             f'    [tune] {op_name:8s} lr={lr:g}  '
-            f'val_acc={mean_score if mean_score is None else f"{mean_score:.4f}"} '
-            f'({len(scores)} points, {n_cell_runs_failed} failed cells)')
+            f'val_tail_acc='
+            f'{mean_score if mean_score is None else f"{mean_score:.4f}"} '
+            f'(final='
+            f'{mean_final if mean_final is None else f"{mean_final:.4f}"}, '
+            f'{len(tail_scores)} points, {n_cell_runs_failed} failed cells)')
         # Strictly-greater: ties keep the earlier (user-order) lr.
         if mean_score is not None and (best_score is None
                                        or mean_score > best_score):
             best_score = mean_score
             best_lr = lr
 
+    selected_final = (per_lr.get(f'{best_lr:g}', {})
+                      .get('mean_final_val_acc'))
     return best_lr, {
         'op': op_name,
         'selected_lr': best_lr,
         'selected_lr_mean_val_acc': best_score,
+        'selected_lr_mean_final_val_acc': selected_final,
+        'selection_statistic': (f'tail mean: mean of the last min(3, n) '
+                                f'validation points per seed, averaged '
+                                f'over seeds'),
+        'val_tail_k': _TUNE_TAIL_K,
         'selection_stream': f'val_monitor_seed+{_VAL_MONITOR_SEED_OFFSET}',
         'tune_seeds': n_seeds,
         'tune_val_every': tune_val_every,
         'lr_grid': per_lr,
-        'note': ('Learning rate selected by held-out validation accuracy '
-                 '(final monitor point), NOT by the headline eval stream; '
-                 'the winning lr is then re-trained with the full seed '
-                 'count. Ties keep the earlier/lower lr.'),
+        'note': ('Learning rate selected by the held-out validation '
+                 'accuracy PLATEAU (tail mean, not a single final point), '
+                 'and never by the headline eval stream; the winning lr is '
+                 'then re-trained with the full seed count. Ties keep the '
+                 'earlier/lower lr.'),
     }
 
 
@@ -3035,6 +3069,349 @@ def _paired_one_sided_t(diffs):
     return {'n_pairs': n, 'mean_diff': mean_diff,
             't_stat': mean_diff / (sd / math.sqrt(n)),
             'all_positive': all(d > 0 for d in diffs)}
+
+
+_HYPOTHESIS_STATUSES = ('supported', 'contradicted', 'not_supported',
+                        'not_computable', 'not_applicable')
+
+
+def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
+    """Machine-readable verdicts for the pre-registered hypotheses.
+
+    The repository already records WHAT each cell was testing
+    (``TASK_HYPOTHESES`` / ``OPERATOR_HYPOTHESES``), but before this
+    function a reader had to interpret the numbers by hand. Each verdict
+    below applies a rule fixed in code, reports its evidence, and uses one
+    of five statuses:
+
+      * ``supported``      — the prediction's signature is present;
+      * ``contradicted``   — the falsification condition fired;
+      * ``not_supported``  — the data are inconclusive (no significant
+                             effect either way);
+      * ``not_computable`` — required rows/statistics are missing;
+      * ``not_applicable`` — the row is a tuned comparison reference, so
+                             a superiority check does not apply to it.
+
+    Checks (all pre-registered):
+
+    1. ``linear_chance_control``: the memoryless ``linear`` baseline must
+       stay at chance. Contradicted if it is significantly ABOVE chance in
+       any cell (the task would then be solvable without token mixing,
+       confounding the memory claim).
+    2. ``kda_nkv_monotonicity``: KDA accuracy is predicted to degrade as
+       the number of key-value pairs grows. Supported when accuracy is
+       non-increasing over the swept n_kv values; contradicted when a
+       higher n_kv unanimously improves every paired seed.
+    3. ``beats_tuned_baseline``: every complex operator must beat the
+       TUNED simple baseline on the seed-paired one-sided test before a
+       superiority claim is allowed. A cell is contradicted only when the
+       REVERSE paired test (reference - candidate) is itself significant,
+       so absence of evidence is not mislabelled as refutation.
+
+    Returns ``(checks, counts)``: the per-rule verdict records and the
+    per-row primary-status counts embedded in the run metadata.
+    """
+    def _cell(r):
+        return f"{r.get('task', 'mqar')}/n_kv={r['n_kv']}"
+
+    checks = OrderedDict()
+    per_row = {}
+
+    def _assign(r, name, verdict):
+        per_row.setdefault(id(r), OrderedDict())[name] = verdict
+
+    # ------------------------------------------------------------------
+    # 1. Memoryless linear control.
+    # ------------------------------------------------------------------
+    linear_rows = [r for r in all_results
+                   if r.get('op') == 'linear' and 'error' not in r
+                   and r.get('mean_acc') is not None]
+    evidence = []
+    contradicted_cells = []
+    for r in linear_rows:
+        chance = r.get('chance_acc')
+        sig = bool(r.get('significant_bonferroni'))
+        above = chance is not None and r['mean_acc'] > chance
+        cell_verdict = ('contradicted' if (sig and above)
+                        else 'supported')
+        rec = {
+            'cell': _cell(r),
+            'mean_acc': float(r['mean_acc']),
+            'chance_acc': chance,
+            't_stat_vs_chance': r.get('t_stat_vs_chance'),
+            'significant_bonferroni': sig,
+            'prediction_holds': not (sig and above),
+        }
+        evidence.append(rec)
+        if cell_verdict == 'contradicted':
+            contradicted_cells.append(_cell(r))
+        _assign(r, 'linear_chance_control', {
+            'rule': ('linear must NOT be significantly above chance '
+                     '(otherwise the task is solvable without token mixing)'),
+            'status': cell_verdict,
+            'falsified': cell_verdict == 'contradicted',
+            'evidence': rec,
+        })
+    if not linear_rows:
+        status = 'not_computable'
+    elif contradicted_cells:
+        status = 'contradicted'
+    else:
+        status = 'supported'
+    checks['linear_chance_control'] = {
+        'rule': ('linear must NOT be significantly above chance '
+                 '(otherwise the task is solvable without token mixing)'),
+        'status': status,
+        'falsified': status == 'contradicted',
+        'n_cells': len(linear_rows),
+        'n_contradicting_cells': len(contradicted_cells),
+        'contradicting_cells': contradicted_cells,
+        'evidence': evidence,
+    }
+
+    # ------------------------------------------------------------------
+    # 2. KDA accuracy degrades with n_kv.
+    # ------------------------------------------------------------------
+    kda_by_task = OrderedDict()
+    for r in all_results:
+        if r.get('op') != 'kda' or 'error' in r:
+            continue
+        if r.get('mean_acc') is None:
+            continue
+        kda_by_task.setdefault(r.get('task', 'mqar'), []).append(r)
+    pair_evidence = []
+    monotone = True
+    unanimous_increase = []
+    for task, rows in kda_by_task.items():
+        rows = sorted(rows, key=lambda x: x['n_kv'])
+        for lo, hi in zip(rows, rows[1:]):
+            base = {s['seed']: s['final_acc']
+                    for s in lo.get('per_seed', [])
+                    if 'error' not in s and s.get('final_acc') is not None}
+            cand = {s['seed']: s['final_acc']
+                    for s in hi.get('per_seed', [])
+                    if 'error' not in s and s.get('final_acc') is not None}
+            common = sorted(set(base) & set(cand))
+            diffs = [cand[s] - base[s] for s in common]
+            mean_diff = (sum(diffs) / len(diffs)) if diffs else None
+            all_up = bool(diffs) and all(d > 1e-12 for d in diffs)
+            all_down = bool(diffs) and all(d < -1e-12 for d in diffs)
+            rec = {
+                'task': task,
+                'n_kv_low': int(lo['n_kv']),
+                'n_kv_high': int(hi['n_kv']),
+                'mean_acc_low': float(lo['mean_acc']),
+                'mean_acc_high': float(hi['mean_acc']),
+                'mean_diff_high_minus_low': mean_diff,
+                'n_pairs': len(common),
+                'all_paired_seeds_increase': all_up,
+                'all_paired_seeds_decrease': all_down,
+            }
+            pair_evidence.append(rec)
+            if mean_diff is None or mean_diff > 1e-12:
+                monotone = False
+            if all_up:
+                unanimous_increase.append(
+                    f"{task}: n_kv {lo['n_kv']}->{hi['n_kv']}")
+    if len(pair_evidence) == 0:
+        kda_status = 'not_computable'
+    elif unanimous_increase:
+        kda_status = 'contradicted'
+    elif monotone:
+        kda_status = 'supported'
+    else:
+        kda_status = 'not_supported'
+    kda_verdict = {
+        'rule': ('KDA mean accuracy must be non-increasing across the swept '
+                 'n_kv values; a unanimous paired increase at higher n_kv '
+                 'refutes the capacity-degradation prediction'),
+        'status': kda_status,
+        'falsified': kda_status == 'contradicted',
+        'unanimous_increases': unanimous_increase,
+        'evidence': pair_evidence,
+    }
+    checks['kda_nkv_monotonicity'] = kda_verdict
+    for rows in kda_by_task.values():
+        for r in rows:
+            _assign(r, 'kda_nkv_monotonicity', kda_verdict)
+
+    # ------------------------------------------------------------------
+    # 3. Complex operators vs the tuned simple baseline.
+    # ------------------------------------------------------------------
+    ref_by_cell = {
+        (r.get('task', 'mqar'), r['n_kv']): r
+        for r in all_results
+        if r.get('op') == baseline_ref and 'error' not in r
+        and r.get('mean_acc') is not None
+    }
+    candidates = [r for r in all_results
+                  if 'error' not in r and r.get('op') not in set(baseline_ops)
+                  and r.get('mean_acc') is not None]
+    n_reverse_tests = sum(
+        1 for r in candidates
+        if ref_by_cell.get((r.get('task', 'mqar'), r['n_kv'])) is not None)
+    reverse_alpha = (0.05 / n_reverse_tests) if n_reverse_tests else None
+    complex_evidence = []
+    for r in candidates:
+        key = _cell(r)
+        if r.get('beats_tuned_baseline') is True:
+            verdict = {
+                'rule': ('complex op must beat the TUNED simple baseline '
+                         'on the seed-paired one-sided test'),
+                'status': 'supported',
+                'falsified': False,
+                'evidence': {
+                    'cell': key,
+                    'reference_op': baseline_ref,
+                    'vs_tuned_baseline': r.get('vs_tuned_baseline'),
+                },
+            }
+            _assign(r, 'beats_tuned_baseline', verdict)
+            complex_evidence.append(('supported', key, r.get('op')))
+            continue
+        ref = ref_by_cell.get((r.get('task', 'mqar'), r['n_kv']))
+        if ref is None:
+            verdict = {
+                'rule': ('complex op must beat the TUNED simple baseline '
+                         'on the seed-paired one-sided test'),
+                'status': 'not_computable',
+                'falsified': False,
+                'evidence': {'cell': key,
+                             'reason': 'reference_row_unavailable'},
+            }
+            _assign(r, 'beats_tuned_baseline', verdict)
+            complex_evidence.append(('not_computable', key, r.get('op')))
+            continue
+            verdict = {
+                'rule': ('complex op must beat the TUNED simple baseline '
+                         'on the seed-paired one-sided test'),
+                'status': 'not_computable',
+                'falsified': False,
+                'evidence': {'cell': key,
+                             'reason': 'missing_reference_or_paired_seeds'},
+            }
+            _assign(r, 'beats_tuned_baseline', verdict)
+            complex_evidence.append(('not_computable', key, r.get('op')))
+            continue
+        cand = {s['seed']: s['final_acc']
+                for s in r.get('per_seed', [])
+                if 'error' not in s and s.get('final_acc') is not None}
+        base = {s['seed']: s['final_acc']
+                for s in ref.get('per_seed', [])
+                if 'error' not in s and s.get('final_acc') is not None}
+        common = sorted(set(cand) & set(base))
+        if len(common) < 2:
+            verdict = {
+                'rule': ('complex op must beat the TUNED simple baseline '
+                         'on the seed-paired one-sided test'),
+                'status': 'not_computable',
+                'falsified': False,
+                'evidence': {'cell': key, 'n_pairs': len(common),
+                             'reason': 'insufficient_paired_seeds'},
+            }
+            _assign(r, 'beats_tuned_baseline', verdict)
+            complex_evidence.append(('not_computable', key, r.get('op')))
+            continue
+        reverse = _paired_one_sided_t([base[s] - cand[s] for s in common])
+        crit = (_bonferroni_crit_q(reverse['n_pairs'], alpha=reverse_alpha)
+                if (reverse_alpha is not None
+                    and reverse['n_pairs'] >= 2) else None)
+        ref_better = False
+        if reverse['mean_diff'] is not None and reverse['mean_diff'] > 0:
+            if (reverse['t_stat'] is not None and crit is not None
+                    and reverse['t_stat'] > crit):
+                ref_better = True
+            elif (reverse['t_stat'] is None and reverse['all_positive']
+                  and reverse['n_pairs'] >= 2 and reverse_alpha is not None
+                  and 2.0 ** (-(reverse['n_pairs'] - 1)) <= reverse_alpha):
+                ref_better = True
+        status = 'contradicted' if ref_better else 'not_supported'
+        verdict = {
+            'rule': ('complex op must beat the TUNED simple baseline; a '
+                     'significant REVERSE paired test refutes superiority '
+                     '(failure to beat is only "not_supported")'),
+            'status': status,
+            'falsified': status == 'contradicted',
+            'evidence': {
+                'cell': key,
+                'reference_op': baseline_ref,
+                'reverse_mean_diff_reference_minus_op':
+                    reverse['mean_diff'],
+                'reverse_t_stat': reverse['t_stat'],
+                'reverse_t_crit_bonferroni': crit,
+                'reverse_alpha_bonferroni': reverse_alpha,
+                'n_pairs': reverse['n_pairs'],
+                'vs_tuned_baseline': r.get('vs_tuned_baseline'),
+            },
+        }
+        _assign(r, 'beats_tuned_baseline', verdict)
+        complex_evidence.append((status, key, r.get('op')))
+
+    complex_statuses = [s for s, _, _ in complex_evidence]
+    if not complex_statuses:
+        complex_status = 'not_computable'
+    elif all(s == 'not_computable' for s in complex_statuses):
+        complex_status = 'not_computable'
+    elif 'contradicted' in complex_statuses:
+        complex_status = 'contradicted'
+    elif all(s == 'supported' for s in complex_statuses):
+        complex_status = 'supported'
+    else:
+        complex_status = 'not_supported'
+    checks['beats_tuned_baseline'] = {
+        'rule': ('every complex operator must beat the tuned simple '
+                 'baseline, seed-paired; a significant reverse test '
+                 'contradicts superiority'),
+        'status': complex_status,
+        'falsified': complex_status == 'contradicted',
+        'reference_op': baseline_ref,
+        'reverse_alpha_bonferroni': reverse_alpha,
+        'n_reverse_tests': n_reverse_tests,
+        'per_cell': [
+            {'status': s, 'cell': cell, 'op': op}
+            for s, cell, op in complex_evidence
+        ],
+    }
+
+    # Attach a compact primary status per row (first applicable check) so
+    # downstream consumers get one machine-readable field without having
+    # to know the check list.
+    for r in all_results:
+        applicable = per_row.get(id(r)) or OrderedDict()
+        if 'error' in r:
+            r['hypothesis_checks'] = {
+                'row': {'status': 'not_computable', 'rule': 'row_error',
+                        'falsified': False,
+                        'evidence': {'error': r.get('error')}}}
+            r['hypothesis_status'] = 'not_computable'
+            continue
+        if not applicable and r.get('op') in set(baseline_ops):
+            r['hypothesis_checks'] = {
+                'reference_baseline': {
+                    'rule': ('this row IS the tuned comparison reference; '
+                             'no superiority claim applies to it'),
+                    'status': 'not_applicable',
+                    'falsified': False,
+                    'evidence': {'op': r.get('op')},
+                }}
+            r['hypothesis_status'] = 'not_applicable'
+            continue
+        r['hypothesis_checks'] = applicable
+        statuses = [v.get('status') for v in applicable.values()]
+        if 'contradicted' in statuses:
+            r['hypothesis_status'] = 'contradicted'
+        elif 'not_supported' in statuses:
+            r['hypothesis_status'] = 'not_supported'
+        elif statuses and all(s == 'supported' for s in statuses):
+            r['hypothesis_status'] = 'supported'
+        else:
+            r['hypothesis_status'] = 'not_computable'
+
+    counts = {s: 0 for s in _HYPOTHESIS_STATUSES}
+    for r in all_results:
+        counts[r.get('hypothesis_status', 'not_computable')] = (
+            counts.get(r.get('hypothesis_status', 'not_computable'), 0) + 1)
+    return checks, counts
 
 
 def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
@@ -3662,7 +4039,7 @@ def main():
     baseline_tuning = {}
     if baseline_tune_enabled and baseline_ops:
         tune_seeds = parse_int_env('MQAR_BASELINE_TUNE_SEEDS',
-                                   min(n_seeds, 2),
+                                   min(n_seeds, 3),
                                    min_value=1, logger=logger)
         logger.info('\n' + '=' * 70)
         logger.info('Tuned-baseline protocol: selecting baseline lr on the '
@@ -4041,6 +4418,22 @@ def main():
                   f"{_fmt_tstat(st.get('t_stat'), width=7, prec=2)} | "
                   f"{'YES' if st.get('significant') else 'no'}"
                   f" ({st.get('verdict')})")
+
+    # ------------------------------------------------------------------
+    # Machine-readable verdicts for the pre-registered hypotheses.
+    # Each row gets ``hypothesis_checks`` (per-rule evidence + status) and
+    # a compact ``hypothesis_status``; the metadata records the aggregate
+    # counts. The rules are fixed in code BEFORE the numbers are read.
+    # ------------------------------------------------------------------
+    hypothesis_verdicts, hypothesis_counts = _hypothesis_verdicts(
+        all_results, baseline_ops, baseline_ref)
+    logger.info(
+        '  hypothesis verdicts: '
+        + ', '.join(f'{k}={v}' for k, v in hypothesis_counts.items())
+        + ' (row counts)')
+    for name, rec in hypothesis_verdicts.items():
+        logger.info(f'    [hypothesis] {name}: {rec["status"]}'
+                    + (' (FALSIFIED)' if rec.get('falsified') else ''))
 
     # ------------------------------------------------------------------
     # Seed-paired ALL-PAIRS operator comparisons (Holm-corrected).
@@ -4547,6 +4940,25 @@ def main():
                          'beats_tuned_baseline=True (paired, Bonferroni); '
                          'a row significant vs chance but not vs the tuned '
                          'baseline only shows the task is learnable.'),
+            },
+            # Machine-readable rule application for the hypotheses above.
+            # Every result row also carries its own ``hypothesis_status``
+            # and ``hypothesis_checks`` (rule + status + evidence).
+            'hypothesis_verdicts': {
+                'checks': hypothesis_verdicts,
+                'row_status_counts': hypothesis_counts,
+                'statuses': list(_HYPOTHESIS_STATUSES),
+                'accessor': ('per-row `hypothesis_status` (one of '
+                             f'{list(_HYPOTHESIS_STATUSES)}) and '
+                             '`hypothesis_checks` (per-rule status + '
+                             'numeric evidence)'),
+                'note': ('Verdicts are computed by fixed code rules, not '
+                         'assigned by hand: contradicted only when the '
+                         'pre-registered falsification condition fires '
+                         '(a significant effect in the predicted-wrong '
+                         'direction), not_supported when the test is '
+                         'inconclusive, not_computable when rows or paired '
+                         'seeds are missing.'),
             },
             'significance_scope': (
                 'vs_chance_baseline_and_seed_paired_vs_tuned_reference_'

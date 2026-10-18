@@ -1,8 +1,18 @@
 """
 LM training for the KDA+CSA+HCA hybrid, built on ``ops_fused``.
 
-The model uses ``HybridKCHAttention`` from ``ops_fused.py``, which already
-implements:
+Architecture contrast (``--arch``): ``hybrid`` (default) trains the
+recurrent/retrieval stack below; ``softmax`` trains a MATCHED dense causal
+attention baseline (same width/depth, data, optimizer, token budget,
+weight tying and embedding scale) through the same training loop. The two
+share ``build_lm_model`` so the overfit gate, the real run and checkpoint
+reload cannot silently build different architectures. ``LM_HYPOTHESES``
+pre-registers the comparison (quality at matched budget + decode-state
+efficiency) and every run record embeds it before the sealed test split is
+opened.
+
+The hybrid model uses ``HybridKCHAttention`` from ``ops_fused.py``, which
+already implements:
 - KDA with proper unit-norm q/k, g clamp, chunked path, conv lookback
 - CSA with overlapped 2-branch compression, STE for indexer, sink logits
 - HCA with heavy compression + dense + sliding window
@@ -985,6 +995,203 @@ class LMWithHybrid(nn.Module):
                                    labels.reshape(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss}
 
+
+class _DenseSoftmaxStack(nn.Module):
+    """Dense causal-softmax stack with the interface the LM loop expects.
+
+    The training loop resets recurrent state before every micro-step
+    (``model.hybrid.reset_state()``) and prints the layout
+    (``model.hybrid.layout_str()``); this wrapper provides both so the
+    softmax baseline is a drop-in architecture for the SAME loop without
+    special-casing call sites. Attention is stateless, so ``reset_state``
+    is a no-op.
+    """
+
+    def __init__(self, d_model: int, n_layers: int, n_heads: int = 4):
+        super().__init__()
+        from run_quality import ResidualAttnLayer, SoftmaxAttn
+        if n_heads < 1 or d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model={d_model} must be divisible by n_heads={n_heads}")
+        head_dim = d_model // n_heads
+        self.n_layers = int(n_layers)
+        self.layers = nn.ModuleList([
+            ResidualAttnLayer(
+                SoftmaxAttn(d_model, H=n_heads, K=head_dim, V=head_dim),
+                d_model)
+            for _ in range(self.n_layers)
+        ])
+
+    def reset_state(self):
+        return None
+
+    def layout_str(self):
+        return '-'.join(['SOFTMAX'] * self.n_layers)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class SoftmaxBaselineLM(nn.Module):
+    """Dense causal-softmax LM: the simplest real token-mixing baseline.
+
+    Matched to ``LMWithHybrid`` on embedding/head tying, embedding scale,
+    final norm and position-less sequence mixing, so a hybrid-vs-baseline
+    comparison changes ONLY the mixing architecture (the scientific
+    contrast), not the tokenizer, data, optimizer, budget or parameter
+    tying. Softmax attention is stateless: decode cost grows with context
+    (KV cache), unlike the recurrent hybrid's constant-size state — that
+    is exactly one of the pre-registered predictions
+    (``LM_HYPOTHESES['decode_state_efficiency']``).
+    """
+
+    def __init__(self, vocab_size, cfg: HybridConfig, n_heads: int = 4,
+                 embed_scale=None, d_model=None):
+        super().__init__()
+        if cfg.layout is not None:
+            total_layers = len(cfg.layout)
+        else:
+            total_layers = cfg.n_kda + cfg.n_csa + cfg.n_hca
+        # Default: matched WIDTH (cfg.d_model). An explicit ``d_model``
+        # supports the optional parameter-matched control (the dense
+        # baseline is otherwise larger than the hybrid at equal width).
+        self.d_model = int(d_model if d_model is not None else cfg.d_model)
+        self.embed = nn.Embedding(vocab_size, self.d_model)
+        self.hybrid = _DenseSoftmaxStack(self.d_model, total_layers,
+                                         n_heads=n_heads)
+        self.norm_f = nn.LayerNorm(self.d_model)
+        self.lm_head = nn.Linear(self.d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+        nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
+        if embed_scale is None:
+            embed_scale = math.sqrt(self.d_model)
+        if (not isinstance(embed_scale, (int, float))
+                or not math.isfinite(embed_scale) or embed_scale <= 0):
+            raise ValueError(
+                f"embed_scale must be a positive finite number, got "
+                f"{embed_scale!r}.")
+        self.embed_scale = float(embed_scale)
+        # The baseline has no recurrent stack to checkpoint, so keep the
+        # attribute for parity with LMWithHybrid (and to make the recorded
+        # recipe explicit).
+        self.ckpt_policy = 'none'
+
+    def forward(self, input_ids, labels=None):
+        x = self.embed(input_ids) * self.embed_scale
+        x = self.hybrid(x)
+        x = self.norm_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   labels.reshape(-1), ignore_index=-100)
+        return {"logits": logits, "loss": loss}
+
+
+def build_lm_model(arch, vocab_size, cfg: HybridConfig, ckpt_policy=None,
+                   d_model=None):
+    """Construct the pre-registered LM architecture.
+
+    ``hybrid`` is the KDA/CSA/HCA attention stack; ``softmax`` is the
+    matched dense causal-attention baseline. Keeping the choice in ONE
+    factory guarantees the overfit gate, the real model and checkpoint
+    reload all build the same architecture.
+    """
+    if arch in ('hybrid', 'kda', 'mamba2', 'rwkv7'):
+        if d_model is not None:
+            raise ValueError(
+                "d_model override applies only to the softmax baseline")
+        return LMWithHybrid(vocab_size, cfg, ckpt_policy=ckpt_policy)
+    if arch in ('softmax', 'dense'):
+        if ckpt_policy not in (None, 'none'):
+            raise ValueError(
+                f"arch={arch!r} has no recurrent stack to checkpoint; "
+                f"got ckpt_policy={ckpt_policy!r}.")
+        return SoftmaxBaselineLM(vocab_size, cfg, d_model=d_model)
+    raise ValueError(
+        f"unknown arch={arch!r}; expected 'hybrid' or 'softmax'.")
+
+
+def _param_matched_softmax_width(vocab_size, cfg: HybridConfig,
+                                 target_params, n_heads=4):
+    """Smallest-width dense baseline closest to ``target_params``.
+
+    Width (``d_model``) is the only free baseline dimension that preserves
+    the matched depth/data/optimizer/budget protocol. Parameter counts are
+    monotone in width, so a binary search over ``d_model = k * n_heads``
+    finds the closest match; both the requested target and the achieved
+    count are recorded in the run record. Returns ``(d_model, n_params)``.
+    """
+    if not isinstance(target_params, int) or target_params <= 0:
+        raise ValueError(
+            f"target_params must be a positive int, got {target_params!r}")
+
+    def build(d):
+        return SoftmaxBaselineLM(vocab_size, cfg, n_heads=n_heads,
+                                 d_model=d)
+
+    def n_params(d):
+        return count_params(build(d))
+
+    k_lo, k_hi = 1, max(4, cfg.d_model // n_heads * 4)
+    while n_params(k_hi * n_heads) < target_params:
+        k_hi *= 2
+    while k_lo < k_hi:
+        k_mid = (k_lo + k_hi) // 2
+        if n_params(k_mid * n_heads) < target_params:
+            k_lo = k_mid + 1
+        else:
+            k_hi = k_mid
+    candidates = [k for k in (k_lo - 1, k_lo, k_lo + 1) if k >= 1]
+    best_k = min(candidates,
+                 key=lambda k: abs(n_params(k * n_heads) - target_params))
+    d = best_k * n_heads
+    return d, n_params(d)
+
+
+# Pre-registered LM-scale hypotheses. These are recorded in every run
+# record BEFORE the test split is opened, so the comparison cannot be
+# re-framed after seeing the numbers. Verdicts are computed by the
+# multi-seed analysis over matched-budget runs (hybrid vs softmax), not
+# asserted per single run.
+LM_HYPOTHESES = OrderedDict([
+    ('matched_budget_quality', {
+        'hypothesis': (
+            'At matched width/depth, step/token budget, data and optimizer '
+            'settings, the KDA/CSA/HCA hybrid matches the dense '
+            'causal-softmax LM on held-out token loss.'),
+        'prediction': (
+            'Paired-seed test perplexity difference (hybrid - softmax) is '
+            'within the paired 95% CI of zero, or the hybrid is better. '
+            'By default width/depth are matched and the dense baseline is '
+            'typically the LARGER model (a hybrid win is then conservative); '
+            'parameter counts are always recorded, and '
+            '--match_baseline_params shrinks the baseline width to match '
+            'them for a strict equal-parameter control.'),
+        'falsified_if': (
+            'The hybrid is worse than the softmax baseline by more than the '
+            'paired 95% CI at the matched budget.'),
+        'status_rule': ('paired test perplexity over seeds, matched budget '
+                        '(hybrid vs softmax)'),
+    }),
+    ('decode_state_efficiency', {
+        'hypothesis': (
+            'The recurrent hybrid decodes with constant-size state, whereas '
+            'dense softmax attention grows a KV cache with context.'),
+        'prediction': (
+            'Hybrid decode bytes/token are flat in context length and lower '
+            'than the softmax baseline at long context.'),
+        'falsified_if': (
+            'Hybrid decode bytes/token grow with context or are not lower '
+            'than the softmax baseline at the longest measured context.'),
+        'status_rule': ('measured decode cache bytes/token vs context '
+                        'length (exp3_kv_cache / decode consistency)'),
+    }),
+])
+
+
 def count_params(m):
     seen = set()
     total = 0
@@ -1246,7 +1453,14 @@ def run_checkpoint_consistency(path, device, seed=1234):
         # torch < 2.0 has no ``weights_only`` kwarg.
         ckpt = torch.load(path, map_location='cpu')
     cfg = HybridConfig(**ckpt['cfg'])
-    model = LMWithHybrid(int(ckpt['vocab']), cfg)
+    arch = ckpt.get('arch', 'hybrid')
+    if arch == 'softmax':
+        raise SystemExit(
+            "checkpoint arch='softmax' is stateless: the prefill-decode "
+            "consistency probe applies only to the recurrent hybrid.")
+    model = build_lm_model(
+        arch, int(ckpt['vocab']), cfg,
+        d_model=ckpt.get('model_d_model') if arch == 'softmax' else None)
     model.load_state_dict(ckpt['model'])
     model.to(device).eval()
     return run_decode_consistency_probe(
@@ -1315,6 +1529,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kaggle", action="store_true")
     parser.add_argument("--autodl", action="store_true")
+    parser.add_argument("--arch", choices=("hybrid", "softmax"),
+                        default="hybrid",
+                        help="LM architecture: 'hybrid' (KDA/CSA/HCA stack) "
+                             "or 'softmax' (matched dense causal-attention "
+                             "baseline; the pre-registered control). "
+                             "Default: hybrid.")
+    parser.add_argument("--match_baseline_params", action="store_true",
+                        help="Only with --arch softmax: choose the baseline "
+                             "width so its parameter count matches the "
+                             "hybrid's at the same depth (default: matched "
+                             "WIDTH/depth instead; the dense baseline is "
+                             "then larger, which is conservative for a "
+                             "hybrid win). The target/achieved parameter "
+                             "counts and widths are recorded.")
+    parser.add_argument("--max_docs", type=int, default=0,
+                        help="Cap the raw corpus at this many documents BEFORE "
+                             "cleaning/splitting (0 = the recipe default "
+                             "budget). Useful for smoke runs; the cap is "
+                             "recorded in the data record.")
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -1469,7 +1702,10 @@ def main():
         raise SystemExit("--error_analysis_examples must be >= 0")
     if args.ppl_bootstrap_nboot < 0:
         raise SystemExit("--ppl_bootstrap_nboot must be >= 0 (0 disables)")
+    if args.max_docs < 0:
+        raise SystemExit("--max_docs must be >= 0")
 
+    arch = args.arch
     is_kaggle = args.kaggle or os.path.exists("/kaggle")
     info = configure_torch_for_device()
     device = info.device
@@ -1493,7 +1729,13 @@ def main():
         return
 
     if HAS_HF:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        except Exception as e:
+            print(f"[train_lm_autodl] GPT-2 tokenizer load failed ({e}); "
+                  "using the char-level fallback tokenizer over synthetic "
+                  "text")
+            tokenizer = _FallbackCharTokenizer()
     else:
         print("[train_lm_autodl] transformers not installed; using the "
               "char-level fallback tokenizer over synthetic text "
@@ -1558,6 +1800,34 @@ def main():
     if args.max_steps is not None:
         max_steps = args.max_steps
 
+    # Optional parameter-matched control: the dense baseline is LARGER than
+    # the hybrid at equal width, so by default we match width/depth and
+    # report the asymmetry. This flag instead shrinks the baseline's width
+    # until the parameter counts match (depth/data/budget unchanged).
+    baseline_d_model = None
+    param_match = None
+    if args.match_baseline_params and arch != 'softmax':
+        raise SystemExit(
+            "--match_baseline_params requires --arch softmax")
+    if args.match_baseline_params:
+        target_params = count_params(LMWithHybrid(vocab_size, cfg))
+        baseline_d_model, achieved = _param_matched_softmax_width(
+            vocab_size, cfg, target_params)
+        param_match = {
+            'enabled': True,
+            'target_model': 'hybrid',
+            'target_params': int(target_params),
+            'achieved_params': int(achieved),
+            'relative_error': (abs(achieved - target_params)
+                               / max(1, target_params)),
+            'hybrid_d_model': int(cfg.d_model),
+            'baseline_d_model': int(baseline_d_model),
+            'depth': ('cfg.layout' if cfg.layout is not None
+                      else 'n_kda+n_csa+n_hca'),
+        }
+        print(f"Param-matched baseline: d_model={baseline_d_model} "
+              f"({achieved/1e6:.2f}M) vs hybrid {target_params/1e6:.2f}M")
+
     if cfg.layout is not None:
         layout_str = '-'.join(k.upper() for k in cfg.layout)
         print(f"Hybrid layout: explicit {len(cfg.layout)} layers "
@@ -1580,6 +1850,8 @@ def main():
     train_budget = 20000 if not is_kaggle else 5000
     train_frac = 1.0 - args.val_frac - args.test_frac
     corpus_budget = int(math.ceil(train_budget / train_frac))
+    if args.max_docs:
+        corpus_budget = min(corpus_budget, int(args.max_docs))
     raw_texts, data_source = _load_raw_texts(corpus_budget, split="train")
     cleaning = clean_lm_texts(raw_texts, tokenizer, seq_len,
                               dedup_windows=bool(args.dedup_windows))
@@ -1663,8 +1935,9 @@ def main():
               f"fixed batch of {int(overfit_batch['input_ids'].shape[0])} "
               f"sequence(s) (weight_decay=0, no dropout/augmentation)...")
         overfit_report = run_overfit_sanity_check(
-            lambda: LMWithHybrid(vocab_size, cfg,
-                                 ckpt_policy=args.ckpt_policy),
+            lambda: build_lm_model(arch, vocab_size, cfg,
+                                   ckpt_policy=args.ckpt_policy,
+                                   d_model=baseline_d_model),
             overfit_batch, device,
             steps=args.overfit_steps, lr=args.overfit_lr, seed=args.seed,
             loss_ratio_threshold=args.overfit_loss_ratio)
@@ -1692,10 +1965,15 @@ def main():
     # Re-seed right before the real model is constructed so its init is
     # identical to a run where the gate never ran.
     set_global_seed(args.seed, deterministic=True)
-    model = LMWithHybrid(vocab_size, cfg,
-                         ckpt_policy=args.ckpt_policy).to(device)
+    model = build_lm_model(arch, vocab_size, cfg,
+                           ckpt_policy=args.ckpt_policy,
+                           d_model=baseline_d_model).to(device)
+    if baseline_d_model is not None and model.embed.embedding_dim \
+            != baseline_d_model:
+        raise RuntimeError('baseline width override was not applied')
     params_count = count_params(model)
     print(f"Params: {params_count/1e6:.2f}M")
+    print(f"Arch: {arch}")
     print(f"Layout: {model.hybrid.layout_str()}")
 
     no_decay_ids = set()
@@ -1737,6 +2015,9 @@ def main():
     # Hyperparameters are captured ONCE here and embedded in every
     # checkpoint / run record so no artifact is ambiguous about its recipe.
     hyperparams = {
+        'arch': arch,
+        'model_d_model': int(model.embed.embedding_dim),
+        'param_match': param_match,
         'optimizer': 'AdamW',
         'lr': 3e-4,
         'weight_decay_decay_group': 0.1,
@@ -1854,6 +2135,10 @@ def main():
         """
         payload = {
             "model": model.state_dict(),
+            "arch": arch,
+            # Actual model width (differs from cfg.d_model only for the
+            # parameter-matched softmax control).
+            "model_d_model": int(model.embed.embedding_dim),
             "cfg": cfg.__dict__,
             "vocab": vocab_size,
             "optimizer_step": optimizer_step,
@@ -2250,9 +2535,12 @@ def main():
               f"(clip at {gradient_norms['clip_norm']})")
     run_record = {
         "kind": "train_lm_autodl",
+        "arch": arch,
         "created_utc": created_utc,
         "elapsed_s": elapsed,
         "seed": args.seed,
+        # Pre-registered before the sealed test split is opened.
+        "hypotheses": LM_HYPOTHESES,
         "seed_info": seed_info,
         "provenance": provenance,
         "hyperparameters": hyperparams,
@@ -2330,15 +2618,20 @@ def main():
     # fingerprints, artifact paths and final results, plus a training-curve
     # digest. Recording is automatic; nothing is tracked by hand.
     consistency_path = None
-    if not args.skip_consistency_check:
+    if not args.skip_consistency_check and arch == 'hybrid':
         # Probing the val-selected weights (the model currently in memory
         # for the test evaluation), so the audit matches the checkpoint
-        # the test number was produced with.
+        # the test number was produced with. The stateless softmax
+        # baseline has no recurrent state to reconcile, so the probe is
+        # not applicable (recorded as null).
         report = run_decode_consistency_probe(
             model, device, seq_len, args.output_dir, seed=args.seed)
         _print_consistency_report(report, title="best_val_lm.pt")
         consistency_path = os.path.join(args.output_dir,
                                         "decode_consistency.json")
+    elif arch != 'hybrid' and not args.skip_consistency_check:
+        print("[consistency] skipped: stateless softmax baseline has no "
+              "prefill/decode state to reconcile")
     manifest_entry = make_run_manifest_entry(
         experiment='train_lm_autodl',
         seeds=int(args.seed),

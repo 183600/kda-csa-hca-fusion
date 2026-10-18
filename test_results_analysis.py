@@ -35,6 +35,7 @@ from results_analysis import (  # noqa: E402
 )
 from run_quality import (  # noqa: E402
     _classify_task_errors,
+    _hypothesis_verdicts,
     _paired_one_sided_t,
     train_one,
 )
@@ -608,3 +609,91 @@ def test_analyze_lm_errors_read_only_deterministic_json(capsys):
 
     tok = _FallbackCharTokenizer()
     assert tok.decode(tok.encode('hello world')) == 'hello world'
+
+
+def test_hypothesis_verdicts_are_machine_readable_and_rule_based():
+    """P2-2: pre-registered hypotheses get rule-based, per-row verdicts."""
+    chance = 0.0625
+
+    def row(op, n_kv, seed_accs, *, chance_acc=chance, sig_chance=False,
+            beats=None):
+        mean = sum(seed_accs) / len(seed_accs)
+        r = {
+            'op': op, 'task': 'mqar', 'n_kv': n_kv,
+            'mean_acc': mean, 'chance_acc': chance_acc,
+            'significant_bonferroni': sig_chance,
+            't_stat_vs_chance': 0.0 if not sig_chance else 99.0,
+            'per_seed': [{'seed': 42 + i, 'final_acc': a}
+                         for i, a in enumerate(seed_accs)],
+        }
+        if beats is not None:
+            r['beats_tuned_baseline'] = beats
+            r['vs_tuned_baseline'] = {
+                'reference_op': 'softmax', 'n_pairs': len(seed_accs),
+                'mean_diff': 0.1, 't_stat': None, 'significant': beats,
+                'verdict': ('beats_tuned_baseline' if beats
+                            else 'not_significantly_better'),
+            }
+        return r
+
+    linear = row('linear', 1, [chance, chance])
+    softmax = row('softmax', 1, [0.3, 0.3])
+    kda_low = row('kda', 1, [0.5, 0.5], beats=True)
+    kda_high = row('kda', 2, [0.3, 0.3], beats=True)
+    # Reference is unanimously (8/8) better than hca: the reverse one-sided
+    # exact sign-flip p = 2^-7 = 0.0078 clears alpha=0.05, so the
+    # superiority claim for hca is contradicted (not merely unsupported).
+    hca = row('hca', 1, [0.2] * 8)
+    softmax['per_seed'] = [{'seed': 42 + i, 'final_acc': 0.3}
+                           for i in range(8)]
+    hca['per_seed'] = [{'seed': 42 + i, 'final_acc': 0.2}
+                       for i in range(8)]
+
+    checks, counts = _hypothesis_verdicts(
+        [linear, softmax, kda_low, kda_high, hca],
+        baseline_ops=['linear', 'softmax'], baseline_ref='softmax')
+
+    assert checks['linear_chance_control']['status'] == 'supported'
+    assert checks['kda_nkv_monotonicity']['status'] == 'supported'
+    assert checks['beats_tuned_baseline']['status'] == 'contradicted'
+    assert checks['beats_tuned_baseline']['falsified'] is True
+    # Per-row compact status + per-rule evidence.
+    assert linear['hypothesis_status'] == 'supported'
+    assert softmax['hypothesis_status'] == 'not_applicable'
+    assert kda_high['hypothesis_status'] == 'supported'
+    assert hca['hypothesis_status'] == 'contradicted'
+    assert hca['hypothesis_checks']['beats_tuned_baseline']['falsified'] is True
+    assert counts == {'supported': 3, 'contradicted': 1,
+                      'not_supported': 0, 'not_computable': 0,
+                      'not_applicable': 1}
+    # JSON-safe: the metadata block must serialize into the result file.
+    json.dumps({'checks': checks, 'counts': counts}, allow_nan=False)
+
+
+def test_tune_baseline_lr_selects_on_tail_plateau(monkeypatch):
+    """P2-1: selection uses the converged tail, not one noisy final point."""
+    import run_quality
+
+    curves = {
+        1e-3: [0.9, 0.9, 0.9, 0.1],   # best plateau, unlucky final point
+        1e-2: [0.5, 0.5, 0.5, 0.5],   # worse plateau, good final point
+    }
+
+    def fake_train_multi_seed(op_name, n_seeds=1, steps=10,
+                              softmax_steps=None, device='cpu', lr=3e-3,
+                              **kw):
+        return {'per_seed': [{'val_history': [{'acc': p} for p in curves[lr]]}]}
+
+    monkeypatch.setattr(run_quality, 'train_multi_seed',
+                        fake_train_multi_seed)
+    best, rec = run_quality.tune_baseline_lr(
+        'linear', [1e-3, 1e-2], [('mqar', 1, 16, 16)],
+        steps=10, softmax_steps=10, n_seeds=1, device='cpu',
+        val_every=1, val_batches=1, val_batch=16)
+    assert best == 1e-3
+    assert rec['val_tail_k'] == 3
+    assert 'tail' in rec['selection_statistic']
+    assert rec['selected_lr_mean_val_acc'] == pytest.approx(1.9 / 3)
+    assert rec['selected_lr_mean_final_val_acc'] == pytest.approx(0.1)
+    assert rec['lr_grid']['0.001']['mean_val_tail_acc'] == pytest.approx(1.9 / 3)
+    assert rec['lr_grid']['0.001']['mean_final_val_acc'] == pytest.approx(0.1)

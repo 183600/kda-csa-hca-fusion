@@ -100,7 +100,9 @@ from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, _task_batch_fingerprint,
     _parse_equivalence_margin, SMALL_MODEL_SPEC, analyze_errors,
+    ResidualAttnLayer, NoMixAttn, SoftmaxAttn,
 )
+from results_analysis import multiclass_classification_metrics
 from train_diagnostics import (
     DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
     ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
@@ -131,6 +133,12 @@ _OVERFIT_BATCH_SEED_OFFSET = 3_000_000
 # inconclusive). Registering it here keeps superiority and equivalence
 # verdicts on one pre-declared family.
 CONTRAST_EQUIVALENCE_MARGIN = 0.05
+
+
+def _fmt_num(value, prec: int = 4) -> str:
+    if value is None:
+        return 'n/a'
+    return f'{float(value):.{prec}f}'
 
 
 def _make_cfg(d_model=32, ratio=(3, 1, 1)):
@@ -249,8 +257,10 @@ def _append_ablation_manifest(mode, return_code, n_seeds, steps,
 
 
 def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
-                n_batches=4, batch=64, seed=42, seed_offset=5_000_000):
+                n_batches=4, batch=64, seed=42, seed_offset=5_000_000,
+                collect_predictions=False):
     was_training = {m: m.training for m in (model, head, embed)}
+    preds_all, target_all, scores_all = [], [], []
     try:
         model.eval()
         head.eval()
@@ -275,11 +285,26 @@ def _eval_model(model, head, embed, seq_len, n_kv=1, device='cpu',
                 model.reset_state()
                 h = model(x_emb)
                 logits = head(h, cue_pos)
-                correct += (logits.argmax(-1) == target).sum().item()
+                pred = logits.argmax(-1)
+                correct += (pred == target).sum().item()
                 total += target.numel()
                 losses.append(F.cross_entropy(logits, target).item())
+                if collect_predictions:
+                    preds_all.append(pred.detach().cpu())
+                    target_all.append(target.detach().cpu())
+                    scores_all.append(
+                        torch.softmax(logits.detach().float(), dim=-1).cpu())
         if total == 0 or not losses:
+            if collect_predictions:
+                return 0.0, 0.0, None
             return 0.0, 0.0
+        if collect_predictions:
+            extra = {
+                'pred': torch.cat(preds_all),
+                'target': torch.cat(target_all),
+                'scores': torch.cat(scores_all),
+            }
+            return correct / total, sum(losses) / len(losses), extra
         return correct / total, sum(losses) / len(losses)
     finally:
         for m, was in was_training.items():
@@ -300,14 +325,72 @@ def _build_layout_model(ratio, d_model, device):
     return model, head, embed
 
 
+SIMPLE_BASELINE_KINDS = ('linear', 'softmax')
+
+
+class SimpleBaselineStack(nn.Module):
+    """Simplest-baseline ladder for the matrix: linear or dense softmax.
+
+    ``linear`` stacks identity token mixers (position-wise only; cannot
+    move information across time, so it MUST stay at chance on MQAR if the
+    task really requires memory). ``softmax`` stacks causal dense
+    attention, the standard architecture families are compared against.
+    Both get the SAME outer residual/LayerNorm structure, depth, data
+    stream, optimizer and budget as every hybrid group, so a complex
+    operator that fails to beat them has no demonstrated advantage.
+    """
+
+    def __init__(self, kind: str, d_model: int, total_layers: int):
+        super().__init__()
+        if kind not in SIMPLE_BASELINE_KINDS:
+            raise ValueError(
+                f'SimpleBaselineStack: kind must be one of '
+                f'{SIMPLE_BASELINE_KINDS}, got {kind!r}')
+        self.kind = kind
+        self.total_layers = int(total_layers)
+        layers = []
+        for _ in range(self.total_layers):
+            attn = (NoMixAttn() if kind == 'linear'
+                    else SoftmaxAttn(d_model, H=2, K=16, V=16))
+            layers.append(ResidualAttnLayer(attn, d_model))
+        self.layers = nn.ModuleList(layers)
+
+    def reset_state(self) -> None:
+        pass
+
+    def layout_str(self) -> str:
+        return '-'.join([self.kind.upper()] * self.total_layers)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def build_simple_baseline_groups(total_layers: int) -> list:
+    """Baseline matrix groups (same depth/outer structure as the hybrids)."""
+    groups = []
+    for kind in SIMPLE_BASELINE_KINDS:
+        layout = (kind,) * int(total_layers)
+        desc = (f'{kind} baseline: {total_layers} x '
+                f'{"identity mixer" if kind == "linear" else "causal dense softmax attention"} '
+                f'(same depth/training recipe as the hybrid groups)')
+        groups.append((f'BASELINE-{kind}', kind, layout, desc))
+    return groups
+
+
 def _build_matrix_model(spec, d_model, device):
     """Construct (model, head, embed) exactly as ``eval_group`` does."""
     memory_type, layout = spec[1], spec[2]
     cfg_overrides = spec[4] if len(spec) > 4 else None
     embed = nn.Embedding(VOCAB, d_model).to(device)
     head = MQARHead(d_model, VOCAB).to(device)
-    cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
-    model = HybridAttentionStack(cfg, total_layers=len(layout)).to(device)
+    if memory_type in SIMPLE_BASELINE_KINDS:
+        model = SimpleBaselineStack(
+            memory_type, d_model, len(layout)).to(device)
+    else:
+        cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
+        model = HybridAttentionStack(cfg, total_layers=len(layout)).to(device)
     return model, head, embed
 
 
@@ -896,6 +979,39 @@ MATRIX_GROUP_ROLES = {
     'E': 'two CSA layers (csa_csa preset only: HCA vs another CSA)',
 }
 
+# Pre-registered hypotheses for the SIMPLEST baselines (baseline-ladder
+# requirement: a complex mixer must beat the simplest thing that could
+# work, trained with the same recipe/budget, before its mechanism can be
+# credited). Disable with ABL_SIMPLE_BASELINES=0.
+SIMPLE_BASELINE_HYPOTHESES = {
+    'linear': {
+        'role': 'simplest rung: position-wise identity mixer (no token mixing)',
+        'hypothesis': ('MQAR requires associating a cued key with an earlier '
+                       'value, so a model that cannot move information '
+                       'across time must stay at chance.'),
+        'prediction': ('linear accuracy is not significantly above '
+                       '1/VOCAB and does not approach the hybrid groups.'),
+        'falsified_if': ('linear is significantly above chance or close to '
+                         'the hybrids: the task is solvable from the current '
+                         'token alone, so the operator ranking is confounded '
+                         'and cannot be attributed to memory.'),
+    },
+    'softmax': {
+        'role': 'standard rung: causal dense softmax attention',
+        'hypothesis': ('Dense attention can solve short MQAR at this depth; '
+                       'it is the standard architecture baseline, not a '
+                       'strawman (same depth, residual/LN structure, data '
+                       'stream, optimizer and budget).'),
+        'prediction': ('softmax reaches high MQAR accuracy; a hybrid claim '
+                       'must be read against it (and against its O(T) '
+                       'per-token state/cache cost).'),
+        'falsified_if': ('softmax fails at this depth/budget: the training '
+                         'recipe (not the memory operator) is the limiting '
+                         'factor, and hybrid-vs-softmax differences are not '
+                         'interpretable as memory-mechanism evidence.'),
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Pre-registered hypotheses for the matrix's paired contrasts
 # (experiment-design requirement: fix the prediction and the falsification
@@ -1299,9 +1415,12 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
     set_global_seed(seed, deterministic=True)
     embed = nn.Embedding(VOCAB, d_model).to(device)
     head = MQARHead(d_model, VOCAB).to(device)
-    cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
     total = len(layout)
-    model = HybridAttentionStack(cfg, total_layers=total).to(device)
+    if memory_type in SIMPLE_BASELINE_KINDS:
+        model = SimpleBaselineStack(memory_type, d_model, total).to(device)
+    else:
+        cfg = _make_matrix_cfg(d_model, memory_type, layout, cfg_overrides)
+        model = HybridAttentionStack(cfg, total_layers=total).to(device)
     param_groups = _build_param_groups(model, head, embed, weight_decay=0.01)
     opt = torch.optim.AdamW(param_groups, lr=lr)
     params = [p for g in param_groups for p in g['params']]
@@ -1364,10 +1483,18 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         if curve.enabled and (step + 1) % curve.val_every == 0:
             curve.record(step + 1)
 
-    final_acc, final_loss = _eval_model(
+    final_acc, final_loss, eval_extra = _eval_model(
         model, head, embed, seq_len, n_kv, device,
         n_batches=eval_batches, batch=eval_batch, seed=seed,
+        collect_predictions=True,
     )
+    # Accuracy alone hides per-class failure on an imbalanced recall set.
+    # Report the full confusion-derived panel on the SAME held-out samples
+    # (macro/micro/weighted F1 + balanced accuracy + PR-/ROC-AUC), so every
+    # matrix row (including the simple baselines) carries it.
+    class_metrics = multiclass_classification_metrics(
+        eval_extra['pred'], eval_extra['target'],
+        num_classes=VOCAB, scores=eval_extra['scores'])
 
     lat_gen = make_seeded_generator(99, device=device)
     x = torch.randn(1, seq_len, d_model, device=device, generator=lat_gen) * 0.1
@@ -1418,6 +1545,15 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         'steps': steps,
         'train_batch': train_batch,
         'last_train_loss': last_loss,
+        'class_metrics': class_metrics,
+        'f1_macro': class_metrics.get('f1_macro'),
+        'f1_micro': class_metrics.get('f1_micro'),
+        'f1_weighted': class_metrics.get('f1_weighted'),
+        'precision_macro': class_metrics.get('precision_macro'),
+        'recall_macro': class_metrics.get('recall_macro'),
+        'balanced_accuracy': class_metrics.get('balanced_accuracy'),
+        'class_balance': class_metrics.get('class_balance'),
+        'pr_auc_macro_ovr': class_metrics.get('pr_auc_macro_ovr'),
         'mean_last10_loss': mean_last10,
         'loss_curve': losses,
         'acc_curve': train_accs,
@@ -1515,6 +1651,29 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     else:
         t_stat = None
 
+    # Seed-level aggregation of the confusion-derived classification panel
+    # (the per-seed rows carry the full per-class report).
+    class_agg = {}
+    for key in ('f1_macro', 'f1_micro', 'f1_weighted', 'precision_macro',
+                'recall_macro', 'balanced_accuracy', 'pr_auc_macro_ovr',
+                'roc_auc_macro_ovr'):
+        vals = [float(r[key]) for r in ok_per_seed
+                if r.get(key) is not None]
+        if not vals:
+            class_agg[key] = {'mean': None, 'std': None, 'ci95': None,
+                              'n_seeds': 0}
+            continue
+        m = sum(vals) / len(vals)
+        if len(vals) > 1:
+            sd = math.sqrt(sum((v - m) ** 2 for v in vals) / (len(vals) - 1))
+            crit = _t_crit_975(len(vals))
+            ci = (crit * sd / math.sqrt(len(vals))
+                  if crit is not None else None)
+        else:
+            sd, ci = 0.0, None
+        class_agg[key] = {'mean': m, 'std': sd, 'ci95': ci,
+                          'n_seeds': len(vals)}
+
     # Pooled bad-case rollup for this group (None when the pass is
     # disabled); same definition as eval_layout_multi_seed.
     error_aggregate = pool_error_analyses(ok_per_seed)
@@ -1538,6 +1697,16 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
         'ci95_acc': ci_acc,
         'chance_acc': chance,
         't_stat_vs_chance': t_stat,
+        # Accuracy is not the only read: the imbalanced-class panel is
+        # aggregated over the same seeds.
+        'class_metrics_mean': class_agg,
+        'mean_f1_macro': class_agg['f1_macro']['mean'],
+        'mean_f1_micro': class_agg['f1_micro']['mean'],
+        'mean_f1_weighted': class_agg['f1_weighted']['mean'],
+        'mean_precision_macro': class_agg['precision_macro']['mean'],
+        'mean_recall_macro': class_agg['recall_macro']['mean'],
+        'mean_balanced_accuracy': class_agg['balanced_accuracy']['mean'],
+        'mean_pr_auc_macro_ovr': class_agg['pr_auc_macro_ovr']['mean'],
         'mean_fwd_ms': mean_fwd,
         'n_params': ok_per_seed[0]['n_params'],
         'n_layers': ok_per_seed[0]['n_layers'],
@@ -2547,6 +2716,15 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
     logger.info(f'  d_model       : {d_model}')
     logger.info(f'  memory routes : {memory_types}')
     groups = build_experiment_matrix(preset, total_layers, memory_types)
+    include_baselines = parse_int_env(
+        'ABL_SIMPLE_BASELINES', 1, min_value=0, logger=logger)
+    if include_baselines:
+        groups = groups + build_simple_baseline_groups(total_layers)
+        logger.info('  simple baselines: '
+                    f'{[g[0] for g in groups[-len(SIMPLE_BASELINE_KINDS):]]} '
+                    '(same depth/recipe; ABL_SIMPLE_BASELINES=0 disables)')
+    else:
+        logger.info('  simple baselines: DISABLED (ABL_SIMPLE_BASELINES=0)')
 
     # Pre-sweep overfit sanity gate: one cell per DISTINCT layout on the
     # first memory route (the memory operators themselves already have
@@ -2757,6 +2935,7 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
     run_meta = {
         'preset': preset,
         'memory_routes': list(memory_types),
+        'include_simple_baselines': bool(include_baselines),
         'n_kv_list': list(n_kv_list),
         'n_seeds': n_seeds,
         'steps': steps,
@@ -2773,6 +2952,8 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         # single readable registration for the whole experiment.
         'hypotheses': {
             'groups': MATRIX_GROUP_ROLES,
+            'simple_baselines': (SIMPLE_BASELINE_HYPOTHESES
+                                 if include_baselines else {}),
             'contrasts': MATRIX_CONTRAST_HYPOTHESES,
             'cross_route': CROSS_ROUTE_CONTRAST_HYPOTHESIS,
             'note': ('Pre-registered in run_ablation.MATRIX_CONTRAST_'
@@ -2976,7 +3157,10 @@ def main():
                 logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {_ci_str} "
                             f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)}, "
                             f"sig_bonferroni={res['significant_bonferroni']})")
-                logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")
+                logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms  "
+                            f"macro_f1={_fmt_num(res.get('mean_f1_macro'))}  "
+                            f"balanced_acc="
+                            f"{_fmt_num(res.get('mean_balanced_accuracy'))}")
             except Exception as e:
                 import traceback as _tb
                 logger.error(f"  ratio {r[0]}:{r[1]}:{r[2]} FAILED: {e}")

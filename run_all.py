@@ -310,6 +310,12 @@ _EXPERIMENT_OUTPUTS = {
     'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
     'exp10_quant_recall': ['results/exp10_quant_recall.json'],
     'exp11_quant_lm': ['results/exp11_quant_lm.json'],
+    # LM-scale architecture contrast (smoke profile): raw run records in
+    # the checkpoint tree, hence listed as raw side files below.
+    'exp12_lm_hybrid_smoke': [
+        'checkpoints_lm/smoke_hybrid/run_record.json'],
+    'exp12_lm_softmax_smoke': [
+        'checkpoints_lm/smoke_softmax/run_record.json'],
 }
 
 # Result files listed in ``_EXPERIMENT_OUTPUTS`` that are NOT results_schema
@@ -324,6 +330,8 @@ _RAW_SIDE_FILES = {
     'results/exp5b_ablation_matrix_provenance.json',
     'results/exp6_decoding_provenance.json',
     'results/exp4_overfit_gate.json',
+    'checkpoints_lm/smoke_hybrid/run_record.json',
+    'checkpoints_lm/smoke_softmax/run_record.json',
 }
 
 
@@ -455,6 +463,39 @@ def _sanitize(obj):
     """
     from kaggle_setup import sanitize_for_json
     return sanitize_for_json(obj)
+
+
+def _run_train_lm_smoke(arch):
+    """Pipeline smoke for ``train_lm_autodl`` (tiny budget, one arch).
+
+    The full LM runs are launched separately (they need a real corpus and
+    a GPU to be meaningful); this exercises the SAME entry point end to
+    end — data fallback, tokenizer, overfit gate skip, training loop,
+    validation selection, sealed-test evaluation, run record and manifest
+    — for both the hybrid and its matched softmax baseline.
+    """
+    import train_lm_autodl
+    out_dir = os.path.join('checkpoints_lm', f'smoke_{arch}')
+    argv = [
+        'train_lm_autodl.py', '--arch', arch, '--kaggle',
+        '--max_docs', '64', '--max_steps', '2', '--seq_len', '32',
+        '--batch_size', '2', '--val_every', '1', '--eval_max_batches', '1',
+        '--early_stop_patience', '0', '--error_analysis_batches', '0',
+        '--ppl_bootstrap_nboot', '0', '--skip_overfit_check',
+        '--skip_consistency_check', '--output_dir', out_dir,
+    ]
+    old_argv = sys.argv
+    sys.argv = argv
+    try:
+        rc = train_lm_autodl.main()
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            raise RuntimeError(
+                f'train_lm_autodl({arch}) exited with {exc}') from exc
+        rc = exc.code
+    finally:
+        sys.argv = old_argv
+    return rc
 
 
 def run_all(seeds=None, steps=None):
@@ -758,6 +799,16 @@ def run_all(seeds=None, steps=None):
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+
+            # LM-scale architecture contrast plumbing: the hybrid and its
+            # matched dense-softmax baseline both run through the SAME
+            # entry point (2 optimizer steps; pipeline validation only).
+            summary['runs'].append(
+                _run('exp12_lm_hybrid_smoke',
+                     lambda: _run_train_lm_smoke('hybrid')))
+            summary['runs'].append(
+                _run('exp12_lm_softmax_smoke',
+                     lambda: _run_train_lm_smoke('softmax')))
 
         # 6b. Mechanism ablation — multi-seed. Same SKIP_SLOW policy as
         #     Exp 5: keep the seed count >= 5 for a usable paired test,
