@@ -495,25 +495,35 @@ def csa_compress_kv_overlapped(
     Zb = Zb.to(compute_dtype).view(B_, n_blocks, m, c)
 
     # Two-branch overlapped compression.
-    # a-branch logits for ALL blocks: [B, n_blocks, m, c]
-    A_logits = Za + Ba[None, None, :, :].to(Za)
-    # b-branch logits shifted by one so block i uses block i-1.
-    # First block has no previous -> pad with -inf so softmax assigns 0 weight.
-    neg_inf_pad = torch.full((B_, 1, m, c), float('-inf'),
-                             device=Ca.device, dtype=compute_dtype)
-    Zb_prev = torch.cat([neg_inf_pad, Zb[:, :-1]], dim=1)         # [B, n_blocks, m, c]
-    Bb_logits = Zb_prev + Bb[None, None, :, :].to(Zb_prev)        # [B, n_blocks, m, c]
-
-    # cat along the m axis -> [B, n_blocks, 2m, c]
-    all_logits = torch.cat([A_logits, Bb_logits], dim=2)
+    # b-branch entries shifted by one so block i uses block i-1; the first
+    # block has no previous -> pad with -inf so softmax assigns 0 weight
+    # (``F.pad`` writes the constant directly, no full-sized pad tensor).
+    Zb_prev = F.pad(Zb[:, :-1], (0, 0, 0, 0, 1, 0),
+                    value=float('-inf'))                          # [B, n_blocks, m, c]
+    # a-branch logits for ALL blocks, then both branches concatenated along
+    # the m axis. Without autograd the sums are written directly into the
+    # two halves of one [B, n_blocks, 2m, c] buffer (the ``out=`` sums are
+    # the same elementwise adds; the buffer has the exact layout
+    # ``torch.cat`` used to allocate), avoiding the per-half temporaries and
+    # the concatenation copy. While a graph is recorded the original
+    # cat-of-sums form is kept (``out=`` does not build a graph).
+    if torch.is_grad_enabled():
+        A_logits = Za + Ba[None, None, :, :].to(Za)
+        Bb_logits = Zb_prev + Bb[None, None, :, :].to(Zb_prev)
+        all_logits = torch.cat([A_logits, Bb_logits], dim=2)
+    else:
+        all_logits = torch.empty(B_, n_blocks, 2 * m, c,
+                                 device=Ca.device, dtype=compute_dtype)
+        torch.add(Za, Ba[None, None, :, :].to(Za), out=all_logits[:, :, :m])
+        torch.add(Zb_prev, Bb[None, None, :, :].to(Zb_prev),
+                  out=all_logits[:, :, m:])
     S = _bf16_safe_softmax(all_logits, dim=2)                          # [B, n_blocks, 2m, c]
     Sa = S[:, :, :m]                                              # [B, n_blocks, m, c]
     Sb = S[:, :, m:]                                              # [B, n_blocks, m, c]
 
     # Cb shifted the same way: first block has no previous -> zero contribution.
-    zero_pad = torch.zeros((B_, 1, m, c),
-                           device=Ca.device, dtype=compute_dtype)
-    Cb_prev = torch.cat([zero_pad, Cb[:, :-1]], dim=1)            # [B, n_blocks, m, c]
+    Cb_prev = F.pad(Cb[:, :-1], (0, 0, 0, 0, 1, 0),
+                    value=0.0)                                    # [B, n_blocks, m, c]
 
     out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)                # [B, n_blocks, c]
     return _bf16_scale_if_needed(out)
@@ -576,6 +586,37 @@ def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
         f"'rms' (paper §2.3.3 RMSNorm form)")
 
 
+def _qk_normalize_(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
+    """In-place :func:`_qk_normalize` on a freshly owned tensor.
+
+    Evaluates the exact same per-element operations in the same order as
+    :func:`_qk_normalize` (``x / clamp_min(||x||_2)`` for ``'l2'`` — the
+    body of ``F.normalize`` — and ``x * rsqrt(mean(x^2) + 1e-6)`` for
+    ``'rms'``), writing back into ``x``. The values are bit-identical to
+    the out-of-place form.
+
+    The caller must own ``x`` (a fresh cast / copy, never a view of cache
+    storage or of a caller's tensor) and autograd must be disabled; the
+    returned tensor is ``x`` itself.
+    """
+    if mode == 'l2':
+        denom = x.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
+        return x.div_(denom)
+    if mode == 'rms':
+        return x.mul_(torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6))
+    raise ValueError(
+        f"qk_norm_mode={mode!r} must be 'l2' (cosine, historical) or "
+        f"'rms' (paper §2.3.3 RMSNorm form)")
+
+
+# Cap on the number of (row, block) entries processed per iteration of the
+# canonical top-k selector's boundary path. The rule is per-row, so the
+# chunk size cannot change any selection; the cap only bounds the transient
+# boolean / int32 masks (which would otherwise be allocated over the full
+# [B, nIh, T, n_blocks] score tensor).
+_TOPK_SELECT_CHUNK_ELEMS = 1 << 22
+
+
 def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     """Top-k indices with a deterministic, shape-independent tie-break.
 
@@ -618,33 +659,49 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
         order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :s]
         values = scores.gather(-1, order)
         return order.masked_fill(torch.isinf(values), -1)
-    # S-th largest score; ties exactly at this boundary are resolved below.
-    boundary = torch.topk(scores, s, dim=-1).values[..., -1:]
-    strictly_above = scores > boundary
-    n_above = strictly_above.sum(dim=-1, keepdim=True)
-    at_boundary = scores == boundary
-    # Fill the remaining slots with the SMALLEST indices tied at the
-    # boundary (the canonical rule). Exactly `s` entries are selected per
-    # row (n_above + boundary ties >= s by the definition of the boundary).
-    # Explicit ``dtype=torch.int32``: a bool cumsum would promote to
-    # int64 on a [., T, n_blocks] tensor.
-    tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
-    fill_ties = at_boundary & (tie_rank <= (s - n_above))
-    selected = strictly_above | fill_ties
-    # With exactly `s` selected entries per row, the row-major nonzero
-    # coordinates group into [..., s] with ascending indices per row.
-    # ``as_tuple=True`` returns just the coordinate vectors, so the last
-    # (block-index) column is taken without materializing the full
-    # [N, rank] coordinate matrix.
-    indices = selected.nonzero(as_tuple=True)[-1].view(
-        *scores.shape[:-1], s)
-    values = scores.gather(-1, indices)
-    # Restore the score-descending slot order (stable: boundary ties keep
-    # the canonical ascending-index order).
-    order = torch.argsort(values, dim=-1, descending=True, stable=True)
-    indices = torch.gather(indices, -1, order)
-    values = torch.gather(values, -1, order)
-    return indices.masked_fill(torch.isinf(values), -1)
+    # Boundary path, processed in chunks of flattened leading rows so the
+    # per-entry boolean / int32 masks below stay bounded. Every operation
+    # here is row-wise (``torch.topk``'s S-th largest value is a per-row
+    # order statistic, independent of how rows are grouped), so the chunk
+    # size cannot change any selection.
+    row_shape = scores.shape[:-1]
+    rows_total = 1
+    for d in row_shape:
+        rows_total *= d
+    flat = scores.reshape(rows_total, n)
+    chunk = max(1, _TOPK_SELECT_CHUNK_ELEMS // max(1, n))
+    out = flat.new_empty(rows_total, s, dtype=torch.long)
+    for lo in range(0, rows_total, chunk):
+        hi = min(rows_total, lo + chunk)
+        blk = flat[lo:hi]
+        # S-th largest score; ties exactly at this boundary are resolved
+        # below.
+        boundary = torch.topk(blk, s, dim=-1).values[..., -1:]
+        strictly_above = blk > boundary
+        n_above = strictly_above.sum(dim=-1, keepdim=True)
+        at_boundary = blk == boundary
+        # Fill the remaining slots with the SMALLEST indices tied at the
+        # boundary (the canonical rule). Exactly `s` entries are selected
+        # per row (n_above + boundary ties >= s by the definition of the
+        # boundary). Explicit ``dtype=torch.int32``: a bool cumsum would
+        # promote to int64.
+        tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
+        fill_ties = at_boundary & (tie_rank <= (s - n_above))
+        selected = strictly_above | fill_ties
+        # With exactly `s` selected entries per row, the row-major nonzero
+        # coordinates group into [chunk_rows, s] with ascending indices per
+        # row. ``as_tuple=True`` returns just the coordinate vectors, so
+        # the last (block-index) column is taken without materializing the
+        # full [rows, rank] coordinate matrix.
+        indices = selected.nonzero(as_tuple=True)[-1].view(hi - lo, s)
+        values = blk.gather(-1, indices)
+        # Restore the score-descending slot order (stable: boundary ties
+        # keep the canonical ascending-index order).
+        order = torch.argsort(values, dim=-1, descending=True, stable=True)
+        indices = torch.gather(indices, -1, order)
+        values = torch.gather(values, -1, order)
+        out[lo:hi] = indices.masked_fill(torch.isinf(values), -1)
+    return out.view(*row_shape, s)
 
 
 def _lightning_indexer_chunk(
@@ -677,8 +734,18 @@ def _lightning_indexer_chunk(
     # Multiplying by exactly 1.0 is an IEEE no-op (values and gradients
     # preserved bit-for-bit); skip it to avoid an allocation.
     if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
-        score = score * scale
-    score = F.relu(score)
+        # ``score`` is a fresh einsum output with no other readers; the
+        # in-place multiply / ReLU evaluate the same elementwise ops
+        # (bit-identical), but an autograd node would need the pre-op
+        # tensor, so they are only used with autograd disabled.
+        if torch.is_grad_enabled():
+            score = score * scale
+        else:
+            score.mul_(scale)
+    if torch.is_grad_enabled():
+        score = F.relu(score)
+    else:
+        score.relu_()
     if w_idx_chunk is None:
         logits = score.sum(1)                                       # [B, T_c, n_blocks]
     else:
@@ -1317,7 +1384,14 @@ def naive_csa(
         Zb = F.linear(H, W_bZ)
         K_idx_raw = F.linear(H, W_KV_idx)
         Z_idx = F.linear(H, W_Z_idx)
-    C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)   # [B, n_blocks, c]
+    compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
+    # Cast the a-branch projection to compute precision once and share it:
+    # ``csa_compress_kv_overlapped`` consumes this tensor (its internal
+    # ``.to(compute_dtype)`` becomes a no-op) and the sliding-window branch
+    # below reuses the same storage instead of re-casting.
+    Ca_c = Ca.to(compute_dtype)
+    C_comp = csa_compress_kv_overlapped(
+        Ca_c, Cb, Za, Zb, Ba, Bb, m)                                 # [B, n_blocks, c]
     # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
     # rotated entry serves as BOTH the attention key and the attention
     # value (shared-KV MQA). The anchor position of compressed entry ``s``
@@ -1389,7 +1463,6 @@ def naive_csa(
     # ``RuntimeError: Expected object of scalar type Half but got scalar type
     # Float``. We cast ``q`` to ``compute_dtype`` before normalization so the
     # entire attention core runs in one consistent precision.
-    compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
     # Honor ``normalize_qk`` for the CORE attention as
     # well as the indexer. When ``normalize_qk=True`` (the default used by
@@ -1609,11 +1682,11 @@ def naive_csa(
     # local KV) so they can share the compressed entries' softmax below.
     if sliding_window > 0:
         win = sliding_window
-        H_proj = Ca  # [B, T, c], already == F.linear(H, W_aKV)
+        H_proj = Ca_c  # [B, T, c], already == F.linear(H, W_aKV)
         if normalize_qk:
-            C_local = _qk_normalize(H_proj.to(compute_dtype), qk_norm_mode)  # [B, T, c]
+            C_local = _qk_normalize(H_proj, qk_norm_mode)          # [B, T, c]
         else:
-            C_local = H_proj.to(compute_dtype)
+            C_local = H_proj
         # Partial RoPE on the sliding-window keys (§2.3.3: RoPE applies to
         # the KV entry vectors used in CSA/HCA — the SW entries are such
         # KV entries). Each key rotates at its own token position; the

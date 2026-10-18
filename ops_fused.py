@@ -1441,9 +1441,20 @@ class HybridAttentionStack(nn.Module):
                 stacklevel=2,
             )
             HybridAttentionStack._stateful_warned = True
-        o, new_kda_state, new_conv_lookbacks = self.forward_functional(
+        # Outside grad mode, reuse the previous state stack's storage: the
+        # shared impl copies each memory layer's new state into place, so a
+        # fresh ``torch.stack`` allocation per step is avoided (the
+        # experiment runners call this once per token). The shape / dtype /
+        # device checks in the impl fall back to a fresh stack whenever the
+        # buffer no longer matches (first call, batch-size change, dtype
+        # change), so behavior is unchanged in every other case. With grad
+        # enabled the fresh stack is kept (in-place copies do not build a
+        # graph).
+        state_out = None if torch.is_grad_enabled() else self._kda_state
+        o, new_kda_state, new_conv_lookbacks = self._forward_functional_impl(
             x, self._kda_state,
-            [_memory_layer_lookback(layer) for layer in self.memory_layers])
+            [_memory_layer_lookback(layer) for layer in self.memory_layers],
+            state_out=state_out)
         self._kda_state = new_kda_state
         # Persist the per-layer lookbacks back to the memory layers
         # (route-aware: KDA/Mamba-2 ``_conv_lookback`` vs RWKV-7
@@ -1510,6 +1521,31 @@ class HybridAttentionStack(nn.Module):
                 ``None`` if ``n_kda_layers == 0``.
               * ``new_conv_lookbacks`` is a list of ``n_kda_layers``
                 tensors (or ``None`` entries).
+        """
+        return self._forward_functional_impl(
+            x, kda_state, conv_lookbacks,
+            detach_state=detach_state, detach_lookback=detach_lookback,
+            state_out=None)
+
+    def _forward_functional_impl(
+        self,
+        x: torch.Tensor,
+        kda_state: torch.Tensor | None,
+        conv_lookbacks: list[torch.Tensor | None],
+        *,
+        detach_state: bool = True,
+        detach_lookback: bool = True,
+        state_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
+        """Shared implementation behind :meth:`forward_functional`.
+
+        ``state_out`` is a private, optional preallocated state buffer
+        used by the stateful :meth:`forward` under no-grad to avoid a
+        fresh ``torch.stack`` allocation on every step: when it has the
+        right shape/dtype/device, the per-layer results are copied into
+        it (in place) and it is returned as the new state. The public
+        :meth:`forward_functional` always passes ``None`` so its return
+        value never shares storage with caller-visible state.
         """
         stacked = kda_state
         if stacked is not None:
@@ -1632,7 +1668,20 @@ class HybridAttentionStack(nn.Module):
                         f"config (e.g. per-layer head_dim) that needs "
                         f"separate state management."
                     )
-            new_kda_state = torch.stack(states, dim=0)
+            if (state_out is not None
+                    and state_out.shape == (len(states),) + ref_shape
+                    and state_out.dtype == states[0].dtype
+                    and state_out.device == states[0].device):
+                # Reuse the caller-provided buffer: copy each layer's new
+                # state into place instead of allocating a fresh stack.
+                # All per-layer results are already computed, and the old
+                # contents have been fully consumed above, so overwriting
+                # the storage in place cannot feed back into this step.
+                for i, s in enumerate(states):
+                    state_out[i].copy_(s)
+                new_kda_state = state_out
+            else:
+                new_kda_state = torch.stack(states, dim=0)
         else:
             new_kda_state = None
         return x, new_kda_state, new_lookbacks

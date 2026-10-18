@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import sys
 import warnings
 from typing import Any
 
@@ -24,6 +25,10 @@ import torch
 
 _VALID_BACKENDS = {"reference", "fla", "auto"}
 _FLA_OPS: tuple[Any, Any] | None = None
+_FLA_IMPORT_ERROR: ImportError | None = None
+_FLA_PROBED = False
+_FLA_MODULE = None
+_REFERENCE_OPS = None
 
 
 def validate_kda_backend(backend: str) -> str:
@@ -36,19 +41,43 @@ def validate_kda_backend(backend: str) -> str:
 
 
 def _load_fla_ops():
-    """Import the FLA KDA operators on first use and cache them."""
-    global _FLA_OPS
-    if _FLA_OPS is not None:
-        return _FLA_OPS
+    """Import the FLA KDA operators on first use and cache the outcome.
+
+    Mirrors the RWKV-7 backend's outcome-caching contract: the first
+    import ATTEMPT is the only one, and its success OR failure is cached
+    so repeated probes / dispatches (e.g. ``backend='auto'`` on every
+    token of a decode loop) never retry a broken install. A failed
+    attempt stores an actionable ``ImportError`` before re-raising it.
+    The cache is only valid for the same ``fla.ops.kda`` module object;
+    tests (and environments) that inject a different module under that
+    name trigger a fresh probe.
+    """
+    global _FLA_OPS, _FLA_IMPORT_ERROR, _FLA_PROBED, _FLA_MODULE
+    if _FLA_PROBED:
+        if sys.modules.get('fla.ops.kda') is _FLA_MODULE:
+            if _FLA_IMPORT_ERROR is not None:
+                raise ImportError(str(_FLA_IMPORT_ERROR))
+            return _FLA_OPS
+        _FLA_OPS = None
+        _FLA_IMPORT_ERROR = None
+        _FLA_PROBED = False
+        _FLA_MODULE = None
     try:
         from fla.ops.kda import chunk_kda, fused_recurrent_kda
-    except ImportError as exc:
-        raise ImportError(
+    except Exception as exc:  # noqa: BLE001 - broken installs raise anything
+        _FLA_IMPORT_ERROR = ImportError(
             "KDA backend 'fla' requires the optional dependency "
             "'flash-linear-attention'. Install it with "
-            "pip install -e '.[fla]' or choose kda_backend='reference'."
-        ) from exc
+            "pip install -e '.[fla]' or choose kda_backend='reference'. "
+            f"(import error: {type(exc).__name__}: {exc})"
+        )
+        _FLA_PROBED = True
+        _FLA_MODULE = sys.modules.get('fla.ops.kda')
+        raise _FLA_IMPORT_ERROR from exc
     _FLA_OPS = (chunk_kda, fused_recurrent_kda)
+    _FLA_IMPORT_ERROR = None
+    _FLA_PROBED = True
+    _FLA_MODULE = sys.modules.get('fla.ops.kda')
     return _FLA_OPS
 
 
@@ -119,6 +148,31 @@ def _warn_dropped_contract_flags(fn: Any, kept: dict[str, Any],
             f"reference backend.", RuntimeWarning, stacklevel=3)
 
 
+# ``inspect.signature`` is introspection-heavy and the accepted keyword set
+# of an FLA operator cannot change while the function object is alive, so
+# the classification is computed once per function (a decode loop dispatches
+# through here on every token).
+_KEEP_ALL_KWARGS = object()
+_CORE_KWARGS_ONLY = object()
+_SIGNATURE_CACHE: dict[Any, Any] = {}
+
+
+def _classify_signature(fn: Any):
+    """Return ``_KEEP_ALL_KWARGS``, ``_CORE_KWARGS_ONLY`` or the accepted
+    parameter-name set for ``fn``."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # Most Python wrappers expose a signature.  If a compiled wrapper does
+        # not, pass the conservative core API only.
+        return _CORE_KWARGS_ONLY
+    params = signature.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD
+           for p in params.values()):
+        return _KEEP_ALL_KWARGS
+    return frozenset(params)
+
+
 def _supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Keep the adapter compatible with nearby FLA API revisions.
 
@@ -129,23 +183,24 @@ def _supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     Transformation-contract flags that cannot be forwarded emit a
     ``RuntimeWarning`` (see :func:`_warn_dropped_contract_flags`) instead of
     being dropped silently.
+
+    The signature classification is cached per function object.
     """
-    try:
-        signature = inspect.signature(fn)
-    except (TypeError, ValueError):
-        # Most Python wrappers expose a signature.  If a compiled wrapper does
-        # not, pass the conservative core API only.
+    accepted = _SIGNATURE_CACHE.get(fn)
+    if accepted is None:
+        accepted = _classify_signature(fn)
+        _SIGNATURE_CACHE[fn] = accepted
+
+    if accepted is _KEEP_ALL_KWARGS:
+        return kwargs
+    if accepted is _CORE_KWARGS_ONLY:
         core = {"q", "k", "v", "g", "beta", "scale",
                 "initial_state", "output_final_state"}
         kept = {k: v for k, v in kwargs.items() if k in core}
         _warn_dropped_contract_flags(fn, kept, kwargs)
         return kept
 
-    params = signature.parameters
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD
-           for p in params.values()):
-        return kwargs
-    kept = {k: v for k, v in kwargs.items() if k in params}
+    kept = {k: v for k, v in kwargs.items() if k in accepted}
     _warn_dropped_contract_flags(fn, kept, kwargs)
     return kept
 
@@ -332,9 +387,17 @@ def kda_forward(
             use_fla = False
 
     # Lazy import avoids an import cycle; ops_kda remains the single source
-    # of truth for correctness tests.
-    from ops_kda import (assoc_scan_chunk_kda, naive_recurrent_kda,
-                         scripted_chunk_kda)
+    # of truth for correctness tests. The resolved symbols are cached on
+    # first use so the (reference-path) decode loop does not re-run the
+    # import machinery per token.
+    global _REFERENCE_OPS
+    if _REFERENCE_OPS is None:
+        from ops_kda import (assoc_scan_chunk_kda, naive_recurrent_kda,
+                             scripted_chunk_kda)
+        _REFERENCE_OPS = (assoc_scan_chunk_kda, naive_recurrent_kda,
+                          scripted_chunk_kda)
+    assoc_scan_chunk_kda, naive_recurrent_kda, scripted_chunk_kda = \
+        _REFERENCE_OPS
 
     if use_chunk:
         if assoc_scan and recompute_attn:

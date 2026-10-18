@@ -254,10 +254,28 @@ class GatedDeltaRule(nn.Module):
             return (torch.zeros(B, 0, H, V, dtype=dtype, device=device),
                     S)
 
-        outputs = []
+        # No-grad inference may update ``S`` in place after the first
+        # iteration, when ``S`` is guaranteed to be owned by this call (a
+        # fresh zero state, or the out-of-place product below); a
+        # caller-provided ``initial_state`` is never mutated. The output is
+        # preallocated in the same branch: index assignment is
+        # elementwise-identical to the append-and-stack form (the promoted
+        # dtype of ``q @ S`` fixes the output dtype up front; a provided
+        # ``initial_state`` may promote it beyond ``q.dtype``). While a
+        # graph is recorded the append-and-stack form is kept.
+        inplace = not torch.is_grad_enabled()
+        if inplace:
+            o = torch.empty(B, T, H, V,
+                            dtype=torch.promote_types(dtype, S.dtype),
+                            device=device)
+        else:
+            outputs = []
         for t in range(T):
             # S = S * gate
-            S = S * gate_state
+            if inplace and (t > 0 or initial_state is None):
+                S = S.mul_(gate_state)
+            else:
+                S = S * gate_state
 
             # delta = v_t - k_t^T S
             k_t = k[:, t].unsqueeze(-1)      # [B, H, K, 1]
@@ -267,14 +285,21 @@ class GatedDeltaRule(nn.Module):
 
             # S = S + beta * k_t * delta^T
             beta_k = beta * k_t              # [B, H, K, 1]
-            S = torch.addcmul(S, beta_k, delta.unsqueeze(-2))  # [B, H, K, V]
+            if inplace and (t > 0 or initial_state is None):
+                S = S.addcmul_(beta_k, delta.unsqueeze(-2))  # [B, H, K, V]
+            else:
+                S = torch.addcmul(S, beta_k, delta.unsqueeze(-2))
 
             # o_t = q_t^T S
             q_t = q[:, t].unsqueeze(-2)      # [B, H, 1, K]
             o_t = (q_t @ S).squeeze(-2)      # [B, H, V]
-            outputs.append(o_t)
+            if inplace:
+                o[:, t] = o_t
+            else:
+                outputs.append(o_t)
 
-        o = torch.stack(outputs, dim=1)      # [B, T, H, V]
+        if not inplace:
+            o = torch.stack(outputs, dim=1)  # [B, T, H, V]
         return o, S
 
 

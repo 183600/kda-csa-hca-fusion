@@ -17,14 +17,21 @@ forget gate per head).
 
 from __future__ import annotations
 
+import os as _os
 import sys
 import warnings as _warnings
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-_KDA_NONFINITE_WARN = True
+# Non-finite-output guard. The check is a full-output reduction, so
+# latency-bound callers (e.g. per-token decoding loops) can opt out via
+# ``KDA_NONFINITE_WARN=0`` (or by setting this module flag to False)
+# without losing the default warning contract.
+_KDA_NONFINITE_WARN = _os.environ.get(
+    'KDA_NONFINITE_WARN', '1').strip().lower() not in ('0', 'false', 'off', 'no')
 
 
 def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):
@@ -216,7 +223,12 @@ def _recurrent_kda_loop_inplace_eager(q, k_col, v, g_exp_col, beta_k_col, S):
     argument) and autograd must be disabled — an in-place update of a
     graph-tracked state would trip the version counter.
     """
-    outs = []
+    # Preallocate the output and write one time slice per step: index
+    # assignment is elementwise-identical to the append-and-stack form
+    # (which squeezes the singleton head dim only once, after the stack).
+    outs = torch.empty(
+        q.shape[0], q.shape[1], q.shape[2], 1, S.shape[-1],
+        dtype=S.dtype, device=S.device)
     for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
             q.unbind(1), k_col.unbind(2), v.unbind(1),
             g_exp_col.unbind(2), beta_k_col.unbind(2))):
@@ -226,10 +238,10 @@ def _recurrent_kda_loop_inplace_eager(q, k_col, v, g_exp_col, beta_k_col, S):
         # update is the delta-rule ``S + beta_i ⊗ delta`` in fp association.
         S = S.addcmul_(beta_k_i, delta[..., None, :])
         # Keep the singleton head dim until the single post-loop squeeze:
-        # append-and-stack as ``[B, H, 1, V]`` then squeeze(-2) is
+        # writing ``[B, H, 1, V]`` then squeeze(-2) is
         # elementwise-identical to squeezing each step before the stack.
-        outs.append(q_i @ S)
-    return torch.stack(outs, 1).squeeze(-2), S
+        outs[:, i] = q_i @ S
+    return outs.squeeze(-2), S
 
 
 _RECURRENT_LOOP_SCRIPTED = None
@@ -399,9 +411,34 @@ def naive_recurrent_kda(
     # broadcast shape the loop consumes; ``q`` carries its singleton query
     # dim from the start (a view, so the values are unchanged).
     q_col = q.unsqueeze(-2)
-    g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
-    k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
-    beta_k_col = (beta[..., None] * k).movedim(1, 2).unsqueeze(-1).contiguous()
+    if not torch.is_grad_enabled():
+        # ``exp`` / ``mul`` are per-element maps, so computing them on the
+        # permuted ``[B,HV,T,K,1]`` view writes exactly the same values as
+        # computing in the ``[B,T,HV,K]`` layout and permuting the result
+        # (bit-identical), while the whole factor is materialized once in
+        # its final layout instead of twice. ``empty_like(..., contiguous)``
+        # guarantees a fresh buffer even when the permuted view happens to
+        # be stride-contiguous (e.g. singleton T/HV dims), so the ``out=``
+        # writes can never touch the caller's tensors.
+        g_m = g.movedim(1, 2).unsqueeze(-1)
+        g_exp_col = torch.empty_like(
+            g_m, memory_format=torch.contiguous_format)
+        torch.exp(g_m, out=g_exp_col)
+        k_m = k.movedim(1, 2).unsqueeze(-1)
+        # ``k_col`` is only read by the loop, and the loop's reductions
+        # must see the same contiguous strides as before.
+        k_col = k_m.contiguous()
+        beta_m = beta.movedim(1, 2).unsqueeze(-1).unsqueeze(-1)
+        beta_k_col = torch.empty_like(
+            k_m, memory_format=torch.contiguous_format)
+        # ``beta * k``: multiplication is commutative and bit-identical in
+        # either operand order.
+        torch.mul(k_m, beta_m, out=beta_k_col)
+    else:
+        g_exp_col = g.exp().movedim(1, 2).unsqueeze(-1).contiguous()
+        k_col = k.movedim(1, 2).unsqueeze(-1).contiguous()
+        beta_k_col = (beta[..., None] * k).movedim(
+            1, 2).unsqueeze(-1).contiguous()
     # Autograd-safe out-of-place loop while a graph is being recorded; the
     # in-place loop (same values) otherwise. ``S`` is always freshly
     # allocated above (``new_zeros`` or the ``+ initial_state`` sum), so
@@ -843,8 +880,15 @@ def _chunk_kda_finalize(
     original_T: int,
     fn_name: str,
 ):
-    """Shared tail for the chunk-parallel KDA path."""
-    o = torch.stack(chunk_outs, dim=2)
+    """Shared tail for the chunk-parallel KDA path.
+
+    ``chunk_outs`` is either the already-assembled ``[B, HV, NT, BT, V]``
+    tensor (the no-grad inner loops write straight into a preallocated
+    buffer; the associative scan already holds its full result) or the
+    historical per-chunk list, which is stacked into that layout.
+    """
+    o = (chunk_outs if isinstance(chunk_outs, torch.Tensor)
+         else torch.stack(chunk_outs, dim=2))
     if not output_final_state:
         S = None
     else:
@@ -929,8 +973,19 @@ def _chunk_kda_inner_loop(
     ``gexp`` is the ``exp`` of the cumsum gate map (also precomputed by
     :func:`_chunk_kda_prepare`, which consumes the same tensor for the
     ``w`` map).
+
+    Returns the assembled ``[B, HV, NT, BT, V]`` output tensor. With
+    autograd disabled the loop writes each chunk straight into a
+    preallocated buffer; while a graph is being recorded the rows are
+    accumulated and stacked at the end (the same values / graph ops as the
+    historical list-plus-stack form).
     """
+    B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
+    V = u.shape[-1]
+    o: Optional[torch.Tensor] = None
     chunk_outs = []
+    if not torch.is_grad_enabled():
+        o = q.new_empty(B, HV, NT, BT, V)
     # The per-chunk gate maps (``exp(g)``, the last-position decay, and the
     # decay-difference weighted keys) are pure elementwise functions of
     # ``g`` / ``k``, evaluated for all chunks up front; each chunk then
@@ -938,17 +993,25 @@ def _chunk_kda_inner_loop(
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     # The subtraction yields a fresh tensor, so ``exp`` may run in place;
-    # the multiply stays out of place because ``exp`` backward saves its
-    # output.
+    # the multiply stays out of place while autograd records the graph
+    # because ``exp`` backward saves its output, and runs in place (same
+    # per-element product) otherwise.
     kexp_all = g[..., -1:, :] - g
     kexp_all.exp_()
-    kexp_all = kexp_all * k
+    if torch.is_grad_enabled():
+        kexp_all = kexp_all * k
+    else:
+        kexp_all.mul_(k)
     for i in range(NT):
         q_i = q[:, :, i]
         u_i = u[:, :, i]
         w_i = w[:, :, i]
         v_i = u_i - w_i @ S
-        chunk_outs.append((q_i * gexp_all[:, :, i]) @ S + Aqk[:, :, i] @ v_i)
+        row = (q_i * gexp_all[:, :, i]) @ S + Aqk[:, :, i] @ v_i
+        if o is not None:
+            o[:, :, i] = row
+        else:
+            chunk_outs.append(row)
         # NOTE: decay direction is ``g_last - g_pos`` (NOT ``g_pos - g_last``).
         # Inside a chunk, position ``c`` contributes to the carried state via
         # ``exp(g_cumsum[last] - g_cumsum[c]) * k_c ⊗ v_c``, where
@@ -960,7 +1023,9 @@ def _chunk_kda_inner_loop(
         # The contraction over positions computes ``sum_c kexp[c, :] ⊗
         # v[c, :]`` as a matmul.
         S = S * glast_all[:, :, i] + kexp_all[:, :, i].transpose(-1, -2) @ v_i
-    return chunk_outs, S
+    if o is not None:
+        return o, S
+    return torch.stack(chunk_outs, dim=2), S
 
 
 def _recompute_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
@@ -1010,19 +1075,31 @@ def _chunk_kda_inner_loop_recompute(
     association (``(q * exp(diff)) * k``, reduced over the contiguous last
     dim), so the values are unchanged; only the Python loop granularity
     differs. Entries with ``j > c`` are zeroed by ``upper_mask``.
+
+    Returns the assembled ``[B, HV, NT, BT, V]`` output tensor, with the
+    same no-grad preallocated-buffer / grad list-plus-stack split as
+    :func:`_chunk_kda_inner_loop`.
     """
-    chunk_outs = []
     B, HV, BT = q.shape[0], q.shape[1], q.shape[3]
+    V = u.shape[-1]
+    o: Optional[torch.Tensor] = None
+    chunk_outs = []
+    if not torch.is_grad_enabled():
+        o = q.new_empty(B, HV, NT, BT, V)
     # Same gate-map layout as ``_chunk_kda_inner_loop`` (pure elementwise
     # functions of ``g`` / ``k``); ``gexp`` is the ``exp`` map precomputed
     # by ``_chunk_kda_prepare``.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     # The subtraction is fresh, so its ``exp`` runs in place; the multiply
-    # stays out of place because ``exp`` backward saves its output.
+    # stays out of place while autograd records the graph because ``exp``
+    # backward saves its output, and runs in place otherwise.
     kexp_all = g[..., -1:, :] - g
     kexp_all.exp_()
-    kexp_all = kexp_all * k
+    if torch.is_grad_enabled():
+        kexp_all = kexp_all * k
+    else:
+        kexp_all.mul_(k)
     _block_rows = block_rows
     for i in range(NT):
         q_i = q[:, :, i]
@@ -1042,13 +1119,19 @@ def _chunk_kda_inner_loop_recompute(
             qe = q_i[..., j0:, :].unsqueeze(-2) * diff
             Aqk_i[..., j0:, j0:j1] = (
                 qe * k_i[..., j0:j1, :].unsqueeze(-3)).sum(-1)
-        Aqk_i = Aqk_i.masked_fill(upper_mask, 0)
+        Aqk_i.masked_fill_(upper_mask, 0)
         v_i = u_i - w_i @ S
-        chunk_outs.append((q_i * gexp_all[:, :, i]) @ S + Aqk_i @ v_i)
+        row = (q_i * gexp_all[:, :, i]) @ S + Aqk_i @ v_i
+        if o is not None:
+            o[:, :, i] = row
+        else:
+            chunk_outs.append(row)
         # State carry mirrors ``_chunk_kda_inner_loop`` (same per-element
         # operations in the same order).
         S = S * glast_all[:, :, i] + kexp_all[:, :, i].transpose(-1, -2) @ v_i
-    return chunk_outs, S
+    if o is not None:
+        return o, S
+    return torch.stack(chunk_outs, dim=2), S
 
 
 def _assoc_scan_chunk_states(
@@ -1085,6 +1168,12 @@ def _assoc_scan_chunk_states(
     # map of chunks 0..n (applied to S0).
     E = M
     Fv = b
+    if not torch.is_grad_enabled():
+        # The doubling levels below overwrite the tail in place; the
+        # caller's tensors must not be touched (the eager/scripted parity
+        # test reuses the same inputs), so work on dedicated copies.
+        E = M.clone()
+        Fv = b.clone()
     off = 1
     levels = 0
     while off < NT:
@@ -1098,8 +1187,16 @@ def _assoc_scan_chunk_states(
         # apply the newly-composed transition to the source too.
         new_E_tail = E_tail @ E_shift
         new_F_tail = E_tail @ F_shift + F_tail
-        E = torch.cat([E[:, :, :off], new_E_tail], dim=2)
-        Fv = torch.cat([Fv[:, :, :off], new_F_tail], dim=2)
+        if torch.is_grad_enabled():
+            # Autograd keeps the out-of-place form: the cat produces a
+            # fresh tensor per level, so no saved operand is mutated.
+            E = torch.cat([E[:, :, :off], new_E_tail], dim=2)
+            Fv = torch.cat([Fv[:, :, :off], new_F_tail], dim=2)
+        else:
+            # Prefix unchanged, tail replaced by the composed values
+            # computed above from the OLD tail: identical to the cat.
+            E[:, :, off:] = new_E_tail
+            Fv[:, :, off:] = new_F_tail
         off = off * 2
     # Exclusive form: S_in[:, :, 0] = S0 (identity map, zero source), while
     # chunk n >= 1 consumes the inclusive prefix of chunks 0..n-1.
@@ -1183,10 +1280,15 @@ def assoc_scan_chunk_kda(
     # ``ggx`` is the ``exp`` of the cumsum gate map precomputed by
     # ``_chunk_kda_prepare``; ``ggx[..., -1, :]`` is elementwise-identical
     # to ``gg[..., -1, :].exp()`` and ``ggx`` to ``gg.exp()``.
-    # The subtraction is fresh, so its ``exp`` runs in place.
+    # The subtraction is fresh, so its ``exp`` runs in place; the multiply
+    # stays out of place only where autograd must keep the ``exp`` output
+    # unmodified for its backward.
     kexp = gg[..., -1:, :] - gg
     kexp.exp_()
-    kexp = kk * kexp
+    if torch.is_grad_enabled():
+        kexp = kk * kexp
+    else:
+        kexp.mul_(kk)
     kexp_t = kexp.transpose(-1, -2)
     M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
     b = kexp_t @ u
@@ -1194,9 +1296,8 @@ def assoc_scan_chunk_kda(
     C = qq * ggx - Aqk @ w
     a = Aqk @ u
     o_all = C @ S_in + a
-    chunk_outs = list(o_all.unbind(2))
     return _chunk_kda_finalize(
-        chunk_outs, S_final,
+        o_all, S_final,
         dtype=prep['dtype'], compute_dtype=prep['compute_dtype'],
         state_dtype=state_dtype, output_final_state=output_final_state,
         original_T=prep['original_T'], fn_name='assoc_scan_chunk_kda',

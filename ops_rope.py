@@ -51,6 +51,8 @@ the same function with negated positions.
 
 from __future__ import annotations
 
+import collections as _collections
+
 import torch
 
 
@@ -106,13 +108,24 @@ def _inv_freq(rope_dim: int, base: float, device, dtype: torch.dtype) -> torch.T
 # ``(cos, sin)`` tables for INTEGER position vectors, keyed by the exact
 # position values plus (rope_dim, base, device, angle_dtype, position dtype).
 # The decode path calls ``partial_rope`` several times per token with the
-# same one-element position vector (query + sliding-window key), and the
-# full-sequence paths re-rotate several tensors at the same positions; the
-# tables are pure functions of the key. The entries are treated as
-# immutable (only ``view``/read by consumers).
-_TABLE_CACHE: dict = {}
+# same one-element position vector (query + sliding-window key), so the
+# value key is tiny there and repeats across calls. The tables are pure
+# functions of the key; entries are treated as immutable (only
+# ``view``/read by consumers).
+#
+# Only SHORT position vectors are value-keyed (``_TABLE_CACHE_MAX_POS``):
+# building the key materializes ``tuple(positions.tolist())``, which for a
+# full-sequence call would be an O(P) host copy (and a P-int key) just to
+# look up a table that is almost never reused at that size. Longer vectors
+# take the uncached branch in :func:`partial_rope`, which is textually the
+# same computation (bit-identical tables). The cache is an LRU bounded by
+# total element count, so the resident tables stay small regardless of the
+# requested sequence lengths.
+_TABLE_CACHE: '_collections.OrderedDict' = _collections.OrderedDict()
 _TABLE_CACHE_MAX_ENTRIES = 128
-_TABLE_CACHE_MAX_ELEMS = 1 << 21
+_TABLE_CACHE_MAX_ELEMS = 1 << 22
+_TABLE_CACHE_ELEMS = 0
+_TABLE_CACHE_MAX_POS = 8
 
 # Integer position dtypes eligible for the table cache (float positions can
 # carry signed zeros / NaN payloads that a value-keyed cache would merge).
@@ -168,19 +181,26 @@ def _cos_sin_cached(
     computations are otherwise textually identical, so a cache hit returns
     the exact bits the uncached path would produce.
     """
+    global _TABLE_CACHE_ELEMS
     key = (rope_dim, float(base), str(device), angle_dtype,
            positions.dtype, tuple(positions.tolist()))
     entry = _TABLE_CACHE.get(key)
     if entry is not None:
+        _TABLE_CACHE.move_to_end(key)
         return entry
     pos_f = positions.to(device=device, dtype=angle_dtype)
     angles = pos_f[:, None] * _inv_freq(rope_dim, base, device, angle_dtype)[None, :]
     cos = angles.cos()
     sin = angles.sin()
-    if positions.numel() * (rope_dim // 2) <= _TABLE_CACHE_MAX_ELEMS:
-        if len(_TABLE_CACHE) >= _TABLE_CACHE_MAX_ENTRIES:
-            _TABLE_CACHE.clear()
+    entry_elems = cos.numel() + sin.numel()
+    if entry_elems <= _TABLE_CACHE_MAX_ELEMS:
+        while _TABLE_CACHE and (
+                len(_TABLE_CACHE) >= _TABLE_CACHE_MAX_ENTRIES
+                or _TABLE_CACHE_ELEMS + entry_elems > _TABLE_CACHE_MAX_ELEMS):
+            _old, (_old_cos, _old_sin) = _TABLE_CACHE.popitem(last=False)
+            _TABLE_CACHE_ELEMS -= _old_cos.numel() + _old_sin.numel()
         _TABLE_CACHE[key] = (cos, sin)
+        _TABLE_CACHE_ELEMS += entry_elems
     return cos, sin
 
 
@@ -244,9 +264,13 @@ def partial_rope(
         raise ValueError(f"partial_rope: base={base!r} must be positive.")
     device = x.device
     angle_dtype = _angle_dtype(x)
-    if positions.dtype in _INT_POS_DTYPES and not positions.requires_grad:
+    if (positions.dtype in _INT_POS_DTYPES and not positions.requires_grad
+            and positions.numel() <= _TABLE_CACHE_MAX_POS):
         # Exact-value table cache (see ``_cos_sin_cached``); the uncached
-        # branch below performs the identical computation.
+        # branch below performs the identical computation. Only short
+        # position vectors are keyed by value: the key construction is
+        # O(P) on the host, and full-sequence tables are not reused often
+        # enough to pay for it.
         cos, sin = _cos_sin_cached(
             positions, rope_dim, base, angle_dtype, device)
     else:

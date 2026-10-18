@@ -224,8 +224,13 @@ def naive_hca(
     scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n)
     if scale != 1.0:
         # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-        # multiply keeps values/gradients bit-for-bit identical.
-        scores = scores * scale
+        # multiply keeps values/gradients bit-for-bit identical. The
+        # einsum output is fresh, so the in-place multiply is the same
+        # elementwise op with autograd disabled.
+        if torch.is_grad_enabled():
+            scores = scores * scale
+        else:
+            scores.mul_(scale)
     # The einsum output (or its scaled copy) is freshly allocated and only
     # consumed by the joint softmax below, so the mask can be written in
     # place.
@@ -299,10 +304,18 @@ def naive_hca(
         # before the ``masked_fill`` below).
         lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
         log_denom = torch.logaddexp(lse, shifted_sink)             # [B, nh, T, 1]
-        p = (shifted - log_denom).exp()                            # [B, nh, T, n_blocks+win]
-        # Out-of-place: autograd's ExpBackward saves this ``exp`` output, so
-        # an in-place fill here would trip the version-counter check.
-        p = p.masked_fill(all_masked, 0.0)
+        if torch.is_grad_enabled():
+            # Out-of-place: autograd's Sub/Exp backward save this chain's
+            # operands/outputs, so in-place writes here would trip the
+            # version-counter check.
+            p = (shifted - log_denom).exp()                        # [B, nh, T, n_blocks+win]
+            p = p.masked_fill(all_masked, 0.0)
+        else:
+            # ``shifted`` has no readers left (``lse`` is computed above),
+            # and its ``- log_denom`` / ``exp`` / fill are the same
+            # elementwise ops as the out-of-place chain (bit-identical).
+            p = shifted.sub_(log_denom).exp_()
+            p.masked_fill_(all_masked, 0.0)
     else:
         all_masked = cat.isinf().all(-1, keepdim=True)
         p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_masked)

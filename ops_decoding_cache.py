@@ -98,7 +98,7 @@ import torch
 
 from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import (csa_compress_kv, csa_compress_kv_overlapped,
-                     csa_lightning_indexer, _qk_normalize)
+                     csa_lightning_indexer, _qk_normalize, _qk_normalize_)
 
 
 def _validate_cache_dtype(dtype) -> None:
@@ -352,9 +352,17 @@ class _SlidingWindowRingBuffer:
         # Index in ``self._buf`` of the OLDEST valid entry. Stays at 0
         # while ``_sw_len < win`` (entries are written sequentially at
         # positions 0, 1, 2, ...). Once the buffer is full, each new
-        # write goes to ``_sw_head`` (overwriting the oldest) and
-        # ``_sw_head`` advances by 1 (mod ``win``).
+        # write goes to ``self._sw_head`` (overwriting the oldest) and
+        # ``_sw_head`` advances by the number of written entries (mod
+        # ``win``).
         self._sw_head = 0
+        # Lazily-allocated causal-order mirror used by ``get()`` when the
+        # ring has wrapped (the physical layout is then split in two).
+        # ``_version`` bumps on every mutation of the ring contents;
+        # ``_window_version`` records which version the mirror holds.
+        self._window = None
+        self._window_version = -1
+        self._version = 0
 
     def reset(self) -> None:
         """Clear all state (does not deallocate the buffer)."""
@@ -364,6 +372,7 @@ class _SlidingWindowRingBuffer:
         self._buf.zero_()
         self._sw_len = 0
         self._sw_head = 0
+        self._version += 1
 
     def append(self, x: torch.Tensor) -> None:
         """Append one or more new entries.
@@ -383,9 +392,7 @@ class _SlidingWindowRingBuffer:
             # ``model.to(cuda)`` would otherwise fail inside
             # ``self._buf[:, ...] = x`` with a device-mismatch error.
             x = x.to(device=self._buf.device, dtype=self._buf.dtype)
-        _, T_new, _ = x.shape
-        for i in range(T_new):
-            self._append_one(x[:, i])
+        self.append_bulk(x)
 
     def append_bulk(self, x: torch.Tensor) -> None:
         """Append ``[B, T_new, c]`` entries in arrival order.
@@ -395,6 +402,10 @@ class _SlidingWindowRingBuffer:
         entries written. Only the physical placement inside ``_buf``
         may differ (any placement with the same causal-order view is
         valid for :meth:`get`).
+
+        The writes go straight into the ring (at most two vectorized
+        slice copies); no concatenation of the previous contents is
+        needed to preserve the causal-order contract.
         """
         if x.dim() != 3 or x.shape[0] != self.B or x.shape[-1] != self.c:
             raise ValueError(
@@ -402,39 +413,44 @@ class _SlidingWindowRingBuffer:
                 f"[{self.B}, T_new, {self.c}], got {tuple(x.shape)}.")
         if x.device != self._buf.device or x.dtype != self._buf.dtype:
             x = x.to(device=self._buf.device, dtype=self._buf.dtype)
-        if x.shape[1] == 0:
+        t_new = x.shape[1]
+        if t_new == 0:
             return
-        if x.shape[1] >= self.win:
+        if t_new >= self.win:
             # Every entry cached before this call (and every entry of ``x``
             # except the newest ``win``) is evicted before it can be read,
             # so the final content is simply the newest ``win`` entries.
             self._buf[:, :self.win] = x[:, -self.win:]
             self._sw_head = 0
             self._sw_len = self.win
+            self._version += 1
             return
-        # Small append (T_new < win): keep the last
-        # ``min(_sw_len + T_new, win)`` entries of (previous + new).
-        combined = torch.cat([self.get(), x], dim=1)
-        keep = combined[:, -self.win:]
-        self._buf[:, :keep.shape[1]] = keep
-        self._sw_head = 0
-        self._sw_len = keep.shape[1]
-
-    def _append_one(self, x_one: torch.Tensor) -> None:
-        """Append a single ``[B, c]`` entry."""
         if self._sw_len < self.win:
-            # Buffer not yet full: append at the next free slot.
-            # ``_sw_head == 0`` and ``_sw_len < win``, so the write
-            # position is simply ``_sw_head + _sw_len``.
-            write_pos = self._sw_head + self._sw_len
-            self._buf[:, write_pos] = x_one
-            self._sw_len += 1
+            # Not yet full -> ``_sw_head == 0`` and entries are at
+            # ``[0, _sw_len)``. Write the new entries after them; if they
+            # do not fit, the overflow wraps to the front, overwriting the
+            # oldest entries (which are evicted by the append).
+            space = self.win - self._sw_len
+            if t_new <= space:
+                self._buf[:, self._sw_len:self._sw_len + t_new] = x
+                self._sw_len += t_new
+            else:
+                self._buf[:, self._sw_len:self.win] = x[:, :space]
+                k = t_new - space
+                self._buf[:, :k] = x[:, space:]
+                self._sw_head = k
+                self._sw_len = self.win
         else:
-            # Buffer full: overwrite the oldest entry, advance head.
-            # ``_sw_head`` is the oldest; write there, then advance so
-            # the NEXT-oldest becomes the new oldest.
-            self._buf[:, self._sw_head] = x_one
-            self._sw_head = (self._sw_head + 1) % self.win
+            # Full: overwrite the ``T_new`` oldest entries starting at the
+            # head (wrapping once if needed) and advance the head past
+            # them.
+            head = self._sw_head
+            write = min(t_new, self.win - head)
+            self._buf[:, head:head + write] = x[:, :write]
+            if write < t_new:
+                self._buf[:, :t_new - write] = x[:, write:]
+            self._sw_head = (head + t_new) % self.win
+        self._version += 1
 
     def get(self) -> torch.Tensor:
         """Return the current contents in causal order (oldest first).
@@ -453,14 +469,33 @@ class _SlidingWindowRingBuffer:
         #     ``[head : head + len]`` in causal order.
         #  2. Wrap (head + len > win): entries are at
         #     ``[head : win]`` (oldest) followed by ``[0 : head + len - win]``
-        #     (newer), concatenated.
+        #     (newer). The two pieces are copied into the reusable
+        #     causal-order mirror instead of allocating a fresh tensor via
+        #     ``torch.cat`` on every call; the mirror is refilled only when
+        #     the ring contents changed since the last fill. While a graph
+        #     is being recorded the old ``cat`` form is kept so the result
+        #     stays connected to the buffer entries' autograd history.
         if self._sw_head + self._sw_len <= self.win:
             return self._buf[:, self._sw_head : self._sw_head + self._sw_len]
-        else:
-            tail = self._buf[:, self._sw_head:]                       # oldest
-            head_len = self._sw_head + self._sw_len - self.win
-            head = self._buf[:, :head_len]                            # newer
-            return torch.cat([tail, head], dim=1)
+        tail_len = self.win - self._sw_head                       # oldest
+        head_len = self._sw_head + self._sw_len - self.win        # newer
+        if torch.is_grad_enabled():
+            return torch.cat([self._buf[:, self._sw_head:],
+                              self._buf[:, :head_len]], dim=1)
+        if (self._window is None
+                or self._window.shape[1:] != (self.win, self.c)
+                or self._window.device != self._buf.device
+                or self._window.dtype != self._buf.dtype):
+            self._window = torch.empty(self.B, self.win, self.c,
+                                       device=self._buf.device,
+                                       dtype=self._buf.dtype)
+            self._window_version = -1
+        if self._window_version != self._version:
+            self._window[:, :tail_len].copy_(self._buf[:, self._sw_head:])
+            self._window[:, tail_len:tail_len + head_len].copy_(
+                self._buf[:, :head_len])
+            self._window_version = self._version
+        return self._window[:, :self._sw_len]
 
     @property
     def n_valid(self) -> int:
@@ -477,6 +512,12 @@ class _SlidingWindowRingBuffer:
         if dtype is not None and dtype != self._buf.dtype:
             self._buf = self._buf.to(dtype=dtype)
             self.dtype = self._buf.dtype
+        # The mirror is lazily rebuilt on the next wrapped ``get()`` (its
+        # device/dtype checks would catch a move anyway; dropping it also
+        # keeps stale contents from being returned).
+        self._window = None
+        self._window_version = -1
+        self._version += 1
         return self
 
 
@@ -1333,13 +1374,19 @@ class CSADecodingCache:
             #
             # ``_qk_normalize`` is a per-row map, so normalizing only the
             # ``topk`` gathered rows (below) is bit-identical to
-            # normalizing all ``n_blocks`` rows first and gathering after.
-            C_comp_valid = _to_dtype(
-                self._C_comp[:, :self._n_blocks], compute_dtype)
+            # normalizing all ``n_blocks`` rows first and gathering after;
+            # the compressed rows are therefore gathered straight out of
+            # the storage-dtype cache and only the selected rows are
+            # upcast (a cast commutes with row selection).
+            C_comp_storage = self._C_comp[:, :self._n_blocks]
+            # The indexer scores ALL blocks (it must, to select), so its
+            # keys are upcast whole. When ``normalize_qk=False`` and
+            # autograd is recording, the upcast copy is a graph input that
+            # a later ``append_step`` would invalidate in place, hence the
+            # clone (same contract as before).
             K_IComp_valid = _to_dtype(
                 self._K_IComp[:, :self._n_blocks], compute_dtype)
             if torch.is_grad_enabled() and not normalize_qk:
-                C_comp_valid = C_comp_valid.clone()
                 K_IComp_valid = K_IComp_valid.clone()
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
@@ -1347,20 +1394,46 @@ class CSADecodingCache:
             # no-grad inference the two forms are forward-equivalent, so
             # gate it just like ``naive_csa``.
             effective_use_ste = use_ste and torch.is_grad_enabled()
-            indexer_result = csa_lightning_indexer(
-                _to_dtype(q_idx, compute_dtype),                       # [B, 1, nIh, c_I]
-                K_IComp_valid,                                         # [B, n_blocks, c_I]
-                _to_dtype(w_idx, compute_dtype),                       # [B, 1, nIh]
-                topk,
-                # Defer scale selection to csa_lightning_indexer — it
-                # picks 1.0 when normalize_qk=True (cosine),
-                # 1/sqrt(c_I) otherwise.
-                scale=None,
-                causal_block_mask=cbm,
-                return_soft_weights=effective_use_ste,
-                ste_mode=ste_mode,
-                normalize_qk=normalize_qk,
-            )
+            if (normalize_qk and not torch.is_grad_enabled()
+                    and self.dtype != compute_dtype):
+                # ``K_IComp_valid`` is a fresh fp32/fp64 copy here, and
+                # the indexer would normalize it with ``F.normalize``
+                # (mode 'l2') as its first step. Normalizing the copy in
+                # place performs the identical per-element chain and
+                # avoids the second full-sized temporary. The query is
+                # normalized the same way (it is a single [B, 1, nIh, c_I]
+                # row per step).
+                _qk_normalize_(K_IComp_valid, 'l2')
+                q_idx_n = torch.nn.functional.normalize(
+                    _to_dtype(q_idx, compute_dtype), dim=-1)
+                # ``scale=1.0`` + ``normalize_qk=False`` reproduces the
+                # indexer's ``normalize_qk=True`` auto-scale exactly.
+                indexer_result = csa_lightning_indexer(
+                    q_idx_n,
+                    K_IComp_valid,
+                    _to_dtype(w_idx, compute_dtype),
+                    topk,
+                    scale=1.0,
+                    causal_block_mask=cbm,
+                    return_soft_weights=effective_use_ste,
+                    ste_mode=ste_mode,
+                    normalize_qk=False,
+                )
+            else:
+                indexer_result = csa_lightning_indexer(
+                    _to_dtype(q_idx, compute_dtype),                    # [B, 1, nIh, c_I]
+                    K_IComp_valid,                                      # [B, n_blocks, c_I]
+                    _to_dtype(w_idx, compute_dtype),                    # [B, 1, nIh]
+                    topk,
+                    # Defer scale selection to csa_lightning_indexer — it
+                    # picks 1.0 when normalize_qk=True (cosine),
+                    # 1/sqrt(c_I) otherwise.
+                    scale=None,
+                    causal_block_mask=cbm,
+                    return_soft_weights=effective_use_ste,
+                    ste_mode=ste_mode,
+                    normalize_qk=normalize_qk,
+                )
             if effective_use_ste:
                 indices, soft_weights = indexer_result
             else:
@@ -1382,21 +1455,25 @@ class CSADecodingCache:
             else:
                 valid_mask = indices >= 0                              # [B, 1, topk]
                 idx_safe = indices.clamp(min=0)                        # [B, 1, topk]
-                # Flat ``index_select`` row gather (same as ``naive_csa``);
-                # value-identical to advanced indexing (distinct blocks
-                # per row).
-                nblk = C_comp_valid.shape[1]
-                flat_idx = (
-                    idx_safe
-                    + torch.arange(B, device=device).view(B, 1, 1) * nblk
-                ).reshape(-1)
-                kv = torch.index_select(
-                    C_comp_valid.reshape(B * nblk, C_comp_valid.shape[-1]),
-                    0, flat_idx,
-                ).view(B, 1, idx_safe.shape[-1], C_comp_valid.shape[-1])  # [B, 1, topk, c]
+                # Per-batch ``dim=1`` gather straight out of the
+                # storage-dtype cache (value-identical to the flat
+                # ``index_select`` used by ``naive_csa``; distinct blocks
+                # per row). Gathering before the upcast keeps the compute
+                # dtype allocation at [B, 1, topk, c] instead of
+                # [B, n_blocks, c], and avoids materializing the
+                # ``[B*n_blocks, c]`` reshape copy when B > 1.
+                nblk = C_comp_storage.shape[1]
+                dim = C_comp_storage.shape[-1]
+                kv = torch.gather(
+                    C_comp_storage.unsqueeze(1).expand(B, 1, nblk, dim),
+                    2,
+                    idx_safe.unsqueeze(-1).expand(
+                        B, 1, idx_safe.shape[-1], dim),
+                )                                                      # [B, 1, topk, c]
+                kv = _to_dtype(kv, compute_dtype)
                 if normalize_qk:
                     # Per-row normalization after the gather (see the note
-                    # at ``C_comp_valid`` above).
+                    # at ``C_comp_storage`` above).
                     kv = _qk_normalize(kv, self.qk_norm_mode)
                 # STE for the indexer (mirrors ``naive_csa``).
                 if effective_use_ste and soft_weights is not None:
@@ -1410,8 +1487,16 @@ class CSADecodingCache:
                         # The full-softmax expected KV reads every block,
                         # so only this branch needs the fully normalized
                         # compressed rows (identical per-row values).
-                        C_comp_n = (_qk_normalize(C_comp_valid, self.qk_norm_mode)
-                                    if normalize_qk else C_comp_valid)
+                        C_comp_n = _to_dtype(C_comp_storage, compute_dtype)
+                        if normalize_qk:
+                            C_comp_n = _qk_normalize(
+                                C_comp_n, self.qk_norm_mode)
+                        elif torch.is_grad_enabled():
+                            # Same grad-mode clone contract as before: the
+                            # einsum saves ``C_comp_n`` and a later
+                            # ``append_step`` would invalidate a view in
+                            # place.
+                            C_comp_n = C_comp_n.clone()
                         soft_full = torch.einsum(
                             'btn,bnc->btc', soft_weights, C_comp_n,
                         )                                              # [B, 1, c]
@@ -2023,10 +2108,16 @@ class HCADecodingCache:
             # ablations a real off-switch rather than a silently-ignored
             # flag.
             if normalize_qk:
-                C_comp_n = _qk_normalize(
-                    _to_dtype(self._C_comp[:, :self._n_blocks],
-                              compute_dtype),
-                    self.qk_norm_mode)                                # [B, n_blocks, c]
+                C_comp_n = _to_dtype(
+                    self._C_comp[:, :self._n_blocks], compute_dtype)
+                if not torch.is_grad_enabled() and self.dtype != compute_dtype:
+                    # ``C_comp_n`` is a fresh compute-dtype copy here
+                    # (the cast above allocated it); normalize it in
+                    # place to avoid a second full-sized temporary. Same
+                    # per-element chain as ``_qk_normalize``.
+                    C_comp_n = _qk_normalize_(C_comp_n, self.qk_norm_mode)
+                else:
+                    C_comp_n = _qk_normalize(C_comp_n, self.qk_norm_mode)  # [B, n_blocks, c]
             else:
                 C_comp_n = _to_dtype(
                     self._C_comp[:, :self._n_blocks], compute_dtype)

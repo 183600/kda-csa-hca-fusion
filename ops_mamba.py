@@ -200,8 +200,12 @@ _SCAN_INTRA_SLAB_ELEMS = 8_000_000
 
 # Shape-keyed cache for the strict-lower-triangular causal mask consumed by
 # ``chunked_mamba2_scan``. It depends only on (chunk_size, device) and is
-# read-only at every use site (``masked_fill(~causal, ...)``).
+# read-only at every use site (``masked_fill(~causal, ...)``). ``chunk_size``
+# may legally be as large as ``T``, so a single mask can reach GB size; masks
+# beyond the element budget are recomputed per call instead of retained
+# (recomputation produces the same bits).
 _CAUSAL_CHUNK_MASK_CACHE: dict = {}
+_CAUSAL_CHUNK_MASK_MAX_ELEMS = 1 << 22
 
 
 def _causal_chunk_mask(BT: int, device) -> torch.Tensor:
@@ -211,9 +215,10 @@ def _causal_chunk_mask(BT: int, device) -> torch.Tensor:
     if mask is None:
         mask = torch.tril(
             torch.ones(BT, BT, dtype=torch.bool, device=device))
-        if len(_CAUSAL_CHUNK_MASK_CACHE) >= 64:
-            _CAUSAL_CHUNK_MASK_CACHE.clear()
-        _CAUSAL_CHUNK_MASK_CACHE[key] = mask
+        if BT * BT <= _CAUSAL_CHUNK_MASK_MAX_ELEMS:
+            if len(_CAUSAL_CHUNK_MASK_CACHE) >= 64:
+                _CAUSAL_CHUNK_MASK_CACHE.clear()
+            _CAUSAL_CHUNK_MASK_CACHE[key] = mask
     return mask
 
 
@@ -271,23 +276,27 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     explicit two-step form so both layouts produce the exact bits they
     produced before the readout was fused.
     """
-    ys: list[torch.Tensor] = []
     T = x_dt.shape[1]
     x_steps = x_dt.unbind(1)
     decay_steps = decay_slab.unbind(1)
     C_steps = C_h.unbind(1)
     Dx_steps = Dx_slab.unbind(1)
+    # Preallocate the output and write one time slice per step: index
+    # assignment is elementwise-identical to the append-and-stack form
+    # (which squeezes the singleton head dim only once, after the stack).
+    ys = torch.empty(
+        x_dt.shape[0], T, 1, S.shape[-2], dtype=S.dtype, device=S.device)
     if S.is_contiguous():
         S_T = S.transpose(-1, -2)
         for t in range(T):
             S = S.mul_(decay_steps[t]).add_(x_steps[t])
-            ys.append(torch.baddbmm(Dx_steps[t], C_steps[t], S_T))
+            ys[:, t] = torch.baddbmm(Dx_steps[t], C_steps[t], S_T)
     else:
         for t in range(T):
             S = S.mul_(decay_steps[t]).add_(x_steps[t])
-            ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2))
-                      + Dx_steps[t])
-    return torch.stack(ys, dim=1).squeeze(-2), S
+            ys[:, t] = (torch.bmm(C_steps[t], S.transpose(-1, -2))
+                        + Dx_steps[t])
+    return ys.squeeze(-2), S
 
 
 def _get_scripted_scan_loop():
@@ -503,20 +512,6 @@ def naive_mamba2_scan(
     # a direct 3D ``bmm`` computing the same per-batch GEMM as the
     # equivalent 4D ``matmul``.
     _bh = batch * nheads
-    if heads_per_group == 1:
-        # No head expansion to do: the group C/B tensors ARE the per-head
-        # ones.
-        B_h_flat = (B_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
-        C_h_flat = (C_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, d_state))
-    else:
-        B_h_flat = (B_c.permute(0, 2, 1, 3).unsqueeze(2)
-                    .expand(batch, ngroups, heads_per_group, seqlen, d_state)
-                    .reshape(_bh, seqlen, d_state))
-        C_h_flat = (C_c.permute(0, 2, 1, 3).unsqueeze(2)
-                    .expand(batch, ngroups, heads_per_group, seqlen, d_state)
-                    .reshape(_bh, seqlen, d_state))
-    x_flat = x_c.permute(0, 2, 1, 3).reshape(_bh, seqlen, headdim)
-    dt_flat = dt_c.permute(0, 2, 1).reshape(_bh, seqlen, 1, 1)
     A_col = A_c.repeat(batch).reshape(_bh, 1, 1, 1)          # [bh, 1, 1, 1]
     D_col = D_c.repeat(batch).reshape(_bh, 1, 1)             # [bh, 1, 1]
     S_flat = S.reshape(_bh, headdim, d_state)
@@ -524,7 +519,11 @@ def naive_mamba2_scan(
     # Slab the precomputed factors for long sequences; the recurrent state
     # carries across slabs, so the values do not depend on the slab size.
     # Only the outer product is held at slab size, so the whole element
-    # budget applies to it.
+    # budget applies to it. The head expansion (permute+reshape, or the
+    # ``expand`` for grouped B/C) is built per slab from the 4D inputs
+    # instead of flattening the whole sequence up front, so the flattened
+    # copies stay slab-bounded as well (identical copies of the same
+    # values).
     slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
                // max(1, batch * nheads * headdim * d_state))
     # Autograd-safe out-of-place loop while a graph is being recorded; the
@@ -534,21 +533,44 @@ def naive_mamba2_scan(
     use_inplace = not torch.is_grad_enabled()
     loop = None if use_inplace else _get_scripted_scan_loop()
     loop_inplace = _get_scripted_scan_loop_inplace() if use_inplace else None
-    if use_inplace:
+    # The in-place loop mutates its state argument; only a caller-provided
+    # ``initial_state`` needs the defensive copy (a zero state built by the
+    # validator is already exclusively owned here).
+    if use_inplace and initial_state is not None:
         S_flat = S_flat.clone()
 
     y_slabs: list[torch.Tensor] = []
     for lo in range(0, seqlen, slab):
         hi = min(seqlen, lo + slab)
-        x_outer = (x_flat[:, lo:hi].unsqueeze(-1)
-                   * B_h_flat[:, lo:hi].unsqueeze(-2))       # [bh, slab, D, N]
-        dt_slab = dt_flat[:, lo:hi]                          # [bh, slab, 1, 1]
+        n_slab = hi - lo
+        if heads_per_group == 1:
+            # No head expansion to do: the group C/B tensors ARE the
+            # per-head ones.
+            B_h_slab = (B_c[:, lo:hi].permute(0, 2, 1, 3)
+                        .reshape(_bh, n_slab, d_state))
+            C_h_slab = (C_c[:, lo:hi].permute(0, 2, 1, 3)
+                        .reshape(_bh, n_slab, d_state))
+        else:
+            B_h_slab = (B_c[:, lo:hi].permute(0, 2, 1, 3).unsqueeze(2)
+                        .expand(batch, ngroups, heads_per_group, n_slab,
+                                d_state)
+                        .reshape(_bh, n_slab, d_state))
+            C_h_slab = (C_c[:, lo:hi].permute(0, 2, 1, 3).unsqueeze(2)
+                        .expand(batch, ngroups, heads_per_group, n_slab,
+                                d_state)
+                        .reshape(_bh, n_slab, d_state))
+        x_flat_slab = (x_c[:, lo:hi].permute(0, 2, 1, 3)
+                       .reshape(_bh, n_slab, headdim))
+        dt_flat_slab = (dt_c[:, lo:hi].permute(0, 2, 1)
+                        .reshape(_bh, n_slab, 1, 1))
+        x_outer = (x_flat_slab.unsqueeze(-1)
+                   * B_h_slab.unsqueeze(-2))                 # [bh, slab, D, N]
         # ``dt * x_outer`` in place: ``x_outer`` was allocated just above
         # and has no other readers.
-        x_dt = x_outer.mul_(dt_slab)                         # [bh, slab, D, N]
-        decay_slab = torch.exp(dt_slab * A_col)              # [bh, slab, 1, 1]
-        C_slab = C_h_flat[:, lo:hi].unsqueeze(-2)            # [bh, slab, 1, N]
-        Dx_slab = (D_col * x_flat[:, lo:hi]).unsqueeze(-2)   # [bh, slab, 1, D]
+        x_dt = x_outer.mul_(dt_flat_slab)                    # [bh, slab, D, N]
+        decay_slab = torch.exp(dt_flat_slab * A_col)         # [bh, slab, 1, 1]
+        C_slab = C_h_slab.unsqueeze(-2)                      # [bh, slab, 1, N]
+        Dx_slab = (D_col * x_flat_slab).unsqueeze(-2)        # [bh, slab, 1, D]
         if use_inplace:
             fn = (loop_inplace if loop_inplace is not None
                   else _mamba2_scan_loop_inplace_eager)
@@ -561,10 +583,14 @@ def naive_mamba2_scan(
         y_slabs.append(y_slab)
     y_flat = (y_slabs[0] if len(y_slabs) == 1
               else torch.cat(y_slabs, dim=1))                # [bh, T, D]
+    # ``transpose`` after the reshape yields the target [B, T, H, D] layout
+    # as a view; the single ``to`` cast then produces the output in one
+    # pass (the transpose+reshape chain used to force an extra full-precision
+    # contiguous copy first). Values are unchanged; callers that need
+    # contiguity can call ``.contiguous()`` themselves.
     y = (y_flat.reshape(batch, nheads, seqlen, headdim)
-         .transpose(1, 2).reshape(batch, seqlen, nheads, headdim))
+         .transpose(1, 2).to(x.dtype))
     S = S_flat.reshape(batch, nheads, headdim, d_state)
-    y = y.to(x.dtype)
     return y, (S if output_final_state else None)
 
 
@@ -716,6 +742,12 @@ def _assoc_scan_chunk_transitions(
     """
     A = a
     BB = b
+    if not torch.is_grad_enabled():
+        # The doubling levels below overwrite the tail in place; the
+        # caller's tensors must not be touched (the eager/scripted parity
+        # tests reuse the same inputs), so work on dedicated copies.
+        A = a.clone()
+        BB = b.clone()
     off = 1
     levels = 0
     NT = a.shape[1]
@@ -730,8 +762,16 @@ def _assoc_scan_chunk_transitions(
         new_A_tail = A_tail * A_shift
         new_BB_tail = (A_tail.unsqueeze(-1).unsqueeze(-1) * BB_shift
                        + BB_tail)
-        A = torch.cat([A[:, :off], new_A_tail], dim=1)
-        BB = torch.cat([BB[:, :off], new_BB_tail], dim=1)
+        if torch.is_grad_enabled():
+            # Autograd keeps the out-of-place form: the cat produces a
+            # fresh tensor per level, so no saved operand is mutated.
+            A = torch.cat([A[:, :off], new_A_tail], dim=1)
+            BB = torch.cat([BB[:, :off], new_BB_tail], dim=1)
+        else:
+            # Prefix unchanged, tail replaced by the composed values
+            # computed above from the OLD tail: identical to the cat.
+            A[:, off:] = new_A_tail
+            BB[:, off:] = new_BB_tail
         off = off * 2
     # Inclusive prefixes after the scan: A[:, n] / BB[:, n] describe the
     # composed map of chunks 0..n. Exclusive form for S_in: chunk 0 sees S0
@@ -823,7 +863,12 @@ def chunked_mamba2_scan(
     ``chunk_size`` is padded with zero ``dt``/``x`` on the right; the
     padded steps leave the final state unchanged and are sliced off the
     output. The non-increasing-``G`` assumption (``A < 0``, ``dt ≥ 0``) is
-    the same contract the dual form documents.
+    the same contract the dual form documents. When the chunk-transition
+    source would exceed the shared slab element budget (e.g.
+    ``chunk_size=1`` on a very long sequence) the call falls back to
+    :func:`naive_mamba2_scan` — the sequential reference for the same
+    operator and the same tolerance contract — instead of materializing
+    the full-sequence source.
 
     Args:
         chunk_size: positions per chunk (must be a positive int). ``1``
@@ -866,6 +911,22 @@ def chunked_mamba2_scan(
     pad = (-seqlen) % BT
     Tp = seqlen + pad
     NT = Tp // BT
+    # The transition source ``b_chunk`` ([B, H, NT, D, N]) and the
+    # Hillis–Steele scan buffers ([BH, NT, D, N], 2–3 live copies) are
+    # allocated whole; only the intra-chunk term is slabbed. With
+    # ``chunk_size=1`` the source degenerates to the full-sequence dual
+    # tensor that :func:`naive_mamba2_scan` deliberately slabs, so past
+    # the shared slab budget fall back to that sequential reference.
+    # Splitting the transition scan across slabs instead would change the
+    # Hillis–Steele association order, so the fallback is the only
+    # semantic-preserving bound; both paths are the same operator's
+    # references (the fp64 tolerance contract pinned by
+    # ``test_chunked_ssd.py``).
+    if batch * nheads * NT * headdim * d_state > _SCAN_XOUTER_SLAB_ELEMS:
+        return naive_mamba2_scan(
+            x, dt, B, C, A, D,
+            initial_state=initial_state,
+            output_final_state=output_final_state)
     if pad:
         # A padded step has dt=0, so the cumulative log-decay must stay
         # CONSTANT (not jump to 0): extend G with a copy of its last value.
@@ -900,6 +961,7 @@ def chunked_mamba2_scan(
     # applied separately below), so the slab size changes only the transient
     # peak memory, never the values.
     causal = _causal_chunk_mask(BT, x.device)
+    noncausal = ~causal
     valid = None
     if pad:
         valid = (torch.arange(Tp, device=x.device) < seqlen).reshape(NT, BT)
@@ -910,19 +972,32 @@ def chunked_mamba2_scan(
         hi = min(NT, lo + slab_n)
         g_slab = g[:, :, lo:hi]
         diff = g_slab.unsqueeze(-1) - g_slab.unsqueeze(-2)  # [B,H,slab,C,C]
-        diff = diff.masked_fill(~causal, float('-inf'))
-        decay = torch.exp(diff)
+        # ``diff`` was allocated just above and has no other readers; the
+        # mask writes the same ``-inf`` entries in place (before the ``exp``,
+        # as required).
+        diff.masked_fill_(noncausal, float('-inf'))
         # cb[c, s] = C_c · B_s (per chunk); the readout is contracted with
         # the source x_s scaled by dt_s (dt at the SOURCE position).
         cb = torch.einsum(
             'bhncN,bhnsN->bhncs', Ch_r[:, :, lo:hi], Bh_r[:, :, lo:hi])
-        # ``decay`` / ``cb`` have no other readers; the same products in the
+        # ``decay`` / ``cb`` have no other readers. The same products in the
         # same association are evaluated in place to avoid a second
-        # slab-sized temporary.
-        weights = decay * cb
-        if pad:
-            weights = weights * valid[None, None, lo:hi, None, :]
-        weights = weights * dt_r[:, :, lo:hi].unsqueeze(-2)
+        # slab-sized temporary; in-place chained multiplies are only safe
+        # with autograd disabled (a saved operand would be mutated
+        # afterwards), so the graph-recording path keeps the out-of-place
+        # form.
+        if torch.is_grad_enabled():
+            decay = torch.exp(diff)
+            weights = decay * cb
+            if pad:
+                weights = weights * valid[None, None, lo:hi, None, :]
+            weights = weights * dt_r[:, :, lo:hi].unsqueeze(-2)
+        else:
+            weights = torch.exp(diff, out=diff)
+            weights.mul_(cb)
+            if pad:
+                weights.mul_(valid[None, None, lo:hi, None, :])
+            weights.mul_(dt_r[:, :, lo:hi].unsqueeze(-2))
         y_intra_slabs.append(torch.einsum(
             'bhncs,bhnsd->bhncd', weights, x_r[:, :, lo:hi]))
     y_intra = (y_intra_slabs[0] if len(y_intra_slabs) == 1

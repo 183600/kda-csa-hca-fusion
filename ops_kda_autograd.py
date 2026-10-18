@@ -64,7 +64,6 @@ Scope / limitations
 from __future__ import annotations
 
 import warnings as _warnings
-from typing import List
 
 import torch
 
@@ -135,8 +134,13 @@ def _custom_kda_forward_loop(q, k, v, g, beta, S, traj):
     Bit-identical to ``ops_kda._recurrent_kda_loop_eager`` (same ops, same
     association order), with optional bfloat16 numerical stability patches.
     """
-    outs = torch.jit.annotate(List[torch.Tensor], [])
+    # Preallocate the output and write one time slice per step (this loop
+    # only runs inside ``autograd.Function.forward``, where autograd is
+    # disabled); index assignment is elementwise-identical to the
+    # append-and-stack form.
     T = q.size(1)
+    o = torch.empty(q.size(0), T, q.size(2), v.size(-1),
+                    dtype=q.dtype, device=q.device)
     for t in range(T):
         traj[t] = S
         P = _bf16_safe_exp(g[:, t])
@@ -145,12 +149,7 @@ def _custom_kda_forward_loop(q, k, v, g, beta, S, traj):
         delta = v[:, t] - (k[:, t].unsqueeze(-1) * S).sum(-2)
         beta_k = (beta[:, t].unsqueeze(-1) * k[:, t]).unsqueeze(-1)
         S = _bf16_safe_addcmul(S, beta_k, delta.unsqueeze(-2))
-        outs.append((q[:, t].unsqueeze(-2) @ S).squeeze(-2))
-    if T > 0:
-        o = torch.stack(outs, 1)
-    else:
-        o = torch.empty(q.size(0), 0, q.size(2), v.size(-1),
-                        dtype=q.dtype, device=q.device)
+        o[:, t] = (q[:, t].unsqueeze(-2) @ S).squeeze(-2)
     return o, S
 
 
@@ -161,6 +160,14 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
     Includes bfloat16 numerical stability patches matching the forward pass.
     """
     T = q.size(1)
+    # Reused per-step temporary for the elementwise products below: the
+    # ``out=`` form performs the same IEEE product as the out-of-place
+    # form (no fusion), and the ``add_``/``sub`` that consume it are the
+    # in-place spellings of the same elementwise ops, so every value is
+    # bit-identical. The loop runs inside ``Function.backward`` (no-grad),
+    # and ``dS`` is always a fresh tensor here (``zeros_like`` or the
+    # caller's clone), so mutating it cannot touch a caller's gradient.
+    scratch = torch.empty_like(dS)
     for t in range(T - 1, -1, -1):
         S_prev = traj[t]
         k_t = k[:, t]
@@ -172,7 +179,9 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         bk = (beta_t.unsqueeze(-1) * k_t).unsqueeze(-1)
         S_t = _bf16_safe_addcmul(D, bk, delta.unsqueeze(-2))
 
-        dS = dS + q[:, t].unsqueeze(-1) * grad_o[:, t].unsqueeze(-2)
+        torch.mul(q[:, t].unsqueeze(-1), grad_o[:, t].unsqueeze(-2),
+                  out=scratch)
+        dS = dS.add_(scratch)
         dq[:, t] = (grad_o[:, t].unsqueeze(-2)
                     @ S_t.transpose(-1, -2)).squeeze(-2)
         ddelta = (dS * bk).sum(-2)
@@ -180,10 +189,11 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         dbeta[:, t] = (dbk * k_t).sum(-1)
         dk_t = dbk * beta_t.unsqueeze(-1)
         dv[:, t] = ddelta
-        dD = dS - k_t.unsqueeze(-1) * ddelta.unsqueeze(-2)
+        torch.mul(k_t.unsqueeze(-1), ddelta.unsqueeze(-2), out=scratch)
+        dD = dS - scratch
         dk_t = dk_t - (D @ ddelta.unsqueeze(-1)).squeeze(-1)
         dk[:, t] = dk_t
-        dS = dD * P.unsqueeze(-1)
+        dS = torch.mul(dD, P.unsqueeze(-1), out=dS)
         dg[:, t] = (dD * S_prev).sum(-1) * P
     return dS
 
