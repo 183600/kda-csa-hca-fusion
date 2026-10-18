@@ -97,7 +97,7 @@ from __future__ import annotations
 import torch
 
 from ops_rope import effective_rope_dim, partial_rope
-from ops_csa import (csa_compress_kv, csa_compress_kv_overlapped,
+from ops_csa import (csa_compress_kv, _csa_compress_kv_overlapped_prev,
                      csa_lightning_indexer, _qk_normalize, _qk_normalize_)
 
 
@@ -167,6 +167,71 @@ def _to_cache(x: torch.Tensor, dtype: torch.dtype, device) -> torch.Tensor:
     if x.dtype == dtype and x.device == device:
         return x
     return x.to(dtype=dtype, device=device)
+
+
+# Shape-keyed memo for the ``[n_blocks]`` causal block mask
+# ``b < b_threshold`` (paper Eq. 16). Depends only on
+# ``(n_blocks, b_threshold, device)`` and is read-only at every use site
+# (``~cbm`` / ``cbm[None, :]`` produce views/copies, and
+# ``csa_lightning_indexer`` negates without mutating), so the same storage
+# can be shared across decode steps.
+_BLOCK_VALID_MEMO: dict = {}
+
+# Shape-keyed memo for all-True boolean masks (the sliding-window validity
+# block of the joint-softmax mask). Read-only at every use site.
+_BOOL_ONES_MEMO: dict = {}
+
+# Per-device single-element int64 scratch used for the position arguments
+# of ``partial_rope``. Only reused outside autograd: when grad is enabled
+# the graph may retain the position tensor, so a fresh tensor is returned.
+_POS_SCRATCH: dict = {}
+
+
+def _block_valid_mask(n_blocks: int, b_threshold: int,
+                      device) -> torch.Tensor:
+    """Memoized ``arange(n_blocks, device=device) < b_threshold``."""
+    key = (n_blocks, b_threshold, str(device))
+    mask = _BLOCK_VALID_MEMO.get(key)
+    if mask is None:
+        mask = torch.arange(n_blocks, device=device) < b_threshold
+        if len(_BLOCK_VALID_MEMO) >= 128:
+            _BLOCK_VALID_MEMO.clear()
+        _BLOCK_VALID_MEMO[key] = mask
+    return mask
+
+
+def _bool_ones(B: int, n: int, device) -> torch.Tensor:
+    """Memoized ``torch.ones(B, 1, 1, n, dtype=torch.bool, device=device)``."""
+    key = (B, n, str(device))
+    mask = _BOOL_ONES_MEMO.get(key)
+    if mask is None:
+        mask = torch.ones(B, 1, 1, n, dtype=torch.bool, device=device)
+        if len(_BOOL_ONES_MEMO) >= 64:
+            _BOOL_ONES_MEMO.clear()
+        _BOOL_ONES_MEMO[key] = mask
+    return mask
+
+
+def _pos_tensor(value: int, device) -> torch.Tensor:
+    """``torch.tensor([value], device=device)``, with a no-grad scratch.
+
+    The scratch is overwritten (``fill_``) immediately before every use and
+    is only handed to read-only consumers, so the values seen are identical
+    to a fresh tensor. Outside autograd nothing can retain it; under grad a
+    fresh tensor is returned so a later ``fill_`` can never rewrite a value
+    kept alive by the graph.
+    """
+    if torch.is_grad_enabled():
+        return torch.tensor([value], device=device)
+    key = str(device)
+    buf = _POS_SCRATCH.get(key)
+    if buf is None:
+        if len(_POS_SCRATCH) >= 8:
+            _POS_SCRATCH.clear()
+        buf = torch.zeros(1, dtype=torch.long, device=device)
+        _POS_SCRATCH[key] = buf
+    buf.fill_(value)
+    return buf
 
 
 def _csa_compress_kv_overlapped_single(
@@ -982,8 +1047,7 @@ class CSADecodingCache:
                 # normalize-then-rotate order as ``naive_csa``'s
                 # sliding-window branch.
                 if self.rope_dim_eff > 0:
-                    pos_t = torch.tensor(
-                        [self._n_tokens_seen - 1], device=self.device)
+                    pos_t = _pos_tensor(self._n_tokens_seen - 1, self.device)
                     ca_store_i = partial_rope(
                         _to_dtype(ca_store_i, compute_dtype), pos_t,
                         self.rope_dim_eff, self.rope_base, dim=1)
@@ -1018,8 +1082,7 @@ class CSADecodingCache:
                 # (the paper scopes RoPE to the core attention, not
                 # the indexer scores).
                 if self.rope_dim_eff > 0:
-                    pos_b = torch.tensor(
-                        [self._n_blocks * self.m], device=self.device)
+                    pos_b = _pos_tensor(self._n_blocks * self.m, self.device)
                     new_C = partial_rope(
                         new_C.unsqueeze(1), pos_b,
                         self.rope_dim_eff, self.rope_base,
@@ -1028,15 +1091,17 @@ class CSADecodingCache:
                 # (compute_dtype) and return that dtype. Cast back to the
                 # cache's storage dtype before writing into the
                 # geometrically-grown storage so all rows stay uniform.
-                new_C_row = _to_dtype(new_C.unsqueeze(1), self.dtype)  # [B, 1, c]
-                new_K_I_row = _to_dtype(new_K_I.unsqueeze(1), self.dtype)  # [B, 1, c_I]
                 # Storage grows geometrically with the number of completed
                 # blocks. The public cache exposes only the valid prefix,
                 # while the storage tensors retain spare capacity for
-                # future blocks.
+                # future blocks. ``copy_`` casts with exactly the same
+                # rounding as ``.to`` and writes straight into the slot, so
+                # the intermediate ``[B, 1, c]`` row temporaries disappear.
                 self._ensure_compressed_capacity(self._n_blocks + 1)
-                self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
-                self._K_IComp[:, self._n_blocks:self._n_blocks + 1] = new_K_I_row
+                self._C_comp[:, self._n_blocks:self._n_blocks + 1].copy_(
+                    _to_dtype(new_C.unsqueeze(1), self.dtype))
+                self._K_IComp[:, self._n_blocks:self._n_blocks + 1].copy_(
+                    _to_dtype(new_K_I.unsqueeze(1), self.dtype))
                 self._n_blocks += 1
                 new_block_indices.append(self._n_blocks - 1)
                 # Stash the just-consumed Cb / Zb as the previous
@@ -1149,20 +1214,18 @@ class CSADecodingCache:
             Cb_rest = Cb_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
             Za_rest = Za_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
             Zb_rest = Zb_new[:, first_needed:rest_end].reshape(B, n_rest, m, c)
-            # Prepend the already-compressed first block so that the batched
-            # overlap shift gives the remaining blocks the correct partner
-            # (row 0 of the output is the first block itself and is dropped).
-            Ca_seq = torch.cat([Ca_first.unsqueeze(1), Ca_rest], dim=1)
-            Cb_seq = torch.cat([Cb_first.unsqueeze(1), Cb_rest], dim=1)
-            Za_seq = torch.cat([Za_first.unsqueeze(1), Za_rest], dim=1)
-            Zb_seq = torch.cat([Zb_first.unsqueeze(1), Zb_rest], dim=1)
-            new_C_rest = csa_compress_kv_overlapped(
-                Ca_seq.reshape(B, (n_rest + 1) * m, c),
-                Cb_seq.reshape(B, (n_rest + 1) * m, c),
-                Za_seq.reshape(B, (n_rest + 1) * m, c),
-                Zb_seq.reshape(B, (n_rest + 1) * m, c),
-                Ba, Bb, m,
-            )[:, 1:]                                               # [B, n_rest, c]
+            # The first kept block's overlap partner is the first physical
+            # block (a real block, unlike the -inf row the full-sequence
+            # helper uses for its dropped row 0). Build only those two
+            # shifted sequences: no full-sequence concatenation, no
+            # recomputation of the already-handled first block.
+            Cb_prev_rest = torch.cat(
+                [Cb_first.unsqueeze(1), Cb_rest[:, :-1]], dim=1)
+            Zb_prev_rest = torch.cat(
+                [Zb_first.unsqueeze(1), Zb_rest[:, :-1]], dim=1)
+            new_C_rest = _csa_compress_kv_overlapped_prev(
+                Ca_rest, Za_rest, Cb_prev_rest, Zb_prev_rest, Ba, Bb,
+            )                                                      # [B, n_rest, c]
             new_K_rest = csa_compress_kv(
                 K_idx_new[:, first_needed:rest_end].reshape(
                     B, n_rest * m, self.c_I),
@@ -1170,31 +1233,41 @@ class CSADecodingCache:
                     B, n_rest * m, self.c_I),
                 B_idx, m,
             )                                                      # [B, n_rest, c_I]
-            new_C_all = torch.cat(
-                [new_C_first.unsqueeze(1), new_C_rest], dim=1)
-            new_K_all = torch.cat(
-                [new_K_first.unsqueeze(1), new_K_rest], dim=1)
             last_Cb = Cb_rest[:, -1]
             last_Zb = Zb_rest[:, -1]
         else:
-            new_C_all = new_C_first.unsqueeze(1)
-            new_K_all = new_K_first.unsqueeze(1)
+            new_C_rest = None
+            new_K_rest = None
             last_Cb = Cb_first
             last_Zb = Zb_first
         n_new = 1 + n_rest
+        block_idx0 = self._n_blocks
         # Partial RoPE: rotate the just-completed compressed entries at
         # their block-anchor positions ``block_idx * m`` (same positions
-        # and normalize-then-rotate order as the per-token path).
-        if self.rope_dim_eff > 0:
-            pos_b = torch.arange(
-                self._n_blocks, self._n_blocks + n_new, device=self.device) * m
-            new_C_all = partial_rope(
-                new_C_all, pos_b,
-                self.rope_dim_eff, self.rope_base, dim=1)
-        block_idx0 = self._n_blocks
+        # and normalize-then-rotate order as the per-token path). The first
+        # block and the rest are rotated separately and written straight
+        # into storage slices; the per-row elements are identical.
+        pos_b = (torch.arange(block_idx0, block_idx0 + n_new,
+                              device=self.device) * m
+                 if self.rope_dim_eff > 0 else None)
+        first_C = new_C_first.unsqueeze(1)
+        if pos_b is not None:
+            first_C = partial_rope(
+                first_C, pos_b[:1], self.rope_dim_eff, self.rope_base, dim=1)
+            if new_C_rest is not None:
+                new_C_rest = partial_rope(
+                    new_C_rest, pos_b[1:], self.rope_dim_eff, self.rope_base,
+                    dim=1)
         self._ensure_compressed_capacity(block_idx0 + n_new)
-        self._C_comp[:, block_idx0:block_idx0 + n_new] = _to_dtype(new_C_all, dtype)
-        self._K_IComp[:, block_idx0:block_idx0 + n_new] = _to_dtype(new_K_all, dtype)
+        self._C_comp[:, block_idx0:block_idx0 + 1].copy_(
+            _to_dtype(first_C, dtype))
+        self._K_IComp[:, block_idx0:block_idx0 + 1].copy_(
+            _to_dtype(new_K_first.unsqueeze(1), dtype))
+        if new_C_rest is not None:
+            self._C_comp[:, block_idx0 + 1:block_idx0 + n_new].copy_(
+                _to_dtype(new_C_rest, dtype))
+            self._K_IComp[:, block_idx0 + 1:block_idx0 + n_new].copy_(
+                _to_dtype(new_K_rest, dtype))
         self._n_blocks += n_new
         new_block_indices = list(range(block_idx0, block_idx0 + n_new))
         # Stash the LAST block's Cb / Zb as the overlap partner for the next
@@ -1312,7 +1385,7 @@ class CSADecodingCache:
         # The rotation applies to the last ``rope_dim_eff`` dims of each
         # per-head vector; the head axis is untouched.
         if self.rope_dim_eff > 0:
-            pos_t = torch.tensor([t], device=device)
+            pos_t = _pos_tensor(t, device)
             q = partial_rope(
                 _to_dtype(q, compute_dtype), pos_t,
                 self.rope_dim_eff, self.rope_base, dim=1)          # [B, 1, nh, c]
@@ -1363,8 +1436,8 @@ class CSADecodingCache:
             # just-completed) is excluded; its content is reachable via
             # the sliding-window branch.
             b_threshold = t // self.m
-            cbm = torch.arange(n_blocks, device=device) < b_threshold   # [n_blocks]
-            cbm = cbm[None, :]                                          # [1, n_blocks]
+            cbm = _block_valid_mask(
+                n_blocks, b_threshold, device)[None, :]                 # [1, n_blocks]
             # Honor ``normalize_qk`` for the CORE attention (as in
             # ``naive_csa``). When normalize_qk=True compressed KV are
             # normalized with ``qk_norm_mode`` (cosine-similarity
@@ -1473,8 +1546,13 @@ class CSADecodingCache:
                 kv = _to_dtype(kv, compute_dtype)
                 if normalize_qk:
                     # Per-row normalization after the gather (see the note
-                    # at ``C_comp_storage`` above).
-                    kv = _qk_normalize(kv, self.qk_norm_mode)
+                    # at ``C_comp_storage`` above). ``kv`` is the fresh
+                    # gather output, so outside autograd the normalization
+                    # runs in place (bit-identical per-element chain).
+                    if torch.is_grad_enabled():
+                        kv = _qk_normalize(kv, self.qk_norm_mode)
+                    else:
+                        kv = _qk_normalize_(kv, self.qk_norm_mode)
                 # STE for the indexer (mirrors ``naive_csa``).
                 if effective_use_ste and soft_weights is not None:
                     soft_weights_selected = torch.gather(
@@ -1514,8 +1592,12 @@ class CSADecodingCache:
                 )                                                      # [B, 1, nh, topk]
                 if core_scale != 1.0:
                     # Multiplying by exactly 1.0 is an IEEE no-op, so the
-                    # guarded multiply is value-identical.
-                    scores = scores * core_scale
+                    # guarded multiply is value-identical. Outside autograd
+                    # the fresh einsum output is scaled in place.
+                    if torch.is_grad_enabled():
+                        scores = scores * core_scale
+                    else:
+                        scores.mul_(core_scale)
                 # The einsum output (or its freshly scaled copy) is not
                 # saved by any autograd node, so the mask can be written
                 # in place (mirrors ``naive_csa``).
@@ -1554,8 +1636,12 @@ class CSADecodingCache:
             )                                                          # [B, nh, sw_len]
             if core_scale != 1.0:
                 # Multiplying by exactly 1.0 is an IEEE no-op, so the
-                # guarded multiply is value-identical.
-                sw = sw * core_scale
+                # guarded multiply is value-identical. Outside autograd the
+                # fresh einsum output is scaled in place.
+                if torch.is_grad_enabled():
+                    sw = sw * core_scale
+                else:
+                    sw.mul_(core_scale)
             scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
         # JOINT softmax over [blocks; window] with the sink in the single
@@ -1567,7 +1653,7 @@ class CSADecodingCache:
         if n_win:
             cat_valid = torch.cat(
                 [valid_mask[:, :, None, :],
-                 torch.ones(B, 1, 1, n_win, dtype=torch.bool, device=device)],
+                 _bool_ones(B, n_win, device)],
                 dim=-1)
         else:
             cat_valid = valid_mask[:, :, None, :]
@@ -1583,12 +1669,22 @@ class CSADecodingCache:
             log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
             p = (shifted - log_denom).exp() * vmask
             all_invalid = ~cat_valid.any(-1, keepdim=True)
-            p = p.masked_fill(all_invalid, 0.0)
+            if torch.is_grad_enabled():
+                p = p.masked_fill(all_invalid, 0.0)
+            else:
+                p.masked_fill_(all_invalid, 0.0)
         else:
             all_invalid = ~cat_valid.any(-1, keepdim=True)
-            safe = cat.masked_fill(all_invalid, 0.0)
-            p = torch.softmax(safe, dim=-1)
-            p = p.masked_fill(all_invalid, 0.0)
+            if not torch.is_grad_enabled():
+                # ``cat`` / the softmax output are fresh tensors of this
+                # step; outside autograd the zeroing runs in place.
+                safe = cat.masked_fill_(all_invalid, 0.0)
+                p = torch.softmax(safe, dim=-1)
+                p.masked_fill_(all_invalid, 0.0)
+            else:
+                safe = cat.masked_fill(all_invalid, 0.0)
+                p = torch.softmax(safe, dim=-1)
+                p = p.masked_fill(all_invalid, 0.0)
 
         topk_size = scores.shape[-1]
         p_b = p[..., :topk_size]
@@ -1607,7 +1703,7 @@ class CSADecodingCache:
         # entry's contribution carries the relative (entry − query)
         # distance — mirroring ``naive_csa``'s output path.
         if self.rope_dim_eff > 0:
-            pos_t = torch.tensor([t], device=device)
+            pos_t = _pos_tensor(t, device)
             out = partial_rope(
                 out, -pos_t, self.rope_dim_eff, self.rope_base, dim=1)
         return out                                                     # [B, 1, nh, c]
@@ -1894,8 +1990,7 @@ class HCADecodingCache:
                 # normalize-then-rotate order as ``naive_hca``'s SW
                 # branch.
                 if self.rope_dim_eff > 0:
-                    pos_t = torch.tensor(
-                        [self._n_tokens_seen - 1], device=self.device)
+                    pos_t = _pos_tensor(self._n_tokens_seen - 1, self.device)
                     c_store_i = partial_rope(
                         _to_dtype(c_store_i, compute_dtype), pos_t,
                         self.rope_dim_eff, self.rope_base, dim=1)
@@ -1911,8 +2006,7 @@ class HCADecodingCache:
                 # normalizes at read time, mirroring the
                 # rotate-then-normalize order of ``naive_hca``.
                 if self.rope_dim_eff > 0:
-                    pos_b = torch.tensor(
-                        [self._n_blocks * self.m2], device=self.device)
+                    pos_b = _pos_tensor(self._n_blocks * self.m2, self.device)
                     new_C = partial_rope(
                         new_C.unsqueeze(1), pos_b,
                         self.rope_dim_eff, self.rope_base,
@@ -1920,9 +2014,9 @@ class HCADecodingCache:
                 # ``_hca_compress_kv_single`` returns fp32/fp64
                 # (compute_dtype) even when the cache stores fp16. Cast
                 # back to the storage dtype before writing the valid row.
-                new_C_row = _to_dtype(new_C.unsqueeze(1), self.dtype)  # [B, 1, c]
                 self._ensure_compressed_capacity(self._n_blocks + 1)
-                self._C_comp[:, self._n_blocks:self._n_blocks + 1] = new_C_row
+                self._C_comp[:, self._n_blocks:self._n_blocks + 1].copy_(
+                    _to_dtype(new_C.unsqueeze(1), self.dtype))
                 self._n_blocks += 1
                 new_block_indices.append(self._n_blocks - 1)
                 self._acc_C.clear()
@@ -2006,7 +2100,8 @@ class HCADecodingCache:
                 self.rope_dim_eff, self.rope_base, dim=1)
         block_idx0 = self._n_blocks
         self._ensure_compressed_capacity(block_idx0 + n_new)
-        self._C_comp[:, block_idx0:block_idx0 + n_new] = _to_dtype(new_C_all, dtype)
+        self._C_comp[:, block_idx0:block_idx0 + n_new].copy_(
+            _to_dtype(new_C_all, dtype))
         self._n_blocks += n_new
         new_block_indices = list(range(block_idx0, block_idx0 + n_new))
         # Leave the tokens past the last full block in the accumulator.
@@ -2078,7 +2173,7 @@ class HCADecodingCache:
         # position AFTER the caller's normalization (the same
         # normalize-then-rotate order as ``naive_hca``'s query path).
         if self.rope_dim_eff > 0:
-            pos_t = torch.tensor([t], device=device)
+            pos_t = _pos_tensor(t, device)
             q = partial_rope(
                 _to_dtype(q, compute_dtype), pos_t,
                 self.rope_dim_eff, self.rope_base, dim=1)          # [B, 1, nh, c]
@@ -2097,8 +2192,8 @@ class HCADecodingCache:
             # excluded; its content is served by the SW branch). Matches
             # ``ops_csa._causal_block_mask`` and ``naive_hca``.
             b_threshold = t // self.m2
-            cbm = torch.arange(n_blocks, device=device) < b_threshold
-            cbm = cbm[None, None, :]                                  # [1, 1, n_blocks]
+            cbm = _block_valid_mask(
+                n_blocks, b_threshold, device)[None, None, :]         # [1, 1, n_blocks]
             # Honor ``normalize_qk`` for the CORE attention (as in
             # ``naive_hca``). When normalize_qk=True compressed KV are
             # normalized with ``qk_norm_mode`` (cosine-similarity
@@ -2129,8 +2224,12 @@ class HCADecodingCache:
             )                                                          # [B, 1, nh, n_blocks]
             if core_scale != 1.0:
                 # Multiplying by exactly 1.0 is an IEEE no-op, so the
-                # guarded multiply is value-identical.
-                scores = scores * core_scale
+                # guarded multiply is value-identical. Outside autograd the
+                # fresh einsum output is scaled in place.
+                if torch.is_grad_enabled():
+                    scores = scores * core_scale
+                else:
+                    scores.mul_(core_scale)
             # In place: the einsum output is freshly allocated and not
             # saved by any autograd node (mirrors ``naive_hca``).
             scores.masked_fill_(~cbm[:, :, None, :], float('-inf'))
@@ -2161,8 +2260,12 @@ class HCADecodingCache:
             )                                                          # [B, nh, sw_len]
             if core_scale != 1.0:
                 # Multiplying by exactly 1.0 is an IEEE no-op, so the
-                # guarded multiply is value-identical.
-                sw = sw * core_scale
+                # guarded multiply is value-identical. Outside autograd the
+                # fresh einsum output is scaled in place.
+                if torch.is_grad_enabled():
+                    sw = sw * core_scale
+                else:
+                    sw.mul_(core_scale)
             scores_w = sw.unsqueeze(1)                                 # [B, 1, nh, sw_len]
 
         # JOINT softmax over [compressed; window] with the sink in the single
@@ -2180,12 +2283,22 @@ class HCADecodingCache:
             log_denom = torch.logaddexp(lse, shifted_sink)
             p = (shifted - log_denom).exp()
             all_masked = torch.isinf(cat).all(-1, keepdim=True)
-            p = p.masked_fill(all_masked, 0.0)
+            if torch.is_grad_enabled():
+                p = p.masked_fill(all_masked, 0.0)
+            else:
+                p.masked_fill_(all_masked, 0.0)
         else:
             all_masked = torch.isinf(cat).all(-1, keepdim=True)
-            safe = cat.masked_fill(all_masked, 0.0)
-            p = torch.softmax(safe, dim=-1)
-            p = p.masked_fill(all_masked, 0.0)
+            if not torch.is_grad_enabled():
+                # ``cat`` / the softmax output are fresh tensors of this
+                # step; outside autograd the zeroing runs in place.
+                safe = cat.masked_fill_(all_masked, 0.0)
+                p = torch.softmax(safe, dim=-1)
+                p.masked_fill_(all_masked, 0.0)
+            else:
+                safe = cat.masked_fill(all_masked, 0.0)
+                p = torch.softmax(safe, dim=-1)
+                p = p.masked_fill(all_masked, 0.0)
         n_blk = scores.shape[-1]
         p_dense = p[..., :n_blk]
         p_w = p[..., n_blk:]
@@ -2203,7 +2316,7 @@ class HCADecodingCache:
         # entry's contribution carries the relative (entry − query)
         # distance — mirroring ``naive_hca``'s output path.
         if self.rope_dim_eff > 0:
-            pos_t = torch.tensor([t], device=device)
+            pos_t = _pos_tensor(t, device)
             out = partial_rope(
                 out, -pos_t, self.rope_dim_eff, self.rope_base, dim=1)
         return out

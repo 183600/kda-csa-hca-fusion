@@ -222,6 +222,25 @@ def _causal_chunk_mask(BT: int, device) -> torch.Tensor:
     return mask
 
 
+# Cached negation of ``_causal_chunk_mask`` (True = strictly-above-diagonal,
+# the entries masked to ``-inf`` before the decay exp). Read-only at every
+# use site, same byte budget as the positive mask.
+_NONCAUSAL_CHUNK_MASK_CACHE: dict = {}
+
+
+def _noncausal_chunk_mask(BT: int, device) -> torch.Tensor:
+    """Cached ``~_causal_chunk_mask(BT, device)`` (read-only)."""
+    key = (BT, str(device))
+    mask = _NONCAUSAL_CHUNK_MASK_CACHE.get(key)
+    if mask is None:
+        mask = ~_causal_chunk_mask(BT, device)
+        if BT * BT <= _CAUSAL_CHUNK_MASK_MAX_ELEMS:
+            if len(_NONCAUSAL_CHUNK_MASK_CACHE) >= 64:
+                _NONCAUSAL_CHUNK_MASK_CACHE.clear()
+            _NONCAUSAL_CHUNK_MASK_CACHE[key] = mask
+    return mask
+
+
 def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     """Sequential scan body over one slab of precomputed factors.
 
@@ -539,7 +558,12 @@ def naive_mamba2_scan(
     if use_inplace and initial_state is not None:
         S_flat = S_flat.clone()
 
-    y_slabs: list[torch.Tensor] = []
+    # Preallocated output: each slab is written straight into its time slice
+    # (index assignment is elementwise-identical to the former
+    # append-and-cat), so the slab temporaries are released as the loop
+    # advances instead of being held until the final concatenation.
+    y_flat = torch.empty(_bh, seqlen, headdim,
+                         dtype=S_flat.dtype, device=S_flat.device)
     for lo in range(0, seqlen, slab):
         hi = min(seqlen, lo + slab)
         n_slab = hi - lo
@@ -580,9 +604,7 @@ def naive_mamba2_scan(
         else:
             y_slab, S_flat = _mamba2_scan_loop_eager(
                 x_dt, decay_slab, C_slab, Dx_slab, S_flat)
-        y_slabs.append(y_slab)
-    y_flat = (y_slabs[0] if len(y_slabs) == 1
-              else torch.cat(y_slabs, dim=1))                # [bh, T, D]
+        y_flat[:, lo:hi] = y_slab
     # ``transpose`` after the reshape yields the target [B, T, H, D] layout
     # as a view; the single ``to`` cast then produces the output in one
     # pass (the transpose+reshape chain used to force an extra full-precision
@@ -672,15 +694,21 @@ def quadratic_mamba2_scan(
     # would overflow to inf and inf * 0 = NaN could then poison the masked
     # entries). Below-diagonal entries become exactly 0.
     diff = G.unsqueeze(2) - G.unsqueeze(1)               # [B, T, T, H]
-    causal = torch.tril(torch.ones(
-        seqlen, seqlen, dtype=torch.bool, device=x.device))
-    decay = torch.exp(
-        diff.masked_fill(~causal[None, :, :, None], float('-inf')))
-
+    noncausal = _noncausal_chunk_mask(seqlen, x.device)
     # [b, t, s, h] = (C_t . B_s) * dt_s; broadcast dt over the readout
     # position t via an extra singleton dim (dim 1).
     cb = torch.einsum('bthn,bshn->btsh', C_h, B_h)
-    weights = decay * cb * dt_c.unsqueeze(1)
+    if torch.is_grad_enabled():
+        decay = torch.exp(
+            diff.masked_fill(noncausal[None, :, :, None], float('-inf')))
+        weights = decay * cb * dt_c.unsqueeze(1)
+    else:
+        # ``diff`` / ``cb`` are fresh tensors of this call; outside autograd
+        # the identical elementwise chain runs in place (same association
+        # order for the product).
+        decay = diff.masked_fill_(
+            noncausal[None, :, :, None], float('-inf')).exp_()
+        weights = decay.mul_(cb).mul_(dt_c.unsqueeze(1))
     y = torch.einsum('btsh,bshd->bthd', weights, x_c)
     if initial_state is not None:
         y = y + torch.exp(G).unsqueeze(-1) * torch.einsum(
@@ -712,6 +740,7 @@ def _assoc_scan_chunk_transitions(
     a: torch.Tensor,
     b: torch.Tensor,
     S0: torch.Tensor,
+    _owns_inputs: bool = False,
 ) -> tuple:
     """TorchScript-compatible associative scan of scalar chunk transitions.
 
@@ -742,10 +771,13 @@ def _assoc_scan_chunk_transitions(
     """
     A = a
     BB = b
-    if not torch.is_grad_enabled():
+    if not torch.is_grad_enabled() and not _owns_inputs:
         # The doubling levels below overwrite the tail in place; the
         # caller's tensors must not be touched (the eager/scripted parity
         # tests reuse the same inputs), so work on dedicated copies.
+        # ``_owns_inputs=True`` marks the private call site, which passes
+        # freshly-built tensors that are never read again afterwards (the
+        # in-place tail writes are then pure buffer reuse).
         A = a.clone()
         BB = b.clone()
     off = 1
@@ -935,22 +967,25 @@ def chunked_mamba2_scan(
         dt_c = F.pad(dt_c, (0, 0, 0, pad))
         B_h = F.pad(B_h, (0, 0, 0, 0, 0, pad))
         C_h = F.pad(C_h, (0, 0, 0, 0, 0, pad))
-    # Cumulative log-decay BEFORE each position (so ``G_prev[:, t0]`` is the
-    # state level at which chunk t0 begins).
-    G_prev = torch.cat(
+    # Cumulative log-decay at the START of each chunk (the state level at
+    # which chunk n begins): 0 for chunk 0, ``G[:, n*BT - 1]`` otherwise.
+    # Only these NT boundary values are read below (``G_prev[:, t0]``), so
+    # they are gathered directly instead of materializing the whole
+    # ``[B, T, H]`` position-shifted sequence. The gathered entries are the
+    # same tensor elements as before.
+    G_chunk_start = torch.cat(
         [torch.zeros(batch, 1, nheads, device=x.device, dtype=compute_dtype),
-         G[:, :-1]], dim=1)
+         G[:, BT - 1:Tp - BT:BT, :]], dim=1)                # [B, NT, H]
 
     # Chunk-major views: [B, H, NT, C, ...] / [B, H, NT, C].
     G_r = G.reshape(batch, NT, BT, nheads).permute(0, 3, 1, 2)
-    Gp_r = G_prev.reshape(batch, NT, BT, nheads).permute(0, 3, 1, 2)
     x_r = x_c.reshape(batch, NT, BT, nheads, headdim).permute(0, 3, 1, 2, 4)
     dt_r = dt_c.reshape(batch, NT, BT, nheads).permute(0, 3, 1, 2)
     Bh_r = B_h.reshape(batch, NT, BT, nheads, d_state).permute(0, 3, 1, 2, 4)
     Ch_r = C_h.reshape(batch, NT, BT, nheads, d_state).permute(0, 3, 1, 2, 4)
 
     # Chunk-local log-gating: g_c = G_{t0+c} - G_{t0-1} <= 0.
-    g = G_r - Gp_r[:, :, :, :1]                           # [B, H, NT, C]
+    g = G_r - G_chunk_start.permute(0, 2, 1).unsqueeze(-1)  # [B, H, NT, C]
 
     # --- intra-chunk quadratic term -----------------------------------
     # decay[t, s] = exp(G_t - G_s) for s <= t inside the chunk. The strict
@@ -960,14 +995,16 @@ def chunked_mamba2_scan(
     # chunk's intra-chunk term is independent (the inter-chunk state is
     # applied separately below), so the slab size changes only the transient
     # peak memory, never the values.
-    causal = _causal_chunk_mask(BT, x.device)
-    noncausal = ~causal
+    noncausal = _noncausal_chunk_mask(BT, x.device)
     valid = None
     if pad:
         valid = (torch.arange(Tp, device=x.device) < seqlen).reshape(NT, BT)
     slab_n = max(1, _SCAN_INTRA_SLAB_ELEMS
                  // max(1, batch * nheads * BT * BT))
-    y_intra_slabs: list[torch.Tensor] = []
+    # Preallocated output written slab-by-slab (elementwise-identical to the
+    # former append-and-cat), so only one slab-sized transient is live.
+    y_intra = torch.empty(batch, nheads, NT, BT, headdim,
+                          dtype=compute_dtype, device=x.device)
     for lo in range(0, NT, slab_n):
         hi = min(NT, lo + slab_n)
         g_slab = g[:, :, lo:hi]
@@ -998,10 +1035,8 @@ def chunked_mamba2_scan(
             if pad:
                 weights.mul_(valid[None, None, lo:hi, None, :])
             weights.mul_(dt_r[:, :, lo:hi].unsqueeze(-2))
-        y_intra_slabs.append(torch.einsum(
-            'bhncs,bhnsd->bhncd', weights, x_r[:, :, lo:hi]))
-    y_intra = (y_intra_slabs[0] if len(y_intra_slabs) == 1
-               else torch.cat(y_intra_slabs, dim=2))       # [B,H,NT,C,D]
+        y_intra[:, :, lo:hi] = torch.einsum(
+            'bhncs,bhnsd->bhncd', weights, x_r[:, :, lo:hi])
 
     # --- chunk transition (a_n) and source (b_n) ----------------------
     # b_n[d, N] = Σ_s exp(g_last - g_s) dt_s x_s[d] B_h[s, N]
@@ -1014,9 +1049,12 @@ def chunked_mamba2_scan(
 
     BH = batch * nheads
     scan = _get_scripted_chunk_transition_scan()
+    # ``_owns_inputs=True``: the reshaped ``a_chunk`` / ``b_chunk`` views are
+    # consumed only by the scan, so its no-grad in-place tail writes reuse
+    # their storage instead of cloning first.
     scan_args = (a_chunk.reshape(BH, NT),
                  b_chunk.reshape(BH, NT, headdim, d_state),
-                 S0.reshape(BH, headdim, d_state))
+                 S0.reshape(BH, headdim, d_state), True)
     if scan is not None:
         S_in, S_end, _levels = scan(*scan_args)
     else:
@@ -1313,7 +1351,12 @@ class Mamba2Mixer(nn.Module):
         # the scan's per-head view) expects ``[B, T, d_inner]``; materializing
         # the layout ONCE avoids a copy per consumer (values identical — a
         # pure layout change).
-        x_act = F.silu(conv_out).transpose(1, 2).contiguous()  # [B, T, d_inner]
+        # The conv output is fresh; outside autograd the activation runs in
+        # place (identical values), the layout ops below are unchanged.
+        if torch.is_grad_enabled():
+            x_act = F.silu(conv_out).transpose(1, 2).contiguous()  # [B, T, d_inner]
+        else:
+            x_act = F.silu(conv_out, inplace=True).transpose(1, 2).contiguous()
 
         # New conv state: the last (d_conv - 1) conv INPUTS. Deriving it
         # from conv_in (not from xt) automatically handles T < d_conv - 1:
@@ -1361,7 +1404,14 @@ class Mamba2Mixer(nn.Module):
         # y in x.dtype; the gating + out_proj run in the input dtype so the
         # mixer's output dtype always matches its input dtype.
         y = y.reshape(B, T, self.d_inner)
-        y = y * F.silu(z)
+        if torch.is_grad_enabled():
+            y = y * F.silu(z)
+        else:
+            # ``z`` / ``y`` are fresh here (a chunk view of the fresh
+            # in-projection output and the fresh scan output); outside
+            # autograd the activation and product run in place with the
+            # identical values.
+            y = y.mul_(F.silu(z, inplace=True))
         out = self.out_proj(y)
         return out, new_state, new_conv
 

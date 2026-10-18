@@ -52,6 +52,7 @@ the same function with negated positions.
 from __future__ import annotations
 
 import collections as _collections
+import weakref as _weakref
 
 import torch
 
@@ -136,6 +137,26 @@ _INT_POS_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
 # table is passed as a stride-0 broadcast view.
 _ROPE_MATERIALIZE_MIN_ELEMS = 1024
 
+# Identity/version-keyed cache for LONG position vectors (full-sequence
+# ``token_positions``): the value-keyed ``_TABLE_CACHE`` above only covers
+# short vectors. Within one CSA/HCA forward the same ``tpos`` tensor is
+# passed to 2-3 ``partial_rope`` calls (query, sliding-window keys, negated
+# output rotation), and its ``(cos, sin)`` tables are a pure function of the
+# position bits plus the rope parameters. The key carries the object id,
+# ``data_ptr`` and ``_version`` (an in-place update invalidates the entry);
+# a weakref to the positions tensor guards against id reuse after the
+# caller's tensor is garbage collected. Consumers treat positions as
+# read-only, matching the existing direct computation.
+_IDENTITY_TABLE_CACHE: dict = {}
+
+
+# Shape-keyed cache for the position vectors built by ``token_positions`` /
+# ``block_positions``. Within one CSA/HCA forward the same token-position
+# vector is consumed by 2-3 ``partial_rope`` calls (query, sliding-window
+# keys, negated output rotation); consumers only read / negate it, so the
+# cached tensor is shared and must be treated as immutable.
+_POSITION_VEC_CACHE: dict = {}
+
 
 def _materialize_pair_table(
     tbl: torch.Tensor,
@@ -158,11 +179,21 @@ def _materialize_pair_table(
     view_shape[dim] = tbl.shape[0]
     view_shape[-1] = tbl.shape[-1]
     out = tbl.view(view_shape)
+    # Materialize every inner axis (between the leading axis and the
+    # feature axis) that the source table does not already cover, in ONE
+    # ``expand`` + ``contiguous`` copy. This fills the exact same element
+    # slots as the former per-axis ``cat([out] * n)`` cascade with the
+    # same broadcast values, without the repeated full-tensor copies.
+    expand_shape = list(view_shape)
+    needs_materialize = False
     for ax in range(1, len(target_shape) - 1):
         n = target_shape[ax]
         if ax != dim and n != 1:
-            out = torch.cat([out] * n, dim=ax)
-    return out
+            expand_shape[ax] = n
+            needs_materialize = True
+    if not needs_materialize:
+        return out
+    return out.expand(expand_shape).contiguous()
 
 
 def _cos_sin_cached(
@@ -201,6 +232,40 @@ def _cos_sin_cached(
             _TABLE_CACHE_ELEMS -= _old_cos.numel() + _old_sin.numel()
         _TABLE_CACHE[key] = (cos, sin)
         _TABLE_CACHE_ELEMS += entry_elems
+    return cos, sin
+
+
+def _cos_sin_by_identity(
+    positions: torch.Tensor,
+    rope_dim: int,
+    base: float,
+    angle_dtype: torch.dtype,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Identity/version-keyed ``(cos, sin)`` tables (long position vectors).
+
+    Computes exactly the same tables as the direct branch of
+    :func:`partial_rope` (same expressions, same order), and returns the
+    cached pair when the same tensor object with the same contents is
+    passed again (the common case: one layer forward reuses ``tpos``).
+    """
+    key = (id(positions), positions.data_ptr(), positions._version,
+           tuple(positions.shape), positions.dtype, rope_dim, float(base),
+           str(device), angle_dtype)
+    entry = _IDENTITY_TABLE_CACHE.get(key)
+    if entry is not None:
+        ref, cos, sin = entry
+        if ref() is positions:
+            return cos, sin
+        _IDENTITY_TABLE_CACHE.pop(key, None)
+    pos_f = positions.to(device=device, dtype=angle_dtype)
+    angles = pos_f[:, None] * _inv_freq(rope_dim, base, device, angle_dtype)[None, :]
+    cos = angles.cos()
+    sin = angles.sin()
+    if cos.numel() + sin.numel() <= _TABLE_CACHE_MAX_ELEMS:
+        if len(_IDENTITY_TABLE_CACHE) >= 8:
+            _IDENTITY_TABLE_CACHE.clear()
+        _IDENTITY_TABLE_CACHE[key] = (_weakref.ref(positions), cos, sin)
     return cos, sin
 
 
@@ -269,9 +334,14 @@ def partial_rope(
         # Exact-value table cache (see ``_cos_sin_cached``); the uncached
         # branch below performs the identical computation. Only short
         # position vectors are keyed by value: the key construction is
-        # O(P) on the host, and full-sequence tables are not reused often
-        # enough to pay for it.
+        # O(P) on the host.
         cos, sin = _cos_sin_cached(
+            positions, rope_dim, base, angle_dtype, device)
+    elif (positions.dtype in _INT_POS_DTYPES and not positions.requires_grad):
+        # Long integer vectors: identity/version-keyed cache instead of the
+        # O(P) value key (see ``_cos_sin_by_identity``). Same expressions as
+        # the direct branch below, so values are bit-identical.
+        cos, sin = _cos_sin_by_identity(
             positions, rope_dim, base, angle_dtype, device)
     else:
         # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1
@@ -346,14 +416,36 @@ def partial_rope(
 
 
 def token_positions(T: int, device, dtype=torch.long) -> torch.Tensor:
-    """Positions 0..T-1 for query / sliding-window tokens."""
-    return torch.arange(T, device=device, dtype=dtype)
+    """Positions 0..T-1 for query / sliding-window tokens.
+
+    The returned tensor is cached and shared; callers must treat it as
+    read-only (all in-repo consumers do).
+    """
+    key = ('tok', T, str(device), str(dtype))
+    pos = _POSITION_VEC_CACHE.get(key)
+    if pos is None:
+        pos = torch.arange(T, device=device, dtype=dtype)
+        if len(_POSITION_VEC_CACHE) >= 64:
+            _POSITION_VEC_CACHE.clear()
+        _POSITION_VEC_CACHE[key] = pos
+    return pos
 
 
 def block_positions(n_blocks: int, m: int, device,
                     dtype=torch.long) -> torch.Tensor:
-    """Anchor positions ``s * m`` of the ``n_blocks`` compressed entries."""
-    return torch.arange(n_blocks, device=device, dtype=dtype) * m
+    """Anchor positions ``s * m`` of the ``n_blocks`` compressed entries.
+
+    The returned tensor is cached and shared; callers must treat it as
+    read-only (all in-repo consumers do).
+    """
+    key = ('blk', n_blocks, m, str(device), str(dtype))
+    pos = _POSITION_VEC_CACHE.get(key)
+    if pos is None:
+        pos = torch.arange(n_blocks, device=device, dtype=dtype) * m
+        if len(_POSITION_VEC_CACHE) >= 64:
+            _POSITION_VEC_CACHE.clear()
+        _POSITION_VEC_CACHE[key] = pos
+    return pos
 
 
 def inverse_partial_rope(

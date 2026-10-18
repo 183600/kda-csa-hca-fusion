@@ -933,9 +933,17 @@ class KDAHybridLayer(nn.Module):
         # otherwise each head's L2 norm becomes ~1/sqrt(H) instead of 1 and
         # the q.k dot products shrink by a factor of 1/H. Mirrors the
         # CSA/HCA branches below.
-        q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
-        k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
-        v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
+        if torch.is_grad_enabled():
+            q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
+            k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
+            v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
+        else:
+            # The projections are fresh linear outputs; outside autograd the
+            # activation runs in place (identical values) and the transpose--
+            # free views below are unchanged.
+            q = F.normalize(F.silu(self.q_proj(x_conv), inplace=True).view(B, T, H, K), dim=-1)
+            k = F.normalize(F.silu(self.k_proj(x_conv), inplace=True).view(B, T, H, K), dim=-1)
+            v = F.silu(self.v_proj(x_conv), inplace=True).view(B, T, HV, V)
         # log-space gate: low-rank down/up with a softplus-style decay. The
         # value 0.1 is exposed as ``HybridConfig.kda_decay_scale`` so all KDA
         # instantiations (this layer, run_quality.KDAAttn,

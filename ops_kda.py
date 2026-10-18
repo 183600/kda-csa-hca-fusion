@@ -135,6 +135,19 @@ def _compute_dtype(dtype):
     return torch.float64 if dtype == torch.float64 else torch.float
 
 
+def _to_contig_compute(x, compute_dtype):
+    """Cast to ``compute_dtype`` in one contiguous copy.
+
+    The chunk-prep rearrange views are non-contiguous, so ``.to(dtype)``
+    would produce a strided copy that a following ``.contiguous()`` copies a
+    second time. Requesting the contiguous memory format lets the cast
+    allocate the final layout directly (elementwise cast, same values).
+    """
+    if x.dtype == compute_dtype:
+        return x
+    return x.to(compute_dtype, memory_format=torch.contiguous_format)
+
+
 def _is_compiling_safely() -> bool:
     """Return True if we are inside a torch.compile / torch.export trace."""
     # Only probe ``torch._dynamo`` when it has ALREADY been imported: a
@@ -757,7 +770,12 @@ def _chunk_kda_prepare(
         scale = K ** -0.5
 
     compute_dtype = _compute_dtype(dtype)
-    q, k = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [q, k]]
+    # ``g`` joins the in-place clamp below only when the rearrange+cast (or
+    # the pad copy above) already produced a tensor this function owns.
+    g_owned = (g.dtype != compute_dtype) or bool(pad)
+    q, k = [_to_contig_compute(
+        rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT), compute_dtype)
+        for x in [q, k]]
     v, g, beta = [rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT).to(compute_dtype) for x in [v, g, beta]]
     # The rearranged views feed several downstream matmuls, which need
     # contiguous q / k tensors; with G == 1 the GVA expansion is a pure
@@ -769,7 +787,10 @@ def _chunk_kda_prepare(
         q = q.repeat_interleave(G, dim=1) * scale
         k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
-        g = g.clamp(min=float(g_clamp_min))
+        if g_owned:
+            g = g.clamp_(min=float(g_clamp_min))
+        else:
+            g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
     # NOTE: the main diagonal AND the strict upper triangle of the raw
@@ -992,22 +1013,23 @@ def _chunk_kda_inner_loop(
     # consumes its own slice.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
-    # The subtraction yields a fresh tensor, so ``exp`` may run in place;
-    # the multiply stays out of place while autograd records the graph
-    # because ``exp`` backward saves its output, and runs in place (same
-    # per-element product) otherwise.
-    kexp_all = g[..., -1:, :] - g
-    kexp_all.exp_()
-    if torch.is_grad_enabled():
-        kexp_all = kexp_all * k
-    else:
-        kexp_all.mul_(k)
+    grad_enabled = torch.is_grad_enabled()
     for i in range(NT):
         q_i = q[:, :, i]
         u_i = u[:, :, i]
         w_i = w[:, :, i]
-        v_i = u_i - w_i @ S
-        row = (q_i * gexp_all[:, :, i]) @ S + Aqk[:, :, i] @ v_i
+        k_i = k[:, :, i]
+        # Each chunk of ``u`` is consumed exactly once, so outside autograd
+        # the subtraction runs on its slice (one fewer chunk-sized
+        # allocation; identical values). While a graph is recorded the
+        # out-of-place form is kept.
+        if grad_enabled:
+            v_i = u_i - w_i @ S
+            row = (q_i * gexp_all[:, :, i]) @ S + Aqk[:, :, i] @ v_i
+        else:
+            v_i = u_i.sub_(w_i @ S)
+            row = (q_i * gexp_all[:, :, i]) @ S
+            row.add_(Aqk[:, :, i] @ v_i)
         if o is not None:
             o[:, :, i] = row
         else:
@@ -1022,7 +1044,26 @@ def _chunk_kda_inner_loop(
         # matches the upstream FLA reference (fla/ops/kda/naive.py).
         # The contraction over positions computes ``sum_c kexp[c, :] ⊗
         # v[c, :]`` as a matmul.
-        S = S * glast_all[:, :, i] + kexp_all[:, :, i].transpose(-1, -2) @ v_i
+        #
+        # ``kexp`` is built lazily per chunk (same per-element subtraction /
+        # exp / product as the former whole-sequence tensor, evaluated on the
+        # identical values) so only one ``[B, HV, BT, K]`` temporary is live
+        # instead of the full ``[B, HV, NT, BT, K]`` map.
+        kexp_i = g[:, :, i, -1:, :] - g[:, :, i]
+        kexp_i.exp_()
+        if grad_enabled:
+            # ``exp`` backward saves its output, so the multiply stays out
+            # of place while a graph is recorded; same per-element product.
+            kexp_i = kexp_i * k_i
+        else:
+            kexp_i.mul_(k_i)
+        if grad_enabled:
+            S = S * glast_all[:, :, i] + kexp_i.transpose(-1, -2) @ v_i
+        else:
+            # ``S`` is this call's freshly-allocated running state; the
+            # in-place multiply/add spell the identical elementwise chain.
+            S = S.mul_(glast_all[:, :, i]).add_(
+                kexp_i.transpose(-1, -2) @ v_i)
     if o is not None:
         return o, S
     return torch.stack(chunk_outs, dim=2), S
@@ -1084,22 +1125,19 @@ def _chunk_kda_inner_loop_recompute(
     V = u.shape[-1]
     o: Optional[torch.Tensor] = None
     chunk_outs = []
+    Aqk_buf: Optional[torch.Tensor] = None
     if not torch.is_grad_enabled():
         o = q.new_empty(B, HV, NT, BT, V)
+        # Reused per-chunk attention-matrix buffer: every entry is rewritten
+        # on each iteration (the lower triangle is stored, everything else
+        # is masked to exactly zero), so no stale value can survive.
+        Aqk_buf = q.new_empty(B, HV, BT, BT)
     # Same gate-map layout as ``_chunk_kda_inner_loop`` (pure elementwise
     # functions of ``g`` / ``k``); ``gexp`` is the ``exp`` map precomputed
     # by ``_chunk_kda_prepare``.
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
-    # The subtraction is fresh, so its ``exp`` runs in place; the multiply
-    # stays out of place while autograd records the graph because ``exp``
-    # backward saves its output, and runs in place otherwise.
-    kexp_all = g[..., -1:, :] - g
-    kexp_all.exp_()
-    if torch.is_grad_enabled():
-        kexp_all = kexp_all * k
-    else:
-        kexp_all.mul_(k)
+    grad_enabled = torch.is_grad_enabled()
     _block_rows = block_rows
     for i in range(NT):
         q_i = q[:, :, i]
@@ -1107,7 +1145,10 @@ def _chunk_kda_inner_loop_recompute(
         u_i = u[:, :, i]
         g_i = g[:, :, i]
         w_i = w[:, :, i]
-        Aqk_i = q_i.new_empty(B, HV, BT, BT)
+        if Aqk_buf is None:
+            Aqk_i = q_i.new_empty(B, HV, BT, BT)
+        else:
+            Aqk_i = Aqk_buf
         # Only the rows ``c >= j`` survive ``upper_mask``.
         for j0 in range(0, BT, _block_rows):
             j1 = min(BT, j0 + _block_rows)
@@ -1120,15 +1161,32 @@ def _chunk_kda_inner_loop_recompute(
             Aqk_i[..., j0:, j0:j1] = (
                 qe * k_i[..., j0:j1, :].unsqueeze(-3)).sum(-1)
         Aqk_i.masked_fill_(upper_mask, 0)
-        v_i = u_i - w_i @ S
-        row = (q_i * gexp_all[:, :, i]) @ S + Aqk_i @ v_i
+        if grad_enabled:
+            v_i = u_i - w_i @ S
+            row = (q_i * gexp_all[:, :, i]) @ S + Aqk_i @ v_i
+        else:
+            # Same in-place reuse as ``_chunk_kda_inner_loop`` (each ``u``
+            # chunk is consumed once; the add's operands are fresh).
+            v_i = u_i.sub_(w_i @ S)
+            row = (q_i * gexp_all[:, :, i]) @ S
+            row.add_(Aqk_i @ v_i)
         if o is not None:
             o[:, :, i] = row
         else:
             chunk_outs.append(row)
         # State carry mirrors ``_chunk_kda_inner_loop`` (same per-element
-        # operations in the same order).
-        S = S * glast_all[:, :, i] + kexp_all[:, :, i].transpose(-1, -2) @ v_i
+        # operations in the same order); ``kexp`` is rebuilt lazily for this
+        # chunk (same values as the former whole-sequence map, one chunk-sized
+        # temporary instead of the full ``[B, HV, NT, BT, K]`` tensor).
+        kexp_i = g_i[..., -1:, :] - g_i
+        kexp_i.exp_()
+        if grad_enabled:
+            kexp_i = kexp_i * k_i
+            S = S * glast_all[:, :, i] + kexp_i.transpose(-1, -2) @ v_i
+        else:
+            kexp_i.mul_(k_i)
+            S = S.mul_(glast_all[:, :, i]).add_(
+                kexp_i.transpose(-1, -2) @ v_i)
     if o is not None:
         return o, S
     return torch.stack(chunk_outs, dim=2), S
@@ -1290,7 +1348,15 @@ def assoc_scan_chunk_kda(
     else:
         kexp.mul_(kk)
     kexp_t = kexp.transpose(-1, -2)
-    M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
+    if torch.is_grad_enabled():
+        M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
+    else:
+        # ``diag(d) - X`` == ``diag(d) + (-X)`` elementwise (identical for
+        # signed zeros / NaN too): negate the fresh matmul output and add
+        # the diagonal in place instead of materializing ``diag_embed``.
+        M = kexp_t @ w
+        M.neg_()
+        M.diagonal(dim1=-2, dim2=-1).add_(ggx[..., -1, :])
     b = kexp_t @ u
     S_in, S_final, _levels = _assoc_scan_chunk_states(M, b, S0)
     C = qq * ggx - Aqk @ w

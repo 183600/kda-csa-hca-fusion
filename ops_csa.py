@@ -16,6 +16,8 @@ and small-scale experiments; it is NOT the production kernel.
 
 from __future__ import annotations
 
+import weakref
+
 import torch
 import torch.nn.functional as F
 
@@ -310,8 +312,13 @@ def _sliding_window_scores(
         scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
         if scale != 1.0:
             # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-            # multiply keeps values/gradients bit-for-bit identical.
-            scores_w = scores_w * scale
+            # multiply keeps values/gradients bit-for-bit identical. The
+            # einsum output is fresh, so inference (no autograd) may scale in
+            # place; a recorded graph keeps the out-of-place multiply.
+            if torch.is_grad_enabled():
+                scores_w = scores_w * scale
+            else:
+                scores_w.mul_(scale)
         # ``scores_w`` is a fresh einsum (or freshly scaled) tensor that no
         # other consumer reads, so the mask can be written in place.
         scores_w.masked_fill_(~win_valid[None, :, None, :], float('-inf'))
@@ -409,6 +416,28 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     return mask
 
 
+# Cached negation of ``_causal_block_mask`` (True = INVALID/blocked). The
+# negation is a pure function of the mask and is only ever read by
+# ``masked_fill_`` / ``where`` consumers, so sharing one tensor avoids
+# re-allocating a full-sized boolean mask per call. Same read-only contract
+# as ``_CAUSAL_BLOCK_MASK_CACHE``.
+_CAUSAL_BLOCK_MASK_INVALID_CACHE: dict = {}
+
+
+def _causal_block_mask_invalid(T: int, n_blocks: int, m: int,
+                               device) -> torch.Tensor:
+    """Cached ``~_causal_block_mask(T, n_blocks, m, device)`` (read-only)."""
+    key = (T, n_blocks, m, str(device))
+    cached = _CAUSAL_BLOCK_MASK_INVALID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    invalid = ~_causal_block_mask(T, n_blocks, m, device)
+    if len(_CAUSAL_BLOCK_MASK_INVALID_CACHE) >= 64:
+        _CAUSAL_BLOCK_MASK_INVALID_CACHE.clear()
+    _CAUSAL_BLOCK_MASK_INVALID_CACHE[key] = invalid
+    return invalid
+
+
 def csa_compress_kv(
     C: torch.Tensor,
     Z: torch.Tensor,
@@ -444,7 +473,13 @@ def csa_compress_kv(
     Z = Z.to(compute_dtype).view(B_, n_blocks, m, c)
     logits = Z + B_pos[None, None, :, :].to(Z)
     S = _bf16_safe_softmax(logits, dim=2)                 # [B, n_blocks, m, c]
-    out = (S * C).sum(dim=2)                              # [B, n_blocks, c]
+    if torch.is_grad_enabled():
+        out = (S * C).sum(dim=2)                          # [B, n_blocks, c]
+    else:
+        # ``S`` is a fresh softmax output and ``C`` is only read: the in-place
+        # multiply evaluates the same per-element product before the same
+        # sum reduction.
+        out = S.mul_(C).sum(dim=2)
     return _bf16_scale_if_needed(out)
 
 
@@ -525,7 +560,58 @@ def csa_compress_kv_overlapped(
     Cb_prev = F.pad(Cb[:, :-1], (0, 0, 0, 0, 1, 0),
                     value=0.0)                                    # [B, n_blocks, m, c]
 
-    out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)                # [B, n_blocks, c]
+    if torch.is_grad_enabled():
+        out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)            # [B, n_blocks, c]
+    else:
+        # ``Sa`` / ``Sb`` are views of the fresh softmax output ``S`` (no
+        # other reader), and ``Ca`` / ``Cb_prev`` are only read; the in-place
+        # products evaluate the identical elementwise chains before the same
+        # sums.
+        out = Sa.mul_(Ca).sum(2) + Sb.mul_(Cb_prev).sum(2)
+    return _bf16_scale_if_needed(out)
+
+
+def _csa_compress_kv_overlapped_prev(
+    Ca: torch.Tensor,        # [B, n, m, c] current block's m tokens
+    Za: torch.Tensor,        # [B, n, m, c]
+    Cb_prev: torch.Tensor,   # [B, n, m, c] previous physical block per row
+    Zb_prev: torch.Tensor,   # [B, n, m, c]
+    Ba: torch.Tensor,
+    Bb: torch.Tensor,
+) -> torch.Tensor:
+    """Overlapped compression with explicit per-row previous blocks.
+
+    Evaluates exactly the value chain of :func:`csa_compress_kv_overlapped`
+    for rows ``>= 1`` (the only rows ``_append_bulk`` keeps), taking the
+    already-shifted previous-block ``Cb``/``Zb`` directly instead of padding
+    and shifting the full sequence and recomputing/dropping row 0. Inputs
+    are pre-blocked ``[B, n, m, c]`` so no concatenation is needed.
+    """
+    B_, n, m, c = Ca.shape
+    compute_dtype = torch.float64 if Ca.dtype == torch.float64 else torch.float
+    Ca = Ca.to(compute_dtype)
+    Za = Za.to(compute_dtype)
+    Cb_prev = Cb_prev.to(compute_dtype)
+    Zb_prev = Zb_prev.to(compute_dtype)
+    if torch.is_grad_enabled():
+        A_logits = Za + Ba[None, None, :, :].to(Za)
+        Bb_logits = Zb_prev + Bb[None, None, :, :].to(Zb_prev)
+        all_logits = torch.cat([A_logits, Bb_logits], dim=2)
+    else:
+        # Same in-place layout as the public overlapped helper (identical
+        # elementwise adds in the same cat layout).
+        all_logits = torch.empty(B_, n, 2 * m, c,
+                                 device=Ca.device, dtype=compute_dtype)
+        torch.add(Za, Ba[None, None, :, :].to(Za), out=all_logits[:, :, :m])
+        torch.add(Zb_prev, Bb[None, None, :, :].to(Zb_prev),
+                  out=all_logits[:, :, m:])
+    S = _bf16_safe_softmax(all_logits, dim=2)                      # [B, n, 2m, c]
+    Sa = S[:, :, :m]
+    Sb = S[:, :, m:]
+    if torch.is_grad_enabled():
+        out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)
+    else:
+        out = Sa.mul_(Ca).sum(2) + Sb.mul_(Cb_prev).sum(2)
     return _bf16_scale_if_needed(out)
 
 
@@ -675,8 +761,10 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
         hi = min(rows_total, lo + chunk)
         blk = flat[lo:hi]
         # S-th largest score; ties exactly at this boundary are resolved
-        # below.
-        boundary = torch.topk(blk, s, dim=-1).values[..., -1:]
+        # below. ``kthvalue`` (the (n-s+1)-th smallest) returns only one
+        # value + index per row instead of ``topk``'s [rows, s] pair.
+        boundary = torch.kthvalue(
+            blk, n - s + 1, dim=-1, keepdim=True).values
         strictly_above = blk > boundary
         n_above = strictly_above.sum(dim=-1, keepdim=True)
         at_boundary = blk == boundary
@@ -712,6 +800,7 @@ def _lightning_indexer_chunk(
     scale: float,
     causal_block_mask_chunk: torch.Tensor | None,   # [T_c, n_blocks]
     return_soft_weights: bool,
+    causal_block_mask_invalid_chunk: torch.Tensor | None = None,
 ):
     """Score + select ONE query slice of the lightning indexer.
 
@@ -757,11 +846,16 @@ def _lightning_indexer_chunk(
         # the fill can be written in place when no backward needs the
         # pre-fill tensor (inference / no-grad). Autograd-tracked logits
         # keep the out-of-place form.
-        if logits.requires_grad:
-            logits = logits.masked_fill(
-                ~causal_block_mask_chunk, float('-inf'))
+        if causal_block_mask_invalid_chunk is not None:
+            # Pre-negated mask supplied by the caller: the negation of the
+            # full-sequence mask is cached, so only the slice is taken.
+            invalid = causal_block_mask_invalid_chunk
         else:
-            logits.masked_fill_(~causal_block_mask_chunk, float('-inf'))
+            invalid = ~causal_block_mask_chunk
+        if logits.requires_grad:
+            logits = logits.masked_fill(invalid, float('-inf'))
+        else:
+            logits.masked_fill_(invalid, float('-inf'))
     B_, T_c, n_blocks = logits.shape
     S = min(topk, n_blocks)
     # Deterministic, size-independent top-k (ties by ascending block
@@ -769,7 +863,11 @@ def _lightning_indexer_chunk(
     # batched-prefill and incremental-decode selections identical.
     idx = _canonical_topk_indices(logits, S)
     if topk > S:
-        idx = torch.cat([idx, idx.new_full((B_, T_c, topk - S), -1)], dim=-1)
+        # One allocation with the left part copied in place (same values as
+        # the former cat with a right-hand ``-1`` fill).
+        padded = idx.new_full((B_, T_c, topk), -1)
+        padded[..., :S].copy_(idx)
+        idx = padded
     if return_soft_weights:
         # The differentiable soft distribution over ALL blocks for the
         # straight-through estimator. Softmax is row-wise, so computing it
@@ -791,6 +889,7 @@ def csa_lightning_indexer(
     ste_mode: str = 'topk_columns',
     normalize_qk: bool = False,
     query_chunk: int = 0,
+    _causal_block_mask_invalid: torch.Tensor | None = None,
 ):
     """Top-k selection over compressed indexer keys (Eq. 13–17).
 
@@ -1041,10 +1140,12 @@ def csa_lightning_indexer(
     def _run_chunk(start: int, end: int):
         mask_chunk = (None if causal_block_mask is None
                       else causal_block_mask[start:end])
+        invalid_chunk = (None if _causal_block_mask_invalid is None
+                         else _causal_block_mask_invalid[start:end])
         w_chunk = None if w_idx is None else w_idx[:, start:end]
         return _lightning_indexer_chunk(
             q_idx[:, start:end], k_idx, w_chunk, topk, scale,
-            mask_chunk, return_soft_weights)
+            mask_chunk, return_soft_weights, invalid_chunk)
 
     if tile >= T:
         # ``topk=0`` is handled inside ``_lightning_indexer_chunk``: the
@@ -1053,8 +1154,27 @@ def csa_lightning_indexer(
         # distribution when requested, preserving the historical contract.
         return _run_chunk(0, T)
 
-    # Tiled path: accumulate per-tile selections, then concatenate along the
-    # query axis.
+    # Tiled path: accumulate per-tile selections along the query axis. The
+    # concatenation output can be preallocated and written slice-by-slice
+    # when no graph is recorded (the integer indices never need grad and
+    # the soft weights are not retained by autograd); while a graph is
+    # recorded the historical list-plus-cat form is kept.
+    if not torch.is_grad_enabled():
+        idx = torch.empty(B_, T, topk, dtype=torch.long,
+                          device=q_idx.device)
+        soft = (torch.empty(B_, T, n_blocks, dtype=compute_dtype,
+                            device=q_idx.device)
+                if return_soft_weights else None)
+        for start in range(0, T, tile):
+            end = min(start + tile, T)
+            result = _run_chunk(start, end)
+            if return_soft_weights:
+                idx_t, soft_t = result
+                soft[:, start:end] = soft_t
+            else:
+                idx_t = result
+            idx[:, start:end] = idx_t
+        return (idx, soft) if return_soft_weights else idx
     idx_tiles: list[torch.Tensor] = []
     soft_tiles: list[torch.Tensor] = []
     for start in range(0, T, tile):
@@ -1070,6 +1190,38 @@ def csa_lightning_indexer(
     if return_soft_weights:
         return idx, torch.cat(soft_tiles, dim=1)
     return idx
+
+
+# Cached concatenation of the 6 KV/indexer projection weights used by
+# ``naive_csa(fuse_projections=True)``. The concatenated tensor is only
+# reused while every source weight is STILL THE SAME TENSOR at the SAME
+# VERSION (an in-place optimizer update bumps ``_version``) and autograd is
+# disabled — while a graph is recorded the per-forward ``cat`` is kept so
+# backward sees the identical node. Weak references avoid pinning a
+# discarded model's parameters in memory.
+_FUSED_WEIGHT_CACHE: dict | None = None
+
+
+def _fused_projection_weight(weights: tuple) -> torch.Tensor:
+    """Return a cached ``cat(weights, dim=0)`` for inference forwards."""
+    global _FUSED_WEIGHT_CACHE
+    entry = _FUSED_WEIGHT_CACHE
+    if entry is not None:
+        refs, versions, combined = entry
+        if (len(refs) == len(weights)
+                and all(r() is w for r, w in zip(refs, weights))
+                and versions == tuple(w._version for w in weights)
+                and combined.shape[0] == sum(w.shape[0] for w in weights)
+                and combined.dtype == weights[0].dtype
+                and combined.device == weights[0].device):
+            return combined
+    combined = torch.cat(list(weights), dim=0)
+    _FUSED_WEIGHT_CACHE = (
+        tuple(weakref.ref(w) for w in weights),
+        tuple(w._version for w in weights),
+        combined,
+    )
+    return combined
 
 
 def naive_csa(
@@ -1356,10 +1508,18 @@ def naive_csa(
         # Concatenate all 6 weights along the out_features axis (dim=0). The
         # ``split_sizes`` list below MUST match this ordering — if you add or
         # reorder weights here, update both lists in lockstep.
-        combined_weight = torch.cat(
-            [W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx],
-            dim=0,
-        )                                                          # [4c + 2*c_I, d]
+        #
+        # The concatenation is a deterministic copy of read-only weights, so
+        # with autograd disabled (inference / evaluation) it is cached across
+        # calls, keyed on tensor identity + ``_version``; a recorded graph
+        # keeps the per-forward ``torch.cat`` exactly as before (its
+        # CatBackward must stay in the current graph).
+        _weights = (W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx)
+        if torch.is_grad_enabled():
+            combined_weight = torch.cat(list(_weights), dim=0)
+        else:
+            combined_weight = _fused_projection_weight(_weights)
+                                                                   # [4c + 2*c_I, d]
         combined_out = F.linear(H, combined_weight)                # [B, T, 4c + 2*c_I]
         # ``torch.split`` returns views into ``combined_out``.
         # split_sizes MUST match the order of weights in ``torch.cat`` above.
@@ -1424,6 +1584,9 @@ def naive_csa(
     q_idx = F.linear(cQ, W_IUQ).view(B_, T, nIh, c_I)              # [B, T, nIh, c_I]
     w_idx = F.linear(H, W_w)                                      # [B, T, nIh]
     cbm = _causal_block_mask(T, n_blocks, m, device)
+    # Cached negation of the full-sequence mask (read-only) so the indexer's
+    # ``masked_fill_`` does not allocate its own [T, n_blocks] boolean.
+    cbm_invalid = _causal_block_mask_invalid(T, n_blocks, m, device)
     # STE is a TRAINING-only surrogate for the non-differentiable top-k
     # indexer. It is forward-equivalent to the hard gather. Under
     # ``torch.no_grad()`` there is no backward path to preserve, so the STE
@@ -1441,7 +1604,9 @@ def naive_csa(
                                     return_soft_weights=effective_use_ste,
                                     ste_mode=ste_mode,
                                     normalize_qk=normalize_qk,
-                                    query_chunk=indexer_chunk)     # [B, T, topk]
+                                    query_chunk=indexer_chunk,
+                                    _causal_block_mask_invalid=cbm_invalid
+                                    )                              # [B, T, topk]
     # When STE is active, the indexer also returns a differentiable
     # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
     # straight-through estimator. We keep it in a variable that is ``None``
@@ -1671,8 +1836,13 @@ def naive_csa(
         scores = torch.einsum('b t h d, b t k d -> b t h k', q, kv)  # [B, T, nh, topk]
         if scale != 1.0:
             # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-            # multiply keeps values/gradients bit-for-bit identical.
-            scores = scores * scale
+            # multiply keeps values/gradients bit-for-bit identical. The
+            # einsum output is fresh, so inference (no autograd) may scale in
+            # place; a recorded graph keeps the out-of-place multiply.
+            if torch.is_grad_enabled():
+                scores = scores * scale
+            else:
+                scores.mul_(scale)
         # Mask -1 padding so those slots get zero weight after softmax.
         # The einsum output is freshly allocated and only consumed by the
         # joint softmax below, so the mask can be written in place.
@@ -1746,12 +1916,27 @@ def naive_csa(
             # exactly ``+0.0``.
             log_sink = sink_logits.view(1, 1, nh, 1).to(cat)      # [1, 1, nh, 1]
             row_max = cat.amax(-1, keepdim=True).clamp(min=0)     # [B, T, nh, 1]
-            shifted = cat - row_max
-            shifted_sink = log_sink - row_max
-            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-            p = (shifted - log_denom).exp()
-            p = p.masked_fill(all_invalid, 0.0)
+            if torch.is_grad_enabled():
+                # Out-of-place: autograd's Sub/Exp backward save this chain's
+                # operands/outputs, so in-place writes would trip the
+                # version-counter check.
+                shifted = cat - row_max
+                shifted_sink = log_sink - row_max
+                log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+                log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
+                p = (shifted - log_denom).exp()
+                p = p.masked_fill(all_invalid, 0.0)
+            else:
+                # ``cat`` is freshly allocated by the einsum / window scoring
+                # above (or is a fresh single-branch tensor) and has no other
+                # readers left, so the shift/exp/fill chain can run in place:
+                # same elementwise ops in the same order (bit-identical).
+                shifted = cat.sub_(row_max)
+                shifted_sink = log_sink - row_max
+                log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+                log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
+                p = shifted.sub_(log_denom).exp_()
+                p.masked_fill_(all_invalid, 0.0)
         else:
             p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_invalid)
 
@@ -1788,7 +1973,13 @@ def naive_csa(
     # Trim the padded SUFFIX off the SEQUENCE axis (dim=1) so the output
     # matches the input's original T (right-padding added zeros at the end,
     # which never affect real-token outputs thanks to the causal block mask).
-    out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
+    # The trim runs BEFORE the dtype cast so a padded call only casts the
+    # real rows (elementwise cast, identical values on the kept rows).
+    if original_T != T:
+        out_final = out[:, :original_T].reshape(
+            B_, original_T, nh * c).to(H.dtype)
+    else:
+        out_final = out.reshape(B_, T, nh * c).to(H.dtype)
     if return_projections:
         # Return the 6 per-token KV/indexer projections (trimmed to
         # original_T) so incremental-decoding callers can populate a

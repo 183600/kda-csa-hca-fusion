@@ -264,7 +264,9 @@ class _KDARecurrentFunction(torch.autograd.Function):
         if grad_state is None:
             dS = torch.zeros_like(initial_state)
         else:
-            dS = grad_state.to(q.dtype).clone()
+            # One copy: the ``copy=True`` cast allocates the compute-dtype
+            # buffer directly instead of casting and then cloning again.
+            dS = grad_state.to(dtype=q.dtype, copy=True)
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)

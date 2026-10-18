@@ -86,7 +86,7 @@ class GatedAttentionMixin:
             raise RuntimeError(f"Unexpected gate shape: {gate.shape}")
 
         # Broadcast and multiply
-        return x * gate.to(x.dtype).to(x.device)
+        return x * gate.to(dtype=x.dtype, device=x.device)
 
     def get_gate_values(self) -> torch.Tensor | None:
         """Return current gate values (for logging/analysis)."""
@@ -154,7 +154,7 @@ def apply_gate_fn(
     elif gate.dim() == 2:
         gate = gate.view(*([1] * (x.dim() - 2)), gate.shape[0], gate.shape[1])
 
-    return x * gate.to(x.dtype).to(x.device)
+    return x * gate.to(dtype=x.dtype, device=x.device)
 
 
 class GatedDeltaRule(nn.Module):

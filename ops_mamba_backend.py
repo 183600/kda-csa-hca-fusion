@@ -373,10 +373,14 @@ class OfficialMamba2Mixer(nn.Module):
                     # batch size.
                     new_conv = None
                 else:
-                    new_conv = new_conv.to(device=x.device, dtype=x.dtype)
+                    # Single cast+copy into a fresh tensor: ``copy=True``
+                    # makes ``to`` allocate and copy in one pass, so no
+                    # second clone is needed (the result never aliases the
+                    # official cache, which the module mutates in place).
+                    new_conv = new_conv.to(
+                        device=x.device, dtype=x.dtype, copy=True)
                     if detach_lookback:
                         new_conv = new_conv.detach()
-                    new_conv = new_conv.clone()
             return x.new_zeros(B, 0, d), new_state, new_conv
 
         if T > 1 and (state is not None or conv_state is not None):
@@ -428,10 +432,12 @@ class OfficialMamba2Mixer(nn.Module):
         new_conv, new_state = ip.key_value_memory_dict[0]
         # Same single-shot cast+copy as ``to().clone()`` above.
         new_state = new_state.to(compute_dtype, copy=True)
-        new_conv = new_conv.to(x.dtype)
+        # One cast+copy in a single allocation (see the T == 0 branch):
+        # ``new_conv`` is the official cache tensor, which the module keeps
+        # mutating in place, so the returned lookback must own fresh storage.
+        new_conv = new_conv.to(device=x.device, dtype=x.dtype, copy=True)
         if detach_lookback:
             new_conv = new_conv.detach()
-        new_conv = new_conv.clone()
         return out, new_state, new_conv
 
     # -- unified inference protocol ---------------------------------------

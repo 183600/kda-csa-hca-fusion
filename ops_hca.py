@@ -22,6 +22,8 @@ import torch.nn.functional as F
 from ops_csa import (
     csa_compress_kv,
     _causal_block_mask,
+    _causal_block_mask_invalid,
+    _sliding_window_chunk_windows,
     _sliding_window_output,
     _sliding_window_scores,
     _nan_safe_softmax,
@@ -62,6 +64,12 @@ def _bf16_scale_if_needed(
     norms = x.norm(p=2, dim=-1, keepdim=True)
     scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
     return x * scale
+
+
+# Query-axis tile budget for the dense score / joint-softmax / value
+# pipeline (elements of the ``[B, nh, T_tile, n_blocks]`` score tensor).
+# Below this size the single-shot path runs unchanged.
+_HCA_SCORE_TILE_ELEMS = 1 << 22
 
 
 def naive_hca(
@@ -219,23 +227,28 @@ def naive_hca(
     if scale is None:
         scale = c ** -0.5 if qk_norm_mode == 'rms' else 1.0
 
-    cbm = _causal_block_mask(T, n_blocks, m2, device)
+    # Query-axis tiling for the dense score / joint-softmax / value
+    # pipeline. Every operation below is row-wise along the query axis, so
+    # evaluating query tiles is value-identical per row while the peak score
+    # tensor shrinks from ``B*nh*T*n_blocks`` to
+    # ``B*nh*T_tile*n_blocks``. Small shapes (including every bit-exact test
+    # geometry) keep the single-shot path below.
+    score_elems = B_ * nh * T * n_blocks
+    tile_T = T
+    if T > 1 and n_blocks > 0 and score_elems > _HCA_SCORE_TILE_ELEMS:
+        # Floor the tile so the per-tile call always stays on the same
+        # batched-GEMM path as the single-shot call (single/small-M
+        # dispatch can select a different reduction kernel).
+        tile_T = max(8, _HCA_SCORE_TILE_ELEMS // max(1, B_ * nh * n_blocks))
+    use_tiles = tile_T < T
+    # When tiling, the blocked mask is rebuilt per query tile
+    # (O(T_tile*n_blocks)) instead of materializing and caching the full
+    # [T, n_blocks] table; the untiled path keeps using the cached negation
+    # (same values for every row).
+    cbm_invalid = (None if use_tiles else
+                   _causal_block_mask_invalid(T, n_blocks, m2, device))
 
-    scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n)
-    if scale != 1.0:
-        # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
-        # multiply keeps values/gradients bit-for-bit identical. The
-        # einsum output is fresh, so the in-place multiply is the same
-        # elementwise op with autograd disabled.
-        if torch.is_grad_enabled():
-            scores = scores * scale
-        else:
-            scores.mul_(scale)
-    # The einsum output (or its scaled copy) is freshly allocated and only
-    # consumed by the joint softmax below, so the mask can be written in
-    # place.
-    scores.masked_fill_(~cbm[None, None], float('-inf'))
-        # --- 3. Sliding-window branch (uncompressed local KV) ---
+    # --- 3. Sliding-window branch (uncompressed local KV) ---
     if sliding_window > 0:
         win = sliding_window
         if W_KV_local is not None:
@@ -281,63 +294,140 @@ def naive_hca(
     # is zero, not a constant 1 broadcast across the head dim.
     # ``torch.cat`` with a zero-width side is a pure copy of the other
     # side; the non-empty tensor is used directly instead.
-    if scores.shape[-1] and scores_w.shape[-1]:
-        cat = torch.cat([scores, scores_w], dim=-1)                # [B, nh, T, n_blocks+win]
-    elif scores_w.shape[-1]:
-        cat = scores_w
-    else:
-        cat = scores
-    if cat.shape[-1] == 0:
-        out = torch.zeros(B_, T, nh, c, dtype=compute_dtype, device=device)
-    elif sink_logits is not None:
-        log_sink = sink_logits.view(1, nh, 1, 1).to(cat)           # [1, nh, 1, 1]
-        row_max = cat.amax(-1, keepdim=True)                       # [B, nh, T, 1]
-        all_masked = torch.isneginf(row_max)                       # [B, nh, T, 1]
-        row_max_safe = torch.where(
-            all_masked, torch.zeros_like(row_max), row_max.clamp(min=0))
-        shifted = cat - row_max_safe
-        shifted_sink = log_sink - row_max_safe
+    #
+    # Every row below is independent, so the whole pipeline is evaluated per
+    # query tile with the identical expressions (bit-identical per row).
+    def _joint_p(scores_t, sw_t):
+        if scores_t.shape[-1] and sw_t.shape[-1]:
+            cat_t = torch.cat([scores_t, sw_t], dim=-1)
+        elif sw_t.shape[-1]:
+            cat_t = sw_t
+        else:
+            cat_t = scores_t
+        if cat_t.shape[-1] == 0:
+            return None
+        if sink_logits is None:
+            all_masked_t = cat_t.isinf().all(-1, keepdim=True)
+            return _nan_safe_softmax(
+                cat_t, dim=-1, all_masked_mask=all_masked_t)
+        log_sink_t = sink_logits.view(1, nh, 1, 1).to(cat_t)
+        row_max_t = cat_t.amax(-1, keepdim=True)
+        all_masked_t = torch.isneginf(row_max_t)
+        row_max_safe_t = torch.where(
+            all_masked_t, torch.zeros_like(row_max_t),
+            row_max_t.clamp(min=0))
+        shifted_t = cat_t - row_max_safe_t
+        shifted_sink_t = log_sink_t - row_max_safe_t
         # Numerically stable logsumexp approach — keep sink_logits in log
         # space (never exp it) and shift it by -row_max alongside every
         # score so the largest exp() argument is 0. An all-``-inf`` row
         # yields ``-inf`` here (and ``-inf - log_sink`` for ``p``, i.e. 0
         # before the ``masked_fill`` below).
-        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(lse, shifted_sink)             # [B, nh, T, 1]
+        lse_t = torch.logsumexp(shifted_t, dim=-1, keepdim=True)
+        log_denom_t = torch.logaddexp(lse_t, shifted_sink_t)
         if torch.is_grad_enabled():
             # Out-of-place: autograd's Sub/Exp backward save this chain's
             # operands/outputs, so in-place writes here would trip the
             # version-counter check.
-            p = (shifted - log_denom).exp()                        # [B, nh, T, n_blocks+win]
-            p = p.masked_fill(all_masked, 0.0)
+            p_t = (shifted_t - log_denom_t).exp()
+            p_t = p_t.masked_fill(all_masked_t, 0.0)
         else:
             # ``shifted`` has no readers left (``lse`` is computed above),
             # and its ``- log_denom`` / ``exp`` / fill are the same
             # elementwise ops as the out-of-place chain (bit-identical).
-            p = shifted.sub_(log_denom).exp_()
-            p.masked_fill_(all_masked, 0.0)
-    else:
-        all_masked = cat.isinf().all(-1, keepdim=True)
-        p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_masked)
+            p_t = shifted_t.sub_(log_denom_t).exp_()
+            p_t.masked_fill_(all_masked_t, 0.0)
+        return p_t
 
-    n_blk = scores.shape[-1]
-    p_dense = p[..., :n_blk]
-    p_w = p[..., n_blk:]
-    # Accumulate the window contribution IN PLACE into the dense einsum
-    # output (same values as ``a + b``). See ``naive_csa`` for the
-    # gradient-safety note.
-    out = torch.einsum('b h t n, b n d -> b t h d', p_dense, C_comp_n)   # [B, T, nh, c]
-    if sliding_window > 0:
-        # The joint-softmax weights are [B, nh, T, win]; move the query axis
-        # back to dim 1 for the tiled value contraction (a pure permute).
-        p_w_t = p_w.permute(0, 2, 1, 3)
-        if C_windows_full is not None:
-            # Reuse the window slab materialized by the scoring pass above
-            # (same per-row contraction as the tiled rebuild).
-            out.add_(torch.einsum(
-                'b t h w, b t w d -> b t h d', p_w_t, C_windows_full))
+    n_blk = n_blocks
+    if use_tiles:
+        C_padded_sw = (F.pad(C_local, (0, 0, win - 1, 0))
+                       if sliding_window > 0 else None)
+        tile_outs: list[torch.Tensor] = []
+        out = (torch.empty(B_, T, nh, c, dtype=compute_dtype, device=device)
+               if not torch.is_grad_enabled() else None)
+        for lo in range(0, T, tile_T):
+            hi = min(T, lo + tile_T)
+            scores_t = torch.einsum(
+                'b t h d, b n d -> b h t n', q[:, lo:hi], C_comp_n)
+            if scale != 1.0:
+                # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+                # multiply keeps values/gradients bit-for-bit identical.
+                if torch.is_grad_enabled():
+                    scores_t = scores_t * scale
+                else:
+                    scores_t.mul_(scale)
+            # The einsum output is freshly allocated and only consumed by
+            # the joint softmax below, so the mask is written in place.
+            # Same blocked-causal table as ``_causal_block_mask`` (strictly
+            # preceding blocks visible), built for this tile only.
+            invalid_t = (
+                torch.arange(lo, hi, device=device)[:, None] // m2
+                <= torch.arange(n_blocks, device=device)[None, :])
+            scores_t.masked_fill_(invalid_t[None, None], float('-inf'))
+            p_t = _joint_p(scores_t, scores_w[:, :, lo:hi])
+            p_dense_t = p_t[..., :n_blk]
+            p_w_t = p_t[..., n_blk:]
+            # Accumulate the window contribution IN PLACE into the dense
+            # einsum output (same values as ``a + b``; see ``naive_csa``
+            # for the gradient-safety note).
+            out_t = torch.einsum(
+                'b h t n, b n d -> b t h d', p_dense_t, C_comp_n)
+            if sliding_window > 0:
+                p_w_perm = p_w_t.permute(0, 2, 1, 3)
+                if C_windows_full is not None:
+                    windows_t = C_windows_full[:, lo:hi]
+                else:
+                    windows_t = _sliding_window_chunk_windows(
+                        C_padded_sw, lo, hi, win)
+                out_t.add_(torch.einsum(
+                    'b t h w, b t w d -> b t h d', p_w_perm, windows_t))
+            if out is None:
+                tile_outs.append(out_t)
+            else:
+                out[:, lo:hi] = out_t
+        if out is None:
+            out = torch.cat(tile_outs, dim=1)
+    else:
+        scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n)
+        if scale != 1.0:
+            # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
+            # multiply keeps values/gradients bit-for-bit identical. The
+            # einsum output is fresh, so the in-place multiply is the same
+            # elementwise op with autograd disabled.
+            if torch.is_grad_enabled():
+                scores = scores * scale
+            else:
+                scores.mul_(scale)
+        # The einsum output (or its scaled copy) is freshly allocated and
+        # only consumed by the joint softmax below, so the mask can be
+        # written in place.
+        scores.masked_fill_(cbm_invalid[None, None], float('-inf'))
+        if scores.shape[-1] + scores_w.shape[-1] == 0:
+            out = torch.zeros(
+                B_, T, nh, c, dtype=compute_dtype, device=device)
         else:
-            out.add_(_sliding_window_output(p_w_t, C_local, win, device))
+            p = _joint_p(scores, scores_w)
+            p_dense = p[..., :n_blk]
+            p_w = p[..., n_blk:]
+            # Accumulate the window contribution IN PLACE into the dense
+            # einsum output (same values as ``a + b``).
+            out = torch.einsum(
+                'b h t n, b n d -> b t h d', p_dense, C_comp_n)
+            if sliding_window > 0:
+                # The joint-softmax weights are [B, nh, T, win]; move the
+                # query axis back to dim 1 for the value contraction (a pure
+                # permute).
+                p_w_t = p_w.permute(0, 2, 1, 3)
+                if C_windows_full is not None:
+                    # Reuse the window slab materialized by the scoring pass
+                    # above (same per-row contraction as the tiled rebuild).
+                    out.add_(torch.einsum(
+                        'b t h w, b t w d -> b t h d', p_w_t,
+                        C_windows_full))
+                else:
+                    out.add_(
+                        _sliding_window_output(p_w_t, C_local, win, device))
 
     # Partial RoPE output countermeasure (§2.3.3): because the compressed
     # KV entries serve as both keys AND values, the naive output carries
@@ -348,7 +438,14 @@ def naive_hca(
         out = partial_rope(
             out, -tpos, rope_dim_eff, rope_base, dim=1)
 
-    out_final = out.reshape(B_, T, nh * c).to(H.dtype)[:, :original_T]
+    # Trim the padded SUFFIX before the dtype cast (elementwise cast,
+    # identical values on the kept rows; a padded call only casts the real
+    # rows).
+    if original_T != T:
+        out_final = out[:, :original_T].reshape(
+            B_, original_T, nh * c).to(H.dtype)
+    else:
+        out_final = out.reshape(B_, T, nh * c).to(H.dtype)
     if return_projections:
         projections = (
             C[:, :original_T],   # [B, original_T, c]

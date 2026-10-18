@@ -443,7 +443,12 @@ def rwkv7_reference_scan(
         loop_i = _get_scripted_rwkv7_scan_loop_inplace()
         fn = (loop_i if loop_i is not None
               else _rwkv7_scan_loop_inplace_eager)
-        o, state = fn(r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state.clone())
+        # The in-place loop mutates its state argument; only a caller-
+        # provided ``initial_state`` needs the defensive copy (a zero state
+        # built just above is already exclusively owned).
+        if initial_state is not None:
+            state = state.clone()
+        o, state = fn(r_c, w_exp_c, k_c, v_c, kk_c, kka_c, state)
     else:
         loop = _get_scripted_rwkv7_scan_loop()
         if loop is not None:
