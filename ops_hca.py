@@ -314,8 +314,10 @@ def naive_hca(
     # Every row below is independent, so the whole pipeline is evaluated per
     # query tile with the identical expressions (bit-identical per row).
     def _joint_p(scores_t, sw_t):
+        cat_fresh = False
         if scores_t.shape[-1] and sw_t.shape[-1]:
             cat_t = torch.cat([scores_t, sw_t], dim=-1)
+            cat_fresh = True
         elif sw_t.shape[-1]:
             cat_t = sw_t
         else:
@@ -332,7 +334,13 @@ def naive_hca(
         row_max_safe_t = torch.where(
             all_masked_t, torch.zeros_like(row_max_t),
             row_max_t.clamp(min=0))
-        shifted_t = cat_t - row_max_safe_t
+        if torch.is_grad_enabled() or not cat_fresh:
+            shifted_t = cat_t - row_max_safe_t
+        else:
+            # ``cat_t`` is the freshly concatenated joint buffer with no
+            # other readers, so the shift runs in place: the same
+            # elementwise subtraction with one fewer full-size temporary.
+            shifted_t = cat_t.sub_(row_max_safe_t)
         shifted_sink_t = log_sink_t - row_max_safe_t
         # Numerically stable logsumexp approach — keep sink_logits in log
         # space (never exp it) and shift it by -row_max alongside every

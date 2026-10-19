@@ -711,7 +711,7 @@ def _boundary_selected_mask(blk: torch.Tensor, s: int) -> torch.Tensor:
     """Boolean selection mask of the canonical top-``s`` of each row of ``blk``.
 
     Shared body of :func:`_canonical_topk_indices`'s boundary path: one
-    ``kthvalue`` supplies the S-th largest score (the boundary value), then
+    ``topk`` supplies the S-th largest score (the boundary value), then
     boolean/comparison masks pick every entry strictly above it plus the
     smallest-index boundary ties needed to fill the ``s`` slots. Exactly
     ``s`` entries are selected per row whenever ``blk`` contains no NaNs
@@ -720,8 +720,12 @@ def _boundary_selected_mask(blk: torch.Tensor, s: int) -> torch.Tensor:
     copy).
     """
     n = blk.shape[-1]
-    boundary = torch.kthvalue(
-        blk, n - s + 1, dim=-1, keepdim=True).values
+    # The S-th largest score (the boundary value). A descending top-k's
+    # last value IS that order statistic; the CPU top-k kernel is several
+    # times faster than ``kthvalue`` on the wide, small-``s`` rows this
+    # path serves. NaNs order identically (last / greatest) in both, so
+    # the selected value is bit-identical to ``kthvalue(n - s + 1)``.
+    boundary = torch.topk(blk, s, dim=-1, sorted=True).values[..., -1:]
     strictly_above = blk > boundary
     n_above = strictly_above.sum(dim=-1, keepdim=True)
     at_boundary = blk == boundary
@@ -766,7 +770,8 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
       (``2*s >= n``, where nearly every entry is selected) and for rows up
       to ``_TOPK_SORT_MAX_ELEMS`` entries;
     * the ``O(n)`` boundary path (:func:`_boundary_selected_mask`) —
-      ``kthvalue`` plus a few vectorized passes, no sort — used for sparse
+      a partial ``topk`` for the boundary value plus a few vectorized
+      passes, no full sort — used for sparse
       selections on larger rows, INCLUDING the single-query-per-step
       decode shape once the block count exceeds the sort threshold, where
       the sort's ``O(n_blocks log n_blocks)`` term would dominate the
@@ -807,7 +812,7 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
         return order.masked_fill(torch.isinf(values), -1)
     # Boundary path, processed in chunks of flattened leading rows so the
     # per-entry boolean / int32 masks below stay bounded. Every operation
-    # here is row-wise (``kthvalue``'s S-th largest value is a per-row
+    # here is row-wise (the S-th largest value is a per-row
     # order statistic, independent of how rows are grouped), so the chunk
     # size cannot change any selection.
     flat = scores.reshape(rows_total, n)
