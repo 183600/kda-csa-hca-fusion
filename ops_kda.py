@@ -560,35 +560,67 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     The count trades fewer loop iterations (larger ``rows``) against
     keeping the transient ``[..., rows, c1, K]`` block small (smaller
     ``rows``): the per-iteration temporary is proportional to
-    ``B * HV * NT * rows * BT * K`` elements. Empirically the best count is
-    governed by the key width (the inner reduction length) and the chunk
-    count, so the bands below key on ``K`` and ``NT``:
+    ``B * HV * NT * rows * BT * K`` elements.
 
-    * ``K <= 16``: 8 rows for ``NT`` <= 32, else 4.
-    * ``K <= 32``: 4 rows for ``NT`` <= 32, 2 for ``NT`` <= 64, else 1.
-    * ``K <= 64``: 4 rows for ``NT`` <= 16, 2 for ``NT`` <= 32, else 1.
-    * ``K <= 128``: 4 rows for ``NT`` <= 8, 2 for ``NT`` <= 16, else 1.
-    * larger ``K``: 8 rows for ``NT`` <= 2, 4 for ``NT`` <= 8, 2 for
-      ``NT`` <= 32, else 1.
+    There are two bands: a single-sequence band (``B == 1``) and a batched
+    band (``B >= 2``). The batched band keeps the pre-existing heuristic,
+    keyed on the key width ``K`` and chunk count ``NT``, plus an override
+    for the multi-batch/multi-head regime where the transient for
+    ``rows > 1`` can exceed the cache: once the total attention-matrix
+    footprint ``B * HV * NT * BT * BT`` is large enough, one row per
+    iteration is measurably faster despite the extra Python iterations.
+    The single-sequence band uses the same ``K``/``NT`` keying but is tuned
+    separately for ``B == 1``, where the per-iteration transient budget is
+    larger and wider blocks win (it decides the standalone ``kda_chunk``
+    rows of ``run_benchmark.py``, which run at ``B == 1``).
 
-    The result is capped by ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``.
-
-    The per-row elementwise/reduction math is identical for every count
-    (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
-    loop granularity.
+    ``rows`` only changes the Python loop granularity, never a value (see
+    :func:`_chunk_kda_attn_loop_eager`). The result is capped by
+    ``_ATTN_BLOCK_ROWS_MAX`` in the batched band and by ``BT`` in both.
     """
+    if B >= 2:
+        if HV >= 2:
+            a_elems = B * HV * NT * BT * BT
+            if a_elems >= 262144:
+                if NT == 1 and BT >= 256:
+                    # One enormous chunk per (batch, head) pair: the loop
+                    # count is tiny, so the wide blocks amortize the
+                    # per-iteration overhead instead of thrashing a cache
+                    # the other way.
+                    rows = 32 if K <= 64 else 16
+                    return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
+                rows = 1
+                return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
+            if a_elems >= 131072 and (NT >= 4 or BT <= 64 or K >= 64):
+                return 1
+        if K <= 16:
+            rows = 8 if NT <= 32 else 4
+        elif K <= 32:
+            rows = 8 if NT <= 32 else (2 if NT <= 64 else 1)
+        elif K <= 64:
+            rows = 4 if NT <= 16 else (2 if NT <= 32 else 1)
+        elif K <= 128:
+            rows = 4 if NT <= 8 else (2 if NT <= 16 else 1)
+        else:
+            rows = (8 if NT <= 2 else 4 if NT <= 8
+                    else 2 if NT <= 32 else 1)
+        return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
     if K <= 16:
-        rows = 8 if NT <= 32 else 4
+        rows = (32 if NT <= 2 else 16 if NT <= 16
+                else 8 if NT <= 32 else 4)
     elif K <= 32:
-        rows = 4 if NT <= 32 else (2 if NT <= 64 else 1)
+        rows = (16 if NT <= 4 else 8 if NT <= 32
+                else 2 if NT <= 64 else 1)
     elif K <= 64:
-        rows = 4 if NT <= 16 else (2 if NT <= 32 else 1)
+        rows = (16 if NT <= 2 else 8 if NT <= 8 else 4 if NT <= 32
+                else 2 if NT <= 64 else 1)
     elif K <= 128:
-        rows = 4 if NT <= 8 else (2 if NT <= 16 else 1)
+        rows = (16 if NT <= 2 else 8 if NT <= 4 else 4 if NT <= 8
+                else 2 if NT <= 16 else 1)
     else:
         rows = (8 if NT <= 2 else 4 if NT <= 8
                 else 2 if NT <= 32 else 1)
-    return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
+    return max(1, min(rows, BT))
 
 
 def _chunk_kda_attn_loop_eager(
