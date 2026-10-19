@@ -682,19 +682,31 @@ class Rwkv7Mixer(nn.Module):
         ratio_0_to_1 = (i / (n - 1)) if n > 1 else 0.0
         ratio_1_to_almost0 = 1.0 - (i / n)
 
-        ddd = torch.ones(1, 1, C)
-        www = torch.zeros(C)
-        zigzag = torch.zeros(C)
-        linear = torch.zeros(C)
-        for c in range(C):
+        # The per-channel ramps are built with Python-double arithmetic
+        # (identical expressions to the former per-element loop) and
+        # materialized in ONE tensor construction, which performs the same
+        # double -> fp32 rounding the per-element stores did. This replaces
+        # C scalar tensor writes with a list comprehension.
+        if C > 1:
+            frac = [c / (C - 1) for c in range(C)]
+        else:
             # 0/0 for C == 1 (degenerate) — guard with 0.0.
-            linear[c] = (c / (C - 1) - 0.5) if C > 1 else 0.0
-            # zigzag: per-head-position triangular ramp in [-1, 1].
-            zz = ((c % N) - ((N - 1) / 2)) / ((N - 1) / 2) if N > 1 else 0.0
-            zigzag[c] = zz * abs(zz)
-            www[c] = -6 + 6 * ((c / (C - 1)) if C > 1 else 0.0) ** (
-                1 + 1 * ratio_0_to_1 ** 0.3)
-            ddd[0, 0, c] = c / C
+            frac = [0.0] * C
+        linear = torch.tensor(
+            [f - 0.5 for f in frac] if C > 1 else [0.0] * C,
+            dtype=torch.float32)
+        # zigzag: per-head-position triangular ramp in [-1, 1].
+        if N > 1:
+            zz = [((c % N) - ((N - 1) / 2)) / ((N - 1) / 2)
+                  for c in range(C)]
+        else:
+            zz = [0.0] * C
+        zigzag = torch.tensor([z * abs(z) for z in zz], dtype=torch.float32)
+        www = torch.tensor(
+            [-6 + 6 * f ** (1 + 1 * ratio_0_to_1 ** 0.3) for f in frac],
+            dtype=torch.float32)
+        ddd = torch.tensor([c / C for c in range(C)],
+                           dtype=torch.float32).view(1, 1, C)
 
         # Token-shift lerp ratios: earlier tokens lean more on the
         # previous input in deeper layers (powers tuned upstream).
