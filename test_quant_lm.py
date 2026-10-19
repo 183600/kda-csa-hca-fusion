@@ -55,8 +55,10 @@ from results_schema import load as load_schema  # noqa: E402
 from run_quant_lm import (  # noqa: E402
     QAT_SPEC,
     StepwiseKDALM,
+    build_corpus,
     build_ptq_rows,
     build_qat_rows,
+    run_part_b,
 )
 
 
@@ -266,6 +268,45 @@ def test_stepwise_kda_lm_qat_smoke():
         losses_a == losses_b, f'{losses_a} vs {losses_b}')
 
 
+def test_part_b_matched_budget_control():
+    """Unequal QLM_STEPS / QLM_QAT_STEPS gets an equal-budget control."""
+    print('\nTest: Part B budget-matched fp16 control')
+    tok, splits, _ = build_corpus(seq_len=8, n_texts=8, seed=0)
+    rows = run_part_b(
+        device='cpu', tokenizer=tok, split_texts=splits, seeds=(0,),
+        qat_steps=2, seq_len=8, batch_size=2, eval_seqs=1,
+        spec=QAT_SPEC, steps=1, lr=3e-3)
+    row = rows[0]
+    _ok('unequal historical budgets are flagged and matched',
+        row['historical_budget_matched'] is False
+        and row['matched_control_reused'] is False
+        and row['total_steps_qat'] == row['total_steps_fp16_matched'] == 2
+        and row['total_steps_fp16'] == 1, f"{row['total_steps_qat']}")
+    _ok('the matched control is separately trained and scored',
+        math.isfinite(row['fp16_matched_ppl'])
+        and math.isfinite(row['ptq_matched_ppl'])
+        and row['fp16_matched_ppl'] != row['fp16_ppl'], '')
+    _ok('matched recovery is derived from the matched damage',
+        (row['recovery_fraction_matched'] is None)
+        or abs((1.0 - (row['qat_ppl'] / row['fp16_matched_ppl'] - 1.0)
+                / (row['ptq_matched_ppl'] / row['fp16_matched_ppl'] - 1.0))
+               - row['recovery_fraction_matched']) < 1e-9, '')
+    _ok('matched log-PPL difference is finite',
+        row['qat_minus_matched_log_ppl'] is not None
+        and math.isfinite(row['qat_minus_matched_log_ppl']), '')
+
+    rows_equal = run_part_b(
+        device='cpu', tokenizer=tok, split_texts=splits, seeds=(0,),
+        qat_steps=1, seq_len=8, batch_size=2, eval_seqs=1,
+        spec=QAT_SPEC, steps=1, lr=3e-3)
+    eq = rows_equal[0]
+    _ok('equal budgets reuse the historical fp16 arm',
+        eq['historical_budget_matched'] is True
+        and eq['matched_control_reused'] is True
+        and eq['fp16_matched_ppl'] == eq['fp16_ppl']
+        and eq['ptq_matched_ppl'] == eq['ptq_ppl'], '')
+
+
 # --- 4. report self-consistency -------------------------------------------
 
 def _fake_window_units(total_nll, counts, profile):
@@ -369,14 +410,22 @@ def test_quant_lm_report_rows():
         f"{s['n_cells_significant_damage_all_seeds']}")
 
     qat_cells = [
-        {'seed': 0, 'steps': 10, 'qat_steps': 10, 'fp16_ppl': 2.0,
+        {'seed': 0, 'steps': 10, 'qat_steps': 20, 'fp16_ppl': 2.0,
          'ptq_ppl': 4.0, 'qat_ppl': 2.5, 'qat_model_fp16_state_ppl': 2.1,
          'recovery_fraction': 0.75, 'grad_norm_first': 1.0,
-         'grad_norm_last': 0.5, 'all_grads_finite': True},
-        {'seed': 1, 'steps': 10, 'qat_steps': 10, 'fp16_ppl': 3.0,
+         'grad_norm_last': 0.5, 'all_grads_finite': True,
+         'fp16_matched_ppl': 1.9, 'ptq_matched_ppl': 3.8,
+         'recovery_fraction_matched': 0.7,
+         'qat_minus_matched_log_ppl': math.log(2.5 / 1.9),
+         'historical_budget_matched': False, 'matched_control_reused': False},
+        {'seed': 1, 'steps': 10, 'qat_steps': 20, 'fp16_ppl': 3.0,
          'ptq_ppl': 3.0, 'qat_ppl': 3.1, 'qat_model_fp16_state_ppl': 3.0,
          'recovery_fraction': None, 'grad_norm_first': 1.0,
-         'grad_norm_last': 0.5, 'all_grads_finite': True},
+         'grad_norm_last': 0.5, 'all_grads_finite': True,
+         'fp16_matched_ppl': 2.9, 'ptq_matched_ppl': 3.2,
+         'recovery_fraction_matched': 0.5,
+         'qat_minus_matched_log_ppl': math.log(3.1 / 2.9),
+         'historical_budget_matched': False, 'matched_control_reused': False},
     ]
     qrows = build_qat_rows(qat_cells, spec)
     agg = next(r for r in qrows if r['row_kind'] == 'qat_recovery')
@@ -384,6 +433,21 @@ def test_quant_lm_report_rows():
         abs(agg['recovery_fraction_mean'] - 0.75) < 1e-12
         and abs(agg['recovery_fraction_min'] - 0.75) < 1e-12,
         f"{agg['recovery_fraction_mean']}")
+    _ok('QAT summary carries mean +/- std + CI',
+        agg.get('qat_ppl_std') is not None
+        and agg.get('qat_ppl_ci95') is not None
+        and agg.get('recovery_fraction_matched_std') is not None, '')
+    _ok('matched-budget control is aggregated and flagged',
+        abs(agg['fp16_matched_ppl_mean'] - 2.4) < 1e-12
+        and agg['budget_control']['historical_arms_equal_budget'] is False
+        and agg['budget_control']['total_steps_qat'] == 20
+        and agg['budget_control']['total_steps_fp16_matched'] == 20, '')
+    paired = agg.get('qat_vs_matched_control')
+    _ok('QAT vs matched control has a paired multi-seed test',
+        paired is not None and paired['n_pairs'] == 2
+        and paired['mean_diff'] is not None
+        and paired['t_test']['p_value_two_sided'] is not None,
+        f"{None if paired is None else paired['mean_diff']}")
     try:
         json.dumps(sanitize_for_json(qrows), allow_nan=False)
         qat_json_ok = True
@@ -430,6 +494,7 @@ _TEST_FUNCS = [
     test_fake_quantize_inplace_contract,
     test_ste_autograd_contract,
     test_stepwise_kda_lm_qat_smoke,
+    test_part_b_matched_budget_control,
     test_quant_lm_report_rows,
 ]
 

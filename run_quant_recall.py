@@ -51,9 +51,10 @@ Honesty / scope
   weights, and the CSA/HCA compressed-KV caches are out of scope; the
   ``kv_budget`` byte bridge (``op_read_bytes`` / ``layout_read_bytes``)
   is what generalizes the accounting to those components.
-* Multi-seed aggregation reports mean/min/max recall; "exact" means
-  min-over-seeds == 1.0 (conservative). Three seeds keep the probe fast;
-  the 2-bit cells are the noisy ones and are reported with min/max.
+* Multi-seed aggregation reports mean, sample std, 95% t-CI, min and max
+  recall; "exact" means min-over-seeds == 1.0 (conservative). Three seeds
+  keep the probe fast; the 2-bit cells are the noisy ones and are
+  reported with their full spread.
 
 Output
 ------
@@ -68,6 +69,7 @@ Output
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 
@@ -282,8 +284,20 @@ def default_sweep_specs(bits_list=DEFAULT_BITS,
 
 
 def _aggregate(values: list) -> dict:
-    return {'mean': sum(values) / len(values), 'min': min(values),
-            'max': max(values)}
+    """Mean/min/max plus sample std and a two-sided 95% t-interval."""
+    n = len(values)
+    mean = sum(values) / n
+    std = None
+    ci95 = None
+    if n > 1:
+        std = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1))
+        from run_quality import _t_crit_975
+        crit = _t_crit_975(n)
+        if crit is not None:
+            half = crit * std / math.sqrt(n)
+            ci95 = [mean - half, mean + half]
+    return {'mean': mean, 'std': std, 'ci95': ci95,
+            'min': min(values), 'max': max(values), 'n': n}
 
 
 def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
@@ -348,8 +362,11 @@ def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
                 'state_elements': int(state_elements),
                 'fp16_state_bytes': state_elements * FP16_BITS / 8.0,
                 'recall_mean': rec['mean'],
+                'recall_std': rec['std'],
+                'recall_ci95': rec['ci95'],
                 'recall_min': rec['min'],
                 'recall_max': rec['max'],
+                'n_seeds': rec['n'],
                 'max_read_error_mean': errmax['mean'],
                 'max_read_error_max': errmax['max'],
                 'exact_recall': bool(rec['min'] == 1.0),
@@ -399,8 +416,8 @@ def _print_rows(rows: list) -> None:
     logger.info('\n-- planted-recall x state quantization '
                 '(mean [min..max] over seeds) --')
     header = (f"{'route':>7} | {'cell':>12} | {'bits/el':>7} | "
-              f"{'bytes':>7} | {'x_fp16':>6} | recall (min..max) | "
-              f"max|err|")
+              f"{'bytes':>7} | {'x_fp16':>6} | recall mean+-sd "
+              f"[min..max] | max|err|")
     logger.info(header)
     logger.info('-' * len(header))
     for row in rows:
@@ -410,7 +427,8 @@ def _print_rows(rows: list) -> None:
             f"{row['route']:>7} | {_cell_label(row):>12} | "
             f"{row['bits_per_element']:>7.2f} | {row['state_bytes']:>7.1f} | "
             f"{row['compression_vs_fp16']:>5.2f}x | "
-            f"{row['recall_mean']:.3f} "
+            f"{row['recall_mean']:.3f}+-"
+            f"{('n/a' if row['recall_std'] is None else format(row['recall_std'], '.3f'))} "
             f"[{row['recall_min']:.3f}..{row['recall_max']:.3f}] | "
             f"{row['max_read_error_mean']:.3f}")
 
@@ -509,7 +527,8 @@ def main():
             'the state fake-quantized after every write; recall-cost curve '
             '= nearest-value decode accuracy vs state bytes (payload + '
             'group metadata). Crosses the matrix memory-route axis with a '
-            'state-bits axis; seeds are aggregated mean/min/max.'),
+            'state-bits axis; seeds are aggregated to mean, sample std, '
+            '95% t-CI, min/max.'),
         'probe_geometry': {
             'n_keys': n_keys,
             'value_dim': value_dim,
@@ -544,7 +563,9 @@ def main():
             'components).',
             'Three seeds keep the probe fast; "exact" is the conservative '
             'min-over-seeds == 1.0 criterion, and 2-bit cells carry the '
-            'visible seed variance (min..max reported).',
+            'visible seed variance (sample std, 95% t-CI and min..max '
+            'reported). With only three seeds the CI is wide and is a '
+            'descriptive uncertainty statement, not a population guarantee.',
         ],
         'provenance': capture_provenance(),
     }

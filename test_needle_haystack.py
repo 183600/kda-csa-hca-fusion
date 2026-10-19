@@ -48,6 +48,7 @@ from run_needle_haystack import (  # noqa: E402
     evaluate_needle_recall,
     evaluate_rule_baselines,
     rule_baseline_predict,
+    run_qat_needle_probe,
     train_needle_model,
     NEEDLE_HYPOTHESES,
 )
@@ -271,6 +272,66 @@ def test_bf16_csa_hca_no_nan_inf():
     _ok('HCA bf16 no Inf', not torch.isinf(out_hca).any().item())
 
 
+def test_qat_probe_budget_matched_control():
+    """QAT is compared against an equally trained fp16 control.
+
+    The QAT arm receives ``steps + qat_steps`` optimizer steps from the
+    fp16 initialization. The control must receive exactly the same total
+    budget from the same init/seed/data stream; otherwise a "recovery"
+    could be explained by extra training alone.
+    """
+    print('\nTest: QAT probe equal-budget fp16 control')
+    tok = _NeedleCharTokenizer()
+    spec = QuantSpec(bits=4, group_size=16)
+    rows = run_qat_needle_probe(
+        tok, seeds=(0,), qat_spec=spec, steps=1, qat_steps=1,
+        train_context_len=128, train_needle_pos=16,
+        eval_context_len=128, eval_needle_pos=32,
+        batch_size=2, device='cpu')
+    per_seed = [r for r in rows if r['row_kind'] == 'qat_needle']
+    summary = next(r for r in rows if r['row_kind'] == 'qat_needle_summary')
+    _ok('one per-seed QAT row', len(per_seed) == 1, f'{len(per_seed)}')
+    row = per_seed[0]
+    _ok('QAT and continued-fp16 total budgets match',
+        row['total_steps_qat'] == row['total_steps_fp16_continued'] == 2,
+        f"{row['total_steps_qat']} vs "
+        f"{row['total_steps_fp16_continued']}")
+    _ok('the shorter fp16 arm records its different budget',
+        row['total_steps_fp16'] == 1, f"{row['total_steps_fp16']}")
+    _ok('budget-matched accuracy fields are present and in [0,1]',
+        all(0.0 <= row[k] <= 1.0 for k in (
+            'fp16_continued_accuracy', 'fp16_continued_ptq_accuracy'))
+        and abs(row['qat_matched_gain']
+                - (row['qat_accuracy']
+                   - row['fp16_continued_ptq_accuracy'])) < 1e-12,
+        f"matched_gain={row['qat_matched_gain']}")
+    _ok('extra-training gain is derived from the two quantized arms',
+        abs(row['extra_training_gain']
+            - (row['fp16_continued_ptq_accuracy']
+               - row['ptq_accuracy'])) < 1e-12,
+        f"extra_gain={row['extra_training_gain']}")
+    _ok('matched recovery uses the matched design (not the short arm)',
+        (row['recovery_fraction_matched'] is None)
+        or abs((1.0 - ((row['fp16_continued_accuracy']
+                        - row['qat_accuracy'])
+                       / (row['fp16_continued_accuracy']
+                          - row['fp16_continued_ptq_accuracy'])))
+               - row['recovery_fraction_matched']) < 1e-9,
+        f"matched_recovery={row['recovery_fraction_matched']}")
+    _ok('summary carries the matched control and budgets',
+        summary.get('fp16_continued_ptq_accuracy_mean') is not None
+        and 'recovery_fraction_matched_mean' in summary
+        and summary['recovery_fraction_matched_mean']
+        == row['recovery_fraction_matched']
+        and summary.get('budget_control', {}).get('matched') is True
+        and summary['budget_control']['total_steps_qat']
+        == summary['budget_control']['total_steps_fp16_continued'],
+        f"budget={summary.get('budget_control')}")
+    _ok('training data remains disjoint from evaluation',
+        row['data_protocol']['disjoint'] is True,
+        f"{row['data_protocol']}")
+
+
 def test_needle_experiment_json_output():
     """Full experiment run produces valid JSON with all row kinds."""
     print('\nTest: experiment JSON structure')
@@ -347,6 +408,7 @@ def main() -> int:
     test_evaluate_needle_recall()
     test_rule_baseline_recovers_fact()
     test_bf16_csa_hca_no_nan_inf()
+    test_qat_probe_budget_matched_control()
     test_needle_experiment_json_output()
     print('\n=== ALL NEEDLE HAYSTACK TESTS PASSED ===')
     return 0

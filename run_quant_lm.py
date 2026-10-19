@@ -28,6 +28,10 @@ and a QAT (**autograd / straight-through**) recovery probe:
   Scoring the fp16 model with PTQ state vs scoring the QAT model shows
   whether autograd through the quantizer recovers the perplexity damage —
   i.e. that the STE contract is usable for QAT, not just formula-correct.
+  If ``QLM_STEPS != QLM_QAT_STEPS``, a third fp16 model is trained for
+  exactly ``QLM_QAT_STEPS`` from the same seed/init/data stream so the
+  primary QAT contrast isolates the quantizer instead of the extra
+  optimization budget.
 
 Reference points are reported, not hidden:
 
@@ -102,6 +106,7 @@ from kv_quant import (  # noqa: E402
     storage_bytes,
 )
 from lm_consistency import build_decoding_clone  # noqa: E402
+from multi_seed_stats import summarize_paired  # noqa: E402
 from ops_fused import HybridConfig  # noqa: E402
 from ppl_bootstrap import paired_bootstrap_ppl  # noqa: E402
 from ops_kda import naive_recurrent_kda  # noqa: E402
@@ -513,6 +518,28 @@ def _aggregate(values: list) -> dict:
             'max': max(values)}
 
 
+def _moment(values: list) -> dict:
+    """Mean, sample std, and 95% t-CI (plus min/max) over finite values."""
+    vals = [v for v in values
+            if v is not None and isinstance(v, (int, float))
+            and math.isfinite(float(v))]
+    if not vals:
+        return {'mean': None, 'std': None, 'ci95': None,
+                'min': None, 'max': None, 'n': 0}
+    mean = sum(vals) / len(vals)
+    std = (math.sqrt(sum((v - mean) ** 2 for v in vals) / (len(vals) - 1))
+           if len(vals) > 1 else None)
+    ci = None
+    if len(vals) > 1 and std is not None:
+        from run_quality import _t_crit_975
+        crit = _t_crit_975(len(vals))
+        if crit is not None:
+            half = crit * std / math.sqrt(len(vals))
+            ci = [mean - half, mean + half]
+    return {'mean': mean, 'std': std, 'ci95': ci,
+            'min': min(vals), 'max': max(vals), 'n': len(vals)}
+
+
 def _spec_fields(spec: QuantSpec | None) -> dict:
     if spec is None:
         return {
@@ -682,7 +709,14 @@ def build_ptq_rows(per_seed: list, specs: list, tolerance: float,
 
 
 def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
-    """Aggregate Part B per-seed QAT cells + the recovery summary row."""
+    """Aggregate Part B per-seed QAT cells + the recovery summary row.
+
+    Historical fields keep their exact definitions. The matched-budget
+    fields use the equally trained fp16 control: when
+    ``qat_steps == steps`` that control IS the historical fp16 arm, so the
+    two recoveries coincide; when the budgets differ, only
+    ``recovery_fraction_matched`` isolates the quantizer.
+    """
     rows = []
     for cell in per_seed:
         row = dict(cell)
@@ -694,10 +728,26 @@ def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
     qat = _aggregate([c['qat_ppl'] for c in per_seed])
     qat_fp16 = _aggregate([c['qat_model_fp16_state_ppl'] for c in per_seed])
     recovery = _aggregate([c['recovery_fraction'] for c in per_seed])
+    fp16_m = _moment([c.get('fp16_matched_ppl') for c in per_seed])
+    ptq_m = _moment([c.get('ptq_matched_ppl') for c in per_seed])
+    rec_m = _moment([c.get('recovery_fraction_matched')
+                     for c in per_seed])
+    fp16_mom = _moment([c['fp16_ppl'] for c in per_seed])
+    ptq_mom = _moment([c['ptq_ppl'] for c in per_seed])
+    qat_mom = _moment([c['qat_ppl'] for c in per_seed])
+    matched_diffs = [c['qat_minus_matched_log_ppl'] for c in per_seed
+                     if c.get('qat_minus_matched_log_ppl') is not None]
+    matched_paired = (summarize_paired(matched_diffs)
+                      if len(matched_diffs) >= 2 else None)
+    budgets_matched = all(
+        bool(c.get('historical_budget_matched',
+                   c.get('steps') == c.get('qat_steps')))
+        for c in per_seed)
     row = {
         'row_kind': 'qat_recovery',
         'model': 'stepwise_kda_lm',
         'seeds': [int(c['seed']) for c in per_seed],
+        'n_seeds': len(per_seed),
         'spec': spec_summary(spec),
         'steps': per_seed[0]['steps'],
         'qat_steps': per_seed[0]['qat_steps'],
@@ -711,6 +761,41 @@ def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
         'recovery_fraction_mean': recovery['mean'],
         'recovery_fraction_min': recovery['min'],
         'recovery_fraction_max': recovery['max'],
+        # Mean +/- sample std / 95% t-CI (historical means kept above).
+        'fp16_ppl_std': fp16_mom['std'],
+        'fp16_ppl_ci95': fp16_mom['ci95'],
+        'ptq_ppl_std': ptq_mom['std'],
+        'ptq_ppl_ci95': ptq_mom['ci95'],
+        'qat_ppl_std': qat_mom['std'],
+        'qat_ppl_ci95': qat_mom['ci95'],
+        'recovery_fraction_std': _moment(
+            [c['recovery_fraction'] for c in per_seed])['std'],
+        'recovery_fraction_ci95': _moment(
+            [c['recovery_fraction'] for c in per_seed])['ci95'],
+        # Matched-budget control (primary causal QAT contrast).
+        'historical_budget_matched': budgets_matched,
+        'fp16_matched_ppl_mean': fp16_m['mean'],
+        'fp16_matched_ppl_std': fp16_m['std'],
+        'fp16_matched_ppl_ci95': fp16_m['ci95'],
+        'ptq_matched_ppl_mean': ptq_m['mean'],
+        'ptq_matched_ppl_std': ptq_m['std'],
+        'ptq_matched_ppl_ci95': ptq_m['ci95'],
+        'recovery_fraction_matched_mean': rec_m['mean'],
+        'recovery_fraction_matched_std': rec_m['std'],
+        'recovery_fraction_matched_ci95': rec_m['ci95'],
+        'qat_vs_matched_control': matched_paired,
+        'budget_control': {
+            'total_steps_fp16': int(per_seed[0]['steps']),
+            'total_steps_qat': int(per_seed[0]['qat_steps']),
+            'total_steps_fp16_matched': int(per_seed[0]['qat_steps']),
+            'historical_arms_equal_budget': bool(budgets_matched),
+            'note': ('When QLM_STEPS != QLM_QAT_STEPS the historical fp16 '
+                     'arm is shorter than QAT; the matched control is a '
+                     'fresh fp16 run at QLM_QAT_STEPS with the same seed/'
+                     'init/data/optimizer/LR, so only the quantizer '
+                     'differs. qat_vs_matched_control tests that contrast '
+                     '(log-PPL difference, <0 favors QAT).'),
+        },
         'grad_norm_first_mean': _aggregate(
             [c['grad_norm_first'] for c in per_seed])['mean'],
         'grad_norm_last_mean': _aggregate(
@@ -720,7 +805,9 @@ def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
         'recovery_definition': (
             '1 - residual/ptq_damage where residual = qat_ppl/fp16_ppl - 1 '
             'and damage = ptq_ppl/fp16_ppl - 1 per seed; None when the '
-            'seed shows no PTQ damage (damage <= 0).'),
+            'seed shows no PTQ damage (damage <= 0). The *_matched variant '
+            'uses the equally trained fp16 control instead of the shorter '
+            'fp16 arm.'),
     }
     rows.append(row)
     return rows
@@ -1037,28 +1124,78 @@ def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
         qat_ppl = evaluate_stepwise_ppl(qat_model, val_windows, pad,
                                         spec=spec)['ppl']
         qat_fp16 = evaluate_stepwise_ppl(qat_model, val_windows, pad)['ppl']
+
+        # Budget-matched fp16 control. QAT trains for ``qat_steps`` while
+        # the historical fp16 arm trains for ``steps``; when those differ,
+        # the QAT-vs-fp16 contrast is confounded with extra optimization.
+        # Reuse the fp16 arm only when the budgets already match; otherwise
+        # train a fresh control for exactly ``qat_steps`` with the same
+        # seed/init/data/optimizer/LR (the only difference from QAT is the
+        # state quantizer).
+        historical_budget_matched = int(qat_steps) == int(steps)
+        matched_reused = historical_budget_matched
+        if matched_reused:
+            fp16_matched_rep = fp16_rep
+            fp16_matched_ppl = fp16_ppl
+            ptq_matched_ppl = ptq_ppl
+        else:
+            fp16_matched_model, fp16_matched_rep = train_stepwise_lm(
+                seed=seed, tokenizer=tokenizer,
+                train_texts=split_texts['train'], steps=qat_steps,
+                seq_len=seq_len, batch_size=batch_size, device=device,
+                spec=None, ste=False, lr=lr)
+            fp16_matched_ppl = evaluate_stepwise_ppl(
+                fp16_matched_model, val_windows, pad)['ppl']
+            ptq_matched_ppl = evaluate_stepwise_ppl(
+                fp16_matched_model, val_windows, pad, spec=spec)['ppl']
+
         damage = ptq_ppl / fp16_ppl - 1.0
         residual = qat_ppl / fp16_ppl - 1.0
         recovery = (1.0 - residual / damage) if damage > 0.0 else None
+        matched_damage = ptq_matched_ppl / fp16_matched_ppl - 1.0
+        matched_residual = qat_ppl / fp16_matched_ppl - 1.0
+        recovery_matched = (
+            1.0 - matched_residual / matched_damage
+            if matched_damage > 0.0 else None)
         per_seed.append({
             'seed': int(seed),
             'steps': int(steps),
             'qat_steps': int(qat_steps),
+            'total_steps_fp16': int(steps),
+            'total_steps_qat': int(qat_steps),
+            'total_steps_fp16_matched': int(qat_steps),
+            'historical_budget_matched': bool(historical_budget_matched),
+            'matched_control_reused': bool(matched_reused),
             'fp16_ppl': fp16_ppl,
             'ptq_ppl': ptq_ppl,
             'qat_ppl': qat_ppl,
             'qat_model_fp16_state_ppl': qat_fp16,
+            'fp16_matched_ppl': fp16_matched_ppl,
+            'ptq_matched_ppl': ptq_matched_ppl,
             'recovery_fraction': recovery,
+            'recovery_fraction_matched': recovery_matched,
+            # Log-PPL difference at matched budget: <0 means QAT has lower
+            # perplexity than the equally trained fp16 control.
+            'qat_minus_matched_log_ppl': (
+                math.log(qat_ppl) - math.log(fp16_matched_ppl)
+                if qat_ppl > 0.0 and fp16_matched_ppl > 0.0 else None),
+            'extra_steps_vs_fp16': int(qat_steps) - int(steps),
             'grad_norm_first': qat_rep['grad_norm_first'],
             'grad_norm_last': qat_rep['grad_norm_last'],
             'all_grads_finite': bool(
-                qat_rep['all_grads_finite'] and fp16_rep['all_grads_finite']),
+                qat_rep['all_grads_finite']
+                and fp16_rep['all_grads_finite']
+                and fp16_matched_rep['all_grads_finite']),
         })
         logger.info(
             'Part B seed %d: fp16 %.4f | PTQ %s %.4f | QAT %.4f '
-            '(recovery %s)', seed, fp16_ppl,
+            '| fp16-matched %.4f (PTQ %.4f) | recovery %s '
+            '(matched %s)', seed, fp16_ppl,
             spec_summary(spec)['bits'], ptq_ppl, qat_ppl,
-            'n/a' if recovery is None else f'{recovery:.2%}')
+            fp16_matched_ppl, ptq_matched_ppl,
+            'n/a' if recovery is None else f'{recovery:.2%}',
+            'n/a' if recovery_matched is None
+            else f'{recovery_matched:.2%}')
     return per_seed
 
 
@@ -1119,11 +1256,16 @@ def _print_qat(rows):
     for row in rows:
         if row['row_kind'] != 'qat_recovery':
             continue
+        rec = row.get('recovery_fraction_mean')
+        rec_str = f'{rec:.2%}' if rec is not None else 'n/a'
+        rec_m = row.get('recovery_fraction_matched_mean')
+        rec_m_str = f'{rec_m:.2%}' if rec_m is not None else 'n/a'
         logger.info(
             f"  fp16 {row['fp16_ppl_mean']:.4f} | PTQ {row['ptq_ppl_mean']:.4f} "
             f"| QAT {row['qat_ppl_mean']:.4f} | "
-            f"recovery {row['recovery_fraction_mean']:.2%} "
-            f"(min {row['recovery_fraction_min']:.2%})")
+            f"fp16-matched {row.get('fp16_matched_ppl_mean') or float('nan'):.4f} "
+            f"| recovery {rec_str} (matched {rec_m_str}) | "
+            f"budgets_equal={row.get('historical_budget_matched')}")
 
 
 def main():
@@ -1218,7 +1360,11 @@ def main():
             '(Exp 10 grid, flat per-layer grouping); Part B trains a '
             'standalone per-token KDA LM twice from the same init '
             '(fp16 vs 2-bit STE state writes) to measure whether QAT '
-            'recovers the PTQ perplexity damage through the quantizer.'),
+            'recovers the PTQ perplexity damage through the quantizer. '
+            'When QLM_STEPS != QLM_QAT_STEPS, an additional fp16 control '
+            'is trained for exactly QLM_QAT_STEPS from the same '
+            'seed/init/data/optimizer/LR, and the matched-budget recovery '
+            'is reported so extra optimization is not credited to QAT.'),
         'model': _cfg_summary(small_hybrid_config()),
         'corpus': {
             'source': 'synthetic fallback (deterministic, offline; no '
@@ -1249,7 +1395,10 @@ def main():
             'tolerance': tolerance,
             'qat': 'straight-through fake_quantize (ste=True) on every '
                    'state write during training; inference scoring uses '
-                   'ste=False on the same spec',
+                   'ste=False on the same spec. The primary QAT contrast '
+                   'is against the equally trained fp16 control '
+                   '(recovery_fraction_matched / qat_vs_matched_control), '
+                   'never against a shorter-budget fp16 arm',
         },
         'train_reports': [
             {k: v for k, v in rep.items() if k != 'cfg'}

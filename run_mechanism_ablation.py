@@ -1066,12 +1066,15 @@ def main():
 
     # Shared Bonferroni family: one paired accuracy test vs baseline per
     # non-baseline variant (only when the baseline variant is present) PLUS
+    # one paired gold-PR-AUC test vs baseline per non-baseline variant PLUS
     # one one-sided recall-vs-chance test per variant (baseline included).
-    # Both use alpha_corrected below, so both must be counted; each test is
+    # All use alpha_corrected below, so all must be counted; each test is
     # repeated for every n_kv group.
     n_paired_tests = ((len(variants) - 1) * len(n_kv_list)
                       if has_baseline else 0)
-    n_tests = n_paired_tests + len(variants) * len(n_kv_list)
+    n_pr_auc_tests = n_paired_tests
+    n_tests = (n_paired_tests + n_pr_auc_tests
+               + len(variants) * len(n_kv_list))
     alpha_corrected = 0.05 / n_tests if n_tests else None
 
     seeds = [42 + i for i in range(n_seeds)]
@@ -1081,6 +1084,7 @@ def main():
         logger.info(f'  n_kv = {n_kv}')
         logger.info(f'{"=" * 70}')
         baseline_acc = {}
+        baseline_pr_auc = {}
         for variant in variants:
             logger.info(f'\n-- variant {variant["name"]} '
                         f'(rope={variant["rope"]}, topk={variant["topk"]}, '
@@ -1155,6 +1159,11 @@ def main():
                                 if 'error' not in r
                                 and r.get('final_acc') is not None
                                 and math.isfinite(r['final_acc'])}
+                baseline_pr_auc = {
+                    r['seed']: r['gold_pr_auc'] for r in per_seed
+                    if 'error' not in r
+                    and r.get('gold_pr_auc') is not None
+                    and math.isfinite(r['gold_pr_auc'])}
             all_rows.append(row)
             _ci = row['ci95_acc']
             _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
@@ -1177,6 +1186,12 @@ def main():
             row['paired_vs_baseline_n_pairs'] = 0
             row['paired_vs_baseline_t_crit_bonferroni'] = None
             row['paired_significant_bonferroni'] = False
+            row['paired_vs_baseline_mean_gold_pr_auc_diff'] = None
+            row['paired_vs_baseline_gold_pr_auc_ci95'] = None
+            row['paired_vs_baseline_gold_pr_auc_t_stat'] = None
+            row['paired_vs_baseline_gold_pr_auc_n_pairs'] = 0
+            row['paired_vs_baseline_gold_pr_auc_t_crit_bonferroni'] = None
+            row['paired_pr_auc_significant_bonferroni'] = False
             row['gold_recall_t_crit_bonferroni'] = None
             row['gold_recall_significant_bonferroni'] = False
             if row['variant'] == 'baseline':
@@ -1205,6 +1220,31 @@ def main():
             row['paired_significant_bonferroni'] = (
                 crit is not None and stats['t_stat'] is not None
                 and abs(stats['t_stat']) > crit)
+            # Paired contrast on the PRIMARY ranking metric. Accuracy alone
+            # cannot show whether a variant improved the indexer's gold-block
+            # ranking; gold_pr_auc is that direct measurement and is paired
+            # by seed against the same baseline run.
+            pr_auc_diffs = []
+            for r in row['per_seed']:
+                if 'error' in r or r.get('gold_pr_auc') is None:
+                    continue
+                base_pr = baseline_pr_auc.get(r['seed'])
+                if base_pr is None or not math.isfinite(base_pr):
+                    continue
+                pr_auc_diffs.append(r['gold_pr_auc'] - base_pr)
+            pr_stats = paired_stats(pr_auc_diffs)
+            pr_crit = None
+            if pr_stats['t_stat'] is not None and alpha_corrected is not None:
+                pr_crit = _bonferroni_crit_q(pr_stats['n_pairs'],
+                                             alpha=alpha_corrected / 2.0)
+            row['paired_vs_baseline_mean_gold_pr_auc_diff'] = pr_stats['mean']
+            row['paired_vs_baseline_gold_pr_auc_ci95'] = pr_stats['ci95']
+            row['paired_vs_baseline_gold_pr_auc_t_stat'] = pr_stats['t_stat']
+            row['paired_vs_baseline_gold_pr_auc_n_pairs'] = pr_stats['n_pairs']
+            row['paired_vs_baseline_gold_pr_auc_t_crit_bonferroni'] = pr_crit
+            row['paired_pr_auc_significant_bonferroni'] = (
+                pr_crit is not None and pr_stats['t_stat'] is not None
+                and abs(pr_stats['t_stat']) > pr_crit)
             # Verdict against the PRE-REGISTERED prediction: only a
             # Bonferroni-significant paired contrast can support or
             # contradict a directional claim; anything else is
@@ -1272,6 +1312,8 @@ def main():
                        if r.get('paired_significant_bonferroni'))
     n_sig_recall = sum(1 for r in all_rows
                        if r.get('gold_recall_significant_bonferroni'))
+    n_sig_pr_auc = sum(1 for r in all_rows
+                       if r.get('paired_pr_auc_significant_bonferroni'))
     n_compared = sum(1 for r in all_rows if r.get('variant') != 'baseline')
     n_hyp_supported = sum(1 for r in all_rows
                           if r.get('prediction_status') == 'supported')
@@ -1295,6 +1337,8 @@ def main():
                 f'{n_sig_paired}/{n_compared} '
                 f'(Bonferroni alpha='
                 f'{alpha_corrected if alpha_corrected is not None else "n/a"})')
+    logger.info(f'  variants with significant paired gold-PR-AUC diff: '
+                f'{n_sig_pr_auc}/{n_compared} (same Bonferroni family)')
     logger.info(f'  variants with recall above chance (Bonferroni): '
                 f'{n_sig_recall}/{len(all_rows)}')
     logger.info(f'  pre-registered predictions: {n_hyp_supported} supported '
@@ -1391,13 +1435,15 @@ def main():
             "gold_top1_recall = fraction ranked first. Chance references: "
             "chance_gold_pr_auc = 1/n_available, chance_gold_mrr = "
             "H(n_available)/n_available. recall@k is thresholded and hides "
-            "near-misses just below the cut; the ranking metrics do not."),
+            "near-misses just below the cut; the ranking metrics do not. "
+            "gold_pr_auc is also tested as a paired-by-seed contrast against "
+            "the baseline (paired_vs_baseline_mean_gold_pr_auc_diff)."),
         'paired_test': (
-            'two-sided paired t over seeds vs baseline; one-sided recall '
-            't vs chance; both share one Bonferroni family of n_tests = '
-            '(n_variants - 1 + n_variants) * n_kv when the baseline variant '
-            'is present; alpha = 0.05/n_tests; undefined statistics are '
-            'null.'),
+            'two-sided paired t over seeds vs baseline for both final '
+            'accuracy and gold_pr_auc; one-sided recall t vs chance; all '
+            'share one Bonferroni family of n_tests = (2*(n_variants - 1) + '
+            'n_variants) * n_kv when the baseline variant is present; '
+            'alpha = 0.05/n_tests; undefined statistics are null.'),
         'cost_tradeoff_policy': {
             'min_effect': DEFAULT_MIN_EFFECT,
             'max_cost_ratio': DEFAULT_MAX_COST_RATIO,
@@ -1489,6 +1535,9 @@ def main():
         results={
             'n_variants': len(all_rows),
             'n_seeds': int(n_seeds),
+            'significant_accuracy_variants': int(n_sig_paired),
+            'significant_pr_auc_variants': int(n_sig_pr_auc),
+            'significant_recall_variants': int(n_sig_recall),
             'errors': int(n_errors),
             'incomplete_seed_sets': int(n_incomplete),
             'return_code': rc,
@@ -1513,21 +1562,23 @@ def _fmt_recall(value):
 
 
 def _print_table(rows):
-    print('\n' + '=' * 108)
+    print('\n' + '=' * 130)
     print(f"{'variant':>16} | {'rope':>4} | {'k':>2} | {'STE':>3} | "
           f"{'mean_acc':>8} | {'+/-CI95':>7} | {'recall':>6} | "
-          f"{'chance':>6} | {'paired_d':>9} | {'sig':>3} | {'pred':>4} | "
-          f"{'fwd_ms':>7}")
-    print('-' * 108)
+          f"{'chance':>6} | {'pr_auc':>6} | {'d_pr_auc':>8} | "
+          f"{'paired_d':>9} | {'sig':>4} | {'pred':>4} | {'fwd_ms':>7}")
+    print('-' * 130)
     pred_tags = {'supported': 'ok', 'contradicted': 'X',
                  'not_supported': '~'}
     for r in rows:
         track = r.get('variant', '?')
         paired = r.get('paired_vs_baseline_mean_acc_diff')
+        paired_pr = r.get('paired_vs_baseline_mean_gold_pr_auc_diff')
         sig_p = r.get('paired_significant_bonferroni')
         sig_r = r.get('gold_recall_significant_bonferroni')
-        sig = 'both' if (sig_p and sig_r) else ('acc' if sig_p
-                                                else ('rec' if sig_r else '-'))
+        sig_pr = r.get('paired_pr_auc_significant_bonferroni')
+        sig = '+'.join(tag for tag, on in (('acc', sig_p), ('pr', sig_pr),
+                                           ('rec', sig_r)) if on) or '-'
         pred = pred_tags.get(r.get('prediction_status'), '-')
         print(f"{track:>16} | {str(r.get('rope')):>4} | {r.get('topk'):>2} | "
               f"{str(r.get('use_ste')):>3} | "
@@ -1535,8 +1586,10 @@ def _print_table(rows):
               f"{('n/a' if r.get('ci95_acc') is None else format(r['ci95_acc'], '.4f')):>7} | "
               f"{_fmt_recall(r.get('mean_gold_recall')):>6} | "
               f"{_fmt_recall(r.get('chance_gold_recall')):>6} | "
+              f"{_fmt_recall(r.get('mean_gold_pr_auc')):>6} | "
+              f"{('n/a' if paired_pr is None else format(paired_pr, '+.4f')):>8} | "
               f"{('n/a' if paired is None else format(paired, '+.4f')):>9} | "
-              f"{sig:>3} | {pred:>4} | {_fmt_num(r.get('mean_fwd_ms'), 2):>7}")
+              f"{sig:>4} | {pred:>4} | {_fmt_num(r.get('mean_fwd_ms'), 2):>7}")
 
 
 if __name__ == '__main__':

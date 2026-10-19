@@ -244,6 +244,43 @@ def test_forward_with_policy_state_threading():
 # runner payload
 # ---------------------------------------------------------------------------
 
+def test_quality_probe_sample_stats_and_seed_pairing():
+    """The MQA quality probe reports sample std/CI and paired contrasts."""
+    import statistics
+    from run_train_roofline import quality_probe
+
+    rows = quality_probe(
+        seeds=(0, 1, 2), device='cpu', d_model=32, n_heads=4, head_dim=8,
+        seq_len=8, vocab=4, steps=1, lr=3e-3, batch=4,
+        eval_batches=1, eval_batch=4)
+    by_variant = {row['variant']: row for row in rows}
+    assert set(by_variant) == {'mha', 'gqa', 'mqa'}
+    assert by_variant['mha']['paired_vs_mha'] is None
+    for name, row in by_variant.items():
+        assert row['n_seeds'] == 3
+        assert len(row['accs']) == len(row['seeds']) == 3
+        assert row['std_acc'] == pytest.approx(
+            statistics.stdev(row['accs']))
+        assert row['std_acc'] != pytest.approx(
+            statistics.pstdev(row['accs'])) or len(set(row['accs'])) == 1
+        assert row['min_acc'] <= row['mean_acc'] <= row['max_acc']
+        assert row['ci95_acc'] is not None
+        lo, hi = row['ci95_acc']
+        assert lo <= row['mean_acc'] <= hi
+        if name != 'mha':
+            paired = row['paired_vs_mha']
+            assert paired is not None and paired['n_pairs'] == 3
+            assert paired['mean_diff'] == pytest.approx(
+                row['mean_acc'] - by_variant['mha']['mean_acc'])
+            p_raw = paired['t_test']['p_value_two_sided']
+            if p_raw is not None:
+                assert paired['bonferroni_family_size'] == 2
+                assert paired['p_value_bonferroni'] == pytest.approx(
+                    min(1.0, 2.0 * p_raw))
+                assert paired['significant_bonferroni'] is (
+                    paired['p_value_bonferroni'] < 0.05)
+
+
 def test_runner_report_json_safe():
     from run_train_roofline import KIND, build_report
     report = build_report(

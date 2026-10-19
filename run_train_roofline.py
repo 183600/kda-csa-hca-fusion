@@ -50,6 +50,7 @@ import results_schema  # noqa: E402
 import roofline  # noqa: E402
 from kaggle_setup import (capture_provenance, configure_torch_for_device,  # noqa: E402
                           sanitize_for_json, write_results_json)
+from multi_seed_stats import summarize_paired  # noqa: E402
 from ops_fused import HybridAttentionStack  # noqa: E402
 from run_decode_bandwidth import build_base_cfg  # noqa: E402
 from run_kv_cache import prefill_flops  # noqa: E402
@@ -435,19 +436,61 @@ def quality_probe(*, seeds: tuple[int, ...], device, d_model: int,
                 n_heads=n_heads, head_dim=head_dim, seq_len=seq_len,
                 vocab=vocab, steps=steps, lr=lr, batch=batch,
                 eval_batches=eval_batches, eval_batch=eval_batch))
+    # Per-variant, per-seed accuracies so the MQA/GQA/MHA contrast can be
+    # seed-paired (the same recipe and seeds are used for every variant).
+    by_variant: dict[str, dict[int, float]] = {}
+    for run in runs:
+        by_variant.setdefault(run['variant'], {})[run['seed']] = \
+            run['final_acc']
+    ref = by_variant.get('mha', {})
     summary: list[dict] = []
     for name in MQA_VARIANTS:
-        accs = [r['final_acc'] for r in runs if r['variant'] == name]
-        if not accs:
+        seed_accs = by_variant.get(name)
+        if not seed_accs:
             continue
+        seeds = sorted(seed_accs)
+        accs = [seed_accs[s] for s in seeds]
+        mean = statistics.fmean(accs)
+        std = statistics.stdev(accs) if len(accs) > 1 else None
+        ci = None
+        if std is not None:
+            from run_quality import _t_crit_975
+            crit = _t_crit_975(len(accs))
+            if crit is not None:
+                half = crit * std / (len(accs) ** 0.5)
+                ci = [mean - half, mean + half]
+        common = sorted(set(seed_accs) & set(ref))
+        paired = None
+        if name != 'mha' and len(common) >= 2:
+            paired = summarize_paired(
+                [seed_accs[s] - ref[s] for s in common])
+            # Two non-baseline variants (GQA, MQA) are contrasted with MHA
+            # inside each probe; apply a Bonferroni adjustment so the
+            # family-wise error stays at 0.05.
+            family = max(1, len(MQA_VARIANTS) - 1)
+            p_raw = (paired.get('t_test') or {}).get('p_value_two_sided')
+            if p_raw is not None:
+                p_adj = min(1.0, p_raw * family)
+                paired['p_value_bonferroni'] = p_adj
+                paired['alpha_bonferroni'] = 0.05 / family
+                paired['significant_bonferroni'] = bool(p_adj < 0.05)
+                paired['bonferroni_family_size'] = family
         summary.append({
             'variant': name,
-            'seeds': [r['seed'] for r in runs if r['variant'] == name],
+            'seeds': seeds,
             'accs': accs,
-            'mean_acc': statistics.fmean(accs),
-            'std_acc': statistics.pstdev(accs) if len(accs) > 1 else 0.0,
+            'mean_acc': mean,
+            # Sample standard deviation (n - 1), not the population
+            # statistic: these seeds are a sample from the run
+            # distribution, and the paired contrast uses the same units.
+            'std_acc': std,
+            'ci95_acc': ci,
+            'min_acc': min(accs),
+            'max_acc': max(accs),
+            'n_seeds': len(accs),
             'n_params': next(r['n_params'] for r in runs
                              if r['variant'] == name),
+            'paired_vs_mha': paired,
         })
     return summary
 
@@ -542,7 +585,11 @@ def build_report(*, T: int, batch: int, d_model: int, seed: int,
             'quality probe: multi_agg at vocab=4 (easy; variants saturate '
             'near 1.0 — the KV sharing is free there) and vocab=16 (hard; '
             'exposes the sharing-quality cost), same recipe per variant and '
-            '3 seeds',
+            '3 seeds; std_acc is the sample standard deviation, ci95_acc is '
+            'a two-sided t-interval, and paired_vs_mha is a seed-paired '
+            'contrast with a Bonferroni-corrected p across the two '
+            'non-baseline variants in each probe (diagnostic probe; the '
+            '3-seed power is low, so non-significance is not equivalence)',
             'efficiency_label relates the roofline ceiling to the measured '
             'fwd+bwd time of the same policy; at this small scale python '
             'overhead dominates, so the achieved fraction is a lower bound',
@@ -613,10 +660,16 @@ def _print_report(report: dict) -> None:
         for frame in q['probes']:
             print(f"  vocab={frame['vocab']} (chance={frame['chance_acc']:.2f}):")
             for row in frame['variants']:
+                std = row.get('std_acc')
+                std_str = f'{std:.3f}' if std is not None else 'n/a'
+                paired = row.get('paired_vs_mha') or {}
+                p = paired.get('p_value_bonferroni')
+                p_str = f'{p:.3g}' if p is not None else 'n/a'
                 print(f"    {row['variant']:<4} acc={row['mean_acc']:.3f} "
-                      f"+- {row['std_acc']:.3f} "
+                      f"+- {std_str} "
                       f"kv={row['kv_bytes_per_token']}B/token "
-                      f"acc/KB={row['acc_per_kv_kb']:.3f}")
+                      f"acc/KB={row['acc_per_kv_kb']:.3f} "
+                      f"p_bonf_vs_mha={p_str}")
 
 
 def main(argv=None) -> int:

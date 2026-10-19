@@ -330,6 +330,19 @@ def test_quant_recall_report_rows():
             rec_ok = False
     _ok('recall aggregates are ordered and exact_recall is conservative',
         rec_ok, '')
+    _ok('single-seed cells leave std/CI undefined instead of faking zero',
+        all(r['recall_std'] is None and r['recall_ci95'] is None
+            and r['n_seeds'] == 1 for r in cells), '')
+    multi = build_quant_recall_rows(
+        device='cpu', seeds=(0, 1, 2), bits_list=(2,), group_sizes=(64,),
+        include_asymmetric=False)
+    multi_cells = [r for r in multi if r['row_kind'] == 'quant_recall']
+    _ok('multi-seed cells report sample std and a 95% CI',
+        all(r['n_seeds'] == 3 and r['recall_std'] is not None
+            and r['recall_ci95'] is not None
+            and r['recall_ci95'][0] <= r['recall_mean']
+            <= r['recall_ci95'][1] for r in multi_cells),
+        f'{len(multi_cells)} cells')
     for s in summaries:
         cell = s['cheapest_exact_cell']
         exact = [r for r in cells

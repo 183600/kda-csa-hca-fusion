@@ -409,9 +409,15 @@ def test_exp8_smoke_envelope():
                 and baseline.get('chance_gold_pr_auc') is not None,
                 f"pr_auc={baseline.get('mean_gold_pr_auc')}, "
                 f"mrr={baseline.get('mean_gold_mrr')}")
+            no_rope = next(r for r in rows if r['variant'] == 'no_rope')
             _ok('paired stats present for the non-baseline variant',
-                next(r for r in rows if r['variant'] == 'no_rope')
-                ['paired_vs_baseline_mean_acc_diff'] is not None, '')
+                no_rope['paired_vs_baseline_mean_acc_diff'] is not None, '')
+            _ok('paired PR-AUC contrast present for the primary metric',
+                no_rope.get('paired_vs_baseline_mean_gold_pr_auc_diff')
+                is not None
+                and no_rope.get('paired_vs_baseline_gold_pr_auc_n_pairs') == 1
+                and no_rope.get('paired_pr_auc_significant_bonferroni')
+                is False, f"{no_rope.get('paired_vs_baseline_mean_gold_pr_auc_diff')}")
             _ok('design metadata documents the diagnostic',
                 'gold_recall_definition' in payload.get('metadata', {})
                 and 'caveats' in payload.get('metadata', {}), '')

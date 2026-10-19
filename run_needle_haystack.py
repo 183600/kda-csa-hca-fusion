@@ -1481,7 +1481,7 @@ def run_needle_sweep(
 
 def run_qat_needle_probe(
     tokenizer: _NeedleCharTokenizer,
-    seeds: tuple[int, ...] = (0, 1),
+    seeds: tuple[int, ...] = (0, 1, 2),
     qat_spec: QuantSpec = QuantSpec(bits=2, group_size=16),
     steps: int = 100,
     qat_steps: int = 100,
@@ -1496,9 +1496,17 @@ def run_qat_needle_probe(
     """QAT recovery probe for needle retrieval (mirroring Exp 11 Part B).
 
     Trains a stepwise KDA LM from the SAME initialization:
-    1. fp16 state writes (baseline)
-    2. 2-bit STE state writes (QAT)
-    Evaluates needle retrieval on both.
+
+    1. fp16 state writes (baseline, ``steps`` optimizer steps)
+    2. 2-bit STE state writes (QAT, ``qat_steps`` steps from the fp16 init)
+    3. fp16 state writes continued for ``qat_steps`` from the SAME fp16
+       init (equal-budget control)
+
+    The third arm exists because arm 2 receives ``steps + qat_steps``
+    optimizer steps in total while arm 1 stops at ``steps``. Comparing
+    QAT against arm 1 would confound the quantizer with extra training, so
+    the primary QAT contrast is against arm 3's PTQ accuracy (identical
+    total budget, initialization, seed, data stream, optimizer and LR).
     """
     rows = []
     for seed in seeds:
@@ -1521,9 +1529,21 @@ def run_qat_needle_probe(
             qat_model, tokenizer, train_context_len, train_needle_pos,
             qat_steps, batch_size, lr, device, seed, quant_spec=qat_spec, ste=True)
 
-        # Evaluate both on needle task (held-out seed band; the SAME
-        # evaluation sequences are used for every model so the fp16/PTQ/QAT
-        # comparison is paired).
+        # Equal-budget fp16 control: continue the SAME initialization for
+        # exactly ``qat_steps`` more steps with the SAME seed/data stream.
+        # Only the state quantizer differs from the QAT arm, so the
+        # matched-budget contrast isolates QAT rather than extra training.
+        fp16_continued_model = NeedleStepwiseKDA(
+            tokenizer.vocab_size, d_model=64, H=2, K=16, V=16)
+        fp16_continued_model.load_state_dict(fp16_model.state_dict())
+        fp16_continued_model, fp16_cont_rep = train_needle_model(
+            fp16_continued_model, tokenizer, train_context_len,
+            train_needle_pos, qat_steps, batch_size, lr, device, seed,
+            quant_spec=None, ste=False)
+
+        # Evaluate every arm on the needle task (held-out seed band; the
+        # SAME evaluation sequences are used for every model so the
+        # fp16/PTQ/QAT comparison is paired).
         fp16_acc = evaluate_needle_recall(
             fp16_model, tokenizer, eval_context_len, eval_needle_pos,
             batch_size=8, n_batches=2, device=device, quant_spec=None, dtype=torch.float16)
@@ -1536,13 +1556,26 @@ def run_qat_needle_probe(
         qat_fp16_acc = evaluate_needle_recall(
             qat_model, tokenizer, eval_context_len, eval_needle_pos,
             batch_size=8, n_batches=2, device=device, quant_spec=None, dtype=torch.float16)
+        # The matched control must be scored through the SAME quantizer as
+        # the QAT arm (both are 2-bit PTQ at inference); its unquantized
+        # score separately shows what extra fp16 training alone bought.
+        fp16_cont_acc = evaluate_needle_recall(
+            fp16_continued_model, tokenizer, eval_context_len,
+            eval_needle_pos, batch_size=8, n_batches=2, device=device,
+            quant_spec=None, dtype=torch.float16)
+        fp16_cont_ptq_acc = evaluate_needle_recall(
+            fp16_continued_model, tokenizer, eval_context_len,
+            eval_needle_pos, batch_size=8, n_batches=2, device=device,
+            quant_spec=qat_spec, dtype=torch.float16)
 
-        # Leakage audit: every sequence fed to either training run (fp16
-        # baseline and QAT) must be disjoint from the evaluation sequences.
+        # Leakage audit: every sequence fed to any training run (fp16
+        # baseline, QAT, equal-budget fp16 control) must be disjoint from
+        # the evaluation sequences.
         eval_seeds = (eval_batch_seeds(0, 8) + eval_batch_seeds(1, 8))
         stream_audit = audit_train_eval_seed_disjointness(
             list(fp16_rep.get('data_seeds') or [])
-            + list(qat_rep.get('data_seeds') or []),
+            + list(qat_rep.get('data_seeds') or [])
+            + list(fp16_cont_rep.get('data_seeds') or []),
             eval_seeds)
         if not stream_audit['disjoint']:
             raise RuntimeError(
@@ -1559,16 +1592,43 @@ def run_qat_needle_probe(
         residual = (fp16_a - qat_a) / fp16_a if fp16_a > 0 else 0
         recovery = 1.0 - residual / damage if damage > 0 else None
 
+        fp16_cont_a = fp16_cont_acc['accuracy']
+        fp16_cont_ptq_a = fp16_cont_ptq_acc['accuracy']
+        # Same recovery definition, but against the equally trained fp16
+        # control (the causal QAT contrast) instead of the shorter arm.
+        matched_damage = ((fp16_cont_a - fp16_cont_ptq_a) / fp16_cont_a
+                          if fp16_cont_a > 0 else 0.0)
+        matched_residual = ((fp16_cont_a - qat_a) / fp16_cont_a
+                            if fp16_cont_a > 0 else 0.0)
+        recovery_matched = (1.0 - matched_residual / matched_damage
+                            if matched_damage > 0 else None)
         rows.append({
             'row_kind': 'qat_needle',
             'seed': seed,
             'steps': steps,
             'qat_steps': qat_steps,
+            # Total optimizer steps per arm. The QAT and fp16-continued
+            # arms must match exactly for the primary contrast to isolate
+            # the quantizer rather than the training budget.
+            'total_steps_fp16': steps,
+            'total_steps_qat': steps + qat_steps,
+            'total_steps_fp16_continued': steps + qat_steps,
+            'budget_matched': True,
             'fp16_accuracy': fp16_a,
             'ptq_accuracy': ptq_a,
             'qat_accuracy': qat_a,
             'qat_fp16_accuracy': qat_fp16_acc['accuracy'],
+            'fp16_continued_accuracy': fp16_cont_a,
+            'fp16_continued_ptq_accuracy': fp16_cont_ptq_a,
+            # Primary QAT effect at matched budget: positive means the
+            # quantized-write training beats the equally trained fp16
+            # control under the same 2-bit inference quantizer.
+            'qat_matched_gain': qat_a - fp16_cont_ptq_a,
+            # What extra optimization alone buys under the same quantizer.
+            'extra_training_gain': fp16_cont_ptq_a - ptq_a,
+            'qat_gain_vs_ptq': qat_a - ptq_a,
             'recovery_fraction': recovery,
+            'recovery_fraction_matched': recovery_matched,
             'train_context_len': train_context_len,
             'train_needle_pos': train_needle_pos,
             'eval_context_len': eval_context_len,
@@ -1577,28 +1637,97 @@ def run_qat_needle_probe(
             'data_protocol': stream_audit,
         })
 
-    # Summary
-    fp16_mean = sum(r['fp16_accuracy'] for r in rows) / len(rows)
-    ptq_mean = sum(r['ptq_accuracy'] for r in rows) / len(rows)
-    qat_mean = sum(r['qat_accuracy'] for r in rows) / len(rows)
-    recs = [r['recovery_fraction'] for r in rows if r['recovery_fraction'] is not None]
-    rec_mean = sum(recs) / len(recs) if recs else None
-    rec_min = min(recs) if recs else None
+    # Summary over per-seed rows only (the summary row is appended last).
+    per_seed_rows = [r for r in rows if r['row_kind'] == 'qat_needle']
+
+    def _moment(values):
+        vals = [v for v in values if v is not None]
+        if not vals:
+            return {'mean': None, 'std': None, 'ci95': None,
+                    'min': None, 'n': 0}
+        mean = sum(vals) / len(vals)
+        std = (math.sqrt(sum((v - mean) ** 2 for v in vals)
+                         / (len(vals) - 1)) if len(vals) > 1 else None)
+        return {'mean': mean, 'std': std,
+                'ci95': _mean_ci95(vals),
+                'min': min(vals), 'n': len(vals)}
+
+    def _paired(values):
+        vals = [v for v in values if v is not None]
+        return summarize_paired(vals) if len(vals) >= 2 else None
+
+    fp16 = _moment(r['fp16_accuracy'] for r in per_seed_rows)
+    ptq = _moment(r['ptq_accuracy'] for r in per_seed_rows)
+    qat = _moment(r['qat_accuracy'] for r in per_seed_rows)
+    fp16_cont = _moment(r['fp16_continued_accuracy']
+                        for r in per_seed_rows)
+    fp16_cont_ptq = _moment(r['fp16_continued_ptq_accuracy']
+                            for r in per_seed_rows)
+    matched_gain = _moment(r['qat_matched_gain'] for r in per_seed_rows)
+    extra_gain = _moment(r['extra_training_gain'] for r in per_seed_rows)
+    rec = _moment(r['recovery_fraction'] for r in per_seed_rows)
+    rec_matched = _moment(r['recovery_fraction_matched']
+                          for r in per_seed_rows)
+    qat_vs_matched = _paired(r['qat_matched_gain'] for r in per_seed_rows)
+    qat_vs_ptq = _paired(r['qat_gain_vs_ptq'] for r in per_seed_rows)
 
     rows.append({
         'row_kind': 'qat_needle_summary',
         'seeds': list(seeds),
-        'fp16_accuracy_mean': fp16_mean,
-        'ptq_accuracy_mean': ptq_mean,
-        'qat_accuracy_mean': qat_mean,
-        'recovery_fraction_mean': rec_mean,
-        'recovery_fraction_min': rec_min,
+        'n_seeds': len(per_seed_rows),
+        # Historical fields (kept for downstream consumers).
+        'fp16_accuracy_mean': fp16['mean'],
+        'ptq_accuracy_mean': ptq['mean'],
+        'qat_accuracy_mean': qat['mean'],
+        'recovery_fraction_mean': rec['mean'],
+        'recovery_fraction_min': rec['min'],
+        'recovery_fraction_matched_mean': rec_matched['mean'],
+        'recovery_fraction_matched_std': rec_matched['std'],
+        'recovery_fraction_matched_ci95': rec_matched['ci95'],
+        'recovery_fraction_matched_min': rec_matched['min'],
+        # Mean +/- sample std + 95% t-CI for every arm.
+        'fp16_accuracy_std': fp16['std'],
+        'fp16_accuracy_ci95': fp16['ci95'],
+        'ptq_accuracy_std': ptq['std'],
+        'ptq_accuracy_ci95': ptq['ci95'],
+        'qat_accuracy_std': qat['std'],
+        'qat_accuracy_ci95': qat['ci95'],
+        'fp16_continued_accuracy_mean': fp16_cont['mean'],
+        'fp16_continued_accuracy_std': fp16_cont['std'],
+        'fp16_continued_accuracy_ci95': fp16_cont['ci95'],
+        'fp16_continued_ptq_accuracy_mean': fp16_cont_ptq['mean'],
+        'fp16_continued_ptq_accuracy_std': fp16_cont_ptq['std'],
+        'fp16_continued_ptq_accuracy_ci95': fp16_cont_ptq['ci95'],
+        # Budget-matched QAT contrast (the primary claim).
+        'qat_matched_gain_mean': matched_gain['mean'],
+        'qat_matched_gain_std': matched_gain['std'],
+        'qat_matched_gain_ci95': matched_gain['ci95'],
+        'qat_vs_matched_control': qat_vs_matched,
+        # Extra training alone (quantized inference on both arms).
+        'extra_training_gain_mean': extra_gain['mean'],
+        'extra_training_gain_std': extra_gain['std'],
+        'extra_training_gain_ci95': extra_gain['ci95'],
+        'qat_vs_ptq': qat_vs_ptq,
+        'budget_control': {
+            'total_steps_fp16': steps,
+            'total_steps_qat': steps + qat_steps,
+            'total_steps_fp16_continued': steps + qat_steps,
+            'matched': True,
+            'note': ('QAT and the fp16-continued control share the same '
+                     'initialization, seed, data stream, optimizer, LR and '
+                     'total optimizer-step budget; only the state-write '
+                     'quantizer differs. ``qat_vs_matched_control`` and '
+                     '``recovery_fraction_matched`` are the causal QAT '
+                     'contrasts; ``qat_vs_ptq`` and the historical '
+                     '``recovery_fraction`` use the shorter fp16 arm and '
+                     'are descriptive only.'),
+        },
         'spec': spec_summary(qat_spec),
         # Every per-seed row carries its own audit; the summary states the
         # conjunction so a consumer does not have to walk the rows.
         'train_eval_disjoint_all_seeds': all(
             r.get('data_protocol', {}).get('disjoint', False)
-            for r in rows if r['row_kind'] == 'qat_needle'),
+            for r in per_seed_rows),
         'eval_seed_band': [0, EVAL_SEED_RESERVE],
         'train_seed_band': [EVAL_SEED_RESERVE, SEED_CEILING],
     })
@@ -1651,10 +1780,21 @@ def _print_qat_rows(rows: list[dict]):
         rec_str = f'{rec:.1%}' if rec is not None else 'n/a'
         rec_min_str = f'{rec_min:.1%}' if rec_min is not None else 'n/a'
         logger.info(
-            f"  fp16 {r['fp16_accuracy_mean']:.3f} | "
+            f"  fp16 {r['fp16_accuracy_mean']:.3f} "
+            f"({r.get('n_seeds', 0)} seeds) | "
             f"PTQ {r['ptq_accuracy_mean']:.3f} | "
             f"QAT {r['qat_accuracy_mean']:.3f} | "
+            f"fp16-cont {r.get('fp16_continued_accuracy_mean', float('nan')):.3f} | "
+            f"fp16-cont-PTQ "
+            f"{r.get('fp16_continued_ptq_accuracy_mean', float('nan')):.3f} | "
             f"recovery {rec_str} (min {rec_min_str})")
+        matched = r.get('qat_matched_gain_mean')
+        if matched is not None:
+            ci = r.get('qat_matched_gain_ci95')
+            ci_str = f' [{ci[0]:+.3f},{ci[1]:+.3f}]' if ci else ''
+            logger.info(
+                f"  budget-matched QAT gain {matched:+.3f}{ci_str} "
+                f"(vs equally trained fp16 control)")
 
 
 def main():
@@ -1722,7 +1862,10 @@ def main():
         dtypes = dtypes or ['fp32', 'fp16', 'bf16']
         quant_bits = quant_bits or [2, 3, 4]
         quant_groups = quant_groups or [16, 64]
-        qat_seeds = (0, 1)
+        # QAT is a key A/B comparison: >=3 seeds are required for any
+        # dispersion/paired summary (the quick profile stays at one seed
+        # and is explicitly plumbing-only).
+        qat_seeds = (0, 1, 2)
         qat_steps = 100
         train_steps = 100
         eval_batches = 4
