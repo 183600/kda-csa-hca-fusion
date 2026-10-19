@@ -321,22 +321,21 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     decay_steps = decay_slab.unbind(1)
     C_steps = C_h.unbind(1)
     Dx_steps = Dx_slab.unbind(1)
-    # Preallocate the output and write one time slice per step: index
-    # assignment is elementwise-identical to the append-and-stack form
-    # (which squeezes the singleton head dim only once, after the stack).
-    ys = torch.empty(
-        x_dt.shape[0], T, 1, S.shape[-2], dtype=S.dtype, device=S.device)
+    # Collect the per-step readouts and stack once at the end: the single
+    # batched copy replaces T tiny per-step copies (elementwise-identical
+    # values; the stack squeezes the singleton head dim only once).
+    ys: list[torch.Tensor] = []
     if S.is_contiguous():
         S_T = S.transpose(-1, -2)
         for t in range(T):
             S = S.mul_(decay_steps[t]).add_(x_steps[t])
-            ys[:, t] = torch.baddbmm(Dx_steps[t], C_steps[t], S_T)
+            ys.append(torch.baddbmm(Dx_steps[t], C_steps[t], S_T))
     else:
         for t in range(T):
             S = S.mul_(decay_steps[t]).add_(x_steps[t])
-            ys[:, t] = (torch.bmm(C_steps[t], S.transpose(-1, -2))
-                        + Dx_steps[t])
-    return ys.squeeze(-2), S
+            ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2))
+                      + Dx_steps[t])
+    return torch.stack(ys, dim=1).squeeze(-2), S
 
 
 def _get_scripted_scan_loop():

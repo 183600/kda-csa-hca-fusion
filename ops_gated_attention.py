@@ -197,15 +197,18 @@ def _gated_delta_loop_inplace_eager(q, k, v, gate_state, beta_k, S,
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
-    outs = torch.empty(B, T, H, V, dtype=S.dtype, device=S.device)
+    # Collect the per-step readouts and stack once at the end: the single
+    # batched copy replaces T tiny per-step copies (elementwise-identical
+    # values; the stack writes the [B, T, H, V] directly).
+    outs: list[torch.Tensor] = []
     for t, (q_t, k_t, v_t, bk_t) in enumerate(zip(
             q.unbind(1), k.unbind(1), v.unbind(1), beta_k.unbind(1))):
         if t > 0 or not first_gated:
             S = S.mul_(gate_state)
         delta = v_t - (k_t.unsqueeze(-1) * S).sum(dim=-2)
         S = S.addcmul_(bk_t.unsqueeze(-1), delta.unsqueeze(-2))
-        outs[:, t] = (q_t.unsqueeze(-2) @ S).squeeze(-2)
-    return outs, S
+        outs.append((q_t.unsqueeze(-2) @ S).squeeze(-2))
+    return torch.stack(outs, dim=1), S
 
 
 def _get_scripted_gated_delta_loop():

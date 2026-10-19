@@ -236,12 +236,10 @@ def _recurrent_kda_loop_inplace_eager(q, k_col, v, g_exp_col, beta_k_col, S):
     argument) and autograd must be disabled — an in-place update of a
     graph-tracked state would trip the version counter.
     """
-    # Preallocate the output and write one time slice per step: index
-    # assignment is elementwise-identical to the append-and-stack form
-    # (which squeezes the singleton head dim only once, after the stack).
-    outs = torch.empty(
-        q.shape[0], q.shape[1], q.shape[2], 1, S.shape[-1],
-        dtype=S.dtype, device=S.device)
+    # Collect the per-step readouts and stack once at the end: the single
+    # batched copy replaces T tiny per-step copies (elementwise-identical
+    # values; the stack squeezes the singleton head dim only once).
+    outs: list[torch.Tensor] = []
     for i, (q_i, k_i, v_i, g_exp_i, beta_k_i) in enumerate(zip(
             q.unbind(1), k_col.unbind(2), v.unbind(1),
             g_exp_col.unbind(2), beta_k_col.unbind(2))):
@@ -250,11 +248,8 @@ def _recurrent_kda_loop_inplace_eager(q, k_col, v, g_exp_col, beta_k_col, S):
         # ``beta_k_i`` is ``beta_i * k_i`` (precomputed by the caller); the
         # update is the delta-rule ``S + beta_i ⊗ delta`` in fp association.
         S = S.addcmul_(beta_k_i, delta[..., None, :])
-        # Keep the singleton head dim until the single post-loop squeeze:
-        # writing ``[B, H, 1, V]`` then squeeze(-2) is
-        # elementwise-identical to squeezing each step before the stack.
-        outs[:, i] = q_i @ S
-    return outs.squeeze(-2), S
+        outs.append(q_i @ S)
+    return torch.stack(outs, 1).squeeze(-2), S
 
 
 _RECURRENT_LOOP_SCRIPTED = None

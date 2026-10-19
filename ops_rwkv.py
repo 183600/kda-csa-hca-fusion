@@ -273,22 +273,21 @@ def _rwkv7_scan_loop_inplace_eager(r, w_exp, k, v, kk, kka, state):
     must pass a dedicated copy of the state (this function mutates its
     ``state`` argument) and autograd must be disabled.
     """
-    # Preallocate the output and write one time slice per step: index
-    # assignment is elementwise-identical to the append-and-stack form.
-    outs = torch.empty(
-        r.shape[0], r.shape[1], r.shape[2], state.shape[-1],
-        dtype=state.dtype, device=state.device)
-    for t, (r_t, w_t, k_t, v_t, kk_t, kka_t) in enumerate(zip(
+    # Collect the per-step readouts and stack once at the end: the single
+    # batched copy replaces T tiny per-step copies (elementwise-identical
+    # values; the stack writes the singleton-free [B, T, H, V] directly).
+    outs: list[torch.Tensor] = []
+    for r_t, w_t, k_t, v_t, kk_t, kka_t in zip(
             r.unbind(1), w_exp.unbind(1), k.unbind(1), v.unbind(1),
-            kk.unbind(1), kka.unbind(1))):
+            kk.unbind(1), kka.unbind(1)):
         # contract[v] = -sum_k kk[k] * S[k, v]   (== -(kk^T S))
         contract = (kk_t * state).sum(dim=-2)                      # [B, H, V]
         # S = exp(log_w)[k] * S[k, v] + (kk*a)[k] * contract[v] + k[k] * v[v]
         state = (state.mul_(w_t)
                  .add_(kka_t * contract.unsqueeze(-2))
                  .add_(k_t * v_t))
-        outs[:, t] = (r_t * state).sum(dim=-2)                     # [B, H, V]
-    return outs, state
+        outs.append((r_t * state).sum(dim=-2))                     # [B, H, V]
+    return torch.stack(outs, dim=1), state
 
 
 def _get_scripted_rwkv7_scan_loop():

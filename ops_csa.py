@@ -707,38 +707,50 @@ _TOPK_SELECT_CHUNK_ELEMS = 1 << 22
 _TOPK_SORT_MAX_ELEMS = 2048
 
 
-def _boundary_selected_mask(blk: torch.Tensor, s: int) -> torch.Tensor:
-    """Boolean selection mask of the canonical top-``s`` of each row of ``blk``.
+def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
+    """Ascending indices of the canonical top-``s`` of each row of ``blk``.
 
-    Shared body of :func:`_canonical_topk_indices`'s boundary path: one
-    ``topk`` supplies the S-th largest score (the boundary value), then
-    boolean/comparison masks pick every entry strictly above it plus the
-    smallest-index boundary ties needed to fill the ``s`` slots. Exactly
-    ``s`` entries are selected per row whenever ``blk`` contains no NaNs
-    (NaNs lose both comparisons, so a NaN at the boundary under-fills — the
-    caller detects that with a row-count check and re-runs on a NaN-free
-    copy).
+    Boundary-path body of :func:`_canonical_topk_indices`. The returned
+    ``[rows, s]`` index tensor holds, per row, the indices of every entry
+    strictly above the S-th largest score followed by the smallest-index
+    entries tied at that boundary value — always in ASCENDING index order.
+
+    Exactly ``s`` valid indices are produced whenever ``blk`` contains no
+    NaNs. NaNs are unselectable (they lose both the ``>`` and ``==``
+    comparisons against the boundary), so a NaN row can under-fill: the
+    missing slots then hold the sentinel ``n`` (the row length). The caller
+    detects that with one range check and re-runs on a NaN-free copy.
     """
     n = blk.shape[-1]
-    # The S-th largest score (the boundary value). A descending top-k's
-    # last value IS that order statistic; the CPU top-k kernel is several
-    # times faster than ``kthvalue`` on the wide, small-``s`` rows this
-    # path serves. NaNs order identically (last / greatest) in both, so
-    # the selected value is bit-identical to ``kthvalue(n - s + 1)``.
-    boundary = torch.topk(blk, s, dim=-1, sorted=True).values[..., -1:]
-    strictly_above = blk > boundary
+    # One top-k supplies the boundary value AND the indices of the
+    # strictly-above entries (every entry above the boundary is one of the
+    # top-``s``). ``sorted=True`` orders both values and indices by
+    # descending value; the values are needed only for the exact boundary
+    # and above-count, so the tail is discarded.
+    top_s, top_i = torch.topk(blk, s, dim=-1, sorted=True)
+    boundary = top_s[..., -1:]
+    above = top_s > boundary
     # Explicit ``dtype=torch.int32``: a bool sum would promote to int64,
     # and the (small) per-row count would then force a full-width int32 ->
-    # int64 promotion of ``tie_rank`` inside the ``<=`` below. Counts never
-    # exceed the row length, so int32 holds every value exactly.
-    n_above = strictly_above.sum(dim=-1, keepdim=True, dtype=torch.int32)
-    at_boundary = blk == boundary
+    # int64 promotion below. Counts never exceed the row length, so int32
+    # holds every value exactly.
+    n_above = above.sum(dim=-1, keepdim=True, dtype=torch.int32)
+    ar = torch.arange(n, device=blk.device)
+    # Indices strictly above the boundary, ascending: sorting the small
+    # ``[rows, s]`` index block (sentinel ``n`` pads the unused slots after
+    # the valid ascending prefix) is cheaper than scanning the wide row.
+    above_idx = torch.sort(
+        torch.where(above, top_i, n), dim=-1).values
     # Fill the remaining slots with the SMALLEST indices tied at the
-    # boundary (the canonical rule). Explicit ``dtype=torch.int32``: a bool
-    # cumsum would promote to int64.
-    tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
-    fill_ties = at_boundary & (tie_rank <= (s - n_above))
-    return strictly_above | fill_ties
+    # boundary (the canonical rule): one masked-index top-k gives them
+    # already in ascending order.
+    tie_idx = torch.topk(
+        torch.where(blk == boundary, ar, n),
+        s, dim=-1, largest=False, sorted=True).values
+    slots = torch.arange(s, device=blk.device)
+    tie_slot = (slots - n_above).clamp_(min=0)
+    return torch.where(
+        slots >= n_above, tie_idx.gather(-1, tie_slot), above_idx)
 
 
 def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -773,7 +785,7 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
       (score-descending, ties ascending-index) — used for dense selections
       (``2*s >= n``, where nearly every entry is selected) and for rows up
       to ``_TOPK_SORT_MAX_ELEMS`` entries;
-    * the ``O(n)`` boundary path (:func:`_boundary_selected_mask`) —
+    * the ``O(n)`` boundary path (:func:`_boundary_selected_indices`) —
       a partial ``topk`` for the boundary value plus a few vectorized
       passes, no full sort — used for sparse
       selections on larger rows, INCLUDING the single-query-per-step
@@ -825,20 +837,15 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     for lo in range(0, rows_total, chunk):
         hi = min(rows_total, lo + chunk)
         blk = flat[lo:hi]
-        selected = _boundary_selected_mask(blk, s)
-        # A NaN that reaches the boundary makes both comparisons False and
-        # under-fills the row. Re-run on a NaN-free copy (NaN -> -inf, so
-        # the canonical tie rule applies and the slot count is exact); the
-        # check itself is one small per-row reduction on the hot path.
-        if bool((selected.sum(dim=-1, dtype=torch.int32) < s).any()):
+        indices = _boundary_selected_indices(blk, s)
+        # A NaN at the boundary under-fills the row (NaNs are unselectable,
+        # so the missing slots hold the sentinel ``n``). Re-run on a
+        # NaN-free copy (NaN -> -inf, so the canonical tie rule applies and
+        # the slot count is exact); the check itself is one small per-row
+        # reduction on the hot path.
+        if bool((indices >= n).any()):
             blk = blk.masked_fill(torch.isnan(blk), float('-inf'))
-            selected = _boundary_selected_mask(blk, s)
-        # With exactly `s` selected entries per row, the row-major nonzero
-        # coordinates group into [chunk_rows, s] with ascending indices per
-        # row. ``as_tuple=True`` returns just the coordinate vectors, so
-        # the last (block-index) column is taken without materializing the
-        # full [rows, rank] coordinate matrix.
-        indices = selected.nonzero(as_tuple=True)[-1].view(hi - lo, s)
+            indices = _boundary_selected_indices(blk, s)
         values = blk.gather(-1, indices)
         # Restore the score-descending slot order (stable: boundary ties
         # keep the canonical ascending-index order).
@@ -876,7 +883,14 @@ def _lightning_indexer_chunk(
     optional full soft distribution) is handled by the caller, which also
     owns the query-chunk loop and the final concatenation.
     """
-    score = torch.einsum('b t h d, b n d -> b h t n', q_idx_chunk, k_idx)
+    # Same batched GEMM as the historical
+    # ``einsum('b t h d, b n d -> b h t n', ...)``, but returned in the
+    # ``[B, T_c, HI, n_blocks]`` layout: the GEMM needs no permute copy and
+    # the following contraction over ``HI`` consumes this layout directly.
+    # The contraction over ``DI`` (and therefore every value) is unchanged.
+    score = torch.einsum(
+        'b t h d, b n d -> b t h n',
+        q_idx_chunk, k_idx)                                     # [B, T_c, HI, n]
     # Multiplying by exactly 1.0 is an IEEE no-op (values and gradients
     # preserved bit-for-bit); skip it to avoid an allocation.
     if not (isinstance(scale, (int, float)) and float(scale) == 1.0):
@@ -893,10 +907,13 @@ def _lightning_indexer_chunk(
     else:
         score.relu_()
     if w_idx_chunk is None:
-        logits = score.sum(1)                                       # [B, T_c, n_blocks]
+        logits = score.sum(2)                                       # [B, T_c, n_blocks]
     else:
-        logits = torch.einsum(
-            'b h t n, b t h -> b t n', score, w_idx_chunk)          # [B, T_c, n_blocks]
+        # Same batched GEMM as the historical einsum (bit-identical forward
+        # and backward), consuming ``score``'s [B, T_c, HI, n] layout
+        # directly so no permute/copy is needed.
+        logits = torch.matmul(
+            w_idx_chunk.unsqueeze(-2), score).squeeze(-2)           # [B, T_c, n_blocks]
     if causal_block_mask_chunk is not None:
         # ``logits`` is fresh (einsum/sum output) and both consumers
         # (the selector and the softmax) read only the masked values, so
