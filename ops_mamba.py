@@ -302,9 +302,9 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
 def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     """No-grad scan body that updates the recurrent state IN PLACE.
 
-    ``S = decay * S + x`` is evaluated as a single in-place ``addcmul``
-    (the same per-element products and sum, without the intermediate
-    tensor). The caller must pass a dedicated copy of the state (this
+    ``S = decay * S + x`` is evaluated as ``S.mul_(decay).add_(x)``: the
+    same products and sums with the same roundings (bit-identical
+    values). The caller must pass a dedicated copy of the state (this
     function mutates its ``S`` argument) and autograd must be disabled —
     an in-place update of a graph-tracked state would trip the version
     counter. See :func:`_mamba2_scan_loop_eager` for the (autograd-safe)
@@ -332,16 +332,14 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
         S_T = S.transpose(-1, -2)
         for xs, ds, Cs, Dxs in zip(x_steps, decay_steps, C_steps,
                                    Dx_steps):
-            # ``S = S * decay + x`` written as one fused ``addcmul`` with
-            # ``out=S`` (the same per-element product/sum; the write is
-            # safe because ``addcmul`` reads each element before writing
-            # it). This replaces the two-kernel mul_/add_ chain.
-            torch.addcmul(xs, S, ds, out=S)
+            # ``mul_`` then ``add_`` (NOT a fused ``addcmul``): the two
+            # roundings match the out-of-place reference path bit-for-bit.
+            S = S.mul_(ds).add_(xs)
             ys.append(torch.baddbmm(Dxs, Cs, S_T))
     else:
         for xs, ds, Cs, Dxs in zip(x_steps, decay_steps, C_steps,
                                    Dx_steps):
-            torch.addcmul(xs, S, ds, out=S)
+            S = S.mul_(ds).add_(xs)
             ys.append(torch.bmm(Cs, S.transpose(-1, -2)) + Dxs)
     return torch.stack(ys, dim=1).squeeze(-2), S
 

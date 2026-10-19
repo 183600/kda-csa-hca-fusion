@@ -756,6 +756,11 @@ def _chunk_kda_prepare(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return {'early': True, 'o': o.to(dtype), 'S': S}
+    # Storage of the caller's ``q`` before any padding/rearrangement. The
+    # no-grad scale below may run in place only on a buffer this function
+    # owns; when the rearranged view shares this storage we must keep the
+    # out-of-place product so the caller's input is not mutated.
+    q_input_storage = q.untyped_storage().data_ptr()
     pad = (-T) % BT
     if pad:
         q    = F.pad(q,    (0, 0, 0, 0, 0, pad))
@@ -781,12 +786,15 @@ def _chunk_kda_prepare(
     # identity.
     if G == 1:
         q = q.contiguous()
-        if torch.is_grad_enabled():
+        # The scale may run in place only when ``q`` no longer aliases the
+        # caller's input: ``contiguous()`` returns a fresh buffer for a
+        # strided rearrange view, but for a shape that is already contiguous
+        # (H == 1 and a single chunk) it returns a view of the input, which
+        # must not be mutated. Same elementwise product either way.
+        if (torch.is_grad_enabled()
+                or q.untyped_storage().data_ptr() == q_input_storage):
             q = q * scale
         else:
-            # ``contiguous()`` above is a fresh private buffer outside
-            # autograd, so the scale runs in place (same elementwise
-            # product, one fewer full-size copy).
             q.mul_(scale)
         k = k.contiguous()
     else:
