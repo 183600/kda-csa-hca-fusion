@@ -94,30 +94,6 @@ contiguous buffer. Result rows: mean/min/max recall over seeds, max
 read-back error, `state_bytes`, `bits_per_element`, compression, and a
 conservative `exact_recall` flag (min-over-seeds == 1.0).
 
-## Measured recall-cost frontier (3 seeds: 0, 1, 2)
-
-```
-route   cheapest exact-recall cell     bits/el   state B   vs fp16   recall(min)
-kda     3-bit, group 16 (symmetric)      4.00      64.0     4.00x    1.000
-mamba2  4-bit, group 64 (symmetric)      4.25      68.0     3.76x    1.000
-```
-
-Both routes collapse at 2 bits (mean recall 0.23–0.46; min 0.125) and are
-exact at 4+ bits. The interesting middle is **route- and group-dependent**:
-
-| cell | KDA recall (min..max) | Mamba-2 recall (min..max) |
-|---|---|---|
-| 2-bit / group 64 | 0.229 (0.125..0.312) | 0.188 (0.125..0.250) |
-| 3-bit / group 64 | 0.896 (0.875..0.938) | 0.771 (0.688..0.812) |
-| 3-bit / group 16 | **1.000 (exact)** | 0.917 (0.812..1.000) |
-| 4-bit / group 64 | 1.000 | **1.000 (exact)** |
-
-On this probe the delta-rule state tolerates 3-bit codes with fine groups
-(4.00 bits/element, 4x smaller than fp16) while the SSD matrix state needs
-4 bits (or finer groups at 3 bits) for exact recall — i.e. the
-memory-route axis of the eight-group matrix buys a measurable ~1 bit of
-quantization headroom on exact associative recall, in KDA's favour.
-
 ## Scope / honesty
 
 * Single-operator probe, **no training, no weights**: it measures
@@ -173,23 +149,6 @@ silently detach a training graph. The autograd contract of the STE path
 is pinned by `test_quant_lm.py` (gradient exactly equals the unquantized
 surrogate; `ste=False` gradient is exactly zero; a multi-step quantized
 recurrence still reaches `q/k/v/g/beta`).
-
-Measured (3 seeds: 0, 1, 2; 400 train / 400 QAT steps, held-out ppl):
-
-| part | fp16 | 2-bit PTQ (g16) | 2-bit QAT | recovery |
-|---|---|---|---|---|
-| A: hybrid LM decode ppl | 1.1523 | 1.2759 (ratio 1.108) | — | — |
-| B: stepwise KDA LM | 1.1708 | 36415 (ratio ~3.1e4) | 1.1876 | 100.00% (min 99.99%) |
-
-Part A grid: 3-bit/group-16 lands at ratio 1.0034 (group-64 at 1.0106,
-right at the 1.01 tolerance); 2-bit/group-64 degrades to ratio 1.689
-while 2-bit/group-16 stays at 1.108 — fine groups again buy roughly a
-bit of headroom. The 4/6/8-bit cells and the asymmetric probe are all
-within 0.1%. Part B's standalone per-token recurrence is far more
-2-bit-sensitive (perplexity explodes to ~3e4), and STE QAT pulls it
-back to the fp16 level on every seed. Absolute perplexities are
-toy-corpus artifacts; the measured quantity is the relative damage at
-fixed weights and path.
 
 ## CI gating for the quantization track
 
@@ -354,39 +313,6 @@ bit-identical reference paths. The precision sweep and
 ``test_bf16_gated_kda.py`` verify bfloat16 stability up to T=2048 for KDA;
 ``test_needle_haystack.py::test_bf16_csa_hca_no_nan_inf`` pins the CSA/HCA
 bf16 path.
-
-## GatedAttentionMixin — unified gating for KDA/CSA/HCA
-
-`ops_gated_attention.py` provides a reusable `GatedAttentionMixin` that
-adds optional per-head or per-channel gating to any attention operator:
-
-```python
-from ops_gated_attention import GatedAttentionMixin
-
-class MyAttention(GatedAttentionMixin, nn.Module):
-    def __init__(self, ..., gate_type='per_channel', gate_dim=64, num_heads=4):
-        super().__init__()
-        self._init_gate(gate_type, gate_dim, num_heads)
-
-    def forward(self, q, k, v, ...):
-        k = self.apply_gate(k, dim=-1)  # gate keys
-        v = self.apply_gate(v, dim=-1)  # gate values
-        ...
-```
-
-Gate types:
-- `'none'` — identity (no parameters)
-- `'per_head'` — one scalar gate per head `[H]`, broadcast over channels
-- `'per_channel'` — full `[H, D]` gate matrix per head
-
-The mixin initializes gates near 1.0 (`nn.Parameter(torch.ones(...))`) so
-the initial forward is an identity mapping. This makes it safe to add
-gating to existing operators without changing their initialization
-semantics.
-
-`GatedDeltaRule` is a standalone fused layer that combines per-channel
-gating with the delta-rule recurrence, usable as a drop-in gated memory
-module or as a building block for gated CSA/HCA variants.
 
 ## Entry points
 

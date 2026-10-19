@@ -27,22 +27,6 @@ the valid bytes at each `prefill_len`, a `classification`
 `max_over_min` (the observed growth ratio). This turns the claim into a
 per-run measurement with an auditable trail rather than an assertion.
 
-Observed on the decode-scale geometry (CPU smoke, lengths 16/32):
-
-```
-softmax  4.8K -> 8.8K  growing    (KV cache, linear)
-kda      2.5K -> 2.5K  constant   (delta-rule state + conv lookback)
-mamba2   9.5K -> 9.5K  constant   (SSD state + conv state)
-rwkv7    4.2K -> 4.2K  constant   (matrix state + shift state)
-csa      1.0K -> 1.2K  growing    (compressed blocks + indexer + ring)
-hca      0.4K -> 0.6K  growing    (compressed blocks + ring)
-hybrid*                growing    (the stack's CSA/HCA caches)
-```
-
-`hybrid*` is classified `growing` on purpose: the memory route is
-constant, but the stack also owns the CSA/HCA sub-layer caches, and the
-certificate reports what the process actually retains.
-
 ## Uniform accounting surface
 
 The certificate reads one API across the three kinds of decode state:
