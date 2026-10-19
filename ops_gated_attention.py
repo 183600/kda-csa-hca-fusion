@@ -11,6 +11,8 @@ Gate types:
 
 from __future__ import annotations
 
+import warnings as _warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -157,6 +159,83 @@ def apply_gate_fn(
     return x * gate.to(dtype=x.dtype, device=x.device)
 
 
+# ---------------------------------------------------------------------------
+# Sequential loop bodies (TorchScript-compiled with an eager fallback, the
+# same pattern the KDA / RWKV-7 / Mamba-2 reference scans use). ``gate_state``
+# is the pre-broadcast ``exp(clamp(g))`` view, ``beta_k`` the precomputed
+# ``beta * k`` product (identical per-element values); both are consumed
+# with the exact operand association of the plain-Python loop, so the values
+# are bit-identical.
+# ---------------------------------------------------------------------------
+_GATED_DELTA_LOOP_SCRIPTED = None
+_GATED_DELTA_LOOP_SCRIPTED_FAILED = False
+_GATED_DELTA_LOOP_INPLACE_SCRIPTED = None
+_GATED_DELTA_LOOP_INPLACE_SCRIPTED_FAILED = False
+
+
+def _gated_delta_loop_eager(q, k, v, gate_state, beta_k, S):
+    outs = []
+    for q_t, k_t, v_t, bk_t in zip(
+            q.unbind(1), k.unbind(1), v.unbind(1), beta_k.unbind(1)):
+        S = S * gate_state
+        delta = v_t - (k_t.unsqueeze(-1) * S).sum(dim=-2)
+        S = torch.addcmul(S, bk_t.unsqueeze(-1), delta.unsqueeze(-2))
+        outs.append(q_t.unsqueeze(-2) @ S)
+    return torch.stack(outs, dim=1).squeeze(-2), S
+
+
+def _gated_delta_loop_inplace_eager(q, k, v, gate_state, beta_k, S,
+                                    first_gated: bool):
+    """No-grad loop body updating ``S`` in place.
+
+    ``first_gated=True`` means the caller has already applied the step-0
+    gate multiplication out of place (a caller-provided ``initial_state``
+    must not be mutated); the loop then applies the in-place gate at every
+    later step. With ``first_gated=False`` the in-place gate runs at every
+    step (the caller's zero-initialized state is exclusively owned, so the
+    in-place multiply keeps the state's dtype exactly as before).
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    outs = torch.empty(B, T, H, V, dtype=S.dtype, device=S.device)
+    for t, (q_t, k_t, v_t, bk_t) in enumerate(zip(
+            q.unbind(1), k.unbind(1), v.unbind(1), beta_k.unbind(1))):
+        if t > 0 or not first_gated:
+            S = S.mul_(gate_state)
+        delta = v_t - (k_t.unsqueeze(-1) * S).sum(dim=-2)
+        S = S.addcmul_(bk_t.unsqueeze(-1), delta.unsqueeze(-2))
+        outs[:, t] = (q_t.unsqueeze(-2) @ S).squeeze(-2)
+    return outs, S
+
+
+def _get_scripted_gated_delta_loop():
+    global _GATED_DELTA_LOOP_SCRIPTED, _GATED_DELTA_LOOP_SCRIPTED_FAILED
+    if _GATED_DELTA_LOOP_SCRIPTED is None and not _GATED_DELTA_LOOP_SCRIPTED_FAILED:
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _GATED_DELTA_LOOP_SCRIPTED = torch.jit.script(
+                    _gated_delta_loop_eager)
+        except Exception:
+            _GATED_DELTA_LOOP_SCRIPTED_FAILED = True
+    return _GATED_DELTA_LOOP_SCRIPTED
+
+
+def _get_scripted_gated_delta_loop_inplace():
+    global _GATED_DELTA_LOOP_INPLACE_SCRIPTED
+    global _GATED_DELTA_LOOP_INPLACE_SCRIPTED_FAILED
+    if (_GATED_DELTA_LOOP_INPLACE_SCRIPTED is None
+            and not _GATED_DELTA_LOOP_INPLACE_SCRIPTED_FAILED):
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _GATED_DELTA_LOOP_INPLACE_SCRIPTED = torch.jit.script(
+                    _gated_delta_loop_inplace_eager)
+        except Exception:
+            _GATED_DELTA_LOOP_INPLACE_SCRIPTED_FAILED = True
+    return _GATED_DELTA_LOOP_INPLACE_SCRIPTED
+
+
 class GatedDeltaRule(nn.Module):
     """Fused gated delta-rule layer: combines per-channel gating with delta update.
 
@@ -254,6 +333,14 @@ class GatedDeltaRule(nn.Module):
             return (torch.zeros(B, 0, H, V, dtype=dtype, device=device),
                     S)
 
+        # ``beta * k`` is a pure elementwise broadcast of one scalar per
+        # head onto each key element; hoisting the whole-sequence product
+        # out of the loop computes the identical per-element values and
+        # removes one loop-body allocation per step. ``beta`` is reshaped
+        # so the head scalar broadcasts onto the key axis exactly as the
+        # per-step ``beta * k_t`` did.
+        beta_k_all = beta.view(1, 1, H, 1) * k
+
         # No-grad inference may update ``S`` in place after the first
         # iteration, when ``S`` is guaranteed to be owned by this call (a
         # fresh zero state, or the out-of-place product below); a
@@ -262,44 +349,32 @@ class GatedDeltaRule(nn.Module):
         # elementwise-identical to the append-and-stack form (the promoted
         # dtype of ``q @ S`` fixes the output dtype up front; a provided
         # ``initial_state`` may promote it beyond ``q.dtype``). While a
-        # graph is recorded the append-and-stack form is kept.
+        # graph is recorded the append-and-stack form is kept. The loop body
+        # is TorchScript-compiled when available (same ops, same order).
         inplace = not torch.is_grad_enabled()
         if inplace:
-            o = torch.empty(B, T, H, V,
-                            dtype=torch.promote_types(dtype, S.dtype),
-                            device=device)
-        else:
-            outputs = []
-        for t in range(T):
-            # S = S * gate
-            if inplace and (t > 0 or initial_state is None):
-                S = S.mul_(gate_state)
-            else:
+            o_dtype = torch.promote_types(dtype, S.dtype)
+            first_gated = initial_state is not None
+            if first_gated:
+                # First-step multiply stays out of place (the caller's
+                # initial state must not be mutated); remaining steps run
+                # in place on the now-owned state.
                 S = S * gate_state
-
-            # delta = v_t - k_t^T S
-            k_t = k[:, t].unsqueeze(-1)      # [B, H, K, 1]
-            v_t = v[:, t]                    # [B, H, V]
-            kTS = (k_t * S).sum(dim=-2)      # [B, H, V]
-            delta = v_t - kTS                # [B, H, V]
-
-            # S = S + beta * k_t * delta^T
-            beta_k = beta * k_t              # [B, H, K, 1]
-            if inplace and (t > 0 or initial_state is None):
-                S = S.addcmul_(beta_k, delta.unsqueeze(-2))  # [B, H, K, V]
+            loop_i = _get_scripted_gated_delta_loop_inplace()
+            if loop_i is not None:
+                o, S = loop_i(q, k, v, gate_state, beta_k_all, S,
+                              first_gated)
             else:
-                S = torch.addcmul(S, beta_k, delta.unsqueeze(-2))
-
-            # o_t = q_t^T S
-            q_t = q[:, t].unsqueeze(-2)      # [B, H, 1, K]
-            o_t = (q_t @ S).squeeze(-2)      # [B, H, V]
-            if inplace:
-                o[:, t] = o_t
-            else:
-                outputs.append(o_t)
-
-        if not inplace:
-            o = torch.stack(outputs, dim=1)  # [B, T, H, V]
+                o, S = _gated_delta_loop_inplace_eager(
+                    q, k, v, gate_state, beta_k_all, S, first_gated)
+            if o.dtype != o_dtype:
+                o = o.to(o_dtype)
+            return o, S
+        loop = _get_scripted_gated_delta_loop()
+        if loop is not None:
+            o, S = loop(q, k, v, gate_state, beta_k_all, S)
+        else:
+            o, S = _gated_delta_loop_eager(q, k, v, gate_state, beta_k_all, S)
         return o, S
 
 

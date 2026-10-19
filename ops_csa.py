@@ -727,7 +727,11 @@ def _boundary_selected_mask(blk: torch.Tensor, s: int) -> torch.Tensor:
     # the selected value is bit-identical to ``kthvalue(n - s + 1)``.
     boundary = torch.topk(blk, s, dim=-1, sorted=True).values[..., -1:]
     strictly_above = blk > boundary
-    n_above = strictly_above.sum(dim=-1, keepdim=True)
+    # Explicit ``dtype=torch.int32``: a bool sum would promote to int64,
+    # and the (small) per-row count would then force a full-width int32 ->
+    # int64 promotion of ``tie_rank`` inside the ``<=`` below. Counts never
+    # exceed the row length, so int32 holds every value exactly.
+    n_above = strictly_above.sum(dim=-1, keepdim=True, dtype=torch.int32)
     at_boundary = blk == boundary
     # Fill the remaining slots with the SMALLEST indices tied at the
     # boundary (the canonical rule). Explicit ``dtype=torch.int32``: a bool
@@ -826,7 +830,7 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
         # under-fills the row. Re-run on a NaN-free copy (NaN -> -inf, so
         # the canonical tie rule applies and the slot count is exact); the
         # check itself is one small per-row reduction on the hot path.
-        if bool((selected.sum(dim=-1) < s).any()):
+        if bool((selected.sum(dim=-1, dtype=torch.int32) < s).any()):
             blk = blk.masked_fill(torch.isnan(blk), float('-inf'))
             selected = _boundary_selected_mask(blk, s)
         # With exactly `s` selected entries per row, the row-major nonzero

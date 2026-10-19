@@ -273,13 +273,25 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     decay_steps = decay_slab.unbind(1)
     C_steps = C_h.unbind(1)
     Dx_steps = Dx_slab.unbind(1)
-    for t in range(T):
-        S = decay_steps[t] * S + x_steps[t]
-        # ``einsum('bdn,bn->bd', S, C)`` written as the equivalent
-        # explicit matmul (the same ``bmm`` contraction over ``n``). The
-        # singleton query dim is kept until the single post-loop squeeze
-        # (append-and-stack is elementwise-identical to squeeze-then-stack).
-        ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2)) + Dx_steps[t])
+    # For a contiguous state the readout ``C @ S^T + Dx`` runs as one
+    # ``baddbmm`` (the same contraction and sum for fp32/fp64 state
+    # operands, see :func:`_mamba2_scan_loop_inplace_eager`); the fresh
+    # ``decay * S + x`` state is always contiguous, but the guard keeps
+    # the explicit two-step form for any other layout.
+    if S.is_contiguous():
+        for t in range(T):
+            S = decay_steps[t] * S + x_steps[t]
+            ys.append(torch.baddbmm(Dx_steps[t], C_steps[t],
+                                    S.transpose(-1, -2)))
+    else:
+        for t in range(T):
+            S = decay_steps[t] * S + x_steps[t]
+            # ``einsum('bdn,bn->bd', S, C)`` written as the equivalent
+            # explicit matmul (the same ``bmm`` contraction over ``n``). The
+            # singleton query dim is kept until the single post-loop squeeze
+            # (append-and-stack is elementwise-identical to squeeze-then-stack).
+            ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2))
+                      + Dx_steps[t])
     return torch.stack(ys, dim=1).squeeze(-2), S
 
 
