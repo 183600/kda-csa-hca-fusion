@@ -462,4 +462,5 @@ def inverse_partial_rope(
     RELATIVE position (entry position − query position), matching the
     DeepSeek-V4 §2.3.3 countermeasure for absolute-position leakage.
     """
-    return partial_rope(x, -positions.to(torch.long), rope_dim, base, dim=dim)
+    neg = -positions if positions.is_floating_point() else -positions.to(torch.long)
+    return partial_rope(x, neg, rope_dim, base, dim=dim)

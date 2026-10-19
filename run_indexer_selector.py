@@ -176,7 +176,7 @@ def _reference_selector(scores: torch.Tensor, k: int) -> torch.Tensor:
     order = torch.sort(
         safe, dim=-1, descending=True, stable=True).indices[..., :s]
     values = safe.gather(-1, order)
-    return order.masked_fill(torch.isinf(values), -1)
+    return order.masked_fill(torch.isneginf(values), -1)
 
 
 def _dispatch_of(shape, k) -> str:

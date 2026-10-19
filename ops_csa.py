@@ -749,8 +749,9 @@ def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
         s, dim=-1, largest=False, sorted=True).values
     slots = torch.arange(s, device=blk.device)
     tie_slot = (slots - n_above).clamp_(min=0)
-    return torch.where(
+    selected = torch.where(
         slots >= n_above, tie_idx.gather(-1, tie_slot), above_idx)
+    return torch.sort(selected, dim=-1).values
 
 
 def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -825,7 +826,7 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
             order = torch.sort(
                 safe, dim=-1, descending=True, stable=True).indices[..., :s]
             values = safe.gather(-1, order)
-        return order.masked_fill(torch.isinf(values), -1)
+        return order.masked_fill(torch.isneginf(values), -1)
     # Boundary path, processed in chunks of flattened leading rows so the
     # per-entry boolean / int32 masks below stay bounded. Every operation
     # here is row-wise (the S-th largest value is a per-row
@@ -852,7 +853,7 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
         order = torch.argsort(values, dim=-1, descending=True, stable=True)
         indices = torch.gather(indices, -1, order)
         values = torch.gather(values, -1, order)
-        out[lo:hi] = indices.masked_fill(torch.isinf(values), -1)
+        out[lo:hi] = indices.masked_fill(torch.isneginf(values), -1)
     return out.view(*row_shape, s)
 
 
