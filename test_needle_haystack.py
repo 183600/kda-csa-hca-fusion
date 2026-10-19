@@ -205,6 +205,49 @@ def test_evaluate_needle_recall():
     _ok('total > 0', res['total'] > 0)
 
 
+def test_needle_validation_and_bad_cases():
+    """Training curve + wrong-sample analysis are attached and read-only."""
+    print('\nTest: needle validation curve and bad-case analysis')
+    tok = _NeedleCharTokenizer()
+    model = NeedleHybridLM(tok.vocab_size, d_model=32, n_layers=2,
+                           memory_type='kda', n_kda=1, n_csa=1, n_hca=0)
+    model, rep = train_needle_model(
+        model, tok, 128, 32, 2, 2, 3e-3, 'cpu', 0,
+        val_every=1, val_batches=2)
+    hist = rep['val_history']
+    _ok('curve records step 0 + every training step + final',
+        [p['step'] for p in hist][0] == 0 and hist[-1]['step'] == 2,
+        str([p['step'] for p in hist]))
+    _ok('every validation point has a finite loss/accuracy',
+        all(0.0 <= p['acc'] <= 1.0 and p['loss'] == p['loss']
+            for p in hist), str(hist))
+    proto = rep['validation_protocol']
+    _ok('validation band is disjoint from train/eval',
+        proto['read_only'] is True and proto['disjoint_from_train'] is True
+        and proto['disjoint_from_eval'] is True, str(proto))
+    _ok('early-stopping regret is quantified',
+        rep['early_stopping_summary'] is not None
+        and 'val_loss_regret' in rep['early_stopping_summary'], '')
+
+    res = evaluate_needle_recall(
+        model, tok, context_len=128, needle_pos=32, batch_size=2,
+        n_batches=1, device='cpu', max_error_examples=1)
+    ea = res['error_analysis']
+    cats = set(ea['categories'])
+    _ok('wrong samples are categorized',
+        cats == {'recency_copy', 'wrong_from_start', 'partial_answer'},
+        str(cats))
+    _ok('category counts partition the wrong samples',
+        sum(v['count'] for v in ea['categories'].values()) == ea['n_wrong'],
+        f"{ea['n_wrong']}")
+    _ok('category rates sum to 1 when there are errors',
+        ea['n_wrong'] == 0
+        or abs(sum(v['rate_of_wrong'] for v in ea['categories'].values())
+               - 1.0) < 1e-12, '')
+    _ok('examples are capped per category',
+        all(len(v) <= 1 for v in ea['examples'].values()), '')
+
+
 def test_rule_baseline_recovers_fact():
     """The weight-free lexical-scan baseline reproduces the planted fact."""
     print('\nTest: symbolic rule baseline (template scan + oracle copy)')
@@ -406,6 +449,7 @@ def main() -> int:
     test_needle_hybrid_lm_stepwise_quant()
     test_stepwise_kda_ste_contract()
     test_evaluate_needle_recall()
+    test_needle_validation_and_bad_cases()
     test_rule_baseline_recovers_fact()
     test_bf16_csa_hca_no_nan_inf()
     test_qat_probe_budget_matched_control()

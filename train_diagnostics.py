@@ -319,6 +319,35 @@ class ValidationCurve:
             'val_acc_peak': (max(h['acc'] for h in self.history)
                              if self.history else None),
         }
+        # The overfitting verdict says "use early stopping"; these fields
+        # quantify what skipping it actually cost, so the recommendation is
+        # backed by a number from THIS run instead of a generic rule. They
+        # are derived only from the recorded history (no extra evaluation)
+        # and are None when the curve is empty/disabled.
+        if self.history and self.best is not None:
+            final = self.history[-1]
+            block['final_val'] = dict(final)
+            block['val_loss_regret_from_best'] = (
+                final['loss'] - self.best['loss'])
+            block['val_acc_regret_from_best'] = (
+                max(h['acc'] for h in self.history) - final['acc'])
+            block['steps_since_best'] = int(final['step']
+                                            - self.best['step'])
+            block['best_val_is_final'] = (
+                bool(final['step'] == self.best['step']))
+            block['early_stopping_summary'] = {
+                'selected_step': int(self.best['step']),
+                'final_step': int(final['step']),
+                'steps_saved': int(final['step'] - self.best['step']),
+                'val_loss_at_selection': float(self.best['loss']),
+                'val_loss_at_final': float(final['loss']),
+                'val_loss_regret': float(final['loss']
+                                         - self.best['loss']),
+                'val_acc_at_selection': float(self.best['acc']),
+                'val_acc_at_final': float(final['acc']),
+                'val_acc_regret': float(max(h['acc'] for h in self.history)
+                                        - final['acc']),
+            }
         regime = self._accuracy_regime(
             train_accs or [])
         if regime is not None:
@@ -333,10 +362,13 @@ class ValidationCurve:
         regime = block.get('accuracy_regime') or {}
         suffix = (' saturated_at_ceiling' if regime.get('saturated') else '')
         best = block.get('best_val') or {}
+        regret = block.get('val_loss_regret_from_best')
         logger.info(
             f'  [curve] {self.label}: {verdict}{suffix} '
             f'({len(self.history)} val points, best val loss '
-            f"{best.get('loss')} @ step {best.get('step')})")
+            f"{best.get('loss')} @ step {best.get('step')}"
+            + (f", final-vs-best regret {regret:+.4f}" if regret is not None
+               else '') + ')')
 
 
 # --------------------------------------------------------------------------

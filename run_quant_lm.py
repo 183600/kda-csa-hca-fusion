@@ -110,7 +110,13 @@ from multi_seed_stats import summarize_paired  # noqa: E402
 from ops_fused import HybridConfig  # noqa: E402
 from ppl_bootstrap import paired_bootstrap_ppl  # noqa: E402
 from ops_kda import naive_recurrent_kda  # noqa: E402
+from results_analysis import (  # noqa: E402
+    LM_ERROR_CATEGORIES,
+    lm_token_diagnostics,
+    summarize_lm_diagnostics,
+)
 from results_schema import write as write_schema  # noqa: E402
+from train_diagnostics import ValPoint, ValidationCurve
 from run_quant_recall import (  # noqa: E402
     DEFAULT_BITS,
     DEFAULT_GROUP_SIZES,
@@ -123,6 +129,7 @@ from train_lm_autodl import (  # noqa: E402
     _FallbackCharTokenizer,
     _synthetic_corpus,
     clean_lm_texts,
+    analyze_lm_errors,
     evaluate_lm_loss,
     run_overfit_sanity_check as run_lm_overfit_sanity_check,
     split_clean_texts,
@@ -225,9 +232,14 @@ def _make_loader(tokenizer, texts, seq_len, batch_size, seed):
 
 
 def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
-                    seq_len: int, batch_size: int, device, lr: float = 3e-3
-                    ) -> tuple:
-    """Train the tiny hybrid LM for ``steps`` steps; deterministic per seed."""
+                    seq_len: int, batch_size: int, device, lr: float = 3e-3,
+                    val_every: int = 0, val_monitor=None) -> tuple:
+    """Train the tiny hybrid LM for ``steps`` steps; deterministic per seed.
+
+    ``val_every > 0`` with a ``val_monitor(model) -> ValPoint`` records
+    a held-out (loss, token-accuracy) curve. The monitor is read-only and
+    RNG-neutral, so enabling it cannot change the trained weights.
+    """
     set_global_seed(seed, deterministic=True)
     cfg = small_hybrid_config()
     model = LMWithHybrid(len(tokenizer), cfg).to(device)
@@ -235,7 +247,14 @@ def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
     opt = torch.optim.AdamW(model.parameters(), lr=float(lr),
                             weight_decay=0.0)
     first_loss = last_loss = None
+    losses: list[float] = []
     model.train()
+    val_curve = None
+    if int(val_every or 0) > 0 and val_monitor is not None:
+        val_curve = ValidationCurve(
+            lambda _step: val_monitor(model), steps=int(steps),
+            val_every=int(val_every), label=f'Part A seed={seed}')
+        val_curve.record(0)
     step = 0
     while step < int(steps):
         for batch in loader:
@@ -254,18 +273,38 @@ def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
             loss.backward()
             opt.step()
             last_loss = float(loss.detach())
+            losses.append(last_loss)
             if first_loss is None:
                 first_loss = last_loss
             step += 1
-    return model, {'cfg': cfg, 'loss_first': first_loss,
-                   'loss_last': last_loss, 'steps': int(steps)}
+            if val_curve is not None and step % int(val_every) == 0:
+                val_curve.record(step)
+    report = {'cfg': cfg, 'loss_first': first_loss,
+              'loss_last': last_loss, 'steps': int(steps), 'losses': losses}
+    if val_curve is not None:
+        block = val_curve.finalize(losses)
+        report.update({
+            'val_every': int(val_every),
+            'validation': block,
+            'curve_diagnosis': block['curve_diagnosis'],
+            'generalization_gap': block['generalization_gap'],
+            'early_stopping_summary': block.get('early_stopping_summary'),
+        })
+        val_curve.log_verdict(block)
+    return model, report
 
 
 def train_stepwise_lm(*, seed: int, tokenizer, train_texts, steps: int,
                       seq_len: int, batch_size: int, device,
                       spec: QuantSpec | None = None, ste: bool = False,
-                      lr: float = 3e-3) -> tuple:
-    """Train the standalone per-token KDA LM, optionally QAT (STE) at ``spec``."""
+                      lr: float = 3e-3, val_every: int = 0,
+                      val_monitor=None) -> tuple:
+    """Train the standalone per-token KDA LM, optionally QAT (STE) at ``spec``.
+
+    ``val_every > 0`` with a ``val_monitor(model) -> ValPoint`` records
+    the held-out curve, so a QAT/PTQ arm that is still improving is not read
+    as converged just because the final loss happened to be lower.
+    """
     set_global_seed(seed, deterministic=True)
     model = StepwiseKDALM(len(tokenizer)).to(device)
     loader = _make_loader(tokenizer, train_texts, seq_len, batch_size, seed)
@@ -273,8 +312,15 @@ def train_stepwise_lm(*, seed: int, tokenizer, train_texts, steps: int,
                             weight_decay=0.0)
     report = {'loss_first': None, 'loss_last': None,
               'grad_norm_first': None, 'grad_norm_last': None,
-              'all_grads_finite': True, 'steps': int(steps)}
+              'all_grads_finite': True, 'steps': int(steps),
+              'losses': []}
     model.train()
+    val_curve = None
+    if int(val_every or 0) > 0 and val_monitor is not None:
+        val_curve = ValidationCurve(
+            lambda _step: val_monitor(model), steps=int(steps),
+            val_every=int(val_every), label=f'Part B seed={seed}')
+        val_curve.record(0)
     step = 0
     while step < int(steps):
         for batch in loader:
@@ -303,11 +349,24 @@ def train_stepwise_lm(*, seed: int, tokenizer, train_texts, steps: int,
             report['all_grads_finite'] = report['all_grads_finite'] and finite
             opt.step()
             report['loss_last'] = float(loss.detach())
+            report['losses'].append(report['loss_last'])
             report['grad_norm_last'] = grad_norm
             if report['loss_first'] is None:
                 report['loss_first'] = report['loss_last']
                 report['grad_norm_first'] = grad_norm
             step += 1
+            if val_curve is not None and step % int(val_every) == 0:
+                val_curve.record(step)
+    if val_curve is not None:
+        block = val_curve.finalize(report['losses'])
+        report.update({
+            'val_every': int(val_every),
+            'validation': block,
+            'curve_diagnosis': block['curve_diagnosis'],
+            'generalization_gap': block['generalization_gap'],
+            'early_stopping_summary': block.get('early_stopping_summary'),
+        })
+        val_curve.log_verdict(block)
     return model, report
 
 
@@ -407,7 +466,9 @@ def quantize_stacked_state(clone, spec: QuantSpec | None) -> tuple:
 
 @torch.no_grad()
 def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
-                        spec: QuantSpec | None = None) -> dict:
+                        spec: QuantSpec | None = None,
+                        collect_diagnostics: bool = False,
+                        top_k: int = 5, confidence: float = 0.5) -> dict:
     """Held-out NLL/perplexity through the incremental decode path.
 
     Scores token-by-token from an empty state; after every write the
@@ -425,6 +486,7 @@ def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
     total_nll, n_tokens = 0.0, 0
     argmaxes = []
     per_window = []
+    raw_diagnostics = []
     state_elements = None
     for ids in windows:
         clone.reset()
@@ -454,13 +516,125 @@ def evaluate_decode_ppl(model, clone, windows: list, pad_id: int,
         per_window.append({'nll_sum': window_nll_sum,
                            'n_tokens': window_n_tokens})
         argmaxes.append(logits.argmax(-1)[mask])
-    return {
+        if collect_diagnostics:
+            # Same logits already materialized for NLL: classify each token
+            # by what the model failed to use. ``-100`` on padded targets
+            # keeps the diagnostic denominator identical to the PPL one.
+            diag_labels = torch.where(mask, targets,
+                                      torch.full_like(targets, -100))
+            with torch.no_grad():
+                raw_diagnostics.append(lm_token_diagnostics(
+                    logits.detach(), diag_labels, ids[:, :-1],
+                    top_k=top_k, confidence=confidence))
+    out = {
         'ppl': _ppl_from_nll(total_nll, n_tokens),
         'mean_nll': total_nll / max(1, n_tokens),
         'n_tokens': n_tokens,
         'argmax': argmaxes,
         'state_elements': state_elements,
         'per_window': per_window,
+    }
+    if collect_diagnostics:
+        out['token_diagnostics'] = summarize_lm_diagnostics(raw_diagnostics)
+        out['raw_diagnostics'] = raw_diagnostics
+    return out
+
+
+def quantization_error_delta(base_raw: list, quant_raw: list,
+                             spec: QuantSpec) -> dict:
+    """Quantization-induced bad cases relative to the fp16 decode path.
+
+    Both inputs are the ``raw_diagnostics`` lists returned by
+    :func:`evaluate_decode_ppl` on the SAME windows. Aligning them
+    token-by-token separates:
+
+      * ``induced`` — fp16 top-1 correct, quantized top-1 wrong;
+      * ``rescued`` — fp16 wrong, quantized correct.
+
+    Categories/distance buckets are computed only over the induced tokens,
+    so the report says WHICH failure mode the state writes create (near
+    miss, confident error, copy/retrieval miss, novel token) instead of
+    only how much PPL moved. Pure tensor bookkeeping; no RNG, no forwards.
+    """
+    if len(base_raw) != len(quant_raw):
+        raise ValueError('base/quant diagnostics cover different windows: '
+                         f'{len(base_raw)} vs {len(quant_raw)}')
+
+    def _cat(raw, key):
+        return torch.cat([d[key].reshape(-1) for d in raw])
+
+    base_valid = _cat(base_raw, 'valid')
+    quant_valid = _cat(quant_raw, 'valid')
+    if base_valid.shape != quant_valid.shape:
+        raise ValueError('base/quant diagnostics have different shapes')
+    valid = base_valid & quant_valid
+    base_correct = _cat(base_raw, 'correct')
+    quant_correct = _cat(quant_raw, 'correct')
+    induced = valid & base_correct & ~quant_correct
+    rescued = valid & ~base_correct & quant_correct
+    n_valid = int(valid.sum())
+    n_fp16_correct = int((valid & base_correct).sum())
+    n_fp16_wrong = int((valid & ~base_correct).sum())
+    n_induced = int(induced.sum())
+    n_rescued = int(rescued.sum())
+
+    categories = [c for d in quant_raw for row in d['category'] for c in row]
+    if len(categories) != int(valid.numel()):
+        raise ValueError('category list is not aligned with token masks')
+    cat_counts = {name: 0 for name in LM_ERROR_CATEGORIES}
+    for cat, is_induced in zip(categories, induced.tolist()):
+        if is_induced:
+            if cat not in cat_counts:
+                raise ValueError(f'unknown LM error category: {cat!r}')
+            cat_counts[cat] += 1
+
+    distance = _cat(quant_raw, 'last_seen_distance')
+    seen = _cat(quant_raw, 'seen_earlier')
+    buckets = []
+    for lo, hi, label in ((1, 8, 'd01_08'), (9, 32, 'd09_32'),
+                          (33, 128, 'd33_128'), (129, None, 'd129_plus')):
+        mask = induced & seen & (distance >= lo)
+        if hi is not None:
+            mask = mask & (distance <= hi)
+        n = int(mask.sum())
+        buckets.append({
+            'bucket': label, 'distance_range': [lo, hi], 'count': n,
+            'share_of_induced': (n / n_induced) if n_induced else None,
+        })
+    n_absent = int((induced & ~seen).sum())
+    buckets.append({
+        'bucket': 'not_in_context', 'distance_range': None,
+        'count': n_absent,
+        'share_of_induced': ((n_absent / n_induced) if n_induced else None),
+    })
+
+    probs = _cat(quant_raw, 'top1_prob')[induced].float()
+    return {
+        'spec': spec_summary(spec),
+        'n_tokens': n_valid,
+        'n_fp16_correct': n_fp16_correct,
+        'n_fp16_wrong': n_fp16_wrong,
+        'n_induced_wrong': n_induced,
+        'induced_rate_of_fp16_correct': (
+            n_induced / n_fp16_correct if n_fp16_correct else None),
+        'n_rescued_wrong': n_rescued,
+        'rescued_rate_of_fp16_wrong': (
+            n_rescued / n_fp16_wrong if n_fp16_wrong else None),
+        'net_extra_wrong': n_induced - n_rescued,
+        'categories_induced': {
+            name: {
+                'count': int(count),
+                'share_of_induced': ((count / n_induced) if n_induced else None),
+                'definition': LM_ERROR_CATEGORIES[name],
+            }
+            for name, count in cat_counts.items()
+        },
+        'distance_buckets_induced': buckets,
+        'top1_prob_induced_mean': (
+            float(probs.mean()) if probs.numel() else None),
+        'note': ('Quantization-induced top-1 flips (fp16 correct -> '
+                 'quantized wrong) on the same held-out windows; '
+                 'read-only, no RNG impact.'),
     }
 
 
@@ -490,21 +664,30 @@ def _decode_state_snr(model, clone, windows, pad_id, spec):
 
 def evaluate_stepwise_ppl(model, windows: list, pad_id: int,
                           spec: QuantSpec | None = None) -> dict:
-    """Held-out perplexity of the standalone stepwise KDA LM."""
+    """Held-out perplexity + token accuracy of the stepwise KDA LM."""
+    was_training = model.training
     model.eval()
-    total_nll, n_tokens = 0.0, 0
-    with torch.no_grad():
-        for ids in windows:
-            logits = model(ids, spec=spec, ste=False)[:, :-1]
-            targets = ids[:, 1:1 + logits.shape[1]]
-            mask = targets.ne(pad_id) & targets.ne(-100)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
-                reduction='none')
-            total_nll += float((nll * mask.reshape(-1)).sum())
-            n_tokens += int(mask.sum())
+    total_nll, n_tokens, n_correct = 0.0, 0, 0
+    try:
+        with torch.no_grad():
+            for ids in windows:
+                logits = model(ids, spec=spec, ste=False)[:, :-1]
+                targets = ids[:, 1:1 + logits.shape[1]]
+                mask = targets.ne(pad_id) & targets.ne(-100)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+                    reduction='none')
+                total_nll += float((nll * mask.reshape(-1)).sum())
+                n_tokens += int(mask.sum())
+                n_correct += int(
+                    ((logits.argmax(-1) == targets) & mask).sum())
+    finally:
+        # A validation monitor must not leave the trainer in eval mode:
+        # dropout / norm statistics would silently change on the next step.
+        model.train(was_training)
     return {'ppl': _ppl_from_nll(total_nll, n_tokens),
-            'mean_nll': total_nll / max(1, n_tokens), 'n_tokens': n_tokens}
+            'mean_nll': total_nll / max(1, n_tokens), 'n_tokens': n_tokens,
+            'token_accuracy': (n_correct / n_tokens) if n_tokens else None}
 
 
 # --------------------------------------------------------------------------
@@ -1042,8 +1225,15 @@ def run_overfit_gates(*, device, tokenizer, split_texts, seq_len,
 # Experiment driver
 # --------------------------------------------------------------------------
 def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
-               seq_len, batch_size, eval_seqs, tolerance, lr=3e-3) -> tuple:
-    """Train + PTQ-score the hybrid LM; return (per_seed_cells, train_report)."""
+               seq_len, batch_size, eval_seqs, tolerance, lr=3e-3,
+               val_every=0, error_batches=0, max_error_examples=2) -> tuple:
+    """Train + PTQ-score the hybrid LM; return (per_seed_cells, train_report).
+
+    ``val_every`` records the held-out curve during training and
+    ``error_batches`` runs the token-level bad-case analysis on the
+    validation split, both read-only and off by default so direct callers
+    (and the unit tests) keep the historical training path exactly.
+    """
     pad = pad_token_id(tokenizer)
     val_windows = encode_windows(tokenizer, split_texts['val'][:eval_seqs],
                                  seq_len, device)
@@ -1051,24 +1241,55 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
         raise RuntimeError('Part A: the val split produced no windows')
     val_dataset = TinyStoriesLM(tokenizer, seq_len=seq_len,
                                 texts=split_texts['val'][:eval_seqs],
-                                name='val')
+                                name='val', split='val')
     per_seed, train_reports = [], []
     for seed in seeds:
+        def _val_monitor(model, _dataset=val_dataset):
+            rep = evaluate_lm_loss(
+                model, _dataset, batch_size=1, device=device,
+                return_accuracy=True)
+            if rep['loss'] is None:
+                raise RuntimeError('Part A validation produced no tokens')
+            return ValPoint(
+                loss=rep['loss'],
+                acc=(rep['token_accuracy']
+                     if rep.get('token_accuracy') is not None else 0.0))
+
         model, report = train_hybrid_lm(
             seed=seed, tokenizer=tokenizer, train_texts=split_texts['train'],
             steps=steps, seq_len=seq_len, batch_size=batch_size,
-            device=device, lr=lr)
+            device=device, lr=lr, val_every=val_every,
+            val_monitor=_val_monitor)
+        if int(error_batches or 0) > 0:
+            # Token-level bad cases on the SAME held-out split used for the
+            # curve: near-miss / confident-wrong / copyable-missed / novel
+            # categories plus decoded examples, so a PPL change can be
+            # attributed to a failure mode rather than to a scalar.
+            report['error_analysis'] = analyze_lm_errors(
+                model, val_dataset, batch_size=1, device=device,
+                max_batches=int(error_batches), seed=seed,
+                tokenizer=tokenizer,
+                max_examples=int(max_error_examples))
         prefill = evaluate_lm_loss(model, val_dataset, batch_size=1,
                                    device=device)
         if prefill['perplexity'] is None:
             raise RuntimeError('Part A: prefill evaluation had no tokens')
         clone = build_decoding_clone(model, device=device)
-        base = evaluate_decode_ppl(model, clone, val_windows, pad, spec=None)
+        diagnose_quant = int(error_batches or 0) > 0
+        base = evaluate_decode_ppl(
+            model, clone, val_windows, pad, spec=None,
+            collect_diagnostics=diagnose_quant)
+        quant_errors = {}
         cells = [None] + list(specs)
         for spec in cells:
             scored = (base if spec is None
-                      else evaluate_decode_ppl(model, clone, val_windows,
-                                               pad, spec=spec))
+                      else evaluate_decode_ppl(
+                          model, clone, val_windows, pad, spec=spec,
+                          collect_diagnostics=diagnose_quant))
+            if spec is not None and diagnose_quant:
+                label = f'{spec.bits}b/g{spec.group_size}'
+                quant_errors[label] = quantization_error_delta(
+                    base['raw_diagnostics'], scored['raw_diagnostics'], spec)
             snr = math.inf if spec is None else _decode_state_snr(
                 model, clone, val_windows, pad, spec)
             agreement = 1.0
@@ -1092,6 +1313,20 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
                 # pairing is exact by construction.
                 'per_window': scored['per_window'],
             })
+        if quant_errors:
+            report['quantization_error_analysis'] = quant_errors
+            for label, delta in quant_errors.items():
+                logger.info(
+                    '  [quant-bad-case] %s: %d/%d fp16-correct tokens '
+                    'flipped (%s), rescued %d, top categories %s',
+                    label, delta['n_induced_wrong'], delta['n_fp16_correct'],
+                    ('n/a' if delta['induced_rate_of_fp16_correct'] is None
+                     else f"{delta['induced_rate_of_fp16_correct']:.2%}"),
+                    delta['n_rescued_wrong'],
+                    ', '.join(
+                        f'{name}={v["count"]}'
+                        for name, v in delta['categories_induced'].items()
+                        if v['count']))
         train_reports.append(report)
         logger.info(
             'Part A seed %d: prefill ppl %.4f, decode fp16 ppl %.4f '
@@ -1101,23 +1336,34 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
 
 
 def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
-               seq_len, batch_size, eval_seqs, spec, steps, lr=3e-3) -> list:
+               seq_len, batch_size, eval_seqs, spec, steps, lr=3e-3,
+               val_every=0) -> list:
     """fp16-vs-QAT A/B training + scoring for the stepwise KDA LM."""
     pad = pad_token_id(tokenizer)
     val_windows = encode_windows(tokenizer, split_texts['val'][:eval_seqs],
                                  seq_len, device)
     if not val_windows:
         raise RuntimeError('Part B: the val split produced no windows')
+
+    def _val_monitor(model):
+        rep = evaluate_stepwise_ppl(model, val_windows, pad)
+        return ValPoint(
+            loss=rep['mean_nll'],
+            acc=(rep['token_accuracy']
+                 if rep.get('token_accuracy') is not None else 0.0))
+
     per_seed = []
     for seed in seeds:
         fp16_model, fp16_rep = train_stepwise_lm(
             seed=seed, tokenizer=tokenizer, train_texts=split_texts['train'],
             steps=steps, seq_len=seq_len, batch_size=batch_size,
-            device=device, spec=None, ste=False, lr=lr)
+            device=device, spec=None, ste=False, lr=lr,
+            val_every=val_every, val_monitor=_val_monitor)
         qat_model, qat_rep = train_stepwise_lm(
             seed=seed, tokenizer=tokenizer, train_texts=split_texts['train'],
             steps=qat_steps, seq_len=seq_len, batch_size=batch_size,
-            device=device, spec=spec, ste=True, lr=lr)
+            device=device, spec=spec, ste=True, lr=lr,
+            val_every=val_every, val_monitor=_val_monitor)
         fp16_ppl = evaluate_stepwise_ppl(fp16_model, val_windows, pad)['ppl']
         ptq_ppl = evaluate_stepwise_ppl(fp16_model, val_windows, pad,
                                         spec=spec)['ppl']
@@ -1143,7 +1389,8 @@ def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
                 seed=seed, tokenizer=tokenizer,
                 train_texts=split_texts['train'], steps=qat_steps,
                 seq_len=seq_len, batch_size=batch_size, device=device,
-                spec=None, ste=False, lr=lr)
+                spec=None, ste=False, lr=lr, val_every=val_every,
+                val_monitor=_val_monitor)
             fp16_matched_ppl = evaluate_stepwise_ppl(
                 fp16_matched_model, val_windows, pad)['ppl']
             ptq_matched_ppl = evaluate_stepwise_ppl(
@@ -1180,6 +1427,13 @@ def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
                 math.log(qat_ppl) - math.log(fp16_matched_ppl)
                 if qat_ppl > 0.0 and fp16_matched_ppl > 0.0 else None),
             'extra_steps_vs_fp16': int(qat_steps) - int(steps),
+            # Persist the held-out curve for each arm (None when disabled):
+            # a QAT arm may end with lower train loss while still improving
+            # or already overfitting on validation, which the endpoint PPL
+            # contrast alone cannot reveal.
+            'fp16_validation': fp16_rep.get('validation'),
+            'qat_validation': qat_rep.get('validation'),
+            'fp16_matched_validation': fp16_matched_rep.get('validation'),
             'grad_norm_first': qat_rep['grad_norm_first'],
             'grad_norm_last': qat_rep['grad_norm_last'],
             'all_grads_finite': bool(
@@ -1304,9 +1558,20 @@ def main():
     # Bootstrap replicates for the paired quantized-vs-fp16 test over the
     # shared held-out windows (pure Python, no extra forwards).
     pp_boot = parse_int_env('QLM_PPL_BOOT', 2000, min_value=1)
+    # Held-out curve + bad-case analysis (read-only; cannot change weights).
+    # Default: four evenly spaced validation checks per arm.
+    val_every = parse_int_env('QLM_VAL_EVERY', max(1, steps // 4),
+                              min_value=0, logger=logger)
+    error_batches = parse_int_env(
+        'QLM_ERROR_BATCHES', max(1, min(int(eval_seqs), 4)), min_value=0,
+        logger=logger)
+    max_error_examples = parse_int_env('QLM_ERROR_EXAMPLES', 2,
+                                       min_value=0, logger=logger)
     logger.info(f'  seeds: {list(seeds)}, steps: {steps}, '
                 f'qat_steps: {qat_steps}, seq_len: {seq_len}, '
                 f'batch: {batch_size}, eval_seqs: {eval_seqs}')
+    logger.info(f'  validation monitor: every {val_every} steps; bad-case '
+                f'batches: {error_batches}')
     logger.info(f'  specs: {len(specs)} quantized cells + fp16 '
                 f'(paired bootstrap n_boot={pp_boot})')
 
@@ -1327,7 +1592,9 @@ def main():
     ptq_per_seed, train_reports = run_part_a(
         device=device, tokenizer=tokenizer, split_texts=split_texts,
         seeds=seeds, specs=specs, steps=steps, seq_len=seq_len,
-        batch_size=batch_size, eval_seqs=eval_seqs, tolerance=tolerance)
+        batch_size=batch_size, eval_seqs=eval_seqs, tolerance=tolerance,
+        val_every=val_every, error_batches=error_batches,
+        max_error_examples=max_error_examples)
     ptq_rows = build_ptq_rows(ptq_per_seed, [None] + specs, tolerance,
                               n_boot=pp_boot)
     _print_ptq(ptq_rows)
@@ -1338,7 +1605,7 @@ def main():
             device=device, tokenizer=tokenizer, split_texts=split_texts,
             seeds=seeds, qat_steps=qat_steps, seq_len=seq_len,
             batch_size=batch_size, eval_seqs=eval_seqs, spec=QAT_SPEC,
-            steps=steps)
+            steps=steps, val_every=val_every)
         qat_rows = build_qat_rows(qat_per_seed, QAT_SPEC)
         _print_qat(qat_rows)
 
@@ -1393,6 +1660,16 @@ def main():
                 'aggregate is in each ptq_ppl row as paired_vs_fp16. '
                 f'n_boot={pp_boot} (env QLM_PPL_BOOT)'),
             'tolerance': tolerance,
+            'validation_monitor': {
+                'val_every': int(val_every),
+                'bad_case_batches': int(error_batches),
+                'bad_case_examples_per_category': int(max_error_examples),
+                'note': ('Held-out (loss, token-accuracy) curve during '
+                         'training and token-level bad-case categories on '
+                         'the same validation split; read-only and '
+                         'RNG-neutral, so enabling them cannot change a '
+                         'reported PPL.'),
+            },
             'qat': 'straight-through fake_quantize (ste=True) on every '
                    'state write during training; inference scoring uses '
                    'ste=False on the same spec. The primary QAT contrast '

@@ -56,8 +56,10 @@ from run_quant_lm import (  # noqa: E402
     QAT_SPEC,
     StepwiseKDALM,
     build_corpus,
+    evaluate_stepwise_ppl,
     build_ptq_rows,
     build_qat_rows,
+    run_part_a,
     run_part_b,
 )
 
@@ -307,6 +309,101 @@ def test_part_b_matched_budget_control():
         and eq['ptq_matched_ppl'] == eq['ptq_ppl'], '')
 
 
+def test_stepwise_eval_reports_accuracy_and_restores_mode():
+    """Held-out eval is read-only: accuracy is returned, train() restored."""
+    print('\nTest: stepwise held-out eval mode/accuracy contract')
+    _torch_seed(0)
+    model = StepwiseKDALM(vocab_size=16)
+    model.train()
+    ids = torch.randint(2, 16, (1, 8))
+    rep = evaluate_stepwise_ppl(model, [ids], pad_id=0)
+    _ok('token accuracy is reported', rep['token_accuracy'] is not None
+        and 0.0 <= rep['token_accuracy'] <= 1.0,
+        f"{rep['token_accuracy']}")
+    _ok('eval restores the caller training mode', model.training, '')
+    model.eval()
+    evaluate_stepwise_ppl(model, [ids], pad_id=0)
+    _ok('eval keeps an already-eval model in eval mode',
+        not model.training, '')
+
+
+def test_part_a_validation_and_bad_cases():
+    """Held-out curve + token-level bad cases must be read-only."""
+    print('\nTest: Part A validation curve and bad-case analysis')
+    tok, splits, _ = build_corpus(seq_len=8, n_texts=8, seed=0)
+    kw = dict(device='cpu', tokenizer=tok, split_texts=splits, seeds=(0,),
+              specs=(QAT_SPEC,), steps=2, seq_len=8, batch_size=2,
+              eval_seqs=1, tolerance=1.5, lr=3e-3)
+    plain_cells, plain_reports = run_part_a(**kw, val_every=0)
+    mon_cells, mon_reports = run_part_a(
+        **kw, val_every=1, error_batches=1, max_error_examples=1)
+    plain_ppl = [c['decode_ppl'] for c in plain_cells
+                 if c['spec'] is None][0]
+    mon_ppl = [c['decode_ppl'] for c in mon_cells if c['spec'] is None][0]
+    _ok('monitoring is RNG-neutral (fp16 PPL unchanged)',
+        plain_ppl == mon_ppl, f'{plain_ppl} vs {mon_ppl}')
+    _ok('monitoring is off by default in the train report',
+        'validation' not in plain_reports[0], '')
+    rep = mon_reports[0]
+    val = rep['validation']
+    _ok('validation curve records step 0 + each check',
+        len(val['val_history']) == 3
+        and val['val_history'][0]['step'] == 0, f"{len(val['val_history'])}")
+    _ok('validation points carry finite loss and accuracy',
+        all(math.isfinite(p['loss']) and math.isfinite(p['acc'])
+            for p in val['val_history']), '')
+    _ok('early-stopping summary is attached',
+        rep['early_stopping_summary']['selected_step']
+        <= rep['early_stopping_summary']['final_step'], '')
+    ea = rep['error_analysis']
+    _ok('bad cases analyzed on the val split',
+        ea['split'] == 'val' and ea['n_batches_analyzed'] == 1
+        and ea['n_tokens'] > 0, f"{ea['split']}/{ea['n_tokens']}")
+    _ok('bad-case categories partition the wrong tokens',
+        sum(v['count'] for k, v in ea['categories'].items()
+            if k not in ('correct', 'ignored')) == ea['n_wrong'], '')
+    label = f'{QAT_SPEC.bits}b/g{QAT_SPEC.group_size}'
+    delta = rep['quantization_error_analysis'][label]
+    _ok('quantization-induced bad cases are aligned to decode tokens',
+        delta['n_tokens'] > 0
+        and delta['n_induced_wrong'] + delta['n_rescued_wrong']
+        <= delta['n_tokens'], f"{delta['n_tokens']}")
+    _ok('induced category mix partitions the induced errors',
+        sum(v['count'] for v in delta['categories_induced'].values())
+        == delta['n_induced_wrong'], '')
+    _ok('net extra wrong is derived consistently',
+        delta['net_extra_wrong']
+        == delta['n_induced_wrong'] - delta['n_rescued_wrong'], '')
+    _ok('distance buckets cover every induced error exactly once',
+        sum(b['count'] for b in delta['distance_buckets_induced'])
+        == delta['n_induced_wrong'], '')
+
+
+def test_part_b_validation_monitor_rng_neutral():
+    """The Part B curve must not perturb the QAT/PTQ comparison."""
+    print('\nTest: Part B validation monitor is RNG-neutral')
+    tok, splits, _ = build_corpus(seq_len=8, n_texts=8, seed=0)
+    kw = dict(device='cpu', tokenizer=tok, split_texts=splits, seeds=(0,),
+              qat_steps=2, seq_len=8, batch_size=2, eval_seqs=1,
+              spec=QAT_SPEC, steps=2, lr=3e-3)
+    plain = run_part_b(**kw, val_every=0)[0]
+    monitored = run_part_b(**kw, val_every=1)[0]
+    keys = ('fp16_ppl', 'ptq_ppl', 'qat_ppl', 'fp16_matched_ppl')
+    _ok('all Part B PPLs are bit-identical with monitoring enabled',
+        all(plain[k] == monitored[k] for k in keys),
+        str({k: (plain[k], monitored[k]) for k in keys
+             if plain[k] != monitored[k]}))
+    _ok('Part B validation is disabled by default',
+        plain.get('fp16_validation') is None
+        and plain.get('qat_validation') is None, '')
+    for arm in ('fp16_validation', 'qat_validation',
+                'fp16_matched_validation'):
+        val = monitored[arm]
+        _ok(f'{arm} persists step 0 + each check',
+            val is not None and len(val['val_history']) == 3
+            and val['val_history'][0]['step'] == 0, '')
+
+
 # --- 4. report self-consistency -------------------------------------------
 
 def _fake_window_units(total_nll, counts, profile):
@@ -494,6 +591,9 @@ _TEST_FUNCS = [
     test_fake_quantize_inplace_contract,
     test_ste_autograd_contract,
     test_stepwise_kda_lm_qat_smoke,
+    test_stepwise_eval_reports_accuracy_and_restores_mode,
+    test_part_a_validation_and_bad_cases,
+    test_part_b_validation_monitor_rng_neutral,
     test_part_b_matched_budget_control,
     test_quant_lm_report_rows,
 ]

@@ -127,6 +127,7 @@ from run_quality import (  # noqa: E402
     make_long_range_batch,
     make_mqar_batch,
 )
+from train_diagnostics import ValPoint, ValidationCurve  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -671,16 +672,79 @@ def _build_recall_model(m: int, m2: int, layout, d_model, device):
     return model, head, embed
 
 
+def _build_recall_val_set(*, embed, seq_len: int, batch: int, vocab: int,
+                          n_batches: int, seed: int, device) -> list[dict]:
+    """Fixed held-out long-range batches for validation monitoring.
+
+    Built ONCE from a dedicated generator, and stored as input ids (not
+    embeddings) so every checkpoint re-embeds them with the current
+    embedding weights. No global RNG draw; the same fixed set is used for
+    every checkpoint, so the curve is comparable across steps.
+    """
+    gen = make_seeded_generator(int(seed) + 9_000_000, device=device)
+    out = []
+    with torch.no_grad():
+        for _ in range(max(1, int(n_batches))):
+            _x, target, cue_pos, meta = make_long_range_batch(
+                int(batch), int(seq_len), 1, int(vocab), embed, device,
+                generator=gen, return_meta=True)
+            out.append({
+                'input_ids': meta['input_ids'].detach().clone(),
+                'target': target.detach().clone(),
+                'cue_pos': int(cue_pos),
+            })
+    return out
+
+
+def _recall_validation_point(model, embed, head,
+                             val_set: list[dict]) -> ValPoint:
+    """Mean held-out CE + accuracy on the fixed validation set.
+
+    Read-only: no gradient, no optimizer step, and all three modules get
+    their previous train/eval mode restored in ``finally``.
+    """
+    modes = (model.training, embed.training, head.training)
+    model.eval()
+    embed.eval()
+    head.eval()
+    loss_sum, correct, total = 0.0, 0, 0
+    try:
+        with torch.no_grad():
+            for batch in val_set:
+                model.reset_state()
+                logits = head(model(embed(batch['input_ids'])),
+                              batch['cue_pos'])
+                loss_sum += float(F.cross_entropy(logits, batch['target']))
+                correct += int(
+                    (logits.argmax(dim=-1) == batch['target']).sum())
+                total += int(batch['target'].numel())
+    finally:
+        model.train(modes[0])
+        embed.train(modes[1])
+        head.train(modes[2])
+    n_batches = max(1, len(val_set))
+    return ValPoint(loss=loss_sum / n_batches,
+                    acc=(correct / total) if total else 0.0)
+
+
 def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
                        seq_len: int = SEQ_LEN, d_model: int = D_MODEL,
                        train_batch: int = 16, lr: float = 3e-3,
-                       vocab: int = VOCAB, device='cpu'):
+                       vocab: int = VOCAB, device='cpu',
+                       val_every: int = 0, val_batches: int = 1,
+                       val_batch: int = 64, return_report: bool = False):
     """Train a hybrid stack on the distance-controlled long-range task.
 
     One (key, value) pair per sequence at a uniformly random position
     (``make_long_range_batch``), cue at the last position, distractor-only
     filler. Returns ``(model, embed, head, losses)``; the model is left in
     ``eval()`` mode.
+
+    ``val_every > 0`` additionally records a held-out (loss, accuracy)
+    curve on a FIXED batch built from a dedicated generator. The monitor is
+    read-only and RNG-neutral, so enabling it cannot change the training
+    loss curve or the final accuracy. With ``return_report=True`` the
+    tuple gains a fifth element: the curve/diagnosis report.
     """
     if isinstance(device, str):
         device = torch.device(device)
@@ -700,6 +764,18 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
     head.train()
     embed.train()
     losses: list[float] = []
+    val_every = max(0, int(val_every or 0))
+    val_curve = None
+    if val_every > 0:
+        val_set = _build_recall_val_set(
+            embed=embed, seq_len=seq_len, batch=val_batch, vocab=vocab,
+            n_batches=val_batches, seed=seed, device=device)
+        val_curve = ValidationCurve(
+            lambda _step: _recall_validation_point(
+                model, embed, head, val_set),
+            steps=int(steps), val_every=val_every,
+            label=f'recall {layout} m={m} m2={m2} seed={seed}')
+        val_curve.record(0)
     for step in range(int(steps)):
         x_emb, target, cue_pos = make_long_range_batch(
             train_batch, seq_len, 1, vocab, embed, device, generator=gen)
@@ -716,9 +792,35 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(float(loss.item()))
+        if val_curve is not None and (step + 1) % val_every == 0:
+            val_curve.record(step + 1)
     model.eval()
     head.eval()
     embed.eval()
+    report = None
+    if val_curve is not None:
+        block = val_curve.finalize(losses)
+        report = {
+            'val_every': int(val_every),
+            'val_batches': int(max(1, val_batches)),
+            'val_batch': int(val_batch),
+            'validation': block,
+            'curve_diagnosis': block['curve_diagnosis'],
+            'generalization_gap': block['generalization_gap'],
+            'val_loss_regret_from_best': block.get(
+                'val_loss_regret_from_best'),
+            'early_stopping_summary': block.get('early_stopping_summary'),
+            'validation_protocol': {
+                'fixed_set': True,
+                'read_only': True,
+                'rng_neutral': True,
+                'seed_offset': 9_000_000,
+                'n_sequences': int(max(1, val_batches)) * int(val_batch),
+            },
+        }
+        val_curve.log_verdict(block)
+    if return_report:
+        return model, embed, head, losses, report
     return model, embed, head, losses
 
 
@@ -988,7 +1090,9 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                       d_model: int = D_MODEL, train_batch: int = 16,
                       eval_batches: int = 4, eval_batch: int = 64,
                       device='cpu', train: bool = True,
-                      csa_topk: int | None = None) -> dict:
+                      csa_topk: int | None = None,
+                      val_every: int = 0, val_batches: int = 1,
+                      val_batch: int = 64) -> dict:
     """The block-size x interleaving recall grid (the experiment body).
 
     For each (m, m2) budget pair x layout preset and each seed, trains the
@@ -1036,10 +1140,12 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
             }
             if train:
                 for seed in seeds:
-                    model, embed, head, losses = train_recall_model(
+                    model, embed, head, losses, val_report = train_recall_model(
                         layout, m, m2, seed=seed, steps=steps,
                         seq_len=seq_len, d_model=d_model,
-                        train_batch=train_batch, device=device)
+                        train_batch=train_batch, device=device,
+                        val_every=val_every, val_batches=val_batches,
+                        val_batch=val_batch, return_report=True)
                     ev = evaluate_recall(
                         model, embed, head, seq_len=seq_len,
                         n_batches=eval_batches, batch=eval_batch,
@@ -1058,6 +1164,10 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                             if losses else None),
                         # Full per-step curve (the run log, not just endpoints).
                         'loss_curve': [float(x) for x in losses],
+                        # Held-out curve on a fixed validation set (None when
+                        # val_every=0). Kept per seed so the row-level
+                        # verdict can be audited against the raw points.
+                        'train_validation': val_report,
                         'accuracy': ev['accuracy'],
                         'buckets': ev['buckets'],
                         'indexer_recall_per_layer': [
@@ -1067,6 +1177,20 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                         'indexer_union_recall': indexer['union_recall'],
                         'hca_resolved_fraction': hca['any_resolved_fraction'],
                     })
+                verdicts: dict = {}
+                for s in row['per_seed']:
+                    rep = s.get('train_validation') or {}
+                    diag = rep.get('curve_diagnosis') or {}
+                    verdict = diag.get('verdict', 'not_monitored')
+                    verdicts[verdict] = verdicts.get(verdict, 0) + 1
+                last_rep = row['per_seed'][-1].get('train_validation') or {}
+                row['train_curve_verdicts'] = verdicts
+                row['train_curve_diagnosis'] = last_rep.get(
+                    'curve_diagnosis')
+                row['train_val_loss_regret_from_best'] = last_rep.get(
+                    'val_loss_regret_from_best')
+                row['train_early_stopping_summary'] = last_rep.get(
+                    'early_stopping_summary')
                 accs = [s['accuracy'] for s in row['per_seed']
                         if s['accuracy'] is not None]
                 mean, std, ci = _mean_std_ci95(accs)
@@ -1140,6 +1264,16 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                 'eval_batch': int(eval_batch),
                 'batch_gen_seed_offset': 1_000_000,
                 'eval_gen_seed_offset': 5_000_000,
+                'validation_monitor': {
+                    'val_every': int(val_every),
+                    'val_batches': int(val_batches),
+                    'val_batch': int(val_batch),
+                    'val_gen_seed_offset': 9_000_000,
+                    'note': ('fixed held-out long-range batch scored every '
+                             'val_every steps; read-only and RNG-neutral, '
+                             'so it cannot change the training loss curve '
+                             'or final accuracy'),
+                },
             },
             'provenance': capture_provenance(),
             'note': ('structural = exact placement reachability at the cue; '
@@ -1208,6 +1342,13 @@ def main(argv=None) -> int:
     parser.add_argument('--train-batch', type=int, default=16)
     parser.add_argument('--eval-batches', type=int, default=4)
     parser.add_argument('--eval-batch', type=int, default=64)
+    parser.add_argument('--val-every', type=int, default=None,
+                        help='held-out validation interval in training '
+                             'steps (default: steps // 4; 0 disables)')
+    parser.add_argument('--val-batches', type=int, default=None,
+                        help='fixed held-out batches per validation check')
+    parser.add_argument('--val-batch', type=int, default=None,
+                        help='sequences per fixed held-out validation batch')
     parser.add_argument('--device', default=None)
     parser.add_argument('--quiet', action='store_true')
     args = parser.parse_args(argv)
@@ -1261,12 +1402,25 @@ def main(argv=None) -> int:
         if not proceed:
             return 1
 
+    val_every = (0 if args.no_train else
+                 (max(0, int(args.val_every))
+                  if args.val_every is not None
+                  else parse_int_env('RECALL_VAL_EVERY', max(1, steps // 4),
+                                     min_value=0, logger=logger)))
+    val_batches = (max(1, int(args.val_batches))
+                   if args.val_batches is not None
+                   else parse_int_env('RECALL_VAL_BATCHES', 1,
+                                      min_value=1, logger=logger))
+    val_batch = (max(1, int(args.val_batch)) if args.val_batch is not None
+                 else parse_int_env('RECALL_VAL_BATCH', 64, min_value=1,
+                                    logger=logger))
     report = run_recall_report(
         pairs=pairs, layouts=layouts, steps=steps, seeds=seeds,
         seq_len=args.seq_len, d_model=args.d_model,
         train_batch=args.train_batch, eval_batches=args.eval_batches,
         eval_batch=args.eval_batch, device=device,
-        train=not args.no_train)
+        train=not args.no_train, val_every=val_every,
+        val_batches=val_batches, val_batch=val_batch)
 
     # Attach the pre-sweep gate verdict so the report is a complete run
     # record (the full per-step curves + fixed-batch fingerprint).

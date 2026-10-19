@@ -556,7 +556,7 @@ class SealedTestSet:
 @torch.no_grad()
 def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
                      max_batches=None, use_amp=False, autocast_dtype=None,
-                     return_units=False):
+                     return_units=False, return_accuracy=False):
     """Token-weighted mean cross-entropy loss of ``model`` on ``dataset``.
 
     Deterministic, read-only evaluation used for validation monitoring,
@@ -600,6 +600,7 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
     was_training = model.training
     model.eval()
     total_nll, total_tokens = 0.0, 0
+    total_correct = 0
     n_batches = n_sequences = 0
     per_unit: list[dict] = []
     unit_offset = 0
@@ -634,6 +635,15 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
                     f'non-finite held-out LM loss ({loss}) during '
                     f'evaluation; refusing to report a corrupted metric. '
                     f'Diagnosis [{diag["verdict"]}]: {diag["summary"]}')
+            if return_accuracy:
+                # Optional token accuracy on the SAME masked positions:
+                # turns the loss curve into a (loss, accuracy) pair the
+                # held-out monitor can diagnose (e.g. saturated accuracy
+                # while loss still falls).
+                valid_mask = labels != -100
+                total_correct += int(
+                    ((out['logits'].argmax(dim=-1) == labels)
+                     & valid_mask).sum())
             if return_units:
                 # Per-item NLL sums for the unit-level bootstrap. The
                 # logits are recomputed through the SAME ignore_index
@@ -671,6 +681,8 @@ def evaluate_lm_loss(model, dataset, *, batch_size=1, device='cpu',
         'loss': mean_loss,
         'perplexity': (math.exp(min(mean_loss, 700.0))
                        if mean_loss is not None else None),
+        'token_accuracy': ((total_correct / total_tokens)
+                           if return_accuracy and total_tokens else None),
         'n_batches': n_batches,
         'n_sequences': n_sequences,
         'n_tokens': total_tokens,

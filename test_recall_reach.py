@@ -448,6 +448,40 @@ def test_report_multi_seed_statistics():
         single['design']['statistical_design']['warning'] is not None, '')
 
 
+def test_validation_curve_monitor():
+    """Held-out curve is reported and cannot perturb the training run."""
+    print('\nTest: fixed-set validation curve (read-only, RNG-neutral)')
+    kw = dict(pairs=((4, 8),), layouts=['alternating'], steps=2,
+              seeds=(42,), seq_len=16, train_batch=8, eval_batches=1,
+              eval_batch=8)
+    off = R.run_recall_report(**kw, val_every=0)
+    on = R.run_recall_report(**kw, val_every=1, val_batches=1, val_batch=8)
+    a = off['rows'][0]['per_seed'][0]
+    b = on['rows'][0]['per_seed'][0]
+    _ok('validation is disabled by default',
+        a.get('train_validation') is None, '')
+    _ok('training loss curve is bit-identical with monitoring',
+        a['loss_curve'] == b['loss_curve'], '')
+    _ok('final accuracy is bit-identical with monitoring',
+        a['accuracy'] == b['accuracy'], f"{a['accuracy']} vs {b['accuracy']}")
+    rep = b['train_validation']
+    _ok('curve records step 0 + every check + final',
+        [p['step'] for p in rep['validation']['val_history']]
+        == [0, 1, 2], str(rep['validation']['val_history']))
+    _ok('validation protocol is fixed/read-only/RNG-neutral',
+        rep['validation_protocol']['fixed_set'] is True
+        and rep['validation_protocol']['read_only'] is True
+        and rep['validation_protocol']['rng_neutral'] is True, '')
+    _ok('early-stopping regret is quantified',
+        rep['early_stopping_summary'] is not None
+        and rep['val_loss_regret_from_best'] is not None, '')
+    row = on['rows'][0]
+    _ok('row aggregates the curve verdict',
+        row['train_curve_verdicts'].get('underfitting') == 1
+        and row['train_curve_diagnosis'] is not None, '')
+    json.dumps(on, allow_nan=False)
+
+
 def test_hypothesis_checks_contract():
     """Pre-registered hypotheses + analytic/empirical checks are reported."""
     structural = R.run_recall_report(train=False)
@@ -499,6 +533,7 @@ def main() -> int:
     test_report_strict_json_and_budget()
     test_seed_statistics_contract()
     test_report_multi_seed_statistics()
+    test_validation_curve_monitor()
     test_hypothesis_checks_contract()
     print('\nAll recall-reach tests passed.')
     return 0

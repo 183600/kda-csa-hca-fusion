@@ -109,6 +109,12 @@ from ops_fused import HybridConfig, HybridKCHAttention, _memory_layer_lookback
 from multi_seed_stats import summarize_paired
 from run_decoding import HybridDecoding
 from results_schema import write as write_schema
+from train_diagnostics import (
+    ValPoint,
+    ValidationCurve,
+    raise_non_finite,
+    triage_gradient,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +262,14 @@ EVAL_SEED_RESERVE = 4096
 TRAIN_SEED_STREAM = 1_000_000  # generator offset for the training seed draws
 SEED_CEILING = 2 ** 31 - 1
 
+# Held-out validation-monitoring band. It sits between the evaluation band
+# [0, EVAL_SEED_RESERVE) and the training band [EVAL_SEED_RESERVE, 2**31):
+# the evaluation uses the low seeds, training draws from 4096 upward, and
+# validation uses [2048, 4096), so monitoring can never inspect a training
+# or evaluation sequence. The sweep checks that the requested evaluation
+# band does not reach into this reservation.
+VAL_SEED_BASE = EVAL_SEED_RESERVE // 2
+
 
 def eval_batch_seeds(batch_index: int, batch_size: int) -> list[int]:
     """Seeds of evaluation batch ``batch_index`` (the held-out band).
@@ -276,6 +290,20 @@ def eval_batch_seeds(batch_index: int, batch_size: int) -> list[int]:
             f'(requested seeds [{lo}, {hi})); raise EVAL_SEED_RESERVE or '
             f'lower batch_size/n_batches')
     return list(range(lo, hi))
+
+
+def _needle_val_seeds(seed: int, count: int) -> list[int]:
+    """Deterministic validation seeds inside the reserved val band."""
+    span = EVAL_SEED_RESERVE - VAL_SEED_BASE
+    count = int(count)
+    if count < 1:
+        raise ValueError('count must be >= 1')
+    if count > span:
+        raise ValueError(
+            f'validation batch of {count} exceeds the reserved band of '
+            f'{span} seeds')
+    base = VAL_SEED_BASE + ((int(seed) * 257) % (span - count + 1))
+    return list(range(base, base + count))
 
 
 def draw_train_seeds(generator, batch_size: int) -> list[int]:
@@ -591,6 +619,39 @@ class NeedleStepwiseKDA(nn.Module):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _needle_error_category(pred_row, expected_row, context_row) -> dict:
+    """Classify one wrong full-answer prediction (bad-case analysis).
+
+    The task is verbatim copying, so a wrong answer is attributable to a
+    concrete failure mode rather than to label ambiguity:
+
+      * ``recency_copy`` — the model copied the final context tokens
+        (a local shortcut instead of retrieving the planted fact);
+      * ``wrong_from_start`` — the very first answer token was wrong
+        (localisation never reached the fact);
+      * ``partial_answer`` — the prefix matched but a later token diverged
+        (fact found, continuation mis-copied).
+
+    Returns the category plus enough detail to debug the sample.
+    """
+    n = int(expected_row.numel())
+    diff = (pred_row != expected_row).nonzero(as_tuple=False)
+    first_wrong = int(diff[0]) if diff.numel() else n
+    recency = context_row[-n:] if context_row.numel() >= n else context_row
+    if recency.numel() == n and torch.equal(pred_row, recency):
+        category = 'recency_copy'
+    elif first_wrong == 0:
+        category = 'wrong_from_start'
+    else:
+        category = 'partial_answer'
+    return {
+        'category': category,
+        'first_wrong_token': first_wrong,
+        'matching_prefix_tokens': first_wrong,
+        'n_answer_tokens': n,
+    }
+
+
 def evaluate_needle_recall(
     model: nn.Module,
     tokenizer: _NeedleCharTokenizer,
@@ -601,6 +662,7 @@ def evaluate_needle_recall(
     device: str | torch.device = 'cpu',
     quant_spec: QuantSpec | None = None,
     dtype: torch.dtype = torch.float32,
+    max_error_examples: int = 0,
 ) -> dict:
     """Evaluate needle retrieval by greedy decoding of the FULL answer.
 
@@ -628,6 +690,10 @@ def evaluate_needle_recall(
     token_correct = 0
     token_total = 0
     first_correct = 0
+    error_counts = OrderedDict((c, 0) for c in
+                               ('recency_copy', 'wrong_from_start',
+                                'partial_answer'))
+    error_examples: dict = OrderedDict((c, []) for c in error_counts)
 
     for b in range(n_batches):
         seeds = eval_batch_seeds(b, batch_size)
@@ -677,9 +743,35 @@ def evaluate_needle_recall(
         token_total += batch_size * n_gen
         first_correct += int(match[:, 0].sum().item())
         total += batch_size
+        if int(max_error_examples) > 0:
+            row_seeds = eval_batch_seeds(b, batch_size)
+            for bi in range(int(batch_size)):
+                if bool(match[bi].all()):
+                    continue
+                info = _needle_error_category(
+                    preds[bi].detach().cpu(), expected_t.detach().cpu(),
+                    input_ids[bi].detach().cpu())
+                cat = info['category']
+                error_counts[cat] = error_counts.get(cat, 0) + 1
+                bucket = error_examples.setdefault(cat, [])
+                if len(bucket) < int(max_error_examples):
+                    bucket.append({
+                        'seed': int(row_seeds[bi]),
+                        'context_len': int(context_len),
+                        'needle_pos': int(needle_pos),
+                        **info,
+                        'expected_ids': expected_t.detach().cpu().tolist(),
+                        'predicted_ids': preds[bi].detach().cpu().tolist(),
+                        'expected_text': tokenizer.decode(
+                            expected_t.detach().cpu().tolist()),
+                        'predicted_text': tokenizer.decode(
+                            preds[bi].detach().cpu().tolist()),
+                        'context_tail_text': tokenizer.decode(
+                            input_ids[bi, -n_gen:].detach().cpu().tolist()),
+                    })
 
     accuracy = correct / total if total else 0.0
-    return {
+    out = {
         # Full-answer exact match (the headline metric).
         'accuracy': accuracy,
         'correct': correct,
@@ -694,6 +786,27 @@ def evaluate_needle_recall(
         'needle_pos': needle_pos,
         'answer_start': context_len,
     }
+    if int(max_error_examples) > 0:
+        n_wrong = int(total - correct)
+        out['error_analysis'] = {
+            'n_samples': int(total),
+            'n_wrong': n_wrong,
+            'error_rate': (n_wrong / total) if total else None,
+            'categories': {
+                c: {
+                    'count': int(n),
+                    'rate_of_wrong': (n / n_wrong) if n_wrong else 0.0,
+                }
+                for c, n in error_counts.items()
+            },
+            'examples': {c: v for c, v in error_examples.items() if v},
+            'note': ('Wrong full-answer samples on held-out sequences; '
+                     'recency_copy = copied the final context tokens, '
+                     'wrong_from_start = first answer token wrong '
+                     '(localisation failure), partial_answer = correct '
+                     'tokens at the start of the answer.'),
+        }
+    return out
 
 
 def evaluate_needle_recall_autoregressive(
@@ -981,6 +1094,50 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
 # Training (for QAT probe)
 # ---------------------------------------------------------------------------
 
+def _needle_validation_point(model: nn.Module, tokenizer: _NeedleCharTokenizer,
+                             context_len: int, needle_pos: int,
+                             seeds: list[int], device,
+                             quant_spec: QuantSpec | None = None,
+                             ste: bool = False) -> ValPoint:
+    """Held-out (loss, exact-match) for one validation checkpoint.
+
+    Uses the SAME teacher-forced full-answer objective as training but on
+    held-out sequences from the reserved validation band. Read-only: no
+    gradient, no optimizer step, no RNG draw; the caller's train/eval mode
+    is restored.
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            input_ids, _targets, answer_positions = build_needle_batch(
+                len(seeds), context_len, needle_pos, tokenizer,
+                seeds=seeds, device=device)
+            answer_ids = tokenizer.encode(_NEEDLE_ANSWER)
+            answer_t = torch.tensor(answer_ids, dtype=torch.long,
+                                    device=device)
+            answer_tail = answer_t[:-1].unsqueeze(0).expand(len(seeds), -1)
+            full = torch.cat([input_ids, answer_tail], dim=1)
+            start = answer_positions[0] - 1
+            if any(p - 1 != start for p in answer_positions):
+                raise RuntimeError(
+                    'needle validation answer positions differ within a batch')
+            if hasattr(model, 'hybrid'):
+                model.hybrid.reset_state()
+                logits = model(full)
+            else:
+                model.reset_state() if hasattr(model, 'reset_state') else None
+                logits = model(full, spec=quant_spec, ste=ste)
+            pred = logits[:, start:start + answer_t.numel(), :]
+            target = answer_t.unsqueeze(0).expand(len(seeds), -1)
+            loss = F.cross_entropy(
+                pred.reshape(-1, pred.size(-1)), target.reshape(-1))
+            acc = (pred.argmax(-1) == target).all(dim=1).float().mean()
+            return ValPoint(loss=float(loss), acc=float(acc))
+    finally:
+        model.train(was_training)
+
+
 def train_needle_model(
     model: nn.Module,
     tokenizer: _NeedleCharTokenizer,
@@ -993,8 +1150,17 @@ def train_needle_model(
     seed: int,
     quant_spec: QuantSpec | None = None,
     ste: bool = False,
+    val_every: int = 0,
+    val_batches: int = 1,
 ) -> tuple[nn.Module, dict]:
-    """Train a needle model (full-sequence or stepwise with optional QAT)."""
+    """Train a needle model (full-sequence or stepwise with optional QAT).
+
+    ``val_every > 0`` additionally records a held-out (loss, exact-match)
+    curve on sequences from the reserved validation band, every
+    ``val_every`` steps plus step 0 and the final step. The curve never
+    touches the optimizer or the training RNG, so enabling it cannot change
+    the trained weights; it only makes over/underfitting visible.
+    """
     set_global_seed(seed, deterministic=True)
     model.train()
     model.to(device)
@@ -1008,6 +1174,18 @@ def train_needle_model(
 
     losses = []
     data_seeds: list[int] = []
+    val_every = max(0, int(val_every or 0))
+    val_batches = max(1, int(val_batches or 1))
+    val_seeds = _needle_val_seeds(seed, val_batches * min(batch_size, 4))
+    val_curve = None
+    if val_every > 0:
+        val_curve = ValidationCurve(
+            lambda _step: _needle_validation_point(
+                model, tokenizer, train_context_len, train_needle_pos,
+                val_seeds, device, quant_spec=quant_spec, ste=ste),
+            steps=int(steps), val_every=val_every,
+            label=f'needle seed={seed} ctx={train_context_len}')
+        val_curve.record(0)
     for step in range(steps):
         # Draw fresh data seeds for every step from the seeded generator.
         # Training seeds live in [EVAL_SEED_RESERVE, 2**31) so no training
@@ -1039,15 +1217,35 @@ def train_needle_model(
         loss = F.cross_entropy(
             pred.reshape(-1, pred.size(-1)), target.reshape(-1))
         if not torch.isfinite(loss):
-            raise RuntimeError(f'Non-finite loss at step {step}: {loss}')
+            # Staged triage: data/token ids -> parameters -> logits ->
+            # gradients, naming the first failing stage instead of a bare
+            # "non-finite loss".
+            raise_non_finite(
+                'loss', loss=loss,
+                token_ids={'train_ids': train_ids},
+                id_range=(0, tokenizer.vocab_size),
+                params=model.parameters(), logits=logits,
+                context=f'needle training seed={seed} step={step}')
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        bad_grads = triage_gradient(model.parameters())
+        clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if bad_grads or not torch.isfinite(clip_norm):
+            raise_non_finite(
+                'gradient', loss=loss,
+                token_ids={'train_ids': train_ids},
+                id_range=(0, tokenizer.vocab_size),
+                params=model.parameters(),
+                grads={f'grad[{i}]': p.grad for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
+                context=f'needle training seed={seed} step={step}')
         opt.step()
         losses.append(float(loss.item()))
+        if val_curve is not None and (step + 1) % val_every == 0:
+            val_curve.record(step + 1)
 
     tail = losses[-min(10, len(losses)):]
-    return model, {
+    report = {
         'losses': losses,
         'final_loss': losses[-1] if losses else None,
         'initial_loss': losses[0] if losses else None,
@@ -1063,6 +1261,33 @@ def train_needle_model(
         # independently audit disjointness from the held-out eval stream.
         'data_seeds': data_seeds,
     }
+    if val_curve is not None:
+        monitor = val_curve.finalize(losses)
+        report.update({
+            'val_every': int(val_every),
+            'val_seeds': list(val_seeds),
+            'val_history': monitor['val_history'],
+            'curve_diagnosis': monitor['curve_diagnosis'],
+            'generalization_gap': monitor['generalization_gap'],
+            'best_val': monitor['best_val'],
+            'val_loss_regret_from_best': monitor.get(
+                'val_loss_regret_from_best'),
+            'early_stopping_summary': monitor.get('early_stopping_summary'),
+            'validation_protocol': {
+                'seed_band': [VAL_SEED_BASE, EVAL_SEED_RESERVE],
+                'n_sequences': len(val_seeds),
+                'read_only': True,
+                'disjoint_from_train': not (
+                    set(val_seeds) & set(data_seeds)),
+                'disjoint_from_eval': not (
+                    set(val_seeds) & set(eval_batch_seeds(0, 1))),
+            },
+        })
+        val_curve.log_verdict(monitor)
+    else:
+        report.update({'val_every': 0, 'val_history': [],
+                       'curve_diagnosis': None})
+    return model, report
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1440,9 @@ def run_needle_sweep(
     train_steps: int = 100,
     train_batch_size: int = 4,
     train_lr: float = 3e-3,
+    val_every: int | None = None,
+    val_batches: int = 1,
+    max_error_examples: int = 1,
 ) -> list[dict]:
     """Train + evaluate every needle config, with untrained controls.
 
@@ -1230,6 +1458,12 @@ def run_needle_sweep(
     Each cache entry is trained once from scratch on a disjoint seed band and
     its actual training loss/seed audit is recorded on every row that uses it.
     """
+    if val_every is None:
+        # One point at 0, then four evenly spaced checks: enough shape for
+        # the over/underfitting diagnosis at the default 100-step budget.
+        val_every = max(1, int(train_steps) // 4)
+    val_every = max(0, int(val_every))
+    max_error_examples = max(0, int(max_error_examples))
     rows = []
     trained: dict[tuple, tuple[dict, dict]] = {}
     untrained_acc: dict[tuple, dict] = {}
@@ -1243,6 +1477,12 @@ def run_needle_sweep(
         dtype_map = {'fp32': torch.float32, 'fp16': torch.float16, 'bf16': torch.bfloat16}
         torch_dtype = dtype_map[cfg.dtype]
         eval_seed_band = eval_batch_seeds(0, batch_size * n_batches)
+        if val_every > 0 and max(eval_seed_band) >= VAL_SEED_BASE:
+            raise ValueError(
+                f'evaluation band reaches {max(eval_seed_band)}, into the '
+                f'validation reservation [{VAL_SEED_BASE}, '
+                f'{EVAL_SEED_RESERVE}); lower batch_size*n_batches or '
+                f'disable validation (val_every=0)')
 
         # Simplest rung of the baseline ladder: the weight-free lexical-scan
         # rule, scored on the SAME held-out sequences as every model row.
@@ -1258,6 +1498,7 @@ def run_needle_sweep(
                      else train_ctx // 4)
         per_seed_results = []
         control_results = []
+        seed_train_reports = []
         for seed in seeds:
             key = (_arch_key(cfg), train_ctx, train_pos, seed)
             if key not in trained:
@@ -1267,7 +1508,8 @@ def run_needle_sweep(
                 model = _build_needle_model(cfg, tokenizer)
                 model, rep = train_needle_model(
                     model, tokenizer, train_ctx, train_pos,
-                    train_steps, train_batch_size, train_lr, device, seed)
+                    train_steps, train_batch_size, train_lr, device, seed,
+                    val_every=val_every, val_batches=val_batches)
                 audit = audit_train_eval_seed_disjointness(
                     rep['data_seeds'], eval_seed_band)
                 if not audit['disjoint']:
@@ -1279,6 +1521,7 @@ def run_needle_sweep(
                                  for k, v in model.state_dict().items()}, rep)
 
             state_dict, rep = trained[key]
+            seed_train_reports.append(rep)
             model = _build_needle_model(cfg, tokenizer)
             model.load_state_dict(state_dict)
             res = evaluate_needle_recall(
@@ -1290,6 +1533,7 @@ def run_needle_sweep(
                 device=device,
                 quant_spec=cfg.quant_spec,
                 dtype=torch_dtype,
+                max_error_examples=max_error_examples,
             )
             res['seed'] = seed
             per_seed_results.append(res)
@@ -1322,6 +1566,62 @@ def run_needle_sweep(
         ctrl_mean = sum(ctrl_accs) / len(ctrl_accs) if ctrl_accs else 0.0
         diffs = [a - c for a, c in zip(accs, ctrl_accs)]
         paired = summarize_paired(diffs) if len(diffs) >= 2 else None
+
+        # Training-curve / bad-case rollup. All per-seed reports come from
+        # the SAME cached trained weights used for this row (quantization
+        # is inference-time here), so the diagnosis applies to every quant
+        # cell of the architecture without retraining.
+        verdict_counts: dict = OrderedDict()
+        for rep_i in seed_train_reports:
+            v = (rep_i.get('curve_diagnosis') or {}).get('verdict')
+            key = v if v is not None else 'not_monitored'
+            verdict_counts[key] = verdict_counts.get(key, 0) + 1
+        train_reports = []
+        for seed_i, rep_i in zip(seeds, seed_train_reports):
+            train_reports.append({
+                'seed': int(seed_i),
+                'initial_loss': rep_i.get('initial_loss'),
+                'final_loss': rep_i.get('final_loss'),
+                'min_loss': rep_i.get('min_loss'),
+                'last10_mean_loss': rep_i.get('last10_mean_loss'),
+                'val_every': rep_i.get('val_every', 0),
+                'val_history': rep_i.get('val_history') or [],
+                'curve_diagnosis': rep_i.get('curve_diagnosis'),
+                'generalization_gap': rep_i.get('generalization_gap'),
+                'best_val': rep_i.get('best_val'),
+                'early_stopping_summary': rep_i.get(
+                    'early_stopping_summary'),
+                'validation_protocol': rep_i.get('validation_protocol'),
+            })
+
+        ea_rows = [r for r in per_seed_results if r.get('error_analysis')]
+        error_aggregate = None
+        if ea_rows:
+            pooled: dict = OrderedDict()
+            n_samples = n_wrong = 0
+            for r in ea_rows:
+                ea = r['error_analysis']
+                n_samples += int(ea.get('n_samples', 0))
+                n_wrong += int(ea.get('n_wrong', 0))
+                for c, v in (ea.get('categories') or {}).items():
+                    acc = pooled.setdefault(c, {'count': 0})
+                    acc['count'] += int(v.get('count', 0))
+            for v in pooled.values():
+                v['rate_of_wrong'] = (v['count'] / n_wrong) if n_wrong else 0.0
+            worst = min(ea_rows, key=lambda r: r.get('accuracy') or 0.0)
+            error_aggregate = {
+                'n_seeds': len(ea_rows),
+                'n_samples': n_samples,
+                'n_wrong': n_wrong,
+                'error_rate': (n_wrong / n_samples) if n_samples else None,
+                'pooled_categories': pooled,
+                'representative_seed': worst.get('seed'),
+                'representative_examples': worst['error_analysis'].get(
+                    'examples'),
+                'note': ('Wrong full-answer samples on held-out sequences; '
+                         'examples come from the lowest-accuracy seed, '
+                         'counts are pooled over seeds.'),
+            }
 
         state = state_meas.get(_arch_key(cfg))
         if state is None:
@@ -1380,6 +1680,21 @@ def run_needle_sweep(
             'train_min_loss': rep['min_loss'],
             'train_last10_mean_loss': rep['last10_mean_loss'],
             'train_data_protocol': rep['data_protocol'],
+            # Held-out monitoring: curve shape (not just final loss),
+            # early-stopping regret, and full per-seed val histories.
+            'train_curve_verdicts': dict(verdict_counts),
+            'train_curve_diagnosis': (
+                seed_train_reports[-1].get('curve_diagnosis')
+                if seed_train_reports else None),
+            'train_generalization_gap': (
+                seed_train_reports[-1].get('generalization_gap')
+                if seed_train_reports else None),
+            'train_val_regret_from_best': (
+                seed_train_reports[-1].get('val_loss_regret_from_best')
+                if seed_train_reports else None),
+            'train_reports': train_reports,
+            # Bad cases: pooled category mix + worst-seed examples.
+            'error_analysis': error_aggregate,
             # Full-answer metric + dispersion/significance vs the control.
             'accuracy_mean': mean_acc,
             'accuracy_std': sd_acc,
@@ -1818,6 +2133,14 @@ def main():
                         help='training geometry: needle position')
     parser.add_argument('--train-batch-size', type=int, default=4)
     parser.add_argument('--train-lr', type=float, default=3e-3)
+    parser.add_argument('--val-every', type=int, default=None,
+                        help='held-out validation interval in optimizer '
+                             'steps (default: train_steps // 4; 0 disables)')
+    parser.add_argument('--val-batches', type=int, default=1,
+                        help='held-out validation sequences per checkpoint')
+    parser.add_argument('--max-error-examples', type=int, default=1,
+                        help='wrong samples retained per bad-case category '
+                             '(0 disables the per-row error report)')
     parser.add_argument('--eval-batch-size', type=int, default=4)
     parser.add_argument('--eval-batches', type=int, default=None,
                         help='held-out evaluation batches per cell')
@@ -1925,7 +2248,10 @@ def main():
         train_needle_pos=train_needle_pos,
         train_steps=train_steps,
         train_batch_size=args.train_batch_size,
-        train_lr=args.train_lr)
+        train_lr=args.train_lr,
+        val_every=args.val_every,
+        val_batches=args.val_batches,
+        max_error_examples=args.max_error_examples)
 
     # QAT probe
     qat_rows = []
