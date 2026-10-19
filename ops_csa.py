@@ -703,6 +703,42 @@ def _qk_normalize_(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
 _TOPK_SELECT_CHUNK_ELEMS = 1 << 22
 
 
+# Path-choice heuristic for ``_canonical_topk_indices``: while the arrays
+# are small the stable sort's lower constant wins (one optimized kernel vs
+# ``kthvalue`` + masks + ``nonzero`` + a small argsort); past this element
+# count the O(n) boundary path wins and the gap grows with ``n``. CPU
+# medians (16 slots, single call, rows x n_blocks): sort is faster at
+# (1, 2048) by 1.8x and at (8, 256) by 2x; the boundary path is faster at
+# (2, 2048) by 2.1x, (1, 4096) by 2.8x, and 3-11x from ~1e4 elements on.
+_TOPK_SORT_MAX_ELEMS = 2048
+
+
+def _boundary_selected_mask(blk: torch.Tensor, s: int) -> torch.Tensor:
+    """Boolean selection mask of the canonical top-``s`` of each row of ``blk``.
+
+    Shared body of :func:`_canonical_topk_indices`'s boundary path: one
+    ``kthvalue`` supplies the S-th largest score (the boundary value), then
+    boolean/comparison masks pick every entry strictly above it plus the
+    smallest-index boundary ties needed to fill the ``s`` slots. Exactly
+    ``s`` entries are selected per row whenever ``blk`` contains no NaNs
+    (NaNs lose both comparisons, so a NaN at the boundary under-fills — the
+    caller detects that with a row-count check and re-runs on a NaN-free
+    copy).
+    """
+    n = blk.shape[-1]
+    boundary = torch.kthvalue(
+        blk, n - s + 1, dim=-1, keepdim=True).values
+    strictly_above = blk > boundary
+    n_above = strictly_above.sum(dim=-1, keepdim=True)
+    at_boundary = blk == boundary
+    # Fill the remaining slots with the SMALLEST indices tied at the
+    # boundary (the canonical rule). Explicit ``dtype=torch.int32``: a bool
+    # cumsum would promote to int64.
+    tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
+    fill_ties = at_boundary & (tie_rank <= (s - n_above))
+    return strictly_above | fill_ties
+
+
 def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     """Top-k indices with a deterministic, shape-independent tie-break.
 
@@ -719,63 +755,90 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     output stopped being a function of the model's scores alone.
 
     This selector makes the selection a pure function of the score vector
-    by breaking ties on ASCENDING block index. Cost stays O(n), like
-    ``torch.topk``: one ``topk`` call supplies the S-th largest score
-    (the boundary value), then boolean/comparison masks pick the entries
-    strictly above the boundary plus the smallest-index boundary ties
-    needed to fill the S slots. No full sort is performed.
+    by breaking ties on ASCENDING block index. The returned slots reproduce
+    ``torch.topk``'s score-descending order (stable, so ties keep the
+    ascending-index rule) and entries selected at ``-inf`` (fewer than
+    ``k`` finite scores available) are reported as ``-1`` (invalid slot),
+    matching the historical contract. ``k`` may exceed the score count; the
+    caller pads the result.
 
-    The returned slots reproduce ``torch.topk``'s score-descending order
-    (stable, so ties keep the ascending-index rule) and entries selected
-    at ``-inf`` (fewer than ``k`` finite scores available) are reported as
-    ``-1`` (invalid slot), matching the historical contract. ``k`` may
-    exceed the score count; the caller pads the result.
+    Path selection and cost
+    -----------------------
+    Two interchangeable kernels produce the identical canonical rule, and
+    the dispatch between them is a pure COST heuristic (both paths are
+    covered by the same parity tests, so the choice cannot change any
+    result):
+
+    * the stable descending sort, whose output IS the canonical rule
+      (score-descending, ties ascending-index) — used for dense selections
+      (``2*s >= n``, where nearly every entry is selected) and for small
+      arrays (``rows * n <= _TOPK_SORT_MAX_ELEMS``), where its lower
+      constant beats the boundary machinery;
+    * the ``O(n)`` boundary path (:func:`_boundary_selected_mask`) —
+      ``kthvalue`` plus a few vectorized passes, no sort — used for sparse
+      selections on larger arrays, INCLUDING the single-query-per-step
+      decode shape once the block count exceeds the same element budget.
+      Decode used to always take the sort path because its output *is*
+      canonical, but at long context that made the per-token step pay
+      ``O(n_blocks log n_blocks)`` inside the lightning indexer: measured
+      on CPU with 16 slots, the boundary path is 2.8x faster at
+      ``n_blocks = 4096`` (``T = 64K`` at ``m = 16``), 6.3x at 8192 and
+      8.8x at 16384, which is exactly the regime CSA exists for.
+
+    Non-finite scores
+    -----------------
+    NaNs are UNSELECTABLE: a NaN score never occupies a returned slot (the
+    slot becomes ``-1`` when the row runs out of selectable entries), so a
+    NaN anywhere in the score tensor can neither crash the selector nor
+    silently occupy a real block index (the historical split behaviour: the
+    single-row sort path selected NaN indices, while the multi-row boundary
+    path raised ``RuntimeError`` on an under-filled ``nonzero`` reshape).
+    ``-inf`` entries keep the documented "selected at ``-inf`` -> ``-1``"
+    contract, and a NaN competes as ``-inf`` for the boundary/tie rules.
     """
     n = scores.shape[-1]
     s = min(k, n)
     if s == 0:
         return scores.new_zeros(*scores.shape[:-1], 0, dtype=torch.long)
-    # Fast path where one stable descending sort IS the canonical rule: the
-    # sort emits entries score-descending, ties ascending-index, and masking
-    # ``-inf`` selections to ``-1`` matches the contract. It is used for the
-    # per-step decode shape (a single score row per batch element) and for
-    # dense selections (``s >= n/2``); otherwise the O(n) boundary path
-    # below applies.
-    if (scores.dim() >= 2 and scores.shape[-2] == 1) or 2 * s >= n:
-        order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :s]
-        values = scores.gather(-1, order)
-        return order.masked_fill(torch.isinf(values), -1)
-    # Boundary path, processed in chunks of flattened leading rows so the
-    # per-entry boolean / int32 masks below stay bounded. Every operation
-    # here is row-wise (``torch.topk``'s S-th largest value is a per-row
-    # order statistic, independent of how rows are grouped), so the chunk
-    # size cannot change any selection.
     row_shape = scores.shape[:-1]
     rows_total = 1
     for d in row_shape:
         rows_total *= d
+    # Dense selections and small arrays: one stable descending sort IS the
+    # canonical rule (see docstring for why this split is cost-only).
+    if 2 * s >= n or rows_total * n <= _TOPK_SORT_MAX_ELEMS:
+        order = torch.sort(
+            scores, dim=-1, descending=True, stable=True).indices[..., :s]
+        values = scores.gather(-1, order)
+        if bool(torch.isnan(values).any()):
+            # NaN scores must be unselectable (see docstring). Checking the
+            # gathered values — not the full score tensor — keeps the
+            # finite-input hot path free of an ``O(n)`` NaN scan; this
+            # branch only runs when a NaN actually entered the top-s slots.
+            safe = scores.masked_fill(torch.isnan(scores), float('-inf'))
+            order = torch.sort(
+                safe, dim=-1, descending=True, stable=True).indices[..., :s]
+            values = safe.gather(-1, order)
+        return order.masked_fill(torch.isinf(values), -1)
+    # Boundary path, processed in chunks of flattened leading rows so the
+    # per-entry boolean / int32 masks below stay bounded. Every operation
+    # here is row-wise (``kthvalue``'s S-th largest value is a per-row
+    # order statistic, independent of how rows are grouped), so the chunk
+    # size cannot change any selection.
     flat = scores.reshape(rows_total, n)
     chunk = max(1, _TOPK_SELECT_CHUNK_ELEMS // max(1, n))
     out = flat.new_empty(rows_total, s, dtype=torch.long)
     for lo in range(0, rows_total, chunk):
         hi = min(rows_total, lo + chunk)
         blk = flat[lo:hi]
-        # S-th largest score; ties exactly at this boundary are resolved
-        # below. ``kthvalue`` (the (n-s+1)-th smallest) returns only one
-        # value + index per row instead of ``topk``'s [rows, s] pair.
-        boundary = torch.kthvalue(
-            blk, n - s + 1, dim=-1, keepdim=True).values
-        strictly_above = blk > boundary
-        n_above = strictly_above.sum(dim=-1, keepdim=True)
-        at_boundary = blk == boundary
-        # Fill the remaining slots with the SMALLEST indices tied at the
-        # boundary (the canonical rule). Exactly `s` entries are selected
-        # per row (n_above + boundary ties >= s by the definition of the
-        # boundary). Explicit ``dtype=torch.int32``: a bool cumsum would
-        # promote to int64.
-        tie_rank = at_boundary.cumsum(dim=-1, dtype=torch.int32)
-        fill_ties = at_boundary & (tie_rank <= (s - n_above))
-        selected = strictly_above | fill_ties
+        selected = _boundary_selected_mask(blk, s)
+        # A NaN that reaches the boundary makes both comparisons False and
+        # under-fills the row. Re-run on a NaN-free copy (NaN -> -inf, so
+        # the canonical tie rule applies and the slot count is exact); the
+        # check itself is one small per-row reduction on the hot path.
+        if bool((selected.sum(dim=-1) < s).any()):
+            blk = blk.masked_fill(torch.isnan(blk), float('-inf'))
+            selected = _boundary_selected_mask(blk, s)
         # With exactly `s` selected entries per row, the row-major nonzero
         # coordinates group into [chunk_rows, s] with ascending indices per
         # row. ``as_tuple=True`` returns just the coordinate vectors, so

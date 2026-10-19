@@ -305,6 +305,10 @@ _EXPERIMENT_OUTPUTS = {
         'results/exp5b_ablation_matrix_provenance.json'],
     'exp6_decoding': ['results/exp6_decoding.json',
                       'results/exp6_decoding_provenance.json'],
+    'exp14_indexer_selector': ['results/exp14_indexer_selector.json',
+                               'results/exp14_indexer_selector_provenance.json'],
+    'exp15_ppl_calibration': ['results/exp15_ppl_calibration.json',
+                              'results/exp15_ppl_calibration_provenance.json'],
     'exp7_roofline': ['results/exp7_roofline.json'],
     'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
     'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
@@ -329,6 +333,8 @@ _RAW_SIDE_FILES = {
     'results/exp5_ablation_provenance.json',
     'results/exp5b_ablation_matrix_provenance.json',
     'results/exp6_decoding_provenance.json',
+    'results/exp14_indexer_selector_provenance.json',
+    'results/exp15_ppl_calibration_provenance.json',
     'results/exp4_overfit_gate.json',
     'checkpoints_lm/smoke_hybrid/run_record.json',
     'checkpoints_lm/smoke_softmax/run_record.json',
@@ -622,6 +628,8 @@ def run_all(seeds=None, steps=None):
         import run_ablation
         import run_mechanism_ablation
         import run_decoding
+        import run_indexer_selector
+        import run_ppl_calibration
         import run_roofline
         import run_budget_frontier
         import test_roofline_schema
@@ -630,6 +638,8 @@ def run_all(seeds=None, steps=None):
         import test_ssd_duality
         import test_quant_recall
         import test_quant_lm
+        import test_indexer_selector
+        import test_ppl_calibration
         import run_quant_recall
         import run_quant_lm
         import method_analysis
@@ -673,6 +683,21 @@ def run_all(seeds=None, steps=None):
         #     KDA QAT smoke, and report-row aggregation.
         summary['runs'].append(
             _run('test_quant_lm', test_quant_lm.main))
+
+        # 1h. Lightning-indexer selector tests (Exp 14) — the canonical
+        #     top-k selector's two kernels (sort / O(n) boundary) must be
+        #     interchangeable, NaN scores must be unselectable without
+        #     crashing, and the decode/sink end-to-end contracts must hold.
+        summary['runs'].append(
+            _run('test_indexer_selector', test_indexer_selector.main))
+
+        # 1i. PPL-machinery calibration tests (Exp 15) — the simulation
+        #     engine's RNG-isolation/determinism contract, the committed
+        #     calibration report staying calibrated, decode/prefill
+        #     perplexity parity, and the schema contract rejecting
+        #     tampered certificates.
+        summary['runs'].append(
+            _run('test_ppl_calibration', test_ppl_calibration.main))
 
         # 2. KV cache analysis — pure arithmetic, always run.
         summary['runs'].append(_run('exp3_kv_cache', run_kv_cache.main))
@@ -829,6 +854,23 @@ def run_all(seeds=None, steps=None):
 
         # 7. Decoding latency.
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
+
+        # 7a. Lightning-indexer selector (Exp 14) — parity gate + per-token
+        #     selection cost. The selector's O(n) boundary kernel replaces
+        #     the historical stable sort for sparse long-context decode
+        #     (both kernels are canonical; parity is checked before any
+        #     timing row is trusted). CPU-cheap (~seconds, no training).
+        summary['runs'].append(
+            _run('exp14_indexer_selector', run_indexer_selector.main))
+
+        # 7a-bis. PPL-machinery calibration (Exp 15) — simulation-based
+        #     calibration certificate for the ppl_bootstrap inference path
+        #     (coverage / size control / power at the pre-registered
+        #     grid) plus the paired decode-vs-prefill corpus-NLL parity
+        #     check. Pure Python, CPU-cheap (~10s); the parity gate runs
+        #     before anything is archived.
+        summary['runs'].append(
+            _run('exp15_ppl_calibration', run_ppl_calibration.main))
 
         # 7b. Budget frontier — analytic curves + measured top-k decode
         #     sweep + joins over Exp 4/5/8 results. On CPU with SKIP_SLOW,

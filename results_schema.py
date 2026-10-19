@@ -678,6 +678,443 @@ def _validate_precision_sweep_rows(rows: list, metadata: dict) -> list[str]:
     return out
 
 
+# ``run_indexer_selector.py`` (Exp 14) row sections. The experiment file
+# is a cost + safety record for ``ops_csa._canonical_topk_indices``: the
+# parity gate must be CLEAN (any mismatch or crash refuses archival) and
+# every timing row must be finite, positive, and tagged with the dispatch
+# branch it exercised, so a future edit that silently changes the
+# selection kernel fails the contract instead of archiving plausible
+# numbers.
+_EXP14_SECTIONS = frozenset({
+    'parity', 'selector_latency', 'indexer_latency', 'sink_guard'})
+_EXP14_DISPATCH = frozenset({'sort', 'boundary', 'empty'})
+_EXP14_TIMING_FIELDS = {
+    'selector_latency': ('shipped_ms', 'historical_sort_ms',
+                         'torch_topk_ms'),
+    'indexer_latency': ('indexer_shipped_ms', 'indexer_historical_sort_ms',
+                        'step_shipped_ms', 'step_historical_sort_ms',
+                        'selector_shipped_ms', 'selector_historical_sort_ms'),
+}
+
+
+@register_row_contract('exp14_indexer_selector')
+def _validate_exp14_rows(rows: list, metadata: dict) -> list[str]:
+    """Indexer-selector rows: clean parity gate + finite positive timings.
+
+    Checks, per section:
+
+    * ``parity``: positive ``n_cases`` and EXACTLY zero ``mismatches`` /
+      ``crashes`` -- a non-zero parity row means the shipped selector
+      disagrees with the reference or crashed, exactly the failure the
+      experiment exists to catch;
+    * ``selector_latency`` / ``indexer_latency``: positive integer
+      geometry, a ``dispatch`` tag in {'sort', 'boundary', 'empty'},
+      finite positive medians, and ``speedup == historical / shipped``
+      (the two recorded medians must reproduce the recorded ratio);
+    * ``sink_guard``: ``finite`` is True and the recorded max-abs values
+      are finite and >= 0 (the NaN / degenerate-config guard).
+    """
+    out: list[str] = []
+    seen: set = set()
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        section = row.get('section')
+        if section not in _EXP14_SECTIONS:
+            out.append(f'{where}: section={section!r} not in '
+                       f'{sorted(_EXP14_SECTIONS)}')
+            continue
+        if section == 'parity':
+            case = row.get('case')
+            if not isinstance(case, str) or not case:
+                out.append(
+                    f"{where}: 'case' must be a non-empty string, got {case!r}")
+            if not _positive_int(row.get('n_cases')):
+                out.append(f"{where}: 'n_cases' must be a positive int, "
+                           f"got {row.get('n_cases')!r}")
+            for key in ('mismatches', 'crashes'):
+                value = row.get(key)
+                if value != 0:
+                    out.append(f'{where}: {key}={value!r} must be exactly 0 '
+                               f'(the parity gate is the experiment)')
+            key = ('parity', case)
+        elif section in ('selector_latency', 'indexer_latency'):
+            for fld in ('n_blocks', 'topk'):
+                if not _positive_int(row.get(fld)):
+                    out.append(f"{where}: {fld!r} must be a positive int, "
+                               f"got {row.get(fld)!r}")
+            if section == 'indexer_latency' \
+                    and not _positive_int(row.get('T')):
+                out.append(f"{where}: 'T' must be a positive int, "
+                           f"got {row.get('T')!r}")
+            if section == 'selector_latency' \
+                    and not _positive_int(row.get('rows')):
+                out.append(f"{where}: 'rows' must be a positive int, "
+                           f"got {row.get('rows')!r}")
+            dispatch = row.get('dispatch')
+            if dispatch not in _EXP14_DISPATCH:
+                out.append(f'{where}: dispatch={dispatch!r} not in '
+                           f'{sorted(_EXP14_DISPATCH)}')
+            for fld in _EXP14_TIMING_FIELDS[section]:
+                value = row.get(fld)
+                if not (_finite_number(value) and float(value) > 0):
+                    out.append(f"{where}: {fld!r} must be finite and > 0, "
+                               f'got {value!r}')
+            for sp, (hist, shipped) in {
+                'speedup_vs_sort': ('historical_sort_ms', 'shipped_ms'),
+                'indexer_speedup': ('indexer_historical_sort_ms',
+                                    'indexer_shipped_ms'),
+                'step_speedup': ('step_historical_sort_ms',
+                                 'step_shipped_ms'),
+            }.items():
+                if sp not in row:
+                    continue
+                value = row.get(sp)
+                if not (_finite_number(value) and float(value) > 0):
+                    out.append(f"{where}: {sp!r} must be finite and > 0, "
+                               f'got {value!r}')
+                a, b = row.get(hist), row.get(shipped)
+                if _finite_number(a) and _finite_number(b) and float(b) > 0:
+                    want = float(a) / float(b)
+                    if abs(float(value) - want) > 1e-6 * max(1.0, want):
+                        out.append(f'{where}: {sp}={value!r} != '
+                                   f'{hist}/{shipped}={want!r}')
+            key = ('selector_latency', row.get('rows'), row.get('n_blocks')) \
+                if section == 'selector_latency' \
+                else ('indexer_latency', row.get('T'))
+        else:  # sink_guard
+            case = row.get('case')
+            if not isinstance(case, str) or not case:
+                out.append(
+                    f"{where}: 'case' must be a non-empty string, got {case!r}")
+            if row.get('finite') is not True:
+                out.append(f"{where}: 'finite' must be True, got "
+                           f"{row.get('finite')!r}")
+            for fld in ('max_abs_diff_vs_naive', 'output_max_abs'):
+                value = row.get(fld)
+                if not (_finite_number(value) and float(value) >= 0):
+                    out.append(f"{where}: {fld!r} must be finite and >= 0, "
+                               f'got {value!r}')
+            key = ('sink_guard', case)
+        if key in seen:
+            out.append(f'{where}: duplicate key {key!r}')
+        seen.add(key)
+    return out
+
+
+# ``run_ppl_calibration.py`` (Exp 15) row sections: the calibration
+# certificate for the perplexity inference machinery. The contract pins
+# the ARITHMETIC of every rate (counts -> rate -> bias/verdict) and of
+# every pre-registered bound, so a future edit that widens a scenario
+# tolerance or ships an uncalibrated report cannot be silently archived
+# as a green artifact. The decode/prefill row's pass flags must match the
+# recorded measurements and tolerances (the effect-size gate, not the
+# p-value, is the contract).
+_EXP15_SECTIONS = frozenset({'coverage', 'paired', 'decode_prefill'})
+_EXP15_PAIRED_CHECKS = frozenset({'size', 'power'})
+
+
+@register_row_contract('exp15_ppl_calibration')
+def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
+    """Calibration rows: self-consistent rates, bounds and verdicts.
+
+    Checks, per section:
+
+    * ``coverage``: positive unit/replicate counts, ``alpha`` in (0, 1),
+      ``n_covered`` in ``[0, n_reps]`` with ``coverage``, ``nominal``,
+      ``se`` and ``bias`` reproduced from the counts, positive ``tol``,
+      and a ``{'calibrated', 'biased'}`` verdict consistent with
+      ``|bias| <= tol``;
+    * ``paired``: ``{'size', 'power'}`` check tag (size requires
+      ``delta == 0``, power ``delta > 0``), ``n_significant`` in
+      ``[0, n_reps]``, ``rejection_rate`` / ``se`` reproduced from the
+      counts, a ``threshold`` in (0, 1], and ``meets`` / ``verdict``
+      consistent with the one-sided comparison the check demands;
+    * ``decode_prefill``: positive geometry/token counts, finite
+      non-negative per-window divergence, positive finite PPLs, an
+      ascending finite CI, ``p_value`` in [0, 1], and ``parity_ok`` /
+      ``effect_ok`` flags exactly reproducing the recorded tolerances
+      (the p-value must NOT gate the pass flags).
+    """
+    out: list[str] = []
+    seen: set = set()
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        section = row.get('section')
+        if section not in _EXP15_SECTIONS:
+            out.append(f'{where}: section={section!r} not in '
+                       f'{sorted(_EXP15_SECTIONS)}')
+            continue
+        if section == 'coverage':
+            if not _positive_int(row.get('n_units')):
+                out.append(f"{where}: 'n_units' must be a positive int, "
+                           f"got {row.get('n_units')!r}")
+            alpha = row.get('alpha')
+            if not (_finite_number(alpha) and 0.0 < float(alpha) < 1.0):
+                out.append(f"{where}: 'alpha' must be in (0, 1), got {alpha!r}")
+            for fld in ('n_boot', 'n_reps'):
+                if not _positive_int(row.get(fld)):
+                    out.append(f"{where}: {fld!r} must be a positive int, "
+                               f"got {row.get(fld)!r}")
+            n_reps = row.get('n_reps')
+            n_covered = row.get('n_covered')
+            if not (_positive_int(n_reps)
+                    and isinstance(n_covered, int)
+                    and 0 <= n_covered <= int(n_reps)):
+                out.append(f"{where}: 'n_covered' must be an int in "
+                           f"[0, n_reps], got {n_covered!r}")
+            coverage = row.get('coverage')
+            nominal = row.get('nominal')
+            bias = row.get('bias')
+            se = row.get('se')
+            tol = row.get('tol')
+            if _positive_int(row.get('n_reps')) and \
+                    isinstance(n_covered, int) and 0 <= n_covered <= n_reps:
+                want = n_covered / n_reps
+                if not (_finite_number(coverage)
+                        and abs(float(coverage) - want) < 1e-9):
+                    out.append(f"{where}: coverage={coverage!r} != "
+                               f'n_covered/n_reps={want!r}')
+            if _finite_number(alpha) and _finite_number(coverage):
+                if not (_finite_number(nominal)
+                        and abs(float(nominal) - (1.0 - float(alpha))) < 1e-12):
+                    out.append(f"{where}: nominal={nominal!r} != 1-alpha")
+                if not (_finite_number(bias)
+                        and abs(float(bias) - (float(coverage)
+                                               - (1.0 - float(alpha))))
+                        < 1e-9):
+                    out.append(f"{where}: bias={bias!r} != coverage - nominal")
+            if (_finite_number(coverage) and _positive_int(n_reps)):
+                want_se = math.sqrt(max(0.0, float(coverage)
+                                        * (1.0 - float(coverage))
+                                        / int(n_reps)))
+                if not (_finite_number(se)
+                        and abs(float(se) - want_se) < 1e-9):
+                    out.append(f"{where}: se={se!r} != binomial SE "
+                               f'{want_se!r}')
+            if not (_finite_number(tol) and float(tol) > 0.0):
+                out.append(f"{where}: 'tol' must be finite and > 0, "
+                           f"got {tol!r}")
+            elif _positive_int(row.get('n_units')):
+                want_tol = 0.05 if int(row['n_units']) >= 32 else 0.08
+                if abs(float(tol) - want_tol) > 1e-12:
+                    out.append(f'{where}: tol={tol!r} != pre-registered '
+                               f'{want_tol!r} for n_units='
+                               f"{row['n_units']!r}")
+            verdict = row.get('verdict')
+            if verdict not in ('calibrated', 'biased'):
+                out.append(f"{where}: verdict={verdict!r} not in "
+                           f"['calibrated', 'biased']")
+            elif _finite_number(bias) and _finite_number(tol):
+                want = ('calibrated'
+                        if abs(float(bias)) <= float(tol) else 'biased')
+                if verdict != want:
+                    out.append(f'{where}: verdict={verdict!r} contradicts '
+                               f'bias={bias!r} vs tol={tol!r}')
+            key = ('coverage', row.get('n_units'), row.get('alpha'))
+        elif section == 'paired':
+            check = row.get('check')
+            if check not in _EXP15_PAIRED_CHECKS:
+                out.append(f'{where}: check={check!r} not in '
+                           f'{sorted(_EXP15_PAIRED_CHECKS)}')
+            if not _positive_int(row.get('n_units')):
+                out.append(f"{where}: 'n_units' must be a positive int, "
+                           f"got {row.get('n_units')!r}")
+            alpha = row.get('alpha')
+            if not (_finite_number(alpha) and 0.0 < float(alpha) < 1.0):
+                out.append(f"{where}: 'alpha' must be in (0, 1), got {alpha!r}")
+            delta = row.get('delta')
+            if not (_finite_number(delta) and float(delta) >= 0.0):
+                out.append(f"{where}: 'delta' must be finite and >= 0, "
+                           f"got {delta!r}")
+            elif check == 'size' and float(delta) != 0.0:
+                out.append(f'{where}: size control requires delta == 0, '
+                           f'got {delta!r}')
+            elif check == 'power' and float(delta) <= 0.0:
+                out.append(f'{where}: power scenario requires delta > 0, '
+                           f'got {delta!r}')
+            noise = row.get('noise_sd')
+            if not (_finite_number(noise) and float(noise) > 0.0):
+                out.append(f"{where}: 'noise_sd' must be finite and > 0, "
+                           f"got {noise!r}")
+            for fld in ('n_boot', 'n_reps'):
+                if not _positive_int(row.get(fld)):
+                    out.append(f"{where}: {fld!r} must be a positive int, "
+                               f"got {row.get(fld)!r}")
+            n_reps = row.get('n_reps')
+            n_sig = row.get('n_significant')
+            if not (_positive_int(n_reps) and isinstance(n_sig, int)
+                    and 0 <= n_sig <= int(n_reps)):
+                out.append(f"{where}: 'n_significant' must be an int in "
+                           f"[0, n_reps], got {n_sig!r}")
+            rate = row.get('rejection_rate')
+            if _positive_int(n_reps) and isinstance(n_sig, int) \
+                    and 0 <= n_sig <= n_reps:
+                want = n_sig / n_reps
+                if not (_finite_number(rate)
+                        and abs(float(rate) - want) < 1e-9):
+                    out.append(f'{where}: rejection_rate={rate!r} != '
+                               f'n_significant/n_reps={want!r}')
+                want_se = math.sqrt(max(0.0, want * (1.0 - want) / n_reps))
+                if not (_finite_number(row.get('se'))
+                        and abs(float(row['se']) - want_se) < 1e-9):
+                    out.append(f"{where}: se={row.get('se')!r} != "
+                               f'binomial SE {want_se!r}')
+            threshold = row.get('threshold')
+            if not (_finite_number(threshold)
+                    and 0.0 < float(threshold) <= 1.0):
+                out.append(f"{where}: 'threshold' must be in (0, 1], "
+                           f"got {threshold!r}")
+            # The pre-registered bound must be RECORDED next to the rate
+            # and must reproduce the threshold exactly: a future edit that
+            # quietly widens a tolerance changes the artifact and fails
+            # here instead of yielding a greener certificate.
+            if check == 'size':
+                tol = row.get('tol')
+                if not (_finite_number(tol) and float(tol) > 0.0):
+                    out.append(f"{where}: size control needs a finite "
+                               f"positive 'tol', got {tol!r}")
+                else:
+                    if _positive_int(row.get('n_units')):
+                        want_tol = (0.06 if int(row['n_units']) >= 32
+                                    else 0.10)
+                        if abs(float(tol) - want_tol) > 1e-12:
+                            out.append(f'{where}: size tol={tol!r} != '
+                                       f'pre-registered {want_tol!r} for '
+                                       f"n_units={row['n_units']!r}")
+                    if _finite_number(alpha) and _finite_number(threshold) \
+                            and not (abs(float(threshold)
+                                         - (float(alpha) + float(tol)))
+                                     < 1e-12):
+                        out.append(f'{where}: threshold={threshold!r} != '
+                                   f'alpha + tol='
+                                   f'{float(alpha) + float(tol)!r}')
+            else:
+                floor = row.get('min_power')
+                if not (_finite_number(floor)
+                        and 0.0 < float(floor) <= 1.0):
+                    out.append(f"{where}: power scenario needs 'min_power' "
+                               f"in (0, 1], got {floor!r}")
+                else:
+                    if _finite_number(delta):
+                        want_floor = (0.55 if float(delta) <= 0.15 else 0.90)
+                        if abs(float(floor) - want_floor) > 1e-12:
+                            out.append(f'{where}: min_power={floor!r} != '
+                                       f'pre-registered {want_floor!r} '
+                                       f'for delta={delta!r}')
+                    if _finite_number(threshold) \
+                            and not (abs(float(threshold) - float(floor))
+                                     < 1e-12):
+                        out.append(f'{where}: threshold={threshold!r} != '
+                                   f'min_power={floor!r}')
+            meets = row.get('meets')
+            if not isinstance(meets, bool):
+                out.append(f"{where}: 'meets' must be a bool, got {meets!r}")
+            elif _finite_number(rate) and _finite_number(threshold):
+                want = (float(rate) <= float(threshold) if check == 'size'
+                        else float(rate) >= float(threshold))
+                if meets != want:
+                    out.append(f'{where}: meets={meets!r} contradicts '
+                               f'rate={rate!r} vs threshold={threshold!r}')
+            verdict = row.get('verdict')
+            allowed = ('within_bound', 'liberal') if check == 'size' \
+                else ('met', 'below_floor')
+            if verdict not in allowed:
+                out.append(f'{where}: verdict={verdict!r} not in '
+                           f'{sorted(allowed)}')
+            elif isinstance(meets, bool):
+                want = allowed[0] if meets else allowed[1]
+                if verdict != want:
+                    out.append(f'{where}: verdict={verdict!r} contradicts '
+                               f'meets={meets!r}')
+            key = ('paired', row.get('n_units'), row.get('alpha'),
+                   row.get('delta'), check)
+        else:  # decode_prefill
+            for fld in ('n_windows', 'seq_len', 'n_tokens'):
+                if not _positive_int(row.get(fld)):
+                    out.append(f"{where}: {fld!r} must be a positive int, "
+                               f"got {row.get(fld)!r}")
+            for fld in ('max_window_nll_diff', 'window_tol_nll'):
+                if not (_finite_number(row.get(fld))
+                        and float(row[fld]) >= 0.0):
+                    out.append(f"{where}: {fld!r} must be finite and >= 0, "
+                               f"got {row.get(fld)!r}")
+            for fld in ('prefill_ppl', 'decode_ppl', 'ppl_ratio'):
+                if not (_finite_number(row.get(fld))
+                        and float(row[fld]) > 0.0):
+                    out.append(f"{where}: {fld!r} must be finite and > 0, "
+                               f"got {row.get(fld)!r}")
+            if not _finite_number(row.get('delta_mean_nll')):
+                out.append(f"{where}: 'delta_mean_nll' must be finite, "
+                           f"got {row.get('delta_mean_nll')!r}")
+            ci = row.get('ci_delta_mean_nll')
+            if not (isinstance(ci, list) and len(ci) == 2
+                    and all(_finite_number(v) for v in ci)
+                    and float(ci[0]) <= float(ci[1])):
+                out.append(f"{where}: 'ci_delta_mean_nll' must be an "
+                           f'ascending finite pair, got {ci!r}')
+            ci_ratio = row.get('ci_ppl_ratio')
+            if not (isinstance(ci, list) and len(ci) == 2
+                    and all(_finite_number(v) for v in ci)):
+                pass  # already reported above
+            elif not (isinstance(ci_ratio, list) and len(ci_ratio) == 2
+                      and all(_finite_number(v) and float(v) > 0.0
+                              for v in ci_ratio)
+                      and abs(float(ci_ratio[0]) - math.exp(float(ci[0])))
+                      <= 1e-9 * max(1.0, abs(float(ci_ratio[0])))
+                      and abs(float(ci_ratio[1]) - math.exp(float(ci[1])))
+                      <= 1e-9 * max(1.0, abs(float(ci_ratio[1])))):
+                out.append(f"{where}: 'ci_ppl_ratio' must be the exponentiated "
+                           f'ci_delta_mean_nll, got {ci_ratio!r} for {ci!r}')
+            p_value = row.get('p_value')
+            if not (_finite_number(p_value) and 0.0 <= float(p_value) <= 1.0):
+                out.append(f"{where}: 'p_value' must be in [0, 1], "
+                           f"got {p_value!r}")
+            if not isinstance(row.get('significant'), bool):
+                out.append(f"{where}: 'significant' must be a bool, got "
+                           f"{row.get('significant')!r}")
+            for fld in ('parity_ok', 'effect_ok', 'finite_ok'):
+                if not isinstance(row.get(fld), bool):
+                    out.append(f"{where}: {fld!r} must be a bool, got "
+                               f"{row.get(fld)!r}")
+            wtol = row.get('window_tol_nll')
+            if (isinstance(row.get('parity_ok'), bool)
+                    and _finite_number(wtol)
+                    and _finite_number(row.get('max_window_nll_diff'))):
+                want = (float(row['max_window_nll_diff']) <= float(wtol))
+                if row['parity_ok'] != want:
+                    out.append(f'{where}: parity_ok contradicts '
+                               f'max_window_nll_diff vs window_tol_nll')
+            etol_nll = row.get('effect_tol_nll')
+            etol_ratio = row.get('effect_tol_ratio')
+            for fld, tol_val in (('effect_tol_nll', etol_nll),
+                                 ('effect_tol_ratio', etol_ratio)):
+                if not (_finite_number(tol_val) and float(tol_val) > 0.0):
+                    out.append(f"{where}: {fld!r} must be finite and > 0, "
+                               f'got {tol_val!r}')
+            if (isinstance(row.get('effect_ok'), bool)
+                    and _finite_number(etol_nll) and _finite_number(etol_ratio)
+                    and _finite_number(row.get('delta_mean_nll'))
+                    and _finite_number(row.get('ppl_ratio'))):
+                want = (abs(float(row['delta_mean_nll']))
+                        <= float(etol_nll)
+                        and abs(float(row['ppl_ratio']) - 1.0)
+                        <= float(etol_ratio))
+                if row['effect_ok'] != want:
+                    out.append(f'{where}: effect_ok contradicts delta / '
+                               f'ppl_ratio vs the recorded tolerances')
+            key = ('decode_prefill', row.get('n_windows'), row.get('seq_len'))
+        if key in seen:
+            out.append(f'{where}: duplicate key {key!r}')
+        seen.add(key)
+    return out
+
+
 def validate_rows(kind: str, rows, metadata: dict | None = None) -> list[str]:
     """Return the contract violations for ``kind``'s rows ([] = conforming).
 
