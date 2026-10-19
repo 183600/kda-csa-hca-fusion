@@ -11,20 +11,16 @@ What is pinned here
    descending sort over ``NaN -> -inf`` scores with ``-inf`` selections
    reported as ``-1``): random scores, maximal ties, ``-inf`` runs, NaN
    sprinkles, all-NaN rows, fp32 and fp64, ``k`` = 0 / > ``n``.
-2. **NaN scores are unselectable, never a crash.** The historical
-   behaviour split: the single-row sort path silently returned a NaN
-   block index (``[[nan, nan, 1.0]]`` with ``k=1`` gave ``[[0]]``), while
-   the multi-row boundary path raised ``RuntimeError`` on an under-filled
-   ``nonzero`` reshape (a NaN loses both the ``>`` and the ``==``
-   comparison, so the row selected fewer than ``s`` entries). The exact
-   hazard shapes now return well-formed ``[..., s]`` tensors that match
-   the reference, and NaN slots surface as ``-1``.
+2. **NaN scores are unselectable, never a crash.** A NaN loses both the
+   ``>`` and the ``==`` comparison, so a NaN at the boundary leaves a row
+   with fewer than ``s`` selectable entries. The hazard shapes below
+   return well-formed ``[..., s]`` tensors that match the reference, and
+   NaN slots surface as ``-1``.
 3. **The end-to-end contract is unchanged.** ``CSADecodingCache``
    stepwise decode equals full ``naive_csa`` with sink + sparse top-k +
    fully tied scores; the sink-only degenerate configuration (``win=0``,
    ``topk=0``, no completed block) is all-masked on both paths; and
-   NaN-poisoned indexer weights (which used to crash the PREFILL selector
-   for multi-row score tensors) leave both paths agreeing, finite, and
+   NaN-poisoned indexer weights leave both paths agreeing, finite, and
    with all-``-1`` selections.
 
 Run via pytest::
@@ -172,10 +168,9 @@ def test_selector_grid_matches_reference_on_both_paths():
 
 
 def test_nan_scores_are_unselectable_not_a_crash():
-    """Historical NaN hazard shapes are well-formed and reference-exact."""
-    # Multi-row sparse (boundary path): the exact geometry that used to
-    # raise ``RuntimeError: shape '[2, 1]' is invalid for input of size ...``
-    # because the NaN at the boundary lost both comparisons.
+    """NaN hazard shapes are well-formed and reference-exact."""
+    # Multi-row sparse (boundary path): the NaN at the boundary loses both
+    # comparisons, so the row has fewer than ``s`` selectable entries.
     crash = torch.tensor([
         [NAN, 5.0, 4.0, 3.0, 2.0, NAN],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -183,13 +178,12 @@ def test_nan_scores_are_unselectable_not_a_crash():
     for k in (1, 2, 5):
         got = _canonical_topk_indices(crash, k)
         _ok(
-            f'historical boundary crash is fixed (k={k})',
+            f'boundary-path NaN row matches the reference (k={k})',
             torch.equal(got, _reference(crash, k))
             and got.shape == (2, min(k, 6)),
             f'{got.tolist()}')
 
-    # Single-row NaN: the sort path used to rank NaN first and return the
-    # NaN slot (``[[nan, nan, 1.0]]`` with k=1 gave ``[[0]]``).
+    # Single-row NaN: the sort path must never select the NaN slot.
     single = torch.tensor([[NAN, NAN, 1.0]])
     got1 = _canonical_topk_indices(single, 1)
     _ok(
@@ -242,8 +236,7 @@ def test_indexer_nan_weights_multi_row_no_crash():
         idx.shape == (B, T, 3) and bool((idx == -1).all()),
         f'shape={tuple(idx.shape)}, all -1={bool((idx == -1).all())}')
 
-    # Same, at a geometry that provably runs the boundary path (the one
-    # that used to raise ``RuntimeError`` on the under-filled nonzero):
+    # Same, at a geometry that provably runs the boundary path:
     # sparse top-k and rows*n above the sort-path element budget.
     B2, T2, n2, k2 = 1, 600, 2100, 3
     shape = (B2, T2, n2)
@@ -331,9 +324,8 @@ def test_cache_decode_with_sink_sparse_ties_and_nan_weights():
 
     # (c) NaN-poisoned indexer weights: every logit is NaN, so the
     # selector must return all-``-1`` and the sparse branch contributes
-    # nothing on BOTH the full-prefill and the incremental paths (the
-    # prefill geometry and the direct boundary-path repro above cover the
-    # historical crash; here the pin is cross-path agreement + finiteness).
+    # nothing on BOTH the full-prefill and the incremental paths; the pin
+    # here is cross-path agreement + finiteness.
     o_full, o_inc = _run_cache_vs_naive(
         p, n_blocks=2, topk=2, win=0, sink=None, T=9, poison_nan=True)
     diff = (o_full - o_inc).abs().max().item()

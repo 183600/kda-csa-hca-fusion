@@ -607,9 +607,8 @@ def naive_mamba2_scan(
         y_flat[:, lo:hi] = y_slab
     # ``transpose`` after the reshape yields the target [B, T, H, D] layout
     # as a view; the single ``to`` cast then produces the output in one
-    # pass (the transpose+reshape chain used to force an extra full-precision
-    # contiguous copy first). Values are unchanged; callers that need
-    # contiguity can call ``.contiguous()`` themselves.
+    # pass. Values are unchanged; callers that need contiguity can call
+    # ``.contiguous()`` themselves.
     y = (y_flat.reshape(batch, nheads, seqlen, headdim)
          .transpose(1, 2).to(x.dtype))
     S = S_flat.reshape(batch, nheads, headdim, d_state)

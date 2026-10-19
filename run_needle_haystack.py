@@ -1108,9 +1108,7 @@ def make_quant_configs(base_configs: list[NeedleConfig], specs: list[QuantSpec])
     """Extend configs with quantization specs for PTQ sweep.
 
     The unquantized base row is KEPT for every config so the sweep has a
-    same-seed fp16/fp32 anchor to read the PTQ damage off directly. Previously
-    the base row was dropped for all recurrent memory types (i.e. always),
-    which left the sweep with quantized rows only and no baseline.
+    same-seed fp16/fp32 anchor to read the PTQ damage off directly.
     """
     configs = []
     for base in base_configs:
@@ -1179,10 +1177,7 @@ def _measure_needle_state(model: NeedleHybridLM,
                           device: str | torch.device) -> dict:
     """Measure the ACTUAL per-sequence streaming state of a trained model.
 
-    The old ``state_bytes`` was a hardcoded ``128*2*32*32`` guess that did
-    not depend on the model (wrong layer count, wrong dtype bits) and the
-    dtype column always charged the quantizer's bits even for fp16/bf16
-    rows. This helper reads the live buffers after a forward pass:
+    This helper reads the live buffers after a forward pass:
     ``_kda_state`` (the stacked recurrent memory) plus each memory layer's
     short-conv / token-shift lookback.
     """
@@ -1699,10 +1694,7 @@ def main():
     seeds = tuple(int(s) for s in args.seeds.split(',') if s.strip())
     tokenizer = _NeedleCharTokenizer()
 
-    # Explicit CLI filters override the phase defaults in BOTH modes: the
-    # ``--quick`` branch used to overwrite them unconditionally, silently
-    # ignoring ``--context-lens`` / ``--memory-types`` / ``--dtypes`` /
-    # ``--quant-*`` (so a filtered quick run evaluated unrelated configs).
+    # Explicit CLI filters override the phase defaults in BOTH modes.
     context_lens = ([int(x) for x in args.context_lens.split(',')]
                     if args.context_lens else None)
     memory_types = args.memory_types.split(',') if args.memory_types else None

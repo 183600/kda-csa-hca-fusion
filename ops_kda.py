@@ -565,19 +565,14 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     ``rows``): the per-iteration temporary is proportional to
     ``B * HV * NT * rows * BT * K`` elements, so the total work
     ``eff = B * HV * NT * BT * K`` sets the block-write bandwidth and the
-    loop's working-set pressure. The thresholds below were tuned on the
-    reference CPU harness over a grid of ``(eff, K, BT)`` cells measured
-    end-to-end: within every key width tried (``K`` from 8 to 128) the
-    optimum is a function of ``eff``, and the transient stays last-level-
-    cache resident while the sequential loop overhead is negligible, hence
-    the piecewise bands:
+    loop's working-set pressure. The piecewise bands below key the count
+    on ``eff``:
 
     * ``eff <= 16384``: 8 rows.
     * ``eff <= 32768``: 4 rows.
     * ``eff <= 131072``: 2 rows.
     * ``eff <= 262144``: 1 row.
-    * ``eff <= 524288``: 2 rows (the block write saturates the loop's
-      working set again, and paired rows vectorize better here).
+    * ``eff <= 524288``: 2 rows.
     * larger ``eff``: 1 row.
 
     The result is capped by ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``.

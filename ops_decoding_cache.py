@@ -538,7 +538,7 @@ class _SlidingWindowRingBuffer:
         #     causal-order mirror instead of allocating a fresh tensor via
         #     ``torch.cat`` on every call; the mirror is refilled only when
         #     the ring contents changed since the last fill. While a graph
-        #     is being recorded the old ``cat`` form is kept so the result
+        #     is being recorded the ``cat`` form is kept so the result
         #     stays connected to the buffer entries' autograd history.
         if self._sw_head + self._sw_len <= self.win:
             return self._buf[:, self._sw_head : self._sw_head + self._sw_len]

@@ -3078,11 +3078,10 @@ _HYPOTHESIS_STATUSES = ('supported', 'contradicted', 'not_supported',
 def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
     """Machine-readable verdicts for the pre-registered hypotheses.
 
-    The repository already records WHAT each cell was testing
-    (``TASK_HYPOTHESES`` / ``OPERATOR_HYPOTHESES``), but before this
-    function a reader had to interpret the numbers by hand. Each verdict
-    below applies a rule fixed in code, reports its evidence, and uses one
-    of five statuses:
+    The repository records WHAT each cell was testing
+    (``TASK_HYPOTHESES`` / ``OPERATOR_HYPOTHESES``). Each verdict below
+    applies a rule fixed in code, reports its evidence, and uses one of
+    five statuses:
 
       * ``supported``      — the prediction's signature is present;
       * ``contradicted``   — the falsification condition fired;
@@ -4550,9 +4549,10 @@ def main():
     #
     # "Report the gain WITH its cost": for every sweep cell, mark each op
     # as Pareto-optimal or dominated on (mean_acc maximise; parameters,
-    # wall-clock train time and per-sample inference latency minimise). A
-    # 0.5% accuracy gain at 10x cost is now visible in the record instead
-    # of requiring a cross-reference to the latency/cache experiments.
+    # wall-clock train time and per-sample inference latency minimise).
+    # Accuracy gains that come at a disproportionate cost are visible
+    # directly in the record instead of requiring a cross-reference to the
+    # latency/cache experiments.
     #
     # The cross-op claim check answers "is the winner actually better?":
     # when the best op's 95% CI overlaps another op's CI, the ranking

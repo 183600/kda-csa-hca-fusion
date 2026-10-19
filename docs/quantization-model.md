@@ -321,12 +321,13 @@ python3 run_needle_haystack.py --quick --no-qat # CI smoke run
 ## bfloat16 numerical stability (extended to CSA/HCA)
 
 The KDA delta-rule recurrence (Exp 10/11) includes three bfloat16-specific
-stabilizers in ``ops_kda_autograd.py``. This round extends the same pattern
-to CSA and HCA operators (``ops_csa.py``, ``ops_hca.py``), which also
-perform repeated softmax and attention score computations sensitive to
+stabilizers in ``ops_kda_autograd.py``. The same pattern applies to the CSA
+and HCA operators (``ops_csa.py``, ``ops_hca.py``), which also perform
+repeated softmax and attention score computations sensitive to
 bfloat16's 8-bit exponent range.
 
-Added to ``ops_csa.py`` and ``ops_hca.py`` (activate **only for bfloat16**):
+The CSA and HCA operators use the same three helpers (active **only for
+bfloat16**):
 
 1. **`_bf16_safe_softmax(logits, dim=-1)`** — clamps logits to `[-50, 50]`
    before softmax to prevent exp overflow (exp(50) ~ 5e21, well below

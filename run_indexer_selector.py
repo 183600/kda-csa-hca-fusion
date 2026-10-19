@@ -7,14 +7,11 @@ CSA's lightning indexer (DeepSeek-V4 Eq. 13-17) scores every completed
 compressed block per query and keeps the top-k. ``_canonical_topk_indices``
 makes that selection a pure function of the score vector (ties break on
 ascending block index), so prefill and incremental decode agree exactly.
-Historically it ran a full stable sort for the single-query decode shape
-("the sort's output *is* the canonical rule") and an ``O(n)`` boundary
-path (``kthvalue`` + comparison masks) only for multi-row sparse scores.
-At long context the sort made every decode step pay
-``O(n_blocks log n_blocks)`` inside the indexer — the dominant per-token
-selection cost in exactly the regime CSA exists for.
+Two interchangeable kernels implement that rule: a stable descending sort
+(whose output *is* the canonical rule) and an ``O(n)`` boundary path
+(``kthvalue`` + comparison masks) for multi-row sparse scores.
 
-``ops_csa._canonical_topk_indices`` now picks its kernel by COST only
+``ops_csa._canonical_topk_indices`` picks its kernel by COST only
 (both kernels implement the identical canonical rule; see
 ``test_indexer_selector.py``):
 
@@ -27,15 +24,14 @@ What this experiment measures
 -----------------------------
 1. ``parity``: the shipped selector against an independent sort-based
    reference over a grid that provably exercises BOTH kernels, including
-   the NaN hazard shapes that split the old behaviour (single-row silent
-   NaN selection vs multi-row ``RuntimeError``). Rows must show zero
-   mismatches and zero crashes BEFORE any timing row is trusted.
+   the NaN hazard shapes. Rows must show zero mismatches and zero crashes
+   BEFORE any timing row is trusted.
 2. ``selector_latency``: per-call median latency of the shipped selector
-   vs the historical stable-sort kernel (the pre-change decode fast path)
-   vs ``torch.topk`` over a ``rows x n_blocks`` grid.
+   vs the stable-sort kernel vs ``torch.topk`` over a ``rows x n_blocks``
+   grid.
 3. ``indexer_latency``: end-to-end ``csa_lightning_indexer`` median
-   latency at decode geometry with the shipped selector vs the historical
-   sort kernel swapped in (temporarily, restored in a ``finally``), plus
+   latency at decode geometry with the shipped selector vs the sort
+   kernel swapped in (temporarily, restored in a ``finally``), plus
    the full ``CSADecodingCache.forward_step`` step for share context.
 4. ``sink_guard``: the sink-only degenerate configuration (no window, no
    top-k, no completed block) and NaN-poisoned indexer weights must stay
@@ -232,8 +228,7 @@ def bench_parity(topk: int) -> list:
         'note': ('shipped selector == sort-based reference; both dispatch '
                  'branches exercised'),
     })
-    # NaN hazard shapes: the old crash (multi-row sparse NaN) and the old
-    # silent NaN selection (single-row) must both be gone.
+    # NaN hazard shapes must select without raising and match the reference.
     hazards = [
         ('boundary_nan_crash',
          torch.tensor([[NAN, 5.0, 4.0, 3.0, 2.0, NAN],
@@ -254,8 +249,7 @@ def bench_parity(topk: int) -> list:
     rows.append({
         'section': 'parity', 'case': 'nan_hazards',
         'n_cases': n_haz, 'mismatches': n_bad, 'crashes': n_crash,
-        'note': ('historical split behaviour (single-row silent NaN, '
-                 'multi-row RuntimeError) eliminated'),
+        'note': 'NaN hazard shapes return well-formed reference-exact rows',
     })
     return rows
 

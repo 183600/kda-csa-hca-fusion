@@ -123,13 +123,12 @@ def _windows_contiguous(windows: torch.Tensor) -> torch.Tensor:
     """Densify a possibly sliding-strided window view without changing values.
 
     The ``unfold(...).permute(...)`` window view has overlapping strides
-    (consecutive window rows start only ``c`` elements apart). For such
-    tensors ``.contiguous()`` / ``.clone()`` fall back to a slow copy path,
-    while an explicit ``copy_`` into a fresh contiguous buffer is exact and
-    several times faster. ``einsum`` on the strided view is likewise much
-    slower than on the dense buffer. Returning the input unchanged when it
-    is already contiguous keeps the function allocation-free for the plain
-    ``win == 1``/full-slice cases; consumers treat the result as read-only.
+    (consecutive window rows start only ``c`` elements apart), so an
+    explicit ``copy_`` into a fresh contiguous buffer materializes the
+    dense layout that ``einsum`` consumes. Returning the input unchanged
+    when it is already contiguous keeps the function allocation-free for
+    the plain ``win == 1``/full-slice cases; consumers treat the result as
+    read-only.
     """
     if windows.is_contiguous():
         return windows
@@ -537,10 +536,8 @@ def csa_compress_kv_overlapped(
                     value=float('-inf'))                          # [B, n_blocks, m, c]
     # a-branch logits for ALL blocks, then both branches concatenated along
     # the m axis. Without autograd the sums are written directly into the
-    # two halves of one [B, n_blocks, 2m, c] buffer (the ``out=`` sums are
-    # the same elementwise adds; the buffer has the exact layout
-    # ``torch.cat`` used to allocate), avoiding the per-half temporaries and
-    # the concatenation copy. While a graph is recorded the original
+    # two halves of one [B, n_blocks, 2m, c] buffer (the ``out=`` sums
+    # compute the same elementwise adds). While a graph is recorded the
     # cat-of-sums form is kept (``out=`` does not build a graph).
     if torch.is_grad_enabled():
         A_logits = Za + Ba[None, None, :, :].to(Za)
@@ -703,13 +700,10 @@ def _qk_normalize_(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
 _TOPK_SELECT_CHUNK_ELEMS = 1 << 22
 
 
-# Path-choice heuristic for ``_canonical_topk_indices``: while the arrays
-# are small the stable sort's lower constant wins (one optimized kernel vs
-# ``kthvalue`` + masks + ``nonzero`` + a small argsort); past this element
-# count the O(n) boundary path wins and the gap grows with ``n``. CPU
-# medians (16 slots, single call, rows x n_blocks): sort is faster at
-# (1, 2048) by 1.8x and at (8, 256) by 2x; the boundary path is faster at
-# (2, 2048) by 2.1x, (1, 4096) by 2.8x, and 3-11x from ~1e4 elements on.
+# Path-choice threshold for ``_canonical_topk_indices``: rows with at most
+# this many entries take the stable sort, larger rows take the O(n)
+# boundary path. Both paths implement the identical canonical rule, so the
+# dispatch only selects which kernel runs.
 _TOPK_SORT_MAX_ELEMS = 2048
 
 
@@ -758,43 +752,34 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     by breaking ties on ASCENDING block index. The returned slots reproduce
     ``torch.topk``'s score-descending order (stable, so ties keep the
     ascending-index rule) and entries selected at ``-inf`` (fewer than
-    ``k`` finite scores available) are reported as ``-1`` (invalid slot),
-    matching the historical contract. ``k`` may exceed the score count; the
-    caller pads the result.
+    ``k`` finite scores available) are reported as ``-1`` (invalid slot).
+    ``k`` may exceed the score count; the caller pads the result.
 
-    Path selection and cost
-    -----------------------
-    Two interchangeable kernels produce the identical canonical rule, and
-    the dispatch between them is a pure COST heuristic (both paths are
-    covered by the same parity tests, so the choice cannot change any
-    result):
+    Path selection
+    --------------
+    Two interchangeable kernels produce the identical canonical rule (both
+    paths are covered by the same parity tests, so the dispatch cannot
+    change any result):
 
     * the stable descending sort, whose output IS the canonical rule
       (score-descending, ties ascending-index) — used for dense selections
-      (``2*s >= n``, where nearly every entry is selected) and for small
-      arrays (``rows * n <= _TOPK_SORT_MAX_ELEMS``), where its lower
-      constant beats the boundary machinery;
+      (``2*s >= n``, where nearly every entry is selected) and for rows up
+      to ``_TOPK_SORT_MAX_ELEMS`` entries;
     * the ``O(n)`` boundary path (:func:`_boundary_selected_mask`) —
       ``kthvalue`` plus a few vectorized passes, no sort — used for sparse
-      selections on larger arrays, INCLUDING the single-query-per-step
-      decode shape once the block count exceeds the same element budget.
-      Decode used to always take the sort path because its output *is*
-      canonical, but at long context that made the per-token step pay
-      ``O(n_blocks log n_blocks)`` inside the lightning indexer: measured
-      on CPU with 16 slots, the boundary path is 2.8x faster at
-      ``n_blocks = 4096`` (``T = 64K`` at ``m = 16``), 6.3x at 8192 and
-      8.8x at 16384, which is exactly the regime CSA exists for.
+      selections on larger rows, INCLUDING the single-query-per-step
+      decode shape once the block count exceeds the sort threshold, where
+      the sort's ``O(n_blocks log n_blocks)`` term would dominate the
+      per-token step.
 
     Non-finite scores
     -----------------
     NaNs are UNSELECTABLE: a NaN score never occupies a returned slot (the
     slot becomes ``-1`` when the row runs out of selectable entries), so a
     NaN anywhere in the score tensor can neither crash the selector nor
-    silently occupy a real block index (the historical split behaviour: the
-    single-row sort path selected NaN indices, while the multi-row boundary
-    path raised ``RuntimeError`` on an under-filled ``nonzero`` reshape).
-    ``-inf`` entries keep the documented "selected at ``-inf`` -> ``-1``"
-    contract, and a NaN competes as ``-inf`` for the boundary/tie rules.
+    silently occupy a real block index. ``-inf`` entries keep the documented
+    "selected at ``-inf`` -> ``-1``" contract, and a NaN competes as
+    ``-inf`` for the boundary/tie rules.
     """
     n = scores.shape[-1]
     s = min(k, n)

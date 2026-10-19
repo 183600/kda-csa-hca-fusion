@@ -24,8 +24,7 @@ tensor per step) plus the inputs; the reverse pass recomputes
 ``D_t``/``delta_t``/``S_t`` in one step of the same ops. Hence:
 
 * activation graph depth is ``O(1)`` (one Function node) instead of ``O(T)``;
-* retained memory is ``~1`` state per step instead of ~6 intermediates
-  (measured 37x lower on T=128, B=1, HV=2, K=V=8);
+* retained memory is ``~1`` state per step instead of ~6 intermediates;
 * gradients match autograd through ``naive_recurrent_kda`` to float
   round-off (verified by parity tests and ``torch.autograd.gradcheck``).
 
