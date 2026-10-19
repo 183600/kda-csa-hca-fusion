@@ -28,6 +28,7 @@ from ops_csa import (
     _sliding_window_scores,
     _nan_safe_softmax,
     _qk_normalize,
+    _qk_normalize_,
     CHUNKED_SW_THRESHOLD,
 )
 from ops_rope import (
@@ -205,13 +206,21 @@ def naive_hca(
         C_comp = partial_rope(
             C_comp, block_positions(n_blocks, m2, device),
             rope_dim_eff, rope_base, dim=1)
-    C_comp_n = _qk_normalize(C_comp, qk_norm_mode)
+    # ``C_comp`` is a fresh compression output (optionally re-bound by
+    # ``partial_rope``) with no other readers left, so with autograd
+    # disabled the normalization runs in place (identical elementwise
+    # chain, one fewer block-sized temporary).
+    C_comp_n = (_qk_normalize(C_comp, qk_norm_mode)
+                if torch.is_grad_enabled()
+                else _qk_normalize_(C_comp, qk_norm_mode))
 
     # --- 2. Dense shared-KV MQA ---
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     cQ = F.linear(H, W_DQ)                                         # [B, T, dc]
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
-    q = _qk_normalize(q, qk_norm_mode)
+    # Same reasoning as above: ``q`` is this call's private tensor.
+    q = (_qk_normalize(q, qk_norm_mode) if torch.is_grad_enabled()
+         else _qk_normalize_(q, qk_norm_mode))
     # Partial RoPE on the core-attention queries (§2.3.3): rotate each
     # query at its own token position AFTER normalization (the decoding
     # cache applies the same order: the caller normalizes ``q``, the cache
@@ -255,7 +264,14 @@ def naive_hca(
             C_local_raw = F.linear(H, W_KV_local)                   # [B, T, c]
         else:
             C_local_raw = C
-        C_local = _qk_normalize(C_local_raw.to(compute_dtype), qk_norm_mode)  # [B, T, c]
+        C_local_src = C_local_raw.to(compute_dtype)
+        # In-place only when the cast produced a fresh copy or ``C`` is not
+        # returned (otherwise the projection storage would be mutated).
+        if (not torch.is_grad_enabled()) and (
+                C_local_src is not C or not return_projections):
+            C_local = _qk_normalize_(C_local_src, qk_norm_mode)     # [B, T, c]
+        else:
+            C_local = _qk_normalize(C_local_src, qk_norm_mode)      # [B, T, c]
         # Partial RoPE on the sliding-window keys (§2.3.3): each key
         # rotates at its own token position; the decoding cache's ring
         # buffer applies the same normalize-then-rotate order at append

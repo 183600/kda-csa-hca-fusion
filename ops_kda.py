@@ -633,10 +633,16 @@ def _chunk_kda_attn_loop_eager(
             g_diff = g_diff.clamp(max=50.0)
         # ``t = exp(g_diff) * k`` is shared by both intra-chunk matrices.
         # The sub/clamp produce fresh tensors, so the exp may run in place;
-        # the product stays out-of-place because autograd saves the exp
-        # output for the multiply's backward.
+        # the product stays out-of-place while a graph is recorded because
+        # autograd saves the exp output for the multiply's backward. With
+        # autograd disabled the product runs in place on the fresh exp
+        # output (identical per-element multiply; one fewer block-sized
+        # temporary).
         g_diff.exp_()
-        t = g_diff * k[..., :c1, :].unsqueeze(-3)
+        if torch.is_grad_enabled():
+            t = g_diff * k[..., :c1, :].unsqueeze(-3)
+        else:
+            t = g_diff.mul_(k[..., :c1, :].unsqueeze(-3))
         A[..., c0:c1, :c1] = (k[..., c0:c1, :].unsqueeze(-2) * t).sum(-1)
         if not recompute_attn:
             Aqk[..., c0:c1, :c1] = (
@@ -1191,6 +1197,7 @@ def _assoc_scan_chunk_states(
     M: torch.Tensor,
     b: torch.Tensor,
     S0: torch.Tensor,
+    _owns_inputs: bool = False,
 ) -> tuple:
     """TorchScript-compatible associative (prefix) scan of affine chunk maps.
 
@@ -1221,10 +1228,13 @@ def _assoc_scan_chunk_states(
     # map of chunks 0..n (applied to S0).
     E = M
     Fv = b
-    if not torch.is_grad_enabled():
+    if not torch.is_grad_enabled() and not _owns_inputs:
         # The doubling levels below overwrite the tail in place; the
         # caller's tensors must not be touched (the eager/scripted parity
         # test reuses the same inputs), so work on dedicated copies.
+        # A caller that passes freshly-owned tensors it never reads again
+        # (``assoc_scan_chunk_kda``: both are fresh matmul outputs) opts
+        # into consuming them via ``_owns_inputs``.
         E = M.clone()
         Fv = b.clone()
     off = 1
@@ -1253,12 +1263,13 @@ def _assoc_scan_chunk_states(
         off = off * 2
     # Exclusive form: S_in[:, :, 0] = S0 (identity map, zero source), while
     # chunk n >= 1 consumes the inclusive prefix of chunks 0..n-1.
-    eye = torch.eye(K, dtype=M.dtype, device=M.device)
-    eye = eye.expand(B, HV, 1, K, K)
-    zero = torch.zeros(B, HV, 1, K, V, dtype=M.dtype, device=M.device)
-    E_pre = torch.cat([eye, E[:, :, :-1]], dim=2)
-    F_pre = torch.cat([zero, Fv[:, :, :-1]], dim=2)
-    S_in = E_pre @ S0.unsqueeze(2) + F_pre
+    # Row 0's map is the identity by construction, so its state is S0
+    # itself; applying the identity matmul to it only re-associates the
+    # (exactly-zero) summations, and slicing it off lets the prefix
+    # matmul run over the NT-1 composed rows only instead of materializing
+    # a broadcast identity row and contracting all NT rows.
+    tail = E[:, :, :-1] @ S0.unsqueeze(2) + Fv[:, :, :-1]
+    S_in = torch.cat([S0.unsqueeze(2), tail], dim=2)
     # NOTE: keep both operands 4-D here: ``E[:, :, -1] @ S0.unsqueeze(2)``
     # would broadcast the batch dims asymmetrically ((B,HV) vs (B,HV,1)).
     S_final = E[:, :, -1] @ S0 + Fv[:, :, -1]
@@ -1353,7 +1364,10 @@ def assoc_scan_chunk_kda(
         M.neg_()
         M.diagonal(dim1=-2, dim2=-1).add_(ggx[..., -1, :])
     b = kexp_t @ u
-    S_in, S_final, _levels = _assoc_scan_chunk_states(M, b, S0)
+    # ``M`` and ``b`` are fresh matmul outputs with no other readers, so
+    # the no-grad scan may consume (overwrite) them instead of cloning.
+    S_in, S_final, _levels = _assoc_scan_chunk_states(
+        M, b, S0, _owns_inputs=True)
     C = qq * ggx - Aqk @ w
     a = Aqk @ u
     o_all = C @ S_in + a

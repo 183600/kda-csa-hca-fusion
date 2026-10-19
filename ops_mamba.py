@@ -191,6 +191,15 @@ _SCAN_LOOP_INPLACE_SCRIPTED_FAILED = False
 # at once, so the cap bounds that single array.
 _SCAN_XOUTER_SLAB_ELEMS = 8_000_000
 
+# Slab budget for the sequential reference scan's factor arrays. The slab
+# size is value-independent (the state carries across slabs), so it is
+# chosen purely for cache behaviour: the per-step working set (one
+# ``[BH, D, N]`` state slice plus its factors) stays hot in L2/L3 for the
+# smaller slab, while a slab that large spills to DRAM on every step.
+# Kept separate from ``_SCAN_XOUTER_SLAB_ELEMS`` so the chunked path's
+# fallback decision (a semantic switch, not a perf knob) is unchanged.
+_SCAN_NAIVE_SLAB_ELEMS = 1_000_000
+
 # Cap on the number of elements in one slab of the chunked path's
 # ``[batch, nheads, slab, chunk, chunk]`` intra-chunk intermediates. The
 # per-chunk intra-chunk outputs are independent of every other chunk, so
@@ -543,7 +552,7 @@ def naive_mamba2_scan(
     # instead of flattening the whole sequence up front, so the flattened
     # copies stay slab-bounded as well (identical copies of the same
     # values).
-    slab = max(1, _SCAN_XOUTER_SLAB_ELEMS
+    slab = max(1, _SCAN_NAIVE_SLAB_ELEMS
                // max(1, batch * nheads * headdim * d_state))
     # Autograd-safe out-of-place loop while a graph is being recorded; the
     # in-place loop (same values) otherwise. The in-place loop mutates its

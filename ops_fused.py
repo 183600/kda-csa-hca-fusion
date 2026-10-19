@@ -59,7 +59,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ops_csa import naive_csa
+from ops_csa import naive_csa, _qk_normalize_
 from ops_hca import naive_hca
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_mamba import Mamba2Mixer, build_mamba2_mixer, validate_mamba2_geometry
@@ -940,9 +940,14 @@ class KDAHybridLayer(nn.Module):
         else:
             # The projections are fresh linear outputs; outside autograd the
             # activation runs in place (identical values) and the transpose--
-            # free views below are unchanged.
-            q = F.normalize(F.silu(self.q_proj(x_conv), inplace=True).view(B, T, H, K), dim=-1)
-            k = F.normalize(F.silu(self.k_proj(x_conv), inplace=True).view(B, T, H, K), dim=-1)
+            # free views below are unchanged. The L2 normalization is the
+            # same ``x / clamp_min(||x||_2)`` chain as ``F.normalize`` and
+            # runs in place on the fresh silu storage (one fewer
+            # [B, T, H, K] temporary per projection).
+            q = _qk_normalize_(
+                F.silu(self.q_proj(x_conv), inplace=True).view(B, T, H, K), 'l2')
+            k = _qk_normalize_(
+                F.silu(self.k_proj(x_conv), inplace=True).view(B, T, H, K), 'l2')
             v = F.silu(self.v_proj(x_conv), inplace=True).view(B, T, HV, V)
         # log-space gate: low-rank down/up with a softplus-style decay. The
         # value 0.1 is exposed as ``HybridConfig.kda_decay_scale`` so all KDA
@@ -950,8 +955,16 @@ class KDAHybridLayer(nn.Module):
         # run_decoding.KDAAttnDecoding, method_analysis._kda_heads) use the
         # same value.
         decay_scale = cfg.kda_decay_scale
-        g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * decay_scale
-        beta = torch.sigmoid(self.beta(x_conv))                   # [B, T, HV]
+        if torch.is_grad_enabled():
+            g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * decay_scale
+            beta = torch.sigmoid(self.beta(x_conv))               # [B, T, HV]
+        else:
+            # Same per-element sign-flip / scale / sigmoid chain, evaluated
+            # in place on the fresh softplus / linear outputs (autograd
+            # disabled, so no saved operand is mutated).
+            g = F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K)
+            g.neg_().mul_(decay_scale)
+            beta = self.beta(x_conv).sigmoid_()                   # [B, T, HV]
         # Choose between the step-by-step recurrent path and the
         # chunkwise-parallel path based on ``cfg.kda_chunk_size``:
         #   * ``kda_chunk_size <= 0`` -> always recurrent (also the only

@@ -1036,9 +1036,18 @@ class CSADecodingCache:
                 compute_dtype = (
                     torch.float64 if self.dtype == torch.float64 else torch.float)
                 if self._normalize_qk:
-                    ca_norm_i = _qk_normalize(
-                        _to_dtype(ca_i.squeeze(1), compute_dtype),
-                        self.qk_norm_mode)
+                    ca_src_i = _to_dtype(ca_i.squeeze(1), compute_dtype)
+                    if (not torch.is_grad_enabled()
+                            and self.dtype != compute_dtype):
+                        # ``ca_src_i`` is a fresh compute-dtype cast copy
+                        # (storage dtype differs from compute dtype), so
+                        # the per-row normalize runs in place with the
+                        # identical per-element chain.
+                        ca_norm_i = _qk_normalize_(
+                            ca_src_i, self.qk_norm_mode)
+                    else:
+                        ca_norm_i = _qk_normalize(
+                            ca_src_i, self.qk_norm_mode)
                     ca_store_i = ca_norm_i.unsqueeze(1)
                 else:
                     ca_store_i = ca_i
@@ -1154,8 +1163,14 @@ class CSADecodingCache:
             # ``append_step``).
             compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
             if self._normalize_qk:
-                ca_store = _qk_normalize(
-                    _to_dtype(Ca_new, compute_dtype), self.qk_norm_mode)
+                ca_src = _to_dtype(Ca_new, compute_dtype)
+                if (not torch.is_grad_enabled()
+                        and self.dtype != compute_dtype):
+                    # Fresh cast copy (see the matching note in
+                    # ``append_step``): normalize in place.
+                    ca_store = _qk_normalize_(ca_src, self.qk_norm_mode)
+                else:
+                    ca_store = _qk_normalize(ca_src, self.qk_norm_mode)
             else:
                 ca_store = Ca_new
             if self.rope_dim_eff > 0:
@@ -1459,7 +1474,12 @@ class CSADecodingCache:
             # clone (same contract as before).
             K_IComp_valid = _to_dtype(
                 self._K_IComp[:, :self._n_blocks], compute_dtype)
-            if torch.is_grad_enabled() and not normalize_qk:
+            if (torch.is_grad_enabled() and not normalize_qk
+                    and self.dtype == compute_dtype):
+                # The clone is only required when the cast above returned
+                # a view aliasing the cache storage (dtype match); with a
+                # dtype mismatch the cast already allocated an unaliased
+                # copy.
                 K_IComp_valid = K_IComp_valid.clone()
             # Lightning indexer: score the current query against ALL
             # cached indexer keys, select top-k (respecting the causal
@@ -1569,11 +1589,14 @@ class CSADecodingCache:
                         if normalize_qk:
                             C_comp_n = _qk_normalize(
                                 C_comp_n, self.qk_norm_mode)
-                        elif torch.is_grad_enabled():
+                        elif (torch.is_grad_enabled()
+                                and self.dtype == compute_dtype):
                             # Same grad-mode clone contract as before: the
                             # einsum saves ``C_comp_n`` and a later
                             # ``append_step`` would invalidate a view in
-                            # place.
+                            # place. Only a dtype-matching cast aliases the
+                            # cache storage; a dtype-mismatching one is
+                            # already an unaliased copy.
                             C_comp_n = C_comp_n.clone()
                         soft_full = torch.einsum(
                             'btn,bnc->btc', soft_weights, C_comp_n,
@@ -1979,9 +2002,16 @@ class HCADecodingCache:
                 compute_dtype = (
                     torch.float64 if self.dtype == torch.float64 else torch.float)
                 if self._normalize_qk:
-                    c_norm_i = _qk_normalize(
-                        _to_dtype(c_i.squeeze(1), compute_dtype),
-                        self.qk_norm_mode)
+                    c_src_i = _to_dtype(c_i.squeeze(1), compute_dtype)
+                    if (not torch.is_grad_enabled()
+                            and self.dtype != compute_dtype):
+                        # Fresh cast copy (see the matching note in the
+                        # CSA cache): normalize in place.
+                        c_norm_i = _qk_normalize_(
+                            c_src_i, self.qk_norm_mode)
+                    else:
+                        c_norm_i = _qk_normalize(
+                            c_src_i, self.qk_norm_mode)
                     c_store_i = c_norm_i.unsqueeze(1)
                 else:
                     c_store_i = c_i
@@ -2045,8 +2075,14 @@ class HCADecodingCache:
             # ``append_step``).
             compute_dtype = torch.float64 if dtype == torch.float64 else torch.float
             if self._normalize_qk:
-                c_store = _qk_normalize(
-                    _to_dtype(C_new, compute_dtype), self.qk_norm_mode)
+                c_src = _to_dtype(C_new, compute_dtype)
+                if (not torch.is_grad_enabled()
+                        and self.dtype != compute_dtype):
+                    # Fresh cast copy (see the matching note in the CSA
+                    # cache's ``_append_bulk``): normalize in place.
+                    c_store = _qk_normalize_(c_src, self.qk_norm_mode)
+                else:
+                    c_store = _qk_normalize(c_src, self.qk_norm_mode)
             else:
                 c_store = C_new
             if self.rope_dim_eff > 0:
@@ -2084,24 +2120,33 @@ class HCADecodingCache:
                 Z_new[:, first_needed:rest_end].reshape(B, n_rest * m2, c),
                 B_pos, m2,
             )                                                      # [B, n_rest, c]
-            new_C_all = torch.cat(
-                [new_C_first.unsqueeze(1), new_C_rest], dim=1)
-        else:
-            new_C_all = new_C_first.unsqueeze(1)
         n_new = 1 + n_rest
+        block_idx0 = self._n_blocks
         # Partial RoPE: rotate the just-completed heavy compressed entries
         # at their block-anchor positions ``block_idx * m2`` (same positions
-        # and rotate-before-store order as the per-token path).
-        if self.rope_dim_eff > 0:
-            pos_b = torch.arange(
-                self._n_blocks, self._n_blocks + n_new, device=self.device) * m2
-            new_C_all = partial_rope(
-                new_C_all, pos_b,
-                self.rope_dim_eff, self.rope_base, dim=1)
-        block_idx0 = self._n_blocks
+        # and rotate-before-store order as the per-token path). The
+        # rotation is a per-row map along ``dim=1``, so rotating the first
+        # block and the rest separately and storing each slice straight
+        # into its slot is elementwise-identical to rotating the
+        # concatenation (no full ``[B, n_new, c]`` concatenation needed;
+        # same split as the CSA cache).
+        pos_b = (torch.arange(block_idx0, block_idx0 + n_new,
+                              device=self.device) * m2
+                 if self.rope_dim_eff > 0 else None)
+        first_C = new_C_first.unsqueeze(1)
+        if pos_b is not None:
+            first_C = partial_rope(
+                first_C, pos_b[:1], self.rope_dim_eff, self.rope_base, dim=1)
+            if n_rest:
+                new_C_rest = partial_rope(
+                    new_C_rest, pos_b[1:],
+                    self.rope_dim_eff, self.rope_base, dim=1)
         self._ensure_compressed_capacity(block_idx0 + n_new)
-        self._C_comp[:, block_idx0:block_idx0 + n_new].copy_(
-            _to_dtype(new_C_all, dtype))
+        self._C_comp[:, block_idx0:block_idx0 + 1].copy_(
+            _to_dtype(first_C, dtype))
+        if n_rest:
+            self._C_comp[:, block_idx0 + 1:block_idx0 + n_new].copy_(
+                _to_dtype(new_C_rest, dtype))
         self._n_blocks += n_new
         new_block_indices = list(range(block_idx0, block_idx0 + n_new))
         # Leave the tokens past the last full block in the accumulator.
@@ -2216,7 +2261,9 @@ class HCADecodingCache:
             else:
                 C_comp_n = _to_dtype(
                     self._C_comp[:, :self._n_blocks], compute_dtype)
-                if torch.is_grad_enabled():
+                if torch.is_grad_enabled() and self.dtype == compute_dtype:
+                    # Clone only when the cast aliases the cache storage
+                    # (see the matching note in CSA ``forward_step``).
                     C_comp_n = C_comp_n.clone()
             # scores: [B, nh, 1, n_blocks] -> [B, 1, nh, n_blocks]
             scores = torch.einsum(

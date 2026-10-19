@@ -1687,10 +1687,24 @@ def naive_csa(
     # branch does for its DI).
     # This makes the flag's semantics consistent across both branches and
     # gives ablations a genuine knob to turn off normalization.
+    # Both ``q`` (fresh linear + cast) and ``C_comp`` (fresh compression
+    # output, optionally re-bound by ``partial_rope``) are exclusively owned
+    # by this call and have no other readers once normalized, so with
+    # autograd disabled the normalization runs in place (identical
+    # elementwise chain, one fewer full-size temporary each). A recorded
+    # graph keeps the out-of-place form.
     if normalize_qk:
-        q = _qk_normalize(q, qk_norm_mode)
-    C_comp_n = (_qk_normalize(C_comp, qk_norm_mode) if normalize_qk
-                else C_comp.to(compute_dtype))
+        if torch.is_grad_enabled():
+            q = _qk_normalize(q, qk_norm_mode)
+        else:
+            q = _qk_normalize_(q, qk_norm_mode)
+    if normalize_qk:
+        if torch.is_grad_enabled():
+            C_comp_n = _qk_normalize(C_comp, qk_norm_mode)
+        else:
+            C_comp_n = _qk_normalize_(C_comp, qk_norm_mode)
+    else:
+        C_comp_n = C_comp.to(compute_dtype)
     # Partial RoPE on the core-attention QUERIES (§2.3.3): rotate each
     # query at its own token position AFTER normalization (the decoding
     # cache applies the same order: the caller normalizes ``q``, the cache
@@ -1744,9 +1758,15 @@ def naive_csa(
         # DISTINCT blocks per row, so the backward scatter/accumulation is
         # unaffected).
         nblk = C_comp_n.shape[1]
-        flat_idx = (
-            idx_safe + torch.arange(B_, device=device).view(B_, 1, 1) * nblk
-        ).reshape(-1)
+        batch_off = torch.arange(B_, device=device).view(B_, 1, 1) * nblk
+        # ``idx_safe`` is a fresh clamp output and has no later readers when
+        # ``effective_use_ste`` is False (the STE path below re-gathers with
+        # the un-offset indices), so that path folds the batch offset in
+        # place instead of materializing a second index tensor.
+        if effective_use_ste:
+            flat_idx = (idx_safe + batch_off).reshape(-1)
+        else:
+            flat_idx = idx_safe.add_(batch_off).reshape(-1)
         kv = torch.index_select(
             C_comp_n.reshape(B_ * nblk, C_comp_n.shape[-1]), 0, flat_idx,
         ).view(B_, T, idx_safe.shape[-1], C_comp_n.shape[-1])           # [B, T, topk, c]
@@ -1902,7 +1922,15 @@ def naive_csa(
         win = sliding_window
         H_proj = Ca_c  # [B, T, c], already == F.linear(H, W_aKV)
         if normalize_qk:
-            C_local = _qk_normalize(H_proj, qk_norm_mode)          # [B, T, c]
+            # Exact same elementwise chain either way; the in-place form is
+            # used only when this call exclusively owns the storage (the
+            # cast produced a fresh copy) or the projection is not returned
+            # (nothing else reads ``Ca`` afterwards).
+            if (not torch.is_grad_enabled()) and (
+                    H_proj is not Ca or not return_projections):
+                C_local = _qk_normalize_(H_proj, qk_norm_mode)     # [B, T, c]
+            else:
+                C_local = _qk_normalize(H_proj, qk_norm_mode)      # [B, T, c]
         else:
             C_local = H_proj
         # Partial RoPE on the sliding-window keys (§2.3.3: RoPE applies to

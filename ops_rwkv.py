@@ -417,8 +417,16 @@ def rwkv7_reference_scan(
         r_c = r_c * scale
     # (kk * a) is used at every step. The sign is folded into ``kka`` so
     # the readout contract needs no in-loop negation (exact sign flips
-    # only — see ``_rwkv7_scan_loop_eager``).
-    kka_c = -(kk_c * a_c)
+    # only — see ``_rwkv7_scan_loop_eager``). Outside autograd, when the
+    # upcast above returned a fresh copy of ``a`` (dtype mismatch), the
+    # sign flip is folded into that copy in place: ``kk * (-a)`` is
+    # bitwise identical to ``-(kk * a)`` (negation flips the sign bit
+    # exactly) and saves one full-size temporary.
+    if not torch.is_grad_enabled() and a_c is not a:
+        a_c.neg_()
+        kka_c = kk_c * a_c
+    else:
+        kka_c = -(kk_c * a_c)
     # ``exp(log_w)`` is an elementwise map, so evaluating it over the whole
     # time axis computes exactly the same fp values as per-step
     # ``w_t.exp()`` (each element rounds identically). The per-step update
@@ -911,9 +919,18 @@ class Rwkv7Mixer(nn.Module):
         # The (r . k) shortcut: per-head dot of r and (post-modulation) k
         # scaled by r_k, broadcasting over the head's value channels.
         rk_dot = (r4 * k4 * self.r_k).sum(dim=-1, keepdim=True)  # [B,T,H,1]
-        o = o + (rk_dot * v4).reshape(B, T, C)
-        # Gate, then project.
-        out = self.o_proj(o * g)
+        if torch.is_grad_enabled():
+            o = o + (rk_dot * v4).reshape(B, T, C)
+            # Gate, then project.
+            out = self.o_proj(o * g)
+        else:
+            # The GroupNorm output is freshly allocated with no other
+            # readers, and ``g`` is not read after the gate: fold the
+            # add and the gate multiply into it in place
+            # (elementwise-identical).
+            o.add_((rk_dot * v4).reshape(B, T, C))
+            o.mul_(g)
+            out = self.o_proj(o)
         return out, new_state, new_shift
 
     # ------------------------------------------------------------------
