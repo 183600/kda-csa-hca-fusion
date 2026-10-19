@@ -104,9 +104,8 @@ conservative `exact_recall` flag (min-over-seeds == 1.0).
   CSA/HCA compressed-KV caches are out of scope; the byte bridge is the
   accounting tool for those components (looping it into Exp 9 result rows
   is future work).
-* "Exact" = min-over-seeds == 1.0 (conservative); 3 seeds keep the probe
-  at ~2 s, and the 2-bit cells carry the visible variance (min..max
-  reported).
+* "Exact" = min-over-seeds == 1.0 (conservative); the min..max spread
+  across seeds is reported.
 * Flattened-buffer grouping matches a state cache stored as one contiguous
   quantized buffer; per-head-dim groupings give different low-bit numbers.
 

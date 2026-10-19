@@ -346,10 +346,8 @@ gap with a dedicated evaluation harness over the seven core paths
   dtype; state in compute precision — fp32 for fp16/bf16/fp32 inputs);
 * two modes: `explicit` (inputs cast to the dtype; ops upcast to fp32) and
   `autocast` (fp32 storage + `torch.autocast`, the real AMP path);
-* budgets: T-independent `factor*u` for storage dtypes (observed ~2u on
-  the shipped cores), and the textbook `accum_factor*T*u` round-off
-  envelope for compute dtypes (the quadratic/chunked SSD state measured
-  0.87*T*u at T=1024).
+* budgets: T-independent `factor*u` for storage dtypes, and the textbook
+  `accum_factor*T*u` round-off envelope for compute dtypes.
 
 `--json` writes a versioned envelope (`kind='precision_sweep'`) whose
 aggregate rows are checked by a registered `results_schema` contract
@@ -385,8 +383,8 @@ Final default-route decision (from the experiment design):
 
 | Result | Choice |
 |---|---|
-| KDA more stable, Mamba-2 no cost win | keep KDA default |
-| Mamba-2 similar quality at clearly lower cost | ship a Mamba-2 performance default |
+| KDA more stable, Mamba-2 no advantage | keep KDA default |
+| Mamba-2 similar quality with a clear advantage | ship a Mamba-2 default |
 | HCA helps both memory operators | prioritise HCA's cross-module role |
 | HCA helps only in specific tasks/lengths | scope conclusions to those conditions |
 | HCA loses to more CSA / more recurrence | simplify; drop the three-operator design |

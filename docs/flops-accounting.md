@@ -1,4 +1,4 @@
-# Measured FLOPs accounting (and the online-softmax oracle)
+# FLOPs accounting audit (and the online-softmax oracle)
 
 `prefill_flops` (`run_kv_cache.py`) is an **analytic** ledger: it models
 the matmul shapes from the paper and never instruments a forward. The
@@ -48,32 +48,6 @@ under the counter, and reports:
 | `reference_tax_vs_canonical` | `2 * gemm_macs / canonical_flops` |
 | `path` | KDA core actually dispatched: `recurrent` or `chunk` |
 
-## Probe-geometry results (d=64, H=2, HV=4, K=V=32, BT=64)
-
-| kind | T | path | canonical | ref GEMM | ref/canon |
-|---|---|---|---|---|---|
-| KDA | 32 | recurrent | 4.092M | 2.257M | **0.552** |
-| KDA | 64 | chunk | 8.184M | 10.854M | **1.326** |
-| KDA | 128 | chunk | 16.368M | 21.709M | **1.326** |
-| CSA | 128 | — | 2.634M | 2.691M | 1.021 |
-| HCA | 128 | — | 1.713M | 1.769M | 1.033 |
-
-The KDA numbers are the two actionable findings:
-
-1. **Short sequences are overcounted.** Below `kda_chunk_size` the layer
-   never enters the chunk path, yet the analytic formula always adds
-   `3T*C*K + T*C^2` per head. At `T=32` the executed work is 55% of the
-   reported number. `kda_executed_flops` zeroes those terms when
-   `kda_path == 'recurrent'`.
-
-2. **The chunk path is undercounted by ~33% at `BT=64`.** The reference
-   builds `A`/`Aqk` with an elementwise sub/clamp/exp/multiply chain,
-   solves a batched triangular system, and runs `A@(gexp*k)`,
-   `A@v`, `w@S`, `q@S`, `Aqk@v`, `k^T@v`. The paper's
-   `3T*C*dh + T*C^2` term only approximates this. The ratio is
-   scale-invariant (`T=128` and `T=256` agree to 1e-9) because both the
-   reference and canonical terms are linear in `T`.
-
 The recurrent path is also special: `(k * S).sum(-2)` and the outer-product
 update are **elementwise broadcast-reduce**, not GEMMs. They are real work
 (`2 * T * HV * K * V` MACs) that no dispatcher-based counter sees, so
@@ -83,7 +57,7 @@ kda_executed_flops` is the identity pinned by the tests.
 ## Exact reference model
 
 All projections run on the padded length `Tp` (ceil to `m`/`m2`/`BT`);
-only `o_proj` runs on the original `T`. The model matches the measured
+only `o_proj` runs on the original `T`. The model matches the dispatched
 GEMM MACs **exactly** for the tested `T` (including padded `T=100`):
 
 * **KDA**: A/Aqk block entries from `_attn_block_rows` (prepare) or

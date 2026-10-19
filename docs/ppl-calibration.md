@@ -53,30 +53,6 @@ contract in `results_schema.py`: a tampered artifact (widened tolerance,
 flipped verdict, threshold that no longer equals `alpha + tol` or the
 recorded floor, non-derived rate) is refused by the schema check.
 
-## Measured certificate (Exp 15, committed grid, `reps=400, n_boot=500`)
-
-| section | scenario | measured | bound/floor | verdict |
-|---|---|---|---|---|
-| coverage | `n=40, alpha=0.10` | 0.868 (bias −0.032) | ±0.05 | calibrated |
-| coverage | `n=40, alpha=0.05` | 0.915 (bias −0.035) | ±0.05 | calibrated |
-| coverage | `n=12, alpha=0.10` | 0.873 (bias −0.027) | ±0.08 | calibrated |
-| coverage | `n=12, alpha=0.05` | 0.887 (bias −0.062) | ±0.08 | calibrated |
-| size | `n=40, alpha=0.10` | 0.087 | ≤0.16 | within bound |
-| size | `n=12, alpha=0.10` | 0.172 | ≤0.20 | within bound |
-| power | `delta=0.10` | 0.615 | ≥0.55 | met |
-| power | `delta=0.20` | 0.988 | ≥0.90 | met |
-
-decode vs prefill: 16 windows / 368 tokens, max per-window
-`|ΔNLL| = 7.6e-06` nats (tol 1e-4), `Δmean NLL = +2.1e-08`,
-`PPL ratio = 1.000000021`, bootstrap `p = 0.54` (not significant),
-`parity_ok = effect_ok = finite_ok = True`.
-
-Interpretation: the inference path is honest at the scales results use
-(40 units is the Exp 11 contrast size); small-sample behaviour is
-slightly conservative on coverage and mildly liberal on size at 12 units
-— documented, bounded by the recorded 0.20 tolerance, and visible in the
-artifact rather than hidden.
-
 ## Verification
 
 * `test_ppl_calibration.py` — RNG isolation/determinism contract, the
