@@ -69,7 +69,11 @@ Block-size x interleaving sweep
     std and the 95% t-CI of end-task accuracy and indexer union recall.
     Single- or two-seed runs are flagged as exploratory in the report
     metadata: with fewer than 3 seeds, cell-to-cell differences must not
-    be read as effects.
+    be read as effects. The pre-registered hypotheses (``HYPOTHESES``) and
+    their analytic/empirical outcomes (``design['hypothesis_checks']``,
+    plus a per-row ``indexer_union_above_chance`` check on trained rows)
+    are fixed before the grid runs, so the coverage/localisation trade-off
+    is measured rather than assumed.
 
 Output
 ------
@@ -789,6 +793,196 @@ def _mean_std_ci95(values: list[float]
     return mean, std, ci
 
 
+# ---------------------------------------------------------------------------
+# Pre-registered hypotheses (fixed BEFORE the grid is run)
+# ---------------------------------------------------------------------------
+# The grid exists to *measure* the coverage/localisation trade-off, not to
+# confirm an assumed monotonic story. Each hypothesis states its prediction
+# and what would falsify it; ``_hypothesis_checks`` then evaluates the
+# analytic part on the frozen structural tables and the empirical part on
+# the trained rows. The naive "bigger block => more coverage" expectation is
+# included ON PURPOSE: the analytic table refutes it at block boundaries
+# (the strict-preceding mask `p // b < cue // b` interacts with the
+# partition), which is exactly why the ablation is measured rather than
+# assumed.
+HYPOTHESES = {
+    'window_reach_matches_geometry': {
+        'hypothesis': (
+            'The sliding-window path is a pure distance condition: a layer '
+            'with window ``win`` recovers exactly the placements with '
+            'cue - p <= win - 1.'),
+        'prediction': (
+            'Per block layer, ``window_hit_fraction`` equals the geometric '
+            'fraction of placements inside the window, for every cell.'),
+        'falsified_if': (
+            'Any layer window_hit_fraction deviates from the geometry '
+            '(window semantics differ from the documented [t-win+1, t] '
+            'inclusive interval).'),
+    },
+    'far_placements_covered_by_blocks': {
+        'hypothesis': (
+            'The compressed-block path is distance-independent: far '
+            'placements (beyond every sliding window) remain recoverable '
+            'when the key/value pair shares a strictly preceding block.'),
+        'prediction': (
+            'For every cell, placements farther than the largest window '
+            'have a strictly positive exact-recall fraction.'),
+        'falsified_if': (
+            'A cell has zero exact coverage beyond the windows (the sparse '
+            'branch cannot reach far placements at all).'),
+    },
+    'block_coverage_not_monotone_in_block_size': {
+        'hypothesis': (
+            'NAIVE EXPECTATION under test: for a fixed layout, a larger '
+            'compression block weakly increases block-path coverage '
+            '(same-block probability grows).'),
+        'prediction': (
+            'All comparable (same layout/layer, increasing m) pairs show '
+            'non-decreasing ``block_hit_fraction``.'),
+        'falsified_if': (
+            'Any comparable pair shows decreasing coverage as m grows: the '
+            'strict-preceding mask at the query-block boundary dominates, '
+            'so coverage must be measured per geometry, not assumed '
+            'monotone in m.'),
+    },
+    'indexer_union_above_chance': {
+        'hypothesis': (
+            'The learned lightning indexer retrieves the gold block more '
+            'often than uniform selection over the visible blocks, so the '
+            'CSA path is content-addressed rather than a random choice.'),
+        'prediction': (
+            'Trained rows have ``indexer_union_recall_mean`` above the '
+            'analytic uniform-selection union chance '
+            '(``csa_union_selection_chance_indep``).'),
+        'falsified_if': (
+            'Union recall is at or below the analytic chance: the indexer '
+            'adds no selection signal over picking uniformly at random.'),
+    },
+}
+
+
+def _window_fraction_from_distances(structural: dict, window: int) -> float:
+    """Geometric window-hit fraction from the per-distance placement table."""
+    if window <= 0:
+        return 0.0
+    total = hit = 0
+    for d_str, slot in structural['by_distance'].items():
+        n = int(slot['n'])
+        total += n
+        if int(d_str) <= window - 1:
+            hit += n
+    return (hit / total) if total else 0.0
+
+
+def _far_fraction_from_distances(structural: dict, max_window: int) -> float:
+    """Exact-recall fraction for placements beyond every window."""
+    total = hit = 0
+    for d_str, slot in structural['by_distance'].items():
+        if int(d_str) > max_window - 1:
+            n = int(slot['n'])
+            total += n
+            hit += int(slot['any_exact'])
+    return (hit / total) if total else 0.0
+
+
+def _hypothesis_checks(rows: list[dict]) -> dict:
+    """Evaluate the pre-registered hypotheses over the report rows."""
+    # H1: window geometry, H2: far coverage, H3: m-monotonicity.
+    window_dev = []
+    far_fractions = []
+    for r in rows:
+        st = r['structural']
+        max_win = max((e['window'] for e in st['per_layer']), default=0)
+        for e in st['per_layer']:
+            if e['kind'] not in BLOCK_KINDS:
+                continue
+            geom = _window_fraction_from_distances(st, e['window'])
+            if abs(e['window_hit_fraction'] - geom) > 1e-12:
+                window_dev.append({
+                    'group': r['group'], 'layer_index': e['layer_index'],
+                    'window': e['window'],
+                    'window_hit_fraction': e['window_hit_fraction'],
+                    'geometric_fraction': geom,
+                })
+        if max_win > 0:
+            far_fractions.append({
+                'group': r['group'],
+                'far_exact_fraction': _far_fraction_from_distances(st, max_win),
+            })
+    # H3: per (layout, csa layer index) series over increasing block size.
+    series: dict[tuple, list] = {}
+    for r in rows:
+        for e in r['structural']['per_layer']:
+            if e['kind'] != 'csa':
+                continue
+            series.setdefault((r['layout'], e['layer_index']), {})[
+                int(e['block'])] = e['block_hit_fraction']
+    monotone_violations = []
+    n_pairs = 0
+    for key, by_block in series.items():
+        blocks = sorted(by_block)
+        for b1, b2 in zip(blocks, blocks[1:]):
+            n_pairs += 1
+            if by_block[b2] < by_block[b1] - 1e-12:
+                monotone_violations.append({
+                    'layout': key[0], 'layer_index': key[1],
+                    'm_smaller': b1, 'coverage_smaller': by_block[b1],
+                    'm_larger': b2, 'coverage_larger': by_block[b2],
+                })
+    # H4 (empirical): union recall above the analytic uniform-selection chance.
+    above = below = no_data = 0
+    per_row = []
+    for r in rows:
+        recall = r.get('indexer_union_recall_mean')
+        chance = r['structural'].get('csa_union_selection_chance_indep')
+        if recall is None or chance is None:
+            no_data += 1
+            continue
+        is_above = bool(recall > chance + 1e-12)
+        above += int(is_above)
+        below += int(not is_above)
+        per_row.append({
+            'group': r['group'],
+            'indexer_union_recall_mean': recall,
+            'uniform_union_chance': chance,
+            'above_chance': is_above,
+        })
+    far_min = (min(f['far_exact_fraction'] for f in far_fractions)
+               if far_fractions else None)
+    return {
+        'window_reach_matches_geometry': {
+            'n_deviations': len(window_dev),
+            'deviations': window_dev[:8],
+            'verdict': (not window_dev) if rows else None,
+        },
+        'far_placements_covered_by_blocks': {
+            'n_cells': len(far_fractions),
+            'min_far_exact_fraction': far_min,
+            'verdict': (bool(far_min and far_min > 0.0)
+                        if far_fractions else None),
+        },
+        'block_coverage_not_monotone_in_block_size': {
+            'n_comparable_pairs': n_pairs,
+            'n_monotonicity_violations': len(monotone_violations),
+            'violation_examples': monotone_violations[:8],
+            'verdict': (None if not n_pairs
+                        else len(monotone_violations) == 0),
+        },
+        'indexer_union_above_chance': {
+            'n_rows_above': above,
+            'n_rows_at_or_below': below,
+            'n_rows_no_data': no_data,
+            'per_row': per_row,
+            'verdict': (None if not (above + below)
+                        else (True if below == 0
+                              else (False if above == 0 else None))),
+            'verdict_note': ('True = every trained cell above chance, '
+                             'False = every trained cell at/below chance, '
+                             'None = mixed cells (read per_row)'),
+        },
+    }
+
+
 def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                       steps: int = 80, seeds=(42, 43, 44), seq_len: int = SEQ_LEN,
                       d_model: int = D_MODEL, train_batch: int = 16,
@@ -886,6 +1080,17 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                 row['indexer_union_recall_mean'] = union_mean
                 row['indexer_union_recall_std'] = union_std
                 row['indexer_union_recall_ci95'] = union_ci
+                chance = structural.get('csa_union_selection_chance_indep')
+                row['hypothesis_checks'] = {
+                    'indexer_union_above_chance': {
+                        'prediction': ('union recall above the analytic '
+                                       'uniform-selection union chance'),
+                        'uniform_union_chance': chance,
+                        'observed_union_recall': union_mean,
+                        'verdict': (None if union_mean is None or chance is None
+                                    else bool(union_mean > chance + 1e-12)),
+                    },
+                }
                 hca = [s['hca_resolved_fraction'] for s in row['per_seed']
                        if s['hca_resolved_fraction'] is not None]
                 row['hca_resolved_fraction_mean'] = _mean_std_ci95(hca)[0]
@@ -940,6 +1145,8 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
             'note': ('structural = exact placement reachability at the cue; '
                      'indexer recall = gold compressed block among the '
                      'selected top-k on a real eval batch'),
+            'hypotheses': HYPOTHESES,
+            'hypothesis_checks': _hypothesis_checks(rows),
         },
         'rows': rows,
     }

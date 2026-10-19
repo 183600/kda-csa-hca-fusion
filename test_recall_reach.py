@@ -448,6 +448,46 @@ def test_report_multi_seed_statistics():
         single['design']['statistical_design']['warning'] is not None, '')
 
 
+def test_hypothesis_checks_contract():
+    """Pre-registered hypotheses + analytic/empirical checks are reported."""
+    structural = R.run_recall_report(train=False)
+    json.dumps(structural, allow_nan=False)
+    design = structural['design']
+    _ok('design carries the hypothesis table',
+        set(design.get('hypotheses', {})) == set(R.HYPOTHESES),
+        f"keys={sorted(design.get('hypotheses', {}))}")
+    checks = design.get('hypothesis_checks', {})
+    _ok('checks cover every hypothesis',
+        set(checks) == set(R.HYPOTHESES), f'keys={sorted(checks)}')
+    win = checks['window_reach_matches_geometry']
+    _ok('window geometry verdict True with zero deviations',
+        win['verdict'] is True and win['n_deviations'] == 0, str(win))
+    far = checks['far_placements_covered_by_blocks']
+    _ok('far placements covered by the block path',
+        far['verdict'] is True and far['min_far_exact_fraction'] > 0.0,
+        str(far))
+    mono = checks['block_coverage_not_monotone_in_block_size']
+    _ok('monotonicity comparison actually ran over >0 pairs',
+        mono['n_comparable_pairs'] > 0 and mono['verdict'] is not None,
+        str({k: v for k, v in mono.items() if k != 'violation_examples'}))
+    _ok('violation examples are capped but consistent',
+        len(mono['violation_examples'])
+        == min(mono['n_monotonicity_violations'], 8), str(mono))
+
+    trained = R.run_recall_report(
+        pairs=((4, 8),), layouts=['alternating'], steps=1, seeds=(42,),
+        seq_len=16, train_batch=8, eval_batches=1, eval_batch=8)
+    json.dumps(trained, allow_nan=False)
+    row = trained['rows'][0]
+    check = row.get('hypothesis_checks', {}).get('indexer_union_above_chance')
+    _ok('trained row carries the indexer-vs-chance check',
+        check is not None and 'uniform_union_chance' in check
+        and check['verdict'] in (True, False, None), str(check))
+    _ok('design-level empirical check aggregated',
+        'verdict' in trained['design']['hypothesis_checks']
+        ['indexer_union_above_chance'])
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -459,6 +499,7 @@ def main() -> int:
     test_report_strict_json_and_budget()
     test_seed_statistics_contract()
     test_report_multi_seed_statistics()
+    test_hypothesis_checks_contract()
     print('\nAll recall-reach tests passed.')
     return 0
 

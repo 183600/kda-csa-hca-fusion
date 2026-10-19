@@ -47,11 +47,26 @@ the trained numbers can be read against their actual chance floor. Aggregate
 rows carry seed-level standard deviations, 95% t-intervals and a paired
 significance test of the trained model's gain over its untrained control.
 
+Baselines and hypotheses
+------------------------
+Following the repository's baseline ladder (Exp 4: rule reference -> linear ->
+tuned softmax -> complex op), this experiment adds the missing simplest rung
+for the needle task: a **symbolic lexical-scan rule** that locates the planted
+fact by matching the answer TEMPLATE prefix in the context and copies the
+following tokens. It uses no model weights, and an oracle-position variant
+(copy from the known ``needle_pos``) is reported as the task-level copy
+ceiling. Every trained row is annotated with machine-readable hypothesis
+checks (``learned_retrieval``, ``trained_matches_rule``) fixed BEFORE the
+numbers are read, so "the model retrieved the needle" cannot be claimed when
+the model is no better than a grep, and a ``needle_summary`` row aggregates
+the verdicts. The full pre-registered hypothesis table lives in
+``NEEDLE_HYPOTHESES`` and is echoed in the JSON ``design`` block.
+
 Output
 ------
 ``results/exp12_needle_haystack.json`` (versioned envelope via ``results_schema``)
-with ``row_kind`` in {``needle_config``, ``needle_recall``,
-``needle_untrained_control``, ``needle_summary``, ``qat_needle``,
+with ``row_kind`` in {``needle_recall``, ``needle_untrained_control``,
+``needle_rule_baseline``, ``needle_summary``, ``qat_needle``,
 ``qat_needle_summary``}.
 """
 
@@ -63,6 +78,7 @@ import math
 import os
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, asdict
 
 import torch
@@ -137,6 +153,85 @@ _DISTRACTOR_SENTENCES = [
     "Many years later, as he faced the firing squad, Colonel Aureliano Buendia was to remember that distant afternoon when his father took him to discover ice. ",
     "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say that they were perfectly normal, thank you very much. ",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Simplest baseline: symbolic lexical-scan rule (no learned weights)
+# ---------------------------------------------------------------------------
+# Baseline ladder for the needle task (mirroring Exp 4's rule -> linear ->
+# softmax ladder): before training ANY model, ask whether a pattern matcher
+# can solve the task. The rule knows the answer TEMPLATE (the first
+# ``_RULE_TEMPLATE_PREFIX_TOKENS`` characters of the fixed-format answer
+# sentence are domain knowledge, not model weights), scans the context for
+# the LAST occurrence of that template prefix, and copies the following
+# ``n_answer`` tokens. The fact sentence is the only template match in the
+# deterministic haystack, so a perfect matcher reproduces the answer exactly.
+# A trained model that does not at least match this rule has not learned
+# *retrieval* on the task it is being evaluated on. The rule records
+# ``uses_answer_prefix_template=True`` so it can never be mistaken for a
+# weight-free oracle of the full answer.
+#
+# The oracle-position variant (copy ``n_answer`` tokens from the known
+# ``needle_pos``) uses ground-truth metadata and is reported only as the
+# task-level copy ceiling: it shows that once a model LOCALISES the fact,
+# reproducing the answer is pure copying, so any learned failure is a
+# localisation failure rather than a generation failure.
+_RULE_TEMPLATE_PREFIX_TOKENS = 6  # len("The se") for the fixed answer
+
+# ---------------------------------------------------------------------------
+# Pre-registered hypotheses (fixed BEFORE reading any numbers)
+# ---------------------------------------------------------------------------
+# These are echoed into the JSON ``design`` block and drive the per-row
+# ``hypothesis_checks`` verdicts. A claim of the form "route X performs
+# long-context retrieval" requires the learned_retrieval and
+# trained_matches_rule checks to hold; otherwise the row only shows that a
+# recurrent/compressed model ran, not that it retrieves.
+NEEDLE_HYPOTHESES = OrderedDict([
+    ('learned_retrieval', {
+        'hypothesis': (
+            'The needle answer is a verbatim copy of the planted fact, so a '
+            'trained model that LOCATES the fact should beat the untrained '
+            'initialisation floor on held-out sequences (localisation, not '
+            'generation, is the difficulty).'),
+        'prediction': (
+            'Trained exact-match accuracy exceeds the untrained control by '
+            'a positive seed-paired margin; the lexical template scan '
+            '(simplest non-learned baseline) reproduces the answer at high '
+            'exact match, confirming the task is lexically copy-solvable.'),
+        'falsified_if': (
+            'Trained accuracy is not above the untrained control, or the '
+            'template rule cannot find the planted fact (the task is not '
+            'lexically solvable / the generator is broken).'),
+    }),
+    ('trained_matches_rule', {
+        'hypothesis': (
+            'A "learned retrieval" claim is only meaningful if the model is '
+            'at least as accurate as the simplest rule baseline: locate the '
+            'fact by template match and copy the continuation.'),
+        'prediction': (
+            'Trained exact-match accuracy is >= the lexical-scan rule '
+            'accuracy on the SAME held-out evaluation sequences.'),
+        'falsified_if': (
+            'A trained memory route scores below the rule baseline, i.e. '
+            'the learned retrieval is weaker than grep-and-copy on the task '
+            'it is evaluated on.'),
+    }),
+    ('distance_degradation', {
+        'hypothesis': (
+            'Long-context retrieval is a localisation problem: at a fixed '
+            'context length, placing the fact farther from the question '
+            'makes localisation harder for bounded-state / compressed '
+            'memory routes.'),
+        'prediction': (
+            'Exact-match accuracy at the farthest needle position is not '
+            'higher than at the nearest position (within the same '
+            'context/route, unquantized rows).'),
+        'falsified_if': (
+            'Far needles are retrieved better than near ones (the distance '
+            'axis does not measure localisation difficulty), or every op is '
+            'at chance so the axis carries no signal.'),
+    }),
+])
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +715,269 @@ def evaluate_needle_recall_autoregressive(
 
 
 # ---------------------------------------------------------------------------
+# Symbolic rule baselines (no learned weights)
+# ---------------------------------------------------------------------------
+
+def _last_subsequence(haystack: list[int], needle: list[int],
+                      limit: int) -> int | None:
+    """Index of the LAST occurrence of ``needle`` with ``start <= limit``.
+
+    ``limit`` bounds the start index (``start + len(needle) - 1`` may still
+    be the last position examined); returns ``None`` when there is no match.
+    """
+    n = len(needle)
+    if n == 0 or limit < 0:
+        return None
+    last_start = min(limit, len(haystack) - n)
+    for i in range(last_start, -1, -1):
+        if haystack[i:i + n] == needle:
+            return i
+    return None
+
+
+def rule_baseline_predict(
+    input_ids: torch.Tensor,
+    tokenizer: _NeedleCharTokenizer,
+    n_gen: int,
+    *,
+    needle_pos: int | None = None,
+    prefix_tokens: int = _RULE_TEMPLATE_PREFIX_TOKENS,
+) -> dict:
+    """Symbolic copy baselines for the needle task (no model weights).
+
+    ``template``: scan the context for the LAST occurrence of the answer
+    template prefix (the first ``prefix_tokens`` tokens of the fixed answer
+    sentence), then copy the following ``n_gen`` tokens. If the full prefix
+    is absent, shorter prefixes are tried (recorded per row); if no prefix
+    matches at all, the recency heuristic (copy the final ``n_gen`` context
+    tokens) is used. The context region searched ends ``n_gen`` tokens
+    before the sequence end so the copy window stays inside the context.
+
+    ``oracle``: copy ``n_gen`` tokens starting at the ground-truth
+    ``needle_pos`` (only computed when ``needle_pos`` is given). This is a
+    metadata ceiling, not a deployable baseline.
+
+    Returns a dict with ``template_preds`` / ``oracle_preds`` ([B, n_gen]
+    long tensors), ``template_starts``, and ``template_prefix_lens``.
+    """
+    if input_ids.dim() != 2:
+        raise ValueError(
+            'rule_baseline_predict expects [B, T] input_ids, got '
+            f'{tuple(input_ids.shape)}')
+    if n_gen < 1:
+        raise ValueError(f'rule_baseline_predict: n_gen={n_gen} must be >= 1')
+    rows = input_ids.tolist()
+    B, T = input_ids.shape
+    answer_ids = tokenizer.encode(_NEEDLE_ANSWER)
+    max_prefix = max(1, min(int(prefix_tokens), len(answer_ids), n_gen))
+    template_preds: list[list[int]] = []
+    oracle_preds: list[list[int]] | None = [] if needle_pos is not None else None
+    template_starts: list[int] = []
+    template_prefix_lens: list[int] = []
+    for b in range(B):
+        row = rows[b]
+        start = None
+        used = 0
+        for plen in range(max_prefix, 0, -1):
+            start = _last_subsequence(row, answer_ids[:plen], T - n_gen)
+            if start is not None:
+                used = plen
+                break
+        if start is None:
+            start = max(0, T - n_gen)  # recency fallback
+            used = 0
+        span = (row[start:start + n_gen] + [0] * n_gen)[:n_gen]
+        template_preds.append(span)
+        template_starts.append(start)
+        template_prefix_lens.append(used)
+        if oracle_preds is not None:
+            op = max(0, min(int(needle_pos), max(0, T - n_gen)))
+            orow = (row[op:op + n_gen] + [0] * n_gen)[:n_gen]
+            oracle_preds.append(orow)
+    out = {
+        'template_preds': torch.tensor(template_preds, dtype=torch.long,
+                                       device=input_ids.device),
+        'template_starts': template_starts,
+        'template_prefix_lens': template_prefix_lens,
+    }
+    if oracle_preds is not None:
+        out['oracle_preds'] = torch.tensor(oracle_preds, dtype=torch.long,
+                                           device=input_ids.device)
+    return out
+
+
+@torch.no_grad()
+def evaluate_rule_baselines(
+    tokenizer: _NeedleCharTokenizer,
+    context_len: int,
+    needle_pos: int,
+    batch_size: int = 8,
+    n_batches: int = 4,
+    device: str | torch.device = 'cpu',
+) -> dict:
+    """Score the symbolic rule baselines on the SAME held-out eval batches.
+
+    Uses ``eval_batch_seeds`` exactly like ``evaluate_needle_recall``, so
+    the returned accuracies are paired with every trained/untrained model
+    row of the same geometry.
+    """
+    expected = tokenizer.encode(_NEEDLE_ANSWER)
+    n_gen = len(expected)
+    expected_t = torch.tensor(expected, dtype=torch.long, device=device)
+    template_correct = template_token_correct = oracle_correct = 0
+    total = token_total = 0
+    prefix_lens: set[int] = set()
+    for b in range(n_batches):
+        seeds = eval_batch_seeds(b, batch_size)
+        input_ids, _, _ = build_needle_batch(
+            batch_size, context_len, needle_pos, tokenizer, seeds=seeds,
+            device=device)
+        out = rule_baseline_predict(input_ids, tokenizer, n_gen,
+                                    needle_pos=needle_pos)
+        match = out['template_preds'].eq(expected_t.unsqueeze(0))
+        template_correct += int(match.all(dim=1).sum().item())
+        template_token_correct += int(match.sum().item())
+        match_o = out['oracle_preds'].eq(expected_t.unsqueeze(0))
+        oracle_correct += int(match_o.all(dim=1).sum().item())
+        prefix_lens.update(int(p) for p in out['template_prefix_lens'])
+        total += batch_size
+        token_total += batch_size * n_gen
+    return {
+        'rule': 'lexical_template_scan',
+        'template_prefix_tokens': _RULE_TEMPLATE_PREFIX_TOKENS,
+        'template_prefix_lens_used': sorted(prefix_lens),
+        'uses_model_weights': False,
+        'uses_answer_prefix_template': True,
+        'uses_oracle_position': False,
+        'decode_mode': 'rule_copy',
+        'accuracy': template_correct / total if total else 0.0,
+        'token_accuracy': (template_token_correct / token_total
+                           if token_total else 0.0),
+        'correct': template_correct,
+        'total': total,
+        'oracle_position_accuracy': (oracle_correct / total
+                                     if total else 0.0),
+        'oracle_position_correct': oracle_correct,
+        'n_answer_tokens': n_gen,
+        'context_len': context_len,
+        'needle_pos': needle_pos,
+        'chance_uniform_exact_match': (1.0 / tokenizer.vocab_size) ** n_gen,
+        'chance_first_token': 1.0 / tokenizer.vocab_size,
+    }
+
+
+def _needle_row_hypothesis_checks(
+    *,
+    mean_acc: float,
+    untrained_mean: float,
+    rule_acc: float | None,
+    paired: dict | None,
+    n_seeds: int,
+) -> dict:
+    """Machine-readable verdicts for one trained row (fixed rules)."""
+    gain = (mean_acc - untrained_mean
+            if mean_acc is not None and untrained_mean is not None else None)
+    p_dir = None
+    if isinstance(paired, dict):
+        p_dir = (paired.get('t_test') or {}).get('p_value_directional')
+    significant_positive = bool(
+        gain is not None and gain > 0.0 and p_dir is not None
+        and p_dir < 0.05)
+    checks = OrderedDict()
+    checks['learned_retrieval'] = {
+        'prediction': 'trained accuracy > untrained control (seed-paired)',
+        'observed_gain': gain,
+        'n_seeds': int(n_seeds),
+        'p_value_directional': p_dir,
+        'significant_positive_gain_at_0.05': (significant_positive
+                                              if n_seeds >= 2 else None),
+        'evidence': ('inferential' if n_seeds >= 2 else
+                     'descriptive (n<2: no paired test)'),
+        'verdict': (significant_positive if n_seeds >= 2 else None),
+    }
+    if rule_acc is None or mean_acc is None:
+        rule_verdict = None
+        diff = None
+    else:
+        diff = mean_acc - rule_acc
+        rule_verdict = bool(mean_acc >= rule_acc)
+    checks['trained_matches_rule'] = {
+        'prediction': 'trained accuracy >= lexical-scan rule accuracy',
+        'rule_accuracy': rule_acc,
+        'difference': diff,
+        'verdict': rule_verdict,
+    }
+    return checks
+
+
+def summarize_needle_hypotheses(rows: list[dict]) -> dict:
+    """Aggregate the pre-registered verdicts into one summary row."""
+    recall = [r for r in rows if r.get('row_kind') == 'needle_recall']
+    rules = [r for r in rows if r.get('row_kind') == 'needle_rule_baseline']
+    unquant = [r for r in recall if not r.get('quantized')]
+    match_verdicts = []
+    for r in unquant:
+        v = ((r.get('hypothesis_checks') or {})
+             .get('trained_matches_rule') or {}).get('verdict')
+        if v is not None:
+            match_verdicts.append(bool(v))
+    learn_verdicts = []
+    for r in recall:
+        v = ((r.get('hypothesis_checks') or {})
+             .get('learned_retrieval') or {}).get('verdict')
+        if v is not None:
+            learn_verdicts.append(bool(v))
+    # Distance check: unquantized rows grouped by (context, route); compare
+    # the farthest vs nearest needle position (descriptive, seed-averaged).
+    by_axis: dict[tuple, list[tuple[int, float]]] = {}
+    for r in unquant:
+        key = (r.get('context_len'), r.get('memory_type'))
+        by_axis.setdefault(key, []).append(
+            (int(r.get('needle_pos', 0)), float(r.get('accuracy_mean', 0.0))))
+    distance_effects = []
+    for key, pts in sorted(by_axis.items(), key=lambda kv: str(kv[0])):
+        if len(pts) < 2:
+            continue
+        near = min(pts)[1]
+        far = max(pts)[1]
+        distance_effects.append({
+            'context_len': key[0],
+            'memory_type': key[1],
+            'near_accuracy': near,
+            'far_accuracy': far,
+            'far_minus_near': far - near,
+        })
+    distance_verdict = None
+    if distance_effects:
+        distance_verdict = all(d['far_minus_near'] <= 0.0
+                               for d in distance_effects)
+    return {
+        'row_kind': 'needle_summary',
+        'n_recall_rows': len(recall),
+        'n_unquantized_recall_rows': len(unquant),
+        'n_rule_baseline_rows': len(rules),
+        'rule_baseline_accuracy_mean': (
+            sum(r['accuracy'] for r in rules) / len(rules) if rules else None),
+        'rule_baseline_accuracy_min': (
+            min(r['accuracy'] for r in rules) if rules else None),
+        'n_trained_rows_meeting_rule': sum(match_verdicts),
+        'n_trained_rows_below_rule': (len(match_verdicts)
+                                      - sum(match_verdicts)),
+        'all_trained_meet_rule': (all(match_verdicts)
+                                  if match_verdicts else None),
+        'n_learned_retrieval_verdicts_available': len(learn_verdicts),
+        'n_learned_retrieval_supported': sum(learn_verdicts),
+        'distance_effects': distance_effects,
+        'distance_degradation_verdict': distance_verdict,
+        'hypotheses': {k: v['prediction'] for k, v in NEEDLE_HYPOTHESES.items()},
+        'note': ('Verdicts are descriptive aggregates over the rows of this '
+                 'run; with a single seed the learned_retrieval verdict is '
+                 'None (no paired test) and only the rule comparison and '
+                 'distance effect are reported.'),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Training (for QAT probe)
 # ---------------------------------------------------------------------------
 
@@ -881,6 +1239,7 @@ def run_needle_sweep(
     trained: dict[tuple, tuple[dict, dict]] = {}
     untrained_acc: dict[tuple, dict] = {}
     state_meas: dict[tuple, dict] = {}
+    rule_baselines: dict[tuple[int, int], dict] = {}
 
     for cfg in configs:
         logger.info(f'  Running: ctx={cfg.context_len}, pos={cfg.needle_pos}, '
@@ -889,6 +1248,15 @@ def run_needle_sweep(
         dtype_map = {'fp32': torch.float32, 'fp16': torch.float16, 'bf16': torch.bfloat16}
         torch_dtype = dtype_map[cfg.dtype]
         eval_seed_band = eval_batch_seeds(0, batch_size * n_batches)
+
+        # Simplest rung of the baseline ladder: the weight-free lexical-scan
+        # rule, scored on the SAME held-out sequences as every model row.
+        rule_key = (cfg.context_len, cfg.needle_pos)
+        if rule_key not in rule_baselines:
+            rule_baselines[rule_key] = evaluate_rule_baselines(
+                tokenizer, cfg.context_len, cfg.needle_pos,
+                batch_size=batch_size, n_batches=n_batches, device=device)
+        rule = rule_baselines[rule_key]
 
         train_ctx = train_context_len or cfg.context_len
         train_pos = (train_needle_pos if train_needle_pos is not None
@@ -1035,6 +1403,21 @@ def run_needle_sweep(
             'accuracy_gain_over_untrained_mean': (
                 sum(diffs) / len(diffs) if diffs else None),
             'accuracy_gain_paired': paired,
+            # Simplest baseline: weight-free lexical-scan rule on the SAME
+            # held-out sequences (+ oracle-position copy ceiling).
+            'rule_baseline_accuracy': rule['accuracy'],
+            'rule_baseline_token_accuracy': rule['token_accuracy'],
+            'rule_baseline_oracle_position_accuracy': rule[
+                'oracle_position_accuracy'],
+            'rule_baseline_uses_answer_prefix_template': rule[
+                'uses_answer_prefix_template'],
+            'accuracy_gain_over_rule_mean': mean_acc - rule['accuracy'],
+            'hypothesis_checks': _needle_row_hypothesis_checks(
+                mean_acc=mean_acc,
+                untrained_mean=ctrl_mean,
+                rule_acc=rule['accuracy'],
+                paired=paired,
+                n_seeds=len(seeds)),
             'chance_uniform_exact_match': (1.0 / tokenizer.vocab_size) **
                                           per_seed_results[0]['n_answer_tokens'],
             'chance_first_token': 1.0 / tokenizer.vocab_size,
@@ -1079,6 +1462,25 @@ def run_needle_sweep(
                          'this control is tested with summarize_paired'),
             })
 
+        # One rule-baseline row per geometry (independent of route, dtype
+        # and quantization: the rule has no weights), written once.
+        rule_row_key = ('rule_row', cfg.context_len, cfg.needle_pos)
+        if not any(r.get('rule_key') == rule_row_key for r in rows):
+            rows.append({
+                'row_kind': 'needle_rule_baseline',
+                'rule_key': rule_row_key,
+                **rule,
+                'is_trained': False,
+                'note': ('Simplest rung of the baseline ladder: a weight-free '
+                         'template lexical scan (uses a prefix of the fixed '
+                         'answer sentence as domain knowledge) followed by '
+                         'copying; oracle_position_accuracy copies from the '
+                         'ground-truth needle_pos and is a metadata ceiling. '
+                         'A trained row that does not reach rule accuracy has '
+                         'not learned retrieval on this task.'),
+            })
+
+    rows.append(summarize_needle_hypotheses(rows))
     return rows
 
 
@@ -1212,7 +1614,8 @@ def _print_needle_rows(rows: list[dict]):
     logger.info('\n-- Needle-in-haystack recall (full-answer exact match) --')
     header = (f"{'ctx':>5} | {'pos':>5} | {'mem':>7} | {'dtype':>5} | "
               f"{'state':>9} | {'acc mean':>8} | {'ci95':>15} | "
-              f"{'ctrl':>6} | {'gain':>6} | {'st':>5}")
+              f"{'ctrl':>6} | {'rule':>6} | {'gain':>6} | "
+              f"{'>>rule':>6} | {'st':>5}")
     logger.info(header)
     logger.info('-' * len(header))
     for r in rows:
@@ -1224,12 +1627,20 @@ def _print_needle_rows(rows: list[dict]):
         ci_str = f"[{ci[0]:.3f},{ci[1]:.3f}]" if ci else 'n/a'
         st = r.get('accuracy_std')
         st_str = f'{st:.3f}' if st is not None else 'n/a'
+        rule_acc = r.get('rule_baseline_accuracy')
+        rule_str = f'{rule_acc:.3f}' if rule_acc is not None else 'n/a'
+        meets = ((r.get('hypothesis_checks') or {})
+                 .get('trained_matches_rule') or {}).get('verdict')
+        meets_str = ('yes' if meets else 'no') if meets is not None else 'n/a'
         logger.info(
             f"{r['context_len']:>5} | {r['needle_pos']:>5} | {r['memory_type']:>7} | "
             f"{r['dtype']:>5} | {state_str:>9} | "
             f"{r['accuracy_mean']:>8.3f} | {ci_str:>15} | "
             f"{r['untrained_accuracy_mean']:>6.3f} | "
-            f"{r['accuracy_gain_over_untrained_mean']:>+6.3f} | {st_str:>5}")
+            f"{rule_str:>6} | "
+            f"{r['accuracy_gain_over_untrained_mean']:>+6.3f} | "
+            f"{r['accuracy_gain_over_rule_mean']:>+6.3f} | {st_str:>5} "
+            f"[{meets_str}]")
 
 
 def _print_qat_rows(rows: list[dict]):
@@ -1404,6 +1815,29 @@ def main():
             'seeds': list(seeds),
             'quantization': 'PTQ sweep over bits x group_size + asymmetric probe; QAT with STE on stepwise KDA',
             'bf16_support': 'uses ops_kda_autograd bf16 stabilizers; CSA/HCA run in bf16 via fp32 LayerNorm',
+            # Baseline ladder (Exp 4 convention): the simplest rung is a
+            # weight-free rule; the untrained control is the chance floor;
+            # every trained row is compared against BOTH.
+            'baselines': {
+                'rule_lexical_scan': (
+                    'weight-free template match of the fixed answer prefix '
+                    'followed by copying the continuation (no answer-text '
+                    'oracle; the prefix comes from the known answer format)'),
+                'rule_oracle_position': (
+                    'copies from the ground-truth needle_pos metadata; a '
+                    'task-level copy ceiling, not a deployable baseline'),
+                'untrained_control': (
+                    'same architecture/seed with random initialisation, '
+                    'scored on the same held-out evaluation sequences'),
+                'chance': (
+                    'uniform-guess exact match (1/vocab)^n_answer_tokens and '
+                    'first-token chance 1/vocab, both recorded per row'),
+            },
+            'hypotheses': NEEDLE_HYPOTHESES,
+            'hypothesis_verdicts': (
+                'per-row hypothesis_checks (learned_retrieval, '
+                'trained_matches_rule) + one needle_summary row aggregating '
+                'them, including the farthest-vs-nearest distance effect'),
             # Data protocol: sequences are deterministic in their seed, so
             # train/test disjointness is enforced (and audited) at the seed
             # level. The QAT probe trains on (256, 64) geometry and scores

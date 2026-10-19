@@ -46,7 +46,10 @@ from run_needle_haystack import (  # noqa: E402
     NeedleHybridLM,
     NeedleStepwiseKDA,
     evaluate_needle_recall,
+    evaluate_rule_baselines,
+    rule_baseline_predict,
     train_needle_model,
+    NEEDLE_HYPOTHESES,
 )
 from kv_quant import QuantSpec  # noqa: E402
 
@@ -201,6 +204,40 @@ def test_evaluate_needle_recall():
     _ok('total > 0', res['total'] > 0)
 
 
+def test_rule_baseline_recovers_fact():
+    """The weight-free lexical-scan baseline reproduces the planted fact."""
+    print('\nTest: symbolic rule baseline (template scan + oracle copy)')
+    tok = _NeedleCharTokenizer()
+    expected = torch.tensor(tok.encode("The secret code is 42-alpha-7."))
+    for ctx_len, needle_pos in ((128, 16), (256, 64), (512, 128)):
+        # Direct copy semantics on one batch.
+        input_ids, _, _ = build_needle_batch(
+            4, ctx_len, needle_pos, tok, seeds=[0, 1, 2, 3])
+        out = rule_baseline_predict(
+            input_ids, tok, expected.numel(), needle_pos=needle_pos)
+        _ok(f'ctx={ctx_len} template copies the fact',
+            bool(out['template_preds'].eq(expected.unsqueeze(0)).all()),
+            f'preds[0]={out["template_preds"][0].tolist()}')
+        _ok(f'ctx={ctx_len} oracle copies the fact',
+            bool(out['oracle_preds'].eq(expected.unsqueeze(0)).all()))
+        _ok(f'ctx={ctx_len} template starts at needle_pos',
+            all(s == needle_pos for s in out['template_starts']),
+            f'starts={out["template_starts"]}')
+        # Aggregated evaluator uses the held-out eval stream.
+        res = evaluate_rule_baselines(
+            tok, ctx_len, needle_pos, batch_size=4, n_batches=2)
+        _ok(f'ctx={ctx_len} rule exact match == 1.0',
+            res['accuracy'] == 1.0, f'acc={res["accuracy"]}')
+        _ok(f'ctx={ctx_len} oracle ceiling == 1.0',
+            res['oracle_position_accuracy'] == 1.0)
+        _ok(f'ctx={ctx_len} rule uses no weights',
+            res['uses_model_weights'] is False
+            and res['uses_answer_prefix_template'] is True
+            and res['uses_oracle_position'] is False)
+        _ok(f'ctx={ctx_len} chance recorded below 1.0',
+            0.0 < res['chance_uniform_exact_match'] < 1.0)
+
+
 def test_bf16_csa_hca_no_nan_inf():
     """CSA/HCA operators in bf16 produce no NaN/Inf."""
     print('\nTest: CSA/HCA bf16 numerical stability')
@@ -263,6 +300,20 @@ def test_needle_experiment_json_output():
     _ok('has needle_recall rows', 'needle_recall' in row_kinds)
     _ok('has untrained control rows',
         'needle_untrained_control' in row_kinds, f'kinds={sorted(row_kinds)}')
+    _ok('has rule baseline rows',
+        'needle_rule_baseline' in row_kinds, f'kinds={sorted(row_kinds)}')
+    _ok('has hypothesis summary row',
+        'needle_summary' in row_kinds, f'kinds={sorted(row_kinds)}')
+    _ok('design carries the pre-registered hypotheses',
+        set(payload['design'].get('hypotheses', {})) == set(NEEDLE_HYPOTHESES),
+        f"keys={sorted(payload['design'].get('hypotheses', {}))}")
+    _ok('design documents the baseline ladder',
+        'rule_lexical_scan' in payload['design'].get('baselines', {}))
+    rule_rows = [r for r in payload['rows']
+                 if r['row_kind'] == 'needle_rule_baseline']
+    _ok('rule rows are weight-free',
+        all(r.get('is_trained') is False
+            and r.get('uses_model_weights') is False for r in rule_rows))
     recall = [r for r in payload['rows'] if r['row_kind'] == 'needle_recall']
     _ok('every recall row is trained',
         all(r.get('is_trained') is True for r in recall))
@@ -271,6 +322,12 @@ def test_needle_experiment_json_output():
             == 'full_answer_exact_match' for r in recall))
     _ok('recall rows carry CI fields',
         all('accuracy_ci95' in r and 'accuracy_std' in r for r in recall))
+    _ok('recall rows carry the rule comparison + hypothesis checks',
+        all('rule_baseline_accuracy' in r
+            and 'accuracy_gain_over_rule_mean' in r
+            and set(r.get('hypothesis_checks', {}))
+            == {'learned_retrieval', 'trained_matches_rule'}
+            for r in recall))
     _ok('untrained rows carry is_trained=False',
         all(r.get('is_trained') is False for r in payload['rows']
             if r['row_kind'] == 'needle_untrained_control'))
@@ -288,6 +345,7 @@ def main() -> int:
     test_needle_hybrid_lm_stepwise_quant()
     test_stepwise_kda_ste_contract()
     test_evaluate_needle_recall()
+    test_rule_baseline_recovers_fact()
     test_bf16_csa_hca_no_nan_inf()
     test_needle_experiment_json_output()
     print('\n=== ALL NEEDLE HAYSTACK TESTS PASSED ===')
