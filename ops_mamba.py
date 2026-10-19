@@ -302,9 +302,9 @@ def _mamba2_scan_loop_eager(x_dt, decay_slab, C_h, Dx_slab, S):
 def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     """No-grad scan body that updates the recurrent state IN PLACE.
 
-    ``S = decay * S + x`` is evaluated as ``S.mul_(decay).add_(x)``: the
-    same products and sums with the same roundings (bit-identical
-    values). The caller must pass a dedicated copy of the state (this
+    ``S = decay * S + x`` is evaluated as a single in-place ``addcmul``
+    (the same per-element products and sum, without the intermediate
+    tensor). The caller must pass a dedicated copy of the state (this
     function mutates its ``S`` argument) and autograd must be disabled —
     an in-place update of a graph-tracked state would trip the version
     counter. See :func:`_mamba2_scan_loop_eager` for the (autograd-safe)
@@ -320,7 +320,6 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     explicit two-step form so both layouts produce the exact bits they
     produced before the readout was fused.
     """
-    T = x_dt.shape[1]
     x_steps = x_dt.unbind(1)
     decay_steps = decay_slab.unbind(1)
     C_steps = C_h.unbind(1)
@@ -331,14 +330,19 @@ def _mamba2_scan_loop_inplace_eager(x_dt, decay_slab, C_h, Dx_slab, S):
     ys: list[torch.Tensor] = []
     if S.is_contiguous():
         S_T = S.transpose(-1, -2)
-        for t in range(T):
-            S = S.mul_(decay_steps[t]).add_(x_steps[t])
-            ys.append(torch.baddbmm(Dx_steps[t], C_steps[t], S_T))
+        for xs, ds, Cs, Dxs in zip(x_steps, decay_steps, C_steps,
+                                   Dx_steps):
+            # ``S = S * decay + x`` written as one fused ``addcmul`` with
+            # ``out=S`` (the same per-element product/sum; the write is
+            # safe because ``addcmul`` reads each element before writing
+            # it). This replaces the two-kernel mul_/add_ chain.
+            torch.addcmul(xs, S, ds, out=S)
+            ys.append(torch.baddbmm(Dxs, Cs, S_T))
     else:
-        for t in range(T):
-            S = S.mul_(decay_steps[t]).add_(x_steps[t])
-            ys.append(torch.bmm(C_steps[t], S.transpose(-1, -2))
-                      + Dx_steps[t])
+        for xs, ds, Cs, Dxs in zip(x_steps, decay_steps, C_steps,
+                                   Dx_steps):
+            torch.addcmul(xs, S, ds, out=S)
+            ys.append(torch.bmm(Cs, S.transpose(-1, -2)) + Dxs)
     return torch.stack(ys, dim=1).squeeze(-2), S
 
 

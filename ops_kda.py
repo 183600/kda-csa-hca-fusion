@@ -560,17 +560,16 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     The count trades fewer loop iterations (larger ``rows``) against
     keeping the transient ``[..., rows, c1, K]`` block small (smaller
     ``rows``): the per-iteration temporary is proportional to
-    ``B * HV * NT * rows * BT * K`` elements, so the total work
-    ``eff = B * HV * NT * BT * K`` sets the block-write bandwidth and the
-    loop's working-set pressure. The piecewise bands below key the count
-    on ``eff``:
+    ``B * HV * NT * rows * BT * K`` elements. Empirically the best count is
+    governed by the key width (the inner reduction length) and the chunk
+    count, so the bands below key on ``K`` and ``NT``:
 
-    * ``eff <= 16384``: 8 rows.
-    * ``eff <= 32768``: 4 rows.
-    * ``eff <= 131072``: 2 rows.
-    * ``eff <= 262144``: 1 row.
-    * ``eff <= 524288``: 2 rows.
-    * larger ``eff``: 1 row.
+    * ``K <= 16``: 8 rows for ``NT`` <= 32, else 4.
+    * ``K <= 32``: 4 rows for ``NT`` <= 32, 2 for ``NT`` <= 64, else 1.
+    * ``K <= 64``: 4 rows for ``NT`` <= 16, 2 for ``NT`` <= 32, else 1.
+    * ``K <= 128``: 4 rows for ``NT`` <= 8, 2 for ``NT`` <= 16, else 1.
+    * larger ``K``: 8 rows for ``NT`` <= 2, 4 for ``NT`` <= 8, 2 for
+      ``NT`` <= 32, else 1.
 
     The result is capped by ``_ATTN_BLOCK_ROWS_MAX`` and ``BT``.
 
@@ -578,19 +577,17 @@ def _attn_block_rows(B: int, HV: int, NT: int, BT: int, K: int) -> int:
     (see :func:`_chunk_kda_attn_loop_eager`), so this only changes the
     loop granularity.
     """
-    eff = B * HV * NT * BT * K
-    if eff <= 16384:
-        rows = 8
-    elif eff <= 32768:
-        rows = 4
-    elif eff <= 131072:
-        rows = 2
-    elif eff <= 262144:
-        rows = 1
-    elif eff <= 524288:
-        rows = 2
+    if K <= 16:
+        rows = 8 if NT <= 32 else 4
+    elif K <= 32:
+        rows = 4 if NT <= 32 else (2 if NT <= 64 else 1)
+    elif K <= 64:
+        rows = 4 if NT <= 16 else (2 if NT <= 32 else 1)
+    elif K <= 128:
+        rows = 4 if NT <= 8 else (2 if NT <= 16 else 1)
     else:
-        rows = 1
+        rows = (8 if NT <= 2 else 4 if NT <= 8
+                else 2 if NT <= 32 else 1)
     return max(1, min(rows, _ATTN_BLOCK_ROWS_MAX, BT))
 
 
@@ -612,13 +609,14 @@ def _chunk_kda_attn_loop_eager(
     ``sum_k k[c,k] * exp(g[c,k] - g[j,k]) * k[j,k]`` (and the q-weighted
     variant for ``Aqk``), writing each row's ``[:c+1]`` prefix. Rows are
     processed in blocks of ``block_rows``: entry ``(c, j)`` evaluates the
-    identical elementwise sub/clamp/exp/multiply chain followed by the same
-    last-dim ``sum`` as the one-row-at-a-time form, so the values are
-    bit-identical. Entries with ``j > c`` are computed by the block write and
-    then zeroed with ``upper_mask`` (the one-row form left them at their
-    ``torch.zeros`` contents, i.e. exactly ``+0.0``). The Python-level
-    iteration is optionally TorchScript-compiled via
-    :func:`_get_scripted_prep_attn_loop`.
+    identical elementwise sub/clamp/exp/multiply chain followed by a
+    reduction over the last dim (the same mathematical contraction) as the
+    one-row-at-a-time form, so the values agree up to the reduction
+    kernel's floating-point association. Entries with ``j > c`` are
+    computed by the block write and then zeroed with ``upper_mask`` (the
+    one-row form left them at their ``torch.zeros`` contents, i.e. exactly
+    ``+0.0``). The Python-level iteration is optionally TorchScript-compiled
+    via :func:`_get_scripted_prep_attn_loop`.
     """
     for c0 in range(0, BT, block_rows):
         c1 = min(BT, c0 + block_rows)
@@ -640,10 +638,11 @@ def _chunk_kda_attn_loop_eager(
             t = g_diff * k[..., :c1, :].unsqueeze(-3)
         else:
             t = g_diff.mul_(k[..., :c1, :].unsqueeze(-3))
-        A[..., c0:c1, :c1] = (k[..., c0:c1, :].unsqueeze(-2) * t).sum(-1)
+        A[..., c0:c1, :c1] = torch.einsum(
+            '...rck,...rk->...rc', t, k[..., c0:c1, :])
         if not recompute_attn:
-            Aqk[..., c0:c1, :c1] = (
-                q[..., c0:c1, :].unsqueeze(-2) * t).sum(-1)
+            Aqk[..., c0:c1, :c1] = torch.einsum(
+                '...rck,...rk->...rc', t, q[..., c0:c1, :])
     if block_rows > 1:
         # Multi-row blocks write within-block entries with ``j > c`` as well,
         # which must be zeroed. With ``block_rows == 1`` every row writes
@@ -781,10 +780,21 @@ def _chunk_kda_prepare(
     # contiguous q / k tensors; with G == 1 the GVA expansion is a pure
     # identity.
     if G == 1:
-        q = q.contiguous() * scale
+        q = q.contiguous()
+        if torch.is_grad_enabled():
+            q = q * scale
+        else:
+            # ``contiguous()`` above is a fresh private buffer outside
+            # autograd, so the scale runs in place (same elementwise
+            # product, one fewer full-size copy).
+            q.mul_(scale)
         k = k.contiguous()
     else:
-        q = q.repeat_interleave(G, dim=1) * scale
+        q = q.repeat_interleave(G, dim=1)
+        if torch.is_grad_enabled():
+            q = q * scale
+        else:
+            q.mul_(scale)
         k = k.repeat_interleave(G, dim=1)
     if g_clamp_min > -float('inf'):
         if g_owned:
@@ -826,8 +836,7 @@ def _chunk_kda_prepare(
     # the strict upper triangle stays at the zeros from the allocation above
     # and the diagonal is explicitly zeroed right after the loop. The loop
     # walks rows rather than columns; entry ``(c, j)`` computes
-    # ``sum_k k[c,k] * exp(g[c,k]-g[j,k]) * k[j,k]``, so the values are
-    # bit-identical.
+    # ``sum_k k[c,k] * exp(g[c,k]-g[j,k]) * k[j,k]`` as one contraction.
     # The row loop itself is shared with ``_chunk_kda_attn_loop_eager`` (see
     # :func:`_get_scripted_prep_attn_loop`); the eager fallback runs the same
     # loop. In ``recompute_attn`` mode ``Aqk`` is None, and the loop receives
@@ -1014,22 +1023,28 @@ def _chunk_kda_inner_loop(
     gexp_all = gexp
     glast_all = gexp_all[..., -1, :].unsqueeze(-1)
     grad_enabled = torch.is_grad_enabled()
-    for i in range(NT):
-        q_i = q[:, :, i]
-        u_i = u[:, :, i]
-        w_i = w[:, :, i]
-        k_i = k[:, :, i]
+    q_chunks = q.unbind(2)
+    u_chunks = u.unbind(2)
+    w_chunks = w.unbind(2)
+    k_chunks = k.unbind(2)
+    gexp_chunks = gexp_all.unbind(2)
+    g_chunks = g.unbind(2)
+    glast_chunks = glast_all.unbind(2)
+    Aqk_chunks = Aqk.unbind(2)
+    for i, (q_i, u_i, w_i, k_i, gexp_i, g_i, glast_i, Aqk_i) in enumerate(
+            zip(q_chunks, u_chunks, w_chunks, k_chunks, gexp_chunks,
+                g_chunks, glast_chunks, Aqk_chunks)):
         # Each chunk of ``u`` is consumed exactly once, so outside autograd
         # the subtraction runs on its slice (one fewer chunk-sized
         # allocation; identical values). While a graph is recorded the
         # out-of-place form is kept.
         if grad_enabled:
             v_i = u_i - w_i @ S
-            row = (q_i * gexp_all[:, :, i]) @ S + Aqk[:, :, i] @ v_i
+            row = (q_i * gexp_i) @ S + Aqk_i @ v_i
         else:
             v_i = u_i.sub_(w_i @ S)
-            row = (q_i * gexp_all[:, :, i]) @ S
-            row.add_(Aqk[:, :, i] @ v_i)
+            row = (q_i * gexp_i) @ S
+            row.add_(Aqk_i @ v_i)
         if o is not None:
             o[:, :, i] = row
         else:
@@ -1049,7 +1064,7 @@ def _chunk_kda_inner_loop(
         # exp / product as the former whole-sequence tensor, evaluated on the
         # identical values) so only one ``[B, HV, BT, K]`` temporary is live
         # instead of the full ``[B, HV, NT, BT, K]`` map.
-        kexp_i = g[:, :, i, -1:, :] - g[:, :, i]
+        kexp_i = g_i[..., -1:, :] - g_i
         kexp_i.exp_()
         if grad_enabled:
             # ``exp`` backward saves its output, so the multiply stays out
@@ -1058,11 +1073,11 @@ def _chunk_kda_inner_loop(
         else:
             kexp_i.mul_(k_i)
         if grad_enabled:
-            S = S * glast_all[:, :, i] + kexp_i.transpose(-1, -2) @ v_i
+            S = S * glast_i + kexp_i.transpose(-1, -2) @ v_i
         else:
             # ``S`` is this call's freshly-allocated running state; the
             # in-place multiply/add spell the identical elementwise chain.
-            S = S.mul_(glast_all[:, :, i]).add_(
+            S = S.mul_(glast_i).add_(
                 kexp_i.transpose(-1, -2) @ v_i)
     if o is not None:
         return o, S
@@ -1101,21 +1116,20 @@ def _chunk_kda_inner_loop_recompute(
     the current chunk only, from the already-materialized ``q`` / ``k`` and
     the cumsum gates ``g``.
 
-    The column update is kept textually aligned with
-    ``_chunk_kda_prepare``'s loop body (``diff = g - g_col``,
-    ``(q * exp(diff)) * k_col`` reduced over the contiguous last dim), so
-    both variants perform the same per-element operations in the same
-    order.
+    The column update mirrors ``_chunk_kda_prepare``'s loop body
+    (``diff = g - g_col``, ``(q * exp(diff)) * k_col`` reduced over the
+    contiguous last dim), so both variants perform the same per-element
+    operations and contraction.
 
     ``clamp_g_diff`` must be the flag computed by ``_chunk_kda_prepare``
     (``max(g) - min(g) > 50`` anywhere), so both variants clamp identically.
 
     ``block_rows`` sets the column-block granularity of the rebuild
     (see :func:`_recompute_block_rows`): entry ``(c, j)`` still evaluates
-    the identical elementwise sub / clamp / exp / multiply chain in the same
-    association (``(q * exp(diff)) * k``, reduced over the contiguous last
-    dim), so the values are unchanged; only the Python loop granularity
-    differs. Entries with ``j > c`` are zeroed by ``upper_mask``.
+    the same elementwise sub / clamp / exp / multiply chain and reduction
+    over the last dim (``(q * exp(diff)) * k``); only the Python loop
+    granularity differs. Entries with ``j > c`` are zeroed by
+    ``upper_mask``.
 
     Returns the assembled ``[B, HV, NT, BT, V]`` output tensor, with the
     same no-grad preallocated-buffer / grad list-plus-stack split as
@@ -1158,8 +1172,8 @@ def _chunk_kda_inner_loop_recompute(
                 diff = diff.clamp(max=50.0)
             diff.exp_()
             qe = q_i[..., j0:, :].unsqueeze(-2) * diff
-            Aqk_i[..., j0:, j0:j1] = (
-                qe * k_i[..., j0:j1, :].unsqueeze(-3)).sum(-1)
+            Aqk_i[..., j0:, j0:j1] = torch.einsum(
+                '...rck,...ck->...rc', qe, k_i[..., j0:j1, :])
         Aqk_i.masked_fill_(upper_mask, 0)
         if grad_enabled:
             v_i = u_i - w_i @ S
