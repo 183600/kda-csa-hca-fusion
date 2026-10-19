@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import torch
 
+from ops_cache import normal_tensor_scope
 from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import (csa_compress_kv, _csa_compress_kv_overlapped_prev,
                      csa_lightning_indexer, _qk_normalize, _qk_normalize_)
@@ -193,7 +194,8 @@ def _block_valid_mask(n_blocks: int, b_threshold: int,
     key = (n_blocks, b_threshold, str(device))
     mask = _BLOCK_VALID_MEMO.get(key)
     if mask is None:
-        mask = torch.arange(n_blocks, device=device) < b_threshold
+        with normal_tensor_scope():
+            mask = torch.arange(n_blocks, device=device) < b_threshold
         if len(_BLOCK_VALID_MEMO) >= 128:
             _BLOCK_VALID_MEMO.clear()
         _BLOCK_VALID_MEMO[key] = mask
@@ -205,7 +207,8 @@ def _bool_ones(B: int, n: int, device) -> torch.Tensor:
     key = (B, n, str(device))
     mask = _BOOL_ONES_MEMO.get(key)
     if mask is None:
-        mask = torch.ones(B, 1, 1, n, dtype=torch.bool, device=device)
+        with normal_tensor_scope():
+            mask = torch.ones(B, 1, 1, n, dtype=torch.bool, device=device)
         if len(_BOOL_ONES_MEMO) >= 64:
             _BOOL_ONES_MEMO.clear()
         _BOOL_ONES_MEMO[key] = mask
@@ -228,7 +231,10 @@ def _pos_tensor(value: int, device) -> torch.Tensor:
     if buf is None:
         if len(_POS_SCRATCH) >= 8:
             _POS_SCRATCH.clear()
-        buf = torch.zeros(1, dtype=torch.long, device=device)
+        # Ordinary tensor: the scratch outlives the inference-mode call that
+        # created it, so a later ``no_grad`` call must be allowed to write it.
+        with normal_tensor_scope():
+            buf = torch.zeros(1, dtype=torch.long, device=device)
         _POS_SCRATCH[key] = buf
     buf.fill_(value)
     return buf

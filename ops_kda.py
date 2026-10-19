@@ -26,6 +26,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from ops_cache import normal_tensor_scope
+
 # Non-finite-output guard. The check is a full-output reduction, so
 # latency-bound callers (e.g. per-token decoding loops) can opt out via
 # ``KDA_NONFINITE_WARN=0`` (or by setting this module flag to False)
@@ -700,9 +702,11 @@ def _chunk_constants(BT: int, dtype: torch.dtype, device):
     key = (BT, dtype, str(device))
     entry = _CHUNK_CONST_CACHE.get(key)
     if entry is None:
-        eye = torch.eye(BT, dtype=dtype, device=device)
-        upper_mask = torch.triu(
-            torch.ones(BT, BT, dtype=torch.bool, device=device), diagonal=1)
+        with normal_tensor_scope():
+            eye = torch.eye(BT, dtype=dtype, device=device)
+            upper_mask = torch.triu(
+                torch.ones(BT, BT, dtype=torch.bool, device=device),
+                diagonal=1)
         if len(_CHUNK_CONST_CACHE) >= 64:
             _CHUNK_CONST_CACHE.clear()
         entry = (eye, upper_mask)

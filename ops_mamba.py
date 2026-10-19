@@ -69,6 +69,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ops_cache import normal_tensor_scope
+
 __all__ = [
     "Mamba2Mixer",
     "build_mamba2_mixer",
@@ -222,8 +224,9 @@ def _causal_chunk_mask(BT: int, device) -> torch.Tensor:
     key = (BT, str(device))
     mask = _CAUSAL_CHUNK_MASK_CACHE.get(key)
     if mask is None:
-        mask = torch.tril(
-            torch.ones(BT, BT, dtype=torch.bool, device=device))
+        with normal_tensor_scope():
+            mask = torch.tril(
+                torch.ones(BT, BT, dtype=torch.bool, device=device))
         if BT * BT <= _CAUSAL_CHUNK_MASK_MAX_ELEMS:
             if len(_CAUSAL_CHUNK_MASK_CACHE) >= 64:
                 _CAUSAL_CHUNK_MASK_CACHE.clear()
@@ -242,7 +245,8 @@ def _noncausal_chunk_mask(BT: int, device) -> torch.Tensor:
     key = (BT, str(device))
     mask = _NONCAUSAL_CHUNK_MASK_CACHE.get(key)
     if mask is None:
-        mask = ~_causal_chunk_mask(BT, device)
+        with normal_tensor_scope():
+            mask = ~_causal_chunk_mask(BT, device)
         if BT * BT <= _CAUSAL_CHUNK_MASK_MAX_ELEMS:
             if len(_NONCAUSAL_CHUNK_MASK_CACHE) >= 64:
                 _NONCAUSAL_CHUNK_MASK_CACHE.clear()

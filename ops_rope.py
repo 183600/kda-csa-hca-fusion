@@ -47,6 +47,14 @@ Design notes (interpretation choices the paper leaves open)
 
 The rotation is applied via :func:`partial_rope`; the inverse rotation is
 the same function with negated positions.
+
+5. **Cache tensor ownership.** The angle/position caches hold ORDINARY
+   tensors even when populated from inside ``torch.inference_mode()`` (see
+   ``ops_cache.normal_tensor_scope``). Inference tensors carry no version
+   counter and cannot be saved for backward, so caching one would crash the
+   next long-context inference call (identity-cache key reads
+   ``positions._version``) or the next grad-enabled call. Regression tests:
+   ``test_rope_inference_mode.py`` and ``test_cache_inference_mode.py``.
 """
 
 from __future__ import annotations
@@ -55,6 +63,8 @@ import collections as _collections
 import weakref as _weakref
 
 import torch
+
+from ops_cache import normal_tensor_scope
 
 
 def effective_rope_dim(requested: int | None, head_dim: int) -> int:
@@ -87,6 +97,11 @@ def _angle_dtype(x: torch.Tensor) -> torch.dtype:
     return torch.float64 if x.dtype == torch.float64 else torch.float32
 
 
+# Backwards-compatible local name; the shared implementation lives in
+# ``ops_cache`` so every operator uses the same cache-ownership rule.
+_normal_tensor_scope = normal_tensor_scope
+
+
 # ``inv_freq = base ** (-arange(0, rope_dim, 2) / rope_dim)`` depends only on
 # (rope_dim, base, device, dtype) — never on the data. The tensors are treated
 # as immutable by all callers.
@@ -98,10 +113,11 @@ def _inv_freq(rope_dim: int, base: float, device, dtype: torch.dtype) -> torch.T
     key = (rope_dim, float(base), str(device), dtype)
     inv_freq = _INV_FREQ_CACHE.get(key)
     if inv_freq is None:
-        inv_freq = base ** (
-            -torch.arange(0, rope_dim, 2, dtype=dtype, device=device)
-            / float(rope_dim)
-        )
+        with _normal_tensor_scope():
+            inv_freq = base ** (
+                -torch.arange(0, rope_dim, 2, dtype=dtype, device=device)
+                / float(rope_dim)
+            )
         _INV_FREQ_CACHE[key] = inv_freq
     return inv_freq
 
@@ -219,10 +235,15 @@ def _cos_sin_cached(
     if entry is not None:
         _TABLE_CACHE.move_to_end(key)
         return entry
-    pos_f = positions.to(device=device, dtype=angle_dtype)
-    angles = pos_f[:, None] * _inv_freq(rope_dim, base, device, angle_dtype)[None, :]
-    cos = angles.cos()
-    sin = angles.sin()
+    # Build the cached tables as ORDINARY tensors (see
+    # :func:`_normal_tensor_scope`): a table created during an
+    # inference-mode warm-up stays usable for every later autograd call.
+    with _normal_tensor_scope():
+        pos_f = positions.to(device=device, dtype=angle_dtype)
+        angles = (pos_f[:, None]
+                  * _inv_freq(rope_dim, base, device, angle_dtype)[None, :])
+        cos = angles.cos()
+        sin = angles.sin()
     entry_elems = cos.numel() + sin.numel()
     if entry_elems <= _TABLE_CACHE_MAX_ELEMS:
         while _TABLE_CACHE and (
@@ -249,20 +270,28 @@ def _cos_sin_by_identity(
     cached pair when the same tensor object with the same contents is
     passed again (the common case: one layer forward reuses ``tpos``).
     """
-    key = (id(positions), positions.data_ptr(), positions._version,
-           tuple(positions.shape), positions.dtype, rope_dim, float(base),
-           str(device), angle_dtype)
-    entry = _IDENTITY_TABLE_CACHE.get(key)
-    if entry is not None:
-        ref, cos, sin = entry
-        if ref() is positions:
-            return cos, sin
-        _IDENTITY_TABLE_CACHE.pop(key, None)
-    pos_f = positions.to(device=device, dtype=angle_dtype)
-    angles = pos_f[:, None] * _inv_freq(rope_dim, base, device, angle_dtype)[None, :]
-    cos = angles.cos()
-    sin = angles.sin()
-    if cos.numel() + sin.numel() <= _TABLE_CACHE_MAX_ELEMS:
+    # Inference tensors have NO version counter, so they cannot be keyed (and
+    # are created by callers inside ``torch.inference_mode()`` for every
+    # long-context forward). Compute their tables directly, still as
+    # ordinary tensors so the result can feed a later autograd pass.
+    cacheable = not positions.is_inference()
+    if cacheable:
+        key = (id(positions), positions.data_ptr(), positions._version,
+               tuple(positions.shape), positions.dtype, rope_dim, float(base),
+               str(device), angle_dtype)
+        entry = _IDENTITY_TABLE_CACHE.get(key)
+        if entry is not None:
+            ref, cos, sin = entry
+            if ref() is positions:
+                return cos, sin
+            _IDENTITY_TABLE_CACHE.pop(key, None)
+    with _normal_tensor_scope():
+        pos_f = positions.to(device=device, dtype=angle_dtype)
+        angles = (pos_f[:, None]
+                  * _inv_freq(rope_dim, base, device, angle_dtype)[None, :])
+        cos = angles.cos()
+        sin = angles.sin()
+    if cacheable and cos.numel() + sin.numel() <= _TABLE_CACHE_MAX_ELEMS:
         if len(_IDENTITY_TABLE_CACHE) >= 8:
             _IDENTITY_TABLE_CACHE.clear()
         _IDENTITY_TABLE_CACHE[key] = (_weakref.ref(positions), cos, sin)
@@ -424,7 +453,12 @@ def token_positions(T: int, device, dtype=torch.long) -> torch.Tensor:
     key = ('tok', T, str(device), str(dtype))
     pos = _POSITION_VEC_CACHE.get(key)
     if pos is None:
-        pos = torch.arange(T, device=device, dtype=dtype)
+        # Ordinary tensor even when the call happens under
+        # ``torch.inference_mode()`` (see :func:`_normal_tensor_scope`):
+        # cached inference tensors have no version counter, which the
+        # long-context identity-table cache key requires.
+        with _normal_tensor_scope():
+            pos = torch.arange(T, device=device, dtype=dtype)
         if len(_POSITION_VEC_CACHE) >= 64:
             _POSITION_VEC_CACHE.clear()
         _POSITION_VEC_CACHE[key] = pos
@@ -441,7 +475,10 @@ def block_positions(n_blocks: int, m: int, device,
     key = ('blk', n_blocks, m, str(device), str(dtype))
     pos = _POSITION_VEC_CACHE.get(key)
     if pos is None:
-        pos = torch.arange(n_blocks, device=device, dtype=dtype) * m
+        # Ordinary tensor even under inference mode (see
+        # :func:`_normal_tensor_scope`).
+        with _normal_tensor_scope():
+            pos = torch.arange(n_blocks, device=device, dtype=dtype) * m
         if len(_POSITION_VEC_CACHE) >= 64:
             _POSITION_VEC_CACHE.clear()
         _POSITION_VEC_CACHE[key] = pos

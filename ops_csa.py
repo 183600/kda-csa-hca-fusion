@@ -21,6 +21,7 @@ import weakref
 import torch
 import torch.nn.functional as F
 
+from ops_cache import normal_tensor_scope
 from ops_rope import (
     effective_rope_dim,
     partial_rope,
@@ -110,9 +111,10 @@ def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:
     key = (T, win, str(device))
     mask = _SLIDING_WINDOW_MASK_CACHE.get(key)
     if mask is None:
-        _j = torch.arange(win, device=device)
-        _t = torch.arange(T, device=device)
-        mask = _j[None, :] >= (win - 1 - _t[:, None])
+        with normal_tensor_scope():
+            _j = torch.arange(win, device=device)
+            _t = torch.arange(T, device=device)
+            mask = _j[None, :] >= (win - 1 - _t[:, None])
         if len(_SLIDING_WINDOW_MASK_CACHE) >= 64:
             _SLIDING_WINDOW_MASK_CACHE.clear()
         _SLIDING_WINDOW_MASK_CACHE[key] = mask
@@ -406,9 +408,10 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
     cached = _CAUSAL_BLOCK_MASK_CACHE.get(key)
     if cached is not None:
         return cached
-    i_t = torch.arange(T, device=device)
-    i_b = torch.arange(n_blocks, device=device)
-    mask = i_t[:, None] // m > i_b[None, :]
+    with normal_tensor_scope():
+        i_t = torch.arange(T, device=device)
+        i_b = torch.arange(n_blocks, device=device)
+        mask = i_t[:, None] // m > i_b[None, :]
     if len(_CAUSAL_BLOCK_MASK_CACHE) >= 64:
         _CAUSAL_BLOCK_MASK_CACHE.clear()
     _CAUSAL_BLOCK_MASK_CACHE[key] = mask
@@ -430,7 +433,8 @@ def _causal_block_mask_invalid(T: int, n_blocks: int, m: int,
     cached = _CAUSAL_BLOCK_MASK_INVALID_CACHE.get(key)
     if cached is not None:
         return cached
-    invalid = ~_causal_block_mask(T, n_blocks, m, device)
+    with normal_tensor_scope():
+        invalid = ~_causal_block_mask(T, n_blocks, m, device)
     if len(_CAUSAL_BLOCK_MASK_INVALID_CACHE) >= 64:
         _CAUSAL_BLOCK_MASK_INVALID_CACHE.clear()
     _CAUSAL_BLOCK_MASK_INVALID_CACHE[key] = invalid
