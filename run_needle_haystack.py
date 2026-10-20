@@ -319,20 +319,68 @@ def draw_train_seeds(generator, batch_size: int) -> list[int]:
     return seeds.cpu().tolist()
 
 
-def audit_train_eval_seed_disjointness(train_seeds, eval_seeds) -> dict:
-    """Independent check that no training seed is an evaluation seed."""
+def audit_train_eval_seed_disjointness(train_seeds, eval_seeds,
+                                        val_seeds=None) -> dict:
+    """Independent check of train / validation / evaluation seed streams.
+
+    Historical fields (``disjoint``, ``overlap_count``, ...) keep their
+    train-vs-eval meaning. When ``val_seeds`` is supplied, the audit also
+    checks the two remaining pairs and verifies that every stream lies in
+    its declared band:
+
+      * train: [EVAL_SEED_RESERVE, SEED_CEILING)
+      * eval:  [0, EVAL_SEED_RESERVE), and in the three-way protocol also
+               below ``VAL_SEED_BASE`` so it cannot enter the validation
+               reservation;
+      * val:   [VAL_SEED_BASE, EVAL_SEED_RESERVE)
+
+    ``all_disjoint`` is the pairwise AND over every supplied stream and
+    ``bands_ok`` is the membership AND, so a caller can require both
+    instead of checking only train-vs-eval.
+    """
     train = {int(s) for s in train_seeds}
     ev = {int(s) for s in eval_seeds}
-    overlap = sorted(train & ev)
+    val = {int(s) for s in (val_seeds or [])}
+    train_eval = sorted(train & ev)
+    train_val = sorted(train & val)
+    eval_val = sorted(ev & val)
+    train_in_band = all(EVAL_SEED_RESERVE <= s < SEED_CEILING
+                        for s in train)
+    eval_in_band = all(0 <= s < EVAL_SEED_RESERVE for s in ev)
+    val_in_band = all(VAL_SEED_BASE <= s < EVAL_SEED_RESERVE for s in val)
+    eval_avoids_val = all(s < VAL_SEED_BASE for s in ev)
+    all_disjoint = not (train_eval or train_val or eval_val)
+    bands_ok = bool(train_in_band and eval_in_band
+                    and (not val or (val_in_band and eval_avoids_val)))
     return {
         'train_seed_min': min(train) if train else None,
         'train_seed_max': max(train) if train else None,
         'n_train_seeds': len(train),
         'n_eval_seeds': len(ev),
+        'n_val_seeds': len(val),
         'eval_seed_band': [0, EVAL_SEED_RESERVE],
-        'overlap_count': len(overlap),
-        'disjoint': not overlap,
-        'overlap_examples': overlap[:8],
+        'val_seed_band': [VAL_SEED_BASE, EVAL_SEED_RESERVE],
+        'train_seed_band_declared': [EVAL_SEED_RESERVE, SEED_CEILING],
+        'overlap_count': len(train_eval),
+        # With a validation stream supplied, ``disjoint`` means the full
+        # three-way pairwise contract; otherwise it keeps the historical
+        # train-vs-eval meaning.
+        'disjoint': (all_disjoint if val_seeds is not None
+                     else not train_eval),
+        'overlap_examples': train_eval[:8],
+        'total_overlap_count': (len(train_eval) + len(train_val)
+                                + len(eval_val)),
+        'train_val_overlap_count': len(train_val),
+        'train_val_overlap_examples': train_val[:8],
+        'eval_val_overlap_count': len(eval_val),
+        'eval_val_overlap_examples': eval_val[:8],
+        'disjoint_from_val': not (train_val or eval_val),
+        'all_disjoint': all_disjoint,
+        'train_in_band': bool(train_in_band),
+        'eval_in_band': bool(eval_in_band),
+        'val_in_band': bool(val_in_band),
+        'eval_avoids_val_band': bool(eval_avoids_val),
+        'bands_ok': bands_ok,
     }
 
 
@@ -1281,6 +1329,12 @@ def train_needle_model(
                     set(val_seeds) & set(data_seeds)),
                 'disjoint_from_eval': not (
                     set(val_seeds) & set(eval_batch_seeds(0, 1))),
+                # Three-way audit: pairwise disjointness plus membership
+                # in the declared train/eval/val seed bands. The old two
+                # booleans above only compared val with one eval batch.
+                'seed_audit': audit_train_eval_seed_disjointness(
+                    data_seeds, eval_batch_seeds(0, 1),
+                    val_seeds=val_seeds),
             },
         })
         val_curve.log_verdict(monitor)
@@ -1511,11 +1565,15 @@ def run_needle_sweep(
                     train_steps, train_batch_size, train_lr, device, seed,
                     val_every=val_every, val_batches=val_batches)
                 audit = audit_train_eval_seed_disjointness(
-                    rep['data_seeds'], eval_seed_band)
-                if not audit['disjoint']:
+                    rep['data_seeds'], eval_seed_band,
+                    val_seeds=rep.get('val_seeds'))
+                if not (audit['all_disjoint'] and audit['bands_ok']):
                     raise RuntimeError(
-                        'needle train/eval seed audit failed for '
-                        f'{key}: overlap {audit["overlap_examples"]}')
+                        'needle train/val/eval seed audit failed for '
+                        f'{key}: train/eval={audit["overlap_examples"]}, '
+                        f'train/val={audit["train_val_overlap_examples"]}, '
+                        f'eval/val={audit["eval_val_overlap_examples"]}, '
+                        f'bands_ok={audit["bands_ok"]}')
                 rep['data_protocol'] = audit
                 trained[key] = ({k: v.detach().clone()
                                  for k, v in model.state_dict().items()}, rep)
@@ -1891,11 +1949,17 @@ def run_qat_needle_probe(
             list(fp16_rep.get('data_seeds') or [])
             + list(qat_rep.get('data_seeds') or [])
             + list(fp16_cont_rep.get('data_seeds') or []),
-            eval_seeds)
-        if not stream_audit['disjoint']:
+            eval_seeds,
+            val_seeds=(list(fp16_rep.get('val_seeds') or [])
+                       + list(qat_rep.get('val_seeds') or [])
+                       + list(fp16_cont_rep.get('val_seeds') or [])))
+        if not (stream_audit['all_disjoint'] and stream_audit['bands_ok']):
             raise RuntimeError(
-                'needle train/eval seed audit failed: training saw evaluation '
-                f'seeds {stream_audit["overlap_examples"]}; refusing to report '
+                'needle train/val/eval seed audit failed: overlapping or '
+                f'out-of-band seeds {stream_audit["overlap_examples"]} / '
+                f'{stream_audit["train_val_overlap_examples"]} / '
+                f'{stream_audit["eval_val_overlap_examples"]} '
+                f'(bands_ok={stream_audit["bands_ok"]}); refusing to report '
                 'leaked numbers')
 
         # Recovery fraction: 1 - (QAT_damage / PTQ_damage)

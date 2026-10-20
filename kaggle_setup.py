@@ -1196,6 +1196,93 @@ def largest_remainder_sizes(n_units: int, fractions) -> list:
     return sizes
 
 
+def _partition_group_order(order, members, targets, active, buckets):
+    """Assign whole groups to consecutive active buckets with balanced cuts.
+
+    The group order is either the seeded shuffle (i.i.d. groups) or the
+    first-appearance order (chronological groups). In both cases groups
+    must stay whole, so the only legal partitions are contiguous cuts of
+    this order. The old greedy walk could overshoot a bucket with one
+    large group and then leave the following bucket EMPTY (e.g. group
+    sizes 60/30/10 with 10% val + 10% test produced 100/0/0). Here the
+    cuts are chosen to minimise the target-relative squared deviation,
+    subject to every requested bucket receiving at least one group when
+    there are enough groups. Fewer than ``len(active)`` groups cannot be
+    partitioned into non-empty requested buckets; the caller's audit then
+    rejects the split instead of silently training on an empty split.
+    """
+    import bisect
+    n_groups = len(order)
+    k = len(active)
+    result = {b: [] for b in buckets}
+    if k == 0 or n_groups == 0:
+        return result
+    if k == 1:
+        for g in order:
+            result[buckets[active[0]]].extend(members[g])
+        return result
+    if n_groups < k:
+        # Not enough indivisible groups for non-empty requested buckets.
+        # Assign one group per bucket in order, then the rest to the last
+        # bucket; audit_split will flag the empty bucket(s).
+        for pos, g in enumerate(order):
+            result[buckets[active[min(pos, k - 1)]]].extend(members[g])
+        return result
+
+    sizes = [len(members[g]) for g in order]
+    prefix = [0]
+    for size in sizes:
+        prefix.append(prefix[-1] + size)
+    total = prefix[-1]
+
+    def _seg_error(size, target):
+        # Relative squared deviation: a 2-row error matters much more on a
+        # 10-row test set than on a 1000-row train set.
+        return ((size - target) ** 2) / float(max(target, 1))
+
+    if k == 2:
+        desired = targets[active[0]]
+        best = None
+        for c in range(1, n_groups):
+            err = (_seg_error(prefix[c], desired)
+                   + _seg_error(total - prefix[c],
+                                targets[active[1]]))
+            if best is None or err < best[0]:
+                best = (err, c)
+        cut = best[1]
+        bounds = [0, cut, n_groups]
+    else:
+        # k == 3 (train/val/test). Search the first cut exhaustively and
+        # the second around its target cumulative size.
+        desired1 = targets[active[0]]
+        desired2 = desired1 + targets[active[1]]
+        best = None
+        for c1 in range(1, n_groups - 1):
+            want = desired2
+            start = c1 + 1
+            j0 = bisect.bisect_left(prefix, want, start, n_groups)
+            for c2 in {j0 - 1, j0, j0 + 1}:
+                if not (start <= c2 <= n_groups - 1):
+                    continue
+                err = (_seg_error(prefix[c1], targets[active[0]])
+                       + _seg_error(prefix[c2] - prefix[c1],
+                                    targets[active[1]])
+                       + _seg_error(total - prefix[c2],
+                                    targets[active[2]]))
+                if best is None or err < best[0]:
+                    best = (err, c1, c2)
+        if best is None:
+            # Degenerate fallback (should be unreachable for n_groups>=3).
+            bounds = [0, 1, n_groups]
+        else:
+            bounds = [0, best[1], best[2], n_groups]
+
+    for bi, bucket in enumerate(active):
+        for g in order[bounds[bi]:bounds[bi + 1]]:
+            result[buckets[bucket]].extend(members[g])
+    return result
+
+
 def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
                          test_frac: float = 0.1, seed: int = 0,
                          group_ids=None, chronological: bool = False) -> dict:
@@ -1278,6 +1365,16 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
         # Only possible when n < 1 (guarded above); keep the invariant.
         result['train'] = list(range(n))
         return result
+    if members is not None:
+        # Whole-group partition. The order is the seeded shuffle for
+        # i.i.d. groups or first-appearance order for chronological data;
+        # either way, cut it into contiguous whole-group blocks.
+        result = _partition_group_order(
+            order, members, targets, active, buckets)
+        for key in result:
+            result[key].sort()
+        return result
+
     counts = [0, 0, 0]
     bucket_ptr = 0
     for unit in order:
@@ -1286,18 +1383,15 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
                targets[active[bucket_ptr]]):
             bucket_ptr += 1
         idx = active[bucket_ptr]
-        if members is None:
-            result[buckets[idx]].append(unit)
-            counts[idx] += 1
-        else:
-            result[buckets[idx]].extend(members[unit])
-            counts[idx] += len(members[unit])
+        result[buckets[idx]].append(unit)
+        counts[idx] += 1
     for key in result:
         result[key].sort()
     return result
 
 
-def audit_split(split: dict, n_samples: int, group_ids=None) -> dict:
+def audit_split(split: dict, n_samples: int, group_ids=None,
+                chronological: bool = False) -> dict:
     """Independently verify a train/val/test assignment has no leakage.
 
     Checks, in order:
@@ -1308,7 +1402,13 @@ def audit_split(split: dict, n_samples: int, group_ids=None) -> dict:
       * every index of ``range(n_samples)`` appears exactly once
         (silent row loss would bias the evaluation);
       * train/val/test are non-empty;
-      * if ``group_ids`` is given, no group straddles two splits.
+      * if ``group_ids`` is given, no group straddles two splits;
+      * if ``chronological`` is set, the split is ordered past -> future
+        (without groups: every train row precedes every val row, which
+        precedes every test row; with groups: first-appearance order of
+        the groups follows the same train -> val -> test order). This
+        catches a future refactor that shuffles a time-ordered split
+        while the caller believes it is chronological.
 
     Returns a JSON-serializable report with ``ok`` plus the individual
     booleans and a ``problems`` list. Callers should abort on
@@ -1366,12 +1466,47 @@ def audit_split(split: dict, n_samples: int, group_ids=None) -> dict:
                             f'group {g!r} straddles {prev} and {key}')
                         break
                     group_to_split[g] = key
+    chronological_ok = None
+    if chronological:
+        if group_ids is not None and len(group_ids) == n:
+            # Group order is defined by first appearance (the natural time
+            # order of a grouped stream). Whole groups may interleave in
+            # row space, so compare group blocks, not min/max row indices.
+            first_seen = {}
+            for i, g in enumerate(group_ids):
+                g = str(g)
+                if g not in first_seen:
+                    first_seen[g] = i
+            blocks = {}
+            for key in ('train', 'val', 'test'):
+                blocks[key] = [first_seen[str(group_ids[i])]
+                               for i in index_sets[key]]
+            chronological_ok = bool(
+                blocks['train'] and blocks['val'] and blocks['test']
+                and max(blocks['train']) < min(blocks['val'])
+                and max(blocks['val']) < min(blocks['test']))
+        elif group_ids is None:
+            chronological_ok = bool(
+                index_sets['train'] and index_sets['val']
+                and index_sets['test']
+                and max(index_sets['train']) < min(index_sets['val'])
+                and max(index_sets['val']) < min(index_sets['test']))
+        if chronological_ok is False:
+            problems.append(
+                'chronological split is not ordered past -> future '
+                '(train before val before test)')
+        elif chronological_ok is None:
+            problems.append(
+                'chronological audit requested but group_ids length does '
+                'not match n_samples')
     return {
         'ok': not problems,
         'pairwise_disjoint': paired_disjoint,
         'complete': complete,
         'non_empty': non_empty,
         'group_integrity': groups_ok,
+        'chronological': bool(chronological),
+        'chronological_order_verified': chronological_ok,
         'n_samples': n,
         'sizes': {k: len(v) for k, v in index_sets.items()},
         'problems': problems,

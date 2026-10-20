@@ -402,7 +402,8 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
                                  test_frac=test_frac, seed=seed,
                                  group_ids=group_ids,
                                  chronological=chronological)
-    audit = audit_split(split, len(texts), group_ids=group_ids)
+    audit = audit_split(split, len(texts), group_ids=group_ids,
+                        chronological=chronological)
     by_split = {k: [texts[i] for i in split[k]]
                 for k in ('train', 'val', 'test')}
     digests = {k: _text_digests(v) for k, v in by_split.items()}
@@ -411,15 +412,9 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         'train_test': len(digests['train'] & digests['test']),
         'val_test': len(digests['val'] & digests['test']),
     }
-    order_verified = None
-    if chronological:
-        # Past -> train -> val -> test. With groups the row indices of a
-        # later group may interleave, so the containment check is only
-        # defined without groups; the group audit covers the rest.
-        if group_ids is None:
-            order_verified = bool(
-                max(split['train']) < min(split['val'])
-                < max(split['val']) < min(split['test']))
+    # The audit verifies the ordering itself: raw row order without
+    # groups, group first-appearance order when groups are declared.
+    order_verified = audit['chronological_order_verified']
     report = {
         'seed': int(seed),
         'val_frac': float(val_frac),
@@ -437,15 +432,142 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         if n_overlap:
             problems.append(
                 f'{pair}: {n_overlap} identical text(s) shared across splits')
-    if order_verified is False:
-        problems.append(
-            'chronological split is not ordered past -> future '
-            '(train before val before test)')
     if problems:
         raise RuntimeError(
             'train/val/test split failed its leakage audit: '
             + '; '.join(problems))
     return split, report
+
+
+def _window_digest(text, tokenizer, seq_len):
+    """Identity of the exact model input window (seq_len + 1 tokens)."""
+    try:
+        ids = tokenizer.encode(text, truncation=True,
+                               max_length=seq_len + 1)
+    except Exception:
+        return None
+    h = hashlib.sha256()
+    for token_id in ids:
+        h.update(str(int(token_id)).encode('ascii'))
+        h.update(b',')
+    return h.digest()
+
+
+def _window_overlap_audit(train_texts, val_texts, test_texts, tokenizer,
+                          seq_len):
+    """Count identical MODEL-INPUT windows shared across split boundaries.
+
+    Exact-string dedup in :func:`clean_lm_texts` cannot see this leak:
+    two different documents can truncate to the same ``seq_len + 1``
+    token window, and ``TinyStoriesLM`` then trains on / evaluates the
+    SAME sample. The global count is already recorded during cleaning;
+    this audit additionally says WHICH pair of splits shares windows.
+    With ``--dedup_windows`` the pre-split cleaning removes them all and
+    every count here is zero.
+    """
+    def _digests(texts):
+        out = set()
+        for text in texts:
+            d = _window_digest(text, tokenizer, seq_len)
+            if d is not None:
+                out.add(d)
+        return out
+
+    train = _digests(train_texts)
+    val = _digests(val_texts)
+    test = _digests(test_texts)
+    overlaps = {
+        'train_val': len(train & val),
+        'train_test': len(train & test),
+        'val_test': len(val & test),
+    }
+    total = sum(overlaps.values())
+    return {
+        'train_val': overlaps['train_val'],
+        'train_test': overlaps['train_test'],
+        'val_test': overlaps['val_test'],
+        'total_cross_split': total,
+        'any': bool(total),
+        'n_train_windows': len(train),
+        'n_val_windows': len(val),
+        'n_test_windows': len(test),
+        'note': ('Windows are the exact seq_len+1 token inputs the model '
+                 'sees after truncation. Any non-zero count is a '
+                 'sample-level leak; use --dedup_windows to remove them '
+                 'before splitting, or --strict_window_dedup to refuse to '
+                 'train on a corpus that has them.'),
+    }
+
+
+def _filter_leaking_heldout(train_texts, val_texts, test_texts, tokenizer,
+                             seq_len, *, min_keep=1):
+    """Drop held-out rows whose model window already exists on the train side.
+
+    The exact-string and optional window cleaning happen BEFORE the split,
+    so this is the last line of defence: after the split, any held-out
+    document whose truncated ``seq_len+1`` token window is identical to a
+    TRAIN window would be a sample the model trained on. Train is
+    authoritative here, exactly the direction a leakage filter must use.
+    Test rows are additionally checked against the kept validation rows.
+
+    Refuses to apply a drop that would empty a held-out split (the corpus
+    then has no non-leaking held-out document at this ``seq_len``); in
+    that case the rows are kept, ``applied`` is False, and the caller's
+    window-overlap audit reports the residual leak. Returns the filtered
+    lists plus before/after counts so the run record can show exactly what
+    was removed and what was kept.
+    """
+    def _digests(texts):
+        out = set()
+        for text in texts:
+            d = _window_digest(text, tokenizer, seq_len)
+            if d is not None:
+                out.add(d)
+        return out
+
+    train_keys = _digests(train_texts)
+
+    def _split(texts, forbidden):
+        kept, dropped = [], 0
+        for text in texts:
+            d = _window_digest(text, tokenizer, seq_len)
+            if d is not None and (d in train_keys or d in forbidden):
+                dropped += 1
+            else:
+                kept.append(text)
+        return kept, dropped
+
+    val_kept, val_dropped = _split(val_texts, set())
+    val_fallback = bool(val_dropped and len(val_kept) < int(min_keep))
+    if val_fallback:
+        val_kept, val_dropped = list(val_texts), 0
+    val_keys = _digests(val_kept)
+    test_kept, test_dropped = _split(test_texts, val_keys)
+    test_fallback = bool(test_dropped and len(test_kept) < int(min_keep))
+    if test_fallback:
+        test_kept, test_dropped = list(test_texts), 0
+    applied = bool(val_dropped or test_dropped)
+    return {
+        'applied': applied,
+        'train_authoritative': True,
+        'min_keep': int(min_keep),
+        'val_texts': val_kept,
+        'test_texts': test_kept,
+        'val_dropped': int(val_dropped),
+        'test_dropped': int(test_dropped),
+        'val_fallback_all_leaking': val_fallback,
+        'test_fallback_all_leaking': test_fallback,
+        'n_val_before': len(val_texts),
+        'n_test_before': len(test_texts),
+        'n_val_after': len(val_kept),
+        'n_test_after': len(test_kept),
+        'note': ('Held-out rows whose exact model-input window also occurs '
+                 'in TRAIN are dropped before any validation/test '
+                 'measurement; test rows are also checked against the kept '
+                 'validation windows. A split is kept whole when dropping '
+                 'would empty it, and window_overlap_audit then reports the '
+                 'residual leak.'),
+    }
 
 
 def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
@@ -495,6 +617,86 @@ def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
         # max_length=seq_len+1 that comes back at the cap may be longer.
         'cap_frac': sum(1 for x in lengths if x >= seq_len + 1) / len(lengths),
         'unk_rate': (unk / total) if total else 0.0,
+    }
+
+
+def _probe_token_lengths(texts, tokenizer, seq_len, *, n_probe=256):
+    """Bounded token-length probe used by the train-only outlier audit.
+
+    Same deterministic, evenly spaced selection as
+    :func:`_text_length_stats`, returned as plain lengths so robust
+    quantiles can be fitted on TRAIN and applied to val/test without ever
+    pooling the held-out splits into the statistic.
+    """
+    n = len(texts)
+    if n == 0:
+        return []
+    if n <= n_probe:
+        probe = list(texts)
+    else:
+        stride = max(1, n // n_probe)
+        probe = [texts[i] for i in range(0, n, stride)][:n_probe]
+    lengths = []
+    for text in probe:
+        try:
+            ids = tokenizer.encode(text, truncation=True,
+                                   max_length=seq_len + 1)
+        except Exception:
+            continue
+        lengths.append(len(ids))
+    return lengths
+
+
+def _quantile_type7(sorted_values, q):
+    """Linear-interpolation quantile (same convention as ppl_bootstrap)."""
+    n = len(sorted_values)
+    if n == 0:
+        raise ValueError('cannot take a quantile of an empty sample')
+    if n == 1:
+        return float(sorted_values[0])
+    pos = float(q) * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return (float(sorted_values[lo]) * (1.0 - frac)
+            + float(sorted_values[hi]) * frac)
+
+
+def _length_outlier_audit(train_lengths, heldout_lengths, *,
+                          iqr_multiplier=1.5):
+    """Robust outlier count for ONE held-out split against TRAIN fences.
+
+    The Tukey fences ``[Q1 - k*IQR, Q3 + k*IQR]`` are fitted on the TRAIN
+    token-length probe ONLY, then applied unchanged to the held-out probe.
+    Pooling train+val+test to pick the fences would let the held-out
+    distribution move the decision boundary (and is exactly the
+    normalization-on-all-data mistake this pipeline avoids).
+    """
+    if not train_lengths:
+        return {'fit_on': 'train', 'fences': None, 'n_probe': 0,
+                'n_outliers': None, 'outlier_fraction': None,
+                'flag': None, 'iqr_multiplier': float(iqr_multiplier)}
+    ordered = sorted(float(x) for x in train_lengths)
+    q1 = _quantile_type7(ordered, 0.25)
+    q3 = _quantile_type7(ordered, 0.75)
+    iqr = q3 - q1
+    lower = q1 - float(iqr_multiplier) * iqr
+    upper = q3 + float(iqr_multiplier) * iqr
+    n = len(heldout_lengths)
+    n_out = sum(1 for x in heldout_lengths if x < lower or x > upper)
+    frac = (n_out / n) if n else None
+    return {
+        'fit_on': 'train',
+        'fences': {'q1': q1, 'q3': q3, 'iqr': iqr,
+                   'lower': lower, 'upper': upper},
+        'iqr_multiplier': float(iqr_multiplier),
+        'n_probe': n,
+        'n_outliers': n_out,
+        'outlier_fraction': frac,
+        # Report-only: text length is not a fitted feature and clipping
+        # held-out documents would change the evaluation population. The
+        # flag is a distribution-shift warning, not a gate.
+        'flag': bool(frac is not None and frac >= 0.05),
     }
 
 
@@ -1596,6 +1798,12 @@ def main():
                              "with a small seq_len many distinct long "
                              "documents share a prefix, so enable it only "
                              "when prefix repetition is genuine leakage.")
+    parser.add_argument("--strict_window_dedup", action="store_true",
+                        help="Refuse to train when the audited train/val/"
+                             "test splits share any identical truncated "
+                             "model-input window. Pair with "
+                             "--dedup_windows for a corpus where distinct "
+                             "documents commonly share a prefix.")
     parser.add_argument("--val_every", type=int, default=100,
                         help="Run a validation pass every N optimizer steps "
                              "(default 100); a validation pass also runs at "
@@ -1878,7 +2086,34 @@ def main():
         seed=args.seed, chronological=bool(args.chronological_split))
     train_texts = [clean_texts[i] for i in split['train']]
     val_texts = [clean_texts[i] for i in split['val']]
-    test_indices = list(split['test'])
+    test_texts = [clean_texts[i] for i in split['test']]
+    # Train is authoritative: drop held-out rows whose model-input window
+    # already exists in train (and test rows that duplicate kept val).
+    leak_filter = _filter_leaking_heldout(
+        train_texts, val_texts, test_texts, tokenizer, seq_len)
+    val_texts = leak_filter['val_texts']
+    test_texts = leak_filter['test_texts']
+    if leak_filter['applied']:
+        print(f"[data] window-leak filter: dropped "
+              f"{leak_filter['val_dropped']} val / "
+              f"{leak_filter['test_dropped']} test row(s) whose "
+              f"truncated window already appeared in train; kept "
+              f"val={len(val_texts)} test={len(test_texts)}")
+    window_audit = _window_overlap_audit(
+        train_texts, val_texts, test_texts, tokenizer, seq_len)
+    if window_audit['any']:
+        print(f"[data] WARNING: {window_audit['total_cross_split']} "
+              f"identical model-input window(s) still shared across splits "
+              f"(train/val={window_audit['train_val']}, "
+              f"train/test={window_audit['train_test']}, "
+              f"val/test={window_audit['val_test']}); "
+              f"use --dedup_windows to remove them before the split")
+        if args.strict_window_dedup:
+            raise SystemExit(
+                "refusing to train: cross-split model-window leakage "
+                f"detected ({window_audit['total_cross_split']} duplicate "
+                "window(s)); rerun with --dedup_windows or relax with "
+                "--strict_window_dedup off")
 
     # Per-split length/unk statistics. Descriptive distribution-shift
     # diagnostics ONLY; they are never fitted or applied to features. The
@@ -1887,6 +2122,11 @@ def main():
     stats_train = _text_length_stats(train_texts, tokenizer, seq_len)
     stats_val = _text_length_stats(val_texts, tokenizer, seq_len)
     shift_val = _distribution_shift(stats_train, stats_val)
+    # Robust outlier fences are fitted on TRAIN lengths only, then applied
+    # to the held-out probes. This is a diagnostic, not a transform.
+    train_lengths = _probe_token_lengths(train_texts, tokenizer, seq_len)
+    val_lengths = _probe_token_lengths(val_texts, tokenizer, seq_len)
+    outlier_val = _length_outlier_audit(train_lengths, val_lengths)
 
     ds = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=train_texts,
                        split="train", name="train")
@@ -1896,8 +2136,7 @@ def main():
     # factory (plus the index list) exists during training.
     sealed_test = SealedTestSet(
         lambda: TinyStoriesLM(
-            tokenizer, seq_len=seq_len,
-            texts=[clean_texts[i] for i in test_indices],
+            tokenizer, seq_len=seq_len, texts=test_texts,
             split="test", name="test"))
 
     print(f"Data: {data_source}, raw={len(raw_texts)}, "
@@ -1910,7 +2149,7 @@ def main():
     print(f"Split (seed={args.seed}, "
           f"chronological={bool(args.chronological_split)}): "
           f"train={len(train_texts)} "
-          f"val={len(val_texts)} test={len(test_indices)} "
+          f"val={len(val_texts)} test={len(test_texts)} "
           f"[val/test sealed until final evaluation]")
     print(f"Fingerprints: train={ds.data_fingerprint[:16]}... "
           f"val={val_ds.data_fingerprint[:16]}...")
@@ -2097,16 +2336,38 @@ def main():
                 'token_length_stats': stats_val,
             },
             'test': {
-                'n': len(test_indices),
+                'n': len(test_texts),
                 'content_fingerprint_sha256': None,
                 'token_length_stats': None,
                 'sealed_until_final_evaluation': True,
             },
         },
         'split_audit': split_report,
+        'window_overlap_audit': window_audit,
+        'window_leak_filter': {
+            'applied': leak_filter['applied'],
+            'train_authoritative': leak_filter['train_authoritative'],
+            'val_dropped': leak_filter['val_dropped'],
+            'test_dropped': leak_filter['test_dropped'],
+            'val_fallback_all_leaking': leak_filter[
+                'val_fallback_all_leaking'],
+            'test_fallback_all_leaking': leak_filter[
+                'test_fallback_all_leaking'],
+            'n_val_before': leak_filter['n_val_before'],
+            'n_test_before': leak_filter['n_test_before'],
+            'n_val_after': leak_filter['n_val_after'],
+            'n_test_after': leak_filter['n_test_after'],
+            'note': leak_filter['note'],
+        },
         'distribution_shift': {
             'val_vs_train': shift_val,
             'test_vs_train': None,
+            'length_outliers': {
+                'iqr_multiplier': 1.5,
+                'fences_fit_on': 'train only',
+                'val_vs_train': outlier_val,
+                'test_vs_train': None,
+            },
         },
         'tokenizer': type(tokenizer).__name__,
         'vocab_size': vocab_size,
@@ -2422,6 +2683,9 @@ def main():
     test_dataset = sealed_test.open()
     stats_test = _text_length_stats(test_dataset.texts, tokenizer, seq_len)
     shift_test = _distribution_shift(stats_train, stats_test)
+    test_lengths = _probe_token_lengths(test_dataset.texts, tokenizer,
+                                        seq_len)
+    outlier_test = _length_outlier_audit(train_lengths, test_lengths)
     test_t0 = time.time()
     test_report = evaluate_lm_loss(
         model, test_dataset, batch_size=batch_size, device=device,
@@ -2465,6 +2729,8 @@ def main():
     data_record['splits']['test']['token_length_stats'] = stats_test
     data_record['splits']['test']['sealed_until_final_evaluation'] = False
     data_record['distribution_shift']['test_vs_train'] = shift_test
+    data_record['distribution_shift']['length_outliers']['test_vs_train'] = \
+        outlier_test
 
     # Persist the full run record (code version + hyperparameters + seed +
     # data version + training curve + final result) next to the checkpoint.

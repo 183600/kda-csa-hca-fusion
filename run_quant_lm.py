@@ -723,6 +723,19 @@ def _moment(values: list) -> dict:
             'min': min(vals), 'max': max(vals), 'n': len(vals)}
 
 
+def _eval_spec_key(spec: QuantSpec | None) -> str:
+    """Unique label for a spec in per-spec diagnostic dictionaries.
+
+    Bits/group alone collide between the symmetric default and the
+    asymmetric probe at the same (bits, group). The suffix keeps both
+    cells in the JSON instead of silently overwriting one.
+    """
+    if spec is None:
+        return 'fp16'
+    key = f'{spec.bits}b/g{spec.group_size}'
+    return key if spec.symmetric else f'{key}-asym'
+
+
 def _spec_fields(spec: QuantSpec | None) -> dict:
     if spec is None:
         return {
@@ -888,6 +901,83 @@ def build_ptq_rows(per_seed: list, specs: list, tolerance: float,
             '"is it distinguishable from window-sampling noise" — a cell '
             'can pass one and fail the other at these corpus sizes'),
     })
+    return rows
+
+
+def build_ptq_test_rows(train_reports: list, specs: list,
+                        tolerance: float) -> list:
+    """Aggregate the confirmatory TEST pass into ``ptq_test_ppl`` rows.
+
+    These rows exist to answer the reviewer question "was the final number
+    ever computed on data that did not participate in model/spec
+    selection?". They are NOT inputs to ``build_ptq_rows`` and are clearly
+    marked ``used_for_selection=False``. Ratios are against the fp16 test
+    decode on the same windows, matching the validation definition.
+    """
+    usable = [r['test_eval'] for r in train_reports
+              if r.get('test_eval') and not r['test_eval'].get('skipped')
+              and r['test_eval'].get('n_tokens')]
+    if not usable:
+        return []
+    fp16_by_seed = {int(r['seed']): r['test_eval']['fp16']['ppl']
+                    for r in train_reports
+                    if r.get('test_eval')
+                    and not r['test_eval'].get('skipped')}
+    rows = []
+    for spec in [None] + list(specs):
+        label = (None if spec is None else _eval_spec_key(spec))
+        ppls, ratios, spec_seeds = [], [], []
+        for rep in train_reports:
+            te = rep.get('test_eval')
+            if not te or te.get('skipped') or not te.get('n_tokens'):
+                continue
+            if spec is None:
+                ppl = te['fp16']['ppl']
+            else:
+                cell = te.get('quantized', {}).get(label)
+                if cell is None:
+                    continue
+                ppl = cell['ppl']
+            ppls.append(float(ppl))
+            spec_seeds.append(int(rep['seed']))
+            if fp16_by_seed[int(rep['seed'])]:
+                ratios.append(float(ppl) / fp16_by_seed[int(rep['seed'])])
+        if not ppls:
+            continue
+        agg = _aggregate(ppls)
+        ratio = _aggregate(ratios)
+        row = {
+            'row_kind': 'ptq_test_ppl',
+            'model': 'hybrid_lm',
+            'eval_split': 'test',
+            'used_for_selection': False,
+            'seeds': spec_seeds,
+            'n_windows': int(usable[0]['n_windows']),
+            'n_tokens_per_seed': [int(u['n_tokens']) for u in usable],
+            'prefill_ppl_mean': _aggregate(
+                [float(u['prefill_ppl']) for u in usable
+                 if u.get('prefill_ppl') is not None])['mean'],
+            'decode_ppl_mean': agg['mean'],
+            'decode_ppl_min': agg['min'],
+            'decode_ppl_max': agg['max'],
+            'ppl_ratio_mean': ratio['mean'],
+            'ppl_ratio_min': ratio['min'],
+            'ppl_ratio_max': ratio['max'],
+            'ppl_preserving': bool(
+                ratio['min'] is not None and ratio['min'] <= 1.0 + tolerance),
+            'tolerance': float(tolerance),
+            'note': ('Confirmatory held-out test pass on the SAME trained '
+                     'models, scored after the validation protocol and '
+                     'spec grid were frozen; never used for selection, '
+                     'early stopping, or tolerance tuning.'),
+        }
+        state_elements = int(usable[0].get('state_elements') or 0)
+        row['state_elements'] = state_elements
+        row['state_bytes'] = (
+            storage_bytes(state_elements, spec) if spec is not None
+            else state_elements * FP16_BITS / 8.0)
+        row.update(_spec_fields(spec))
+        rows.append(row)
     return rows
 
 
@@ -1226,13 +1316,21 @@ def run_overfit_gates(*, device, tokenizer, split_texts, seq_len,
 # --------------------------------------------------------------------------
 def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
                seq_len, batch_size, eval_seqs, tolerance, lr=3e-3,
-               val_every=0, error_batches=0, max_error_examples=2) -> tuple:
+               val_every=0, error_batches=0, max_error_examples=2,
+               test_seqs=0) -> tuple:
     """Train + PTQ-score the hybrid LM; return (per_seed_cells, train_report).
 
     ``val_every`` records the held-out curve during training and
     ``error_batches`` runs the token-level bad-case analysis on the
     validation split, both read-only and off by default so direct callers
     (and the unit tests) keep the historical training path exactly.
+
+    ``test_seqs > 0`` additionally scores the sealed TEST split with the
+    already-trained model after every validation-based decision has been
+    made. The test windows are never used for the spec grid, the tolerance
+    flag, the validation curve, or the bad-case analysis; they are stored
+    in the train report as a confirmatory read-only measurement. Keeping
+    the default at 0 preserves the historical direct-call contract.
     """
     pad = pad_token_id(tokenizer)
     val_windows = encode_windows(tokenizer, split_texts['val'][:eval_seqs],
@@ -1287,7 +1385,7 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
                           model, clone, val_windows, pad, spec=spec,
                           collect_diagnostics=diagnose_quant))
             if spec is not None and diagnose_quant:
-                label = f'{spec.bits}b/g{spec.group_size}'
+                label = _eval_spec_key(spec)
                 quant_errors[label] = quantization_error_delta(
                     base['raw_diagnostics'], scored['raw_diagnostics'], spec)
             snr = math.inf if spec is None else _decode_state_snr(
@@ -1327,6 +1425,57 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
                         f'{name}={v["count"]}'
                         for name, v in delta['categories_induced'].items()
                         if v['count']))
+        report['seed'] = int(seed)
+        if int(test_seqs or 0) > 0:
+            # Confirmatory TEST pass: by this point the spec grid, the
+            # tolerance and every validation decision are fixed. Opening
+            # test here cannot influence selection (and the returned cells
+            # keep their historical validation semantics).
+            test_texts = list(split_texts.get('test', []))[:int(test_seqs)]
+            test_windows = encode_windows(tokenizer, test_texts, seq_len,
+                                         device)
+            if test_windows:
+                test_dataset = TinyStoriesLM(
+                    tokenizer, seq_len=seq_len, texts=test_texts,
+                    name='test', split='test')
+                test_prefill = evaluate_lm_loss(
+                    model, test_dataset, batch_size=1, device=device)
+                test_base = evaluate_decode_ppl(
+                    model, clone, test_windows, pad, spec=None)
+                test_quant = {}
+                for spec in specs:
+                    label = _eval_spec_key(spec)
+                    scored_test = evaluate_decode_ppl(
+                        model, clone, test_windows, pad, spec=spec)
+                    test_quant[label] = {
+                        'ppl': scored_test['ppl'],
+                        'mean_nll': scored_test['mean_nll'],
+                        'n_tokens': scored_test['n_tokens'],
+                    }
+                report['test_eval'] = {
+                    'split': 'test',
+                    'used_for_selection': False,
+                    'n_windows': len(test_windows),
+                    'n_tokens': test_base['n_tokens'],
+                    'prefill_ppl': test_prefill.get('perplexity'),
+                    'state_elements': test_base.get('state_elements'),
+                    'fp16': {
+                        'ppl': test_base['ppl'],
+                        'mean_nll': test_base['mean_nll'],
+                        'n_tokens': test_base['n_tokens'],
+                    },
+                    'quantized': test_quant,
+                }
+                logger.info(
+                    'Part A seed %d: sealed TEST decode fp16 ppl %.4f '
+                    '(n_tokens=%d; not used for selection)',
+                    seed, test_base['ppl'], test_base['n_tokens'])
+            else:
+                report['test_eval'] = {
+                    'split': 'test', 'used_for_selection': False,
+                    'skipped': True, 'reason': 'no test windows',
+                    'n_windows': 0, 'quantized': {},
+                }
         train_reports.append(report)
         logger.info(
             'Part A seed %d: prefill ppl %.4f, decode fp16 ppl %.4f '
@@ -1594,10 +1743,25 @@ def main():
         seeds=seeds, specs=specs, steps=steps, seq_len=seq_len,
         batch_size=batch_size, eval_seqs=eval_seqs, tolerance=tolerance,
         val_every=val_every, error_batches=error_batches,
-        max_error_examples=max_error_examples)
+        max_error_examples=max_error_examples,
+        # Confirmatory only: test is opened after every validation-based
+        # decision in this run has been made.
+        test_seqs=eval_seqs)
     ptq_rows = build_ptq_rows(ptq_per_seed, [None] + specs, tolerance,
                               n_boot=pp_boot)
+    ptq_test_rows = build_ptq_test_rows(train_reports, specs, tolerance)
     _print_ptq(ptq_rows)
+    if ptq_test_rows:
+        logger.info('\n-- Part A: confirmatory TEST decode perplexity '
+                    '(never used for selection) --')
+        for row in ptq_test_rows:
+            label = ('fp16' if not row['quantized']
+                     else f"{row['bits']}b/g{row['group_size']}")
+            logger.info(
+                f"  {label:>12} | test decode ppl {row['decode_ppl_mean']:.4f} "
+                f"[{row['decode_ppl_min']:.4f}..{row['decode_ppl_max']:.4f}] "
+                f"| ratio vs test fp16 {row['ppl_ratio_mean']:.4f} | "
+                f"n_tokens/seed {row['n_tokens_per_seed']}")
 
     qat_rows: list = []
     if not skip_qat:
@@ -1670,6 +1834,16 @@ def main():
                          'RNG-neutral, so enabling them cannot change a '
                          'reported PPL.'),
             },
+            'test_split': {
+                'used': bool(ptq_test_rows),
+                'eval_sequences': int(eval_seqs),
+                'note': ('Part A scores the sealed test split once per '
+                         'seed after the spec grid, tolerance and '
+                         'validation protocol are frozen. The resulting '
+                         'ptq_test_ppl rows are marked '
+                         'used_for_selection=False and do not feed back '
+                         'into any row used for selection.'),
+            },
             'qat': 'straight-through fake_quantize (ste=True) on every '
                    'state write during training; inference scoring uses '
                    'ste=False on the same spec. The primary QAT contrast '
@@ -1726,7 +1900,7 @@ def main():
     }
     metadata['provenance']['overfit_sanity_check'] = gate_record
 
-    rows = plt_rows + ptq_rows + qat_rows
+    rows = plt_rows + ptq_rows + qat_rows + ptq_test_rows
     os.makedirs(os.path.dirname(RESULTS_PATH) or '.', exist_ok=True)
     write_schema(RESULTS_PATH, rows, kind='exp11_quant_lm',
                  metadata=metadata)
