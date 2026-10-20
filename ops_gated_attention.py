@@ -68,26 +68,15 @@ class GatedAttentionMixin:
 
         Args:
             x: input tensor [..., num_heads, gate_dim] or [..., gate_dim]
-            dim: dimension to gate (must match gate_dim)
+            dim: feature dimension to gate (must match gate_dim); the head
+                axis, when present, is the axis immediately before it.
 
         Returns:
             Gated tensor of same shape as x.
         """
         if self.gate_type == 'none' or self._gate is None:
             return x
-
-        gate = self._gate
-        # Expand gate to match x's head dimension if needed
-        if gate.dim() == 1:
-            # per_head: [H] -> [..., H, 1]
-            gate = gate.view(*([1] * (x.dim() - 2)), gate.shape[0], 1)
-        elif gate.dim() == 2:
-            # per_channel: [H, D] -> [..., H, D]
-            gate = gate.view(*([1] * (x.dim() - 2)), gate.shape[0], gate.shape[1])
-        else:
-            raise RuntimeError(f"Unexpected gate shape: {gate.shape}")
-
-        # Broadcast and multiply
+        gate = _broadcast_gate(self._gate, x, dim)
         return x * gate.to(dtype=x.dtype, device=x.device)
 
     def get_gate_values(self) -> torch.Tensor | None:
@@ -132,6 +121,49 @@ def create_gate(
     return gate
 
 
+def _broadcast_gate(gate: torch.Tensor, x: torch.Tensor,
+                    dim: int) -> torch.Tensor:
+    """Reshape ``gate`` so its feature axis lands on ``dim`` of ``x``."""
+    if gate.dim() not in (1, 2):
+        raise RuntimeError(f"Unexpected gate shape: {gate.shape}")
+    if x.dim() == 0:
+        raise ValueError('apply_gate: x must have at least one dimension.')
+    axis = dim if dim >= 0 else x.dim() + dim
+    if axis < 0 or axis >= x.dim():
+        raise ValueError(
+            f'apply_gate: dim={dim} is out of range for x with '
+            f'{x.dim()} dimensions.')
+    n_heads = gate.shape[0]
+    head_axis = axis - 1
+    if gate.dim() == 1:
+        if n_heads == 1:
+            return gate.reshape(())
+        if head_axis < 0 or x.shape[head_axis] not in (1, n_heads):
+            raise ValueError(
+                f'apply_gate: gate has {n_heads} heads but the axis before '
+                f'dim={dim} of x has size '
+                f'{None if head_axis < 0 else x.shape[head_axis]}.')
+        shape = [1] * x.dim()
+        shape[head_axis] = n_heads
+        return gate.view(shape)
+    gate_dim = gate.shape[-1]
+    if x.shape[axis] != gate_dim:
+        raise ValueError(
+            f'apply_gate: x.shape[{axis}]={x.shape[axis]} does not match '
+            f'gate feature dim {gate_dim}.')
+    if n_heads != 1 and (
+            head_axis < 0 or x.shape[head_axis] not in (1, n_heads)):
+        raise ValueError(
+            f'apply_gate: gate has {n_heads} heads but the axis before '
+            f'dim={dim} of x has size '
+            f'{None if head_axis < 0 else x.shape[head_axis]}.')
+    shape = [1] * x.dim()
+    shape[axis] = gate_dim
+    if n_heads != 1:
+        shape[head_axis] = n_heads
+    return gate.view(shape)
+
+
 def apply_gate_fn(
     x: torch.Tensor,
     gate: torch.Tensor | None,
@@ -142,20 +174,14 @@ def apply_gate_fn(
     Args:
         x: [..., num_heads, gate_dim] or [..., gate_dim]
         gate: [num_heads] or [num_heads, gate_dim] or None
-        dim: dimension to gate
+        dim: feature dimension to gate
 
     Returns:
         Gated tensor.
     """
     if gate is None:
         return x
-
-    # Align gate dimensions with x
-    if gate.dim() == 1:
-        gate = gate.view(*([1] * (x.dim() - 2)), gate.shape[0], 1)
-    elif gate.dim() == 2:
-        gate = gate.view(*([1] * (x.dim() - 2)), gate.shape[0], gate.shape[1])
-
+    gate = _broadcast_gate(gate, x, dim)
     return x * gate.to(dtype=x.dtype, device=x.device)
 
 
