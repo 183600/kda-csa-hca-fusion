@@ -90,22 +90,6 @@ python3 prefill_profile.py --model csa --total-len 128 \
     --json results/prefill_profile.json
 ```
 
-Illustrative CPU numbers from this repository's CI host (`d_model=64`,
-`T=32`, `--repeats 3 --warmup 1`; do **not** compare wall-clock across
-machines):
-
-| model | schedule | latency before | latency after | drift (after) |
-|---|---|---:|---:|---:|
-| HCA | `full` | 1.28 ms | 1.28 ms | 0 |
-| HCA | `16` | 10.44 ms | 2.50 ms | 3.0e-08 |
-| CSA | `4` | — | 10.76 ms | 1.5e-08 |
-| Hybrid | `16` | — | 11.71 ms | 6.0e-08 |
-
-The one-shot row is unchanged, as intended: it never used the incremental
-path. The `schedule=1` row is also unchanged (a single token has nothing to
-batch); it is the per-token eager floor and stays in the sweep as a
-reference.
-
 ## Verification
 
 * `test_chunked_prefill_cache.py` compares `forward_chunk` with a
