@@ -77,6 +77,13 @@ def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):
                 f"{fn_name}: {name}.shape[0:2]={tuple(t.shape[0:2])} does not "
                 f"match q.shape[0:2]=({B_q}, {T_q}). All inputs must share "
                 f"the same batch (B) and sequence (T) dimensions.")
+    # q and k share the query/key head count and key width; letting torch
+    # broadcast a mismatched k would silently change the recurrence
+    # geometry (or fail later with an opaque matmul error).
+    if k.shape != q.shape:
+        raise ValueError(
+            f"{fn_name}: k.shape={tuple(k.shape)} must equal "
+            f"q.shape={tuple(q.shape)} ([B, T, H, K]).")
     ref_device = q.device
     for name, t in [('k', k), ('v', v), ('g', g), ('beta', beta)]:
         if t.device != ref_device:
@@ -93,12 +100,16 @@ def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):
                 f"dtype (cast before calling if needed).")
 
 
-def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None):
+def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None,
+                         initial_state=None):
     """Validate KDA shape dimensions.
 
     Args:
         chunk_size: if not None, also validates chunk_size >= 1 (chunk path
             only).
+        initial_state: optional ``[B, HV, K, V]`` recurrent state. Exact
+            shape is required: a broadcastable slice would silently use a
+            smaller state than the caller intended.
     """
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[-1]
@@ -106,6 +117,8 @@ def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None):
         raise ValueError(
             f"{fn_name}: H={H} must be >= 1 "
             f"(would cause ZeroDivisionError in HV // H)")
+    if HV < 1:
+        raise ValueError(f"{fn_name}: HV={HV} must be >= 1")
     if K < 1:
         raise ValueError(f"{fn_name}: K={K} must be >= 1")
     if V < 1:
@@ -130,6 +143,17 @@ def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None):
         raise ValueError(
             f"{fn_name}: beta.shape[2]={beta.shape[2]} must equal HV={HV} "
             f"(beta must be [B, T, HV], got {tuple(beta.shape)})")
+    if initial_state is not None:
+        if not isinstance(initial_state, torch.Tensor):
+            raise TypeError(
+                f"{fn_name}: initial_state must be a torch.Tensor or None, "
+                f"got {type(initial_state).__name__}.")
+        expected = (B, HV, K, V)
+        if tuple(initial_state.shape) != expected:
+            raise ValueError(
+                f"{fn_name}: initial_state.shape="
+                f"{tuple(initial_state.shape)} does not match the expected "
+                f"{expected} ([B, HV, K, V]).")
 
 
 def _compute_dtype(dtype):
@@ -340,7 +364,8 @@ def naive_recurrent_kda(
     dtype = v.dtype
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    _validate_kda_shapes(q, k, v, g, beta, fn_name='naive_recurrent_kda')
+    _validate_kda_shapes(q, k, v, g, beta, fn_name='naive_recurrent_kda',
+                         initial_state=initial_state)
     G = HV // H
     if scale is None:
         scale = K ** -0.5
@@ -771,7 +796,8 @@ def _chunk_kda_prepare(
     dtype = v.dtype
     _validate_kda_inputs(q, k, v, g, beta, fn_name=fn_name)
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    _validate_kda_shapes(q, k, v, g, beta, fn_name=fn_name, chunk_size=chunk_size)
+    _validate_kda_shapes(q, k, v, g, beta, fn_name=fn_name,
+                         chunk_size=chunk_size, initial_state=initial_state)
     G = HV // H
     BT = chunk_size
     original_T = T

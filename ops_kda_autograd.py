@@ -330,7 +330,8 @@ def custom_recurrent_kda(
     _validate_kda_inputs(q, k, v, g, beta,
                          fn_name='custom_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
-    _validate_kda_shapes(q, k, v, g, beta, fn_name='custom_recurrent_kda')
+    _validate_kda_shapes(q, k, v, g, beta, fn_name='custom_recurrent_kda',
+                         initial_state=initial_state)
     G = HV // H
     if scale is None:
         scale = K ** -0.5
