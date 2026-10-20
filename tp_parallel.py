@@ -861,6 +861,7 @@ class HardwareModel:
     link_bw_gbps: float = 300.0
     allreduce_latency_us: float = 5.0
     itemsize: int = 4
+    gpu_anchored: bool = False
 
     def __post_init__(self):
         for name in ('peak_tflops', 'peak_bw_gbps', 'link_bw_gbps'):
@@ -884,6 +885,46 @@ class HardwareModel:
             raise ValueError(
                 f'HardwareModel.itemsize={self.itemsize!r} must be an '
                 f'int >= 1.')
+        if not isinstance(self.gpu_anchored, bool):
+            raise TypeError(
+                f'HardwareModel.gpu_anchored must be a bool, got '
+                f'{type(self.gpu_anchored).__name__}.')
+
+    @classmethod
+    def from_gpu(cls, mode: str = 'auto') -> 'HardwareModel':
+        """Build a HardwareModel anchored to a real CUDA device when available.
+
+        ``mode='nominal'`` always returns the H100-class defaults without
+        touching ``torch.cuda``. ``mode='auto'`` inspects ``torch.cuda``:
+        when CUDA is available the device's reported memory clock and bus
+        width anchor ``peak_bw_gbps`` and ``gpu_anchored=True``; when CUDA is
+        unavailable (CPU hosts, CI) it returns the nominal defaults with
+        ``gpu_anchored=False``.
+
+        ``peak_tflops`` and ``link_bw_gbps`` are deliberately left nominal:
+        ``torch.cuda`` exposes neither per-SM core counts (needed for an
+        honest fp32 peak) nor interconnect bandwidth, so deriving them would
+        require architecture-specific guesses. The model therefore stays
+        analytic and conservative — a real deployment should measure its own
+        peaks and pass a constructed :class:`HardwareModel` to
+        :func:`tp_latency` / :func:`tp_sweep`.
+        """
+        if mode not in ('auto', 'nominal'):
+            raise ValueError(
+                f"HardwareModel.from_gpu: mode={mode!r} must be 'auto' or "
+                "'nominal'.")
+        if mode == 'nominal' or not torch.cuda.is_available():
+            return cls()
+        props = torch.cuda.get_device_properties(0)
+        peak_bw = float(cls().peak_bw_gbps)
+        mem_clock = getattr(props, 'memory_clock_rate', None)
+        bus_width = getattr(props, 'bus_width', None)
+        if mem_clock is not None and bus_width is not None and bus_width > 0:
+            # GB/s = (kHz * 1e3 cycles/s) * (bits / 8 bytes/bit) / 1e9.
+            peak_bw = float(mem_clock) * 1e3 * float(bus_width) / 8.0 / 1e9
+            if not math.isfinite(peak_bw) or peak_bw <= 0:
+                peak_bw = float(cls().peak_bw_gbps)
+        return cls(peak_bw_gbps=peak_bw, gpu_anchored=True)
 
 
 def ring_allreduce_ms(nbytes: float, tp_size: int,
@@ -1143,16 +1184,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--peak-bw-gbps', type=float, default=3000.0)
     parser.add_argument('--link-bw-gbps', type=float, default=300.0)
     parser.add_argument('--allreduce-latency-us', type=float, default=5.0)
+    parser.add_argument('--hardware', choices=('auto', 'nominal'),
+                        default='auto',
+                        help='auto = anchor HardwareModel to a real CUDA '
+                             'device when available (CPU/CI falls back to '
+                             'the nominal H100-class defaults); nominal = '
+                             'always use the built-in defaults. Individual '
+                             '--peak-* / --link-* / --allreduce-* flags '
+                             'override the chosen anchor.')
     args = parser.parse_args(argv)
     cfg = mqar_probe_config() if args.config == 'mqar' \
         else adjacent_probe_config()
     sizes = tuple(int(part) for part in args.tp.split(',') if part.strip())
-    hardware = HardwareModel(
-        peak_tflops=args.peak_tflops,
-        peak_bw_gbps=args.peak_bw_gbps,
-        link_bw_gbps=args.link_bw_gbps,
-        allreduce_latency_us=args.allreduce_latency_us,
-    )
+    _numeric_defaults = {
+        'peak_tflops': parser.get_default('peak_tflops'),
+        'peak_bw_gbps': parser.get_default('peak_bw_gbps'),
+        'link_bw_gbps': parser.get_default('link_bw_gbps'),
+        'allreduce_latency_us': parser.get_default('allreduce_latency_us'),
+    }
+    overrides = {k: getattr(args, k) for k in _numeric_defaults
+                 if getattr(args, k) != _numeric_defaults[k]}
+    hardware = HardwareModel.from_gpu(args.hardware)
+    if overrides:
+        hardware = dataclasses.replace(hardware, **overrides)
     sweep = tp_sweep(
         cfg, sizes, prefill_len=args.prefill_len,
         decode_batch=args.decode_batch, total_layers=args.layers,

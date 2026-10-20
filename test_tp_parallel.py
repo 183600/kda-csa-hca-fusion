@@ -331,5 +331,90 @@ def test_tp_latency_sweep_invariants():
         tp.HardwareModel(peak_tflops=-1.0)
 
 
+def test_hardware_from_gpu_cpu_fallback(monkeypatch):
+    """CPU / no-CUDA returns the nominal HardwareModel, not a crash."""
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    hw = tp.HardwareModel.from_gpu('auto')
+    assert hw.gpu_anchored is False
+    assert hw.peak_tflops == pytest.approx(60.0)
+    assert hw.peak_bw_gbps == pytest.approx(3000.0)
+    assert hw.link_bw_gbps == pytest.approx(300.0)
+    for value in dataclasses.asdict(hw).values():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            assert math.isfinite(value)
+
+
+def test_hardware_from_gpu_monkeypatched_gpu(monkeypatch):
+    """A real CUDA device anchors peak bandwidth and sets gpu_anchored."""
+
+    class FakeProps:
+        memory_clock_rate = 8000  # kHz
+        bus_width = 4096  # bits
+
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'get_device_properties',
+                        lambda device: FakeProps())
+    hw = tp.HardwareModel.from_gpu('auto')
+    assert hw.gpu_anchored is True
+    expected = 8000 * 1e3 * 4096 / 8.0 / 1e9
+    assert hw.peak_bw_gbps == pytest.approx(expected)
+    # peak_tflops / link are left nominal (require kernel measurement).
+    assert hw.peak_tflops == pytest.approx(60.0)
+    assert hw.link_bw_gbps == pytest.approx(300.0)
+
+    # Explicit nominal mode never touches torch.cuda.
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    hw_nominal = tp.HardwareModel.from_gpu('nominal')
+    assert hw_nominal.gpu_anchored is False
+    assert hw_nominal.peak_bw_gbps == pytest.approx(3000.0)
+
+    with pytest.raises(ValueError):
+        tp.HardwareModel.from_gpu('not-a-mode')
+
+
+def test_tp_decode_traffic_sliding_window_limits_reads():
+    """A smaller CSA/HCA sliding window caps replicated decode reads under TP.
+
+    The sliding-window branch only admits the most recent ``window`` tokens,
+    so shrinking the window reduces the per-rank replicated CSA/HCA read
+    traffic; KDA memory reads (head-scaled, divided by TP) are unaffected by
+    the CSA/HCA window knob.
+    """
+    T = 512
+    base = tp.adjacent_probe_config()
+    small = dataclasses.replace(base, csa_sliding_window=8,
+                                hca_sliding_window=8)
+    large = dataclasses.replace(base, csa_sliding_window=T,
+                                hca_sliding_window=T)
+    for tp_size in (1, 4):
+        s = tp.tp_decode_traffic(small, T, tp_size)
+        l = tp.tp_decode_traffic(large, T, tp_size)
+        assert s['read_bytes_by_op_per_rank']['csa'] < \
+            l['read_bytes_by_op_per_rank']['csa']
+        assert s['read_bytes_by_op_per_rank']['hca'] < \
+            l['read_bytes_by_op_per_rank']['hca']
+        assert s['read_bytes_by_op_per_rank']['memory'] == \
+            l['read_bytes_by_op_per_rank']['memory']
+        assert s['state_bytes_per_token_per_rank'] < \
+            l['state_bytes_per_token_per_rank']
+
+
+def test_tp_sweep_hardware_param():
+    """tp_sweep accepts a hardware= anchor and rows reflect it."""
+    hw_a = tp.HardwareModel(peak_tflops=50.0, peak_bw_gbps=1000.0,
+                            link_bw_gbps=100.0, allreduce_latency_us=5.0)
+    hw_b = tp.HardwareModel(peak_tflops=100.0, peak_bw_gbps=2000.0,
+                            link_bw_gbps=200.0, allreduce_latency_us=5.0)
+    cfg = tp.mqar_probe_config()
+    sa = tp.tp_sweep(cfg, (1, 2), prefill_len=32, decode_batch=8,
+                     total_layers=5, hardware=hw_a)
+    sb = tp.tp_sweep(cfg, (1, 2), prefill_len=32, decode_batch=8,
+                     total_layers=5, hardware=hw_b)
+    assert sa['hardware']['peak_tflops'] == 50.0
+    assert sb['hardware']['peak_tflops'] == 100.0
+    assert sb['rows'][0]['prefill']['compute_ms'] <= \
+        sa['rows'][0]['prefill']['compute_ms']
+
+
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
