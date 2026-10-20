@@ -333,6 +333,13 @@ _STATE_KEY = 'state_elements'
 _TOTAL_KEY = 'total_read_elements'
 
 
+# ``core_read_elements`` in a kv_budget operator row already includes its
+# per-branch read components (CSA: selected + window; HCA: dense + window).
+# They are exposed separately for diagnosis, but must not be added to the
+# aggregate a second time when converting elements to bytes.
+_CORE_SUBCOMPONENT_STEMS = frozenset({'selected', 'window', 'dense'})
+
+
 def _row_component_stems(row: dict) -> list[str]:
     """Stems of the per-component element fields of a kv_budget row.
 
@@ -402,9 +409,12 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
     The per-query aggregate ``total_read_bytes`` sums the *read* components
     only: the retained state is storage, not a per-query read, matching
     ``total_read_elements`` (which counts reads; the KDA state size is
-    exposed separately as ``state_elements``). The returned dict also
-    carries ``quant_bytes_per_element`` (stem → bytes/element) so a reader
-    can see which policy priced which component.
+    exposed separately as ``state_elements``). For operator rows whose
+    ``core_read_elements`` already aggregates branch reads, the branch
+    columns (``selected`` / ``window`` / ``dense``) stay diagnostic and are
+    not added to the total again. The returned dict also carries
+    ``quant_bytes_per_element`` (stem → bytes/element) so a reader can see
+    which policy priced which component.
 
     ``quant`` follows :func:`_normalize_policy`: ``None`` prices every
     component at fp16 (2.0 bytes/element); a :class:`QuantSpec` applies to
@@ -439,9 +449,11 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
             continue
         b = float(value) * bpe
         out[key] = b
-        if stem != 'state':
+        if stem != 'state' and not (
+                'core' in stems and stem in _CORE_SUBCOMPONENT_STEMS):
             # The retained state is storage, not a per-query read; it is
-            # exposed as state_bytes but never folded into total.
+            # exposed as state_bytes but never folded into total. Branch
+            # components are already part of ``core_read_elements``.
             total += b
     out[_TOTAL_KEY.replace('_elements', '_bytes')] = total
     out['quant_bytes_per_element'] = bytes_per_element_map
