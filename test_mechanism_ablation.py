@@ -378,6 +378,46 @@ def test_ablation_design_audit():
     _ok('parameter-count drift detected',
         bad['controlled_variables']['parameter_count_parity'] is False, '')
 
+    def _controlled_rows(steps_b=200):
+        return [
+            {'variant': 'baseline', 'n_params': 100, 'n_layers': 5,
+             'steps': 200, 'train_batch': 16, 'lr': 3e-3,
+             'seeds': [42, 43],
+             'per_seed': [{'seed': 42, 'final_acc': 0.2},
+                          {'seed': 43, 'final_acc': 0.3}]},
+            {'variant': 'no_rope', 'n_params': 100, 'n_layers': 5,
+             'steps': steps_b, 'train_batch': 16, 'lr': 3e-3,
+             'seeds': [42, 43],
+             'per_seed': [{'seed': 42, 'final_acc': 0.1},
+                          {'seed': 43, 'final_acc': 0.2}]},
+        ]
+
+    controlled = M.ablation_design_audit(
+        subset, rows=_controlled_rows(),
+        recipe={'steps': 200, 'train_batch': 16, 'lr': 3e-3})
+    cv = controlled['controlled_variables']
+    _ok('matching recipe and seed set verified as controlled',
+        cv['controls_status'] == 'controlled'
+        and all(v is True for v in cv['recipe_parity'].values())
+        and cv['seed_alignment_ok'] is True
+        and cv['common_requested_seeds'] == [42, 43], str(cv))
+
+    drifted = M.ablation_design_audit(subset, rows=_controlled_rows(100))
+    _ok('training-budget drift detected',
+        drifted['controlled_variables']['controls_status']
+        == 'recipe_mismatch'
+        and drifted['controlled_variables']['recipe_parity']['steps']
+        is False, str(drifted['controlled_variables']))
+
+    unpaired_rows = _controlled_rows()
+    unpaired_rows[1]['per_seed'] = unpaired_rows[1]['per_seed'][:1]
+    unpaired = M.ablation_design_audit(subset, rows=unpaired_rows)
+    _ok('failed/missing paired seed detected',
+        unpaired['controlled_variables']['controls_status']
+        == 'seed_mismatch'
+        and unpaired['controlled_variables']['seed_alignment_ok'] is False,
+        str(unpaired['controlled_variables']))
+
 
 def test_exp8_smoke_envelope():
     """End-to-end smoke: tiny run writes a v1.0 envelope with the right kind."""

@@ -958,7 +958,8 @@ def _variant_factor_diffs(variant, baseline):
     return diffs
 
 
-def ablation_design_audit(variants, rows=None, requested=None):
+def ablation_design_audit(variants, rows=None, requested=None,
+                          recipe=None):
     """Audit the selected variant set as a controlled ablation design.
 
     Exp 8 toggles three CSA mechanism factors — partial RoPE, the top-k
@@ -972,11 +973,18 @@ def ablation_design_audit(variants, rows=None, requested=None):
 
     When ``rows`` (the summarized result rows) are given, the audit also
     cross-checks the controlled-variable claim empirically: the observed
-    parameter counts and depths must match across variants (the mechanism
-    switches must not have changed model size).
+    parameter counts, depths AND training recipe (steps, batch, lr) must
+    match across variants (the mechanism switches must not have changed
+    model size or training budget), and every variant must share the same
+    successfully evaluated seed set. ``recipe`` may pass the expected
+    recipe explicitly; otherwise it is inferred from the rows where
+    available.
 
     Returns a JSON-safe dict with ``status`` one of
     ``'leave_one_out_complete'`` / ``'incomplete'`` / ``'no_baseline'``.
+    ``controlled_variables['controls_status']`` separately reports
+    ``'controlled'`` / ``'recipe_mismatch'`` / ``'seed_mismatch'`` /
+    ``'partially_observed'``.
     """
     names = [v['name'] for v in variants]
     baseline = next((v for v in variants if v['name'] == 'baseline'), None)
@@ -1040,23 +1048,121 @@ def ablation_design_audit(variants, rows=None, requested=None):
             'run, regardless of any paired contrast that still computes.'),
     }
     if rows is not None:
+        def _observed(row, field):
+            value = row.get(field)
+            if value is None:
+                for seed_row in row.get('per_seed') or []:
+                    value = seed_row.get(field)
+                    if value is not None:
+                        break
+            return value
+
+        recipe_fields = ('steps', 'train_batch', 'lr')
+        observed_fields = ('n_params', 'n_layers') + recipe_fields
         n_params: dict = {}
         n_layers: dict = {}
+        values: dict[str, dict[str, set]] = {}
+        requested_seeds: dict[str, set] = {}
+        successful_seeds: dict[str, set] = {}
         for r in rows:
             name = r.get('variant')
             if name is None:
                 continue
-            if r.get('n_params') is not None:
-                n_params.setdefault(name, r['n_params'])
-            if r.get('n_layers') is not None:
-                n_layers.setdefault(name, r['n_layers'])
+            values.setdefault(name, {f: set() for f in observed_fields})
+            requested_seeds.setdefault(name, set())
+            successful_seeds.setdefault(name, set())
+            for field in observed_fields:
+                value = _observed(r, field)
+                if value is not None:
+                    values[name][field].add(value)
+            for seed in r.get('seeds') or []:
+                requested_seeds[name].add(seed)
+            for seed_row in r.get('per_seed') or []:
+                if ('error' in seed_row
+                        or seed_row.get('final_acc') is None):
+                    continue
+                successful_seeds[name].add(seed_row.get('seed'))
+
+        names_with_rows = [n for n in names if n in values]
+
+        def _parity(field):
+            per_variant = [values[n][field] for n in names_with_rows]
+            if not per_variant or any(not v for v in per_variant):
+                return None
+            if any(len(v) != 1 for v in per_variant):
+                return False
+            return len({next(iter(v)) for v in per_variant}) <= 1
+
+        recipe_parity = {f: _parity(f) for f in recipe_fields}
+        expected_recipe = dict(recipe or {})
+        recipe_matches_expected = {}
+        for field in recipe_fields:
+            if field not in expected_recipe:
+                continue
+            per_variant = [values[n][field] for n in names_with_rows]
+            if not per_variant or any(len(v) != 1 for v in per_variant):
+                recipe_matches_expected[field] = None
+            else:
+                recipe_matches_expected[field] = all(
+                    next(iter(v)) == expected_recipe[field]
+                    for v in per_variant)
+
+        req_sets = [requested_seeds[n] for n in names_with_rows]
+        if not req_sets or any(not s for s in req_sets):
+            seed_alignment_ok = None
+            common_seeds: set = set()
+        else:
+            common_seeds = set.intersection(*req_sets)
+            seed_alignment_ok = (
+                len(common_seeds) == len(req_sets[0])
+                and all(s == req_sets[0] for s in req_sets)
+                and all(successful_seeds[n] == req_sets[0]
+                        for n in names_with_rows))
+
+        mismatched_fields = [f for f, ok in recipe_parity.items()
+                             if ok is False]
+        if (any(v is False for v in recipe_matches_expected.values())
+                or mismatched_fields):
+            controls_status = 'recipe_mismatch'
+        elif seed_alignment_ok is False:
+            controls_status = 'seed_mismatch'
+        elif (any(v is None for v in recipe_parity.values())
+              or seed_alignment_ok is None):
+            controls_status = 'partially_observed'
+        else:
+            controls_status = 'controlled'
+
         audit['controlled_variables'] = {
-            'parameter_count_by_variant': n_params,
-            'parameter_count_parity': (len(set(n_params.values())) <= 1
-                                       if n_params else None),
-            'depth_by_variant': n_layers,
-            'depth_parity': (len(set(n_layers.values())) <= 1
-                             if n_layers else None),
+            'parameter_count_by_variant': {
+                n: next(iter(values[n]['n_params']))
+                for n in names_with_rows if values[n]['n_params']},
+            'parameter_count_parity': _parity('n_params'),
+            'depth_by_variant': {
+                n: next(iter(values[n]['n_layers']))
+                for n in names_with_rows if values[n]['n_layers']},
+            'depth_parity': _parity('n_layers'),
+            'recipe_fields': list(recipe_fields),
+            'recipe_by_variant': {
+                n: {f: sorted(values[n][f], key=repr)
+                    for f in recipe_fields}
+                for n in names_with_rows},
+            'recipe_parity': recipe_parity,
+            'expected_recipe': expected_recipe,
+            'recipe_matches_expected': recipe_matches_expected,
+            'requested_seeds_by_variant': {
+                n: sorted(s for s in requested_seeds[n] if s is not None)
+                for n in names_with_rows},
+            'successful_seeds_by_variant': {
+                n: sorted(s for s in successful_seeds[n] if s is not None)
+                for n in names_with_rows},
+            'common_requested_seeds': sorted(
+                s for s in common_seeds if s is not None),
+            'seed_alignment_ok': seed_alignment_ok,
+            'controls_status': controls_status,
+            'note': ('A single-factor mechanism claim also requires the '
+                     'variants to share steps/batch/lr and the requested '
+                     'seed set; otherwise the contrast mixes the mechanism '
+                     'with a budget or sampling difference.'),
         }
     return audit
 
@@ -1432,7 +1538,8 @@ def main():
     # against the observed parameter counts / depths.
     design_audit = ablation_design_audit(
         variants, rows=all_rows,
-        requested=requested if requested else None)
+        requested=requested if requested else None,
+        recipe={'steps': steps, 'train_batch': train_batch, 'lr': 3e-3})
     if design_audit['status'] != 'leave_one_out_complete':
         logger.warning(
             '  WARNING: selected variant set is not a complete leave-one-out '
@@ -1449,6 +1556,12 @@ def main():
         logger.warning(
             '  WARNING: observed depths differ across variants: %s',
             cv.get('depth_by_variant'))
+    if cv.get('controls_status') in ('recipe_mismatch', 'seed_mismatch'):
+        logger.warning(
+            '  WARNING: controlled-variable check failed (%s): '
+            'recipe_parity=%s seed_alignment_ok=%s',
+            cv.get('controls_status'), cv.get('recipe_parity'),
+            cv.get('seed_alignment_ok'))
 
     metadata = {
         'experiment': 'exp8_mechanism_ablation',
