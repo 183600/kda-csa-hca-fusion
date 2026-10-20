@@ -597,12 +597,12 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     back to the raw rule, as does a bootstrap move from ``score=None``.
 
     The reported ``best`` closes the quality plateau: among the feasible
-    candidates within ``min_delta`` of the greedy endpoint's score, a
-    strictly resource-cheaper one wins (so a state-neutral top-k reduction
-    is recommended even though the strict-improvement rule would not move
-    to it); without a strictly cheaper tie the endpoint itself is
-    reported, so an unsupported noise-sized score bump can never promote a
-    candidate. The raw endpoint is kept as ``greedy_endpoint`` for the
+    candidates whose score is no higher than the greedy endpoint's and no
+    more than ``min_delta`` below it, a strictly resource-cheaper one wins
+    (so a state-neutral top-k reduction is recommended even though the
+    strict-improvement rule would not move to it); without a strictly
+    cheaper tie the endpoint itself is reported, so an unsupported
+    noise-sized score bump can never promote a candidate. The raw endpoint is kept as ``greedy_endpoint`` for the
     trace. The returned ``best_vs_start`` block is the paired test of the
     recommended candidate against the start (``None`` when the metrics do
     not carry per-seed data).
@@ -707,11 +707,15 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     # The closure only ever recommends a STRICTLY resource-cheaper tie:
     # with equal resources the endpoint itself wins, so an unsupported
     # (noise-sized) score bump can never promote a non-endpoint candidate.
+    # The plateau is bounded ABOVE by the endpoint's score: a neighbour
+    # with a higher raw mean that failed the paired-support test is not a
+    # "tie", so it must not be promoted merely because it is cheaper.
     endpoint = current_record
     plateau = [r for r in records.values()
                if r['feasible'] and r['score'] is not None
                and endpoint['score'] is not None
-               and r['score'] >= endpoint['score'] - float(min_delta)]
+               and endpoint['score'] - float(min_delta)
+               <= r['score'] <= endpoint['score']]
     best = endpoint
     if plateau:
         candidate = min(plateau, key=lambda r: (

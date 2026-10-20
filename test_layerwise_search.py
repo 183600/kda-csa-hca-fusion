@@ -427,6 +427,39 @@ def test_greedy_search_requires_seed_reproducibility():
     assert result['best_vs_start']['significant'] is False
 
 
+def test_plateau_does_not_promote_unsupported_cheaper_gain():
+    """A cheaper neighbour with an unsupported score bump is not a tie."""
+    target_layout = ('csa', 'kda', 'kda', 'csa', 'hca')
+    target_label = Candidate(target_layout).label
+
+    def evaluate(cand):
+        per_seed = ([0.10, 0.10, 0.10]
+                    if tuple(cand.layout) == target_layout
+                    else [0.0, 0.0, 0.0])
+        return {'score': sum(per_seed) / len(per_seed),
+                'metrics': {'seeds': [42, 43, 44],
+                            'per_seed_accuracy': per_seed}}
+
+    def cost(cand):
+        cheaper = tuple(cand.layout) == target_layout
+        return {
+            'state_bytes_allocated': 100 if cheaper else 200,
+            'decode_marginal_read_elements': 1.0,
+        }
+
+    result = greedy_search(
+        SearchProblem(evaluate=evaluate, cost=cost), START, max_rounds=1)
+    round0 = result['rounds'][0]
+    assert round0['best_neighbor'] == target_label
+    assert round0['improvement'] is True
+    assert round0['improvement_supported'] is False
+    assert round0['accepted'] is False
+    assert result['greedy_endpoint']['label'] == START.label
+    assert result['best']['label'] == START.label, \
+        'a cheaper but statistically unsupported gain must not be promoted'
+    assert result['best_vs_start']['significant'] is False
+
+
 def test_mqar_objective_seed_statistics():
     import inspect
     import layerwise_search as L
