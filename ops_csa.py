@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from ops_cache import normal_tensor_scope
+from ops_norm import RMS_NORM_EPS, rms_norm, rms_norm_
 from ops_rope import (
     effective_rope_dim,
     partial_rope,
@@ -692,7 +693,7 @@ def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
     if mode == 'l2':
         return F.normalize(x, dim=-1)
     if mode == 'rms':
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        return rms_norm(x, eps=RMS_NORM_EPS)
     raise ValueError(
         f"qk_norm_mode={mode!r} must be 'l2' (cosine, historical) or "
         f"'rms' (paper §2.3.3 RMSNorm form)")
@@ -715,7 +716,7 @@ def _qk_normalize_(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
         denom = x.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
         return x.div_(denom)
     if mode == 'rms':
-        return x.mul_(torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6))
+        return rms_norm_(x, eps=RMS_NORM_EPS)
     raise ValueError(
         f"qk_norm_mode={mode!r} must be 'l2' (cosine, historical) or "
         f"'rms' (paper §2.3.3 RMSNorm form)")

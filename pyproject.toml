@@ -108,12 +108,14 @@ py-modules = [
     "ops_kda",
     "ops_kda_backend",
     "ops_rope",
+    "ops_norm",
     "ops_csa",
     "ops_hca",
     "ops_fused",
     "ops_mamba",
     "ops_mamba_backend",
     "ops_decoding_cache",
+    "prefill_profile",
     "run_correctness",
     "run_benchmark",
     "run_quality",
@@ -150,7 +152,7 @@ markers = [
 # Coverage config so ``pytest --cov`` covers the ``ops_*`` library
 # modules (the default would otherwise skip them and only cover tests).
 [tool.coverage.run]
-source = ["ops_kda", "ops_rope", "ops_csa", "ops_hca", "ops_fused", "ops_mamba", "ops_mamba_backend", "ops_decoding_cache"]
+source = ["ops_kda", "ops_rope", "ops_norm", "ops_csa", "ops_hca", "ops_fused", "ops_mamba", "ops_mamba_backend", "ops_decoding_cache", "prefill_profile"]
 branch = true
 omit = [
     "run_*",       # experiment runners (not library code)

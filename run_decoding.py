@@ -705,9 +705,9 @@ class CSAAttnDecoding(nn.Module):
     retained prefix, while the indexer/attention work still scales with
     the number of completed compressed blocks (roughly O(T/m + win)). A
     continuation chunk (``T_new > 1`` received after the cache already
-    holds context) also goes through the incremental per-token path,
-    because chunk-local ``naive_csa`` output would ignore the cached
-    history.
+    holds context) uses one batched projection GEMM plus
+    :meth:`CSADecodingCache.forward_chunk`, because chunk-local
+    ``naive_csa`` output would ignore the cached history.
 
     The parameterization mirrors :class:`ops_fused.CSAHybridLayer` so
     the decode-cost comparison reflects the SAME operator the fused
@@ -839,30 +839,33 @@ class CSAAttnDecoding(nn.Module):
         # (T_new > 1) prefill received AFTER the cache already holds
         # context. The chunk-local naive_csa output above would silently
         # ignore every previously cached token, so continuation chunks
-        # must go through the per-token cache path (append + attend) to
-        # see the same history a full-sequence forward would.
-        outs = []
-        for i in range(T_new):
-            x_i = x[:, i:i + 1]
-            Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project(x_i)
-            # Detach projections before caching (KV cache should not retain
-            # the autograd graph across decode steps — mirrors the
-            # SoftmaxAttnDecoding / KDAAttnDecoding pattern).
-            cache.append_step(
-                Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
-                K_idx.detach(), Z_idx.detach(),
-                self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
-            )
-            compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
-            q_n = F.normalize(q.to(compute_dtype), dim=-1)
-            outs.append(cache.forward_step(
-                q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
-                topk=self.topk, nh=self.nh, nIh=self.nIh, scale=1.0,
-                sink_logits=self.sink, use_ste=self.use_ste,
-                normalize_qk=True,
-            ))   # each [B, 1, nh, c] in compute_dtype
-        o = torch.cat(outs, dim=1)
-        return self.o_proj(o.reshape(B, T_new, self.nh * self.c).to(x.dtype))
+        # must go through the cache path to see the same history a
+        # full-sequence forward would.
+        #
+        # Chunked-prefill fast path: project the WHOLE chunk with one
+        # batched matmul and run the cache's batched ``forward_chunk``
+        # (one append + one attention call) instead of a Python loop of
+        # per-token GEMV + append + decode. ``forward_chunk`` rebuilds the
+        # per-query strictly-preceding block mask and sliding window, so
+        # the outputs are equivalent to the token-by-token path.
+        Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project(x)
+        compute_dtype = (
+            torch.float64 if x.dtype == torch.float64 else torch.float)
+        q_n = F.normalize(q.to(compute_dtype), dim=-1)
+        # Detach projections before caching (KV cache should not retain the
+        # autograd graph across decode steps — mirrors the
+        # SoftmaxAttnDecoding / KDAAttnDecoding pattern).
+        o = cache.forward_chunk(
+            Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+            K_idx.detach(), Z_idx.detach(),
+            self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
+            q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+            topk=self.topk, nh=self.nh, nIh=self.nIh, scale=1.0,
+            sink_logits=self.sink, use_ste=self.use_ste,
+            normalize_qk=True,
+        )   # [B, T_new, nh, c] in compute_dtype
+        return self.o_proj(
+            o.reshape(B, T_new, self.nh * self.c).to(x.dtype))
 
 
 class HCAAttnDecoding(nn.Module):
@@ -952,20 +955,23 @@ class HCAAttnDecoding(nn.Module):
         # (T_new > 1) prefill received AFTER the cache already holds
         # context. The chunk-local naive_hca output above would silently
         # ignore every previously cached token, so continuation chunks
-        # must go through the per-token cache path (append + attend) to
-        # see the same history a full-sequence forward would.
-        outs = []
-        for i in range(T_new):
-            x_i = x[:, i:i + 1]
-            C, Z, q = self._project(x_i)
-            cache.append_step(C.detach(), Z.detach(), self.B_pos.detach())
-            compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
-            q_n = F.normalize(q.to(compute_dtype), dim=-1)
-            outs.append(cache.forward_step(
-                q_n, nh=self.nh, scale=1.0, sink_logits=self.sink,
-            ))   # each [B, 1, nh, c] in compute_dtype
-        o = torch.cat(outs, dim=1)
-        return self.o_proj(o.reshape(B, T_new, self.nh * self.c).to(x.dtype))
+        # must go through the cache path to see the same history a
+        # full-sequence forward would.
+        #
+        # Chunked-prefill fast path (see CSAAttnDecoding.forward): one
+        # batched projection GEMM + cache.forward_chunk instead of a
+        # per-token loop. forward_chunk rebuilds the per-query windows
+        # from a pre-append SW snapshot, so the history is identical.
+        C, Z, q = self._project(x)
+        compute_dtype = (
+            torch.float64 if x.dtype == torch.float64 else torch.float)
+        q_n = F.normalize(q.to(compute_dtype), dim=-1)
+        o = cache.forward_chunk(
+            C.detach(), Z.detach(), self.B_pos.detach(), q_n,
+            nh=self.nh, scale=1.0, sink_logits=self.sink,
+        )   # [B, T_new, nh, c] in compute_dtype
+        return self.o_proj(
+            o.reshape(B, T_new, self.nh * self.c).to(x.dtype))
 
 
 class HybridDecoding(nn.Module):
@@ -1254,30 +1260,30 @@ class HybridDecoding(nn.Module):
             # (T_new > 1) prefill received AFTER the cache already holds
             # context. The chunk-local naive_csa output above would ignore
             # every previously cached token, so continuation chunks must go
-            # through the per-token cache path (append + attend).
-            outs = []
-            for i in range(T_new):
-                h_i = h[:, i:i + 1]
-                Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = \
-                    self._project_csa(layer, h_i)
-                cache.append_step(
-                    Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
-                    K_idx.detach(), Z_idx.detach(),
-                    layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
-                )
-                compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
-                # Normalize with the layer's configured qk_norm_mode ('l2'
-                # default, 'rms' paper §2.3.3 form) so both paths
-                # match the prefill path's naive_csa call. ``scale=None``
-                # lets the cache auto-select the matching temperature.
-                q_n = _qk_normalize(q.to(compute_dtype), cfg.csa_qk_norm_mode)
-                outs.append(cache.forward_step(
-                    q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
-                    topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
-                    scale=None, sink_logits=layer.sink, use_ste=False,
-                    normalize_qk=True,
-                ))
-            o_core = torch.cat(outs, dim=1).reshape(
+            # through the cache path.
+            #
+            # Chunked-prefill fast path: ONE batched projection GEMM +
+            # cache.forward_chunk (one append + one batched attention)
+            # instead of a per-token GEMV + append + decode loop.
+            Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = \
+                self._project_csa(layer, h)
+            compute_dtype = (
+                torch.float64 if h.dtype == torch.float64 else torch.float)
+            # Normalize with the layer's configured qk_norm_mode ('l2'
+            # default, 'rms' paper §2.3.3 form) so both paths match the
+            # prefill path's naive_csa call. ``scale=None`` lets the cache
+            # auto-select the matching temperature.
+            q_n = _qk_normalize(q.to(compute_dtype), cfg.csa_qk_norm_mode)
+            o = cache.forward_chunk(
+                Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+                K_idx.detach(), Z_idx.detach(),
+                layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
+                q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+                topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
+                scale=None, sink_logits=layer.sink, use_ste=False,
+                normalize_qk=True,
+            )
+            o_core = o.reshape(
                 B, T_new, cfg.csa_nh * cfg.csa_c).to(h.dtype)
         return layer.o_proj(o_core)
 
@@ -1306,19 +1312,20 @@ class HybridDecoding(nn.Module):
             # Incremental path: T_new == 1 decode, or a continuation chunk
             # (T_new > 1) prefill received AFTER the cache already holds
             # context. See the CSA branch above for the rationale.
-            outs = []
-            for i in range(T_new):
-                h_i = h[:, i:i + 1]
-                C, Z, q = self._project_hca(layer, h_i)
-                cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
-                compute_dtype = torch.float64 if h.dtype == torch.float64 else torch.float
-                # Match the prefill path's naive_hca normalization mode; see
-                # the CSA branch above for the rationale.
-                q_n = _qk_normalize(q.to(compute_dtype), cfg.hca_qk_norm_mode)
-                outs.append(cache.forward_step(
-                    q_n, nh=cfg.hca_nh, scale=None, sink_logits=layer.sink,
-                ))
-            o_core = torch.cat(outs, dim=1).reshape(
+            #
+            # Chunked-prefill fast path (see the CSA branch above): one
+            # batched projection GEMM + cache.forward_chunk.
+            C, Z, q = self._project_hca(layer, h)
+            compute_dtype = (
+                torch.float64 if h.dtype == torch.float64 else torch.float)
+            # Match the prefill path's naive_hca normalization mode; see
+            # the CSA branch above for the rationale.
+            q_n = _qk_normalize(q.to(compute_dtype), cfg.hca_qk_norm_mode)
+            o = cache.forward_chunk(
+                C.detach(), Z.detach(), layer.B_pos.detach(), q_n,
+                nh=cfg.hca_nh, scale=None, sink_logits=layer.sink,
+            )
+            o_core = o.reshape(
                 B, T_new, cfg.hca_nh * cfg.hca_c).to(h.dtype)
         return layer.o_proj(o_core)
 

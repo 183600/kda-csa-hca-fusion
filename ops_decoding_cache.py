@@ -246,6 +246,72 @@ def _pos_tensor(value: int, device) -> torch.Tensor:
     return buf
 
 
+def _chunk_window_keys(keys: torch.Tensor, n_pre: int,
+                       win: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query sliding windows for a whole continuation chunk.
+
+    ``keys`` is the causal-order concatenation
+    ``[pre-chunk SW tail ; chunk keys]`` of shape ``[B, n_pre + T, c]``.
+    Query ``i`` of the chunk sits at concatenated index ``n_pre + i`` and
+    sees the last ``win`` entries ending there (the same window
+    ``_SlidingWindowRingBuffer.get()`` exposes after appending that
+    query). Returns ``(windows, valid)`` with shapes
+    ``[B, T, win, c]`` and ``[T, win]``. Left-padding (fewer than ``win``
+    entries available) is zero-filled and marked invalid, so the joint
+    softmax masks it exactly like the per-token path's absent entries.
+    """
+    if keys.dim() != 3:
+        raise ValueError(
+            f'_chunk_window_keys: keys must be [B, N, c], got '
+            f'{tuple(keys.shape)}')
+    if win < 0:
+        raise ValueError(f'_chunk_window_keys: win={win} must be >= 0')
+    total = keys.shape[1]
+    T = total - n_pre
+    if T < 0:
+        raise ValueError(
+            f'_chunk_window_keys: n_pre={n_pre} exceeds keys length {total}')
+    B, _, c = keys.shape
+    if win == 0 or T == 0:
+        return (keys.new_zeros(B, T, 0, c),
+                torch.zeros(T, 0, dtype=torch.bool, device=keys.device))
+    ends = n_pre + torch.arange(T, device=keys.device)       # [T]
+    starts = (ends - win + 1).clamp(min=0)                   # [T]
+    offsets = torch.arange(win, device=keys.device)          # [win]
+    idx = starts[:, None] + offsets[None, :]                 # [T, win]
+    valid = idx <= ends[:, None]
+    idx = idx.clamp(max=max(total - 1, 0))
+    flat = idx.reshape(-1)
+    windows = keys[:, flat, :].reshape(B, T, win, c)
+    return windows, valid
+
+
+def _joint_softmax_chunk(logits: torch.Tensor, valid: torch.Tensor,
+                         sink_logits: torch.Tensor | None) -> torch.Tensor:
+    """Stable joint softmax over ``[compressed ; window]`` for a chunk.
+
+    Mirrors the per-token ``forward_step`` chain: shift by
+    ``max(0, row_max)`` so the largest exponent argument is <= 0, keep
+    the sink in log space (denominator only), and zero all-invalid rows.
+    ``valid`` broadcasts to ``logits``'s shape.
+    """
+    masked = logits.masked_fill(~valid, float('-inf'))
+    all_invalid = ~valid.any(-1, keepdim=True)
+    if sink_logits is not None:
+        nh = masked.shape[2]
+        log_sink = sink_logits.view(1, 1, nh, 1).to(masked)
+        row_max = masked.amax(-1, keepdim=True).clamp(min=0)
+        shifted = masked - row_max
+        shifted_sink = log_sink - row_max
+        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
+        log_denom = torch.logaddexp(lse, shifted_sink)
+        p = (shifted - log_denom).exp()
+        return p.masked_fill(all_invalid, 0.0)
+    safe = masked.masked_fill(all_invalid, 0.0)
+    p = torch.softmax(safe, dim=-1)
+    return p.masked_fill(all_invalid, 0.0)
+
+
 def _csa_compress_kv_overlapped_single(
     Ca_new: torch.Tensor,   # [B, m, c]
     Cb_new: torch.Tensor,   # [B, m, c]
@@ -1752,6 +1818,302 @@ class CSADecodingCache:
         return out                                                     # [B, 1, nh, c]
 
 
+    def forward_chunk(
+        self,
+        Ca_new: torch.Tensor,
+        Cb_new: torch.Tensor,
+        Za_new: torch.Tensor,
+        Zb_new: torch.Tensor,
+        K_idx_new: torch.Tensor,
+        Z_idx_new: torch.Tensor,
+        Ba: torch.Tensor,
+        Bb: torch.Tensor,
+        B_idx: torch.Tensor,
+        q: torch.Tensor,
+        q_idx: torch.Tensor,
+        w_idx: torch.Tensor,
+        *,
+        topk: int,
+        nh: int,
+        nIh: int,
+        scale: float | None = None,
+        sink_logits: torch.Tensor | None = None,
+        use_ste: bool = True,
+        ste_mode: str = 'topk_columns',
+        normalize_qk: bool = True,
+    ) -> torch.Tensor:
+        """Batched equivalent of ``append_step`` + ``forward_step`` per token.
+
+        Feeds a whole continuation chunk through the cache and returns all
+        ``T_new`` outputs at once.  The cache state after the call is
+        IDENTICAL to the per-token ``append_step`` loop (same block
+        boundaries, same compression helpers); only the attention is
+        evaluated with a batched block mask and batched per-query sliding
+        windows.  This is the chunked-prefill fast path: one projection
+        GEMM (done by the caller) plus one attention call per chunk
+        instead of one per token.
+
+        The per-query window is reconstructed from a snapshot of the
+        pre-chunk SW tail plus the chunk keys.  Queries inside the chunk
+        therefore see exactly the history they would see in the
+        token-by-token path; future tokens of the same chunk are excluded
+        by construction (window end index == query index).
+
+        Args:
+            Ca_new, Cb_new, Za_new, Zb_new: ``[B, T_new, c]`` projections.
+            K_idx_new, Z_idx_new: ``[B, T_new, c_I]`` indexer projections.
+            Ba, Bb, B_idx: positional biases (same shapes as
+                :meth:`append_step`).
+            q: ``[B, T_new, nh, c]`` queries (already normalized iff
+                ``normalize_qk``); rotated inside at absolute positions.
+            q_idx: ``[B, T_new, nIh, c_I]`` indexer queries.
+            w_idx: ``[B, T_new, nIh]`` indexer head weights.
+            topk, nh, nIh, scale, sink_logits, use_ste, ste_mode,
+                normalize_qk: same semantics as :meth:`forward_step`.
+
+        Returns:
+            ``[B, T_new, nh, c]`` attention output in ``compute_dtype``.
+        """
+        B, T_new, c = Ca_new.shape
+        if T_new < 1:
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: T_new={T_new} must be >= 1')
+        if B != self.B:
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: batch size {B} does not '
+                f"match cache's B={self.B}.")
+        if c != self.c:
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: c={c} does not match '
+                f"cache's c={self.c}.")
+        if q.shape != (B, T_new, nh, c):
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: q shape {tuple(q.shape)} '
+                f'does not match {(B, T_new, nh, c)}.')
+        if q_idx.shape[0] != B or q_idx.shape[1] != T_new \
+                or q_idx.shape[2] != nIh:
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: q_idx shape '
+                f'{tuple(q_idx.shape)} does not match '
+                f'{(B, T_new, nIh, q_idx.shape[-1])}.')
+        if w_idx.shape != (B, T_new, nIh):
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: w_idx shape '
+                f'{tuple(w_idx.shape)} does not match '
+                f'{(B, T_new, nIh)}.')
+        if q.device != self.device:
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: q.device={q.device} does '
+                f"not match cache's device={self.device}.")
+        if T_new == 1:
+            # Keep the canonical decode step for the singleton case.
+            self.append_step(
+                Ca_new, Cb_new, Za_new, Zb_new, K_idx_new, Z_idx_new,
+                Ba, Bb, B_idx)
+            return self.forward_step(
+                q, q_idx, w_idx, topk=topk, nh=nh, nIh=nIh, scale=scale,
+                sink_logits=sink_logits, use_ste=use_ste,
+                ste_mode=ste_mode, normalize_qk=normalize_qk)
+
+        # Cast once so the SW-key preparation below sees exactly the
+        # tensors ``append_step`` will store.
+        Ca_new = _to_cache(Ca_new, self.dtype, self.device)
+        Cb_new = _to_cache(Cb_new, self.dtype, self.device)
+        Za_new = _to_cache(Za_new, self.dtype, self.device)
+        Zb_new = _to_cache(Zb_new, self.dtype, self.device)
+        K_idx_new = _to_cache(K_idx_new, self.dtype, self.device)
+        Z_idx_new = _to_cache(Z_idx_new, self.dtype, self.device)
+        n0 = self._n_tokens_seen
+        compute_dtype = (
+            torch.float64 if self.dtype == torch.float64 else torch.float)
+        # Snapshot the pre-chunk SW tail BEFORE ``append_step`` overwrites
+        # the ring (clone: the ring is mutated in place).
+        pre_sw = None
+        if self._sw is not None and self._sw.n_valid:
+            pre_sw = self._sw.get().clone()
+        # Reproduce exactly the SW key preparation in ``_append_bulk``:
+        # normalize (when enabled) then rotate at absolute positions.
+        ca_store_store = None
+        if self._sw is not None:
+            if self._normalize_qk:
+                ca_src = _to_dtype(Ca_new, compute_dtype)
+                if (not torch.is_grad_enabled()
+                        and self.dtype != compute_dtype):
+                    ca_store = _qk_normalize_(ca_src, self.qk_norm_mode)
+                else:
+                    ca_store = _qk_normalize(ca_src, self.qk_norm_mode)
+            else:
+                ca_store = Ca_new
+            if self.rope_dim_eff > 0:
+                pos = torch.arange(
+                    n0, n0 + T_new, device=self.device)
+                ca_store = partial_rope(
+                    _to_dtype(ca_store, compute_dtype), pos,
+                    self.rope_dim_eff, self.rope_base, dim=1)
+            ca_store_store = _to_dtype(ca_store, self.dtype)
+        # Advance the cache exactly as the per-token loop would.
+        self.append_step(
+            Ca_new, Cb_new, Za_new, Zb_new, K_idx_new, Z_idx_new,
+            Ba, Bb, B_idx)
+        t_pos = torch.arange(n0, n0 + T_new, device=self.device)
+        q_compute = _to_dtype(q, compute_dtype)
+        if self.rope_dim_eff > 0:
+            q_compute = partial_rope(
+                q_compute, t_pos, self.rope_dim_eff, self.rope_base, dim=1)
+        if scale is None:
+            core_scale = (self.c ** -0.5
+                          if (not normalize_qk or self.qk_norm_mode == 'rms')
+                          else 1.0)
+        else:
+            core_scale = scale
+
+        # --- compressed-block branch (indexer top-k) -------------------
+        n_blocks = self._n_blocks
+        if n_blocks:
+            cbm = (torch.arange(n_blocks, device=self.device)[None, :]
+                   < (t_pos // self.m)[:, None])                    # [T, nb]
+            K_I = _to_dtype(
+                self._K_IComp[:, :n_blocks], compute_dtype)
+            effective_use_ste = use_ste and torch.is_grad_enabled()
+            if (normalize_qk and not torch.is_grad_enabled()
+                    and self.dtype != compute_dtype):
+                _qk_normalize_(K_I, 'l2')
+                q_idx_n = torch.nn.functional.normalize(
+                    _to_dtype(q_idx, compute_dtype), dim=-1)
+                indexer_result = csa_lightning_indexer(
+                    q_idx_n, K_I, _to_dtype(w_idx, compute_dtype), topk,
+                    scale=1.0, causal_block_mask=cbm,
+                    return_soft_weights=effective_use_ste,
+                    ste_mode=ste_mode, normalize_qk=False)
+            else:
+                indexer_result = csa_lightning_indexer(
+                    _to_dtype(q_idx, compute_dtype), K_I,
+                    _to_dtype(w_idx, compute_dtype), topk, scale=None,
+                    causal_block_mask=cbm,
+                    return_soft_weights=effective_use_ste,
+                    ste_mode=ste_mode, normalize_qk=normalize_qk)
+            if effective_use_ste:
+                indices, soft_weights = indexer_result
+            else:
+                indices = indexer_result
+                soft_weights = None
+            if indices.shape[-1] == 0:
+                scores = torch.empty(
+                    B, T_new, nh, 0, dtype=compute_dtype,
+                    device=self.device)
+                valid_mask = torch.empty(
+                    B, T_new, 0, dtype=torch.bool, device=self.device)
+                kv = torch.empty(
+                    B, T_new, 0, self.c, dtype=compute_dtype,
+                    device=self.device)
+            else:
+                valid_mask = indices >= 0                       # [B,T,topk]
+                idx_safe = indices.clamp(min=0)
+                C_storage = self._C_comp[:, :n_blocks]
+                dim = C_storage.shape[-1]
+                kv = torch.gather(
+                    C_storage.unsqueeze(1).expand(
+                        B, T_new, n_blocks, dim),
+                    2,
+                    idx_safe.unsqueeze(-1).expand(
+                        B, T_new, idx_safe.shape[-1], dim),
+                )                                               # [B,T,topk,c]
+                kv = _to_dtype(kv, compute_dtype)
+                if normalize_qk:
+                    kv = _qk_normalize(kv, self.qk_norm_mode)
+                if effective_use_ste and soft_weights is not None:
+                    soft_sel = torch.gather(
+                        soft_weights, dim=-1, index=idx_safe)
+                    soft_sel = soft_sel * valid_mask.to(soft_sel.dtype)
+                    soft_kv = soft_sel.unsqueeze(-1) * kv.detach()
+                    if ste_mode == 'full_softmax':
+                        C_all = _to_dtype(C_storage, compute_dtype)
+                        if normalize_qk:
+                            C_all = _qk_normalize(
+                                C_all, self.qk_norm_mode)
+                        soft_full = torch.einsum(
+                            'btn,bnc->btc', soft_weights, C_all)
+                        topk_size = kv.shape[2]
+                        soft_full_exp = soft_full.unsqueeze(2).expand(
+                            -1, -1, topk_size, -1)
+                        aux = soft_full_exp - soft_full_exp.detach()
+                        soft_kv = soft_kv + aux
+                    kv = kv + (soft_kv - soft_kv.detach())
+                scores = torch.einsum(
+                    'bthd,btkd->bthk', q_compute, kv)
+                if core_scale != 1.0:
+                    scores = scores * core_scale
+                scores = scores.masked_fill(
+                    ~valid_mask[:, :, None, :], float('-inf'))
+        else:
+            cbm = torch.empty(
+                T_new, 0, dtype=torch.bool, device=self.device)
+            scores = torch.empty(
+                B, T_new, nh, 0, dtype=compute_dtype, device=self.device)
+            valid_mask = torch.empty(
+                B, T_new, 0, dtype=torch.bool, device=self.device)
+            kv = torch.empty(
+                B, T_new, 0, self.c, dtype=compute_dtype,
+                device=self.device)
+
+        # --- sliding-window branch ------------------------------------
+        if self._sw is not None and ca_store_store is not None:
+            if pre_sw is None:
+                keys = ca_store_store
+                n_pre = 0
+            else:
+                keys = torch.cat([pre_sw, ca_store_store], dim=1)
+                n_pre = pre_sw.shape[1]
+            windows, valid_w = _chunk_window_keys(
+                keys, n_pre, self.win)
+            windows = _to_dtype(windows, compute_dtype)
+            scores_w = torch.einsum(
+                'bthd,btwd->bthw', q_compute, windows)
+            if core_scale != 1.0:
+                scores_w = scores_w * core_scale
+            scores_w = scores_w.masked_fill(
+                ~valid_w[None, :, None, :], float('-inf'))
+        else:
+            windows = torch.empty(
+                B, T_new, 0, self.c, dtype=compute_dtype,
+                device=self.device)
+            scores_w = torch.empty(
+                B, T_new, nh, 0, dtype=compute_dtype, device=self.device)
+            valid_w = torch.empty(
+                T_new, 0, dtype=torch.bool, device=self.device)
+
+        # --- joint softmax + output -----------------------------------
+        n_sparse = scores.shape[-1]
+        n_win = scores_w.shape[-1]
+        if n_sparse + n_win == 0:
+            out = torch.zeros(
+                B, T_new, nh, self.c, dtype=compute_dtype,
+                device=self.device)
+        else:
+            logits = torch.cat([scores, scores_w], dim=-1)
+            valid = torch.cat([
+                valid_mask[:, :, None, :],
+                valid_w[None, :, None, :].expand(
+                    B, T_new, 1, valid_w.shape[-1]),
+            ], dim=-1)
+            p = _joint_softmax_chunk(logits, valid, sink_logits)
+            p_b = p[..., :n_sparse]
+            p_w = p[..., n_sparse:]
+            out = torch.zeros(
+                B, T_new, nh, self.c, dtype=compute_dtype,
+                device=self.device)
+            if n_sparse:
+                out = out + torch.einsum(
+                    'bthk,btkd->bthd', p_b, kv)
+            if n_win:
+                out = out + torch.einsum(
+                    'bthw,btwd->bthd', p_w, windows)
+        if self.rope_dim_eff > 0:
+            out = partial_rope(
+                out, -t_pos, self.rope_dim_eff, self.rope_base, dim=1)
+        return out
+
+
 # =============================================================================
 # HCADecodingCache
 # =============================================================================
@@ -2387,6 +2749,172 @@ class HCADecodingCache:
             pos_t = _pos_tensor(t, device)
             out = partial_rope(
                 out, -pos_t, self.rope_dim_eff, self.rope_base, dim=1)
+        return out
+
+
+    def forward_chunk(
+        self,
+        C_new: torch.Tensor,
+        Z_new: torch.Tensor,
+        B_pos: torch.Tensor,
+        q: torch.Tensor,
+        *,
+        nh: int,
+        scale: float | None = None,
+        sink_logits: torch.Tensor | None = None,
+        normalize_qk: bool = True,
+    ) -> torch.Tensor:
+        """Batched equivalent of ``append_step`` + ``forward_step`` per token.
+
+        See :meth:`CSADecodingCache.forward_chunk` for the contract. HCA
+        has no indexer/top-k, so the dense compressed-block scores are
+        computed for all queries at once with the per-query strictly-
+        preceding block mask; the sliding-window branch is reconstructed
+        from a pre-append snapshot plus the chunk keys.
+        """
+        B, T_new, c = C_new.shape
+        if T_new < 1:
+            raise ValueError(
+                f'HCADecodingCache.forward_chunk: T_new={T_new} must be >= 1')
+        if B != self.B:
+            raise ValueError(
+                f'HCADecodingCache.forward_chunk: batch size {B} does not '
+                f"match cache's B={self.B}.")
+        if c != self.c:
+            raise ValueError(
+                f'HCADecodingCache.forward_chunk: c={c} does not match '
+                f"cache's c={self.c}.")
+        if q.shape != (B, T_new, nh, c):
+            raise ValueError(
+                f'HCADecodingCache.forward_chunk: q shape {tuple(q.shape)} '
+                f'does not match {(B, T_new, nh, c)}.')
+        if Z_new.shape[1] != T_new:
+            raise ValueError(
+                f'HCADecodingCache.forward_chunk: Z_new.shape[1]='
+                f'{Z_new.shape[1]} does not match C_new.shape[1]={T_new}.')
+        if q.device != self.device:
+            raise ValueError(
+                f'HCADecodingCache.forward_chunk: q.device={q.device} does '
+                f"not match cache's device={self.device}.")
+        if T_new == 1:
+            self.append_step(C_new, Z_new, B_pos)
+            return self.forward_step(
+                q, nh=nh, scale=scale, sink_logits=sink_logits,
+                normalize_qk=normalize_qk)
+
+        C_new = _to_cache(C_new, self.dtype, self.device)
+        Z_new = _to_cache(Z_new, self.dtype, self.device)
+        n0 = self._n_tokens_seen
+        compute_dtype = (
+            torch.float64 if self.dtype == torch.float64 else torch.float)
+        pre_sw = None
+        if self._sw is not None and self._sw.n_valid:
+            pre_sw = self._sw.get().clone()
+        c_store_store = None
+        if self._sw is not None:
+            if self._normalize_qk:
+                c_src = _to_dtype(C_new, compute_dtype)
+                if (not torch.is_grad_enabled()
+                        and self.dtype != compute_dtype):
+                    c_store = _qk_normalize_(c_src, self.qk_norm_mode)
+                else:
+                    c_store = _qk_normalize(c_src, self.qk_norm_mode)
+            else:
+                c_store = C_new
+            if self.rope_dim_eff > 0:
+                pos = torch.arange(
+                    n0, n0 + T_new, device=self.device)
+                c_store = partial_rope(
+                    _to_dtype(c_store, compute_dtype), pos,
+                    self.rope_dim_eff, self.rope_base, dim=1)
+            c_store_store = _to_dtype(c_store, self.dtype)
+        self.append_step(C_new, Z_new, B_pos)
+        t_pos = torch.arange(n0, n0 + T_new, device=self.device)
+        q_compute = _to_dtype(q, compute_dtype)
+        if self.rope_dim_eff > 0:
+            q_compute = partial_rope(
+                q_compute, t_pos, self.rope_dim_eff, self.rope_base, dim=1)
+        if scale is None:
+            core_scale = (self.c ** -0.5
+                          if (not normalize_qk or self.qk_norm_mode == 'rms')
+                          else 1.0)
+        else:
+            core_scale = scale
+
+        n_blocks = self._n_blocks
+        if n_blocks:
+            cbm = (torch.arange(n_blocks, device=self.device)[None, :]
+                   < (t_pos // self.m2)[:, None])                    # [T, nb]
+            C_comp_n = _to_dtype(
+                self._C_comp[:, :n_blocks], compute_dtype)
+            if normalize_qk:
+                C_comp_n = _qk_normalize(C_comp_n, self.qk_norm_mode)
+            scores = torch.einsum(
+                'bthd,bnd->bthn', q_compute, C_comp_n)
+            if core_scale != 1.0:
+                scores = scores * core_scale
+            scores = scores.masked_fill(
+                ~cbm[None, :, None, :], float('-inf'))
+        else:
+            cbm = torch.empty(
+                T_new, 0, dtype=torch.bool, device=self.device)
+            scores = torch.empty(
+                B, T_new, nh, 0, dtype=compute_dtype, device=self.device)
+            C_comp_n = torch.empty(
+                B, 0, self.c, dtype=compute_dtype, device=self.device)
+
+        if self._sw is not None and c_store_store is not None:
+            if pre_sw is None:
+                keys = c_store_store
+                n_pre = 0
+            else:
+                keys = torch.cat([pre_sw, c_store_store], dim=1)
+                n_pre = pre_sw.shape[1]
+            windows, valid_w = _chunk_window_keys(
+                keys, n_pre, self.win)
+            windows = _to_dtype(windows, compute_dtype)
+            scores_w = torch.einsum(
+                'bthd,btwd->bthw', q_compute, windows)
+            if core_scale != 1.0:
+                scores_w = scores_w * core_scale
+            scores_w = scores_w.masked_fill(
+                ~valid_w[None, :, None, :], float('-inf'))
+        else:
+            windows = torch.empty(
+                B, T_new, 0, self.c, dtype=compute_dtype,
+                device=self.device)
+            scores_w = torch.empty(
+                B, T_new, nh, 0, dtype=compute_dtype, device=self.device)
+            valid_w = torch.empty(
+                T_new, 0, dtype=torch.bool, device=self.device)
+
+        n_dense = scores.shape[-1]
+        n_win = scores_w.shape[-1]
+        if n_dense + n_win == 0:
+            out = torch.zeros(
+                B, T_new, nh, self.c, dtype=compute_dtype,
+                device=self.device)
+        else:
+            logits = torch.cat([scores, scores_w], dim=-1)
+            valid = torch.cat([
+                cbm[None, :, None, :],
+                valid_w[None, :, None, :],
+            ], dim=-1)
+            p = _joint_softmax_chunk(logits, valid, sink_logits)
+            p_dense = p[..., :n_dense]
+            p_w = p[..., n_dense:]
+            out = torch.zeros(
+                B, T_new, nh, self.c, dtype=compute_dtype,
+                device=self.device)
+            if n_dense:
+                out = out + torch.einsum(
+                    'bthn,bnd->bthd', p_dense, C_comp_n)
+            if n_win:
+                out = out + torch.einsum(
+                    'bthw,btwd->bthd', p_w, windows)
+        if self.rope_dim_eff > 0:
+            out = partial_rope(
+                out, -t_pos, self.rope_dim_eff, self.rope_base, dim=1)
         return out
 
 
