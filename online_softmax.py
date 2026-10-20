@@ -125,15 +125,22 @@ def online_softmax_finalize(m: torch.Tensor, den: torch.Tensor,
     logit added to the **denominator only**, matching ``ops_hca`` /
     ``ops_csa``.  Rows with no valid entry (``den == 0``) return zeros.
     """
-    if sink_logits is None:
-        log_denom = m + torch.log(den.clamp_min(torch.finfo(den.dtype).tiny))
-    else:
+    empty = (den == 0)
+    # Substitute a finite state for all-empty rows BEFORE forming the
+    # exponent. Their output is zeroed at the end anyway, but with the raw
+    # ``m == -inf`` / ``den == 0`` pair the expression evaluates
+    # ``-inf - (-inf)`` (or ``-inf - log(0)``), and the NaN/Inf produced by
+    # ``exp`` poisons the backward pass even though ``torch.where`` selects
+    # the zero branch forward.
+    m_safe = torch.where(empty, torch.zeros_like(m), m)
+    den_safe = torch.where(empty, torch.ones_like(den), den)
+    log_denom = m_safe + torch.log(
+        den_safe.clamp_min(torch.finfo(den.dtype).tiny))
+    if sink_logits is not None:
         sink = sink_logits.view(1, -1, 1, 1).to(m)
-        log_l = m + torch.log(den.clamp_min(torch.finfo(den.dtype).tiny))
-        log_denom = torch.logaddexp(log_l, sink)
-    out = acc * (m - log_denom).exp()
-    empty = (den == 0).expand_as(out)
-    return torch.where(empty, torch.zeros_like(out), out)
+        log_denom = torch.logaddexp(log_denom, sink)
+    out = acc * (m_safe - log_denom).exp()
+    return torch.where(empty.expand_as(out), torch.zeros_like(out), out)
 
 
 def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
