@@ -1615,8 +1615,14 @@ class HybridAttentionStack(nn.Module):
             states = [None] * self.n_memory_layers
 
         # Build a mutable copy of the conv lookbacks so we can update per
-        # layer without touching self.
-        lookback_list = list(conv_lookbacks)
+        # layer without touching self. A ``None`` lookbacks list (e.g. from
+        # ``forward_with_policy`` with ``lookbacks=None``) defaults to one
+        # ``None`` per memory layer, mirroring the ``kda_state`` handling
+        # above.
+        if conv_lookbacks is None:
+            lookback_list = [None] * self.n_memory_layers
+        else:
+            lookback_list = list(conv_lookbacks)
         # A length mismatch between ``conv_lookbacks`` and
         # ``n_kda_layers`` means the caller is feeding state from a
         # different config. Raise a clear ValueError rather than
