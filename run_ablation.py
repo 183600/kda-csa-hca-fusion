@@ -119,7 +119,10 @@ from train_diagnostics import (
     ValidationCurve, accuracy_cost_tradeoff, log_pooled_errors, log_tradeoff,
     pool_error_analyses, raise_non_finite, triage_gradient,
 )
-from multi_seed_stats import tost_from_summary, _ZERO_VAR_REL_EPS
+from multi_seed_stats import (
+    min_detectable_effect, seeds_required, tost_from_summary,
+    _ZERO_VAR_REL_EPS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2422,6 +2425,20 @@ def _annotate_contrast_significance(contrasts: list,
         'n_significant': 0,
         'n_supported': 0,
         'n_contradicted': 0,
+        'n_significant_but_below_min_effect': 0,
+        'effect_size': {
+            'measure': ("Cohen's d_z = mean seed-paired difference / SD of "
+                        'the paired differences'),
+            'power_target': 0.8,
+            'reference_min_effect': DEFAULT_MIN_EFFECT,
+            'mde_note': (
+                'min_detectable_effect is the smallest mean difference this '
+                'run could detect at 80% power using the observed paired SD '
+                'and the corrected per-test alpha. It is a post-hoc planning '
+                'quantity, not a second test; a significant effect smaller '
+                'than the reference_min_effect is statistically detectable '
+                'but may not be scientifically meaningful.'),
+        },
         'equivalence_margin': equivalence_margin,
         'n_equivalent': 0,
         'tost': None,
@@ -2463,6 +2480,50 @@ def _annotate_contrast_significance(contrasts: list,
         c['alpha_bonferroni'] = alpha_test
         c['t_crit_bonferroni'] = crit
         c['significant_bonferroni'] = sig
+
+        # Standardized effect size + planning quantities. The t-statistic
+        # alone hides whether a significant contrast is a large effect or
+        # a tiny one bought with many seeds; d_z is on the paired-difference
+        # SD scale, and the MDE/seed count show what this run could and
+        # could not have resolved. Additive fields only.
+        sd = c.get('sd_diff')
+        dz = None
+        if (isinstance(mean_diff, (int, float))
+                and not isinstance(mean_diff, bool)
+                and isinstance(sd, (int, float))
+                and not isinstance(sd, bool)
+                and math.isfinite(float(mean_diff))
+                and math.isfinite(float(sd)) and float(sd) > 0.0):
+            dz = float(mean_diff) / float(sd)
+        mde = None
+        required_n = None
+        if (alpha_test is not None and n >= 2
+                and isinstance(sd, (int, float))
+                and not isinstance(sd, bool)
+                and math.isfinite(float(sd)) and float(sd) >= 0.0):
+            mde_alt = 'greater' if direction == 'greater' else 'two-sided'
+            mde = min_detectable_effect(
+                n, float(sd), alpha=alpha_test, power=0.8,
+                alternative=mde_alt)
+            if dz is not None:
+                required_n = seeds_required(
+                    dz, alpha=alpha_test, power=0.8,
+                    alternative=mde_alt)
+        c['effect_size_cohens_dz'] = dz
+        c['min_detectable_effect'] = mde
+        c['min_detectable_effect_alpha'] = alpha_test
+        c['min_detectable_effect_power'] = 0.8
+        c['seeds_required_80pct_power'] = required_n
+        below_min = (isinstance(mean_diff, (int, float))
+                     and not isinstance(mean_diff, bool)
+                     and math.isfinite(float(mean_diff))
+                     and abs(float(mean_diff)) < DEFAULT_MIN_EFFECT)
+        c['below_default_min_effect'] = below_min
+        c['significant_but_below_default_min_effect'] = bool(
+            sig and below_min)
+        summary['n_significant_but_below_min_effect'] += int(
+            sig and below_min)
+
         if direction == 'greater':
             if sig and mean_diff is not None and mean_diff > 0:
                 c['hypothesis_status'] = 'supported'

@@ -430,6 +430,38 @@ def test_matrix_design_audit_verifies_factorial_recipe_and_seed_parity():
     assert audit['missing_groups'] == ['KDA-A']
 
 
+def test_contrast_annotation_reports_effect_size_and_power_plan():
+    rows = [
+        _matrix_row('KDA-A', 'kda', (0.20, 0.25, 0.30)),
+        _matrix_row('KDA-B', 'kda', (0.30, 0.45, 0.60)),
+    ]
+    contrasts = _matrix_contrast_report(rows)
+    assert len(contrasts) == 1
+    summary = _annotate_contrast_significance(contrasts)
+    c = contrasts[0]
+    # Per-seed differences [0.1, 0.2, 0.3]: mean 0.2, SD 0.1, d_z = 2.
+    assert c['effect_size_cohens_dz'] == pytest.approx(2.0)
+    assert c['min_detectable_effect'] == pytest.approx(
+        (1.6448536269514722 + 0.8416212335729143) * 0.1 / (3 ** 0.5))
+    assert c['seeds_required_80pct_power'] == 2
+    assert c['below_default_min_effect'] is False
+    assert c['significant_bonferroni'] is True
+    assert summary['n_significant_but_below_min_effect'] == 0
+    assert summary['effect_size']['power_target'] == 0.8
+
+    small = [
+        _matrix_row('KDA-A', 'kda', (0.200, 0.210, 0.220)),
+        _matrix_row('KDA-B', 'kda', (0.201, 0.212, 0.223)),
+    ]
+    small_contrasts = _matrix_contrast_report(small)
+    small_summary = _annotate_contrast_significance(small_contrasts)
+    assert small_contrasts[0]['significant_bonferroni'] is True
+    assert small_contrasts[0]['below_default_min_effect'] is True
+    assert small_contrasts[0][
+        'significant_but_below_default_min_effect'] is True
+    assert small_summary['n_significant_but_below_min_effect'] == 1
+
+
 def test_contrast_tost_separates_equivalent_from_different():
     """A non-significant contrast is not equivalence; TOST decides it.
 
