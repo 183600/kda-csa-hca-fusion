@@ -4296,17 +4296,18 @@ def main():
     # Summary table (grouped by task + n_kv). The lr column makes the
     # tuned-baseline protocol visible in the headline table: baseline ops
     # may show a non-default lr selected on the validation stream.
-    print('\n' + '=' * 99)
+    print('\n' + '=' * 121)
     print(f"{'task':>10} | {'n_kv':>4} | {'op':>10} | {'lr':>7} | {'chance':>7} | {'mean_acc':>10} | "
-          f"{'+/- CI95':>10} | {'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
-    print('-' * 99)
+          f"{'f1_macro':>10} | {'pr_auc_ovr':>10} | {'+/- CI95':>10} | {'std':>8} | {'t_vs_chance':>12} | {'mean_loss':>10}")
+    print('-' * 121)
     for r in all_results:
         # Error rows have None for all numeric fields; render them as
         # dashes instead of crashing on ``f'{None:.4f}'``.
         if 'error' in r:
             err_msg = (r.get('error') or '')[:40]
             print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
-                  f"{'-':>7} | {'-':>7} | {'-':>10} | {'-':>10} | {'-':>8} | {'-':>12} | "
+                  f"{'-':>7} | {'-':>7} | {'-':>10} | {'-':>10} | {'-':>10} | "
+                  f"{'-':>10} | {'-':>8} | {'-':>12} | "
                   f"{'-':>10}   ERROR: {err_msg}")
             continue
         # ci95_acc may be None when only one seed survived; render 'n/a'.
@@ -4315,8 +4316,16 @@ def main():
         else:
             ci_str = f"{'n/a':>10}"
         lr_str = f"{r.get('lr', 3e-3):>7.1e}"
+        # Imbalance-robust metrics live in mean_final_metrics (populated
+        # whenever collect_predictions=True, which main() always sets).
+        mfm = r.get('mean_final_metrics') or {}
+        f1 = mfm.get('f1_macro_mean')
+        pr = mfm.get('pr_auc_macro_ovr_mean')
+        f1_str = f"{f1:>10.4f}" if f1 is not None else f"{'n/a':>10}"
+        pr_str = f"{pr:>10.4f}" if pr is not None else f"{'n/a':>10}"
         print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
               f"{lr_str} | {r['chance_acc']:>7.4f} | {r['mean_acc']:>10.4f} | "
+              f"{f1_str} | {pr_str} | "
               f"{ci_str} | {r['std_acc']:>8.4f} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
     # Fairness annotation: the softmax baseline is trained for
