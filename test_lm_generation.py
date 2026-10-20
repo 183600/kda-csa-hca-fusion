@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+import dataclasses
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -21,6 +23,7 @@ import torch  # noqa: E402
 
 from ops_fused import HybridConfig  # noqa: E402
 from train_lm_autodl import (LMWithHybrid, _sample_token,
+                             _export_lm_bundle, load_lm_for_inference,
                              TinyStoriesLM, _FallbackCharTokenizer)  # noqa: E402
 
 
@@ -31,9 +34,8 @@ def _ok(name, cond, detail=''):
     return cond
 
 
-def _make_model(vocab=17, device='cpu'):
-    torch.manual_seed(123)
-    cfg = HybridConfig(
+def _tiny_cfg():
+    return HybridConfig(
         d_model=32, n_heads_qk=2, n_heads_v=2,
         head_dim_k=8, head_dim_v=8,
         kda_chunk_size=4,
@@ -43,7 +45,11 @@ def _make_model(vocab=17, device='cpu'):
         n_kda=1, n_csa=1, n_hca=1,
         kda_backend='reference',
     )
-    return LMWithHybrid(vocab, cfg).to(device).eval()
+
+
+def _make_model(vocab=17, device='cpu'):
+    torch.manual_seed(123)
+    return LMWithHybrid(vocab, _tiny_cfg()).to(device).eval()
 
 
 def test_sample_token_invocab_and_greedy():
@@ -132,6 +138,46 @@ def test_generate_zero_new_tokens():
         f'got={gen}')
 
 
+def test_export_bundle_roundtrip(tmp_path=None):
+    """Exported bundle reloads and generates in-vocab, deterministically."""
+    root = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp()
+    model = _make_model()
+    vocab = model.embed.num_embeddings
+    ckpt = {
+        'cfg': dataclasses.asdict(_tiny_cfg()),
+        'model': model.state_dict(),
+        'vocab': vocab,
+        'arch': 'hybrid',
+    }
+    ckpt_path = os.path.join(root, 'lm.pt')
+    torch.save(ckpt, ckpt_path)
+    export_dir = os.path.join(root, 'bundle')
+    _export_lm_bundle(ckpt_path, export_dir,
+                      generation_defaults={'temperature': 0.0,
+                                           'max_new_tokens': 6})
+    # Bundle files all present.
+    for name in ('config.json', 'pytorch_model.bin', 'tokenizer.json',
+                 'generation_config.json', 'provenance.json'):
+        _ok(f'bundle file {name}',
+            os.path.exists(os.path.join(export_dir, name)),
+            f'missing {name}')
+    # Reload for inference and generate.
+    reloaded, tok, gen_cfg = load_lm_for_inference(export_dir)
+    reloaded.eval()
+    torch.manual_seed(5)
+    prompt = torch.tensor([[0, 1, 2]])
+    gen = reloaded.generate(prompt, max_new_tokens=6, seed=7)[0]
+    _ok('exported reload generate in-vocab',
+        all(0 <= t < vocab for t in gen), f'gen={gen}')
+    _ok('exported reload generate length', len(gen) == 6,
+        f'len={len(gen)}')
+    # Deterministic across independent reloads.
+    reloaded2, _, _ = load_lm_for_inference(export_dir)
+    gen2 = reloaded2.generate(prompt, max_new_tokens=6, seed=7)[0]
+    _ok('exported reload deterministic', gen == gen2,
+        f'run1={gen}, run2={gen2}')
+
+
 def test_prefetch_cache_equals_live_encode():
     """Prefetch-cache ids must equal a fresh encode of the same text."""
     tok = _FallbackCharTokenizer()
@@ -168,6 +214,7 @@ _TEST_FUNCS = [
     test_generate_deterministic_with_seed,
     test_generate_eos_stops_early,
     test_generate_zero_new_tokens,
+    test_export_bundle_roundtrip,
     test_prefetch_cache_equals_live_encode,
     test_prefetch_cap_respected,
 ]

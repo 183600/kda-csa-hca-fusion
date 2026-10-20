@@ -49,6 +49,7 @@ import hashlib
 import datetime
 import json
 import math
+import dataclasses
 from collections import OrderedDict
 import torch
 import torch.nn as nn
@@ -1346,6 +1347,129 @@ class LMWithHybrid(nn.Module):
         return [seq[T:] for seq in sequences]
 
 
+def _fallback_tokenizer_payload() -> dict:
+    """Serialise the fallback char tokenizer into a JSON-friendly dict."""
+    tok = _FallbackCharTokenizer()
+    return {
+        'type': 'fallback_char',
+        'itos': list(tok._itos),
+        'pad_token_id': int(tok.pad_token_id),
+        'unk_token_id': int(tok.unk_token_id),
+    }
+
+
+def _export_lm_bundle(ckpt_path, export_dir, generation_defaults=None,
+                      device='cpu'):
+    """Package a trained LM checkpoint into a self-contained deployment bundle.
+
+    Writes, into ``export_dir``:
+
+      * ``config.json``        - :class:`HybridConfig` (``dataclasses.asdict``)
+                                 needed to rebuild the model
+      * ``pytorch_model.bin``  - model ``state_dict``
+      * ``tokenizer.json``     - fallback-char ``itos`` (or an HF name marker)
+      * ``generation_config.json`` - sampling defaults
+                                 (temperature/top_k/top_p/eos/max_new_tokens + vocab)
+      * ``provenance.json``    - environment/git/torch provenance
+
+    Returns the export directory. The bundle is deliberately framework-lean:
+    rebuilding needs only this repo plus ``torch`` (and ``transformers`` for
+    the optional HF tokenizer path), so a trained model can be shipped and
+    reloaded for inference without the training script.
+    """
+    if not os.path.exists(ckpt_path):
+        raise SystemExit(f"checkpoint not found: {ckpt_path}")
+    try:
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+    cfg = HybridConfig(**ckpt['cfg'])
+    arch = ckpt.get('arch', 'hybrid')
+    vocab = int(ckpt['vocab'])
+    model = build_lm_model(
+        arch, vocab, cfg,
+        d_model=ckpt.get('model_d_model') if arch == 'softmax' else None)
+    model.load_state_dict(ckpt['model'])
+    model.eval()
+
+    os.makedirs(export_dir, exist_ok=True)
+    torch.save(model.state_dict(),
+               os.path.join(export_dir, 'pytorch_model.bin'))
+    write_json_atomic(dataclasses.asdict(cfg),
+                      os.path.join(export_dir, 'config.json'),
+                      indent=2, allow_nan=False)
+
+    if HAS_HF:
+        try:
+            _hf_tok = AutoTokenizer.from_pretrained("gpt2")
+            tok_payload = {
+                'type': 'hf',
+                'name': getattr(_hf_tok, 'name_or_path', 'gpt2'),
+                'pad_token_id': getattr(_hf_tok, 'pad_token_id', None),
+                'unk_token_id': getattr(_hf_tok, 'unk_token_id', None),
+            }
+        except Exception:
+            tok_payload = _fallback_tokenizer_payload()
+    else:
+        tok_payload = _fallback_tokenizer_payload()
+    write_json_atomic(tok_payload,
+                      os.path.join(export_dir, 'tokenizer.json'),
+                      indent=2, allow_nan=False)
+
+    gen_cfg = {
+        'temperature': 1.0, 'top_k': None, 'top_p': None,
+        'eos_token_id': None, 'max_new_tokens': 32, 'vocab': vocab,
+    }
+    if generation_defaults:
+        for key in ('temperature', 'top_k', 'top_p', 'eos_token_id',
+                    'max_new_tokens'):
+            if key in generation_defaults:
+                gen_cfg[key] = generation_defaults[key]
+    write_json_atomic(gen_cfg,
+                      os.path.join(export_dir, 'generation_config.json'),
+                      indent=2, allow_nan=False)
+    write_json_atomic(capture_provenance(),
+                      os.path.join(export_dir, 'provenance.json'),
+                      indent=2, allow_nan=False)
+    return export_dir
+
+
+def load_lm_for_inference(export_dir, device='cpu'):
+    """Reload a deployment bundle produced by :func:`_export_lm_bundle`.
+
+    Returns ``(model, tokenizer, generation_config)`` with the model in
+    ``eval()`` on ``device``, ready for :meth:`LMWithHybrid.generate`.
+    """
+    with open(os.path.join(export_dir, 'config.json')) as f:
+        cfg = HybridConfig(**json.load(f))
+    with open(os.path.join(export_dir, 'tokenizer.json')) as f:
+        tok_payload = json.load(f)
+    if tok_payload.get('type') == 'fallback_char':
+        tok = _FallbackCharTokenizer()
+        tok._itos = list(tok_payload['itos'])
+        tok._stoi = {c: i for i, c in enumerate(tok._itos)}
+        tok.pad_token_id = int(tok_payload.get('pad_token_id', 0))
+        tok.unk_token_id = int(tok_payload.get('unk_token_id', 1))
+    else:
+        tok_name = tok_payload.get('name', 'gpt2')
+        if HAS_HF:
+            tok = AutoTokenizer.from_pretrained(tok_name)
+        else:
+            tok = _FallbackCharTokenizer()
+    if getattr(tok, "pad_token", None) is None \
+            and hasattr(tok, "eos_token"):
+        tok.pad_token = tok.eos_token
+    with open(os.path.join(export_dir, 'generation_config.json')) as f:
+        gen_config = json.load(f)
+    vocab = int(gen_config.get('vocab', len(tok)))
+    with open(os.path.join(export_dir, 'pytorch_model.bin'), 'rb') as f:
+        state_dict = torch.load(f, map_location='cpu', weights_only=True)
+    model = build_lm_model('hybrid', vocab, cfg)
+    model.load_state_dict(state_dict)
+    model.to(device).eval()
+    return model, tok, gen_config
+
+
 class _DenseSoftmaxStack(nn.Module):
     """Dense causal-softmax stack with the interface the LM loop expects.
 
@@ -1979,6 +2103,16 @@ def main():
                         help="RNG seed for --generate sampling (deterministic).")
     parser.add_argument("--generate_max_context", type=int, default=512,
                         help="Max prompt tokens fed to --generate (truncated).")
+    # --- deployment: package a trained checkpoint into a self-contained
+    # bundle that can be reloaded and used to generate outside this script. --
+    parser.add_argument("--export", action="store_true",
+                        help="Load --checkpoint and write a self-contained "
+                             "deployment bundle (config + weights + tokenizer "
+                             "desc + generation config + provenance) to "
+                             "--export_dir, then exit without training.")
+    parser.add_argument("--export_dir", type=str, default=None,
+                        help="Destination directory for --export (default: "
+                             "--output_dir).")
     parser.add_argument("--val_frac", type=float, default=0.1,
                         help="Fraction of the cleaned corpus held out as the "
                              "validation split (model selection + early "
@@ -2221,6 +2355,49 @@ def main():
         print(f"[generate] generated={gen_text!r}")
         print(f"[generate] full={full_text!r}")
         print(f"[generate] saved={out_path}")
+        return
+
+    if args.export:
+        ckpt_path = args.checkpoint or os.path.join(
+            args.output_dir, "final_lm.pt")
+        export_dir = args.export_dir or args.output_dir
+        generation_defaults = {
+            'temperature': args.temperature,
+            'top_k': args.top_k,
+            'top_p': args.top_p,
+            'eos_token_id': args.eos_token_id,
+            'max_new_tokens': args.max_new_tokens,
+        }
+        _export_lm_bundle(ckpt_path, export_dir,
+                          generation_defaults=generation_defaults,
+                          device=device)
+        print(f"[export] bundle written to {export_dir}")
+        # Optional smoke generation from the reloaded bundle to prove the
+        # deployment artifact round-trips end to end.
+        if args.prompt:
+            model, tok, gen_cfg = load_lm_for_inference(
+                export_dir, device=device)
+            prompt_ids = tok.encode(args.prompt, truncation=True,
+                                    max_length=args.generate_max_context)
+            input_ids = torch.tensor([prompt_ids], dtype=torch.long,
+                                     device=device)
+            gen_ids = model.generate(
+                input_ids,
+                max_new_tokens=int(gen_cfg.get('max_new_tokens',
+                                               args.max_new_tokens)),
+                temperature=float(gen_cfg.get('temperature',
+                                              args.temperature)),
+                top_k=(None if gen_cfg.get('top_k') is None
+                       else int(gen_cfg['top_k'])),
+                top_p=(None if gen_cfg.get('top_p') is None
+                       else float(gen_cfg['top_p'])),
+                eos_token_id=(None if gen_cfg.get('eos_token_id') is None
+                              else int(gen_cfg['eos_token_id'])),
+                seed=args.generate_seed,
+            )[0]
+            gen_text = tok.decode(gen_ids, skip_special_tokens=True)
+            print(f"[export] prompt={args.prompt!r}")
+            print(f"[export] generated={gen_text!r}")
         return
 
     if HAS_HF:
