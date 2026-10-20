@@ -104,8 +104,10 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
+    make_run_manifest_entry,
     make_seeded_generator,
     parse_int_env,
     sanitize_for_json,
@@ -1562,6 +1564,56 @@ def main(argv=None) -> int:
     if not args.quiet:
         _print_table(report)
     write_results_json(payload, out_path, logger=logger)
+
+    # Campaign-level ledger entry: the exact seed list, recipe, data
+    # version and pre-sweep gate verdict in one strict-JSON line next to
+    # the result artifact.
+    gate_failures = sum(1 for r in gate_record.get('reports', [])
+                        if not r.get('passed'))
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp9_recall_reach',
+        seeds=list(seeds),
+        provenance=report['design']['provenance'],
+        hyperparameters={
+            'pairs': [[int(a), int(b)] for a, b in pairs],
+            'layouts': [str(name) for name in layouts],
+            'steps': int(steps) if not args.no_train else 0,
+            'seq_len': int(args.seq_len),
+            'd_model': int(args.d_model),
+            'train_batch': int(args.train_batch),
+            'eval_batches': int(args.eval_batches),
+            'eval_batch': int(args.eval_batch),
+            'val_every': int(val_every),
+            'val_batches': int(val_batches),
+            'val_batch': int(val_batch),
+            'trained': not bool(args.no_train),
+            'overfit_gate': {
+                key: gate_record.get(key)
+                for key in ('enabled', 'strict', 'steps', 'seed',
+                            'train_batch')},
+        },
+        data={
+            'task': 'long-range MQAR (run_quality.make_long_range_batch)',
+            'vocab': int(VOCAB),
+            'seq_len': int(args.seq_len),
+            'd_model': int(args.d_model),
+            'seed_stream_offsets': {
+                'train': 1_000_000,
+                'eval': 5_000_000,
+                'validation': 9_000_000,
+            },
+        },
+        artifacts={'results': out_path},
+        results={
+            'n_rows': len(report['rows']),
+            'n_seeds': len(seeds),
+            'trained': not bool(args.no_train),
+            'overfit_gate_enabled': bool(gate_record.get('enabled')),
+            'overfit_gate_failures': int(gate_failures),
+        },
+        status=('completed' if gate_failures == 0 else 'partial'),
+    ), logger=logger)
+
     print(f'[recall-reach] wrote {out_path} '
           f'({"trained" if not args.no_train else "structural-only"})')
     return 0

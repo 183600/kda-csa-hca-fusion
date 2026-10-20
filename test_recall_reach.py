@@ -547,6 +547,32 @@ def test_hypothesis_checks_contract():
         ['indexer_union_above_chance'])
 
 
+def test_main_writes_run_manifest(tmp_path, monkeypatch):
+    """The CLI ledger records seeds/recipe/artifact for a structural run."""
+    manifest = tmp_path / 'manifest.jsonl'
+    result_json = tmp_path / 'recall.json'
+    monkeypatch.setenv('RUN_MANIFEST_PATH', str(manifest))
+    rc = R.main(['--no-train', '--quick', '--quiet',
+                 '--json', str(result_json)])
+    _ok('structural CLI exits 0', rc == 0, str(rc))
+    _ok('result artifact written', result_json.exists(), str(result_json))
+    lines = manifest.read_text(encoding='utf-8').splitlines()
+    _ok('exactly one manifest line', len(lines) == 1, str(len(lines)))
+    entry = json.loads(lines[0])
+    _ok('manifest experiment id',
+        entry['experiment'] == 'exp9_recall_reach', entry['experiment'])
+    _ok('manifest seeds are the CLI defaults',
+        entry['seeds'] == [42, 43, 44], str(entry['seeds']))
+    _ok('manifest records structural-only run',
+        entry['results']['trained'] is False, str(entry['results']))
+    _ok('manifest points at the result artifact',
+        entry['artifacts']['results'] == str(result_json),
+        str(entry['artifacts']))
+    _ok('manifest carries provenance',
+        bool(entry['provenance'].get('git_commit')),
+        str(entry['provenance'].get('git_commit')))
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()

@@ -550,5 +550,29 @@ def test_mqar_objective_smoke(device):
     assert result['metrics']['probe'] == 'mqar-long-range-cue-last'
 
 
+def test_main_writes_run_manifest_and_gate(tmp_path, monkeypatch):
+    """The CLI records the disabled gate and the ledger entry."""
+    import layerwise_search as L
+
+    manifest = tmp_path / 'manifest.jsonl'
+    result_json = tmp_path / 'search.json'
+    monkeypatch.setenv('RUN_MANIFEST_PATH', str(manifest))
+    monkeypatch.setenv('SEARCH_OVERFIT_CHECK', '0')
+    rc = L.main([
+        '--quick', '--depth', '3', '--steps', '1', '--seeds', '42',
+        '--max-rounds', '0', '--quiet', '--json', str(result_json),
+    ])
+    assert rc == 0
+    assert result_json.exists()
+    lines = manifest.read_text(encoding='utf-8').splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry['experiment'] == 'exp12_layerwise_search'
+    assert entry['seeds'] == [42]
+    assert entry['results']['overfit_gate_enabled'] is False
+    assert entry['artifacts']['results'] == str(result_json)
+    assert entry['status'] == 'completed'
+
+
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))

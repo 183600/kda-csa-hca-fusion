@@ -118,8 +118,10 @@ from cache_accounting import (  # noqa: E402
     analytic_cache_components,
 )
 from kaggle_setup import (  # noqa: E402
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
+    make_run_manifest_entry,
     parse_int_env,
     sanitize_for_json,
     write_results_json,
@@ -1094,6 +1096,27 @@ def main(argv=None) -> int:
             raise SystemExit('--budget-mult must be > 0.')
         max_state_bytes = int(math.ceil(args.budget_mult * reference_bytes))
 
+    # Pre-search overfit gate through the exact probe construction path.
+    # A greedy search trains many candidates; a broken recipe must be caught
+    # once, before the compute is spent.
+    from recall_reach import (
+        VOCAB,
+        _build_recall_model,
+        make_long_range_batch,
+    )
+    from run_ablation import _run_ablation_overfit_gate
+
+    gate_record, proceed = _run_ablation_overfit_gate(
+        [(f'search start {start.label}',
+          lambda: _build_recall_model(args.m, args.m2, start.layout,
+                                      args.d_model, device))],
+        device, env_prefix='SEARCH',
+        make_task_batch=lambda b, embed, gen: make_long_range_batch(
+            b, args.seq_len, 1, VOCAB, embed, device, generator=gen),
+        seq_len=args.seq_len)
+    if not proceed:
+        return 1
+
     evaluate = make_mqar_objective(
         m=args.m, m2=args.m2, seeds=seeds, steps=steps,
         seq_len=args.seq_len, d_model=args.d_model,
@@ -1169,6 +1192,7 @@ def main(argv=None) -> int:
         'pareto': result['pareto'],
         'best_vs_start': result['best_vs_start'],
         'acceptance_policy': result['acceptance_policy'],
+        'overfit_sanity_check': gate_record,
         'provenance': capture_provenance(),
     }
     payload = sanitize_for_json(report)
@@ -1177,6 +1201,38 @@ def main(argv=None) -> int:
         _print_report(payload)
     out_path = args.json or RESULTS_PATH
     write_results_json(payload, out_path, logger=logger)
+
+    # Campaign-level ledger entry: seed list, full search recipe, data
+    # version, gate verdict and best candidate in one strict-JSON line.
+    gate_failures = sum(1 for r in gate_record.get('reports', [])
+                        if not r.get('passed'))
+    best = result['best']
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp12_layerwise_search',
+        seeds=list(seeds),
+        provenance=report['provenance'],
+        hyperparameters=report['config'],
+        data={
+            'probe': 'mqar-long-range-cue-last',
+            'generator': 'run_quality.make_long_range_batch',
+            'vocab': int(VOCAB),
+            'seq_len': int(args.seq_len),
+            'd_model': int(args.d_model),
+            'shared_seed_list': True,
+        },
+        artifacts={'results': out_path},
+        results={
+            'n_candidates': len(result['records']),
+            'n_rounds': len(result['rounds']),
+            'best_label': best.get('label'),
+            'best_score': best.get('score'),
+            'best_state_bytes': best.get('state_bytes_allocated'),
+            'overfit_gate_enabled': bool(gate_record.get('enabled')),
+            'overfit_gate_failures': int(gate_failures),
+        },
+        status=('completed' if gate_failures == 0 else 'partial'),
+    ), logger=logger)
+
     print(f'[layerwise-search] wrote {out_path} '
           f'({len(result["records"])} candidates evaluated)')
     return 0
