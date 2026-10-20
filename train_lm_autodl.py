@@ -1571,6 +1571,20 @@ class SoftmaxBaselineLM(nn.Module):
                                    labels.reshape(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss}
 
+    @torch.no_grad()
+    def generate(self, input_ids, *, max_new_tokens=32, temperature=1.0,
+                 top_k=None, top_p=None, eos_token_id=None, seed=None):
+        """Autoregressive generation, same contract as the hybrid LM.
+
+        Export bundles advertise ``generate`` for every architecture, so the
+        dense baseline must implement it too; the implementation is shared
+        (fully recomputed prefix, state reset, training mode restored).
+        """
+        return LMWithHybrid.generate(
+            self, input_ids, max_new_tokens=max_new_tokens,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            eos_token_id=eos_token_id, seed=seed)
+
 
 def build_lm_model(arch, vocab_size, cfg: HybridConfig, ckpt_policy=None,
                    d_model=None):
