@@ -161,6 +161,13 @@ def _lm_memory_route(cfg: HybridConfig) -> str:
     return cfg.memory_type
 
 
+def _n_csa_layers(cfg: HybridConfig) -> int:
+    """Number of CSA layers in the RESOLVED stack (layout-aware)."""
+    if cfg.layout is not None:
+        return sum(1 for k in cfg.layout if k == 'csa')
+    return cfg.n_csa
+
+
 def decode_read_spec(cfg: HybridConfig) -> dict:
     """Per-operator geometry blocks consumed by ``kv_budget.op_read_elements``."""
     return {
@@ -366,7 +373,7 @@ def _summarize_selection(captured: dict, cfg: HybridConfig, *,
       * ``inc`` records are emitted one indexer call per CSA layer per
         decoded token, in step-major order.
     """
-    n = cfg.n_csa
+    n = _n_csa_layers(cfg)
     full_records = captured['full']
     inc_records = captured['inc']
     base = {
@@ -626,7 +633,7 @@ def run_lm_consistency_check(model, input_ids, *, prefill_len: int | None = None
     cfg, _hybrid = _tower(model)
     out = prefill_decode_tower_outputs(
         model, input_ids, prefill_len=prefill_len, device=device,
-        capture_selection=cfg.n_csa > 0)
+        capture_selection=_n_csa_layers(cfg) > 0)
     with torch.no_grad():
         logits_full = model.lm_head(model.norm_f(out['tower_full']))
         logits_inc = model.lm_head(model.norm_f(out['tower_inc']))
