@@ -415,9 +415,11 @@ def partial_rope(
         return out
     cos = cos.view(bc_shape)
     sin = sin.view(bc_shape)
-    if x.requires_grad and torch.is_grad_enabled():
+    if (x.requires_grad or positions.requires_grad) and torch.is_grad_enabled():
         # Differentiable path: ``out=`` kernels do not record autograd, so
         # build the rotated pairs as plain expressions (identical values).
+        # Also required when only ``positions`` carries a gradient (the
+        # inference path's ``out=`` kernel would reject it outright).
         o1 = x1 * cos - x2 * sin
         o2 = x1 * sin + x2 * cos
         out = torch.empty(x.shape, dtype=x.dtype, device=device)
