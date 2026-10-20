@@ -1347,14 +1347,38 @@ class LMWithHybrid(nn.Module):
         return [seq[T:] for seq in sequences]
 
 
-def _fallback_tokenizer_payload() -> dict:
-    """Serialise the fallback char tokenizer into a JSON-friendly dict."""
-    tok = _FallbackCharTokenizer()
+def _fallback_tokenizer_payload(tokenizer=None) -> dict:
+    """Serialise a fallback char tokenizer into a JSON-friendly dict."""
+    tok = tokenizer if tokenizer is not None else _FallbackCharTokenizer()
     return {
         'type': 'fallback_char',
         'itos': list(tok._itos),
         'pad_token_id': int(tok.pad_token_id),
         'unk_token_id': int(tok.unk_token_id),
+    }
+
+
+def _tokenizer_payload(tokenizer=None) -> dict:
+    """Describe the tokenizer a checkpoint was trained with.
+
+    Export must rebuild the SAME vocabulary, not whatever tokenizer is
+    installed on the exporting host: a fallback-char run exported on a host
+    with ``transformers`` would otherwise advertise GPT-2 ids for a
+    97-token embedding. The payload is a plain JSON-safe dict so it can be
+    stored inside the checkpoint (``weights_only=True``-compatible).
+    """
+    if tokenizer is None or isinstance(tokenizer, _FallbackCharTokenizer):
+        return _fallback_tokenizer_payload(tokenizer)
+    name = getattr(tokenizer, 'name_or_path', None)
+    if not isinstance(name, str) or not name.strip():
+        # No reconstructable name (e.g. an in-memory custom tokenizer);
+        # the fallback is the only framework-free representation.
+        return _fallback_tokenizer_payload()
+    return {
+        'type': 'hf',
+        'name': name,
+        'pad_token_id': getattr(tokenizer, 'pad_token_id', None),
+        'unk_token_id': getattr(tokenizer, 'unk_token_id', None),
     }
 
 
@@ -1399,19 +1423,19 @@ def _export_lm_bundle(ckpt_path, export_dir, generation_defaults=None,
                       os.path.join(export_dir, 'config.json'),
                       indent=2, allow_nan=False)
 
-    if HAS_HF:
-        try:
-            _hf_tok = AutoTokenizer.from_pretrained("gpt2")
-            tok_payload = {
-                'type': 'hf',
-                'name': getattr(_hf_tok, 'name_or_path', 'gpt2'),
-                'pad_token_id': getattr(_hf_tok, 'pad_token_id', None),
-                'unk_token_id': getattr(_hf_tok, 'unk_token_id', None),
-            }
-        except Exception:
+    # Prefer the tokenizer recorded at TRAINING time. Only legacy
+    # checkpoints (saved before this field existed) fall back to the
+    # host's tokenizer, preserving their previous export behaviour.
+    tok_payload = ckpt.get('tokenizer')
+    if not isinstance(tok_payload, dict):
+        if HAS_HF:
+            try:
+                _hf_tok = AutoTokenizer.from_pretrained("gpt2")
+                tok_payload = _tokenizer_payload(_hf_tok)
+            except Exception:
+                tok_payload = _fallback_tokenizer_payload()
+        else:
             tok_payload = _fallback_tokenizer_payload()
-    else:
-        tok_payload = _fallback_tokenizer_payload()
     write_json_atomic(tok_payload,
                       os.path.join(export_dir, 'tokenizer.json'),
                       indent=2, allow_nan=False)
@@ -2901,6 +2925,7 @@ def main():
             "git_dirty": provenance.get("git_dirty"),
             "hyperparams": hyperparams,
             "data": data_record,
+            "tokenizer": _tokenizer_payload(tokenizer),
             "loss_history": list(curve_losses),
         }
         if extra:
