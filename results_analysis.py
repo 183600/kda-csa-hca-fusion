@@ -1106,6 +1106,24 @@ def multiclass_classification_metrics(pred, target, *, num_classes: int | None =
     if nonzero_support:
         class_balance = (max(nonzero_support) / min(nonzero_support)
                          if min(nonzero_support) > 0 else None)
+    # Imbalance-aware guidance (metadata only; does not alter any metric).
+    # Under extreme imbalance accuracy and ROC-AUC are overly optimistic
+    # (the huge negative mass makes FPR grow slowly), so PR-AUC / macro F1
+    # should be the primary ranking metrics; see the README fairness notes.
+    imbalance_note = None
+    if class_balance is not None:
+        if class_balance >= 1000:
+            imbalance_note = (
+                f'extreme class imbalance (max/min support = {class_balance:.0f}:1): '
+                'accuracy and ROC-AUC are overly optimistic; prefer PR-AUC '
+                '(pr_auc_macro_ovr) and macro F1 (f1_macro) as the primary '
+                'ranking metrics.'
+            )
+        elif class_balance >= 100:
+            imbalance_note = (
+                f'class imbalance (max/min support = {class_balance:.0f}:1): '
+                'prefer macro F1 / PR-AUC over raw accuracy.'
+            )
 
     report = {
         'n_samples': n,
@@ -1124,6 +1142,7 @@ def multiclass_classification_metrics(pred, target, *, num_classes: int | None =
         'f1_weighted': _weighted([pc['f1'] for pc in per_class]),
         'per_class': per_class,
         'class_balance': class_balance,
+        'imbalance_note': imbalance_note,
         'averaging_note': _AVERAGING_NOTE,
     }
 
