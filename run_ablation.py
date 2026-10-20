@@ -3757,14 +3757,40 @@ def main():
     ]
     if any(sum(r) != 5 for r in ratios):
         raise AssertionError('ablation layouts must all have total depth 5')
-    n_tests = len(ratios) * len(n_kv_list)
+    # Simple baselines (linear / softmax) at the SAME depth (5 layers) and
+    # same training recipe as every ratio group, so the sweep can answer
+    # "does the hybrid mix beat a tuned simple model?" instead of only
+    # "which mix is least bad". Mirror matrix mode's ABL_SIMPLE_BASELINES.
+    include_baselines = parse_int_env(
+        'ABL_SIMPLE_BASELINES', 1, min_value=0, logger=logger)
+    baseline_cells = []
+    if include_baselines:
+        for kind in SIMPLE_BASELINE_KINDS:
+            layout = (kind,) * 5
+            desc = (f'{kind} baseline: 5 x '
+                    f"{'identity mixer (no token mixing)' if kind == 'linear' else 'causal dense softmax attention'} "
+                    f'(same depth/training recipe as the ratio groups)')
+            baseline_cells.append((f'BASELINE-{kind}', kind, layout, desc))
+        logger.info('  simple baselines: '
+                    f'{[c[0] for c in baseline_cells]} '
+                    '(same depth 5 / recipe; ABL_SIMPLE_BASELINES=0 disables)')
+    else:
+        logger.info('  simple baselines: DISABLED (ABL_SIMPLE_BASELINES=0)')
+
+    # Each cell is ('ratio', ratio_tuple) or ('baseline',
+    # (group_id, memory_type, layout, description)).
+    cells = [('ratio', r) for r in ratios] + \
+        [('baseline', c) for c in baseline_cells]
+    n_tests = len(cells) * len(n_kv_list)
     alpha_corrected = 0.05 / n_tests
     try:
         from scipy.stats import t as _t_dist  # noqa: F401
         bonferroni_available = True
     except ImportError:
         bonferroni_available = False
-    logger.info(f'  {n_tests} one-sample t-tests vs chance; '
+    logger.info(f'  {n_tests} one-sample t-tests vs chance '
+                f'({len(ratios)} ratios + {len(baseline_cells)} baselines x '
+                f'{len(n_kv_list)} n_kv); '
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
                 f'(scipy={bonferroni_available}; fallback=exact-beta-bisection)')
 
@@ -3773,15 +3799,26 @@ def main():
         logger.info(f'\n{"=" * 70}')
         logger.info(f'  n_kv = {n_kv}   (harder: {n_kv} KV pairs to disambiguate)')
         logger.info(f'{"=" * 70}')
-        for r in ratios:
-            logger.info(f'\n-- ratio KDA:CSA:HCA = {r[0]}:{r[1]}:{r[2]} '
-                        f'(n_kv={n_kv}, {n_seeds} seeds) --')
+        for kind, spec in cells:
+            if kind == 'ratio':
+                label = f'ratio KDA:CSA:HCA = {spec[0]}:{spec[1]}:{spec[2]}'
+                ratio_str = f'{spec[0]}:{spec[1]}:{spec[2]}'
+            else:
+                group_id, _memory, _layout, desc = spec
+                label = desc
+                ratio_str = group_id
+            logger.info(f'\n-- {label} (n_kv={n_kv}, {n_seeds} seeds) --')
             try:
-                res = eval_layout_multi_seed(r, n_seeds=n_seeds, steps=steps,
-                                             device=device, n_kv=n_kv,
-                                             error_batches=error_batches,
-                                             error_batch=error_batch,
-                                             max_error_examples=error_examples)
+                kw = dict(n_seeds=n_seeds, steps=steps, device=device,
+                          n_kv=n_kv, error_batches=error_batches,
+                          error_batch=error_batch,
+                          max_error_examples=error_examples)
+                if kind == 'ratio':
+                    res = eval_layout_multi_seed(spec, **kw)
+                else:
+                    res = eval_group_multi_seed(spec, **kw)
+                res['ratio'] = ratio_str
+                res['is_baseline'] = (kind == 'baseline')
                 t_stat = res.get('t_stat_vs_chance')
                 n_ok = res.get('n_seeds_ok', 0)
                 if t_stat is not None and n_ok >= 2:
@@ -3794,22 +3831,25 @@ def main():
                     res['t_crit_bonferroni'] = None
                     res['significant_bonferroni'] = False
                 all_results.append(res)
-                logger.info(f"  layout={res['layout']}  n_params={res['n_params']}  n_layers={res['n_layers']}")
-                _ci = res['ci95_acc']
+                logger.info(f"  layout={res.get('layout')}  "
+                            f"n_params={res.get('n_params')}  "
+                            f"n_layers={res.get('n_layers')}")
+                _ci = res.get('ci95_acc')
                 _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
-                logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {_ci_str} "
-                            f"(std={res['std_acc']:.4f}, t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)}, "
+                logger.info(f"  -> mean_acc={res.get('mean_acc'):.4f} +/- {_ci_str} "
+                            f"(std={res.get('std_acc'):.4f}, "
+                            f"t_vs_chance={_fmt_tstat(res.get('t_stat_vs_chance'), width=0, prec=2)}, "
                             f"sig_bonferroni={res['significant_bonferroni']})")
-                logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms  "
+                logger.info(f"     mean_fwd={res.get('mean_fwd_ms'):.2f}ms  "
                             f"macro_f1={_fmt_num(res.get('mean_f1_macro'))}  "
                             f"balanced_acc="
                             f"{_fmt_num(res.get('mean_balanced_accuracy'))}")
             except Exception as e:
                 import traceback as _tb
-                logger.error(f"  ratio {r[0]}:{r[1]}:{r[2]} FAILED: {e}")
+                logger.error(f"  {ratio_str} FAILED: {e}")
                 _tb.print_exc()
                 all_results.append({
-                    'ratio': f'{r[0]}:{r[1]}:{r[2]}',
+                    'ratio': ratio_str,
                     'n_kv': n_kv,
                     'n_seeds': n_seeds,
                     'n_seeds_ok': 0,
@@ -3823,13 +3863,14 @@ def main():
                     'std_acc': None,
                     'mean_fwd_ms': None,
                     'n_params': None,
-                    'n_layers': sum(r),
+                    'n_layers': 5 if kind == 'baseline' else sum(spec),
                     'chance_acc': 1.0 / VOCAB,
                     't_stat_vs_chance': None,
                     't_crit_bonferroni': None,
                     'significant_bonferroni': False,
                     'mean_train_time_s': None,
                     'per_seed': [],
+                    'is_baseline': (kind == 'baseline'),
                 })
 
     print('\n' + '=' * 112)
