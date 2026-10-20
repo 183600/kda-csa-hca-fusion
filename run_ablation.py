@@ -53,8 +53,9 @@ Methodology (both modes):
     get the same depth/recipe/budget, and the softmax lr is selected on
     the held-out validation stream (``ABL_BASELINE_TUNE``,
     ``ABL_BASELINE_LRS``, ``ABL_BASELINE_TUNE_SEEDS``) before the main
-    sweep. Every CSA/HCA-containing hybrid group additionally gets a
-    seed-paired one-sided test against that tuned softmax under its own
+    sweep. Every non-baseline group (including the pure recurrent
+    control) additionally gets a seed-paired one-sided test against that
+    tuned softmax under its own
     Bonferroni family (``TUNED_BASELINE_HYPOTHESIS``), recorded in the
     matrix metadata; ``ABL_BASELINE_TUNE=0`` preserves the historical
     fixed lr=3e-3 and skips the tuning pass.
@@ -1042,10 +1043,10 @@ TUNED_BASELINE_HYPOTHESIS = {
                    'tuned dense-softmax baseline: the memory mechanism, not '
                    'an untuned baseline or extra optimization, explains the '
                    'difference.'),
-    'prediction': ('each CSA/HCA-containing hybrid group has a positive '
-                   'seed-paired final_acc difference versus the tuned '
-                   'BASELINE-softmax at the same n_kv (the pure recurrent '
-                   'control is not part of this hybrid claim).'),
+    'prediction': ('each non-baseline group, including the pure recurrent '
+                   'control, has a positive seed-paired final_acc '
+                   'difference versus the tuned BASELINE-softmax at '
+                   'the same n_kv.'),
     'falsified_if': ('the corrected one-sided test does not clear the '
                      'threshold (hybrid advantage not established) or is '
                      'significantly negative (the tuned baseline wins); '
@@ -1925,7 +1926,7 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
 def _tuned_baseline_contrast_report(
         all_results: list,
         reference_group: str = TUNED_BASELINE_GROUP) -> list:
-    """Direct paired tests of every hybrid group vs tuned softmax.
+    """Direct paired tests of every non-baseline group vs tuned softmax.
 
     ``_matrix_contrast_report`` answers the CSA/HCA layout questions but
     never asks the prior question: does *any* hybrid beat the standard
@@ -3233,7 +3234,7 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
             hypotheses={'tuned_baseline': TUNED_BASELINE_HYPOTHESIS})
         baseline_tests['reference_group'] = TUNED_BASELINE_GROUP
         baseline_tests['family_scope'] = (
-            'every CSA/HCA-containing hybrid group x n_kv, tested against the tuned '
+            'every non-baseline group x n_kv, tested against the tuned '
             f'{TUNED_BASELINE_GROUP} at the same n_kv')
         baseline_tests['rows'] = baseline_contrasts
         _log_tuned_baseline_table(baseline_contrasts, baseline_tests)
