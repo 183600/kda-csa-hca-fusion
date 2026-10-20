@@ -260,11 +260,16 @@ def test_dense_variant_recall_is_one():
         and diag['gold_top1_recall'] is not None
         and 0.0 <= diag['gold_top1_recall'] <= 1.0,
         f"pr_auc={diag['gold_pr_auc']} mrr={diag['gold_mrr']}")
-    _ok('ranking chance references match the 1-of-N geometry',
-        abs(diag['chance_gold_pr_auc'] - 1 / 3) < 1e-9
-        and abs(diag['chance_gold_mrr'] - (1 + 0.5 + 1 / 3) / 3) < 1e-9,
+    expected_chance_ap = (1 + 0.5 + 1 / 3) / 3
+    _ok('ranking chance references use the exact random-AP expectation',
+        abs(diag['chance_gold_pr_auc'] - expected_chance_ap) < 1e-9
+        and abs(diag['chance_gold_mrr'] - expected_chance_ap) < 1e-9
+        and abs(diag['chance_gold_roc_auc'] - 0.5) < 1e-9,
         f"chance_pr={diag['chance_gold_pr_auc']} "
         f"chance_mrr={diag['chance_gold_mrr']}")
+    _ok('one-gold-block macro AP equals MRR (per-query metrics)',
+        abs(diag['gold_pr_auc'] - diag['gold_mrr']) < 1e-12,
+        f"ap={diag['gold_pr_auc']} mrr={diag['gold_mrr']}")
 
 
 def test_sparse_variant_recall_is_below_one_or_none():
@@ -290,7 +295,8 @@ def test_sparse_variant_recall_is_below_one_or_none():
         diag['gold_pr_auc'] is not None
         and 0.0 <= diag['gold_pr_auc'] <= 1.0
         and diag['gold_mrr'] is not None
-        and abs(diag['chance_gold_pr_auc'] - 1 / 3) < 1e-9,
+        and abs(diag['chance_gold_pr_auc']
+                - (1 + 0.5 + 1 / 3) / 3) < 1e-9,
         f"pr_auc={diag['gold_pr_auc']} mrr={diag['gold_mrr']}")
 
 

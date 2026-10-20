@@ -1147,6 +1147,53 @@ def multiclass_classification_metrics(pred, target, *, num_classes: int | None =
     return report
 
 
+def expected_average_precision(n_pos: int, n_neg: int) -> float | None:
+    """Exact expected average precision of a uniformly random ranking.
+
+    For one query with ``n_pos`` relevant items among
+    ``n = n_pos + n_neg`` candidates, average precision (AP) is
+
+        AP = (1 / n_pos) * sum_{i: y_i = 1} (TP_i / i).
+
+    If the ranking is a uniformly random permutation, the expected AP is
+    **not** the prevalence ``n_pos / n`` (a common but incorrect
+    "chance AP" shorthand).  Conditioning on a relevant item at rank
+    ``r``, the expected precision there is::
+
+        [1 + (r - 1) * (n_pos - 1) / (n - 1)] / r,
+
+    because each earlier slot is relevant with probability
+    ``(n_pos - 1) / (n - 1)``.  Summing over ranks and simplifying gives
+
+        E[AP] = (H_n + (n_pos - 1) / (n - 1) * (n - H_n)) / n,
+
+    where ``H_n`` is the n-th harmonic number.  For a single relevant
+    item this is ``H_n / n`` -- identical to chance mean reciprocal rank
+    (which is why the two chance references must agree for the
+    one-gold-block indexer diagnostic).
+
+    The prevalence is the area under the *expected* precision-recall
+    curve, a different (smoothed) quantity; it understates the expected
+    AP of a finite random ranking, badly so for rare positives
+    (``H_100 / 100 ~= 0.052`` vs prevalence ``0.01``).
+
+    Returns ``None`` when there are no positives (AP undefined) and 1.0
+    when every candidate is relevant.
+    """
+    n_pos = int(n_pos)
+    n_neg = int(n_neg)
+    if n_pos < 0 or n_neg < 0:
+        raise ValueError('n_pos and n_neg must be >= 0')
+    if n_pos == 0:
+        return None
+    n = n_pos + n_neg
+    if n_neg == 0:
+        return 1.0
+    harmonic = sum(1.0 / i for i in range(1, n + 1))
+    return float((harmonic
+                  + (n_pos - 1) / (n - 1) * (n - harmonic)) / n)
+
+
 def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
     """Threshold-free ranking metrics for a binary decision / retrieval.
 
@@ -1160,7 +1207,8 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
         Average precision (area under the precision-recall curve, step
         interpolation). PRIMARY metric when positives are rare: ROC-AUC
         stays high because FPR grows slowly over a huge negative base,
-        while PR-AUC drops toward prevalence as the ranking degrades.
+        while PR-AUC drops toward its (finite-sample) chance expectation
+        as the ranking degrades.
     roc_auc
         Mann-Whitney U / rank statistic with average ranks for ties.
     mrr
@@ -1169,7 +1217,11 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
         Same number for a single relevant item: is the top-ranked
         candidate positive.
     chance_pr_auc / chance_roc_auc
-        Chance references (prevalence / 0.5) so a number can be judged.
+        Chance references so a number can be judged. ``chance_roc_auc``
+        is 0.5; ``chance_pr_auc`` is the EXACT expected AP under a
+        uniformly random tie-free ranking (``expected_average_precision``),
+        not the prevalence -- for a single positive among n candidates it
+        is ``H_n / n``. The two differ most when positives are rare.
 
     Returns ``None`` for pr_auc / roc_auc / mrr when the sample has only
     one class (undefined), never 0.0 or NaN. Equal scores are handled
@@ -1204,7 +1256,7 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
         'mrr': None,
         'recall_at_1': None,
         'precision_at_1': None,
-        'chance_pr_auc': prevalence,
+        'chance_pr_auc': expected_average_precision(n_pos, n_neg),
         'chance_roc_auc': 0.5 if n else None,
         'note': ('PR-AUC is the primary metric when positives are rare; '
                  'ROC-AUC is optimistic under a large negative base.'),

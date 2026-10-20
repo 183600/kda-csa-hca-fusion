@@ -14,7 +14,9 @@
    sentinel exclusion), output/state dtype normalization, the
    ``(output, final_state)`` result contract, the widened ``auto``
    fallback (RuntimeError -> warning + reference, CUDA OOM -> re-raise),
-   the never-raising availability probe, and ``resolve_kda_backend``.
+   the never-raising availability probe, ``resolve_kda_backend``, and the
+   TP shard's ``cfg.kda_backend`` dispatch (a model configured for FLA
+   must not silently run the reference kernel under TP).
 
 Run via pytest::
 
@@ -493,6 +495,68 @@ def test_kda_fla_backend_adapter_contract(device='cpu'):
                 sys.modules[name] = mod
 
 
+def test_kda_tp_layer_honors_configured_fla_backend(device='cpu'):
+    """The TP KDA shard dispatches through ``cfg.kda_backend``.
+
+    The TP oracle used to hard-code the reference backend, so a model
+    configured with ``kda_backend='fla'`` silently ran a different kernel
+    under TP than unsharded.  A fake FLA module (delegating to the
+    reference recurrence) pins the plumbing without needing CUDA.
+    """
+    import tp_parallel as tp
+    from ops_fused import HybridConfig, KDAHybridLayer
+
+    saved_ops = kdb._FLA_OPS
+    saved_modules = {
+        name: sys.modules.get(name)
+        for name in ('fla', 'fla.ops', 'fla.ops.kda')
+    }
+
+    def _delegate(q, k, v, g, beta, scale=None, initial_state=None,
+                  output_final_state=False, **kwargs):
+        return naive_recurrent_kda(
+            q, k, v, g, beta, scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state)
+
+    torch.manual_seed(53)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=4,
+        head_dim_k=16, head_dim_v=16, kda_chunk_size=0,
+        kda_backend='fla',
+    )
+    layer = KDAHybridLayer(cfg).eval()
+    x = torch.randn(2, 8, cfg.d_model, device=device) * 0.1
+    cuda_patch = mock.patch.object(
+        torch.Tensor, 'is_cuda', property(lambda self: True))
+    try:
+        _install_fake_fla(_delegate, _delegate)
+        with cuda_patch, torch.no_grad():
+            fla_parts = [
+                tp.kda_layer_forward_tp(layer, x, None, rank, 2)
+                for rank in range(2)]
+        with torch.no_grad():
+            ref_parts = [
+                tp.kda_layer_forward_tp(layer, x, None, rank, 2,
+                                        backend='reference')
+                for rank in range(2)]
+        diffs = [
+            (a['output'] - b['output']).abs().max().item()
+            for a, b in zip(fla_parts, ref_parts)]
+        _ok('cfg.kda_backend=fla dispatches TP shards through FLA',
+            all(p['backend'] == 'fla' for p in fla_parts)
+            and max(diffs) < 1e-6, f'max|diff|={max(diffs):.2e}')
+        _ok('explicit backend=reference overrides cfg.kda_backend',
+            all(p['backend'] == 'reference' for p in ref_parts), '')
+    finally:
+        kdb._FLA_OPS = saved_ops
+        for name, mod in saved_modules.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+
 def test_hybrid_config_indexer_chunk_wiring():
     """``HybridConfig.csa_indexer_chunk`` is plumbed through and inert.
 
@@ -540,4 +604,5 @@ if __name__ == '__main__':
     test_csa_naive_indexer_chunk_end_to_end()
     test_hybrid_config_indexer_chunk_wiring()
     test_kda_fla_backend_adapter_contract()
+    test_kda_tp_layer_honors_configured_fla_backend()
     print('all CSA-chunk / FLA-adapter tests passed')

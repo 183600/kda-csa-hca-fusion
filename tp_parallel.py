@@ -40,10 +40,13 @@ This module supplies both:
 Scope and honesty
 -----------------
 * The TP forward is a **correctness reference**, not a distributed
-  runtime.  It runs every simulated rank in one process, always selects
-  the reference KDA backend, and assumes fresh state for the stack-level
-  equivalence check.  It is the oracle a distributed kernel would be
-  tested against.
+  runtime.  It runs every simulated rank in one process and follows the
+  layer's configured KDA backend (``cfg.kda_backend``; an explicit
+  ``backend=`` argument overrides it for A/B checks).  Fresh-sequence
+  stack checks use :func:`hybrid_stack_forward_tp`; streaming / incremental
+  decoding of a KDA-only stack uses :func:`kda_stack_forward_tp`, which
+  carries the per-head recurrent state and short-conv lookback across
+  calls.  It is the oracle a distributed kernel would be tested against.
 * The latency model is analytic.  FLOPs reuse the canonical
   ``run_kv_cache.prefill_flops`` decomposition (a test pins that the
   replicated + sharded split sums to it exactly); decode bytes reuse
@@ -73,7 +76,8 @@ import decode_bandwidth
 from ops_csa import naive_csa
 from ops_fused import HybridConfig, build_mixer
 from ops_hca import naive_hca
-from ops_kda_backend import kda_forward
+from ops_kda_backend import (kda_forward, resolve_kda_backend,
+                             validate_kda_backend)
 from run_kv_cache import (
     causal_block_entries,
     causal_selected_entries,
@@ -338,14 +342,21 @@ def kda_layer_forward_tp(
     tp_rank: int,
     tp_size: int,
     conv_lookback: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
 ) -> dict:
-    """One rank's head-sharded KDA layer forward (reference backend).
+    """One rank's head-sharded KDA layer forward.
 
     Replicated: short conv, q/k projections, ``g_down``.  Sharded by the
     value-head axis: ``v_proj``, ``g_up``, ``beta``, the recurrent state
     and ``o_proj`` columns.  q/k are expanded by the GVA factor and then
     sliced to this rank's value-head range, so a rank boundary may fall
     inside one q/k head without changing the math.
+
+    ``backend`` defaults to ``cfg.kda_backend`` so the TP oracle exercises
+    the SAME kernel selection as the unsharded model.  Pass ``'reference'``
+    explicitly to force the pure-PyTorch path; an invalid name raises via
+    :func:`ops_kda_backend.validate_kda_backend`.
     """
     cfg = layer.cfg
     _validate_tp_size(tp_size)
@@ -353,6 +364,9 @@ def kda_layer_forward_tp(
         raise ValueError(
             f'kda_layer_forward_tp: tp_rank={tp_rank} out of range for '
             f'tp_size={tp_size}.')
+    requested_backend = cfg.kda_backend if backend is None else backend
+    requested_backend = validate_kda_backend(requested_backend)
+    resolved_backend = resolve_kda_backend(requested_backend)
     B, T, d = x.shape
     H, K, V, HV = (cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v,
                    cfg.n_heads_v)
@@ -370,7 +384,9 @@ def kda_layer_forward_tp(
             new_state = torch.zeros(B, hv, K, V, device=x.device,
                                     dtype=compute_dtype)
         return {'output': x.new_zeros(B, 0, d), 'state': new_state,
-                'conv_lookback': conv_lookback}
+                'conv_lookback': conv_lookback,
+                'backend': requested_backend,
+                'resolved_backend': resolved_backend}
     x_conv, new_lookback = _conv_features(layer, x, conv_lookback)
     q = F.normalize(
         F.silu(layer.q_proj(x_conv)).view(B, T, H, K), dim=-1)
@@ -392,14 +408,16 @@ def kda_layer_forward_tp(
         output_final_state=True,
         chunk_size=cfg.kda_chunk_size,
         use_chunk=use_chunk,
-        backend='reference',
+        backend=requested_backend,
         recompute_attn=cfg.kda_recompute_attn,
         assoc_scan=cfg.kda_assoc_scan,
     )
     o_proj = layer.o_proj.weight[:, lo * V:hi * V]
     partial = F.linear(o.reshape(B, T, hv * V), o_proj)
     return {'output': partial, 'state': new_state,
-            'conv_lookback': new_lookback}
+            'conv_lookback': new_lookback,
+            'backend': requested_backend,
+            'resolved_backend': resolved_backend}
 
 
 def csa_layer_forward_tp(
@@ -476,11 +494,13 @@ def hca_layer_forward_tp(
 def layer_forward_tp(layer, kind: str, x: torch.Tensor, tp_rank: int,
                      tp_size: int, *,
                      state_shard: torch.Tensor | None = None,
-                     conv_lookback: torch.Tensor | None = None) -> dict:
+                     conv_lookback: torch.Tensor | None = None,
+                     backend: str | None = None) -> dict:
     """Dispatch one rank's forward for a layer kind."""
     if kind == 'kda':
         return kda_layer_forward_tp(
-            layer, x, state_shard, tp_rank, tp_size, conv_lookback)
+            layer, x, state_shard, tp_rank, tp_size, conv_lookback,
+            backend=backend)
     if kind == 'csa':
         return csa_layer_forward_tp(layer, x, tp_rank, tp_size)
     if kind == 'hca':
@@ -489,7 +509,8 @@ def layer_forward_tp(layer, kind: str, x: torch.Tensor, tp_rank: int,
         f'tp_parallel: layer_forward_tp does not support kind {kind!r}.')
 
 
-def hybrid_stack_forward_tp(model, x: torch.Tensor, tp_size: int) -> dict:
+def hybrid_stack_forward_tp(model, x: torch.Tensor, tp_size: int, *,
+                            backend: str | None = None) -> dict:
     """Fresh-sequence TP reference forward of a whole hybrid stack.
 
     Every simulated rank is executed locally and its partial mixer output
@@ -497,6 +518,9 @@ def hybrid_stack_forward_tp(model, x: torch.Tensor, tp_size: int) -> dict:
     stream are replicated, this is exactly the unsharded stack forward
     (up to fp reduction order), which is what makes MQAR logits / recall
     invariant to the TP degree.
+
+    ``backend`` defaults to ``model.cfg.kda_backend`` (see
+    :func:`kda_layer_forward_tp`).
     """
     _validate_tp_size(tp_size)
     _validate_cfg(model.cfg)
@@ -506,15 +530,144 @@ def hybrid_stack_forward_tp(model, x: torch.Tensor, tp_size: int) -> dict:
                 f'hybrid_stack_forward_tp: layer kind {kind!r} is not '
                 f'supported.')
     validate_tp_size(model.cfg, tp_size)
+    requested_backend = _resolve_backend(model.cfg, backend)
     h = x
     for layer, norm, kind in zip(model.layers, model.norms, model.layout):
         mix_in = norm(h)
         partials = [layer_forward_tp(
-            layer, kind, mix_in, rank, tp_size)['output']
-            for rank in range(tp_size)]
+            layer, kind, mix_in, rank, tp_size, backend=requested_backend
+        )['output'] for rank in range(tp_size)]
         h = h + torch.stack(partials, dim=0).sum(dim=0)
     return {'output': h, 'tp_size': tp_size,
-            'n_layers': len(model.layout)}
+            'n_layers': len(model.layout),
+            'backend': requested_backend,
+            'resolved_backend': resolve_kda_backend(requested_backend)}
+
+
+def _resolve_backend(cfg: HybridConfig, backend: str | None) -> str:
+    """Resolve a per-call backend override against the configured one."""
+    requested = cfg.kda_backend if backend is None else backend
+    return validate_kda_backend(requested)
+
+
+def kda_stack_forward_tp(
+    model,
+    x: torch.Tensor,
+    tp_size: int,
+    *,
+    kda_state: torch.Tensor | None = None,
+    conv_lookbacks: list[torch.Tensor | None] | None = None,
+    backend: str | None = None,
+) -> dict:
+    """Streaming (incremental) TP forward for a KDA-only stack.
+
+    This is the stateful counterpart of :func:`hybrid_stack_forward_tp`.
+    It carries the KDA incremental rule across calls:
+
+    * ``kda_state`` is the SAME stacked tensor used by
+      ``HybridAttentionStack.forward_functional``, shape
+      ``[n_layers, B, HV, K, V]``.  Each rank receives only its
+      value-head slice ``state[:, lo:hi]``; the KDA recurrence never mixes
+      heads, so a rank's shard is a complete recurrent state for its
+      heads and **no state all-reduce is needed** (only the per-layer
+      output all-reduce).
+    * ``conv_lookbacks`` is the per-layer short-conv left context
+      (``[B, ksize-1, d]`` or ``None``).  The short conv is replicated, so
+      every rank uses the same lookback and returns the same new one.
+
+    Only KDA layers are supported: CSA/HCA need their own KV/index caches
+    to stream, which live in ``ops_decoding_cache`` and are outside this
+    reference.  Use :func:`hybrid_stack_forward_tp` for a fresh hybrid
+    sequence.
+
+    Returns ``{'output', 'kda_state', 'conv_lookbacks', 'tp_size',
+    'n_layers', 'backend'}``.  The returned state is in the full,
+    unsharded head layout, so it can be fed back into this function or
+    into the unsharded model's ``forward_functional`` interchange-ably.
+    """
+    _validate_tp_size(tp_size)
+    _validate_cfg(model.cfg)
+    if any(kind != 'kda' for kind in model.layout):
+        raise NotImplementedError(
+            'kda_stack_forward_tp: streaming TP is defined only for a '
+            'KDA-only stack; CSA/HCA incremental state lives in '
+            'ops_decoding_cache. Got layout '
+            f'{list(model.layout)}.')
+    validate_tp_size(model.cfg, tp_size)
+    requested_backend = _resolve_backend(model.cfg, backend)
+    cfg = model.cfg
+    B, T, _ = x.shape
+    n_layers = len(model.layout)
+    HV, K, V = cfg.n_heads_v, cfg.head_dim_k, cfg.head_dim_v
+    if kda_state is not None:
+        if not isinstance(kda_state, torch.Tensor):
+            raise TypeError(
+                'kda_stack_forward_tp: kda_state must be a tensor of shape '
+                f'[n_layers, B, HV, K, V], got {type(kda_state).__name__}.')
+        want = (n_layers, B, HV, K, V)
+        if tuple(kda_state.shape) != want:
+            raise ValueError(
+                'kda_stack_forward_tp: kda_state must have shape '
+                f'{want} (n_layers, B, HV, K, V); got '
+                f'{tuple(kda_state.shape)}. Drop the state when B or the '
+                'stack geometry changes.')
+    if conv_lookbacks is None:
+        conv_lookbacks = [None] * n_layers
+    elif len(conv_lookbacks) != n_layers:
+        raise ValueError(
+            'kda_stack_forward_tp: conv_lookbacks must have one entry per '
+            f'layer ({n_layers}); got {len(conv_lookbacks)}.')
+    if n_layers == 0:
+        return {'output': x, 'kda_state': kda_state,
+                'conv_lookbacks': list(conv_lookbacks),
+                'tp_size': tp_size, 'n_layers': 0,
+                'backend': requested_backend,
+                'resolved_backend': resolve_kda_backend(requested_backend)}
+
+    ranges = head_ranges(HV, tp_size)
+    h = x
+    new_states: list[torch.Tensor] = []
+    new_lookbacks: list[torch.Tensor | None] = []
+    for layer, norm, full_state, lookback in zip(
+            model.layers, model.norms, _iter_state_layers(kda_state,
+                                                          n_layers),
+            conv_lookbacks):
+        mix_in = norm(h)
+        partials = []
+        state_shards = []
+        new_lookback = None
+        for rank in range(tp_size):
+            lo, hi = ranges[rank]
+            state_shard = (None if full_state is None
+                           else full_state[:, lo:hi])
+            out = layer_forward_tp(
+                layer, 'kda', mix_in, rank, tp_size,
+                state_shard=state_shard,
+                conv_lookback=lookback,
+                backend=requested_backend,
+            )
+            partials.append(out['output'])
+            state_shards.append(out['state'])
+            if rank == 0:
+                new_lookback = out['conv_lookback']
+        h = h + torch.stack(partials, dim=0).sum(dim=0)
+        new_states.append(torch.cat(state_shards, dim=1))
+        new_lookbacks.append(new_lookback)
+    return {'output': h, 'kda_state': torch.stack(new_states, dim=0),
+            'conv_lookbacks': new_lookbacks,
+            'tp_size': tp_size, 'n_layers': n_layers,
+            'backend': requested_backend,
+            'resolved_backend': resolve_kda_backend(requested_backend)}
+
+
+def _iter_state_layers(kda_state: torch.Tensor | None, n_layers: int):
+    """Yield each layer's full state slice (or ``None``) for the stack."""
+    if kda_state is None:
+        for _ in range(n_layers):
+            yield None
+    else:
+        for idx in range(n_layers):
+            yield kda_state[idx]
 
 
 # ---------------------------------------------------------------------------

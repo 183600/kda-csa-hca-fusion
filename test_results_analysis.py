@@ -28,6 +28,7 @@ from results_analysis import (  # noqa: E402
     annotate_rows_with_pareto,
     binary_ranking_metrics,
     diagnose_nonfinite,
+    expected_average_precision,
     diagnose_training_curves,
     multiclass_classification_metrics,
     pareto_frontier,
@@ -259,6 +260,27 @@ def test_multiclass_metrics_perfect_and_single_class():
     assert one['balanced_accuracy'] == pytest.approx(1.0)
 
 
+def test_expected_average_precision_matches_enumeration():
+    """The closed-form random-ranking AP equals exhaustive enumeration."""
+    import itertools
+
+    def ap_at_positions(positions, n):
+        # 1-based positions of the relevant items in the ranking.
+        return sum((i + 1) / r for i, r in enumerate(positions)) / len(positions)
+
+    for n in range(2, 8):
+        for n_pos in range(1, n):
+            values = [ap_at_positions(c, n)
+                      for c in itertools.combinations(range(1, n + 1), n_pos)]
+            assert expected_average_precision(n_pos, n - n_pos) == pytest.approx(
+                sum(values) / len(values), rel=0, abs=1e-12)
+    assert expected_average_precision(0, 5) is None
+    assert expected_average_precision(3, 0) == 1.0
+    # One positive among n is H_n / n, identical to chance MRR.
+    assert expected_average_precision(1, 99) == pytest.approx(
+        sum(1.0 / i for i in range(1, 101)) / 100)
+
+
 def test_binary_ranking_metrics_rare_positive_and_ties():
     # 1 positive among 100 candidates: PR-AUC is the informative metric.
     labels = torch.zeros(100, dtype=torch.long)
@@ -270,7 +292,11 @@ def test_binary_ranking_metrics_rare_positive_and_ties():
     assert m['roc_auc'] == pytest.approx(1.0)
     assert m['mrr'] == pytest.approx(1.0)
     assert m['recall_at_1'] == pytest.approx(1.0)
-    assert m['chance_pr_auc'] == pytest.approx(0.01)
+    # Chance AP is the EXACT expectation under a uniformly random ranking,
+    # H_100 / 100 for a single positive -- not the prevalence 0.01.
+    assert m['chance_pr_auc'] == pytest.approx(
+        sum(1.0 / i for i in range(1, 101)) / 100)
+    assert m['chance_pr_auc'] > m['prevalence']
     # All-equal (for example quantized) scores: ROC-AUC is the exact chance
     # value 0.5 thanks to average-rank tie handling. PR-AUC breaks ties by
     # candidate order (stable sort): the positive sits at index 7, so the

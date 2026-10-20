@@ -61,12 +61,33 @@ quality* from end-task accuracy.
 
 ``gold_recall`` is thresholded (top-k hit or miss) and hides how well the
 gold block is RANKED. The diagnostic therefore also reports threshold-free
-metrics over the indexer's full soft distribution: ``gold_pr_auc``
-(average precision; PRIMARY, because one gold block among ``n_available``
-candidates is an extreme-imbalance retrieval problem), ``gold_roc_auc``
-(tie-corrected), ``gold_mrr`` (mean per-sequence reciprocal rank) and
-``gold_top1_recall``, each with its geometry-derived chance reference
-(``1/n_available`` and ``H(n)/n``).
+metrics over the indexer's full soft distribution. Because every sequence
+is its own retrieval query with EXACTLY ONE relevant block, the primary
+metrics are macro-averaged over sequences, never pooled across them:
+
+  * ``gold_pr_auc`` -- mean per-query average precision, tie-averaged.
+    For a single relevant item this is identically ``gold_mrr``
+    (AP = 1/rank); both are reported because they are computed by
+    independent code paths.
+  * ``gold_roc_auc`` -- mean per-query tie-corrected ROC-AUC
+    (probability a gold score beats a random non-gold score of the SAME
+    query).
+  * ``gold_mrr`` -- mean per-sequence reciprocal rank of the gold block.
+  * ``gold_top1_recall`` -- fraction of sequences where the gold block is
+    ranked first.
+
+Pooling candidates from different queries into one ranking (the previous
+behaviour) silently lets high-scoring queries define the negatives for
+low-scoring ones, so ``gold_pr_auc_pooled`` / ``gold_roc_auc_pooled`` are
+kept only as labelled secondary diagnostics.
+
+Chance references for one relevant item among ``n = n_available``
+candidates are ``chance_gold_pr_auc = chance_gold_mrr = H(n) / n``
+(``expected_average_precision(1, n - 1)``) and
+``chance_gold_roc_auc = 0.5``. ``H(n)/n`` is the exact expected AP of a
+uniformly random ranking; the prevalence ``1/n`` is the area under the
+smoothed chance PR curve and is NOT the expectation of finite-sample AP
+(it understates chance for rare positives).
 
 Budget / configuration (environment variables)
 ----------------------------------------------
@@ -118,7 +139,8 @@ from kaggle_setup import (
 )
 from ops_csa import _causal_block_mask, csa_compress_kv, csa_lightning_indexer
 from ops_fused import CSAHybridLayer, HybridKCHAttention
-from results_analysis import binary_ranking_metrics
+from results_analysis import (binary_ranking_metrics,
+                              expected_average_precision)
 from results_schema import write as write_schema
 from run_ablation import (
     _aggregate_curve_diagnosis,
@@ -389,15 +411,18 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
     block distribution (from the differentiable soft weights), because the
     gold block is a single rare positive among ``n_available`` blocks:
 
-      * ``gold_pr_auc`` / ``gold_roc_auc`` — pooled average precision and
-        tie-corrected ROC-AUC of the gold block vs all other causally
-        available blocks (PR-AUC is the primary metric: 1 positive among
-        n_available candidates is an extreme-imbalance retrieval problem
-        where ROC-AUC flatters the indexer).
+      * ``gold_pr_auc`` — mean per-query average precision (tie-averaged),
+        the PRIMARY metric. With exactly one relevant block per sequence
+        it equals ``gold_mrr``; both are computed independently.
+      * ``gold_roc_auc`` — mean per-query tie-corrected ROC-AUC.
       * ``gold_mrr`` — mean per-sequence reciprocal rank of the gold block
         (average-rank tie handling); ``chance_gold_mrr`` = H(n)/n.
       * ``gold_top1_recall`` — fraction of sequences where the gold block
         is ranked first.
+      * ``gold_pr_auc_pooled`` / ``gold_roc_auc_pooled`` — the old
+        candidate-pooled values, kept only as labelled secondary
+        diagnostics (they mix negatives across queries and are not
+        query-level retrieval metrics).
 
     Returns a dict with ``gold_recall`` (``None`` when skipped),
     ``n_samples``, ``gold_topk_effective``, ``gold_n_available_blocks``,
@@ -410,7 +435,10 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
         'chance_gold_recall': None,
         'gold_pr_auc': None, 'gold_roc_auc': None, 'gold_mrr': None,
         'gold_top1_recall': None,
-        'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
+        'gold_pr_auc_pooled': None, 'gold_roc_auc_pooled': None,
+        'chance_gold_pr_auc': None, 'chance_gold_roc_auc': None,
+        'chance_gold_mrr': None,
+        'gold_n_ranking_queries': 0,
         'skipped_reason': None,
     }
     if m is None:
@@ -441,6 +469,8 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
     hits = 0
     top1_hits = 0
     rr_sum = 0.0
+    roc_sum = 0.0
+    n_roc_queries = 0
     total = 0
     score_chunks, label_chunks = [], []
     skipped_reason = None
@@ -493,6 +523,17 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
                 avg_rank = (1.0 + greater.to(scores_cue.dtype)
                             + (equal.to(scores_cue.dtype) - 1.0) / 2.0)
                 rr_sum += float((1.0 / avg_rank).sum().item())
+                # Query-level ROC-AUC for one positive among n_available
+                # candidates: (# negatives below + 0.5 * ties) / n_neg.
+                # With average-rank tie handling this is exactly
+                # (n_available - avg_rank) / (n_available - 1). Queries
+                # with n_available == 1 have no negative and are skipped
+                # (ROC-AUC undefined), matching binary_ranking_metrics.
+                if n_available > 1:
+                    roc_sum += float(
+                        ((n_available - avg_rank)
+                         / (n_available - 1)).sum().item())
+                    n_roc_queries += int(avg_rank.numel())
                 top1_hits += int((scores_cue.argmax(dim=1)
                                   == key_block).sum().item())
                 score_chunks.append(scores_cue.reshape(-1))
@@ -507,21 +548,30 @@ def diagnose_gold_recall(model, embed, *, seq_len=SEQ_LEN, n_kv=1, device,
     pooled = (binary_ranking_metrics(torch.cat(score_chunks),
                                      torch.cat(label_chunks))
               if score_chunks else None)
-    chance_mrr = (sum(1.0 / i for i in range(1, n_available + 1))
-                  / n_available) if n_available else None
+    # One relevant block per query: macro AP is the mean reciprocal
+    # (tie-averaged) rank, and the chance AP equals the chance MRR
+    # H(n)/n. Both are computed from the same per-query average ranks so
+    # they can never disagree.
+    chance_ap = (expected_average_precision(1, n_available - 1)
+                 if n_available else None)
     return {
         'gold_recall': hits / total if total else None,
         'n_samples': total,
         'gold_topk_effective': topk_effective,
         'gold_n_available_blocks': n_available,
+        'gold_n_ranking_queries': total,
         'chance_gold_recall': (topk_effective / n_available
                                if n_available else None),
-        'gold_pr_auc': (pooled or {}).get('pr_auc'),
-        'gold_roc_auc': (pooled or {}).get('roc_auc'),
+        'gold_pr_auc': (rr_sum / total) if total else None,
+        'gold_roc_auc': (roc_sum / n_roc_queries
+                         if n_roc_queries else None),
         'gold_mrr': (rr_sum / total) if total else None,
         'gold_top1_recall': (top1_hits / total) if total else None,
-        'chance_gold_pr_auc': (1.0 / n_available) if n_available else None,
-        'chance_gold_mrr': chance_mrr,
+        'gold_pr_auc_pooled': (pooled or {}).get('pr_auc'),
+        'gold_roc_auc_pooled': (pooled or {}).get('roc_auc'),
+        'chance_gold_pr_auc': chance_ap,
+        'chance_gold_roc_auc': 0.5 if n_available > 1 else None,
+        'chance_gold_mrr': chance_ap,
         'skipped_reason': None,
     }
 
@@ -664,10 +714,13 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         diag = {'gold_recall': None, 'n_samples': 0,
                 'gold_topk_effective': None,
                 'gold_n_available_blocks': None,
+                'gold_n_ranking_queries': 0,
                 'chance_gold_recall': None,
                 'gold_pr_auc': None, 'gold_roc_auc': None,
                 'gold_mrr': None, 'gold_top1_recall': None,
-                'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
+                'gold_pr_auc_pooled': None, 'gold_roc_auc_pooled': None,
+                'chance_gold_pr_auc': None, 'chance_gold_roc_auc': None,
+                'chance_gold_mrr': None,
                 'skipped_reason': 'diagnostic disabled by caller'}
 
     curve_block = _attach_curve_diagnostics(
@@ -706,14 +759,18 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         'gold_n_available_blocks': diag['gold_n_available_blocks'],
         'chance_gold_recall': diag['chance_gold_recall'],
         # Threshold-free ranking quality of the gold block (see
-        # diagnose_gold_recall): PR-AUC is primary under the 1-of-N
-        # extreme-imbalance geometry.
+        # diagnose_gold_recall): macro AP is primary under the 1-of-N
+        # extreme-imbalance geometry; pooled values are secondary.
         'gold_pr_auc': diag.get('gold_pr_auc'),
         'gold_roc_auc': diag.get('gold_roc_auc'),
         'gold_mrr': diag.get('gold_mrr'),
         'gold_top1_recall': diag.get('gold_top1_recall'),
+        'gold_pr_auc_pooled': diag.get('gold_pr_auc_pooled'),
+        'gold_roc_auc_pooled': diag.get('gold_roc_auc_pooled'),
         'chance_gold_pr_auc': diag.get('chance_gold_pr_auc'),
+        'chance_gold_roc_auc': diag.get('chance_gold_roc_auc'),
         'chance_gold_mrr': diag.get('chance_gold_mrr'),
+        'gold_n_ranking_queries': diag.get('gold_n_ranking_queries'),
         'gold_recall_skipped_reason': diag['skipped_reason'],
         'layout': model.layout_str(),
     }
@@ -783,8 +840,9 @@ def summarize_variant(per_seed, variant):
                         if r.get('gold_recall_skipped_reason')), None)
 
     # Seed-aggregated ranking quality of the gold block (threshold-free).
-    # Chance references are geometry constants (1/n_available for PR-AUC,
-    # H(n)/n for MRR), identical across seeds of a variant.
+    # The primary metrics are macro-averaged per query; chance references
+    # are geometry constants (H(n)/n for AP and MRR, 0.5 for ROC-AUC) and
+    # identical across seeds of a variant.
     def _agg_optional(key):
         vals = [r[key] for r in ok if r.get(key) is not None]
         return _mean_ci(vals) + (len(vals),)
@@ -794,9 +852,14 @@ def summarize_variant(per_seed, variant):
     mean_gold_roc_auc = _agg_optional('gold_roc_auc')[0]
     mean_gold_mrr, std_gold_mrr, ci95_gold_mrr, _ = _agg_optional('gold_mrr')
     mean_gold_top1 = _agg_optional('gold_top1_recall')[0]
+    mean_gold_pr_auc_pooled = _agg_optional('gold_pr_auc_pooled')[0]
+    mean_gold_roc_auc_pooled = _agg_optional('gold_roc_auc_pooled')[0]
     chance_gold_pr_auc = next(
         (r['chance_gold_pr_auc'] for r in ok
          if r.get('chance_gold_pr_auc') is not None), None)
+    chance_gold_roc_auc = next(
+        (r['chance_gold_roc_auc'] for r in ok
+         if r.get('chance_gold_roc_auc') is not None), None)
     chance_gold_mrr = next(
         (r['chance_gold_mrr'] for r in ok
          if r.get('chance_gold_mrr') is not None), None)
@@ -844,10 +907,11 @@ def summarize_variant(per_seed, variant):
         'chance_gold_recall': chance_recall,
         'gold_recall_t_vs_chance': recall_t,
         # Threshold-free gold-block ranking (see diagnose_gold_recall).
-        # gold_pr_auc is the primary metric: 1 gold block among
+        # Macro AP is the primary metric: 1 gold block among
         # n_available candidates is an extreme-imbalance retrieval
         # problem, where ROC-AUC is optimistic and recall@k hides
-        # near-misses just below the top-k cut.
+        # near-misses just below the top-k cut. Pooled values are kept as
+        # labelled secondary diagnostics only.
         'mean_gold_pr_auc': mean_gold_pr_auc,
         'std_gold_pr_auc': std_gold_pr_auc,
         'ci95_gold_pr_auc': ci95_gold_pr_auc,
@@ -856,8 +920,11 @@ def summarize_variant(per_seed, variant):
         'std_gold_mrr': std_gold_mrr,
         'ci95_gold_mrr': ci95_gold_mrr,
         'mean_gold_top1_recall': mean_gold_top1,
+        'mean_gold_pr_auc_pooled': mean_gold_pr_auc_pooled,
+        'mean_gold_roc_auc_pooled': mean_gold_roc_auc_pooled,
         'n_gold_ranking_seeds': n_gold_ranking,
         'chance_gold_pr_auc': chance_gold_pr_auc,
+        'chance_gold_roc_auc': chance_gold_roc_auc,
         'chance_gold_mrr': chance_gold_mrr,
         'gold_recall_skipped_reason': skip_reason,
         'mean_fwd_ms': mean_fwd,
@@ -1145,7 +1212,12 @@ def main():
                         'chance_gold_recall': None,
                         'gold_pr_auc': None, 'gold_roc_auc': None,
                         'gold_mrr': None, 'gold_top1_recall': None,
-                        'chance_gold_pr_auc': None, 'chance_gold_mrr': None,
+                        'gold_pr_auc_pooled': None,
+                        'gold_roc_auc_pooled': None,
+                        'chance_gold_pr_auc': None,
+                        'chance_gold_roc_auc': None,
+                        'chance_gold_mrr': None,
+                        'gold_n_ranking_queries': 0,
                         'gold_recall_skipped_reason': None,
                         'layout': None,
                         'error': str(e),
@@ -1428,14 +1500,19 @@ def main():
             "Threshold-free ranking quality of the gold block over the "
             "causally available compressed blocks at the cue position, "
             "from the indexer's full soft block distribution (not only the "
-            "hard top-k): gold_pr_auc = average precision (primary metric: "
-            "one gold block among n_available candidates is an extreme-"
-            "imbalance retrieval problem where ROC-AUC is optimistic), "
-            "gold_roc_auc = tie-corrected ROC-AUC, gold_mrr = mean "
-            "per-sequence reciprocal rank of the gold block, "
-            "gold_top1_recall = fraction ranked first. Chance references: "
-            "chance_gold_pr_auc = 1/n_available, chance_gold_mrr = "
-            "H(n_available)/n_available. recall@k is thresholded and hides "
+            "hard top-k): gold_pr_auc = mean per-query average precision "
+            "(primary metric: one gold block among n_available candidates "
+            "is an extreme-imbalance retrieval problem where ROC-AUC is "
+            "optimistic; for one relevant block it equals gold_mrr), "
+            "gold_roc_auc = mean per-query tie-corrected ROC-AUC, "
+            "gold_mrr = mean per-sequence reciprocal rank of the gold "
+            "block, gold_top1_recall = fraction ranked first. "
+            "gold_pr_auc_pooled / gold_roc_auc_pooled pool candidates "
+            "across queries and are secondary diagnostics only. Chance "
+            "references: chance_gold_pr_auc = chance_gold_mrr = "
+            "H(n_available)/n_available (the exact expected AP of a "
+            "uniformly random ranking, NOT the 1/n_available prevalence), "
+            "chance_gold_roc_auc = 0.5. recall@k is thresholded and hides "
             "near-misses just below the cut; the ranking metrics do not. "
             "gold_pr_auc is also tested as a paired-by-seed contrast against "
             "the baseline (paired_vs_baseline_mean_gold_pr_auc_diff)."),

@@ -5190,6 +5190,55 @@ def test_hybrid_decoding_mamba2_route(device='cpu'):
     ]
 
 
+def test_ranking_chance_reference_is_exact(device='cpu'):
+    """Chance PR-AUC must be the expected AP of a random ranking.
+
+    ``binary_ranking_metrics`` reports ``chance_pr_auc`` next to a learned
+    PR-AUC so a reader can judge whether the ranking beat chance. Using
+    the prevalence (``n_pos / n``) as that reference is wrong for finite
+    rankings: with a single relevant item the AP is ``1 / rank``, whose
+    expectation over a uniform random ranking is the harmonic mean
+    ``H_n / n`` (which is also the chance MRR). The closed-form helper is
+    checked against exhaustive enumeration of every ranking for small n.
+    """
+    import itertools
+    from results_analysis import (binary_ranking_metrics,
+                                  expected_average_precision)
+
+    def ap_at_positions(positions):
+        return sum((i + 1) / r for i, r in enumerate(positions)) / len(positions)
+
+    bad = []
+    for n in range(2, 8):
+        for n_pos in range(1, n):
+            values = [ap_at_positions(c)
+                      for c in itertools.combinations(range(1, n + 1), n_pos)]
+            want = sum(values) / len(values)
+            got = expected_average_precision(n_pos, n - n_pos)
+            if abs(got - want) > 1e-12:
+                bad.append(f'n={n} n_pos={n_pos}: {got} != {want}')
+    if expected_average_precision(0, 5) is not None:
+        bad.append('zero positives must return None')
+    if expected_average_precision(3, 0) != 1.0:
+        bad.append('all-positive ranking must have chance AP 1.0')
+
+    labels = torch.zeros(100, dtype=torch.long)
+    labels[7] = 1
+    m = binary_ranking_metrics(torch.arange(100, dtype=torch.float64), labels)
+    h100 = sum(1.0 / i for i in range(1, 101)) / 100
+    if abs(m['chance_pr_auc'] - h100) > 1e-12:
+        bad.append(f"chance_pr_auc={m['chance_pr_auc']} != H_100/100={h100}")
+    if not (m['chance_pr_auc'] > m['prevalence']):
+        bad.append('chance AP must exceed prevalence for rare positives')
+
+    return [_ok(
+        'ranking_chance_reference_is_exact',
+        not bad,
+        '; '.join(bad) if bad else
+        'closed form == exhaustive enumeration; one-positive chance AP = H_n/n',
+    )]
+
+
 def test_mqar_noise_excludes_keys_and_values(device='cpu'):
     """MQAR filler noise must not leak key/value (or the cued answer) tokens.
 
@@ -7071,6 +7120,7 @@ def main():
     # MQAR task construction shared by Exp 4 / Exp 5 (run_quality/run_ablation):
     # filler noise must never leak key/value/answer tokens.
     all_results += _run_safe(test_mqar_noise_excludes_keys_and_values, device)
+    all_results += _run_safe(test_ranking_chance_reference_is_exact, device)
 
     # Partial RoPE (DeepSeek-V4 §2.3.3) — paper-faithful positional
     # embedding for CSA/HCA: unit properties, module wiring, and

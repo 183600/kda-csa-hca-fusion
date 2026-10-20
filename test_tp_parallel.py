@@ -4,9 +4,11 @@ These pin the two claims of :mod:`tp_parallel`:
 
 1. **Head sharding is numerically transparent.**  Every rank's partial
    output sums to the unsharded layer output (KDA also reassembles the
-   recurrent state), and a whole 3:1:1 hybrid stack produces the same MQAR
-   representations under TP=2.  This is why MQAR accuracy measured on the
-   unsharded tower transfers to a TP deployment.
+   recurrent state), a whole 3:1:1 hybrid stack produces the same MQAR
+   representations under TP=2, and ``kda_stack_forward_tp`` streams
+   uneven chunks while preserving the KDA incremental state and conv
+   lookbacks.  This is why MQAR accuracy measured on the unsharded tower
+   transfers to a TP deployment (and to a stateful decode).
 2. **The latency ledger is self-consistent.**  The replicated + sharded
    FLOP split equals the canonical ``run_kv_cache.prefill_flops``, the
    TP=1 traffic equals the canonical decode accounting, KDA state traffic
@@ -35,6 +37,7 @@ import tp_parallel as tp  # noqa: E402
 from ops_fused import (  # noqa: E402
     CSAHybridLayer,
     HCAHybridLayer,
+    HybridAttentionStack,
     HybridConfig,
     HybridKCHAttention,
     KDAHybridLayer,
@@ -83,6 +86,108 @@ def test_kda_head_shard_equivalence(chunk_size, device):
         state_diff = (torch.cat(states, dim=1) - full_state).abs().max().item()
     assert out_diff < 1e-5, f'out max|diff|={out_diff:.2e}'
     assert state_diff < 1e-5, f'state max|diff|={state_diff:.2e}'
+
+
+def _assert_close(name, a, b, tol=1e-5):
+    assert a.shape == b.shape, f'{name}: shape {tuple(a.shape)} != {tuple(b.shape)}'
+    diff = (a.float() - b.float()).abs().max().item()
+    assert diff < tol, f'{name}: max|diff|={diff:.2e} (tol {tol})'
+
+
+def _assert_lookbacks_close(name, got, want):
+    assert len(got) == len(want), f'{name}: {len(got)} != {len(want)} entries'
+    for idx, (a, b) in enumerate(zip(got, want)):
+        if a is None or b is None:
+            assert a is None and b is None, \
+                f'{name}[{idx}]: one side is None ({a is None} vs {b is None})'
+        else:
+            _assert_close(f'{name}[{idx}]', a, b)
+
+
+@pytest.mark.parametrize('schedule', ([1, 3, 4, 3], [5, 6], [11],
+                                      [0, 4, 0, 7]))
+@pytest.mark.parametrize('tp_size', (2, 4))
+def test_kda_streaming_tp_matches_full_sequence(schedule, tp_size, device):
+    """Streaming TP carries the KDA incremental rule across chunk calls.
+
+    A KDA-only stack is fed in ``schedule``-sized chunks.  Both the
+    unsharded ``forward_functional`` path and the simulated TP forward
+    must reproduce the one-shot full-sequence output, recurrent state and
+    short-conv lookbacks.  The zero-length chunks also pin the T=0
+    state-preserving contract.
+    """
+    torch.manual_seed(17)
+    cfg = dataclasses.replace(_kda_cfg(16), n_kda=3, n_csa=0, n_hca=0)
+    model = HybridAttentionStack(cfg, total_layers=3).to(device).eval()
+    n_layers = len(model.layout)
+    x = torch.randn(2, 11, cfg.d_model, device=device) * 0.5
+    assert sum(schedule) == x.shape[1]
+
+    with torch.no_grad():
+        full, full_state, full_lbs = model.forward_functional(
+            x, None, [None] * n_layers)
+
+        outs, state, lbs, pos = [], None, [None] * n_layers, 0
+        for length in schedule:
+            y, state, lbs = model.forward_functional(
+                x[:, pos:pos + length], state, lbs)
+            outs.append(y)
+            pos += length
+        streamed = torch.cat(outs, dim=1)
+        _assert_close('unsharded streaming output', streamed, full)
+        _assert_close('unsharded streaming state', state, full_state)
+        _assert_lookbacks_close('unsharded streaming lookbacks', lbs, full_lbs)
+
+        outs, state, lbs, pos = [], None, [None] * n_layers, 0
+        for length in schedule:
+            res = tp.kda_stack_forward_tp(
+                model, x[:, pos:pos + length], tp_size,
+                kda_state=state, conv_lookbacks=lbs)
+            outs.append(res['output'])
+            state, lbs = res['kda_state'], res['conv_lookbacks']
+            pos += length
+        streamed_tp = torch.cat(outs, dim=1)
+
+    _assert_close('TP streaming output', streamed_tp, full)
+    _assert_close('TP streaming state', state, full_state)
+    _assert_lookbacks_close('TP streaming lookbacks', lbs, full_lbs)
+    assert state.shape == (n_layers, 2, cfg.n_heads_v,
+                           cfg.head_dim_k, cfg.head_dim_v)
+
+
+def test_kda_streaming_tp_contract_and_backend(device):
+    """Validation, backend provenance, and the no-all-reduce state map."""
+    torch.manual_seed(19)
+    cfg = dataclasses.replace(_kda_cfg(16), n_kda=2, n_csa=0, n_hca=0)
+    model = HybridAttentionStack(cfg, total_layers=2).to(device).eval()
+    x = torch.randn(2, 7, cfg.d_model, device=device) * 0.5
+    with torch.no_grad():
+        out = tp.kda_stack_forward_tp(model, x, 2)
+    assert out['backend'] == 'reference'
+    assert out['kda_state'].shape == (
+        2, 2, cfg.n_heads_v, cfg.head_dim_k, cfg.head_dim_v)
+    assert all(lb is not None for lb in out['conv_lookbacks'])
+
+    with torch.no_grad():
+        forced = tp.kda_stack_forward_tp(
+            model, x, 2, kda_state=out['kda_state'],
+            conv_lookbacks=out['conv_lookbacks'], backend='reference')
+    assert forced['backend'] == 'reference'
+
+    with pytest.raises(ValueError):
+        tp.kda_stack_forward_tp(model, x, 2, backend='not-a-backend')
+    with pytest.raises(ValueError):
+        tp.kda_stack_forward_tp(
+            model, x, 2,
+            kda_state=torch.zeros(2, 2, cfg.n_heads_v - 1,
+                                  cfg.head_dim_k, cfg.head_dim_v))
+    with pytest.raises(ValueError):
+        tp.kda_stack_forward_tp(model, x, 2, conv_lookbacks=[None])
+
+    hybrid = HybridAttentionStack(_kda_cfg(16), total_layers=5).to(
+        device).eval()
+    with pytest.raises(NotImplementedError):
+        tp.kda_stack_forward_tp(hybrid, x, 2)
 
 
 def test_csa_hca_head_shard_equivalence(device):

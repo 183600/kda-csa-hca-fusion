@@ -40,11 +40,39 @@ The last identity is measured on an actual MQAR batch
 representations — hence measured MQAR accuracy — are invariant to the TP
 degree**. TP is a serving/throughput transformation, not a model change.
 
+## Incremental (streaming) TP
+
+`hybrid_stack_forward_tp` is stateless (fresh sequence). For decode,
+`kda_stack_forward_tp` carries the KDA incremental rule across chunk calls.
+It takes the same stacked state as `HybridAttentionStack.forward_functional`
+(`[n_layers, B, HV, K, V]`) plus the per-layer short-conv lookbacks, and
+returns the updated full-layout state:
+
+```python
+res = kda_stack_forward_tp(model, x_chunk, tp_size,
+                           kda_state=state, conv_lookbacks=lookbacks)
+state, lookbacks = res['kda_state'], res['conv_lookbacks']
+```
+
+Why no state all-reduce: the KDA recurrence updates each value head
+independently, so a rank that owns heads `[lo, hi)` owns a complete
+recurrent state for those heads. The state shard evolves locally
+(`S ← (I − βkkᵀ)Diag(α)S + βkvᵀ`) and is only concatenated for reporting;
+the one all-reduce per layer is still the output projection. The short conv
+is replicated, so every rank sees and returns the same lookback.
+
+`test_tp_parallel.py` streams a 3-layer KDA-only stack in uneven chunks
+(`[1,3,4,3]`, `[5,6]`, `[11]`, `[0,4,0,7]`) and pins output, state and
+lookback equality against the one-shot unsharded forward. Streaming is
+restricted to KDA-only stacks: CSA/HCA incremental state lives in
+`ops_decoding_cache`, not in a stateless layer forward.
+
 Scope: KDA memory route only (Mamba-2 / RWKV-7 state layouts are rejected
-rather than mis-priced). The reference always selects the reference KDA
-backend and assumes fresh state for the stack-level check. It simulates
-every rank in one process; it is the oracle for a distributed kernel, not
-a runtime.
+rather than mis-priced). The forward follows `cfg.kda_backend` (an explicit
+`backend=` argument overrides it), so TP and the unsharded model exercise
+the same kernel selection; the fake-FLA regression injects a reference
+delegate to pin that dispatch on CPU. It simulates every rank in one
+process; it is the oracle for a distributed kernel, not a runtime.
 
 ## FLOP split
 
