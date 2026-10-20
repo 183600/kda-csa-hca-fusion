@@ -252,6 +252,20 @@ def test_fake_quantize_contract():
     _ok('quantization_error matches direct measurement',
         abs(stats['max_abs_error'] - err) < 1e-12 and stats['snr_db'] > 0,
         f"snr={stats['snr_db']:.1f} dB")
+    # Asymmetric groups whose values are all positive (or all negative)
+    # must still use the full unsigned code grid: the zero-point clamp
+    # must not push the far end past qmax and saturate it.
+    asym = QuantSpec(bits=4, group_size=16, symmetric=False)
+    onesided = torch.linspace(1.0, 4.5, 16)[None, :]
+    for label, v in (('all-positive', onesided),
+                     ('all-negative', -onesided)):
+        dq_one = fake_quantize(v, asym, ste=False)
+        span = (v.max().clamp(min=0) - v.min().clamp(max=0)).item()
+        step = span / asym.qmax
+        err_one = (v - dq_one).abs().max().item()
+        _ok(f'asymmetric {label} groups span the full code grid',
+            err_one <= step / 2 + 1e-6,
+            f'max|err|={err_one:.3e}, half-step={step / 2:.3e}')
 
 
 # --- 3. planted-recall probe ----------------------------------------------

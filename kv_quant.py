@@ -230,11 +230,16 @@ def fake_quantize(x: torch.Tensor, spec: QuantSpec,
         codes = torch.round(groups / scale).clamp(-qmax, qmax)
         deq = codes * scale
     else:
-        # min/max scale + integer zero point per group. Constant groups
-        # reconstruct their value exactly (span == 0 is special-cased).
+        # min/max scale + integer zero point per group. The representable
+        # range must include zero: the unsigned code grid is ``[0, qmax]``
+        # and the zero point is clamped into that range, so a group whose
+        # values are all positive (or all negative) would otherwise have
+        # its far end pushed past the grid and saturated to a constant.
+        # Constant groups reconstruct their value exactly.
         with torch.no_grad():
-            lo = groups.amin(dim=-1, keepdim=True)
-            hi = groups.amax(dim=-1, keepdim=True)
+            zero_t = torch.zeros_like(groups[..., :1])
+            lo = torch.minimum(groups.amin(dim=-1, keepdim=True), zero_t)
+            hi = torch.maximum(groups.amax(dim=-1, keepdim=True), zero_t)
             span = hi - lo
             degenerate = span <= 0
             scale = torch.where(degenerate, torch.ones_like(span),
