@@ -209,6 +209,18 @@ def test_drift_metrics_nonfinite_and_shape_mismatch():
     assert empty['n_elements'] == 0
 
 
+def test_drift_metrics_flags_dtype_mismatch():
+    # Same values, different precision: numeric drift is zero but the
+    # schedule contract is still violated, so dtype_match must be False.
+    ref = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    drift = drift_metrics(ref, ref.to(torch.float64))
+    assert drift['dtype_match'] is False
+    assert drift['finite'] is True
+    assert drift['max_abs'] == 0.0
+    same = drift_metrics(ref, ref.clone())
+    assert same['dtype_match'] is True
+
+
 def test_drift_metrics_uses_fp64_accumulation():
     # 1 + 1e-12 rounds back to 1.0 in fp32 but is representable in fp64.
     # The metric path must cast to fp64 before reducing, not silently
@@ -264,6 +276,28 @@ def test_profile_rejects_drifting_schedule():
     assert bad['schedule'] == '1'
     assert bad['passed'] is False
     assert bad['drift']['max_abs'] == pytest.approx(0.01, rel=1e-5)
+
+
+def test_profile_rejects_dtype_changing_schedule():
+    class _DtypeSwitch(torch.nn.Module):
+        def reset(self):
+            pass
+
+        def forward(self, x):
+            # Token-by-token calls return fp64 with the same values, so a
+            # numeric-only drift check would pass.
+            out = x + 0.0
+            return out.to(torch.float64) if x.shape[1] == 1 else out
+
+    x = torch.randn(1, 4, 8)
+    report = profile_prefill_schedules(
+        _DtypeSwitch(), x, ['full', '1'], repeats=1, warmup=0)
+    assert report['all_passed'] is False
+    bad = [r for r in report['rows'] if not r['is_reference']][0]
+    assert bad['schedule'] == '1'
+    assert bad['passed'] is False
+    assert bad['drift']['dtype_match'] is False
+    assert bad['drift']['max_abs'] == 0.0
 
 
 def test_timing_returns_output_of_last_run():

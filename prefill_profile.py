@@ -37,8 +37,12 @@ that claim falsifiable:
   model), so a fp32 report does not hide a 1e-6 signal in fp32 rounding;
 * a row whose output contains NaN/Inf is marked ``finite=False`` and
   fails even if the numeric drift fields are undefined;
-* the pass criterion is ``max_abs <= atol + rtol * max|reference|`` (the
-  same mixed absolute/relative form as ``torch.testing.assert_close``);
+* a row whose output dtype differs from the reference is marked
+  ``dtype_match=False`` and fails: a schedule may not change the model's
+  precision, even when the resulting numeric drift is tiny;
+* the pass criterion is ``dtype_match and max_abs <= atol + rtol *
+  max|reference|`` (the same mixed absolute/relative form as
+  ``torch.testing.assert_close``);
 * ``bitwise_equal`` is reported separately so exact schedule invariance
   (the CPU case) is visible rather than rounded away.
 
@@ -276,13 +280,21 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
     shapes differ, ``finite`` is False and the numeric fields are None
     (undefined) rather than a misleading NaN.  Empty tensors are treated
     as exactly equal (zero drift, cosine 1.0).
+
+    ``dtype_match`` is reported independently of the drift: two schedules
+    can agree numerically while returning different dtypes (e.g. one path
+    silently promotes fp32 to fp64).  That is a split contract, not a
+    rounding difference, so callers that require schedule invariance must
+    check it as well.
     """
     if not isinstance(reference, torch.Tensor) or not isinstance(
             candidate, torch.Tensor):
         raise TypeError('drift_metrics expects two torch.Tensor inputs')
+    dtype_match = reference.dtype == candidate.dtype
     if reference.shape != candidate.shape:
         return {
             'shape_match': False,
+            'dtype_match': dtype_match,
             'finite': False,
             'bitwise_equal': False,
             'max_abs': None,
@@ -300,6 +312,7 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
     if ref.numel() == 0:
         return {
             'shape_match': True,
+            'dtype_match': dtype_match,
             'finite': finite,
             'bitwise_equal': True,
             'max_abs': 0.0,
@@ -314,6 +327,7 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
     if not finite:
         return {
             'shape_match': True,
+            'dtype_match': dtype_match,
             'finite': False,
             'bitwise_equal': False,
             'max_abs': None,
@@ -345,6 +359,7 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
             / (ref_norm * cand_norm), -1.0, 1.0))
     return {
         'shape_match': True,
+        'dtype_match': dtype_match,
         'finite': True,
         'bitwise_equal': bool(torch.equal(reference, candidate)),
         'max_abs': _finite_float(max_abs),
@@ -437,8 +452,10 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
 
     The one-shot (``[T]``) schedule is the reference.  Every row carries
     both its timing and its drift against that reference; a row passes iff
-    the output is finite and satisfies
-    ``max_abs <= atol + rtol * max|reference|``.
+    the output dtype matches the reference, the output is finite, and it
+    satisfies ``max_abs <= atol + rtol * max|reference|``.  The dtype
+    clause keeps a schedule that silently changes precision from hiding
+    behind a tiny numeric drift.
     """
     if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 1:
         raise ValueError(f'repeats must be an int >= 1, got {repeats!r}')
@@ -463,10 +480,11 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
     # The reference is a row too: a non-finite reference output cannot
     # pass, even when it is the only schedule profiled. The remaining
     # numeric fields are undefined in that case (see ``drift_metrics``).
-    ref_row['passed'] = bool(ref_row['drift']['finite'])
+    ref_row['passed'] = bool(
+        ref_row['drift']['finite'] and ref_row['drift']['dtype_match'])
     ref_row['tolerance'] = {
         'atol': float(atol), 'rtol': float(rtol),
-        'criterion': 'max_abs <= atol + rtol * max|reference|'}
+        'criterion': 'dtype_match and max_abs <= atol + rtol * max|reference|'}
 
     rows = [ref_row]
     seen = set()
@@ -493,9 +511,9 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
         row['drift'] = drift
         row['tolerance'] = {
             'atol': float(atol), 'rtol': float(rtol),
-            'criterion': 'max_abs <= atol + rtol * max|reference|'}
+            'criterion': 'dtype_match and max_abs <= atol + rtol * max|reference|'}
         row['passed'] = bool(
-            tol_abs is not None and drift['finite']
+            drift['dtype_match'] and tol_abs is not None and drift['finite']
             and drift['max_abs'] is not None
             and drift['max_abs'] <= tol_abs)
         row['_requested_schedule'] = schedule_label(spec)
@@ -514,7 +532,7 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
         'reference_max_abs': ref_scale,
         'tolerance': {
             'atol': float(atol), 'rtol': float(rtol),
-            'criterion': 'max_abs <= atol + rtol * max|reference|'},
+            'criterion': 'dtype_match and max_abs <= atol + rtol * max|reference|'},
         'all_passed': bool(all(r['passed'] for r in rows)),
         'rows': rows,
         'note': (
