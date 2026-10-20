@@ -692,6 +692,15 @@ def make_kv_update_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
 
     cue_pos = seq_len - 1
     n_noise = seq_len - 4 * n_kv - 1
+    # The filler must come from ids that are neither keys nor old/new
+    # values; an exactly-full vocabulary leaves no such ids, and drawing
+    # ``randint(0, 0, ...)`` would crash instead of reporting the bad
+    # geometry.
+    if n_noise > 0 and 3 * n_kv >= vocab:
+        raise ValueError(
+            f"vocab={vocab} leaves no distractor ids for {n_noise} noise "
+            f"slots; need vocab > 3*n_kv={3 * n_kv} when seq_len exceeds "
+            f"the paired region plus the cue.")
 
     perm = torch.rand(batch, vocab, device=device,
                       generator=generator).argsort(dim=-1)
