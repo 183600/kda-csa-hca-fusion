@@ -186,8 +186,15 @@ def _load_raw_texts(max_samples, split="train"):
 
 class TinyStoriesLM(Dataset):
     def __init__(self, tokenizer, seq_len=1024, max_samples=20000, split="train",
-                 texts=None, name=None):
+                 texts=None, name=None, prefetch_cache=False, prefetch_cap=1024):
         """Token-window dataset over a list of raw stories.
+
+        When ``prefetch_cache`` is set, each sample's token ids are encoded
+        once and reused on later ``__getitem__`` calls (prefetch), cutting
+        repeated ``tokenizer.encode`` work in the training hot path. A
+        correctness self-check re-encodes every 64th cache hit and asserts
+        equality with the cached ids, so a stale cache can never silently
+        change the training inputs.
 
         When ``texts`` is None the corpus is loaded from HuggingFace (or
         the synthetic fallback), capped at ``max_samples``. The training
@@ -212,12 +219,37 @@ class TinyStoriesLM(Dataset):
         # ``n_probe`` texts truncated per-text); the sample is enough to
         # detect a swapped split / stale cache.
         self.data_fingerprint = _texts_fingerprint(self.texts)
+        # Prefetch cache: idx -> encoded token ids (tuple). Populated lazily
+        # on first access; capped by ``prefetch_cap`` (0 = unbounded). Only
+        # active when ``prefetch_cache`` is on; defaults off so existing
+        # training runs are bit-identical.
+        self.prefetch_cache = bool(prefetch_cache)
+        self.prefetch_cap = int(prefetch_cap)
+        self._prefetch_store: dict[int, tuple[int, ...]] = {}
+        self._prefetch_hits = 0
 
     def __len__(self): return len(self.texts)
 
     def __getitem__(self, idx):
         text = self.texts[idx]
-        tokens = self.tokenizer.encode(text, truncation=True, max_length=self.seq_len + 1)
+        if self.prefetch_cache and idx in self._prefetch_store:
+            tokens = list(self._prefetch_store[idx])
+            self._prefetch_hits += 1
+            # Correctness self-check: a cached encoding must stay identical
+            # to a fresh encode of the same text (tokenizer is a pure
+            # function; this guards against a future stateful tokenizer or a
+            # stale cache silently changing training inputs).
+            if self._prefetch_hits % 64 == 0:
+                fresh = self.tokenizer.encode(
+                    text, truncation=True, max_length=self.seq_len + 1)
+                assert list(fresh) == tokens, (
+                    f"prefetch cache mismatch at idx={idx}")
+        else:
+            tokens = self.tokenizer.encode(
+                text, truncation=True, max_length=self.seq_len + 1)
+            if self.prefetch_cache and self.prefetch_cap > 0 \
+                    and len(self._prefetch_store) < self.prefetch_cap:
+                self._prefetch_store[idx] = tuple(tokens)
         real_len = min(len(tokens), self.seq_len + 1)
         if real_len < self.seq_len + 1:
             tokens = tokens + [self.tokenizer.pad_token_id] * (self.seq_len + 1 - real_len)
@@ -263,7 +295,7 @@ def _is_nonfinite_document(text):
 
     A raw corpus assembled from a dataframe or a JSON feed can carry
     ``None`` / ``NaN`` / ``Inf`` entries. ``str(value)`` would turn those
-    into the strings ``'None'`` / ``'nan'`` / ``'inf'`` — i.e. pure label
+    into the strings ``'None'`` / ``'nan'`` / ``'inf'`` - i.e. pure label
     noise that no cleaning step downstream would ever notice. Strings and
     finite numbers are NOT non-finite documents (``5`` is legitimate text).
     """
@@ -1901,6 +1933,18 @@ def main():
                              "cleaning/splitting (0 = the recipe default "
                              "budget). Useful for smoke runs; the cap is "
                              "recorded in the data record.")
+    parser.add_argument("--prefetch_cache", action="store_true",
+                        help="Enable the token-id prefetch cache in "
+                             "TinyStoriesLM: encode each sample once and "
+                             "reuse the cached ids on later __getitem__ "
+                             "calls (prefetch), cutting repeated tokenizer "
+                             "encode work in the training hot path. Off by "
+                             "default so existing runs are bit-identical; a "
+                             "correctness self-check re-encodes every 64th "
+                             "cache hit and asserts equality with the cache.")
+    parser.add_argument("--prefetch_cap", type=int, default=1024,
+                        help="Max number of samples held in the prefetch "
+                             "cache (0 = unbounded). Default 1024.")
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -2360,7 +2404,9 @@ def main():
     outlier_val = _length_outlier_audit(train_lengths, val_lengths)
 
     ds = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=train_texts,
-                       split="train", name="train")
+                       split="train", name="train",
+                       prefetch_cache=args.prefetch_cache,
+                       prefetch_cap=args.prefetch_cap)
     val_ds = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=val_texts,
                            split="validation", name="val")
     # The test split stays unopened until the model is frozen. Only a
@@ -2605,6 +2651,8 @@ def main():
         'content_fingerprint_sha256': ds.data_fingerprint,
         'fingerprint_scheme': ('sha256 of <=64 evenly spaced texts truncated '
                                'to 4096 chars + corpus size'),
+        'prefetch_cache': bool(args.prefetch_cache),
+        'prefetch_cap': int(args.prefetch_cap),
     }
     created_utc = datetime.datetime.now(
         datetime.timezone.utc).isoformat()

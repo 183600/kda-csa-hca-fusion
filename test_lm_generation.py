@@ -20,7 +20,8 @@ sys.path.insert(0, HERE)
 import torch  # noqa: E402
 
 from ops_fused import HybridConfig  # noqa: E402
-from train_lm_autodl import LMWithHybrid, _sample_token  # noqa: E402
+from train_lm_autodl import (LMWithHybrid, _sample_token,
+                             TinyStoriesLM, _FallbackCharTokenizer)  # noqa: E402
 
 
 def _ok(name, cond, detail=''):
@@ -131,6 +132,35 @@ def test_generate_zero_new_tokens():
         f'got={gen}')
 
 
+def test_prefetch_cache_equals_live_encode():
+    """Prefetch-cache ids must equal a fresh encode of the same text."""
+    tok = _FallbackCharTokenizer()
+    texts = ["hello world", "abc def ghi", "hello world again"]
+    ds = TinyStoriesLM(tok, seq_len=8, texts=texts, split="train",
+                       name="train", prefetch_cache=True, prefetch_cap=8)
+    a = ds[0]["input_ids"].tolist()
+    b = ds[0]["input_ids"].tolist()
+    _ok('prefetch cache stable across accesses', a == b,
+        f'first={a}, second={b}')
+    expected = tok.encode(texts[0], truncation=True, max_length=9)
+    _ok('prefetch cache equals live encode',
+        a == expected[:-1],
+        f'cached={a}, live={expected[:-1]}')
+
+
+def test_prefetch_cap_respected():
+    """The prefetch cache must never exceed ``prefetch_cap`` entries."""
+    tok = _FallbackCharTokenizer()
+    texts = [f"story {i} text here" for i in range(20)]
+    ds = TinyStoriesLM(tok, seq_len=8, texts=texts, split="train",
+                       name="train", prefetch_cache=True, prefetch_cap=5)
+    for i in range(20):
+        ds[i]["input_ids"]
+    _ok('prefetch cap respected',
+        len(ds._prefetch_store) <= 5,
+        f'store size={len(ds._prefetch_store)}')
+
+
 _TEST_FUNCS = [
     test_sample_token_invocab_and_greedy,
     test_sample_token_topk_toph,
@@ -138,6 +168,8 @@ _TEST_FUNCS = [
     test_generate_deterministic_with_seed,
     test_generate_eos_stops_early,
     test_generate_zero_new_tokens,
+    test_prefetch_cache_equals_live_encode,
+    test_prefetch_cap_respected,
 ]
 
 
