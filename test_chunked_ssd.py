@@ -62,6 +62,7 @@ from ops_mamba import (  # noqa: E402
     _assoc_scan_chunk_transitions,
     _get_scripted_chunk_transition_scan,
     chunked_mamba2_scan,
+    mamba2_scan_boundary_metadata,
     naive_mamba2_scan,
     quadratic_mamba2_scan,
 )
@@ -126,6 +127,90 @@ def test_chunked_hand_computed_values():
         _ok(f'closed-form final state [C={chunk_size}]',
             (s_ch - expect_s).abs().max().item() < 1e-12,
             f'maxdiff={(s_ch - expect_s).abs().max().item():.2e}')
+
+
+# --- operator boundary metadata -------------------------------------------
+
+def test_chunked_boundary_metadata():
+    print('\nTest: chunk-boundary metadata + exact checkpoint resume')
+    cases = [
+        (0, 4, 0, 0, 0, (), ()),
+        (1, 4, 1, 4, 0, (0,), (1,)),
+        (8, 4, 2, 8, 1, (0, 4), (4, 4)),
+        (9, 4, 3, 12, 2, (0, 4, 8), (4, 4, 1)),
+        (13, 3, 5, 15, 3, (0, 3, 6, 9, 12), (3, 3, 3, 3, 1)),
+        (64, 64, 1, 64, 0, (0,), (64,)),
+    ]
+    for T, C, n, padded, levels, starts, lengths in cases:
+        md = mamba2_scan_boundary_metadata(T, chunk_size=C)
+        label = f'T={T} C={C}'
+        _ok(f'boundary metadata [chunk starts {label}]',
+            md['n_chunks'] == n and md['padded_len'] == padded
+            and md['pad'] == padded - T and md['scan_levels'] == levels,
+            f"n={md['n_chunks']} padded={md['padded_len']} "
+            f"levels={md['scan_levels']}")
+        _ok(f'boundary metadata [chunk starts/lengths {label}]',
+            md['chunk_starts'] == starts
+            and md['chunk_lengths'] == lengths
+            and md['last_chunk_len'] == (lengths[-1] if lengths else 0),
+            f"starts={md['chunk_starts']} lengths={md['chunk_lengths']}")
+
+    # The analytic model and the operator must agree on the boundary.
+    import roofline
+    for T in (0, 1, 5, 13, 64, 65, 127):
+        for C in (1, 3, 8, 16, 64):
+            md = mamba2_scan_boundary_metadata(T, chunk_size=C)
+            br = roofline.ssd_core_flops_breakdown(
+                T, 4, 8, 8, chunk_size=C)
+            _ok(f'boundary matches roofline [T={T} C={C}]',
+                md['n_chunks'] == br['n_chunks']
+                and md['padded_len'] == br['padded_len']
+                and md['scan_levels'] == br['scan_levels'],
+                f"op=({md['n_chunks']},{md['padded_len']},"
+                f"{md['scan_levels']}) model=({br['n_chunks']},"
+                f"{br['padded_len']},{br['scan_levels']})")
+
+    for bad in (-1, 1.5, True, None):
+        try:
+            mamba2_scan_boundary_metadata(bad, chunk_size=4)
+        except ValueError:
+            pass
+        else:
+            _ok(f'seqlen={bad!r} rejected', False, 'no error raised')
+    for bad in (0, -1, 1.5, True, None):
+        try:
+            mamba2_scan_boundary_metadata(8, chunk_size=bad)
+        except ValueError:
+            pass
+        else:
+            _ok(f'chunk_size={bad!r} rejected', False, 'no error raised')
+    _ok('invalid metadata arguments rejected', True, '-1/1.5/True/None')
+
+    # A chunk start is an exact checkpoint: prefix scan -> carry the state
+    # -> suffix scan reproduces the full call to fp round-off. This is the
+    # property that makes the metadata useful for chunked prefill instead
+    # of merely descriptive.
+    T, C = 37, 8
+    x, dt, Bm, Cm, A, D = _rand_inputs(2, T, 4, 5, 2, 6, seed=91)
+    S0 = torch.randn(2, 4, 5, 6, dtype=torch.float64,
+                     generator=torch.Generator().manual_seed(92)) * 0.1
+    y_full, s_full = _chunked(x, dt, Bm, Cm, A, D, initial_state=S0,
+                              chunk_size=C)
+    md = mamba2_scan_boundary_metadata(T, chunk_size=C)
+    for start in md['chunk_starts'][1:]:
+        y_pre, s_pre = _chunked(x[:, :start], dt[:, :start],
+                                Bm[:, :start], Cm[:, :start], A, D,
+                                initial_state=S0, chunk_size=C)
+        y_suf, s_suf = _chunked(x[:, start:], dt[:, start:],
+                                Bm[:, start:], Cm[:, start:], A, D,
+                                initial_state=s_pre, chunk_size=C)
+        y_diff = max((y_pre - y_full[:, :start]).abs().max().item(),
+                     (y_suf - y_full[:, start:]).abs().max().item())
+        _ok(f'checkpoint resume output [start={start}]',
+            y_diff < 1e-12, f'maxdiff={y_diff:.2e}')
+        _ok(f'checkpoint resume final state [start={start}]',
+            (s_suf - s_full).abs().max().item() < 1e-12,
+            f'maxdiff={(s_suf - s_full).abs().max().item():.2e}')
 
 
 # --- forward parity -------------------------------------------------------

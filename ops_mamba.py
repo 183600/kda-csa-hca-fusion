@@ -57,7 +57,9 @@ scalar-affine chunk transitions), with every exponent anchored at the
 chunk boundary for log-space gating stability. It is a drop-in replacement
 for the recurrence inside ``Mamba2Mixer`` (selected by
 ``HybridConfig.mamba_chunk_size``) and is pinned against both views above
-by ``test_chunked_ssd.py``.
+by ``test_chunked_ssd.py``. :func:`mamba2_scan_boundary_metadata` exposes
+the decomposition it executes (chunk count/padding/scan depth/checkpoint
+starts) so analytic accounting and benchmark rows share one definition.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ __all__ = [
     "Mamba2Mixer",
     "build_mamba2_mixer",
     "chunked_mamba2_scan",
+    "mamba2_scan_boundary_metadata",
     "naive_mamba2_scan",
     "quadratic_mamba2_scan",
     "resolve_mamba_dt_rank",
@@ -866,6 +869,79 @@ def _get_scripted_chunk_transition_scan():
     return _CHUNK_TRANSITION_SCAN_SCRIPTED
 
 
+def mamba2_scan_boundary_metadata(
+    seqlen: int,
+    *,
+    chunk_size: int = 64,
+) -> dict:
+    """Describe the chunk decomposition used by :func:`chunked_mamba2_scan`.
+
+    The chunked SSD path is the only scan view whose *operator boundary*
+    (how many chunks, how much right-padding, how deep the associative
+    scan, where a checkpoint can be inserted) depends on a tuning knob.
+    Experiment tooling needs those numbers to price a row analytically
+    (``roofline.ssd_core_flops_breakdown``) and to join measurements across
+    chunk sizes, but re-deriving them in every consumer invites drift with
+    the implementation. This function is the single source of truth:
+    ``chunked_mamba2_scan`` allocates from the same decomposition.
+
+    Args:
+        seqlen: number of real tokens (non-negative int).
+        chunk_size: positions per chunk (positive int; bool is rejected).
+
+    Returns:
+        A JSON-safe dict with:
+
+        * ``seqlen`` / ``chunk_size`` — the inputs;
+        * ``n_chunks`` — ``ceil(seqlen / chunk_size)`` (0 for an empty
+          sequence);
+        * ``padded_len`` — ``n_chunks * chunk_size``;
+        * ``pad`` — right-padding added by the scan (``padded_len - seqlen``);
+        * ``scan_levels`` — Hillis-Steele doubling depth,
+          ``ceil(log2(n_chunks))`` (0 for 0 or 1 chunks);
+        * ``chunk_starts`` — tuple of the zero-based start index of every
+          chunk (the last one is always ``< seqlen`` when ``seqlen > 0``);
+        * ``chunk_lengths`` — tuple of REAL (unpadded) token counts per
+          chunk; only the last entry can be shorter than ``chunk_size``;
+        * ``last_chunk_len`` — ``chunk_lengths[-1]`` (0 when empty).
+
+    A start index in ``chunk_starts`` is an exact state-checkpoint
+    boundary: running :func:`chunked_mamba2_scan` on the prefix, then on
+    the suffix with the returned final state, reproduces the full call to
+    fp round-off (the decomposition restarts on aligned boundaries).
+    """
+    if isinstance(seqlen, bool) or not isinstance(seqlen, int) or seqlen < 0:
+        raise ValueError(
+            f"mamba2_scan_boundary_metadata: seqlen={seqlen!r} must be a "
+            f"non-negative int.")
+    if (isinstance(chunk_size, bool) or not isinstance(chunk_size, int)
+            or chunk_size < 1):
+        raise ValueError(
+            f"mamba2_scan_boundary_metadata: chunk_size={chunk_size!r} must "
+            f"be a positive int.")
+    n_chunks = ((seqlen + chunk_size - 1) // chunk_size) if seqlen else 0
+    padded_len = n_chunks * chunk_size
+    levels = math.ceil(math.log2(n_chunks)) if n_chunks > 1 else 0
+    starts = tuple(range(0, padded_len, chunk_size))
+    if n_chunks:
+        last_len = seqlen - (n_chunks - 1) * chunk_size
+        lengths = (chunk_size,) * (n_chunks - 1) + (last_len,)
+    else:
+        last_len = 0
+        lengths = ()
+    return {
+        'seqlen': seqlen,
+        'chunk_size': chunk_size,
+        'n_chunks': n_chunks,
+        'padded_len': padded_len,
+        'pad': padded_len - seqlen,
+        'scan_levels': levels,
+        'chunk_starts': starts,
+        'chunk_lengths': lengths,
+        'last_chunk_len': last_len,
+    }
+
+
 def chunked_mamba2_scan(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -964,10 +1040,14 @@ def chunked_mamba2_scan(
     log_a = dt_c * A_c                                    # [B, T, H]
     G = torch.cumsum(log_a, dim=1)
 
-    BT = chunk_size
-    pad = (-seqlen) % BT
-    Tp = seqlen + pad
-    NT = Tp // BT
+    # Single source of truth for the operator boundary (n_chunks,
+    # padded length, chunk starts). Benchmark/roofline consumers call the
+    # same helper, so their metadata cannot drift from this allocation.
+    meta = mamba2_scan_boundary_metadata(seqlen, chunk_size=chunk_size)
+    BT = meta['chunk_size']
+    pad = meta['pad']
+    Tp = meta['padded_len']
+    NT = meta['n_chunks']
     # The transition source ``b_chunk`` ([B, H, NT, D, N]) and the
     # Hillis–Steele scan buffers ([BH, NT, D, N], 2–3 live copies) are
     # allocated whole; only the intra-chunk term is slabbed. With
