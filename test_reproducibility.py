@@ -356,6 +356,23 @@ def test_needle_overfit_check_is_deterministic_and_reports_grad_flow():
     json.dumps(first, allow_nan=False)
 
 
+def test_needle_stepwise_ste_overfit_gate_covers_qat_path():
+    import run_needle_haystack as nh
+
+    report = nh.run_needle_overfit_sanity_check(
+        tokenizer=nh._NeedleCharTokenizer(), memory_type='kda',
+        context_len=64, needle_pos=8, batch_size=4, steps=12,
+        lr=3e-3, seed=123, device='cpu', log_every=0,
+        stepwise=True, quant_spec=nh.QuantSpec(bits=2, group_size=16),
+        ste=True)
+    assert report['label'] == 'needle-stepwise-ste'
+    assert report['stepwise'] is True and report['ste'] is True
+    assert report['quant_spec']['bits'] == 2
+    assert report['grad_flow']['n_missing_grad'] == 0
+    assert isinstance(report['passed'], bool)
+    json.dumps(report, allow_nan=False)
+
+
 def test_needle_overfit_gate_can_be_disabled(monkeypatch):
     import run_needle_haystack as nh
 

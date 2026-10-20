@@ -1467,7 +1467,7 @@ def run_needle_overfit_sanity_check(
         *, tokenizer, memory_type='kda', context_len=64, needle_pos=8,
         batch_size=8, steps=100, lr=3e-3, seed=2026, device='cpu',
         grad_clip=1.0, acc_threshold=0.99, loss_ratio_threshold=0.5,
-        log_every=0):
+        log_every=0, stepwise=False, quant_spec=None, ste=False):
     """Overfit ONE fixed needle batch before the full sweep.
 
     Mirrors the Exp 4/5/8/11 gates: a FRESH model is trained on a single
@@ -1478,6 +1478,12 @@ def run_needle_overfit_sanity_check(
     finite. This is necessary but NOT sufficient: it proves the training
     loss is connected to the parameters; it cannot prove the eval stream,
     tokenizer alignment, or quantization path are correct.
+
+    ``stepwise=True`` exercises the ``NeedleStepwiseKDA`` QAT path instead
+    of the hybrid stack; ``quant_spec`` + ``ste=True`` then fake-quantize
+    every state write through the straight-through estimator, so a broken
+    STE gradient path fails here rather than silently producing random QAT
+    rows.
     """
     if isinstance(device, str):
         device = torch.device(device)
@@ -1495,7 +1501,10 @@ def run_needle_overfit_sanity_check(
     cfg = NeedleConfig(context_len=int(context_len),
                        needle_pos=int(needle_pos),
                        memory_type=str(memory_type))
-    model = _build_needle_model(cfg, tokenizer).to(device)
+    if stepwise:
+        model = NeedleStepwiseKDA(tokenizer.vocab_size).to(device)
+    else:
+        model = _build_needle_model(cfg, tokenizer).to(device)
     model.train()
     train_ids, start, target, data_seeds = _needle_fixed_batch(
         tokenizer, cfg.context_len, cfg.needle_pos, batch_size, seed, device)
@@ -1508,7 +1517,10 @@ def run_needle_overfit_sanity_check(
     t0 = time.time()
     for step in range(steps):
         model.reset_state()
-        logits = model(train_ids)
+        if stepwise:
+            logits = model(train_ids, spec=quant_spec, ste=ste)
+        else:
+            logits = model(train_ids)
         pred = logits[:, start:start + n_answer, :]
         loss = F.cross_entropy(pred.reshape(-1, pred.size(-1)),
                                target.reshape(-1))
@@ -1566,8 +1578,13 @@ def run_needle_overfit_sanity_check(
         h.update(str(t.detach().to('cpu').reshape(-1).tolist()).encode())
     report = {
         'passed': bool(passed),
-        'label': f'needle-{memory_type}',
+        'label': ('needle-stepwise-ste' if stepwise
+                  else f'needle-{memory_type}'),
         'memory_type': str(memory_type),
+        'stepwise': bool(stepwise),
+        'ste': bool(ste),
+        'quant_spec': (spec_summary(quant_spec)
+                       if quant_spec is not None else None),
         'context_len': int(context_len),
         'needle_pos': int(needle_pos),
         'batch_size': batch_size,
@@ -1619,8 +1636,14 @@ def _compact_needle_gate_report(report):
 
 def _run_needle_overfit_gate(*, tokenizer, device, memory_types,
                              env_prefix='NEEDLE', gate_context_len=64,
-                             gate_needle_pos=8, lr=3e-3):
-    """Run the fixed-batch gate once per memory route; return (record, ok)."""
+                             gate_needle_pos=8, lr=3e-3,
+                             include_stepwise=False, qat_spec=None):
+    """Run the fixed-batch gate once per memory route; return (record, ok).
+
+    When ``include_stepwise`` is true, one additional report trains the
+    QAT/STE stepwise model on a fixed batch, so the quantized path gets
+    the same pre-sweep gradient check as the hybrid routes.
+    """
     enabled = parse_int_env(f'{env_prefix}_OVERFIT_CHECK', 1, min_value=0,
                             logger=logger) != 0
     strict = parse_int_env(f'{env_prefix}_OVERFIT_STRICT', 1, min_value=0,
@@ -1668,10 +1691,41 @@ def _run_needle_overfit_gate(*, tokenizer, device, memory_types,
                 f"(exact={report.get('final_exact_match')}, "
                 f"loss={report.get('final_loss')}, "
                 f"error={report.get('error')})")
+    if include_stepwise:
+        if qat_spec is None:
+            qat_spec = QuantSpec(bits=2, group_size=16)
+        try:
+            report = run_needle_overfit_sanity_check(
+                tokenizer=tokenizer, memory_type='kda',
+                context_len=gate_context_len, needle_pos=gate_needle_pos,
+                batch_size=batch, steps=steps, lr=lr, seed=seed,
+                device=device, log_every=max(10, steps // 5),
+                stepwise=True, quant_spec=qat_spec, ste=True)
+        except Exception as e:
+            logger.error(
+                f'  [overfit] needle-stepwise-ste: gate crashed: {e}')
+            report = {'passed': False, 'label': 'needle-stepwise-ste',
+                      'stepwise': True, 'ste': True, 'error': str(e),
+                      'steps': steps, 'seed': seed, 'batch_size': batch}
+        reports.append(report)
+        if report.get('passed'):
+            logger.info(
+                f"  [overfit] needle-stepwise-ste: PASS "
+                f"(exact={report['final_exact_match']:.4f}, "
+                f"loss {report['initial_loss']:.4f}->"
+                f"{report['final_loss']:.4f})")
+        else:
+            all_passed = False
+            logger.error(
+                f"  [overfit] needle-stepwise-ste: FAIL "
+                f"(exact={report.get('final_exact_match')}, "
+                f"loss={report.get('final_loss')}, "
+                f"error={report.get('error')})")
     record = {'enabled': True, 'strict': bool(strict), 'steps': steps,
               'seed': seed, 'train_batch': batch,
               'context_len': int(gate_context_len),
-              'needle_pos': int(gate_needle_pos), 'reports': reports}
+              'needle_pos': int(gate_needle_pos),
+              'stepwise_gate': bool(include_stepwise), 'reports': reports}
     if not all_passed and strict:
         logger.error(
             f'  {env_prefix}_OVERFIT_STRICT=1: refusing to start the needle '
@@ -2559,7 +2613,8 @@ def main():
     gate_record, proceed = _run_needle_overfit_gate(
         tokenizer=tokenizer, device=device,
         memory_types=memory_types or ['kda', 'mamba2', 'rwkv7'],
-        lr=args.train_lr)
+        lr=args.train_lr, include_stepwise=not args.no_qat,
+        qat_spec=QuantSpec(bits=2, group_size=16))
     if not proceed:
         return 1
 
