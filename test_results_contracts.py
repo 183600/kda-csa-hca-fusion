@@ -48,8 +48,10 @@ from run_ablation import (  # noqa: E402
     CONTRAST_EQUIVALENCE_MARGIN,
     MATRIX_UNIT,
     _annotate_contrast_significance,
+    _attach_tuned_baseline_flags,
     _contrast_consistency_violations,
     _matrix_contrast_report,
+    _tuned_baseline_contrast_report,
     build_experiment_matrix,
 )
 from run_decoding import (  # noqa: E402
@@ -145,6 +147,49 @@ def test_row_contract_contrasts_requires_real_pairs():
                             [dict(good[0], mean_diff=float('nan'))], {})
     assert rs.validate_rows('exp5b_ablation_matrix_contrasts',
                             good + [dict(good[0])], {})
+
+
+def test_tuned_baseline_contrasts_pair_each_group_with_softmax():
+    """Every non-baseline row is tested against softmax at the same n_kv."""
+    rows = [
+        {'group': 'BASELINE-softmax', 'memory': 'softmax', 'n_kv': 1,
+         'lr': 1e-2, 'per_seed': [
+             {'seed': 42, 'final_acc': 0.50},
+             {'seed': 43, 'final_acc': 0.60}]},
+        {'group': 'BASELINE-softmax', 'memory': 'softmax', 'n_kv': 2,
+         'lr': 1e-2, 'per_seed': [
+             {'seed': 42, 'final_acc': 0.40},
+             {'seed': 43, 'final_acc': 0.50}]},
+        {'group': 'KDA-D', 'memory': 'kda', 'n_kv': 1, 'lr': 3e-3,
+         'per_seed': [
+             {'seed': 42, 'final_acc': 0.70},
+             {'seed': 43, 'final_acc': 0.80}]},
+        {'group': 'BASELINE-linear', 'memory': 'linear', 'n_kv': 1,
+         'lr': 3e-3, 'per_seed': [
+             {'seed': 42, 'final_acc': 0.05},
+             {'seed': 43, 'final_acc': 0.05}]},
+    ]
+    contrasts = _tuned_baseline_contrast_report(rows)
+    assert len(contrasts) == 1
+    row = contrasts[0]
+    assert row['candidate_group'] == 'KDA-D'
+    assert row['reference_group'] == 'BASELINE-softmax'
+    assert row['baseline_lr'] == 1e-2 and row['candidate_lr'] == 3e-3
+    assert row['mean_diff'] == pytest.approx(0.2)
+    summary = _annotate_contrast_significance(
+        contrasts, hypotheses={'tuned_baseline': {'direction': 'greater'}})
+    assert summary['n_contrasts'] == 1
+    assert row['significant_bonferroni'] is False
+    assert row['hypothesis_status'] == 'not_supported'
+
+    _attach_tuned_baseline_flags(rows, contrasts)
+    assert rows[2]['beats_tuned_baseline'] is False
+    assert rows[2]['tuned_baseline_diff'] == pytest.approx(0.2)
+    assert rows[0]['beats_tuned_baseline'] is None
+    assert rows[3]['beats_tuned_baseline'] is None
+
+    # No softmax reference at this n_kv -> no directly testable pair.
+    assert _tuned_baseline_contrast_report(rows[2:]) == []
 
 
 def test_row_contract_exp6_cache_flags_are_honest():

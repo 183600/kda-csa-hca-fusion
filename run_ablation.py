@@ -49,6 +49,15 @@ Methodology (both modes):
     different parameter counts — same d_model does NOT mean same
     capacity, and the budget-matching experiment exists precisely to
     close that gap.
+  * **Tuned simple baselines.** In matrix mode the linear/softmax rungs
+    get the same depth/recipe/budget, and the softmax lr is selected on
+    the held-out validation stream (``ABL_BASELINE_TUNE``,
+    ``ABL_BASELINE_LRS``, ``ABL_BASELINE_TUNE_SEEDS``) before the main
+    sweep. Every CSA/HCA-containing hybrid group additionally gets a
+    seed-paired one-sided test against that tuned softmax under its own
+    Bonferroni family (``TUNED_BASELINE_HYPOTHESIS``), recorded in the
+    matrix metadata; ``ABL_BASELINE_TUNE=0`` preserves the historical
+    fixed lr=3e-3 and skips the tuning pass.
   * **Device awareness.** Runs on GPU (Kaggle T4) when available.
   * **Equivalence, not just significance.** Every paired contrast also
     gets a TOST equivalence verdict against the PRE-SPECIFIED margin
@@ -99,8 +108,8 @@ from ops_rwkv_backend import validate_rwkv_backend
 from run_quality import (
     make_mqar_batch, MQARHead, _parse_nkv_list, _fmt_tstat, _t_crit_975,
     _bonferroni_crit_q, _build_param_groups, _task_batch_fingerprint,
-    _parse_equivalence_margin, SMALL_MODEL_SPEC, analyze_errors,
-    ResidualAttnLayer, NoMixAttn, SoftmaxAttn,
+    _parse_equivalence_margin, _parse_lr_list, SMALL_MODEL_SPEC,
+    analyze_errors, ResidualAttnLayer, NoMixAttn, SoftmaxAttn,
 )
 from results_analysis import multiclass_classification_metrics
 from train_diagnostics import (
@@ -1018,6 +1027,32 @@ SIMPLE_BASELINE_HYPOTHESES = {
     },
 }
 
+# Standard-rung reference for the direct baseline test. The baseline is
+# TUNED on the held-out validation stream (never the headline eval stream)
+# so "the hybrid beats softmax" cannot be explained by an untuned or
+# under-budgeted standard architecture.
+TUNED_BASELINE_GROUP = 'BASELINE-softmax'
+DEFAULT_BASELINE_TUNE_LRS = '1e-3,3e-3,1e-2'
+TUNED_BASELINE_HYPOTHESIS = {
+    'reference_group': TUNED_BASELINE_GROUP,
+    'role': ('standard rung: causal dense softmax attention, tuned on the '
+             'same validation stream and re-trained with the full seed '
+             'count under the same depth/recipe/budget as the hybrids'),
+    'hypothesis': ('A hybrid layout improves MQAR accuracy over a properly '
+                   'tuned dense-softmax baseline: the memory mechanism, not '
+                   'an untuned baseline or extra optimization, explains the '
+                   'difference.'),
+    'prediction': ('each CSA/HCA-containing hybrid group has a positive '
+                   'seed-paired final_acc difference versus the tuned '
+                   'BASELINE-softmax at the same n_kv (the pure recurrent '
+                   'control is not part of this hybrid claim).'),
+    'falsified_if': ('the corrected one-sided test does not clear the '
+                     'threshold (hybrid advantage not established) or is '
+                     'significantly negative (the tuned baseline wins); '
+                     'raw mean differences alone are not evidence.'),
+    'direction': 'greater',
+}
+
 # ---------------------------------------------------------------------------
 # Pre-registered hypotheses for the matrix's paired contrasts
 # (experiment-design requirement: fix the prediction and the falsification
@@ -1551,6 +1586,7 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         'seed': seed,
         'steps': steps,
         'train_batch': train_batch,
+        'lr': float(lr),
         'last_train_loss': last_loss,
         'class_metrics': class_metrics,
         'f1_macro': class_metrics.get('f1_macro'),
@@ -1610,6 +1646,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                 'final_acc': None, 'final_loss': None, 'fwd_ms': None,
                 'n_params': None, 'n_layers': None,
                 'seed': s, 'steps': steps,
+                'lr': kw.get('lr', 3e-3),
                 'train_batch': stub_train_batch,
                 'last_train_loss': None, 'mean_last10_loss': None,
                 'loss_curve': [],
@@ -1717,12 +1754,115 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
         'mean_fwd_ms': mean_fwd,
         'n_params': ok_per_seed[0]['n_params'],
         'n_layers': ok_per_seed[0]['n_layers'],
+        'lr': ok_per_seed[0].get('lr'),
         'mean_train_time_s': sum(r.get('train_time_s', 0.0)
                                  for r in ok_per_seed) / n,
         # Same sweep-level curve rollup as the ratio mode.
         **_aggregate_curve_diagnosis(ok_per_seed),
         # Pooled bad-case rollup for this group (None when disabled).
         'error_analysis': error_aggregate,
+    }
+
+
+def _validation_tail_score(result: dict, tail_k: int = 3):
+    """Mean held-out validation accuracy over the last <= ``tail_k`` points.
+
+    Mirrors ``run_quality.tune_baseline_lr``: average the plateau per seed,
+    then average over seeds. Selection uses only the validation stream, so
+    the headline eval stream stays untouched.
+    """
+    scores = []
+    for row in result.get('per_seed', []):
+        vh = row.get('val_history') or []
+        vals = [float(p['acc']) for p in vh[-int(tail_k):]
+                if p.get('acc') is not None]
+        if vals:
+            scores.append(sum(vals) / len(vals))
+    return (sum(scores) / len(scores)) if scores else None
+
+
+def tune_simple_baseline_lr(spec, lrs, *, n_kv_list, tune_seeds, steps,
+                            device, d_model, val_batches=2, val_batch=32):
+    """Select a simple baseline's lr on the validation stream.
+
+    Experiment-design requirement: the standard softmax baseline must be
+    tuned as carefully as the proposed hybrid before any hybrid-vs-baseline
+    difference is interpreted. Every candidate lr is trained over the same
+    cells/seeds with the SAME recipe; the winner maximizes the mean
+    validation-tail accuracy (plateau, not one noisy final point) and is
+    then re-trained with the full seed count. Ties keep the earlier grid
+    entry, which preserves the historical ``3e-3`` default ordering.
+    """
+    if not lrs:
+        raise ValueError('tune_simple_baseline_lr requires a non-empty lr grid')
+    group_id = spec[0]
+    tune_seeds = max(1, int(tune_seeds))
+    per_lr = {}
+    best_lr = float(lrs[0])
+    best_score = None
+    for lr in lrs:
+        val_scores = []
+        final_accs = []
+        failed_cells = []
+        for n_kv in n_kv_list:
+            try:
+                r = eval_group_multi_seed(
+                    spec, n_seeds=tune_seeds, steps=steps, device=device,
+                    n_kv=n_kv, d_model=d_model, lr=float(lr),
+                    val_batches=val_batches, val_batch=val_batch,
+                    error_batches=0, error_batch=64,
+                    max_error_examples=0)
+            except Exception as e:
+                failed_cells.append({'n_kv': n_kv, 'error': str(e)})
+                logger.warning(
+                    f'    [baseline-tune] {group_id} lr={lr:g} '
+                    f'n_kv={n_kv} FAILED: {e}')
+                continue
+            score = _validation_tail_score(r)
+            if score is not None:
+                val_scores.append(score)
+            if r.get('mean_acc') is not None:
+                final_accs.append(float(r['mean_acc']))
+        mean_score = ((sum(val_scores) / len(val_scores))
+                      if val_scores else None)
+        mean_final = ((sum(final_accs) / len(final_accs))
+                      if final_accs else None)
+        per_lr[f'{lr:g}'] = {
+            'mean_val_tail_acc': mean_score,
+            'mean_final_eval_acc': mean_final,
+            'n_val_cells': len(val_scores),
+            'n_cells_failed': len(failed_cells),
+            'failed_cells': failed_cells,
+        }
+        logger.info(
+            f'    [baseline-tune] {group_id:16s} lr={lr:g}  '
+            f'val_tail_acc='
+            f'{mean_score if mean_score is None else f"{mean_score:.4f}"} '
+            f'(eval={mean_final if mean_final is None else f"{mean_final:.4f}"}, '
+            f'{len(val_scores)}/{len(n_kv_list)} cells)')
+        if mean_score is not None and (best_score is None
+                                       or mean_score > best_score):
+            best_score = mean_score
+            best_lr = float(lr)
+    if best_score is None:
+        logger.warning(
+            f'    [baseline-tune] {group_id}: no usable validation signal; '
+            f'falling back to lr={best_lr:g}')
+    return best_lr, {
+        'group': group_id,
+        'selected_lr': best_lr,
+        'selected_lr_mean_val_acc': best_score,
+        'selection_statistic': ('mean of the last min(3, n) validation '
+                                'accuracies per seed, averaged over seeds '
+                                'and n_kv cells'),
+        'selection_stream': f'val_monitor_seed+{VAL_MONITOR_SEED_OFFSET}',
+        'tune_seeds': tune_seeds,
+        'tune_n_kv': list(n_kv_list),
+        'lr_grid': per_lr,
+        'note': ('The baseline lr is chosen on held-out validation '
+                 'accuracy, never on the headline eval stream, then '
+                 're-trained with the full seed count. Ties keep the '
+                 'earlier grid entry.'),
     }
 
 
@@ -1780,6 +1920,66 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
     else:
         unanimous = 'mixed'
     return mean_diff, t_stat, n, unanimous, std
+
+
+def _tuned_baseline_contrast_report(
+        all_results: list,
+        reference_group: str = TUNED_BASELINE_GROUP) -> list:
+    """Direct paired tests of every hybrid group vs tuned softmax.
+
+    ``_matrix_contrast_report`` answers the CSA/HCA layout questions but
+    never asks the prior question: does *any* hybrid beat the standard
+    dense-attention rung after that rung has been tuned? Each row here is
+    a seed-paired ``group - BASELINE-softmax`` accuracy difference at the
+    same ``n_kv``; the annotation step applies its own Bonferroni family
+    (separate from the layout-contrast family) and the pre-registered
+    ``TUNED_BASELINE_HYPOTHESIS`` decision rule.
+    """
+    ok_results = [r for r in all_results if 'error' not in r]
+    by_key = {(r.get('n_kv'), r.get('group')): r for r in ok_results}
+    references = {
+        r.get('n_kv'): r for r in ok_results
+        if r.get('group') == reference_group
+    }
+    rows = []
+    for r in ok_results:
+        gid = r.get('group')
+        if gid == reference_group or r.get('memory') in SIMPLE_BASELINE_KINDS:
+            continue
+        layout_tokens = set(str(r.get('layout') or '').split('-'))
+        if not ({'CSA', 'HCA'} & layout_tokens):
+            continue
+        ref = references.get(r.get('n_kv'))
+        if ref is None:
+            continue
+        diff, t_stat, n, unanimous, sd = _paired_contrast(
+            _seed_accuracy_map(r), _seed_accuracy_map(ref))
+        if diff is None:
+            continue
+        rows.append({
+            'n_kv': r.get('n_kv'),
+            'memory': r.get('memory'),
+            'contrast': f'{gid} - {reference_group} (tuned)',
+            'candidate_group': gid,
+            'reference_group': reference_group,
+            'mean_diff': diff,
+            't_stat': t_stat,
+            'sd_diff': sd,
+            'n_common_seeds': n,
+            'unanimous': unanimous,
+            'candidate_lr': r.get('lr'),
+            'baseline_lr': ref.get('lr'),
+            'predicted_direction':
+                TUNED_BASELINE_HYPOTHESIS['direction'],
+            'hypothesis': TUNED_BASELINE_HYPOTHESIS['hypothesis'],
+            'prediction': TUNED_BASELINE_HYPOTHESIS['prediction'],
+            'falsified_if': TUNED_BASELINE_HYPOTHESIS['falsified_if'],
+            'metric': 'final_acc',
+            'direction': 'higher_is_better',
+            'question': ('does this group beat a softmax baseline tuned '
+                         'on the same validation stream and budget?'),
+        })
+    return rows
 
 
 def _matrix_contrast_report(all_results: list) -> list:
@@ -2702,6 +2902,68 @@ def _log_ratio_contrast_table(contrasts: list) -> None:
     logger.info('=' * 104)
 
 
+def _attach_tuned_baseline_flags(all_results: list,
+                                 baseline_contrasts: list) -> None:
+    """Copy the direct tuned-baseline verdict onto every per-group row.
+
+    The result reader should not have to join a side table to see whether
+    a hybrid cleared the standard rung: the corrected verdict, effect and
+    threshold ride on the row itself. Baseline rows (and groups without a
+    paired reference) carry explicit ``None`` rather than a misleading
+    ``False``.
+    """
+    by_group = {(c.get('n_kv'), c.get('candidate_group')): c
+                for c in baseline_contrasts}
+    for r in all_results:
+        if 'error' in r:
+            continue
+        r['tuned_baseline_group'] = TUNED_BASELINE_GROUP
+        c = by_group.get((r.get('n_kv'), r.get('group')))
+        if c is None:
+            r['beats_tuned_baseline'] = None
+            r['tuned_baseline_diff'] = None
+            r['tuned_baseline_t_stat'] = None
+            r['tuned_baseline_alpha_bonferroni'] = None
+            continue
+        r['beats_tuned_baseline'] = bool(
+            c.get('significant_bonferroni')
+            and c.get('mean_diff') is not None
+            and c['mean_diff'] > 0)
+        r['tuned_baseline_diff'] = c.get('mean_diff')
+        r['tuned_baseline_t_stat'] = c.get('t_stat')
+        r['tuned_baseline_alpha_bonferroni'] = c.get('alpha_bonferroni')
+
+
+def _log_tuned_baseline_table(rows: list, summary: dict) -> None:
+    """Log the direct group-vs-tuned-softmax tests."""
+    if not rows:
+        logger.info('\n  Direct tuned-baseline tests: not available '
+                    '(ABL_SIMPLE_BASELINES=0 or no paired groups).')
+        return
+    logger.info('\n' + '=' * 104)
+    logger.info('Direct tuned-baseline tests (seed-matched final_acc vs '
+                f'{TUNED_BASELINE_GROUP}; positive = group better):')
+    logger.info('=' * 104)
+    for c in rows:
+        sig = 'YES' if c.get('significant_bonferroni') else 'no'
+        t_str = _fmt_tstat(c.get('t_stat'), width=8, prec=2)
+        logger.info(
+            f"  n_kv={c['n_kv']:<3} {c['candidate_group']:<16} "
+            f"diff={c['mean_diff']:+.4f}  t={t_str}  "
+            f"n={c['n_common_seeds']}  sig={sig:<3} "
+            f"({c.get('hypothesis_status', 'n/a')})  "
+            f"lr={c.get('candidate_lr')} vs base={c.get('baseline_lr')}")
+    logger.info(
+        '  Significance = Bonferroni-corrected ONE-SIDED seed-paired '
+        't-test over this baseline-test family; non-significant rows are '
+        'inconclusive, not evidence that the hybrid fails to help.')
+    logger.info(f"  supported={summary.get('n_supported', 0)}/"
+              f"{summary.get('n_contrasts', 0)}  "
+              f"significant={summary.get('n_significant', 0)}/"
+              f"{summary.get('n_contrasts', 0)}")
+    logger.info('=' * 104)
+
+
 def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                      error_batches=0, error_batch=64, error_examples=2):
     """ABL_MODE=matrix driver: build + run + report the explicit matrix."""
@@ -2732,6 +2994,48 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                     '(same depth/recipe; ABL_SIMPLE_BASELINES=0 disables)')
     else:
         logger.info('  simple baselines: DISABLED (ABL_SIMPLE_BASELINES=0)')
+
+    # Tune the simple baselines BEFORE the main sweep. The standard softmax
+    # rung is the bar a hybrid must clear; leaving it at one fixed lr would
+    # confound "the operator helps" with "the baseline was untuned". Each
+    # candidate is selected on the held-out validation stream and then
+    # re-trained with the full seed count in the main loop below.
+    baseline_specs = [g for g in groups
+                      if g[1] in SIMPLE_BASELINE_KINDS]
+    baseline_lrs = {}
+    baseline_tuning = {}
+    baseline_tune_enabled = parse_int_env(
+        'ABL_BASELINE_TUNE', 1, min_value=0, logger=logger)
+    if baseline_specs and baseline_tune_enabled:
+        baseline_lr_grid = _parse_lr_list(
+            'ABL_BASELINE_LRS', DEFAULT_BASELINE_TUNE_LRS)
+        tune_seeds = parse_int_env(
+            'ABL_BASELINE_TUNE_SEEDS', min(int(n_seeds), 3),
+            min_value=1, logger=logger)
+        tune_seeds = max(1, min(tune_seeds, int(n_seeds)))
+        logger.info(f'\nTuning simple baselines on validation stream '
+                    f'(lr grid={baseline_lr_grid}, '
+                    f'{tune_seeds} seed(s), {len(n_kv_list)} n_kv cell(s)):')
+        for spec in baseline_specs:
+            best_lr, record = tune_simple_baseline_lr(
+                spec, baseline_lr_grid, n_kv_list=n_kv_list,
+                tune_seeds=tune_seeds, steps=steps, device=device,
+                d_model=d_model)
+            baseline_lrs[spec[0]] = best_lr
+            baseline_tuning[spec[0]] = record
+    elif baseline_specs:
+        logger.info('  baseline tuning: DISABLED '
+                    '(ABL_BASELINE_TUNE=0); using lr=3e-3')
+        for spec in baseline_specs:
+            baseline_lrs[spec[0]] = 3e-3
+            baseline_tuning[spec[0]] = {
+                'group': spec[0],
+                'selected_lr': 3e-3,
+                'status': 'disabled_by_ABL_BASELINE_TUNE',
+                'note': ('tuning disabled; the historical fixed lr is '
+                         'kept so ABL_BASELINE_TUNE=0 reproduces the old '
+                         'numeric behaviour'),
+            }
 
     # Pre-sweep overfit sanity gate: one cell per DISTINCT layout on the
     # first memory route (the memory operators themselves already have
@@ -2780,12 +3084,13 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
             gid = spec[0]
             logger.info(f'\n-- group {gid} (n_kv={n_kv}, {n_seeds} seeds) --')
             try:
-                res = eval_group_multi_seed(spec, n_seeds=n_seeds,
-                                            steps=steps, device=device,
-                                            n_kv=n_kv, d_model=d_model,
-                                            error_batches=error_batches,
-                                            error_batch=error_batch,
-                                            max_error_examples=error_examples)
+                res = eval_group_multi_seed(
+                    spec, n_seeds=n_seeds, steps=steps, device=device,
+                    n_kv=n_kv, d_model=d_model,
+                    lr=baseline_lrs.get(gid, 3e-3),
+                    error_batches=error_batches,
+                    error_batch=error_batch,
+                    max_error_examples=error_examples)
                 t_stat = res.get('t_stat_vs_chance')
                 n_ok = res.get('n_seeds_ok', 0)
                 if t_stat is not None and n_ok >= 2:
@@ -2897,7 +3202,8 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         r['rwkv7_upstream_binding'] = RWKV7_UPSTREAM_BINDING
         r['significance_scope'] = (
             'vs_chance_bonferroni_and_seed_paired_layout_contrasts_'
-            'bonferroni_and_tost_equivalence')
+            'bonferroni_and_tost_equivalence_and_tuned_softmax_'
+            'baseline_bonferroni')
 
     # Paired seed-matched contrasts (B-A / C-A / D-B / D-C / interaction
     # per route; A/D replacement across routes — the KDA-vs-RWKV-7
@@ -2916,6 +3222,35 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
     # judge the same evidence.
     _attach_matrix_cost_tradeoffs(contrasts, all_results)
     _log_contrast_table(contrasts)
+
+    # Direct answer to the prior question: does each hybrid beat the tuned
+    # standard rung? This is a SEPARATE pre-registered family from the
+    # layout contrasts; it must not be folded into their Bonferroni family
+    # (that would make both screens harder to interpret).
+    baseline_contrasts = []
+    if include_baselines:
+        baseline_contrasts = _tuned_baseline_contrast_report(all_results)
+    if baseline_contrasts:
+        baseline_tests = _annotate_contrast_significance(
+            baseline_contrasts,
+            hypotheses={'tuned_baseline': TUNED_BASELINE_HYPOTHESIS})
+        baseline_tests['reference_group'] = TUNED_BASELINE_GROUP
+        baseline_tests['family_scope'] = (
+            'every CSA/HCA-containing hybrid group x n_kv, tested against the tuned '
+            f'{TUNED_BASELINE_GROUP} at the same n_kv')
+        baseline_tests['rows'] = baseline_contrasts
+        _log_tuned_baseline_table(baseline_contrasts, baseline_tests)
+    else:
+        baseline_tests = {
+            'status': ('disabled' if not include_baselines
+                       else 'no_paired_tuned_baseline_reference'),
+            'reference_group': TUNED_BASELINE_GROUP,
+            'n_contrasts': 0,
+            'n_significant': 0,
+            'n_supported': 0,
+        }
+        _log_tuned_baseline_table([], baseline_tests)
+    _attach_tuned_baseline_flags(all_results, baseline_contrasts)
 
     # Regime of the matrix as a whole (same vocabulary as the ratio sweep):
     # are the rows saturated / underfitting / overfitting, and do the seeds
@@ -2943,6 +3278,15 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         'preset': preset,
         'memory_routes': list(memory_types),
         'include_simple_baselines': bool(include_baselines),
+        'baseline_tuning': {
+            'enabled': bool(include_baselines and baseline_tune_enabled),
+            'reference_group': TUNED_BASELINE_GROUP,
+            'records': baseline_tuning,
+            'note': ('Baseline lrs are selected on validation-tail accuracy '
+                     '(held-out monitor stream), then re-trained with the '
+                     'full seed count. ABL_BASELINE_TUNE=0 keeps the '
+                     'historical fixed lr=3e-3.'),
+        },
         'n_kv_list': list(n_kv_list),
         'n_seeds': n_seeds,
         'steps': steps,
@@ -2961,6 +3305,8 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
             'groups': MATRIX_GROUP_ROLES,
             'simple_baselines': (SIMPLE_BASELINE_HYPOTHESES
                                  if include_baselines else {}),
+            'tuned_baseline': (TUNED_BASELINE_HYPOTHESIS
+                               if include_baselines else {}),
             'contrasts': MATRIX_CONTRAST_HYPOTHESES,
             'cross_route': CROSS_ROUTE_CONTRAST_HYPOTHESIS,
             'note': ('Pre-registered in run_ablation.MATRIX_CONTRAST_'
@@ -2978,6 +3324,9 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         # travels with the results).
         'contrast_tests': contrast_tests,
         'contrast_equivalence_margin': equiv_margin,
+        # Separate family: every group's direct paired test against the
+        # TUNED softmax rung (the baseline-superiority question).
+        'baseline_tests': baseline_tests,
         # Sweep-wide training regime + the accuracy-vs-cost screen, so the
         # artifact records not only which group won but whether the win
         # survives the curve diagnosis and what it cost.
