@@ -181,6 +181,8 @@ def _sliding_window_attention(
         are well below the fp32 tolerance enforced by ``run_correctness.py``.
     """
     B, T, nh, c = q.shape
+    if T == 0:
+        return q.new_zeros(B, 0, nh, c)
     # Static validity mask (shape [T, win]). The mask depends only on
     # (T, win, device) and is cached across calls (read-only contract).
     valid_mask = _sliding_window_valid_mask(T, win, device)  # True=real
@@ -316,9 +318,17 @@ def _sliding_window_scores(
     peak intermediate size is bounded.
     """
     B, T, nh, c = q.shape
-    C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
     # Cached [T, win] mask (read-only contract, see the helper).
     win_valid = _sliding_window_valid_mask(T, win, device)  # True=real
+    if T == 0:
+        # No queries: the left padding has only ``win-1`` rows, too short
+        # to unfold, and both tiled/full paths would fail. Empty results
+        # are exact (nothing to attend to).
+        if return_windows:
+            return (q.new_empty(B, 0, nh, win),
+                    C_local.new_empty(B, 0, win, c), win_valid)
+        return q.new_empty(B, 0, nh, win), None, win_valid
+    C_padded = F.pad(C_local, (0, 0, win - 1, 0))          # [B, T+win-1, c]
     if return_windows:
         # Overlapping view: einsum consumes it directly (bit-identical
         # values, no densification copy).
