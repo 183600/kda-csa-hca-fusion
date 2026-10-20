@@ -500,6 +500,29 @@ def configure_logging(verbose: bool = True) -> None:
         root.setLevel(target_level)
 
 
+def _enable_cudnn_autotune_if_safe() -> bool:
+    """Enable cuDNN autotune unless determinism was already requested.
+
+    ``torch.backends.cudnn.benchmark = True`` lets cuDNN time candidate
+    kernels and choose one per input shape. That choice is not guaranteed
+    to be stable run-to-run, so it must not clobber
+    ``set_global_seed(deterministic=True)`` (which sets
+    ``cudnn.deterministic=True`` / ``benchmark=False``) or an explicit
+    ``torch.use_deterministic_algorithms(True)``. Returns whether autotune
+    was enabled.
+    """
+    try:
+        if torch.are_deterministic_algorithms_enabled():
+            return False
+        if torch.backends.cudnn.deterministic:
+            return False
+        torch.backends.cudnn.benchmark = True
+        return True
+    except Exception:
+        # Never let a provenance/performance convenience break a run.
+        return False
+
+
 def configure_torch_for_device(
     device: torch.device | None = None,
     *,
@@ -541,8 +564,12 @@ def configure_torch_for_device(
             _interop_threads_set = True
     else:
         # Enable cuDNN autotune for the fixed input shapes used by the
-        # benchmarks.
-        torch.backends.cudnn.benchmark = True
+        # benchmarks, but NEVER override an already-requested deterministic
+        # configuration: benchmark mode times candidate kernels and can
+        # pick different ones between runs, undoing the same-machine
+        # reproducibility guarantee that set_global_seed(deterministic=True)
+        # established when it was called before this function.
+        _enable_cudnn_autotune_if_safe()
         # TF32 (TensorFloat-32) matmul is only supported on Ampere (sm_80)
         # and later. Kaggle's T4 is sm_75 (Turing), so allow_tf32=True is a
         # no-op there — harmless but misleading (it suggests TF32 acceleration

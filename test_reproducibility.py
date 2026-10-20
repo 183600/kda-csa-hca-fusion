@@ -127,6 +127,26 @@ def test_seed_worker_derives_from_torch_initial_seed():
             == np.random.RandomState(321).rand(3).tolist())
 
 
+def test_cudnn_autotune_never_overrides_deterministic_settings():
+    import kaggle_setup
+
+    # A deterministic request made before device configuration must survive:
+    # benchmark=True lets cuDNN pick kernels by timing, which can differ
+    # between otherwise identical runs.
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    assert kaggle_setup._enable_cudnn_autotune_if_safe() is False
+    assert torch.backends.cudnn.benchmark is False
+
+    # When determinism was not requested, the historical autotune path is
+    # still enabled.
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = False
+    assert kaggle_setup._enable_cudnn_autotune_if_safe() is True
+    assert torch.backends.cudnn.benchmark is True
+
+
 def test_make_seeded_generator_is_reproducible():
     def sample(seed):
         gen = make_seeded_generator(seed)
