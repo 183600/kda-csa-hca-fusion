@@ -88,9 +88,11 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
     grad_flow_report,
+    make_run_manifest_entry,
     make_seeded_generator,
     parse_int_env,
     sanitize_for_json,
@@ -2660,6 +2662,61 @@ def main():
     os.makedirs(os.path.dirname(args.json) or '.', exist_ok=True)
     write_results_json(payload, args.json, logger=logger)
     logger.info(f'\nSaved: {args.json}')
+
+    # Campaign-level ledger entry: one strict-JSON line linking this run's
+    # seeds / recipe / data version / gate verdict to its artifact, so the
+    # experiment is reproducible without hand-written notes.
+    gate_failures = sum(1 for r in gate_record.get('reports', [])
+                        if not r.get('passed'))
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp12_needle_haystack',
+        seeds=list(seeds),
+        provenance=payload['provenance'],
+        hyperparameters={
+            'eval_batch_size': int(args.eval_batch_size),
+            'eval_batches': int(eval_batches),
+            'train_steps': int(train_steps),
+            'train_context_len': (None if train_context_len is None
+                                  else int(train_context_len)),
+            'train_needle_pos': (None if train_needle_pos is None
+                                 else int(train_needle_pos)),
+            'train_batch_size': int(args.train_batch_size),
+            'train_lr': float(args.train_lr),
+            'val_every': (None if args.val_every is None
+                          else int(args.val_every)),
+            'val_batches': int(args.val_batches),
+            'max_error_examples': int(args.max_error_examples),
+            'quick': bool(args.quick),
+            'qat_enabled': not bool(args.no_qat),
+            'qat_steps': int(qat_steps),
+            'qat_seeds': list(qat_seeds),
+            'context_lens': list(context_lens),
+            'needle_ratios': list(needle_ratios),
+            'memory_types': list(memory_types),
+            'dtypes': list(dtypes),
+            'quant_bits': list(quant_bits),
+            'quant_groups': list(quant_groups),
+        },
+        data={
+            'generator': 'build_needle_haystack (deterministic per seed)',
+            'tokenizer': '_NeedleCharTokenizer',
+            'vocab_size': int(tokenizer.vocab_size),
+            'eval_seed_band': [0, EVAL_SEED_RESERVE],
+            'train_seed_band': [EVAL_SEED_RESERVE, SEED_CEILING],
+            'train_seed_stream_offset': TRAIN_SEED_STREAM,
+            'n_base_configs': len(base_configs),
+            'n_quant_configs': len(all_configs),
+        },
+        artifacts={'results': args.json},
+        results={
+            'n_rows': len(all_rows),
+            'n_needle_rows': len(needle_rows),
+            'n_qat_rows': len(qat_rows),
+            'overfit_gate_enabled': bool(gate_record['enabled']),
+            'overfit_gate_failures': int(gate_failures),
+        },
+        status=('completed' if gate_failures == 0 else 'partial'),
+    ), logger=logger)
 
     if not args.quick:
         _print_needle_rows(needle_rows)

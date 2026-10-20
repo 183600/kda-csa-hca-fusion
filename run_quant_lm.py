@@ -88,9 +88,11 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
     grad_flow_report,
+    make_run_manifest_entry,
     make_seeded_generator,
     parse_int_env,
     seed_worker,
@@ -133,6 +135,7 @@ from train_lm_autodl import (  # noqa: E402
     TinyStoriesLM,
     _FallbackCharTokenizer,
     _synthetic_corpus,
+    _texts_fingerprint,
     clean_lm_texts,
     analyze_lm_errors,
     evaluate_lm_loss,
@@ -1956,6 +1959,53 @@ def main():
     write_schema(RESULTS_PATH, rows, kind='exp11_quant_lm',
                  metadata=metadata)
     logger.info(f'\nSaved: {RESULTS_PATH}')
+
+    # Campaign-level ledger entry: seeds / recipe / corpus fingerprints /
+    # gate verdict / artifact path in one strict-JSON line.
+    gate_failures = sum(1 for r in gate_record.get('reports', [])
+                        if not r.get('passed'))
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp11_quant_lm',
+        seeds=list(seeds),
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'steps': int(steps),
+            'qat_steps': int(qat_steps),
+            'seq_len': int(seq_len),
+            'batch_size': int(batch_size),
+            'eval_sequences': int(eval_seqs),
+            'n_corpus_texts': int(n_corpus),
+            'lr': 3e-3,
+            'tolerance': float(tolerance),
+            'val_every': int(val_every),
+            'error_batches': int(error_batches),
+            'max_error_examples': int(max_error_examples),
+            'qat_enabled': not bool(skip_qat),
+            'specs': [spec_summary(s) for s in specs],
+            'qat_spec': spec_summary(QAT_SPEC),
+        },
+        data={
+            'source': metadata['corpus']['source'],
+            'split': split_report,
+            'sizes': {name: len(texts)
+                      for name, texts in split_texts.items()},
+            'fingerprints': {
+                name: _texts_fingerprint(texts)
+                for name, texts in split_texts.items()},
+        },
+        artifacts={'results': RESULTS_PATH},
+        results={
+            'n_rows': len(rows),
+            'n_ptq_rows': len(ptq_rows),
+            'n_ptq_test_rows': len(ptq_test_rows),
+            'n_qat_rows': len(qat_rows),
+            'n_specs': len(specs),
+            'n_seeds': len(seeds),
+            'overfit_gate_enabled': bool(gate_record['enabled']),
+            'overfit_gate_failures': int(gate_failures),
+        },
+        status=('completed' if gate_failures == 0 else 'partial'),
+    ), logger=logger)
     return 0
 
 
