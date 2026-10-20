@@ -1107,6 +1107,44 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
     return report
 
 
+def _sample_token(logits, *, temperature=1.0, top_k=None, top_p=None):
+    """Sample a single token id from logits with temperature / top-k / top-p.
+
+    ``temperature <= 0`` selects greedy (argmax). ``top_k`` keeps only the
+    ``k`` most likely tokens; ``top_p`` keeps the smallest nucleus whose
+    cumulative probability mass is at least ``top_p``. Returns a Python int.
+    Deterministic for a fixed torch RNG state (caller seeds via
+    ``torch.manual_seed``).
+    """
+    logits = logits.float().reshape(-1)
+    vocab = int(logits.shape[0])
+    if temperature is not None and temperature > 0:
+        logits = logits / float(temperature)
+    if top_k is not None and 0 < int(top_k) < vocab:
+        k = int(top_k)
+        top_values, top_indices = torch.topk(logits, k)
+        masked = torch.full_like(logits, float('-inf'))
+        masked[top_indices] = top_values
+        logits = masked
+    if top_p is not None and 0.0 < float(top_p) < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        probs_sorted = torch.softmax(sorted_logits, dim=-1)
+        cum_probs = torch.cumsum(probs_sorted, dim=-1)
+        sorted_remove = cum_probs > float(top_p)
+        # Keep the first token that pushes cumulative mass over top_p (the
+        # standard nucleus rule); drop everything after it.
+        sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+        sorted_remove[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(sorted_remove,
+                                                  float('-inf'))
+        logits = logits.new_full((vocab,), float('-inf'))
+        logits.scatter_(0, sorted_indices, sorted_logits)
+    probs = torch.softmax(logits, dim=-1)
+    if temperature is not None and temperature <= 0:
+        return int(torch.argmax(probs).item())
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
 class LMWithHybrid(nn.Module):
     """Causal LM wrapper: token embedding -> hybrid stack -> final norm -> head.
 
@@ -1209,6 +1247,71 @@ class LMWithHybrid(nn.Module):
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                    labels.reshape(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss}
+
+    @torch.no_grad()
+    def generate(self, input_ids, *, max_new_tokens=32, temperature=1.0,
+                 top_k=None, top_p=None, eos_token_id=None, seed=None):
+        """Autoregressive next-token generation from the trained LM.
+
+        Generation is correctness-first: every step re-runs a full forward
+        over the *entire* prefix (prompt + tokens generated so far) with the
+        recurrent state reset, takes the logits at the last position, and
+        samples the next token.
+
+        Why recompute the full prefix: ``LMWithHybrid``'s KDA layers carry a
+        recurrent state across forward calls, but the CSA/HCA layers are
+        stateless *inside* the stack — their incremental decode state lives
+        in ``ops_decoding_cache`` and is not threaded through
+        ``LMWithHybrid.forward``. Recomputing the full prefix is therefore
+        the only path that lets *all three* operator types see the complete
+        history on every generated token. It is O(n^2) in generated length —
+        fine for short generations and a correct reference; an
+        incremental-cache path can be layered on top later through
+        ``run_decoding.HybridDecoding`` (the same path used by
+        ``lm_consistency``).
+
+        Returns a list of generated token-id lists (one per batch item),
+        *excluding* the input prompt. Sampling is deterministic when ``seed``
+        is set.
+        """
+        self.eval()
+        was_training = self.training
+        device = self.embed.weight.device
+        input_ids = input_ids.to(device)
+        B, T = input_ids.shape
+        if seed is not None:
+            torch.manual_seed(int(seed))
+        sequences = [list(input_ids[b].tolist()) for b in range(B)]
+        finished = [False] * B
+        try:
+            for _ in range(int(max_new_tokens)):
+                any_active = False
+                logits_all = [None] * B
+                for b in range(B):
+                    if finished[b]:
+                        continue
+                    any_active = True
+                    prefix = torch.tensor([sequences[b]], device=device,
+                                          dtype=torch.long)
+                    self.hybrid.reset_state()
+                    out = self(prefix)
+                    logits_all[b] = out["logits"][0, -1]
+                if not any_active:
+                    break
+                for b in range(B):
+                    if finished[b] or logits_all[b] is None:
+                        continue
+                    next_id = _sample_token(
+                        logits_all[b], temperature=temperature,
+                        top_k=top_k, top_p=top_p)
+                    sequences[b].append(int(next_id))
+                    if eos_token_id is not None \
+                            and int(next_id) == int(eos_token_id):
+                        finished[b] = True
+        finally:
+            self.train(was_training)
+            self.hybrid.reset_state()
+        return [seq[T:] for seq in sequences]
 
 
 class _DenseSoftmaxStack(nn.Module):
@@ -1811,6 +1914,27 @@ def main():
                              "results — the machine-readable experiment log.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for model init and DataLoader shuffle.")
+    # --- text generation (the trained LM can also produce text) -----------
+    parser.add_argument("--generate", action="store_true",
+                        help="Load --checkpoint and generate text from --prompt "
+                             "instead of training. Runs a single generation "
+                             "pass and exits.")
+    parser.add_argument("--prompt", type=str, default="",
+                        help="Text prompt to continue with --generate.")
+    parser.add_argument("--max_new_tokens", type=int, default=32,
+                        help="Number of tokens to generate with --generate.")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature for --generate (<=0 = greedy).")
+    parser.add_argument("--top_k", type=int, default=None,
+                        help="Top-k cutoff for --generate sampling.")
+    parser.add_argument("--top_p", type=float, default=None,
+                        help="Nucleus (top-p) cutoff for --generate sampling.")
+    parser.add_argument("--eos_token_id", type=int, default=None,
+                        help="Token id that stops --generate early when sampled.")
+    parser.add_argument("--generate_seed", type=int, default=None,
+                        help="RNG seed for --generate sampling (deterministic).")
+    parser.add_argument("--generate_max_context", type=int, default=512,
+                        help="Max prompt tokens fed to --generate (truncated).")
     parser.add_argument("--val_frac", type=float, default=0.1,
                         help="Fraction of the cleaned corpus held out as the "
                              "validation split (model selection + early "
@@ -1982,6 +2106,77 @@ def main():
             raise SystemExit(f"checkpoint not found: {ckpt_path}")
         report = run_checkpoint_consistency(ckpt_path, device, seed=args.seed)
         _print_consistency_report(report, title=os.path.basename(ckpt_path))
+        return
+
+    if args.generate:
+        ckpt_path = args.checkpoint or os.path.join(
+            args.output_dir, "final_lm.pt")
+        if not os.path.exists(ckpt_path):
+            raise SystemExit(f"checkpoint not found: {ckpt_path}")
+        if not args.prompt:
+            raise SystemExit("--generate requires --prompt")
+        try:
+            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        except TypeError:
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+        cfg = HybridConfig(**ckpt['cfg'])
+        arch = ckpt.get('arch', 'hybrid')
+        vocab = int(ckpt['vocab'])
+        model = build_lm_model(
+            arch, vocab, cfg,
+            d_model=ckpt.get('model_d_model') if arch == 'softmax' else None)
+        model.load_state_dict(ckpt['model'])
+        model.to(device).eval()
+        if HAS_HF:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            except Exception:
+                tokenizer = _FallbackCharTokenizer()
+        else:
+            tokenizer = _FallbackCharTokenizer()
+        if getattr(tokenizer, "pad_token", None) is None \
+                and hasattr(tokenizer, "eos_token"):
+            tokenizer.pad_token = tokenizer.eos_token
+        prompt_ids = tokenizer.encode(args.prompt, truncation=True,
+                                      max_length=args.generate_max_context)
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long,
+                                 device=device)
+        gen_ids = model.generate(
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            eos_token_id=args.eos_token_id,
+            seed=args.generate_seed,
+        )[0]
+        full = list(prompt_ids) + gen_ids
+        gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        full_text = tokenizer.decode(full, skip_special_tokens=True)
+        result = {
+            'checkpoint': ckpt_path,
+            'prompt': args.prompt,
+            'prompt_ids': prompt_ids,
+            'generated_ids': gen_ids,
+            'generated_text': gen_text,
+            'full_text': full_text,
+            'max_new_tokens': int(args.max_new_tokens),
+            'temperature': float(args.temperature),
+            'top_k': (None if args.top_k is None else int(args.top_k)),
+            'top_p': (None if args.top_p is None else float(args.top_p)),
+            'eos_token_id': (
+                None if args.eos_token_id is None else int(args.eos_token_id)),
+            'generate_seed': (
+                None if args.generate_seed is None else int(args.generate_seed)),
+            'provenance': provenance,
+        }
+        os.makedirs(args.output_dir, exist_ok=True)
+        out_path = os.path.join(args.output_dir, 'generation.json')
+        write_json_atomic(result, out_path, indent=2, allow_nan=False)
+        print(f"[generate] prompt={args.prompt!r}")
+        print(f"[generate] generated={gen_text!r}")
+        print(f"[generate] full={full_text!r}")
+        print(f"[generate] saved={out_path}")
         return
 
     if HAS_HF:
