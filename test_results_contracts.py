@@ -54,6 +54,7 @@ from run_ablation import (  # noqa: E402
     _matrix_design_audit,
     _tuned_baseline_contrast_report,
     build_experiment_matrix,
+    build_simple_baseline_groups,
 )
 from run_decoding import (  # noqa: E402
     HYBRID_OPS,
@@ -428,6 +429,36 @@ def test_matrix_design_audit_verifies_factorial_recipe_and_seed_parity():
         survivor_only, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
     assert audit['status'] == 'incomplete'
     assert audit['missing_groups'] == ['KDA-A']
+
+
+def test_matrix_design_audit_counts_and_flags_simple_baseline_cells():
+    groups = (build_experiment_matrix('main8', 10, ('kda',))
+              + build_simple_baseline_groups(10))
+    rows = []
+    for spec in groups:
+        for n_kv in (1, 2):
+            row = _matrix_row(spec[0], spec[1], (0.2, 0.4), n_kv=n_kv)
+            row.update({'steps': 100, 'train_batch': 16, 'lr': 3e-3,
+                        'd_model': 32})
+            rows.append(row)
+    audit = _matrix_design_audit(
+        rows, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
+    assert audit['status'] == 'complete_factorial'
+    assert audit['n_expected_cells'] == audit['n_present_cells'] == 12
+    assert audit['missing_groups'] == []
+    baseline_cells = [c for c in audit['cells']
+                      if c['memory'] in ('linear', 'softmax')]
+    assert len(baseline_cells) == 4
+    assert all(c['factorial_complete'] for c in baseline_cells)
+    assert all(c['present_groups'] == ['BASELINE-' + c['memory']]
+               for c in baseline_cells)
+
+    dropped = [r for r in rows
+               if not (r['group'] == 'BASELINE-linear' and r['n_kv'] == 1)]
+    audit = _matrix_design_audit(
+        dropped, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
+    assert audit['status'] == 'incomplete'
+    assert audit['missing_groups'] == ['BASELINE-linear']
 
 
 def test_contrast_annotation_reports_effect_size_and_power_plan():

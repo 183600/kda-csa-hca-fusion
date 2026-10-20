@@ -2203,9 +2203,8 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
     expected_groups = [spec[0] for spec in groups]
     expected_by_route = {}
     for spec in groups:
-        if spec[1] in SIMPLE_BASELINE_KINDS:
-            continue
         expected_by_route.setdefault(spec[1], set()).add(spec[0])
+    baseline_routes = set(SIMPLE_BASELINE_KINDS)
 
     ok_rows = [r for r in all_results
                if 'error' not in r and r.get('mean_acc') is not None]
@@ -2225,9 +2224,16 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
             for gid in missing:
                 if gid not in missing_groups:
                     missing_groups.append(gid)
+            # Simple baselines are appended to the matrix for the tuned
+            # reference comparison but are not factorial units; still,
+            # their promised cells must be present (and counted in
+            # n_expected_cells), so audit presence without demanding a
+            # preset unit.
+            is_baseline = memory in baseline_routes
             units_present = {_unit_of_group(g) for g in present}
-            required_units = _FACTORIAL_UNITS.get(preset)
-            units_complete = (required_units is None
+            required_units = (None if is_baseline
+                              else _FACTORIAL_UNITS.get(preset))
+            units_complete = (is_baseline or required_units is None
                               or units_present == set(required_units))
             if not units_complete:
                 factorial_incomplete.append(
