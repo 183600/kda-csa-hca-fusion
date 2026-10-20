@@ -1946,9 +1946,6 @@ def _tuned_baseline_contrast_report(
         gid = r.get('group')
         if gid == reference_group or r.get('memory') in SIMPLE_BASELINE_KINDS:
             continue
-        layout_tokens = set(str(r.get('layout') or '').split('-'))
-        if not ({'CSA', 'HCA'} & layout_tokens):
-            continue
         ref = references.get(r.get('n_kv'))
         if ref is None:
             continue
