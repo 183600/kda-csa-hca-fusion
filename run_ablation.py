@@ -2142,6 +2142,209 @@ def _matrix_contrast_report(all_results: list) -> list:
     return contrasts
 
 
+_FACTORIAL_UNITS = {
+    'main8': ('A', 'B', 'C', 'D'),
+    'csa_csa': ('A', 'D', 'E'),
+}
+
+
+def _unit_of_group(group_id: str) -> str:
+    return str(group_id).rsplit('-', 1)[-1]
+
+
+def _row_design_field(row: dict, field: str):
+    """Read a recipe field from the aggregate row or its per-seed rows."""
+    value = row.get(field)
+    if value is None:
+        for seed_row in row.get('per_seed') or []:
+            value = seed_row.get(field)
+            if value is not None:
+                break
+    return value
+
+
+def _finite_seed_set(row: dict) -> set:
+    seeds = set()
+    for seed_row in row.get('per_seed') or []:
+        if ('error' in seed_row or seed_row.get('final_acc') is None):
+            continue
+        try:
+            acc = float(seed_row['final_acc'])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(acc):
+            seeds.add(seed_row.get('seed'))
+    return seeds
+
+
+def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
+                         n_kv_list, n_seeds: int,
+                         requested_seeds=None) -> dict:
+    """Machine-readable audit of the matrix as a controlled experiment.
+
+    Verifies three things that the contrast arithmetic cannot see:
+
+    1. every preset group is present for every n_kv (no survivor-only
+       matrix, no silently missing factorial cell);
+    2. every non-baseline group was trained with the same recipe fields
+       (steps, batch, lr, depth, width), apart from the intentionally
+       tuned simple-baseline rungs; and
+    3. every contrasted cell shares the same requested seed set, so the
+       paired differences are genuinely paired.
+    """
+    if requested_seeds is None:
+        requested_seeds = [42 + i for i in range(int(n_seeds))]
+    requested = set(requested_seeds)
+    recipe_fields = ('steps', 'train_batch', 'lr', 'n_layers', 'd_model')
+
+    expected_groups = [spec[0] for spec in groups]
+    expected_by_route = {}
+    for spec in groups:
+        if spec[1] in SIMPLE_BASELINE_KINDS:
+            continue
+        expected_by_route.setdefault(spec[1], set()).add(spec[0])
+
+    ok_rows = [r for r in all_results
+               if 'error' not in r and r.get('mean_acc') is not None]
+    by_key = {(r.get('n_kv'), r.get('memory'), r.get('group')): r
+              for r in ok_rows}
+
+    cells = []
+    missing_groups = []
+    factorial_incomplete = []
+    seed_mismatch_cells = []
+    for n_kv in n_kv_list:
+        for memory in sorted(expected_by_route):
+            expected = expected_by_route[memory]
+            present = {gid for gid in expected
+                       if (n_kv, memory, gid) in by_key}
+            missing = sorted(expected - present)
+            for gid in missing:
+                if gid not in missing_groups:
+                    missing_groups.append(gid)
+            units_present = {_unit_of_group(g) for g in present}
+            required_units = _FACTORIAL_UNITS.get(preset)
+            units_complete = (required_units is None
+                              or units_present == set(required_units))
+            if not units_complete:
+                factorial_incomplete.append(
+                    {'n_kv': n_kv, 'memory': memory,
+                     'missing_units': sorted(
+                         set(required_units) - units_present)})
+            seed_sets = {gid: _finite_seed_set(by_key[(n_kv, memory, gid)])
+                         for gid in present}
+            common = (set.intersection(*seed_sets.values())
+                      if seed_sets else set())
+            seed_aligned = bool(seed_sets) and all(
+                seeds == requested for seeds in seed_sets.values())
+            if not seed_aligned:
+                seed_mismatch_cells.append(
+                    {'n_kv': n_kv, 'memory': memory,
+                     'requested_seeds': sorted(requested),
+                     'per_group_seeds': {
+                         gid: sorted(s for s in seeds if s is not None)
+                         for gid, seeds in sorted(seed_sets.items())}})
+            cells.append({
+                'n_kv': n_kv,
+                'memory': memory,
+                'present_groups': sorted(present),
+                'missing_groups': missing,
+                'factorial_complete': units_complete,
+                'required_units': (list(required_units)
+                                   if required_units else None),
+                'n_common_seeds': len(common),
+                'common_seeds': sorted(s for s in common if s is not None),
+                'seed_alignment_ok': seed_aligned,
+            })
+
+    hybrid_rows = [r for r in ok_rows
+                   if r.get('memory') not in SIMPLE_BASELINE_KINDS]
+    baseline_rows = [r for r in ok_rows
+                     if r.get('memory') in SIMPLE_BASELINE_KINDS]
+
+    def values_for(rows, field):
+        vals = []
+        for row in rows:
+            value = _row_design_field(row, field)
+            if value is None:
+                continue
+            if field in ('steps', 'train_batch', 'n_layers', 'd_model'):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    pass
+            elif field == 'lr':
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    pass
+            vals.append(value)
+        return sorted(set(vals), key=repr)
+
+    hybrid_values = {f: values_for(hybrid_rows, f) for f in recipe_fields}
+    hybrid_parity = {f: len(hybrid_values[f]) <= 1 for f in recipe_fields}
+    baseline_values = {f: values_for(baseline_rows, f) for f in recipe_fields}
+    baseline_parity = {f: len(baseline_values[f]) <= 1
+                       for f in recipe_fields}
+
+    violations = []
+    if missing_groups:
+        violations.append(f'missing_groups:{missing_groups}')
+    if factorial_incomplete:
+        violations.append(
+            f'factorial_incomplete:{factorial_incomplete}')
+    mismatched = [f for f in ('steps', 'train_batch', 'lr',
+                              'n_layers', 'd_model')
+                  if not hybrid_parity[f]]
+    if mismatched:
+        violations.append(f'hybrid_recipe_mismatch:{mismatched}')
+    if seed_mismatch_cells:
+        violations.append(
+            f'seed_mismatch:{len(seed_mismatch_cells)}_cells')
+
+    if not ok_rows:
+        status = 'not_computable'
+    elif missing_groups:
+        status = 'incomplete'
+    elif factorial_incomplete:
+        status = 'incomplete_factorial'
+    elif mismatched:
+        status = 'recipe_mismatch'
+    elif seed_mismatch_cells:
+        status = 'seed_mismatch'
+    else:
+        status = ('complete_factorial' if preset == 'main8'
+                  else 'complete_preset')
+
+    return {
+        'status': status,
+        'preset': preset,
+        'required_units': (list(_FACTORIAL_UNITS[preset])
+                           if preset in _FACTORIAL_UNITS else None),
+        'expected_groups': list(expected_groups),
+        'n_expected_cells': len(expected_groups) * len(n_kv_list),
+        'n_present_cells': sum(len(c['present_groups']) for c in cells),
+        'cells': cells,
+        'missing_groups': missing_groups,
+        'factorial_incomplete_cells': factorial_incomplete,
+        'controls': {
+            'recipe_fields': list(recipe_fields),
+            'hybrid_values': hybrid_values,
+            'hybrid_parity': hybrid_parity,
+            'baseline_values': baseline_values,
+            'baseline_parity': baseline_parity,
+            'requested_seeds': sorted(requested),
+            'seed_alignment_ok': not seed_mismatch_cells,
+            'seed_mismatch_cells': seed_mismatch_cells,
+            'note': ('Baseline lrs are tuned independently on a held-out '
+                     'validation tail; every non-baseline group must share '
+                     'the same steps/batch/lr/depth/width. A non-complete '
+                     'status means the design claims are not verified.'),
+        },
+        'violations': violations,
+    }
+
+
 def _annotate_contrast_significance(contrasts: list,
                                     alpha: float = 0.05,
                                     hypotheses: dict | None = None,
@@ -3250,6 +3453,22 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         _log_tuned_baseline_table([], baseline_tests)
     _attach_tuned_baseline_flags(all_results, baseline_contrasts)
 
+    # Independent design audit: a complete factorial is only meaningful if
+    # every promised group ran, every non-baseline group used the same
+    # training recipe, and every contrasted cell shares the requested seed
+    # set. This catches a survivor-only matrix or a drifted run that the
+    # contrast arithmetic itself cannot see.
+    design_audit = _matrix_design_audit(
+        all_results, groups, preset=preset, n_kv_list=n_kv_list,
+        n_seeds=n_seeds)
+    logger.info(f'Design audit: {design_audit["status"]} '
+                f'({len(design_audit["missing_groups"])} missing groups, '
+                f'{len(design_audit["violations"])} violations)')
+    if design_audit['status'] not in ('complete_factorial',
+                                      'complete_preset'):
+        logger.warning(f'Matrix design is NOT verified: '
+                       f'{design_audit["violations"]}')
+
     # Regime of the matrix as a whole (same vocabulary as the ratio sweep):
     # are the rows saturated / underfitting / overfitting, and do the seeds
     # agree on the verdict? Without this, a final-number-only table cannot
@@ -3294,6 +3513,9 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         # The preset's promised group ids; the row contract refuses to
         # write a survivor-only matrix (a crash mid-sweep) as if complete.
         'expected_groups': [spec[0] for spec in groups],
+        # Machine-readable check that the promised cells actually ran with
+        # a common recipe and a common seed set (see _matrix_design_audit).
+        'design_audit': design_audit,
         # Pre-registered design intent (fixed before the numbers were
         # read): what each layout group is for, and the prediction +
         # falsification criterion for every paired contrast family. The

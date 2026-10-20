@@ -51,6 +51,7 @@ from run_ablation import (  # noqa: E402
     _attach_tuned_baseline_flags,
     _contrast_consistency_violations,
     _matrix_contrast_report,
+    _matrix_design_audit,
     _tuned_baseline_contrast_report,
     build_experiment_matrix,
 )
@@ -379,6 +380,54 @@ def test_matrix_contrast_report_seed_matched_arithmetic():
         _matrix_row('KDA-B', 'kda', (0.5, 0.8), seeds=[100, 101]),
     ]
     assert _matrix_contrast_report(disjoint) == []
+
+
+def _controlled_matrix_rows():
+    groups = build_experiment_matrix('main8', 10, ('kda',))
+    rows = []
+    for spec in groups:
+        for n_kv in (1, 2):
+            row = _matrix_row(spec[0], 'kda', (0.2, 0.4), n_kv=n_kv)
+            row.update({'steps': 100, 'train_batch': 16, 'lr': 3e-3,
+                        'd_model': 32})
+            rows.append(row)
+    return groups, rows
+
+
+def test_matrix_design_audit_verifies_factorial_recipe_and_seed_parity():
+    groups, rows = _controlled_matrix_rows()
+    audit = _matrix_design_audit(
+        rows, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
+    assert audit['status'] == 'complete_factorial'
+    assert audit['n_expected_cells'] == audit['n_present_cells'] == 8
+    assert audit['missing_groups'] == []
+    assert audit['violations'] == []
+    assert audit['controls']['hybrid_parity']['steps'] is True
+    assert audit['controls']['hybrid_parity']['train_batch'] is True
+    assert audit['controls']['hybrid_parity']['lr'] is True
+    assert audit['controls']['seed_alignment_ok'] is True
+    assert all(c['factorial_complete'] for c in audit['cells'])
+    assert all(c['n_common_seeds'] == 2 for c in audit['cells'])
+
+    drifted = [dict(r) for r in rows]
+    drifted[0]['lr'] = 1e-2
+    audit = _matrix_design_audit(
+        drifted, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
+    assert audit['status'] == 'recipe_mismatch'
+    assert any('hybrid_recipe_mismatch' in v for v in audit['violations'])
+
+    unpaired = [dict(r) for r in rows]
+    unpaired[1]['per_seed'] = unpaired[1]['per_seed'][:1]
+    audit = _matrix_design_audit(
+        unpaired, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
+    assert audit['status'] == 'seed_mismatch'
+    assert audit['controls']['seed_mismatch_cells']
+
+    survivor_only = rows[1:]
+    audit = _matrix_design_audit(
+        survivor_only, groups, preset='main8', n_kv_list=[1, 2], n_seeds=2)
+    assert audit['status'] == 'incomplete'
+    assert audit['missing_groups'] == ['KDA-A']
 
 
 def test_contrast_tost_separates_equivalent_from_different():
