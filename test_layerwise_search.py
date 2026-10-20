@@ -427,6 +427,40 @@ def test_greedy_search_requires_seed_reproducibility():
     assert result['best_vs_start']['significant'] is False
 
 
+def test_selection_correction_penalizes_winner_curse():
+    """The argmax of many candidates is not a pre-registered comparison."""
+    target_layout = ('csa', 'kda', 'kda', 'csa', 'hca')
+
+    def evaluate(cand):
+        per_seed = ([0.05, 0.10, 0.15]
+                    if tuple(cand.layout) == target_layout
+                    else [0.0, 0.0, 0.0])
+        return {'score': sum(per_seed) / len(per_seed),
+                'metrics': {'seeds': [42, 43, 44],
+                            'per_seed_accuracy': per_seed}}
+
+    problem = SearchProblem(
+        evaluate=evaluate,
+        cost=lambda cand: {'state_bytes_allocated': 100,
+                           'decode_marginal_read_elements': 1.0})
+    uncorrected = greedy_search(problem, START, max_rounds=1)
+    corrected = greedy_search(problem, START, max_rounds=1,
+                              selection_correction=True)
+    assert uncorrected['rounds'][0]['accepted'] is True
+    round0 = corrected['rounds'][0]
+    assert round0['improvement'] is True
+    assert round0['selection_family_size'] > 1
+    assert round0['alpha_used'] == pytest.approx(
+        0.05 / round0['selection_family_size'])
+    assert round0['paired']['alpha_used'] == pytest.approx(
+        round0['alpha_used'])
+    assert round0['accepted'] is False
+    assert corrected['best']['label'] == START.label
+    assert corrected['acceptance_policy']['selection_correction'] is True
+    assert corrected['best_vs_start']['selection_correction'] is True
+    json.dumps(corrected, allow_nan=False)
+
+
 def test_plateau_does_not_promote_unsupported_cheaper_gain():
     """A cheaper neighbour with an unsupported score bump is not a tie."""
     target_layout = ('csa', 'kda', 'kda', 'csa', 'hca')

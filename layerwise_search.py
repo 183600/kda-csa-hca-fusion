@@ -576,6 +576,7 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
                   min_delta: float = 0.0,
                   require_supported: bool = True,
                   alpha: float = 0.05,
+                  selection_correction: bool = False,
                   logger: logging.Logger | None = None) -> dict:
     """Greedy best-improvement layerwise search.
 
@@ -595,6 +596,18 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     ``improvement_supported=False``) but NOT accepted. Problems whose
     metrics lack per-seed accuracies (injected synthetic landscapes) fall
     back to the raw rule, as does a bootstrap move from ``score=None``.
+
+    ``selection_correction`` (default False, exposed as
+    ``--selection-correction``) applies a Bonferroni correction over the
+    whole set of feasible neighbors that could have been selected in that
+    round. Testing only the argmax candidate at the uncorrected alpha is
+    a winner's-curse error: the selected candidate is the best of many
+    correlated comparisons, so its p-value is not valid as if it were
+    pre-registered. With the flag on, the acceptance test uses
+    ``alpha / n_selectable`` and the round record carries both alphas;
+    ``best_vs_start`` is similarly corrected over all evaluated feasible
+    candidates. The correction is off by default because the search is
+    documented as exploratory and at 3 seeds it is extremely conservative.
 
     The reported ``best`` closes the quality plateau: among the feasible
     candidates whose score is no higher than the greedy endpoint's and no
@@ -657,11 +670,23 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
                     or best_rec['score'] > current_score + float(min_delta))
         paired = None
         supported = None
+        family_size = len(selectable)
+        alpha_move = (float(alpha) / family_size
+                      if (selection_correction and family_size)
+                      else float(alpha))
         if improved and current_score is not None and require_supported:
             pair = _paired_seed_diffs(best_rec, current_record)
             if pair is not None:
-                pair_stats, supported = _paired_support(pair[1], alpha=alpha)
-                paired = {'seeds': [int(s) for s in pair[0]], **pair_stats}
+                pair_stats, supported = _paired_support(
+                    pair[1], alpha=alpha_move)
+                paired = {
+                    'seeds': [int(s) for s in pair[0]],
+                    'selection_correction': bool(selection_correction),
+                    'selection_family_size': family_size,
+                    'alpha_uncorrected': float(alpha),
+                    'alpha_used': alpha_move,
+                    **pair_stats,
+                }
         accepted = bool(improved and supported is not False)
         if not improved:
             reason = 'no strict improvement over current'
@@ -670,7 +695,11 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
                       else 'improved (seed-paired supported)')
         else:
             reason = (f'mean score improved but not reproducible across '
-                      f'seeds (paired one-sided t, alpha={float(alpha):g})')
+                      f'seeds (paired one-sided t, '
+                      f'alpha={alpha_move:g}'
+                      + (f' = {float(alpha):g}/{family_size} selection-'
+                         f'corrected' if selection_correction else '')
+                      + ')')
         rounds.append({
             'round': round_index,
             'from': current.label,
@@ -682,6 +711,10 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
                 'decode_marginal_read_elements'],
             'improvement': bool(improved),
             'improvement_supported': supported,
+            'selection_correction': bool(selection_correction),
+            'selection_family_size': family_size,
+            'alpha_uncorrected': float(alpha),
+            'alpha_used': alpha_move,
             'paired': paired,
             'accepted': accepted,
             'reason': reason,
@@ -732,11 +765,19 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     best_vs_start = None
     pair = _paired_seed_diffs(best, get(start))
     if pair is not None:
-        pair_stats, supported = _paired_support(pair[1], alpha=alpha)
+        final_family_size = max(1, sum(
+            1 for r in records.values()
+            if r['feasible'] and r['score'] is not None))
+        alpha_final = (float(alpha) / final_family_size
+                       if selection_correction else float(alpha))
+        pair_stats, supported = _paired_support(pair[1], alpha=alpha_final)
         best_vs_start = {
             'test': ('seed-paired one-sided t on per-seed accuracy '
                      '(best - start); H1: best > start'),
-            'alpha': float(alpha),
+            'alpha': alpha_final,
+            'alpha_uncorrected': float(alpha),
+            'selection_correction': bool(selection_correction),
+            'selection_family_size': final_family_size,
             'seeds': [int(s) for s in pair[0]],
             'significant': bool(supported),
             **pair_stats,
@@ -754,6 +795,15 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
             'min_delta': float(min_delta),
             'require_supported': bool(require_supported),
             'alpha': float(alpha),
+            'selection_correction': bool(selection_correction),
+            'selection_correction_method': (
+                'bonferroni over all feasible scored contenders in the '
+                'round (and over all evaluated candidates for '
+                'best_vs_start)'
+                if selection_correction else
+                'none: the selected argmax is tested at the uncorrected '
+                'alpha, so its p-value is selection-biased and the search '
+                'must be treated as exploratory'),
             'seed_support_rule': (
                 'seed-paired one-sided t on per-candidate common-seed '
                 'accuracies; zero-variance unanimous sweeps need '
@@ -982,6 +1032,10 @@ def main(argv=None) -> int:
                         help='minimum score improvement to accept a move')
     parser.add_argument('--no-swaps', action='store_true',
                         help='disable adjacent-swap (ordering) moves')
+    parser.add_argument('--selection-correction', action='store_true',
+                        help='Bonferroni-correct the paired acceptance test '
+                             'over all feasible contenders in each round '
+                             '(default: off, exploratory)')
     parser.add_argument('--device', default=None)
     parser.add_argument('--quick', action='store_true',
                         help='small search: depth 3, 60 steps, 1 round')
@@ -1054,6 +1108,7 @@ def main(argv=None) -> int:
     result = greedy_search(
         problem, start, max_rounds=args.max_rounds, topk_grid=topk_grid,
         include_swaps=not args.no_swaps, min_delta=args.min_delta,
+        selection_correction=args.selection_correction,
         logger=logger)
 
     report = {
@@ -1082,6 +1137,10 @@ def main(argv=None) -> int:
                                         '(ddof=1), standard error and 95% '
                                         't-CI of MQAR accuracy; per-seed '
                                         'accuracies retained'),
+                'selection_correction': (
+                    'bonferroni over feasible contenders'
+                    if args.selection_correction else
+                    'none (uncorrected argmax test; exploratory)'),
                 'warning': (
                     f'only {len(seeds)} probe seed(s): the seed-paired '
                     f'acceptance test is undefined and candidate '
@@ -1095,6 +1154,7 @@ def main(argv=None) -> int:
             'include_swaps': not args.no_swaps,
             'max_rounds': int(args.max_rounds),
             'min_delta': float(args.min_delta),
+            'selection_correction': bool(args.selection_correction),
             'budget_T': int(args.budget_T),
             'dtype_bytes': 4,
             'reference_state_bytes': int(reference_bytes),
