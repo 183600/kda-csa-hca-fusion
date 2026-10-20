@@ -40,6 +40,19 @@ tolerance) to the corresponding rows of ``naive_csa`` / ``naive_hca``
 called once on the full ``[B, T, d]`` sequence** — including when the
 CSA indexer's scores tie (see "Deterministic tie-breaking" below).
 
+Mixed-precision contract
+------------------------
+Both read paths pick their compute dtype with ONE rule
+(:func:`_attention_compute_dtype`): the widest floating dtype among the
+cache storage and the query-side tensors (``q``, ``q_idx``, ``w_idx``,
+``sink_logits``), floored at fp32.  A float64 cache with an fp32 query
+therefore computes in fp64 instead of silently quantizing the cache
+through fp32, and an fp64 query against an fp32 cache is not downcast.
+``forward_step`` and ``forward_chunk`` share the rule, so token-by-token
+decode and a continuation chunk agree on both values and output dtype.
+SW keys remain prepared in the cache's own compute dtype, exactly like
+``append_step``, so the query precision can never change stored state.
+
 The bit-equivalence holds because:
 
   * The compressed block cache stores EXACTLY the ``C_comp`` tensor that
@@ -110,6 +123,34 @@ def _validate_cache_dtype(dtype) -> None:
         raise TypeError(f'cache dtype must be a floating torch.dtype, got {dtype!r}') from exc
     if not is_float:
         raise TypeError(f'cache dtype must be floating-point, got {dtype!r}')
+
+
+def _attention_compute_dtype(cache_dtype: torch.dtype,
+                            *tensors: torch.Tensor | None) -> torch.dtype:
+    """Compute dtype for an attention read of the cache.
+
+    The cache's storage dtype sets the numeric floor (a float64 cache must
+    never be quantized through fp32 just because its query is fp32), and
+    every floating query-side tensor raises the result to its own
+    precision.  The rule is shared by ``forward_step`` and
+    ``forward_chunk`` so a per-token decode and a continuation chunk use
+    the SAME precision for mixed-dtype inputs; ``None`` entries (e.g. a
+    disabled sink) are ignored.
+
+    Non-floating query-side tensors are rejected here instead of failing
+    later inside an einsum or RoPE kernel.
+    """
+    dtype = torch.float64 if cache_dtype == torch.float64 else torch.float
+    for t in tensors:
+        if t is None:
+            continue
+        if not t.is_floating_point():
+            raise TypeError(
+                f'attention inputs must be floating-point, got dtype '
+                f'{t.dtype}')
+        if t.dtype == torch.float64:
+            dtype = torch.float64
+    return dtype
 
 
 def _geometric_capacity(n_rows: int) -> int:
@@ -1467,10 +1508,9 @@ class CSADecodingCache:
                 f"CSADecodingCache.forward_step: q.device={q.device} does "
                 f"not match cache's device={self.device}. Call "
                 f"cache.to(device=q.device) or move q to the cache's device.")
-        device, dtype = q.device, q.dtype
-        compute_dtype = (
-            torch.float64 if dtype == torch.float64 else torch.float
-        )
+        device = q.device
+        compute_dtype = _attention_compute_dtype(
+            self.dtype, q, q_idx, w_idx, sink_logits)
         # The current query is at absolute position t = n_tokens_seen - 1
         # (we just appended it in ``append_step``). Its causal block
         # mask is ``b < t // m`` (paper Eq. 16): a query attends only to
@@ -1870,7 +1910,9 @@ class CSADecodingCache:
                 normalize_qk: same semantics as :meth:`forward_step`.
 
         Returns:
-            ``[B, T_new, nh, c]`` attention output in ``compute_dtype``.
+            ``[B, T_new, nh, c]`` attention output in the shared
+            mixed-precision compute dtype (fp64 iff the cache or any
+            query-side tensor is fp64, else fp32).
         """
         B, T_new, c = Ca_new.shape
         if T_new < 1:
@@ -1922,7 +1964,14 @@ class CSADecodingCache:
         K_idx_new = _to_cache(K_idx_new, self.dtype, self.device)
         Z_idx_new = _to_cache(Z_idx_new, self.dtype, self.device)
         n0 = self._n_tokens_seen
-        compute_dtype = (
+        # The attention is computed at the widest precision among the
+        # cache and the query-side tensors (shared rule with
+        # ``forward_step``). SW keys, however, are prepared exactly as
+        # ``append_step`` prepares them -- in the cache's own compute
+        # dtype -- so a wider query can never change the stored keys.
+        compute_dtype = _attention_compute_dtype(
+            self.dtype, q, q_idx, w_idx, sink_logits)
+        key_compute_dtype = (
             torch.float64 if self.dtype == torch.float64 else torch.float)
         # Snapshot the pre-chunk SW tail BEFORE ``append_step`` overwrites
         # the ring (clone: the ring is mutated in place).
@@ -1934,9 +1983,9 @@ class CSADecodingCache:
         ca_store_store = None
         if self._sw is not None:
             if self._normalize_qk:
-                ca_src = _to_dtype(Ca_new, compute_dtype)
+                ca_src = _to_dtype(Ca_new, key_compute_dtype)
                 if (not torch.is_grad_enabled()
-                        and self.dtype != compute_dtype):
+                        and self.dtype != key_compute_dtype):
                     ca_store = _qk_normalize_(ca_src, self.qk_norm_mode)
                 else:
                     ca_store = _qk_normalize(ca_src, self.qk_norm_mode)
@@ -1946,7 +1995,7 @@ class CSADecodingCache:
                 pos = torch.arange(
                     n0, n0 + T_new, device=self.device)
                 ca_store = partial_rope(
-                    _to_dtype(ca_store, compute_dtype), pos,
+                    _to_dtype(ca_store, key_compute_dtype), pos,
                     self.rope_dim_eff, self.rope_base, dim=1)
             ca_store_store = _to_dtype(ca_store, self.dtype)
         # Advance the cache exactly as the per-token loop would.
@@ -2591,10 +2640,9 @@ class HCADecodingCache:
                 f"HCADecodingCache.forward_step: q.device={q.device} does "
                 f"not match cache's device={self.device}. Call "
                 f"cache.to(device=q.device) or move q to the cache's device.")
-        device, dtype = q.device, q.dtype
-        compute_dtype = (
-            torch.float64 if dtype == torch.float64 else torch.float
-        )
+        device = q.device
+        compute_dtype = _attention_compute_dtype(
+            self.dtype, q, sink_logits)
         # Core-attention scale: compute ONCE here so it is available to
         # BOTH the dense branch (below) and the sliding-window branch
         # (further down). Auto-selection mirrors ``naive_hca``: cosine
@@ -2822,7 +2870,12 @@ class HCADecodingCache:
         C_new = _to_cache(C_new, self.dtype, self.device)
         Z_new = _to_cache(Z_new, self.dtype, self.device)
         n0 = self._n_tokens_seen
-        compute_dtype = (
+        # Attention precision follows the widest cache/query operand;
+        # SW keys are prepared in the cache's own compute dtype so they
+        # match ``append_step`` regardless of the caller's query dtype.
+        compute_dtype = _attention_compute_dtype(
+            self.dtype, q, sink_logits)
+        key_compute_dtype = (
             torch.float64 if self.dtype == torch.float64 else torch.float)
         pre_sw = None
         if self._sw is not None and self._sw.n_valid:
@@ -2830,9 +2883,9 @@ class HCADecodingCache:
         c_store_store = None
         if self._sw is not None:
             if self._normalize_qk:
-                c_src = _to_dtype(C_new, compute_dtype)
+                c_src = _to_dtype(C_new, key_compute_dtype)
                 if (not torch.is_grad_enabled()
-                        and self.dtype != compute_dtype):
+                        and self.dtype != key_compute_dtype):
                     c_store = _qk_normalize_(c_src, self.qk_norm_mode)
                 else:
                     c_store = _qk_normalize(c_src, self.qk_norm_mode)
@@ -2842,7 +2895,7 @@ class HCADecodingCache:
                 pos = torch.arange(
                     n0, n0 + T_new, device=self.device)
                 c_store = partial_rope(
-                    _to_dtype(c_store, compute_dtype), pos,
+                    _to_dtype(c_store, key_compute_dtype), pos,
                     self.rope_dim_eff, self.rope_base, dim=1)
             c_store_store = _to_dtype(c_store, self.dtype)
         self.append_step(C_new, Z_new, B_pos)

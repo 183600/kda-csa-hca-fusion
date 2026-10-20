@@ -12,7 +12,10 @@ chunks. They must be *exactly* the per-token ``append_step`` +
 * L2 and paper §2.3.3 RMS normalization;
 * partial RoPE on/off and the inverse-rotation output path;
 * sinks, explicit scales, and batch > 1;
-* float64 caches (the fp32 fast paths must not quantize them).
+* float64 caches (the fp32 fast paths must not quantize them);
+* mixed cache/query dtypes (fp64 cache + fp32 query and vice versa),
+  where both paths must promote to fp64 instead of disagreeing on the
+  compute precision.
 
 Run via pytest::
 
@@ -213,6 +216,28 @@ def test_forward_chunk_fp64_is_exact_to_roundoff():
     out, _ = _hca_chunk_output(dh)
     assert out.dtype == torch.float64
     assert (out - ref).abs().max().item() < 1e-12
+
+
+@pytest.mark.parametrize('which', ['csa', 'hca'])
+@pytest.mark.parametrize('cache_dtype,q_dtype', [
+    (torch.float64, torch.float32),
+    (torch.float32, torch.float64),
+])
+def test_forward_chunk_mixed_dtype_matches_step(which, cache_dtype, q_dtype):
+    # The cache and the query disagree on precision: the shared policy
+    # must promote to fp64 in BOTH the token loop and the chunked path,
+    # so values and output dtype stay identical.
+    make, token, chunk = (
+        (_make_csa, _csa_token_outputs, _csa_chunk_output) if which == 'csa'
+        else (_make_hca, _hca_token_outputs, _hca_chunk_output))
+    d = make(n0=5, T=7, win=4, rope=4, qk='rms', sink=True,
+             dtype=cache_dtype)
+    d['q'] = d['q'].to(q_dtype)
+    ref, _ = token(d)
+    out, _ = chunk(d)
+    assert ref.dtype == torch.float64
+    assert out.dtype == torch.float64
+    assert (out - ref).abs().max().item() < 1e-10
 
 
 def test_forward_chunk_no_keys_returns_zeros():

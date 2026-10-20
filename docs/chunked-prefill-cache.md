@@ -76,6 +76,21 @@ The only observable difference is batched-GEMM reduction order: fp32
 outputs agree with the token loop to ~`1e-7` (`~1e-16` in fp64), which is
 far below the `1e-5` mixed-tolerance contract.
 
+### Mixed-precision inputs
+
+`forward_step` and `forward_chunk` now share one compute-dtype rule: the
+widest floating dtype among the cache storage and the query-side tensors
+(`q`, `q_idx`, `w_idx`, `sink_logits`), floored at fp32. An fp64 cache
+with an fp32 query therefore computes in fp64 (it used to produce fp32
+token outputs but fp64 chunk outputs), and an fp64 query against an fp32
+cache is not downcast. Sliding-window keys are still prepared in the
+cache's own compute dtype, exactly like `append_step`, so query precision
+never changes stored state.
+
+`prefill_profile.drift_metrics` reports `dtype_match` separately and the
+profiler fails any schedule whose output dtype differs from the one-shot
+reference, so a precision change cannot hide behind a tiny numeric drift.
+
 ## Measuring it
 
 `prefill_profile.py` profiles a decoder wrapper over a prompt and a set of
