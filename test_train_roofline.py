@@ -326,6 +326,30 @@ def test_runner_report_json_safe():
     json.dumps(sanitize_for_json(env), allow_nan=False)
 
 
+def test_main_writes_run_manifest(tmp_path, monkeypatch):
+    """The CLI ledger records seeds, recipe, artifact and probe status."""
+    import run_train_roofline as R
+
+    manifest = tmp_path / 'manifest.jsonl'
+    result_json = tmp_path / 'roofline.json'
+    monkeypatch.setenv('RUN_MANIFEST_PATH', str(manifest))
+    rc = R.main([
+        '--T', '8', '--batch', '1', '--timing-reps', '1',
+        '--quality-seeds', '0,1', '--skip-quality',
+        '--json', str(result_json),
+    ])
+    assert rc == 0
+    assert result_json.exists()
+    lines = manifest.read_text(encoding='utf-8').splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry['experiment'] == R.KIND
+    assert entry['seeds'] == [0, 1]
+    assert entry['results']['quality_status'] == 'skipped'
+    assert entry['artifacts']['results'] == str(result_json)
+    assert entry['status'] == 'completed'
+
+
 def test_runner_rejects_bad_geometry():
     from run_train_roofline import build_report
     with pytest.raises(ValueError):

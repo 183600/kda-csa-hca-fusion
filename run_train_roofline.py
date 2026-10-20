@@ -48,8 +48,11 @@ import grad_checkpointing as gc  # noqa: E402
 import mqa_attention as mqa  # noqa: E402
 import results_schema  # noqa: E402
 import roofline  # noqa: E402
-from kaggle_setup import (capture_provenance, configure_torch_for_device,  # noqa: E402
-                          sanitize_for_json, write_results_json)
+from kaggle_setup import (append_run_manifest,  # noqa: E402
+                          capture_provenance,
+                          configure_torch_for_device,
+                          make_run_manifest_entry, sanitize_for_json,
+                          set_global_seed, write_results_json)
 from multi_seed_stats import summarize_paired  # noqa: E402
 from ops_fused import HybridAttentionStack  # noqa: E402
 from run_decode_bandwidth import build_base_cfg  # noqa: E402
@@ -383,7 +386,10 @@ def _train_variant(name: str, n_kv_heads: int, *, seed: int, device,
     KV-head count, not the budget.
     """
     from run_quality import MQARHead, ResidualAttnLayer, make_multi_agg_batch
-    torch.manual_seed(seed)
+    # Seed Python/NumPy/Torch/CUDA and request deterministic kernels. This
+    # probe is not used for the timing rows, so the deterministic path does
+    # not bias the roofline measurement.
+    set_global_seed(seed, deterministic=True)
     embed = torch.nn.Embedding(vocab, d_model).to(device)
     attn = mqa.MQAAttn(d_model, n_heads, n_kv_heads, head_dim).to(device)
     layer = ResidualAttnLayer(attn, d_model).to(device)
@@ -728,6 +734,52 @@ def main(argv=None) -> int:
     _print_report(report)
     os.makedirs(os.path.dirname(args.json) or '.', exist_ok=True)
     write_results_json(payload, args.json, logger=logger)
+
+    # Campaign-level ledger: timing seed + quality-probe seeds, recipe,
+    # artifact and probe status in one strict-JSON line.
+    quality_seeds = parse_int_list(args.quality_seeds)
+    run_seeds = sorted(set([int(args.seed), *quality_seeds]))
+    quality = report['quality_probe']
+    append_run_manifest(make_run_manifest_entry(
+        experiment=KIND,
+        seeds=run_seeds,
+        provenance=payload['metadata']['provenance'],
+        hyperparameters={
+            'T': int(args.T),
+            'batch': int(args.batch),
+            'd_model': int(args.d_model),
+            'timing_seed': int(args.seed),
+            'policies': list(policies),
+            'itemsize': int(args.itemsize),
+            'timing_reps': int(args.timing_reps),
+            'quality_steps': int(args.quality_steps),
+            'quality_lr': float(args.quality_lr),
+            'quality_seeds': list(quality_seeds),
+            'skip_quality': bool(args.skip_quality),
+            'peak_source': peak_source,
+            'peaks': dict(peaks),
+        },
+        data={
+            'tasks': ['gradient-checkpointing parity/roofline',
+                      'dense MQA/GQA/MHA KV ladder',
+                      'multi_agg MQAR quality probe'],
+            'seq_len': int(args.T),
+            'd_model': int(args.d_model),
+            'dtype_bytes': int(args.itemsize),
+        },
+        artifacts={'results': args.json},
+        results={
+            'n_policies': len(policies),
+            'quality_status': quality.get('status'),
+            'quality_probes': len(quality.get('probes', [])),
+            'all_policy_parity_ok': bool(all(
+                r['output_max_abs_diff_vs_baseline'] < 1e-5
+                and r['grad_max_abs_diff_vs_baseline'] < 1e-5
+                for r in report['checkpoint_policies'])),
+        },
+        status='completed',
+    ), logger=logger)
+
     print(f'[exp14] wrote {args.json}')
     return 0
 
