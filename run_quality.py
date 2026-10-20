@@ -3235,23 +3235,31 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
                    and r.get('mean_acc') is not None]
     evidence = []
     contradicted_cells = []
+    missing_chance_cells = []
     for r in linear_rows:
         chance = r.get('chance_acc')
         sig = bool(r.get('significant_bonferroni'))
         above = chance is not None and r['mean_acc'] > chance
-        cell_verdict = ('contradicted' if (sig and above)
-                        else 'supported')
+        if chance is None:
+            cell_verdict = 'not_computable'
+        elif sig and above:
+            cell_verdict = 'contradicted'
+        else:
+            cell_verdict = 'supported'
         rec = {
             'cell': _cell(r),
             'mean_acc': float(r['mean_acc']),
             'chance_acc': chance,
             't_stat_vs_chance': r.get('t_stat_vs_chance'),
             'significant_bonferroni': sig,
-            'prediction_holds': not (sig and above),
+            'prediction_holds': (None if chance is None
+                                 else not (sig and above)),
         }
         evidence.append(rec)
         if cell_verdict == 'contradicted':
             contradicted_cells.append(_cell(r))
+        elif cell_verdict == 'not_computable':
+            missing_chance_cells.append(_cell(r))
         _assign(r, 'linear_chance_control', {
             'rule': ('linear must NOT be significantly above chance '
                      '(otherwise the task is solvable without token mixing)'),
@@ -3263,6 +3271,8 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
         status = 'not_computable'
     elif contradicted_cells:
         status = 'contradicted'
+    elif missing_chance_cells:
+        status = 'not_computable'
     else:
         status = 'supported'
     checks['linear_chance_control'] = {
@@ -3288,6 +3298,7 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
         kda_by_task.setdefault(r.get('task', 'mqar'), []).append(r)
     pair_evidence = []
     monotone = True
+    missing_pairs = []
     unanimous_increase = []
     for task, rows in kda_by_task.items():
         rows = sorted(rows, key=lambda x: x['n_kv'])
@@ -3315,7 +3326,11 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
                 'all_paired_seeds_decrease': all_down,
             }
             pair_evidence.append(rec)
-            if mean_diff is None or mean_diff > 1e-12:
+            if mean_diff is None:
+                monotone = False
+                missing_pairs.append(
+                    f"{task}: n_kv {lo['n_kv']}->{hi['n_kv']}")
+            elif mean_diff > 1e-12:
                 monotone = False
             if all_up:
                 unanimous_increase.append(
@@ -3324,6 +3339,11 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
         kda_status = 'not_computable'
     elif unanimous_increase:
         kda_status = 'contradicted'
+    elif missing_pairs:
+        # A missing common-seed pair means monotonicity was not evaluated
+        # for every requested step; that is missing evidence, not evidence
+        # that the prediction failed.
+        kda_status = 'not_computable'
     elif monotone:
         kda_status = 'supported'
     else:
@@ -3335,6 +3355,7 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
         'status': kda_status,
         'falsified': kda_status == 'contradicted',
         'unanimous_increases': unanimous_increase,
+        'missing_pairs': missing_pairs,
         'evidence': pair_evidence,
     }
     checks['kda_nkv_monotonicity'] = kda_verdict
@@ -3385,17 +3406,6 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
                 'falsified': False,
                 'evidence': {'cell': key,
                              'reason': 'reference_row_unavailable'},
-            }
-            _assign(r, 'beats_tuned_baseline', verdict)
-            complex_evidence.append(('not_computable', key, r.get('op')))
-            continue
-            verdict = {
-                'rule': ('complex op must beat the TUNED simple baseline '
-                         'on the seed-paired one-sided test'),
-                'status': 'not_computable',
-                'falsified': False,
-                'evidence': {'cell': key,
-                             'reason': 'missing_reference_or_paired_seeds'},
             }
             _assign(r, 'beats_tuned_baseline', verdict)
             complex_evidence.append(('not_computable', key, r.get('op')))

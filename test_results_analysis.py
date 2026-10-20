@@ -705,6 +705,40 @@ def test_hypothesis_verdicts_are_machine_readable_and_rule_based():
     json.dumps({'checks': checks, 'counts': counts}, allow_nan=False)
 
 
+def test_hypothesis_verdicts_mark_missing_evidence_not_computable():
+    """Missing chance / paired seeds are not evidence for or against."""
+    def row(op, n_kv, seed_accs, *, chance_acc=0.1, seeds=None):
+        return {
+            'op': op, 'task': 'mqar', 'n_kv': n_kv,
+            'mean_acc': sum(seed_accs) / len(seed_accs),
+            'chance_acc': chance_acc,
+            'significant_bonferroni': False,
+            't_stat_vs_chance': 0.0,
+            'per_seed': [
+                {'seed': (seeds[i] if seeds else 42 + i), 'final_acc': a}
+                for i, a in enumerate(seed_accs)],
+        }
+
+    linear = row('linear', 1, [0.3, 0.3], chance_acc=None)
+    softmax = row('softmax', 1, [0.5, 0.5])
+    # The two KDA cells share no seed, so their monotonicity pair is not
+    # computable even though both cells have a mean accuracy.
+    kda_low = row('kda', 1, [0.9, 0.9], seeds=[42, 43])
+    kda_high = row('kda', 2, [0.1, 0.1], seeds=[44, 45])
+
+    checks, _ = _hypothesis_verdicts(
+        [linear, softmax, kda_low, kda_high],
+        baseline_ops=['linear', 'softmax'], baseline_ref='softmax')
+
+    assert checks['linear_chance_control']['status'] == 'not_computable'
+    assert linear['hypothesis_checks'][
+        'linear_chance_control']['status'] == 'not_computable'
+    assert linear['hypothesis_status'] == 'not_computable'
+    assert checks['kda_nkv_monotonicity']['status'] == 'not_computable'
+    assert checks['kda_nkv_monotonicity']['missing_pairs'] == [
+        'mqar: n_kv 1->2']
+
+
 def test_tune_baseline_lr_selects_on_tail_plateau(monkeypatch):
     """P2-1: selection uses the converged tail, not one noisy final point."""
     import run_quality
