@@ -167,6 +167,12 @@ def _to_cache(x: torch.Tensor, dtype: torch.dtype, device) -> torch.Tensor:
     """
     if x.dtype == dtype and x.device == device:
         return x
+    if torch.is_inference_mode_enabled():
+        # A cache tensor created under ``torch.inference_mode`` cannot be
+        # mutated later outside inference mode. Convert in a normal scope so
+        # the retained cache stays ordinary (see ``normal_tensor_scope``).
+        with normal_tensor_scope(), torch.no_grad():
+            return x.to(dtype=dtype, device=device)
     return x.to(dtype=dtype, device=device)
 
 
@@ -424,7 +430,9 @@ class _SlidingWindowRingBuffer:
         # (left over from a previous write cycle before a reset) and
         # MUST NOT be read; ``get`` only ever returns the first
         # ``_sw_len`` entries of the causal-order view.
-        self._buf = torch.zeros(B, win, c, device=self.device, dtype=dtype)
+        with normal_tensor_scope():
+            self._buf = torch.zeros(
+                B, win, c, device=self.device, dtype=dtype)
         # Number of valid entries currently in the buffer (0..win).
         self._sw_len = 0
         # Index in ``self._buf`` of the OLDEST valid entry. Stays at 0
@@ -564,9 +572,10 @@ class _SlidingWindowRingBuffer:
                 or self._window.shape[1:] != (self.win, self.c)
                 or self._window.device != self._buf.device
                 or self._window.dtype != self._buf.dtype):
-            self._window = torch.empty(self.B, self.win, self.c,
-                                       device=self._buf.device,
-                                       dtype=self._buf.dtype)
+            with normal_tensor_scope():
+                self._window = torch.empty(
+                    self.B, self.win, self.c,
+                    device=self._buf.device, dtype=self._buf.dtype)
             self._window_version = -1
         if self._window_version != self._version:
             self._window[:, :tail_len].copy_(self._buf[:, self._sw_head:])
@@ -585,10 +594,10 @@ class _SlidingWindowRingBuffer:
         if device is not None:
             device = torch.device(device)
         if device is not None and device != self._buf.device:
-            self._buf = self._buf.to(device=device)
+            self._buf = _to_cache(self._buf, self._buf.dtype, device)
             self.device = self._buf.device
         if dtype is not None and dtype != self._buf.dtype:
-            self._buf = self._buf.to(dtype=dtype)
+            self._buf = _to_cache(self._buf, dtype, self._buf.device)
             self.dtype = self._buf.dtype
         # The mirror is lazily rebuilt on the next wrapped ``get()`` (its
         # device/dtype checks would catch a move anyway; dropping it also
@@ -771,14 +780,15 @@ class CSADecodingCache:
             return
         old_capacity = 0 if self._C_comp is None else self._C_comp.shape[1]
         new_capacity = max(_geometric_capacity(required), old_capacity * 2)
-        new_C = torch.empty(
-            self.B, new_capacity, self.c,
-            device=self.device, dtype=self.dtype,
-        )
-        new_K = torch.empty(
-            self.B, new_capacity, self.c_I,
-            device=self.device, dtype=self.dtype,
-        )
+        with normal_tensor_scope():
+            new_C = torch.empty(
+                self.B, new_capacity, self.c,
+                device=self.device, dtype=self.dtype,
+            )
+            new_K = torch.empty(
+                self.B, new_capacity, self.c_I,
+                device=self.device, dtype=self.dtype,
+            )
         if self._n_blocks:
             new_C[:, :self._n_blocks] = self._C_comp[:, :self._n_blocks]
             new_K[:, :self._n_blocks] = self._K_IComp[:, :self._n_blocks]
@@ -909,29 +919,26 @@ class CSADecodingCache:
         if dtype is not None and dtype != self.dtype:
             self.dtype = dtype
         # Move partial accumulator.
-        self._acc_Ca = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_Ca = [_to_cache(t, self.dtype, self.device)
                         for t in self._acc_Ca]
-        self._acc_Cb = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_Cb = [_to_cache(t, self.dtype, self.device)
                         for t in self._acc_Cb]
-        self._acc_Za = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_Za = [_to_cache(t, self.dtype, self.device)
                         for t in self._acc_Za]
-        self._acc_Zb = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_Zb = [_to_cache(t, self.dtype, self.device)
                         for t in self._acc_Zb]
-        self._acc_K_idx = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_K_idx = [_to_cache(t, self.dtype, self.device)
                            for t in self._acc_K_idx]
-        self._acc_Z_idx = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_Z_idx = [_to_cache(t, self.dtype, self.device)
                            for t in self._acc_Z_idx]
         if self._prev_Cb is not None:
-            self._prev_Cb = self._prev_Cb.to(
-                device=self.device, dtype=self.dtype)
+            self._prev_Cb = _to_cache(self._prev_Cb, self.dtype, self.device)
         if self._prev_Zb is not None:
-            self._prev_Zb = self._prev_Zb.to(
-                device=self.device, dtype=self.dtype)
+            self._prev_Zb = _to_cache(self._prev_Zb, self.dtype, self.device)
         if self._C_comp is not None:
-            self._C_comp = self._C_comp.to(device=self.device, dtype=self.dtype)
+            self._C_comp = _to_cache(self._C_comp, self.dtype, self.device)
         if self._K_IComp is not None:
-            self._K_IComp = self._K_IComp.to(
-                device=self.device, dtype=self.dtype)
+            self._K_IComp = _to_cache(self._K_IComp, self.dtype, self.device)
         if self._sw is not None:
             self._sw.to(device=self.device, dtype=self.dtype)
         return self
@@ -1850,10 +1857,11 @@ class HCADecodingCache:
             return
         old_capacity = 0 if self._C_comp is None else self._C_comp.shape[1]
         new_capacity = max(_geometric_capacity(required), old_capacity * 2)
-        new_C = torch.empty(
-            self.B, new_capacity, self.c,
-            device=self.device, dtype=self.dtype,
-        )
+        with normal_tensor_scope():
+            new_C = torch.empty(
+                self.B, new_capacity, self.c,
+                device=self.device, dtype=self.dtype,
+            )
         if self._n_blocks:
             new_C[:, :self._n_blocks] = self._C_comp[:, :self._n_blocks]
         self._C_comp = new_C
@@ -1947,12 +1955,12 @@ class HCADecodingCache:
             self.device = device
         if dtype is not None and dtype != self.dtype:
             self.dtype = dtype
-        self._acc_C = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_C = [_to_cache(t, self.dtype, self.device)
                        for t in self._acc_C]
-        self._acc_Z = [t.to(device=self.device, dtype=self.dtype)
+        self._acc_Z = [_to_cache(t, self.dtype, self.device)
                        for t in self._acc_Z]
         if self._C_comp is not None:
-            self._C_comp = self._C_comp.to(device=self.device, dtype=self.dtype)
+            self._C_comp = _to_cache(self._C_comp, self.dtype, self.device)
         if self._sw is not None:
             self._sw.to(device=self.device, dtype=self.dtype)
         return self

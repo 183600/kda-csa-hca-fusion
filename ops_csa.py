@@ -1311,20 +1311,38 @@ _FUSED_WEIGHT_CACHE: dict | None = None
 def _fused_projection_weight(weights: tuple) -> torch.Tensor:
     """Return a cached ``cat(weights, dim=0)`` for inference forwards."""
     global _FUSED_WEIGHT_CACHE
+    # Build ordinary tensors even when this runs under ``torch.inference_mode``
+    # (see ``ops_cache.normal_tensor_scope``): a cached inference tensor has no
+    # version counter, so it can neither be validated nor safely reused by
+    # later calls outside inference mode. ``no_grad`` is explicit because
+    # leaving inference mode restores the ambient grad mode, which may
+    # otherwise record a graph for parameters.
+    if any(w.is_inference() for w in weights):
+        # Inference tensors created inside ``torch.inference_mode()`` (e.g. a
+        # model constructed under inference mode) have no version counter.
+        # Reading ``_version`` raises, and their contents cannot be validated
+        # across calls, so skip the cache and build the identical
+        # concatenation directly.
+        with normal_tensor_scope(), torch.no_grad():
+            return torch.cat(list(weights), dim=0)
     entry = _FUSED_WEIGHT_CACHE
     if entry is not None:
-        refs, versions, combined = entry
+        refs, versions, ptrs, shapes, combined = entry
         if (len(refs) == len(weights)
                 and all(r() is w for r, w in zip(refs, weights))
                 and versions == tuple(w._version for w in weights)
-                and combined.shape[0] == sum(w.shape[0] for w in weights)
+                and ptrs == tuple(w.data_ptr() for w in weights)
+                and shapes == tuple(w.shape for w in weights)
                 and combined.dtype == weights[0].dtype
                 and combined.device == weights[0].device):
             return combined
-    combined = torch.cat(list(weights), dim=0)
+    with normal_tensor_scope(), torch.no_grad():
+        combined = torch.cat(list(weights), dim=0)
     _FUSED_WEIGHT_CACHE = (
         tuple(weakref.ref(w) for w in weights),
         tuple(w._version for w in weights),
+        tuple(w.data_ptr() for w in weights),
+        tuple(w.shape for w in weights),
         combined,
     )
     return combined
