@@ -102,6 +102,20 @@ def test_accuracy_regime_separates_saturation_from_overfitting():
     assert accuracy_regime([0.5]) is None
 
 
+def test_train_lm_accuracy_regime_reports_optimizer_step_not_index():
+    from train_lm_autodl import _accuracy_regime_for_history
+
+    history = [
+        {'step': 0, 'token_accuracy': 0.10},
+        {'step': 10, 'token_accuracy': None},
+        {'step': 20, 'token_accuracy': 0.50},
+        {'step': 30, 'token_accuracy': 0.90},
+    ]
+    regime = _accuracy_regime_for_history(history, ceiling=1.0)
+    assert regime['val_acc_peak'] == pytest.approx(0.90)
+    assert regime['val_acc_best_step'] == 30
+
+
 def test_accuracy_cost_tradeoff_screens_effect_significance_and_cost():
     base = {'mean_acc': 0.60, 'n_params': 1000, 'mean_train_time_s': 10.0,
             'mean_fwd_ms': 1.0}

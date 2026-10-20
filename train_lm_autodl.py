@@ -1757,6 +1757,24 @@ def _lm_rwkv_dims() -> dict:
     return out
 
 
+def _accuracy_regime_for_history(val_history, *, ceiling=1.0):
+    """Accuracy regime with ``val_acc_best_step`` in optimizer steps.
+
+    ``train_diagnostics.accuracy_regime`` works on bare accuracy sequences
+    and therefore reports the peak's INDEX. Records built from a
+    validation history must map that index back through the same filtered
+    points and store the actual step, as ``ValidationCurve`` does.
+    """
+    points = [h for h in val_history
+              if h.get('token_accuracy') is not None]
+    regime = accuracy_regime(
+        [h['token_accuracy'] for h in points], ceiling=ceiling)
+    if regime is not None:
+        regime['val_acc_best_step'] = int(
+            points[int(regime['val_acc_best_step'])]['step'])
+    return regime
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kaggle", action="store_true")
@@ -2771,9 +2789,7 @@ def main():
         curve_losses, [h['loss'] for h in val_history])
     # Accuracy-level regime: distinguishes a flat validation loss at the
     # task ceiling (converged) from a flat loss caused by overfitting.
-    val_accs = [h['token_accuracy'] for h in val_history
-                if h.get('token_accuracy') is not None]
-    acc_regime = accuracy_regime(val_accs, ceiling=1.0)
+    acc_regime = _accuracy_regime_for_history(val_history, ceiling=1.0)
     if acc_regime is not None:
         curve_diagnosis['accuracy_regime'] = acc_regime
     # Early-stopping accounting from the monitored curve: the model that is
