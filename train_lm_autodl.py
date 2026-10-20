@@ -91,6 +91,7 @@ from kaggle_setup import (configure_torch_for_device, set_global_seed,
 from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
                               diagnose_training_curves, lm_token_diagnostics,
                               summarize_lm_diagnostics)
+from train_diagnostics import accuracy_regime, raise_non_finite, triage_gradient
 from ppl_bootstrap import bootstrap_ppl_ci, throughput_summary
 import grad_checkpointing as grad_ckpt
 
@@ -1511,9 +1512,13 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
         out = model(input_ids, labels=labels)
         loss = out["loss"]
         if loss is None or not torch.isfinite(loss):
-            raise RuntimeError(
-                f"overfit sanity check: non-finite LM loss at step {step} "
-                f"({loss}); aborting before full training.")
+            raise_non_finite(
+                'loss', loss=(loss if loss is not None else float('nan')),
+                token_ids={'input_ids': input_ids},
+                id_range=(0, int(getattr(model.embed, 'num_embeddings',
+                                         input_ids.max().item() + 1))),
+                params=model.parameters(), logits=out.get("logits"),
+                context=f'overfit sanity check step={step} seed={seed}')
         with torch.no_grad():
             mask = labels.ne(-100)
             correct = ((out["logits"].argmax(-1) == labels) & mask).sum()
@@ -1526,7 +1531,20 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
             # branch (a model can still memorize through the layers that DO
             # receive gradients while another operator silently gets none).
             grad_flow = grad_flow_report(model.named_parameters())
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        bad_grads = triage_gradient(model.parameters())
+        clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                   grad_clip)
+        if bad_grads or not torch.isfinite(clip_norm):
+            raise_non_finite(
+                'gradient', loss=loss,
+                token_ids={'input_ids': input_ids},
+                id_range=(0, int(getattr(model.embed, 'num_embeddings',
+                                         input_ids.max().item() + 1))),
+                params=model.parameters(), logits=out.get("logits"),
+                grads={f'grad[{i}]': p.grad
+                       for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
+                context=f'overfit sanity check step={step} seed={seed}')
         opt.step()
         losses.append(float(loss.detach()))
         accs.append(acc)
@@ -2450,7 +2468,7 @@ def main():
         report = evaluate_lm_loss(
             model, val_ds, batch_size=batch_size, device=device,
             max_batches=eval_batch_cap, use_amp=use_amp,
-            autocast_dtype=autocast_dtype)
+            autocast_dtype=autocast_dtype, return_accuracy=True)
         if report['loss'] is None:
             raise RuntimeError(
                 f'validation split produced no supervised tokens at step '
@@ -2459,6 +2477,12 @@ def main():
             'step': int(step),
             'loss': report['loss'],
             'perplexity': report['perplexity'],
+            # Token accuracy comes from the SAME held-out forward pass (no
+            # extra compute): a loss that stops falling at an accuracy
+            # ceiling is saturation, which the loss curve alone would
+            # mislabel as overfitting. ``.get`` keeps legacy/monkeypatched
+            # evaluators that predate ``return_accuracy`` working.
+            'token_accuracy': report.get('token_accuracy'),
             'n_batches': report['n_batches'],
             'n_sequences': report['n_sequences'],
             'n_tokens': report['n_tokens'],
@@ -2745,7 +2769,52 @@ def main():
     # picked because of overfitting, and what to try next.
     curve_diagnosis = diagnose_training_curves(
         curve_losses, [h['loss'] for h in val_history])
+    # Accuracy-level regime: distinguishes a flat validation loss at the
+    # task ceiling (converged) from a flat loss caused by overfitting.
+    val_accs = [h['token_accuracy'] for h in val_history
+                if h.get('token_accuracy') is not None]
+    acc_regime = accuracy_regime(val_accs, ceiling=1.0)
+    if acc_regime is not None:
+        curve_diagnosis['accuracy_regime'] = acc_regime
+    # Early-stopping accounting from the monitored curve: the model that is
+    # finally evaluated is the best-validation checkpoint, so the gap
+    # between the last check and that best point quantifies what stopping
+    # at the budget endpoint would have cost.
+    if val_history:
+        best_check = min(val_history, key=lambda h: h['loss'])
+        final_check = val_history[-1]
+        curve_diagnosis['early_stopping_summary'] = {
+            'selected_step': int(best_check['step']),
+            'final_step': int(final_check['step']),
+            'steps_saved': int(final_check['step'] - best_check['step']),
+            'val_loss_at_selection': float(best_check['loss']),
+            'val_loss_at_final': float(final_check['loss']),
+            'val_loss_regret': float(final_check['loss']
+                                     - best_check['loss']),
+            'selected_by': 'min validation loss',
+        }
+        if best_check.get('token_accuracy') is not None:
+            peak_acc = max(h['token_accuracy'] for h in val_history
+                           if h.get('token_accuracy') is not None)
+            curve_diagnosis['early_stopping_summary'].update({
+                'val_acc_at_selection': float(best_check['token_accuracy']),
+                'val_acc_at_final': (
+                    float(final_check['token_accuracy'])
+                    if final_check.get('token_accuracy') is not None
+                    else None),
+                # Accuracy left on the table because selection follows
+                # validation LOSS, not accuracy: peak accuracy minus the
+                # accuracy at the loss-selected checkpoint.
+                'val_acc_regret_from_peak': float(
+                    peak_acc - best_check['token_accuracy']),
+            })
     print(f"[diagnosis] train/val curves: {curve_diagnosis['verdict']}")
+    if acc_regime is not None:
+        print(f"[diagnosis] held-out token accuracy: "
+              f"{acc_regime['val_acc_head_mean']:.4f} -> "
+              f"{acc_regime['val_acc_tail_mean']:.4f} "
+              f"(peak {acc_regime['val_acc_peak']:.4f}, "
+              f"saturated={acc_regime['saturated']})")
     for _rec in curve_diagnosis['recommendations']:
         print(f"[diagnosis]   - {_rec}")
 

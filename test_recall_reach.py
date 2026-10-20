@@ -358,6 +358,31 @@ def test_report_strict_json_and_budget():
         row['structural']['any_exact_fraction'] > 0.0
         and row['structural']['n_placements'] == 14,
         str(row['structural']['n_placements']))
+    # Bad-case analysis: wrong predictions are categorised by the token
+    # they copied (cue / recency / filler) and kept as JSON-safe examples.
+    ea = seed0['error_analysis']
+    _ok('per-seed bad-case block present',
+        ea['n_errors'] == round((ea['error_rate'] or 0.0) * 8)
+        and len(ea['examples']) <= 8 and 'categories' in ea, str(ea))
+    _ok('category fractions sum to 1 over errors',
+        abs(sum(slot['fraction'] for slot in ea['categories'].values())
+            - (1.0 if ea['n_errors'] else 0.0)) < 1e-12,
+        str(ea['categories']))
+    _ok('row bad-case rollup present',
+        row['error_analysis']['n_errors_total'] == ea['n_errors']
+        and row['error_analysis']['worst_seed'] == 42,
+        str(row['error_analysis']))
+    # The classifier names a cue copy, a recency copy and filler copy.
+    ids = torch.tensor([1, 2, 3, 4, 5])
+    _ok('cue key copy named',
+        R._recall_error_category(5, 3, ids, key_pos=1, cue_pos=4)
+        == 'cue_repeat', '')
+    _ok('previous-token copy named',
+        R._recall_error_category(4, 3, ids, key_pos=1, cue_pos=4)
+        == 'recency_copy', '')
+    _ok('filler copy named',
+        R._recall_error_category(2, 3, ids, key_pos=1, cue_pos=4)
+        == 'distractor_copy', '')
     _ok('cost = n_csa/m + n_hca/m2',
         abs(row['compressed_entries_per_token']
             - (row['n_csa'] / 4 + row['n_hca'] / 8)) < 1e-12,

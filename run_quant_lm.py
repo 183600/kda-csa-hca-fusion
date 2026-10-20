@@ -116,7 +116,12 @@ from results_analysis import (  # noqa: E402
     summarize_lm_diagnostics,
 )
 from results_schema import write as write_schema  # noqa: E402
-from train_diagnostics import ValPoint, ValidationCurve
+from train_diagnostics import (  # noqa: E402
+    ValPoint,
+    ValidationCurve,
+    raise_non_finite,
+    triage_gradient,
+)
 from run_quant_recall import (  # noqa: E402
     DEFAULT_BITS,
     DEFAULT_GROUP_SIZES,
@@ -253,7 +258,8 @@ def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
     if int(val_every or 0) > 0 and val_monitor is not None:
         val_curve = ValidationCurve(
             lambda _step: val_monitor(model), steps=int(steps),
-            val_every=int(val_every), label=f'Part A seed={seed}')
+            val_every=int(val_every), label=f'Part A seed={seed}',
+            ceiling=1.0)
         val_curve.record(0)
     step = 0
     while step < int(steps):
@@ -266,11 +272,30 @@ def train_hybrid_lm(*, seed: int, tokenizer, train_texts, steps: int,
             out = model(input_ids, labels=labels)
             loss = out['loss']
             if loss is None or not torch.isfinite(loss):
-                raise RuntimeError(
-                    f'train_hybrid_lm: non-finite loss ({loss}) at step '
-                    f'{step}; refusing to continue')
+                # Same staged triage as the other trainers: token ids ->
+                # loss -> logits -> parameters. A bare "non-finite loss"
+                # names no cause, so a single bad seed costs a debugging
+                # cycle instead of pointing at the first failing stage.
+                raise_non_finite(
+                    'loss', loss=(loss if loss is not None
+                                  else float('nan')),
+                    token_ids={'input_ids': input_ids},
+                    id_range=(0, len(tokenizer)),
+                    params=model.parameters(),
+                    logits=out.get('logits'),
+                    context=f'train_hybrid_lm seed={seed} step={step}')
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            bad_grads = triage_gradient(model.parameters())
+            if bad_grads:
+                raise_non_finite(
+                    'gradient', loss=loss,
+                    token_ids={'input_ids': input_ids},
+                    id_range=(0, len(tokenizer)),
+                    params=model.parameters(),
+                    grads={f'grad[{i}]': p.grad
+                           for i, p in enumerate(bad_grads)},
+                    context=f'train_hybrid_lm seed={seed} step={step}')
             opt.step()
             last_loss = float(loss.detach())
             losses.append(last_loss)
@@ -319,7 +344,8 @@ def train_stepwise_lm(*, seed: int, tokenizer, train_texts, steps: int,
     if int(val_every or 0) > 0 and val_monitor is not None:
         val_curve = ValidationCurve(
             lambda _step: val_monitor(model), steps=int(steps),
-            val_every=int(val_every), label=f'Part B seed={seed}')
+            val_every=int(val_every), label=f'Part B seed={seed}',
+            ceiling=1.0)
         val_curve.record(0)
     step = 0
     while step < int(steps):
@@ -333,20 +359,32 @@ def train_stepwise_lm(*, seed: int, tokenizer, train_texts, steps: int,
                 logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
                 ignore_index=-100)
             if loss is None or not torch.isfinite(loss):
-                raise RuntimeError(
-                    f'train_stepwise_lm: non-finite loss ({loss}) at step '
-                    f'{step}; refusing to continue')
+                raise_non_finite(
+                    'loss', loss=(loss if loss is not None
+                                  else float('nan')),
+                    token_ids={'input_ids': input_ids},
+                    id_range=(0, len(tokenizer)),
+                    params=model.parameters(), logits=logits,
+                    context=f'train_stepwise_lm seed={seed} step={step}')
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            bad_grads = triage_gradient(model.parameters())
             grad_norm = 0.0
-            finite = True
             for p in model.parameters():
                 if p.grad is not None:
-                    if not bool(torch.isfinite(p.grad).all()):
-                        finite = False
                     grad_norm += float(p.grad.detach().pow(2).sum())
             grad_norm = math.sqrt(grad_norm)
-            report['all_grads_finite'] = report['all_grads_finite'] and finite
+            if bad_grads or not math.isfinite(grad_norm):
+                raise_non_finite(
+                    'gradient', loss=loss,
+                    token_ids={'input_ids': input_ids},
+                    id_range=(0, len(tokenizer)),
+                    params=model.parameters(), logits=logits,
+                    grads={f'grad[{i}]': p.grad
+                           for i, p in enumerate(bad_grads)},
+                    grad_norm=grad_norm,
+                    context=f'train_stepwise_lm seed={seed} step={step}')
+            report['all_grads_finite'] = True
             opt.step()
             report['loss_last'] = float(loss.detach())
             report['losses'].append(report['loss_last'])
@@ -1146,9 +1184,12 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                labels.reshape(-1), ignore_index=-100)
         if loss is None or not torch.isfinite(loss):
-            raise RuntimeError(
-                f'overfit sanity check (Part B STE): non-finite LM loss at '
-                f'step {step} ({loss}); aborting before full training.')
+            raise_non_finite(
+                'loss', loss=(loss if loss is not None else float('nan')),
+                token_ids={'input_ids': input_ids},
+                id_range=(0, len(tokenizer)),
+                params=model.parameters(), logits=logits,
+                context=f'overfit sanity check (Part B STE) step={step}')
         with torch.no_grad():
             mask = labels.reshape(-1).ne(-100)
             correct = ((logits.argmax(-1).reshape(-1) == labels.reshape(-1))
@@ -1161,10 +1202,20 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
             # on the STE path a detached or unused tensor would silently
             # keep receiving no gradient while the loss still falls.
             grad_flow = grad_flow_report(model.named_parameters())
-        for p in model.parameters():
-            if p.grad is not None and not bool(torch.isfinite(p.grad).all()):
-                all_grads_finite = False
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        bad_grads = {name: p.grad for name, p in model.named_parameters()
+                     if p.grad is not None
+                     and not bool(torch.isfinite(p.grad).all())}
+        clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                   grad_clip)
+        if bad_grads or not torch.isfinite(clip_norm):
+            all_grads_finite = False
+            raise_non_finite(
+                'gradient', loss=loss,
+                token_ids={'input_ids': input_ids},
+                id_range=(0, len(tokenizer)),
+                params=model.parameters(), logits=logits, grads=bad_grads,
+                grad_norm=float(clip_norm),
+                context=f'overfit sanity check (Part B STE) step={step}')
         opt.step()
         losses.append(float(loss.detach()))
         accs.append(acc)

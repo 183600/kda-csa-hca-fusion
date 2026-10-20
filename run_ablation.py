@@ -467,9 +467,10 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
         if not torch.isfinite(loss):
-            raise RuntimeError(
-                f"overfit sanity check: non-finite loss at step {step} "
-                f"({loss.item()}) for {label}; aborting before the sweep.")
+            raise_non_finite(
+                'loss', loss=float(loss.detach()),
+                inputs={'x_emb': x_emb}, params=params, logits=logits,
+                context=f'overfit sanity check step={step} {label}')
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -481,14 +482,15 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
                 list(model.named_parameters())
                 + [(f'head.{n}', p) for n, p in head.named_parameters()]
                 + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
-        bad_grads = [p for p in params
-                     if p.grad is not None and not torch.isfinite(p.grad).all()]
-        if bad_grads:
-            raise RuntimeError(
-                f"overfit sanity check: non-finite gradient at step {step} "
-                f"in {len(bad_grads)} params for {label}; aborting before "
-                f"the sweep.")
-        torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        bad_grads = triage_gradient(params)
+        clip_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        if bad_grads or not torch.isfinite(clip_norm):
+            raise_non_finite(
+                'gradient', loss=float(loss.detach()),
+                inputs={'x_emb': x_emb}, params=params, logits=logits,
+                grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
+                context=f'overfit sanity check step={step} {label}')
         opt.step()
         losses.append(float(loss.detach()))
         accs.append(float(acc))
@@ -749,13 +751,17 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
         opt.zero_grad()
         loss.backward()
         bad_grads = triage_gradient(params)
-        if bad_grads:
+        clip_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if bad_grads or not torch.isfinite(clip_norm):
+            # A finite per-parameter norm can still overflow the global
+            # norm; report it through the same staged triage instead of
+            # letting the optimizer step on a corrupted direction.
             raise_non_finite(
                 'gradient', loss=float(loss.detach()),
                 params=params,
                 grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
                 context=f'step={step}, ratio={ratio}, seed={seed}')
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
         train_accs.append(float((logits.argmax(-1) == target).float().mean()))
@@ -1470,13 +1476,14 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         opt.zero_grad()
         loss.backward()
         bad_grads = triage_gradient(params)
-        if bad_grads:
+        clip_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if bad_grads or not torch.isfinite(clip_norm):
             raise_non_finite(
                 'gradient', loss=float(loss.detach()),
                 params=params,
                 grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
                 context=f'step={step}, group={group_id}, seed={seed}')
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
         train_accs.append(float((logits.argmax(-1) == target).float().mean()))

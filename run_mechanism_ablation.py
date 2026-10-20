@@ -609,14 +609,15 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         opt.zero_grad()
         loss.backward()
         bad_grads = triage_gradient(params)
-        if bad_grads:
+        clip_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if bad_grads or not torch.isfinite(clip_norm):
             raise_non_finite(
                 'gradient', loss=float(loss.detach()),
                 params=params,
                 grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
                 context=f'step={step}, variant={variant["name"]}, '
                         f'seed={seed}')
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
         train_accs.append(float((logits.argmax(-1) == target).float().mean()))

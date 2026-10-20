@@ -127,7 +127,12 @@ from run_quality import (  # noqa: E402
     make_long_range_batch,
     make_mqar_batch,
 )
-from train_diagnostics import ValPoint, ValidationCurve  # noqa: E402
+from train_diagnostics import (  # noqa: E402
+    ValPoint,
+    ValidationCurve,
+    raise_non_finite,
+    triage_gradient,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -774,7 +779,8 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
             lambda _step: _recall_validation_point(
                 model, embed, head, val_set),
             steps=int(steps), val_every=val_every,
-            label=f'recall {layout} m={m} m2={m2} seed={seed}')
+            label=f'recall {layout} m={m} m2={m2} seed={seed}',
+            ceiling=1.0)
         val_curve.record(0)
     for step in range(int(steps)):
         x_emb, target, cue_pos = make_long_range_batch(
@@ -783,13 +789,27 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
         h = model(x_emb)
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
+        context = (f'train_recall_model layout={layout} m={m} m2={m2} '
+                   f'seed={seed} step={step}')
         if not torch.isfinite(loss):
-            raise RuntimeError(
-                f'train_recall_model: non-finite loss at step {step} '
-                f'(layout={layout}, m={m}, m2={m2}, seed={seed}).')
+            # Staged triage: embedded input -> loss -> logits -> params.
+            # Without this, a diverged seed reports only "non-finite loss"
+            # and names none of the possible causes.
+            raise_non_finite(
+                'loss', loss=float(loss.detach()),
+                inputs={'x_emb': x_emb}, params=params, logits=logits,
+                context=context)
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        bad_grads = triage_gradient(params)
+        clip_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if bad_grads or not torch.isfinite(clip_norm):
+            raise_non_finite(
+                'gradient', loss=float(loss.detach()),
+                inputs={'x_emb': x_emb}, params=params, logits=logits,
+                grads={f'grad[{i}]': p.grad
+                       for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm), context=context)
         opt.step()
         losses.append(float(loss.item()))
         if val_curve is not None and (step + 1) % val_every == 0:
@@ -824,14 +844,47 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
     return model, embed, head, losses
 
 
+def _recall_bucket(distance: int, win: int, mid_edge: int) -> str:
+    if 2 <= distance <= win:
+        return 'window'
+    if win < distance <= mid_edge:
+        return 'mid'
+    return 'far'
+
+
+def _recall_error_category(pred: int, target: int, ids, key_pos: int,
+                           cue_pos: int) -> str:
+    """Name a wrong single-token recall in terms of the copy it made.
+
+    ``cue_repeat`` copies the cue key, ``recency_copy`` copies the token
+    just before the cue (the classic recency shortcut), and
+    ``distractor_copy`` copies some other filler token. Anything else is
+    ``other``. ``correct`` is only returned defensively (callers pass
+    wrong rows).
+    """
+    if pred == target:
+        return 'correct'
+    if pred == int(ids[cue_pos]):
+        return 'cue_repeat'
+    if cue_pos > 0 and pred == int(ids[cue_pos - 1]):
+        return 'recency_copy'
+    if bool((ids == pred).any()):
+        return 'distractor_copy'
+    return 'other'
+
+
 def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
                     n_batches: int = 4, batch: int = 64, seed: int = 42,
-                    vocab: int = VOCAB, device='cpu') -> dict:
+                    vocab: int = VOCAB, device='cpu',
+                    max_error_examples: int = 8) -> dict:
     """Accuracy + distance buckets on fresh long-range batches.
 
     Also returns the *probe batch* (embeddings + key positions + cue) so
     the caller can run the indexer diagnostic on the exact same samples the
-    accuracy was measured on.
+    accuracy was measured on, and a bad-case block that names *what a
+    wrong prediction copied* (cue key, previous token, filler) plus its
+    distance. Error categories are counted over every wrong sample;
+    ``examples`` keeps at most ``max_error_examples`` JSON-safe rows.
     """
     if isinstance(device, str):
         device = torch.device(device)
@@ -842,6 +895,10 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
     win = SMALL_MODEL_SPEC['csa_sliding_window']
     mid_edge = max(win + 1, seq_len // 2)
     probe = None
+    error_total = 0
+    category_counts: dict[str, int] = {}
+    examples: list[dict] = []
+    max_error_examples = max(0, int(max_error_examples))
     with torch.no_grad():
         for b in range(n_batches):
             x_emb, target, cue_pos, meta = make_long_range_batch(
@@ -860,6 +917,35 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
                 m = (dist >= lo) & (dist <= hi)
                 buckets[name][0] += int((hit & m).sum().item())
                 buckets[name][1] += int(m.sum().item())
+            ids = meta['input_ids']
+            wrong = (~hit).nonzero(as_tuple=False).flatten().tolist()
+            error_total += len(wrong)
+            for j in wrong:
+                key_pos = int(meta['key_pos'][j])
+                distance = int(dist[j])
+                pred_id = int(pred[j])
+                target_id = int(target[j])
+                category = _recall_error_category(
+                    pred_id, target_id, ids[j], key_pos, cue_pos)
+                category_counts[category] = category_counts.get(
+                    category, 0) + 1
+                if len(examples) < max_error_examples:
+                    examples.append({
+                        'batch': int(b),
+                        'sample': int(j),
+                        'distance': distance,
+                        'distance_bucket': _recall_bucket(
+                            distance, win, mid_edge),
+                        'key_pos': key_pos,
+                        'category': category,
+                        'pred': pred_id,
+                        'target': target_id,
+                        'key_id': int(ids[j, key_pos]),
+                        'pred_is_key': pred_id == int(ids[j, key_pos]),
+                        'pred_is_previous': (
+                            cue_pos > 0
+                            and pred_id == int(ids[j, cue_pos - 1])),
+                    })
             if b == 0:
                 probe = {'x_emb': x_emb, 'key_pos': meta['key_pos'],
                          'cue_pos': cue_pos}
@@ -869,6 +955,18 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
         'buckets': {k: {'correct': v[0], 'n': v[1],
                         'accuracy': (v[0] / v[1]) if v[1] else None}
                     for k, v in buckets.items()},
+        'error_analysis': {
+            'n_errors': error_total,
+            'error_rate': ((error_total / total) if total else None),
+            'categories': {
+                k: {'count': c,
+                    'fraction': (c / error_total) if error_total else None}
+                for k, c in sorted(category_counts.items())},
+            'examples': examples,
+            'protocol': ('wrong predictions on the same fixed eval batches '
+                         'used for accuracy; categories name the copied '
+                         'token, not a hypothesised mechanism'),
+        },
     }
     out['probe'] = probe
     return out
@@ -1170,6 +1268,7 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                         'train_validation': val_report,
                         'accuracy': ev['accuracy'],
                         'buckets': ev['buckets'],
+                        'error_analysis': ev['error_analysis'],
                         'indexer_recall_per_layer': [
                             l['recall'] for l in indexer['layers']],
                         'indexer_chance_per_layer': [
@@ -1218,6 +1317,38 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                 hca = [s['hca_resolved_fraction'] for s in row['per_seed']
                        if s['hca_resolved_fraction'] is not None]
                 row['hca_resolved_fraction_mean'] = _mean_std_ci95(hca)[0]
+                # Pooled bad-case rollup: category mix over all seeds, with
+                # examples from the weakest seed (the most diagnostic one).
+                cat_totals: dict[str, int] = {}
+                n_errors_total = 0
+                n_seeds_with_errors = 0
+                for s in row['per_seed']:
+                    ea = s.get('error_analysis') or {}
+                    n_errors_total += int(ea.get('n_errors') or 0)
+                    if int(ea.get('n_errors') or 0) > 0:
+                        n_seeds_with_errors += 1
+                    for cat, slot in (ea.get('categories') or {}).items():
+                        cat_totals[cat] = cat_totals.get(cat, 0) + int(
+                            slot.get('count') or 0)
+                worst = min(
+                    row['per_seed'],
+                    key=lambda s: (s.get('accuracy') is None,
+                                   -(s.get('accuracy') or 0.0)))
+                worst_ea = worst.get('error_analysis') or {}
+                row['error_analysis'] = {
+                    'n_errors_total': n_errors_total,
+                    'n_seeds_with_errors': n_seeds_with_errors,
+                    'category_totals': dict(sorted(cat_totals.items())),
+                    'category_fractions': {
+                        k: (v / n_errors_total) if n_errors_total else None
+                        for k, v in sorted(cat_totals.items())},
+                    'worst_seed': int(worst.get('seed'))
+                    if worst.get('seed') is not None else None,
+                    'representative_examples': worst_ea.get(
+                        'examples', []),
+                    'protocol': ('category mix pooled over seeds; examples '
+                                 'from the lowest-accuracy seed'),
+                }
             rows.append(row)
 
     return {

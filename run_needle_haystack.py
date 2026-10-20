@@ -1232,7 +1232,8 @@ def train_needle_model(
                 model, tokenizer, train_context_len, train_needle_pos,
                 val_seeds, device, quant_spec=quant_spec, ste=ste),
             steps=int(steps), val_every=val_every,
-            label=f'needle seed={seed} ctx={train_context_len}')
+            label=f'needle seed={seed} ctx={train_context_len}',
+            ceiling=1.0)
         val_curve.record(0)
     for step in range(steps):
         # Draw fresh data seeds for every step from the seeded generator.

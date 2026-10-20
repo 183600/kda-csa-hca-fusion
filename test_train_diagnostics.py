@@ -26,6 +26,7 @@ from train_diagnostics import (
     ValPoint,
     ValidationCurve,
     accuracy_cost_tradeoff,
+    accuracy_regime,
     pool_error_analyses,
     raise_non_finite,
     triage_gradient,
@@ -83,6 +84,22 @@ def test_validation_curve_rejects_swapped_fields_and_disabled_is_empty():
     block = disabled.finalize([1.0, 0.9])
     assert block['val_history'] == []
     assert 'early_stopping_summary' not in block
+
+
+def test_accuracy_regime_separates_saturation_from_overfitting():
+    # Validation loss is flat while held-out accuracy is pinned at 1.0:
+    # that is convergence, not a generalization failure.
+    regime = accuracy_regime([0.2, 0.6, 1.0, 1.0, 1.0],
+                             [0.1, 0.3, 0.7, 0.9, 1.0], ceiling=1.0)
+    assert regime['saturated'] is True
+    assert regime['val_acc_tail_mean'] == pytest.approx(1.0)
+    assert regime['train_acc_still_rising'] is True
+    assert regime['ceiling'] == 1.0
+
+    # With no declared ceiling, saturation is unknown, not silently False.
+    unknown = accuracy_regime([0.2, 0.3, 0.4])
+    assert unknown['saturated'] is None
+    assert accuracy_regime([0.5]) is None
 
 
 def test_accuracy_cost_tradeoff_screens_effect_significance_and_cost():

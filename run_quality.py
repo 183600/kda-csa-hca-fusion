@@ -86,6 +86,7 @@ from multi_seed_stats import _sample_sd, holm_adjust, summarize_paired
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
+from train_diagnostics import ValPoint, ValidationCurve
 from results_schema import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
@@ -1819,21 +1820,32 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # from the headline eval (+5_000_000) — so the curve is a genuine
     # held-out signal and enabling it cannot change any reported metric
     # (read-only eval, dedicated RNG). See _VAL_MONITOR_SEED_OFFSET.
+    #
+    # ValidationCurve (rather than a bare list) is used so the record keeps
+    # the best-validation point and the early-stopping regret alongside the
+    # final number: a run whose final weights sit past the turn is visible
+    # as a positive regret instead of only as "final_acc = 0.62".
     val_every = int(val_every or 0)
-    val_history = []
-
-    def _monitor_validation(step):
-        acc_v, loss_v = _eval_model(
-            layer, head, embed, seq_len, n_kv, vocab, device,
-            n_batches=val_batches, batch=val_batch, seed=seed, task=task,
-            gen_offset=_VAL_MONITOR_SEED_OFFSET)
-        val_history.append({'step': int(step), 'loss': float(loss_v),
-                            'acc': float(acc_v)})
-
+    val_curve = None
     if val_every > 0:
-        _monitor_validation(0)
+        def _monitor_validation(step):
+            acc_v, loss_v = _eval_model(
+                layer, head, embed, seq_len, n_kv, vocab, device,
+                n_batches=val_batches, batch=val_batch, seed=seed, task=task,
+                gen_offset=_VAL_MONITOR_SEED_OFFSET)
+            return ValPoint(loss=loss_v, acc=acc_v)
+
+        val_curve = ValidationCurve(
+            _monitor_validation, steps=actual_steps, val_every=val_every,
+            label=f'{op_name}/{task}/n_kv={n_kv}/seed={seed}', ceiling=1.0)
+        val_curve.record(0)
 
     losses, accs = [], []
+    # Pre-clip gradient norms. The clip call already computes this value,
+    # so recording it is free and turns "the loss stayed finite" into
+    # "the optimizer stayed healthy" (a long tail of huge norms is the
+    # first sign of an LR that is too large).
+    grad_norms = []
     # Set train mode ONCE before the loop, not per step (calling
     # layer.train()/head.train() inside the loop is a redundant O(steps)
     # no-op once the modules are already in train mode).
@@ -1873,43 +1885,46 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad()
         loss.backward()
-        # Guard against NaN/Inf gradients BEFORE clip+step. ``clip_grad_norm_``
+        # Guard against NaN/Inf gradients BEFORE step. ``clip_grad_norm_``
         # computes ``total_norm`` and (if NaN) the comparison
         # ``total_norm > max_norm`` is False, so no clipping happens and the
         # NaN grads pass through to ``opt.step()`` unchecked. That corrupts
         # ALL parameters in one step; the NEXT iteration's forward then
         # produces a NaN loss, which the finite-loss guard above catches —
         # but by then every parameter is already NaN and the seed is lost
-        # without a clear root cause. Check here so the per-seed try/except
-        # surfaces the real failure mode.
+        # without a clear root cause.
         #
-        # The grad-finiteness check runs only every 50 steps to avoid a
-        # GPU→CPU sync per parameter on every step (still catches NaN
-        # propagation within ~50 steps, well before it can corrupt the
-        # final accuracy estimate).
-        if step % 50 == 0:
-            bad_grads = [p for p in params
-                         if p.grad is not None and not torch.isfinite(p.grad).all()]
-            if bad_grads:
-                _diag = diagnose_nonfinite(
-                    grads=bad_grads,
-                    context=f'{op_name}/task={task}/seed={seed}/step={step}')
-                raise RuntimeError(
-                    f"non-finite gradient at step {step} in {len(bad_grads)} "
-                    f"params (op={op_name}, seed={seed}); diagnosis "
-                    f"[{_diag['verdict']}]: {_diag['summary']}")
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        # The returned norm is already computed by the clip call, so
+        # checking it costs no extra kernel and runs EVERY step (the old
+        # every-50-steps per-parameter scan could let a NaN step through
+        # between checks). Only when it is non-finite do we pay for the
+        # per-parameter scan that names the offending tensors.
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        grad_norms.append(float(grad_norm))
+        if not torch.isfinite(grad_norm):
+            bad_grads = {f'p{i}': p.grad for i, p in enumerate(params)
+                         if p.grad is not None
+                         and not torch.isfinite(p.grad).all()}
+            _diag = diagnose_nonfinite(
+                loss=float(loss.detach()),
+                inputs={'x_emb': x_emb}, params=params, logits=logits,
+                grads=bad_grads or None, grad_norm=float('nan'),
+                context=f'{op_name}/task={task}/seed={seed}/step={step}')
+            raise RuntimeError(
+                f"non-finite gradient norm at step {step} "
+                f"({len(bad_grads)} non-finite param grads; op={op_name}, "
+                f"seed={seed}); diagnosis [{_diag['verdict']}]: "
+                f"{_diag['summary']}")
         opt.step()
         losses.append(loss.item())
         accs.append(acc)
-        if val_every > 0 and (step + 1) % val_every == 0:
-            _monitor_validation(step + 1)
+        if val_curve is not None and (step + 1) % val_every == 0:
+            val_curve.record(step + 1)
 
     # Ensure the monitored curve ends at the final trained state (e.g.
     # steps=25 with val_every=10 would otherwise stop at step 20).
-    if val_every > 0 and (not val_history
-                          or val_history[-1]['step'] != actual_steps):
-        _monitor_validation(actual_steps)
+    if val_curve is not None:
+        val_curve.close(actual_steps)
 
     # Final eval on multiple fresh batches for a stable accuracy estimate.
     # Timed so the results carry an in-experiment inference-cost proxy,
@@ -1944,8 +1959,16 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
     # Post-training results analysis, all from streams the training never
     # saw: the held-out validation curve (monitor stream), its
     # over/underfitting verdict, and the bad-case analysis (error stream).
+    if val_curve is not None:
+        curve_block = val_curve.finalize(losses, accs)
+        curve_block['val_monitor_seed_offset'] = _VAL_MONITOR_SEED_OFFSET
+        val_curve.log_verdict(curve_block)
+    else:
+        curve_block = None
+    val_history = (curve_block['val_history'] if curve_block else [])
     val_losses = [v['loss'] for v in val_history]
-    curve_diagnosis = diagnose_training_curves(losses, val_losses or None)
+    curve_diagnosis = (curve_block['curve_diagnosis'] if curve_block
+                       else diagnose_training_curves(losses, None))
     error_analysis = None
     if int(error_batches or 0) > 0:
         error_analysis = analyze_errors(
@@ -1959,16 +1982,43 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
             f"wrong; categories: "
             f"{ {c: v['count'] for c, v in error_analysis['categories'].items() if v['count']} }")
 
+    gradient_norms = None
+    if grad_norms:
+        gradient_norms = {
+            'n_steps': len(grad_norms),
+            'max': max(grad_norms),
+            'mean': sum(grad_norms) / len(grad_norms),
+            'last': grad_norms[-1],
+            'clip_norm': 1.0,
+            # Pre-clip norm much larger than the clip budget means the raw
+            # gradients were exploding and clipping is masking it.
+            'n_above_clip': sum(1 for g in grad_norms if g > 1.0),
+        }
+    curve_fields = {}
+    if curve_block is not None:
+        # Additive curve-reading fields. ``final_acc`` above still means
+        # "accuracy at the fixed step budget"; these say whether that
+        # endpoint was the right place to read the curve, and whether an
+        # apparently flat validation loss is actually accuracy saturation.
+        for key in ('best_val', 'val_loss_regret_from_best',
+                    'val_acc_regret_from_best', 'steps_since_best',
+                    'best_val_is_final', 'early_stopping_summary',
+                    'accuracy_regime', 'val_acc_first', 'val_acc_last',
+                    'val_acc_peak'):
+            if key in curve_block:
+                curve_fields[key] = curve_block[key]
     analysis_fields = {
         'val_history': val_history,
         'curve_diagnosis': curve_diagnosis,
         'error_analysis': error_analysis,
+        'gradient_norms': gradient_norms,
         'final_eval_time_s': final_eval_time_s,
         'final_eval_ms_per_sample': (
             1000.0 * final_eval_time_s / max(1, int(eval_batches) * int(eval_batch))),
         'generalization_gap': (
-            val_losses[-1] - sum(losses[-10:]) / min(10, len(losses))
-            if val_losses and losses else None),
+            curve_block['generalization_gap'] if curve_block is not None
+            else None),
+        **curve_fields,
         # Full confusion-derived metric block (each key names its averaging
         # convention — see results_analysis.multiclass_classification_metrics)
         # plus flat convenience keys so a table/DataFrame does not need to
@@ -2446,10 +2496,15 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
         logits = head(h, cue_pos)
         loss = F.cross_entropy(logits, target)
         if not torch.isfinite(loss):
+            _diag = diagnose_nonfinite(
+                loss=float(loss.detach()), inputs={'x_emb': x_emb},
+                params=params, logits=logits,
+                context=f'overfit sanity check step={step} '
+                        f'op={op_name} task={task}')
             raise RuntimeError(
                 f"overfit sanity check: non-finite loss at step {step} "
-                f"({loss.item()}) for op={op_name} task={task}; aborting "
-                f"before the full sweep.")
+                f"({loss.item()}) for op={op_name} task={task}; diagnosis "
+                f"[{_diag['verdict']}]: {_diag['summary']}")
         acc = (logits.argmax(-1) == target).float().mean().item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -2461,7 +2516,21 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
                 [(f'layer.{n}', p) for n, p in layer.named_parameters()]
                 + [(f'head.{n}', p) for n, p in head.named_parameters()]
                 + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
-        torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        bad_grads = [p for p in params
+                     if p.grad is not None
+                     and not torch.isfinite(p.grad).all()]
+        clip_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        if bad_grads or not torch.isfinite(clip_norm):
+            _diag = diagnose_nonfinite(
+                loss=float(loss.detach()), inputs={'x_emb': x_emb},
+                params=params, logits=logits, grads=bad_grads or None,
+                grad_norm=float(clip_norm),
+                context=f'overfit sanity check step={step} '
+                        f'op={op_name} task={task}')
+            raise RuntimeError(
+                f"overfit sanity check: non-finite gradient at step {step} "
+                f"for op={op_name} task={task}; diagnosis "
+                f"[{_diag['verdict']}]: {_diag['summary']}")
         opt.step()
         losses.append(float(loss.detach()))
         accs.append(float(acc))
@@ -2630,6 +2699,17 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                 'final_eval_time_s': None,
                 'final_eval_ms_per_sample': None,
                 'generalization_gap': None,
+                'best_val': None,
+                'val_loss_regret_from_best': None,
+                'val_acc_regret_from_best': None,
+                'steps_since_best': None,
+                'best_val_is_final': None,
+                'early_stopping_summary': None,
+                'accuracy_regime': None,
+                'val_acc_first': None,
+                'val_acc_last': None,
+                'val_acc_peak': None,
+                'gradient_norms': None,
                 'final_metrics': None,
                 'final_f1_macro': None,
                 'final_f1_weighted': None,
@@ -2706,6 +2786,18 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     for r in ok_per_seed:
         v = (r.get('curve_diagnosis') or {}).get('verdict', 'unknown')
         verdicts[v] = verdicts.get(v, 0) + 1
+
+    # Aggregate the curve-reading fields that a final-number-only table
+    # hides: how far the final weights sit past the best validation point
+    # (early-stopping regret), and how often validation accuracy was pinned
+    # at the task ceiling (saturation, not overfitting).
+    regrets = [r['val_loss_regret_from_best'] for r in ok_per_seed
+               if r.get('val_loss_regret_from_best') is not None]
+    regimes = [r.get('accuracy_regime') for r in ok_per_seed
+               if r.get('accuracy_regime')]
+    n_saturated = sum(1 for reg in regimes if reg.get('saturated'))
+    tail_accs = [reg['val_acc_tail_mean'] for reg in regimes
+                 if reg.get('val_acc_tail_mean') is not None]
 
     # Pooled bad-case analysis across seeds: counts add up over every
     # analyzed sample, while the EXAMPLES come from the worst seed (lowest
@@ -2822,6 +2914,22 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
             'n_seeds_summarized': len(ok_per_seed),
         },
         'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        # Best-validation regret: a positive value means the fixed-budget
+        # final weights were past the turning point, so the final metric
+        # understates what this operator achieved during training.
+        'mean_val_loss_regret_from_best': (
+            sum(regrets) / len(regrets)) if regrets else None,
+        'n_seeds_with_positive_val_regret': sum(1 for x in regrets if x > 0),
+        'accuracy_regime_summary': {
+            'n_seeds_saturated': int(n_saturated),
+            'n_seeds_with_regime': len(regimes),
+            'mean_val_acc_tail': (
+                sum(tail_accs) / len(tail_accs)) if tail_accs else None,
+            'note': ('saturated = validation accuracy at the task ceiling '
+                     'while train accuracy is still rising; this is '
+                     'convergence, not overfitting, and more steps cannot '
+                     'improve the metric.'),
+        },
         'error_analysis': error_aggregate,
         'mean_final_metrics': mean_final_metrics,
     }

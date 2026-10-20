@@ -352,6 +352,15 @@ def test_monitoring_does_not_change_training_results():
     assert len(monitored['val_history']) == 4  # steps 0, 10, 20 + final 25
     assert monitored['curve_diagnosis']['verdict'] in {
         'healthy', 'overfitting', 'underfitting', 'diverged'}
+    # Reading the curve, not only its endpoint: best-validation point,
+    # early-stopping regret, accuracy regime and optimizer health are all
+    # recorded next to ``final_acc`` (which keeps its fixed-budget meaning).
+    assert monitored['best_val']['step'] in {0, 10, 20, 25}
+    assert monitored['early_stopping_summary']['selected_step'] == \
+        monitored['best_val']['step']
+    assert monitored['steps_since_best'] >= 0
+    assert monitored['accuracy_regime']['saturated'] is False
+    assert monitored['gradient_norms']['n_steps'] == 25
 
 
 def test_train_one_records_confusion_and_ranking_metrics():

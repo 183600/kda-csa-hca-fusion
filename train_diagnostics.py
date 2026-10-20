@@ -161,6 +161,53 @@ def triage_gradient(params: Sequence[torch.nn.Parameter],
 # --------------------------------------------------------------------------
 # 2. Held-out validation curve
 # --------------------------------------------------------------------------
+def accuracy_regime(val_accs: Sequence[float],
+                    train_accs: Sequence[float] | None = None, *,
+                    ceiling: float | None = None) -> dict | None:
+    """Summarise the held-out ACCURACY curve, which loss shape cannot.
+
+    The loss verdict can call a curve "overfitting" when validation loss
+    flattens, but on a bounded metric a flat validation loss while held-out
+    accuracy sits at the task ceiling is *convergence*, not a generalization
+    failure. This block records the head/tail means, peak accuracy and (when
+    ``ceiling`` is supplied) whether the tail is pinned at it, so a reader
+    can tell the two apart. It deliberately does not override the loss
+    verdict; it is additive evidence.
+
+    Returns ``None`` when there are fewer than two points (no shape).
+    """
+    if val_accs is None or len(val_accs) < 2:
+        return None
+    vals = [float(v) for v in val_accs]
+    head_k = max(1, len(vals) // 5)
+    val_head = sum(vals[:head_k]) / head_k
+    val_tail = sum(vals[-head_k:]) / head_k
+    out = {
+        'val_acc_head_mean': val_head,
+        'val_acc_tail_mean': val_tail,
+        'val_acc_peak': max(vals),
+        'val_acc_best_step': int(max(range(len(vals)),
+                                     key=lambda i: vals[i])),
+    }
+    if ceiling is not None:
+        out['ceiling'] = float(ceiling)
+        out['saturated'] = bool(
+            val_tail >= float(ceiling) * (1.0 - 1e-3))
+    else:
+        # No declared ceiling: say so honestly instead of guessing "not
+        # saturated" from an arbitrary threshold.
+        out['ceiling'] = None
+        out['saturated'] = None
+    if train_accs:
+        train = [float(v) for v in train_accs]
+        t_head_k = max(1, len(train) // 5)
+        out['train_acc_head_mean'] = sum(train[:t_head_k]) / t_head_k
+        out['train_acc_tail_mean'] = sum(train[-t_head_k:]) / t_head_k
+        out['train_acc_still_rising'] = bool(
+            out['train_acc_tail_mean'] > out['train_acc_head_mean'])
+    return out
+
+
 class ValPoint(NamedTuple):
     """One held-out measurement.
 
@@ -264,28 +311,13 @@ class ValidationCurve:
         """
         if self.ceiling is None or len(self.history) < 2:
             return None
-        val_accs = [h['acc'] for h in self.history]
-        head_k = max(1, len(val_accs) // 5)
-        val_head = sum(val_accs[:head_k]) / head_k
-        val_tail = sum(val_accs[-head_k:]) / head_k
-        saturated = val_tail >= self.ceiling * (1.0 - 1e-3)
-        out = {
-            'val_acc_head_mean': val_head,
-            'val_acc_tail_mean': val_tail,
-            'val_acc_peak': max(val_accs),
-            'val_acc_best_step': self.history[
-                int(max(range(len(val_accs)), key=lambda i: val_accs[i]))]['step'],
-            'ceiling': float(self.ceiling),
-            'saturated': bool(saturated),
-        }
-        if train_accs:
-            t_head_k = max(1, len(train_accs) // 5)
-            out['train_acc_head_mean'] = sum(
-                train_accs[:t_head_k]) / t_head_k
-            out['train_acc_tail_mean'] = sum(
-                train_accs[-t_head_k:]) / t_head_k
-            out['train_acc_still_rising'] = bool(
-                out['train_acc_tail_mean'] > out['train_acc_head_mean'])
+        out = accuracy_regime([h['acc'] for h in self.history],
+                              train_accs, ceiling=self.ceiling)
+        if out is not None:
+            # Report the STEP of the peak (the module-level helper works on
+            # bare sequences and therefore only knows the index).
+            out['val_acc_best_step'] = self.history[
+                out['val_acc_best_step']]['step']
         return out
 
     def finalize(self, train_losses: Sequence[float],
