@@ -3020,8 +3020,9 @@ def _parse_lr_list(env_var, default='3e-4,1e-3,3e-3,1e-2,3e-2'):
             raise ValueError(
                 f'{env_var}={raw!r} must be comma-separated floats, '
                 f'e.g. "1e-3,3e-3,1e-2"')
-        if not (v > 0):
-            raise ValueError(f'{env_var} values must be > 0, got {v!r}')
+        if not math.isfinite(v) or not (v > 0):
+            raise ValueError(
+                f'{env_var} values must be finite and > 0, got {v!r}')
         vals.append(v)
     if not vals:
         raise ValueError(

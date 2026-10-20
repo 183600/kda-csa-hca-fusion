@@ -38,6 +38,7 @@ from run_quality import (  # noqa: E402
     _classify_task_errors,
     _hypothesis_verdicts,
     _paired_one_sided_t,
+    _parse_lr_list,
     train_one,
 )
 
@@ -737,6 +738,14 @@ def test_hypothesis_verdicts_mark_missing_evidence_not_computable():
     assert checks['kda_nkv_monotonicity']['status'] == 'not_computable'
     assert checks['kda_nkv_monotonicity']['missing_pairs'] == [
         'mqar: n_kv 1->2']
+
+
+def test_parse_lr_list_rejects_non_finite(monkeypatch):
+    monkeypatch.setenv('TEST_LR_LIST', '1e-3,1e999')
+    with pytest.raises(ValueError, match='finite'):
+        _parse_lr_list('TEST_LR_LIST')
+    assert _parse_lr_list('TEST_LR_LIST_MISSING', default='1e-3,3e-3') == [
+        1e-3, 3e-3]
 
 
 def test_tune_baseline_lr_selects_on_tail_plateau(monkeypatch):
