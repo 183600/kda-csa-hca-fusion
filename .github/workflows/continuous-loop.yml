@@ -339,11 +339,11 @@ jobs:
           TASK_IMPROVE='改进这个项目'
 
           # 每阶段单次调用的最大时长（秒）
-          PERF_TIMEOUT=$((60*60))     # 1h
-          BUG_TIMEOUT=$((60*60))      # 1h
-          SCI_TIMEOUT=$((60*60))      # 1h（改进科研方法，随机选一个提示词）
-          IMPROVE_TIMEOUT=$((60*60))  # 1h（xuen：2 轮 × 单轮上限 1500s + 余量）
-          CLEAN_TIMEOUT=$((30*60))    # 30m
+          PERF_TIMEOUT=$((3*3600))     # 3h
+          BUG_TIMEOUT=$((3*3600))      # 3h
+          SCI_TIMEOUT=$((3*3600))      # 3h
+          IMPROVE_TIMEOUT=$((3*3600))  # 3h
+          CLEAN_TIMEOUT=$((3*3600))    # 3h
 
           # ================= 动态模型池（不写死，实时读取线上目录） =================
           # 池直接来自 `opencode models opencode` 的实时输出：模型上新自动入池、
@@ -914,7 +914,7 @@ jobs:
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
               return 0
             fi
-            if [ "$TG_FIX_BUDGET" -gt 2700 ]; then TG_FIX_BUDGET=2700; fi
+            if [ "$TG_FIX_BUDGET" -gt 10800 ]; then TG_FIX_BUDGET=10800; fi
             {
               echo '本仓库的测试跑不通，请修复。复现方式：在仓库根目录运行 bash /tmp/tg_run.sh。'
               echo
