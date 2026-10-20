@@ -788,14 +788,6 @@ def _chunk_kda_prepare(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return {'early': True, 'o': o.to(dtype), 'S': S}
-    # Ownership hint for the no-grad scale below. The in-place multiply is
-    # only safe on a buffer this function owns. A contiguous input makes the
-    # subsequent ``rearrange`` a view of the caller's storage (and
-    # ``contiguous()`` then returns that view), while a non-contiguous input
-    # forces ``contiguous()`` to copy. This metadata-only test replaces the
-    # old ``untyped_storage().data_ptr()`` comparison, which Dynamo cannot
-    # trace and therefore blocked ``torch.compile(fullgraph=True)``.
-    q_input_contiguous = q.is_contiguous()
     pad = (-T) % BT
     if pad:
         q    = F.pad(q,    (0, 0, 0, 0, 0, pad))
@@ -821,15 +813,15 @@ def _chunk_kda_prepare(
     # identity.
     if G == 1:
         q = q.contiguous()
-        # The scale may run in place only when ``q`` no longer aliases the
-        # caller's input. Padding already produced a fresh tensor; otherwise
-        # a contiguous input rearranges to a view of the caller's storage
-        # (out-of-place), while a non-contiguous input is copied by
-        # ``contiguous()`` (owned). Same elementwise product either way.
-        if torch.is_grad_enabled() or (q_input_contiguous and not pad):
-            q = q * scale
-        else:
-            q.mul_(scale)
+        # Always scale out of place. A non-contiguous input can rearrange to
+        # a CONTIGUOUS view of the caller's storage (e.g. a transposed
+        # tensor whose original layout matches the chunk-major order), so
+        # ``contiguous()`` returning a view does not prove ownership.
+        # Testing the input's contiguity is likewise insufficient: the
+        # rearranged result may alias regardless of the input strides. The
+        # out-of-place product is value-identical and, unlike a storage
+        # pointer check, is traceable by ``torch.compile(fullgraph=True)``.
+        q = q * scale
         k = k.contiguous()
     else:
         q = q.repeat_interleave(G, dim=1)
