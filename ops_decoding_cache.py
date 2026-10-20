@@ -1553,14 +1553,21 @@ class CSADecodingCache:
             # the storage-dtype cache and only the selected rows are
             # upcast (a cast commutes with row selection).
             C_comp_storage = self._C_comp[:, :self._n_blocks]
+            if torch.is_grad_enabled():
+                # Every read-path op that builds a graph (gather,
+                # normalize, einsum) saves its input for backward. When
+                # the cast/gather aliases the compressed storage, a later
+                # ``append_step`` overwrites that storage in place and
+                # backward raises a version-counter error. Keep a stable
+                # copy while autograd is recording.
+                C_comp_storage = C_comp_storage.clone()
             # The indexer scores ALL blocks (it must, to select), so its
-            # keys are upcast whole. When ``normalize_qk=False`` and
-            # autograd is recording, the upcast copy is a graph input that
-            # a later ``append_step`` would invalidate in place, hence the
-            # clone (same contract as before).
+            # keys are upcast whole. When autograd is recording, the same
+            # version-counter contract applies to the indexer's
+            # normalization/einsums, hence the clone.
             K_IComp_valid = _to_dtype(
                 self._K_IComp[:, :self._n_blocks], compute_dtype)
-            if (torch.is_grad_enabled() and not normalize_qk
+            if (torch.is_grad_enabled()
                     and self.dtype == compute_dtype):
                 # The clone is only required when the cast above returned
                 # a view aliasing the cache storage (dtype match); with a
@@ -1675,15 +1682,6 @@ class CSADecodingCache:
                         if normalize_qk:
                             C_comp_n = _qk_normalize(
                                 C_comp_n, self.qk_norm_mode)
-                        elif (torch.is_grad_enabled()
-                                and self.dtype == compute_dtype):
-                            # Same grad-mode clone contract as before: the
-                            # einsum saves ``C_comp_n`` and a later
-                            # ``append_step`` would invalidate a view in
-                            # place. Only a dtype-matching cast aliases the
-                            # cache storage; a dtype-mismatching one is
-                            # already an unaliased copy.
-                            C_comp_n = C_comp_n.clone()
                         soft_full = torch.einsum(
                             'btn,bnc->btc', soft_weights, C_comp_n,
                         )                                              # [B, 1, c]
@@ -1974,6 +1972,14 @@ class CSADecodingCache:
                    < (t_pos // self.m)[:, None])                    # [T, nb]
             K_I = _to_dtype(
                 self._K_IComp[:, :n_blocks], compute_dtype)
+            if (torch.is_grad_enabled()
+                    and self.dtype == compute_dtype):
+                # Same grad-mode clone contract as ``forward_step``: the
+                # cast above aliases the cache storage when the dtypes
+                # match, and the indexer's normalization/einsums save
+                # these keys for backward. A later ``append_step`` would
+                # overwrite that storage in place.
+                K_I = K_I.clone()
             effective_use_ste = use_ste and torch.is_grad_enabled()
             if (normalize_qk and not torch.is_grad_enabled()
                     and self.dtype != compute_dtype):
@@ -2010,6 +2016,12 @@ class CSADecodingCache:
                 valid_mask = indices >= 0                       # [B,T,topk]
                 idx_safe = indices.clamp(min=0)
                 C_storage = self._C_comp[:, :n_blocks]
+                if torch.is_grad_enabled():
+                    # Same grad-mode clone contract as ``forward_step``:
+                    # gather/normalize/einsum save their input for
+                    # backward, so the read must not alias storage that a
+                    # later ``append_step`` overwrites in place.
+                    C_storage = C_storage.clone()
                 dim = C_storage.shape[-1]
                 kv = torch.gather(
                     C_storage.unsqueeze(1).expand(
@@ -2633,6 +2645,11 @@ class HCADecodingCache:
             if normalize_qk:
                 C_comp_n = _to_dtype(
                     self._C_comp[:, :self._n_blocks], compute_dtype)
+                if torch.is_grad_enabled() and self.dtype == compute_dtype:
+                    # The cast aliases the cache storage; normalization
+                    # saves its input for backward, and a later
+                    # ``append_step`` overwrites that storage in place.
+                    C_comp_n = C_comp_n.clone()
                 if not torch.is_grad_enabled() and self.dtype != compute_dtype:
                     # ``C_comp_n`` is a fresh compute-dtype copy here
                     # (the cast above allocated it); normalize it in
@@ -2847,6 +2864,13 @@ class HCADecodingCache:
                    < (t_pos // self.m2)[:, None])                    # [T, nb]
             C_comp_n = _to_dtype(
                 self._C_comp[:, :n_blocks], compute_dtype)
+            if torch.is_grad_enabled() and self.dtype == compute_dtype:
+                # Same grad-mode clone contract as ``forward_step``: the
+                # cast aliases the cache storage when the dtypes match,
+                # and normalization/einsums save their input for
+                # backward, while a later ``append_step`` overwrites that
+                # storage in place.
+                C_comp_n = C_comp_n.clone()
             if normalize_qk:
                 C_comp_n = _qk_normalize(C_comp_n, self.qk_norm_mode)
             scores = torch.einsum(

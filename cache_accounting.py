@@ -424,13 +424,17 @@ def lcm_packing(cfg: HybridConfig, T: int) -> dict:
     L = math.lcm(cfg.csa_m, cfg.hca_m2)
     k1, k2 = L // cfg.csa_m, L // cfg.hca_m2
     n_blocks = T // L
+    # Trailing partial super-blocks still produce full CSA/HCA rows whenever
+    # their own compression factor has completed, so derive the exact row
+    # counts directly from T (identity: T // m == (T // L) * (L // m)
+    # + (T % L) // m).
     return {
         'lcm_tokens': L,
         'k1_csa_rows_per_block': k1,
         'k2_hca_rows_per_block': k2,
         'complete_lcm_blocks': n_blocks,
-        'csa_blocks_expected': n_blocks * k1,
-        'hca_blocks_expected': n_blocks * k2,
+        'csa_blocks_expected': T // cfg.csa_m,
+        'hca_blocks_expected': T // cfg.hca_m2,
     }
 
 
@@ -756,6 +760,13 @@ def autograd_graph_probe(cfg: HybridConfig, *, total_layers: int | None = None,
             f'autograd_graph_probe: steps must be >= 2 positive ints, '
             f'got {steps!r}')
     steps = sorted(int(s) for s in steps)
+    if len(set(steps)) != len(steps):
+        # Checkpoints must be distinct: duplicates make the returned
+        # ``reachable_nodes`` shorter than ``checkpoints`` and can make
+        # ``steps[-1] - steps[0]`` zero (division by zero below).
+        raise ValueError(
+            f'autograd_graph_probe: steps must be distinct checkpoints, '
+            f'got {steps!r}')
     if total_layers is None:
         total_layers = (len(cfg.layout) if cfg.layout is not None
                         else max(1, cfg.n_kda + cfg.n_csa + cfg.n_hca))

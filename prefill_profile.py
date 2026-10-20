@@ -460,16 +460,24 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
     ref_row['is_reference'] = True
     ref_row['drift'] = drift_metrics(
         reference, reference, dtype=drift_dtype)
-    ref_row['passed'] = True
+    # The reference is a row too: a non-finite reference output cannot
+    # pass, even when it is the only schedule profiled. The remaining
+    # numeric fields are undefined in that case (see ``drift_metrics``).
+    ref_row['passed'] = bool(ref_row['drift']['finite'])
     ref_row['tolerance'] = {
         'atol': float(atol), 'rtol': float(rtol),
         'criterion': 'max_abs <= atol + rtol * max|reference|'}
 
     rows = [ref_row]
     seen = set()
-    ref_scale = float(reference.detach().to(dtype=drift_dtype).abs().max()) \
-        if reference.numel() else 0.0
-    tol_abs = float(atol) + float(rtol) * ref_scale
+    if reference.numel() and ref_row['drift']['finite']:
+        ref_scale = float(reference.detach().to(dtype=drift_dtype).abs().max())
+    elif reference.numel():
+        ref_scale = None
+    else:
+        ref_scale = 0.0
+    tol_abs = (None if ref_scale is None
+               else float(atol) + float(rtol) * ref_scale)
     for spec, sched in zip(schedules, expanded):
         key = tuple(sched)
         if key == tuple(ref_schedule) or key in seen:
@@ -487,7 +495,8 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
             'atol': float(atol), 'rtol': float(rtol),
             'criterion': 'max_abs <= atol + rtol * max|reference|'}
         row['passed'] = bool(
-            drift['finite'] and drift['max_abs'] is not None
+            tol_abs is not None and drift['finite']
+            and drift['max_abs'] is not None
             and drift['max_abs'] <= tol_abs)
         row['_requested_schedule'] = schedule_label(spec)
         rows.append(row)
@@ -630,9 +639,11 @@ def main(argv=None) -> int:
               f"{row['latency_ms']:>12.3f} {tok_s:>10} {max_abs:>12} "
               f"{rel:>10} {str(row['passed']):>6}")
     print('-' * 78)
+    ref_max = report['reference_max_abs']
+    ref_max_text = 'n/a' if ref_max is None else f'{ref_max:.3e}'
     print(f"Tolerance: {report['tolerance']['criterion']} "
           f"(atol={report['atol']:.1e}, rtol={report['rtol']:.1e}, "
-          f"max|ref|={report['reference_max_abs']:.3e})")
+          f"max|ref|={ref_max_text})")
     print('Latency is host/thread-specific; only the drift column is portable.')
 
     if args.json:
