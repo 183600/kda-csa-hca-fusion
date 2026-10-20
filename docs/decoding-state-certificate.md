@@ -54,7 +54,7 @@ model. The allocated capacity follows the same geometric rule
 
 ## Invariants pinned by tests
 
-`test_decode_state_certificate.py` checks 14 properties, among them:
+`test_decode_state_certificate.py` checks 18 properties, among them:
 
 * the cache breakdown equals an independent walk over the cache's
   tensors AND the analytic per-component formula (fp32 bytes);
