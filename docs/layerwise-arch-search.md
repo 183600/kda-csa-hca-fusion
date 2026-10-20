@@ -36,8 +36,17 @@ The neighborhood order is fixed, so the whole search is reproducible from
   Components in the `PARAMETER` pool (attention sinks) are shared by all
   requests and are reported separately. A memory-only layout is exactly
   constant in `T`; any layout with a CSA/HCA layer grows with the
-  compressed-block count — the two-point `state_constant` flag is the
-  Exp 6 certificate reduced to the search's needs.
+  compressed-block count. `state_constant` is a **component-aware
+  context-ratio certificate**: it sweeps `T, 2T, 4T` and requires every
+  component's allocated bytes to be flat. A total-only check is unsound —
+  e.g. HCA with `m2=8` at `T=30` has a flat 2560 B total at 30/60/120
+  while compressed KV grows 512 → 1024 → 2048 B and the partial tail
+  empties 1536 → 1024 → 0 B. `state_growth_certificate` records the
+  per-length totals, per-component series, growing components, total and
+  per-component log-log growth exponents, and the
+  `total_flat_but_components_grow` cancellation flag;
+  `state_constant_two_point` keeps the old two-point verdict for audit
+  only.
 * **KV read budget** — `kv_budget` (Exp 9b), both the prefill average and
   the marginal decode step after a `T`-token prefill. The CSA term is
   where the top-k selection cost lives: the indexer scans **every** visible

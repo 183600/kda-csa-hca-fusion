@@ -15,6 +15,10 @@ bytes (Exp 3 / ``cache_accounting``) and KV read budget (Exp 9b /
   memory-only layout is exactly constant in ``T`` while any CSA/HCA
   layout grows, and the ``kv_budget`` geometry agrees with the committed
   Exp 9b builder;
+* the state certificate — the context-ratio sweep rejects a growing
+  layout whose total bytes happen to be flat because compressed blocks
+  grow while the partial tail empties (component cancellation), a case
+  the legacy two-point total-only check misclassifies;
 * read-budget monotonicity in ``csa_topk`` (the top-k selection knob);
 * the search loop — greedy best-improvement on injected landscapes
   (target recovery, budget exclusion, error records, determinism,
@@ -183,6 +187,49 @@ def test_layouts_with_retrieval_grow_with_T():
         assert high['state_bytes_allocated'] > low['state_bytes_allocated']
         assert high['state_constant'] is False
         assert low['state_constant'] is False
+
+
+def test_state_certificate_rejects_component_cancellation():
+    """A flat TOTAL is not a constant state when components cancel.
+
+    HCA with m2=8 at T=30: compressed KV is 512/1024/2048 B at
+    T=30/60/120 while the partial tail is 1536/1024/0 B, so every
+    total-only check (including the old two-point flag) sees 2560 B and
+    would certify a growing layout as constant. The component-aware
+    certificate must reject it and name the growing components.
+    """
+    report = cost_report(Candidate(('hca',)), T=30, m=8, m2=8,
+                         d_model=32)
+    cert = report['state_growth_certificate']
+    assert report['state_bytes_allocated'] == 2560
+    assert report['state_constant_two_point'] is True
+    assert cert['total_flat'] is True
+    assert cert['total_flat_but_components_grow'] is True
+    assert report['state_constant'] is False
+    assert set(cert['growing_components']) == {
+        'hca_compressed_kv', 'hca_partial_tail'}
+    assert cert['lengths'] == [30, 60, 120]
+    assert cert['growth_exponent'] == 0.0
+    # The per-component series makes the cancellation auditable.
+    assert cert['component_bytes']['hca_compressed_kv'] == [512, 1024, 2048]
+    assert cert['component_bytes']['hca_partial_tail'] == [1536, 1024, 0]
+    # Compressed KV doubles when T doubles => exponent 1.0; the tail
+    # shrinks toward zero, so its exponent is negative.
+    assert abs(cert['component_growth_exponents']
+               ['hca_compressed_kv'] - 1.0) < 1e-12
+    assert cert['component_growth_exponents']['hca_partial_tail'] < 0.0
+
+
+def test_state_certificate_is_flat_for_memory_only_layout():
+    report = cost_report(Candidate(('kda', 'kda')), T=64, **SMALL)
+    cert = report['state_growth_certificate']
+    assert report['state_constant'] is True
+    assert cert['total_flat'] is True
+    assert cert['growing_components'] == []
+    assert cert['growth_exponent'] == 0.0
+    assert len(set(cert['total_bytes'])) == 1
+    assert all(len(set(series)) == 1
+               for series in cert['component_bytes'].values())
 
 
 def test_budget_spec_agrees_with_exp9b_builder():

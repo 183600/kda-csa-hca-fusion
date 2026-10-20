@@ -23,9 +23,13 @@ timed region (so they cannot perturb the latency numbers):
 
 The run envelope includes `metadata.decode_state_certificate`: per operator,
 the valid bytes at each `prefill_len`, a `classification`
-(`constant` when identical at every length, else `growing`), and
-`max_over_min` (the observed growth ratio). This turns the claim into a
-per-run measurement with an auditable trail rather than an assertion.
+(`constant` only when the total AND every observed component are
+identical at every length, else `growing`), `max_over_min` (the observed
+growth ratio), `growing_components`, the per-component series, and the
+`total_valid_flat_but_components_grow` cancellation flag. This turns the
+claim into a per-run measurement with an auditable trail rather than an
+assertion, and makes a flat total with offsetting components visible
+instead of silently certifying it as constant.
 
 ## Uniform accounting surface
 
@@ -61,7 +65,15 @@ model. The allocated capacity follows the same geometric rule
   sub-linearly (below the softmax factor);
 * `bench_decoding` rows carry JSON-safe certificate fields and
   `_decode_state_certificate` classifies constant vs growing correctly
-  while excluding error rows.
+  while excluding error rows;
+* the certificate is component-aware: a flat total caused by offsetting
+  components is classified as growing. At prefill lengths 30/60/120 an
+  HCA cache can hold 2560 B at every point while compressed KV grows
+  512 → 1024 → 2048 B and the partial tail empties 1536 → 1024 → 0 B.
+  Rows expose `growing_components`,
+  `total_valid_flat_but_components_grow`, and the per-component series
+  so the cancellation is auditable; legacy rows without a breakdown keep
+  the total-only fallback.
 
 `results_schema`'s `exp6_decoding` contract additionally rejects
 malformed certificate fields on write (`decode_state_bytes` must be a

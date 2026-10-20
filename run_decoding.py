@@ -163,6 +163,16 @@ def _decode_state_certificate(results, prefill_lens):
     ``'growing'`` (the softmax KV cache and the CSA/HCA compressed-block
     caches), recording the per-length byte counts so the classification
     is auditable rather than asserted.
+
+    The verdict is COMPONENT-AWARE when ``decode_state_breakdown`` is
+    present. A flat total is not sufficient evidence of constant state:
+    HCA at prefill lengths 30/60/120 (m2=8) has a flat 2560 B total while
+    compressed KV grows 512 -> 1024 -> 2048 B and the partial tail empties
+    1536 -> 1024 -> 0 B. A total-only check would certify that growing
+    layout as constant, so the certificate only says ``constant`` when
+    every observed component is also flat and reports the growing
+    components plus the cancellation flag for audit. Legacy rows without
+    a breakdown fall back to the total-only rule.
     """
     ops = []
     for r in results:
@@ -174,14 +184,37 @@ def _decode_state_certificate(results, prefill_lens):
         rows = {r.get('prefill_len'): r for r in results
                 if r.get('op') == op and 'error' not in r
                 and r.get('decode_state_bytes') is not None}
-        by_len = {str(p): rows[p]['decode_state_bytes']
-                  for p in prefill_lens if p in rows}
+        present = [p for p in prefill_lens if p in rows]
+        by_len = {str(p): rows[p]['decode_state_bytes'] for p in present}
         if not by_len:
             continue
         values = list(by_len.values())
-        constant = len(set(values)) == 1
+
+        component_by_len: dict[str, dict[str, int]] = {}
+        for p in present:
+            breakdown = rows[p].get('decode_state_breakdown')
+            if not isinstance(breakdown, dict):
+                continue
+            for name, rec in breakdown.items():
+                if isinstance(rec, dict) and rec.get('valid_bytes') is not None:
+                    component_by_len.setdefault(name, {})[str(p)] = int(
+                        rec['valid_bytes'])
+        growing = []
+        for name, series in sorted(component_by_len.items()):
+            observed = [series.get(str(p)) for p in present]
+            if any(v is None for v in observed):
+                continue
+            if len(set(observed)) > 1:
+                growing.append(name)
+        total_flat = len(set(values)) == 1
+        constant = bool(total_flat and not growing)
         cert[op] = {
             'bytes_by_prefill_len': by_len,
+            'component_valid_bytes_by_prefill_len': component_by_len,
+            'growing_components': growing,
+            'total_valid_flat': total_flat,
+            'total_valid_flat_but_components_grow': bool(
+                total_flat and growing),
             'classification': 'constant' if constant else 'growing',
             'max_over_min': (
                 max(values) / min(values) if min(values) > 0 else None),

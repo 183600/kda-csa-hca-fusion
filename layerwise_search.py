@@ -80,9 +80,13 @@ Honesty / scope
   precision, allocator fragmentation, or the batch dimension (state is
   reported per sequence). See ``cache_accounting`` for the authoritative
   component taxonomy.
-* ``state_constant`` compares allocated bytes at ``T`` and ``2T``: a
-  heuristic two-point version of Exp 6's certificate (a memory-only layout
-  is exactly constant; any layout with a CSA/HCA layer grows).
+* ``state_constant`` is a component-aware, context-ratio certificate:
+  allocated bytes are swept at ``T, 2T, 4T`` and the layout is constant
+  only when *every component* is flat. A two-point total-only check is
+  unsound: HCA at ``T=14, m2=4`` has 1536 B at both 14 and 28 (compressed
+  KV doubles while the partial tail empties), so component cancellation
+  can mask unbounded growth. The report keeps the legacy two-point flag
+  as ``state_constant_two_point`` for audit and adds the full certificate.
 * Only the reference operators are searched. ``memory_type`` stays ``kda``
   (the probe geometry of ``recall_reach.make_grid_cfg``); extending the
   space to Mamba-2 / RWKV-7 is a matter of providing another
@@ -377,6 +381,36 @@ def read_budget(cfg, T: int) -> dict:
     }
 
 
+#: Context-length ratios for the state certificate's ratio sweep. The
+#: sweep must contain more than the two points ``{1, 2}``: a total-only
+#: comparison can be flat at two lengths while individual components
+#: (compressed blocks growing, partial tail emptying) cancel exactly.
+_STATE_CERTIFICATE_RATIOS = (1, 2, 4)
+
+
+def _loglog_slope(xs: Sequence[int], ys: Sequence[int]):
+    """Least-squares slope of ``log(y) ~ log(x)`` (``None`` if undefined).
+
+    Used as the certificate's growth exponent: 0 for constant state,
+    between 0 and 1 for sub-linear growth, ~1 for linear growth. Only
+    positive points enter the fit; fewer than two points or a degenerate
+    x-range yields ``None`` rather than a fabricated number.
+    """
+    pts = [(float(x), float(y)) for x, y in zip(xs, ys)
+           if x > 0 and y > 0]
+    if len(pts) < 2:
+        return None
+    lx = [math.log(x) for x, _ in pts]
+    ly = [math.log(y) for _, y in pts]
+    mx = sum(lx) / len(lx)
+    my = sum(ly) / len(ly)
+    den = sum((x - mx) ** 2 for x in lx)
+    if den <= 0.0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(lx, ly)) / den
+    return 0.0 if abs(slope) < 1e-12 else slope
+
+
 def cost_report(candidate: Candidate, *, m: int, m2: int, T: int,
                 d_model: int = 32, dtype_bytes: int = 4,
                 check_constant: bool = True) -> dict:
@@ -384,10 +418,21 @@ def cost_report(candidate: Candidate, *, m: int, m2: int, T: int,
 
     Returns plain floats/ints (JSON-safe). ``state_bytes_allocated`` /
     ``state_bytes_valid`` are per-sequence sums over Exp 3's component
-    taxonomy; ``state_bytes_by_op`` groups them by operator. When
-    ``check_constant`` and ``T > 0``, ``state_constant`` compares the
-    allocated total at ``T`` and ``2T`` (a two-point certificate: exactly
-    True for a memory-only layout, False for any layout with CSA/HCA).
+    taxonomy; ``state_bytes_by_op`` groups them by operator.
+
+    When ``check_constant`` and ``T > 0``, the report carries a
+    **component-aware state certificate** over a context-ratio sweep
+    ``T, 2T, 4T``:
+
+    * ``state_constant`` is True only when every component's allocated
+      bytes are identical at all swept lengths (hence the total is flat
+      for the right reason, not because components cancel);
+    * ``state_growth_certificate`` records the per-length totals, the
+      per-component series, the growing components, the log-log growth
+      exponent, and ``total_flat_but_components_grow`` (the cancellation
+      case a total-only check would misclassify);
+    * ``state_constant_two_point`` preserves the old ``T`` vs ``2T``
+      total-only verdict for audit; it is NOT the certificate.
     """
     if not isinstance(candidate, Candidate):
         raise TypeError(
@@ -416,14 +461,44 @@ def cost_report(candidate: Candidate, *, m: int, m2: int, T: int,
         **read_budget(cfg, T),
     }
     if check_constant and T > 0:
-        alloc2, _, _, _ = _state_bytes_at(cfg, 2 * T, dtype_bytes)
-        total2 = int(sum(alloc2.values()))
-        report['state_bytes_allocated_at_2T'] = total2
-        report['state_constant'] = (total2 == report['state_bytes_allocated'])
+        lengths = [T * r for r in _STATE_CERTIFICATE_RATIOS]
+        snapshots = [_state_bytes_at(cfg, length, dtype_bytes)[0]
+                     for length in lengths]
+        names = sorted({name for snap in snapshots for name in snap})
+        component_bytes = {
+            name: [int(snap.get(name, 0)) for snap in snapshots]
+            for name in names
+        }
+        totals = [int(sum(snap.values())) for snap in snapshots]
+        growing = sorted(
+            name for name, series in component_bytes.items()
+            if len(set(series)) > 1)
+        total_flat = len(set(totals)) == 1
+        report['state_bytes_allocated_at_2T'] = totals[1]
+        report['state_constant_two_point'] = (
+            totals[1] == totals[0])
+        report['state_constant'] = bool(total_flat and not growing)
+        report['state_growth_certificate'] = {
+            'lengths': lengths,
+            'total_bytes': totals,
+            'component_bytes': component_bytes,
+            'growing_components': growing,
+            'component_growth_exponents': {
+                name: _loglog_slope(lengths, component_bytes[name])
+                for name in growing
+            },
+            'total_flat': total_flat,
+            'total_flat_but_components_grow': bool(total_flat and growing),
+            'growth_exponent': _loglog_slope(lengths, totals),
+            'max_over_min': (
+                max(totals) / min(totals) if min(totals) > 0 else None),
+        }
     else:
         report['state_bytes_allocated_at_2T'] = report[
             'state_bytes_allocated']
+        report['state_constant_two_point'] = None
         report['state_constant'] = None
+        report['state_growth_certificate'] = None
     return report
 
 

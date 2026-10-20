@@ -304,11 +304,81 @@ def test_bench_decoding_records_state_bytes(device='cpu'):
     return results
 
 
+def test_certificate_rejects_component_cancellation():
+    """A flat total is not a constant state when components cancel.
+
+    Synthetic HCA-shaped rows at prefill lengths 30/60/120: compressed KV
+    grows 512 -> 1024 -> 2048 B while the partial tail empties
+    1536 -> 1024 -> 0 B, so the total stays exactly 2560 B. The old
+    total-only rule would call this constant; the component-aware
+    certificate must call it growing and expose the cancellation.
+    """
+    from run_decoding import _decode_state_certificate
+
+    lengths = [30, 60, 120]
+    rows = []
+    for p, compressed, tail in zip(lengths, (512, 1024, 2048),
+                                   (1536, 1024, 0)):
+        rows.append({
+            'op': 'hca', 'prefill_len': p, 'decode_state_bytes': 2560,
+            'decode_state_breakdown': {
+                'hca_compressed_kv': {'allocated_bytes': compressed,
+                                      'valid_bytes': compressed},
+                'hca_sliding_window': {'allocated_bytes': 512,
+                                       'valid_bytes': 512},
+                'hca_partial_tail': {'allocated_bytes': tail,
+                                     'valid_bytes': tail},
+            },
+        })
+    rows += [
+        {'op': 'kda', 'prefill_len': p, 'decode_state_bytes': 1100,
+         'decode_state_breakdown': {
+             'recurrent_state': {'allocated_bytes': 1000, 'valid_bytes': 1000},
+             'conv_lookback': {'allocated_bytes': 100, 'valid_bytes': 100},
+         }} for p in lengths
+    ] + [
+        # Legacy row pair without a breakdown: total-only fallback.
+        {'op': 'legacy_constant', 'prefill_len': p, 'decode_state_bytes': 64}
+        for p in lengths
+    ]
+    cert = _decode_state_certificate(rows, lengths)
+    hca = cert.get('hca', {})
+    kda = cert.get('kda', {})
+    legacy = cert.get('legacy_constant', {})
+    results = [
+        _ok('component cancellation is classified as growing',
+            hca.get('classification') == 'growing'
+            and hca.get('total_valid_flat') is True
+            and hca.get('total_valid_flat_but_components_grow') is True,
+            f"class={hca.get('classification')}, "
+            f"total_flat={hca.get('total_valid_flat')}, "
+            f"growing={hca.get('growing_components')}"),
+        _ok('certificate names both offsetting components',
+            hca.get('growing_components')
+            == ['hca_compressed_kv', 'hca_partial_tail']
+            and hca['component_valid_bytes_by_prefill_len'][
+                'hca_compressed_kv'] == {'30': 512, '60': 1024,
+                                         '120': 2048},
+            f"growing={hca.get('growing_components')}"),
+        _ok('genuinely constant components stay constant',
+            kda.get('classification') == 'constant'
+            and kda.get('growing_components') == []
+            and kda.get('total_valid_flat') is True,
+            f"class={kda.get('classification')}"),
+        _ok('legacy rows without a breakdown use the total-only fallback',
+            legacy.get('classification') == 'constant'
+            and legacy.get('growing_components') == [],
+            f"class={legacy.get('classification')}"),
+    ]
+    return results
+
+
 if __name__ == '__main__':
     all_rows = []
     for fn in (test_decoding_cache_nbytes_accounting,
                test_decode_state_constant_vs_growing,
-               test_bench_decoding_records_state_bytes):
+               test_bench_decoding_records_state_bytes,
+               test_certificate_rejects_component_cancellation):
         print(f'== {fn.__name__} ==')
         all_rows += fn()
     failed = [r for r in all_rows if r['status'] != 'PASS']
