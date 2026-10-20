@@ -391,7 +391,19 @@ class HybridConfig:
         if not isinstance(self.n_heads_v, int) or isinstance(self.n_heads_v, bool) or self.n_heads_v < 1:
             raise ValueError(
                 f"n_heads_v={self.n_heads_v!r} must be a positive int")
-        if self.n_heads_v % self.n_heads_qk != 0:
+        # Only KDA uses the GVA expansion; a CSA/HCA-only explicit layout
+        # must not be constrained by an unused KDA head ratio.
+        if self.layout is None:
+            uses_kda = self.n_kda > 0
+        elif isinstance(self.layout, (list, tuple)):
+            uses_kda = any(
+                kind == 'kda'
+                or (kind == 'memory' and self.memory_type == 'kda')
+                for kind in self.layout)
+        else:
+            # Let _resolve_layout_kinds report the malformed type below.
+            uses_kda = True
+        if uses_kda and self.n_heads_v % self.n_heads_qk != 0:
             raise ValueError(
                 f"n_heads_v={self.n_heads_v} must be divisible by "
                 f"n_heads_qk={self.n_heads_qk} (KDA GVA factor G = HV // H "
@@ -497,11 +509,12 @@ class HybridConfig:
                     f"(Python's ``[x] * n`` semantics), building a model "
                     f"with no {name.replace('n_', '').upper()} layers "
                     f"instead of crashing loudly.")
-        if self.n_kda + self.n_csa + self.n_hca == 0:
+        if self.layout is None and self.n_kda + self.n_csa + self.n_hca == 0:
             raise ValueError(
-                f"HybridConfig has n_kda=n_csa=n_hca=0; the model would "
-                f"have no attention layers at all. Set at least one of "
-                f"n_kda / n_csa / n_hca to a positive value.")
+                f"HybridConfig has n_kda=n_csa=n_hca=0 and no explicit "
+                f"layout; the model would have no attention layers at all. "
+                f"Set at least one ratio to a positive value, or pass an "
+                f"explicit non-empty layout.")
         # CSA-specific: topk=0 is valid (disables sparse selection) but
         # negative values would fail inside ``torch.topk``. nh must be >= 1
         # (it's a head count). sliding_window=0 disables the branch
@@ -643,10 +656,15 @@ class HybridConfig:
         # tiny test geometries like d_model=32 with the default
         # headdim=64 would otherwise be rejected for no KDA-relevant
         # reason.
-        uses_mamba2 = (
-            self.memory_type == 'mamba2'
-            or (resolved_layout is not None and 'mamba2' in resolved_layout)
-        )
+        if resolved_layout is not None:
+            uses_mamba2 = 'mamba2' in resolved_layout
+            uses_rwkv7 = 'rwkv7' in resolved_layout
+        else:
+            # Ratio mode fills the memory slots only when n_kda > 0.
+            uses_mamba2 = (self.memory_type == 'mamba2'
+                           and self.n_kda > 0)
+            uses_rwkv7 = (self.memory_type == 'rwkv7'
+                          and self.n_kda > 0)
         if uses_mamba2:
             validate_mamba2_geometry(
                 self.d_model, self.mamba_d_state, self.mamba_d_conv,
@@ -657,10 +675,6 @@ class HybridConfig:
         # must not be constrained by another route's divisibility — tiny
         # test geometries like d_model=32 with the default head_dim=64
         # would otherwise be rejected for no KDA-relevant reason).
-        uses_rwkv7 = (
-            self.memory_type == 'rwkv7'
-            or (resolved_layout is not None and 'rwkv7' in resolved_layout)
-        )
         if uses_rwkv7:
             validate_rwkv7_geometry(
                 self.d_model, self.rwkv_head_dim, self.rwkv_decay_lora,
