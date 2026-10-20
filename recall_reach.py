@@ -1214,8 +1214,19 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
     if isinstance(layouts, dict):
         layouts = list(layouts.items())
     else:
-        layouts = [(name, LAYOUT_PRESETS[name]) if isinstance(name, str)
-                   else tuple(name) for name in layouts]
+        # A bare layout tuple was previously collapsed to ``tuple(name)``
+        # (not a ``(label, layout)`` pair), so the loop below failed to
+        # unpack it. Keep the caller's sequence and derive a printable
+        # label (also gives strict-JSON metadata a string, not a nested
+        # tuple).
+        resolved_layouts = []
+        for name in layouts:
+            if isinstance(name, str):
+                resolved_layouts.append((name, LAYOUT_PRESETS[name]))
+            else:
+                seq = tuple(name)
+                resolved_layouts.append(('-'.join(seq), seq))
+        layouts = resolved_layouts
 
     rows = []
     for m, m2 in pairs:
@@ -1223,17 +1234,21 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
             layout = tuple(layout)
             cfg = make_grid_cfg(m, m2, layout, d_model=d_model,
                                 csa_topk=csa_topk)
-            plan = plan_from_config(cfg, cfg.layout)
+            # ``HybridConfig`` resolves 'memory' tokens to the concrete
+            # recurrent kind; report the stack that is actually built, not
+            # the caller's unresolved plan.
+            resolved = tuple(cfg.layout)
+            plan = plan_from_config(cfg, resolved)
             structural = structural_summary(plan, seq_len)
-            n_csa = sum(1 for k in layout if k == 'csa')
-            n_hca = sum(1 for k in layout if k == 'hca')
+            n_csa = sum(1 for k in resolved if k == 'csa')
+            n_hca = sum(1 for k in resolved if k == 'hca')
             row = {
                 'group': f'{layout_name}-m{m}-m2_{m2}',
                 'layout': layout_name,
-                'layout_sequence': '-'.join(layout),
+                'layout_sequence': '-'.join(resolved),
                 'm': int(m), 'm2': int(m2),
-                'n_layers': len(layout), 'n_csa': n_csa, 'n_hca': n_hca,
-                'n_memory': len(layout) - n_csa - n_hca,
+                'n_layers': len(resolved), 'n_csa': n_csa, 'n_hca': n_hca,
+                'n_memory': len(resolved) - n_csa - n_hca,
                 'compressed_entries_per_token': (n_csa / m + n_hca / m2),
                 'structural': structural,
                 'per_seed': [],
