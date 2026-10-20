@@ -1307,8 +1307,8 @@ class LMWithHybrid(nn.Module):
         *excluding* the input prompt. Sampling is deterministic when ``seed``
         is set.
         """
-        self.eval()
         was_training = self.training
+        self.eval()
         device = self.embed.weight.device
         input_ids = input_ids.to(device)
         B, T = input_ids.shape
@@ -1419,6 +1419,11 @@ def _export_lm_bundle(ckpt_path, export_dir, generation_defaults=None,
     gen_cfg = {
         'temperature': 1.0, 'top_k': None, 'top_p': None,
         'eos_token_id': None, 'max_new_tokens': 32, 'vocab': vocab,
+        # The bundle must be rebuildable without the training checkpoint:
+        # record the architecture discriminator and (for the parameter-
+        # matched dense baseline) its width alongside the weights.
+        'arch': arch,
+        'model_d_model': int(model.embed.embedding_dim),
     }
     if generation_defaults:
         for key in ('temperature', 'top_k', 'top_p', 'eos_token_id',
@@ -1462,9 +1467,12 @@ def load_lm_for_inference(export_dir, device='cpu'):
     with open(os.path.join(export_dir, 'generation_config.json')) as f:
         gen_config = json.load(f)
     vocab = int(gen_config.get('vocab', len(tok)))
+    arch = gen_config.get('arch', 'hybrid')
+    d_model = (gen_config.get('model_d_model')
+               if arch in ('softmax', 'dense') else None)
     with open(os.path.join(export_dir, 'pytorch_model.bin'), 'rb') as f:
         state_dict = torch.load(f, map_location='cpu', weights_only=True)
-    model = build_lm_model('hybrid', vocab, cfg)
+    model = build_lm_model(arch, vocab, cfg, d_model=d_model)
     model.load_state_dict(state_dict)
     model.to(device).eval()
     return model, tok, gen_config
