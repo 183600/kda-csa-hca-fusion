@@ -2723,9 +2723,11 @@ def main():
     # experiment is reproducible without hand-written notes.
     gate_failures = sum(1 for r in gate_record.get('reports', [])
                         if not r.get('passed'))
+    manifest_seeds = list(dict.fromkeys(
+        [*seeds, *(qat_seeds if not args.no_qat else [])]))
     append_run_manifest(make_run_manifest_entry(
         experiment='exp12_needle_haystack',
-        seeds=list(seeds),
+        seeds=manifest_seeds,
         provenance=payload['provenance'],
         hyperparameters={
             'eval_batch_size': int(args.eval_batch_size),
