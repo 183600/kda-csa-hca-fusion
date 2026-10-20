@@ -434,6 +434,16 @@ def _validate_mamba2_scan_inputs(
         raise ValueError(
             f"{fn_name}: C.shape={tuple(C.shape)} must equal "
             f"B.shape={tuple(B.shape)}.")
+    # Reject empty recurrence geometry before the divisibility check, which
+    # would otherwise raise an opaque ZeroDivisionError for ngroups == 0.
+    if nheads < 1:
+        raise ValueError(f"{fn_name}: nheads={nheads} must be >= 1.")
+    if headdim < 1:
+        raise ValueError(f"{fn_name}: headdim={headdim} must be >= 1.")
+    if ngroups < 1:
+        raise ValueError(f"{fn_name}: ngroups={ngroups} must be >= 1.")
+    if d_state < 1:
+        raise ValueError(f"{fn_name}: d_state={d_state} must be >= 1.")
     if nheads % ngroups != 0:
         raise ValueError(
             f"{fn_name}: nheads={nheads} must be divisible by "
