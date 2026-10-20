@@ -1,0 +1,20 @@
+# CI-only dependency set (CPU, Python 3.12).
+#
+# 只列 continuous-loop.yml 里真正用到的包：ci_gate.py（语法检查 + 全量 pytest 对拍）
+# 需要 torch(CPU) / einops / numpy / matplotlib / pytest。
+# 用途：
+#   - continuous-loop.yml 的 actions/setup-python 用它作为 pip 缓存键
+#     （cache-dependency-path: requirements-ci.txt + requirements.txt + pyproject.toml）；
+#   - 同一 workflow 里先按本文件预热一次，后续依赖安装直接复用 wheel。
+#
+# 安装方式（CPU wheel）：
+#   python3 -m pip install -r requirements-ci.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# 注意：版本必须与仓库 requirements.txt / pyproject.toml 保持一致；
+#       本文件由批量改造生成、生成时没有仓库 checkout，首次接入请人工核对版本。
+numpy==2.5.4
+torch==2.14.1
+einops==0.8.1
+matplotlib==3.11.2
+pytest==9.0.2
