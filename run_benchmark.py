@@ -282,6 +282,70 @@ def bench_kda_chunk(B, T, H, K, V, device):
     return fn
 
 
+def bench_kda_chunk_compiled(B, T, H, K, V, device, meta=None):
+    """``torch.compile`` chunked-KDA core row at the same boundary.
+
+    Draws from the SAME ``kda_chunk`` generator key as ``bench_kda_chunk``
+    (identical q/k/v/g/beta), gates parity against the eager chunk path
+    BEFORE timing, and records the compile policy plus the per-channel
+    decay parity residual. ``recompute_attn`` follows the
+    ``KDA_RECOMPUTE_ATTN`` env knob (default 0 = cached ``Aqk``) so the
+    memory-bounded policy can be measured without changing the eager
+    reference row.
+    """
+    gen = _make_op_gen('kda_chunk', T, device)
+    q = torch.nn.functional.normalize(
+        _rand(B, T, H, K, device=device, generator=gen), dim=-1)
+    k = torch.nn.functional.normalize(
+        _rand(B, T, H, K, device=device, generator=gen), dim=-1)
+    v = _rand(B, T, H, V, device=device, generator=gen)
+    g = -torch.rand(B, T, H, K, device=device, generator=gen) * 0.05
+    beta = torch.rand(B, T, H, device=device, generator=gen) * 0.2
+    BT = 64
+    recompute = os.environ.get(
+        'KDA_RECOMPUTE_ATTN', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+    with torch.no_grad():
+        o_ref, s_ref = ops_kda.naive_chunk_kda(
+            q, k, v, g, beta,
+            output_final_state=True, chunk_size=BT,
+            recompute_attn=recompute)
+        o_cmp, s_cmp = ops_kda.compiled_chunk_kda(
+            q, k, v, g, beta,
+            output_final_state=True, chunk_size=BT,
+            recompute_attn=recompute, fullgraph=True)
+    finite = bool(torch.isfinite(o_cmp).all())
+    if s_cmp is not None:
+        finite = finite and bool(torch.isfinite(s_cmp).all())
+    parity = (float((o_cmp - o_ref).abs().max().item())
+              if o_cmp.numel() and o_ref.numel() else 0.0)
+    state_parity = 0.0
+    if s_cmp is not None and s_ref is not None and s_cmp.numel():
+        state_parity = float((s_cmp - s_ref).abs().max().item())
+    if meta is not None:
+        meta['param_elements'] = 0
+        meta['kda_chunk_size'] = BT
+        meta['kda_recompute_attn'] = recompute
+        meta['kda_execution'] = 'torch.compile'
+        meta['kda_compile_fullgraph'] = True
+        meta['kda_compile_dynamic'] = False
+        meta['kda_chunk_parity_max_abs'] = parity
+        meta['kda_chunk_state_parity_max_abs'] = state_parity
+        meta['kda_chunk_parity_ok'] = bool(
+            finite and parity <= 1e-4 and state_parity <= 1e-4)
+    if not finite or parity > 1e-4 or state_parity > 1e-4:
+        raise RuntimeError(
+            f'compiled chunked-KDA parity gate failed at T={T}: '
+            f'finite={finite} out={parity:.3e} state={state_parity:.3e}')
+
+    def fn():
+        with torch.no_grad():
+            return ops_kda.compiled_chunk_kda(
+                q, k, v, g, beta,
+                output_final_state=True, chunk_size=BT,
+                recompute_attn=recompute, fullgraph=True)
+    return fn
+
+
 def bench_csa(B, T, d, device, meta=None):
     m, topk = 8, 4
     nh, c, dc, nIh, cI = 2, 16, 32, 2, 8
@@ -572,6 +636,8 @@ def main():
         ('softmax',  lambda T, meta=None: bench_softmax_attn(B, T, H, K, V, device)),
         ('kda_rec',  lambda T, meta=None: bench_kda_recurrent(B, T, H, K, V, device)),
         ('kda_chunk', lambda T, meta=None: bench_kda_chunk(B, T, H, K, V, device)),
+        ('kda_chunk_compiled', lambda T, meta=None: bench_kda_chunk_compiled(
+            B, T, H, K, V, device, meta=meta)),
         ('kda_rec_hybrid', lambda T, meta=None: bench_kda_recurrent(B, T, H2, K2, V2, device)),
         ('kda_chunk_hybrid', lambda T, meta=None: bench_kda_chunk(B, T, H2, K2, V2, device)),
         ('mamba2_scan', lambda T, meta=None: bench_mamba2_scan(B, T, d, device, meta=meta)),
@@ -593,6 +659,12 @@ def main():
         'kda_chunk': {'compute_boundary': 'core',
                       'n_layers': 1,
                       'note': 'chunked recurrence core only; q/k/v/g/beta pre-projected (H=4, K=V=32, matched to softmax capacity)'},
+        'kda_chunk_compiled': {'compute_boundary': 'core',
+                               'n_layers': 1,
+                               'note': ('torch.compile chunked recurrence core; '
+                                        'identical inputs to kda_chunk, '
+                                        'output/state parity-gated against '
+                                        'the eager chunk path before timing')},
         'kda_rec_hybrid': {'compute_boundary': 'core',
                            'n_layers': 1,
                            'note': 'recurrence core only; q/k/v/g/beta pre-projected (H=2, K=V=16, matched to hybrid KDA sub-layer config)'},
@@ -644,7 +716,14 @@ def main():
         'kda_rec':   {'heads': H, 'head_dim': K,
                       'note': 'recurrent delta-rule; O(1) state, attends to all T via recurrence'},
         'kda_chunk': {'heads': H, 'head_dim': K, 'chunk_size': 64,
+                      'recompute_attn': False,
                       'note': 'chunked recurrence; attends to all T via chunk-state passing'},
+        'kda_chunk_compiled': {'heads': H, 'head_dim': K, 'chunk_size': 64,
+                               'execution': 'torch.compile fullgraph=True',
+                               'note': ('same per-channel-decay chunked '
+                                        'recurrence as kda_chunk; '
+                                        'torch.compile-fused setup + '
+                                        'state carry')},
         'kda_rec_hybrid': {'heads': H2, 'head_dim': K2,
                            'note': 'recurrent delta-rule at hybrid KDA sub-layer config (H=2, K=V=16); directly comparable to the hybrid stack\'s per-KDA-layer cost'},
         'kda_chunk_hybrid': {'heads': H2, 'head_dim': K2, 'chunk_size': 64,
@@ -722,9 +801,34 @@ def main():
                            'device': str(device), 'repeats': n_repeats,
                            'tokens_per_s': ((B * T) / t) if t > 0 else None,
                            'param_elements': meta.get('param_elements')}
-                    if name in {'kda_rec', 'kda_chunk', 'kda_rec_hybrid',
-                                'kda_chunk_hybrid', 'hybrid'}:
-                        row['kda_backend'] = _selected_kda_backend()
+                    if name in {'kda_rec', 'kda_chunk', 'kda_chunk_compiled',
+                                'kda_rec_hybrid', 'kda_chunk_hybrid',
+                                'hybrid'}:
+                        # The compiled row is always the reference operator
+                        # executed by torch.compile (even when KDA_BACKEND
+                        # selects FLA for the eager rows), so record the
+                        # reference identity for the roofline boundary join
+                        # and the execution mode separately.
+                        row['kda_backend'] = (
+                            'reference' if name == 'kda_chunk_compiled'
+                            else _selected_kda_backend())
+                    if meta.get('kda_execution') is not None:
+                        row['kda_execution'] = meta['kda_execution']
+                        row['kda_compile_fullgraph'] = meta.get(
+                            'kda_compile_fullgraph')
+                        row['kda_compile_dynamic'] = meta.get(
+                            'kda_compile_dynamic')
+                        row['kda_chunk_parity_max_abs'] = meta.get(
+                            'kda_chunk_parity_max_abs')
+                        row['kda_chunk_state_parity_max_abs'] = meta.get(
+                            'kda_chunk_state_parity_max_abs')
+                        row['kda_chunk_parity_ok'] = meta.get(
+                            'kda_chunk_parity_ok')
+                    if name in {'kda_chunk', 'kda_chunk_compiled'}:
+                        row['kda_chunk_size'] = meta.get(
+                            'kda_chunk_size', 64)
+                        row['kda_recompute_attn'] = meta.get(
+                            'kda_recompute_attn', False)
                     if name in {'mamba2_scan', 'mamba2_chunked_scan',
                                 'mamba2_layer', 'hybrid_mamba2'}:
                         row['mamba_backend'] = _selected_mamba_backend()
@@ -753,10 +857,15 @@ def main():
                     err_row = {
                         'T': T, 'op': name, 'error': str(e),
                         'device': str(device),
-                        'kda_backend': (os.environ.get('KDA_BACKEND', 'reference')
-                                        if name in {'kda_rec', 'kda_chunk',
-                                                    'kda_rec_hybrid', 'kda_chunk_hybrid',
-                                                    'hybrid'} else None),
+                        'kda_backend': ('reference'
+                                        if name == 'kda_chunk_compiled'
+                                        else (os.environ.get(
+                                            'KDA_BACKEND', 'reference')
+                                            if name in {
+                                                'kda_rec', 'kda_chunk',
+                                                'kda_rec_hybrid',
+                                                'kda_chunk_hybrid',
+                                                'hybrid'} else None)),
                         'mamba_backend': (os.environ.get('MAMBA_BACKEND', 'reference')
                                           if name in {'mamba2_scan',
                                                       'mamba2_chunked_scan',
@@ -769,6 +878,9 @@ def main():
                         'repeats': n_repeats,
                         'param_elements': None,
                     }
+                    if name == 'kda_chunk_compiled':
+                        err_row['kda_execution'] = 'torch.compile'
+                        err_row['kda_chunk_size'] = 64
                     if name in {'csa', 'hybrid'}:
                         err_row['csa_indexer_normalize_qk'] = True
                         err_row['csa_ste_in_timed_region'] = False

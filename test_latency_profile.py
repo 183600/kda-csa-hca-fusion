@@ -457,6 +457,59 @@ def test_real_profile_small_and_json_roundtrip():
             and 'model_best_chunk_size' in raw['metadata'], '')
 
 
+def test_benchmark_compiled_kda_row_metadata():
+    print('\nTest: Exp 2 compiled-KDA row carries parity + execution metadata')
+    import run_benchmark as rb
+
+    meta = {}
+    fn = rb.bench_kda_chunk_compiled(
+        1, 130, 4, 32, 32, torch.device('cpu'), meta=meta)
+    with torch.no_grad():
+        y, state = fn()
+    _ok('compiled KDA row runs at tiny T',
+        tuple(y.shape) == (1, 130, 4, 32)
+        and tuple(state.shape) == (1, 4, 32, 32),
+        f'y={tuple(y.shape)} s={tuple(state.shape)}')
+    _ok('row records the compiled execution policy',
+        meta.get('kda_execution') == 'torch.compile'
+        and meta.get('kda_compile_fullgraph') is True,
+        f"exec={meta.get('kda_execution')} "
+        f"fullgraph={meta.get('kda_compile_fullgraph')}")
+    _ok('row records a passing output/state parity gate',
+        meta.get('kda_chunk_parity_ok') is True
+        and meta.get('kda_chunk_parity_max_abs', 1.0) <= 1e-4
+        and meta.get('kda_chunk_state_parity_max_abs', 1.0) <= 1e-4,
+        f"out={meta.get('kda_chunk_parity_max_abs')} "
+        f"state={meta.get('kda_chunk_state_parity_max_abs')}")
+    _ok('row keeps the core-boundary weight contract',
+        meta.get('param_elements') == 0, str(meta.get('param_elements')))
+
+
+def test_run_roofline_accounts_compiled_kda_route():
+    print('\nTest: run_roofline prices the compiled KDA row as chunked core')
+    import roofline
+    from run_roofline import _account_row
+
+    T = 128
+    w = {'heads': 4, 'head_dim': 32, 'chunk_size': 64}
+    acct = _account_row({
+        'op': 'kda_chunk_compiled', 'T': T, 'time_ms': 1.0,
+        'workload': w, 'kda_execution': 'torch.compile',
+        'kda_chunk_parity_max_abs': 1e-9})
+    _ok('compiled KDA row stays on the core boundary',
+        acct['analytic_boundary'] == 'core', acct['analytic_boundary'])
+    _ok('compiled KDA row uses the chunked KDA FLOP model',
+        acct['flops'] == roofline.kda_core_flops(
+            T, 4, 32, 32, chunked=True, chunk_size=64),
+        f"{acct['flops']}")
+    _ok('compiled KDA row uses the chunked compulsory-traffic model',
+        acct['bytes'] == roofline.core_bytes(
+            'kda', T, heads=4, head_dim=32, value_dim=32,
+            chunked=True, chunk_size=64), f"{acct['bytes']}")
+    _ok('compiled KDA core row carries no weight traffic',
+        acct['weights_included'] is False, '')
+
+
 def test_benchmark_chunked_scan_row_metadata():
     print('\nTest: Exp 2 chunked-scan row carries boundary metadata + parity')
     import run_benchmark as rb
@@ -495,6 +548,8 @@ _TEST_FUNCS = [
     test_recommend_and_summarize_synthetic,
     test_real_profile_small_and_json_roundtrip,
     test_benchmark_chunked_scan_row_metadata,
+    test_benchmark_compiled_kda_row_metadata,
+    test_run_roofline_accounts_compiled_kda_route,
 ]
 
 

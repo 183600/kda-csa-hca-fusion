@@ -196,7 +196,8 @@ def _core_accounting(op: str, T: int, w: dict) -> tuple[float, float]:
         nbytes = roofline.core_bytes('softmax', T, heads=heads, head_dim=kd,
                                      value_dim=vd)
     else:
-        chunked = op in ('kda_chunk', 'kda_chunk_hybrid')
+        chunked = op in ('kda_chunk', 'kda_chunk_compiled',
+                         'kda_chunk_hybrid')
         cs = w.get('chunk_size', 64)
         flops = roofline.kda_core_flops(T, heads, kd, vd, chunked=chunked,
                                         chunk_size=cs)
@@ -238,7 +239,8 @@ def _account_row(row: dict) -> dict:
     """Build the analytic (flops, bytes) record for one Exp 2 benchmark row."""
     op, T = row['op'], row['T']
     w = row.get('workload') or {}
-    if op in ('softmax', 'kda_rec', 'kda_chunk', 'kda_rec_hybrid',
+    if op in ('softmax', 'kda_rec', 'kda_chunk',
+              'kda_chunk_compiled', 'kda_rec_hybrid',
               'kda_chunk_hybrid'):
         flops, nbytes = _core_accounting(op, T, w)
         return {'flops': flops, 'bytes': nbytes, 'weights_included': False,
@@ -376,6 +378,13 @@ def main() -> int:
         if row.get('scan_boundary') is not None:
             point['scan_boundary'] = row['scan_boundary']
             point['scan_parity_max_abs'] = row.get('scan_parity_max_abs')
+        # Compiled-KDA rows carry their execution policy and the parity
+        # residual against the eager chunk path, so the roofline join does
+        # not silently treat a compiled row as a different operator.
+        if row.get('kda_execution') is not None:
+            point['kda_execution'] = row['kda_execution']
+            point['kda_chunk_parity_max_abs'] = row.get(
+                'kda_chunk_parity_max_abs')
         point.update(roofline.roofline_point(
             flops=acct['flops'], nbytes=acct['bytes'],
             time_ms=row['time_ms'], peak_flops_per_s=peak_flops,
