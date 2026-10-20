@@ -9,8 +9,10 @@ This runner joins three existing artifacts:
   and state-size formulas, evaluated at the EXACT Exp 2 geometry read from
   each row's ``workload`` metadata;
 * ``roofline.ssd_core_flops`` / ``core_bytes('ssd', ...)`` for the
-  ``mamba2_scan`` core row (sequential or chunked per the workload's
-  recorded ``mamba_chunk_size``); ``mamba2_layer`` and ``hybrid_mamba2``
+  ``mamba2_scan`` / ``mamba2_chunked_scan`` core rows (sequential or
+  chunked per the workload's recorded ``mamba_chunk_size``); the chunked
+  row's ``scan_boundary`` metadata is carried into the output point;
+  ``mamba2_layer`` and ``hybrid_mamba2``
   end-to-end rows are joined through ``run_kv_cache`` at their recorded
   realization geometry, so the join uses the benchmarked Mamba settings
   instead of paper-scale defaults.
@@ -160,13 +162,14 @@ def _hybrid_mamba2_geometry(w: dict) -> dict:
 
 
 def _mamba2_scan_accounting(T: int, w: dict) -> dict:
-    """Core-boundary (flops, bytes) for a ``mamba2_scan`` benchmark row.
+    """Core-boundary (flops, bytes) for a sequential/chunked SSD scan row.
 
     Uses :func:`roofline.ssd_core_flops` / ``core_bytes('ssd', ...)`` —
     the sequential recurrence when the row was benchmarked that way, the
     chunked SSD decomposition when the workload records
-    ``mamba_chunk_size > 0`` (so a future chunked benchmark row is
-    accounted correctly without touching this function).
+    ``mamba_chunk_size > 0``. The benchmark's ``mamba2_chunked_scan`` row
+    records that knob (and its ``scan_boundary`` metadata), so the same
+    join prices both rows without a per-op special case.
     """
     heads, headdim, d_state = w['heads'], w['headdim'], w['d_state']
     raw_cs = w.get('mamba_chunk_size', 0)
@@ -240,10 +243,10 @@ def _account_row(row: dict) -> dict:
         flops, nbytes = _core_accounting(op, T, w)
         return {'flops': flops, 'bytes': nbytes, 'weights_included': False,
                 'analytic_boundary': 'core'}
-    if op == 'mamba2_scan':
-        # Core-boundary Mamba-2 (SSD) scan: accounted by the roofline SSD
-        # model (sequential or chunked, per the workload's knob), NOT by
-        # the end-to-end run_kv_cache path used for the layer rows.
+    if op in ('mamba2_scan', 'mamba2_chunked_scan'):
+        # Core-boundary Mamba-2 (SSD) scan rows: accounted by the roofline
+        # SSD model (sequential or chunked, per the workload's knob), NOT
+        # by the end-to-end run_kv_cache path used for the layer rows.
         return _mamba2_scan_accounting(T, w)
     flops, nbytes, weights_included = _e2e_accounting(
         op, T, w, row.get('param_elements'))
@@ -366,6 +369,13 @@ def main() -> int:
         }
         if backend not in (None, 'reference'):
             point['kda_backend'] = backend
+        # Chunked-SSD rows carry the operator boundary that the analytic
+        # work model was evaluated at (n_chunks / padded_len / scan_levels)
+        # plus the parity residual of the measured operator; preserving it
+        # makes the join auditable instead of re-deriving chunk metadata.
+        if row.get('scan_boundary') is not None:
+            point['scan_boundary'] = row['scan_boundary']
+            point['scan_parity_max_abs'] = row.get('scan_parity_max_abs')
         point.update(roofline.roofline_point(
             flops=acct['flops'], nbytes=acct['bytes'],
             time_ms=row['time_ms'], peak_flops_per_s=peak_flops,
@@ -406,7 +416,8 @@ def main() -> int:
         'flops_model': (
             'analytic prefill FLOPs at the Exp 2 geometry: core-only '
             '(causal QK^T + AV, the KDA recurrence + chunk terms, or the '
-            'SSD scan model roofline.ssd_core_flops for mamba2_scan) for '
+            'SSD scan model roofline.ssd_core_flops for '
+            'mamba2_scan/mamba2_chunked_scan) for '
             'core-boundary rows; run_kv_cache.prefill_flops end-to-end '
             'accounting for csa/hca/hybrid/mamba2_layer/hybrid_mamba2 rows, '
             'at their recorded realization geometry.'),

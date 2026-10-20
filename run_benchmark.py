@@ -43,7 +43,8 @@ from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
 from ops_hca import naive_hca
 from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
-from ops_mamba import Mamba2Mixer, build_mamba2_mixer, naive_mamba2_scan
+from ops_mamba import (Mamba2Mixer, build_mamba2_mixer, chunked_mamba2_scan,
+                       mamba2_scan_boundary_metadata, naive_mamba2_scan)
 from ops_mamba_backend import validate_mamba_backend
 import ops_kda
 
@@ -342,15 +343,16 @@ def bench_hca(B, T, d, device, meta=None):
     return fn
 
 
-def bench_mamba2_scan(B, T, d, device, meta=None):
-    """Mamba-2 SSD scan at the CORE boundary (mirrors bench_kda_recurrent).
+def _mamba2_scan_inputs(B, T, device):
+    """Shared seeded inputs for the sequential/chunked SSD core rows.
 
-    Inputs (x, dt, B, C) are pre-projected OUTSIDE the timed region, so
-    the row measures only the recurrence — the same boundary as the
-    softmax / kda_rec / kda_chunk rows. Geometry is capacity-matched to
-    the KDA core bench (H=4, K=V=32 -> 4 heads x 32x32 state): 4 heads x
-    (headdim=32 x d_state=32) = the same per-model recurrent-state size,
-    so the scan-cost comparison is not confounded by state size.
+    Both scan rows draw from the SAME ``mamba2_scan`` generator key, so the
+    chunked row is a parity-checked, apples-to-apples re-execution of the
+    sequential row's exact inputs (not a different random draw). Geometry
+    is capacity-matched to the KDA core bench (H=4, K=V=32 -> 4 heads x
+    32x32 state): 4 heads x (headdim=32 x d_state=32) = the same per-model
+    recurrent-state size, so the scan-cost comparison is not confounded by
+    state size.
     """
     H, headdim, d_state = 4, 32, 32
     gen = _make_op_gen('mamba2_scan', T, device)
@@ -362,6 +364,17 @@ def bench_mamba2_scan(B, T, d, device, meta=None):
     A = -torch.exp(torch.log(torch.arange(1, H + 1, device=device,
                                            dtype=torch.float32)))
     D = torch.ones(H, device=device)
+    return x, dt, Bm, Cm, A, D
+
+
+def bench_mamba2_scan(B, T, d, device, meta=None):
+    """Mamba-2 SSD scan at the CORE boundary (mirrors bench_kda_recurrent).
+
+    Inputs (x, dt, B, C) are pre-projected OUTSIDE the timed region, so
+    the row measures only the recurrence — the same boundary as the
+    softmax / kda_rec / kda_chunk rows.
+    """
+    x, dt, Bm, Cm, A, D = _mamba2_scan_inputs(B, T, device)
     if meta is not None:
         meta['param_elements'] = 0  # the core boundary carries no weights
 
@@ -370,6 +383,50 @@ def bench_mamba2_scan(B, T, d, device, meta=None):
             return naive_mamba2_scan(
                 x, dt, Bm, Cm, A, D,
                 output_final_state=True)
+    return fn
+
+
+def bench_mamba2_chunked_scan(B, T, d, device, meta=None, chunk_size=64):
+    """Chunked-SSD scan at the SAME core boundary as ``bench_mamba2_scan``.
+
+    Same inputs and geometry as the sequential row, so the latency ratio is
+    a clean kernel/organization comparison. Correctness is gated BEFORE any
+    timing: the chunked output must be finite and match the sequential
+    reference on the same inputs (max-abs <= 1e-4 fp32); a divergent
+    operator raises instead of producing a fast-but-wrong row.
+
+    ``meta`` records the operator-boundary decomposition
+    (``mamba2_scan_boundary_metadata``: n_chunks / padded_len / scan_levels
+    / chunk starts) plus the parity residual, so the row is self-describing
+    and ``run_roofline`` can price the exact chunked decomposition.
+    """
+    x, dt, Bm, Cm, A, D = _mamba2_scan_inputs(B, T, device)
+    args = (x, dt, Bm, Cm, A, D)
+    with torch.no_grad():
+        y_ref, _ = naive_mamba2_scan(*args, output_final_state=True)
+        y_ch, s_ch = chunked_mamba2_scan(
+            *args, output_final_state=True, chunk_size=chunk_size)
+    finite = bool(torch.isfinite(y_ch).all())
+    if s_ch is not None:
+        finite = finite and bool(torch.isfinite(s_ch).all())
+    parity = (float((y_ch - y_ref).abs().max().item())
+              if y_ch.numel() and y_ref.numel() else 0.0)
+    boundary = mamba2_scan_boundary_metadata(T, chunk_size=chunk_size)
+    if meta is not None:
+        meta['param_elements'] = 0
+        meta['mamba_chunk_size'] = chunk_size
+        meta['scan_boundary'] = boundary
+        meta['scan_parity_max_abs'] = parity
+        meta['scan_parity_ok'] = bool(finite and parity <= 1e-4)
+    if not finite or parity > 1e-4:
+        raise RuntimeError(
+            f'chunked SSD parity gate failed at T={T} C={chunk_size}: '
+            f'finite={finite} max_abs={parity:.3e}')
+
+    def fn():
+        with torch.no_grad():
+            return chunked_mamba2_scan(
+                *args, output_final_state=True, chunk_size=chunk_size)
     return fn
 
 
@@ -518,6 +575,8 @@ def main():
         ('kda_rec_hybrid', lambda T, meta=None: bench_kda_recurrent(B, T, H2, K2, V2, device)),
         ('kda_chunk_hybrid', lambda T, meta=None: bench_kda_chunk(B, T, H2, K2, V2, device)),
         ('mamba2_scan', lambda T, meta=None: bench_mamba2_scan(B, T, d, device, meta=meta)),
+        ('mamba2_chunked_scan', lambda T, meta=None: bench_mamba2_chunked_scan(
+            B, T, d, device, meta=meta)),
         ('mamba2_layer', lambda T, meta=None: bench_mamba2_layer(B, T, d, device, meta=meta)),
         ('csa',      lambda T, meta=None: bench_csa(B, T, d, device, meta=meta)),
         ('hca',      lambda T, meta=None: bench_hca(B, T, d, device, meta=meta)),
@@ -551,7 +610,19 @@ def main():
                       'note': '5-layer KDA+CSA+HCA stack with LayerNorm, projections, attention, state management (3:1:1 default ratio)'},
         'mamba2_scan': {'compute_boundary': 'core',
                         'n_layers': 1,
-                        'note': 'SSD recurrence core only; x/dt/B/C pre-projected (4 heads x 32x32 state, capacity-matched to kda_rec)'},
+                        'note': ('SSD recurrence core only; x/dt/B/C '
+                                 'pre-projected (4 heads x 32x32 state, '
+                                 'capacity-matched to kda_rec); sequential '
+                                 'reference scan')},
+        'mamba2_chunked_scan': {'compute_boundary': 'core',
+                                'n_layers': 1,
+                                'note': ('chunked SSD scan core only; same '
+                                         'inputs/geometry as mamba2_scan '
+                                         '(C=64); quadratic intra-chunk + '
+                                         'Hillis-Steele chunk transition '
+                                         'scan; output parity-gated against '
+                                         'the sequential reference before '
+                                         'timing')},
         'mamba2_layer': {'compute_boundary': 'end_to_end_single_layer',
                          'n_layers': 1,
                          'note': 'single Mamba-2 mixer from hidden state (in_proj + causal conv + x_proj + scan + gate + out_proj)'},
@@ -602,7 +673,18 @@ def main():
                       'attends_to_all_T': False,
                       'note': 'hybrid stack: KDA recurrence covers all T; CSA layer is sparse (topk-capped, ~constant radius); HCA layer attends to all compressed blocks (linear in T)'},
         'mamba2_scan': {'heads': 4, 'headdim': 32, 'd_state': 32,
-                        'note': 'SSD scan core only; x/dt/B/C pre-projected (4 heads x 32x32 state, capacity-matched to the kda_rec core row)'},
+                        'ngroups': 1, 'mamba_chunk_size': 0,
+                        'note': ('SSD scan core only; x/dt/B/C '
+                                 'pre-projected (4 heads x 32x32 state, '
+                                 'capacity-matched to the kda_rec core '
+                                 'row); sequential reference scan')},
+        'mamba2_chunked_scan': {'heads': 4, 'headdim': 32, 'd_state': 32,
+                                'ngroups': 1, 'mamba_chunk_size': 64,
+                                'note': ('same core boundary and inputs as '
+                                         'mamba2_scan; chunk_size=64 '
+                                         'chunked SSD decomposition '
+                                         '(parity-gated against the '
+                                         'sequential reference)')},
         'mamba2_layer': {'d': d, 'expand': 2, 'd_state': 16, 'd_conv': 4,
                          'headdim': 32, 'backend_env': 'MAMBA_BACKEND',
                          'note': 'full Mamba-2 mixer from hidden state (in_proj + causal conv + x_proj + scan + gate + out_proj)'},
@@ -638,15 +720,24 @@ def main():
                     t, mem = _measure(fn, repeats=n_repeats, device=device)
                     row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                            'device': str(device), 'repeats': n_repeats,
+                           'tokens_per_s': ((B * T) / t) if t > 0 else None,
                            'param_elements': meta.get('param_elements')}
                     if name in {'kda_rec', 'kda_chunk', 'kda_rec_hybrid',
                                 'kda_chunk_hybrid', 'hybrid'}:
                         row['kda_backend'] = _selected_kda_backend()
-                    if name in {'mamba2_scan', 'mamba2_layer',
-                                'hybrid_mamba2'}:
+                    if name in {'mamba2_scan', 'mamba2_chunked_scan',
+                                'mamba2_layer', 'hybrid_mamba2'}:
                         row['mamba_backend'] = _selected_mamba_backend()
                         row['mamba_effective_backend'] = meta.get(
                             'mamba_effective_backend', 'reference')
+                    # Operator-boundary metadata for the chunked SSD row:
+                    # decomposition + the parity residual measured against
+                    # the sequential reference on the SAME inputs.
+                    if meta.get('scan_boundary') is not None:
+                        row['scan_boundary'] = meta['scan_boundary']
+                        row['scan_parity_max_abs'] = meta.get(
+                            'scan_parity_max_abs')
+                        row['scan_parity_ok'] = meta.get('scan_parity_ok')
                     if name in {'csa', 'hybrid'}:
                         row['csa_indexer_normalize_qk'] = True
                         row['csa_ste_in_timed_region'] = False
@@ -667,9 +758,12 @@ def main():
                                                     'kda_rec_hybrid', 'kda_chunk_hybrid',
                                                     'hybrid'} else None),
                         'mamba_backend': (os.environ.get('MAMBA_BACKEND', 'reference')
-                                          if name in {'mamba2_scan', 'mamba2_layer',
+                                          if name in {'mamba2_scan',
+                                                      'mamba2_chunked_scan',
+                                                      'mamba2_layer',
                                                       'hybrid_mamba2'} else None),
                         'time_ms': None, 'peak_mem_MB': None,
+                        'tokens_per_s': None,
                         'time_min_ms': None, 'time_max_ms': None,
                         'time_std_ms': None,
                         'repeats': n_repeats,

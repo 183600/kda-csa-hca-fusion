@@ -126,6 +126,10 @@ def fig_benchmark():
         'csa': 'end_to_end_single_layer',
         'hca': 'end_to_end_single_layer',
         'hybrid': 'end_to_end_multi_layer',
+        'mamba2_scan': 'core',
+        'mamba2_chunked_scan': 'core',
+        'mamba2_layer': 'end_to_end_single_layer',
+        'hybrid_mamba2': 'end_to_end_multi_layer',
     }
     ops = {}
     for r in data:
@@ -149,11 +153,16 @@ def fig_benchmark():
 
     markers = {'softmax': 'o-', 'kda_rec': 's-', 'kda_chunk': '^-',
                'kda_rec_hybrid': 's--', 'kda_chunk_hybrid': '^--',
-               'csa': 'D-', 'hca': 'v-', 'hybrid': 'p-'}
+               'csa': 'D-', 'hca': 'v-', 'hybrid': 'p-',
+               'mamba2_scan': 'x-', 'mamba2_chunked_scan': 'x--',
+               'mamba2_layer': '<-', 'hybrid_mamba2': '<--'}
     labels = {'softmax': 'Softmax attention', 'kda_rec': 'KDA (recurrent)',
               'kda_chunk': 'KDA (chunk)', 'kda_rec_hybrid': 'KDA (recurrent, hybrid-config)',
               'kda_chunk_hybrid': 'KDA (chunk, hybrid-config)', 'csa': 'CSA', 'hca': 'HCA',
-              'hybrid': 'Fused KDA+CSA+HCA'}
+              'hybrid': 'Fused KDA+CSA+HCA',
+              'mamba2_scan': 'Mamba-2 SSD (sequential)',
+              'mamba2_chunked_scan': 'Mamba-2 SSD (chunked, C=64)',
+              'mamba2_layer': 'Mamba-2 layer', 'hybrid_mamba2': 'Fused Mamba-2+CSA+HCA'}
     boundary_titles = {
         'core': 'Core kernel only\n(q/k/v pre-projected; 1 layer)',
         'end_to_end_single_layer': 'End-to-end single layer\n(H -> projections -> attention -> o_proj)',

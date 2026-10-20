@@ -408,11 +408,13 @@ not to pre-empt the answer by changing the default route.
   dual-form oracle (section 4.1), so the CPU-only official-backend gap
   does not leave the reference unverified. The chunked path (section
   4.2) is an alternative reference evaluation for hosts without
-  `mamba-ssm`; it is parity-pinned to both other views but is not wired
-  into the main experiment rows yet (`mamba_chunk_size` defaults to 0).
-  Its device-level latency is measured by `latency_profile.py` (section
-  4.3); those numbers are host- and torch-build-specific and must not be
-  compared across machines.
+  `mamba-ssm`; it is parity-pinned to both other views. `mamba_chunk_size`
+  still defaults to 0, so the mixer's default route is unchanged, but Exp 2
+  now carries a parity-gated `mamba2_chunked_scan` core row and the
+  chunk-boundary metadata contract is documented in
+  `docs/ssd-scan-boundaries.md`. Its device-level latency is also measured
+  by `latency_profile.py` (section 4.3); those numbers are host- and
+  torch-build-specific and must not be compared across machines.
 * Hybrid-decode equality tests use the `csa_topk=100` protocol (select
   every visible block); with the deterministic ascending-index tie-break
   in `ops_csa._canonical_topk_indices` this is defense-in-depth, not a

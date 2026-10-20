@@ -196,6 +196,18 @@ def test_run_roofline_accounts_mamba_route():
             T, 4, 32, 32, chunked=True, chunk_size=32)
         and chunked_acct['bytes'] < acct['bytes'],
         f"{chunked_acct['flops']} vs {acct['flops']}")
+    # The dedicated benchmark row must take the same core-boundary path,
+    # not fall through to the end-to-end run_kv_cache accounting.
+    row_chunked = _account_row({
+        'op': 'mamba2_chunked_scan', 'T': T, 'time_ms': 1.0,
+        'workload': {**scan_w, 'mamba_chunk_size': 32}})
+    _ok('mamba2_chunked_scan boundary is core',
+        row_chunked['analytic_boundary'] == 'core',
+        row_chunked['analytic_boundary'])
+    _ok('mamba2_chunked_scan row prices the chunked decomposition',
+        row_chunked['flops'] == chunked_acct['flops']
+        and row_chunked['bytes'] == chunked_acct['bytes'],
+        f"{row_chunked['flops']} vs {chunked_acct['flops']}")
 
     # mamba2_layer: end-to-end single mixer at the RECORDED realization.
     layer_w = {'d': 64, 'expand': 2, 'd_state': 16, 'd_conv': 4, 'headdim': 32}
@@ -445,6 +457,31 @@ def test_real_profile_small_and_json_roundtrip():
             and 'model_best_chunk_size' in raw['metadata'], '')
 
 
+def test_benchmark_chunked_scan_row_metadata():
+    print('\nTest: Exp 2 chunked-scan row carries boundary metadata + parity')
+    import run_benchmark as rb
+
+    meta = {}
+    fn = rb.bench_mamba2_chunked_scan(1, 130, 64, torch.device('cpu'),
+                                      meta=meta)
+    with torch.no_grad():
+        y, state = fn()
+    _ok('chunked row runs at tiny T', tuple(y.shape) == (1, 130, 4, 32)
+        and tuple(state.shape) == (1, 4, 32, 32),
+        f'y={tuple(y.shape)} s={tuple(state.shape)}')
+    boundary = meta.get('scan_boundary') or {}
+    _ok('row records the chunk decomposition',
+        boundary.get('n_chunks') == 3 and boundary.get('padded_len') == 192
+        and boundary.get('scan_levels') == 2,
+        f"boundary={boundary}")
+    _ok('row records a passing parity gate',
+        meta.get('scan_parity_ok') is True
+        and meta.get('scan_parity_max_abs', 1.0) <= 1e-4,
+        f"parity={meta.get('scan_parity_max_abs')}")
+    _ok('row keeps the core-boundary weight contract',
+        meta.get('param_elements') == 0, str(meta.get('param_elements')))
+
+
 _TEST_FUNCS = [
     test_ssd_core_flops_sequential_formula,
     test_ssd_core_flops_breakdown_exact,
@@ -457,6 +494,7 @@ _TEST_FUNCS = [
     test_profile_parity_guard_detects_divergence,
     test_recommend_and_summarize_synthetic,
     test_real_profile_small_and_json_roundtrip,
+    test_benchmark_chunked_scan_row_metadata,
 ]
 
 
