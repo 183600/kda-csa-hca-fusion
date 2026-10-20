@@ -336,6 +336,26 @@ class GatedDeltaRule(nn.Module):
             return (torch.zeros(B, 0, H, V, dtype=dtype, device=device),
                     S)
 
+        # Parameters default to float32, and a caller-provided initial
+        # state may differ from the activation dtype. Promote every operand
+        # (including the state) to one work dtype: multiplying by a
+        # float32 gate would otherwise promote ``S`` and then fail the
+        # ``q @ S`` matmul on mixed dtypes. When all inputs already share a
+        # dtype this is a no-op and preserves the original output dtype.
+        work_dtype = torch.promote_types(
+            torch.promote_types(q.dtype, k.dtype),
+            torch.promote_types(v.dtype, S.dtype))
+        if q.dtype != work_dtype:
+            q = q.to(work_dtype)
+        if k.dtype != work_dtype:
+            k = k.to(work_dtype)
+        if v.dtype != work_dtype:
+            v = v.to(work_dtype)
+        if S.dtype != work_dtype:
+            S = S.to(work_dtype)
+        gate_state = gate_state.to(dtype=work_dtype, device=device)
+        beta = beta.to(dtype=work_dtype, device=device)
+
         # ``beta * k`` is a pure elementwise broadcast of one scalar per
         # head onto each key element; hoisting the whole-sequence product
         # out of the loop computes the identical per-element values and
