@@ -36,7 +36,9 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ops_kda import (  # noqa: E402
+    _chunk_kda_attn_loop_eager,
     _chunk_kda_prepare,
+    compiled_chunk_kda,
     compiled_recurrent_kda,
     naive_chunk_kda,
     naive_recurrent_kda,
@@ -274,6 +276,80 @@ def test_compiled_recurrent_kda_fast_parity(device):
     assert (o_ref - o_cmp).abs().max().item() < BIT_MATCH
     assert (s_ref - s_cmp).abs().max().item() < BIT_MATCH
 
+
+
+def test_compiled_chunk_kda_fullgraph_per_channel_decay(device):
+    """``compiled_chunk_kda`` is fullgraph-traceable and decay-faithful.
+
+    The chunk setup previously reduced the gate range to a host scalar and
+    compared storage pointers, both of which are untraceable under
+    ``torch.compile(fullgraph=True)``. The branch-free clamp and the
+    metadata-only ownership check fix that. This test runs both the
+    cached-``Aqk`` and the ``recompute_attn`` memory policy on an
+    anisotropic per-channel-decay input and checks output + final state.
+    """
+    import torch._dynamo as _dynamo
+
+    q, k, v, g, beta = _make_case(51, 1, 32, 1, 8, 8, device=device)
+    # Per-channel anisotropy: the first half of the key channels forgets
+    # ~8x faster; the late prefix forces the >50 clamp branch.
+    g = g.clone()
+    g[..., :4] *= 8.0
+    g[:, 16:] = -5.0
+    for recompute in (False, True):
+        o_ref, s_ref = naive_chunk_kda(
+            q, k, v, g, beta, output_final_state=True, chunk_size=16,
+            recompute_attn=recompute)
+        _dynamo.reset()
+        o_cmp, s_cmp = compiled_chunk_kda(
+            q, k, v, g, beta, output_final_state=True, chunk_size=16,
+            recompute_attn=recompute, dynamic=False, fullgraph=True)
+        assert (o_ref - o_cmp).abs().max().item() < BIT_MATCH
+        assert (s_ref - s_cmp).abs().max().item() < BIT_MATCH
+
+
+def test_unconditional_decay_clamp_is_below_threshold_identity(device):
+    """Always-clamping is bit-identical when every gate difference is <= 50.
+
+    Removing the data-dependent range check is only valid if the clamp is a
+    numerical no-op in the regime where the old code skipped it.
+    """
+    q, k, v, g, beta = _make_case(52, 1, 32, 1, 8, 8, device=device)
+    prep = _chunk_kda_prepare(
+        q, k, v, g, beta, None, None, False, 16, -10.0, None, 'test',
+        recompute_attn=True)
+    assert prep['clamp_g_diff'] is True
+    A_open = torch.zeros(*prep['g'].shape[:-1], 16,
+                         dtype=prep['g'].dtype, device=device)
+    A_closed = A_open.clone()
+    _chunk_kda_attn_loop_eager(
+        prep['g'], prep['k'], prep['q'], A_open, A_open, 16,
+        False, True, prep['upper_mask'], 1)
+    _chunk_kda_attn_loop_eager(
+        prep['g'], prep['k'], prep['q'], A_closed, A_closed, 16,
+        True, True, prep['upper_mask'], 1)
+    assert torch.equal(A_open, A_closed)
+
+
+def test_compiled_chunk_kda_delegates_degenerate_and_initial_state(device):
+    """T=0 and ``initial_state`` keep the eager contract (no compile cost)."""
+    q, k, v, g, beta = _make_case(53, 1, 16, 1, 8, 8, device=device)
+    S0 = torch.randn(1, 1, 8, 8, device=device) * 0.1
+    o_ref, s_ref = naive_chunk_kda(
+        q, k, v, g, beta, initial_state=S0, output_final_state=True,
+        chunk_size=16)
+    o_cmp, s_cmp = compiled_chunk_kda(
+        q, k, v, g, beta, initial_state=S0, output_final_state=True,
+        chunk_size=16, dynamic=False, fullgraph=True)
+    assert (o_ref - o_cmp).abs().max().item() < BIT_MATCH
+    assert (s_ref - s_cmp).abs().max().item() < BIT_MATCH
+    q0 = torch.zeros(1, 0, 1, 8, device=device)
+    v0 = torch.zeros(1, 0, 1, 8, device=device)
+    b0 = torch.zeros(1, 0, 1, device=device)
+    o0, s0 = compiled_chunk_kda(
+        q0, q0, v0, q0, b0, output_final_state=True)
+    assert o0.shape == (1, 0, 1, 8)
+    assert s0.shape == (1, 1, 8, 8)
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))

@@ -788,11 +788,14 @@ def _chunk_kda_prepare(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return {'early': True, 'o': o.to(dtype), 'S': S}
-    # Storage of the caller's ``q`` before any padding/rearrangement. The
-    # no-grad scale below may run in place only on a buffer this function
-    # owns; when the rearranged view shares this storage we must keep the
-    # out-of-place product so the caller's input is not mutated.
-    q_input_storage = q.untyped_storage().data_ptr()
+    # Ownership hint for the no-grad scale below. The in-place multiply is
+    # only safe on a buffer this function owns. A contiguous input makes the
+    # subsequent ``rearrange`` a view of the caller's storage (and
+    # ``contiguous()`` then returns that view), while a non-contiguous input
+    # forces ``contiguous()`` to copy. This metadata-only test replaces the
+    # old ``untyped_storage().data_ptr()`` comparison, which Dynamo cannot
+    # trace and therefore blocked ``torch.compile(fullgraph=True)``.
+    q_input_contiguous = q.is_contiguous()
     pad = (-T) % BT
     if pad:
         q    = F.pad(q,    (0, 0, 0, 0, 0, pad))
@@ -819,12 +822,11 @@ def _chunk_kda_prepare(
     if G == 1:
         q = q.contiguous()
         # The scale may run in place only when ``q`` no longer aliases the
-        # caller's input: ``contiguous()`` returns a fresh buffer for a
-        # strided rearrange view, but for a shape that is already contiguous
-        # (H == 1 and a single chunk) it returns a view of the input, which
-        # must not be mutated. Same elementwise product either way.
-        if (torch.is_grad_enabled()
-                or q.untyped_storage().data_ptr() == q_input_storage):
+        # caller's input. Padding already produced a fresh tensor; otherwise
+        # a contiguous input rearranges to a view of the caller's storage
+        # (out-of-place), while a non-contiguous input is copied by
+        # ``contiguous()`` (owned). Same elementwise product either way.
+        if torch.is_grad_enabled() or (q_input_contiguous and not pad):
             q = q * scale
         else:
             q.mul_(scale)
@@ -866,12 +868,19 @@ def _chunk_kda_prepare(
     # triangle at exactly zero; the lower triangle is written below.
     Aqk = None if recompute_attn else torch.zeros(
         *g.shape[:-1], BT, dtype=compute_dtype, device=q.device)
-    # ``clamp(max=50.0)`` is applied when the largest positive pair
-    # difference ``max(g) - min(g)`` exceeds 50; NaN / +inf ranges also
-    # take the clamp path. The recompute inner loop receives
-    # ``clamp_g_diff`` so it makes the same clamp decision.
-    _g_lo, _g_hi = torch.aminmax(g, dim=-2)
-    clamp_g_diff = not bool((_g_hi - _g_lo).max() <= 50.0)
+    # ``clamp(max=50.0)`` is ALWAYS applied. The old code first reduced the
+    # gate range to a host scalar and skipped the clamp when every pair
+    # difference was <= 50; that decision is a data-dependent device sync
+    # (``bool(tensor)``) and breaks ``torch.compile(fullgraph=True)``.
+    # Applying the clamp unconditionally is value-identical:
+    #   * if max(g) - min(g) <= 50, every individual difference is <= 50,
+    #     so ``clamp(max=50)`` is the identity for every entry;
+    #   * if any difference exceeds 50 (or is NaN/+inf), the old code
+    #     clamped all entries anyway.
+    # The metadata key stays ``True`` so the eager / TorchScript inner loops
+    # and the recompute policy keep making the same (now unconditional)
+    # choice without a second range reduction.
+    clamp_g_diff = True
     # Only the entries with row ``c >= j`` (column ``j``) are materialized;
     # the strict upper triangle stays at the zeros from the allocation above
     # and the diagonal is explicitly zeroed right after the loop. The loop
@@ -1161,8 +1170,10 @@ def _chunk_kda_inner_loop_recompute(
     contiguous last dim), so both variants perform the same per-element
     operations and contraction.
 
-    ``clamp_g_diff`` must be the flag computed by ``_chunk_kda_prepare``
-    (``max(g) - min(g) > 50`` anywhere), so both variants clamp identically.
+    ``clamp_g_diff`` is the flag returned by ``_chunk_kda_prepare``. It is
+    now unconditionally ``True`` there (the clamp is an identity when the
+    gate range is below 50, and the old range check forced a device sync),
+    so both variants keep the identical clamp chain.
 
     ``block_rows`` sets the column-block granularity of the rebuild
     (see :func:`_recompute_block_rows`): entry ``(c, j)`` still evaluates
@@ -1536,4 +1547,114 @@ def scripted_chunk_kda(
         dtype=prep['dtype'], compute_dtype=prep['compute_dtype'],
         state_dtype=state_dtype, output_final_state=output_final_state,
         original_T=prep['original_T'], fn_name='scripted_chunk_kda',
+    )
+
+
+# ---------------------------------------------------------------------------
+# torch.compile wrapper for the chunked KDA path
+# ---------------------------------------------------------------------------
+_COMPILED_CHUNK_KDA_CACHE: '_collections.OrderedDict' = _collections.OrderedDict()
+_COMPILED_CHUNK_CACHE_MAX = 32
+
+
+def compiled_chunk_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    *,
+    g_clamp_min: float = -10.0,
+    state_dtype: torch.dtype | None = None,
+    recompute_attn: bool = False,
+    dynamic: bool = False,
+    fullgraph: bool = False,
+    mode: str | None = None,
+):
+    """``torch.compile``-wrapped :func:`naive_chunk_kda`.
+
+    The chunked path is the training / prefill workhorse, but its setup step
+    (per-chunk decay map, intra-chunk attention matrices, triangular solve)
+    is a long elementwise + batched-GEMM chain that eager PyTorch executes
+    as many small kernels. Compiling the whole operator lets Inductor fuse
+    the per-channel decay arithmetic and the chunk preparation while keeping
+    the exact same math. ``recompute_attn=True`` selects the memory-bounded
+    policy (one ``Aqk`` chunk instead of the full ``[B, HV, NT, BT, BT]``
+    cache); combining it with compile is the intended
+    "memory-efficient attention" configuration.
+
+    The compiled callable is cached per (shape, dtype, grad mode, chunk
+    policy, compile options) signature, mirroring
+    :func:`compiled_recurrent_kda`. ``T == 0`` and invalid inputs delegate
+    to :func:`naive_chunk_kda` / its validators directly so the degenerate
+    path never pays a compile or hides a shape error.
+
+    ``fullgraph=False`` is the default because the setup code contains
+    Python-level branches (padding / GVA / optional state). With the
+    branch-free decay clamp in :func:`_chunk_kda_prepare`, ``fullgraph=True``
+    is supported for the standard shape regime and is what the regression
+    test pins.
+    """
+    _validate_kda_inputs(q, k, v, g, beta, fn_name='compiled_chunk_kda')
+    if q.shape[1] == 0:
+        return naive_chunk_kda(
+            q, k, v, g, beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=chunk_size,
+            g_clamp_min=g_clamp_min,
+            state_dtype=state_dtype,
+            recompute_attn=recompute_attn,
+        )
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[-1]
+    state_key = (None if initial_state is None
+                 else (tuple(initial_state.shape), initial_state.dtype))
+    cache_key = (
+        B, T, H, K, HV, V,
+        q.dtype, q.device.type,
+        q.requires_grad or k.requires_grad or v.requires_grad
+        or g.requires_grad or beta.requires_grad,
+        int(chunk_size), bool(recompute_attn),
+        bool(dynamic), bool(fullgraph), mode,
+        bool(output_final_state), state_key,
+        str(state_dtype), repr(scale), repr(g_clamp_min),
+    )
+    compiled_fn = _COMPILED_CHUNK_KDA_CACHE.get(cache_key)
+    if compiled_fn is None:
+        if len(_COMPILED_CHUNK_KDA_CACHE) >= _COMPILED_CHUNK_CACHE_MAX:
+            _COMPILED_CHUNK_KDA_CACHE.popitem(last=False)
+
+        def _chunk_kernel(
+            q_arg, k_arg, v_arg, g_arg, beta_arg,
+            scale_val, g_clamp_min_val, initial_state_arg,
+        ):
+            return naive_chunk_kda(
+                q_arg, k_arg, v_arg, g_arg, beta_arg,
+                scale=scale_val,
+                initial_state=initial_state_arg,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+                g_clamp_min=g_clamp_min_val,
+                state_dtype=state_dtype,
+                recompute_attn=recompute_attn,
+            )
+
+        compile_kwargs = {"dynamic": dynamic, "fullgraph": fullgraph}
+        if mode is not None:
+            compile_kwargs["mode"] = mode
+        compiled_fn = torch.compile(_chunk_kernel, **compile_kwargs)
+        _COMPILED_CHUNK_KDA_CACHE[cache_key] = compiled_fn
+    else:
+        _COMPILED_CHUNK_KDA_CACHE.move_to_end(cache_key)
+
+    return compiled_fn(
+        q, k, v, g, beta,
+        scale, g_clamp_min,
+        initial_state,
     )
