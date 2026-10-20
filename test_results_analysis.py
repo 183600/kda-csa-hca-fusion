@@ -706,6 +706,31 @@ def test_hypothesis_verdicts_are_machine_readable_and_rule_based():
     json.dumps({'checks': checks, 'counts': counts}, allow_nan=False)
 
 
+def test_linear_control_above_chance_without_significance_is_not_supported():
+    """A failed superiority test is not evidence that linear is at chance."""
+    chance = 0.0625
+    linear = {
+        'op': 'linear', 'task': 'mqar', 'n_kv': 1,
+        # 3x chance but not significant at this seed budget.
+        'mean_acc': 0.1875, 'chance_acc': chance,
+        'significant_bonferroni': False,
+        't_stat_vs_chance': 1.2,
+        'per_seed': [{'seed': 42 + i, 'final_acc': a}
+                     for i, a in enumerate([0.10, 0.20, 0.26])],
+    }
+    checks, counts = _hypothesis_verdicts(
+        [linear], baseline_ops=['linear'], baseline_ref='softmax')
+    assert checks['linear_chance_control']['status'] == 'not_supported'
+    assert checks['linear_chance_control']['falsified'] is False
+    assert checks['linear_chance_control']['n_inconclusive_cells'] == 1
+    assert checks['linear_chance_control']['inconclusive_cells'] == [
+        'mqar/n_kv=1']
+    assert linear['hypothesis_status'] == 'not_supported'
+    assert counts['supported'] == 0 and counts['not_supported'] == 1
+    assert linear['hypothesis_checks'][
+        'linear_chance_control']['evidence']['prediction_holds'] is None
+
+
 def test_hypothesis_verdicts_mark_missing_evidence_not_computable():
     """Missing chance / paired seeds are not evidence for or against."""
     def row(op, n_kv, seed_accs, *, chance_acc=0.1, seeds=None):

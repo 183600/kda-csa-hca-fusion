@@ -3205,7 +3205,11 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
     1. ``linear_chance_control``: the memoryless ``linear`` baseline must
        stay at chance. Contradicted if it is significantly ABOVE chance in
        any cell (the task would then be solvable without token mixing,
-       confounding the memory claim).
+       confounding the memory claim). A non-significant cell whose observed
+       mean is still ABOVE chance is ``not_supported`` (inconclusive): a
+       failed superiority test is not evidence that the control is at
+       chance. Only a cell whose mean is at or below chance (or
+       significantly below) supports the prediction.
     2. ``kda_nkv_monotonicity``: KDA accuracy is predicted to degrade as
        the number of key-value pairs grows. Supported when accuracy is
        non-increasing over the swept n_kv values; contradicted when a
@@ -3237,30 +3241,44 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
     evidence = []
     contradicted_cells = []
     missing_chance_cells = []
+    inconclusive_cells = []
     for r in linear_rows:
         chance = r.get('chance_acc')
         sig = bool(r.get('significant_bonferroni'))
         above = chance is not None and r['mean_acc'] > chance
         if chance is None:
             cell_verdict = 'not_computable'
+            prediction_holds = None
         elif sig and above:
             cell_verdict = 'contradicted'
-        else:
+            prediction_holds = False
+        elif not above:
+            # Observed mean is at or below chance (significantly or not):
+            # this cell does not show the memoryless control solving the
+            # task, so the prediction is supported for this cell.
             cell_verdict = 'supported'
+            prediction_holds = True
+        else:
+            # Above chance but not significantly so: the test is
+            # inconclusive. Calling this "supported" would be the classic
+            # absence-of-evidence error, so record it explicitly.
+            cell_verdict = 'not_supported'
+            prediction_holds = None
         rec = {
             'cell': _cell(r),
             'mean_acc': float(r['mean_acc']),
             'chance_acc': chance,
             't_stat_vs_chance': r.get('t_stat_vs_chance'),
             'significant_bonferroni': sig,
-            'prediction_holds': (None if chance is None
-                                 else not (sig and above)),
+            'prediction_holds': prediction_holds,
         }
         evidence.append(rec)
         if cell_verdict == 'contradicted':
             contradicted_cells.append(_cell(r))
         elif cell_verdict == 'not_computable':
             missing_chance_cells.append(_cell(r))
+        elif cell_verdict == 'not_supported':
+            inconclusive_cells.append(_cell(r))
         _assign(r, 'linear_chance_control', {
             'rule': ('linear must NOT be significantly above chance '
                      '(otherwise the task is solvable without token mixing)'),
@@ -3274,16 +3292,24 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
         status = 'contradicted'
     elif missing_chance_cells:
         status = 'not_computable'
+    elif inconclusive_cells:
+        # At least one cell is above chance without clearing the corrected
+        # threshold: the overall "at chance" claim is inconclusive, not
+        # supported.
+        status = 'not_supported'
     else:
         status = 'supported'
     checks['linear_chance_control'] = {
         'rule': ('linear must NOT be significantly above chance '
-                 '(otherwise the task is solvable without token mixing)'),
+                 '(otherwise the task is solvable without token mixing); '
+                 'cells above chance without significance are inconclusive'),
         'status': status,
         'falsified': status == 'contradicted',
         'n_cells': len(linear_rows),
         'n_contradicting_cells': len(contradicted_cells),
         'contradicting_cells': contradicted_cells,
+        'n_inconclusive_cells': len(inconclusive_cells),
+        'inconclusive_cells': inconclusive_cells,
         'evidence': evidence,
     }
 
