@@ -116,6 +116,48 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return m, den, acc
 
 
+def _align_sink_logits(sink_logits: torch.Tensor,
+                       m: torch.Tensor) -> torch.Tensor:
+    """Broadcast a per-head sink logit against ``m`` of shape [B, H, T, 1].
+
+    ``[H]`` is the canonical form; the documented contract also accepts any
+    tensor broadcastable to ``[B, H, T, 1]`` after the head axis has been
+    made explicit (e.g. ``[B, H, 1, 1]`` or ``[1, H, 1, 1]``).
+    """
+    sink = sink_logits.to(device=m.device, dtype=m.dtype)
+    H = m.shape[1]
+    if sink.dim() == 1:
+        if sink.shape[0] != H:
+            raise ValueError(
+                f'online_softmax: sink_logits has {sink.shape[0]} entries '
+                f'but the attention has {H} heads.')
+        return sink.view(1, H, 1, 1)
+    if sink.dim() == 2:
+        if sink.shape[-1] == H:
+            return sink.view(*sink.shape, 1, 1)
+        if sink.shape[-1] == 1 and sink.shape[0] == H:
+            return sink.view(1, H, 1, 1)
+        raise ValueError(
+            'online_softmax: 2-D sink_logits must be [B, H] or [H, 1]; '
+            f'got {tuple(sink.shape)} for H={H}.')
+    if sink.dim() == 3:
+        if sink.shape[-2:] == (1, 1):
+            if sink.shape[0] == H:
+                return sink.view(1, H, 1, 1)
+            return sink.view(*sink.shape, 1)
+        if sink.shape[-1] == 1:
+            return sink.unsqueeze(-1)
+        raise ValueError(
+            'online_softmax: 3-D sink_logits must be [B, H, 1] or '
+            f'[H, 1, 1]; got {tuple(sink.shape)} for H={H}.')
+    if sink.dim() > 4:
+        raise ValueError(
+            'online_softmax: sink_logits must be [H] or broadcastable to '
+            f'[B, H, T, 1]; got rank {sink.dim()} '
+            f'(shape={tuple(sink.shape)}).')
+    return sink
+
+
 def online_softmax_finalize(m: torch.Tensor, den: torch.Tensor,
                             acc: torch.Tensor,
                             sink_logits: torch.Tensor | None = None):
@@ -137,7 +179,7 @@ def online_softmax_finalize(m: torch.Tensor, den: torch.Tensor,
     log_denom = m_safe + torch.log(
         den_safe.clamp_min(torch.finfo(den.dtype).tiny))
     if sink_logits is not None:
-        sink = sink_logits.view(1, -1, 1, 1).to(m)
+        sink = _align_sink_logits(sink_logits, m)
         log_denom = torch.logaddexp(log_denom, sink)
     out = acc * (m_safe - log_denom).exp()
     return torch.where(empty.expand_as(out), torch.zeros_like(out), out)
@@ -168,7 +210,9 @@ def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
     merged = None
     for lo in range(0, n, chunk):
         hi = min(n, lo + chunk)
-        block_mask = None if mask is None else mask[:, lo:hi]
+        # ``mask`` may be [T, Nc] or any leading-batch/head broadcastable
+        # form ([B, H, T, Nc]); only the key axis is chunked here.
+        block_mask = None if mask is None else mask[..., lo:hi]
         state = online_softmax_state(
             q, k[:, :, lo:hi], v[:, :, lo:hi], scale=scale, mask=block_mask)
         merged = state if merged is None else online_softmax_merge(merged, state)
