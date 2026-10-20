@@ -90,6 +90,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (
     capture_provenance,
     configure_torch_for_device,
+    grad_flow_report,
     make_seeded_generator,
     parse_int_env,
     sanitize_for_json,
@@ -261,6 +262,9 @@ NEEDLE_HYPOTHESES = OrderedDict([
 EVAL_SEED_RESERVE = 4096
 TRAIN_SEED_STREAM = 1_000_000  # generator offset for the training seed draws
 SEED_CEILING = 2 ** 31 - 1
+# Fixed-batch overfit gate stream: disjoint from evaluation (no offset),
+# training (TRAIN_SEED_STREAM) and validation (VAL_SEED_BASE).
+OVERFIT_BATCH_SEED_OFFSET = 3_000_000
 
 # Held-out validation-monitoring band. It sits between the evaluation band
 # [0, EVAL_SEED_RESERVE) and the training band [EVAL_SEED_RESERVE, 2**31):
@@ -1434,6 +1438,248 @@ def _build_needle_model(cfg: NeedleConfig, tokenizer: _NeedleCharTokenizer) -> N
     )
 
 
+# ---------------------------------------------------------------------------
+# Pre-training fixed-batch overfit sanity gate
+# ---------------------------------------------------------------------------
+def _needle_fixed_batch(tokenizer, context_len, needle_pos, batch_size,
+                        seed, device):
+    """One deterministic training batch, held fixed across gate steps."""
+    gen = make_seeded_generator(seed + OVERFIT_BATCH_SEED_OFFSET,
+                                device=device)
+    data_seeds = draw_train_seeds(gen, batch_size)
+    input_ids, _targets, answer_positions = build_needle_batch(
+        batch_size, context_len, needle_pos, tokenizer, seeds=data_seeds,
+        device=device)
+    answer_t = torch.tensor(tokenizer.encode(_NEEDLE_ANSWER),
+                            dtype=torch.long, device=device)
+    answer_tail = answer_t[:-1].unsqueeze(0).expand(batch_size, -1)
+    train_ids = torch.cat([input_ids, answer_tail], dim=1)
+    start = answer_positions[0] - 1
+    if any(p - 1 != start for p in answer_positions):
+        raise RuntimeError('needle answer positions differ within a batch')
+    target = answer_t.unsqueeze(0).expand(batch_size, -1)
+    return train_ids, start, target, data_seeds
+
+
+def run_needle_overfit_sanity_check(
+        *, tokenizer, memory_type='kda', context_len=64, needle_pos=8,
+        batch_size=8, steps=100, lr=3e-3, seed=2026, device='cpu',
+        grad_clip=1.0, acc_threshold=0.99, loss_ratio_threshold=0.5,
+        log_every=0):
+    """Overfit ONE fixed needle batch before the full sweep.
+
+    Mirrors the Exp 4/5/8/11 gates: a FRESH model is trained on a single
+    fixed batch with regularization disabled (``weight_decay=0``; the needle
+    pipeline has no dropout or data augmentation). Passes when the tail
+    exact-match accuracy is near 1.0 OR the tail loss is below
+    ``loss_ratio_threshold`` times the head loss, and every gradient is
+    finite. This is necessary but NOT sufficient: it proves the training
+    loss is connected to the parameters; it cannot prove the eval stream,
+    tokenizer alignment, or quantization path are correct.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    steps = int(steps)
+    if steps < 10:
+        raise ValueError(
+            f'overfit check needs steps >= 10 to be meaningful, got {steps}')
+    batch_size = int(batch_size)
+    if batch_size < 1:
+        raise ValueError(f'batch_size must be >= 1, got {batch_size}')
+    warmup = max(1, min(5, steps // 10))
+    tail = max(1, min(5, steps // 10))
+
+    seed_info = set_global_seed(seed, deterministic=True)
+    cfg = NeedleConfig(context_len=int(context_len),
+                       needle_pos=int(needle_pos),
+                       memory_type=str(memory_type))
+    model = _build_needle_model(cfg, tokenizer).to(device)
+    model.train()
+    train_ids, start, target, data_seeds = _needle_fixed_batch(
+        tokenizer, cfg.context_len, cfg.needle_pos, batch_size, seed, device)
+    n_answer = int(target.size(1))
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr),
+                            weight_decay=0.0)
+
+    losses, exact, token_acc, elapsed_s = [], [], [], []
+    grad_flow = None
+    t0 = time.time()
+    for step in range(steps):
+        model.reset_state()
+        logits = model(train_ids)
+        pred = logits[:, start:start + n_answer, :]
+        loss = F.cross_entropy(pred.reshape(-1, pred.size(-1)),
+                               target.reshape(-1))
+        if loss is None or not torch.isfinite(loss):
+            raise_non_finite(
+                'loss', loss=(loss if loss is not None else float('nan')),
+                token_ids={'train_ids': train_ids},
+                id_range=(0, tokenizer.vocab_size),
+                params=model.parameters(), logits=logits,
+                context=f'needle overfit sanity check step={step} '
+                        f'mem={memory_type}')
+        with torch.no_grad():
+            correct_tokens = (pred.argmax(-1) == target)
+            exact_acc = float(correct_tokens.all(dim=1).float().mean())
+            tok_acc = float(correct_tokens.float().mean())
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_flow is None:
+            grad_flow = grad_flow_report(model.named_parameters())
+        bad_grads = triage_gradient(model.parameters())
+        clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                   grad_clip)
+        if bad_grads or not torch.isfinite(clip_norm):
+            raise_non_finite(
+                'gradient', loss=loss,
+                token_ids={'train_ids': train_ids},
+                id_range=(0, tokenizer.vocab_size),
+                params=model.parameters(), logits=logits,
+                grads={f'grad[{i}]': p.grad
+                       for i, p in enumerate(bad_grads)},
+                grad_norm=float(clip_norm),
+                context=f'needle overfit sanity check step={step} '
+                        f'mem={memory_type}')
+        opt.step()
+        losses.append(float(loss.detach()))
+        exact.append(exact_acc)
+        token_acc.append(tok_acc)
+        elapsed_s.append(time.time() - t0)
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f'[overfit-check] needle/{memory_type} step {step:4d} '
+                  f'loss {losses[-1]:.4f} exact {exact_acc:.4f} '
+                  f'token_acc {tok_acc:.4f} ({elapsed_s[-1]:.1f}s)',
+                  flush=True)
+
+    initial_loss = sum(losses[:warmup]) / warmup
+    final_loss = sum(losses[-tail:]) / tail
+    final_exact = sum(exact[-tail:]) / tail
+    final_token_acc = sum(token_acc[-tail:]) / tail
+    passed = ((final_exact >= acc_threshold)
+              or (final_loss < loss_ratio_threshold * initial_loss))
+    import hashlib
+    h = hashlib.sha256()
+    for name, t in (('train_ids', train_ids), ('target', target)):
+        h.update(f'{name}:{tuple(t.shape)}:'.encode())
+        h.update(str(t.detach().to('cpu').reshape(-1).tolist()).encode())
+    report = {
+        'passed': bool(passed),
+        'label': f'needle-{memory_type}',
+        'memory_type': str(memory_type),
+        'context_len': int(context_len),
+        'needle_pos': int(needle_pos),
+        'batch_size': batch_size,
+        'steps': steps,
+        'lr': float(lr),
+        'weight_decay': 0.0,
+        'dropout': 0.0,
+        'data_augmentation': 'none',
+        'grad_clip_norm': float(grad_clip),
+        'seed': int(seed),
+        'seed_info': seed_info,
+        'fixed_batch_seed': int(seed + OVERFIT_BATCH_SEED_OFFSET),
+        'fixed_batch_seeds': list(data_seeds),
+        'fixed_batch_sha256': h.hexdigest(),
+        'initial_loss': initial_loss,
+        'final_loss': final_loss,
+        'best_loss': min(losses),
+        'loss_reduction': ((initial_loss - final_loss) / initial_loss
+                           if initial_loss > 0 else None),
+        'final_exact_match': final_exact,
+        'best_exact_match': max(exact),
+        'final_train_token_acc': final_token_acc,
+        'acc_threshold': float(acc_threshold),
+        'loss_ratio_threshold': float(loss_ratio_threshold),
+        'loss_curve': losses,
+        'exact_match_curve': exact,
+        'token_acc_curve': token_acc,
+        'elapsed_s': elapsed_s,
+        'grad_flow': grad_flow,
+        'note': ('Necessary but NOT sufficient: passing proves the loss is '
+                 'connected to the fixed-batch parameters; it cannot rule '
+                 'out eval-stream / tokenizer-alignment / quantization-path '
+                 'bugs.'),
+    }
+    if grad_flow and grad_flow['n_missing_grad']:
+        print(f"[overfit-check] WARNING: {grad_flow['n_missing_grad']}/"
+              f"{grad_flow['n_trainable_tensors']} trainable tensor(s) "
+              f"received NO gradient on the fixed needle batch for "
+              f"{memory_type} (e.g. "
+              f"{grad_flow['missing_grad_names'][:3]})", flush=True)
+    return report
+
+
+def _compact_needle_gate_report(report):
+    return {k: v for k, v in report.items()
+            if k not in ('loss_curve', 'exact_match_curve',
+                         'token_acc_curve', 'elapsed_s', 'seed_info')}
+
+
+def _run_needle_overfit_gate(*, tokenizer, device, memory_types,
+                             env_prefix='NEEDLE', gate_context_len=64,
+                             gate_needle_pos=8, lr=3e-3):
+    """Run the fixed-batch gate once per memory route; return (record, ok)."""
+    enabled = parse_int_env(f'{env_prefix}_OVERFIT_CHECK', 1, min_value=0,
+                            logger=logger) != 0
+    strict = parse_int_env(f'{env_prefix}_OVERFIT_STRICT', 1, min_value=0,
+                           logger=logger) != 0
+    if not enabled:
+        logger.info(f'  overfit sanity gate disabled '
+                    f'({env_prefix}_OVERFIT_CHECK=0)')
+        return {'enabled': False, 'strict': bool(strict), 'reports': []}, True
+    steps = parse_int_env(f'{env_prefix}_OVERFIT_STEPS', 100, min_value=10,
+                          logger=logger)
+    seed = parse_int_env(f'{env_prefix}_OVERFIT_SEED', 2026, min_value=0,
+                         logger=logger)
+    batch = parse_int_env(f'{env_prefix}_OVERFIT_BATCH', 8, min_value=1,
+                          logger=logger)
+    routes = list(dict.fromkeys(memory_types or ['kda']))
+    logger.info(f'  overfit sanity gate: {len(routes)} route(s), {steps} '
+                f'steps on one fixed batch each (batch={batch}, '
+                f'seed={seed}, strict={bool(strict)})')
+    reports = []
+    all_passed = True
+    for memory_type in routes:
+        try:
+            report = run_needle_overfit_sanity_check(
+                tokenizer=tokenizer, memory_type=memory_type,
+                context_len=gate_context_len, needle_pos=gate_needle_pos,
+                batch_size=batch, steps=steps, lr=lr, seed=seed,
+                device=device, log_every=max(10, steps // 5))
+        except Exception as e:
+            logger.error(f'  [overfit] needle/{memory_type}: gate crashed: '
+                         f'{e}')
+            report = {'passed': False, 'label': f'needle-{memory_type}',
+                      'memory_type': memory_type, 'error': str(e),
+                      'steps': steps, 'seed': seed, 'batch_size': batch}
+        reports.append(report)
+        if report.get('passed'):
+            logger.info(
+                f"  [overfit] needle/{memory_type}: PASS "
+                f"(exact={report['final_exact_match']:.4f}, "
+                f"loss {report['initial_loss']:.4f}->"
+                f"{report['final_loss']:.4f})")
+        else:
+            all_passed = False
+            logger.error(
+                f"  [overfit] needle/{memory_type}: FAIL "
+                f"(exact={report.get('final_exact_match')}, "
+                f"loss={report.get('final_loss')}, "
+                f"error={report.get('error')})")
+    record = {'enabled': True, 'strict': bool(strict), 'steps': steps,
+              'seed': seed, 'train_batch': batch,
+              'context_len': int(gate_context_len),
+              'needle_pos': int(gate_needle_pos), 'reports': reports}
+    if not all_passed and strict:
+        logger.error(
+            f'  {env_prefix}_OVERFIT_STRICT=1: refusing to start the needle '
+            f'sweep on a recipe that cannot overfit a fixed batch. Fix the '
+            f'training path, or set {env_prefix}_OVERFIT_STRICT=0 to record '
+            f'the failure and continue (not recommended).')
+        return record, False
+    return record, True
+
+
 def _mean_ci95(values: list[float]) -> list[float] | None:
     """Two-sided 95% t-interval of the mean (None for n < 2)."""
     n = len(values)
@@ -2304,6 +2550,17 @@ def main():
                 f'({train_steps} steps, {train_geom}); untrained controls '
                 f'reported alongside')
 
+    # Pre-training fixed-batch gate: every memory route that will be swept
+    # must first drive one fixed batch to a collapsing loss with finite
+    # gradients. A broken gradient path would otherwise only surface as
+    # random-level retrieval accuracy across the whole sweep.
+    gate_record, proceed = _run_needle_overfit_gate(
+        tokenizer=tokenizer, device=device,
+        memory_types=memory_types or ['kda', 'mamba2', 'rwkv7'],
+        lr=args.train_lr)
+    if not proceed:
+        return 1
+
     # Run sweep
     needle_rows = run_needle_sweep(
         all_configs, tokenizer, seeds=seeds,
@@ -2386,6 +2643,19 @@ def main():
         'provenance': capture_provenance(),
         'rows': all_rows,
     })
+    # Gate verdict next to the rows; full per-step curves in provenance.
+    payload['overfit_sanity_check'] = {
+        'enabled': gate_record['enabled'],
+        'strict': gate_record.get('strict'),
+        'steps': gate_record.get('steps'),
+        'seed': gate_record.get('seed'),
+        'train_batch': gate_record.get('train_batch'),
+        'context_len': gate_record.get('context_len'),
+        'needle_pos': gate_record.get('needle_pos'),
+        'reports': [_compact_needle_gate_report(r)
+                    for r in gate_record.get('reports', [])],
+    }
+    payload['provenance']['overfit_sanity_check'] = gate_record
     json.dumps(payload, allow_nan=False)
     os.makedirs(os.path.dirname(args.json) or '.', exist_ok=True)
     write_results_json(payload, args.json, logger=logger)

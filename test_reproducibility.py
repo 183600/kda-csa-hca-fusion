@@ -298,6 +298,57 @@ def test_lm_overfit_gate_does_not_perturb_model_init():
 
 
 # ---------------------------------------------------------------------------
+# Needle-sweep (Exp 12) fixed-batch overfit gate
+# ---------------------------------------------------------------------------
+
+def _needle_gate(steps, *, lr=3e-3, seed=123, batch=4):
+    import run_needle_haystack as nh
+
+    return nh.run_needle_overfit_sanity_check(
+        tokenizer=nh._NeedleCharTokenizer(), memory_type='kda',
+        context_len=64, needle_pos=8, batch_size=batch, steps=steps,
+        lr=lr, seed=seed, device='cpu', log_every=0)
+
+
+def test_needle_overfit_check_rejects_too_few_steps():
+    with pytest.raises(ValueError):
+        _needle_gate(steps=9)
+
+
+def test_needle_overfit_check_detects_frozen_training():
+    report = _needle_gate(steps=12, lr=0.0)
+    assert report['passed'] is False
+    assert report['loss_curve'][0] == report['loss_curve'][-1]
+    assert report['exact_match_curve'][0] == \
+        report['exact_match_curve'][-1]
+
+
+def test_needle_overfit_check_is_deterministic_and_reports_grad_flow():
+    first = _needle_gate(steps=12, seed=321)
+    second = _needle_gate(steps=12, seed=321)
+    assert first['fixed_batch_sha256'] == second['fixed_batch_sha256']
+    assert first['loss_curve'] == second['loss_curve']
+    assert first['exact_match_curve'] == second['exact_match_curve']
+    assert first['seed_info']['torch'] is True
+    assert first['grad_flow']['n_missing_grad'] == 0
+    assert first['weight_decay'] == 0.0
+    assert first['data_augmentation'] == 'none'
+    json.dumps(first, allow_nan=False)
+
+
+def test_needle_overfit_gate_can_be_disabled(monkeypatch):
+    import run_needle_haystack as nh
+
+    monkeypatch.setenv('NEEDLE_OVERFIT_CHECK', '0')
+    record, proceed = nh._run_needle_overfit_gate(
+        tokenizer=nh._NeedleCharTokenizer(), device='cpu',
+        memory_types=['kda'])
+    assert proceed is True
+    assert record['enabled'] is False
+    assert record['reports'] == []
+
+
+# ---------------------------------------------------------------------------
 # Hybrid-sweep (Exp 5 / 8 / 9) classification overfit gate in run_ablation
 # ---------------------------------------------------------------------------
 
