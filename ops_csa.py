@@ -98,6 +98,14 @@ def _bf16_safe_einsum_sum(
 # exceed 8M elements.
 CHUNKED_SW_THRESHOLD = 8_000_000
 
+# The window view from ``unfold(...).permute(...)`` overlaps in memory.
+# Both einsum contractions accept it directly and (measured on CPU) are
+# FASTER on the view than on a densified copy once the slab is large, while
+# small slabs still favor the dense layout. The tiled scoring path therefore
+# densifies only up to this many elements (the full-slab and output paths
+# always use the view).
+_SW_TILE_DENSIFY_MAX = 5_000_000
+
 # Shape-keyed cache for the static ``[T, win]`` sliding-window validity mask
 # (True = real, non-padding position). The mask depends only on
 # (T, win, device) and never on the data. Every consumer treats the returned
@@ -125,12 +133,12 @@ def _windows_contiguous(windows: torch.Tensor) -> torch.Tensor:
     """Densify a possibly sliding-strided window view without changing values.
 
     The ``unfold(...).permute(...)`` window view has overlapping strides
-    (consecutive window rows start only ``c`` elements apart), so an
-    explicit ``copy_`` into a fresh contiguous buffer materializes the
-    dense layout that ``einsum`` consumes. Returning the input unchanged
-    when it is already contiguous keeps the function allocation-free for
-    the plain ``win == 1``/full-slice cases; consumers treat the result as
-    read-only.
+    (consecutive window rows start only ``c`` elements apart). ``einsum``
+    accepts that view directly, so this helper is only used where the dense
+    layout measures faster (small tiled slabs and the softmax path) or where
+    a contiguous buffer is otherwise required. Returning the input unchanged
+    when it is already contiguous keeps the call allocation-free; consumers
+    treat the result as read-only.
     """
     if windows.is_contiguous():
         return windows
@@ -272,7 +280,10 @@ def _sliding_window_chunk_windows(
     if ct < win:
         C_slice = F.pad(C_slice, (0, 0, win - ct, 0))
     windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)
-    return _windows_contiguous(windows[:, -ct:])
+    # Return the overlapping view: consumers either feed it straight to
+    # einsum (which is faster than a densified copy for large slabs) or
+    # densify explicitly when their measured crossover favors it.
+    return windows[:, -ct:]
 
 
 def _sliding_window_scores(
@@ -308,8 +319,9 @@ def _sliding_window_scores(
     # Cached [T, win] mask (read-only contract, see the helper).
     win_valid = _sliding_window_valid_mask(T, win, device)  # True=real
     if return_windows:
-        C_windows = _windows_contiguous(
-            C_padded.unfold(1, win, 1).permute(0, 1, 3, 2))  # [B, T, win, c]
+        # Overlapping view: einsum consumes it directly (bit-identical
+        # values, no densification copy).
+        C_windows = C_padded.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, T, win, c]
         scores_w = torch.einsum('b t h d, b t w d -> b t h w', q, C_windows)
         if scale != 1.0:
             # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
@@ -329,10 +341,20 @@ def _sliding_window_scores(
     for t_lo in range(0, T, tile):
         t_hi = min(T, t_lo + tile)
         windows = _sliding_window_chunk_windows(C_padded, t_lo, t_hi, win)
+        # Small slabs are faster densified; large slabs are faster (and
+        # allocation-free) as the overlapping view (see
+        # ``_SW_TILE_DENSIFY_MAX``).
+        if (t_hi - t_lo) * win * c <= _SW_TILE_DENSIFY_MAX:
+            windows = _windows_contiguous(windows)
         chunk = torch.einsum(
             'b t h d, b t w d -> b t h w', q[:, t_lo:t_hi], windows)
         if scale != 1.0:
-            chunk = chunk * scale
+            # ``chunk`` is a fresh einsum output; the graph-recording path
+            # keeps the out-of-place multiply (autograd saves the operand).
+            if torch.is_grad_enabled():
+                chunk = chunk * scale
+            else:
+                chunk.mul_(scale)
         scores_w[:, t_lo:t_hi] = chunk
     scores_w.masked_fill_(~win_valid[None, :, None, :], float('-inf'))
     return scores_w, None, win_valid
@@ -567,8 +589,10 @@ def csa_compress_kv_overlapped(
         # ``Sa`` / ``Sb`` are views of the fresh softmax output ``S`` (no
         # other reader), and ``Ca`` / ``Cb_prev`` are only read; the in-place
         # products evaluate the identical elementwise chains before the same
-        # sums.
-        out = Sa.mul_(Ca).sum(2) + Sb.mul_(Cb_prev).sum(2)
+        # sums. The second branch sum is added in place into the fresh first
+        # sum (same addition, one fewer [B, n_blocks, c] temporary).
+        out = Sa.mul_(Ca).sum(2)
+        out.add_(Sb.mul_(Cb_prev).sum(2))
     return _bf16_scale_if_needed(out)
 
 
@@ -612,7 +636,8 @@ def _csa_compress_kv_overlapped_prev(
     if torch.is_grad_enabled():
         out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)
     else:
-        out = Sa.mul_(Ca).sum(2) + Sb.mul_(Cb_prev).sum(2)
+        out = Sa.mul_(Ca).sum(2)
+        out.add_(Sb.mul_(Cb_prev).sum(2))
     return _bf16_scale_if_needed(out)
 
 
@@ -712,12 +737,15 @@ _TOPK_SORT_MAX_ELEMS = 2048
 
 
 def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
-    """Ascending indices of the canonical top-``s`` of each row of ``blk``.
+    """Canonical top-``s`` indices of each row of ``blk`` (boundary path).
 
     Boundary-path body of :func:`_canonical_topk_indices`. The returned
     ``[rows, s]`` index tensor holds, per row, the indices of every entry
-    strictly above the S-th largest score followed by the smallest-index
-    entries tied at that boundary value — always in ASCENDING index order.
+    strictly above the S-th largest score (in ascending index order, with
+    sentinel ``n`` padding the unused slots) followed by the smallest-index
+    entries tied at that boundary value (also ascending). The caller's
+    stable descending-value argsort turns this into the canonical
+    score-descending order, so no extra full sort is needed here.
 
     Exactly ``s`` valid indices are produced whenever ``blk`` contains no
     NaNs. NaNs are unselectable (they lose both the ``>`` and ``==``
@@ -753,9 +781,8 @@ def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
         s, dim=-1, largest=False, sorted=True).values
     slots = torch.arange(s, device=blk.device)
     tie_slot = (slots - n_above).clamp_(min=0)
-    selected = torch.where(
+    return torch.where(
         slots >= n_above, tie_idx.gather(-1, tie_slot), above_idx)
-    return torch.sort(selected, dim=-1).values
 
 
 def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:

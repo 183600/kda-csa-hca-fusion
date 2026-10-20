@@ -308,7 +308,14 @@ def _csa_compress_kv_overlapped_single(
     S = torch.softmax(all_logits, dim=1)                        # [B, 2m, c]
     Sa = S[:, :m]                                               # [B, m, c]
     Sb = S[:, m:]                                               # [B, m, c]
-    out = (Sa * Ca_new).sum(1) + (Sb * Cb_prev_eff).sum(1)      # [B, c]
+    if torch.is_grad_enabled():
+        out = (Sa * Ca_new).sum(1) + (Sb * Cb_prev_eff).sum(1)  # [B, c]
+    else:
+        # ``S`` is fresh and its two halves have no other readers; the
+        # second sum is added in place into the fresh first sum (same
+        # addition, one fewer [B, c] temporary).
+        out = Sa.mul_(Ca_new).sum(1)
+        out.add_(Sb.mul_(Cb_prev_eff).sum(1))
     return out
 
 
