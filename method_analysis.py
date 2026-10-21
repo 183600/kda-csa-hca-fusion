@@ -33,7 +33,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device
-from ops_csa import csa_compress_kv, _causal_block_mask
+from ops_csa import csa_compress_kv, _causal_block_mask, _nan_safe_softmax
 from ops_kda import naive_recurrent_kda
 
 
@@ -224,10 +224,7 @@ class HeadwiseFusedAttention(nn.Module):
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
         topk = min(self.cfg.csa_topk, n_blocks)
         topk_scores, topk_idx = torch.topk(scores, topk, dim=-1)
-        all_masked = torch.isinf(topk_scores).all(dim=-1, keepdim=True)
-        safe_scores = topk_scores.masked_fill(all_masked, 0.0)
-        p = torch.softmax(safe_scores, dim=-1)
-        p = p.masked_fill(all_masked, 0.0)
+        p = _nan_safe_softmax(topk_scores, dim=-1)
         b_idx = torch.arange(B, device=x.device).view(B, 1, 1, 1)
         C_sel = C_comp_n[b_idx, topk_idx]
         out = torch.einsum('b h t k, b h t k d -> b h t d', p, C_sel)
@@ -251,10 +248,7 @@ class HeadwiseFusedAttention(nn.Module):
         cbm = _causal_block_mask(Tp, n_blocks, m2, x.device)
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
-        all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
-        safe_scores = scores.masked_fill(all_masked, 0.0)
-        p = torch.softmax(safe_scores, dim=-1)
-        p = p.masked_fill(all_masked, 0.0)
+        p = _nan_safe_softmax(scores, dim=-1)
         out = torch.einsum('b h t n, b n d -> b h t d', p, C_comp_n)
         if pad:
             out = out[:, :, :T]
@@ -263,7 +257,6 @@ class HeadwiseFusedAttention(nn.Module):
     def forward(self, x):
         B, T, d = x.shape
         h = self.norm(x)
-        hd = self.cfg.head_dim
         kda_o = self._kda_heads(h)
         csa_o = self._csa_heads(h)
         hca_o = self._hca_heads(h)
