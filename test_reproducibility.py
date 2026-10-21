@@ -553,11 +553,31 @@ def test_split_clean_texts_has_no_cross_split_overlap():
     assert report['audit']['ok'], report['audit']['problems']
     assert report['exact_text_overlaps'] == {
         'train_val': 0, 'train_test': 0, 'val_test': 0}
+    assert report['normalized_text_overlaps'] == {
+        'train_val': 0, 'train_test': 0, 'val_test': 0}
     # The three text partitions are disjoint by construction.
     by_split = {k: {cleaned[i] for i in split[k]} for k in split}
     assert not (by_split['train'] & by_split['val'])
     assert not (by_split['train'] & by_split['test'])
     assert not (by_split['val'] & by_split['test'])
+
+
+def test_clean_lm_texts_dedups_whitespace_and_unicode_variants():
+    """Source-formatting variants are the same document, not new data."""
+    tok = _FallbackCharTokenizer()
+    texts = [
+        'hello world',
+        'hello  world',          # collapsed whitespace
+        'hello\tworld',          # tab
+        'hello\u00a0world',       # NBSP -> space under NFKC
+        'Hello world',           # case is content, keep it
+    ]
+    result = clean_lm_texts(texts, tok, seq_len=32)
+    assert result['texts'] == ['hello world', 'Hello world']
+    stats = result['stats']
+    assert stats['n_duplicates'] == 3
+    assert stats['n_normalized_duplicates'] == 3
+    json.dumps(stats, allow_nan=False)
 
 
 def test_clean_lm_texts_drops_null_and_nonfinite_documents():

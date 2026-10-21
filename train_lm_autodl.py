@@ -50,6 +50,7 @@ import datetime
 import json
 import math
 import dataclasses
+import unicodedata
 from collections import OrderedDict
 import torch
 import torch.nn as nn
@@ -289,9 +290,27 @@ class TinyStoriesLM(Dataset):
 # only. Per-split summary statistics below are computed for REPORTING
 # distribution shift, never fed back into training or model selection.
 
+def _normalized_text(text):
+    """Canonical text identity for duplicate detection.
+
+    Exact-string dedup misses the same document stored with different
+    whitespace / Unicode normalization (common when a corpus is merged
+    from CSV, JSON and HTML sources). NFKC plus whitespace collapsing
+    makes those variants hash to one identity WITHOUT lowercasing, so
+    genuinely different casing is still treated as different text.
+    """
+    return ' '.join(unicodedata.normalize('NFKC', str(text)).split())
+
+
 def _text_digests(texts):
     """Content digests of a list of texts (exact-duplicate identity)."""
     return {hashlib.sha256(str(t).encode('utf-8', 'replace')).digest()
+            for t in texts}
+
+
+def _normalized_text_digests(texts):
+    """Content digests after whitespace/Unicode normalization."""
+    return {hashlib.sha256(_normalized_text(t).encode('utf-8', 'replace')).digest()
             for t in texts}
 
 
@@ -330,9 +349,13 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
       * drop null / non-finite documents (``None``, NaN, +-Inf) instead of
         stringifying them into ``'None'``/``'nan'`` label noise;
       * drop empty / whitespace-only documents;
-      * drop exact duplicates (content hash) so the same story can never
-        end up on both sides of the split — dedup BEFORE splitting is
-        what makes the cross-split disjointness guarantee possible;
+      * drop duplicates (content hash) so the same story can never end
+        up on both sides of the split — dedup BEFORE splitting is what
+        makes the cross-split disjointness guarantee possible. A second
+        text whose NFKC-normalized, whitespace-collapsed form matches an
+        already-kept text is also dropped (``n_normalized_duplicates``);
+        exact-string-only dedup would leak the same document when sources
+        differ only in whitespace or Unicode compatibility forms;
       * count documents whose MODEL WINDOW (the ``seq_len + 1`` tokens
         ``TinyStoriesLM`` actually consumes) was already seen: two
         different strings sharing that token prefix are the same training
@@ -352,8 +375,9 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
     JSON-serializable and go straight into the run record.
     """
     texts = list(texts)
-    clean, seen_texts, seen_windows = [], set(), set()
+    clean, seen_texts, seen_normalized, seen_windows = [], set(), set(), set()
     n_nonfinite = n_empty = n_duplicates = 0
+    n_normalized_duplicates = 0
     n_window_duplicates = n_too_short = n_tokenize_errors = 0
     for text in texts:
         if _is_nonfinite_document(text):
@@ -365,10 +389,15 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
             continue
         key = hashlib.sha256(s.encode('utf-8', 'replace')).digest()
         if dedup:
-            if key in seen_texts:
+            normalized_key = hashlib.sha256(
+                _normalized_text(s).encode('utf-8', 'replace')).digest()
+            if key in seen_texts or normalized_key in seen_normalized:
                 n_duplicates += 1
+                if key not in seen_texts:
+                    n_normalized_duplicates += 1
                 continue
             seen_texts.add(key)
+            seen_normalized.add(normalized_key)
         try:
             ids = tokenizer.encode(s, truncation=True,
                                    max_length=seq_len + 1)
@@ -397,6 +426,7 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
         'n_empty': n_empty,
         'n_nonfinite': n_nonfinite,
         'n_duplicates': n_duplicates,
+        'n_normalized_duplicates': n_normalized_duplicates,
         'n_window_duplicates': n_window_duplicates,
         'n_too_short_to_supervise': n_too_short,
         'n_tokenize_errors': n_tokenize_errors,
@@ -425,8 +455,9 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         no group straddles train/val/test.
 
     On top of the structural audit this verifies that the three text
-    partitions share no exact duplicate — a defense-in-depth check against
-    a future refactor that moves dedup after the split.
+    partitions share no exact OR normalized duplicate (same content after
+    NFKC + whitespace collapsing) — a defense-in-depth check against a
+    future refactor that moves dedup after the split.
 
     Returns ``(split, report)`` where ``split`` maps split names to index
     lists and ``report`` is the JSON-serializable audit + overlap report.
@@ -445,10 +476,20 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
     by_split = {k: [texts[i] for i in split[k]]
                 for k in ('train', 'val', 'test')}
     digests = {k: _text_digests(v) for k, v in by_split.items()}
+    normalized_digests = {k: _normalized_text_digests(v)
+                          for k, v in by_split.items()}
     overlaps = {
         'train_val': len(digests['train'] & digests['val']),
         'train_test': len(digests['train'] & digests['test']),
         'val_test': len(digests['val'] & digests['test']),
+    }
+    normalized_overlaps = {
+        'train_val': len(normalized_digests['train']
+                         & normalized_digests['val']),
+        'train_test': len(normalized_digests['train']
+                          & normalized_digests['test']),
+        'val_test': len(normalized_digests['val']
+                        & normalized_digests['test']),
     }
     # The audit verifies the ordering itself: raw row order without
     # groups, group first-appearance order when groups are declared.
@@ -464,12 +505,18 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         'chronological_order_verified': order_verified,
         'audit': audit,
         'exact_text_overlaps': overlaps,
+        'normalized_text_overlaps': normalized_overlaps,
     }
     problems = list(audit['problems'])
     for pair, n_overlap in overlaps.items():
         if n_overlap:
             problems.append(
                 f'{pair}: {n_overlap} identical text(s) shared across splits')
+    for pair, n_overlap in normalized_overlaps.items():
+        if n_overlap:
+            problems.append(
+                f'{pair}: {n_overlap} normalized-duplicate text(s) shared '
+                'across splits')
     if problems:
         raise RuntimeError(
             'train/val/test split failed its leakage audit: '
