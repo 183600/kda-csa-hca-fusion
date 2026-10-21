@@ -150,6 +150,13 @@ DEFAULT_TOPK_GRID: tuple[int, ...] = (0, 1, 2, 4, 8)
 #: The reference 3:1:1 layout the budget defaults are derived from.
 DEFAULT_START: tuple[str, ...] = ('kda', 'kda', 'kda', 'csa', 'hca')
 
+#: Probe RNG streams. Candidate selection uses VALIDATION; the recommended
+#: layout is then retrained and scored ONCE on a disjoint sealed test stream.
+#: Training lives at ``recall_reach.TRAIN_GEN_OFFSET`` (1M), so neither of
+#: these streams can reproduce a training batch.
+VALIDATION_GEN_OFFSET = 5_000_000
+FINAL_TEST_GEN_OFFSET = 10_000_000
+
 
 # ===========================================================================
 # 1. Candidate layouts
@@ -899,6 +906,8 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
                         d_model: int = 32, train_batch: int = 16,
                         eval_batches: int = 4, eval_batch: int = 64,
                         device='cpu', logger: logging.Logger | None = None,
+                        gen_offset: int = VALIDATION_GEN_OFFSET,
+                        stream: str = 'validation',
                         ) -> Callable[[Candidate], dict]:
     """Return an ``evaluate(candidate)`` closure for the MQAR probe.
 
@@ -909,12 +918,29 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
     standard error / 95% t-CI, losses' final value, and the geometry are
     recorded in ``metrics`` for the trace — the greedy acceptance rule in
     :func:`greedy_search` reads the per-seed pairings from there.
+
+    ``gen_offset`` selects the scoring stream. The default is the
+    validation stream used for selection; the final test pass passes
+    :data:`FINAL_TEST_GEN_OFFSET` and ``stream='test'`` so the recommended
+    layout is measured exactly once on data that never influenced the
+    search. ``stream`` is recorded in ``metrics`` for provenance.
     """
     from recall_reach import evaluate_recall, train_recall_model
     from run_quality import _t_crit_975
 
     if not seeds:
         raise ValueError('make_mqar_objective: seeds must be non-empty.')
+    if isinstance(gen_offset, bool) or not isinstance(gen_offset, int):
+        raise ValueError(
+            f'make_mqar_objective: gen_offset must be an exact int, got '
+            f'{gen_offset!r}')
+    if gen_offset < 0:
+        raise ValueError(
+            f'make_mqar_objective: gen_offset must be >= 0, got '
+            f'{gen_offset!r}')
+    if not isinstance(stream, str) or not stream:
+        raise ValueError('make_mqar_objective: stream must be a non-empty '
+                         f'string, got {stream!r}')
 
     def evaluate(candidate: Candidate) -> dict:
         accuracies: list[float | None] = []
@@ -927,7 +953,7 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
             result = evaluate_recall(
                 model, embed, head, seq_len=int(seq_len),
                 n_batches=int(eval_batches), batch=int(eval_batch),
-                seed=int(seed), device=device)
+                seed=int(seed), device=device, gen_offset=int(gen_offset))
             accuracies.append(result['accuracy'])
             final_losses.append(losses[-1] if losses else None)
             if logger is not None:
@@ -961,6 +987,8 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
                 'm': int(m),
                 'm2': int(m2),
                 'probe': 'mqar-long-range-cue-last',
+                'evaluation_stream': str(stream),
+                'eval_gen_offset': int(gen_offset),
             },
         }
 
@@ -1116,6 +1144,10 @@ def main(argv=None) -> int:
     parser.add_argument('--device', default=None)
     parser.add_argument('--quick', action='store_true',
                         help='small search: depth 3, 60 steps, 1 round')
+    parser.add_argument('--skip-final-test', action='store_true',
+                        help='do not retrain the recommended layout for the '
+                             'one-shot sealed-test evaluation (selection is '
+                             'still validation-only)')
     parser.add_argument('--quiet', action='store_true')
     args = parser.parse_args(argv)
 
@@ -1209,6 +1241,41 @@ def main(argv=None) -> int:
         selection_correction=args.selection_correction,
         logger=logger)
 
+    # The search above used VALIDATION only. Freeze the recommended layout and
+    # score it exactly once on a disjoint sealed test stream (fresh retrain
+    # with the same seeds/training stream), so the reported final number never
+    # participated in candidate selection.
+    final_test = None
+    if not args.skip_final_test:
+        best_candidate = Candidate(
+            tuple(result['best']['layout']),
+            csa_topk=int(result['best']['csa_topk']))
+        test_evaluate = make_mqar_objective(
+            m=args.m, m2=args.m2, seeds=seeds, steps=steps,
+            seq_len=args.seq_len, d_model=args.d_model,
+            train_batch=args.train_batch, eval_batches=args.eval_batches,
+            eval_batch=args.eval_batch, device=device, logger=logger,
+            gen_offset=FINAL_TEST_GEN_OFFSET, stream='test')
+        test_record = test_evaluate(best_candidate)
+        final_test = {
+            'candidate': best_candidate.label,
+            'stream': 'test',
+            'used_for_selection': False,
+            'gen_offset': int(FINAL_TEST_GEN_OFFSET),
+            'score': test_record['score'],
+            'metrics': test_record['metrics'],
+            'note': ('recommended layout retrained from scratch with the '
+                     'same seeds and training stream as the search, then '
+                     'scored exactly once on a seed stream disjoint from '
+                     'training and validation; never used to select, accept '
+                     'or tune any candidate'),
+        }
+        if not args.quiet:
+            _test_view = {'score': test_record['score'],
+                          'metrics': test_record['metrics']}
+            print(f"FINAL TEST (sealed, never used for selection): "
+                  f"{best_candidate.label} score={_fmt_score(_test_view)}")
+
     report = {
         'kind': 'exp12_layerwise_search',
         'method': 'greedy best-improvement over single-edit layout '
@@ -1248,6 +1315,10 @@ def main(argv=None) -> int:
             'train_batch': int(args.train_batch),
             'eval_batches': int(args.eval_batches),
             'eval_batch': int(args.eval_batch),
+            'validation_gen_offset': int(VALIDATION_GEN_OFFSET),
+            'final_test_gen_offset': (None if final_test is None
+                                      else int(FINAL_TEST_GEN_OFFSET)),
+            'final_test_used_for_selection': False,
             'topk_grid': [int(k) for k in topk_grid],
             'include_swaps': not args.no_swaps,
             'max_rounds': int(args.max_rounds),
@@ -1266,6 +1337,7 @@ def main(argv=None) -> int:
         'records': result['records'],
         'pareto': result['pareto'],
         'best_vs_start': result['best_vs_start'],
+        'final_test': final_test,
         'acceptance_policy': result['acceptance_policy'],
         'overfit_sanity_check': gate_record,
         'provenance': capture_provenance(),
@@ -1302,6 +1374,9 @@ def main(argv=None) -> int:
             'best_label': best.get('label'),
             'best_score': best.get('score'),
             'best_state_bytes': best.get('state_bytes_allocated'),
+            'final_test_score': (None if final_test is None
+                                 else final_test.get('score')),
+            'final_test_used_for_selection': False,
             'overfit_gate_enabled': bool(gate_record.get('enabled')),
             'overfit_gate_failures': int(gate_failures),
         },

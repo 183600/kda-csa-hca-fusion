@@ -62,7 +62,9 @@ from kv_budget import instant_layout_read_elements  # noqa: E402
 from layerwise_search import (  # noqa: E402
     Candidate,
     DEFAULT_TOPK_GRID,
+    FINAL_TEST_GEN_OFFSET,
     SearchProblem,
+    VALIDATION_GEN_OFFSET,
     budget_spec,
     candidate_config,
     candidate_from_ratio,
@@ -595,6 +597,9 @@ def test_mqar_objective_smoke(device):
     assert 0.0 <= result['score'] <= 1.0
     assert result['metrics']['per_seed_accuracy'][0] is not None
     assert result['metrics']['probe'] == 'mqar-long-range-cue-last'
+    assert result['metrics']['evaluation_stream'] == 'validation'
+    assert result['metrics']['eval_gen_offset'] == VALIDATION_GEN_OFFSET
+    assert FINAL_TEST_GEN_OFFSET != VALIDATION_GEN_OFFSET
 
 
 def test_main_writes_run_manifest_and_gate(tmp_path, monkeypatch):
@@ -617,6 +622,8 @@ def test_main_writes_run_manifest_and_gate(tmp_path, monkeypatch):
     assert entry['experiment'] == 'exp12_layerwise_search'
     assert entry['seeds'] == [42]
     assert entry['results']['overfit_gate_enabled'] is False
+    assert entry['results']['final_test_used_for_selection'] is False
+    assert entry['results']['final_test_score'] is not None
     assert entry['artifacts']['results'] == str(result_json)
     assert entry['status'] == 'completed'
 
