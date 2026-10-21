@@ -54,6 +54,7 @@ Scope and honesty
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import torch
 
@@ -396,11 +397,16 @@ def bandwidth_bound_ms(nbytes: float, bw_gbps: float) -> float:
     reference's Python overhead — compare it with the roofline module's
     ``efficiency_label`` conventions, not with a wall-clock claim.
     """
-    if not isinstance(nbytes, (int, float)) or nbytes < 0:
+    if (isinstance(nbytes, bool)
+            or not isinstance(nbytes, (int, float))
+            or not math.isfinite(nbytes) or nbytes < 0):
         raise ValueError(
-            f'bandwidth_bound_ms: nbytes={nbytes!r} must be a '
+            f'bandwidth_bound_ms: nbytes={nbytes!r} must be a finite '
             f'non-negative number.')
-    if not isinstance(bw_gbps, (int, float)) or bw_gbps <= 0:
+    if (isinstance(bw_gbps, bool)
+            or not isinstance(bw_gbps, (int, float))
+            or not math.isfinite(bw_gbps) or bw_gbps <= 0):
         raise ValueError(
-            f'bandwidth_bound_ms: bw_gbps={bw_gbps!r} must be positive.')
+            f'bandwidth_bound_ms: bw_gbps={bw_gbps!r} must be finite and '
+            f'positive.')
     return float(nbytes) / (float(bw_gbps) * 1e9) * 1e3

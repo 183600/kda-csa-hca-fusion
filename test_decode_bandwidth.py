@@ -200,7 +200,6 @@ def test_route_table_all_routes_and_route_invariance():
     assert [r['route'] for r in rows] == ['kda', 'mamba2', 'rwkv7']
     assert all(r['status'] == 'ok' for r in rows), [r.get('reason')
                                                     for r in rows]
-    by_route = {r['route']: r for r in rows}
     csa = {r['read_bytes_by_op_per_token']['csa'] for r in rows}
     hca = {r['read_bytes_by_op_per_token']['hca'] for r in rows}
     assert len(csa) == 1 and len(hca) == 1
@@ -269,6 +268,11 @@ def test_validation_errors():
         db.bandwidth_bound_ms(1e6, 0.0)
     with pytest.raises(ValueError):
         db.bandwidth_bound_ms(-1.0, 100.0)
+    for bad in (True, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            db.bandwidth_bound_ms(bad, 100.0)
+        with pytest.raises(ValueError):
+            db.bandwidth_bound_ms(1e6, bad)
     with pytest.raises(ValueError):
         db.attention_tower_weight_bytes(cfg, itemsize=0)
 
