@@ -982,6 +982,18 @@ def _peak_memory_bytes():
         return None
 
 
+def _lm_error_examples_saturated(examples, max_examples) -> bool:
+    """Whether every error category already reached its example cap.
+
+    ``examples`` maps a category name to its collected examples; the
+    ``'correct'`` / ``'ignored'`` pseudo-categories are excluded because
+    they never collect examples.
+    """
+    return all(len(examples[c]) >= int(max_examples)
+               for c in LM_ERROR_CATEGORIES
+               if c not in ('correct', 'ignored'))
+
+
 @torch.no_grad()
 def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
                       max_batches=2, seed=0, tokenizer=None, max_examples=3,
@@ -1028,10 +1040,19 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
     diags = []
     examples = OrderedDict((name, []) for name in LM_ERROR_CATEGORIES)
     n_batches = n_nonfinite = 0
+    # Counts EVERY batch pulled from the loader (including the ones that are
+    # skipped below).  ``n_batches`` counts only the ANALYZED batches, so it
+    # cannot be used to locate a sample in the dataset: a skipped batch would
+    # shift every later row index down by one batch.
+    loader_batch_index = 0
     try:
         for batch in loader:
             if max_batches is not None and n_batches >= int(max_batches):
                 break
+            # Row offset of this batch's first sample in the dataset
+            # (``shuffle=False``, so the loader is a plain sequential slice).
+            batch_row_base = loader_batch_index * int(batch_size)
+            loader_batch_index += 1
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             if labels.numel() == 0 or not (labels != -100).any():
@@ -1044,8 +1065,11 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
             d = lm_token_diagnostics(logits, labels, input_ids,
                                      top_k=top_k, confidence=confidence)
             diags.append(d)
-            sample_base = n_batches * int(batch_size)
+            sample_base = batch_row_base
+            saturated = False
             for bi in range(int(input_ids.shape[0])):
+                if saturated:
+                    break
                 for t, cat in enumerate(d['category'][bi]):
                     if cat in ('correct', 'ignored'):
                         continue
@@ -1072,10 +1096,10 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
                         'pred_text': _decode_tokens(
                             tokenizer, [int(d['pred'][bi, t])]),
                     })
-                    if len(bucket) > 0 and all(
-                            len(examples[c]) >= int(max_examples)
-                            for c in LM_ERROR_CATEGORIES
-                            if c not in ('correct', 'ignored')):
+                    if _lm_error_examples_saturated(examples, max_examples):
+                        # Every error category has reached its cap: stop
+                        # collecting examples for the rest of the stream.
+                        saturated = True
                         break
             n_batches += 1
             if max_batches is not None and n_batches >= int(max_batches):

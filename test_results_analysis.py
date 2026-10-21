@@ -647,6 +647,46 @@ def test_analyze_lm_errors_read_only_deterministic_json(capsys):
     assert tok.decode(tok.encode('hello world')) == 'hello world'
 
 
+def test_analyze_lm_errors_sample_ids_point_at_the_dataset_row():
+    """The recorded ``sample`` id must be the dataset row, not a batch count.
+
+    A batch whose labels carry no supervised token is skipped by the
+    analyzer.  The row index of the samples in the FOLLOWING batches must
+    still be the dataset rows they came from, so the bad-case report can be
+    traced back to the exact held-out examples.
+    """
+    from train_lm_autodl import analyze_lm_errors
+
+    class _PartlyUnsupervisedDataset(torch.utils.data.Dataset):
+        """Rows 0-1 have no supervised token; rows 2-5 do."""
+
+        def __init__(self):
+            self.split = 'validation'
+
+        def __len__(self):
+            return 6
+
+        def __getitem__(self, i):
+            ids = torch.arange(4) + i
+            labels = ids.clone()
+            if i < 2:
+                labels[:] = -100
+            return {'input_ids': ids, 'labels': labels}
+
+    model = _FixedLogitModel(8)
+    rep = analyze_lm_errors(model, _PartlyUnsupervisedDataset(),
+                             batch_size=2, max_batches=5, seed=0,
+                             max_examples=10)
+    samples = [ex['sample']
+               for bucket in rep['examples'].values() for ex in bucket]
+    assert samples, 'expected at least one collected bad case'
+    # The first batch (rows 0-1) has no supervised token and is skipped;
+    # every recorded sample must therefore be a row of a LATER batch
+    # (rows 2-5), never a row of the skipped one.
+    assert min(samples) >= 2, f'sample ids {sorted(samples)} point into the skipped batch'
+    assert max(samples) <= 5, f'sample ids {sorted(samples)} exceed the dataset'
+
+
 def test_hypothesis_verdicts_are_machine_readable_and_rule_based():
     """P2-2: pre-registered hypotheses get rule-based, per-row verdicts."""
     chance = 0.0625
