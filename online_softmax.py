@@ -219,8 +219,18 @@ def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
     for lo in range(0, n, chunk):
         hi = min(n, lo + chunk)
         # ``mask`` may be [T, Nc] or any leading-batch/head broadcastable
-        # form ([B, H, T, Nc]); only the key axis is chunked here.
-        block_mask = None if mask is None else mask[..., lo:hi]
+        # form ([B, H, T, Nc]); only the key axis is chunked here.  A mask
+        # whose last axis is a broadcast singleton (size 1, e.g. a
+        # per-query keep/drop-all flag) must NOT be sliced: slicing a
+        # size-1 axis past its start yields an empty block, which the
+        # masked_fill/amax chain cannot reduce.  Such a mask is already
+        # broadcastable to every chunk, so it is passed through whole.
+        if mask is None:
+            block_mask = None
+        elif mask.shape[-1] == n:
+            block_mask = mask[..., lo:hi]
+        else:
+            block_mask = mask
         state = online_softmax_state(
             q, k[:, :, lo:hi], v[:, :, lo:hi], scale=scale, mask=block_mask)
         merged = state if merged is None else online_softmax_merge(merged, state)
