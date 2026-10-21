@@ -309,6 +309,36 @@ def test_part_b_matched_budget_control():
         and eq['ptq_matched_ppl'] == eq['ptq_ppl'], '')
 
 
+def test_build_corpus_audits_windows_and_fits_diagnostics_on_train():
+    """Exp 11's corpus builder must expose (and remove) sample-level leaks."""
+    print('\nTest: quant-LM corpus window audit + train-fitted diagnostics')
+    tok, splits, report = build_corpus(seq_len=32, n_texts=64, seed=0)
+    _ok('cleaning stats are attached',
+        report['cleaning']['n_kept'] == sum(len(v) for v in splits.values())
+        or report['cleaning']['n_kept'] >= sum(len(v)
+                                               for v in splits.values()),
+        f"{report['cleaning']['n_kept']}")
+    audit = report['window_overlap_audit']
+    _ok('cross-split model windows are audited',
+        audit['any'] is False and audit['total_cross_split'] == 0
+        and audit['n_train_windows'] > 0, f"{audit['total_cross_split']}")
+    _ok('held-out leak filter ran in the train-authoritative direction',
+        report['window_leak_filter']['train_authoritative'] is True
+        and report['window_leak_filter']['n_val_after']
+        == len(splits['val'])
+        and report['window_leak_filter']['n_test_after']
+        == len(splits['test']), '')
+    diag = report['distribution_diagnostics']
+    _ok('diagnostics are fitted on train only',
+        diag['fit_on'] == 'train'
+        and set(diag['split_stats']) == {'train', 'val', 'test'}
+        and all(v['fit_on'] == 'train'
+                for v in diag['length_outlier_audit'].values())
+        and all(v['reference'] == 'train'
+                for v in diag['distribution_shift'].values()), '')
+    json.dumps(report, allow_nan=False)
+
+
 def test_stepwise_eval_reports_accuracy_and_restores_mode():
     """Held-out eval is read-only: accuracy is returned, train() restored."""
     print('\nTest: stepwise held-out eval mode/accuracy contract')

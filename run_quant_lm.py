@@ -136,6 +136,12 @@ from train_lm_autodl import (  # noqa: E402
     _FallbackCharTokenizer,
     _synthetic_corpus,
     _texts_fingerprint,
+    _distribution_shift,
+    _filter_leaking_heldout,
+    _length_outlier_audit,
+    _probe_token_lengths,
+    _text_length_stats,
+    _window_overlap_audit,
     clean_lm_texts,
     analyze_lm_errors,
     evaluate_lm_loss,
@@ -177,12 +183,58 @@ def build_corpus(seq_len: int = DEFAULT_SEQ_LEN,
     train/val/test split are the same code paths the real LM pipeline uses.
     """
     tokenizer = _FallbackCharTokenizer()
-    clean = clean_lm_texts(_synthetic_corpus(n_texts), tokenizer,
-                           seq_len)['texts']
+    cleaning = clean_lm_texts(_synthetic_corpus(n_texts), tokenizer,
+                              seq_len)
+    clean = cleaning['texts']
     split, report = split_clean_texts(clean, val_frac=0.2, test_frac=0.1,
                                       seed=seed)
     split_texts = {name: [clean[i] for i in split[name]]
                    for name in ('train', 'val', 'test')}
+
+    # Last line of defence: a held-out row whose truncated (seq_len+1)-token
+    # model input already occurs in TRAIN is a sample the model saw during
+    # training, even when the raw strings differ. Filter those rows BEFORE
+    # any evaluation; the audit below records whether any residual overlap
+    # remains (a fallback keeps a split whole rather than emptying it).
+    leak_filter = _filter_leaking_heldout(
+        split_texts['train'], split_texts['val'], split_texts['test'],
+        tokenizer, seq_len)
+    split_texts['val'] = leak_filter['val_texts']
+    split_texts['test'] = leak_filter['test_texts']
+    window_overlap = _window_overlap_audit(
+        split_texts['train'], split_texts['val'], split_texts['test'],
+        tokenizer, seq_len)
+
+    # Distribution diagnostics are fitted on TRAIN only and merely
+    # reported for val/test: text length is not a model feature, so acting
+    # on these fences would change the evaluation population.
+    split_stats = {
+        name: _text_length_stats(texts, tokenizer, seq_len)
+        for name, texts in split_texts.items()}
+    train_lengths = _probe_token_lengths(
+        split_texts['train'], tokenizer, seq_len)
+    diagnostics = {
+        'fit_on': 'train',
+        'split_stats': split_stats,
+        'length_outlier_audit': {
+            name: _length_outlier_audit(
+                train_lengths,
+                _probe_token_lengths(split_texts[name], tokenizer, seq_len))
+            for name in ('val', 'test')},
+        'distribution_shift': {
+            name: _distribution_shift(split_stats['train'],
+                                      split_stats[name])
+            for name in ('val', 'test')},
+        'note': ('Token-length outlier fences and Cohen\'s d are fitted on '
+                 'TRAIN and reported for val/test; they are shift warnings, '
+                 'never transforms or selection criteria.'),
+    }
+    report['cleaning'] = cleaning['stats']
+    report['window_leak_filter'] = {
+        k: v for k, v in leak_filter.items()
+        if k not in ('val_texts', 'test_texts')}
+    report['window_overlap_audit'] = window_overlap
+    report['distribution_diagnostics'] = diagnostics
     return tokenizer, split_texts, report
 
 
