@@ -251,6 +251,14 @@ def test_exp15_row_contract_rejects_tampering():
             lambda r: r[3].__setitem__('ci_ppl_ratio', [1.0, 1.0])
         yield 'decode_prefill p_value out of range', \
             lambda r: r[3].__setitem__('p_value', 1.5)
+        yield 'booleans accepted as coverage counts', \
+            lambda r: r[0].update(
+                n_reps=1, n_covered=True, coverage=1.0, se=0.0,
+                bias=0.9, verdict='biased')
+        yield 'booleans accepted as significance counts', \
+            lambda r: r[1].update(
+                n_reps=1, n_significant=True, rejection_rate=1.0, se=0.0,
+                meets=False, verdict='liberal')
         yield 'duplicate coverage row key', \
             lambda r: r.append(copy.deepcopy(r[0]))
 

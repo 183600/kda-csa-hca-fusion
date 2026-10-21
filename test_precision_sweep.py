@@ -474,6 +474,8 @@ def test_precision_contract_rejects_inconsistent_rows():
          _mutated(n_ok=0, worst_seed=3, out_eps_max=None,
                   out_eps_median=None, state_eps_max=None,
                   state_eps_median=None, finite_ok=False, verdict='fail')),
+        ('missing worst_seed despite finite seeds',
+         _mutated(worst_seed=None)),
     ]
     for name, row in cases:
         _ok(f'rejects: {name}',

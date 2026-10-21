@@ -653,8 +653,13 @@ def _validate_precision_sweep_rows(rows: list, metadata: dict) -> list[str]:
                                  or not isinstance(seed, int) or seed < 0):
             out.append(f"{where}: 'worst_seed' must be null or a "
                        f'non-negative int, got {seed!r}')
-        if n_ok == 0 and seed is not None:
-            out.append(f'{where}: worst_seed set but n_ok=0 (no finite seed)')
+        finite_seed = (row.get('out_eps_max') is not None
+                       or row.get('state_eps_max') is not None)
+        if finite_seed and seed is None:
+            out.append(f'{where}: worst_seed missing although a finite seed '
+                       f'is recorded')
+        if not finite_seed and seed is not None:
+            out.append(f'{where}: worst_seed set but no finite seed exists')
         flags = {}
         for key in ('out_budget_ok', 'state_budget_ok', 'dtype_contract_ok',
                     'finite_ok'):
@@ -884,6 +889,7 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
             n_covered = row.get('n_covered')
             if not (_positive_int(n_reps)
                     and isinstance(n_covered, int)
+                    and not isinstance(n_covered, bool)
                     and 0 <= n_covered <= int(n_reps)):
                 out.append(f"{where}: 'n_covered' must be an int in "
                            f"[0, n_reps], got {n_covered!r}")
@@ -968,6 +974,7 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
             n_reps = row.get('n_reps')
             n_sig = row.get('n_significant')
             if not (_positive_int(n_reps) and isinstance(n_sig, int)
+                    and not isinstance(n_sig, bool)
                     and 0 <= n_sig <= int(n_reps)):
                 out.append(f"{where}: 'n_significant' must be an int in "
                            f"[0, n_reps], got {n_sig!r}")
