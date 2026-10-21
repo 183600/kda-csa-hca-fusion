@@ -573,6 +573,40 @@ def test_main_writes_run_manifest(tmp_path, monkeypatch):
         str(entry['provenance'].get('git_commit')))
 
 
+def test_worst_seed_selection_picks_lowest_accuracy():
+    """The bad-case rollup must quote the WEAKEST seed, not the strongest.
+
+    The pooled category mix covers every seed, but the representative
+    examples are supposed to come from the lowest-accuracy seed (the most
+    diagnostic one) — a negated sort key silently inverted that selection
+    and made the published examples come from the luckiest seed.
+    """
+    seeds = [
+        {'seed': 42, 'accuracy': 0.30,
+         'error_analysis': {'examples': ['weak']}},
+        {'seed': 43, 'accuracy': 0.55,
+         'error_analysis': {'examples': ['mid']}},
+        {'seed': 44, 'accuracy': 0.90,
+         'error_analysis': {'examples': ['best']}},
+    ]
+    worst = min(seeds, key=R._seed_accuracy_rank)
+    _ok('weakest seed selected', worst['seed'] == 42, str(worst['seed']))
+    _ok('weakest-seed examples returned',
+        worst['error_analysis']['examples'] == ['weak'],
+        str(worst['error_analysis']))
+
+    # Missing / non-finite accuracies rank last: they are missing data,
+    # not evidence of a weak run.
+    mixed = [
+        {'seed': 1, 'accuracy': None},
+        {'seed': 2, 'accuracy': 0.10},
+        {'seed': 3, 'accuracy': float('nan')},
+    ]
+    worst_mixed = min(mixed, key=R._seed_accuracy_rank)
+    _ok('missing accuracy does not win the ranking',
+        worst_mixed['seed'] == 2, str(worst_mixed['seed']))
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -586,6 +620,7 @@ def main() -> int:
     test_report_multi_seed_statistics()
     test_validation_curve_monitor()
     test_hypothesis_checks_contract()
+    test_worst_seed_selection_picks_lowest_accuracy()
     print('\nAll recall-reach tests passed.')
     return 0
 

@@ -1185,6 +1185,26 @@ def _hypothesis_checks(rows: list[dict]) -> dict:
     }
 
 
+def _seed_accuracy_rank(seed_row: dict) -> tuple[int, float]:
+    """Sort key that ranks the *lowest*-accuracy seed first.
+
+    ``min(..., key=_seed_accuracy_rank)`` therefore selects the weakest
+    seed — the one whose failures are the most diagnostic.  Seeds with a
+    missing / non-finite accuracy rank last (they are not evidence of a
+    weak run, they are missing data).
+    """
+    value = seed_row.get('accuracy')
+    if value is None:
+        return (1, float('inf'))
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return (1, float('inf'))
+    if not math.isfinite(value):
+        return (1, float('inf'))
+    return (0, value)
+
+
 def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                       steps: int = 80, seeds=(42, 43, 44), seq_len: int = SEQ_LEN,
                       d_model: int = D_MODEL, train_batch: int = 16,
@@ -1347,10 +1367,7 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                     for cat, slot in (ea.get('categories') or {}).items():
                         cat_totals[cat] = cat_totals.get(cat, 0) + int(
                             slot.get('count') or 0)
-                worst = min(
-                    row['per_seed'],
-                    key=lambda s: (s.get('accuracy') is None,
-                                   -(s.get('accuracy') or 0.0)))
+                worst = min(row['per_seed'], key=_seed_accuracy_rank)
                 worst_ea = worst.get('error_analysis') or {}
                 row['error_analysis'] = {
                     'n_errors_total': n_errors_total,
