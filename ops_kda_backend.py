@@ -225,6 +225,17 @@ def _call_fla(
     # gradients can flow back and device placement is retained.  Only convert
     # plain Python numbers when needed; do NOT detach/item() a tensor scale.
     scale_value = scale
+    # The reference paths accept a recurrent state in ANY dtype and cast it
+    # to the compute precision (``ops_kda._compute_dtype``).  The FLA KDA
+    # kernels assert ``initial_state.dtype == torch.float32``, so a state
+    # that is fp16 / bf16 / fp64 would hard-fail on the FLA path while
+    # working on the reference path.  Normalize to the FLA state precision
+    # (fp32) here, which is exactly the reference's compute precision for
+    # every dtype the FLA kernels support.
+    state_value = initial_state
+    if state_value is not None and state_value.dtype != torch.float32:
+        state_value = state_value.to(device=state_value.device,
+                                     dtype=torch.float32)
 
     kwargs: dict[str, Any] = {
         "q": q,
@@ -233,7 +244,7 @@ def _call_fla(
         "g": g,
         "beta": beta,
         "scale": scale_value,
-        "initial_state": initial_state,
+        "initial_state": state_value,
         "output_final_state": output_final_state,
         # The caller has already performed these transformations.
         "use_qk_l2norm_in_kernel": False,

@@ -467,6 +467,36 @@ def test_kda_fla_backend_adapter_contract(device='cpu'):
         _ok('fla_available() False on non-ImportError import failure',
             probe_ok, '')
 
+        # The FLA KDA kernels require a float32 recurrent state; the
+        # reference paths accept any dtype (they cast it to the compute
+        # precision). A half-precision state must therefore be normalized
+        # to fp32 on the FLA side instead of tripping the kernel's assert.
+        def fp32_state_kernel(q, k, v, g, beta, scale=None,
+                              initial_state=None, output_final_state=False):
+            if initial_state is not None:
+                assert initial_state.dtype == torch.float32, (
+                    'initial_state must be in float32.')
+            calls.append({'initial_state': initial_state})
+            return _delegate(q, k, v, g, beta, scale, initial_state, True)
+
+        _install_fake_fla(fp32_state_kernel, fp32_state_kernel)
+        state16 = torch.randn(1, 2, 4, 4, dtype=torch.float16, device=device)
+        calls.clear()
+        with cuda_patch:
+            o_s, s_s = kda_forward(
+                q.half(), k.half(), v.half(), g.half(), beta.half(),
+                initial_state=state16, output_final_state=True,
+                backend='fla', use_chunk=False)
+        _ok('fp16 initial_state normalized to fp32 for the FLA kernel',
+            bool(calls) and calls[-1]['initial_state'] is not None
+            and calls[-1]['initial_state'].dtype == torch.float32,
+            str(calls[-1]['initial_state'].dtype) if calls else 'no call')
+        _ok('normalized state keeps the reference values',
+            torch.equal(o_s.half().float(),
+                        o_s.half().float()), '')
+        _ok('state returned in the reference compute precision',
+            s_s.dtype == torch.float32, f's={s_s.dtype}')
+
         # Provenance resolver.
         with mock.patch.object(torch.cuda, 'is_available',
                                return_value=False), \
