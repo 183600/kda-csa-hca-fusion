@@ -669,6 +669,32 @@ def test_recall_flops_accepts_tuple_layout_forms():
         str([r['n_layers'] for r in nested['rows']]))
 
 
+def test_report_materializes_one_shot_inputs():
+    """Generators are valid grid inputs; empty trained seeds fail clearly."""
+    report = R.run_recall_report(
+        pairs=iter(((4, 8),)), layouts=['alternating'], seeds=iter((42,)),
+        train=False, seq_len=8)
+    _ok('generator seeds survive the design metadata',
+        report['design']['seeds'] == [42], str(report['design']['seeds']))
+    _ok('generator pairs survive the design metadata',
+        report['design']['pairs'] == [[4, 8]],
+        str(report['design']['pairs']))
+    _ok('generator inputs still produce one row', len(report['rows']) == 1,
+        str(len(report['rows'])))
+
+    try:
+        R.run_recall_report(
+            pairs=((4, 8),), layouts=['alternating'], seeds=(), train=True,
+            steps=0, seq_len=8)
+        raised = False
+    except ValueError:
+        raised = True
+    except Exception as exc:  # noqa: BLE001 - verify the actionable type
+        raised = f'{type(exc).__name__}: {exc}'
+    _ok('empty seeds with train=True raise ValueError', raised is True,
+        str(raised))
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -685,6 +711,7 @@ def main() -> int:
     test_worst_seed_selection_picks_lowest_accuracy()
     test_far_metrics_are_undefined_without_far_placements()
     test_recall_flops_accepts_tuple_layout_forms()
+    test_report_materializes_one_shot_inputs()
     print('\nAll recall-reach tests passed.')
     return 0
 

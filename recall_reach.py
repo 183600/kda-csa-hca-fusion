@@ -1287,6 +1287,16 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
     default is 3 seeds; a shorter seed list is recorded as exploratory in
     ``design['statistical_design']['warning']``.
     """
+    # Materialize one-shot iterables: the seed list is read once per cell
+    # and again when building the design metadata, so a generator would be
+    # exhausted by the first cell (and ``len`` fails on it). An empty seed
+    # list with ``train=True`` has no rows to aggregate and previously
+    # failed later with ``IndexError``.
+    seeds = tuple(seeds)
+    pairs = tuple(pairs)
+    if train and not seeds:
+        raise ValueError(
+            'run_recall_report: seeds must be non-empty when train=True.')
     if layouts is None:
         layouts = list(LAYOUT_PRESETS)
     if isinstance(layouts, dict):
