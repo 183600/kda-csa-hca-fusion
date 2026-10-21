@@ -88,9 +88,10 @@ def _ppl_from_mean_nll(mean_nll: float) -> float:
 
 
 def _validate_boot_args(alpha: float, n_boot: int) -> None:
-    if not 0.0 < float(alpha) < 1.0:
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
+            or not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
         raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
-    if int(n_boot) < 1:
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
         raise ValueError(f'n_boot must be >= 1, got {n_boot!r}')
 
 
@@ -123,15 +124,20 @@ def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
                 raise ValueError(
                     f'unit {i}: expected an (nll_sum, n_tokens) pair or a '
                     f'dict, got {unit!r}') from None
+        if isinstance(nll_sum, bool) or not isinstance(nll_sum, (int, float)):
+            raise ValueError(
+                f'unit {i}: nll_sum must be a real number, got {nll_sum!r}')
         nll_sum = float(nll_sum)
-        n_tokens = int(n_tokens)
-        if n_tokens < 0:
-            raise ValueError(f'unit {i}: n_tokens must be >= 0, '
-                             f'got {n_tokens}')
         if not math.isfinite(nll_sum):
             raise ValueError(
                 f'unit {i}: nll_sum is not finite ({nll_sum!r}); refusing '
                 f'to bootstrap a corrupted metric')
+        if isinstance(n_tokens, bool) or not isinstance(n_tokens, int):
+            raise ValueError(
+                f'unit {i}: n_tokens must be an int, got {n_tokens!r}')
+        if n_tokens < 0:
+            raise ValueError(f'unit {i}: n_tokens must be >= 0, '
+                             f'got {n_tokens}')
         out.append((nll_sum, n_tokens))
     return out
 
@@ -424,15 +430,20 @@ def throughput_summary(*, n_tokens: int, elapsed_s: float,
     kernel microbenchmark, and it is only comparable across runs on the
     same machine (the repo's accounting-honesty policy).
     """
-    n_tokens = int(n_tokens)
+    if isinstance(n_tokens, bool) or not isinstance(n_tokens, int):
+        raise ValueError(f'n_tokens must be an int, got {n_tokens!r}')
     if n_tokens < 0:
         raise ValueError(f'n_tokens must be >= 0, got {n_tokens}')
+    if isinstance(elapsed_s, bool) or not isinstance(elapsed_s, (int, float)):
+        raise ValueError(f'elapsed_s must be a real number, got {elapsed_s!r}')
     elapsed = float(elapsed_s)
     if not math.isfinite(elapsed) or elapsed <= 0.0:
         raise ValueError(f'elapsed_s must be a positive finite number, '
                          f'got {elapsed_s!r}')
     if n_sequences is not None:
-        n_sequences = int(n_sequences)
+        if isinstance(n_sequences, bool) or not isinstance(n_sequences, int):
+            raise ValueError(
+                f'n_sequences must be an int, got {n_sequences!r}')
         if n_sequences < 0:
             raise ValueError(f'n_sequences must be >= 0, got {n_sequences}')
     return {

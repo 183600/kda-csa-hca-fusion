@@ -77,6 +77,13 @@ def test_unit_normalization_validation():
         P.unit_nll_stats([(1.0,)])  # not a pair
     with pytest.raises(ValueError):
         P.unit_nll_stats([{'nll_sum': 1.0}])  # missing n_tokens
+    # Token counts are exact integers: a fractional/boolean count must
+    # not be silently truncated into a different corpus size.
+    for bad_tokens in (True, 1.9, '2'):
+        with pytest.raises(ValueError):
+            P.unit_nll_stats([(1.0, bad_tokens)])
+    with pytest.raises(ValueError):
+        P.unit_nll_stats([(True, 1)])  # bool nll_sum
 
 
 def test_bootstrap_ci_deterministic_rng_isolated_and_nested():
@@ -104,6 +111,12 @@ def test_bootstrap_ci_deterministic_rng_isolated_and_nested():
         P.bootstrap_ppl_ci(units, n_boot=0)
     with pytest.raises(ValueError):
         P.bootstrap_ppl_ci(units, alpha=1.0)
+    for bad_n_boot in (True, 1.5, '10'):
+        with pytest.raises(ValueError):
+            P.bootstrap_ppl_ci(units, n_boot=bad_n_boot)
+    for bad_alpha in (True, float('nan'), '0.05'):
+        with pytest.raises(ValueError):
+            P.bootstrap_ppl_ci(units, alpha=bad_alpha)
 
     single = P.bootstrap_ppl_ci([(2.0, 4)], n_boot=50, seed=0)
     assert single['degenerate'] is True
@@ -226,6 +239,16 @@ def test_throughput_summary_contract():
         P.throughput_summary(n_tokens=-1, elapsed_s=1.0)
     with pytest.raises(ValueError):
         P.throughput_summary(n_tokens=1, elapsed_s=1.0, n_sequences=-2)
+    for bad_tokens in (True, 1.5, '10'):
+        with pytest.raises(ValueError):
+            P.throughput_summary(n_tokens=bad_tokens, elapsed_s=1.0)
+    for bad_elapsed in (True, '1.0'):
+        with pytest.raises(ValueError):
+            P.throughput_summary(n_tokens=10, elapsed_s=bad_elapsed)
+    for bad_sequences in (True, 1.5, '2'):
+        with pytest.raises(ValueError):
+            P.throughput_summary(
+                n_tokens=10, elapsed_s=1.0, n_sequences=bad_sequences)
 
 
 # ---------------------------------------------------------------------------
