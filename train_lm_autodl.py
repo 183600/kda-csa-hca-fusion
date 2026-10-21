@@ -226,6 +226,10 @@ class TinyStoriesLM(Dataset):
         # training runs are bit-identical.
         self.prefetch_cache = bool(prefetch_cache)
         self.prefetch_cap = int(prefetch_cap)
+        if self.prefetch_cap < 0:
+            raise ValueError(
+                f"prefetch_cap must be >= 0 (0 = unbounded), got "
+                f"{self.prefetch_cap}.")
         self._prefetch_store: dict[int, tuple[int, ...]] = {}
         self._prefetch_hits = 0
 
