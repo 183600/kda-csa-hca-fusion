@@ -173,6 +173,38 @@ def test_paired_bootstrap_alignment_and_degenerate_contracts():
     assert one['significant'] is None and one['worse_model'] is None
 
 
+def test_paired_bootstrap_drops_zero_token_units_of_BOTH_models():
+    """The paired test must keep the two unit lists index-aligned.
+
+    A zero-token unit carries no information, so it is dropped — but the
+    two models must drop the SAME positions. Dropping them per model let
+    the lists drift: with A's zero-token unit at index 1 and B's at index
+    2, A's third unit was paired with B's second one, and the pairwise
+    token-count check could not detect it (the counts still matched).
+    """
+    # index:      0          1         2          3
+    a = [(10.0, 4), (5.0, 0), (12.0, 6), (14.0, 10)]
+    b = [(11.0, 4), (13.0, 6), (7.0, 0), (15.0, 10)]
+    rep = P.paired_bootstrap_ppl(a, b, n_boot=200, seed=0)
+    # A's zero-token unit is at index 1, B's at index 2: the UNION {1, 2}
+    # is dropped, so indices 0 and 3 survive and stay paired with each
+    # other.  Dropping per model kept three units and paired A[2] with
+    # B[1] - a different corpus window - which the pairwise token-count
+    # check cannot see (the counts still matched).
+    assert rep['n_units'] == 2 and rep['n_pairs'] == 2
+    assert rep['mean_nll_a'] == pytest.approx(24.0 / 14.0)
+    assert rep['mean_nll_b'] == pytest.approx(26.0 / 14.0)
+    assert rep['n_tokens_a'] == rep['n_tokens_b'] == 14
+
+    # A zero-token unit at the SAME index for both models is dropped too.
+    a2 = [(10.0, 10), (5.0, 0), (12.0, 10)]
+    b2 = [(11.0, 10), (6.0, 0), (7.0, 10)]
+    rep2 = P.paired_bootstrap_ppl(a2, b2, n_boot=200, seed=0)
+    assert rep2['n_units'] == 2
+    assert rep2['mean_nll_a'] == pytest.approx(22.0 / 20.0)
+    assert rep2['mean_nll_b'] == pytest.approx(18.0 / 20.0)
+
+
 def test_throughput_summary_contract():
     ts = P.throughput_summary(n_tokens=1000, elapsed_s=2.0, n_sequences=10)
     assert ts['tokens_per_second'] == pytest.approx(500.0, rel=1e-12)

@@ -94,27 +94,17 @@ def _validate_boot_args(alpha: float, n_boot: int) -> None:
         raise ValueError(f'n_boot must be >= 1, got {n_boot!r}')
 
 
-def normalize_units(units) -> list[tuple[float, int]]:
+def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
     """Validate evaluation units and return ``[(nll_sum, n_tokens), ...]``.
 
-    Accepts an iterable of ``(nll_sum, n_tokens)`` pairs/tuples/lists or
-    of dicts with ``'nll_sum'`` / ``'n_tokens'`` keys (the shape
-    ``evaluate_lm_loss(..., return_units=True)`` emits as ``per_unit``).
-
-    Contract:
-      * unit order is preserved — two ``evaluate_lm_loss`` calls on the
-        same dataset with the same batch size yield unit-aligned lists,
-        which is what makes the paired test pair CORRECT units;
-      * ``nll_sum`` must be finite (a non-finite value means the
-        evaluation already refused to report a metric) and
-        ``n_tokens >= 0``;
-      * units with zero supervised tokens are DROPPED: they carry no
-        information for any corpus-mean statistic and resampling only
-        them would produce tokenless replicates (division by zero);
-      * at least one informative unit must remain.
+    Zero-token units are KEPT here.  A paired comparison must drop the
+    zero-token positions of BOTH models (their UNION) so the two lists
+    keep their index alignment; dropping them per model would shift the
+    remaining units against each other.  :func:`normalize_units` drops
+    them for the single-model statistics.
     """
     if units is None:
-        raise ValueError('units must be an iterable of '
+        raise ValueError(f'{label} must be an iterable of '
                          '(nll_sum, n_tokens) pairs or dicts, got None')
     out: list[tuple[float, int]] = []
     for i, unit in enumerate(units):
@@ -142,12 +132,35 @@ def normalize_units(units) -> list[tuple[float, int]]:
             raise ValueError(
                 f'unit {i}: nll_sum is not finite ({nll_sum!r}); refusing '
                 f'to bootstrap a corrupted metric')
-        if n_tokens > 0:
-            out.append((nll_sum, n_tokens))
-    if not out:
+        out.append((nll_sum, n_tokens))
+    return out
+
+
+def normalize_units(units) -> list[tuple[float, int]]:
+    """Validate evaluation units and return ``[(nll_sum, n_tokens), ...]``.
+
+    Accepts an iterable of ``(nll_sum, n_tokens)`` pairs/tuples/lists or
+    of dicts with ``'nll_sum'`` / ``'n_tokens'`` keys (the shape
+    ``evaluate_lm_loss(..., return_units=True)`` emits as ``per_unit``).
+
+    Contract:
+      * unit order is preserved — two ``evaluate_lm_loss`` calls on the
+        same dataset with the same batch size yield unit-aligned lists,
+        which is what makes the paired test pair CORRECT units;
+      * ``nll_sum`` must be finite (a non-finite value means the
+        evaluation already refused to report a metric) and
+        ``n_tokens >= 0``;
+      * units with zero supervised tokens are DROPPED: they carry no
+        information for any corpus-mean statistic and resampling only
+        them would produce tokenless replicates (division by zero);
+      * at least one informative unit must remain.
+    """
+    out = _parse_units(units, 'units')
+    informative = [(nll, tok) for nll, tok in out if tok > 0]
+    if not informative:
         raise ValueError('no informative evaluation units (all missing or '
                          'zero supervised tokens)')
-    return out
+    return informative
 
 
 def unit_nll_stats(units) -> dict:
@@ -285,8 +298,28 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
     same data and the pairing would be wrong.
     """
     _validate_boot_args(alpha, n_boot)
-    a = normalize_units(units_a)
-    b = normalize_units(units_b)
+    raw_a = _parse_units(units_a, 'units_a')
+    raw_b = _parse_units(units_b, 'units_b')
+    if len(raw_a) == len(raw_b):
+        # Same corpus in the same order: drop the zero-token positions of
+        # BOTH models (their UNION).  Dropping them per model would let
+        # the two lists drift out of index alignment — with A's zero-token
+        # unit at index 1 and B's at index 2, A's third unit would be
+        # paired with B's second one, and ``check_alignment`` cannot see
+        # it because the token counts still match pairwise.
+        keep = [i for i, (ua, ub) in enumerate(zip(raw_a, raw_b))
+                if ua[1] > 0 and ub[1] > 0]
+        a = [raw_a[i] for i in keep]
+        b = [raw_b[i] for i in keep]
+        if not a:
+            raise ValueError(
+                'no informative evaluation units (all missing or zero '
+                'supervised tokens) for either model')
+    else:
+        # Different unit counts: the two evaluations did not see the same
+        # corpus, so no alignment can be established.
+        a = [(nll, tok) for nll, tok in raw_a if tok > 0]
+        b = [(nll, tok) for nll, tok in raw_b if tok > 0]
     if len(a) != len(b):
         raise ValueError(
             f'paired bootstrap needs the same number of informative units '
