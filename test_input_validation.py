@@ -42,8 +42,12 @@ sys.path.insert(0, HERE)
 import torch  # noqa: E402
 
 from online_softmax import online_softmax_state  # noqa: E402
-from ops_decoding_cache import CSADecodingCache  # noqa: E402
-from ops_gated_attention import GatedDeltaRule  # noqa: E402
+from ops_decoding_cache import (  # noqa: E402
+    CSADecodingCache, HCADecodingCache, _SlidingWindowRingBuffer,
+)
+from ops_gated_attention import (  # noqa: E402
+    GatedDeltaRule, gated_delta_rule_step,
+)
 
 
 def _ok(name, cond, detail=''):
@@ -78,6 +82,26 @@ def test_gated_delta_rule_rejects_geometry_mismatch():
         except Exception as exc:  # noqa: BLE001 - the point is the type
             _ok(f'{name} mismatch rejected', False,
                 f'{type(exc).__name__}: {exc}')
+
+
+def test_gated_delta_rule_step_rejects_unknown_gate_type():
+    """The functional step must not treat every label as ``per_head``."""
+    S = torch.zeros(1, 2, 4, 5)
+    q = torch.randn(1, 2, 4)
+    k = torch.randn(1, 2, 4)
+    v = torch.randn(1, 2, 5)
+    gate = torch.ones(2)
+    beta = torch.full((2,), 0.1)
+    out, state = gated_delta_rule_step(
+        S, q, k, v, gate, beta, gate_type='per_head')
+    assert out.shape == (1, 2, 5) and state.shape == S.shape
+    try:
+        gated_delta_rule_step(
+            S, q, k, v, gate, beta, gate_type='bogus')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unknown gate_type was silently accepted')
 
 
 def test_gated_delta_rule_check_survives_python_optimized():
@@ -124,6 +148,28 @@ def test_online_softmax_rejects_non_boolean_mask():
                 f'{type(exc).__name__}: {exc}')
 
 
+def test_decoding_cache_to_rejects_non_float_storage_dtype():
+    """``.to(dtype=...)`` follows the constructor's floating-point contract."""
+    B, c, c_I, m, win = 1, 4, 4, 2, 4
+    csa = CSADecodingCache(B, c, c_I, m, win, 'cpu', torch.float32)
+    hca = HCADecodingCache(B, c, m, win, 'cpu', torch.float32)
+    ring = _SlidingWindowRingBuffer(B, win, c, 'cpu', torch.float32)
+    for obj in (csa, hca, ring):
+        for bad in (torch.int32, torch.bool):
+            try:
+                obj.to(dtype=bad)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError(
+                    f'{type(obj).__name__}.to accepted {bad}')
+        assert obj.dtype == torch.float32
+    csa.to(dtype=torch.float64)
+    hca.to(dtype=torch.float64)
+    ring.to(dtype=torch.float64)
+    assert (csa.dtype, hca.dtype, ring.dtype) == (torch.float64,) * 3
+
+
 def test_csa_decode_step_validates_indexer_operands():
     """``forward_step`` checks q_idx / w_idx like ``forward_chunk`` does."""
     B, c, c_I, m, win, nh, nIh = 1, 4, 4, 2, 4, 2, 2
@@ -151,7 +197,9 @@ def test_csa_decode_step_validates_indexer_operands():
 
 if __name__ == '__main__':
     test_gated_delta_rule_rejects_geometry_mismatch()
+    test_gated_delta_rule_step_rejects_unknown_gate_type()
     test_gated_delta_rule_check_survives_python_optimized()
     test_online_softmax_rejects_non_boolean_mask()
+    test_decoding_cache_to_rejects_non_float_storage_dtype()
     test_csa_decode_step_validates_indexer_operands()
     print('all input-validation tests passed')

@@ -480,6 +480,9 @@ def gated_delta_rule_step(
     Returns:
         output [B, H, V], new_state [B, H, K, V]
     """
+    if gate_type not in ('per_channel', 'per_head'):
+        raise ValueError(
+            f"gate_type={gate_type!r} must be 'per_channel' or 'per_head'")
     B, H, K, V = S.shape
 
     # Match ``GatedDeltaRule.forward``: promote every operand (state, q/k/v,

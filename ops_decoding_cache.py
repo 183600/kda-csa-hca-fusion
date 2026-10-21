@@ -528,6 +528,7 @@ class _SlidingWindowRingBuffer:
                 f"_SlidingWindowRingBuffer: win={win} must be >= 1 "
                 f"(win=0 disables the SW branch and should bypass this "
                 f"class entirely).")
+        _validate_cache_dtype(dtype)
         self.B, self.win, self.c = B, win, c
         self.device, self.dtype = torch.device(device), dtype
         # Pre-allocated buffer. Entries at indices >= _sw_len are stale
@@ -695,6 +696,8 @@ class _SlidingWindowRingBuffer:
 
     def to(self, device=None, dtype=None) -> '_SlidingWindowRingBuffer':
         """Move the buffer to a new device / dtype (in-place)."""
+        if dtype is not None:
+            _validate_cache_dtype(dtype)
         if device is not None:
             device = torch.device(device)
         if device is not None and device != self._buf.device:
@@ -1016,6 +1019,8 @@ class CSADecodingCache:
 
     def to(self, device=None, dtype=None) -> 'CSADecodingCache':
         """Move all cache tensors to a new device / dtype (in-place)."""
+        if dtype is not None:
+            _validate_cache_dtype(dtype)
         if device is not None:
             device = torch.device(device)
         if device is not None and device != self.device:
@@ -2373,6 +2378,8 @@ class HCADecodingCache:
     # ----- state migration -----------------------------------------------
 
     def to(self, device=None, dtype=None) -> 'HCADecodingCache':
+        if dtype is not None:
+            _validate_cache_dtype(dtype)
         if device is not None:
             device = torch.device(device)
         if device is not None and device != self.device:
