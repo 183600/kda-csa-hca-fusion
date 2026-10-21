@@ -293,7 +293,7 @@ def test_run_kv_cache_validation():
     """Public cache-accounting helpers reject bool / non-int geometry."""
     print("\nTest: run_kv_cache helper validation")
     from run_kv_cache import (causal_block_entries,
-                              causal_selected_entries)
+                              causal_selected_entries, prefill_flops)
 
     cases = [
         ('geometric_capacity(True)', lambda: geometric_capacity(True)),
@@ -311,6 +311,22 @@ def test_run_kv_cache_validation():
          lambda: kv_cache_elements('csa', True)),
         ('kv_cache_elements(T=1.5)',
          lambda: kv_cache_elements('csa', 1.5)),
+        ('kv_cache_elements(unknown kw)',
+         lambda: kv_cache_elements('csa', 4, csa_typo=1)),
+        ('kv_cache_breakdown(T=-1)',
+         lambda: kv_cache_breakdown('csa', -1)),
+        ('kv_cache_breakdown(T=True)',
+         lambda: kv_cache_breakdown('csa', True)),
+        ('kv_cache_breakdown(unknown kw)',
+         lambda: kv_cache_breakdown('csa', 4, csa_typo=1)),
+        ('prefill_flops(T=-1)',
+         lambda: prefill_flops('csa', -1)),
+        ('prefill_flops(T=True)',
+         lambda: prefill_flops('csa', True)),
+        ('prefill_flops(T=1.5)',
+         lambda: prefill_flops('csa', 1.5)),
+        ('prefill_flops(unknown kw)',
+         lambda: prefill_flops('csa', 4, csa_typo=1)),
     ]
     bad = 0
     for _name, fn in cases:
@@ -327,6 +343,10 @@ def test_run_kv_cache_validation():
         and causal_selected_entries(0, 4, 2) == 0
         and isinstance(zero_cache, int) and zero_cache >= 0,
         f'kv_cache_elements={zero_cache!r}')
+    _ok('prefill_flops(0) remains valid',
+        prefill_flops('csa', 0) == 0
+        and prefill_flops('hybrid_kch', 0) == 0,
+        f"csa={prefill_flops('csa', 0)!r}")
 
 
 def test_autograd_hygiene_and_bounded_graph():

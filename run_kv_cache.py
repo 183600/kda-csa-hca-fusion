@@ -392,11 +392,20 @@ def kv_cache_breakdown(op: str, T: int, mode: str = 'full_accounting', **kw):
     explicitly-labelled ``compressed_kv_only_total`` reference annotation,
     which is informational and never part of the total.
     """
-    p = {**DEFAULTS, **kw}
+    if not isinstance(T, int) or isinstance(T, bool) or T < 0:
+        raise ValueError(
+            f'kv_cache_breakdown: T must be a non-negative int, got {T!r}.')
+    _valid_keys = set(DEFAULTS.keys())
+    _unknown = set(kw.keys()) - _valid_keys
+    if _unknown:
+        raise ValueError(
+            f"kv_cache_breakdown: unknown keyword argument(s) "
+            f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
     if mode not in ('compressed_kv_only', 'full_accounting'):
         raise ValueError(
             f"kv_cache_breakdown: mode={mode!r} must be one of "
             f"['compressed_kv_only', 'full_accounting'].")
+    p = {**DEFAULTS, **kw}
     full = mode == 'full_accounting'
     if op == 'softmax_gqa':
         if full:
@@ -526,6 +535,15 @@ def prefill_flops(op: str, T: int, **kw):
     CSA/HCA ``o_proj``), so Exp3's "single-layer FLOPs" boundary matches
     Exp2's end-to-end standalone CSA/HCA boundary.
     """
+    if not isinstance(T, int) or isinstance(T, bool) or T < 0:
+        raise ValueError(
+            f'prefill_flops: T must be a non-negative int, got {T!r}.')
+    _valid_keys = set(DEFAULTS.keys())
+    _unknown = set(kw.keys()) - _valid_keys
+    if _unknown:
+        raise ValueError(
+            f"prefill_flops: unknown keyword argument(s) "
+            f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
     p = {**DEFAULTS, **kw}
     H, K, V, d = p['H'], p['K'], p['V'], p['d']
     csa_m, csa_topk, csa_c = p['csa_m'], p['csa_topk'], p['csa_c']
