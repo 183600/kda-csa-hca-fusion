@@ -1125,15 +1125,22 @@ def _window_fraction_from_distances(structural: dict, window: int) -> float:
     return (hit / total) if total else 0.0
 
 
-def _far_fraction_from_distances(structural: dict, max_window: int) -> float:
-    """Exact-recall fraction for placements beyond every window."""
+def _far_fraction_from_distances(
+        structural: dict, max_window: int) -> float | None:
+    """Exact-recall fraction for placements beyond every window.
+
+    ``None`` when no placement lies beyond the largest window (for example
+    ``seq_len=4`` with a window of 4). Such a cell has no far-placement
+    evidence, so it must not be counted as a zero-coverage counterexample
+    to the far-placement hypothesis.
+    """
     total = hit = 0
     for d_str, slot in structural['by_distance'].items():
         if int(d_str) > max_window - 1:
             n = int(slot['n'])
             total += n
             hit += int(slot['any_exact'])
-    return (hit / total) if total else 0.0
+    return (hit / total) if total else None
 
 
 def _hypothesis_checks(rows: list[dict]) -> dict:
@@ -1156,10 +1163,12 @@ def _hypothesis_checks(rows: list[dict]) -> dict:
                     'geometric_fraction': geom,
                 })
         if max_win > 0:
-            far_fractions.append({
-                'group': r['group'],
-                'far_exact_fraction': _far_fraction_from_distances(st, max_win),
-            })
+            far_fraction = _far_fraction_from_distances(st, max_win)
+            if far_fraction is not None:
+                far_fractions.append({
+                    'group': r['group'],
+                    'far_exact_fraction': far_fraction,
+                })
     # H3: per (layout, csa layer index) series over increasing block size.
     series: dict[tuple, list] = {}
     for r in rows:

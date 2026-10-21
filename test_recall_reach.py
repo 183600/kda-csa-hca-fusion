@@ -607,6 +607,36 @@ def test_worst_seed_selection_picks_lowest_accuracy():
         worst_mixed['seed'] == 2, str(worst_mixed['seed']))
 
 
+def test_far_metrics_are_undefined_without_far_placements():
+    """A short sequence has no far evidence; do not report zero coverage.
+
+    With ``seq_len=4`` every placement is inside the window, so the
+    far-placement hypothesis has no sampled cell. Reporting ``0.0`` as the
+    far fraction (and ``False`` as the verdict) would falsely claim that
+    far placements exist and are all unreachable.
+    """
+    report = R.run_recall_report(train=False, seq_len=4)
+    far = report['design']['hypothesis_checks'][
+        'far_placements_covered_by_blocks']
+    _ok('no far cells on a sequence shorter than every window',
+        far['n_cells'] == 0, str(far))
+    _ok('no far-placement verdict without far cells',
+        far['min_far_exact_fraction'] is None and far['verdict'] is None,
+        str(far))
+
+    # The compute-side audit must agree: both far aggregates are undefined
+    # rather than 0.0 when there is no distance beyond the largest window.
+    import recall_flops_audit as rfa
+    audit = rfa.audit_layout(('kda', 'csa', 'hca'), seq_len=8,
+                             measure=False)
+    reach = audit['compute_reach']
+    _ok('compute audit has no far rows for a short sequence',
+        reach['far_min_distance'] > reach['seq_len'] - 1, str(reach))
+    _ok('compute and structural far fractions are both undefined',
+        reach['far_mean_exact_reachable_fraction'] is None
+        and reach['structural_far_any_exact_fraction'] is None, str(reach))
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -621,6 +651,7 @@ def main() -> int:
     test_validation_curve_monitor()
     test_hypothesis_checks_contract()
     test_worst_seed_selection_picks_lowest_accuracy()
+    test_far_metrics_are_undefined_without_far_placements()
     print('\nAll recall-reach tests passed.')
     return 0
 

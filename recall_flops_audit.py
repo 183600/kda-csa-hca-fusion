@@ -185,7 +185,15 @@ def layer_reference_flops(plan, cfg: HybridConfig, T: int,
     return rows
 
 
-def _structural_far_fraction(structural: dict, far_min_distance: int) -> float:
+def _structural_far_fraction(
+        structural: dict, far_min_distance: int) -> float | None:
+    """Exact-path placement fraction beyond ``far_min_distance``.
+
+    ``None`` when the sequence has no placement at or beyond the threshold
+    (e.g. a window longer than the whole sequence). Reporting ``0.0`` there
+    would falsely claim that far placements exist and are all unreachable;
+    the compute-side aggregate is likewise ``None`` with no far rows.
+    """
     total = hit = 0
     for distance, slot in structural['by_distance'].items():
         if int(distance) < far_min_distance:
@@ -193,7 +201,7 @@ def _structural_far_fraction(structural: dict, far_min_distance: int) -> float:
         n = int(slot['n'])
         total += n
         hit += int(slot['any_exact'])
-    return (hit / total) if total else 0.0
+    return (hit / total) if total else None
 
 
 def distance_compute_reach(plan, cfg: HybridConfig, seq_len: int, *,
