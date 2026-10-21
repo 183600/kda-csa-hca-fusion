@@ -1305,8 +1305,11 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
     mrr
         Reciprocal rank of the highest-scored positive (1.0 = best).
     recall_at_1 / precision_at_1
-        Same number for a single relevant item: is the top-ranked
-        candidate positive.
+        ``precision_at_1`` is the top-ranked candidate's label (1.0 or
+        0.0). ``recall_at_1`` is the fraction of all relevant items found
+        in that one slot, so with several positives it is ``1/n_pos``
+        when the top candidate is relevant (and 0.0 otherwise). The two
+        coincide for a single relevant item.
     chance_pr_auc / chance_roc_auc
         Chance references so a number can be judged. ``chance_roc_auc``
         is 0.5; ``chance_pr_auc`` is the EXACT expected AP under a
@@ -1396,6 +1399,10 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
     # ---- MRR / recall@1 ---------------------------------------------
     first_pos_rank = int(torch.nonzero(labels_desc, as_tuple=False)[0].item()) + 1
     report['mrr'] = 1.0 / first_pos_rank
-    report['recall_at_1'] = bool(labels_desc[0].item())
-    report['precision_at_1'] = float(labels_desc[0].item())
+    top1 = float(labels_desc[0].item())
+    report['precision_at_1'] = top1
+    # With one positive the old boolean is numerically identical to the
+    # fraction and remains the documented type; with several positives,
+    # recall@1 must divide by the number of relevant items.
+    report['recall_at_1'] = bool(top1) if n_pos == 1 else top1 / n_pos
     return report

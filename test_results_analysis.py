@@ -396,6 +396,18 @@ def test_binary_ranking_metrics_rare_positive_and_ties():
     assert tied['pr_auc'] == pytest.approx(1 / 8)
     assert tied['mrr'] == pytest.approx(1 / 8)
     assert tied['recall_at_1'] is False
+    # Several relevant items: recall@1 is the fraction found in the top
+    # slot (1/n_pos when the top candidate is relevant), not a boolean.
+    multi = binary_ranking_metrics(
+        torch.tensor([0.9, 0.8, 0.7, 0.1]),
+        torch.tensor([1, 1, 0, 0]))
+    assert multi['precision_at_1'] == pytest.approx(1.0)
+    assert multi['recall_at_1'] == pytest.approx(0.5)
+    missed = binary_ranking_metrics(
+        torch.tensor([0.9, 0.8, 0.7, 0.1]),
+        torch.tensor([0, 1, 1, 0]))
+    assert missed['precision_at_1'] == pytest.approx(0.0)
+    assert missed['recall_at_1'] == pytest.approx(0.0)
     # No positives at all: ranking metrics are undefined (None).
     none_pos = binary_ranking_metrics(torch.rand(10), torch.zeros(10,
                                                                   dtype=torch.long))
