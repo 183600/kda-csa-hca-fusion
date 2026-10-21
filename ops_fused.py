@@ -812,7 +812,12 @@ class KDAHybridLayer(nn.Module):
         """
         u = self.g_up(self.g_down(x_conv))
         if self._decay_bias_active:
-            u = u + self._decay_bias
+            # The buffer is stored in fp32 for a stable checkpoint-independent
+            # prior, but under autocast ``u`` is bf16/fp16. Adding the fp32
+            # buffer directly would promote the gate to fp32 and violate the
+            # KDA same-dtype contract; cast the prior to the projection's
+            # compute dtype instead (a no-op on the default fp32 path).
+            u = u + self._decay_bias.to(dtype=u.dtype)
         return u
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):

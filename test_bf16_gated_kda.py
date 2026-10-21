@@ -350,6 +350,26 @@ def test_gated_delta_rule_bf16():
     _ok('GatedDeltaRule bf16 no Inf', not torch.isinf(o).any().item(), '')
 
 
+def test_kda_log_decay_init_under_autocast():
+    print('\nTest: log_uniform decay prior under bf16 autocast')
+    from ops_fused import HybridConfig, KDAHybridLayer
+
+    cfg = HybridConfig(
+        d_model=16, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8, kda_chunk_size=0,
+        n_kda=1, n_csa=0, n_hca=0, kda_backend='reference',
+        kda_decay_init='log_uniform')
+    layer = KDAHybridLayer(cfg).eval()
+    x = torch.randn(2, 5, cfg.d_model)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        out, state = layer(x, None)
+    _ok('autocast forward returns bf16', out.dtype == torch.bfloat16,
+        f'{out.dtype}')
+    _ok('autocast forward finite',
+        bool(torch.isfinite(out).all()) and bool(torch.isfinite(state).all()),
+        '')
+
+
 if __name__ == '__main__':
     test_bf16_forward_parity()
     test_bf16_backward_parity()
@@ -368,5 +388,6 @@ if __name__ == '__main__':
     test_gated_delta_rule_state_contract_and_mixed_dtype_step()
     test_gated_delta_rule_empty_sequence_dtype_contract()
     test_gated_delta_rule_bf16()
+    test_kda_log_decay_init_under_autocast()
 
     print('\n=== ALL TESTS PASSED ===')
