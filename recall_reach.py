@@ -853,10 +853,37 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
     return model, embed, head, losses
 
 
+def _recall_bucket_ranges(win: int, seq_len: int) -> dict[str, tuple[int, int]]:
+    """Distance ranges matching the structural window/block semantics.
+
+    A (key, value) pair at ``(p, p+1)`` is inside a layer's sliding window
+    only when ``cue - p <= win - 1`` (the key itself must be in
+    ``[cue-win+1, cue]``; ``recall_reach.structural_recall`` and the
+    ``window edge d=win is out`` regression in ``test_recall_reach.py`` pin
+    this rule).  The historical bucket helper used ``d <= win``, which
+    labelled the first out-of-window distance as ``window`` and made bucket
+    accuracy incomparable with the structural table.  The ranges below are
+    inclusive and use the same ``d <= win - 1`` rule.
+    """
+    if isinstance(win, bool) or not isinstance(win, int) or win < 0:
+        raise ValueError(f'win={win!r} must be a non-negative int.')
+    if isinstance(seq_len, bool) or not isinstance(seq_len, int) \
+            or seq_len < 3:
+        raise ValueError(f'seq_len={seq_len!r} must be an int >= 3.')
+    window_lo, window_hi = 2, win - 1
+    mid_lo = max(2, win)
+    mid_hi = max(mid_lo - 1, seq_len // 2)
+    return {
+        'window': (window_lo, window_hi),
+        'mid': (mid_lo, mid_hi),
+        'far': (mid_hi + 1, seq_len - 1),
+    }
+
+
 def _recall_bucket(distance: int, win: int, mid_edge: int) -> str:
-    if 2 <= distance <= win:
+    if 2 <= distance <= win - 1:
         return 'window'
-    if win < distance <= mid_edge:
+    if max(2, win) <= distance <= mid_edge:
         return 'mid'
     return 'far'
 
@@ -916,7 +943,8 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
     total = 0
     buckets = {'window': [0, 0], 'mid': [0, 0], 'far': [0, 0]}
     win = SMALL_MODEL_SPEC['csa_sliding_window']
-    mid_edge = max(win + 1, seq_len // 2)
+    bucket_ranges = _recall_bucket_ranges(win, seq_len)
+    mid_edge = bucket_ranges['mid'][1]
     probe = None
     error_total = 0
     category_counts: dict[str, int] = {}
@@ -934,9 +962,7 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
             correct += int(hit.sum().item())
             total += int(target.numel())
             dist = meta['distance']
-            for name, (lo, hi) in (('window', (2, win)),
-                                   ('mid', (win + 1, mid_edge)),
-                                   ('far', (mid_edge + 1, seq_len))):
+            for name, (lo, hi) in bucket_ranges.items():
                 m = (dist >= lo) & (dist <= hi)
                 buckets[name][0] += int((hit & m).sum().item())
                 buckets[name][1] += int(m.sum().item())

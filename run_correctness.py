@@ -4729,6 +4729,267 @@ def test_prefill_flops_kch_output_projections(device='cpu'):
     ]
 
 
+def test_recall_distance_buckets_match_structural_window(device='cpu'):
+    """Long-range distance buckets must use the structural window boundary.
+
+    ``structural_recall`` counts a pair as window-reachable only when
+    ``cue - p <= win - 1`` (the key itself is inside ``[cue-win+1, cue]``).
+    ``evaluate_recall`` used to label ``distance == win`` as ``window``,
+    which is the first out-of-window placement.  The buckets therefore did
+    not agree with the structural table they are reported next to.  This
+    test pins the corrected inclusive ranges and checks every distance
+    against the structural per-layer window flag.
+    """
+    logger.info("Test: recall distance buckets match structural window")
+    from recall_reach import (
+        _recall_bucket, _recall_bucket_ranges, LayerSpec,
+        structural_recall,
+    )
+
+    results = []
+    win, seq_len = 4, 32
+    ranges = _recall_bucket_ranges(win, seq_len)
+    results.append(_ok(
+        'window bucket ends at win-1 (key inside the window)',
+        ranges['window'] == (2, win - 1),
+        f"window={ranges['window']}"))
+    results.append(_ok(
+        'mid bucket starts at win (first out-of-window distance)',
+        ranges['mid'][0] == win,
+        f"mid={ranges['mid']}"))
+    results.append(_ok(
+        'far bucket starts after the mid edge',
+        ranges['far'][0] == ranges['mid'][1] + 1,
+        f"far={ranges['far']}"))
+
+    covered = []
+    for lo, hi in ranges.values():
+        covered.extend(range(lo, hi + 1))
+    results.append(_ok(
+        'buckets partition every distance in [2, seq_len-1] exactly once',
+        covered == list(range(2, seq_len)),
+        f'n_covered={len(covered)}, first={covered[:2]}, '
+        f'last={covered[-2:]}'))
+
+    plan = [LayerSpec(0, 'csa', block=16, window=win, topk=2)]
+    structural = structural_recall(plan, seq_len)
+    by_distance = {r['distance']: r for r in structural['rows']}
+    mismatches = []
+    for distance in range(2, seq_len):
+        row = by_distance[distance]
+        label = _recall_bucket(distance, win, ranges['mid'][1])
+        if label == 'window' and not row['layers'][0]['window_hit']:
+            mismatches.append((distance, 'window', 'structural miss'))
+        if label != 'window' and row['layers'][0]['window_hit']:
+            mismatches.append((distance, label, 'structural hit'))
+    results.append(_ok(
+        'window label agrees with structural window_hit for every distance',
+        not mismatches,
+        f'mismatches={mismatches[:4]}'))
+
+    class _IdentityModel:
+        def reset_state(self):
+            pass
+
+        def __call__(self, x):
+            return x
+
+    class _ZeroHead:
+        def __call__(self, x, cue_pos):
+            return torch.zeros(x.shape[0], 16, device=x.device)
+
+    from recall_reach import evaluate_recall
+    evaluation = evaluate_recall(
+        _IdentityModel(), torch.nn.Embedding(16, 4), _ZeroHead(),
+        seq_len=seq_len, n_batches=1, batch=16, seed=0)
+    bucket_n = {name: slot['n']
+                for name, slot in evaluation['buckets'].items()}
+    results.append(_ok(
+        'evaluate_recall buckets partition the evaluation set',
+        sum(bucket_n.values()) == evaluation['n_eval']
+        and all(n > 0 for n in bucket_n.values()),
+        f"bucket_n={bucket_n}, total={evaluation['n_eval']}"))
+
+    degenerate = _recall_bucket_ranges(0, 8)
+    results.append(_ok(
+        'win=0 leaves the window bucket empty and covers [2, seq_len-1]',
+        degenerate['window'][0] > degenerate['window'][1]
+        and degenerate['mid'][0] == 2
+        and degenerate['far'][1] == 7,
+        f'ranges={degenerate}'))
+    invalid = [(4, 2), (-1, 8), (True, 8)]
+    for win_arg, seq_len_arg in invalid:
+        try:
+            _recall_bucket_ranges(win_arg, seq_len_arg)
+        except (TypeError, ValueError):
+            results.append(_ok(
+                f'rejects win={win_arg!r}, seq_len={seq_len_arg!r}', True))
+        else:
+            results.append(_ok(
+                f'rejects win={win_arg!r}, seq_len={seq_len_arg!r}', False,
+                'no error raised'))
+    return results
+
+
+def test_recall_flops_audit(device='cpu'):
+    """Whole-stack FLOPs + distance-conditioned exact-recall accounting.
+
+    Pins the new ``recall_flops_audit`` module against hand-derived cases:
+
+      1. A far placement reachable only by CSA puts exactly the CSA layer's
+         FLOPs in the numerator; a block-boundary placement with no exact
+         path puts zero.
+      2. A KDA-only plan has zero exact-reachable FLOPs and 100% state
+         FLOPs, matching ``recall_reach``'s decision not to count recurrent
+         state as an exact path.
+      3. The whole-stack reference sum matches a real
+         ``HybridAttentionStack`` forward exactly at T=64, and within the
+         documented HCA single-block value-fold bound at T=32.
+      4. Ratio expansion and invalid inputs fail loudly.
+    """
+    logger.info("Test: recall-conditioned FLOPs audit")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flops_audit as fa
+    from recall_reach import LayerSpec, plan_from_config, structural_recall
+    import recall_flops_audit as rfa
+
+    results = []
+    cfg = fa.probe_config(
+        csa_m=4, hca_m2=8, csa_sliding_window=4, hca_sliding_window=4)
+    layout = ('kda', 'csa', 'hca')
+    plan = plan_from_config(cfg, layout)
+    layer_flops = rfa.layer_reference_flops(plan, cfg, 16)
+    total = sum(row['gemm_flops'] for row in layer_flops)
+    results.append(_ok(
+        'per-layer FLOPs are 2 * reference MACs',
+        all(row['gemm_flops'] == 2 * row['gemm_macs']
+            for row in layer_flops),
+        f'layers={[row["gemm_flops"] for row in layer_flops]}'))
+    results.append(_ok(
+        'per-layer kinds follow the explicit layout',
+        [row['kind'] for row in layer_flops] == list(layout),
+        f'kinds={[row["kind"] for row in layer_flops]}'))
+
+    reach = rfa.distance_compute_reach(
+        plan, cfg, 16, layer_flops=layer_flops)
+    by_distance = {row['distance']: row for row in reach['rows']}
+    csa_flops = layer_flops[1]['gemm_flops']
+    results.append(_ok(
+        'block-boundary placement at d=4 has no exact path',
+        by_distance[4]['exact_layer_indices'] == []
+        and by_distance[4]['exact_reachable_fraction'] == 0.0,
+        f"row={by_distance[4]['exact_layer_indices']}"))
+    results.append(_ok(
+        'd=5 is reachable only by CSA and prices exactly the CSA layer',
+        by_distance[5]['exact_layer_indices'] == [1]
+        and by_distance[5]['exact_reachable_flops'] == csa_flops
+        and abs(by_distance[5]['exact_reachable_fraction']
+                - csa_flops / total) < 1e-12,
+        f"fraction={by_distance[5]['exact_reachable_fraction']:.4f}"))
+    results.append(_ok(
+        'd=9 is reachable by both retrieval layers',
+        by_distance[9]['exact_layer_indices'] == [1, 2],
+        f"row={by_distance[9]['exact_layer_indices']}"))
+    results.append(_ok(
+        'far threshold starts beyond the largest window',
+        reach['far_min_distance'] == 4,
+        f"far_min={reach['far_min_distance']}"))
+    results.append(_ok(
+        'state-capable fraction is the KDA layer share',
+        abs(reach['state_capable_fraction']
+            - layer_flops[0]['gemm_flops'] / total) < 1e-12,
+        f"state_fraction={reach['state_capable_fraction']:.4f}"))
+
+    kda_plan = [LayerSpec(0, 'kda', block=None, window=0, topk=None)]
+    kda_reach = rfa.distance_compute_reach(kda_plan, cfg, 16)
+    results.append(_ok(
+        'KDA-only plan has zero exact-reachable FLOPs',
+        kda_reach['max_exact_reachable_fraction'] == 0.0
+        and kda_reach['structural_any_exact_fraction'] == 0.0,
+        f"max={kda_reach['max_exact_reachable_fraction']}"))
+    results.append(_ok(
+        'KDA-only plan prices all compute as state-capable',
+        abs(kda_reach['state_capable_fraction'] - 1.0) < 1e-12,
+        f"state={kda_reach['state_capable_fraction']}"))
+
+    measured_cfg = fa.probe_config()
+    measured_layout = ('kda', 'kda', 'kda', 'csa', 'hca')
+    row64 = rfa.audit_layout(
+        measured_layout, cfg=measured_cfg, seq_len=64, device=device,
+        measure=True)
+    measurement = row64['measurement']
+    results.append(_ok(
+        'whole-stack reference FLOPs match the dispatch counter at T=64',
+        measurement['match_kind'] == 'exact'
+        and measurement['gemm_macs'] == row64['reference_gemm_macs'],
+        f"delta={measurement['reference_minus_measured_macs']}, "
+        f"kind={measurement['match_kind']}"))
+    results.append(_ok(
+        'audit reports one placement per legal key position',
+        row64['compute_reach']['n_placements'] == 64 - 2,
+        f"n={row64['compute_reach']['n_placements']}"))
+    results.append(_ok(
+        'structural and compute far fractions are both in [0, 1]',
+        0.0 <= row64['compute_reach']['structural_far_any_exact_fraction']
+        <= 1.0
+        and 0.0 <= row64['compute_reach']['far_mean_exact_reachable_fraction']
+        <= 1.0,
+        f"struct={row64['compute_reach']['structural_far_any_exact_fraction']:.3f}, "
+        f"compute={row64['compute_reach']['far_mean_exact_reachable_fraction']:.3f}"))
+
+    row32 = rfa.audit_layout(
+        measured_layout, cfg=measured_cfg, seq_len=32, device=device,
+        measure=True)
+    measurement32 = row32['measurement']
+    results.append(_ok(
+        'T=32 difference is inside the documented HCA value-fold bound',
+        measurement32['match_kind'] in ('exact', 'hca_value_fold')
+        and measurement32['within_documented_hca_value_fold']
+        and 0 <= measurement32['reference_minus_measured_macs']
+        <= measurement32['hca_value_fold_bound_macs'],
+        f"delta={measurement32['reference_minus_measured_macs']}, "
+        f"bound={measurement32['hca_value_fold_bound_macs']}"))
+
+    ratio = rfa.ratio_layout(3, 1, 1, total_layers=10)
+    results.append(_ok(
+        'ratio expansion repeats and truncates to the requested depth',
+        len(ratio) == 10
+        and ratio.count('kda') == 6
+        and ratio.count('csa') == 2
+        and ratio.count('hca') == 2,
+        f"layout={'-'.join(ratio)}"))
+
+    report = rfa.audit_layouts(
+        ['alternating'], seq_len=32, measure=False)
+    results.append(_ok(
+        'batch audit keeps names and Pareto flags',
+        report['rows'][0]['group'] == 'alternating'
+        and isinstance(report['rows'][0]['pareto_optimal'], bool),
+        f"group={report['rows'][0]['group']}"))
+
+    invalid = [
+        ('unknown layer kind', lambda: rfa.audit_layout(
+            ('kda', 'mamba2'), cfg=measured_cfg, seq_len=32, measure=False)),
+        ('seq_len below key+value+cue', lambda: rfa.audit_layout(
+            measured_layout, cfg=measured_cfg, seq_len=2, measure=False)),
+        ('zero ratio', lambda: rfa.ratio_layout(0, 0, 0, 10)),
+        ('unknown preset', lambda: rfa.audit_layouts(
+            ['not-a-preset'], seq_len=32, measure=False)),
+    ]
+    for name, fn in invalid:
+        try:
+            fn()
+        except (TypeError, ValueError):
+            results.append(_ok(f'rejects {name}', True))
+        except Exception as exc:
+            results.append(_ok(
+                f'rejects {name}', False,
+                f'{type(exc).__name__}: {exc}'))
+        else:
+            results.append(_ok(f'rejects {name}', False, 'no error raised'))
+    return results
+
+
 def test_standalone_kda_gate_matches_hybrid(device='cpu'):
     """Standalone Exp4/Exp6 KDA wrappers must use the hybrid low-rank gate.
 
@@ -7222,6 +7483,11 @@ def main():
     all_results += _run_safe(test_kv_cache_full_accounting_runtime_state, device)
     all_results += _run_safe(test_prefill_flops_softmax_gqa_projections, device)
     all_results += _run_safe(test_prefill_flops_kch_output_projections, device)
+    # Exp 17: the distance buckets and the recall-conditioned FLOPs ledger
+    # must agree with the structural reachability contract.
+    all_results += _run_safe(
+        test_recall_distance_buckets_match_structural_window, device)
+    all_results += _run_safe(test_recall_flops_audit, device)
     all_results += _run_safe(test_standalone_kda_gate_matches_hybrid, device)
     all_results += _run_safe(test_decoding_batch_size_change, device)
     # Incremental decoding cache tests (ops_decoding_cache.py).

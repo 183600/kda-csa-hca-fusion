@@ -755,9 +755,10 @@ def make_long_range_batch(batch: int, seq_len: int, n_kv: int, vocab: int,
     Layout per sequence: a single (key, value) pair at a uniformly random
     position ``p in [0, seq_len-3]``, distractors everywhere else, and the
     cue key at the final position. Target = the paired value.
-    ``distance = (seq_len-1) - p`` spans ``[2, seq_len-2]`` per sequence,
-    so accuracy-vs-distance curves (binned from ``return_meta``'s
-    ``distance`` field) measure long-range LOCALISATION, not just recall.
+    ``distance = (seq_len-1) - p`` spans ``[2, seq_len-1]`` per sequence
+    (``p=0`` is the farthest placement), so accuracy-vs-distance curves
+    (binned from ``return_meta``'s ``distance`` field) measure long-range
+    LOCALISATION, not just recall.
 
     ``n_kv`` is accepted for signature compatibility and ignored (the
     distance is the controlled variable, not the pair count).

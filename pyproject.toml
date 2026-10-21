@@ -125,6 +125,7 @@ py-modules = [
     "run_all",
     "make_figures",
     "method_analysis",
+    "recall_flops_audit",
     "kaggle_setup",
     "ppl_bootstrap",
     "train_lm_autodl",
