@@ -447,6 +447,59 @@ def test_train_one_records_confusion_and_ranking_metrics():
     assert sum(c['support'] for c in fm['per_class']) == fm['n_samples']
 
 
+def test_train_multi_seed_single_surviving_seed_reports_undefined_std(
+        monkeypatch):
+    """One surviving seed -> std/CI are None, never a fake ``0.0000``.
+
+    The sample std is undefined for ``n == 1``; reporting ``0.0`` claims
+    perfect precision, and the summary table / logger already render
+    ``ci95_acc is None`` as 'n/a'. Pre-fix the std fields were ``0.0``
+    while the comment above them documented None.
+    """
+    import run_quality as rq_mod
+
+    def _fake_train_one(op_name, seed=42, steps=10, device=None,
+                        softmax_steps=None, **kw):
+        return {
+            'op': op_name, 'seed': seed, 'steps': steps, 'n_kv': 1,
+            'task': 'mqar', 'n_params': 123, 'lr': 3e-3, 'train_batch': 32,
+            'final_acc': 0.5 + 0.01 * seed, 'final_loss': 1.0,
+            'chance_acc': 0.0625, 'val_history': [], 'curve_diagnosis': None,
+            'error_analysis': None, 'accuracy_regime': None,
+            'final_metrics': None, 'loss_curve': [], 'acc_curve': [],
+            'generalization_gap': None, 'val_loss_regret_from_best': None,
+            'best_val_is_final': None, 'early_stopping_summary': None,
+            'final_eval_ms_per_sample': 1.5, 'gradient_norms': None,
+        }
+
+    monkeypatch.setattr(rq_mod, 'train_one', _fake_train_one)
+    one = rq_mod.train_multi_seed('kda', n_seeds=1, steps=1, device='cpu')
+    assert one['n_seeds_ok'] == 1
+    assert one['std_acc'] is None and one['std_loss'] is None
+    assert one['ci95_acc'] is None and one['ci95_loss'] is None
+    assert one['t_stat_vs_chance'] is None
+    assert one['mean_acc'] == pytest.approx(0.92)
+
+    two = rq_mod.train_multi_seed('kda', n_seeds=2, steps=1, device='cpu')
+    assert two['n_seeds_ok'] == 2
+    assert two['std_acc'] is not None and two['std_acc'] > 0
+
+    def _flaky(op_name, seed=42, **kw):
+        if seed == 43:
+            raise RuntimeError('seed diverged')
+        return _fake_train_one(op_name, seed=seed, **kw)
+
+    monkeypatch.setattr(rq_mod, 'train_one', _flaky)
+    partial = rq_mod.train_multi_seed('kda', n_seeds=2, steps=1, device='cpu')
+    assert partial['n_seeds_ok'] == 1 and partial['n_seeds_failed'] == 1
+    # A partially failed multi-seed run is the same n==1 case: undefined
+    # std, and the summary table must render it without crashing.
+    assert partial['std_acc'] is None and partial['ci95_acc'] is None
+    std_str = (f"{partial['std_acc']:>8.4f}"
+               if partial['std_acc'] is not None else f"{'n/a':>8}")
+    assert std_str.strip() == 'n/a'
+
+
 def test_error_classification_mqar_layout():
     torch.manual_seed(0)
     # Layout: [k0, v0, k1, v1, noise, cue]; cue = k0, target = v0.

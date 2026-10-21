@@ -2770,12 +2770,10 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         ci_loss = t * std_loss / math.sqrt(n)
     else:
         # With a single seed, the sample std is undefined and the t-CI is
-        # NOT zero — the uncertainty is maximal. Mirror the convention
-        # used in run_ablation.py::eval_layout_multi_seed: return None so
-        # downstream consumers (summary table, make_figures.py) can render
-        # 'n/a' instead of a misleading '0.0000' that implies perfect
-        # precision.
-        std_acc = std_loss = 0.0
+        # NOT zero — the uncertainty is maximal. Return None (like ci95)
+        # so downstream consumers (the summary table below) render 'n/a'
+        # instead of a misleading '0.0000' that implies perfect precision.
+        std_acc = std_loss = None
         ci_acc = ci_loss = None
 
     # One-sample t-test vs chance: tests whether mean_acc differs from the
@@ -4247,10 +4245,12 @@ def main():
                 all_results.append(r)
                 # ci95_acc may be None when only one seed survived (see
                 # train_multi_seed). Render as 'n/a' instead of crashing on
-                # ``f'{None:.4f}'``.
+                # ``f'{None:.4f}'``. std_acc/std_loss are None in the same
+                # n==1 case (the sample std is undefined, not zero).
                 ci_str = f"{r['ci95_acc']:.4f}" if r['ci95_acc'] is not None else 'n/a'
+                std_str = f"{r['std_acc']:.4f}" if r['std_acc'] is not None else 'n/a'
                 logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {ci_str} "
-                            f"(std={r['std_acc']:.4f}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
+                            f"(std={std_str}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
                 # Curve verdicts: over/underfitting is a property of the
                 # training CURVE, reported per op so a good mean accuracy
                 # from an overfit best-epoch cannot go unnoticed.
@@ -4323,11 +4323,16 @@ def main():
                   f"{'-':>10} | {'-':>8} | {'-':>12} | "
                   f"{'-':>10}   ERROR: {err_msg}")
             continue
-        # ci95_acc may be None when only one seed survived; render 'n/a'.
+        # ci95_acc / std_acc may be None when only one seed survived;
+        # render 'n/a' rather than crashing on ``f'{None:.4f}'``.
         if r['ci95_acc'] is not None:
             ci_str = f"{r['ci95_acc']:>10.4f}"
         else:
             ci_str = f"{'n/a':>10}"
+        if r['std_acc'] is not None:
+            std_str = f"{r['std_acc']:>8.4f}"
+        else:
+            std_str = f"{'n/a':>8}"
         lr_str = f"{r.get('lr', 3e-3):>7.1e}"
         # Imbalance-robust metrics live in mean_final_metrics (populated
         # whenever collect_predictions=True, which main() always sets).
@@ -4339,7 +4344,7 @@ def main():
         print(f"{r.get('task', 'mqar'):>10} | {r['n_kv']:>4} | {r['op']:>10} | "
               f"{lr_str} | {r['chance_acc']:>7.4f} | {r['mean_acc']:>10.4f} | "
               f"{f1_str} | {pr_str} | "
-              f"{ci_str} | {r['std_acc']:>8.4f} | "
+              f"{ci_str} | {std_str} | "
               f"{_fmt_tstat(r['t_stat_vs_chance'], width=12, prec=2)} | {r['mean_loss']:>10.4f}")
     # Fairness annotation: the softmax baseline is trained for
     # ``softmax_steps`` steps while the other ops get ``steps`` steps. This
