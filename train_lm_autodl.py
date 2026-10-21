@@ -1367,7 +1367,13 @@ def _tokenizer_payload(tokenizer=None) -> dict:
     97-token embedding. The payload is a plain JSON-safe dict so it can be
     stored inside the checkpoint (``weights_only=True``-compatible).
     """
-    if tokenizer is None or isinstance(tokenizer, _FallbackCharTokenizer):
+    if tokenizer is None:
+        return _fallback_tokenizer_payload()
+    if isinstance(tokenizer, _FallbackCharTokenizer) \
+            or hasattr(tokenizer, '_itos'):
+        # Any char-tokenizer with an id->char table can be represented
+        # exactly; do not silently replace a custom vocabulary with the
+        # default fallback.
         return _fallback_tokenizer_payload(tokenizer)
     name = getattr(tokenizer, 'name_or_path', None)
     if not isinstance(name, str) or not name.strip():
