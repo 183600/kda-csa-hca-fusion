@@ -890,11 +890,20 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
                 # Same keys as a live row, so a consumer can read every
                 # per_seed entry with one code path (mirrors run_quality's
                 # failed-seed stub).
+                'val_every': (int(kw.get('val_every', 0) or 0)
+                              or max(1, steps // 4)),
                 'val_history': [],
                 'curve_diagnosis': None,
                 'generalization_gap': None,
                 'best_val': None,
+                'val_loss_first': None,
+                'val_loss_last': None,
+                'val_acc_first': None,
+                'val_acc_last': None,
+                'val_acc_peak': None,
                 'error_analysis': None,
+                'error_analysis_seed_offset': ERROR_ANALYSIS_SEED_OFFSET,
+                'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
                 'train_time_s': time.time() - t0,
                 'error': str(e),
             })
@@ -1655,11 +1664,20 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                 'last_train_loss': None, 'mean_last10_loss': None,
                 'loss_curve': [],
                 'acc_curve': [],
+                'val_every': (int(kw.get('val_every', 0) or 0)
+                              or max(1, steps // 4)),
                 'val_history': [],
                 'curve_diagnosis': None,
                 'generalization_gap': None,
                 'best_val': None,
+                'val_loss_first': None,
+                'val_loss_last': None,
+                'val_acc_first': None,
+                'val_acc_last': None,
+                'val_acc_peak': None,
                 'error_analysis': None,
+                'error_analysis_seed_offset': ERROR_ANALYSIS_SEED_OFFSET,
+                'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
                 'train_time_s': time.time() - t0,
                 'error': str(e),
             })
