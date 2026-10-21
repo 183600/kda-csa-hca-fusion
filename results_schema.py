@@ -760,7 +760,8 @@ def _validate_exp14_rows(rows: list, metadata: dict) -> list[str]:
                            f"got {row.get('n_cases')!r}")
             for key in ('mismatches', 'crashes'):
                 value = row.get(key)
-                if value != 0:
+                if not (isinstance(value, int)
+                        and not isinstance(value, bool) and value == 0):
                     out.append(f'{where}: {key}={value!r} must be exactly 0 '
                                f'(the parity gate is the experiment)')
             key = ('parity', case)

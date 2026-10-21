@@ -252,6 +252,20 @@ def test_row_contract_exp6_decode_state_certificate_fields():
         meta)
 
 
+def test_row_contract_exp14_parity_counts_reject_bools():
+    """Parity counts are integer counts, not truthy/falsy flags."""
+    base = {'section': 'parity', 'case': 'random', 'n_cases': 10,
+            'mismatches': 0, 'crashes': 0}
+    assert rs.validate_rows('exp14_indexer_selector', [base], {}) == []
+    for key in ('mismatches', 'crashes'):
+        bad = dict(base, **{key: False})
+        violations = rs.validate_rows('exp14_indexer_selector', [bad], {})
+        assert any(key in v and 'exactly 0' in v for v in violations)
+        bad = dict(base, **{key: 0.0})
+        violations = rs.validate_rows('exp14_indexer_selector', [bad], {})
+        assert any(key in v and 'exactly 0' in v for v in violations)
+
+
 def test_unknown_kinds_and_legacy_payloads_pass():
     assert rs.validate_rows('no_such_kind', [{'anything': 1}], {}) == []
     assert rs.validate_payload([{'legacy': True}]) == []
