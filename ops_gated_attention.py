@@ -328,9 +328,23 @@ class GatedDeltaRule(nn.Module):
         """
         B, T, H, K = q.shape
         V = v.shape[-1]
-        assert H == self.num_heads
-        assert K == self.key_dim
-        assert V == self.value_dim
+        # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
+        # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert``
+        # statements are silently stripped under optimization, which would
+        # turn a geometry mismatch into an opaque low-level error from
+        # inside the recurrence.
+        if H != self.num_heads:
+            raise ValueError(
+                f'GatedDeltaRule: query head count H={H} does not match '
+                f'num_heads={self.num_heads}.')
+        if K != self.key_dim:
+            raise ValueError(
+                f'GatedDeltaRule: key dim K={K} does not match '
+                f'key_dim={self.key_dim}.')
+        if V != self.value_dim:
+            raise ValueError(
+                f'GatedDeltaRule: value dim V={V} does not match '
+                f'value_dim={self.value_dim}.')
 
         dtype = q.dtype
         device = q.device

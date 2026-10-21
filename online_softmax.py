@@ -107,6 +107,14 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         scale = q.shape[-1] ** -0.5
     scores = torch.einsum('b h t d, b h n d -> b h t n', q, k) * scale
     if mask is not None:
+        # The mask contract is boolean (``True`` = keep). An integer mask
+        # would make ``~mask`` a BITWISE inversion (1 -> -2, 0 -> -1), so
+        # the mask is validated instead of silently inverted.
+        if mask.dtype != torch.bool:
+            raise ValueError(
+                'online_softmax_state: mask must be a boolean tensor '
+                '(True = keep); got dtype '
+                f'{mask.dtype}.')
         scores = scores.masked_fill(~mask, _NEG_INF)
     m = scores.amax(dim=-1, keepdim=True)
     shifted = scores - m

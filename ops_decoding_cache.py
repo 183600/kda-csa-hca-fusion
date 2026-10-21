@@ -1500,6 +1500,15 @@ class CSADecodingCache:
         if q_idx.shape[2] != nIh:
             raise ValueError(
                 f"q_idx.shape[2]={q_idx.shape[2]} does not match nIh={nIh}.")
+        if q_idx.shape[0] != B or q_idx.shape[1] != 1:
+            raise ValueError(
+                f'CSADecodingCache.forward_step: q_idx shape '
+                f'{tuple(q_idx.shape)} does not match '
+                f'{(B, 1, nIh, q_idx.shape[-1])}.')
+        if tuple(w_idx.shape) != (B, 1, nIh):
+            raise ValueError(
+                f'CSADecodingCache.forward_step: w_idx shape '
+                f'{tuple(w_idx.shape)} does not match {(B, 1, nIh)}.')
         # Validate ``q.device == self.device`` so a caller passing a GPU
         # query to a CPU cache (or vice versa) gets a clear error instead
         # of a cryptic cross-device einsum error deep inside.
@@ -1508,6 +1517,17 @@ class CSADecodingCache:
                 f"CSADecodingCache.forward_step: q.device={q.device} does "
                 f"not match cache's device={self.device}. Call "
                 f"cache.to(device=q.device) or move q to the cache's device.")
+        for name, tensor in (('q_idx', q_idx), ('w_idx', w_idx)):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f'CSADecodingCache.forward_step: {name}.device='
+                    f'{tensor.device} does not match cache\'s '
+                    f'device={self.device}.')
+        if sink_logits is not None and sink_logits.device != self.device:
+            raise ValueError(
+                f'CSADecodingCache.forward_step: sink_logits.device='
+                f'{sink_logits.device} does not match cache\'s '
+                f'device={self.device}.')
         device = q.device
         compute_dtype = _attention_compute_dtype(
             self.dtype, q, q_idx, w_idx, sink_logits)
@@ -2640,6 +2660,11 @@ class HCADecodingCache:
                 f"HCADecodingCache.forward_step: q.device={q.device} does "
                 f"not match cache's device={self.device}. Call "
                 f"cache.to(device=q.device) or move q to the cache's device.")
+        if sink_logits is not None and sink_logits.device != self.device:
+            raise ValueError(
+                f'HCADecodingCache.forward_step: sink_logits.device='
+                f'{sink_logits.device} does not match cache\'s '
+                f'device={self.device}.')
         device = q.device
         compute_dtype = _attention_compute_dtype(
             self.dtype, q, sink_logits)
