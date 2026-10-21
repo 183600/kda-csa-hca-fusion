@@ -326,6 +326,29 @@ def test_decode_roofline_accounting(device='cpu'):
     _ok('decode_roofline rejects T<1', raised, '')
 
 
+def test_consistency_metrics_start_validation():
+    """``start`` must be a non-negative exact int.
+
+    A negative ``start`` used to slice from the END of the sequence
+    (silently comparing the wrong positions), and ``True`` / ``1.0`` were
+    accepted as position 1. Both are caller bugs, not valid comparisons.
+    """
+    a = torch.zeros(1, 3, 5)
+    b = torch.zeros(1, 3, 5)
+    cases = [(-1, ValueError), (True, TypeError), (1.0, TypeError)]
+    for bad, exc in cases:
+        raised = False
+        try:
+            lm_consistency.consistency_metrics(a, b, start=bad)
+        except exc:
+            raised = True
+        _ok(f'consistency_metrics rejects start={bad!r}',
+            raised, f'expected {exc.__name__}')
+    ok = lm_consistency.consistency_metrics(a, b, start=0)
+    _ok('consistency_metrics still accepts start=0',
+        ok['n_positions'] == 3 and ok['consistent'], f'{ok}')
+
+
 def test_decode_roofline_host_peaks_fallback():
     """``host_peaks`` measures on-host and labels the source; explicit wins."""
     print("\nTest: decode roofline host peaks resolution")
@@ -340,6 +363,7 @@ def test_decode_roofline_host_peaks_fallback():
 
 _TEST_FUNCS = [
     test_lm_prefill_decode_consistency,
+    test_consistency_metrics_start_validation,
     test_selection_diagnostic,
     test_decode_roofline_accounting,
     test_decode_roofline_host_peaks_fallback,

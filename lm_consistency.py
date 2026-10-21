@@ -580,6 +580,12 @@ def consistency_metrics(logits_full: torch.Tensor, logits_inc: torch.Tensor,
         raise ValueError(
             f'consistency_metrics: shape mismatch '
             f'{tuple(logits_full.shape)} vs {tuple(logits_inc.shape)}.')
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise TypeError(
+            f'consistency_metrics: start must be an int, got {start!r}.')
+    if start < 0:
+        raise ValueError(
+            f'consistency_metrics: start={start} must be >= 0.')
     a = logits_full[:, start:]
     b = logits_inc[:, start:]
     if a.numel() == 0:
