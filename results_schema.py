@@ -297,6 +297,25 @@ def _positive_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _ci_ratio_matches(ci, ci_ratio) -> bool:
+    """Whether ``ci_ratio`` is the exponentiation of ``ci``.
+
+    ``math.exp`` raises ``OverflowError`` above ~709.78, so the
+    exponentiation is computed defensively: a CI bound that overflows
+    makes the row a CONTRACT VIOLATION (it cannot be the exponentiation
+    of the reported bound), never an exception that aborts the validator.
+    """
+    for bound, ratio in zip(ci, ci_ratio):
+        try:
+            want = math.exp(float(bound))
+        except OverflowError:
+            return False
+        tol = 1e-9 * max(1.0, abs(float(ratio)))
+        if abs(float(ratio) - want) > tol:
+            return False
+    return True
+
+
 def _recomputed_mean(per_seed: list) -> tuple[float | None, int]:
     """Mean over the per-seed rows that qualify for aggregation.
 
@@ -1065,10 +1084,7 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
             elif not (isinstance(ci_ratio, list) and len(ci_ratio) == 2
                       and all(_finite_number(v) and float(v) > 0.0
                               for v in ci_ratio)
-                      and abs(float(ci_ratio[0]) - math.exp(float(ci[0])))
-                      <= 1e-9 * max(1.0, abs(float(ci_ratio[0])))
-                      and abs(float(ci_ratio[1]) - math.exp(float(ci[1])))
-                      <= 1e-9 * max(1.0, abs(float(ci_ratio[1])))):
+                      and _ci_ratio_matches(ci, ci_ratio)):
                 out.append(f"{where}: 'ci_ppl_ratio' must be the exponentiated "
                            f'ci_delta_mean_nll, got {ci_ratio!r} for {ci!r}')
             p_value = row.get('p_value')

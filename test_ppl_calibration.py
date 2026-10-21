@@ -195,6 +195,27 @@ def _valid_exp15_rows():
     ]
 
 
+def test_exp15_row_contract_reports_overflow_instead_of_crashing():
+    """An overflowing CI bound must be a CONTRACT VIOLATION, not a crash.
+
+    ``math.exp`` raises ``OverflowError`` above ~709.78. The validator
+    used to call it unguarded, so a row whose ``ci_delta_mean_nll`` bound
+    overflowed aborted the whole validation with an unexpected exception
+    instead of reporting the violation.
+    """
+    import copy
+
+    from results_schema import ROW_CONTRACTS
+
+    contract = ROW_CONTRACTS['exp15_ppl_calibration']
+    rows = copy.deepcopy(_valid_exp15_rows())
+    row = rows[3]
+    row['ci_delta_mean_nll'] = [700.0, 900.0]
+    row['ci_ppl_ratio'] = [math.exp(700.0), math.exp(700.0)]
+    violations = contract(rows, {})
+    assert any('ci_ppl_ratio' in v for v in violations), violations
+
+
 def test_exp15_row_contract_rejects_tampering():
     import copy
 
