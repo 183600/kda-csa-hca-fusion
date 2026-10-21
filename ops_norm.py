@@ -78,10 +78,10 @@ def _resolve_normalized_shape(
 
 def _check_eps(eps: float) -> float:
     """Reject eps values that would silently produce NaNs/negative variances."""
-    try:
-        value = float(eps)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"rms_norm: eps must be a real number, got {eps!r}") from exc
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+        raise TypeError(
+            f"rms_norm: eps must be a real number, got {eps!r}")
+    value = float(eps)
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(
             f"rms_norm: eps must be finite and non-negative, got {eps!r}")
