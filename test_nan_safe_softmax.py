@@ -20,6 +20,10 @@ classified as "fully masked" and silently zeroed (the mass belongs on the
 detected and produced ``NaN`` — in a function whose whole purpose is to not
 produce ``NaN``.
 
+The decoding-cache read paths (``ops_decoding_cache``) share the same
+contract: they are the fast path behind ``naive_csa`` / ``naive_hca`` and
+must not diverge from the reference chain on a ``+inf`` / ``-inf`` row.
+
 Run via pytest::
 
     pytest -q test_nan_safe_softmax.py
@@ -114,10 +118,99 @@ def test_explicit_all_masked_mask_is_honoured():
         f'{out[0, 1].tolist()}')
 
 
+# --- decoding-cache read paths -------------------------------------------
+#
+# The chunked / per-token decode reads used to run a bare
+# ``torch.softmax`` (NaN on a ``+inf`` row) and the HCA read used
+# ``torch.isinf(...).all()`` as its fully-masked predicate (``isinf``
+# also matches ``+inf``).  Both are the regression pinned above, so the
+# cache paths are held to the same contract as the reference chain.
+
+def test_joint_softmax_chunk_matches_the_nan_safe_contract():
+    """``_joint_softmax_chunk`` follows the ``+inf`` / ``-inf`` contract."""
+    from ops_decoding_cache import _joint_softmax_chunk
+    logits = torch.tensor([[[[1.0, float('inf'), 2.0, 3.0],
+                             [float('inf'), float('inf'), 0.0, 1.0],
+                             [1.0, 5.0, -1.0, 2.0],
+                             [2.0, -1.0, 0.0, 4.0]]]])
+    valid = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    valid[..., 2, 1:] = False                      # partially masked row
+    valid[..., 3, :] = False                       # fully masked row
+    out = _joint_softmax_chunk(logits, valid, None)
+    masked_logits = logits.masked_fill(~valid, float('-inf'))
+    ref = _nan_safe_softmax(
+        masked_logits, dim=-1, all_masked_mask=~valid.any(-1, keepdim=True))
+    _ok('cache chunk softmax == reference NaN-safe softmax',
+        torch.equal(out, ref), f'{out.tolist()}')
+    _ok('cache chunk softmax stays finite on +inf rows',
+        bool(torch.isfinite(out).all()), f'{out.tolist()}')
+    _ok('+inf row puts all its mass on the +inf entry',
+        torch.allclose(out[0, 0, 0], torch.tensor([0.0, 1.0, 0.0, 0.0])),
+        f'{out[0, 0, 0].tolist()}')
+    _ok('two +inf entries split the mass evenly',
+        torch.allclose(out[0, 0, 1], torch.tensor([0.5, 0.5, 0.0, 0.0])),
+        f'{out[0, 0, 1].tolist()}')
+    _ok('partially masked row keeps softmax on its valid slot',
+        torch.allclose(out[0, 0, 2], torch.tensor([1.0, 0.0, 0.0, 0.0])),
+        f'{out[0, 0, 2].tolist()}')
+    _ok('fully-masked row is zeroed',
+        torch.equal(out[0, 0, 3], torch.zeros(4)), f'{out[0, 0, 3].tolist()}')
+
+
+def _hca_overflow_decode(sink):
+    """HCA decode with scores that overflow to ``+inf`` (no q/k norm)."""
+    from ops_decoding_cache import HCADecodingCache
+    torch.manual_seed(3)
+    B, c, m2, win, nh = 1, 4, 4, 2, 1
+    cache = HCADecodingCache(
+        B, c, m2, win, torch.device('cpu'), torch.float32)
+    cache._normalize_qk = False
+    outs = []
+    with torch.no_grad():
+        for _t in range(6):
+            # ~1e19 stored values x ~2e19 query values = ~2e38+ -> +inf
+            # scores in fp32; the state itself stays finite.
+            cache.append_step(
+                torch.randn(B, 1, c) * 1e19, torch.randn(B, 1, c) * 0.1,
+                torch.zeros(1, c))
+            q = torch.randn(B, 1, nh, c) * 2e19
+            outs.append(cache.forward_step(
+                q, nh=nh, scale=1.0, sink_logits=sink, normalize_qk=False))
+    return torch.cat(outs, dim=1)
+
+
+def test_hca_decode_step_keeps_overflowed_scores_finite():
+    """The HCA decode read must not turn ``+inf`` scores into NaN.
+
+    The no-sink chain mirrors ``naive_hca`` (``_nan_safe_softmax``), so
+    an overflowed ``+inf`` score keeps the softmax limit instead of
+    ``NaN``; the sink chain keeps ``naive_hca``'s own value (the shared
+    ``row_max`` shift overflows to ``NaN`` there in BOTH paths), so it is
+    only pinned for shape/dtype sanity.
+    """
+    out = _hca_overflow_decode(None)
+    _ok('sink-less HCA decode output stays finite under score overflow',
+        bool(torch.isfinite(out).all()),
+        f'nan_count={(~torch.isfinite(out)).sum().item()} '
+        f'shape={tuple(out.shape)}')
+    out_sink = _hca_overflow_decode(torch.tensor([0.5]))
+    _ok('sink HCA decode keeps its shape and dtype',
+        out_sink.shape == out.shape and out_sink.dtype == out.dtype,
+        f'{tuple(out_sink.shape)} {out_sink.dtype}')
+
+
+_TEST_FUNCS = [
+    test_fully_masked_rows_return_zeros,
+    test_finite_rows_match_torch_softmax,
+    test_positive_infinity_rows_stay_finite,
+    test_masked_rows_and_pos_inf_coexist,
+    test_explicit_all_masked_mask_is_honoured,
+    test_joint_softmax_chunk_matches_the_nan_safe_contract,
+    test_hca_decode_step_keeps_overflowed_scores_finite,
+]
+
+
 if __name__ == '__main__':
-    test_fully_masked_rows_return_zeros()
-    test_finite_rows_match_torch_softmax()
-    test_positive_infinity_rows_stay_finite()
-    test_masked_rows_and_pos_inf_coexist()
-    test_explicit_all_masked_mask_is_honoured()
+    for _fn in _TEST_FUNCS:
+        _fn()
     print('all NaN-safe softmax tests passed')
