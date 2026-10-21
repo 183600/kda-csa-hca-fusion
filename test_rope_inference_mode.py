@@ -222,9 +222,37 @@ def test_naive_csa_hca_inference_mode_long_rope(device='cpu'):
         hca_err < 1e-5, f'T={T}, rope_dim={rope_dim}, err={hca_err:.2e}')
 
 
+def test_default_dim_is_the_sequence_axis(device='cpu'):
+    """The default ``dim`` must rotate the SEQUENCE, not the heads.
+
+    The 4-D query layout is ``[B, T, nh, c]``; its sequence axis is 1.
+    The previous default (``-2``) resolved to axis 2 - the HEAD axis -
+    and silently rotated the heads with token positions instead of the
+    tokens.
+    """
+    torch.manual_seed(7)
+    x = torch.randn(1, 4, 4, 8, dtype=torch.float64, device=device)
+    pos = torch.arange(4, dtype=torch.long, device=device)
+    default = partial_rope(x, pos, 8, 10000.0)
+    explicit = partial_rope(x, pos, 8, 10000.0, dim=1)
+    _ok('default dim equals the sequence axis (dim=1)',
+        torch.equal(default, explicit), '')
+    # Position 0 is the identity rotation, so token 0 is untouched.
+    _ok('position 0 is the identity rotation',
+        torch.allclose(default[0, 0], x[0, 0]), '')
+    # With the sequence axis, the rotation does not depend on the head
+    # index: reversing the head order commutes with the rotation.  With
+    # the head axis it would not (each head would be rotated by its own
+    # index as a position).
+    flipped = partial_rope(x[:, :, [3, 2, 1, 0], :], pos, 8, 10000.0)
+    _ok('the rotation does not depend on the head index',
+        torch.allclose(flipped, default[:, :, [3, 2, 1, 0], :]), '')
+
+
 if __name__ == '__main__':
     test_position_vectors_are_ordinary_under_inference()
     test_long_context_rope_in_inference_mode()
     test_inference_warmup_does_not_poison_autograd()
+    test_default_dim_is_the_sequence_axis()
     test_naive_csa_hca_inference_mode_long_rope()
     print('all RoPE inference-mode regression tests passed')

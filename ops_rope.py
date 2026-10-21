@@ -303,7 +303,7 @@ def partial_rope(
     positions: torch.Tensor,
     rope_dim: int,
     base: float = 10000.0,
-    dim: int = -2,
+    dim: int = 1,
 ) -> torch.Tensor:
     """Rotate the LAST ``rope_dim`` feature dims of ``x`` at given positions.
 
@@ -312,7 +312,10 @@ def partial_rope(
     x : torch.Tensor
         ``[..., P, D]`` along ``dim`` — e.g. queries ``[B, T, nh, c]`` use
         ``dim=1`` (the sequence axis is T); compressed KV ``[B, n_blocks, c]``
-        use ``dim=1`` (== ``dim=-2``).
+        use ``dim=1`` as well.  ``dim=1`` is the default because it is the
+        sequence axis of every layout this repository uses; the previous
+        default ``-2`` resolved to the HEAD axis for the 4-D query layout
+        and silently rotated the heads instead of the tokens.
     positions : torch.Tensor
         1-D tensor of length ``P = x.shape[dim]`` with the position of each
         row along the sequence axis. May be negative (negative positions
@@ -323,8 +326,9 @@ def partial_rope(
     base : float
         RoPE frequency base (default 10000.0).
     dim : int
-        The sequence axis along which ``positions`` applies (default -2;
-        must not be the last axis, which is the feature axis).
+        The sequence axis along which ``positions`` applies (default 1;
+        must not be the last axis, which is the feature axis).  A 2-D
+        ``[P, D]`` tensor must pass ``dim=0`` explicitly.
 
     Returns
     -------
@@ -337,7 +341,9 @@ def partial_rope(
         return x
     if dim == -1 or dim == x.dim() - 1:
         raise ValueError(
-            f"partial_rope: dim={dim} cannot be the feature (last) axis")
+            f"partial_rope: dim={dim} cannot be the feature (last) axis; "
+            f"pass the sequence axis explicitly (dim=1 for the "
+            f"[B, T, ...] layouts, dim=0 for a 2-D [P, D] tensor)")
     if dim < 0:
         dim = x.dim() + dim
     D = x.shape[-1]
@@ -492,7 +498,7 @@ def inverse_partial_rope(
     positions: torch.Tensor,
     rope_dim: int,
     base: float = 10000.0,
-    dim: int = -2,
+    dim: int = 1,
 ) -> torch.Tensor:
     """Inverse-rotate at the given positions (rotate by the negated angle).
 
