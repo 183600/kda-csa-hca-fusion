@@ -1388,6 +1388,26 @@ def _tokenizer_payload(tokenizer=None) -> dict:
     }
 
 
+def _tokenizer_from_payload(payload) -> object:
+    """Rebuild the tokenizer described by a checkpoint/export payload."""
+    if not isinstance(payload, dict):
+        payload = {}
+    if payload.get('type') == 'fallback_char':
+        tok = _FallbackCharTokenizer()
+        tok._itos = list(payload['itos'])
+        tok._stoi = {c: i for i, c in enumerate(tok._itos)}
+        tok.pad_token_id = int(payload.get('pad_token_id', 0))
+        tok.unk_token_id = int(payload.get('unk_token_id', 1))
+        return tok
+    tok_name = payload.get('name', 'gpt2')
+    if HAS_HF:
+        try:
+            return AutoTokenizer.from_pretrained(tok_name)
+        except Exception:
+            pass
+    return _FallbackCharTokenizer()
+
+
 def _export_lm_bundle(ckpt_path, export_dir, generation_defaults=None,
                       device='cpu'):
     """Package a trained LM checkpoint into a self-contained deployment bundle.
@@ -1479,18 +1499,7 @@ def load_lm_for_inference(export_dir, device='cpu'):
         cfg = HybridConfig(**json.load(f))
     with open(os.path.join(export_dir, 'tokenizer.json')) as f:
         tok_payload = json.load(f)
-    if tok_payload.get('type') == 'fallback_char':
-        tok = _FallbackCharTokenizer()
-        tok._itos = list(tok_payload['itos'])
-        tok._stoi = {c: i for i, c in enumerate(tok._itos)}
-        tok.pad_token_id = int(tok_payload.get('pad_token_id', 0))
-        tok.unk_token_id = int(tok_payload.get('unk_token_id', 1))
-    else:
-        tok_name = tok_payload.get('name', 'gpt2')
-        if HAS_HF:
-            tok = AutoTokenizer.from_pretrained(tok_name)
-        else:
-            tok = _FallbackCharTokenizer()
+    tok = _tokenizer_from_payload(tok_payload)
     if getattr(tok, "pad_token", None) is None \
             and hasattr(tok, "eos_token"):
         tok.pad_token = tok.eos_token
@@ -2357,7 +2366,12 @@ def main():
             d_model=ckpt.get('model_d_model') if arch == 'softmax' else None)
         model.load_state_dict(ckpt['model'])
         model.to(device).eval()
-        if HAS_HF:
+        tok_payload = ckpt.get('tokenizer')
+        if isinstance(tok_payload, dict):
+            # Rebuild the vocabulary the model was TRAINED with, not the
+            # host's installed tokenizer.
+            tokenizer = _tokenizer_from_payload(tok_payload)
+        elif HAS_HF:
             try:
                 tokenizer = AutoTokenizer.from_pretrained("gpt2")
             except Exception:
