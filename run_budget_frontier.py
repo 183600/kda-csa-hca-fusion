@@ -74,12 +74,16 @@ Output
 ------
 ``results/exp9_budget_frontier.json`` — v1.0 envelope
 (``kind='exp9_budget_frontier'``) with a flat row list; every row carries
-``section`` in {'budget_curve', 'decode_sweep', 'quality_join',
-'ranking_summary'}.
+``section`` in {'budget_curve', 'decode_budget_curve', 'decode_sweep',
+'quality_join', 'ranking_summary', 'source_audit'}. The ``source_audit``
+rows record each join source's file hash, git commit/dirty flag, seeds
+and resolved backends, plus a cross-source comparability verdict.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import os
@@ -103,7 +107,9 @@ from kv_budget import (
     spearman,
     windowed_layout_read_elements,
 )
+from results_schema import detect_version as detect_schema_version
 from results_schema import load as load_schema
+from results_schema import parse as parse_schema
 from results_schema import write as write_schema
 from run_ablation import _make_cfg
 from run_decoding import HybridDecoding, bench_decoding
@@ -137,6 +143,12 @@ JOIN_SOURCES = (
     ('exp8_mechanism_ablation',
      os.path.join('results', 'exp8_mechanism_ablation.json')),
 )
+# Exp 5 writes its result file as a bare array (legacy schema 0.0), so its
+# provenance/seeds live in a sidecar written by the same run.
+SOURCE_PROVENANCE_PATHS = {
+    'exp5_ablation': os.path.join(
+        'results', 'exp5_ablation_provenance.json'),
+}
 
 
 def _parse_int_list(raw, name, min_value=0):
@@ -353,32 +365,241 @@ def _parse_ratio(label):
     return tuple(parts)
 
 
-def _try_load(path):
-    if not os.path.exists(path):
-        return None, f'{path} not found; join skipped (run the experiment)'
+def _file_sha256(path):
+    """SHA-256 of a result file, so a join records the exact bytes used."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_join_source(source, path, provenance_path=None):
+    """Load one Exp 4/5/8 result file plus its provenance for the join.
+
+    Returns a record with the rows and the comparability fields. Missing
+    or malformed sources are recorded (``readable=False`` + ``error``)
+    instead of aborting the experiment: Exp 9 must still run when one
+    upstream experiment has not been produced. Exp 5's bare-array result
+    has no metadata, so its sidecar provenance file is the fallback.
+    """
+    if provenance_path is None:
+        provenance_path = SOURCE_PROVENANCE_PATHS.get(source)
+    rec = {
+        'source': source,
+        'path': path,
+        'exists': os.path.exists(path),
+        'readable': False,
+        'schema_version': None,
+        'n_rows': 0,
+        'sha256': None,
+        'git_commit': None,
+        'git_dirty': None,
+        'captured_at_utc': None,
+        'seeds': [],
+        'n_seeds': 0,
+        'backends': {},
+        'provenance_source': None,
+        'error': None,
+        'rows': [],
+    }
+    if not rec['exists']:
+        rec['error'] = f'{path} not found; join skipped (run the experiment)'
+        return rec
     try:
-        _meta, rows = load_schema(path)
+        rec['sha256'] = _file_sha256(path)
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        rec['schema_version'] = detect_schema_version(data)
+        meta, rows, _version = parse_schema(data)
     except Exception as e:
-        return None, f'{path} unreadable: {type(e).__name__}: {e}'
+        rec['error'] = f'{path} unreadable: {type(e).__name__}: {e}'
+        return rec
     if not isinstance(rows, list):
-        return None, f'{path} did not yield a row list'
-    return rows, None
+        rec['error'] = f'{path} did not yield a row list'
+        return rec
+    rec['rows'] = rows
+    rec['n_rows'] = len(rows)
+    rec['readable'] = True
+
+    prov = meta.get('provenance')
+    if isinstance(prov, dict) and prov:
+        rec['provenance_source'] = 'metadata.provenance'
+    else:
+        prov = {}
+    seeds = meta.get('seeds')
+    sidecar_meta = {}
+    if provenance_path and os.path.exists(provenance_path):
+        try:
+            with open(provenance_path, encoding='utf-8') as f:
+                sidecar_meta = json.load(f)
+        except Exception as e:
+            rec['error'] = (f'{provenance_path} unreadable: '
+                            f'{type(e).__name__}: {e}')
+            sidecar_meta = {}
+    if isinstance(sidecar_meta, dict):
+        sidecar_prov = sidecar_meta.get('provenance')
+        if not isinstance(sidecar_prov, dict) or not sidecar_prov:
+            sidecar_prov = sidecar_meta
+        if not prov and isinstance(sidecar_prov, dict):
+            prov = sidecar_prov
+            if rec['provenance_source'] is None:
+                rec['provenance_source'] = 'sidecar'
+        if not isinstance(seeds, list) and isinstance(
+                sidecar_meta.get('seeds'), list):
+            seeds = sidecar_meta['seeds']
+
+    if isinstance(seeds, list):
+        rec['seeds'] = sorted({int(s) for s in seeds
+                               if isinstance(s, int)
+                               and not isinstance(s, bool)})
+    rec['n_seeds'] = len(rec['seeds'])
+    rec['git_commit'] = prov.get('git_commit')
+    rec['git_dirty'] = prov.get('git_dirty')
+    rec['captured_at_utc'] = prov.get('captured_at_utc')
+    rec['backends'] = {
+        key: prov.get(key) or prov.get(key.replace('_resolved', ''))
+        for key in ('kda_backend_resolved', 'mamba_backend_resolved',
+                    'rwkv_backend_resolved')
+        if prov.get(key) or prov.get(key.replace('_resolved', ''))
+    }
+    return rec
 
 
-def build_quality_join(spec, context_T=MQAR_SEQ_LEN):
+def _source_audit_row(rec):
+    """The on-disk summary of one join source (rows omitted)."""
+    row = {k: v for k, v in rec.items() if k != 'rows'}
+    row['section'] = 'source_audit'
+    return row
+
+
+def audit_join_sources(source_records):
+    """Check whether Exp 4/5/8 rows may be compared in one ranking.
+
+    The join is only interpretable when the sources ran the same code
+    revision, overlap on seeds, and agree on the resolved memory
+    backends. This function never changes the measured numbers; it
+    records the evidence and returns a status used to annotate (and, for
+    mixed revisions, caveat) the ranking summary.
+    """
+    records = list(source_records)
+    present = [r for r in records if r.get('readable')]
+    missing = [r['source'] for r in records if not r.get('readable')]
+    missing_prov = [r['source'] for r in present
+                    if not r.get('git_commit')]
+    commits = sorted({r['git_commit'] for r in present
+                      if r.get('git_commit')})
+    dirty = [r['source'] for r in present if r.get('git_dirty') is True]
+    seed_sets = [set(r['seeds']) for r in present if r.get('seeds')]
+    if seed_sets:
+        shared = set.intersection(*seed_sets)
+        shared_seeds = sorted(shared)
+        seed_status = ('shared' if shared_seeds else 'disjoint')
+        if len(seed_sets) != len(present):
+            seed_status = 'partial'
+    else:
+        shared_seeds = []
+        seed_status = 'missing'
+
+    backend_keys = sorted({key for r in present
+                           for key in (r.get('backends') or {})})
+    backend_mismatches = []
+    for key in backend_keys:
+        values = {r['source']: (r.get('backends') or {})[key]
+                  for r in present if key in (r.get('backends') or {})}
+        if len(set(values.values())) > 1:
+            backend_mismatches.append({
+                'backend': key,
+                'values': values,
+            })
+    backends_consistent = not backend_mismatches
+
+    if not present:
+        status = 'no_sources'
+    elif missing or missing_prov:
+        status = 'provenance_missing'
+    elif len(commits) > 1:
+        status = 'mixed_revisions'
+    elif not shared_seeds:
+        status = 'no_shared_seeds'
+    elif not backends_consistent:
+        status = 'mixed_backends'
+    elif dirty:
+        status = 'comparable_dirty_tree'
+    else:
+        status = 'comparable'
+    comparable_for_ranking = status in (
+        'comparable', 'comparable_dirty_tree')
+
+    warnings = []
+    if status == 'mixed_revisions':
+        warnings.append(
+            'join sources were produced at different git commits '
+            f'{commits}; the cross-source ranking mixes code revisions')
+    if status == 'provenance_missing':
+        warnings.append(
+            'join provenance is incomplete (missing sources '
+            f'{missing}; missing git commit {missing_prov})')
+    if status == 'no_shared_seeds':
+        warnings.append(
+            'join sources share no seed; seed-level differences are '
+            'confounded with the source experiment')
+    if status == 'mixed_backends':
+        warnings.append(
+            'join sources resolved different memory backends: '
+            f'{backend_mismatches}')
+    if status == 'comparable_dirty_tree':
+        warnings.append(
+            'join sources share a git commit but were produced from a '
+            f'dirty checkout ({dirty}); the exact code revision is not '
+            'recoverable from the commit alone')
+
+    summary = {
+        'status': status,
+        'comparable_for_ranking': comparable_for_ranking,
+        'n_sources_requested': len(records),
+        'n_sources_readable': len(present),
+        'missing_sources': missing,
+        'missing_provenance': missing_prov,
+        'git_commits': commits,
+        'dirty_sources': dirty,
+        'seed_status': seed_status,
+        'shared_seeds': shared_seeds,
+        'n_shared_seeds': len(shared_seeds),
+        'backends_consistent': backends_consistent,
+        'backend_mismatches': backend_mismatches,
+        'warnings': warnings,
+    }
+    audit_rows = [_source_audit_row(r) for r in records]
+    audit_rows.append({
+        'section': 'source_audit',
+        'source': 'cross_source',
+        **summary,
+    })
+    return audit_rows, summary
+
+
+def build_quality_join(spec, context_T=MQAR_SEQ_LEN, source_records=None):
     """Join existing Exp 4/5/8 measured rows with their analytic budget.
 
     Returns ``(rows, skipped)`` where ``skipped`` lists per-source reasons;
-    a missing source is a documented skip, never a silent zero.
+    a missing source is a documented skip, never a silent zero. Each
+    joined row carries the source's git commit, dirty flag, seed list and
+    file hash, so a mixed-revision join is visible at row level rather
+    than only in the run log.
     """
+    if source_records is None:
+        source_records = [_load_join_source(source, path)
+                          for source, path in JOIN_SOURCES]
     rows = []
     skipped = []
-    for source, path in JOIN_SOURCES:
-        data, reason = _try_load(path)
-        if data is None:
-            skipped.append(reason)
+    for rec in source_records:
+        source = rec['source']
+        if not rec.get('readable'):
+            skipped.append(rec.get('error')
+                           or f"{rec.get('path')} unreadable; join skipped")
             continue
-        for r in data:
+        for r in rec['rows']:
             if not isinstance(r, dict):
                 continue
             acc = r.get('mean_acc')
@@ -421,18 +642,36 @@ def build_quality_join(spec, context_T=MQAR_SEQ_LEN):
                 'n_seeds_ok': r.get('n_seeds_ok'),
                 'mean_fwd_ms': r.get('mean_fwd_ms'),
                 'total_read_elements_per_query': budget,
+                'source_git_commit': rec.get('git_commit'),
+                'source_git_dirty': rec.get('git_dirty'),
+                'source_seeds': list(rec.get('seeds') or []),
+                'source_sha256': rec.get('sha256'),
+                'source_schema_version': rec.get('schema_version'),
             })
     return rows, skipped
 
 
-def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192):
+def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192,
+                          comparability=None):
     """Compare the Exp 5 layout accuracy ranking with budget rankings.
 
     Only ``exp5_ablation`` rows are used (one row per layout, its own
     controlled-depth measurement). The comparison at ``aT`` is the measured
     context; at ``bT`` it extrapolates the same layouts' budgets to long
     context in each geometry. Over 7 layouts this is exploratory.
+
+    ``comparability`` is the summary from :func:`audit_join_sources`. It
+    is copied onto every ranking row so a consumer cannot read the
+    Spearman coefficient without also seeing whether the source runs are
+    on a common revision/seed set.
     """
+    cmp = comparability if isinstance(comparability, dict) else {}
+    source_fields = {
+        'source_comparability': cmp.get('status'),
+        'source_git_commits': cmp.get('git_commits'),
+        'source_shared_seeds': cmp.get('shared_seeds'),
+        'comparable_across_sources': cmp.get('comparable_for_ranking'),
+    }
     exp5 = [r for r in join_rows if r.get('source') == 'exp5_ablation']
     if len(exp5) < 3:
         return [{
@@ -440,6 +679,7 @@ def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192):
             'skipped_reason': (
                 'fewer than 3 exp5_ablation rows were joined; ranking '
                 'summary skipped'),
+            **source_fields,
         }]
     labels = [r['label'] for r in exp5]
     accs = [r['mean_acc'] for r in exp5]
@@ -471,6 +711,7 @@ def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192):
             'spearman_acc_vs_budget': rho,
             'layout_order_by_decode_budget_ascending': dec_order,
             'spearman_acc_vs_decode_budget': dec_rho,
+            **source_fields,
         })
         long_budgets = [layout_read_elements(bT, r, spec)
                         ['total_read_elements'] for r in ratios]
@@ -498,6 +739,7 @@ def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192):
                 'indexer term), and composition also drives the measured '
                 'short-context accuracy. The rank correlation detects the '
                 'composition confound, not a causal budget effect.'),
+            **source_fields,
         })
     return out
 
@@ -596,11 +838,21 @@ def main():
         device, topk_values, prefill_lens, n_decode, repeats)
     rows.extend(decode_rows)
 
-    join_rows, join_skipped = build_quality_join(specs['mqar'])
+    source_records = [_load_join_source(source, path)
+                      for source, path in JOIN_SOURCES]
+    source_audit_rows, source_audit = audit_join_sources(source_records)
+    rows.extend(source_audit_rows)
+    join_rows, join_skipped = build_quality_join(
+        specs['mqar'], source_records=source_records)
     rows.extend(join_rows)
     for reason in join_skipped:
         logger.info(f'  join skipped: {reason}')
-    rows.extend(build_ranking_summary(join_rows, specs))
+    if source_audit['status'] not in ('comparable',
+                                      'comparable_dirty_tree'):
+        logger.warning('  quality join is NOT comparable across sources: '
+                       f"{source_audit['status']} ({'; '.join(source_audit['warnings'])})")
+    rows.extend(build_ranking_summary(
+        join_rows, specs, comparability=source_audit))
 
     metadata = {
         'experiment': 'exp9_budget_frontier',
@@ -657,6 +909,7 @@ def main():
         },
         'join_sources': [name for name, _ in JOIN_SOURCES],
         'join_skipped': join_skipped,
+        'source_audit': source_audit,
         'caveats': [
             'The budget is an analytical lower bound on KV-side reads; '
             'matching latency to budget is confounded by Python-loop '
@@ -675,6 +928,12 @@ def main():
             'evaluated at one position; it excludes Python-loop and '
             'cache-management overhead, so it is the right shape of the '
             'decode cost, not a latency prediction.',
+            'Cross-experiment join provenance is audited in source_audit. '
+            'The ranking is only marked comparable when every source has '
+            'provenance, one shared git commit, a non-empty shared seed '
+            'set, and consistent resolved backends; a dirty checkout is '
+            'reported separately because the commit alone then does not '
+            'pin the exact code.',
         ],
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
         'seed': DECODE_SWEEP_SEED,

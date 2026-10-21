@@ -500,6 +500,191 @@ def test_decode_sweep_smoke():
         by_k[2] > by_k[0], f'{by_k}')
 
 
+# --- Exp 9 cross-source provenance audit --------------------------------
+
+def _audit_record(source, commit='a' * 40, seeds=(42, 43, 44, 45, 46),
+                  backends=None, readable=True, dirty=False):
+    return {
+        'source': source,
+        'path': f'/tmp/{source}.json',
+        'exists': readable,
+        'readable': readable,
+        'schema_version': '1.0' if readable else None,
+        'n_rows': 1,
+        'sha256': '0' * 64 if readable else None,
+        'git_commit': commit,
+        'git_dirty': dirty,
+        'captured_at_utc': '2026-01-01T00:00:00+00:00',
+        'seeds': list(seeds),
+        'n_seeds': len(seeds),
+        'backends': backends if backends is not None else {
+            'kda_backend_resolved': 'reference',
+            'mamba_backend_resolved': 'reference',
+            'rwkv_backend_resolved': 'reference',
+        },
+        'provenance_source': 'metadata.provenance' if readable else None,
+        'error': None if readable else 'missing',
+        'rows': [],
+    }
+
+
+def test_exp9_source_audit_same_revision_is_comparable():
+    print('\nTest: Exp 9 source audit accepts a common revision/seed set')
+    from run_budget_frontier import audit_join_sources
+    records = [_audit_record(s) for s in
+               ('exp4_mqar', 'exp5_ablation', 'exp8_mechanism_ablation')]
+    rows, summary = audit_join_sources(records)
+    _ok('same commit + shared seeds -> comparable',
+        summary['status'] == 'comparable', summary['status'])
+    _ok('ranking is allowed', summary['comparable_for_ranking'] is True, '')
+    _ok('shared seed set is recorded',
+        summary['shared_seeds'] == [42, 43, 44, 45, 46], summary['shared_seeds'])
+    _ok('one row per source plus a cross-source row',
+        len(rows) == 4
+        and rows[-1]['source'] == 'cross_source'
+        and all(r['section'] == 'source_audit' for r in rows), '')
+    _ok('source rows omit the raw result rows',
+        all('rows' not in r for r in rows), '')
+
+
+def test_exp9_source_audit_rejects_mixed_revisions():
+    print('\nTest: Exp 9 source audit rejects mixed revisions')
+    from run_budget_frontier import audit_join_sources
+    records = [_audit_record('exp4_mqar', commit='a' * 40),
+               _audit_record('exp5_ablation', commit='b' * 40),
+               _audit_record('exp8_mechanism_ablation')]
+    _rows, summary = audit_join_sources(records)
+    _ok('mixed commits -> mixed_revisions',
+        summary['status'] == 'mixed_revisions', summary['status'])
+    _ok('mixed revisions are not comparable for ranking',
+        summary['comparable_for_ranking'] is False, '')
+    _ok('both commits are recorded',
+        summary['git_commits'] == ['a' * 40, 'b' * 40], summary['git_commits'])
+    _ok('warning names the mixed revisions',
+        any('different git commits' in w for w in summary['warnings']), '')
+
+
+def test_exp9_source_audit_rejects_missing_provenance_and_seed_mismatch():
+    print('\nTest: Exp 9 source audit rejects missing provenance / seeds')
+    from run_budget_frontier import audit_join_sources
+    no_prov = [_audit_record('exp4_mqar'),
+               _audit_record('exp5_ablation', commit=None),
+               _audit_record('exp8_mechanism_ablation')]
+    _rows, summary = audit_join_sources(no_prov)
+    _ok('missing commit -> provenance_missing',
+        summary['status'] == 'provenance_missing', summary['status'])
+    _ok('missing provenance is named',
+        summary['missing_provenance'] == ['exp5_ablation'],
+        summary['missing_provenance'])
+    _ok('ranking is blocked', summary['comparable_for_ranking'] is False, '')
+    disjoint = [_audit_record('exp4_mqar', seeds=(42, 43)),
+                _audit_record('exp5_ablation', seeds=(44, 45)),
+                _audit_record('exp8_mechanism_ablation', seeds=(46, 47))]
+    _rows, summary = audit_join_sources(disjoint)
+    _ok('disjoint seeds -> no_shared_seeds',
+        summary['status'] == 'no_shared_seeds', summary['status'])
+    _ok('no shared seed is reported', summary['shared_seeds'] == [], '')
+
+
+def test_exp9_source_audit_flags_dirty_tree_and_backend_mix():
+    print('\nTest: Exp 9 source audit distinguishes dirty tree/backend mix')
+    from run_budget_frontier import audit_join_sources
+    dirty = [_audit_record('exp4_mqar', dirty=True),
+             _audit_record('exp5_ablation'),
+             _audit_record('exp8_mechanism_ablation')]
+    _rows, summary = audit_join_sources(dirty)
+    _ok('same commit + dirty -> comparable_dirty_tree',
+        summary['status'] == 'comparable_dirty_tree', summary['status'])
+    _ok('dirty tree still permits ranking with a caveat',
+        summary['comparable_for_ranking'] is True
+        and any('dirty checkout' in w for w in summary['warnings']), '')
+    mixed = [_audit_record('exp4_mqar'),
+             _audit_record('exp5_ablation', backends={
+                 'kda_backend_resolved': 'fla',
+                 'mamba_backend_resolved': 'reference',
+                 'rwkv_backend_resolved': 'reference'}),
+             _audit_record('exp8_mechanism_ablation')]
+    _rows, summary = audit_join_sources(mixed)
+    _ok('backend mismatch -> mixed_backends',
+        summary['status'] == 'mixed_backends', summary['status'])
+    _ok('mismatching backend is recorded',
+        len(summary['backend_mismatches']) == 1
+        and summary['backend_mismatches'][0]['backend']
+        == 'kda_backend_resolved', summary['backend_mismatches'])
+
+
+def test_exp9_load_join_source_reads_exp5_sidecar():
+    print('\nTest: Exp 9 loader reads legacy Exp 5 result + provenance sidecar')
+    import hashlib
+    import json
+    import tempfile
+    from run_budget_frontier import _load_join_source
+    with tempfile.TemporaryDirectory() as td:
+        result_path = os.path.join(td, 'exp5_ablation.json')
+        prov_path = os.path.join(td, 'exp5_ablation_provenance.json')
+        payload = [{'ratio': '3:1:1', 'mean_acc': 0.5}]
+        with open(result_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        with open(prov_path, 'w', encoding='utf-8') as f:
+            json.dump({'git_commit': 'c' * 40, 'git_dirty': False,
+                       'seeds': [42, 43], 'kda_backend': 'reference'}, f)
+        rec = _load_join_source('exp5_ablation', result_path,
+                                provenance_path=prov_path)
+        digest = hashlib.sha256(open(result_path, 'rb').read()).hexdigest()
+        _ok('legacy bare array is readable',
+            rec['readable'] is True and rec['n_rows'] == 1, '')
+        _ok('legacy schema version is 0.0',
+            rec['schema_version'] == '0.0', rec['schema_version'])
+        _ok('sidecar supplies commit and seeds',
+            rec['git_commit'] == 'c' * 40 and rec['seeds'] == [42, 43],
+            f"{rec['git_commit']} {rec['seeds']}")
+        _ok('file hash is recorded', rec['sha256'] == digest, '')
+
+
+def test_exp9_quality_join_carries_source_provenance():
+    print('\nTest: Exp 9 quality join annotates rows with source provenance')
+    from run_budget_frontier import build_quality_join, mqar_spec
+    rec = _audit_record('exp5_ablation')
+    rec['rows'] = [{'ratio': '3:1:1', 'mean_acc': 0.5, 'ci95_acc': 0.05,
+                    'n_seeds_ok': 5, 'mean_fwd_ms': 1.0}]
+    rows, skipped = build_quality_join(mqar_spec(), source_records=[rec])
+    _ok('one joined row, no skip', len(rows) == 1 and not skipped, f'{skipped}')
+    row = rows[0]
+    _ok('joined row carries commit/dirty/seeds/hash',
+        row['source_git_commit'] == 'a' * 40
+        and row['source_git_dirty'] is False
+        and row['source_seeds'] == [42, 43, 44, 45, 46]
+        and row['source_sha256'] == '0' * 64, f'{row}')
+
+
+def test_exp9_ranking_summary_carries_comparability():
+    print('\nTest: Exp 9 ranking summary carries the comparability verdict')
+    from run_budget_frontier import (LAYOUTS, build_ranking_summary,
+                                     mqar_spec, paper_spec)
+    join_rows = []
+    for i, ratio in enumerate(LAYOUTS):
+        join_rows.append({
+            'source': 'exp5_ablation',
+            'label': ':'.join(str(x) for x in ratio),
+            'mean_acc': 0.10 + 0.05 * i,
+        })
+    summary = {
+        'status': 'mixed_revisions',
+        'comparable_for_ranking': False,
+        'git_commits': ['a' * 40, 'b' * 40],
+        'shared_seeds': [42, 43],
+    }
+    rows = build_ranking_summary(
+        join_rows, {'mqar': mqar_spec(), 'paper': paper_spec()},
+        comparability=summary)
+    _ok('one row per geometry and context view', len(rows) == 4, len(rows))
+    _ok('every ranking row carries the source verdict',
+        all(r['source_comparability'] == 'mixed_revisions'
+            and r['comparable_across_sources'] is False
+            and r['source_git_commits'] == ['a' * 40, 'b' * 40]
+            for r in rows), '')
+
+
 _TEST_FUNCS = [
     test_sliding_window_entries_hand_values,
     test_op_budget_hand_values_mqar_geometry,
@@ -516,6 +701,13 @@ _TEST_FUNCS = [
     test_build_budget_curves_rows,
     test_decode_budget_curve_and_sweep_join,
     test_decode_sweep_smoke,
+    test_exp9_source_audit_same_revision_is_comparable,
+    test_exp9_source_audit_rejects_mixed_revisions,
+    test_exp9_source_audit_rejects_missing_provenance_and_seed_mismatch,
+    test_exp9_source_audit_flags_dirty_tree_and_backend_mix,
+    test_exp9_load_join_source_reads_exp5_sidecar,
+    test_exp9_quality_join_carries_source_provenance,
+    test_exp9_ranking_summary_carries_comparability,
 ]
 
 
