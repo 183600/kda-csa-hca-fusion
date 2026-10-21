@@ -644,3 +644,145 @@ def test_matrix_rows_survive_json_roundtrip_validation(tmp_path):
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
     assert rs.validate_payload(data) == []
+
+
+# ---------------------------------------------------------------------------
+# Exp 2 / latency-profile / Exp 9 contracts (uncertainty + join audit)
+# ---------------------------------------------------------------------------
+
+def _exp2_row(**overrides):
+    row = {
+        'T': 128, 'op': 'softmax', 'device': 'cpu', 'repeats': 5,
+        'time_ms': 1.0, 'time_min_ms': 0.8, 'time_max_ms': 1.2,
+        'time_std_ms': 0.1, 'time_mean_ms': 1.0, 'time_q10_ms': 0.9,
+        'time_q90_ms': 1.1, 'time_ci95_low_ms': 0.95,
+        'time_ci95_high_ms': 1.05, 'time_ci95_halfwidth_ms': 0.05,
+        'time_cv': 0.1, 'time_n': 5,
+        'time_ci_method': 'percentile_bootstrap_median',
+        'time_bootstrap_reps': 2000,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_row_contract_exp2_requires_ordered_uncertainty():
+    good = _exp2_row()
+    assert rs.validate_rows('exp2_benchmark', [good], {}) == []
+    assert rs.validate_rows('exp2_benchmark', [{
+        'T': 128, 'op': 'softmax', 'device': 'cpu', 'repeats': 5,
+        'time_ms': 1.0, 'time_min_ms': 0.8, 'time_max_ms': 1.2,
+        'time_std_ms': 0.1}], {}) == []  # legacy row without CI block
+    for bad, needle in (
+        (_exp2_row(time_q10_ms=1.2), 'median outside'),
+        (_exp2_row(time_ci95_low_ms=1.1, time_ci95_high_ms=1.0), 'low_ms >'),
+        (_exp2_row(time_n=4), 'time_n must equal repeats'),
+        (_exp2_row(time_ci95_halfwidth_ms=0.5), 'halfwidth'),
+    ):
+        violations = rs.validate_rows('exp2_benchmark', [bad], {})
+        assert any(needle in v for v in violations), violations
+    assert any('duplicate' in v for v in rs.validate_rows(
+        'exp2_benchmark', [good, good], {}))
+
+
+def _profile_row(**overrides):
+    row = {
+        'T': 128, 'mode': 'sequential', 'chunk_size': None,
+        'time_ms': 1.0, 'time_min_ms': 0.8, 'time_max_ms': 1.2,
+        'time_std_ms': 0.1, 'time_q10_ms': 0.9, 'time_q90_ms': 1.1,
+        'time_ci95_low_ms': 0.95, 'time_ci95_high_ms': 1.05,
+        'times_ms': [0.9, 1.0, 1.1], 'n': 3, 'finite': True,
+        'parity_max_abs': 0.0, 'parity_ok': True,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_row_contract_latency_profile_parity_gate():
+    meta = {'parity_tol': 1e-4}
+    assert rs.validate_rows('mamba2_scan_latency_profile',
+                            [_profile_row()], meta) == []
+    row = _profile_row(mode='chunked', chunk_size=16,
+                       parity_max_abs=1e-3)
+    violations = rs.validate_rows('mamba2_scan_latency_profile', [row], meta)
+    assert any('parity_ok' in v for v in violations), violations
+    violations = rs.validate_rows(
+        'mamba2_scan_latency_profile',
+        [_profile_row(n=2)], meta)
+    assert any('n=' in v for v in violations), violations
+
+
+def _exp9_contract_rows():
+    commit = 'a' * 40
+    audit = {
+        'section': 'source_audit', 'source': 'exp5_ablation',
+        'path': 'results/exp5_ablation.json', 'exists': True,
+        'readable': True, 'schema_version': '0.0', 'n_rows': 1,
+        'sha256': '0' * 64, 'git_commit': commit, 'git_dirty': False,
+        'captured_at_utc': '2026-01-01T00:00:00+00:00',
+        'seeds': [42], 'n_seeds': 1, 'backends': {},
+        'provenance_source': 'sidecar', 'error': None,
+    }
+    cross = {
+        'section': 'source_audit', 'source': 'cross_source',
+        'status': 'comparable', 'comparable_for_ranking': True,
+        'n_sources_requested': 1, 'n_sources_readable': 1,
+        'missing_sources': [], 'missing_provenance': [],
+        'git_commits': [commit], 'dirty_sources': [],
+        'seed_status': 'shared', 'shared_seeds': [42],
+        'n_shared_seeds': 1, 'backends_consistent': True,
+        'backend_mismatches': [], 'warnings': [],
+    }
+    return [
+        {'section': 'budget_curve', 'row_kind': 'op', 'geometry': 'mqar',
+         'T': 16, 'name': 'csa', 'total_read_elements': 100.0},
+        {'section': 'budget_curve', 'row_kind': 'layout', 'geometry': 'mqar',
+         'T': 16, 'name': '3:1:1', 'ratio': [3, 1, 1],
+         'total_read_elements': 120.0},
+        {'section': 'decode_budget_curve', 'row_kind': 'op',
+         'geometry': 'mqar', 't': 16, 'name': 'csa',
+         'total_read_elements': 100.0},
+        {'section': 'decode_sweep', 'csa_topk': 0, 'prefill_len': 256,
+         'n_decode': 2, 'repeats': 1, 'prefill_ms': 1.0,
+         'mean_decode_ms_per_token': 0.5,
+         'total_read_elements_per_query': 100.0},
+        {'section': 'quality_join', 'source': 'exp5_ablation',
+         'label': '3:1:1', 'context_T': 16, 'mean_acc': 0.5,
+         'ci95_acc': 0.01, 'n_seeds_ok': 1, 'mean_fwd_ms': None,
+         'total_read_elements_per_query': 120.0,
+         'source_git_commit': commit, 'source_git_dirty': False,
+         'source_seeds': [42], 'source_sha256': '0' * 64,
+         'source_schema_version': '0.0'},
+        {'section': 'ranking_summary', 'geometry': 'mqar', 'context_T': 16,
+         'decode_budget_position': 16, 'n_layouts': 3,
+         'labels': ['3:1:1', '4:1:0', '2:1:2'],
+         'layout_order_by_budget_ascending': ['3:1:1', '4:1:0', '2:1:2'],
+         'layout_order_by_decode_budget_ascending': ['4:1:0', '3:1:1',
+                                                     '2:1:2'],
+         'spearman_acc_vs_budget': 0.5,
+         'spearman_acc_vs_decode_budget': -0.5,
+         'source_comparability': 'comparable', 'source_git_commits': [commit],
+         'source_shared_seeds': [42], 'comparable_across_sources': True},
+        audit, cross,
+    ]
+
+
+def test_row_contract_exp9_audits_cross_source_ranking():
+    rows = _exp9_contract_rows()
+    assert rs.validate_rows('exp9_budget_frontier', rows, {}) == []
+    # A mixed-revision verdict must name at least two commits.
+    bad = [dict(r) for r in rows]
+    bad[-1] = dict(bad[-1], status='mixed_revisions')
+    violations = rs.validate_rows('exp9_budget_frontier', bad, {})
+    assert any('mixed_revisions' in v for v in violations), violations
+    # Ranking rows cannot claim comparability with a non-bool flag.
+    bad = [dict(r) for r in rows]
+    idx = next(i for i, r in enumerate(bad)
+               if r['section'] == 'ranking_summary')
+    bad[idx] = dict(bad[idx], comparable_across_sources='yes')
+    assert any('comparable_across_sources' in v for v in
+               rs.validate_rows('exp9_budget_frontier', bad, {}))
+    # Every joined source needs a source_audit row.
+    bad = [r for r in rows if r.get('source') != 'exp5_ablation'
+           or r['section'] != 'source_audit']
+    violations = rs.validate_rows('exp9_budget_frontier', bad, {})
+    assert any('no audit row' in v for v in violations), violations

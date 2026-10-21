@@ -47,6 +47,7 @@ from ops_mamba import (Mamba2Mixer, build_mamba2_mixer, chunked_mamba2_scan,
                        mamba2_scan_boundary_metadata, naive_mamba2_scan)
 from ops_mamba_backend import validate_mamba_backend
 from timing_stats import summarize_timings_s
+from results_schema import RowContractError, validate_rows
 import ops_kda
 
 logger = logging.getLogger(__name__)
@@ -912,6 +913,14 @@ def main():
         ops_kda._KDA_NONFINITE_WARN = prev_nonfinite_warn
 
     os.makedirs('results', exist_ok=True)
+    violations = validate_rows('exp2_benchmark', results)
+    if violations:
+        shown = '; '.join(violations[:5])
+        more = (f' (+{len(violations) - 5} more)'
+                if len(violations) > 5 else '')
+        raise RowContractError(
+            f'exp2_benchmark: {len(violations)} row-contract violation(s): '
+            f'{shown}{more}')
     try:
         write_json_atomic(results, 'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)

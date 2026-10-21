@@ -110,7 +110,7 @@ from kv_budget import (
 from results_schema import detect_version as detect_schema_version
 from results_schema import load as load_schema
 from results_schema import parse as parse_schema
-from results_schema import write as write_schema
+from results_schema import write_checked as write_schema
 from run_ablation import _make_cfg
 from run_decoding import HybridDecoding, bench_decoding
 from run_kv_cache import DEFAULTS as PAPER_DEFAULTS

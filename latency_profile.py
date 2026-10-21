@@ -423,7 +423,7 @@ def _resolve_device(requested: str | None) -> str:
 
 def _write_json(path: str, profile: dict) -> None:
     """Write the profile as a versioned ``results_schema`` envelope."""
-    from results_schema import write as write_results
+    from results_schema import write_checked as write_results
     from kaggle_setup import capture_provenance
     geometry = profile['geometry']
     metadata = {

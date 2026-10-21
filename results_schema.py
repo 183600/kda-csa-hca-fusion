@@ -523,6 +523,59 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
         if peak is not None and not (_finite_number(peak) and float(peak) >= 0):
             out.append(f"{where}: 'peak_mem_MB' must be null or finite >= 0, "
                        f'got {peak!r}')
+        if 'decode_ci95_low_ms' in row:
+            ci_keys = (
+                'prefill_mean_ms', 'prefill_std_ms', 'prefill_q10_ms',
+                'prefill_q90_ms', 'prefill_ci95_low_ms',
+                'prefill_ci95_high_ms', 'prefill_ci95_halfwidth_ms',
+                'prefill_cv', 'prefill_n', 'decode_std_ms', 'decode_q10_ms',
+                'decode_q90_ms', 'decode_ci95_low_ms',
+                'decode_ci95_high_ms', 'decode_ci95_halfwidth_ms',
+                'decode_cv', 'decode_n', 'timing_ci_method',
+                'timing_bootstrap_reps')
+            for key in ci_keys:
+                if key not in row:
+                    out.append(f"{where}: missing uncertainty field {key!r}")
+            for prefix, median_key in (('prefill', 'prefill_ms'),
+                                       ('decode',
+                                        'median_decode_ms_per_token')):
+                vals = [row.get(f'{prefix}_{suffix}') for suffix in (
+                    'q10_ms', 'q90_ms', 'ci95_low_ms', 'ci95_high_ms',
+                    'ci95_halfwidth_ms')]
+                if all(_finite_number(v) for v in vals):
+                    q10, q90, lo, hi, half = map(float, vals)
+                    med = row.get(median_key)
+                    if not (q10 <= float(med) <= q90):
+                        out.append(f'{where}: {prefix} median outside '
+                                   f'[q10, q90]')
+                    if lo > hi:
+                        out.append(f'{where}: {prefix} CI bounds reversed')
+                    if abs(half - (hi - lo) / 2.0) > 1e-9:
+                        out.append(f'{where}: {prefix} ci95_halfwidth != '
+                                   f'(high-low)/2')
+                for key in (f'{prefix}_std_ms', f'{prefix}_cv'):
+                    value = row.get(key)
+                    if not (_finite_number(value) and float(value) >= 0):
+                        out.append(f"{where}: {key!r} must be finite >= 0")
+            n_prefill, n_decode = row.get('prefill_n'), row.get('decode_n')
+            if not (isinstance(n_prefill, int)
+                    and not isinstance(n_prefill, bool)
+                    and n_prefill == row.get('repeats')):
+                out.append(f'{where}: prefill_n must equal repeats, '
+                           f'got {n_prefill!r}')
+            if not (isinstance(n_decode, int)
+                    and not isinstance(n_decode, bool)
+                    and isinstance(row.get('repeats'), int)
+                    and isinstance(row.get('n_decode'), int)
+                    and n_decode == row['repeats'] * row['n_decode']):
+                out.append(f'{where}: decode_n must equal '
+                           f'repeats * n_decode, got {n_decode!r}')
+            if not isinstance(row.get('timing_ci_method'), str) \
+                    or not row['timing_ci_method']:
+                out.append(f"{where}: 'timing_ci_method' must be a string")
+            if not _positive_int(row.get('timing_bootstrap_reps')):
+                out.append(f"{where}: 'timing_bootstrap_reps' must be a "
+                           f"positive int")
         # Decode-state certificate fields (optional for legacy rows, but
         # checked when present): valid bytes must be a positive int,
         # allocated >= valid, and the breakdown must be a mapping.
@@ -1136,6 +1189,405 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
         if key in seen:
             out.append(f'{where}: duplicate key {key!r}')
         seen.add(key)
+    return out
+
+
+def _nonnegative_int(value) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0)
+
+
+def _is_hex_sha256(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in '0123456789abcdef' for c in value.lower()))
+
+
+_EXP2_TIMING_KEYS = (
+    'time_ms', 'time_min_ms', 'time_max_ms', 'time_std_ms',
+    'time_mean_ms', 'time_q10_ms', 'time_q90_ms',
+    'time_ci95_low_ms', 'time_ci95_high_ms', 'time_ci95_halfwidth_ms',
+    'time_cv',
+)
+
+
+@register_row_contract('exp2_benchmark')
+def _validate_exp2_rows(rows: list, metadata: dict) -> list[str]:
+    """Latency benchmark: unique (op, T) cells with ordered interval stats.
+
+    New rows carry a bootstrap CI95 and quantiles; legacy rows (schema
+    0.0) are accepted without them, but as soon as a row declares
+    ``time_ci_method`` the full uncertainty block must be present and
+    internally ordered. A failed cell is still identified by (op, T) and
+    may carry only the error text.
+    """
+    out: list[str] = []
+    seen: set = set()
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        T, op = row.get('T'), row.get('op')
+        if not _positive_int(T):
+            out.append(f"{where}: 'T' must be a positive int, got {T!r}")
+        if not isinstance(op, str) or not op:
+            out.append(f"{where}: 'op' must be a non-empty string, got {op!r}")
+        if _positive_int(T) and isinstance(op, str) and op:
+            key = (op, T)
+            if key in seen:
+                out.append(f'{where}: duplicate (op, T)={key!r}')
+            seen.add(key)
+        if not isinstance(row.get('device'), str) or not row.get('device'):
+            out.append(f"{where}: 'device' must be a non-empty string, "
+                       f"got {row.get('device')!r}")
+        if 'error' in row:
+            if not isinstance(row['error'], str) or not row['error']:
+                out.append(f"{where}: 'error' must be a non-empty string")
+            continue
+        if not _positive_int(row.get('repeats')):
+            out.append(f"{where}: 'repeats' must be a positive int, "
+                       f"got {row.get('repeats')!r}")
+        base_keys = ('time_ms', 'time_min_ms', 'time_max_ms', 'time_std_ms')
+        modern = 'time_ci_method' in row
+        for key in base_keys + (_EXP2_TIMING_KEYS[4:] if modern else ()):
+            value = row.get(key)
+            if not (_finite_number(value) and float(value) >= 0):
+                out.append(f"{where}: {key!r} must be finite and >= 0, "
+                           f'got {value!r}')
+        if modern and all(_finite_number(row.get(k))
+                          for k in _EXP2_TIMING_KEYS):
+            lo, hi = row['time_ci95_low_ms'], row['time_ci95_high_ms']
+            med = row['time_ms']
+            if not (float(lo) <= float(hi)):
+                out.append(f'{where}: time_ci95_low_ms > time_ci95_high_ms')
+            if not (float(row['time_q10_ms']) <= float(med)
+                    <= float(row['time_q90_ms'])):
+                out.append(f'{where}: median outside [q10, q90]')
+            if not (float(row['time_min_ms']) <= float(med)
+                    <= float(row['time_max_ms'])):
+                out.append(f'{where}: median outside [min, max]')
+            half = (float(hi) - float(lo)) / 2.0
+            if abs(float(row['time_ci95_halfwidth_ms']) - half) > 1e-9:
+                out.append(f'{where}: ci95_halfwidth != (high-low)/2')
+            if not (isinstance(row.get('time_n'), int)
+                    and not isinstance(row['time_n'], bool)
+                    and row['time_n'] == row['repeats']
+                    and row['time_n'] >= 1):
+                out.append(f'{where}: time_n must equal repeats (>= 2), '
+                           f"got {row.get('time_n')!r}")
+            if not isinstance(row.get('time_ci_method'), str) \
+                    or not row['time_ci_method']:
+                out.append(f"{where}: 'time_ci_method' must be a string")
+            if not _positive_int(row.get('time_bootstrap_reps')):
+                out.append(f"{where}: 'time_bootstrap_reps' must be a "
+                           f"positive int, got {row.get('time_bootstrap_reps')!r}")
+    return out
+
+
+@register_row_contract('mamba2_scan_latency_profile')
+def _validate_latency_profile_rows(rows: list, metadata: dict) -> list[str]:
+    """SSD scan profiler: one row per (T, mode, chunk_size), parity-gated.
+
+    A non-sequential row's parity certificate must be internally
+    consistent (``parity_ok`` implies finite and ``parity_max_abs <=
+    parity_tol`` from the envelope metadata). Timing rows carry the same
+    bootstrap CI block as Exp 2.
+    """
+    out: list[str] = []
+    seen: set = set()
+    meta = metadata if isinstance(metadata, dict) else {}
+    tol = meta.get('parity_tol')
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        T, mode, chunk = row.get('T'), row.get('mode'), row.get('chunk_size')
+        if not _positive_int(T):
+            out.append(f"{where}: 'T' must be a positive int, got {T!r}")
+        if mode not in ('sequential', 'chunked', 'quadratic'):
+            out.append(f'{where}: mode={mode!r} not in '
+                       f"'sequential'/'chunked'/'quadratic'")
+        if mode == 'chunked' and not _positive_int(chunk):
+            out.append(f"{where}: chunked row needs a positive chunk_size, "
+                       f'got {chunk!r}')
+        key = (T, mode, chunk)
+        if key in seen:
+            out.append(f'{where}: duplicate (T, mode, chunk_size)={key!r}')
+        seen.add(key)
+        for fld in ('time_ms', 'time_min_ms', 'time_max_ms', 'time_std_ms'):
+            value = row.get(fld)
+            if not (_finite_number(value) and float(value) >= 0):
+                out.append(f"{where}: {fld!r} must be finite and >= 0, "
+                           f'got {value!r}')
+        if all(_finite_number(row.get(k)) for k in
+               ('time_ms', 'time_q10_ms', 'time_q90_ms',
+                'time_ci95_low_ms', 'time_ci95_high_ms')):
+            if not (float(row['time_q10_ms']) <= float(row['time_ms'])
+                    <= float(row['time_q90_ms'])):
+                out.append(f'{where}: median outside [q10, q90]')
+            if float(row['time_ci95_low_ms']) > float(row['time_ci95_high_ms']):
+                out.append(f'{where}: CI bounds are reversed')
+            if not (isinstance(row.get('n'), int)
+                    and not isinstance(row['n'], bool) and row['n'] >= 1):
+                out.append(f"{where}: 'n' must be an int >= 1, "
+                           f"got {row.get('n')!r}")
+        times = row.get('times_ms')
+        if times is not None:
+            if not isinstance(times, list) or not times:
+                out.append(f"{where}: 'times_ms' must be a non-empty list")
+            elif not all(_finite_number(t) and float(t) >= 0 for t in times):
+                out.append(f'{where}: times_ms must contain finite >= 0 values')
+            elif isinstance(row.get('n'), int) and row['n'] != len(times):
+                out.append(f'{where}: n={row["n"]} != len(times_ms)={len(times)}')
+        finite = row.get('finite')
+        if not isinstance(finite, bool):
+            out.append(f"{where}: 'finite' must be a bool, got {finite!r}")
+        parity = row.get('parity_max_abs')
+        if not (_finite_number(parity) and float(parity) >= 0):
+            out.append(f"{where}: 'parity_max_abs' must be finite and >= 0, "
+                       f'got {parity!r}')
+        ok = row.get('parity_ok')
+        if not isinstance(ok, bool):
+            out.append(f"{where}: 'parity_ok' must be a bool, got {ok!r}")
+        elif isinstance(finite, bool) and _finite_number(parity):
+            want = finite and (tol is None or float(parity) <= float(tol))
+            if ok != want:
+                out.append(f'{where}: parity_ok={ok} contradicts finite/'
+                           f'parity_max_abs={parity} vs tol={tol}')
+    return out
+
+
+_EXP9_SECTIONS = frozenset({
+    'budget_curve', 'decode_budget_curve', 'decode_sweep', 'quality_join',
+    'ranking_summary', 'source_audit'})
+_EXP9_AUDIT_STATUSES = frozenset({
+    'comparable', 'comparable_dirty_tree', 'mixed_revisions',
+    'provenance_missing', 'no_shared_seeds', 'mixed_backends',
+    'sources_missing', 'no_sources'})
+
+
+@register_row_contract('exp9_budget_frontier')
+def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
+    """Budget frontier: analytic curves, measured sweep, audited join.
+
+    New files carry ``source_audit`` rows; the contract validates them
+    and cross-checks the quality-join/ranking rows against the recorded
+    comparability verdict. Legacy files without the audit still pass the
+    structural curve checks, but cannot claim a cross-source ranking
+    (the ranking rows are checked only when they carry the new fields).
+    """
+    out: list[str] = []
+    seen: set = set()
+    audit_cross = None
+    audit_sources: set = set()
+    join_sources: set = set()
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        section = row.get('section')
+        if section not in _EXP9_SECTIONS:
+            out.append(f'{where}: section={section!r} not in '
+                       f'{sorted(_EXP9_SECTIONS)}')
+            continue
+        if section in ('budget_curve', 'decode_budget_curve'):
+            kind = row.get('row_kind')
+            if kind not in ('op', 'layout'):
+                out.append(f"{where}: row_kind must be 'op'|'layout', "
+                           f'got {kind!r}')
+            if not isinstance(row.get('geometry'), str) or not row['geometry']:
+                out.append(f"{where}: 'geometry' must be a non-empty string")
+            t_key = 'T' if section == 'budget_curve' else 't'
+            if not _positive_int(row.get(t_key)):
+                out.append(f"{where}: {t_key!r} must be a positive int, "
+                           f"got {row.get(t_key)!r}")
+            name = row.get('name')
+            if not isinstance(name, str) or not name:
+                out.append(f"{where}: 'name' must be a non-empty string")
+            if not (_finite_number(row.get('total_read_elements'))
+                    and float(row['total_read_elements']) >= 0):
+                out.append(f"{where}: total_read_elements must be finite >= 0")
+            if kind == 'layout':
+                ratio = row.get('ratio')
+                if not (isinstance(ratio, list) and len(ratio) == 3
+                        and all(_nonnegative_int(x) for x in ratio)
+                        and sum(ratio) > 0):
+                    out.append(f"{where}: layout ratio must be 3 non-negative "
+                               f'ints with positive sum, got {ratio!r}')
+                elif isinstance(name, str) and name != ':'.join(map(str, ratio)):
+                    out.append(f'{where}: name {name!r} != ratio {ratio!r}')
+            key = (section, row.get('geometry'), t_key, row.get(t_key),
+                   kind, name)
+        elif section == 'decode_sweep':
+            if not _nonnegative_int(row.get('csa_topk')):
+                out.append(f"{where}: csa_topk must be a non-negative int, "
+                           f"got {row.get('csa_topk')!r}")
+            for fld in ('prefill_len', 'n_decode', 'repeats'):
+                if not _positive_int(row.get(fld)):
+                    out.append(f"{where}: {fld!r} must be a positive int, "
+                               f"got {row.get(fld)!r}")
+            if 'error' in row:
+                key = ('decode_sweep', row.get('csa_topk'),
+                       row.get('prefill_len'))
+                if key in seen:
+                    out.append(f'{where}: duplicate key {key!r}')
+                seen.add(key)
+                continue
+            for fld in ('prefill_ms', 'mean_decode_ms_per_token',
+                        'total_read_elements_per_query'):
+                value = row.get(fld)
+                if not (_finite_number(value) and float(value) >= 0):
+                    out.append(f"{where}: {fld!r} must be finite >= 0, "
+                               f'got {value!r}')
+            key = ('decode_sweep', row.get('csa_topk'), row.get('prefill_len'))
+        elif section == 'quality_join':
+            source = row.get('source')
+            if not isinstance(source, str) or not source:
+                out.append(f"{where}: 'source' must be a non-empty string")
+            elif source not in ('exp4_mqar', 'exp5_ablation',
+                                'exp8_mechanism_ablation'):
+                out.append(f'{where}: unknown source {source!r}')
+            else:
+                join_sources.add(source)
+            if not isinstance(row.get('label'), str) or not row['label']:
+                out.append(f"{where}: 'label' must be a non-empty string")
+            if not _positive_int(row.get('context_T')):
+                out.append(f"{where}: 'context_T' must be a positive int")
+            if not _finite_number(row.get('mean_acc')):
+                out.append(f"{where}: 'mean_acc' must be finite")
+            if not (_finite_number(row.get('total_read_elements_per_query'))
+                    and float(row['total_read_elements_per_query']) >= 0):
+                out.append(f'{where}: total_read_elements_per_query must be '
+                           f'finite >= 0')
+            commit = row.get('source_git_commit')
+            if commit is not None and not isinstance(commit, str):
+                out.append(f"{where}: source_git_commit must be null or str")
+            seeds = row.get('source_seeds')
+            if seeds is not None and not (isinstance(seeds, list)
+                                          and all(_nonnegative_int(s)
+                                                  for s in seeds)):
+                out.append(f"{where}: source_seeds must be a list of ints")
+            key = ('quality_join', source, row.get('label'))
+        elif section == 'ranking_summary':
+            if 'skipped_reason' in row:
+                if not isinstance(row['skipped_reason'], str):
+                    out.append(f"{where}: skipped_reason must be a string")
+                key = ('ranking_summary', 'skipped')
+            else:
+                if not isinstance(row.get('geometry'), str):
+                    out.append(f"{where}: 'geometry' must be a string")
+                if not _positive_int(row.get('context_T')):
+                    out.append(f"{where}: 'context_T' must be a positive int")
+                n_layouts = row.get('n_layouts')
+                if not (_positive_int(n_layouts) and int(n_layouts) >= 3):
+                    out.append(f"{where}: n_layouts must be >= 3, "
+                               f'got {n_layouts!r}')
+                labels = row.get('labels')
+                if not (isinstance(labels, list) and labels
+                        and all(isinstance(x, str) and x for x in labels)):
+                    out.append(f"{where}: labels must be a non-empty list of "
+                               f'non-empty strings')
+                elif _positive_int(n_layouts) and len(labels) != n_layouts:
+                    out.append(f'{where}: len(labels) != n_layouts')
+                for fld in ('layout_order_by_budget_ascending',
+                            'layout_order_by_decode_budget_ascending'):
+                    seq = row.get(fld)
+                    if not (isinstance(seq, list) and len(seq) == len(labels)):
+                        out.append(f'{where}: {fld} must match len(labels)')
+                for fld in ('spearman_acc_vs_budget',
+                            'spearman_acc_vs_decode_budget'):
+                    value = row.get(fld)
+                    if value is not None and not (
+                            _finite_number(value)
+                            and -1.0 <= float(value) <= 1.0):
+                        out.append(f"{where}: {fld} must be in [-1, 1] or null")
+                if 'comparable_across_sources' in row and not isinstance(
+                        row['comparable_across_sources'], bool):
+                    out.append(f'{where}: comparable_across_sources must be '
+                               f'a bool')
+                key = ('ranking_summary', row.get('geometry'),
+                       row.get('context_T'), row.get('decode_budget_position'))
+        else:  # source_audit
+            source = row.get('source')
+            if not isinstance(source, str) or not source:
+                out.append(f"{where}: 'source' must be a non-empty string")
+            if source == 'cross_source':
+                audit_cross = row
+                status = row.get('status')
+                if status not in _EXP9_AUDIT_STATUSES:
+                    out.append(f'{where}: status={status!r} not in '
+                               f'{sorted(_EXP9_AUDIT_STATUSES)}')
+                if not isinstance(row.get('comparable_for_ranking'), bool):
+                    out.append(f'{where}: comparable_for_ranking must be bool')
+                elif status in ('comparable', 'comparable_dirty_tree')                         and row['comparable_for_ranking'] is not True:
+                    out.append(f'{where}: status={status} must allow ranking')
+                elif status not in ('comparable', 'comparable_dirty_tree')                         and row['comparable_for_ranking'] is not False:
+                    out.append(f'{where}: status={status} must block ranking')
+                for fld in ('missing_sources', 'missing_provenance',
+                            'git_commits', 'dirty_sources', 'shared_seeds',
+                            'warnings'):
+                    if not isinstance(row.get(fld), list):
+                        out.append(f'{where}: {fld!r} must be a list')
+                for fld in ('n_sources_requested', 'n_sources_readable'):
+                    if not _nonnegative_int(row.get(fld)):
+                        out.append(f'{where}: {fld!r} must be a non-negative '
+                                   f'int')
+                key = ('source_audit', 'cross_source')
+            else:
+                if isinstance(source, str) and source:
+                    audit_sources.add(source)
+                if not isinstance(row.get('path'), str) or not row['path']:
+                    out.append(f"{where}: 'path' must be a non-empty string")
+                for fld in ('exists', 'readable'):
+                    if not isinstance(row.get(fld), bool):
+                        out.append(f'{where}: {fld!r} must be a bool')
+                if not _nonnegative_int(row.get('n_rows')):
+                    out.append(f"{where}: 'n_rows' must be a non-negative int")
+                if row.get('readable') is True:
+                    if not isinstance(row.get('schema_version'), str):
+                        out.append(f"{where}: readable row needs schema_version")
+                    if not _is_hex_sha256(row.get('sha256')):
+                        out.append(f"{where}: readable row needs a sha256")
+                    if not isinstance(row.get('seeds'), list) or not all(
+                            _nonnegative_int(s) for s in row['seeds']):
+                        out.append(f"{where}: seeds must be a list of ints")
+                    if row.get('n_seeds') != len(row.get('seeds') or []):
+                        out.append(f"{where}: n_seeds != len(seeds)")
+                    if not isinstance(row.get('backends'), dict):
+                        out.append(f"{where}: backends must be an object")
+                if row.get('git_dirty') is not None and not isinstance(
+                        row['git_dirty'], bool):
+                    out.append(f'{where}: git_dirty must be null or bool')
+                if row.get('git_commit') is not None and not isinstance(
+                        row['git_commit'], str):
+                    out.append(f'{where}: git_commit must be null or str')
+                key = ('source_audit', source)
+        if key in seen:
+            out.append(f'{where}: duplicate key {key!r}')
+        seen.add(key)
+
+    if audit_cross is not None:
+        status = audit_cross.get('status')
+        commits = audit_cross.get('git_commits') or []
+        shared = audit_cross.get('shared_seeds') or []
+        if status == 'mixed_revisions' and len(commits) < 2:
+            out.append('source_audit: mixed_revisions needs >= 2 git commits')
+        if status in ('comparable', 'comparable_dirty_tree') \
+                and len(commits) != 1:
+            out.append('source_audit: comparable status needs exactly one '
+                       'git commit')
+        if status == 'no_shared_seeds' and shared:
+            out.append('source_audit: no_shared_seeds but shared_seeds is '
+                       'non-empty')
+        if status in ('comparable', 'comparable_dirty_tree') \
+                and not shared:
+            out.append('source_audit: comparable status needs shared seeds')
+        missing_audit = sorted(join_sources - audit_sources)
+        if missing_audit:
+            out.append('source_audit: joined source(s) '
+                       f'{missing_audit} have no audit row')
     return out
 
 
