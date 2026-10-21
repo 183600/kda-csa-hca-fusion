@@ -1043,6 +1043,7 @@ def multiclass_classification_metrics(pred, target, *, num_classes: int | None =
             'precision_weighted': None, 'recall_weighted': None,
             'f1_weighted': None,
             'per_class': [], 'class_balance': None,
+            'imbalance_note': None,
             'averaging_note': _AVERAGING_NOTE,
         }
 
