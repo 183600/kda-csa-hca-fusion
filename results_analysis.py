@@ -657,6 +657,12 @@ LM_ERROR_CATEGORIES = OrderedDict([
 
 _LM_ERROR_CATEGORY_ORDER = tuple(LM_ERROR_CATEGORIES)
 
+# The two categories that are NOT errors: a 'correct' prediction is by
+# definition not a mistake, and an 'ignored' position is masked out of the
+# loss entirely.  They are part of the position partition, so they carry a
+# share of ALL positions, but they contribute NO share of the wrong ones.
+_LM_NON_ERROR_CATEGORIES = frozenset(('correct', 'ignored'))
+
 
 def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
                          input_ids: torch.Tensor, *, top_k: int = 5,
@@ -818,10 +824,18 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
     cat_report = OrderedDict()
     for name, definition in LM_ERROR_CATEGORIES.items():
         c = counts.get(name, 0)
+        # 'rate_of_wrong' is the share of the WRONG tokens that fall into
+        # this category.  'correct' and 'ignored' are not errors, so they
+        # contribute no share of them (dividing their count by ``n_wrong``
+        # reported e.g. "67% of the errors were masked positions" and could
+        # exceed 1.0 on padding-heavy batches).  The error categories still
+        # sum to exactly 1.
+        is_error = name not in _LM_NON_ERROR_CATEGORIES
         cat_report[name] = {
             'count': int(c),
             'rate_of_all': (c / n_all) if n_all else 0.0,
-            'rate_of_wrong': (c / n_wrong) if n_wrong else 0.0,
+            'rate_of_wrong': ((c / n_wrong)
+                              if (n_wrong and is_error) else 0.0),
             'definition': definition,
         }
 

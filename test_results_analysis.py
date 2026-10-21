@@ -584,6 +584,39 @@ def test_lm_token_diagnostics_masked_and_empty():
     json.dumps(s0, allow_nan=False)
 
 
+def test_rate_of_wrong_only_covers_error_categories():
+    """'rate_of_wrong' is the share of the WRONG tokens per category.
+
+    'correct' and 'ignored' complete the position partition but are not
+    errors: a correct prediction is not a mistake and an ignored position
+    is masked out of the loss. Dividing their counts by the error count
+    reported nonsense (e.g. "67% of the errors were masked positions",
+    and a rate above 1.0 on padding-heavy batches).
+    """
+    vocab = 4
+    logits = torch.stack([
+        _row_logits(vocab, 2, 1),   # correct
+        _row_logits(vocab, 1, 2),   # near_miss
+        _row_logits(vocab, 3, 2),   # near_miss
+        _row_logits(vocab, 1, 2),
+    ]).unsqueeze(0)
+    labels = torch.tensor([[2, 1, 3, 1]])
+    d = lm_token_diagnostics(logits, labels, torch.tensor([[1, 2, 3, 4]]))
+    s = summarize_lm_diagnostics(d)
+    cats = s['categories']
+    assert s['n_wrong'] == 3
+    # The error categories still partition the wrong tokens exactly.
+    error_total = sum(cats[name]['rate_of_wrong']
+                      for name in cats if name not in ('correct', 'ignored'))
+    assert error_total == pytest.approx(1.0)
+    # The non-error categories contribute no share of the wrong tokens.
+    assert cats['correct']['rate_of_wrong'] == 0.0
+    assert cats['ignored']['rate_of_wrong'] == 0.0
+    # Every category's rate_of_wrong stays within [0, 1].
+    for name, v in cats.items():
+        assert 0.0 <= v['rate_of_wrong'] <= 1.0, (name, v)
+
+
 class _FixedLogitModel(torch.nn.Module):
     """Deterministic LM stand-in: logits depend only on the input ids."""
 
