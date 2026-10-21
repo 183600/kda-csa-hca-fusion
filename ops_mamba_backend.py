@@ -160,11 +160,11 @@ def _build_official_mamba2(cfg) -> nn.Module:
     from ops_mamba import resolve_mamba_dt_rank
     kwargs: dict[str, Any] = {
         'd_model': cfg.d_model,
-        'd_state': int(getattr(cfg, 'mamba_d_state', 64)),
-        'd_conv': int(getattr(cfg, 'mamba_d_conv', 4)),
-        'expand': int(getattr(cfg, 'mamba_expand', 2)),
-        'headdim': int(getattr(cfg, 'mamba_headdim', 64)),
-        'ngroups': int(getattr(cfg, 'mamba_ngroups', 1)),
+        'd_state': getattr(cfg, 'mamba_d_state', 64),
+        'd_conv': getattr(cfg, 'mamba_d_conv', 4),
+        'expand': getattr(cfg, 'mamba_expand', 2),
+        'headdim': getattr(cfg, 'mamba_headdim', 64),
+        'ngroups': getattr(cfg, 'mamba_ngroups', 1),
         'dt_rank': resolve_mamba_dt_rank(
             getattr(cfg, 'mamba_dt_rank', 'auto'), cfg.d_model),
         # The wrapper manages inference state itself; layer_idx=0 keeps the
@@ -269,25 +269,25 @@ class OfficialMamba2Mixer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         from ops_mamba import validate_mamba2_geometry
+        d_state = getattr(cfg, 'mamba_d_state', 64)
+        d_conv = getattr(cfg, 'mamba_d_conv', 4)
+        expand = getattr(cfg, 'mamba_expand', 2)
+        headdim = getattr(cfg, 'mamba_headdim', 64)
+        ngroups = getattr(cfg, 'mamba_ngroups', 1)
         geo = validate_mamba2_geometry(
-            cfg.d_model,
-            int(getattr(cfg, 'mamba_d_state', 64)),
-            int(getattr(cfg, 'mamba_d_conv', 4)),
-            int(getattr(cfg, 'mamba_expand', 2)),
-            int(getattr(cfg, 'mamba_headdim', 64)),
-            int(getattr(cfg, 'mamba_ngroups', 1)),
+            cfg.d_model, d_state, d_conv, expand, headdim, ngroups,
             getattr(cfg, 'mamba_dt_rank', 'auto'))
         self.d_model = cfg.d_model
-        self.d_state = int(getattr(cfg, 'mamba_d_state', 64))
-        self.d_conv = int(getattr(cfg, 'mamba_d_conv', 4))
-        self.ngroups = int(getattr(cfg, 'mamba_ngroups', 1))
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.ngroups = ngroups
         self.d_inner = geo['d_inner']
         self.nheads = geo['nheads']
         # ``validate_mamba2_geometry`` returns the derived sizes, not the
         # configured headdim; read it from the config exactly like the
         # reference mixer does (the geometry check already proved it
         # divides d_inner).
-        self.headdim = int(getattr(cfg, 'mamba_headdim', 64))
+        self.headdim = headdim
         # Official conv channels: xBC = x + the B/C projections.
         self.conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         self.backend = 'official'

@@ -205,6 +205,7 @@ def test_memory_mixers_reject_coerced_integer_config_fields():
     validators are strict; the constructors must hand them the raw values.
     """
     from ops_mamba import Mamba2Mixer
+    from ops_mamba_backend import OfficialMamba2Mixer
     from ops_rwkv import Rwkv7Mixer
 
     rwkv_ok = SimpleNamespace(d_model=64, rwkv_head_dim=16)
@@ -223,6 +224,8 @@ def test_memory_mixers_reject_coerced_integer_config_fields():
          SimpleNamespace(d_model=8, mamba_d_state=1.5)),
         ('Mamba d_conv string', Mamba2Mixer,
          SimpleNamespace(d_model=8, mamba_d_conv='4')),
+        ('official Mamba d_state float', OfficialMamba2Mixer,
+         SimpleNamespace(d_model=8, mamba_d_state=1.5)),
     )
     for name, ctor, cfg in cases:
         try:
