@@ -92,9 +92,9 @@ def causal_block_entries(T: int, m: int) -> int:
     NEXT block — and a query never sees its own block through the sparse
     branch (the sliding-window branch serves that local context).
     """
-    if not isinstance(T, int) or T < 0:
+    if not isinstance(T, int) or isinstance(T, bool) or T < 0:
         raise ValueError(f'T must be a non-negative int, got {T!r}')
-    if not isinstance(m, int) or m < 1:
+    if not isinstance(m, int) or isinstance(m, bool) or m < 1:
         raise ValueError(f'm must be a positive int, got {m!r}')
     if T == 0:
         return 0
@@ -111,8 +111,10 @@ def causal_block_entries(T: int, m: int) -> int:
 
 def geometric_capacity(n_rows: int) -> int:
     """Return the power-of-two storage capacity used by decode caches."""
-    if not isinstance(n_rows, int) or n_rows < 0:
-        raise ValueError(f'n_rows must be a non-negative int, got {n_rows!r}')
+    if (not isinstance(n_rows, int) or isinstance(n_rows, bool)
+            or n_rows < 0):
+        raise ValueError(
+            f'n_rows must be a non-negative int, got {n_rows!r}')
     if n_rows == 0:
         return 0
     return 1 << (n_rows - 1).bit_length()
@@ -124,11 +126,12 @@ def causal_selected_entries(T: int, m: int, topk: int) -> int:
     Uses the paper-exact strictly-preceding mask (Eq. 16): query ``t``
     selects from ``floor(t / m)`` visible blocks, capped at ``topk``.
     """
-    if not isinstance(T, int) or T < 0:
+    if not isinstance(T, int) or isinstance(T, bool) or T < 0:
         raise ValueError(f'T must be a non-negative int, got {T!r}')
-    if not isinstance(m, int) or m < 1:
+    if not isinstance(m, int) or isinstance(m, bool) or m < 1:
         raise ValueError(f'm must be a positive int, got {m!r}')
-    if not isinstance(topk, int) or topk < 0:
+    if (not isinstance(topk, int) or isinstance(topk, bool)
+            or topk < 0):
         raise ValueError(f'topk must be a non-negative int, got {topk!r}')
     if T == 0 or topk == 0:
         return 0
@@ -167,6 +170,9 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
                                  capacity + indexer key cache + partial-token
                                  accumulators + CSA overlap state + sink.
     """
+    if not isinstance(T, int) or isinstance(T, bool) or T < 0:
+        raise ValueError(
+            f'kv_cache_elements: T must be a non-negative int, got {T!r}.')
     p = {**DEFAULTS, **kw}
     _valid_keys = set(DEFAULTS.keys())
     _unknown = set(kw.keys()) - _valid_keys

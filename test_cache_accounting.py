@@ -289,6 +289,46 @@ def test_geometric_capacity_contract():
     _ok('_geometric_capacity validation', bad == 3, f'raised={bad}')
 
 
+def test_run_kv_cache_validation():
+    """Public cache-accounting helpers reject bool / non-int geometry."""
+    print("\nTest: run_kv_cache helper validation")
+    from run_kv_cache import (causal_block_entries,
+                              causal_selected_entries)
+
+    cases = [
+        ('geometric_capacity(True)', lambda: geometric_capacity(True)),
+        ('causal_block_entries(True, 4)',
+         lambda: causal_block_entries(True, 4)),
+        ('causal_block_entries(4, True)',
+         lambda: causal_block_entries(4, True)),
+        ('causal_selected_entries(True, 4, 2)',
+         lambda: causal_selected_entries(True, 4, 2)),
+        ('causal_selected_entries(4, 4, True)',
+         lambda: causal_selected_entries(4, 4, True)),
+        ('kv_cache_elements(T=-1)',
+         lambda: kv_cache_elements('csa', -1)),
+        ('kv_cache_elements(T=True)',
+         lambda: kv_cache_elements('csa', True)),
+        ('kv_cache_elements(T=1.5)',
+         lambda: kv_cache_elements('csa', 1.5)),
+    ]
+    bad = 0
+    for _name, fn in cases:
+        try:
+            fn()
+        except (TypeError, ValueError):
+            bad += 1
+    _ok('all invalid geometry raises', bad == len(cases),
+        f'raised={bad}/{len(cases)}')
+    zero_cache = kv_cache_elements('csa', 0, mode='compressed_kv_only')
+    _ok('T=0 remains valid',
+        geometric_capacity(0) == 0
+        and causal_block_entries(0, 4) == 0
+        and causal_selected_entries(0, 4, 2) == 0
+        and isinstance(zero_cache, int) and zero_cache >= 0,
+        f'kv_cache_elements={zero_cache!r}')
+
+
 def test_autograd_hygiene_and_bounded_graph():
     """Decode caches are detached; retained graph is BOUNDED across steps."""
     print("\nTest: decode autograd hygiene + bounded graph growth")
@@ -503,6 +543,7 @@ _TEST_FUNCS = [
     test_kv_cache_breakdown_reconciles_in_both_modes,
     test_live_equals_analytic_for_every_fill_history,
     test_geometric_capacity_contract,
+    test_run_kv_cache_validation,
     test_autograd_hygiene_and_bounded_graph,
     test_paper_aligned_bytes,
     test_lcm_packing_and_full_report,
