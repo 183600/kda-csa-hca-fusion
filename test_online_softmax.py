@@ -107,10 +107,88 @@ def test_masked_reference_matches_dense_reference():
         f'max|d|={(out - ref).abs().max().item():.2e}')
 
 
+def test_positive_infinity_scores_use_the_softmax_limit():
+    """``+inf`` scores must not turn the online state/merge into NaN."""
+    B, H, T, N, D = 1, 2, 4, 4, 4
+    torch.manual_seed(11)
+    q = torch.zeros(B, H, T, D)
+    k = torch.zeros(B, H, N, D)
+    v = torch.randn(B, H, N, D)
+    # Query 1 sees key 1 as +inf; the other rows are ordinary finite rows.
+    q[:, :, 1, :] = 1e20
+    k[:, :, 1, :] = 1e20
+    sink = torch.zeros(H)
+    ref = online_softmax_attention(q, k, v, sink_logits=sink, key_chunk=0)
+    _ok('single +inf row selects that value',
+        bool((ref[:, :, 1] - v[:, :, 1]).abs().max() == 0.0),
+        f'max|d|={(ref[:, :, 1] - v[:, :, 1]).abs().max().item():.2e}')
+    _ok('output is finite', bool(torch.isfinite(ref).all()))
+    for key_chunk in (1, 2, 3):
+        out = online_softmax_attention(q, k, v, sink_logits=sink,
+                                       key_chunk=key_chunk)
+        _ok(f'key_chunk={key_chunk} finite rows match (merge rounding)',
+            bool((out - ref).abs().max() < 1e-5),
+            f'max|d|={(out - ref).abs().max().item():.2e}')
+        _ok(f'key_chunk={key_chunk} keeps the +inf row exact',
+            bool((out[:, :, 1] - v[:, :, 1]).abs().max() == 0.0),
+            f'max|d|={(out[:, :, 1] - v[:, :, 1]).abs().max().item():.2e}')
+
+    # A huge but finite sink must still lose to the +inf score.
+    out = online_softmax_attention(q, k, v,
+                                   sink_logits=torch.full((H,), 1e30),
+                                   key_chunk=2)
+    _ok('sink cannot take mass from a +inf row',
+        bool((out[:, :, 1] - v[:, :, 1]).abs().max() == 0.0),
+        f'max|d|={(out[:, :, 1] - v[:, :, 1]).abs().max().item():.2e}')
+
+    # Two +inf keys in different chunks: merging must add both states.
+    k2 = k.clone()
+    k2[:, :, 2, :] = 1e20
+    expected = (v[:, :, 1] + v[:, :, 2]) / 2
+    for key_chunk in (0, 1, 2, 3):
+        out = online_softmax_attention(q, k2, v, sink_logits=sink,
+                                       key_chunk=key_chunk)
+        _ok(f'key_chunk={key_chunk} averages two +inf keys',
+            bool((out[:, :, 1] - expected).abs().max() < 1e-6),
+            f'max|d|={(out[:, :, 1] - expected).abs().max().item():.2e}')
+
+    # Gradients through a batch containing a +inf row must stay finite.
+    qg = q.clone().requires_grad_()
+    kg = k2.clone().requires_grad_()
+    vg = v.clone().requires_grad_()
+    loss = online_softmax_attention(qg, kg, vg, sink_logits=sink,
+                                    key_chunk=1).sum()
+    loss.backward()
+    grads = {'q': qg.grad, 'k': kg.grad, 'v': vg.grad}
+    for name, grad in grads.items():
+        _ok(f'+inf row: grad_{name} finite',
+            bool(torch.isfinite(grad).all()),
+            f'max|g|={grad.abs().max().item():.2e}')
+
+
+def test_all_positive_infinity_scores_average_all_values():
+    """An all-``+inf`` row is uniform over every key, not NaN."""
+    B, H, T, N, D = 1, 1, 2, 3, 4
+    torch.manual_seed(13)
+    q = torch.zeros(B, H, T, D)
+    k = torch.zeros(B, H, N, D)
+    v = torch.randn(B, H, N, D)
+    q[:, :, 1, :] = 1e20
+    k[:, :, :, :] = 1e20
+    expected = v.mean(dim=2)
+    for key_chunk in (0, 1, 2):
+        out = online_softmax_attention(q, k, v, key_chunk=key_chunk)
+        _ok(f'key_chunk={key_chunk} uniforms the all-+inf row',
+            bool((out[:, :, 1] - expected).abs().max() < 1e-6),
+            f'max|d|={(out[:, :, 1] - expected).abs().max().item():.2e}')
+
+
 _TEST_FUNCS = [
     test_singleton_key_axis_mask_survives_key_chunking,
     test_materialized_masks_are_still_sliced_per_chunk,
     test_masked_reference_matches_dense_reference,
+    test_positive_infinity_scores_use_the_softmax_limit,
+    test_all_positive_infinity_scores_average_all_values,
 ]
 
 

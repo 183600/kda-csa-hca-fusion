@@ -75,6 +75,24 @@ def online_softmax_merge(state_a: tuple, state_b: tuple) -> tuple:
     a_b = _shrink(m_b - m)
     den = den_a * a_a + den_b * a_b
     acc = acc_a * a_a + acc_b * a_b
+    # A row containing ``+inf`` scores puts all its mass on those entries,
+    # so a state with ``m == +inf`` dominates any finite state and two
+    # ``+inf`` states add. The carry factors above are 0 (or NaN turned
+    # into 0 by ``_shrink``) for these rows, so replace their state here
+    # instead of losing the mass.
+    pos_inf_a = torch.isposinf(m_a)
+    pos_inf_b = torch.isposinf(m_b)
+    pos_inf = pos_inf_a | pos_inf_b
+    if bool(pos_inf.any()):
+        both = pos_inf_a & pos_inf_b
+        den_inf = torch.where(
+            both, den_a + den_b,
+            torch.where(pos_inf_a, den_a, den_b))
+        acc_inf = torch.where(
+            both, acc_a + acc_b,
+            torch.where(pos_inf_a, acc_a, acc_b))
+        den = torch.where(pos_inf, den_inf, den)
+        acc = torch.where(pos_inf, acc_inf, acc)
     return m, den, acc
 
 
@@ -117,8 +135,26 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 f'{mask.dtype}.')
         scores = scores.masked_fill(~mask, _NEG_INF)
     m = scores.amax(dim=-1, keepdim=True)
-    shifted = scores - m
-    p = torch.where(torch.isneginf(m), torch.zeros_like(shifted), shifted.exp())
+    pos_inf = torch.isposinf(scores)
+    has_pos_inf = pos_inf.any(dim=-1, keepdim=True)
+    if bool(has_pos_inf.any()):
+        # ``+inf`` scores make ``scores - m`` an ``inf - inf`` NaN. Keep
+        # the ordinary softmax for finite rows and use the limit (mass
+        # split evenly over the +inf entries) on the others. Empty rows
+        # also get a finite shift so the discarded ``exp`` branch cannot
+        # poison backward.
+        empty = torch.isneginf(m)
+        special = empty | has_pos_inf
+        m_safe = torch.where(special, torch.zeros_like(m), m)
+        shifted = scores - m_safe
+        shifted = torch.where(special, torch.zeros_like(shifted), shifted)
+        p = shifted.exp()
+        p = torch.where(empty, torch.zeros_like(p), p)
+        p = torch.where(has_pos_inf, pos_inf.to(p.dtype), p)
+    else:
+        shifted = scores - m
+        p = torch.where(torch.isneginf(m), torch.zeros_like(shifted),
+                        shifted.exp())
     den = p.sum(dim=-1, keepdim=True)
     acc = torch.einsum('b h t n, b h n d -> b h t d', p, v)
     return m, den, acc
@@ -176,18 +212,22 @@ def online_softmax_finalize(m: torch.Tensor, den: torch.Tensor,
     ``ops_csa``.  Rows with no valid entry (``den == 0``) return zeros.
     """
     empty = (den == 0)
-    # Substitute a finite state for all-empty rows BEFORE forming the
-    # exponent. Their output is zeroed at the end anyway, but with the raw
-    # ``m == -inf`` / ``den == 0`` pair the expression evaluates
-    # ``-inf - (-inf)`` (or ``-inf - log(0)``), and the NaN/Inf produced by
-    # ``exp`` poisons the backward pass even though ``torch.where`` selects
-    # the zero branch forward.
-    m_safe = torch.where(empty, torch.zeros_like(m), m)
+    pos_inf = torch.isposinf(m)
+    # Substitute a finite state for all-empty and ``+inf``-max rows BEFORE
+    # forming the exponent. Empty rows are zeroed at the end anyway, and a
+    # ``+inf`` row is the softmax limit ``acc / den`` (the sink is
+    # irrelevant because its finite logit loses to the +inf scores).
+    # Without the substitution ``-inf - (-inf)`` / ``inf - inf`` produces a
+    # NaN/Inf that poisons the backward pass even though ``torch.where``
+    # discards that branch forward.
+    special = empty | pos_inf
+    m_safe = torch.where(special, torch.zeros_like(m), m)
     den_safe = torch.where(empty, torch.ones_like(den), den)
     log_denom = m_safe + torch.log(
         den_safe.clamp_min(torch.finfo(den.dtype).tiny))
     if sink_logits is not None:
         sink = _align_sink_logits(sink_logits, m)
+        sink = torch.where(pos_inf, torch.full_like(sink, _NEG_INF), sink)
         log_denom = torch.logaddexp(log_denom, sink)
     out = acc * (m_safe - log_denom).exp()
     return torch.where(empty.expand_as(out), torch.zeros_like(out), out)
