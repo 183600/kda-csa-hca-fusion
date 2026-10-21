@@ -28,6 +28,17 @@ untouched; any future raw-w backend adapter MUST document its
 conversion in one place (here). ``rwkv7_reference_scan`` also consumes
 log-decay and applies ``exp()`` exactly once.
 
+**Keyword spelling across FLA revisions.** The chunked kernel names the
+decay argument differently depending on the installed distribution:
+``RWKV-Vibe/rwkv-fla`` exposes ``log_w=`` (pass-through) next to a raw
+``w=`` that it converts internally, while mainline
+``flash-linear-attention`` names the log-decay ``w=`` and has no
+``log_w`` at all. The adapter therefore reads the installed signature
+(:func:`_chunk_decay_param`) and forwards the log-decay under whichever
+keyword that revision expects — forwarding ``w=`` to the fork would
+convert the decay a second time, and forwarding ``log_w=`` to mainline
+leaves its required ``w`` unbound.
+
 **State layout.** The fla kernels use ``[B, H, K, V]`` (rows = key dim,
 columns = value dim) — the same layout as the reference scan in
 ``ops_rwkv.py`` — so the adapter transposes nothing. (The BlinkDL demo
@@ -50,8 +61,10 @@ requirement). :func:`rwkv7_fla_available` therefore checks for the
 
 from __future__ import annotations
 
+import inspect
 import sys
 import warnings
+from typing import Any
 
 import torch
 
@@ -64,6 +77,12 @@ _FLA_RECURRENT_FN = None
 _FLA_IMPORT_ERROR: Exception | None = None
 _FLA_PROBED = False
 _FLA_MODULE = None
+
+# ``inspect.signature`` is introspection-heavy and the accepted keyword set
+# of an installed FLA operator cannot change while the function object is
+# alive, so the decay-keyword classification is computed once per function
+# (a decode loop dispatches through here on every token).
+_DECAY_PARAM_CACHE: dict[Any, str] = {}
 
 
 def validate_rwkv_backend(backend: str) -> str:
@@ -167,6 +186,46 @@ def resolve_rwkv_backend(requested: str) -> str:
     return 'reference'
 
 
+def _chunk_decay_param(chunk_fn) -> str:
+    """Return the keyword that carries the log-decay into ``chunk_fn``.
+
+    The chunked RWKV-7 kernel has two upstream spellings for the decay:
+
+    * ``RWKV-Vibe/rwkv-fla`` (the fork this repo cites for the
+      parameterization) — ``chunk_rwkv7(r, k, v, a, b, w=None, log_w=None)``.
+      ``log_w`` carries the log-decay and is forwarded **unchanged**; ``w``
+      is a RAW pre-activation that the kernel converts internally
+      (``log_w = -exp(w)``).
+    * mainline ``flash-linear-attention`` (the version ``pyproject.toml``
+      pins) — ``chunk_rwkv7(r, w, k, v, a, b)`` where ``w`` IS the
+      log-decay (``gk=w``, forwarded unchanged).
+
+    Both spellings expect the SAME log-decay from this module, so the
+    keyword is chosen from the INSTALLED signature: forwarding ``w=`` to
+    the fork would apply the ``-exp()`` conversion a second time and
+    silently change the decay; forwarding ``log_w=`` to mainline is
+    swallowed by its ``**kwargs`` and leaves the required ``w`` unbound.
+    """
+    cached = _DECAY_PARAM_CACHE.get(chunk_fn)
+    if cached is not None:
+        return cached
+    try:
+        params = inspect.signature(chunk_fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if 'log_w' in params:
+        param = 'log_w'
+    elif 'w' in params:
+        param = 'w'
+    else:
+        # Signature not introspectable (a compiled wrapper): keep the
+        # documented fork contract.  A mainline kernel then raises
+        # TypeError, which the 'auto' path surfaces as a fallback.
+        param = 'log_w'
+    _DECAY_PARAM_CACHE[chunk_fn] = param
+    return param
+
+
 def _fla_rwkv7_scan(
     r: torch.Tensor,
     log_w: torch.Tensor,
@@ -211,13 +270,17 @@ def _fla_rwkv7_scan(
             output_final_state=output_final_state,
         )
         return o, state
-    o, state = chunk_fn(
-        r=r, log_w=log_w, k=k, v=v,
+    # The decay keyword differs between the two upstream spellings; both
+    # receive the log-decay unchanged (see :func:`_chunk_decay_param`).
+    chunk_kwargs = dict(
+        r=r, k=k, v=v,
         a=-kk, b=kk * a,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
     )
+    chunk_kwargs[_chunk_decay_param(chunk_fn)] = log_w
+    o, state = chunk_fn(**chunk_kwargs)
     return o, state
 
 

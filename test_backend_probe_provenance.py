@@ -284,6 +284,73 @@ def test_rwkv_adapter_dispatch_uses_kernel_convention():
                 'chunk' in calls, f'calls={sorted(calls)}')
 
 
+def test_rwkv_chunk_decay_keyword_matches_installed_signature():
+    """The chunk kernel's decay keyword follows the INSTALLED signature.
+
+    Two upstream spellings exist for the chunked RWKV-7 kernel:
+
+    * ``RWKV-Vibe/rwkv-fla``: ``chunk_rwkv7(r, k, v, a, b, w=None,
+      log_w=None)`` — ``log_w`` carries the log-decay (pass-through) while
+      ``w`` is a raw pre-activation the kernel converts internally
+      (``log_w = -exp(w)``);
+    * mainline ``flash-linear-attention``: ``chunk_rwkv7(r, w, k, v, a, b)``
+      where ``w`` IS the log-decay and no ``log_w`` exists.
+
+    Forwarding ``log_w=`` to mainline leaves its required ``w`` unbound
+    (TypeError -> the 'fla' backend crashes and 'auto' never accelerates),
+    and forwarding ``w=`` to the fork converts the decay a second time.
+    The adapter must therefore read the installed signature.
+    """
+    calls: dict = {}
+
+    def fork_chunk_fn(r, k, v, a, b, w=None, log_w=None, scale=1.0,
+                      initial_state=None, output_final_state=True):
+        calls['fork'] = {'w': w, 'log_w': log_w, 'a': a, 'b': b}
+        return r * 0.0 + 7.0, r * 0.0 + 1.0
+
+    def mainline_chunk_fn(r, w, k, v, a, b, scale=1.0, initial_state=None,
+                          output_final_state=False, **kwargs):
+        calls['mainline'] = {'w': w, 'log_w': kwargs.get('log_w'),
+                             'a': a, 'b': b}
+        return r * 0.0 + 8.0, r * 0.0 + 1.0
+
+    def recurrent_fn(**kwargs):
+        return kwargs['r'] * 0.0 + 9.0, kwargs['r'] * 0.0 + 2.0
+
+    B, T, H, N = 1, 5, 2, 3
+    torch.manual_seed(3)
+    r = torch.randn(B, T, H, N)
+    log_w = -0.1 * torch.ones(B, T, H, N)
+    k = torch.randn(B, T, H, N)
+    v = torch.randn(B, T, H, N)
+    kk = torch.randn(B, T, H, N)
+    a = torch.sigmoid(torch.randn(B, T, H, N))
+
+    with _reset_rwkv_cache() as rb, _injected_modules(
+            _fake_fla_ops_rwkv7(fork_chunk_fn, recurrent_fn)):
+        rb.rwkv7_forward(r, log_w, k, v, kk, a, backend='fla')
+        kw = calls.get('fork', {})
+        _ok('fork spelling receives the log-decay as log_w',
+            torch.equal(kw.get('log_w'), log_w)
+            and kw.get('w') is None, f'{ {k: None if v is None else "tensor" for k, v in kw.items()} }')
+        _ok('fork spelling still forms a_op=-kk, b_op=kk*a',
+            torch.equal(kw.get('a'), -kk)
+            and torch.equal(kw.get('b'), kk * a), '')
+
+    calls.clear()
+    with _reset_rwkv_cache() as rb, _injected_modules(
+            _fake_fla_ops_rwkv7(mainline_chunk_fn, recurrent_fn)):
+        rb.rwkv7_forward(r, log_w, k, v, kk, a, backend='fla')
+        kw = calls.get('mainline', {})
+        _ok('mainline spelling receives the log-decay as w',
+            torch.equal(kw.get('w'), log_w), '')
+        _ok('mainline spelling never sends a log_w keyword',
+            kw.get('log_w') is None, f'{kw.get("log_w")!r}')
+        _ok('mainline spelling still forms a_op=-kk, b_op=kk*a',
+            torch.equal(kw.get('a'), -kk)
+            and torch.equal(kw.get('b'), kk * a), '')
+
+
 def test_rwkv_auto_fallback_surface_and_oom_reraise():
     """TypeError drift falls back with a warning; CUDA OOM is re-raised."""
     mode = {'fail': 'type'}
@@ -601,6 +668,7 @@ def test_csa_overlapped_recompression_across_chunkings(device='cpu'):
 if __name__ == '__main__':
     test_rwkv_broken_install_probe_never_raises_or_poisons()
     test_rwkv_adapter_dispatch_uses_kernel_convention()
+    test_rwkv_chunk_decay_keyword_matches_installed_signature()
     test_rwkv_auto_fallback_surface_and_oom_reraise()
     test_mamba_broken_install_probe_and_actionable_error()
     test_mamba_official_constructor_filtering_and_transfer()
