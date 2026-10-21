@@ -814,6 +814,14 @@ def _chunk_kda_prepare(
                                   else compute_dtype)
             S = S.to(target_state_dtype)
         return {'early': True, 'o': o.to(dtype), 'S': S}
+    # Clamp the REAL gates before padding. The padded steps carry g=0
+    # (an identity decay); clamping zeros up to a positive ``g_clamp_min``
+    # would instead make every padded step decay the state by
+    # ``exp(g_clamp_min) > 1``, corrupting the returned final state when
+    # ``T % chunk_size != 0``. The clamp is out of place so the caller's
+    # ``g`` is never mutated.
+    if g_clamp_min > -float('inf'):
+        g = g.clamp(min=float(g_clamp_min))
     pad = (-T) % BT
     if pad:
         q    = F.pad(q,    (0, 0, 0, 0, 0, pad))
@@ -827,9 +835,6 @@ def _chunk_kda_prepare(
         scale = K ** -0.5
 
     compute_dtype = _compute_dtype(dtype)
-    # ``g`` joins the in-place clamp below only when the rearrange+cast (or
-    # the pad copy above) already produced a tensor this function owns.
-    g_owned = (g.dtype != compute_dtype) or bool(pad)
     q, k = [_to_contig_compute(
         rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT), compute_dtype)
         for x in [q, k]]
@@ -856,11 +861,6 @@ def _chunk_kda_prepare(
         else:
             q.mul_(scale)
         k = k.repeat_interleave(G, dim=1)
-    if g_clamp_min > -float('inf'):
-        if g_owned:
-            g = g.clamp_(min=float(g_clamp_min))
-        else:
-            g = g.clamp(min=float(g_clamp_min))
     g = g.cumsum(-2)
 
     # NOTE: the main diagonal AND the strict upper triangle of the raw

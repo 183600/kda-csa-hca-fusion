@@ -271,6 +271,32 @@ def test_assoc_scan_initial_state_and_empty(device):
     assert s3.dtype == torch.float64
 
 
+def test_chunk_padding_is_identity_with_positive_gate_floor(device):
+    """Padded steps must not clamp their synthetic g=0 up to a positive floor.
+
+    ``T % chunk_size != 0`` pads ``g`` with zeros, which are identity decay
+    steps. Applying a positive ``g_clamp_min`` after padding turns them into
+    ``exp(g_clamp_min) > 1`` decays and corrupts the returned final state.
+    """
+    B, T, H, K, V = 1, 5, 1, 2, 2
+    q = torch.ones(B, T, H, K, device=device)
+    k = torch.full((B, T, H, K), K ** -0.5, device=device)
+    v = torch.full((B, T, H, V), 0.1, device=device)
+    g = torch.ones(B, T, H, K, device=device)
+    beta = torch.full((B, T, H), 0.1, device=device)
+    state = torch.ones(B, H, K, V, device=device)
+    _, s_rec = naive_recurrent_kda(
+        q, k, v, g, beta, initial_state=state, output_final_state=True,
+        g_clamp_min=1.0)
+    for fn in (naive_chunk_kda, assoc_scan_chunk_kda):
+        _, s_chunk = fn(
+            q, k, v, g, beta, initial_state=state, output_final_state=True,
+            chunk_size=4, g_clamp_min=1.0)
+        torch.testing.assert_close(
+            s_chunk, s_rec, rtol=1e-5, atol=1e-5,
+            msg=lambda m: f'{fn.__name__}: {m}')
+
+
 def test_kda_forward_assoc_scan_adapter(device):
     """``kda_forward(assoc_scan=...)`` routes to the scan on the chunk path."""
     q, k, v, g, beta = _make_case(82, 1, 64, 1, 8, 8, device=device)
