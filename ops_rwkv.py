@@ -569,14 +569,15 @@ class Rwkv7Mixer(nn.Module):
                  n_rwkv_layers: int = 1):
         super().__init__()
         d_model = getattr(cfg, 'd_model', None)
-        if not isinstance(d_model, int) or d_model < 1:
+        if not isinstance(d_model, int) or isinstance(d_model, bool) \
+                or d_model < 1:
             raise ValueError(
                 f"Rwkv7Mixer: cfg.d_model={d_model!r} must be a positive int.")
         self.d_model = d_model
-        self.head_dim = int(getattr(cfg, 'rwkv_head_dim', 64))
-        self.decay_lora = int(getattr(cfg, 'rwkv_decay_lora', 32))
-        self.a_lora = int(getattr(cfg, 'rwkv_a_lora', 32))
-        self.gate_lora = int(getattr(cfg, 'rwkv_gate_lora', 64))
+        self.head_dim = getattr(cfg, 'rwkv_head_dim', 64)
+        self.decay_lora = getattr(cfg, 'rwkv_decay_lora', 32)
+        self.a_lora = getattr(cfg, 'rwkv_a_lora', 32)
+        self.gate_lora = getattr(cfg, 'rwkv_gate_lora', 64)
         # Backend selection is validated eagerly (typo -> immediate
         # error before any parameters are allocated); the optional FLA
         # import stays lazy inside ops_rwkv_backend (mirrors the
@@ -588,14 +589,20 @@ class Rwkv7Mixer(nn.Module):
         geo = validate_rwkv7_geometry(
             d_model, self.head_dim, self.decay_lora, self.a_lora,
             self.gate_lora)
+        self.head_dim = geo['head_dim']
+        self.decay_lora = geo['decay_lora']
+        self.a_lora = geo['a_lora']
+        self.gate_lora = geo['gate_lora']
         self.n_heads = geo['n_heads']
 
-        if not isinstance(rwkv_layer_idx, int) or rwkv_layer_idx < 0:
+        if (not isinstance(rwkv_layer_idx, int)
+                or isinstance(rwkv_layer_idx, bool) or rwkv_layer_idx < 0):
             raise ValueError(
                 f"Rwkv7Mixer: rwkv_layer_idx={rwkv_layer_idx!r} must be a "
                 f"non-negative int.")
-        if not isinstance(n_rwkv_layers, int) or n_rwkv_layers < 1 \
-                or rwkv_layer_idx >= n_rwkv_layers:
+        if (not isinstance(n_rwkv_layers, int)
+                or isinstance(n_rwkv_layers, bool) or n_rwkv_layers < 1
+                or rwkv_layer_idx >= n_rwkv_layers):
             raise ValueError(
                 f"Rwkv7Mixer: n_rwkv_layers={n_rwkv_layers!r} must be >= 1 "
                 f"and rwkv_layer_idx={rwkv_layer_idx} must be < "

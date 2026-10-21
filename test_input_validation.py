@@ -35,6 +35,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -195,6 +196,52 @@ def test_csa_decode_step_validates_indexer_operands():
             _ok(f'{name} rejected', False, f'{type(exc).__name__}: {exc}')
 
 
+def test_memory_mixers_reject_coerced_integer_config_fields():
+    """RWKV-7 / Mamba-2 config ints are validated, not ``int()``-truncated.
+
+    The constructors used to cast optional geometry fields with ``int(...)``,
+    so ``rwkv_head_dim=1.5`` silently became 1 (a different model), a
+    numeric string was accepted, and ``True`` became 1. The algebra
+    validators are strict; the constructors must hand them the raw values.
+    """
+    from ops_mamba import Mamba2Mixer
+    from ops_rwkv import Rwkv7Mixer
+
+    rwkv_ok = SimpleNamespace(d_model=64, rwkv_head_dim=16)
+    Rwkv7Mixer(rwkv_ok)  # the valid contract still works
+    mamba_ok = SimpleNamespace(
+        d_model=8, mamba_d_state=4, mamba_d_conv=2, mamba_expand=2,
+        mamba_headdim=8, mamba_ngroups=1)
+    Mamba2Mixer(mamba_ok)
+
+    cases = (
+        ('RWKV head_dim float', Rwkv7Mixer,
+         SimpleNamespace(d_model=64, rwkv_head_dim=1.5)),
+        ('RWKV head_dim string', Rwkv7Mixer,
+         SimpleNamespace(d_model=64, rwkv_head_dim='16')),
+        ('Mamba d_state float', Mamba2Mixer,
+         SimpleNamespace(d_model=8, mamba_d_state=1.5)),
+        ('Mamba d_conv string', Mamba2Mixer,
+         SimpleNamespace(d_model=8, mamba_d_conv='4')),
+    )
+    for name, ctor, cfg in cases:
+        try:
+            ctor(cfg)
+            _ok(f'{name} rejected', False, 'no error raised')
+        except ValueError:
+            _ok(f'{name} rejected', True, '')
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'{name} rejected', False, f'{type(exc).__name__}: {exc}')
+
+    try:
+        Rwkv7Mixer(SimpleNamespace(d_model=64, rwkv_head_dim=16),
+                   rwkv_layer_idx=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('boolean rwkv_layer_idx was silently accepted')
+
+
 if __name__ == '__main__':
     test_gated_delta_rule_rejects_geometry_mismatch()
     test_gated_delta_rule_step_rejects_unknown_gate_type()
@@ -202,4 +249,5 @@ if __name__ == '__main__':
     test_online_softmax_rejects_non_boolean_mask()
     test_decoding_cache_to_rejects_non_float_storage_dtype()
     test_csa_decode_step_validates_indexer_operands()
+    test_memory_mixers_reject_coerced_integer_config_fields()
     print('all input-validation tests passed')

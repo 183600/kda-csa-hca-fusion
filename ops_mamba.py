@@ -1027,7 +1027,7 @@ def chunked_mamba2_scan(
         x, dt, B, C, A, D, initial_state, 'chunked_mamba2_scan')
     batch, seqlen = v['batch'], v['seqlen']
     nheads, headdim = v['nheads'], v['headdim']
-    ngroups, d_state = v['ngroups'], v['d_state']
+    d_state = v['d_state']
     heads_per_group = v['heads_per_group']
     compute_dtype = v['compute_dtype']
     S0 = v['state']
@@ -1235,15 +1235,16 @@ class Mamba2Mixer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         d_model = getattr(cfg, 'd_model', None)
-        if not isinstance(d_model, int) or d_model < 1:
+        if not isinstance(d_model, int) or isinstance(d_model, bool) \
+                or d_model < 1:
             raise ValueError(
                 f"Mamba2Mixer: cfg.d_model={d_model!r} must be a positive int.")
         self.d_model = d_model
-        self.d_state = int(getattr(cfg, 'mamba_d_state', 64))
-        self.d_conv = int(getattr(cfg, 'mamba_d_conv', 4))
-        self.expand = int(getattr(cfg, 'mamba_expand', 2))
-        self.headdim = int(getattr(cfg, 'mamba_headdim', 64))
-        self.ngroups = int(getattr(cfg, 'mamba_ngroups', 1))
+        self.d_state = getattr(cfg, 'mamba_d_state', 64)
+        self.d_conv = getattr(cfg, 'mamba_d_conv', 4)
+        self.expand = getattr(cfg, 'mamba_expand', 2)
+        self.headdim = getattr(cfg, 'mamba_headdim', 64)
+        self.ngroups = getattr(cfg, 'mamba_ngroups', 1)
         dt_rank_cfg = getattr(cfg, 'mamba_dt_rank', 'auto')
         # Backend selection is validated eagerly (typo -> immediate error,
         # before any parameters are allocated) but the optional official
