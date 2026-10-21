@@ -348,8 +348,9 @@ def test_hardware_from_gpu_monkeypatched_gpu(monkeypatch):
     """A real CUDA device anchors peak bandwidth and sets gpu_anchored."""
 
     class FakeProps:
+        # Attribute names must match torch's ``_CudaDeviceProperties``.
         memory_clock_rate = 8000  # kHz
-        bus_width = 4096  # bits
+        memory_bus_width = 4096  # bits
 
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'get_device_properties',
@@ -361,6 +362,18 @@ def test_hardware_from_gpu_monkeypatched_gpu(monkeypatch):
     # peak_tflops / link are left nominal (require kernel measurement).
     assert hw.peak_tflops == pytest.approx(60.0)
     assert hw.link_bw_gbps == pytest.approx(300.0)
+
+    # A device that does not report the clock / bus width cannot anchor the
+    # model, so the nominal bandwidth is kept and the provenance flag stays
+    # False (the anchor must not be claimed when it did not happen).
+    class BareProps:
+        name = 'FakeGPU'
+
+    monkeypatch.setattr(torch.cuda, 'get_device_properties',
+                        lambda device: BareProps())
+    hw_bare = tp.HardwareModel.from_gpu('auto')
+    assert hw_bare.gpu_anchored is False
+    assert hw_bare.peak_bw_gbps == pytest.approx(3000.0)
 
     # Explicit nominal mode never touches torch.cuda.
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)

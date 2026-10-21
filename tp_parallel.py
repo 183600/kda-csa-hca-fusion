@@ -899,7 +899,9 @@ class HardwareModel:
         when CUDA is available the device's reported memory clock and bus
         width anchor ``peak_bw_gbps`` and ``gpu_anchored=True``; when CUDA is
         unavailable (CPU hosts, CI) it returns the nominal defaults with
-        ``gpu_anchored=False``.
+        ``gpu_anchored=False``.  ``gpu_anchored`` stays ``False`` when the
+        device does not report the clock / bus width, so the flag never
+        overstates the provenance of the returned model.
 
         ``peak_tflops`` and ``link_bw_gbps`` are deliberately left nominal:
         ``torch.cuda`` exposes neither per-SM core counts (needed for an
@@ -917,14 +919,23 @@ class HardwareModel:
             return cls()
         props = torch.cuda.get_device_properties(0)
         peak_bw = float(cls().peak_bw_gbps)
+        # NOTE: torch exposes the bus width as ``memory_bus_width`` on
+        # ``_CudaDeviceProperties`` (there is no ``bus_width`` attribute);
+        # reading the wrong name silently disabled the anchor and left the
+        # nominal H100 bandwidth in place on every real GPU.
         mem_clock = getattr(props, 'memory_clock_rate', None)
-        bus_width = getattr(props, 'bus_width', None)
+        bus_width = getattr(props, 'memory_bus_width', None)
+        anchored = False
         if mem_clock is not None and bus_width is not None and bus_width > 0:
             # GB/s = (kHz * 1e3 cycles/s) * (bits / 8 bytes/bit) / 1e9.
             peak_bw = float(mem_clock) * 1e3 * float(bus_width) / 8.0 / 1e9
             if not math.isfinite(peak_bw) or peak_bw <= 0:
                 peak_bw = float(cls().peak_bw_gbps)
-        return cls(peak_bw_gbps=peak_bw, gpu_anchored=True)
+            else:
+                anchored = True
+        # ``gpu_anchored`` is a provenance flag: only claim the model is
+        # device-anchored when the device actually supplied the numbers.
+        return cls(peak_bw_gbps=peak_bw, gpu_anchored=anchored)
 
 
 def ring_allreduce_ms(nbytes: float, tp_size: int,
