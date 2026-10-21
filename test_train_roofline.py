@@ -240,6 +240,37 @@ def test_forward_with_policy_state_threading():
         gc.forward_with_policy(stack, x2, lookbacks=[None])
 
 
+def test_forward_with_policy_matches_state_guards():
+    """Batch changes drop the state and detach_state controls BPTT."""
+    cfg = tiny_cfg()
+    stack = build_stack(cfg)
+    x1 = torch.randn(BATCH, T, cfg.d_model)
+    _, state, _ = stack.forward_functional(
+        x1, None, [None] * stack.n_memory_layers)
+
+    # A batch-size change invalidates the per-sequence state; both entry
+    # points must fall back to a fresh sequence instead of mixing rows.
+    x2 = torch.randn(BATCH + 1, T, cfg.d_model)
+    out_ref, _, _ = stack.forward_functional(
+        x2, None, [None] * stack.n_memory_layers)
+    out, _, _ = gc.forward_with_policy(stack, x2, state=state)
+    assert torch.equal(out, out_ref)
+
+    # detach_state=False must leave the incoming state on the graph.
+    x3 = torch.randn(BATCH, T, cfg.d_model)
+    live = state.detach().requires_grad_(True)
+    out, _, _ = gc.forward_with_policy(stack, x3, state=live,
+                                       detach_state=False)
+    out.sum().backward()
+    assert live.grad is not None and live.grad.abs().sum() > 0
+
+    detached = state.detach().requires_grad_(True)
+    out, _, _ = gc.forward_with_policy(stack, x3, state=detached,
+                                       detach_state=True)
+    out.sum().backward()
+    assert detached.grad is None
+
+
 # ---------------------------------------------------------------------------
 # runner payload
 # ---------------------------------------------------------------------------

@@ -249,6 +249,7 @@ def forward_with_policy(stack, x: torch.Tensor, *, policy: str = 'none',
                         state: torch.Tensor | None = None,
                         lookbacks: list | None = None,
                         probe: SavedBytesProbe | None = None,
+                        detach_state: bool = True,
                         detach_lookback: bool = True,
                         preserve_rng_state: bool = False,
                         ) -> tuple[torch.Tensor, torch.Tensor | None, list]:
@@ -260,6 +261,11 @@ def forward_with_policy(stack, x: torch.Tensor, *, policy: str = 'none',
     Layers selected by the policy are wrapped in non-reentrant
     ``torch.utils.checkpoint``; the pure functional layer calls make the
     recompute safe (no module-state mutation).
+
+    ``detach_state`` mirrors the stack argument of the same name: the
+    incoming stacked memory state is detached by default and is dropped when
+    its batch size no longer matches ``x``. Pass ``detach_state=False`` to
+    carry the autograd graph across chunks (cross-chunk BPTT).
     """
     policy = parse_policy(policy)
     n_mem = stack.n_memory_layers
@@ -270,7 +276,17 @@ def forward_with_policy(stack, x: torch.Tensor, *, policy: str = 'none',
             raise ValueError(
                 f"forward_with_policy: state has {state.shape[0]} layers "
                 f"but the stack has {n_mem} memory layers.")
-        states = list(state.unbind(0))
+        if state.shape[1] != x.shape[0]:
+            # Batch size changed between calls: the per-sequence state is
+            # invalid. Mirror HybridAttentionStack.forward_functional and
+            # fall back to a fresh sequence rather than mixing rows.
+            states = [None] * n_mem
+        else:
+            if state.device != x.device:
+                state = state.to(device=x.device)
+            if detach_state:
+                state = state.detach()
+            states = list(state.unbind(0))
     if lookbacks is None:
         lookback_list = [None] * n_mem
     else:
@@ -313,6 +329,18 @@ def forward_with_policy(stack, x: torch.Tensor, *, policy: str = 'none',
         x = residual + o
 
     if n_mem > 0:
+        if any(s is None for s in states):
+            raise RuntimeError(
+                "forward_with_policy: a memory layer returned new_state=None "
+                "despite output_final_state=True. Refusing to persist a "
+                "partial state stack.")
+        ref_shape = tuple(states[0].shape)
+        for i, s in enumerate(states):
+            if tuple(s.shape) != ref_shape:
+                raise RuntimeError(
+                    f"forward_with_policy: memory layer {i} returned "
+                    f"new_state with shape {tuple(s.shape)} but layer 0 "
+                    f"returned shape {ref_shape}.")
         new_state = torch.stack(states, dim=0)
     else:
         new_state = None
