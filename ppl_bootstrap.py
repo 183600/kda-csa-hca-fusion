@@ -87,12 +87,16 @@ def _ppl_from_mean_nll(mean_nll: float) -> float:
     return math.exp(min(float(mean_nll), MAX_LOG_PPL))
 
 
-def _validate_boot_args(alpha: float, n_boot: int) -> None:
+def _validate_boot_args(alpha: float, n_boot: int,
+                        seed: int | None = None) -> None:
     if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
             or not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
         raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
     if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
         raise ValueError(f'n_boot must be >= 1, got {n_boot!r}')
+    if seed is not None and (isinstance(seed, bool)
+                             or not isinstance(seed, int)):
+        raise ValueError(f'seed must be an int, got {seed!r}')
 
 
 def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
@@ -241,7 +245,7 @@ def bootstrap_ppl_ci(units, *, alpha: float = 0.05, n_boot: int = 10000,
     estimate and ``degenerate`` is set: there is no resampling evidence to
     estimate corpus uncertainty from. JSON-serializable report.
     """
-    _validate_boot_args(alpha, n_boot)
+    _validate_boot_args(alpha, n_boot, seed)
     norm = normalize_units(units)
     stats = unit_nll_stats(norm)
     n = len(norm)
@@ -303,7 +307,7 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
     match pairwise — a mismatch means the two evaluations did not see the
     same data and the pairing would be wrong.
     """
-    _validate_boot_args(alpha, n_boot)
+    _validate_boot_args(alpha, n_boot, seed)
     raw_a = _parse_units(units_a, 'units_a')
     raw_b = _parse_units(units_b, 'units_b')
     if len(raw_a) == len(raw_b):

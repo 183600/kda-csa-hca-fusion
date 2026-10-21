@@ -86,6 +86,16 @@ def test_unit_normalization_validation():
         P.unit_nll_stats([(True, 1)])  # bool nll_sum
 
 
+def test_bootstrap_seed_must_be_an_exact_int():
+    """Float / boolean seeds used to be silently truncated by ``int(seed)``."""
+    units = [(4.0, 2), (5.0, 2), (3.0, 1)]
+    for bad in (True, 1.5, '1'):
+        with pytest.raises(ValueError):
+            P.bootstrap_ppl_ci(units, n_boot=10, seed=bad)
+        with pytest.raises(ValueError):
+            P.paired_bootstrap_ppl(units, units, n_boot=10, seed=bad)
+
+
 def test_bootstrap_ci_deterministic_rng_isolated_and_nested():
     units = [(4.0, 2), (5.0, 2), (3.0, 1), (6.0, 3), (2.0, 2)]
     state = random.getstate()
