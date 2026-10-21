@@ -316,10 +316,14 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
                 'no informative evaluation units (all missing or zero '
                 'supervised tokens) for either model')
     else:
-        # Different unit counts: the two evaluations did not see the same
-        # corpus, so no alignment can be established.
-        a = [(nll, tok) for nll, tok in raw_a if tok > 0]
-        b = [(nll, tok) for nll, tok in raw_b if tok > 0]
+        # Different raw unit counts: the two evaluations did not see the
+        # same corpus, so no alignment can be established. Do NOT filter
+        # zero-token units per model here: that can make the filtered
+        # lengths coincide by accident and pair unrelated units.
+        raise ValueError(
+            f'paired bootstrap needs the same number of raw units for both '
+            f'models, got {len(raw_a)} vs {len(raw_b)}; score both models '
+            f'on the same corpus with the same batch size/max_batches')
     if len(a) != len(b):
         raise ValueError(
             f'paired bootstrap needs the same number of informative units '

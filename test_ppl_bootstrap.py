@@ -160,6 +160,12 @@ def test_paired_bootstrap_alignment_and_degenerate_contracts():
 
     with pytest.raises(ValueError):
         P.paired_bootstrap_ppl(a, b[:-1], n_boot=200)  # length mismatch
+    # A raw length mismatch must be rejected even when independently
+    # dropping zero-token units would make the filtered lengths equal.
+    a_with_zero = [(2.0, 4), (99.0, 0), (2.2, 4)]
+    b_short = [(2.5, 4), (2.6, 4)]
+    with pytest.raises(ValueError):
+        P.paired_bootstrap_ppl(a_with_zero, b_short, n_boot=200)
     mismatched = [(nll, tok + 1) for nll, tok in b]
     with pytest.raises(ValueError):
         P.paired_bootstrap_ppl(a, mismatched, n_boot=200)
