@@ -17,6 +17,7 @@ forget gate per head).
 
 from __future__ import annotations
 
+import math as _math
 import os as _os
 import sys
 import warnings as _warnings
@@ -34,6 +35,92 @@ from ops_cache import normal_tensor_scope
 # without losing the default warning contract.
 _KDA_NONFINITE_WARN = _os.environ.get(
     'KDA_NONFINITE_WARN', '1').strip().lower() not in ('0', 'false', 'off', 'no')
+
+
+def per_channel_log_decay_bias(
+    n_heads: int,
+    head_dim: int,
+    decay_scale: float,
+    *,
+    min_half_life: float = 1.0,
+    max_half_life: float = 1024.0,
+) -> torch.Tensor:
+    """Build a zero-parameter RWKV-style multi-timescale KDA gate bias.
+
+    KDA's log-decay gate is ``g = -softplus(u) * decay_scale``. At
+    initialization ``u`` is zero-mean, so every channel starts with the
+    same expected decay (``softplus(0) * 0.1 ~= 0.069``). RWKV-7 instead
+    initializes a deterministic per-channel decay spectrum spanning fast
+    and slow channels. This helper returns an additive bias for ``u``
+    that places channel ``c``'s expected per-step log-decay at
+
+    .. math::
+
+        \\lambda_c = \\ln(2) / T_{1/2,c},
+
+    where ``T_{1/2,c}`` is log-spaced between ``min_half_life`` and
+    ``max_half_life`` tokens. Because ``u`` is offset by
+    ``softplus^{-1}(\\lambda_c / decay_scale)``, the expected decay is
+    ``exp(-\\lambda_c)``.
+
+    The spectrum is identical for every value head and is returned as a
+    flat ``[n_heads * head_dim]`` tensor (the gate's channel order). It is
+    intended as a non-persistent initialization buffer, not a parameter:
+    the low-rank gate remains fully trainable, and the default (zero)
+    bias reproduces the historical KDA initialization exactly.
+
+    Args:
+        n_heads: number of value heads (``HV``).
+        head_dim: key width ``K``.
+        decay_scale: the KDA ``kda_decay_scale`` multiplier.
+        min_half_life: half-life (tokens) of the fastest channel; must be
+            finite and positive.
+        max_half_life: half-life (tokens) of the slowest channel; must be
+            finite, positive, and at least ``min_half_life``.
+
+    Returns:
+        ``torch.Tensor`` of shape ``[n_heads * head_dim]`` in float32.
+    """
+    for name, value in (('n_heads', n_heads), ('head_dim', head_dim)):
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 1):
+            raise ValueError(
+                f"per_channel_log_decay_bias: {name}={value!r} must be a "
+                f"positive int.")
+    if (not isinstance(decay_scale, (int, float))
+            or isinstance(decay_scale, bool)
+            or not _math.isfinite(float(decay_scale))
+            or decay_scale < 0):
+        raise ValueError(
+            f"per_channel_log_decay_bias: decay_scale={decay_scale!r} must "
+            f"be a finite non-negative number.")
+    for name, value in (('min_half_life', min_half_life),
+                        ('max_half_life', max_half_life)):
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not _math.isfinite(float(value))
+                or value <= 0):
+            raise ValueError(
+                f"per_channel_log_decay_bias: {name}={value!r} must be a "
+                f"finite positive number.")
+    if min_half_life > max_half_life:
+        raise ValueError(
+            f"per_channel_log_decay_bias: min_half_life={min_half_life} "
+            f"must be <= max_half_life={max_half_life}.")
+
+    bias = torch.zeros(n_heads * head_dim, dtype=torch.float32)
+    if decay_scale == 0:
+        return bias
+    if head_dim == 1:
+        fractions = torch.zeros(1, dtype=torch.float64)
+    else:
+        fractions = torch.arange(head_dim, dtype=torch.float64) / (head_dim - 1)
+    log_span = torch.log(torch.tensor(
+        float(max_half_life) / float(min_half_life), dtype=torch.float64))
+    half_lives = float(min_half_life) * torch.exp(fractions * log_span)
+    target = (torch.log(torch.tensor(2.0, dtype=torch.float64))
+              / half_lives / float(decay_scale))
+    channel_bias = torch.log(torch.expm1(target)).to(torch.float32)
+    return channel_bias.repeat(n_heads)
 
 
 def _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda'):

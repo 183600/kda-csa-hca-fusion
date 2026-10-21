@@ -398,6 +398,8 @@ def kda_layer_forward_tp(
     v = F.silu(F.linear(x_conv, v_weight)).view(B, T, hv, V)
     g_up_weight = layer.g_up.weight.view(HV, K, K)[lo:hi].reshape(hv * K, K)
     g = F.linear(layer.g_down(x_conv), g_up_weight).view(B, T, hv, K)
+    if getattr(layer, '_decay_bias_active', False):
+        g = g + layer._decay_bias.view(HV, K)[lo:hi]
     g = -F.softplus(g) * cfg.kda_decay_scale
     beta = F.linear(x_conv, layer.beta.weight[lo:hi]).sigmoid()
     use_chunk = (cfg.kda_chunk_size >= 1 and T >= cfg.kda_chunk_size)

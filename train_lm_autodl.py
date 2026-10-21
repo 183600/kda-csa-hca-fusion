@@ -2362,6 +2362,19 @@ def main():
                              "(default: env LM_LAYOUT_REPEAT or 2 = the "
                              "10-layer formal configuration). Ignored for "
                              "comma-separated layouts.")
+    parser.add_argument("--kda_decay_init", choices=("default", "log_uniform"),
+                        default=None,
+                        help="KDA per-channel log-decay initialization: "
+                             "'default' (historical zero bias) or "
+                             "'log_uniform' (RWKV-style multi-timescale "
+                             "spectrum; zero extra parameters). Default: "
+                             "HybridConfig's 'default'.")
+    parser.add_argument("--kda_decay_half_life_min", type=float, default=None,
+                        help="Fastest channel half-life in tokens for "
+                             "--kda_decay_init log_uniform (default 1.0).")
+    parser.add_argument("--kda_decay_half_life_max", type=float, default=None,
+                        help="Slowest channel half-life in tokens for "
+                             "--kda_decay_init log_uniform (default 1024.0).")
     parser.add_argument("--ckpt_policy",
                         choices=grad_ckpt.CHECKPOINT_POLICIES, default="none",
                         help="Gradient-checkpointing policy for the hybrid "
@@ -2587,6 +2600,12 @@ def main():
         rwkv_backend=rwkv_backend,
     )
     route_kw.update(_lm_rwkv_dims())
+    if args.kda_decay_init is not None:
+        route_kw['kda_decay_init'] = args.kda_decay_init
+    if args.kda_decay_half_life_min is not None:
+        route_kw['kda_decay_half_life_min'] = args.kda_decay_half_life_min
+    if args.kda_decay_half_life_max is not None:
+        route_kw['kda_decay_half_life_max'] = args.kda_decay_half_life_max
     if layout_spec is not None:
         route_kw['layout'] = _parse_lm_layout(layout_spec, layout_repeat)
     if is_kaggle:

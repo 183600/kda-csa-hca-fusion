@@ -61,6 +61,7 @@ import torch.nn.functional as F
 
 from ops_csa import naive_csa, _qk_normalize_
 from ops_hca import naive_hca
+from ops_kda import per_channel_log_decay_bias
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_mamba import Mamba2Mixer, build_mamba2_mixer, validate_mamba2_geometry
 from ops_rwkv import Rwkv7Mixer, build_rwkv7_mixer, validate_rwkv7_geometry
@@ -255,6 +256,18 @@ class HybridConfig:
     # run_decoding.KDAAttnDecoding, method_analysis._kda_heads); a config
     # field keeps them consistent and makes the value tunable.
     kda_decay_scale: float = 0.1
+    # Optional per-channel log-decay initialization profile.
+    # 'default' keeps the historical zero-bias init (every channel starts
+    # with the same expected decay), which is also what old checkpoints
+    # reconstruct. 'log_uniform' adds a NON-PERSISTENT, NON-TRAINABLE bias
+    # to the gate pre-activation so the channels span a log-uniform
+    # half-life spectrum [min, max] tokens at initialization, mirroring
+    # RWKV-7's deliberate multi-timescale decay init. The low-rank gate
+    # remains trainable, no parameters are added, and the bias is rebuilt
+    # from this config on checkpoint reload.
+    kda_decay_init: str = "default"
+    kda_decay_half_life_min: float = 1.0
+    kda_decay_half_life_max: float = 1024.0
     # init_std for learnable positional biases (Ba, Bb, B_idx,
     # B_pos). Lifting to a config field makes it tunable and keeps the
     # value consistent across instantiations.
@@ -577,6 +590,31 @@ class HybridConfig:
                 f"kda_decay_scale={self.kda_decay_scale} must be >= 0 "
                 f"(negative would invert the decay sign and cause state "
                 f"explosion).")
+        # KDA decay-init profile (see the field comments). Validate all
+        # three fields here so a typo fails before parameter allocation and
+        # before a training run writes a checkpoint that cannot be rebuilt.
+        if not isinstance(self.kda_decay_init, str):
+            raise TypeError(
+                f"kda_decay_init={self.kda_decay_init!r} must be a string "
+                f"('default' or 'log_uniform').")
+        if self.kda_decay_init not in ('default', 'log_uniform'):
+            raise ValueError(
+                f"kda_decay_init={self.kda_decay_init!r} must be 'default' "
+                f"(historical zero-bias init) or 'log_uniform' (RWKV-style "
+                f"multi-timescale per-channel init).")
+        for name, val in (
+                ('kda_decay_half_life_min', self.kda_decay_half_life_min),
+                ('kda_decay_half_life_max', self.kda_decay_half_life_max)):
+            if (not isinstance(val, (int, float)) or isinstance(val, bool)
+                    or not math.isfinite(val) or val <= 0):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be a finite positive "
+                    f"number (a half-life in tokens).")
+        if self.kda_decay_half_life_min > self.kda_decay_half_life_max:
+            raise ValueError(
+                f"kda_decay_half_life_min="
+                f"{self.kda_decay_half_life_min} must be <= "
+                f"kda_decay_half_life_max={self.kda_decay_half_life_max}.")
         # --- Partial RoPE config (DeepSeek-V4 §2.3.3) -----------------
         # rope dims: None or a non-negative int. None/0 disables RoPE; a
         # positive value is clamped to the head dim (even) at use time, so
@@ -704,6 +742,21 @@ class KDAHybridLayer(nn.Module):
         # per-channel log-decay gate (low-rank parameterization as in the paper)
         self.g_down = nn.Linear(d, K, bias=False)
         self.g_up = nn.Linear(K, cfg.n_heads_v * K, bias=False)
+        decay_init = getattr(cfg, 'kda_decay_init', 'default')
+        if decay_init == 'log_uniform':
+            decay_bias = per_channel_log_decay_bias(
+                cfg.n_heads_v, K, cfg.kda_decay_scale,
+                min_half_life=float(getattr(
+                    cfg, 'kda_decay_half_life_min', 1.0)),
+                max_half_life=float(getattr(
+                    cfg, 'kda_decay_half_life_max', 1024.0)))
+        else:
+            decay_bias = torch.zeros(cfg.n_heads_v * K)
+        # Non-persistent: this is an initialization prior rebuilt from the
+        # config, not learned state. Old checkpoints (whose config lacks
+        # these fields) reconstruct the historical all-zero bias.
+        self.register_buffer('_decay_bias', decay_bias, persistent=False)
+        self._decay_bias_active = bool(decay_init == 'log_uniform')
         self.beta = nn.Linear(d, cfg.n_heads_v, bias=False)
         self.o_proj = nn.Linear(cfg.n_heads_v * V, d, bias=False)
         # Causal depthwise short-conv: pad only on the left so that
@@ -747,6 +800,20 @@ class KDAHybridLayer(nn.Module):
         ``HybridKCHAttention.reset_state`` calls this for every KDA layer.
         """
         self._conv_lookback = None
+
+    def log_decay_preactivation(self, x_conv: torch.Tensor) -> torch.Tensor:
+        """Per-channel gate pre-activation ``u`` of shape ``[B, T, HV*K]``.
+
+        The forward path computes ``g = -softplus(u) * kda_decay_scale``.
+        With ``kda_decay_init='log_uniform'`` the non-persistent
+        ``_decay_bias`` buffer is added here, placing each channel's
+        expected decay on the configured half-life spectrum. The default
+        profile skips the add so the historical numerics are unchanged.
+        """
+        u = self.g_up(self.g_down(x_conv))
+        if self._decay_bias_active:
+            u = u + self._decay_bias
+        return u
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         """Stateful forward.
@@ -969,14 +1036,15 @@ class KDAHybridLayer(nn.Module):
         # run_decoding.KDAAttnDecoding, method_analysis._kda_heads) use the
         # same value.
         decay_scale = cfg.kda_decay_scale
+        u = self.log_decay_preactivation(x_conv).view(B, T, HV, K)
         if torch.is_grad_enabled():
-            g = -F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K) * decay_scale
+            g = -F.softplus(u) * decay_scale
             beta = torch.sigmoid(self.beta(x_conv))               # [B, T, HV]
         else:
             # Same per-element sign-flip / scale / sigmoid chain, evaluated
             # in place on the fresh softplus / linear outputs (autograd
             # disabled, so no saved operand is mutated).
-            g = F.softplus(self.g_up(self.g_down(x_conv))).view(B, T, HV, K)
+            g = F.softplus(u)
             g.neg_().mul_(decay_scale)
             beta = self.beta(x_conv).sigmoid_()                   # [B, T, HV]
         # Choose between the step-by-step recurrent path and the

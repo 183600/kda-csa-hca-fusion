@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
 from ops_kda import (
     naive_recurrent_kda, naive_chunk_kda, scripted_chunk_kda,
-    compiled_recurrent_kda,
+    compiled_recurrent_kda, per_channel_log_decay_bias,
 )
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
@@ -954,6 +954,127 @@ def test_kda_g_clamp(device='cpu'):
             chunk_outputs_differ,
             f'chunk clamped vs unclamped max|diff|={(o_chunk - o_chunk_unclamped).abs().max().item():.2e}'),
     ]
+
+
+def test_kda_per_channel_decay_init(device='cpu'):
+    """RWKV-style multi-timescale init for KDA's per-channel log-decay.
+
+    ``kda_decay_init='log_uniform'`` adds a non-persistent, non-trainable
+    bias to the gate pre-activation. This test pins:
+
+      1. the helper's expected per-channel half-lives are log-spaced and
+         match the requested endpoints;
+      2. the spectrum repeats identically across value heads;
+      3. the layer's forward actually adds the buffer to the gate
+         pre-activation (captured at the ``kda_forward`` boundary);
+      4. no parameters / ``state_dict`` keys are added, and the default
+         profile keeps the historical zero bias;
+      5. invalid profiles / half-lives fail at config construction.
+    """
+    logger.info("Test: KDA per-channel log-decay initialization")
+    import math
+    import ops_fused as ops_fused_module
+
+    results = []
+    scale, HV, K = 0.1, 2, 8
+    hl_min, hl_max = 2.0, 1024.0
+    bias = per_channel_log_decay_bias(
+        HV, K, scale, min_half_life=hl_min, max_half_life=hl_max)
+    head0 = bias.view(HV, K)[0]
+    half_lives = math.log(2.0) / (F.softplus(head0) * scale)
+    expected = hl_min * (hl_max / hl_min) ** (
+        torch.arange(K, dtype=torch.float64) / (K - 1))
+    results.append(_ok(
+        'helper emits a log-spaced half-life spectrum',
+        torch.allclose(half_lives.double(), expected, rtol=1e-4, atol=1e-5),
+        f'half_lives={half_lives.tolist()}'))
+    results.append(_ok(
+        'spectrum endpoints match the requested half-lives',
+        abs(half_lives[0].item() - hl_min) / hl_min < 1e-3
+        and abs(half_lives[-1].item() - hl_max) / hl_max < 1e-3,
+        f'first={half_lives[0].item():.4f}, last={half_lives[-1].item():.4f}'))
+    results.append(_ok(
+        'spectrum is identical across value heads',
+        torch.equal(bias.view(HV, K)[0], bias.view(HV, K)[1]),
+        f'heads={HV}'))
+
+    base = dict(
+        d_model=16, n_heads_qk=2, n_heads_v=HV,
+        head_dim_k=K, head_dim_v=8, kda_chunk_size=0,
+        n_kda=1, n_csa=0, n_hca=0, kda_backend='reference')
+    cfg_default = HybridConfig(**base)
+    cfg_profile = HybridConfig(
+        **base, kda_decay_init='log_uniform',
+        kda_decay_half_life_min=hl_min,
+        kda_decay_half_life_max=hl_max)
+    m_default = KDAHybridLayer(cfg_default).to(device).eval()
+    m_profile = KDAHybridLayer(cfg_profile).to(device).eval()
+
+    results.append(_ok(
+        'default profile keeps the historical zero bias',
+        (not m_default._decay_bias_active)
+        and bool(torch.count_nonzero(m_default._decay_bias) == 0),
+        f'active={m_default._decay_bias_active}'))
+    results.append(_ok(
+        'decay bias is non-persistent (not saved in state_dict)',
+        '_decay_bias' not in m_profile.state_dict(),
+        f'state_dict keys={len(m_profile.state_dict())}'))
+    results.append(_ok(
+        'profile adds no parameters or state_dict keys',
+        set(m_default.state_dict()) == set(m_profile.state_dict())
+        and sum(p.numel() for p in m_default.parameters())
+        == sum(p.numel() for p in m_profile.parameters()),
+        f'params={sum(p.numel() for p in m_profile.parameters())}'))
+
+    captured = {}
+
+    def _fake_kda_forward(*args, **kwargs):
+        captured['g'] = args[3].detach().clone()
+        return torch.zeros_like(args[2]), None
+
+    original = ops_fused_module.kda_forward
+    try:
+        ops_fused_module.kda_forward = _fake_kda_forward
+        torch.manual_seed(0)
+        with torch.no_grad():
+            m_profile.g_up.weight.zero_()
+        x = torch.randn(2, 5, cfg_profile.d_model, device=device) * 0.1
+        with torch.no_grad():
+            m_profile.forward_functional(x, None, None)
+    finally:
+        ops_fused_module.kda_forward = original
+
+    expected_g = (-F.softplus(m_profile._decay_bias).view(HV, K) * scale)
+    captured_g = captured['g'].view(-1, HV, K)[0]
+    results.append(_ok(
+        'forward adds the spectrum to the gate pre-activation',
+        torch.allclose(captured_g, expected_g, rtol=1e-6, atol=1e-7),
+        f'max|diff|={(captured_g - expected_g).abs().max().item():.2e}'))
+
+    invalid = [
+        (dict(kda_decay_init='bogus'), ValueError),
+        (dict(kda_decay_init='log_uniform',
+              kda_decay_half_life_min=0.0), ValueError),
+        (dict(kda_decay_init='log_uniform',
+              kda_decay_half_life_max=float('nan')), ValueError),
+        (dict(kda_decay_init='log_uniform',
+              kda_decay_half_life_min=10.0,
+              kda_decay_half_life_max=1.0), ValueError),
+    ]
+    for overrides, err in invalid:
+        try:
+            HybridConfig(**base, **overrides)
+        except err:
+            results.append(_ok(
+                f'rejects {overrides}', True))
+        except Exception as exc:
+            results.append(_ok(
+                f'rejects {overrides}', False,
+                f'{type(exc).__name__}: {exc}'))
+        else:
+            results.append(_ok(
+                f'rejects {overrides}', False, 'no error raised'))
+    return results
 
 
 def test_kda_unnormalized_input_warns(device='cpu'):
@@ -7024,6 +7145,8 @@ def main():
     all_results += _run_safe(test_kda_gradient, device)
     # P0 regression: g-clamp prevents catastrophic state decay.
     all_results += _run_safe(test_kda_g_clamp, device)
+    # RWKV-inspired per-channel (multi-timescale) KDA decay initialization.
+    all_results += _run_safe(test_kda_per_channel_decay_init, device)
     # Review-fix 1.1 regression: non-finite KDA output triggers a warning
     # instead of silently propagating (see ops_kda._warn_if_nonfinite).
     all_results += _run_safe(test_kda_unnormalized_input_warns, device)
