@@ -371,6 +371,28 @@ def test_min_detectable_effect_decreases_with_seeds():
     assert M.min_detectable_effect(1, 0.1) is None
 
 
+def test_power_planning_rejects_invalid_arguments_before_undefined_n():
+    # An undefined seed count (n < 2) must not mask invalid planning
+    # inputs: an alpha/sd typo has to fail loudly even when the result is
+    # None, otherwise a broken analysis plan looks like a valid "n/a".
+    for bad_n in (True, 1.5, -1):
+        with pytest.raises(ValueError):
+            M.min_detectable_effect(bad_n, 0.1)
+    with pytest.raises(ValueError):
+        M.min_detectable_effect(1, 0.1, alpha=0.0)
+    with pytest.raises(ValueError):
+        M.min_detectable_effect(1, float('nan'))
+    with pytest.raises(ValueError):
+        M.min_detectable_effect(5, True)
+    with pytest.raises(ValueError):
+        M.seeds_required(True)
+    with pytest.raises(ValueError):
+        M.seeds_required('1.0')
+    # Zero and non-finite effects stay the documented None cases.
+    assert M.seeds_required(float('nan')) is None
+    assert M.seeds_required(float('inf')) is None
+
+
 # ---------------------------------------------------------------------------
 # summarize_paired panel
 # ---------------------------------------------------------------------------

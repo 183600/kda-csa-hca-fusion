@@ -647,17 +647,20 @@ def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
     guarantee — at n = 5 the normal approximation to the t-test is
     optimistic by roughly 10%; use the exact tests above for inference.
     """
-    if n < 2:
-        return None
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError(f'n must be a non-negative int, got {n!r}')
     if not (0.0 < alpha < 1.0) or not (0.0 < power < 1.0):
         raise ValueError(
             f'alpha and power must be in (0,1), got {alpha!r}, {power!r}')
-    if not math.isfinite(sd) or sd < 0.0:
+    if isinstance(sd, bool) or not isinstance(sd, (int, float)) \
+            or not math.isfinite(sd) or sd < 0.0:
         raise ValueError(f'sd must be finite and >= 0, got {sd!r}')
     if alternative not in ('two-sided', 'greater', 'less'):
         raise ValueError(
             f"alternative must be 'two-sided'|'greater'|'less', "
             f"got {alternative!r}")
+    if n < 2:
+        return None
     z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
         else _ND.inv_cdf(1.0 - alpha)
     z_power = _ND.inv_cdf(power)
@@ -682,6 +685,8 @@ def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
         raise ValueError(
             f"alternative must be 'two-sided'|'greater'|'less', "
             f"got {alternative!r}")
+    if isinstance(dz, bool) or not isinstance(dz, (int, float)):
+        raise ValueError(f'dz must be a real number, got {dz!r}')
     dz = float(dz)
     if not math.isfinite(dz) or dz == 0.0:
         return None
