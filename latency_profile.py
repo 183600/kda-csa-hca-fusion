@@ -81,6 +81,12 @@ VALID_MODES = ('sequential', 'chunked', 'quadratic')
 # ---------------------------------------------------------------------------
 # Inputs and execution
 # ---------------------------------------------------------------------------
+def _require_positive_int(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f'{name}={value!r} must be a positive int.')
+    return value
+
+
 def make_scan_inputs(
     T: int,
     *,
@@ -103,7 +109,13 @@ def make_scan_inputs(
     """
     if isinstance(T, bool) or not isinstance(T, int) or T < 0:
         raise ValueError(f'make_scan_inputs: T={T!r} must be a non-negative int.')
-    gen = torch.Generator(device='cpu').manual_seed(int(seed) & 0xFFFFFFFF)
+    for name, value in (('batch', batch), ('heads', heads),
+                        ('headdim', headdim), ('d_state', d_state),
+                        ('ngroups', ngroups)):
+        _require_positive_int(value, f'make_scan_inputs: {name}')
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f'make_scan_inputs: seed={seed!r} must be an int.')
+    gen = torch.Generator(device='cpu').manual_seed(seed & 0xFFFFFFFF)
     x = (torch.randn(batch, T, heads, headdim, generator=gen,
                      dtype=torch.float32) * 0.1).to(device=device, dtype=dtype)
     dt = (torch.rand(batch, T, heads, generator=gen,
@@ -190,10 +202,12 @@ def model_best_chunk_size(T: int, *, heads: int, headdim: int, d_state: int,
     cand = list(candidates)
     if not cand:
         raise ValueError('model_best_chunk_size: candidates must be non-empty.')
+    for c in cand:
+        _require_positive_int(c, 'model_best_chunk_size: chunk candidate')
     scored = sorted(
         (roofline.ssd_core_flops(T, heads, headdim, d_state, chunked=True,
-                                 chunk_size=int(c)),
-         int(c))
+                                 chunk_size=c),
+         c)
         for c in cand)
     return scored[0][1]
 
@@ -322,6 +336,8 @@ def profile_scan_modes(
     geo.update(geometry or {})
     lengths = list(lengths)
     chunk_sizes = list(chunk_sizes)
+    for C in chunk_sizes:
+        _require_positive_int(C, 'profile_scan_modes: chunk size')
     rows: list[dict] = []
     model_best: dict = {}
     for T in lengths:
@@ -336,7 +352,7 @@ def profile_scan_modes(
             runner=runner, parity_tol=parity_tol))
         for C in chunk_sizes:
             rows.append(_profile_row(
-                T=T, mode='chunked', chunk_size=int(C), inputs=inputs,
+                T=T, mode='chunked', chunk_size=C, inputs=inputs,
                 y_ref=y_ref, s_ref=s_ref, geometry=geo, warmup=warmup,
                 repeats=repeats, timer=timer, synchronize=synchronize,
                 runner=runner, parity_tol=parity_tol))
@@ -358,7 +374,7 @@ def profile_scan_modes(
         'warmup': warmup,
         'repeats': repeats,
         'parity_tol': parity_tol,
-        'chunk_sizes': [int(c) for c in chunk_sizes],
+        'chunk_sizes': chunk_sizes,
         'model_best_chunk_size': model_best,
         'measured_best_chunk_size': recommend_chunk_sizes(rows),
     }

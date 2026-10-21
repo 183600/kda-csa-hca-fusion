@@ -87,7 +87,7 @@ def test_ssd_core_flops_breakdown_exact():
     _ok('assoc_scan = 16', abs(b['assoc_scan'] - 16.0) < 1e-9,
         f"{b['assoc_scan']}")
     _ok('total = 144', abs(b['total'] - 144.0) < 1e-9, f"{b['total']}")
-    _ok('n_chunks / padded_len / levels', 
+    _ok('n_chunks / padded_len / levels',
         (b['n_chunks'], b['padded_len'], b['scan_levels']) == (2, 4, 1),
         f"{b['n_chunks']},{b['padded_len']},{b['scan_levels']}")
     _ok('ssd_core_flops(chunked) == breakdown total',
@@ -100,6 +100,13 @@ def test_ssd_core_flops_breakdown_exact():
         and abs(one['intra_chunk_attention'] - 128.0) < 1e-9, f"{one}")
     zero = roofline.ssd_core_flops_breakdown(0, 1, 2, 2, chunk_size=4)
     _ok('T=0 breakdown is all zeros', zero['total'] == 0.0, f"{zero['total']}")
+    for bad_seed in (1.5, True):
+        raised = False
+        try:
+            lp.make_scan_inputs(2, seed=bad_seed)
+        except ValueError:
+            raised = True
+        _ok(f'invalid seed {bad_seed!r} rejected', raised, '')
 
 
 def test_ssd_core_flops_chunk_grid_and_model_best():
@@ -126,6 +133,15 @@ def test_ssd_core_flops_chunk_grid_and_model_best():
     except ValueError:
         raised = True
     _ok('empty candidate set rejected', raised, '')
+    # Chunk candidates are exact positive ints; 8.9 must not become 8.
+    for bad in (8.9, True, '8', 0):
+        raised = False
+        try:
+            lp.model_best_chunk_size(T, heads=H, headdim=D, d_state=N,
+                                     candidates=(bad,))
+        except ValueError:
+            raised = True
+        _ok(f'invalid chunk candidate {bad!r} rejected', raised, '')
     # More chunks must monotonically shrink the associative-scan share.
     scan_lo = roofline.ssd_core_flops_breakdown(T, H, D, N,
                                                 chunk_size=4)['assoc_scan']
