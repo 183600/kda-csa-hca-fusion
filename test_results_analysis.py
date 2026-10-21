@@ -31,6 +31,7 @@ from results_analysis import (  # noqa: E402
     expected_average_precision,
     diagnose_training_curves,
     multiclass_classification_metrics,
+    confusion_matrix,
     pareto_frontier,
     summarize_lm_diagnostics,
 )
@@ -234,6 +235,20 @@ def test_pareto_frontier_skips_missing_costs():
     rep = pareto_frontier(rows)
     assert rep['skipped'] == ['b']
     assert rep['frontier'] == ['a']
+
+
+def test_confusion_matrix_rejects_out_of_range_explicit_classes():
+    """An explicit num_classes must bound every observed id, not alias them."""
+    with pytest.raises(ValueError):
+        confusion_matrix([2], [0], num_classes=2)
+    with pytest.raises(ValueError):
+        confusion_matrix([0], [4], num_classes=2)
+    # In-range explicit classes still keep the full zero row/column.
+    cm = confusion_matrix([1], [1], num_classes=3)
+    assert cm.shape == (3, 3)
+    assert cm[1, 1].item() == 1 and cm.sum().item() == 1
+    # No explicit count: the derived shape covers the observed maximum.
+    assert confusion_matrix([2], [2]).shape == (3, 3)
 
 
 # ---------------------------------------------------------------------------

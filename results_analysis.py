@@ -977,12 +977,21 @@ def confusion_matrix(pred, target, *, num_classes: int | None = None):
         raise ValueError('target contains negative class ids')
     if pred.numel() and int(pred.min()) < 0:
         raise ValueError('pred contains negative class ids')
+    explicit_num_classes = num_classes is not None
     if num_classes is None:
         max_id = int(max(pred.max(), target.max()).item()) if pred.numel() else -1
         num_classes = max_id + 1
     num_classes = int(num_classes)
     if num_classes < 0:
         raise ValueError(f'num_classes={num_classes} must be >= 0')
+    if explicit_num_classes and pred.numel():
+        max_id = int(max(pred.max(), target.max()).item())
+        if max_id >= num_classes:
+            # ``flat = target * num_classes + pred`` would otherwise alias
+            # an out-of-range id into another class's cell (or overflow the
+            # reshape), silently corrupting the matrix.
+            raise ValueError(
+                f'class id {max_id} is outside [0, num_classes={num_classes})')
     if num_classes == 0:
         return torch.zeros(0, 0, dtype=torch.long)
     flat = target * num_classes + pred
