@@ -284,8 +284,16 @@ def default_sweep_specs(bits_list=DEFAULT_BITS,
 
 
 def _aggregate(values: list) -> dict:
-    """Mean/min/max plus sample std and a two-sided 95% t-interval."""
+    """Mean/min/max plus sample std and a two-sided 95% t-interval.
+
+    An empty value list yields an explicit empty aggregate (``n = 0`` and
+    ``None`` statistics) instead of a ``ZeroDivisionError`` from the mean
+    and a ``ValueError`` from ``min()`` on an empty sequence.
+    """
     n = len(values)
+    if n == 0:
+        return {'mean': None, 'std': None, 'ci95': None,
+                'min': None, 'max': None, 'n': 0}
     mean = sum(values) / n
     std = None
     ci95 = None
@@ -313,6 +321,11 @@ def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
     ``frontier_summary`` row per route (cheapest exact-recall cell).
     """
     rows: list = []
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError(
+            'build_quant_recall_rows: seeds must be a non-empty iterable '
+            '(the per-cell aggregate is taken over the seeds).')
     for route in routes:
         for spec in default_sweep_specs(bits_list, group_sizes,
                                         include_asymmetric):
