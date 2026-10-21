@@ -192,6 +192,39 @@ def test_pareto_frontier_dominance():
     assert by_op['c']['acc_per_eval_ms'] == pytest.approx(0.95 / 3.0)
 
 
+def test_pareto_frontier_keeps_duplicate_names_apart():
+    """Two rows with the same name must not collapse into one point.
+
+    The points are keyed by name, so a repeated name used to overwrite
+    the earlier row: that row vanished from the dominance analysis AND
+    both rows were annotated with the surviving row's ratios (the
+    first row reported acc_per_train_second 0.9 instead of 0.05).
+    """
+    rows = [
+        {'op': 'kda', 'mean_acc': 0.5, 'n_params': 100,
+         'mean_train_time_s': 10.0},
+        {'op': 'kda', 'mean_acc': 0.9, 'n_params': 50,
+         'mean_train_time_s': 1.0},
+        {'op': 'csa', 'mean_acc': 0.8, 'n_params': 80,
+         'mean_train_time_s': 5.0},
+    ]
+    report = pareto_frontier(rows)
+    # Both 'kda' rows are present under distinct keys.
+    assert set(report['points']) == {'kda', 'kda#2', 'csa'}
+    assert report['points']['kda']['acc_per_train_second'] == pytest.approx(0.05)
+    assert report['points']['kda#2']['acc_per_train_second'] == pytest.approx(0.9)
+    # The weaker 'kda' row is dominated by the stronger one.
+    assert report['dominated_by']['kda'] == 'kda#2'
+
+    annotate_rows_with_pareto(rows)
+    assert rows[0]['pareto']['acc_per_train_second'] == pytest.approx(0.05)
+    assert rows[0]['pareto']['optimal'] is False
+    assert rows[0]['pareto']['dominated_by'] == 'kda#2'
+    assert rows[1]['pareto']['acc_per_train_second'] == pytest.approx(0.9)
+    assert rows[1]['pareto']['optimal'] is True
+    assert rows[2]['pareto']['acc_per_train_second'] == pytest.approx(0.16)
+
+
 def test_pareto_frontier_skips_missing_costs():
     rows = [
         {'op': 'a', 'mean_acc': 0.5, 'n_params': 10, 'mean_train_time_s': 1.0},

@@ -517,6 +517,25 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
     }
 
 
+def _pareto_row_keys(rows: Sequence[Mapping], name_key: str) -> list[str]:
+    """Unique keys for the rows, disambiguating repeated names.
+
+    ``pareto_frontier`` keys its points by the row name.  Two rows with
+    the SAME name used to collide: the later one overwrote the earlier
+    point, so the earlier row vanished from the dominance analysis AND
+    both rows were annotated with the SURVIVING row's ratios.  Duplicates
+    now get a stable ``name#2`` / ``name#3`` suffix.
+    """
+    seen: dict = {}
+    keys: list[str] = []
+    for r in rows:
+        name = r.get(name_key, r.get('op', '?'))
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        keys.append(name if count == 1 else f'{name}#{count}')
+    return keys
+
+
 def pareto_frontier(rows: Sequence[Mapping],
                     *, accuracy_key: str = 'mean_acc',
                     cost_keys: Sequence[str] = ('mean_train_time_s',
@@ -529,16 +548,20 @@ def pareto_frontier(rows: Sequence[Mapping],
     non-finite accuracy or costs are excluded (listed under ``skipped``).
     Ties do not dominate.
 
+    Repeated names are disambiguated with a ``name#2`` suffix (see
+    :func:`_pareto_row_keys`) so that no row is silently dropped.
+
     Returns ``{'frontier': [names], 'dominated_by': {name: dominator},
     'points': {...}, 'skipped': [...]}``.
     """
     points: dict = {}
     skipped: list = []
-    for r in rows:
-        name = r.get(name_key, r.get('op', '?'))
+    row_keys = _pareto_row_keys(rows, name_key)
+    for row, key in zip(rows, row_keys):
+        r = row
         acc = r.get(accuracy_key)
         if acc is None or not math.isfinite(float(acc)):
-            skipped.append(name)
+            skipped.append(key)
             continue
         costs = {}
         ok = True
@@ -549,13 +572,13 @@ def pareto_frontier(rows: Sequence[Mapping],
                 break
             costs[k] = float(v)
         if not ok:
-            skipped.append(name)
+            skipped.append(key)
             continue
         eval_ms = r.get('mean_eval_ms_per_sample')
         if eval_ms is not None and (not math.isfinite(float(eval_ms))
                                     or float(eval_ms) <= 0):
             eval_ms = None
-        points[name] = {
+        points[key] = {
             'accuracy': float(acc),
             'costs': costs,
             'acc_per_train_second': (
@@ -606,15 +629,16 @@ def annotate_rows_with_pareto(rows: Sequence[dict], **kwargs) -> dict:
     Returns the frontier report.
     """
     report = pareto_frontier(rows, **kwargs)
-    for r in rows:
-        name = r.get(kwargs.get('name_key', 'op'))
-        p = report['points'].get(name)
+    name_key = kwargs.get('name_key', 'op')
+    row_keys = _pareto_row_keys(rows, name_key)
+    for r, key in zip(rows, row_keys):
+        p = report['points'].get(key)
         if p is None:
             r['pareto'] = None
             continue
         r['pareto'] = {
-            'optimal': name in report['frontier'],
-            'dominated_by': report['dominated_by'].get(name),
+            'optimal': key in report['frontier'],
+            'dominated_by': report['dominated_by'].get(key),
             'acc_per_train_second': p['acc_per_train_second'],
             'acc_per_1k_params': p['acc_per_1k_params'],
             'acc_per_eval_ms': p.get('acc_per_eval_ms'),
