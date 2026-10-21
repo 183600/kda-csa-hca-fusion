@@ -137,6 +137,29 @@ def test_lm_prefill_decode_consistency(device='cpu'):
         f'strict_dumps_ok={json_ok}, start_oob_raises={edge_raised}')
 
 
+def test_zero_decode_report_is_defined(device='cpu'):
+    """``prefill_len == T`` (including the default T=1) must not crash."""
+    torch.manual_seed(2028)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        kda_chunk_size=4,
+        n_kda=1, n_csa=0, n_hca=0,
+        kda_backend='reference',
+    )
+    model = LMWithHybrid(17, cfg).to(device).eval()
+    ids = torch.randint(0, 17, (1, 1),
+                        generator=torch.Generator().manual_seed(8)).to(device)
+    report = lm_consistency.run_lm_consistency_check(model, ids, device=device)
+    _ok('zero-decode report has no decode positions',
+        report['n_decode'] == 0 and report['prefill_len'] == 1, '')
+    _ok('zero-decode metrics are undefined, not fabricated',
+        report['decode_max_abs_logit_diff'] is None
+        and report['decode_top1_agreement'] is None, '')
+    _ok('zero-decode report stays strict-JSON safe',
+        json.dumps(report, allow_nan=False) is not None, '')
+
+
 def test_selection_diagnostic(device='cpu'):
     """The probe must separate top-k tie artifacts from real state bugs.
 

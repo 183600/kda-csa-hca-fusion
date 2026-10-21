@@ -640,9 +640,17 @@ def run_lm_consistency_check(model, input_ids, *, prefill_len: int | None = None
 
     all_pos = consistency_metrics(logits_full, logits_inc,
                                   start=0, tolerance=tolerance)
-    decode_pos = consistency_metrics(logits_full, logits_inc,
-                                     start=out['prefill_len'],
-                                     tolerance=tolerance)
+    if out['n_decode'] > 0:
+        decode_pos = consistency_metrics(logits_full, logits_inc,
+                                         start=out['prefill_len'],
+                                         tolerance=tolerance)
+    else:
+        # ``prefill_len == T`` is a valid input to
+        # ``prefill_decode_tower_outputs`` (it reports
+        # ``decode_ms_per_token=None``); there are no decode-only positions
+        # to compare, so report the metric as undefined rather than calling
+        # ``consistency_metrics`` with an empty slice.
+        decode_pos = {'max_abs_logit_diff': None, 'top1_agreement': None}
     dev = str(input_ids.device if device is None else device)
     report = {
         'seq_len': out['seq_len'],
