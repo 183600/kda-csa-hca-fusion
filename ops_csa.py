@@ -559,7 +559,10 @@ def csa_compress_kv_overlapped(
     # match ``csa_compress_kv`` (which already handles T=0 correctly via the
     # view operation returning an empty [B, 0, m, c] tensor).
     if T == 0:
-        return Ca.new_zeros(B_, 0, c)
+        # Match the T>0 contract: compression always computes in
+        # ``compute_dtype`` (fp32 for fp16/bf16 inputs), so the empty result
+        # must use the same dtype rather than inheriting the input dtype.
+        return Ca.to(compute_dtype).new_zeros(B_, 0, c)
     Ca = Ca.to(compute_dtype).view(B_, n_blocks, m, c)
     Cb = Cb.to(compute_dtype).view(B_, n_blocks, m, c)
     Za = Za.to(compute_dtype).view(B_, n_blocks, m, c)
