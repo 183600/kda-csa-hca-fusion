@@ -46,6 +46,7 @@ from ops_fused import HybridAttentionStack, HybridKCHAttention, HybridConfig
 from ops_mamba import (Mamba2Mixer, build_mamba2_mixer, chunked_mamba2_scan,
                        mamba2_scan_boundary_metadata, naive_mamba2_scan)
 from ops_mamba_backend import validate_mamba_backend
+from timing_stats import summarize_timings_s
 import ops_kda
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,15 @@ def _selected_mamba_backend() -> str:
 
 
 _LAST_TIMING_STATS: dict = {}
+
+
+def _record_timing_stats(times):
+    """Store the uncertainty summary for the row just measured."""
+    stats = summarize_timings_s(times)
+    _LAST_TIMING_STATS.clear()
+    _LAST_TIMING_STATS.update(stats)
+    _LAST_TIMING_STATS['times'] = list(times)
+    return stats
 
 
 def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
@@ -152,12 +162,7 @@ def _measure(fn, repeats, device):
             del out
             torch.cuda.synchronize()
         peak_mb = max(0.0, peak_bytes - baseline_bytes) / (1024 ** 2)
-        _LAST_TIMING_STATS['times'] = list(times)
-        _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
-        _LAST_TIMING_STATS['max_ms'] = (max(times) * 1000.0) if times else 0.0
-        _LAST_TIMING_STATS['std_ms'] = (
-            (statistics.stdev(times) * 1000.0) if len(times) >= 2 else 0.0
-        )
+        _record_timing_stats(times)
         # Guard against repeats=0: ``statistics.median([])`` raises
         # ``StatisticsError``. Returns 0.0 so the JSON row is well-formed.
         return (statistics.median(times) if times else 0.0), peak_mb
@@ -199,12 +204,7 @@ def _measure(fn, repeats, device):
         finally:
             torch.set_num_threads(_prev_threads)
         peak_mb = None  # CPU peak memory is not reliably measurable
-        _LAST_TIMING_STATS['times'] = list(times)
-        _LAST_TIMING_STATS['min_ms'] = (min(times) * 1000.0) if times else 0.0
-        _LAST_TIMING_STATS['max_ms'] = (max(times) * 1000.0) if times else 0.0
-        _LAST_TIMING_STATS['std_ms'] = (
-            (statistics.stdev(times) * 1000.0) if len(times) >= 2 else 0.0
-        )
+        _record_timing_stats(times)
         return (statistics.median(times) if times else 0.0), peak_mb
 
 
@@ -848,6 +848,21 @@ def main():
                     row['time_min_ms'] = _LAST_TIMING_STATS.get('min_ms')
                     row['time_max_ms'] = _LAST_TIMING_STATS.get('max_ms')
                     row['time_std_ms'] = _LAST_TIMING_STATS.get('std_ms')
+                    row['time_mean_ms'] = _LAST_TIMING_STATS.get('mean_ms')
+                    row['time_q10_ms'] = _LAST_TIMING_STATS.get('q10_ms')
+                    row['time_q90_ms'] = _LAST_TIMING_STATS.get('q90_ms')
+                    row['time_ci95_low_ms'] = _LAST_TIMING_STATS.get(
+                        'ci95_low_ms')
+                    row['time_ci95_high_ms'] = _LAST_TIMING_STATS.get(
+                        'ci95_high_ms')
+                    row['time_ci95_halfwidth_ms'] = _LAST_TIMING_STATS.get(
+                        'ci95_halfwidth_ms')
+                    row['time_cv'] = _LAST_TIMING_STATS.get('cv')
+                    row['time_n'] = _LAST_TIMING_STATS.get('n')
+                    row['time_ci_method'] = _LAST_TIMING_STATS.get(
+                        'ci_method')
+                    row['time_bootstrap_reps'] = _LAST_TIMING_STATS.get(
+                        'bootstrap_reps')
                     row.update(op_boundary[name])
                     row['workload'] = op_workload.get(name, {})
                     results.append(row)
@@ -874,7 +889,12 @@ def main():
                         'time_ms': None, 'peak_mem_MB': None,
                         'tokens_per_s': None,
                         'time_min_ms': None, 'time_max_ms': None,
-                        'time_std_ms': None,
+                        'time_std_ms': None, 'time_mean_ms': None,
+                        'time_q10_ms': None, 'time_q90_ms': None,
+                        'time_ci95_low_ms': None, 'time_ci95_high_ms': None,
+                        'time_ci95_halfwidth_ms': None, 'time_cv': None,
+                        'time_n': 0, 'time_ci_method': None,
+                        'time_bootstrap_reps': None,
                         'repeats': n_repeats,
                         'param_elements': None,
                     }

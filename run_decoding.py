@@ -60,6 +60,7 @@ from ops_rwkv import build_rwkv7_mixer
 from ops_rwkv_backend import validate_rwkv_backend
 from results_schema import (SchemaError, write_checked as
                             write_results_checked)
+from timing_stats import summarize_timings_ms
 
 # Operator groups shared by the result rows and their contracts
 # (``results_schema``'s exp6_decoding contract mirrors the cache-flag
@@ -1604,10 +1605,37 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         state = {'components': {}, 'allocated_bytes': None,
                  'valid_bytes': None, 'error': str(e)}
 
+    # Uncertainty of the two primaries. The point estimates above are
+    # unchanged (median across repeats / flattened trial tokens); these
+    # fields make small cross-operator gaps interpretable instead of
+    # treating two medians as an ordering.
+    prefill_stats = summarize_timings_ms(prefill_times)
+    decode_stats = summarize_timings_ms(flat_decode)
+
     return {
         'prefill_ms': prefill_ms,
+        'prefill_mean_ms': prefill_stats['mean_ms'],
+        'prefill_std_ms': prefill_stats['std_ms'],
+        'prefill_q10_ms': prefill_stats['q10_ms'],
+        'prefill_q90_ms': prefill_stats['q90_ms'],
+        'prefill_ci95_low_ms': prefill_stats['ci95_low_ms'],
+        'prefill_ci95_high_ms': prefill_stats['ci95_high_ms'],
+        'prefill_ci95_halfwidth_ms': prefill_stats['ci95_halfwidth_ms'],
+        'prefill_cv': prefill_stats['cv'],
+        'prefill_n': prefill_stats['n'],
         'mean_decode_ms_per_token': mean_decode,
         'median_decode_ms_per_token': median_decode,
+        'decode_std_ms': decode_stats['std_ms'],
+        'decode_q10_ms': decode_stats['q10_ms'],
+        'decode_q90_ms': decode_stats['q90_ms'],
+        'decode_ci95_low_ms': decode_stats['ci95_low_ms'],
+        'decode_ci95_high_ms': decode_stats['ci95_high_ms'],
+        'decode_ci95_halfwidth_ms': decode_stats['ci95_halfwidth_ms'],
+        'decode_cv': decode_stats['cv'],
+        'decode_n': decode_stats['n'],
+        'timing_ci_method': prefill_stats['ci_method'],
+        'timing_bootstrap_reps': prefill_stats['bootstrap_reps'],
+        'timing_ci_alpha': prefill_stats['alpha'],
         'peak_mem_MB': peak_mb,
         'decode_state_bytes': state['valid_bytes'],
         'decode_state_allocated_bytes': state['allocated_bytes'],

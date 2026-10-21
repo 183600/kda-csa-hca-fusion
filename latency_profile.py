@@ -52,7 +52,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import statistics
 import sys
 import time
 
@@ -63,6 +62,7 @@ import torch  # noqa: E402
 from ops_mamba import (chunked_mamba2_scan, naive_mamba2_scan,  # noqa: E402
                        quadratic_mamba2_scan)
 import roofline  # noqa: E402
+from timing_stats import summarize_timings_s  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -178,13 +178,9 @@ def time_call(
         fn()
         barrier()
         times.append(max(0.0, timer() - t0))
-    return {
-        'median_ms': statistics.median(times) * 1e3,
-        'min_ms': min(times) * 1e3,
-        'max_ms': max(times) * 1e3,
-        'std_ms': (statistics.stdev(times) * 1e3) if len(times) > 1 else 0.0,
-        'times_ms': [t * 1e3 for t in times],
-    }
+    stats = summarize_timings_s(times)
+    stats['times_ms'] = [t * 1e3 for t in times]
+    return stats
 
 
 # ---------------------------------------------------------------------------
