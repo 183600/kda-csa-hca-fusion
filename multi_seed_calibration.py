@@ -53,6 +53,7 @@ import sys
 
 from multi_seed_stats import (
     bootstrap_paired_ci,
+    holm_adjust,
     paired_t_test,
     permutation_test,
     sign_test,
@@ -63,6 +64,7 @@ __all__ = [
     'size_study',
     'coverage_study',
     'power_study',
+    'family_study',
     'default_scenarios',
     'calibration_report',
 ]
@@ -371,6 +373,75 @@ def power_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
     return rows
 
 
+def family_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
+    """Empirical family-wise error rate of Holm over paired t-tests.
+
+    Scenario keys: ``m`` (family size >= 2), ``n_pairs``,
+    ``distribution``, ``alpha``, ``tol``, optional ``noise_sd`` and
+    ``name``. Every comparison is a null (``effect=0``) paired t-test and
+    the replicate is a family error if Holm rejects at least one. This
+    calibrates the correction actually used by Exp 4/5/8, not just the
+    per-comparison tests.
+    """
+    _validate_study_args(reps, DEFAULT_NBOOT, seed)
+    rows = []
+    for s_i, scenario in enumerate(scenarios):
+        m = _require_int(scenario['m'], f'scenario {s_i} m', minimum=2)
+        n_pairs = _require_int(scenario['n_pairs'], f'scenario {s_i} n_pairs',
+                               minimum=2)
+        alpha = float(scenario.get('alpha', DEFAULT_ALPHA))
+        tol = float(scenario['tol'])
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(f'scenario {s_i}: alpha must be in (0, 1)')
+        if not (math.isfinite(tol) and tol > 0.0):
+            raise ValueError(f'scenario {s_i}: tol must be positive')
+        distribution = str(scenario.get('distribution', 'normal'))
+        noise_sd = float(scenario.get('noise_sd', DEFAULT_NOISE_SD))
+        diagnostic = bool(scenario.get('diagnostic', False))
+        name = str(scenario.get('name', f'{distribution}_m{m}_n{n_pairs}'))
+        n_family = 0
+        for r in range(int(reps)):
+            p_values = []
+            for j in range(m):
+                rng = random.Random(_derive_seed(seed, 300 + s_i, r, j))
+                diffs = simulate_paired_diffs(
+                    n_pairs, rng, effect=0.0, noise_sd=noise_sd,
+                    distribution=distribution)
+                p_values.append(
+                    paired_t_test(diffs, alternative='two-sided')['p_value'])
+            holm = holm_adjust(
+                [1.0 if p is None else p for p in p_values], alpha=alpha)
+            if any(holm['rejected']):
+                n_family += 1
+        rate = n_family / int(reps)
+        threshold = alpha + tol
+        meets = rate <= threshold
+        rows.append({
+            'section': 'family',
+            'name': name,
+            'm': m,
+            'n_pairs': n_pairs,
+            'distribution': distribution,
+            'noise_sd': noise_sd,
+            'method': 'holm_paired_t',
+            'alpha': alpha,
+            'n_reps': int(reps),
+            'n_significant': n_family,
+            'family_error_rate': rate,
+            'se': _se(rate, int(reps)),
+            'threshold': threshold,
+            'tol': tol,
+            'meets': meets,
+            'verdict': 'within_bound' if meets else 'liberal',
+            'gate': not diagnostic,
+            'diagnostic_only': diagnostic,
+            'note': ('fraction of null families where Holm rejected at '
+                     'least one paired t-test; FWER must stay <= alpha + '
+                     'tol'),
+        })
+    return rows
+
+
 def default_scenarios():
     """The committed calibration grid (normal / Laplace / contaminated)."""
     return {
@@ -404,6 +475,15 @@ def default_scenarios():
              'distribution': 'normal', 'effect': 1.2, 'alpha': 0.05,
              'min_power': 0.85},
         ],
+        'family': [
+            {'name': 'normal_m6_n5', 'm': 6, 'n_pairs': 5,
+             'distribution': 'normal', 'alpha': 0.05, 'tol': 0.04},
+            {'name': 'normal_m12_n5', 'm': 12, 'n_pairs': 5,
+             'distribution': 'normal', 'alpha': 0.05, 'tol': 0.04},
+            {'name': 'contaminated_m6_n7', 'm': 6, 'n_pairs': 7,
+             'distribution': 'contaminated', 'alpha': 0.05, 'tol': 0.06,
+             'diagnostic': True},
+        ],
     }
 
 
@@ -414,6 +494,7 @@ def calibration_report(*, reps=DEFAULT_REPS, n_boot=DEFAULT_NBOOT, seed=0):
     rows += coverage_study(scenarios['coverage'], reps=reps, n_boot=n_boot,
                            seed=seed)
     rows += power_study(scenarios['power'], reps=reps, seed=seed)
+    rows += family_study(scenarios['family'], reps=reps, seed=seed)
     failed = [r for r in rows if r.get('gate', True) and not r['meets']]
     diagnostic_failed = [
         r for r in rows if not r.get('gate', True) and not r['meets']]
@@ -438,6 +519,9 @@ def calibration_report(*, reps=DEFAULT_REPS, n_boot=DEFAULT_NBOOT, seed=0):
             'The contaminated scenario has 10% outliers at 5x the base '
             'scale; the t-test and the mean bootstrap are expected to lose '
             'efficiency there. That scenario is diagnostic, not a gate.',
+            'The family study measures FWER of Holm over independent null '
+            'paired t-tests; real operator comparisons are positively '
+            'dependent, which makes Holm conservative rather than liberal.',
         ],
         'settings': {
             'reps': int(reps),
@@ -484,9 +568,13 @@ def main(argv=None):
         elif row['section'] == 'coverage':
             print(f"cov  {row['name']:>16s} coverage={row['coverage']:.3f} "
                   f"nominal={row['nominal']:.3f} {row['verdict']}")
-        else:
+        elif row['section'] == 'power':
             print(f"pow  {row['name']:>16s} power={row['rejection_rate']:.3f} "
                   f"floor={row['min_power']:.3f} {row['verdict']}")
+        else:
+            print(f"fam  {row['name']:>16s} m={row['m']} "
+                  f"FWER={row['family_error_rate']:.3f} "
+                  f"threshold={row['threshold']:.3f} {row['verdict']}")
     print(f"all_pass={report['all_pass']} failed={report['n_failed']}")
     return 0 if report['all_pass'] else 1
 

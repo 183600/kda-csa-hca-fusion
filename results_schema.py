@@ -1595,7 +1595,7 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
 # inference panel. Rates are recomputed from counts, and every gate/verdict
 # is derived from the recorded threshold so a widened tolerance or a
 # manually flipped verdict cannot be archived as a green certificate.
-_EXP16_SECTIONS = frozenset({'size', 'coverage', 'power'})
+_EXP16_SECTIONS = frozenset({'size', 'coverage', 'power', 'family'})
 _EXP16_METHODS = frozenset({'paired_t', 'sign', 'permutation'})
 
 
@@ -1730,6 +1730,53 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
                     or not isinstance(row.get('diagnostic_only'), bool):
                 out.append(f'{where}: gate/diagnostic_only must be bool')
             elif row['gate'] == row['diagnostic_only']:
+                out.append(f'{where}: diagnostic_only must be !gate')
+        elif section == 'family':
+            m = row.get('m')
+            if not (_positive_int(m) and int(m) >= 2):
+                out.append(f"{where}: 'm' must be an int >= 2")
+            if row.get('method') != 'holm_paired_t':
+                out.append(f"{where}: family method must be 'holm_paired_t'")
+            n_family = row.get('n_significant')
+            if not (isinstance(n_family, int)
+                    and not isinstance(n_family, bool)
+                    and _positive_int(n_reps)
+                    and 0 <= n_family <= n_reps):
+                out.append(f'{where}: n_significant must be in [0, n_reps]')
+            rate = row.get('family_error_rate')
+            if _positive_int(n_reps) and isinstance(n_family, int) \
+                    and not isinstance(n_family, bool) \
+                    and 0 <= n_family <= n_reps:
+                want = n_family / int(n_reps)
+                if not (_finite_number(rate)
+                        and abs(float(rate) - want) < 1e-12):
+                    out.append(f'{where}: family_error_rate != '
+                               f'n_significant/n_reps')
+            tol = row.get('tol')
+            threshold = row.get('threshold')
+            if not (_finite_number(tol) and float(tol) > 0):
+                out.append(f"{where}: 'tol' must be finite > 0")
+            if _finite_number(alpha) and _finite_number(tol):
+                if not (_finite_number(threshold)
+                        and abs(float(threshold)
+                                - (float(alpha) + float(tol))) < 1e-12):
+                    out.append(f'{where}: threshold != alpha + tol')
+            meets = row.get('meets')
+            if isinstance(meets, bool) and _finite_number(rate) \
+                    and _finite_number(threshold):
+                if meets != (float(rate) <= float(threshold)):
+                    out.append(f'{where}: meets contradicts FWER/threshold')
+            verdict = row.get('verdict')
+            if verdict not in ('within_bound', 'liberal'):
+                out.append(f'{where}: verdict={verdict!r} invalid')
+            if isinstance(meets, bool) \
+                    and verdict != ('within_bound' if meets else 'liberal'):
+                out.append(f'{where}: family verdict contradicts meets')
+            diag = row.get('diagnostic_only')
+            if not isinstance(row.get('gate'), bool) \
+                    or not isinstance(diag, bool):
+                out.append(f'{where}: gate/diagnostic_only must be bool')
+            elif row['gate'] == diag:
                 out.append(f'{where}: diagnostic_only must be !gate')
         else:  # power
             effect, floor = row.get('effect'), row.get('min_power')

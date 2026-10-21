@@ -150,6 +150,22 @@ def test_calibration_does_not_touch_global_rng():
     _ok('global RNG sequence is unchanged', got == expected, f'{got}')
 
 
+def test_family_study_controls_holm_fwer():
+    print('\nTest: family-wise error of Holm')
+    scenarios = mc.default_scenarios()['family'][:2]
+    rows = mc.family_study(scenarios, reps=120, seed=0)
+    _ok('one row per family scenario', len(rows) == len(scenarios), rows)
+    for row in rows:
+        _ok(f"FWER within bound for {row['name']}",
+            row['family_error_rate'] <= row['threshold'],
+            row['family_error_rate'])
+        _ok(f"family row gates for {row['name']}",
+            row['gate'] and not row['diagnostic_only'], row)
+        _ok(f"count and rate agree for {row['name']}",
+            abs(row['family_error_rate']
+                - row['n_significant'] / row['n_reps']) < 1e-12, row)
+
+
 def test_exp16_row_contract_recomputes_rates_and_verdicts():
     print('\nTest: Exp 16 row contract')
     import results_schema as rs
@@ -238,6 +254,7 @@ _TEST_FUNCS = [
     test_coverage_and_power_rows,
     test_report_is_json_safe_and_gate_consistent,
     test_calibration_does_not_touch_global_rng,
+    test_family_study_controls_holm_fwer,
     test_exp16_row_contract_recomputes_rates_and_verdicts,
     test_exp16_runner_archives_only_on_pass,
 ]

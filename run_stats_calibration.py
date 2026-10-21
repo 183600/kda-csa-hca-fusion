@@ -9,7 +9,8 @@ populations:
 * null size of the paired t-test, exact sign test, and exact sign-flip
   permutation test (normal / Laplace / contaminated errors);
 * percentile-bootstrap CI coverage of a known mean paired difference;
-* power at pre-registered standardized effects.
+* power at pre-registered standardized effects;
+* family-wise error of Holm over six and twelve null comparisons.
 
 The committed grid is in :func:`multi_seed_calibration.default_scenarios`.
 Diagnostic rows (small-n / heavy-tail bootstrap under-coverage and the
@@ -80,10 +81,15 @@ def main() -> int:
             logger.info(f"  cov  {row['name']:>16s} "
                         f"coverage={row['coverage']:.3f} "
                         f"nominal={row['nominal']:.3f} {row['verdict']}")
-        else:
+        elif row['section'] == 'power':
             logger.info(f"  pow  {row['name']:>16s} "
                         f"power={row['rejection_rate']:.3f} "
                         f"floor={row['min_power']:.3f} {row['verdict']}")
+        else:
+            logger.info(f"  fam  {row['name']:>16s} m={row['m']} "
+                        f"FWER={row['family_error_rate']:.3f} "
+                        f"threshold={row['threshold']:.3f} "
+                        f"{row['verdict']}")
     if report['n_diagnostic_failed']:
         logger.warning('  diagnostic rows outside nominal: '
                        f"{report['n_diagnostic_failed']} "
