@@ -156,7 +156,8 @@ def csa_read_elements(T: int, *, m: int, topk: int, c: int, c_i: int,
     _validate_positive(c, 'c', 'csa_read_elements')
     _validate_positive(c_i, 'c_i', 'csa_read_elements')
     _validate_positive(n_idx_heads, 'n_idx_heads', 'csa_read_elements')
-    if not isinstance(sliding_window, int) or sliding_window < 0:
+    if (not isinstance(sliding_window, int)
+            or isinstance(sliding_window, bool) or sliding_window < 0):
         raise ValueError(
             f'csa_read_elements: sliding_window must be a non-negative int, '
             f'got {sliding_window!r}')
@@ -188,7 +189,8 @@ def hca_read_elements(T: int, *, m2: int, c: int,
     _validate_T(T, 'hca_read_elements')
     _validate_positive(m2, 'm2', 'hca_read_elements')
     _validate_positive(c, 'c', 'hca_read_elements')
-    if not isinstance(sliding_window, int) or sliding_window < 0:
+    if (not isinstance(sliding_window, int)
+            or isinstance(sliding_window, bool) or sliding_window < 0):
         raise ValueError(
             f'hca_read_elements: sliding_window must be a non-negative int, '
             f'got {sliding_window!r}')

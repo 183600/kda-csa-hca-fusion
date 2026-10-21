@@ -106,8 +106,6 @@ def test_budget_scaling_claims():
         f'{sm_small} -> {sm_large}')
     # With topk fixed at 2, the selected-gather term saturates while the
     # indexer scan keeps growing linearly: the indexer is the binding term.
-    c1 = kv_budget.csa_read_elements(
-        256, m=4, topk=2, c=32, c_i=16, n_idx_heads=2, sliding_window=4)
     c2 = kv_budget.csa_read_elements(
         4096, m=4, topk=2, c=32, c_i=16, n_idx_heads=2, sliding_window=4)
     _ok('CSA indexer dominates at long T',
@@ -164,6 +162,18 @@ def test_op_and_layout_dispatch():
     except ValueError:
         raised = True
     _ok('empty layout raises ValueError', raised, '')
+    for name, fn, kwargs in (
+            ('CSA', kv_budget.csa_read_elements,
+             dict(T=16, m=4, topk=2, c=32, c_i=16)),
+            ('HCA', kv_budget.hca_read_elements,
+             dict(T=16, m2=8, c=32))):
+        for bad in (True, 1.0):
+            raised = False
+            try:
+                fn(sliding_window=bad, **kwargs)
+            except ValueError:
+                raised = True
+            _ok(f'{name} rejects sliding_window={bad!r}', raised, '')
 
 
 def _mqar_spec():
