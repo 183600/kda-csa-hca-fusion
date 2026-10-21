@@ -254,6 +254,15 @@ def test_confusion_matrix_rejects_out_of_range_explicit_classes():
         with pytest.raises(ValueError):
             confusion_matrix([0], [0], num_classes=bad_classes)
 
+    # Class ids are exact too: 1.9 must not silently become class 1.
+    for bad_pred, bad_target in (
+            ([0.0, 1.9], [0, 1]),
+            ([0, 1], [0.0, 1.0]),
+            ([True], [1]),
+    ):
+        with pytest.raises(ValueError):
+            confusion_matrix(bad_pred, bad_target)
+
 
 # ---------------------------------------------------------------------------
 # Imbalance-aware classification / ranking metrics

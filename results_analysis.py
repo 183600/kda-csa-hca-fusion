@@ -959,6 +959,17 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
 #     predicts the majority class (high accuracy, near-zero minority F1).
 
 
+def _class_id_tensor(values, name: str) -> torch.Tensor:
+    """Flatten integer class ids; never truncate floats or coerce bools."""
+    tensor = torch.as_tensor(values)
+    if tensor.numel() and (tensor.dtype == torch.bool
+                           or tensor.is_floating_point()
+                           or tensor.is_complex()):
+        raise ValueError(
+            f'{name} must contain integer class ids, got dtype {tensor.dtype}')
+    return tensor.reshape(-1).to(dtype=torch.long)
+
+
 def confusion_matrix(pred, target, *, num_classes: int | None = None):
     """Integer confusion matrix ``C[i, j] = #(target == i, pred == j)``.
 
@@ -968,8 +979,8 @@ def confusion_matrix(pred, target, *, num_classes: int | None = None):
     rows/columns stay zero, which is exactly the evidence needed to detect
     a class that is never predicted).
     """
-    pred = torch.as_tensor(pred, dtype=torch.long).reshape(-1)
-    target = torch.as_tensor(target, dtype=torch.long).reshape(-1)
+    pred = _class_id_tensor(pred, 'pred')
+    target = _class_id_tensor(target, 'target')
     if pred.numel() != target.numel():
         raise ValueError(
             f'pred/target length mismatch: {pred.numel()} vs {target.numel()}')
