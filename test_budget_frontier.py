@@ -381,6 +381,26 @@ def test_delta_rule_orthonormal_keys_exact_recall():
 
 # --- Exp 9 builder / sweep -------------------------------------------------
 
+def test_parse_ratio_rejects_invalid_layouts():
+    """A malformed layout label must be a skip, never a crash.
+
+    The layout accounting rejects negative components and the empty
+    layout; the parser has to reject them too, otherwise the join dies
+    with an uncaught ValueError instead of dropping the row.
+    """
+    from run_budget_frontier import _parse_ratio
+    _ok('valid ratio parsed', _parse_ratio('3:1:1') == (3, 1, 1),
+        str(_parse_ratio('3:1:1')))
+    _ok('negative component rejected', _parse_ratio('3:-1:1') is None,
+        str(_parse_ratio('3:-1:1')))
+    _ok('empty layout rejected', _parse_ratio('0:0:0') is None,
+        str(_parse_ratio('0:0:0')))
+    _ok('wrong arity rejected', _parse_ratio('3:1') is None,
+        str(_parse_ratio('3:1')))
+    _ok('non-numeric rejected', _parse_ratio('a:b:c') is None,
+        str(_parse_ratio('a:b:c')))
+
+
 def test_build_budget_curves_rows():
     print('\nTest: run_budget_frontier.build_budget_curves row shape')
     from run_budget_frontier import LAYOUTS, build_budget_curves, mqar_spec
@@ -482,6 +502,7 @@ _TEST_FUNCS = [
     test_spearman_rank_correlation,
     test_delta_rule_recent_write_identity,
     test_delta_rule_orthonormal_keys_exact_recall,
+    test_parse_ratio_rejects_invalid_layouts,
     test_build_budget_curves_rows,
     test_decode_budget_curve_and_sweep_join,
     test_decode_sweep_smoke,

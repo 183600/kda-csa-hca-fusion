@@ -333,11 +333,24 @@ def run_decode_sweep(device, topk_values, prefill_lens, n_decode, repeats):
 
 
 def _parse_ratio(label):
+    """Parse a ``'n_kda:n_csa:n_hca'`` layout label.
+
+    Returns ``None`` for anything that is not a valid layout, INCLUDING a
+    negative component: the layout accounting rejects those, and a
+    malformed label must be a documented skip (the row is dropped) rather
+    than an uncaught ``ValueError`` that aborts the whole join.
+    """
     try:
         parts = [int(x) for x in str(label).replace(' ', '').split(':')]
     except (TypeError, ValueError):
         return None
-    return tuple(parts) if len(parts) == 3 else None
+    if len(parts) != 3:
+        return None
+    if any(n < 0 for n in parts):
+        return None
+    if sum(parts) == 0:
+        return None
+    return tuple(parts)
 
 
 def _try_load(path):
