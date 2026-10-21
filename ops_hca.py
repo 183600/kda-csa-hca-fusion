@@ -325,7 +325,7 @@ def naive_hca(
         if cat_t.shape[-1] == 0:
             return None
         if sink_logits is None:
-            all_masked_t = cat_t.isinf().all(-1, keepdim=True)
+            all_masked_t = cat_t.isneginf().all(-1, keepdim=True)
             return _nan_safe_softmax(
                 cat_t, dim=-1, all_masked_mask=all_masked_t)
         log_sink_t = sink_logits.view(1, nh, 1, 1).to(cat_t)

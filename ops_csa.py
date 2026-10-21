@@ -660,15 +660,37 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
         dim: the softmax reduction dim.
         all_masked_mask: optional precomputed boolean mask of fully-masked
             rows (shape broadcastable to ``logits`` with ``dim`` reduced).
-            If ``None`` we compute it from ``logits.isinf().all(dim=...)``.
+            If ``None`` we compute it from ``logits.isneginf().all(dim=...)``.
 
     Returns:
         Softmax along ``dim`` with fully-masked rows zeroed.
+
+    Notes:
+        ``-inf`` is the *only* marker of a fully-masked row: ``isinf()``
+        would also match ``+inf`` and silently zero a row whose softmax is
+        a well-defined distribution over the ``+inf`` entries.  Rows that
+        contain ``+inf`` scores get all their mass on those entries
+        (``1/k`` each) — the ``softmax`` limit — so the result stays finite
+        instead of ``NaN``.
     """
     if all_masked_mask is None:
-        all_masked = logits.isinf().all(dim=dim, keepdim=True)
+        all_masked = logits.isneginf().all(dim=dim, keepdim=True)
     else:
         all_masked = all_masked_mask
+    # ``+inf`` scores: torch.softmax returns NaN there, so the limit is
+    # applied explicitly (all the mass on the +inf entries, 1/k each).
+    pos_inf = logits.isposinf()
+    has_pos_inf = pos_inf.any(dim=dim, keepdim=True)
+    if bool(has_pos_inf.any()):
+        n_pos = pos_inf.sum(dim=dim, keepdim=True).clamp(min=1)
+        pos_soft = pos_inf.to(logits.dtype) / n_pos.to(logits.dtype)
+        # Rows without +inf keep the ordinary softmax; the +inf rows are
+        # replaced wholesale by ``pos_soft``.
+        safe_logits = logits.masked_fill(has_pos_inf, 0.0)
+        soft = _bf16_safe_softmax(safe_logits, dim=dim)
+        soft = soft.masked_fill(has_pos_inf, 0.0)
+        soft = soft.masked_fill(all_masked, 0.0)
+        return soft + pos_soft
     if not bool(all_masked.any()):
         # No fully-masked rows: use bf16-safe softmax.
         return _bf16_safe_softmax(logits, dim=dim)
