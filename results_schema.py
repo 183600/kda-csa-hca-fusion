@@ -1591,6 +1591,175 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
     return out
 
 
+# ``multi_seed_calibration`` / Exp 16: the certificate for the paired
+# inference panel. Rates are recomputed from counts, and every gate/verdict
+# is derived from the recorded threshold so a widened tolerance or a
+# manually flipped verdict cannot be archived as a green certificate.
+_EXP16_SECTIONS = frozenset({'size', 'coverage', 'power'})
+_EXP16_METHODS = frozenset({'paired_t', 'sign', 'permutation'})
+
+
+@register_row_contract('exp16_paired_stats_calibration')
+def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
+    out: list[str] = []
+    seen: set = set()
+    sections_present: set = set()
+    meta = metadata if isinstance(metadata, dict) else {}
+    settings = meta.get('settings') if isinstance(meta.get('settings'),
+                                                  dict) else {}
+    for i, row in enumerate(rows):
+        where = f'row[{i}]'
+        if not isinstance(row, dict):
+            out.append(f'{where}: expected an object, got {type(row).__name__}')
+            continue
+        section = row.get('section')
+        if section not in _EXP16_SECTIONS:
+            out.append(f'{where}: section={section!r} not in '
+                       f'{sorted(_EXP16_SECTIONS)}')
+            continue
+        sections_present.add(section)
+        name = row.get('name')
+        if not isinstance(name, str) or not name:
+            out.append(f"{where}: 'name' must be a non-empty string")
+        n_pairs = row.get('n_pairs')
+        if not (_positive_int(n_pairs) and int(n_pairs) >= 2):
+            out.append(f"{where}: 'n_pairs' must be an int >= 2, "
+                       f'got {n_pairs!r}')
+        n_reps = row.get('n_reps')
+        if not _positive_int(n_reps):
+            out.append(f"{where}: 'n_reps' must be a positive int")
+        elif settings.get('reps') is not None \
+                and int(settings['reps']) != int(n_reps):
+            out.append(f'{where}: n_reps != metadata.settings.reps')
+        alpha = row.get('alpha')
+        if not (_finite_number(alpha) and 0.0 < float(alpha) < 1.0):
+            out.append(f"{where}: 'alpha' must be in (0, 1), got {alpha!r}")
+        elif settings.get('alpha') is not None \
+                and abs(float(settings['alpha']) - float(alpha)) > 1e-12:
+            out.append(f'{where}: alpha != metadata.settings.alpha')
+        se = row.get('se')
+        if not (_finite_number(se) and float(se) >= 0):
+            out.append(f"{where}: 'se' must be finite >= 0")
+        n_sig, rate = row.get('n_significant'), row.get('rejection_rate')
+        if section in ('size', 'power'):
+            if not (isinstance(n_sig, int) and not isinstance(n_sig, bool)
+                    and _positive_int(n_reps) and 0 <= n_sig <= n_reps):
+                out.append(f"{where}: n_significant must be in [0, n_reps]")
+            elif _finite_number(rate) and abs(
+                    float(rate) - n_sig / int(n_reps)) > 1e-12:
+                out.append(f'{where}: rejection_rate != n_significant/n_reps')
+            method = row.get('method')
+            if section == 'power':
+                if method != 'paired_t':
+                    out.append(f"{where}: power method must be 'paired_t'")
+            elif method not in _EXP16_METHODS:
+                out.append(f'{where}: method={method!r} not in '
+                           f'{sorted(_EXP16_METHODS)}')
+        if section == 'size':
+            tol = row.get('tol')
+            threshold = row.get('threshold')
+            if not (_finite_number(tol) and float(tol) > 0):
+                out.append(f"{where}: 'tol' must be finite > 0")
+            if not (_finite_number(threshold) and _finite_number(alpha)):
+                out.append(f"{where}: 'threshold' must be finite")
+            elif abs(float(threshold) - (float(alpha) + float(tol))) > 1e-12:
+                out.append(f'{where}: threshold != alpha + tol')
+            meets = row.get('meets')
+            if isinstance(meets, bool) and _finite_number(rate) \
+                    and _finite_number(threshold):
+                if meets != (float(rate) <= float(threshold)):
+                    out.append(f'{where}: meets contradicts rate/threshold')
+            gate = row.get('gate')
+            diag = row.get('diagnostic_only')
+            if not isinstance(gate, bool) or not isinstance(diag, bool):
+                out.append(f'{where}: gate/diagnostic_only must be bool')
+            elif gate == diag:
+                out.append(f'{where}: diagnostic_only must be !gate')
+            verdict = row.get('verdict')
+            if verdict not in ('within_bound', 'conservative', 'liberal'):
+                out.append(f'{where}: verdict={verdict!r} invalid')
+            elif isinstance(meets, bool):
+                want = ('within_bound' if meets
+                        else ('conservative'
+                              if float(rate) < float(alpha) - float(tol)
+                              else 'liberal'))
+                if verdict != want:
+                    out.append(f'{where}: verdict={verdict!r} != {want!r}')
+        elif section == 'coverage':
+            n_boot = row.get('n_boot')
+            if not _positive_int(n_boot):
+                out.append(f"{where}: 'n_boot' must be a positive int")
+            n_finite, n_cov = row.get('n_finite'), row.get('n_covered')
+            if not (isinstance(n_finite, int) and not isinstance(n_finite, bool)
+                    and _nonnegative_int(n_cov)
+                    and _positive_int(n_reps) and n_cov <= n_finite <= n_reps):
+                out.append(f'{where}: need 0 <= n_covered <= n_finite <= '
+                           f'n_reps, got {n_cov!r}/{n_finite!r}/{n_reps!r}')
+            coverage = row.get('coverage')
+            if _positive_int(n_reps) and _nonnegative_int(n_cov) \
+                    and n_cov <= n_reps:
+                want = n_cov / n_reps
+                if not (_finite_number(coverage)
+                        and abs(float(coverage) - want) < 1e-12):
+                    out.append(f'{where}: coverage != n_covered/n_reps')
+            nominal, bias = row.get('nominal'), row.get('bias')
+            if _finite_number(alpha) and _finite_number(coverage):
+                if not (_finite_number(nominal)
+                        and abs(float(nominal) - (1.0 - float(alpha)))
+                        < 1e-12):
+                    out.append(f'{where}: nominal != 1-alpha')
+                if not (_finite_number(bias)
+                        and abs(float(bias) - (float(coverage)
+                                               - float(nominal))) < 1e-12):
+                    out.append(f'{where}: bias != coverage-nominal')
+            tol = row.get('tol')
+            if not (_finite_number(tol) and float(tol) > 0):
+                out.append(f"{where}: 'tol' must be finite > 0")
+            meets = row.get('meets')
+            if isinstance(meets, bool) and _finite_number(bias) \
+                    and _finite_number(tol):
+                if meets != (abs(float(bias)) <= float(tol)):
+                    out.append(f'{where}: meets contradicts |bias| vs tol')
+            verdict = row.get('verdict')
+            if verdict not in ('calibrated', 'biased'):
+                out.append(f'{where}: verdict={verdict!r} invalid')
+            if isinstance(meets, bool) \
+                    and verdict != ('calibrated' if meets else 'biased'):
+                out.append(f'{where}: coverage verdict contradicts meets')
+            if not isinstance(row.get('gate'), bool) \
+                    or not isinstance(row.get('diagnostic_only'), bool):
+                out.append(f'{where}: gate/diagnostic_only must be bool')
+            elif row['gate'] == row['diagnostic_only']:
+                out.append(f'{where}: diagnostic_only must be !gate')
+        else:  # power
+            effect, floor = row.get('effect'), row.get('min_power')
+            if not (_finite_number(effect) and float(effect) > 0):
+                out.append(f"{where}: 'effect' must be finite > 0")
+            if not (_finite_number(floor) and 0.0 < float(floor) <= 1.0):
+                out.append(f"{where}: 'min_power' must be in (0, 1]")
+            meets = row.get('meets')
+            if isinstance(meets, bool) and _finite_number(rate) \
+                    and _finite_number(floor):
+                if meets != (float(rate) >= float(floor)):
+                    out.append(f'{where}: meets contradicts rate/min_power')
+            verdict = row.get('verdict')
+            if verdict not in ('met', 'below_floor'):
+                out.append(f'{where}: verdict={verdict!r} invalid')
+            if isinstance(meets, bool) \
+                    and verdict != ('met' if meets else 'below_floor'):
+                out.append(f'{where}: power verdict contradicts meets')
+            if row.get('gate') is not True:
+                out.append(f'{where}: power row must gate')
+        key = (section, name, row.get('method'))
+        if key in seen:
+            out.append(f'{where}: duplicate key {key!r}')
+        seen.add(key)
+    missing = sorted(_EXP16_SECTIONS - sections_present)
+    if missing:
+        out.append(f'certificate is incomplete: section(s) {missing} absent')
+    return out
+
+
 def validate_rows(kind: str, rows, metadata: dict | None = None) -> list[str]:
     """Return the contract violations for ``kind``'s rows ([] = conforming).
 

@@ -45,6 +45,9 @@ Environment knobs (set before importing / via ``os.environ``):
   * ``BUDGET_PREFILL_LENS`` (default '256,512') — Exp 9 decode prefill lengths.
   * ``BUDGET_DECODE_TOKENS`` (default 10) — Exp 9 decode tokens per cell.
   * ``BUDGET_REPEATS``  (default 2) — Exp 9 decode timing repeats.
+  * ``STATS_CAL_REPS``  (default 300) — Exp 16 calibration replicates.
+  * ``STATS_CAL_NBOOT`` (default 400) — Exp 16 bootstrap replicates.
+  * ``STATS_CAL_SEED``  (default 0)   — Exp 16 base seed.
   * ``SKIP_SLOW``       (default 0)   — if "1", skip CSA-heavy experiments on CPU.
 
 This script is the reproducibility anchor referenced by the paper's
@@ -309,6 +312,9 @@ _EXPERIMENT_OUTPUTS = {
                                'results/exp14_indexer_selector_provenance.json'],
     'exp15_ppl_calibration': ['results/exp15_ppl_calibration.json',
                               'results/exp15_ppl_calibration_provenance.json'],
+    'exp16_paired_stats_calibration': [
+        'results/exp16_paired_stats_calibration.json',
+        'results/exp16_paired_stats_calibration_provenance.json'],
     'exp7_roofline': ['results/exp7_roofline.json'],
     'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
     'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
@@ -335,6 +341,7 @@ _RAW_SIDE_FILES = {
     'results/exp6_decoding_provenance.json',
     'results/exp14_indexer_selector_provenance.json',
     'results/exp15_ppl_calibration_provenance.json',
+    'results/exp16_paired_stats_calibration_provenance.json',
     'results/exp4_overfit_gate.json',
     'checkpoints_lm/smoke_hybrid/run_record.json',
     'checkpoints_lm/smoke_softmax/run_record.json',
@@ -630,6 +637,7 @@ def run_all(seeds=None, steps=None):
         import run_decoding
         import run_indexer_selector
         import run_ppl_calibration
+        import run_stats_calibration
         import run_roofline
         import run_budget_frontier
         import test_roofline_schema
@@ -640,6 +648,7 @@ def run_all(seeds=None, steps=None):
         import test_quant_lm
         import test_indexer_selector
         import test_ppl_calibration
+        import test_multi_seed_calibration
         import run_quant_recall
         import run_quant_lm
         import method_analysis
@@ -871,6 +880,14 @@ def run_all(seeds=None, steps=None):
         #     before anything is archived.
         summary['runs'].append(
             _run('exp15_ppl_calibration', run_ppl_calibration.main))
+
+        # 7a-ter. Multi-seed inference calibration (Exp 16) — null size,
+        #     CI coverage and power of the paired t/sign/permutation panel
+        #     used by Exp 4/5/8. Pure Python, CPU-cheap (~2 s); the gate
+        #     refuses to archive a certificate with a failed gated row.
+        summary['runs'].append(
+            _run('exp16_paired_stats_calibration',
+                 run_stats_calibration.main))
 
         # 7b. Budget frontier — analytic curves + measured top-k decode
         #     sweep + joins over Exp 4/5/8 results. On CPU with SKIP_SLOW,
