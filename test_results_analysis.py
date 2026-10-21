@@ -226,6 +226,30 @@ def test_pareto_frontier_keeps_duplicate_names_apart():
     assert rows[2]['pareto']['acc_per_train_second'] == pytest.approx(0.16)
 
 
+def test_pareto_frontier_suffix_collision_stays_unique():
+    """A literal ``a#2`` name must not collide with the duplicate suffix."""
+    rows = [
+        {'op': 'a', 'mean_acc': 0.5, 'n_params': 100,
+         'mean_train_time_s': 10.0},
+        {'op': 'a#2', 'mean_acc': 0.9, 'n_params': 50,
+         'mean_train_time_s': 1.0},
+        {'op': 'a', 'mean_acc': 0.8, 'n_params': 200,
+         'mean_train_time_s': 4.0},
+    ]
+    report = pareto_frontier(rows)
+    assert set(report['points']) == {'a', 'a#2', 'a#3'}
+    assert report['points']['a']['acc_per_train_second'] == pytest.approx(0.05)
+    assert report['points']['a#2']['acc_per_train_second'] == pytest.approx(0.9)
+    assert report['points']['a#3']['acc_per_train_second'] == pytest.approx(0.2)
+    assert report['dominated_by'] == {'a': 'a#2', 'a#3': 'a#2'}
+
+    annotate_rows_with_pareto(rows)
+    assert rows[0]['pareto']['dominated_by'] == 'a#2'
+    assert rows[1]['pareto']['optimal'] is True
+    assert rows[2]['pareto']['dominated_by'] == 'a#2'
+    assert rows[2]['pareto']['acc_per_train_second'] == pytest.approx(0.2)
+
+
 def test_pareto_frontier_skips_missing_costs():
     rows = [
         {'op': 'a', 'mean_acc': 0.5, 'n_params': 10, 'mean_train_time_s': 1.0},

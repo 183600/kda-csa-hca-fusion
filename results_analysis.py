@@ -525,14 +525,24 @@ def _pareto_row_keys(rows: Sequence[Mapping], name_key: str) -> list[str]:
     point, so the earlier row vanished from the dominance analysis AND
     both rows were annotated with the SURVIVING row's ratios.  Duplicates
     now get a stable ``name#2`` / ``name#3`` suffix.
+
+    The generated suffix can itself be a literal name (``a``, ``a#2``,
+    ``a``), so keys are checked against every already-assigned key and
+    the suffix is advanced until it is unique.
     """
     seen: dict = {}
+    used: set = set()
     keys: list[str] = []
     for r in rows:
         name = r.get(name_key, r.get('op', '?'))
         count = seen.get(name, 0) + 1
+        key = name if count == 1 else f'{name}#{count}'
+        while key in used:
+            count += 1
+            key = f'{name}#{count}'
         seen[name] = count
-        keys.append(name if count == 1 else f'{name}#{count}')
+        used.add(key)
+        keys.append(key)
     return keys
 
 
