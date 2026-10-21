@@ -1096,17 +1096,28 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
             learn_verdicts.append(bool(v))
     # Distance check: unquantized rows grouped by (context, route); compare
     # the farthest vs nearest needle position (descriptive, seed-averaged).
-    by_axis: dict[tuple, list[tuple[int, float]]] = {}
+    # Rows are per dtype, so a position can appear several times: the
+    # accuracy AT an extreme position is the mean over the rows at that
+    # position (not an extreme of the (position, accuracy) tuples, which
+    # would take the lowest accuracy at the nearest position and the
+    # highest at the farthest one and bias the verdict).
+    by_axis: dict[tuple, dict[int, list[float]]] = {}
     for r in unquant:
         key = (r.get('context_len'), r.get('memory_type'))
-        by_axis.setdefault(key, []).append(
-            (int(r.get('needle_pos', 0)), float(r.get('accuracy_mean', 0.0))))
+        pos = int(r.get('needle_pos', 0))
+        by_axis.setdefault(key, {}).setdefault(pos, []).append(
+            float(r.get('accuracy_mean', 0.0)))
     distance_effects = []
-    for key, pts in sorted(by_axis.items(), key=lambda kv: str(kv[0])):
-        if len(pts) < 2:
+    for key, by_pos in sorted(by_axis.items(), key=lambda kv: str(kv[0])):
+        if len(by_pos) < 2:
+            # No distance axis without at least two distinct positions.
             continue
-        near = min(pts)[1]
-        far = max(pts)[1]
+        near_pos = min(by_pos)
+        far_pos = max(by_pos)
+        near_vals = by_pos[near_pos]
+        far_vals = by_pos[far_pos]
+        near = sum(near_vals) / len(near_vals)
+        far = sum(far_vals) / len(far_vals)
         distance_effects.append({
             'context_len': key[0],
             'memory_type': key[1],

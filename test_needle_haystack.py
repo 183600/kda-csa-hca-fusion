@@ -25,6 +25,12 @@ What is pinned here
 
 6. **Report self-consistency.** The JSON output round-trips as strict JSON;
    all row kinds are present; per-seed records are retained.
+
+7. **Distance degradation axis.** ``summarize_needle_hypotheses`` reports
+   the accuracy AT the nearest / farthest needle position (mean over the
+   per-dtype rows at that position), so the pre-registered
+   ``distance_degradation_verdict`` cannot be flipped by which dtype
+   happens to score best at which position.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from run_needle_haystack import (  # noqa: E402
     evaluate_rule_baselines,
     rule_baseline_predict,
     run_qat_needle_probe,
+    summarize_needle_hypotheses,
     train_needle_model,
     NEEDLE_HYPOTHESES,
 )
@@ -375,6 +382,78 @@ def test_qat_probe_budget_matched_control():
         f"{row['data_protocol']}")
 
 
+def test_distance_effect_uses_accuracy_at_extreme_positions():
+    """The distance axis compares accuracy AT the near/far positions.
+
+    Recall rows are emitted per dtype, so one needle position can appear
+    several times inside a (context, route) group.  Taking the extreme of
+    the ``(position, accuracy)`` tuples would report the LOWEST accuracy
+    at the nearest position and the HIGHEST at the farthest one, biasing
+    ``far_minus_near`` upward and the ``distance_degradation_verdict``
+    with it.  The accuracy at an extreme position is the mean over the
+    rows at that position.
+    """
+    print('\nTest: distance effect picks accuracy at the extreme positions')
+
+    def _row(ctx, pos, mem, acc, dtype):
+        return {
+            'row_kind': 'needle_recall', 'context_len': ctx,
+            'needle_pos': pos, 'memory_type': mem, 'dtype': dtype,
+            'quantized': False, 'accuracy_mean': acc,
+            'hypothesis_checks': {
+                'learned_retrieval': {'verdict': None},
+                'trained_matches_rule': {'verdict': None},
+            },
+        }
+
+    dtypes = ['fp32', 'fp16', 'bf16']
+    # Every dtype degrades with distance -> the verdict must hold.
+    degrading = ([_row(256, 64, 'kda', a, d)
+                  for d, a in zip(dtypes, [0.90, 0.85, 0.80])]
+                 + [_row(256, 192, 'kda', a, d)
+                    for d, a in zip(dtypes, [0.40, 0.35, 0.30])])
+    summary = summarize_needle_hypotheses(degrading)
+    eff = summary['distance_effects'][0]
+    _ok('near accuracy is the mean at the nearest position',
+        abs(eff['near_accuracy'] - 0.85) < 1e-12,
+        f"{eff['near_accuracy']}")
+    _ok('far accuracy is the mean at the farthest position',
+        abs(eff['far_accuracy'] - 0.35) < 1e-12,
+        f"{eff['far_accuracy']}")
+    _ok('degrading across every dtype -> verdict True',
+        summary['distance_degradation_verdict'] is True,
+        f"far-near={eff['far_minus_near']}")
+
+    # Every dtype improves with distance -> the verdict must be falsified.
+    improving = ([_row(256, 64, 'kda', a, d)
+                  for d, a in zip(dtypes, [0.30, 0.35, 0.40])]
+                 + [_row(256, 192, 'kda', a, d)
+                    for d, a in zip(dtypes, [0.80, 0.85, 0.90])])
+    summary = summarize_needle_hypotheses(improving)
+    eff = summary['distance_effects'][0]
+    _ok('improving across every dtype -> verdict False',
+        summary['distance_degradation_verdict'] is False
+        and eff['far_minus_near'] > 0,
+        f"far-near={eff['far_minus_near']}")
+
+    # One row per position (single dtype) keeps the exact reported values.
+    single = [_row(256, 64, 'kda', 0.9, 'fp32'),
+              _row(256, 192, 'kda', 0.4, 'fp32')]
+    eff = summarize_needle_hypotheses(single)['distance_effects'][0]
+    _ok('single-dtype rows keep their exact accuracies',
+        eff['near_accuracy'] == 0.9 and eff['far_accuracy'] == 0.4
+        and eff['far_minus_near'] == -0.5, f'{eff}')
+
+    # A single needle position is not a distance axis (no fake far/near).
+    one_pos = [_row(256, 64, 'kda', 0.9, 'fp32'),
+               _row(256, 64, 'kda', 0.4, 'fp16')]
+    summary = summarize_needle_hypotheses(one_pos)
+    _ok('one distinct position yields no distance axis',
+        summary['distance_effects'] == []
+        and summary['distance_degradation_verdict'] is None,
+        f"{summary['distance_effects']}")
+
+
 def test_needle_experiment_json_output():
     """Full experiment run produces valid JSON with all row kinds."""
     print('\nTest: experiment JSON structure')
@@ -453,6 +532,7 @@ def main() -> int:
     test_rule_baseline_recovers_fact()
     test_bf16_csa_hca_no_nan_inf()
     test_qat_probe_budget_matched_control()
+    test_distance_effect_uses_accuracy_at_extreme_positions()
     test_needle_experiment_json_output()
     print('\n=== ALL NEEDLE HAYSTACK TESTS PASSED ===')
     return 0
