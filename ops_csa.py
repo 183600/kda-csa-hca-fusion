@@ -431,11 +431,11 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
         operators, decoding caches, and the FLOPs accounting in
         ``run_kv_cache``).
     """
-    if not isinstance(T, int) or T < 0:
+    if isinstance(T, bool) or not isinstance(T, int) or T < 0:
         raise ValueError(f"T must be a non-negative int, got {T!r}")
-    if not isinstance(n_blocks, int) or n_blocks < 0:
+    if isinstance(n_blocks, bool) or not isinstance(n_blocks, int) or n_blocks < 0:
         raise ValueError(f"n_blocks must be a non-negative int, got {n_blocks!r}")
-    if not isinstance(m, int) or m < 1:
+    if isinstance(m, bool) or not isinstance(m, int) or m < 1:
         raise ValueError(f"m must be a positive int, got {m!r}")
     key = (T, n_blocks, m, str(device))
     cached = _CAUSAL_BLOCK_MASK_CACHE.get(key)

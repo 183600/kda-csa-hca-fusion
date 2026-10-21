@@ -57,6 +57,30 @@ def _ok(name, cond, detail=''):
     return cond
 
 
+def test_causal_block_mask_validation():
+    """Reject bool/float geometry instead of accepting it as an int."""
+    cases = [
+        ('T=True', lambda: _causal_block_mask(True, 2, 2, 'cpu')),
+        ('T=-1', lambda: _causal_block_mask(-1, 2, 2, 'cpu')),
+        ('T=1.5', lambda: _causal_block_mask(1.5, 2, 2, 'cpu')),
+        ('n_blocks=True', lambda: _causal_block_mask(4, True, 2, 'cpu')),
+        ('n_blocks=1.5', lambda: _causal_block_mask(4, 1.5, 2, 'cpu')),
+        ('m=True', lambda: _causal_block_mask(4, 2, True, 'cpu')),
+        ('m=0', lambda: _causal_block_mask(4, 2, 0, 'cpu')),
+        ('m=2.5', lambda: _causal_block_mask(4, 2, 2.5, 'cpu')),
+    ]
+    raised = 0
+    for _label, fn in cases:
+        try:
+            fn()
+        except ValueError:
+            raised += 1
+    _ok('causal block-mask geometry validation', raised == len(cases),
+        f'raised={raised}/{len(cases)}')
+    empty = _causal_block_mask(0, 0, 2, 'cpu')
+    _ok('T=0 remains valid', tuple(empty.shape) == (0, 0), str(empty.shape))
+
+
 # ---------------------------------------------------------------------------
 # 1. CSA lightning-indexer query-axis chunking
 # ---------------------------------------------------------------------------
