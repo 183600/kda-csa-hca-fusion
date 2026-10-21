@@ -141,6 +141,13 @@ logger = logging.getLogger(__name__)
 VOCAB = 16
 SEQ_LEN = 32
 D_MODEL = 32
+
+# Dedicated RNG streams. Training, validation monitoring and the headline
+# evaluation must never share a stream, or a held-out batch could reproduce a
+# training example (or the selection stream could double as the test set).
+TRAIN_GEN_OFFSET = 1_000_000
+EVAL_GEN_OFFSET = 5_000_000
+VAL_GEN_OFFSET = 9_000_000
 RESULTS_PATH = os.path.join('results', 'exp9_recall_reach.json')
 
 MEMORY_KINDS = ('kda', 'mamba2')
@@ -688,7 +695,7 @@ def _build_recall_val_set(*, embed, seq_len: int, batch: int, vocab: int,
     embedding weights. No global RNG draw; the same fixed set is used for
     every checkpoint, so the curve is comparable across steps.
     """
-    gen = make_seeded_generator(int(seed) + 9_000_000, device=device)
+    gen = make_seeded_generator(int(seed) + VAL_GEN_OFFSET, device=device)
     out = []
     with torch.no_grad():
         for _ in range(max(1, int(n_batches))):
@@ -765,7 +772,7 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
     param_groups = _build_param_groups(model, head, embed, weight_decay=0.01)
     opt = torch.optim.AdamW(param_groups, lr=lr)
     params = [p for g in param_groups for p in g['params']]
-    gen = make_seeded_generator(seed + 1_000_000, device=device)
+    gen = make_seeded_generator(int(seed) + TRAIN_GEN_OFFSET, device=device)
 
     model.train()
     head.train()
@@ -836,7 +843,7 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
                 'fixed_set': True,
                 'read_only': True,
                 'rng_neutral': True,
-                'seed_offset': 9_000_000,
+                'seed_offset': VAL_GEN_OFFSET,
                 'n_sequences': int(max(1, val_batches)) * int(val_batch),
             },
         }
@@ -878,8 +885,15 @@ def _recall_error_category(pred: int, target: int, ids, key_pos: int,
 def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
                     n_batches: int = 4, batch: int = 64, seed: int = 42,
                     vocab: int = VOCAB, device='cpu',
-                    max_error_examples: int = 8) -> dict:
+                    max_error_examples: int = 8,
+                    gen_offset: int = EVAL_GEN_OFFSET) -> dict:
     """Accuracy + distance buckets on fresh long-range batches.
+
+    ``gen_offset`` selects the evaluation stream (``seed + gen_offset``).
+    The default is the historical headline evaluation stream; callers that
+    need a sealed test stream pass a distinct offset (e.g. the layerwise
+    search's final-test offset) so the same batches are never used both to
+    select a configuration and to report its final score.
 
     Also returns the *probe batch* (embeddings + key positions + cue) so
     the caller can run the indexer diagnostic on the exact same samples the
@@ -890,7 +904,14 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
     """
     if isinstance(device, str):
         device = torch.device(device)
-    gen = make_seeded_generator(seed + 5_000_000, device=device)
+    if isinstance(gen_offset, bool) or not isinstance(gen_offset, int):
+        raise ValueError(
+            f'evaluate_recall: gen_offset must be an exact int, got '
+            f'{gen_offset!r}')
+    if gen_offset < 0:
+        raise ValueError(
+            f'evaluate_recall: gen_offset must be >= 0, got {gen_offset!r}')
+    gen = make_seeded_generator(int(seed) + int(gen_offset), device=device)
     correct = 0
     total = 0
     buckets = {'window': [0, 0], 'mid': [0, 0], 'far': [0, 0]}
@@ -953,6 +974,8 @@ def evaluate_recall(model, embed, head, *, seq_len: int = SEQ_LEN,
                          'cue_pos': cue_pos}
     out = {
         'accuracy': (correct / total) if total else None,
+        'seed': int(seed),
+        'gen_offset': int(gen_offset),
         'n_eval': total,
         'buckets': {k: {'correct': v[0], 'n': v[1],
                         'accuracy': (v[0] / v[1]) if v[1] else None}
@@ -1427,13 +1450,13 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                 'train_batch': int(train_batch),
                 'eval_batches': int(eval_batches),
                 'eval_batch': int(eval_batch),
-                'batch_gen_seed_offset': 1_000_000,
-                'eval_gen_seed_offset': 5_000_000,
+                'batch_gen_seed_offset': TRAIN_GEN_OFFSET,
+                'eval_gen_seed_offset': EVAL_GEN_OFFSET,
                 'validation_monitor': {
                     'val_every': int(val_every),
                     'val_batches': int(val_batches),
                     'val_batch': int(val_batch),
-                    'val_gen_seed_offset': 9_000_000,
+                    'val_gen_seed_offset': VAL_GEN_OFFSET,
                     'note': ('fixed held-out long-range batch scored every '
                              'val_every steps; read-only and RNG-neutral, '
                              'so it cannot change the training loss curve '
@@ -1630,9 +1653,9 @@ def main(argv=None) -> int:
             'seq_len': int(args.seq_len),
             'd_model': int(args.d_model),
             'seed_stream_offsets': {
-                'train': 1_000_000,
-                'eval': 5_000_000,
-                'validation': 9_000_000,
+                'train': TRAIN_GEN_OFFSET,
+                'eval': EVAL_GEN_OFFSET,
+                'validation': VAL_GEN_OFFSET,
             },
         },
         artifacts={'results': out_path},
