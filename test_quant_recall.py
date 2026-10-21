@@ -118,11 +118,18 @@ def test_quant_spec_accounting():
             _ok(label, False, 'no error')
         except ValueError:
             _ok(label, True)
-    try:
-        storage_bytes(-1, spec)
-        _ok('negative element count rejected', False, 'no error')
-    except ValueError:
-        _ok('negative element count rejected', True)
+    for bad_n in (-1, True, float('nan'), float('inf')):
+        try:
+            storage_bytes(bad_n, spec)
+            _ok(f'element count {bad_n!r} rejected', False, 'no error')
+        except ValueError:
+            _ok(f'element count {bad_n!r} rejected', True)
+    for bad_base in (True, 0.0, float('nan'), float('inf')):
+        try:
+            compression_ratio(spec, bad_base)
+            _ok(f'baseline {bad_base!r} rejected', False, 'no error')
+        except ValueError:
+            _ok(f'baseline {bad_base!r} rejected', True)
 
 
 def test_quantized_row_bytes_bridge():
