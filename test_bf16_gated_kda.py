@@ -312,6 +312,26 @@ def test_gated_delta_rule_state_contract_and_mixed_dtype_step():
         f'{o.dtype}')
 
 
+def test_gated_delta_rule_empty_sequence_dtype_contract():
+    print('\nTest: GatedDeltaRule T=0 dtype contract')
+    B, H, K, V = 2, 3, 4, 5
+    layer = GatedDeltaRule(H, K, V, gate_type='per_channel')
+    q = torch.empty(B, 0, H, K)
+    k = torch.empty(B, 0, H, K)
+    v = torch.empty(B, 0, H, V)
+    init = torch.randn(B, H, K, V, dtype=torch.float64)
+
+    o0, s0 = layer(q, k, v, initial_state=init)
+    q1 = torch.randn(B, 1, H, K)
+    k1 = torch.randn(B, 1, H, K)
+    v1 = torch.randn(B, 1, H, V)
+    o1, s1 = layer(q1, k1, v1, initial_state=init)
+    _ok('T=0 output shape', o0.shape == (B, 0, H, V), f'{o0.shape}')
+    _ok('T=0 state promoted', s0.dtype == torch.float64, f'{s0.dtype}')
+    _ok('T=0 output matches T=1 dtype', o0.dtype == o1.dtype,
+        f'{o0.dtype} vs {o1.dtype}')
+
+
 def test_gated_delta_rule_bf16():
     print('\nTest: GatedDeltaRule bfloat16 forward')
     dtype = torch.bfloat16
@@ -346,6 +366,7 @@ if __name__ == '__main__':
     test_gated_delta_rule_gradient()
     test_gated_delta_rule_step_functional()
     test_gated_delta_rule_state_contract_and_mixed_dtype_step()
+    test_gated_delta_rule_empty_sequence_dtype_contract()
     test_gated_delta_rule_bf16()
 
     print('\n=== ALL TESTS PASSED ===')

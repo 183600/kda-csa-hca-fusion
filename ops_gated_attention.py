@@ -382,15 +382,6 @@ class GatedDeltaRule(nn.Module):
         else:
             S = initial_state
 
-        # Empty sequence: no steps to take, return an empty output and the
-        # (unchanged) initial state. ``torch.stack([])`` below would raise
-        # ``RuntimeError: stack expects a non-empty TensorList``; the
-        # reference ``ops_kda.naive_recurrent_kda`` short-circuits T=0 in
-        # the same way.
-        if T == 0:
-            return (torch.zeros(B, 0, H, V, dtype=dtype, device=device),
-                    S)
-
         # Parameters default to float32, and a caller-provided initial
         # state may differ from the activation dtype. Promote every operand
         # (including the state) to one work dtype: multiplying by a
@@ -408,6 +399,17 @@ class GatedDeltaRule(nn.Module):
             v = v.to(work_dtype)
         if S.dtype != work_dtype:
             S = S.to(work_dtype)
+
+        # Empty sequence: no steps to take, but the result must follow the
+        # same dtype contract as the non-empty path. In particular a
+        # mixed-dtype ``initial_state`` promotes both the returned state
+        # and the (empty) output; returning the raw initial state / q dtype
+        # would make T=0 disagree with T=1.
+        if T == 0:
+            out_dtype = torch.promote_types(dtype, S.dtype)
+            return (torch.zeros(B, 0, H, V, dtype=out_dtype,
+                                device=device), S)
+
         gate_state = gate_state.to(dtype=work_dtype, device=device)
         beta = beta.to(dtype=work_dtype, device=device)
 
