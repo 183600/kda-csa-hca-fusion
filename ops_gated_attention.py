@@ -346,6 +346,21 @@ class GatedDeltaRule(nn.Module):
                 f'GatedDeltaRule: value dim V={V} does not match '
                 f'value_dim={self.value_dim}.')
 
+        # The state geometry is part of the operator contract. Accepting a
+        # broadcastable slice (e.g. [B, H, K, 1] or [1, H, K, V]) would
+        # silently run a smaller state and return a differently shaped one.
+        if initial_state is not None:
+            if not isinstance(initial_state, torch.Tensor):
+                raise TypeError(
+                    'GatedDeltaRule: initial_state must be a torch.Tensor or '
+                    f'None, got {type(initial_state).__name__}.')
+            expected = (B, H, K, V)
+            if tuple(initial_state.shape) != expected:
+                raise ValueError(
+                    'GatedDeltaRule: initial_state.shape='
+                    f'{tuple(initial_state.shape)} does not match the '
+                    f'expected {expected} ([B, H, K, V]).')
+
         dtype = q.dtype
         device = q.device
 
@@ -466,6 +481,28 @@ def gated_delta_rule_step(
         output [B, H, V], new_state [B, H, K, V]
     """
     B, H, K, V = S.shape
+
+    # Match ``GatedDeltaRule.forward``: promote every operand (state, q/k/v,
+    # gate, beta) to one work dtype before the recurrence. Otherwise a
+    # float64 state with float32 activations fails the ``q_t @ S`` matmul
+    # even though the module-level operator accepts the same combination.
+    work_dtype = torch.promote_types(
+        torch.promote_types(q_t.dtype, k_t.dtype),
+        torch.promote_types(v_t.dtype, S.dtype))
+    work_dtype = torch.promote_types(work_dtype, gate.dtype)
+    work_dtype = torch.promote_types(work_dtype, beta.dtype)
+    if S.dtype != work_dtype:
+        S = S.to(work_dtype)
+    if q_t.dtype != work_dtype:
+        q_t = q_t.to(work_dtype)
+    if k_t.dtype != work_dtype:
+        k_t = k_t.to(work_dtype)
+    if v_t.dtype != work_dtype:
+        v_t = v_t.to(work_dtype)
+    if gate.dtype != work_dtype:
+        gate = gate.to(work_dtype)
+    if beta.dtype != work_dtype:
+        beta = beta.to(work_dtype)
 
     if gate_type == 'per_channel':
         gate_state = gate.view(1, H, K, 1)

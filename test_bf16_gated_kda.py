@@ -280,6 +280,38 @@ def test_gated_delta_rule_step_functional():
     _ok('per_head gate shape', o3.shape == (B, H, V), '')
 
 
+def test_gated_delta_rule_state_contract_and_mixed_dtype_step():
+    print('\nTest: GatedDeltaRule state geometry + functional-step dtypes')
+    B, T, H, K, V = 2, 6, 3, 4, 5
+    q = F.normalize(torch.randn(B, T, H, K), dim=-1)
+    k = F.normalize(torch.randn(B, T, H, K), dim=-1)
+    v = torch.randn(B, T, H, V) * 0.3
+    layer = GatedDeltaRule(H, K, V, gate_type='per_channel')
+
+    bad_shapes = [(B, H, K, 1), (B, H, 1, V), (1, H, K, V),
+                  (B, 1, K, V), (1, 1, 1, 1, 1)]
+    for shape in bad_shapes:
+        raised = False
+        try:
+            layer(q, k, v, initial_state=torch.zeros(shape))
+        except ValueError:
+            raised = True
+        _ok(f'rejects initial_state {shape}', raised, '')
+
+    # The functional step follows the module's mixed-dtype promotion, so a
+    # float64 state with float32 activations must run (not raise).
+    S = torch.randn(B, H, K, V, dtype=torch.float64)
+    gate = torch.full((H, K), 0.9, dtype=torch.float32)
+    beta = torch.full((H,), 0.1, dtype=torch.float32)
+    o, S_new = gated_delta_rule_step(
+        S, q[:, 0], k[:, 0], v[:, 0], gate, beta, 'per_channel')
+    _ok('mixed-dtype step runs', o.shape == (B, H, V), f'{o.shape}')
+    _ok('mixed-dtype step promotes state', S_new.dtype == torch.float64,
+        f'{S_new.dtype}')
+    _ok('mixed-dtype step promotes output', o.dtype == torch.float64,
+        f'{o.dtype}')
+
+
 def test_gated_delta_rule_bf16():
     print('\nTest: GatedDeltaRule bfloat16 forward')
     dtype = torch.bfloat16
@@ -313,6 +345,7 @@ if __name__ == '__main__':
     test_gated_delta_rule_forward()
     test_gated_delta_rule_gradient()
     test_gated_delta_rule_step_functional()
+    test_gated_delta_rule_state_contract_and_mixed_dtype_step()
     test_gated_delta_rule_bf16()
 
     print('\n=== ALL TESTS PASSED ===')
