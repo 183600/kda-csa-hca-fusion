@@ -423,6 +423,21 @@ def test_binary_ranking_metrics_rare_positive_and_ties():
     for bad in ([-1, 0, 1], [0, 2, 0], [0.0, 0.5, 1.0]):
         with pytest.raises(ValueError):
             binary_ranking_metrics(torch.arange(3.0), torch.tensor(bad))
+    # A non-finite score is not a rank, and a 0.5 mask value is not
+    # "False with extra confidence": both silently corrupt the metric.
+    for bad_scores in ([0.0, float('nan'), 1.0],
+                       [0.0, float('inf'), 1.0]):
+        with pytest.raises(ValueError):
+            binary_ranking_metrics(torch.tensor(bad_scores),
+                                   torch.tensor([0, 1, 0]))
+    with pytest.raises(ValueError):
+        binary_ranking_metrics(torch.arange(3.0), torch.tensor([0, 1, 0]),
+                               valid=torch.tensor([1.0, 0.5, 1.0]))
+    # Non-finite scores on explicitly EXCLUDED candidates are harmless.
+    allowed = binary_ranking_metrics(
+        torch.tensor([float('nan'), 0.1, 0.9]),
+        torch.tensor([0, 0, 1]), valid=torch.tensor([False, True, True]))
+    assert allowed['n'] == 2 and allowed['recall_at_1'] == pytest.approx(1.0)
 
 
 def test_tune_baseline_lr_selects_on_validation_stream():

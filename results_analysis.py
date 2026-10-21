@@ -1334,11 +1334,20 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
         raise ValueError('labels must contain only 0/1 binary values')
     labels_t = labels_raw.to(dtype=torch.bool)
     if valid is not None:
-        valid_t = torch.as_tensor(valid).reshape(-1).to(dtype=torch.bool)
-        if valid_t.numel() != scores_t.numel():
+        valid_raw = torch.as_tensor(valid).reshape(-1)
+        if valid_raw.numel() != scores_t.numel():
             raise ValueError('valid mask length mismatch')
-        scores_t = scores_t[valid_t]
-        labels_t = labels_t[valid_t]
+        if valid_raw.dtype != torch.bool:
+            if valid_raw.numel() and not bool(
+                    ((valid_raw == 0) | (valid_raw == 1)).all().item()):
+                raise ValueError(
+                    'valid must be a boolean mask (or exact 0/1 values), '
+                    f'got {valid!r}')
+            valid_raw = valid_raw.to(dtype=torch.bool)
+        scores_t = scores_t[valid_raw]
+        labels_t = labels_t[valid_raw]
+    if scores_t.numel() and not bool(torch.isfinite(scores_t).all().item()):
+        raise ValueError('scores must be finite for the kept candidates')
 
     n = int(scores_t.numel())
     n_pos = int(labels_t.sum().item())
