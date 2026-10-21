@@ -101,14 +101,25 @@ def _se(rate: float, n: int) -> float:
     return math.sqrt(max(0.0, rate * (1.0 - rate)) / n)
 
 
+def _require_int(value, name: str, *, minimum: int | None = None) -> int:
+    """Reject bool/float/string counts instead of silently truncating them."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'{name} must be an exact int, got {value!r}')
+    if minimum is not None and value < minimum:
+        raise ValueError(f'{name} must be >= {minimum}, got {value!r}')
+    return value
+
+
 def _validate_common(n_units: int, n_reps: int, n_boot: int) -> None:
-    if int(n_units) < 2:
-        raise ValueError(f'n_units must be >= 2 to resample units, '
-                         f'got {n_units!r}')
-    if int(n_reps) < 1:
-        raise ValueError(f'n_reps must be >= 1, got {n_reps!r}')
-    if int(n_boot) < 1:
-        raise ValueError(f'n_boot must be >= 1, got {n_boot!r}')
+    _require_int(n_units, 'n_units', minimum=2)
+    _require_int(n_reps, 'n_reps', minimum=1)
+    _require_int(n_boot, 'n_boot', minimum=1)
+
+
+def _validate_study_args(n_reps: int, n_boot: int, seed: int) -> None:
+    _require_int(n_reps, 'n_reps', minimum=1)
+    _require_int(n_boot, 'n_boot', minimum=1)
+    _require_int(seed, 'seed')
 
 
 def simulate_units(n_units: int, rng: random.Random, *, mean_nll: float = MEAN_NLL,
@@ -186,10 +197,11 @@ def coverage_study(scenarios, *, n_boot: int = 500, reps: int = 400,
     binomial standard error, the signed bias and a
     ``{'calibrated', 'biased'}`` verdict.
     """
+    _validate_study_args(reps, n_boot, seed)
     rows: list[dict] = []
     for s_i, scenario in enumerate(scenarios):
-        n_units = int(scenario['n_units'])
-        alpha = float(scenario['alpha'])
+        n_units = scenario['n_units']
+        alpha = scenario['alpha']
         tol = float(scenario['tol'])
         _validate_common(n_units, reps, n_boot)
         _pb._validate_boot_args(alpha, n_boot)
@@ -197,7 +209,7 @@ def coverage_study(scenarios, *, n_boot: int = 500, reps: int = 400,
             raise ValueError(
                 f'scenario {s_i}: tol must be positive and finite, got {tol!r}')
         n_covered = 0
-        for r in range(int(reps)):
+        for r in range(reps):
             rng = random.Random(_derive_seed(seed, s_i, r))
             units = simulate_units(n_units, rng)
             report = _pb.bootstrap_ppl_ci(
@@ -206,7 +218,7 @@ def coverage_study(scenarios, *, n_boot: int = 500, reps: int = 400,
             lo, hi = report['ci_mean_nll']
             if lo <= MEAN_NLL <= hi:
                 n_covered += 1
-        coverage = n_covered / int(reps)
+        coverage = n_covered / reps
         nominal = 1.0 - alpha
         bias = coverage - nominal
         rows.append({
@@ -238,10 +250,11 @@ def paired_study(scenarios, *, n_boot: int = 500, reps: int = 400,
     ``delta > 0``; the pass floor is ``min_power`` required). Rates carry
     their binomial SE; each row records the bound it was judged against.
     """
+    _validate_study_args(reps, n_boot, seed)
     rows: list[dict] = []
     for s_i, scenario in enumerate(scenarios):
-        n_units = int(scenario['n_units'])
-        alpha = float(scenario['alpha'])
+        n_units = scenario['n_units']
+        alpha = scenario['alpha']
         delta = float(scenario.get('delta', 0.0))
         noise_sd = float(scenario.get('noise_sd', 0.2))
         check = str(scenario.get('check', 'size'))
@@ -269,7 +282,7 @@ def paired_study(scenarios, *, n_boot: int = 500, reps: int = 400,
                                  f'(0, 1], got {floor!r}')
             threshold = floor
         n_significant = 0
-        for r in range(int(reps)):
+        for r in range(reps):
             rng = random.Random(_derive_seed(seed, 100 + s_i, r))
             a, b = simulate_paired_units(
                 n_units, rng, noise_sd=noise_sd, delta=delta)
@@ -278,7 +291,7 @@ def paired_study(scenarios, *, n_boot: int = 500, reps: int = 400,
                 seed=_derive_seed(seed, 100 + s_i, r, 7))
             if report['significant']:
                 n_significant += 1
-        rate = n_significant / int(reps)
+        rate = n_significant / reps
         if check == 'size':
             meets = rate <= threshold
             verdict = 'within_bound' if meets else 'liberal'
@@ -324,17 +337,18 @@ def default_scenarios(*, small_n_units: int = 12) -> dict:
       {0.10, 0.20} with pre-registered floors {0.55, 0.90} (a power
       analysis at this geometry measured ~0.67 and ~1.00).
     """
+    small_n_units = _require_int(small_n_units, 'small_n_units', minimum=2)
     cov_tol_mid, cov_tol_small = 0.05, 0.08
     coverage = [
         {'n_units': 40, 'alpha': 0.10, 'tol': cov_tol_mid},
         {'n_units': 40, 'alpha': 0.05, 'tol': cov_tol_mid},
-        {'n_units': int(small_n_units), 'alpha': 0.10, 'tol': cov_tol_small},
-        {'n_units': int(small_n_units), 'alpha': 0.05, 'tol': cov_tol_small},
+        {'n_units': small_n_units, 'alpha': 0.10, 'tol': cov_tol_small},
+        {'n_units': small_n_units, 'alpha': 0.05, 'tol': cov_tol_small},
     ]
     paired = [
         {'n_units': 40, 'alpha': 0.10, 'delta': 0.0, 'check': 'size',
          'tol': 0.06},
-        {'n_units': int(small_n_units), 'alpha': 0.10, 'delta': 0.0,
+        {'n_units': small_n_units, 'alpha': 0.10, 'delta': 0.0,
          'check': 'size', 'tol': 0.10},
         {'n_units': 40, 'alpha': 0.10, 'delta': 0.10, 'check': 'power',
          'min_power': 0.55},

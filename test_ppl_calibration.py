@@ -93,6 +93,42 @@ def test_simulation_contract_and_rng_isolation():
         raise AssertionError('a size-control scenario with delta > 0 '
                              'must be refused')
 
+    # Trial counts, unit counts and seeds are exact ints: silently
+    # truncating 2.5 -> 2 would change the measured rate and its denominator.
+    scen = [{'n_units': 12, 'alpha': 0.10, 'tol': 0.08}]
+    bad_kwargs = (
+        ('reps', {'reps': True, 'n_boot': 4}),
+        ('reps', {'reps': 2.5, 'n_boot': 4}),
+        ('n_boot', {'reps': 2, 'n_boot': 4.5}),
+        ('seed', {'reps': 2, 'n_boot': 4, 'seed': 1.5}),
+    )
+    for label, kwargs in bad_kwargs:
+        for study in (PC.coverage_study, PC.paired_study):
+            try:
+                study(scen if study is PC.coverage_study else [
+                    {'n_units': 12, 'alpha': 0.1, 'delta': 0.0,
+                     'check': 'size', 'tol': 0.05}], **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f'{study.__name__} accepted non-int {label}={kwargs[label]!r}')
+    for bad_units in (12.5, True, '12'):
+        try:
+            PC.coverage_study([{'n_units': bad_units, 'alpha': 0.10,
+                                'tol': 0.08}], reps=2, n_boot=4)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'coverage_study accepted n_units={bad_units!r}')
+    try:
+        PC.default_scenarios(small_n_units=12.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('default_scenarios truncated small_n_units')
+
     # The process-global RNG stream is never advanced.
     state = random.getstate()
     PC.simulate_units(4, random.Random(1))
