@@ -400,7 +400,13 @@ def _resolve_layouts(layouts, labels) -> list[tuple[str, tuple[str, ...]]]:
         layouts = list(LAYOUT_PRESETS)
     elif isinstance(layouts, str):
         layouts = [layouts]
-    elif isinstance(layouts, tuple):
+    elif (isinstance(layouts, tuple) and layouts
+          and all(isinstance(kind, str) and kind in SUPPORTED_LAYER_KINDS
+                  for kind in layouts)):
+        # A bare explicit layout is naturally written as a tuple of kinds
+        # (``('kda', 'csa', 'hca')``). A tuple of preset NAMES is a
+        # sequence of layouts instead: the two vocabularies are disjoint,
+        # so this does not make the API ambiguous.
         layouts = [layouts]
     else:
         layouts = list(layouts)

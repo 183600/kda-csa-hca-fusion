@@ -637,6 +637,38 @@ def test_far_metrics_are_undefined_without_far_placements():
         and reach['structural_far_any_exact_fraction'] is None, str(reach))
 
 
+def test_recall_flops_accepts_tuple_layout_forms():
+    """Preset names and a bare layout can both be passed as a tuple.
+
+    ``_resolve_layouts`` treated EVERY tuple as one explicit layout, so
+    ``('alternating',)`` was parsed as a layer kind and rejected, and a
+    tuple of layouts was rejected as one nested kind. The two string
+    vocabularies (preset names vs layer kinds) are disjoint, so the
+    intent is unambiguous.
+    """
+    import recall_flops_audit as rfa
+
+    one = rfa.audit_layouts(('alternating',), measure=False)
+    _ok('tuple with one preset name selects one layout',
+        [r['group'] for r in one['rows']] == ['alternating'], str(one))
+    two = rfa.audit_layouts(('alternating', 'spread'), measure=False)
+    _ok('tuple of preset names selects both layouts',
+        [r['group'] for r in two['rows']] == ['alternating', 'spread'],
+        str([r['group'] for r in two['rows']]))
+    bare = rfa.audit_layouts(('kda', 'csa', 'hca'), measure=False)
+    _ok('tuple of layer kinds is one explicit layout',
+        len(bare['rows']) == 1
+        and bare['rows'][0]['layout'] == ['kda', 'csa', 'hca'],
+        str(bare['rows'][0]['layout']))
+    nested = rfa.audit_layouts((('kda', 'csa'), ('csa', 'hca')),
+                               measure=False)
+    _ok('tuple of explicit layout tuples is a layout sequence',
+        len(nested['rows']) == 2
+        and nested['rows'][0]['n_layers'] == 2
+        and nested['rows'][1]['n_layers'] == 2,
+        str([r['n_layers'] for r in nested['rows']]))
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -652,6 +684,7 @@ def main() -> int:
     test_hypothesis_checks_contract()
     test_worst_seed_selection_picks_lowest_accuracy()
     test_far_metrics_are_undefined_without_far_placements()
+    test_recall_flops_accepts_tuple_layout_forms()
     print('\nAll recall-reach tests passed.')
     return 0
 
