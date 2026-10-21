@@ -393,6 +393,36 @@ def test_power_planning_rejects_invalid_arguments_before_undefined_n():
     assert M.seeds_required(float('inf')) is None
 
 
+def test_resampling_arguments_reject_bool_float_and_zero():
+    """Bootstrap / permutation counts and seeds are exact ints.
+
+    Previously ``n_boot=True`` silently meant one resample, ``n_boot=1.5``
+    leaked a raw ``TypeError`` from ``range``, and float seeds were
+    truncated by ``random.Random(int(seed))``. All are caller bugs that
+    must fail before the undefined-n / exact-enumeration shortcuts hide
+    them.
+    """
+    d = [0.1, 0.2, 0.3, 0.4] * 5          # n > max_exact for Monte Carlo
+    for bad in (True, 1.5, 0):
+        with pytest.raises(ValueError):
+            M.bootstrap_paired_ci(d, n_boot=bad)
+        with pytest.raises(ValueError):
+            M.permutation_test(d, n_permutations=bad)
+    for bad in (True, 1.5):
+        with pytest.raises(ValueError):
+            M.bootstrap_paired_ci(d, seed=bad)
+        with pytest.raises(ValueError):
+            M.permutation_test(d, seed=bad)
+    for bad in (True, 1.5, -1):
+        with pytest.raises(ValueError):
+            M.permutation_test(d, max_exact=bad)
+    # Validation runs even on the undefined / exact shortcuts.
+    with pytest.raises(ValueError):
+        M.bootstrap_paired_ci([0.1], n_boot=0)
+    with pytest.raises(ValueError):
+        M.permutation_test([0.1], n_permutations=0)
+
+
 # ---------------------------------------------------------------------------
 # summarize_paired panel
 # ---------------------------------------------------------------------------

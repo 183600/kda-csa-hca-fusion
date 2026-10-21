@@ -339,6 +339,17 @@ def permutation_test(diffs, alternative: str = 'two-sided',
         raise ValueError(
             f"alternative must be 'two-sided'|'greater'|'less', "
             f"got {alternative!r}")
+    if (isinstance(n_permutations, bool)
+            or not isinstance(n_permutations, int) or n_permutations < 1):
+        raise ValueError(
+            f'n_permutations must be a positive int, got '
+            f'{n_permutations!r}')
+    if (isinstance(max_exact, bool)
+            or not isinstance(max_exact, int) or max_exact < 0):
+        raise ValueError(
+            f'max_exact must be a non-negative int, got {max_exact!r}')
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f'seed must be an int, got {seed!r}')
     d = _as_clean_diffs(diffs)
     n = len(d)
     if n == 0:
@@ -367,9 +378,6 @@ def permutation_test(diffs, alternative: str = 'two-sided',
                 'p_value': min(1.0, hits / float(n_perm)),
                 'alternative': alternative}
     rng = random.Random(seed)
-    if n_permutations < 1:
-        raise ValueError(
-            f'n_permutations must be >= 1, got {n_permutations!r}')
     hits = 0
     for _ in range(n_permutations):
         stat = 0.0
@@ -395,8 +403,10 @@ def bootstrap_paired_ci(diffs, alpha: float = 0.05, n_boot: int = 10000,
     """
     if not (0.0 < alpha < 1.0):
         raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
-    if n_boot < 1:
-        raise ValueError(f'n_boot must be >= 1, got {n_boot!r}')
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
+        raise ValueError(f'n_boot must be a positive int, got {n_boot!r}')
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f'seed must be an int, got {seed!r}')
     d = _as_clean_diffs(diffs)
     n = len(d)
     if n < 2:
