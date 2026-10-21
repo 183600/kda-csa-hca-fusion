@@ -702,6 +702,64 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     return soft.masked_fill(all_masked, 0.0)
 
 
+def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
+                  inplace_ok: bool = False):
+    """Joint softmax with an attention sink, matching ``_nan_safe_softmax``.
+
+    ``log_sink`` must already be broadcastable to ``scores``. Rows that
+    contain ``+inf`` take the softmax limit (all mass split evenly over the
+    ``+inf`` entries); leaving them in the shifted logsumexp path computes
+    ``+inf - +inf`` and returns NaN, even though the no-sink path already
+    handles them. Finite and all-``-inf`` rows follow the historical
+    log-space shift exactly, including the in-place fast path when the
+    caller owns ``scores``.
+    """
+    pos_inf = scores.isposinf()
+    has_pos_inf = pos_inf.any(dim=-1, keepdim=True)
+    any_pos_inf = bool(has_pos_inf.any())
+    if any_pos_inf:
+        # The +inf rows are overwritten below; a finite replacement also
+        # keeps the shared shift/logsumexp path from producing NaN.
+        scores = scores.masked_fill(has_pos_inf, 0.0)
+        inplace_ok = True
+    row_max = scores.amax(dim=-1, keepdim=True)
+    if all_masked_mask is None:
+        all_masked = torch.isneginf(row_max)
+    else:
+        all_masked = all_masked_mask
+    row_max_safe = torch.where(
+        all_masked, torch.zeros_like(row_max), row_max.clamp(min=0))
+    if torch.is_grad_enabled() or not inplace_ok:
+        shifted = scores - row_max_safe
+    else:
+        shifted = scores.sub_(row_max_safe)
+    # Fully-masked rows contribute nothing (``p`` is zeroed below). Their
+    # raw ``-inf - row_max`` entries still make the logsumexp backward
+    # produce ``0 * inf -> NaN``; replacing them with zeros only touches
+    # values that the final ``masked_fill`` discards, and keeps gradients
+    # finite for a batch containing an empty row.
+    if bool(all_masked.any()):
+        if torch.is_grad_enabled() or not inplace_ok:
+            shifted = shifted.masked_fill(all_masked, 0.0)
+        else:
+            shifted.masked_fill_(all_masked, 0.0)
+    shifted_sink = log_sink - row_max_safe
+    log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+    log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
+    if torch.is_grad_enabled():
+        p = (shifted - log_denom).exp()
+        p = p.masked_fill(all_masked, 0.0)
+    else:
+        p = shifted.sub_(log_denom).exp_()
+        p.masked_fill_(all_masked, 0.0)
+    if any_pos_inf:
+        n_pos = pos_inf.sum(dim=-1, keepdim=True).clamp(min=1)
+        pos_soft = pos_inf.to(p.dtype) / n_pos.to(p.dtype)
+        p = p.masked_fill(has_pos_inf, 0.0) + pos_soft
+        p = p.masked_fill(all_masked, 0.0)
+    return p
+
+
 def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
     """Normalize queries / compressed KV before the core attention.
 
@@ -2101,30 +2159,12 @@ def naive_csa(
             # space (never exp it) and shift it by -row_max alongside every
             # score so the largest exp() argument is 0. Invalid slots hold
             # ``-inf`` from the masked fills above, so their ``exp`` is
-            # exactly ``+0.0``.
+            # exactly ``+0.0``. ``_sink_softmax`` also applies the documented
+            # +inf limit (all mass on the +inf entries, none on the sink).
             log_sink = sink_logits.view(1, 1, nh, 1).to(cat)      # [1, 1, nh, 1]
-            row_max = cat.amax(-1, keepdim=True).clamp(min=0)     # [B, T, nh, 1]
-            if torch.is_grad_enabled():
-                # Out-of-place: autograd's Sub/Exp backward save this chain's
-                # operands/outputs, so in-place writes would trip the
-                # version-counter check.
-                shifted = cat - row_max
-                shifted_sink = log_sink - row_max
-                log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-                log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-                p = (shifted - log_denom).exp()
-                p = p.masked_fill(all_invalid, 0.0)
-            else:
-                # ``cat`` is freshly allocated by the einsum / window scoring
-                # above (or is a fresh single-branch tensor) and has no other
-                # readers left, so the shift/exp/fill chain can run in place:
-                # same elementwise ops in the same order (bit-identical).
-                shifted = cat.sub_(row_max)
-                shifted_sink = log_sink - row_max
-                log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-                log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-                p = shifted.sub_(log_denom).exp_()
-                p.masked_fill_(all_invalid, 0.0)
+            p = _sink_softmax(
+                cat, log_sink, all_invalid,
+                inplace_ok=not torch.is_grad_enabled())
         else:
             p = _nan_safe_softmax(cat, dim=-1, all_masked_mask=all_invalid)
 

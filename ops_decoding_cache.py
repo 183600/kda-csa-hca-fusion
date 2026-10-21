@@ -113,7 +113,7 @@ from ops_cache import normal_tensor_scope
 from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import (csa_compress_kv, _csa_compress_kv_overlapped_prev,
                      csa_lightning_indexer, _qk_normalize, _qk_normalize_,
-                     _nan_safe_softmax)
+                     _nan_safe_softmax, _sink_softmax)
 
 
 def _validate_cache_dtype(dtype) -> None:
@@ -342,13 +342,7 @@ def _joint_softmax_chunk(logits: torch.Tensor, valid: torch.Tensor,
     if sink_logits is not None:
         nh = masked.shape[2]
         log_sink = sink_logits.view(1, 1, nh, 1).to(masked)
-        row_max = masked.amax(-1, keepdim=True).clamp(min=0)
-        shifted = masked - row_max
-        shifted_sink = log_sink - row_max
-        lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-        log_denom = torch.logaddexp(lse, shifted_sink)
-        p = (shifted - log_denom).exp()
-        return p.masked_fill(all_invalid, 0.0)
+        return _sink_softmax(masked, log_sink, all_invalid)
     # ``torch.softmax`` alone is not enough: a row containing ``+inf``
     # scores (an overflowed indexer/sink term) yields NaN, while
     # ``naive_csa``'s no-sink chain stays finite through the shared
@@ -1829,20 +1823,10 @@ class CSADecodingCache:
             cat_valid = valid_mask[:, :, None, :]
         if cat.shape[-1] == 0:
             return torch.zeros(B, 1, nh, self.c, dtype=compute_dtype, device=device)
+        all_invalid = ~cat_valid.any(-1, keepdim=True)
         if sink_logits is not None:
             log_sink = sink_logits.view(1, 1, nh, 1).to(cat)
-            vmask = cat_valid.to(cat.dtype)
-            row_max = cat.amax(-1, keepdim=True).clamp(min=0)
-            shifted = cat - row_max
-            shifted_sink = log_sink - row_max
-            log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
-            log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
-            p = (shifted - log_denom).exp() * vmask
-            all_invalid = ~cat_valid.any(-1, keepdim=True)
-            if torch.is_grad_enabled():
-                p = p.masked_fill(all_invalid, 0.0)
-            else:
-                p.masked_fill_(all_invalid, 0.0)
+            p = _sink_softmax(cat, log_sink, all_invalid)
         else:
             all_invalid = ~cat_valid.any(-1, keepdim=True)
             # Mirrors ``naive_csa``'s no-sink chain: the shared NaN-safe
@@ -2793,21 +2777,13 @@ class HCADecodingCache:
             return torch.zeros(B, 1, nh, self.c, dtype=compute_dtype, device=device)
         if sink_logits is not None:
             log_sink = sink_logits.view(1, 1, nh, 1).to(cat)
-            row_max = cat.amax(-1, keepdim=True).clamp(min=0)
-            shifted = cat - row_max
-            shifted_sink = log_sink - row_max
-            lse = torch.logsumexp(shifted, dim=-1, keepdim=True)
-            log_denom = torch.logaddexp(lse, shifted_sink)
-            p = (shifted - log_denom).exp()
             # ``-inf`` is the only fully-masked marker (``naive_hca``'s
             # ``isneginf(row_max)``): ``isinf`` also matched ``+inf`` and
             # silently zeroed a row whose mass belongs on the ``+inf``
-            # entries.
+            # entries. ``_sink_softmax`` also keeps overflowed ``+inf``
+            # scores finite instead of forming ``+inf - +inf``.
             all_masked = torch.isneginf(cat).all(-1, keepdim=True)
-            if torch.is_grad_enabled():
-                p = p.masked_fill(all_masked, 0.0)
-            else:
-                p.masked_fill_(all_masked, 0.0)
+            p = _sink_softmax(cat, log_sink, all_masked)
         else:
             # Mirrors ``naive_hca``'s no-sink chain: NaN-safe softmax over
             # the masked scores (fully-masked rows zeroed, ``+inf`` rows

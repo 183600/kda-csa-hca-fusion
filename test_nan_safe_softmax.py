@@ -157,6 +157,78 @@ def test_joint_softmax_chunk_matches_the_nan_safe_contract():
         torch.equal(out[0, 0, 3], torch.zeros(4)), f'{out[0, 0, 3].tolist()}')
 
 
+def test_sink_softmax_positive_infinity_rows_stay_finite():
+    """The sink branch follows the same ``+inf`` limit as the no-sink path."""
+    from ops_csa import _sink_softmax
+    logits = torch.tensor([[
+        [[float('inf'), 0.0, 1.0]],
+        [[float('inf'), float('inf'), float('-inf')]],
+        [[float('-inf'), float('-inf'), float('-inf')]],
+    ]])
+    log_sink = torch.tensor([[[[0.7]]]])
+    out = _sink_softmax(logits, log_sink)
+    _ok('mixed +inf row -> all mass on the +inf entry',
+        torch.allclose(out[0, 0, 0], torch.tensor([1.0, 0.0, 0.0])),
+        f'{out[0, 0, 0].tolist()}')
+    _ok('two +inf entries split the mass evenly (sink gets none)',
+        torch.allclose(out[0, 1, 0], torch.tensor([0.5, 0.5, 0.0])),
+        f'{out[0, 1, 0].tolist()}')
+    _ok('all -inf row is zeroed despite the sink',
+        torch.equal(out[0, 2, 0], torch.zeros(3)),
+        f'{out[0, 2, 0].tolist()}')
+    _ok('sink softmax stays finite', bool(torch.isfinite(out).all()), '')
+
+    # All-masked rows must not poison the backward pass with 0 * inf.
+    x = torch.tensor([
+        [[[float('-inf'), float('-inf')]]],
+        [[[0.2, 0.3]]],
+    ], requires_grad=True)
+    y = _sink_softmax(x, torch.tensor([[[[0.7]]]]))
+    grad = torch.autograd.grad(y.sum(), x)[0]
+    _ok('all-masked sink row has a finite gradient',
+        bool(torch.isfinite(grad).all()), f'{grad.tolist()}')
+
+
+def _overflow_reference_sink(sink):
+    """CSA/HCA reference outputs for finite inputs whose scores overflow."""
+    from ops_csa import naive_csa
+    from ops_hca import naive_hca
+    torch.manual_seed(11)
+
+    def pos(*shape):
+        return torch.rand(*shape) * 0.2 + 0.05
+
+    B, T, d = 1, 8, 8
+    m, topk, nh, nIh, c, c_I, dc = 4, 2, 2, 2, 8, 4, 8
+    H = pos(B, T, d)
+    csa = naive_csa(
+        H, pos(c, d), pos(c, d), pos(c, d), pos(c, d),
+        pos(m, c), pos(m, c), pos(dc, d), pos(c * nh, dc),
+        pos(c_I * nIh, dc), pos(nIh, d), pos(c_I, d), pos(c_I, d),
+        pos(m, c_I), m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+        sliding_window=0, sink_logits=sink, normalize_qk=True,
+        scale=1e39, fuse_projections=False)
+    m2, nh2, c2, dc2 = 4, 2, 8, 8
+    H2 = pos(B, T, d)
+    hca = naive_hca(
+        H2, pos(c2, d), pos(c2, d), pos(m2, c2), pos(dc2, d),
+        pos(c2 * nh2, dc2), m2=m2, nh=nh2, c=c2, dc=dc2,
+        sliding_window=0, sink_logits=sink, scale=1e39)
+    return csa, hca
+
+
+def test_reference_sink_keeps_overflowed_scores_finite():
+    """``naive_csa`` / ``naive_hca`` sink paths must not emit NaN on +inf."""
+    sink = torch.tensor([0.5, -0.3])
+    csa, hca = _overflow_reference_sink(sink)
+    _ok('CSA reference sink output stays finite under score overflow',
+        bool(torch.isfinite(csa).all()),
+        f'nan_count={(~torch.isfinite(csa)).sum().item()}')
+    _ok('HCA reference sink output stays finite under score overflow',
+        bool(torch.isfinite(hca).all()),
+        f'nan_count={(~torch.isfinite(hca)).sum().item()}')
+
+
 def _hca_overflow_decode(sink):
     """HCA decode with scores that overflow to ``+inf`` (no q/k norm)."""
     from ops_decoding_cache import HCADecodingCache
@@ -182,11 +254,9 @@ def _hca_overflow_decode(sink):
 def test_hca_decode_step_keeps_overflowed_scores_finite():
     """The HCA decode read must not turn ``+inf`` scores into NaN.
 
-    The no-sink chain mirrors ``naive_hca`` (``_nan_safe_softmax``), so
-    an overflowed ``+inf`` score keeps the softmax limit instead of
-    ``NaN``; the sink chain keeps ``naive_hca``'s own value (the shared
-    ``row_max`` shift overflows to ``NaN`` there in BOTH paths), so it is
-    only pinned for shape/dtype sanity.
+    Both chains mirror ``naive_hca``: an overflowed ``+inf`` score keeps
+    the softmax limit instead of ``NaN``, and the sink cannot receive mass
+    from a row whose valid scores are all ``+inf``.
     """
     out = _hca_overflow_decode(None)
     _ok('sink-less HCA decode output stays finite under score overflow',
@@ -194,6 +264,10 @@ def test_hca_decode_step_keeps_overflowed_scores_finite():
         f'nan_count={(~torch.isfinite(out)).sum().item()} '
         f'shape={tuple(out.shape)}')
     out_sink = _hca_overflow_decode(torch.tensor([0.5]))
+    _ok('sink HCA decode output stays finite under score overflow',
+        bool(torch.isfinite(out_sink).all()),
+        f'nan_count={(~torch.isfinite(out_sink)).sum().item()} '
+        f'shape={tuple(out_sink.shape)}')
     _ok('sink HCA decode keeps its shape and dtype',
         out_sink.shape == out.shape and out_sink.dtype == out.dtype,
         f'{tuple(out_sink.shape)} {out_sink.dtype}')
@@ -205,6 +279,8 @@ _TEST_FUNCS = [
     test_positive_infinity_rows_stay_finite,
     test_masked_rows_and_pos_inf_coexist,
     test_explicit_all_masked_mask_is_honoured,
+    test_sink_softmax_positive_infinity_rows_stay_finite,
+    test_reference_sink_keeps_overflowed_scores_finite,
     test_joint_softmax_chunk_matches_the_nan_safe_contract,
     test_hca_decode_step_keeps_overflowed_scores_finite,
 ]

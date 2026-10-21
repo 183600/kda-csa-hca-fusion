@@ -27,6 +27,7 @@ from ops_csa import (
     _sliding_window_output,
     _sliding_window_scores,
     _nan_safe_softmax,
+    _sink_softmax,
     _qk_normalize,
     _qk_normalize_,
     CHUNKED_SW_THRESHOLD,
@@ -329,39 +330,14 @@ def naive_hca(
             return _nan_safe_softmax(
                 cat_t, dim=-1, all_masked_mask=all_masked_t)
         log_sink_t = sink_logits.view(1, nh, 1, 1).to(cat_t)
-        row_max_t = cat_t.amax(-1, keepdim=True)
-        all_masked_t = torch.isneginf(row_max_t)
-        row_max_safe_t = torch.where(
-            all_masked_t, torch.zeros_like(row_max_t),
-            row_max_t.clamp(min=0))
-        if torch.is_grad_enabled() or not cat_fresh:
-            shifted_t = cat_t - row_max_safe_t
-        else:
-            # ``cat_t`` is the freshly concatenated joint buffer with no
-            # other readers, so the shift runs in place: the same
-            # elementwise subtraction with one fewer full-size temporary.
-            shifted_t = cat_t.sub_(row_max_safe_t)
-        shifted_sink_t = log_sink_t - row_max_safe_t
+        all_masked_t = cat_t.isneginf().all(-1, keepdim=True)
         # Numerically stable logsumexp approach — keep sink_logits in log
         # space (never exp it) and shift it by -row_max alongside every
-        # score so the largest exp() argument is 0. An all-``-inf`` row
-        # yields ``-inf`` here (and ``-inf - log_sink`` for ``p``, i.e. 0
-        # before the ``masked_fill`` below).
-        lse_t = torch.logsumexp(shifted_t, dim=-1, keepdim=True)
-        log_denom_t = torch.logaddexp(lse_t, shifted_sink_t)
-        if torch.is_grad_enabled():
-            # Out-of-place: autograd's Sub/Exp backward save this chain's
-            # operands/outputs, so in-place writes here would trip the
-            # version-counter check.
-            p_t = (shifted_t - log_denom_t).exp()
-            p_t = p_t.masked_fill(all_masked_t, 0.0)
-        else:
-            # ``shifted`` has no readers left (``lse`` is computed above),
-            # and its ``- log_denom`` / ``exp`` / fill are the same
-            # elementwise ops as the out-of-place chain (bit-identical).
-            p_t = shifted_t.sub_(log_denom_t).exp_()
-            p_t.masked_fill_(all_masked_t, 0.0)
-        return p_t
+        # score so the largest exp() argument is 0. ``_sink_softmax`` also
+        # applies the documented +inf limit (all mass on the +inf entries,
+        # none on the sink) instead of forming ``+inf - +inf``.
+        return _sink_softmax(
+            cat_t, log_sink_t, all_masked_t, inplace_ok=cat_fresh)
 
     n_blk = n_blocks
     if use_tiles:
