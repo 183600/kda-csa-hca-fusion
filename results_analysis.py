@@ -1311,11 +1311,15 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
     scores come from a quantized model.
     """
     scores_t = torch.as_tensor(scores, dtype=torch.float64).reshape(-1)
-    labels_t = torch.as_tensor(labels).reshape(-1).to(dtype=torch.bool)
-    if scores_t.numel() != labels_t.numel():
+    labels_raw = torch.as_tensor(labels).reshape(-1)
+    if scores_t.numel() != labels_raw.numel():
         raise ValueError(
             f'scores/labels length mismatch: {scores_t.numel()} vs '
-            f'{labels_t.numel()}')
+            f'{labels_raw.numel()}')
+    if labels_raw.numel() and not bool(
+            ((labels_raw == 0) | (labels_raw == 1)).all().item()):
+        raise ValueError('labels must contain only 0/1 binary values')
+    labels_t = labels_raw.to(dtype=torch.bool)
     if valid is not None:
         valid_t = torch.as_tensor(valid).reshape(-1).to(dtype=torch.bool)
         if valid_t.numel() != scores_t.numel():

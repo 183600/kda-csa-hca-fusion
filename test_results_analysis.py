@@ -383,6 +383,11 @@ def test_binary_ranking_metrics_rare_positive_and_ties():
                                     valid=torch.tensor([False, True, True]))
     assert masked['n'] == 2 and masked['n_pos'] == 1
 
+    # Negative / non-binary labels must not be treated as positives.
+    for bad in ([-1, 0, 1], [0, 2, 0], [0.0, 0.5, 1.0]):
+        with pytest.raises(ValueError):
+            binary_ranking_metrics(torch.arange(3.0), torch.tensor(bad))
+
 
 def test_tune_baseline_lr_selects_on_validation_stream():
     """Baseline lr selection must run on the held-out monitor stream."""
