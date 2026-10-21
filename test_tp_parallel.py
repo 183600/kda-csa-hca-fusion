@@ -431,3 +431,17 @@ def test_tp_sweep_hardware_param():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
+
+
+def test_kda_tp_decay_init_under_autocast(device):
+    """The TP KDA path keeps the fp32 decay prior from promoting the gate."""
+    cfg = dataclasses.replace(
+        _kda_cfg(0), kda_decay_init='log_uniform')
+    layer = KDAHybridLayer(cfg).to(device).eval()
+    x = torch.randn(2, 5, cfg.d_model, device=device)
+    dtype = torch.bfloat16
+    with torch.autocast(device_type=torch.device(device).type, dtype=dtype):
+        out = tp.kda_layer_forward_tp(layer, x, None, 0, 2)
+    assert out['output'].dtype == dtype
+    assert torch.isfinite(out['output']).all()
+    assert torch.isfinite(out['state']).all()

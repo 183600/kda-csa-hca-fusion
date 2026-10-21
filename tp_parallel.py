@@ -399,7 +399,11 @@ def kda_layer_forward_tp(
     g_up_weight = layer.g_up.weight.view(HV, K, K)[lo:hi].reshape(hv * K, K)
     g = F.linear(layer.g_down(x_conv), g_up_weight).view(B, T, hv, K)
     if getattr(layer, '_decay_bias_active', False):
-        g = g + layer._decay_bias.view(HV, K)[lo:hi]
+        # Match the unsharded layer: the prior is stored in fp32, but the
+        # sharded projection can be bf16/fp16 under autocast, so cast the
+        # slice before the add instead of promoting the gate and breaking
+        # KDA's same-dtype contract.
+        g = g + layer._decay_bias.view(HV, K)[lo:hi].to(dtype=g.dtype)
     g = -F.softplus(g) * cfg.kda_decay_scale
     beta = F.linear(x_conv, layer.beta.weight[lo:hi]).sigmoid()
     use_chunk = (cfg.kda_chunk_size >= 1 and T >= cfg.kda_chunk_size)
