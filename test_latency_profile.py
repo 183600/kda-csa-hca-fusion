@@ -388,6 +388,44 @@ def test_profile_fake_runner_and_rows():
     _ok('quadratic flops collapse to the C=T model',
         quad[0]['analytic_flops'] == roofline.ssd_core_flops(
             8, 2, 4, 2, chunked=True, chunk_size=8), '')
+    bias = profile['selection_bias']
+    _ok('profile carries a split-half selection-bias diagnostic',
+        bias['seed'] == 0 and len(bias['rows']) == 2
+        and all(r['available'] for r in bias['rows']), '')
+    _ok('selection-bias rows stay non-negative and bounded',
+        all(r['selection_optimism'] >= 0
+            and r['heldout_speedup'] <= r['oracle_speedup'] + 1e-12
+            for r in bias['rows']), bias['rows'])
+
+
+def test_selection_bias_detects_winners_curse():
+    print('\nTest: split-half selection bias (winner\'s curse)')
+    rows = [
+        {'T': 64, 'mode': 'sequential', 'chunk_size': None,
+         'times_ms': [10.0, 10.0, 10.0, 10.0]},
+        {'T': 64, 'mode': 'chunked', 'chunk_size': 16,
+         'times_ms': [1.0, 1.0, 9.0, 9.0]},
+        {'T': 64, 'mode': 'chunked', 'chunk_size': 32,
+         'times_ms': [9.0, 9.0, 1.0, 1.0]},
+    ]
+    row = lp.selection_bias_study(rows, seed=1)['rows'][0]
+    _ok('selection half picks the in-sample winner', 
+        row['selected_chunk_size'] == 32, row)
+    _ok('full-sample argmin differs from the selection-half pick',
+        row['full_best_chunk_size'] == 16 and row['stable'] is False, row)
+    _ok('held-out speedup is below the oracle and optimism is positive',
+        abs(row['selection_optimism'] - (10.0 - 10.0 / 9.0)) < 1e-12,
+        row['selection_optimism'])
+    _ok('split sizes are reported', row['n_selection'] == 2
+        and row['n_evaluation'] == 2, row)
+    thin = lp.selection_bias_study([
+        {'T': 8, 'mode': 'sequential', 'chunk_size': None,
+         'times_ms': [5.0]},
+        {'T': 8, 'mode': 'chunked', 'chunk_size': 4, 'times_ms': [4.0]},
+        {'T': 8, 'mode': 'chunked', 'chunk_size': 8, 'times_ms': [3.0]},
+    ])['rows'][0]
+    _ok('one repeat is flagged instead of guessed',
+        thin['available'] is False and 'repeat' in thin['reason'], thin)
 
 
 def test_profile_parity_guard_detects_divergence():
@@ -560,6 +598,7 @@ _TEST_FUNCS = [
     test_time_call_fake_clock,
     test_time_call_synchronize_hook,
     test_profile_fake_runner_and_rows,
+    test_selection_bias_detects_winners_curse,
     test_profile_parity_guard_detects_divergence,
     test_recommend_and_summarize_synthetic,
     test_real_profile_small_and_json_roundtrip,

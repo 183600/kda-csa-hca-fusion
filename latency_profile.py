@@ -23,7 +23,11 @@ This module supplies it:
   divergent operator;
 * the analytic counterpart from :mod:`roofline`
   (``ssd_core_flops_breakdown``): the model's per-phase FLOPs and its
-  argmin chunk size, printed next to the measured optimum.
+  argmin chunk size, printed next to the measured optimum;
+* a split-half ``selection_bias_study``: the best chunk size is chosen on
+  one half of the repeats and its speedup is evaluated on the held-out
+  half. The gap to the held-out oracle is the winner's-curse optimism of
+  reporting the in-sample argmin. Short sweeps are flagged as diagnostic.
 
 Honest caveats
 --------------
@@ -52,6 +56,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
+import statistics
 import sys
 import time
 
@@ -225,6 +231,116 @@ def recommend_chunk_sizes(rows) -> dict:
     return {T: C for T, (_, C) in by_t.items()}
 
 
+def selection_bias_study(rows, *, seed: int = 0) -> dict:
+    """Split-half check for winner's curse in the reported best chunk size.
+
+    For each T the repeat indices are shuffled once (shared by the
+    sequential and chunked rows), the first half selects the chunk with the
+    lowest median, and the held-out half evaluates that chunk against the
+    sequential median and against the held-out oracle (best chunk on the
+    evaluation half). ``selection_optimism`` is
+    ``oracle_speedup - heldout_speedup``; it is non-negative by
+    construction and large values mean the in-sample argmin overstates the
+    deployable speedup. Ties break to the smaller chunk size.
+
+    Fewer than two repeats or fewer than two chunk sizes gives an
+    ``available=False`` row rather than a misleading number.
+    """
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f'selection_bias_study: seed={seed!r} must be an int.')
+    by_t: dict = {}
+    for row in rows:
+        times = row.get('times_ms')
+        if not isinstance(times, list) or not times:
+            continue
+        if row.get('mode') not in ('sequential', 'chunked'):
+            continue
+        if any(not isinstance(t, (int, float)) or t != t for t in times):
+            continue
+        entry = by_t.setdefault(row['T'], {'sequential': None, 'chunked': {}})
+        if row['mode'] == 'sequential':
+            entry['sequential'] = [float(t) for t in times]
+        elif row.get('chunk_size') is not None:
+            entry['chunked'][int(row['chunk_size'])] = [float(t) for t in times]
+    out = []
+    for T in sorted(by_t):
+        entry = by_t[T]
+        seq = entry['sequential']
+        chunks = entry['chunked']
+        base = {
+            'T': T,
+            'seed': seed,
+            'n_selection': 0,
+            'n_evaluation': 0,
+            'selected_chunk_size': None,
+            'full_best_chunk_size': None,
+            'heldout_speedup': None,
+            'oracle_speedup': None,
+            'selection_optimism': None,
+            'stable': None,
+            'available': False,
+        }
+        if seq is None or len(chunks) < 2:
+            out.append(dict(base, reason='need sequential + >= 2 chunk sizes'))
+            continue
+        n = min([len(seq)] + [len(v) for v in chunks.values()])
+        if n < 2:
+            out.append(dict(base, reason='need >= 2 repeats'))
+            continue
+        idx = list(range(n))
+        random.Random(f'{seed}|{T}|selection-bias').shuffle(idx)
+        half = n // 2
+        sel_idx, eval_idx = idx[:half], idx[half:]
+        if not sel_idx or not eval_idx:
+            out.append(dict(base, reason='empty split half'))
+            continue
+        full_med = {C: statistics.median(v[:n]) for C, v in chunks.items()}
+        sel_med = {C: statistics.median([v[i] for i in sel_idx])
+                   for C, v in chunks.items()}
+        eval_med = {C: statistics.median([v[i] for i in eval_idx])
+                    for C, v in chunks.items()}
+        full_best = min(full_med, key=lambda C: (full_med[C], C))
+        selected = min(sel_med, key=lambda C: (sel_med[C], C))
+        seq_eval = statistics.median([seq[i] for i in eval_idx])
+        selected_eval = eval_med[selected]
+        oracle = min(eval_med.values())
+        heldout = (seq_eval / selected_eval
+                   if selected_eval > 0 else None)
+        oracle_speed = seq_eval / oracle if oracle > 0 else None
+        optimism = (oracle_speed - heldout
+                    if oracle_speed is not None and heldout is not None
+                    else None)
+        out.append({
+            **base,
+            'n_selection': len(sel_idx),
+            'n_evaluation': len(eval_idx),
+            'selected_chunk_size': selected,
+            'full_best_chunk_size': full_best,
+            'heldout_speedup': heldout,
+            'oracle_speedup': oracle_speed,
+            'selection_optimism': optimism,
+            'stable': selected == full_best,
+            'available': True,
+        })
+    return {
+        'seed': seed,
+        'method': ('shuffle repeat indices; select best chunk on the first '
+                   'half, evaluate on the second; compare with the '
+                   'held-out oracle'),
+        'rows': out,
+        'caveats': [
+            'Split halves share one seeded permutation per T, so repeated '
+            'profiles are deterministic and the same repeats are compared.',
+            'With the default 3 repeats the halves are 2/1: the check is a '
+            'diagnostic, not a precise estimate. Use --repeats >= 6 for a '
+            'useful optimism estimate.',
+            'Optimism is defined as oracle_speedup - heldout_speedup and is '
+            'non-negative up to floating point; large values mean the '
+            'in-sample argmin is not a deployable guarantee.',
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Profiling
 # ---------------------------------------------------------------------------
@@ -373,6 +489,7 @@ def profile_scan_modes(
         'chunk_sizes': chunk_sizes,
         'model_best_chunk_size': model_best,
         'measured_best_chunk_size': recommend_chunk_sizes(rows),
+        'selection_bias': selection_bias_study(rows, seed=seed),
     }
 
 
@@ -389,6 +506,8 @@ def summarize(profile: dict) -> list[dict]:
         speedup = None
         if seq and best and seq['time_ms'] and best['time_ms']:
             speedup = seq['time_ms'] / best['time_ms']
+        bias = {r['T']: r for r in profile.get('selection_bias', {})
+                .get('rows', [])}.get(T, {})
         out.append({
             'T': T,
             'sequential_ms': seq['time_ms'] if seq else None,
@@ -397,6 +516,8 @@ def summarize(profile: dict) -> list[dict]:
             'speedup_vs_sequential': speedup,
             'model_best_chunk_size': profile['model_best_chunk_size'].get(T),
             'parity_ok': all(r['parity_ok'] for r in rows if r['T'] == T),
+            'selection_optimism': bias.get('selection_optimism'),
+            'selection_stable': bias.get('stable'),
         })
     return out
 
@@ -437,6 +558,7 @@ def _write_json(path: str, profile: dict) -> None:
         'geometry': geometry,
         'model_best_chunk_size': profile['model_best_chunk_size'],
         'measured_best_chunk_size': profile['measured_best_chunk_size'],
+        'selection_bias': profile.get('selection_bias'),
         'summary': summarize(profile),
         'flops_model': (
             'roofline.ssd_core_flops_breakdown: dominant-MAC accounting of '
@@ -446,7 +568,10 @@ def _write_json(path: str, profile: dict) -> None:
         'caveat': (
             'Wall-clock is host- and torch-build-specific. parity_max_abs '
             'is the max deviation from the sequential reference scan at the '
-            'same T; parity_ok gates each row at parity_tol.'),
+            'same T; parity_ok gates each row at parity_tol. '
+            'selection_bias is a split-half winner\'s-curse diagnostic: '
+            'selection_optimism = held-out oracle speedup minus held-out '
+            'speedup of the chunk selected in-sample; it is not a p-value.'),
         'provenance': capture_provenance(),
     }
     directory = os.path.dirname(os.path.abspath(path))
@@ -544,6 +669,15 @@ def main(argv: list[str] | None = None) -> int:
             s['T'], s['best_chunk_size'], s['best_chunked_ms'], speed,
             s['model_best_chunk_size'],
             '' if s['parity_ok'] else '  [PARITY FAILURE]')
+        bias = next((r for r in profile.get('selection_bias', {})
+                     .get('rows', []) if r['T'] == s['T']), {})
+        if bias.get('available'):
+            logger.info(
+                '      split-half C=%s: held-out %.2fx, oracle %.2fx, '
+                'optimism %.2fx, stable=%s',
+                bias['selected_chunk_size'], bias['heldout_speedup'],
+                bias['oracle_speedup'], bias['selection_optimism'],
+                bias['stable'])
     if args.json:
         _write_json(args.json, profile)
         logger.info('Saved: %s', args.json)
