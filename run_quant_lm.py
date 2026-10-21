@@ -1179,6 +1179,48 @@ def build_qat_rows(per_seed: list, spec: QuantSpec) -> list:
     return rows
 
 
+def build_qat_test_rows(per_seed: list, spec: QuantSpec) -> list:
+    """Aggregate the Part B confirmatory TEST pass into one row.
+
+    The row is explicitly ``used_for_selection=False`` and is not an input
+    to :func:`build_qat_rows`; it exists so the final QAT recovery claim
+    also has a number computed on data that never informed training,
+    early stopping or the recovery definition.
+    """
+    usable = [r['test_eval'] for r in per_seed
+              if r.get('test_eval') and not r['test_eval'].get('skipped')
+              and r['test_eval'].get('n_tokens')]
+    if not usable:
+        return []
+    keys = ('fp16_ppl', 'ptq_ppl', 'qat_ppl',
+            'qat_model_fp16_state_ppl', 'fp16_matched_ppl',
+            'ptq_matched_ppl', 'ptq_damage', 'qat_residual',
+            'recovery_fraction', 'recovery_fraction_matched')
+    agg = {key: _aggregate([u.get(key) for u in usable]) for key in keys}
+    row = {
+        'row_kind': 'qat_test_ppl',
+        'model': 'stepwise_kda_lm',
+        'eval_split': 'test',
+        'used_for_selection': False,
+        'seeds': [int(r['seed']) for r in per_seed
+                  if r.get('test_eval')
+                  and not r['test_eval'].get('skipped')
+                  and r['test_eval'].get('n_tokens')],
+        'n_seeds': len(usable),
+        'n_windows': int(usable[0]['n_windows']),
+        'n_tokens_per_seed': [int(u['n_tokens']) for u in usable],
+        **{f'{key}_{stat}': agg[key][stat]
+           for key in keys for stat in ('mean', 'min', 'max')},
+        'spec': spec_summary(spec),
+        'note': ('Confirmatory held-out test pass on the frozen Part B '
+                 'models, scored after all training/validation decisions; '
+                 'never used for selection, early stopping or tolerance '
+                 'tuning.'),
+    }
+    row.update(_spec_fields(spec))
+    return [row]
+
+
 # --------------------------------------------------------------------------
 # Pre-training overfit sanity gates (one fixed batch per part)
 # --------------------------------------------------------------------------
@@ -1592,8 +1634,16 @@ def run_part_a(*, device, tokenizer, split_texts, seeds, specs, steps,
 
 def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
                seq_len, batch_size, eval_seqs, spec, steps, lr=3e-3,
-               val_every=0) -> list:
-    """fp16-vs-QAT A/B training + scoring for the stepwise KDA LM."""
+               val_every=0, test_seqs=0) -> list:
+    """fp16-vs-QAT A/B training + scoring for the stepwise KDA LM.
+
+    ``test_seqs > 0`` adds a confirmatory sealed-test pass after every
+    training and validation decision for that seed is complete. Test
+    windows are scored by the same frozen models and never feed back into
+    training, early stopping, the spec, or the recovery definition; the
+    per-seed block is marked ``used_for_selection=False``. The default 0
+    preserves the historical direct-call contract.
+    """
     pad = pad_token_id(tokenizer)
     val_windows = encode_windows(tokenizer, split_texts['val'][:eval_seqs],
                                  seq_len, device)
@@ -1659,6 +1709,75 @@ def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
         recovery_matched = (
             1.0 - matched_residual / matched_damage
             if matched_damage > 0.0 else None)
+        test_eval = None
+        if int(test_seqs or 0) > 0:
+            test_texts = list(split_texts.get('test', []))[:int(test_seqs)]
+            test_windows = encode_windows(tokenizer, test_texts, seq_len,
+                                          device)
+            if test_windows:
+                test_fp16 = evaluate_stepwise_ppl(
+                    fp16_model, test_windows, pad)
+                test_ptq = evaluate_stepwise_ppl(
+                    fp16_model, test_windows, pad, spec=spec)
+                test_qat = evaluate_stepwise_ppl(
+                    qat_model, test_windows, pad, spec=spec)
+                test_qat_fp16 = evaluate_stepwise_ppl(
+                    qat_model, test_windows, pad)
+                matched_model = (fp16_model if matched_reused
+                                 else fp16_matched_model)
+                test_fp16_matched = evaluate_stepwise_ppl(
+                    matched_model, test_windows, pad)
+                test_ptq_matched = evaluate_stepwise_ppl(
+                    matched_model, test_windows, pad, spec=spec)
+                test_damage = (test_ptq['ppl'] / test_fp16['ppl'] - 1.0
+                               if test_fp16['ppl'] > 0.0 else None)
+                test_residual = (test_qat['ppl'] / test_fp16['ppl'] - 1.0
+                                 if test_fp16['ppl'] > 0.0 else None)
+                test_matched_damage = (
+                    test_ptq_matched['ppl'] / test_fp16_matched['ppl'] - 1.0
+                    if test_fp16_matched['ppl'] > 0.0 else None)
+                test_matched_residual = (
+                    test_qat['ppl'] / test_fp16_matched['ppl'] - 1.0
+                    if test_fp16_matched['ppl'] > 0.0 else None)
+                test_eval = {
+                    'split': 'test',
+                    'used_for_selection': False,
+                    'n_windows': len(test_windows),
+                    'n_tokens': test_fp16['n_tokens'],
+                    'fp16_ppl': test_fp16['ppl'],
+                    'ptq_ppl': test_ptq['ppl'],
+                    'qat_ppl': test_qat['ppl'],
+                    'qat_model_fp16_state_ppl': test_qat_fp16['ppl'],
+                    'fp16_matched_ppl': test_fp16_matched['ppl'],
+                    'ptq_matched_ppl': test_ptq_matched['ppl'],
+                    'ptq_damage': test_damage,
+                    'qat_residual': test_residual,
+                    'ptq_matched_damage': test_matched_damage,
+                    'qat_matched_residual': test_matched_residual,
+                    'recovery_fraction': (
+                        1.0 - test_residual / test_damage
+                        if test_damage is not None and test_damage > 0.0
+                        else None),
+                    'recovery_fraction_matched': (
+                        1.0 - test_matched_residual / test_matched_damage
+                        if test_matched_damage is not None
+                        and test_matched_damage > 0.0 else None),
+                    'note': ('Confirmatory held-out test pass with the '
+                             'frozen fp16/QAT/matched-control models; '
+                             'never used for training, early stopping or '
+                             'the recovery definition.'),
+                }
+                logger.info(
+                    'Part B seed %d: sealed TEST fp16 %.4f | PTQ %.4f | '
+                    'QAT %.4f (n_tokens=%d; not used for selection)',
+                    seed, test_fp16['ppl'], test_ptq['ppl'],
+                    test_qat['ppl'], test_fp16['n_tokens'])
+            else:
+                test_eval = {
+                    'split': 'test', 'used_for_selection': False,
+                    'skipped': True, 'reason': 'no test windows',
+                    'n_windows': 0,
+                }
         per_seed.append({
             'seed': int(seed),
             'steps': int(steps),
@@ -1695,6 +1814,7 @@ def run_part_b(*, device, tokenizer, split_texts, seeds, qat_steps,
                 qat_rep['all_grads_finite']
                 and fp16_rep['all_grads_finite']
                 and fp16_matched_rep['all_grads_finite']),
+            'test_eval': test_eval,
         })
         logger.info(
             'Part B seed %d: fp16 %.4f | PTQ %s %.4f | QAT %.4f '
@@ -1870,14 +1990,29 @@ def main():
                 f"n_tokens/seed {row['n_tokens_per_seed']}")
 
     qat_rows: list = []
+    qat_test_rows: list = []
     if not skip_qat:
         qat_per_seed = run_part_b(
             device=device, tokenizer=tokenizer, split_texts=split_texts,
             seeds=seeds, qat_steps=qat_steps, seq_len=seq_len,
             batch_size=batch_size, eval_seqs=eval_seqs, spec=QAT_SPEC,
-            steps=steps, val_every=val_every)
+            steps=steps, val_every=val_every,
+            # Confirmatory only: opened after both Part B arms and the
+            # validation-based budget control are frozen.
+            test_seqs=eval_seqs)
         qat_rows = build_qat_rows(qat_per_seed, QAT_SPEC)
+        qat_test_rows = build_qat_test_rows(qat_per_seed, QAT_SPEC)
         _print_qat(qat_rows)
+        if qat_test_rows:
+            qrow = qat_test_rows[0]
+            logger.info('\n-- Part B: confirmatory TEST decode perplexity '
+                        '(never used for selection) --')
+            logger.info(
+                f"  fp16 test ppl {qrow['fp16_ppl_mean']:.4f} | "
+                f"PTQ test ppl {qrow['ptq_ppl_mean']:.4f} | "
+                f"QAT test ppl {qrow['qat_ppl_mean']:.4f} | "
+                f"test recovery {qrow['recovery_fraction_mean']} | "
+                f"n_tokens/seed {qrow['n_tokens_per_seed']}")
 
     plt_rows = []
     for cell in ptq_per_seed:
@@ -1941,12 +2076,15 @@ def main():
                          'reported PPL.'),
             },
             'test_split': {
-                'used': bool(ptq_test_rows),
+                'used': bool(ptq_test_rows or qat_test_rows),
+                'part_a_used': bool(ptq_test_rows),
+                'part_b_used': bool(qat_test_rows),
                 'eval_sequences': int(eval_seqs),
-                'note': ('Part A scores the sealed test split once per '
-                         'seed after the spec grid, tolerance and '
-                         'validation protocol are frozen. The resulting '
-                         'ptq_test_ppl rows are marked '
+                'note': ('Part A and Part B each score the sealed test '
+                         'split once per seed after their training, spec '
+                         'grid, tolerance and validation protocol are '
+                         'frozen. The resulting ptq_test_ppl / '
+                         'qat_test_ppl rows are marked '
                          'used_for_selection=False and do not feed back '
                          'into any row used for selection.'),
             },
@@ -2006,7 +2144,7 @@ def main():
     }
     metadata['provenance']['overfit_sanity_check'] = gate_record
 
-    rows = plt_rows + ptq_rows + qat_rows + ptq_test_rows
+    rows = plt_rows + ptq_rows + qat_rows + ptq_test_rows + qat_test_rows
     os.makedirs(os.path.dirname(RESULTS_PATH) or '.', exist_ok=True)
     write_schema(RESULTS_PATH, rows, kind='exp11_quant_lm',
                  metadata=metadata)
@@ -2051,6 +2189,7 @@ def main():
             'n_ptq_rows': len(ptq_rows),
             'n_ptq_test_rows': len(ptq_test_rows),
             'n_qat_rows': len(qat_rows),
+            'n_qat_test_rows': len(qat_test_rows),
             'n_specs': len(specs),
             'n_seeds': len(seeds),
             'overfit_gate_enabled': bool(gate_record['enabled']),

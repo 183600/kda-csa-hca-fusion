@@ -59,6 +59,7 @@ from run_quant_lm import (  # noqa: E402
     evaluate_stepwise_ppl,
     build_ptq_rows,
     build_qat_rows,
+    build_qat_test_rows,
     run_part_a,
     run_part_b,
 )
@@ -337,6 +338,31 @@ def test_build_corpus_audits_windows_and_fits_diagnostics_on_train():
         and all(v['reference'] == 'train'
                 for v in diag['distribution_shift'].values()), '')
     json.dumps(report, allow_nan=False)
+
+
+def test_part_b_sealed_test_pass_is_confirmatory_only():
+    """Part B's final number comes from frozen models on untouched test rows."""
+    print('\nTest: Part B sealed-test evaluation')
+    tok, splits, _ = build_corpus(seq_len=8, n_texts=8, seed=0)
+    rows = run_part_b(
+        device='cpu', tokenizer=tok, split_texts=splits, seeds=(0,),
+        qat_steps=1, seq_len=8, batch_size=2, eval_seqs=1,
+        spec=QAT_SPEC, steps=1, lr=3e-3, test_seqs=1)
+    te = rows[0]['test_eval']
+    _ok('test block is marked confirmatory',
+        te['split'] == 'test' and te['used_for_selection'] is False
+        and te['n_tokens'] > 0, f"{te.get('n_tokens')}")
+    _ok('all frozen Part B arms are scored on test',
+        all(math.isfinite(te[k]) for k in
+            ('fp16_ppl', 'ptq_ppl', 'qat_ppl',
+             'qat_model_fp16_state_ppl', 'fp16_matched_ppl',
+             'ptq_matched_ppl')), '')
+    summary = build_qat_test_rows(rows, QAT_SPEC)
+    _ok('summary row keeps confirmatory semantics',
+        len(summary) == 1
+        and summary[0]['row_kind'] == 'qat_test_ppl'
+        and summary[0]['used_for_selection'] is False
+        and summary[0]['eval_split'] == 'test', '')
 
 
 def test_stepwise_eval_reports_accuracy_and_restores_mode():
