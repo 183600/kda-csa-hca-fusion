@@ -981,7 +981,9 @@ def confusion_matrix(pred, target, *, num_classes: int | None = None):
     if num_classes is None:
         max_id = int(max(pred.max(), target.max()).item()) if pred.numel() else -1
         num_classes = max_id + 1
-    num_classes = int(num_classes)
+    elif isinstance(num_classes, bool) or not isinstance(num_classes, int):
+        raise ValueError(
+            f'num_classes={num_classes!r} must be a non-negative int or None')
     if num_classes < 0:
         raise ValueError(f'num_classes={num_classes} must be >= 0')
     if explicit_num_classes and pred.numel():
@@ -1247,10 +1249,11 @@ def expected_average_precision(n_pos: int, n_neg: int) -> float | None:
     Returns ``None`` when there are no positives (AP undefined) and 1.0
     when every candidate is relevant.
     """
-    n_pos = int(n_pos)
-    n_neg = int(n_neg)
-    if n_pos < 0 or n_neg < 0:
-        raise ValueError('n_pos and n_neg must be >= 0')
+    for name, value in (('n_pos', n_pos), ('n_neg', n_neg)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f'{name}={value!r} must be a non-negative int')
+        if value < 0:
+            raise ValueError('n_pos and n_neg must be >= 0')
     if n_pos == 0:
         return None
     n = n_pos + n_neg

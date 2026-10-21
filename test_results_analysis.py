@@ -249,6 +249,10 @@ def test_confusion_matrix_rejects_out_of_range_explicit_classes():
     assert cm[1, 1].item() == 1 and cm.sum().item() == 1
     # No explicit count: the derived shape covers the observed maximum.
     assert confusion_matrix([2], [2]).shape == (3, 3)
+    # The class count is exact, not silently truncated from a bool/float.
+    for bad_classes in (True, 2.5, '3'):
+        with pytest.raises(ValueError):
+            confusion_matrix([0], [0], num_classes=bad_classes)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +329,9 @@ def test_expected_average_precision_matches_enumeration():
                 sum(values) / len(values), rel=0, abs=1e-12)
     assert expected_average_precision(0, 5) is None
     assert expected_average_precision(3, 0) == 1.0
+    for bad_counts in ((True, 1), (1, True), (1.5, 2), (1, '2')):
+        with pytest.raises(ValueError):
+            expected_average_precision(*bad_counts)
     # One positive among n is H_n / n, identical to chance MRR.
     assert expected_average_precision(1, 99) == pytest.approx(
         sum(1.0 / i for i in range(1, 101)) / 100)
