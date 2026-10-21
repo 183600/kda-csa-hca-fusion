@@ -18,12 +18,21 @@ long-context inference warm-up poisoned the caches in two ways:
 2. Tables cached as inference tensors cannot participate in a later
    grad-enabled call: reuse raised
    ``RuntimeError: Inference tensors cannot be saved for backward``.
+3. ``partial_rope``'s ``dim`` validation must run in the right order. The
+   feature-axis check ("``dim`` cannot be the feature (last) axis") ran
+   BEFORE the negative-index wraparound, so a dim below ``-nd`` (e.g.
+   ``dim=-5`` on a 4-D tensor) slipped through, wrapped to ``-1`` and
+   silently resolved to the feature axis - rotating the heads, and failing
+   with the confusing ``positions has N entries but axis dim=-1 ... has
+   P=D`` instead of naming the bad dim. Out-of-range dims are now rejected
+   up front, and in-range negative dims wrap to the same axis as their
+   positive form.
 
 ``ops_rope._normal_tensor_scope`` now builds every cached object in
 ``torch.inference_mode(False)``, so the cache always holds ordinary tensors.
 These tests verify the long-context inference path, the warm-up -> autograd
-reuse path, and end-to-end ``naive_csa`` / ``naive_hca`` output parity
-between inference mode and normal mode.
+reuse path, end-to-end ``naive_csa`` / ``naive_hca`` output parity between
+inference mode and normal mode, and the ``dim`` argument validation.
 
 Run via pytest::
 
@@ -249,10 +258,54 @@ def test_default_dim_is_the_sequence_axis(device='cpu'):
         torch.allclose(flipped, default[:, :, [3, 2, 1, 0], :]), '')
 
 
+def test_dim_validation_rejects_feature_and_out_of_range(device='cpu'):
+    """``dim`` validation must reject the feature axis and out-of-range dims.
+
+    Pre-fix a dim below ``-nd`` (``dim=-5`` on a 4-D tensor) escaped the
+    feature-axis check, wrapped to ``-1`` and resolved to the feature axis
+    via ``x.shape[-1]``, so it either rotated the heads when the positions
+    length happened to match D, or failed with
+    ``positions has N entries but axis dim=-1 ... has P=D``.
+    """
+    torch.manual_seed(11)
+    x = torch.randn(2, 5, 3, 8, dtype=torch.float64, device=device)
+    pos_seq = torch.arange(5, dtype=torch.long, device=device)
+    pos_bat = torch.arange(2, dtype=torch.long, device=device)
+
+    def _raises(dim, positions, needle):
+        try:
+            partial_rope(x, positions, 4, 10000.0, dim=dim)
+        except ValueError as exc:
+            _ok(f'dim={dim} rejected', needle in str(exc), str(exc))
+            return
+        _ok(f'dim={dim} rejected', False, 'no ValueError raised')
+
+    _raises(-1, pos_seq, 'cannot be the feature (last) axis')
+    _raises(3, pos_seq, 'cannot be the feature (last) axis')
+    _raises(-5, pos_bat, 'out of range for a 4-D tensor')
+    _raises(4, pos_bat, 'out of range for a 4-D tensor')
+    # A 2-D [P, D] layout must pass dim=0 explicitly (documented contract).
+    y2 = torch.randn(5, 8, dtype=torch.float64, device=device)
+    try:
+        partial_rope(y2, pos_seq, 4, 10000.0, dim=-1)
+        _ok('2-D dim=-1 rejected', False, 'no ValueError raised')
+    except ValueError as exc:
+        _ok('2-D dim=-1 rejected',
+            'cannot be the feature (last) axis' in str(exc), str(exc))
+
+    # In-range negative dims wrap to the same axis as their positive form.
+    for neg, pos_axis, positions in ((-4, 0, pos_bat), (-3, 1, pos_seq)):
+        a = partial_rope(x, positions, 4, 10000.0, dim=neg)
+        b = partial_rope(x, positions, 4, 10000.0, dim=pos_axis)
+        _ok(f'dim={neg} equals dim={pos_axis}', torch.equal(a, b),
+            f'maxdiff={(a - b).abs().max().item():.2e}')
+
+
 if __name__ == '__main__':
     test_position_vectors_are_ordinary_under_inference()
     test_long_context_rope_in_inference_mode()
     test_inference_warmup_does_not_poison_autograd()
     test_default_dim_is_the_sequence_axis()
+    test_dim_validation_rejects_feature_and_out_of_range()
     test_naive_csa_hca_inference_mode_long_rope()
     print('all RoPE inference-mode regression tests passed')

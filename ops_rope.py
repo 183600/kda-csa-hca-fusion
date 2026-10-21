@@ -339,13 +339,18 @@ def partial_rope(
     """
     if rope_dim is None or rope_dim <= 0:
         return x
-    if dim == -1 or dim == x.dim() - 1:
+    nd = x.dim()
+    if not -nd <= dim < nd:
+        raise ValueError(
+            f"partial_rope: dim={dim} is out of range for a {nd}-D tensor "
+            f"(valid range [{-nd}, {nd - 1}])")
+    if dim == -1 or dim == nd - 1:
         raise ValueError(
             f"partial_rope: dim={dim} cannot be the feature (last) axis; "
             f"pass the sequence axis explicitly (dim=1 for the "
             f"[B, T, ...] layouts, dim=0 for a 2-D [P, D] tensor)")
     if dim < 0:
-        dim = x.dim() + dim
+        dim = nd + dim
     D = x.shape[-1]
     if rope_dim > D:
         raise ValueError(
