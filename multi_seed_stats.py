@@ -1006,7 +1006,12 @@ def leave_one_out_sensitivity(
                 f'given, got {alpha!r}')
     d = _as_clean_diffs(diffs)
     n = len(d)
-    mean = (sum(d) / n) if n else None
+    # Use the same overflow-safe mean as the rest of the panel. A raw
+    # ``sum(d) / n`` turns a finite vector like [1e308, 1e308] into ``inf``
+    # here, which then poisons ``mean_shift`` / ``relative_mean_shift`` and
+    # makes the JSON report non-strict (the drop-one means below already use
+    # ``_safe_mean``).
+    mean = _safe_mean(d)
     sd = _sample_sd(d, mean) if n >= 2 else None
     t = paired_t_test(d)
     sign = sign_test(d)

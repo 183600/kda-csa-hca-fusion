@@ -975,6 +975,12 @@ def test_finite_extreme_differences_keep_reports_json_safe():
     json.dumps(record, allow_nan=False)  # must not raise
     t = M.paired_t_test([1e308, 1e308])
     assert t['mean_diff'] == 1e308 and math.isfinite(t['mean_diff'])
+    loo = M.leave_one_out_sensitivity([1e308, 1e308, 1e308],
+                                      n_permutations=10)
+    assert loo['baseline']['mean_diff'] == 1e308
+    assert math.isfinite(loo['baseline']['mean_diff'])
+    assert all(math.isfinite(d['mean_diff']) for d in loo['drops'])
+    json.dumps(loo, allow_nan=False)  # must not raise
     # A normal-range sample keeps the exact legacy arithmetic.
     assert M.summarize_paired([1.0, 2.0, 3.0, 4.0],
                               n_boot=10)['median_diff'] == 2.5
