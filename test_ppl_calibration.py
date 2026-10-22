@@ -75,6 +75,27 @@ def test_simulation_contract_and_rng_isolation():
     assert len(ua) == len(ub) == 9
     assert [t for _, t in ua] == [t for _, t in ub]
 
+    # The simulation primitives themselves are strict: truncating
+    # n_units=2.9 -> 2 or token bounds 8.7 -> 8 would silently change the
+    # corpus the calibration study is supposed to draw.
+    for bad_call in (
+            lambda: PC.simulate_units(2.9, random.Random(0)),
+            lambda: PC.simulate_units(True, random.Random(0)),
+            lambda: PC.simulate_units(4, random.Random(0), token_lo=0),
+            lambda: PC.simulate_units(4, random.Random(0), token_hi=1.5),
+            lambda: PC.simulate_units(4, random.Random(0), spread=float('nan')),
+            lambda: PC.simulate_paired_units(2.9, random.Random(0)),
+            lambda: PC.simulate_paired_units(4, random.Random(0),
+                                             token_lo=9, token_hi=2),
+            lambda: PC.simulate_paired_units(4, random.Random(0),
+                                             noise_sd=float('inf'))):
+        try:
+            bad_call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('ppl simulation accepted a malformed input')
+
     # Malformed scenarios are refused instead of silently mis-measured.
     for bad in ({'n_units': 1, 'alpha': 0.1, 'tol': 0.05},
                 {'n_units': 8, 'alpha': 0.1, 'tol': -1.0}):

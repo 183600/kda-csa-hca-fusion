@@ -131,11 +131,18 @@ def simulate_units(n_units: int, rng: random.Random, *, mean_nll: float = MEAN_N
     (difficulty and token counts are independent), which is the target the
     coverage study checks the CI against.
     """
-    if not 0 < int(token_lo) <= int(token_hi):
-        raise ValueError(f'token_lo={token_lo!r} must be in [1, token_hi]')
-    if float(spread) < 0.0:
-        raise ValueError(f'spread must be >= 0, got {spread!r}')
-    if not math.isfinite(float(mean_nll)):
+    _require_int(n_units, 'n_units', minimum=0)
+    _require_int(token_lo, 'token_lo', minimum=1)
+    _require_int(token_hi, 'token_hi', minimum=1)
+    if token_lo > token_hi:
+        raise ValueError(
+            f'token_lo={token_lo} must be <= token_hi={token_hi}.')
+    if (isinstance(spread, bool) or not isinstance(spread, (int, float))
+            or not math.isfinite(float(spread)) or float(spread) < 0.0):
+        raise ValueError(
+            f'spread must be finite and >= 0, got {spread!r}')
+    if (isinstance(mean_nll, bool) or not isinstance(mean_nll, (int, float))
+            or not math.isfinite(float(mean_nll))):
         raise ValueError(f'mean_nll must be finite, got {mean_nll!r}')
     units = []
     for _ in range(int(n_units)):
@@ -166,10 +173,26 @@ def simulate_paired_units(n_units: int, rng: random.Random, *,
 
     ``delta = 0`` is the null (both models from the same distribution).
     """
-    if float(noise_sd) < 0.0:
-        raise ValueError(f'noise_sd must be >= 0, got {noise_sd!r}')
-    if not math.isfinite(float(delta)):
+    _require_int(n_units, 'n_units', minimum=0)
+    _require_int(token_lo, 'token_lo', minimum=1)
+    _require_int(token_hi, 'token_hi', minimum=1)
+    if token_lo > token_hi:
+        raise ValueError(
+            f'token_lo={token_lo} must be <= token_hi={token_hi}.')
+    if (isinstance(noise_sd, bool) or not isinstance(noise_sd, (int, float))
+            or not math.isfinite(float(noise_sd)) or float(noise_sd) < 0.0):
+        raise ValueError(
+            f'noise_sd must be finite and >= 0, got {noise_sd!r}')
+    if (isinstance(delta, bool) or not isinstance(delta, (int, float))
+            or not math.isfinite(float(delta))):
         raise ValueError(f'delta must be finite, got {delta!r}')
+    if (isinstance(spread, bool) or not isinstance(spread, (int, float))
+            or not math.isfinite(float(spread)) or float(spread) < 0.0):
+        raise ValueError(
+            f'spread must be finite and >= 0, got {spread!r}')
+    if (isinstance(mean_nll, bool) or not isinstance(mean_nll, (int, float))
+            or not math.isfinite(float(mean_nll))):
+        raise ValueError(f'mean_nll must be finite, got {mean_nll!r}')
     half_width = float(noise_sd) * math.sqrt(3.0)
     toks = [rng.randint(int(token_lo), int(token_hi))
             for _ in range(int(n_units))]
