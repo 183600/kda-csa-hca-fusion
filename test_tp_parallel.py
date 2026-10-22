@@ -313,6 +313,19 @@ def test_tp_latency_sweep_invariants():
     assert row2['decode']['state_bytes_per_sequence'] < \
         row1['decode']['state_bytes_per_sequence']
     assert row2['prefill']['full_flops'] > 0
+    # A prefill batch of B sequences executes B times the per-sequence
+    # FLOPs (the all-reduce already counted the batch); the batch must not
+    # be silently ignored by the compute model.
+    one = tp.tp_latency(cfg, tp_size=1, prefill_len=32,
+                        prefill_batch=1, total_layers=5, hardware=hw)
+    four = tp.tp_latency(cfg, tp_size=1, prefill_len=32,
+                         prefill_batch=4, total_layers=5, hardware=hw)
+    assert four['prefill']['full_flops'] == pytest.approx(
+        4.0 * one['prefill']['full_flops'])
+    assert four['prefill']['flops_per_rank'] == pytest.approx(
+        4.0 * one['prefill']['flops_per_rank'])
+    assert four['prefill']['compute_ms'] == pytest.approx(
+        4.0 * one['prefill']['compute_ms'])
     for row in sweep['rows']:
         for phase in ('prefill', 'decode'):
             for key in ('total_ms', 'core_ms', 'compute_ms', 'memory_ms',

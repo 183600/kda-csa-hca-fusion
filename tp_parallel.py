@@ -1393,9 +1393,12 @@ def tp_latency(cfg: HybridConfig, *, tp_size: int, prefill_len: int,
     prefill_comm_ms = 0.0
     message_bytes = prefill_batch * prefill_len * cfg.d_model * hw.itemsize
     for kind in layout:
-        prefill_flops_rank += _rank_flops(
+        # Each sequence in the prefill batch does the same per-layer work;
+        # the all-reduce message already includes the batch (below), so
+        # the compute and full-FLOPs fields must scale with it too.
+        prefill_flops_rank += prefill_batch * _rank_flops(
             cfg, kind, prefill_len, tp_size, flop_cache)
-        full_prefill_flops += layer_flops_split(
+        full_prefill_flops += prefill_batch * layer_flops_split(
             cfg, kind, prefill_len)['total']
         prefill_comm_ms += ring_allreduce_ms(message_bytes, tp_size, hw)
     prefill_compute_ms = (prefill_flops_rank / (hw.peak_tflops * 1e12)) * 1e3
