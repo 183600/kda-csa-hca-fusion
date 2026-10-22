@@ -181,6 +181,15 @@ def test_exp16_row_contract_recomputes_rates_and_verdicts():
                                   bad, meta)
     _ok('tampered rate is rejected',
         any('rejection_rate' in v for v in violations), violations)
+    for patch in ({'rejection_rate': None}, {'tol': None},
+                  {'method': []}, {'section': []}, {'name': []}):
+        bad = [dict(r) for r in report['rows']]
+        idx = next(i for i, r in enumerate(bad) if r['section'] == 'size')
+        bad[idx] = dict(bad[idx], **patch)
+        violations = rs.validate_rows('exp16_paired_stats_calibration',
+                                      bad, meta)
+        _ok(f'malformed {next(iter(patch))} is rejected without crashing',
+            bool(violations), violations)
     bad = [dict(r) for r in report['rows']]
     idx = next(i for i, r in enumerate(bad) if r['section'] == 'coverage')
     bad[idx] = dict(bad[idx], verdict='calibrated', meets=False)

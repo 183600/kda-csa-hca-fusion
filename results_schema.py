@@ -1615,13 +1615,14 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
             out.append(f'{where}: expected an object, got {type(row).__name__}')
             continue
         section = row.get('section')
-        if section not in _EXP16_SECTIONS:
+        if not isinstance(section, str) or section not in _EXP16_SECTIONS:
             out.append(f'{where}: section={section!r} not in '
                        f'{sorted(_EXP16_SECTIONS)}')
             continue
         sections_present.add(section)
         name = row.get('name')
-        if not isinstance(name, str) or not name:
+        name_ok = isinstance(name, str) and bool(name)
+        if not name_ok:
             out.append(f"{where}: 'name' must be a non-empty string")
         n_pairs = row.get('n_pairs')
         if not (_positive_int(n_pairs) and int(n_pairs) >= 2):
@@ -1650,11 +1651,13 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
             elif _finite_number(rate) and abs(
                     float(rate) - n_sig / int(n_reps)) > 1e-12:
                 out.append(f'{where}: rejection_rate != n_significant/n_reps')
+            if not _finite_number(rate):
+                out.append(f"{where}: 'rejection_rate' must be finite")
             method = row.get('method')
             if section == 'power':
                 if method != 'paired_t':
                     out.append(f"{where}: power method must be 'paired_t'")
-            elif method not in _EXP16_METHODS:
+            elif not isinstance(method, str) or method not in _EXP16_METHODS:
                 out.append(f'{where}: method={method!r} not in '
                            f'{sorted(_EXP16_METHODS)}')
         if section == 'size':
@@ -1662,7 +1665,8 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
             threshold = row.get('threshold')
             if not (_finite_number(tol) and float(tol) > 0):
                 out.append(f"{where}: 'tol' must be finite > 0")
-            if not (_finite_number(threshold) and _finite_number(alpha)):
+            if not (_finite_number(threshold) and _finite_number(alpha)
+                    and _finite_number(tol)):
                 out.append(f"{where}: 'threshold' must be finite")
             elif abs(float(threshold) - (float(alpha) + float(tol))) > 1e-12:
                 out.append(f'{where}: threshold != alpha + tol')
@@ -1680,7 +1684,8 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
             verdict = row.get('verdict')
             if verdict not in ('within_bound', 'conservative', 'liberal'):
                 out.append(f'{where}: verdict={verdict!r} invalid')
-            elif isinstance(meets, bool):
+            elif (isinstance(meets, bool) and _finite_number(rate)
+                  and _finite_number(alpha) and _finite_number(tol)):
                 want = ('within_bound' if meets
                         else ('conservative'
                               if float(rate) < float(alpha) - float(tol)
@@ -1710,7 +1715,7 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
                         and abs(float(nominal) - (1.0 - float(alpha)))
                         < 1e-12):
                     out.append(f'{where}: nominal != 1-alpha')
-                if not (_finite_number(bias)
+                if not (_finite_number(bias) and _finite_number(nominal)
                         and abs(float(bias) - (float(coverage)
                                                - float(nominal))) < 1e-12):
                     out.append(f'{where}: bias != coverage-nominal')
@@ -1799,10 +1804,12 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
                 out.append(f'{where}: power verdict contradicts meets')
             if row.get('gate') is not True:
                 out.append(f'{where}: power row must gate')
-        key = (section, name, row.get('method'))
-        if key in seen:
-            out.append(f'{where}: duplicate key {key!r}')
-        seen.add(key)
+        method_key = row.get('method')
+        if name_ok and isinstance(method_key, (str, type(None))):
+            key = (section, name, method_key)
+            if key in seen:
+                out.append(f'{where}: duplicate key {key!r}')
+            seen.add(key)
     missing = sorted(_EXP16_SECTIONS - sections_present)
     if missing:
         out.append(f'certificate is incomplete: section(s) {missing} absent')
