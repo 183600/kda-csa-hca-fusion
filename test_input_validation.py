@@ -283,6 +283,7 @@ def test_kda_g_clamp_rejects_positive_infinity_and_nan():
     it before the clamp. ``-inf`` (disabled) and finite bounds still work.
     """
     from ops_kda import naive_chunk_kda, naive_recurrent_kda
+    from ops_kda_autograd import custom_recurrent_kda
     from ops_kda_backend import kda_forward
 
     B, T, H, K, HV, V = 1, 3, 1, 2, 1, 2
@@ -295,6 +296,7 @@ def test_kda_g_clamp_rejects_positive_infinity_and_nan():
     for fn, kwargs in (
             (naive_recurrent_kda, {}),
             (naive_chunk_kda, {'chunk_size': 2}),
+            (custom_recurrent_kda, {}),
             (kda_forward, {'use_chunk': False})):
         for bad in (float('inf'), float('nan'), True):
             try:

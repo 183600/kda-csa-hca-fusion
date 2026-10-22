@@ -68,6 +68,7 @@ import torch
 
 from ops_kda import (
     _compute_dtype,
+    _validate_g_clamp_min,
     _validate_kda_inputs,
     _validate_kda_shapes,
     _warn_if_nonfinite,
@@ -327,6 +328,7 @@ def custom_recurrent_kda(
         first-order only (no double backward).
     """
     dtype = v.dtype
+    _validate_g_clamp_min(g_clamp_min, 'custom_recurrent_kda')
     _validate_kda_inputs(q, k, v, g, beta,
                          fn_name='custom_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
