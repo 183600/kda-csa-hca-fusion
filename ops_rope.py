@@ -60,6 +60,7 @@ the same function with negated positions.
 from __future__ import annotations
 
 import collections as _collections
+import math as _math
 import weakref as _weakref
 
 import torch
@@ -337,8 +338,16 @@ def partial_rope(
         rotated. The rotation is orthogonal (norm-preserving), so L2 norms
         computed before/after agree up to floating-point rounding.
     """
-    if rope_dim is None or rope_dim <= 0:
+    if rope_dim is None:
         return x
+    if isinstance(rope_dim, bool) or not isinstance(rope_dim, int):
+        raise ValueError(
+            f"partial_rope: rope_dim={rope_dim!r} must be an int or None.")
+    if rope_dim <= 0:
+        return x
+    if isinstance(dim, bool) or not isinstance(dim, int):
+        raise ValueError(
+            f"partial_rope: dim={dim!r} must be an int sequence axis.")
     nd = x.dim()
     if not -nd <= dim < nd:
         raise ValueError(
@@ -356,6 +365,10 @@ def partial_rope(
         raise ValueError(
             f"partial_rope: rope_dim={rope_dim} exceeds the feature dim D={D}")
     P = x.shape[dim]
+    if positions.dim() != 1:
+        raise ValueError(
+            f"partial_rope: positions must be a 1-D vector, got shape "
+            f"{tuple(positions.shape)}.")
     if positions.numel() != P:
         raise ValueError(
             f"partial_rope: positions has {positions.numel()} entries but axis "
@@ -365,8 +378,10 @@ def partial_rope(
     if rope_dim % 2 != 0:
         raise ValueError(
             f"partial_rope: rope_dim={rope_dim} must be even.")
-    if not isinstance(base, (int, float)) or base <= 0:
-        raise ValueError(f"partial_rope: base={base!r} must be positive.")
+    if (isinstance(base, bool) or not isinstance(base, (int, float))
+            or not _math.isfinite(float(base)) or base <= 0):
+        raise ValueError(
+            f"partial_rope: base={base!r} must be a finite positive number.")
     device = x.device
     angle_dtype = _angle_dtype(x)
     if (positions.dtype in _INT_POS_DTYPES and not positions.requires_grad
@@ -463,6 +478,9 @@ def token_positions(T: int, device, dtype=torch.long) -> torch.Tensor:
     The returned tensor is cached and shared; callers must treat it as
     read-only (all in-repo consumers do).
     """
+    if isinstance(T, bool) or not isinstance(T, int) or T < 0:
+        raise ValueError(
+            f"token_positions: T={T!r} must be a non-negative int.")
     key = ('tok', T, str(device), str(dtype))
     pos = _POSITION_VEC_CACHE.get(key)
     if pos is None:
@@ -485,6 +503,14 @@ def block_positions(n_blocks: int, m: int, device,
     The returned tensor is cached and shared; callers must treat it as
     read-only (all in-repo consumers do).
     """
+    if (isinstance(n_blocks, bool) or not isinstance(n_blocks, int)
+            or n_blocks < 0):
+        raise ValueError(
+            f"block_positions: n_blocks={n_blocks!r} must be a non-negative "
+            f"int.")
+    if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+        raise ValueError(
+            f"block_positions: m={m!r} must be a positive int.")
     key = ('blk', n_blocks, m, str(device), str(dtype))
     pos = _POSITION_VEC_CACHE.get(key)
     if pos is None:

@@ -311,6 +311,53 @@ def test_kda_g_clamp_rejects_positive_infinity_and_nan():
             fn(q, k, v, g, beta, g_clamp_min=negative_inf, **kwargs)
 
 
+def test_rope_rejects_invalid_dims_bases_and_positions():
+    """RoPE parameter errors fail before they can produce NaN tables.
+
+    ``base=NaN/inf`` used to reach ``_inv_freq`` and turn every rotated
+    channel into NaN; a float/bool ``rope_dim`` or ``dim`` reached slicing
+    with an opaque error. Positions are also required to be a 1-D integer
+    vector, and the cached position builders require exact non-negative
+    lengths.
+    """
+    from ops_rope import block_positions, partial_rope, token_positions
+
+    x = torch.randn(1, 4, 8)
+    pos = torch.arange(4)
+    partial_rope(x, pos, 4)  # valid contract still works
+    for kwargs in (
+            {'rope_dim': 4, 'base': float('nan')},
+            {'rope_dim': 4, 'base': float('inf')},
+            {'rope_dim': 4, 'base': True},
+            {'rope_dim': 4.0},
+            {'rope_dim': True},
+            {'rope_dim': 4, 'dim': True}):
+        try:
+            partial_rope(x, pos, **kwargs)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'partial_rope {kwargs} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'partial_rope {kwargs} rejected', False, 'no error raised')
+
+    for fn, args in (
+            (token_positions, (-1, 'cpu')),
+            (token_positions, (True, 'cpu')),
+            (block_positions, (-1, 2, 'cpu')),
+            (block_positions, (2, 0, 'cpu'))):
+        try:
+            fn(*args)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _ok(f'{fn.__name__}{args} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'{fn.__name__}{args} rejected', False, 'no error raised')
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -401,6 +448,7 @@ if __name__ == '__main__':
     test_csa_decode_step_validates_indexer_operands()
     test_kda_chunk_size_requires_an_exact_positive_int()
     test_kda_g_clamp_rejects_positive_infinity_and_nan()
+    test_rope_rejects_invalid_dims_bases_and_positions()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()
