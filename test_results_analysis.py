@@ -86,6 +86,30 @@ def test_curve_diagnosis_healthy_and_diverged():
     assert rep['val']['non_finite_at'] == 1
 
 
+def test_curve_diagnosis_keeps_extreme_finite_curves_json_safe():
+    """A finite loss curve must never emit an inf/NaN summary.
+
+    ``sum([1e308, 1e308])`` overflows even though both losses and their
+    mean are finite, and an opposite-sign swing can produce a slope larger
+    than the float range.  The report is embedded in strict JSON, so the
+    ordinary path is kept and only these overflow cases degrade to a
+    finite scaled mean or a documented ``None`` slope.
+    """
+    for train in ([1e308, 1e308, 1e308],
+                  [1e308, -1e308, 1e308],
+                  [1e308, -1e308],
+                  [1e308, 1e308]):
+        rep = diagnose_training_curves(train)
+        json.dumps(rep, allow_nan=False)
+        assert rep['train']['head_mean'] is not None
+        assert rep['train']['tail_mean'] is not None
+    # Ordinary curves still have the historical values.
+    rep = diagnose_training_curves([3.0, 2.0, 1.0])
+    assert rep['train']['head_mean'] == 3.0
+    assert rep['train']['tail_mean'] == 1.0
+    assert rep['train']['tail_slope_per_point'] == pytest.approx(-1.0)
+
+
 def test_curve_diagnosis_flags_a_budget_limited_run():
     """A healthy run that is still descending at the last step is NOT converged.
 

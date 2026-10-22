@@ -46,22 +46,46 @@ def _finite(values: Sequence[float]) -> bool:
     return all(v is not None and math.isfinite(float(v)) for v in values)
 
 
+def _safe_mean(values: Sequence[float]) -> float | None:
+    """Mean of finite values without overflowing the intermediate sum.
+
+    ``sum([1e308, 1e308]) / 2`` is ``inf / 2`` even though both inputs and
+    the true mean are finite.  The ordinary path keeps the exact previous
+    arithmetic; only an overflowing sum falls back to a scaled sum, which
+    is value-equal up to ordinary floating-point round-off.
+    """
+    if not values:
+        return None
+    total = sum(values)
+    if math.isfinite(total):
+        return float(total / len(values))
+    scale = max(abs(float(v)) for v in values)
+    if scale == 0.0:
+        return 0.0
+    mean = float(scale * (math.fsum(float(v) / scale for v in values)
+                          / len(values)))
+    if not math.isfinite(mean):
+        raise ValueError(
+            f'mean is not finite after scaled summation (scale={scale!r})')
+    return mean
+
+
 def _window_mean(values: Sequence[float], k: int) -> float | None:
     if not values:
         return None
     k = max(1, min(int(k), len(values)))
-    return float(sum(values[-k:]) / k)
+    return _safe_mean(values[-k:])
 
 
 def _head_mean(values: Sequence[float], frac: float = 0.1) -> float | None:
     if not values:
         return None
     k = max(1, int(math.ceil(len(values) * frac)))
-    return float(sum(values[:k]) / k)
+    return _safe_mean(values[:k])
 
 
 def _tail_slope(losses: Sequence[float], *, frac: float = 0.25
-                ) -> tuple[float, float | None, int]:
+                ) -> tuple[float | None, float | None, int]:
     """Least-squares slope over the last ``frac`` of a curve.
 
     A head/tail MEAN comparison cannot tell a curve that reached a plateau
@@ -69,7 +93,10 @@ def _tail_slope(losses: Sequence[float], *, frac: float = 0.25
     the same tail mean. The slope of the final segment answers that
     question. Returns ``(slope_per_point, slope_relative_to_tail_mean,
     n_points_used)``; the relative value is ``None`` when the tail mean is
-    zero, so it can be stored in strict JSON.
+    zero, so it can be stored in strict JSON.  ``slope_per_point`` is also
+    ``None`` when the true slope is not representable as a finite float
+    (e.g. an opposite-sign swing of two ``1e308`` losses); returning
+    ``inf``/``NaN`` would break the strict-JSON contract.
     """
     n = len(losses)
     if n < 2:
@@ -79,12 +106,37 @@ def _tail_slope(losses: Sequence[float], *, frac: float = 0.25
     ys = [float(v) for v in losses[-k:]]
     xs = list(range(k))
     mean_x = (k - 1) / 2.0
-    mean_y = sum(ys) / k
+    mean_y = _safe_mean(ys)
     denom = sum((x - mean_x) ** 2 for x in xs)
-    slope = (sum((x - mean_x) * (y - mean_y)
-                 for x, y in zip(xs, ys)) / denom) if denom else 0.0
-    relative = (slope / abs(mean_y)) if mean_y != 0.0 else None
-    return float(slope), relative, k
+    slope = None
+    if denom:
+        deviations = [y - mean_y for y in ys]
+        num = math.fsum((x - mean_x) * d for x, d in zip(xs, deviations))
+        candidate = num / denom
+        if math.isfinite(candidate):
+            slope = candidate
+        else:
+            # The true slope is finite in units of the curve but can exceed
+            # the float range.  Recompute in scaled units and only multiply
+            # back when the product is representable.
+            scale = max(abs(y) for y in ys)
+            if scale > 0.0:
+                scaled = [y / scale for y in ys]
+                scaled_mean = _safe_mean(scaled)
+                scaled_num = math.fsum(
+                    (x - mean_x) * (y - scaled_mean)
+                    for x, y in zip(xs, scaled))
+                scaled_slope = scaled_num / denom
+                candidate = scaled_slope * scale
+                if math.isfinite(candidate):
+                    slope = candidate
+    else:
+        slope = 0.0
+    relative = (slope / abs(mean_y)) if (
+        slope is not None and mean_y not in (None, 0.0)) else None
+    if relative is not None and not math.isfinite(relative):
+        relative = None
+    return slope, relative, k
 
 
 def _curve_stats(losses: Sequence[float]) -> dict:
@@ -92,11 +144,20 @@ def _curve_stats(losses: Sequence[float]) -> dict:
     n = len(losses)
     head_k = max(1, int(math.ceil(n * 0.1)))
     tail_k = max(1, int(math.ceil(n * 0.1)))
-    head = float(sum(losses[:head_k]) / head_k)
-    tail = float(sum(losses[-tail_k:]) / tail_k)
+    head = _safe_mean(losses[:head_k])
+    tail = _safe_mean(losses[-tail_k:])
     best = float(min(losses))
     best_step = int(min(range(n), key=lambda i: losses[i]))
-    relative_change = ((tail - head) / abs(head)) if head != 0.0 else None
+    relative_change = None
+    if head not in (None, 0.0):
+        delta = tail - head
+        if math.isfinite(delta):
+            relative_change = delta / abs(head)
+        else:
+            # Same ratio, evaluated without the overflowing subtraction.
+            relative_change = (tail / abs(head)) - math.copysign(1.0, head)
+        if not math.isfinite(relative_change):
+            relative_change = None
     tail_slope, tail_slope_rel, tail_slope_points = _tail_slope(losses)
     return {
         'n_points': n,
