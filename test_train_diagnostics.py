@@ -14,6 +14,7 @@ Run with ``pytest -q test_train_diagnostics.py``.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -72,6 +73,16 @@ def test_gradient_norm_summary_names_masked_explosions():
     assert mixed['max'] == 3.0
     assert mixed['mean'] == 2.0
     json.dumps(mixed, allow_nan=False)
+
+    # Finite values near the float maximum must not overflow the summary to
+    # ``inf``: the mean/median and the last-k tail mean stay representable
+    # and the report remains JSON-strict.
+    huge = summarize_gradient_norms([1e308, 1e308], clip_norm=1e10)
+    assert huge['mean'] == 1e308 and huge['median'] == 1e308
+    assert huge['tail_mean'] == 1e308
+    assert all(math.isfinite(huge[k]) for k in ('mean', 'median',
+                                                'tail_mean'))
+    json.dumps(huge, allow_nan=False)
 
     assert summarize_gradient_norms([]) is None
     dead = summarize_gradient_norms([float('nan')], clip_norm=1.0)

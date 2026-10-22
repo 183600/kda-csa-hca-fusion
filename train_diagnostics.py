@@ -256,6 +256,44 @@ def optimizer_update_report(before, named_parameters, optimizer, *,
 # --------------------------------------------------------------------------
 # 1b. Gradient-norm health summary
 # --------------------------------------------------------------------------
+def _finite_safe_mean(values: list[float]) -> float:
+    """Mean of finite floats without overflowing the intermediate sum.
+
+    ``sum([1e308, 1e308]) / 2`` is ``inf`` although both the inputs and the
+    true mean are finite. Keep the ordinary expression for every in-range
+    sample; only fall back to a scaled summation when it overflows.
+    """
+    n = len(values)
+    total = sum(values)
+    if math.isfinite(total):
+        return total / n
+    scale = max(abs(x) for x in values)
+    if scale == 0.0:
+        return 0.0
+    mean = scale * (math.fsum(x / scale for x in values) / n)
+    if not math.isfinite(mean):
+        raise ValueError(
+            f'gradient-norm mean is not finite after scaled summation '
+            f'(scale={scale!r})')
+    return mean
+
+
+def _finite_safe_median(ordered: list[float]) -> float:
+    """Median whose even-sample midpoint cannot overflow to ``inf``."""
+    n = len(ordered)
+    if n % 2:
+        return ordered[n // 2]
+    a, b = ordered[n // 2 - 1], ordered[n // 2]
+    mid = (a + b) / 2.0
+    if math.isfinite(mid):
+        return mid
+    mid = a / 2.0 + b / 2.0
+    if not math.isfinite(mid):
+        raise ValueError(
+            'gradient-norm median is not finite after overflow-safe midpoint')
+    return mid
+
+
 def summarize_gradient_norms(grad_norms, *, clip_norm: float | None = None
                              ) -> dict | None:
     """Summarize the per-step PRE-CLIP gradient norm curve.
@@ -299,15 +337,14 @@ def summarize_gradient_norms(grad_norms, *, clip_norm: float | None = None
     n = len(ordered)
     out.update({
         'max': ordered[-1],
-        'mean': sum(finite) / n,
-        'median': (ordered[n // 2] if n % 2
-                   else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0),
+        'mean': _finite_safe_mean(finite),
+        'median': _finite_safe_median(ordered),
         'p95': ordered[max(0, math.ceil(0.95 * n) - 1)],
         'first': finite[0],
         'last': finite[-1],
     })
     tail_k = max(1, min(10, math.ceil(0.1 * n)))
-    out['tail_mean'] = sum(finite[-tail_k:]) / tail_k
+    out['tail_mean'] = _finite_safe_mean(finite[-tail_k:])
     if clip_norm is not None:
         try:
             clip = float(clip_norm)
