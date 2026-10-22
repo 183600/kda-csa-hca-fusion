@@ -7,7 +7,9 @@ per-request footprint does not grow with context. Softmax attention grows
 linearly (KV cache), and CSA/HCA grow with the compressed-block count
 (~`T/m` + fixed window). The claim is backed by the analytical accounting
 (`run_kv_cache.py`, `cache_accounting.py`) and per-op tests; the Exp 6
-certificate additionally MEASURES it across all operators.
+certificate additionally MEASURES it across all operators. For a
+counterfactual proof that each state family is actually read during
+incremental decode, see `docs/decode-state-ablation.md`.
 
 ## What Exp 6 records
 

@@ -22,9 +22,9 @@ adds the missing negative controls:
   suffix (the non-vacuous control).
 
 Both functions are measurement helpers for tests and experiments; they do
-not train, benchmark, or modify weights.  ``run_correctness`` drives them
-on the 3:1:1 KDA hybrid geometry, and ``test_tp_parallel`` uses the same
-future-perturbation contract on the streaming TP reference.
+not train, benchmark, or modify weights.  ``test_tp_parallel`` drives them
+on the 3:1:1 KDA hybrid geometry and reuses the future-perturbation
+contract on the streaming TP reference.
 """
 
 from __future__ import annotations
