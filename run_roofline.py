@@ -57,7 +57,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (configure_torch_for_device, parse_int_env,
-                          set_global_seed, capture_provenance)
+                          set_global_seed, capture_provenance,
+                          append_run_manifest, make_run_manifest_entry)
 from results_schema import SchemaError, parse, write as write_results
 from run_kv_cache import kv_cache_elements, prefill_flops
 import roofline
@@ -446,6 +447,29 @@ def main() -> int:
     out = 'results/exp7_roofline.json'
     write_results(out, points, kind='exp7_roofline', metadata=metadata)
     logger.info(f'\nSaved: {out}')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp7_roofline',
+        seeds=ROOFLINE_SEED,
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'device': device,
+            'source': metadata['source'],
+            'flops_model': metadata['flops_model'],
+            'byte_model': metadata['byte_model'],
+            'seed_scheme': metadata['seed_info'],
+        },
+        data={
+            'source_experiment': 'exp2_benchmark',
+            'source_path': src,
+            'source_schema_version': src_version,
+            'n_source_rows': len(rows),
+        },
+        artifacts={'results': out},
+        results={
+            'n_points': len(points),
+            'n_skipped': len(skipped),
+        },
+    ), logger=logger)
     return 0
 
 
