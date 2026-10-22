@@ -2211,27 +2211,53 @@ def _unit_of_group(group_id: str) -> str:
 
 
 def _row_design_field(row: dict, field: str):
-    """Read a recipe field from the aggregate row or its per-seed rows."""
+    """Read a recipe field from the aggregate row or its per-seed rows.
+
+    Malformed per-seed entries are skipped (a result file can contain an
+    error stub or a hand-edited placeholder); the aggregate field, when
+    present, always wins.
+    """
+    if not isinstance(row, dict):
+        return None
     value = row.get(field)
     if value is None:
-        for seed_row in row.get('per_seed') or []:
-            value = seed_row.get(field)
-            if value is not None:
-                break
+        per_seed = row.get('per_seed')
+        if isinstance(per_seed, (list, tuple)):
+            for seed_row in per_seed:
+                if not isinstance(seed_row, dict):
+                    continue
+                value = seed_row.get(field)
+                if value is not None:
+                    break
     return value
 
 
 def _finite_seed_set(row: dict) -> set:
+    """Seed ids with a finite numeric ``final_acc`` in one result row.
+
+    This is the seed-alignment audit's population. It must use exactly the
+    same survivorship rule as the paired contrasts (see
+    :func:`_seed_accuracy_map`): a malformed per-seed record, a non-int
+    seed id, or a non-finite/string/bool accuracy is not a measurement and
+    must not be treated as a successfully aligned seed.
+    """
     seeds = set()
-    for seed_row in row.get('per_seed') or []:
-        if ('error' in seed_row or seed_row.get('final_acc') is None):
+    if not isinstance(row, dict):
+        return seeds
+    per_seed = row.get('per_seed')
+    if not isinstance(per_seed, (list, tuple)):
+        return seeds
+    for seed_row in per_seed:
+        if not isinstance(seed_row, dict) or 'error' in seed_row:
             continue
-        try:
-            acc = float(seed_row['final_acc'])
-        except (TypeError, ValueError):
+        seed = seed_row.get('seed')
+        if isinstance(seed, bool) or not isinstance(seed, int):
             continue
-        if math.isfinite(acc):
-            seeds.add(seed_row.get('seed'))
+        acc = seed_row.get('final_acc')
+        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
+                or not math.isfinite(float(acc))):
+            continue
+        seeds.add(seed)
     return seeds
 
 

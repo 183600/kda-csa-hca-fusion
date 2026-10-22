@@ -1024,3 +1024,38 @@ def test_seed_accuracy_map_ignores_malformed_seed_metrics():
     ]}
     assert _seed_accuracy_map(result) == {1: 0.4, 8: 0.8}
     assert _seed_accuracy_map({'per_seed': None}) == {}
+
+
+def test_matrix_design_audit_ignores_malformed_per_seed_rows():
+    """The seed-alignment audit must skip bad rows, not crash or count them.
+
+    ``_finite_seed_set`` feeds the matrix design audit's "all groups share
+    the requested seeds" check. It must use the same survivorship rule as
+    ``_seed_accuracy_map``: malformed records, non-int seed ids and
+    non-finite/string/bool accuracies are not successful seeds.
+    """
+    from run_ablation import _finite_seed_set, _row_design_field
+
+    row = {'per_seed': [
+        {'seed': 1, 'final_acc': 0.4},
+        {'seed': 2, 'final_acc': float('nan')},
+        {'seed': 3, 'final_acc': '0.5'},
+        {'seed': 4, 'final_acc': True},
+        {'seed': '5', 'final_acc': 0.9},
+        {'seed': 6, 'final_acc': 0.8},
+        {'seed': 7, 'final_acc': 0.7, 'error': 'diverged'},
+        'not-a-row',
+        None,
+    ]}
+    assert _finite_seed_set(row) == {1, 6}
+    assert _finite_seed_set({'per_seed': None}) == set()
+    assert _finite_seed_set(None) == set()
+
+    # The recipe-field fallback has the same malformed-row contract and
+    # still gives the aggregate field precedence.
+    assert _row_design_field({'per_seed': ['x', None,
+                                           {'lr': 0.2}]}, 'lr') == 0.2
+    assert _row_design_field({'lr': 0.1,
+                              'per_seed': [{'lr': 0.2}]}, 'lr') == 0.1
+    assert _row_design_field({'per_seed': ['x', None]}, 'lr') is None
+    assert _row_design_field(None, 'lr') is None
