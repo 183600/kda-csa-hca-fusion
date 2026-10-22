@@ -122,7 +122,7 @@ from train_diagnostics import (
 )
 from multi_seed_stats import (
     min_detectable_effect, seeds_required, tost_from_summary,
-    _sample_sd,
+    _safe_mean, _sample_sd,
 )
 from experiment_design import (audit_run as audit_experiment_design,
                                common_analyzed_seeds)
@@ -1823,14 +1823,30 @@ def _validation_tail_score(result: dict, tail_k: int = 3):
     then average over seeds. Selection uses only the validation stream, so
     the headline eval stream stays untouched.
     """
+    if not isinstance(result, dict):
+        return None
+    per_seed = result.get('per_seed')
+    if not isinstance(per_seed, (list, tuple)):
+        return None
     scores = []
-    for row in result.get('per_seed', []):
-        vh = row.get('val_history') or []
-        vals = [float(p['acc']) for p in vh[-int(tail_k):]
-                if p.get('acc') is not None]
+    for row in per_seed:
+        if not isinstance(row, dict):
+            continue
+        vh = row.get('val_history')
+        if not isinstance(vh, (list, tuple)):
+            continue
+        vals = []
+        for point in vh[-int(tail_k):]:
+            if not isinstance(point, dict):
+                continue
+            acc = point.get('acc')
+            if (isinstance(acc, bool) or not isinstance(acc, (int, float))
+                    or not math.isfinite(float(acc))):
+                continue
+            vals.append(float(acc))
         if vals:
-            scores.append(sum(vals) / len(vals))
-    return (sum(scores) / len(scores)) if scores else None
+            scores.append(_safe_mean(vals))
+    return _safe_mean(scores) if scores else None
 
 
 def tune_simple_baseline_lr(spec, lrs, *, n_kv_list, tune_seeds, steps,

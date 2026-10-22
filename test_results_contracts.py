@@ -35,6 +35,7 @@ How to run::
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -1060,6 +1061,38 @@ def test_matrix_design_audit_ignores_malformed_per_seed_rows():
     assert _row_design_field({'per_seed': ['x', None]}, 'lr') is None
     assert _row_design_field(None, 'lr') is None
 
+
+def test_validation_tail_score_skips_malformed_and_nonfinite_points():
+    """The baseline-LR tuner must not crash on a malformed per-seed record.
+
+    ``_validation_tail_score`` is fed result rows that may contain error
+    stubs or hand-edited placeholders. The rest of ``run_ablation`` skips
+    such records in paired contrasts; the tuning selector must apply the
+    same rule, and a NaN/Inf point must not poison the plateau mean.
+    """
+    from run_ablation import _validation_tail_score
+
+    assert _validation_tail_score(None) is None
+    assert _validation_tail_score({'per_seed': None}) is None
+    record = {'per_seed': [
+        'not-a-row',
+        None,
+        {'val_history': None},
+        {'val_history': ['not-a-point', None, {'loss': 1.0}]},
+        {'val_history': [{'acc': 0.2}, {'acc': 0.4},
+                         {'acc': float('nan')}, {'acc': '0.9'}]},
+        {'val_history': [{'acc': 0.6}, {'acc': float('inf')},
+                         {'acc': 0.8}]},
+    ]}
+    # Last 3 points per row: row 5 -> [0.4, NaN, '0.9'] keeps [0.4]; row 6
+    # -> [0.6, Inf, 0.8] keeps [0.6, 0.8]. Mean of the two per-seed
+    # plateaus = (0.4 + 0.7) / 2 = 0.55.
+    score = _validation_tail_score(record, tail_k=3)
+    assert score == pytest.approx(0.55)
+    assert math.isfinite(score)
+    # No usable point -> None (the tuner falls back to the grid ordering).
+    assert _validation_tail_score(
+        {'per_seed': [{'val_history': [{'acc': float('nan')}]}]}) is None
 
 def test_softmax_gqa_prefill_uses_the_requested_head_width():
     """``prefill_flops('softmax_gqa')`` must derive n_q from ``K``.
