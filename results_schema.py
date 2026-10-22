@@ -1429,6 +1429,7 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
             if not (_finite_number(row.get('total_read_elements'))
                     and float(row['total_read_elements']) >= 0):
                 out.append(f"{where}: total_read_elements must be finite >= 0")
+            memory_op = row.get('memory_op', 'kda')
             if kind == 'layout':
                 ratio = row.get('ratio')
                 if not (isinstance(ratio, list) and len(ratio) == 3
@@ -1438,8 +1439,13 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                                f'ints with positive sum, got {ratio!r}')
                 elif isinstance(name, str) and name != ':'.join(map(str, ratio)):
                     out.append(f'{where}: name {name!r} != ratio {ratio!r}')
+            elif 'memory_op' in row:
+                out.append(f"{where}: memory_op is only valid on layout rows")
+            if kind == 'layout' and memory_op not in ('kda', 'mamba2'):
+                out.append(f"{where}: memory_op={memory_op!r} must be "
+                           f"'kda' or 'mamba2'")
             key = (section, row.get('geometry'), t_key, row.get(t_key),
-                   kind, name)
+                   kind, name, memory_op if kind == 'layout' else None)
         elif section == 'decode_sweep':
             if not _nonnegative_int(row.get('csa_topk')):
                 out.append(f"{where}: csa_topk must be a non-negative int, "

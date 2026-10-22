@@ -476,7 +476,7 @@ def test_build_budget_curves_rows():
     spec = mqar_spec()
     rows = build_budget_curves([16], {'mqar': spec})
     _ok('one row per op and layout',
-        len(rows) == 5 + len(LAYOUTS), f'{len(rows)} rows')
+        len(rows) == 5 + 2 * len(LAYOUTS), f'{len(rows)} rows')
     csa = next(r for r in rows if r['row_kind'] == 'op'
                and r['name'] == 'csa')
     _ok('CSA row exposes both terms',
@@ -488,9 +488,15 @@ def test_build_budget_curves_rows():
         abs(mamba['total_read_elements'] - 2048.0) < 1e-9
         and mamba['state_elements'] == 1024, f'{mamba}')
     lay = next(r for r in rows if r['row_kind'] == 'layout'
-               and r['name'] == '3:1:1')
-    _ok('3:1:1 row total = 3408',
+               and r['name'] == '3:1:1' and r['memory_op'] == 'kda')
+    _ok('3:1:1 KDA route total = 3408',
         abs(lay['total_read_elements'] - 3408.0) < 1e-9, f'{lay}')
+    mamba = next(r for r in rows if r['row_kind'] == 'layout'
+                 and r['name'] == '3:1:1' and r['memory_op'] == 'mamba2')
+    _ok('3:1:1 Mamba-2 route is a separate row',
+        mamba['n_mamba2'] == 3 and mamba['n_kda'] == 0
+        and abs(mamba['total_read_elements'] - 3 * 2048.0
+                - 204.0 - 132.0) < 1e-9, f'{mamba}')
 
 
 def test_decode_budget_curve_and_sweep_join():
@@ -500,7 +506,7 @@ def test_decode_budget_curve_and_sweep_join():
     spec = mqar_spec()
     rows = build_decode_budget_curves([16], {'mqar': spec})
     _ok('one marginal row per op and layout',
-        len(rows) == 5 + len(LAYOUTS), f'{len(rows)} rows')
+        len(rows) == 5 + 2 * len(LAYOUTS), f'{len(rows)} rows')
     csa = next(r for r in rows if r['row_kind'] == 'op'
                and r['name'] == 'csa')
     _ok('CSA marginal t=16 total = 320, indexer = 128',
@@ -511,9 +517,14 @@ def test_decode_budget_curve_and_sweep_join():
     _ok('Mamba-2 marginal is the O(1) state read',
         abs(mamba['total_read_elements'] - 2048.0) < 1e-9, f'{mamba}')
     lay = next(r for r in rows if r['row_kind'] == 'layout'
-               and r['name'] == '3:1:1')
-    _ok('3:1:1 marginal t=16 total = 3584',
+               and r['name'] == '3:1:1' and r['memory_op'] == 'kda')
+    _ok('3:1:1 KDA marginal t=16 total = 3584',
         abs(lay['total_read_elements'] - 3584.0) < 1e-9, f'{lay}')
+    mamba = next(r for r in rows if r['row_kind'] == 'layout'
+                 and r['name'] == '3:1:1' and r['memory_op'] == 'mamba2')
+    _ok('3:1:1 Mamba-2 marginal uses its own state read',
+        abs(mamba['total_read_elements'] - 3 * 2048.0
+            - 320.0 - 192.0) < 1e-9, f'{mamba}')
     _ok('marginal row carries position t (not T)',
         lay['t'] == 16 and 'T' not in lay, '')
     sweep = run_decode_sweep(

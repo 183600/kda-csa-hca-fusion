@@ -78,9 +78,12 @@ is KDA by default; pass ``memory_op='mamba2'`` to
 ``windowed_layout_read_elements`` to price the alternative route. The row
 keeps ``n_memory`` and ``memory_op``, sets ``kda_read_elements`` or
 ``mamba2_read_elements`` accordingly, and leaves the default KDA totals
-bit-identical. `run_budget_frontier` still emits its layout curves on the
-KDA route; the Mamba-2 route is available per-op (Exp 4 join) and through
-this explicit API rather than being silently assumed away.
+bit-identical. `run_budget_frontier` emits the layout curves for **both** routes and
+carries `memory_op` on every layout row; the schema includes that field in
+its row key, so the same ratio on KDA and Mamba-2 is two rows rather than
+a duplicate (legacy rows without the field still mean KDA). The quality
+join also keeps Exp 4's standalone `mamba2` rows, priced at that probe's
+own Mamba-2 geometry.
 
 ## Scope / honesty
 

@@ -796,6 +796,15 @@ def _exp9_contract_rows():
 def test_row_contract_exp9_audits_cross_source_ranking():
     rows = _exp9_contract_rows()
     assert rs.validate_rows('exp9_budget_frontier', rows, {}) == []
+    # The same ratio on the two memory routes is two rows, not a duplicate.
+    both_routes = [dict(r) for r in rows]
+    both_routes.append(dict(
+        both_routes[1], memory_op='mamba2', total_read_elements=140.0))
+    assert rs.validate_rows('exp9_budget_frontier', both_routes, {}) == []
+    bad_route = [dict(r) for r in both_routes]
+    bad_route[-1] = dict(bad_route[-1], memory_op='rwkv7')
+    assert any('memory_op' in v for v in
+               rs.validate_rows('exp9_budget_frontier', bad_route, {}))
     # A mixed-revision verdict must name at least two commits.
     bad = [dict(r) for r in rows]
     bad[-1] = dict(bad[-1], status='mixed_revisions')

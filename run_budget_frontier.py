@@ -138,6 +138,7 @@ DEFAULT_REPEATS = 2
 # (recorded in the result metadata so the latency rows are reproducible).
 DECODE_SWEEP_SEED = 0
 CORE_OPS = ('softmax', 'kda', 'mamba2', 'csa', 'hca')
+LAYOUT_MEMORY_OPS = ('kda', 'mamba2')
 LAYOUTS = (
     (3, 1, 1),
     (4, 1, 0), (4, 0, 1),
@@ -267,16 +268,19 @@ def build_budget_curves(t_grid, specs):
                     'name': op,
                     **r,
                 })
-            for ratio in LAYOUTS:
-                r = layout_read_elements(T, ratio, spec)
-                rows.append({
-                    'section': 'budget_curve',
-                    'row_kind': 'layout',
-                    'geometry': geom,
-                    'name': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
-                    'ratio': list(ratio),
-                    **r,
-                })
+            for memory_op in LAYOUT_MEMORY_OPS:
+                for ratio in LAYOUTS:
+                    r = layout_read_elements(
+                        T, ratio, spec, memory_op=memory_op)
+                    rows.append({
+                        'section': 'budget_curve',
+                        'row_kind': 'layout',
+                        'geometry': geom,
+                        'name': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
+                        'ratio': list(ratio),
+                        'memory_op': memory_op,
+                        **r,
+                    })
     return rows
 
 
@@ -302,16 +306,19 @@ def build_decode_budget_curves(t_grid, specs):
                     'name': op,
                     **r,
                 })
-            for ratio in LAYOUTS:
-                r = instant_layout_read_elements(ratio, t, spec)
-                rows.append({
-                    'section': 'decode_budget_curve',
-                    'row_kind': 'layout',
-                    'geometry': geom,
-                    'name': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
-                    'ratio': list(ratio),
-                    **r,
-                })
+            for memory_op in LAYOUT_MEMORY_OPS:
+                for ratio in LAYOUTS:
+                    r = instant_layout_read_elements(
+                        ratio, t, spec, memory_op=memory_op)
+                    rows.append({
+                        'section': 'decode_budget_curve',
+                        'row_kind': 'layout',
+                        'geometry': geom,
+                        'name': f'{ratio[0]}:{ratio[1]}:{ratio[2]}',
+                        'ratio': list(ratio),
+                        'memory_op': memory_op,
+                        **r,
+                    })
     return rows
 
 
@@ -833,7 +840,7 @@ def _print_curves(rows, t_grid):
             f'T={T:>6}' for T in t_grid)
         print(header)
         print('-' * len(header))
-        for name in ('softmax', 'kda', 'csa', 'hca'):
+        for name in CORE_OPS:
             vals = []
             for T in t_grid:
                 r = next(r for r in rows if r['section'] == 'budget_curve'
@@ -841,16 +848,20 @@ def _print_curves(rows, t_grid):
                          and r['name'] == name and r['T'] == T)
                 vals.append(f"{r['total_read_elements']:>8.1f}")
             print(f'{name:>8} | ' + ' | '.join(vals))
-        for ratio in LAYOUTS:
-            label = f'{ratio[0]}:{ratio[1]}:{ratio[2]}'
-            vals = []
-            for T in t_grid:
-                r = next(r for r in rows if r['section'] == 'budget_curve'
-                         and r['geometry'] == geom
-                         and r['row_kind'] == 'layout'
-                         and r['name'] == label and r['T'] == T)
-                vals.append(f"{r['total_read_elements']:>8.1f}")
-            print(f'{label:>8} | ' + ' | '.join(vals))
+        for memory_op in LAYOUT_MEMORY_OPS:
+            for ratio in LAYOUTS:
+                label = f'{ratio[0]}:{ratio[1]}:{ratio[2]}'
+                vals = []
+                for T in t_grid:
+                    r = next(r for r in rows
+                             if r['section'] == 'budget_curve'
+                             and r['geometry'] == geom
+                             and r['row_kind'] == 'layout'
+                             and r['name'] == label
+                             and r.get('memory_op', 'kda') == memory_op
+                             and r['T'] == T)
+                    vals.append(f"{r['total_read_elements']:>8.1f}")
+                print(f'{label:>8} {memory_op:>6} | ' + ' | '.join(vals))
 
 
 def _print_decode_frontier(rows, t_grid):
@@ -864,7 +875,7 @@ def _print_decode_frontier(rows, t_grid):
             f't={t:>6}' for t in t_grid)
         print(header)
         print('-' * len(header))
-        for name in ('softmax', 'kda', 'csa', 'hca'):
+        for name in CORE_OPS:
             vals = []
             for t in t_grid:
                 r = next(r for r in rows
@@ -945,7 +956,8 @@ def main():
             'view is exactly the prefill average (pinned by '
             'test_budget_frontier). Curves cover the 5 core operators '
             '(including both memory routes, KDA and Mamba-2) and the 7 '
-            'Exp 5 layouts in MQAR and paper geometries; a measured '
+            'Exp 5 layouts on BOTH memory routes in MQAR and paper '
+            'geometries; a measured '
             'decode-latency sweep over csa_topk joins BOTH views; Exp 4/5/8 '
             'rows (if present) are joined with their measured-context '
             'budget, and the layout ranking is reported under both views.'),
