@@ -131,3 +131,14 @@ correlated keys.
   changes bytes per element, not the underlying element counts.
 * Weights and CSA/HCA caches are priced at the caller's `itemsize`; this
   module does not model FP8 weights or FP8 attention compute.
+
+## TTFT extension (Exp 17)
+
+`ttft_budget.py` reuses the same storage contract for the prefill side:
+`weight_storage=FP8Spec()` prices tower weights and `state_storage` prices
+the prompt-written cache. The interesting result is a boundary, not a
+constant speedup: weight-only FP8 helps TTFT only while prefill is
+memory-bound (`batch * T` below the machine ridge). Above it, FP8 *storage*
+converges to 1.00x and only FP8 *arithmetic* (the explicitly labelled
+`compute_speedup` assumption) can approach 2x. See `docs/ttft-budget.md`
+and `python3 run_ttft_budget.py`.

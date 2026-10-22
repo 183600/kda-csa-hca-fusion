@@ -175,6 +175,9 @@ per-operator storage policy, so the recurrent state, CSA cache, and HCA
 cache can be priced at different precisions; see
 [docs/fp8-block-scaled-state.md](fp8-block-scaled-state.md) for the
 memory-bound analysis and the T=128/T=4096 crossover results.
+`ttft_budget` extends the same contract to the prefill side and separates
+storage bytes from arithmetic rate; see
+[docs/ttft-budget.md](ttft-budget.md).
 
 ## bfloat16 delta-rule numerical stability
 
@@ -289,6 +292,9 @@ Entry points:
 python3 run_needle_haystack.py                 # writes results/exp12_needle_haystack.json
 python3 test_needle_haystack.py                # or: pytest -q test_needle_haystack.py
 python3 run_needle_haystack.py --quick --no-qat # CI smoke run
+
+python3 run_ttft_budget.py                     # writes results/exp17_ttft_budget.json
+pytest -q test_ttft_budget.py                  # TTFT lower-bound contracts
 ```
 
 ## bfloat16 numerical stability (extended to CSA/HCA)
@@ -343,4 +349,7 @@ QLM_SKIP_QAT=1 python3 run_quant_lm.py      # Part A only (fast)
 python3 run_needle_haystack.py                 # writes results/exp12_needle_haystack.json
 python3 test_needle_haystack.py                # or: pytest -q test_needle_haystack.py
 python3 run_needle_haystack.py --quick --no-qat # CI smoke run
+
+python3 run_ttft_budget.py                     # writes results/exp17_ttft_budget.json
+pytest -q test_ttft_budget.py                  # TTFT lower-bound contracts
 ```
