@@ -397,7 +397,21 @@ class GatedDeltaRule(nn.Module):
         Returns:
             outputs [B, T, H, V], final_state [B, H, K, V] or None
         """
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                'GatedDeltaRule: q/k/v must be 4-D [B, T, H, *]; got '
+                f'{tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}.')
         B, T, H, K = q.shape
+        if tuple(k.shape) != (B, T, H, K):
+            raise ValueError(
+                'GatedDeltaRule: k must share q shape '
+                f'{tuple(q.shape)}; got {tuple(k.shape)}. The recurrence '
+                'zips the time axis, so a shorter k would silently truncate '
+                'the output.')
+        if tuple(v.shape[:3]) != (B, T, H):
+            raise ValueError(
+                'GatedDeltaRule: v must be [B, T, H, V] matching q[:3]='
+                f'{(B, T, H)}; got {tuple(v.shape)}.')
         V = v.shape[-1]
         # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
         # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert``
@@ -556,7 +570,32 @@ def gated_delta_rule_step(
     if gate_type not in ('per_channel', 'per_head'):
         raise ValueError(
             f"gate_type={gate_type!r} must be 'per_channel' or 'per_head'")
+    if S.dim() != 4:
+        raise ValueError(
+            f'gated_delta_rule_step: S must be [B, H, K, V], got '
+            f'{tuple(S.shape)}.')
     B, H, K, V = S.shape
+    if q_t.shape != (B, H, K):
+        raise ValueError(
+            f'gated_delta_rule_step: q_t.shape={tuple(q_t.shape)} must be '
+            f'{(B, H, K)}.')
+    if k_t.shape != (B, H, K):
+        raise ValueError(
+            f'gated_delta_rule_step: k_t.shape={tuple(k_t.shape)} must be '
+            f'{(B, H, K)}.')
+    if v_t.shape != (B, H, V):
+        raise ValueError(
+            f'gated_delta_rule_step: v_t.shape={tuple(v_t.shape)} must be '
+            f'{(B, H, V)}.')
+    if beta.shape != (H,):
+        raise ValueError(
+            f'gated_delta_rule_step: beta.shape={tuple(beta.shape)} must be '
+            f'{(H,)}.')
+    expected_gate = (H, K) if gate_type == 'per_channel' else (H,)
+    if gate.shape != expected_gate:
+        raise ValueError(
+            f'gated_delta_rule_step: gate.shape={tuple(gate.shape)} must be '
+            f'{expected_gate} for gate_type={gate_type!r}.')
 
     # Match ``GatedDeltaRule.forward``: promote every operand (state, q/k/v,
     # gate, beta) to one work dtype before the recurrence. Otherwise a

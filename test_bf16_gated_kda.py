@@ -332,6 +332,44 @@ def test_gated_delta_rule_state_contract_and_mixed_dtype_step():
         f'{o.dtype}')
 
 
+def test_gated_delta_rule_rejects_mismatched_geometry():
+    print('\nTest: GatedDeltaRule rejects mismatched q/k/v geometry')
+    B, T, H, K, V = 2, 4, 2, 3, 4
+    layer = GatedDeltaRule(H, K, V, gate_type='per_channel')
+    q = torch.randn(B, T, H, K)
+    for k, v in (
+            (torch.randn(B, T - 2, H, K), torch.randn(B, T - 2, H, V)),
+            (torch.randn(1, T, H, K), torch.randn(1, T, H, V)),
+            (torch.randn(B, T, H, K), torch.randn(B, T, H - 1, V))):
+        raised = False
+        try:
+            layer(q, k, v)
+        except ValueError:
+            raised = True
+        _ok(f'rejects k={tuple(k.shape)} v={tuple(v.shape)}', raised, '')
+
+    S = torch.randn(B, H, K, V)
+    q_t = torch.randn(B, H, K)
+    k_t = torch.randn(B, H, K)
+    v_t = torch.randn(B, H, V)
+    gate = torch.ones(H, K)
+    beta = torch.ones(H)
+    bad_steps = (
+        (torch.randn(B - 1, H, K), k_t, v_t, gate, beta),
+        (q_t, torch.randn(1, H, K), v_t, gate, beta),
+        (q_t, k_t, torch.randn(B, H, V + 1), gate, beta),
+        (q_t, k_t, v_t, torch.ones(H + 1, K), beta),
+        (q_t, k_t, v_t, gate, torch.ones(H + 1)),
+    )
+    for args in bad_steps:
+        raised = False
+        try:
+            gated_delta_rule_step(S, *args)
+        except ValueError:
+            raised = True
+        _ok('functional step rejects mismatched geometry', raised, '')
+
+
 def test_gated_delta_rule_empty_sequence_dtype_contract():
     print('\nTest: GatedDeltaRule T=0 dtype contract')
     B, H, K, V = 2, 3, 4, 5
