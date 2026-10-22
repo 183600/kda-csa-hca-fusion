@@ -358,6 +358,69 @@ def test_rope_rejects_invalid_dims_bases_and_positions():
             _ok(f'{fn.__name__}{args} rejected', False, 'no error raised')
 
 
+def test_decoding_cache_geometry_requires_exact_ints():
+    """Cache constructors reject bool/float geometry and non-finite bases.
+
+    ``B/c/m/win`` feed ``torch.zeros`` shapes and ring slicing; a bool or a
+    float used to survive the ``< 1`` checks and fail later with an opaque
+    torch error. ``rope_base=NaN/inf`` silently produced NaN position
+    tables. Both cache classes and the ring buffer now validate the
+    constructor contract, while valid geometry and the ``-inf``/finite
+    clamp-like sentinels used elsewhere are unaffected.
+    """
+    from ops_decoding_cache import (
+        CSADecodingCache, HCADecodingCache, _SlidingWindowRingBuffer,
+    )
+
+    CSADecodingCache(1, 4, 4, 2, 4, 'cpu', torch.float32)
+    HCADecodingCache(1, 4, 2, 4, 'cpu', torch.float32)
+    _SlidingWindowRingBuffer(1, 4, 4, 'cpu', torch.float32)
+
+    for ctor, good in (
+            (CSADecodingCache, (1, 4, 4, 2, 4, 'cpu', torch.float32)),
+            (HCADecodingCache, (1, 4, 2, 4, 'cpu', torch.float32))):
+        for bad in ((True,) + good[1:], (1.5,) + good[1:],
+                    ('1',) + good[1:]):
+            try:
+                ctor(*bad)
+            except ValueError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - the point is the type
+                _ok(f'{ctor.__name__} {bad} rejected', False,
+                    f'{type(exc).__name__}: {exc}')
+            else:
+                _ok(f'{ctor.__name__} {bad} rejected', False,
+                    'no error raised')
+        for base in (float('nan'), float('inf'), True):
+            if ctor is CSADecodingCache:
+                call = (1, 4, 4, 2, 4, 'cpu', torch.float32)
+            else:
+                call = (1, 4, 2, 4, 'cpu', torch.float32)
+            try:
+                ctor(*call, rope_base=base)
+            except ValueError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                _ok(f'{ctor.__name__} rope_base={base!r} rejected', False,
+                    f'{type(exc).__name__}: {exc}')
+            else:
+                _ok(f'{ctor.__name__} rope_base={base!r} rejected', False,
+                    'no error raised')
+
+    for args in ((True, 2, 4, 'cpu', torch.float32),
+                 (1, 2.0, 4, 'cpu', torch.float32),
+                 (1, 2, 0, 'cpu', torch.float32)):
+        try:
+            _SlidingWindowRingBuffer(*args)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _ok(f'ring buffer {args} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'ring buffer {args} rejected', False, 'no error raised')
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -449,6 +512,7 @@ if __name__ == '__main__':
     test_kda_chunk_size_requires_an_exact_positive_int()
     test_kda_g_clamp_rejects_positive_infinity_and_nan()
     test_rope_rejects_invalid_dims_bases_and_positions()
+    test_decoding_cache_geometry_requires_exact_ints()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()

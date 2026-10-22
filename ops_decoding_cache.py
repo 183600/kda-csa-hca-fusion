@@ -107,6 +107,7 @@ spec they would be validated against.
 
 from __future__ import annotations
 
+import math
 import warnings as _warnings
 
 import torch
@@ -126,6 +127,32 @@ def _validate_cache_dtype(dtype) -> None:
         raise TypeError(f'cache dtype must be a floating torch.dtype, got {dtype!r}') from exc
     if not is_float:
         raise TypeError(f'cache dtype must be floating-point, got {dtype!r}')
+
+
+def _validate_cache_int(name: str, value, minimum: int = 0) -> int:
+    """Require an exact int geometry value for a cache constructor.
+
+    Python's ``bool`` is an ``int`` subclass, and floats/strings reach
+    ``torch.zeros`` / slicing with opaque errors; the cache geometry is part
+    of the documented constructor contract, so validate it here.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f'{name}={value!r} must be an int (cache geometry).')
+    if value < minimum:
+        raise ValueError(f'{name}={value} must be >= {minimum}.')
+    return value
+
+
+def _validate_rope_base(owner: str, rope_base) -> float:
+    """Finite positive RoPE base (bool/string/NaN are configuration bugs)."""
+    if (isinstance(rope_base, bool)
+            or not isinstance(rope_base, (int, float))
+            or not math.isfinite(float(rope_base)) or rope_base <= 0):
+        raise ValueError(
+            f'{owner}: rope_base={rope_base!r} must be a finite positive '
+            f'number.')
+    return float(rope_base)
 
 
 def _attention_compute_dtype(cache_dtype: torch.dtype,
@@ -566,11 +593,9 @@ class _SlidingWindowRingBuffer:
         # must be handled by the CALLER (the cache classes skip the SW
         # branch entirely when ``win == 0``, so this class is never
         # instantiated with ``win = 0``).
-        if win < 1:
-            raise ValueError(
-                f"_SlidingWindowRingBuffer: win={win} must be >= 1 "
-                f"(win=0 disables the SW branch and should bypass this "
-                f"class entirely).")
+        _validate_cache_int('B', B, minimum=1)
+        _validate_cache_int('win', win, minimum=1)
+        _validate_cache_int('c', c, minimum=1)
         _validate_cache_dtype(dtype)
         self.B, self.win, self.c = B, win, c
         self.device, self.dtype = torch.device(device), dtype
@@ -841,16 +866,11 @@ class CSADecodingCache:
         # raises at construction (not deep inside ``append_step``).
         # NOTE: use ``raise ValueError`` (NOT ``assert``) so the checks
         # survive ``python -O``.
-        if B < 1:
-            raise ValueError(f"B={B} must be >= 1")
-        if c < 1:
-            raise ValueError(f"c={c} must be >= 1")
-        if c_I < 1:
-            raise ValueError(f"c_I={c_I} must be >= 1")
-        if m < 1:
-            raise ValueError(f"m={m} must be >= 1")
-        if win < 0:
-            raise ValueError(f"win={win} must be >= 0 (0 disables SW)")
+        _validate_cache_int('B', B, minimum=1)
+        _validate_cache_int('c', c, minimum=1)
+        _validate_cache_int('c_I', c_I, minimum=1)
+        _validate_cache_int('m', m, minimum=1)
+        _validate_cache_int('win', win, minimum=0)
         self.B, self.c, self.c_I, self.m, self.win = B, c, c_I, m, win
         _validate_cache_dtype(dtype)
         self.device, self.dtype = torch.device(device), dtype
@@ -869,9 +889,7 @@ class CSADecodingCache:
         # same contract as the full-sequence ``naive_csa`` path, so the
         # incremental decode stays equivalent to prefill. ``rope_dim=None``
         # (default) disables RoPE.
-        if rope_base <= 0:
-            raise ValueError(
-                f"CSADecodingCache: rope_base={rope_base!r} must be positive")
+        rope_base = _validate_rope_base('CSADecodingCache', rope_base)
         # qk_norm_mode must match the mode the full-sequence ``naive_csa``
         # call uses; otherwise the incremental decode would normalize keys
         # differently from prefill and silently disagree with it.
@@ -2274,14 +2292,10 @@ class HCADecodingCache:
         rope_base: float = 10000.0,
         qk_norm_mode: str = 'l2',
     ):
-        if B < 1:
-            raise ValueError(f"B={B} must be >= 1")
-        if c < 1:
-            raise ValueError(f"c={c} must be >= 1")
-        if m2 < 1:
-            raise ValueError(f"m2={m2} must be >= 1")
-        if win < 0:
-            raise ValueError(f"win={win} must be >= 0 (0 disables SW)")
+        _validate_cache_int('B', B, minimum=1)
+        _validate_cache_int('c', c, minimum=1)
+        _validate_cache_int('m2', m2, minimum=1)
+        _validate_cache_int('win', win, minimum=0)
         self.B, self.c, self.m2, self.win = B, c, m2, win
         _validate_cache_dtype(dtype)
         self.device, self.dtype = torch.device(device), dtype
@@ -2297,9 +2311,7 @@ class HCADecodingCache:
         # positions, the query at the current position, and the output is
         # inverse-rotated at the negated query position. ``rope_dim=None``
         # (default) disables RoPE.
-        if rope_base <= 0:
-            raise ValueError(
-                f"HCADecodingCache: rope_base={rope_base!r} must be positive")
+        rope_base = _validate_rope_base('HCADecodingCache', rope_base)
         # qk_norm_mode must match the mode the full-sequence ``naive_hca``
         # call uses; otherwise the incremental decode would normalize keys
         # differently from prefill and silently disagree with it.
