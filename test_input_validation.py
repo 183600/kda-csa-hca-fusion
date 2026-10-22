@@ -421,6 +421,28 @@ def test_decoding_cache_geometry_requires_exact_ints():
             _ok(f'ring buffer {args} rejected', False, 'no error raised')
 
 
+def test_online_softmax_chunk_sizes_require_exact_ints():
+    """A bool/float tile size must not silently become a different schedule."""
+    from online_softmax import online_softmax_attention
+
+    q = torch.randn(2, 2, 3, 4)
+    k = torch.randn(2, 1, 5, 4)
+    v = torch.randn(2, 1, 5, 4)
+    online_softmax_attention(q, k, v, key_chunk=2, query_chunk=2)
+    for patch in ({'key_chunk': True}, {'key_chunk': 1.5},
+                  {'query_chunk': True}, {'query_chunk': '2'}):
+        try:
+            online_softmax_attention(q, k, v, **patch)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'online softmax {patch} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'online softmax {patch} rejected', False,
+                'no error raised')
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -513,6 +535,7 @@ if __name__ == '__main__':
     test_kda_g_clamp_rejects_positive_infinity_and_nan()
     test_rope_rejects_invalid_dims_bases_and_positions()
     test_decoding_cache_geometry_requires_exact_ints()
+    test_online_softmax_chunk_sizes_require_exact_ints()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()

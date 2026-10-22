@@ -341,14 +341,16 @@ def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
       row of the softmax is independent — including when ``mask`` or a
       per-query ``sink_logits`` varies with the query row.
     """
-    if key_chunk < 0:
+    if (isinstance(key_chunk, bool) or not isinstance(key_chunk, int)
+            or key_chunk < 0):
         raise ValueError(
-            f'online_softmax_attention: key_chunk={key_chunk} must be >= 0 '
-            f'(0 = single chunk).')
-    if query_chunk < 0:
+            f'online_softmax_attention: key_chunk={key_chunk!r} must be a '
+            f'non-negative int (0 = single chunk).')
+    if (isinstance(query_chunk, bool) or not isinstance(query_chunk, int)
+            or query_chunk < 0):
         raise ValueError(
-            f'online_softmax_attention: query_chunk={query_chunk} must be '
-            f'>= 0 (0 = single query tile).')
+            f'online_softmax_attention: query_chunk={query_chunk!r} must be '
+            f'a non-negative int (0 = single query tile).')
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             'online_softmax_attention: q/k/v must be 4-D [B, H, T, D]; got '
