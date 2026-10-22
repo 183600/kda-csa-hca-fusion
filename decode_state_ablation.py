@@ -29,6 +29,8 @@ contract on the streaming TP reference.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 DECODE_STATE_PARTS = ('memory_state', 'memory_lookback',
@@ -143,25 +145,37 @@ def _decode(decoder, x, prefill_len, part=None, mode=None):
 
 
 def _suffix_metrics(reference, observed, start, tol):
-    ref = reference[:, start:].detach().float()
-    got = observed[:, start:].detach().float()
+    # Compute in float64: casting a finite float64 value (e.g. 1e39) to
+    # float32 would turn it into inf and hide a real divergence.
+    ref = reference[:, start:].detach().double()
+    got = observed[:, start:].detach().double()
     diff = (ref - got).abs()
-    ref_norm = float(ref.norm())
-    diff_norm = float((ref - got).norm())
-    if ref_norm > 0:
+    ref_norm = float(torch.linalg.vector_norm(ref))
+    diff_norm = float(torch.linalg.vector_norm(ref - got))
+    if ref_norm > 0.0:
         rel_l2 = diff_norm / ref_norm
     else:
-        rel_l2 = 0.0 if diff_norm == 0 else float('inf')
+        # 0/0 is undefined, and a nonzero difference over a zero reference
+        # has no finite relative scale; None is the JSON-safe statement.
+        rel_l2 = 0.0 if diff_norm == 0.0 else None
+    if rel_l2 is not None and not math.isfinite(rel_l2):
+        rel_l2 = None
     per_step = diff.amax(dim=(0, 2))
     hits = (per_step > tol).nonzero()
-    prefix_diff = (reference[:, :start].detach().float()
-                   - observed[:, :start].detach().float()).abs()
+    prefix_diff = (reference[:, :start].detach().double()
+                   - observed[:, :start].detach().double()).abs()
+
+    def _finite(value):
+        return value if value is not None and math.isfinite(value) else None
+
     return {
-        'max_abs_diff': float(diff.max()) if diff.numel() else 0.0,
-        'mean_abs_diff': float(diff.mean()) if diff.numel() else 0.0,
-        'rel_l2': float(rel_l2),
+        'max_abs_diff': (_finite(float(diff.max()))
+                         if diff.numel() else 0.0),
+        'mean_abs_diff': (_finite(float(diff.mean()))
+                          if diff.numel() else 0.0),
+        'rel_l2': rel_l2,
         'first_divergence_step': int(hits[0]) if hits.numel() else None,
-        'prefix_max_abs_diff': (float(prefix_diff.max())
+        'prefix_max_abs_diff': (_finite(float(prefix_diff.max()))
                                 if prefix_diff.numel() else 0.0),
     }
 

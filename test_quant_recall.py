@@ -605,3 +605,19 @@ def test_storage_bytes_charges_one_metadata_block_per_whole_or_partial_group():
     # Fractional counts keep the effective-rate convention.
     assert abs(storage_bytes(1.5, spec)
                - 1.5 * bytes_per_element(spec)) < 1e-12
+
+
+def test_quantization_extremes_stay_finite_and_json_safe():
+    import json
+    x = torch.tensor([[-3.4e38, 3.4e38]], dtype=torch.float32)
+    spec = QuantSpec(bits=8, group_size=2, symmetric=False)
+    y = fake_quantize(x, spec, ste=False)
+    assert bool(torch.isfinite(y).all())
+    stats = quantization_error(x, spec)
+    assert stats['max_abs_error'] is not None
+    assert stats['rms_error'] is not None
+    assert stats['signal_rms'] is not None
+    json.dumps(stats, allow_nan=False)
+
+    n = 5 * 10 ** 307
+    assert storage_bytes(n, QuantSpec(bits=4, group_size=64)) == 2.65625e307

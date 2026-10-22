@@ -341,3 +341,16 @@ def test_timing_returns_output_of_last_run():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
+
+
+def test_drift_metrics_huge_finite_tensors_are_json_safe():
+    import json
+    a = torch.tensor([[1e154, 1e154]], dtype=torch.float64)
+    drift = drift_metrics(a, a.clone())
+    assert drift['cosine'] is not None
+    assert abs(drift['cosine'] - 1.0) < 1e-12
+    assert drift['relative_l2'] == 0.0
+    json.dumps(drift, allow_nan=False)
+    doubled = drift_metrics(a, a * 2)
+    assert doubled['relative_l2'] == 1.0
+    json.dumps(doubled, allow_nan=False)

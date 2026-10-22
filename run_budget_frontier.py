@@ -642,8 +642,11 @@ def audit_join_sources(source_records):
             })
     # Missing backend metadata is not agreement: a source with an empty
     # backends block cannot be compared with sources that resolved their
-    # kda/mamba/rwkv backends. This mirrors the partial-seed evidence rule.
-    backends_consistent = not backend_mismatches and not backend_missing
+    # kda/mamba/rwkv backends. Requiring at least one backend key also
+    # prevents "every source is empty" from vacuously passing as
+    # consistent. This mirrors the partial-seed evidence rule.
+    backends_consistent = bool(backend_keys) and not (
+        backend_mismatches or backend_missing)
 
     if not present:
         status = 'no_sources'
@@ -690,6 +693,10 @@ def audit_join_sources(source_records):
             f'{missing_seed_sources}); cross-source seed overlap cannot be '
             'verified')
     if status == 'mixed_backends':
+        if not backend_keys:
+            warnings.append(
+                'join sources carry no resolved backend metadata; backend '
+                'agreement cannot be verified')
         if backend_missing:
             warnings.append(
                 'join sources have missing backend metadata: '

@@ -839,6 +839,7 @@ def paper_aligned_bytes(cfg: HybridConfig, components: dict, *,
 
     by_component: dict[str, dict] = {}
     pool_bytes = {CLASSICAL_KV_CACHE: 0, STATE_CACHE: 0, PARAMETER: 0}
+    weighted_elements = []
     for name, meta in COMPONENT_SPECS.items():
         rec = components.get(name)
         if rec is None:
@@ -858,27 +859,56 @@ def paper_aligned_bytes(cfg: HybridConfig, components: dict, *,
         else:
             per_element = 2.0
         nbytes = float(elements) * per_element
+        weighted_elements.append((float(elements), per_element))
         by_component[name] = {
             'elements_allocated': elements,
             'bytes_per_element': per_element,
-            'bytes': nbytes,
+            'bytes': nbytes if math.isfinite(nbytes) else None,
         }
         pool_bytes[pool] = pool_bytes.get(pool, 0) + nbytes
 
     total = sum(pool_bytes.values())
+    if not math.isfinite(total):
+        total = None
+    finite_pool_bytes = {
+        key: (value if math.isfinite(value) else None)
+        for key, value in pool_bytes.items()
+    }
     if policy == 'pure_bf16':
         bf16_total = total
+        ratio = 1.0
     else:
         bf16_total = paper_aligned_bytes(
             cfg, components, policy='pure_bf16')['total_bytes']
+        ratio = None
+        if total is not None and bf16_total:
+            candidate = total / bf16_total
+            if math.isfinite(candidate):
+                ratio = candidate
+        if ratio is None and weighted_elements:
+            # Both totals can overflow even though their ratio is finite.
+            # Evaluate the same ratio in element units (the common factor
+            # cancels), using a shared scale so the sums stay finite.
+            scale = max(abs(elements) for elements, _ in weighted_elements)
+            if scale > 0.0:
+                mixed_scaled = sum(
+                    (elements / scale) * per_element
+                    for elements, per_element in weighted_elements)
+                bf16_scaled = sum(
+                    (elements / scale) * 2.0
+                    for elements, _ in weighted_elements)
+                if bf16_scaled > 0.0:
+                    candidate = mixed_scaled / bf16_scaled
+                    if math.isfinite(candidate):
+                        ratio = candidate
     return {
         'policy': policy,
         'rope_dim_effective': rope,
         'by_component': by_component,
-        'bytes_by_pool': pool_bytes,
+        'bytes_by_pool': finite_pool_bytes,
         'total_bytes': total,
         'pure_bf16_total_bytes': bf16_total,
-        'ratio_vs_pure_bf16': (total / bf16_total if bf16_total else None),
+        'ratio_vs_pure_bf16': ratio,
     }
 
 

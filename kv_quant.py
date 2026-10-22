@@ -252,8 +252,19 @@ def storage_bytes(n_elements, spec: StorageSpec) -> float:
                       + (0 if isinstance(spec, FP8Spec)
                          else (spec.zero_bits or 0)))
         n_groups = (n + spec.group_size - 1) // spec.group_size
-        return (n * float(payload_bits)
-                + n_groups * float(scale_bits)) / 8.0
+        value = (n * float(payload_bits)
+                 + n_groups * float(scale_bits)) / 8.0
+        if math.isfinite(value):
+            return value
+        # The float multiply overflowed even though the exact byte count
+        # may be representable. Recompute in integer bits and convert only
+        # the final (already divided) quantity.
+        total_bits = n * int(payload_bits) + n_groups * int(scale_bits)
+        whole, remainder = divmod(total_bits, 8)
+        try:
+            return whole + remainder / 8.0
+        except OverflowError:
+            return math.inf
     return float(n_elements) * bytes_per_element(spec)
 
 
@@ -442,10 +453,38 @@ def fake_quantize(x: torch.Tensor, spec: StorageSpec,
             zero = torch.where(
                 degenerate, torch.zeros_like(lo),
                 torch.round(-lo / scale).clamp(0, qmax))
+            # Finite endpoint values can still make the raw span overflow
+            # (e.g. -FLT_MAX..FLT_MAX): scale becomes inf and the
+            # reconstruction is 0 * inf = NaN. Recompute only those groups
+            # from a divided span, which is the same ratio without the
+            # overflow; ordinary groups keep the exact historical scale.
+            overflow_groups = None
+            finite_span = torch.isfinite(span)
+            if not bool(finite_span.all()):
+                scale_safe = hi / qmax - lo / qmax
+                if not bool(torch.isfinite(scale_safe).all()):
+                    mag = torch.maximum(lo.abs(), hi.abs())
+                    safe_mag = torch.where(mag > 0, mag,
+                                           torch.ones_like(mag))
+                    scale_norm = ((hi / safe_mag) - (lo / safe_mag)) * (
+                        safe_mag / qmax)
+                    scale_safe = torch.where(
+                        torch.isfinite(scale_safe), scale_safe, scale_norm)
+                replace = ~finite_span & ~degenerate
+                scale = torch.where(replace, scale_safe, scale)
+                zero_safe = torch.round(-lo / scale).clamp(0, qmax)
+                zero = torch.where(replace, zero_safe, zero)
+                overflow_groups = replace
         codes = torch.round(groups / scale) + zero
         codes = codes.clamp(0, qmax)
         deq = (codes - zero) * scale
         deq = torch.where(degenerate, hi, deq)
+        if overflow_groups is not None:
+            # Rounding the zero point can put an endpoint one step beyond
+            # the finite input range; saturate to that range instead of
+            # letting the reconstruction overflow to +-inf.
+            deq = torch.where(overflow_groups,
+                              torch.clamp(deq, min=lo, max=hi), deq)
 
     deq = deq.reshape(*lead, -1)[..., :n].to(orig_dtype)
     if ste and x.requires_grad:
@@ -504,14 +543,38 @@ def quantization_error(x: torch.Tensor, spec: StorageSpec) -> dict:
     err = xf - df
     rms_err = float(err.pow(2).mean().sqrt())
     signal_rms = float(xf.pow(2).mean().sqrt())
-    if rms_err == 0.0:
+
+    def _scaled_rms(t):
+        """RMS without overflowing the sum of squares (None if unrepresentable)."""
+        amax = float(t.abs().max())
+        if amax == 0.0:
+            return 0.0
+        scaled = t / amax
+        value = amax * float(scaled.pow(2).mean().sqrt())
+        return value if math.isfinite(value) else None
+
+    if not (math.isfinite(rms_err) and math.isfinite(signal_rms)):
+        rms_err = _scaled_rms(err)
+        signal_rms = _scaled_rms(xf)
+    max_abs_error = float(err.abs().max())
+    if not math.isfinite(max_abs_error):
+        max_abs_error = None
+    if rms_err is None or signal_rms is None:
+        snr_db = None
+    elif rms_err == 0.0:
         snr_db = math.inf
     elif signal_rms == 0.0:
         snr_db = -math.inf
     else:
-        snr_db = 20.0 * math.log10(signal_rms / rms_err)
+        ratio = signal_rms / rms_err
+        if math.isfinite(ratio):
+            snr_db = 20.0 * math.log10(ratio)
+        else:
+            snr_db = 20.0 * (math.log10(signal_rms) - math.log10(rms_err))
+        if not math.isfinite(snr_db):
+            snr_db = None
     return {
-        'max_abs_error': float(err.abs().max()),
+        'max_abs_error': max_abs_error,
         'rms_error': rms_err,
         'signal_rms': signal_rms,
         'snr_db': snr_db,

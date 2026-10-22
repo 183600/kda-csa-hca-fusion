@@ -689,3 +689,21 @@ def test_kda_tp_decay_init_under_autocast(device):
     assert out['output'].dtype == dtype
     assert torch.isfinite(out['output']).all()
     assert torch.isfinite(out['state']).all()
+
+
+def test_suffix_metrics_are_double_precision_and_json_safe():
+    import json
+    from decode_state_ablation import _suffix_metrics
+    ref = torch.zeros(1, 4, 2)
+    got = torch.zeros(1, 4, 2)
+    got[:, 2:] = 1.0
+    metrics = _suffix_metrics(ref, got, 2, 1e-5)
+    assert metrics['rel_l2'] is None
+    json.dumps(metrics, allow_nan=False)
+
+    ref = torch.full((1, 4, 2), 1e39, dtype=torch.float64)
+    got = torch.full((1, 4, 2), 2e39, dtype=torch.float64)
+    metrics = _suffix_metrics(ref, got, 2, 1e-5)
+    assert metrics['rel_l2'] == 1.0
+    assert metrics['first_divergence_step'] == 0
+    json.dumps(metrics, allow_nan=False)

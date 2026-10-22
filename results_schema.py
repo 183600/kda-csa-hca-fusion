@@ -463,7 +463,9 @@ def _validate_matrix_rows(rows: list, metadata: dict) -> list[str]:
             out.append('metadata.expected_groups must contain only hashable '
                        'group labels')
         else:
-            missing = sorted(set(expected) - present)
+            # JSON permits mixed scalar arrays; sorting raw labels raises
+            # TypeError instead of reporting the contract violation.
+            missing = sorted(set(expected) - present, key=repr)
             if missing:
                 out.append(
                     f'matrix incomplete: expected group(s) {missing} are '

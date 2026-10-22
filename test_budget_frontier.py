@@ -913,3 +913,21 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def test_exp9_source_audit_requires_backend_evidence():
+    print('\nTest: Exp 9 source audit requires backend evidence')
+    from run_budget_frontier import audit_join_sources
+    records = [_audit_record(s) for s in
+               ('exp4_mqar', 'exp5_ablation', 'exp8_mechanism_ablation')]
+    for record in records:
+        record['backends'] = {}
+    _rows, summary = audit_join_sources(records)
+    _ok('all-empty backend metadata is not agreement',
+        summary['status'] == 'mixed_backends'
+        and summary['comparable_for_ranking'] is False
+        and summary['backends_consistent'] is False,
+        f"{summary['status']} {summary['backends_consistent']}")
+    _ok('the missing backend evidence is warned about',
+        any('no resolved backend metadata' in w for w in summary['warnings']),
+        summary['warnings'])

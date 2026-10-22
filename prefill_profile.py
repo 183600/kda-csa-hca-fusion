@@ -357,9 +357,19 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
     max_abs = abs_diff.max()
     mean_abs = abs_diff.mean()
     rms = torch.sqrt(torch.mean(diff * diff))
-    ref_norm = torch.linalg.vector_norm(ref)
-    cand_norm = torch.linalg.vector_norm(cand)
-    diff_norm = torch.linalg.vector_norm(diff)
+
+    def _safe_norm(t):
+        norm = torch.linalg.vector_norm(t)
+        if bool(torch.isfinite(norm)):
+            return norm
+        scale = float(t.abs().max()) if t.numel() else 0.0
+        if scale == 0.0:
+            return torch.zeros((), dtype=t.dtype)
+        return torch.linalg.vector_norm(t / scale) * scale
+
+    ref_norm = _safe_norm(ref)
+    cand_norm = _safe_norm(cand)
+    diff_norm = _safe_norm(diff)
     tiny = torch.finfo(dtype).tiny
     relative_l2 = diff_norm / ref_norm.clamp_min(tiny)
     if ref_norm <= tiny or cand_norm <= tiny:
@@ -367,9 +377,23 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
         # one is zero; mirror ``F.cosine_similarity``'s eps convention.
         cosine = 1.0 if (ref_norm <= tiny and cand_norm <= tiny) else 0.0
     else:
-        cosine = float(torch.clamp(
-            torch.dot(ref.reshape(-1), cand.reshape(-1))
-            / (ref_norm * cand_norm), -1.0, 1.0))
+        dot = torch.dot(ref.reshape(-1), cand.reshape(-1))
+        denominator = ref_norm * cand_norm
+        raw = dot / denominator
+        if not bool(torch.isfinite(raw)):
+            # Squared magnitudes near the float limit overflow both the
+            # dot product and the norms. Recompute the cosine after
+            # dividing by a common scale; the ratio is unchanged.
+            scale = max(float(ref.abs().max()), float(cand.abs().max()))
+            if scale == 0.0:
+                raw = torch.ones((), dtype=ref.dtype)
+            else:
+                rs = ref / scale
+                cs = cand / scale
+                raw = (torch.dot(rs.reshape(-1), cs.reshape(-1))
+                       / (torch.linalg.vector_norm(rs)
+                          * torch.linalg.vector_norm(cs)))
+        cosine = float(torch.clamp(raw, -1.0, 1.0))
     return {
         'shape_match': True,
         'dtype_match': dtype_match,
@@ -379,7 +403,7 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
         'mean_abs': _finite_float(mean_abs),
         'rms': _finite_float(rms),
         'relative_l2': _finite_float(relative_l2),
-        'cosine': float(cosine),
+        'cosine': _finite_float(cosine),
         'reference_norm': _finite_float(ref_norm),
         'candidate_norm': _finite_float(cand_norm),
         'n_elements': int(ref.numel()),

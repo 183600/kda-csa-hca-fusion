@@ -84,6 +84,48 @@ DEFAULTS = dict(
 )
 
 
+_POSITIVE_GEOMETRY_KEYS = (
+    'H', 'K', 'V', 'd', 'csa_m', 'csa_c', 'csa_nIh', 'csa_cI', 'csa_nh',
+    'csa_dc', 'hca_m2', 'hca_c', 'hca_nh', 'hca_dc', 'kda_hv', 'kda_k',
+    'kda_v', 'kda_conv_ksize', 'mamba_d_state',
+    'mamba_d_conv', 'mamba_expand', 'mamba_headdim', 'mamba_ngroups',
+    'rwkv_head_dim', 'rwkv_decay_lora', 'rwkv_a_lora', 'rwkv_gate_lora',
+)
+_NONNEGATIVE_GEOMETRY_KEYS = (
+    'csa_topk', 'csa_sliding_window', 'hca_sliding_window',
+    'kda_chunk_size',
+    'hybrid_n_kda', 'hybrid_n_csa', 'hybrid_n_hca',
+)
+
+
+def _validate_geometry(p, where):
+    """Reject non-positive / non-integer accounting geometry before use.
+
+    A negative width can otherwise produce a negative cache size, and
+    ``csa_m=0`` reaches a raw ZeroDivisionError; both are impossible
+    counts, not measurements.
+    """
+    for key in _POSITIVE_GEOMETRY_KEYS:
+        value = p[key]
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value <= 0):
+            raise ValueError(
+                f'{where}: {key} must be a positive int, got {value!r}')
+    for key in _NONNEGATIVE_GEOMETRY_KEYS:
+        value = p[key]
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < 0):
+            raise ValueError(
+                f'{where}: {key} must be a non-negative int, got {value!r}')
+    if p.get('mamba_dt_rank') != 'auto' and (
+            isinstance(p.get('mamba_dt_rank'), bool)
+            or not isinstance(p.get('mamba_dt_rank'), int)
+            or p.get('mamba_dt_rank') <= 0):
+        raise ValueError(
+            "run_kv_cache: mamba_dt_rank must be 'auto' or a positive int, "
+            f"got {p.get('mamba_dt_rank')!r}")
+
+
 def causal_block_entries(T: int, m: int) -> int:
     """Count visible (query, compressed-block) pairs.
 
@@ -181,6 +223,7 @@ def kv_cache_elements(op: str, T: int, *, mode: str = 'compressed_kv_only', **kw
         raise ValueError(
             f"kv_cache_elements: unknown keyword argument(s) "
             f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
+    _validate_geometry(p, 'kv_cache_elements')
     _valid_ops = {'softmax_gqa', 'kda', 'mamba2', 'rwkv7', 'csa', 'hca',
                   'hybrid_kch', 'hybrid_mamba2', 'hybrid_rwkv7'}
     if op not in _valid_ops:
@@ -407,6 +450,7 @@ def kv_cache_breakdown(op: str, T: int, mode: str = 'full_accounting', **kw):
             f"kv_cache_breakdown: mode={mode!r} must be one of "
             f"['compressed_kv_only', 'full_accounting'].")
     p = {**DEFAULTS, **kw}
+    _validate_geometry(p, 'kv_cache_breakdown')
     full = mode == 'full_accounting'
     if op == 'softmax_gqa':
         if full:
@@ -546,6 +590,7 @@ def prefill_flops(op: str, T: int, **kw):
             f"prefill_flops: unknown keyword argument(s) "
             f"{sorted(_unknown)}. Valid keys: {sorted(_valid_keys)}.")
     p = {**DEFAULTS, **kw}
+    _validate_geometry(p, 'prefill_flops')
     H, K, V, d = p['H'], p['K'], p['V'], p['d']
     csa_m, csa_topk, csa_c = p['csa_m'], p['csa_topk'], p['csa_c']
     hca_m2, hca_c = p['hca_m2'], p['hca_c']

@@ -1125,3 +1125,15 @@ def test_schema_finite_numbers_reject_huge_json_integers():
     violations = rs.validate_rows('exp5b_ablation_matrix', [row])
     assert violations
     assert 'mean_acc' in violations[0]
+
+
+def test_schema_mixed_expected_group_labels_report_a_violation():
+    rows = [{'group': 'a', 'memory': 'kda', 'n_kv': 1, 'mean_acc': 1.0,
+             'per_seed': [{'final_acc': 1.0, 'final_loss': 0.5}],
+             'n_seeds_ok': 1, 'layout': 'KDA-CSA-HCA',
+             'n_params': 1, 'n_layers': 5}]
+    violations = rs.validate_rows(
+        'exp5b_ablation_matrix', rows,
+        {'expected_groups': [1, 'b'], 'total_layers': 5})
+    assert violations
+    assert 'matrix incomplete' in violations[0]

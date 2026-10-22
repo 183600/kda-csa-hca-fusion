@@ -618,3 +618,29 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def test_paper_aligned_ratio_and_geometry_are_json_safe_at_extremes():
+    import json
+    from run_kv_cache import prefill_flops
+    cfg = HybridConfig(d_model=32, n_heads_qk=2, n_heads_v=2,
+                       head_dim_k=16, head_dim_v=16, csa_c=8,
+                       csa_rope_dim=8, csa_m=4, hca_c=8, hca_m2=4,
+                       n_csa=1, n_hca=0, n_kda=0)
+    report = cache_accounting.paper_aligned_bytes(
+        cfg, {'csa_compressed_kv': {'elements_allocated': 10 ** 308}})
+    assert report['ratio_vs_pure_bf16'] == 1.0
+    assert report['total_bytes'] is None
+    json.dumps(report, allow_nan=False)
+
+    for call in (
+            lambda: kv_cache_elements('csa', 16, csa_c=-4),
+            lambda: kv_cache_elements('csa', 16, csa_m=0),
+            lambda: kv_cache_breakdown('csa', 16, csa_c=-4),
+            lambda: prefill_flops('softmax_gqa', 8, H=2, K=8, V=-8)):
+        try:
+            call()
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError('invalid accounting geometry was accepted')
