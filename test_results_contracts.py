@@ -565,6 +565,14 @@ def test_tune_baseline_lr_ignores_malformed_validation_points(monkeypatch):
     assert cell['mean_final_val_acc'] == pytest.approx(0.6)
 
 
+def test_benchmark_input_seed_aliases_the_compiled_chunk_row():
+    from run_benchmark import benchmark_input_seed
+    assert (benchmark_input_seed('kda_chunk_compiled', 64)
+            == benchmark_input_seed('kda_chunk', 64))
+    assert (benchmark_input_seed('kda_chunk', 64)
+            != benchmark_input_seed('kda_rec', 64))
+
+
 def test_directional_contrast_contradicted_and_one_sided_exact_p():
     """A unanimous negative sweep falsifies a directional prediction.
 

@@ -92,6 +92,24 @@ def _rand(*shape, scale=0.1, device=None, dtype=None, generator=None):
     return t * scale
 
 
+def benchmark_input_seed(op_name, T):
+    """Stable per-(operator, length) input seed used by the benchmark.
+
+    Kept as a public helper so the provenance manifest derives the seed
+    from the SAME operator key that generated the tensors. In particular
+    the compiled chunk row reuses the eager chunk generator (see
+    ``_BENCH_INPUT_SEED_ALIASES``).
+    """
+    op_key = _BENCH_INPUT_SEED_ALIASES.get(str(op_name), str(op_name))
+    name_hash = zlib.crc32(op_key.encode('utf-8')) & 0xFFFFFFFF
+    t_hash = (T * 2654435761) & 0xFFFFFFFF
+    return name_hash ^ t_hash
+
+
+#: Rows whose timed implementation reuses another row's input stream.
+_BENCH_INPUT_SEED_ALIASES = {'kda_chunk_compiled': 'kda_chunk'}
+
+
 def _make_op_gen(op_name, T, device):
     """Build a seeded ``torch.Generator`` keyed on (op_name, T).
 
@@ -103,9 +121,7 @@ def _make_op_gen(op_name, T, device):
     ``torch.randn(..., device='cuda', generator=cpu_gen)`` is supported and
     still produces reproducible (CPU-seeded, then GPU-materialized) draws.
     """
-    name_hash = zlib.crc32(op_name.encode('utf-8')) & 0xFFFFFFFF
-    t_hash = (T * 2654435761) & 0xFFFFFFFF
-    seed = name_hash ^ t_hash
+    seed = benchmark_input_seed(op_name, T)
     return make_seeded_generator(seed, device=device)
 
 
@@ -956,8 +972,7 @@ def main():
     # Record the exact per-(op, T) input seeds rather than a fake global
     # seed: the benchmark is deliberately independent of process RNG state.
     input_seeds = {
-        (zlib.crc32(str(r['op']).encode('utf-8')) & 0xFFFFFFFF)
-        ^ ((int(r['T']) * 2654435761) & 0xFFFFFFFF)
+        benchmark_input_seed(r['op'], int(r['T']))
         for r in results if 'op' in r and 'T' in r}
     weight_init_seeds = {
         name: zlib.crc32(label.encode('utf-8')) & 0xFFFFFFFF
