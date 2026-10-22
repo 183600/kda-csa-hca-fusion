@@ -488,6 +488,16 @@ def test_exp8_smoke_envelope():
         restore()
 
 
+def test_single_seed_aggregate_reports_undefined_std():
+    """One surviving seed must not claim zero sample variance."""
+    mean, std, ci = M._mean_ci([0.5])
+    _ok('single value mean is defined', mean == 0.5, mean)
+    _ok('single value std is undefined', std is None, std)
+    _ok('single value CI is undefined', ci is None, ci)
+    mean, std, ci = M._mean_ci([0.4, 0.6])
+    _ok('two values keep a finite std', std is not None and std > 0, std)
+
+
 _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
@@ -498,6 +508,7 @@ _TEST_FUNCS = [
     test_paired_stats_math,
     test_ablation_design_audit,
     test_exp8_smoke_envelope,
+    test_single_seed_aggregate_reports_undefined_std,
 ]
 
 

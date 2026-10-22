@@ -955,7 +955,7 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         t = _t_crit_975(n)
         ci_acc = t * std_acc / math.sqrt(n)
     else:
-        std_acc = 0.0
+        std_acc = None
         ci_acc = None
 
     chance = 1.0 / VOCAB
@@ -1734,7 +1734,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
         t = _t_crit_975(n)
         ci_acc = t * std_acc / math.sqrt(n)
     else:
-        std_acc = 0.0
+        std_acc = None
         ci_acc = None
 
     chance = 1.0 / VOCAB
@@ -1762,7 +1762,9 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
             ci = (crit * sd / math.sqrt(len(vals))
                   if crit is not None else None)
         else:
-            sd, ci = 0.0, None
+            # One surviving seed has no sample SD; 0.0 would claim perfect
+            # precision. Mirror run_quality's undefined-std convention.
+            sd, ci = None, None
         class_agg[key] = {'mean': m, 'std': sd, 'ci95': ci,
                           'n_seeds': len(vals)}
 
@@ -3500,7 +3502,7 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                 _ci = res['ci95_acc']
                 _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
                 logger.info(f"  -> mean_acc={res['mean_acc']:.4f} +/- {_ci_str} "
-                            f"(std={res['std_acc']:.4f}, "
+                            f"(std={_fmt_num(res['std_acc'])}, "
                             f"t_vs_chance={_fmt_tstat(res['t_stat_vs_chance'], width=0, prec=2)}, "
                             f"sig_bonferroni={res['significant_bonferroni']})")
                 logger.info(f"     mean_fwd={res['mean_fwd_ms']:.2f}ms")
@@ -3961,7 +3963,7 @@ def main():
                 _ci = res.get('ci95_acc')
                 _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
                 logger.info(f"  -> mean_acc={res.get('mean_acc'):.4f} +/- {_ci_str} "
-                            f"(std={res.get('std_acc'):.4f}, "
+                            f"(std={_fmt_num(res.get('std_acc'))}, "
                             f"t_vs_chance={_fmt_tstat(res.get('t_stat_vs_chance'), width=0, prec=2)}, "
                             f"sig_bonferroni={res['significant_bonferroni']})")
                 logger.info(f"     mean_fwd={res.get('mean_fwd_ms'):.2f}ms  "

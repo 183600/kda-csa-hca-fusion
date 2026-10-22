@@ -787,7 +787,9 @@ def _mean_ci(values, label=''):
         return None, None, None
     mean = sum(values) / n
     if n < 2:
-        return mean, 0.0, None
+        # The sample std of one observation is undefined; 0.0 would claim
+        # perfect precision. The CI is likewise undefined.
+        return mean, None, None
     var = sum((v - mean) ** 2 for v in values) / (n - 1)
     std = math.sqrt(var)
     crit = _t_crit_975(n)
