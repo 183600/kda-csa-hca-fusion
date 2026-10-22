@@ -457,23 +457,30 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
 def test_needle_experiment_json_output():
     """Full experiment run produces valid JSON with all row kinds."""
     print('\nTest: experiment JSON structure')
-    # Run a minimal quick experiment
+    # Run a minimal quick experiment. Both the result and the campaign
+    # ledger live in a temp directory: a smoke test must not pollute the
+    # real experiment index with a fake run.
     import subprocess
-    result = subprocess.run([
-        sys.executable, 'run_needle_haystack.py',
-        '--quick', '--no-qat', '--json', '/tmp/needle_test.json',
-        '--seeds', '0', '--context-lens', '128',
-        '--memory-types', 'kda', '--dtypes', 'fp32,bf16',
-        '--quant-bits', '4', '--quant-groups', '16'
-    ], capture_output=True, text=True, cwd=HERE, timeout=120)
-    if result.returncode != 0:
-        print(f'  stderr: {result.stderr}')
-        print(f'  stdout: {result.stdout}')
-    _ok('experiment runs successfully', result.returncode == 0,
-        f'returncode={result.returncode}')
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='_needle_test_') as tmp:
+        json_path = os.path.join(tmp, 'needle_test.json')
+        env = dict(os.environ)
+        env['RUN_MANIFEST_PATH'] = os.path.join(tmp, 'run_manifest.jsonl')
+        result = subprocess.run([
+            sys.executable, 'run_needle_haystack.py',
+            '--quick', '--no-qat', '--json', json_path,
+            '--seeds', '0', '--context-lens', '128',
+            '--memory-types', 'kda', '--dtypes', 'fp32,bf16',
+            '--quant-bits', '4', '--quant-groups', '16'
+        ], capture_output=True, text=True, cwd=HERE, timeout=120, env=env)
+        if result.returncode != 0:
+            print(f'  stderr: {result.stderr}')
+            print(f'  stdout: {result.stdout}')
+        _ok('experiment runs successfully', result.returncode == 0,
+            f'returncode={result.returncode}')
 
-    with open('/tmp/needle_test.json') as f:
-        payload = json.load(f)
+        with open(json_path) as f:
+            payload = json.load(f)
 
     _ok('has experiment field', 'experiment' in payload)
     _ok('experiment is exp12', payload['experiment'] == 'exp12_needle_haystack')

@@ -429,7 +429,14 @@ def test_exp8_smoke_envelope():
     try:
         with tempfile.TemporaryDirectory(prefix='_mech_test_') as tmp:
             M.RESULTS_PATH = os.path.join(tmp, 'exp8.json')
-            rc = M.main()
+            # Smoke runs must never append a fake row to the campaign
+            # ledger: keep the manifest inside the temp directory too.
+            manifest_env = _set_env({
+                'RUN_MANIFEST_PATH': os.path.join(tmp, 'run_manifest.jsonl')})
+            try:
+                rc = M.main()
+            finally:
+                manifest_env()
             _ok('main returns 0 for a finite tiny run', rc == 0, f'rc={rc}')
             with open(M.RESULTS_PATH, encoding='utf-8') as f:
                 payload = json.load(f)
