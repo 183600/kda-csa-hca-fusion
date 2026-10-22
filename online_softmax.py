@@ -210,7 +210,7 @@ def _align_sink_logits(sink_logits: torch.Tensor,
     made explicit (e.g. ``[B, H, 1, 1]`` or ``[1, H, 1, 1]``).
     """
     sink = sink_logits.to(device=m.device, dtype=m.dtype)
-    H = m.shape[1]
+    B, H = m.shape[0], m.shape[1]
     if sink.dim() == 1:
         if sink.shape[0] != H:
             raise ValueError(
@@ -219,22 +219,37 @@ def _align_sink_logits(sink_logits: torch.Tensor,
         return sink.view(1, H, 1, 1)
     if sink.dim() == 2:
         if sink.shape[-1] == H:
+            # ``[B, H]``: one logit per (batch, head).
             return sink.view(*sink.shape, 1, 1)
-        if sink.shape[-1] == 1 and sink.shape[0] == H:
-            return sink.view(1, H, 1, 1)
+        if sink.shape[-1] == 1:
+            # ``[H, 1]`` is per-head and ``[B, 1]`` is per-batch. When
+            # B == H the shape alone is ambiguous; prefer the batch axis,
+            # because the documented contract is "broadcastable to
+            # [B, H, T, 1]" and a leading batch axis is the only reason to
+            # pass a 2-D singleton at all. A caller who really wants
+            # per-head logits can use the canonical 1-D ``[H]`` form.
+            if sink.shape[0] == B:
+                return sink.view(B, 1, 1, 1)
+            if sink.shape[0] == H:
+                return sink.view(1, H, 1, 1)
         raise ValueError(
-            'online_softmax: 2-D sink_logits must be [B, H] or [H, 1]; '
-            f'got {tuple(sink.shape)} for H={H}.')
+            'online_softmax: 2-D sink_logits must be [B, H], [B, 1] or '
+            f'[H, 1]; got {tuple(sink.shape)} for B={B}, H={H}.')
     if sink.dim() == 3:
         if sink.shape[-2:] == (1, 1):
+            # Same ambiguity as the 2-D singleton: a leading batch axis
+            # that happens to equal H must not be reinterpreted as the
+            # head axis. Prefer the batch interpretation.
+            if sink.shape[0] == B:
+                return sink.view(B, 1, 1, 1)
             if sink.shape[0] == H:
                 return sink.view(1, H, 1, 1)
             return sink.view(*sink.shape, 1)
         if sink.shape[-1] == 1:
             return sink.unsqueeze(-1)
         raise ValueError(
-            'online_softmax: 3-D sink_logits must be [B, H, 1] or '
-            f'[H, 1, 1]; got {tuple(sink.shape)} for H={H}.')
+            'online_softmax: 3-D sink_logits must be [B, H, 1], [B, 1, 1] '
+            f'or [H, 1, 1]; got {tuple(sink.shape)} for B={B}, H={H}.')
     if sink.dim() > 4:
         raise ValueError(
             'online_softmax: sink_logits must be [H] or broadcastable to '
