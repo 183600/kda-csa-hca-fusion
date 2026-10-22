@@ -515,6 +515,35 @@ def test_paired_family_size_counts_every_n_kv_cell():
         M._paired_family_size([{'name': 'baseline'}], [1, 2]))
 
 
+def test_finite_metric_filters_diverged_seed_values():
+    """Paired contrasts must never subtract a NaN/string per-seed metric.
+
+    ``summarize_variant`` already drops a diverged seed from its aggregate,
+    but the raw record stays in ``per_seed``. The accuracy and PR-AUC
+    contrasts must use the same surviving population; otherwise one NaN
+    poisons every downstream t-statistic (or raises inside ``math``).
+    """
+    records = [
+        {'seed': 1, 'final_acc': 0.4, 'gold_pr_auc': 0.5},
+        {'seed': 2, 'final_acc': float('nan'), 'gold_pr_auc': float('inf')},
+        {'seed': 3, 'final_acc': '0.6', 'gold_pr_auc': '0.7'},
+        {'seed': 4, 'final_acc': True, 'gold_pr_auc': False},
+        {'seed': 5, 'final_acc': None, 'gold_pr_auc': None},
+        {'seed': 6, 'final_acc': 0.8, 'gold_pr_auc': 0.9},
+        {'seed': 7, 'final_acc': 0.9, 'gold_pr_auc': 0.95, 'error': 'x'},
+        'not-a-record',
+    ]
+    assert M._finite_metric(records[0], 'final_acc') == 0.4
+    assert M._finite_metric(records[0], 'gold_pr_auc') == 0.5
+    invalid = [records[i] for i in (1, 2, 3, 4, 7)]
+    for record in invalid:
+        assert M._finite_metric(record, 'final_acc') is None, record
+        assert M._finite_metric(record, 'gold_pr_auc') is None, record
+    assert M._finite_metric(records[5], 'final_acc') == 0.8
+    assert M._finite_metric(records[6], 'gold_pr_auc') == 0.95
+    assert M._finite_metric({'seed': 1}, 'missing') is None
+
+
 _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
@@ -527,6 +556,7 @@ _TEST_FUNCS = [
     test_exp8_smoke_envelope,
     test_single_seed_aggregate_reports_undefined_std,
     test_paired_family_size_counts_every_n_kv_cell,
+    test_finite_metric_filters_diverged_seed_values,
 ]
 
 

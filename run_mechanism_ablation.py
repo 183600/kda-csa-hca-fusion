@@ -821,6 +821,23 @@ def paired_stats(diffs):
     return {'n_pairs': n, 'mean': mean, 'ci95': ci, 't_stat': t_stat}
 
 
+def _finite_metric(record, key):
+    """Finite numeric per-seed metric, or ``None`` when not a measurement.
+
+    A diverged seed may remain in ``per_seed`` with a NaN or string value
+    for ``final_acc`` / ``gold_pr_auc`` even though the aggregate row
+    excludes it. Paired contrasts must exclude the same seeds; passing the
+    raw value into a subtraction would poison every downstream statistic.
+    """
+    if not isinstance(record, dict):
+        return None
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def summarize_variant(per_seed, variant):
     """Aggregate per-seed records into the row stored in the result file."""
     ok = [r for r in per_seed
@@ -1398,12 +1415,21 @@ def main():
                 continue
             diffs = []
             for r in row['per_seed']:
-                if 'error' in r or r.get('final_acc') is None:
+                if 'error' in r:
+                    continue
+                acc = _finite_metric(r, 'final_acc')
+                if acc is None:
+                    # A diverged seed can survive with a NaN/string
+                    # ``final_acc`` even though ``summarize_variant``
+                    # excluded it from the aggregate. Treat it exactly like
+                    # the aggregate path: it is not a measurement, so it
+                    # must not enter the paired difference (one NaN would
+                    # poison every downstream t-statistic).
                     continue
                 base = baseline_acc.get(r['seed'])
                 if base is None or not math.isfinite(base):
                     continue
-                diffs.append(r['final_acc'] - base)
+                diffs.append(acc - base)
             stats = paired_stats(diffs)
             crit = None
             if stats['t_stat'] is not None and alpha_corrected is not None:
@@ -1426,12 +1452,18 @@ def main():
             # by seed against the same baseline run.
             pr_auc_diffs = []
             for r in row['per_seed']:
-                if 'error' in r or r.get('gold_pr_auc') is None:
+                if 'error' in r:
+                    continue
+                pr_auc = _finite_metric(r, 'gold_pr_auc')
+                if pr_auc is None:
+                    # Same finite-value contract as the accuracy contrast:
+                    # an undefined ranking metric must not poison the
+                    # paired PR-AUC test.
                     continue
                 base_pr = baseline_pr_auc.get(r['seed'])
                 if base_pr is None or not math.isfinite(base_pr):
                     continue
-                pr_auc_diffs.append(r['gold_pr_auc'] - base_pr)
+                pr_auc_diffs.append(pr_auc - base_pr)
             pr_stats = paired_stats(pr_auc_diffs)
             pr_crit = None
             if pr_stats['t_stat'] is not None and alpha_corrected is not None:
