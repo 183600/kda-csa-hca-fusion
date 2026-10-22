@@ -2886,6 +2886,19 @@ def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
         1 for r in ok_per_seed
         if ((r.get('curve_diagnosis') or {}).get('signals') or {}).get(
             'val_still_improving_at_end'))
+    # Optimizer health rides along with the curve verdict: a row can have a
+    # healthy-looking loss while clipping is masking a gradient explosion,
+    # which makes its endpoint no more trustworthy than an overfit one.
+    grad_records = [r.get('gradient_norms') for r in ok_per_seed
+                    if r.get('gradient_norms')]
+    grad_warned = [g for g in grad_records if g.get('notes')]
+    grad_clipped = [g for g in grad_records
+                    if int(g.get('n_above_clip') or 0) > 0]
+    grad_over = [float(g['max_over_clip']) for g in grad_records
+                 if g.get('max_over_clip') is not None
+                 and math.isfinite(float(g['max_over_clip']))]
+    grad_notes = sorted({note for g in grad_warned
+                         for note in (g.get('notes') or [])})
     modal = (max(counts, key=lambda k: counts[k])
              if len(set(counts.values())) == 1 or counts else None)
     return {
@@ -2904,6 +2917,10 @@ def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
         'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
         'best_val_step_any_seed': best_step,
         'n_seeds_at_ceiling': saturated,
+        'n_seeds_with_gradient_warnings': len(grad_warned),
+        'n_seeds_clipped': len(grad_clipped),
+        'max_gradient_over_clip': max(grad_over) if grad_over else None,
+        'gradient_warning_notes': grad_notes,
     }
 
 
@@ -2961,6 +2978,13 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
     still_improving = sorted(
         str(r.get(label_key))
         for r in counted if r.get('n_seeds_budget_limited'))
+    grad_warn_rows = sorted(
+        str(r.get(label_key))
+        for r in counted if r.get('n_seeds_with_gradient_warnings'))
+    grad_over = [float(r['max_gradient_over_clip'])
+                 for r in counted
+                 if r.get('max_gradient_over_clip') is not None
+                 and math.isfinite(float(r['max_gradient_over_clip']))]
 
     summary = {
         'rows_total': len(rows),
@@ -2973,6 +2997,8 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         'rows_partially_saturated': partially_saturated,
         'rows_with_unstable_verdict': unstable,
         'rows_still_improving_at_budget': still_improving,
+        'rows_with_gradient_warnings': grad_warn_rows,
+        'max_gradient_over_clip': max(grad_over) if grad_over else None,
         'regime': None,
         'interpretation': '',
         'recommended_action': '',
@@ -3075,6 +3101,15 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
              summary['recommended_action'] else '')
             + 'raise ABL_STEPS (or the validation frequency) until the '
               'per-seed verdicts agree before quoting them.')
+    if grad_warn_rows:
+        peak = summary['max_gradient_over_clip']
+        peak_txt = f'{peak:.1f}x' if peak is not None else '>10x'
+        summary['recommended_action'] = (
+            (summary['recommended_action'] + ' ').strip()
+            + f' Separately, raw gradients exceeded the clip budget in '
+            f'{grad_warn_rows} (peak {peak_txt}): lower the learning rate or '
+            f'fix the exploding stage before treating the endpoints of those '
+            f'rows as converged, even where the loss curve looks healthy.')
     return summary
 
 

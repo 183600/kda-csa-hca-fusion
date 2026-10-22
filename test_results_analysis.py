@@ -171,6 +171,40 @@ def test_sweep_summary_prefers_saturation_over_loss_shape():
     assert summary['rows_partially_saturated'] == []
 
 
+def test_curve_rollup_surfaces_masked_gradient_explosions():
+    """A healthy loss curve must not hide clipping-masked explosions.
+
+    The per-seed gradient summary is now rolled up to the row and the
+    sweep, so the action line can say "lower the LR" even when the loss
+    verdict itself is healthy.
+    """
+    from run_ablation import (_aggregate_curve_diagnosis,
+                              _curve_diagnosis_summary)
+
+    seeds = [
+        {'gradient_norms': {
+            'notes': ['peak gradient norm is 20.0x the clip budget'],
+            'n_above_clip': 3, 'max_over_clip': 20.0}},
+        {'gradient_norms': {
+            'notes': [], 'n_above_clip': 0, 'max_over_clip': 1.0}},
+    ]
+    agg = _aggregate_curve_diagnosis(seeds)
+    assert agg['n_seeds_with_gradient_warnings'] == 1
+    assert agg['n_seeds_clipped'] == 1
+    assert agg['max_gradient_over_clip'] == 20.0
+    assert agg['gradient_warning_notes'] == [
+        'peak gradient norm is 20.0x the clip budget']
+    json.dumps(agg, allow_nan=False)
+
+    rows = [{'ratio': '3:1:1', 'curve_verdict': 'healthy',
+             'n_seeds_ok': 2, 'n_seeds_with_gradient_warnings': 1,
+             'max_gradient_over_clip': 20.0}]
+    summary = _curve_diagnosis_summary(rows, 'ratio')
+    assert summary['rows_with_gradient_warnings'] == ['3:1:1']
+    assert summary['max_gradient_over_clip'] == 20.0
+    assert 'Separately, raw gradients' in summary['recommended_action']
+
+
 # ---------------------------------------------------------------------------
 # Systematic non-finite triage
 # ---------------------------------------------------------------------------
