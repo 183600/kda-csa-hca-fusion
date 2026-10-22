@@ -451,11 +451,15 @@ def _validate_matrix_rows(rows: list, metadata: dict) -> list[str]:
                 f'{where}: n_layers={n_layers} != metadata.total_layers='
                 f'{total_layers} (the design is depth-controlled)')
     if isinstance(expected, list) and expected:
-        missing = sorted(set(expected) - present)
-        if missing:
-            out.append(
-                f'matrix incomplete: expected group(s) {missing} are absent '
-                f'from the {len(present)} group(s) present')
+        if not all(_is_hashable(value) for value in expected):
+            out.append('metadata.expected_groups must contain only hashable '
+                       'group labels')
+        else:
+            missing = sorted(set(expected) - present)
+            if missing:
+                out.append(
+                    f'matrix incomplete: expected group(s) {missing} are '
+                    f'absent from the {len(present)} group(s) present')
     return out
 
 
@@ -654,20 +658,31 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
                 out.append(
                     f'{where}: op {op!r} uses its native state path but '
                     f'prefill_cache_build={build!r}')
-    if isinstance(prefill_lens, list) and prefill_lens:
+    prefill_lens_ok = (not isinstance(prefill_lens, list) or not prefill_lens
+                       or all(_is_hashable(value) for value in prefill_lens))
+    ops_ok = (not isinstance(ops_expected, list) or not ops_expected
+              or all(_is_hashable(value) for value in ops_expected))
+    if not prefill_lens_ok:
+        out.append('metadata.prefill_lens must contain only hashable values')
+    if not ops_ok:
+        out.append('metadata.ops must contain only hashable values')
+    if prefill_lens_ok and isinstance(prefill_lens, list) and prefill_lens:
         stray = sorted({plen for _op, plen in cells} - set(prefill_lens))
         if stray:
             out.append(f'prefill_len value(s) {stray} not in metadata.prefill_lens')
-    if isinstance(ops_expected, list) and ops_expected:
+    if ops_ok and isinstance(ops_expected, list) and ops_expected:
         stray_ops = sorted({op for op, _plen in cells} - set(ops_expected))
         if stray_ops:
             out.append(f'op value(s) {stray_ops} not in metadata.ops')
-        missing_cells = sorted(
-            (op, plen) for op in ops_expected for plen in (prefill_lens or [])
-            if (op, plen) not in cells
-        )
-        if missing_cells:
-            out.append(f'missing (op, prefill_len) cell(s): {missing_cells[:6]}')
+        if prefill_lens_ok:
+            missing_cells = sorted(
+                (op, plen) for op in ops_expected
+                for plen in (prefill_lens or [])
+                if (op, plen) not in cells
+            )
+            if missing_cells:
+                out.append('missing (op, prefill_len) cell(s): '
+                           f'{missing_cells[:6]}')
     return out
 
 
@@ -1667,6 +1682,16 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
     meta = metadata if isinstance(metadata, dict) else {}
     settings = meta.get('settings') if isinstance(meta.get('settings'),
                                                   dict) else {}
+    settings_reps = settings.get('reps')
+    if settings_reps is not None and not _positive_int(settings_reps):
+        out.append('metadata.settings.reps must be a positive int')
+        settings_reps = None
+    settings_alpha = settings.get('alpha')
+    if settings_alpha is not None and not (
+            _finite_number(settings_alpha)
+            and 0.0 < float(settings_alpha) < 1.0):
+        out.append('metadata.settings.alpha must be in (0, 1)')
+        settings_alpha = None
     for i, row in enumerate(rows):
         where = f'row[{i}]'
         if not isinstance(row, dict):
@@ -1689,14 +1714,13 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
         n_reps = row.get('n_reps')
         if not _positive_int(n_reps):
             out.append(f"{where}: 'n_reps' must be a positive int")
-        elif settings.get('reps') is not None \
-                and int(settings['reps']) != int(n_reps):
+        elif settings_reps is not None and settings_reps != n_reps:
             out.append(f'{where}: n_reps != metadata.settings.reps')
         alpha = row.get('alpha')
         if not (_finite_number(alpha) and 0.0 < float(alpha) < 1.0):
             out.append(f"{where}: 'alpha' must be in (0, 1), got {alpha!r}")
-        elif settings.get('alpha') is not None \
-                and abs(float(settings['alpha']) - float(alpha)) > 1e-12:
+        elif settings_alpha is not None \
+                and abs(float(settings_alpha) - float(alpha)) > 1e-12:
             out.append(f'{where}: alpha != metadata.settings.alpha')
         se = row.get('se')
         if not (_finite_number(se) and float(se) >= 0):

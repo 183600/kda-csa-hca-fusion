@@ -899,3 +899,23 @@ def test_row_contract_exp9_malformed_types_do_not_crash():
     bad[idx].update(csa_topk=[], error='boom')
     violations = rs.validate_rows('exp9_budget_frontier', bad, {})
     assert any('csa_topk' in v for v in violations), violations
+
+
+def test_row_contracts_reject_unhashable_metadata_entries():
+    """Malformed metadata lists must be violations, not TypeError crashes."""
+    violations = rs.validate_rows(
+        'exp5b_ablation_matrix', [],
+        {'expected_groups': [['g1']], 'total_layers': 2})
+    assert any('expected_groups' in v for v in violations), violations
+
+    violations = rs.validate_rows(
+        'exp6_decoding', [],
+        {'prefill_lens': [[1]], 'ops': [['kda']]})
+    assert any('prefill_lens' in v for v in violations), violations
+    assert any('metadata.ops' in v for v in violations), violations
+
+    violations = rs.validate_rows(
+        'exp16_paired_stats_calibration', [],
+        {'settings': {'reps': [], 'alpha': 'not-a-level'}})
+    assert any('settings.reps' in v for v in violations), violations
+    assert any('settings.alpha' in v for v in violations), violations
