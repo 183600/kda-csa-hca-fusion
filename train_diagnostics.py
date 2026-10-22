@@ -374,13 +374,26 @@ class ValidationCurve:
                 f'validation accuracy must lie in [0, 1]; got {acc} '
                 f'(loss={loss}). Either the (loss, acc) pair is swapped or '
                 f'the evaluator is returning a loss in the accuracy slot.')
-        point = {'step': step, 'loss': loss, 'acc': acc}
+        loss_finite = math.isfinite(loss)
+        # Persist a non-finite checkpoint as JSON null (the same sentinel
+        # ``diagnose_training_curves`` already understands) instead of NaN/
+        # Infinity, which would make the whole artifact fail strict JSON
+        # serialization long after the run recovered. ``loss_finite`` keeps
+        # the distinction explicit.
+        point = {'step': step, 'loss': loss if loss_finite else None,
+                 'acc': acc, 'loss_finite': bool(loss_finite)}
         self.history.append(point)
         # Track the validation minimum by LOSS, which is the quantity the
         # early-stopping rule would use; accuracy is kept alongside so the
         # diagnosis can distinguish "val loss fell" from "val accuracy rose"
         # (they disagree when the probe saturates).
-        if self.best is None or loss < self.best['loss']:
+        #
+        # Only FINITE losses may win the best slot. A NaN compares False
+        # against everything, so the old ``best is None or loss < best``
+        # rule kept a NaN first checkpoint forever: every later finite
+        # checkpoint lost to it, and the reported best/regret/early-stopping
+        # summary became NaN even though the run recovered.
+        if loss_finite and (self.best is None or loss < self.best['loss']):
             self.best = dict(point)
         return point
 
@@ -429,10 +442,25 @@ class ValidationCurve:
         val_losses = [h['loss'] for h in self.history]
         diagnosis = diagnose_training_curves(
             train_losses, val_losses or None)
+        def _point_finite(h):
+            flag = h.get('loss_finite')
+            if flag is not None:
+                return bool(flag)
+            return h.get('loss') is not None and math.isfinite(
+                float(h['loss']))
+
+        finite = [h for h in self.history if _point_finite(h)]
+        final = self.history[-1] if self.history else None
+        final_finite = bool(final and _point_finite(final))
+        last_finite = finite[-1] if finite else None
         # Same definition run_quality uses, so the two are comparable:
         # final held-out loss minus the mean of the last 10 training steps.
-        gap = (val_losses[-1] - sum(train_losses[-10:]) / min(10, len(train_losses))
-               if val_losses and train_losses else None)
+        # A non-finite endpoint has no meaningful gap, so report None
+        # instead of propagating NaN into every downstream mean.
+        gap = None
+        if final_finite and train_losses:
+            gap = (float(final['loss'])
+                   - sum(train_losses[-10:]) / min(10, len(train_losses)))
         block = {
             'val_every': self.val_every,
             'val_history': self.history,
@@ -441,40 +469,57 @@ class ValidationCurve:
             'best_val': self.best,
             'val_loss_first': val_losses[0] if val_losses else None,
             'val_loss_last': val_losses[-1] if val_losses else None,
+            'val_loss_last_finite': (last_finite['loss']
+                                     if last_finite else None),
             'val_acc_first': self.history[0]['acc'] if self.history else None,
             'val_acc_last': self.history[-1]['acc'] if self.history else None,
             'val_acc_peak': (max(h['acc'] for h in self.history)
                              if self.history else None),
+            'n_nonfinite_val_points': len(self.history) - len(finite),
+            'nonfinite_val_steps': [int(h['step']) for h in self.history
+                                    if not _point_finite(h)],
         }
         # The overfitting verdict says "use early stopping"; these fields
         # quantify what skipping it actually cost, so the recommendation is
         # backed by a number from THIS run instead of a generic rule. They
         # are derived only from the recorded history (no extra evaluation)
-        # and are None when the curve is empty/disabled.
-        if self.history and self.best is not None:
-            final = self.history[-1]
+        # and are None when the curve is empty/disabled OR the final
+        # checkpoint is non-finite (the run diverged before the endpoint).
+        if final is not None and self.best is not None:
             block['final_val'] = dict(final)
-            block['val_loss_regret_from_best'] = (
-                final['loss'] - self.best['loss'])
             block['val_acc_regret_from_best'] = (
                 max(h['acc'] for h in self.history) - final['acc'])
             block['steps_since_best'] = int(final['step']
                                             - self.best['step'])
             block['best_val_is_final'] = (
-                bool(final['step'] == self.best['step']))
-            block['early_stopping_summary'] = {
-                'selected_step': int(self.best['step']),
-                'final_step': int(final['step']),
-                'steps_saved': int(final['step'] - self.best['step']),
-                'val_loss_at_selection': float(self.best['loss']),
-                'val_loss_at_final': float(final['loss']),
-                'val_loss_regret': float(final['loss']
-                                         - self.best['loss']),
-                'val_acc_at_selection': float(self.best['acc']),
-                'val_acc_at_final': float(final['acc']),
-                'val_acc_regret': float(max(h['acc'] for h in self.history)
-                                        - final['acc']),
-            }
+                bool(final_finite and final['step'] == self.best['step']))
+            if final_finite:
+                block['val_loss_regret_from_best'] = float(
+                    final['loss'] - self.best['loss'])
+                block['early_stopping_summary'] = {
+                    'selected_step': int(self.best['step']),
+                    'final_step': int(final['step']),
+                    'steps_saved': int(final['step'] - self.best['step']),
+                    'val_loss_at_selection': float(self.best['loss']),
+                    'val_loss_at_final': float(final['loss']),
+                    'val_loss_regret': float(final['loss']
+                                             - self.best['loss']),
+                    'val_acc_at_selection': float(self.best['acc']),
+                    'val_acc_at_final': float(final['acc']),
+                    'val_acc_regret': float(
+                        max(h['acc'] for h in self.history)
+                        - final['acc']),
+                }
+            else:
+                # Keep the schema stable while making the missing arithmetic
+                # explicit: no finite endpoint, no regret.
+                block['val_loss_regret_from_best'] = None
+                block['early_stopping_summary'] = None
+                block['early_stopping_unavailable_reason'] = (
+                    'the final validation checkpoint is non-finite; the '
+                    'loss regret against the best finite checkpoint is '
+                    'undefined. Diagnose the eval pass (data -> log(0)/'
+                    'div_by_zero -> softmax overflow -> AMP -> grads/LR).')
         regime = self._accuracy_regime(
             train_accs or [])
         if regime is not None:

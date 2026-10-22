@@ -77,6 +77,44 @@ def test_validation_curve_no_regret_when_final_is_best():
     assert block['early_stopping_summary']['steps_saved'] == 0
 
 
+def test_validation_curve_ignores_nonfinite_points_for_best_and_regret():
+    """A NaN checkpoint must not win the best slot forever.
+
+    NaN compares False against every later loss, so the old min-rule kept
+    a non-finite first point as ``best`` and poisoned the regret/summary
+    with NaN even after the curve recovered. The monitor must select over
+    finite points and record where the non-finite points were.
+    """
+    curve = _curve([(float('nan'), 0.10), (1.0, 0.50), (0.8, 0.70)],
+                   steps=2, val_every=1)
+    for step in range(3):
+        curve.record(step)
+    block = curve.finalize([2.0, 1.5, 1.0])
+    assert block['best_val']['step'] == 2
+    assert block['best_val']['loss'] == pytest.approx(0.8)
+    assert block['n_nonfinite_val_points'] == 1
+    assert block['nonfinite_val_steps'] == [0]
+    assert block['val_loss_last_finite'] == pytest.approx(0.8)
+    assert block['val_loss_regret_from_best'] == pytest.approx(0.0)
+    assert block['generalization_gap'] == pytest.approx(0.8 - 1.5)
+    json.dumps(block, allow_nan=False)
+
+    # A non-finite FINAL checkpoint has no regret against the best finite
+    # point: report None (and the reason) rather than NaN.
+    curve = _curve([(1.0, 0.50), (float('inf'), 0.60)],
+                   steps=1, val_every=1)
+    curve.record(0)
+    curve.record(1)
+    block = curve.finalize([2.0, 1.0])
+    assert block['best_val']['step'] == 0
+    assert block['val_loss_regret_from_best'] is None
+    assert block['early_stopping_summary'] is None
+    assert block['best_val_is_final'] is False
+    assert 'non-finite' in block['early_stopping_unavailable_reason']
+    assert block['generalization_gap'] is None
+    json.dumps(block, allow_nan=False)
+
+
 def test_validation_curve_rejects_swapped_fields_and_disabled_is_empty():
     curve = _curve([(1.0, 3.0)], steps=1, val_every=1)
     with pytest.raises(ValueError, match='accuracy must lie in'):
