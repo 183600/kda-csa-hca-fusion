@@ -440,6 +440,17 @@ def test_seed_statistics_contract():
     _ok('95% CI half-width = se * t_{n-1}',
         abs(ci - (1.0 / (3 ** 0.5)) * t_crit) < 1e-12, str(ci))
 
+    # Finite extreme samples must not overflow the mean/variance into
+    # inf/NaN, and an unrepresentable CI is reported as None (JSON-safe).
+    import json
+    mean, std, ci = R._mean_std_ci95([1e308, 1e308])
+    _ok('extreme equal samples keep a finite mean',
+        mean == 1e308 and std == 0.0 and ci == 0.0, f'{mean}/{std}/{ci}')
+    mean, std, ci = R._mean_std_ci95([1e308, -1e308])
+    _ok('opposite extremes keep a finite mean/SD and undefined CI',
+        mean == 0.0 and std == 2 ** 0.5 * 1e308 and ci is None, f'{mean}/{std}/{ci}')
+    json.dumps({'mean': mean, 'std': std, 'ci': ci}, allow_nan=False)
+
     default = inspect.signature(R.run_recall_report).parameters['seeds'].default
     _ok('run_recall_report defaults to >= 3 seeds',
         tuple(default) == (42, 43, 44), str(default))

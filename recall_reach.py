@@ -1046,13 +1046,62 @@ def _mean_std_ci95(values: list[float]
     if n == 0:
         return None, None, None
     mean = sum(values) / n
+    if not math.isfinite(mean):
+        # Finite samples near the float limit can overflow the raw sum;
+        # evaluate the same mean from a common scale.
+        scale = max(abs(v) for v in values)
+        if scale == 0.0:
+            mean = 0.0
+        else:
+            mean = scale * (math.fsum(v / scale for v in values) / n)
+        if not math.isfinite(mean):
+            return None, None, None
     if n == 1:
         return mean, None, None
-    var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    std = math.sqrt(var)
+    try:
+        var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    except OverflowError:
+        # CPython raises (rather than returning inf) when squaring a
+        # finite value above the float range.
+        var = math.inf
+    if math.isfinite(var):
+        std = math.sqrt(var)
+    else:
+        # The squared deviations overflow though the SD may be finite.
+        # Compute the same ratio from scaled deviations, then multiply back.
+        dev = [v - mean for v in values]
+        if all(math.isfinite(d) for d in dev):
+            dev_scale = max(abs(d) for d in dev)
+            if dev_scale == 0.0:
+                std = 0.0
+            else:
+                ratio = math.fsum((d / dev_scale) ** 2
+                                  for d in dev) / (n - 1)
+                std = dev_scale * math.sqrt(ratio)
+        else:
+            # ``v - mean`` itself overflowed: scale the samples first.
+            value_scale = max(abs(v) for v in values)
+            if value_scale == 0.0:
+                std = 0.0
+            else:
+                scaled = [v / value_scale for v in values]
+                smean = math.fsum(scaled) / n
+                sdev = [v - smean for v in scaled]
+                dev_scale = max(abs(d) for d in sdev)
+                if dev_scale == 0.0:
+                    std = 0.0
+                else:
+                    ratio = math.fsum((d / dev_scale) ** 2
+                                      for d in sdev) / (n - 1)
+                    std = value_scale * dev_scale * math.sqrt(ratio)
+        if not math.isfinite(std):
+            return mean, None, None
     se = std / math.sqrt(n)
     t = _t_crit_975(n)
     ci = (se * t) if t is not None else None
+    if ci is not None and not math.isfinite(ci):
+        # An unrepresentable CI half-width is undefined, not +inf.
+        ci = None
     return mean, std, ci
 
 
