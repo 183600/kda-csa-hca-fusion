@@ -1239,9 +1239,9 @@ def _needle_hypothesis_family(rows: list[dict], hypothesis_key: str,
         if not isinstance(row, dict) or row.get('row_kind') != 'needle_recall':
             continue
         checks = row.get('hypothesis_checks')
-        claim = (checks.get(hypothesis_key) if isinstance(checks, dict)
-                 else None) or {}
-        p_value = claim.get('p_value_directional')
+        claim = checks.get(hypothesis_key) if isinstance(checks, dict) else None
+        p_value = (claim.get('p_value_directional')
+                   if isinstance(claim, dict) else None)
         if (isinstance(p_value, bool)
                 or not isinstance(p_value, (int, float))
                 or not math.isfinite(float(p_value))

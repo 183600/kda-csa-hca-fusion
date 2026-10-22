@@ -542,6 +542,9 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
          'context_len': 256, 'needle_pos': 128, 'accuracy_mean': 0.5,
          'hypothesis_checks': {'learned_retrieval':
                                {'p_value_directional': '0.01'}}},
+        {'row_kind': 'needle_recall', 'memory_type': 'kda',
+         'context_len': 256, 'needle_pos': 128, 'accuracy_mean': 0.5,
+         'hypothesis_checks': {'learned_retrieval': []}},
         {'row_kind': 'needle_rule_baseline', 'accuracy': 'bad'},
         {'row_kind': 'needle_rule_baseline', 'accuracy': 0.25},
     ]
