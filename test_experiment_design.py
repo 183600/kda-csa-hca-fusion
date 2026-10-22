@@ -166,6 +166,183 @@ def test_planning_rejects_invalid_overrides():
 
 
 # ---------------------------------------------------------------------------
+# Equivalence (TOST) planning
+# ---------------------------------------------------------------------------
+
+def test_equivalence_planning_uses_the_tost_doubled_tail():
+    """TOST n uses z_{1-beta/2}, its own family, and the TOST margin."""
+    from statistics import NormalDist
+    rep = D.planning_report('exp4_mqar')
+    eq = rep['equivalence']
+    assert eq is not None
+    assert eq['margin'] == 0.05
+    assert eq['family_size'] == 21
+    assert eq['alpha_per_test'] == pytest.approx(0.05 / 21)
+    assert eq['ci_level'] == pytest.approx(1.0 - 2.0 * 0.05 / 21)
+    z_crit = NormalDist().inv_cdf(1.0 - eq['alpha_per_test'])
+    z_power = NormalDist().inv_cdf(0.5 * (1.0 + eq['target_power']))
+    expected = math.ceil(((z_crit + z_power) * rep['assumed_sd']
+                          / eq['margin']) ** 2)
+    assert eq['required_seeds_at_zero'] == max(2, expected)
+    # At a true difference of zero the forward power is
+    # 2*Phi(margin/se - z) - 1.
+    se = rep['assumed_sd'] / math.sqrt(eq['seeds'])
+    expected_power = 2.0 * NormalDist().cdf(
+        eq['margin'] / se - z_crit) - 1.0
+    assert eq['planned_power_at_zero'] == pytest.approx(
+        max(0.0, min(1.0, expected_power)))
+    # The superiority budget is not an equivalence budget.
+    assert rep['required_seeds'] < eq['required_seeds_at_zero']
+    assert eq['supports_equivalence_at_planned_n'] is False
+    assert eq['status'] == 'equivalence_underpowered'
+    assert eq['claim_allowed'] is False
+    # The (1-2*alpha) interval is wider than the margin at this n, so no
+    # observed mean could yield a verdict.
+    assert eq['minimum_supportable_margin_at_n'] > eq['margin']
+
+    # The forward helper agrees, and at the required n it reaches target.
+    assert D.equivalence_power(
+        eq['required_seeds_at_zero'], eq['margin'], rep['assumed_sd'],
+        alpha=eq['alpha_family_wise'], family_size=eq['family_size']) \
+        >= eq['target_power'] - 1e-9
+    # A true difference at the margin cannot be declared equivalent; the
+    # power is at most the per-test alpha.
+    assert D.equivalence_power(
+        eq['required_seeds_at_zero'], eq['margin'], rep['assumed_sd'],
+        alpha=eq['alpha_family_wise'], family_size=eq['family_size'],
+        true_diff=eq['margin']) <= eq['alpha_per_test'] + 1e-9
+    # A zero-variance vector is equivalent exactly when it is inside the
+    # strict margin.
+    assert D.equivalence_power(5, 0.05, 0.0) == 1.0
+    assert D.equivalence_power(5, 0.05, 0.0, true_diff=0.05) == 0.0
+    assert D.equivalence_power(5, 0.05, 0.0, true_diff=0.06) == 0.0
+
+
+def test_equivalence_margin_must_not_exceed_the_sesoi():
+    base = D.get_plan('exp4_mqar')
+    wide = dict(base, equivalence=dict(base['equivalence'], margin=0.20))
+    errors = D.validate_plan(wide)
+    assert any('must not exceed the superiority sesoi' in e for e in errors)
+
+    # A plan that CLAIMS a powered equivalence test must actually reach its
+    # own TOST requirement.
+    claimed = dict(base, equivalence=dict(base['equivalence'],
+                                          required_for_claim=True))
+    errors = D.validate_plan(claimed)
+    assert any('equivalence.required_for_claim' in e for e in errors)
+    assert any('required_seeds_at_zero' in e for e in errors)
+
+    # At the actual TOST requirement the same claim validates.
+    supported = dict(base, planned_seeds=68,
+                     equivalence=dict(base['equivalence'],
+                                      required_for_claim=True))
+    assert D.validate_plan(supported) == []
+
+
+def test_equivalence_helpers_reject_malformed_inputs():
+    with pytest.raises(D.DesignError):
+        D.equivalence_seeds_required(0.0, 0.1)
+    with pytest.raises(D.DesignError):
+        D.equivalence_seeds_required(0.05, -0.1)
+    with pytest.raises(D.DesignError):
+        D.equivalence_seeds_required(0.05, 0.1, family_size=0)
+    with pytest.raises(D.DesignError):
+        D.equivalence_seeds_required(0.05, 0.1, alpha=0.6)
+    with pytest.raises(D.DesignError):
+        D.equivalence_power(1.5, 0.05, 0.1)
+    with pytest.raises(D.DesignError):
+        D.equivalence_power(5, 0.05, 0.1, true_diff=float('nan'))
+    with pytest.raises(D.DesignError):
+        D.equivalence_plan(margin=0.05, sd=0.1, seeds=True)
+    with pytest.raises(D.DesignError):
+        D.equivalence_plan(margin=0.05, sd=0.1, seeds=5,
+                           required_for_claim='yes')
+    assert D.equivalence_power(1, 0.05, 0.1) is None
+
+
+def test_audit_only_allows_equivalence_when_the_budget_supports_it():
+    levels = {'operator': ['linear', 'softmax', 'kda']}
+    unpowered = D.audit_run('exp4_mqar', seeds=[42 + i for i in range(11)],
+                            levels=levels, family_size=5)
+    assert unpowered['status'] == 'confirmatory'
+    assert unpowered['equivalence_claim_allowed'] is False
+    assert 'practical_equivalence_at_margin' not in \
+        unpowered['claims_allowed']
+    assert any('TOST margin' in w for w in unpowered['design_warnings'])
+    assert unpowered['equivalence']['margin'] == 0.05
+
+    powered = D.audit_run('exp4_mqar', seeds=[42 + i for i in range(68)],
+                          levels=levels, family_size=5)
+    assert powered['equivalence_claim_allowed'] is True
+    assert 'practical_equivalence_at_margin' in powered['claims_allowed']
+    assert powered['design_warnings'] == []
+
+
+def test_mechanism_plan_makes_no_equivalence_claim():
+    rep = D.planning_report('exp8_mechanism')
+    assert rep['equivalence'] is None
+    assert rep['equivalence_status'] is None
+    audit = D.audit_run('exp8_mechanism', seeds=[42 + i for i in range(14)],
+                        levels={'variant': ['baseline', 'no_rope']},
+                        family_size=5)
+    assert audit['equivalence'] is None
+    assert audit['equivalence_claim_allowed'] is None
+    assert 'practical_equivalence_at_margin' not in audit['claims_allowed']
+
+
+def test_runner_equivalence_margins_match_the_registry():
+    """The pre-registered TOST margin must equal the runner's default.
+
+    The runners' margins are module constants (overridable only at run
+    start). If one is changed without updating the registry, the planning
+    report silently describes a different test from the one that runs.
+    Parse the literal assignments instead of importing the torch-heavy
+    runner modules, so this check works in the stdlib-only planning
+    environment.
+    """
+    import ast
+    import pathlib
+
+    def constant(path, name):
+        tree = ast.parse(pathlib.Path(path).read_text(encoding='utf-8'))
+        for node in tree.body:
+            targets = (node.targets if isinstance(node, ast.Assign) else [])
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+        raise AssertionError(f'{name} not found as a literal in {path}')
+
+    assert constant('run_quality.py', 'PAIRWISE_EQUIVALENCE_MARGIN') == \
+        D.PLANS['exp4_mqar']['equivalence']['margin']
+    assert constant('run_ablation.py', 'CONTRAST_EQUIVALENCE_MARGIN') == \
+        D.PLANS['exp5_ratio']['equivalence']['margin']
+    assert D.PLANS['exp5_ratio']['equivalence']['margin'] == \
+        D.PLANS['exp5b_matrix']['equivalence']['margin'], (
+            'run_ablation uses ONE margin for both the ratio and matrix '
+            'modes; the two plans must register the same value')
+
+
+def test_pilot_reports_the_separate_equivalence_requirement():
+    report = D.pilot_report('exp4_mqar', _exp4_rows(), family_size=5,
+                            sd=0.10)
+    assert report['required_seeds_equivalence'] is not None
+    assert report['required_seeds_equivalence'] > \
+        report['required_seeds_pooled_sd']
+    assert report['recommended_seeds'] == \
+        report['required_seeds_pooled_sd']
+    assert 'equivalence' in report['equivalence_recommendation']
+    # A supplied SD has no observed max, so the conservative companion is
+    # undefined rather than silently reusing the point estimate.
+    assert report['required_seeds_equivalence_conservative'] is None
+    # An extracted pilot carries the max per-contrast SD and its
+    # conservative TOST requirement.
+    observed = D.pilot_report('exp4_mqar', _exp4_rows(), family_size=5)
+    assert observed['required_seeds_equivalence_conservative'] >= \
+        observed['required_seeds_equivalence']
+    assert 'conservative max SD' in observed['equivalence_recommendation']
+
+
+# ---------------------------------------------------------------------------
 # Runtime audit
 # ---------------------------------------------------------------------------
 
@@ -512,6 +689,12 @@ def test_run_all_wires_the_design_manifest(monkeypatch, tmp_path):
     assert block['plans']['exp4_mqar']['n_seeds'] == 3
     assert block['plans']['exp5_ratio']['n_seeds'] == 4
     assert block['plans']['exp8_mechanism']['n_seeds'] == 2
+    # The pre-run summary surfaces the separate TOST budget, so a reader
+    # cannot mistake a superiority budget for an equivalence one.
+    assert block['plans']['exp4_mqar']['equivalence_status'] == \
+        'equivalence_underpowered'
+    assert block['plans']['exp4_mqar']['equivalence_required_seeds'] >= 11
+    assert block['plans']['exp8_mechanism']['equivalence_status'] is None
     written = json.loads(
         (tmp_path / 'results' / 'experiment_design.json').read_text(
             encoding='utf-8'))

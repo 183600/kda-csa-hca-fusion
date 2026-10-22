@@ -117,13 +117,18 @@ _ERROR_ANALYSIS_SEED_OFFSET = 7_000_000
 # computing the rule reference can never perturb any reported metric.
 _RULE_BASELINE_SEED_OFFSET = 8_000_000
 
-# Pre-specified smallest effect of interest (SESOI) for the seed-paired
-# operator comparisons, in ABSOLUTE accuracy units. This is the margin
-# parameter of the TOST equivalence test in ``multi_seed_stats``: two
-# operators separated by less than this are declared practically
-# equivalent (at the corrected alpha), and a non-significant superiority
-# test alone NEVER licenses a "same" claim (absence of evidence is not
-# evidence of absence — see ``_pairwise_op_comparisons``).
+# Pre-specified EQUIVALENCE MARGIN for the seed-paired operator
+# comparisons, in ABSOLUTE accuracy units. This is the margin parameter of
+# the TOST equivalence test in ``multi_seed_stats``: two operators
+# separated by less than this are declared practically equivalent (at the
+# corrected alpha), and a non-significant superiority test alone NEVER
+# licenses a "same" claim (absence of evidence is not evidence of absence —
+# see ``_pairwise_op_comparisons``). It is NOT the superiority SESOI: the
+# pre-registered superiority SESOI is 0.10 (experiment_design.PLANS); this
+# tighter 0.05 margin is a separate endpoint, and its TOST family is wider
+# (all operator pairs, not just the vs-softmax contrasts). The 11-seed
+# confirmatory budget is powered for the SESOI, not for this margin; see
+# ``planning_report(...)['equivalence']`` for the required n.
 #
 # Rationale for 0.05: the MQAR probe's chance level is 1/16 = 0.0625, and
 # the README fairness note warns that several ablations land within a few

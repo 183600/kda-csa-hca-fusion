@@ -21,6 +21,13 @@ each one, records:
 * the confirmatory seed budget derived from the SESOI, an assumed
   per-seed difference SD, and the target power (normal approximation,
   clearly labelled as planning rather than inference);
+* the SEPARATE pre-specified equivalence margin used by the TOST, with
+  its own family, so a "practically the same" claim is not smuggled into a
+  budget that was sized for superiority. The equivalence margin and the
+  SESOI are different scientific thresholds (the runner uses a margin of
+  0.05 accuracy points while the superiority SESOI is 0.10), and a run
+  powered to detect the SESOI is almost never powered to declare
+  equivalence at the tighter margin;
 * the stopping rule (fixed n, no optional stopping, no replacing failed
   seeds) and the decision rule.
 
@@ -106,6 +113,9 @@ __all__ = [
     'validate_plan',
     'validate_plans',
     'planning_report',
+    'equivalence_seeds_required',
+    'equivalence_power',
+    'equivalence_plan',
     'common_analyzed_seeds',
     'audit_run',
     'pilot_sd_from_rows',
@@ -196,11 +206,33 @@ PLANS: dict[str, dict] = {
         'target_power': DEFAULT_TARGET_POWER,
         'screening_seeds': 5,
         'planned_seeds': 11,
+        # The TOST margin is HALF the superiority SESOI and it belongs to a
+        # wider family: run_quality applies Holm to every operator pair in a
+        # cell (21 pairs for the default seven operators), not just to the
+        # five vs-softmax contrasts. The confirmatory budget above was sized
+        # for superiority, so equivalence is explicitly a secondary
+        # (descriptive) endpoint unless a dedicated equivalence-powered run
+        # is registered. See docs/experiment-design.md.
+        'equivalence': {
+            'margin': 0.05,
+            'family_size': 21,
+            'alpha': DEFAULT_ALPHA,
+            'required_for_claim': False,
+            'source': ('run_quality.PAIRWISE_EQUIVALENCE_MARGIN, overridable '
+                       'only at run start by MQAR_EQUIV_MARGIN; the TOST '
+                       'family is one Holm correction over all operator '
+                       'pairs in a cell (21 for the default seven ops)'),
+            'note': ('the TOST margin is a stricter threshold than the 0.10 '
+                     'superiority SESOI; the 11-seed budget cannot support '
+                     'an equivalence claim at this margin (the planning '
+                     'report states the required n)'),
+        },
         'analysis': (
             'one-sided seed-paired t-test for the vs-reference contrast, '
             'Bonferroni/Holm over the planned family; exact sign and '
             'sign-flip permutation tests as robustness checks; TOST at the '
-            'pre-specified SESOI for a "practically the same" claim'),
+            'separately pre-specified equivalence margin (0.05), which is a '
+            'secondary endpoint and is not powered at the 11-seed budget'),
         'decision_rule': (
             'a superiority claim requires beats_tuned_baseline=True; a '
             'non-significant contrast is inconclusive, never evidence of '
@@ -255,9 +287,21 @@ PLANS: dict[str, dict] = {
         'target_power': DEFAULT_TARGET_POWER,
         'screening_seeds': 7,
         'planned_seeds': 14,
+        'equivalence': {
+            'margin': 0.05,
+            'family_size': 6,
+            'alpha': DEFAULT_ALPHA,
+            'required_for_claim': False,
+            'source': ('run_ablation.CONTRAST_EQUIVALENCE_MARGIN, overridable '
+                       'only at run start by ABL_EQUIV_MARGIN'),
+            'note': ('the ratio sweep reports a TOST verdict per alternative '
+                     'ratio, but its 14-seed budget is powered for the 0.10 '
+                     'superiority SESOI, not equivalence at 0.05'),
+        },
         'analysis': (
             'two-sided seed-paired t-test against the reference under one '
-            'Bonferroni family; TOST at the pre-specified margin; no raw '
+            'Bonferroni family; TOST at the separately pre-specified '
+            'equivalence margin (0.05) as a secondary endpoint; no raw '
             'mean ranking'),
         'decision_rule': (
             'only corrected-significant rows may be called different from '
@@ -316,11 +360,24 @@ PLANS: dict[str, dict] = {
         'target_power': DEFAULT_TARGET_POWER,
         'screening_seeds': 7,
         'planned_seeds': 14,
+        'equivalence': {
+            'margin': 0.05,
+            'family_size': 21,
+            'alpha': DEFAULT_ALPHA,
+            'required_for_claim': False,
+            'source': ('run_ablation.CONTRAST_EQUIVALENCE_MARGIN, overridable '
+                       'only at run start by ABL_EQUIV_MARGIN'),
+            'note': ('the TOST is applied to every contrast row under one '
+                     'Bonferroni family; the 14-seed budget is sized for the '
+                     '0.10 superiority SESOI, so equivalence at 0.05 is '
+                     'reported but not powered'),
+        },
         'analysis': (
             'seed-paired t-test under one Bonferroni family over every '
             'contrast row; one-sided for the pre-registered layout '
-            'directions, two-sided for cross-route replacement; TOST for '
-            'practical equivalence'),
+            'directions, two-sided for cross-route replacement; TOST at the '
+            'separately pre-specified equivalence margin (0.05) as a '
+            'secondary endpoint'),
         'decision_rule': (
             'only significant_bonferroni=True rows may be cited; the '
             'interaction row is a claim about complementarity, not a '
@@ -584,6 +641,44 @@ def validate_plan(plan) -> list[str]:
         if not isinstance(exclude, list) \
                 or not all(_is_nonempty_str(k) for k in exclude):
             errors.append('pilot.exclude must be a list of names')
+    # The equivalence (TOST) endpoint has its own margin, family, alpha and
+    # power requirement. It is optional (some mechanism runs make no
+    # equivalence claim), but when present it must be internally coherent and
+    # it may not be looser than the superiority SESOI.
+    equiv = plan.get('equivalence')
+    equiv_required = False
+    if equiv is not None:
+        if not isinstance(equiv, dict):
+            errors.append('equivalence must be a dict when present')
+        else:
+            eq_margin = equiv.get('margin')
+            if not _is_number(eq_margin) or float(eq_margin) <= 0.0:
+                errors.append('equivalence.margin must be a finite number > 0')
+            elif _is_number(plan.get('sesoi')) \
+                    and float(eq_margin) > float(plan['sesoi']) + 1e-12:
+                errors.append(
+                    'equivalence.margin must not exceed the superiority '
+                    'sesoi: declaring equivalence at a margin wider than the '
+                    'smallest effect of interest would call a practically '
+                    'relevant difference "equivalent"')
+            eq_family = equiv.get('family_size', family)
+            if not _is_int(eq_family) or eq_family < 1:
+                errors.append('equivalence.family_size must be an int >= 1')
+            eq_alpha = equiv.get('alpha', alpha)
+            if not _is_number(eq_alpha) or not (0.0 < float(eq_alpha) < 1.0):
+                errors.append('equivalence.alpha must be in (0,1)')
+            elif _is_int(eq_family) and eq_family >= 1 \
+                    and float(eq_alpha) / eq_family >= 0.5:
+                errors.append('equivalence.alpha / equivalence.family_size '
+                              'must be below 0.5')
+            eq_target = equiv.get('target_power', target)
+            if not _is_number(eq_target) or not (0.0 < float(eq_target) < 1.0):
+                errors.append('equivalence.target_power must be in (0,1)')
+            flag = equiv.get('required_for_claim', False)
+            if not isinstance(flag, bool):
+                errors.append('equivalence.required_for_claim must be a bool')
+            else:
+                equiv_required = flag
     if errors:
         return errors
     # A plan whose declared confirmatory budget does not reach its own
@@ -606,6 +701,19 @@ def validate_plan(plan) -> list[str]:
         errors.append(
             f"planned_power={rep.get('planned_power')!r} does not reach "
             f"target_power={plan['target_power']!r}")
+    if equiv_required:
+        eq = rep.get('equivalence') or {}
+        eq_required_n = eq.get('required_seeds_at_zero')
+        if not eq.get('supports_equivalence_at_planned_n'):
+            errors.append(
+                'equivalence.required_for_claim is set, but the planned '
+                f"seeds={plan.get('planned_seeds')!r} do not reach the TOST "
+                f"requirement required_seeds_at_zero={eq_required_n!r} at "
+                f"margin={eq.get('margin')!r} and the corrected per-test "
+                f"alpha={eq.get('alpha_per_test')!r}; raise planned_seeds, "
+                'widen the pre-specified margin, or record '
+                'required_for_claim=False and treat equivalence as '
+                'descriptive')
     return errors
 
 
@@ -622,6 +730,211 @@ def validate_plans() -> list[str]:
 # ---------------------------------------------------------------------------
 # Prospective planning
 # ---------------------------------------------------------------------------
+
+_NORMAL = statistics.NormalDist()
+
+
+def equivalence_seeds_required(margin, sd, *, alpha=DEFAULT_ALPHA,
+                               family_size=1,
+                               power=DEFAULT_TARGET_POWER):
+    """Seed pairs needed to DECLARE equivalence at ``margin``.
+
+    This is the TOST companion of :func:`planning_report`, not a
+    superiority calculation. Two one-sided tests at the Bonferroni-corrected
+    tail ``alpha / family_size`` are run against ``+-margin``. Under the
+    normal approximation at a true difference of zero, the probability of
+    declaring equivalence is ``2*Phi(margin/se - z) - 1`` with
+    ``se = sd/sqrt(n)``. Requiring target power ``1-beta`` gives
+
+    ``n = ceil(((z_{1-alpha/family} + z_{1-beta/2}) * sd / margin)^2)``.
+
+    The ``z_{1-beta/2}`` (not ``z_{1-beta}``) is the TOST-specific term: a
+    two-sided interval must clear the margin on BOTH sides. Equivalence
+    therefore needs substantially more seeds than superiority at the same
+    standardized effect, and a budget planned only for the SESOI is
+    normally not powered to declare equivalence.
+
+    This is a planning approximation, like :func:`planning_report`; it is
+    not used for inference. It uses the normal critical value rather than
+    the t critical value, so it is slightly optimistic (a lower bound on the
+    seeds needed). The margin must be positive and finite.
+    """
+    margin = _need_number(margin, 'equivalence margin', positive=True)
+    sd_value = _need_number(sd, 'sd', positive=True)
+    alpha_value = _need_number(alpha, 'alpha')
+    if not (0.0 < alpha_value < 1.0):
+        raise DesignError(f'alpha must be in (0,1), got {alpha_value!r}')
+    if not _is_int(family_size) or family_size < 1:
+        raise DesignError(
+            f'equivalence family_size must be an int >= 1, got '
+            f'{family_size!r}')
+    if alpha_value / family_size >= 0.5:
+        raise DesignError(
+            'the per-test equivalence alpha must be below 0.5 so a '
+            f'(1-2*alpha) interval exists, got {alpha_value / family_size!r}')
+    power_value = _need_number(power, 'power', positive=True)
+    if not (0.0 < power_value < 1.0):
+        raise DesignError(f'power must be in (0,1), got {power_value!r}')
+    z_crit = _NORMAL.inv_cdf(1.0 - alpha_value / family_size)
+    # At a true difference of zero the TOST power is
+    # 2*Phi(m/se - z) - 1, so target power needs Phi(...) = 1 - beta/2.
+    z_power = _NORMAL.inv_cdf(0.5 * (1.0 + power_value))
+    try:
+        required = ((z_crit + z_power) * sd_value / margin) ** 2
+    except OverflowError:
+        return None
+    if not math.isfinite(required):
+        return None
+    # A paired design needs at least two seed pairs.
+    return max(2, int(math.ceil(required)))
+
+
+def equivalence_power(n, margin, sd, *, alpha=DEFAULT_ALPHA,
+                      family_size=1, true_diff=0.0):
+    """Approximate probability that TOST declares equivalence at ``n``.
+
+    ``true_diff`` is the hypothesized true mean paired difference. The
+    approximate power is
+
+    ``Phi((margin + delta)/se - z) + Phi((margin - delta)/se - z) - 1``,
+
+    with ``se = sd/sqrt(n)`` and ``z = z_{1-alpha/family_size}``. At
+    ``delta = 0`` this is the usual ``2*Phi(margin/se - z) - 1``. The
+    approximation ignores the correlation between the two one-sided
+    statistics (it is the standard planning shortcut) and is not used for
+    inference.
+
+    Returns ``None`` when fewer than two seed pairs make the sample SD
+    undefined. A true difference on or beyond the margin has power at or
+    below the per-test alpha: no finite seed budget turns a real
+    difference into equivalence.
+    """
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise DesignError(f'n must be a non-negative int, got {n!r}')
+    margin = _need_number(margin, 'equivalence margin', positive=True)
+    sd_value = _need_number(sd, 'sd')
+    if sd_value < 0.0:
+        raise DesignError(f'sd must be >= 0, got {sd_value!r}')
+    alpha_value = _need_number(alpha, 'alpha')
+    if not (0.0 < alpha_value < 1.0):
+        raise DesignError(f'alpha must be in (0,1), got {alpha_value!r}')
+    if not _is_int(family_size) or family_size < 1:
+        raise DesignError(
+            f'equivalence family_size must be an int >= 1, got '
+            f'{family_size!r}')
+    if alpha_value / family_size >= 0.5:
+        raise DesignError(
+            'the per-test equivalence alpha must be below 0.5 so a '
+            f'(1-2*alpha) interval exists, got {alpha_value / family_size!r}')
+    delta = _need_number(true_diff, 'true_diff')
+    if n < 2:
+        return None
+    if sd_value == 0.0:
+        # A noiseless difference vector declares equivalence iff it lies
+        # strictly inside the margin (the TOST p is 0 / 0.5 / 1 inside /
+        # boundary / outside).
+        return 1.0 if abs(delta) < margin else 0.0
+    tail_alpha = alpha_value / family_size
+    z_crit = _NORMAL.inv_cdf(1.0 - tail_alpha)
+    se = sd_value / math.sqrt(n)
+    lower = _NORMAL.cdf((delta + margin) / se - z_crit)
+    upper = _NORMAL.cdf((margin - delta) / se - z_crit)
+    return min(1.0, max(0.0, float(lower + upper - 1.0)))
+
+
+def equivalence_plan(*, margin, sd, seeds, alpha=DEFAULT_ALPHA,
+                     family_size=1, target_power=DEFAULT_TARGET_POWER,
+                     required_for_claim=False, source=None, note=None) -> dict:
+    """Prospective read-out for a TOST equivalence endpoint.
+
+    The superiority budget in :func:`planning_report` answers a different
+    question from the TOST budget computed here. Reporting both, side by
+    side, prevents a run powered for a 0.10 accuracy-point superiority
+    difference from being read as a confirmatory equivalence result at a
+    tighter 0.05 margin.
+    """
+    margin = _need_number(margin, 'equivalence margin', positive=True)
+    sd_value = _need_number(sd, 'sd', positive=True)
+    if not _is_int(seeds) or seeds < 0:
+        raise DesignError(f'seeds must be a non-negative int, got {seeds!r}')
+    alpha_value = _need_number(alpha, 'alpha')
+    if not (0.0 < alpha_value < 1.0):
+        raise DesignError(f'alpha must be in (0,1), got {alpha_value!r}')
+    if not _is_int(family_size) or family_size < 1:
+        raise DesignError(
+            f'equivalence family_size must be an int >= 1, got '
+            f'{family_size!r}')
+    target = _need_number(target_power, 'target_power', positive=True)
+    if not (0.0 < target < 1.0):
+        raise DesignError(f'target_power must be in (0,1), got {target!r}')
+    if not isinstance(required_for_claim, bool):
+        raise DesignError(
+            'required_for_claim must be a bool, got '
+            f'{required_for_claim!r}')
+    required = equivalence_seeds_required(
+        margin, sd_value, alpha=alpha_value, family_size=family_size,
+        power=target)
+    power_zero = equivalence_power(
+        seeds, margin, sd_value, alpha=alpha_value,
+        family_size=family_size, true_diff=0.0)
+    power_half = equivalence_power(
+        seeds, margin, sd_value, alpha=alpha_value,
+        family_size=family_size, true_diff=margin / 2.0)
+    power_edge = equivalence_power(
+        seeds, margin, sd_value, alpha=alpha_value,
+        family_size=family_size, true_diff=margin)
+    supported = bool(
+        required is not None and seeds >= required
+        and power_zero is not None and power_zero >= target - 1e-9)
+    if seeds < 2:
+        status = 'not_estimable'
+    elif supported:
+        status = 'equivalence_supported'
+    else:
+        status = 'equivalence_underpowered'
+    # Smallest margin (in endpoint units) at which THIS n reaches the
+    # target power at a true difference of zero. If it is wider than the
+    # registered margin, the run cannot declare equivalence at that margin.
+    minimum_margin = None
+    if seeds >= 2:
+        z_crit = _NORMAL.inv_cdf(1.0 - alpha_value / family_size)
+        z_power = _NORMAL.inv_cdf(0.5 * (1.0 + target))
+        minimum_margin = (z_crit + z_power) * sd_value / math.sqrt(seeds)
+    shortfall = (max(0, int(required) - int(seeds))
+                 if required is not None else None)
+    return {
+        'margin': margin,
+        'margin_source': source,
+        'note': note,
+        'alpha_family_wise': alpha_value,
+        'family_size': family_size,
+        'alpha_per_test': alpha_value / family_size,
+        'ci_level': 1.0 - 2.0 * alpha_value / family_size,
+        'target_power': target,
+        'seeds': int(seeds),
+        'required_seeds_at_zero': required,
+        'shortfall_seeds': shortfall,
+        'planned_power_at_zero': power_zero,
+        'planned_power_at_half_margin': power_half,
+        'planned_power_at_margin_edge': power_edge,
+        'minimum_supportable_margin_at_n': minimum_margin,
+        'supports_equivalence_at_planned_n': supported,
+        'required_for_claim': bool(required_for_claim),
+        'claim_allowed': supported,
+        'status': status,
+        'method': (
+            'TOST normal approximation for planning only: '
+            'n = ceil(((z_{1-alpha/family} + z_{1-beta/2}) * sd / '
+            'margin)^2) at a true difference of zero; inference uses '
+            'multi_seed_stats.tost_paired / tost_from_summary'),
+        'caveat': (
+            'the equivalence margin is a separate scientific threshold '
+            'from the superiority SESOI. A run powered to detect the SESOI '
+            'is not automatically powered to declare equivalence; only '
+            'claim_allowed=True may support a "practically the same" '
+            'conclusion'),
+    }
+
 
 def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                     alpha=None, alternative=None, sesoi=None,
@@ -705,6 +1018,36 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         status = 'confirmatory_ready'
     else:
         status = 'underpowered_at_sesoi'
+    # A TOST equivalence claim is a DIFFERENT design question from the
+    # superiority SESOI above. Compute its prospective budget separately so
+    # a run that is confirmatory-ready for superiority cannot be presented
+    # as a confirmatory equivalence result by accident.
+    equivalence = None
+    equiv_cfg = plan.get('equivalence')
+    if equiv_cfg is not None:
+        if not isinstance(equiv_cfg, Mapping):
+            raise DesignError(
+                'plan.equivalence must be a mapping of margin/family_size/'
+                f'alpha, got {type(equiv_cfg).__name__}')
+        required_flag = equiv_cfg.get('required_for_claim', False)
+        if not isinstance(required_flag, bool):
+            raise DesignError(
+                'plan.equivalence.required_for_claim must be a bool, got '
+                f'{required_flag!r}')
+        equivalence = equivalence_plan(
+            margin=equiv_cfg.get('margin'),
+            sd=sd_value,
+            seeds=n_seeds,
+            alpha=(alpha if equiv_cfg.get('alpha') is None
+                   else equiv_cfg['alpha']),
+            family_size=(family if equiv_cfg.get('family_size') is None
+                         else equiv_cfg['family_size']),
+            target_power=(target if equiv_cfg.get('target_power') is None
+                          else equiv_cfg['target_power']),
+            required_for_claim=required_flag,
+            source=equiv_cfg.get('source'),
+            note=equiv_cfg.get('note'),
+        )
     return {
         'sesoi': sesoi_value,
         'assumed_sd': sd_value,
@@ -720,6 +1063,12 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         'planned_power': achieved,
         'power_gap': (None if achieved is None else target - achieved),
         'status': status,
+        'equivalence': equivalence,
+        'equivalence_status': (
+            None if equivalence is None else equivalence['status']),
+        'equivalence_claim_allowed': (
+            None if equivalence is None
+            else equivalence['supports_equivalence_at_planned_n']),
         'method': ('normal approximation for planning only: '
                    'n = ceil(((z_crit + z_power) / (SESOI / SD))^2); '
                    'inference uses the exact/t tests in multi_seed_stats'),
@@ -727,7 +1076,9 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                  'reaches required_seeds at the corrected per-test alpha; '
                  'the normal approximation is slightly optimistic at small '
                  'n, so treat the target power as a floor to beat, not a '
-                 'promise.'),
+                 'promise. Equivalence is a separate endpoint: see the '
+                 'nested equivalence record, whose required n is usually '
+                 'larger.'),
     }
 
 
@@ -954,6 +1305,10 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
 
     planning = planning_report(plan, seeds=n_seeds, family_size=family_size,
                                sd=sd)
+    equivalence = planning.get('equivalence')
+    equivalence_supported = bool(
+        equivalence is not None
+        and equivalence.get('supports_equivalence_at_planned_n'))
     planned_family = plan.get('planned_family_size')
     family_reduced = (family_size is not None
                       and family_size < int(planned_family))
@@ -976,10 +1331,21 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             and n_analyzed >= 2),
         'complete_case_population': (
             None if not population_provided else complete_case),
+        # None = the plan makes no TOST equivalence claim.
+        'equivalence_supported': (
+            None if equivalence is None else equivalence_supported),
     }
     valid_seeds = all(checks[key] for key in (
         'seeds_present', 'at_least_two_seeds', 'seeds_unique',
         'seeds_are_non_negative_ints'))
+    design_warnings: list[str] = []
+    if equivalence is not None and not equivalence_supported:
+        design_warnings.append(
+            f"the TOST margin {equivalence['margin']!r} needs "
+            f"{equivalence.get('required_seeds_at_zero')!r} seeds for "
+            f"{equivalence['target_power']:.0%} power at a true difference "
+            f"of zero; this run has {n_seeds}. Equivalence verdicts are "
+            "descriptive only and must not be cited as confirmatory")
     if not valid_seeds:
         status = 'invalid'
         claims = []
@@ -1006,6 +1372,8 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         status = 'confirmatory'
         claims = ['descriptive', 'paired_inference_at_planned_alpha',
                   'directional_claim_at_sesoi']
+        if equivalence_supported:
+            claims.append('practical_equivalence_at_margin')
     analysis_planning = None
     if population_provided and n_analyzed is not None:
         # Realized sensitivity of the population that was actually
@@ -1033,13 +1401,21 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'population_errors': population_errors,
         'planning': planning,
         'planning_at_analyzed_n': analysis_planning,
+        'equivalence': equivalence,
+        'equivalence_claim_allowed': (
+            None if equivalence is None
+            else bool(equivalence_supported and status == 'confirmatory')),
+        'design_warnings': design_warnings,
         'claims_allowed': claims,
         'interpretation': {
             'confirmatory': ('the seed budget reaches the pre-registered '
                              'required n, the full planned contrast family '
                              'is present, and the required controls are '
                              'present; corrected paired inference may be '
-                             'reported as confirmatory'),
+                             'reported as confirmatory. A practical-'
+                             'equivalence claim additionally requires '
+                             'equivalence_claim_allowed=True, which uses '
+                             'the separate TOST margin and family'),
             'reduced_family': (
                 'the run reaches the required n only because it tests a '
                 'subset of the pre-registered contrast family; report it as '
@@ -1301,6 +1677,20 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
         status = 'pilot_is_screening_only'
     recommended = max([n for n in (required, conservative) if n is not None],
                       default=None)
+    equivalence = pooled_plan.get('equivalence') or {}
+    required_equivalence = equivalence.get('required_seeds_at_zero')
+    # The equivalence requirement is more sensitive to the SD than the
+    # superiority requirement; report the conservative (max-SD) companion
+    # next to it so a pilot cannot under-budget the TOST endpoint.
+    required_equivalence_conservative = None
+    if equivalence and sd_info.get('sd_max') is not None \
+            and sd_info['sd_max'] > 0:
+        conservative_plan = planning_report(
+            plan, seeds=plan['planned_seeds'], family_size=family,
+            sd=sd_info['sd_max'])
+        required_equivalence_conservative = (
+            conservative_plan.get('equivalence') or {}
+        ).get('required_seeds_at_zero')
     return {
         'plan_id': plan_id,
         'status': status,
@@ -1324,6 +1714,9 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
         'pilot_power_at_sesoi': pooled_plan['planned_power'],
         'required_seeds_pooled_sd': required,
         'required_seeds_conservative': conservative,
+        'required_seeds_equivalence': required_equivalence,
+        'required_seeds_equivalence_conservative':
+            required_equivalence_conservative,
         'recommended_seeds': recommended,
         'planned_confirmatory_seeds': plan['planned_seeds'],
         'recommendation': (
@@ -1333,6 +1726,16 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
             ('the pilot is a screening run: plan the confirmatory run at '
              f'n >= {recommended} seeds, then re-run the audit; do not '
              'promote the pilot rows themselves to confirmatory evidence')),
+        'equivalence_recommendation': (
+            'this plan makes no TOST equivalence claim'
+            if not equivalence else
+            (f'equivalence at margin {equivalence.get("margin")} needs '
+             f'{required_equivalence} seeds at the pooled SD'
+             + (f' (or {required_equivalence_conservative} at the '
+                'conservative max SD)'
+                if required_equivalence_conservative is not None else '')
+             + '; the superiority recommendation above is not sufficient '
+             'for a practical-equivalence claim')),
         'caveat': (
             'the pilot SD is estimated from few seed pairs and is itself '
             'uncertain; the conservative recommendation uses the largest '
@@ -1421,7 +1824,7 @@ def write_design_manifest(path: str, *, plan_ids=None,
 
 def _print_table(manifest: dict) -> None:
     header = (f"{'plan':<16} {'n':>3} {'family':>6} {'SESOI':>6} "
-              f"{'SD':>5} {'need':>5} {'power':>6}  status")
+              f"{'SD':>5} {'need':>5} {'power':>6} {'eq_n':>5}  status")
     print(header)
     print('-' * len(header))
     for row in manifest['results']:
@@ -1430,12 +1833,19 @@ def _print_table(manifest: dict) -> None:
                  else f"{p['planned_power']:.2f}")
         need = ('n/a' if p['required_seeds'] is None
                 else str(p['required_seeds']))
+        eq = p.get('equivalence') or {}
+        eq_need = ('-' if eq.get('required_seeds_at_zero') is None
+                   else str(eq['required_seeds_at_zero']))
         print(f"{row['plan_id']:<16} {row['n_seeds']:>3} "
               f"{p['family_size']:>6} {p['sesoi']:>6.2f} "
-              f"{p['assumed_sd']:>5.2f} {need:>5} {power:>6}  "
-              f"{row['status']}")
+              f"{p['assumed_sd']:>5.2f} {need:>5} {power:>6} "
+              f"{eq_need:>5}  {row['status']}")
     print('\nPlanning is normal-approximation; status=screening means the '
           'seed budget is below the pre-registered confirmatory n.')
+    print('eq_n is the separate TOST budget at the registered equivalence '
+          'margin; "-" means the plan makes no equivalence claim. A plan can '
+          'be confirmatory_ready for superiority and still not support an '
+          'equivalence claim.')
 
 
 def main(argv=None) -> int:
@@ -1469,7 +1879,9 @@ def main(argv=None) -> int:
                 print(f'  - {error}')
             return 1
         print(f'[experiment_design] {len(PLANS)} plans valid; every '
-              'declared confirmatory budget reaches its target power')
+              'declared confirmatory budget reaches its target power, and '
+              'every equivalence endpoint either reaches its TOST budget or '
+              'is marked required_for_claim=False')
         return 0
 
     plan_ids = args.plan or list(PLAN_IDS)

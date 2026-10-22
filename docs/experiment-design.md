@@ -42,6 +42,7 @@ same problem appears in subtler forms:
 | `endpoint` / `direction` | the outcome and its interpretation |
 | `sesoi` | smallest effect of interest, in endpoint units |
 | `assumed_sd` | working per-seed difference SD used for planning |
+| `equivalence` | optional TOST block: margin, family, alpha, target power, and whether an equivalence claim is required |
 | `alpha` / `planned_family_size` / `alternative` | the analysis family and correction |
 | `target_power` | planning target (80% by default) |
 | `screening_seeds` | the cheap default budget, explicitly non-confirmatory |
@@ -78,6 +79,69 @@ exact sign and sign-flip permutation tests and the paired t-test in
 `multi_seed_stats`; the normal approximation is slightly optimistic at the
 5-7-seed scale.
 
+## Superiority and practical equivalence are different budgets
+
+The registry contains **two** pre-specified effects, not one:
+
+* `sesoi` (0.10 accuracy points) is the smallest **superiority** difference
+  the confirmatory run is powered to detect;
+* `equivalence.margin` (0.05 accuracy points) is the **TOST** margin:
+  differences inside `±0.05` are called practically the same.
+
+They answer different questions and need different sample sizes. For a
+seed-paired design with per-seed difference SD `sd`, the number of seed pairs
+needed to *declare* equivalence at a true difference of zero is
+
+```
+n_eq = ceil(((z_{1-alpha/f} + z_{1-beta/2}) * sd / margin)^2)
+```
+
+where `alpha` is the family-wise alpha and `f` is the TOST family size. The
+`z_{1-beta/2}` term (rather than the superiority `z_{1-beta}`) appears because
+the `(1-2*alpha)` interval must clear the margin on **both** sides. The
+function is `experiment_design.equivalence_seeds_required`; the forward power
+is `equivalence_power`.
+
+The TOST family is wider than the superiority family. `run_quality` applies
+one Holm correction over *every* operator pair in a cell (21 pairs for the
+default seven operators), not just the five vs-softmax contrasts, and
+`run_ablation` uses one family over all contrast rows. At `sd = 0.10`,
+`margin = 0.05`, and 80% target power the planning report gives:
+
+| plan | registered n | TOST family | TOST n at margin 0.05 |
+|---|---:|---:|---:|
+| `exp4_mqar` | 11 | 21 | 68 |
+| `exp5_ratio` | 14 | 6 | 55 |
+| `exp5b_matrix` | 14 | 21 | 68 |
+
+At the registered budgets and the **planning** SD, the `(1-2*alpha)`
+interval half-width already exceeds 0.05, so with a sample SD at the planning
+value no observed mean could produce an equivalence verdict:
+`planned_power_at_zero` is 0 and `minimum_supportable_margin_at_n` is
+0.098-0.124, above the registered margin.
+(If a *pre-run pilot* shows a much smaller SD, the planning report recomputes
+from that SD; plugging the run's own realized SD back in to upgrade a
+post-hoc TOST is circular and is not a confirmatory design.)
+Those plans therefore record `required_for_claim: False`. Equivalence is a
+secondary/descriptive endpoint for them; only an equivalence-powered run may
+support a "practically the same" claim. This is deliberate and auditable, not
+an omission:
+
+* `planning_report(plan)['equivalence']` reports the margin, TOST family,
+  corrected alpha, `required_seeds_at_zero`, the realized power at zero /
+  half-margin / margin edge, `minimum_supportable_margin_at_n`, and
+  `supports_equivalence_at_planned_n`;
+* `audit_run` returns `equivalence_claim_allowed` and adds
+  `practical_equivalence_at_margin` to `claims_allowed` **only** when the
+  seed budget supports it;
+* an underpowered TOST produces a `design_warnings` entry; a
+  `required_for_claim: True` plan whose budget does not reach `n_eq` fails
+  `validate_plan`, so the registry cannot claim a powered equivalence test
+  it does not have.
+
+`exp8_mechanism` intentionally has no equivalence block: that runner reports
+non-significance as inconclusive and makes no TOST claim.
+
 ## Statuses and claims
 
 `audit_run(plan_id, seeds=..., levels=..., family_size=...,
@@ -85,7 +149,7 @@ analyzed_seeds=...)` compares an actual run with the plan:
 
 | Status | Meaning | Allowed claims |
 |---|---|---|
-| `confirmatory` | seed budget reaches the required n, the full planned family is present, required controls are present, and the analyzed population is the complete requested block | corrected paired inference at the planned alpha |
+| `confirmatory` | seed budget reaches the required n, the full planned family is present, required controls are present, and the analyzed population is the complete requested block | corrected paired inference at the planned alpha; a practical-equivalence claim additionally requires `equivalence_claim_allowed=True` |
 | `reduced_family` | the seed budget is adequate only for a subset of the pre-registered contrast family | confirmatory only for the tested subset |
 | `screening` | fewer seeds than required (or a larger-than-planned family) | descriptive / exploratory inference only |
 | `incomplete_attrition` | the analyzed seed block is smaller than the requested block, or contains seeds outside it (see below) | descriptive; complete-case paired inference only |
@@ -170,10 +234,13 @@ rung) are not treatments and are excluded from the SD estimate.
 
 The report returns `required_seeds_pooled_sd`,
 `required_seeds_conservative` (using the largest per-contrast SD) and
-`recommended_seeds`. A pilot is **never** confirmatory: the same rows cannot
-both choose the sample size and test the hypothesis, so
-`pilot_is_confirmatory` is always `False`, even when the pilot happens to have
-enough seeds.
+`recommended_seeds`. It also returns `required_seeds_equivalence` and
+`required_seeds_equivalence_conservative` when the plan registers a TOST
+endpoint; those are separate, usually much larger numbers, and the
+superiority `recommended_seeds` is not sufficient for an equivalence claim. A
+pilot is **never** confirmatory: the same rows cannot both choose the sample
+size and test the hypothesis, so `pilot_is_confirmatory` is always `False`,
+even when the pilot happens to have enough seeds.
 
 The SD estimate from a small pilot is itself uncertain, which is why the
 conservative recommendation uses the maximum rather than the pooled estimate.
@@ -227,7 +294,17 @@ and never upgrades a claim. See
 ## Limitations
 
 * The normal approximation is optimistic at small n; treat the target power as
-  a floor to beat, not a guarantee.
+  a floor to beat, not a guarantee. The TOST planning formula is the standard
+  normal shortcut: it uses `z` rather than the `t` critical value and ignores
+  the correlation between the two one-sided statistics, so `n_eq` is a lower
+  bound and the realized power is a little below the nominal target at
+  moderate n.
+* Superiority and equivalence are separate budgets. A run powered to detect
+  the SESOI is not automatically powered to declare equivalence at the tighter
+  TOST margin, and a non-significant superiority test is never evidence of
+  equivalence. The current registry records `required_for_claim: False` for
+  every equivalence endpoint, so those TOST verdicts are descriptive; an
+  equivalence claim needs a dedicated run at `required_seeds_at_zero`.
 * The assumed SD is an assumption. Replace it with a pilot estimate and use
   the conservative recommendation before committing a confirmatory budget.
 * The family size used for planning is a conservative model of the tests the

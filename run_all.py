@@ -209,10 +209,13 @@ def _write_experiment_design_manifest(profile: str) -> dict:
         'results/experiment_design.json', manifest=manifest)
     for row in manifest['results']:
         plan = row['planning']
+        eq = plan.get('equivalence') or {}
         print(f"[design] {row['plan_id']}: n={row['n_seeds']} "
               f"required={plan['required_seeds']} "
               f"power={plan['planned_power']} "
-              f"status={row['status']}")
+              f"status={row['status']} "
+              f"eq_n={eq.get('required_seeds_at_zero', '-')} "
+              f"eq_status={eq.get('status', '-')}")
     return {
         'path': 'results/experiment_design.json',
         'run_profile': profile,
@@ -223,6 +226,11 @@ def _write_experiment_design_manifest(profile: str) -> dict:
                 'status': row['status'],
                 'required_seeds': row['planning']['required_seeds'],
                 'planned_power': row['planning']['planned_power'],
+                'equivalence_required_seeds': (
+                    (row['planning'].get('equivalence') or {}).get(
+                        'required_seeds_at_zero')),
+                'equivalence_status': row['planning'].get(
+                    'equivalence_status'),
             }
             for row in manifest['results']
         },
