@@ -145,10 +145,12 @@ def test_sweep_summary_prefers_saturation_over_loss_shape():
 
     rows = [
         {'ratio': '3:1:1', 'curve_verdict': 'overfitting',
-         'n_seeds_at_ceiling': 2, 'curve_verdict_stable': True,
+         'n_seeds_ok': 5, 'n_seeds_at_ceiling': 4,
+         'curve_verdict_stable': True,
          'mean_generalization_gap': 0.1, 'n_seeds_budget_limited': 0},
         {'ratio': '2:2:1', 'curve_verdict': 'overfitting',
-         'n_seeds_at_ceiling': 2, 'curve_verdict_stable': True,
+         'n_seeds_ok': 5, 'n_seeds_at_ceiling': 4,
+         'curve_verdict_stable': True,
          'mean_generalization_gap': 0.2, 'n_seeds_budget_limited': 0},
     ]
     summary = _curve_diagnosis_summary(rows, 'ratio')
@@ -156,10 +158,17 @@ def test_sweep_summary_prefers_saturation_over_loss_shape():
     assert 'too easy' in summary['interpretation']
     assert 'regularization' not in summary['recommended_action']
 
+    # One lucky seed at 100% must not label the whole PROBE too easy.
+    rows[1]['n_seeds_at_ceiling'] = 1
+    summary = _curve_diagnosis_summary(rows, 'ratio')
+    assert summary['regime'] == 'overfitting'
+    assert summary['rows_partially_saturated'] == ['2:2:1']
+
     # Without universal saturation, the loss-shape verdict still drives.
     rows[1]['n_seeds_at_ceiling'] = 0
     summary = _curve_diagnosis_summary(rows, 'ratio')
     assert summary['regime'] == 'overfitting'
+    assert summary['rows_partially_saturated'] == []
 
 
 # ---------------------------------------------------------------------------

@@ -2937,9 +2937,24 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         g = r.get('mean_generalization_gap')
         if g is not None and math.isfinite(float(g)):
             gaps.append(float(g))
+    def _row_saturated(r) -> bool:
+        n_ceiling = int(r.get('n_seeds_at_ceiling') or 0)
+        if n_ceiling <= 0:
+            return False
+        n_ok = int(r.get('n_seeds_ok') or 0)
+        # A single lucky seed at 100% is not evidence that the PROBE is too
+        # easy; the row has to be at the ceiling for at least half of its
+        # surviving seeds. Artifacts written before n_seeds_ok was carried
+        # keep the old any-seed behaviour.
+        return (n_ceiling * 2 >= n_ok) if n_ok else True
+
     saturated = sorted(
         str(r.get(label_key))
-        for r in counted if r.get('n_seeds_at_ceiling'))
+        for r in counted if _row_saturated(r))
+    partially_saturated = sorted(
+        str(r.get(label_key))
+        for r in counted
+        if r.get('n_seeds_at_ceiling') and not _row_saturated(r))
     unstable = sorted(
         str(r.get(label_key))
         for r in counted if r.get('curve_verdict_stable') is False)
@@ -2955,6 +2970,7 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
         'max_generalization_gap': max(gaps) if gaps else None,
         'saturated_at_ceiling': saturated,
+        'rows_partially_saturated': partially_saturated,
         'rows_with_unstable_verdict': unstable,
         'rows_still_improving_at_budget': still_improving,
         'regime': None,
