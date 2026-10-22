@@ -421,6 +421,22 @@ def test_pareto_frontier_skips_malformed_values_instead_of_crashing():
     assert rows[4]['pareto']['dominated_by'] == str(['unhashable'])
 
 
+def test_pareto_ratios_stay_finite_for_tiny_costs():
+    """A finite subnormal cost can overflow the derived efficiency ratio."""
+    tiny = float.fromhex('0x0.0000000000001p-1022')  # smallest subnormal
+    rows = [{'op': 'subnormal', 'mean_acc': 1.0,
+             'mean_train_time_s': tiny, 'n_params': tiny,
+             'mean_eval_ms_per_sample': tiny}]
+    rep = pareto_frontier(rows, cost_keys=('mean_train_time_s',))
+    point = rep['points']['subnormal']
+    assert point['acc_per_train_second'] is None
+    assert point['acc_per_1k_params'] is None
+    assert point['acc_per_eval_ms'] is None
+    json.dumps(rep, allow_nan=False)
+    annotate_rows_with_pareto(rows, cost_keys=('mean_train_time_s',))
+    json.dumps(rows, allow_nan=False)
+
+
 def test_confusion_matrix_rejects_out_of_range_explicit_classes():
     """An explicit num_classes must bound every observed id, not alias them."""
     with pytest.raises(ValueError):

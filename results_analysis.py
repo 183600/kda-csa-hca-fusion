@@ -697,6 +697,20 @@ def _finite_float_or_none(value):
     return number if math.isfinite(number) else None
 
 
+def _safe_ratio(numerator, denominator) -> float | None:
+    """Ratio with a non-positive / non-finite denominator, or overflow → None."""
+    if denominator is None:
+        return None
+    denominator = float(denominator)
+    if not math.isfinite(denominator) or denominator <= 0.0:
+        return None
+    try:
+        ratio = float(numerator) / denominator
+    except (OverflowError, ZeroDivisionError):
+        return None
+    return ratio if math.isfinite(ratio) else None
+
+
 def _pareto_row_keys(rows: Sequence[Mapping], name_key: str) -> list[str]:
     """Unique keys for the rows, disambiguating repeated names.
 
@@ -782,14 +796,12 @@ def pareto_frontier(rows: Sequence[Mapping],
         points[key] = {
             'accuracy': acc,
             'costs': costs,
-            'acc_per_train_second': (
-                acc / costs['mean_train_time_s']
-                if costs.get('mean_train_time_s', 0.0) > 0 else None),
-            'acc_per_1k_params': (
-                acc / (costs['n_params'] / 1000.0)
+            'acc_per_train_second': _safe_ratio(
+                acc, costs.get('mean_train_time_s')),
+            'acc_per_1k_params': _safe_ratio(
+                acc, (costs['n_params'] / 1000.0)
                 if costs.get('n_params', 0.0) > 0 else None),
-            'acc_per_eval_ms': (
-                acc / float(eval_ms) if eval_ms else None),
+            'acc_per_eval_ms': _safe_ratio(acc, eval_ms),
         }
 
     names = list(points)
