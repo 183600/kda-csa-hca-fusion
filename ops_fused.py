@@ -425,9 +425,11 @@ class HybridConfig:
                     f"with no {name.replace('n_', '').upper()} layers "
                     f"instead of crashing loudly.")
         # Only KDA uses the GVA expansion; a CSA/HCA-only explicit layout
-        # must not be constrained by an unused KDA head ratio.
+        # must not be constrained by an unused KDA head ratio. Ratio mode
+        # fills the memory slots with ``memory_type``, so a Mamba-2 / RWKV-7
+        # route does not build any KDA layer even when ``n_kda > 0``.
         if self.layout is None:
-            uses_kda = self.n_kda > 0
+            uses_kda = self.memory_type == 'kda' and self.n_kda > 0
         elif isinstance(self.layout, (list, tuple)):
             uses_kda = any(
                 kind == 'kda'

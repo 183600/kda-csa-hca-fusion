@@ -278,6 +278,33 @@ def test_hybrid_config_rejects_coerced_and_nonfinite_fields():
         raise AssertionError('total_layers=True was silently accepted')
 
 
+def test_kda_gva_constraint_is_not_applied_to_other_memory_routes():
+    """The KDA-only HV % H constraint must follow the built layer kinds.
+
+    In ratio mode the memory slots are filled with ``memory_type``; a
+    Mamba-2 / RWKV-7 route builds no KDA layer, so an arbitrary
+    Q/K-to-V head ratio there must not be rejected for an unused operator.
+    """
+    from ops_fused import HybridAttentionStack, HybridConfig
+
+    common = dict(d_model=32, n_heads_qk=3, n_heads_v=4,
+                  head_dim_k=8, head_dim_v=8, n_kda=1, n_csa=0, n_hca=0,
+                  mamba_expand=2, mamba_headdim=16, mamba_d_state=8,
+                  mamba_d_conv=4)
+    # Still rejected for the KDA route, where GVA is real.
+    try:
+        HybridConfig(**common, memory_type='kda')
+    except ValueError:
+        pass
+    else:  # pragma: no cover - must not regress the real constraint
+        raise AssertionError('KDA route accepted a non-integral GVA factor')
+
+    # Valid for the Mamba-2 route (no KDA layer is constructed).
+    cfg = HybridConfig(**common, memory_type='mamba2')
+    stack = HybridAttentionStack(cfg, total_layers=1)
+    assert stack.layout == ['mamba2']
+
+
 def test_kda_g_clamp_rejects_positive_infinity_and_nan():
     """A positive-infinity lower bound is never a meaningful gate clamp.
 
