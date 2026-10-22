@@ -212,6 +212,7 @@ def probe_policies(cfg, *, T: int, batch: int, policies: tuple[str, ...],
     gradient parity, retained activation bytes (probe), and a min-of-reps
     forward+backward wall time. The analytic overhead model is attached.
     """
+    set_global_seed(seed, deterministic=True)
     torch.manual_seed(seed)
     layout = _layout_for(cfg)
     stack = HybridAttentionStack(cfg, total_layers=len(layout)).to(device)
