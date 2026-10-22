@@ -633,6 +633,42 @@ def test_pilot_without_two_common_seeds_is_insufficient():
     assert report['observed_sd'] is None
 
 
+def test_pilot_sd_from_rows_keeps_extreme_finite_differences_json_safe():
+    """Finite 1e308 differences square past the float range.
+
+    The pooled within-pair SD is still representable (1.41e308), so the
+    extraction must not turn it into ``inf`` and must remain strict-JSON
+    serializable; ordinary pilots keep their historical statistics.
+    """
+    rows = [
+        {'op': 'softmax', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 0.0},
+                      {'seed': 43, 'final_acc': 0.0}]},
+        {'op': 'kda', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 1e308},
+                      {'seed': 43, 'final_acc': -1e308}]},
+    ]
+    info = D.pilot_sd_from_rows(rows, group_key='op', reference='softmax',
+                                cell_keys=['task', 'n_kv'])
+    assert info is not None
+    assert math.isfinite(info['sd_pooled'])
+    assert math.isfinite(info['sd_max'])
+    json.dumps(info, allow_nan=False)
+
+    # Mixed hashable seed types must not abort the extraction on sort().
+    mixed = [
+        {'op': 'softmax', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 0.0},
+                      {'seed': '43', 'final_acc': 0.0}]},
+        {'op': 'kda', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 0.1},
+                      {'seed': '43', 'final_acc': 0.2}]},
+    ]
+    info = D.pilot_sd_from_rows(mixed, group_key='op', reference='softmax',
+                                cell_keys=['task', 'n_kv'])
+    assert info is not None and info['n_differences'] == 2
+
+
 # ---------------------------------------------------------------------------
 # Manifest + CLI
 # ---------------------------------------------------------------------------

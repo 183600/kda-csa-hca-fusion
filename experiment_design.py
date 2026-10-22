@@ -1472,8 +1472,49 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
 # Pilot -> power -> confirmatory
 # ---------------------------------------------------------------------------
 
+def _safe_mean(values):
+    """Mean of finite values without overflowing the intermediate sum."""
+    n = len(values)
+    if n == 0:
+        return None
+    total = sum(values)
+    if math.isfinite(total):
+        return total / n
+    scale = max(abs(v) for v in values)
+    if scale == 0.0:
+        return 0.0
+    mean = scale * (math.fsum(v / scale for v in values) / n)
+    if not math.isfinite(mean):
+        raise DesignError(
+            f'mean is not finite after scaled summation (scale={scale!r})')
+    return mean
+
+
 def _sample_sd(values):
-    return statistics.stdev(values) if len(values) >= 2 else None
+    """Sample SD, falling back to scaled arithmetic on an overflow.
+
+    ``statistics.stdev`` is exact for ordinary pilots but can raise /
+    return a non-finite value when two finite differences are near the
+    float limits (``1.7e308 - -1.7e308`` overflows its float conversion).
+    The fallback evaluates the same SD after dividing every value by a
+    common scale, so ordinary samples keep the historical result.
+    """
+    if len(values) < 2:
+        return None
+    try:
+        sd = statistics.stdev(values)
+    except (OverflowError, ValueError):
+        sd = None
+    if sd is not None and math.isfinite(sd):
+        return sd
+    scale = max(abs(v) for v in values)
+    if scale == 0.0:
+        return 0.0
+    scaled = [v / scale for v in values]
+    mean = _safe_mean(scaled)
+    var = math.fsum((v - mean) ** 2 for v in scaled) / (len(values) - 1)
+    sd = scale * math.sqrt(var)
+    return sd if math.isfinite(sd) else None
 
 
 def pilot_sd_from_rows(rows, *, group_key: str, reference,
@@ -1578,11 +1619,16 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
         for group, acc in groups.items():
             if group == reference:
                 continue
-            common = sorted(set(ref) & set(acc))
+            # Seed ids are hashable but not necessarily mutually ordered
+            # (an integer-vs-string mix would make ``sorted`` raise). The
+            # order is irrelevant to the paired statistics, so a stable
+            # string key keeps a malformed seed type from aborting the
+            # whole pilot extraction.
+            common = sorted(set(ref) & set(acc), key=str)
             if len(common) < 2:
                 continue
             diffs = [acc[seed] - ref[seed] for seed in common]
-            mean_diff = sum(diffs) / len(diffs)
+            mean_diff = _safe_mean(diffs)
             sd = _sample_sd(diffs)
             if sd is None:
                 continue
@@ -1601,11 +1647,36 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
     # 2-seed contrast with a huge SD dominate.
     ss = 0.0
     dof = 0
-    for pair in pairs:
-        mean_diff = pair['mean_diff']
-        ss += sum((d - mean_diff) ** 2 for d in pair['diffs'])
-        dof += pair['n'] - 1
-    pooled = math.sqrt(ss / dof) if dof > 0 else None
+    try:
+        for pair in pairs:
+            mean_diff = pair['mean_diff']
+            ss += math.fsum((d - mean_diff) ** 2 for d in pair['diffs'])
+            dof += pair['n'] - 1
+    except OverflowError:
+        # Squaring a finite ~1e308 difference raises instead of producing
+        # inf on CPython; mark the raw sum as unusable and use the scaled
+        # path below.
+        ss = math.inf
+        dof = sum(pair['n'] - 1 for pair in pairs)
+    pooled = None
+    if dof > 0:
+        if math.isfinite(ss):
+            pooled = math.sqrt(ss / dof)
+            if not math.isfinite(pooled):
+                pooled = None
+        if pooled is None:
+            # Finite differences up to ~1e154 square to values the float
+            # range cannot hold; evaluate the same pooled variance in
+            # scaled units so the reported SD stays finite.
+            scale = max(abs(d) for pair in pairs for d in pair['diffs'])
+            if scale == 0.0:
+                pooled = 0.0
+            else:
+                ss_scaled = math.fsum(
+                    ((d / scale) - (pair['mean_diff'] / scale)) ** 2
+                    for pair in pairs for d in pair['diffs'])
+                candidate = scale * math.sqrt(ss_scaled / dof)
+                pooled = candidate if math.isfinite(candidate) else None
     sds = [pair['sd_diff'] for pair in pairs]
     median_sd = statistics.median(sds)
     return {
