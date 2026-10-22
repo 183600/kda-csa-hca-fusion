@@ -876,7 +876,7 @@ def paper_aligned_bytes(cfg: HybridConfig, components: dict, *,
     }
     if policy == 'pure_bf16':
         bf16_total = total
-        ratio = 1.0
+        ratio = None if total == 0.0 else 1.0
     else:
         bf16_total = paper_aligned_bytes(
             cfg, components, policy='pure_bf16')['total_bytes']
