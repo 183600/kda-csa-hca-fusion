@@ -82,6 +82,9 @@ from results_schema import (  # noqa: E402
 EXP_REPS = 400
 EXP_NBOOT = 500
 EXP_SEED = 0
+# Fixed model-construction draw, independent of the calibration seed. The
+# same model is used for both sides of the decode-vs-prefill parity probe.
+MODEL_CONSTRUCTION_SEED = 2027
 
 # Decode-vs-prefill geometry: small enough for a CPU CI child process,
 # large enough that the incremental caches complete several compressed
@@ -108,7 +111,7 @@ def _tiny_hybrid_lm(device):
     from ops_fused import HybridConfig
     from train_lm_autodl import LMWithHybrid
 
-    torch.manual_seed(2027)
+    torch.manual_seed(MODEL_CONSTRUCTION_SEED)
     cfg = HybridConfig(
         d_model=32, n_heads_qk=2, n_heads_v=2,
         head_dim_k=8, head_dim_v=8,
@@ -236,11 +239,10 @@ def main() -> int:
     n_boot = _env_int('PPL_CAL_NBOOT', EXP_NBOOT)
     seed = _env_int('PPL_CAL_SEED', EXP_SEED)
     # Seed every RNG family, not just torch's global generator: the
-    # calibration code uses local random.Random streams, while model
-    # construction draws from torch. torch.manual_seed(0) keeps the model
-    # stream fixed exactly as the committed protocol describes.
+    # calibration code uses local random.Random streams. ``_tiny_hybrid_lm``
+    # then fixes the model-construction draw to MODEL_CONSTRUCTION_SEED, the
+    # value recorded in both the result metadata and the run manifest.
     set_global_seed(seed, deterministic=True)
-    torch.manual_seed(0)
 
     print(f'[exp15] calibration grid (reps={reps}, n_boot={n_boot}, '
           f'seed={seed})...')
@@ -296,8 +298,8 @@ def main() -> int:
             'scheme': ('set_global_seed(seed) covers Python/NumPy/torch/'
                        'CUDA; ppl_calibration uses local random.Random '
                        f'streams from (seed={seed}, scenario, replicate); '
-                       'torch manual_seed(0) for model construction, '
-                       'Generator(3) for windows'),
+                       f'torch.manual_seed({MODEL_CONSTRUCTION_SEED}) for '
+                       'model construction, Generator(3) for windows'),
         },
         'provenance': capture_provenance(),
     }
@@ -320,7 +322,7 @@ def main() -> int:
             'scenarios': PC.default_scenarios(),
             'method': report['method'],
             'decode_prefill_protocol': metadata['decode_prefill_protocol'],
-            'model_construction_seed': 2027,
+            'model_construction_seed': MODEL_CONSTRUCTION_SEED,
             'window_generator_seed': 3,
         },
         data={
