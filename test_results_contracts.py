@@ -538,6 +538,31 @@ def test_contrast_annotation_reports_effect_size_and_power_plan():
     assert small_summary['n_significant_but_below_min_effect'] == 1
 
 
+def test_directional_contrast_contradicted_and_one_sided_exact_p():
+    """A unanimous negative sweep falsifies a directional prediction.
+
+    The exact one-sided sign-flip p for n unanimous pairs is 2^-n (the
+    old 2^-(n-1) was the two-sided value). With n=5 and one contrast the
+    corrected alpha is 0.05, so the negative sweep must be significant
+    and labelled ``contradicted`` rather than ``not_supported``.
+    """
+    rows = [
+        _matrix_row('KDA-A', 'kda', (0.50, 0.50, 0.50, 0.50, 0.50)),
+        _matrix_row('KDA-B', 'kda', (0.10, 0.10, 0.10, 0.10, 0.10)),
+    ]
+    contrasts = _matrix_contrast_report(rows)
+    summary = _annotate_contrast_significance(contrasts)
+    c = contrasts[0]
+    assert c['mean_diff'] == pytest.approx(-0.4)
+    assert c['t_stat'] is None
+    assert c['significant_bonferroni'] is True
+    assert c['significant_negative'] is True
+    assert c['significant_positive'] is False
+    assert c['hypothesis_status'] == 'contradicted'
+    assert summary['n_contradicted'] == 1
+    assert summary['n_supported'] == 0
+
+
 def test_two_sided_contrast_planning_uses_the_tail_alpha_once():
     """A two-sided row's MDE must use its one-sided tail threshold once.
 

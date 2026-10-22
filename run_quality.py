@@ -3670,7 +3670,7 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
                 ref_better = True
             elif (reverse['t_stat'] is None and reverse['all_positive']
                   and reverse['n_pairs'] >= 2 and reverse_alpha is not None
-                  and 2.0 ** (-(reverse['n_pairs'] - 1)) <= reverse_alpha):
+                  and 2.0 ** (-reverse['n_pairs']) <= reverse_alpha):
                 ref_better = True
         status = 'contradicted' if ref_better else 'not_supported'
         verdict = {
@@ -4808,10 +4808,10 @@ def main():
                       and n_pairs >= 2):
                     # Zero-variance unanimous improvement (every seed
                     # strictly better): the exact one-sided sign-flip
-                    # p-value of the all-positive pattern is 2^{-(n-1)}; it
+                    # p-value of the all-positive pattern is 2^{-n}; it
                     # counts as significant only when that clears the
                     # Bonferroni-corrected alpha (recorded via t_stat=None).
-                    exact_p = 2.0 ** (-(n_pairs - 1))
+                    exact_p = 2.0 ** (-n_pairs)
                     sig = bool(alpha_pair is not None
                                and exact_p <= alpha_pair)
             stats['t_crit_bonferroni'] = crit_pair

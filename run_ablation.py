@@ -2524,10 +2524,10 @@ def _annotate_contrast_significance(contrasts: list,
         'null_hypothesis': ('H0: the mean seed-paired accuracy difference '
                             'is zero (for directional contrasts, against '
                             'the pre-registered positive direction)'),
-        'zero_variance_rule': ('a UNANIMOUS all-positive sweep of a '
-                               'directional contrast (t_stat=None) counts '
-                               'as significant only if the exact one-sided '
-                               'sign-flip p-value 2^{-(n-1)} clears the '
+        'zero_variance_rule': ('a UNANIMOUS sweep of a directional '
+                               'contrast (t_stat=None) counts as significant '
+                               'in that direction only if the exact one-sided '
+                               'sign-flip p-value 2^{-n} clears the '
                                'corrected alpha; all other zero-variance '
                                'rows can never reject'),
         'n_significant': 0,
@@ -2566,18 +2566,29 @@ def _annotate_contrast_significance(contrasts: list,
             alpha_test = alpha / n_family if n_family else None
             crit = (_bonferroni_crit_q(n, alpha=alpha_test)
                     if (alpha_test is not None and n >= 2) else None)
-            sig = bool(crit is not None and t_stat is not None
-                       and t_stat > crit)
-            if t_stat is None and c.get('unanimous') == 'positive' \
-                    and n >= 2 and mean_diff is not None and mean_diff > 0:
-                # Zero-variance unanimous improvement: the exact
-                # one-sided sign-flip permutation p-value of the
-                # all-positive pattern is 2^{-(n-1)}; it counts as
-                # significant only when that clears the corrected alpha
-                # (e.g. n >= 9 at a 10-contrast family with alpha=0.05).
+            # The pre-registered direction is positive, but a significant
+            # result in the OPPOSITE tail falsifies the prediction (see
+            # each hypothesis's ``falsified_if``). Compute both one-sided
+            # tails so the ``contradicted`` branch below is reachable.
+            sig_pos = bool(crit is not None and t_stat is not None
+                           and t_stat > crit)
+            sig_neg = bool(crit is not None and t_stat is not None
+                           and t_stat < -crit)
+            if t_stat is None and n >= 2 and mean_diff is not None \
+                    and alpha_test is not None:
+                # Zero-variance unanimous sweep: the exact one-sided
+                # sign-flip permutation p-value of the all-positive (or
+                # all-negative) pattern is 2^{-n}; it counts as
+                # significant only when that clears the corrected alpha.
                 # Never claim a degenerate 2-seed sweep as evidence.
-                exact_p = 2.0 ** (-(n - 1))
-                sig = bool(alpha_test is not None and exact_p <= alpha_test)
+                exact_p = 2.0 ** (-n)
+                if c.get('unanimous') == 'positive' and mean_diff > 0:
+                    sig_pos = bool(exact_p <= alpha_test)
+                elif c.get('unanimous') == 'negative' and mean_diff < 0:
+                    sig_neg = bool(exact_p <= alpha_test)
+            sig = bool(sig_pos or sig_neg)
+            c['significant_positive'] = bool(sig_pos)
+            c['significant_negative'] = bool(sig_neg)
         else:
             c['test'] = 'paired_two_sided_t'
             alpha_test = alpha / (2 * n_family) if n_family else None
@@ -2640,9 +2651,11 @@ def _annotate_contrast_significance(contrasts: list,
             sig and below_min)
 
         if direction == 'greater':
-            if sig and mean_diff is not None and mean_diff > 0:
+            if c.get('significant_positive') \
+                    and mean_diff is not None and mean_diff > 0:
                 c['hypothesis_status'] = 'supported'
-            elif sig and mean_diff is not None and mean_diff < 0:
+            elif c.get('significant_negative') \
+                    and mean_diff is not None and mean_diff < 0:
                 c['hypothesis_status'] = 'contradicted'
             else:
                 c['hypothesis_status'] = 'not_supported'
