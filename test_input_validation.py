@@ -807,6 +807,65 @@ def test_csa_hca_geometry_requires_exact_ints():
                 raise AssertionError(f'{name} accepted {key}={bad!r}')
 
 
+def test_csa_hca_validate_rope_base_even_when_rope_is_disabled():
+    """A disabled rotation must not excuse an invalid RoPE base.
+
+    ``naive_csa``/``naive_hca`` only reached the downstream ``partial_rope``
+    validator when ``rope_dim`` was active. With ``rope_dim=0`` a NaN/Inf
+    base was accepted, and a string/bool raised a bare TypeError. The cache
+    constructors validate the base unconditionally, so the direct operators
+    must too.
+    """
+    from ops_csa import naive_csa
+    from ops_hca import naive_hca
+
+    c, d, c_I, m, nh, nIh, dc = 4, 8, 2, 2, 1, 1, 4
+    W = torch.randn(c, d)
+    W_idx = torch.randn(c_I, d)
+    B_pos = torch.randn(m, c)
+    B_idx = torch.randn(m, c_I)
+    W_DQ = torch.randn(dc, d)
+    W_UQ = torch.randn(c * nh, dc)
+    W_IUQ = torch.randn(c_I * nIh, dc)
+    W_w = torch.randn(nIh, d)
+    H = torch.randn(1, 3, d)
+    for bad in (float('nan'), float('inf'), '10000', True):
+        try:
+            naive_csa(
+                H, W, W, W, W, B_pos, B_pos, W_DQ, W_UQ, W_IUQ, W_w,
+                W_idx, W_idx, B_idx,
+                m=m, topk=1, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+                rope_dim=0, rope_base=bad)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'naive_csa rope_base={bad!r} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'naive_csa rope_base={bad!r} rejected', False,
+                'no error raised')
+        try:
+            naive_hca(
+                H, W, W, B_pos, W_DQ, W_UQ,
+                m2=m, nh=nh, c=c, dc=dc,
+                rope_dim=0, rope_base=bad)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'naive_hca rope_base={bad!r} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'naive_hca rope_base={bad!r} rejected', False,
+                'no error raised')
+    # The valid disabled-RoPE path (and an explicit valid base) still works.
+    naive_csa(H, W, W, W, W, B_pos, B_pos, W_DQ, W_UQ, W_IUQ, W_w,
+              W_idx, W_idx, B_idx,
+              m=m, topk=1, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+              rope_dim=0, rope_base=10000.0)
+    naive_hca(H, W, W, B_pos, W_DQ, W_UQ,
+              m2=m, nh=nh, c=c, dc=dc, rope_dim=0, rope_base=10000.0)
+
+
 if __name__ == '__main__':
     test_gated_delta_rule_rejects_geometry_mismatch()
     test_gated_delta_rule_step_rejects_unknown_gate_type()
@@ -827,4 +886,5 @@ if __name__ == '__main__':
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()
+    test_csa_hca_validate_rope_base_even_when_rope_is_disabled()
     print('all input-validation tests passed')

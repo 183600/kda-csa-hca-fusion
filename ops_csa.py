@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import weakref
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -1639,9 +1641,17 @@ def naive_csa(
     # run_decoding) default to the paper's 64-dim partial RoPE (clamped to
     # the head dim for small geometries).
     rope_dim_eff = effective_rope_dim(rope_dim, c)
-    if rope_base <= 0:
+    # Validate the base even when RoPE is disabled: the public operators
+    # accept rope_base independently of rope_dim, and a NaN/Inf/non-real
+    # value would otherwise be silently accepted whenever rope_dim_eff == 0
+    # (then the downstream partial_rope check never runs). This matches the
+    # decoding-cache constructors, which always validate the base.
+    if (isinstance(rope_base, bool)
+            or not isinstance(rope_base, (int, float))
+            or not math.isfinite(float(rope_base)) or rope_base <= 0):
         raise ValueError(
-            f"naive_csa: rope_base={rope_base!r} must be positive")
+            f"naive_csa: rope_base={rope_base!r} must be a finite positive "
+            f"number")
     device = H.device
     # Degenerate case: empty sequence. With n_blocks=0 the downstream
     # ``csa_compress_kv_overlapped`` cannot broadcast the [B, n_blocks, m, c]

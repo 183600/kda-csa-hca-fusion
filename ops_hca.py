@@ -16,6 +16,8 @@ magnitude larger than ``m``.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -163,9 +165,17 @@ def naive_hca(
     # disables it; the model-level wrappers default to the paper's 64-dim
     # partial RoPE (clamped to the head dim for small geometries).
     rope_dim_eff = effective_rope_dim(rope_dim, c)
-    if rope_base <= 0:
+    # Validate the base even when RoPE is disabled: the public operators
+    # accept rope_base independently of rope_dim, and a NaN/Inf/non-real
+    # value would otherwise be silently accepted whenever rope_dim_eff == 0
+    # (then the downstream partial_rope check never runs). This matches the
+    # decoding-cache constructors, which always validate the base.
+    if (isinstance(rope_base, bool)
+            or not isinstance(rope_base, (int, float))
+            or not math.isfinite(float(rope_base)) or rope_base <= 0):
         raise ValueError(
-            f"naive_hca: rope_base={rope_base!r} must be positive")
+            f"naive_hca: rope_base={rope_base!r} must be a finite positive "
+            f"number")
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (see ``F.normalize`` calls below), their dot product is already a cosine
     # similarity in ``[-1, 1]``. A ``1/sqrt(c)`` scale would further shrink the
