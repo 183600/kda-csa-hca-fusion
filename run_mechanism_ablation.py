@@ -1385,12 +1385,15 @@ def main():
                 for seed_row in per_seed:
                     if not isinstance(seed_row, dict) or 'error' in seed_row:
                         continue
+                    seed = seed_row.get('seed')
+                    if isinstance(seed, bool) or not isinstance(seed, int):
+                        continue
                     acc = _finite_metric(seed_row, 'final_acc')
                     if acc is not None:
-                        baseline_acc[seed_row['seed']] = acc
+                        baseline_acc[seed] = acc
                     pr_auc = _finite_metric(seed_row, 'gold_pr_auc')
                     if pr_auc is not None:
-                        baseline_pr_auc[seed_row['seed']] = pr_auc
+                        baseline_pr_auc[seed] = pr_auc
             all_rows.append(row)
             _ci = row['ci95_acc']
             _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
