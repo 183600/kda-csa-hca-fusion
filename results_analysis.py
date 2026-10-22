@@ -507,11 +507,17 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
                            f'current one')
             record('parameters', 'fail',
                    {'non_finite': bad_params[:10], 'n_total': len(params_map)})
-        else:
+        elif param_info:
             record('parameters', 'pass',
-                   {'n_tensors': len(params_map),
+                   {'n_tensors': len(param_info),
                     'absmax': max((v['absmax'] or 0.0)
                                   for v in param_info.values())})
+        else:
+            # A non-empty map of non-tensors (e.g. ``{'w': None}``) has no
+            # parameter to triage. Report it as skipped instead of calling
+            # ``max()`` on an empty sequence.
+            record('parameters', 'skipped',
+                   'parameter map contained no tensor values')
     else:
         record('parameters', 'skipped', 'no parameters supplied')
 

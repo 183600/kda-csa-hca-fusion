@@ -1375,3 +1375,13 @@ def test_sweep_cells_match_task_defaults():
         ('long_range', 1)]
     assert run_quality._sweep_cells(['mqar', 'long_range'], [1, 2]) == [
         ('mqar', 1), ('mqar', 2), ('long_range', 1)]
+
+
+def test_nonfinite_diagnosis_skips_non_tensor_parameter_maps():
+    import json
+    for params in ({'w': None}, [None], {'w': 'not-a-tensor'}):
+        rep = diagnose_nonfinite(loss=1.0, params=params)
+        check = [c for c in rep['checks']
+                 if c['check'] == 'parameters'][0]
+        assert check['status'] == 'skipped', check
+        json.dumps(rep, allow_nan=False)
