@@ -424,6 +424,7 @@ def test_fp8_spec_and_grid():
         f'{bits_per_element(fp16_scale)}')
     for kwargs, label in [
         (dict(format='e3m4'), 'unknown format rejected'),
+        (dict(format=['e4m3fn']), 'unhashable format rejected'),
         (dict(group_size=0), 'group_size=0 rejected'),
         (dict(scale_bits=-1), 'negative scale_bits rejected'),
         (dict(power_of_two=1), 'non-bool power_of_two rejected'),

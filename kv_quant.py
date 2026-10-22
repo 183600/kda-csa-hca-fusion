@@ -167,7 +167,11 @@ class FP8Spec:
     power_of_two: bool = True
 
     def __post_init__(self) -> None:
-        if self.format not in _FP8_FORMATS:
+        # ``format`` is used as a dict key below and in the quantizer;
+        # an unhashable value (e.g. a list) would raise TypeError from the
+        # membership test instead of the documented ValueError.
+        if (not isinstance(self.format, str)
+                or self.format not in _FP8_FORMATS):
             raise ValueError(
                 f'FP8Spec.format must be one of {sorted(_FP8_FORMATS)}, '
                 f'got {self.format!r}')
