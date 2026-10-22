@@ -2814,9 +2814,16 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     # record says HOW MANY seeds showed overfitting / underfitting, instead
     # of leaving the reader to infer it from the per-seed curves.
     verdicts: dict = OrderedDict()
+    n_budget_limited = 0
+    n_val_still = 0
     for r in ok_per_seed:
-        v = (r.get('curve_diagnosis') or {}).get('verdict', 'unknown')
+        diag = r.get('curve_diagnosis') or {}
+        v = diag.get('verdict', 'unknown')
         verdicts[v] = verdicts.get(v, 0) + 1
+        if diag.get('budget_limited'):
+            n_budget_limited += 1
+        if (diag.get('signals') or {}).get('val_still_improving_at_end'):
+            n_val_still += 1
 
     # Aggregate the curve-reading fields that a final-number-only table
     # hides: how far the final weights sit past the best validation point
@@ -2943,6 +2950,16 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         'curve_diagnosis_summary': {
             'verdicts': dict(verdicts),
             'n_seeds_summarized': len(ok_per_seed),
+            # A healthy verdict does not mean the fixed-budget endpoint is
+            # converged: count the seeds whose train AND validation tails
+            # were still falling when training stopped.
+            'n_seeds_budget_limited': int(n_budget_limited),
+            'n_seeds_val_still_improving': int(n_val_still),
+            'budget_note': (
+                'budget_limited seeds were still descending on both curves '
+                'at the final checkpoint; their endpoint is not a converged '
+                'property of the operator and comparisons may reorder with '
+                'more steps.' if n_budget_limited else None),
         },
         'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
         # Best-validation regret: a positive value means the fixed-budget

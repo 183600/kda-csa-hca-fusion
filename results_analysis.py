@@ -60,8 +60,35 @@ def _head_mean(values: Sequence[float], frac: float = 0.1) -> float | None:
     return float(sum(values[:k]) / k)
 
 
+def _tail_slope(losses: Sequence[float], *, frac: float = 0.25
+                ) -> tuple[float, float | None, int]:
+    """Least-squares slope over the last ``frac`` of a curve.
+
+    A head/tail MEAN comparison cannot tell a curve that reached a plateau
+    from one that is still falling when the budget runs out: both can have
+    the same tail mean. The slope of the final segment answers that
+    question. Returns ``(slope_per_point, slope_relative_to_tail_mean,
+    n_points_used)``; the relative value is ``None`` when the tail mean is
+    zero, so it can be stored in strict JSON.
+    """
+    n = len(losses)
+    if n < 2:
+        return 0.0, None, n
+    k = max(2, int(math.ceil(n * float(frac))))
+    k = min(k, n)
+    ys = [float(v) for v in losses[-k:]]
+    xs = list(range(k))
+    mean_x = (k - 1) / 2.0
+    mean_y = sum(ys) / k
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = (sum((x - mean_x) * (y - mean_y)
+                 for x, y in zip(xs, ys)) / denom) if denom else 0.0
+    relative = (slope / abs(mean_y)) if mean_y != 0.0 else None
+    return float(slope), relative, k
+
+
 def _curve_stats(losses: Sequence[float]) -> dict:
-    """Head/tail/best summary of one loss curve."""
+    """Head/tail/best/tail-trend summary of one loss curve."""
     n = len(losses)
     head_k = max(1, int(math.ceil(n * 0.1)))
     tail_k = max(1, int(math.ceil(n * 0.1)))
@@ -70,6 +97,7 @@ def _curve_stats(losses: Sequence[float]) -> dict:
     best = float(min(losses))
     best_step = int(min(range(n), key=lambda i: losses[i]))
     relative_change = ((tail - head) / abs(head)) if head != 0.0 else None
+    tail_slope, tail_slope_rel, tail_slope_points = _tail_slope(losses)
     return {
         'n_points': n,
         'first': float(losses[0]),
@@ -79,7 +107,39 @@ def _curve_stats(losses: Sequence[float]) -> dict:
         'best': best,
         'best_step': best_step,
         'relative_change': relative_change,
+        # Negative = still falling at the final checkpoint. Compare the
+        # RELATIVE slope across tasks/architectures; the absolute one is in
+        # the row's loss units.
+        'tail_slope_per_point': tail_slope,
+        'tail_slope_relative_per_point': tail_slope_rel,
+        'tail_slope_points': int(tail_slope_points),
     }
+
+
+#: A relative tail slope more negative than this (per point) means the curve
+#: has not flattened at the final checkpoint. Being within
+#: ``TAIL_BEST_TOLERANCE`` of its own minimum rules out a late rebound.
+TAIL_STILL_IMPROVING_SLOPE = 1e-3
+TAIL_BEST_TOLERANCE = 0.02
+
+
+def _still_improving_at_end(stats: Mapping) -> bool:
+    """Whether a loss curve was still falling when the budget ran out.
+
+    Uses the final-segment slope, not the head/tail means: a curve that
+    dropped early and then plateaued and one that dropped early and is
+    still dropping have the same tail mean but opposite next-step
+    prospects. The endpoint must also be near its own minimum, so a late
+    rebound is not mislabelled as "still improving".
+    """
+    slope = stats.get('tail_slope_relative_per_point')
+    if slope is None:
+        return False
+    best = float(stats.get('best', stats.get('last', 0.0)))
+    last = float(stats.get('last', best))
+    tolerance = TAIL_BEST_TOLERANCE * max(1.0, abs(best))
+    return bool(slope < -TAIL_STILL_IMPROVING_SLOPE
+                and last <= best + tolerance)
 
 
 def diagnose_training_curves(train_losses: Sequence[float],
@@ -163,11 +223,15 @@ def diagnose_training_curves(train_losses: Sequence[float],
     train_head, train_tail = tr['head_mean'], tr['tail_mean']
     train_improved = (train_head > 0
                       and train_tail < train_head * (1.0 - relative_improvement))
+    train_still_improving = _still_improving_at_end(tr)
     signals = {
         'train_improved': bool(train_improved),
         'train_head_mean': train_head,
         'train_tail_mean': train_tail,
         'train_relative_change': tr['relative_change'],
+        'train_tail_slope_relative_per_point': tr[
+            'tail_slope_relative_per_point'],
+        'train_still_improving_at_end': bool(train_still_improving),
     }
 
     if val is not None and val:
@@ -195,6 +259,7 @@ def diagnose_training_curves(train_losses: Sequence[float],
                         and val_tail < val_head * (1.0 - relative_improvement))
         head_gap = val_head - train_head
         tail_gap = val_tail - train_tail
+        val_still_improving = _still_improving_at_end(va)
         signals.update({
             'val_improved': bool(val_improved),
             'val_head_mean': val_head,
@@ -202,6 +267,9 @@ def diagnose_training_curves(train_losses: Sequence[float],
             'val_best': val_best,
             'val_best_step': va['best_step'],
             'val_rose_from_best': bool(val_rose_from_best),
+            'val_tail_slope_relative_per_point': va[
+                'tail_slope_relative_per_point'],
+            'val_still_improving_at_end': bool(val_still_improving),
             'generalization_gap_head': float(head_gap),
             'generalization_gap_tail': float(tail_gap),
         })
@@ -261,7 +329,32 @@ def diagnose_training_curves(train_losses: Sequence[float],
                 'optimizer wiring, or the data pipeline itself before '
                 'changing the model.',
             ]
+    # Budget status is a separate axis from over/underfitting: a healthy
+    # run can still be mid-descent when the fixed step budget expires, and
+    # then the final number is not a converged property of the recipe.
+    # Requiring BOTH curves to still fall keeps a noisy train curve from
+    # triggering the label when validation has already flattened.
+    budget_limited = bool(val is not None and len(val) >= 2
+                          and train_still_improving
+                          and signals.get('val_still_improving_at_end'))
+    signals['budget_limited'] = budget_limited
+    if budget_limited:
+        report['recommendations'].append(
+            'both training and validation loss were still falling at the '
+            'final checkpoint (relative tail slopes '
+            f"{signals.get('train_tail_slope_relative_per_point'):+.4g} / "
+            f"{signals.get('val_tail_slope_relative_per_point'):+.4g} per "
+            'point): the fixed-budget endpoint is not converged, so do not '
+            'rank configurations on it alone. Extend the budget (or lower '
+            'the validation interval) until the tail slope flattens, then '
+            're-compare.')
+    elif train_still_improving and not val:
+        report['recommendations'].append(
+            'the training curve was still falling at the final checkpoint; '
+            'the run may be budget-limited. Add held-out validation to tell '
+            'a genuine descent from memorization before extending it.')
     report['signals'] = signals
+    report['budget_limited'] = budget_limited
     return report
 
 

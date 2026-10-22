@@ -2868,12 +2868,24 @@ def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
         best_step = min(int(b['step']) for b in best_vals)
     saturated = sum(1 for r in ok_per_seed
                     if (r.get('accuracy_regime') or {}).get('saturated'))
+    # Budget status is separate from the over/under verdict: a healthy run
+    # can still be descending at the last checkpoint. Count it per seed so
+    # the sweep summary can refuse to treat such a ranking as converged.
+    budget_limited = sum(
+        1 for r in ok_per_seed
+        if (r.get('curve_diagnosis') or {}).get('budget_limited'))
+    val_still = sum(
+        1 for r in ok_per_seed
+        if ((r.get('curve_diagnosis') or {}).get('signals') or {}).get(
+            'val_still_improving_at_end'))
     modal = (max(counts, key=lambda k: counts[k])
              if len(set(counts.values())) == 1 or counts else None)
     return {
         'curve_verdict_counts': counts,
         'curve_verdict': modal,
         'curve_verdict_stable': (len(set(counts)) <= 1 if counts else None),
+        'n_seeds_budget_limited': int(budget_limited),
+        'n_seeds_val_still_improving': int(val_still),
         'curve_verdict_note': (
             None if not counts or len(set(counts)) <= 1 else
             f'the surviving seeds disagree on the curve verdict ({counts}); '
@@ -2923,6 +2935,9 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
     unstable = sorted(
         str(r.get(label_key))
         for r in counted if r.get('curve_verdict_stable') is False)
+    still_improving = sorted(
+        str(r.get(label_key))
+        for r in counted if r.get('n_seeds_budget_limited'))
 
     summary = {
         'rows_total': len(rows),
@@ -2933,6 +2948,7 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         'max_generalization_gap': max(gaps) if gaps else None,
         'saturated_at_ceiling': saturated,
         'rows_with_unstable_verdict': unstable,
+        'rows_still_improving_at_budget': still_improving,
         'regime': None,
         'interpretation': '',
         'recommended_action': '',
@@ -2980,6 +2996,18 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
             'raise the difficulty (more keys, more distractors, a longer '
             'context) so the metric has headroom before the architecture '
             'is ranked.')
+    elif len(still_improving) * 2 >= n:
+        summary['regime'] = 'budget_limited'
+        summary['interpretation'] = (
+            f"{len(still_improving)}/{n} rows were still descending on BOTH "
+            f'the training and validation curves at the final checkpoint '
+            f'({still_improving}): their fixed-budget endpoints are not '
+            f'converged, so the ordering may reorder with more steps even '
+            f'though the curve verdicts look healthy.')
+        summary['recommended_action'] = (
+            'extend ABL_STEPS (or raise the validation frequency) until '
+            'the tail slopes flatten, then re-run the paired contrasts; '
+            'do not quote this ranking as a converged structural result.')
     else:
         summary['regime'] = 'mixed'
         summary['interpretation'] = (
@@ -2996,6 +3024,11 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
             f" {len(saturated)}/{n} rows are additionally pinned at the "
             f"task ceiling (saturated at ceiling={saturated}), which "
             f"compresses any accuracy gap between them.")
+    if still_improving and summary['regime'] != 'budget_limited':
+        summary['interpretation'] += (
+            f" {len(still_improving)}/{n} rows were still improving at the "
+            f'final checkpoint ({still_improving}); extend their budget '
+            f'before treating their endpoint as converged.')
 
     # The measurement's own validity. Seeds of ONE configuration cannot
     # genuinely disagree about being under- or overfitting, so a split

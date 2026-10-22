@@ -465,6 +465,12 @@ class ValidationCurve:
             'val_every': self.val_every,
             'val_history': self.history,
             'curve_diagnosis': diagnosis,
+            # Convenience copies of the two budget-status fields a reader
+            # needs most often; the full evidence stays in the diagnosis.
+            'budget_limited': bool(diagnosis.get('budget_limited')),
+            'val_still_improving_at_end': bool(
+                (diagnosis.get('signals') or {}).get(
+                    'val_still_improving_at_end')),
             'generalization_gap': gap,
             'best_val': self.best,
             'val_loss_first': val_losses[0] if val_losses else None,
@@ -533,6 +539,8 @@ class ValidationCurve:
         verdict = (block.get('curve_diagnosis') or {}).get('verdict', '?')
         regime = block.get('accuracy_regime') or {}
         suffix = (' saturated_at_ceiling' if regime.get('saturated') else '')
+        if block.get('budget_limited'):
+            suffix += ' still_improving_at_budget'
         best = block.get('best_val') or {}
         regret = block.get('val_loss_regret_from_best')
         logger.info(

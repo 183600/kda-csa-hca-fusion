@@ -85,6 +85,38 @@ def test_curve_diagnosis_healthy_and_diverged():
     assert rep['val']['non_finite_at'] == 1
 
 
+def test_curve_diagnosis_flags_a_budget_limited_run():
+    """A healthy run that is still descending at the last step is NOT converged.
+
+    Head/tail means cannot distinguish "plateaued" from "still falling";
+    the tail slope can, and the report must say the fixed-budget endpoint
+    should not be ranked as a converged result.
+    """
+    train = [3.0 - 0.04 * i for i in range(60)]
+    val = [3.0 - 0.03 * i for i in range(20)]
+    rep = diagnose_training_curves(train, val)
+    assert rep['verdict'] == 'healthy'
+    assert rep['budget_limited'] is True
+    assert rep['signals']['train_still_improving_at_end'] is True
+    assert rep['signals']['val_still_improving_at_end'] is True
+    assert any('not converged' in r or 'Extend the budget' in r
+               for r in rep['recommendations'])
+    json.dumps(rep, allow_nan=False)
+
+    # Same early drop, but the final segment is flat: converged, not
+    # budget-limited (the tail mean is similar; the slope is not).
+    plateau_train = [3.0 - 0.04 * i for i in range(20)] + [2.2] * 20
+    plateau_val = [3.0 - 0.03 * i for i in range(10)] + [2.7] * 10
+    rep = diagnose_training_curves(plateau_train, plateau_val)
+    assert rep['budget_limited'] is False
+    assert rep['signals']['val_still_improving_at_end'] is False
+
+    # A late rebound must not be mistaken for "still improving".
+    rebound = [3.0 - 0.03 * i for i in range(15)] + [2.8, 3.0, 3.2]
+    rep = diagnose_training_curves(rebound, None)
+    assert rep['signals']['train_still_improving_at_end'] is False
+
+
 def test_curve_diagnosis_train_improving_only():
     rep = diagnose_training_curves([3.0 - 0.05 * i for i in range(40)])
     assert rep['verdict'] == 'train_improving_only'
