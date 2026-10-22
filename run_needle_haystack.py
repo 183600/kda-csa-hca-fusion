@@ -312,16 +312,28 @@ def _needle_val_seeds(seed: int, count: int) -> list[int]:
     return list(range(base, base + count))
 
 
-def draw_train_seeds(generator, batch_size: int) -> list[int]:
+def draw_train_seeds(generator, batch_size: int, *, device=None) -> list[int]:
     """Draw one training batch's data seeds OUTSIDE the eval band.
 
     Training seeds are random per step (fresh data every optimizer step),
     but restricted to ``[EVAL_SEED_RESERVE, 2**31)`` so no drawn seed can
     reproduce an evaluation sequence.
+
+    ``make_seeded_generator`` may return ``None`` on a CUDA build that
+    cannot construct a device-specific generator (it then seeds the global
+    CUDA generator instead). Callers therefore pass the target ``device``
+    so the fallback draw uses that device's global generator rather than
+    dereferencing a missing generator.
     """
+    if generator is not None:
+        device = generator.device
+    elif device is None:
+        device = torch.device('cpu')
+    else:
+        device = torch.device(device)
     seeds = torch.randint(EVAL_SEED_RESERVE, SEED_CEILING,
                           (int(batch_size),), generator=generator,
-                          device=generator.device)
+                          device=device)
     return seeds.cpu().tolist()
 
 
@@ -1256,7 +1268,7 @@ def train_needle_model(
         # Draw fresh data seeds for every step from the seeded generator.
         # Training seeds live in [EVAL_SEED_RESERVE, 2**31) so no training
         # batch can reproduce a held-out evaluation sequence.
-        step_seeds = draw_train_seeds(gen, batch_size)
+        step_seeds = draw_train_seeds(gen, batch_size, device=device)
         data_seeds.extend(step_seeds)
         # Build training batch
         input_ids, _targets, answer_positions = build_needle_batch(
@@ -1459,7 +1471,7 @@ def _needle_fixed_batch(tokenizer, context_len, needle_pos, batch_size,
     """One deterministic training batch, held fixed across gate steps."""
     gen = make_seeded_generator(seed + OVERFIT_BATCH_SEED_OFFSET,
                                 device=device)
-    data_seeds = draw_train_seeds(gen, batch_size)
+    data_seeds = draw_train_seeds(gen, batch_size, device=device)
     input_ids, _targets, answer_positions = build_needle_batch(
         batch_size, context_len, needle_pos, tokenizer, seeds=data_seeds,
         device=device)

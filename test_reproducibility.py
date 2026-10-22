@@ -774,6 +774,18 @@ def test_needle_train_eval_seed_streams_are_reserved_and_disjoint():
     assert leaked['overlap_examples'] == [5]
 
 
+def test_draw_train_seeds_falls_back_to_global_generator():
+    """A None generator (CUDA fallback) must not crash on ``.device``."""
+    from run_needle_haystack import (
+        EVAL_SEED_RESERVE,
+        SEED_CEILING,
+        draw_train_seeds,
+    )
+    seeds = draw_train_seeds(None, 16, device='cpu')
+    assert len(seeds) == 16
+    assert all(EVAL_SEED_RESERVE <= s < SEED_CEILING for s in seeds)
+
+
 def test_sealed_test_set_opens_exactly_once():
     calls = []
 
