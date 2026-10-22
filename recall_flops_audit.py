@@ -90,7 +90,8 @@ __all__ = [
     'ratio_layout',
 ]
 
-SUPPORTED_LAYER_KINDS = ('kda', 'csa', 'hca')
+SUPPORTED_LAYER_KINDS = ('kda', 'mamba2', 'csa', 'hca')
+_MEMORY_KINDS = ('kda', 'mamba2')
 
 
 def _validate_positive_int(name: str, value, *, minimum: int = 1) -> int:
@@ -114,8 +115,14 @@ def _validate_layout(layout) -> tuple[str, ...]:
         if kind not in SUPPORTED_LAYER_KINDS:
             raise ValueError(
                 f'layout kind={kind!r} is not auditable; supported kinds are '
-                f'{SUPPORTED_LAYER_KINDS}. Mamba-2 / RWKV-7 memory layers '
-                f'have no exact GEMM reference model in flops_audit yet.')
+                f'{SUPPORTED_LAYER_KINDS}. RWKV-7 memory layers have no '
+                f'exact GEMM reference model in flops_audit yet.')
+    memory_kinds = [kind for kind in layout if kind in _MEMORY_KINDS]
+    if len(set(memory_kinds)) > 1:
+        raise ValueError(
+            'layout mixes multiple memory routes '
+            f'({sorted(set(memory_kinds))}); audit one pure KDA or Mamba-2 '
+            'route at a time.')
     return layout
 
 
@@ -123,15 +130,15 @@ def _validate_cfg(cfg) -> None:
     if not isinstance(cfg, HybridConfig):
         raise TypeError(
             f'cfg must be a HybridConfig, got {type(cfg).__name__}.')
-    if cfg.memory_type != 'kda':
+    if cfg.memory_type not in _MEMORY_KINDS:
         raise ValueError(
             f"cfg.memory_type={cfg.memory_type!r} is not auditable; the exact "
-            f"FLOPs reference model currently covers the KDA memory route "
-            f"only.")
+            f"FLOPs reference model covers the {'/'.join(_MEMORY_KINDS)} "
+            f"memory routes only.")
 
 
 def ratio_layout(n_kda: int, n_csa: int, n_hca: int,
-                 total_layers: int) -> tuple[str, ...]:
+                 total_layers: int, memory_kind: str = 'kda') -> tuple[str, ...]:
     """Expand a KDA:CSA:HCA ratio into an explicit fixed-depth layout.
 
     The repeating unit is ``[kda] * n_kda + [csa] * n_csa + [hca] * n_hca``;
@@ -146,9 +153,12 @@ def ratio_layout(n_kda: int, n_csa: int, n_hca: int,
         if value < 0:
             raise ValueError(f'{name}={value} must be >= 0.')
     _validate_positive_int('total_layers', total_layers)
+    if memory_kind not in _MEMORY_KINDS:
+        raise ValueError(
+            f'memory_kind={memory_kind!r} must be one of {_MEMORY_KINDS}.')
     if n_kda + n_csa + n_hca == 0:
         raise ValueError('at least one of n_kda/n_csa/n_hca must be > 0.')
-    unit = (['kda'] * n_kda + ['csa'] * n_csa + ['hca'] * n_hca)
+    unit = ([memory_kind] * n_kda + ['csa'] * n_csa + ['hca'] * n_hca)
     repeats = math.ceil(total_layers / len(unit))
     return tuple((unit * repeats)[:total_layers])
 
@@ -350,7 +360,11 @@ def audit_layout(layout, cfg: HybridConfig | None = None, *,
     if cfg is None:
         cfg = fa.probe_config()
     _validate_cfg(cfg)
-    cfg = dataclasses.replace(cfg, layout=layout)
+    memory_kinds = {kind for kind in layout if kind in _MEMORY_KINDS}
+    memory_type = (next(iter(memory_kinds)) if memory_kinds
+                   else cfg.memory_type)
+    cfg = dataclasses.replace(
+        cfg, layout=layout, memory_type=memory_type)
     plan = plan_from_config(cfg, layout)
     layer_flops = layer_reference_flops(plan, cfg, seq_len, batch=batch)
     reference_macs = int(sum(row['gemm_macs'] for row in layer_flops))
@@ -362,6 +376,7 @@ def audit_layout(layout, cfg: HybridConfig | None = None, *,
         'layout': list(layout),
         'n_layers': len(layout),
         'n_kda': sum(1 for kind in layout if kind == 'kda'),
+        'n_mamba2': sum(1 for kind in layout if kind == 'mamba2'),
         'n_csa': sum(1 for kind in layout if kind == 'csa'),
         'n_hca': sum(1 for kind in layout if kind == 'hca'),
         'reference_gemm_macs': reference_macs,
@@ -369,6 +384,10 @@ def audit_layout(layout, cfg: HybridConfig | None = None, *,
         'kda_flops_fraction': (
             sum(row['gemm_flops'] for row in layer_flops
                 if row['kind'] == 'kda') / (2 * reference_macs)
+            if reference_macs else None),
+        'memory_flops_fraction': (
+            sum(row['gemm_flops'] for row in layer_flops
+                if row['kind'] in _MEMORY_KINDS) / (2 * reference_macs)
             if reference_macs else None),
         'layer_flops': layer_flops,
         'structural': structural_summary(plan, seq_len),
@@ -507,7 +526,8 @@ def audit_layouts(layouts=None, cfg: HybridConfig | None = None, *,
                 'store associations without an exact guarantee',
                 'GEMM FLOPs exclude layernorm/residual elementwise work and '
                 'are not a latency prediction',
-                'the exact reference model covers the KDA memory route only',
+                'the exact reference model covers the KDA and Mamba-2 '
+                'memory routes; RWKV-7 is rejected rather than approximated',
             ],
             'provenance': capture_provenance(),
         },
@@ -533,7 +553,7 @@ def _parse_ratio(text: str) -> tuple[int, int, int]:
 
 
 def _format_table(rows: list[dict]) -> str:
-    header = (f"{'group':>22} {'L':>3} {'GFLOPs':>10} {'KDA%':>7} "
+    header = (f"{'group':>22} {'L':>3} {'GFLOPs':>10} {'mem%':>7} "
               f"{'far reach%':>11} {'struct far%':>11} {'measure':>12}")
     lines = [header, '-' * len(header)]
     for row in rows:
@@ -546,7 +566,7 @@ def _format_table(rows: list[dict]) -> str:
         lines.append(
             f"{row['group']:>22} {row['n_layers']:>3} "
             f"{row['reference_gemm_flops'] / 1e9:>10.4f} "
-            f"{100 * (row['kda_flops_fraction'] or 0.0):>6.1f}% "
+            f"{100 * (row['memory_flops_fraction'] or 0.0):>6.1f}% "
             f"{100 * (far_reach or 0.0):>10.2f}% "
             f"{100 * (struct_far or 0.0):>10.2f}% "
             f"{measure_label:>12}")
@@ -564,6 +584,9 @@ def main(argv=None) -> int:
                              '3:1:1,1:2:2,1:0:0')
     parser.add_argument('--total-layers', type=int, default=10,
                         help='depth used to expand --ratios (default: 10)')
+    parser.add_argument('--memory-route', default='kda',
+                        choices=list(_MEMORY_KINDS),
+                        help='memory operator for --ratios (default: kda)')
     parser.add_argument('--seq-len', type=int, default=128,
                         help='prefill length / cue length (default: 128)')
     parser.add_argument('--batch', type=int, default=1)
@@ -584,8 +607,12 @@ def main(argv=None) -> int:
     if args.ratios:
         for text in [s.strip() for s in args.ratios.split(',') if s.strip()]:
             values = _parse_ratio(text)
-            layouts.append(ratio_layout(*values, total_layers=args.total_layers))
-            labels.append(f'ratio-{values[0]}:{values[1]}:{values[2]}')
+            layouts.append(ratio_layout(
+                *values, total_layers=args.total_layers,
+                memory_kind=args.memory_route))
+            labels.append(
+                f'ratio-{values[0]}:{values[1]}:{values[2]}'
+                f'-{args.memory_route}')
     if not layouts:
         layouts = list(LAYOUT_PRESETS)
         labels = list(LAYOUT_PRESETS)

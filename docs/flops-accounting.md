@@ -70,9 +70,18 @@ GEMM MACs **exactly** for the tested `T` (including padded `T=100`):
   with a single block (`nb == 1`) the reference folds the PV product into
   `mul + sum`, so no `bmm` dispatches; the model over-reports by
   `Tp * c * nh`. Tests allow that documented shortfall.
+* **Mamba-2**: in_proj (`2*d_inner`), the depthwise causal short conv,
+  x_proj (`dt_rank + 2*G*N`), dt_proj, the sequential scan's per-step
+  `baddbmm` readout (`nheads*headdim*d_state`), and out_proj. The state
+  update and output gate are elementwise and stay out of the GEMM ledger,
+  exactly like KDA's broadcast-encoded terms. The chunked SSD scan and a
+  non-reference backend raise `NotImplementedError` rather than being
+  priced with the sequential model.
 
 `associated_scan` (KDA's alternative core) is not modelled: `audit_layer`
-raises rather than mis-pricing it.
+raises rather than mis-pricing it. Likewise the chunked Mamba-2 scan
+(`mamba_chunk_size > 0`) has a different intra-chunk ledger and is measured
+from the dispatch counter instead of the closed form.
 
 ## Online-softmax oracle
 

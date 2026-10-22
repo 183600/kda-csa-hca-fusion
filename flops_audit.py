@@ -104,7 +104,7 @@ __all__ = [
     'reference_gemm_macs',
 ]
 
-SUPPORTED_KINDS = ('kda', 'csa', 'hca')
+SUPPORTED_KINDS = ('kda', 'mamba2', 'csa', 'hca')
 
 #: Readable labels for the non-matmul ops the ledger tracks.  These are
 #: element counts, NOT FLOPs: the point is to expose the gated-attention /
@@ -419,6 +419,59 @@ def kda_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
             + u_macs + ws_macs + qs_macs + aqv_macs + ksv_macs)
 
 
+def mamba2_path(cfg) -> str:
+    """Which Mamba-2 core path ``Mamba2Mixer`` dispatches to."""
+    _validate('mamba2', 0, 1)
+    return 'chunked' if int(getattr(cfg, 'mamba_chunk_size', 0)) > 0 \
+        else 'sequential'
+
+
+def mamba2_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
+    """Exact GEMM+conv MACs executed by the reference ``Mamba2Mixer``.
+
+    Mirrors ``ops_mamba.Mamba2Mixer.forward_functional`` on the default
+    sequential scan: the four projections, the depthwise causal short conv,
+    and the per-step ``baddbmm`` readout ``C @ S^T``.  The state update
+    (``decay * S + dt * x (x) B``) and the output gate are elementwise, so
+    they are *not* in this GEMM ledger (the same convention as KDA's
+    broadcast-encoded term).
+
+    The chunked SSD path and a non-reference backend have a different
+    operator boundary, so they raise ``NotImplementedError`` instead of
+    being silently priced with the sequential model.
+    """
+    _validate('mamba2', T, batch)
+    if int(getattr(cfg, 'mamba_chunk_size', 0)) != 0:
+        raise NotImplementedError(
+            'flops_audit: the chunked Mamba-2 scan has a different '
+            'quadratic-intra-chunk / associative-transition ledger; call '
+            'measure_forward() to measure it instead.')
+    backend = str(getattr(cfg, 'mamba_backend', 'reference'))
+    if backend != 'reference':
+        raise NotImplementedError(
+            f'flops_audit: mamba_backend={backend!r} is not the reference '
+            f'implementation; call measure_forward() instead.')
+    d = cfg.d_model
+    d_inner = cfg.mamba_expand * d
+    headdim = cfg.mamba_headdim
+    d_state = cfg.mamba_d_state
+    ngroups = cfg.mamba_ngroups
+    nheads = d_inner // headdim
+    dt_rank_cfg = cfg.mamba_dt_rank
+    if isinstance(dt_rank_cfg, str):
+        dt_rank = max(1, (d + 15) // 16)
+    else:
+        dt_rank = int(dt_rank_cfg)
+    B, T = batch, T
+    in_proj = B * T * d * (2 * d_inner)
+    conv = B * T * d_inner * cfg.mamba_d_conv
+    x_proj = B * T * d_inner * (dt_rank + 2 * ngroups * d_state)
+    dt_proj = B * T * dt_rank * nheads
+    scan_readout = B * T * nheads * headdim * d_state
+    out_proj = B * T * d_inner * d
+    return (in_proj + conv + x_proj + dt_proj + scan_readout + out_proj)
+
+
 def csa_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
     """Exact GEMM MACs executed by ``CSAHybridLayer`` at length ``T``.
 
@@ -466,6 +519,8 @@ def reference_gemm_macs(kind: str, cfg, T: int, batch: int = 1) -> int:
     """Exact executed GEMM+TRSM MACs for the reference layer ``kind``."""
     if kind == 'kda':
         return kda_reference_gemm_macs(cfg, T, batch)
+    if kind == 'mamba2':
+        return mamba2_reference_gemm_macs(cfg, T, batch)
     if kind == 'csa':
         return csa_reference_gemm_macs(cfg, T, batch)
     if kind == 'hca':
@@ -519,6 +574,8 @@ def audit_layer(kind: str, cfg, T: int, batch: int = 1, *,
         result['executed_flops'] = kda_executed_flops(cfg, T, batch)
         result['broadcast_encoded_macs'] = kda_broadcast_encoded_macs(
             cfg, T, batch)
+    elif kind == 'mamba2':
+        result['path'] = mamba2_path(cfg)
     if model_macs is not None:
         result['model_matches_measurement'] = (
             model_macs == ledger.gemm_macs)

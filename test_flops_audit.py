@@ -153,6 +153,27 @@ def test_kda_exact_model_padded_sequence(device):
     assert row['ledger'].special_ops['softplus'] == 100 * HV * K
 
 
+@pytest.mark.parametrize('T', [1, 8, 32, 63, 100])
+def test_mamba2_exact_model_sequential(T, device):
+    cfg = _cfg()
+    row = fa.audit_layer('mamba2', cfg, T, device=device)
+    assert row['path'] == 'sequential'
+    assert row['model_matches_measurement'], (
+        f'T={T}: model={row["reference_model_macs"]} '
+        f'measured={row["reference_gemm_macs"]} '
+        f'diff={row["model_minus_measured_macs"]}')
+    assert row['canonical_flops'] > 0
+
+
+def test_mamba2_exact_model_rejects_unmodelled_path(device):
+    cfg = _cfg(mamba_chunk_size=16)
+    row = fa.audit_layer('mamba2', cfg, 64, device=device)
+    assert row['path'] == 'chunked'
+    assert row['reference_model_macs'] is None
+    with pytest.raises(NotImplementedError):
+        fa.mamba2_reference_gemm_macs(cfg, 64)
+
+
 def test_csa_exact_model(device):
     cfg = _cfg()
     for T in (64, 128, 100):
@@ -258,7 +279,7 @@ def test_audit_softmax_ledger_csa_hca(device):
 def test_audit_validation():
     cfg = _cfg()
     with pytest.raises(ValueError):
-        fa.audit_layer('mamba2', cfg, 64)
+        fa.audit_layer('rwkv7', cfg, 64)
     with pytest.raises(ValueError):
         fa.audit_layer('kda', cfg, -1)
     with pytest.raises(TypeError):

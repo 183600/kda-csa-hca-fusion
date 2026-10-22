@@ -64,6 +64,9 @@ python3 recall_flops_audit.py --seq-len 128
 python3 recall_flops_audit.py \
   --ratios 3:1:1,1:2:2,1:0:0,0:1:1 --total-layers 10 \
   --seq-len 128 --json /tmp/recall_flops.json
+# Same ratio frontier on the Mamba-2 memory route:
+python3 recall_flops_audit.py --ratios 3:1:1 --memory-route mamba2 \
+  --total-layers 5 --seq-len 128
 ```
 
 The default geometry is `flops_audit.probe_config()` (`d_model=64`,
@@ -104,8 +107,11 @@ frontier is not a ranking.
 * GEMM FLOPs exclude layernorm/residual/elementwise work and are not a
   latency prediction. The special-op ledger is reported by
   `flops_audit`, not converted to FLOPs here.
-* The exact reference model currently covers the KDA memory route only.
-  Mamba-2 / RWKV-7 layouts are rejected rather than silently approximated.
+* The exact reference model covers the KDA and Mamba-2 memory routes.
+  A layout may contain one pure memory route (mixing KDA and Mamba-2 is
+  rejected, matching `HybridAttentionStack`'s route-purity rule). RWKV-7
+  has no exact reference model yet and is rejected rather than silently
+  approximated.
 * The `pareto_optimal` flag is a two-axis diagnostic (total FLOPs vs far
   exact-reachable share with structural coverage as a constraint), not a
   recommendation. Parameter count and model quality are not in the objective.
