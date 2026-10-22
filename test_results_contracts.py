@@ -974,3 +974,32 @@ def test_pairwise_tests_ignore_nonfinite_per_seed_accuracy():
     report = _pairwise_op_comparisons(rows, n_boot=20, n_permutations=20)
     pair = report['cells']['mqar/n_kv=1']['pairs']['a~b']
     assert pair['verdict'] == 'insufficient_paired_seeds'
+
+
+def test_lower_tail_bonferroni_quantile_is_the_mirror():
+    """``alpha > 0.5`` must return the (negative) lower-tail t quantile.
+
+    The dependency-free inverse-CDF path only brackets the upper tail, so
+    it used to return a near-zero positive value for every lower-tail
+    request. The t distribution is symmetric: ``t_{1-alpha} = -t_alpha``.
+    """
+    from multi_seed_stats import _t_quantile
+    from run_quality import _bonferroni_crit_q
+
+    for n in (2, 3, 5, 10, 100, 101):
+        for alpha in (0.51, 0.6, 0.75, 0.9, 0.975, 0.999):
+            got = _bonferroni_crit_q(n, alpha=alpha)
+            want = _t_quantile(1.0 - alpha, n - 1)
+            assert abs(got - want) <= 1e-7 * max(1.0, abs(want)), (
+                n, alpha, got, want)
+
+    for bad in (0, 1, -0.1, 1.1, float('nan'), True, '0.05'):
+        try:
+            _bonferroni_crit_q(5, alpha=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'alpha={bad!r} was silently accepted')
+
+    # n < 2 remains the documented "undefined" case.
+    assert _bonferroni_crit_q(1, alpha=0.05) is None

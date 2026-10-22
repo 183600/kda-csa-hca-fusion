@@ -369,6 +369,21 @@ def _bonferroni_crit_q(n, alpha=0.05):
     """
     if n < 2:
         return None
+    if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+            or not math.isfinite(float(alpha))
+            or not 0.0 < float(alpha) < 1.0):
+        raise ValueError(
+            f'_bonferroni_crit_q: alpha={alpha!r} must be a finite number '
+            f'in (0, 1).')
+    alpha = float(alpha)
+    # t_{1-alpha} = -t_alpha by the symmetry of the t distribution. The
+    # dependency-free fallback below only brackets the UPPER tail, so asking
+    # it for a quantile below the median (alpha > 0.5) used to return ~0
+    # instead of the correct negative critical value. (scipy's ppf already
+    # handles the lower tail, but taking the mirror first keeps both paths
+    # numerically identical and lets the fallback stay upper-tail only.)
+    if alpha > 0.5:
+        return -_bonferroni_crit_q(n, 1.0 - alpha)
     # Try scipy first (exact for any alpha / any n).
     global _T_PP
     if _T_PP is None:
@@ -456,7 +471,6 @@ def _bonferroni_crit_q(n, alpha=0.05):
     # the far upper tail: 1 - CDF(t) ≈ 0.5 * ib for large t, and ib itself
     # is computed from _betai which is stable for small x.  Taking logs
     # avoids catastrophic cancellation when CDF(t) is extremely close to 1.
-    import math
     target_log_sf = math.log(max(alpha, 1e-300))  # log(1 - target_p) = log(alpha)
     # Coarse bracket: find lo, hi such that log_sf(lo) > target_log_sf > log_sf(hi)
     lo = 0.0
