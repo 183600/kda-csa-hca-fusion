@@ -207,7 +207,9 @@ def parse(data) -> tuple[dict, list, str]:
             raise SchemaFormatError(
                 "envelope dict must contain a 'results' list, found "
                 f'{type(rows).__name__}')
-        meta = data.get('metadata') or {}
+        meta = data.get('metadata', {})
+        if meta is None:
+            meta = {}
         if not isinstance(meta, dict):
             raise SchemaFormatError(
                 f"envelope 'metadata' must be a dict, found "
