@@ -847,13 +847,17 @@ def summarize_variant(per_seed, variant):
           and _finite_metric(r, 'final_loss') is not None]
     accs = [r['final_acc'] for r in ok]
     mean_acc, std_acc, ci_acc = _mean_ci(accs)
-    mean_fwd, _std_fwd, _ = _mean_ci([r['fwd_ms'] for r in ok])
+    fwd_vals = [_finite_metric(r, 'fwd_ms') for r in ok]
+    mean_fwd, _std_fwd, _ = _mean_ci(
+        [v for v in fwd_vals if v is not None])
 
-    recall_rows = [r for r in ok if r.get('gold_recall') is not None]
-    recalls = [r['gold_recall'] for r in recall_rows]
+    recall_rows = [r for r in ok
+                   if _finite_metric(r, 'gold_recall') is not None]
+    recalls = [_finite_metric(r, 'gold_recall') for r in recall_rows]
     mean_recall, std_recall, ci_recall = _mean_ci(recalls)
-    chance_recall = (recall_rows[0]['chance_gold_recall']
-                     if recall_rows else None)
+    chance_recall = next(
+        (_finite_metric(r, 'chance_gold_recall') for r in recall_rows
+         if _finite_metric(r, 'chance_gold_recall') is not None), None)
     if len(recalls) > 1 and std_recall and std_recall > 0 \
             and chance_recall is not None:
         recall_t = ((mean_recall - chance_recall)
@@ -868,7 +872,8 @@ def summarize_variant(per_seed, variant):
     # are geometry constants (H(n)/n for AP and MRR, 0.5 for ROC-AUC) and
     # identical across seeds of a variant.
     def _agg_optional(key):
-        vals = [r[key] for r in ok if r.get(key) is not None]
+        vals = [_finite_metric(r, key) for r in ok]
+        vals = [v for v in vals if v is not None]
         return _mean_ci(vals) + (len(vals),)
 
     (mean_gold_pr_auc, std_gold_pr_auc,
@@ -878,15 +883,14 @@ def summarize_variant(per_seed, variant):
     mean_gold_top1 = _agg_optional('gold_top1_recall')[0]
     mean_gold_pr_auc_pooled = _agg_optional('gold_pr_auc_pooled')[0]
     mean_gold_roc_auc_pooled = _agg_optional('gold_roc_auc_pooled')[0]
-    chance_gold_pr_auc = next(
-        (r['chance_gold_pr_auc'] for r in ok
-         if r.get('chance_gold_pr_auc') is not None), None)
-    chance_gold_roc_auc = next(
-        (r['chance_gold_roc_auc'] for r in ok
-         if r.get('chance_gold_roc_auc') is not None), None)
-    chance_gold_mrr = next(
-        (r['chance_gold_mrr'] for r in ok
-         if r.get('chance_gold_mrr') is not None), None)
+    def _first_finite(key):
+        return next(
+            (_finite_metric(r, key) for r in ok
+             if _finite_metric(r, key) is not None), None)
+
+    chance_gold_pr_auc = _first_finite('chance_gold_pr_auc')
+    chance_gold_roc_auc = _first_finite('chance_gold_roc_auc')
+    chance_gold_mrr = _first_finite('chance_gold_mrr')
 
     chance = 1.0 / VOCAB
     if len(accs) > 1 and std_acc and std_acc > 0:

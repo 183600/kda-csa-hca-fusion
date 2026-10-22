@@ -564,16 +564,24 @@ def test_summarize_variant_ignores_malformed_metrics():
                   chance_gold_roc_auc=None, chance_gold_mrr=None,
                   gold_recall_skipped_reason=None)
     per_seed = [
-        dict(common, seed=1, final_acc=0.4, final_loss=1.0),
+        dict(common, seed=1, final_acc=0.4, final_loss=1.0,
+             gold_recall=0.25, gold_pr_auc=0.5,
+             chance_gold_pr_auc=0.1),
         dict(common, seed=2, final_acc=float('nan'), final_loss=1.0),
         dict(common, seed=3, final_acc='0.6', final_loss=1.0),
         dict(common, seed=4, final_acc=0.6, final_loss=float('inf')),
-        dict(common, seed=5, final_acc=0.8, final_loss=1.0),
+        dict(common, seed=5, final_acc=0.8, final_loss=1.0,
+             gold_recall=float('nan'), gold_pr_auc='0.7',
+             chance_gold_pr_auc=float('inf')),
     ]
     row = M.summarize_variant(per_seed, variant)
     assert row['n_seeds_total'] == len(per_seed)
     assert row['n_seeds_ok'] == 2
     assert abs(row['mean_acc'] - 0.6) < 1e-12
+    assert abs(row['mean_gold_pr_auc'] - 0.5) < 1e-12
+    assert row['n_gold_ranking_seeds'] == 1
+    assert row['mean_gold_recall'] == 0.25
+    assert row['chance_gold_pr_auc'] == 0.1
 
 
 _TEST_FUNCS = [
