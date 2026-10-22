@@ -52,8 +52,8 @@ def _clean(values):
             v = float(value)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(v):
-            out.append(max(0.0, v))
+        if math.isfinite(v) and v >= 0.0:
+            out.append(v)
     return out
 
 
@@ -134,7 +134,11 @@ def summarize_timings_ms(times_ms, *, n_boot=DEFAULT_BOOTSTRAP_REPS,
 def summarize_timings_s(times_s, *, n_boot=DEFAULT_BOOTSTRAP_REPS,
                         alpha=DEFAULT_ALPHA, seed=0):
     """Summary of timings expressed in seconds, returned in milliseconds."""
-    return summarize_timings_ms([float(t) * 1e3 for t in times_s],
+    # Clean before converting so a ``None`` / NaN / negative entry is
+    # dropped by the same contract as ``summarize_timings_ms`` instead of
+    # raising in ``float(None)``.
+    vals_s = _clean(times_s)
+    return summarize_timings_ms([v * 1e3 for v in vals_s],
                                 n_boot=n_boot, alpha=alpha, seed=seed)
 
 

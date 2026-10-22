@@ -73,8 +73,11 @@ def test_summary_seconds_and_edge_cases():
         one['n'] == 1 and one['ci95_low_ms'] == 5.0
         and one['ci95_high_ms'] == 5.0 and one['std_ms'] == 0.0, '')
     dirty = ts.summarize_timings_ms([1.0, float('nan'), float('inf'), -2.0])
-    _ok('non-finite dropped, negative clamped to zero',
-        dirty['n'] == 2 and dirty['median_ms'] == 0.5, dirty)
+    _ok('non-finite and negative samples are dropped',
+        dirty['n'] == 1 and dirty['median_ms'] == 1.0, dirty)
+    sec_dirty = ts.summarize_timings_s([0.001, None, -0.002, float('nan')])
+    _ok('seconds wrapper drops invalid entries instead of raising',
+        sec_dirty['n'] == 1 and sec_dirty['median_ms'] == 1.0, sec_dirty)
     a = ts.summarize_timings_ms([1.0, 2.0, 3.0], seed=11)
     b = ts.summarize_timings_ms([1.0, 2.0, 3.0], seed=11)
     _ok('bootstrap is deterministic for a fixed seed',
