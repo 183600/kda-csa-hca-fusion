@@ -555,6 +555,27 @@ def test_finite_metric_filters_diverged_seed_values():
     assert M._finite_metric({'seed': 1}, 'missing') is None
 
 
+def test_summarize_variant_ignores_malformed_metrics():
+    """The aggregate and baseline maps must not crash on a bad metric type."""
+    variant = next(v for v in M.VARIANTS if v['name'] == 'baseline')
+    common = dict(n_kv=1, layout='baseline', n_params=100, n_layers=5,
+                  fwd_ms=1.0, train_time_s=1.0, gold_recall=None,
+                  chance_gold_recall=None, chance_gold_pr_auc=None,
+                  chance_gold_roc_auc=None, chance_gold_mrr=None,
+                  gold_recall_skipped_reason=None)
+    per_seed = [
+        dict(common, seed=1, final_acc=0.4, final_loss=1.0),
+        dict(common, seed=2, final_acc=float('nan'), final_loss=1.0),
+        dict(common, seed=3, final_acc='0.6', final_loss=1.0),
+        dict(common, seed=4, final_acc=0.6, final_loss=float('inf')),
+        dict(common, seed=5, final_acc=0.8, final_loss=1.0),
+    ]
+    row = M.summarize_variant(per_seed, variant)
+    assert row['n_seeds_total'] == len(per_seed)
+    assert row['n_seeds_ok'] == 2
+    assert abs(row['mean_acc'] - 0.6) < 1e-12
+
+
 _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
@@ -568,6 +589,7 @@ _TEST_FUNCS = [
     test_single_seed_aggregate_reports_undefined_std,
     test_paired_family_size_counts_every_n_kv_cell,
     test_finite_metric_filters_diverged_seed_values,
+    test_summarize_variant_ignores_malformed_metrics,
 ]
 
 

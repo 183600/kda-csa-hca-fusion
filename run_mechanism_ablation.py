@@ -841,11 +841,10 @@ def _finite_metric(record, key):
 def summarize_variant(per_seed, variant):
     """Aggregate per-seed records into the row stored in the result file."""
     ok = [r for r in per_seed
-          if 'error' not in r
-          and r.get('final_acc') is not None
-          and math.isfinite(r['final_acc'])
-          and r.get('final_loss') is not None
-          and math.isfinite(r['final_loss'])]
+          if isinstance(r, dict)
+          and 'error' not in r
+          and _finite_metric(r, 'final_acc') is not None
+          and _finite_metric(r, 'final_loss') is not None]
     accs = [r['final_acc'] for r in ok]
     mean_acc, std_acc, ci_acc = _mean_ci(accs)
     mean_fwd, _std_fwd, _ = _mean_ci([r['fwd_ms'] for r in ok])
@@ -1377,15 +1376,17 @@ def main():
 
             row = summarize_variant(per_seed, variant)
             if variant['name'] == 'baseline':
-                baseline_acc = {r['seed']: r['final_acc'] for r in per_seed
-                                if 'error' not in r
-                                and r.get('final_acc') is not None
-                                and math.isfinite(r['final_acc'])}
-                baseline_pr_auc = {
-                    r['seed']: r['gold_pr_auc'] for r in per_seed
-                    if 'error' not in r
-                    and r.get('gold_pr_auc') is not None
-                    and math.isfinite(r['gold_pr_auc'])}
+                baseline_acc = {}
+                baseline_pr_auc = {}
+                for seed_row in per_seed:
+                    if not isinstance(seed_row, dict) or 'error' in seed_row:
+                        continue
+                    acc = _finite_metric(seed_row, 'final_acc')
+                    if acc is not None:
+                        baseline_acc[seed_row['seed']] = acc
+                    pr_auc = _finite_metric(seed_row, 'gold_pr_auc')
+                    if pr_auc is not None:
+                        baseline_pr_auc[seed_row['seed']] = pr_auc
             all_rows.append(row)
             _ci = row['ci95_acc']
             _ci_str = f'{_ci:.4f}' if _ci is not None else 'n/a'
