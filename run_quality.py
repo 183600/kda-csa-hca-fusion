@@ -3767,6 +3767,14 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
     adjusted for the permutation, the t-test, AND (when enabled) the TOST
     equivalence test — each in its own family.
 
+    Single-seed robustness: every pair record also carries
+    ``seed_influence`` from ``multi_seed_stats.leave_one_out_sensitivity``.
+    It is descriptive (it re-uses the same data and is not a test): a
+    significant ``verdict`` whose direction reverses when one seed is
+    deleted is labelled ``direction_fragile`` and the winning row records
+    the opponent under ``pairwise_direction_fragile_wins``. The report
+    aggregates the per-cell counts under ``seed_influence``.
+
     Side effect: every row participating in >= 1 testable pair gets
     ``pairwise_tests``, ``pairwise_significant_wins`` and
     ``pairwise_significant_losses`` (operator-name lists) so downstream
@@ -3805,6 +3813,9 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         'n_significant': 0,
         'n_skipped': 0,
         'n_equivalent': 0,
+        'n_direction_fragile': 0,
+        'n_boundary_sensitive': 0,
+        'n_seed_influence_stable': 0,
         'equivalence': {
             'enabled': equivalence_margin is not None,
             'margin': equivalence_margin,
@@ -3834,7 +3845,9 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         cell_key = f'{task_name}/n_kv={n_kv_key}'
         rows_sorted = sorted(rows, key=lambda r: str(r.get('op')))
         cell = {'n_tests': 0, 'n_significant': 0, 'n_skipped': 0,
-                'n_equivalent': 0, 'pairs': OrderedDict()}
+                'n_equivalent': 0, 'n_direction_fragile': 0,
+                'n_boundary_sensitive': 0, 'n_seed_influence_stable': 0,
+                'pairs': OrderedDict()}
         records = []
         for i in range(len(rows_sorted)):
             for j in range(i + 1, len(rows_sorted)):
@@ -3860,7 +3873,8 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                     diffs, seed=seed, n_boot=n_boot,
                     n_permutations=n_permutations,
                     max_exact=max_exact, alpha=alpha,
-                    equivalence_margin=equivalence_margin)
+                    equivalence_margin=equivalence_margin,
+                    include_seed_influence=True)
                 rec = {'op_a': a.get('op'), 'op_b': b.get('op'),
                        'common_seeds': common, **stats}
                 records.append((rec, a, b))
@@ -3916,6 +3930,7 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                 r['pairwise_tests'] = r.get('pairwise_tests', 0) + 1
                 r.setdefault('pairwise_significant_wins', [])
                 r.setdefault('pairwise_significant_losses', [])
+                r.setdefault('pairwise_direction_fragile_wins', [])
                 if equivalence_margin is not None:
                     r.setdefault('pairwise_equivalent_to', [])
             if rec['verdict'] == 'op_a_better':
@@ -3924,6 +3939,13 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
             elif rec['verdict'] == 'op_b_better':
                 b['pairwise_significant_wins'].append(a.get('op'))
                 a['pairwise_significant_losses'].append(b.get('op'))
+            if (rec['verdict'] != 'not_significant'
+                    and rec.get('seed_influence', {}).get(
+                        'direction_fragile')):
+                if rec['verdict'] == 'op_a_better':
+                    a['pairwise_direction_fragile_wins'].append(b.get('op'))
+                else:
+                    b['pairwise_direction_fragile_wins'].append(a.get('op'))
             if equivalence_margin is not None and \
                     rec['equivalence_verdict'] == 'equivalent':
                 a['pairwise_equivalent_to'].append(b.get('op'))
@@ -3934,11 +3956,43 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         cell['n_equivalent'] = sum(
             1 for rec, _, _ in records
             if rec.get('equivalence_verdict') == 'equivalent')
+        cell['n_direction_fragile'] = sum(
+            1 for rec, _, _ in records
+            if rec.get('seed_influence', {}).get('direction_fragile'))
+        cell['n_boundary_sensitive'] = sum(
+            1 for rec, _, _ in records
+            if rec.get('seed_influence', {}).get('decision_sensitive'))
+        cell['n_seed_influence_stable'] = sum(
+            1 for rec, _, _ in records
+            if rec.get('seed_influence', {}).get('status') == 'stable')
         report['cells'][cell_key] = cell
         report['n_tests'] += cell['n_tests']
         report['n_significant'] += cell['n_significant']
         report['n_equivalent'] += cell['n_equivalent']
         report['n_skipped'] += cell['n_skipped']
+        report['n_direction_fragile'] += cell['n_direction_fragile']
+        report['n_boundary_sensitive'] += cell['n_boundary_sensitive']
+        report['n_seed_influence_stable'] += cell['n_seed_influence_stable']
+
+    report['seed_influence'] = {
+        'method': 'leave_one_seed_out',
+        'primary_test': 'sign_flip_permutation',
+        'alpha': alpha,
+        'correction': 'none (raw per-pair alpha; the Holm family is not '
+                      're-run for each deletion)',
+        'n_direction_fragile': report['n_direction_fragile'],
+        'n_boundary_sensitive': report['n_boundary_sensitive'],
+        'n_stable': report['n_seed_influence_stable'],
+        'note': (
+            'For every testable pair, each seed is deleted in turn and the '
+            'paired panel is recomputed. direction_fragile means some '
+            'single deletion reverses (or erases) the sign of the mean '
+            'difference; boundary_sensitive means the direction survives '
+            'but the primary permutation decision flips at alpha. This is '
+            'a descriptive sensitivity check, not a test: it re-uses the '
+            'same data, is not multiplicity-corrected, and never upgrades '
+            'a claim.'),
+    }
 
     report['note'] = (
         'Pairwise claims must cite these tests, not raw mean rankings or '
@@ -3965,10 +4019,17 @@ def _print_pairwise_report(op_pairwise):
     print(f'\nSeed-paired op-vs-op comparisons {title}')
     header = (f"{'cell':>28} | {'op_a':>10} | {'op_b':>10} | {'d_acc':>8} | "
               f"{'n':>3} | {'p_perm':>9} | {'p_holm':>9} | {'seeds@80%':>9} | "
-              f"verdict")
+              f"verdict | {'infl':>9}")
     if eq_on:
         header += f" | {'p_tost':>9} | equivalence"
     print(header)
+    infl_short = {
+        'stable': 'stable',
+        'direction_fragile': 'DIR-FRAG',
+        'boundary_sensitive': 'boundary',
+        'no_direction': 'none',
+        'insufficient_data': 'n/a',
+    }
     for cell_key, cell in op_pairwise['cells'].items():
         for rec in cell['pairs'].values():
             if rec.get('verdict') in (None, 'insufficient_paired_seeds'):
@@ -3981,10 +4042,13 @@ def _print_pairwise_report(op_pairwise):
             ph_str = f'{ph:.4f}' if ph is not None else 'n/a'
             need = rec.get('seeds_required_80pct_power')
             need_str = str(need) if need is not None else 'n/a'
+            status = rec.get('seed_influence', {}).get('status', 'n/a')
+            status_str = infl_short.get(status, status)
             row = (f"{cell_key:>28} | {str(rec.get('op_a')):>10} | "
                    f"{str(rec.get('op_b')):>10} | {d_str:>8} | "
                    f"{rec.get('n_pairs', 0):>3} | {p_str:>9} | "
-                   f"{ph_str:>9} | {need_str:>9} | {rec['verdict']}")
+                   f"{ph_str:>9} | {need_str:>9} | {rec['verdict']} | "
+                   f"{status_str:>9}")
             if eq_on:
                 pt = rec.get('holm_adjusted_p_tost')
                 pt_str = f'{pt:.4f}' if pt is not None else 'n/a'
@@ -4811,6 +4875,12 @@ def main():
                 f"alpha={op_pairwise['alpha']}")
         else:
             logger.info('  TOST equivalence: disabled (MQAR_EQUIV_MARGIN=0)')
+        logger.info(
+            f"  single-seed robustness (leave-one-seed-out): "
+            f"{op_pairwise['n_direction_fragile']} pair(s) direction-fragile, "
+            f"{op_pairwise['n_boundary_sensitive']} boundary-sensitive, "
+            f"{op_pairwise['n_seed_influence_stable']} stable "
+            f"(descriptive; not a test)")
 
     # Experiment-level statistical validity summary. Mirrors run_ablation.py
     # but with the appropriate thresholds for the 4-op MQAR sweep.
@@ -4949,10 +5019,26 @@ def main():
                 op for op in best.get('pairwise_significant_wins', [])
                 if any(r.get('op') == op for r in live)]
             best_sig_wins = sorted(best_sig_wins, key=str)
+            # Of those significant wins, which ones reverse direction when
+            # a single seed is deleted? The pairwise verdict stays as
+            # computed; the claim is qualified so a one-seed-driven win is
+            # not read as a structural ordering.
+            best_fragile_wins = sorted(
+                [op for op in best_sig_wins
+                 if op in best.get('pairwise_direction_fragile_wins', [])],
+                key=str)
+            best_robust_wins = [op for op in best_sig_wins
+                                if op not in best_fragile_wins]
             if best_sig_wins:
                 paired_claim = (
                     f"Seed-paired Holm-corrected tests support {best['op']} "
                     f"over: {', '.join(best_sig_wins)}.")
+                if best_fragile_wins:
+                    paired_claim += (
+                        " The sign of that difference reverses when one "
+                        "seed is deleted for: "
+                        f"{', '.join(best_fragile_wins)} "
+                        "(leave-one-seed-out; descriptive, not a test).")
             else:
                 paired_claim = (
                     f"No seed-paired Holm-corrected test separates "
@@ -4983,6 +5069,8 @@ def main():
                 'best_ci95_acc': best.get('ci95_acc'),
                 'ops_with_overlapping_ci95': overlaps,
                 'best_op_pairwise_significant_wins': best_sig_wins,
+                'best_op_single_seed_robust_wins': best_robust_wins,
+                'best_op_direction_fragile_wins': best_fragile_wins,
                 'best_op_practically_equivalent_to': (
                     best_equiv_to if equivalence_margin is not None
                     else None),
@@ -5007,6 +5095,13 @@ def main():
                     f"{best['op']} (acc={best['mean_acc']:.4f}) has no "
                     f"significant seed-paired win (Holm) — treat the "
                     f"ranking as inconclusive.")
+            elif best_fragile_wins:
+                logger.warning(
+                    f'  [cost/claim] {task_name}/n_kv={n_kv_key}: best='
+                    f"{best['op']} — the significant direction vs "
+                    f"{', '.join(best_fragile_wins)} reverses when one seed "
+                    f'is deleted (leave-one-seed-out); do not report that '
+                    f'ordering as structural.')
             dominated = rep['dominated_by']
             if dominated:
                 logger.info(

@@ -701,3 +701,204 @@ def test_pairwise_op_comparisons_equivalence_disabled_by_default():
     assert 'pairwise_equivalent_to' not in rows[0]
     assert report['n_equivalent'] == 0
     assert report['equivalence']['enabled'] is False
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-seed-out sensitivity
+# ---------------------------------------------------------------------------
+
+def test_leave_one_out_stable_unanimous_seven_seed_sweep():
+    # 7/7 positive: exact two-sided p = 2/128 = 0.015625. Deleting one
+    # seed leaves 6/6 positive, p = 2/64 = 0.03125, still below alpha, so
+    # neither the direction nor the primary decision flips.
+    d = [0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.30]
+    r = M.leave_one_out_sensitivity(d)
+    assert r['n_pairs'] == 7 and r['n_dropped'] == 7
+    assert r['status'] == 'stable'
+    assert r['fragile'] is False
+    assert r['direction_fragile'] is False
+    assert r['decision_sensitive'] is False
+    assert r['sign_stable'] is True
+    assert r['primary_significance_stable'] is True
+    assert r['n_sign_flips'] == 0
+    assert r['n_primary_significance_flips'] == 0
+    assert math.isclose(r['baseline']['permutation_p_value'],
+                        0.015625, rel_tol=1e-15)
+    # Dropping the largest value (0.30) moves the mean the most.
+    assert r['most_influential_index'] == 6
+    assert r['most_influential_value'] == 0.30
+    assert math.isclose(r['max_abs_mean_shift'], 0.025, rel_tol=1e-12)
+    assert math.isclose(r['drops'][6]['mean_diff'], 0.75 / 6, rel_tol=1e-12)
+    assert math.isclose(r['drops'][6]['mean_shift'], -0.025, rel_tol=1e-12)
+    assert math.isclose(r['max_relative_mean_shift'],
+                        0.025 / 0.15, rel_tol=1e-12)
+    assert r['min_mean_diff'] < r['max_mean_diff']
+    json.dumps(r, allow_nan=False)
+
+
+def test_leave_one_out_flags_an_exact_test_boundary():
+    # 6/6 positive: p = 0.03125 clears alpha, but every 5/5 deletion has
+    # p = 0.0625 and never can clear it. The direction is stable; the
+    # decision is at the exact test's resolution boundary.
+    d = [0.10, 0.12, 0.14, 0.11, 0.13, 0.15]
+    r = M.leave_one_out_sensitivity(d)
+    assert r['status'] == 'boundary_sensitive'
+    assert r['fragile'] is True
+    assert r['direction_fragile'] is False
+    assert r['decision_sensitive'] is True
+    assert r['sign_stable'] is True
+    assert r['primary_significance_stable'] is False
+    assert r['n_sign_flips'] == 0
+    assert r['n_primary_significance_flips'] == 6
+    assert all(math.isclose(x['permutation_p_value'], 0.0625,
+                            rel_tol=1e-15) for x in r['drops'])
+    json.dumps(r, allow_nan=False)
+
+
+def test_leave_one_out_detects_a_direction_flip():
+    # Six tiny positive differences and one huge negative one: the full
+    # mean is negative, but deleting the outlier makes every remaining
+    # seed positive. The exact test is not significant on the full set
+    # (the outlier dominates the sign-flip distribution), yet deleting it
+    # manufactures a significant 6/6 result — exactly the sensitivity this
+    # report must expose.
+    d = [0.1] * 6 + [-2.0]
+    r = M.leave_one_out_sensitivity(d)
+    assert r['status'] == 'direction_fragile'
+    assert r['direction_fragile'] is True
+    assert r['decision_sensitive'] is False
+    assert r['fragile'] is True
+    assert r['n_sign_flips'] == 1
+    assert r['most_influential_index'] == 6
+    assert r['most_influential_value'] == -2.0
+    assert r['baseline']['direction'] == 'less'
+    assert r['drops'][6]['direction'] == 'greater'
+    assert r['drops'][6]['sign_flip'] is True
+    assert math.isclose(r['drops'][6]['mean_diff'], 0.1, rel_tol=1e-12)
+    assert math.isclose(r['min_mean_diff'], (-1.5) / 6, rel_tol=1e-12)
+    assert math.isclose(r['max_mean_diff'], 0.1, rel_tol=1e-12)
+    # Deleting the outlier turns a non-significant full sample into a
+    # significant exact 6/6 sweep; the report must count that boundary
+    # flip without presenting the deleted result as the finding.
+    assert r['n_primary_significance_flips'] == 1
+
+
+def test_leave_one_out_no_direction_and_insufficient_data():
+    flat = M.leave_one_out_sensitivity([0.1, -0.1, 0.2, -0.2, 0.0])
+    assert flat['status'] == 'no_direction'
+    assert flat['baseline']['mean_diff'] == 0.0
+    assert flat['fragile'] is False
+    assert flat['direction_fragile'] is False
+    assert flat['sign_stable'] is None
+    for d, n in (([], 0), ([0.5], 1), ([0.5, 0.6], 2)):
+        r = M.leave_one_out_sensitivity(d)
+        assert r['n_pairs'] == n
+        assert r['status'] == 'insufficient_data'
+        assert r['n_dropped'] == 0
+        assert r['drops'] == []
+        assert r['fragile'] is None
+        assert r['sign_stable'] is None
+        assert r['primary_significance_stable'] is None
+        assert r['most_influential_index'] is None
+        json.dumps(r, allow_nan=False)
+
+
+def test_leave_one_out_equivalence_verdict_stability_is_separate():
+    # baseline: mean 0.24, wide spread -> not equivalent at margin 0.3.
+    # Deleting the 0.8 outlier leaves four identical 0.1 values (point CI)
+    # -> equivalent. The direction never flips, so `status` stays stable;
+    # the equivalence verdict is reported separately.
+    d = [0.1, 0.1, 0.1, 0.1, 0.8]
+    r = M.leave_one_out_sensitivity(d, equivalence_margin=0.3)
+    assert r['status'] == 'stable'
+    assert r['fragile'] is False
+    assert r['equivalence_verdict_stable'] is False
+    assert r['n_equivalence_verdict_flips'] == 1
+    assert r['baseline']['practically_equivalent'] is False
+    assert r['drops'][4]['practically_equivalent'] is True
+    assert r['drops'][4]['equivalence_verdict_flip'] is True
+    json.dumps(r, allow_nan=False)
+
+
+def test_leave_one_out_mc_is_deterministic_and_rng_isolated():
+    d = [0.05, 0.07, 0.06, 0.04, 0.05, 0.08, 0.06, 0.05,
+         0.07, 0.04, 0.06, 0.05, 0.09, 0.05, 0.06, 0.04, 0.07, 0.05]
+    state = random.getstate()
+    first = M.leave_one_out_sensitivity(
+        d, max_exact=4, n_permutations=50, seed=7)
+    assert random.getstate() == state, (
+        'leave_one_out_sensitivity leaked into the global RNG stream')
+    second = M.leave_one_out_sensitivity(
+        d, max_exact=4, n_permutations=50, seed=7)
+    assert first == second
+    assert first['n_dropped'] == len(d)
+    assert all(x['n_pairs'] == len(d) - 1 for x in first['drops'])
+    json.dumps(first, allow_nan=False)
+
+
+def test_leave_one_out_rejects_invalid_arguments():
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], alpha=0.0)
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], alpha=1.0)
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], max_exact=-1)
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], max_exact=True)
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], n_permutations=0)
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], seed=True)
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, float('nan'), 0.3])
+    for bad_margin in (0.0, -0.1, float('nan'), float('inf'), True):
+        with pytest.raises(ValueError):
+            M.leave_one_out_sensitivity([0.1, 0.2, 0.3],
+                                        equivalence_margin=bad_margin)
+    # The TOST equivalence CI only exists for alpha < 0.5.
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3], alpha=0.5,
+                                    equivalence_margin=0.05)
+
+
+def test_summarize_paired_seed_influence_is_opt_in_and_matches_standalone():
+    d = [0.10, 0.12, 0.14, 0.11, 0.13, 0.15]
+    default = M.summarize_paired(d, n_boot=100, n_permutations=100)
+    assert 'seed_influence' not in default
+    s = M.summarize_paired(d, n_boot=100, n_permutations=100,
+                           include_seed_influence=True)
+    assert s['seed_influence'] == M.leave_one_out_sensitivity(
+        d, n_permutations=100)
+    assert s['seed_influence']['status'] == 'boundary_sensitive'
+    json.dumps(s, allow_nan=False)
+    with_margin = M.summarize_paired(
+        d, n_boot=100, n_permutations=100, equivalence_margin=0.5,
+        include_seed_influence=True)
+    assert with_margin['seed_influence']['equivalence_margin'] == 0.5
+
+
+def test_pairwise_report_integrates_seed_influence_counts():
+    rows = [_row('op_a', [0.9] * 6), _row('op_b', [0.1] * 6)]
+    report = _pairwise_op_comparisons(rows, alpha=0.05, seed=0,
+                                      n_boot=200, n_permutations=200)
+    rec = report['cells']['mqar/n_kv=1']['pairs']['op_a~op_b']
+    assert rec['seed_influence']['status'] == 'boundary_sensitive'
+    assert report['n_direction_fragile'] == 0
+    assert report['n_boundary_sensitive'] == 1
+    assert report['n_seed_influence_stable'] == 0
+    assert report['seed_influence']['n_boundary_sensitive'] == 1
+    assert rows[0]['pairwise_direction_fragile_wins'] == []
+    json.dumps(report, allow_nan=False)
+
+    # Direction fragility on a non-significant pair is still aggregated,
+    # but it must not fabricate a winning row annotation.
+    rows2 = [_row('op_c', [0.6] * 6 + [-1.5]), _row('op_d', [0.5] * 7)]
+    report2 = _pairwise_op_comparisons(rows2, alpha=0.05, seed=0,
+                                       n_boot=200, n_permutations=200)
+    rec2 = report2['cells']['mqar/n_kv=1']['pairs']['op_c~op_d']
+    assert rec2['seed_influence']['status'] == 'direction_fragile'
+    assert rec2['verdict'] == 'not_significant'
+    assert report2['n_direction_fragile'] == 1
+    assert rows2[0]['pairwise_direction_fragile_wins'] == []
+    assert rows2[1]['pairwise_direction_fragile_wins'] == []
+

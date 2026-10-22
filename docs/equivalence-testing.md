@@ -109,3 +109,8 @@ plain non-significant superiority test can never make.
 * `test_multi_seed_stats.py`, `test_results_contracts.py` — hand-computed
   and numerical-integration cross-checks of the TOST p-values,
   degenerate-case contracts, and the runner integrations.
+
+An equivalence claim is still a claim about a *seed set*. See
+[seed-influence.md](seed-influence.md) for the leave-one-seed-out check that
+reports whether the direction (or the TOST verdict) reverses when one seed
+is deleted; it is descriptive and never upgrades either claim.

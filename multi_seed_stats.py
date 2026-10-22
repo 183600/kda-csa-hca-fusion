@@ -65,6 +65,12 @@ the whole pipeline for a list of seed-paired differences:
    actionable (widen the margin you can defend or run more seeds).
 9. :func:`summarize_paired` — one call that runs the whole panel and
    returns a single JSON-safe record for the results file.
+10. :func:`leave_one_out_sensitivity` — the post-hoc robustness companion:
+    delete each seed in turn and report whether the direction or the
+    primary significance decision depends on that single seed. It is
+    explicitly descriptive (not a test, no multiplicity correction) and
+    cannot upgrade a claim; it prevents a one-seed-driven ordering from
+    being read as a structural result.
 
 Design constraints
 ------------------
@@ -112,6 +118,7 @@ __all__ = [
     'power_at_effect',
     'seeds_required',
     'summarize_paired',
+    'leave_one_out_sensitivity',
 ]
 
 # ---------------------------------------------------------------------------
@@ -806,6 +813,301 @@ def power_at_effect(n: int, sd: float, effect: float,
 
 
 # ---------------------------------------------------------------------------
+# Leave-one-seed-out sensitivity
+# ---------------------------------------------------------------------------
+
+def _direction_of(mean: float | None) -> str:
+    """Signed direction label used by the influence report."""
+    if mean is None or mean == 0.0:
+        return 'none'
+    return 'greater' if mean > 0.0 else 'less'
+
+
+def leave_one_out_sensitivity(
+        diffs, *, alpha: float = 0.05,
+        equivalence_margin: float | None = None,
+        max_exact: int = 16, n_permutations: int = 10000,
+        seed: int = 0) -> dict:
+    """Drop each seed in turn and re-run the paired decision.
+
+    At the 5-7-seed scale a single diverging seed can carry a mean
+    difference, flip its sign, or move a p-value across alpha. The
+    three-p-value panel in :func:`summarize_paired` can show that the
+    statistic is fragile, but not WHICH seed is responsible or whether
+    the reported direction survives. This function answers that by
+    re-computing the full paired panel on every ``n - 1`` subset (the
+    leave-one-seed-out / deletion-jackknife view).
+
+    For every deleted position it records the remaining mean / SD /
+    direction, the t, sign and sign-flip permutation p-values, whether
+    the direction or the primary (permutation) decision changed, and —
+    when a pre-specified ``equivalence_margin`` is supplied — the TOST
+    verdict. The summary names the most influential seed, the range of
+    the remaining mean, and a status:
+
+    ``stable``
+        The direction and the primary significance decision are unchanged
+        by deleting any single seed.
+    ``direction_fragile``
+        Deleting at least one seed reverses (or erases) the sign of the
+        mean difference.
+    ``boundary_sensitive``
+        The direction survives, but the primary permutation decision
+        flips at ``alpha`` when at least one seed is deleted. Note that a
+        unanimous 6-pair exact permutation result is *always* in this
+        class: deleting one seed leaves 5 pairs, whose smallest attainable
+        two-sided p is 0.0625. That is a resolution property of the exact
+        test, not evidence against the effect; read
+        ``n_primary_significance_flips`` alongside ``n_pairs``.
+    ``no_direction``
+        The full-sample mean difference is exactly zero, so there is no
+        direction to test for stability.
+    ``insufficient_data``
+        Fewer than 3 pairs: at least two pairs must remain after a
+        deletion, so no leave-one-out subset is testable.
+
+    This is a **descriptive sensitivity analysis, not a test**. The
+    leave-one-out p-values re-use the same data, are not independent,
+    are not corrected for multiplicity, and are not a license to delete
+    the seed that "fixes" the result. A stable report also cannot upgrade
+    a non-significant or underpowered claim; it can only show that the
+    observed decision does not hinge on one seed. The confirmatory
+    inference remains :func:`summarize_paired` on the pre-registered seed
+    set.
+
+    When ``equivalence_margin`` is supplied, the TOST flags
+    (``equivalence_verdict_stable`` / ``n_equivalence_verdict_flips``) are
+    computed at the raw per-pair ``alpha``; the family is not re-Holm-ed
+    for each deletion, so they describe the raw TOST verdict, not the
+    reported Holm-corrected equivalence verdict. Likewise, the
+    ``primary_significance_*`` fields use the raw per-pair ``alpha``, not
+    the Holm-adjusted family decision (deleting a seed changes the family
+    as well, which this per-pair view deliberately does not re-run). The
+    ``status`` concerns only the direction and the raw-alpha superiority
+    decision; a direction flip is alpha-independent and remains the
+    relevant robustness signal for a Holm-corrected claim.
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    if (isinstance(max_exact, bool)
+            or not isinstance(max_exact, int) or max_exact < 0):
+        raise ValueError(
+            f'max_exact must be a non-negative int, got {max_exact!r}')
+    if (isinstance(n_permutations, bool)
+            or not isinstance(n_permutations, int) or n_permutations < 1):
+        raise ValueError(
+            f'n_permutations must be a positive int, got '
+            f'{n_permutations!r}')
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f'seed must be an int, got {seed!r}')
+    margin = None
+    if equivalence_margin is not None:
+        if isinstance(equivalence_margin, bool):
+            raise ValueError(
+                f'equivalence_margin must be a positive number, got '
+                f'{equivalence_margin!r}')
+        try:
+            margin = float(equivalence_margin)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f'equivalence_margin must be a positive number, got '
+                f'{equivalence_margin!r}') from None
+        if not math.isfinite(margin) or margin <= 0.0:
+            raise ValueError(
+                f'equivalence_margin must be finite and > 0, got '
+                f'{equivalence_margin!r}')
+        # The TOST equivalence CI only exists for alpha < 0.5.
+        if not (0.0 < alpha < 0.5):
+            raise ValueError(
+                f'alpha must be in (0, 0.5) when an equivalence margin is '
+                f'given, got {alpha!r}')
+    d = _as_clean_diffs(diffs)
+    n = len(d)
+    mean = (sum(d) / n) if n else None
+    sd = _sample_sd(d, mean) if n >= 2 else None
+    t = paired_t_test(d)
+    sign = sign_test(d)
+    perm = permutation_test(d, max_exact=max_exact,
+                            n_permutations=n_permutations, seed=seed)
+    base_direction = _direction_of(mean)
+    base_t_sig = (t['p_value'] < alpha) if t['p_value'] is not None else None
+    base_sign_sig = bool(sign['p_value'] < alpha)
+    base_perm_sig = (bool(perm['p_value'] < alpha)
+                     if perm['p_value'] is not None else None)
+    base_tost = (tost_paired(d, margin, alpha=alpha)
+                 if margin is not None else None)
+    baseline = {
+        'n_pairs': n,
+        'mean_diff': mean,
+        'sd_diff': sd,
+        'direction': base_direction,
+        't_p_value': t['p_value'],
+        't_significant': base_t_sig,
+        'sign_test_p_value': sign['p_value'],
+        'sign_test_significant': base_sign_sig,
+        'permutation_p_value': perm['p_value'],
+        'permutation_significant': base_perm_sig,
+    }
+    if base_tost is not None:
+        baseline['tost_p_value'] = base_tost['p_value']
+        baseline['practically_equivalent'] = base_tost['equivalent']
+
+    note = (
+        'Leave-one-seed-out sensitivity is DESCRIPTIVE: it re-uses the '
+        'same data, tests no hypothesis, is not multiplicity-corrected, '
+        'and cannot upgrade or rescue a claim. It shows only whether the '
+        'observed direction or the primary permutation decision depends '
+        'on one training seed.')
+    if n < 3:
+        return {
+            'n_pairs': n, 'n_dropped': 0,
+            'method': 'leave_one_seed_out',
+            'primary_test': 'sign_flip_permutation',
+            'correction': 'none (raw per-pair alpha; descriptive only)',
+            'alpha': alpha, 'equivalence_margin': margin,
+            'status': 'insufficient_data',
+            'fragile': None,
+            'direction_fragile': None,
+            'decision_sensitive': None,
+            'baseline': baseline,
+            'drops': [],
+            'min_mean_diff': None, 'max_mean_diff': None,
+            'max_abs_mean_shift': None,
+            'max_relative_mean_shift': None,
+            'most_influential_index': None,
+            'most_influential_value': None,
+            'sign_stable': None,
+            'primary_significance_stable': None,
+            't_significance_stable': None,
+            'sign_test_significance_stable': None,
+            'equivalence_verdict_stable': None,
+            'n_sign_flips': 0,
+            'n_primary_significance_flips': 0,
+            'n_t_significance_flips': None,
+            'n_sign_test_significance_flips': 0,
+            'n_equivalence_verdict_flips': None,
+            'note': note,
+        }
+
+    drops = []
+    for i in range(n):
+        rest = d[:i] + d[i + 1:]
+        m = sum(rest) / len(rest)
+        s = _sample_sd(rest, m)
+        rt = paired_t_test(rest)
+        rs = sign_test(rest)
+        rp = permutation_test(rest, max_exact=max_exact,
+                              n_permutations=n_permutations, seed=seed)
+        direction = _direction_of(m)
+        shift = m - mean
+        t_sig = (rt['p_value'] < alpha) if rt['p_value'] is not None else None
+        perm_sig = (bool(rp['p_value'] < alpha)
+                    if rp['p_value'] is not None else None)
+        sign_sig = bool(rs['p_value'] < alpha)
+        entry = {
+            'dropped_index': i,
+            'dropped_value': d[i],
+            'n_pairs': len(rest),
+            'mean_diff': m,
+            'sd_diff': s,
+            'direction': direction,
+            'mean_shift': shift,
+            'relative_mean_shift': (
+                abs(shift) / abs(mean) if mean != 0.0 else None),
+            'sign_flip': bool(base_direction != 'none'
+                              and direction != base_direction),
+            't_p_value': rt['p_value'],
+            't_significant': t_sig,
+            'sign_test_p_value': rs['p_value'],
+            'sign_test_significant': sign_sig,
+            'permutation_p_value': rp['p_value'],
+            'permutation_significant': perm_sig,
+            'primary_significance_flip': bool(
+                base_perm_sig is not None and perm_sig != base_perm_sig),
+        }
+        if margin is not None:
+            rtost = tost_paired(rest, margin, alpha=alpha)
+            entry['tost_p_value'] = rtost['p_value']
+            entry['practically_equivalent'] = rtost['equivalent']
+            entry['equivalence_verdict_flip'] = (
+                None if (base_tost['equivalent'] is None
+                         or rtost['equivalent'] is None)
+                else bool(rtost['equivalent'] != base_tost['equivalent']))
+        drops.append(entry)
+
+    abs_shifts = [abs(x['mean_shift']) for x in drops]
+    max_shift = max(abs_shifts)
+    most = abs_shifts.index(max_shift)
+    n_sign_flips = sum(1 for x in drops if x['sign_flip'])
+    n_perm_flips = sum(1 for x in drops if x['primary_significance_flip'])
+    t_flags = [x['t_significant'] for x in drops]
+    t_all_defined = (base_t_sig is not None
+                     and all(v is not None for v in t_flags))
+    t_stable = (all(v == base_t_sig for v in t_flags)
+                if t_all_defined else None)
+    sign_stable = (n_sign_flips == 0) if base_direction != 'none' else None
+    perm_stable = (n_perm_flips == 0) if base_perm_sig is not None else None
+    if margin is not None:
+        eq_flags = [x['practically_equivalent'] for x in drops]
+        eq_defined = (base_tost['equivalent'] is not None
+                      and all(v is not None for v in eq_flags))
+        n_eq_flips = (sum(1 for x in drops
+                          if x['equivalence_verdict_flip'])
+                      if eq_defined else None)
+        eq_stable = (n_eq_flips == 0) if eq_defined else None
+    else:
+        n_eq_flips = None
+        eq_stable = None
+    if base_direction == 'none':
+        status = 'no_direction'
+    elif n_sign_flips:
+        status = 'direction_fragile'
+    elif n_perm_flips:
+        status = 'boundary_sensitive'
+    else:
+        status = 'stable'
+    direction_fragile = bool(status == 'direction_fragile')
+    decision_sensitive = bool(status == 'boundary_sensitive')
+    return {
+        'n_pairs': n, 'n_dropped': n,
+        'method': 'leave_one_seed_out',
+        'primary_test': 'sign_flip_permutation',
+        'correction': 'none (raw per-pair alpha; descriptive only)',
+        'alpha': alpha, 'equivalence_margin': margin,
+        'status': status,
+        'fragile': bool(direction_fragile or decision_sensitive),
+        'direction_fragile': direction_fragile,
+        'decision_sensitive': decision_sensitive,
+        'baseline': baseline,
+        'drops': drops,
+        'min_mean_diff': min(x['mean_diff'] for x in drops),
+        'max_mean_diff': max(x['mean_diff'] for x in drops),
+        'max_abs_mean_shift': max_shift,
+        'max_relative_mean_shift': (
+            max(abs(x['mean_shift']) for x in drops) / abs(mean)
+            if mean != 0.0 else None),
+        'most_influential_index': most,
+        'most_influential_value': d[most],
+        'sign_stable': sign_stable,
+        'primary_significance_stable': perm_stable,
+        't_significance_stable': t_stable,
+        'sign_test_significance_stable': bool(
+            all(v == base_sign_sig
+                for v in (x['sign_test_significant'] for x in drops))),
+        'equivalence_verdict_stable': eq_stable,
+        'n_sign_flips': n_sign_flips,
+        'n_primary_significance_flips': n_perm_flips,
+        'n_t_significance_flips': (
+            sum(1 for v in t_flags if v != base_t_sig)
+            if t_all_defined else None),
+        'n_sign_test_significance_flips': sum(
+            1 for x in drops if x['sign_test_significant'] != base_sign_sig),
+        'n_equivalence_verdict_flips': n_eq_flips,
+        'note': note,
+    }
+
+
+# ---------------------------------------------------------------------------
 # One-call panel
 # ---------------------------------------------------------------------------
 
@@ -814,7 +1116,8 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                      max_exact: int = 16,
                      alpha: float = 0.05,
                      power: float = 0.8,
-                     equivalence_margin: float | None = None) -> dict:
+                     equivalence_margin: float | None = None,
+                     include_seed_influence: bool = False) -> dict:
     """Run the full multi-seed inference panel on paired differences.
 
     Returns a single JSON-safe record containing the effect estimate,
@@ -837,6 +1140,14 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     comparison: if they disagree materially at n = 5, the per-seed
     differences are skew/outlier-driven and the result should be treated
     as fragile rather than decided by whichever test looks best.
+
+    ``include_seed_influence=True`` additionally attaches a
+    ``seed_influence`` block from :func:`leave_one_out_sensitivity`: which
+    seed, if deleted, would change the direction or the primary
+    permutation decision. It is opt-in because it re-runs the panel
+    ``n`` times; enable it for the operator comparisons whose claim
+    depends on the seed set, not for bulk per-cell summaries where the
+    extra record would dominate the output.
     """
     d = _as_clean_diffs(diffs)
     n = len(d)
@@ -914,6 +1225,10 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
         record['tost'] = tost
         record['equivalence_margin_supported'] = equivalence_margin_supported(
             d, alpha=alpha)
+    if include_seed_influence:
+        record['seed_influence'] = leave_one_out_sensitivity(
+            d, alpha=alpha, equivalence_margin=equivalence_margin,
+            max_exact=max_exact, n_permutations=n_permutations, seed=seed)
     return record
 
 
