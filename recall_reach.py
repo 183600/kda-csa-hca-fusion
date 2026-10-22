@@ -120,6 +120,7 @@ from ops_fused import (  # noqa: E402
     HybridConfig,
     HybridKCHAttention,
 )
+from multi_seed_stats import holm_adjust, summarize_paired  # noqa: E402
 from run_ablation import _run_ablation_overfit_gate  # noqa: E402
 from run_quality import (  # noqa: E402
     MQARHead,
@@ -1104,7 +1105,9 @@ HYPOTHESES = {
         'prediction': (
             'Trained rows have ``indexer_union_recall_mean`` above the '
             'analytic uniform-selection union chance '
-            '(``csa_union_selection_chance_indep``).'),
+            '(``csa_union_selection_chance_indep``), with the seed-paired '
+            'directional test (and its Holm correction across empirical '
+            'cells) reported rather than the point crossing alone.'),
         'falsified_if': (
             'Union recall is at or below the analytic chance: the indexer '
             'adds no selection signal over picking uniformly at random.'),
@@ -1207,6 +1210,36 @@ def _hypothesis_checks(rows: list[dict]) -> dict:
             'uniform_union_chance': chance,
             'above_chance': is_above,
         })
+    union_tests = []
+    for r in rows:
+        check = ((r.get('hypothesis_checks') or {})
+                 .get('indexer_union_above_chance') or {})
+        p_value = check.get('p_value_directional')
+        if p_value is None:
+            continue
+        union_tests.append((r, check, float(p_value)))
+    union_holm = holm_adjust([item[2] for item in union_tests])
+    for (r, check, p_value), adjusted, rejected in zip(
+            union_tests, union_holm['adjusted'], union_holm['rejected']):
+        check['holm_adjusted_p'] = adjusted
+        check['significant_at_alpha'] = bool(rejected)
+        check['family_size'] = union_holm['n_tests']
+    union_family = {
+        'method': 'holm_bonferroni',
+        'alpha': 0.05,
+        'family_unit': 'one empirical cell (rows are distinct geometries)',
+        'n_tests': union_holm['n_tests'],
+        'n_rejected': int(sum(union_holm['rejected'])),
+        'tests': [{
+            'group': r.get('group'),
+            'observed_union_recall': check.get('observed_union_recall'),
+            'uniform_union_chance': check.get('uniform_union_chance'),
+            'raw_p_value_directional': p_value,
+            'holm_adjusted_p': adjusted,
+            'reject_at_alpha': bool(rejected),
+        } for (r, check, p_value), adjusted, rejected in zip(
+            union_tests, union_holm['adjusted'], union_holm['rejected'])],
+    }
     far_min = (min(f['far_exact_fraction'] for f in far_fractions)
                if far_fractions else None)
     return {
@@ -1232,13 +1265,19 @@ def _hypothesis_checks(rows: list[dict]) -> dict:
             'n_rows_above': above,
             'n_rows_at_or_below': below,
             'n_rows_no_data': no_data,
+            'n_rows_significantly_above_chance_holm': (
+                union_family['n_rejected']),
+            'familywise': union_family,
             'per_row': per_row,
             'verdict': (None if not (above + below)
                         else (True if below == 0
                               else (False if above == 0 else None))),
-            'verdict_note': ('True = every trained cell above chance, '
-                             'False = every trained cell at/below chance, '
-                             'None = mixed cells (read per_row)'),
+            'verdict_note': ('Point verdict: True = every trained cell above '
+                             'chance, False = every trained cell at/below '
+                             'chance, None = mixed cells (read per_row). The '
+                             'familywise block Holm-corrects the seed-paired '
+                             'directional tests and is the inferential '
+                             'count.'),
         },
     }
 
@@ -1409,14 +1448,40 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                 row['indexer_union_recall_std'] = union_std
                 row['indexer_union_recall_ci95'] = union_ci
                 chance = structural.get('csa_union_selection_chance_indep')
+                union_diffs = ([u - chance for u in union
+                                if math.isfinite(u)]
+                               if chance is not None else [])
+                union_paired = (summarize_paired(union_diffs)
+                                if len(union_diffs) >= 2 else None)
+                p_union = None
+                ci_union = None
+                if isinstance(union_paired, dict):
+                    p_union = (union_paired.get('t_test') or {}).get(
+                        'p_value_directional')
+                    ci_union = union_paired.get('ci95_mean_diff_t')
+                significant_union = bool(
+                    union_mean is not None and chance is not None
+                    and union_mean > chance and p_union is not None
+                    and p_union < 0.05)
                 row['hypothesis_checks'] = {
                     'indexer_union_above_chance': {
                         'prediction': ('union recall above the analytic '
-                                       'uniform-selection union chance'),
+                                       'uniform-selection union chance '
+                                       '(seed-paired directional test)'),
                         'uniform_union_chance': chance,
                         'observed_union_recall': union_mean,
+                        'n_seeds': len(union),
+                        'p_value_directional': p_union,
+                        'ci95_mean_diff_t': ci_union,
+                        'significant_positive_gain_at_0.05': (
+                            significant_union if len(union) >= 2 else None),
+                        'evidence': ('inferential' if len(union) >= 2 else
+                                     'descriptive (n<2: no paired test)'),
+                        # Historical pre-registered point rule.
                         'verdict': (None if union_mean is None or chance is None
                                     else bool(union_mean > chance + 1e-12)),
+                        'inferential_verdict': (
+                            significant_union if len(union) >= 2 else None),
                     },
                 }
                 hca = [s['hca_resolved_fraction'] for s in row['per_seed']

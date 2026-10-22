@@ -452,6 +452,18 @@ def test_report_multi_seed_statistics():
         _ok('indexer union recall std populated',
             row['indexer_union_recall_std'] is not None,
             f"std={row['indexer_union_recall_std']}")
+        check = row['hypothesis_checks']['indexer_union_above_chance']
+        _ok('indexer-vs-chance check carries paired inference',
+            check['n_seeds'] == 2 and check['evidence'] == 'inferential'
+            and 'p_value_directional' in check
+            and 'ci95_mean_diff_t' in check, f'{check}')
+        design_check = report['design']['hypothesis_checks'][
+            'indexer_union_above_chance']
+        _ok('design empirical check exposes its familywise block',
+            design_check['familywise']['method'] == 'holm_bonferroni'
+            and design_check['familywise']['n_tests'] >= 1
+            and 'n_rows_significantly_above_chance_holm' in design_check,
+            f"{design_check['familywise']}")
     _ok('HCA resolved fraction aggregated',
         row['hca_resolved_fraction_mean'] is not None, '')
     design = report['design']
@@ -542,6 +554,9 @@ def test_hypothesis_checks_contract():
     _ok('trained row carries the indexer-vs-chance check',
         check is not None and 'uniform_union_chance' in check
         and check['verdict'] in (True, False, None), str(check))
+    _ok('a single seed is labelled descriptive, not inferential',
+        check.get('evidence', '').startswith('descriptive')
+        and check.get('p_value_directional') is None, str(check))
     _ok('design-level empirical check aggregated',
         'verdict' in trained['design']['hypothesis_checks']
         ['indexer_union_above_chance'])
