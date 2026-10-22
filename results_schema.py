@@ -1905,6 +1905,9 @@ def load_or_empty(path: str, *, context: str = '') -> tuple[dict, list]:
     except json.JSONDecodeError as e:
         print(f'[results_schema] {label}{path} is malformed: {e}; skipping',
               file=sys.stderr)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f'[results_schema] {label}{path} could not be read: {e}; '
+              'skipping', file=sys.stderr)
     except SchemaError as e:
         print(f'[results_schema] {label}{path}: {e}', file=sys.stderr)
     return {}, []

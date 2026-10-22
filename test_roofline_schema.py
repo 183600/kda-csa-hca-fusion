@@ -103,6 +103,23 @@ def test_schema_future_version_is_refused():
     _ok('non-list results raises SchemaFormatError', raised, 'malformed')
 
 
+def test_load_or_empty_degrades_on_io_and_decode_failures():
+    print("\nTest: load_or_empty tolerates unreadable and non-UTF-8 paths")
+    with tempfile.TemporaryDirectory(prefix='_schema_test_') as tmp:
+        directory = os.path.join(tmp, 'results_dir')
+        os.mkdir(directory)
+        meta, rows = results_schema.load_or_empty(directory)
+        _ok('directory path degrades to empty', (meta, rows) == ({}, []),
+            f'{meta}, {rows}')
+
+        binary = os.path.join(tmp, 'binary.json')
+        with open(binary, 'wb') as f:
+            f.write(b'\xff\xfe{}')
+        meta, rows = results_schema.load_or_empty(binary)
+        _ok('non-UTF-8 file degrades to empty', (meta, rows) == ({}, []),
+            f'{meta}, {rows}')
+
+
 # --- roofline math --------------------------------------------------------
 
 def test_roofline_core_math():
