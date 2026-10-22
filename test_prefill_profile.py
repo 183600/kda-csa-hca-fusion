@@ -267,6 +267,25 @@ def test_profile_emits_throughput_and_drift_rows():
     json.dumps(report, allow_nan=False)
 
 
+def test_profile_handles_empty_prefill():
+    # ``expand_prefill_schedule(0, ...)`` and ``run_prefill_schedule``
+    # both support an empty prompt; the reference row must use the same
+    # empty schedule instead of the invalid literal ``[0]``.
+    model = _tiny_hca()
+    x = torch.zeros(1, 0, 16)
+    report = profile_prefill_schedules(
+        model, x, ['full', '4'], repeats=1, warmup=0)
+    assert report['prefill_len'] == 0
+    assert len(report['rows']) == 1
+    row = report['rows'][0]
+    assert row['is_reference'] is True
+    assert row['n_chunks'] == 0
+    assert row['chunk_sizes'] == []
+    assert row['drift']['finite'] is True
+    assert row['passed'] is True
+    assert report['all_passed'] is True
+
+
 def test_profile_rejects_drifting_schedule():
     class _ChunkSensitive(torch.nn.Module):
         def reset(self):

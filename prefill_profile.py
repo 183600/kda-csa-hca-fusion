@@ -482,7 +482,11 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
         raise ValueError('schedules must not be empty')
     expanded = [expand_prefill_schedule(total_len, s) for s in schedules]
 
-    ref_schedule = [total_len]
+    # An empty prompt already has a well-defined one-shot schedule: no
+    # chunks at all. ``[0]`` is not a valid literal schedule (chunks must
+    # be positive and must not be passed for an empty input), so use the
+    # empty list that ``expand_prefill_schedule(0, ...)`` produces.
+    ref_schedule = [] if total_len == 0 else [total_len]
     ref_row, reference = time_prefill_schedule(
         model, x, [], repeats=repeats, warmup=warmup,
         return_output=True, schedule=ref_schedule)
