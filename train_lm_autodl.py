@@ -254,8 +254,11 @@ class TinyStoriesLM(Dataset):
             if self._prefetch_hits % 64 == 0:
                 fresh = self.tokenizer.encode(
                     text, truncation=True, max_length=self.seq_len + 1)
-                assert list(fresh) == tokens, (
-                    f"prefetch cache mismatch at idx={idx}")
+                if list(fresh) != tokens:
+                    # Explicit raise so ``python -O`` cannot strip the
+                    # stale-cache check and train on wrong tokens.
+                    raise RuntimeError(
+                        f"prefetch cache mismatch at idx={idx}")
         else:
             tokens = self.tokenizer.encode(
                 text, truncation=True, max_length=self.seq_len + 1)

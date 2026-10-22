@@ -273,13 +273,17 @@ def bench_kda_chunk(B, T, H, K, V, device):
                 use_chunk=True,
                 backend=backend,
             )
-            assert o.shape[1] == T, (
-                f"naive_chunk_kda output shape {tuple(o.shape)} does not "
-                f"match input T={T} on dim=1 (sequence). The chunk path "
-                f"is supposed to right-pad T up to a multiple of "
-                f"chunk_size={BT} and trim back to original_T internally; "
-                f"a shape mismatch indicates a regression in the trim "
-                f"logic.")
+            if o.shape[1] != T:
+                # A plain ``assert`` here would be stripped under
+                # ``python -O``, silently accepting a corrupted benchmark
+                # row when the chunk path stops trimming its padding.
+                raise RuntimeError(
+                    f"naive_chunk_kda output shape {tuple(o.shape)} does "
+                    f"not match input T={T} on dim=1 (sequence). The chunk "
+                    f"path is supposed to right-pad T up to a multiple of "
+                    f"chunk_size={BT} and trim back to original_T "
+                    f"internally; a shape mismatch indicates a regression "
+                    f"in the trim logic.")
             return o, s
     return fn
 

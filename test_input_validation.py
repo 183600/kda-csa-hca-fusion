@@ -479,6 +479,37 @@ def test_gate_factory_and_gated_delta_geometry_reject_coercions():
             _ok(f'GatedDeltaRule {args} rejected', False, 'no error raised')
 
 
+def test_benchmark_chunk_shape_guard_survives_python_optimized():
+    """The chunked-KDA trim check must not be a bare ``assert``.
+
+    ``python -O`` strips ``assert`` statements, which would silently accept
+    a chunk-path regression that returns the padded length instead of T and
+    corrupt every benchmark row. The guard is an explicit RuntimeError.
+    """
+    import run_benchmark as rb
+
+    original = rb.kda_forward
+
+    def _wrong_shape(*args, **kwargs):
+        return torch.zeros(1, 4, 1, 2), torch.zeros(1, 1, 2, 2)
+
+    rb.kda_forward = _wrong_shape
+    try:
+        fn = rb.bench_kda_chunk(1, 5, 1, 2, 2, 'cpu')
+        try:
+            fn()
+        except RuntimeError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok('chunk shape guard rejected the padded shape', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok('chunk shape guard rejected the padded shape', False,
+                'no error raised')
+    finally:
+        rb.kda_forward = original
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -573,6 +604,7 @@ if __name__ == '__main__':
     test_decoding_cache_geometry_requires_exact_ints()
     test_online_softmax_chunk_sizes_require_exact_ints()
     test_gate_factory_and_gated_delta_geometry_reject_coercions()
+    test_benchmark_chunk_shape_guard_survives_python_optimized()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()
