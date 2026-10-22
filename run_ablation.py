@@ -1919,14 +1919,28 @@ def tune_simple_baseline_lr(spec, lrs, *, n_kv_list, tune_seeds, steps,
 
 
 def _seed_accuracy_map(result: dict) -> dict[int, float]:
-    """Map seed -> final_acc from a group's per-seed rows (missing = skip)."""
+    """Map seed -> final_acc from a group's per-seed rows (missing = skip).
+
+    A diverged seed can survive with a NaN/string ``final_acc`` (the
+    aggregate path already excludes it). It must not enter a paired
+    contrast either: one NaN poisons the difference, and a string raises
+    inside ``math.isfinite``.
+    """
     out = {}
-    for row in result.get('per_seed', []):
+    per_seed = result.get('per_seed', [])
+    if not isinstance(per_seed, (list, tuple)):
+        return out
+    for row in per_seed:
+        if not isinstance(row, dict) or 'error' in row:
+            continue
         acc = row.get('final_acc')
         seed = row.get('seed')
-        if acc is None or seed is None or not math.isfinite(acc):
+        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
+                or not math.isfinite(float(acc))):
             continue
-        out[int(seed)] = float(acc)
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            continue
+        out[seed] = float(acc)
     return out
 
 

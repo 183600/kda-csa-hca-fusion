@@ -1003,3 +1003,24 @@ def test_lower_tail_bonferroni_quantile_is_the_mirror():
 
     # n < 2 remains the documented "undefined" case.
     assert _bonferroni_crit_q(1, alpha=0.05) is None
+
+
+def test_seed_accuracy_map_ignores_malformed_seed_metrics():
+    """Paired contrasts use only finite numeric per-seed accuracies."""
+    from run_ablation import _seed_accuracy_map
+
+    result = {'per_seed': [
+        {'seed': 1, 'final_acc': 0.4},
+        {'seed': 2, 'final_acc': float('nan')},
+        {'seed': 3, 'final_acc': float('inf')},
+        {'seed': 4, 'final_acc': '0.5'},
+        {'seed': 5, 'final_acc': True},
+        {'seed': 6, 'final_acc': None},
+        {'seed': 7, 'final_acc': 0.7, 'error': 'diverged'},
+        {'seed': 8, 'final_acc': 0.8},
+        {'seed': '9', 'final_acc': 0.9},
+        {'seed': True, 'final_acc': 0.95},
+        'not-a-row',
+    ]}
+    assert _seed_accuracy_map(result) == {1: 0.4, 8: 0.8}
+    assert _seed_accuracy_map({'per_seed': None}) == {}
