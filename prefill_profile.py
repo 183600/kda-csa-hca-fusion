@@ -245,11 +245,22 @@ def run_prefill_schedule(model, x: torch.Tensor, chunks, *,
     if schedule is None:
         schedule = expand_prefill_schedule(total_len, chunks)
     else:
-        schedule = list(schedule)
-        if sum(schedule) != total_len:
-            raise ValueError(
-                f'expanded schedule sums to {sum(schedule)}, expected '
-                f'{total_len}')
+        try:
+            schedule = list(schedule)
+        except TypeError as exc:
+            raise TypeError(
+                'expanded schedule must be a sequence of positive ints, '
+                f'got {type(schedule).__name__}') from exc
+        if total_len == 0:
+            if schedule:
+                raise ValueError(
+                    f'empty input requires an empty schedule, got '
+                    f'{schedule!r}')
+        else:
+            # Reuse the same positivity/sum contract as a user-supplied
+            # literal schedule; otherwise a negative entry (e.g. [-1, T+1])
+            # silently slices weirdly instead of failing.
+            schedule = _literal_schedule(total_len, schedule, schedule)
     _require_reset(model)
     if reset:
         model.reset()

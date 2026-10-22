@@ -168,6 +168,15 @@ def test_run_prefill_schedule_validates():
     with pytest.raises(ValueError):
         run_prefill_schedule(model, x, [4, 1])  # wrong sum
     with pytest.raises(ValueError):
+        run_prefill_schedule(model, x, [-1, 7])  # negative, sum matches
+    with pytest.raises(ValueError):
+        run_prefill_schedule(model, x, [0, 6])  # zero-sized chunk
+    with pytest.raises(TypeError):
+        run_prefill_schedule(model, x, [3.0, 3.0])  # non-int chunk
+    with pytest.raises(ValueError):
+        run_prefill_schedule(model, torch.zeros(1, 0, 8), 'full',
+                             schedule=[1])  # non-empty schedule, empty input
+    with pytest.raises(ValueError):
         run_prefill_schedule(model, torch.randn(1, 6), 'full')  # rank
     with pytest.raises(TypeError):
         run_prefill_schedule(object(), x, 'full')  # no reset()
