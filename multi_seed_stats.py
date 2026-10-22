@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import math
 import random
+import sys
 from statistics import NormalDist
 
 __all__ = [
@@ -237,10 +238,12 @@ def _as_clean_diffs(diffs) -> list[float]:
 
 
 # Numerical-zero rule: a difference vector whose entries are all the same
-# float has exactly zero sample variance. Do not clamp by the ABSOLUTE
-# magnitude of the values: a real spread of 1 around 1e12 is genuine
-# variance, and a relative-to-offset threshold would misreport it as zero
-# (making t / d_z undefined for a perfectly testable sample).
+# float has exactly zero sample variance. For last-ulp differences, the
+# variance residue is at the scale of the values' floating-point resolution,
+# so clamp only when it is within a few ULPs of the ABSOLUTE magnitude. Do
+# NOT use a loose relative epsilon (the old 1e-12 * max|value| threshold
+# zeroed a real spread of 1 around 1e12).
+_ZERO_VAR_ULP_FACTOR = 8.0
 
 
 def _sample_sd(values: list[float], mean: float) -> float | None:
@@ -249,11 +252,14 @@ def _sample_sd(values: list[float], mean: float) -> float | None:
         return None
     # Constant vectors (including values like 0.8 / 0.1 with no exact binary
     # representation) are the only case where mean-subtraction round-off can
-    # leave a non-zero variance residue. Detect that case directly instead of
-    # scaling the tolerance by the absolute values.
+    # leave a non-zero variance residue.
     if all(v == values[0] for v in values):
         return 0.0
     var = math.fsum((v - mean) ** 2 for v in values) / (n - 1)
+    scale = max(abs(mean), max(abs(v) for v in values), 1.0e-300)
+    roundoff = _ZERO_VAR_ULP_FACTOR * sys.float_info.epsilon * scale
+    if var <= roundoff ** 2:
+        return 0.0
     if var <= 0.0:
         return 0.0
     return math.sqrt(var)
