@@ -259,6 +259,7 @@ jobs:
           PROMPT_SCI_4='从可复现性与工程规范的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_SCI_5='从对比实验与消融的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_SCI_6='从结果分析的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          # SINGLE 与 SCI_1~6 一起进入随机池：命中时本轮 sci 做单因素实验检查。
           PROMPT_SINGLE='确保需要是单因素实验的实验都是单因素实验。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_CLEAN='整理仓库：确保仓库里没有实验产物文件（REPORT*.md、临时图表、.pyc、.opencode 残留、临时脚本等）；确保仓库里没有任何关于性能、预算、花费、修复了哪些bug的记录（包括注释）；删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README.md 是项目说明文档，同样必须保留，不能删除或移动；ci_gate.py 是 CI 质量门禁脚本；conftest.py / run_correctness.py / test_figures.py 是对拍测试套件；results_lm/ 是已提交的实验数据；2510.26692v2.pdf、2510.26692v2.txt、2606.19348v1.pdf、2606.19348v1.txt 是论文参考文献——以上全部必须原样保留，绝对不能删除、修改或移动。清理只针对多余内容，不要重构或改动源代码本身。'
 
@@ -271,7 +272,6 @@ jobs:
           PERF_TIMEOUT=$((3*3600))     # 3h
           BUG_TIMEOUT=$((3*3600))      # 3h
           SCI_TIMEOUT=$((3*3600))      # 3h
-          SINGLE_TIMEOUT=$((3600))     # 1h（并入 sci 的单因素实验检查）
           IMPROVE_TIMEOUT=$((3*3600))  # 3h
           CLEAN_TIMEOUT=$((3*3600))    # 3h
 
@@ -916,15 +916,15 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（含单因素检查）-> improve(xuen)（clean 的清理工作交给收尾的 shell 步骤）-----
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（7 选 1，含单因素）-> improve(xuen)（clean 的清理工作交给收尾的 shell 步骤）-----
             # for phase in perf bug sci improve clean; do
             for phase in bug sci improve; do
               case "$phase" in
                 perf)    P="$PROMPT_PERF";    T="$PERF_TIMEOUT"    ;;
                 bug)     P="$PROMPT_BUG";     T="$BUG_TIMEOUT"     ;;
                 sci)
-                  # 科研方法改进：从 PROMPT_SCI_1~6 中随机选一个提示词
-                  SCI_ROLL=$(( (RANDOM % 6) + 1 ))
+                  # 科研方法改进：从 PROMPT_SCI_1~6 + PROMPT_SINGLE 中随机选一个提示词（7 选 1）
+                  SCI_ROLL=$(( (RANDOM % 7) + 1 ))
                   case "$SCI_ROLL" in
                     1) P="$PROMPT_SCI_1"; SCI_LABEL='通用（不指定方面）' ;;
                     2) P="$PROMPT_SCI_2"; SCI_LABEL='实验设计与准备' ;;
@@ -932,6 +932,7 @@ jobs:
                     4) P="$PROMPT_SCI_4"; SCI_LABEL='可复现性与工程规范' ;;
                     5) P="$PROMPT_SCI_5"; SCI_LABEL='对比实验与消融' ;;
                     6) P="$PROMPT_SCI_6"; SCI_LABEL='结果分析' ;;
+                    7) P="$PROMPT_SINGLE"; SCI_LABEL='单因素实验' ;;
                   esac
                   T="$SCI_TIMEOUT"
                   echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
@@ -954,13 +955,6 @@ jobs:
               esac
               PHASE_BASE="$(git rev-parse HEAD)"
               run_phase "$phase" "$P" "$T"
-
-              # 单因素实验检查并入 sci：同一次 sci 阶段内追加一次调用
-              if [ "$phase" = "sci" ]; then
-                echo ">>> iteration #$i | phase=sci-single | budget=${SINGLE_TIMEOUT}s（并入 sci）"
-                run_phase "sci-single" "$PROMPT_SINGLE" "$SINGLE_TIMEOUT"
-              fi
-
               # ---- 质量门禁：通过才提交；不通过则整段撤销 ----
               if gate_check; then
                 commit_and_push "$i-$phase"
