@@ -161,7 +161,12 @@ def _suffix_metrics(reference, observed, start, tol):
     if rel_l2 is not None and not math.isfinite(rel_l2):
         rel_l2 = None
     per_step = diff.amax(dim=(0, 2))
-    hits = (per_step > tol).nonzero()
+    # A NaN survives ``amax`` as NaN, and ``NaN > tol`` is False, so a
+    # state family whose removal poisons the suffix with NaN would be
+    # certified as NOT load-bearing. A non-finite suffix element is a
+    # divergence (and certainly not evidence that the state was unused).
+    nonfinite_step = (~torch.isfinite(diff)).any(dim=(0, 2))
+    hits = ((per_step > tol) | nonfinite_step).nonzero()
     prefix_diff = (reference[:, :start].detach().double()
                    - observed[:, :start].detach().double()).abs()
 
