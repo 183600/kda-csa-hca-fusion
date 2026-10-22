@@ -236,22 +236,25 @@ def _as_clean_diffs(diffs) -> list[float]:
     return out
 
 
-# Relative tolerance for "numerically zero" variance. A perfectly
-# constant difference vector (e.g. every seed improved by a fixed 0.8)
-# can still produce a ~1e-16 residue in the floating-point variance from
-# the mean-subtraction round-off. Treating that residue as real variance
-# turns Cohen's d_z into ~1e16 and the power estimate into 1 seed, so it
-# must be clamped to zero.
-_ZERO_VAR_REL_EPS = 1.0e-12
+# Numerical-zero rule: a difference vector whose entries are all the same
+# float has exactly zero sample variance. Do not clamp by the ABSOLUTE
+# magnitude of the values: a real spread of 1 around 1e12 is genuine
+# variance, and a relative-to-offset threshold would misreport it as zero
+# (making t / d_z undefined for a perfectly testable sample).
 
 
 def _sample_sd(values: list[float], mean: float) -> float | None:
     n = len(values)
     if n < 2:
         return None
-    var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    scale = max(abs(mean), max(abs(v) for v in values), 1.0e-300)
-    if var <= (_ZERO_VAR_REL_EPS * scale) ** 2:
+    # Constant vectors (including values like 0.8 / 0.1 with no exact binary
+    # representation) are the only case where mean-subtraction round-off can
+    # leave a non-zero variance residue. Detect that case directly instead of
+    # scaling the tolerance by the absolute values.
+    if all(v == values[0] for v in values):
+        return 0.0
+    var = math.fsum((v - mean) ** 2 for v in values) / (n - 1)
+    if var <= 0.0:
         return 0.0
     return math.sqrt(var)
 

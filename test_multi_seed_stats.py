@@ -484,6 +484,31 @@ def test_summarize_paired_rejects_nonfinite_inputs():
         M.summarize_paired([1.0, float('inf')])
 
 
+def test_sample_sd_keeps_real_spread_at_a_large_offset():
+    """Only an exactly constant vector is numerically zero-variance.
+
+    The old clamp compared the variance with ``(1e-12 * max|value|)**2``,
+    so a genuine spread of 1 around 1e12 was reported as zero and the
+    paired t-test / d_z / TOST all became undefined.
+    """
+    flat = [1e12, 1e12 + 1.0, 1e12 + 2.0]
+    mean = sum(flat) / len(flat)
+    assert M._sample_sd(flat, mean) == pytest.approx(1.0)
+    t = M.paired_t_test(flat)
+    assert t['sd_diff'] == pytest.approx(1.0)
+    assert t['t_stat'] == pytest.approx(mean / (1.0 / (3 ** 0.5)))
+    assert t['p_value'] is not None
+    assert M.cohens_dz(flat) == pytest.approx(mean)
+    tost = M.tost_paired(flat, margin=0.5)
+    assert tost['sd_diff'] == pytest.approx(1.0)
+    assert tost['p_value'] is not None
+    assert tost['ci_equiv_lo'] < tost['ci_equiv_hi']
+    # Exactly constant vectors (including non-binary values) stay zero.
+    const = [0.1, 0.1, 0.1]
+    assert M._sample_sd(const, sum(const) / 3) == 0.0
+    assert M.paired_t_test(const)['t_stat'] is None
+
+
 def test_summarize_paired_without_margin_has_no_equivalence_claim():
     # Backward compatibility: without a pre-specified margin there must be
     # no TOST block and no equivalence verdict -- a non-significant test

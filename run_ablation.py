@@ -122,7 +122,7 @@ from train_diagnostics import (
 )
 from multi_seed_stats import (
     min_detectable_effect, seeds_required, tost_from_summary,
-    _ZERO_VAR_REL_EPS,
+    _sample_sd,
 )
 
 logger = logging.getLogger(__name__)
@@ -1950,16 +1950,13 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
     diffs = [accs_a[s] - accs_b[s] for s in common]
     n = len(diffs)
     mean_diff = sum(diffs) / n
-    var = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
-    # Same zero-variance convention as multi_seed_stats._sample_sd: a
-    # variance below the relative epsilon is floating-point noise, not
-    # spread. Without this a "flat" sweep that differs in the last ulp
-    # would report an astronomical t-stat and a spurious significance.
-    scale = max(abs(mean_diff), max(abs(d) for d in diffs), 1.0e-300)
-    if var <= (_ZERO_VAR_REL_EPS * scale) ** 2:
+    # Same exact-constant-vector zero-variance convention as
+    # multi_seed_stats._sample_sd: only a genuinely constant sweep has
+    # numerically zero spread, so a real spread around a large common offset
+    # is not mistaken for a flat sweep.
+    std = _sample_sd(diffs, mean_diff)
+    if std is None:
         std = 0.0
-    else:
-        std = math.sqrt(var)
     t_stat = (mean_diff / (std / math.sqrt(n))) if std > 0 else None
     if all(d > 0 for d in diffs):
         unanimous = 'positive'
@@ -2110,13 +2107,9 @@ def _matrix_contrast_report(all_results: list) -> list:
                              + accs['A'][s] for s in sorted(common)]
                     n = len(inter)
                     mean_i = sum(inter) / n
-                    var = sum((x - mean_i) ** 2 for x in inter) / (n - 1)
-                    scale_i = max(abs(mean_i),
-                                  max(abs(x) for x in inter), 1.0e-300)
-                    if var <= (_ZERO_VAR_REL_EPS * scale_i) ** 2:
+                    sd_i = _sample_sd(inter, mean_i)
+                    if sd_i is None:
                         sd_i = 0.0
-                    else:
-                        sd_i = math.sqrt(var)
                     t_i = (mean_i / (sd_i / math.sqrt(n))) \
                         if sd_i > 0 else None
                     if all(x > 0 for x in inter):
@@ -2751,17 +2744,14 @@ def _contrast_consistency_violations(all_results: list,
     def paired_stats(diffs: list):
         """Mean and sample SD of per-seed differences.
 
-        Mirrors ``_paired_contrast``'s zero-variance convention (relative
-        epsilon): a "flat" sweep with last-ulp noise reports SD 0.0, not
-        a tiny positive spread.
+        Uses the same exact-constant-vector convention as
+        ``multi_seed_stats._sample_sd``: a real spread around a large
+        common offset is not mistaken for a flat sweep.
         """
         n = len(diffs)
         mean = sum(diffs) / n
-        var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
-        scale = max(abs(mean), max(abs(d) for d in diffs), 1.0e-300)
-        if var <= (_ZERO_VAR_REL_EPS * scale) ** 2:
-            return mean, 0.0
-        return mean, math.sqrt(var)
+        sd = _sample_sd(diffs, mean)
+        return mean, (0.0 if sd is None else sd)
 
     def paired_mean(a_map: dict, b_map: dict):
         common = sorted(set(a_map) & set(b_map))
