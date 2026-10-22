@@ -185,10 +185,35 @@ def test_headwise_empty_sequence_and_empty_head_groups():
         raise AssertionError('negative head count was silently accepted')
 
 
+def test_headwise_invalid_compression_geometry_is_rejected():
+    """Zero/negative compression factors and top-k fail at construction."""
+    base = dict(d_model=16, H_total=2, H_kda=0, H_csa=1, H_hca=1,
+                head_dim=4, csa_m=2, csa_topk=1, hca_m2=2,
+                csa_c=4, hca_c=4)
+    for field, value in (('csa_m', 0), ('csa_m', -1),
+                         ('hca_m2', 0), ('hca_m2', 2.0),
+                         ('csa_topk', -1), ('csa_topk', True)):
+        kwargs = dict(base, **{field: value})
+        try:
+            HeadwiseFusedAttention(HeadwiseConfig(**kwargs))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'{field}={value!r} was silently accepted')
+    # top-k = 0 is a valid "no sparse blocks" ablation in the operators.
+    cfg = HeadwiseConfig(**dict(base, csa_topk=0))
+    model = HeadwiseFusedAttention(cfg).eval()
+    y = model(torch.randn(2, 3, cfg.d_model))
+    _ok('csa_topk=0 remains a valid ablation',
+        y.shape == (2, 3, cfg.d_model) and bool(torch.isfinite(y).all()), '')
+
+
 _TEST_FUNCS = [
     test_headwise_csa_and_hca_use_the_softmax_limit_for_positive_inf,
     test_headwise_fully_masked_rows_are_still_zeroed,
     test_headwise_empty_sequence_and_empty_head_groups,
+    test_headwise_invalid_compression_geometry_is_rejected,
 ]
 
 

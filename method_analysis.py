@@ -183,6 +183,24 @@ class HeadwiseFusedAttention(nn.Module):
                 "Prototype requires csa_c == hca_c == head_dim "
                 f"(got csa_c={cfg.csa_c}, hca_c={cfg.hca_c}, "
                 f"head_dim={cfg.head_dim})")
+        # Compression factors and the sparse-selection width feed the
+        # branch arithmetic directly (T % m, torch.topk). Validate them at
+        # construction so a bad config raises a named ValueError instead of
+        # a bare ZeroDivisionError deep in the forward or a topk error after
+        # all parameters have already been allocated.
+        for _name in ('csa_m', 'hca_m2'):
+            _value = getattr(cfg, _name)
+            if (not isinstance(_value, int) or isinstance(_value, bool)
+                    or _value < 1):
+                raise ValueError(
+                    f"HeadwiseConfig.{_name}={_value!r} must be a positive "
+                    f"int.")
+        _topk = cfg.csa_topk
+        if (not isinstance(_topk, int) or isinstance(_topk, bool)
+                or _topk < 0):
+            raise ValueError(
+                f"HeadwiseConfig.csa_topk={_topk!r} must be a "
+                f"non-negative int.")
         d, hd = cfg.d_model, cfg.head_dim
 
         self.kda_q = nn.Linear(d, cfg.H_kda * hd, bias=False)
