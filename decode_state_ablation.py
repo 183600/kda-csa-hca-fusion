@@ -78,8 +78,9 @@ def available_state_parts(decoder) -> dict:
 
 
 def _resolve_parts(decoder, parts):
+    available = available_state_parts(decoder)
     if parts is None:
-        parts = DECODE_STATE_PARTS
+        parts = tuple(p for p in DECODE_STATE_PARTS if available[p])
     if isinstance(parts, str):
         parts = (parts,)
     parts = tuple(parts)
@@ -90,7 +91,6 @@ def _resolve_parts(decoder, parts):
         raise ValueError(
             f'decode_state_ablation: unknown part(s) {unknown}; choose '
             f'from {list(DECODE_STATE_PARTS)}.')
-    available = available_state_parts(decoder)
     missing = [p for p in parts if not available[p]]
     if missing:
         raise ValueError(

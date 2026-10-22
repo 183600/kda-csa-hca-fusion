@@ -591,6 +591,24 @@ def test_hybrid_decode_state_ablation(device):
          f"{causal['incremental_prefix_max_abs_diff']:.3e}")
 
 
+def test_decode_state_ablation_defaults_to_owned_parts(device):
+    """``parts=None`` means all AVAILABLE families, not all families."""
+    from decode_state_ablation import (available_state_parts,
+                                       decode_state_ablation)
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(919)
+    cfg = dataclasses.replace(_kda_cfg(0), n_kda=2, n_csa=0, n_hca=0)
+    decoder = HybridDecoding(cfg=cfg, total_layers=2).to(device).eval()
+    x = torch.randn(2, 6, cfg.d_model, device=device) * 0.4
+    available = available_state_parts(decoder)
+    expected = [p for p, owned in available.items() if owned]
+    with torch.no_grad():
+        result = decode_state_ablation(decoder, x, prefill_len=2)
+    assert result['parts'] == expected
+    assert {a['part'] for a in result['arms']} == set(expected)
+
+
 def test_hybrid_streaming_tp_causality(device):
     """Streaming TP carries state without leaking future tokens.
 
