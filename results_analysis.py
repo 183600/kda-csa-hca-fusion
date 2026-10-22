@@ -866,6 +866,17 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
     if t and v < 1:
         raise ValueError('logits must have a non-empty vocabulary')
     valid = labels != int(ignore_index)
+    if valid.any():
+        # A label outside the vocabulary used to be clamped into range for
+        # the rank lookup, silently scoring a different token and emitting
+        # a plausible category. Refuse it: a malformed label is a data bug,
+        # not a model failure.
+        bad_label = valid & ((labels < 0) | (labels >= v))
+        if bool(bad_label.any()):
+            raise ValueError(
+                f'labels contain {int(bad_label.sum())} token id(s) outside '
+                f'[0, vocab={v}) (ignoring {ignore_index}); fix the label '
+                f'pipeline before computing token bad-case diagnostics')
     if t == 0:
         empty = torch.zeros(b, 0, dtype=torch.long, device=logits.device)
         return {

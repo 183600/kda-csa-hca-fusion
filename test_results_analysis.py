@@ -927,6 +927,12 @@ def test_lm_token_diagnostics_rejects_malformed_inputs():
                        torch.tensor([[False, True]])):
         with pytest.raises(ValueError):
             lm_token_diagnostics(logits, bad_labels, input_ids)
+    for bad_labels in (torch.tensor([[0, vocab]]),
+                       torch.tensor([[0, -2]])):
+        with pytest.raises(ValueError, match='outside'):
+            lm_token_diagnostics(logits, bad_labels, input_ids)
+    # The ignore index may itself be negative and is not a bad label.
+    lm_token_diagnostics(logits, torch.tensor([[0, -100]]), input_ids)
     with pytest.raises(ValueError):
         lm_token_diagnostics(logits, labels, input_ids.to(torch.float32))
     with pytest.raises(ValueError):
@@ -1086,8 +1092,11 @@ def test_analyze_lm_errors_sample_ids_point_at_the_dataset_row():
             return 6
 
         def __getitem__(self, i):
-            ids = torch.arange(4) + i
-            labels = ids.clone()
+            # Valid token ids for the stand-in's vocab=8, with a deliberate
+            # off-by-one label so a wrong prediction is available. The test
+            # is about row indices, not label validity.
+            ids = (torch.arange(4) + i) % 8
+            labels = (ids + 1) % 8
             if i < 2:
                 labels[:] = -100
             return {'input_ids': ids, 'labels': labels}
