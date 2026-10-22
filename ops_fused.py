@@ -404,6 +404,26 @@ class HybridConfig:
         if not isinstance(self.n_heads_v, int) or isinstance(self.n_heads_v, bool) or self.n_heads_v < 1:
             raise ValueError(
                 f"n_heads_v={self.n_heads_v!r} must be a positive int")
+        # Validate the layer counts BEFORE they are read as numbers. The
+        # KDA-GVA check below compares ``self.n_kda > 0`` and the all-zero
+        # ratio guard adds the three counts; doing either on a string/float
+        # would raise a bare ``TypeError`` (or silently accept a bool) instead
+        # of the documented, actionable ValueError.
+        for name, val in [
+            ('n_kda', self.n_kda),
+            ('n_csa', self.n_csa),
+            ('n_hca', self.n_hca),
+        ]:
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be an int.")
+            if val < 0:
+                raise ValueError(
+                    f"HybridConfig.{name}={val} must be >= 0. A negative "
+                    f"value would silently produce an empty layer list "
+                    f"(Python's ``[x] * n`` semantics), building a model "
+                    f"with no {name.replace('n_', '').upper()} layers "
+                    f"instead of crashing loudly.")
         # Only KDA uses the GVA expansion; a CSA/HCA-only explicit layout
         # must not be constrained by an unused KDA head ratio.
         if self.layout is None:
@@ -508,21 +528,6 @@ class HybridConfig:
         # Python's ``[layer] * n`` semantics (``[x] * -1 == []``), so a
         # typo like ``n_kda=-1`` would silently build a model with NO
         # KDA layers instead of raising. Reject negative values up-front.
-        for name, val in [
-            ('n_kda', self.n_kda),
-            ('n_csa', self.n_csa),
-            ('n_hca', self.n_hca),
-        ]:
-            if not isinstance(val, int) or isinstance(val, bool):
-                raise ValueError(
-                    f"HybridConfig.{name}={val!r} must be an int.")
-            if val < 0:
-                raise ValueError(
-                    f"HybridConfig.{name}={val} must be >= 0. A negative "
-                    f"value would silently produce an empty layer list "
-                    f"(Python's ``[x] * n`` semantics), building a model "
-                    f"with no {name.replace('n_', '').upper()} layers "
-                    f"instead of crashing loudly.")
         if self.layout is None and self.n_kda + self.n_csa + self.n_hca == 0:
             raise ValueError(
                 f"HybridConfig has n_kda=n_csa=n_hca=0 and no explicit "
