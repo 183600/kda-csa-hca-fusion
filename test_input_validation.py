@@ -196,6 +196,38 @@ def test_csa_decode_step_validates_indexer_operands():
             _ok(f'{name} rejected', False, f'{type(exc).__name__}: {exc}')
 
 
+def test_backend_validators_reject_non_string_values():
+    """Unhashable / non-string backend names are ValueError, not TypeError.
+
+    ``backend not in {...}`` raises ``TypeError: unhashable type`` for a
+    list/dict, bypassing the documented validation contract. The three
+    adapters (KDA, Mamba-2, RWKV-7) must reject every non-string value
+    with the same actionable ``ValueError`` as an unknown string.
+    """
+    from ops_kda_backend import validate_kda_backend
+    from ops_mamba_backend import validate_mamba_backend
+    from ops_rwkv_backend import validate_rwkv_backend
+
+    validators = (
+        ('KDA', validate_kda_backend, 'reference'),
+        ('Mamba-2', validate_mamba_backend, 'reference'),
+        ('RWKV-7', validate_rwkv_backend, 'reference'),
+    )
+    for name, validate, good in validators:
+        assert validate(good) == good
+        for bad in (['reference'], {'backend': 'reference'}, None, 1, True):
+            try:
+                validate(bad)
+            except ValueError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - the point is the type
+                _ok(f'{name} backend {bad!r} rejected', False,
+                    f'{type(exc).__name__}: {exc}')
+            else:
+                _ok(f'{name} backend {bad!r} rejected', False,
+                    'no error raised')
+
+
 def test_memory_mixers_reject_coerced_integer_config_fields():
     """RWKV-7 / Mamba-2 config ints are validated, not ``int()``-truncated.
 
@@ -252,5 +284,6 @@ if __name__ == '__main__':
     test_online_softmax_rejects_non_boolean_mask()
     test_decoding_cache_to_rejects_non_float_storage_dtype()
     test_csa_decode_step_validates_indexer_operands()
+    test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     print('all input-validation tests passed')

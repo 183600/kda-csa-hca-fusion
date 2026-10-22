@@ -33,7 +33,7 @@ _REFERENCE_OPS = None
 
 def validate_kda_backend(backend: str) -> str:
     """Validate and return a KDA backend name."""
-    if backend not in _VALID_BACKENDS:
+    if not isinstance(backend, str) or backend not in _VALID_BACKENDS:
         raise ValueError(
             f"kda_backend={backend!r} must be one of "
             f"{sorted(_VALID_BACKENDS)}.")

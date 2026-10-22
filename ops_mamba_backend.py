@@ -56,7 +56,7 @@ _IMPORT_ERROR: Exception | None = None
 
 def validate_mamba_backend(backend: str) -> str:
     """Validate and return a Mamba-2 backend name."""
-    if backend not in _VALID_BACKENDS:
+    if not isinstance(backend, str) or backend not in _VALID_BACKENDS:
         raise ValueError(
             f"mamba_backend={backend!r} must be one of "
             f"{sorted(_VALID_BACKENDS)}.")

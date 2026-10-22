@@ -87,7 +87,7 @@ _DECAY_PARAM_CACHE: dict[Any, str] = {}
 
 def validate_rwkv_backend(backend: str) -> str:
     """Validate and return an RWKV-7 backend name."""
-    if backend not in _VALID_BACKENDS:
+    if not isinstance(backend, str) or backend not in _VALID_BACKENDS:
         raise ValueError(
             f"rwkv_backend={backend!r} must be one of "
             f"{sorted(_VALID_BACKENDS)}.")
