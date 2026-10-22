@@ -499,6 +499,30 @@ def test_fp8_fake_quantize_contract():
         f"{byte_row['state_bytes']}")
 
 
+def test_fp8_state_recall_probe():
+    print('\nTest: FP8 state on the planted-recall probe')
+    keys, values = planted_batch(16, 8, seed=0, device='cpu')
+    for route in ('kda', 'mamba2'):
+        fp16 = run_planted_recall(route, keys, values, None)
+        mx = run_planted_recall(route, keys, values, FP8Spec())
+        i8 = run_planted_recall(route, keys, values, QuantSpec(8, 64))
+        _ok(f'{route}: MXFP8 state keeps exact recall (pinned seed)',
+            mx['readback_recall'] == 1.0,
+            f"recall={mx['readback_recall']}, "
+            f"err={mx['max_read_error']:.3f}")
+        _ok(f'{route}: MXFP8 read-back error exceeds int8 (coarser mantissa)',
+            mx['max_read_error'] > i8['max_read_error'] > 0.0,
+            f"fp8={mx['max_read_error']:.3f}, "
+            f"int8={i8['max_read_error']:.3f}")
+        _ok(f'{route}: FP8 recall does not exceed the fp16 reference',
+            mx['readback_recall'] <= fp16['readback_recall'], '')
+    try:
+        run_planted_recall('kda', keys, values, 'fp8')
+        _ok('non-spec FP8 argument rejected', False, 'no error')
+    except TypeError:
+        _ok('non-spec FP8 argument rejected', True)
+
+
 _TEST_FUNCS = [
     test_quant_spec_accounting,
     test_quantized_row_bytes_bridge,
@@ -507,6 +531,7 @@ _TEST_FUNCS = [
     test_quant_recall_report_rows,
     test_fp8_spec_and_grid,
     test_fp8_fake_quantize_contract,
+    test_fp8_state_recall_probe,
 ]
 
 

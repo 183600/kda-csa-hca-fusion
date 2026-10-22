@@ -102,6 +102,23 @@ the useful negative result: FP8 state storage is a short/medium-context
 lever, not a long-context one, unless the retrieval caches are quantized
 too.
 
+## State-damage probe (Exp 10 planted recall)
+
+`run_quant_recall.run_planted_recall` now accepts an `FP8Spec` and routes it
+through the same quantize-after-every-write stepwise path. On the pinned
+16-key/8-value orthonormal-key probe both routes keep **exact** read-back
+recall under MXFP8, but the value error is larger than int8 because E4M3FN
+has 3 mantissa bits versus int8's 8-bit uniform grid:
+
+| route | fp16 max read error | int8/g64 | MXFP8 (E4M3FN/g32) |
+|---|---:|---:|---:|
+| KDA | 0.0 | 0.047 | 0.170 |
+| Mamba-2 | 0.0 | 0.050 | 0.232 |
+
+Exact recall here is a best-case association property, not an end-task
+quality claim; the state error is the quantity that grows with real,
+correlated keys.
+
 ## Scope / honesty
 
 * `FP8Spec` simulates storage numerics, not a fused FP8 kernel's throughput.

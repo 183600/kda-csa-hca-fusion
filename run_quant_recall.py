@@ -86,6 +86,7 @@ from kaggle_setup import (  # noqa: E402
 )
 from kv_quant import (  # noqa: E402
     FP16_BITS,
+    FP8Spec,
     QuantSpec,
     bits_per_element,
     compression_ratio,
@@ -217,17 +218,19 @@ def _decode_recall(reads: torch.Tensor, values: torch.Tensor):
 
 
 def run_planted_recall(route: str, keys: torch.Tensor, values: torch.Tensor,
-                       spec: QuantSpec | None = None) -> dict:
+                       spec: QuantSpec | FP8Spec | None = None) -> dict:
     """One planted-recall episode for one route and quantization spec.
 
     ``spec=None`` is the full-precision reference (no quantization).
+    ``FP8Spec`` exercises the block-scaled FP8 grid through the same
+    stepwise quantize-after-write path.
     """
     if route not in _STATE_FN:
         raise ValueError(f'run_planted_recall: unknown route {route!r}; '
                          f'expected one of {list(ROUTES)}.')
-    if spec is not None and not isinstance(spec, QuantSpec):
-        raise TypeError(f'run_planted_recall: spec must be None or a '
-                        f'QuantSpec, got {spec!r}')
+    if spec is not None and not isinstance(spec, (QuantSpec, FP8Spec)):
+        raise TypeError(f'run_planted_recall: spec must be None, a '
+                        f'QuantSpec or an FP8Spec, got {spec!r}')
     state = _STATE_FN[route](keys, values, spec,
                              quantize_after_write=spec is not None)
     reads = read_back(route, keys, state)
