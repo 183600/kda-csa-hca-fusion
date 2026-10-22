@@ -137,6 +137,19 @@ def bench_decode_prefill(device='cpu', *, seq_len: int = DP_SEQ_LEN,
     """
     from lm_consistency import build_decoding_clone
 
+    # The parity gate uses a PAIRED bootstrap over windows: fewer than two
+    # windows makes the paired p-value undefined, and a one-token window has
+    # no next-token targets at all. Reject those degenerate schedules up
+    # front instead of failing later in ``math.isfinite(None)`` / the
+    # paired bootstrap's empty-informative-unit guard.
+    for name, value, minimum in (('seq_len', seq_len, 2),
+                                 ('n_windows', n_windows, 2)):
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or value < minimum:
+            raise ValueError(
+                f'bench_decode_prefill: {name}={value!r} must be an int '
+                f'>= {minimum}.')
+
     model = _tiny_hybrid_lm(device)
     clone = build_decoding_clone(model, device=device)
     gen = torch.Generator(device='cpu').manual_seed(3)
@@ -185,10 +198,13 @@ def bench_decode_prefill(device='cpu', *, seq_len: int = DP_SEQ_LEN,
     parity_ok = max_window_diff <= DP_WINDOW_TOL_NLL
     effect_ok = (abs(delta) <= DP_EFFECT_TOL_NLL
                  and abs(ratio - 1.0) <= DP_EFFECT_TOL_RATIO)
-    finite_ok = all(math.isfinite(v) for v in (
+    finite_values = [
         pre_stat['mean_nll'], dec_stat['mean_nll'], delta,
         paired['ci_delta_mean_nll'][0], paired['ci_delta_mean_nll'][1],
-        ratio, paired['p_value']))
+        ratio]
+    if paired['p_value'] is not None:
+        finite_values.append(paired['p_value'])
+    finite_ok = all(math.isfinite(v) for v in finite_values)
     return [{
         'section': 'decode_prefill',
         'n_windows': int(n_windows),
