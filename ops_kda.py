@@ -265,7 +265,11 @@ def _validate_g_clamp_min(value, fn_name):
         raise TypeError(
             f"{fn_name}: g_clamp_min={value!r} must be a real number or "
             f"-inf (clamp disabled).")
-    if _math.isnan(float(value)):
+    # ``value != value`` is the NaN predicate. Unlike ``math.isnan(float(...))``
+    # it is a Python comparison on a constant, so a ``torch.compile``
+    # fullgraph trace can fold it instead of emitting a non-Tensor ``isnan``
+    # call (which Dynamo rejects).
+    if value != value:
         raise ValueError(f"{fn_name}: g_clamp_min must not be NaN.")
     if value == float('inf'):
         raise ValueError(
