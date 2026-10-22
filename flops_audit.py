@@ -426,6 +426,66 @@ def mamba2_path(cfg) -> str:
         else 'sequential'
 
 
+def mamba2_canonical_terms(cfg, T: int, batch: int = 1) -> dict:
+    """Term-by-term decomposition of the canonical Mamba-2 prefill FLOPs.
+
+    Mirrors ``prefill_flops('mamba2')``; ``sum(values)`` equals
+    ``canonical_flops('mamba2', ...)``. The ``scan`` term charges the three
+    state-sized MACs the ideal recurrence performs (decayed update,
+    ``x (x) B`` outer product, ``C @ S^T`` readout); only the readout
+    dispatches as a GEMM in the reference implementation.
+    """
+    _validate('mamba2', T, batch)
+    d = cfg.d_model
+    d_inner = cfg.mamba_expand * d
+    headdim = cfg.mamba_headdim
+    d_state = cfg.mamba_d_state
+    ngroups = cfg.mamba_ngroups
+    nheads = d_inner // headdim
+    dt_rank_cfg = cfg.mamba_dt_rank
+    dt_rank = (max(1, (d + 15) // 16)
+               if isinstance(dt_rank_cfg, str) else int(dt_rank_cfg))
+    b = float(batch)
+    return {
+        'in_proj': b * 2 * T * d * 2 * d_inner,
+        'conv': b * 2 * T * d_inner * cfg.mamba_d_conv,
+        'x_proj': b * 2 * T * d_inner * (dt_rank + 2 * ngroups * d_state),
+        'dt_proj': b * 2 * T * dt_rank * nheads,
+        'scan': b * 2 * 3 * T * nheads * headdim * d_state,
+        'out_proj': b * 2 * T * d_inner * d,
+    }
+
+
+def mamba2_broadcast_encoded_macs(cfg, T: int, batch: int = 1) -> int:
+    """State-sized MACs the sequential reference encodes elementwise.
+
+    The decayed update ``decay * S + x_dt`` and the ``x (x) B`` outer
+    product are broadcast elementwise kernels, not GEMMs. Two state-sized
+    MACs per token are therefore missing from the dispatch ledger; the
+    readout ``C @ S^T`` is the one scan contraction that does dispatch.
+    """
+    _validate('mamba2', T, batch)
+    if mamba2_path(cfg) != 'sequential':
+        raise NotImplementedError(
+            'flops_audit: the chunked Mamba-2 scan has a different '
+            'broadcast/GEMM split; call measure_forward() instead.')
+    nheads = (cfg.mamba_expand * cfg.d_model) // cfg.mamba_headdim
+    return batch * 2 * T * nheads * cfg.mamba_headdim * cfg.mamba_d_state
+
+
+def mamba2_executed_flops(cfg, T: int, batch: int = 1) -> float:
+    """Exact FLOPs executed by the sequential reference Mamba-2 layer.
+
+    ``2 * reference_gemm_macs + 2 * broadcast_encoded_macs``. This equals
+    the canonical ``prefill_flops('mamba2')`` for the sequential path
+    (pinned by the regression suite), which is why the accounting gap is
+    the broadcast encoding rather than a missing model term.
+    """
+    _validate('mamba2', T, batch)
+    return (2.0 * mamba2_reference_gemm_macs(cfg, T, batch)
+            + 2.0 * mamba2_broadcast_encoded_macs(cfg, T, batch))
+
+
 def mamba2_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
     """Exact GEMM+conv MACs executed by the reference ``Mamba2Mixer``.
 
@@ -576,6 +636,12 @@ def audit_layer(kind: str, cfg, T: int, batch: int = 1, *,
             cfg, T, batch)
     elif kind == 'mamba2':
         result['path'] = mamba2_path(cfg)
+        if result['path'] == 'sequential':
+            result['canonical_terms'] = mamba2_canonical_terms(
+                cfg, T, batch)
+            result['executed_flops'] = mamba2_executed_flops(cfg, T, batch)
+            result['broadcast_encoded_macs'] = (
+                mamba2_broadcast_encoded_macs(cfg, T, batch))
     if model_macs is not None:
         result['model_matches_measurement'] = (
             model_macs == ledger.gemm_macs)
@@ -609,7 +675,7 @@ def _format_table(rows: list) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description='Measured GEMM-work audit of the reference operators.')
-    parser.add_argument('--kinds', default='kda,csa,hca',
+    parser.add_argument('--kinds', default='kda,mamba2,csa,hca',
                         help='comma-separated layer kinds (default: all)')
     parser.add_argument('--seq-lens', default='32,64,128,256',
                         help='comma-separated sequence lengths')
@@ -628,9 +694,9 @@ def main() -> int:
     print(_format_table(rows))
     print()
     for row in rows:
-        if row['kind'] != 'kda':
+        if row['kind'] not in ('kda', 'mamba2'):
             continue
-        print(f"KDA T={row['T']:>4} ({row['path']}): "
+        print(f"{row['kind'].upper()} T={row['T']:>4} ({row['path']}): "
               f"canonical={row['canonical_flops'] / 1e6:.3f}M "
               f"executed={row['executed_flops'] / 1e6:.3f}M "
               f"ref_gemm={row['reference_gemm_flops'] / 1e6:.3f}M "

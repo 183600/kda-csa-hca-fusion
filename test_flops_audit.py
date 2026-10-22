@@ -165,6 +165,20 @@ def test_mamba2_exact_model_sequential(T, device):
     assert row['canonical_flops'] > 0
 
 
+def test_mamba2_canonical_terms_and_executed_identity(device):
+    cfg = _cfg()
+    for T in (1, 8, 32, 63, 100):
+        row = fa.audit_layer('mamba2', cfg, T, device=device)
+        terms = row['canonical_terms']
+        assert abs(sum(terms.values()) - row['canonical_flops']) < 1e-9
+        assert abs(row['executed_flops'] - row['canonical_flops']) < 1e-9, (
+            T, row['executed_flops'], row['canonical_flops'])
+        assert row['executed_flops'] == (
+            2 * row['reference_gemm_macs']
+            + 2 * row['broadcast_encoded_macs'])
+        assert terms['scan'] == 3 * row['broadcast_encoded_macs']
+
+
 def test_mamba2_exact_model_rejects_unmodelled_path(device):
     cfg = _cfg(mamba_chunk_size=16)
     row = fa.audit_layer('mamba2', cfg, 64, device=device)

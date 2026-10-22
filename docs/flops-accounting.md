@@ -74,9 +74,13 @@ GEMM MACs **exactly** for the tested `T` (including padded `T=100`):
   x_proj (`dt_rank + 2*G*N`), dt_proj, the sequential scan's per-step
   `baddbmm` readout (`nheads*headdim*d_state`), and out_proj. The state
   update and output gate are elementwise and stay out of the GEMM ledger,
-  exactly like KDA's broadcast-encoded terms. The chunked SSD scan and a
-  non-reference backend raise `NotImplementedError` rather than being
-  priced with the sequential model.
+  exactly like KDA's broadcast-encoded terms. The identity
+  `2 * reference_gemm_macs + 2 * broadcast_encoded_macs == canonical_flops`
+  holds for the sequential path, and `mamba2_canonical_terms` exposes the
+  per-term decomposition; `scan` is `3 * broadcast_encoded_macs` (one
+  dispatched readout + two elementwise state MACs). The chunked SSD scan
+  and a non-reference backend raise `NotImplementedError` rather than
+  being priced with the sequential model.
 
 `associated_scan` (KDA's alternative core) is not modelled: `audit_layer`
 raises rather than mis-pricing it. Likewise the chunked Mamba-2 scan
