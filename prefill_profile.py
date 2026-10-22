@@ -357,6 +357,14 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
     max_abs = abs_diff.max()
     mean_abs = abs_diff.mean()
     rms = torch.sqrt(torch.mean(diff * diff))
+    if not bool(torch.isfinite(rms)):
+        # ``diff**2`` can overflow even when the RMS itself is
+        # representable (e.g. a 2e200 difference in fp64). Scale before
+        # squaring; the ordinary in-range value above is unchanged bit for
+        # bit.
+        scale = abs_diff.max()
+        if bool(torch.isfinite(scale)) and float(scale) > 0.0:
+            rms = torch.sqrt(torch.mean((diff / scale) ** 2)) * scale
 
     def _safe_norm(t):
         norm = torch.linalg.vector_norm(t)

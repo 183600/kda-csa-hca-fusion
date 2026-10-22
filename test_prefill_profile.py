@@ -343,6 +343,19 @@ if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
 
 
+def test_drift_metrics_rms_survives_squaring_overflow():
+    # 2e200 is finite in fp64, but squaring it overflows. The RMS is still
+    # representable and must be reported, not silently dropped.
+    ref = torch.tensor([1e200], dtype=torch.float64)
+    cand = torch.tensor([-1e200], dtype=torch.float64)
+    drift = drift_metrics(ref, cand)
+    assert drift['finite'] is True
+    assert drift['max_abs'] == pytest.approx(2e200, rel=1e-12)
+    assert drift['rms'] == pytest.approx(2e200, rel=1e-12)
+    import json
+    json.dumps(drift, allow_nan=False)
+
+
 def test_drift_metrics_huge_finite_tensors_are_json_safe():
     import json
     a = torch.tensor([[1e154, 1e154]], dtype=torch.float64)
