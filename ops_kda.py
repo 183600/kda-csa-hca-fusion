@@ -119,7 +119,8 @@ def per_channel_log_decay_bias(
     half_lives = float(min_half_life) * torch.exp(fractions * log_span)
     target = (torch.log(torch.tensor(2.0, dtype=torch.float64))
               / half_lives / float(decay_scale))
-    channel_bias = torch.log(torch.expm1(target)).to(torch.float32)
+    inverse = target + torch.log(-torch.expm1(-target))
+    channel_bias = inverse.to(torch.float32)
     return channel_bias.repeat(n_heads)
 
 
