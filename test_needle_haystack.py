@@ -513,6 +513,23 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         and summary['distance_degradation_verdict'] is None,
         f"{summary['distance_effects']}")
 
+    # Malformed recall rows must be skipped, not read as pos=0 / acc=0.0
+    # (which would invent a third distance point and bias both extremes).
+    malformed = degrading + [
+        {'row_kind': 'needle_recall', 'memory_type': 'kda',
+         'dtype': 'fp32', 'quantized': False, 'accuracy_mean': 0.5,
+         'hypothesis_checks': {}},                      # missing context/pos
+        _row(256, 'bad', 'kda', 0.1, 'fp32'),
+        _row(256, 128, 'kda', float('nan'), 'fp32'),
+        _row(256, 128, 'kda', True, 'fp32'),
+    ]
+    summary = summarize_needle_hypotheses(malformed)
+    _ok('malformed recall rows are skipped from the distance axis',
+        len(summary['distance_effects']) == 1
+        and summary['distance_effects'][0]['near_needle_pos'] == 192
+        and summary['distance_effects'][0]['far_needle_pos'] == 64,
+        f"{summary['distance_effects']}")
+
 
 def test_learned_retrieval_familywise_correction():
     """Repeated dtype/PTQ rows must not count as independent evidence.

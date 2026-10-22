@@ -1341,10 +1341,24 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
     # highest at the farthest one and bias the verdict).
     by_axis: dict[tuple, dict[int, list[float]]] = {}
     for r in unquant:
-        key = (r.get('context_len'), r.get('memory_type'))
-        pos = int(r.get('needle_pos', 0))
-        by_axis.setdefault(key, {}).setdefault(pos, []).append(
-            float(r.get('accuracy_mean', 0.0)))
+        if not isinstance(r, dict):
+            continue
+        context_len = r.get('context_len')
+        pos = r.get('needle_pos')
+        acc = r.get('accuracy_mean')
+        # A malformed row (missing / string / non-finite value) must not be
+        # silently read as position 0 / accuracy 0.0: that would invent a
+        # distance point and pull the extreme-position mean toward zero.
+        if (isinstance(context_len, bool)
+                or not isinstance(context_len, int) or context_len < 0
+                or isinstance(pos, bool)
+                or not isinstance(pos, int) or pos < 0
+                or isinstance(acc, bool)
+                or not isinstance(acc, (int, float))
+                or not math.isfinite(float(acc))):
+            continue
+        key = (context_len, r.get('memory_type'))
+        by_axis.setdefault(key, {}).setdefault(pos, []).append(float(acc))
 
     def _distance(key, pos: int) -> int:
         context_len = key[0]
