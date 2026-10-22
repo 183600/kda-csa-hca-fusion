@@ -418,6 +418,17 @@ def test_ablation_design_audit():
         and unpaired['controlled_variables']['seed_alignment_ok'] is False,
         str(unpaired['controlled_variables']))
 
+    # Malformed per-seed records must be skipped, not crash the audit.
+    malformed_rows = _controlled_rows()
+    malformed_rows[0]['per_seed'] = ['not-a-row', None]
+    malformed = M.ablation_design_audit(subset, rows=malformed_rows)
+    _ok('malformed per-seed records are skipped',
+        malformed['controlled_variables']['controls_status']
+        == 'seed_mismatch'
+        and malformed['controlled_variables']['successful_seeds_by_variant']
+        ['baseline'] == [],
+        str(malformed['controlled_variables']))
+
     # A seed that survived with a non-finite accuracy is excluded from the
     # aggregate; the audit must not count it as a successful seed either.
     diverged_rows = _controlled_rows()
@@ -573,6 +584,7 @@ def test_summarize_variant_ignores_malformed_metrics():
         dict(common, seed=5, final_acc=0.8, final_loss=1.0,
              gold_recall=float('nan'), gold_pr_auc='0.7',
              chance_gold_pr_auc=float('inf')),
+        'not-a-record',
     ]
     row = M.summarize_variant(per_seed, variant)
     assert row['n_seeds_total'] == len(per_seed)
@@ -582,6 +594,7 @@ def test_summarize_variant_ignores_malformed_metrics():
     assert row['n_gold_ranking_seeds'] == 1
     assert row['mean_gold_recall'] == 0.25
     assert row['chance_gold_pr_auc'] == 0.1
+    assert row['seeds'] == [1, 2, 3, 4, 5]
 
 
 _TEST_FUNCS = [

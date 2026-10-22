@@ -864,8 +864,10 @@ def summarize_variant(per_seed, variant):
                     / (std_recall / math.sqrt(len(recalls))))
     else:
         recall_t = None
-    skip_reason = next((r['gold_recall_skipped_reason'] for r in per_seed
-                        if r.get('gold_recall_skipped_reason')), None)
+    skip_reason = next(
+        (r['gold_recall_skipped_reason'] for r in per_seed
+         if isinstance(r, dict) and r.get('gold_recall_skipped_reason')),
+        None)
 
     # Seed-aggregated ranking quality of the gold block (threshold-free).
     # The primary metrics are macro-averaged per query; chance references
@@ -917,11 +919,14 @@ def summarize_variant(per_seed, variant):
         'rope': bool(variant['rope']),
         'topk': int(variant['topk']),
         'use_ste': bool(variant['use_ste']),
-        'n_kv': ok[0]['n_kv'] if ok else per_seed[0].get('n_kv'),
+        'n_kv': (ok[0]['n_kv'] if ok else
+                 next((r.get('n_kv') for r in per_seed
+                       if isinstance(r, dict)), None)),
         'layout': ok[0]['layout'] if ok else None,
         'n_seeds_ok': len(ok),
         'n_seeds_total': len(per_seed),
-        'seeds': [r['seed'] for r in per_seed],
+        'seeds': [r.get('seed') for r in per_seed
+                  if isinstance(r, dict) and r.get('seed') is not None],
         'per_seed': per_seed,
         'mean_acc': mean_acc,
         'std_acc': std_acc,
@@ -1077,12 +1082,18 @@ def ablation_design_audit(variants, rows=None, requested=None,
     }
     if rows is not None:
         def _observed(row, field):
+            if not isinstance(row, dict):
+                return None
             value = row.get(field)
             if value is None:
-                for seed_row in row.get('per_seed') or []:
-                    value = seed_row.get(field)
-                    if value is not None:
-                        break
+                per_seed = row.get('per_seed')
+                if isinstance(per_seed, (list, tuple)):
+                    for seed_row in per_seed:
+                        if not isinstance(seed_row, dict):
+                            continue
+                        value = seed_row.get(field)
+                        if value is not None:
+                            break
             return value
 
         recipe_fields = ('steps', 'train_batch', 'lr')
@@ -1093,6 +1104,8 @@ def ablation_design_audit(variants, rows=None, requested=None,
         requested_seeds: dict[str, set] = {}
         successful_seeds: dict[str, set] = {}
         for r in rows:
+            if not isinstance(r, dict):
+                continue
             name = r.get('variant')
             if name is None:
                 continue
@@ -1102,11 +1115,22 @@ def ablation_design_audit(variants, rows=None, requested=None,
             for field in observed_fields:
                 value = _observed(r, field)
                 if value is not None:
-                    values[name][field].add(value)
-            for seed in r.get('seeds') or []:
-                requested_seeds[name].add(seed)
-            for seed_row in r.get('per_seed') or []:
-                if ('error' in seed_row
+                    try:
+                        values[name][field].add(value)
+                    except TypeError:
+                        # An unhashable observation is not a usable design
+                        # field; it must not abort the whole audit.
+                        pass
+            seeds_field = r.get('seeds')
+            if isinstance(seeds_field, (list, tuple)):
+                for seed in seeds_field:
+                    if isinstance(seed, int) and not isinstance(seed, bool):
+                        requested_seeds[name].add(seed)
+            per_seed_field = r.get('per_seed')
+            if not isinstance(per_seed_field, (list, tuple)):
+                per_seed_field = []
+            for seed_row in per_seed_field:
+                if (not isinstance(seed_row, dict) or 'error' in seed_row
                         or _finite_metric(seed_row, 'final_acc') is None):
                     # A seed whose accuracy never became a finite
                     # measurement did not contribute to the aggregate, so
@@ -1114,7 +1138,9 @@ def ablation_design_audit(variants, rows=None, requested=None,
                     # audit either (otherwise a diverged seed would leave
                     # controls_status='controlled').
                     continue
-                successful_seeds[name].add(seed_row.get('seed'))
+                seed = seed_row.get('seed')
+                if isinstance(seed, int) and not isinstance(seed, bool):
+                    successful_seeds[name].add(seed)
 
         names_with_rows = [n for n in names if n in values]
 
