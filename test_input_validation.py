@@ -736,10 +736,79 @@ def test_t0_memory_mixers_reject_wrong_full_state_geometry():
     rwkv.forward_functional(x_rwkv, None, torch.zeros(1, 1, 64))
 
 
+def test_csa_hca_geometry_requires_exact_ints():
+    """Bool/float geometry must not silently mean a different operator.
+
+    ``m=True`` used to mean ``m=1`` (one token per compressed block) and a
+    float chunk factor reached ``view``/``topk`` with an opaque error. The
+    public CSA/HCA operators now share the repository's exact-int contract;
+    valid integer geometry is unchanged.
+    """
+    from ops_csa import (
+        csa_compress_kv, csa_compress_kv_overlapped,
+        csa_lightning_indexer, naive_csa,
+    )
+    from ops_hca import naive_hca
+
+    B, T, c, c_I = 1, 4, 3, 2
+    C = torch.randn(B, T, c)
+    Z = torch.randn(B, T, c)
+    B_pos = torch.randn(2, c)
+    for bad in (True, 1.0, '2', None):
+        for fn, args in (
+                (csa_compress_kv, (C, Z, B_pos, bad)),
+                (csa_compress_kv_overlapped,
+                 (C, C, Z, Z, B_pos, B_pos, bad)),
+        ):
+            try:
+                fn(*args)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(
+                    f'{fn.__name__} accepted m={bad!r}')
+    # The valid integer path still works (T must be divisible by m).
+    csa_compress_kv(C, Z, B_pos, 2)
+    csa_compress_kv_overlapped(C, C, Z, Z, B_pos, B_pos, 2)
+
+    q_idx = torch.randn(1, 2, 1, c_I)
+    k_idx = torch.randn(1, 2, c_I)
+    w_idx = torch.randn(1, 2, 1)
+    for bad in (True, 1.0, '1', None):
+        try:
+            csa_lightning_indexer(q_idx, k_idx, w_idx, topk=bad)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(
+                f'csa_lightning_indexer accepted topk={bad!r}')
+    csa_lightning_indexer(q_idx, k_idx, w_idx, topk=1)
+
+    H = torch.zeros(1, 3, 4)
+    for name, fn, kwargs in (
+            ('naive_csa', naive_csa,
+             dict(m=2, topk=1, nh=1, nIh=1, c=2, c_I=2, dc=2)),
+            ('naive_hca', naive_hca,
+             dict(m2=2, nh=1, c=2, dc=2)),
+    ):
+        key = 'm' if name == 'naive_csa' else 'm2'
+        for bad in (True, 2.0, '2'):
+            patch = dict(kwargs)
+            patch[key] = bad
+            try:
+                fn(H, *(None,) * (13 if name == 'naive_csa' else 5),
+                   **patch)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f'{name} accepted {key}={bad!r}')
+
+
 if __name__ == '__main__':
     test_gated_delta_rule_rejects_geometry_mismatch()
     test_gated_delta_rule_step_rejects_unknown_gate_type()
     test_t0_memory_mixers_reject_wrong_full_state_geometry()
+    test_csa_hca_geometry_requires_exact_ints()
     test_gated_delta_rule_check_survives_python_optimized()
     test_online_softmax_rejects_non_boolean_mask()
     test_decoding_cache_to_rejects_non_float_storage_dtype()

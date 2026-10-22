@@ -115,6 +115,26 @@ _SW_TILE_DENSIFY_MAX = 5_000_000
 _SLIDING_WINDOW_MASK_CACHE: dict = {}
 
 
+def _require_int_geometry(fn_name: str, name: str, value,
+                          minimum: int = 1) -> int:
+    """Require an exact int geometry value (bool is not a dimension).
+
+    The public CSA/HCA operators are also called directly by the test and
+    analysis code, so they must defend their own contract. A bool silently
+    becomes 0/1 (e.g. ``m=True`` means one token per block), and a float
+    either truncates through ``//`` or fails later inside ``view`` with an
+    opaque error. Both are configuration bugs the caller needs to see.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f'{fn_name}: {name}={value!r} must be an int '
+            f'({"positive" if minimum >= 1 else f">= {minimum}"}).')
+    if value < minimum:
+        raise ValueError(
+            f'{fn_name}: {name}={value} must be >= {minimum}.')
+    return value
+
+
 def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:
     """Cached ``[T, win]`` boolean mask (True = real position)."""
     key = (T, win, str(device))
@@ -498,8 +518,7 @@ def csa_compress_kv(
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
     # are silently stripped under optimization.
-    if m < 1:
-        raise ValueError(f"compression factor m={m} must be >= 1")
+    _require_int_geometry('csa_compress_kv', 'm', m)
     if T % m != 0:
         raise ValueError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
@@ -540,8 +559,7 @@ def csa_compress_kv_overlapped(
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
     # are silently stripped under optimization.
-    if m < 1:
-        raise ValueError(f"compression factor m={m} must be >= 1")
+    _require_int_geometry('csa_compress_kv_overlapped', 'm', m)
     if T % m != 0:
         raise ValueError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
@@ -1244,9 +1262,8 @@ def csa_lightning_indexer(
     # NOTE: use ``raise ValueError`` (NOT ``assert``) so the check
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
     # are silently stripped under optimization.
-    if topk < 0:
-        raise ValueError(
-            f"topk={topk} must be >= 0 (0 selects zero blocks)")
+    _require_int_geometry('csa_lightning_indexer', 'topk', topk,
+                          minimum=0)
     # ``query_chunk`` tiles the QUERY axis (see the docstring section of the
     # same name). Negative values are rejected rather than silently treated
     # as "disabled": a typo like ``query_chunk=-4096`` would otherwise run
@@ -1565,50 +1582,34 @@ def naive_csa(
     # are silently stripped under optimization.
     # ``raise ValueError`` is the standard exception for invalid user input
     # (``run_correctness.py::test_csa_hca_input_validation`` expects it).
-    if m < 1:
-        raise ValueError(f"compression factor m={m} must be >= 1")
-    if topk < 0:
-        raise ValueError(
-            f"topk={topk} must be >= 0 (0 disables sparse selection)")
-    if nh < 1:
-        raise ValueError(f"nh={nh} must be >= 1")
-    if c < 1:
-        raise ValueError(f"c={c} must be >= 1")
-    if dc < 1:
-        raise ValueError(f"dc={dc} must be >= 1")
+    _require_int_geometry('naive_csa', 'm', m)
+    _require_int_geometry('naive_csa', 'topk', topk, minimum=0)
+    _require_int_geometry('naive_csa', 'nh', nh)
+    _require_int_geometry('naive_csa', 'c', c)
+    _require_int_geometry('naive_csa', 'dc', dc)
     # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) are
     # validated here, not inside ``csa_lightning_indexer``: the explicit
     # ``scale=c_I ** -0.5`` below requires c_I > 0, and ``nIh == 0`` makes
     # the indexer produce an all-zero ``logits`` tensor (the ``sum(1)``
     # over an empty head dim is 0), so top-k selects the first k blocks for
     # every query. Reject both up-front.
-    if c_I < 1:
-        raise ValueError(f"c_I={c_I} must be >= 1 (indexer key dim)")
-    if nIh < 1:
-        raise ValueError(f"nIh={nIh} must be >= 1 (indexer head count)")
+    _require_int_geometry('naive_csa', 'c_I', c_I)
+    _require_int_geometry('naive_csa', 'nIh', nIh)
     # ``sliding_window`` is gated by ``if sliding_window > 0`` below, so a
     # negative value silently skips the SW branch (looking like the caller
     # intentionally disabled it). A negative window is never a meaningful
     # configuration — reject it so the caller learns about the typo instead
     # of getting a model with no local-attention branch.
-    if sliding_window < 0:
-        raise ValueError(
-            f"sliding_window={sliding_window} must be >= 0 "
-            f"(0 disables the branch)")
+    _require_int_geometry('naive_csa', 'sliding_window', sliding_window,
+                          minimum=0)
     # ``indexer_chunk`` tiles the indexer's QUERY axis (see
     # ``csa_lightning_indexer``'s ``query_chunk``). 0 = disabled (the
     # historical full-sequence scoring); a positive value bounds the peak
     # per-head score tensor to ``B · nIh · indexer_chunk · n_blocks``.
     # Negative values would silently run the untiled path (looking like a
     # memory bound was applied) — reject them.
-    if not isinstance(indexer_chunk, int) or isinstance(indexer_chunk, bool):
-        raise ValueError(
-            f"indexer_chunk={indexer_chunk!r} must be an int (0 disables "
-            f"query-axis tiling of the lightning indexer).")
-    if indexer_chunk < 0:
-        raise ValueError(
-            f"indexer_chunk={indexer_chunk} must be >= 0 "
-            f"(0 disables query-axis tiling).")
+    _require_int_geometry('naive_csa', 'indexer_chunk', indexer_chunk,
+                          minimum=0)
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (i.e. when ``normalize_qk=True``, see the normalization block below),
     # their dot product is a cosine similarity in ``[-1, 1]`` and the natural

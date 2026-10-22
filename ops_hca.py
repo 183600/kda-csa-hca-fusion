@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from ops_csa import (
+    _require_int_geometry,
     csa_compress_kv,
     _causal_block_mask,
     _causal_block_mask_invalid,
@@ -117,18 +118,12 @@ def naive_hca(
     causal block mask ensures no real token attends to it.
     """
     B_, T, d = H.shape
-    if m2 < 1:
-        raise ValueError(f"heavy compression factor m2={m2} must be >= 1")
-    if nh < 1:
-        raise ValueError(f"nh={nh} must be >= 1")
-    if c < 1:
-        raise ValueError(f"c={c} must be >= 1")
-    if dc < 1:
-        raise ValueError(f"dc={dc} must be >= 1")
-    if sliding_window < 0:
-        raise ValueError(
-            f"sliding_window={sliding_window} must be >= 0 "
-            f"(0 disables the branch)")
+    _require_int_geometry('naive_hca', 'm2', m2)
+    _require_int_geometry('naive_hca', 'nh', nh)
+    _require_int_geometry('naive_hca', 'c', c)
+    _require_int_geometry('naive_hca', 'dc', dc)
+    _require_int_geometry('naive_hca', 'sliding_window', sliding_window,
+                          minimum=0)
     if not torch.is_floating_point(H):
         raise TypeError(
             f"naive_hca: H must be a floating-point tensor, got dtype={H.dtype}")
