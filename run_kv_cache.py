@@ -36,8 +36,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import (sanitize_for_json, write_json_atomic,
-                          capture_provenance)
+from kaggle_setup import (append_run_manifest, sanitize_for_json,
+                          write_json_atomic, capture_provenance,
+                          make_run_manifest_entry)
 from results_schema import envelope, write as write_results
 
 
@@ -923,6 +924,23 @@ def main():
                                        metadata=metadata)),
             'results/exp3_kv_cache.json', indent=2, default=str)
     print('\nSaved: results/exp3_kv_cache.json')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp3_kv_cache',
+        seeds=[],
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'seq_lengths': seq_lengths,
+            'ops': ops,
+            'accounting_modes': metadata['accounting_modes'],
+            'bytes_convention': metadata['bytes_convention'],
+            'randomness': 'none (analytic closed-form accounting)',
+        },
+        artifacts={'results': 'results/exp3_kv_cache.json'},
+        results={
+            'n_rows': len(rows),
+            'max_T': max(seq_lengths),
+        },
+    ))
     return 0
 
 

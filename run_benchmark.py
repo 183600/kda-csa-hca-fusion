@@ -36,8 +36,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (
-    configure_torch_for_device, parse_int_env, sanitize_for_json,
-    write_json_atomic, capture_provenance, make_seeded_generator,
+    append_run_manifest, configure_torch_for_device, parse_int_env,
+    sanitize_for_json, write_json_atomic, capture_provenance,
+    make_run_manifest_entry, make_seeded_generator,
 )
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa
@@ -929,6 +930,7 @@ def main():
         write_json_atomic(sanitize_for_json(results),
                           'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
+    prov = None
     try:
         prov = capture_provenance()
         # This benchmark seeds per-(op, T) generators rather than a global
@@ -947,6 +949,35 @@ def main():
         logger.warning(f'failed to write provenance: {e}')
     logger.info('\nSaved: results/exp2_benchmark.json')
     n_errors = sum(1 for r in results if 'error' in r)
+    # Record the exact per-(op, T) input seeds rather than a fake global
+    # seed: the benchmark is deliberately independent of process RNG state.
+    used_seeds = sorted({
+        (zlib.crc32(str(r['op']).encode('utf-8')) & 0xFFFFFFFF)
+        ^ ((int(r['T']) * 2654435761) & 0xFFFFFFFF)
+        for r in results if 'op' in r and 'T' in r})
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp2_benchmark',
+        seeds=used_seeds,
+        provenance=prov,
+        hyperparameters={
+            'device': str(device),
+            'seq_lengths': seq_lengths,
+            'model_geometry': {'B': B, 'H': H, 'K': K, 'V': V, 'd': d},
+            'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
+            'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
+            'seed_scheme': ('per-(op, T) zlib.crc32 seeds; scoped weight '
+                            'init restores the caller RNG state'),
+        },
+        artifacts={
+            'results': 'results/exp2_benchmark.json',
+            'provenance': 'results/exp2_benchmark_provenance.json',
+        },
+        results={
+            'n_rows': len(results),
+            'n_errors': int(n_errors),
+        },
+        status=('completed' if not n_errors else 'partial'),
+    ), logger=logger)
     if n_errors:
         logger.error(
             f'\n{n_errors}/{len(results)} (T, op) cells errored out. '

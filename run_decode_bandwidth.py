@@ -34,7 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import roofline  # noqa: E402
 
 import decode_bandwidth as db  # noqa: E402
-from kaggle_setup import (capture_provenance, configure_torch_for_device,  # noqa: E402
+from kaggle_setup import (append_run_manifest, capture_provenance,  # noqa: E402
+                          configure_torch_for_device, make_run_manifest_entry,
                           sanitize_for_json, write_results_json)
 from ops_fused import HybridConfig  # noqa: E402
 
@@ -242,6 +243,23 @@ def main(argv=None) -> int:
     os.makedirs(os.path.dirname(args.json) or '.', exist_ok=True)
     write_results_json(payload, args.json, logger=logger)
     print(f'[exp13] wrote {args.json}')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp13_decode_bandwidth',
+        seeds=[],
+        provenance=payload['provenance'],
+        hyperparameters={
+            'config': payload['config'],
+            'method': payload['method'],
+            'randomness': 'none (analytic traffic ledger; host bandwidth '
+                          'measured, not sampled)',
+        },
+        artifacts={'results': args.json},
+        results={
+            'n_routes': len(payload['routes']),
+            'n_routes_ok': sum(1 for r in payload['routes']
+                               if r.get('status') == 'ok'),
+        },
+    ), logger=logger)
     return 0
 
 

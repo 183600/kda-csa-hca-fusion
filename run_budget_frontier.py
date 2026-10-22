@@ -94,8 +94,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
+    make_run_manifest_entry,
     parse_int_env,
     set_global_seed,
 )
@@ -963,9 +965,35 @@ def main():
     logger.info(f'\nSaved: {RESULTS_PATH}')
 
     errors = sum(1 for r in decode_rows if 'error' in r)
-    if (not any(r['section'] == 'budget_curve' for r in rows)
-            or not any(r['section'] == 'decode_budget_curve' for r in rows)
-            or errors):
+    complete = (any(r['section'] == 'budget_curve' for r in rows)
+                and any(r['section'] == 'decode_budget_curve' for r in rows)
+                and not errors)
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp9_budget_frontier',
+        seeds=DECODE_SWEEP_SEED,
+        provenance=metadata['provenance'],
+        hyperparameters={
+            't_grid': t_grid,
+            'decode_sweep': metadata['decode_sweep'],
+            'geometries': specs,
+            'kda_backend': metadata['kda_backend'],
+            'seed_scheme': metadata['seed_scheme'],
+            'join_sources': metadata['join_sources'],
+        },
+        data={
+            'kind': 'analytical_kv_read_budget',
+            'join_skipped': join_skipped,
+        },
+        artifacts={'results': RESULTS_PATH},
+        results={
+            'n_rows': len(rows),
+            'decode_sweep_errors': int(errors),
+            'complete': bool(complete),
+            'source_audit_status': source_audit['status'],
+        },
+        status=('completed' if complete else 'partial'),
+    ), logger=logger)
+    if not complete:
         logger.error(
             f'\nexp9 incomplete: {errors} decode-sweep cells errored; '
             f'returning non-zero.')

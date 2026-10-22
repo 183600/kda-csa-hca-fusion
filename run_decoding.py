@@ -44,8 +44,10 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import (configure_torch_for_device, write_json_atomic,
-                          make_seeded_generator, capture_provenance)
+from kaggle_setup import (append_run_manifest, configure_torch_for_device,
+                          write_json_atomic, make_seeded_generator,
+                          capture_provenance, make_run_manifest_entry,
+                          set_global_seed)
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa, _qk_normalize
 from ops_hca import naive_hca
@@ -1692,9 +1694,10 @@ def main():
         'hybrid_mamba2': lambda: HybridDecoding(d_model, memory_type='mamba2'),
         'hybrid_rwkv7': lambda: HybridDecoding(d_model, memory_type='rwkv7'),
     }
-    # Seed the global RNG before constructing any model so each operator's
-    # weights are deterministic across runs (the ``main()`` path otherwise
-    # consumes the unseeded process RNG; timing rows would not be reproducible).
+    # Seed every RNG family before constructing any model. The per-model
+    # torch.manual_seed(0) below pins the weight stream; set_global_seed also
+    # covers Python/NumPy/CUDA so no unrecorded stream can leak in.
+    set_global_seed(0, deterministic=True)
     torch.manual_seed(0)
 
     results = []
@@ -1894,7 +1897,8 @@ def main():
         'ops': list(models),
         'seeds': {
             'value': 0,
-            'scheme': ('torch.manual_seed(0) before every model '
+            'scheme': ('set_global_seed(0) covers Python/NumPy/torch/CUDA; '
+                       'torch.manual_seed(0) before every model '
                        'construction and make_seeded_generator(0) for the '
                        'prefill/decode inputs; see run_decoding.main / '
                        'bench_decoding'),
@@ -1930,7 +1934,8 @@ def main():
         prov = capture_provenance()
         prov['seeds'] = {
             'value': 0,
-            'scheme': ('torch.manual_seed(0) before every model '
+            'scheme': ('set_global_seed(0) covers Python/NumPy/torch/CUDA; '
+                       'torch.manual_seed(0) before every model '
                        'construction and make_seeded_generator(0) for the '
                        'prefill/decode inputs; see run_decoding.main / '
                        'bench_decoding'),
@@ -1943,6 +1948,28 @@ def main():
     # ``run_all._run`` records the experiment as ``status='fail'`` instead
     # of silently treating a partial run as success.
     n_errors = sum(1 for r in results if 'error' in r)
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp6_decoding',
+        seeds=0,
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'device': metadata['device'],
+            'prefill_lens': metadata['prefill_lens'],
+            'n_decode': metadata['n_decode'],
+            'n_repeats': metadata['n_repeats'],
+            'ops': metadata['ops'],
+            'seed_scheme': metadata['seeds']['scheme'],
+        },
+        artifacts={
+            'results': 'results/exp6_decoding.json',
+            'provenance': 'results/exp6_decoding_provenance.json',
+        },
+        results={
+            'n_rows': len(results),
+            'n_errors': int(n_errors),
+        },
+        status=('completed' if not n_errors else 'partial'),
+    ))
     if n_errors:
         print(
             f'\n[result] {n_errors}/{len(results)} (prefill_len, op) cells '
