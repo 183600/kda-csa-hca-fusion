@@ -38,7 +38,8 @@ sys.path.insert(0, HERE)
 
 import torch  # noqa: E402
 
-from online_softmax import online_softmax_attention  # noqa: E402
+from online_softmax import (  # noqa: E402
+    online_softmax_attention, online_softmax_state)
 
 
 def _ok(name, cond, detail=''):
@@ -229,7 +230,21 @@ def test_shared_kv_mqa_gqa_and_query_tiling():
         _ok('negative query_chunk is rejected', False, 'no ValueError')
 
 
+def test_empty_key_block_is_rejected_with_a_clear_error():
+    q = torch.randn(1, 1, 2, 4)
+    k = torch.randn(1, 1, 0, 4)
+    v = torch.randn(1, 1, 0, 4)
+    try:
+        online_softmax_state(q, k, v)
+    except ValueError as exc:
+        _ok('empty key block raises ValueError',
+            'empty' in str(exc).lower(), str(exc))
+    else:
+        _ok('empty key block raises ValueError', False, 'no ValueError')
+
+
 _TEST_FUNCS = [
+    test_empty_key_block_is_rejected_with_a_clear_error,
     test_singleton_key_axis_mask_survives_key_chunking,
     test_materialized_masks_are_still_sliced_per_chunk,
     test_masked_reference_matches_dense_reference,

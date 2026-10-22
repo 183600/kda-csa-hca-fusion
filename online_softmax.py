@@ -146,6 +146,11 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         raise ValueError(
             'online_softmax_state: q/k feature dims must match; got '
             f'{q.shape[-1]} vs {k.shape[-1]}.')
+    if k.shape[2] == 0:
+        raise ValueError(
+            'online_softmax_state: the key/value block is empty (Nc=0); '
+            'there is no score row to reduce. Skip empty key chunks or use '
+            'the all-masked/empty-row contract instead.')
     group = q.shape[1] // k.shape[1]
     if group > 1:
         # Shared-KV expansion.  Keeping the original ``Hkv`` head axis
