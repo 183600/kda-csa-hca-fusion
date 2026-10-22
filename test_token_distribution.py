@@ -290,3 +290,25 @@ def test_length_shift_normal_and_missing_cases_remain_json_safe():
     assert nonfinite['cohen_d'] is None
     assert nonfinite['flag'] is None
     json.dumps(nonfinite, allow_nan=False)
+
+
+def test_length_shift_extreme_finite_values_are_json_safe():
+    # Finite SDs near the float limit used to raise OverflowError while
+    # squaring, hiding a genuine shift instead of reporting it.
+    shifted = _distribution_shift(
+        {'mean_tokens': 0.0, 'std_tokens': 1e308},
+        {'mean_tokens': 1e308, 'std_tokens': 1e308})
+    assert shifted['cohen_d'] == 1.0
+    assert shifted['flag'] is True
+    assert shifted['mean_difference'] == 1e308
+    json.dumps(shifted, allow_nan=False)
+
+    # The raw difference of two finite near-limit values can itself exceed
+    # the float range; it must not smuggle inf into the record.
+    overflow = _distribution_shift(
+        {'mean_tokens': -1e308, 'std_tokens': 1.0},
+        {'mean_tokens': 1e308, 'std_tokens': 1.0})
+    assert overflow['mean_difference'] is None
+    assert overflow['flag'] is True
+    assert overflow['cohen_d'] is None
+    json.dumps(overflow, allow_nan=False)

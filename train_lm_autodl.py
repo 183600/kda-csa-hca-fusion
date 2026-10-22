@@ -1047,7 +1047,23 @@ def _distribution_shift(train_stats, other_stats, *, threshold=0.5):
     if s_t is None or s_o is None or s_t < 0.0 or s_o < 0.0:
         return _invalid('invalid standard deviation')
     mean_difference = m_o - m_t
-    pooled = math.sqrt((s_t ** 2 + s_o ** 2) / 2.0)
+    mean_difference_finite = math.isfinite(mean_difference)
+    # ``s ** 2`` raises OverflowError on CPython for finite inputs near the
+    # float limit, and even when it returns a value the intermediate sum can
+    # overflow. Keep the historical expression for ordinary inputs (so the
+    # reported values are unchanged) and fall back to scaled arithmetic only
+    # when that expression cannot produce a finite pooled SD.
+    try:
+        pooled = math.sqrt((s_t ** 2 + s_o ** 2) / 2.0)
+    except OverflowError:
+        pooled = math.inf
+    if not math.isfinite(pooled):
+        scale = max(s_t, s_o)
+        if scale == 0.0:
+            pooled = 0.0
+        else:
+            pooled = scale * (
+                math.hypot(s_t / scale, s_o / scale) / math.sqrt(2.0))
     zero_pooled = pooled == 0.0
     if zero_pooled:
         # The standardized effect is undefined when both splits are
@@ -1055,13 +1071,31 @@ def _distribution_shift(train_stats, other_stats, *, threshold=0.5):
         cohen_d = 0.0 if mean_difference == 0.0 else None
         flag = mean_difference != 0.0
     else:
-        ratio = mean_difference / pooled
-        if math.isfinite(ratio):
+        ratio = (mean_difference / pooled) if mean_difference_finite else None
+        if ratio is not None and math.isfinite(ratio):
             cohen_d = ratio
             flag = abs(ratio) >= threshold_value
         else:
-            cohen_d = None
-            flag = True
+            # Both the difference and/or the pooled SD can be outside the
+            # representable float range even though all inputs are finite.
+            # A common scaling leaves the standardized effect unchanged.
+            scale = max(abs(m_t), abs(m_o), s_t, s_o, 1.0)
+            scaled_pooled = math.hypot(s_t / scale, s_o / scale) / math.sqrt(
+                2.0)
+            if scaled_pooled > 0.0:
+                scaled_ratio = ((m_o / scale) - (m_t / scale)) / scaled_pooled
+            else:
+                scaled_ratio = math.inf
+            if math.isfinite(scaled_ratio):
+                cohen_d = scaled_ratio
+                flag = abs(scaled_ratio) >= threshold_value
+            else:
+                cohen_d = None
+                flag = True
+    if not mean_difference_finite:
+        # +-max float values can differ by more than the float range can
+        # represent. ``null`` is the JSON-safe statement of that fact.
+        mean_difference = None
     return {
         'reference': 'train',
         'cohen_d': cohen_d,
@@ -3495,10 +3529,12 @@ def main():
         _d = shift_val['cohen_d']
         _d_text = ('undefined (zero within-split variance)'
                    if _d is None else f'{_d:.3f}')
+        _mean_diff = shift_val['mean_difference']
+        _mean_text = ('unrepresentable (outside float range)'
+                      if _mean_diff is None else f'{_mean_diff:.3f}')
         print(f"[data] WARNING: val token-length distribution differs from "
-              f"train (Cohen's d={_d_text}, mean difference="
-              f"{shift_val['mean_difference']:.3f}); the held-out loss may "
-              f"not be exchangeable with train")
+              f"train (Cohen's d={_d_text}, mean difference={_mean_text}); "
+              f"the held-out loss may not be exchangeable with train")
     if token_shift_val['flag']:
         _excess = token_shift_val['excess'] or {}
         print(f"[data] WARNING: val token distribution differs from train "
