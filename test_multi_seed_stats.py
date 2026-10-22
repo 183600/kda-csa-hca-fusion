@@ -79,6 +79,26 @@ def test_paired_t_numerical_integration_cross_check():
     assert abs((1.0 - cdf) - M.paired_t_test(diffs)['p_value']) < 1e-9
 
 
+def test_student_t_survival_tail_stays_positive():
+    """The upper-tail p-value must not collapse to 0 below machine epsilon.
+
+    Closed form for dof=1: P(T > t) = 0.5 - atan(t)/pi. Computing it as
+    1 - CDF used to underflow to exactly 0.0, turning a tiny but real
+    p-value into a fabricated certainty.
+    """
+    t_value = 1.0e6
+    tail = 0.5 - math.atan(t_value) / math.pi
+    assert math.isclose(M.student_t_sf(t_value, 1), tail, rel_tol=1e-9)
+    assert M.student_t_sf(t_value, 1) > 0.0
+    for dof in (2, 3, 5, 10):
+        cdf = M.student_t_cdf(5.0, dof)
+        sf = M.student_t_sf(5.0, dof)
+        assert math.isclose(cdf + sf, 1.0, rel_tol=1e-12)
+        assert sf > 0.0
+        assert M.paired_t_test([0.0] * (dof - 1) + [10.0 * math.sqrt(dof)])[
+            'p_value'] > 0.0
+
+
 def test_paired_t_directional_pvalue_is_half_the_two_sided():
     t2 = M.paired_t_test([1, 2, 3, 4, 5])
     tg = M.paired_t_test([1, 2, 3, 4, 5], alternative='greater')

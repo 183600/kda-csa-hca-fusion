@@ -189,8 +189,25 @@ def student_t_cdf(t_value: float, dof: int) -> float:
 
 
 def student_t_sf(t_value: float, dof: int) -> float:
-    """Survival function ``P(T > t)`` of Student's t."""
-    return 1.0 - student_t_cdf(t_value, dof)
+    """Survival function ``P(T > t)`` of Student's t.
+
+    Computed from the same incomplete-beta tail as the CDF rather than as
+    ``1 - cdf``: the subtraction cancels catastrophically in the upper
+    tail, where it used to return exactly 0.0 for every p-value below
+    machine epsilon (e.g. t=100, dof=5 should be 9.48e-10). P-values must
+    stay positive however extreme the evidence is.
+    """
+    if dof <= 0:
+        raise ValueError(f'student_t_sf requires dof > 0, got {dof!r}')
+    if not math.isfinite(t_value):
+        return 0.0 if t_value > 0 else 1.0
+    if t_value == 0.0:
+        return 0.5
+    x = dof / (dof + t_value * t_value)
+    ib = betainc_regularized(0.5 * dof, 0.5, x)
+    if t_value > 0.0:
+        return 0.5 * ib
+    return 1.0 - 0.5 * ib
 
 
 # ---------------------------------------------------------------------------
