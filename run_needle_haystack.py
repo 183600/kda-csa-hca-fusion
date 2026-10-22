@@ -109,7 +109,7 @@ from kv_quant import (
     storage_bytes,
 )
 from ops_fused import HybridConfig, HybridKCHAttention, _memory_layer_lookback
-from multi_seed_stats import summarize_paired
+from multi_seed_stats import holm_adjust, summarize_paired
 from run_decoding import HybridDecoding
 from results_schema import write as write_schema
 from train_diagnostics import (
@@ -1091,6 +1091,127 @@ def _needle_row_hypothesis_checks(
     return checks
 
 
+def _needle_learned_retrieval_family_key(row: dict) -> tuple:
+    """One hypothesis per trained model and evaluation geometry.
+
+    The same trained weights are evaluated under several dtypes / PTQ specs
+    and, when ``train_context_len`` is pinned, at several evaluation
+    contexts. Those rows are repeated measurements of the SAME model, so
+    counting each as independent evidence of ``learned_retrieval``
+    overstates the family. The key keeps the architecture, training
+    geometry and evaluation geometry distinct, while the precision cells
+    collapse to one primary test per key.
+    """
+    return (
+        row.get('memory_type'),
+        row.get('n_layers'),
+        row.get('n_kda'),
+        row.get('n_csa'),
+        row.get('n_hca'),
+        row.get('train_context_len'),
+        row.get('train_needle_pos'),
+        row.get('context_len'),
+        row.get('needle_pos'),
+    )
+
+
+def _needle_primary_precision_rank(row: dict) -> tuple:
+    """Prefer the unquantized reference cell, then the widest format."""
+    if not row.get('quantized'):
+        dtype_rank = {'fp32': 0, 'fp16': 1, 'bf16': 2}.get(
+            str(row.get('dtype')), 3)
+        return (0, dtype_rank, 0, 0, '')
+    return (
+        1,
+        int(row.get('bits') or 0),
+        int(row.get('group_size') or 0),
+        0 if row.get('symmetric') else 1,
+        '',
+    )
+
+
+def _needle_learned_retrieval_family(rows: list[dict],
+                                     alpha: float = 0.05) -> dict:
+    """Holm-correct the learned-retrieval tests over primary precision cells.
+
+    Every recall row keeps its raw directional p-value (descriptive, and
+    comparable with earlier result files). The familywise block selects one
+    pre-registered precision cell per (architecture, training geometry,
+    evaluation geometry) and reports both raw and Holm-adjusted p-values,
+    so the summary cannot present repeated dtype/PTQ measurements as
+    independent support for the same trained model.
+    """
+    groups: dict[tuple, list[tuple]] = {}
+    for row in rows:
+        if row.get('row_kind') != 'needle_recall':
+            continue
+        learned = ((row.get('hypothesis_checks') or {})
+                   .get('learned_retrieval') or {})
+        p_value = learned.get('p_value_directional')
+        if p_value is None:
+            continue
+        key = _needle_learned_retrieval_family_key(row)
+        groups.setdefault(key, []).append(
+            (_needle_primary_precision_rank(row), row, float(p_value)))
+
+    primary = []
+    for key, candidates in groups.items():
+        candidates.sort(key=lambda item: item[0])
+        _, row, p_value = candidates[0]
+        primary.append((key, row, p_value, candidates))
+    primary.sort(key=lambda item: str(item[0]))
+
+    holm = holm_adjust([item[2] for item in primary], alpha=alpha)
+    for item, adjusted, rejected in zip(primary, holm['adjusted'],
+                                        holm['rejected']):
+        _, primary_row, _, candidates = item
+        for _, row, row_p in candidates:
+            row['learned_retrieval_holm'] = {
+                'selected_as_primary': row is primary_row,
+                'family_size': holm['n_tests'],
+                'raw_p_value_directional': row_p,
+                'holm_adjusted_p': adjusted if row is primary_row else None,
+                'significant_at_alpha': (bool(rejected)
+                                         if row is primary_row else None),
+                'alpha': float(alpha),
+                'family_unit': ('one primary-precision row per architecture '
+                                'x training geometry x evaluation geometry'),
+            }
+
+    tests = []
+    for (key, row, p_value, _), adjusted, rejected in zip(
+            primary, holm['adjusted'], holm['rejected']):
+        tests.append({
+            'memory_type': row.get('memory_type'),
+            'n_layers': row.get('n_layers'),
+            'n_kda': row.get('n_kda'),
+            'n_csa': row.get('n_csa'),
+            'n_hca': row.get('n_hca'),
+            'train_context_len': row.get('train_context_len'),
+            'train_needle_pos': row.get('train_needle_pos'),
+            'context_len': row.get('context_len'),
+            'needle_pos': row.get('needle_pos'),
+            'dtype': row.get('dtype'),
+            'quantized': bool(row.get('quantized')),
+            'bits': row.get('bits'),
+            'group_size': row.get('group_size'),
+            'symmetric': row.get('symmetric'),
+            'raw_p_value_directional': p_value,
+            'holm_adjusted_p': adjusted,
+            'reject_at_alpha': bool(rejected),
+        })
+    return {
+        'method': 'holm_bonferroni',
+        'alpha': float(alpha),
+        'family_unit': ('one primary-precision row per architecture x '
+                        'training geometry x evaluation geometry'),
+        'n_candidate_rows': sum(len(c) for _, _, _, c in primary),
+        'n_primary_tests': holm['n_tests'],
+        'n_rejected': int(sum(holm['rejected'])),
+        'tests': tests,
+    }
+
+
 def summarize_needle_hypotheses(rows: list[dict]) -> dict:
     """Aggregate the pre-registered verdicts into one summary row."""
     recall = [r for r in rows if r.get('row_kind') == 'needle_recall']
@@ -1108,6 +1229,7 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
              .get('learned_retrieval') or {}).get('verdict')
         if v is not None:
             learn_verdicts.append(bool(v))
+    learn_family = _needle_learned_retrieval_family(recall)
     # Distance check: unquantized rows grouped by (context, route); compare
     # the farthest vs nearest needle position (descriptive, seed-averaged).
     # Rows are per dtype, so a position can appear several times: the
@@ -1159,13 +1281,20 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
                                   if match_verdicts else None),
         'n_learned_retrieval_verdicts_available': len(learn_verdicts),
         'n_learned_retrieval_supported': sum(learn_verdicts),
+        'n_learned_retrieval_supported_holm': learn_family['n_rejected'],
+        'learned_retrieval_familywise': learn_family,
         'distance_effects': distance_effects,
         'distance_degradation_verdict': distance_verdict,
         'hypotheses': {k: v['prediction'] for k, v in NEEDLE_HYPOTHESES.items()},
         'note': ('Verdicts are descriptive aggregates over the rows of this '
                  'run; with a single seed the learned_retrieval verdict is '
                  'None (no paired test) and only the rule comparison and '
-                 'distance effect are reported.'),
+                 'distance effect are reported. The raw '
+                 'n_learned_retrieval_supported count treats repeated '
+                 'dtype/PTQ rows as separate verdicts; the '
+                 'learned_retrieval_familywise block Holm-corrects one '
+                 'primary-precision test per trained model x geometry and is '
+                 'the familywise count.'),
     }
 
 

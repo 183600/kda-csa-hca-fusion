@@ -454,6 +454,90 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         f"{summary['distance_effects']}")
 
 
+def test_learned_retrieval_familywise_correction():
+    """Repeated dtype/PTQ rows must not count as independent evidence.
+
+    ``summarize_needle_hypotheses`` keeps the raw row-level count for
+    comparability with earlier files, but the familywise block selects one
+    primary precision row per (architecture, training geometry, evaluation
+    geometry) and Holm-corrects those p-values.
+    """
+    print('\nTest: needle learned-retrieval familywise correction')
+
+    def _row(ctx, dtype, p_value, *, quantized=False, bits=None,
+             verdict=True):
+        return {
+            'row_kind': 'needle_recall',
+            'context_len': ctx, 'needle_pos': ctx // 4,
+            'memory_type': 'kda', 'n_layers': 4, 'n_kda': 2,
+            'n_csa': 1, 'n_hca': 1,
+            'train_context_len': ctx, 'train_needle_pos': ctx // 4,
+            'quantized': quantized, 'dtype': dtype, 'bits': bits,
+            'group_size': 16, 'symmetric': True,
+            'accuracy_mean': 0.9,
+            'hypothesis_checks': {
+                'learned_retrieval': {
+                    'p_value_directional': p_value,
+                    'verdict': verdict,
+                },
+                'trained_matches_rule': {'verdict': True},
+            },
+        }
+
+    # The same two trained models are measured at three precisions. The
+    # family is two, not six, and the fp32 cell is the primary row.
+    rows = []
+    for ctx in (256, 512):
+        rows += [
+            _row(ctx, 'fp32', 0.01),
+            _row(ctx, 'fp16', 0.001),
+            _row(ctx, 'bf16', 0.02),
+        ]
+    summary = summarize_needle_hypotheses(rows)
+    family = summary['learned_retrieval_familywise']
+    _ok('raw row count is preserved',
+        summary['n_learned_retrieval_supported'] == 6,
+        f"raw={summary['n_learned_retrieval_supported']}")
+    _ok('family collapses repeated precision cells',
+        family['n_primary_tests'] == 2
+        and family['n_candidate_rows'] == 6,
+        f"primary={family['n_primary_tests']}, "
+        f"candidates={family['n_candidate_rows']}")
+    _ok('fp32 rows are selected as primary',
+        all(t['dtype'] == 'fp32' and t['reject_at_alpha']
+            for t in family['tests']),
+        f"{[(t['dtype'], t['reject_at_alpha']) for t in family['tests']]}")
+    _ok('non-primary rows say they were not selected',
+        all(r['learned_retrieval_holm']['selected_as_primary'] is False
+            and r['learned_retrieval_holm']['holm_adjusted_p'] is None
+            for r in rows if r['dtype'] != 'fp32'))
+
+    # Three uncorrected p<0.05 rows, none significant after Holm.
+    rows = [_row(256, 'fp32', 0.030),
+            _row(512, 'fp32', 0.040),
+            _row(1024, 'fp32', 0.045)]
+    summary = summarize_needle_hypotheses(rows)
+    family = summary['learned_retrieval_familywise']
+    _ok('uncorrected rows would all look supported',
+        summary['n_learned_retrieval_supported'] == 3,
+        f"raw={summary['n_learned_retrieval_supported']}")
+    _ok('Holm rejects none of the three weak p-values',
+        family['n_rejected'] == 0
+        and all(not t['reject_at_alpha'] for t in family['tests']),
+        f"family={family['n_rejected']}, "
+        f"adjusted={[t['holm_adjusted_p'] for t in family['tests']]}")
+
+    # If the reference dtype is absent, the next-best unquantized cell is
+    # still the primary test rather than dropping the group.
+    rows = [_row(256, 'fp16', 0.01)]
+    family = summarize_needle_hypotheses(rows)[
+        'learned_retrieval_familywise']
+    _ok('missing fp32 falls back to the best unquantized cell',
+        family['n_primary_tests'] == 1
+        and family['tests'][0]['dtype'] == 'fp16'
+        and family['n_rejected'] == 1, f'{family["tests"]}')
+
+
 def test_needle_experiment_json_output():
     """Full experiment run produces valid JSON with all row kinds."""
     print('\nTest: experiment JSON structure')
@@ -540,6 +624,7 @@ def main() -> int:
     test_bf16_csa_hca_no_nan_inf()
     test_qat_probe_budget_matched_control()
     test_distance_effect_uses_accuracy_at_extreme_positions()
+    test_learned_retrieval_familywise_correction()
     test_needle_experiment_json_output()
     print('\n=== ALL NEEDLE HAYSTACK TESTS PASSED ===')
     return 0
