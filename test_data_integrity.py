@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import random
 from decimal import Decimal
+from fractions import Fraction
 
 import numpy as np
 
@@ -21,6 +22,7 @@ from near_duplicates import (
 from train_lm_autodl import (
     _FallbackCharTokenizer,
     _is_nonfinite_document,
+    _evenly_spaced_probe_indices,
     _probe_token_lengths,
     _text_length_stats,
     _window_digest,
@@ -218,7 +220,8 @@ def test_near_duplicate_parameter_validation():
                 f'coerced near-dup parameter accepted: {kwargs}')
 
     # A non-integer document index must not be coerced to the wrong row.
-    for bad_pairs in ([[0.5, 1]], [[True, 1]], [['0', 1]]):
+    for bad_pairs in ([[0.5, 1]], [[True, 1]], [['0', 1]],
+                      [{0: 1, 1: 0}], [{0, 1}]):
         try:
             near_duplicate_clusters(bad_pairs, 2)
         except ValueError:
@@ -261,11 +264,17 @@ def test_nonfinite_classification_handles_huge_ints_and_decimals():
     for value in (complex(0, float('inf')), complex(float('nan'), 0)):
         assert _is_nonfinite_document(value) is True
     assert _is_nonfinite_document(complex(1, 2)) is False
+    # Finite extended-precision values must not be dropped just because
+    # converting them to a Python float overflows / rounds to inf.
+    assert _is_nonfinite_document(np.longdouble('1e4000')) is False
+    assert _is_nonfinite_document(Fraction(10 ** 400, 1)) is False
+    assert _is_nonfinite_document(np.longdouble('inf')) is True
 
 
 def test_near_duplicate_token_ids_are_not_silently_coerced():
-    for bad in ([1.0, 2.0], [True, 2], [-1, 2], 'not ids',
-                np.array([1.0, 2.0]), np.array([True, False])):
+    for bad in ([1.0, 2.0], [True, 2], [-1, 2], [2 ** 64, 1],
+                {1: 'x'}, {1, 2},
+                'not ids', np.array([1.0, 2.0]), np.array([True, False])):
         try:
             near_duplicate_pairs([[1, 2, 3, 4], bad], threshold=1.0)
         except ValueError:
@@ -352,6 +361,26 @@ def test_malformed_token_ids_are_reported_not_crashed_or_coerced():
     assert _probe_token_lengths([valid], tok, 1024) == [3]
 
 
+def test_near_duplicate_parameter_and_jaccard_overflow_is_controlled():
+    for threshold in (10 ** 400, Fraction(10 ** 400, 1), Fraction(1, 10 ** 400)):
+        try:
+            near_duplicate_pairs([[1, 2, 3]], threshold=threshold)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'huge threshold accepted: {threshold!r}')
+    for jaccard in (10 ** 400, Fraction(10 ** 400, 1), -0.1, 1.1):
+        try:
+            summarize_cross_split([[0, 1, jaccard]], ['train', 'val'])
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'invalid jaccard accepted: {jaccard!r}')
+    # Tiny positive fractions are valid thresholds (not coerced away).
+    report = near_duplicate_pairs([[1, 2, 3, 4]], threshold=Fraction(1, 2))
+    assert report['threshold'] == 0.5
+
+
 def test_clean_near_dup_parameters_are_validated_even_on_tiny_corpus():
     tok = _FallbackCharTokenizer()
     for kwargs in ({'near_dup_threshold': 0.0},
@@ -424,3 +453,43 @@ def test_data_probe_geometry_requires_exact_integers():
             pass
         else:  # pragma: no cover
             raise AssertionError(f'invalid fingerprint geometry accepted: {kwargs}')
+
+
+def test_token_ids_beyond_uint64_are_rejected_before_the_hash_cast():
+    class _HugeIdTokenizer:
+        pad_token_id = 0
+        unk_token_id = 0
+
+        def encode(self, text, truncation=False, max_length=None):
+            return [2 ** 64, 1]
+
+    tok = _HugeIdTokenizer()
+    cleaned = clean_lm_texts(['a long document', 'another long document'],
+                             tok, seq_len=64, dedup_near=True)
+    assert cleaned['texts'] == []
+    assert cleaned['stats']['n_tokenize_errors'] == 2
+    audit = near_duplicate_leakage_audit(['a'], ['b'], [], tok, 64)
+    assert audit['n_tokenize_errors'] == 2
+
+
+def test_single_probe_uses_the_corpus_tail_and_fingerprint_needs_content():
+    assert _evenly_spaced_probe_indices(10, 1) == [9]
+    # A one-text fingerprint must still see a change in the last document.
+    assert _texts_fingerprint(['a', 'b'], n_probe=1) != _texts_fingerprint(
+        ['a', 'c'], n_probe=1)
+    for bad_probe in (0, -1):
+        try:
+            _texts_fingerprint(['a', 'b'], n_probe=bad_probe)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'content-free probe accepted: {bad_probe}')
+
+
+def test_length_and_fingerprint_probes_accept_text_iterators():
+    tok = _FallbackCharTokenizer()
+    texts = ['abc', 'defgh']
+    stats = _text_length_stats((t for t in texts), tok, 64)
+    assert stats['n'] == 2 and stats['n_probe'] == 2
+    assert _probe_token_lengths((t for t in texts), tok, 64) == [3, 5]
+    assert _texts_fingerprint((t for t in texts)) == _texts_fingerprint(texts)

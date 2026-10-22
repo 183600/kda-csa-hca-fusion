@@ -47,6 +47,7 @@ from __future__ import annotations
 import math
 import numbers
 import operator
+from collections.abc import Mapping, Set
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -102,10 +103,17 @@ def _require_int(name: str, value, *, minimum: int) -> int:
 def _check_parameters(*, threshold: float, shingle_size: int, num_perm: int,
                       band_rows: int,
                       max_candidate_pairs: int) -> None:
-    if (isinstance(threshold, bool)
-            or not isinstance(threshold, numbers.Real)
-            or not math.isfinite(float(threshold))
-            or not 0.0 < float(threshold) <= 1.0):
+    if isinstance(threshold, bool) or not isinstance(threshold, numbers.Real):
+        raise ValueError(
+            f'near-duplicate threshold must be a finite number in (0, 1], '
+            f'got {threshold!r}')
+    try:
+        threshold_value = float(threshold)
+    except (OverflowError, ValueError):
+        raise ValueError(
+            f'near-duplicate threshold must be a finite number in (0, 1], '
+            f'got {threshold!r}') from None
+    if not math.isfinite(threshold_value) or not 0.0 < threshold_value <= 1.0:
         raise ValueError(
             f'near-duplicate threshold must be a finite number in (0, 1], '
             f'got {threshold!r}')
@@ -143,8 +151,9 @@ def _as_ids(token_ids: Sequence[int] | None) -> np.ndarray:
             raise ValueError('token ids must be integers, not bools')
         raw = list(values.reshape(-1))
     else:
-        if isinstance(token_ids, (str, bytes)):
-            raise ValueError('token ids must be integers, not text')
+        if isinstance(token_ids, (str, bytes, Mapping, Set)):
+            raise ValueError(
+                'token ids must be an ordered sequence of integers')
         try:
             raw = list(token_ids)
         except TypeError:
@@ -153,6 +162,7 @@ def _as_ids(token_ids: Sequence[int] | None) -> np.ndarray:
             ) from None
     if not raw:
         return np.empty(0, dtype=_U64)
+    max_id = (1 << 64) - 1
     out = []
     for token in raw:
         # Check the original values, not a NumPy-promoted copy: a mixed
@@ -172,6 +182,9 @@ def _as_ids(token_ids: Sequence[int] | None) -> np.ndarray:
             token_id = int(token_id)
         if token_id < 0:
             raise ValueError('token ids must be non-negative')
+        if token_id > max_id:
+            raise ValueError(
+                f'token id exceeds the uint64 shingle-hash domain: {token_id}')
         out.append(token_id)
     return np.asarray(out, dtype=_U64).reshape(-1)
 
@@ -386,7 +399,9 @@ def _pair_indices(row, where: str) -> tuple[int, int]:
     float / bool / string index is a malformed row rather than something
     to coerce.
     """
-    if isinstance(row, (str, bytes)):
+    if isinstance(row, (str, bytes, Mapping, Set)):
+        # A mapping/set has a length but no positional fields; iterating it
+        # would silently use keys/values as the two document indices.
         raise ValueError(f'{where}: malformed near-duplicate pair: {row!r}')
     try:
         fields = len(row)
@@ -397,7 +412,11 @@ def _pair_indices(row, where: str) -> tuple[int, int]:
         raise ValueError(f'{where}: malformed near-duplicate pair: {row!r}')
     out = []
     for pos in range(2):
-        value = row[pos]
+        try:
+            value = row[pos]
+        except (TypeError, KeyError, IndexError):
+            raise ValueError(
+                f'{where}: malformed near-duplicate pair: {row!r}') from None
         if isinstance(value, bool) or not isinstance(value, numbers.Integral):
             raise ValueError(
                 f'{where}: pair index #{pos} must be an exact int, got '
@@ -490,13 +509,22 @@ def summarize_cross_split(pairs: Iterable[Sequence],
         if len(row) >= 3:
             raw = row[2]
             if raw is not None:
-                if (isinstance(raw, bool)
-                        or not isinstance(raw, numbers.Real)
-                        or not math.isfinite(float(raw))):
+                if isinstance(raw, bool) or not isinstance(raw, numbers.Real):
                     raise ValueError(
                         'summarize_cross_split: pair jaccard must be a '
                         f'finite number or None, got {raw!r} in row {row!r}')
-                jaccard = float(raw)
+                try:
+                    jaccard = float(raw)
+                except (OverflowError, ValueError):
+                    raise ValueError(
+                        'summarize_cross_split: pair jaccard must be a '
+                        f'finite number or None, got {raw!r} in row {row!r}'
+                    ) from None
+                if not math.isfinite(jaccard) or not 0.0 <= jaccard <= 1.0:
+                    raise ValueError(
+                        'summarize_cross_split: pair jaccard must be a '
+                        f'finite number in [0, 1] or None, got {raw!r} in '
+                        f'row {row!r}')
         li, lj = labels[i], labels[j]
         if li == lj:
             within += 1

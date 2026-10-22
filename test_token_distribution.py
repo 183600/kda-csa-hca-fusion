@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import random
+from fractions import Fraction
 
 import numpy as np
 
@@ -367,3 +368,33 @@ def test_quantile_argument_is_bounded_and_finite():
             pass
         else:  # pragma: no cover
             raise AssertionError(f'invalid quantile accepted: {q!r}')
+
+
+def test_quantile_sample_values_must_be_finite_and_representable():
+    for values in ([10 ** 400], [10 ** 400, 2 * 10 ** 400],
+                   [float('nan'), 1.0, 2.0],
+                   [float('inf'), 1.0, 2.0]):
+        try:
+            _quantile_type7(values, 0.5)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'invalid sample accepted: {values!r}')
+
+
+def test_nonzero_statistics_below_float_range_are_not_flattened_to_zero():
+    tiny = Fraction(1, 10 ** 400)
+    # A true finite difference/SD that underflows to 0.0 must not become a
+    # confident "no shift" / zero-variance result.
+    report = _distribution_shift(
+        {'mean_tokens': 0, 'std_tokens': tiny},
+        {'mean_tokens': tiny, 'std_tokens': tiny})
+    assert report['flag'] is None
+    assert report['zero_pooled_variance'] is None
+    json.dumps(report, allow_nan=False)
+    try:
+        _quantile_type7([tiny, 2 * tiny], 0.5)
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('underflowing sample values were accepted')

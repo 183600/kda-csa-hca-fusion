@@ -55,6 +55,7 @@ import numbers
 import operator
 import unicodedata
 from collections import Counter, OrderedDict
+from collections.abc import Mapping, Set
 import numpy as np
 import torch
 import torch.nn as nn
@@ -106,6 +107,7 @@ from train_diagnostics import (
 )
 from ppl_bootstrap import bootstrap_ppl_ci, throughput_summary
 from near_duplicates import (
+    DEFAULT_NEAR_DUP_BAND_ROWS,
     DEFAULT_NEAR_DUP_MAX_CANDIDATES,
     DEFAULT_NEAR_DUP_NUM_PERM,
     DEFAULT_NEAR_DUP_SHINGLE_SIZE,
@@ -113,6 +115,7 @@ from near_duplicates import (
     near_duplicate_clusters,
     near_duplicate_pairs,
     summarize_cross_split,
+    _check_parameters as _check_near_dup_parameters,
 )
 import grad_checkpointing as grad_ckpt
 
@@ -360,13 +363,23 @@ def _is_nonfinite_document(text):
     # non-finite (``inf == inf``), so the old ``(int, float)`` check
     # silently kept it as the literal text "inf".
     if isinstance(text, numbers.Real):
+        # Compare in the value's own dtype: converting a finite longdouble
+        # / huge Fraction to Python float can overflow or round to inf and
+        # would misclassify legitimate data as a missing value.
         try:
-            return not math.isfinite(float(text))
-        except OverflowError:
-            # A finite value too large for float is still finite.
-            return False
-        except (ValueError, TypeError):
-            return True
+            if bool(text != text):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(text == math.inf or text == -math.inf)
+        except Exception:
+            try:
+                return not math.isfinite(float(text))
+            except OverflowError:
+                return False
+            except (ValueError, TypeError):
+                return True
     # Complex infinities/NaNs need ``cmath``; ``x != x`` only catches NaN.
     if isinstance(text, numbers.Complex):
         try:
@@ -388,6 +401,9 @@ def _is_nonfinite_document(text):
         return False
 
 
+_MAX_TOKEN_ID = (1 << 64) - 1
+
+
 def _validated_token_ids(ids):
     """Exact non-negative integer token ids from a tokenizer result.
 
@@ -398,8 +414,10 @@ def _validated_token_ids(ids):
     Objects implementing ``__index__`` (NumPy / torch integer scalars) are
     accepted; floats and bools are not.
     """
-    if isinstance(ids, (str, bytes)):
-        raise ValueError('tokenizer returned text instead of token ids')
+    if isinstance(ids, (str, bytes, Mapping, Set)):
+        # A mapping iterates over its keys and a set has no stable order;
+        # neither is a token-id sequence.
+        raise ValueError('tokenizer returned a non-sequence token container')
     try:
         iterator = iter(ids)
     except TypeError:
@@ -420,6 +438,9 @@ def _validated_token_ids(ids):
             token_id = int(token_id)
         if token_id < 0:
             raise ValueError(f'negative token id: {token_id}')
+        if token_id > _MAX_TOKEN_ID:
+            raise ValueError(
+                f'token id exceeds the uint64 shingle-hash domain: {token_id}')
         out.append(token_id)
     return out
 
@@ -474,6 +495,10 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
     texts = list(texts)
     seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
     min_tokens = _exact_int_arg('min_tokens', min_tokens, minimum=0)
+    _check_near_dup_parameters(
+        threshold=near_dup_threshold, shingle_size=near_dup_shingle_size,
+        num_perm=near_dup_num_perm, band_rows=DEFAULT_NEAR_DUP_BAND_ROWS,
+        max_candidate_pairs=near_dup_max_candidates)
     clean, seen_texts, seen_normalized, seen_windows = [], set(), set(), set()
     clean_ids = [] if dedup_near else None
     n_nonfinite = n_empty = n_duplicates = 0
@@ -933,7 +958,9 @@ def _evenly_spaced_probe_indices(n, n_probe):
     if n <= n_probe:
         return list(range(n))
     if n_probe == 1:
-        return [0]
+        # One probe cannot span the range; use the tail so a bounded
+        # fingerprint / length probe still sees the end of the split.
+        return [n - 1]
     return [round(i * (n - 1) / (n_probe - 1)) for i in range(n_probe)]
 
 
@@ -947,6 +974,7 @@ def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
     """
     seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
     n_probe = _exact_int_arg('n_probe', n_probe, minimum=0)
+    texts = list(texts)
     n = len(texts)
     if n == 0:
         return {'n': 0, 'n_probe': 0, 'mean_tokens': None,
@@ -995,6 +1023,7 @@ def _probe_token_lengths(texts, tokenizer, seq_len, *, n_probe=256):
     """
     seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
     n_probe = _exact_int_arg('n_probe', n_probe, minimum=0)
+    texts = list(texts)
     n = len(texts)
     if n == 0:
         return []
@@ -1018,14 +1047,21 @@ def _quantile_type7(sorted_values, q):
     q_value = _finite_float_or_none(q)
     if q_value is None or not 0.0 <= q_value <= 1.0:
         raise ValueError(f'quantile must be a finite number in [0, 1], got {q!r}')
+    values = []
+    for value in sorted_values:
+        number = _finite_float_or_none(value)
+        if number is None:
+            raise ValueError(
+                f'sample values must be finite numbers, got {value!r}')
+        values.append(number)
     if n == 1:
-        return float(sorted_values[0])
+        return values[0]
     pos = q_value * (n - 1)
     lo = int(math.floor(pos))
     hi = min(lo + 1, n - 1)
     frac = pos - lo
-    return (float(sorted_values[lo]) * (1.0 - frac)
-            + float(sorted_values[hi]) * frac)
+    return (values[lo] * (1.0 - frac)
+            + values[hi] * frac)
 
 
 def _length_outlier_audit(train_lengths, heldout_lengths, *,
@@ -1122,6 +1158,15 @@ def _finite_float_or_none(value):
         number = float(value)
     except (OverflowError, ValueError):
         return None
+    if number == 0.0:
+        # ``float(Fraction(1, 10**400))`` is 0.0 even though the value is
+        # nonzero. Returning 0 would silently turn a real difference into
+        # "zero variance"; the value is simply not representable.
+        try:
+            if value != 0:
+                return None
+        except Exception:
+            return None
     return number if math.isfinite(number) else None
 
 
@@ -2600,9 +2645,10 @@ def _texts_fingerprint(texts, n_probe=64, max_chars_per_text=4096):
     ``["a", "bc"]`` hashed the same byte stream and therefore received the
     same data-version id even though they are different corpora.
     """
-    n_probe = _exact_int_arg('n_probe', n_probe, minimum=0)
+    n_probe = _exact_int_arg('n_probe', n_probe, minimum=1)
     max_chars_per_text = _exact_int_arg(
         'max_chars_per_text', max_chars_per_text, minimum=1)
+    texts = list(texts)
     n = len(texts)
     indices = _evenly_spaced_probe_indices(n, n_probe)
     h = hashlib.sha256()
