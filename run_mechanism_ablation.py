@@ -142,7 +142,8 @@ from ops_fused import CSAHybridLayer, HybridKCHAttention
 from results_analysis import (binary_ranking_metrics,
                               expected_average_precision)
 from results_schema import write as write_schema
-from experiment_design import audit_run as audit_experiment_design
+from experiment_design import (audit_run as audit_experiment_design,
+                               common_analyzed_seeds)
 from run_ablation import (
     _aggregate_curve_diagnosis,
     _attach_curve_diagnostics,
@@ -1589,18 +1590,29 @@ def main():
     # checks that the leave-one-factor-out cells exist): a complete design
     # can still be too underpowered for the claim it invites. The paired
     # family is one accuracy contrast per non-baseline variant in EVERY
-    # n_kv cell, mirroring ``n_paired_tests`` above.
+    # n_kv cell, mirroring ``n_paired_tests`` above. The analyzed seed set
+    # is the intersection across variants, so a variant that lost a seed
+    # is reported as ``incomplete_attrition`` rather than dropped.
+    mechanism_analyzed_population = common_analyzed_seeds(
+        all_rows, finite_keys=('final_acc',))
     mechanism_experiment_design = audit_experiment_design(
         'exp8_mechanism',
         seeds=[42 + i for i in range(n_seeds)],
         levels={'variant': [v['name'] for v in variants]},
         family_size=max(1, _paired_family_size(variants, n_kv_list)),
+        analyzed_seeds=mechanism_analyzed_population,
     )
-    logger.info(f'Prospective design audit: '
-                f'{mechanism_experiment_design["status"]} '
-                f'(n={mechanism_experiment_design["n_seeds"]}, '
+    logger.info(f'Design audit: {mechanism_experiment_design["status"]} '
+                f'(requested={mechanism_experiment_design["n_seeds"]}, '
+                f'analyzed={mechanism_experiment_design["n_analyzed"]}, '
                 f'required='
                 f'{mechanism_experiment_design["planning"]["required_seeds"]})')
+    if mechanism_experiment_design['status'] == 'incomplete_attrition':
+        logger.warning(
+            'Failed seeds were dropped from the mechanism ablation; the '
+            'reported contrasts are complete-case, not the pre-registered '
+            'complete block (see metadata.experiment_design.'
+            'analysis_population).')
 
     metadata = {
         'experiment': 'exp8_mechanism_ablation',

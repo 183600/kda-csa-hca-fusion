@@ -80,14 +80,15 @@ exact sign and sign-flip permutation tests and the paired t-test in
 
 ## Statuses and claims
 
-`audit_run(plan_id, seeds=..., levels=..., family_size=...)` compares an actual
-run with the plan:
+`audit_run(plan_id, seeds=..., levels=..., family_size=...,
+analyzed_seeds=...)` compares an actual run with the plan:
 
 | Status | Meaning | Allowed claims |
 |---|---|---|
-| `confirmatory` | seed budget reaches the required n, the full planned family is present, and required controls are present | corrected paired inference at the planned alpha |
+| `confirmatory` | seed budget reaches the required n, the full planned family is present, required controls are present, and the analyzed population is the complete requested block | corrected paired inference at the planned alpha |
 | `reduced_family` | the seed budget is adequate only for a subset of the pre-registered contrast family | confirmatory only for the tested subset |
 | `screening` | fewer seeds than required (or a larger-than-planned family) | descriptive / exploratory inference only |
+| `incomplete_attrition` | the analyzed seed block is smaller than the requested block, or contains seeds outside it (see below) | descriptive; complete-case paired inference only |
 | `exploratory_missing_controls` | a required control or level is absent | descriptive only; the treatment effect is confounded |
 | `invalid` | fewer than two unique non-negative integer seeds | none |
 
@@ -95,6 +96,59 @@ The runners attach this audit to their result metadata as
 `metadata.experiment_design`, so a reader can see whether a result was
 confirmatory without reconstructing the seed count by hand. The audit never
 changes the experiment or its exit code; it only labels the evidence.
+
+## Requested vs analyzed seeds (attrition)
+
+A pre-registered `n = 11` is a statement about the seeds the experiment
+*requests*, not about the seeds that happen to survive. A training run may
+crash, diverge, or produce a non-finite metric; the aggregate then drops it
+and reports the mean over the remaining seeds. That is a **complete-case
+analysis**. If the failure is related to the treatment — for example a wider
+CSA layout that OOMs, or a different memory route that diverges — the
+surviving-seed difference is biased, and no amount of post-hoc correction can
+recover the missing counterfactual.
+
+`audit_run(..., analyzed_seeds=[...])` therefore takes the population that
+actually entered the analysis. `common_analyzed_seeds(rows)` computes the
+conservative default: the intersection of the seed ids with usable `per_seed`
+records in every row (a row-level error or a missing `per_seed` list yields
+the empty set). The audit reports:
+
+* `analysis_population.n_requested` / `n_analyzed` / `n_missing`;
+* `missing_seeds` (requested but absent) and `unexpected_seeds` (analyzed
+  but outside the requested block);
+* `attrition_rate` and `complete_case`;
+* `planning_at_analyzed_n` — the realized power/MDE at the analyzed n, next
+  to the planned power at the requested n.
+
+An incomplete block is labelled `incomplete_attrition` even when the
+surviving n still clears the planned required n. The estimate is not
+"wrong"; it is a complete-case estimate, and the label prevents it from
+being presented as the pre-registered result. The only ways back to
+`confirmatory` are to analyse the full block or to establish
+(pre-specifiably) that the missing seeds are unrelated to the treatment.
+
+The Exp 4, Exp 5/5b and Exp 8 runners pass this population automatically.
+Exp 4 intersects across every operator/task/n_kv row; the ablation matrix and
+ratio sweep intersect across every group; the mechanism ablation intersects
+across every variant. A seed lost anywhere in the block therefore downgrades
+the whole block, which is conservative on purpose: the pre-registered family
+is a joint claim, not a collection of independently salvageable cells.
+
+```python
+from experiment_design import audit_run, common_analyzed_seeds
+
+# rows: the result-block rows, each with a per_seed list of success/error
+# records. The intersection is the conservative complete-case population.
+population = common_analyzed_seeds(
+    rows, finite_keys=('final_acc', 'final_loss'))
+audit = audit_run(
+    'exp4_mqar', seeds=[42 + i for i in range(11)],
+    levels={'operator': ['linear', 'softmax', 'kda']},
+    family_size=5, analyzed_seeds=population)
+audit['status']              # confirmatory / incomplete_attrition / ...
+audit['analysis_population']  # missing seeds, attrition rate, complete_case
+```
 
 ## Pilot -> power -> confirmatory
 
@@ -180,6 +234,12 @@ and never upgrades a claim. See
   run will perform. If a runner adds cells or contrasts, pass the actual
   `family_size` to `audit_run`; the planning report then uses the corrected
   alpha for that larger family.
+* The attrition audit labels a complete-case analysis; it does not repair
+  one. There is no imputation for a diverged or crashed seed, and no
+  statistical test can show that the dropout is unrelated to the treatment.
+  If the missing seeds are plausibly treatment-related, the honest options
+  are to report the complete-case estimate with its attrition, or to fix the
+  failure and re-run the whole block.
 * The registry covers the multi-seed inference experiments. Timing experiments
   (Exp 2/6/9) need a different design vocabulary (repeats, interleaving,
   order effects); they are not squeezed into the seed-power model.

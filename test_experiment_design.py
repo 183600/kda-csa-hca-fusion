@@ -11,7 +11,8 @@ They pin the properties the planning layer is supposed to guarantee:
 * planning uses the multiplicity-corrected per-test alpha, not the raw
   family-wise alpha;
 * a run is labelled confirmatory only when it reaches the required seed
-  count AND contains the required controls;
+  count, contains the required controls, AND the analyzed population is the
+  complete requested seed block (dropped seeds are attrition, not a pass);
 * a pilot SD is extracted from per-seed rows (or from reported
   ``sd_diff`` rows) and never promotes the pilot itself to confirmatory;
 * the manifest writer produces strict JSON that can be read back.
@@ -223,6 +224,104 @@ def test_audit_does_not_require_unobserved_levels_to_fail():
     assert audit['level_checks']['variant']['status'] == 'not_evaluated'
     assert audit['checks']['required_levels_present'] is True
     assert audit['status'] in ('screening', 'confirmatory')
+
+
+def test_audit_reports_attrition_instead_of_confirmatory():
+    """Survivors of a failed seed block are not the pre-registered run."""
+    plan = D.get_plan('exp4_mqar')
+    requested = [42 + i for i in range(plan['planned_seeds'])]
+    levels = {'operator': ['linear', 'softmax', 'kda']}
+    family = plan['planned_family_size']
+
+    # Omitting analyzed_seeds keeps the historical requested-block audit.
+    prospective = D.audit_run('exp4_mqar', seeds=requested, levels=levels,
+                             family_size=family)
+    assert prospective['status'] == 'confirmatory'
+    assert prospective['analysis_population']['provided'] is False
+    assert prospective['n_analyzed'] is None
+    assert prospective['planning_at_analyzed_n'] is None
+
+    # Two missing seeds downgrade the claim even though the surviving n
+    # still clears the old screening budget.
+    analyzed = requested[:-2]
+    attrition = D.audit_run('exp4_mqar', seeds=requested, levels=levels,
+                            family_size=family, analyzed_seeds=analyzed)
+    assert attrition['status'] == 'incomplete_attrition'
+    assert attrition['n_seeds'] == len(requested)
+    assert attrition['n_analyzed'] == len(analyzed)
+    assert attrition['analysis_population']['missing_seeds'] == requested[-2:]
+    assert attrition['analysis_population']['n_missing'] == 2
+    assert attrition['analysis_population']['attrition_rate'] == 2 / 11
+    assert attrition['checks']['complete_case_population'] is False
+    assert attrition['claims_allowed'] == [
+        'descriptive', 'complete_case_paired_inference_only']
+    # Realized power is reported at the analyzed n, separately from the
+    # planned power at the requested n.
+    assert attrition['planning_at_analyzed_n']['seeds'] == len(analyzed)
+    assert attrition['planning']['seeds'] == len(requested)
+
+    # A complete analyzed block is still confirmatory.
+    complete = D.audit_run('exp4_mqar', seeds=requested, levels=levels,
+                           family_size=family, analyzed_seeds=requested)
+    assert complete['status'] == 'confirmatory'
+    assert complete['analysis_population']['complete_case'] is True
+    assert complete['analysis_population']['missing_seeds'] == []
+
+    # Fewer than two analyzed seeds cannot support paired inference.
+    empty = D.audit_run('exp4_mqar', seeds=requested, levels=levels,
+                        family_size=family, analyzed_seeds=[42])
+    assert empty['status'] == 'incomplete_attrition'
+    assert empty['claims_allowed'] == []
+    assert empty['checks']['analyzed_seeds_valid'] is False
+
+    # Seeds outside the requested block are reported, not silently added.
+    extra = D.audit_run('exp4_mqar', seeds=requested, levels=levels,
+                        family_size=family,
+                        analyzed_seeds=requested[:-1] + [999])
+    assert extra['status'] == 'incomplete_attrition'
+    assert extra['analysis_population']['unexpected_seeds'] == [999]
+    assert extra['checks']['complete_case_population'] is False
+
+    # An int is a seed COUNT for ``seeds`` but ambiguous for the analyzed
+    # population; require the explicit list instead of inventing 42..46.
+    with pytest.raises(D.DesignError):
+        D.audit_run('exp4_mqar', seeds=requested, levels=levels,
+                    analyzed_seeds=5)
+
+
+def test_common_analyzed_seeds_intersects_survivors_conservatively():
+    def row(seeds, **kwargs):
+        return {'op': 'kda',
+                'per_seed': [{'seed': s, 'final_acc': 0.5, **kwargs}
+                             for s in seeds]}
+
+    assert D.common_analyzed_seeds([row([42, 43, 44]),
+                                    row([42, 43, 44])]) == [42, 43, 44]
+    # A success row may carry an explicit ``error: null`` after a JSON
+    # round-trip; only a non-null error means the row is unusable.
+    assert D.common_analyzed_seeds(
+        [dict(row([42, 43]), error=None)]) == [42, 43]
+
+    # A seed that failed in one row is not part of the complete-case block.
+    failed = row([42, 43, 44])
+    failed['per_seed'][1]['error'] = 'diverged'
+    assert D.common_analyzed_seeds([row([42, 43, 44]), failed]) == [42, 44]
+
+    # A row-level error means no population can be certified.
+    assert D.common_analyzed_seeds([row([42, 43]), {'error': 'OOM'}]) == []
+    # A missing/malformed per_seed list is conservative too.
+    assert D.common_analyzed_seeds([{'op': 'kda'}]) == []
+    assert D.common_analyzed_seeds([{'op': 'kda', 'per_seed': 5}]) == []
+    # Optional finite-metric filtering keeps non-finite survivors out.
+    bad = row([42, 43])
+    bad['per_seed'][0]['final_acc'] = float('nan')
+    assert D.common_analyzed_seeds(
+        [bad, row([42, 43])], finite_keys=('final_acc',)) == [43]
+    assert D.common_analyzed_seeds([]) == []
+    with pytest.raises(D.DesignError):
+        D.common_analyzed_seeds({'op': 'kda'})
+    with pytest.raises(D.DesignError):
+        D.common_analyzed_seeds(5)
 
 
 # ---------------------------------------------------------------------------

@@ -31,12 +31,24 @@ Two things follow from that registry:
    ``planned_seeds`` is below the required count fails :func:`validate_plan`,
    so the registry cannot silently drift away from its own arithmetic.
 2. :func:`audit_run` compares an ACTUAL run configuration (seed list,
-   observed factor levels, family size, optionally a pilot SD) with the
-   plan. It labels the run ``confirmatory`` / ``screening`` /
+   observed factor levels, family size, the ANALYZED seed set, and a pilot
+   SD) with the plan. It labels the run ``confirmatory`` /
+   ``reduced_family`` / ``screening`` / ``incomplete_attrition`` /
    ``exploratory_missing_controls`` / ``invalid`` and states which claims
    the run is allowed to support. Runners attach this audit to their result
-   metadata, so a 5-seed screening run cannot be mistaken for the
-   pre-registered confirmatory run.
+   metadata, so neither a 5-seed screening run nor a run that silently
+   dropped failed seeds can be mistaken for the pre-registered confirmatory
+   experiment.
+
+The distinction between the REQUESTED seed block and the seeds that
+actually entered the analysis matters. A training run that crashes, diverges
+or produces a non-finite metric is normally excluded from the aggregate, but
+excluding it turns the pre-registered experiment into a complete-case
+analysis. If failures are related to the treatment (OOM under a wider
+layout, divergence under a different memory route, ...), the surviving-seed
+mean is biased. :func:`common_analyzed_seeds` computes the seed ids that
+survived in every row, and :func:`audit_run` downgrades an incomplete block
+to ``incomplete_attrition`` instead of calling it confirmatory.
 
 The pilot workflow
 ------------------
@@ -94,6 +106,7 @@ __all__ = [
     'validate_plan',
     'validate_plans',
     'planning_report',
+    'common_analyzed_seeds',
     'audit_run',
     'pilot_sd_from_rows',
     'pilot_report',
@@ -722,22 +735,89 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
 # Runtime audit
 # ---------------------------------------------------------------------------
 
+def common_analyzed_seeds(rows, *, per_seed_key: str = 'per_seed',
+                          seed_key: str = 'seed',
+                          error_key: str = 'error',
+                          finite_keys=()) -> list[int]:
+    """Return the seed ids that survived in EVERY row of a result block.
+
+    Multi-seed rows carry a ``per_seed`` list whose entries may be error
+    stubs (a diverged or crashed training run). The pre-registered design
+    promises a COMPLETE seed block, so averaging only the survivors is a
+    complete-case analysis, not the confirmatory experiment. This helper
+    computes the intersection of the seed ids with usable data in every
+    row; runners pass the result to :func:`audit_run` as
+    ``analyzed_seeds``.
+
+    The function is deliberately conservative: a row that is itself an
+    error stub, or that has no usable ``per_seed`` list, yields ``[]`` (no
+    complete-case population can be certified). ``finite_keys`` optionally
+    names per-seed fields that must be present and finite (for example
+    ``('final_acc', 'final_loss')``).
+
+    Returns a sorted list of non-negative integer seed ids. It never
+    raises on a malformed result row: the audit should report missing
+    evidence, not abort the run that produced it.
+    """
+    if isinstance(rows, Mapping):
+        raise DesignError('rows must be an iterable of row mappings, not a '
+                          'single mapping')
+    try:
+        row_list = list(rows)
+    except TypeError:
+        raise DesignError('rows must be an iterable of row mappings') from None
+    if not row_list:
+        return []
+    common: set[int] | None = None
+    for row in row_list:
+        if (not isinstance(row, Mapping)
+                or row.get(error_key) is not None):
+            return []
+        per_seed = row.get(per_seed_key)
+        if not isinstance(per_seed, list):
+            return []
+        valid: set[int] = set()
+        for record in per_seed:
+            if (not isinstance(record, Mapping)
+                    or record.get(error_key) is not None):
+                continue
+            seed = record.get(seed_key)
+            if not _is_int(seed) or seed < 0:
+                continue
+            if any(_clean_float(record.get(key)) is None
+                   for key in finite_keys):
+                continue
+            valid.add(seed)
+        common = valid if common is None else (common & valid)
+        if not common:
+            return []
+    return sorted(common)
+
+
 def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
-              sd=None) -> dict:
+              sd=None, analyzed_seeds=None) -> dict:
     """Compare an actual run configuration with its pre-registered plan.
 
-    ``seeds`` is the explicit seed list used by the run. ``levels`` maps
-    factor name -> observed levels (e.g. ``{'operator': ['linear',
+    ``seeds`` is the explicit seed list REQUESTED by the run. ``levels``
+    maps factor name -> observed levels (e.g. ``{'operator': ['linear',
     'softmax', ...]}``); a required control missing from the observed
     levels changes the verdict to ``exploratory_missing_controls``.
     ``family_size`` is the number of tests actually planned for THIS run
     (defaults to the registered family); passing the observed count keeps
     the audit honest when a runner adds or drops cells.
 
+    ``analyzed_seeds`` is the optional explicit set of seed ids that
+    actually entered the analysis. When it is supplied and is not exactly
+    the requested block, the run is labelled ``incomplete_attrition``:
+    dropping failed seeds is a complete-case analysis, and it is only
+    confirmatory if the missing seeds can be treated as missing completely
+    at random, which the data cannot establish. Omitting the argument keeps
+    the historical behaviour (the audit reports only the requested block).
+
     The audit never changes the experiment; it is attached to the result
     metadata so a reader can see whether a claim is confirmatory. It does
-    not raise for a merely underpowered or control-less run: those are
-    exactly the states the audit exists to report.
+    not raise for a merely underpowered, control-less, or attrition-afflicted
+    run: those are exactly the states the audit exists to report.
     """
     plan = get_plan(plan_id)
     seed_list = _seed_list(seeds)
@@ -764,6 +844,87 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         seed_errors.append('seed list contains duplicates')
     if bad_seeds:
         seed_errors.append(f'seeds must be non-negative ints, got {bad_seeds!r}')
+
+    # ---- Analysis population (optional post-run attrition audit) --------
+    population_provided = analyzed_seeds is not None
+    analyzed: list[int] | None = None
+    population_bad: list[str] = []
+    population_duplicates: list[int] = []
+    population_errors: list[str] = []
+    if population_provided:
+        if (isinstance(analyzed_seeds, (str, bytes))
+                or not hasattr(analyzed_seeds, '__iter__')):
+            raise DesignError(
+                'analyzed_seeds must be an explicit iterable of seed ids '
+                f'(an int is a seed COUNT, which is ambiguous here), got '
+                f'{analyzed_seeds!r}')
+        analyzed = []
+        seen_seeds: set[int] = set()
+        for seed in list(analyzed_seeds):
+            if not _is_int(seed) or seed < 0:
+                population_bad.append(repr(seed))
+                continue
+            if seed in seen_seeds:
+                population_duplicates.append(seed)
+                continue
+            seen_seeds.add(seed)
+            analyzed.append(seed)
+        if population_bad:
+            population_errors.append(
+                f'analyzed seeds must be non-negative ints, got '
+                f'{population_bad!r}')
+        if population_duplicates:
+            population_errors.append(
+                f'analyzed seed list contains duplicates: '
+                f'{sorted(population_duplicates)!r}')
+
+    requested_set = {s for s in seed_list
+                     if _is_int(s) and s >= 0}
+    analyzed_set = set(analyzed or ())
+    missing_seeds = (sorted(requested_set - analyzed_set)
+                     if population_provided else None)
+    unexpected_seeds = (sorted(analyzed_set - requested_set)
+                        if population_provided else None)
+    n_analyzed = len(analyzed) if population_provided else None
+    attrition_rate = (
+        len(missing_seeds) / len(requested_set)
+        if population_provided and requested_set else None)
+    complete_case = bool(
+        population_provided
+        and not population_bad
+        and not population_duplicates
+        and not missing_seeds
+        and not unexpected_seeds
+        and n_analyzed is not None
+        and n_analyzed >= 2)
+    if (population_provided and n_analyzed is not None
+            and n_analyzed < 2):
+        population_errors.append(
+            'the analyzed population has fewer than two seeds; no paired '
+            'inference is defined')
+    analysis_population = {
+        'provided': population_provided,
+        'requested_seeds': seed_list,
+        'analyzed_seeds': analyzed,
+        'n_requested': len(seed_list),
+        'n_analyzed': n_analyzed,
+        'missing_seeds': missing_seeds,
+        'unexpected_seeds': unexpected_seeds,
+        'duplicate_seeds': (population_duplicates
+                            if population_provided else None),
+        'invalid_seeds': (population_bad if population_provided else None),
+        'n_missing': (len(missing_seeds)
+                      if missing_seeds is not None else None),
+        'attrition_rate': attrition_rate,
+        'complete_case': (complete_case if population_provided else None),
+        'errors': population_errors,
+        'note': (
+            'analyzed_seeds is the population that actually entered the '
+            'analysis. A block smaller than the requested one is a '
+            'complete-case analysis: if failures are related to the '
+            'treatment, its estimate is biased. The pre-registered '
+            'experiment is the complete block, not the survivors.'),
+    }
 
     level_checks: dict[str, dict] = {}
     missing_required: list[str] = []
@@ -806,6 +967,15 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         # be checked either way.
         'family_size_at_least_planned': (
             None if family_size is None else not family_reduced),
+        # None = the caller did not pass the analyzed population, so the
+        # requested-seed audit is all that can be computed.
+        'analysis_population_provided': population_provided,
+        'analyzed_seeds_valid': (
+            None if not population_provided
+            else not population_bad and n_analyzed is not None
+            and n_analyzed >= 2),
+        'complete_case_population': (
+            None if not population_provided else complete_case),
     }
     valid_seeds = all(checks[key] for key in (
         'seeds_present', 'at_least_two_seeds', 'seeds_unique',
@@ -816,6 +986,13 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     elif missing_required:
         status = 'exploratory_missing_controls'
         claims = ['descriptive_only']
+    elif population_provided and not complete_case:
+        status = 'incomplete_attrition'
+        if n_analyzed is not None and n_analyzed >= 2:
+            claims = ['descriptive',
+                      'complete_case_paired_inference_only']
+        else:
+            claims = []
     elif planning['status'] != 'confirmatory_ready':
         status = 'screening'
         claims = ['descriptive', 'exploratory_inference_with_caveat']
@@ -829,11 +1006,21 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         status = 'confirmatory'
         claims = ['descriptive', 'paired_inference_at_planned_alpha',
                   'directional_claim_at_sesoi']
+    analysis_planning = None
+    if population_provided and n_analyzed is not None:
+        # Realized sensitivity of the population that was actually
+        # analyzed. This is reported next to the planned power so a reader
+        # can see how much attrition cost, even when the survivors still
+        # clear the planned n.
+        analysis_planning = planning_report(
+            plan, seeds=n_analyzed, family_size=family_size, sd=sd)
     return {
         'plan_id': plan_id,
         'status': status,
         'n_seeds': n_seeds,
+        'n_analyzed': n_analyzed,
         'seeds': seed_list,
+        'analysis_population': analysis_population,
         'screening_seeds': plan.get('screening_seeds'),
         'planned_seeds': plan.get('planned_seeds'),
         'family_size': family_size,
@@ -843,7 +1030,9 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'level_checks': level_checks,
         'missing_required_levels': missing_required,
         'seed_errors': seed_errors,
+        'population_errors': population_errors,
         'planning': planning,
+        'planning_at_analyzed_n': analysis_planning,
         'claims_allowed': claims,
         'interpretation': {
             'confirmatory': ('the seed budget reaches the pre-registered '
@@ -860,6 +1049,13 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                           'report the seed budget and the MDE, treat the '
                           'result as exploratory, and do not promote it to '
                           'a confirmatory claim without a larger run'),
+            'incomplete_attrition': (
+                'the analyzed population is smaller than the pre-registered '
+                'seed block (or contains seeds outside it), so the reported '
+                'estimate is a complete-case estimate. Report the missing '
+                'seeds and the realized power; do not present it as the '
+                'pre-registered confirmatory result unless the failures can '
+                'be shown to be unrelated to the treatment'),
             'exploratory_missing_controls': (
                 'a required control/level is absent, so treatment '
                 'differences cannot be attributed to the factor under '

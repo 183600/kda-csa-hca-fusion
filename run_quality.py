@@ -83,7 +83,8 @@ from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
 from multi_seed_stats import _sample_sd, holm_adjust, summarize_paired
-from experiment_design import audit_run as audit_experiment_design
+from experiment_design import (audit_run as audit_experiment_design,
+                               common_analyzed_seeds)
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
@@ -5112,6 +5113,36 @@ def main():
                 logger.info(
                     f'  [cost/claim] {task_name}/n_kv={n_kv_key}: all live '
                     f'ops on the accuracy/cost Pareto frontier')
+
+    # Post-run analysis-population audit. The prospective audit above only
+    # knows the REQUESTED seed budget. Seeds that crashed, diverged or
+    # produced a non-finite metric are filtered out of the aggregates, so
+    # the run that actually contributes evidence can be smaller than the
+    # pre-registered block. Passing the common surviving seed set turns
+    # that silent complete-case analysis into an explicit
+    # ``incomplete_attrition`` label (the planned power is still reported
+    # beside the realized power at the analyzed n).
+    analyzed_population = common_analyzed_seeds(
+        all_results, finite_keys=('final_acc', 'final_loss'))
+    experiment_design_audit = audit_experiment_design(
+        'exp4_mqar',
+        seeds=[42 + i for i in range(n_seeds)],
+        levels={'operator': list(ops_list), 'task': list(task_list),
+                'n_kv': list(n_kv_list)},
+        family_size=design_family_size,
+        analyzed_seeds=analyzed_population,
+    )
+    logger.info(
+        f'  design audit (post-run): {experiment_design_audit["status"]} '
+        f'(requested={experiment_design_audit["n_seeds"]}, '
+        f'analyzed={experiment_design_audit["n_analyzed"]}, '
+        f'missing={experiment_design_audit["analysis_population"]["n_missing"]})')
+    if experiment_design_audit['status'] == 'incomplete_attrition':
+        logger.warning(
+            '  [design] failed seeds were dropped from the analysis; the '
+            'reported estimates are complete-case, not the pre-registered '
+            'complete block. See metadata.experiment_design.'
+            'analysis_population.')
 
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped

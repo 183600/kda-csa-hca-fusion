@@ -218,8 +218,11 @@ Before any experiment runs, `run_all.py` writes `results/experiment_design.json`
 the pre-registered SESOI, analysis family, required seed count, and the power
 the current budget actually delivers. Each multi-seed runner also embeds its
 runtime audit as `metadata.experiment_design` (`confirmatory` /
-`reduced_family` / `screening` / `exploratory_missing_controls`). Validate the
-registry with
+`reduced_family` / `screening` / `incomplete_attrition` /
+`exploratory_missing_controls`). The audit compares the REQUESTED seed block
+with the seeds that actually survived into the analysis, so a run that
+silently dropped failed seeds is labelled `incomplete_attrition` instead of
+`confirmatory`. Validate the registry with
 `python experiment_design.py --check`, and use
 `python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json`
 to turn a pilot's paired SD into a confirmatory seed budget. See

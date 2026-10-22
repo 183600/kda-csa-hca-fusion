@@ -124,7 +124,8 @@ from multi_seed_stats import (
     min_detectable_effect, seeds_required, tost_from_summary,
     _sample_sd,
 )
-from experiment_design import audit_run as audit_experiment_design
+from experiment_design import (audit_run as audit_experiment_design,
+                               common_analyzed_seeds)
 
 logger = logging.getLogger(__name__)
 
@@ -3674,7 +3675,12 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
     # budget and the number of contrast rows in THIS run are compared with
     # the declared SESOI / family. The post-hoc design_audit above checks
     # that the promised cells ran; this audit checks whether the run is
-    # powered to make the claims those cells invite.
+    # powered to make the claims those cells invite. The analyzed seed set
+    # is the intersection of the seeds that survived in every group: a
+    # dropped seed makes the matrix a complete-case analysis, which the
+    # audit labels ``incomplete_attrition`` instead of confirmatory.
+    matrix_analyzed_population = common_analyzed_seeds(
+        all_results, finite_keys=('final_acc', 'final_loss'))
     matrix_experiment_design = audit_experiment_design(
         'exp5b_matrix',
         seeds=[42 + i for i in range(n_seeds)],
@@ -3683,13 +3689,20 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
             'layout_unit': sorted({_unit_of_group(spec[0]) for spec in groups}),
         },
         family_size=max(1, len(contrasts)),
+        analyzed_seeds=matrix_analyzed_population,
     )
-    logger.info(f'Prospective design audit: '
-                f'{matrix_experiment_design["status"]} '
-                f'(n={matrix_experiment_design["n_seeds"]}, '
+    logger.info(f'Design audit: {matrix_experiment_design["status"]} '
+                f'(requested={matrix_experiment_design["n_seeds"]}, '
+                f'analyzed={matrix_experiment_design["n_analyzed"]}, '
                 f'family={matrix_experiment_design["planning"]["family_size"]}, '
                 f'required='
                 f'{matrix_experiment_design["planning"]["required_seeds"]})')
+    if matrix_experiment_design['status'] == 'incomplete_attrition':
+        logger.warning(
+            'Failed seeds were dropped from the matrix analysis; the '
+            'reported contrasts are complete-case, not the pre-registered '
+            'complete block (see metadata.experiment_design.'
+            'analysis_population).')
 
     # Regime of the matrix as a whole (same vocabulary as the ratio sweep):
     # are the rows saturated / underfitting / overfitting, and do the seeds
@@ -4087,20 +4100,31 @@ def main():
     # Prospective audit of the pre-registered Exp 5 ratio plan. The family
     # is the number of alternative-vs-reference contrasts this run actually
     # produced; it is recorded next to the seed budget so a 7-seed screening
-    # sweep is never read as a confirmatory allocation claim.
+    # sweep is never read as a confirmatory allocation claim. The analyzed
+    # population is the intersection of the seeds that survived in every
+    # ratio row, so a failed seed downgrades the claim to
+    # ``incomplete_attrition`` rather than disappearing from the table.
+    ratio_analyzed_population = common_analyzed_seeds(
+        all_results, finite_keys=('final_acc', 'final_loss'))
     ratio_experiment_design = audit_experiment_design(
         'exp5_ratio',
         seeds=[42 + i for i in range(n_seeds)],
         levels={'ratio': sorted({str(r.get('ratio')) for r in all_results
                                  if r.get('ratio') is not None})},
         family_size=max(1, len(ratio_contrasts)),
+        analyzed_seeds=ratio_analyzed_population,
     )
-    logger.info(f'Prospective design audit: '
-                f'{ratio_experiment_design["status"]} '
-                f'(n={ratio_experiment_design["n_seeds"]}, '
+    logger.info(f'Design audit: {ratio_experiment_design["status"]} '
+                f'(requested={ratio_experiment_design["n_seeds"]}, '
+                f'analyzed={ratio_experiment_design["n_analyzed"]}, '
                 f'family={ratio_experiment_design["planning"]["family_size"]}, '
                 f'required='
                 f'{ratio_experiment_design["planning"]["required_seeds"]})')
+    if ratio_experiment_design['status'] == 'incomplete_attrition':
+        logger.warning(
+            'Failed seeds were dropped from the ratio sweep; the reported '
+            'contrasts are complete-case, not the pre-registered complete '
+            'block (see results/exp5_ablation_provenance.json).')
 
     # Regime of the sweep as a whole. Individual rows already carry their
     # own verdict; this is the one-line answer to "can this ranking be
