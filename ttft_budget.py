@@ -294,13 +294,16 @@ def ttft_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
         raise ValueError(
             f"ttft_ledger: state_mode={state_mode!r} must be "
             f"'compressed_kv_only' or 'full_accounting'.")
-    for name, spec in (('weight_storage', weight_storage),
-                       ('state_storage', state_storage)):
-        if spec is not None and not isinstance(
-                spec, (kv_quant.QuantSpec, kv_quant.FP8Spec, dict)):
-            raise TypeError(
-                f'ttft_ledger: {name} must be None, a QuantSpec, an '
-                f'FP8Spec or a dict, got {type(spec)!r}.')
+    if weight_storage is not None and not isinstance(
+            weight_storage, (kv_quant.QuantSpec, kv_quant.FP8Spec)):
+        raise TypeError(
+            f'ttft_ledger: weight_storage must be None, a QuantSpec or an '
+            f'FP8Spec, got {type(weight_storage)!r}.')
+    if state_storage is not None and not isinstance(
+            state_storage, (kv_quant.QuantSpec, kv_quant.FP8Spec, dict)):
+        raise TypeError(
+            f'ttft_ledger: state_storage must be None, a QuantSpec, an '
+            f'FP8Spec or a dict, got {type(state_storage)!r}.')
 
     if weight_elements is None:
         weight_elements = attention_tower_parameter_elements(cfg)['total']

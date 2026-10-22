@@ -204,6 +204,9 @@ def test_invalid_inputs_raise():
     with pytest.raises(TypeError):
         ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=BW,
                     weight_storage='fp8')
+    with pytest.raises(TypeError):
+        ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=BW,
+                    weight_storage={'memory': kv_quant.FP8Spec()})
     with pytest.raises(ValueError):
         resolve_scenario('int4')
 
