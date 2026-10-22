@@ -624,7 +624,10 @@ def _finite_float_or_none(value):
     on them used to abort the whole domination pass with TypeError /
     ValueError instead of annotating the remaining rows.
     """
-    if isinstance(value, bool):
+    if isinstance(value, (bool, str, bytes)):
+        # A JSON string (even a numeric-looking one) is a malformed metric,
+        # not a measurement: the row must be skipped so stringified output
+        # cannot silently enter the Pareto frontier.
         return None
     try:
         number = float(value)

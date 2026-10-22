@@ -377,6 +377,8 @@ def test_pareto_frontier_skips_malformed_values_instead_of_crashing():
          'n_params': 10, 'mean_train_time_s': 1.0},
         {'op': 'bad_cost', 'mean_acc': 0.5,
          'n_params': [10], 'mean_train_time_s': 1.0},
+        {'op': 'string_metric', 'mean_acc': '0.9', 'n_params': '10',
+         'mean_train_time_s': '1.0'},
         {'op': ['unhashable'], 'mean_acc': 0.7,
          'n_params': 10, 'mean_train_time_s': 1.0},
         {'op': 'good', 'mean_acc': 0.5,
@@ -384,13 +386,15 @@ def test_pareto_frontier_skips_malformed_values_instead_of_crashing():
         'not-a-row',
     ]
     rep = pareto_frontier(rows)
-    assert rep['skipped'] == ['bad_acc', 'bad_cost', 'row#4']
+    assert rep['skipped'] == ['bad_acc', 'bad_cost', 'string_metric',
+                              'row#5']
     # The unhashable name is keyed by repr, so it can still participate.
     assert rep['frontier'] == [str(['unhashable'])]
     annotate_rows_with_pareto(rows)
     assert rows[0]['pareto'] is None and rows[1]['pareto'] is None
-    assert rows[2]['pareto']['optimal'] is True
-    assert rows[3]['pareto']['dominated_by'] == str(['unhashable'])
+    assert rows[2]['pareto'] is None
+    assert rows[3]['pareto']['optimal'] is True
+    assert rows[4]['pareto']['dominated_by'] == str(['unhashable'])
 
 
 def test_confusion_matrix_rejects_out_of_range_explicit_classes():
