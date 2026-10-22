@@ -187,8 +187,17 @@ def test_switch_batch_definition_and_share():
     assert abs(switch - params['total'] / elems['total_elements_per_token']) \
         < 1e-9
     b_near = max(1, int(round(switch)))
-    share = db.decode_step_ledger(cfg, T, batch=b_near)['state_share']
+    led = db.decode_step_ledger(cfg, T, batch=b_near)
+    share = led['state_share']
     assert abs(share - 0.5) < 0.1, f'B={b_near}, share={share}'
+    assert led['weights_state_switch_batch'] == pytest.approx(switch)
+
+    fp8_led = db.decode_step_ledger(
+        cfg, T, batch=8, storage={'memory': FP8Spec()},
+        weight_itemsize=2)
+    fp8_switch = db.weights_state_switch_batch(
+        cfg, T, storage={'memory': FP8Spec()}, weight_itemsize=2)
+    assert fp8_led['weights_state_switch_batch'] == pytest.approx(fp8_switch)
 
 
 # ---------------------------------------------------------------------------

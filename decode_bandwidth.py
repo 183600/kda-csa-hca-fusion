@@ -353,7 +353,10 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
     state_read_bytes = batch * traffic['read_bytes_per_token']
     state_write_bytes = batch * traffic['write_bytes_per_token']
     state_bytes = state_read_bytes + state_write_bytes
+    state_bytes_per_token = traffic['total_bytes_per_token']
     total_bytes = weight_bytes + state_bytes
+    switch_batch = (weight_bytes / state_bytes_per_token
+                    if state_bytes_per_token > 0 else None)
     return {
         'T': int(T),
         'batch': batch,
@@ -372,6 +375,7 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
         'bytes_per_sequence_per_token': total_bytes / batch,
         'weights_share': (weight_bytes / total_bytes) if total_bytes else 0.0,
         'state_share': (state_bytes / total_bytes) if total_bytes else 0.0,
+        'weights_state_switch_batch': switch_batch,
         'read_bytes_by_op_per_step': {
             op: batch * traffic['read_bytes_by_op'][op]
             for op in ('memory', 'csa', 'hca')},
