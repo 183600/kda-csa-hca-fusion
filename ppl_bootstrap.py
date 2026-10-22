@@ -373,8 +373,11 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
     # that sum(centered_a) == sum(b) exactly. This is the token-weighted
     # analogue of subtracting the mean per-unit difference.
     shift = stats_a['total_nll'] - stats_b['total_nll']
-    centered_a = [(nll - shift * (tok / total_tokens), tok)
-                  for nll, tok in a]
+    delta_finite = math.isfinite(delta)
+    shift_finite = math.isfinite(shift)
+    centered_a = ([(nll - shift * (tok / total_tokens), tok)
+                   for nll, tok in a] if shift_finite
+                  else [(0.0, tok) for _, tok in a])
 
     rng = random.Random(int(seed))
     n = len(a)
@@ -421,10 +424,18 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
         hit_gap = (sc / t) - mean_b
         if abs(hit_gap) >= scaled_abs_delta:
             hits += 1
-    ordered = sorted(reps)
-    lo = _percentile(ordered, float(alpha) / 2.0)
-    hi = _percentile(ordered, 1.0 - float(alpha) / 2.0)
-    if n < 2:
+    # A finite difference can still produce an unrepresentable replicate
+    # (e.g. the scaled path multiplies back beyond the float range), and
+    # an inf/nan endpoint would break the strict-JSON contract.
+    ordered = sorted(x for x in reps if math.isfinite(x))
+    if ordered:
+        lo = _percentile(ordered, float(alpha) / 2.0)
+        hi = _percentile(ordered, 1.0 - float(alpha) / 2.0)
+    else:
+        lo = hi = None
+    if n < 2 or not (delta_finite and shift_finite):
+        # Without a representable observed shift / centered resample there
+        # is no valid centered hypothesis test to report.
         p_value = None
         significant = None
         worse = None
@@ -441,10 +452,12 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
         'mean_nll_b': stats_b['mean_nll'],
         'perplexity_a': stats_a['perplexity'],
         'perplexity_b': stats_b['perplexity'],
-        'delta_mean_nll': delta,
+        'delta_mean_nll': delta if delta_finite else None,
         'ci_delta_mean_nll': [lo, hi],
-        'ppl_ratio_a_over_b': _ppl_from_mean_nll(delta),
-        'ci_ppl_ratio': [_ppl_from_mean_nll(lo), _ppl_from_mean_nll(hi)],
+        'ppl_ratio_a_over_b': (_ppl_from_mean_nll(delta)
+                               if delta_finite else None),
+        'ci_ppl_ratio': [_ppl_from_mean_nll(x) if x is not None else None
+                         for x in (lo, hi)],
         'p_value': p_value,
         'p_value_resolution': 1.0 / (int(n_boot) + 1),
         'significant': significant,

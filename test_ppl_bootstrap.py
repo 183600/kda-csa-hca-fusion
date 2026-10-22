@@ -407,3 +407,16 @@ def test_finite_unit_sums_cannot_overflow_into_non_json_reports():
     assert all(math.isfinite(x) for x in paired_diff['ci_delta_mean_nll'])
     assert math.isfinite(paired_diff['p_value'])
     json.dumps(paired_diff, allow_nan=False)
+
+    # Opposite-sign single units have finite point means and totals, but
+    # their difference is beyond the float range and the centered shift
+    # overflows too. Those unrepresentable fields must be None, not inf/nan.
+    for a, b in (([(1.7e308, 1)], [(-1.7e308, 1)]),
+                 ([(1.5e308, 1)], [(-1.5e308, 1)]),
+                 ([(1e308, 1)], [(-1e308, 1)])):
+        rep = P.paired_bootstrap_ppl(a, b, n_boot=20, seed=0)
+        assert rep['delta_mean_nll'] is None
+        assert rep['ppl_ratio_a_over_b'] is None
+        assert rep['ci_delta_mean_nll'] == [None, None]
+        assert rep['p_value'] is None
+        json.dumps(rep, allow_nan=False)
