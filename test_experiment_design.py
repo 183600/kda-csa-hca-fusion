@@ -441,3 +441,60 @@ def test_cpu_skip_slow_seed_floor_is_recorded(monkeypatch, tmp_path):
     assert {plan: row['n_seeds'] for plan, row in block['plans'].items()} \
         == {'exp4_mqar': 5, 'exp5_ratio': 5, 'exp5b_matrix': 5,
             'exp8_mechanism': 5}
+
+
+def test_malformed_plan_and_audit_inputs_raise_design_errors():
+    """Malformed registry/audit inputs must not escape as raw TypeError.
+
+    These are configuration errors, so the public entry points report a
+    DesignError (or a validation string) instead of an opaque crash from a
+    dict lookup / set key.
+    """
+    base = D.get_plan('exp4_mqar')
+    for factor in (None, [], 'x'):
+        plan = dict(base, factors={'operator': factor})
+        errors = D.validate_plan(plan)
+        assert isinstance(errors, list) and errors
+        assert any('not a dict' in e for e in errors)
+
+    for levels in (5, 'softmax', ('softmax',)):
+        with pytest.raises(D.DesignError):
+            D.audit_run('exp4_mqar', seeds=[42, 43], levels=levels)
+    bad_levels = {'operator': 3}
+    with pytest.raises(D.DesignError):
+        D.audit_run('exp4_mqar', seeds=[42, 43], levels=bad_levels)
+    ok = D.audit_run('exp4_mqar', seeds=[42, 43],
+                    levels={'operator': ['linear', 'softmax']})
+    assert ok['level_checks']['operator']['status'] == 'present'
+
+    for key, value in (('alpha', '0.05'), ('sesoi', None),
+                       ('assumed_sd', True), ('target_power', '0.8'),
+                       ('planned_family_size', True)):
+        plan = dict(base, **{key: value})
+        with pytest.raises(D.DesignError):
+            D.planning_report(plan)
+
+
+def test_pilot_extraction_skips_unhashable_cells_groups_and_seeds():
+    """A malformed pilot row is skipped, not allowed to abort extraction."""
+    rows = [
+        {'op': 'softmax', 'task': ['mqa'], 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 0.2},
+                      {'seed': 43, 'final_acc': 0.2},
+                      {'seed': 44, 'final_acc': 0.2}]},
+        {'op': 'kda', 'task': ['mqa'], 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 0.3},
+                      {'seed': 43, 'final_acc': 0.3},
+                      {'seed': 44, 'final_acc': 0.3}]},
+        {'op': ['softmax'], 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 0.9},
+                      {'seed': 43, 'final_acc': 0.9}]},
+        {'op': 'kda', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': ['42'], 'final_acc': 0.9},
+                      {'seed': 43, 'final_acc': 0.9}]},
+        {'op': 'softmax', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': [42], 'final_acc': 0.2},
+                      {'seed': 43, 'final_acc': 0.2}]},
+    ]
+    assert D.pilot_sd_from_rows(rows, group_key='op', reference='softmax',
+                                cell_keys=['task', 'n_kv']) is None

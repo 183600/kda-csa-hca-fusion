@@ -81,6 +81,7 @@ import os
 import statistics
 import sys
 import tempfile
+from collections.abc import Mapping
 
 from multi_seed_stats import (min_detectable_effect, power_at_effect,
                               seeds_required)
@@ -449,6 +450,14 @@ def _clean_float(value):
     return value if math.isfinite(value) else None
 
 
+def _is_hashable(value) -> bool:
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Plan access and static validation
 # ---------------------------------------------------------------------------
@@ -508,7 +517,14 @@ def validate_plan(plan) -> list[str]:
             errors.append(f'required_levels[{name!r}] must be a non-empty '
                           'list')
             continue
-        factor_levels = factors[name].get('levels', [])
+        factor = factors[name]
+        if not isinstance(factor, dict):
+            # Already reported above as "factor ... must be a dict"; do not
+            # crash on the follow-up lookup.
+            errors.append(f'required_levels names factor {name!r} that is '
+                          'not a dict')
+            continue
+        factor_levels = factor.get('levels', [])
         if not isinstance(factor_levels, list):
             errors.append(f'required_levels names a factor {name!r} whose '
                           'levels are not an explicit list')
@@ -614,8 +630,8 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
     plan = get_plan(plan) if isinstance(plan, str) else plan
     if not isinstance(plan, dict):
         raise DesignError('plan must be a plan id or a dict')
-    alpha = float(plan.get('alpha', DEFAULT_ALPHA) if alpha is None
-                  else _need_number(alpha, 'alpha'))
+    alpha = _need_number(
+        plan.get('alpha', DEFAULT_ALPHA) if alpha is None else alpha, 'alpha')
     if not (0.0 < alpha < 1.0):
         raise DesignError(f'alpha must be in (0,1), got {alpha!r}')
     family = plan.get('planned_family_size', 1) if family_size is None \
@@ -626,18 +642,16 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         else alternative
     if alt not in ('two-sided', 'greater', 'less'):
         raise DesignError(f'invalid alternative {alt!r}')
-    sesoi_value = float(plan.get('sesoi', 0.10) if sesoi is None
-                        else _need_number(sesoi, 'sesoi', positive=True))
-    if sesoi_value <= 0.0:
-        raise DesignError(f'sesoi must be > 0, got {sesoi_value!r}')
-    sd_value = float(plan.get('assumed_sd', DEFAULT_ASSUMED_SD) if sd is None
-                     else _need_number(sd, 'sd', positive=True))
-    if sd_value <= 0.0:
-        raise DesignError(f'sd must be > 0, got {sd_value!r}')
-    target = float(plan.get('target_power', DEFAULT_TARGET_POWER)
-                   if target_power is None
-                   else _need_number(target_power, 'target_power',
-                                     positive=True))
+    sesoi_value = _need_number(
+        plan.get('sesoi', 0.10) if sesoi is None else sesoi, 'sesoi',
+        positive=True)
+    sd_value = _need_number(
+        plan.get('assumed_sd', DEFAULT_ASSUMED_SD) if sd is None else sd,
+        'sd', positive=True)
+    target = _need_number(
+        plan.get('target_power', DEFAULT_TARGET_POWER)
+        if target_power is None else target_power, 'target_power',
+        positive=True)
     if not (0.0 < target < 1.0):
         raise DesignError(f'target_power must be in (0,1), got {target!r}')
     n_seeds = plan.get('planned_seeds', 2) if seeds is None else seeds
@@ -728,7 +742,17 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     plan = get_plan(plan_id)
     seed_list = _seed_list(seeds)
     n_seeds = len(seed_list)
-    levels = dict(levels or {})
+    if levels is None:
+        levels = {}
+    elif not isinstance(levels, Mapping):
+        raise DesignError(
+            f'levels must be a mapping of factor name -> observed levels, '
+            f'got {type(levels).__name__}')
+    else:
+        try:
+            levels = dict(levels)
+        except (TypeError, ValueError) as exc:
+            raise DesignError(f'levels is not a usable mapping: {exc}') from None
 
     seed_errors: list[str] = []
     if n_seeds < 2:
@@ -750,13 +774,20 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                                     'required': list(required_levels),
                                     'observed': None}
             continue
+        if isinstance(observed, (str, bytes)) or not hasattr(
+                observed, '__iter__'):
+            raise DesignError(
+                f'levels[{factor!r}] must be an iterable of observed levels, '
+                f'got {type(observed).__name__}; a bare string is ambiguous '
+                'and is rejected rather than iterated character by character')
+        observed = list(observed)
         missing = [level for level in required_levels
-                   if level not in list(observed)]
+                   if level not in observed]
         missing_required.extend(f'{factor}:{level}' for level in missing)
         level_checks[factor] = {
             'status': 'missing' if missing else 'present',
             'required': list(required_levels),
-            'observed': list(observed),
+            'observed': observed,
             'missing': missing,
         }
 
@@ -916,7 +947,14 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
         if not isinstance(row, dict) or 'error' in row:
             continue
         group = row.get(group_key)
-        if group is None or str(group) in excluded:
+        if group is None or not _is_hashable(group) \
+                or str(group) in excluded:
+            # A malformed (e.g. list-valued) group cannot be a dict key or
+            # compared to the reference level; skip it like any other
+            # unusable pilot row rather than aborting the extraction.
+            continue
+        cell = _cell_key(row, cell_keys)
+        if not _is_hashable(cell):
             continue
         acc_by_seed = {}
         for seed_row in row.get('per_seed') or []:
@@ -927,12 +965,11 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
             if acc is None:
                 acc = seed_row.get('acc')
             acc = _clean_float(acc)
-            if seed is None or acc is None:
+            if seed is None or not _is_hashable(seed) or acc is None:
                 continue
             acc_by_seed[seed] = acc
         if acc_by_seed:
-            cells.setdefault(_cell_key(row, cell_keys), {})[group] = \
-                acc_by_seed
+            cells.setdefault(cell, {})[group] = acc_by_seed
 
     pairs = []
     for cell, groups in cells.items():
