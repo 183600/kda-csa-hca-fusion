@@ -123,7 +123,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       # 预热 pip 缓存：命中时后续依赖安装直接复用 wheel。失败不致命（`|| echo`）。
       # 版本以仓库 requirements.txt / pyproject.toml 为准；首次接入请人工核对
@@ -202,8 +202,18 @@ jobs:
           swapon --show
           df -h /
 
-      - name: Install opencode
-        run: npm i -g opencode-ai
+      - name: Install DeepSeek Harness (dsh)
+        run: |
+          npm i -g @deepseek-ai/dsh@0.2.1-rc.2
+          dsh --version
+
+      - name: Configure dsh (DeepSeek official API)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -e
+          [ -n "$DEEPSEEK_API_KEY" ] || { echo "[error] secrets.DEEPSEEK_API_KEY 未配置" >&2; exit 1; }
+          echo "[info] dsh $(dsh --version) | provider=deepseek-official | model=deepseek-flash"
 
       - name: Install xuen (drives the improve phase)
         run: |
@@ -217,97 +227,15 @@ jobs:
           python3 /tmp/xuen/main.py --help >/dev/null
           echo "[ok] xuen ready at /tmp/xuen (workspace: /tmp/xuen-workspace)"
 
-      - name: Configure opencode (free models + tamper protection)
-        env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-        run: |
-          # opencode 自带的 OpenCode Zen 免费 provider 无需任何 API key；
-          # 如需更高限额，可在仓库 secrets 里可选配置 OPENCODE_API_KEY。
-          if [ -n "$OPENCODE_API_KEY" ]; then
-            echo "[info] OPENCODE_API_KEY 已配置（用于提升免费模型限额）"
-          else
-            echo "[info] 未配置 OPENCODE_API_KEY，匿名使用免费模型（有速率限制）"
-          fi
-          mkdir -p ~/.config/opencode
-          cat > ~/.config/opencode/opencode.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "permission": {
-              "*": "allow",
-              "edit": {
-                "*": "allow",
-                ".github/**": "deny",
-                "**/.github/**": "deny",
-                "LICENSE": "deny",
-                "LICENSE.*": "deny",
-                "**/LICENSE": "deny",
-                "**/LICENSE.*": "deny",
-                "ci_gate.py": "deny",
-                "**/ci_gate.py": "deny",
-                "README.md": "deny",
-                "README*.md": "deny",
-                "conftest.py": "deny",
-                "run_correctness.py": "deny",
-                "test_figures.py": "deny",
-                "results_lm/**": "deny"
-              },
-              "bash": {
-                "*": "allow",
-                "rm -rf .github*": "deny",
-                "rm -r .github*": "deny",
-                "rm .github*": "deny",
-                "mv .github*": "deny",
-                "git rm -r .github*": "deny",
-                "rm *LICENSE*": "deny",
-                "mv *LICENSE*": "deny",
-                "cp *LICENSE*": "deny",
-                "git rm *LICENSE*": "deny",
-                "git mv *LICENSE*": "deny",
-                "shred *LICENSE*": "deny",
-                "truncate *LICENSE*": "deny",
-                "unlink *LICENSE*": "deny",
-                "dd *of=LICENSE*": "deny",
-                "find * -name *LICENSE*": "deny",
-                "git push*": "deny",
-                "git checkout --orphan*": "deny",
-                "git switch --orphan*": "deny",
-                "git filter-branch*": "deny",
-                "git rebase*": "deny",
-                "git branch -D*": "deny",
-                "git update-ref*": "deny",
-                "git symbolic-ref*": "deny",
-                "git reflog*": "deny",
-                "git gc*": "deny",
-                "git remote add*": "deny",
-                "git remote remove*": "deny",
-                "git remote set-url*": "deny",
-                "rm *ci_gate*": "deny",
-                "mv *ci_gate*": "deny",
-                "rm *run_correctness*": "deny",
-                "rm *test_figures*": "deny",
-                "rm -r results_lm*": "deny",
-                "rm -rf results_lm*": "deny",
-                "mv results_lm*": "deny"
-              }
-            }
-          }
-          EOF
-          echo "[guard] opencode 权限已锁定：edit/bash 对 .github/**、LICENSE、README、测试与 ci_gate.py 禁止操作"
-
-          echo "=== OpenCode Zen 可用模型目录 ==="
-          opencode models opencode 2>/dev/null \
-            || opencode models 2>/dev/null | grep -F 'opencode/' \
-            || echo "[warn] 暂时无法获取模型列表，将在运行时重试"
-
       - name: Configure git
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: "Run opencode for ~3 hours (bug / sci / improve-via-xuen; perf/clean disabled)"
+      - name: "Run dsh for ~3 hours (bug / sci / improve-via-xuen; perf/clean disabled)"
         timeout-minutes: 180
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -667,7 +595,7 @@ jobs:
 
           # ---------- 一次性模型探测（每个 run 只做一次） ----------
           # run 开始时在 detect_provider 里探测一次，选定 SELECTED_MODEL；之后所有阶段直接
-          #   opencode run -m "$SELECTED_MODEL" ...
+          #   dsh --profile headless ...
           # 只有收到 429 / 5xx / 连接失败 / 其它非零退出时，才丢弃它并重新探测
           # （重新探测会跳过本次 run 内已判定失效的候选）。
           # 注意：只看 `opencode models` 目录不够——必须真跑一次冒烟调用，否则会选中
@@ -678,7 +606,7 @@ jobs:
             local args=()
             [ -n "$eff" ] && args=(--variant "$eff")
             # shellcheck disable=SC2086
-            timeout --kill-after=30 120 opencode run -m "$m" ${args[@]+"${args[@]}"} "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+            timeout --kill-after=30 120 dsh --profile headless "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
           }
 
           detect_provider() {
@@ -710,6 +638,40 @@ jobs:
           }
 
           # run 开始时探测一次；失败也不阻塞，第一个阶段需要时会再探测
+          # ================= harness: DeepSeek Harness (dsh) + DeepSeek 官方 API =================
+          # 固定 provider=deepseek-official、model=deepseek-flash；API key 从启动环境
+          # DEEPSEEK_API_KEY 读取（headless profile 不读 GUI 凭据库）。
+          # 本段覆盖下方（或上方）原有的 provider 探测实现：不再探测 NVIDIA / opencode Zen。
+          SELECTED_MODEL="deepseek-official/deepseek-flash"
+          SELECTED_PROVIDER="deepseek-official"
+          CURRENT_MODEL="$SELECTED_MODEL"
+          CURRENT_PROVIDER="$SELECTED_PROVIDER"
+          pick_model() {
+            CURRENT_MODEL="deepseek-official/deepseek-flash"
+            CURRENT_PROVIDER="deepseek-official"
+            return 0
+          }
+          pick_provider() {
+            CURRENT_MODEL="deepseek-official/deepseek-flash"
+            CURRENT_PROVIDER="deepseek-official"
+            return 0
+          }
+          smoke_test() {
+            timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+          }
+          detect_provider() {
+            SELECTED_MODEL="deepseek-official/deepseek-flash"
+            SELECTED_PROVIDER="deepseek-official"
+            CURRENT_MODEL="$SELECTED_MODEL"
+            CURRENT_PROVIDER="$SELECTED_PROVIDER"
+            export SELECTED_MODEL SELECTED_PROVIDER
+            echo "[provider] 固定使用 $SELECTED_MODEL（DeepSeek 官方 API）"
+            if smoke_test; then
+              return 0
+            fi
+            echo "[warn] dsh 冒烟测试失败（API key / 网络 / 配额）"
+            return 1
+          }
           if detect_provider; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
 
           # ---------- xuen 配置（improve 阶段专用） ----------
@@ -722,7 +684,7 @@ jobs:
             [ -n "$effort" ] && varargs="--variant $effort "
             cat > /tmp/xuen/config.yaml <<XEOF
           agent:
-            command: 'opencode run -m ${SELECTED_MODEL} ${varargs}"\$prompt"'
+            command: 'dsh --profile headless "$prompt"'
             timeout: 1500
           extra_notes: |
             你是一位严谨的科研工程助手，正在改进 KDA-CSA-HCA Fusion 仓库（PyTorch 线性注意力混合架构的正确性参考实现与实验框架）。
@@ -806,7 +768,7 @@ jobs:
               else
                 echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$SELECTED_MODEL effort=${EFFORT:-none} ==========="
                 timeout --kill-after=180 "$budget_now" \
-                  opencode run -m "$SELECTED_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
+                  dsh --profile headless "$prompt" 2>&1 | tee "$OUT"
               fi
               local EC=$?
 
@@ -872,7 +834,7 @@ jobs:
           # 在 bug / sci / improve(xuen) 阶段提交之后触发（调用点见主循环的 phase 守卫）。
           # 原先按 20% 抽样，80% 的提交从未被验证过；本仓库的测试走 ci_gate.py
           # （语法检查 + 全量 pytest 对拍），成本远低于一个阶段预算，所以每次都跑。
-          # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 master。
+          # 跑不通 → 调用 dsh 修复 → 修复结果按本仓库既有提交路径落到 master。
           maybe_run_tests() {
             local iter="$1"
             echo "[test-gate] iter #$iter 执行全量测试（ci_gate.py）"
@@ -908,7 +870,7 @@ jobs:
               echo "[test-gate] 测试超时/被中断 (exit=$TG_EC)，结果不确定，本轮不修复"
               return 0
             fi
-            echo "[test-gate] 测试未通过 (exit=$TG_EC)，调用 opencode 修复"
+            echo "[test-gate] 测试未通过 (exit=$TG_EC)，调用 dsh 修复"
             local TG_FIX_BUDGET=$(( DEADLINE - $(date +%s) - 900 ))
             if [ "$TG_FIX_BUDGET" -lt 900 ]; then
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
