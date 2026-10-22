@@ -578,8 +578,20 @@ class ValidationCurve:
         # instead of propagating NaN into every downstream mean.
         gap = None
         if final_finite and train_losses:
-            gap = (float(final['loss'])
-                   - sum(train_losses[-10:]) / min(10, len(train_losses)))
+            # ``train_losses`` may carry the same JSON-null sentinel for a
+            # sanitized non-finite step that ``val_history`` does. Average
+            # the finite entries of the last 10 steps; if none are finite
+            # the gap is undefined (None), never a TypeError or NaN.
+            tail = []
+            for value in train_losses[-10:]:
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    tail.append(value)
+            if tail:
+                gap = float(final['loss']) - sum(tail) / len(tail)
         block = {
             'val_every': self.val_every,
             'val_history': self.history,

@@ -186,6 +186,28 @@ def test_validation_curve_ignores_nonfinite_points_for_best_and_regret():
     json.dumps(block, allow_nan=False)
 
 
+def test_validation_curve_gap_ignores_json_null_training_losses():
+    """A sanitized non-finite training loss must not abort the report.
+
+    ``diagnose_training_curves`` accepts ``None`` entries (the JSON-null
+    sentinel written for a non-finite loss), but ``finalize`` used to add
+    them with ``sum(...)`` and raise TypeError. The gap must average the
+    finite tail entries instead.
+    """
+    curve = _curve([(1.0, 0.5), (0.9, 0.6), (0.8, 0.7)],
+                   steps=2, val_every=1)
+    for step in range(3):
+        curve.record(step)
+    block = curve.finalize([2.0, None, 1.0])
+    assert block['generalization_gap'] == pytest.approx(0.8 - 1.5)
+    json.dumps(block, allow_nan=False)
+
+    # No finite entry in the tail -> an explicit undefined gap, not NaN.
+    block = curve.finalize([None, float('nan'), float('inf')])
+    assert block['generalization_gap'] is None
+    json.dumps(block, allow_nan=False)
+
+
 def test_validation_curve_rejects_swapped_fields_and_disabled_is_empty():
     curve = _curve([(1.0, 3.0)], steps=1, val_every=1)
     with pytest.raises(ValueError, match='accuracy must lie in'):
