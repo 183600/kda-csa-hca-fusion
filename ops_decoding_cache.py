@@ -1393,12 +1393,18 @@ class CSADecodingCache:
         first_needed = m - acc
         if T_new < first_needed:
             # Still short of the next block boundary: stash every token.
-            self._acc_Ca += list(Ca_new.split(1, dim=1))
-            self._acc_Cb += list(Cb_new.split(1, dim=1))
-            self._acc_Za += list(Za_new.split(1, dim=1))
-            self._acc_Zb += list(Zb_new.split(1, dim=1))
-            self._acc_K_idx += list(K_idx_new.split(1, dim=1))
-            self._acc_Z_idx += list(Z_idx_new.split(1, dim=1))
+            # ``split`` returns views of the caller's projection tensors;
+            # copy them (as the per-token path and the tail branch below
+            # already do) so a caller that reuses its projection buffer
+            # cannot mutate the cache's partial-block state in place.
+            self._acc_Ca += [t.clone() for t in Ca_new.split(1, dim=1)]
+            self._acc_Cb += [t.clone() for t in Cb_new.split(1, dim=1)]
+            self._acc_Za += [t.clone() for t in Za_new.split(1, dim=1)]
+            self._acc_Zb += [t.clone() for t in Zb_new.split(1, dim=1)]
+            self._acc_K_idx += [t.clone()
+                                for t in K_idx_new.split(1, dim=1)]
+            self._acc_Z_idx += [t.clone()
+                                for t in Z_idx_new.split(1, dim=1)]
             return []
         if acc:
             Ca_first = torch.cat(
@@ -2659,8 +2665,10 @@ class HCADecodingCache:
         acc = len(self._acc_C)
         first_needed = m2 - acc
         if T_new < first_needed:
-            self._acc_C += list(C_new.split(1, dim=1))
-            self._acc_Z += list(Z_new.split(1, dim=1))
+            # Clone the split views: see the matching note in
+            # ``CSADecodingCache._append_bulk``.
+            self._acc_C += [t.clone() for t in C_new.split(1, dim=1)]
+            self._acc_Z += [t.clone() for t in Z_new.split(1, dim=1)]
             return []
         if acc:
             C_first = torch.cat(

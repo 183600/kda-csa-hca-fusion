@@ -453,3 +453,52 @@ def test_partial_block_accumulators_own_their_tokens():
     hca_b.append_step(*hca_tok(1.0), Ba)
     hca_b.append_step(*hca_tok(2.0), Ba)
     assert torch.equal(hca_a.C_comp, hca_b.C_comp)
+
+
+def test_bulk_partial_block_accumulators_own_their_tokens():
+    """A bulk chunk shorter than the next block must copy its tokens.
+
+    ``append_step`` accepts ``T_new > 1`` (prefill chunks). The shortfall
+    branch used to store ``split`` views of the caller's projections, so
+    reusing that projection buffer before the next chunk silently mutated
+    the cache's pending partial block. The per-token path already cloned;
+    this pins the bulk path too.
+    """
+    from ops_decoding_cache import CSADecodingCache, HCADecodingCache
+    B, c, c_I, m, win = 1, 2, 2, 4, 2
+    Ba = torch.randn(m, c)
+    Bb = torch.randn(m, c)
+    Bi = torch.randn(m, c_I)
+
+    def csa_chunk(value, n):
+        return ([torch.full((B, n, c), float(value)) for _ in range(4)]
+                + [torch.full((B, n, c_I), float(value)) for _ in range(2)])
+
+    cache_a = CSADecodingCache(B, c, c_I, m, win, torch.device('cpu'),
+                               torch.float32)
+    ins = csa_chunk(1.0, 2)
+    cache_a.append_step(*ins, Ba, Bb, Bi)
+    for tensor in ins:
+        tensor.fill_(9.0)
+    cache_a.append_step(*csa_chunk(2.0, 2), Ba, Bb, Bi)
+    cache_b = CSADecodingCache(B, c, c_I, m, win, torch.device('cpu'),
+                               torch.float32)
+    cache_b.append_step(*csa_chunk(1.0, 2), Ba, Bb, Bi)
+    cache_b.append_step(*csa_chunk(2.0, 2), Ba, Bb, Bi)
+    assert torch.equal(cache_a.C_comp, cache_b.C_comp)
+
+    def hca_chunk(value, n):
+        return [torch.full((B, n, c), float(value)) for _ in range(2)]
+
+    hca_a = HCADecodingCache(B, c, m, win, torch.device('cpu'),
+                             torch.float32)
+    ins = hca_chunk(1.0, 2)
+    hca_a.append_step(*ins, Ba)
+    for tensor in ins:
+        tensor.fill_(9.0)
+    hca_a.append_step(*hca_chunk(2.0, 2), Ba)
+    hca_b = HCADecodingCache(B, c, m, win, torch.device('cpu'),
+                             torch.float32)
+    hca_b.append_step(*hca_chunk(1.0, 2), Ba)
+    hca_b.append_step(*hca_chunk(2.0, 2), Ba)
+    assert torch.equal(hca_a.C_comp, hca_b.C_comp)
