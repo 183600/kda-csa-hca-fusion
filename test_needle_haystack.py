@@ -530,6 +530,29 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         and summary['distance_effects'][0]['far_needle_pos'] == 64,
         f"{summary['distance_effects']}")
 
+    # Non-dict rows, a non-dict hypothesis block and a string p-value must
+    # not abort the aggregation; a malformed rule-baseline accuracy is
+    # skipped instead of becoming 0.0 / raising.
+    hardened = malformed + [
+        42,
+        {'row_kind': 'needle_recall', 'memory_type': 'kda',
+         'context_len': 256, 'needle_pos': 128, 'accuracy_mean': 0.5,
+         'hypothesis_checks': 'not-a-mapping'},
+        {'row_kind': 'needle_recall', 'memory_type': 'kda',
+         'context_len': 256, 'needle_pos': 128, 'accuracy_mean': 0.5,
+         'hypothesis_checks': {'learned_retrieval':
+                               {'p_value_directional': '0.01'}}},
+        {'row_kind': 'needle_rule_baseline', 'accuracy': 'bad'},
+        {'row_kind': 'needle_rule_baseline', 'accuracy': 0.25},
+    ]
+    summary = summarize_needle_hypotheses(hardened)
+    _ok('malformed non-distance rows are skipped safely',
+        summary['rule_baseline_accuracy_mean'] == 0.25
+        and summary['n_rule_baseline_rows'] == 2
+        and len(summary['distance_effects']) == 1,
+        f"rule={summary['rule_baseline_accuracy_mean']}, "
+        f"n_rule={summary['n_rule_baseline_rows']}")
+
 
 def test_learned_retrieval_familywise_correction():
     """Repeated dtype/PTQ rows must not count as independent evidence.

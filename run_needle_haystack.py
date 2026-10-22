@@ -1201,13 +1201,23 @@ def _needle_primary_precision_rank(row: dict) -> tuple:
         dtype_rank = {'fp32': 0, 'fp16': 1, 'bf16': 2}.get(
             str(row.get('dtype')), 3)
         return (0, dtype_rank, 0, 0, '')
+    # Quantization metadata is optional and may be malformed (a string /
+    # bool / float). It is only a tie-break, so coerce only exact ints and
+    # otherwise rank the cell last instead of aborting the whole summary.
+    bits = row.get('bits')
+    group_size = row.get('group_size')
+    bits = int(bits) if isinstance(bits, int) and not isinstance(bits, bool) \
+        else 0
+    group_size = (int(group_size)
+                  if isinstance(group_size, int)
+                  and not isinstance(group_size, bool) else 0)
     return (
         1,
         # Sort key is ascending: negate bits so the WIDEST format wins the
         # primary-cell slot (2-bit must not outrank 8-bit when a family has
         # no unquantized reference row).
-        -int(row.get('bits') or 0),
-        int(row.get('group_size') or 0),
+        -bits,
+        group_size,
         0 if row.get('symmetric') else 1,
         '',
     )
@@ -1226,12 +1236,16 @@ def _needle_hypothesis_family(rows: list[dict], hypothesis_key: str,
     """
     groups: dict[tuple, list[tuple]] = {}
     for row in rows:
-        if row.get('row_kind') != 'needle_recall':
+        if not isinstance(row, dict) or row.get('row_kind') != 'needle_recall':
             continue
-        claim = ((row.get('hypothesis_checks') or {})
-                 .get(hypothesis_key) or {})
+        checks = row.get('hypothesis_checks')
+        claim = (checks.get(hypothesis_key) if isinstance(checks, dict)
+                 else None) or {}
         p_value = claim.get('p_value_directional')
-        if p_value is None:
+        if (isinstance(p_value, bool)
+                or not isinstance(p_value, (int, float))
+                or not math.isfinite(float(p_value))
+                or not 0.0 <= float(p_value) <= 1.0):
             continue
         key = _needle_learned_retrieval_family_key(row)
         groups.setdefault(key, []).append(
@@ -1310,21 +1324,24 @@ def _needle_trained_matches_rule_family(rows: list[dict],
 
 def summarize_needle_hypotheses(rows: list[dict]) -> dict:
     """Aggregate the pre-registered verdicts into one summary row."""
+    rows = [r for r in rows if isinstance(r, dict)]
     recall = [r for r in rows if r.get('row_kind') == 'needle_recall']
     rules = [r for r in rows if r.get('row_kind') == 'needle_rule_baseline']
     unquant = [r for r in recall if not r.get('quantized')]
-    match_verdicts = []
-    for r in unquant:
-        v = ((r.get('hypothesis_checks') or {})
-             .get('trained_matches_rule') or {}).get('verdict')
-        if v is not None:
-            match_verdicts.append(bool(v))
-    learn_verdicts = []
-    for r in recall:
-        v = ((r.get('hypothesis_checks') or {})
-             .get('learned_retrieval') or {}).get('verdict')
-        if v is not None:
-            learn_verdicts.append(bool(v))
+    def _verdicts(rows, key):
+        out = []
+        for r in rows:
+            checks = r.get('hypothesis_checks')
+            claim = (checks.get(key) if isinstance(checks, dict) else None)
+            if not isinstance(claim, dict):
+                continue
+            v = claim.get('verdict')
+            if v is not None:
+                out.append(bool(v))
+        return out
+
+    match_verdicts = _verdicts(unquant, 'trained_matches_rule')
+    learn_verdicts = _verdicts(recall, 'learned_retrieval')
     learn_family = _needle_learned_retrieval_family(recall)
     rule_family = _needle_trained_matches_rule_family(recall)
     # Distance check: unquantized rows grouped by (context, route); compare
@@ -1394,15 +1411,25 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
     if distance_effects:
         distance_verdict = all(d['far_minus_near'] <= 0.0
                                for d in distance_effects)
+    # Rule-baseline accuracies are optional diagnostics; a malformed row
+    # (missing / string / bool / non-finite value) is skipped rather than
+    # aborting the whole summary with KeyError/TypeError.
+    rule_accs = []
+    for r in rules:
+        acc = r.get('accuracy')
+        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
+                or not math.isfinite(float(acc))):
+            continue
+        rule_accs.append(float(acc))
     return {
         'row_kind': 'needle_summary',
         'n_recall_rows': len(recall),
         'n_unquantized_recall_rows': len(unquant),
         'n_rule_baseline_rows': len(rules),
         'rule_baseline_accuracy_mean': (
-            sum(r['accuracy'] for r in rules) / len(rules) if rules else None),
+            sum(rule_accs) / len(rule_accs) if rule_accs else None),
         'rule_baseline_accuracy_min': (
-            min(r['accuracy'] for r in rules) if rules else None),
+            min(rule_accs) if rule_accs else None),
         'n_trained_rows_meeting_rule': sum(match_verdicts),
         'n_trained_rows_below_rule': (len(match_verdicts)
                                       - sum(match_verdicts)),
