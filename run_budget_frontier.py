@@ -514,6 +514,7 @@ def _load_join_source(source, path, provenance_path=None):
         'sha256': None,
         'git_commit': None,
         'git_dirty': None,
+        'source_tree_sha256': None,
         'captured_at_utc': None,
         'seeds': [],
         'n_seeds': 0,
@@ -575,6 +576,7 @@ def _load_join_source(source, path, provenance_path=None):
     rec['n_seeds'] = len(rec['seeds'])
     rec['git_commit'] = prov.get('git_commit')
     rec['git_dirty'] = prov.get('git_dirty')
+    rec['source_tree_sha256'] = prov.get('source_tree_sha256')
     rec['captured_at_utc'] = prov.get('captured_at_utc')
     rec['backends'] = {
         key: prov.get(key) or prov.get(key.replace('_resolved', ''))
@@ -600,6 +602,12 @@ def audit_join_sources(source_records):
     backends. This function never changes the measured numbers; it
     records the evidence and returns a status used to annotate (and, for
     mixed revisions, caveat) the ranking summary.
+
+    A shared git commit is not sufficient when the checkouts were dirty:
+    the ``source_tree_sha256`` recorded by ``capture_provenance`` is
+    compared too, so two dirty runs with the same HEAD but different
+    uncommitted code are reported as ``mixed_source_trees`` instead of
+    being treated as the same implementation.
     """
     records = list(source_records)
     present = [r for r in records if r.get('readable')]
@@ -609,6 +617,14 @@ def audit_join_sources(source_records):
     commits = sorted({r['git_commit'] for r in present
                       if r.get('git_commit')})
     dirty = [r['source'] for r in present if r.get('git_dirty') is True]
+    source_digests = sorted({
+        r['source_tree_sha256'] for r in present
+        if isinstance(r.get('source_tree_sha256'), str)
+        and r['source_tree_sha256']})
+    missing_source_tree = [
+        r['source'] for r in present
+        if r.get('git_dirty') is True
+        and not isinstance(r.get('source_tree_sha256'), str)]
     seed_sets = [set(r['seeds']) for r in present if r.get('seeds')]
     if seed_sets:
         shared = set.intersection(*seed_sets)
@@ -654,6 +670,11 @@ def audit_join_sources(source_records):
         status = 'provenance_missing'
     elif len(commits) > 1:
         status = 'mixed_revisions'
+    elif len(source_digests) > 1:
+        # Same commit, different working-tree content. A bare dirty flag
+        # cannot tell whether the two runs executed the same uncommitted
+        # edits; the source digest can, and here it says they did not.
+        status = 'mixed_source_trees'
     elif not shared_seeds:
         status = 'no_shared_seeds'
     elif seed_status == 'partial':
@@ -677,6 +698,11 @@ def audit_join_sources(source_records):
         warnings.append(
             'join sources were produced at different git commits '
             f'{commits}; the cross-source ranking mixes code revisions')
+    if status == 'mixed_source_trees':
+        warnings.append(
+            'join sources share a git commit but different working-tree '
+            f'source digests {source_digests}; the dirty checkouts contain '
+            'different code, so the ranking mixes implementations')
     if status == 'provenance_missing':
         warnings.append(
             'join provenance is incomplete (missing sources '
@@ -710,6 +736,11 @@ def audit_join_sources(source_records):
             'join sources share a git commit but were produced from a '
             f'dirty checkout ({dirty}); the exact code revision is not '
             'recoverable from the commit alone')
+    if missing_source_tree:
+        warnings.append(
+            'dirty sources carry no source-tree digest: '
+            f'{missing_source_tree}; their exact uncommitted code cannot be '
+            'verified')
 
     summary = {
         'status': status,
@@ -720,6 +751,8 @@ def audit_join_sources(source_records):
         'missing_provenance': missing_prov,
         'git_commits': commits,
         'dirty_sources': dirty,
+        'source_tree_sha256s': source_digests,
+        'missing_source_tree': missing_source_tree,
         'seed_status': seed_status,
         'shared_seeds': shared_seeds,
         'n_shared_seeds': len(shared_seeds),
@@ -742,9 +775,9 @@ def build_quality_join(spec, context_T=MQAR_SEQ_LEN, source_records=None):
 
     Returns ``(rows, skipped)`` where ``skipped`` lists per-source reasons;
     a missing source is a documented skip, never a silent zero. Each
-    joined row carries the source's git commit, dirty flag, seed list and
-    file hash, so a mixed-revision join is visible at row level rather
-    than only in the run log.
+    joined row carries the source's git commit, dirty flag, source-tree
+    digest, seed list and file hash, so a mixed-revision or mixed-dirty
+    join is visible at row level rather than only in the run log.
     """
     if source_records is None:
         source_records = [_load_join_source(source, path)
@@ -802,6 +835,7 @@ def build_quality_join(spec, context_T=MQAR_SEQ_LEN, source_records=None):
                 'total_read_elements_per_query': budget,
                 'source_git_commit': rec.get('git_commit'),
                 'source_git_dirty': rec.get('git_dirty'),
+                'source_tree_sha256': rec.get('source_tree_sha256'),
                 'source_seeds': list(rec.get('seeds') or []),
                 'source_sha256': rec.get('sha256'),
                 'source_schema_version': rec.get('schema_version'),
@@ -827,6 +861,7 @@ def build_ranking_summary(join_rows, specs, aT=MQAR_SEQ_LEN, bT=8192,
     source_fields = {
         'source_comparability': cmp.get('status'),
         'source_git_commits': cmp.get('git_commits'),
+        'source_tree_sha256s': cmp.get('source_tree_sha256s'),
         'source_shared_seeds': cmp.get('shared_seeds'),
         'comparable_across_sources': cmp.get('comparable_for_ranking'),
     }

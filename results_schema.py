@@ -1420,8 +1420,8 @@ _EXP9_SECTIONS = frozenset({
     'ranking_summary', 'source_audit'})
 _EXP9_AUDIT_STATUSES = frozenset({
     'comparable', 'comparable_dirty_tree', 'mixed_revisions',
-    'provenance_missing', 'no_shared_seeds', 'partial_seeds',
-    'mixed_backends', 'sources_missing', 'no_sources'})
+    'mixed_source_trees', 'provenance_missing', 'no_shared_seeds',
+    'partial_seeds', 'mixed_backends', 'sources_missing', 'no_sources'})
 
 
 @register_row_contract('exp9_budget_frontier')
@@ -1538,6 +1538,10 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
             commit = row.get('source_git_commit')
             if commit is not None and not isinstance(commit, str):
                 out.append(f"{where}: source_git_commit must be null or str")
+            source_tree = row.get('source_tree_sha256')
+            if source_tree is not None and not _is_hex_sha256(source_tree):
+                out.append(f"{where}: source_tree_sha256 must be null or a "
+                           '64-char hex digest')
             seeds = row.get('source_seeds')
             if seeds is not None and not (isinstance(seeds, list)
                                           and all(_nonnegative_int(s)
@@ -1584,6 +1588,12 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                         row['comparable_across_sources'], bool):
                     out.append(f'{where}: comparable_across_sources must be '
                                f'a bool')
+                rank_trees = row.get('source_tree_sha256s')
+                if rank_trees is not None and not (
+                        isinstance(rank_trees, list)
+                        and all(_is_hex_sha256(t) for t in rank_trees)):
+                    out.append(f'{where}: source_tree_sha256s must be null or '
+                               'a list of hex digests')
                 key = ('ranking_summary', row.get('geometry'),
                        row.get('context_T'), row.get('decode_budget_position'))
         else:  # source_audit
@@ -1608,6 +1618,16 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                             'warnings'):
                     if not isinstance(row.get(fld), list):
                         out.append(f'{where}: {fld!r} must be a list')
+                trees = row.get('source_tree_sha256s')
+                if trees is not None and not (
+                        isinstance(trees, list)
+                        and all(_is_hex_sha256(t) for t in trees)):
+                    out.append(f'{where}: source_tree_sha256s must be null or '
+                               'a list of hex digests')
+                if status == 'mixed_source_trees' and not (
+                        isinstance(trees, list) and len(trees) >= 2):
+                    out.append('source_audit: mixed_source_trees needs >= 2 '
+                               'source-tree digests')
                 for fld in ('n_sources_requested', 'n_sources_readable'):
                     if not _nonnegative_int(row.get(fld)):
                         out.append(f'{where}: {fld!r} must be a non-negative '
@@ -1643,6 +1663,10 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                 if row.get('git_commit') is not None and not isinstance(
                         row['git_commit'], str):
                     out.append(f'{where}: git_commit must be null or str')
+                tree = row.get('source_tree_sha256')
+                if tree is not None and not _is_hex_sha256(tree):
+                    out.append(f'{where}: source_tree_sha256 must be null or '
+                               'a hex digest')
                 key = ('source_audit', source)
         if all(_is_hashable(part) for part in key):
             if key in seen:

@@ -871,6 +871,26 @@ def test_row_contract_exp9_audits_cross_source_ranking():
         partial[rank_idx], source_comparability='partial_seeds',
         comparable_across_sources=False)
     assert rs.validate_rows('exp9_budget_frontier', partial, {}) == []
+    # Different dirty working trees at the same commit block the ranking and
+    # must carry at least two digests as evidence.
+    mixed_trees = [dict(r) for r in rows]
+    cross_idx = next(i for i, r in enumerate(mixed_trees)
+                     if r.get('source') == 'cross_source')
+    mixed_trees[cross_idx] = dict(
+        mixed_trees[cross_idx], status='mixed_source_trees',
+        comparable_for_ranking=False,
+        source_tree_sha256s=['d' * 64, 'e' * 64])
+    rank_idx = next(i for i, r in enumerate(mixed_trees)
+                    if r['section'] == 'ranking_summary')
+    mixed_trees[rank_idx] = dict(
+        mixed_trees[rank_idx], source_comparability='mixed_source_trees',
+        comparable_across_sources=False)
+    assert rs.validate_rows('exp9_budget_frontier', mixed_trees, {}) == []
+    one_digest = [dict(r) for r in mixed_trees]
+    one_digest[cross_idx] = dict(
+        one_digest[cross_idx], source_tree_sha256s=['d' * 64])
+    assert any('mixed_source_trees' in v for v in
+               rs.validate_rows('exp9_budget_frontier', one_digest, {}))
 
 
 def test_row_contract_exp9_malformed_types_do_not_crash():

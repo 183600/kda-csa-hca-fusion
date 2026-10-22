@@ -692,6 +692,234 @@ def backend_resolution_provenance() -> dict:
     return out
 
 
+# --------------------------------------------------------------------------
+# Source-tree identity (reproducibility)
+# --------------------------------------------------------------------------
+#
+# A git commit hash identifies the committed code, but it says nothing about
+# a run started from a dirty checkout: two runs can share the same HEAD and
+# still execute different code. ``git_dirty`` alone cannot distinguish
+# "uncommitted README edit" from "uncommitted operator change". The source
+# digest below closes that gap by hashing the working-tree content of every
+# code/config file (tracked AND untracked-but-not-ignored, so a new helper
+# module is part of the identity too). Paths are framed before content so a
+# rename is visible and concatenation is unambiguous.
+_SOURCE_FILE_SUFFIXES = frozenset({
+    '.py', '.toml', '.txt', '.sh', '.cfg', '.ini', '.yml', '.yaml',
+})
+_SOURCE_FILE_NAMES = frozenset({'Dockerfile', 'Makefile', 'makefile'})
+_SOURCE_TREE_DIGEST_VERSION = b'kda-csa-hca-source-tree-v1\x00'
+
+# Arguments that may carry credentials; their values are redacted before the
+# command line is stored in a result file.
+_SECRET_ARG_FLAGS = frozenset({
+    '--token', '--api-key', '--api_key', '--apikey', '--password',
+    '--secret', '--access-token', '--hf-token',
+})
+
+
+def _source_tree_root(root=None) -> str:
+    """Return the repository root for ``root`` (or this module's directory)."""
+    base = os.path.abspath(
+        root if root is not None else os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'], cwd=base,
+            stderr=subprocess.DEVNULL,
+        )
+        resolved = out.decode('utf-8', 'replace').strip()
+        if resolved:
+            return os.path.abspath(resolved)
+    except Exception:
+        pass
+    return base
+
+
+def _is_source_file(rel_path: str) -> bool:
+    """Whether a repo-relative path is part of the code/config identity."""
+    name = rel_path.rsplit('/', 1)[-1]
+    if name in _SOURCE_FILE_NAMES:
+        return True
+    dot = name.rfind('.')
+    return dot >= 0 and name[dot:].lower() in _SOURCE_FILE_SUFFIXES
+
+
+def _source_files(root: str) -> list[str]:
+    """Repo-relative code/config files, tracked or untracked-but-not-ignored."""
+    try:
+        raw = subprocess.check_output(
+            ['git', 'ls-files', '-z', '--cached', '--others',
+             '--exclude-standard'],
+            cwd=root, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        raw = None
+    if raw is not None:
+        files = []
+        for chunk in raw.split(b'\0'):
+            if not chunk:
+                continue
+            rel = chunk.decode('utf-8', 'surrogateescape').replace('\\', '/')
+            if _is_source_file(rel):
+                files.append(rel)
+        return sorted(set(files))
+
+    # Git is unavailable (tarball / installed sdist). Walk the tree, skipping
+    # generated / cache / hidden directories. The suffix filter keeps the
+    # digest scoped to code and configuration rather than data or figures.
+    skip_dirs = {
+        '__pycache__', 'results', 'figures', 'checkpoints_lm', 'wt103_cache',
+        'node_modules', 'venv', '.venv', 'build', 'dist',
+    }
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in skip_dirs and not d.startswith('.'))
+        for filename in sorted(filenames):
+            rel = os.path.relpath(
+                os.path.join(dirpath, filename), root).replace(os.sep, '/')
+            if _is_source_file(rel):
+                files.append(rel)
+    return sorted(set(files))
+
+
+def _source_tree_digest(root=None) -> tuple[str | None, int, int]:
+    """Return ``(sha256, n_read, n_missing)`` for the working-tree sources."""
+    import hashlib
+
+    root = _source_tree_root(root)
+    files = _source_files(root)
+    if not files:
+        return None, 0, 0
+    digest = hashlib.sha256()
+    digest.update(_SOURCE_TREE_DIGEST_VERSION)
+    n_read = 0
+    n_missing = 0
+    for rel in files:
+        digest.update(rel.encode('utf-8', 'surrogateescape'))
+        digest.update(b'\0')
+        try:
+            with open(os.path.join(root, *rel.split('/')), 'rb') as f:
+                data = f.read()
+        except OSError:
+            # A tracked-but-deleted (or unreadable) file is still part of the
+            # identity; mark it so the digest cannot silently equal the
+            # pre-deletion tree.
+            digest.update(b'MISSING\0')
+            n_missing += 1
+            continue
+        digest.update(len(data).to_bytes(8, 'big'))
+        digest.update(data)
+        n_read += 1
+    return digest.hexdigest(), n_read, n_missing
+
+
+def source_tree_sha256(root=None) -> str | None:
+    """Stable SHA-256 of the working-tree code/config files.
+
+    Covers ``.py`` / ``.toml`` / ``.txt`` / ``.sh`` / ``.cfg`` / ``.ini`` /
+    ``.yml`` / ``.yaml`` files (tracked plus untracked non-ignored) and the
+    conventional ``Dockerfile`` / ``Makefile`` names. This is code identity,
+    not a data fingerprint: corpus files are recorded separately by each
+    runner's data-version block. Returns ``None`` when no source files are
+    found (e.g. a broken package install).
+    """
+    return _source_tree_digest(root)[0]
+
+
+def _package_versions(names) -> dict:
+    """Best-effort exact versions for the named distributions."""
+    from importlib import metadata
+
+    out = {}
+    for name in names:
+        try:
+            out[name] = metadata.version(name)
+        except Exception:
+            out[name] = None
+    return out
+
+
+def _redact_command_line(argv=None) -> list[str]:
+    """Return ``argv`` with credential-bearing flag values redacted."""
+    args = list(sys.argv if argv is None else argv)
+    out: list[str] = []
+    redact_next = False
+    for arg in args:
+        text = str(arg)
+        if redact_next:
+            out.append('<redacted>')
+            redact_next = False
+            continue
+        name = text.split('=', 1)[0].lower()
+        if name in _SECRET_ARG_FLAGS:
+            if '=' in text:
+                out.append(f'{text.split("=", 1)[0]}=<redacted>')
+            else:
+                out.append(text)
+                redact_next = True
+            continue
+        out.append(text)
+    return out
+
+
+def capture_source_identity(root=None) -> dict:
+    """Capture the working tree's code identity, including dirty content.
+
+    Unlike a bare ``git rev-parse HEAD``, this records the *content* that a
+    run actually executed: the commit, branch, dirty flag/count, and a
+    ``source_tree_sha256`` over the working tree. Two dirty runs that share a
+    commit but contain different edits therefore receive different identities
+    instead of being indistinguishable.
+
+    Every field is best-effort: a tarball without git still gets a source
+    digest, and missing git metadata is recorded as ``None`` rather than
+    failing the run.
+    """
+    root = _source_tree_root(root)
+    identity = {
+        'git_commit': None,
+        'git_branch': None,
+        'git_describe': None,
+        'git_dirty': None,
+        'git_dirty_files': None,
+        'source_tree_sha256': None,
+        'source_file_count': 0,
+        'source_missing_count': 0,
+    }
+
+    def _git_text(args):
+        try:
+            return subprocess.check_output(
+                ['git'] + list(args), cwd=root,
+                stderr=subprocess.DEVNULL,
+            ).decode('utf-8', 'replace').strip()
+        except Exception:
+            return None
+
+    commit = _git_text(['rev-parse', 'HEAD'])
+    if commit:
+        identity['git_commit'] = commit
+    branch = _git_text(['rev-parse', '--abbrev-ref', 'HEAD'])
+    if branch:
+        identity['git_branch'] = branch
+    describe = _git_text(['describe', '--tags', '--always', '--dirty'])
+    if describe:
+        identity['git_describe'] = describe
+    status = _git_text(['status', '--porcelain=v1'])
+    if status is not None:
+        dirty_lines = [line for line in status.splitlines() if line.strip()]
+        identity['git_dirty'] = bool(dirty_lines)
+        identity['git_dirty_files'] = len(dirty_lines)
+
+    digest, n_read, n_missing = _source_tree_digest(root)
+    identity['source_tree_sha256'] = digest
+    identity['source_file_count'] = n_read
+    identity['source_missing_count'] = n_missing
+    return identity
+
+
 def capture_provenance() -> dict:
     """Capture environment provenance for result JSON files.
 
@@ -704,17 +932,20 @@ def capture_provenance() -> dict:
     when the run started: a bare commit hash is not enough to reproduce a
     run whose code differs from HEAD, and silently reporting only the hash
     would make such a run look reproducible when it is not.
+    ``source_tree_sha256`` closes the remaining gap: it digests the actual
+    working-tree code/config content, so two dirty runs at the same commit
+    are distinguishable. The invocation (redacted argv + cwd), exact
+    dependency versions, and current determinism/thread settings are
+    recorded alongside.
 
     Also merges :func:`backend_resolution_provenance`: requested backend
     env vars alone are misleading when ``'auto'`` silently resolves to
     the reference path, so the resolved backends / optional-package
     availability / versions are recorded alongside.
     """
-    import os
-    import platform
-    import subprocess
-    import sys
     import datetime
+    import platform
+    import sys
     try:
         from importlib import metadata as _importlib_metadata
         fla_version = _importlib_metadata.version('flash-linear-attention')
@@ -726,39 +957,53 @@ def capture_provenance() -> dict:
     except Exception:
         numpy_version = None
     info = detect_env()
-    # Best-effort git commit; ignore errors (running from a tarball, etc).
-    git_commit = None
-    git_dirty = None
     try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        git_commit = subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'], cwd=here, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        dirty = subprocess.check_output(
-            ['git', 'status', '--porcelain'], cwd=here,
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        git_dirty = bool(dirty)
+        source = capture_source_identity()
     except Exception:
-        pass
+        # Provenance capture must never be the reason an experiment dies.
+        source = {}
     try:
         backend_info = backend_resolution_provenance()
     except Exception:
         # Even the never-raising helper is guarded here: provenance must
         # never take a run down, whatever happens in an exotic env.
         backend_info = {}
+    try:
+        package_versions = _package_versions((
+            'torch', 'numpy', 'scipy', 'matplotlib', 'einops',
+            'transformers', 'datasets', 'tqdm', 'pytest',
+            'flash-linear-attention', 'mamba-ssm',
+        ))
+    except Exception:
+        package_versions = {}
     return {
         'captured_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'python_version': sys.version.split()[0],
+        'python_executable': sys.executable,
         'platform': platform.platform(),
         'torch_version': info.torch_version,
         'cuda_version': info.cuda_version,
         'numpy_version': numpy_version,
+        'scipy_version': package_versions.get('scipy'),
+        'matplotlib_version': package_versions.get('matplotlib'),
+        'einops_version': package_versions.get('einops'),
         'device_name': info.device_name,
-        'git_commit': git_commit,
-        'git_dirty': git_dirty,
+        'git_commit': source.get('git_commit'),
+        'git_branch': source.get('git_branch'),
+        'git_describe': source.get('git_describe'),
+        'git_dirty': source.get('git_dirty'),
+        'git_dirty_files': source.get('git_dirty_files'),
+        'source_tree_sha256': source.get('source_tree_sha256'),
+        'source_file_count': source.get('source_file_count'),
+        'source_missing_count': source.get('source_missing_count'),
+        # Exact command line (credential flags redacted) and working
+        # directory: the hyperparameter block alone cannot reconstruct how
+        # a run was launched.
+        'command_line': _redact_command_line(),
+        'working_directory': os.getcwd(),
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
         'flash_linear_attention_version': fla_version,
+        'package_versions': package_versions,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED', '<unset>'),
         # Deterministic-cuBLAS workspace config (set by
         # ``set_global_seed(deterministic=True)``; ``<unset>`` when the run
@@ -768,8 +1013,23 @@ def capture_provenance() -> dict:
         'cublas_workspace_config': os.environ.get(
             'CUBLAS_WORKSPACE_CONFIG', '<unset>'),
         'num_threads': info.num_threads,
+        'torch_num_threads': _torch_num_threads(),
+        'determinism': {
+            'torch_deterministic_algorithms': bool(
+                torch.are_deterministic_algorithms_enabled()),
+            'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
+            'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
+        },
         **backend_info,
     }
+
+
+def _torch_num_threads() -> int | None:
+    """Actual intra-op thread count (``None`` if torch cannot report it)."""
+    try:
+        return int(torch.get_num_threads())
+    except Exception:
+        return None
 
 
 def set_global_seed(seed: int, *, deterministic: bool = False) -> dict:

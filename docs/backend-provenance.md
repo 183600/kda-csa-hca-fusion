@@ -122,3 +122,10 @@ out-of-memory **re-raised** (a resource failure must stay loud) and a
 * The run manifest records provenance per run, but no figure/analysis code
   groups result rows by resolved backend; a recall table mixing
   `reference` and `mamba_ssm` rows is detectable but not flagged.
+
+## See also
+
+[reproducibility.md](reproducibility.md) documents the working-tree source
+digest (`source_tree_sha256`), the redacted invocation record, and the
+`python reproducibility.py <result.json>` verifier that separates code drift
+from advisory host differences.
