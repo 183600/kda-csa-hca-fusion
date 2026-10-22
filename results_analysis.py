@@ -610,6 +610,23 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
     }
 
 
+def _finite_float_or_none(value):
+    """Finite non-bool float for a metric, or ``None`` when not usable.
+
+    Malformed result rows (a string placeholder, a list, ``True``) must be
+    listed under ``skipped`` like a missing/NaN value; calling ``float()``
+    on them used to abort the whole domination pass with TypeError /
+    ValueError instead of annotating the remaining rows.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _pareto_row_keys(rows: Sequence[Mapping], name_key: str) -> list[str]:
     """Unique keys for the rows, disambiguating repeated names.
 
@@ -621,13 +638,22 @@ def _pareto_row_keys(rows: Sequence[Mapping], name_key: str) -> list[str]:
 
     The generated suffix can itself be a literal name (``a``, ``a#2``,
     ``a``), so keys are checked against every already-assigned key and
-    the suffix is advanced until it is unique.
+    the suffix is advanced until it is unique.  A non-hashable name (e.g.
+    a list from a malformed row) is keyed by its ``repr`` so it cannot
+    abort the pass.
     """
     seen: dict = {}
     used: set = set()
     keys: list[str] = []
-    for r in rows:
-        name = r.get(name_key, r.get('op', '?'))
+    for index, r in enumerate(rows):
+        if not isinstance(r, Mapping):
+            name = f'row#{index}'
+        else:
+            name = r.get(name_key, r.get('op', '?'))
+        try:
+            hash(name)
+        except TypeError:
+            name = repr(name)
         count = seen.get(name, 0) + 1
         key = name if count == 1 else f'{name}#{count}'
         while key in used:
@@ -661,37 +687,39 @@ def pareto_frontier(rows: Sequence[Mapping],
     skipped: list = []
     row_keys = _pareto_row_keys(rows, name_key)
     for row, key in zip(rows, row_keys):
+        if not isinstance(row, Mapping):
+            skipped.append(key)
+            continue
         r = row
-        acc = r.get(accuracy_key)
-        if acc is None or not math.isfinite(float(acc)):
+        acc = _finite_float_or_none(r.get(accuracy_key))
+        if acc is None:
             skipped.append(key)
             continue
         costs = {}
         ok = True
         for k in cost_keys:
-            v = r.get(k)
-            if v is None or not math.isfinite(float(v)):
+            v = _finite_float_or_none(r.get(k))
+            if v is None:
                 ok = False
                 break
-            costs[k] = float(v)
+            costs[k] = v
         if not ok:
             skipped.append(key)
             continue
-        eval_ms = r.get('mean_eval_ms_per_sample')
-        if eval_ms is not None and (not math.isfinite(float(eval_ms))
-                                    or float(eval_ms) <= 0):
+        eval_ms = _finite_float_or_none(r.get('mean_eval_ms_per_sample'))
+        if eval_ms is not None and eval_ms <= 0:
             eval_ms = None
         points[key] = {
-            'accuracy': float(acc),
+            'accuracy': acc,
             'costs': costs,
             'acc_per_train_second': (
-                float(acc) / costs['mean_train_time_s']
+                acc / costs['mean_train_time_s']
                 if costs.get('mean_train_time_s', 0.0) > 0 else None),
             'acc_per_1k_params': (
-                float(acc) / (costs['n_params'] / 1000.0)
+                acc / (costs['n_params'] / 1000.0)
                 if costs.get('n_params', 0.0) > 0 else None),
             'acc_per_eval_ms': (
-                float(acc) / float(eval_ms) if eval_ms else None),
+                acc / float(eval_ms) if eval_ms else None),
         }
 
     names = list(points)
@@ -735,6 +763,10 @@ def annotate_rows_with_pareto(rows: Sequence[dict], **kwargs) -> dict:
     name_key = kwargs.get('name_key', 'op')
     row_keys = _pareto_row_keys(rows, name_key)
     for r, key in zip(rows, row_keys):
+        if not isinstance(r, dict):
+            # ``pareto_frontier`` already listed the malformed entry under
+            # ``skipped``; there is nowhere to annotate it in place.
+            continue
         p = report['points'].get(key)
         if p is None:
             r['pareto'] = None

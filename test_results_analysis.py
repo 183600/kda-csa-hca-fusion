@@ -365,6 +365,34 @@ def test_pareto_frontier_skips_missing_costs():
     assert rep['frontier'] == ['a']
 
 
+def test_pareto_frontier_skips_malformed_values_instead_of_crashing():
+    """Non-numeric fields and unhashable names are reported, not fatal.
+
+    The dominance pass used to call ``float()`` directly on every metric and
+    hash the row name, so one malformed row aborted the whole annotation
+    instead of being listed under ``skipped``.
+    """
+    rows = [
+        {'op': 'bad_acc', 'mean_acc': 'n/a',
+         'n_params': 10, 'mean_train_time_s': 1.0},
+        {'op': 'bad_cost', 'mean_acc': 0.5,
+         'n_params': [10], 'mean_train_time_s': 1.0},
+        {'op': ['unhashable'], 'mean_acc': 0.7,
+         'n_params': 10, 'mean_train_time_s': 1.0},
+        {'op': 'good', 'mean_acc': 0.5,
+         'n_params': 10, 'mean_train_time_s': 1.0},
+        'not-a-row',
+    ]
+    rep = pareto_frontier(rows)
+    assert rep['skipped'] == ['bad_acc', 'bad_cost', 'row#4']
+    # The unhashable name is keyed by repr, so it can still participate.
+    assert rep['frontier'] == [str(['unhashable'])]
+    annotate_rows_with_pareto(rows)
+    assert rows[0]['pareto'] is None and rows[1]['pareto'] is None
+    assert rows[2]['pareto']['optimal'] is True
+    assert rows[3]['pareto']['dominated_by'] == str(['unhashable'])
+
+
 def test_confusion_matrix_rejects_out_of_range_explicit_classes():
     """An explicit num_classes must bound every observed id, not alias them."""
     with pytest.raises(ValueError):
