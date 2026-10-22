@@ -115,7 +115,9 @@ from results_schema import write as write_schema
 from train_diagnostics import (
     ValPoint,
     ValidationCurve,
+    optimizer_update_report,
     raise_non_finite,
+    snapshot_parameters,
     triage_gradient,
 )
 
@@ -1537,6 +1539,7 @@ def run_needle_overfit_sanity_check(
 
     losses, exact, token_acc, elapsed_s = [], [], [], []
     grad_flow = None
+    update_report = None
     t0 = time.time()
     for step in range(steps):
         model.reset_state()
@@ -1577,7 +1580,13 @@ def run_needle_overfit_sanity_check(
                 grad_norm=float(clip_norm),
                 context=f'needle overfit sanity check step={step} '
                         f'mem={memory_type}')
+        before_step = None
+        if update_report is None:
+            before_step = snapshot_parameters(model.named_parameters())
         opt.step()
+        if update_report is None:
+            update_report = optimizer_update_report(
+                before_step, model.named_parameters(), opt, step=step)
         losses.append(float(loss.detach()))
         exact.append(exact_acc)
         token_acc.append(tok_acc)
@@ -1594,6 +1603,8 @@ def run_needle_overfit_sanity_check(
     final_token_acc = sum(token_acc[-tail:]) / tail
     passed = ((final_exact >= acc_threshold)
               or (final_loss < loss_ratio_threshold * initial_loss))
+    if update_report is not None and not update_report['ok']:
+        passed = False
     import hashlib
     h = hashlib.sha256()
     for name, t in (('train_ids', train_ids), ('target', target)):
@@ -1622,6 +1633,7 @@ def run_needle_overfit_sanity_check(
         'fixed_batch_seed': int(seed + OVERFIT_BATCH_SEED_OFFSET),
         'fixed_batch_seeds': list(data_seeds),
         'fixed_batch_sha256': h.hexdigest(),
+        'optimizer_updates': update_report,
         'initial_loss': initial_loss,
         'final_loss': final_loss,
         'best_loss': min(losses),

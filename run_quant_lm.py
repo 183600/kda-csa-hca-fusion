@@ -121,7 +121,9 @@ from results_schema import write as write_schema  # noqa: E402
 from train_diagnostics import (  # noqa: E402
     ValPoint,
     ValidationCurve,
+    optimizer_update_report,
     raise_non_finite,
+    snapshot_parameters,
     triage_gradient,
 )
 from run_quant_recall import (  # noqa: E402
@@ -1275,6 +1277,7 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
     losses, accs, elapsed_s = [], [], []
     all_grads_finite = True
     grad_flow = None
+    update_report = None
     t0 = time.time()
     for step in range(steps):
         logits = model(input_ids, spec=QAT_SPEC, ste=True)
@@ -1313,7 +1316,13 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
                 params=model.parameters(), logits=logits, grads=bad_grads,
                 grad_norm=float(clip_norm),
                 context=f'overfit sanity check (Part B STE) step={step}')
+        before_step = None
+        if update_report is None:
+            before_step = snapshot_parameters(model.named_parameters())
         opt.step()
+        if update_report is None:
+            update_report = optimizer_update_report(
+                before_step, model.named_parameters(), opt, step=step)
         losses.append(float(loss.detach()))
         accs.append(acc)
         elapsed_s.append(time.time() - t0)
@@ -1327,6 +1336,8 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
     final_acc = sum(accs[-tail:]) / tail
     passed = (all_grads_finite
               and final_loss < loss_ratio_threshold * initial_loss)
+    if update_report is not None and not update_report['ok']:
+        passed = False
     report = {
         'passed': bool(passed),
         'label': 'partB-stepwise-ste',
@@ -1342,6 +1353,7 @@ def _run_stepwise_ste_overfit_gate(batch, *, device, tokenizer, steps, seed,
         'ste': True,
         'all_grads_finite': bool(all_grads_finite),
         'grad_flow': grad_flow,
+        'optimizer_updates': update_report,
         'initial_loss': initial_loss,
         'final_loss': final_loss,
         'best_loss': min(losses),

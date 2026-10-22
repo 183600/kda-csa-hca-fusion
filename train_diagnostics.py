@@ -158,6 +158,101 @@ def triage_gradient(params: Sequence[torch.nn.Parameter],
             if p.grad is not None and not torch.isfinite(p.grad).all()]
 
 
+def snapshot_parameters(named_parameters) -> dict[str, torch.Tensor]:
+    """CPU snapshot of every trainable tensor, for a post-step update audit.
+
+    The overfit gates already check that gradients REACH the parameters
+    (:func:`snapshot_parameters` is called before ``optimizer.step()``).
+    They did not check that the optimizer actually covers and MOVES those
+    parameters: a parameter group that accidentally omits the head, or a
+    frozen / detached copy passed to the optimizer, can leave the loss
+    falling through the remaining weights and still pass the gate. This
+    snapshot lets :func:`optimizer_update_report` close that gap on the
+    first optimizer step.
+
+    Tensors are copied to CPU so the audit does not keep a second
+    device-resident copy of the model alive during training.
+    """
+    return {
+        str(name): p.detach().to(device='cpu', copy=True)
+        for name, p in named_parameters
+        if getattr(p, 'requires_grad', False)
+    }
+
+
+def optimizer_update_report(before, named_parameters, optimizer, *,
+                            step: int = 0,
+                            max_names: int = 10) -> dict:
+    """Audit optimizer coverage and whether covered parameters moved.
+
+    ``before`` must be the :func:`snapshot_parameters` output taken before
+    ``optimizer.step()``. The report distinguishes three failure modes the
+    loss-only overfit criterion cannot see:
+
+      * a trainable tensor absent from every ``optimizer.param_groups``
+        (the optimizer can never update it);
+      * a tensor with a non-zero gradient that did not change at all after
+        the step (frozen / detached copy / wrong device);
+      * duplicate parameters registered in several groups (ambiguous
+        update semantics; reported but not itself a failure).
+
+    Returns a JSON-serializable dict. ``ok`` is True only when every
+    trainable tensor is covered exactly once and every tensor that received
+    a non-zero gradient changed. Tensors with missing / zero gradients are
+    excluded from the "should have moved" set; the separate
+    ``grad_flow_report`` names those.
+    """
+    if not isinstance(before, Mapping):
+        raise TypeError('before must be a snapshot_parameters() mapping')
+
+    grouped: dict[int, torch.nn.Parameter] = {}
+    duplicates: list[str] = []
+    for group in getattr(optimizer, 'param_groups', ()):
+        for p in group.get('params', ()):
+            if id(p) in grouped:
+                duplicates.append(str(getattr(p, 'name', id(p))))
+            grouped[id(p)] = p
+
+    named = [(str(name), p) for name, p in named_parameters
+             if getattr(p, 'requires_grad', False)]
+    not_in_optimizer = [name for name, p in named if id(p) not in grouped]
+    grad_nonzero = [
+        name for name, p in named
+        if p.grad is not None
+        and bool(torch.isfinite(p.grad).all())
+        and float(p.grad.detach().float().norm()) > 0.0
+    ]
+    not_updated = []
+    for name, p in named:
+        if name not in grad_nonzero or name not in before:
+            continue
+        after = p.detach().to(device='cpu')
+        if torch.equal(before[name], after):
+            not_updated.append(name)
+
+    def _cap(names):
+        return names[:int(max_names)]
+
+    return {
+        'step': int(step),
+        'n_trainable_tensors': len(named),
+        'n_optimizer_tensors': len(grouped),
+        'n_not_in_optimizer': len(not_in_optimizer),
+        'not_in_optimizer_names': _cap(not_in_optimizer),
+        'n_duplicate_optimizer_tensors': len(duplicates),
+        'duplicate_optimizer_names': _cap(duplicates),
+        'n_grad_nonzero': len(grad_nonzero),
+        'n_not_updated': len(not_updated),
+        'not_updated_names': _cap(not_updated),
+        'names_truncated_at': int(max_names),
+        'ok': bool(not not_in_optimizer and not not_updated),
+        'note': ('Coverage/update audit for the first optimizer step: a '
+                 'trainable tensor missing from the optimizer, or one with '
+                 'a non-zero gradient that did not move, makes the fixed-'
+                 'batch gate fail even if another path lowers the loss.'),
+    }
+
+
 # --------------------------------------------------------------------------
 # 2. Held-out validation curve
 # --------------------------------------------------------------------------

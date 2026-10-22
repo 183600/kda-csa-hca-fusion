@@ -13,6 +13,7 @@ Run with ``pytest -q test_train_diagnostics.py``.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -27,8 +28,10 @@ from train_diagnostics import (
     ValidationCurve,
     accuracy_cost_tradeoff,
     accuracy_regime,
+    optimizer_update_report,
     pool_error_analyses,
     raise_non_finite,
+    snapshot_parameters,
     triage_gradient,
     triage_nonfinite,
 )
@@ -197,3 +200,46 @@ def test_pooled_error_analyses_use_worst_seed_examples():
     assert pooled['representative_seed'] == 1
     assert pooled['representative_examples'] == {'copyable_missed': ['worst']}
     assert pool_error_analyses([{'seed': 0}]) is None
+
+
+def test_optimizer_update_report_detects_coverage_and_frozen_params():
+    # A healthy step: every trainable tensor is covered and moved.
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.ReLU(),
+                                torch.nn.Linear(4, 2))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+    loss = model(torch.arange(12, dtype=torch.float32).reshape(3, 4)).sum()
+    opt.zero_grad()
+    loss.backward()
+    named = list(model.named_parameters())
+    before = snapshot_parameters(named)
+    opt.step()
+    report = optimizer_update_report(before, named, opt)
+    assert report['ok'] is True
+    assert report['n_not_in_optimizer'] == 0
+    assert report['n_not_updated'] == 0
+    assert report['n_grad_nonzero'] == report['n_trainable_tensors']
+    json.dumps(report, allow_nan=False)
+
+    # A parameter group that omits the head: loss can still fall through the
+    # trunk, so the update audit must fail even though gradients reached it.
+    opt_missing = torch.optim.AdamW(model[0].parameters(), lr=1e-2)
+    opt_missing.zero_grad()
+    loss = model(torch.arange(12, dtype=torch.float32).reshape(3, 4)).sum()
+    loss.backward()
+    before = snapshot_parameters(named)
+    opt_missing.step()
+    missing = optimizer_update_report(before, named, opt_missing)
+    assert missing['ok'] is False
+    assert '2.weight' in missing['not_in_optimizer_names']
+    assert '2.bias' in missing['not_in_optimizer_names']
+
+    # lr=0 freezes every covered parameter although gradients are non-zero.
+    opt_frozen = torch.optim.AdamW(model.parameters(), lr=0.0)
+    opt_frozen.zero_grad()
+    loss = model(torch.arange(12, dtype=torch.float32).reshape(3, 4)).sum()
+    loss.backward()
+    before = snapshot_parameters(named)
+    opt_frozen.step()
+    frozen = optimizer_update_report(before, named, opt_frozen)
+    assert frozen['ok'] is False
+    assert frozen['n_not_updated'] == frozen['n_grad_nonzero']

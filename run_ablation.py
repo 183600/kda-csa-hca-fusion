@@ -117,7 +117,8 @@ from train_diagnostics import (
     DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
     ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
     ValidationCurve, accuracy_cost_tradeoff, log_pooled_errors, log_tradeoff,
-    pool_error_analyses, raise_non_finite, triage_gradient,
+    optimizer_update_report, pool_error_analyses, raise_non_finite,
+    snapshot_parameters, triage_gradient,
 )
 from multi_seed_stats import (
     min_detectable_effect, seeds_required, tost_from_summary,
@@ -468,6 +469,7 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
     losses, accs, elapsed_s = [], [], []
     first_batch = None
     grad_flow = None
+    update_report = None
     t0 = time.time()
     for step in range(steps):
         gen = make_seeded_generator(seed + _OVERFIT_BATCH_SEED_OFFSET,
@@ -495,6 +497,10 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
                 list(model.named_parameters())
                 + [(f'head.{n}', p) for n, p in head.named_parameters()]
                 + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
+        named_params = (
+            list(model.named_parameters())
+            + [(f'head.{n}', p) for n, p in head.named_parameters()]
+            + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
         bad_grads = triage_gradient(params)
         clip_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
         if bad_grads or not torch.isfinite(clip_norm):
@@ -504,7 +510,13 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
                 grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
                 grad_norm=float(clip_norm),
                 context=f'overfit sanity check step={step} {label}')
+        before_step = None
+        if update_report is None:
+            before_step = snapshot_parameters(named_params)
         opt.step()
+        if update_report is None:
+            update_report = optimizer_update_report(
+                before_step, named_params, opt, step=step)
         losses.append(float(loss.detach()))
         accs.append(float(acc))
         elapsed_s.append(time.time() - t0)
@@ -520,6 +532,8 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
                       if initial_loss > 0 else None)
     passed = ((final_acc >= acc_threshold)
               or (final_loss < loss_ratio_threshold * initial_loss))
+    if update_report is not None and not update_report['ok']:
+        passed = False
     report = {
         'passed': bool(passed),
         'label': label,
@@ -550,6 +564,10 @@ def run_overfit_sanity_check(build_model, make_batch, *, label, seed=2026,
         # Gradient-flow audit (first step): which trainable tensors the loss
         # actually reached, recorded next to the pass verdict.
         'grad_flow': grad_flow,
+        # Optimizer coverage/update audit (first step): a param missing from
+        # the optimizer, or a non-zero-gradient param that never moved, now
+        # fails the gate instead of hiding behind a falling loss.
+        'optimizer_updates': update_report,
         'note': ('Necessary but NOT sufficient: passing proves gradients '
                  'flow and the loss responds on a fixed batch; it cannot '
                  'rule out data-augmentation / feature-alignment / '

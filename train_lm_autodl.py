@@ -93,7 +93,13 @@ from kaggle_setup import (configure_torch_for_device, set_global_seed,
 from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
                               diagnose_training_curves, lm_token_diagnostics,
                               summarize_lm_diagnostics)
-from train_diagnostics import accuracy_regime, raise_non_finite, triage_gradient
+from train_diagnostics import (
+    accuracy_regime,
+    optimizer_update_report,
+    raise_non_finite,
+    snapshot_parameters,
+    triage_gradient,
+)
 from ppl_bootstrap import bootstrap_ppl_ci, throughput_summary
 import grad_checkpointing as grad_ckpt
 
@@ -1904,6 +1910,7 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
 
     losses, accs, elapsed_s = [], [], []
     grad_flow = None
+    update_report = None
     t0 = time.time()
     for step in range(steps):
         model.hybrid.reset_state()
@@ -1943,7 +1950,13 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
                        for i, p in enumerate(bad_grads)},
                 grad_norm=float(clip_norm),
                 context=f'overfit sanity check step={step} seed={seed}')
+        before_step = None
+        if update_report is None:
+            before_step = snapshot_parameters(model.named_parameters())
         opt.step()
+        if update_report is None:
+            update_report = optimizer_update_report(
+                before_step, model.named_parameters(), opt, step=step)
         losses.append(float(loss.detach()))
         accs.append(acc)
         elapsed_s.append(time.time() - t0)
@@ -1957,6 +1970,8 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
     loss_reduction = (initial_loss - final_loss) / initial_loss
     final_acc = sum(accs[-tail:]) / tail
     passed = final_loss < loss_ratio_threshold * initial_loss
+    if update_report is not None and not update_report['ok']:
+        passed = False
     report = {
         "passed": bool(passed),
         "steps": steps,
@@ -1981,6 +1996,10 @@ def run_overfit_sanity_check(model_factory, batch, device, *, steps=100,
         # loss actually reached. A missing / zero gradient names a detached
         # or dead branch that the loss-based pass criterion could mask.
         "grad_flow": grad_flow,
+        # Optimizer coverage/update audit (first step): catches a parameter
+        # group that omits a trainable tensor, or a param with a non-zero
+        # gradient that the step never moved.
+        "optimizer_updates": update_report,
         "note": ("Necessary but NOT sufficient: passing proves gradients flow "
                  "and the loss responds on a fixed batch; it cannot rule out "
                  "data-augmentation / feature-alignment / label-mapping bugs."),

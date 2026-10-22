@@ -86,7 +86,12 @@ from multi_seed_stats import _sample_sd, holm_adjust, summarize_paired
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
-from train_diagnostics import ValPoint, ValidationCurve
+from train_diagnostics import (
+    ValPoint,
+    ValidationCurve,
+    optimizer_update_report,
+    snapshot_parameters,
+)
 from results_schema import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
@@ -2493,6 +2498,7 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
     losses, accs, elapsed_s = [], [], []
     first_batch = None
     grad_flow = None
+    update_report = None
     t0 = time.time()
     for step in range(steps):
         gen = make_seeded_generator(seed + _OVERFIT_BATCH_SEED_OFFSET,
@@ -2541,7 +2547,17 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
                 f"overfit sanity check: non-finite gradient at step {step} "
                 f"for op={op_name} task={task}; diagnosis "
                 f"[{_diag['verdict']}]: {_diag['summary']}")
+        named_params = (
+            [(f'layer.{n}', p) for n, p in layer.named_parameters()]
+            + [(f'head.{n}', p) for n, p in head.named_parameters()]
+            + [(f'embed.{n}', p) for n, p in embed.named_parameters()])
+        before_step = None
+        if update_report is None:
+            before_step = snapshot_parameters(named_params)
         opt.step()
+        if update_report is None:
+            update_report = optimizer_update_report(
+                before_step, named_params, opt, step=step)
         losses.append(float(loss.detach()))
         accs.append(float(acc))
         elapsed_s.append(time.time() - t0)
@@ -2557,6 +2573,8 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
                       if initial_loss > 0 else None)
     passed = ((final_acc >= acc_threshold)
               or (final_loss < loss_ratio_threshold * initial_loss))
+    if update_report is not None and not update_report['ok']:
+        passed = False
     report = {
         'passed': bool(passed),
         'op': op_name,
@@ -2590,6 +2608,11 @@ def run_overfit_sanity_check(op_name, task='mqar', d_model=32, seq_len=16,
         # Gradient-flow audit (first step): which trainable tensors the loss
         # actually reached, recorded next to the pass verdict.
         'grad_flow': grad_flow,
+        # Optimizer coverage/update audit (first step): proves every
+        # trainable tensor is in a param group and actually moved. A gate
+        # that only watched the loss could pass while the optimizer skipped
+        # a frozen or unwired branch.
+        'optimizer_updates': update_report,
         'note': ('Necessary but NOT sufficient: passing proves gradients '
                  'flow and the loss responds on a fixed batch; it cannot '
                  'rule out data-augmentation / feature-alignment / '
