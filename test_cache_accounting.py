@@ -558,7 +558,32 @@ def test_lcm_packing_and_full_report():
     _ok('report validation', raised == 2, f'raised={raised}')
 
 
+def test_explicit_layout_report_uses_resolved_counts():
+    """The audit's ``layout`` must be the counts it actually reconciled.
+
+    In explicit-layout mode the ratio fields are ignored by
+    ``_layer_counts``; echoing them made the report contradict both
+    ``resolved_layout`` and the per-operator totals.
+    """
+    from types import SimpleNamespace
+    cfg = _cfg(n_kda=3, n_csa=1, n_hca=1, layout=['csa', 'csa', 'hca'])
+    dec = SimpleNamespace(
+        model=SimpleNamespace(layers=[]), _csa_caches=[], _hca_caches=[])
+    report = cache_accounting.audit_cache_accounting(
+        dec, cfg, T=9, live={'batch_size': 1, 'components': {}})
+    _ok('explicit-layout report counts memory/CSA/HCA layers',
+        report['layout'] == [0, 2, 1]
+        and report['resolved_layout'] == ['csa', 'csa', 'hca'],
+        f"layout={report['layout']} resolved={report['resolved_layout']}")
+    ratio_cfg = _cfg(n_kda=3, n_csa=1, n_hca=1)
+    ratio_report = cache_accounting.audit_cache_accounting(
+        dec, ratio_cfg, T=9, live={'batch_size': 1, 'components': {}})
+    _ok('ratio-mode report keeps [memory, CSA, HCA]',
+        ratio_report['layout'] == [3, 1, 1], ratio_report['layout'])
+
+
 _TEST_FUNCS = [
+    test_explicit_layout_report_uses_resolved_counts,
     test_analytic_decomposition_matches_exp3,
     test_kv_cache_breakdown_reconciles_in_both_modes,
     test_live_equals_analytic_for_every_fill_history,

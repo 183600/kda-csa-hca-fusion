@@ -695,10 +695,15 @@ def audit_cache_accounting(decoder, cfg: HybridConfig, *, T: int | None = None,
                            'live': hybrid_live,
                            'analytic': hybrid_committed})
 
+    # In explicit-layout mode ``cfg.n_kda/n_csa/n_hca`` are ignored by
+    # ``_layer_counts``; report the counts the audit actually used (with
+    # the three memory kinds folded into the memory slot, matching ratio
+    # mode's [memory, CSA, HCA] convention).
+    memory_layers = sum(n_layers[op] for op in _MEMORY_KINDS)
     return {
         'context_len': T,
         'batch_size': live['batch_size'],
-        'layout': [cfg.n_kda, cfg.n_csa, cfg.n_hca],
+        'layout': [memory_layers, n_layers['csa'], n_layers['hca']],
         'memory_type': memory_route,
         'resolved_layout': list(cfg.layout) if cfg.layout is not None else None,
         'per_component': per_component,
