@@ -129,17 +129,25 @@ def test_structural_recall_hand_derived():
         abs(res['csa_union_selection_chance_indep'] - 3 / 7) < 1e-12,
         f"{res['csa_union_selection_chance_indep']!r}")
 
-    # Explicit placements include the value-at-cue edge (p = cue-1).
-    edge = R.structural_recall(plan, seq_len=16, key_positions=[14])
-    _ok('explicit key position at cue-1 accepted',
+    # The last valid placement puts the value immediately BEFORE the cue
+    # (p = cue-2); p = cue-1 would make the value the cue token itself.
+    edge = R.structural_recall(plan, seq_len=16, key_positions=[13])
+    _ok('explicit key position at cue-2 accepted',
         edge['n_placements'] == 1
-        and edge['rows'][0]['key_pos'] == 14, 'p=14')
+        and edge['rows'][0]['key_pos'] == 13, 'p=13')
+    for p in (14, 15):
+        try:
+            R.structural_recall(plan, seq_len=16, key_positions=[p])
+            raised = False
+        except ValueError:
+            raised = True
+        _ok(f'key position at/after cue-1 rejected (p={p})', raised, '')
 
 
 def test_structural_validation_and_distance():
     plan = _plan()
-    for kwargs in ({'key_positions': [-1]}, {'key_positions': [15]},
-                   {'key_positions': []}):
+    for kwargs in ({'key_positions': [-1]}, {'key_positions': [14]},
+                   {'key_positions': [15]}, {'key_positions': []}):
         try:
             R.structural_recall(plan, seq_len=16, **kwargs)
             raised = False
@@ -294,6 +302,7 @@ def test_indexer_recall_error_paths_and_no_csa():
         {'key_pos': [0], 'cue_pos': cue},
         {'key_pos': [-1, 0], 'cue_pos': cue},
         {'key_pos': [0, 99], 'cue_pos': cue},
+        {'key_pos': [0, cue - 1], 'cue_pos': cue},
     ):
         try:
             R.per_layer_indexer_recall(model2, x_emb, **kwargs)

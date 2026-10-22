@@ -271,10 +271,11 @@ def _validate_key_positions(key_positions, cue: int) -> list[int]:
             raise ValueError(
                 f'key positions must be plain ints, got {p!r} '
                 f'({type(p).__name__}).')
-        if not 0 <= p <= cue - 1:
+        if not 0 <= p <= cue - 2:
             raise ValueError(
-                f'key position p={p} must satisfy 0 <= p <= cue-1={cue - 1} '
-                f'(the value sits at p+1 and must precede the cue).')
+                f'key position p={p} must satisfy 0 <= p <= cue-2={cue - 2} '
+                f'(the value sits at p+1 and must strictly precede the cue '
+                f'at {cue}).')
         out.append(p)
     if not out:
         raise ValueError('key_positions must be non-empty.')
@@ -469,11 +470,12 @@ def per_layer_indexer_recall(model, x_emb: torch.Tensor, key_pos,
         raise ValueError(
             f'per_layer_indexer_recall: key_pos must be a [B={B}] tensor, '
             f'got shape {tuple(key_pos_t.shape)}.')
-    if int(key_pos_t.min()) < 0 or int(key_pos_t.max()) > cue_pos - 1:
+    if int(key_pos_t.min()) < 0 or int(key_pos_t.max()) > cue_pos - 2:
         raise ValueError(
-            f'per_layer_indexer_recall: key_pos must lie in [0, cue_pos-1='
-            f'{cue_pos - 1}] so that key and value (p+1) precede the cue; '
-            f'got [{int(key_pos_t.min())}, {int(key_pos_t.max())}].')
+            f'per_layer_indexer_recall: key_pos must lie in [0, cue_pos-2='
+            f'{cue_pos - 2}] so that key and value (p+1) strictly precede '
+            f'the cue; got [{int(key_pos_t.min())}, '
+            f'{int(key_pos_t.max())}].')
 
     csa_global = [i for i, layer in enumerate(model.layers)
                   if isinstance(layer, CSAHybridLayer)]
