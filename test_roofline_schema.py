@@ -54,6 +54,27 @@ def test_schema_detects_legacy_and_current_versions():
         == results_schema.CURRENT_SCHEMA_VERSION, 'versioned envelope')
 
 
+def test_schema_rejects_non_mapping_metadata():
+    print("\nTest: results_schema validates envelope metadata type")
+    for bad in ([], ['note', 'n'], 0, '', 1.5, True):
+        for build in (
+                lambda: results_schema.envelope([], kind='k', metadata=bad),
+                lambda: results_schema.normalize(
+                    {'results': []}, kind='k', metadata=bad)):
+            raised = False
+            try:
+                build()
+            except results_schema.SchemaFormatError:
+                raised = True
+            _ok(f'non-mapping metadata {bad!r} raises', raised, '')
+    # A Mapping (not just a dict) and None remain accepted.
+    from collections import UserDict
+    assert results_schema.envelope(
+        [], kind='k', metadata=UserDict({'x': 1}))['metadata']['x'] == 1
+    assert results_schema.envelope([], kind='k', metadata=None)['metadata']
+    _ok('Mapping/None metadata accepted', True, '')
+
+
 def test_schema_versioned_envelope_roundtrip():
     print("\nTest: results_schema write/load roundtrip")
     with tempfile.TemporaryDirectory(prefix='_schema_test_') as tmp:
@@ -227,6 +248,7 @@ def test_account_row_matches_prefill_flops():
 
 _TEST_FUNCS = [
     test_schema_detects_legacy_and_current_versions,
+    test_schema_rejects_non_mapping_metadata,
     test_schema_versioned_envelope_roundtrip,
     test_schema_future_version_is_refused,
     test_roofline_core_math,

@@ -86,6 +86,7 @@ import json
 import math
 import os
 import sys
+from collections.abc import Mapping
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -226,7 +227,14 @@ def envelope(rows: list, *, kind: str, metadata: dict | None = None,
     ``kind`` identifies the producing experiment (e.g. ``"exp7_roofline"``)
     so tooling can validate that a file holds what its name claims.
     """
-    meta = dict(metadata) if metadata else {}
+    if metadata is None:
+        meta = {}
+    elif not isinstance(metadata, Mapping):
+        raise SchemaFormatError(
+            "envelope 'metadata' must be a mapping or None, found "
+            f'{type(metadata).__name__}')
+    else:
+        meta = dict(metadata)
     meta.setdefault('created_utc', created_utc or _dt.datetime.now(
         _dt.timezone.utc).isoformat())
     return {
@@ -246,7 +254,11 @@ def normalize(data, *, kind: str, metadata: dict | None = None) -> dict:
     """
     legacy_meta, rows, _version = parse(data)
     merged = dict(legacy_meta)
-    if metadata:
+    if metadata is not None:
+        if not isinstance(metadata, Mapping):
+            raise SchemaFormatError(
+                "normalize 'metadata' must be a mapping or None, found "
+                f'{type(metadata).__name__}')
         merged.update(metadata)
     merged.pop('schema_version', None)
     return envelope(rows, kind=kind, metadata=merged)
