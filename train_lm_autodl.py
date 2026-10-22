@@ -844,7 +844,13 @@ def near_duplicate_leakage_audit(
     row; dropping must happen before the split (``clean_lm_texts(...,
     dedup_near=True)``) or be refused by the caller's strict gate.
     """
-    combined = list(train_texts) + list(val_texts) + list(test_texts)
+    train_texts = list(train_texts)
+    val_texts = list(val_texts)
+    test_texts = list(test_texts)
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    if not callable(getattr(tokenizer, 'encode', None)):
+        raise ValueError('tokenizer must provide a callable encode()')
+    combined = train_texts + val_texts + test_texts
     labels = (['train'] * len(train_texts)
               + ['val'] * len(val_texts)
               + ['test'] * len(test_texts))

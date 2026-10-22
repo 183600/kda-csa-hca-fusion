@@ -333,3 +333,28 @@ def test_clean_near_dup_parameters_are_validated_even_on_tiny_corpus():
                 raise AssertionError(
                     f'invalid near-dup parameter accepted on {texts!r}: '
                     f'{kwargs}')
+
+
+def test_near_duplicate_audit_accepts_iterators_and_validates_window_args():
+    tok = _FallbackCharTokenizer()
+    report = near_duplicate_leakage_audit(
+        (text for text in ['a' * 20]),
+        (text for text in ['b' * 20]), [], tok, seq_len=64)
+    assert report['splits'] == {'train': 1, 'val': 1, 'test': 0}
+    assert report['n_tokenize_errors'] == 0
+    json.dumps(report, allow_nan=False)
+
+    for bad_seq_len in (0, -1, 1.5, True):
+        try:
+            near_duplicate_leakage_audit(['a'], ['b'], [], tok, bad_seq_len)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(
+                f'invalid audit seq_len accepted: {bad_seq_len!r}')
+    try:
+        near_duplicate_leakage_audit(['a'], ['b'], [], object(), 64)
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('tokenizer without encode() was accepted')
