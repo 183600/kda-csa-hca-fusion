@@ -517,6 +517,100 @@ def test_hybrid_streaming_tp_contract(device):
         tp.hybrid_stack_forward_tp_streaming(mamba_stack, x, 2)
 
 
+def test_hybrid_decode_state_ablation(device):
+    """Decode caches are load-bearing, and future tokens cannot leak.
+
+    Matches the counterfactual controls in ``decode_state_ablation``:
+    dropping any one state family after prefill (or before every step)
+    must change the suffix, while the prefill prefix is untouched.  The
+    causality audit additionally requires a non-vacuous future
+    perturbation and an incremental prefix equal to the one-shot forward.
+    """
+    from decode_state_ablation import (DECODE_STATE_PARTS,
+                                       decode_causality_audit,
+                                       decode_state_ablation)
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(907)
+    decoder = HybridDecoding(
+        d_model=32, total_layers=5, csa_topk=100).to(device).eval()
+    x = torch.randn(2, 14, 32, device=device) * 0.4
+    with torch.no_grad():
+        ablation = decode_state_ablation(decoder, x, prefill_len=8)
+        causal = decode_causality_audit(
+            decoder, x, cut=10, prefix_chunks=(5, 5))
+
+    arms = {(a['part'], a['mode']): a for a in ablation['arms']}
+    for part in DECODE_STATE_PARTS:
+        for mode in ('at_prefill', 'every_step'):
+            arm = arms[(part, mode)]
+            assert arm['load_bearing'], \
+                f'{part}/{mode}: dropping the state had no effect'
+            assert arm['max_abs_diff'] > 1e-4, \
+                (f'{part}/{mode}: max_abs_diff={arm["max_abs_diff"]:.3e} '
+                 f'is below the load-bearing threshold')
+            assert arm['prefix_max_abs_diff'] < 1e-7, \
+                f'{part}/{mode}: the prefill prefix changed'
+    assert causal['prefix_unchanged'], \
+        f"future leakage: prefix_diff={causal['prefix_max_abs_diff']:.3e}"
+    assert causal['future_perturbation_nonvacuous'], \
+        'the future perturbation did not change the suffix (vacuous probe)'
+    assert causal['incremental_prefix_matches_one_shot'], \
+        (f"incremental prefix diff="
+         f"{causal['incremental_prefix_max_abs_diff']:.3e}")
+
+
+def test_hybrid_streaming_tp_causality(device):
+    """Streaming TP carries state without leaking future tokens.
+
+    Runs the TP reference over a prefill chunk and a continuation chunk,
+    repeats it on a stream whose suffix is replaced with noise, and checks
+    that the prefix is unchanged while the suffix moves.  This extends the
+    causality contract from the unsharded ``HybridDecoding`` audit to the
+    shared-cache + head-sharded streaming path.
+    """
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(911)
+    cfg = dataclasses.replace(_kda_cfg(4), n_kda=3, n_csa=1, n_hca=1)
+    decoder = HybridDecoding(cfg=cfg, total_layers=5).to(device).eval()
+    x = torch.randn(2, 12, cfg.d_model, device=device) * 0.5
+    perturbed = x.clone()
+    perturbed[:, 8:] = torch.randn(
+        2, 4, cfg.d_model, device=device) * 2.0
+    schedule = ((0, 5), (5, 8), (8, 10), (10, 12))
+
+    def run_tp(stream):
+        state = None
+        pieces = []
+        with torch.no_grad():
+            for start, end in schedule:
+                got = tp.hybrid_stack_forward_tp_streaming(
+                    decoder.model, stream[:, start:end], 2, state=state)
+                pieces.append(got['output'])
+                state = got['state']
+        return torch.cat(pieces, dim=1), state
+
+    out, state = run_tp(x)
+    out_p, state_p = run_tp(perturbed)
+    prefix_diff = (out[:, :8] - out_p[:, :8]).abs().max().item()
+    suffix_diff = (out[:, 8:] - out_p[:, 8:]).abs().max().item()
+    assert prefix_diff < 1e-6, \
+        f'TP streaming leaked future tokens: prefix_diff={prefix_diff:.3e}'
+    assert suffix_diff > 1e-4, \
+        f'the future perturbation did not reach the suffix: {suffix_diff:.3e}'
+    assert state['csa_caches'][0].n_tokens_seen == 12
+    assert state_p['csa_caches'][0].n_tokens_seen == 12
+
+    with torch.no_grad():
+        decoder.reset()
+        reference = decoder(x)
+    one_shot_diff = (out[:, :8] - reference[:, :8]).abs().max().item()
+    assert one_shot_diff < 1e-5, \
+        (f'TP streaming prefix differs from the unsharded one-shot '
+         f'forward: {one_shot_diff:.3e}')
+
+
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
 
