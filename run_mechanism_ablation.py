@@ -1184,7 +1184,7 @@ def _paired_family_size(variants, n_kv_list) -> int:
     """
     if not any(v['name'] == 'baseline' for v in variants):
         return 0
-    return max(1, (len(variants) - 1) * len(n_kv_list))
+    return (len(variants) - 1) * len(n_kv_list)
 
 
 def main():

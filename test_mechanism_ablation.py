@@ -510,6 +510,9 @@ def test_paired_family_size_counts_every_n_kv_cell():
     _ok('no baseline means no paired family',
         M._paired_family_size([{'name': 'no_rope'}], [1, 2]) == 0,
         M._paired_family_size([{'name': 'no_rope'}], [1, 2]))
+    _ok('a baseline-only run has no paired contrasts',
+        M._paired_family_size([{'name': 'baseline'}], [1, 2]) == 0,
+        M._paired_family_size([{'name': 'baseline'}], [1, 2]))
 
 
 _TEST_FUNCS = [
