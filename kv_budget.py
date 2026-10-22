@@ -119,6 +119,33 @@ def kda_state_elements(hv: int, d_k: int, d_v: int) -> int:
     return hv * d_k * d_v
 
 
+def mamba2_state_elements(nheads: int, headdim: int, d_state: int) -> int:
+    """Elements of the Mamba-2 recurrent state ``[nheads, headdim, d_state]``.
+
+    The short-conv lookback is excluded, matching KDA's accounting (its
+    short conv is also outside the recurrent-state currency).
+    """
+    _validate_positive(nheads, 'nheads', 'mamba2_state_elements')
+    _validate_positive(headdim, 'headdim', 'mamba2_state_elements')
+    _validate_positive(d_state, 'd_state', 'mamba2_state_elements')
+    return nheads * headdim * d_state
+
+
+def mamba2_read_elements(T: int, nheads: int, headdim: int,
+                         d_state: int) -> float:
+    """Average state elements READ per query by a Mamba-2 SSD step.
+
+    ``ops_mamba.naive_mamba2_scan`` reads the state twice per token: once
+    for the decayed update ``S = decay * S + x`` and once for the readout
+    ``C @ S^T``. The state is O(1) in T, exactly like KDA's delta-rule
+    state; only the value-head geometry differs.
+    """
+    _validate_T(T, 'mamba2_read_elements')
+    if T == 0:
+        return 0.0
+    return 2.0 * mamba2_state_elements(nheads, headdim, d_state)
+
+
 def kda_read_elements(T: int, hv: int, d_k: int, d_v: int) -> float:
     """Average state elements READ per query by the KDA delta-rule step.
 
@@ -211,7 +238,11 @@ def hca_read_elements(T: int, *, m2: int, c: int,
     }
 
 
+# Layout rows are ratio-based KDA:CSA:HCA; the per-op API additionally
+# prices the alternative Mamba-2 memory route so the two routes can be
+# compared on the same currency without changing existing layout rows.
 _OP_FUNCS = ('softmax', 'kda', 'csa', 'hca')
+_BUDGET_OPS = ('softmax', 'kda', 'mamba2', 'csa', 'hca')
 
 
 def op_read_elements(op: str, T: int, spec: dict) -> dict:
@@ -224,9 +255,10 @@ def op_read_elements(op: str, T: int, spec: dict) -> dict:
     only), ``state_elements`` (KDA state size, else ``None``) and
     ``total_read_elements``.
     """
-    if op not in _OP_FUNCS:
+    if op not in _BUDGET_OPS:
         raise ValueError(
-            f"op_read_elements: op={op!r} must be one of {list(_OP_FUNCS)}.")
+            f"op_read_elements: op={op!r} must be one of "
+            f"{list(_BUDGET_OPS)}.")
     if op not in spec:
         raise ValueError(
             f"op_read_elements: spec is missing the {op!r} geometry block "
@@ -241,6 +273,12 @@ def op_read_elements(op: str, T: int, spec: dict) -> dict:
     elif op == 'kda':
         core = kda_read_elements(T, geo['hv'], geo['d_k'], geo['d_v'])
         state = kda_state_elements(geo['hv'], geo['d_k'], geo['d_v'])
+        indexer = 0.0
+    elif op == 'mamba2':
+        core = mamba2_read_elements(
+            T, geo['nheads'], geo['headdim'], geo['d_state'])
+        state = mamba2_state_elements(
+            geo['nheads'], geo['headdim'], geo['d_state'])
         indexer = 0.0
     elif op == 'csa':
         parts = csa_read_elements(
@@ -300,6 +338,13 @@ def _instant_op_components(op: str, t: int, geo: dict) -> dict:
         return {'core_read_elements': core,
                 'indexer_read_elements': 0.0,
                 'total_read_elements': core}
+    if op == 'mamba2':
+        # Same two-read contract as KDA: decayed update + C @ S^T readout.
+        core = 2.0 * mamba2_state_elements(
+            geo['nheads'], geo['headdim'], geo['d_state'])
+        return {'core_read_elements': core,
+                'indexer_read_elements': 0.0,
+                'total_read_elements': core}
     if op == 'csa':
         selected = min(geo['topk'], t // geo['m']) * float(geo['c'])
         window = (min(t + 1, geo['sliding_window']) * float(geo['c'])
@@ -341,10 +386,10 @@ def instant_read_elements(op: str, t: int, spec: dict) -> dict:
     checks are position-independent), so invalid specs raise the same
     ``ValueError`` here as in the averaged path.
     """
-    if op not in _OP_FUNCS:
+    if op not in _BUDGET_OPS:
         raise ValueError(
             f"instant_read_elements: op={op!r} must be one of "
-            f"{list(_OP_FUNCS)}.")
+            f"{list(_BUDGET_OPS)}.")
     if op not in spec:
         raise ValueError(
             f"instant_read_elements: spec is missing the {op!r} geometry "
@@ -472,7 +517,7 @@ def op_read_bytes(op: str, T: int, spec: dict, quant=None) -> dict:
 
     Element counts are converted with :func:`kv_quant.quantized_row_bytes`:
     each ``<stem>_read_elements`` gains a ``<stem>_read_bytes`` sibling,
-    ``state_elements`` (KDA) gains ``state_bytes``, and
+    ``state_elements`` (KDA / Mamba-2) gains ``state_bytes``, and
     ``total_read_bytes`` sums the read components (retained state
     excluded). ``quant=None`` prices every component at fp16 (2 bytes /
     element); a :class:`kv_quant.QuantSpec` applies to all components; a

@@ -41,6 +41,11 @@ latter mixes in cheap early positions and understates late-context cost.
 * The sliding window and dense softmax include the query's own token.
 * KDA reads its `hv x d_k x d_v` delta-rule state twice per step (masked
   delta read + output read) and is therefore O(1) in `T`.
+* Mamba-2 reads its `nheads x headdim x d_state` SSD state twice per step
+  (decayed update + `C @ S^T` readout), so it is the same O(1) currency
+  with a different state geometry. `op_read_elements('mamba2', ...)` and
+  `instant_read_elements('mamba2', ...)` price that route; the short-conv
+  lookback is excluded, matching KDA's convention.
 * CSA charges the lightning-indexer scan over **every visible block**
   (the reference implementation scores before top-k selection, including
   `topk=0`); the top-k gather itself is capped at `min(topk, visible)`.
@@ -52,7 +57,7 @@ latter mixes in cheap early positions and understates late-context cost.
 
 | `section` | Rows | Content |
 |---|---|---|
-| `budget_curve` | `row_kind` `op`/`layout` | prefill-average curves over `BUDGET_T_GRID` |
+| `budget_curve` | `row_kind` `op`/`layout` | prefill-average curves over `BUDGET_T_GRID` for softmax/KDA/Mamba-2/CSA/HCA and the layouts |
 | `decode_budget_curve` | `row_kind` `op`/`layout` | marginal (one-query) curves at position `t` |
 | `decode_sweep` | measured | per-token decode latency joined with both views (`total_read_elements_per_query` = prefill average, `decode_step_*` / `decode_window_*` = decode view) |
 | `quality_join` | measured | Exp 4/5/8 accuracy rows annotated with their analytic budget |
@@ -66,6 +71,11 @@ component→`QuantSpec` policy (payload bits + per-group scale/zero-point
 metadata), and `run_quant_recall.py` (Exp 10) measures the recall side of
 the trade-off on planted associations for both recurrent routes. See
 [quantization-model.md](quantization-model.md).
+
+Layout rows are still expanded from a KDA:CSA:HCA ratio (the memory slot
+is KDA). Per-op Mamba-2 rows carry the route's own state size, so the two
+memory routes can be compared without pretending a ratio row is
+route-neutral.
 
 ## Scope / honesty
 

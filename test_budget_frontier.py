@@ -75,6 +75,10 @@ def test_op_budget_hand_values_mqar_geometry():
         kv_budget.kda_state_elements(2, 16, 16) == 512, '')
     _ok('kda read = 2x state = 1024',
         abs(kv_budget.kda_read_elements(16, 2, 16, 16) - 1024.0) < 1e-9, '')
+    _ok('mamba2 state = 4*16*8 = 512',
+        kv_budget.mamba2_state_elements(4, 16, 8) == 512, '')
+    _ok('mamba2 read = 2x state = 1024',
+        abs(kv_budget.mamba2_read_elements(16, 4, 16, 8) - 1024.0) < 1e-9, '')
     # CSA: m=4, topk=2, c=32, c_i=16, n_idx_heads=2, sw=4, T=16.
     # selected pairs = 20 -> 20*32/16 = 40; window = 58*32/16 = 116;
     # indexer pairs = 24 -> 24*16*2/16 = 48.
@@ -129,6 +133,7 @@ def test_op_and_layout_dispatch():
     spec = {
         'softmax': {'n_kv_heads': 2, 'd_k': 16, 'd_v': 16},
         'kda': {'hv': 2, 'd_k': 16, 'd_v': 16},
+        'mamba2': {'nheads': 4, 'headdim': 16, 'd_state': 8},
         'csa': {'m': 4, 'topk': 2, 'c': 32, 'c_i': 16, 'n_idx_heads': 2,
                 'sliding_window': 4},
         'hca': {'m2': 8, 'c': 32, 'sliding_window': 4},
@@ -140,6 +145,13 @@ def test_op_and_layout_dispatch():
         and abs(totals['kda'] - 1024.0) < 1e-9
         and abs(totals['csa'] - 204.0) < 1e-9
         and abs(totals['hca'] - 132.0) < 1e-9, f'{totals}')
+    mamba = kv_budget.op_read_elements('mamba2', 16, spec)
+    _ok('Mamba-2 op row is O(1) and reports its state',
+        abs(mamba['total_read_elements'] - 1024.0) < 1e-9
+        and mamba['state_elements'] == 512, f'{mamba}')
+    _ok('per-op Mamba-2 marginal equals the prefill average',
+        abs(kv_budget.instant_read_elements('mamba2', 16, spec)
+            ['total_read_elements'] - mamba['total_read_elements']) < 1e-9, '')
     lay = kv_budget.layout_read_elements(16, (3, 1, 1), spec)
     _ok('3:1:1 layout = 3*1024 + 204 + 132 = 3408',
         abs(lay['total_read_elements'] - 3408.0) < 1e-9, f'{lay}')
@@ -181,6 +193,7 @@ def _mqar_spec():
     return {
         'softmax': {'n_kv_heads': 2, 'd_k': 16, 'd_v': 16},
         'kda': {'hv': 2, 'd_k': 16, 'd_v': 16},
+        'mamba2': {'nheads': 4, 'headdim': 16, 'd_state': 8},
         'csa': {'m': 4, 'topk': 2, 'c': 32, 'c_i': 16, 'n_idx_heads': 2,
                 'sliding_window': 4},
         'hca': {'m2': 8, 'c': 32, 'sliding_window': 4},
@@ -197,6 +210,10 @@ def test_instant_budget_hand_values():
     kda5 = kv_budget.instant_read_elements('kda', 5, spec)
     _ok('KDA marginal is position-independent (2*state)',
         kda5['total_read_elements'] == 1024.0, f'{kda5}')
+    mamba5 = kv_budget.instant_read_elements('mamba2', 5, spec)
+    _ok('Mamba-2 marginal is position-independent (2*state)',
+        mamba5['total_read_elements'] == 1024.0
+        and mamba5['state_elements'] == 512, f'{mamba5}')
     # CSA t=16: blocks 0..3 visible (strictly preceding), window saturates
     # at 4 tokens, indexer scores 4 blocks x 16 x 2 heads.
     csa16 = kv_budget.instant_read_elements('csa', 16, spec)
@@ -417,12 +434,17 @@ def test_build_budget_curves_rows():
     spec = mqar_spec()
     rows = build_budget_curves([16], {'mqar': spec})
     _ok('one row per op and layout',
-        len(rows) == 4 + len(LAYOUTS), f'{len(rows)} rows')
+        len(rows) == 5 + len(LAYOUTS), f'{len(rows)} rows')
     csa = next(r for r in rows if r['row_kind'] == 'op'
                and r['name'] == 'csa')
     _ok('CSA row exposes both terms',
         abs(csa['total_read_elements'] - 204.0) < 1e-9
         and csa['indexer_read_elements'] == 48.0, f'{csa}')
+    mamba = next(r for r in rows if r['row_kind'] == 'op'
+                 and r['name'] == 'mamba2')
+    _ok('Mamba-2 row joins at the Exp 4 quality geometry',
+        abs(mamba['total_read_elements'] - 2048.0) < 1e-9
+        and mamba['state_elements'] == 1024, f'{mamba}')
     lay = next(r for r in rows if r['row_kind'] == 'layout'
                and r['name'] == '3:1:1')
     _ok('3:1:1 row total = 3408',
@@ -436,12 +458,16 @@ def test_decode_budget_curve_and_sweep_join():
     spec = mqar_spec()
     rows = build_decode_budget_curves([16], {'mqar': spec})
     _ok('one marginal row per op and layout',
-        len(rows) == 4 + len(LAYOUTS), f'{len(rows)} rows')
+        len(rows) == 5 + len(LAYOUTS), f'{len(rows)} rows')
     csa = next(r for r in rows if r['row_kind'] == 'op'
                and r['name'] == 'csa')
     _ok('CSA marginal t=16 total = 320, indexer = 128',
         abs(csa['total_read_elements'] - 320.0) < 1e-9
         and abs(csa['indexer_read_elements'] - 128.0) < 1e-9, f'{csa}')
+    mamba = next(r for r in rows if r['row_kind'] == 'op'
+                 and r['name'] == 'mamba2')
+    _ok('Mamba-2 marginal is the O(1) state read',
+        abs(mamba['total_read_elements'] - 2048.0) < 1e-9, f'{mamba}')
     lay = next(r for r in rows if r['row_kind'] == 'layout'
                and r['name'] == '3:1:1')
     _ok('3:1:1 marginal t=16 total = 3584',
@@ -698,6 +724,26 @@ def test_exp9_quality_join_carries_source_provenance():
         and row['source_sha256'] == '0' * 64, f'{row}')
 
 
+def test_exp9_quality_join_keeps_mamba2_rows():
+    print('\nTest: Exp 9 quality join keeps the Mamba-2 memory route')
+    from run_budget_frontier import build_quality_join, mqar_spec
+    rec = _audit_record('exp4_mqar')
+    rec['rows'] = [
+        {'op': 'kda', 'mean_acc': 0.5, 'ci95_acc': 0.05,
+         'n_seeds_ok': 5, 'mean_fwd_ms': 1.0},
+        {'op': 'mamba2', 'mean_acc': 0.4, 'ci95_acc': 0.05,
+         'n_seeds_ok': 5, 'mean_fwd_ms': 1.1},
+    ]
+    rows, skipped = build_quality_join(mqar_spec(), source_records=[rec])
+    labels = {r['label'] for r in rows}
+    _ok('both memory routes are joined', labels == {'kda', 'mamba2'},
+        f'{labels} skipped={skipped}')
+    mamba = next(r for r in rows if r['label'] == 'mamba2')
+    _ok('Mamba-2 row is priced on the O(1) state read',
+        abs(mamba['total_read_elements_per_query'] - 2048.0) < 1e-9,
+        f'{mamba["total_read_elements_per_query"]}')
+
+
 def test_exp9_ranking_summary_carries_comparability():
     print('\nTest: Exp 9 ranking summary carries the comparability verdict')
     from run_budget_frontier import (LAYOUTS, build_ranking_summary,
@@ -749,6 +795,7 @@ _TEST_FUNCS = [
     test_exp9_source_audit_flags_dirty_tree_and_backend_mix,
     test_exp9_load_join_source_reads_exp5_sidecar,
     test_exp9_quality_join_carries_source_provenance,
+    test_exp9_quality_join_keeps_mamba2_rows,
     test_exp9_ranking_summary_carries_comparability,
 ]
 

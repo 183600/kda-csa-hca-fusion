@@ -22,8 +22,9 @@ contract). The currency has TWO views that ``kv_budget`` keeps unified:
 
 Questions:
 
-1. **Analytic budget curves** over context length for the four core
-   operators and the seven Exp 5 hybrid layouts, in two geometries (the
+1. **Analytic budget curves** over context length for the five core
+   operators (softmax, KDA, Mamba-2, CSA, HCA) and the seven Exp 5 hybrid
+   layouts, in two geometries (the
    small MQAR probe and the paper-scale ``run_kv_cache.DEFAULTS``). The
    curves expose the two terms of CSA: the O(topk) selected gather AND the
    O(T) lightning-indexer scan, which the reference implementation performs
@@ -136,6 +137,7 @@ DEFAULT_REPEATS = 2
 # Seed for the measured decode sweep's model construction / benchmark inputs
 # (recorded in the result metadata so the latency rows are reproducible).
 DECODE_SWEEP_SEED = 0
+CORE_OPS = ('softmax', 'kda', 'mamba2', 'csa', 'hca')
 LAYOUTS = (
     (3, 1, 1),
     (4, 1, 0), (4, 0, 1),
@@ -175,12 +177,42 @@ def _parse_int_list(raw, name, min_value=0):
     return values
 
 
+def _mamba2_spec(cfg):
+    """Mamba-2 state geometry implied by a ``HybridConfig``."""
+    d_inner = cfg.mamba_expand * cfg.d_model
+    if cfg.mamba_headdim < 1:
+        raise ValueError(
+            f'mamba_headdim must be >= 1, got {cfg.mamba_headdim!r}')
+    return {'nheads': d_inner // cfg.mamba_headdim,
+            'headdim': cfg.mamba_headdim,
+            'd_state': cfg.mamba_d_state}
+
+
+def _quality_mamba2_spec(d_model=32):
+    """Mamba-2 geometry used by the Exp 4 standalone quality probe.
+
+    Mirrors ``run_quality.Mamba2Attn``'s env knobs (default d_state=16,
+    headdim=16, expand=2) rather than the paper-scale ``HybridConfig``
+    defaults, so the Exp 4 `mamba2` rows join at their measured geometry.
+    """
+    expand = parse_int_env('MAMBA2_EXPAND', 2, min_value=1, logger=logger)
+    d_state = parse_int_env('MAMBA2_D_STATE', 16, min_value=1, logger=logger)
+    headdim = parse_int_env('MAMBA2_HEADDIM', 16, min_value=1, logger=logger)
+    d_inner = expand * d_model
+    headdim_eff = min(headdim, d_inner)
+    while d_inner % headdim_eff != 0:
+        headdim_eff //= 2
+    return {'nheads': d_inner // headdim_eff,
+            'headdim': headdim_eff, 'd_state': d_state}
+
+
 def _spec_from_hybrid_cfg(cfg, *, softmax_geo):
     """Build a kv_budget geometry dict from a ``HybridConfig``."""
     return {
         'softmax': dict(softmax_geo),
         'kda': {'hv': cfg.n_heads_v, 'd_k': cfg.head_dim_k,
                 'd_v': cfg.head_dim_v},
+        'mamba2': _mamba2_spec(cfg),
         'csa': {'m': cfg.csa_m, 'topk': cfg.csa_topk, 'c': cfg.csa_c,
                 'c_i': cfg.csa_cI, 'n_idx_heads': cfg.csa_nIh,
                 'sliding_window': cfg.csa_sliding_window},
@@ -193,18 +225,26 @@ def mqar_spec():
     """MQAR probe geometry (Exp 4/5/8): d_model=32 3:1:1 hybrid + softmax."""
     cfg = _make_cfg(32, (3, 1, 1))
     softmax = SoftmaxAttn(8)
-    return _spec_from_hybrid_cfg(
+    spec = _spec_from_hybrid_cfg(
         cfg, softmax_geo={'n_kv_heads': softmax.H, 'd_k': softmax.K,
                           'd_v': softmax.V})
+    # Exp 4's standalone Mamba-2 row uses the quality-probe geometry, not
+    # the paper HybridConfig defaults carried by this KDA config.
+    spec['mamba2'] = _quality_mamba2_spec(cfg.d_model)
+    return spec
 
 
 def paper_spec():
     """Paper-scale geometry (Exp 3 defaults): H=8, K=V=128, c=128."""
     p = PAPER_DEFAULTS
+    mamba_d_inner = p['mamba_expand'] * p['d']
     return {
         'softmax': {'n_kv_heads': GQA_H, 'd_k': GQA_HEAD_DIM,
                     'd_v': GQA_HEAD_DIM},
         'kda': {'hv': p['kda_hv'], 'd_k': p['kda_k'], 'd_v': p['kda_v']},
+        'mamba2': {'nheads': mamba_d_inner // p['mamba_headdim'],
+                   'headdim': p['mamba_headdim'],
+                   'd_state': p['mamba_d_state']},
         'csa': {'m': p['csa_m'], 'topk': p['csa_topk'], 'c': p['csa_c'],
                 'c_i': p['csa_cI'], 'n_idx_heads': p['csa_nIh'],
                 'sliding_window': p['csa_sliding_window']},
@@ -218,7 +258,7 @@ def build_budget_curves(t_grid, specs):
     rows = []
     for geom, spec in specs.items():
         for T in t_grid:
-            for op in ('softmax', 'kda', 'csa', 'hca'):
+            for op in CORE_OPS:
                 r = op_read_elements(op, T, spec)
                 rows.append({
                     'section': 'budget_curve',
@@ -253,7 +293,7 @@ def build_decode_budget_curves(t_grid, specs):
     rows = []
     for geom, spec in specs.items():
         for t in t_grid:
-            for op in ('softmax', 'kda', 'csa', 'hca'):
+            for op in CORE_OPS:
                 r = instant_read_elements(op, t, spec)
                 rows.append({
                     'section': 'decode_budget_curve',
@@ -649,7 +689,7 @@ def build_quality_join(spec, context_T=MQAR_SEQ_LEN, source_records=None):
             label = None
             if source == 'exp4_mqar':
                 op = r.get('op')
-                if op in ('softmax', 'kda', 'csa', 'hca'):
+                if op in CORE_OPS:
                     budget = op_read_elements(op, context_T,
                                               spec)['total_read_elements']
                     label = str(op)
@@ -903,8 +943,9 @@ def main():
             'the marginal view at position t (the first token decoded '
             'after a t-token prefill); the rolling mean of the marginal '
             'view is exactly the prefill average (pinned by '
-            'test_budget_frontier). Curves cover the 4 core operators and '
-            'the 7 Exp 5 layouts in MQAR and paper geometries; a measured '
+            'test_budget_frontier). Curves cover the 5 core operators '
+            '(including both memory routes, KDA and Mamba-2) and the 7 '
+            'Exp 5 layouts in MQAR and paper geometries; a measured '
             'decode-latency sweep over csa_topk joins BOTH views; Exp 4/5/8 '
             'rows (if present) are joined with their measured-context '
             'budget, and the layout ranking is reported under both views.'),
@@ -923,7 +964,9 @@ def main():
         'currency_definition': (
             'element = one scalar of the KV-side representation (compressed '
             'shared-KV vector counts once; window token contributes c; KDA '
-            'state contributes hv*d_k*d_v). Causal masks match the '
+            'state contributes hv*d_k*d_v; Mamba-2 state contributes '
+            'nheads*headdim*d_state and is also read twice per step). '
+            'Causal masks match the '
             'implementations (inclusive own-token for softmax/window, '
             'strictly preceding compressed blocks). KDA reads its state '
             'twice per step (delta masked read + output read). CSA charges '
