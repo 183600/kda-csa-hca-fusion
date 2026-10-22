@@ -474,6 +474,37 @@ def test_hybrid_streaming_tp_matches_unsharded(chunk_size, schedule, device):
         assert state['hca_caches'][0].n_blocks == hca_ref.n_blocks
 
 
+def test_hybrid_streaming_tp_bf16_decode_dtype(device):
+    """Single-token TP decode matches the unsharded bf16 output dtype.
+
+    The CSA/HCA cache returns fp32 attention in bf16 mode, and the
+    unsharded decoder casts it back before ``o_proj``. The TP oracle must
+    do the same or the sharded linear rejects the dtype mismatch.
+    """
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(31)
+    cfg = dataclasses.replace(_kda_cfg(0), n_kda=1, n_csa=1, n_hca=1)
+    decoder = HybridDecoding(cfg=cfg, total_layers=3).to(
+        device=device, dtype=torch.bfloat16).eval()
+    x = (torch.randn(2, 7, cfg.d_model, device=device) * 0.5).to(
+        torch.bfloat16)
+    with torch.no_grad():
+        ref_prefill = decoder(x[:, :5])
+        got = tp.hybrid_stack_forward_tp_streaming(
+            decoder.model, x[:, :5], 2)
+        _assert_close('bf16 streaming prefill', got['output'],
+                      ref_prefill, tol=2e-2)
+        for pos in (5, 6):
+            ref = decoder(x[:, pos:pos + 1])
+            got = tp.hybrid_stack_forward_tp_streaming(
+                decoder.model, x[:, pos:pos + 1], 2,
+                state=got['state'])
+            assert got['output'].dtype == torch.bfloat16
+            _assert_close(f'bf16 streaming step@{pos}', got['output'],
+                          ref, tol=2e-2)
+
+
 def test_hybrid_streaming_tp_contract(device):
     """T=0 preservation and malformed-state diagnostics."""
     from run_decoding import HybridDecoding

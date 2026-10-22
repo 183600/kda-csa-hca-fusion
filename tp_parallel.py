@@ -631,7 +631,7 @@ def csa_layer_forward_tp_streaming(layer, h: torch.Tensor,
                 sink_logits=layer.sink[lo:hi], use_ste=False,
                 normalize_qk=True)
             partials.append(F.linear(
-                o.reshape(B, 1, nh * cfg.csa_c),
+                o.reshape(B, 1, nh * cfg.csa_c).to(h.dtype),
                 layer.o_proj.weight[:, lo * cfg.csa_c:hi * cfg.csa_c]))
         return {'output': torch.stack(partials, dim=0).sum(dim=0),
                 'cache': cache}
@@ -688,7 +688,7 @@ def hca_layer_forward_tp_streaming(layer, h: torch.Tensor,
                 q_n[:, :, lo:hi], nh=nh, scale=None,
                 sink_logits=layer.sink[lo:hi], normalize_qk=True)
             partials.append(F.linear(
-                o.reshape(B, 1, nh * cfg.hca_c),
+                o.reshape(B, 1, nh * cfg.hca_c).to(h.dtype),
                 layer.o_proj.weight[:, lo * cfg.hca_c:hi * cfg.hca_c]))
         return {'output': torch.stack(partials, dim=0).sum(dim=0),
                 'cache': cache}
