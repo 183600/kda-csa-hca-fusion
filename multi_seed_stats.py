@@ -263,14 +263,23 @@ def _sample_sd(values: list[float], mean: float) -> float | None:
     # leave a non-zero variance residue.
     if all(v == values[0] for v in values):
         return 0.0
-    var = math.fsum((v - mean) ** 2 for v in values) / (n - 1)
+    # Square SCALED deviations: ``(v - mean) ** 2`` overflows for finite
+    # differences above ~1e154 even though the sample SD itself is
+    # representable. Scaling is exact for the ratio, then the square root
+    # is multiplied back, which is value-equal up to round-off for the
+    # ordinary range.
+    deviations = [v - mean for v in values]
+    dev_scale = max(abs(x) for x in deviations)
+    if dev_scale == 0.0:
+        return 0.0
+    var_ratio = math.fsum((x / dev_scale) ** 2
+                          for x in deviations) / (n - 1)
     scale = max(abs(mean), max(abs(v) for v in values), 1.0e-300)
     roundoff = _ZERO_VAR_ULP_FACTOR * sys.float_info.epsilon * scale
-    if var <= roundoff ** 2:
+    sd = dev_scale * math.sqrt(var_ratio) if var_ratio > 0.0 else 0.0
+    if sd <= roundoff:
         return 0.0
-    if var <= 0.0:
-        return 0.0
-    return math.sqrt(var)
+    return sd
 
 
 def paired_t_test(diffs, alternative: str = 'two-sided') -> dict:
@@ -390,7 +399,12 @@ def permutation_test(diffs, alternative: str = 'two-sided',
         return {'n_pairs': 0, 'method': 'exact', 'n_permutations': 1,
                 'p_value': None, 'alternative': alternative}
     observed = sum(d) / n
-    eps = 1e-12
+    # The sign-flip test is scale-invariant, so the tie tolerance must be
+    # relative to the observed/data scale. A fixed 1e-12 absolute epsilon
+    # makes every sign assignment a hit when the differences are smaller
+    # than that (e.g. unanimous 1e-13 effects returned p=1 instead of
+    # 2**(1-n)); it also loses exact ties at very large scales.
+    eps = 1e-12 * max(abs(observed), max(abs(x) for x in d), 1.0e-300)
 
     def _tail_hit(stat: float) -> bool:
         if alternative == 'two-sided':
@@ -654,6 +668,9 @@ def holm_adjust(p_values, alpha: float = 0.05) -> dict:
             raise ValueError(
                 f'p_values[{i}] is None; exclude untestable comparisons '
                 f'from the family or set p=1.0 explicitly')
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise ValueError(
+                f'p_values[{i}]={p!r} is not a real number in [0,1]')
         p = float(p)
         if not (0.0 <= p <= 1.0) or not math.isfinite(p):
             raise ValueError(f'p_values[{i}]={p!r} is not in [0,1]')
@@ -737,7 +754,18 @@ def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
     z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
         else _ND.inv_cdf(1.0 - alpha)
     z_power = _ND.inv_cdf(power)
-    return int(math.ceil(((z_crit + z_power) / abs(dz)) ** 2))
+    try:
+        required = ((z_crit + z_power) / abs(dz)) ** 2
+    except OverflowError:
+        return None
+    if not math.isfinite(required):
+        # The exact effect is non-zero but no finite seed count can reach
+        # the requested power; report that instead of raising/returning 0.
+        return None
+    # A paired test is undefined below two seed pairs. The normal
+    # approximation can round a very large effect down to 0 or 1, so clamp
+    # the recommendation to the smallest runnable design.
+    return max(2, int(math.ceil(required)))
 
 
 def power_at_effect(n: int, sd: float, effect: float,

@@ -902,3 +902,38 @@ def test_pairwise_report_integrates_seed_influence_counts():
     assert rows2[0]['pairwise_direction_fragile_wins'] == []
     assert rows2[1]['pairwise_direction_fragile_wins'] == []
 
+
+
+def test_permutation_test_is_scale_invariant():
+    """The sign-flip test must not depend on the units of the differences."""
+    for scale in (1.0, 1e-13, 1e13):
+        d = [1.0 * scale, 2.0 * scale, 3.0 * scale]
+        assert math.isclose(M.permutation_test(d)['p_value'], 0.25,
+                            rel_tol=1e-15)
+        unanimous = [0.1 * scale] * 6
+        assert math.isclose(M.permutation_test(unanimous)['p_value'],
+                            0.03125, rel_tol=1e-15)
+    # Exact ties are still counted at a large scale.
+    assert M.permutation_test([1e300, -1e300])['p_value'] == 1.0
+
+
+def test_sample_sd_survives_finite_large_differences():
+    sd = M._sample_sd([1e200, 3e200], 2e200)
+    assert sd == pytest.approx(2e200 / math.sqrt(2))
+    t = M.paired_t_test([1e200, 3e200])
+    assert t['t_stat'] is not None and math.isfinite(t['p_value'])
+
+
+def test_seeds_required_never_recommends_an_unrunnable_design():
+    assert M.seeds_required(3.0) == 2
+    assert M.seeds_required(1e200) == 2
+    assert M.seeds_required(1e-200) is None
+    s = M.summarize_paired([10.0, 11.0, 12.0], n_boot=50, seed=0)
+    assert s['seeds_required_80pct_power'] == 2
+
+
+def test_holm_adjust_rejects_bool_p_values():
+    with pytest.raises(ValueError):
+        M.holm_adjust([False, 0.5])
+    with pytest.raises(ValueError):
+        M.holm_adjust([True])
