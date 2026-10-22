@@ -51,6 +51,7 @@ import json
 import math
 import dataclasses
 import numbers
+import operator
 import unicodedata
 from collections import Counter, OrderedDict
 import numpy as np
@@ -365,6 +366,42 @@ def _is_nonfinite_document(text):
         return False
 
 
+def _validated_token_ids(ids):
+    """Exact non-negative integer token ids from a tokenizer result.
+
+    A tokenizer that returns ``None``, a string, a float id, or a negative
+    id would otherwise crash a later ``len()`` / be silently truncated by
+    ``np.asarray(..., dtype=uint64)``. Those are tokenizer contract
+    violations, not documents, so callers count them as tokenize errors.
+    Objects implementing ``__index__`` (NumPy / torch integer scalars) are
+    accepted; floats and bools are not.
+    """
+    if isinstance(ids, (str, bytes)):
+        raise ValueError('tokenizer returned text instead of token ids')
+    try:
+        iterator = iter(ids)
+    except TypeError:
+        raise ValueError(
+            f'tokenizer returned a non-iterable {type(ids).__name__}') from None
+    out = []
+    for token in iterator:
+        if isinstance(token, bool):
+            raise ValueError('token id is a bool')
+        if isinstance(token, numbers.Integral):
+            token_id = int(token)
+        else:
+            try:
+                token_id = operator.index(token)
+            except TypeError:
+                raise ValueError(
+                    f'token id is not an exact integer: {token!r}') from None
+            token_id = int(token_id)
+        if token_id < 0:
+            raise ValueError(f'negative token id: {token_id}')
+        out.append(token_id)
+    return out
+
+
 def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
                    dedup_windows=False, dedup_near=False,
                    near_dup_threshold=DEFAULT_NEAR_DUP_THRESHOLD,
@@ -438,8 +475,8 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
             seen_texts.add(key)
             seen_normalized.add(normalized_key)
         try:
-            ids = tokenizer.encode(s, truncation=True,
-                                   max_length=seq_len + 1)
+            ids = _validated_token_ids(tokenizer.encode(
+                s, truncation=True, max_length=seq_len + 1))
         except Exception:
             n_tokenize_errors += 1
             continue
@@ -653,13 +690,13 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
 def _window_digest(text, tokenizer, seq_len):
     """Identity of the exact model input window (seq_len + 1 tokens)."""
     try:
-        ids = tokenizer.encode(text, truncation=True,
-                               max_length=seq_len + 1)
+        ids = _validated_token_ids(tokenizer.encode(
+            text, truncation=True, max_length=seq_len + 1))
     except Exception:
         return None
     h = hashlib.sha256()
     for token_id in ids:
-        h.update(str(int(token_id)).encode('ascii'))
+        h.update(str(token_id).encode('ascii'))
         h.update(b',')
     return h.digest()
 
@@ -812,8 +849,8 @@ def near_duplicate_leakage_audit(
     n_tokenize_errors = 0
     for text in combined:
         try:
-            ids = tokenizer.encode(
-                text, truncation=True, max_length=seq_len + 1)
+            ids = _validated_token_ids(tokenizer.encode(
+                text, truncation=True, max_length=seq_len + 1))
             token_ids.append(np.asarray(ids, dtype=np.uint64))
         except Exception:
             n_tokenize_errors += 1
@@ -885,8 +922,8 @@ def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
     unk_id = getattr(tokenizer, 'unk_token_id', None)
     for text in probe:
         try:
-            ids = tokenizer.encode(text, truncation=True,
-                                   max_length=seq_len + 1)
+            ids = _validated_token_ids(tokenizer.encode(
+                text, truncation=True, max_length=seq_len + 1))
         except Exception:
             continue
         lengths.append(len(ids))
@@ -928,8 +965,8 @@ def _probe_token_lengths(texts, tokenizer, seq_len, *, n_probe=256):
     lengths = []
     for text in probe:
         try:
-            ids = tokenizer.encode(text, truncation=True,
-                                   max_length=seq_len + 1)
+            ids = _validated_token_ids(tokenizer.encode(
+                text, truncation=True, max_length=seq_len + 1))
         except Exception:
             continue
         lengths.append(len(ids))
@@ -1158,17 +1195,9 @@ def _probe_token_documents(texts, tokenizer, seq_len, *, n_probe):
             n_errors += 1
             continue
         try:
-            ids = tokenizer.encode(str(text), truncation=True,
-                                   max_length=seq_len + 1)
-            tokens = []
-            for token in ids:
-                # ``int(0.9) == 0`` would silently count a corrupted id as
-                # token 0; require an exact non-negative integer instead.
-                if (isinstance(token, bool)
-                        or not isinstance(token, numbers.Integral)
-                        or int(token) < 0):
-                    raise ValueError('non-integral or negative token id')
-                tokens.append(int(token))
+            ids = _validated_token_ids(tokenizer.encode(
+                str(text), truncation=True, max_length=seq_len + 1))
+            tokens = list(ids)
         except Exception:
             n_errors += 1
             continue

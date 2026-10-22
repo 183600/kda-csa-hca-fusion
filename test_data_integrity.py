@@ -20,6 +20,9 @@ from near_duplicates import (
 from train_lm_autodl import (
     _FallbackCharTokenizer,
     _is_nonfinite_document,
+    _probe_token_lengths,
+    _text_length_stats,
+    _window_digest,
     _texts_fingerprint,
     clean_lm_texts,
     near_duplicate_leakage_audit,
@@ -274,3 +277,40 @@ def test_near_duplicate_candidate_cap_exact_boundary_is_complete():
     over = near_duplicate_pairs(three, max_candidate_pairs=2)
     assert over['n_candidate_pairs'] == 2
     assert over['candidates_truncated'] is True
+
+
+class _BadIdsTokenizer:
+    """Tokenizer whose encode() returns a malformed id sequence."""
+    pad_token_id = 0
+    unk_token_id = 0
+
+    def __init__(self, result):
+        self.result = result
+
+    def encode(self, text, truncation=False, max_length=None):
+        return self.result
+
+
+def test_malformed_token_ids_are_reported_not_crashed_or_coerced():
+    valid = 'a real document ' * 5
+    for bad in (None, 1.5, 'not ids', [1.0, 2.0], [-1, 2], [True, 2],
+                object()):
+        tok = _BadIdsTokenizer(bad)
+        cleaned = clean_lm_texts([valid], tok, seq_len=1024)
+        assert cleaned['texts'] == []
+        assert cleaned['stats']['n_tokenize_errors'] == 1
+        assert _text_length_stats([valid], tok, 1024)['n_probe'] == 0
+        assert _probe_token_lengths([valid], tok, 1024) == []
+        assert _window_digest(valid, tok, 1024) is None
+        audit = near_duplicate_leakage_audit([valid], ['b'], ['c'], tok,
+                                             seq_len=1024)
+        assert audit['n_tokenize_errors'] == 3
+
+    # Integer-like scalars (NumPy / torch) are real token ids; the
+    # uint64 cast in the near-duplicate path must not see floats.
+    import numpy as np
+    tok = _BadIdsTokenizer(np.array([1, 2, 3], dtype=np.int64))
+    cleaned = clean_lm_texts([valid], tok, seq_len=1024)
+    assert cleaned['texts'] == [valid]
+    assert cleaned['stats']['n_tokenize_errors'] == 0
+    assert _probe_token_lengths([valid], tok, 1024) == [3]
