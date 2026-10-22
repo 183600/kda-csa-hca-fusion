@@ -732,6 +732,32 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
             f'labels/input_ids must be {tuple(logits.shape[:2])}, got '
             f'{tuple(labels.shape)} / {tuple(input_ids.shape)}')
     b, t, v = logits.shape
+    if not logits.is_floating_point():
+        raise ValueError(
+            f'logits must be a floating-point tensor, got {logits.dtype}')
+    for name, ids in (('labels', labels), ('input_ids', input_ids)):
+        if (ids.dtype == torch.bool or ids.is_floating_point()
+                or ids.is_complex()):
+            raise ValueError(
+                f'{name} must contain integer token ids, got {ids.dtype}')
+    if isinstance(ignore_index, bool) or not isinstance(ignore_index, int):
+        raise ValueError(
+            f'ignore_index={ignore_index!r} must be an integer')
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise ValueError(f'top_k={top_k!r} must be a positive int')
+    if top_k < 1:
+        raise ValueError(f'top_k={top_k} must be a positive int')
+    if (isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))):
+        raise ValueError(
+            f'confidence={confidence!r} must be a number in [0, 1]')
+    confidence = float(confidence)
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise ValueError(
+            f'confidence={confidence} must be a finite number in [0, 1]')
+    if t and v < 1:
+        raise ValueError('logits must have a non-empty vocabulary')
+    valid = labels != int(ignore_index)
     if t == 0:
         empty = torch.zeros(b, 0, dtype=torch.long, device=logits.device)
         return {
@@ -752,7 +778,6 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
             'confidence': float(confidence),
         }
 
-    valid = labels != int(ignore_index)
     pred = logits.argmax(dim=-1)
     correct = valid & (pred == labels)
 
@@ -783,8 +808,8 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
         last_pos >= 0, idx.view(1, t) - last_pos,
         torch.full_like(last_pos, -1))
 
-    k = max(1, int(top_k))
-    conf = float(confidence)
+    k = top_k
+    conf = confidence
     cat_idx = torch.zeros(b, t, dtype=torch.long, device=logits.device)
     cat_idx = torch.where(~valid, torch.full_like(cat_idx, 5), cat_idx)
     wrong = valid & ~correct

@@ -787,6 +787,34 @@ def test_position_quartiles_are_relative_to_each_sequence_length():
     json.dumps(s, allow_nan=False)
 
 
+def test_lm_token_diagnostics_rejects_malformed_inputs():
+    vocab = 4
+    logits = torch.zeros(1, 2, vocab)
+    labels = torch.tensor([[0, 1]])
+    input_ids = torch.tensor([[1, 0]])
+    lm_token_diagnostics(logits, labels, input_ids)
+
+    for bad_labels in (torch.tensor([[0.0, 1.0]]),
+                       torch.tensor([[False, True]])):
+        with pytest.raises(ValueError):
+            lm_token_diagnostics(logits, bad_labels, input_ids)
+    with pytest.raises(ValueError):
+        lm_token_diagnostics(logits, labels, input_ids.to(torch.float32))
+    with pytest.raises(ValueError):
+        lm_token_diagnostics(logits.to(torch.long), labels, input_ids)
+    for bad_k in (0, -1, True, 2.5):
+        with pytest.raises(ValueError):
+            lm_token_diagnostics(logits, labels, input_ids, top_k=bad_k)
+    for bad_conf in (-0.1, 1.1, float('nan'), True):
+        with pytest.raises(ValueError):
+            lm_token_diagnostics(logits, labels, input_ids,
+                                 confidence=bad_conf)
+    for bad_ignore in (True, 1.5):
+        with pytest.raises(ValueError):
+            lm_token_diagnostics(logits, labels, input_ids,
+                                 ignore_index=bad_ignore)
+
+
 def test_lm_token_diagnostics_masked_and_empty():
     vocab = 4
     logits = torch.stack([_row_logits(vocab, 2, 1),
