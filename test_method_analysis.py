@@ -148,9 +148,47 @@ def test_headwise_fully_masked_rows_are_still_zeroed():
             hca[:, :, :model.cfg.hca_m2])), '')
 
 
+def test_headwise_empty_sequence_and_empty_head_groups():
+    """T=0 and zero-width head groups are valid ablations, not crashes.
+
+    ``HeadwiseConfig`` only constrains the SUM of the group counts, so a
+    split may legitimately assign zero heads to KDA / CSA / HCA.  The
+    prototype used to call ``naive_recurrent_kda`` with ``H=0`` for such a
+    split and to use ``reshape(..., -1)`` on a zero-element T=0 output —
+    both raise despite the intended feature width being well defined.
+    """
+    groups = [(0, 1, 1), (1, 0, 1), (1, 1, 0), (0, 0, 1),
+              (1, 0, 0), (0, 1, 0), (1, 1, 1)]
+    for h_kda, h_csa, h_hca in groups:
+        cfg = HeadwiseConfig(
+            d_model=16, H_total=h_kda + h_csa + h_hca,
+            H_kda=h_kda, H_csa=h_csa, H_hca=h_hca, head_dim=4,
+            csa_m=2, csa_topk=1, hca_m2=2, csa_c=4, hca_c=4)
+        model = HeadwiseFusedAttention(cfg).eval()
+        for T in (0, 3):
+            x = torch.randn(2, T, cfg.d_model)
+            with torch.no_grad():
+                y = model(x)
+            _ok(f'head split {h_kda}:{h_csa}:{h_hca} T={T} shape',
+                y.shape == (2, T, cfg.d_model), f'{tuple(y.shape)}')
+            _ok(f'head split {h_kda}:{h_csa}:{h_hca} T={T} finite',
+                bool(torch.isfinite(y).all()), '')
+
+    try:
+        cfg = HeadwiseConfig(
+            d_model=16, H_total=1, H_kda=-1, H_csa=1, H_hca=1,
+            head_dim=4, csa_m=2, csa_topk=1, hca_m2=2, csa_c=4, hca_c=4)
+        HeadwiseFusedAttention(cfg)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('negative head count was silently accepted')
+
+
 _TEST_FUNCS = [
     test_headwise_csa_and_hca_use_the_softmax_limit_for_positive_inf,
     test_headwise_fully_masked_rows_are_still_zeroed,
+    test_headwise_empty_sequence_and_empty_head_groups,
 ]
 
 

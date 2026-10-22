@@ -164,6 +164,16 @@ class HeadwiseFusedAttention(nn.Module):
     def __init__(self, cfg: HeadwiseConfig):
         super().__init__()
         self.cfg = cfg
+        for _name in ('H_total', 'H_kda', 'H_csa', 'H_hca'):
+            _value = getattr(cfg, _name)
+            if (not isinstance(_value, int) or isinstance(_value, bool)
+                    or _value < 0):
+                raise ValueError(
+                    f"HeadwiseConfig.{_name}={_value!r} must be a "
+                    f"non-negative int.")
+        if cfg.head_dim < 1:
+            raise ValueError(
+                f"HeadwiseConfig.head_dim={cfg.head_dim!r} must be >= 1.")
         if cfg.H_kda + cfg.H_csa + cfg.H_hca != cfg.H_total:
             raise ValueError(
                 f"H_kda({cfg.H_kda}) + H_csa({cfg.H_csa}) + H_hca({cfg.H_hca}) "
@@ -198,6 +208,11 @@ class HeadwiseFusedAttention(nn.Module):
     def _kda_heads(self, x):
         B, T, d = x.shape
         H, hd = self.cfg.H_kda, self.cfg.head_dim
+        if H == 0:
+            # A zero-width head group is a valid ablation split: there is
+            # no KDA head to run, so return the empty [B, T, 0, hd] block
+            # instead of calling a recurrence with H=0.
+            return x.new_zeros(B, T, 0, hd)
         q = F.normalize(F.silu(self.kda_q(x)).view(B, T, H, hd), dim=-1)
         k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
@@ -209,6 +224,10 @@ class HeadwiseFusedAttention(nn.Module):
     def _csa_heads(self, x):
         B, T, d = x.shape
         H, c, m = self.cfg.H_csa, self.cfg.csa_c, self.cfg.csa_m
+        if H == 0:
+            # See _kda_heads: an empty head group contributes an empty
+            # [B, H, T, c] block (the branch returns [B, H, T, c]).
+            return x.new_zeros(B, 0, T, c)
         pad = (-T) % m
         if pad:
             x = F.pad(x, (0, 0, 0, pad))
@@ -235,6 +254,9 @@ class HeadwiseFusedAttention(nn.Module):
     def _hca_heads(self, x):
         B, T, d = x.shape
         H, c, m2 = self.cfg.H_hca, self.cfg.hca_c, self.cfg.hca_m2
+        if H == 0:
+            # See _csa_heads: empty head group, same [B, H, T, c] layout.
+            return x.new_zeros(B, 0, T, c)
         pad = (-T) % m2
         if pad:
             x = F.pad(x, (0, 0, 0, pad))
@@ -260,12 +282,19 @@ class HeadwiseFusedAttention(nn.Module):
         kda_o = self._kda_heads(h)
         csa_o = self._csa_heads(h)
         hca_o = self._hca_heads(h)
+        cfg = self.cfg
+        # Explicit feature widths instead of ``reshape(..., -1)``: a
+        # T == 0 chunk has zero elements, for which -1 is ambiguous even
+        # though the intended width (H * head_dim) is well defined.
         all_heads = torch.cat([
-            kda_o.reshape(B, T, -1).to(x.dtype),
-            csa_o.transpose(1, 2).contiguous().reshape(B, T, -1).to(x.dtype),
-            hca_o.transpose(1, 2).contiguous().reshape(B, T, -1).to(x.dtype)
+            kda_o.reshape(B, T, cfg.H_kda * cfg.head_dim).to(x.dtype),
+            csa_o.transpose(1, 2).contiguous().reshape(
+                B, T, cfg.H_csa * cfg.csa_c).to(x.dtype),
+            hca_o.transpose(1, 2).contiguous().reshape(
+                B, T, cfg.H_hca * cfg.hca_c).to(x.dtype)
         ], dim=2)
-        return x + self.o_proj(all_heads.reshape(B, T, -1))
+        return x + self.o_proj(
+            all_heads.reshape(B, T, cfg.H_total * cfg.head_dim))
 
 
 # Fixed seed for the headwise-fusion demo. The demo is a standalone forward
