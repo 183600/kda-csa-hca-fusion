@@ -45,7 +45,9 @@ band). An explicit **untrained control** row (random initialisation, same
 architecture and evaluation sequences) is written for every base geometry so
 the trained numbers can be read against their actual chance floor. Aggregate
 rows carry seed-level standard deviations, 95% t-intervals and a paired
-significance test of the trained model's gain over its untrained control.
+significance test of the trained model's gain over its untrained control at
+the SAME inference precision (dtype and PTQ spec), so quantization damage is
+not counted as a training gain or loss.
 
 Baselines and hypotheses
 ------------------------
@@ -205,10 +207,11 @@ NEEDLE_HYPOTHESES = OrderedDict([
             'initialisation floor on held-out sequences (localisation, not '
             'generation, is the difficulty).'),
         'prediction': (
-            'Trained exact-match accuracy exceeds the untrained control by '
-            'a positive seed-paired margin; the lexical template scan '
-            '(simplest non-learned baseline) reproduces the answer at high '
-            'exact match, confirming the task is lexically copy-solvable.'),
+            'Trained exact-match accuracy exceeds the same-precision '
+            'untrained control by a positive seed-paired margin; the lexical '
+            'template scan (simplest non-learned baseline) reproduces the '
+            'answer at high exact match, confirming the task is lexically '
+            'copy-solvable.'),
         'falsified_if': (
             'Trained accuracy is not above the untrained control, or the '
             'template rule cannot find the planted fact (the task is not '
@@ -1066,7 +1069,8 @@ def _needle_row_hypothesis_checks(
         and p_dir < 0.05)
     checks = OrderedDict()
     checks['learned_retrieval'] = {
-        'prediction': 'trained accuracy > untrained control (seed-paired)',
+        'prediction': ('trained accuracy > same-precision untrained control '
+                       '(seed-paired)'),
         'observed_gain': gain,
         'n_seeds': int(n_seeds),
         'p_value_directional': p_dir,
@@ -1582,6 +1586,13 @@ def _arch_key(cfg: NeedleConfig) -> tuple:
     return (cfg.memory_type, cfg.n_layers, cfg.n_kda, cfg.n_csa, cfg.n_hca)
 
 
+def _quant_spec_key(spec: QuantSpec | None) -> tuple | None:
+    """Hashable identity of an inference quantizer (None = full precision)."""
+    if spec is None:
+        return None
+    return (int(spec.bits), int(spec.group_size), bool(spec.symmetric))
+
+
 def _build_needle_model(cfg: NeedleConfig, tokenizer: _NeedleCharTokenizer) -> NeedleHybridLM:
     return NeedleHybridLM(
         vocab_size=tokenizer.vocab_size,
@@ -2064,9 +2075,12 @@ def run_needle_sweep(
             per_seed_results.append(res)
 
             # Untrained control: the SAME architecture/seed with random
-            # initialisation, scored on the SAME evaluation sequences.
+            # initialisation, scored on the SAME evaluation sequences AND
+            # through the SAME inference precision (dtype + PTQ spec). Using
+            # an unquantized control for a quantized row would confound
+            # quantization damage with the training gain.
             ckey = (_arch_key(cfg), cfg.context_len, cfg.needle_pos,
-                    cfg.dtype, seed)
+                    cfg.dtype, _quant_spec_key(cfg.quant_spec), seed)
             if ckey not in untrained_acc:
                 set_global_seed(seed, deterministic=True)
                 ctrl = _build_needle_model(cfg, tokenizer)
@@ -2077,7 +2091,7 @@ def run_needle_sweep(
                     batch_size=batch_size,
                     n_batches=n_batches,
                     device=device,
-                    quant_spec=None,
+                    quant_spec=cfg.quant_spec,
                     dtype=torch_dtype,
                 )
             control_results.append(untrained_acc[ckey])
@@ -2235,6 +2249,15 @@ def run_needle_sweep(
             'untrained_accuracy_mean': ctrl_mean,
             'untrained_accuracy_per_seed': ctrl_accs,
             'untrained_accuracy_ci95': _mean_ci95(ctrl_accs),
+            'untrained_control_quantized': bool(cfg.quant_spec is not None),
+            'untrained_control_bits': (
+                cfg.quant_spec.bits if cfg.quant_spec is not None else None),
+            'untrained_control_group_size': (
+                cfg.quant_spec.group_size
+                if cfg.quant_spec is not None else None),
+            'untrained_control_symmetric': (
+                cfg.quant_spec.symmetric
+                if cfg.quant_spec is not None else None),
             'accuracy_gain_over_untrained_mean': (
                 sum(diffs) / len(diffs) if diffs else None),
             'accuracy_gain_paired': paired,
@@ -2261,11 +2284,13 @@ def run_needle_sweep(
         }
         rows.append(row)
 
-        # One untrained-control row per base geometry (dtype/quant
-        # independent), written once so it is not duplicated per quant spec.
+        # One full-precision untrained-control row per base geometry,
+        # written once from the unquantized config (quantized recall rows
+        # carry their own same-precision control fields).
         base_key = ('control_row', _arch_key(cfg), cfg.context_len,
                     cfg.needle_pos)
-        if not any(r.get('control_key') == base_key for r in rows):
+        if (cfg.quant_spec is None
+                and not any(r.get('control_key') == base_key for r in rows)):
             rows.append({
                 'row_kind': 'needle_untrained_control',
                 'control_key': base_key,
@@ -2292,9 +2317,12 @@ def run_needle_sweep(
                 'chance_first_token': 1.0 / tokenizer.vocab_size,
                 'seeds': list(seeds),
                 'per_seed': control_results,
-                'note': ('random-initialisation floor; every reported '
-                         'needle_recall row is trained and its gain over '
-                         'this control is tested with summarize_paired'),
+                'untrained_control_quantized': False,
+                'note': ('full-precision random-initialisation floor; every '
+                         'reported needle_recall row is trained and its gain '
+                         'over a SAME-precision control is tested with '
+                         'summarize_paired (quantized rows carry that '
+                         'control in their own untrained_accuracy fields)'),
             })
 
         # One rule-baseline row per geometry (independent of route, dtype
@@ -2832,7 +2860,9 @@ def main():
                     'task-level copy ceiling, not a deployable baseline'),
                 'untrained_control': (
                     'same architecture/seed with random initialisation, '
-                    'scored on the same held-out evaluation sequences'),
+                    'scored on the same held-out evaluation sequences and '
+                    'through the same inference precision (dtype + PTQ spec); '
+                    'the standalone control row is the full-precision case'),
                 'chance': (
                     'uniform-guess exact match (1/vocab)^n_answer_tokens and '
                     'first-token chance 1/vocab, both recorded per row'),

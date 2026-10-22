@@ -602,8 +602,24 @@ def test_needle_experiment_json_output():
             and set(r.get('hypothesis_checks', {}))
             == {'learned_retrieval', 'trained_matches_rule'}
             for r in recall))
+    quantized_recall = [r for r in recall if r.get('quantized')]
+    _ok('quick sweep contains quantized recall rows',
+        bool(quantized_recall), f'{len(quantized_recall)} rows')
+    _ok('quantized recall rows use a quant-matched untrained control',
+        all(r.get('untrained_control_quantized') is True
+            and r.get('untrained_control_bits') == r.get('bits')
+            and r.get('untrained_control_group_size') == r.get('group_size')
+            for r in quantized_recall), f'{len(quantized_recall)} rows')
+    _ok('unquantized recall rows use a full-precision control',
+        all(r.get('untrained_control_quantized') is False
+            and r.get('untrained_control_bits') is None
+            for r in recall if not r.get('quantized')))
     _ok('untrained rows carry is_trained=False',
         all(r.get('is_trained') is False for r in payload['rows']
+            if r['row_kind'] == 'needle_untrained_control'))
+    _ok('the standalone control row is the full-precision floor',
+        all(r.get('untrained_control_quantized') is False
+            for r in payload['rows']
             if r['row_kind'] == 'needle_untrained_control'))
 
     # Validate JSON round-trips strictly
