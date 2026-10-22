@@ -801,6 +801,26 @@ def test_evaluate_lm_loss_nonfinite_refuses_with_diagnosis():
         evaluate_lm_loss(NaNLossModel(), DummyDataset(), batch_size=1)
 
 
+def test_analyze_errors_refuses_nonfinite_logits():
+    """A diverged forward pass must not produce a plausible error mix."""
+    from run_quality import analyze_errors
+
+    vocab = 8
+
+    class _BadLayer(torch.nn.Module):
+        def forward(self, x):
+            return torch.full_like(x, float('nan'))
+
+    class _BadHead(torch.nn.Module):
+        def forward(self, h, cue_pos):
+            return torch.full((int(h.shape[0]), vocab), float('nan'))
+
+    with pytest.raises(ValueError, match='non-finite'):
+        analyze_errors(_BadLayer(), _BadHead(), torch.nn.Embedding(vocab, 4),
+                       op_name='bad', task='mqar', seq_len=8, n_kv=1,
+                       vocab=vocab, n_batches=1, batch=4, max_examples=1)
+
+
 def test_error_analysis_report_is_json_serializable():
     r = train_one('kda', seed=3, steps=12, device='cpu', val_every=6,
                   val_batches=1, val_batch=8, error_batches=1,

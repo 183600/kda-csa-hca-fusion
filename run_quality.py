@@ -2335,6 +2335,17 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
                     generator=gen, return_meta=True)
                 h = layer(x_emb)
                 logits = head(h, cue_pos)
+                if not bool(torch.isfinite(logits).all()):
+                    # A NaN/Inf output has no category: argmax would pick an
+                    # arbitrary class and the report would show a plausible
+                    # error mix for a diverged model. Refuse the analysis;
+                    # staged triage belongs to the training/eval path.
+                    n_bad = int((~torch.isfinite(logits)).sum())
+                    raise ValueError(
+                        f'analyze_errors received {n_bad} non-finite '
+                        f'logit(s) for task={task!r}; run '
+                        f'diagnose_nonfinite() on the eval forward pass '
+                        f'instead of interpreting the bad-case mix')
                 pred = logits.argmax(-1)
                 cats, extras = _classify_task_errors(
                     task, meta, target, pred, cue_pos, n_kv)
