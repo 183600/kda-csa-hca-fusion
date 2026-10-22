@@ -33,6 +33,7 @@ Or directly::
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -48,6 +49,9 @@ from ops_csa import (  # noqa: E402
     naive_csa,
 )
 from ops_decoding_cache import CSADecodingCache  # noqa: E402
+from run_indexer_selector import (  # noqa: E402
+    _timeit_blocked_samples, _timeit_samples,
+)
 from test_csa_tiebreak import (  # noqa: E402
     _make_csa_params, _project_csa,
 )
@@ -336,11 +340,47 @@ def test_cache_decode_with_sink_sparse_ties_and_nan_weights():
         f'outputs finite')
 
 
+def test_timing_samples_feed_the_ci_fields():
+    """The blocked timer must return every timed call, not only a median.
+
+    The experiment attaches bootstrap CIs to the latency rows; that is only
+    auditable if the raw samples are exposed. This pins the sample count
+    (``reps * rounds`` for the A/B path, ``reps`` for the single-variant
+    path) and that the point medians are finite.
+    """
+    print('\nTest: blocked timing exposes samples for the bootstrap CIs')
+    calls = {'a': 0, 'b': 0}
+
+    def fn_a():
+        calls['a'] += 1
+
+    def fn_b():
+        calls['b'] += 1
+
+    med_a, med_b, samples_a, samples_b = _timeit_blocked_samples(
+        fn_a, fn_b, warmup=0, reps=2, rounds=3)
+    _ok('blocked timer keeps reps*rounds samples per variant',
+        len(samples_a) == 6 and len(samples_b) == 6,
+        f'{len(samples_a)} / {len(samples_b)}')
+    _ok('blocked timer runs both variants in every round',
+        calls == {'a': 6, 'b': 6}, f'{calls}')
+    _ok('blocked medians and samples are finite',
+        all(math.isfinite(v) and v >= 0.0
+            for v in (med_a, med_b, *samples_a, *samples_b)),
+        f'{med_a}, {med_b}')
+
+    med, samples = _timeit_samples(fn_a, warmup=1, reps=4)
+    _ok('single-variant timer keeps every post-warmup sample',
+        len(samples) == 4 and all(math.isfinite(v) for v in samples)
+        and math.isfinite(med), f'{len(samples)} samples')
+
+
 def main() -> int:
     test_selector_grid_matches_reference_on_both_paths()
     test_nan_scores_are_unselectable_not_a_crash()
     test_indexer_nan_weights_multi_row_no_crash()
     test_cache_decode_with_sink_sparse_ties_and_nan_weights()
+    test_timing_samples_feed_the_ci_fields()
     print('\nAll indexer-selector tests passed.')
     return 0
 

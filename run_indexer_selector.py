@@ -28,11 +28,12 @@ What this experiment measures
    BEFORE any timing row is trusted.
 2. ``selector_latency``: per-call median latency of the shipped selector
    vs the stable-sort kernel vs ``torch.topk`` over a ``rows x n_blocks``
-   grid.
+   grid, with bootstrap CI95 for each median and for the A/B ratio.
 3. ``indexer_latency``: end-to-end ``csa_lightning_indexer`` median
    latency at decode geometry with the shipped selector vs the sort
    kernel swapped in (temporarily, restored in a ``finally``), plus
-   the full ``CSADecodingCache.forward_step`` step for share context.
+   the full ``CSADecodingCache.forward_step`` step for share context;
+   every median and speedup carries its bootstrap CI95.
 4. ``sink_guard``: the sink-only degenerate configuration (no window, no
    top-k, no completed block) and NaN-poisoned indexer weights must stay
    finite and agree with ``naive_csa`` — the selector must never turn a
@@ -69,6 +70,7 @@ from ops_csa import (  # noqa: E402
 )
 from ops_decoding_cache import CSADecodingCache, _block_valid_mask  # noqa: E402
 import ops_csa  # noqa: E402
+from timing_stats import ratio_of_medians_ci, summarize_timings_s  # noqa: E402
 from results_schema import (  # noqa: E402
     SchemaError, write_checked as write_results_checked,
 )
@@ -114,8 +116,9 @@ def _env_list(name: str, default: tuple) -> tuple:
         return default
 
 
-def _timeit(fn, warmup: int = WARMUP, reps: int = REPS) -> float:
-    """Median wall-clock seconds per call (float, CPU-pinned by caller)."""
+def _timeit_samples(fn, warmup: int = WARMUP,
+                    reps: int = REPS) -> tuple:
+    """Median wall-clock seconds per call plus the raw samples."""
     for _ in range(warmup):
         fn()
     samples = []
@@ -123,34 +126,71 @@ def _timeit(fn, warmup: int = WARMUP, reps: int = REPS) -> float:
         t0 = time.perf_counter()
         fn()
         samples.append(time.perf_counter() - t0)
-    return statistics.median(samples)
+    return statistics.median(samples), samples
 
 
-def _timeit_blocked(fn_a, fn_b, warmup: int = WARMUP, reps: int = REPS,
-                    rounds: int = 2) -> tuple:
-    """Drift-resistant medians for two variants, measured in homogeneous
-    blocks with alternating block order (A-B then B-A by default).
+def _timeit(fn, warmup: int = WARMUP, reps: int = REPS) -> float:
+    """Median wall-clock seconds per call (float, CPU-pinned by caller)."""
+    return _timeit_samples(fn, warmup=warmup, reps=reps)[0]
+
+
+def _timeit_blocked_samples(fn_a, fn_b, warmup: int = WARMUP,
+                            reps: int = REPS, rounds: int = 2) -> tuple:
+    """Drift-resistant medians plus the raw per-call samples.
 
     Call-by-call interleaving would let each variant disturb the other's
     allocator/cache state; separate blocks in ABBA order instead cancel
     first-order drift while each variant runs in its own steady state.
-    Returns ``(median_a, median_b)`` (median of the per-round medians).
+    Returns ``(median_a, median_b, samples_a, samples_b)`` where the
+    medians are taken over the per-round medians and the samples are every
+    timed call (used for the bootstrap CIs).
     """
     med_a, med_b = [], []
+    samples_a, samples_b = [], []
     for rnd in range(rounds):
-        pairs = ((fn_a, med_a), (fn_b, med_b))
+        pairs = ((fn_a, med_a, samples_a), (fn_b, med_b, samples_b))
         if rnd % 2:
             pairs = (pairs[1], pairs[0])
-        for fn, out in pairs:
+        for fn, meds, samples in pairs:
             for _ in range(warmup):
                 fn()
-            samples = []
+            block = []
             for _ in range(reps):
                 t0 = time.perf_counter()
                 fn()
-                samples.append(time.perf_counter() - t0)
-            out.append(statistics.median(samples))
-    return statistics.median(med_a), statistics.median(med_b)
+                block.append(time.perf_counter() - t0)
+            samples.extend(block)
+            meds.append(statistics.median(block))
+    return (statistics.median(med_a), statistics.median(med_b),
+            samples_a, samples_b)
+
+
+def _timeit_blocked(fn_a, fn_b, warmup: int = WARMUP, reps: int = REPS,
+                    rounds: int = 2) -> tuple:
+    """Drift-resistant medians for two variants (median of round medians)."""
+    med_a, med_b, _, _ = _timeit_blocked_samples(
+        fn_a, fn_b, warmup=warmup, reps=reps, rounds=rounds)
+    return med_a, med_b
+
+
+def _timing_ci_fields(samples_s: list, prefix: str) -> dict:
+    """Flat JSON-safe CI fields for one variant's wall-clock samples."""
+    stats = summarize_timings_s(samples_s)
+    return {
+        f'{prefix}_ci95_low_ms': stats['ci95_low_ms'],
+        f'{prefix}_ci95_high_ms': stats['ci95_high_ms'],
+        f'{prefix}_n_samples': stats['n'],
+    }
+
+
+def _speedup_ci_fields(samples_a_s: list, samples_b_s: list,
+                       prefix: str) -> dict:
+    """Flat JSON-safe CI fields for ``median(a)/median(b)``."""
+    stats = ratio_of_medians_ci(samples_a_s, samples_b_s)
+    return {
+        f'{prefix}_ci95_low': stats['ratio_ci95_low'],
+        f'{prefix}_ci95_high': stats['ratio_ci95_high'],
+    }
 
 
 def _historical_sort_selector(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -265,10 +305,12 @@ def bench_selector_latency(topk: int) -> list:
             continue
         scores = torch.randn(r, n)
         s = min(topk, n)
-        t_shipped, t_hist = _timeit_blocked(
-            lambda: _canonical_topk_indices(scores, topk),
-            lambda: _historical_sort_selector(scores, topk))
-        t_topk = _timeit(lambda: torch.topk(scores, s, dim=-1).indices)
+        t_shipped, t_hist, samples_shipped, samples_hist = \
+            _timeit_blocked_samples(
+                lambda: _canonical_topk_indices(scores, topk),
+                lambda: _historical_sort_selector(scores, topk))
+        t_topk, samples_topk = _timeit_samples(
+            lambda: torch.topk(scores, s, dim=-1).indices)
         rows.append({
             'section': 'selector_latency',
             'rows': r, 'n_blocks': n, 'topk': topk,
@@ -277,6 +319,11 @@ def bench_selector_latency(topk: int) -> list:
             'historical_sort_ms': t_hist * 1e3,
             'torch_topk_ms': t_topk * 1e3,
             'speedup_vs_sort': t_hist / t_shipped,
+            **_timing_ci_fields(samples_shipped, 'shipped'),
+            **_timing_ci_fields(samples_hist, 'historical_sort'),
+            **_timing_ci_fields(samples_topk, 'torch_topk'),
+            **_speedup_ci_fields(samples_hist, samples_shipped,
+                                 'speedup_vs_sort'),
         })
     return rows
 
@@ -347,8 +394,8 @@ def bench_indexer_latency(topk: int, geom: dict, lengths) -> list:
                                       causal_block_mask=cbm,
                                       normalize_qk=False)
 
-        t_shipped, t_hist = _timeit_blocked(
-            idx_call, _with_historical(idx_call))
+        t_shipped, t_hist, samples_indexer, samples_indexer_hist = \
+            _timeit_blocked_samples(idx_call, _with_historical(idx_call))
 
         q = torch.randn(1, 1, geom['nh'], geom['c'])
         sink = torch.zeros(geom['nh'])
@@ -360,13 +407,15 @@ def bench_indexer_latency(topk: int, geom: dict, lengths) -> list:
                     nIh=geom['nIh'], sink_logits=sink, use_ste=False,
                     normalize_qk=True)
 
-        t_step, t_step_hist = _timeit_blocked(
-            step_call, _with_historical(step_call), warmup=2, reps=5)
+        t_step, t_step_hist, samples_step, samples_step_hist = \
+            _timeit_blocked_samples(
+                step_call, _with_historical(step_call), warmup=2, reps=5)
         # Selector-only medians on the same geometry (rows=1 synthetic).
         scores = torch.randn(1, nb)
-        t_sel, t_sel_hist = _timeit_blocked(
-            lambda: _canonical_topk_indices(scores, topk),
-            lambda: _historical_sort_selector(scores, topk))
+        t_sel, t_sel_hist, samples_selector, samples_selector_hist = \
+            _timeit_blocked_samples(
+                lambda: _canonical_topk_indices(scores, topk),
+                lambda: _historical_sort_selector(scores, topk))
         rows.append({
             'section': 'indexer_latency', 'T': T, 'n_blocks': nb,
             'topk': topk, 'dispatch': _dispatch_of((1, nb), topk),
@@ -379,6 +428,21 @@ def bench_indexer_latency(topk: int, geom: dict, lengths) -> list:
             'selector_shipped_ms': t_sel * 1e3,
             'selector_historical_sort_ms': t_sel_hist * 1e3,
             'selector_share_of_step': t_sel / t_step,
+            **_timing_ci_fields(samples_indexer, 'indexer_shipped'),
+            **_timing_ci_fields(samples_indexer_hist,
+                                'indexer_historical_sort'),
+            **_speedup_ci_fields(samples_indexer_hist, samples_indexer,
+                                 'indexer_speedup'),
+            **_timing_ci_fields(samples_step, 'step_shipped'),
+            **_timing_ci_fields(samples_step_hist,
+                                'step_historical_sort'),
+            **_speedup_ci_fields(samples_step_hist, samples_step,
+                                 'step_speedup'),
+            **_timing_ci_fields(samples_selector, 'selector_shipped'),
+            **_timing_ci_fields(samples_selector_hist,
+                                'selector_historical_sort'),
+            **_speedup_ci_fields(samples_selector_hist, samples_selector,
+                                 'selector_speedup'),
         })
     return rows
 
@@ -562,6 +626,10 @@ def main() -> int:
         'timing_protocol': {
             'warmup': WARMUP, 'reps': REPS,
             'statistic': 'median wall-clock seconds per call',
+            'ci': ('percentile bootstrap over every timed call; 2000 '
+                   'resamples, alpha=0.05, local deterministic RNG'),
+            'ratio_ci': ('unpaired bootstrap of median(sort)/median(shipped) '
+                         '(independent ABBA blocks)'),
         },
         'seeds': {
             'value': 0,
