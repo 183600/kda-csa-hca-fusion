@@ -1188,6 +1188,14 @@ class CSADecodingCache:
                     f"CSADecodingCache.append_step: {_name}.shape="
                     f"{tuple(_t.shape)} does not match the expected "
                     f"{(B, T_new, _width)}.")
+        for _b_name, _b, _b_width in (
+                ('Ba', Ba, self.c), ('Bb', Bb, self.c),
+                ('B_idx', B_idx, self.c_I)):
+            if tuple(_b.shape) != (self.m, _b_width):
+                raise ValueError(
+                    f'CSADecodingCache.append_step: {_b_name}.shape='
+                    f'{tuple(_b.shape)} does not match the expected '
+                    f'{(self.m, _b_width)}.')
         # Cast to cache dtype/device defensively.
         Ca_new = _to_cache(Ca_new, self.dtype, self.device)
         Cb_new = _to_cache(Cb_new, self.dtype, self.device)
@@ -2525,6 +2533,15 @@ class HCADecodingCache:
                 f"HCADecodingCache.append_step: Z_new.shape="
                 f"{tuple(Z_new.shape)} does not match the expected "
                 f"{(B, T_new, self.c)}.")
+        # ``(m2, c)`` is the documented geometry; a single ``(1, c)``
+        # broadcast row is accepted for callers that apply one shared
+        # positional bias (the compression helper broadcasts it).
+        if (B_pos.dim() != 2 or B_pos.shape[-1] != self.c
+                or B_pos.shape[0] not in (1, self.m2)):
+            raise ValueError(
+                f'HCADecodingCache.append_step: B_pos.shape='
+                f'{tuple(B_pos.shape)} does not match the expected '
+                f'{(self.m2, self.c)} (or a broadcast {(1, self.c)}).')
         C_new = _to_cache(C_new, self.dtype, self.device)
         Z_new = _to_cache(Z_new, self.dtype, self.device)
         if T_new > 1:

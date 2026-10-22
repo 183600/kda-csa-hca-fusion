@@ -978,3 +978,60 @@ def test_csa_cache_rejects_wrong_indexer_feature_width():
         pass
     else:  # pragma: no cover
         raise AssertionError('wrong q_idx feature width was accepted')
+
+
+def test_csa_bias_and_sink_geometry_are_validated_at_empty_length():
+    from ops_csa import naive_csa
+    d, c, c_I, m, nh, nIh, dc = 8, 4, 2, 2, 2, 2, 4
+    mk = lambda *shape: torch.randn(*shape)
+    args = [mk(c, d), mk(c, d), mk(c, d), mk(c, d), mk(m, c), mk(m, c),
+            mk(dc, d), mk(c * nh, dc), mk(c_I * nIh, dc), mk(nIh, d),
+            mk(c_I, d), mk(c_I, d), mk(m, c_I)]
+    kwargs = dict(m=m, topk=2, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc)
+    bad = list(args)
+    bad[4] = mk(m, 1)
+    for T in (0, 4):
+        for call in (lambda: naive_csa(torch.randn(1, T, d), *bad, **kwargs),
+                     lambda: naive_csa(torch.randn(1, T, d), *args,
+                                       sink_logits=mk(nh + 1), **kwargs)):
+            try:
+                call()
+            except ValueError:
+                pass
+            else:  # pragma: no cover
+                raise AssertionError(
+                    f'invalid CSA bias/sink accepted at T={T}')
+
+
+def test_csa_cache_rejects_broadcastable_bias_widths():
+    cache = CSADecodingCache(1, 4, 2, 2, 2, torch.device('cpu'),
+                             torch.float32)
+    proj = [torch.randn(1, 1, 4) for _ in range(4)]
+    proj += [torch.randn(1, 1, 2) for _ in range(2)]
+    try:
+        cache.append_step(*proj, torch.randn(2, 1), torch.randn(2, 4),
+                          torch.randn(2, 2))
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('width-1 CSA bias was silently broadcast')
+
+
+def test_fused_csa_weights_see_data_mutation():
+    from ops_fused import CSAHybridLayer, HybridConfig
+    torch.manual_seed(0)
+    cfg = HybridConfig(
+        d_model=16, csa_m=2, csa_topk=2, csa_nh=2, csa_c=4, csa_dc=8,
+        csa_nIh=1, csa_cI=4, csa_sliding_window=2, csa_rope_dim=0,
+        layout=('csa',))
+    layer = CSAHybridLayer(cfg).eval()
+    x = torch.randn(2, 5, 16)
+    with torch.no_grad():
+        before = layer(x)[0]
+        layer.W_aKV.weight.data.mul_(2.0)
+        after = layer(x)[0]
+        fresh = CSAHybridLayer(cfg).eval()
+        fresh.load_state_dict(layer.state_dict())
+        expected = fresh(x)[0]
+    assert not torch.equal(before, after)
+    assert torch.equal(after, expected)

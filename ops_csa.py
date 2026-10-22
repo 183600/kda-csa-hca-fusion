@@ -1633,6 +1633,22 @@ def naive_csa(
             raise ValueError(
                 f"naive_csa: {_w_name}.shape={tuple(_w.shape)} — second dim "
                 f"(in_features) must equal d={d} (H.shape[-1]).")
+    # Positional biases / sink have exact geometries too: a broadcastable
+    # (m, 1) bias would silently replicate one channel across the feature
+    # axis, and a wrong-size sink would fail later inside ``.view`` with an
+    # opaque error. Validate before the empty-sequence return so T=0 and
+    # T>0 agree.
+    for _b_name, _b, _b_shape in (
+            ('Ba', Ba, (m, c)), ('Bb', Bb, (m, c)),
+            ('B_idx', B_idx, (m, c_I))):
+        if tuple(_b.shape) != _b_shape:
+            raise ValueError(
+                f'naive_csa: {_b_name}.shape={tuple(_b.shape)} does not '
+                f'match the expected {_b_shape}.')
+    if sink_logits is not None and tuple(sink_logits.shape) != (nh,):
+        raise ValueError(
+            f'naive_csa: sink_logits.shape={tuple(sink_logits.shape)} does '
+            f'not match the expected {(nh,)}.')
     # Degenerate case: empty sequence. With n_blocks=0 the downstream
     # ``csa_compress_kv_overlapped`` cannot broadcast the [B, n_blocks, m, c]
     # reshape against the [m, c] positional bias (``Expected size 0 but got
