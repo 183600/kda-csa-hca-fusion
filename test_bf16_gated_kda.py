@@ -204,6 +204,26 @@ def test_gated_attention_mixin_init_semantics():
             f'max diff from 1: {(gate_val - 1.0).abs().max().item():.3f}')
 
 
+def test_gated_attention_mixin_rejects_invalid_geometry():
+    print('\nTest: GatedAttentionMixin geometry validation')
+    for gate_type, gate_dim, num_heads in (
+            ('per_head', 0, 4),
+            ('per_channel', 0, 4),
+            ('per_channel', 4, 0),
+            ('per_channel', True, 4),
+            ('bogus', 4, 4)):
+        raised = False
+        try:
+            _TestAttention(gate_type, gate_dim, num_heads)
+        except ValueError:
+            raised = True
+        _ok(f'{gate_type}/{gate_dim}/{num_heads} rejected', raised, '')
+    # 'none' has no gate tensor, so unused geometry is accepted (mirrors
+    # create_gate's early return).
+    _TestAttention('none', 0, 0)
+    _ok('none accepts unused geometry', True, '')
+
+
 def test_gated_attention_functional():
     print('\nTest: apply_gate_fn / create_gate functional forms')
     x = torch.randn(2, 10, 4, 32)
@@ -380,6 +400,7 @@ if __name__ == '__main__':
     test_gated_attention_mixin_shapes()
     test_gated_attention_mixin_gradient_flow()
     test_gated_attention_mixin_init_semantics()
+    test_gated_attention_mixin_rejects_invalid_geometry()
     test_gated_attention_functional()
 
     test_gated_delta_rule_forward()

@@ -43,6 +43,18 @@ class GatedAttentionMixin:
             gate_dim: dimension of the gated axis (K for keys, V for values)
             num_heads: number of heads (H for Q/K, HV for V)
         """
+        if gate_type not in ('none', 'per_head', 'per_channel'):
+            raise ValueError(
+                f"gate_type={gate_type!r} must be 'none', 'per_head', or "
+                f"'per_channel'")
+        # 'none' has no gate tensor, so its geometry arguments are unused
+        # (mirroring ``create_gate``'s early return). A real gate must have
+        # positive integer dimensions: zero/negative entries created a
+        # zero-length parameter that only failed later, deep inside
+        # ``apply_gate``.
+        if gate_type != 'none':
+            gate_dim = _require_positive_int('gate_dim', gate_dim)
+            num_heads = _require_positive_int('num_heads', num_heads)
         self.gate_type = gate_type
         self.gate_dim = gate_dim
         self.num_heads = num_heads
@@ -59,9 +71,10 @@ class GatedAttentionMixin:
             self.register_parameter(
                 '_gate', nn.Parameter(torch.ones(num_heads, gate_dim))
             )
-        else:
+        else:  # pragma: no cover - validated above
             raise ValueError(
-                f"gate_type={gate_type!r} must be 'none', 'per_head', or 'per_channel'"
+                f"gate_type={gate_type!r} must be 'none', 'per_head', or "
+                f"'per_channel'"
             )
 
     def apply_gate(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
