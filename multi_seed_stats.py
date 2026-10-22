@@ -285,7 +285,13 @@ def _safe_median(values):
     ordered = sorted(values)
     if n % 2:
         return ordered[n // 2]
-    mid = ordered[n // 2 - 1] / 2.0 + ordered[n // 2] / 2.0
+    a, b = ordered[n // 2 - 1], ordered[n // 2]
+    mid = (a + b) / 2.0
+    if math.isfinite(mid):
+        return mid
+    # Same midpoint without the overflowing intermediate sum. This branch
+    # is reached only for two same-sign finite values near the float max.
+    mid = a / 2.0 + b / 2.0
     if not math.isfinite(mid):
         raise ValueError(
             'median is not finite after overflow-safe midpoint')
