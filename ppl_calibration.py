@@ -359,9 +359,25 @@ def default_scenarios(*, small_n_units: int = 12) -> dict:
       as mildly liberal at 12 units), plus power at ``delta`` in
       {0.10, 0.20} with pre-registered floors {0.55, 0.90} (a power
       analysis at this geometry measured ~0.67 and ~1.00).
+
+    The tolerance breakpoint is ``n_units >= 32``, matching the
+    pre-registered exp15 row contract in ``results_schema``. A caller
+    that places the "small" geometry at or above that breakpoint gets the
+    moderate tolerances (the small-sample justification no longer
+    applies); the two scenario roles must also stay distinct, so the
+    small geometry must be below the fixed moderate one (40 units).
     """
     small_n_units = _require_int(small_n_units, 'small_n_units', minimum=2)
-    cov_tol_mid, cov_tol_small = 0.05, 0.08
+    if small_n_units >= 40:
+        raise ValueError(
+            f'small_n_units={small_n_units} must be < 40 (the moderate '
+            'scenario uses 40 units); otherwise the two protocol roles '
+            'would describe the same geometry.')
+    small_sample = small_n_units < 32
+    cov_tol_mid = 0.05
+    cov_tol_small = 0.08 if small_sample else cov_tol_mid
+    paired_size_tol_mid = 0.06
+    paired_size_tol_small = 0.10 if small_sample else paired_size_tol_mid
     coverage = [
         {'n_units': 40, 'alpha': 0.10, 'tol': cov_tol_mid},
         {'n_units': 40, 'alpha': 0.05, 'tol': cov_tol_mid},
@@ -370,9 +386,9 @@ def default_scenarios(*, small_n_units: int = 12) -> dict:
     ]
     paired = [
         {'n_units': 40, 'alpha': 0.10, 'delta': 0.0, 'check': 'size',
-         'tol': 0.06},
+         'tol': paired_size_tol_mid},
         {'n_units': small_n_units, 'alpha': 0.10, 'delta': 0.0,
-         'check': 'size', 'tol': 0.10},
+         'check': 'size', 'tol': paired_size_tol_small},
         {'n_units': 40, 'alpha': 0.10, 'delta': 0.10, 'check': 'power',
          'min_power': 0.55},
         {'n_units': 40, 'alpha': 0.10, 'delta': 0.20, 'check': 'power',

@@ -164,6 +164,37 @@ def test_simulation_contract_and_rng_isolation():
     assert rows_a == rows_b
 
 
+def test_default_scenarios_tolerances_follow_the_exp15_contract():
+    """A caller-chosen small geometry must produce contract-valid rows.
+
+    The row contract pins tolerance breakpoints at ``n_units >= 32``. The
+    scenario builder used to keep the small-sample tolerances (0.08 / 0.10)
+    for every ``small_n_units``, so ``small_n_units=32`` produced a
+    certificate that ``write_checked`` rejected. It must now follow the
+    same breakpoint (and reject a geometry that collides with the fixed
+    40-unit moderate set).
+    """
+    from results_schema import ROW_CONTRACTS
+
+    contract = ROW_CONTRACTS['exp15_ppl_calibration']
+    for small_n_units in (12, 31, 32, 39):
+        scenarios = PC.default_scenarios(small_n_units=small_n_units)
+        coverage = PC.coverage_study(
+            scenarios['coverage'][2:], reps=2, n_boot=4, seed=0)
+        paired = PC.paired_study(
+            scenarios['paired'][1:2], reps=2, n_boot=4, seed=0)
+        violations = contract(coverage + paired, {})
+        assert violations == [], (small_n_units, violations)
+    for bad in (2.5, True, 40, 64):
+        try:
+            PC.default_scenarios(small_n_units=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'default_scenarios accepted small_n_units={bad!r}')
+
+
 def test_calibration_report_is_calibrated_and_self_consistent():
     report = PC.calibration_report(
         reps=TEST_REPS, n_boot=TEST_NBOOT, seed=0)
