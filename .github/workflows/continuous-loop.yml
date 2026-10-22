@@ -271,7 +271,7 @@ jobs:
           PERF_TIMEOUT=$((3*3600))     # 3h
           BUG_TIMEOUT=$((3*3600))      # 3h
           SCI_TIMEOUT=$((3*3600))      # 3h
-          SINGLE_TIMEOUT=$((3600))     # 1h（单因素实验检查）
+          SINGLE_TIMEOUT=$((3600))     # 1h（并入 sci 的单因素实验检查）
           IMPROVE_TIMEOUT=$((3*3600))  # 3h
           CLEAN_TIMEOUT=$((3*3600))    # 3h
 
@@ -916,9 +916,9 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci -> single -> improve(xuen)（clean 的清理工作交给收尾的 shell 步骤）-----
-            # for phase in perf bug sci single improve clean; do
-            for phase in bug sci single improve; do
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（含单因素检查）-> improve(xuen)（clean 的清理工作交给收尾的 shell 步骤）-----
+            # for phase in perf bug sci improve clean; do
+            for phase in bug sci improve; do
               case "$phase" in
                 perf)    P="$PROMPT_PERF";    T="$PERF_TIMEOUT"    ;;
                 bug)     P="$PROMPT_BUG";     T="$BUG_TIMEOUT"     ;;
@@ -936,7 +936,6 @@ jobs:
                   T="$SCI_TIMEOUT"
                   echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
                 ;;
-                single) P="$PROMPT_SINGLE"; T="$SINGLE_TIMEOUT" ;;
                 improve) P="$TASK_IMPROVE";   T="$IMPROVE_TIMEOUT" ;;
                 clean)   P="$PROMPT_CLEAN";   T="$CLEAN_TIMEOUT"   ;;
               esac
@@ -956,6 +955,12 @@ jobs:
               PHASE_BASE="$(git rev-parse HEAD)"
               run_phase "$phase" "$P" "$T"
 
+              # 单因素实验检查并入 sci：同一次 sci 阶段内追加一次调用
+              if [ "$phase" = "sci" ]; then
+                echo ">>> iteration #$i | phase=sci-single | budget=${SINGLE_TIMEOUT}s（并入 sci）"
+                run_phase "sci-single" "$PROMPT_SINGLE" "$SINGLE_TIMEOUT"
+              fi
+
               # ---- 质量门禁：通过才提交；不通过则整段撤销 ----
               if gate_check; then
                 commit_and_push "$i-$phase"
@@ -963,9 +968,9 @@ jobs:
                 reject_phase
               fi
 
-              # ⭐ 测试门：写代码的阶段（bug / sci / single / improve）提交后都跑一遍全量测试，详见 maybe_run_tests
+              # ⭐ 测试门：写代码的阶段（bug / sci / improve）提交后都跑一遍全量测试，详见 maybe_run_tests
               case "$phase" in
-                bug|sci|single|improve) maybe_run_tests "$i" ;;
+                bug|sci|improve) maybe_run_tests "$i" ;;
               esac
 
               sleep 5
