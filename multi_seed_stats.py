@@ -751,8 +751,11 @@ def power_at_effect(n: int, sd: float, effect: float,
     by roughly 10%, so a planned power of 0.80 is a target, not a
     promise.  Returns ``None`` when fewer than two seed pairs make the
     sample SD (and therefore the test) undefined.  A zero SD is handled
-    exactly: power is ``alpha`` for a zero effect and 1 for a non-zero
-    effect (the degenerate noiseless case).
+    exactly: power is ``alpha`` for a zero effect, 1 when a non-zero effect
+    points in the alternative's direction, and 0 when it points the other
+    way (the degenerate noiseless case).  The sign of ``effect`` therefore
+    matters for ``alternative='greater'|'less'``; a positive effect has
+    power below ``alpha`` under ``less``.
     """
     if isinstance(n, bool) or not isinstance(n, int) or n < 0:
         raise ValueError(f'n must be a non-negative int, got {n!r}')
@@ -774,14 +777,31 @@ def power_at_effect(n: int, sd: float, effect: float,
     if float(sd) == 0.0:
         if effect == 0.0:
             return float(alpha)
-        return 1.0
-    ncp = abs(effect) / (float(sd) / math.sqrt(n))
+        # A noiseless paired test rejects with probability 1 when the sign
+        # of the effect matches the one-sided alternative and with
+        # probability 0 when it points the other way.  Two-sided rejection
+        # is sign-agnostic.  Returning 1.0 unconditionally would claim
+        # full power for an effect in the WRONG direction.
+        if alternative == 'two-sided':
+            return 1.0
+        if alternative == 'greater':
+            return 1.0 if effect > 0.0 else 0.0
+        return 1.0 if effect < 0.0 else 0.0
+    # Keep the sign for the directional alternatives: ``less`` rejects in
+    # the lower tail, so a positive effect has power BELOW alpha rather
+    # than the ``greater`` power.  The two-sided computation is symmetric
+    # and uses the magnitude.
+    ncp = effect / (float(sd) / math.sqrt(n))
     if alternative == 'two-sided':
         z_crit = _ND.inv_cdf(1.0 - alpha / 2.0)
-        power = (1.0 - _ND.cdf(z_crit - ncp)) + _ND.cdf(-z_crit - ncp)
-    else:
+        power = ((1.0 - _ND.cdf(z_crit - abs(ncp)))
+                 + _ND.cdf(-z_crit - abs(ncp)))
+    elif alternative == 'greater':
         z_crit = _ND.inv_cdf(1.0 - alpha)
         power = 1.0 - _ND.cdf(z_crit - ncp)
+    else:
+        z_crit = _ND.inv_cdf(1.0 - alpha)
+        power = _ND.cdf(-z_crit - ncp)
     return min(1.0, max(0.0, float(power)))
 
 

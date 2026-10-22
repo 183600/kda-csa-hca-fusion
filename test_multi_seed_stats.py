@@ -410,6 +410,18 @@ def test_power_at_effect_inverts_seeds_required():
     assert M.power_at_effect(1, 1.0, 1.0) is None
     assert M.power_at_effect(5, 0.0, 0.0) == pytest.approx(0.05)
     assert M.power_at_effect(5, 0.0, 1.0) == 1.0
+    # Directional power follows the SIGN of the effect.  The old magnitude-
+    # only implementation returned the ``greater`` power for ``less`` and
+    # full noiseless power for an effect pointing the wrong way.
+    assert M.power_at_effect(5, 1.0, 1.0, alternative='less') < 0.05
+    assert M.power_at_effect(5, 1.0, -1.0, alternative='less') > \
+        M.power_at_effect(5, 1.0, 1.0, alternative='less')
+    assert M.power_at_effect(5, 1.0, -1.0, alternative='greater') < 0.05
+    assert M.power_at_effect(5, 0.0, 1.0, alternative='greater') == 1.0
+    assert M.power_at_effect(5, 0.0, -1.0, alternative='greater') == 0.0
+    assert M.power_at_effect(5, 0.0, -1.0, alternative='less') == 1.0
+    assert M.power_at_effect(5, 0.0, 1.0, alternative='less') == 0.0
+    assert M.power_at_effect(5, 0.0, -1.0) == 1.0
     with pytest.raises(ValueError):
         M.power_at_effect(True, 1.0, 1.0)
     with pytest.raises(ValueError):
