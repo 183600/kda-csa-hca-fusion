@@ -58,6 +58,9 @@ from train_lm_autodl import (  # noqa: E402
     SealedTestSet,
     TinyStoriesLM,
     _FallbackCharTokenizer,
+    _probe_token_lengths,
+    _text_length_stats,
+    _texts_fingerprint,
     clean_lm_texts,
     evaluate_lm_loss,
     run_overfit_sanity_check,
@@ -560,6 +563,46 @@ def test_split_clean_texts_has_no_cross_split_overlap():
     assert not (by_split['train'] & by_split['val'])
     assert not (by_split['train'] & by_split['test'])
     assert not (by_split['val'] & by_split['test'])
+
+
+def test_token_length_probe_is_evenly_spaced_over_the_whole_split():
+    """The diagnostic probe must include the corpus tail, not stop early.
+
+    With n=300 and n_probe=256 the old ``stride = n // n_probe`` selection
+    had stride 1 and took the first 256 texts, hiding texts 256..299. The
+    fixed probe spans 0..299, so its max length and mean match the whole
+    corpus rather than the prefix.
+    """
+    tok = _FallbackCharTokenizer()
+    texts = ['x' * i for i in range(300)]
+    stats = _text_length_stats(texts, tok, seq_len=1024, n_probe=256)
+    lengths = _probe_token_lengths(texts, tok, seq_len=1024, n_probe=256)
+    assert stats['n'] == 300
+    assert stats['n_probe'] == 256
+    assert len(lengths) == 256
+    assert stats['max_tokens'] == 299
+    assert abs(stats['mean_tokens'] - 149.5) < 1.0
+    # A small split is used whole (no sampling change).
+    small = ['x' * i for i in range(10)]
+    assert len(_probe_token_lengths(small, tok, seq_len=1024,
+                                    n_probe=256)) == 10
+
+
+def test_text_fingerprint_probe_is_bounded_and_reaches_the_tail():
+    tok_texts = [f'unique story {i}' for i in range(300)]
+    fp = _texts_fingerprint(tok_texts, n_probe=64)
+    assert fp == _texts_fingerprint(list(tok_texts), n_probe=64)
+    # The last text is always sampled, so a stale shorter cache changes id.
+    assert _texts_fingerprint(tok_texts[:-1], n_probe=64) != fp
+    # Exactly ``n_probe`` evenly spaced texts are hashed: an unprobed
+    # interior text can change without changing the fingerprint.
+    changed = list(tok_texts)
+    changed[1] = 'not sampled'
+    assert _texts_fingerprint(changed, n_probe=64) == fp
+    # A short corpus hashes every text, so any edit changes the id.
+    short = ['a', 'b', 'c']
+    assert _texts_fingerprint(short, n_probe=64) != _texts_fingerprint(
+        ['a', 'b', 'changed'], n_probe=64)
 
 
 def test_clean_lm_texts_dedups_whitespace_and_unicode_variants():

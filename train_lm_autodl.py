@@ -655,6 +655,27 @@ def _filter_leaking_heldout(train_texts, val_texts, test_texts, tokenizer,
     }
 
 
+def _evenly_spaced_probe_indices(n, n_probe):
+    """At most ``n_probe`` strictly increasing indices spanning ``[0, n)``.
+
+    Unlike a fixed ``stride = n // n_probe`` walk, this always reaches the
+    LAST text and spreads the requested budget over the whole split.  The
+    old stride-then-truncate selection silently stopped early whenever
+    ``n // n_probe`` rounded down (e.g. n=300 / 256 kept texts 0..255 and
+    n=1000 / 256 kept texts 0..765), so the diagnostics under-sampled the
+    corpus tail and could miss a length shift there.
+    """
+    n = int(n)
+    n_probe = int(n_probe)
+    if n <= 0 or n_probe <= 0:
+        return []
+    if n <= n_probe:
+        return list(range(n))
+    if n_probe == 1:
+        return [0]
+    return [round(i * (n - 1) / (n_probe - 1)) for i in range(n_probe)]
+
+
 def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
     """Descriptive token-length stats for ONE split (reporting only).
 
@@ -668,11 +689,7 @@ def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
         return {'n': 0, 'n_probe': 0, 'mean_tokens': None,
                 'std_tokens': None, 'min_tokens': None, 'max_tokens': None,
                 'cap_frac': None, 'unk_rate': None}
-    if n <= n_probe:
-        probe = list(texts)
-    else:
-        stride = max(1, n // n_probe)
-        probe = [texts[i] for i in range(0, n, stride)][:n_probe]
+    probe = [texts[i] for i in _evenly_spaced_probe_indices(n, n_probe)]
     lengths, unk, total = [], 0, 0
     unk_id = getattr(tokenizer, 'unk_token_id', None)
     for text in probe:
@@ -716,11 +733,7 @@ def _probe_token_lengths(texts, tokenizer, seq_len, *, n_probe=256):
     n = len(texts)
     if n == 0:
         return []
-    if n <= n_probe:
-        probe = list(texts)
-    else:
-        stride = max(1, n // n_probe)
-        probe = [texts[i] for i in range(0, n, stride)][:n_probe]
+    probe = [texts[i] for i in _evenly_spaced_probe_indices(n, n_probe)]
     lengths = []
     for text in probe:
         try:
@@ -1824,22 +1837,12 @@ def _texts_fingerprint(texts, n_probe=64, max_chars_per_text=4096):
     without hashing gigabytes on every launch.
     """
     n = len(texts)
+    indices = _evenly_spaced_probe_indices(n, n_probe)
     h = hashlib.sha256()
     h.update(
-        f"n={n};probe={min(n, n_probe)};max_chars={max_chars_per_text}".encode())
-    if n:
-        stride = max(1, n // max(1, n_probe))
-        seen = 0
-        for i in range(0, n, stride):
-            if seen >= n_probe:
-                break
-            h.update(str(texts[i])[:max_chars_per_text].encode(
-                'utf-8', 'replace'))
-            seen += 1
-        # Always include the last sample so a truncation of the corpus (e.g.
-        # a shorter stale cache) changes the fingerprint even if the stride
-        # sample happens to coincide.
-        h.update(str(texts[-1])[:max_chars_per_text].encode(
+        f"n={n};probe={len(indices)};max_chars={max_chars_per_text}".encode())
+    for i in indices:
+        h.update(str(texts[i])[:max_chars_per_text].encode(
             'utf-8', 'replace'))
     return h.hexdigest()
 
