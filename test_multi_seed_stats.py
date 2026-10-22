@@ -552,6 +552,26 @@ def test_sample_sd_keeps_real_spread_at_a_large_offset():
     assert M.paired_t_test(const)['t_stat'] is None
 
 
+def test_sample_sd_keeps_a_one_unit_spread_at_1e15():
+    """A ULP-scale clamp must not zero a real spread at a huge offset.
+
+    ``1e15 + 1`` is exactly representable, so ``[1e15, 1e15 + 1]`` has a
+    genuine sample SD of ``sqrt(0.5)``. An epsilon proportional to the
+    ABSOLUTE value (the previous 8-ULP clamp) reported zero variance and
+    made every paired statistic undefined; only an exactly constant vector
+    is numerically zero-variance.
+    """
+    flat = [1e15, 1e15 + 1.0]
+    mean = sum(flat) / len(flat)
+    sd = M._sample_sd(flat, mean)
+    assert sd == pytest.approx(math.sqrt(0.5))
+    assert M.cohens_dz(flat) == pytest.approx(mean / math.sqrt(0.5))
+    t = M.paired_t_test(flat)
+    assert t['sd_diff'] == pytest.approx(math.sqrt(0.5))
+    assert t['t_stat'] is not None
+    assert t['p_value'] is not None
+
+
 def test_summarize_paired_without_margin_has_no_equivalence_claim():
     # Backward compatibility: without a pre-specified margin there must be
     # no TOST block and no equivalence verdict -- a non-significant test

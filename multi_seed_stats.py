@@ -98,7 +98,6 @@ from __future__ import annotations
 
 import math
 import random
-import sys
 from statistics import NormalDist
 
 __all__ = [
@@ -299,12 +298,11 @@ def _safe_median(values):
 
 
 # Numerical-zero rule: a difference vector whose entries are all the same
-# float has exactly zero sample variance. For last-ulp differences, the
-# variance residue is at the scale of the values' floating-point resolution,
-# so clamp only when it is within a few ULPs of the ABSOLUTE magnitude. Do
-# NOT use a loose relative epsilon (the old 1e-12 * max|value| threshold
-# zeroed a real spread of 1 around 1e12).
-_ZERO_VAR_ULP_FACTOR = 8.0
+# float has exactly zero sample variance. Do NOT clamp a genuine non-zero
+# spread to zero based on the magnitude of the values: a per-value epsilon
+# (even a few ULPs) still zeroes a real spread of 1 around 1e15, which makes
+# the paired t-test / d_z / TOST silently undefined. Only the exactly
+# constant vector is numerically zero-variance.
 
 
 def _sample_sd(values: list[float], mean: float) -> float | None:
@@ -322,8 +320,6 @@ def _sample_sd(values: list[float], mean: float) -> float | None:
     # is multiplied back, which is value-equal up to round-off for the
     # ordinary range.
     deviations = [v - mean for v in values]
-    scale = max(abs(mean), max(abs(v) for v in values), 1.0e-300)
-    roundoff = _ZERO_VAR_ULP_FACTOR * sys.float_info.epsilon * scale
     if all(math.isfinite(x) for x in deviations):
         dev_scale = max(abs(x) for x in deviations)
         if dev_scale == 0.0:
@@ -353,8 +349,6 @@ def _sample_sd(values: list[float], mean: float) -> float | None:
         # honest "not representable" value (an ``inf`` would poison every
         # strict-JSON report).
         return None
-    if sd <= roundoff:
-        return 0.0
     return sd
 
 
