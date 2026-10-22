@@ -684,6 +684,50 @@ def test_recall_flops_accepts_tuple_layout_forms():
         str([r['n_layers'] for r in nested['rows']]))
 
 
+def test_recall_flops_audits_the_mamba2_memory_route():
+    """The recall-conditioned ledger covers both shipped memory routes.
+
+    The exact FLOPs model is route-sensitive (Mamba-2's state/projection
+    shapes differ from KDA's), so the whole-stack counter must still match
+    and the route must be explicit in the record. Mixed-route and RWKV-7
+    layouts stay rejected instead of being silently approximated.
+    """
+    import flops_audit as fa
+    import recall_flops_audit as rfa
+
+    cfg = fa.probe_config()
+    layout = ('mamba2', 'mamba2', 'mamba2', 'csa', 'hca')
+    row = rfa.audit_layout(layout, cfg=cfg, seq_len=64, measure=True)
+    _ok('Mamba-2 layout is recorded with its own route',
+        row['n_mamba2'] == 3 and row['n_kda'] == 0
+        and row['n_csa'] == 1 and row['n_hca'] == 1,
+        str([row['n_kda'], row['n_mamba2'], row['n_csa'], row['n_hca']]))
+    _ok('Mamba-2 memory share is positive and below one',
+        0.0 < row['memory_flops_fraction'] < 1.0,
+        f"{row['memory_flops_fraction']:.4f}")
+    _ok('whole-stack Mamba-2 reference FLOPs match the dispatcher',
+        row['measurement']['match_kind'] == 'exact'
+        and row['measurement']['gemm_macs'] == row['reference_gemm_macs'],
+        f"delta={row['measurement']['reference_minus_measured_macs']}")
+    _ok('Mamba-2 ratio expansion substitutes the memory kind',
+        rfa.ratio_layout(3, 1, 1, 5, memory_kind='mamba2')
+        == ('mamba2',) * 3 + ('csa', 'hca'), '')
+    mixed = False
+    try:
+        rfa.audit_layout(('kda', 'mamba2'), cfg=cfg, seq_len=32,
+                         measure=False)
+    except ValueError:
+        mixed = True
+    _ok('mixed memory routes are rejected', mixed, '')
+    rwkv = False
+    try:
+        rfa.audit_layout(('rwkv7', 'csa', 'hca'), cfg=cfg, seq_len=32,
+                         measure=False)
+    except ValueError:
+        rwkv = True
+    _ok('RWKV-7 is still rejected (no exact model)', rwkv, '')
+
+
 def test_report_materializes_one_shot_inputs():
     """Generators are valid grid inputs; empty trained seeds fail clearly."""
     report = R.run_recall_report(

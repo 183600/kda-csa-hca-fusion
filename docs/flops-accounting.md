@@ -51,8 +51,9 @@ under the counter, and reports:
 The recurrent path is also special: `(k * S).sum(-2)` and the outer-product
 update are **elementwise broadcast-reduce**, not GEMMs. They are real work
 (`2 * T * HV * K * V` MACs) that no dispatcher-based counter sees, so
-`kda_reference_gemm_macs + kda_broadcast_encoded_macs ==
-kda_executed_flops` is the identity pinned by the tests.
+`2 * (kda_reference_gemm_macs + kda_broadcast_encoded_macs) ==
+kda_executed_flops` is the identity pinned by the tests (the MAC counts are
+converted to FLOPs exactly once).
 
 ## Exact reference model
 

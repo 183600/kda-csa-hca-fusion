@@ -78,7 +78,7 @@ The default geometry is `flops_audit.probe_config()` (`d_model=64`,
 ## Example result (probe geometry, `seq_len=128`)
 
 ```
-                 group   L     GFLOPs    KDA%  far reach% struct far%      measure
+                 group   L     GFLOPs    mem%  far reach% struct far%      measure
 ----------------------------------------------------------------------------------
            alternating  10     0.1415   93.7%       5.64%      96.43%        exact
         retrieval_back  10     0.1415   93.7%       5.64%      96.43%        exact
@@ -88,6 +88,10 @@ The default geometry is `flops_audit.probe_config()` (`d_model=64`,
            ratio-1:2:2  10     0.0620   71.2%      25.74%      96.43%        exact
            ratio-1:0:0  10     0.2210  100.0%       0.00%       0.00%        exact
            ratio-0:1:1  10     0.0223    0.0%      89.50%      96.43%        exact
+
+`mem%` is the share of GEMM FLOPs in recurrent memory layers (KDA or
+Mamba-2, whichever route the audited layout uses). The same ratio on the
+Mamba-2 route is available via `--memory-route mamba2`.
 ```
 
 The four interleaving presets have identical per-kind counts, so they tie by
