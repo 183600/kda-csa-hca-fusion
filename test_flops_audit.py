@@ -197,6 +197,16 @@ def test_csa_exact_model(device):
             f'measured={row["reference_gemm_macs"]}')
 
 
+def test_csa_topk1_folded_value_term_is_not_charged(device):
+    cfg = _cfg(csa_topk=1)
+    for T in (17, 64, 100):
+        row = fa.audit_layer('csa', cfg, T, device=device)
+        assert row['model_matches_measurement'], (
+            f'T={T}: model={row["reference_model_macs"]} '
+            f'measured={row["reference_gemm_macs"]} '
+            f'diff={row["model_minus_measured_macs"]}')
+
+
 def test_hca_exact_model(device):
     cfg = _cfg()
     for T in (96, 128, 100):

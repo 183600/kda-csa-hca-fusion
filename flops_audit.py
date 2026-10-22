@@ -551,6 +551,11 @@ def csa_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
                 + Tp * d * nIh + T * nh * c * d)
     indexer = B * (Tp * nb * cI * nIh + Tp * nb * nIh)
     core = B * 2 * Tp * topk * c * nh if nb > 0 else 0
+    if nb > 0 and topk == 1:
+        # With a one-column gather PyTorch folds the value contraction
+        # into a mul+sum, exactly like HCA's single compressed block, so
+        # one Tp*c*nh GEMM term is not dispatched.
+        core -= B * Tp * c * nh
     window = B * 2 * Tp * sw * c * nh if sw > 0 else 0
     return proj + indexer + core + window
 
