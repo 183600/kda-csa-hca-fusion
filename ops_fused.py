@@ -468,7 +468,8 @@ class HybridConfig:
         # is independent of which KDA path is taken). Streaming-decode callers
         # should leave kda_chunk_size at its default if they want chunked
         # training, OR set it to 0 to force the recurrent path during decode.
-        if not isinstance(self.kda_chunk_size, int):
+        if (isinstance(self.kda_chunk_size, bool)
+                or not isinstance(self.kda_chunk_size, int)):
             raise ValueError(
                 f"kda_chunk_size={self.kda_chunk_size!r} must be an int "
                 f"(>= 1 enables the chunk path; <= 0 forces the recurrent "
@@ -578,7 +579,8 @@ class HybridConfig:
         # and silently poison the entire recurrence. A negative scale
         # would invert the decay sign (making g positive -> exp(g) > 1
         # -> state explosion), which is never a meaningful configuration.
-        if not isinstance(self.kda_decay_scale, (int, float)):
+        if (isinstance(self.kda_decay_scale, bool)
+                or not isinstance(self.kda_decay_scale, (int, float))):
             raise ValueError(
                 f"kda_decay_scale={self.kda_decay_scale!r} must be a number.")
         if not math.isfinite(self.kda_decay_scale):
@@ -642,14 +644,27 @@ class HybridConfig:
             ('csa_qk_norm_mode', self.csa_qk_norm_mode),
             ('hca_qk_norm_mode', self.hca_qk_norm_mode),
         ]:
-            if val not in ('l2', 'rms'):
+            if not isinstance(val, str) or val not in ('l2', 'rms'):
                 raise ValueError(
                     f"HybridConfig.{name}={val!r} must be 'l2' or 'rms'.")
+        # ``init_std`` seeds every learnable positional bias (Ba / Bb /
+        # B_idx / B_pos) with ``torch.randn(...) * init_std``. A negative
+        # std raises deep inside torch at stack-build time, while NaN
+        # silently poisons every bias (and the resulting model); validate
+        # it with the rest of the numeric config here.
+        if (isinstance(self.init_std, bool)
+                or not isinstance(self.init_std, (int, float))
+                or not math.isfinite(self.init_std)
+                or self.init_std < 0):
+            raise ValueError(
+                f"HybridConfig.init_std={self.init_std!r} must be a finite "
+                f"non-negative number.")
         # --- Memory route (KDA / Mamba-2) + explicit layout -------------
         # Validated at config creation (fail before any parameters are
         # allocated), mirroring the kda_backend validation above. The
         # optional mamba_ssm import stays lazy inside ops_mamba_backend.
-        if self.memory_type not in MEMORY_LAYER_KINDS:
+        if (not isinstance(self.memory_type, str)
+                or self.memory_type not in MEMORY_LAYER_KINDS):
             raise ValueError(
                 f"HybridConfig.memory_type={self.memory_type!r} must be "
                 f"one of {MEMORY_LAYER_KINDS}. This field selects the "
@@ -1327,7 +1342,8 @@ class HybridAttentionStack(nn.Module):
         # then has zero layers and ``forward`` is a no-op (returns the
         # input unchanged) — a silently broken model with no diagnostic.
         # total_layers == 0 IS a valid (if useless) no-op and is allowed.
-        if not isinstance(total_layers, int) or total_layers < 0:
+        if (isinstance(total_layers, bool)
+                or not isinstance(total_layers, int) or total_layers < 0):
             raise ValueError(
                 f"total_layers={total_layers!r} must be a non-negative int "
                 f"(0 produces an empty no-op model; use >= 1 for a real model)."

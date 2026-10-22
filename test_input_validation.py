@@ -227,6 +227,54 @@ def test_kda_chunk_size_requires_an_exact_positive_int():
         raise AssertionError('KDA chunk_size=0 was silently accepted')
 
 
+def test_hybrid_config_rejects_coerced_and_nonfinite_fields():
+    """Numeric/typed config fields fail at construction, not deep in torch.
+
+    ``init_std`` is multiplied into every positional bias; a negative value
+    used to fail inside ``torch.randn`` at stack-build time, while NaN
+    silently poisoned the biases. ``kda_chunk_size``/``kda_decay_scale``
+    accepted ``True`` as 1/1.0, and the string-membership fields raised a
+    bare ``TypeError`` for a list. All are actionable ``ValueError``/config
+    errors now, and the valid values still work.
+    """
+    from ops_fused import HybridAttentionStack, HybridConfig
+
+    base = dict(d_model=8, n_heads_qk=1, n_heads_v=1, head_dim_k=2,
+                head_dim_v=2)
+    HybridConfig(**base, init_std=0.0, kda_chunk_size=0)
+    cases = (
+        {'init_std': float('nan')},
+        {'init_std': float('inf')},
+        {'init_std': -0.1},
+        {'init_std': True},
+        {'kda_chunk_size': True},
+        {'kda_decay_scale': True},
+        {'memory_type': []},
+        {'csa_qk_norm_mode': []},
+        {'hca_qk_norm_mode': {}},
+    )
+    for patch in cases:
+        try:
+            HybridConfig(**base, **patch)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'HybridConfig {patch} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'HybridConfig {patch} rejected', False, 'no error raised')
+
+    try:
+        HybridAttentionStack(HybridConfig(**base), total_layers=True)
+    except ValueError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        raise AssertionError(
+            f'total_layers=True raised {type(exc).__name__}: {exc}')
+    else:
+        raise AssertionError('total_layers=True was silently accepted')
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -318,4 +366,5 @@ if __name__ == '__main__':
     test_kda_chunk_size_requires_an_exact_positive_int()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
+    test_hybrid_config_rejects_coerced_and_nonfinite_fields()
     print('all input-validation tests passed')
