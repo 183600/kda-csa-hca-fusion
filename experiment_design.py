@@ -664,7 +664,13 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         required = max(2, int(required))
     mde = min_detectable_effect(n_seeds, sd_value, alpha=planning_alpha,
                                 power=target, alternative=alt)
-    achieved = power_at_effect(n_seeds, sd_value, sesoi_value,
+    # The SESOI is a magnitude.  For a lower-tail alternative the effect that
+    # the plan is powered against points DOWN, while for 'greater' and the
+    # symmetric two-sided test it points up.  Passing the positive magnitude
+    # to a directional power calculation would make every 'less' plan look
+    # powerless even when the seed budget is ample.
+    planning_effect = (-sesoi_value if alt == 'less' else sesoi_value)
+    achieved = power_at_effect(n_seeds, sd_value, planning_effect,
                                alpha=planning_alpha, alternative=alt)
     if required is None:
         status = 'not_estimable'

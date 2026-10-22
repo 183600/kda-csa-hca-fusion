@@ -130,6 +130,20 @@ def test_two_sided_planning_applies_bonferroni_once():
     assert rep['planned_power'] == pytest.approx(expected_power)
 
 
+def test_lower_tail_planning_aims_the_sesoi_downward():
+    # SESOI is a magnitude.  Under a 'less' alternative the effect being
+    # powered is -SESOI, so the planned power must match the 'greater'
+    # mirror image instead of collapsing to ~0.
+    plan = D.get_plan('exp4_mqar')
+    greater = D.planning_report(plan, alternative='greater')
+    less = D.planning_report(plan, alternative='less')
+    assert less['alpha_per_test'] == pytest.approx(greater['alpha_per_test'])
+    assert less['required_seeds'] == greater['required_seeds']
+    assert less['planned_mde'] == pytest.approx(greater['planned_mde'])
+    assert less['planned_power'] == pytest.approx(greater['planned_power'])
+    assert less['status'] == 'confirmatory_ready'
+
+
 def test_planning_rejects_invalid_overrides():
     plan = D.get_plan('exp4_mqar')
     with pytest.raises(D.DesignError):
