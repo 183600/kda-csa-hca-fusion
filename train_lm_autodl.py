@@ -414,7 +414,8 @@ def _validated_token_ids(ids):
     Objects implementing ``__index__`` (NumPy / torch integer scalars) are
     accepted; floats and bools are not.
     """
-    if isinstance(ids, (str, bytes, Mapping, Set)):
+    if isinstance(ids, (str, bytes, bytearray, memoryview,
+                        Mapping, Set)):
         # A mapping iterates over its keys and a set has no stable order;
         # neither is a token-id sequence.
         raise ValueError('tokenizer returned a non-sequence token container')
@@ -1403,14 +1404,36 @@ def _unigram_shift_stats(fit_documents, eval_documents, *,
       distributions, in [0, 1].
     """
     max_examples = _exact_int_arg('max_examples', max_examples, minimum=0)
+    fit_documents = list(fit_documents)
+    eval_documents = list(eval_documents)
     if not fit_documents or not eval_documents:
         return None
-    fit_counts: Counter = Counter()
-    for document in fit_documents:
-        fit_counts.update(document)
-    eval_counts: Counter = Counter()
-    for document in eval_documents:
-        eval_counts.update(document)
+
+    def _accumulate(documents, where):
+        counts: Counter = Counter()
+        for index, document in enumerate(documents):
+            if not isinstance(document, Mapping):
+                raise ValueError(
+                    f'{where}[{index}] must be a token-id -> count mapping')
+            for token_id, count in document.items():
+                if (isinstance(token_id, bool)
+                        or not isinstance(token_id, numbers.Integral)
+                        or int(token_id) < 0
+                        or int(token_id) > _MAX_TOKEN_ID):
+                    raise ValueError(
+                        f'{where}[{index}] has an invalid token id: '
+                        f'{token_id!r}')
+                if (isinstance(count, bool)
+                        or not isinstance(count, numbers.Integral)
+                        or int(count) < 0):
+                    raise ValueError(
+                        f'{where}[{index}] has an invalid token count for '
+                        f'id {token_id!r}: {count!r}')
+                counts[int(token_id)] += int(count)
+        return counts
+
+    fit_counts = _accumulate(fit_documents, 'fit_documents')
+    eval_counts = _accumulate(eval_documents, 'eval_documents')
     fit_total = sum(fit_counts.values())
     eval_total = sum(eval_counts.values())
     if fit_total <= 0 or eval_total <= 0:

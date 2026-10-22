@@ -273,7 +273,8 @@ def test_nonfinite_classification_handles_huge_ints_and_decimals():
 
 def test_near_duplicate_token_ids_are_not_silently_coerced():
     for bad in ([1.0, 2.0], [True, 2], [-1, 2], [2 ** 64, 1],
-                {1: 'x'}, {1, 2},
+                {1: 'x'}, {1, 2}, bytearray(b'\x01\x02'),
+                memoryview(b'\x01\x02'),
                 'not ids', np.array([1.0, 2.0]), np.array([True, False])):
         try:
             near_duplicate_pairs([[1, 2, 3, 4], bad], threshold=1.0)
@@ -493,3 +494,18 @@ def test_length_and_fingerprint_probes_accept_text_iterators():
     assert stats['n'] == 2 and stats['n_probe'] == 2
     assert _probe_token_lengths((t for t in texts), tok, 64) == [3, 5]
     assert _texts_fingerprint((t for t in texts)) == _texts_fingerprint(texts)
+
+
+def test_unigram_counts_must_be_exact_non_negative_integers():
+    from collections import Counter
+    from train_lm_autodl import _unigram_shift_stats
+    for fit, evl in (([Counter({1: 1.5})], [Counter({2: 2.5})]),
+                     ([Counter({1: float('nan')})], [Counter({2: 1})]),
+                     ([Counter({1: -1})], [Counter({2: 1})]),
+                     ([Counter({1: True})], [Counter({2: 1})])):
+        try:
+            _unigram_shift_stats(fit, evl, max_examples=2)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'malformed counters accepted: {fit!r}')

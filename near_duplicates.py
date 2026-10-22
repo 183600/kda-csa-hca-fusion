@@ -151,7 +151,8 @@ def _as_ids(token_ids: Sequence[int] | None) -> np.ndarray:
             raise ValueError('token ids must be integers, not bools')
         raw = list(values.reshape(-1))
     else:
-        if isinstance(token_ids, (str, bytes, Mapping, Set)):
+        if isinstance(token_ids, (str, bytes, bytearray, memoryview,
+                                  Mapping, Set)):
             raise ValueError(
                 'token ids must be an ordered sequence of integers')
         try:
@@ -399,7 +400,8 @@ def _pair_indices(row, where: str) -> tuple[int, int]:
     float / bool / string index is a malformed row rather than something
     to coerce.
     """
-    if isinstance(row, (str, bytes, Mapping, Set)):
+    if isinstance(row, (str, bytes, bytearray, memoryview,
+                        Mapping, Set)):
         # A mapping/set has a length but no positional fields; iterating it
         # would silently use keys/values as the two document indices.
         raise ValueError(f'{where}: malformed near-duplicate pair: {row!r}')
