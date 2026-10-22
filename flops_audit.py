@@ -218,10 +218,25 @@ class _GemmAuditMode(TorchDispatchMode):
             if macs is not None:
                 self.macs_by_op[name] = self.macs_by_op.get(name, 0) + macs
         elif name == 'aten::linalg_solve_triangular':
-            a = args[1]
-            n = a.shape[-1]
-            systems = a.numel() // (n * n)
-            self.trsm_macs += systems * n * n * (n - 1) // 2
+            # Schema: solve_triangular(A, B, upper, left=True,
+            # unitriangular=False). ``args[0]`` is the triangular A;
+            # ``args[1]`` is the right-hand side B. The old code read B
+            # as the triangular matrix, so a rectangular RHS (an N x K
+            # solve, the general case) used K as N and miscounted the
+            # number of systems. Derive N from A and count one full
+            # forward/back substitution per RHS column.
+            tri, rhs = args[0], args[1]
+            n = int(tri.shape[-1])
+            if n > 1:
+                left = (args[3] if len(args) > 3
+                        else kwargs.get('left', True))
+                k = int(rhs.shape[-1] if left else rhs.shape[-2])
+                if k > 0:
+                    batch = torch.broadcast_shapes(
+                        tuple(tri.shape[:-2]), tuple(rhs.shape[:-2]))
+                    systems = math.prod(batch) if batch else 1
+                    self.trsm_macs += (
+                        int(systems) * n * (n - 1) // 2 * k)
             self.trsm_calls += 1
         label = SPECIAL_OPS.get(name)
         if label is not None:

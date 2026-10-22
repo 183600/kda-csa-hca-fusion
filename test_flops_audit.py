@@ -422,3 +422,14 @@ def test_online_softmax_validation():
     empty = torch.randn(1, 2, 0, 3)
     with pytest.raises(ValueError):
         osf.online_softmax_attention(q, empty, empty)
+
+
+def test_counter_counts_rectangular_triangular_solve_rhs():
+    """``solve_triangular(A, B)`` counts N from A, columns from B."""
+    a = torch.randn(2, 8, 8).tril()
+    b = torch.randn(2, 8, 3)
+    ledger = _count(lambda: torch.linalg.solve_triangular(
+        a, b, upper=False, unitriangular=True))
+    # 2 batched systems * (8*7/2 MACs per column) * 3 RHS columns.
+    assert ledger.trsm_calls == 1
+    assert ledger.trsm_macs == 2 * (8 * (8 - 1) // 2) * 3
