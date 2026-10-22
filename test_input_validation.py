@@ -196,6 +196,37 @@ def test_csa_decode_step_validates_indexer_operands():
             _ok(f'{name} rejected', False, f'{type(exc).__name__}: {exc}')
 
 
+def test_kda_chunk_size_requires_an_exact_positive_int():
+    """A bool / float / string chunk size must fail before slicing."""
+    from ops_kda import naive_chunk_kda
+
+    B, T, H, K, HV, V = 1, 3, 1, 2, 1, 2
+    q = torch.randn(B, T, H, K)
+    k = torch.randn(B, T, H, K)
+    v = torch.randn(B, T, HV, V)
+    g = -torch.rand(B, T, HV, K)
+    beta = torch.rand(B, T, HV)
+    naive_chunk_kda(q, k, v, g, beta, chunk_size=2)  # valid contract
+
+    for bad in (True, 1.5, '2'):
+        try:
+            naive_chunk_kda(q, k, v, g, beta, chunk_size=bad)
+        except TypeError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'KDA chunk_size {bad!r} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'KDA chunk_size {bad!r} rejected', False,
+                'no error raised')
+    try:
+        naive_chunk_kda(q, k, v, g, beta, chunk_size=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('KDA chunk_size=0 was silently accepted')
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -284,6 +315,7 @@ if __name__ == '__main__':
     test_online_softmax_rejects_non_boolean_mask()
     test_decoding_cache_to_rejects_non_float_storage_dtype()
     test_csa_decode_step_validates_indexer_operands()
+    test_kda_chunk_size_requires_an_exact_positive_int()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     print('all input-validation tests passed')

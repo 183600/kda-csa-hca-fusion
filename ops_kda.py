@@ -211,11 +211,19 @@ def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None,
         raise ValueError(f"{fn_name}: K={K} must be >= 1")
     if V < 1:
         raise ValueError(f"{fn_name}: V={V} must be >= 1")
-    if chunk_size is not None and chunk_size < 1:
-        raise ValueError(
-            f"{fn_name}: chunk_size={chunk_size} must be >= 1 "
-            f"(would cause ZeroDivisionError in T // chunk_size and "
-            f"(-T) % chunk_size)")
+    if chunk_size is not None:
+        # An exact int is required: ``True`` would silently mean 1, a
+        # float/string reaches ``T // chunk_size`` / ``F.pad`` and fails
+        # later with an opaque TypeError instead of naming the parameter.
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise TypeError(
+                f"{fn_name}: chunk_size={chunk_size!r} must be an int, got "
+                f"{type(chunk_size).__name__}.")
+        if chunk_size < 1:
+            raise ValueError(
+                f"{fn_name}: chunk_size={chunk_size} must be >= 1 "
+                f"(would cause ZeroDivisionError in T // chunk_size and "
+                f"(-T) % chunk_size)")
     if HV % H != 0:
         raise ValueError(
             f"{fn_name}: HV={HV} must be divisible by H={H} (GVA factor)")
