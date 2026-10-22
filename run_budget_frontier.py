@@ -37,9 +37,12 @@ Questions:
    3:1:1 hybrid as ``csa_topk`` varies (0 = sparse branch off, then 1/2/4/8),
    joined with BOTH analytic views at the same geometry: the prefill
    average (backward-compatible ``total_read_elements_per_query``) and the
-   decode-window budget over the actually decoded positions. This tests
-   whether shrinking the top-k budget actually buys latency in the
-   reference implementation.
+   decode-window budget over the actually decoded positions. Every decode
+   row carries the prefill/decode bootstrap CI95 and sample count from
+   ``run_decoding.bench_decoding``, so a small top-k latency gap is not
+   read as an ordering without its uncertainty. This tests whether
+   shrinking the top-k budget actually buys latency in the reference
+   implementation.
 3. **Quality-budget join**: if Exp 4/5/8 result files exist, each measured
    configuration is annotated with its analytic budget at the MQAR context
    (T=16), and the Exp 5 layout ranking is compared against the budget
@@ -292,8 +295,28 @@ def _decode_row(cfg, bench, topk, prefill_len, n_decode, repeats):
         'repeats': repeats,
         'layout': f'{cfg.n_kda}:{cfg.n_csa}:{cfg.n_hca}',
         'prefill_ms': bench['prefill_ms'],
+        'prefill_mean_ms': bench.get('prefill_mean_ms'),
+        'prefill_std_ms': bench.get('prefill_std_ms'),
+        'prefill_q10_ms': bench.get('prefill_q10_ms'),
+        'prefill_q90_ms': bench.get('prefill_q90_ms'),
+        'prefill_ci95_low_ms': bench.get('prefill_ci95_low_ms'),
+        'prefill_ci95_high_ms': bench.get('prefill_ci95_high_ms'),
+        'prefill_ci95_halfwidth_ms': bench.get('prefill_ci95_halfwidth_ms'),
+        'prefill_cv': bench.get('prefill_cv'),
+        'prefill_n': bench.get('prefill_n'),
         'mean_decode_ms_per_token': bench['mean_decode_ms_per_token'],
         'median_decode_ms_per_token': bench['median_decode_ms_per_token'],
+        'decode_std_ms': bench.get('decode_std_ms'),
+        'decode_q10_ms': bench.get('decode_q10_ms'),
+        'decode_q90_ms': bench.get('decode_q90_ms'),
+        'decode_ci95_low_ms': bench.get('decode_ci95_low_ms'),
+        'decode_ci95_high_ms': bench.get('decode_ci95_high_ms'),
+        'decode_ci95_halfwidth_ms': bench.get('decode_ci95_halfwidth_ms'),
+        'decode_cv': bench.get('decode_cv'),
+        'decode_n': bench.get('decode_n'),
+        'timing_ci_method': bench.get('timing_ci_method'),
+        'timing_bootstrap_reps': bench.get('timing_bootstrap_reps'),
+        'timing_ci_alpha': bench.get('timing_ci_alpha'),
         'peak_mem_MB': bench['peak_mem_MB'],
         'budget_context_T': prefill_len,
         'total_read_elements_per_query': budget['total_read_elements'],

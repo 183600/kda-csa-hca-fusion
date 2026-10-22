@@ -495,6 +495,19 @@ def test_decode_sweep_smoke():
     _ok('decode latency measured and finite',
         all(math.isfinite(r['mean_decode_ms_per_token'])
             and r['mean_decode_ms_per_token'] > 0 for r in rows), '')
+    _ok('decode rows keep the prefill/decode bootstrap CIs',
+        all(r.get('decode_ci95_low_ms') is not None
+            and r.get('decode_ci95_high_ms') is not None
+            and r.get('prefill_ci95_low_ms') is not None
+            and r.get('prefill_ci95_high_ms') is not None
+            and r.get('decode_n') == r['repeats'] * r['n_decode']
+            and r.get('prefill_n') == r['repeats'] for r in rows),
+        f"{[(r.get('decode_n'), r.get('prefill_n')) for r in rows]}")
+    _ok('CI bounds bracket the reported point medians',
+        all(r['decode_ci95_low_ms'] <= r['median_decode_ms_per_token']
+            <= r['decode_ci95_high_ms']
+            and r['prefill_ci95_low_ms'] <= r['prefill_ms']
+            <= r['prefill_ci95_high_ms'] for r in rows), '')
     by_k = {r['csa_topk']: r['total_read_elements_per_query'] for r in rows}
     _ok('budget increases from k=0 to k=2 (selected gather added)',
         by_k[2] > by_k[0], f'{by_k}')
