@@ -314,3 +314,22 @@ def test_malformed_token_ids_are_reported_not_crashed_or_coerced():
     assert cleaned['texts'] == [valid]
     assert cleaned['stats']['n_tokenize_errors'] == 0
     assert _probe_token_lengths([valid], tok, 1024) == [3]
+
+
+def test_clean_near_dup_parameters_are_validated_even_on_tiny_corpus():
+    tok = _FallbackCharTokenizer()
+    for kwargs in ({'near_dup_threshold': 0.0},
+                   {'near_dup_threshold': float('nan')},
+                   {'near_dup_shingle_size': 0},
+                   {'near_dup_num_perm': 3},
+                   {'near_dup_max_candidates': 0}):
+        for texts in ([], ['one document']):
+            try:
+                clean_lm_texts(texts, tok, seq_len=1024, dedup_near=True,
+                               **kwargs)
+            except ValueError:
+                pass
+            else:  # pragma: no cover - every invalid value must be rejected
+                raise AssertionError(
+                    f'invalid near-dup parameter accepted on {texts!r}: '
+                    f'{kwargs}')

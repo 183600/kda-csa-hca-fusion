@@ -513,7 +513,10 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
         'largest_near_duplicate_cluster': 0,
         'near_duplicate_candidates_truncated': False,
     }
-    if dedup_near and len(clean) > 1:
+    if dedup_near:
+        # Run the detector even for an empty / single-document corpus so the
+        # detector's parameter contract is enforced regardless of corpus
+        # size (an invalid threshold must not be silently recorded).
         near = near_duplicate_pairs(
             clean_ids, threshold=near_dup_threshold,
             shingle_size=near_dup_shingle_size,
