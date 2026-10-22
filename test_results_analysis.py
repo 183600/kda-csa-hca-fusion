@@ -438,6 +438,13 @@ def test_binary_ranking_metrics_rare_positive_and_ties():
         torch.tensor([float('nan'), 0.1, 0.9]),
         torch.tensor([0, 0, 1]), valid=torch.tensor([False, True, True]))
     assert allowed['n'] == 2 and allowed['recall_at_1'] == pytest.approx(1.0)
+    # The same holds for labels on excluded candidates: a masked slot must
+    # not inject a sentinel class into the binary label contract.
+    allowed_labels = binary_ranking_metrics(
+        torch.tensor([0.3, 0.1, 0.9]),
+        torch.tensor([-1, 0, 1]), valid=torch.tensor([False, True, True]))
+    assert allowed_labels['n'] == 2
+    assert allowed_labels['recall_at_1'] == pytest.approx(1.0)
 
 
 def test_tune_baseline_lr_selects_on_validation_stream():

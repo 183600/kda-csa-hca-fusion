@@ -1333,10 +1333,6 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
         raise ValueError(
             f'scores/labels length mismatch: {scores_t.numel()} vs '
             f'{labels_raw.numel()}')
-    if labels_raw.numel() and not bool(
-            ((labels_raw == 0) | (labels_raw == 1)).all().item()):
-        raise ValueError('labels must contain only 0/1 binary values')
-    labels_t = labels_raw.to(dtype=torch.bool)
     if valid is not None:
         valid_raw = torch.as_tensor(valid).reshape(-1)
         if valid_raw.numel() != scores_t.numel():
@@ -1349,7 +1345,11 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
                     f'got {valid!r}')
             valid_raw = valid_raw.to(dtype=torch.bool)
         scores_t = scores_t[valid_raw]
-        labels_t = labels_t[valid_raw]
+        labels_raw = labels_raw[valid_raw]
+    if labels_raw.numel() and not bool(
+            ((labels_raw == 0) | (labels_raw == 1)).all().item()):
+        raise ValueError('labels must contain only 0/1 binary values')
+    labels_t = labels_raw.to(dtype=torch.bool)
     if scores_t.numel() and not bool(torch.isfinite(scores_t).all().item()):
         raise ValueError('scores must be finite for the kept candidates')
 
