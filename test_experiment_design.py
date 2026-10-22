@@ -375,6 +375,22 @@ def test_audit_labels_screening_confirmatory_and_invalid_runs():
     assert reduced['claims_allowed'] == [
         'descriptive', 'paired_inference_for_tested_subset']
 
+    # A family LARGER than the pre-registered one is also not the
+    # pre-registered experiment, even when the seed budget is ample at the
+    # larger corrected alpha: the extra comparisons were not planned.
+    expanded = D.audit_run(
+        'exp4_mqar', seeds=[42 + i for i in range(100)],
+        levels={'operator': ['linear', 'softmax', 'kda']},
+        family_size=plan['planned_family_size'] + 1)
+    assert expanded['status'] == 'screening'
+    assert expanded['family_expanded'] is True
+    assert expanded['family_reduced'] is False
+    assert expanded['checks']['family_size_at_most_planned'] is False
+    assert expanded['claims_allowed'] == [
+        'descriptive', 'exploratory_inference_with_caveat']
+    assert any('exceeds the pre-registered planned_family_size' in w
+               for w in expanded['design_warnings'])
+
     missing_control = D.audit_run(
         'exp4_mqar', seeds=[42, 43, 44],
         levels={'operator': ['softmax', 'kda']}, family_size=1)

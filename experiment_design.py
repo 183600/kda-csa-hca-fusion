@@ -1312,6 +1312,8 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     planned_family = plan.get('planned_family_size')
     family_reduced = (family_size is not None
                       and family_size < int(planned_family))
+    family_expanded = (family_size is not None
+                       and family_size > int(planned_family))
     checks = {
         'seeds_present': bool(seed_list),
         'at_least_two_seeds': n_seeds >= 2,
@@ -1322,6 +1324,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         # be checked either way.
         'family_size_at_least_planned': (
             None if family_size is None else not family_reduced),
+        # None = the caller did not pass the observed family. A family LARGER
+        # than the pre-registered one is not the pre-registered experiment
+        # either: it tests extra comparisons and needs its own (larger)
+        # multiplicity correction, so it cannot be promoted to confirmatory.
+        'family_size_at_most_planned': (
+            None if family_size is None else not family_expanded),
         # None = the caller did not pass the analyzed population, so the
         # requested-seed audit is all that can be computed.
         'analysis_population_provided': population_provided,
@@ -1346,6 +1354,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             f"{equivalence['target_power']:.0%} power at a true difference "
             f"of zero; this run has {n_seeds}. Equivalence verdicts are "
             "descriptive only and must not be cited as confirmatory")
+    if family_expanded:
+        design_warnings.append(
+            f"the observed family size {family_size} exceeds the "
+            f"pre-registered planned_family_size={planned_family}; the extra "
+            "comparisons were not part of the confirmatory plan, so the run "
+            "is screening/exploratory even if its seed budget is ample")
     if not valid_seeds:
         status = 'invalid'
         claims = []
@@ -1368,6 +1382,14 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         # the tested subset and cannot borrow the full family's coverage.
         status = 'reduced_family'
         claims = ['descriptive', 'paired_inference_for_tested_subset']
+    elif family_expanded:
+        # Extra comparisons beyond the pre-registered family were added
+        # after the design was fixed. Even with enough seeds at the larger
+        # corrected alpha, this is an exploratory scan, not the registered
+        # experiment (the plan's family size and decision rule no longer
+        # describe the analysis that was run).
+        status = 'screening'
+        claims = ['descriptive', 'exploratory_inference_with_caveat']
     else:
         status = 'confirmatory'
         claims = ['descriptive', 'paired_inference_at_planned_alpha',
@@ -1394,6 +1416,7 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'family_size': family_size,
         'planned_family_size': planned_family,
         'family_reduced': family_reduced,
+        'family_expanded': family_expanded,
         'checks': checks,
         'level_checks': level_checks,
         'missing_required_levels': missing_required,
@@ -1421,10 +1444,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                 'subset of the pre-registered contrast family; report it as '
                 'a confirmatory test of that subset, not as the full '
                 'pre-registered experiment'),
-            'screening': ('the run is below the pre-registered required n; '
-                          'report the seed budget and the MDE, treat the '
-                          'result as exploratory, and do not promote it to '
-                          'a confirmatory claim without a larger run'),
+            'screening': ('the run is below the pre-registered required n '
+                          'or tests a LARGER family than the pre-registered '
+                          'one; report the seed budget and the MDE, treat '
+                          'the result as exploratory, and do not promote it '
+                          'to a confirmatory claim without a pre-registered '
+                          'run at the matching family size'),
             'incomplete_attrition': (
                 'the analyzed population is smaller than the pre-registered '
                 'seed block (or contains seeds outside it), so the reported '
