@@ -71,6 +71,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import experiment_design  # noqa: E402  (needs HERE on sys.path)
+
 
 # ---------------------------------------------------------------------------
 # Run profiles (framework design: smoke / screening / formal tiers).
@@ -140,6 +142,71 @@ def _apply_run_profile() -> str:
     else:
         print(f'[run_all] profile {profile!r}: no overrides needed')
     return profile
+
+
+def _env_seed_list(name: str, default: int) -> list[int]:
+    """Read a seed COUNT env var the way the runners do, then expand it.
+
+    The runners use ``parse_int_env`` (warn + default on a malformed value),
+    so the design manifest must use the same fallback; otherwise the plan
+    would record a budget the experiment did not use.
+    """
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        count = int(default)
+    # The runners call parse_int_env(..., min_value=1): a zero/negative
+    # seed count falls back to the default rather than running zero seeds.
+    if count < 1:
+        count = int(default)
+    return [experiment_design.DEFAULT_SEED_BASE + i for i in range(count)]
+
+
+def _write_experiment_design_manifest(profile: str) -> dict:
+    """Write the prospective design manifest; return a compact summary block.
+
+    This runs BEFORE the experiments, so the seed budget, SESOI and required
+    n are on disk independently of the numbers. A stale registry is reported
+    but does not block the pipeline: the manifest still records what the
+    run is about to do, and each runner attaches its own runtime audit.
+    """
+    design_seeds = {
+        'exp4_mqar': _env_seed_list('MQAR_SEEDS', 5),
+        'exp5_ratio': _env_seed_list('ABL_SEEDS', 7),
+        'exp5b_matrix': _env_seed_list('ABL_SEEDS', 7),
+        'exp8_mechanism': _env_seed_list('MECH_SEEDS', 5),
+    }
+    design_errors = experiment_design.validate_plans()
+    if design_errors:
+        print('[run_all] WARNING: the pre-registered design registry is '
+              'inconsistent; the manifest is still written so the run is not '
+              'blocked, but fix these before citing it:')
+        for error in design_errors:
+            print(f'  - {error}')
+    manifest = experiment_design.design_manifest(seeds_by_plan=design_seeds)
+    experiment_design.write_design_manifest(
+        'results/experiment_design.json', manifest=manifest)
+    for row in manifest['results']:
+        plan = row['planning']
+        print(f"[design] {row['plan_id']}: n={row['n_seeds']} "
+              f"required={plan['required_seeds']} "
+              f"power={plan['planned_power']} "
+              f"status={row['status']}")
+    return {
+        'path': 'results/experiment_design.json',
+        'run_profile': profile,
+        'validation_errors': design_errors,
+        'plans': {
+            row['plan_id']: {
+                'n_seeds': row['n_seeds'],
+                'status': row['status'],
+                'required_seeds': row['planning']['required_seeds'],
+                'planned_power': row['planning']['planned_power'],
+            }
+            for row in manifest['results']
+        },
+    }
 
 
 def _version_tuple(raw: str) -> tuple[int, ...]:
@@ -326,6 +393,8 @@ _EXPERIMENT_OUTPUTS = {
         'checkpoints_lm/smoke_hybrid/run_record.json'],
     'exp12_lm_softmax_smoke': [
         'checkpoints_lm/smoke_softmax/run_record.json'],
+    # Prospective design manifest written before the experiments start.
+    'experiment_design': ['results/experiment_design.json'],
 }
 
 # Result files listed in ``_EXPERIMENT_OUTPUTS`` that are NOT results_schema
@@ -343,6 +412,7 @@ _RAW_SIDE_FILES = {
     'results/exp15_ppl_calibration_provenance.json',
     'results/exp16_paired_stats_calibration_provenance.json',
     'results/exp4_overfit_gate.json',
+    'results/experiment_design.json',
     'checkpoints_lm/smoke_hybrid/run_record.json',
     'checkpoints_lm/smoke_softmax/run_record.json',
 }
@@ -626,6 +696,19 @@ def run_all(seeds=None, steps=None):
             'runs': [],
             'run_profile': profile,
         }
+
+        # Pre-registered design manifest. Written BEFORE the experiments so
+        # the seed budget, SESOI and required n are on disk independently of
+        # the numbers (a plan cannot be edited after seeing the outcome and
+        # still be pre-registered). Each runner also attaches its own
+        # runtime audit to its result metadata.
+        try:
+            summary['experiment_design'] = \
+                _write_experiment_design_manifest(profile)
+        except Exception as exc:  # planning must never block the experiments
+            print(f'[run_all] WARNING: could not write the experiment '
+                  f'design manifest: {exc}')
+            summary['experiment_design'] = {'error': str(exc)}
 
         # Import after deps are installed.
         import run_correctness

@@ -124,6 +124,7 @@ from multi_seed_stats import (
     min_detectable_effect, seeds_required, tost_from_summary,
     _sample_sd,
 )
+from experiment_design import audit_run as audit_experiment_design
 
 logger = logging.getLogger(__name__)
 
@@ -3662,6 +3663,27 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         logger.warning(f'Matrix design is NOT verified: '
                        f'{design_audit["violations"]}')
 
+    # Prospective audit of the pre-registered Exp 5b plan: the actual seed
+    # budget and the number of contrast rows in THIS run are compared with
+    # the declared SESOI / family. The post-hoc design_audit above checks
+    # that the promised cells ran; this audit checks whether the run is
+    # powered to make the claims those cells invite.
+    matrix_experiment_design = audit_experiment_design(
+        'exp5b_matrix',
+        seeds=[42 + i for i in range(n_seeds)],
+        levels={
+            'memory': list(memory_types),
+            'layout_unit': sorted({_unit_of_group(spec[0]) for spec in groups}),
+        },
+        family_size=max(1, len(contrasts)),
+    )
+    logger.info(f'Prospective design audit: '
+                f'{matrix_experiment_design["status"]} '
+                f'(n={matrix_experiment_design["n_seeds"]}, '
+                f'family={matrix_experiment_design["planning"]["family_size"]}, '
+                f'required='
+                f'{matrix_experiment_design["planning"]["required_seeds"]})')
+
     # Regime of the matrix as a whole (same vocabulary as the ratio sweep):
     # are the rows saturated / underfitting / overfitting, and do the seeds
     # agree on the verdict? Without this, a final-number-only table cannot
@@ -3709,6 +3731,9 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         # Machine-readable check that the promised cells actually ran with
         # a common recipe and a common seed set (see _matrix_design_audit).
         'design_audit': design_audit,
+        # Prospective audit of the same run against the pre-registered
+        # Exp 5b plan (seed budget, family size, required n at the SESOI).
+        'experiment_design': matrix_experiment_design,
         # Pre-registered design intent (fixed before the numbers were
         # read): what each layout group is for, and the prediction +
         # falsification criterion for every paired contrast family. The
@@ -4052,6 +4077,24 @@ def main():
     _attach_cost_tradeoffs(ratio_contrasts, all_results)
     _log_ratio_contrast_table(ratio_contrasts)
 
+    # Prospective audit of the pre-registered Exp 5 ratio plan. The family
+    # is the number of alternative-vs-reference contrasts this run actually
+    # produced; it is recorded next to the seed budget so a 7-seed screening
+    # sweep is never read as a confirmatory allocation claim.
+    ratio_experiment_design = audit_experiment_design(
+        'exp5_ratio',
+        seeds=[42 + i for i in range(n_seeds)],
+        levels={'ratio': sorted({str(r.get('ratio')) for r in all_results
+                                 if r.get('ratio') is not None})},
+        family_size=max(1, len(ratio_contrasts)),
+    )
+    logger.info(f'Prospective design audit: '
+                f'{ratio_experiment_design["status"]} '
+                f'(n={ratio_experiment_design["n_seeds"]}, '
+                f'family={ratio_experiment_design["planning"]["family_size"]}, '
+                f'required='
+                f'{ratio_experiment_design["planning"]["required_seeds"]})')
+
     # Regime of the sweep as a whole. Individual rows already carry their
     # own verdict; this is the one-line answer to "can this ranking be
     # trusted, or is it a budget artifact?".
@@ -4173,6 +4216,9 @@ def main():
         provenance['ratio_contrasts'] = ratio_contrasts
         provenance['contrast_tests'] = ratio_contrast_tests
         provenance['hypotheses'] = RATIO_SWEEP_HYPOTHESES
+        # Prospective audit against the pre-registered Exp 5 plan: seed
+        # budget, actual contrast family and required n at the SESOI.
+        provenance['experiment_design'] = ratio_experiment_design
         # Sweep-wide training regime + the accuracy-vs-cost screen, so the
         # artifact records not only which layout won but whether the win
         # survives the curve diagnosis and what it cost.

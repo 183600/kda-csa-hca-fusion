@@ -109,6 +109,7 @@ __all__ = [
     'equivalence_margin_supported',
     'holm_adjust',
     'min_detectable_effect',
+    'power_at_effect',
     'seeds_required',
     'summarize_paired',
 ]
@@ -730,6 +731,58 @@ def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
         else _ND.inv_cdf(1.0 - alpha)
     z_power = _ND.inv_cdf(power)
     return int(math.ceil(((z_crit + z_power) / abs(dz)) ** 2))
+
+
+def power_at_effect(n: int, sd: float, effect: float,
+                    alpha: float = 0.05,
+                    alternative: str = 'two-sided') -> float | None:
+    """Normal-approximation power for the paired test at ``effect``.
+
+    This is the forward companion of :func:`seeds_required`: it answers
+    "if the true mean paired difference is ``effect`` and the per-seed
+    difference SD is ``sd``, what is the probability that a run with
+    ``n`` seed pairs rejects at ``alpha``?".  ``effect`` and ``sd`` are
+    on the same scale (raw difference units); standardize by
+    ``effect / sd`` for a ``d_z`` formulation.
+
+    The normal approximation is the same planning model used by
+    :func:`min_detectable_effect` / :func:`seeds_required`; it is
+    deliberately NOT used for inference.  At ``n = 5`` it is optimistic
+    by roughly 10%, so a planned power of 0.80 is a target, not a
+    promise.  Returns ``None`` when fewer than two seed pairs make the
+    sample SD (and therefore the test) undefined.  A zero SD is handled
+    exactly: power is ``alpha`` for a zero effect and 1 for a non-zero
+    effect (the degenerate noiseless case).
+    """
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError(f'n must be a non-negative int, got {n!r}')
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    if alternative not in ('two-sided', 'greater', 'less'):
+        raise ValueError(
+            f"alternative must be 'two-sided'|'greater'|'less', "
+            f"got {alternative!r}")
+    if isinstance(sd, bool) or not isinstance(sd, (int, float)) \
+            or not math.isfinite(sd) or sd < 0.0:
+        raise ValueError(f'sd must be finite and >= 0, got {sd!r}')
+    if isinstance(effect, bool) or not isinstance(effect, (int, float)) \
+            or not math.isfinite(effect):
+        raise ValueError(f'effect must be finite, got {effect!r}')
+    if n < 2:
+        return None
+    effect = float(effect)
+    if float(sd) == 0.0:
+        if effect == 0.0:
+            return float(alpha)
+        return 1.0
+    ncp = abs(effect) / (float(sd) / math.sqrt(n))
+    if alternative == 'two-sided':
+        z_crit = _ND.inv_cdf(1.0 - alpha / 2.0)
+        power = (1.0 - _ND.cdf(z_crit - ncp)) + _ND.cdf(-z_crit - ncp)
+    else:
+        z_crit = _ND.inv_cdf(1.0 - alpha)
+        power = 1.0 - _ND.cdf(z_crit - ncp)
+    return min(1.0, max(0.0, float(power)))
 
 
 # ---------------------------------------------------------------------------

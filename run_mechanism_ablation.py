@@ -142,6 +142,7 @@ from ops_fused import CSAHybridLayer, HybridKCHAttention
 from results_analysis import (binary_ranking_metrics,
                               expected_average_precision)
 from results_schema import write as write_schema
+from experiment_design import audit_run as audit_experiment_design
 from run_ablation import (
     _aggregate_curve_diagnosis,
     _attach_curve_diagnostics,
@@ -1570,6 +1571,23 @@ def main():
             cv.get('controls_status'), cv.get('recipe_parity'),
             cv.get('seed_alignment_ok'))
 
+    # Prospective audit against the pre-registered Exp 8 plan: the actual
+    # seed budget and compared-variant family are checked against the
+    # declared SESOI. This is separate from ``ablation_design`` (which
+    # checks that the leave-one-factor-out cells exist): a complete design
+    # can still be too underpowered for the claim it invites.
+    mechanism_experiment_design = audit_experiment_design(
+        'exp8_mechanism',
+        seeds=[42 + i for i in range(n_seeds)],
+        levels={'variant': [v['name'] for v in variants]},
+        family_size=max(1, len(variants) - 1),
+    )
+    logger.info(f'Prospective design audit: '
+                f'{mechanism_experiment_design["status"]} '
+                f'(n={mechanism_experiment_design["n_seeds"]}, '
+                f'required='
+                f'{mechanism_experiment_design["planning"]["required_seeds"]})')
+
     metadata = {
         'experiment': 'exp8_mechanism_ablation',
         'design': (
@@ -1590,6 +1608,8 @@ def main():
              'predicted_acc_sign': v['predicted_acc_sign']}
             for v in variants],
         'ablation_design': design_audit,
+        # Prospective power/seed audit against the pre-registered plan.
+        'experiment_design': mechanism_experiment_design,
         'prediction_status_definition': (
             'Per-row verdict of the pre-registered prediction against the '
             'paired Bonferroni-corrected accuracy contrast vs baseline: '

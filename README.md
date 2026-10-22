@@ -81,6 +81,7 @@ eight-group experiment matrix.
 ├── method_analysis.py     # Headwise prototype (CSA simplified to dense for the demo)
 ├── make_figures.py        # Generate figures/* from results/* (incl. quality-vs-cost)
 ├── run_all.py             # Single-entry runner (RUN_ALL_PROFILE=smoke|screen|full)
+├── experiment_design.py   # Pre-registered plans, prospective power/MDE, runtime audit
 ├── kaggle_setup.py        # CUDA bootstrap + shared utilities (sanitize_for_json, parse_int_env)
 ├── test_figures.py        # Tests for the figure generation pipeline
 ├── results/               # Generated JSON outputs (gitignored; regenerate via run_all.py)
@@ -213,6 +214,17 @@ RUN_ALL_PROFILE=smoke python run_all.py  # minutes: plumbing validation only
 RUN_ALL_PROFILE=full python run_all.py   # 7 seeds for the multi-seed statistics
 ```
 
+Before any experiment runs, `run_all.py` writes `results/experiment_design.json`:
+the pre-registered SESOI, analysis family, required seed count, and the power
+the current budget actually delivers. Each multi-seed runner also embeds its
+runtime audit as `metadata.experiment_design` (`confirmatory` /
+`reduced_family` / `screening` / `exploratory_missing_controls`). Validate the
+registry with
+`python experiment_design.py --check`, and use
+`python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json`
+to turn a pilot's paired SD into a confirmatory seed budget. See
+[docs/experiment-design.md](docs/experiment-design.md).
+
 ### Switchable KDA / Mamba-2 memory route (quick start)
 
 ```python
@@ -303,6 +315,7 @@ runs during development.
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper (`ABL_MODE=ratio`) |
 | `results/exp5b_ablation_matrix.json` | `[{group, memory, layout, n_kv, per_seed, mean_acc, n_params, total_layers, d_model, ...}, ...]` | the eight-group matrix and its presets (`ABL_MODE=matrix`) |
 | `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, compute_boundary, n_layers, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches; `n_layers` marks hybrid as a 5-layer stack vs single-layer methods) |
+| `results/experiment_design.json` | `{schema_version, kind: "experiment_design", metadata, results: [{plan_id, factors, sesoi, planned_seeds, planning, status}, ...]}` | prospective plan + required n, written by `run_all.py` before the experiments start |
 | `results/summary.json` | `{env: {git_commit, torch_version, cuda_version, kda_backend, ...}, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |
 
 > **Known schema inconsistency.** Exp 4 wraps its results in

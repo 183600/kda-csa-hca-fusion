@@ -391,6 +391,37 @@ def test_min_detectable_effect_decreases_with_seeds():
     assert M.min_detectable_effect(1, 0.1) is None
 
 
+def test_power_at_effect_inverts_seeds_required():
+    # The forward power and the inverse sample-size rule must agree: at the
+    # n returned by seeds_required, power is at least the requested target.
+    for dz in (0.5, 1.0, 1.5):
+        n = M.seeds_required(dz, alpha=0.05, power=0.8)
+        power = M.power_at_effect(n, sd=1.0, effect=dz, alpha=0.05)
+        assert power is not None and power >= 0.8 - 1e-9
+    # One-sided tests need fewer pairs than two-sided tests for the same
+    # effect; the null effect has power alpha (two-sided).
+    assert M.power_at_effect(5, 1.0, 1.0, alternative='greater') > \
+        M.power_at_effect(5, 1.0, 1.0)
+    assert M.power_at_effect(5, 1.0, 0.0) == pytest.approx(0.05)
+    assert M.power_at_effect(5, 1.0, 0.0, alternative='greater') == \
+        pytest.approx(0.05)
+    # Degenerate / undefined cases are explicit, and invalid arguments still
+    # fail loudly before the n < 2 shortcut.
+    assert M.power_at_effect(1, 1.0, 1.0) is None
+    assert M.power_at_effect(5, 0.0, 0.0) == pytest.approx(0.05)
+    assert M.power_at_effect(5, 0.0, 1.0) == 1.0
+    with pytest.raises(ValueError):
+        M.power_at_effect(True, 1.0, 1.0)
+    with pytest.raises(ValueError):
+        M.power_at_effect(5, -0.1, 1.0)
+    with pytest.raises(ValueError):
+        M.power_at_effect(5, 1.0, float('nan'))
+    with pytest.raises(ValueError):
+        M.power_at_effect(5, 1.0, 1.0, alpha=0.0)
+    with pytest.raises(ValueError):
+        M.power_at_effect(5, 1.0, 1.0, alternative='both')
+
+
 def test_power_planning_rejects_invalid_arguments_before_undefined_n():
     # An undefined seed count (n < 2) must not mask invalid planning
     # inputs: an alpha/sd typo has to fail loudly even when the result is

@@ -83,6 +83,7 @@ from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
 from multi_seed_stats import _sample_sd, holm_adjust, summarize_paired
+from experiment_design import audit_run as audit_experiment_design
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)
@@ -4063,6 +4064,26 @@ def main():
     # advantaged in the default result table.
     softmax_steps = parse_int_env('MQAR_SOFTMAX_STEPS', steps, min_value=1,
                                   logger=logger)
+    # Prospective design audit (experiment_design.py): record the actual
+    # seed budget, control set and analysis-family size against the
+    # pre-registered Exp 4 plan. This does not change the run; it prevents a
+    # screening budget from being read as a confirmatory result. The family
+    # is the number of non-baseline operators tested against the tuned
+    # reference in this sweep.
+    design_family_size = max(
+        1, len([op for op in ops_list if op not in baseline_ops]))
+    experiment_design_audit = audit_experiment_design(
+        'exp4_mqar',
+        seeds=[42 + i for i in range(n_seeds)],
+        levels={'operator': list(ops_list), 'task': list(task_list),
+                'n_kv': list(n_kv_list)},
+        family_size=design_family_size,
+    )
+    logger.info(
+        f'  design audit  : {experiment_design_audit["status"]} '
+        f'(n={experiment_design_audit["n_seeds"]}, '
+        f'required={experiment_design_audit["planning"]["required_seeds"]}, '
+        f'power={experiment_design_audit["planning"]["planned_power"]})')
     # Results-analysis controls (monitoring + bad cases). Defaults are
     # cheap enough for every run: 5 held-out validation points and 2
     # held-out analysis batches per seed, both on dedicated RNG streams.
@@ -5028,6 +5049,10 @@ def main():
             'provenance': capture_provenance(),
             'seeds': [42 + i for i in range(n_seeds)],
             'n_seeds': n_seeds,
+            # Runtime audit of the pre-registered Exp 4 design: status,
+            # required vs actual seed budget, per-test alpha, MDE and the
+            # claims this run is allowed to support (see experiment_design).
+            'experiment_design': experiment_design_audit,
             # Data version block: this experiment's "dataset" is synthetic
             # and fully determined by (generator function, task spec, seed
             # + offset). Recording all three makes the data version explicit
