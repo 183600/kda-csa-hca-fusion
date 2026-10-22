@@ -479,6 +479,45 @@ def test_gate_factory_and_gated_delta_geometry_reject_coercions():
             _ok(f'GatedDeltaRule {args} rejected', False, 'no error raised')
 
 
+def test_gated_delta_rule_rejects_nonfinite_init_and_clamps():
+    """GatedDeltaRule parameters are validated before they poison the state.
+
+    ``g_init``/``beta_init`` are copied into nn.Parameters; a NaN there made
+    every forward output NaN. ``g_clamp_max=+inf`` lets ``exp(g)`` overflow
+    instead of reporting the invalid bound, and a reversed clamp range
+    silently pins the gate to one endpoint.
+    """
+    from ops_gated_attention import GatedDeltaRule
+
+    GatedDeltaRule(2, 4, 5)  # valid defaults still construct
+    cases = (
+        {'g_init': float('nan')},
+        {'beta_init': float('inf')},
+        {'g_clamp_min': float('nan')},
+        {'g_clamp_min': float('inf')},
+        {'g_clamp_max': float('inf')},
+        {'g_clamp_min': 1.0, 'g_clamp_max': -1.0},
+    )
+    for kwargs in cases:
+        try:
+            GatedDeltaRule(2, 4, 5, **kwargs)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'GatedDeltaRule {kwargs} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'GatedDeltaRule {kwargs} rejected', False,
+                'no error raised')
+    # -inf is the documented "disable the lower clamp" sentinel.
+    layer = GatedDeltaRule(2, 4, 5, g_clamp_min=float('-inf'))
+    q = torch.randn(1, 3, 2, 4)
+    k = torch.randn(1, 3, 2, 4)
+    v = torch.randn(1, 3, 2, 5)
+    o, _ = layer(q, k, v)
+    _ok('finite -inf lower clamp still runs', torch.isfinite(o).all(), '')
+
+
 def test_benchmark_chunk_shape_guard_survives_python_optimized():
     """The chunked-KDA trim check must not be a bare ``assert``.
 
@@ -604,6 +643,7 @@ if __name__ == '__main__':
     test_decoding_cache_geometry_requires_exact_ints()
     test_online_softmax_chunk_sizes_require_exact_ints()
     test_gate_factory_and_gated_delta_geometry_reject_coercions()
+    test_gated_delta_rule_rejects_nonfinite_init_and_clamps()
     test_benchmark_chunk_shape_guard_survives_python_optimized()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()

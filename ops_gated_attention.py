@@ -103,6 +103,26 @@ def _require_finite_real(name: str, value) -> float:
     return float(value)
 
 
+def _require_gate_clamp(name: str, value, *, allow_negative_inf: bool) -> float:
+    """Validate a multiplicative-gate clamp bound.
+
+    ``g_clamp_min=-inf`` is a meaningful way to disable the lower clamp;
+    ``+inf`` is not a bound (``exp(+inf)`` poisons the state) and is
+    rejected on either side. NaN and non-real values are rejected too.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'{name}={value!r} must be a real number.')
+    if value != value:  # NaN
+        raise ValueError(f'{name}={value!r} must not be NaN.')
+    if value == float('inf'):
+        raise ValueError(
+            f'{name}=+inf is not a valid clamp bound (exp(+inf) has no '
+            f'finite meaning).')
+    if not allow_negative_inf and value == float('-inf'):
+        raise ValueError(f'{name}=-inf is not a valid upper clamp bound.')
+    return float(value)
+
+
 def create_gate(
     gate_type: str,
     num_heads: int,
@@ -317,16 +337,32 @@ class GatedDeltaRule(nn.Module):
         self.key_dim = _require_positive_int('key_dim', key_dim)
         self.value_dim = _require_positive_int('value_dim', value_dim)
         self.gate_type = gate_type
-        self.g_clamp_min = g_clamp_min
-        self.g_clamp_max = g_clamp_max
+        # The gate/beta initial values are baked into nn.Parameters and the
+        # clamps are applied on every forward. Reject non-finite values
+        # up-front: a NaN ``g_init`` silently makes every output NaN, while
+        # ``g_clamp_max=+inf`` can turn the state multiplicative update into
+        # an overflow instead of an actionable configuration error.
+        self.g_init = _require_finite_real('g_init', g_init)
+        self.beta_init = _require_finite_real('beta_init', beta_init)
+        self.g_clamp_min = _require_gate_clamp(
+            'g_clamp_min', g_clamp_min, allow_negative_inf=True)
+        self.g_clamp_max = _require_gate_clamp(
+            'g_clamp_max', g_clamp_max, allow_negative_inf=False)
+        if self.g_clamp_min > self.g_clamp_max:
+            raise ValueError(
+                f'g_clamp_min={self.g_clamp_min!r} must be <= '
+                f'g_clamp_max={self.g_clamp_max!r}.')
 
         # Learnable log-gate (g) and beta
         if gate_type == 'per_channel':
-            self.g = nn.Parameter(torch.full((num_heads, key_dim), g_init))
-            self.beta = nn.Parameter(torch.full((num_heads,), beta_init))
+            self.g = nn.Parameter(
+                torch.full((num_heads, key_dim), self.g_init))
+            self.beta = nn.Parameter(
+                torch.full((num_heads,), self.beta_init))
         elif gate_type == 'per_head':
-            self.g = nn.Parameter(torch.full((num_heads,), g_init))
-            self.beta = nn.Parameter(torch.full((num_heads,), beta_init))
+            self.g = nn.Parameter(torch.full((num_heads,), self.g_init))
+            self.beta = nn.Parameter(
+                torch.full((num_heads,), self.beta_init))
         else:
             raise ValueError(f"gate_type={gate_type!r} must be 'per_head' or 'per_channel'")
 
