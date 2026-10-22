@@ -149,11 +149,32 @@ def ratio_of_medians_ci(a_ms, b_ms, *, paired=False,
     blocks). Returns a dict with the point ratio, CI, and the two medians.
     """
     _check_bootstrap(n_boot, alpha)
-    a = _clean(a_ms)
-    b = _clean(b_ms)
-    if paired and len(a) != len(b):
-        raise ValueError('paired ratio requires equal-length samples: '
-                         f'{len(a)} != {len(b)}')
+    if paired:
+        # Pairing is by trial index, so the two raw samples must line up
+        # BEFORE any invalid entry is removed. Cleaning each side
+        # independently and then comparing lengths can silently pair
+        # different trials (e.g. a NaN at index 0 of A and at index 2 of B
+        # both disappear, leaving equal-length but misaligned lists).
+        raw_a = list(a_ms)
+        raw_b = list(b_ms)
+        if len(raw_a) != len(raw_b):
+            raise ValueError('paired ratio requires equal-length samples: '
+                             f'{len(raw_a)} != {len(raw_b)}')
+        a = []
+        b = []
+        for value_a, value_b in zip(raw_a, raw_b):
+            clean_a = _clean([value_a])
+            clean_b = _clean([value_b])
+            if not clean_a or not clean_b:
+                # Drop the whole pair: one missing/invalid side makes the
+                # trial unusable, and keeping the other would break the
+                # index correspondence.
+                continue
+            a.append(clean_a[0])
+            b.append(clean_b[0])
+    else:
+        a = _clean(a_ms)
+        b = _clean(b_ms)
     if not a or not b:
         raise ValueError('ratio requires two non-empty samples.')
     med_a = statistics.median(a)

@@ -114,6 +114,34 @@ def test_ratio_of_medians_ci():
         _ok(f'rejects {kwargs}', raised, '')
 
 
+def test_paired_ratio_drops_whole_trials_after_invalid_values():
+    print('\nTest: paired ratio keeps trial indices aligned')
+    # A has NaN at index 0, B at index 2. A pairwise drop leaves trials
+    # (a=1,b=2) and (a=9,b=90); independently cleaning each side would
+    # instead pair (1,10), (3,2), (9,90).
+    stats = ts.ratio_of_medians_ci(
+        [float('nan'), 1.0, 3.0, 9.0],
+        [10.0, 2.0, float('nan'), 90.0], paired=True, seed=3)
+    _ok('paired ratio drops only complete pairs',
+        stats['n_a'] == stats['n_b'] == 2, stats)
+    _ok('paired ratio uses the aligned medians',
+        abs(stats['ratio_median'] - 5.0 / 46.0) < 1e-12,
+        stats['ratio_median'])
+    # A fully valid paired sample keeps the original behavior.
+    valid = ts.ratio_of_medians_ci([1.0, 2.0, 3.0], [2.0, 4.0, 6.0],
+                                   paired=True, seed=3)
+    _ok('valid paired ratio is unchanged',
+        valid['n_a'] == valid['n_b'] == 3
+        and abs(valid['ratio_median'] - 0.5) < 1e-12, valid)
+    raised = False
+    try:
+        ts.ratio_of_medians_ci([float('nan'), float('nan')],
+                               [2.0, 4.0], paired=True)
+    except ValueError:
+        raised = True
+    _ok('a paired sample with no usable trials is rejected', raised, '')
+
+
 def test_producer_wiring_reports_uncertainty():
     print('\nTest: latency_profile.time_call and run_benchmark expose CI fields')
     stats = lp.time_call(lambda: None, warmup=0, repeats=4,
@@ -140,6 +168,7 @@ _TEST_FUNCS = [
     test_summary_hand_values_and_quantiles,
     test_summary_seconds_and_edge_cases,
     test_ratio_of_medians_ci,
+    test_paired_ratio_drops_whole_trials_after_invalid_values,
     test_producer_wiring_reports_uncertainty,
 ]
 
