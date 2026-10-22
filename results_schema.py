@@ -1461,9 +1461,15 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
             if 'error' in row:
                 key = ('decode_sweep', row.get('csa_topk'),
                        row.get('prefill_len'), memory_op)
-                if key in seen:
-                    out.append(f'{where}: duplicate key {key!r}')
-                seen.add(key)
+                # csa_topk may be malformed (e.g. a list). The duplicate
+                # check must report that as a contract violation, not abort
+                # the whole validation pass with an unhashable-key
+                # TypeError; the field check above already appends the
+                # actionable violation.
+                if all(_is_hashable(part) for part in key):
+                    if key in seen:
+                        out.append(f'{where}: duplicate key {key!r}')
+                    seen.add(key)
                 continue
             for fld in ('prefill_ms', 'mean_decode_ms_per_token',
                         'total_read_elements_per_query'):

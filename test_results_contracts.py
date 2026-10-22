@@ -858,3 +858,16 @@ def test_row_contract_exp9_malformed_types_do_not_crash():
         bad[index] = dict(bad[index], **patch)
         violations = rs.validate_rows('exp9_budget_frontier', bad, {})
         assert violations, patch
+
+    # An error row keeps the malformed key out of the duplicate-detection
+    # set: hashing a list used to abort validation with a TypeError instead
+    # of reporting the csa_topk violation.
+    bad = copy.deepcopy(rows)
+    idx = next(i for i, r in enumerate(bad)
+               if r['section'] == 'decode_sweep')
+    bad[idx] = {k: v for k, v in bad[idx].items()
+                if k not in ('prefill_ms', 'mean_decode_ms_per_token',
+                             'total_read_elements_per_query')}
+    bad[idx].update(csa_topk=[], error='boom')
+    violations = rs.validate_rows('exp9_budget_frontier', bad, {})
+    assert any('csa_topk' in v for v in violations), violations
