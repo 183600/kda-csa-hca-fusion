@@ -1104,7 +1104,12 @@ def ablation_design_audit(variants, rows=None, requested=None,
                 requested_seeds[name].add(seed)
             for seed_row in r.get('per_seed') or []:
                 if ('error' in seed_row
-                        or seed_row.get('final_acc') is None):
+                        or _finite_metric(seed_row, 'final_acc') is None):
+                    # A seed whose accuracy never became a finite
+                    # measurement did not contribute to the aggregate, so
+                    # it must not count as a successful seed in the design
+                    # audit either (otherwise a diverged seed would leave
+                    # controls_status='controlled').
                     continue
                 successful_seeds[name].add(seed_row.get('seed'))
 

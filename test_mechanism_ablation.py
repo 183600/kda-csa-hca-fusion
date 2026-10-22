@@ -418,6 +418,17 @@ def test_ablation_design_audit():
         and unpaired['controlled_variables']['seed_alignment_ok'] is False,
         str(unpaired['controlled_variables']))
 
+    # A seed that survived with a non-finite accuracy is excluded from the
+    # aggregate; the audit must not count it as a successful seed either.
+    diverged_rows = _controlled_rows()
+    diverged_rows[0]['per_seed'][1]['final_acc'] = float('nan')
+    diverged = M.ablation_design_audit(subset, rows=diverged_rows)
+    _ok('non-finite seed accuracy is not a successful seed',
+        diverged['controlled_variables']['controls_status']
+        == 'seed_mismatch'
+        and diverged['controlled_variables']['seed_alignment_ok'] is False,
+        str(diverged['controlled_variables']))
+
 
 def test_exp8_smoke_envelope():
     """End-to-end smoke: tiny run writes a v1.0 envelope with the right kind."""
