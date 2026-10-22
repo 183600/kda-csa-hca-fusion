@@ -275,6 +275,24 @@ def test_forward_with_policy_matches_state_guards():
 # runner payload
 # ---------------------------------------------------------------------------
 
+def test_mqa_variant_ladder_scales_with_head_count():
+    """MHA/GQA/MQA labels must follow n_heads, not a fixed 4-head table."""
+    from run_train_roofline import mqa_variant_table, resolve_mqa_variants
+    assert resolve_mqa_variants(4) == [('mha', 4), ('gqa', 2), ('mqa', 1)]
+    assert resolve_mqa_variants(8) == [('mha', 8), ('gqa', 4), ('mqa', 1)]
+    # At two query heads, GQA with one KV head IS MQA: emit one row.
+    assert resolve_mqa_variants(2) == [('mha', 2), ('gqa', 1)]
+    rows = {r['variant']: r for r in mqa_variant_table(
+        d_model=32, n_heads=8, head_dim=8, T=16, itemsize=2)}
+    assert rows['mha']['n_kv_heads'] == 8
+    assert rows['mha']['group_size'] == 1
+    assert rows['mha']['kv_reduction_vs_mha'] == 1.0
+    assert rows['gqa']['n_kv_heads'] == 4
+    assert rows['gqa']['group_size'] == 2
+    assert rows['mqa']['n_kv_heads'] == 1
+    assert rows['mqa']['group_size'] == 8
+
+
 def test_quality_probe_sample_stats_and_seed_pairing():
     """The MQA quality probe reports sample std/CI and paired contrasts."""
     import statistics

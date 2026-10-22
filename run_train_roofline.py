@@ -63,9 +63,35 @@ logger = logging.getLogger(__name__)
 RESULTS_PATH = os.path.join('results', 'exp14_train_roofline.json')
 KIND = 'exp14_train_roofline'
 
-#: MQA/GQA/MHA variant ladder: name -> KV-head count as a divisor of
-#: ``n_heads`` (resolved per configuration).
-MQA_VARIANTS = {'mha': 4, 'gqa': 2, 'mqa': 1}
+#: MQA/GQA/MHA variant ladder (canonical order). The KV-head counts are
+#: derived from the configured ``n_heads`` by :func:`resolve_mqa_variants`;
+#: a fixed count would mislabel the ladder for any ``n_heads != 4``.
+MQA_VARIANTS = ('mha', 'gqa', 'mqa')
+
+
+def resolve_mqa_variants(n_heads: int) -> list[tuple[str, int]]:
+    """Resolve the variant ladder for ``n_heads`` (duplicates skipped).
+
+    ``mha`` keeps every query head's own K/V head, ``gqa`` halves the KV
+    head count (rounded down but at least one), and ``mqa`` shares one KV
+    head. For ``n_heads == 4`` this is exactly the historical
+    ``mha=4, gqa=2, mqa=1`` table; for ``n_heads == 2`` the GQA and MQA
+    rows coincide, so only the first (GQA) label is emitted.
+    """
+    if isinstance(n_heads, bool) or not isinstance(n_heads, int)             or n_heads < 1:
+        raise ValueError(
+            f'n_heads={n_heads!r} must be a positive int')
+    candidates = (('mha', n_heads),
+                  ('gqa', max(1, n_heads // 2)),
+                  ('mqa', 1))
+    out: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for name, n_kv in candidates:
+        if n_heads % n_kv != 0 or n_kv in seen:
+            continue
+        seen.add(n_kv)
+        out.append((name, n_kv))
+    return out
 
 
 def parse_int_list(raw: str, *, minimum: int = 0) -> tuple[int, ...]:
@@ -327,10 +353,7 @@ def mqa_variant_table(*, d_model: int, n_heads: int, head_dim: int, T: int,
                       itemsize: int, batch: int = 1) -> list[dict]:
     """MHA / GQA / MQA KV budget at fixed ``(n_heads, head_dim)``."""
     rows: list[dict] = []
-    for name, n_kv in MQA_VARIANTS.items():
-        n_kv = min(n_kv, n_heads)
-        if n_heads % n_kv != 0:
-            continue
+    for name, n_kv in resolve_mqa_variants(n_heads):
         params = mqa.attention_parameter_elements(
             d_model, n_heads, n_kv, head_dim)
         kv_per_token = mqa.kv_state_elements_per_token(n_kv, head_dim)
@@ -433,10 +456,8 @@ def quality_probe(*, seeds: tuple[int, ...], device, d_model: int,
                   steps: int, lr: float, batch: int,
                   eval_batches: int, eval_batch: int) -> list[dict]:
     runs: list[dict] = []
-    for name, n_kv in MQA_VARIANTS.items():
-        n_kv = min(n_kv, n_heads)
-        if n_heads % n_kv != 0:
-            continue
+    variants = resolve_mqa_variants(n_heads)
+    for name, n_kv in variants:
         for seed in seeds:
             runs.append(_train_variant(
                 name, n_kv, seed=seed, device=device, d_model=d_model,
@@ -451,7 +472,7 @@ def quality_probe(*, seeds: tuple[int, ...], device, d_model: int,
             run['final_acc']
     ref = by_variant.get('mha', {})
     summary: list[dict] = []
-    for name in MQA_VARIANTS:
+    for name, _n_kv in variants:
         seed_accs = by_variant.get(name)
         if not seed_accs:
             continue
@@ -474,7 +495,7 @@ def quality_probe(*, seeds: tuple[int, ...], device, d_model: int,
             # Two non-baseline variants (GQA, MQA) are contrasted with MHA
             # inside each probe; apply a Bonferroni adjustment so the
             # family-wise error stays at 0.05.
-            family = max(1, len(MQA_VARIANTS) - 1)
+            family = max(1, len(variants) - 1)
             p_raw = (paired.get('t_test') or {}).get('p_value_two_sided')
             if p_raw is not None:
                 p_adj = min(1.0, p_raw * family)
