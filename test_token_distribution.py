@@ -26,6 +26,7 @@ from train_lm_autodl import (
     _FallbackCharTokenizer,
     _distribution_shift,
     _length_outlier_audit,
+    _quantile_type7,
     token_distribution_audit,
 )
 
@@ -342,3 +343,27 @@ def test_length_outlier_audit_skips_malformed_lengths_and_rejects_bad_k():
             pass
         else:  # pragma: no cover
             raise AssertionError(f'invalid iqr_multiplier accepted: {bad_k!r}')
+
+
+def test_length_shift_does_not_treat_subnormal_sd_as_zero_variance():
+    report = _distribution_shift(
+        {'mean_tokens': 0.0, 'std_tokens': 1e-200},
+        {'mean_tokens': 1e-300, 'std_tokens': 1e-200})
+    # Squaring 1e-200 underflows, but the pooled SD is still nonzero and
+    # d = 1e-100 is far below the 0.5 warning threshold.
+    assert report['zero_pooled_variance'] is False
+    assert report['cohen_d'] == 1e-100
+    assert report['flag'] is False
+    json.dumps(report, allow_nan=False)
+
+
+def test_quantile_argument_is_bounded_and_finite():
+    for q in (0.0, 0.25, 0.5, 1.0):
+        assert 1.0 <= _quantile_type7([1.0, 2.0, 3.0, 4.0], q) <= 4.0
+    for q in (-0.1, 1.5, float('nan'), float('inf'), True, '0.5'):
+        try:
+            _quantile_type7([1.0, 2.0, 3.0, 4.0], q)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'invalid quantile accepted: {q!r}')

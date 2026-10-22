@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import math
 import numbers
+import operator
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -121,12 +122,58 @@ def _check_parameters(*, threshold: float, shingle_size: int, num_perm: int,
 
 
 def _as_ids(token_ids: Sequence[int] | None) -> np.ndarray:
-    """Tokens as a uint64 array; empty for ``None`` / empty sequences."""
+    """Tokens as a uint64 array; empty for ``None`` / empty sequences.
+
+    The uint64 cast is exact only for integer input: ``np.asarray([4.9],
+    dtype=np.uint64)`` silently becomes ``4`` and a negative id wraps
+    around. Those would compare the wrong model window, so malformed ids
+    are rejected just like malformed geometry / pair indices.
+    """
     if token_ids is None:
         return np.empty(0, dtype=_U64)
     if isinstance(token_ids, np.ndarray):
-        return np.asarray(token_ids, dtype=_U64).reshape(-1)
-    return np.asarray(list(token_ids), dtype=_U64).reshape(-1)
+        values = token_ids
+        if values.size == 0:
+            return np.empty(0, dtype=_U64)
+        if values.dtype.kind in 'iu':
+            if values.dtype.kind == 'i' and bool(np.any(values < 0)):
+                raise ValueError('token ids must be non-negative')
+            return values.astype(_U64).reshape(-1)
+        if values.dtype.kind == 'b':
+            raise ValueError('token ids must be integers, not bools')
+        raw = list(values.reshape(-1))
+    else:
+        if isinstance(token_ids, (str, bytes)):
+            raise ValueError('token ids must be integers, not text')
+        try:
+            raw = list(token_ids)
+        except TypeError:
+            raise ValueError(
+                'token ids must be an iterable of non-negative integers'
+            ) from None
+    if not raw:
+        return np.empty(0, dtype=_U64)
+    out = []
+    for token in raw:
+        # Check the original values, not a NumPy-promoted copy: a mixed
+        # [True, 2] list promotes to an integer array and would otherwise
+        # hide the bool.
+        if isinstance(token, bool):
+            raise ValueError('token ids must be integers, not bools')
+        if isinstance(token, numbers.Integral):
+            token_id = int(token)
+        else:
+            try:
+                token_id = operator.index(token)
+            except TypeError:
+                raise ValueError(
+                    f'token id is not an exact integer: {token!r}'
+                ) from None
+            token_id = int(token_id)
+        if token_id < 0:
+            raise ValueError('token ids must be non-negative')
+        out.append(token_id)
+    return np.asarray(out, dtype=_U64).reshape(-1)
 
 
 def _effective_shingle_size(n_tokens: int, shingle_size: int) -> int:

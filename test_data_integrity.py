@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+from decimal import Decimal
 
 import numpy as np
 
@@ -242,6 +243,41 @@ def test_numpy_infinite_scalars_are_dropped_not_stringified():
         assert _is_nonfinite_document(value) is True
     assert _is_nonfinite_document(np.float32(1.5)) is False
     assert _is_nonfinite_document(np.int64(3)) is False
+
+
+def test_nonfinite_classification_handles_huge_ints_and_decimals():
+    # A finite integer too large for float() is data, not a missing value.
+    assert _is_nonfinite_document(10 ** 400) is False
+    cleaned = clean_lm_texts([10 ** 400, 'a real document'],
+                             _FallbackCharTokenizer(), seq_len=1024)
+    assert len(cleaned['texts']) == 2
+    assert cleaned['stats']['n_nonfinite'] == 0
+
+    # Decimal infinities / signalling NaNs are not caught by ``x != x``.
+    for value in (Decimal('Infinity'), Decimal('-Infinity'),
+                  Decimal('NaN'), Decimal('sNaN')):
+        assert _is_nonfinite_document(value) is True
+    assert _is_nonfinite_document(Decimal('1.5')) is False
+    for value in (complex(0, float('inf')), complex(float('nan'), 0)):
+        assert _is_nonfinite_document(value) is True
+    assert _is_nonfinite_document(complex(1, 2)) is False
+
+
+def test_near_duplicate_token_ids_are_not_silently_coerced():
+    for bad in ([1.0, 2.0], [True, 2], [-1, 2], 'not ids',
+                np.array([1.0, 2.0]), np.array([True, False])):
+        try:
+            near_duplicate_pairs([[1, 2, 3, 4], bad], threshold=1.0)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - every malformed id must be rejected
+            raise AssertionError(f'malformed token ids accepted: {bad!r}')
+
+    # NumPy / torch integer scalars are exact ids and remain accepted.
+    ok = near_duplicate_pairs(
+        [[1, 2, 3, 4], [np.int64(1), np.uint64(2), np.int64(3), 4]],
+        threshold=1.0)
+    assert ok['pairs'] == [[0, 1, 1.0]]
 
     tok = _FallbackCharTokenizer()
     cleaned = clean_lm_texts(

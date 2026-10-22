@@ -49,6 +49,7 @@ import hashlib
 import datetime
 import json
 import math
+import cmath
 import dataclasses
 import numbers
 import operator
@@ -348,18 +349,39 @@ def _is_nonfinite_document(text):
         return True
     if isinstance(text, bool):
         return False
-    # ``numbers.Real`` covers Python int/float AND NumPy scalar floats /
-    # integers, which are the usual carriers of a missing/infinite value in
-    # a dataframe column.  Comparing / stringifying a NumPy ``inf`` does not
-    # reveal that it is non-finite (``inf == inf``), so the old
-    # ``(int, float)`` check silently kept it as the literal text "inf".
+    # Every Python / NumPy integer is finite, including values whose
+    # ``float()`` conversion would overflow (``10**400`` is a legitimate
+    # text document, not a missing value).
+    if isinstance(text, numbers.Integral):
+        return False
+    # ``numbers.Real`` covers Python / NumPy scalar floats, which are the
+    # usual carriers of a missing/infinite value in a dataframe column.
+    # Comparing / stringifying a NumPy ``inf`` does not reveal that it is
+    # non-finite (``inf == inf``), so the old ``(int, float)`` check
+    # silently kept it as the literal text "inf".
     if isinstance(text, numbers.Real):
         try:
             return not math.isfinite(float(text))
-        except (OverflowError, ValueError):
+        except OverflowError:
+            # A finite value too large for float is still finite.
+            return False
+        except (ValueError, TypeError):
             return True
-    # NaN-like objects whose ``x != x`` (e.g. Decimal / object floats) are
-    # caught by the comparison; guard against types whose __ne__ raises.
+    # Complex infinities/NaNs need ``cmath``; ``x != x`` only catches NaN.
+    if isinstance(text, numbers.Complex):
+        try:
+            return not cmath.isfinite(text)
+        except (OverflowError, ValueError, TypeError):
+            return False
+    # Decimal and similar numeric types expose an exact ``is_finite``.
+    is_finite = getattr(text, 'is_finite', None)
+    if callable(is_finite):
+        try:
+            return not bool(is_finite())
+        except Exception:
+            pass
+    # NaN-like objects whose ``x != x`` (e.g. object floats) are caught by
+    # the comparison; guard against types whose __ne__ raises.
     try:
         return bool(text != text)
     except Exception:
@@ -987,9 +1009,12 @@ def _quantile_type7(sorted_values, q):
     n = len(sorted_values)
     if n == 0:
         raise ValueError('cannot take a quantile of an empty sample')
+    q_value = _finite_float_or_none(q)
+    if q_value is None or not 0.0 <= q_value <= 1.0:
+        raise ValueError(f'quantile must be a finite number in [0, 1], got {q!r}')
     if n == 1:
         return float(sorted_values[0])
-    pos = float(q) * (n - 1)
+    pos = q_value * (n - 1)
     lo = int(math.floor(pos))
     hi = min(lo + 1, n - 1)
     frac = pos - lo
@@ -1158,6 +1183,13 @@ def _distribution_shift(train_stats, other_stats, *, threshold=0.5):
         else:
             pooled = scale * (
                 math.hypot(s_t / scale, s_o / scale) / math.sqrt(2.0))
+    elif pooled == 0.0 and (s_t > 0.0 or s_o > 0.0):
+        # Squaring subnormal-sized SDs underflows to zero even though the
+        # pooled SD (and hence d) is nonzero. Re-evaluate in scaled units;
+        # do not report a constant split when the inputs vary.
+        scale = max(s_t, s_o)
+        pooled = scale * (
+            math.hypot(s_t / scale, s_o / scale) / math.sqrt(2.0))
     zero_pooled = pooled == 0.0
     if zero_pooled:
         # The standardized effect is undefined when both splits are
