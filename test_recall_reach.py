@@ -652,6 +652,32 @@ def test_far_metrics_are_undefined_without_far_placements():
         and reach['structural_far_any_exact_fraction'] is None, str(reach))
 
 
+def test_undefined_far_metrics_do_not_create_pareto_domination():
+    """A layout with no far placements must not be ranked as 0 reach.
+
+    ``_structural_far_fraction`` returns None when the sequence has no
+    placement beyond the largest window. The Pareto pass used to coerce
+    None to 0.0, so a short-window layout with a measured far fraction
+    "dominated" the unmeasurable one on evidence that did not exist.
+    """
+    import flops_audit as fa
+    import recall_flops_audit as rfa
+
+    cfg = fa.probe_config(csa_sliding_window=128, hca_sliding_window=8)
+    audit = rfa.audit_layouts(
+        [('csa',), ('hca',)], cfg=cfg, seq_len=128, measure=False)
+    rows = {r['group']: r for r in audit['rows']}
+    _ok('the long-window layout has undefined far metrics',
+        rows['csa']['compute_reach']['far_mean_exact_reachable_fraction']
+        is None
+        and rows['csa']['compute_reach'][
+            'structural_far_any_exact_fraction'] is None,
+        str(rows['csa']['compute_reach']))
+    _ok('undefined metrics cannot be dominated',
+        rows['csa']['pareto_optimal'] is True,
+        str(rows['csa']['pareto_optimal']))
+
+
 def test_recall_flops_accepts_tuple_layout_forms():
     """Preset names and a bare layout can both be passed as a tuple.
 

@@ -459,19 +459,29 @@ def _pareto_flags(rows: list[dict]) -> list[bool]:
                 continue
             left = row['compute_reach']
             right = other['compute_reach']
+            # A missing far-placement metric means the axis was not
+            # measurable for that layout (no placement beyond its largest
+            # window), not that its reach is zero. Coercing None to 0.0
+            # would fabricate a domination claim on undefined evidence.
+            left_metrics = (
+                left['far_mean_exact_reachable_fraction'],
+                left['structural_far_any_exact_fraction'],
+            )
+            right_metrics = (
+                right['far_mean_exact_reachable_fraction'],
+                right['structural_far_any_exact_fraction'],
+            )
+            if any(v is None for v in left_metrics + right_metrics):
+                continue
             no_worse = (
                 other['reference_gemm_flops'] <= row['reference_gemm_flops']
-                and (right['far_mean_exact_reachable_fraction'] or 0.0)
-                >= (left['far_mean_exact_reachable_fraction'] or 0.0)
-                and (right['structural_far_any_exact_fraction'] or 0.0)
-                >= (left['structural_far_any_exact_fraction'] or 0.0)
+                and right_metrics[0] >= left_metrics[0]
+                and right_metrics[1] >= left_metrics[1]
             )
             strictly_better = (
                 other['reference_gemm_flops'] < row['reference_gemm_flops']
-                or (right['far_mean_exact_reachable_fraction'] or 0.0)
-                > (left['far_mean_exact_reachable_fraction'] or 0.0)
-                or (right['structural_far_any_exact_fraction'] or 0.0)
-                > (left['structural_far_any_exact_fraction'] or 0.0)
+                or right_metrics[0] > left_metrics[0]
+                or right_metrics[1] > left_metrics[1]
             )
             if no_worse and strictly_better:
                 dominated = True
