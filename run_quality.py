@@ -3113,6 +3113,22 @@ def _parse_task_list(env_var, default='mqar'):
     return list(dict.fromkeys(vals))
 
 
+def _sweep_cells(task_list, n_kv_list):
+    """The concrete ``(task, n_kv)`` cells the quality sweep will run.
+
+    Tasks that do not sweep ``n_kv`` run only their default value. Keeping
+    this in one place means the paired-comparison family size recorded in
+    the design audit cannot drift from the cells that actually run.
+    """
+    cells = []
+    for task in task_list:
+        spec = SYNTHETIC_TASKS[task]
+        kv_values = (n_kv_list if spec.get('n_kv_swept')
+                     else [spec.get('default_n_kv', 1)])
+        cells.extend((task, n_kv) for n_kv in kv_values)
+    return cells
+
+
 def _parse_op_list(env_var, default='linear,softmax,kda,mamba2,rwkv7,csa,hca'):
     """Parse the operator list for the quality sweep.
 
@@ -4068,10 +4084,13 @@ def main():
     # seed budget, control set and analysis-family size against the
     # pre-registered Exp 4 plan. This does not change the run; it prevents a
     # screening budget from being read as a confirmatory result. The family
-    # is the number of non-baseline operators tested against the tuned
-    # reference in this sweep.
+    # is one vs-reference contrast per non-baseline operator in EVERY
+    # (task, n_kv) cell, not just the default cell: a multi-task / multi-n_kv
+    # sweep runs proportionally more tests and therefore needs a correction
+    # at least as strong.
     design_family_size = max(
-        1, len([op for op in ops_list if op not in baseline_ops]))
+        1, len([op for op in ops_list if op not in baseline_ops])
+        * len(_sweep_cells(task_list, n_kv_list)))
     experiment_design_audit = audit_experiment_design(
         'exp4_mqar',
         seeds=[42 + i for i in range(n_seeds)],
@@ -4114,12 +4133,9 @@ def main():
     # (Bonferroni family size, log lines, result grouping) matches what
     # actually runs.
     sweep = []
-    for task in task_list:
+    for task, n_kv in _sweep_cells(task_list, n_kv_list):
         spec = SYNTHETIC_TASKS[task]
-        kv_values = n_kv_list if spec.get('n_kv_swept') \
-            else [spec.get('default_n_kv', 1)]
-        for n_kv in kv_values:
-            sweep.append((task, n_kv, spec['seq_len'], spec['vocab']))
+        sweep.append((task, n_kv, spec['seq_len'], spec['vocab']))
 
     # ------------------------------------------------------------------
     # Non-learned rule-based reference (baseline-ladder rung 0): the

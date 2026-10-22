@@ -1331,3 +1331,19 @@ def test_tune_baseline_lr_selects_on_tail_plateau(monkeypatch):
     assert rec['selected_lr_mean_final_val_acc'] == pytest.approx(0.1)
     assert rec['lr_grid']['0.001']['mean_val_tail_acc'] == pytest.approx(1.9 / 3)
     assert rec['lr_grid']['0.001']['mean_final_val_acc'] == pytest.approx(0.1)
+
+
+def test_sweep_cells_match_task_defaults():
+    """The design-audit family must count every actual sweep cell.
+
+    Tasks that do not sweep n_kv run only their default cell; tasks that do
+    run one cell per requested n_kv. Both the sweep construction and the
+    prospective Exp 4 family size now share this rule.
+    """
+    import run_quality
+    assert run_quality._sweep_cells(['mqar'], [1, 2]) == [
+        ('mqar', 1), ('mqar', 2)]
+    assert run_quality._sweep_cells(['long_range'], [1, 2, 4]) == [
+        ('long_range', 1)]
+    assert run_quality._sweep_cells(['mqar', 'long_range'], [1, 2]) == [
+        ('mqar', 1), ('mqar', 2), ('long_range', 1)]
