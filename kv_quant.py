@@ -8,8 +8,10 @@ serving stores that state **quantized** (int8 / 4-bit grouped) to trade
 recall for bytes, and nothing in the repo could express that trade. This
 module adds the missing second axis:
 
-* :class:`QuantSpec` — a validated storage contract: payload bits per
-  element, group size, symmetric/asymmetric, metadata bits.
+* :class:`QuantSpec` — a validated integer storage contract: payload bits
+  per element, group size, symmetric/asymmetric, metadata bits.
+* :class:`FP8Spec` — a block-scaled FP8 contract (E4M3FN/E5M2 payload,
+  shared E8M0 or fp16 scale), the format real FP8 state caches use.
 * :func:`fake_quantize` — exact grouped round-to-grid + dequantize with a
   straight-through gradient, so a decoder's quantize/dequantize kernels can
   be simulated in the full-precision graph without low-bit kernels.
@@ -23,7 +25,7 @@ module adds the missing second axis:
   cache layout would.
 * :func:`quantized_row_bytes` — converts any element row produced by
   ``kv_budget`` (operator-level or layout-level) into component-wise byte
-  columns under a component→:class:`QuantSpec` policy.
+  columns under a component→:class:`QuantSpec` / :class:`FP8Spec` policy.
 
 Contract / honesty
 ------------------
@@ -56,6 +58,22 @@ import torch
 
 FP16_BITS = 16.0
 FP16_BYTES_PER_ELEMENT = FP16_BITS / 8.0
+FP8_BITS = 8.0
+
+_FP8_FORMATS = {
+    'e4m3fn': {
+        'ebits': 4,
+        'mbits': 3,
+        'max_finite': 448.0,
+        'min_normal': 2.0 ** -6,
+    },
+    'e5m2': {
+        'ebits': 5,
+        'mbits': 2,
+        'max_finite': 57344.0,
+        'min_normal': 2.0 ** -14,
+    },
+}
 
 
 def _require_int(value, name: str, lo: int, hi: int) -> int:
@@ -118,19 +136,90 @@ class QuantSpec:
         return (self.scale_bits + (self.zero_bits or 0)) / self.group_size
 
 
-def bits_per_element(spec: QuantSpec) -> float:
+@dataclass(frozen=True)
+class FP8Spec:
+    """Block-scaled 8-bit floating-point storage contract.
+
+    This is the FP8 counterpart of :class:`QuantSpec`: the payload is a
+    real IEEE-style FP8 element (E4M3FN or E5M2), not an integer code, and
+    one scale is shared by a contiguous block of ``group_size`` elements.
+    The default mirrors MXFP8 — 32-element blocks with an 8-bit (E8M0,
+    power-of-two) shared scale — so the storage cost includes the scale
+    actually needed to decode the block.
+
+    Args:
+        format: ``'e4m3fn'`` (4 exponent bits, 3 mantissa bits, finite
+            range ±448, NaN at the two all-ones codes, no Inf) or
+            ``'e5m2'`` (5 exponent bits, 2 mantissa bits, finite range
+            ±57344, Inf/NaN at exponent 31).
+        group_size: elements sharing one scale (``>= 1``).
+        scale_bits: bits charged per stored scale (default 8 = E8M0;
+            use 16 for an fp16 scale).
+        power_of_two: ``True`` snaps the per-block scale up to the next
+            power of two (the MXFP8/E8M0 contract); ``False`` uses the
+            exact absmax scale. Power-of-two scales can never overflow the
+            FP8 format, while exact scales use the full mantissa range.
+    """
+
+    format: str = 'e4m3fn'
+    group_size: int = 32
+    scale_bits: int = 8
+    power_of_two: bool = True
+
+    def __post_init__(self) -> None:
+        if self.format not in _FP8_FORMATS:
+            raise ValueError(
+                f'FP8Spec.format must be one of {sorted(_FP8_FORMATS)}, '
+                f'got {self.format!r}')
+        _require_int(self.group_size, 'FP8Spec.group_size', 1, 2 ** 30)
+        _require_int(self.scale_bits, 'FP8Spec.scale_bits', 0, 64)
+        if not isinstance(self.power_of_two, bool):
+            raise ValueError(
+                f'FP8Spec.power_of_two must be a bool, got '
+                f'{self.power_of_two!r}')
+
+    @property
+    def payload_bits(self) -> int:
+        return 8
+
+    @property
+    def max_finite(self) -> float:
+        return _FP8_FORMATS[self.format]['max_finite']
+
+    @property
+    def min_normal(self) -> float:
+        return _FP8_FORMATS[self.format]['min_normal']
+
+    @property
+    def metadata_bits(self) -> float:
+        """Metadata bits charged per element (the shared block scale)."""
+        return self.scale_bits / self.group_size
+
+
+StorageSpec = QuantSpec | FP8Spec
+
+
+def _require_storage_spec(spec, name: str) -> StorageSpec:
+    if not isinstance(spec, (QuantSpec, FP8Spec)):
+        raise TypeError(
+            f'{name}: expected QuantSpec or FP8Spec, got {spec!r}')
+    return spec
+
+
+def bits_per_element(spec: StorageSpec) -> float:
     """Payload + metadata bits per stored element."""
-    if not isinstance(spec, QuantSpec):
-        raise TypeError(f'bits_per_element: expected QuantSpec, got {spec!r}')
+    _require_storage_spec(spec, 'bits_per_element')
+    if isinstance(spec, FP8Spec):
+        return FP8_BITS + spec.metadata_bits
     return float(spec.bits) + spec.metadata_bits
 
 
-def bytes_per_element(spec: QuantSpec) -> float:
+def bytes_per_element(spec: StorageSpec) -> float:
     """Effective bytes per stored element (payload + metadata)."""
     return bits_per_element(spec) / 8.0
 
 
-def storage_bytes(n_elements, spec: QuantSpec) -> float:
+def storage_bytes(n_elements, spec: StorageSpec) -> float:
     """Bytes required to store ``n_elements`` under ``spec`` (fractional ok)."""
     if (not isinstance(n_elements, (int, float))
             or isinstance(n_elements, bool)
@@ -144,7 +233,7 @@ def storage_bytes(n_elements, spec: QuantSpec) -> float:
     return float(n_elements) * bytes_per_element(spec)
 
 
-def compression_ratio(spec: QuantSpec,
+def compression_ratio(spec: StorageSpec,
                       baseline_bits: float = FP16_BITS) -> float:
     """Byte reduction factor vs an un-quantized ``baseline_bits`` layout.
 
@@ -160,9 +249,23 @@ def compression_ratio(spec: QuantSpec,
     return float(baseline_bits) / bits_per_element(spec)
 
 
-def spec_summary(spec: QuantSpec,
+def spec_summary(spec: StorageSpec,
                  baseline_bits: float = FP16_BITS) -> dict:
     """Flat, JSON-safe description of a spec (for provenance metadata)."""
+    _require_storage_spec(spec, 'spec_summary')
+    if isinstance(spec, FP8Spec):
+        return {
+            'format': spec.format,
+            'bits': spec.payload_bits,
+            'group_size': spec.group_size,
+            'symmetric': True,
+            'scale_bits': spec.scale_bits,
+            'zero_bits': 0,
+            'power_of_two_scale': spec.power_of_two,
+            'bits_per_element': bits_per_element(spec),
+            'bytes_per_element': bytes_per_element(spec),
+            'compression_vs_fp16': compression_ratio(spec, baseline_bits),
+        }
     return {
         'bits': spec.bits,
         'group_size': spec.group_size,
@@ -184,7 +287,61 @@ def _pad_last_dim(x: torch.Tensor, group_size: int):
     return x, n
 
 
-def fake_quantize(x: torch.Tensor, spec: QuantSpec,
+def _fp8_round_magnitude(values: torch.Tensor, fmt: str) -> torch.Tensor:
+    """Round non-negative magnitudes to the finite FP8 grid (ties to even).
+
+    The result saturates at ``max_finite`` instead of overflowing to Inf
+    (E5M2) or NaN (E4M3FN): a quantizer that silently emits non-finite
+    values is not a storage contract. Subnormal magnitudes are rounded on
+    the format's subnormal step, so the grid is exact at both ends.
+    """
+    meta = _FP8_FORMATS[fmt]
+    max_finite = meta['max_finite']
+    min_normal = meta['min_normal']
+    mbits = meta['mbits']
+    values = values.clamp(max=max_finite)
+    exp = torch.floor(torch.log2(values.clamp(min=min_normal)))
+    normal_step = torch.exp2(exp - mbits)
+    normal = torch.round(values / normal_step) * normal_step
+    subnormal_step = min_normal / (2.0 ** mbits)
+    subnormal = torch.round(values / subnormal_step) * subnormal_step
+    return torch.where(values < min_normal, subnormal, normal).clamp(
+        max=max_finite)
+
+
+def _fp8_group_scale(groups: torch.Tensor, spec: FP8Spec) -> torch.Tensor:
+    with torch.no_grad():
+        amax = groups.abs().amax(dim=-1, keepdim=True)
+        scale = torch.where(amax > 0, amax / spec.max_finite,
+                            torch.ones_like(amax))
+        if spec.power_of_two:
+            tiny = torch.finfo(groups.dtype).tiny
+            exp = torch.ceil(torch.log2(scale.clamp(min=tiny)))
+            exp = exp.clamp(-126.0, 127.0)
+            scale = torch.exp2(exp)
+    return scale
+
+
+def _fake_quantize_fp8(x: torch.Tensor, spec: FP8Spec,
+                       *, ste: bool) -> torch.Tensor:
+    orig_dtype = x.dtype
+    compute_dtype = (torch.float64 if orig_dtype == torch.float64
+                     else torch.float32)
+    work = x.to(compute_dtype)
+    padded, n = _pad_last_dim(work, spec.group_size)
+    lead = padded.shape[:-1]
+    groups = padded.reshape(*lead, -1, spec.group_size)
+    scale = _fp8_group_scale(groups, spec)
+    magnitude = groups.abs() / scale
+    codes = _fp8_round_magnitude(magnitude, spec.format)
+    deq = torch.sign(groups) * codes * scale
+    deq = deq.reshape(*lead, -1)[..., :n].to(orig_dtype)
+    if ste and x.requires_grad:
+        deq = x + (deq - x).detach()
+    return deq
+
+
+def fake_quantize(x: torch.Tensor, spec: StorageSpec,
                   *, ste: bool = True) -> torch.Tensor:
     """Quantize ``x`` to ``spec``'s grid and dequantize, in full precision.
 
@@ -192,6 +349,9 @@ def fake_quantize(x: torch.Tensor, spec: QuantSpec,
     the same shape/dtype/device as ``x``. With ``ste=True`` (default) the
     straight-through gradient is applied, so autograd sees
     ``d(output)/d(input) == 1`` almost everywhere.
+
+    ``spec`` may be a :class:`QuantSpec` (integer round-to-grid) or an
+    :class:`FP8Spec` (block-scaled E4M3FN/E5M2 round-to-nearest-even).
 
     Raises:
         ValueError: if ``x`` is not a floating-point tensor or contains
@@ -206,14 +366,15 @@ def fake_quantize(x: torch.Tensor, spec: QuantSpec,
             f'{x.dtype}')
     if x.dim() == 0:
         raise ValueError('fake_quantize: expected a tensor of rank >= 1')
-    if not isinstance(spec, QuantSpec):
-        raise TypeError(f'fake_quantize: expected QuantSpec, got {spec!r}')
+    _require_storage_spec(spec, 'fake_quantize')
     if x.numel() == 0:
         return x.clone()
     if not bool(torch.isfinite(x).all()):
         raise ValueError(
             'fake_quantize: input contains NaN/Inf; refusing to quantize '
             'non-finite values (they would map to an arbitrary grid point).')
+    if isinstance(spec, FP8Spec):
+        return _fake_quantize_fp8(x, spec, ste=ste)
 
     orig_dtype = x.dtype
     compute_dtype = (torch.float64 if orig_dtype == torch.float64
@@ -263,7 +424,7 @@ def fake_quantize(x: torch.Tensor, spec: QuantSpec,
     return deq
 
 
-def fake_quantize_(x: torch.Tensor, spec: QuantSpec) -> torch.Tensor:
+def fake_quantize_(x: torch.Tensor, spec: StorageSpec) -> torch.Tensor:
     """In-place :func:`fake_quantize` for inference-time cache writes.
 
     Overwrites ``x`` with its quantize→dequantize image and returns ``x``,
@@ -297,7 +458,7 @@ def fake_quantize_(x: torch.Tensor, spec: QuantSpec) -> torch.Tensor:
     return x
 
 
-def quantization_error(x: torch.Tensor, spec: QuantSpec) -> dict:
+def quantization_error(x: torch.Tensor, spec: StorageSpec) -> dict:
     """Observed error of ``fake_quantize(x, spec)`` vs ``x``.
 
     Returns ``max_abs_error``, ``rms_error``, ``signal_rms`` and ``snr_db``
@@ -365,9 +526,10 @@ def _normalize_policy(row: dict, quant) -> dict:
     """Resolve ``quant`` into a ``{stem: QuantSpec | None}`` policy.
 
     ``quant`` may be ``None`` (fp16 baseline for every component), a single
-    :class:`QuantSpec` (applied to every component), or a mapping from row
-    field stem (e.g. ``'core'``, ``'indexer'``, ``'state'``, ``'kda'``) to
-    a :class:`QuantSpec`/``None``. A ``'*'`` key sets the default for
+    :class:`QuantSpec` / :class:`FP8Spec` (applied to every component), or a
+    mapping from row field stem (e.g. ``'core'``, ``'indexer'``,
+    ``'state'``, ``'kda'``) to a spec/``None``. A ``'*'`` key sets the
+    default for
     stems not listed. Stems that do not exist in ``row`` raise
     ``ValueError`` (typo protection: applying a policy to a field the row
     does not carry would silently not happen).
@@ -375,29 +537,29 @@ def _normalize_policy(row: dict, quant) -> dict:
     stems = _row_component_stems(row)
     if quant is None:
         return {stem: None for stem in stems}
-    if isinstance(quant, QuantSpec):
+    if isinstance(quant, (QuantSpec, FP8Spec)):
         return {stem: quant for stem in stems}
     if not isinstance(quant, dict):
         raise TypeError(
-            f'quantized_row_bytes: quant must be None, a QuantSpec or a '
-            f'dict, got {type(quant)!r}')
+            f'quantized_row_bytes: quant must be None, a QuantSpec, an '
+            f'FP8Spec or a dict, got {type(quant)!r}')
     unknown = sorted(set(quant) - set(stems) - {'*'})
     if unknown:
         raise ValueError(
             f'quantized_row_bytes: policy names unknown component(s) '
             f'{unknown}; this row has {stems}.')
     default = quant.get('*')
-    if default is not None and not isinstance(default, QuantSpec):
+    if default is not None and not isinstance(default, (QuantSpec, FP8Spec)):
         raise TypeError(
-            f'quantized_row_bytes: policy["*"] must be a QuantSpec or '
-            f'None, got {default!r}')
+            f'quantized_row_bytes: policy["*"] must be a QuantSpec, an '
+            f'FP8Spec or None, got {default!r}')
     resolved = {}
     for stem in stems:
         spec = quant.get(stem, default)
-        if spec is not None and not isinstance(spec, QuantSpec):
+        if spec is not None and not isinstance(spec, (QuantSpec, FP8Spec)):
             raise TypeError(
                 f'quantized_row_bytes: policy[{stem!r}] must be a '
-                f'QuantSpec or None, got {spec!r}')
+                f'QuantSpec, an FP8Spec or None, got {spec!r}')
         resolved[stem] = spec
     return resolved
 
@@ -421,8 +583,9 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
     which policy priced which component.
 
     ``quant`` follows :func:`_normalize_policy`: ``None`` prices every
-    component at fp16 (2.0 bytes/element); a :class:`QuantSpec` applies to
-    all; a mapping prices per stem with an optional ``'*'`` fallback.
+    component at fp16 (2.0 bytes/element); a :class:`QuantSpec` or
+    :class:`FP8Spec` applies to all; a mapping prices per stem with an
+    optional ``'*'`` fallback.
     """
     if not isinstance(row, dict):
         raise TypeError(f'quantized_row_bytes: row must be a dict, got '

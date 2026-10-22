@@ -46,6 +46,7 @@ import torch  # noqa: E402
 import decode_bandwidth as db  # noqa: E402
 import kv_budget  # noqa: E402
 import lm_consistency  # noqa: E402
+from kv_quant import FP8Spec  # noqa: E402
 from ops_fused import HybridAttentionStack, HybridConfig  # noqa: E402
 
 
@@ -281,6 +282,69 @@ def test_bandwidth_bound_units():
     assert db.bandwidth_bound_ms(1e9, 1000.0) == pytest.approx(1.0)
     assert db.bandwidth_bound_ms(0, 100.0) == 0.0
     assert db.bandwidth_bound_ms(4e9, 500.0) == pytest.approx(8.0)
+
+
+# ---------------------------------------------------------------------------
+# per-operator storage policy (FP8 recurrent state)
+# ---------------------------------------------------------------------------
+
+def test_fp8_state_storage_pricing():
+    cfg = small_cfg()
+    fp8 = FP8Spec()
+    base = db.decode_traffic_breakdown(cfg, T)
+    opt = db.decode_traffic_breakdown(cfg, T,
+                                      storage={'memory': fp8})
+    assert opt['bytes_per_element_by_op'] == {
+        'memory': 1.03125, 'csa': 4.0, 'hca': 4.0}
+    assert opt['read_bytes_by_op']['csa'] == base['read_bytes_by_op']['csa']
+    assert opt['read_bytes_by_op']['hca'] == base['read_bytes_by_op']['hca']
+    assert opt['read_bytes_by_op']['memory'] == pytest.approx(
+        base['read_elements_by_op']['memory'] * 1.03125)
+    assert opt['total_bytes_per_token'] < base['total_bytes_per_token']
+    assert opt['read_bytes_per_token'] + opt['write_bytes_per_token'] \
+        == pytest.approx(opt['total_bytes_per_token'])
+
+    led = db.decode_step_ledger(cfg, T, batch=8,
+                                storage={'memory': fp8},
+                                weight_itemsize=2)
+    fp8_state = 8 * opt['total_bytes_per_token']
+    assert led['state_bytes_per_step'] == pytest.approx(fp8_state)
+    assert led['weight_bytes_per_step'] \
+        == db.attention_tower_weight_bytes(cfg, itemsize=2)['bytes']
+    assert led['total_bytes_per_step'] == pytest.approx(
+        led['weight_bytes_per_step'] + fp8_state)
+
+    old_switch = db.weights_state_switch_batch(cfg, T)
+    new_switch = db.weights_state_switch_batch(
+        cfg, T, storage={'memory': fp8}, weight_itemsize=2)
+    manual = (db.attention_tower_weight_bytes(cfg, itemsize=2)['bytes']
+              / opt['total_bytes_per_token'])
+    assert new_switch == pytest.approx(manual)
+    # Shrinking the state moves the switch to a larger batch; with fp16
+    # weights the switch is smaller than the fp32-weight/fp8-state one but
+    # still larger than the all-fp32 element-ratio baseline.
+    fp32_switch = db.weights_state_switch_batch(
+        cfg, T, storage={'memory': fp8})
+    assert fp32_switch > new_switch > old_switch
+
+    rows = db.route_switch_table(cfg, T, batches=(1, 16),
+                                 storage={'memory': fp8})
+    assert all(r['status'] == 'ok' for r in rows)
+    base_rows = db.route_switch_table(cfg, T, batches=(1, 16))
+    for row, base_row in zip(rows, base_rows):
+        assert row['state_bytes_per_token'] \
+            < base_row['state_bytes_per_token']
+        assert row['weights_state_switch_batch'] \
+            > base_row['weights_state_switch_batch']
+        assert row['bytes_per_element_by_op']['memory'] == 1.03125
+
+    summary = db.storage_summary({'memory': fp8})
+    assert summary['bytes_per_element_by_op']['memory'] == 1.03125
+    assert summary['spec']['memory']['format'] == 'e4m3fn'
+    with pytest.raises(ValueError):
+        db.decode_traffic_breakdown(cfg, T, storage={'mamba': fp8})
+    with pytest.raises(TypeError):
+        db.decode_traffic_breakdown(cfg, T, storage={'memory': 'fp8'})
 
 
 # ---------------------------------------------------------------------------

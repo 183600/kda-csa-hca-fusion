@@ -161,6 +161,21 @@ Exp 4 overfit-gate report are explicitly exempt). `ci_gate.py` covers
 `run_correctness.py` / `test_figures.py`, so this wiring provides the
 quantization experiments' pipeline coverage.
 
+
+## Block-scaled FP8 (`FP8Spec`)
+
+`kv_quant` also carries a real FP8 storage contract for the format actual
+FP8 state caches use: `FP8Spec(format='e4m3fn'|'e5m2', group_size=32,
+scale_bits=8, power_of_two=True)` is MXFP8 by default (8-bit E4M3FN payload
++ one E8M0 scale per 32 elements = **8.25 bits/element**). It supports
+round-to-nearest-even onto the finite grid, subnormals, finite saturation,
+exact-absmax or power-of-two scales, STE training, and the same
+`kv_budget` byte bridge as `QuantSpec`. `decode_bandwidth` accepts a
+per-operator storage policy, so the recurrent state, CSA cache, and HCA
+cache can be priced at different precisions; see
+[docs/fp8-block-scaled-state.md](fp8-block-scaled-state.md) for the
+memory-bound analysis and the T=128/T=4096 crossover results.
+
 ## bfloat16 delta-rule numerical stability
 
 The KDA delta-rule recurrence is sensitive to reduced precision because it

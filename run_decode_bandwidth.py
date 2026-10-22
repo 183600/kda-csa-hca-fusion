@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import roofline  # noqa: E402
 
 import decode_bandwidth as db  # noqa: E402
+from kv_quant import FP8Spec  # noqa: E402
 from kaggle_setup import (append_run_manifest, capture_provenance,  # noqa: E402
                           configure_torch_for_device, make_run_manifest_entry,
                           sanitize_for_json, write_results_json)
@@ -125,7 +126,8 @@ def measure_host_bandwidth(device) -> tuple[float | None, str]:
 def _print_report(report: dict) -> None:
     cfg = report['config']
     print(f"[exp13] T={cfg['T']}  batches={cfg['batches']}  "
-          f"itemsize={cfg['itemsize']}B  d_model={cfg['d_model']}  "
+          f"itemsize={cfg['itemsize']}B  storage={cfg['storage']}  "
+          f"d_model={cfg['d_model']}  "
           f"layout={'-'.join(cfg['layout_unit'])}")
     if cfg['bw_gbps'] is None:
         print('[exp13] host bandwidth unavailable; bandwidth-bound '
@@ -155,11 +157,30 @@ def _print_report(report: dict) -> None:
 def build_report(*, T: int, batches: tuple[int, ...],
                  routes: tuple[str, ...], d_model: int = 32,
                  itemsize: int = 4, bw_gbps: float | None = None,
-                 bw_source: str = 'unavailable') -> dict:
-    """Assemble the JSON-safe Exp 13 payload (pure; no I/O)."""
+                 bw_source: str = 'unavailable',
+                 storage: str = 'uniform') -> dict:
+    """Assemble the JSON-safe Exp 13 payload (pure; no I/O).
+
+    ``storage='mixed-fp8'`` prices MXFP8 recurrent state (E4M3FN payload,
+    32-element blocks, E8M0 scales) while weights and CSA/HCA caches keep
+    the ``itemsize`` baseline, so the comparison isolates state storage.
+    Use ``itemsize=2`` for an all-fp16 baseline or the realistic fp16
+    weights + FP8 state configuration. The default ``'uniform'`` is the
+    legacy baseline.
+    """
+    if storage not in ('uniform', 'mixed-fp8'):
+        raise ValueError(
+            f"storage={storage!r} must be 'uniform' or 'mixed-fp8'.")
     base_cfg = build_base_cfg(d_model)
+    if storage == 'uniform':
+        state_storage = None
+    else:
+        state_storage = {'memory': FP8Spec()}
+    weight_itemsize = itemsize
     table = db.route_switch_table(base_cfg, T, batches=batches,
-                                  routes=routes, itemsize=itemsize)
+                                  routes=routes, itemsize=itemsize,
+                                  storage=state_storage,
+                                  weight_itemsize=weight_itemsize)
     if bw_gbps is not None:
         for row in table:
             if row['status'] != 'ok':
@@ -167,7 +188,8 @@ def build_report(*, T: int, batches: tuple[int, ...],
             for cell in row['by_batch'].values():
                 cell['bandwidth_bound_ms'] = db.bandwidth_bound_ms(
                     cell['total_bytes_per_step'], bw_gbps)
-    weights = db.attention_tower_weight_bytes(base_cfg, itemsize=itemsize)
+    weights = db.attention_tower_weight_bytes(
+        base_cfg, itemsize=weight_itemsize)
     return {
         'kind': KIND,
         'method': (
@@ -179,6 +201,9 @@ def build_report(*, T: int, batches: tuple[int, ...],
             'T': int(T),
             'batches': [int(b) for b in batches],
             'itemsize': int(itemsize),
+            'weight_itemsize': int(weight_itemsize),
+            'storage': storage,
+            'storage_policy': db.storage_summary(state_storage, itemsize),
             'd_model': int(d_model),
             'routes': list(routes),
             'layout_unit': list(db.unit_layout(base_cfg)),
@@ -202,6 +227,10 @@ def build_report(*, T: int, batches: tuple[int, ...],
             'recurrent-state writes); see its docstring for exclusions',
             'bandwidth_bound_ms uses the host copy bandwidth and is a '
             'memory-side lower bound, not a latency prediction',
+            'storage=mixed-fp8: MXFP8 recurrent state (8-bit E4M3FN payload '
+            '+ E8M0 block scale per 32 elements = 8.25 bits/element); '
+            'weights and CSA/HCA caches keep the itemsize baseline, so '
+            'the delta isolates state storage',
         ],
         'provenance': capture_provenance(),
     }
@@ -219,7 +248,10 @@ def main(argv=None) -> int:
     parser.add_argument('--d-model', type=int, default=32,
                         help='model width for the matrix geometry')
     parser.add_argument('--itemsize', type=int, default=4,
-                        help='bytes per element (4 = fp32)')
+                        help='bytes per element baseline (4 = fp32)')
+    parser.add_argument('--storage', choices=('uniform', 'mixed-fp8'),
+                        default='uniform',
+                        help='uniform baseline or MXFP8 recurrent state')
     parser.add_argument('--bw-gbps', type=float, default=None,
                         help='override the measured host bandwidth')
     parser.add_argument('--json', default=RESULTS_PATH,
@@ -236,7 +268,8 @@ def main(argv=None) -> int:
     report = build_report(
         T=args.T, batches=parse_batches(args.batches),
         routes=parse_routes(args.routes), d_model=args.d_model,
-        itemsize=args.itemsize, bw_gbps=bw, bw_source=source)
+        itemsize=args.itemsize, bw_gbps=bw, bw_source=source,
+        storage=args.storage)
     payload = sanitize_for_json(report)
     json.dumps(payload, allow_nan=False)
     _print_report(payload)

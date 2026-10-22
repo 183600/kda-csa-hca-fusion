@@ -59,6 +59,7 @@ import math
 import torch
 
 import kv_budget
+from kv_quant import FP8Spec, QuantSpec, bytes_per_element, spec_summary
 from lm_consistency import decode_elements_per_token, decode_read_spec
 from ops_fused import MEMORY_LAYER_KINDS, HybridAttentionStack, HybridConfig
 
@@ -98,6 +99,71 @@ def _validate_batch(batch: int) -> None:
     if batch < 1:
         raise ValueError(
             f'decode_bandwidth: batch={batch} must be >= 1.')
+
+
+_STORAGE_OPS = ('memory', 'csa', 'hca')
+
+
+def _resolve_storage(storage, itemsize: int) -> dict[str, float]:
+    """Resolve a per-operator storage policy into bytes/element.
+
+    ``None`` keeps the legacy uniform ``itemsize``. A single
+    :class:`~kv_quant.QuantSpec` / :class:`~kv_quant.FP8Spec` applies to
+    every operator; a mapping may override ``'memory'`` (the recurrent
+    state) and/or ``'csa'`` / ``'hca'`` (their read traffic), with ``'*'``
+    as the fallback. Metadata (block scales) is charged by
+    ``kv_quant.bytes_per_element`` exactly as in the storage contract.
+    """
+    if storage is None:
+        return {op: float(itemsize) for op in _STORAGE_OPS}
+    if isinstance(storage, (QuantSpec, FP8Spec)):
+        bpe = bytes_per_element(storage)
+        return {op: bpe for op in _STORAGE_OPS}
+    if not isinstance(storage, dict):
+        raise TypeError(
+            f'decode_bandwidth: storage must be None, a QuantSpec, an '
+            f'FP8Spec or a dict, got {type(storage)!r}')
+    unknown = sorted(set(storage) - set(_STORAGE_OPS) - {'*'})
+    if unknown:
+        raise ValueError(
+            f'decode_bandwidth: storage names unknown operator(s) '
+            f'{unknown}; choose from {list(_STORAGE_OPS)} or "*".')
+    default = storage.get('*', itemsize)
+    out: dict[str, float] = {}
+    for op in _STORAGE_OPS:
+        spec = storage.get(op, default)
+        if spec is None:
+            out[op] = float(itemsize)
+        elif isinstance(spec, (QuantSpec, FP8Spec)):
+            out[op] = bytes_per_element(spec)
+        elif (isinstance(spec, (int, float)) and not isinstance(spec, bool)
+              and math.isfinite(spec) and spec > 0):
+            out[op] = float(spec)
+        else:
+            raise TypeError(
+                f'decode_bandwidth: storage[{op!r}] must be a QuantSpec, '
+                f'an FP8Spec, a positive bytes/element number or None, '
+                f'got {spec!r}')
+    return out
+
+
+def storage_summary(storage, itemsize: int = 4) -> dict:
+    """JSON-safe provenance for a storage policy (no tensors)."""
+    _validate_itemsize(itemsize)
+    bpe = _resolve_storage(storage, itemsize)
+    if isinstance(storage, (QuantSpec, FP8Spec)):
+        spec = spec_summary(storage)
+    elif isinstance(storage, dict):
+        spec = {key: (spec_summary(value)
+                      if isinstance(value, (QuantSpec, FP8Spec)) else value)
+                for key, value in storage.items()}
+    else:
+        spec = None
+    return {
+        'itemsize': itemsize,
+        'bytes_per_element_by_op': bpe,
+        'spec': spec,
+    }
 
 
 def unit_layout(cfg: HybridConfig) -> tuple[str, ...]:
@@ -175,7 +241,7 @@ def attention_tower_weight_bytes(cfg: HybridConfig, *,
 
 
 def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
-                             itemsize: int = 4) -> dict:
+                             itemsize: int = 4, storage=None) -> dict:
     """Per-sequence per-token decode traffic split by operator.
 
     Totals come from the canonical ``lm_consistency`` decode byte model
@@ -192,11 +258,15 @@ def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
     model amortizes / excludes compressed-block and window writes (see
     ``lm_consistency.decode_elements_per_token``).
 
-    Returns read/write element and byte dicts keyed by
-    ``'memory' / 'csa' / 'hca'`` plus the canonical totals.
+    ``storage`` prices each operator's elements independently (e.g. FP8
+    recurrent state + fp16 CSA/HCA caches). ``None`` is the legacy uniform
+    ``itemsize`` baseline. Returns read/write element and byte dicts keyed
+    by ``'memory' / 'csa' / 'hca'`` plus the canonical totals and the
+    resolved ``bytes_per_element_by_op``.
     """
     _require_cfg(cfg)
     _validate_itemsize(itemsize)
+    bpe = _resolve_storage(storage, itemsize)
     elems = decode_elements_per_token(cfg, T)
     n_mem, n_csa, n_hca = elems['layout']
     spec = decode_read_spec(cfg)
@@ -220,26 +290,33 @@ def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
                   'hca': float(hca_read)}
     write_by_op = {'memory': write_total, 'csa': 0.0, 'hca': 0.0}
     total_elements = total_read + write_total
+    read_bytes_by_op = {op: read_by_op[op] * bpe[op] for op in _STORAGE_OPS}
+    write_bytes_by_op = {op: write_by_op[op] * bpe[op]
+                         for op in _STORAGE_OPS}
+    read_bytes = sum(read_bytes_by_op.values())
+    write_bytes = sum(write_bytes_by_op.values())
     return {
         'T': int(T),
         'itemsize': itemsize,
         'memory_route': elems['memory_route'],
         'layout': list(elems['layout']),
+        'bytes_per_element_by_op': bpe,
         'read_elements_by_op': read_by_op,
         'write_elements_by_op': write_by_op,
         'read_elements_per_token': total_read,
         'write_elements_per_token': write_total,
         'total_elements_per_token': total_elements,
-        'read_bytes_by_op': {k: v * itemsize for k, v in read_by_op.items()},
-        'write_bytes_by_op': {k: v * itemsize for k, v in write_by_op.items()},
-        'read_bytes_per_token': total_read * itemsize,
-        'write_bytes_per_token': write_total * itemsize,
-        'total_bytes_per_token': total_elements * itemsize,
+        'read_bytes_by_op': read_bytes_by_op,
+        'write_bytes_by_op': write_bytes_by_op,
+        'read_bytes_per_token': read_bytes,
+        'write_bytes_per_token': write_bytes,
+        'total_bytes_per_token': read_bytes + write_bytes,
     }
 
 
 def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
-                       itemsize: int = 4,
+                       itemsize: int = 4, storage=None,
+                       weight_itemsize: int | None = None,
                        include_weights: bool = True) -> dict:
     """The batch-aware decode-step traffic ledger.
 
@@ -250,17 +327,24 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
     weight term dominates and shrinks with batch; at large batch the
     per-sequence state/cache term saturates it.
 
-    ``state_share`` is the fraction of the step's traffic that is
-    per-sequence state/cache; ``weights_state_switch_batch`` (float) is
-    the batch at which the two terms are equal (``None`` when there is no
-    state traffic). All values are JSON-strict Python scalars.
+    ``storage`` prices the state/cache term per operator (see
+    :func:`decode_traffic_breakdown`); ``weight_itemsize`` lets weights use
+    a different precision from the ``itemsize`` baseline. ``state_share``
+    is the fraction of the step's traffic that is per-sequence
+    state/cache; ``weights_state_switch_batch`` (float) is the batch at
+    which the two terms are equal (``None`` when there is no state
+    traffic). All values are JSON-strict Python scalars.
     """
     _require_cfg(cfg)
     _validate_itemsize(itemsize)
     _validate_batch(batch)
-    traffic = decode_traffic_breakdown(cfg, T, itemsize=itemsize)
+    if weight_itemsize is None:
+        weight_itemsize = itemsize
+    _validate_itemsize(weight_itemsize)
+    traffic = decode_traffic_breakdown(cfg, T, itemsize=itemsize,
+                                       storage=storage)
     if include_weights:
-        weights = attention_tower_weight_bytes(cfg, itemsize=itemsize)
+        weights = attention_tower_weight_bytes(cfg, itemsize=weight_itemsize)
         weight_elements = int(weights['total'])
         weight_bytes = int(weights['bytes'])
     else:
@@ -274,8 +358,10 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
         'T': int(T),
         'batch': batch,
         'itemsize': itemsize,
+        'weight_itemsize': weight_itemsize,
         'memory_route': traffic['memory_route'],
         'layout': traffic['layout'],
+        'bytes_per_element_by_op': traffic['bytes_per_element_by_op'],
         'weight_elements': weight_elements,
         'weight_bytes_per_step': weight_bytes,
         'state_read_bytes_per_step': state_read_bytes,
@@ -296,28 +382,44 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
 
 
 def weights_state_switch_batch(cfg: HybridConfig, T: int, *,
-                               itemsize: int = 4) -> float | None:
+                               itemsize: int = 4, storage=None,
+                               weight_itemsize: int | None = None
+                               ) -> float | None:
     """Batch at which weight traffic equals per-sequence state traffic.
 
-    ``itemsize`` cancels in the ratio (both terms are bytes), but is
-    accepted so every public entry point shares one signature. Returns
-    ``None`` when the canonical model attributes zero state traffic to the
-    configuration (then weights dominate at every batch).
+    With a uniform ``itemsize`` and no storage policy the element ratio
+    cancels to the legacy value. With ``storage`` (and/or a different
+    ``weight_itemsize``) the ratio is computed in BYTES, so FP8 state
+    storage moves the switch to a larger batch (weights dominate longer).
+    Returns ``None`` when the canonical model attributes zero state traffic
+    to the configuration (then weights dominate at every batch).
     """
     _require_cfg(cfg)
     _validate_itemsize(itemsize)
-    weight_elements = attention_tower_parameter_elements(cfg)['total']
-    state_elements = decode_elements_per_token(cfg, T)[
-        'total_elements_per_token']
-    if state_elements <= 0:
+    if weight_itemsize is not None:
+        _validate_itemsize(weight_itemsize)
+    if storage is None and weight_itemsize is None:
+        weight_elements = attention_tower_parameter_elements(cfg)['total']
+        state_elements = decode_elements_per_token(cfg, T)[
+            'total_elements_per_token']
+        if state_elements <= 0:
+            return None
+        return weight_elements / state_elements
+    win = itemsize if weight_itemsize is None else weight_itemsize
+    weight_bytes = attention_tower_weight_bytes(cfg, itemsize=win)['bytes']
+    traffic = decode_traffic_breakdown(cfg, T, itemsize=itemsize,
+                                       storage=storage)
+    state_bytes = traffic['total_bytes_per_token']
+    if state_bytes <= 0:
         return None
-    return weight_elements / state_elements
+    return weight_bytes / state_bytes
 
 
 def route_switch_table(base_cfg: HybridConfig, T: int, *,
                        batches: tuple[int, ...] = (1, 4, 16, 64),
                        routes: tuple[str, ...] = MEMORY_ROUTES,
-                       itemsize: int = 4) -> list[dict]:
+                       itemsize: int = 4, storage=None,
+                       weight_itemsize: int | None = None) -> list[dict]:
     """One ledger row per memory route, all else held fixed.
 
     Each row replaces ONLY ``memory_type`` on ``base_cfg`` (the ratio-mode
@@ -326,6 +428,10 @@ def route_switch_table(base_cfg: HybridConfig, T: int, *,
     layouts are rejected: they pin concrete memory kinds and a
     route switch is not expressible there.
 
+    ``storage`` and ``weight_itemsize`` follow
+    :func:`decode_step_ledger`; the same policy is applied to every route,
+    so the only per-row difference remains the recurrent operator.
+
     A route whose geometry is incompatible with the base config (or whose
     optional backend is unavailable) is recorded as
     ``{'route': ..., 'status': 'unavailable', 'reason': ...}`` instead of
@@ -333,6 +439,10 @@ def route_switch_table(base_cfg: HybridConfig, T: int, *,
     """
     _require_cfg(base_cfg)
     _validate_itemsize(itemsize)
+    if weight_itemsize is None:
+        weight_itemsize = itemsize
+    _validate_itemsize(weight_itemsize)
+    _resolve_storage(storage, itemsize)
     if base_cfg.layout is not None:
         raise ValueError(
             'route_switch_table requires a ratio-mode config '
@@ -351,12 +461,16 @@ def route_switch_table(base_cfg: HybridConfig, T: int, *,
                 f'{MEMORY_LAYER_KINDS}.')
         try:
             cfg = dataclasses.replace(base_cfg, memory_type=route)
-            weights = attention_tower_weight_bytes(cfg, itemsize=itemsize)
-            switch = weights_state_switch_batch(cfg, T, itemsize=itemsize)
+            weights = attention_tower_weight_bytes(
+                cfg, itemsize=weight_itemsize)
+            switch = weights_state_switch_batch(
+                cfg, T, itemsize=itemsize, storage=storage,
+                weight_itemsize=weight_itemsize)
             by_batch: dict[str, dict] = {}
             for b in batches:
-                led = decode_step_ledger(cfg, T, batch=b, itemsize=itemsize,
-                                         include_weights=True)
+                led = decode_step_ledger(
+                    cfg, T, batch=b, itemsize=itemsize, storage=storage,
+                    weight_itemsize=weight_itemsize, include_weights=True)
                 by_batch[str(b)] = {
                     'total_bytes_per_step': led['total_bytes_per_step'],
                     'bytes_per_sequence_per_token':
@@ -365,13 +479,16 @@ def route_switch_table(base_cfg: HybridConfig, T: int, *,
                     'read_bytes_by_op_per_step':
                         led['read_bytes_by_op_per_step'],
                 }
-            breakdown = decode_traffic_breakdown(cfg, T, itemsize=itemsize)
+            breakdown = decode_traffic_breakdown(
+                cfg, T, itemsize=itemsize, storage=storage)
             rows.append({
                 'route': route,
                 'status': 'ok',
                 'weight_elements': int(weights['total']),
                 'weight_bytes_per_step': int(weights['bytes']),
                 'weight_bytes_by_kind': weights['bytes_by_kind'],
+                'bytes_per_element_by_op':
+                    breakdown['bytes_per_element_by_op'],
                 'state_elements_per_token':
                     breakdown['total_elements_per_token'],
                 'state_bytes_per_token': breakdown['total_bytes_per_token'],

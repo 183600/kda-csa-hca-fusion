@@ -7372,6 +7372,67 @@ def test_rwkv7_cache_live_accounting(device='cpu'):
     return results
 
 
+def test_fp8_state_storage_ledger(device='cpu'):
+    """FP8 block-scaled state storage prices the memory-bound decode ledger.
+
+    Pins the cross-module contract: an ``FP8Spec`` payload is round-to-grid
+    with a charged block scale, and the decode ledger applies a per-operator
+    storage policy (FP8 recurrent state, unchanged CSA/HCA caches) without
+    touching the canonical element model. The weights<->state switch batch
+    must move to a larger batch when state bytes shrink.
+    """
+    logger.info("Test: FP8 block-scaled state storage in the decode ledger")
+    results = []
+    import decode_bandwidth as db
+    from kv_quant import FP8Spec, bits_per_element, fake_quantize
+
+    spec = FP8Spec(format='e4m3fn', group_size=32, scale_bits=8,
+                   power_of_two=True)
+    results.append(_ok(
+        'MXFP8 storage = 8.25 bits/element',
+        abs(bits_per_element(spec) - 8.25) < 1e-12,
+        f'{bits_per_element(spec)}'))
+    torch.manual_seed(23)
+    x = torch.randn(2, 64, device=device)
+    q = fake_quantize(x, spec, ste=False)
+    results.append(_ok(
+        'FP8 fake-quantize is finite and bounds-preserving',
+        bool(torch.isfinite(q).all())
+        and float(q.abs().max()) <= spec.max_finite,
+        f'max|q|={float(q.abs().max()):.3f}'))
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=4, csa_topk=2, csa_nh=2, csa_c=8, csa_dc=8,
+        csa_cI=4, csa_nIh=1, csa_sliding_window=4,
+        hca_m2=4, hca_nh=2, hca_c=8, hca_dc=8,
+        hca_sliding_window=4)
+    T = 128
+    base = db.decode_traffic_breakdown(cfg, T)
+    fp8 = db.decode_traffic_breakdown(cfg, T, storage={'memory': spec})
+    results.append(_ok(
+        'FP8 prices only the memory-route state',
+        fp8['bytes_per_element_by_op'] == {'memory': 1.03125,
+                                           'csa': 4.0, 'hca': 4.0}
+        and fp8['read_bytes_by_op']['csa'] == base['read_bytes_by_op']['csa']
+        and fp8['read_bytes_by_op']['hca'] == base['read_bytes_by_op']['hca'],
+        str(fp8['bytes_per_element_by_op'])))
+    results.append(_ok(
+        'FP8 memory traffic is the element row times 1.03125',
+        abs(fp8['read_bytes_by_op']['memory']
+            - base['read_elements_by_op']['memory'] * 1.03125) < 1e-9,
+        f"{fp8['read_bytes_by_op']['memory']:.3f}"))
+    old_switch = db.weights_state_switch_batch(cfg, T)
+    new_switch = db.weights_state_switch_batch(cfg, T,
+                                               storage={'memory': spec})
+    results.append(_ok(
+        'FP8 state moves the weights/state switch batch outward',
+        old_switch is not None and new_switch is not None
+        and new_switch > old_switch,
+        f'old={old_switch:.3f}, new={new_switch:.3f}'))
+    return results
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -7564,6 +7625,8 @@ def main():
     all_results += _run_safe(test_rwkv7_backend_selection_contract, device)
     all_results += _run_safe(test_rwkv7_fla_backend_parity, device)
     all_results += _run_safe(test_rwkv7_cache_live_accounting, device)
+    # FP8 block-scaled state storage priced through the decode ledger.
+    all_results += _run_safe(test_fp8_state_storage_ledger, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

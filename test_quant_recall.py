@@ -45,13 +45,16 @@ import torch  # noqa: E402
 import kv_budget  # noqa: E402
 from kaggle_setup import sanitize_for_json  # noqa: E402
 from kv_quant import (  # noqa: E402
+    FP8Spec,
     QuantSpec,
+    _fp8_round_magnitude,
     bits_per_element,
     bytes_per_element,
     compression_ratio,
     fake_quantize,
     quantization_error,
     quantized_row_bytes,
+    spec_summary,
     storage_bytes,
 )
 from run_quant_recall import (  # noqa: E402
@@ -381,12 +384,129 @@ def test_quant_recall_report_rows():
                 abs(cell['state_bytes'] - cheapest['state_bytes']) < 1e-9, '')
 
 
+# --- 5. block-scaled FP8 storage -----------------------------------------
+
+def test_fp8_spec_and_grid():
+    print('\nTest: FP8Spec accounting and FP8 grid')
+    spec = FP8Spec()
+    _ok('MXFP8 default = 8 + 8/32 = 8.25 bits/element',
+        abs(bits_per_element(spec) - 8.25) < 1e-12,
+        f'{bits_per_element(spec)}')
+    _ok('MXFP8 default = 1.03125 bytes/element',
+        abs(bytes_per_element(spec) - 1.03125) < 1e-12,
+        f'{bytes_per_element(spec)}')
+    _ok('MXFP8 compression vs fp16 = 16/8.25',
+        abs(spec_summary(spec)['compression_vs_fp16'] - 16.0 / 8.25)
+        < 1e-12, f"{spec_summary(spec)['compression_vs_fp16']:.4f}")
+    _ok('storage_bytes(256, MXFP8) = 264 B',
+        abs(storage_bytes(256, spec) - 264.0) < 1e-12,
+        f'{storage_bytes(256, spec)}')
+    fp16_scale = FP8Spec(scale_bits=16)
+    _ok('fp16 scale = 8.5 bits/element',
+        abs(bits_per_element(fp16_scale) - 8.5) < 1e-12,
+        f'{bits_per_element(fp16_scale)}')
+    for kwargs, label in [
+        (dict(format='e3m4'), 'unknown format rejected'),
+        (dict(group_size=0), 'group_size=0 rejected'),
+        (dict(scale_bits=-1), 'negative scale_bits rejected'),
+        (dict(power_of_two=1), 'non-bool power_of_two rejected'),
+    ]:
+        try:
+            FP8Spec(**kwargs)
+            _ok(label, False, 'no error')
+        except ValueError:
+            _ok(label, True)
+
+    e4 = torch.tensor([0.0, 1.0, 1.0625, 1.1875, 1.3125, 2.0 ** -9,
+                       0.0029296875, 0.015625, 448.0, 449.0])
+    e4_ref = torch.tensor([0.0, 1.0, 1.0, 1.25, 1.25, 2.0 ** -9,
+                           2.0 ** -8, 0.015625, 448.0, 448.0])
+    got4 = _fp8_round_magnitude(e4, 'e4m3fn')
+    _ok('E4M3FN grid: RNE ties, subnormals, saturation',
+        bool(torch.equal(got4, e4_ref)),
+        f'{got4.tolist()}')
+    e5 = torch.tensor([0.0, 1.0, 1.125, 1.375, 2.0 ** -16, 2.0 ** -17,
+                       57344.0, 60000.0])
+    e5_ref = torch.tensor([0.0, 1.0, 1.0, 1.5, 2.0 ** -16, 0.0,
+                           57344.0, 57344.0])
+    got5 = _fp8_round_magnitude(e5, 'e5m2')
+    _ok('E5M2 grid: RNE ties, subnormals, finite saturation',
+        bool(torch.equal(got5, e5_ref)), f'{got5.tolist()}')
+    for fmt, dtype_name in (('e4m3fn', 'float8_e4m3fn'),
+                            ('e5m2', 'float8_e5m2')):
+        dtype = getattr(torch, dtype_name, None)
+        if dtype is None:
+            continue
+        grid = torch.linspace(0, 60000 if fmt == 'e5m2' else 500,
+                              20001)
+        native = grid.to(dtype).float()
+        manual = _fp8_round_magnitude(grid, fmt)
+        _ok(f'{fmt}: manual grid matches torch native cast',
+            bool(torch.equal(manual, native)),
+            f'maxdiff={(manual - native).abs().max().item():.2e}')
+
+
+def test_fp8_fake_quantize_contract():
+    print('\nTest: block-scaled FP8 fake-quantize contract')
+    torch.manual_seed(17)
+    x = torch.randn(4, 128)
+    exact = FP8Spec(power_of_two=False)
+    y = fake_quantize(x, exact, ste=False)
+    err = (x - y).abs()
+    # E4M3FN normal relative step is 2**-3, so half-ULP <= |x|/16; the
+    # min_normal/subnormal branch has a fixed step of 2**-9.
+    bound = x.abs() / 16.0 + 2.0 ** -9
+    _ok('E4M3FN exact-scale error <= half-ULP bound',
+        bool((err <= bound + 1e-6).all()),
+        f'max|err|={float(err.max()):.3e}')
+    stats = quantization_error(x, exact)
+    _ok('E4M3FN fp8 SNR is positive', stats['snr_db'] > 0,
+        f"snr={stats['snr_db']:.1f} dB")
+    const = torch.full((2, 37), 0.7)
+    dqc = fake_quantize(const, FP8Spec(power_of_two=False), ste=False)
+    _ok('constant groups reconstruct exactly with an exact scale',
+        bool(torch.allclose(dqc, const, atol=1e-6)),
+        f'max|err|={(dqc - const).abs().max().item():.2e}')
+    _ok('all-zero FP8 groups are exactly zero',
+        bool((fake_quantize(torch.zeros(2, 40), FP8Spec()) == 0).all()))
+    pow2 = FP8Spec()
+    yp = fake_quantize(x, pow2, ste=False)
+    _ok('power-of-two scale stays finite and bounded',
+        bool(torch.isfinite(yp).all())
+        and float(yp.abs().max()) <= pow2.max_finite, '')
+    bad = x.clone()
+    bad[0, 0] = float('inf')
+    try:
+        fake_quantize(bad, FP8Spec())
+        _ok('non-finite FP8 input rejected', False, 'no error')
+    except ValueError:
+        _ok('non-finite FP8 input rejected', True)
+    g = x.clone().requires_grad_(True)
+    fake_quantize(g, FP8Spec(), ste=True).sum().backward()
+    _ok('FP8 STE gradient is exactly 1',
+        bool((g.grad == 1.0).all()), f'{float(g.grad.mean()):.3f}')
+    g2 = x.clone().requires_grad_(True)
+    fake_quantize(g2, FP8Spec(), ste=False).sum().backward()
+    _ok('FP8 ste=False exposes the zero-gradient quantizer',
+        bool((g2.grad == 0.0).all()), '')
+    dq16 = fake_quantize(x.half(), FP8Spec())
+    _ok('FP8 path preserves fp16 input dtype',
+        dq16.dtype == torch.float16, f'{dq16.dtype}')
+    row = kv_budget.op_read_elements('kda', 16, _MQAR_SPEC)
+    byte_row = quantized_row_bytes(row, {'state': FP8Spec()})
+    _ok('FP8 byte bridge prices the KDA state at 1.03125 B/elem',
+        abs(byte_row['state_bytes'] - 32 * 1.03125) < 1e-12,
+        f"{byte_row['state_bytes']}")
+
+
 _TEST_FUNCS = [
     test_quant_spec_accounting,
     test_quantized_row_bytes_bridge,
     test_fake_quantize_contract,
     test_quantized_state_recall_probe,
     test_quant_recall_report_rows,
+    test_fp8_spec_and_grid,
+    test_fp8_fake_quantize_contract,
 ]
 
 
