@@ -114,7 +114,7 @@ from ops_fused import HybridConfig, HybridKCHAttention, _memory_layer_lookback
 from multi_seed_stats import (_safe_mean, _sample_sd, holm_adjust,
                                summarize_paired)
 from run_decoding import HybridDecoding
-from results_schema import write as write_schema
+from results_schema import CURRENT_SCHEMA_VERSION, attach_integrity
 from train_diagnostics import (
     ValPoint,
     ValidationCurve,
@@ -3088,6 +3088,14 @@ def main():
                     for r in gate_record.get('reports', [])],
     }
     payload['provenance']['overfit_sanity_check'] = gate_record
+    # Keep the legacy ``rows``/``design`` fields (existing readers and the
+    # regression test use them) while also emitting the versioned
+    # ``results_schema`` envelope the module docstring promises. Without
+    # the ``results`` alias ``results_schema.parse`` rejects this file.
+    payload['schema_version'] = CURRENT_SCHEMA_VERSION
+    payload['kind'] = 'exp12_needle_haystack'
+    payload['results'] = all_rows
+    payload = attach_integrity(payload)
     json.dumps(payload, allow_nan=False)
     os.makedirs(os.path.dirname(args.json) or '.', exist_ok=True)
     write_results_json(payload, args.json, logger=logger)

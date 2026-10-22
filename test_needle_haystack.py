@@ -718,6 +718,17 @@ def test_needle_experiment_json_output():
     _ok('has experiment field', 'experiment' in payload)
     _ok('experiment is exp12', payload['experiment'] == 'exp12_needle_haystack')
     _ok('has rows', 'rows' in payload and len(payload['rows']) > 0)
+    # The module promises a versioned results_schema envelope; the legacy
+    # ``rows`` alias must stay, but the strict reader must also accept it.
+    import results_schema
+    meta, schema_rows, version = results_schema.parse(payload)
+    _ok('payload parses as a results_schema envelope',
+        schema_rows == payload['rows'],
+        f'{len(schema_rows)} vs {len(payload["rows"])} rows, v={version}')
+    from results_schema import verify_integrity
+    _ok('envelope carries a valid content digest',
+        verify_integrity(payload)['status'] == 'ok',
+        str(verify_integrity(payload)['status']))
 
     row_kinds = {r['row_kind'] for r in payload['rows']}
     _ok('has needle_recall rows', 'needle_recall' in row_kinds)
