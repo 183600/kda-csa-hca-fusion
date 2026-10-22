@@ -37,6 +37,7 @@ from results_analysis import (  # noqa: E402
 )
 from run_quality import (  # noqa: E402
     _classify_task_errors,
+    _error_confidence,
     _hypothesis_verdicts,
     _paired_one_sided_t,
     _parse_lr_list,
@@ -646,6 +647,30 @@ def test_error_classification_mqar_layout():
         assert cats == [expected], (int(pred[0]), cats)
 
 
+def test_error_confidence_separates_blind_spot_from_near_tie():
+    """Wrong is not one failure mode: confidence distinguishes them."""
+    logits = torch.tensor([[5.0, 0.0, 0.0]])
+    conf = _error_confidence(logits, torch.tensor([2]),
+                             torch.tensor([0]), 0)
+    probs = torch.softmax(logits[0], dim=-1)
+    assert conf['pred_prob'] == pytest.approx(float(probs[0]))
+    assert conf['target_prob'] == pytest.approx(float(probs[2]))
+    assert conf['margin'] == pytest.approx(float(probs[0] - probs[2]))
+    assert conf['target_rank'] == 2
+    assert 0.0 <= conf['entropy_ratio'] <= 1.0
+    assert conf['pred_prob'] >= 0.5  # confident blind spot
+
+    near_tie = torch.tensor([[0.01, 0.0, 0.0]])
+    conf = _error_confidence(near_tie, torch.tensor([2]),
+                             torch.tensor([0]), 0)
+    assert conf['margin'] < 0.01
+    assert conf['entropy_ratio'] > 0.9  # ambiguous for the model
+
+    bad = torch.tensor([[float('nan'), 0.0, 0.0]])
+    assert _error_confidence(bad, torch.tensor([2]),
+                             torch.tensor([0]), 0) is None
+
+
 def test_error_classification_kv_update_stale_value():
     # Layout: [k0,v0_old, k1,v1_old, k1,v1_new, k0,v0_new, cue]; cue=k0.
     # keys2 (shuffled) = [k1, k0]; old value for k0 is 10; new value is 13.
@@ -710,6 +735,20 @@ def test_error_analysis_report_is_json_serializable():
     assert ea is not None
     assert ea['n_samples'] == 8
     assert sum(v['count'] for v in ea['categories'].values()) == ea['n_wrong']
+    # A wrong answer carries the model's confidence, so an ambiguous
+    # near-tie can be separated from a confident blind spot.
+    assert ea['confidence'] is not None
+    assert ea['confidence']['n_scored_wrong'] == ea['n_wrong']
+    for cat in ea['categories'].values():
+        if cat['count']:
+            assert cat['confidence'] is not None
+    for bucket in ea['examples'].values():
+        for ex in bucket:
+            for key in ('pred_prob', 'target_prob', 'margin',
+                        'target_rank', 'entropy_nats', 'entropy_ratio'):
+                assert key in ex
+            assert 0.0 <= ex['pred_prob'] <= 1.0
+            assert 0.0 <= ex['target_prob'] <= 1.0
     json.dumps(r, allow_nan=False)
 
 

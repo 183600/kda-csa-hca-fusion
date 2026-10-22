@@ -217,7 +217,18 @@ def test_pooled_error_analyses_use_worst_seed_examples():
                 'n_samples': 10,
                 'n_wrong': sum(counts.values()),
                 'categories': {
-                    c: {'count': n, 'definition': c}
+                    c: {
+                        'count': n,
+                        'definition': c,
+                        'confidence': {
+                            'n_scored': n,
+                            'n_confident_wrong': 1,
+                            'mean_pred_prob': 0.8,
+                            'mean_target_prob': 0.1,
+                            'mean_margin': 0.7,
+                            'mean_entropy_ratio': 0.2,
+                        },
+                    }
                     for c, n in counts.items()
                 },
                 'examples': examples,
@@ -237,6 +248,13 @@ def test_pooled_error_analyses_use_worst_seed_examples():
     assert pooled['pooled_categories']['copyable_missed']['count'] == 6
     assert pooled['representative_seed'] == 1
     assert pooled['representative_examples'] == {'copyable_missed': ['worst']}
+    # Confidence is pooled with count weights, not by averaging seed means.
+    conf = pooled['pooled_categories']['copyable_missed']['confidence']
+    assert conf['n_scored'] == 6
+    assert conf['n_confident_wrong'] == 1
+    assert conf['mean_pred_prob'] == pytest.approx(0.8)
+    assert pooled['confidence']['n_scored_wrong'] == 9
+    assert pooled['confidence']['n_confident_wrong'] == 2
     assert pool_error_analyses([{'seed': 0}]) is None
 
 

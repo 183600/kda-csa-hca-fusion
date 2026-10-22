@@ -743,6 +743,7 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
     if not rows:
         return None
     pooled: dict = {}
+    conf_acc: dict = {}
     n_samples = n_wrong = 0
     for r in rows:
         ea = r['error_analysis']
@@ -752,9 +753,65 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
             acc = pooled.setdefault(
                 c, {'count': 0, 'definition': v.get('definition')})
             acc['count'] += int(v.get('count', 0) or 0)
+            # Confidence is a nested block; combine it with sample-count
+            # weights (means cannot simply be averaged across seeds with
+            # different numbers of errors).
+            conf = v.get('confidence') or {}
+            n_scored = int(conf.get('n_scored', 0) or 0)
+            if n_scored:
+                ca = conf_acc.setdefault(c, {
+                    'n_scored': 0,
+                    'n_confident_wrong': 0,
+                    'sum_pred_prob': 0.0,
+                    'sum_target_prob': 0.0,
+                    'sum_margin': 0.0,
+                    'sum_entropy_ratio': 0.0,
+                })
+                ca['n_scored'] += n_scored
+                ca['n_confident_wrong'] += int(
+                    conf.get('n_confident_wrong', 0) or 0)
+                ca['sum_pred_prob'] += (
+                    float(conf.get('mean_pred_prob') or 0.0) * n_scored)
+                ca['sum_target_prob'] += (
+                    float(conf.get('mean_target_prob') or 0.0) * n_scored)
+                ca['sum_margin'] += (
+                    float(conf.get('mean_margin') or 0.0) * n_scored)
+                ca['sum_entropy_ratio'] += (
+                    float(conf.get('mean_entropy_ratio') or 0.0) * n_scored)
     for v in pooled.values():
         v['rate_of_wrong'] = (v['count'] / n_wrong) if n_wrong else 0.0
         v['rate_of_all'] = (v['count'] / n_samples) if n_samples else 0.0
+    for c, ca in conf_acc.items():
+        n = ca['n_scored']
+        pooled[c]['confidence'] = {
+            'n_scored': int(n),
+            'n_confident_wrong': int(ca['n_confident_wrong']),
+            'rate_confident_wrong': ca['n_confident_wrong'] / n,
+            'mean_pred_prob': ca['sum_pred_prob'] / n,
+            'mean_target_prob': ca['sum_target_prob'] / n,
+            'mean_margin': ca['sum_margin'] / n,
+            'mean_entropy_ratio': ca['sum_entropy_ratio'] / n,
+        }
+    n_scored_all = sum(ca['n_scored'] for ca in conf_acc.values())
+    confidence_summary = None
+    if n_scored_all:
+        n_conf = sum(ca['n_confident_wrong'] for ca in conf_acc.values())
+        confidence_summary = {
+            'n_scored_wrong': int(n_scored_all),
+            'n_confident_wrong': int(n_conf),
+            'rate_confident_wrong': n_conf / n_scored_all,
+            'mean_pred_prob': (sum(ca['sum_pred_prob']
+                                   for ca in conf_acc.values())
+                               / n_scored_all),
+            'mean_target_prob': (sum(ca['sum_target_prob']
+                                     for ca in conf_acc.values())
+                                 / n_scored_all),
+            'mean_margin': (sum(ca['sum_margin']
+                                for ca in conf_acc.values()) / n_scored_all),
+            'note': ('Pooled confidence over every analyzed wrong sample: '
+                     'high values mean the failures are confident blind '
+                     'spots rather than ambiguous near-ties.'),
+        }
 
     def _acc(r):
         value = r.get(accuracy_key)
@@ -770,6 +827,7 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
         'n_wrong': n_wrong,
         'error_rate': (n_wrong / n_samples) if n_samples else None,
         'pooled_categories': pooled,
+        'confidence': confidence_summary,
         'representative_seed': worst.get('seed'),
         'representative_examples': worst_ea.get('examples'),
         'accuracy_by_distance_bin': worst_ea.get('accuracy_by_distance_bin'),

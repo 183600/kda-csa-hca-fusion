@@ -90,6 +90,7 @@ from train_diagnostics import (
     ValPoint,
     ValidationCurve,
     optimizer_update_report,
+    pool_error_analyses,
     snapshot_parameters,
 )
 from results_schema import CURRENT_SCHEMA_VERSION
@@ -2235,7 +2236,44 @@ def _classify_task_errors(task, meta, target, pred, cue_pos, n_kv):
     return cat, extras
 
 
-def _error_example(task, meta, target, pred, i, cue_pos, extras):
+def _error_confidence(logits, target, pred, i):
+    """Model confidence for one misclassified sample, without extra RNG.
+
+    A wrong answer with ``pred_prob ~= 0.5`` and ``margin ~= 0`` is a
+    near-tie (the sample is ambiguous for this model); a wrong answer with
+    ``pred_prob ~ 1`` is a confident blind spot. The aggregate accuracy
+    cannot distinguish them, and they imply different next experiments
+    (more data / calibration vs. a new mechanism). Returns ``None`` when
+    the row is non-finite, so a diverged forward cannot fabricate a
+    plausible confidence block or poison strict JSON.
+    """
+    row = logits[i].detach().float()
+    if row.numel() == 0 or not bool(torch.isfinite(row).all()):
+        return None
+    probs = torch.softmax(row, dim=-1)
+    pred_id = int(pred[i])
+    target_id = int(target[i])
+    pred_prob = float(probs[pred_id])
+    target_prob = float(probs[target_id])
+    target_rank = int((row > row[target_id]).sum().item()) + 1
+    # Shannon entropy in nats, normalized by the vocabulary maximum so the
+    # value is comparable across vocab sizes (1 = uniform / maximally
+    # ambiguous, 0 = one-hot).
+    log_probs = torch.log_softmax(row, dim=-1)
+    entropy = float(-(probs * log_probs).sum())
+    vocab = int(row.numel())
+    return {
+        'pred_prob': pred_prob,
+        'target_prob': target_prob,
+        'margin': pred_prob - target_prob,
+        'target_rank': target_rank,
+        'entropy_nats': entropy,
+        'entropy_ratio': (entropy / math.log(vocab)) if vocab > 1 else 0.0,
+    }
+
+
+def _error_example(task, meta, target, pred, i, cue_pos, extras,
+                   confidence=None):
     """Decode one misclassified sample into human-readable task terms."""
     ids = meta['input_ids']
     ex = {
@@ -2244,6 +2282,8 @@ def _error_example(task, meta, target, pred, i, cue_pos, extras):
         'pred': int(pred[i]),
         'cue_pos': int(cue_pos),
     }
+    if confidence:
+        ex.update(confidence)
     if task in ('mqar', 'kv_update'):
         ex['key_idx'] = int(meta['key_idx'][i])
     if task == 'kv_update':
@@ -2287,6 +2327,10 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
     was_training = {m: m.training for m in (layer, head, embed)}
     counts: dict = OrderedDict()
     examples: dict = OrderedDict()
+    # Per-category confidence accumulators: is the category dominated by
+    # near-ties (ambiguous samples) or by high-confidence mistakes (blind
+    # spots)? Keeping only the first example would hide that distinction.
+    conf_acc: dict = OrderedDict()
     n_total = n_wrong = 0
     dist_correct: dict = {}
     dist_total: dict = {}
@@ -2310,10 +2354,29 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
                         continue
                     n_wrong += 1
                     counts[c] = counts.get(c, 0) + 1
+                    confidence = _error_confidence(logits, target, pred, i)
+                    if confidence is not None:
+                        conf = conf_acc.setdefault(c, {
+                            'n_scored': 0,
+                            'n_confident_wrong': 0,
+                            'sum_pred_prob': 0.0,
+                            'sum_target_prob': 0.0,
+                            'sum_margin': 0.0,
+                            'sum_entropy_ratio': 0.0,
+                        })
+                        conf['n_scored'] += 1
+                        conf['n_confident_wrong'] += int(
+                            confidence['pred_prob'] >= 0.5)
+                        conf['sum_pred_prob'] += confidence['pred_prob']
+                        conf['sum_target_prob'] += confidence['target_prob']
+                        conf['sum_margin'] += confidence['margin']
+                        conf['sum_entropy_ratio'] += confidence[
+                            'entropy_ratio']
                     bucket = examples.setdefault(c, [])
                     if len(bucket) < int(max_examples):
                         bucket.append(_error_example(
-                            task, meta, target, pred, i, cue_pos, extras))
+                            task, meta, target, pred, i, cue_pos, extras,
+                            confidence=confidence))
                 if task == 'long_range':
                     ok = (pred == target)
                     d = meta['distance']
@@ -2325,6 +2388,24 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
         for m, was in was_training.items():
             m.train(was)
 
+    def _confidence_block(name):
+        acc = conf_acc.get(name)
+        if not acc or not acc['n_scored']:
+            return None
+        n = acc['n_scored']
+        return {
+            'n_scored': int(n),
+            'n_confident_wrong': int(acc['n_confident_wrong']),
+            'rate_confident_wrong': acc['n_confident_wrong'] / n,
+            'mean_pred_prob': acc['sum_pred_prob'] / n,
+            'mean_target_prob': acc['sum_target_prob'] / n,
+            'mean_margin': acc['sum_margin'] / n,
+            'mean_entropy_ratio': acc['sum_entropy_ratio'] / n,
+            'note': ('confidence = top-1 probability of the WRONG answer. '
+                     'High pred_prob is a blind spot; margins near zero / '
+                     'entropy near 1 are ambiguous near-ties.'),
+        }
+
     categories = OrderedDict()
     for name, definition in _ERROR_CATEGORY_DEFINITIONS[task].items():
         n = counts.get(name, 0)
@@ -2333,6 +2414,7 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
             'rate_of_wrong': (n / n_wrong) if n_wrong else 0.0,
             'rate_of_all': (n / n_total) if n_total else 0.0,
             'definition': definition,
+            'confidence': _confidence_block(name),
         }
     for name in counts:
         if name not in categories:
@@ -2341,7 +2423,28 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
                 'rate_of_wrong': counts[name] / n_wrong if n_wrong else 0.0,
                 'rate_of_all': (counts[name] / n_total) if n_total else 0.0,
                 'definition': 'category not covered by the task layout',
+                'confidence': _confidence_block(name),
             }
+
+    scored = [c for c in conf_acc.values() if c['n_scored']]
+    n_scored_wrong = sum(c['n_scored'] for c in scored)
+    confidence_summary = None
+    if n_scored_wrong:
+        n_conf = sum(c['n_confident_wrong'] for c in scored)
+        confidence_summary = {
+            'n_scored_wrong': int(n_scored_wrong),
+            'n_confident_wrong': int(n_conf),
+            'rate_confident_wrong': n_conf / n_scored_wrong,
+            'mean_pred_prob': (sum(c['sum_pred_prob'] for c in scored)
+                               / n_scored_wrong),
+            'mean_target_prob': (sum(c['sum_target_prob'] for c in scored)
+                                 / n_scored_wrong),
+            'mean_margin': (sum(c['sum_margin'] for c in scored)
+                            / n_scored_wrong),
+            'note': ('High confidence on wrong answers points to a '
+                     'systematic blind spot; low margin / high entropy '
+                     'points to genuinely ambiguous samples.'),
+        }
 
     by_distance = None
     if dist_total:
@@ -2365,9 +2468,19 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
             if not v['count'] or c not in examples or not examples[c]:
                 continue
             ex = examples[c][0]
+            p_pred = ('n/a' if ex.get('pred_prob') is None
+                      else format(ex['pred_prob'], '.3f'))
+            p_target = ('n/a' if ex.get('target_prob') is None
+                        else format(ex['target_prob'], '.3f'))
+            meta_show = {
+                k: v2 for k, v2 in ex.items()
+                if k not in ('input_ids', 'target', 'pred', 'cue_pos',
+                             'pred_prob', 'target_prob', 'margin',
+                             'target_rank', 'entropy_nats', 'entropy_ratio')}
             logger.info(f"  [bad-case] e.g. {c}: target={ex['target']} "
                         f"pred={ex['pred']} cue_pos={ex['cue_pos']} "
-                        f"meta={ {k: v2 for k, v2 in ex.items() if k not in ('input_ids', 'target', 'pred', 'cue_pos')} }")
+                        f"p_pred={p_pred} p_target={p_target} "
+                        f"meta={meta_show}")
             logger.info(f"  [bad-case]   input_ids={ex['input_ids']}")
             shown += 1
             if shown >= 2:
@@ -2389,6 +2502,7 @@ def analyze_errors(layer, head, embed, *, op_name, task='mqar', seq_len=16,
         'n_wrong': int(n_wrong),
         'error_rate': (n_wrong / n_total) if n_total else None,
         'categories': categories,
+        'confidence': confidence_summary,
         'examples': examples,
         'accuracy_by_distance_bin': by_distance,
         'note': ('Errors are inspected on a stream never used for training, '
@@ -2841,38 +2955,10 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     # analyzed sample, while the EXAMPLES come from the worst seed (lowest
     # final accuracy) so the artifact shows the most informative failures
     # rather than a lucky seed's.
-    error_aggregate = None
-    ea_seeds = [r for r in ok_per_seed if r.get('error_analysis')]
-    if ea_seeds:
-        pooled: dict = OrderedDict()
-        n_samples = n_wrong = 0
-        for r in ea_seeds:
-            ea = r['error_analysis']
-            n_samples += ea['n_samples']
-            n_wrong += ea['n_wrong']
-            for c, v in ea['categories'].items():
-                acc = pooled.setdefault(
-                    c, {'count': 0, 'definition': v.get('definition')})
-                acc['count'] += int(v['count'])
-        for v in pooled.values():
-            v['rate_of_wrong'] = v['count'] / n_wrong if n_wrong else 0.0
-            v['rate_of_all'] = v['count'] / n_samples if n_samples else 0.0
-        worst = min(ea_seeds, key=lambda r: r['final_acc'])
-        error_aggregate = {
-            'n_seeds': len(ea_seeds),
-            'n_samples': n_samples,
-            'n_wrong': n_wrong,
-            'error_rate': (n_wrong / n_samples) if n_samples else None,
-            'pooled_categories': pooled,
-            'representative_seed': worst['seed'],
-            'representative_examples': worst['error_analysis']['examples'],
-            'accuracy_by_distance_bin': worst['error_analysis'].get(
-                'accuracy_by_distance_bin'),
-            'note': ('Pooled over seeds; examples come from the worst seed '
-                     '(lowest final accuracy) so the artifact shows the '
-                     'most informative failures. See the per-seed '
-                     'error_analysis for each seed.'),
-        }
+    # One implementation for every caller: the helper also pools the
+    # per-category confidence block (ambiguous near-ties vs confident blind
+    # spots) and picks examples from the worst seed.
+    error_aggregate = pool_error_analyses(ok_per_seed)
 
     gaps = [r['generalization_gap'] for r in ok_per_seed
             if r.get('generalization_gap') is not None]
