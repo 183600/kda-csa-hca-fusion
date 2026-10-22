@@ -1059,3 +1059,23 @@ def test_matrix_design_audit_ignores_malformed_per_seed_rows():
                               'per_seed': [{'lr': 0.2}]}, 'lr') == 0.1
     assert _row_design_field({'per_seed': ['x', None]}, 'lr') is None
     assert _row_design_field(None, 'lr') is None
+
+
+def test_softmax_gqa_prefill_uses_the_requested_head_width():
+    """``prefill_flops('softmax_gqa')`` must derive n_q from ``K``.
+
+    The module default ``K=GQA_HEAD_DIM=128`` hides the bug; a caller that
+    prices a 64-wide head geometry used to keep ``n_q=d//128`` and
+    undercount every query-side term (core, q_proj, o_proj).
+    """
+    from run_kv_cache import prefill_flops
+
+    T, d, H, V = 10, 4096, 8, 128
+    for K in (128, 64, 32):
+        got = prefill_flops('softmax_gqa', T, d=d, H=H, K=K, V=V)
+        n_q = d // K
+        entries = T * (T + 1) // 2
+        core = 2 * entries * n_q * (K + V)
+        proj = 2 * T * d * (n_q * K + H * K + H * V)
+        out_proj = 2 * T * n_q * V * d
+        assert got == core + proj + out_proj, (K, got, core + proj + out_proj)

@@ -557,11 +557,25 @@ def prefill_flops(op: str, T: int, **kw):
         # apply a strictly-upper-triangular mask). Each query t attends
         # to keys [0, t], i.e. (t+1) keys. Total attention entries over
         # all queries = T*(T+1)/2 (the upper-triangular-inclusive count).
-        # GQA8: H=8 KV heads shared by a full-rank query side. With
-        # head_dim=128 and d=4096, the query side has n_q = d // head_dim = 32
-        # heads; the KV side has n_kv = 8. Query-side terms (core, q_proj,
-        # o_proj) scale with n_q; KV-side terms (k_proj, v_proj) with n_kv.
-        n_q = d // GQA_HEAD_DIM
+        # GQA8: H=8 KV heads shared by a full-rank query side. The query
+        # head count follows the SAME per-head key width as the scores, so
+        # it must be derived from the ``K`` argument rather than from the
+        # module default: with head_dim=128 and d=4096 the query side has
+        # n_q = d // K = 32 heads (the historical default), but a caller
+        # that changes ``K`` (e.g. a 64-wide head geometry) must get
+        # ``n_q = d // K``. Using the constant silently undercounted the
+        # query-side core/projection work whenever K != GQA_HEAD_DIM.
+        # Query-side terms (core, q_proj, o_proj) scale with n_q; KV-side
+        # terms (k_proj, v_proj) with n_kv.
+        if K <= 0:
+            raise ValueError(
+                f'prefill_flops(softmax_gqa): K must be a positive int, '
+                f'got {K!r}.')
+        n_q = d // K
+        if n_q < 1:
+            raise ValueError(
+                f'prefill_flops(softmax_gqa): d={d} must be >= K={K} so '
+                f'the query side has at least one head.')
         n_kv = H
         causal_entries = T * (T + 1) // 2
         core = 2 * causal_entries * n_q * (K + V)
