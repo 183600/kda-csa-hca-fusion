@@ -243,6 +243,7 @@ def hca_read_elements(T: int, *, m2: int, c: int,
 # compared on the same currency without changing existing layout rows.
 _OP_FUNCS = ('softmax', 'kda', 'csa', 'hca')
 _BUDGET_OPS = ('softmax', 'kda', 'mamba2', 'csa', 'hca')
+_MEMORY_OPS = ('kda', 'mamba2')
 
 
 def op_read_elements(op: str, T: int, spec: dict) -> dict:
@@ -445,68 +446,106 @@ def _validate_ratio(ratio, fn_name: str) -> tuple:
     return n_kda, n_csa, n_hca
 
 
+def _validate_memory_op(memory_op, fn_name: str) -> str:
+    if memory_op not in _MEMORY_OPS:
+        raise ValueError(
+            f'{fn_name}: memory_op={memory_op!r} must be one of '
+            f'{list(_MEMORY_OPS)}.')
+    return memory_op
+
+
 def _layout_row(time_key: str, time_value, n_kda: int, n_csa: int,
-                n_hca: int, per_layer: dict) -> dict:
-    """Shared row shape for the averaged / marginal / windowed layout views."""
-    kda = n_kda * per_layer['kda']
+                n_hca: int, per_layer: dict, memory_op: str = 'kda') -> dict:
+    """Shared row shape for the averaged / marginal / windowed layout views.
+
+    ``n_kda`` is the number of memory slots (the ratio's first component);
+    ``memory_op`` says which operator fills them. The legacy
+    ``kda_read_elements`` / ``n_kda`` fields remain the memory-slot values
+    for the default KDA route, while ``memory_read_elements`` is route
+    neutral and ``mamba2_read_elements`` is populated only on that route.
+    """
+    memory = n_kda * per_layer[memory_op]
     csa = n_csa * per_layer['csa']
     hca = n_hca * per_layer['hca']
     return {
         time_key: time_value,
-        'n_kda': n_kda,
+        'n_memory': n_kda,
+        'n_kda': n_kda if memory_op == 'kda' else 0,
+        'n_mamba2': n_kda if memory_op == 'mamba2' else 0,
         'n_csa': n_csa,
         'n_hca': n_hca,
-        'kda_read_elements': kda,
+        'memory_op': memory_op,
+        'memory_read_elements': memory,
+        'kda_read_elements': memory if memory_op == 'kda' else 0.0,
+        'mamba2_read_elements': memory if memory_op == 'mamba2' else 0.0,
         'csa_read_elements': csa,
         'hca_read_elements': hca,
-        'total_read_elements': kda + csa + hca,
+        'total_read_elements': memory + csa + hca,
     }
 
 
-def layout_read_elements(T: int, ratio, spec: dict) -> dict:
+def layout_read_elements(T: int, ratio, spec: dict, *,
+                         memory_op: str = 'kda') -> dict:
     """Read budget of a ``(n_kda, n_csa, n_hca)`` hybrid layout.
 
-    The layout budget is the per-layer sum because layers execute
-    sequentially and each query passes through every layer once.
+    The first ratio component is the number of *memory* slots; ``memory_op``
+    chooses the recurrent operator that fills them (``'kda'`` default, so
+    every historical result is unchanged, or ``'mamba2'`` for the
+    alternative route). The layout budget is the per-layer sum because
+    layers execute sequentially and each query passes through every layer
+    once.
     """
+    _validate_memory_op(memory_op, 'layout_read_elements')
     n_kda, n_csa, n_hca = _validate_ratio(ratio, 'layout_read_elements')
-    per_layer = {op: op_read_elements(op, T, spec)['total_read_elements']
-                 for op in _OP_FUNCS}
-    return _layout_row('T', int(T), n_kda, n_csa, n_hca, per_layer)
+    per_layer = {
+        op: op_read_elements(op, T, spec)['total_read_elements']
+        for op in ('csa', 'hca', memory_op)}
+    return _layout_row('T', int(T), n_kda, n_csa, n_hca, per_layer,
+                       memory_op)
 
 
-def instant_layout_read_elements(ratio, t: int, spec: dict) -> dict:
+def instant_layout_read_elements(ratio, t: int, spec: dict, *,
+                                 memory_op: str = 'kda') -> dict:
     """Marginal layout budget at position ``t`` (the first decode step after
     a ``t``-token prefill). Layers execute sequentially, so per-layer
     marginal budgets add.
     """
+    _validate_memory_op(memory_op, 'instant_layout_read_elements')
     _validate_t(t, 'instant_layout_read_elements')
     n_kda, n_csa, n_hca = _validate_ratio(
         ratio, 'instant_layout_read_elements')
-    per_layer = {op: instant_read_elements(op, t, spec)
-                 ['total_read_elements'] for op in _OP_FUNCS}
-    return _layout_row('t', int(t), n_kda, n_csa, n_hca, per_layer)
+    per_layer = {
+        op: instant_read_elements(op, t, spec)['total_read_elements']
+        for op in ('csa', 'hca', memory_op)}
+    return _layout_row('t', int(t), n_kda, n_csa, n_hca, per_layer,
+                       memory_op)
 
 
 def windowed_layout_read_elements(ratio, t0: int, t1: int,
-                                  spec: dict) -> dict:
+                                  spec: dict, *,
+                                  memory_op: str = 'kda') -> dict:
     """Mean marginal layout budget over decode positions ``[t0, t1)``.
 
     Component-wise ``windowed_layout_read_elements(ratio, 0, T, spec)``
     equals :func:`layout_read_elements`, and ``t0 = T`` gives the budget of
-    a decode window after a ``T``-token prefill.
+    a decode window after a ``T``-token prefill. ``memory_op`` selects the
+    recurrent route exactly as in :func:`layout_read_elements`.
     """
+    _validate_memory_op(memory_op, 'windowed_layout_read_elements')
     _validate_t(t0, 'windowed_layout_read_elements')
     _validate_t(t1, 'windowed_layout_read_elements')
     if t1 <= t0:
         raise ValueError(
             f'windowed_layout_read_elements: need 0 <= t0 < t1, got '
             f't0={t0!r}, t1={t1!r}')
-    row0 = layout_read_elements(t0, ratio, spec)
-    row1 = layout_read_elements(t1, ratio, spec)
-    out = {'t0': int(t0), 't1': int(t1), 'n_kda': row1['n_kda'],
-           'n_csa': row1['n_csa'], 'n_hca': row1['n_hca']}
-    for key in ('kda_read_elements', 'csa_read_elements',
+    row0 = layout_read_elements(t0, ratio, spec, memory_op=memory_op)
+    row1 = layout_read_elements(t1, ratio, spec, memory_op=memory_op)
+    out = {'t0': int(t0), 't1': int(t1), 'n_memory': row1['n_memory'],
+           'n_kda': row1['n_kda'], 'n_mamba2': row1['n_mamba2'],
+           'n_csa': row1['n_csa'], 'n_hca': row1['n_hca'],
+           'memory_op': memory_op}
+    for key in ('memory_read_elements', 'kda_read_elements',
+                'mamba2_read_elements', 'csa_read_elements',
                 'hca_read_elements', 'total_read_elements'):
         out[key] = (t1 * row1[key] - t0 * row0[key]) / (t1 - t0)
     return out
@@ -531,7 +570,8 @@ def op_read_bytes(op: str, T: int, spec: dict, quant=None) -> dict:
     return row
 
 
-def layout_read_bytes(T: int, ratio, spec: dict, quant=None) -> dict:
+def layout_read_bytes(T: int, ratio, spec: dict, quant=None, *,
+                      memory_op: str = 'kda') -> dict:
     """Byte view of :func:`layout_read_elements` under a quantization policy.
 
     Layout rows aggregate by operator, so the policy stems are the memory
@@ -539,7 +579,7 @@ def layout_read_bytes(T: int, ratio, spec: dict, quant=None) -> dict:
     (selected / indexer / window) treatment use :func:`op_read_bytes` per
     operator. Same ``quant`` semantics as :func:`op_read_bytes`.
     """
-    row = dict(layout_read_elements(T, ratio, spec))
+    row = dict(layout_read_elements(T, ratio, spec, memory_op=memory_op))
     row.update(quantized_row_bytes(row, quant))
     return row
 

@@ -200,6 +200,48 @@ def _mqar_spec():
     }
 
 
+def test_layout_memory_route_substitution():
+    print('\nTest: layout budget can select the Mamba-2 memory route')
+    spec = _mqar_spec()
+    spec['mamba2'] = {'nheads': 2, 'headdim': 16, 'd_state': 8}
+    kda = kv_budget.layout_read_elements(16, (3, 1, 1), spec)
+    _ok('default layout route is KDA and unchanged',
+        kda['memory_op'] == 'kda'
+        and kda['kda_read_elements'] == 3072.0
+        and kda['mamba2_read_elements'] == 0.0
+        and abs(kda['total_read_elements'] - 3408.0) < 1e-9, f'{kda}')
+    mamba = kv_budget.layout_read_elements(
+        16, (3, 1, 1), spec, memory_op='mamba2')
+    _ok('Mamba-2 route prices 3 * (2*256) + CSA + HCA',
+        mamba['memory_op'] == 'mamba2'
+        and mamba['n_memory'] == 3 and mamba['n_kda'] == 0
+        and mamba['n_mamba2'] == 3
+        and mamba['memory_read_elements'] == 1536.0
+        and mamba['kda_read_elements'] == 0.0
+        and abs(mamba['total_read_elements'] - 1872.0) < 1e-9, f'{mamba}')
+    step = kv_budget.instant_layout_read_elements(
+        (3, 1, 1), 16, spec, memory_op='mamba2')
+    _ok('Mamba-2 marginal step = 1536 + 320 + 192',
+        abs(step['total_read_elements'] - 2048.0) < 1e-9, f'{step}')
+    win = kv_budget.windowed_layout_read_elements(
+        (3, 1, 1), 4, 20, spec, memory_op='mamba2')
+    direct = [kv_budget.instant_layout_read_elements(
+        (3, 1, 1), t, spec, memory_op='mamba2')['total_read_elements']
+        for t in range(4, 20)]
+    _ok('Mamba-2 windowed view is the mean of marginal steps',
+        abs(win['total_read_elements'] - sum(direct) / len(direct)) < 1e-9,
+        f"{win['total_read_elements']} vs {sum(direct) / len(direct)}")
+    _ok('route stays explicit on the windowed row',
+        win['memory_op'] == 'mamba2' and win['n_mamba2'] == 3, f'{win}')
+    raised = False
+    try:
+        kv_budget.layout_read_elements(16, (3, 1, 1), spec,
+                                       memory_op='rwkv7')
+    except ValueError:
+        raised = True
+    _ok('unknown memory route raises ValueError', raised, '')
+
+
 def test_instant_budget_hand_values():
     print('\nTest: marginal (decode-position) budget hand values')
     spec = _mqar_spec()
@@ -778,6 +820,7 @@ _TEST_FUNCS = [
     test_budget_scaling_claims,
     test_op_and_layout_dispatch,
     test_instant_budget_hand_values,
+    test_layout_memory_route_substitution,
     test_prefill_decode_unification_identity,
     test_windowed_budget_matches_instant_sums,
     test_decode_frontier_structural_claims,

@@ -72,10 +72,15 @@ metadata), and `run_quant_recall.py` (Exp 10) measures the recall side of
 the trade-off on planted associations for both recurrent routes. See
 [quantization-model.md](quantization-model.md).
 
-Layout rows are still expanded from a KDA:CSA:HCA ratio (the memory slot
-is KDA). Per-op Mamba-2 rows carry the route's own state size, so the two
-memory routes can be compared without pretending a ratio row is
-route-neutral.
+Layout rows are expanded from a ``memory:CSA:HCA`` ratio. The memory slot
+is KDA by default; pass ``memory_op='mamba2'`` to
+``layout_read_elements`` / ``instant_layout_read_elements`` /
+``windowed_layout_read_elements`` to price the alternative route. The row
+keeps ``n_memory`` and ``memory_op``, sets ``kda_read_elements`` or
+``mamba2_read_elements`` accordingly, and leaves the default KDA totals
+bit-identical. `run_budget_frontier` still emits its layout curves on the
+KDA route; the Mamba-2 route is available per-op (Exp 4 join) and through
+this explicit API rather than being silently assumed away.
 
 ## Scope / honesty
 
