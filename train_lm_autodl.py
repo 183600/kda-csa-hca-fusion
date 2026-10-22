@@ -1000,28 +1000,76 @@ def _length_outlier_audit(train_lengths, heldout_lengths, *,
     Pooling train+val+test to pick the fences would let the held-out
     distribution move the decision boundary (and is exactly the
     normalization-on-all-data mistake this pipeline avoids).
+
+    Malformed lengths (non-finite, negative, bool, non-numeric) are
+    counted and skipped rather than silently entering the quantiles and
+    making the recorded fences NaN/inf. A non-finite multiplier is a
+    caller error and raises ``ValueError``.
     """
-    if not train_lengths:
+    multiplier = _finite_float_or_none(iqr_multiplier)
+    if multiplier is None or multiplier < 0.0:
+        raise ValueError(
+            f'iqr_multiplier must be a finite number >= 0, got '
+            f'{iqr_multiplier!r}')
+
+    try:
+        train_values = list(train_lengths) if train_lengths is not None else []
+    except TypeError:
+        raise ValueError('train_lengths must be a sequence of lengths') from None
+    try:
+        heldout_values = (list(heldout_lengths)
+                          if heldout_lengths is not None else [])
+    except TypeError:
+        raise ValueError(
+            'heldout_lengths must be a sequence of lengths') from None
+
+    def _finite_lengths(values):
+        finite, invalid = [], 0
+        for value in values:
+            number = _finite_float_or_none(value)
+            if number is None or number < 0.0:
+                invalid += 1
+                continue
+            finite.append(number)
+        return finite, invalid
+
+    train_values, n_invalid_train = _finite_lengths(train_values)
+    heldout_values, n_invalid_heldout = _finite_lengths(heldout_values)
+    if not train_values:
         return {'fit_on': 'train', 'fences': None, 'n_probe': 0,
                 'n_outliers': None, 'outlier_fraction': None,
-                'flag': None, 'iqr_multiplier': float(iqr_multiplier)}
-    ordered = sorted(float(x) for x in train_lengths)
+                'flag': None, 'iqr_multiplier': multiplier,
+                'n_invalid_train': n_invalid_train,
+                'n_invalid_heldout': n_invalid_heldout,
+                'note': 'no finite non-negative train lengths'}
+    ordered = sorted(train_values)
     q1 = _quantile_type7(ordered, 0.25)
     q3 = _quantile_type7(ordered, 0.75)
     iqr = q3 - q1
-    lower = q1 - float(iqr_multiplier) * iqr
-    upper = q3 + float(iqr_multiplier) * iqr
-    n = len(heldout_lengths)
-    n_out = sum(1 for x in heldout_lengths if x < lower or x > upper)
+    lower = q1 - multiplier * iqr
+    upper = q3 + multiplier * iqr
+    fences = (q1, q3, iqr, lower, upper)
+    if not all(math.isfinite(value) for value in fences):
+        return {'fit_on': 'train', 'fences': None, 'n_probe': 0,
+                'n_outliers': None, 'outlier_fraction': None,
+                'flag': None, 'iqr_multiplier': multiplier,
+                'n_invalid_train': n_invalid_train,
+                'n_invalid_heldout': n_invalid_heldout,
+                'note': ('token-length fences are outside the finite float '
+                         'range')}
+    n = len(heldout_values)
+    n_out = sum(1 for x in heldout_values if x < lower or x > upper)
     frac = (n_out / n) if n else None
     return {
         'fit_on': 'train',
         'fences': {'q1': q1, 'q3': q3, 'iqr': iqr,
                    'lower': lower, 'upper': upper},
-        'iqr_multiplier': float(iqr_multiplier),
+        'iqr_multiplier': multiplier,
         'n_probe': n,
         'n_outliers': n_out,
         'outlier_fraction': frac,
+        'n_invalid_train': n_invalid_train,
+        'n_invalid_heldout': n_invalid_heldout,
         # Report-only: text length is not a fitted feature and clipping
         # held-out documents would change the evaluation population. The
         # flag is a distribution-shift warning, not a gate.

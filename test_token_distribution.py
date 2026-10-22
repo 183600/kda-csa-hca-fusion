@@ -25,6 +25,7 @@ import numpy as np
 from train_lm_autodl import (
     _FallbackCharTokenizer,
     _distribution_shift,
+    _length_outlier_audit,
     token_distribution_audit,
 )
 
@@ -312,3 +313,32 @@ def test_length_shift_extreme_finite_values_are_json_safe():
     assert overflow['flag'] is True
     assert overflow['cohen_d'] is None
     json.dumps(overflow, allow_nan=False)
+
+
+def test_length_outlier_audit_skips_malformed_lengths_and_rejects_bad_k():
+    report = _length_outlier_audit(
+        [1, 2, 3, 4, float('inf'), float('nan'), None, 'bad', True],
+        [1, float('nan'), float('inf'), None, -3])
+    assert report['n_invalid_train'] == 5
+    assert report['n_invalid_heldout'] == 4
+    assert report['n_probe'] == 1
+    assert report['fences']['q1'] == 1.75
+    assert report['fences']['q3'] == 3.25
+    json.dumps(report, allow_nan=False)
+
+    assert _length_outlier_audit([], [1])['fences'] is None
+    assert _length_outlier_audit([float('nan')], [1])['fences'] is None
+    # Finite near-limit lengths can overflow the upper Tukey fence; it
+    # must be reported as unavailable instead of inf.
+    extreme = _length_outlier_audit([1e308, 1.4e308, 1.7e308], [1])
+    assert extreme['fences'] is None
+    assert extreme['n_outliers'] is None
+    json.dumps(extreme, allow_nan=False)
+
+    for bad_k in (-0.1, float('nan'), float('inf'), True, '1.5'):
+        try:
+            _length_outlier_audit([1, 2, 3], [1], iqr_multiplier=bad_k)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'invalid iqr_multiplier accepted: {bad_k!r}')
