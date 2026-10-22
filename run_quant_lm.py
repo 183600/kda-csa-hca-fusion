@@ -759,6 +759,12 @@ def _decode_state_snr(model, clone, windows, pad_id, spec):
                 deq = fake_quantize(flat, spec, ste=False)
                 num += float(flat.pow(2).sum())
                 den += float((deq - flat).pow(2).sum())
+                # Feed the quantized write back into the decoder exactly as
+                # ``evaluate_decode_ppl`` / ``quantize_stacked_state`` do.
+                # Without this assignment the measured SNR is taken along
+                # the unquantized fp16 trajectory, not the quantized decode
+                # path whose state_snr_db is reported.
+                clone.model._kda_state = deq.reshape_as(state)
         clone.reset()
     return 10.0 * math.log10(num / den) if den > 0.0 and num > 0.0 \
         else math.inf
