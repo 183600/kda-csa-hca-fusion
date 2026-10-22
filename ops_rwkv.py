@@ -856,6 +856,13 @@ class Rwkv7Mixer(nn.Module):
                 if new_shift.shape[0] != B:
                     new_shift = None
                 else:
+                    expected_shift = (B, 1, d)
+                    if tuple(new_shift.shape) != expected_shift:
+                        raise ValueError(
+                            'Rwkv7Mixer: shift state shape='
+                            f'{tuple(new_shift.shape)} does not match the '
+                            f'expected {expected_shift} ([B, 1, d]) even '
+                            'though T=0.')
                     new_shift = new_shift.to(device=x.device, dtype=x.dtype)
                     if detach_lookback:
                         new_shift = new_shift.detach()

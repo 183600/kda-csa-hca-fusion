@@ -942,6 +942,18 @@ class KDAHybridLayer(nn.Module):
                 if new_lookback.shape[0] != B:
                     new_lookback = None
                 else:
+                    expected_lb = (
+                        B, self.short_conv.kernel_size[0] - 1, d)
+                    if tuple(new_lookback.shape) != expected_lb:
+                        # A lookback from a different kernel/geometry would
+                        # otherwise be echoed back and corrupt the next
+                        # conv call. The full recurrent state is validated
+                        # above on the same empty-chunk contract.
+                        raise ValueError(
+                            'KDAHybridLayer: conv_lookback.shape='
+                            f'{tuple(new_lookback.shape)} does not match the '
+                            f'expected {expected_lb} ([B, ksize-1, d]) even '
+                            'though T=0.')
                     new_lookback = new_lookback.to(device=x.device, dtype=x.dtype)
                     if detach_lookback:
                         new_lookback = new_lookback.detach()
@@ -980,6 +992,12 @@ class KDAHybridLayer(nn.Module):
             # state-handling pattern in HybridKCHAttention.forward.
             if lookback.shape[0] != B:
                 lookback = None
+            elif tuple(lookback.shape) != (B, ksize - 1, d):
+                raise ValueError(
+                    'KDAHybridLayer: conv_lookback.shape='
+                    f'{tuple(lookback.shape)} does not match the expected '
+                    f'{(B, ksize - 1, d)} ([B, ksize-1, d]). The lookback '
+                    'was likely persisted from a different kernel/geometry.')
             elif lookback.device != x.device or lookback.dtype != x.dtype:
                 lookback = lookback.to(device=x.device, dtype=x.dtype)
                 if detach_lookback:

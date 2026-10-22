@@ -1437,6 +1437,16 @@ class Mamba2Mixer(nn.Module):
                 if new_conv.shape[0] != B:
                     new_conv = None
                 else:
+                    expected_conv = (B, self.d_inner, self.d_conv - 1)
+                    if tuple(new_conv.shape) != expected_conv:
+                        # Same empty-chunk geometry contract as the SSM
+                        # state above: a stale conv state must not be
+                        # echoed back to contaminate the next chunk.
+                        raise ValueError(
+                            'Mamba2Mixer: conv_state.shape='
+                            f'{tuple(new_conv.shape)} does not match the '
+                            f'expected {expected_conv} '
+                            '([B, d_inner, d_conv-1]) even though T=0.')
                     new_conv = new_conv.to(device=x.device, dtype=x.dtype)
                     if detach_lookback:
                         new_conv = new_conv.detach()
@@ -1449,6 +1459,13 @@ class Mamba2Mixer(nn.Module):
         if lookback is not None:
             if lookback.shape[0] != B:
                 lookback = None
+            elif tuple(lookback.shape) != (B, self.d_inner, self.d_conv - 1):
+                raise ValueError(
+                    'Mamba2Mixer: conv_state.shape='
+                    f'{tuple(lookback.shape)} does not match the expected '
+                    f'{(B, self.d_inner, self.d_conv - 1)} '
+                    '([B, d_inner, d_conv-1]). The conv state was likely '
+                    'persisted from a different geometry.')
             elif lookback.device != x.device or lookback.dtype != x.dtype:
                 lookback = lookback.to(device=x.device, dtype=x.dtype)
                 if detach_lookback:

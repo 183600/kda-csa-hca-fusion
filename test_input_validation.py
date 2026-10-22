@@ -680,6 +680,61 @@ def test_t0_memory_mixers_reject_wrong_full_state_geometry():
     else:
         raise AssertionError('RWKV-7 T=0 accepted a wrong state shape')
 
+    # The short-conv / shift state is part of the same per-layer contract:
+    # an empty chunk must not echo a stale geometry back to the caller.
+    x_kda = torch.zeros(1, 0, 8)
+    kda_lb = kda.short_conv.kernel_size[0] - 1
+    for bad in (torch.zeros(1, kda_lb + 1, 8),
+                torch.zeros(1, kda_lb, 7)):
+        try:
+            kda.forward_functional(x_kda, None, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'KDA T=0 accepted a wrong lookback shape {tuple(bad.shape)}')
+    kda.forward_functional(x_kda, None, torch.zeros(1, kda_lb, 8))
+    try:
+        kda.forward_functional(torch.randn(1, 1, 8), None,
+                               torch.zeros(1, kda_lb + 1, 8))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('KDA T=1 accepted a wrong lookback shape')
+
+    x_mamba = torch.zeros(1, 0, 8)
+    mamba_conv = mamba.d_conv - 1
+    for bad in (torch.zeros(1, mamba.d_inner, mamba_conv + 1),
+                torch.zeros(1, mamba.d_inner + 1, mamba_conv)):
+        try:
+            mamba.forward_functional(x_mamba, None, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'Mamba-2 T=0 accepted a wrong conv state {tuple(bad.shape)}')
+    mamba.forward_functional(
+        x_mamba, None, torch.zeros(1, mamba.d_inner, mamba_conv))
+    try:
+        mamba.forward_functional(
+            torch.randn(1, 1, 8), None,
+            torch.zeros(1, mamba.d_inner, mamba_conv + 1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('Mamba-2 T=1 accepted a wrong conv state')
+
+    x_rwkv = torch.zeros(1, 0, 64)
+    for bad in (torch.zeros(1, 2, 64), torch.zeros(1, 1, 63)):
+        try:
+            rwkv.forward_functional(x_rwkv, None, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'RWKV-7 T=0 accepted a wrong shift state {tuple(bad.shape)}')
+    rwkv.forward_functional(x_rwkv, None, torch.zeros(1, 1, 64))
+
 
 if __name__ == '__main__':
     test_gated_delta_rule_rejects_geometry_mismatch()
