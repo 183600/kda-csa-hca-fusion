@@ -243,6 +243,30 @@ def test_forward_validation():
                                torch.zeros(2, 4, 3, HEAD_DIM)))
 
 
+def test_mqa_cache_validates_the_kv_pair():
+    """K and V form one cache: shape/dtype/device mismatches fail early."""
+    with pytest.raises(ValueError):
+        mqa.MQACache(torch.zeros(2, 4, 2, HEAD_DIM),
+                     torch.zeros(2, 4, 3, HEAD_DIM))
+    with pytest.raises(ValueError):
+        mqa.MQACache(torch.zeros(2, 4, 2, HEAD_DIM),
+                     torch.zeros(2, 4, 2, HEAD_DIM, dtype=torch.float64))
+    with pytest.raises(ValueError):
+        mqa.MQACache(torch.zeros(2, 4, 2),
+                     torch.zeros(2, 4, 2))
+    with pytest.raises(TypeError):
+        mqa.MQACache('k', 'v')
+
+    # A valid cache from a float64 model must not be fed a float32 input
+    # (torch.cat would promote or fail deep inside the einsum).
+    attn = make_attn(2).double()
+    cache = mqa.MQACache(torch.zeros(2, 4, 2, HEAD_DIM),
+                         torch.zeros(2, 4, 2, HEAD_DIM))
+    with pytest.raises(ValueError):
+        attn.forward_incremental(
+            torch.randn(2, 1, D_MODEL, dtype=torch.float64), cache)
+
+
 def test_accounting_validation():
     with pytest.raises(ValueError):
         mqa.attention_parameter_elements(D_MODEL, 5, 2, HEAD_DIM)

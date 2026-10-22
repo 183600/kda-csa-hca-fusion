@@ -73,6 +73,33 @@ class MQACache:
     k: torch.Tensor
     v: torch.Tensor
 
+    def __post_init__(self) -> None:
+        # K and V are one cache: different shapes / dtypes / devices make
+        # the concatenation in forward_incremental either fail deep inside
+        # torch.cat or silently produce a mixed-precision cache. Validate
+        # the pair at construction so the error names the cache contract.
+        for name, t in (('k', self.k), ('v', self.v)):
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(
+                    f'MQACache.{name} must be a torch.Tensor, got '
+                    f'{type(t).__name__}.')
+            if t.dim() != 4:
+                raise ValueError(
+                    f'MQACache.{name} must be [B, S, n_kv_heads, head_dim], '
+                    f'got shape {tuple(t.shape)}.')
+        if self.k.shape != self.v.shape:
+            raise ValueError(
+                f'MQACache: k.shape={tuple(self.k.shape)} must equal '
+                f'v.shape={tuple(self.v.shape)} (one shared KV cache).')
+        if self.k.dtype != self.v.dtype:
+            raise ValueError(
+                f'MQACache: k.dtype={self.k.dtype} must equal '
+                f'v.dtype={self.v.dtype}.')
+        if self.k.device != self.v.device:
+            raise ValueError(
+                f'MQACache: k.device={self.k.device} must equal '
+                f'v.device={self.v.device}.')
+
     @property
     def seen(self) -> int:
         return int(self.k.shape[1])
@@ -194,6 +221,18 @@ class MQAAttn(nn.Module):
                 raise ValueError(
                     f"MQAAttn: cache K head shape {tuple(cache.k.shape[-2:])} "
                     f"!= ({self.n_kv_heads}, {self.head_dim}).")
+            if cache.v.shape[-2:] != (self.n_kv_heads, self.head_dim):
+                raise ValueError(
+                    f"MQAAttn: cache V head shape {tuple(cache.v.shape[-2:])} "
+                    f"!= ({self.n_kv_heads}, {self.head_dim}).")
+            if (cache.k.dtype != x.dtype or cache.v.dtype != x.dtype
+                    or cache.k.device != x.device
+                    or cache.v.device != x.device):
+                raise ValueError(
+                    'MQAAttn: cache dtype/device must match the new input; '
+                    f'cache=({cache.k.dtype}, {cache.k.device}), '
+                    f'input=({x.dtype}, {x.device}). Convert the cache with '
+                    'a fresh MQACache of matching tensors.')
             k_all = torch.cat([cache.k, k_new], dim=1)
             v_all = torch.cat([cache.v, v_new], dim=1)
             seen = cache.seen
