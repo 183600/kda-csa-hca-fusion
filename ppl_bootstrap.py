@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import math
 import random
+import sys
 
 __all__ = [
     'normalize_units',
@@ -381,22 +382,44 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
     b_sums = [nll for nll, _ in b]
     toks = [tok for _, tok in a]
     c_sums = [nll for nll, _ in centered_a]
+    # A resample can draw the same large unit ``n`` times, so a finite
+    # full-sample total can still overflow an individual replicate sum
+    # (the single-model path in ``_resample_means`` already guards this).
+    # Below the safe bound keep the historical raw arithmetic bit-for-bit;
+    # above it rescale every sum by the same factor and multiply the
+    # replicate difference back once. The token-weighted mean and the
+    # centered-hit comparison are scale-invariant, so this changes only the
+    # overflow case (where the raw path produced ``inf``/``nan``).
+    abs_delta = abs(delta)
+    max_unit = max((abs(x) for x in a_sums + b_sums + c_sums), default=0.0)
+    resample_bound = max_unit * n
+    scaled = (not math.isfinite(resample_bound)
+              or resample_bound > sys.float_info.max * 0.5)
+    if scaled and max_unit > 0.0:
+        a_work = [x / max_unit for x in a_sums]
+        b_work = [x / max_unit for x in b_sums]
+        c_work = [x / max_unit for x in c_sums]
+        scaled_abs_delta = abs_delta / max_unit
+    else:
+        a_work, b_work, c_work = a_sums, b_sums, c_sums
+        scaled_abs_delta = abs_delta
     reps: list[float] = []
     hits = 0
-    abs_delta = abs(delta)
     for _ in range(int(n_boot)):
         idx = [rng.randrange(n) for _ in range(n)]
         sa = sb = sc = 0.0
         t = 0
         for i in idx:
-            sa += a_sums[i]
-            sb += b_sums[i]
-            sc += c_sums[i]
+            sa += a_work[i]
+            sb += b_work[i]
+            sc += c_work[i]
             t += toks[i]
         mean_a = sa / t
         mean_b = sb / t
-        reps.append(mean_a - mean_b)
-        if abs((sc / t) - mean_b) >= abs_delta:
+        reps.append((mean_a - mean_b) * max_unit if scaled else
+                    (mean_a - mean_b))
+        hit_gap = (sc / t) - mean_b
+        if abs(hit_gap) >= scaled_abs_delta:
             hits += 1
     ordered = sorted(reps)
     lo = _percentile(ordered, float(alpha) / 2.0)

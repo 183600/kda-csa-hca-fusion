@@ -391,3 +391,19 @@ def test_finite_unit_sums_cannot_overflow_into_non_json_reports():
     ci = P.bootstrap_ppl_ci(units, n_boot=100, seed=0)
     assert all(math.isfinite(x) for x in ci['ci_mean_nll'])
     json.dumps(ci, allow_nan=False)
+    # The PAIRED path draws the same shared indices; its replicate sums can
+    # overflow in exactly the same way, and a common overflow in both
+    # models used to produce ``inf - inf = nan`` even when the point
+    # estimate is finite. The scaled resampling must keep both the CI and
+    # the p-value report strict-JSON-safe.
+    paired = P.paired_bootstrap_ppl(units, units, n_boot=100, seed=0)
+    assert paired['delta_mean_nll'] == 0.0
+    assert paired['ci_delta_mean_nll'] == [0.0, 0.0]
+    assert paired['p_value'] == 1.0
+    assert all(math.isfinite(x) for x in paired['ci_delta_mean_nll'])
+    json.dumps(paired, allow_nan=False)
+    other = [(1.5e308 - 1e300, 1), (1e307, 1), (1e307, 1)]
+    paired_diff = P.paired_bootstrap_ppl(units, other, n_boot=100, seed=0)
+    assert all(math.isfinite(x) for x in paired_diff['ci_delta_mean_nll'])
+    assert math.isfinite(paired_diff['p_value'])
+    json.dumps(paired_diff, allow_nan=False)
