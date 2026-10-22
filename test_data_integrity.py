@@ -255,3 +255,22 @@ def test_texts_fingerprint_is_unambiguous_at_text_boundaries():
     assert _texts_fingerprint(['ab', 'c']) == _texts_fingerprint(['ab', 'c'])
     # Order is part of the corpus identity.
     assert _texts_fingerprint(['ab', 'c']) != _texts_fingerprint(['c', 'ab'])
+
+
+def test_near_duplicate_candidate_cap_exact_boundary_is_complete():
+    # Exactly ``max_candidate_pairs`` distinct candidates is a complete
+    # audit: nothing was dropped. Only a pair that cannot be retained
+    # makes the report a lower bound.
+    two = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]]
+    exact_one = near_duplicate_pairs(two, max_candidate_pairs=1)
+    assert exact_one['n_candidate_pairs'] == 1
+    assert exact_one['candidates_truncated'] is False
+
+    three = [[1, 2, 3, 4, 5, 6]] * 3
+    exact_three = near_duplicate_pairs(three, max_candidate_pairs=3)
+    assert exact_three['n_candidate_pairs'] == 3
+    assert exact_three['candidates_truncated'] is False
+
+    over = near_duplicate_pairs(three, max_candidate_pairs=2)
+    assert over['n_candidate_pairs'] == 2
+    assert over['candidates_truncated'] is True

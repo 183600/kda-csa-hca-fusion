@@ -269,10 +269,16 @@ def near_duplicate_pairs(
         for pos, i in enumerate(bucket):
             for j in bucket[pos + 1:]:
                 pair = (i, j) if i < j else (j, i)
-                candidates.add(pair)
+                if pair in candidates:
+                    continue
+                # The cap bounds the retained candidate set. Reaching the
+                # cap exactly is complete only if no further *new* pair
+                # exists, so report truncation only when this pair cannot be
+                # retained.
                 if len(candidates) >= int(max_candidate_pairs):
                     truncated = True
                     break
+                candidates.add(pair)
             if truncated:
                 break
         if truncated:
