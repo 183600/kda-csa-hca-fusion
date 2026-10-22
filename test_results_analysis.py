@@ -802,15 +802,16 @@ def _row_logits(vocab, target, rank, top1=None):
 def _toy_diagnostics():
     """Five positions covering every error category in the partition."""
     vocab = 8
-    # Prefix at t: input_ids[:t]; target seen earlier drives copy distance.
+    # Context for the prediction at t is input_ids[:t+1] (the current token
+    # is already consumed); distance is measured from the predicted t+1.
     input_ids = torch.tensor([[1, 2, 1, 4, 2]])
     labels = torch.tensor([[2, 1, 4, 5, 2]])
     rows = [
         _row_logits(vocab, 2, 1),              # correct
-        _row_logits(vocab, 1, 2),              # near_miss (seen, dist 1)
+        _row_logits(vocab, 1, 2),              # near_miss (seen, dist 2)
         _row_logits(vocab, 4, 6),              # novel_token
         _row_logits(vocab, 5, 6, top1=8.0),    # confident_wrong
-        _row_logits(vocab, 2, 6),              # copyable_missed (dist 3)
+        _row_logits(vocab, 2, 6),              # copyable_missed (dist 1)
     ]
     logits = torch.stack(rows).unsqueeze(0)
     return lm_token_diagnostics(logits, labels, input_ids,
@@ -824,10 +825,36 @@ def test_lm_token_diagnostics_categories_and_copy_distance():
     assert d['pred'].tolist() == [[2, 0, 0, 0, 0]]
     assert d['target_rank'].tolist() == [[1, 2, 6, 6, 6]]
     assert d['seen_earlier'].tolist() == [[False, True, False, False, True]]
-    assert d['last_seen_distance'].tolist() == [[-1, 1, -1, -1, 3]]
+    assert d['last_seen_distance'].tolist() == [[-1, 2, -1, -1, 1]]
     # Confident wrong really is confident; the copy miss is not.
     assert float(d['top1_prob'][0, 3]) > 0.9
     assert float(d['top1_prob'][0, 4]) < 0.5
+
+
+def test_lm_token_diagnostics_counts_immediate_repetition_as_copyable():
+    """The token just consumed is context for the next prediction.
+
+    A strict-prefix mask made ``... 3, 3`` look like an unseen target, so a
+    failed immediate copy was reported as ``novel_token`` (intrinsic
+    difficulty) instead of ``copyable_missed`` (retrieval failure).
+    """
+    vocab = 6
+    input_ids = torch.tensor([[1, 2, 3]])
+    labels = torch.tensor([[2, 3, 3]])
+    logits = torch.stack([
+        _row_logits(vocab, 2, 1),
+        _row_logits(vocab, 3, 1),
+        _row_logits(vocab, 3, 5),
+    ]).unsqueeze(0)
+    d = lm_token_diagnostics(logits, labels, input_ids, top_k=2)
+    assert d['seen_earlier'].tolist() == [[False, False, True]]
+    assert d['last_seen_distance'].tolist() == [[-1, -1, 1]]
+    assert d['category'][0] == ['correct', 'correct', 'copyable_missed']
+
+    s = summarize_lm_diagnostics(d)
+    dist = {b['bucket']: b for b in s['accuracy_by_repeat_distance']}
+    assert dist['d01_08']['n'] == 1
+    assert dist['not_in_context']['n'] == 2
 
 
 def test_summarize_lm_diagnostics_reports_both_axes():

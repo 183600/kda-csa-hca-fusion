@@ -808,10 +808,14 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
         (rank 1 = the target is (one of) the argmax token(s));
       * ``top1_prob`` — softmax probability of the predicted token, computed
         with the max-shift (logsumexp) stable form;
-      * ``seen_earlier`` / ``last_seen_distance`` — whether (and how long
-        ago) the target token occurred earlier in the same input. Distance
-        buckets turn "the model can't copy" into "the model can copy at
-        distance d but not at distance d'", which is exactly the evidence a
+      * ``seen_earlier`` / ``last_seen_distance`` — whether the target
+        occurred in the context available for this prediction, and the
+        distance from the PREDICTED position to its most recent occurrence.
+        The token just consumed (``input_ids[:, t]``) is part of that
+        context, so an immediate repetition has distance 1; excluding it
+        mislabelled repeat failures as ``novel_token``. Distance buckets
+        turn "the model can't copy" into "the model can copy at distance d
+        but not at distance d'", which is exactly the evidence a
         long-context architecture change needs.
 
     Tensors are returned with the same ``(B, T)`` shape as the inputs; the
@@ -899,8 +903,12 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
     # token occurred earlier in the same sample. B*T*T bool is small for the
     # analysis batch sizes (a 1k-token sequence is ~1M entries).
     seen = input_ids.unsqueeze(1) == labels.unsqueeze(2)
+    # The model predicts position t+1 after consuming input_ids[t], so the
+    # current token is context too (diagonal 0, not -1). With a strict
+    # prefix mask, ``... 3, 3`` made the second 3 look unseen and turned an
+    # easy copy into a "novel token".
     lower = torch.ones(t, t, dtype=torch.bool, device=logits.device)
-    lower = lower.tril(diagonal=-1)
+    lower = lower.tril(diagonal=0)
     seen = seen & lower.unsqueeze(0)
     seen_earlier = seen.any(dim=-1) & valid
     idx = torch.arange(t, device=logits.device)
@@ -908,8 +916,10 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
                         device=logits.device)
     last_pos = torch.where(seen, idx.view(1, 1, t).expand_as(seen),
                            no_pos).max(dim=-1).values
+    # Distance is measured from the predicted position (t+1): an immediate
+    # repetition is distance 1, the previous token is distance 2, etc.
     last_seen_distance = torch.where(
-        last_pos >= 0, idx.view(1, t) - last_pos,
+        last_pos >= 0, (idx + 1).view(1, t) - last_pos,
         torch.full_like(last_pos, -1))
 
     k = top_k
