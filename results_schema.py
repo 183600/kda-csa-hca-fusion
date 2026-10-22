@@ -482,7 +482,7 @@ def _validate_contrast_rows(rows: list, metadata: dict) -> list[str]:
                 f"{where}: direction must be 'higher_is_better', got "
                 f"{row.get('direction')!r}")
         key = (n_kv, row.get('memory'), row.get('contrast'))
-        if all(part is not None for part in key):
+        if all(part is not None and _is_hashable(part) for part in key):
             if key in seen:
                 out.append(f'{where}: duplicate contrast key {key!r}')
             seen.add(key)
@@ -616,7 +616,7 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
         if not isinstance(flag, bool):
             out.append(f"{where}: 'uses_incremental_cache' must be a bool, "
                        f'got {flag!r}')
-        if build not in _EXP6_PREFILL_BUILDS:
+        if not isinstance(build, str) or build not in _EXP6_PREFILL_BUILDS:
             out.append(f"{where}: 'prefill_cache_build'={build!r} not in "
                        f'{sorted(_EXP6_PREFILL_BUILDS)}')
         if isinstance(op, str) and isinstance(flag, bool):
@@ -684,10 +684,10 @@ def _validate_precision_sweep_rows(rows: list, metadata: dict) -> list[str]:
             if not isinstance(value, str) or not value:
                 out.append(f"{where}: '{key}' must be a non-empty string, got {value!r}")
         dtype, mode = row.get('dtype'), row.get('mode')
-        if dtype not in _PRECISION_DTYPES:
+        if not isinstance(dtype, str) or dtype not in _PRECISION_DTYPES:
             out.append(f"{where}: 'dtype'={dtype!r} not in "
                        f'{sorted(_PRECISION_DTYPES)}')
-        if mode not in _PRECISION_MODES:
+        if not isinstance(mode, str) or mode not in _PRECISION_MODES:
             out.append(f"{where}: 'mode'={mode!r} not in "
                        f'{sorted(_PRECISION_MODES)}')
         if not _positive_int(row.get('seq_len')):
@@ -737,7 +737,7 @@ def _validate_precision_sweep_rows(rows: list, metadata: dict) -> list[str]:
             if not isinstance(value, bool):
                 out.append(f"{where}: {key!r} must be a bool, got {value!r}")
         verdict = row.get('verdict')
-        if verdict not in _PRECISION_VERDICTS:
+        if not isinstance(verdict, str) or verdict not in _PRECISION_VERDICTS:
             out.append(f"{where}: 'verdict'={verdict!r} not in "
                        f'{sorted(_PRECISION_VERDICTS)}')
         if verdict == 'pass':
@@ -757,7 +757,8 @@ def _validate_precision_sweep_rows(rows: list, metadata: dict) -> list[str]:
                 and row.get('state_eps_max') is not None:
             out.append(f'{where}: verdict=fail but every recorded check '
                        f'passed')
-        if isinstance(dtype, str) and mode in _PRECISION_MODES \
+        if isinstance(dtype, str) and isinstance(mode, str) \
+                and mode in _PRECISION_MODES \
                 and isinstance(row.get('case'), str) \
                 and isinstance(row.get('path'), str):
             key = (row['case'], row['path'], dtype, mode)
@@ -815,7 +816,7 @@ def _validate_exp14_rows(rows: list, metadata: dict) -> list[str]:
             out.append(f'{where}: expected an object, got {type(row).__name__}')
             continue
         section = row.get('section')
-        if section not in _EXP14_SECTIONS:
+        if not isinstance(section, str) or section not in _EXP14_SECTIONS:
             out.append(f'{where}: section={section!r} not in '
                        f'{sorted(_EXP14_SECTIONS)}')
             continue
@@ -848,7 +849,7 @@ def _validate_exp14_rows(rows: list, metadata: dict) -> list[str]:
                 out.append(f"{where}: 'rows' must be a positive int, "
                            f"got {row.get('rows')!r}")
             dispatch = row.get('dispatch')
-            if dispatch not in _EXP14_DISPATCH:
+            if not isinstance(dispatch, str) or dispatch not in _EXP14_DISPATCH:
                 out.append(f'{where}: dispatch={dispatch!r} not in '
                            f'{sorted(_EXP14_DISPATCH)}')
             for fld in _EXP14_TIMING_FIELDS[section]:
@@ -892,9 +893,10 @@ def _validate_exp14_rows(rows: list, metadata: dict) -> list[str]:
                     out.append(f"{where}: {fld!r} must be finite and >= 0, "
                                f'got {value!r}')
             key = ('sink_guard', case)
-        if key in seen:
-            out.append(f'{where}: duplicate key {key!r}')
-        seen.add(key)
+        if _is_hashable(key):
+            if key in seen:
+                out.append(f'{where}: duplicate key {key!r}')
+            seen.add(key)
     return out
 
 
@@ -1329,9 +1331,10 @@ def _validate_latency_profile_rows(rows: list, metadata: dict) -> list[str]:
             out.append(f"{where}: chunked row needs a positive chunk_size, "
                        f'got {chunk!r}')
         key = (T, mode, chunk)
-        if key in seen:
-            out.append(f'{where}: duplicate (T, mode, chunk_size)={key!r}')
-        seen.add(key)
+        if _is_hashable(key):
+            if key in seen:
+                out.append(f'{where}: duplicate (T, mode, chunk_size)={key!r}')
+            seen.add(key)
         for fld in ('time_ms', 'time_min_ms', 'time_max_ms', 'time_std_ms'):
             value = row.get(fld)
             if not (_finite_number(value) and float(value) >= 0):

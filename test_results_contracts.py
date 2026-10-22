@@ -149,6 +149,11 @@ def test_row_contract_contrasts_requires_real_pairs():
                             [dict(good[0], mean_diff=float('nan'))], {})
     assert rs.validate_rows('exp5b_ablation_matrix_contrasts',
                             good + [dict(good[0])], {})
+    for field in ('memory', 'contrast'):
+        violations = rs.validate_rows(
+            'exp5b_ablation_matrix_contrasts',
+            [dict(good[0], **{field: []})], {})
+        assert any(field in v for v in violations), violations
 
 
 def test_tuned_baseline_contrasts_pair_each_group_with_softmax():
@@ -216,6 +221,13 @@ def test_row_contract_exp6_cache_flags_are_honest():
         meta)
     # An incomplete benchmark grid (op list recorded in metadata).
     assert rs.validate_rows('exp6_decoding', rows[:-1], meta)
+    # An unhashable build tag must be reported, not crash the validator.
+    violations = rs.validate_rows(
+        'exp6_decoding',
+        [dict(r, prefill_cache_build=[])
+         if r['op'] == 'kda' else r for r in rows],
+        meta)
+    assert any('prefill_cache_build' in v for v in violations), violations
 
 
 def test_row_contract_exp6_decode_state_certificate_fields():
@@ -264,6 +276,12 @@ def test_row_contract_exp14_parity_counts_reject_bools():
         bad = dict(base, **{key: 0.0})
         violations = rs.validate_rows('exp14_indexer_selector', [bad], {})
         assert any(key in v and 'exactly 0' in v for v in violations)
+    # Malformed section/case tokens are violations, not unhashable-set
+    # crashes during duplicate detection.
+    for field in ('section', 'case'):
+        bad = dict(base, **{field: []})
+        violations = rs.validate_rows('exp14_indexer_selector', [bad], {})
+        assert any(field in v for v in violations), violations
 
 
 def test_unknown_kinds_and_legacy_payloads_pass():
@@ -709,6 +727,15 @@ def test_row_contract_latency_profile_parity_gate():
         'mamba2_scan_latency_profile',
         [_profile_row(n=2)], meta)
     assert any('n=' in v for v in violations), violations
+    for field in ('T', 'mode'):
+        violations = rs.validate_rows(
+            'mamba2_scan_latency_profile',
+            [_profile_row(**{field: []})], meta)
+        assert any(field in v for v in violations), violations
+    violations = rs.validate_rows(
+        'mamba2_scan_latency_profile',
+        [_profile_row(mode='chunked', chunk_size=[])], meta)
+    assert any('chunk_size' in v for v in violations), violations
 
 
 def _exp9_contract_rows():
