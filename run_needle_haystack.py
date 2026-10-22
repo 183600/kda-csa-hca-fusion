@@ -552,6 +552,56 @@ def build_needle_batch(
 # Model wrappers for needle evaluation
 # ---------------------------------------------------------------------------
 
+def _quantize_hybrid_kda_state(hybrid, quant_spec: QuantSpec | None) -> None:
+    """Fake-quantize ``hybrid._kda_state`` after one state write.
+
+    Shared by the stepwise ``forward_step`` path and the cache-aware
+    quantized prefill helper so both apply exactly the same per-layer
+    quantizer (and therefore the same state-write contract).
+    """
+    state = getattr(hybrid, '_kda_state', None)
+    if quant_spec is None or state is None:
+        return
+    # state: [n_layers, B, HV, K, V]; flatten per layer and quantize.
+    quantized_layers = []
+    for layer_state in state.unbind(0):
+        flat = layer_state.reshape(layer_state.shape[0], -1)
+        quantized_layers.append(
+            fake_quantize(flat, quant_spec, ste=False).reshape_as(layer_state))
+    hybrid._kda_state = torch.stack(quantized_layers, dim=0)
+
+
+def _build_needle_decoder(model, device, dtype: torch.dtype):
+    """Cache-aware incremental decoder sharing ``model.hybrid``'s weights.
+
+    ``HybridKCHAttention`` is stateless for CSA/HCA. Running a prefill
+    through ``NeedleHybridLM.forward_step`` token-by-token therefore made
+    those layers see only the current token, so a quantized hybrid row was
+    not comparable with the unquantized full-sequence forward. The clone
+    owns real CSA/HCA caches and reproduces the full-prefix path.
+    """
+    from lm_consistency import build_decoding_clone
+
+    decoder = build_decoding_clone(model, device=device)
+    if dtype is not None:
+        decoder = decoder.to(dtype=dtype)
+    return decoder.eval()
+
+
+def _quantized_hybrid_prefill_last_logits(model, input_ids, quant_spec,
+                                          decoder):
+    """Prefill ``input_ids`` through the cache-aware quantized decoder."""
+    decoder.reset()
+    h = None
+    for t in range(input_ids.shape[1]):
+        h = decoder(model.embed(input_ids[:, t:t + 1]))
+        _quantize_hybrid_kda_state(decoder.model, quant_spec)
+    if h is None:
+        raise ValueError(
+            'quantized hybrid prefill needs at least one token')
+    return model.lm_head(model.norm_f(h))[:, -1, :]
+
+
 class NeedleHybridLM(nn.Module):
     """Tiny hybrid LM for needle-in-haystack evaluation.
 
@@ -616,20 +666,7 @@ class NeedleHybridLM(nn.Module):
         """
         x = self.embed(input_ids)  # [B, 1, d]
         h = self.hybrid(x)  # stateful, updates internal _kda_state
-        if quant_spec is not None:
-            # Quantize the stacked KDA state after every write
-            state = self.hybrid._kda_state
-            if state is not None:
-                # state: [n_layers, B, HV, K, V]
-                # Flatten per layer and quantize
-                n_layers = state.shape[0]
-                quantized_layers = []
-                for li in range(n_layers):
-                    layer_state = state[li]  # [B, HV, K, V]
-                    flat = layer_state.reshape(layer_state.shape[0], -1)
-                    deq = fake_quantize(flat, quant_spec, ste=False).reshape_as(layer_state)
-                    quantized_layers.append(deq)
-                self.hybrid._kda_state = torch.stack(quantized_layers, dim=0)
+        _quantize_hybrid_kda_state(self.hybrid, quant_spec)
         h = self.norm_f(h)
         return self.lm_head(h).squeeze(1)  # [B, vocab]
 
@@ -746,8 +783,12 @@ def evaluate_needle_recall(
     first-token accuracies are still reported for continuity.
 
     With ``quant_spec`` the memory state is fake-quantized after every write
-    during the prefill as well as during decoding (the PTQ contract), so the
-    prefill runs token-by-token through ``forward_step``.
+    during the prefill as well as during decoding (the PTQ contract). The
+    quantized prefill runs through a cache-aware ``HybridDecoding`` clone:
+    ``HybridKCHAttention`` is stateless for CSA/HCA, so feeding the prefix
+    through single-token ``forward_step`` calls would drop all compressed
+    context and make the quantized row incomparable with the unquantized
+    full-sequence forward.
     """
     model.eval()
     model.to(device)
@@ -767,6 +808,9 @@ def evaluate_needle_recall(
                                ('recency_copy', 'wrong_from_start',
                                 'partial_answer'))
     error_examples: dict = OrderedDict((c, []) for c in error_counts)
+    # Built lazily only for quantized hybrid rows; its caches carry the
+    # CSA/HCA prefix that the stateless tower cannot retain per token.
+    decoder = None
 
     for b in range(n_batches):
         seeds = eval_batch_seeds(b, batch_size)
@@ -783,17 +827,25 @@ def evaluate_needle_recall(
                 logits = model(input_ids)
                 next_logits = logits[:, -1]
             else:
-                # Quantize after every state write: no vectorized shortcut.
-                next_logits = None
-                for t in range(context_len):
-                    next_logits = model.forward_step(
-                        input_ids[:, t:t + 1], quant_spec)
+                if decoder is None:
+                    decoder = _build_needle_decoder(model, device, dtype)
+                # Quantize after every state write: the cache-aware clone
+                # keeps CSA/HCA context while the state quantizer still runs
+                # on the memory route after each token.
+                next_logits = _quantized_hybrid_prefill_last_logits(
+                    model, input_ids, quant_spec, decoder)
             generated = []
             cur = next_logits.argmax(dim=-1)
             for _ in range(n_gen):
                 generated.append(cur)
-                cur = model.forward_step(
-                    cur.unsqueeze(-1), quant_spec).argmax(dim=-1)
+                if quant_spec is None:
+                    cur = model.forward_step(
+                        cur.unsqueeze(-1), quant_spec).argmax(dim=-1)
+                else:
+                    h = decoder(model.embed(cur.unsqueeze(-1)))
+                    _quantize_hybrid_kda_state(decoder.model, quant_spec)
+                    cur = model.lm_head(
+                        model.norm_f(h)).squeeze(1).argmax(dim=-1)
             preds = torch.stack(generated, dim=1)  # [B, n_gen]
         else:
             # --- Stepwise model has no persistent cross-call state: score the
@@ -1151,7 +1203,10 @@ def _needle_primary_precision_rank(row: dict) -> tuple:
         return (0, dtype_rank, 0, 0, '')
     return (
         1,
-        int(row.get('bits') or 0),
+        # Sort key is ascending: negate bits so the WIDEST format wins the
+        # primary-cell slot (2-bit must not outrank 8-bit when a family has
+        # no unquantized reference row).
+        -int(row.get('bits') or 0),
         int(row.get('group_size') or 0),
         0 if row.get('symmetric') else 1,
         '',

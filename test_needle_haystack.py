@@ -47,6 +47,9 @@ import torch.nn.functional as F  # noqa: E402
 
 from run_needle_haystack import (  # noqa: E402
     _NeedleCharTokenizer,
+    _build_needle_decoder,
+    _needle_primary_precision_rank,
+    _quantized_hybrid_prefill_last_logits,
     build_needle_haystack,
     build_needle_batch,
     NeedleHybridLM,
@@ -162,6 +165,57 @@ def test_needle_hybrid_lm_stepwise_quant():
             logits_t = model.forward_step(input_ids[:, t:t+1], quant_spec=spec)
     _ok('stepwise quant: no NaN', not torch.isnan(logits_t).any().item())
     _ok('stepwise quant: correct shape', tuple(logits_t.shape) == (2, tok.vocab_size))
+
+
+def test_quantized_hybrid_prefill_keeps_csa_context():
+    """Quantized prefill must not reduce CSA/HCA to single-token attention.
+
+    ``forward_step`` feeds one token to a tower whose CSA/HCA branches are
+    stateless. The cache-aware prefill helper must instead let the final
+    query see the whole prefix.
+    """
+    tok = _NeedleCharTokenizer()
+    torch.manual_seed(0)
+    model = NeedleHybridLM(
+        tok.vocab_size, d_model=64, n_layers=1,
+        memory_type='kda', n_kda=0, n_csa=1, n_hca=0).eval()
+    ids = torch.randint(0, tok.vocab_size, (1, 32))
+    changed = ids.clone()
+    changed[0, 0] = (int(changed[0, 0]) + 1) % tok.vocab_size
+    spec = QuantSpec(bits=4, group_size=16)
+    decoder = _build_needle_decoder(model, 'cpu', torch.float32)
+    with torch.no_grad():
+        base = _quantized_hybrid_prefill_last_logits(
+            model, ids, spec, decoder)
+        perturbed = _quantized_hybrid_prefill_last_logits(
+            model, changed, spec, decoder)
+    diff = (base - perturbed).abs().max().item()
+    _ok('changing an early context token changes the final-token logits',
+        diff > 1e-6, f'max|d|={diff:.3e}')
+
+    # The evaluator must take the cache-aware path, not the stateless
+    # single-token forward_step loop that caused the context loss.
+    from unittest.mock import patch
+    with patch.object(model, 'forward_step',
+                      side_effect=AssertionError('stateless prefill used')):
+        result = evaluate_needle_recall(
+            model, tok, context_len=128, needle_pos=32, batch_size=1,
+            n_batches=1, device='cpu', quant_spec=spec,
+            dtype=torch.float32)
+    _ok('quantized evaluator does not prefill through forward_step',
+        result['total'] == 1, result)
+
+
+def test_primary_precision_rank_prefers_the_widest_format():
+    """Without an unquantized row, the primary cell is the highest-bit one."""
+    low = _needle_primary_precision_rank(
+        {'quantized': True, 'bits': 2, 'group_size': 16})
+    high = _needle_primary_precision_rank(
+        {'quantized': True, 'bits': 8, 'group_size': 16})
+    _ok('8-bit ranks ahead of 2-bit', high < low, f'{high} vs {low}')
+    unquant = _needle_primary_precision_rank(
+        {'quantized': False, 'dtype': 'fp16'})
+    _ok('an unquantized cell still ranks first', unquant < high, unquant)
 
 
 def test_stepwise_kda_ste_contract():
