@@ -800,11 +800,18 @@ def test_row_contract_exp9_audits_cross_source_ranking():
     both_routes = [dict(r) for r in rows]
     both_routes.append(dict(
         both_routes[1], memory_op='mamba2', total_read_elements=140.0))
+    sweep_idx = next(i for i, r in enumerate(both_routes)
+                     if r['section'] == 'decode_sweep')
+    both_routes.append(dict(both_routes[sweep_idx], memory_op='mamba2'))
     assert rs.validate_rows('exp9_budget_frontier', both_routes, {}) == []
     bad_route = [dict(r) for r in both_routes]
     bad_route[-1] = dict(bad_route[-1], memory_op='rwkv7')
     assert any('memory_op' in v for v in
                rs.validate_rows('exp9_budget_frontier', bad_route, {}))
+    duplicate = [dict(r) for r in both_routes]
+    duplicate.append(dict(duplicate[-1]))
+    assert any('duplicate key' in v for v in
+               rs.validate_rows('exp9_budget_frontier', duplicate, {}))
     # A mixed-revision verdict must name at least two commits.
     bad = [dict(r) for r in rows]
     bad[-1] = dict(bad[-1], status='mixed_revisions')

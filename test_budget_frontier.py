@@ -559,6 +559,25 @@ def test_decode_budget_curve_and_sweep_join():
             - kv_budget.layout_read_elements(
                 16, (3, 1, 1), decode_spec)['total_read_elements']) < 1e-9,
         f"{row['total_read_elements_per_query']}")
+    # The measured sweep now crosses the memory route: a Mamba-2 arm must
+    # price its own state, not the KDA state of the same layout string.
+    mamba_rows = run_decode_sweep(
+        torch.device('cpu'), [2], [16], n_decode=2, repeats=1,
+        memory_routes=('mamba2',))
+    mamba = mamba_rows[0]
+    mamba_cfg = HybridDecoding(
+        d_model=64, total_layers=5, csa_topk=2,
+        memory_type='mamba2').cfg
+    mamba_spec = _spec_from_hybrid_cfg(
+        mamba_cfg, softmax_geo={'n_kv_heads': 2, 'd_k': 16, 'd_v': 16})
+    mamba_step = kv_budget.instant_layout_read_elements(
+        (3, 1, 1), 16, mamba_spec, memory_op='mamba2')
+    _ok('Mamba-2 sweep row carries its route and route-matched budget',
+        mamba['memory_op'] == 'mamba2'
+        and abs(mamba['decode_step_read_elements_per_query']
+                - mamba_step['total_read_elements']) < 1e-9
+        and mamba['decode_step_mamba2_read_elements'] > 0.0
+        and mamba['decode_step_kda_read_elements'] == 0.0, f'{mamba}')
 
 
 def test_decode_sweep_smoke():

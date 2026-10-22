@@ -35,8 +35,9 @@ Questions:
    decoding, not the prefill average (the decode average understates the
    cost of late positions).
 2. **Measured top-k decode sweep**: per-token decode latency of the fused
-   3:1:1 hybrid as ``csa_topk`` varies (0 = sparse branch off, then 1/2/4/8),
-   joined with BOTH analytic views at the same geometry: the prefill
+   3:1:1 hybrid on both memory routes (KDA and Mamba-2) as ``csa_topk``
+   varies (0 = sparse branch off, then 1/2/4/8), joined with BOTH analytic
+   views at the same geometry: the prefill
    average (backward-compatible ``total_read_elements_per_query``) and the
    decode-window budget over the actually decoded positions. Every decode
    row carries the prefill/decode bootstrap CI95 and sample count from
@@ -73,6 +74,7 @@ Environment variables
 * ``BUDGET_PREFILL_LENS``   (default '256,512').
 * ``BUDGET_DECODE_TOKENS``  (default 10).
 * ``BUDGET_REPEATS``        (default 2).
+* ``BUDGET_DECODE_ROUTES``  (default 'kda,mamba2').
 
 Output
 ------
@@ -157,6 +159,20 @@ SOURCE_PROVENANCE_PATHS = {
     'exp5_ablation': os.path.join(
         'results', 'exp5_ablation_provenance.json'),
 }
+
+
+def _parse_memory_routes(raw, name='BUDGET_DECODE_ROUTES'):
+    parts = [part.strip() for part in str(raw).split(',') if part.strip()]
+    if not parts:
+        raise ValueError(f'{name} has no memory routes: {raw!r}')
+    unknown = [p for p in parts if p not in LAYOUT_MEMORY_OPS]
+    if unknown:
+        raise ValueError(
+            f'{name} contains unsupported route(s) {unknown}; choose from '
+            f'{list(LAYOUT_MEMORY_OPS)}.')
+    if len(set(parts)) != len(parts):
+        raise ValueError(f'{name} contains duplicate routes: {parts}')
+    return tuple(parts)
 
 
 def _parse_int_list(raw, name, min_value=0):
@@ -326,17 +342,23 @@ def _decode_row(cfg, bench, topk, prefill_len, n_decode, repeats):
     softmax_geo = {'n_kv_heads': 2, 'd_k': 16, 'd_v': 16}
     spec = _spec_from_hybrid_cfg(cfg, softmax_geo=softmax_geo)
     ratio = (cfg.n_kda, cfg.n_csa, cfg.n_hca)
-    budget = layout_read_elements(prefill_len, ratio, spec)
+    memory_op = cfg.memory_type if cfg.memory_type in LAYOUT_MEMORY_OPS \
+        else 'kda'
+    budget = layout_read_elements(
+        prefill_len, ratio, spec, memory_op=memory_op)
     csa_op = op_read_elements('csa', prefill_len, spec)
     # Decode-side (marginal) budgets: the first decoded token sits at
     # position prefill_len, and the n_decode measured tokens span the
     # window [prefill_len, prefill_len + n_decode).
-    step = instant_layout_read_elements(ratio, prefill_len, spec)
+    step = instant_layout_read_elements(
+        ratio, prefill_len, spec, memory_op=memory_op)
     window = windowed_layout_read_elements(
-        ratio, prefill_len, prefill_len + n_decode, spec)
+        ratio, prefill_len, prefill_len + n_decode, spec,
+        memory_op=memory_op)
     return {
         'section': 'decode_sweep',
         'csa_topk': topk,
+        'memory_op': memory_op,
         'prefill_len': prefill_len,
         'n_decode': n_decode,
         'repeats': repeats,
@@ -375,44 +397,69 @@ def _decode_row(cfg, bench, topk, prefill_len, n_decode, repeats):
             step['total_read_elements'],
         'decode_window_read_elements_per_query':
             window['total_read_elements'],
+        'decode_step_memory_read_elements': step['memory_read_elements'],
         'decode_step_kda_read_elements': step['kda_read_elements'],
+        'decode_step_mamba2_read_elements': step['mamba2_read_elements'],
         'decode_step_csa_read_elements': step['csa_read_elements'],
         'decode_step_hca_read_elements': step['hca_read_elements'],
     }
 
 
-def run_decode_sweep(device, topk_values, prefill_lens, n_decode, repeats):
-    """Measure decode latency of the fused hybrid vs the top-k budget."""
+def run_decode_sweep(device, topk_values, prefill_lens, n_decode, repeats,
+                     memory_routes=('kda',)):
+    """Measure decode latency of the fused hybrid vs the top-k budget.
+
+    ``memory_routes`` crosses the measured sweep with the memory operator
+    (KDA default, Mamba-2 for the second arm of the main matrix). Each row
+    carries ``memory_op`` and prices its budget on the matching route.
+    """
+    if isinstance(memory_routes, str):
+        memory_routes = (memory_routes,)
+    memory_routes = tuple(memory_routes)
+    if not memory_routes:
+        raise ValueError('run_decode_sweep: memory_routes must be non-empty.')
+    for route in memory_routes:
+        if route not in LAYOUT_MEMORY_OPS:
+            raise ValueError(
+                f'run_decode_sweep: memory route {route!r} must be one of '
+                f'{list(LAYOUT_MEMORY_OPS)}.')
     rows = []
-    for prefill_len in prefill_lens:
-        for topk in topk_values:
-            try:
-                set_global_seed(DECODE_SWEEP_SEED, deterministic=True)
-                model = HybridDecoding(
-                    d_model=DECODE_D_MODEL, total_layers=DECODE_TOTAL_LAYERS,
-                    csa_topk=topk)
-                bench = bench_decoding(
-                    model, DECODE_D_MODEL, prefill_len, n_decode, device,
-                    repeats=repeats)
-                rows.append(_decode_row(
-                    model.cfg, bench, topk, prefill_len, n_decode, repeats))
-                logger.info(
-                    f'  decode sweep topk={topk} L={prefill_len}: '
-                    f'prefill={bench["prefill_ms"]:.2f}ms '
-                    f'decode/token={bench["mean_decode_ms_per_token"]:.3f}ms')
-            except Exception as e:
-                logger.warning(
-                    f'  decode sweep topk={topk} L={prefill_len} FAILED: {e}')
-                rows.append({
-                    'section': 'decode_sweep',
-                    'csa_topk': topk,
-                    'prefill_len': prefill_len,
-                    'n_decode': n_decode,
-                    'repeats': repeats,
-                    'error': str(e),
-                })
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+    for route in memory_routes:
+        for prefill_len in prefill_lens:
+            for topk in topk_values:
+                try:
+                    set_global_seed(DECODE_SWEEP_SEED, deterministic=True)
+                    model = HybridDecoding(
+                        d_model=DECODE_D_MODEL,
+                        total_layers=DECODE_TOTAL_LAYERS,
+                        csa_topk=topk, memory_type=route)
+                    bench = bench_decoding(
+                        model, DECODE_D_MODEL, prefill_len, n_decode, device,
+                        repeats=repeats)
+                    rows.append(_decode_row(
+                        model.cfg, bench, topk, prefill_len, n_decode,
+                        repeats))
+                    logger.info(
+                        f'  decode sweep {route} topk={topk} '
+                        f'L={prefill_len}: '
+                        f'prefill={bench["prefill_ms"]:.2f}ms '
+                        f'decode/token='
+                        f'{bench["mean_decode_ms_per_token"]:.3f}ms')
+                except Exception as e:
+                    logger.warning(
+                        f'  decode sweep {route} topk={topk} '
+                        f'L={prefill_len} FAILED: {e}')
+                    rows.append({
+                        'section': 'decode_sweep',
+                        'csa_topk': topk,
+                        'memory_op': route,
+                        'prefill_len': prefill_len,
+                        'n_decode': n_decode,
+                        'repeats': repeats,
+                        'error': str(e),
+                    })
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
     return rows
 
 
@@ -912,9 +959,12 @@ def main():
         logger=logger)
     repeats = parse_int_env(
         'BUDGET_REPEATS', DEFAULT_REPEATS, min_value=1, logger=logger)
+    decode_routes = _parse_memory_routes(
+        os.environ.get('BUDGET_DECODE_ROUTES', 'kda,mamba2'))
     logger.info(f'  T grid: {t_grid}')
     logger.info(f'  decode: topk={topk_values}, prefill={prefill_lens}, '
-                f'n_decode={n_decode}, repeats={repeats}')
+                f'n_decode={n_decode}, repeats={repeats}, '
+                f'routes={decode_routes}')
 
     specs = {'mqar': mqar_spec(), 'paper': paper_spec()}
     rows = build_budget_curves(t_grid, specs)
@@ -925,7 +975,8 @@ def main():
 
     logger.info('\n-- decode top-k sweep (fused 3:1:1 hybrid) --')
     decode_rows = run_decode_sweep(
-        device, topk_values, prefill_lens, n_decode, repeats)
+        device, topk_values, prefill_lens, n_decode, repeats,
+        memory_routes=decode_routes)
     rows.extend(decode_rows)
 
     source_records = [_load_join_source(source, path)
@@ -1000,6 +1051,7 @@ def main():
             'prefill_lens': prefill_lens,
             'n_decode': n_decode,
             'repeats': repeats,
+            'memory_routes': list(decode_routes),
         },
         'join_sources': [name for name, _ in JOIN_SOURCES],
         'join_skipped': join_skipped,

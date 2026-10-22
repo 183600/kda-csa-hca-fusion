@@ -1454,9 +1454,13 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                 if not _positive_int(row.get(fld)):
                     out.append(f"{where}: {fld!r} must be a positive int, "
                                f"got {row.get(fld)!r}")
+            memory_op = row.get('memory_op', 'kda')
+            if memory_op not in ('kda', 'mamba2'):
+                out.append(f"{where}: memory_op={memory_op!r} must be "
+                           f"'kda' or 'mamba2'")
             if 'error' in row:
                 key = ('decode_sweep', row.get('csa_topk'),
-                       row.get('prefill_len'))
+                       row.get('prefill_len'), memory_op)
                 if key in seen:
                     out.append(f'{where}: duplicate key {key!r}')
                 seen.add(key)
@@ -1467,7 +1471,8 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                 if not (_finite_number(value) and float(value) >= 0):
                     out.append(f"{where}: {fld!r} must be finite >= 0, "
                                f'got {value!r}')
-            key = ('decode_sweep', row.get('csa_topk'), row.get('prefill_len'))
+            key = ('decode_sweep', row.get('csa_topk'),
+                   row.get('prefill_len'), memory_op)
         elif section == 'quality_join':
             source = row.get('source')
             if not isinstance(source, str) or not source:

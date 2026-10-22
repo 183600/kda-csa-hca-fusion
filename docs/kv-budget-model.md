@@ -59,7 +59,7 @@ latter mixes in cheap early positions and understates late-context cost.
 |---|---|---|
 | `budget_curve` | `row_kind` `op`/`layout` | prefill-average curves over `BUDGET_T_GRID` for softmax/KDA/Mamba-2/CSA/HCA and the layouts |
 | `decode_budget_curve` | `row_kind` `op`/`layout` | marginal (one-query) curves at position `t` |
-| `decode_sweep` | measured | per-token decode latency joined with both views (`total_read_elements_per_query` = prefill average, `decode_step_*` / `decode_window_*` = decode view) |
+| `decode_sweep` | measured | per-token decode latency joined with both views (`total_read_elements_per_query` = prefill average, `decode_step_*` / `decode_window_*` = decode view); measured on both memory routes, with each row's budget priced on its own route |
 | `quality_join` | measured | Exp 4/5/8 accuracy rows annotated with their analytic budget |
 | `ranking_summary` | derived | layout orders and Spearman correlations against accuracy under both views |
 
