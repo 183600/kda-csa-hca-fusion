@@ -2967,7 +2967,23 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
     def _frac(v):
         return counts.get(v, 0) / n
 
-    if _frac('underfitting') >= 0.5:
+    # Saturation is checked before the loss-shape verdicts: when every row
+    # is pinned at the task ceiling there is no accuracy headroom, so a
+    # rising/flat validation LOSS cannot be repaired by regularization or a
+    # larger step budget -- the probe itself has to get harder. Putting the
+    # loss verdicts first used to mislabel a fully saturated sweep as
+    # "overfitting" and recommend the wrong next experiment.
+    if len(saturated) == n:
+        summary['regime'] = 'saturated'
+        summary['interpretation'] = (
+            'every row reached the task ceiling: the probe is too easy to '
+            'discriminate these layouts and the measured gaps are '
+            'compressions of near-ceiling behaviour.')
+        summary['recommended_action'] = (
+            'raise the difficulty (more keys, more distractors, a longer '
+            'context) so the metric has headroom before the architecture '
+            'is ranked.')
+    elif _frac('underfitting') >= 0.5:
         summary['regime'] = 'budget_limited'
         summary['interpretation'] = (
             f"{_frac('underfitting'):.0%} of rows are still underfitting at "
@@ -2986,16 +3002,6 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         summary['recommended_action'] = (
             'select on the recorded best-validation step instead of the last '
             'step, and/or add regularization or more data.')
-    elif len(saturated) == n:
-        summary['regime'] = 'saturated'
-        summary['interpretation'] = (
-            'every row reached the task ceiling: the probe is too easy to '
-            'discriminate these layouts and the measured gaps are '
-            'compressions of near-ceiling behaviour.')
-        summary['recommended_action'] = (
-            'raise the difficulty (more keys, more distractors, a longer '
-            'context) so the metric has headroom before the architecture '
-            'is ranked.')
     elif len(still_improving) * 2 >= n:
         summary['regime'] = 'budget_limited'
         summary['interpretation'] = (
@@ -3019,7 +3025,7 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
             're-run any row whose verdict is underfitting or overfitting '
             'before quoting an aggregate ranking.')
 
-    if saturated:
+    if saturated and summary['regime'] != 'saturated':
         summary['interpretation'] += (
             f" {len(saturated)}/{n} rows are additionally pinned at the "
             f"task ceiling (saturated at ceiling={saturated}), which "

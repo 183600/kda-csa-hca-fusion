@@ -134,6 +134,34 @@ def test_curve_diagnosis_single_validation_point_is_insufficient():
     json.dumps(rep, allow_nan=False)
 
 
+def test_sweep_summary_prefers_saturation_over_loss_shape():
+    """No accuracy headroom is a stronger fact than a rising val loss.
+
+    A fully saturated sweep has no room to improve, so recommending
+    regularization would send the next experiment in the wrong direction;
+    the probe must get harder instead.
+    """
+    from run_ablation import _curve_diagnosis_summary
+
+    rows = [
+        {'ratio': '3:1:1', 'curve_verdict': 'overfitting',
+         'n_seeds_at_ceiling': 2, 'curve_verdict_stable': True,
+         'mean_generalization_gap': 0.1, 'n_seeds_budget_limited': 0},
+        {'ratio': '2:2:1', 'curve_verdict': 'overfitting',
+         'n_seeds_at_ceiling': 2, 'curve_verdict_stable': True,
+         'mean_generalization_gap': 0.2, 'n_seeds_budget_limited': 0},
+    ]
+    summary = _curve_diagnosis_summary(rows, 'ratio')
+    assert summary['regime'] == 'saturated'
+    assert 'too easy' in summary['interpretation']
+    assert 'regularization' not in summary['recommended_action']
+
+    # Without universal saturation, the loss-shape verdict still drives.
+    rows[1]['n_seeds_at_ceiling'] = 0
+    summary = _curve_diagnosis_summary(rows, 'ratio')
+    assert summary['regime'] == 'overfitting'
+
+
 # ---------------------------------------------------------------------------
 # Systematic non-finite triage
 # ---------------------------------------------------------------------------
