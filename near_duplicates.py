@@ -44,6 +44,8 @@ The module exposes four building blocks:
 """
 from __future__ import annotations
 
+import math
+import numbers
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -80,29 +82,42 @@ def _splitmix64(x: np.ndarray) -> np.ndarray:
     return x ^ (x >> _U64(31))
 
 
+def _require_int(name: str, value, *, minimum: int) -> int:
+    """Exact integer geometry (bool and floats are not dimensions).
+
+    ``int(5.9) == 5`` / ``int(True) == 1`` would silently run a different
+    detector than the caller asked for, so reject them up front.  NumPy
+    integer scalars are accepted (``numbers.Integral``), mirroring the
+    token-id representation used by the caller.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f'{name} must be an exact int, got {value!r}')
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f'{name} must be >= {minimum}, got {value!r}')
+    return value
+
+
 def _check_parameters(*, threshold: float, shingle_size: int, num_perm: int,
                       band_rows: int,
                       max_candidate_pairs: int) -> None:
-    if not 0.0 < float(threshold) <= 1.0:
+    if (isinstance(threshold, bool)
+            or not isinstance(threshold, numbers.Real)
+            or not math.isfinite(float(threshold))
+            or not 0.0 < float(threshold) <= 1.0):
         raise ValueError(
-            f'near-duplicate threshold must be in (0, 1], got {threshold!r}')
-    if int(shingle_size) < 1:
-        raise ValueError(
-            f'shingle_size must be >= 1, got {shingle_size!r}')
-    if int(num_perm) < 2:
-        raise ValueError(f'num_perm must be >= 2, got {num_perm!r}')
-    if int(band_rows) < 1:
-        raise ValueError(f'band_rows must be >= 1, got {band_rows!r}')
-    if int(num_perm) % int(band_rows) != 0:
+            f'near-duplicate threshold must be a finite number in (0, 1], '
+            f'got {threshold!r}')
+    shingle_size = _require_int('shingle_size', shingle_size, minimum=1)
+    num_perm = _require_int('num_perm', num_perm, minimum=2)
+    band_rows = _require_int('band_rows', band_rows, minimum=1)
+    _require_int('max_candidate_pairs', max_candidate_pairs, minimum=1)
+    if num_perm % band_rows != 0:
         raise ValueError(
             f'num_perm={num_perm} must be divisible by band_rows={band_rows}')
-    if int(band_rows) > int(num_perm):
+    if band_rows > num_perm:
         raise ValueError(
             f'band_rows={band_rows} must be <= num_perm={num_perm}')
-    if int(max_candidate_pairs) < 1:
-        raise ValueError(
-            'max_candidate_pairs must be >= 1, '
-            f'got {max_candidate_pairs!r}')
 
 
 def _as_ids(token_ids: Sequence[int] | None) -> np.ndarray:
@@ -158,10 +173,10 @@ def minhash_signature(token_ids: Sequence[int] | None, *,
     permutation of the hash universe), which is the MinHash requirement;
     the constants are derived deterministically from ``seed`` and ``i``.
     """
-    if int(num_perm) < 2:
-        raise ValueError(f'num_perm must be >= 2, got {num_perm!r}')
-    if int(shingle_size) < 1:
-        raise ValueError(f'shingle_size must be >= 1, got {shingle_size!r}')
+    num_perm = _require_int('num_perm', num_perm, minimum=2)
+    shingle_size = _require_int('shingle_size', shingle_size, minimum=1)
+    if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
+        raise ValueError(f'seed must be an exact int, got {seed!r}')
     hashes = _shingle_hashes(token_ids, shingle_size=shingle_size, seed=seed)
     if hashes.size == 0:
         return None
@@ -221,6 +236,8 @@ def near_duplicate_pairs(
     _check_parameters(
         threshold=threshold, shingle_size=shingle_size, num_perm=num_perm,
         band_rows=band_rows, max_candidate_pairs=max_candidate_pairs)
+    if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
+        raise ValueError(f'seed must be an exact int, got {seed!r}')
     token_ids = list(token_ids)
     n_docs = len(token_ids)
     signatures: list[np.ndarray | None] = [
@@ -309,6 +326,33 @@ def near_duplicate_pairs(
     }
 
 
+def _pair_indices(row, where: str) -> tuple[int, int]:
+    """Extract exact integer indices from a reported pair row.
+
+    ``int(0.9) == 0`` would silently connect the wrong documents, so a
+    float / bool / string index is a malformed row rather than something
+    to coerce.
+    """
+    if isinstance(row, (str, bytes)):
+        raise ValueError(f'{where}: malformed near-duplicate pair: {row!r}')
+    try:
+        fields = len(row)
+    except TypeError:
+        raise ValueError(
+            f'{where}: malformed near-duplicate pair: {row!r}') from None
+    if fields < 2:
+        raise ValueError(f'{where}: malformed near-duplicate pair: {row!r}')
+    out = []
+    for pos in range(2):
+        value = row[pos]
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise ValueError(
+                f'{where}: pair index #{pos} must be an exact int, got '
+                f'{value!r} in row {row!r}')
+        out.append(int(value))
+    return out[0], out[1]
+
+
 def near_duplicate_clusters(pairs: Iterable[Sequence], n_documents: int,
                             *, keep: str = 'first') -> list[list[int]]:
     """Connected components of the near-duplicate graph.
@@ -326,9 +370,7 @@ def near_duplicate_clusters(pairs: Iterable[Sequence], n_documents: int,
     """
     if keep != 'first':
         raise ValueError(f"keep must be 'first', got {keep!r}")
-    n = int(n_documents)
-    if n < 0:
-        raise ValueError(f'n_documents must be >= 0, got {n_documents!r}')
+    n = _require_int('n_documents', n_documents, minimum=0)
     parent = list(range(n))
 
     def find(x: int) -> int:
@@ -349,9 +391,7 @@ def near_duplicate_clusters(pairs: Iterable[Sequence], n_documents: int,
             parent[rx] = ry
 
     for row in pairs:
-        if len(row) < 2:
-            raise ValueError(f'malformed near-duplicate pair: {row!r}')
-        i, j = int(row[0]), int(row[1])
+        i, j = _pair_indices(row, 'near_duplicate_clusters')
         if not (0 <= i < n and 0 <= j < n):
             raise ValueError(
                 f'near-duplicate pair {(i, j)} out of range for n={n}')
@@ -380,6 +420,7 @@ def summarize_cross_split(pairs: Iterable[Sequence],
     The caller is responsible for the ordering: a pair ``(i, j)`` is
     compared using ``split_labels[i]`` / ``split_labels[j]``.
     """
+    max_examples = _require_int('max_examples', max_examples, minimum=0)
     labels = [str(x) for x in split_labels]
     n = len(labels)
     by_pair: dict[str, int] = {}
@@ -388,12 +429,21 @@ def summarize_cross_split(pairs: Iterable[Sequence],
     max_jaccard = None
     examples: list[dict] = []
     for row in pairs:
-        if len(row) < 2:
-            raise ValueError(f'malformed near-duplicate pair: {row!r}')
-        i, j = int(row[0]), int(row[1])
+        i, j = _pair_indices(row, 'summarize_cross_split')
         if not (0 <= i < n and 0 <= j < n):
             raise ValueError(
                 f'near-duplicate pair {(i, j)} out of range for n={n}')
+        jaccard = None
+        if len(row) >= 3:
+            raw = row[2]
+            if raw is not None:
+                if (isinstance(raw, bool)
+                        or not isinstance(raw, numbers.Real)
+                        or not math.isfinite(float(raw))):
+                    raise ValueError(
+                        'summarize_cross_split: pair jaccard must be a '
+                        f'finite number or None, got {raw!r} in row {row!r}')
+                jaccard = float(raw)
         li, lj = labels[i], labels[j]
         if li == lj:
             within += 1
@@ -402,11 +452,10 @@ def summarize_cross_split(pairs: Iterable[Sequence],
         by_pair[key] = by_pair.get(key, 0) + 1
         involved.add(i)
         involved.add(j)
-        jaccard = float(row[2]) if len(row) >= 3 else None
         if jaccard is not None:
             max_jaccard = (jaccard if max_jaccard is None
                            else max(max_jaccard, jaccard))
-        if len(examples) < int(max_examples):
+        if len(examples) < max_examples:
             examples.append({
                 'i': i, 'j': j,
                 'splits': [li, lj],

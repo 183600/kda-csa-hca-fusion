@@ -198,6 +198,37 @@ def test_near_duplicate_parameter_validation():
         else:  # pragma: no cover - every invalid value must be rejected
             raise AssertionError(f'invalid near-dup parameter accepted: {kwargs}')
 
+    # Coerced types are rejected instead of silently truncating:
+    # int(5.9) would run a different detector than requested, and
+    # int(True) would accept an accidental flag.
+    for kwargs in ({'shingle_size': 5.9}, {'num_perm': 64.5},
+                   {'band_rows': True}, {'max_candidate_pairs': 1.5},
+                   {'seed': 1.5}, {'threshold': True},
+                   {'threshold': float('nan')}):
+        try:
+            near_duplicate_pairs([[1, 2, 3]], **kwargs)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(
+                f'coerced near-dup parameter accepted: {kwargs}')
+
+    # A non-integer document index must not be coerced to the wrong row.
+    for bad_pairs in ([[0.5, 1]], [[True, 1]], [['0', 1]]):
+        try:
+            near_duplicate_clusters(bad_pairs, 2)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'malformed pair accepted: {bad_pairs}')
+    try:
+        summarize_cross_split([[0, 1, float('nan')]],
+                              ['train', 'val'])
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('non-finite pair jaccard accepted')
+
 
 def test_numpy_infinite_scalars_are_dropped_not_stringified():
     # A dataframe/JSON feed commonly carries NumPy scalars.  ``inf == inf``,
