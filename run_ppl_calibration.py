@@ -70,7 +70,10 @@ import torch.nn.functional as F  # noqa: E402
 
 import ppl_bootstrap as P  # noqa: E402
 import ppl_calibration as PC  # noqa: E402
-from kaggle_setup import capture_provenance, write_json_atomic  # noqa: E402
+from kaggle_setup import (  # noqa: E402
+    append_run_manifest, capture_provenance, make_run_manifest_entry,
+    set_global_seed, write_json_atomic,
+)
 from results_schema import (  # noqa: E402
     SchemaError, write_checked as write_results_checked,
 )
@@ -216,6 +219,11 @@ def main() -> int:
     reps = _env_int('PPL_CAL_REPS', EXP_REPS)
     n_boot = _env_int('PPL_CAL_NBOOT', EXP_NBOOT)
     seed = _env_int('PPL_CAL_SEED', EXP_SEED)
+    # Seed every RNG family, not just torch's global generator: the
+    # calibration code uses local random.Random streams, while model
+    # construction draws from torch. torch.manual_seed(0) keeps the model
+    # stream fixed exactly as the committed protocol describes.
+    set_global_seed(seed, deterministic=True)
     torch.manual_seed(0)
 
     print(f'[exp15] calibration grid (reps={reps}, n_boot={n_boot}, '
@@ -269,9 +277,10 @@ def main() -> int:
         },
         'seeds': {
             'value': seed,
-            'scheme': ('ppl_calibration local random.Random streams from '
-                       f'(seed={seed}, scenario, replicate); torch '
-                       'manual_seed(0) for model construction, '
+            'scheme': ('set_global_seed(seed) covers Python/NumPy/torch/'
+                       'CUDA; ppl_calibration uses local random.Random '
+                       f'streams from (seed={seed}, scenario, replicate); '
+                       'torch manual_seed(0) for model construction, '
                        'Generator(3) for windows'),
         },
         'provenance': capture_provenance(),
@@ -286,6 +295,30 @@ def main() -> int:
         return 1
     print('\nSaved: results/exp15_ppl_calibration.json '
           '(schema kind=exp15_ppl_calibration)')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp15_ppl_calibration',
+        seeds=seed,
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'simulation': report['settings'],
+            'scenarios': PC.default_scenarios(),
+            'method': report['method'],
+            'decode_prefill_protocol': metadata['decode_prefill_protocol'],
+            'model_construction_seed': 2027,
+            'window_generator_seed': 3,
+        },
+        artifacts={
+            'results': 'results/exp15_ppl_calibration.json',
+            'provenance': (
+                'results/exp15_ppl_calibration_provenance.json'),
+        },
+        results={
+            'all_pass': bool(report['all_pass']),
+            'n_rows': len(rows),
+            'decode_prefill_parity_ok': bool(dp['parity_ok']),
+            'decode_prefill_effect_ok': bool(dp['effect_ok']),
+        },
+    ))
     try:
         prov = capture_provenance()
         prov['seeds'] = metadata['seeds']

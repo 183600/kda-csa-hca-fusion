@@ -78,8 +78,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    append_run_manifest,
     capture_provenance,
     configure_torch_for_device,
+    make_run_manifest_entry,
     make_seeded_generator,
 )
 from kv_quant import (  # noqa: E402
@@ -587,6 +589,30 @@ def main():
     write_schema(RESULTS_PATH, rows, kind='exp10_quant_recall',
                  metadata=metadata)
     logger.info(f'\nSaved: {RESULTS_PATH}')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp10_quant_recall',
+        seeds=list(seeds),
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'routes': list(ROUTES),
+            'bits': list(bits_list),
+            'group_sizes': list(group_sizes),
+            'probe_geometry': metadata['probe_geometry'],
+            'specs': specs_provenance,
+        },
+        data={
+            'kind': 'synthetic_planted_associative_recall',
+            'n_keys': n_keys,
+            'value_dim': value_dim,
+            'context_T': n_keys,
+        },
+        artifacts={'results': RESULTS_PATH},
+        results={
+            'n_rows': len(rows),
+            'n_seeds': len(seeds),
+            'routes': list(ROUTES),
+        },
+    ), logger=logger)
     return 0
 
 

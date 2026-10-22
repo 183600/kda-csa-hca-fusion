@@ -72,7 +72,10 @@ import ops_csa  # noqa: E402
 from results_schema import (  # noqa: E402
     SchemaError, write_checked as write_results_checked,
 )
-from kaggle_setup import capture_provenance, write_json_atomic  # noqa: E402
+from kaggle_setup import (  # noqa: E402
+    append_run_manifest, capture_provenance, make_run_manifest_entry,
+    set_global_seed, write_json_atomic,
+)
 
 NAN = float('nan')
 NINF = float('-inf')
@@ -498,7 +501,7 @@ def bench_sink_guard() -> list:
 def main() -> int:
     topk = _env_int('SELECTOR_TOPK', 16)
     lengths = _env_list('SELECTOR_DECODE_LENS', DECODE_LENS)
-    torch.manual_seed(0)
+    set_global_seed(0, deterministic=True)
     torch.set_num_threads(max(1, min(torch.get_num_threads(), 8)))
 
     results = []
@@ -562,9 +565,9 @@ def main() -> int:
         },
         'seeds': {
             'value': 0,
-            'scheme': ('torch.manual_seed(0); seeded torch.Generator(0/7) '
-                       'for score tensors and cache fill; see '
-                       'run_indexer_selector.main'),
+            'scheme': ('set_global_seed(0) covers Python/NumPy/torch/CUDA; '
+                       'seeded torch.Generator(0/7) for score tensors and '
+                       'cache fill; see run_indexer_selector.main'),
         },
         'provenance': capture_provenance(),
     }
@@ -578,6 +581,29 @@ def main() -> int:
         return 1
     print('\nSaved: results/exp14_indexer_selector.json '
           '(schema kind=exp14_indexer_selector)')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp14_indexer_selector',
+        seeds=0,
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'topk': topk,
+            'selector_grid': metadata['selector_grid'],
+            'decode_lengths': metadata['decode_lengths'],
+            'decode_geometry': metadata['decode_geometry'],
+            'topk_sort_max_elems': metadata['topk_sort_max_elems'],
+            'timing_protocol': metadata['timing_protocol'],
+        },
+        artifacts={
+            'results': 'results/exp14_indexer_selector.json',
+            'provenance': (
+                'results/exp14_indexer_selector_provenance.json'),
+        },
+        results={
+            'n_rows': len(results),
+            'parity_ok': True,
+            'guard_ok': True,
+        },
+    ))
     try:
         prov = capture_provenance()
         prov['seeds'] = metadata['seeds']

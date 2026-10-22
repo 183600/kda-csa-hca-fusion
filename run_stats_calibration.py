@@ -36,7 +36,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from kaggle_setup import capture_provenance, write_json_atomic  # noqa: E402
+from kaggle_setup import (  # noqa: E402
+    append_run_manifest, capture_provenance, make_run_manifest_entry,
+    write_json_atomic,
+)
 import multi_seed_calibration as MC  # noqa: E402
 from results_schema import write_checked  # noqa: E402
 
@@ -116,6 +119,11 @@ def main() -> int:
         'caveats': report['caveats'],
         'diagnostic_failed': report['diagnostic_failed'],
         'all_pass': True,
+        'seeds': {
+            'value': seed,
+            'scheme': ('multi_seed_calibration local random.Random streams '
+                       f'from (seed={seed}, scenario, replicate)'),
+        },
         'provenance': capture_provenance(),
     }
     os.makedirs(os.path.dirname(RESULT_PATH) or '.', exist_ok=True)
@@ -126,6 +134,26 @@ def main() -> int:
     except Exception as e:
         logger.warning(f'failed to write provenance: {e}')
     logger.info(f'\nSaved: {RESULT_PATH}')
+    append_run_manifest(make_run_manifest_entry(
+        experiment='exp16_paired_stats_calibration',
+        seeds=seed,
+        provenance=metadata['provenance'],
+        hyperparameters={
+            'settings': report['settings'],
+            'method': report['method'],
+            'scenarios': MC.default_scenarios(),
+        },
+        artifacts={
+            'results': RESULT_PATH,
+            'provenance': PROVENANCE_PATH,
+        },
+        results={
+            'all_pass': bool(report['all_pass']),
+            'n_rows': len(report['rows']),
+            'n_failed': int(report['n_failed']),
+            'n_diagnostic_failed': int(report['n_diagnostic_failed']),
+        },
+    ), logger=logger)
     return 0
 
 
