@@ -799,3 +799,19 @@ def test_row_contract_exp9_audits_cross_source_ranking():
         partial[rank_idx], source_comparability='partial_seeds',
         comparable_across_sources=False)
     assert rs.validate_rows('exp9_budget_frontier', partial, {}) == []
+
+
+def test_row_contract_exp9_malformed_types_do_not_crash():
+    import copy
+
+    rows = _exp9_contract_rows()
+    for index, patch in (
+            (0, {'section': []}),
+            (0, {'row_kind': []}),
+            (0, {'geometry': []}),
+            (0, {'name': []}),
+    ):
+        bad = copy.deepcopy(rows)
+        bad[index] = dict(bad[index], **patch)
+        violations = rs.validate_rows('exp9_budget_frontier', bad, {})
+        assert violations, patch

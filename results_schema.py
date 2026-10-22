@@ -295,6 +295,20 @@ def _finite_number(value) -> bool:
             and math.isfinite(float(value)))
 
 
+def _is_hashable(value) -> bool:
+    """True when ``value`` can be used in a set/dict key.
+
+    Row contracts build duplicate-detection keys from arbitrary JSON
+    fields. A malformed row must produce a violation, not an unhashable
+    ``TypeError`` that aborts the whole validation pass.
+    """
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
 def _positive_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -926,7 +940,7 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
             out.append(f'{where}: expected an object, got {type(row).__name__}')
             continue
         section = row.get('section')
-        if section not in _EXP15_SECTIONS:
+        if not isinstance(section, str) or section not in _EXP15_SECTIONS:
             out.append(f'{where}: section={section!r} not in '
                        f'{sorted(_EXP15_SECTIONS)}')
             continue
@@ -1000,7 +1014,7 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
             key = ('coverage', row.get('n_units'), row.get('alpha'))
         elif section == 'paired':
             check = row.get('check')
-            if check not in _EXP15_PAIRED_CHECKS:
+            if not isinstance(check, str) or check not in _EXP15_PAIRED_CHECKS:
                 out.append(f'{where}: check={check!r} not in '
                            f'{sorted(_EXP15_PAIRED_CHECKS)}')
             if not _positive_int(row.get('n_units')):
@@ -1188,9 +1202,10 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
                     out.append(f'{where}: effect_ok contradicts delta / '
                                f'ppl_ratio vs the recorded tolerances')
             key = ('decode_prefill', row.get('n_windows'), row.get('seq_len'))
-        if key in seen:
-            out.append(f'{where}: duplicate key {key!r}')
-        seen.add(key)
+        if all(_is_hashable(part) for part in key):
+            if key in seen:
+                out.append(f'{where}: duplicate key {key!r}')
+            seen.add(key)
     return out
 
 
@@ -1390,7 +1405,7 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
             out.append(f'{where}: expected an object, got {type(row).__name__}')
             continue
         section = row.get('section')
-        if section not in _EXP9_SECTIONS:
+        if not isinstance(section, str) or section not in _EXP9_SECTIONS:
             out.append(f'{where}: section={section!r} not in '
                        f'{sorted(_EXP9_SECTIONS)}')
             continue
@@ -1487,8 +1502,10 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                     out.append(f"{where}: n_layouts must be >= 3, "
                                f'got {n_layouts!r}')
                 labels = row.get('labels')
-                if not (isinstance(labels, list) and labels
-                        and all(isinstance(x, str) and x for x in labels)):
+                labels_ok = (isinstance(labels, list) and bool(labels)
+                             and all(isinstance(x, str) and x
+                                     for x in labels))
+                if not labels_ok:
                     out.append(f"{where}: labels must be a non-empty list of "
                                f'non-empty strings')
                 elif _positive_int(n_layouts) and len(labels) != n_layouts:
@@ -1496,7 +1513,8 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                 for fld in ('layout_order_by_budget_ascending',
                             'layout_order_by_decode_budget_ascending'):
                     seq = row.get(fld)
-                    if not (isinstance(seq, list) and len(seq) == len(labels)):
+                    if not (isinstance(seq, list) and labels_ok
+                            and len(seq) == len(labels)):
                         out.append(f'{where}: {fld} must match len(labels)')
                 for fld in ('spearman_acc_vs_budget',
                             'spearman_acc_vs_decode_budget'):
@@ -1518,7 +1536,8 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
             if source == 'cross_source':
                 audit_cross = row
                 status = row.get('status')
-                if status not in _EXP9_AUDIT_STATUSES:
+                if not isinstance(status, str) \
+                        or status not in _EXP9_AUDIT_STATUSES:
                     out.append(f'{where}: status={status!r} not in '
                                f'{sorted(_EXP9_AUDIT_STATUSES)}')
                 if not isinstance(row.get('comparable_for_ranking'), bool):
@@ -1555,7 +1574,9 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                     if not isinstance(row.get('seeds'), list) or not all(
                             _nonnegative_int(s) for s in row['seeds']):
                         out.append(f"{where}: seeds must be a list of ints")
-                    if row.get('n_seeds') != len(row.get('seeds') or []):
+                    seeds_ok = isinstance(row.get('seeds'), list)
+                    if row.get('n_seeds') != (len(row['seeds'])
+                                              if seeds_ok else 0):
                         out.append(f"{where}: n_seeds != len(seeds)")
                     if not isinstance(row.get('backends'), dict):
                         out.append(f"{where}: backends must be an object")
@@ -1566,14 +1587,19 @@ def _validate_exp9_rows(rows: list, metadata: dict) -> list[str]:
                         row['git_commit'], str):
                     out.append(f'{where}: git_commit must be null or str')
                 key = ('source_audit', source)
-        if key in seen:
-            out.append(f'{where}: duplicate key {key!r}')
-        seen.add(key)
+        if all(_is_hashable(part) for part in key):
+            if key in seen:
+                out.append(f'{where}: duplicate key {key!r}')
+            seen.add(key)
 
     if audit_cross is not None:
         status = audit_cross.get('status')
         commits = audit_cross.get('git_commits') or []
         shared = audit_cross.get('shared_seeds') or []
+        if not isinstance(commits, list):
+            commits = []
+        if not isinstance(shared, list):
+            shared = []
         if status == 'mixed_revisions' and len(commits) < 2:
             out.append('source_audit: mixed_revisions needs >= 2 git commits')
         if status in ('comparable', 'comparable_dirty_tree') \

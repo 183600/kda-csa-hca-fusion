@@ -252,6 +252,26 @@ def test_exp15_row_contract_reports_overflow_instead_of_crashing():
     assert any('ci_ppl_ratio' in v for v in violations), violations
 
 
+def test_exp15_row_contract_rejects_malformed_types_without_crashing():
+    """Malformed JSON fields must yield violations, never a TypeError."""
+    import copy
+
+    from results_schema import ROW_CONTRACTS
+
+    contract = ROW_CONTRACTS['exp15_ppl_calibration']
+    for index, patch in (
+            (0, {'section': []}),
+            (0, {'n_units': []}),
+            (0, {'alpha': {}}),
+            (1, {'check': []}),
+            (1, {'delta': {}}),
+    ):
+        rows = copy.deepcopy(_valid_exp15_rows())
+        rows[index] = dict(rows[index], **patch)
+        violations = contract(rows, {})
+        assert violations, patch
+
+
 def test_exp15_row_contract_rejects_tampering():
     import copy
 
