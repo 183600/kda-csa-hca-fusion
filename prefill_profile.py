@@ -72,6 +72,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
 
+from kaggle_setup import capture_provenance, set_global_seed  # noqa: E402
+
 __all__ = [
     'PREFILL_PROFILE_KIND',
     'drift_metrics',
@@ -625,6 +627,7 @@ def main(argv=None) -> int:
         except (TypeError, ValueError) as exc:
             parser.error(str(exc))
 
+    seed_info = set_global_seed(args.seed, deterministic=True)
     torch.manual_seed(args.seed)
     model = _build_model(args.model, args.d_model).to(device).eval()
     gen = torch.Generator(device='cpu').manual_seed(args.seed)
@@ -635,8 +638,10 @@ def main(argv=None) -> int:
         model, x, schedules, repeats=args.repeats, warmup=args.warmup,
         atol=args.atol, rtol=args.rtol)
     report['seed'] = args.seed
+    report['seed_info'] = seed_info
     report['torch_version'] = torch.__version__
     report['num_threads'] = torch.get_num_threads()
+    report['provenance'] = capture_provenance()
 
     print('=' * 78)
     print(f"Chunked-prefill profile: {args.model} on {device} "
