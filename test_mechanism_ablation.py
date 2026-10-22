@@ -498,6 +498,20 @@ def test_single_seed_aggregate_reports_undefined_std():
     _ok('two values keep a finite std', std is not None and std > 0, std)
 
 
+def test_paired_family_size_counts_every_n_kv_cell():
+    """The accuracy contrast family is per variant AND per n_kv cell."""
+    variants = [{'name': 'baseline'}, {'name': 'no_rope'}, {'name': 'topk1'}]
+    _ok('one n_kv cell counts non-baseline variants',
+        M._paired_family_size(variants, [1]) == 2,
+        M._paired_family_size(variants, [1]))
+    _ok('three n_kv cells multiply the family',
+        M._paired_family_size(variants, [1, 2, 4]) == 6,
+        M._paired_family_size(variants, [1, 2, 4]))
+    _ok('no baseline means no paired family',
+        M._paired_family_size([{'name': 'no_rope'}], [1, 2]) == 0,
+        M._paired_family_size([{'name': 'no_rope'}], [1, 2]))
+
+
 _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
@@ -509,6 +523,7 @@ _TEST_FUNCS = [
     test_ablation_design_audit,
     test_exp8_smoke_envelope,
     test_single_seed_aggregate_reports_undefined_std,
+    test_paired_family_size_counts_every_n_kv_cell,
 ]
 
 

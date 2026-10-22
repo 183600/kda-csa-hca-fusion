@@ -1174,6 +1174,19 @@ def ablation_design_audit(variants, rows=None, requested=None,
     return audit
 
 
+def _paired_family_size(variants, n_kv_list) -> int:
+    """Accuracy contrasts vs baseline: one per non-baseline variant per n_kv.
+
+    Returns 0 when the baseline variant is absent (no paired test is
+    defined). This is the family size the Bonferroni correction and the
+    prospective design audit must both use, so a multi-n_kv sweep cannot be
+    audited as if it ran a single cell.
+    """
+    if not any(v['name'] == 'baseline' for v in variants):
+        return 0
+    return max(1, (len(variants) - 1) * len(n_kv_list))
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -1251,8 +1264,7 @@ def main():
     # one one-sided recall-vs-chance test per variant (baseline included).
     # All use alpha_corrected below, so all must be counted; each test is
     # repeated for every n_kv group.
-    n_paired_tests = ((len(variants) - 1) * len(n_kv_list)
-                      if has_baseline else 0)
+    n_paired_tests = _paired_family_size(variants, n_kv_list)
     n_pr_auc_tests = n_paired_tests
     n_tests = (n_paired_tests + n_pr_auc_tests
                + len(variants) * len(n_kv_list))
@@ -1575,12 +1587,14 @@ def main():
     # seed budget and compared-variant family are checked against the
     # declared SESOI. This is separate from ``ablation_design`` (which
     # checks that the leave-one-factor-out cells exist): a complete design
-    # can still be too underpowered for the claim it invites.
+    # can still be too underpowered for the claim it invites. The paired
+    # family is one accuracy contrast per non-baseline variant in EVERY
+    # n_kv cell, mirroring ``n_paired_tests`` above.
     mechanism_experiment_design = audit_experiment_design(
         'exp8_mechanism',
         seeds=[42 + i for i in range(n_seeds)],
         levels={'variant': [v['name'] for v in variants]},
-        family_size=max(1, len(variants) - 1),
+        family_size=max(1, _paired_family_size(variants, n_kv_list)),
     )
     logger.info(f'Prospective design audit: '
                 f'{mechanism_experiment_design["status"]} '
