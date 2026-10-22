@@ -327,9 +327,13 @@ def ttft_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
     activation_bytes = (2.0 * float(batch) * float(T) * float(cfg.d_model)
                         * float(activation_itemsize))
     state = prefill_state_elements(cfg, T, mode=state_mode)
+    state_elements_by_op = {
+        op: float(batch) * elements
+        for op, elements in state['by_op'].items()
+    }
     state_bytes_by_op = {
         op: elements * state_bpe[op]
-        for op, elements in state['by_op'].items()
+        for op, elements in state_elements_by_op.items()
     }
     state_bytes = sum(state_bytes_by_op.values())
     prefill_bytes = weight_bytes + activation_bytes + state_bytes
@@ -392,7 +396,7 @@ def ttft_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
             'lower_bound_ms': prefill_ms,
             'bound': prefill_bound,
             'state_mode': state_mode,
-            'state_elements_by_op': state['by_op'],
+            'state_elements_by_op': state_elements_by_op,
             'state_bytes_by_op': state_bytes_by_op,
             'bytes': {
                 'weights': weight_bytes,

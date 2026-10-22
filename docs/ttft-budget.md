@@ -17,7 +17,7 @@ TTFT >= prefill_lower_bound + first_decode_lower_bound
 flops  = batch * prefill_flops(hybrid_<route>, T, config geometry)
 bytes  = weight_bytes
        + 2 * batch * T * d_model * activation_itemsize   # input + output
-       + state_bytes                                      # retained cache
+       + batch * state_bytes                              # retained cache
 time   = max(flops / effective_peak_flops, bytes / bw)
 ```
 
@@ -100,6 +100,7 @@ outputs.
 * `max(compute, memory)` assumes perfect intra-phase overlap and no
   cross-phase overlap; the sum of two lower bounds is a lower bound.
 * Prefill state bytes are the retained cache footprint (one write of every
-  retained slot), not the reference Python path's temporary traffic.
+  retained slot per sequence), not the reference Python path's temporary
+  traffic.
 * A weight stream is charged in both phases; a kernel that keeps weights
   resident across requests can do better on the weight term.

@@ -164,6 +164,20 @@ def test_batch_moves_the_compute_memory_boundary():
 # first-decode marginal budget
 # ---------------------------------------------------------------------------
 
+def test_batch_scales_prefill_state_writes():
+    cfg = small_cfg()
+    one = ttft_ledger(cfg, 64, batch=1, peak_tflops=PEAK, bw_gbps=BW)
+    eight = ttft_ledger(cfg, 64, batch=8, peak_tflops=PEAK, bw_gbps=BW)
+    assert (eight['prefill']['bytes']['state']
+            == pytest.approx(8.0 * one['prefill']['bytes']['state']))
+    for op, elements in one['prefill']['state_elements_by_op'].items():
+        assert (eight['prefill']['state_elements_by_op'][op]
+                == pytest.approx(8.0 * elements))
+    assert eight['prefill']['bytes']['total'] == pytest.approx(
+        eight['weights']['bytes'] + eight['prefill']['bytes']['activations']
+        + eight['prefill']['bytes']['state'])
+
+
 def test_first_decode_reads_are_marginal_not_average():
     cfg = small_cfg()
     row = first_decode_elements(cfg, 4096)
