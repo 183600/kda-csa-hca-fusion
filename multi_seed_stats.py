@@ -245,6 +245,53 @@ def _as_clean_diffs(diffs) -> list[float]:
     return out
 
 
+def _safe_mean(values) -> float | None:
+    """Mean of finite values without overflowing the intermediate sum.
+
+    ``sum([1e308, 1e308]) / 2`` is ``inf / 2`` even though both inputs and
+    the true mean are finite. The ordinary path keeps the exact previous
+    arithmetic for every in-range sample; only an overflow falls back to a
+    scaled sum, which is value-equal up to ordinary floating-point
+    round-off. A result that is still non-finite is a programming error in
+    this module's "JSON-safe" contract and is rejected loudly rather than
+    inserted into a report.
+    """
+    n = len(values)
+    if n == 0:
+        return None
+    total = sum(values)
+    if math.isfinite(total):
+        return total / n
+    scale = max(abs(x) for x in values)
+    if scale == 0.0:
+        return 0.0
+    mean = scale * (math.fsum(x / scale for x in values) / n)
+    if not math.isfinite(mean):
+        raise ValueError(
+            f'mean is not finite after scaled summation (scale={scale!r}); '
+            'the inputs exceed the representable range of their mean')
+    return mean
+
+
+def _safe_median(values):
+    """Median whose even-sample midpoint cannot overflow to ``inf``.
+
+    ``(a + b) / 2`` overflows for two finite large samples; ``a/2 + b/2``
+    is the same midpoint without that overflow.
+    """
+    n = len(values)
+    if n == 0:
+        return None
+    ordered = sorted(values)
+    if n % 2:
+        return ordered[n // 2]
+    mid = ordered[n // 2 - 1] / 2.0 + ordered[n // 2] / 2.0
+    if not math.isfinite(mid):
+        raise ValueError(
+            'median is not finite after overflow-safe midpoint')
+    return mid
+
+
 # Numerical-zero rule: a difference vector whose entries are all the same
 # float has exactly zero sample variance. For last-ulp differences, the
 # variance residue is at the scale of the values' floating-point resolution,
@@ -306,7 +353,7 @@ def paired_t_test(diffs, alternative: str = 'two-sided') -> dict:
                 't_stat': None, 'dof': None, 'p_value': None,
                 'all_positive': False, 'all_negative': False,
                 'alternative': alternative}
-    mean = sum(d) / n
+    mean = _safe_mean(d)
     if n < 2:
         return {'n_pairs': n, 'mean_diff': mean, 'sd_diff': None,
                 't_stat': None, 'dof': None, 'p_value': None,
@@ -398,29 +445,35 @@ def permutation_test(diffs, alternative: str = 'two-sided',
     if n == 0:
         return {'n_pairs': 0, 'method': 'exact', 'n_permutations': 1,
                 'p_value': None, 'alternative': alternative}
-    observed = sum(d) / n
+    observed = _safe_mean(d)
     # The sign-flip test is scale-invariant, so the tie tolerance must be
-    # relative to the observed/data scale. A fixed 1e-12 absolute epsilon
-    # makes every sign assignment a hit when the differences are smaller
-    # than that (e.g. unanimous 1e-13 effects returned p=1 instead of
-    # 2**(1-n)); it also loses exact ties at very large scales.
-    eps = 1e-12 * max(abs(observed), max(abs(x) for x in d), 1.0e-300)
+    # relative to the two statistics being compared, never to the largest
+    # raw difference. The old data-scale epsilon (1e-12 * max|d|) exceeded
+    # the observed mean for an outlier pair that nearly cancelled
+    # (d=[1e12, -1e12+1, 2]) and made every sign assignment count as a
+    # tie (p=1 instead of the exact 0.75). ``math.isclose`` only bridges
+    # last-ulp differences between two near-equal statistics, so exact
+    # ties still count at any unit scale and no below-observed statistic
+    # is admitted by a data-driven epsilon.
+    def _same_stat(a: float, b: float) -> bool:
+        return a == b or math.isclose(
+            a, b, rel_tol=1e-12, abs_tol=0.0)
 
     def _tail_hit(stat: float) -> bool:
         if alternative == 'two-sided':
-            return abs(stat) >= abs(observed) - eps
+            a, b = abs(stat), abs(observed)
+            return a >= b or _same_stat(a, b)
         if alternative == 'greater':
-            return stat >= observed - eps
-        return stat <= observed + eps
+            return stat >= observed or _same_stat(stat, observed)
+        return stat <= observed or _same_stat(stat, observed)
 
     if n <= max_exact:
         n_perm = 2 ** n
         hits = 0
         for mask in range(n_perm):
-            stat = 0.0
-            for i in range(n):
-                stat += d[i] if (mask >> i) & 1 else -d[i]
-            if _tail_hit(stat / n):
+            signed = [d[i] if (mask >> i) & 1 else -d[i]
+                      for i in range(n)]
+            if _tail_hit(_safe_mean(signed)):
                 hits += 1
         return {'n_pairs': n, 'method': 'exact', 'n_permutations': n_perm,
                 'p_value': min(1.0, hits / float(n_perm)),
@@ -428,10 +481,8 @@ def permutation_test(diffs, alternative: str = 'two-sided',
     rng = random.Random(seed)
     hits = 0
     for _ in range(n_permutations):
-        stat = 0.0
-        for x in d:
-            stat += x if rng.random() < 0.5 else -x
-        if _tail_hit(stat / n):
+        signed = [x if rng.random() < 0.5 else -x for x in d]
+        if _tail_hit(_safe_mean(signed)):
             hits += 1
     p = min(1.0, (hits + 1) / float(n_permutations + 1))
     return {'n_pairs': n, 'method': 'monte_carlo',
@@ -464,10 +515,8 @@ def bootstrap_paired_ci(diffs, alpha: float = 0.05, n_boot: int = 10000,
     rng = random.Random(seed)
     means = []
     for _ in range(n_boot):
-        s = 0.0
-        for _ in range(n):
-            s += d[rng.randrange(n)]
-        means.append(s / n)
+        sample = [d[rng.randrange(n)] for _ in range(n)]
+        means.append(_safe_mean(sample))
     means.sort()
     lo_idx = int(math.floor((alpha / 2.0) * n_boot))
     hi_idx = int(math.ceil((1.0 - alpha / 2.0) * n_boot)) - 1
@@ -489,7 +538,7 @@ def cohens_dz(diffs) -> float | None:
     d = _as_clean_diffs(diffs)
     if len(d) < 2:
         return None
-    mean = sum(d) / len(d)
+    mean = _safe_mean(d)
     sd = _sample_sd(d, mean)
     if sd is None or sd <= 0.0:
         return None
@@ -532,7 +581,7 @@ def tost_paired(diffs, margin: float, alpha: float = 0.05) -> dict:
     """
     d = _as_clean_diffs(diffs)
     n = len(d)
-    mean = (sum(d) / n) if n else None
+    mean = _safe_mean(d)
     sd = _sample_sd(d, mean) if n >= 2 else None
     return tost_from_summary(mean, sd, n, margin, alpha=alpha)
 
@@ -643,7 +692,7 @@ def equivalence_margin_supported(diffs, alpha: float = 0.05) -> float | None:
     n = len(d)
     if n < 2:
         return None
-    mean = sum(d) / n
+    mean = _safe_mean(d)
     sd = _sample_sd(d, mean)
     if sd is None or sd <= 0.0:
         return abs(mean)
@@ -1020,7 +1069,7 @@ def leave_one_out_sensitivity(
     drops = []
     for i in range(n):
         rest = d[:i] + d[i + 1:]
-        m = sum(rest) / len(rest)
+        m = _safe_mean(rest)
         s = _sample_sd(rest, m)
         rt = paired_t_test(rest)
         rs = sign_test(rest)
@@ -1179,12 +1228,8 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     """
     d = _as_clean_diffs(diffs)
     n = len(d)
-    mean = (sum(d) / n) if n else None
-    median = None
-    if n:
-        s = sorted(d)
-        median = (s[(n - 1) // 2] if n % 2 else
-                  0.5 * (s[n // 2 - 1] + s[n // 2]))
+    mean = _safe_mean(d)
+    median = _safe_median(d)
     sd = _sample_sd(d, mean) if n >= 2 else None
     t = paired_t_test(d, alternative='two-sided')
     t_dir = paired_t_test(

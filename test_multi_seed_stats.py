@@ -937,3 +937,44 @@ def test_holm_adjust_rejects_bool_p_values():
         M.holm_adjust([False, 0.5])
     with pytest.raises(ValueError):
         M.holm_adjust([True])
+
+
+def test_permutation_tie_epsilon_does_not_swallow_the_observed_effect():
+    """An outlier pair must not make every sign flip count as a tie.
+
+    The tie tolerance used to scale with ``max|d_i|``; for
+    ``[1e12, -1e12+1, 2]`` that epsilon exceeded the observed mean and
+    the exact two-sided p became 1.0 instead of 0.75.
+    """
+    d = [1e12, -1e12 + 1, 2.0]
+    exact = M.permutation_test(d)
+    assert exact['method'] == 'exact' and exact['n_permutations'] == 8
+    # Independent enumeration with the documented strict tail.
+    n = len(d)
+    observed = sum(d) / n
+    hits = 0
+    for mask in range(2 ** n):
+        stat = sum(d[i] if (mask >> i) & 1 else -d[i]
+                   for i in range(n)) / n
+        if abs(stat) >= abs(observed):
+            hits += 1
+    assert exact['p_value'] == pytest.approx(hits / 2 ** n)
+    assert exact['p_value'] == pytest.approx(0.75)
+    # The scale-invariance contract still holds at both extremes.
+    assert M.permutation_test([x * 1e-13 for x in (1.0, 2.0, 3.0)])[
+        'p_value'] == pytest.approx(0.25)
+    assert M.permutation_test([1e300, -1e300])['p_value'] == 1.0
+
+
+def test_finite_extreme_differences_keep_reports_json_safe():
+    """Finite inputs of 1e308 must not overflow mean/median to ``inf``."""
+    record = M.summarize_paired([1e308, 1e308], n_boot=20)
+    assert record['mean_diff'] == 1e308
+    assert record['median_diff'] == 1e308
+    assert math.isfinite(record['mean_diff'])
+    json.dumps(record, allow_nan=False)  # must not raise
+    t = M.paired_t_test([1e308, 1e308])
+    assert t['mean_diff'] == 1e308 and math.isfinite(t['mean_diff'])
+    # A normal-range sample keeps the exact legacy arithmetic.
+    assert M.summarize_paired([1.0, 2.0, 3.0, 4.0],
+                              n_boot=10)['median_diff'] == 2.5
