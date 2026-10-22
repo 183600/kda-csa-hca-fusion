@@ -393,6 +393,23 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
     library-internal intermediates and are NOT counted (same policy as the
     softmax operator's score matrix).
     """
+    for name, val, minimum in (('T', T, 0), ('heads', heads, 1),
+                               ('head_dim', head_dim, 1),
+                               ('ngroups', ngroups, 1),
+                               ('itemsize', itemsize, 1)):
+        if isinstance(val, bool) or not isinstance(val, int) or val < minimum:
+            raise ValueError(
+                f"core_bytes: {name}={val!r} must be an int >= {minimum}.")
+    for name, val in (('value_dim', value_dim), ('d_state', d_state)):
+        if val is not None and (isinstance(val, bool)
+                                or not isinstance(val, int) or val < 1):
+            raise ValueError(
+                f"core_bytes: {name}={val!r} must be a positive int or None.")
+    if chunked and (isinstance(chunk_size, bool)
+                    or not isinstance(chunk_size, int) or chunk_size < 1):
+        raise ValueError(
+            f"core_bytes: chunk_size={chunk_size!r} must be a positive int "
+            'when chunked=True.')
     V = value_dim if value_dim is not None else head_dim
     if op == 'softmax':
         # q + k read at head_dim, v read at value_dim, o written at

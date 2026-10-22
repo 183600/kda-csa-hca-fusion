@@ -180,6 +180,23 @@ def test_core_bytes_ssd_accounting():
     except ValueError:
         raised = True
     _ok('unknown op rejected', raised, '')
+    for op, kwargs in (
+            ('softmax', dict(heads=2, head_dim=8, value_dim=8)),
+            ('kda', dict(heads=2, head_dim=8))):
+        for bad_T in (-1, True, 1.5):
+            raised = False
+            try:
+                roofline.core_bytes(op, bad_T, **kwargs)
+            except ValueError:
+                raised = True
+            _ok(f'{op} rejects T={bad_T!r}', raised, '')
+    raised = False
+    try:
+        roofline.core_bytes('kda', 4, heads=2, head_dim=8,
+                            chunked=True, chunk_size=0)
+    except ValueError:
+        raised = True
+    _ok('chunk_size=0 rejected when chunked', raised, '')
 
 
 # --- run_roofline integration --------------------------------------------
