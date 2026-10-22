@@ -1487,8 +1487,23 @@ def _needle_validation_point(model: nn.Module, tokenizer: _NeedleCharTokenizer,
                 raise RuntimeError(
                     'needle validation answer positions differ within a batch')
             if hasattr(model, 'hybrid'):
-                model.hybrid.reset_state()
-                logits = model(full)
+                if quant_spec is None:
+                    model.hybrid.reset_state()
+                    logits = model(full)
+                else:
+                    # The hybrid tower's full-sequence forward has no
+                    # quantized state-write hook; use the cache-aware
+                    # decoder so the validation loss actually reflects the
+                    # PTQ state writes instead of silently ignoring them.
+                    decoder = _build_needle_decoder(
+                        model, device, model.embed.weight.dtype)
+                    decoder.reset()
+                    step_logits = []
+                    for t in range(full.shape[1]):
+                        h = decoder(model.embed(full[:, t:t + 1]))
+                        _quantize_hybrid_kda_state(decoder.model, quant_spec)
+                        step_logits.append(model.lm_head(model.norm_f(h)))
+                    logits = torch.cat(step_logits, dim=1)
             else:
                 model.reset_state() if hasattr(model, 'reset_state') else None
                 logits = model(full, spec=quant_spec, ste=ste)
@@ -1572,6 +1587,11 @@ def train_needle_model(
         if any(p - 1 != start for p in answer_positions):
             raise RuntimeError('needle answer positions differ within a batch')
         if hasattr(model, 'hybrid'):
+            if quant_spec is not None:
+                raise NotImplementedError(
+                    'hybrid QAT/PTQ training needs a state-write-aware '
+                    'autograd path; use NeedleStepwiseKDA for quantized '
+                    'training instead of silently ignoring quant_spec')
             model.hybrid.reset_state()
             logits = model(train_ids)
         else:

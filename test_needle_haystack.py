@@ -49,6 +49,7 @@ from run_needle_haystack import (  # noqa: E402
     _NeedleCharTokenizer,
     _build_needle_decoder,
     _needle_primary_precision_rank,
+    _needle_validation_point,
     _quantized_hybrid_prefill_last_logits,
     build_needle_haystack,
     build_needle_batch,
@@ -165,6 +166,21 @@ def test_needle_hybrid_lm_stepwise_quant():
             logits_t = model.forward_step(input_ids[:, t:t+1], quant_spec=spec)
     _ok('stepwise quant: no NaN', not torch.isnan(logits_t).any().item())
     _ok('stepwise quant: correct shape', tuple(logits_t.shape) == (2, tok.vocab_size))
+
+
+def test_hybrid_validation_respects_state_quantization():
+    """A PTQ spec must change the hybrid validation loss, not be ignored."""
+    tok = _NeedleCharTokenizer()
+    torch.manual_seed(3)
+    model = NeedleHybridLM(
+        tok.vocab_size, d_model=64, n_layers=1,
+        memory_type='kda', n_kda=1, n_csa=0, n_hca=0).eval()
+    spec = QuantSpec(bits=2, group_size=16)
+    args = dict(tokenizer=tok, context_len=64, needle_pos=8,
+                seeds=[7, 8], device='cpu')
+    plain = _needle_validation_point(model, quant_spec=None, **args)
+    quant = _needle_validation_point(model, quant_spec=spec, **args)
+    assert plain.loss != quant.loss, (plain, quant)
 
 
 def test_quantized_hybrid_prefill_keeps_csa_context():
