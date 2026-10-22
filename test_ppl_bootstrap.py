@@ -420,3 +420,15 @@ def test_finite_unit_sums_cannot_overflow_into_non_json_reports():
         assert rep['ci_delta_mean_nll'] == [None, None]
         assert rep['p_value'] is None
         json.dumps(rep, allow_nan=False)
+
+
+def test_throughput_rates_are_json_safe_for_extreme_finite_timings():
+    import json
+    tiny = P.throughput_summary(n_tokens=1, elapsed_s=5e-324)
+    assert tiny['tokens_per_second'] is None
+    json.dumps(tiny, allow_nan=False)
+
+    slow = P.throughput_summary(n_tokens=1, elapsed_s=1e308, n_sequences=1)
+    assert slow['tokens_per_second'] == 1e-308
+    assert slow['ms_per_sequence'] is None
+    json.dumps(slow, allow_nan=False)

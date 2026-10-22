@@ -144,6 +144,7 @@ from results_analysis import (binary_ranking_metrics,
 from results_schema import write as write_schema
 from experiment_design import (audit_run as audit_experiment_design,
                                common_analyzed_seeds)
+from multi_seed_stats import _safe_mean, _sample_sd
 from run_ablation import (
     _aggregate_curve_diagnosis,
     _attach_curve_diagnostics,
@@ -783,19 +784,45 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
 
 
 def _mean_ci(values, label=''):
-    """Return ``(mean, std, ci95)`` for a list of floats (empty -> Nones)."""
+    """Return ``(mean, std, ci95)`` for a list of floats (empty -> Nones).
+
+    The historical arithmetic is used for ordinary samples. Finite values
+    near the float limit can overflow the sum / squared deviations; the
+    overflow-safe estimators then keep the record JSON-safe and return
+    ``None`` for a statistic the float range cannot represent.
+    """
     n = len(values)
     if n == 0:
         return None, None, None
-    mean = sum(values) / n
+    try:
+        mean = sum(values) / n
+        if n < 2:
+            # The sample std of one observation is undefined; 0.0 would claim
+            # perfect precision. The CI is likewise undefined.
+            if not math.isfinite(mean):
+                raise OverflowError
+            return mean, None, None
+        var = sum((v - mean) ** 2 for v in values) / (n - 1)
+        std = math.sqrt(var)
+        crit = _t_crit_975(n)
+        ci = crit * std / math.sqrt(n) if crit is not None else None
+        if math.isfinite(mean) and math.isfinite(std) and (
+                ci is None or math.isfinite(ci)):
+            return mean, std, ci
+    except (OverflowError, ValueError, ZeroDivisionError):
+        pass
+    mean = _safe_mean(values)
+    if mean is None or not math.isfinite(mean):
+        return None, None, None
     if n < 2:
-        # The sample std of one observation is undefined; 0.0 would claim
-        # perfect precision. The CI is likewise undefined.
         return mean, None, None
-    var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    std = math.sqrt(var)
+    std = _sample_sd(values, mean)
+    if std is None or not math.isfinite(std):
+        return mean, None, None
     crit = _t_crit_975(n)
     ci = crit * std / math.sqrt(n) if crit is not None else None
+    if ci is not None and not math.isfinite(ci):
+        ci = None
     return mean, std, ci
 
 
@@ -810,14 +837,40 @@ def paired_stats(diffs):
     n = len(diffs)
     if n == 0:
         return {'n_pairs': 0, 'mean': None, 'ci95': None, 't_stat': None}
-    mean = sum(diffs) / n
+    try:
+        mean = sum(diffs) / n
+        if n < 2:
+            if not math.isfinite(mean):
+                raise OverflowError
+            return {'n_pairs': n, 'mean': mean, 'ci95': None,
+                    't_stat': None}
+        var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+        std = math.sqrt(var)
+        crit = _t_crit_975(n)
+        ci = crit * std / math.sqrt(n) if crit is not None else None
+        t_stat = mean / (std / math.sqrt(n)) if std > 0 else None
+        if (math.isfinite(mean) and math.isfinite(std)
+                and (ci is None or math.isfinite(ci))
+                and (t_stat is None or math.isfinite(t_stat))):
+            return {'n_pairs': n, 'mean': mean, 'ci95': ci,
+                    't_stat': t_stat}
+    except (OverflowError, ValueError, ZeroDivisionError):
+        pass
+    mean = _safe_mean(diffs)
+    if mean is None or not math.isfinite(mean):
+        return {'n_pairs': n, 'mean': None, 'ci95': None, 't_stat': None}
     if n < 2:
         return {'n_pairs': n, 'mean': mean, 'ci95': None, 't_stat': None}
-    var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
-    std = math.sqrt(var)
+    std = _sample_sd(diffs, mean)
+    if std is None or not math.isfinite(std):
+        return {'n_pairs': n, 'mean': mean, 'ci95': None, 't_stat': None}
     crit = _t_crit_975(n)
     ci = crit * std / math.sqrt(n) if crit is not None else None
+    if ci is not None and not math.isfinite(ci):
+        ci = None
     t_stat = mean / (std / math.sqrt(n)) if std > 0 else None
+    if t_stat is not None and not math.isfinite(t_stat):
+        t_stat = None
     return {'n_pairs': n, 'mean': mean, 'ci95': ci, 't_stat': t_stat}
 
 

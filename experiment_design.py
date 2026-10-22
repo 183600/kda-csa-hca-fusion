@@ -458,8 +458,12 @@ PLAN_IDS = tuple(PLANS)
 # ---------------------------------------------------------------------------
 
 def _is_number(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
 
 
 def _is_int(value) -> bool:
@@ -516,7 +520,10 @@ def _rows_from_payload(payload):
 def _clean_float(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
     return value if math.isfinite(value) else None
 
 
@@ -900,6 +907,8 @@ def equivalence_plan(*, margin, sd, seeds, alpha=DEFAULT_ALPHA,
         z_crit = _NORMAL.inv_cdf(1.0 - alpha_value / family_size)
         z_power = _NORMAL.inv_cdf(0.5 * (1.0 + target))
         minimum_margin = (z_crit + z_power) * sd_value / math.sqrt(seeds)
+        if not math.isfinite(minimum_margin):
+            minimum_margin = None
     shortfall = (max(0, int(required) - int(seeds))
                  if required is not None else None)
     return {

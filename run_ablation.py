@@ -2971,7 +2971,7 @@ def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
             f'overfitting, so the held-out curve is too short/flat to label '
             f'this row at the current step budget — raise the step count (or '
             f'the validation frequency) before quoting the verdict.'),
-        'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        'mean_generalization_gap': _safe_mean(gaps) if gaps else None,
         'best_val_step_any_seed': best_step,
         'n_seeds_at_ceiling': saturated,
         'n_seeds_with_gradient_warnings': len(grad_warned),
@@ -3048,7 +3048,7 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         'rows_with_curve': len(counted),
         'rows_without_curve': len(rows) - len(counted),
         'verdict_counts': counts,
-        'mean_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        'mean_generalization_gap': _safe_mean(gaps) if gaps else None,
         'max_generalization_gap': max(gaps) if gaps else None,
         'saturated_at_ceiling': saturated,
         'rows_partially_saturated': partially_saturated,

@@ -848,3 +848,12 @@ def test_pilot_extraction_skips_unhashable_cells_groups_and_seeds():
     assert D.pilot_sd_from_rows(
         malformed, group_key='op', reference='softmax',
         cell_keys=['n_kv']) is None
+
+
+def test_planning_mde_and_minimum_margin_are_json_safe_at_float_limit():
+    report = D.planning_report('exp4_mqar', seeds=2, sd=1e308)
+    assert report['planned_mde'] is None
+    assert report['equivalence']['minimum_supportable_margin_at_n'] is None
+    json.dumps(report, allow_nan=False)
+    assert D._is_number(10 ** 400) is False
+    assert D._clean_float(10 ** 400) is None

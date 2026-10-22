@@ -823,7 +823,10 @@ def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
     z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
         else _ND.inv_cdf(1.0 - alpha)
     z_power = _ND.inv_cdf(power)
-    return (z_crit + z_power) * sd / math.sqrt(n)
+    value = (z_crit + z_power) * sd / math.sqrt(n)
+    # A finite SD can still exceed the representable MDE range; the module
+    # convention for an unrepresentable statistic is ``None``, never inf.
+    return value if math.isfinite(value) else None
 
 
 def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
@@ -1131,6 +1134,13 @@ def leave_one_out_sensitivity(
                               n_permutations=n_permutations, seed=seed)
         direction = _direction_of(m)
         shift = m - mean
+        if not math.isfinite(shift):
+            shift = None
+        relative_shift = None
+        if shift is not None and mean != 0.0:
+            relative_shift = abs(shift) / abs(mean)
+            if not math.isfinite(relative_shift):
+                relative_shift = None
         t_sig = (rt['p_value'] < alpha) if rt['p_value'] is not None else None
         perm_sig = (bool(rp['p_value'] < alpha)
                     if rp['p_value'] is not None else None)
@@ -1143,8 +1153,7 @@ def leave_one_out_sensitivity(
             'sd_diff': s,
             'direction': direction,
             'mean_shift': shift,
-            'relative_mean_shift': (
-                abs(shift) / abs(mean) if mean != 0.0 else None),
+            'relative_mean_shift': relative_shift,
             'sign_flip': bool(base_direction != 'none'
                               and direction != base_direction),
             't_p_value': rt['p_value'],
@@ -1166,9 +1175,15 @@ def leave_one_out_sensitivity(
                 else bool(rtost['equivalent'] != base_tost['equivalent']))
         drops.append(entry)
 
-    abs_shifts = [abs(x['mean_shift']) for x in drops]
-    max_shift = max(abs_shifts)
-    most = abs_shifts.index(max_shift)
+    finite_shifts = [(abs(x['mean_shift']), i) for i, x in enumerate(drops)
+                     if x['mean_shift'] is not None]
+    if finite_shifts:
+        max_shift = max(shift for shift, _ in finite_shifts)
+        most = next(i for shift, i in finite_shifts if shift == max_shift)
+    else:
+        max_shift = most = None
+    finite_relative = [x['relative_mean_shift'] for x in drops
+                       if x['relative_mean_shift'] is not None]
     n_sign_flips = sum(1 for x in drops if x['sign_flip'])
     n_perm_flips = sum(1 for x in drops if x['primary_significance_flip'])
     t_flags = [x['t_significant'] for x in drops]
@@ -1214,11 +1229,10 @@ def leave_one_out_sensitivity(
         'min_mean_diff': min(x['mean_diff'] for x in drops),
         'max_mean_diff': max(x['mean_diff'] for x in drops),
         'max_abs_mean_shift': max_shift,
-        'max_relative_mean_shift': (
-            max(abs(x['mean_shift']) for x in drops) / abs(mean)
-            if mean != 0.0 else None),
+        'max_relative_mean_shift': (max(finite_relative)
+                                    if finite_relative else None),
         'most_influential_index': most,
-        'most_influential_value': d[most],
+        'most_influential_value': d[most] if most is not None else None,
         'sign_stable': sign_stable,
         'primary_significance_stable': perm_stable,
         't_significance_stable': t_stable,

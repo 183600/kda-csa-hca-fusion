@@ -1429,3 +1429,43 @@ def test_nonfinite_diagnosis_skips_non_tensor_parameter_maps():
                  if c['check'] == 'parameters'][0]
         assert check['status'] == 'skipped', check
         json.dumps(rep, allow_nan=False)
+
+
+def test_huge_json_integers_are_skipped_not_crashing_pareto():
+    rep = pareto_frontier([
+        {'op': 'huge', 'mean_acc': 10 ** 400,
+         'mean_train_time_s': 1.0, 'n_params': 10},
+        {'op': 'huge_cost', 'mean_acc': 0.5,
+         'mean_train_time_s': 1.0, 'n_params': 10 ** 400},
+        {'op': 'ok', 'mean_acc': 0.5,
+         'mean_train_time_s': 1.0, 'n_params': 10},
+    ])
+    assert rep['skipped'] == ['huge', 'huge_cost']
+    assert rep['frontier'] == ['ok']
+    json.dumps(rep, allow_nan=False)
+
+
+def test_training_curve_generalization_gaps_are_json_safe_at_float_limit():
+    rep = diagnose_training_curves([1e308] * 3, [-1e308] * 3)
+    assert rep['signals']['generalization_gap_head'] is None
+    assert rep['signals']['generalization_gap_tail'] is None
+    assert rep['signals']['gap_grew'] is False
+    json.dumps(rep, allow_nan=False)
+
+
+def test_curve_gap_summaries_use_overflow_safe_mean():
+    from run_ablation import (_aggregate_curve_diagnosis,
+                              _curve_diagnosis_summary)
+    seeds = [{'generalization_gap': 1e308},
+             {'generalization_gap': 1e308}]
+    agg = _aggregate_curve_diagnosis(seeds)
+    assert agg['mean_generalization_gap'] == 1e308
+    json.dumps(agg, allow_nan=False)
+
+    rows = [{'ratio': '3:1:1', 'curve_verdict': 'healthy',
+             'mean_generalization_gap': 1e308},
+            {'ratio': '2:2:1', 'curve_verdict': 'healthy',
+             'mean_generalization_gap': 1e308}]
+    summary = _curve_diagnosis_summary(rows, 'ratio')
+    assert summary['mean_generalization_gap'] == 1e308
+    json.dumps(summary, allow_nan=False)

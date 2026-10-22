@@ -302,9 +302,17 @@ def register_row_contract(kind: str):
 
 
 def _finite_number(value) -> bool:
-    """True for a real (non-bool) finite int/float."""
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    """True for a real (non-bool) finite int/float.
+
+    JSON has unbounded integers, so a valid document can carry an integer
+    too large for ``float()``; that is a malformed metric (not a crash).
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
 
 
 def _is_hashable(value) -> bool:

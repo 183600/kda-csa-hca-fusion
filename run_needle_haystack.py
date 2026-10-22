@@ -111,7 +111,8 @@ from kv_quant import (
     storage_bytes,
 )
 from ops_fused import HybridConfig, HybridKCHAttention, _memory_layer_lookback
-from multi_seed_stats import holm_adjust, summarize_paired
+from multi_seed_stats import (_safe_mean, _sample_sd, holm_adjust,
+                               summarize_paired)
 from run_decoding import HybridDecoding
 from results_schema import write as write_schema
 from train_diagnostics import (
@@ -2070,21 +2071,45 @@ def _run_needle_overfit_gate(*, tokenizer, device, memory_types,
 
 
 def _mean_ci95(values: list[float]) -> list[float] | None:
-    """Two-sided 95% t-interval of the mean (None for n < 2)."""
+    """Two-sided 95% t-interval of the mean (None for n < 2).
+
+    The historical expression is kept for ordinary samples. Finite values
+    near the float limit can overflow the sum / squared deviations (or the
+    endpoint arithmetic); then the overflow-safe estimators are used and
+    an unrepresentable interval is reported as ``None``, never NaN/inf.
+    """
     n = len(values)
     if n < 2:
         return None
-    mean = sum(values) / n
-    var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    sd = math.sqrt(var)
+    try:
+        mean = sum(values) / n
+        var = sum((v - mean) ** 2 for v in values) / (n - 1)
+        sd = math.sqrt(var)
+        if not (math.isfinite(mean) and math.isfinite(sd)):
+            raise OverflowError
+    except (OverflowError, ValueError, ZeroDivisionError):
+        try:
+            mean = _safe_mean(values)
+            sd = _sample_sd(values, mean)
+        except (OverflowError, ValueError):
+            return None
+        if (mean is None or sd is None
+                or not (math.isfinite(mean) and math.isfinite(sd))):
+            return None
     if sd == 0.0:
         return [mean, mean]
     from run_quality import _t_crit_975
     crit = _t_crit_975(n)
     if crit is None:
         return None
-    half = crit * sd / math.sqrt(n)
-    return [mean - half, mean + half]
+    try:
+        half = crit * sd / math.sqrt(n)
+        lower, upper = mean - half, mean + half
+    except OverflowError:
+        return None
+    if not all(math.isfinite(x) for x in (half, lower, upper)):
+        return None
+    return [lower, upper]
 
 
 def _measure_needle_state(model: NeedleHybridLM,

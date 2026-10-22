@@ -637,3 +637,14 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def test_mechanism_aggregators_are_json_safe_at_float_limit():
+    import json
+    mean, std, ci = M._mean_ci([1e308, 1e308, 1e308])
+    assert mean == 1e308 and std == 0.0 and ci == 0.0
+    assert M.paired_stats([1e308, 1e308])['mean'] == 1e308
+    stats = M.paired_stats([1e308, -1e308])
+    assert stats['mean'] == 0.0
+    assert stats['t_stat'] == 0.0
+    json.dumps(stats, allow_nan=False)

@@ -502,16 +502,33 @@ def throughput_summary(*, n_tokens: int, elapsed_s: float,
                 f'n_sequences must be an int, got {n_sequences!r}')
         if n_sequences < 0:
             raise ValueError(f'n_sequences must be >= 0, got {n_sequences}')
+    def _finite(value):
+        return value if value is not None and math.isfinite(value) else None
+
+    try:
+        tokens_per_second = _finite(n_tokens / elapsed)
+    except OverflowError:
+        tokens_per_second = None
+    sequences_per_second = None
+    if n_sequences is not None:
+        try:
+            sequences_per_second = _finite(n_sequences / elapsed)
+        except OverflowError:
+            sequences_per_second = None
+    ms_per_sequence = None
+    if n_sequences:
+        try:
+            ms_per_sequence = _finite(1000.0 * elapsed / n_sequences)
+        except OverflowError:
+            ms_per_sequence = None
     return {
         'phase': phase,
         'n_tokens': n_tokens,
         'n_sequences': n_sequences,
         'elapsed_s': elapsed,
-        'tokens_per_second': n_tokens / elapsed,
-        'sequences_per_second': (
-            (n_sequences / elapsed) if n_sequences is not None else None),
-        'ms_per_sequence': (
-            (1000.0 * elapsed / n_sequences) if n_sequences else None),
+        'tokens_per_second': tokens_per_second,
+        'sequences_per_second': sequences_per_second,
+        'ms_per_sequence': ms_per_sequence,
         'note': ('end-to-end evaluation-loop timing (data loading + '
                  'full-sequence forward); compare only same-machine runs, '
                  'and do not read it as a kernel benchmark'),

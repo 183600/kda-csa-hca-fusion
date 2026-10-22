@@ -82,7 +82,8 @@ from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
-from multi_seed_stats import _sample_sd, holm_adjust, summarize_paired
+from multi_seed_stats import (_safe_mean, _sample_sd, holm_adjust,
+                               summarize_paired)
 from experiment_design import (audit_run as audit_experiment_design,
                                common_analyzed_seeds)
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
@@ -3371,7 +3372,10 @@ def _paired_one_sided_t(diffs):
     if n == 0:
         return {'n_pairs': 0, 'mean_diff': None, 't_stat': None,
                 'all_positive': False}
-    mean_diff = sum(diffs) / n
+    mean_diff = _safe_mean(diffs) if n else None
+    if mean_diff is None or not math.isfinite(mean_diff):
+        return {'n_pairs': n, 'mean_diff': None, 't_stat': None,
+                'all_positive': all(d > 0 for d in diffs)}
     if n < 2:
         return {'n_pairs': n, 'mean_diff': mean_diff, 't_stat': None,
                 'all_positive': all(d > 0 for d in diffs)}
@@ -3379,8 +3383,11 @@ def _paired_one_sided_t(diffs):
     if sd is None or sd <= 0.0:
         return {'n_pairs': n, 'mean_diff': mean_diff, 't_stat': None,
                 'all_positive': all(d > 0 for d in diffs)}
+    t_stat = mean_diff / (sd / math.sqrt(n))
+    if not math.isfinite(t_stat):
+        t_stat = None
     return {'n_pairs': n, 'mean_diff': mean_diff,
-            't_stat': mean_diff / (sd / math.sqrt(n)),
+            't_stat': t_stat,
             'all_positive': all(d > 0 for d in diffs)}
 
 

@@ -784,3 +784,12 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+
+def test_needle_mean_ci_is_json_safe_for_finite_extremes():
+    from run_needle_haystack import _mean_ci95
+    import json
+    assert _mean_ci95([1e308, 1e308, 1e308]) == [1e308, 1e308]
+    assert _mean_ci95([1e308, -1e308]) is None
+    ci = _mean_ci95([1, 2, 3, 4])
+    assert ci is not None
+    json.dumps(ci, allow_nan=False)

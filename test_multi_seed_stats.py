@@ -997,3 +997,15 @@ def test_finite_extreme_differences_keep_reports_json_safe():
     # A normal-range sample keeps the exact legacy arithmetic.
     assert M.summarize_paired([1.0, 2.0, 3.0, 4.0],
                               n_boot=10)['median_diff'] == 2.5
+
+
+def test_leave_one_out_relative_shift_overflow_is_json_safe():
+    report = M.leave_one_out_sensitivity([1e308, -1e308, 1e-300])
+    assert report['drops'][0]['relative_mean_shift'] is None
+    assert report['drops'][1]['relative_mean_shift'] is None
+    assert report['max_relative_mean_shift'] == 1.0
+    json.dumps(report, allow_nan=False)
+
+
+def test_min_detectable_effect_returns_none_when_unrepresentable():
+    assert M.min_detectable_effect(5, 1e308) is None

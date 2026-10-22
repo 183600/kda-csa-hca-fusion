@@ -1112,3 +1112,16 @@ def test_softmax_gqa_prefill_uses_the_requested_head_width():
         proj = 2 * T * d * (n_q * K + H * K + H * V)
         out_proj = 2 * T * n_q * V * d
         assert got == core + proj + out_proj, (K, got, core + proj + out_proj)
+
+
+def test_schema_finite_numbers_reject_huge_json_integers():
+    huge = 10 ** 400
+    assert rs._finite_number(huge) is False
+    # A row with an out-of-float-range integer must produce a contract
+    # violation, not abort the whole validation pass.
+    row = {'group': 'g', 'memory': 'kda', 'n_kv': 1, 'mean_acc': huge,
+           'n_seeds_ok': 1, 'layout': 'KDA-KDA-KDA-CSA-HCA',
+           'n_params': 10, 'n_layers': 5, 'per_seed': []}
+    violations = rs.validate_rows('exp5b_ablation_matrix', [row])
+    assert violations
+    assert 'mean_acc' in violations[0]

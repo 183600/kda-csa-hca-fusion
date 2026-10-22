@@ -320,6 +320,11 @@ def diagnose_training_curves(train_losses: Sequence[float],
                         and val_tail < val_head * (1.0 - relative_improvement))
         head_gap = val_head - train_head
         tail_gap = val_tail - train_tail
+        # The difference of two finite means can overflow; a gap that the
+        # float range cannot represent is reported as unavailable, never
+        # as +-inf in the JSON record.
+        head_gap = head_gap if math.isfinite(head_gap) else None
+        tail_gap = tail_gap if math.isfinite(tail_gap) else None
         val_still_improving = _still_improving_at_end(va)
         signals.update({
             'val_improved': bool(val_improved),
@@ -331,10 +336,11 @@ def diagnose_training_curves(train_losses: Sequence[float],
             'val_tail_slope_relative_per_point': va[
                 'tail_slope_relative_per_point'],
             'val_still_improving_at_end': bool(val_still_improving),
-            'generalization_gap_head': float(head_gap),
-            'generalization_gap_tail': float(tail_gap),
+            'generalization_gap_head': head_gap,
+            'generalization_gap_tail': tail_gap,
         })
-        gap_grew = (tail_gap > max(0.0, head_gap) * 2.0 + 0.1
+        gap_grew = (head_gap is not None and tail_gap is not None
+                    and tail_gap > max(0.0, head_gap) * 2.0 + 0.1
                     and val_tail > val_head * 0.999)
         signals['gap_grew'] = bool(gap_grew)
         if train_improved and (val_rose_from_best or gap_grew):
@@ -692,7 +698,7 @@ def _finite_float_or_none(value):
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
