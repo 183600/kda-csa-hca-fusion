@@ -588,3 +588,20 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def test_storage_bytes_charges_one_metadata_block_per_whole_or_partial_group():
+    """Integer layouts pay ceil(n/group_size) scales, not a linear average."""
+    spec = QuantSpec(2, 64, scale_bits=16)
+    # 1 element: 2 payload bits + one 16-bit scale = 18 bits = 2.25 B
+    assert abs(storage_bytes(1, spec) - 2.25) < 1e-12
+    assert abs(storage_bytes(63, spec) - (63 * 2 + 16) / 8.0) < 1e-12
+    assert abs(storage_bytes(64, spec) - 18.0) < 1e-12
+    assert abs(storage_bytes(65, spec) - (65 * 2 + 2 * 16) / 8.0) < 1e-12
+    assert abs(storage_bytes(256, spec) - 72.0) < 1e-12
+    fp8 = FP8Spec()
+    assert abs(storage_bytes(1, fp8) - 2.0) < 1e-12
+    assert abs(storage_bytes(256, fp8) - 264.0) < 1e-12
+    # Fractional counts keep the effective-rate convention.
+    assert abs(storage_bytes(1.5, spec)
+               - 1.5 * bytes_per_element(spec)) < 1e-12

@@ -224,7 +224,18 @@ def bytes_per_element(spec: StorageSpec) -> float:
 
 
 def storage_bytes(n_elements, spec: StorageSpec) -> float:
-    """Bytes required to store ``n_elements`` under ``spec`` (fractional ok)."""
+    """Bytes required to store ``n_elements`` under ``spec`` (fractional ok).
+
+    Integer element counts are priced as a real layout: the payload bits
+    plus ONE scale (and optional zero point) per *whole or partial* group,
+    because the quantizer pads the last axis up to a full group. The
+    asymptotic per-element rate in :func:`bits_per_element` amortizes that
+    metadata as ``metadata_bits / group_size`` and therefore under-charges
+    a non-divisible cache (e.g. one 2-bit element with a 64-element group
+    and a 16-bit scale is 2.25 B, not 0.28125 B). A fractional
+    ``n_elements`` keeps the effective-rate convention because a partial
+    element has no well-defined group count.
+    """
     if (not isinstance(n_elements, (int, float))
             or isinstance(n_elements, bool)
             or not math.isfinite(n_elements)):
@@ -234,6 +245,15 @@ def storage_bytes(n_elements, spec: StorageSpec) -> float:
     if n_elements < 0:
         raise ValueError(
             f'storage_bytes: n_elements must be >= 0, got {n_elements!r}')
+    if float(n_elements).is_integer():
+        n = int(n_elements)
+        payload_bits = (FP8_BITS if isinstance(spec, FP8Spec) else spec.bits)
+        scale_bits = (spec.scale_bits
+                      + (0 if isinstance(spec, FP8Spec)
+                         else (spec.zero_bits or 0)))
+        n_groups = (n + spec.group_size - 1) // spec.group_size
+        return (n * float(payload_bits)
+                + n_groups * float(scale_bits)) / 8.0
     return float(n_elements) * bytes_per_element(spec)
 
 
