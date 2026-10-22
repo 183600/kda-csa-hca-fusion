@@ -538,6 +538,33 @@ def test_contrast_annotation_reports_effect_size_and_power_plan():
     assert small_summary['n_significant_but_below_min_effect'] == 1
 
 
+def test_tune_baseline_lr_ignores_malformed_validation_points(monkeypatch):
+    """A JSON-null/nonfinite validation accuracy must not crash the tuner."""
+    import run_quality as rq
+    calls = []
+
+    def fake_train(op_name, **kwargs):
+        calls.append(kwargs['lr'])
+        return {'per_seed': [
+            {'val_history': [{'acc': 0.2}, {'acc': 0.3},
+                             {'acc': None, 'loss': 1.0}]},
+            {'val_history': [{'acc': 0.4}, {'acc': float('nan')},
+                             {'acc': 0.6}]},
+            'not-a-dict',
+        ]}
+
+    monkeypatch.setattr(rq, 'train_multi_seed', fake_train)
+    best, record = rq.tune_baseline_lr(
+        'softmax', [1e-3, 3e-3], [('mqar', 1, 8, 4)],
+        steps=2, softmax_steps=2, n_seeds=2, device='cpu',
+        val_every=1, val_batches=1, val_batch=1)
+    assert best == 1e-3
+    cell = record['lr_grid']['0.001']
+    # Last finite tail values: [0.2,0.3] -> 0.25 and [0.4,0.6] -> 0.5.
+    assert cell['mean_val_tail_acc'] == pytest.approx(0.375)
+    assert cell['mean_final_val_acc'] == pytest.approx(0.6)
+
+
 def test_directional_contrast_contradicted_and_one_sided_exact_p():
     """A unanimous negative sweep falsifies a directional prediction.
 

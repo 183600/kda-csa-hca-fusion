@@ -3263,20 +3263,33 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
                     f'FAILED: {e}')
                 continue
             for seed_row in r.get('per_seed', []):
-                vh = seed_row.get('val_history') or []
-                if not vh:
+                if not isinstance(seed_row, dict):
                     continue
-                final_scores.append(float(vh[-1]['acc']))
+                vh = seed_row.get('val_history')
+                if not isinstance(vh, (list, tuple)) or not vh:
+                    continue
+                last = vh[-1]
+                if isinstance(last, dict):
+                    acc = last.get('acc')
+                    if (not isinstance(acc, bool)
+                            and isinstance(acc, (int, float))
+                            and math.isfinite(float(acc))):
+                        final_scores.append(float(acc))
                 k = min(_TUNE_TAIL_K, len(vh))
                 tail_ks.append(k)
-                tail_vals = [float(p['acc']) for p in vh[-k:]
-                             if p.get('acc') is not None]
+                tail_vals = []
+                for point in vh[-k:]:
+                    if not isinstance(point, dict):
+                        continue
+                    acc = point.get('acc')
+                    if (not isinstance(acc, bool)
+                            and isinstance(acc, (int, float))
+                            and math.isfinite(float(acc))):
+                        tail_vals.append(float(acc))
                 if tail_vals:
-                    tail_scores.append(sum(tail_vals) / len(tail_vals))
-        mean_score = ((sum(tail_scores) / len(tail_scores))
-                      if tail_scores else None)
-        mean_final = ((sum(final_scores) / len(final_scores))
-                      if final_scores else None)
+                    tail_scores.append(_safe_mean(tail_vals))
+        mean_score = _safe_mean(tail_scores) if tail_scores else None
+        mean_final = _safe_mean(final_scores) if final_scores else None
         per_lr[f'{lr:g}'] = {
             'mean_val_tail_acc': mean_score,
             'mean_final_val_acc': mean_final,
@@ -4757,7 +4770,12 @@ def main():
         }
         comparisons = []
         for r in all_results:
-            if 'error' in r or r.get('op') == baseline_ref:
+            # Every baseline rung (not only the reference one) is a
+            # comparison reference, never a complex candidate: including
+            # e.g. ``linear`` in the vs-softmax family would both give it
+            # a misleading ``beats_tuned_baseline=False`` and inflate the
+            # Bonferroni family.
+            if 'error' in r or r.get('op') in baseline_ops:
                 continue
             ref = ref_by_cell.get((r.get('task', 'mqar'), r['n_kv']))
             if ref is None:
