@@ -165,3 +165,122 @@ number.
 * The audit does not repair a split and does not impute missing data. It
   only makes the leakage visible; the remedy is to drop near duplicates
   before splitting, or to keep them and report the contamination.
+
+## Held-out vocabulary / domain shift (token unigrams)
+
+Near-duplicate leakage is an *overlap* failure. The complementary
+*exchangeability* failure is a held-out split whose token distribution is
+not representative of train: a different topic, source, language variety or
+annotation template. Then held-out perplexity partly measures domain
+mismatch, and a comparison between two models can flip because one happened
+to fit the shifted vocabulary better. Length statistics cannot see this —
+two splits can have identical length histograms and disjoint vocabularies.
+
+`train_lm_autodl.token_distribution_audit` compares the token-unigram
+distributions of the train probe and a held-out probe. It is fitted on
+**train only**, is deterministic and RNG-neutral, and computes no model
+metric, so it can run before the sealed test split is opened. In the LM
+entry point the `test_vs_train` block is filled only after that split's
+single final evaluation; `run_quant_lm.build_corpus` records both val and
+test alongside its existing offline length diagnostics.
+
+### Metrics
+
+On the same bounded, evenly spaced document probe used by the length
+diagnostics:
+
+| Field | Meaning |
+|---|---|
+| `unseen_token_mass` | fraction of held-out tokens whose id never occurs in the train probe |
+| `unseen_type_fraction` | fraction of held-out token types absent from train |
+| `js_divergence_bits` | Jensen-Shannon divergence (base 2) between the unigram distributions over the union of observed ids |
+| `total_variation` | half the L1 distance between the same two distributions |
+| `unseen_examples` | up to `max_examples` most frequent unseen ids, with a best-effort decoded form |
+
+### Why the raw number is not the decision
+
+A plug-in comparison always finds *some* unseen held-out tokens: with finite
+samples, even a perfectly i.i.d. split contains rare words that the train
+sample missed, and the amount grows as the fit sample shrinks. Reporting
+that raw count as "distribution shift" would flag every split.
+
+The audit therefore computes the **same metrics on two disjoint document
+folds of the train probe**, preferring an evaluation fold sized to the
+held-out probe and falling back to a balanced train half-split when two
+matched folds are not available. That is an empirical i.i.d. null built
+from the *same* corpus, tokenizer and probe mechanism. (If the train probe
+is too small for either construction, no null is reported.) The decision
+uses
+
+```
+excess = max(0, observed - null_reference)
+```
+
+and sets `flag=True` only when the excess unseen-token mass exceeds
+`unseen_mass_threshold` (default 1%) or the excess JS exceeds
+`js_threshold` (default 0.05 bits). The defaults are pre-specified warning
+levels, not gates: no row is dropped and no model-selection decision is
+derived from them. If the train probe is too small for two disjoint folds,
+`null_reference` is `None` and `flag` is `None` — the raw metrics are still
+recorded, but the audit refuses to call them a shift.
+
+The null is deliberately conservative: the observed fit uses the entire
+train probe while the null fit uses one fold, so finite-sample unseen mass
+in the null is at least as large as in the observed comparison. A moderate
+domain mixture still clears the bar (a 10% foreign-vocabulary mixture is
+flagged in the regression suite), which is the intended sensitivity.
+
+### Record layout
+
+In the LM run record (`train_lm_autodl.py`):
+
+```text
+distribution_shift.token_distribution = {
+  fit_on: "train probe only",
+  null_calibration: "within-train document folds",
+  val_vs_train: {
+    available, reference: "train", fit_on,
+    train_probe: {n_texts, n_probe_requested, n_documents_probed,
+                  n_documents_scored, n_empty_documents,
+                  n_tokenize_errors, n_tokens},
+    heldout_probe: {...same...},
+    observed: {n_fit_documents, n_eval_documents, n_fit_tokens,
+               n_eval_tokens, n_fit_types, n_eval_types, n_unseen_types,
+               unseen_type_fraction, unseen_token_mass,
+               js_divergence_bits, total_variation,
+               unseen_examples, examples_truncated},
+    null_reference: {...same metrics, no examples...} | null,
+    excess: {unseen_token_mass, js_divergence_bits, definition} | null,
+    flag: true | false | null,
+    flag_reasons: [...], js_threshold, unseen_mass_threshold,
+    seed, max_examples, no_rows_dropped: true
+  },
+  test_vs_train: {...same, filled after the sealed test opens...}
+}
+```
+
+`run_quant_lm.build_corpus` records the same blocks under
+`distribution_diagnostics.token_distribution_shift` for its val/test splits.
+
+### Recommended reporting
+
+Report the flag, the observed excess, and the probe sizes. A flagged split
+should be described as a distribution-shift caveat on the held-out number,
+not silently re-split after seeing the result — changing the split after
+looking at the metric is a selection effect. The honest remedies, fixed
+before the next run, are: stratify the split on the shifted variable,
+restrict claims to the vocabulary both splits cover, or report the shift as
+part of the result.
+
+### Limitations
+
+* Unigram overlap is lexical. A topic shift expressed with the same common
+  words is not detected; rare-word and domain shifts are.
+* Tokenization is the model's tokenizer, so subword vocabularies hide some
+  word-level novelty (a new word composed of known subwords is not unseen).
+* The probe is bounded and evenly spaced; a shift confined to a small part
+  of the corpus can be missed. `n_probe` is recorded.
+* The null calibrates finite-sample bias, not every possible confound. It
+  is a warning diagnostic, not a formal test with a p-value.
+* The audit reads text only; it cannot tell whether a shift is harmful for a
+  particular model, only that the held-out population differs.

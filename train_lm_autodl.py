@@ -52,7 +52,7 @@ import math
 import dataclasses
 import numbers
 import unicodedata
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -989,6 +989,17 @@ def _length_outlier_audit(train_lengths, heldout_lengths, *,
     }
 
 
+def _finite_float_or_none(value):
+    """Finite float for a real scalar, else ``None`` (bools are not numbers)."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _distribution_shift(train_stats, other_stats, *, threshold=0.5):
     """Standardized mean difference (Cohen's d) of token lengths vs train.
 
@@ -996,22 +1007,418 @@ def _distribution_shift(train_stats, other_stats, *, threshold=0.5):
     split is not exchangeable with train, which would make the reported
     held-out loss hard to interpret. The threshold only sets the
     ``flag`` field.
+
+    Zero-variance handling matters: if both splits have the same token
+    length for every probed document (``pooled == 0``), the old formula
+    returned ``d = 0.0`` even when the two means were completely
+    different, silently reporting "no shift".  A constant train length of
+    3 and a constant held-out length of 300 is the strongest possible
+    shift.  This function now reports ``cohen_d=None`` for that case
+    (the standardized effect is undefined, not zero), keeps the raw
+    ``mean_difference``, and sets ``flag=True`` whenever the means differ.
+
+    Malformed statistics (non-mapping input, non-finite means, negative or
+    non-finite SDs) are reported as ``flag=None`` with a ``note`` instead
+    of crashing the data-record assembly or smuggling a NaN into JSON.
     """
-    m_t, m_o = train_stats.get('mean_tokens'), other_stats.get('mean_tokens')
-    if m_t is None or m_o is None:
+    threshold_value = _finite_float_or_none(threshold)
+    if threshold_value is None or threshold_value < 0.0:
+        raise ValueError(
+            f'threshold must be a finite number >= 0, got {threshold!r}')
+
+    def _invalid(note):
         return {'reference': 'train', 'cohen_d': None, 'abs_cohen_d': None,
-                'flag': None, 'threshold': float(threshold)}
-    s_t = train_stats.get('std_tokens') or 0.0
-    s_o = other_stats.get('std_tokens') or 0.0
+                'mean_difference': None, 'zero_pooled_variance': None,
+                'flag': None, 'threshold': threshold_value, 'note': note}
+
+    try:
+        m_t_raw = train_stats.get('mean_tokens')
+        m_o_raw = other_stats.get('mean_tokens')
+        s_t_raw = train_stats.get('std_tokens')
+        s_o_raw = other_stats.get('std_tokens')
+    except AttributeError:
+        return _invalid('length statistics must be mappings')
+    m_t = _finite_float_or_none(m_t_raw)
+    m_o = _finite_float_or_none(m_o_raw)
+    if m_t is None or m_o is None:
+        return _invalid('missing or non-finite mean token length')
+    s_t = 0.0 if s_t_raw is None else _finite_float_or_none(s_t_raw)
+    s_o = 0.0 if s_o_raw is None else _finite_float_or_none(s_o_raw)
+    if s_t is None or s_o is None or s_t < 0.0 or s_o < 0.0:
+        return _invalid('invalid standard deviation')
+    mean_difference = m_o - m_t
     pooled = math.sqrt((s_t ** 2 + s_o ** 2) / 2.0)
-    d = (m_o - m_t) / pooled if pooled > 0 else 0.0
+    zero_pooled = pooled == 0.0
+    if zero_pooled:
+        # The standardized effect is undefined when both splits are
+        # constant. Do not encode a real separation as d=0.
+        cohen_d = 0.0 if mean_difference == 0.0 else None
+        flag = mean_difference != 0.0
+    else:
+        ratio = mean_difference / pooled
+        if math.isfinite(ratio):
+            cohen_d = ratio
+            flag = abs(ratio) >= threshold_value
+        else:
+            cohen_d = None
+            flag = True
     return {
         'reference': 'train',
-        'cohen_d': d,
-        'abs_cohen_d': abs(d),
-        'flag': abs(d) >= threshold,
-        'threshold': float(threshold),
+        'cohen_d': cohen_d,
+        'abs_cohen_d': abs(cohen_d) if cohen_d is not None else None,
+        'mean_difference': mean_difference,
+        'zero_pooled_variance': bool(zero_pooled),
+        'flag': bool(flag),
+        'threshold': threshold_value,
+        'note': ('zero within-split variance: d is undefined, not zero; '
+                 'flag is set from the raw mean difference'
+                 if zero_pooled and cohen_d is None else
+                 'Cohen d on the bounded token-length probe'),
     }
+
+
+def _exact_int_arg(name, value, *, minimum):
+    """Exact integer argument (bool / float would silently change geometry)."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f'{name} must be an exact int, got {value!r}')
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f'{name} must be >= {minimum}, got {value!r}')
+    return value
+
+
+def _finite_unit_interval_arg(name, value):
+    """Finite real argument in [0, 1] (bool is not a valid threshold)."""
+    number = _finite_float_or_none(value)
+    if number is None or not 0.0 <= number <= 1.0:
+        raise ValueError(
+            f'{name} must be a finite number in [0, 1], got {value!r}')
+    return number
+
+
+def _probe_token_documents(texts, tokenizer, seq_len, *, n_probe):
+    """Per-document token counts over a bounded, evenly spaced probe.
+
+    Returns ``(documents, stats)``: ``documents`` is a list of
+    ``collections.Counter`` objects (one per successfully tokenized,
+    non-empty probe document) and ``stats`` is a JSON-serializable record
+    of how the probe was obtained.  The probe is the SAME deterministic
+    evenly spaced selection used by :func:`_text_length_stats`, so the
+    token audit and the length audit describe the same documents and the
+    audit cost is bounded on a large corpus.
+
+    A document the tokenizer cannot encode (or that yields an invalid
+    negative id) is counted in ``n_tokenize_errors`` instead of aborting
+    the audit: one bad row must not hide the distribution of the rest.
+    """
+    n_probe = _exact_int_arg('n_probe', n_probe, minimum=1)
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    texts = list(texts)
+    n = len(texts)
+    indices = _evenly_spaced_probe_indices(n, n_probe)
+    documents: list[Counter] = []
+    n_errors = n_empty = n_tokens = 0
+    for i in indices:
+        text = texts[i]
+        if _is_nonfinite_document(text):
+            n_errors += 1
+            continue
+        try:
+            ids = tokenizer.encode(str(text), truncation=True,
+                                   max_length=seq_len + 1)
+            tokens = []
+            for token in ids:
+                # ``int(0.9) == 0`` would silently count a corrupted id as
+                # token 0; require an exact non-negative integer instead.
+                if (isinstance(token, bool)
+                        or not isinstance(token, numbers.Integral)
+                        or int(token) < 0):
+                    raise ValueError('non-integral or negative token id')
+                tokens.append(int(token))
+        except Exception:
+            n_errors += 1
+            continue
+        if not tokens:
+            n_empty += 1
+            continue
+        documents.append(Counter(tokens))
+        n_tokens += len(tokens)
+    return documents, {
+        'n_texts': n,
+        'n_probe_requested': int(n_probe),
+        'n_documents_probed': len(indices),
+        'n_documents_scored': len(documents),
+        'n_empty_documents': n_empty,
+        'n_tokenize_errors': n_errors,
+        'n_tokens': n_tokens,
+    }
+
+
+def _decode_token_id(tokenizer, token_id, *, max_chars=40):
+    """Best-effort readable form of one token id (``None`` if unsupported)."""
+    decode = getattr(tokenizer, 'decode', None)
+    if not callable(decode):
+        return None
+    try:
+        text = decode([int(token_id)], skip_special_tokens=False)
+    except TypeError:
+        try:
+            text = decode([int(token_id)])
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if not isinstance(text, str):
+        return None
+    # A JSON record must not smuggle raw NUL / newlines into the examples;
+    # escape them so the field is inspectable in a one-line log.
+    text = text.replace('\x00', '\\x00').replace('\r', '\\r') \
+               .replace('\n', '\\n')
+    return text[:int(max_chars)]
+
+
+def _unigram_shift_stats(fit_documents, eval_documents, *,
+                         tokenizer=None, max_examples=0):
+    """Unigram distribution comparison between two document samples.
+
+    Both samples are collections of per-document token ``Counter`` objects,
+    so the unit of sampling stays the DOCUMENT (tokens inside a document are
+    correlated).  Returns ``None`` when either sample has no tokens.
+
+    Metrics (all bounded, JSON-safe):
+
+    * ``unseen_token_mass`` — fraction of held-out TOKENS whose id never
+      occurs in the fit sample.  This is the share of the evaluation the
+      model's training vocabulary/embedding never saw.
+    * ``unseen_type_fraction`` — fraction of held-out token TYPES that are
+      absent from the fit sample.
+    * ``js_divergence_bits`` — Jensen-Shannon divergence (base 2, in
+      [0, 1]) between the two unigram distributions over the union of
+      observed ids.  Plug-in JS is biased upward by finite samples; the
+      caller compares it with a within-train null computed the same way.
+    * ``total_variation`` — half the L1 distance between the two unigram
+      distributions, in [0, 1].
+    """
+    max_examples = _exact_int_arg('max_examples', max_examples, minimum=0)
+    if not fit_documents or not eval_documents:
+        return None
+    fit_counts: Counter = Counter()
+    for document in fit_documents:
+        fit_counts.update(document)
+    eval_counts: Counter = Counter()
+    for document in eval_documents:
+        eval_counts.update(document)
+    fit_total = sum(fit_counts.values())
+    eval_total = sum(eval_counts.values())
+    if fit_total <= 0 or eval_total <= 0:
+        return None
+
+    unseen = [token_id for token_id in eval_counts
+              if token_id not in fit_counts]
+    unseen_mass = (sum(eval_counts[token_id] for token_id in unseen)
+                   / eval_total)
+    unseen_type_fraction = len(unseen) / max(len(eval_counts), 1)
+
+    js = 0.0
+    total_variation = 0.0
+    # Sorted, not raw set order: the JS sum is a float reduction, so a
+    # deterministic order makes repeated audits bit-identical.
+    for token_id in sorted(set(fit_counts) | set(eval_counts)):
+        p = fit_counts.get(token_id, 0) / fit_total
+        q = eval_counts.get(token_id, 0) / eval_total
+        midpoint = 0.5 * (p + q)
+        if p > 0.0:
+            js += 0.5 * p * math.log2(p / midpoint)
+        if q > 0.0:
+            js += 0.5 * q * math.log2(q / midpoint)
+        total_variation += abs(p - q)
+    # Guard the bounds against floating-point round-off (the exact values
+    # are in [0, 1]); a value outside them would be an invalid metric.
+    js = min(1.0, max(0.0, js))
+    total_variation = min(1.0, max(0.0, 0.5 * total_variation))
+
+    examples = []
+    ordered_unseen = sorted(unseen,
+                            key=lambda t: (-eval_counts[t], t))
+    for token_id in ordered_unseen[:max_examples]:
+        examples.append({
+            'token_id': int(token_id),
+            'count': int(eval_counts[token_id]),
+            'decoded': (_decode_token_id(tokenizer, token_id)
+                        if tokenizer is not None else None),
+        })
+    return {
+        'n_fit_documents': len(fit_documents),
+        'n_eval_documents': len(eval_documents),
+        'n_fit_tokens': int(fit_total),
+        'n_eval_tokens': int(eval_total),
+        'n_fit_types': len(fit_counts),
+        'n_eval_types': len(eval_counts),
+        'n_unseen_types': len(unseen),
+        'unseen_type_fraction': float(unseen_type_fraction),
+        'unseen_token_mass': float(unseen_mass),
+        'js_divergence_bits': float(js),
+        'total_variation': float(total_variation),
+        'unseen_examples': examples,
+        # ``max_examples=0`` (the null fold) deliberately omits examples;
+        # that is not a truncated list, so do not report it as one.
+        'examples_truncated': bool(max_examples > 0
+                                   and len(unseen) > len(examples)),
+    }
+
+
+def _stable_document_order(n_documents, *, seed):
+    """Deterministic document order derived only from ``(seed, index)``.
+
+    The null calibration must not use the global RNG: the audit runs inside
+    the training entry point and must not perturb the model / batch RNG
+    streams.  Sorting by a keyed SHA-256 digest gives a reproducible,
+    seed-specific permutation with no library RNG state at all.
+    """
+    n = _exact_int_arg('n_documents', n_documents, minimum=0)
+    if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
+        raise ValueError(f'seed must be an exact int, got {seed!r}')
+    seed = int(seed)
+    return sorted(
+        range(n),
+        key=lambda i: hashlib.sha256(
+            f'{seed}\x00{i}'.encode('ascii')).digest())
+
+
+def token_distribution_audit(
+        train_texts, heldout_texts, tokenizer, seq_len, *,
+        n_probe=256, js_threshold=0.05, unseen_mass_threshold=0.01,
+        max_examples=10, seed=0):
+    """Audit held-out token-distribution shift against the TRAIN probe.
+
+    Token-length shift (:func:`_distribution_shift`) is only one nuisance
+    dimension.  Two splits can have the same length distribution while the
+    held-out split contains a different vocabulary / topic / source mix;
+    the held-out perplexity then partly measures domain mismatch and the
+    two numbers are not exchangeable.  This audit tests that directly on
+    token unigrams, fitting every reference statistic on TRAIN only (the
+    pipeline's standing contract) and never inspecting a model metric.
+
+    Why a null calibration
+    ----------------------
+    A plug-in comparison always finds *some* held-out tokens unseen in
+    train: with finite samples, even a perfectly i.i.d. split produces
+    unseen rare words, and the amount grows as the fit sample shrinks.
+    Reporting that raw number as "distribution shift" would flag every
+    split.  The audit therefore also computes the SAME metrics on two
+    disjoint folds of the TRAIN probe (document-level folds, preferring an
+    evaluation fold sized to the held-out probe and falling back to a
+    balanced train half-split), giving an empirical i.i.d. baseline.  The
+    decision uses the EXCESS ``max(0, observed - null)``.  If the train
+    probe is too small for a null, ``flag`` is ``None``: the raw numbers
+    are still recorded, but the audit refuses to call them a shift.
+
+    The default thresholds are pre-specified warnings (5% excess JS,
+    1% excess unseen-token mass), not gates; no row is dropped and no
+    model-selection decision is derived from them.  In the LM entry point
+    ``test_vs_train`` is computed only after the sealed test split is
+    opened for its single final evaluation.
+
+    Returns a strictly JSON-serializable dict with ``observed``,
+    ``null_reference``, ``excess``, ``flag`` and the probe provenance.
+    """
+    n_probe = _exact_int_arg('n_probe', n_probe, minimum=1)
+    max_examples = _exact_int_arg('max_examples', max_examples, minimum=0)
+    js_threshold = _finite_unit_interval_arg('js_threshold', js_threshold)
+    unseen_mass_threshold = _finite_unit_interval_arg(
+        'unseen_mass_threshold', unseen_mass_threshold)
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
+        raise ValueError(f'seed must be an exact int, got {seed!r}')
+    seed = int(seed)
+    if not callable(getattr(tokenizer, 'encode', None)):
+        raise ValueError('tokenizer must provide a callable encode()')
+
+    train_documents, train_probe = _probe_token_documents(
+        list(train_texts), tokenizer, seq_len, n_probe=n_probe)
+    heldout_documents, heldout_probe = _probe_token_documents(
+        list(heldout_texts), tokenizer, seq_len, n_probe=n_probe)
+    report = {
+        'available': bool(train_documents and heldout_documents),
+        'fit_on': 'train probe only',
+        'reference': 'train',
+        'train_probe': train_probe,
+        'heldout_probe': heldout_probe,
+        'js_threshold': js_threshold,
+        'unseen_mass_threshold': unseen_mass_threshold,
+        'max_examples': max_examples,
+        'seed': seed,
+        'observed': None,
+        'null_reference': None,
+        'excess': None,
+        'flag': None,
+        'flag_reasons': [],
+        'no_rows_dropped': True,
+        'note': ('Descriptive distribution-shift warning fitted on TRAIN; '
+                 'the flag compares the held-out probe with a within-train '
+                 'document-level null and is never used for model '
+                 'selection or as a data transform.'),
+    }
+    if not report['available']:
+        report['reason'] = (
+            'no non-empty tokenized documents in the train or held-out '
+            'probe')
+        return report
+    observed = _unigram_shift_stats(
+        train_documents, heldout_documents, tokenizer=tokenizer,
+        max_examples=max_examples)
+    if observed is None:
+        report['available'] = False
+        report['reason'] = 'the token probe contained no token ids'
+        return report
+    report['observed'] = observed
+
+    # Within-train null: two disjoint document folds, sized so the null
+    # evaluation fold matches the held-out probe's document count.  When
+    # the train probe is too small for two matched folds, fall back to a
+    # balanced half-split; if even that is not possible, no null is
+    # reported and the audit refuses to flag.
+    order = _stable_document_order(len(train_documents), seed=seed)
+    n_eval = min(len(heldout_documents), len(train_documents))
+    null = None
+    if n_eval >= 2 and len(train_documents) >= 2 * n_eval:
+        null_fit_idx = order[n_eval:2 * n_eval]
+        null_eval_idx = order[:n_eval]
+    else:
+        n_eval = len(train_documents) // 2
+        if n_eval >= 2 and len(train_documents) - n_eval >= 2:
+            null_fit_idx = order[n_eval:]
+            null_eval_idx = order[:n_eval]
+        else:
+            null_fit_idx = null_eval_idx = None
+    if null_fit_idx is not None:
+        null = _unigram_shift_stats(
+            [train_documents[i] for i in null_fit_idx],
+            [train_documents[i] for i in null_eval_idx],
+            tokenizer=None, max_examples=0)
+    report['null_reference'] = null
+    if null is None:
+        report['flag_reasons'] = ['null_calibration_unavailable']
+        report['excess'] = None
+        return report
+
+    excess_unseen = max(
+        0.0, observed['unseen_token_mass'] - null['unseen_token_mass'])
+    excess_js = max(
+        0.0, observed['js_divergence_bits'] - null['js_divergence_bits'])
+    reasons = []
+    if excess_unseen > unseen_mass_threshold:
+        reasons.append('unseen_token_mass')
+    if excess_js > js_threshold:
+        reasons.append('js_divergence_bits')
+    report['excess'] = {
+        'unseen_token_mass': float(excess_unseen),
+        'js_divergence_bits': float(excess_js),
+        'definition': 'max(0, observed - within-train null)',
+    }
+    report['flag'] = bool(reasons)
+    report['flag_reasons'] = reasons
+    return report
 
 
 class SealedTestSet:
@@ -3050,6 +3457,11 @@ def main():
     train_lengths = _probe_token_lengths(train_texts, tokenizer, seq_len)
     val_lengths = _probe_token_lengths(val_texts, tokenizer, seq_len)
     outlier_val = _length_outlier_audit(train_lengths, val_lengths)
+    # Vocabulary/domain shift: length balance is necessary, not sufficient.
+    # All reference statistics are fitted on TRAIN; the null folds are
+    # drawn from TRAIN, so this never looks at the sealed test split.
+    token_shift_val = token_distribution_audit(
+        train_texts, val_texts, tokenizer, seq_len, seed=args.seed)
 
     ds = TinyStoriesLM(tokenizer, seq_len=seq_len, texts=train_texts,
                        split="train", name="train",
@@ -3080,9 +3492,20 @@ def main():
     print(f"Fingerprints: train={ds.data_fingerprint[:16]}... "
           f"val={val_ds.data_fingerprint[:16]}...")
     if shift_val['flag']:
+        _d = shift_val['cohen_d']
+        _d_text = ('undefined (zero within-split variance)'
+                   if _d is None else f'{_d:.3f}')
         print(f"[data] WARNING: val token-length distribution differs from "
-              f"train (Cohen's d={shift_val['cohen_d']:.3f}); the held-out "
-              f"loss may not be exchangeable with train")
+              f"train (Cohen's d={_d_text}, mean difference="
+              f"{shift_val['mean_difference']:.3f}); the held-out loss may "
+              f"not be exchangeable with train")
+    if token_shift_val['flag']:
+        _excess = token_shift_val['excess'] or {}
+        print(f"[data] WARNING: val token distribution differs from train "
+              f"beyond the within-train null "
+              f"({token_shift_val['flag_reasons']}): excess unseen-token "
+              f"mass={_excess.get('unseen_token_mass', 0.0):.4f}, "
+              f"excess JS={_excess.get('js_divergence_bits', 0.0):.4f} bits")
     loader_gen = torch.Generator()
     loader_gen.manual_seed(args.seed + 1_000_000)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0,
@@ -3306,6 +3729,12 @@ def main():
                 'iqr_multiplier': 1.5,
                 'fences_fit_on': 'train only',
                 'val_vs_train': outlier_val,
+                'test_vs_train': None,
+            },
+            'token_distribution': {
+                'fit_on': 'train probe only',
+                'null_calibration': 'within-train document folds',
+                'val_vs_train': token_shift_val,
                 'test_vs_train': None,
             },
         },
@@ -3636,6 +4065,10 @@ def main():
     test_lengths = _probe_token_lengths(test_dataset.texts, tokenizer,
                                         seq_len)
     outlier_test = _length_outlier_audit(train_lengths, test_lengths)
+    # The test split is now open for its single final evaluation, so the
+    # same vocabulary-shift audit can be recorded without peeking earlier.
+    token_shift_test = token_distribution_audit(
+        train_texts, test_dataset.texts, tokenizer, seq_len, seed=args.seed)
     test_t0 = time.time()
     test_report = evaluate_lm_loss(
         model, test_dataset, batch_size=batch_size, device=device,
@@ -3674,6 +4107,14 @@ def main():
           f"{'' if _ci is None else f'[{_ci[0]:.2f}, {_ci[1]:.2f}] '}"
           f"over {test_report['n_tokens']} tokens, "
           f"prefill {_tps:,.0f} tok/s")
+    if token_shift_test['flag']:
+        _test_excess = token_shift_test['excess'] or {}
+        print(f"[test] WARNING: the sealed test split's token distribution "
+              f"differs from train beyond the within-train null "
+              f"({token_shift_test['flag_reasons']}): excess unseen-token "
+              f"mass={_test_excess.get('unseen_token_mass', 0.0):.4f}, "
+              f"excess JS={_test_excess.get('js_divergence_bits', 0.0):.4f} "
+              f"bits; the test perplexity partly reflects domain mismatch")
     data_record['splits']['test']['content_fingerprint_sha256'] = \
         test_dataset.data_fingerprint
     data_record['splits']['test']['token_length_stats'] = stats_test
@@ -3681,6 +4122,8 @@ def main():
     data_record['distribution_shift']['test_vs_train'] = shift_test
     data_record['distribution_shift']['length_outliers']['test_vs_train'] = \
         outlier_test
+    data_record['distribution_shift']['token_distribution'][
+        'test_vs_train'] = token_shift_test
 
     # Persist the full run record (code version + hyperparameters + seed +
     # data version + training curve + final result) next to the checkpoint.

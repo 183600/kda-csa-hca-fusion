@@ -144,6 +144,7 @@ from train_lm_autodl import (  # noqa: E402
     _probe_token_lengths,
     _text_length_stats,
     _window_overlap_audit,
+    token_distribution_audit,
     clean_lm_texts,
     analyze_lm_errors,
     evaluate_lm_loss,
@@ -227,9 +228,15 @@ def build_corpus(seq_len: int = DEFAULT_SEQ_LEN,
             name: _distribution_shift(split_stats['train'],
                                       split_stats[name])
             for name in ('val', 'test')},
-        'note': ('Token-length outlier fences and Cohen\'s d are fitted on '
-                 'TRAIN and reported for val/test; they are shift warnings, '
-                 'never transforms or selection criteria.'),
+        'token_distribution_shift': {
+            name: token_distribution_audit(
+                split_texts['train'], split_texts[name], tokenizer, seq_len,
+                seed=seed)
+            for name in ('val', 'test')},
+        'note': ('Token-length fences, Cohen\'s d and the token-unigram '
+                 'shift (with its within-train null) are fitted on TRAIN and '
+                 'reported for val/test; they are shift warnings, never '
+                 'transforms or selection criteria.'),
     }
     report['cleaning'] = cleaning['stats']
     report['window_leak_filter'] = {

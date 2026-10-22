@@ -336,7 +336,9 @@ def test_build_corpus_audits_windows_and_fits_diagnostics_on_train():
         and all(v['fit_on'] == 'train'
                 for v in diag['length_outlier_audit'].values())
         and all(v['reference'] == 'train'
-                for v in diag['distribution_shift'].values()), '')
+                for v in diag['distribution_shift'].values())
+        and all(v['fit_on'] == 'train probe only'
+                for v in diag['token_distribution_shift'].values()), '')
     json.dumps(report, allow_nan=False)
 
 
