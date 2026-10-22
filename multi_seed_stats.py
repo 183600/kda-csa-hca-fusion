@@ -71,6 +71,20 @@ the whole pipeline for a list of seed-paired differences:
     explicitly descriptive (not a test, no multiplicity correction) and
     cannot upgrade a claim; it prevents a one-seed-driven ordering from
     being read as a structural result.
+11. :func:`exact_test_resolution` — the discreteness check that must be
+    read BEFORE a non-significant exact test: an exact sign/sign-flip
+    test has only ``2**n`` sign assignments, so at ``n = 5`` the smallest
+    attainable two-sided p is 0.0625 and a Holm-corrected family of 21
+    comparisons can never reject at alpha=0.05.  The function returns the
+    attainable p floor, the minimum seed count that would give the family
+    a rejection region, and the largest family the current n can support.
+12. :func:`binomial_proportion_ci` — the exact Clopper-Pearson interval
+    for the seed win rate, so a 5/5 sweep is reported as ``[0.478, 1]``
+    rather than as a confident "100% win rate".
+13. :func:`median_order_statistic_ci` — the distribution-free median
+    interval from the binomial order statistics.  At n=5 no 95% interval
+    exists; the function says so (minimum n=6) instead of returning a
+    spuriously narrow interval.
 
 Design constraints
 ------------------
@@ -118,6 +132,9 @@ __all__ = [
     'seeds_required',
     'summarize_paired',
     'leave_one_out_sensitivity',
+    'exact_test_resolution',
+    'binomial_proportion_ci',
+    'median_order_statistic_ci',
 ]
 
 # ---------------------------------------------------------------------------
@@ -297,6 +314,281 @@ def _safe_median(values):
     return mid
 
 
+# ---------------------------------------------------------------------------
+# Exact-test resolution and nonparametric effect-size uncertainty
+# ---------------------------------------------------------------------------
+
+def _validate_alpha(alpha) -> float:
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    alpha = float(alpha)
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    return alpha
+
+
+def _beta_quantile(q: float, a: float, b: float) -> float:
+    """Quantile of the Beta(a, b) distribution by forward-CDF bisection.
+
+    ``betainc_regularized`` is monotone in x, so bisection is robust for
+    the small integer shape parameters used by Clopper-Pearson. The cost
+    (a few hundred incomplete-beta evaluations) is negligible for the
+    n = 5-7 seed scale this module targets.
+    """
+    if not (0.0 <= q <= 1.0):
+        raise ValueError(f'q must be in [0,1], got {q!r}')
+    if q == 0.0:
+        return 0.0
+    if q == 1.0:
+        return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid <= lo or mid >= hi:
+            break
+        if betainc_regularized(a, b, mid) < q:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def binomial_proportion_ci(k, n, *, alpha: float = 0.05) -> dict:
+    """Exact Clopper-Pearson interval for a binomial proportion ``k/n``.
+
+    The seed win rate is a binomial proportion over the ``n_effective``
+    non-tied pairs. A bare ``5/5 = 100%`` hides that five seeds are also
+    consistent with a true win probability as low as 0.478; the exact
+    interval makes that uncertainty explicit. ``n=0`` returns undefined
+    endpoints (``None``) instead of fabricating [0, 1].
+
+    The interval is conservative by construction (its coverage is at least
+    ``1 - alpha``), and ties are excluded by the caller, exactly as in
+    :func:`sign_test`.
+    """
+    alpha = _validate_alpha(alpha)
+    if (isinstance(n, bool) or not isinstance(n, int) or n < 0):
+        raise ValueError(f'n must be a non-negative int, got {n!r}')
+    if (isinstance(k, bool) or not isinstance(k, int) or k < 0 or k > n):
+        raise ValueError(f'k must be an int in [0, n], got {k!r} (n={n!r})')
+    out = {
+        'k': int(k), 'n': int(n), 'alpha': alpha,
+        'ci_level': 1.0 - alpha,
+        'ci_low': None, 'ci_high': None,
+        'method': 'clopper_pearson_exact',
+        'note': ('Exact binomial interval over non-tied seed pairs; '
+                 'conservative (coverage >= ci_level).'),
+    }
+    if n == 0:
+        return out
+    low = 0.0 if k == 0 else _beta_quantile(alpha / 2.0, k, n - k + 1)
+    high = 1.0 if k == n else _beta_quantile(
+        1.0 - alpha / 2.0, k + 1, n - k)
+    # Guard against a last-ulp inversion on extreme shapes.
+    low = min(max(low, 0.0), 1.0)
+    high = min(max(high, 0.0), 1.0)
+    if low > high:
+        low, high = high, low
+    out['ci_low'] = low
+    out['ci_high'] = high
+    return out
+
+
+def median_order_statistic_ci(diffs, *, alpha: float = 0.05) -> dict:
+    """Distribution-free confidence interval for the paired median.
+
+    For ``n`` independent paired differences, the interval
+    ``[x_(k), x_(n-k+1)]`` (1-based order statistics) covers the population
+    median with probability
+    ``1 - 2 * P(Binomial(n, 0.5) <= k - 1)``. Pick the largest ``k`` whose
+    lower tail is at most ``alpha/2``; that gives the shortest such
+    interval. The construction assumes only exchangeability/continuity and
+    is robust to a single diverging seed.
+
+    At ``n = 5`` even the full range ``[x_(1), x_(5)]`` has only 93.75%
+    coverage, so no 95% interval exists; the function returns ``None``
+    endpoints and ``min_pairs_for_ci = 6`` rather than pretending. Ties
+    make the interval conservative.
+    """
+    alpha = _validate_alpha(alpha)
+    d = _as_clean_diffs(diffs)
+    n = len(d)
+    min_pairs = max(1, int(math.ceil(math.log2(2.0 / alpha))))
+    out = {
+        'n_pairs': n, 'alpha': alpha, 'ci_level': 1.0 - alpha,
+        'k': None, 'ci_low': None, 'ci_high': None,
+        'coverage': None, 'min_pairs_for_ci': min_pairs,
+        'method': 'binomial_order_statistics',
+        'note': ('Distribution-free interval for the population median. '
+                 'The largest admissible k with P(Bin(n,.5)<=k-1) <= '
+                 'alpha/2 is used; ties are conservative.'),
+    }
+    if n == 0:
+        return out
+    # P(X <= k-1) = I_{0.5}(n-k+1, k), monotone in k. Use the
+    # incomplete-beta form (no 2**n) and binary-search the largest
+    # admissible k, so the routine stays stable for large n as well.
+    def _tail(k: int) -> float:
+        return betainc_regularized(n - k + 1, k, 0.5)
+
+    k_best = 0
+    tail_best = None
+    lo, hi = 1, (n + 1) // 2
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        tail = _tail(mid)
+        if tail <= alpha / 2.0 + 1e-15:
+            k_best, tail_best = mid, tail
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if k_best == 0:
+        return out
+    ordered = sorted(d)
+    out['k'] = int(k_best)
+    out['ci_low'] = ordered[k_best - 1]
+    out['ci_high'] = ordered[n - k_best]
+    out['coverage'] = 1.0 - 2.0 * tail_best
+    return out
+
+
+def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
+                          family_size: int = 1,
+                          alternative: str = 'two-sided',
+                          n_zero: int = 0) -> dict:
+    """Rejection-region floor for the exact sign / sign-flip test.
+
+    An exact paired sign-flip (or sign) test has only ``2**n_effective``
+    sign assignments. Its smallest attainable two-sided p is therefore
+    ``2 / 2**n_effective`` (``1 / 2**n_effective`` for a directional test),
+    and a Holm family of ``m`` comparisons has an adjusted floor of
+    ``m`` times that value. When the floor exceeds ``alpha`` the family has
+    **no rejection region at all**: a non-significant result is forced by
+    the design, not evidence of no effect. This is the small-n discreteness
+    problem that ordinary power calculations (which use continuous normal
+    or t distributions) do not see.
+
+    ``n_zero`` is the number of exactly tied pairs. Ties carry no sign
+    information, so the effective count is ``n_pairs - n_zero``; the floor
+    uses that count exactly as :func:`sign_test` does.
+
+    Returns a JSON-safe record with:
+
+    * ``min_attainable_p_raw`` / ``min_attainable_p_holm`` — p-value
+      floors before/after the family correction (capped at 1);
+    * ``raw_testable`` / ``family_testable`` — whether the comparison
+      could reject on its own, and whether it could be the *first*
+      (smallest-p) rejection in the Holm family. When every family member
+      has the same n (the usual complete-seed-block case), the latter is
+      exactly whether the family has any rejection region;
+    * ``later_rank_possible`` — the raw floor is at or below ``alpha``, so
+      a later-rank rejection is not ruled out even when this comparison
+      could not be the first one. It is necessary, not sufficient;
+    * ``min_effective_pairs_raw`` / ``min_effective_pairs_holm`` — the
+      smallest effective n that would restore a rejection region;
+    * ``shortfall_pairs_raw`` / ``shortfall_pairs_holm`` — how many
+      additional informative pairs the current run needs;
+    * ``max_comparisons_at_alpha`` — the largest family this n can
+      support (0 means not even one comparison is testable).
+
+    This is a **necessary** condition, not a power guarantee: a family can
+    be testable and still be badly underpowered at the SESOI.
+    """
+    alpha = _validate_alpha(alpha)
+    if (isinstance(n_pairs, bool) or not isinstance(n_pairs, int)
+            or n_pairs < 0):
+        raise ValueError(
+            f'n_pairs must be a non-negative int, got {n_pairs!r}')
+    if (isinstance(n_zero, bool) or not isinstance(n_zero, int)
+            or n_zero < 0 or n_zero > n_pairs):
+        raise ValueError(
+            f'n_zero must be an int in [0, n_pairs], got {n_zero!r} '
+            f'(n_pairs={n_pairs!r})')
+    if (isinstance(family_size, bool) or not isinstance(family_size, int)
+            or family_size < 1):
+        raise ValueError(
+            f'family_size must be a positive int, got {family_size!r}')
+    if alternative not in ('two-sided', 'greater', 'less'):
+        raise ValueError(
+            f"alternative must be 'two-sided'|'greater'|'less', "
+            f'got {alternative!r}')
+    n_eff = n_pairs - n_zero
+    sided = 2 if alternative == 'two-sided' else 1
+    if n_eff == 0:
+        p_min = 1.0
+    elif n_eff <= 1023:
+        # Exact power-of-two arithmetic for every realistic seed count;
+        # the float form avoids the last-ulp noise of exp(log(...)).
+        p_min = min(1.0, sided / float(1 << n_eff))
+    else:
+        # exp(log) keeps the floor finite for n far beyond 2**1024.
+        log_floor = math.log(sided) - n_eff * math.log(2.0)
+        p_min = 1.0 if log_floor >= 0.0 else math.exp(log_floor)
+    if p_min <= 0.0:
+        p_holm = 0.0
+    elif family_size > 1.0 / p_min:
+        p_holm = 1.0
+    else:
+        p_holm = min(1.0, family_size * p_min)
+
+    def _min_effective(multiplier: int) -> int:
+        # smallest n >= 1 with multiplier * sided / 2**n <= alpha,
+        # compared in log space so an absurd family size cannot overflow
+        # the float conversion of 2**n.
+        log_num = math.log(multiplier) + math.log(sided)
+        log_alpha = math.log(alpha)
+        if log_num - log_alpha <= 0.0:
+            return 0
+        n = max(1, int(math.ceil((log_num - log_alpha) / math.log(2.0))))
+        while log_num - n * math.log(2.0) > log_alpha:
+            n += 1
+        while (n > 1
+               and log_num - (n - 1) * math.log(2.0) <= log_alpha):
+            n -= 1
+        return n
+
+    min_raw = _min_effective(1)
+    min_holm = _min_effective(family_size)
+    if p_min <= 0.0:
+        max_family = None
+    else:
+        max_family = int(math.floor(alpha / p_min))
+    return {
+        'n_pairs': n_pairs,
+        'n_zero': n_zero,
+        'n_effective': n_eff,
+        'alternative': alternative,
+        'sided': sided,
+        'alpha': alpha,
+        'family_size': family_size,
+        'min_attainable_p_raw': p_min,
+        'min_attainable_p_holm': p_holm,
+        'raw_testable': bool(p_min <= alpha),
+        # ``family_testable`` is the first-rank (smallest-p) condition.
+        # With equal n across the family it is exactly the family-level
+        # feasibility; with unequal n a later-ranked comparison can still
+        # reject, which ``later_rank_possible`` records as a necessary
+        # (not sufficient) condition.
+        'family_testable': bool(p_holm <= alpha),
+        'first_rejection_testable': bool(p_holm <= alpha),
+        'later_rank_possible': bool(p_min <= alpha),
+        'min_effective_pairs_raw': min_raw,
+        'min_effective_pairs_holm': min_holm,
+        'shortfall_pairs_raw': max(0, min_raw - n_eff),
+        'shortfall_pairs_holm': max(0, min_holm - n_eff),
+        'max_comparisons_at_alpha': max_family,
+        'method': 'exact_sign_flip_resolution',
+        'note': ('Exact-test discreteness floor, a NECESSARY condition for '
+                 'rejection. family_testable=False means this comparison '
+                 'cannot be the first (smallest-p) rejection at alpha; with '
+                 'equal n across the family, no outcome of the family could '
+                 'have been significant. later_rank_possible records the '
+                 'weaker condition that its own p floor is <= alpha. The '
+                 'floor is not evidence of equivalence or of a null effect, '
+                 'and does not apply to the continuous t-test.'),
+    }
+
+
 # Numerical-zero rule: a difference vector whose entries are all the same
 # float has exactly zero sample variance. Values that differ only by a few
 # ULPs of their own magnitude can also be a rounding residue (e.g. per-seed
@@ -416,7 +708,7 @@ def paired_t_test(diffs, alternative: str = 'two-sided') -> dict:
             'alternative': alternative}
 
 
-def sign_test(diffs) -> dict:
+def sign_test(diffs, *, alpha: float = 0.05) -> dict:
     """Exact two-sided binomial sign test on paired differences.
 
     Zeros are dropped (Steel's convention): a seed that produced *exactly*
@@ -425,7 +717,13 @@ def sign_test(diffs) -> dict:
     ``X ~ Binomial(n+, n-, 0.5)``, capped at 1.0. Distribution-free and
     robust to a single divergent magnitude; it is the exact paired
     permutation test restricted to sign information.
+
+    The record also carries the observed seed win rate over the
+    ``n_effective`` non-tied pairs and its exact Clopper-Pearson interval
+    (``win_rate_ci95``). A 5/5 sweep is reported as ``[0.478, 1]``, not as
+    a confident 100% win probability.
     """
+    alpha = _validate_alpha(alpha)
     d = _as_clean_diffs(diffs)
     n_pos = sum(1 for x in d if x > 0)
     n_neg = sum(1 for x in d if x < 0)
@@ -433,12 +731,19 @@ def sign_test(diffs) -> dict:
     n_eff = n_pos + n_neg
     if n_eff == 0:
         p = 1.0
+        win_rate = None
     else:
         k = max(n_pos, n_neg)
         tail = sum(math.comb(n_eff, i) for i in range(k, n_eff + 1))
         p = min(1.0, 2.0 * tail / float(2 ** n_eff))
+        win_rate = n_pos / float(n_eff)
+    ci = binomial_proportion_ci(n_pos, n_eff, alpha=alpha)
     return {'n_pairs': len(d), 'n_positive': n_pos, 'n_negative': n_neg,
-            'n_zero': n_zero, 'n_effective': n_eff, 'p_value': p}
+            'n_zero': n_zero, 'n_effective': n_eff, 'p_value': p,
+            'win_rate': win_rate,
+            'win_rate_ci95': [ci['ci_low'], ci['ci_high']],
+            'win_rate_ci_method': ci['method'],
+            'win_rate_alpha': alpha}
 
 
 def permutation_test(diffs, alternative: str = 'two-sided',
@@ -1266,7 +1571,8 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                      alpha: float = 0.05,
                      power: float = 0.8,
                      equivalence_margin: float | None = None,
-                     include_seed_influence: bool = False) -> dict:
+                     include_seed_influence: bool = False,
+                     family_size: int = 1) -> dict:
     """Run the full multi-seed inference panel on paired differences.
 
     Returns a single JSON-safe record containing the effect estimate,
@@ -1290,6 +1596,23 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     differences are skew/outlier-driven and the result should be treated
     as fragile rather than decided by whichever test looks best.
 
+    ``family_size`` is the number of comparisons the caller will correct
+    with Holm. The record then carries a ``test_resolution`` block from
+    :func:`exact_test_resolution`: the smallest p the exact test could
+    possibly produce at this n, the smallest Holm-adjusted p for this
+    family, and the seed count needed to restore a rejection region.
+    Without this block a forced non-significant exact test is easy to
+    misread as evidence of no difference. The default ``family_size=1``
+    describes the comparison in isolation; callers that correct a family
+    should pass the actual family size (or overwrite the block from the
+    family-level report).
+
+    The record also carries the exact Clopper-Pearson interval for the
+    seed win rate (``win_rate_ci95``) and the distribution-free order-
+    statistic interval for the paired median (``median_ci``). Both are
+    undefined at the sample sizes where no interval exists, rather than
+    replaced by a misleading point.
+
     ``include_seed_influence=True`` additionally attaches a
     ``seed_influence`` block from :func:`leave_one_out_sensitivity`: which
     seed, if deleted, would change the direction or the primary
@@ -1298,6 +1621,10 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     depends on the seed set, not for bulk per-cell summaries where the
     extra record would dominate the output.
     """
+    if (isinstance(family_size, bool) or not isinstance(family_size, int)
+            or family_size < 1):
+        raise ValueError(
+            f'family_size must be a positive int, got {family_size!r}')
     d = _as_clean_diffs(diffs)
     n = len(d)
     mean = _safe_mean(d)
@@ -1307,7 +1634,11 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     t_dir = paired_t_test(
         d, alternative='greater' if (mean is not None and mean >= 0)
         else 'less')
-    sign = sign_test(d)
+    sign = sign_test(d, alpha=alpha)
+    median_ci = median_order_statistic_ci(d, alpha=alpha)
+    resolution = exact_test_resolution(
+        n, alpha=alpha, family_size=family_size,
+        alternative='two-sided', n_zero=sign['n_zero'])
     perm = permutation_test(d, alternative='two-sided', seed=seed,
                             n_permutations=n_permutations,
                             max_exact=max_exact)
@@ -1341,11 +1672,14 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
         'cohens_dz': dz,
         'direction': direction,
         'win_rate': win_rate,
+        'win_rate_ci95': sign['win_rate_ci95'],
         'n_seeds_a_wins': n_pos,
         'n_seeds_b_wins': n_neg,
         'n_seeds_tied': n - n_nonzero,
         'ci95_mean_diff_t': [ci_lo, ci_hi],
         'ci95_mean_diff_bootstrap': [boot['ci_lo'], boot['ci_hi']],
+        'ci95_median_diff': [median_ci['ci_low'], median_ci['ci_high']],
+        'median_ci': median_ci,
         'bootstrap': {'n_boot': boot['n_boot'], 'seed': boot['seed']},
         't_test': {'t_stat': t['t_stat'], 'dof': t['dof'],
                    'p_value_two_sided': t['p_value'],
@@ -1353,6 +1687,9 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                    'all_positive': t['all_positive'],
                    'all_negative': t['all_negative']},
         'sign_test': {'n_effective': sign['n_effective'],
+                      'n_zero': sign['n_zero'],
+                      'win_rate': sign['win_rate'],
+                      'win_rate_ci95': sign['win_rate_ci95'],
                       'p_value_two_sided': sign['p_value']},
         'permutation_test': {'method': perm['method'],
                              'n_permutations': perm['n_permutations'],
@@ -1363,6 +1700,7 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                        'planning estimate for a FUTURE run at the observed '
                        '|d_z| (two-sided alpha, 80% power), not a guarantee '
                        'for this one.'),
+        'test_resolution': resolution,
         'practically_equivalent': (tost['equivalent'] if tost else None),
         'equivalence_note': (
             'practically_equivalent is None unless a PRE-SPECIFIED '

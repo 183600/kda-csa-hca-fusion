@@ -112,6 +112,12 @@ rep['drops'][5]['mean_diff']  # the remaining mean after deleting seed 5
 * It is a one-at-a-time deletion view, not an exhaustive subset or
   influence-function analysis. Two seeds can jointly drive a result while
   no single deletion flips it.
+* A `boundary_sensitive` label is unavoidable when the exact test has no
+  rejection region to begin with (e.g. 5 seeds x 21 Holm-corrected
+  comparisons). Read `n_primary_significance_flips` together with
+  `test_resolution` from `summarize_paired`; the latter reports whether
+  any p-value in the family could have crossed alpha. See
+  [inference-resolution.md](inference-resolution.md).
 * The permutation Monte-Carlo branch is reused with the same local seed, so
   the report is deterministic; its resolution is still
   `1 / (n_permutations + 1)`.

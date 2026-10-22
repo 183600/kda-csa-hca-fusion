@@ -102,8 +102,8 @@ import sys
 import tempfile
 from collections.abc import Mapping
 
-from multi_seed_stats import (min_detectable_effect, power_at_effect,
-                              seeds_required)
+from multi_seed_stats import (exact_test_resolution, min_detectable_effect,
+                              power_at_effect, seeds_required)
 
 __all__ = [
     'DesignError',
@@ -708,6 +708,17 @@ def validate_plan(plan) -> list[str]:
         errors.append(
             f"planned_power={rep.get('planned_power')!r} does not reach "
             f"target_power={plan['target_power']!r}")
+    exact = rep.get('exact_test_resolution') or {}
+    if exact and not exact.get('family_testable', True):
+        errors.append(
+            'the planned budget has no exact-test rejection region: '
+            f"n={plan.get('planned_seeds')!r}, "
+            f"family_size={plan.get('planned_family_size')!r}, "
+            f"min attainable Holm p="
+            f"{exact.get('min_attainable_p_holm')!r} > alpha; raise "
+            f"planned_seeds to at least "
+            f"{exact.get('min_effective_pairs_holm')!r} effective pairs or "
+            'shrink the confirmatory family')
     if equiv_required:
         eq = rep.get('equivalence') or {}
         eq_required_n = eq.get('required_seeds_at_zero')
@@ -1027,6 +1038,28 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         status = 'confirmatory_ready'
     else:
         status = 'underpowered_at_sesoi'
+    # The power arithmetic above uses a continuous normal approximation.
+    # The runners' primary paired test is exact (sign-flip permutation),
+    # whose p-value takes only 2**n discrete values. At small n and/or a
+    # large corrected family the exact test can have NO rejection region,
+    # so a normal-power "confirmatory_ready" verdict would be unattainable.
+    # Report that floor before the run; do not let a p-value that could
+    # never cross alpha be read as evidence.
+    exact_resolution = exact_test_resolution(
+        n_seeds, alpha=alpha, family_size=family, alternative=alt)
+    exact_warning = None
+    if not exact_resolution['family_testable']:
+        exact_warning = (
+            f'the exact sign-flip test has no rejection region at '
+            f'n={n_seeds} and family_size={family}: the smallest '
+            f'attainable Holm-adjusted p is '
+            f"{exact_resolution['min_attainable_p_holm']:.6g} > "
+            f'alpha={alpha:g}. The normal-approximation power number is '
+            f'therefore unattainable; this is a screening design, not a '
+            f'confirmatory one. It needs '
+            f"{exact_resolution['min_effective_pairs_holm']} effective "
+            f'seed pairs (shortfall '
+            f"{exact_resolution['shortfall_pairs_holm']}).")
     # A TOST equivalence claim is a DIFFERENT design question from the
     # superiority SESOI above. Compute its prospective budget separately so
     # a run that is confirmatory-ready for superiority cannot be presented
@@ -1072,6 +1105,8 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         'planned_power': achieved,
         'power_gap': (None if achieved is None else target - achieved),
         'status': status,
+        'exact_test_resolution': exact_resolution,
+        'exact_test_warning': exact_warning,
         'equivalence': equivalence,
         'equivalence_status': (
             None if equivalence is None else equivalence['status']),
@@ -1087,7 +1122,10 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                  'n, so treat the target power as a floor to beat, not a '
                  'promise. Equivalence is a separate endpoint: see the '
                  'nested equivalence record, whose required n is usually '
-                 'larger.'),
+                 'larger. exact_test_resolution is an independent '
+                 'feasibility check on the discrete exact test: when '
+                 'family_testable is False no p-value from that family '
+                 'could have crossed alpha, whatever the observed effect.'),
     }
 
 
@@ -1314,6 +1352,8 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
 
     planning = planning_report(plan, seeds=n_seeds, family_size=family_size,
                                sd=sd)
+    exact_testable = bool(
+        planning['exact_test_resolution']['family_testable'])
     equivalence = planning.get('equivalence')
     equivalence_supported = bool(
         equivalence is not None
@@ -1351,6 +1391,10 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         # None = the plan makes no TOST equivalence claim.
         'equivalence_supported': (
             None if equivalence is None else equivalence_supported),
+        # A necessary (not sufficient) feasibility check: if the discrete
+        # exact test has no rejection region at this n/family, no outcome
+        # could have crossed alpha.
+        'exact_test_has_rejection_region': exact_testable,
     }
     valid_seeds = all(checks[key] for key in (
         'seeds_present', 'at_least_two_seeds', 'seeds_unique',
@@ -1369,6 +1413,11 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             f"pre-registered planned_family_size={planned_family}; the extra "
             "comparisons were not part of the confirmatory plan, so the run "
             "is screening/exploratory even if its seed budget is ample")
+    if not exact_testable:
+        design_warnings.append(
+            planning.get('exact_test_warning')
+            or ('the exact sign-flip test has no rejection region at this '
+                'seed count and family size; treat the run as screening'))
     if not valid_seeds:
         status = 'invalid'
         claims = []
@@ -1382,6 +1431,13 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                       'complete_case_paired_inference_only']
         else:
             claims = []
+    elif (planning['status'] == 'confirmatory_ready'
+          and not exact_testable):
+        # The normal-approximation power target is met, but the exact test
+        # the plan actually names cannot reject at any p-value. That is a
+        # resolution-limited design, not a confirmatory one.
+        status = 'screening'
+        claims = ['descriptive', 'exploratory_inference_with_caveat']
     elif planning['status'] != 'confirmatory_ready':
         status = 'screening'
         claims = ['descriptive', 'exploratory_inference_with_caveat']

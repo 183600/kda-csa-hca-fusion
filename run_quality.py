@@ -82,8 +82,8 @@ from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
-from multi_seed_stats import (_safe_mean, _sample_sd, holm_adjust,
-                               summarize_paired)
+from multi_seed_stats import (_safe_mean, _sample_sd, exact_test_resolution,
+                               holm_adjust, summarize_paired)
 from experiment_design import (audit_run as audit_experiment_design,
                                common_analyzed_seeds)
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
@@ -3774,6 +3774,69 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
     return checks, counts
 
 
+def _pairwise_family_resolution(records, alpha):
+    """Summarize the exact-test rejection floor of one pairwise family.
+
+    Every record carries its own ``test_resolution`` computed with the
+    actual family size. A family with unequal common-seed counts can be
+    testable for one pair and resolution-limited for another, so the
+    aggregate reports both the worst and the best floor rather than a
+    single misleading number.
+    """
+    if not records:
+        return None
+    flags = [bool(r['test_resolution']['family_testable'])
+             for r in records]
+    later = [bool(r['test_resolution']['later_rank_possible'])
+             for r in records]
+    n_limited = sum(1 for f in flags if not f)
+    worst = max(records,
+                key=lambda r: r['test_resolution'][
+                    'min_attainable_p_holm'])
+    best = min(records,
+               key=lambda r: r['test_resolution'][
+                   'min_attainable_p_holm'])
+    if n_limited == 0:
+        status = 'testable'
+    elif n_limited == len(records):
+        status = 'resolution_limited'
+    else:
+        status = 'partially_resolution_limited'
+    return {
+        'family_size': len(records),
+        'min_n_pairs': min(r['n_pairs'] for r in records),
+        'max_n_pairs': max(r['n_pairs'] for r in records),
+        'status': status,
+        'all_pairs_testable': bool(n_limited == 0),
+        'any_pair_testable': bool(n_limited < len(records)),
+        'n_resolution_limited': n_limited,
+        # With unequal common-seed counts a later-ranked comparison can
+        # still reject after the smaller-p members; record that weaker
+        # possibility separately so the aggregate does not overstate it.
+        'n_later_rank_possible': sum(1 for f in later if f),
+        'any_pair_later_rank_possible': bool(any(later)),
+        'worst_min_attainable_p_holm': worst['test_resolution'][
+            'min_attainable_p_holm'],
+        'best_min_attainable_p_holm': best['test_resolution'][
+            'min_attainable_p_holm'],
+        'min_effective_pairs_for_holm': max(
+            r['test_resolution']['min_effective_pairs_holm']
+            for r in records),
+        'max_shortfall_pairs_for_holm': max(
+            r['test_resolution']['shortfall_pairs_holm']
+            for r in records),
+        'note': ('The exact sign-flip test takes only 2**n values, and the '
+                 'Holm correction multiplies its p floor by the family '
+                 'size. A resolution_limited pair cannot be the first '
+                 '(smallest-p) rejection; with equal n across the family '
+                 '(the usual complete seed block) no outcome could have '
+                 'crossed alpha, so a non-significant result is forced by '
+                 'the design rather than evidence of equivalence. With '
+                 'unequal n, n_later_rank_possible counts pairs whose own '
+                 'p floor could still clear alpha at a later Holm rank.'),
+    }
+
+
 def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                              n_boot=2000, n_permutations=10000,
                              max_exact=16, equivalence_margin=None):
@@ -3797,11 +3860,18 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
       regime; exact enumeration below ``max_exact`` pairs, deterministic
       Monte-Carlo above);
     * the paired t-test as a secondary, normality-dependent view;
-    * the exact binomial sign test, Cohen's ``d_z``, win rate, and two
-      bootstrap/t CIs for the mean difference;
+    * the exact binomial sign test, Cohen's ``d_z``, win rate with its
+      exact Clopper-Pearson interval, the distribution-free median
+      interval, and two bootstrap/t CIs for the mean difference;
     * ``seeds_required_80pct_power`` — how many seeds a follow-up run
       would need at the observed |d_z|. This converts an inconclusive
-      comparison into an actionable multi-seed budget.
+      comparison into an actionable multi-seed budget;
+    * ``test_resolution`` — the smallest p the exact test could possibly
+      produce at this n and family size, and whether the family has ANY
+      rejection region. With seven operators (21 pairs) and five seeds the
+      exact two-sided floor is 1.0, so every pair is forced to
+      ``not_significant``; the report labels that a resolution limit
+      instead of evidence of equivalence.
 
     When ``equivalence_margin`` is not None, every testable pair ALSO
     gets a TOST equivalence test against that PRE-SPECIFIED margin
@@ -3880,6 +3950,8 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         'n_direction_fragile': 0,
         'n_boundary_sensitive': 0,
         'n_seed_influence_stable': 0,
+        'n_resolution_limited': 0,
+        'resolution': None,
         'equivalence': {
             'enabled': equivalence_margin is not None,
             'margin': equivalence_margin,
@@ -3939,6 +4011,16 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                        'common_seeds': common, **stats}
                 records.append((rec, a, b))
                 cell['pairs'][pair_key] = rec
+
+        # The exact-test floor depends on the actual family size, which is
+        # only known after every testable pair has been collected. Replace
+        # the per-comparison default (family_size=1) from summarize_paired
+        # with the family-aware record.
+        for rec, _, _ in records:
+            rec['test_resolution'] = exact_test_resolution(
+                rec['n_pairs'], alpha=alpha, family_size=len(records),
+                alternative='two-sided',
+                n_zero=rec['sign_test']['n_zero'])
 
         p_perm = [rec['permutation_test']['p_value_two_sided']
                   for rec, _, _ in records]
@@ -4011,6 +4093,11 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                 a['pairwise_equivalent_to'].append(b.get('op'))
                 b['pairwise_equivalent_to'].append(a.get('op'))
         cell['n_tests'] = len(records)
+        cell['resolution'] = _pairwise_family_resolution(
+            [rec for rec, _, _ in records], alpha)
+        cell['n_resolution_limited'] = (
+            0 if cell['resolution'] is None
+            else cell['resolution']['n_resolution_limited'])
         cell['n_significant'] = sum(
             1 for rec, _, _ in records if rec['verdict'] != 'not_significant')
         cell['n_equivalent'] = sum(
@@ -4033,6 +4120,51 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         report['n_direction_fragile'] += cell['n_direction_fragile']
         report['n_boundary_sensitive'] += cell['n_boundary_sensitive']
         report['n_seed_influence_stable'] += cell['n_seed_influence_stable']
+        report['n_resolution_limited'] += cell['n_resolution_limited']
+
+    cells_with_resolution = [
+        cell['resolution'] for cell in report['cells'].values()
+        if cell.get('resolution') is not None]
+    report['resolution'] = {
+        'family_scope': (
+            'one family per (task, n_kv) cell, exactly the pairs that were '
+            'Holm-corrected; the floor depends on the family size and on '
+            'each pair\'s common-seed count'),
+        'n_pairs': report['n_tests'],
+        'n_resolution_limited': report['n_resolution_limited'],
+        'all_pairs_testable': (
+            all(c['all_pairs_testable'] for c in cells_with_resolution)
+            if cells_with_resolution else None),
+        'any_pair_testable': (
+            any(c['any_pair_testable'] for c in cells_with_resolution)
+            if cells_with_resolution else None),
+        'max_shortfall_pairs_for_holm': (
+            max(c['max_shortfall_pairs_for_holm']
+                for c in cells_with_resolution)
+            if cells_with_resolution else None),
+        'n_later_rank_possible': sum(
+            c['n_later_rank_possible'] for c in cells_with_resolution),
+        'any_pair_later_rank_possible': (
+            any(c['any_pair_later_rank_possible']
+                for c in cells_with_resolution)
+            if cells_with_resolution else None),
+        'worst_min_attainable_p_holm': (
+            max(c['worst_min_attainable_p_holm']
+                for c in cells_with_resolution)
+            if cells_with_resolution else None),
+        'best_min_attainable_p_holm': (
+            min(c['best_min_attainable_p_holm']
+                for c in cells_with_resolution)
+            if cells_with_resolution else None),
+        'note': (
+            'Exact sign/sign-flip tests have only 2**n sign assignments, '
+            'so their p-value has a floor; Holm multiplies that floor by '
+            'the family size. When n_resolution_limited > 0 the affected '
+            'pairs cannot reject at alpha for ANY data, and their '
+            'not_significant verdict is a property of the design, not '
+            'evidence of equivalence. The continuous t-test is not subject '
+            'to this floor.'),
+    }
 
     report['seed_influence'] = {
         'method': 'leave_one_seed_out',
@@ -4061,7 +4193,9 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         'run would need at the observed effect size. A "same/practically '
         'equivalent" claim requires equivalence_verdict=equivalent from '
         'the pre-specified-margin TOST; a non-significant superiority test '
-        'alone never supports it.')
+        'alone never supports it. Read the resolution block first: a '
+        'family whose exact-test floor exceeds alpha has no rejection '
+        'region at all, so its non-significance is not a finding.')
     return report
 
 
@@ -4115,6 +4249,19 @@ def _print_pairwise_report(op_pairwise):
                 row += (f" | {pt_str:>9} | "
                         f"{rec.get('equivalence_verdict', 'n/a')}")
             print(row)
+    res = op_pairwise.get('resolution') or {}
+    n_limited = res.get('n_resolution_limited') or 0
+    if n_limited:
+        floor = res.get('worst_min_attainable_p_holm')
+        floor_str = f'{floor:.4f}' if floor is not None else 'n/a'
+        short = res.get('max_shortfall_pairs_for_holm')
+        print(f"  RESOLUTION: {n_limited}/{res.get('n_pairs', 0)} pair(s) "
+              f"cannot be the first rejection in this Holm family "
+              f"(smallest attainable adjusted p={floor_str}); "
+              f"{short} more effective pair(s) would be needed. With equal "
+              f"seed counts across the family, no rejection is possible; "
+              f"read 'not_significant' as a design limit, not evidence of "
+              f"equivalence.")
 
 
 def main():
@@ -4927,6 +5074,20 @@ def main():
             f"{op_pairwise['n_significant']}/{op_pairwise['n_tests']} "
             f"significant at Holm alpha={op_pairwise['alpha']} "
             f"({op_pairwise['n_skipped']} pair(s) skipped: <2 common seeds)")
+        _resolution = op_pairwise.get('resolution') or {}
+        if _resolution.get('n_resolution_limited'):
+            logger.warning(
+                f"  RESOLUTION LIMIT: "
+                f"{_resolution['n_resolution_limited']}/"
+                f"{_resolution['n_pairs']} pair(s) cannot be the first "
+                f"rejection in this Holm family (smallest attainable "
+                f"adjusted p="
+                f"{_resolution.get('worst_min_attainable_p_holm')!r}). "
+                f"With equal seed counts, no rejection is possible; a "
+                f"'not_significant' verdict is forced by the exact test's "
+                f"discreteness, not evidence of no difference. Add seed "
+                f"pairs or reduce the family before claiming a "
+                f"null/equivalence result.")
         if equivalence_margin is not None:
             logger.info(
                 f"  TOST equivalence (pre-specified margin="
@@ -5035,6 +5196,9 @@ def main():
     pareto_reports = {}
     cross_op_checks = {}
     for (task_name, n_kv_key), rows in groups.items():
+        cell_key = f'{task_name}/n_kv={n_kv_key}'
+        cell_res = ((op_pairwise.get('cells', {}).get(cell_key) or {})
+                    .get('resolution'))
         live = [r for r in rows if 'error' not in r
                 and r.get('mean_acc') is not None
                 and r.get('mean_train_time_s') is not None
@@ -5100,6 +5264,22 @@ def main():
                         "seed is deleted for: "
                         f"{', '.join(best_fragile_wins)} "
                         "(leave-one-seed-out; descriptive, not a test).")
+            elif (cell_res is not None
+                  and not cell_res.get('any_pair_testable')):
+                _floor = cell_res.get('worst_min_attainable_p_holm')
+                _floor_str = (f'{_floor:.4f}' if _floor is not None
+                              else 'n/a')
+                paired_claim = (
+                    f"No seed-paired Holm-corrected test CAN separate "
+                    f"{best['op']} from any other op: with "
+                    f"{cell_res.get('min_n_pairs')}-"
+                    f"{cell_res.get('max_n_pairs')} seed pairs across "
+                    f"{cell_res.get('family_size')} comparisons, the exact "
+                    f"test's smallest attainable Holm-adjusted p is "
+                    f"{_floor_str} > alpha; with equal seed counts across "
+                    f"the cell, the family has no rejection region. This is "
+                    f"a resolution limit of the design, not evidence that "
+                    f"the operators are equivalent.")
             else:
                 paired_claim = (
                     f"No seed-paired Holm-corrected test separates "
@@ -5135,6 +5315,7 @@ def main():
                 'best_op_practically_equivalent_to': (
                     best_equiv_to if equivalence_margin is not None
                     else None),
+                'family_resolution': cell_res,
                 'paired_test_note': (
                     'CI overlap is a continuity heuristic, not a test: '
                     'overlapping CIs do not imply a non-significant '

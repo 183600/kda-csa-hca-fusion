@@ -79,6 +79,25 @@ exact sign and sign-flip permutation tests and the paired t-test in
 `multi_seed_stats`; the normal approximation is slightly optimistic at the
 5-7-seed scale.
 
+### Exact-test resolution is a separate feasibility check
+
+A continuous normal/t power calculation can certify a design that the
+discrete exact test can never reject. The exact sign-flip test has only
+`2**n_effective` sign assignments, so its two-sided p floor is
+`2 / 2**n_effective`; a Holm family of `f` comparisons has a floor of
+`f` times that. `planning_report` therefore also returns
+`exact_test_resolution` (`family_testable`, `min_attainable_p_holm`,
+`min_effective_pairs_holm`, `shortfall_pairs_holm`) and an
+`exact_test_warning`, and `audit_run` adds the
+`exact_test_has_rejection_region` check. If the floor exceeds `alpha`, no
+outcome could have been significant and the run is labelled `screening`
+even when the normal power target is met; `validate_plan` also rejects a
+registry entry whose declared confirmatory budget has no exact-test
+rejection region. See
+[inference-resolution.md](inference-resolution.md) for the arithmetic and
+worked examples (the default 5-seed, 21-pair quality sweep is
+resolution-limited; the planned 11-seed, 5-contrast Exp 4 budget is not).
+
 ## Superiority and practical equivalence are different budgets
 
 The registry contains **two** pre-specified effects, not one:
