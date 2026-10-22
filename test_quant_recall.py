@@ -499,6 +499,17 @@ def test_fp8_fake_quantize_contract():
         f"{byte_row['state_bytes']}")
 
 
+def test_fp8_fp64_dynamic_range():
+    print('\nTest: FP8 fp64 dynamic range')
+    for value in (1e300, 1e-300, 5e-324):
+        x = torch.tensor([value], dtype=torch.float64)
+        dq = fake_quantize(x, FP8Spec(), ste=False)
+        ratio = (dq / x).item()
+        _ok(f'fp64 {value:.1e}: finite and inside the power-of-two band',
+            bool(torch.isfinite(dq).all()) and 0.25 <= ratio <= 2.0,
+            f'ratio={ratio:.3e}')
+
+
 def test_fp8_state_recall_probe():
     print('\nTest: FP8 state on the planted-recall probe')
     keys, values = planted_batch(16, 8, seed=0, device='cpu')
@@ -531,6 +542,7 @@ _TEST_FUNCS = [
     test_quant_recall_report_rows,
     test_fp8_spec_and_grid,
     test_fp8_fake_quantize_contract,
+    test_fp8_fp64_dynamic_range,
     test_fp8_state_recall_probe,
 ]
 

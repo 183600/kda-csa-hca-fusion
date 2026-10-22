@@ -315,9 +315,15 @@ def _fp8_group_scale(groups: torch.Tensor, spec: FP8Spec) -> torch.Tensor:
         scale = torch.where(amax > 0, amax / spec.max_finite,
                             torch.ones_like(amax))
         if spec.power_of_two:
-            tiny = torch.finfo(groups.dtype).tiny
-            exp = torch.ceil(torch.log2(scale.clamp(min=tiny)))
-            exp = exp.clamp(-126.0, 127.0)
+            finfo = torch.finfo(groups.dtype)
+            if groups.dtype == torch.float64:
+                min_scale = finfo.tiny * finfo.eps
+                exp_min, exp_max = -1074.0, 1023.0
+            else:
+                min_scale = finfo.tiny
+                exp_min, exp_max = -126.0, 127.0
+            exp = torch.ceil(torch.log2(scale.clamp(min=min_scale)))
+            exp = exp.clamp(exp_min, exp_max)
             scale = torch.exp2(exp)
     return scale
 
