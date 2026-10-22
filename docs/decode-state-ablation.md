@@ -95,8 +95,13 @@ unsharded one-shot forward.
   initialization and the geometry; the contract is the sign of the effect
   (`load_bearing`) plus the exact prefix.
 * `memory_state` and `memory_lookback` are route-neutral: the same helper
-  drops the KDA, Mamba-2, or RWKV-7 state through ``reset_conv_state``. The
-  reference tests use the KDA route.
+  drops the KDA, Mamba-2, or RWKV-7 state through ``reset_conv_state``.
+  The regression now runs the full negative-control matrix (all four state
+  families × both drop modes) plus the causality audit on **all three**
+  shipped routes. RWKV-7's reference port initializes ``o_proj`` to zero
+  (identity-in-residual at init), which makes its output identically zero
+  and any state drop look inert; the RWKV arm installs a deterministic
+  nonzero output projection first so the control is non-vacuous.
 * The audit calls the reference decoder token-by-token, so it is intentionally
   small. It is meant to run in CI and on a laptop, not to replace Exp 6's
   decode benchmark.

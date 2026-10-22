@@ -548,7 +548,8 @@ def test_hybrid_streaming_tp_contract(device):
         tp.hybrid_stack_forward_tp_streaming(mamba_stack, x, 2)
 
 
-def test_hybrid_decode_state_ablation(device):
+@pytest.mark.parametrize('memory_type', ['kda', 'mamba2', 'rwkv7'])
+def test_hybrid_decode_state_ablation(device, memory_type):
     """Decode caches are load-bearing, and future tokens cannot leak.
 
     Matches the counterfactual controls in ``decode_state_ablation``:
@@ -556,6 +557,13 @@ def test_hybrid_decode_state_ablation(device):
     must change the suffix, while the prefill prefix is untouched.  The
     causality audit additionally requires a non-vacuous future
     perturbation and an incremental prefix equal to the one-shot forward.
+
+    Runs on every shipped memory route. RWKV-7's port initializes
+    ``o_proj`` to zero (identity-in-residual at init); without a nonzero
+    readout the mixer output is identically zero, so the state controls
+    would pass vacuously. The RWKV arm therefore installs a deterministic
+    nonzero output projection before running the audit; KDA/Mamba-2 use
+    their ordinary random init.
     """
     from decode_state_ablation import (DECODE_STATE_PARTS,
                                        decode_causality_audit,
@@ -564,7 +572,12 @@ def test_hybrid_decode_state_ablation(device):
 
     torch.manual_seed(907)
     decoder = HybridDecoding(
-        d_model=32, total_layers=5, csa_topk=100).to(device).eval()
+        d_model=32, total_layers=5, csa_topk=100,
+        memory_type=memory_type).to(device).eval()
+    if memory_type == 'rwkv7':
+        with torch.no_grad():
+            for layer in decoder.model.memory_layers:
+                torch.nn.init.normal_(layer.o_proj.weight, std=0.1)
     x = torch.randn(2, 14, 32, device=device) * 0.4
     with torch.no_grad():
         ablation = decode_state_ablation(decoder, x, prefill_len=8)
