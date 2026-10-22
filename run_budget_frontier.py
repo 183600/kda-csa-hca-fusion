@@ -623,6 +623,15 @@ def audit_join_sources(source_records):
     backend_keys = sorted({key for r in present
                            for key in (r.get('backends') or {})})
     backend_mismatches = []
+    backend_missing = []
+    for r in present:
+        present_keys = set((r.get('backends') or {}))
+        missing_keys = sorted(set(backend_keys) - present_keys)
+        if missing_keys:
+            backend_missing.append({
+                'source': r['source'],
+                'missing': missing_keys,
+            })
     for key in backend_keys:
         values = {r['source']: (r.get('backends') or {})[key]
                   for r in present if key in (r.get('backends') or {})}
@@ -631,7 +640,10 @@ def audit_join_sources(source_records):
                 'backend': key,
                 'values': values,
             })
-    backends_consistent = not backend_mismatches
+    # Missing backend metadata is not agreement: a source with an empty
+    # backends block cannot be compared with sources that resolved their
+    # kda/mamba/rwkv backends. This mirrors the partial-seed evidence rule.
+    backends_consistent = not backend_mismatches and not backend_missing
 
     if not present:
         status = 'no_sources'
@@ -678,9 +690,14 @@ def audit_join_sources(source_records):
             f'{missing_seed_sources}); cross-source seed overlap cannot be '
             'verified')
     if status == 'mixed_backends':
-        warnings.append(
-            'join sources resolved different memory backends: '
-            f'{backend_mismatches}')
+        if backend_missing:
+            warnings.append(
+                'join sources have missing backend metadata: '
+                f'{backend_missing}; backend agreement cannot be verified')
+        if backend_mismatches:
+            warnings.append(
+                'join sources resolved different memory backends: '
+                f'{backend_mismatches}')
     if status == 'comparable_dirty_tree':
         warnings.append(
             'join sources share a git commit but were produced from a '
@@ -701,6 +718,7 @@ def audit_join_sources(source_records):
         'n_shared_seeds': len(shared_seeds),
         'backends_consistent': backends_consistent,
         'backend_mismatches': backend_mismatches,
+        'backend_missing': backend_missing,
         'warnings': warnings,
     }
     audit_rows = [_source_audit_row(r) for r in records]

@@ -750,6 +750,23 @@ def test_exp9_source_audit_flags_dirty_tree_and_backend_mix():
         len(summary['backend_mismatches']) == 1
         and summary['backend_mismatches'][0]['backend']
         == 'kda_backend_resolved', summary['backend_mismatches'])
+    missing = [_audit_record('exp4_mqar'),
+               _audit_record('exp5_ablation', backends={}),
+               _audit_record('exp8_mechanism_ablation')]
+    _rows, summary = audit_join_sources(missing)
+    _ok('missing backend metadata blocks a comparable join',
+        summary['status'] == 'mixed_backends'
+        and summary['comparable_for_ranking'] is False,
+        summary['status'])
+    _ok('missing backend metadata is named',
+        summary['backend_missing'] == [{
+            'source': 'exp5_ablation',
+            'missing': ['kda_backend_resolved', 'mamba_backend_resolved',
+                        'rwkv_backend_resolved'],
+        }], summary['backend_missing'])
+    _ok('the warning explains the missing evidence',
+        any('missing backend metadata' in w for w in summary['warnings']),
+        summary['warnings'])
 
 
 def test_exp9_load_join_source_reads_exp5_sidecar():
