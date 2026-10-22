@@ -425,7 +425,17 @@ def run_sweep(*, cases=None, dtypes, seeds, seq_len: int = 64,
     dts = [as_torch_dtype(d) for d in dtypes]
     if not dts:
         raise ValueError('dtypes must be a non-empty iterable.')
-    seed_list = [int(s) for s in seeds]
+    # Seeds are part of the reproducibility contract: silently truncating
+    # ``2.9 -> 2`` (or accepting ``True -> 1``) would run a different draw
+    # than the caller recorded. Require exact ints, like the rest of the
+    # repo's seed/count arguments.
+    seed_list = []
+    for i, seed in enumerate(seeds):
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(
+                f'seeds[{i}]={seed!r} must be an exact int, got '
+                f'{type(seed).__name__}.')
+        seed_list.append(seed)
     if not seed_list:
         raise ValueError('seeds must be a non-empty iterable.')
     rows = []

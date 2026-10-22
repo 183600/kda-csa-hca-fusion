@@ -276,6 +276,17 @@ def test_injected_contract_violations_and_failures():
     _ok('failures() explains the error',
         all('errored' in line for line in ps.failures(summary)), '')
 
+    # Seeds are part of the reproducibility contract: a float/bool seed must
+    # not be truncated into a different draw.
+    for bad_seed in (True, 0.5, '0', None):
+        raised = False
+        try:
+            ps.run_sweep(cases=['kda'], dtypes=[torch.float16],
+                         seeds=[bad_seed], seq_len=8)
+        except (TypeError, ValueError):
+            raised = True
+        _ok(f'run_sweep rejects seed {bad_seed!r}', raised, '')
+
 
 # --- seed-sweep aggregation -------------------------------------------------
 
