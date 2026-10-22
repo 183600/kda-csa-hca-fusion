@@ -230,6 +230,17 @@ def test_row_contract_exp6_cache_flags_are_honest():
          if r['op'] == 'kda' else r for r in rows],
         meta)
     assert any('prefill_cache_build' in v for v in violations), violations
+    # A CI block with the median missing must be reported, not crash the
+    # validator with float(None).
+    broken = dict(_exp6_row('kda'), decode_std_ms=0.1,
+                  decode_q10_ms=0.05, decode_q90_ms=0.2,
+                  decode_ci95_low_ms=0.04, decode_ci95_high_ms=0.21,
+                  decode_ci95_halfwidth_ms=0.085, decode_cv=0.5,
+                  decode_n=3, timing_ci_method='percentile_bootstrap_median',
+                  timing_bootstrap_reps=2000)
+    del broken['median_decode_ms_per_token']
+    violations = rs.validate_rows('exp6_decoding', [broken], meta)
+    assert any('median_decode_ms_per_token' in v for v in violations), violations
 
 
 def test_row_contract_exp6_decode_state_certificate_fields():
@@ -766,6 +777,11 @@ def test_row_contract_latency_profile_parity_gate():
         'mamba2_scan_latency_profile',
         [_profile_row(mode='chunked', chunk_size=[])], meta)
     assert any('chunk_size' in v for v in violations), violations
+    # A non-numeric metadata tolerance must be reported once, not raised.
+    violations = rs.validate_rows(
+        'mamba2_scan_latency_profile', [_profile_row()],
+        {'parity_tol': 'not-a-number'})
+    assert any('parity_tol' in v for v in violations), violations
 
 
 def _exp9_contract_rows():

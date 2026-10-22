@@ -734,9 +734,14 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
                 if all(_finite_number(v) for v in vals):
                     q10, q90, lo, hi, half = map(float, vals)
                     med = row.get(median_key)
-                    if not (q10 <= float(med) <= q90):
-                        out.append(f'{where}: {prefix} median outside '
-                                   f'[q10, q90]')
+                    # A missing/non-finite median is already reported by
+                    # the required-field loop above; comparing it here
+                    # would raise TypeError and abort the whole validation
+                    # pass instead of returning the violations.
+                    if _finite_number(med):
+                        if not (q10 <= float(med) <= q90):
+                            out.append(f'{where}: {prefix} median outside '
+                                       f'[q10, q90]')
                     if lo > hi:
                         out.append(f'{where}: {prefix} CI bounds reversed')
                     if abs(half - (hi - lo) / 2.0) > 1e-9:
@@ -1500,6 +1505,11 @@ def _validate_latency_profile_rows(rows: list, metadata: dict) -> list[str]:
     seen: set = set()
     meta = metadata if isinstance(metadata, dict) else {}
     tol = meta.get('parity_tol')
+    tol_valid = tol is None or _finite_number(tol)
+    if not tol_valid:
+        out.append(
+            "metadata['parity_tol'] must be a finite number or null, got "
+            f'{tol!r}')
     for i, row in enumerate(rows):
         where = f'row[{i}]'
         if not isinstance(row, dict):
@@ -1554,7 +1564,8 @@ def _validate_latency_profile_rows(rows: list, metadata: dict) -> list[str]:
         ok = row.get('parity_ok')
         if not isinstance(ok, bool):
             out.append(f"{where}: 'parity_ok' must be a bool, got {ok!r}")
-        elif isinstance(finite, bool) and _finite_number(parity):
+        elif (isinstance(finite, bool) and _finite_number(parity)
+              and tol_valid):
             want = finite and (tol is None or float(parity) <= float(tol))
             if ok != want:
                 out.append(f'{where}: parity_ok={ok} contradicts finite/'
