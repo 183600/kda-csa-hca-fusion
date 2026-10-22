@@ -915,3 +915,66 @@ if __name__ == '__main__':
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()
     test_csa_hca_validate_rope_base_even_when_rope_is_disabled()
     print('all input-validation tests passed')
+
+
+def test_rwkv_malformed_shift_is_rejected_not_silently_dropped():
+    from ops_rwkv import Rwkv7Mixer
+    mixer = Rwkv7Mixer(SimpleNamespace(d_model=64, rwkv_head_dim=16))
+    x = torch.randn(1, 1, 64)
+    try:
+        mixer.forward_functional(x, None, torch.randn(1, 2, 64))
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('malformed RWKV shift state was silently dropped')
+
+
+def test_functional_stack_rejects_wrong_rank_memory_state():
+    from ops_fused import HybridAttentionStack, HybridConfig
+    cfg = HybridConfig(
+        d_model=8, n_heads_qk=1, n_heads_v=1, head_dim_k=4, head_dim_v=4,
+        csa_m=2, csa_topk=2, csa_nh=1, csa_c=4, csa_dc=4, csa_nIh=1,
+        csa_cI=2, csa_sliding_window=1, hca_m2=2, hca_nh=1, hca_c=4,
+        hca_dc=4, hca_sliding_window=1, n_csa=1, n_hca=1)
+    stack = HybridAttentionStack(cfg, 3)
+    try:
+        stack.forward_functional(torch.randn(1, 2, 8), torch.zeros(1), None)
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('wrong-rank memory state was accepted')
+
+
+def test_csa_validates_weights_before_the_empty_sequence_return():
+    from ops_csa import naive_csa
+    d, c, c_I, m, nh, nIh, dc = 8, 4, 2, 2, 2, 2, 4
+    mk = lambda *shape: torch.randn(*shape)
+    args = [mk(c, d + 1), mk(c, d), mk(c, d), mk(c, d), mk(m, c),
+            mk(m, c), mk(dc, d), mk(c * nh, dc), mk(c_I * nIh, dc),
+            mk(nIh, d), mk(c_I, d), mk(c_I, d), mk(m, c_I)]
+    kwargs = dict(m=m, topk=2, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc)
+    for T in (0, 4):
+        try:
+            naive_csa(torch.randn(1, T, d), *args, **kwargs)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(
+                f'invalid CSA weight geometry accepted at T={T}')
+
+
+def test_csa_cache_rejects_wrong_indexer_feature_width():
+    cache = CSADecodingCache(1, 4, 3, 2, 2, torch.device('cpu'),
+                             torch.float32)
+    proj = ([torch.randn(1, 2, 4) for _ in range(4)]
+            + [torch.randn(1, 2, 3) for _ in range(2)])
+    cache.append_step(*proj, torch.randn(2, 4), torch.randn(2, 4),
+                      torch.randn(2, 3))
+    try:
+        cache.forward_step(torch.randn(1, 1, 2, 4),
+                           torch.randn(1, 1, 2, 2),
+                           torch.randn(1, 1, 2), topk=1, nh=2, nIh=2)
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('wrong q_idx feature width was accepted')

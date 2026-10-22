@@ -1174,23 +1174,20 @@ class CSADecodingCache:
             raise ValueError(
                 f"CSADecodingCache.append_step: c={c} does not match "
                 f"cache's c={self.c}.")
-        if K_idx_new.shape[-1] != self.c_I:
-            raise ValueError(
-                f"CSADecodingCache.append_step: c_I={K_idx_new.shape[-1]} "
-                f"does not match cache's c_I={self.c_I}.")
-        # Validate T_new consistency across ALL inputs, not just
-        # ``Ca_new``: a mismatch (e.g. ``Ca_new`` has T_new=4 but
-        # ``Cb_new`` has T_new=3) would otherwise raise deep inside the
-        # per-token Python loop with a cryptic IndexError.
-        for _name, _t in [
-            ('Cb_new', Cb_new), ('Za_new', Za_new), ('Zb_new', Zb_new),
-            ('K_idx_new', K_idx_new), ('Z_idx_new', Z_idx_new),
+        # Validate every projection's full shape, not only T_new: a
+        # width-1 feature dim would otherwise be silently broadcast by the
+        # compression helper instead of failing like the prefill path.
+        for _name, _t, _width in [
+            ('Cb_new', Cb_new, self.c), ('Za_new', Za_new, self.c),
+            ('Zb_new', Zb_new, self.c),
+            ('K_idx_new', K_idx_new, self.c_I),
+            ('Z_idx_new', Z_idx_new, self.c_I),
         ]:
-            if _t.shape[1] != T_new:
+            if _t.dim() != 3 or tuple(_t.shape) != (B, T_new, _width):
                 raise ValueError(
-                    f"CSADecodingCache.append_step: {_name}.shape[1]="
-                    f"{_t.shape[1]} does not match Ca_new.shape[1]="
-                    f"{T_new}. All inputs must share the same T_new.")
+                    f"CSADecodingCache.append_step: {_name}.shape="
+                    f"{tuple(_t.shape)} does not match the expected "
+                    f"{(B, T_new, _width)}.")
         # Cast to cache dtype/device defensively.
         Ca_new = _to_cache(Ca_new, self.dtype, self.device)
         Cb_new = _to_cache(Cb_new, self.dtype, self.device)
@@ -1214,12 +1211,12 @@ class CSADecodingCache:
             k_i = K_idx_new[:, i:i+1]  # [B, 1, c_I]
             z_i = Z_idx_new[:, i:i+1]
             # Append to accumulator.
-            self._acc_Ca.append(ca_i)
-            self._acc_Cb.append(cb_i)
-            self._acc_Za.append(za_i)
-            self._acc_Zb.append(zb_i)
-            self._acc_K_idx.append(k_i)
-            self._acc_Z_idx.append(z_i)
+            self._acc_Ca.append(ca_i.clone())
+            self._acc_Cb.append(cb_i.clone())
+            self._acc_Za.append(za_i.clone())
+            self._acc_Zb.append(zb_i.clone())
+            self._acc_K_idx.append(k_i.clone())
+            self._acc_Z_idx.append(z_i.clone())
             self._n_tokens_seen += 1
             # Append Ca to the SW ring buffer. When normalize_qk=True
             # (the default), normalize with ``qk_norm_mode`` (L2 by
@@ -1502,12 +1499,18 @@ class CSADecodingCache:
         self._prev_Zb = last_Zb.detach().clone()
         # Leave the tokens past the last full block in the accumulator.
         if tail:
-            self._acc_Ca = list(Ca_new[:, -tail:].split(1, dim=1))
-            self._acc_Cb = list(Cb_new[:, -tail:].split(1, dim=1))
-            self._acc_Za = list(Za_new[:, -tail:].split(1, dim=1))
-            self._acc_Zb = list(Zb_new[:, -tail:].split(1, dim=1))
-            self._acc_K_idx = list(K_idx_new[:, -tail:].split(1, dim=1))
-            self._acc_Z_idx = list(Z_idx_new[:, -tail:].split(1, dim=1))
+            self._acc_Ca = [t.clone() for t in
+                            Ca_new[:, -tail:].split(1, dim=1)]
+            self._acc_Cb = [t.clone() for t in
+                            Cb_new[:, -tail:].split(1, dim=1)]
+            self._acc_Za = [t.clone() for t in
+                            Za_new[:, -tail:].split(1, dim=1)]
+            self._acc_Zb = [t.clone() for t in
+                            Zb_new[:, -tail:].split(1, dim=1)]
+            self._acc_K_idx = [t.clone() for t in
+                               K_idx_new[:, -tail:].split(1, dim=1)]
+            self._acc_Z_idx = [t.clone() for t in
+                               Z_idx_new[:, -tail:].split(1, dim=1)]
         else:
             self._acc_Ca = []
             self._acc_Cb = []
@@ -1578,9 +1581,15 @@ class CSADecodingCache:
             raise ValueError(
                 f"CSADecodingCache.forward_step: batch size {B} does not "
                 f"match cache's B={self.B}.")
-        if q.shape[2] != nh:
+        if q.dim() != 4 or q.shape[2] != nh:
             raise ValueError(
-                f"q.shape[2]={q.shape[2]} does not match nh={nh}.")
+                f'CSADecodingCache.forward_step: q shape '
+                f'{tuple(q.shape)} does not match a 4-D query with nh={nh}.')
+        if q_idx.dim() != 4 or q_idx.shape[-1] != self.c_I:
+            raise ValueError(
+                f'CSADecodingCache.forward_step: q_idx shape '
+                f'{tuple(q_idx.shape)} does not match a 4-D indexer query '
+                f'with feature width c_I={self.c_I}.')
         if q_idx.shape[2] != nIh:
             raise ValueError(
                 f"q_idx.shape[2]={q_idx.shape[2]} does not match nIh={nIh}.")
@@ -2018,6 +2027,11 @@ class CSADecodingCache:
             raise ValueError(
                 f'CSADecodingCache.forward_chunk: q shape {tuple(q.shape)} '
                 f'does not match {(B, T_new, nh, c)}.')
+        if q_idx.dim() != 4 or q_idx.shape[-1] != self.c_I:
+            raise ValueError(
+                f'CSADecodingCache.forward_chunk: q_idx shape '
+                f'{tuple(q_idx.shape)} does not match a 4-D indexer query '
+                f'with feature width c_I={self.c_I}.')
         if q_idx.shape[0] != B or q_idx.shape[1] != T_new \
                 or q_idx.shape[2] != nIh:
             raise ValueError(
@@ -2504,11 +2518,13 @@ class HCADecodingCache:
             raise ValueError(
                 f"HCADecodingCache.append_step: c={c} does not match "
                 f"cache's c={self.c}.")
-        # Validate T_new consistency between C_new and Z_new.
-        if Z_new.shape[1] != T_new:
+        # Validate Z_new's full shape; a width-1 feature dim would
+        # otherwise be silently broadcast by the compression helper.
+        if Z_new.dim() != 3 or tuple(Z_new.shape) != (B, T_new, self.c):
             raise ValueError(
-                f"HCADecodingCache.append_step: Z_new.shape[1]="
-                f"{Z_new.shape[1]} does not match C_new.shape[1]={T_new}.")
+                f"HCADecodingCache.append_step: Z_new.shape="
+                f"{tuple(Z_new.shape)} does not match the expected "
+                f"{(B, T_new, self.c)}.")
         C_new = _to_cache(C_new, self.dtype, self.device)
         Z_new = _to_cache(Z_new, self.dtype, self.device)
         if T_new > 1:
@@ -2518,8 +2534,8 @@ class HCADecodingCache:
         for i in range(T_new):
             c_i = C_new[:, i:i+1]    # [B, 1, c]
             z_i = Z_new[:, i:i+1]
-            self._acc_C.append(c_i)
-            self._acc_Z.append(z_i)
+            self._acc_C.append(c_i.clone())
+            self._acc_Z.append(z_i.clone())
             self._n_tokens_seen += 1
             if self._sw is not None:
                 # Run the SW key normalize/rotate path in the cache's
@@ -2679,8 +2695,10 @@ class HCADecodingCache:
         new_block_indices = list(range(block_idx0, block_idx0 + n_new))
         # Leave the tokens past the last full block in the accumulator.
         if tail:
-            self._acc_C = list(C_new[:, -tail:].split(1, dim=1))
-            self._acc_Z = list(Z_new[:, -tail:].split(1, dim=1))
+            self._acc_C = [t.clone() for t in
+                           C_new[:, -tail:].split(1, dim=1)]
+            self._acc_Z = [t.clone() for t in
+                           Z_new[:, -tail:].split(1, dim=1)]
         else:
             self._acc_C = []
             self._acc_Z = []

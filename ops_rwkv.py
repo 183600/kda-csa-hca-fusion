@@ -873,10 +873,16 @@ class Rwkv7Mixer(nn.Module):
         # (mirrors the KDA lookback guards).
         shift = conv_state
         if shift is not None:
-            if shift.dim() != 3 or shift.shape != (B, 1, d):
-                # A stale shift state from a different geometry/batch:
-                # drop it (per-sequence state, cannot be reused).
+            if shift.dim() != 3 or shift.shape[0] != B:
+                # A state from a different batch cannot be reused; drop it.
                 shift = None
+            elif tuple(shift.shape) != (B, 1, d):
+                # Same batch but a malformed geometry is a caller error,
+                # not a fresh sequence (mirrors the T=0 path).
+                raise ValueError(
+                    'Rwkv7Mixer: shift state shape='
+                    f'{tuple(shift.shape)} does not match the expected '
+                    f'{(B, 1, d)} ([B, 1, d]).')
             elif shift.device != x.device or shift.dtype != x.dtype:
                 shift = shift.to(device=x.device, dtype=x.dtype)
                 if detach_lookback:

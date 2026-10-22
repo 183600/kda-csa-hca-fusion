@@ -282,9 +282,11 @@ def _cos_sin_by_identity(
                str(device), angle_dtype)
         entry = _IDENTITY_TABLE_CACHE.get(key)
         if entry is not None:
-            ref, cos, sin = entry
-            if ref() is positions:
+            ref, cos, sin, snapshot = entry
+            if ref() is positions and torch.equal(snapshot, positions):
                 return cos, sin
+            # Either the object was collected or its contents changed
+            # without a version bump (``pos.data.add_(...)``).
             _IDENTITY_TABLE_CACHE.pop(key, None)
     with _normal_tensor_scope():
         pos_f = positions.to(device=device, dtype=angle_dtype)
@@ -295,7 +297,12 @@ def _cos_sin_by_identity(
     if cacheable and cos.numel() + sin.numel() <= _TABLE_CACHE_MAX_ELEMS:
         if len(_IDENTITY_TABLE_CACHE) >= 8:
             _IDENTITY_TABLE_CACHE.clear()
-        _IDENTITY_TABLE_CACHE[key] = (_weakref.ref(positions), cos, sin)
+        # A snapshot catches ``.data`` mutations, which do not bump
+        # ``_version``; the identity/version key alone would return a
+        # stale table for a reused position buffer.
+        snapshot = positions.detach().clone()
+        _IDENTITY_TABLE_CACHE[key] = (_weakref.ref(positions), cos, sin,
+                                      snapshot)
     return cos, sin
 
 

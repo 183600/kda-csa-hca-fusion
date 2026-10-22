@@ -16,7 +16,6 @@ and small-scale experiments; it is NOT the production kernel.
 
 from __future__ import annotations
 
-import weakref
 
 import math
 
@@ -1411,54 +1410,17 @@ def csa_lightning_indexer(
     return idx
 
 
-# Cached concatenation of the 6 KV/indexer projection weights used by
-# ``naive_csa(fuse_projections=True)``. The concatenated tensor is only
-# reused while every source weight is STILL THE SAME TENSOR at the SAME
-# VERSION (an in-place optimizer update bumps ``_version``) and autograd is
-# disabled — while a graph is recorded the per-forward ``cat`` is kept so
-# backward sees the identical node. Weak references avoid pinning a
-# discarded model's parameters in memory.
-_FUSED_WEIGHT_CACHE: dict | None = None
-
-
 def _fused_projection_weight(weights: tuple) -> torch.Tensor:
-    """Return a cached ``cat(weights, dim=0)`` for inference forwards."""
-    global _FUSED_WEIGHT_CACHE
-    # Build ordinary tensors even when this runs under ``torch.inference_mode``
-    # (see ``ops_cache.normal_tensor_scope``): a cached inference tensor has no
-    # version counter, so it can neither be validated nor safely reused by
-    # later calls outside inference mode. ``no_grad`` is explicit because
-    # leaving inference mode restores the ambient grad mode, which may
-    # otherwise record a graph for parameters.
-    if any(w.is_inference() for w in weights):
-        # Inference tensors created inside ``torch.inference_mode()`` (e.g. a
-        # model constructed under inference mode) have no version counter.
-        # Reading ``_version`` raises, and their contents cannot be validated
-        # across calls, so skip the cache and build the identical
-        # concatenation directly.
-        with normal_tensor_scope(), torch.no_grad():
-            return torch.cat(list(weights), dim=0)
-    entry = _FUSED_WEIGHT_CACHE
-    if entry is not None:
-        refs, versions, ptrs, shapes, combined = entry
-        if (len(refs) == len(weights)
-                and all(r() is w for r, w in zip(refs, weights))
-                and versions == tuple(w._version for w in weights)
-                and ptrs == tuple(w.data_ptr() for w in weights)
-                and shapes == tuple(w.shape for w in weights)
-                and combined.dtype == weights[0].dtype
-                and combined.device == weights[0].device):
-            return combined
+    """Return ``cat(weights, dim=0)`` for an inference forward.
+
+    A cross-call cache keyed on tensor identity / ``_version`` is unsafe:
+    ``weight.data.mul_(...)`` (and checkpoint refits) change the values
+    without bumping ``_version``, so a later forward would silently reuse
+    stale weights. The concatenation must therefore be rebuilt per call;
+    the fused single matmul (the actual speed-up) is unchanged.
+    """
     with normal_tensor_scope(), torch.no_grad():
-        combined = torch.cat(list(weights), dim=0)
-    _FUSED_WEIGHT_CACHE = (
-        tuple(weakref.ref(w) for w in weights),
-        tuple(w._version for w in weights),
-        tuple(w.data_ptr() for w in weights),
-        tuple(w.shape for w in weights),
-        combined,
-    )
-    return combined
+        return torch.cat(list(weights), dim=0)
 
 
 def naive_csa(
@@ -1653,6 +1615,24 @@ def naive_csa(
             f"naive_csa: rope_base={rope_base!r} must be a finite positive "
             f"number")
     device = H.device
+    for _w_name, _w in [
+        ('W_aKV', W_aKV), ('W_bKV', W_bKV), ('W_aZ', W_aZ), ('W_bZ', W_bZ),
+        ('W_KV_idx', W_KV_idx), ('W_Z_idx', W_Z_idx),
+    ]:
+        if _w.device != H.device:
+            raise ValueError(
+                f"naive_csa: {_w_name}.device={_w.device} does not match "
+                f"H.device={H.device}. All weights must be on the same "
+                f"device as the input.")
+        if _w.dtype != H.dtype:
+            raise ValueError(
+                f"naive_csa: {_w_name}.dtype={_w.dtype} does not match "
+                f"H.dtype={H.dtype}. All weights must share the input's "
+                f"dtype (cast before calling if needed).")
+        if _w.shape[1] != d:
+            raise ValueError(
+                f"naive_csa: {_w_name}.shape={tuple(_w.shape)} — second dim "
+                f"(in_features) must equal d={d} (H.shape[-1]).")
     # Degenerate case: empty sequence. With n_blocks=0 the downstream
     # ``csa_compress_kv_overlapped`` cannot broadcast the [B, n_blocks, m, c]
     # reshape against the [m, c] positional bias (``Expected size 0 but got
@@ -1715,24 +1695,6 @@ def naive_csa(
     # We add a defensive check so a misconfigured caller gets a clear error
     # instead of a cryptic ``Expected all tensors to be on the same device``
     # from inside ``torch.cat``.
-    for _w_name, _w in [
-        ('W_aKV', W_aKV), ('W_bKV', W_bKV), ('W_aZ', W_aZ), ('W_bZ', W_bZ),
-        ('W_KV_idx', W_KV_idx), ('W_Z_idx', W_Z_idx),
-    ]:
-        if _w.device != H.device:
-            raise ValueError(
-                f"naive_csa: {_w_name}.device={_w.device} does not match "
-                f"H.device={H.device}. All weights must be on the same "
-                f"device as the input.")
-        if _w.dtype != H.dtype:
-            raise ValueError(
-                f"naive_csa: {_w_name}.dtype={_w.dtype} does not match "
-                f"H.dtype={H.dtype}. All weights must share the input's "
-                f"dtype (cast before calling if needed).")
-        if _w.shape[1] != d:
-            raise ValueError(
-                f"naive_csa: {_w_name}.shape={tuple(_w.shape)} — second dim "
-                f"(in_features) must equal d={d} (H.shape[-1]).")
     if fuse_projections:
         # Concatenate all 6 weights along the out_features axis (dim=0). The
         # ``split_sizes`` list below MUST match this ordering — if you add or

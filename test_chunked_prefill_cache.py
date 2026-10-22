@@ -412,3 +412,44 @@ def test_sliding_window_ring_buffer_get_is_a_snapshot_by_default():
     held_empty = empty.get()
     empty.append(torch.tensor([[[1.0]]]))
     assert held_empty.numel() == 0
+
+
+def test_partial_block_accumulators_own_their_tokens():
+    from ops_decoding_cache import CSADecodingCache, HCADecodingCache
+    B, c, c_I, m, win = 1, 2, 2, 2, 2
+    Ba = torch.randn(m, c)
+    Bb = torch.randn(m, c)
+    Bi = torch.randn(m, c_I)
+
+    def csa_tok(value):
+        return ([torch.full((B, 1, c), float(value)) for _ in range(4)]
+                + [torch.full((B, 1, c_I), float(value)) for _ in range(2)])
+
+    cache_a = CSADecodingCache(B, c, c_I, m, win, torch.device('cpu'),
+                               torch.float32)
+    ins = csa_tok(1.0)
+    cache_a.append_step(*ins, Ba, Bb, Bi)
+    for tensor in ins:
+        tensor.fill_(9.0)
+    cache_a.append_step(*csa_tok(2.0), Ba, Bb, Bi)
+    cache_b = CSADecodingCache(B, c, c_I, m, win, torch.device('cpu'),
+                               torch.float32)
+    cache_b.append_step(*csa_tok(1.0), Ba, Bb, Bi)
+    cache_b.append_step(*csa_tok(2.0), Ba, Bb, Bi)
+    assert torch.equal(cache_a.C_comp, cache_b.C_comp)
+
+    def hca_tok(value):
+        return [torch.full((B, 1, c), float(value)) for _ in range(2)]
+
+    hca_a = HCADecodingCache(B, c, m, win, torch.device('cpu'),
+                             torch.float32)
+    ins = hca_tok(1.0)
+    hca_a.append_step(*ins, Ba)
+    for tensor in ins:
+        tensor.fill_(9.0)
+    hca_a.append_step(*hca_tok(2.0), Ba)
+    hca_b = HCADecodingCache(B, c, m, win, torch.device('cpu'),
+                             torch.float32)
+    hca_b.append_step(*hca_tok(1.0), Ba)
+    hca_b.append_step(*hca_tok(2.0), Ba)
+    assert torch.equal(hca_a.C_comp, hca_b.C_comp)

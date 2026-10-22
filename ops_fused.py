@@ -1704,6 +1704,12 @@ class HybridAttentionStack(nn.Module):
         """
         stacked = kda_state
         if stacked is not None:
+            if stacked.dim() != 5:
+                raise ValueError(
+                    'HybridAttentionStack.forward_functional: stacked '
+                    'memory state must have shape '
+                    '[n_layers, B, HV, K, V], got '
+                    f'{tuple(stacked.shape)}.')
             # Batch dim is axis 1 (axis 0 is the per-layer index).
             if stacked.shape[1] != x.shape[0]:
                 logger.debug(

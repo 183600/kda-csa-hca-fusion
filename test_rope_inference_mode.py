@@ -329,3 +329,14 @@ if __name__ == '__main__':
     test_naive_csa_hca_inference_mode_long_rope()
     test_empty_positions_still_validate_rope_geometry()
     print('all RoPE inference-mode regression tests passed')
+
+
+def test_long_position_cache_sees_data_mutation():
+    x = torch.randn(1, 16, 4, 8)
+    pos = torch.arange(16, dtype=torch.long)
+    first = partial_rope(x, pos, 8)
+    pos.data.add_(5)
+    mutated = partial_rope(x, pos, 8)
+    fresh = partial_rope(x, torch.arange(5, 21, dtype=torch.long), 8)
+    assert not torch.equal(first, mutated)
+    assert torch.equal(mutated, fresh)
