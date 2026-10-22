@@ -394,3 +394,33 @@ def test_near_duplicate_audit_accepts_iterators_and_validates_window_args():
         pass
     else:  # pragma: no cover
         raise AssertionError('tokenizer without encode() was accepted')
+
+
+def test_data_probe_geometry_requires_exact_integers():
+    tok = _FallbackCharTokenizer()
+    for bad_seq_len in (0, 1.5, True):
+        try:
+            clean_lm_texts(['a real document'], tok, bad_seq_len)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(
+                f'invalid cleaning seq_len accepted: {bad_seq_len!r}')
+    for bad_min_tokens in (2.5, True):
+        try:
+            clean_lm_texts(['a real document'], tok, 1024,
+                           min_tokens=bad_min_tokens)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(
+                f'invalid min_tokens accepted: {bad_min_tokens!r}')
+    for kwargs in ({'n_probe': 1.5}, {'n_probe': -1},
+                   {'max_chars_per_text': 0},
+                   {'max_chars_per_text': True}):
+        try:
+            _texts_fingerprint(['a', 'b'], **kwargs)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'invalid fingerprint geometry accepted: {kwargs}')

@@ -472,6 +472,8 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
     JSON-serializable and go straight into the run record.
     """
     texts = list(texts)
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    min_tokens = _exact_int_arg('min_tokens', min_tokens, minimum=0)
     clean, seen_texts, seen_normalized, seen_windows = [], set(), set(), set()
     clean_ids = [] if dedup_near else None
     n_nonfinite = n_empty = n_duplicates = 0
@@ -943,6 +945,8 @@ def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
     reported in the run record and never used to fit a transformation or
     to select a model.
     """
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    n_probe = _exact_int_arg('n_probe', n_probe, minimum=0)
     n = len(texts)
     if n == 0:
         return {'n': 0, 'n_probe': 0, 'mean_tokens': None,
@@ -989,6 +993,8 @@ def _probe_token_lengths(texts, tokenizer, seq_len, *, n_probe=256):
     quantiles can be fitted on TRAIN and applied to val/test without ever
     pooling the held-out splits into the statistic.
     """
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    n_probe = _exact_int_arg('n_probe', n_probe, minimum=0)
     n = len(texts)
     if n == 0:
         return []
@@ -2594,6 +2600,9 @@ def _texts_fingerprint(texts, n_probe=64, max_chars_per_text=4096):
     ``["a", "bc"]`` hashed the same byte stream and therefore received the
     same data-version id even though they are different corpora.
     """
+    n_probe = _exact_int_arg('n_probe', n_probe, minimum=0)
+    max_chars_per_text = _exact_int_arg(
+        'max_chars_per_text', max_chars_per_text, minimum=1)
     n = len(texts)
     indices = _evenly_spaced_probe_indices(n, n_probe)
     h = hashlib.sha256()
