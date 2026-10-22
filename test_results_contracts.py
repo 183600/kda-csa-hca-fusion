@@ -786,3 +786,16 @@ def test_row_contract_exp9_audits_cross_source_ranking():
            or r['section'] != 'source_audit']
     violations = rs.validate_rows('exp9_budget_frontier', bad, {})
     assert any('no audit row' in v for v in violations), violations
+    # Partial seed metadata is a first-class non-comparable verdict.
+    partial = [dict(r) for r in rows]
+    cross_idx = next(i for i, r in enumerate(partial)
+                     if r.get('source') == 'cross_source')
+    partial[cross_idx] = dict(
+        partial[cross_idx], status='partial_seeds',
+        comparable_for_ranking=False, seed_status='partial')
+    rank_idx = next(i for i, r in enumerate(partial)
+                    if r['section'] == 'ranking_summary')
+    partial[rank_idx] = dict(
+        partial[rank_idx], source_comparability='partial_seeds',
+        comparable_across_sources=False)
+    assert rs.validate_rows('exp9_budget_frontier', partial, {}) == []

@@ -586,6 +586,34 @@ def test_exp9_source_audit_rejects_missing_provenance_and_seed_mismatch():
     _ok('no shared seed is reported', summary['shared_seeds'] == [], '')
 
 
+def test_exp9_source_audit_rejects_partial_seed_metadata():
+    print('\nTest: Exp 9 source audit blocks partial seed evidence')
+    from run_budget_frontier import audit_join_sources
+    records = [_audit_record('exp4_mqar', seeds=(42, 43)),
+               _audit_record('exp5_ablation', seeds=()),
+               _audit_record('exp8_mechanism_ablation', seeds=(42, 43))]
+    _rows, summary = audit_join_sources(records)
+    _ok('a source without seeds -> partial_seeds',
+        summary['status'] == 'partial_seeds', summary['status'])
+    _ok('partial seed evidence blocks ranking',
+        summary['comparable_for_ranking'] is False, '')
+    _ok('seed status still records the overlap',
+        summary['seed_status'] == 'partial'
+        and summary['shared_seeds'] == [42, 43],
+        f"{summary['seed_status']} {summary['shared_seeds']}")
+    _ok('warning names the source without seeds',
+        any('partial seed metadata' in w and 'exp5_ablation' in w
+            for w in summary['warnings']), summary['warnings'])
+    # Partial metadata with no actual intersection is still the stronger
+    # no-shared-seed verdict.
+    disjoint = [_audit_record('exp4_mqar', seeds=(42,)),
+                _audit_record('exp5_ablation', seeds=()),
+                _audit_record('exp8_mechanism_ablation', seeds=(43,))]
+    _rows, summary = audit_join_sources(disjoint)
+    _ok('partial + disjoint seeds -> no_shared_seeds',
+        summary['status'] == 'no_shared_seeds', summary['status'])
+
+
 def test_exp9_source_audit_flags_dirty_tree_and_backend_mix():
     print('\nTest: Exp 9 source audit distinguishes dirty tree/backend mix')
     from run_budget_frontier import audit_join_sources
@@ -704,6 +732,7 @@ _TEST_FUNCS = [
     test_exp9_source_audit_same_revision_is_comparable,
     test_exp9_source_audit_rejects_mixed_revisions,
     test_exp9_source_audit_rejects_missing_provenance_and_seed_mismatch,
+    test_exp9_source_audit_rejects_partial_seed_metadata,
     test_exp9_source_audit_flags_dirty_tree_and_backend_mix,
     test_exp9_load_join_source_reads_exp5_sidecar,
     test_exp9_quality_join_carries_source_provenance,

@@ -1363,8 +1363,8 @@ _EXP9_SECTIONS = frozenset({
     'ranking_summary', 'source_audit'})
 _EXP9_AUDIT_STATUSES = frozenset({
     'comparable', 'comparable_dirty_tree', 'mixed_revisions',
-    'provenance_missing', 'no_shared_seeds', 'mixed_backends',
-    'sources_missing', 'no_sources'})
+    'provenance_missing', 'no_shared_seeds', 'partial_seeds',
+    'mixed_backends', 'sources_missing', 'no_sources'})
 
 
 @register_row_contract('exp9_budget_frontier')

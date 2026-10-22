@@ -522,6 +522,13 @@ def audit_join_sources(source_records):
         status = 'mixed_revisions'
     elif not shared_seeds:
         status = 'no_shared_seeds'
+    elif seed_status == 'partial':
+        # At least one readable source carries no seed metadata. The
+        # intersection above is then taken over the remaining sources
+        # only, so a cross-source ranking would silently assume the
+        # unrecorded source agrees on the seed set. Treat missing evidence
+        # as a blocker rather than as agreement.
+        status = 'partial_seeds'
     elif not backends_consistent:
         status = 'mixed_backends'
     elif dirty:
@@ -544,6 +551,13 @@ def audit_join_sources(source_records):
         warnings.append(
             'join sources share no seed; seed-level differences are '
             'confounded with the source experiment')
+    if status == 'partial_seeds':
+        missing_seed_sources = [r['source'] for r in present
+                                if not r.get('seeds')]
+        warnings.append(
+            'join sources have partial seed metadata (no seeds recorded for '
+            f'{missing_seed_sources}); cross-source seed overlap cannot be '
+            'verified')
     if status == 'mixed_backends':
         warnings.append(
             'join sources resolved different memory backends: '
