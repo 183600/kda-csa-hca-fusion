@@ -62,6 +62,7 @@ from run_quant_lm import (  # noqa: E402
     build_qat_test_rows,
     run_part_a,
     run_part_b,
+    _decode_state_snr,
 )
 
 
@@ -501,6 +502,48 @@ def _fake_cells():
     return cells
 
 
+def test_decode_state_snr_measures_the_quantized_trajectory():
+    """The SNR pass must feed the dequantized state back, like evaluation."""
+    import types
+
+    class _FakeClone:
+        def __init__(self):
+            self.model = types.SimpleNamespace(
+                _kda_state=torch.zeros(1, 1, 4, 1))
+
+        def reset(self):
+            self.model._kda_state = torch.zeros(1, 1, 4, 1)
+
+        def __call__(self, x):
+            offset = torch.tensor([0.1, 0.7, 1.3, 2.9]).view(1, 1, 4, 1)
+            self.model._kda_state = -2.0 * self.model._kda_state + offset
+
+    class _FakeModel:
+        @staticmethod
+        def embed(ids):
+            return ids.to(torch.float32).unsqueeze(-1)
+
+    spec = QuantSpec(bits=2, group_size=4)
+    ids = torch.zeros(1, 3, dtype=torch.long)
+    clone = _FakeClone()
+    got = _decode_state_snr(_FakeModel(), clone, [ids], 0, spec)
+
+    # Reference: the same loop with the quantized write fed back.
+    state = torch.zeros(1, 1, 4, 1)
+    num = den = 0.0
+    offset = torch.tensor([0.1, 0.7, 1.3, 2.9]).view(1, 1, 4, 1)
+    for _ in range(ids.shape[1] - 1):
+        state = -2.0 * state + offset
+        flat = state.reshape(1, -1)
+        deq = fake_quantize(flat, spec, ste=False)
+        num += float(flat.pow(2).sum())
+        den += float((deq - flat).pow(2).sum())
+        state = deq.reshape_as(state)
+    want = 10.0 * math.log10(num / den)
+    _ok('SNR follows the quantized feedback trajectory',
+        abs(got - want) < 1e-9, f'{got:.6f} vs {want:.6f}')
+
+
 def test_quant_lm_report_rows():
     print('\nTest: Exp 11 row aggregation + committed artifact')
     spec = QuantSpec(bits=2, group_size=16)
@@ -653,6 +696,7 @@ _TEST_FUNCS = [
     test_part_a_validation_and_bad_cases,
     test_part_b_validation_monitor_rng_neutral,
     test_part_b_matched_budget_control,
+    test_decode_state_snr_measures_the_quantized_trajectory,
     test_quant_lm_report_rows,
 ]
 
