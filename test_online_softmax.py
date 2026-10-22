@@ -183,12 +183,59 @@ def test_all_positive_infinity_scores_average_all_values():
             f'max|d|={(out[:, :, 1] - expected).abs().max().item():.2e}')
 
 
+
+def test_shared_kv_mqa_gqa_and_query_tiling():
+    """MQA/GQA + query tiles must equal the dense shared-KV reference."""
+    torch.manual_seed(21)
+    B, Hq, Hkv, T, N, D = 2, 4, 2, 7, 9, 8
+    scale = D ** -0.5
+    q = torch.randn(B, Hq, T, D)
+    k = torch.randn(B, Hkv, N, D)
+    v = torch.randn(B, Hkv, N, D)
+    mask = torch.tril(torch.ones(T, N, dtype=torch.bool))
+    sink = torch.randn(Hq)
+    group = Hq // Hkv
+    scores = torch.einsum(
+        'b h t d, b h n d -> b h t n', q,
+        k.repeat_interleave(group, dim=1)) * scale
+    scores = scores.masked_fill(~mask, float('-inf'))
+    row_max = scores.amax(dim=-1, keepdim=True)
+    e = (scores - row_max).exp()
+    den = e.sum(dim=-1, keepdim=True) + (
+        sink.view(1, Hq, 1, 1) - row_max).exp()
+    ref = torch.einsum(
+        'b h t n, b h n d -> b h t d', e / den,
+        v.repeat_interleave(group, dim=1))
+    for query_chunk, key_chunk in ((0, 0), (2, 3), (T, N)):
+        out = online_softmax_attention(
+            q, k, v, key_chunk=key_chunk, query_chunk=query_chunk,
+            scale=scale, mask=mask, sink_logits=sink)
+        _ok(f'qc={query_chunk} kc={key_chunk}: MQA/GQA matches dense',
+            bool((out - ref).abs().max() < 1e-5),
+            f'max|d|={(out - ref).abs().max().item():.2e}')
+    try:
+        online_softmax_attention(
+            torch.randn(1, 3, 4, D), torch.randn(1, 2, 5, D),
+            torch.randn(1, 2, 5, D))
+    except ValueError:
+        _ok('non-divisible Hq/Hkv is rejected', True, '')
+    else:
+        _ok('non-divisible Hq/Hkv is rejected', False, 'no ValueError')
+    try:
+        online_softmax_attention(q, k, v, query_chunk=-1)
+    except ValueError:
+        _ok('negative query_chunk is rejected', True, '')
+    else:
+        _ok('negative query_chunk is rejected', False, 'no ValueError')
+
+
 _TEST_FUNCS = [
     test_singleton_key_axis_mask_survives_key_chunking,
     test_materialized_masks_are_still_sliced_per_chunk,
     test_masked_reference_matches_dense_reference,
     test_positive_infinity_scores_use_the_softmax_limit,
     test_all_positive_infinity_scores_average_all_values,
+    test_shared_kv_mqa_gqa_and_query_tiling,
 ]
 
 

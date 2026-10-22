@@ -18,8 +18,14 @@ semantics, kept as an oracle for such kernels:
   ``sum exp(s - m) * v``;
 * ``online_softmax_merge`` folds two states, so key chunks can be
   processed (and re-associated) in any order / granularity;
-* ``online_softmax_attention`` streams over key chunks and never holds
-  more than ``B * nh * T * key_chunk`` score elements;
+* ``online_softmax_attention`` streams over key chunks and (optionally)
+  query tiles, so it never holds more than
+  ``B * nh * query_chunk * key_chunk`` score elements — the two-axis
+  blocking a Flash/Triton kernel uses;
+* shared-KV (MQA / GQA) attention is supported directly: queries may have
+  ``Hq`` heads while ``K`` / ``V`` carry ``Hkv`` heads with
+  ``Hq % Hkv == 0``, and the per-query-head output is assembled without
+  materializing a repeated ``K`` / ``V`` *sequence*;
 * the sink enters **only the denominator** — a virtual key whose value is
   zero — matching ``ops_hca``: ``out = sum exp(s) v / (sum exp(s) +
   exp(sink))``.
@@ -31,6 +37,13 @@ softmax; only the memory footprint changes (pinned by the audit tests via
 per chunk, which is why the primitive is not *bit*-identical to the dense
 path — it is value-equal up to fp round-off, and it is exactly
 re-association-invariant.
+
+The GQA/MQA expansion is a reference-quality convenience: ``K`` / ``V``
+are repeated across their query-head group before scoring.  A fused kernel
+would index the shared head directly; the *values* are identical, and the
+extra memory is ``O(B * Hq * key_chunk * D)`` per streamed key chunk, not
+the ``O(B * Hq * T * key_chunk)`` score block the primitive exists to
+avoid.
 """
 from __future__ import annotations
 
@@ -101,10 +114,12 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          mask: torch.Tensor | None = None) -> tuple:
     """Online-softmax state for one key block.
 
-    ``q``: ``[B, H, T, D]``; ``k`` / ``v``: ``[B, H, Nc, D]``.
-    ``mask``: optional boolean ``[T, Nc]`` broadcastable to
-    ``[B, H, T, Nc]`` where ``True`` = keep (used for the causal /
-    block-causal cases).  Returns ``(m, den, acc)``.
+    ``q``: ``[B, Hq, T, D]``; ``k`` / ``v``: ``[B, Hkv, Nc, D]`` with
+    ``Hq % Hkv == 0`` (``Hkv == 1`` is MQA, ``1 < Hkv < Hq`` is GQA and
+    ``Hkv == Hq`` is the ordinary case).  ``mask``: optional boolean
+    broadcastable to ``[B, Hq, T, Nc]`` where ``True`` = keep (used for
+    the causal / block-causal cases); a 4-D mask with the ``Hkv`` head
+    axis is expanded alongside ``K`` / ``V``.  Returns ``(m, den, acc)``.
     """
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
@@ -114,13 +129,34 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         raise ValueError(
             'online_softmax_state: k and v must share shape (shared-KV / '
             f'MQA contract); got {tuple(k.shape)} vs {tuple(v.shape)}.')
-    if k.shape[0] != q.shape[0] or k.shape[1] != q.shape[1]:
+    if k.shape[0] != q.shape[0]:
         raise ValueError(
-            'online_softmax_state: batch/head dims of q and k must match.')
+            'online_softmax_state: batch dims of q and k must match; got '
+            f'{q.shape[0]} vs {k.shape[0]}.')
+    if q.shape[1] < 1 or k.shape[1] < 1:
+        raise ValueError(
+            'online_softmax_state: q and k must have at least one head; '
+            f'got {q.shape[1]} and {k.shape[1]}.')
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(
+            'online_softmax_state: the query head count must be a multiple '
+            'of the KV head count (MQA/GQA contract); got Hq='
+            f'{q.shape[1]} and Hkv={k.shape[1]}.')
     if q.shape[-1] != k.shape[-1]:
         raise ValueError(
             'online_softmax_state: q/k feature dims must match; got '
             f'{q.shape[-1]} vs {k.shape[-1]}.')
+    group = q.shape[1] // k.shape[1]
+    if group > 1:
+        # Shared-KV expansion.  Keeping the original ``Hkv`` head axis
+        # would require a 5-D score tensor and a grouped value contraction;
+        # the reference materializes the (small) per-chunk KV copy instead
+        # of the (large) replicated score block.
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+        if (mask is not None and mask.dim() == 4
+                and mask.shape[1] == q.shape[1] // group):
+            mask = mask.repeat_interleave(group, dim=1)
     if scale is None:
         scale = q.shape[-1] ** -0.5
     scores = torch.einsum('b h t d, b h n d -> b h t n', q, k) * scale
@@ -233,28 +269,30 @@ def online_softmax_finalize(m: torch.Tensor, den: torch.Tensor,
     return torch.where(empty.expand_as(out), torch.zeros_like(out), out)
 
 
-def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
-                             v: torch.Tensor, *,
-                             key_chunk: int = 0,
-                             scale: float | None = None,
-                             mask: torch.Tensor | None = None,
-                             sink_logits: torch.Tensor | None = None):
-    """Streaming softmax attention over key chunks.
+def _slice_query_mask(mask: torch.Tensor | None, lo: int, hi: int,
+                      T: int) -> torch.Tensor | None:
+    """Slice a mask's QUERY axis for a query tile.
 
-    Same value as ``softmax(q k^T / sqrt(D)) v`` with the optional
-    ``mask`` (``True`` = keep) and an attention sink that appears in the
-    denominator only.  ``key_chunk=0`` (default) uses one chunk (still
-    online, just not memory-sharded).
+    The canonical 2-D mask is ``[T, Nc]`` and the 4-D form is
+    ``[B, H, T, Nc]``; in both the query axis is ``-2``.  Masks with a
+    broadcast query singleton (``[B, H, 1, Nc]``) are passed through
+    unchanged.  A 1-D mask has no query axis.  With ``query_chunk > 0`` a
+    2-D mask is therefore interpreted as ``[T, Nc]`` (the documented
+    canonical form), not ``[B, Nc]`` with ``B == T``.
     """
-    if key_chunk < 0:
-        raise ValueError(
-            f'online_softmax_attention: key_chunk={key_chunk} must be >= 0 '
-            f'(0 = single chunk).')
+    if mask is None or mask.dim() < 2:
+        return mask
+    if mask.shape[-2] == T:
+        return mask[..., lo:hi, :]
+    return mask
+
+
+def _stream_keys(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 key_chunk: int, scale: float | None,
+                 mask: torch.Tensor | None) -> tuple:
+    """Online state for a fixed query tile, streaming over the key axis."""
     n = k.shape[2]
     chunk = n if key_chunk == 0 else min(key_chunk, n)
-    if n == 0:
-        raise ValueError(
-            'online_softmax_attention: the key/value sequence is empty.')
     merged = None
     for lo in range(0, n, chunk):
         hi = min(n, lo + chunk)
@@ -274,5 +312,77 @@ def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
         state = online_softmax_state(
             q, k[:, :, lo:hi], v[:, :, lo:hi], scale=scale, mask=block_mask)
         merged = state if merged is None else online_softmax_merge(merged, state)
-    return online_softmax_finalize(merged[0], merged[1], merged[2],
-                                   sink_logits=sink_logits)
+    return merged
+
+
+def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
+                             v: torch.Tensor, *,
+                             key_chunk: int = 0,
+                             query_chunk: int = 0,
+                             scale: float | None = None,
+                             mask: torch.Tensor | None = None,
+                             sink_logits: torch.Tensor | None = None):
+    """Streaming softmax attention over key chunks and query tiles.
+
+    Same value as ``softmax(q k^T / sqrt(D)) v`` with the optional
+    ``mask`` (``True`` = keep) and an attention sink that appears in the
+    denominator only.  ``q``: ``[B, Hq, T, D]``; ``k`` / ``v``:
+    ``[B, Hkv, N, D]`` with ``Hq % Hkv == 0`` (shared-KV MQA/GQA).
+
+    Blocking (both ``0`` = one block, i.e. online but not memory-sharded):
+
+    * ``key_chunk`` shards the key axis; the running state is merged with
+      :func:`online_softmax_merge`, so the peak score tensor is
+      ``B * Hq * T * key_chunk``;
+    * ``query_chunk`` tiling is the second axis of a Flash/Triton
+      schedule: each tile streams the keys independently and the results
+      are concatenated, giving a peak of
+      ``B * Hq * query_chunk * key_chunk``.  Query tiling is exact — every
+      row of the softmax is independent — including when ``mask`` or a
+      per-query ``sink_logits`` varies with the query row.
+    """
+    if key_chunk < 0:
+        raise ValueError(
+            f'online_softmax_attention: key_chunk={key_chunk} must be >= 0 '
+            f'(0 = single chunk).')
+    if query_chunk < 0:
+        raise ValueError(
+            f'online_softmax_attention: query_chunk={query_chunk} must be '
+            f'>= 0 (0 = single query tile).')
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError(
+            'online_softmax_attention: q/k/v must be 4-D [B, H, T, D]; got '
+            f'{tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}.')
+    n = k.shape[2]
+    if n == 0:
+        raise ValueError(
+            'online_softmax_attention: the key/value sequence is empty.')
+    T = q.shape[2]
+    if query_chunk == 0 or query_chunk >= T:
+        merged = _stream_keys(q, k, v, key_chunk, scale, mask)
+        return online_softmax_finalize(merged[0], merged[1], merged[2],
+                                       sink_logits=sink_logits)
+
+    # Normalise the sink ONCE so a per-query sink can be tiled with the
+    # queries.  ``_align_sink_logits`` only reads the head count / dtype /
+    # device from its second argument, so a 1-row probe is enough.
+    sink = None
+    if sink_logits is not None:
+        probe = q.new_zeros(1, q.shape[1], 1, 1)
+        sink = _align_sink_logits(sink_logits, probe)
+        if sink.dim() >= 2 and sink.shape[-2] not in (1, T):
+            raise ValueError(
+                'online_softmax_attention: with query_chunk>0 a sink_logits '
+                f'query axis must be 1 or T={T}; got shape '
+                f'{tuple(sink.shape)}.')
+    outs = []
+    for lo in range(0, T, query_chunk):
+        hi = min(T, lo + query_chunk)
+        mask_t = _slice_query_mask(mask, lo, hi, T)
+        sink_t = sink
+        if sink is not None and sink.dim() >= 2 and sink.shape[-2] == T:
+            sink_t = sink[..., lo:hi, :]
+        merged = _stream_keys(q[:, :, lo:hi], k, v, key_chunk, scale, mask_t)
+        outs.append(online_softmax_finalize(
+            merged[0], merged[1], merged[2], sink_logits=sink_t))
+    return torch.cat(outs, dim=2)

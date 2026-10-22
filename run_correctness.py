@@ -7469,6 +7469,143 @@ def test_fp8_state_storage_ledger(device='cpu'):
     return results
 
 
+
+def test_online_softmax_shared_kv_tiling(device='cpu'):
+    """Streaming softmax must honour the shared-KV MQA/GQA contract.
+
+    CSA/HCA core attention is shared-KV MQA (``Hkv`` keys, ``Hq`` query
+    heads) with a block-causal mask and a denominator-only sink.  The
+    online primitive is the kernel oracle for that pattern, so it must:
+
+    * accept ``Hq % Hkv == 0`` (MQA and GQA), not require ``Hq == Hkv``;
+    * stay value-equal to the dense softmax under key-chunk and
+      query-tile blocking (the two axes a Flash/Triton schedule blocks);
+    * tile a per-query sink and a 4-D mask on the same axes; and
+    * keep gradients finite and equal to the dense reference.
+    """
+    logger.info("Test: online softmax shared-KV (MQA/GQA) + two-axis tiling")
+    results = []
+    import online_softmax as osf
+
+    def _dense(q, k, v, mask, sink, scale):
+        group = q.shape[1] // k.shape[1]
+        kk = k.repeat_interleave(group, dim=1)
+        vv = v.repeat_interleave(group, dim=1)
+        scores = torch.einsum('b h t d, b h n d -> b h t n', q, kk) * scale
+        if mask is not None:
+            if mask.dim() == 4 and mask.shape[1] == k.shape[1] and group > 1:
+                mask = mask.repeat_interleave(group, dim=1)
+            scores = scores.masked_fill(~mask, float('-inf'))
+        row_max = scores.amax(dim=-1, keepdim=True)
+        row_max = torch.where(torch.isneginf(row_max),
+                              torch.zeros_like(row_max), row_max)
+        e = (scores - row_max).exp()
+        den = e.sum(dim=-1, keepdim=True)
+        if sink is not None:
+            ss = sink
+            if ss.dim() == 1:
+                ss = ss.view(1, q.shape[1], 1, 1)
+            elif ss.dim() == 2:
+                ss = ss.view(1, q.shape[1], 1, 1)
+            elif ss.dim() == 3:
+                ss = ss.unsqueeze(-1)
+            den = den + (ss - row_max).exp()
+        return torch.einsum('b h t n, b h n d -> b h t d', e / den, vv)
+
+    torch.manual_seed(2027)
+    B, T, N, D = 2, 7, 9, 8
+    scale = D ** -0.5
+    mask = torch.tril(torch.ones(T, N, dtype=torch.bool))
+    for Hq, Hkv in ((4, 1), (4, 2), (3, 3)):
+        q = torch.randn(B, Hq, T, D, device=device)
+        k = torch.randn(B, Hkv, N, D, device=device)
+        v = torch.randn(B, Hkv, N, D, device=device)
+        sink = torch.randn(Hq, device=device)
+        ref = _dense(q, k, v, mask, sink, scale)
+        for query_chunk, key_chunk in ((0, 0), (2, 3), (T, N), (3, 2)):
+            out = osf.online_softmax_attention(
+                q, k, v, key_chunk=key_chunk, query_chunk=query_chunk,
+                scale=scale, mask=mask, sink_logits=sink)
+            diff = (out - ref).abs().max().item()
+            results.append(_ok(
+                f'Hq={Hq},Hkv={Hkv} qc={query_chunk} kc={key_chunk} '
+                f'matches dense shared-KV softmax',
+                diff < 1e-5, f'max|d|={diff:.2e}'))
+
+        sink_q = torch.randn(B, Hq, T, 1, device=device)
+        ref_q = _dense(q, k, v, mask, sink_q, scale)
+        out_q = osf.online_softmax_attention(
+            q, k, v, key_chunk=3, query_chunk=2, scale=scale, mask=mask,
+            sink_logits=sink_q)
+        diff = (out_q - ref_q).abs().max().item()
+        results.append(_ok(
+            f'Hq={Hq},Hkv={Hkv} per-query sink tiles with the query axis',
+            diff < 1e-5, f'max|d|={diff:.2e}'))
+
+        mask_hkv = torch.randn(B, Hkv, T, N, device=device) > 0
+        mask_hkv[..., 0] = True
+        ref_m = _dense(q, k, v, mask_hkv, sink, scale)
+        out_m = osf.online_softmax_attention(
+            q, k, v, key_chunk=2, query_chunk=2, scale=scale,
+            mask=mask_hkv, sink_logits=sink)
+        diff = (out_m - ref_m).abs().max().item()
+        results.append(_ok(
+            f'Hq={Hq},Hkv={Hkv} KV-head mask expands with K/V',
+            diff < 1e-5, f'max|d|={diff:.2e}'))
+
+    # Gradient parity on a small MQA geometry.
+    torch.manual_seed(2028)
+    B, Hq, Hkv, T, N, D = 1, 3, 1, 5, 6, 8
+    scale = D ** -0.5
+    mask = torch.tril(torch.ones(T, N, dtype=torch.bool))
+    sink = torch.randn(Hq, device=device)
+    q0 = torch.randn(B, Hq, T, D, device=device)
+    k0 = torch.randn(B, Hkv, N, D, device=device)
+    v0 = torch.randn(B, Hkv, N, D, device=device)
+    grads = {}
+    for label, fn in (
+            ('dense', lambda q, k, v: _dense(q, k, v, mask, sink, scale)),
+            ('online', lambda q, k, v: osf.online_softmax_attention(
+                q, k, v, key_chunk=2, query_chunk=2, scale=scale,
+                mask=mask, sink_logits=sink))):
+        q = q0.clone().requires_grad_()
+        k = k0.clone().requires_grad_()
+        v = v0.clone().requires_grad_()
+        fn(q, k, v).sum().backward()
+        grads[label] = (q.grad, k.grad, v.grad)
+    for i, name in enumerate(('q', 'k', 'v')):
+        finite = all(torch.isfinite(g).all() for g in grads['online'])
+        diff = (grads['dense'][i] - grads['online'][i]).abs().max().item()
+        results.append(_ok(
+            f'MQA grad_{name} finite and matches dense', finite and diff < 1e-5,
+            f'max|d|={diff:.2e}'))
+
+    bad_head = False
+    try:
+        osf.online_softmax_attention(
+            torch.randn(1, 3, 4, D, device=device),
+            torch.randn(1, 2, 5, D, device=device),
+            torch.randn(1, 2, 5, D, device=device))
+    except ValueError:
+        bad_head = True
+    results.append(_ok('non-divisible Hq/Hkv is rejected', bad_head, ''))
+    bad_chunk = False
+    try:
+        osf.online_softmax_attention(
+            q0, k0, v0, query_chunk=-1)
+    except ValueError:
+        bad_chunk = True
+    results.append(_ok('negative query_chunk is rejected', bad_chunk, ''))
+    bad_sink = False
+    try:
+        osf.online_softmax_attention(
+            q0, k0, v0, query_chunk=2, sink_logits=torch.randn(1, Hq, 3, 1))
+    except ValueError:
+        bad_sink = True
+    results.append(_ok('untileable per-query sink is rejected', bad_sink, ''))
+    return results
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -7666,6 +7803,7 @@ def main():
     all_results += _run_safe(test_rwkv7_cache_live_accounting, device)
     # FP8 block-scaled state storage priced through the decode ledger.
     all_results += _run_safe(test_fp8_state_storage_ledger, device)
+    all_results += _run_safe(test_online_softmax_shared_kv_tiling, device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)
