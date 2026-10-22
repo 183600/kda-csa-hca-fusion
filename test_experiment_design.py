@@ -104,6 +104,32 @@ def test_planning_uses_corrected_alpha_and_mde():
     assert screening['planned_power'] < plan['target_power']
 
 
+def test_two_sided_planning_applies_bonferroni_once():
+    # exp5_ratio is a two-sided family: alpha_per_test is the one-sided TAIL
+    # probability (alpha/(2*family)).  multi_seed_stats takes a test level,
+    # so passing the tail alpha directly would halve it a second time and
+    # overstate both the MDE and the required seed count.
+    plan = D.get_plan('exp5_ratio')
+    rep = D.planning_report(plan)
+    assert rep['alternative'] == 'two-sided'
+    assert rep['alpha_per_test'] == pytest.approx(
+        rep['alpha_family_wise'] / (2.0 * rep['family_size']))
+    from statistics import NormalDist
+    z_crit = NormalDist().inv_cdf(1.0 - rep['alpha_per_test'])
+    z_power = NormalDist().inv_cdf(rep['target_power'])
+    expected_mde = ((z_crit + z_power) * rep['assumed_sd']
+                    / math.sqrt(rep['seeds']))
+    assert rep['planned_mde'] == pytest.approx(expected_mde)
+    expected_required = math.ceil(
+        ((z_crit + z_power) / rep['standardized_effect_dz']) ** 2)
+    assert rep['required_seeds'] == max(2, expected_required)
+    assert plan['planned_seeds'] >= rep['required_seeds']
+    ncp = rep['standardized_effect_dz'] * math.sqrt(rep['seeds'])
+    expected_power = ((1.0 - NormalDist().cdf(z_crit - ncp))
+                      + NormalDist().cdf(-z_crit - ncp))
+    assert rep['planned_power'] == pytest.approx(expected_power)
+
+
 def test_planning_rejects_invalid_overrides():
     plan = D.get_plan('exp4_mqar')
     with pytest.raises(D.DesignError):

@@ -601,9 +601,12 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
 
     All overrides are for "what if" planning and are validated; the
     defaults come from the plan. ``alpha`` is the FAMILY-WISE alpha. The
-    per-test threshold used here is ``alpha / family_size`` for a
-    directional family and ``alpha / (2 * family_size)`` for a two-sided
-    family, matching the Bonferroni convention in the runners.
+    per-test threshold used here is the one-sided TAIL probability used by
+    the runners: ``alpha / family_size`` for a directional family and
+    ``alpha / (2 * family_size)`` for a two-sided family.  The planning
+    helpers in :mod:`multi_seed_stats` take a TEST level (and halve it
+    internally for a two-sided test), so the two-sided case is passed
+    ``2 * alpha_per_test``; otherwise the correction would be applied twice.
 
     The returned record is JSON-safe and includes the arithmetic inputs so a
     reader can audit the sample-size decision without importing this module.
@@ -642,18 +645,27 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         raise DesignError(f'seeds must be a non-negative int, got {n_seeds!r}')
     alpha_test = (alpha / family if alt in ('greater', 'less')
                   else alpha / (2.0 * family))
+    # ``multi_seed_stats`` interprets ``alpha`` as a two-sided TEST level and
+    # halves it again internally.  ``alpha_test`` here is the one-sided TAIL
+    # probability the significance test will actually use (matching
+    # run_ablation's corrected threshold), so undo the internal halving for
+    # the two-sided planning calls.  Passing ``alpha_test`` directly would
+    # correct a two-sided plan twice (alpha/(4*family)) and overstate both
+    # the required n and the MDE.
+    planning_alpha = (alpha_test if alt in ('greater', 'less')
+                      else 2.0 * alpha_test)
     dz = sesoi_value / sd_value
-    required = seeds_required(dz, alpha=alpha_test, power=target,
+    required = seeds_required(dz, alpha=planning_alpha, power=target,
                               alternative=alt)
     # A paired test is undefined below two seed pairs. The normal
     # approximation can return 1 for a very large effect; clamp the
     # planning answer to the smallest design that can actually be run.
     if required is not None:
         required = max(2, int(required))
-    mde = min_detectable_effect(n_seeds, sd_value, alpha=alpha_test,
+    mde = min_detectable_effect(n_seeds, sd_value, alpha=planning_alpha,
                                 power=target, alternative=alt)
     achieved = power_at_effect(n_seeds, sd_value, sesoi_value,
-                               alpha=alpha_test, alternative=alt)
+                               alpha=planning_alpha, alternative=alt)
     if required is None:
         status = 'not_estimable'
     elif achieved is not None and achieved >= target - 1e-9:
