@@ -951,10 +951,18 @@ def main():
     n_errors = sum(1 for r in results if 'error' in r)
     # Record the exact per-(op, T) input seeds rather than a fake global
     # seed: the benchmark is deliberately independent of process RNG state.
-    used_seeds = sorted({
+    input_seeds = {
         (zlib.crc32(str(r['op']).encode('utf-8')) & 0xFFFFFFFF)
         ^ ((int(r['T']) * 2654435761) & 0xFFFFFFFF)
-        for r in results if 'op' in r and 'T' in r})
+        for r in results if 'op' in r and 'T' in r}
+    weight_init_seeds = {
+        name: zlib.crc32(label.encode('utf-8')) & 0xFFFFFFFF
+        for name, label in (
+            ('mamba2_layer', b'mamba2_layer_weights'),
+            ('hybrid', b'hybrid_weights'),
+            ('hybrid_mamba2', b'hybrid_mamba2_weights'),
+        )}
+    used_seeds = sorted(input_seeds | set(weight_init_seeds.values()))
     append_run_manifest(make_run_manifest_entry(
         experiment='exp2_benchmark',
         seeds=used_seeds,
@@ -967,6 +975,7 @@ def main():
             'mamba_backend': os.environ.get('MAMBA_BACKEND', 'reference'),
             'seed_scheme': ('per-(op, T) zlib.crc32 seeds; scoped weight '
                             'init restores the caller RNG state'),
+            'weight_init_seeds': weight_init_seeds,
         },
         data={
             'kind': 'synthetic_benchmark_workloads',
