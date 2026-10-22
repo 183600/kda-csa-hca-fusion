@@ -192,7 +192,10 @@ def test_headwise_invalid_compression_geometry_is_rejected():
                 csa_c=4, hca_c=4)
     for field, value in (('csa_m', 0), ('csa_m', -1),
                          ('hca_m2', 0), ('hca_m2', 2.0),
-                         ('csa_topk', -1), ('csa_topk', True)):
+                         ('csa_topk', -1), ('csa_topk', True),
+                         ('d_model', 0), ('d_model', 16.0),
+                         ('head_dim', True), ('head_dim', '4'),
+                         ('csa_c', 4.0), ('hca_c', True)):
         kwargs = dict(base, **{field: value})
         try:
             HeadwiseFusedAttention(HeadwiseConfig(**kwargs))

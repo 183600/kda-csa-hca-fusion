@@ -171,9 +171,17 @@ class HeadwiseFusedAttention(nn.Module):
                 raise ValueError(
                     f"HeadwiseConfig.{_name}={_value!r} must be a "
                     f"non-negative int.")
-        if cfg.head_dim < 1:
-            raise ValueError(
-                f"HeadwiseConfig.head_dim={cfg.head_dim!r} must be >= 1.")
+        # Exact integer geometry. A float/string reaches nn.Linear with an
+        # opaque TypeError (or, worse, a bool is silently accepted as 1) only
+        # after every parameter has been allocated; validate it up front with
+        # the same exact-int contract the compression factors use.
+        for _name in ('d_model', 'head_dim', 'csa_c', 'hca_c'):
+            _value = getattr(cfg, _name)
+            if (not isinstance(_value, int) or isinstance(_value, bool)
+                    or _value < 1):
+                raise ValueError(
+                    f"HeadwiseConfig.{_name}={_value!r} must be a positive "
+                    f"int.")
         if cfg.H_kda + cfg.H_csa + cfg.H_hca != cfg.H_total:
             raise ValueError(
                 f"H_kda({cfg.H_kda}) + H_csa({cfg.H_csa}) + H_hca({cfg.H_hca}) "
