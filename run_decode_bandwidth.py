@@ -253,6 +253,13 @@ def main(argv=None) -> int:
             'randomness': 'none (analytic traffic ledger; host bandwidth '
                           'measured, not sampled)',
         },
+        data={
+            'kind': 'analytic_decode_traffic_ledger',
+            'T': payload['config']['T'],
+            'batches': payload['config']['batches'],
+            'routes': payload['config']['routes'],
+            'layout_unit': payload['config']['layout_unit'],
+        },
         artifacts={'results': args.json},
         results={
             'n_routes': len(payload['routes']),

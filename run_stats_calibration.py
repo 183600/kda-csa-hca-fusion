@@ -143,6 +143,12 @@ def main() -> int:
             'method': report['method'],
             'scenarios': MC.default_scenarios(),
         },
+        data={
+            'kind': 'synthetic_paired_effect_simulations',
+            'settings': report['settings'],
+            'scenarios': MC.default_scenarios(),
+            'populations': 'known-mean normal / Laplace / contaminated draws',
+        },
         artifacts={
             'results': RESULT_PATH,
             'provenance': PROVENANCE_PATH,

@@ -935,6 +935,13 @@ def main():
             'bytes_convention': metadata['bytes_convention'],
             'randomness': 'none (analytic closed-form accounting)',
         },
+        data={
+            'kind': 'analytic_kv_flops_grid',
+            'seq_lengths': seq_lengths,
+            'ops': ops,
+            'accounting_modes': metadata['accounting_modes'],
+            'note': 'closed-form model; no dataset or sampled inputs',
+        },
         artifacts={'results': 'results/exp3_kv_cache.json'},
         results={
             'n_rows': len(rows),

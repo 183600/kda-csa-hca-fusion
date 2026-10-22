@@ -1960,6 +1960,12 @@ def main():
             'ops': metadata['ops'],
             'seed_scheme': metadata['seeds']['scheme'],
         },
+        data={
+            'kind': 'synthetic_decode_workload',
+            'prefill_lens': metadata['prefill_lens'],
+            'n_decode': metadata['n_decode'],
+            'generator': 'make_seeded_generator(0) for inputs; no corpus',
+        },
         artifacts={
             'results': 'results/exp6_decoding.json',
             'provenance': 'results/exp6_decoding_provenance.json',

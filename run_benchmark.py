@@ -968,6 +968,12 @@ def main():
             'seed_scheme': ('per-(op, T) zlib.crc32 seeds; scoped weight '
                             'init restores the caller RNG state'),
         },
+        data={
+            'kind': 'synthetic_benchmark_workloads',
+            'seq_lengths': seq_lengths,
+            'geometry': {'B': B, 'H': H, 'K': K, 'V': V, 'd': d},
+            'inputs': 'seeded torch.Generator tensors; no corpus file',
+        },
         artifacts={
             'results': 'results/exp2_benchmark.json',
             'provenance': 'results/exp2_benchmark_provenance.json',

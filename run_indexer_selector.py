@@ -593,6 +593,13 @@ def main() -> int:
             'topk_sort_max_elems': metadata['topk_sort_max_elems'],
             'timing_protocol': metadata['timing_protocol'],
         },
+        data={
+            'kind': 'synthetic_selector_score_tensors',
+            'selector_grid': metadata['selector_grid'],
+            'decode_lengths': metadata['decode_lengths'],
+            'decode_geometry': metadata['decode_geometry'],
+            'generator_seeds': [0, 7],
+        },
         artifacts={
             'results': 'results/exp14_indexer_selector.json',
             'provenance': (

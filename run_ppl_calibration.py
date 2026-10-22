@@ -307,6 +307,12 @@ def main() -> int:
             'model_construction_seed': 2027,
             'window_generator_seed': 3,
         },
+        data={
+            'kind': 'synthetic_calibration_and_decode_parity',
+            'scenarios': PC.default_scenarios(),
+            'decode_prefill_protocol': metadata['decode_prefill_protocol'],
+            'corpora': 'synthetic NLL draws with known population mean',
+        },
         artifacts={
             'results': 'results/exp15_ppl_calibration.json',
             'provenance': (
