@@ -695,6 +695,8 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         'relative_accuracy_gain': None,
         'cost_ratios': {},
         'worst_cost_ratio': None,
+        'measured_cost_keys': [],
+        'missing_cost_keys': [],
         'min_effect': float(min_effect),
         'max_cost_ratio': float(max_cost_ratio),
         'significant': significant,
@@ -714,22 +716,26 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
     report['relative_accuracy_gain'] = (delta / float(base)) if base else None
 
     ratios = {}
+    missing = []
     for key in cost_keys:
         c, b = candidate.get(key), baseline.get(key)
-        if c is None or b is None:
-            continue
         try:
             c, b = float(c), float(b)
         except (TypeError, ValueError):
+            missing.append(key)
             continue
         if not (math.isfinite(c) and math.isfinite(b)):
+            missing.append(key)
             continue
         # A zero baseline cost is uninformative (division by zero), not
         # "infinitely cheaper"; skip rather than invent a ratio.
         if b <= 0.0:
+            missing.append(key)
             continue
         ratios[key] = c / b
     report['cost_ratios'] = ratios
+    report['measured_cost_keys'] = list(ratios)
+    report['missing_cost_keys'] = list(missing)
     if ratios:
         worst_key = max(ratios, key=lambda k: ratios[k])
         report['worst_cost_ratio'] = {'cost': worst_key,
@@ -784,12 +790,18 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         return report
 
     report['verdict'] = 'warranted'
+    coverage_clause = ''
+    if missing:
+        coverage_clause = (
+            f" Cost axes not compared (missing or uninformative): "
+            f"{', '.join(missing)}; the 'warranted' verdict covers only the "
+            f'measured axes.')
     report['recommendation'] = (
         f'gain of {delta:+.4f} clears the minimum effect'
         + ('' if significant is not None else
            ' but was NOT tested for significance (paired_pvalue/significant '
            'were not supplied), so it is still a candidate, not a claim')
-        + f' and stays within the cost budget.{cost_clause}')
+        + f' and stays within the cost budget.{cost_clause}{coverage_clause}')
     return report
 
 

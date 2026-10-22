@@ -263,6 +263,20 @@ def test_accuracy_cost_tradeoff_screens_effect_significance_and_cost():
     assert more_flops['verdict'] == 'cost_prohibitive'
     assert more_flops['worst_cost_ratio']['cost'] == 'flops'
 
+    # "warranted" must say which cost axes it could NOT compare: an
+    # unmeasured memory axis must not be silently treated as free.
+    assert 'peak_memory_bytes' in untested['missing_cost_keys']
+    assert 'peak_memory_bytes' not in untested['measured_cost_keys']
+    assert 'not compared' in untested['recommendation']
+
+    full = {**base, 'flops': 1.0, 'mean_eval_ms_per_sample': 1.0,
+            'peak_memory_bytes': 1024 ** 2}
+    complete = accuracy_cost_tradeoff(
+        {**full, 'mean_acc': 0.65}, full, significant=True)
+    assert complete['verdict'] == 'warranted'
+    assert complete['missing_cost_keys'] == []
+    assert len(complete['measured_cost_keys']) == 6
+
 
 def test_nonfinite_triage_names_first_failing_stage_and_gradient_triage():
     bad = torch.tensor([float('nan'), 1.0])
