@@ -1142,8 +1142,8 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
                     bucket = examples[cat]
                     if len(bucket) >= int(max_examples):
                         continue
-                    lo = max(0, t - int(context_tokens))
-                    ctx_ids = [int(v) for v in input_ids[bi, lo:t].tolist()]
+                    lo = max(0, t + 1 - int(context_tokens))
+                    ctx_ids = [int(v) for v in input_ids[bi, lo:t + 1].tolist()]
                     bucket.append({
                         'sample': sample_base + bi,
                         'position': int(t),
@@ -1204,7 +1204,9 @@ def analyze_lm_errors(model, dataset, *, batch_size=1, device='cpu',
                if v['count']}
         print(f"[bad-case] categories: {mix}")
         print('[bad-case] accuracy by position quartile: ' + ', '.join(
-            f"{b['quartile']}={b['accuracy']:.3f}(n={b['n']})"
+            f"{b['quartile']}="
+            f"{'n/a' if b['accuracy'] is None else format(b['accuracy'], '.3f')}"
+            f"(n={b['n']})"
             for b in report['accuracy_by_position_quartile']))
         print('[bad-case] accuracy by repeat distance: ' + ', '.join(
             f"{b['bucket']}="
