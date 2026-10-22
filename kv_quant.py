@@ -358,7 +358,15 @@ def _fp8_group_scale(groups: torch.Tensor, spec: FP8Spec) -> torch.Tensor:
                 min_scale = finfo.tiny
                 exp_min, exp_max = -126.0, 127.0
             exp = torch.ceil(torch.log2(scale.clamp(min=min_scale)))
-            exp = exp.clamp(exp_min, exp_max)
+            # A power-of-two scale rounded UP can push the largest code
+            # (``max_finite``) past the compute dtype's largest finite
+            # value: e.g. fp32 E4M3 input FLT_MAX gets scale 2**120 and
+            # dequantizes to 2**128 = inf. Cap the exponent so the grid's
+            # top point stays representable. This leaves every ordinary
+            # group (whose scale is far below the cap) bit-identical.
+            safe_exp_max = math.floor(math.log2(
+                torch.finfo(groups.dtype).max / spec.max_finite))
+            exp = exp.clamp(exp_min, min(exp_max, float(safe_exp_max)))
             scale = torch.exp2(exp)
     return scale
 

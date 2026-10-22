@@ -492,6 +492,14 @@ def test_fp8_fake_quantize_contract():
     _ok('power-of-two scale stays finite and bounded',
         bool(torch.isfinite(yp).all())
         and float(yp.abs().max()) <= pow2.max_finite, '')
+    # Finite inputs near FLT_MAX must not dequantize to +-inf just because
+    # the power-of-two E8M0 scale rounds up past the dtype range.
+    extreme = torch.tensor([[3.4e38, -3.4e38, 0.0, 1.7e38]])
+    for fmt in ('e4m3fn', 'e5m2'):
+        dq_extreme = fake_quantize(extreme, FP8Spec(format=fmt), ste=False)
+        _ok(f'extreme finite input stays finite ({fmt})',
+            bool(torch.isfinite(dq_extreme).all()),
+            f'{dq_extreme.tolist()}')
     bad = x.clone()
     bad[0, 0] = float('inf')
     try:
