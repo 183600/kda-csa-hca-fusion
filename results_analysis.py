@@ -828,6 +828,17 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
     if not logits.is_floating_point():
         raise ValueError(
             f'logits must be a floating-point tensor, got {logits.dtype}')
+    # A NaN/+Inf logit would silently fall through every category test and
+    # be recorded as a plausible-looking error (usually ``novel_token``),
+    # and its probability/entropy would make the summary NaN. Refuse the
+    # report instead: the caller already has diagnose_nonfinite() for the
+    # staged data -> log(0)/div0 -> softmax -> AMP -> grad/LR triage.
+    if logits.numel() and not bool(torch.isfinite(logits).all()):
+        n_bad = int((~torch.isfinite(logits)).sum())
+        raise ValueError(
+            f'logits contain {n_bad} non-finite value(s); run '
+            f'diagnose_nonfinite() on the forward pass before computing '
+            f'token bad-case diagnostics')
     for name, ids in (('labels', labels), ('input_ids', input_ids)):
         if (ids.dtype == torch.bool or ids.is_floating_point()
                 or ids.is_complex()):

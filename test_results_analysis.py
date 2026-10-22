@@ -873,6 +873,11 @@ def test_lm_token_diagnostics_rejects_malformed_inputs():
         lm_token_diagnostics(logits, labels, input_ids.to(torch.float32))
     with pytest.raises(ValueError):
         lm_token_diagnostics(logits.to(torch.long), labels, input_ids)
+    for bad_value in (float('nan'), float('inf'), float('-inf')):
+        bad_logits = logits.clone()
+        bad_logits[0, 0, 0] = bad_value
+        with pytest.raises(ValueError, match='non-finite'):
+            lm_token_diagnostics(bad_logits, labels, input_ids)
     for bad_k in (0, -1, True, 2.5):
         with pytest.raises(ValueError):
             lm_token_diagnostics(logits, labels, input_ids, top_k=bad_k)
