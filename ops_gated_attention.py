@@ -11,6 +11,7 @@ Gate types:
 
 from __future__ import annotations
 
+import math as _math
 import warnings as _warnings
 
 import torch
@@ -87,6 +88,21 @@ class GatedAttentionMixin:
         return f"gate_type={self.gate_type}, gate_dim={self.gate_dim}, num_heads={self.num_heads}"
 
 
+def _require_positive_int(name: str, value) -> int:
+    """Exact positive integer geometry (bool is not a dimension)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f'{name}={value!r} must be a positive int.')
+    return value
+
+
+def _require_finite_real(name: str, value) -> float:
+    if (isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not _math.isfinite(float(value))):
+        raise ValueError(f'{name}={value!r} must be a finite number.')
+    return float(value)
+
+
 def create_gate(
     gate_type: str,
     num_heads: int,
@@ -112,6 +128,12 @@ def create_gate(
     """
     if gate_type == 'none':
         return None
+    num_heads = _require_positive_int('num_heads', num_heads)
+    gate_dim = _require_positive_int('gate_dim', gate_dim)
+    init_value = _require_finite_real('init_value', init_value)
+    init_std = _require_finite_real('init_std', init_std)
+    if init_std < 0.0:
+        raise ValueError(f'init_std={init_std!r} must be >= 0.')
     if gate_type == 'per_head':
         gate = torch.normal(init_value, init_std, (num_heads,), device=device, dtype=dtype)
     elif gate_type == 'per_channel':
@@ -291,9 +313,9 @@ class GatedDeltaRule(nn.Module):
         g_clamp_max: float = 50.0,
     ):
         super().__init__()
-        self.num_heads = num_heads
-        self.key_dim = key_dim
-        self.value_dim = value_dim
+        self.num_heads = _require_positive_int('num_heads', num_heads)
+        self.key_dim = _require_positive_int('key_dim', key_dim)
+        self.value_dim = _require_positive_int('value_dim', value_dim)
         self.gate_type = gate_type
         self.g_clamp_min = g_clamp_min
         self.g_clamp_max = g_clamp_max

@@ -443,6 +443,40 @@ def test_online_softmax_chunk_sizes_require_exact_ints():
                 'no error raised')
 
 
+def test_gate_factory_and_gated_delta_geometry_reject_coercions():
+    """Head widths are exact positive ints; gate std is finite and >= 0."""
+    from ops_gated_attention import GatedDeltaRule, create_gate
+
+    create_gate('per_channel', 2, 4)
+    create_gate('none', 0, 0)  # 'none' ignores the unused geometry
+    for kwargs in (
+            {'num_heads': True}, {'num_heads': 2.0}, {'gate_dim': 0},
+            {'init_std': -1.0}, {'init_std': float('nan')},
+            {'init_value': float('inf')}):
+        call = {'num_heads': 2, 'gate_dim': 4}
+        call.update(kwargs)
+        try:
+            create_gate('per_channel', **call)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'create_gate {kwargs} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'create_gate {kwargs} rejected', False, 'no error raised')
+
+    for args in ((True, 2, 2), (1, 0, 2), (1, 2, -1), (1, 2.0, 2)):
+        try:
+            GatedDeltaRule(*args)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _ok(f'GatedDeltaRule {args} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+        else:
+            _ok(f'GatedDeltaRule {args} rejected', False, 'no error raised')
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -536,6 +570,7 @@ if __name__ == '__main__':
     test_rope_rejects_invalid_dims_bases_and_positions()
     test_decoding_cache_geometry_requires_exact_ints()
     test_online_softmax_chunk_sizes_require_exact_ints()
+    test_gate_factory_and_gated_delta_geometry_reject_coercions()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()
