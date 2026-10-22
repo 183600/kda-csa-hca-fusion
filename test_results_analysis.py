@@ -579,6 +579,9 @@ def test_monitoring_does_not_change_training_results():
     assert monitored['steps_since_best'] >= 0
     assert monitored['accuracy_regime']['saturated'] is False
     assert monitored['gradient_norms']['n_steps'] == 25
+    assert monitored['gradient_norms']['median'] is not None
+    assert monitored['gradient_norms']['n_nonfinite'] == 0
+    assert isinstance(monitored['gradient_norms']['notes'], list)
 
 
 def test_train_one_records_confusion_and_ranking_metrics():

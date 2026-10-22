@@ -92,6 +92,7 @@ from train_diagnostics import (
     optimizer_update_report,
     pool_error_analyses,
     snapshot_parameters,
+    summarize_gradient_norms,
 )
 from results_schema import CURRENT_SCHEMA_VERSION
 
@@ -1998,18 +1999,7 @@ def train_one(op_name, d_model=32, seq_len=16, n_kv=1, vocab=16,
             f"wrong; categories: "
             f"{ {c: v['count'] for c, v in error_analysis['categories'].items() if v['count']} }")
 
-    gradient_norms = None
-    if grad_norms:
-        gradient_norms = {
-            'n_steps': len(grad_norms),
-            'max': max(grad_norms),
-            'mean': sum(grad_norms) / len(grad_norms),
-            'last': grad_norms[-1],
-            'clip_norm': 1.0,
-            # Pre-clip norm much larger than the clip budget means the raw
-            # gradients were exploding and clipping is masking it.
-            'n_above_clip': sum(1 for g in grad_norms if g > 1.0),
-        }
+    gradient_norms = summarize_gradient_norms(grad_norms, clip_norm=1.0)
     curve_fields = {}
     if curve_block is not None:
         # Additive curve-reading fields. ``final_acc`` above still means

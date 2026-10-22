@@ -154,7 +154,8 @@ from train_diagnostics import (
     DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
     ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
     ValidationCurve, accuracy_cost_tradeoff, log_pooled_errors, log_tradeoff,
-    pool_error_analyses, raise_non_finite, triage_gradient,
+    pool_error_analyses, raise_non_finite, summarize_gradient_norms,
+    triage_gradient,
 )
 from run_quality import (
     MQARHead,
@@ -642,6 +643,7 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
 
     losses = []
     train_accs = []
+    grad_norms = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
             train_batch, seq_len, n_kv, VOCAB, embed, device,
@@ -668,6 +670,7 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
                 grad_norm=float(clip_norm),
                 context=f'step={step}, variant={variant["name"]}, '
                         f'seed={seed}')
+        grad_norms.append(float(clip_norm))
         opt.step()
         losses.append(loss.item())
         train_accs.append(float((logits.argmax(-1) == target).float().mean()))
@@ -750,6 +753,7 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
                              if losses else None),
         'loss_curve': losses,
         'acc_curve': train_accs,
+        'gradient_norms': summarize_gradient_norms(grad_norms, clip_norm=1.0),
         # Additive results-analysis block (held-out curve + verdict +
         # generalization gap + bad cases); see run_ablation.eval_layout.
         **curve_block,
@@ -1294,6 +1298,7 @@ def main():
                         'fwd_ms': None, 'n_params': None, 'n_layers': None,
                         'last_train_loss': None, 'mean_last10_loss': None,
                         'loss_curve': [], 'acc_curve': [],
+                        'gradient_norms': None,
                         # Mirror the success-row diagnostic schema
                         # (held-out curve + bad cases) so
                         # pd.DataFrame(per_seed) has uniform columns.

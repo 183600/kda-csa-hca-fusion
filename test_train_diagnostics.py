@@ -32,6 +32,7 @@ from train_diagnostics import (
     pool_error_analyses,
     raise_non_finite,
     snapshot_parameters,
+    summarize_gradient_norms,
     triage_gradient,
     triage_nonfinite,
 )
@@ -43,6 +44,65 @@ def _curve(points, *, steps, val_every=1, ceiling=None):
                             steps=steps, val_every=val_every,
                             label='test', ceiling=ceiling)
     return curve
+
+
+def test_gradient_norm_summary_names_masked_explosions():
+    # Raw norms far above the clip budget mean clipping is masking an
+    # explosion; a growing tail adds a second, independent warning.
+    summary = summarize_gradient_norms([0.5, 1.0, 2.0, 20.0],
+                                       clip_norm=1.0)
+    assert summary['n_steps'] == 4
+    assert summary['max'] == 20.0
+    assert summary['n_above_clip'] == 2
+    assert summary['max_over_clip'] == 20.0
+    assert summary['n_over_10x_clip'] == 1
+    assert any('masking an explosion' in n for n in summary['notes'])
+    assert any('grew from' in n for n in summary['notes'])
+    json.dumps(summary, allow_nan=False)
+
+    # A healthy, clipped run must not raise a false alarm.
+    quiet = summarize_gradient_norms([0.8, 0.9, 0.85, 0.7], clip_norm=1.0)
+    assert quiet['n_above_clip'] == 0
+    assert quiet['notes'] == []
+
+    # Non-finite norms are counted but never poison the finite statistics.
+    mixed = summarize_gradient_norms([1.0, float('inf'), float('nan'), 3.0],
+                                     clip_norm=1.0)
+    assert mixed['n_nonfinite'] == 2
+    assert mixed['max'] == 3.0
+    assert mixed['mean'] == 2.0
+    json.dumps(mixed, allow_nan=False)
+
+    assert summarize_gradient_norms([]) is None
+    dead = summarize_gradient_norms([float('nan')], clip_norm=1.0)
+    assert dead['max'] is None
+    assert 'every recorded gradient norm is non-finite' in dead['notes'][0]
+
+
+def test_experiment_rows_carry_gradient_health():
+    """Exp 5/8 per-seed rows now expose the same clipping/explosion signal
+    as Exp 7, so a layout or mechanism row can be rejected for an unstable
+    optimizer even when its endpoint loss happens to look fine."""
+    import run_ablation
+    import run_mechanism_ablation
+
+    layout = run_ablation.eval_layout(
+        (1, 1, 1), steps=3, device='cpu', train_batch=8,
+        eval_batches=1, eval_batch=8, val_every=0,
+        error_batches=1, error_batch=8, max_error_examples=2)
+    assert layout['gradient_norms']['n_steps'] == 3
+    assert layout['gradient_norms']['clip_norm'] == 1.0
+    json.dumps(layout['gradient_norms'], allow_nan=False)
+
+    group = run_ablation.eval_group(
+        'g', 'kda', ('memory', 'csa', 'hca'), steps=3, device='cpu',
+        train_batch=8, eval_batches=1, eval_batch=8, val_every=0)
+    assert group['gradient_norms']['n_steps'] == 3
+
+    variant = run_mechanism_ablation.train_variant(
+        run_mechanism_ablation.VARIANTS[0], seed=0, steps=3, device='cpu',
+        train_batch=8, eval_batches=1, eval_batch=8)
+    assert variant['gradient_norms']['n_steps'] == 3
 
 
 def test_validation_curve_quantifies_early_stopping_regret():

@@ -254,6 +254,88 @@ def optimizer_update_report(before, named_parameters, optimizer, *,
 
 
 # --------------------------------------------------------------------------
+# 1b. Gradient-norm health summary
+# --------------------------------------------------------------------------
+def summarize_gradient_norms(grad_norms, *, clip_norm: float | None = None
+                             ) -> dict | None:
+    """Summarize the per-step PRE-CLIP gradient norm curve.
+
+    The loss curve says whether the objective fell; this says whether the
+    optimizer stayed healthy while it fell. A run whose raw norm sits far
+    above the clip budget is being carried by clipping, and a norm that is
+    still growing at the end is the first sign of an LR that is too large.
+    ``None`` is returned when no norms were recorded, so a caller can keep
+    the field absent/None for a disabled probe.
+
+    All values are finite-only; non-finite norms are counted separately
+    (``n_nonfinite``) rather than poisoning the summary with NaN.
+    """
+    vals = [float(g) for g in grad_norms if g is not None]
+    if not vals:
+        return None
+    finite = [v for v in vals if math.isfinite(v)]
+    out = {
+        'n_steps': len(vals),
+        'n_nonfinite': len(vals) - len(finite),
+        'max': None,
+        'mean': None,
+        'median': None,
+        'p95': None,
+        'first': None,
+        'last': None,
+        'tail_mean': None,
+        'clip_norm': None,
+        'n_above_clip': None,
+        'max_over_clip': None,
+        'n_over_10x_clip': None,
+        'notes': [],
+    }
+    if not finite:
+        out['notes'].append(
+            'every recorded gradient norm is non-finite: run '
+            'diagnose_nonfinite() on the first failing step.')
+        return out
+    ordered = sorted(finite)
+    n = len(ordered)
+    out.update({
+        'max': ordered[-1],
+        'mean': sum(finite) / n,
+        'median': (ordered[n // 2] if n % 2
+                   else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0),
+        'p95': ordered[max(0, math.ceil(0.95 * n) - 1)],
+        'first': finite[0],
+        'last': finite[-1],
+    })
+    tail_k = max(1, min(10, math.ceil(0.1 * n)))
+    out['tail_mean'] = sum(finite[-tail_k:]) / tail_k
+    if clip_norm is not None:
+        try:
+            clip = float(clip_norm)
+        except (TypeError, ValueError):
+            clip = None
+        if clip is not None and math.isfinite(clip) and clip > 0:
+            out['clip_norm'] = clip
+            out['n_above_clip'] = sum(1 for v in finite if v > clip)
+            out['max_over_clip'] = out['max'] / clip
+            out['n_over_10x_clip'] = sum(1 for v in finite if v > 10.0 * clip)
+            if out['max_over_clip'] > 10.0:
+                out['notes'].append(
+                    f"peak gradient norm is {out['max_over_clip']:.1f}x the "
+                    f'clip budget: clipping is masking an explosion, not '
+                    f'just stabilizing a healthy step.')
+            elif out['n_above_clip'] == n:
+                out['notes'].append(
+                    'every step exceeded the clip budget: lower the learning '
+                    'rate or inspect the loss for large early gradients.')
+    if out['first'] > 0 and out['tail_mean'] > 2.0 * out['first']:
+        out['notes'].append(
+            f"gradient norms grew from {out['first']:.3g} to a tail mean of "
+            f"{out['tail_mean']:.3g}: the optimization is diverging even if "
+            f'the loss has not caught up yet.')
+    return out
+
+
+# --------------------------------------------------------------------------
 # 2. Held-out validation curve
 # --------------------------------------------------------------------------
 def accuracy_regime(val_accs: Sequence[float],

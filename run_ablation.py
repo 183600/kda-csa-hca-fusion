@@ -118,7 +118,7 @@ from train_diagnostics import (
     ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
     ValidationCurve, accuracy_cost_tradeoff, log_pooled_errors, log_tradeoff,
     optimizer_update_report, pool_error_analyses, raise_non_finite,
-    snapshot_parameters, triage_gradient,
+    snapshot_parameters, summarize_gradient_norms, triage_gradient,
 )
 from multi_seed_stats import (
     min_detectable_effect, seeds_required, tost_from_summary,
@@ -761,6 +761,7 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
 
     losses = []
     train_accs = []
+    grad_norms = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
             train_batch, seq_len, n_kv, VOCAB, embed, device, generator=batch_gen)
@@ -793,6 +794,7 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
                 grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
                 grad_norm=float(clip_norm),
                 context=f'step={step}, ratio={ratio}, seed={seed}')
+        grad_norms.append(float(clip_norm))
         opt.step()
         losses.append(loss.item())
         train_accs.append(float((logits.argmax(-1) == target).float().mean()))
@@ -859,6 +861,7 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
         'mean_last10_loss': mean_last10,
         'loss_curve': losses,
         'acc_curve': train_accs,
+        'gradient_norms': summarize_gradient_norms(grad_norms, clip_norm=1.0),
         # Additive results-analysis block: the held-out curve, its
         # over/under/saturation verdict, the generalization gap, the
         # best-validation point and the bad-case report. Additive on
@@ -905,6 +908,7 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
                 'mean_last10_loss': None,
                 'loss_curve': [],
                 'acc_curve': [],
+                'gradient_norms': None,
                 # Same keys as a live row, so a consumer can read every
                 # per_seed entry with one code path (mirrors run_quality's
                 # failed-seed stub).
@@ -1527,6 +1531,7 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
 
     losses = []
     train_accs = []
+    grad_norms = []
     for step in range(steps):
         x_emb, target, cue_pos = make_mqar_batch(
             train_batch, seq_len, n_kv, VOCAB, embed, device, generator=batch_gen)
@@ -1550,6 +1555,7 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
                 grads={f'p{i}': p.grad for i, p in enumerate(bad_grads)},
                 grad_norm=float(clip_norm),
                 context=f'step={step}, group={group_id}, seed={seed}')
+        grad_norms.append(float(clip_norm))
         opt.step()
         losses.append(loss.item())
         train_accs.append(float((logits.argmax(-1) == target).float().mean()))
@@ -1631,6 +1637,7 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
         'mean_last10_loss': mean_last10,
         'loss_curve': losses,
         'acc_curve': train_accs,
+        'gradient_norms': summarize_gradient_norms(grad_norms, clip_norm=1.0),
         # Additive results-analysis block (see eval_layout).
         **curve_block,
     }
@@ -1682,6 +1689,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                 'last_train_loss': None, 'mean_last10_loss': None,
                 'loss_curve': [],
                 'acc_curve': [],
+                'gradient_norms': None,
                 'val_every': (int(kw.get('val_every', 0) or 0)
                               or max(1, steps // 4)),
                 'val_history': [],
