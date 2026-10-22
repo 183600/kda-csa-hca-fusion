@@ -83,6 +83,8 @@ eight-group experiment matrix.
 ├── run_all.py             # Single-entry runner (RUN_ALL_PROFILE=smoke|screen|full)
 ├── experiment_design.py   # Pre-registered plans, prospective power/MDE, runtime audit
 ├── kaggle_setup.py        # CUDA bootstrap + shared utilities (sanitize_for_json, parse_int_env)
+├── near_duplicates.py     # Token n-gram MinHash/LSH near-duplicate leakage detector
+├── docs/data-integrity.md # Near-duplicate + fingerprint data-integrity contract
 ├── test_figures.py        # Tests for the figure generation pipeline
 ├── results/               # Generated JSON outputs (gitignored; regenerate via run_all.py)
 ├── figures/               # Generated PDF/PNG outputs (gitignored; regenerate via make_figures.py)
@@ -421,6 +423,25 @@ measured from a real forward pass. The unit tests in `run_correctness.py`
 (`test_prefill_flops_*`, `test_kv_cache_ceil_block_count`) verify the
 formulas against hand-computed expected values; for production claims,
 cross-check with `torch.cuda.memory_allocated` and a FLOP counter.
+
+### 6. Near-duplicate leakage and data fingerprints
+
+The LM data protocol removes exact and whitespace/Unicode-normalized
+duplicates before splitting, and audits identical truncated model windows.
+It also audits **near duplicates** — the same story with a few words changed,
+which exact hashing cannot see and which would inflate a held-out score if
+the two copies straddled train/val/test. `near_duplicates.py` compares the
+truncated `seq_len+1` token windows by token n-gram Jaccard (default
+threshold `0.8`, 5-grams), using MinHash+LSH for candidates and an exact
+second pass for the reported similarity. The cross-split audit runs by
+default in `train_lm_autodl.py`; `--dedup_near` removes near duplicates
+before the split and `--strict_near_dup` refuses to train while any
+cross-split pair remains (or while the candidate cap left the audit
+incomplete). The audit is structural (no model metric), so it
+can run while the test split is still sealed. See
+[docs/data-integrity.md](docs/data-integrity.md) for the full contract,
+the recorded `near_duplicate_audit` fields, the candidate-truncation
+caveat, and the corpus-fingerprint framing fix.
 
 ---
 

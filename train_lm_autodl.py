@@ -52,6 +52,7 @@ import math
 import dataclasses
 import unicodedata
 from collections import OrderedDict
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,6 +102,15 @@ from train_diagnostics import (
     triage_gradient,
 )
 from ppl_bootstrap import bootstrap_ppl_ci, throughput_summary
+from near_duplicates import (
+    DEFAULT_NEAR_DUP_MAX_CANDIDATES,
+    DEFAULT_NEAR_DUP_NUM_PERM,
+    DEFAULT_NEAR_DUP_SHINGLE_SIZE,
+    DEFAULT_NEAR_DUP_THRESHOLD,
+    near_duplicate_clusters,
+    near_duplicate_pairs,
+    summarize_cross_split,
+)
 import grad_checkpointing as grad_ckpt
 
 # tokenizer / dataset handling (reuse TinyStories if available)
@@ -350,7 +360,11 @@ def _is_nonfinite_document(text):
 
 
 def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
-                   dedup_windows=False):
+                   dedup_windows=False, dedup_near=False,
+                   near_dup_threshold=DEFAULT_NEAR_DUP_THRESHOLD,
+                   near_dup_shingle_size=DEFAULT_NEAR_DUP_SHINGLE_SIZE,
+                   near_dup_num_perm=DEFAULT_NEAR_DUP_NUM_PERM,
+                   near_dup_max_candidates=DEFAULT_NEAR_DUP_MAX_CANDIDATES):
     """Clean the raw corpus BEFORE any split is drawn.
 
     Cleaning steps (all recorded in the returned stats):
@@ -374,6 +388,15 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
         counted (``n_window_duplicates``) so the reference corpus
         composition is unchanged for a short-``seq_len`` corpus where
         many distinct documents share a prefix;
+      * with ``dedup_near=True``, drop NEAR-duplicate documents as well:
+        two windows whose token n-gram Jaccard is at least
+        ``near_dup_threshold`` are the same story with an edit, not two
+        independent samples. The duplicate clusters are computed on the
+        cleaned corpus BEFORE the split, so no near-twin can straddle the
+        train/eval boundary. The default is off for backward
+        compatibility; the training entry point enables the cross-split
+        AUDIT by default (see ``near_duplicate_leakage_audit``) and the
+        pre-split drop only with ``--dedup_near``;
       * drop documents that tokenize to fewer than ``min_tokens`` ids:
         they produce no supervised label at all (every target is masked
         with -100), i.e. they are pure label noise for a next-token
@@ -385,6 +408,7 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
     """
     texts = list(texts)
     clean, seen_texts, seen_normalized, seen_windows = [], set(), set(), set()
+    clean_ids = [] if dedup_near else None
     n_nonfinite = n_empty = n_duplicates = 0
     n_normalized_duplicates = 0
     n_window_duplicates = n_too_short = n_tokenize_errors = 0
@@ -428,6 +452,48 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
         else:
             seen_windows.add(window_key)
         clean.append(s)
+        if clean_ids is not None:
+            # Compact representation: a 20k-document corpus at seq_len=1024
+            # would otherwise hold ~20M Python ints (hundreds of MB) just
+            # for the near-duplicate sketch.
+            clean_ids.append(np.asarray(ids, dtype=np.uint64))
+
+    near_dup = {
+        'dedup_near': bool(dedup_near),
+        'near_dup_threshold': float(near_dup_threshold),
+        'near_dup_shingle_size': int(near_dup_shingle_size),
+        'near_dup_num_perm': int(near_dup_num_perm),
+        'near_dup_max_candidates': int(near_dup_max_candidates),
+        'n_near_duplicates': 0,
+        'n_near_duplicate_pairs': 0,
+        'n_near_duplicate_clusters': 0,
+        'largest_near_duplicate_cluster': 0,
+        'near_duplicate_candidates_truncated': False,
+    }
+    if dedup_near and len(clean) > 1:
+        near = near_duplicate_pairs(
+            clean_ids, threshold=near_dup_threshold,
+            shingle_size=near_dup_shingle_size,
+            num_perm=near_dup_num_perm,
+            max_candidate_pairs=near_dup_max_candidates)
+        clusters = near_duplicate_clusters(near['pairs'], len(clean))
+        # Keep the first (corpus-order) representative of every cluster;
+        # dropping the rest removes the redundant near-twin without
+        # looking at the split assignment.
+        drop = set()
+        for cluster in clusters:
+            drop.update(cluster[1:])
+        if drop:
+            clean = [text for i, text in enumerate(clean) if i not in drop]
+        near_dup.update({
+            'n_near_duplicates': len(drop),
+            'n_near_duplicate_pairs': int(near['n_pairs']),
+            'n_near_duplicate_clusters': len(clusters),
+            'largest_near_duplicate_cluster': (
+                max((len(c) for c in clusters), default=0)),
+            'near_duplicate_candidates_truncated':
+                bool(near['candidates_truncated']),
+        })
     n_raw = len(texts)
     stats = {
         'n_raw': n_raw,
@@ -443,12 +509,20 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
         'dedup_windows': bool(dedup_windows),
         'min_tokens': int(min_tokens),
         'kept_fraction': (len(clean) / n_raw) if n_raw else 0.0,
+        **near_dup,
     }
     return {'texts': clean, 'stats': stats}
 
 
 def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
-                      group_ids=None, chronological=False):
+                      group_ids=None, chronological=False,
+                      tokenizer=None, seq_len=None,
+                      near_dup_audit=False,
+                      near_dup_threshold=DEFAULT_NEAR_DUP_THRESHOLD,
+                      near_dup_shingle_size=DEFAULT_NEAR_DUP_SHINGLE_SIZE,
+                      near_dup_num_perm=DEFAULT_NEAR_DUP_NUM_PERM,
+                      near_dup_max_candidates=DEFAULT_NEAR_DUP_MAX_CANDIDATES,
+                      strict_near_dup=False):
     """Draw and audit the train/val/test split over CLEANED texts.
 
     The split itself is deterministic (see
@@ -468,10 +542,24 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
     NFKC + whitespace collapsing) — a defense-in-depth check against a
     future refactor that moves dedup after the split.
 
+    ``near_dup_audit=True`` adds the token n-gram near-duplicate audit (see
+    :func:`near_duplicate_leakage_audit`). It reports cross-split pairs in
+    ``report['near_duplicate_overlaps']`` but does NOT drop rows; dropping
+    must happen before the split (``clean_lm_texts(..., dedup_near=True)``).
+    ``strict_near_dup=True`` forces the audit and raises when any
+    cross-split near-duplicate pair remains.
+
     Returns ``(split, report)`` where ``split`` maps split names to index
     lists and ``report`` is the JSON-serializable audit + overlap report.
     Raises ``RuntimeError`` on any leakage violation.
     """
+    if strict_near_dup:
+        near_dup_audit = True
+    if near_dup_audit and (tokenizer is None or seq_len is None):
+        raise ValueError(
+            'split_clean_texts(near_dup_audit=True) needs the tokenizer and '
+            'seq_len used by the model window (got tokenizer=None or '
+            'seq_len=None)')
     if group_ids is not None and len(group_ids) != len(texts):
         raise ValueError(
             f'group_ids has length {len(group_ids)} but there are '
@@ -515,7 +603,30 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         'audit': audit,
         'exact_text_overlaps': overlaps,
         'normalized_text_overlaps': normalized_overlaps,
+        'near_duplicate_overlaps': None,
     }
+    if near_dup_audit:
+        near = near_duplicate_leakage_audit(
+            by_split['train'], by_split['val'], by_split['test'],
+            tokenizer, seq_len, threshold=near_dup_threshold,
+            shingle_size=near_dup_shingle_size, num_perm=near_dup_num_perm,
+            max_candidate_pairs=near_dup_max_candidates)
+        report['near_duplicate_overlaps'] = near
+        if strict_near_dup and near['detector']['candidates_truncated']:
+            raise RuntimeError(
+                'train/val/test split cannot certify near-duplicate '
+                'safety: the candidate budget was exhausted '
+                f"({near['detector']['n_candidate_pairs']} candidate "
+                'pairs); raise near_dup_max_candidates')
+        if strict_near_dup and near['n_cross_split_pairs']:
+            problems = list(audit['problems'])
+            problems.append(
+                f"{near['n_cross_split_pairs']} cross-split "
+                f"near-duplicate pair(s) at Jaccard >= "
+                f"{near_dup_threshold}: {near['by_split_pair']}")
+            raise RuntimeError(
+                'train/val/test split failed its near-duplicate leakage '
+                'audit: ' + '; '.join(problems))
     problems = list(audit['problems'])
     for pair, n_overlap in overlaps.items():
         if n_overlap:
@@ -662,6 +773,71 @@ def _filter_leaking_heldout(train_texts, val_texts, test_texts, tokenizer,
                  'would empty it, and window_overlap_audit then reports the '
                  'residual leak.'),
     }
+
+
+def near_duplicate_leakage_audit(
+        train_texts, val_texts, test_texts, tokenizer, seq_len, *,
+        threshold=DEFAULT_NEAR_DUP_THRESHOLD,
+        shingle_size=DEFAULT_NEAR_DUP_SHINGLE_SIZE,
+        num_perm=DEFAULT_NEAR_DUP_NUM_PERM,
+        max_candidate_pairs=DEFAULT_NEAR_DUP_MAX_CANDIDATES):
+    """Audit NEAR-duplicate leakage across the three already-drawn splits.
+
+    Exact-string and exact-window dedup cannot see a document that was
+    stored again with a few edited words.  Such a near-twin is a leak when
+    one copy is in train and the other in val/test: the held-out loss then
+    measures memorisation of a near-copy instead of generalisation.  This
+    function compares the truncated model-input windows with token
+    n-gram Jaccard (MinHash candidate retrieval + exact verification, see
+    :mod:`near_duplicates`) and reports only pairs that STRADDLE a split
+    boundary.  Within-split redundancy is counted separately.
+
+    The audit is structural: it reads the text/token content but computes
+    no model metric and makes no model-selection decision, so it can run
+    before training with the test split still sealed.  It never drops a
+    row; dropping must happen before the split (``clean_lm_texts(...,
+    dedup_near=True)``) or be refused by the caller's strict gate.
+    """
+    combined = list(train_texts) + list(val_texts) + list(test_texts)
+    labels = (['train'] * len(train_texts)
+              + ['val'] * len(val_texts)
+              + ['test'] * len(test_texts))
+    token_ids = []
+    n_tokenize_errors = 0
+    for text in combined:
+        try:
+            ids = tokenizer.encode(
+                text, truncation=True, max_length=seq_len + 1)
+            token_ids.append(np.asarray(ids, dtype=np.uint64))
+        except Exception:
+            n_tokenize_errors += 1
+            token_ids.append(None)
+    detector = near_duplicate_pairs(
+        token_ids, threshold=threshold, shingle_size=shingle_size,
+        num_perm=num_perm, max_candidate_pairs=max_candidate_pairs)
+    report = summarize_cross_split(detector['pairs'], labels)
+    report.update({
+        'enabled': True,
+        'splits': {'train': len(train_texts),
+                   'val': len(val_texts),
+                   'test': len(test_texts)},
+        'n_tokenize_errors': int(n_tokenize_errors),
+        'detector': {
+            'method': 'token-n-gram jaccard (minhash + exact verification)',
+            'threshold': float(threshold),
+            'shingle_size': int(shingle_size),
+            'num_perm': int(num_perm),
+            'band_rows': int(detector['band_rows']),
+            'seed': int(detector['seed']),
+            'n_documents': int(detector['n_documents']),
+            'n_nonempty_documents': int(detector['n_nonempty_documents']),
+            'n_candidate_pairs': int(detector['n_candidate_pairs']),
+            'candidates_truncated': bool(detector['candidates_truncated']),
+            'exact_verification': bool(detector['exact_verification']),
+        },
+        'flag': bool(report['n_cross_split_pairs'] > 0),
+    })
+    return report
 
 
 def _evenly_spaced_probe_indices(n, n_probe):
@@ -1846,6 +2022,12 @@ def _texts_fingerprint(texts, n_probe=64, max_chars_per_text=4096):
     texts (each truncated to ``max_chars_per_text``) plus the corpus size,
     so a run record can detect a swapped split / stale dataset cache
     without hashing gigabytes on every launch.
+
+    Each sampled text is framed with its index and byte length before
+    hashing. Without the length prefix, concatenating the raw strings made
+    the fingerprint ambiguous at text boundaries: ``["ab", "c"]`` and
+    ``["a", "bc"]`` hashed the same byte stream and therefore received the
+    same data-version id even though they are different corpora.
     """
     n = len(texts)
     indices = _evenly_spaced_probe_indices(n, n_probe)
@@ -1853,8 +2035,16 @@ def _texts_fingerprint(texts, n_probe=64, max_chars_per_text=4096):
     h.update(
         f"n={n};probe={len(indices)};max_chars={max_chars_per_text}".encode())
     for i in indices:
-        h.update(str(texts[i])[:max_chars_per_text].encode(
-            'utf-8', 'replace'))
+        chunk = str(texts[i])[:max_chars_per_text].encode(
+            'utf-8', 'replace')
+        # Explicit framing: index, byte length, then the bytes. The index
+        # also distinguishes a reordered probe from the original one.
+        h.update(b'\x00i=')
+        h.update(str(int(i)).encode('ascii'))
+        h.update(b';len=')
+        h.update(str(len(chunk)).encode('ascii'))
+        h.update(b'\x00')
+        h.update(chunk)
     return h.hexdigest()
 
 
@@ -2305,6 +2495,44 @@ def main():
                              "model-input window. Pair with "
                              "--dedup_windows for a corpus where distinct "
                              "documents commonly share a prefix.")
+    parser.add_argument("--dedup_near", action="store_true",
+                        help="Drop NEAR-duplicate documents (token n-gram "
+                             "Jaccard >= --near_dup_threshold) BEFORE the "
+                             "split. Exact/normalized dedup cannot see a "
+                             "story stored again with a few words changed; "
+                             "such a near-twin is a leak when the two copies "
+                             "land on different sides of train/eval. Off by "
+                             "default for backward compatibility; the "
+                             "cross-split near-duplicate AUDIT is always on "
+                             "unless --skip_near_dup_audit is passed.")
+    parser.add_argument("--near_dup_threshold", type=float,
+                        default=DEFAULT_NEAR_DUP_THRESHOLD,
+                        help="Pre-specified token n-gram Jaccard threshold "
+                             "for near-duplicate detection (default 0.8). "
+                             "Must be in (0, 1]; do not tune it on the "
+                             "observed held-out pairs.")
+    parser.add_argument("--near_dup_shingle", type=int,
+                        default=DEFAULT_NEAR_DUP_SHINGLE_SIZE,
+                        help="Token n-gram width for near-duplicate "
+                             "detection (default 5).")
+    parser.add_argument("--near_dup_max_candidates", type=int,
+                        default=DEFAULT_NEAR_DUP_MAX_CANDIDATES,
+                        help="Cap on LSH candidate pairs re-scored by the "
+                             "near-duplicate audit (default 200000). When "
+                             "the cap is hit the audit reports a lower "
+                             "bound, and --strict_near_dup refuses to "
+                             "certify the split.")
+    parser.add_argument("--strict_near_dup", action="store_true",
+                        help="Refuse to train when the audited train/val/"
+                             "test splits share any near-duplicate pair at "
+                             "Jaccard >= --near_dup_threshold. Pair with "
+                             "--dedup_near to remove them before the split.")
+    parser.add_argument("--skip_near_dup_audit", action="store_true",
+                        help="Skip the (default-on) cross-split "
+                             "near-duplicate audit. Not recommended: without "
+                             "it the leakage-safe split guarantee covers "
+                             "only exact duplicates and identical truncated "
+                             "windows.")
     parser.add_argument("--val_every", type=int, default=100,
                         help="Run a validation pass every N optimizer steps "
                              "(default 100); a validation pass also runs at "
@@ -2712,8 +2940,13 @@ def main():
     if args.max_docs:
         corpus_budget = min(corpus_budget, int(args.max_docs))
     raw_texts, data_source = _load_raw_texts(corpus_budget, split="train")
-    cleaning = clean_lm_texts(raw_texts, tokenizer, seq_len,
-                              dedup_windows=bool(args.dedup_windows))
+    cleaning = clean_lm_texts(
+        raw_texts, tokenizer, seq_len,
+        dedup_windows=bool(args.dedup_windows),
+        dedup_near=bool(args.dedup_near),
+        near_dup_threshold=args.near_dup_threshold,
+        near_dup_shingle_size=args.near_dup_shingle,
+        near_dup_max_candidates=args.near_dup_max_candidates)
     clean_texts = cleaning['texts']
     if len(clean_texts) < 10:
         raise SystemExit(
@@ -2754,6 +2987,51 @@ def main():
                 "window(s)); rerun with --dedup_windows or relax with "
                 "--strict_window_dedup off")
 
+    # Near-duplicate leakage audit. Exact/normalized/window audits above
+    # catch identical content; this catches the same story with edits.
+    # It reads only text/token content (no model metric), so it can run
+    # while the test split is still sealed for training.
+    if args.strict_near_dup and args.skip_near_dup_audit:
+        raise SystemExit(
+            "--strict_near_dup requires the near-duplicate audit; remove "
+            "--skip_near_dup_audit")
+    near_audit = None
+    if not args.skip_near_dup_audit:
+        near_audit = near_duplicate_leakage_audit(
+            train_texts, val_texts, test_texts, tokenizer, seq_len,
+            threshold=args.near_dup_threshold,
+            shingle_size=args.near_dup_shingle,
+            max_candidate_pairs=args.near_dup_max_candidates)
+        truncated = bool(
+            near_audit['detector']['candidates_truncated'])
+        if truncated:
+            print("[data] WARNING: near-duplicate candidate budget was "
+                  "exhausted; the reported cross-split pair count is a "
+                  "lower bound (raise --near_dup_max_candidates for a "
+                  "full audit)")
+            if args.strict_near_dup:
+                raise SystemExit(
+                    "refusing to certify the split: the near-duplicate "
+                    "candidate budget was exhausted "
+                    f"({near_audit['detector']['n_candidate_pairs']} "
+                    "candidate pairs), so the audit cannot prove the "
+                    "absence of cross-split near duplicates; raise "
+                    "--near_dup_max_candidates")
+        if near_audit['n_cross_split_pairs']:
+            print(f"[data] WARNING: {near_audit['n_cross_split_pairs']} "
+                  f"cross-split near-duplicate pair(s) at token "
+                  f"Jaccard >= {args.near_dup_threshold} "
+                  f"({near_audit['by_split_pair']}); a held-out near-twin "
+                  f"of a train document inflates the held-out metric. "
+                  f"Use --dedup_near to remove near duplicates before the "
+                  f"split, or --strict_near_dup to refuse to train.")
+            if args.strict_near_dup:
+                raise SystemExit(
+                    "refusing to train: cross-split near-duplicate leakage "
+                    f"detected ({near_audit['n_cross_split_pairs']} pair(s) "
+                    f"at Jaccard >= {args.near_dup_threshold}); rerun with "
+                    "--dedup_near or relax --strict_near_dup")
+
     # Per-split length/unk statistics. Descriptive distribution-shift
     # diagnostics ONLY; they are never fitted or applied to features. The
     # test split's stats are computed with its single evaluation at the
@@ -2786,6 +3064,7 @@ def main():
           f"nonfinite={cleaning['stats']['n_nonfinite']}, "
           f"dup={cleaning['stats']['n_duplicates']}, "
           f"window_dup={cleaning['stats']['n_window_duplicates']}, "
+          f"near_dup={cleaning['stats']['n_near_duplicates']}, "
           f"too_short={cleaning['stats']['n_too_short_to_supervise']})")
     print(f"Split (seed={args.seed}, "
           f"chronological={bool(args.chronological_split)}): "
@@ -2957,14 +3236,28 @@ def main():
                      'order is preserved (past -> train, next -> val, '
                      'most recent -> test) so no future document leaks '
                      'into fitting or selection. Cleaning before the split '
-                     'also removes exact duplicates; documents whose '
-                     'truncated model window repeats are counted '
+                     'also removes exact/normalized duplicates; documents '
+                     'whose truncated model window repeats are counted '
                      '(n_window_duplicates) and dropped only with '
-                     '--dedup_windows. No fitted preprocessing '
+                     '--dedup_windows; near-duplicates (token n-gram '
+                     'Jaccard >= near_dup_threshold) are audited across '
+                     'splits and dropped before the split only with '
+                     '--dedup_near. No fitted preprocessing '
                      'transform exists in this pipeline; were one added '
                      '(e.g. a tokenizer or length normalizer), it must '
                      'be fitted on train indices only.'),
         },
+        'near_dup_policy': {
+            'pre_split_dedup': bool(args.dedup_near),
+            'cross_split_audit': bool(not args.skip_near_dup_audit),
+            'strict_gate': bool(args.strict_near_dup),
+            'threshold': float(args.near_dup_threshold),
+            'shingle_size': int(args.near_dup_shingle),
+            'max_candidate_pairs': int(args.near_dup_max_candidates),
+            'scope': ('truncated seq_len+1 model-input token windows; '
+                      'token n-gram Jaccard'),
+        },
+        'near_duplicate_audit': near_audit,
         'splits': {
             'train': {
                 'n': len(train_texts),
@@ -3014,7 +3307,8 @@ def main():
         'vocab_size': vocab_size,
         'content_fingerprint_sha256': ds.data_fingerprint,
         'fingerprint_scheme': ('sha256 of <=64 evenly spaced texts truncated '
-                               'to 4096 chars + corpus size'),
+                               'to 4096 chars + corpus size, each framed by '
+                               'index and byte length'),
         'prefetch_cache': bool(args.prefetch_cache),
         'prefetch_cap': int(args.prefetch_cap),
     }
@@ -3615,6 +3909,8 @@ def main():
             'cleaning': cleaning['stats'],
             'split_protocol': data_record['split_protocol'],
             'split_audit': split_report,
+            'near_dup_policy': data_record['near_dup_policy'],
+            'near_duplicate_audit': data_record['near_duplicate_audit'],
             'splits': {
                 split: {
                     'n': rec['n'],
