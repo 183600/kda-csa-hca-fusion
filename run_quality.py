@@ -3300,6 +3300,38 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
     }
 
 
+def _finite_per_seed_acc(per_seed, *, seed_key='seed',
+                         acc_key='final_acc', error_key='error'):
+    """Map ``seed -> finite accuracy`` for the usable per-seed records.
+
+    A diverged seed can survive into a result row with ``final_acc`` set to
+    ``NaN`` (or a string placeholder) when the training guard did not fire.
+    The aggregate path filters those seeds, so the paired tests must use
+    the SAME surviving population instead of treating a non-finite value as
+    a measurement. Otherwise one NaN poisons every paired difference and
+    aborts the whole quality report inside ``multi_seed_stats``.
+
+    Only real finite numeric accuracies are kept; error stubs, missing
+    values, bools, and stringified metrics are excluded. The returned
+    values are left in their original numeric type.
+    """
+    out = {}
+    if not isinstance(per_seed, (list, tuple)):
+        return out
+    for record in per_seed:
+        if not isinstance(record, dict) or error_key in record:
+            continue
+        seed = record.get(seed_key)
+        acc = record.get(acc_key)
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            continue
+        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
+                or not math.isfinite(float(acc))):
+            continue
+        out[seed] = acc
+    return out
+
+
 def _paired_one_sided_t(diffs):
     """One-sided paired t-test statistics for an array of paired differences.
 
@@ -3483,12 +3515,8 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
     for task, rows in kda_by_task.items():
         rows = sorted(rows, key=lambda x: x['n_kv'])
         for lo, hi in zip(rows, rows[1:]):
-            base = {s['seed']: s['final_acc']
-                    for s in lo.get('per_seed', [])
-                    if 'error' not in s and s.get('final_acc') is not None}
-            cand = {s['seed']: s['final_acc']
-                    for s in hi.get('per_seed', [])
-                    if 'error' not in s and s.get('final_acc') is not None}
+            base = _finite_per_seed_acc(lo.get('per_seed', []))
+            cand = _finite_per_seed_acc(hi.get('per_seed', []))
             common = sorted(set(base) & set(cand))
             diffs = [cand[s] - base[s] for s in common]
             mean_diff = (sum(diffs) / len(diffs)) if diffs else None
@@ -3590,12 +3618,8 @@ def _hypothesis_verdicts(all_results, baseline_ops, baseline_ref):
             _assign(r, 'beats_tuned_baseline', verdict)
             complex_evidence.append(('not_computable', key, r.get('op')))
             continue
-        cand = {s['seed']: s['final_acc']
-                for s in r.get('per_seed', [])
-                if 'error' not in s and s.get('final_acc') is not None}
-        base = {s['seed']: s['final_acc']
-                for s in ref.get('per_seed', [])
-                if 'error' not in s and s.get('final_acc') is not None}
+        cand = _finite_per_seed_acc(r.get('per_seed', []))
+        base = _finite_per_seed_acc(ref.get('per_seed', []))
         common = sorted(set(cand) & set(base))
         if len(common) < 2:
             verdict = {
@@ -3854,12 +3878,8 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
             for j in range(i + 1, len(rows_sorted)):
                 a, b = rows_sorted[i], rows_sorted[j]
                 pair_key = f"{a.get('op')}~{b.get('op')}"
-                a_seed = {s['seed']: s['final_acc']
-                          for s in a.get('per_seed', [])
-                          if 'error' not in s and s.get('final_acc') is not None}
-                b_seed = {s['seed']: s['final_acc']
-                          for s in b.get('per_seed', [])
-                          if 'error' not in s and s.get('final_acc') is not None}
+                a_seed = _finite_per_seed_acc(a.get('per_seed', []))
+                b_seed = _finite_per_seed_acc(b.get('per_seed', []))
                 common = sorted(set(a_seed) & set(b_seed))
                 if len(common) < 2:
                     cell['pairs'][pair_key] = {
@@ -4724,12 +4744,8 @@ def main():
                     'verdict': 'reference_row_unavailable',
                 }
                 continue
-            cand = {s['seed']: s['final_acc']
-                    for s in r.get('per_seed', [])
-                    if 'error' not in s and s.get('final_acc') is not None}
-            base = {s['seed']: s['final_acc']
-                    for s in ref.get('per_seed', [])
-                    if 'error' not in s and s.get('final_acc') is not None}
+            cand = _finite_per_seed_acc(r.get('per_seed', []))
+            base = _finite_per_seed_acc(ref.get('per_seed', []))
             common = sorted(set(cand) & set(base))
             if len(common) < 2:
                 r['vs_tuned_baseline'] = {

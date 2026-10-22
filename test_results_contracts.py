@@ -919,3 +919,58 @@ def test_row_contracts_reject_unhashable_metadata_entries():
         {'settings': {'reps': [], 'alpha': 'not-a-level'}})
     assert any('settings.reps' in v for v in violations), violations
     assert any('settings.alpha' in v for v in violations), violations
+
+
+def test_pairwise_tests_ignore_nonfinite_per_seed_accuracy():
+    """A diverged seed must not abort the paired-comparison report.
+
+    ``train_multi_seed`` filters non-finite seeds from its aggregate, but the
+    ``per_seed`` list still carries the raw record. The paired tests used to
+    treat ``final_acc is not None`` as usable, so one NaN made
+    ``multi_seed_stats`` raise and the whole quality report disappear. The
+    seed must instead be excluded from the common population, exactly like
+    the aggregate path does.
+    """
+    from run_quality import _finite_per_seed_acc, _pairwise_op_comparisons
+
+    records = [
+        {'seed': 1, 'final_acc': 0.4},
+        {'seed': 2, 'final_acc': float('nan')},
+        {'seed': 3, 'final_acc': float('inf')},
+        {'seed': 4, 'final_acc': '0.5'},
+        {'seed': 5, 'final_acc': True},
+        {'seed': 6, 'final_acc': None},
+        {'seed': 7, 'final_acc': 0.7, 'error': 'diverged'},
+        {'seed': 8, 'final_acc': 0.8},
+    ]
+    assert _finite_per_seed_acc(records) == {1: 0.4, 8: 0.8}
+    assert _finite_per_seed_acc(None) == {}
+    assert _finite_per_seed_acc([None, 'x', {'seed': True, 'final_acc': 1.0}]) == {}
+
+    rows = [
+        {'op': 'a', 'task': 'mqar', 'n_kv': 1, 'mean_acc': 0.5,
+         'per_seed': [{'seed': 1, 'final_acc': 0.4},
+                      {'seed': 2, 'final_acc': float('nan')},
+                      {'seed': 3, 'final_acc': 0.6}]},
+        {'op': 'b', 'task': 'mqar', 'n_kv': 1, 'mean_acc': 0.4,
+         'per_seed': [{'seed': 1, 'final_acc': 0.3},
+                      {'seed': 2, 'final_acc': 0.5},
+                      {'seed': 3, 'final_acc': 0.5}]},
+    ]
+    report = _pairwise_op_comparisons(
+        rows, equivalence_margin=0.05, n_boot=50, n_permutations=50)
+    pair = report['cells']['mqar/n_kv=1']['pairs']['a~b']
+    assert pair['common_seeds'] == [1, 3]
+    assert pair['n_pairs'] == 2
+    assert abs(pair['mean_diff'] - 0.1) < 1e-12
+
+    # A malformed metric is not a measurement either: with only one valid
+    # pair the comparison is explicitly skipped instead of crashing.
+    rows[0]['per_seed'] = [
+        {'seed': 1, 'final_acc': '0.4'},
+        {'seed': 2, 'final_acc': float('nan')},
+        {'seed': 3, 'final_acc': True},
+    ]
+    report = _pairwise_op_comparisons(rows, n_boot=20, n_permutations=20)
+    pair = report['cells']['mqar/n_kv=1']['pairs']['a~b']
+    assert pair['verdict'] == 'insufficient_paired_seeds'
