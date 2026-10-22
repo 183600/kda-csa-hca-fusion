@@ -298,11 +298,15 @@ def _safe_median(values):
 
 
 # Numerical-zero rule: a difference vector whose entries are all the same
-# float has exactly zero sample variance. Do NOT clamp a genuine non-zero
-# spread to zero based on the magnitude of the values: a per-value epsilon
-# (even a few ULPs) still zeroes a real spread of 1 around 1e15, which makes
-# the paired t-test / d_z / TOST silently undefined. Only the exactly
-# constant vector is numerically zero-variance.
+# float has exactly zero sample variance. Values that differ only by a few
+# ULPs of their own magnitude can also be a rounding residue (e.g. per-seed
+# accuracy differences computed from inputs that are mathematically equal),
+# so those are treated as numerically constant too. The threshold is based
+# on the ULP of the DIFFERENCES, not on ``eps * max|value|``: an accuracy
+# residue of a few 1e-17 is zeroed, while a real spread of 1 at 1e15 (8 ULP
+# of that magnitude) is not, so the paired t-test / d_z / TOST stay defined
+# for large-offset data.
+_ZERO_VAR_ULP_FACTOR = 8.0
 
 
 def _sample_sd(values: list[float], mean: float) -> float | None:
@@ -310,10 +314,16 @@ def _sample_sd(values: list[float], mean: float) -> float | None:
     if n < 2:
         return None
     # Constant vectors (including values like 0.8 / 0.1 with no exact binary
-    # representation) are the only case where mean-subtraction round-off can
-    # leave a non-zero variance residue.
+    # representation) are the only exact-zero case.
     if all(v == values[0] for v in values):
         return 0.0
+    max_abs = max(abs(v) for v in values)
+    if max_abs > 0.0:
+        span = max(values) - min(values)
+        # Strict ``<`` keeps a spread of exactly 8 ULP (e.g. 1 at 1e15)
+        # distinct; only a strictly sub-8-ULP spread is last-bit residue.
+        if span < _ZERO_VAR_ULP_FACTOR * math.ulp(max_abs):
+            return 0.0
     # Square SCALED deviations: ``(v - mean) ** 2`` overflows for finite
     # differences above ~1e154 even though the sample SD itself is
     # representable. Scaling is exact for the ratio, then the square root
