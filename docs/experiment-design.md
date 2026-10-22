@@ -156,6 +156,20 @@ python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json
 python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json --sd 0.12
 ```
 
+## Post-run sensitivity
+
+Planning fixes the seed budget and the primary analysis before the data
+exist. It does not make the realized seed set interchangeable: at 5-7 seeds
+one diverged run can still carry a mean difference. After the confirmatory
+test, `multi_seed_stats.leave_one_out_sensitivity` deletes each seed in turn
+and reports whether the direction or the primary decision depends on that
+seed. The exp4 operator comparisons carry the block automatically and use a
+`direction_fragile` label to qualify a significant ordering. This is
+descriptive only — it re-uses the same data, is not multiplicity-corrected,
+and never upgrades a claim. See
+[seed-influence.md](seed-influence.md) for the status definitions and the
+`n = 6` exact-test caveat.
+
 ## Limitations
 
 * The normal approximation is optimistic at small n; treat the target power as
