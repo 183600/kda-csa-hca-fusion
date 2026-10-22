@@ -525,6 +525,34 @@ def test_contrast_annotation_reports_effect_size_and_power_plan():
     assert small_summary['n_significant_but_below_min_effect'] == 1
 
 
+def test_two_sided_contrast_planning_uses_the_tail_alpha_once():
+    """A two-sided row's MDE must use its one-sided tail threshold once.
+
+    The significance test uses the upper-tail quantile at alpha/(2*n); the
+    planning helper also halves a two-sided TEST level internally, so the
+    reported MDE has to be computed at alpha/n, not at alpha/(2*n) again.
+    """
+    from statistics import NormalDist
+    contrasts = [{
+        'predicted_direction': 'two_sided',
+        'n_common_seeds': 5,
+        'mean_diff': 0.20,
+        'sd_diff': 0.10,
+        't_stat': 0.20 / (0.10 / (5 ** 0.5)),
+    }]
+    _annotate_contrast_significance(contrasts)
+    c = contrasts[0]
+    assert c['test'] == 'paired_two_sided_t'
+    assert c['alpha_bonferroni'] == pytest.approx(0.05 / 2.0)
+    z_crit = NormalDist().inv_cdf(1.0 - c['alpha_bonferroni'])
+    z_power = NormalDist().inv_cdf(0.8)
+    expected = ((z_crit + z_power) * 0.10 / (5 ** 0.5))
+    assert c['min_detectable_effect'] == pytest.approx(expected)
+    # d_z = 2; required n from the same corrected threshold.
+    expected_n = 2  # ceil(((z_crit + z_power) / 2)^2) stays below 2 here
+    assert c['seeds_required_80pct_power'] == expected_n
+
+
 def test_contrast_tost_separates_equivalent_from_different():
     """A non-significant contrast is not equivalence; TOST decides it.
 

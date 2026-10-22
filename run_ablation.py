@@ -2548,12 +2548,19 @@ def _annotate_contrast_significance(contrasts: list,
                 and not isinstance(sd, bool)
                 and math.isfinite(float(sd)) and float(sd) >= 0.0):
             mde_alt = 'greater' if direction == 'greater' else 'two-sided'
+            # ``alpha_test`` is the one-sided TAIL probability used by the
+            # significance test above.  The planning helpers take a two-sided
+            # TEST level and halve it internally, so pass the full test level
+            # for a two-sided row; passing the tail alpha again would correct
+            # twice and overstate both the MDE and the required seed count.
+            planning_alpha = (alpha_test if direction == 'greater'
+                              else 2.0 * alpha_test)
             mde = min_detectable_effect(
-                n, float(sd), alpha=alpha_test, power=0.8,
+                n, float(sd), alpha=planning_alpha, power=0.8,
                 alternative=mde_alt)
             if dz is not None:
                 required_n = seeds_required(
-                    dz, alpha=alpha_test, power=0.8,
+                    dz, alpha=planning_alpha, power=0.8,
                     alternative=mde_alt)
         c['effect_size_cohens_dz'] = dz
         c['min_detectable_effect'] = mde
