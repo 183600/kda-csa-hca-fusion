@@ -498,3 +498,19 @@ def test_pilot_extraction_skips_unhashable_cells_groups_and_seeds():
     ]
     assert D.pilot_sd_from_rows(rows, group_key='op', reference='softmax',
                                 cell_keys=['task', 'n_kv']) is None
+    # Non-iterable per_seed and non-exact/infinite n_common_seeds are
+    # malformed rows too; they must be skipped rather than truncating a
+    # float count (which would invent seed pairs) or raising.
+    malformed = [
+        {'op': 'kda', 'per_seed': 5},
+        {'op': 'kda', 'per_seed': {'seed': 42, 'final_acc': 0.5}},
+        {'contrast': 'B-A', 'n_kv': 1,
+         'n_common_seeds': float('inf'), 'sd_diff': 0.1},
+        {'contrast': 'B-A', 'n_kv': 1, 'n_common_seeds': 2.9,
+         'sd_diff': 0.1},
+        {'contrast': 'B-A', 'n_kv': 1, 'n_common_seeds': True,
+         'sd_diff': 0.1},
+    ]
+    assert D.pilot_sd_from_rows(
+        malformed, group_key='op', reference='softmax',
+        cell_keys=['n_kv']) is None

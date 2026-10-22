@@ -911,9 +911,8 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
         if str(label) in excluded:
             continue
         sd = _clean_float(row.get('sd_diff'))
-        try:
-            n_common = int(row.get('n_common_seeds'))
-        except (TypeError, ValueError):
+        n_common = row.get('n_common_seeds')
+        if not _is_int(n_common) or n_common < 0:
             n_common = 0
         if sd is not None and sd >= 0.0 and n_common >= 2:
             direct.append({'sd': sd, 'n': n_common,
@@ -956,8 +955,11 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
         cell = _cell_key(row, cell_keys)
         if not _is_hashable(cell):
             continue
+        per_seed = row.get('per_seed') or []
+        if not isinstance(per_seed, (list, tuple)):
+            continue
         acc_by_seed = {}
-        for seed_row in row.get('per_seed') or []:
+        for seed_row in per_seed:
             if not isinstance(seed_row, dict) or 'error' in seed_row:
                 continue
             seed = seed_row.get('seed')
