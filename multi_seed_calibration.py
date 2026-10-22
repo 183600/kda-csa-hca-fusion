@@ -111,7 +111,12 @@ def _laplace(rng, scale):
     u = rng.random() - 0.5
     if u == 0.0:
         return 0.0
-    return -scale * math.copysign(1.0, u) * math.log(1.0 - 2.0 * abs(u))
+    # ``random()`` can return exactly 0.0 (probability 2**-53), which maps
+    # to the endpoint u=-0.5 and a log(0) = -inf draw. Clamp the magnitude
+    # one representable step inside the interval so the inverse CDF stays
+    # finite (the same tail draw, rounded to the nearest representable u).
+    a = min(abs(u), 0.5 - 2.0 ** -53)
+    return -scale * math.copysign(1.0, u) * math.log(1.0 - 2.0 * a)
 
 
 def _base_sd_for_mixture(noise_sd, outlier_prob, outlier_scale):

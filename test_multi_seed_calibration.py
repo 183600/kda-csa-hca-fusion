@@ -55,6 +55,20 @@ def test_simulator_known_population_and_determinism():
             raised = True
         _ok(f'rejects {kwargs}', raised, '')
 
+    # ``random.Random.random`` can return exactly 0.0; the inverse-CDF
+    # Laplace draw must clamp the endpoint instead of taking log(0).
+    class _ZeroRng:
+        def random(self):
+            return 0.0
+
+        def gauss(self, mu, sigma):
+            return mu
+
+    draws = mc.simulate_paired_diffs(
+        2, _ZeroRng(), distribution='laplace', noise_sd=1.0)
+    _ok('laplace endpoint draw is finite',
+        all(math.isfinite(x) for x in draws), str(draws))
+
 
 def test_size_study_rows_and_diagnostics():
     print('\nTest: null-size study rows and diagnostic gating')
