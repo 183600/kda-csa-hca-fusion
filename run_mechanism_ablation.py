@@ -1683,6 +1683,23 @@ def main():
         },
         'seq_len': SEQ_LEN,
         'ratio': list(RATIO),
+        'data': {
+            'kind': 'synthetic_mqar',
+            'vocab': VOCAB,
+            'seq_len': SEQ_LEN,
+            'n_kv': list(n_kv_list),
+            'train_batch': int(train_batch),
+            'layout': ('alternating (key, value) pairs, distractor-only '
+                       'filler, final-token recall cue'),
+            'generator': ('make_mqar_batch with per-stream seeded '
+                          'torch.Generator: training=seed+1_000_000, '
+                          'headline_eval=seed+5_000_000, '
+                          f'val_monitor=seed+{VAL_MONITOR_SEED_OFFSET}, '
+                          f'error_analysis=seed+{ERROR_ANALYSIS_SEED_OFFSET}'),
+            'split': ('synthetic on-the-fly streams; no corpus file, so '
+                      'the seed offsets + task geometry are the data '
+                      'version'),
+        },
         'csa_m': SMALL_MODEL_SPEC['csa_m'],
         'csa_indexer_normalize_qk': True,
         'kda_backend': os.environ.get('KDA_BACKEND', 'reference'),
