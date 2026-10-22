@@ -373,8 +373,6 @@ def partial_rope(
         raise ValueError(
             f"partial_rope: positions has {positions.numel()} entries but axis "
             f"dim={dim} of x has P={P}.")
-    if P == 0:
-        return x
     if rope_dim % 2 != 0:
         raise ValueError(
             f"partial_rope: rope_dim={rope_dim} must be even.")
@@ -382,6 +380,11 @@ def partial_rope(
             or not _math.isfinite(float(base)) or base <= 0):
         raise ValueError(
             f"partial_rope: base={base!r} must be a finite positive number.")
+    if P == 0:
+        # Empty sequence: the arithmetic is a no-op, but the geometry/base
+        # checks above already ran so an invalid config cannot be accepted
+        # merely because a shape probe used an empty positions vector.
+        return x
     device = x.device
     angle_dtype = _angle_dtype(x)
     if (positions.dtype in _INT_POS_DTYPES and not positions.requires_grad

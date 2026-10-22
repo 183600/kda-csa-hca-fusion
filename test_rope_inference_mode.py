@@ -301,6 +301,25 @@ def test_dim_validation_rejects_feature_and_out_of_range(device='cpu'):
             f'maxdiff={(a - b).abs().max().item():.2e}')
 
 
+def test_empty_positions_still_validate_rope_geometry(device='cpu'):
+    """An empty position probe must not bypass rope_dim/base validation."""
+    x = torch.zeros(0, 8, dtype=torch.float64, device=device)
+    pos = torch.empty(0, dtype=torch.long, device=device)
+    for kwargs, needle in ((dict(rope_dim=3), 'must be even'),
+                           (dict(rope_dim=4, base=-1.0),
+                            'finite positive')):
+        try:
+            partial_rope(x, pos, dim=0, **kwargs)
+        except ValueError as exc:
+            _ok(f'empty positions validate {needle}', needle in str(exc),
+                str(exc))
+        else:
+            _ok(f'empty positions validate {needle}', False,
+                'no ValueError raised')
+    out = partial_rope(x, pos, 4, 10000.0, dim=0)
+    _ok('valid empty rope is a no-op', out.shape == x.shape, f'{out.shape}')
+
+
 if __name__ == '__main__':
     test_position_vectors_are_ordinary_under_inference()
     test_long_context_rope_in_inference_mode()
@@ -308,4 +327,5 @@ if __name__ == '__main__':
     test_default_dim_is_the_sequence_axis()
     test_dim_validation_rejects_feature_and_out_of_range()
     test_naive_csa_hca_inference_mode_long_rope()
+    test_empty_positions_still_validate_rope_geometry()
     print('all RoPE inference-mode regression tests passed')
