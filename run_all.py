@@ -163,6 +163,26 @@ def _env_seed_list(name: str, default: int) -> list[int]:
     return [experiment_design.DEFAULT_SEED_BASE + i for i in range(count)]
 
 
+def _raise_seed_floor(name: str, default: int, minimum: int = 5) -> int:
+    """Raise a seed-count env var to ``minimum`` and return the new count.
+
+    ``parse_int_env`` falls back to ``default`` on a malformed value, so use
+    the same fallback before applying the floor.  The CPU ``SKIP_SLOW`` path
+    uses this to keep the multi-seed tests usable; applying it BEFORE the
+    design manifest (and before provenance capture) makes the recorded seed
+    budget match the budget the runners actually use.
+    """
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        count = int(default)
+    if count < int(minimum):
+        count = int(minimum)
+    os.environ[name] = str(count)
+    return count
+
+
 def _write_experiment_design_manifest(profile: str) -> dict:
     """Write the prospective design manifest; return a compact summary block.
 
@@ -686,6 +706,20 @@ def run_all(seeds=None, steps=None):
         os.environ['RESULTS_DIR'] = os.path.join(out_root, 'results')
         os.environ['FIGURES_DIR'] = os.path.join(out_root, 'figures')
 
+        # Resolve the CPU/SKIP_SLOW policy now and apply its seed floor
+        # BEFORE provenance capture and the design manifest. The runners
+        # apply the same floor just before they start; doing it here keeps
+        # the recorded budget (and the prospective design manifest) equal to
+        # the budget the experiments actually run instead of the pre-floor
+        # smoke value.
+        skip_slow = os.environ.get('SKIP_SLOW', '0').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        is_cpu = not info.has_gpu
+        if skip_slow and is_cpu:
+            for _seed_var, _seed_default in (('MQAR_SEEDS', 5),
+                                             ('ABL_SEEDS', 7),
+                                             ('MECH_SEEDS', 5)):
+                _raise_seed_floor(_seed_var, _seed_default)
+
         # Store structured provenance rather than only ``repr(EnvInfo)`` so
         # the summary records git commit, torch/CUDA versions, thread count,
         # and the selected KDA backend. This matters when comparing a
@@ -736,9 +770,6 @@ def run_all(seeds=None, steps=None):
         import run_quant_lm
         import method_analysis
         import make_figures
-
-        skip_slow = os.environ.get('SKIP_SLOW', '0').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-        is_cpu = not info.has_gpu
 
         # 1. Correctness — always run (fast, ~seconds).
         summary['runs'].append(_run('exp1_correctness', run_correctness.main))

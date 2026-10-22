@@ -419,3 +419,25 @@ def test_run_all_wires_the_design_manifest(monkeypatch, tmp_path):
     assert written['kind'] == 'experiment_design'
     assert {row['plan_id']: row['n_seeds']
             for row in written['results']}['exp4_mqar'] == 3
+
+
+def test_cpu_skip_slow_seed_floor_is_recorded(monkeypatch, tmp_path):
+    # The smoke profile writes 2 seeds; the CPU SKIP_SLOW path raises that
+    # floor to 5 just before each runner. The manifest must record the
+    # budget that will actually run, not the pre-floor smoke value.
+    import run_all
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('SKIP_SLOW', '1')
+    monkeypatch.setenv('MQAR_SEEDS', '2')
+    monkeypatch.setenv('ABL_SEEDS', '2')
+    monkeypatch.setenv('MECH_SEEDS', '2')
+    for var, default in (('MQAR_SEEDS', 5), ('ABL_SEEDS', 7),
+                         ('MECH_SEEDS', 5)):
+        assert run_all._raise_seed_floor(var, default) == 5
+    # A malformed value falls back to the default and is then floored.
+    monkeypatch.setenv('MQAR_SEEDS', 'not-an-int')
+    assert run_all._raise_seed_floor('MQAR_SEEDS', 5) == 5
+    block = run_all._write_experiment_design_manifest('smoke')
+    assert {plan: row['n_seeds'] for plan, row in block['plans'].items()} \
+        == {'exp4_mqar': 5, 'exp5_ratio': 5, 'exp5b_matrix': 5,
+            'exp8_mechanism': 5}
