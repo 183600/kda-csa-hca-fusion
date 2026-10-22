@@ -224,7 +224,9 @@ NEEDLE_HYPOTHESES = OrderedDict([
             'fact by template match and copy the continuation.'),
         'prediction': (
             'Trained exact-match accuracy is >= the lexical-scan rule '
-            'accuracy on the SAME held-out evaluation sequences.'),
+            'accuracy on the SAME held-out evaluation sequences; the seed '
+            'paired directional test and its familywise correction are '
+            'reported instead of relying on the point crossing alone.'),
         'falsified_if': (
             'A trained memory route scores below the rule baseline, i.e. '
             'the learned retrieval is weaker than grep-and-copy on the task '
@@ -1056,6 +1058,7 @@ def _needle_row_hypothesis_checks(
     untrained_mean: float,
     rule_acc: float | None,
     paired: dict | None,
+    rule_paired: dict | None,
     n_seeds: int,
 ) -> dict:
     """Machine-readable verdicts for one trained row (fixed rules)."""
@@ -1083,14 +1086,35 @@ def _needle_row_hypothesis_checks(
     if rule_acc is None or mean_acc is None:
         rule_verdict = None
         diff = None
+        p_rule = None
+        ci_rule = None
     else:
         diff = mean_acc - rule_acc
         rule_verdict = bool(mean_acc >= rule_acc)
+        p_rule = None
+        ci_rule = None
+        if isinstance(rule_paired, dict):
+            p_rule = (rule_paired.get('t_test') or {}).get(
+                'p_value_directional')
+            ci_rule = rule_paired.get('ci95_mean_diff_t')
+    significant_rule = bool(
+        diff is not None and diff > 0.0 and p_rule is not None
+        and p_rule < 0.05)
     checks['trained_matches_rule'] = {
-        'prediction': 'trained accuracy >= lexical-scan rule accuracy',
+        'prediction': ('trained accuracy >= lexical-scan rule accuracy '
+                       '(seed-paired directional test reported)'),
         'rule_accuracy': rule_acc,
         'difference': diff,
+        'n_seeds': int(n_seeds),
+        'p_value_directional': p_rule,
+        'ci95_mean_diff_t': ci_rule,
+        'significant_positive_gain_at_0.05': (
+            significant_rule if n_seeds >= 2 else None),
+        'evidence': ('inferential' if n_seeds >= 2 else
+                     'descriptive (n<2: no paired test)'),
+        # Historical pre-registered point rule; kept for compatibility.
         'verdict': rule_verdict,
+        'inferential_verdict': (significant_rule if n_seeds >= 2 else None),
     }
     return checks
 
@@ -1134,9 +1158,9 @@ def _needle_primary_precision_rank(row: dict) -> tuple:
     )
 
 
-def _needle_learned_retrieval_family(rows: list[dict],
-                                     alpha: float = 0.05) -> dict:
-    """Holm-correct the learned-retrieval tests over primary precision cells.
+def _needle_hypothesis_family(rows: list[dict], hypothesis_key: str,
+                              alpha: float = 0.05) -> dict:
+    """Holm-correct one needle hypothesis over primary precision cells.
 
     Every recall row keeps its raw directional p-value (descriptive, and
     comparable with earlier result files). The familywise block selects one
@@ -1149,9 +1173,9 @@ def _needle_learned_retrieval_family(rows: list[dict],
     for row in rows:
         if row.get('row_kind') != 'needle_recall':
             continue
-        learned = ((row.get('hypothesis_checks') or {})
-                   .get('learned_retrieval') or {})
-        p_value = learned.get('p_value_directional')
+        claim = ((row.get('hypothesis_checks') or {})
+                 .get(hypothesis_key) or {})
+        p_value = claim.get('p_value_directional')
         if p_value is None:
             continue
         key = _needle_learned_retrieval_family_key(row)
@@ -1170,7 +1194,7 @@ def _needle_learned_retrieval_family(rows: list[dict],
                                         holm['rejected']):
         _, primary_row, _, candidates = item
         for _, row, row_p in candidates:
-            row['learned_retrieval_holm'] = {
+            row[f'{hypothesis_key}_holm'] = {
                 'selected_as_primary': row is primary_row,
                 'family_size': holm['n_tests'],
                 'raw_p_value_directional': row_p,
@@ -1205,6 +1229,7 @@ def _needle_learned_retrieval_family(rows: list[dict],
             'reject_at_alpha': bool(rejected),
         })
     return {
+        'hypothesis': hypothesis_key,
         'method': 'holm_bonferroni',
         'alpha': float(alpha),
         'family_unit': ('one primary-precision row per architecture x '
@@ -1214,6 +1239,18 @@ def _needle_learned_retrieval_family(rows: list[dict],
         'n_rejected': int(sum(holm['rejected'])),
         'tests': tests,
     }
+
+
+def _needle_learned_retrieval_family(rows: list[dict],
+                                     alpha: float = 0.05) -> dict:
+    """Familywise correction for the learned-retrieval hypothesis."""
+    return _needle_hypothesis_family(rows, 'learned_retrieval', alpha)
+
+
+def _needle_trained_matches_rule_family(rows: list[dict],
+                                        alpha: float = 0.05) -> dict:
+    """Familywise correction for the trained-vs-rule hypothesis."""
+    return _needle_hypothesis_family(rows, 'trained_matches_rule', alpha)
 
 
 def summarize_needle_hypotheses(rows: list[dict]) -> dict:
@@ -1234,6 +1271,7 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
         if v is not None:
             learn_verdicts.append(bool(v))
     learn_family = _needle_learned_retrieval_family(recall)
+    rule_family = _needle_trained_matches_rule_family(recall)
     # Distance check: unquantized rows grouped by (context, route); compare
     # the farthest vs nearest needle position (descriptive, seed-averaged).
     # Rows are per dtype, so a position can appear several times: the
@@ -1281,8 +1319,11 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
         'n_trained_rows_meeting_rule': sum(match_verdicts),
         'n_trained_rows_below_rule': (len(match_verdicts)
                                       - sum(match_verdicts)),
+        'n_trained_rows_significantly_above_rule_holm': (
+            rule_family['n_rejected']),
         'all_trained_meet_rule': (all(match_verdicts)
                                   if match_verdicts else None),
+        'trained_matches_rule_familywise': rule_family,
         'n_learned_retrieval_verdicts_available': len(learn_verdicts),
         'n_learned_retrieval_supported': sum(learn_verdicts),
         'n_learned_retrieval_supported_holm': learn_family['n_rejected'],
@@ -1298,7 +1339,10 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
                  'dtype/PTQ rows as separate verdicts; the '
                  'learned_retrieval_familywise block Holm-corrects one '
                  'primary-precision test per trained model x geometry and is '
-                 'the familywise count.'),
+                 'the familywise count. The point trained_matches_rule '
+                 'verdict is kept for continuity; '
+                 'trained_matches_rule_familywise corrects the seed-paired '
+                 'directional test against that fixed rule.'),
     }
 
 
@@ -2105,6 +2149,10 @@ def run_needle_sweep(
         ctrl_mean = sum(ctrl_accs) / len(ctrl_accs) if ctrl_accs else 0.0
         diffs = [a - c for a, c in zip(accs, ctrl_accs)]
         paired = summarize_paired(diffs) if len(diffs) >= 2 else None
+        rule_diffs = ([a - rule['accuracy'] for a in accs]
+                      if accs and rule.get('accuracy') is not None else [])
+        rule_paired = (summarize_paired(rule_diffs)
+                       if len(rule_diffs) >= 2 else None)
 
         # Training-curve / bad-case rollup. All per-seed reports come from
         # the SAME cached trained weights used for this row (quantization
@@ -2275,6 +2323,7 @@ def run_needle_sweep(
                 untrained_mean=ctrl_mean,
                 rule_acc=rule['accuracy'],
                 paired=paired,
+                rule_paired=rule_paired,
                 n_seeds=len(seeds)),
             'chance_uniform_exact_match': (1.0 / tokenizer.vocab_size) **
                                           per_seed_results[0]['n_answer_tokens'],

@@ -465,7 +465,7 @@ def test_learned_retrieval_familywise_correction():
     print('\nTest: needle learned-retrieval familywise correction')
 
     def _row(ctx, dtype, p_value, *, quantized=False, bits=None,
-             verdict=True):
+             verdict=True, rule_p=None):
         return {
             'row_kind': 'needle_recall',
             'context_len': ctx, 'needle_pos': ctx // 4,
@@ -480,7 +480,10 @@ def test_learned_retrieval_familywise_correction():
                     'p_value_directional': p_value,
                     'verdict': verdict,
                 },
-                'trained_matches_rule': {'verdict': True},
+                'trained_matches_rule': {
+                    'p_value_directional': rule_p,
+                    'verdict': True,
+                },
             },
         }
 
@@ -536,6 +539,36 @@ def test_learned_retrieval_familywise_correction():
         family['n_primary_tests'] == 1
         and family['tests'][0]['dtype'] == 'fp16'
         and family['n_rejected'] == 1, f'{family["tests"]}')
+
+    # The trained-vs-rule claim gets the same treatment: repeated dtype
+    # rows collapse to one primary test, and three weak crossings do not
+    # survive Holm.
+    rows = []
+    for ctx in (256, 512):
+        rows += [
+            _row(ctx, 'fp32', 0.01, rule_p=0.01),
+            _row(ctx, 'fp16', 0.001, rule_p=0.001),
+        ]
+    summary = summarize_needle_hypotheses(rows)
+    rule_family = summary['trained_matches_rule_familywise']
+    _ok('rule family collapses repeated precision cells',
+        rule_family['n_primary_tests'] == 2
+        and rule_family['n_candidate_rows'] == 4
+        and rule_family['n_rejected'] == 2,
+        f'{rule_family["n_primary_tests"]} primary, '
+        f'{rule_family["n_candidate_rows"]} candidates')
+    _ok('summary exposes the corrected rule count',
+        summary['n_trained_rows_significantly_above_rule_holm'] == 2,
+        f"{summary['n_trained_rows_significantly_above_rule_holm']}")
+
+    rows = [_row(256, 'fp32', 0.01, rule_p=0.030),
+            _row(512, 'fp32', 0.01, rule_p=0.040),
+            _row(1024, 'fp32', 0.01, rule_p=0.045)]
+    rule_family = summarize_needle_hypotheses(rows)[
+        'trained_matches_rule_familywise']
+    _ok('weak rule crossings do not survive Holm',
+        rule_family['n_rejected'] == 0,
+        f"adjusted={[t['holm_adjusted_p'] for t in rule_family['tests']]}")
 
 
 def test_needle_experiment_json_output():
