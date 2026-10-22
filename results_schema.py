@@ -1732,10 +1732,9 @@ def _validate_exp16_rows(rows: list, metadata: dict) -> list[str]:
                 out.append(f'{where}: verdict={verdict!r} invalid')
             elif (isinstance(meets, bool) and _finite_number(rate)
                   and _finite_number(alpha) and _finite_number(tol)):
-                want = ('within_bound' if meets
-                        else ('conservative'
-                              if float(rate) < float(alpha) - float(tol)
-                              else 'liberal'))
+                want = ('conservative'
+                        if float(rate) < float(alpha) - float(tol)
+                        else ('within_bound' if meets else 'liberal'))
                 if verdict != want:
                     out.append(f'{where}: verdict={verdict!r} != {want!r}')
         elif section == 'coverage':

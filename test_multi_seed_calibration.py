@@ -88,6 +88,28 @@ def test_size_study_rows_and_diagnostics():
     _ok('missing/invalid tolerance is rejected', raised, '')
 
 
+def test_conservative_size_verdict_is_reachable_and_accepted():
+    """A rate far below the nominal level is classified conservative.
+
+    The old branch checked ``meets`` first, so ``rate < alpha - tol``
+    always became ``within_bound`` and the documented conservative verdict
+    was dead. The exp16 row contract mirrored that impossible branch.
+    """
+    rows = mc.size_study(
+        [{'name': 'very_conservative', 'n_pairs': 2,
+          'distribution': 'normal', 'alpha': 0.05, 'tol': 0.04}],
+        reps=20, seed=0)
+    _ok('a zero-rejection null cell is conservative',
+        all(r['rejection_rate'] < r['alpha'] - r['tol']
+            and r['meets'] is True and r['verdict'] == 'conservative'
+            for r in rows), rows)
+    from results_schema import ROW_CONTRACTS
+    violations = ROW_CONTRACTS['exp16_paired_stats_calibration'](
+        rows, {'settings': {'reps': 20}})
+    _ok('the contract accepts the conservative row',
+        not any('verdict' in v for v in violations), violations)
+
+
 def test_coverage_and_power_rows():
     print('\nTest: coverage and power row arithmetic')
     cov = mc.coverage_study(

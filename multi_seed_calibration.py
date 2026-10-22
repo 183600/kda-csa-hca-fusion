@@ -220,10 +220,14 @@ def size_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
         for method in SIZE_METHODS:
             rate = counts[method] / int(reps)
             meets = rate <= threshold
-            if meets:
-                verdict = 'within_bound'
-            elif rate < alpha - tol:
+            # A rate far BELOW the nominal level is a conservative size
+            # control, not "within bound" in the symmetric sense. Check it
+            # before the meets branch: otherwise the conservative verdict
+            # is unreachable (rate < alpha - tol already implies meets).
+            if rate < alpha - tol:
                 verdict = 'conservative'
+            elif meets:
+                verdict = 'within_bound'
             else:
                 verdict = 'liberal'
             rows.append({
