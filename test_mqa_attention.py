@@ -286,6 +286,12 @@ def test_accounting_validation():
     with pytest.raises(ValueError):
         mqa.expand_kv_heads(torch.zeros(1, 2, 3, 4), torch.zeros(1, 2, 3, 4),
                             n_heads=4, n_kv_heads=2)
+    with pytest.raises(ValueError):
+        mqa.expand_kv_heads(torch.zeros(1, 2, 2, 4), torch.zeros(1, 2, 2, 3),
+                            n_heads=4, n_kv_heads=2)
+    with pytest.raises(ValueError):
+        mqa.expand_kv_heads(torch.zeros(1, 2, 2, 4), torch.zeros(1, 3, 2, 4),
+                            n_heads=4, n_kv_heads=2)
 
 
 if __name__ == '__main__':

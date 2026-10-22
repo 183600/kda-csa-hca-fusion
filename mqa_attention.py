@@ -135,7 +135,11 @@ def expand_kv_heads(k: torch.Tensor, v: torch.Tensor, *, n_heads: int,
             f"n_heads={n_heads} must be divisible by n_kv_heads="
             f"{n_kv_heads}.")
     group = n_heads // n_kv_heads
-    if k.shape[-2] != n_kv_heads or v.shape[-2] != n_kv_heads:
+    if k.shape != v.shape:
+        raise ValueError(
+            f"expand_kv_heads: k.shape={tuple(k.shape)} must equal "
+            f"v.shape={tuple(v.shape)} (shared K/V heads).")
+    if k.shape[-2] != n_kv_heads:
         raise ValueError(
             f"k/v head axes must be {n_kv_heads}; got {tuple(k.shape)} / "
             f"{tuple(v.shape)}.")
