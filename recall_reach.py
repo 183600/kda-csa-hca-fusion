@@ -876,7 +876,13 @@ def _recall_bucket_ranges(win: int, seq_len: int) -> dict[str, tuple[int, int]]:
     if isinstance(seq_len, bool) or not isinstance(seq_len, int) \
             or seq_len < 3:
         raise ValueError(f'seq_len={seq_len!r} must be an int >= 3.')
-    window_lo, window_hi = 2, win - 1
+    # A window longer than the sequence covers every placement, so cap its
+    # inclusive upper edge at the largest possible distance (``seq_len-1``).
+    # Without the cap a win > seq_len request reported a window range that
+    # extended past the valid distance domain and a ``mid``/``far`` range
+    # that started beyond it, so the buckets no longer partitioned
+    # ``[2, seq_len-1]`` exactly once.
+    window_lo, window_hi = 2, min(win - 1, seq_len - 1)
     mid_lo = max(2, win)
     mid_hi = max(mid_lo - 1, seq_len // 2)
     return {

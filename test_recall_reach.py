@@ -789,6 +789,31 @@ def test_report_materializes_one_shot_inputs():
         str(raised))
 
 
+def test_distance_buckets_cap_an_oversized_window():
+    """A window larger than the sequence still partitions the distances.
+
+    ``_recall_bucket_ranges`` returns inclusive ranges; when ``win`` exceeds
+    ``seq_len`` the window's uncapped upper edge used to run past the valid
+    distance domain (and the empty mid/far ranges started beyond it), so
+    the three buckets did not partition every observable distance exactly
+    once. The structural window test itself is unchanged (distance <= win-1
+    is still a window hit).
+    """
+    seq_len = 8
+    for win in (seq_len - 1, seq_len, seq_len + 1, 100):
+        ranges = R._recall_bucket_ranges(win, seq_len)
+        covered = []
+        for lo, hi in ranges.values():
+            covered.extend(range(lo, hi + 1))
+        assert covered == list(range(2, seq_len)), (win, ranges, covered)
+    # The label agrees with the structural predicate for every distance.
+    for win in (seq_len + 1, 100):
+        ranges = R._recall_bucket_ranges(win, seq_len)
+        for distance in range(2, seq_len):
+            assert R._recall_bucket(distance, win, ranges['mid'][1]) == \
+                'window'
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -805,6 +830,7 @@ def main() -> int:
     test_worst_seed_selection_picks_lowest_accuracy()
     test_far_metrics_are_undefined_without_far_placements()
     test_recall_flops_accepts_tuple_layout_forms()
+    test_distance_buckets_cap_an_oversized_window()
     test_report_materializes_one_shot_inputs()
     print('\nAll recall-reach tests passed.')
     return 0
