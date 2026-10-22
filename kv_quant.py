@@ -509,6 +509,10 @@ _TOTAL_KEY = 'total_read_elements'
 # They are exposed separately for diagnosis, but must not be added to the
 # aggregate a second time when converting elements to bytes.
 _CORE_SUBCOMPONENT_STEMS = frozenset({'selected', 'window', 'dense'})
+#: Layout rows carry both a route-neutral ``memory`` aggregate and the
+#: per-route columns. ``memory`` must not be added on top of the route it
+#: summarizes (the same rule as ``core`` vs its branch subcomponents).
+_MEMORY_ROUTE_STEMS = frozenset({'kda', 'mamba2'})
 
 
 def _row_component_stems(row: dict) -> list[str]:
@@ -576,7 +580,10 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
     ``row`` is any element row produced by ``kv_budget`` (operator-level
     ``op_read_elements`` or layout-level ``layout_read_elements``). Every
     ``<stem>_read_elements`` field becomes ``<stem>_read_bytes`` and the
-    KDA ``state_elements`` becomes ``state_bytes``.
+    KDA ``state_elements`` becomes ``state_bytes``. On layout rows the
+    route-neutral ``memory_read_elements`` is an aggregate of the
+    ``kda``/``mamba2`` route column, so it is reported but not added to
+    ``total_read_bytes`` twice.
 
     The per-query aggregate ``total_read_bytes`` sums the *read* components
     only: the retained state is storage, not a per-query read, matching
@@ -622,12 +629,18 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
             continue
         b = float(value) * bpe
         out[key] = b
-        if stem != 'state' and not (
-                'core' in stems and stem in _CORE_SUBCOMPONENT_STEMS):
+        if stem == 'state':
             # The retained state is storage, not a per-query read; it is
-            # exposed as state_bytes but never folded into total. Branch
-            # components are already part of ``core_read_elements``.
-            total += b
+            # exposed as state_bytes but never folded into total.
+            continue
+        if 'core' in stems and stem in _CORE_SUBCOMPONENT_STEMS:
+            # Branch components are already part of ``core_read_elements``.
+            continue
+        if stem == 'memory' and (set(stems) & _MEMORY_ROUTE_STEMS):
+            # The route-neutral memory total is the sum of the route
+            # column already present; adding both would double-count.
+            continue
+        total += b
     out[_TOTAL_KEY.replace('_elements', '_bytes')] = total
     out['quant_bytes_per_element'] = bytes_per_element_map
     return out

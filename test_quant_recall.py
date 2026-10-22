@@ -77,6 +77,7 @@ def _ok(name, cond, detail=''):
 _MQAR_SPEC = {
     'softmax': {'n_kv_heads': 2, 'd_k': 4, 'd_v': 4},
     'kda': {'hv': 1, 'd_k': 8, 'd_v': 4},
+    'mamba2': {'nheads': 2, 'headdim': 4, 'd_state': 8},
     'csa': {'m': 4, 'topk': 2, 'c': 8, 'c_i': 4},
     'hca': {'m2': 8, 'c': 8},
 }
@@ -182,6 +183,22 @@ def test_quantized_row_bytes_bridge():
         abs(lay['total_read_bytes']
             - (lay['kda_read_bytes'] + lay['csa_read_bytes']
                + lay['hca_read_bytes'])) < 1e-9, '')
+    _ok('route-neutral memory aggregate stays diagnostic (default fp16)',
+        abs(lay['memory_read_bytes'] - 3 * 64.0 * 2.0) < 1e-9
+        and abs(lay['total_read_bytes']
+                - (lay['kda_read_bytes'] + lay['csa_read_bytes']
+                   + lay['hca_read_bytes'])) < 1e-9,
+        f"memory={lay['memory_read_bytes']} total={lay['total_read_bytes']}")
+    lay_m = kv_budget.layout_read_bytes(
+        16, (3, 1, 1), _MQAR_SPEC, quant={'mamba2': QuantSpec(4, 64)},
+        memory_op='mamba2')
+    _ok('Mamba-2 layout total excludes the memory aggregate',
+        abs(lay_m['total_read_bytes']
+            - (lay_m['mamba2_read_bytes'] + lay_m['csa_read_bytes']
+               + lay_m['hca_read_bytes'])) < 1e-9
+        and lay_m['kda_read_bytes'] == 0.0
+        and abs(lay_m['memory_read_bytes'] - 3 * 128.0 * 2.0) < 1e-9,
+        f'{lay_m}')
     try:
         kv_budget.layout_read_bytes(16, (3, 1, 1), _MQAR_SPEC,
                                     quant={'core': QuantSpec(4, 64)})
