@@ -461,13 +461,19 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         }
 
     dtypes = ['fp32', 'fp16', 'bf16']
-    # Every dtype degrades with distance -> the verdict must hold.
+    # The fact is inserted at ``needle_pos`` from the START and the question
+    # is appended at the END, so pos=64 is the FARTHEST placement and pos=192
+    # the NEAREST one. Every dtype degrades with distance -> verdict holds.
     degrading = ([_row(256, 64, 'kda', a, d)
-                  for d, a in zip(dtypes, [0.90, 0.85, 0.80])]
+                  for d, a in zip(dtypes, [0.40, 0.35, 0.30])]
                  + [_row(256, 192, 'kda', a, d)
-                    for d, a in zip(dtypes, [0.40, 0.35, 0.30])])
+                    for d, a in zip(dtypes, [0.90, 0.85, 0.80])])
     summary = summarize_needle_hypotheses(degrading)
     eff = summary['distance_effects'][0]
+    _ok('near position is the one closest to the appended question',
+        eff['near_needle_pos'] == 192 and eff['far_needle_pos'] == 64
+        and eff['near_distance'] == 64 and eff['far_distance'] == 192,
+        f"{eff}")
     _ok('near accuracy is the mean at the nearest position',
         abs(eff['near_accuracy'] - 0.85) < 1e-12,
         f"{eff['near_accuracy']}")
@@ -478,11 +484,11 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         summary['distance_degradation_verdict'] is True,
         f"far-near={eff['far_minus_near']}")
 
-    # Every dtype improves with distance -> the verdict must be falsified.
+    # A fact near the question is retrieved worse -> verdict falsified.
     improving = ([_row(256, 64, 'kda', a, d)
-                  for d, a in zip(dtypes, [0.30, 0.35, 0.40])]
+                  for d, a in zip(dtypes, [0.80, 0.85, 0.90])]
                  + [_row(256, 192, 'kda', a, d)
-                    for d, a in zip(dtypes, [0.80, 0.85, 0.90])])
+                    for d, a in zip(dtypes, [0.30, 0.35, 0.40])])
     summary = summarize_needle_hypotheses(improving)
     eff = summary['distance_effects'][0]
     _ok('improving across every dtype -> verdict False',
@@ -491,8 +497,8 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         f"far-near={eff['far_minus_near']}")
 
     # One row per position (single dtype) keeps the exact reported values.
-    single = [_row(256, 64, 'kda', 0.9, 'fp32'),
-              _row(256, 192, 'kda', 0.4, 'fp32')]
+    single = [_row(256, 64, 'kda', 0.4, 'fp32'),
+              _row(256, 192, 'kda', 0.9, 'fp32')]
     eff = summarize_needle_hypotheses(single)['distance_effects'][0]
     _ok('single-dtype rows keep their exact accuracies',
         eff['near_accuracy'] == 0.9 and eff['far_accuracy'] == 0.4

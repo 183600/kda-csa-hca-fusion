@@ -1329,6 +1329,11 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
     rule_family = _needle_trained_matches_rule_family(recall)
     # Distance check: unquantized rows grouped by (context, route); compare
     # the farthest vs nearest needle position (descriptive, seed-averaged).
+    # ``needle_pos`` is measured from the SEQUENCE START and the question is
+    # appended at the END, so retrieval distance is ``context_len -
+    # needle_pos`` (the constant question suffix cancels from the ranking).
+    # Ranking directly on ``needle_pos`` inverted the axis: min(position) is
+    # the FARTHEST needle from the question, max(position) the nearest.
     # Rows are per dtype, so a position can appear several times: the
     # accuracy AT an extreme position is the mean over the rows at that
     # position (not an extreme of the (position, accuracy) tuples, which
@@ -1340,13 +1345,22 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
         pos = int(r.get('needle_pos', 0))
         by_axis.setdefault(key, {}).setdefault(pos, []).append(
             float(r.get('accuracy_mean', 0.0)))
+
+    def _distance(key, pos: int) -> int:
+        context_len = key[0]
+        if isinstance(context_len, bool) or not isinstance(context_len, int):
+            raise ValueError(
+                'needle distance effect needs an integer context_len, got '
+                f'{context_len!r} for needle_pos={pos!r}')
+        return int(context_len) - int(pos)
+
     distance_effects = []
     for key, by_pos in sorted(by_axis.items(), key=lambda kv: str(kv[0])):
         if len(by_pos) < 2:
             # No distance axis without at least two distinct positions.
             continue
-        near_pos = min(by_pos)
-        far_pos = max(by_pos)
+        near_pos = min(by_pos, key=lambda p: _distance(key, p))
+        far_pos = max(by_pos, key=lambda p: _distance(key, p))
         near_vals = by_pos[near_pos]
         far_vals = by_pos[far_pos]
         near = sum(near_vals) / len(near_vals)
@@ -1354,6 +1368,10 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
         distance_effects.append({
             'context_len': key[0],
             'memory_type': key[1],
+            'near_needle_pos': near_pos,
+            'far_needle_pos': far_pos,
+            'near_distance': _distance(key, near_pos),
+            'far_distance': _distance(key, far_pos),
             'near_accuracy': near,
             'far_accuracy': far,
             'far_minus_near': far - near,
