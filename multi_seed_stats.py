@@ -322,14 +322,37 @@ def _sample_sd(values: list[float], mean: float) -> float | None:
     # is multiplied back, which is value-equal up to round-off for the
     # ordinary range.
     deviations = [v - mean for v in values]
-    dev_scale = max(abs(x) for x in deviations)
-    if dev_scale == 0.0:
-        return 0.0
-    var_ratio = math.fsum((x / dev_scale) ** 2
-                          for x in deviations) / (n - 1)
     scale = max(abs(mean), max(abs(v) for v in values), 1.0e-300)
     roundoff = _ZERO_VAR_ULP_FACTOR * sys.float_info.epsilon * scale
-    sd = dev_scale * math.sqrt(var_ratio) if var_ratio > 0.0 else 0.0
+    if all(math.isfinite(x) for x in deviations):
+        dev_scale = max(abs(x) for x in deviations)
+        if dev_scale == 0.0:
+            return 0.0
+        var_ratio = math.fsum((x / dev_scale) ** 2
+                              for x in deviations) / (n - 1)
+        sd = dev_scale * math.sqrt(var_ratio) if var_ratio > 0.0 else 0.0
+    else:
+        # ``v - mean`` itself overflowed (opposite-sign values near the
+        # float limit). Evaluate the same SD on values divided by a common
+        # scale so the intermediate sums stay finite.
+        value_scale = max(abs(v) for v in values)
+        if value_scale == 0.0:
+            return 0.0
+        scaled = [v / value_scale for v in values]
+        scaled_mean = _safe_mean(scaled)
+        scaled_dev = [v - scaled_mean for v in scaled]
+        dev_scale = max(abs(x) for x in scaled_dev)
+        if dev_scale == 0.0:
+            return 0.0
+        var_ratio = math.fsum((x / dev_scale) ** 2
+                              for x in scaled_dev) / (n - 1)
+        sd = (value_scale * dev_scale * math.sqrt(var_ratio)
+              if var_ratio > 0.0 else 0.0)
+    if not math.isfinite(sd):
+        # The true SD exceeds the float range; ``None`` is the module's
+        # honest "not representable" value (an ``inf`` would poison every
+        # strict-JSON report).
+        return None
     if sd <= roundoff:
         return 0.0
     return sd
@@ -589,6 +612,15 @@ def tost_paired(diffs, margin: float, alpha: float = 0.05) -> dict:
     n = len(d)
     mean = _safe_mean(d)
     sd = _sample_sd(d, mean) if n >= 2 else None
+    if n >= 2 and sd is None:
+        # The sample SD exceeds the float range (e.g. two opposite-sign
+        # differences near 1.7e308). The t interval is unrepresentable, so
+        # report an undefined TOST instead of raising or emitting inf.
+        out = tost_from_summary(mean, 0.0, n, margin, alpha=alpha)
+        out.update(sd_diff=None, t_lower=None, t_upper=None,
+                   p_lower=None, p_upper=None, p_value=None,
+                   equivalent=None, ci_equiv_lo=None, ci_equiv_hi=None)
+        return out
     return tost_from_summary(mean, sd, n, margin, alpha=alpha)
 
 
@@ -667,10 +699,18 @@ def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
     p_upper = student_t_cdf(t_upper, dof)
     p = min(1.0, max(0.0, max(p_lower, p_upper)))
     half = _t_quantile(1.0 - alpha, dof) * se
-    out.update(t_lower=t_lower, t_upper=t_upper,
+    ci_lo, ci_hi = mean - half, mean + half
+    # A finite mean/SD can still produce an interval endpoint beyond the
+    # float range (half ~1e308).  ``inf`` is not JSON-serializable, so an
+    # unrepresentable interval is reported as undefined rather than
+    # poisoning the whole record.
+    if not (math.isfinite(ci_lo) and math.isfinite(ci_hi)):
+        ci_lo = ci_hi = None
+    out.update(t_lower=t_lower if math.isfinite(t_lower) else None,
+               t_upper=t_upper if math.isfinite(t_upper) else None,
                p_lower=p_lower, p_upper=p_upper, p_value=p,
                equivalent=bool(p < alpha),
-               ci_equiv_lo=mean - half, ci_equiv_hi=mean + half)
+               ci_equiv_lo=ci_lo, ci_equiv_hi=ci_hi)
     return out
 
 
@@ -703,7 +743,10 @@ def equivalence_margin_supported(diffs, alpha: float = 0.05) -> float | None:
     if sd is None or sd <= 0.0:
         return abs(mean)
     se = sd / math.sqrt(n)
-    return abs(mean) + _t_quantile(1.0 - alpha, n - 1) * se
+    supported = abs(mean) + _t_quantile(1.0 - alpha, n - 1) * se
+    # The true infimum can exceed the float range for extreme finite
+    # differences; ``inf`` cannot be stored in the strict-JSON record.
+    return supported if math.isfinite(supported) else None
 
 
 def holm_adjust(p_values, alpha: float = 0.05) -> dict:
@@ -1263,6 +1306,11 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
         crit = _t_quantile(1.0 - alpha / 2.0, n - 1)
         half = crit * sd / math.sqrt(n)
         ci_lo, ci_hi = mean - half, mean + half
+        # Finite inputs can produce a half-width beyond the float range;
+        # an unrepresentable interval is reported as undefined so the
+        # record stays strict-JSON.
+        if not (math.isfinite(ci_lo) and math.isfinite(ci_hi)):
+            ci_lo = ci_hi = None
     direction = ('none' if mean is None or mean == 0.0
                  else ('greater' if mean > 0 else 'less'))
     tost = (tost_paired(d, equivalence_margin, alpha=alpha)

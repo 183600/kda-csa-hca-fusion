@@ -981,6 +981,19 @@ def test_finite_extreme_differences_keep_reports_json_safe():
     assert math.isfinite(loo['baseline']['mean_diff'])
     assert all(math.isfinite(d['mean_diff']) for d in loo['drops'])
     json.dumps(loo, allow_nan=False)  # must not raise
+    # Opposite-sign extremes can make the t half-width / TOST interval
+    # unrepresentable. Those fields become None instead of +/-inf, and a
+    # sample SD beyond the float range is reported as undefined rather
+    # than raising from tost_paired().
+    for diffs in ([1e308, -1e308], [1.5e308, -1.5e308]):
+        rep = M.summarize_paired(diffs, n_boot=20,
+                                 equivalence_margin=1.0)
+        assert rep['ci95_mean_diff_t'] == [None, None]
+        assert rep['tost']['ci_equiv_lo'] is None
+        assert rep['tost']['ci_equiv_hi'] is None
+        json.dumps(rep, allow_nan=False)
+    assert M.tost_paired([1.5e308, -1.5e308], margin=1.0)[
+        'p_value'] is None
     # A normal-range sample keeps the exact legacy arithmetic.
     assert M.summarize_paired([1.0, 2.0, 3.0, 4.0],
                               n_boot=10)['median_diff'] == 2.5
