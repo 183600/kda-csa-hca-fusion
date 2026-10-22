@@ -337,6 +337,11 @@ def kda_forward(
         raise TypeError(f"g_clamp_min must be a real number, got {g_clamp_min!r}")
     if math.isnan(float(g_clamp_min)):
         raise ValueError("g_clamp_min must not be NaN")
+    if float(g_clamp_min) == float('inf'):
+        raise ValueError(
+            "g_clamp_min must be finite or -inf (clamp disabled); +inf "
+            "would clamp every log-decay to +inf and make the recurrence "
+            "non-finite")
 
     # Apply g_clamp_min exactly once here, before any backend dispatch.
     # The downstream functions (_call_fla, naive_recurrent_kda,

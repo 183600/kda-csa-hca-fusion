@@ -275,6 +275,42 @@ def test_hybrid_config_rejects_coerced_and_nonfinite_fields():
         raise AssertionError('total_layers=True was silently accepted')
 
 
+def test_kda_g_clamp_rejects_positive_infinity_and_nan():
+    """A positive-infinity lower bound is never a meaningful gate clamp.
+
+    ``g.clamp(min=+inf)`` makes every log-decay ``+inf`` (state becomes
+    non-finite), so both the operators and the backend adapter must reject
+    it before the clamp. ``-inf`` (disabled) and finite bounds still work.
+    """
+    from ops_kda import naive_chunk_kda, naive_recurrent_kda
+    from ops_kda_backend import kda_forward
+
+    B, T, H, K, HV, V = 1, 3, 1, 2, 1, 2
+    q = torch.randn(B, T, H, K)
+    k = torch.randn(B, T, H, K)
+    v = torch.randn(B, T, HV, V)
+    g = -torch.rand(B, T, HV, K)
+    beta = torch.rand(B, T, HV)
+    negative_inf = -float('inf')
+    for fn, kwargs in (
+            (naive_recurrent_kda, {}),
+            (naive_chunk_kda, {'chunk_size': 2}),
+            (kda_forward, {'use_chunk': False})):
+        for bad in (float('inf'), float('nan'), True):
+            try:
+                fn(q, k, v, g, beta, g_clamp_min=bad, **kwargs)
+            except (TypeError, ValueError):
+                pass
+            except Exception as exc:  # noqa: BLE001 - the point is the type
+                _ok(f'{fn.__name__} g_clamp_min={bad!r} rejected', False,
+                    f'{type(exc).__name__}: {exc}')
+            else:
+                _ok(f'{fn.__name__} g_clamp_min={bad!r} rejected', False,
+                    'no error raised')
+        with torch.no_grad():
+            fn(q, k, v, g, beta, g_clamp_min=negative_inf, **kwargs)
+
+
 def test_backend_validators_reject_non_string_values():
     """Unhashable / non-string backend names are ValueError, not TypeError.
 
@@ -364,6 +400,7 @@ if __name__ == '__main__':
     test_decoding_cache_to_rejects_non_float_storage_dtype()
     test_csa_decode_step_validates_indexer_operands()
     test_kda_chunk_size_requires_an_exact_positive_int()
+    test_kda_g_clamp_rejects_positive_infinity_and_nan()
     test_backend_validators_reject_non_string_values()
     test_memory_mixers_reject_coerced_integer_config_fields()
     test_hybrid_config_rejects_coerced_and_nonfinite_fields()

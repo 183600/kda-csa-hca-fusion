@@ -252,6 +252,27 @@ def _validate_kda_shapes(q, k, v, g, beta, fn_name, chunk_size=None,
                 f"{expected} ([B, HV, K, V]).")
 
 
+def _validate_g_clamp_min(value, fn_name):
+    """Validate the optional lower bound on the log-decay gate.
+
+    A real number or the ``-inf`` sentinel (clamp disabled) is accepted.
+    ``+inf`` is not a meaningful lower bound: ``g.clamp(min=+inf)`` makes
+    every gate ``+inf``, so the recurrent state becomes non-finite instead
+    of the caller getting an actionable error. NaN is rejected for the same
+    reason (its comparisons silently produce unspecified results).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"{fn_name}: g_clamp_min={value!r} must be a real number or "
+            f"-inf (clamp disabled).")
+    if _math.isnan(float(value)):
+        raise ValueError(f"{fn_name}: g_clamp_min must not be NaN.")
+    if value == float('inf'):
+        raise ValueError(
+            f"{fn_name}: g_clamp_min=+inf is not a valid lower bound; pass "
+            f"a finite value or -inf to disable clamping.")
+
+
 def _compute_dtype(dtype):
     """Pick the compute dtype for KDA math."""
     return torch.float64 if dtype == torch.float64 else torch.float
@@ -458,6 +479,7 @@ def naive_recurrent_kda(
         fallback that computes the same result.
     """
     dtype = v.dtype
+    _validate_g_clamp_min(g_clamp_min, 'naive_recurrent_kda')
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     _validate_kda_shapes(q, k, v, g, beta, fn_name='naive_recurrent_kda',
@@ -890,6 +912,7 @@ def _chunk_kda_prepare(
     sequential loop (see that function's docstring). The math is unchanged.
     """
     dtype = v.dtype
+    _validate_g_clamp_min(g_clamp_min, fn_name)
     _validate_kda_inputs(q, k, v, g, beta, fn_name=fn_name)
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     _validate_kda_shapes(q, k, v, g, beta, fn_name=fn_name,
