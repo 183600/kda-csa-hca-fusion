@@ -283,6 +283,9 @@ def test_confusion_matrix_rejects_out_of_range_explicit_classes():
             ([0.0, 1.9], [0, 1]),
             ([0, 1], [0.0, 1.0]),
             ([True], [1]),
+            ([True, 2], [1, 0]),
+            ([0, 1], [False, 1]),
+            ([[False, 2]], [[0, 1]]),
     ):
         with pytest.raises(ValueError):
             confusion_matrix(bad_pred, bad_target)

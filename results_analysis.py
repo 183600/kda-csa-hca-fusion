@@ -975,6 +975,17 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
 
 def _class_id_tensor(values, name: str) -> torch.Tensor:
     """Flatten integer class ids; never truncate floats or coerce bools."""
+    if not isinstance(values, torch.Tensor):
+        def _has_bool(value) -> bool:
+            if isinstance(value, bool):
+                return True
+            if isinstance(value, (list, tuple)):
+                return any(_has_bool(item) for item in value)
+            return False
+
+        if _has_bool(values):
+            raise ValueError(
+                f'{name} must contain integer class ids, got a bool element')
     tensor = torch.as_tensor(values)
     if tensor.numel() and (tensor.dtype == torch.bool
                            or tensor.is_floating_point()
