@@ -885,22 +885,26 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
             'accuracy': (float(correct[mask].float().mean()) if n else None),
         }
 
-    # (a) Relative position quartiles: a recurrent state early in the
-    # sequence has seen less context, so this separates cold-start errors
-    # from steady-state errors.
-    pos = position[valid]
-    width = int(pos.max().item()) + 1 if pos.numel() else 1
+    lengths = [int(d['position'].shape[-1]) for d in items]
     pos_buckets = []
-    if pos.numel():
+    if n_tokens:
+        position_bucket = torch.cat([
+            (d['position'].reshape(-1) * 4)
+            // max(1, int(d['position'].shape[-1]))
+            for d in items
+        ])
+        uniform_width = lengths[0] if len(set(lengths)) == 1 else None
         for qi in range(4):
-            mask = valid & ((position * 4) // max(1, width) == qi)
+            mask = valid & (position_bucket == qi)
             entry = _acc(mask)
             entry['quartile'] = f'q{qi + 1}_of_4'
-            # Half-open interval of the SAME mask condition
-            # ``(position*4)//width == qi``  <=>
-            # ceil(qi*width/4) <= position < ceil((qi+1)*width/4).
-            entry['position_range'] = [
-                -(-qi * width // 4), -(-(qi + 1) * width // 4)]
+            if uniform_width is None:
+                entry['position_range'] = None
+                entry['relative_position_range'] = [qi / 4, (qi + 1) / 4]
+            else:
+                entry['position_range'] = [
+                    -(-qi * uniform_width // 4),
+                    -(-(qi + 1) * uniform_width // 4)]
             pos_buckets.append(entry)
 
     # (b) Distance to the target's last earlier occurrence: copy accuracy is

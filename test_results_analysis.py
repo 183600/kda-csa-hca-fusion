@@ -736,6 +736,47 @@ def test_summarize_lm_diagnostics_reports_both_axes():
     json.dumps(s, allow_nan=False)
 
 
+def _all_correct_diag(T):
+    logits = torch.zeros(1, T, 3)
+    labels = torch.zeros(1, T, dtype=torch.long)
+    input_ids = torch.zeros(1, T, dtype=torch.long)
+    return lm_token_diagnostics(logits, labels, input_ids)
+
+
+def test_position_quartiles_use_full_sequence_length_not_last_valid():
+    """An ignored padded tail must not compress the position axis.
+
+    With T=8 and only positions 0..1 valid, deriving the width from the
+    last VALID position (the old ``pos.max()+1``) put position 1 in q3
+    instead of q1. Quartiles are relative to the sequence length.
+    """
+    T = 8
+    logits = torch.zeros(1, T, 3)
+    labels = torch.full((1, T), -100, dtype=torch.long)
+    labels[0, :2] = 0
+    input_ids = torch.zeros(1, T, dtype=torch.long)
+    s = summarize_lm_diagnostics(lm_token_diagnostics(
+        logits, labels, input_ids))
+    q = {b['quartile']: b for b in s['accuracy_by_position_quartile']}
+    assert [q[f'q{i}_of_4']['n'] for i in range(1, 5)] == [2, 0, 0, 0]
+    assert q['q1_of_4']['position_range'] == [0, 2]
+    assert q['q4_of_4']['position_range'] == [6, 8]
+
+
+def test_position_quartiles_are_relative_to_each_sequence_length():
+    """Batched diagnostics of different lengths get per-sequence bins."""
+    s = summarize_lm_diagnostics([_all_correct_diag(4),
+                                  _all_correct_diag(8)])
+    q = {b['quartile']: b for b in s['accuracy_by_position_quartile']}
+    assert [q[f'q{i}_of_4']['n'] for i in range(1, 5)] == [3, 3, 3, 3]
+    for i in range(1, 5):
+        entry = q[f'q{i}_of_4']
+        assert entry['position_range'] is None
+        assert entry['relative_position_range'] == [
+            (i - 1) / 4, i / 4]
+    json.dumps(s, allow_nan=False)
+
+
 def test_lm_token_diagnostics_masked_and_empty():
     vocab = 4
     logits = torch.stack([_row_logits(vocab, 2, 1),
