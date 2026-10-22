@@ -564,6 +564,19 @@ def test_mqar_objective_seed_statistics():
     assert len(metrics['per_seed_accuracy']) == 2
     json.dumps(result, allow_nan=False)
 
+    # Empty generators are truthy, and float/bool seeds would be silently
+    # truncated by the training call. Both must be rejected before training.
+    for bad_seeds in ((s for s in ()), (0, 1.5), (True,), (0, '1')):
+        try:
+            make_mqar_objective(
+                m=4, m2=8, seeds=bad_seeds, steps=1, seq_len=8, d_model=32,
+                train_batch=4, eval_batches=1, eval_batch=8, device='cpu')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'make_mqar_objective accepted seeds={bad_seeds!r}')
+
 
 # ---------------------------------------------------------------------------
 # integration

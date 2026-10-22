@@ -928,8 +928,16 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
     from recall_reach import evaluate_recall, train_recall_model
     from run_quality import _t_crit_975
 
-    if not seeds:
+    # Materialize first: a generator is always truthy, so ``if not seeds``
+    # would let an EMPTY generator through and silently return score=None.
+    seed_list = list(seeds)
+    if not seed_list:
         raise ValueError('make_mqar_objective: seeds must be non-empty.')
+    for i, seed in enumerate(seed_list):
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(
+                f'make_mqar_objective: seeds[{i}]={seed!r} must be an exact '
+                f'int; silently truncating it would change the trained probe.')
     if isinstance(gen_offset, bool) or not isinstance(gen_offset, int):
         raise ValueError(
             f'make_mqar_objective: gen_offset must be an exact int, got '
@@ -945,7 +953,7 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
     def evaluate(candidate: Candidate) -> dict:
         accuracies: list[float | None] = []
         final_losses: list[float | None] = []
-        for seed in seeds:
+        for seed in seed_list:
             model, embed, head, losses = train_recall_model(
                 candidate.layout, int(m), int(m2), seed=int(seed),
                 steps=int(steps), seq_len=int(seq_len), d_model=int(d_model),
@@ -979,7 +987,7 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
                 'n_seeds': len(finite),
                 'per_seed_accuracy': [None if a is None else float(a)
                                       for a in accuracies],
-                'seeds': [int(s) for s in seeds],
+                'seeds': list(seed_list),
                 'final_loss': [None if v is None else float(v)
                                for v in final_losses],
                 'steps': int(steps),
