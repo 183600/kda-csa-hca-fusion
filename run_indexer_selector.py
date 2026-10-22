@@ -567,7 +567,9 @@ def main() -> int:
             'value': 0,
             'scheme': ('set_global_seed(0) covers Python/NumPy/torch/CUDA; '
                        'seeded torch.Generator(0/7) for score tensors and '
-                       'cache fill; see run_indexer_selector.main'),
+                       'cache fill; bench_sink_guard re-seeds torch with 3 '
+                       'for the degenerate-config guard; see '
+                       'run_indexer_selector.main'),
         },
         'provenance': capture_provenance(),
     }
@@ -592,6 +594,7 @@ def main() -> int:
             'decode_geometry': metadata['decode_geometry'],
             'topk_sort_max_elems': metadata['topk_sort_max_elems'],
             'timing_protocol': metadata['timing_protocol'],
+            'sink_guard_torch_seed': 3,
         },
         data={
             'kind': 'synthetic_selector_score_tensors',
