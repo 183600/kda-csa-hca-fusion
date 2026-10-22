@@ -840,6 +840,12 @@ class Rwkv7Mixer(nn.Module):
         # untouched, return a zero-length output.
         if T == 0:
             if state is not None and state.shape[0] == B:
+                expected = (B, self.n_heads, self.head_dim, self.head_dim)
+                if tuple(state.shape) != expected:
+                    raise ValueError(
+                        'Rwkv7Mixer: state.shape='
+                        f'{tuple(state.shape)} does not match the expected '
+                        f'{expected} ([B, H, K, V]) even though T=0.')
                 new_state = state.to(device=x.device, dtype=compute_dtype)
             else:
                 new_state = torch.zeros(

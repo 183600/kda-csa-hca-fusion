@@ -630,9 +630,61 @@ def test_memory_mixers_reject_coerced_integer_config_fields():
         raise AssertionError('boolean rwkv_layer_idx was silently accepted')
 
 
+def test_t0_memory_mixers_reject_wrong_full_state_geometry():
+    """T=0 must not bypass the [B, H, K, V] state contract.
+
+    These branches only checked ``state.shape[0] == B`` and echoed a
+    same-batch tensor back, so a state from a different geometry was
+    accepted on an empty call and could re-enter a later decode step.
+    """
+    from ops_fused import KDAHybridLayer
+    from ops_mamba import Mamba2Mixer
+    from ops_rwkv import Rwkv7Mixer
+
+    kda_cfg = SimpleNamespace(
+        d_model=8, n_heads_qk=2, head_dim_k=3, head_dim_v=4, n_heads_v=2,
+        kda_decay_init='default', kda_decay_scale=0.1, kda_chunk_size=0,
+        kda_backend='reference', kda_recompute_attn=False,
+        kda_assoc_scan=False, n_kda=1, n_csa=0, n_hca=0, layout=None)
+    kda = KDAHybridLayer(kda_cfg)
+    try:
+        kda.forward_functional(torch.zeros(1, 0, 8),
+                               torch.zeros(1, 2, 5, 5), None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('KDA T=0 accepted a wrong K/V state shape')
+
+    mamba_cfg = SimpleNamespace(
+        d_model=8, mamba_d_state=4, mamba_d_conv=2, mamba_expand=2,
+        mamba_headdim=8, mamba_ngroups=1)
+    mamba = Mamba2Mixer(mamba_cfg)
+    try:
+        mamba.forward_functional(
+            torch.zeros(1, 0, 8),
+            torch.zeros(1, mamba.nheads, mamba.headdim, mamba.d_state + 1),
+            None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('Mamba-2 T=0 accepted a wrong state shape')
+
+    rwkv = Rwkv7Mixer(SimpleNamespace(d_model=64, rwkv_head_dim=16))
+    try:
+        rwkv.forward_functional(
+            torch.zeros(1, 0, 64),
+            torch.zeros(1, rwkv.n_heads, rwkv.head_dim, rwkv.head_dim + 1),
+            None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('RWKV-7 T=0 accepted a wrong state shape')
+
+
 if __name__ == '__main__':
     test_gated_delta_rule_rejects_geometry_mismatch()
     test_gated_delta_rule_step_rejects_unknown_gate_type()
+    test_t0_memory_mixers_reject_wrong_full_state_geometry()
     test_gated_delta_rule_check_survives_python_optimized()
     test_online_softmax_rejects_non_boolean_mask()
     test_decoding_cache_to_rejects_non_float_storage_dtype()

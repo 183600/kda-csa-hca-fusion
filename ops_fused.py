@@ -927,6 +927,12 @@ class KDAHybridLayer(nn.Module):
         if T == 0:
             compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float
             if state is not None and state.shape[0] == B:
+                expected = (B, HV, K, V)
+                if tuple(state.shape) != expected:
+                    raise ValueError(
+                        'KDAHybridLayer: state.shape='
+                        f'{tuple(state.shape)} does not match the expected '
+                        f'{expected} ([B, HV, K, V]) even though T=0.')
                 new_state = state.to(device=x.device, dtype=compute_dtype)
             else:
                 new_state = torch.zeros(

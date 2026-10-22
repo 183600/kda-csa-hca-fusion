@@ -1420,6 +1420,13 @@ class Mamba2Mixer(nn.Module):
         # return a zero-length output.
         if T == 0:
             if state is not None and state.shape[0] == B:
+                expected = (B, self.nheads, self.headdim, self.d_state)
+                if tuple(state.shape) != expected:
+                    raise ValueError(
+                        'Mamba2Mixer: state.shape='
+                        f'{tuple(state.shape)} does not match the expected '
+                        f'{expected} ([B, nheads, headdim, d_state]) even '
+                        'though T=0.')
                 new_state = state.to(device=x.device, dtype=compute_dtype)
             else:
                 new_state = torch.zeros(
