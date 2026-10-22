@@ -295,5 +295,51 @@ def test_forward_chunk_validates_shapes():
             topk=dc['topk'], nh=dc['nh'], nIh=dc['nIh'])
 
 
+def test_chunk_window_keys_torchscript_parity():
+    """The scripted window gather is bit-identical to the eager body.
+
+    The continuation-chunk fast path calls ``_chunk_window_keys`` for every
+    CSA/HCA layer; compiling the pure gather removes Python control flow
+    without changing the gather geometry.  Values, validity masks, and the
+    gradient w.r.t. the key tensor must match exactly; the eager fallback
+    keeps working on a build where ``torch.jit.script`` is unavailable.
+    """
+    from ops_decoding_cache import (_chunk_window_keys,
+                                    _chunk_window_keys_eager,
+                                    _get_scripted_chunk_window_keys)
+
+    cases = ((10, 4, 5), (6, 0, 0), (2, 0, 3), (5, 5, 4),
+             (0, 0, 1), (8, 2, 9))
+    for total, n_pre, win in cases:
+        torch.manual_seed(1000 + total * 100 + n_pre * 10 + win)
+        keys = torch.randn(2, total, 3)
+        want, want_valid = _chunk_window_keys_eager(keys, n_pre, win)
+        got, got_valid = _chunk_window_keys(keys, n_pre, win)
+        assert torch.equal(got, want), (total, n_pre, win)
+        assert torch.equal(got_valid, want_valid), (total, n_pre, win)
+
+    with pytest.raises(ValueError):
+        _chunk_window_keys(torch.zeros(2, 4), 0, 2)
+    with pytest.raises(ValueError):
+        _chunk_window_keys(torch.zeros(2, 4, 3), 0, -1)
+    with pytest.raises(ValueError):
+        _chunk_window_keys(torch.zeros(2, 4, 3), 5, 2)
+
+    scripted = _get_scripted_chunk_window_keys()
+    if scripted is None:
+        pytest.skip('torch.jit.script unavailable; eager fallback is pinned')
+
+    keys = torch.randn(2, 9, 3, requires_grad=True)
+    got, got_valid = scripted(keys, 3, 4)
+    got.sum().backward()
+    scripted_grad = keys.grad.clone()
+    keys.grad = None
+    want, want_valid = _chunk_window_keys_eager(keys, 3, 4)
+    want.sum().backward()
+    assert torch.equal(got, want)
+    assert torch.equal(got_valid, want_valid)
+    assert torch.equal(scripted_grad, keys.grad)
+
+
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))

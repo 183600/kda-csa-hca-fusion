@@ -107,6 +107,8 @@ spec they would be validated against.
 
 from __future__ import annotations
 
+import warnings as _warnings
+
 import torch
 
 from ops_cache import normal_tensor_scope
@@ -288,31 +290,11 @@ def _pos_tensor(value: int, device) -> torch.Tensor:
     return buf
 
 
-def _chunk_window_keys(keys: torch.Tensor, n_pre: int,
-                       win: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-query sliding windows for a whole continuation chunk.
-
-    ``keys`` is the causal-order concatenation
-    ``[pre-chunk SW tail ; chunk keys]`` of shape ``[B, n_pre + T, c]``.
-    Query ``i`` of the chunk sits at concatenated index ``n_pre + i`` and
-    sees the last ``win`` entries ending there (the same window
-    ``_SlidingWindowRingBuffer.get()`` exposes after appending that
-    query). Returns ``(windows, valid)`` with shapes
-    ``[B, T, win, c]`` and ``[T, win]``. Left-padding (fewer than ``win``
-    entries available) is zero-filled and marked invalid, so the joint
-    softmax masks it exactly like the per-token path's absent entries.
-    """
-    if keys.dim() != 3:
-        raise ValueError(
-            f'_chunk_window_keys: keys must be [B, N, c], got '
-            f'{tuple(keys.shape)}')
-    if win < 0:
-        raise ValueError(f'_chunk_window_keys: win={win} must be >= 0')
+def _chunk_window_keys_eager(keys: torch.Tensor, n_pre: int,
+                             win: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Window gather body, kept as the TorchScript source of truth."""
     total = keys.shape[1]
     T = total - n_pre
-    if T < 0:
-        raise ValueError(
-            f'_chunk_window_keys: n_pre={n_pre} exceeds keys length {total}')
     B, _, c = keys.shape
     if win == 0 or T == 0:
         return (keys.new_zeros(B, T, 0, c),
@@ -326,6 +308,67 @@ def _chunk_window_keys(keys: torch.Tensor, n_pre: int,
     flat = idx.reshape(-1)
     windows = keys[:, flat, :].reshape(B, T, win, c)
     return windows, valid
+
+
+_CHUNK_WINDOW_KEYS_SCRIPTED = None
+_CHUNK_WINDOW_KEYS_SCRIPT_FAILED = False
+
+
+def _get_scripted_chunk_window_keys():
+    """Lazily script the continuation-chunk window gather.
+
+    TorchScript compiles the same index arithmetic and one gather as the
+    eager body, so the values are bit-identical.  The cached scripted
+    function removes the remaining Python-level control flow from the
+    chunked sliding-window path; a build without a usable TorchScript
+    falls back to the eager body.
+    """
+    global _CHUNK_WINDOW_KEYS_SCRIPTED, _CHUNK_WINDOW_KEYS_SCRIPT_FAILED
+    if (_CHUNK_WINDOW_KEYS_SCRIPTED is None
+            and not _CHUNK_WINDOW_KEYS_SCRIPT_FAILED):
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter('ignore', FutureWarning)
+                _CHUNK_WINDOW_KEYS_SCRIPTED = torch.jit.script(
+                    _chunk_window_keys_eager)
+        except Exception:
+            _CHUNK_WINDOW_KEYS_SCRIPT_FAILED = True
+    return _CHUNK_WINDOW_KEYS_SCRIPTED
+
+
+def _chunk_window_keys(keys: torch.Tensor, n_pre: int,
+                       win: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query sliding windows for a whole continuation chunk.
+
+    ``keys`` is the causal-order concatenation
+    ``[pre-chunk SW tail ; chunk keys]`` of shape ``[B, n_pre + T, c]``.
+    Query ``i`` of the chunk sits at concatenated index ``n_pre + i`` and
+    sees the last ``win`` entries ending there (the same window
+    ``_SlidingWindowRingBuffer.get()`` exposes after appending that
+    query). Returns ``(windows, valid)`` with shapes
+    ``[B, T, win, c]`` and ``[T, win]``. Left-padding (fewer than ``win``
+    entries available) is zero-filled and marked invalid, so the joint
+    softmax masks it exactly like the per-token path's absent entries.
+
+    The gather runs through a lazily scripted copy when TorchScript is
+    available (eager fallback otherwise); validation stays here so bad
+    geometry still raises the same ``ValueError`` with the same message.
+    """
+    if keys.dim() != 3:
+        raise ValueError(
+            f'_chunk_window_keys: keys must be [B, N, c], got '
+            f'{tuple(keys.shape)}')
+    if win < 0:
+        raise ValueError(f'_chunk_window_keys: win={win} must be >= 0')
+    total = keys.shape[1]
+    T = total - n_pre
+    if T < 0:
+        raise ValueError(
+            f'_chunk_window_keys: n_pre={n_pre} exceeds keys length {total}')
+    fn = _get_scripted_chunk_window_keys()
+    if fn is not None:
+        return fn(keys, n_pre, win)
+    return _chunk_window_keys_eager(keys, n_pre, win)
 
 
 def _joint_softmax_chunk(logits: torch.Tensor, valid: torch.Tensor,
