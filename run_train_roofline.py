@@ -63,10 +63,12 @@ logger = logging.getLogger(__name__)
 RESULTS_PATH = os.path.join('results', 'exp14_train_roofline.json')
 KIND = 'exp14_train_roofline'
 
-#: MQA/GQA/MHA variant ladder (canonical order). The KV-head counts are
-#: derived from the configured ``n_heads`` by :func:`resolve_mqa_variants`;
-#: a fixed count would mislabel the ladder for any ``n_heads != 4``.
-MQA_VARIANTS = ('mha', 'gqa', 'mqa')
+#: MQA/GQA/MHA variant ladder. The mapping's values are the historical
+#: counts for ``n_heads == 4``; the actual counts are derived from the
+#: configured ``n_heads`` by :func:`resolve_mqa_variants`, so the labels stay
+#: correct for every head count. The dict shape is kept for callers that
+#: imported this constant.
+MQA_VARIANTS = {'mha': 4, 'gqa': 2, 'mqa': 1}
 
 
 def resolve_mqa_variants(n_heads: int) -> list[tuple[str, int]]:
@@ -83,7 +85,7 @@ def resolve_mqa_variants(n_heads: int) -> list[tuple[str, int]]:
             f'n_heads={n_heads!r} must be a positive int')
     candidates = (('mha', n_heads),
                   ('gqa', max(1, n_heads // 2)),
-                  ('mqa', 1))
+                  ('mqa', 1))[:len(MQA_VARIANTS)]
     out: list[tuple[str, int]] = []
     seen: set[int] = set()
     for name, n_kv in candidates:
