@@ -46,7 +46,10 @@ Scope and honesty
   stack checks use :func:`hybrid_stack_forward_tp`; streaming / incremental
   decoding of a KDA-only stack uses :func:`kda_stack_forward_tp`, which
   carries the per-head recurrent state and short-conv lookback across
-  calls.  It is the oracle a distributed kernel would be tested against.
+  calls.  :func:`hybrid_stack_forward_tp_streaming` extends the same
+  contract to a full hybrid stack by also carrying one shared-KV
+  CSA/HCA decoding cache per layer.  These are the oracles a distributed
+  kernel would be tested against.
 * The latency model is analytic.  FLOPs reuse the canonical
   ``run_kv_cache.prefill_flops`` decomposition (a test pins that the
   replicated + sharded split sums to it exactly); decode bytes reuse
@@ -58,7 +61,9 @@ Scope and honesty
   compressed entries are shared across value heads, so every rank reads
   the same KV rows.  KDA recurrent state *is* head-scaled and therefore
   shrinks by the TP degree.  This asymmetry is the main decode-phase
-  finding the ledger exposes.
+  finding the ledger exposes, and it is why the streaming reference keeps
+  ONE CSA/HCA cache per layer (shared by all ranks) rather than one per
+  rank.
 * Supported memory route: ``memory_type='kda'``.  Mamba-2 / RWKV-7 have
   their own state layouts and are rejected rather than silently priced
   with a wrong shard map.
@@ -73,7 +78,8 @@ import torch
 import torch.nn.functional as F
 
 import decode_bandwidth
-from ops_csa import naive_csa
+from ops_csa import _qk_normalize, naive_csa
+from ops_decoding_cache import CSADecodingCache, HCADecodingCache
 from ops_fused import HybridConfig, build_mixer
 from ops_hca import naive_hca
 from ops_kda_backend import (kda_forward, resolve_kda_backend,
@@ -497,6 +503,205 @@ def hca_layer_forward_tp(
     return {'output': F.linear(o, o_proj), 'state': None}
 
 
+def _split_linear_output(weight: torch.Tensor, o: torch.Tensor,
+                        width: int, n_heads: int, tp_size: int) -> torch.Tensor:
+    """Sum the per-rank slices of one sharded output projection."""
+    partials = []
+    for rank in range(tp_size):
+        lo, hi = head_ranges(n_heads, tp_size)[rank]
+        w = weight[:, lo * width:hi * width]
+        partials.append(F.linear(o[..., lo * width:hi * width], w))
+    return torch.stack(partials, dim=0).sum(dim=0)
+
+
+def _csa_stream_project(layer, h: torch.Tensor):
+    """Replicated CSA projections for the incremental cache path."""
+    cfg = layer.cfg
+    B, T, _ = h.shape
+    combined = torch.cat(
+        [layer.W_aKV.weight, layer.W_bKV.weight,
+         layer.W_aZ.weight, layer.W_bZ.weight,
+         layer.W_KV_idx.weight, layer.W_Z_idx.weight], dim=0)
+    Ca, Cb, Za, Zb, K_idx, Z_idx = F.linear(h, combined).split(
+        [cfg.csa_c, cfg.csa_c, cfg.csa_c, cfg.csa_c,
+         cfg.csa_cI, cfg.csa_cI], dim=-1)
+    cQ = F.linear(h, layer.W_DQ.weight)
+    q = F.linear(cQ, layer.W_UQ.weight).view(B, T, cfg.csa_nh, cfg.csa_c)
+    q_idx = F.linear(cQ, layer.W_IUQ.weight).view(
+        B, T, cfg.csa_nIh, cfg.csa_cI)
+    w_idx = F.linear(h, layer.W_w.weight)
+    return Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx
+
+
+def _hca_stream_project(layer, h: torch.Tensor):
+    """Replicated HCA projections for the incremental cache path."""
+    cfg = layer.cfg
+    B, T, _ = h.shape
+    C = F.linear(h, layer.W_KV.weight)
+    Z = F.linear(h, layer.W_Z.weight)
+    cQ = F.linear(h, layer.W_DQ.weight)
+    q = F.linear(cQ, layer.W_UQ.weight).view(B, T, cfg.hca_nh, cfg.hca_c)
+    return C, Z, q
+
+
+def _ensure_csa_cache(layer, h: torch.Tensor,
+                      cache: CSADecodingCache | None) -> CSADecodingCache:
+    cfg = layer.cfg
+    if (cache is None or cache.B != h.shape[0]
+            or cache.device != h.device or cache.dtype != h.dtype):
+        cache = CSADecodingCache(
+            h.shape[0], cfg.csa_c, cfg.csa_cI, cfg.csa_m,
+            cfg.csa_sliding_window, h.device, h.dtype,
+            rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.csa_qk_norm_mode)
+    return cache
+
+
+def _ensure_hca_cache(layer, h: torch.Tensor,
+                      cache: HCADecodingCache | None) -> HCADecodingCache:
+    cfg = layer.cfg
+    if (cache is None or cache.B != h.shape[0]
+            or cache.device != h.device or cache.dtype != h.dtype):
+        cache = HCADecodingCache(
+            h.shape[0], cfg.hca_c, cfg.hca_m2, cfg.hca_sliding_window,
+            h.device, h.dtype,
+            rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.hca_qk_norm_mode)
+    return cache
+
+
+def csa_layer_forward_tp_streaming(layer, h: torch.Tensor,
+                                   cache: CSADecodingCache | None,
+                                   tp_size: int) -> dict:
+    """One rank-summed CSA output for a streaming chunk.
+
+    Shared-KV state (compressed blocks, indexer keys, sliding window) lives
+    in ONE cache populated by the replicated branch.  A single-token call
+    runs ``forward_step`` on each rank's value-head slice; multi-token
+    chunks reuse the cache's vectorized ``forward_chunk`` and then split
+    only the output projection, which is exactly the documented shard map.
+    """
+    cfg = layer.cfg
+    _validate_tp_size(tp_size)
+    validate_tp_size(cfg, tp_size)
+    B, T, _ = h.shape
+    out_dim = cfg.csa_nh * cfg.csa_c
+    if T == 0:
+        return {'output': h.new_zeros(B, 0, cfg.d_model), 'cache': cache}
+    cache = _ensure_csa_cache(layer, h, cache)
+    if T > 1 and cache.n_tokens_seen == 0:
+        o, (Ca, Cb, Za, Zb, K_idx, Z_idx) = naive_csa(
+            h, layer.W_aKV.weight, layer.W_bKV.weight,
+            layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
+            layer.W_DQ.weight, layer.W_UQ.weight, layer.W_IUQ.weight,
+            layer.W_w.weight, layer.W_KV_idx.weight, layer.W_Z_idx.weight,
+            layer.B_idx,
+            m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh,
+            nIh=cfg.csa_nIh, c=cfg.csa_c, c_I=cfg.csa_cI,
+            dc=cfg.csa_dc, sliding_window=cfg.csa_sliding_window,
+            sink_logits=layer.sink, use_ste=False, normalize_qk=True,
+            rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.csa_qk_norm_mode, return_projections=True)
+        cache.append_step(
+            Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+            K_idx.detach(), Z_idx.detach(),
+            layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach())
+        return {'output': _split_linear_output(
+            layer.o_proj.weight, o.reshape(B, T, out_dim),
+            cfg.csa_c, cfg.csa_nh, tp_size), 'cache': cache}
+
+    Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = _csa_stream_project(
+        layer, h)
+    compute_dtype = (torch.float64 if h.dtype == torch.float64
+                     else torch.float)
+    q_n = _qk_normalize(q.to(compute_dtype), cfg.csa_qk_norm_mode)
+    if T == 1:
+        cache.append_step(
+            Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+            K_idx.detach(), Z_idx.detach(),
+            layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach())
+        partials = []
+        for rank in range(tp_size):
+            lo, hi = head_ranges(cfg.csa_nh, tp_size)[rank]
+            nh = hi - lo
+            o = cache.forward_step(
+                q_n[:, :, lo:hi], q_idx.to(compute_dtype),
+                w_idx.to(compute_dtype), topk=cfg.csa_topk, nh=nh,
+                nIh=cfg.csa_nIh, scale=None,
+                sink_logits=layer.sink[lo:hi], use_ste=False,
+                normalize_qk=True)
+            partials.append(F.linear(
+                o.reshape(B, 1, nh * cfg.csa_c),
+                layer.o_proj.weight[:, lo * cfg.csa_c:hi * cfg.csa_c]))
+        return {'output': torch.stack(partials, dim=0).sum(dim=0),
+                'cache': cache}
+
+    o = cache.forward_chunk(
+        Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
+        K_idx.detach(), Z_idx.detach(),
+        layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
+        q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+        topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh, scale=None,
+        sink_logits=layer.sink, use_ste=False, normalize_qk=True)
+    return {'output': _split_linear_output(
+        layer.o_proj.weight,
+        o.reshape(B, T, out_dim).to(h.dtype),
+        cfg.csa_c, cfg.csa_nh, tp_size), 'cache': cache}
+
+
+def hca_layer_forward_tp_streaming(layer, h: torch.Tensor,
+                                   cache: HCADecodingCache | None,
+                                   tp_size: int) -> dict:
+    """One rank-summed HCA output for a streaming chunk."""
+    cfg = layer.cfg
+    _validate_tp_size(tp_size)
+    validate_tp_size(cfg, tp_size)
+    B, T, _ = h.shape
+    out_dim = cfg.hca_nh * cfg.hca_c
+    if T == 0:
+        return {'output': h.new_zeros(B, 0, cfg.d_model), 'cache': cache}
+    cache = _ensure_hca_cache(layer, h, cache)
+    if T > 1 and cache.n_tokens_seen == 0:
+        o, (C, Z) = naive_hca(
+            h, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
+            layer.W_DQ.weight, layer.W_UQ.weight,
+            m2=cfg.hca_m2, nh=cfg.hca_nh, c=cfg.hca_c, dc=cfg.hca_dc,
+            sliding_window=cfg.hca_sliding_window, sink_logits=layer.sink,
+            rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
+            qk_norm_mode=cfg.hca_qk_norm_mode, return_projections=True)
+        cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
+        return {'output': _split_linear_output(
+            layer.o_proj.weight, o.reshape(B, T, out_dim),
+            cfg.hca_c, cfg.hca_nh, tp_size), 'cache': cache}
+
+    C, Z, q = _hca_stream_project(layer, h)
+    compute_dtype = (torch.float64 if h.dtype == torch.float64
+                     else torch.float)
+    q_n = _qk_normalize(q.to(compute_dtype), cfg.hca_qk_norm_mode)
+    if T == 1:
+        cache.append_step(C.detach(), Z.detach(), layer.B_pos.detach())
+        partials = []
+        for rank in range(tp_size):
+            lo, hi = head_ranges(cfg.hca_nh, tp_size)[rank]
+            nh = hi - lo
+            o = cache.forward_step(
+                q_n[:, :, lo:hi], nh=nh, scale=None,
+                sink_logits=layer.sink[lo:hi], normalize_qk=True)
+            partials.append(F.linear(
+                o.reshape(B, 1, nh * cfg.hca_c),
+                layer.o_proj.weight[:, lo * cfg.hca_c:hi * cfg.hca_c]))
+        return {'output': torch.stack(partials, dim=0).sum(dim=0),
+                'cache': cache}
+
+    o = cache.forward_chunk(
+        C.detach(), Z.detach(), layer.B_pos.detach(), q_n,
+        nh=cfg.hca_nh, scale=None, sink_logits=layer.sink)
+    return {'output': _split_linear_output(
+        layer.o_proj.weight,
+        o.reshape(B, T, out_dim).to(h.dtype),
+        cfg.hca_c, cfg.hca_nh, tp_size), 'cache': cache}
+
+
 def layer_forward_tp(layer, kind: str, x: torch.Tensor, tp_rank: int,
                      tp_size: int, *,
                      state_shard: torch.Tensor | None = None,
@@ -674,6 +879,180 @@ def _iter_state_layers(kda_state: torch.Tensor | None, n_layers: int):
     else:
         for idx in range(n_layers):
             yield kda_state[idx]
+
+
+_STREAM_STATE_KEYS = ('kda_state', 'conv_lookbacks',
+                      'csa_caches', 'hca_caches')
+
+
+def hybrid_stack_forward_tp_streaming(
+        model, x: torch.Tensor, tp_size: int, *,
+        state: dict | None = None,
+        backend: str | None = None) -> dict:
+    """Incremental TP forward for a full KDA/CSA/HCA hybrid stack.
+
+    This is the streaming counterpart of :func:`hybrid_stack_forward_tp`:
+    it carries the KDA recurrent state / short-conv lookbacks AND the
+    per-layer CSA/HCA decoding caches across calls, so a hybrid stack can
+    be decoded token-by-token under the same head-sharded map.
+
+    ``state`` is the dict returned by a previous call (``None`` for a
+    fresh sequence). The caches are shared-KV replicas: every rank reads
+    the same compressed blocks / sliding window, while attention is
+    evaluated on that rank's value-head slice for a single-token step.
+    A multi-token chunk uses the cache's vectorized ``forward_chunk`` and
+    splits only ``o_proj``; this is the same shard map, just with the
+    replicated attention factored out for speed.
+
+    Returns ``{'output', 'state', 'kda_state', 'conv_lookbacks',
+    'csa_caches', 'hca_caches', 'tp_size', 'n_layers', 'backend',
+    'resolved_backend'}``.
+    """
+    _validate_tp_size(tp_size)
+    _validate_cfg(model.cfg)
+    for kind in model.layout:
+        if kind not in SHARDED_PARAMETERS:
+            raise NotImplementedError(
+                f'hybrid_stack_forward_tp_streaming: layer kind {kind!r} '
+                f'is not supported.')
+    validate_tp_size(model.cfg, tp_size)
+    requested_backend = _resolve_backend(model.cfg, backend)
+    cfg = model.cfg
+    B, T, _ = x.shape
+    n_mem = sum(1 for kind in model.layout if kind == 'kda')
+    n_csa = sum(1 for kind in model.layout if kind == 'csa')
+    n_hca = sum(1 for kind in model.layout if kind == 'hca')
+    HV, K, V = cfg.n_heads_v, cfg.head_dim_k, cfg.head_dim_v
+
+    if state is None:
+        kda_state = None
+        conv_lookbacks = [None] * n_mem
+        csa_caches: list[CSADecodingCache | None] = [None] * n_csa
+        hca_caches: list[HCADecodingCache | None] = [None] * n_hca
+    else:
+        if not isinstance(state, dict):
+            raise TypeError(
+                'hybrid_stack_forward_tp_streaming: state must be the dict '
+                f'returned by a previous call, got {type(state).__name__}.')
+        missing = [k for k in _STREAM_STATE_KEYS if k not in state]
+        if missing:
+            raise ValueError(
+                'hybrid_stack_forward_tp_streaming: state is missing '
+                f'{missing}; expected keys {list(_STREAM_STATE_KEYS)}.')
+        kda_state = state['kda_state']
+        conv_lookbacks = state['conv_lookbacks']
+        csa_caches = state['csa_caches']
+        hca_caches = state['hca_caches']
+        if kda_state is not None:
+            if not isinstance(kda_state, torch.Tensor):
+                raise TypeError(
+                    'hybrid_stack_forward_tp_streaming: state["kda_state"] '
+                    f'must be a tensor or None, got '
+                    f'{type(kda_state).__name__}.')
+            want = (n_mem, B, HV, K, V)
+            if tuple(kda_state.shape) != want:
+                raise ValueError(
+                    'hybrid_stack_forward_tp_streaming: state["kda_state"] '
+                    f'must have shape {want} (n_mem, B, HV, K, V); got '
+                    f'{tuple(kda_state.shape)}. Drop the state when B or '
+                    'the stack geometry changes.')
+        if not isinstance(conv_lookbacks, (list, tuple)) \
+                or len(conv_lookbacks) != n_mem:
+            raise ValueError(
+                'hybrid_stack_forward_tp_streaming: state["conv_lookbacks"] '
+                f'must have one entry per KDA layer ({n_mem}).')
+        if not isinstance(csa_caches, (list, tuple)) \
+                or len(csa_caches) != n_csa:
+            raise ValueError(
+                'hybrid_stack_forward_tp_streaming: state["csa_caches"] '
+                f'must have one entry per CSA layer ({n_csa}).')
+        if not isinstance(hca_caches, (list, tuple)) \
+                or len(hca_caches) != n_hca:
+            raise ValueError(
+                'hybrid_stack_forward_tp_streaming: state["hca_caches"] '
+                f'must have one entry per HCA layer ({n_hca}).')
+        conv_lookbacks = list(conv_lookbacks)
+        csa_caches = list(csa_caches)
+        hca_caches = list(hca_caches)
+        for idx, cache in enumerate(csa_caches):
+            if cache is not None and not isinstance(cache, CSADecodingCache):
+                raise TypeError(
+                    'hybrid_stack_forward_tp_streaming: '
+                    f'state["csa_caches"][{idx}] must be a '
+                    f'CSADecodingCache or None, got '
+                    f'{type(cache).__name__}.')
+        for idx, cache in enumerate(hca_caches):
+            if cache is not None and not isinstance(cache, HCADecodingCache):
+                raise TypeError(
+                    'hybrid_stack_forward_tp_streaming: '
+                    f'state["hca_caches"][{idx}] must be an '
+                    f'HCADecodingCache or None, got '
+                    f'{type(cache).__name__}.')
+
+    h = x
+    mem_idx = csa_idx = hca_idx = 0
+    new_states: list[torch.Tensor] = []
+    new_lookbacks: list[torch.Tensor | None] = []
+    new_csa_caches: list[CSADecodingCache | None] = []
+    new_hca_caches: list[HCADecodingCache | None] = []
+    ranges = head_ranges(HV, tp_size)
+    for layer, norm, kind in zip(model.layers, model.norms, model.layout):
+        mix_in = norm(h)
+        if kind == 'kda':
+            full_state = (None if kda_state is None
+                          else kda_state[mem_idx])
+            partials = []
+            state_shards = []
+            new_lookback = None
+            for rank in range(tp_size):
+                lo, hi = ranges[rank]
+                shard = None if full_state is None else full_state[:, lo:hi]
+                out = layer_forward_tp(
+                    layer, 'kda', mix_in, rank, tp_size,
+                    state_shard=shard,
+                    conv_lookback=conv_lookbacks[mem_idx],
+                    backend=requested_backend)
+                partials.append(out['output'])
+                state_shards.append(out['state'])
+                if rank == 0:
+                    new_lookback = out['conv_lookback']
+            h = h + torch.stack(partials, dim=0).sum(dim=0)
+            new_states.append(torch.cat(state_shards, dim=1))
+            new_lookbacks.append(new_lookback)
+            mem_idx += 1
+        elif kind == 'csa':
+            out = csa_layer_forward_tp_streaming(
+                layer, mix_in, csa_caches[csa_idx], tp_size)
+            h = h + out['output']
+            new_csa_caches.append(out['cache'])
+            csa_idx += 1
+        else:
+            out = hca_layer_forward_tp_streaming(
+                layer, mix_in, hca_caches[hca_idx], tp_size)
+            h = h + out['output']
+            new_hca_caches.append(out['cache'])
+            hca_idx += 1
+
+    new_kda_state = (torch.stack(new_states, dim=0)
+                     if n_mem else None)
+    stream_state = {
+        'kda_state': new_kda_state,
+        'conv_lookbacks': new_lookbacks,
+        'csa_caches': new_csa_caches,
+        'hca_caches': new_hca_caches,
+    }
+    return {
+        'output': h,
+        'state': stream_state,
+        'kda_state': new_kda_state,
+        'conv_lookbacks': new_lookbacks,
+        'csa_caches': new_csa_caches,
+        'hca_caches': new_hca_caches,
+        'tp_size': tp_size,
+        'n_layers': len(model.layout),
+        'backend': requested_backend,
+        'resolved_backend': resolve_kda_backend(requested_backend),
+    }
 
 
 # ---------------------------------------------------------------------------

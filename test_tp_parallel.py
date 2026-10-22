@@ -429,6 +429,94 @@ def test_tp_sweep_hardware_param():
         sa['rows'][0]['prefill']['compute_ms']
 
 
+@pytest.mark.parametrize('chunk_size', [0, 4])
+@pytest.mark.parametrize('schedule', ([8, 1, 1, 3], [1, 1, 1, 1, 9],
+                                      [13]))
+def test_hybrid_streaming_tp_matches_unsharded(chunk_size, schedule, device):
+    """Streaming TP carries KDA state AND CSA/HCA caches across chunks.
+
+    The unsharded ``HybridDecoding`` uses the same per-layer incremental
+    caches.  Both starts are fresh; every chunk boundary (including
+    single-token decode steps and a multi-token continuation) must produce
+    the same output, KDA state, conv lookbacks, and cache fill counters.
+    """
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(23)
+    cfg = dataclasses.replace(_kda_cfg(chunk_size), n_kda=3, n_csa=1,
+                              n_hca=1)
+    decoder = HybridDecoding(cfg=cfg, total_layers=5).to(device).eval()
+    model = decoder.model
+    x = torch.randn(2, sum(schedule), cfg.d_model, device=device) * 0.5
+    state = None
+    pos = 0
+    with torch.no_grad():
+        for length in schedule:
+            chunk = x[:, pos:pos + length]
+            ref = decoder(chunk)
+            got = tp.hybrid_stack_forward_tp_streaming(
+                model, chunk, 2, state=state)
+            _assert_close(f'hybrid streaming chunk@{pos}', got['output'], ref)
+            state = got['state']
+            pos += length
+        _assert_close('hybrid streaming KDA state', state['kda_state'],
+                      decoder.model._kda_state)
+        _assert_lookbacks_close(
+            'hybrid streaming lookbacks', state['conv_lookbacks'],
+            [layer._conv_lookback for layer in decoder.model.memory_layers])
+        csa_ref = decoder._csa_caches[0]
+        hca_ref = decoder._hca_caches[0]
+        assert state['csa_caches'][0].n_tokens_seen == \
+            csa_ref.n_tokens_seen
+        assert state['csa_caches'][0].n_blocks == csa_ref.n_blocks
+        assert state['hca_caches'][0].n_tokens_seen == \
+            hca_ref.n_tokens_seen
+        assert state['hca_caches'][0].n_blocks == hca_ref.n_blocks
+
+
+def test_hybrid_streaming_tp_contract(device):
+    """T=0 preservation and malformed-state diagnostics."""
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(29)
+    cfg = dataclasses.replace(_kda_cfg(4), n_kda=3, n_csa=1, n_hca=1)
+    decoder = HybridDecoding(cfg=cfg, total_layers=5).to(device).eval()
+    model = decoder.model
+    x = torch.randn(2, 7, cfg.d_model, device=device) * 0.5
+    with torch.no_grad():
+        first = tp.hybrid_stack_forward_tp_streaming(model, x, 2)
+        empty = tp.hybrid_stack_forward_tp_streaming(
+            model, x[:, :0], 2, state=first['state'])
+    assert empty['output'].shape == (2, 0, cfg.d_model)
+    _assert_close('empty chunk KDA state', empty['kda_state'],
+                  first['kda_state'])
+    assert empty['csa_caches'][0] is first['csa_caches'][0]
+    assert empty['hca_caches'][0] is first['hca_caches'][0]
+    assert empty['conv_lookbacks'] == first['conv_lookbacks']
+
+    with pytest.raises(ValueError):
+        tp.hybrid_stack_forward_tp_streaming(
+            model, x, 2, state={'kda_state': None})
+    bad = dict(first['state'])
+    bad['kda_state'] = torch.zeros(1, 2, cfg.n_heads_v,
+                                   cfg.head_dim_k, cfg.head_dim_v,
+                                   device=device)
+    with pytest.raises(ValueError):
+        tp.hybrid_stack_forward_tp_streaming(model, x, 2, state=bad)
+    bad = dict(first['state'])
+    bad['csa_caches'] = [object()]
+    with pytest.raises(TypeError):
+        tp.hybrid_stack_forward_tp_streaming(model, x, 2, state=bad)
+
+    mamba = dataclasses.replace(
+        cfg, memory_type='mamba2', mamba_headdim=16,
+        mamba_d_state=16, mamba_expand=2)
+    mamba_stack = HybridAttentionStack(mamba, total_layers=5).to(
+        device).eval()
+    with pytest.raises(NotImplementedError):
+        tp.hybrid_stack_forward_tp_streaming(mamba_stack, x, 2)
+
+
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
 

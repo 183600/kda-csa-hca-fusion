@@ -63,9 +63,30 @@ is replicated, so every rank sees and returns the same lookback.
 
 `test_tp_parallel.py` streams a 3-layer KDA-only stack in uneven chunks
 (`[1,3,4,3]`, `[5,6]`, `[11]`, `[0,4,0,7]`) and pins output, state and
-lookback equality against the one-shot unsharded forward. Streaming is
-restricted to KDA-only stacks: CSA/HCA incremental state lives in
-`ops_decoding_cache`, not in a stateless layer forward.
+lookback equality against the one-shot unsharded forward.
+
+For a **full hybrid stack** (KDA + CSA + HCA), use
+`hybrid_stack_forward_tp_streaming(model, x_chunk, tp_size, state=state)`.
+Its state dict carries `kda_state`, `conv_lookbacks`, and one CSA/HCA
+decoding cache per layer:
+
+```python
+res = hybrid_stack_forward_tp_streaming(model, x_chunk, tp_size,
+                                        state=state)
+out, state = res['output'], res['state']   # state=None starts fresh
+```
+
+The compressed KV / indexer keys / sliding window are **replicated**
+(one shared cache per layer, matching the TP shard map), while the
+attention read uses each rank's value-head slice. A single-token step
+runs `cache.forward_step` per rank; a multi-token chunk uses the cache's
+vectorized `forward_chunk` and splits only `o_proj`, which is the same
+math with the replicated attention factored out. The regression suite
+drives the same uneven chunk schedule through the unsharded
+`run_decoding.HybridDecoding` and this TP path and pins output, KDA
+state, short-conv lookbacks, and cache fill counters equal to fp32
+tolerance — so the decode path is invariant to the TP degree, not just
+the fresh-sequence prefill path.
 
 Scope: KDA memory route only (Mamba-2 / RWKV-7 state layouts are rejected
 rather than mis-priced). The forward follows `cfg.kda_backend` (an explicit

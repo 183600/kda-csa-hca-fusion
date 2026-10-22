@@ -5523,6 +5523,42 @@ def test_hybrid_decoding_cache_matches_full_sequence(device='cpu'):
         f'prefill_len={prefill_len}, n_decode={n_decode}, csa_topk=100')]
 
 
+def test_hybrid_streaming_tp_matches_unsharded(device='cpu'):
+    """Head-sharded streaming TP reproduces the full hybrid decoder.
+
+    The TP reference has to carry three state families across calls: the KDA
+    recurrent state, the short-conv lookbacks, and one CSA/HCA incremental
+    cache per layer.  Compare its outputs against ``run_decoding.HybridDecoding``
+    on the SAME weights for a prefill, single-token decode steps, and a
+    multi-token continuation chunk.  A divergence here would mean the TP
+    decode oracle is wrong even though the fresh-sequence TP test passes.
+    """
+    logger.info("Test: hybrid streaming TP matches unsharded decoder")
+    import tp_parallel as tp
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(811)
+    cfg = tp.mqar_probe_config()
+    decoder = HybridDecoding(cfg=cfg, total_layers=5).to(device).eval()
+    x = torch.randn(2, 13, cfg.d_model, device=device) * 0.5
+    state = None
+    worst = 0.0
+    with torch.no_grad():
+        for start, end in ((0, 8), (8, 9), (9, 10), (10, 13)):
+            ref = decoder(x[:, start:end])
+            got = tp.hybrid_stack_forward_tp_streaming(
+                decoder.model, x[:, start:end], 2, state=state)
+            worst = max(worst, (ref - got['output']).abs().max().item())
+            state = got['state']
+        state_diff = (state['kda_state']
+                      - decoder.model._kda_state).abs().max().item()
+    return [_ok(
+        'hybrid_streaming_tp_matches_unsharded',
+        worst < 1e-5 and state_diff < 1e-5,
+        f'max_diff={worst:.3e}, state_diff={state_diff:.3e}, '
+        f'tp_size=2, layers=5')]
+
+
 def test_hybrid_decoding_mamba2_route(device='cpu'):
     """HybridDecoding prefill+decode matches full sequence on the Mamba-2 route.
 
@@ -7564,6 +7600,9 @@ def main():
     all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
     # Integrated Exp6 hybrid decode-cache path (KDA state + CSA/HCA caches).
     all_results += _run_safe(test_hybrid_decoding_cache_matches_full_sequence, device)
+    # The tensor-parallel streaming oracle must carry the same KDA state,
+    # conv lookbacks, and CSA/HCA caches and reproduce the unsharded decoder.
+    all_results += _run_safe(test_hybrid_streaming_tp_matches_unsharded, device)
     # The same integration on the Mamba-2 route (SSM state + conv
     # lookbacks + CSA/HCA caches).
     all_results += _run_safe(test_hybrid_decoding_mamba2_route, device)
