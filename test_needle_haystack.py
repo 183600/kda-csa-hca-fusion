@@ -205,6 +205,19 @@ def test_quantized_hybrid_prefill_keeps_csa_context():
     _ok('quantized evaluator does not prefill through forward_step',
         result['total'] == 1, result)
 
+    # The unquantized arm must use the same cache-aware path; the old
+    # ``model.forward_step`` loop silently dropped all CSA/HCA prefix
+    # context, so the unquantized and quantized rows were produced by
+    # different models.
+    with patch.object(model, 'forward_step',
+                      side_effect=AssertionError('stateless prefill used')):
+        plain = evaluate_needle_recall(
+            model, tok, context_len=128, needle_pos=32, batch_size=1,
+            n_batches=1, device='cpu', quant_spec=None,
+            dtype=torch.float32)
+    _ok('unquantized evaluator also uses the cache-aware path',
+        plain['total'] == 1, plain)
+
 
 def test_primary_precision_rank_prefers_the_widest_format():
     """Without an unquantized row, the primary cell is the highest-bit one."""

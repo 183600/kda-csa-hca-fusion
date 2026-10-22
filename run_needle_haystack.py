@@ -823,30 +823,23 @@ def evaluate_needle_recall(
         if hasattr(model, 'hybrid'):
             # --- Hybrid model: batch-level prefill + stateful decode -------
             decode_mode = 'greedy_autoregressive'
-            model.hybrid.reset_state()
-            if quant_spec is None:
-                logits = model(input_ids)
-                next_logits = logits[:, -1]
-            else:
-                if decoder is None:
-                    decoder = _build_needle_decoder(model, device, dtype)
-                # Quantize after every state write: the cache-aware clone
-                # keeps CSA/HCA context while the state quantizer still runs
-                # on the memory route after each token.
-                next_logits = _quantized_hybrid_prefill_last_logits(
-                    model, input_ids, quant_spec, decoder)
+            # ``HybridKCHAttention.forward_step`` is stateless for CSA/HCA,
+            # so using it for the unquantized arm would silently discard the
+            # prefix context (and make the PTQ comparison confounded). Both
+            # arms use the cache-aware decoder; only the state quantizer
+            # differs.
+            if decoder is None:
+                decoder = _build_needle_decoder(model, device, dtype)
+            next_logits = _quantized_hybrid_prefill_last_logits(
+                model, input_ids, quant_spec, decoder)
             generated = []
             cur = next_logits.argmax(dim=-1)
             for _ in range(n_gen):
                 generated.append(cur)
-                if quant_spec is None:
-                    cur = model.forward_step(
-                        cur.unsqueeze(-1), quant_spec).argmax(dim=-1)
-                else:
-                    h = decoder(model.embed(cur.unsqueeze(-1)))
-                    _quantize_hybrid_kda_state(decoder.model, quant_spec)
-                    cur = model.lm_head(
-                        model.norm_f(h)).squeeze(1).argmax(dim=-1)
+                h = decoder(model.embed(cur.unsqueeze(-1)))
+                _quantize_hybrid_kda_state(decoder.model, quant_spec)
+                cur = model.lm_head(
+                    model.norm_f(h)).squeeze(1).argmax(dim=-1)
             preds = torch.stack(generated, dim=1)  # [B, n_gen]
         else:
             # --- Stepwise model has no persistent cross-call state: score the
