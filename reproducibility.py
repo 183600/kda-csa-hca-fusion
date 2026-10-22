@@ -14,6 +14,12 @@ module turns that block into an actionable check instead of a passive record:
 * **Advisory identity** — platform, CUDA/device, plotting-library version and
   thread count are reported as warnings rather than hard failures (they are
   expected to differ across CPU/GPU reruns).
+* **Result integrity** — when the file carries an ``integrity`` digest
+  (written by ``results_schema``), the verifier recomputes it over the
+  canonical payload. A mismatch means a number, seed, or metadata field was
+  edited after the run, which is a different (and more serious) problem than
+  environment drift. Legacy files without a digest are still checked for
+  provenance and reported as ``missing`` integrity.
 
 Usage::
 
@@ -27,8 +33,8 @@ Usage::
     # would record) without running an experiment.
     python reproducibility.py --identity
 
-Exit codes: ``0`` all checked results reproducible; ``1`` at least one code
-or runtime drift; ``2`` provenance was absent/unverifiable.
+Exit codes: ``0`` all checked results reproducible; ``1`` at least one code,
+runtime or content-integrity drift; ``2`` provenance was absent/unverifiable.
 
 The comparison is intentionally conservative: missing evidence is reported
 as unverifiable rather than treated as agreement.
@@ -249,12 +255,59 @@ def compare_provenance(recorded, current=None) -> dict:
 
 
 def verify_record(record, current=None) -> dict:
-    """Extract the provenance block from ``record`` and compare it."""
-    return compare_provenance(extract_provenance(record), current=current)
+    """Extract the provenance block from ``record`` and compare it.
+
+    The report also carries an ``integrity`` sub-report. A digest mismatch
+    is treated as ``drift`` even when the code and runtime match: the file
+    no longer contains the numbers the recorded run wrote. A missing digest
+    (legacy file) is a warning only, while an unreadable/unsupported digest
+    degrades a would-be ``reproducible`` verdict to ``unverifiable``.
+    """
+    report = compare_provenance(extract_provenance(record), current=current)
+    try:
+        from results_schema import verify_integrity
+        integrity = verify_integrity(record)
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        integrity = {
+            'status': 'unavailable',
+            'algorithm': None,
+            'recorded': None,
+            'observed': None,
+            'scope': None,
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+    report['integrity'] = integrity
+    status = integrity.get('status')
+    if status == 'mismatch':
+        report['status'] = 'drift'
+        report['reproducible'] = False
+        report['n_integrity_mismatches'] = 1
+        report['warnings'].append(
+            'the result content digest does not match: at least one field '
+            'was edited after the file was written')
+    elif status in ('malformed', 'unsupported', 'unavailable'):
+        report['n_integrity_mismatches'] = 0
+        if report['status'] == 'reproducible':
+            report['status'] = 'unverifiable'
+            report['reproducible'] = False
+        report['warnings'].append(
+            f'the result integrity digest is {status}; the file content '
+            'cannot be verified')
+    elif status == 'missing':
+        report['n_integrity_mismatches'] = 0
+        report['warnings'].append(
+            'the record carries no content digest (legacy file); its '
+            'numbers cannot be checked for post-hoc edits')
+    else:
+        report['n_integrity_mismatches'] = 0
+    return report
 
 
 def _format_report(path: str, report: dict) -> str:
     lines = [f'{path}: {report["status"].upper()}']
+    integrity = report.get('integrity')
+    if isinstance(integrity, dict):
+        lines.append(f'  integrity: {integrity.get("status", "unknown")}')
     for name, check in report.get('checks', {}).items():
         if check['status'] == 'match':
             continue

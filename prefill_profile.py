@@ -62,7 +62,6 @@ inside the configured tolerance.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import statistics
 import sys
@@ -72,7 +71,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
 
-from kaggle_setup import capture_provenance, set_global_seed  # noqa: E402
+from kaggle_setup import (capture_provenance, set_global_seed,
+                          write_json_atomic)  # noqa: E402
 
 __all__ = [
     'PREFILL_PROFILE_KIND',
@@ -713,9 +713,8 @@ def main(argv=None) -> int:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as fh:
-            json.dump(report, fh, indent=2, sort_keys=True, allow_nan=False)
-            fh.write('\n')
+        write_json_atomic(report, path, indent=2, sort_keys=True,
+                          allow_nan=False, trailing_newline=True)
         print(f'Saved: {path}')
 
     return 0 if report['all_passed'] else 1

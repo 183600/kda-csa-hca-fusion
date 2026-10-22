@@ -1233,7 +1233,9 @@ def sanitize_for_json(obj):
 
 
 def write_json_atomic(payload, target_path: str, *, indent: int = 2,
-                      allow_nan: bool = False, default=None) -> None:
+                      allow_nan: bool = False, default=None,
+                      sort_keys: bool = False,
+                      trailing_newline: bool = False) -> None:
     """Atomically write ``payload`` as JSON to ``target_path``.
 
     Uses the standard temp-file + ``os.replace`` pattern:
@@ -1264,6 +1266,11 @@ def write_json_atomic(payload, target_path: str, *, indent: int = 2,
             payload may contain non-finite floats).
         default: passed to ``json.dumps`` (default None — use
             ``sanitize_for_json`` instead of this for non-finite handling).
+        sort_keys: passed to ``json.dumps`` (default False). Results whose
+            consumers used sorted output can keep byte-stable formatting.
+        trailing_newline: append ``"\\n"`` before the atomic rename. Some
+            existing CLI reports ended with a newline; this preserves that
+            convention without a second, non-atomic write.
     """
     import json
     import os
@@ -1273,7 +1280,9 @@ def write_json_atomic(payload, target_path: str, *, indent: int = 2,
     # contains NaN/Inf, this raises ValueError BEFORE we touch the
     # filesystem — the target file is never opened for writing.
     text = json.dumps(payload, indent=indent, allow_nan=allow_nan,
-                      default=default)
+                      default=default, sort_keys=sort_keys)
+    if trailing_newline:
+        text += '\n'
 
     # Step 2: write to a temp file in the SAME directory as the target
     # (so os.replace is a same-filesystem rename and therefore atomic).

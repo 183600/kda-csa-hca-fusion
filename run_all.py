@@ -1218,8 +1218,15 @@ def run_all(seeds=None, steps=None):
         # target file as the OLD version (or absent) rather than a
         # truncated partial JSON document. See
         # kaggle_setup.write_json_atomic's docstring.
+        #
+        # The campaign summary is also an archived claim: it lists which
+        # experiments passed and how long they took. Attach the same
+        # canonical content digest used by result envelopes so an edited
+        # summary is detectable by ``reproducibility.py``/``results_schema``.
         from kaggle_setup import write_json_atomic
-        write_json_atomic(_sanitize(summary), 'results/summary.json',
+        from results_schema import attach_integrity
+        summary = attach_integrity(_sanitize(summary))
+        write_json_atomic(summary, 'results/summary.json',
                           indent=2, allow_nan=False)
         print('\nSaved: results/summary.json')
 

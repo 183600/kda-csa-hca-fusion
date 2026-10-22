@@ -51,7 +51,6 @@ All functions return JSON-strict Python scalars (no tensors/dtypes).
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 
@@ -59,7 +58,8 @@ import torch
 
 from ops_fused import HybridConfig  # noqa: F401  (public re-export / typing)
 from ops_rope import effective_rope_dim
-from kaggle_setup import capture_provenance, set_global_seed
+from kaggle_setup import (capture_provenance, set_global_seed,
+                          write_json_atomic)
 from run_kv_cache import geometric_capacity, kv_cache_elements
 
 # ---------------------------------------------------------------------------
@@ -1107,8 +1107,7 @@ def main(argv=None) -> int:
     report['provenance'] = capture_provenance()
     _print_audit_summary(report)
     if args.json:
-        with open(args.json, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, allow_nan=False)
+        write_json_atomic(report, args.json, indent=2, allow_nan=False)
         print(f'[cache-audit] report saved: {args.json}')
     return 0 if report['comparison']['consistent'] else 1
 

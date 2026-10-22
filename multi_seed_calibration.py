@@ -46,7 +46,6 @@ Run the committed protocol directly with::
 """
 from __future__ import annotations
 
-import json
 import math
 import random
 import sys
@@ -562,8 +561,10 @@ def main(argv=None):
             raise SystemExit(f'unknown argument {args[i]!r}')
     report = calibration_report(reps=reps, n_boot=n_boot, seed=seed)
     if output:
-        with open(output, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, allow_nan=False)
+        # Imported lazily so this pure-statistics module stays importable in
+        # a minimal environment without torch (kaggle_setup imports torch).
+        from kaggle_setup import write_json_atomic
+        write_json_atomic(report, output, indent=2, allow_nan=False)
     for row in report['rows']:
         if row['section'] == 'size':
             print(f"size {row['name']:>16s} {row['method']:>10s} "

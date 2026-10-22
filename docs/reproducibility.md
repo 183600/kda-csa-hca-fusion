@@ -82,6 +82,63 @@ matches, the exact uncommitted code is present. A dirty run **without** a
 source digest is reported as `unverifiable`, because the commit hash cannot
 reconstruct it.
 
+## Result content integrity
+
+Provenance answers *which code and runtime produced the numbers*. It does not
+answer whether the numbers on disk are still the ones that run wrote: a
+post-processing script (or a hand edit) can change a metric without touching
+the provenance block, and the provenance comparison would still pass.
+
+Every envelope written by `results_schema.write` / `write_checked` therefore
+carries a self-describing content digest:
+
+```json
+"integrity": {
+  "algorithm": "sha256",
+  "scope": "sha256 of the canonical JSON envelope (sorted keys, compact separators, UTF-8) with the integrity field itself removed",
+  "value": "<64 hex characters>"
+}
+```
+
+The digest covers every other field, including `metadata.provenance` and the
+per-seed `results` rows. It is computed over **canonical JSON** (sorted keys,
+compact separators, strict RFC 8259 numbers), so pretty-printing, key
+reordering, or re-saving a file does not invalidate it; changing a value
+does. The block is computed last, after `created_utc` is fixed, so it
+identifies the exact artifact rather than only its rows.
+
+`reproducibility.verify_record` now includes an `integrity` sub-report and
+folds a mismatch into the top-level verdict:
+
+| Integrity status | Meaning | Effect on the verdict |
+|---|---|---|
+| `ok` | digest matches the content | none |
+| `missing` | legacy file with no digest | warning only; provenance still checked |
+| `mismatch` | at least one field was edited after writing | **`drift`** (exit `1`) |
+| `malformed` / `unsupported` | digest present but unreadable or uses an unknown algorithm | `unverifiable` (exit `2`) |
+
+`results_schema.py` also exposes the check directly:
+
+```bash
+# Report and gate integrity for result files.
+python results_schema.py --check-integrity results/*.json
+
+# Same, but treat a legacy file without a digest as a failure.
+python results_schema.py --require-integrity results/*.json
+```
+
+`--check-integrity` gates only the digest, so it also works for the
+campaign summary (which is not an envelope and has no `results` list).
+Schema validation stays a separate request via `--check` / `--check-rows`;
+combine them to gate both.
+
+Because a mismatch proves the content differs from the archived artifact,
+it is reported as drift rather than as a warning. This is deliberately
+stronger than the advisory platform checks: a changed metric is not a
+legitimate consequence of rerunning on another host. The campaign summary
+(`results/summary.json`) uses the same block, so its pass/fail list and
+timings are covered too.
+
 ## Cross-source comparability
 
 `run_budget_frontier.audit_join_sources()` joins measured rows from Exp 4,
@@ -106,7 +163,10 @@ when its commit matches.
 
 * The digest identifies code/config content. It does not hash datasets,
   generated result files, PDFs or figures; use the data-version block and the
-  per-file `sha256` in Exp 9 for those.
+  per-file `sha256` in Exp 9 for those. The envelope `integrity` digest does
+  cover a result file, but it is tamper evidence, not a signature: it detects
+  accidental or naive edits, not an adversary who rewrites both the content
+  and the stored digest.
 * The digest is a working-tree digest. It intentionally changes when a source
   file is edited, renamed, added or deleted; reproducing a historical run
   therefore means restoring the same tree, not merely checking out the same
@@ -123,8 +183,11 @@ when its commit matches.
 `test_source_identity.py` covers the digest contract (determinism, content /
 path / rename sensitivity, non-source exclusion, no-git fallback), the
 commit/branch/dirty record, credential redaction, verifier statuses, and the
-Exp 9 `mixed_source_trees` verdict:
+Exp 9 `mixed_source_trees` verdict. `test_result_integrity.py` covers the
+envelope content digest (formatting neutrality, row/metadata/provenance
+tampering, legacy `missing`, `malformed`/`unsupported` statuses, and the
+`--check-integrity` CLI).
 
 ```bash
-pytest -q test_source_identity.py
+pytest -q test_source_identity.py test_result_integrity.py
 ```

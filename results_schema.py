@@ -20,8 +20,22 @@ canonical on-disk shape, with an explicit semantic version:
       "kind": "exp7_roofline",          # which experiment produced this
       "created_utc": "2026-...Z",
       "metadata": {...},                 # provenance / caveats
-      "results": [{...}, ...]            # the per-row records
+      "results": [{...}, ...],           # the per-row records
+      "integrity": {                     # tamper evidence (see below)
+        "algorithm": "sha256",
+        "scope": "...",
+        "value": "..."                   # digest of every other field
+      }
     }
+
+The ``integrity`` block is computed over the canonical JSON of the whole
+envelope *except itself*. It makes an archived result self-checking: a
+post-hoc edit to a metric, a seed, or the provenance block changes the
+digest, so :func:`verify_integrity` can distinguish "same numbers, newly
+formatted" from "numbers were changed". The digest is formatting-neutral
+(sorted keys, compact separators), so pretty-printing or reordering keys
+does not invalidate it. Legacy files without the block still parse; they
+are reported as ``missing`` rather than silently accepted as intact.
 
 Per-kind row contracts
 ----------------------
@@ -76,15 +90,20 @@ CLI
 version report per file. ``--check`` exits non-zero if any file is
 incompatible (future major version) or malformed, so a CI job can gate on
 it; ``--check-rows`` additionally enforces the per-kind row contracts on
-kind-tagged files. With no arguments it scans ``results/*.json``.
+kind-tagged files. ``--check-integrity`` reports and gates the content
+digest (a mismatch is a hard failure; a legacy file without a digest is
+reported as ``missing``), and ``--require-integrity`` makes even a missing
+digest a failure. With no arguments it scans ``results/*.json``.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import glob
+import hashlib
 import json
 import math
 import os
+import re
 import sys
 from collections.abc import Mapping
 
@@ -93,6 +112,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import sanitize_for_json, write_json_atomic  # noqa: E402
 
 CURRENT_SCHEMA_VERSION = "1.0"
+
+#: Top-level field holding the artifact's content digest.
+#:
+#: Provenance answers "which code and runtime produced this file"; the
+#: integrity block answers "is this still the exact content those producers
+#: wrote".  Without it, a result JSON can be edited (deliberately or by a
+#: buggy post-processing script) and the provenance check still passes,
+#: because the provenance block itself was not touched.
+INTEGRITY_FIELD = 'integrity'
+INTEGRITY_ALGORITHM = 'sha256'
+INTEGRITY_SCOPE = (
+    'sha256 of the canonical JSON envelope (sorted keys, compact separators, '
+    'UTF-8) with the integrity field itself removed')
+_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 
 
 class SchemaError(ValueError):
@@ -220,12 +253,125 @@ def parse(data) -> tuple[dict, list, str]:
         f'result payload must be a list or dict, got {type(data).__name__}')
 
 
+def _canonical_bytes(payload: Mapping) -> bytes:
+    """Canonical UTF-8 bytes of an envelope, excluding its integrity block.
+
+    Sorted keys and compact separators make the digest independent of
+    on-disk formatting (indentation, key order, a trailing newline) while
+    still covering every semantic field, including ``metadata`` and
+    ``results``. ``sanitize_for_json`` runs first so tuples / NumPy scalar
+    values cannot make the canonical form writer-specific.
+    """
+    body = {k: v for k, v in payload.items() if k != INTEGRITY_FIELD}
+    text = json.dumps(sanitize_for_json(body), sort_keys=True,
+                      separators=(',', ':'), allow_nan=False,
+                      # Mirror write_json_atomic(default=str)'s coercion path:
+                      # integrity computation must not become the new failure
+                      # point for a producer that already needs that fallback.
+                      default=str)
+    return text.encode('utf-8')
+
+
+def compute_integrity(payload: Mapping) -> dict:
+    """Return the integrity block for ``payload`` (without mutating it).
+
+    The block is self-describing: it names the algorithm and exactly what
+    was hashed, so a future reader can tell a content mismatch from an
+    unsupported algorithm rather than guessing.
+    """
+    if not isinstance(payload, Mapping):
+        raise SchemaFormatError(
+            f"integrity requires a mapping payload, found "
+            f'{type(payload).__name__}')
+    return {
+        'algorithm': INTEGRITY_ALGORITHM,
+        'scope': INTEGRITY_SCOPE,
+        'value': hashlib.sha256(_canonical_bytes(payload)).hexdigest(),
+    }
+
+
+def attach_integrity(payload: Mapping) -> dict:
+    """Return a copy of ``payload`` carrying a freshly computed integrity block."""
+    out = {k: v for k, v in payload.items() if k != INTEGRITY_FIELD}
+    out[INTEGRITY_FIELD] = compute_integrity(out)
+    return out
+
+
+def verify_integrity(data) -> dict:
+    """Check a payload's content digest without trusting any recorded field.
+
+    Returns a strict-JSON report with ``status`` one of:
+
+    * ``ok`` — the recorded digest matches the canonical payload;
+    * ``missing`` — no integrity block (legacy file); not evidence of
+      tampering, but also not evidence of integrity;
+    * ``mismatch`` — the digest does not match: at least one field was
+      edited after the file was written;
+    * ``malformed`` — the block is present but cannot be interpreted
+      (wrong shape or a non-hex digest);
+    * ``unsupported`` — a well-formed block names an algorithm this reader
+      does not implement.
+    """
+    if not isinstance(data, Mapping) or INTEGRITY_FIELD not in data:
+        return {
+            'status': 'missing',
+            'algorithm': None,
+            'recorded': None,
+            'observed': None,
+            'scope': None,
+        }
+    block = data.get(INTEGRITY_FIELD)
+    if not isinstance(block, Mapping):
+        return {
+            'status': 'malformed',
+            'algorithm': None,
+            'recorded': None,
+            'observed': None,
+            'scope': None,
+            'error': f'integrity must be a mapping, found '
+                     f'{type(block).__name__}',
+        }
+    algorithm = block.get('algorithm')
+    recorded = block.get('value')
+    if algorithm != INTEGRITY_ALGORITHM:
+        return {
+            'status': 'unsupported',
+            'algorithm': algorithm,
+            'recorded': recorded,
+            'observed': None,
+            'scope': block.get('scope'),
+            'error': f'unsupported integrity algorithm: {algorithm!r}',
+        }
+    if not isinstance(recorded, str) or not _SHA256_RE.match(recorded):
+        return {
+            'status': 'malformed',
+            'algorithm': algorithm,
+            'recorded': recorded,
+            'observed': None,
+            'scope': block.get('scope'),
+            'error': 'integrity value must be a lowercase 64-character '
+                     'hex sha256 digest',
+        }
+    observed = compute_integrity(data)['value']
+    return {
+        'status': 'ok' if observed == recorded else 'mismatch',
+        'algorithm': algorithm,
+        'recorded': recorded,
+        'observed': observed,
+        'scope': block.get('scope'),
+    }
+
+
 def envelope(rows: list, *, kind: str, metadata: dict | None = None,
              created_utc: str | None = None) -> dict:
     """Build a current-version envelope around ``rows``.
 
     ``kind`` identifies the producing experiment (e.g. ``"exp7_roofline"``)
     so tooling can validate that a file holds what its name claims.
+
+    The returned envelope carries an ``integrity`` content digest covering
+    every other field. It is computed last, after ``created_utc`` is set,
+    so the digest identifies the exact artifact rather than only its rows.
     """
     if metadata is None:
         meta = {}
@@ -237,13 +383,14 @@ def envelope(rows: list, *, kind: str, metadata: dict | None = None,
         meta = dict(metadata)
     meta.setdefault('created_utc', created_utc or _dt.datetime.now(
         _dt.timezone.utc).isoformat())
-    return {
+    payload = {
         'schema_version': CURRENT_SCHEMA_VERSION,
         'kind': kind,
         'created_utc': meta['created_utc'],
         'metadata': meta,
         'results': rows,
     }
+    return attach_integrity(payload)
 
 
 def normalize(data, *, kind: str, metadata: dict | None = None) -> dict:
@@ -2065,11 +2212,37 @@ def _row_violations(path: str) -> list[str]:
         return []
 
 
+def _integrity_report(path: str) -> dict:
+    """Integrity report for one file; unreadable files are reported, not raised."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            'status': 'unreadable',
+            'algorithm': None,
+            'recorded': None,
+            'observed': None,
+            'scope': None,
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+    return verify_integrity(data)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    check = '--check' in argv or '--check-rows' in argv
     check_rows = '--check-rows' in argv
-    argv = [a for a in argv if a not in ('--check', '--check-rows')]
+    check_integrity = ('--check-integrity' in argv
+                       or '--require-integrity' in argv)
+    require_integrity = '--require-integrity' in argv
+    # Schema/row-contract gating is opt-in separately from integrity: a
+    # campaign summary is not an envelope (no ``results`` list), but it can
+    # still carry a valid digest and should be checkable on its own.
+    schema_gate = check_rows or '--check' in argv
+    check = schema_gate or check_integrity
+    argv = [a for a in argv if a not in (
+        '--check', '--check-rows', '--check-integrity',
+        '--require-integrity')]
     paths = argv or sorted(glob.glob(os.path.join('results', '*.json')))
     if not paths:
         print('[results_schema] no result files found')
@@ -2077,19 +2250,41 @@ def main(argv: list[str] | None = None) -> int:
     bad = 0
     for p in paths:
         version, n_rows, status = _describe(p)
+        failed = schema_gate and status != 'ok'
         violations: list[str] = []
         if check_rows and status == 'ok':
             violations = _row_violations(p)
             if violations:
                 status = f'contract ({len(violations)})'
-        print(f'{version:>5}  {n_rows:>6} rows  {status:<12}  {p}')
+                failed = True
+        integrity_suffix = ''
+        if check_integrity:
+            report = _integrity_report(p)
+            integrity_status = report['status']
+            integrity_suffix = f'  [integrity: {integrity_status}]'
+            if integrity_status in (
+                    'mismatch', 'malformed', 'unsupported', 'unreadable'):
+                failed = True
+            elif integrity_status == 'missing' and require_integrity:
+                failed = True
+        print(f'{version:>5}  {n_rows:>6} rows  {status:<12}  {p}'
+              f'{integrity_suffix}')
         for v in violations[:5]:
             print(f'          - {v}')
-        if status != 'ok':
+        if check_integrity and integrity_status != 'ok':
+            print(f'          - integrity: {report.get("error", integrity_status)}')
+        if failed:
             bad += 1
     if check and bad:
-        mode = 'schema+row-contract' if check_rows else 'schema'
-        print(f'[results_schema] {bad} file(s) failed the {mode} check')
+        modes = []
+        if schema_gate:
+            modes.append('schema')
+        if check_rows:
+            modes.append('row-contract')
+        if check_integrity:
+            modes.append('integrity')
+        print(f'[results_schema] {bad} file(s) failed the '
+              f'{"+".join(modes)} check')
         return 1
     return 0
 
