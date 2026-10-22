@@ -183,6 +183,26 @@ def test_accuracy_cost_tradeoff_screens_effect_significance_and_cost():
         significant=True)
     assert cheaper['verdict'] == 'warranted'
 
+    # Compute / memory / eval latency are part of the same budget screen
+    # when the rows carry them.
+    memory_hog = accuracy_cost_tradeoff(
+        {**base, 'mean_acc': 0.65, 'peak_memory_bytes': 3 * 1024 ** 3},
+        {**base, 'peak_memory_bytes': 1024 ** 3}, significant=True)
+    assert memory_hog['verdict'] == 'cost_prohibitive'
+    assert memory_hog['worst_cost_ratio']['cost'] == 'peak_memory_bytes'
+
+    slow_eval = accuracy_cost_tradeoff(
+        {**base, 'mean_acc': 0.65, 'mean_eval_ms_per_sample': 9.0},
+        {**base, 'mean_eval_ms_per_sample': 1.0}, significant=True)
+    assert slow_eval['verdict'] == 'cost_prohibitive'
+    assert slow_eval['worst_cost_ratio']['cost'] == 'mean_eval_ms_per_sample'
+
+    more_flops = accuracy_cost_tradeoff(
+        {**base, 'mean_acc': 0.65, 'flops': 10.0},
+        {**base, 'flops': 1.0}, significant=True)
+    assert more_flops['verdict'] == 'cost_prohibitive'
+    assert more_flops['worst_cost_ratio']['cost'] == 'flops'
+
 
 def test_nonfinite_triage_names_first_failing_stage_and_gradient_triage():
     bad = torch.tensor([float('nan'), 1.0])

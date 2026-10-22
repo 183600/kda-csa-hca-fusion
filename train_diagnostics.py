@@ -555,11 +555,15 @@ class ValidationCurve:
 # 3. Accuracy-vs-cost acceptance
 # --------------------------------------------------------------------------
 #: Cost keys compared by default. These are the axes an ablation changes:
-#: parameter count, wall-clock training cost, and per-sample inference
-#: latency. Peak memory is compared too when the caller has measured it
-#: (CUDA only; on CPU the tensor footprint is not comparable across
-#: configs).
-DEFAULT_COST_KEYS = ('n_params', 'mean_train_time_s', 'mean_fwd_ms')
+#: parameter count, analytic/measured compute, wall-clock training cost,
+#: per-sample inference latency through the operator, per-sample evaluation
+#: cost, and measured peak memory. Missing axes are skipped (the row simply
+#: carries no measurement), so a caller that only knows parameters is not
+#: penalised for the others; but when both sides measured memory or eval
+#: latency, a 2x increase is enough to reject a sub-noise accuracy gain.
+DEFAULT_COST_KEYS = ('n_params', 'flops', 'mean_train_time_s',
+                     'mean_fwd_ms', 'mean_eval_ms_per_sample',
+                     'peak_memory_bytes')
 
 #: Smallest accuracy difference worth claiming (0.5 percentage points).
 #: Below this a "win" is indistinguishable from seed noise at the 5-7 seed
