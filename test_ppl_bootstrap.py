@@ -367,3 +367,27 @@ def test_evaluate_lm_loss_units_are_batch_composition_invariant(device='cpu'):
                              batch_size=2, device=device, return_units=True)
     assert empty['loss'] is None and empty['perplexity'] is None
     assert empty['per_unit'] == [] and empty['n_tokens'] == 0
+
+
+def test_finite_unit_sums_cannot_overflow_into_non_json_reports():
+    """Finite inputs can still overflow a plain Python sum.
+
+    The module promises strict-JSON-safe reports, so a pooled total that
+    becomes inf must raise instead of leaking inf into the point stats.
+    """
+    import json
+    with pytest.raises(ValueError):
+        P.unit_nll_stats([(1e308, 1), (1e308, 1)])
+    with pytest.raises(ValueError):
+        P.bootstrap_ppl_ci([(1e308, 1), (1e308, 1)], n_boot=10, seed=0)
+    with pytest.raises(ValueError):
+        P.paired_bootstrap_ppl([(1e308, 1), (1e308, 1)],
+                               [(1e308, 1), (1e308, 1)], n_boot=10, seed=0)
+
+    # A finite full-sample total can still overflow a resampled sum when
+    # the same large unit is drawn repeatedly. The scaled resampling must
+    # keep the report finite and JSON-serializable.
+    units = [(1.5e308, 1), (1e307, 1), (1e307, 1)]
+    ci = P.bootstrap_ppl_ci(units, n_boot=100, seed=0)
+    assert all(math.isfinite(x) for x in ci['ci_mean_nll'])
+    json.dumps(ci, allow_nan=False)

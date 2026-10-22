@@ -183,7 +183,13 @@ def unit_nll_stats(units) -> dict:
     norm = normalize_units(units)
     total_nll = sum(nll for nll, _ in norm)
     total_tokens = sum(tok for _, tok in norm)
+    if not math.isfinite(total_nll):
+        raise ValueError(
+            'total nll_sum is not finite after pooling finite units; the '
+            'report would contain inf and cannot be strict-JSON safe')
     mean_nll = total_nll / total_tokens
+    if not math.isfinite(mean_nll):
+        raise ValueError('mean_nll is not finite after pooling')
     return {
         'n_units': len(norm),
         'n_tokens': total_tokens,
@@ -220,15 +226,25 @@ def _resample_means(sums: list[float], toks: list[int], n_boot: int,
     """
     rng = random.Random(int(seed))
     n = len(sums)
+    # Resampling with replacement can pick one large unit repeatedly, so a
+    # direct sum can overflow even when the full-sample total is finite.
+    # Rescale by the largest |sum| first and multiply the (bounded) ratio
+    # back at the end; this keeps the token-weighted mean finite without
+    # changing the ordinary-range estimate beyond round-off.
+    sum_scale = max((abs(x) for x in sums), default=0.0)
+    if sum_scale == 0.0:
+        scaled = [0.0] * n
+    else:
+        scaled = [x / sum_scale for x in sums]
     reps: list[float] = []
     for _ in range(int(n_boot)):
         s = 0.0
         t = 0
         for _ in range(n):
             i = rng.randrange(n)
-            s += sums[i]
+            s += scaled[i]
             t += toks[i]
-        reps.append(s / t)
+        reps.append((s / t) * sum_scale if sum_scale else 0.0)
     return reps
 
 
