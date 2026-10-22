@@ -19,6 +19,7 @@ from near_duplicates import (
 )
 from train_lm_autodl import (
     _FallbackCharTokenizer,
+    _is_nonfinite_document,
     _texts_fingerprint,
     clean_lm_texts,
     near_duplicate_leakage_audit,
@@ -196,6 +197,24 @@ def test_near_duplicate_parameter_validation():
             pass
         else:  # pragma: no cover - every invalid value must be rejected
             raise AssertionError(f'invalid near-dup parameter accepted: {kwargs}')
+
+
+def test_numpy_infinite_scalars_are_dropped_not_stringified():
+    # A dataframe/JSON feed commonly carries NumPy scalars.  ``inf == inf``,
+    # so the old ``x != x`` fallback only caught NaN, and ``np.float32(inf)``
+    # survived as the literal text "inf".
+    for value in (np.float32('inf'), np.float32('-inf'),
+                  np.float64('inf'), np.float16('nan')):
+        assert _is_nonfinite_document(value) is True
+    assert _is_nonfinite_document(np.float32(1.5)) is False
+    assert _is_nonfinite_document(np.int64(3)) is False
+
+    tok = _FallbackCharTokenizer()
+    cleaned = clean_lm_texts(
+        [np.float32('inf'), np.float32('nan'), 'a real document'],
+        tok, seq_len=1024)
+    assert cleaned['texts'] == ['a real document']
+    assert cleaned['stats']['n_nonfinite'] == 2
 
 
 def test_texts_fingerprint_is_unambiguous_at_text_boundaries():

@@ -50,6 +50,7 @@ import datetime
 import json
 import math
 import dataclasses
+import numbers
 import unicodedata
 from collections import OrderedDict
 import numpy as np
@@ -346,13 +347,18 @@ def _is_nonfinite_document(text):
         return True
     if isinstance(text, bool):
         return False
-    if isinstance(text, (int, float)):
+    # ``numbers.Real`` covers Python int/float AND NumPy scalar floats /
+    # integers, which are the usual carriers of a missing/infinite value in
+    # a dataframe column.  Comparing / stringifying a NumPy ``inf`` does not
+    # reveal that it is non-finite (``inf == inf``), so the old
+    # ``(int, float)`` check silently kept it as the literal text "inf".
+    if isinstance(text, numbers.Real):
         try:
             return not math.isfinite(float(text))
         except (OverflowError, ValueError):
             return True
-    # NaN-like objects whose ``x != x`` (e.g. numpy floats) are caught by
-    # the comparison; guard against types whose __ne__ raises.
+    # NaN-like objects whose ``x != x`` (e.g. Decimal / object floats) are
+    # caught by the comparison; guard against types whose __ne__ raises.
     try:
         return bool(text != text)
     except Exception:
