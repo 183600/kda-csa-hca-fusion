@@ -1379,19 +1379,42 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
     # Target sizes in row units.
     target_train, target_val, target_test = largest_remainder_sizes(
         n, [train_frac, val_frac, test_frac])
-
-    # Active buckets = requested buckets (train always active). The last
-    # active bucket absorbs the remainder, so with fractions that round
-    # to zero the empty buckets are skipped entirely instead of stealing
-    # the whole dataset.
     targets = [target_train, target_val, target_test]
     buckets = ['train', 'val', 'test']
-    active = [i for i, t in enumerate(targets) if t > 0]
+
+    # Requested buckets come from the FRACTIONS, not the rounded targets:
+    # train is always requested (train_frac > 0), val/test only when their
+    # fraction is positive. Using ``target > 0`` here silently dropped a
+    # requested split on tiny data (e.g. n=3 with default 10% val/test
+    # rounded both targets to 0 and put every row in train), even though
+    # ``audit_split`` rightly rejects an empty split.
+    active = [0]
+    if val_frac > 0:
+        active.append(1)
+    if test_frac > 0:
+        active.append(2)
+    if len(active) > n:
+        raise ValueError(
+            f'cannot make {len(active)} non-empty splits from '
+            f'n_samples={n}; use more rows or set smaller val/test '
+            f'fractions (got val={val_frac}, test={test_frac})')
+
+    # Hamilton rounding can still give a requested bucket zero units when
+    # n is small. Move single units from the largest bucket until every
+    # requested split has at least one row (possible because n >= active).
+    for idx in active:
+        while targets[idx] == 0:
+            donors = [j for j in range(3)
+                      if j != idx and targets[j] > 0]
+            if not donors:
+                raise ValueError(
+                    f'cannot allocate a non-empty {buckets[idx]} split '
+                    f'from n_samples={n}')
+            donor = max(donors, key=lambda j: targets[j])
+            targets[donor] -= 1
+            targets[idx] += 1
+
     result = {'train': [], 'val': [], 'test': []}
-    if not active:
-        # Only possible when n < 1 (guarded above); keep the invariant.
-        result['train'] = list(range(n))
-        return result
     if members is not None:
         # Whole-group partition. The order is the seeded shuffle for
         # i.i.d. groups or first-appearance order for chronological data;

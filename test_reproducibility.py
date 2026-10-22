@@ -496,6 +496,31 @@ def test_split_chronological_never_shuffles():
                                 chronological=True) == split
 
 
+def test_split_tiny_data_keeps_requested_splits_non_empty():
+    """Hamilton rounding must not silently empty a requested split.
+
+    Before the fix, n=3 with the default 10% val/test allocated all three
+    rows to train (both held-out targets rounded to 0), and n=1 with
+    val/test 0.4 left train empty. The split explainably belongs to real
+    data, but it still must satisfy its own audit.
+    """
+    for n in range(3, 11):
+        split = split_train_val_test(n, seed=7)
+        assert all(split[k] for k in ('train', 'val', 'test'))
+        report = audit_split(split, n)
+        assert report['ok'], (n, report['problems'])
+    split = split_train_val_test(3, chronological=True)
+    assert {k: len(v) for k, v in split.items()} == {
+        'train': 1, 'val': 1, 'test': 1}
+    assert audit_split(split, 3, chronological=True)['ok']
+    # Too few rows for the requested buckets: fail loudly instead of
+    # returning a split the audit would immediately reject.
+    with pytest.raises(ValueError, match='non-empty splits'):
+        split_train_val_test(2)
+    with pytest.raises(ValueError, match='non-empty splits'):
+        split_train_val_test(1, val_frac=0.4, test_frac=0.4)
+
+
 def test_split_keeps_groups_whole():
     # 12 groups of varying sizes, interleaved in the row order.
     group_sizes = [1, 5, 2, 8, 3, 1, 4, 2, 6, 1, 3, 9]
