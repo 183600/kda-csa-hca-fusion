@@ -1406,10 +1406,20 @@ class CSADecodingCache:
             # helper uses for its dropped row 0). Build only those two
             # shifted sequences: no full-sequence concatenation, no
             # recomputation of the already-handled first block.
+            #
+            # Detach the overlap partners to match the per-token loop,
+            # which stashes ``_prev_Cb`` / ``_prev_Zb`` with ``detach()``
+            # as each block completes. Without the detach the chunked path
+            # would backpropagate through later blocks into earlier
+            # blocks' ``Cb`` / ``Zb`` projections, while the equivalent
+            # token-by-token path treats those as constants; forward
+            # values are unchanged either way.
             Cb_prev_rest = torch.cat(
-                [Cb_first.unsqueeze(1), Cb_rest[:, :-1]], dim=1)
+                [Cb_first.detach().unsqueeze(1),
+                 Cb_rest[:, :-1].detach()], dim=1)
             Zb_prev_rest = torch.cat(
-                [Zb_first.unsqueeze(1), Zb_rest[:, :-1]], dim=1)
+                [Zb_first.detach().unsqueeze(1),
+                 Zb_rest[:, :-1].detach()], dim=1)
             new_C_rest = _csa_compress_kv_overlapped_prev(
                 Ca_rest, Za_rest, Cb_prev_rest, Zb_prev_rest, Ba, Bb,
             )                                                      # [B, n_rest, c]

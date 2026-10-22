@@ -218,6 +218,52 @@ def test_forward_chunk_fp64_is_exact_to_roundoff():
     assert (out - ref).abs().max().item() < 1e-12
 
 
+def test_csa_forward_chunk_matches_per_token_gradients():
+    # The chunked path must be the exact autograd equivalent of the
+    # per-token append/forward loop too: in particular, the overlapped
+    # compression partners (``Cb`` / ``Zb`` of an earlier block) are
+    # constants in the token path (stashed with ``detach()``), so the
+    # chunked path must not route gradients through them.
+    d = _make_csa(n0=0, T=9, win=4, rope=4, topk=2, sink=True,
+                  dtype=torch.float64)
+    leaves = [p.detach().clone().requires_grad_(True) for p in d['P']]
+    q = d['q'].detach().clone().requires_grad_(True)
+    q_idx = d['q_idx'].detach().clone().requires_grad_(True)
+    w_idx = d['w_idx'].detach().clone().requires_grad_(True)
+    all_leaves = leaves + [q, q_idx, w_idx]
+    weight = torch.randn(2, d['T'], d['nh'], 4, dtype=torch.float64)
+
+    chunk_cache = copy.deepcopy(d['cache'])
+    chunk_out = chunk_cache.forward_chunk(
+        *leaves, d['Ba'], d['Bb'], d['B_idx'], q, q_idx, w_idx,
+        topk=d['topk'], nh=d['nh'], nIh=d['nIh'],
+        sink_logits=d['sink'], use_ste=True, normalize_qk=True)
+    chunk_grads = torch.autograd.grad(
+        (chunk_out * weight).sum(), all_leaves, allow_unused=True)
+
+    token_cache = copy.deepcopy(d['cache'])
+    token_outs = []
+    for i in range(d['T']):
+        token_cache.append_step(
+            *(x[:, i:i + 1] for x in leaves),
+            d['Ba'], d['Bb'], d['B_idx'])
+        token_outs.append(token_cache.forward_step(
+            q[:, i:i + 1], q_idx[:, i:i + 1], w_idx[:, i:i + 1],
+            topk=d['topk'], nh=d['nh'], nIh=d['nIh'],
+            sink_logits=d['sink'], use_ste=True, normalize_qk=True))
+    token_out = torch.cat(token_outs, dim=1)
+    token_grads = torch.autograd.grad(
+        (token_out * weight).sum(), all_leaves, allow_unused=True)
+
+    assert (chunk_out - token_out).abs().max().item() < 1e-12
+    for i, (a, b) in enumerate(zip(chunk_grads, token_grads)):
+        if a is None:
+            a = torch.zeros_like(all_leaves[i])
+        if b is None:
+            b = torch.zeros_like(all_leaves[i])
+        assert (a - b).abs().max().item() < 1e-10
+
+
 @pytest.mark.parametrize('which', ['csa', 'hca'])
 @pytest.mark.parametrize('cache_dtype,q_dtype', [
     (torch.float64, torch.float32),
