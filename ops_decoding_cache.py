@@ -711,8 +711,13 @@ class _SlidingWindowRingBuffer:
             self._sw_head = (head + t_new) % self.win
         self._version += 1
 
-    def get(self) -> torch.Tensor:
+    def get(self, *, copy: bool = True) -> torch.Tensor:
         """Return the current contents in causal order (oldest first).
+
+        ``copy=True`` (default) returns a snapshot: a later ``append`` must
+        not mutate a tensor the caller already read. The decode hot path
+        passes ``copy=False`` when it immediately consumes the view without
+        another append (and clones itself only when autograd saves it).
 
         Returns:
             ``[B, sw_len, c]`` where ``sw_len = min(n_written, win)``.
@@ -721,8 +726,12 @@ class _SlidingWindowRingBuffer:
             via ``softmax(-inf) = NaN`` guards, but a zero-shape tensor
             is more convenient for the downstream einsum path).
         """
+        if not isinstance(copy, bool):
+            raise TypeError(
+                f'_SlidingWindowRingBuffer.get: copy={copy!r} must be a bool.')
         if self._sw_len == 0:
-            return self._buf[:, :0]
+            view = self._buf[:, :0]
+            return view.clone() if copy else view
         # Two cases:
         #  1. No wrap (head + len <= win): entries are at
         #     ``[head : head + len]`` in causal order.
@@ -735,7 +744,8 @@ class _SlidingWindowRingBuffer:
         #     is being recorded the ``cat`` form is kept so the result
         #     stays connected to the buffer entries' autograd history.
         if self._sw_head + self._sw_len <= self.win:
-            return self._buf[:, self._sw_head : self._sw_head + self._sw_len]
+            view = self._buf[:, self._sw_head : self._sw_head + self._sw_len]
+            return view.clone() if copy else view
         tail_len = self.win - self._sw_head                       # oldest
         head_len = self._sw_head + self._sw_len - self.win        # newer
         if torch.is_grad_enabled():
@@ -755,7 +765,8 @@ class _SlidingWindowRingBuffer:
             self._window[:, tail_len:tail_len + head_len].copy_(
                 self._buf[:, :head_len])
             self._window_version = self._version
-        return self._window[:, :self._sw_len]
+        view = self._window[:, :self._sw_len]
+        return view.clone() if copy else view
 
     @property
     def n_valid(self) -> int:
@@ -1868,7 +1879,7 @@ class CSADecodingCache:
             # neither ``q_compute`` nor the buffer entries do (e.g. a
             # learnable attention sink). Outside grad mode nothing can
             # save the view, so the copy is skipped.
-            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
+            C_local = _to_dtype(self._sw.get(copy=False), compute_dtype)         # [B, sw_len, c]
             if torch.is_grad_enabled():
                 C_local = C_local.clone()
             sw = torch.einsum(
@@ -2054,7 +2065,7 @@ class CSADecodingCache:
         # the ring (clone: the ring is mutated in place).
         pre_sw = None
         if self._sw is not None and self._sw.n_valid:
-            pre_sw = self._sw.get().clone()
+            pre_sw = self._sw.get(copy=False).clone()
         # Reproduce exactly the SW key preparation in ``_append_bulk``:
         # normalize (when enabled) then rotate at absolute positions.
         ca_store_store = None
@@ -2815,8 +2826,8 @@ class HCADecodingCache:
             C_local = torch.empty(B, 0, self.c, dtype=compute_dtype, device=device)
         else:
             # ``clone()``: same autograd version guard as the CSA cache —
-            # ``get()`` returns a live view into the ring buffer, and the
-            # einsum's below save it to compute gradients; a later
+            # ``get(copy=False)`` returns a live view into the ring buffer, and
+            # the einsum's below save it to compute gradients; a later
             # ``append_step`` overwrites the buffer in place and would
             # invalidate that saved view. The copy is needed whenever grad
             # is enabled: the ``sw_out`` einsum
@@ -2825,7 +2836,7 @@ class HCADecodingCache:
             # ``q_compute`` nor the buffer entries do (e.g. a learnable
             # attention sink). Outside grad mode nothing can save the
             # view, so the copy is skipped.
-            C_local = _to_dtype(self._sw.get(), compute_dtype)         # [B, sw_len, c]
+            C_local = _to_dtype(self._sw.get(copy=False), compute_dtype)         # [B, sw_len, c]
             if torch.is_grad_enabled():
                 C_local = C_local.clone()
             sw = torch.einsum(
@@ -2948,7 +2959,7 @@ class HCADecodingCache:
             torch.float64 if self.dtype == torch.float64 else torch.float)
         pre_sw = None
         if self._sw is not None and self._sw.n_valid:
-            pre_sw = self._sw.get().clone()
+            pre_sw = self._sw.get(copy=False).clone()
         c_store_store = None
         if self._sw is not None:
             if self._normalize_qk:

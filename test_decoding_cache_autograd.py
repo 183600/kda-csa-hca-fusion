@@ -8,9 +8,9 @@ decoded continuation, or any teacher-forced decode under autograd). The
 window-scores einsums save the window keys for the query gradient AND for
 the gradient w.r.t. the softmax weights (which can require grad on their
 own, e.g. through a learnable attention sink), and
-``_SlidingWindowRingBuffer.get()`` returns a VIEW into the ring buffer; a
-later ``append_step`` overwrites that buffer in place, which would
-invalidate the saved view. Both caches materialize a stable copy of the
+``_SlidingWindowRingBuffer.get(copy=False)`` exposes a VIEW into the ring
+buffer; a later ``append_step`` overwrites that buffer in place, which
+would invalidate the saved view. Both caches materialize a stable copy of the
 window keys before the einsums, so these tests keep the multi-step
 backward contract green.
 

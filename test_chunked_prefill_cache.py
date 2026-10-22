@@ -37,6 +37,7 @@ from ops_csa import _qk_normalize  # noqa: E402
 from ops_decoding_cache import (  # noqa: E402
     CSADecodingCache,
     HCADecodingCache,
+    _SlidingWindowRingBuffer,
 )
 
 
@@ -389,3 +390,25 @@ def test_chunk_window_keys_torchscript_parity():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
+
+
+def test_sliding_window_ring_buffer_get_is_a_snapshot_by_default():
+    """A returned window must not change when the cache advances.
+
+    The internal decode path asks for the no-copy view explicitly
+    (``get(copy=False)``) and clones only when autograd will save it, so the
+    public default can be a stable snapshot without slowing the hot path.
+    """
+    buf = _SlidingWindowRingBuffer(1, 3, 1, torch.device('cpu'),
+                                   torch.float32)
+    buf.append(torch.tensor([[[1.0], [2.0], [3.0]]]))
+    held = buf.get()
+    assert held.flatten().tolist() == [1.0, 2.0, 3.0]
+    buf.append(torch.tensor([[[4.0]]]))
+    assert held.flatten().tolist() == [1.0, 2.0, 3.0]
+    assert buf.get().flatten().tolist() == [2.0, 3.0, 4.0]
+    empty = _SlidingWindowRingBuffer(1, 3, 1, torch.device('cpu'),
+                                     torch.float32)
+    held_empty = empty.get()
+    empty.append(torch.tensor([[[1.0]]]))
+    assert held_empty.numel() == 0
