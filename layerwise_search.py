@@ -957,7 +957,8 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
             model, embed, head, losses = train_recall_model(
                 candidate.layout, int(m), int(m2), seed=int(seed),
                 steps=int(steps), seq_len=int(seq_len), d_model=int(d_model),
-                train_batch=int(train_batch), device=device)
+                train_batch=int(train_batch), device=device,
+                csa_topk=int(candidate.csa_topk))
             result = evaluate_recall(
                 model, embed, head, seq_len=int(seq_len),
                 n_batches=int(eval_batches), batch=int(eval_batch),
@@ -1224,7 +1225,8 @@ def main(argv=None) -> int:
     gate_record, proceed = _run_ablation_overfit_gate(
         [(f'search start {start.label}',
           lambda: _build_recall_model(args.m, args.m2, start.layout,
-                                      args.d_model, device))],
+                                      args.d_model, device,
+                                      csa_topk=int(start.csa_topk)))],
         device, env_prefix='SEARCH',
         make_task_batch=lambda b, embed, gen: make_long_range_batch(
             b, args.seq_len, 1, VOCAB, embed, device, generator=gen),

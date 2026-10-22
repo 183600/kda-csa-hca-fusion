@@ -673,16 +673,18 @@ def make_grid_cfg(m: int, m2: int, layout, *, d_model: int = D_MODEL,
     )
 
 
-def _build_recall_model(m: int, m2: int, layout, d_model, device):
+def _build_recall_model(m: int, m2: int, layout, d_model, device, *,
+                        csa_topk: int | None = None):
     """Construct (model, head, embed) exactly as ``train_recall_model`` does.
 
     Factored out so the overfit gate builds the probe model through the
     same construction path (config, layout, init distribution) as the grid
-    sweep it guards.
+    sweep it guards. ``csa_topk`` is forwarded so a search/grid candidate's
+    top-k knob is part of the trained geometry, not only the cost model.
     """
     embed = nn.Embedding(VOCAB, d_model).to(device)
     head = MQARHead(d_model, VOCAB).to(device)
-    cfg = make_grid_cfg(m, m2, layout, d_model=d_model)
+    cfg = make_grid_cfg(m, m2, layout, d_model=d_model, csa_topk=csa_topk)
     model = HybridKCHAttention(cfg, total_layers=len(cfg.layout)).to(device)
     return model, head, embed
 
@@ -746,6 +748,7 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
                        seq_len: int = SEQ_LEN, d_model: int = D_MODEL,
                        train_batch: int = 16, lr: float = 3e-3,
                        vocab: int = VOCAB, device='cpu',
+                       csa_topk: int | None = None,
                        val_every: int = 0, val_batches: int = 1,
                        val_batch: int = 64, return_report: bool = False):
     """Train a hybrid stack on the distance-controlled long-range task.
@@ -768,7 +771,7 @@ def train_recall_model(layout, m: int, m2: int, *, seed: int, steps: int,
     set_global_seed(seed, deterministic=True)
     embed = nn.Embedding(vocab, d_model).to(device)
     head = MQARHead(d_model, vocab).to(device)
-    cfg = make_grid_cfg(m, m2, layout, d_model=d_model)
+    cfg = make_grid_cfg(m, m2, layout, d_model=d_model, csa_topk=csa_topk)
     model = HybridKCHAttention(cfg, total_layers=len(cfg.layout)).to(device)
     param_groups = _build_param_groups(model, head, embed, weight_decay=0.01)
     opt = torch.optim.AdamW(param_groups, lr=lr)
@@ -1386,6 +1389,7 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                         layout, m, m2, seed=seed, steps=steps,
                         seq_len=seq_len, d_model=d_model,
                         train_batch=train_batch, device=device,
+                        csa_topk=csa_topk,
                         val_every=val_every, val_batches=val_batches,
                         val_batch=val_batch, return_report=True)
                     ev = evaluate_recall(

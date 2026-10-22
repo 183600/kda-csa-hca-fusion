@@ -578,6 +578,35 @@ def test_mqar_objective_seed_statistics():
                 f'make_mqar_objective accepted seeds={bad_seeds!r}')
 
 
+def test_mqar_objective_trains_with_the_candidate_topk():
+    """The probe must use Candidate.csa_topk, not the global default.
+
+    The cost model and layout neighbors both vary ``csa_topk``; training the
+    probe at the default top-k made every top-k move score identically, so
+    the search could recommend a "cheaper" candidate whose quality had never
+    been measured at that setting.
+    """
+    from unittest.mock import patch
+
+    import recall_reach
+
+    seen = []
+    original = recall_reach.make_grid_cfg
+
+    def spy(m, m2, layout, *, d_model=recall_reach.D_MODEL,
+            csa_topk=None):
+        seen.append(csa_topk)
+        return original(m, m2, layout, d_model=d_model, csa_topk=csa_topk)
+
+    objective = make_mqar_objective(
+        m=4, m2=8, seeds=(0,), steps=1, seq_len=8, d_model=32,
+        train_batch=4, eval_batches=1, eval_batch=8, device='cpu')
+    with patch.object(recall_reach, 'make_grid_cfg', spy):
+        result = objective(Candidate(('kda', 'csa', 'hca'), csa_topk=0))
+    assert seen == [0], f'objective trained at csa_topk={seen}'
+    assert result['score'] is not None
+
+
 # ---------------------------------------------------------------------------
 # integration
 # ---------------------------------------------------------------------------
