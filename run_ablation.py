@@ -1983,7 +1983,12 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
         return None, None, 0, None, None
     diffs = [accs_a[s] - accs_b[s] for s in common]
     n = len(diffs)
-    mean_diff = sum(diffs) / n
+    # Overflow-safe mean: ``sum([1.7e308, 1.7e308]) / 2`` is ``inf`` even
+    # though both differences and their true mean are finite. The module
+    # already uses ``_safe_mean`` / ``_sample_sd`` for the same reason
+    # elsewhere, so an extreme-but-finite contrast must not emit ``inf``
+    # (which is not strict-JSON and would poison the annotation).
+    mean_diff = _safe_mean(diffs)
     # Same exact-constant-vector zero-variance convention as
     # multi_seed_stats._sample_sd: only a genuinely constant sweep has
     # numerically zero spread, so a real spread around a large common offset

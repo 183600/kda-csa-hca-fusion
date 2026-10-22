@@ -49,6 +49,7 @@ from run_ablation import (  # noqa: E402
     CONTRAST_EQUIVALENCE_MARGIN,
     MATRIX_UNIT,
     _annotate_contrast_significance,
+    _paired_contrast,
     _attach_tuned_baseline_flags,
     _contrast_consistency_violations,
     _matrix_contrast_report,
@@ -1157,3 +1158,20 @@ def test_schema_mixed_expected_group_labels_report_a_violation():
         {'expected_groups': [1, 'b'], 'total_layers': 5})
     assert violations
     assert 'matrix incomplete' in violations[0]
+
+def test_paired_contrast_keeps_a_finite_mean_under_sum_overflow():
+    """Two finite large wins must not produce an infinite mean contrast.
+
+    ``sum([1.7e308, 1.7e308]) / 2`` overflows to ``inf`` although the
+    paired mean difference is the finite ``1.7e308``. The contrast row is
+    written into the strict-JSON ablation report, so the helper must use
+    the overflow-safe mean (and keep the ordinary sample SD).
+    """
+    a = {0: 1.7e308, 1: 1.7e308}
+    b = {0: 0.0, 1: 0.0}
+    mean_diff, t_stat, n, unanimous, sd = _paired_contrast(a, b)
+    assert math.isfinite(mean_diff)
+    assert mean_diff == pytest.approx(1.7e308)
+    assert n == 2 and unanimous == 'positive'
+    assert sd == 0.0 and t_stat is None
+
