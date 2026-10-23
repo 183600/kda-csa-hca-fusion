@@ -116,7 +116,7 @@ from ops_cache import normal_tensor_scope
 from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import (csa_compress_kv, _csa_compress_kv_overlapped_prev,
                      csa_lightning_indexer, _qk_normalize, _qk_normalize_,
-                     _nan_safe_softmax, _sink_softmax)
+                     _nan_safe_softmax, _sink_softmax, _require_scale)
 
 
 def _validate_cache_dtype(dtype) -> None:
@@ -1613,6 +1613,7 @@ class CSADecodingCache:
         """
         B = q.shape[0]
         T_new = q.shape[1]   # must be 1
+        _require_scale('CSADecodingCache.forward_step', scale)
         if T_new != 1:
             raise ValueError(
                 f"CSADecodingCache.forward_step: T_new={T_new} must be 1. "
@@ -2055,6 +2056,7 @@ class CSADecodingCache:
             query-side tensor is fp64, else fp32).
         """
         B, T_new, c = Ca_new.shape
+        _require_scale('CSADecodingCache.forward_chunk', scale)
         if T_new < 1:
             raise ValueError(
                 f'CSADecodingCache.forward_chunk: T_new={T_new} must be >= 1')
@@ -2781,6 +2783,7 @@ class HCADecodingCache:
         """
         B = q.shape[0]
         T_new = q.shape[1]
+        _require_scale('HCADecodingCache.forward_step', scale)
         if T_new != 1:
             raise ValueError(
                 f"HCADecodingCache.forward_step: T_new={T_new} must be 1.")
@@ -2992,6 +2995,7 @@ class HCADecodingCache:
         from a pre-append snapshot plus the chunk keys.
         """
         B, T_new, c = C_new.shape
+        _require_scale('HCADecodingCache.forward_chunk', scale)
         if T_new < 1:
             raise ValueError(
                 f'HCADecodingCache.forward_chunk: T_new={T_new} must be >= 1')

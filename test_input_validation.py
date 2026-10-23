@@ -196,6 +196,32 @@ def test_csa_decode_step_validates_indexer_operands():
             _ok(f'{name} rejected', False, f'{type(exc).__name__}: {exc}')
 
 
+def test_decode_caches_reject_oversized_scale():
+    """A JSON-sized int temperature fails before the score arithmetic."""
+    B, c, c_I, m, win, nh, nIh = 1, 4, 4, 2, 4, 2, 2
+    csa = CSADecodingCache(B, c, c_I, m, win, 'cpu', torch.float32)
+    hca = HCADecodingCache(B, c, m, win, 'cpu', torch.float32)
+    huge = 10 ** 400
+    q = torch.randn(B, 1, nh, c)
+    q_idx = torch.randn(B, 1, nIh, c_I)
+    w_idx = torch.randn(B, 1, nIh)
+    try:
+        csa.forward_step(q, q_idx, w_idx, topk=2, nh=nh, nIh=nIh,
+                         scale=huge)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('CSADecodingCache.forward_step accepted an '
+                             'oversized scale')
+    try:
+        hca.forward_step(q, nh=nh, scale=huge)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('HCADecodingCache.forward_step accepted an '
+                             'oversized scale')
+
+
 def test_kda_chunk_size_requires_an_exact_positive_int():
     """A bool / float / string chunk size must fail before slicing."""
     from ops_kda import naive_chunk_kda
