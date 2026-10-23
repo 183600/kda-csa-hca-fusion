@@ -342,6 +342,12 @@ def test_tp_latency_sweep_invariants():
         tp.tp_latency(cfg, tp_size=0, prefill_len=32)
     with pytest.raises(ValueError):
         tp.HardwareModel(peak_tflops=-1.0)
+    huge = 10 ** 400
+    for kwargs in ({'peak_tflops': huge}, {'peak_bw_gbps': huge},
+                   {'link_bw_gbps': huge},
+                   {'allreduce_latency_us': huge}, {'itemsize': huge}):
+        with pytest.raises(ValueError):
+            tp.HardwareModel(**kwargs)
 
 
 def test_hardware_from_gpu_cpu_fallback(monkeypatch):

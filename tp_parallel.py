@@ -1255,21 +1255,41 @@ class HardwareModel:
                 raise TypeError(
                     f'HardwareModel.{name} must be a number, got '
                     f'{type(value).__name__}.')
-            if not math.isfinite(value) or value <= 0:
+            try:
+                number = float(value)
+            except OverflowError:
+                raise ValueError(
+                    f'HardwareModel.{name}={value} must be finite and > 0.'
+                ) from None
+            if not math.isfinite(number) or number <= 0:
                 raise ValueError(
                     f'HardwareModel.{name}={value} must be finite and > 0.')
-        if not isinstance(self.allreduce_latency_us, (int, float)) \
-                or isinstance(self.allreduce_latency_us, bool) \
-                or not math.isfinite(self.allreduce_latency_us) \
-                or self.allreduce_latency_us < 0:
+        latency = self.allreduce_latency_us
+        if not isinstance(latency, (int, float)) or isinstance(latency, bool):
             raise ValueError(
                 f'HardwareModel.allreduce_latency_us='
-                f'{self.allreduce_latency_us} must be finite and >= 0.')
+                f'{latency} must be finite and >= 0.')
+        try:
+            latency = float(latency)
+        except OverflowError:
+            raise ValueError(
+                f'HardwareModel.allreduce_latency_us='
+                f'{latency} must be finite and >= 0.') from None
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError(
+                f'HardwareModel.allreduce_latency_us='
+                f'{latency} must be finite and >= 0.')
         if isinstance(self.itemsize, bool) or not isinstance(self.itemsize, int) \
                 or self.itemsize < 1:
             raise ValueError(
                 f'HardwareModel.itemsize={self.itemsize!r} must be an '
                 f'int >= 1.')
+        try:
+            float(self.itemsize)
+        except OverflowError:
+            raise ValueError(
+                f'HardwareModel.itemsize={self.itemsize!r} must be '
+                f'representable as a finite float.') from None
         if not isinstance(self.gpu_anchored, bool):
             raise TypeError(
                 f'HardwareModel.gpu_anchored must be a bool, got '
