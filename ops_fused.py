@@ -590,11 +590,18 @@ class HybridConfig:
                 or not isinstance(self.kda_decay_scale, (int, float))):
             raise ValueError(
                 f"kda_decay_scale={self.kda_decay_scale!r} must be a number.")
-        if not math.isfinite(self.kda_decay_scale):
+        try:
+            kda_decay_scale = float(self.kda_decay_scale)
+        except (OverflowError, ValueError):
+            raise ValueError(
+                f"kda_decay_scale={self.kda_decay_scale!r} must be a finite "
+                f"number (a JSON integer outside the float range is not a "
+                f"usable config value).") from None
+        if not math.isfinite(kda_decay_scale):
             raise ValueError(
                 f"kda_decay_scale={self.kda_decay_scale} must be finite "
                 f"(NaN or inf would poison the KDA gate computation).")
-        if self.kda_decay_scale < 0:
+        if kda_decay_scale < 0:
             raise ValueError(
                 f"kda_decay_scale={self.kda_decay_scale} must be >= 0 "
                 f"(negative would invert the decay sign and cause state "
@@ -614,8 +621,17 @@ class HybridConfig:
         for name, val in (
                 ('kda_decay_half_life_min', self.kda_decay_half_life_min),
                 ('kda_decay_half_life_max', self.kda_decay_half_life_max)):
-            if (not isinstance(val, (int, float)) or isinstance(val, bool)
-                    or not math.isfinite(val) or val <= 0):
+            if (not isinstance(val, (int, float)) or isinstance(val, bool)):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be a finite positive "
+                    f"number (a half-life in tokens).")
+            try:
+                numeric = float(val)
+            except (OverflowError, ValueError):
+                raise ValueError(
+                    f"HybridConfig.{name}={val!r} must be a finite positive "
+                    f"number (a half-life in tokens).") from None
+            if not math.isfinite(numeric) or numeric <= 0:
                 raise ValueError(
                     f"HybridConfig.{name}={val!r} must be a finite positive "
                     f"number (a half-life in tokens).")
@@ -640,9 +656,15 @@ class HybridConfig:
                     f"HybridConfig.{name}={val!r} must be None or a "
                     f"non-negative int (None/0 disables partial RoPE; the "
                     f"paper value is 64).")
-        if not isinstance(self.rope_base, (int, float)) \
-                or isinstance(self.rope_base, bool) \
-                or not math.isfinite(self.rope_base) or self.rope_base <= 0:
+        rope_base = None
+        if (isinstance(self.rope_base, (int, float))
+                and not isinstance(self.rope_base, bool)):
+            try:
+                rope_base = float(self.rope_base)
+            except (OverflowError, ValueError):
+                rope_base = None
+        if rope_base is None or not math.isfinite(rope_base) \
+                or rope_base <= 0:
             raise ValueError(
                 f"HybridConfig.rope_base={self.rope_base!r} must be a "
                 f"finite positive float.")
@@ -659,10 +681,14 @@ class HybridConfig:
         # std raises deep inside torch at stack-build time, while NaN
         # silently poisons every bias (and the resulting model); validate
         # it with the rest of the numeric config here.
-        if (isinstance(self.init_std, bool)
-                or not isinstance(self.init_std, (int, float))
-                or not math.isfinite(self.init_std)
-                or self.init_std < 0):
+        init_std = None
+        if (isinstance(self.init_std, (int, float))
+                and not isinstance(self.init_std, bool)):
+            try:
+                init_std = float(self.init_std)
+            except (OverflowError, ValueError):
+                init_std = None
+        if init_std is None or not math.isfinite(init_std) or init_std < 0:
             raise ValueError(
                 f"HybridConfig.init_std={self.init_std!r} must be a finite "
                 f"non-negative number.")

@@ -255,6 +255,11 @@ def test_hybrid_config_rejects_coerced_and_nonfinite_fields():
         {'memory_type': []},
         {'csa_qk_norm_mode': []},
         {'hca_qk_norm_mode': {}},
+        {'init_std': 10 ** 400},
+        {'kda_decay_scale': 10 ** 400},
+        {'kda_decay_half_life_min': 10 ** 400},
+        {'kda_decay_half_life_max': 10 ** 400},
+        {'rope_base': 10 ** 400},
     )
     for patch in cases:
         try:
