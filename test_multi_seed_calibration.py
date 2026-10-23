@@ -44,7 +44,9 @@ def test_simulator_known_population_and_determinism():
         _ok(f'{dist}: marginal SD ~= noise_sd',
             abs(sd - 1.0) < 0.08, f'sd={sd:.3f}')
     for kwargs in ({'n_pairs': 1}, {'distribution': 'cauchy'},
-                   {'noise_sd': 0.0}, {'effect': float('nan')}):
+                   {'noise_sd': 0.0}, {'effect': float('nan')},
+                   {'effect': 10 ** 400}, {'noise_sd': 10 ** 400},
+                   {'outlier_scale': 10 ** 400}):
         raised = False
         call = dict(kwargs)
         call.setdefault('n_pairs', 5)

@@ -58,6 +58,16 @@ from multi_seed_stats import (
     sign_test,
 )
 
+
+def _is_finite_real(value) -> bool:
+    """True for a non-bool real representable as a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
 __all__ = [
     'simulate_paired_diffs',
     'size_study',
@@ -143,19 +153,20 @@ def simulate_paired_diffs(n_pairs, rng, *, effect=0.0, noise_sd=1.0,
                          f'{DISTRIBUTIONS}')
     if not (isinstance(effect, (int, float))
             and not isinstance(effect, bool)
-            and math.isfinite(float(effect))):
+            and _is_finite_real(effect)):
         raise ValueError(f'effect must be finite, got {effect!r}')
     if not (isinstance(noise_sd, (int, float))
             and not isinstance(noise_sd, bool)
-            and math.isfinite(float(noise_sd)) and float(noise_sd) > 0.0):
+            and _is_finite_real(noise_sd) and float(noise_sd) > 0.0):
         raise ValueError(f'noise_sd must be finite and > 0, got {noise_sd!r}')
     if not (isinstance(outlier_prob, (int, float))
             and not isinstance(outlier_prob, bool)
+            and _is_finite_real(outlier_prob)
             and 0.0 <= float(outlier_prob) < 1.0):
         raise ValueError(f'outlier_prob must be in [0, 1), got {outlier_prob!r}')
     if not (isinstance(outlier_scale, (int, float))
             and not isinstance(outlier_scale, bool)
-            and math.isfinite(float(outlier_scale))
+            and _is_finite_real(outlier_scale)
             and float(outlier_scale) > 0.0):
         raise ValueError(f'outlier_scale must be finite and > 0, got '
                          f'{outlier_scale!r}')

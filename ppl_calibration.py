@@ -63,6 +63,16 @@ import random
 
 import ppl_bootstrap as _pb
 
+
+def _is_finite_real(value) -> bool:
+    """True for a non-bool real representable as a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
 __all__ = [
     'simulate_units',
     'simulate_paired_units',
@@ -138,11 +148,11 @@ def simulate_units(n_units: int, rng: random.Random, *, mean_nll: float = MEAN_N
         raise ValueError(
             f'token_lo={token_lo} must be <= token_hi={token_hi}.')
     if (isinstance(spread, bool) or not isinstance(spread, (int, float))
-            or not math.isfinite(float(spread)) or float(spread) < 0.0):
+            or not _is_finite_real(spread) or float(spread) < 0.0):
         raise ValueError(
             f'spread must be finite and >= 0, got {spread!r}')
     if (isinstance(mean_nll, bool) or not isinstance(mean_nll, (int, float))
-            or not math.isfinite(float(mean_nll))):
+            or not _is_finite_real(mean_nll)):
         raise ValueError(f'mean_nll must be finite, got {mean_nll!r}')
     units = []
     for _ in range(int(n_units)):
@@ -180,18 +190,18 @@ def simulate_paired_units(n_units: int, rng: random.Random, *,
         raise ValueError(
             f'token_lo={token_lo} must be <= token_hi={token_hi}.')
     if (isinstance(noise_sd, bool) or not isinstance(noise_sd, (int, float))
-            or not math.isfinite(float(noise_sd)) or float(noise_sd) < 0.0):
+            or not _is_finite_real(noise_sd) or float(noise_sd) < 0.0):
         raise ValueError(
             f'noise_sd must be finite and >= 0, got {noise_sd!r}')
     if (isinstance(delta, bool) or not isinstance(delta, (int, float))
-            or not math.isfinite(float(delta))):
+            or not _is_finite_real(delta)):
         raise ValueError(f'delta must be finite, got {delta!r}')
     if (isinstance(spread, bool) or not isinstance(spread, (int, float))
-            or not math.isfinite(float(spread)) or float(spread) < 0.0):
+            or not _is_finite_real(spread) or float(spread) < 0.0):
         raise ValueError(
             f'spread must be finite and >= 0, got {spread!r}')
     if (isinstance(mean_nll, bool) or not isinstance(mean_nll, (int, float))
-            or not math.isfinite(float(mean_nll))):
+            or not _is_finite_real(mean_nll)):
         raise ValueError(f'mean_nll must be finite, got {mean_nll!r}')
     half_width = float(noise_sd) * math.sqrt(3.0)
     toks = [rng.randint(int(token_lo), int(token_hi))

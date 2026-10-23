@@ -103,7 +103,7 @@ def test_error_budget_regimes():
         except (TypeError, ValueError):
             raised = True
         _ok(f'rejects seq_len {bad!r}', raised, '')
-    for bad in (0.0, -2.0, float('nan'), float('inf')):
+    for bad in (0.0, -2.0, float('nan'), float('inf'), 10 ** 400):
         for kw in ({'factor': bad}, {'accum_factor': bad}):
             raised = False
             try:

@@ -81,6 +81,17 @@ from ops_rwkv import rwkv7_reference_scan  # noqa: E402
 #: ``results_schema`` kind for the optional JSON output.
 SWEEP_KIND = 'precision_sweep'
 
+
+def _is_finite_real(value) -> bool:
+    """True for a non-bool real representable as a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 #: Unit roundoff (half a ulp at 1.0; IEEE binary formats).
 UNIT_ROUNDOFF = {
     torch.float16: 2.0 ** -11,
@@ -207,7 +218,7 @@ def error_budget_eps_units(dtype, seq_len: int, *,
     _require_positive_int(seq_len, 'seq_len')
     for name, value in (('factor', factor), ('accum_factor', accum_factor)):
         if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                or not math.isfinite(float(value)) or float(value) <= 0:
+                or not _is_finite_real(value) or float(value) <= 0:
             raise ValueError(
                 f'{name}={value!r} must be a positive finite number.')
     if dt in STORAGE_DTYPES:

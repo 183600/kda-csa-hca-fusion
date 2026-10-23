@@ -84,11 +84,19 @@ def test_simulation_contract_and_rng_isolation():
             lambda: PC.simulate_units(4, random.Random(0), token_lo=0),
             lambda: PC.simulate_units(4, random.Random(0), token_hi=1.5),
             lambda: PC.simulate_units(4, random.Random(0), spread=float('nan')),
+            lambda: PC.simulate_units(4, random.Random(0),
+                                      spread=10 ** 400),
+            lambda: PC.simulate_units(4, random.Random(0),
+                                      mean_nll=10 ** 400),
             lambda: PC.simulate_paired_units(2.9, random.Random(0)),
             lambda: PC.simulate_paired_units(4, random.Random(0),
                                              token_lo=9, token_hi=2),
             lambda: PC.simulate_paired_units(4, random.Random(0),
-                                             noise_sd=float('inf'))):
+                                             noise_sd=float('inf')),
+            lambda: PC.simulate_paired_units(4, random.Random(0),
+                                             delta=10 ** 400),
+            lambda: PC.simulate_paired_units(4, random.Random(0),
+                                             spread=10 ** 400)):
         try:
             bad_call()
         except ValueError:
