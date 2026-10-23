@@ -3271,9 +3271,7 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
                 last = vh[-1]
                 if isinstance(last, dict):
                     acc = last.get('acc')
-                    if (not isinstance(acc, bool)
-                            and isinstance(acc, (int, float))
-                            and math.isfinite(float(acc))):
+                    if _is_finite_real(acc):
                         final_scores.append(float(acc))
                 k = min(_TUNE_TAIL_K, len(vh))
                 tail_ks.append(k)
@@ -3282,9 +3280,7 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
                     if not isinstance(point, dict):
                         continue
                     acc = point.get('acc')
-                    if (not isinstance(acc, bool)
-                            and isinstance(acc, (int, float))
-                            and math.isfinite(float(acc))):
+                    if _is_finite_real(acc):
                         tail_vals.append(float(acc))
                 if tail_vals:
                     tail_scores.append(_safe_mean(tail_vals))
@@ -3333,6 +3329,21 @@ def tune_baseline_lr(op_name, lrs, sweep, steps, softmax_steps, n_seeds,
     }
 
 
+def _is_finite_real(value) -> bool:
+    """True for a real (non-bool) value representable as a finite float.
+
+    JSON integers have no upper bound; a result row can therefore carry an
+    integer too large for ``float()``. That is a malformed metric to skip,
+    not an OverflowError that aborts the whole report.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _finite_per_seed_acc(per_seed, *, seed_key='seed',
                          acc_key='final_acc', error_key='error'):
     """Map ``seed -> finite accuracy`` for the usable per-seed records.
@@ -3358,8 +3369,7 @@ def _finite_per_seed_acc(per_seed, *, seed_key='seed',
         acc = record.get(acc_key)
         if isinstance(seed, bool) or not isinstance(seed, int):
             continue
-        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
-                or not math.isfinite(float(acc))):
+        if not _is_finite_real(acc):
             continue
         out[seed] = acc
     return out

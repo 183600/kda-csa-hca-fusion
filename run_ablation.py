@@ -1816,6 +1816,20 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     }
 
 
+def _is_finite_real(value) -> bool:
+    """True for a real (non-bool) value representable as a finite float.
+
+    A JSON result file can carry an integer too large for ``float()``;
+    that seed is malformed for this analysis, not a reason to abort it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _validation_tail_score(result: dict, tail_k: int = 3):
     """Mean held-out validation accuracy over the last <= ``tail_k`` points.
 
@@ -1840,8 +1854,7 @@ def _validation_tail_score(result: dict, tail_k: int = 3):
             if not isinstance(point, dict):
                 continue
             acc = point.get('acc')
-            if (isinstance(acc, bool) or not isinstance(acc, (int, float))
-                    or not math.isfinite(float(acc))):
+            if not _is_finite_real(acc):
                 continue
             vals.append(float(acc))
         if vals:
@@ -1951,8 +1964,7 @@ def _seed_accuracy_map(result: dict) -> dict[int, float]:
             continue
         acc = row.get('final_acc')
         seed = row.get('seed')
-        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
-                or not math.isfinite(float(acc))):
+        if not _is_finite_real(acc):
             continue
         if isinstance(seed, bool) or not isinstance(seed, int):
             continue
@@ -2275,8 +2287,7 @@ def _finite_seed_set(row: dict) -> set:
         if isinstance(seed, bool) or not isinstance(seed, int):
             continue
         acc = seed_row.get('final_acc')
-        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
-                or not math.isfinite(float(acc))):
+        if not _is_finite_real(acc):
             continue
         seeds.add(seed)
     return seeds

@@ -1262,3 +1262,14 @@ def test_paired_contrast_keeps_a_finite_mean_under_sum_overflow():
     assert n == 2 and unanimous == 'positive'
     assert sd == 0.0 and t_stat is None
 
+
+def test_per_seed_filters_skip_oversized_json_integers():
+    """A JSON int too large for float is a malformed seed, not a crash."""
+    from run_quality import _finite_per_seed_acc
+    from run_ablation import _finite_seed_set, _seed_accuracy_map
+    rows = [{'seed': 1, 'final_acc': 10 ** 400},
+            {'seed': 2, 'final_acc': 0.5}]
+    assert _finite_per_seed_acc(rows) == {2: 0.5}
+    assert _seed_accuracy_map({'per_seed': rows}) == {2: 0.5}
+    assert _finite_seed_set({'per_seed': rows}) == {2}
+
