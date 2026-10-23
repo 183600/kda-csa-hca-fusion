@@ -233,6 +233,19 @@ def test_validation_curve_gap_is_finite_for_extreme_finite_losses():
     json.dumps(block, allow_nan=False)
 
 
+def test_validation_curve_treats_oversized_loss_as_nonfinite():
+    """A JSON-sized int loss is a non-finite checkpoint, not OverflowError."""
+    huge = 10 ** 400
+    curve = _curve([(huge, 0.5), (1.0, 0.6)], steps=1, val_every=1)
+    point = curve.record(0)
+    assert point['loss'] is None and point['loss_finite'] is False
+    curve.record(1)
+    block = curve.finalize([huge, 1.0])
+    assert block['generalization_gap'] is not None
+    json.dumps(block, allow_nan=False)
+
+
+
 def test_validation_curve_rejects_swapped_fields_and_disabled_is_empty():
     curve = _curve([(1.0, 3.0)], steps=1, val_every=1)
     with pytest.raises(ValueError, match='accuracy must lie in'):

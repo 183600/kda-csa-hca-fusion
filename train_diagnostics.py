@@ -547,7 +547,19 @@ class ValidationCurve:
                 f'got {type(point_in).__name__}. Build it as '
                 f'ValPoint(loss=..., acc=...) so the two fields cannot be '
                 f'silently swapped.')
-        loss, acc = float(point_in.loss), float(point_in.acc)
+        try:
+            loss = float(point_in.loss)
+        except (TypeError, ValueError, OverflowError):
+            # A JSON-sized int is not representable. Treat it like any other
+            # non-finite checkpoint (stored as JSON null, loss_finite=False)
+            # instead of aborting the whole curve with OverflowError.
+            loss = float('nan')
+        try:
+            acc = float(point_in.acc)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'validation accuracy must be a real number in [0, 1]; got '
+                f'{point_in.acc!r}') from None
         # Accuracy is a proportion. A value outside [0, 1] means the fields
         # arrived swapped (or the evaluator is broken), and every downstream
         # verdict would be wrong in a way that still looks plausible.
@@ -628,8 +640,13 @@ class ValidationCurve:
             flag = h.get('loss_finite')
             if flag is not None:
                 return bool(flag)
-            return h.get('loss') is not None and math.isfinite(
-                float(h['loss']))
+            if h.get('loss') is None:
+                return False
+            try:
+                return math.isfinite(float(h['loss']))
+            except (TypeError, ValueError, OverflowError):
+                # A JSON-sized int is not a representable finite loss.
+                return False
 
         finite = [h for h in self.history if _point_finite(h)]
         final = self.history[-1] if self.history else None
@@ -649,7 +666,7 @@ class ValidationCurve:
             for value in train_losses[-10:]:
                 try:
                     value = float(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     continue
                 if math.isfinite(value):
                     tail.append(value)
