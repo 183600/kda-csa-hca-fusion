@@ -96,7 +96,7 @@ def test_error_budget_regimes():
     _ok('accum_factor unchanged by dtype-specific factor',
         ps.error_budget_eps_units(torch.float32, 100, factor=0.5,
                                   accum_factor=3.0) == 300.0, '')
-    for bad in (0, -1, 1.5, True, '4'):
+    for bad in (0, -1, 1.5, True, '4', 10 ** 400):
         raised = False
         try:
             ps.error_budget_eps_units(torch.float16, bad)

@@ -188,6 +188,14 @@ def as_torch_dtype(dtype) -> torch.dtype:
 def _require_positive_int(value, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f'{name}={value!r} must be a positive int.')
+    try:
+        float(value)
+    except OverflowError:
+        # JSON integers are unbounded; ``error_budget_eps_units`` scales the
+        # budget by this length in float arithmetic.
+        raise ValueError(
+            f'{name}={value!r} must be representable as a finite float.'
+        ) from None
     return value
 
 
