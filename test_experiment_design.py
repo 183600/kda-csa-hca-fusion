@@ -858,6 +858,17 @@ def test_planning_mde_and_minimum_margin_are_json_safe_at_float_limit():
     assert D._is_number(10 ** 400) is False
     assert D._clean_float(10 ** 400) is None
 
+    # A finite SD can overflow the interaction's sqrt(2) inflation. That
+    # must produce a JSON-safe not-estimable record, not a crash.
+    inter = D.planning_report(
+        'exp5b_matrix', seeds=2, sd=1.5e308)['interaction']
+    assert inter['sd_interaction'] is None
+    assert inter['required_seeds'] is None
+    assert inter['planned_power'] is None
+    assert inter['status'] == 'not_estimable'
+    assert 'overflowed' in inter['caveat']
+    json.dumps(inter, allow_nan=False)
+
 
 def test_interaction_planning_uses_the_four_cell_variance_budget():
     """A 2x2 interaction is planned at sqrt(2) x the main-effect SD."""

@@ -1204,9 +1204,7 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         raise DesignError(
             f'required_for_claim must be a bool, got {required_for_claim!r}')
     sd_interaction = sd_value * inflation
-    if not math.isfinite(sd_interaction):
-        raise DesignError(
-            'sd * interaction sd_inflation is not a finite float')
+    finite_sd = math.isfinite(sd_interaction)
     # ``alpha_test`` is the one-sided TAIL probability the runner's
     # corrected threshold uses; multi_seed_stats takes a TEST level and
     # halves it internally, so undo that for the symmetric alternatives.
@@ -1215,18 +1213,27 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
                   else alpha_value / (2.0 * family_size))
     planning_alpha = (alpha_test if alternative in ('greater', 'less')
                       else 2.0 * alpha_test)
-    dz = sesoi / sd_interaction
-    required = seeds_required(
-        dz, alpha=planning_alpha, power=target, alternative=alternative)
-    if required is not None:
-        required = max(2, int(required))
-    mde = min_detectable_effect(
-        seeds, sd_interaction, alpha=planning_alpha, power=target,
-        alternative=alternative)
-    planning_effect = -sesoi if alternative == 'less' else sesoi
-    achieved = power_at_effect(
-        seeds, sd_interaction, planning_effect, alpha=planning_alpha,
-        alternative=alternative)
+    if finite_sd:
+        dz = sesoi / sd_interaction
+        required = seeds_required(
+            dz, alpha=planning_alpha, power=target, alternative=alternative)
+        if required is not None:
+            required = max(2, int(required))
+        mde = min_detectable_effect(
+            seeds, sd_interaction, alpha=planning_alpha, power=target,
+            alternative=alternative)
+        planning_effect = -sesoi if alternative == 'less' else sesoi
+        achieved = power_at_effect(
+            seeds, sd_interaction, planning_effect, alpha=planning_alpha,
+            alternative=alternative)
+    else:
+        # A finite SD can overflow the sqrt(2) inflation. Planning output is
+        # JSON-safe and must stay readable: report the interaction as
+        # not-estimable instead of raising from an otherwise valid plan.
+        dz = None
+        required = None
+        mde = None
+        achieved = None
     exact = exact_test_resolution(
         seeds, alpha=alpha_value, family_size=family_size,
         alternative=alternative)
@@ -1255,7 +1262,7 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         'sesoi': sesoi,
         'assumed_sd': sd_value,
         'sd_inflation': inflation,
-        'sd_interaction': sd_interaction,
+        'sd_interaction': (sd_interaction if finite_sd else None),
         'standardized_effect_dz': dz,
         'alpha_family_wise': alpha_value,
         'family_size': family_size,
@@ -1290,7 +1297,10 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
             'conservative; a dedicated four-cell pilot can replace it. The '
             'main-effect seed budget is not the interaction budget, and a '
             'non-significant interaction is inconclusive, never evidence '
-            'of additivity'),
+            'of additivity'
+            + ('' if finite_sd else
+               '; sd * sd_inflation overflowed the float range, so no '
+               'finite interaction budget is estimable')),
     }
 
 
