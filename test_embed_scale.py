@@ -35,7 +35,8 @@ sys.path.insert(0, HERE)
 import torch  # noqa: E402
 
 from ops_fused import HybridConfig  # noqa: E402
-from train_lm_autodl import LMWithHybrid, count_params  # noqa: E402
+from train_lm_autodl import (LMWithHybrid, SoftmaxBaselineLM,  # noqa: E402
+                             count_params)
 
 
 def _tiny_cfg(d_model=32) -> HybridConfig:
@@ -152,13 +153,16 @@ def test_embed_scale_validation(device='cpu'):
     """Non-positive / non-finite / non-numeric scales are rejected."""
     print("\nTest: embed_scale input validation")
     cfg = _tiny_cfg(d_model=32)
-    for bad in (0.0, -1.0, float('nan'), float('inf')):
-        try:
-            LMWithHybrid(17, cfg, embed_scale=bad)
-        except ValueError:
-            _ok(f"rejects {bad}", True)
-        else:
-            _ok(f"rejects {bad}", False, "no ValueError raised")
+    for bad in (0.0, -1.0, float('nan'), float('inf'), 10 ** 400):
+        for cls, kwargs in ((LMWithHybrid, {}),
+                            (SoftmaxBaselineLM, {'n_heads': 2})):
+            try:
+                cls(17, cfg, embed_scale=bad, **kwargs)
+            except ValueError:
+                _ok(f"{cls.__name__} rejects {bad}", True)
+            else:
+                _ok(f"{cls.__name__} rejects {bad}", False,
+                    "no ValueError raised")
 
 
 def main() -> int:

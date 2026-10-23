@@ -2161,12 +2161,21 @@ class LMWithHybrid(nn.Module):
         # legacy unscaled behaviour exactly.
         if embed_scale is None:
             embed_scale = math.sqrt(cfg.d_model)
-        if (not isinstance(embed_scale, (int, float))
-                or not math.isfinite(embed_scale) or embed_scale <= 0):
+        if not isinstance(embed_scale, (int, float)):
             raise ValueError(
                 f"embed_scale must be a positive finite number, got "
                 f"{embed_scale!r}.")
-        self.embed_scale = float(embed_scale)
+        try:
+            embed_scale = float(embed_scale)
+        except OverflowError:
+            raise ValueError(
+                f"embed_scale must be a positive finite number, got "
+                f"{embed_scale!r}.") from None
+        if not math.isfinite(embed_scale) or embed_scale <= 0:
+            raise ValueError(
+                f"embed_scale must be a positive finite number, got "
+                f"{embed_scale!r}.")
+        self.embed_scale = embed_scale
         # Gradient-checkpointing policy for the hybrid stack. Validated via
         # ``grad_checkpointing.parse_policy`` so a typo fails at
         # construction, not mid-training.
@@ -2502,12 +2511,21 @@ class SoftmaxBaselineLM(nn.Module):
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
         if embed_scale is None:
             embed_scale = math.sqrt(self.d_model)
-        if (not isinstance(embed_scale, (int, float))
-                or not math.isfinite(embed_scale) or embed_scale <= 0):
+        if not isinstance(embed_scale, (int, float)):
             raise ValueError(
                 f"embed_scale must be a positive finite number, got "
                 f"{embed_scale!r}.")
-        self.embed_scale = float(embed_scale)
+        try:
+            embed_scale = float(embed_scale)
+        except OverflowError:
+            raise ValueError(
+                f"embed_scale must be a positive finite number, got "
+                f"{embed_scale!r}.") from None
+        if not math.isfinite(embed_scale) or embed_scale <= 0:
+            raise ValueError(
+                f"embed_scale must be a positive finite number, got "
+                f"{embed_scale!r}.")
+        self.embed_scale = embed_scale
         # The baseline has no recurrent stack to checkpoint, so keep the
         # attribute for parity with LMWithHybrid (and to make the recorded
         # recipe explicit).
