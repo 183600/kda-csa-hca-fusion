@@ -90,6 +90,14 @@ def _validate_itemsize(itemsize: int) -> None:
     if itemsize < 1:
         raise ValueError(
             f'decode_bandwidth: itemsize={itemsize} must be >= 1.')
+    try:
+        float(itemsize)
+    except OverflowError:
+        # JSON integers are unbounded; a byte count outside the float
+        # range cannot participate in the byte/bandwidth arithmetic.
+        raise ValueError(
+            f'decode_bandwidth: itemsize={itemsize!r} must be representable '
+            f'as a finite float.') from None
 
 
 def _validate_batch(batch: int) -> None:
@@ -136,9 +144,18 @@ def _resolve_storage(storage, itemsize: int) -> dict[str, float]:
             out[op] = float(itemsize)
         elif isinstance(spec, (QuantSpec, FP8Spec)):
             out[op] = bytes_per_element(spec)
-        elif (isinstance(spec, (int, float)) and not isinstance(spec, bool)
-              and math.isfinite(spec) and spec > 0):
-            out[op] = float(spec)
+        elif isinstance(spec, (int, float)) and not isinstance(spec, bool):
+            try:
+                numeric = float(spec)
+            except OverflowError:
+                numeric = None
+            if numeric is not None and math.isfinite(numeric) and numeric > 0:
+                out[op] = numeric
+            else:
+                raise TypeError(
+                    f'decode_bandwidth: storage[{op!r}] must be a QuantSpec, '
+                    f'an FP8Spec, a positive bytes/element number or None, '
+                    f'got {spec!r}')
         else:
             raise TypeError(
                 f'decode_bandwidth: storage[{op!r}] must be a QuantSpec, '
@@ -519,15 +536,33 @@ def bandwidth_bound_ms(nbytes: float, bw_gbps: float) -> float:
     ``efficiency_label`` conventions, not with a wall-clock claim.
     """
     if (isinstance(nbytes, bool)
-            or not isinstance(nbytes, (int, float))
-            or not math.isfinite(nbytes) or nbytes < 0):
+            or not isinstance(nbytes, (int, float))):
+        raise ValueError(
+            f'bandwidth_bound_ms: nbytes={nbytes!r} must be a finite '
+            f'non-negative number.')
+    try:
+        nbytes_value = float(nbytes)
+    except OverflowError:
+        raise ValueError(
+            f'bandwidth_bound_ms: nbytes={nbytes!r} must be a finite '
+            f'non-negative number.') from None
+    if not math.isfinite(nbytes_value) or nbytes_value < 0:
         raise ValueError(
             f'bandwidth_bound_ms: nbytes={nbytes!r} must be a finite '
             f'non-negative number.')
     if (isinstance(bw_gbps, bool)
-            or not isinstance(bw_gbps, (int, float))
-            or not math.isfinite(bw_gbps) or bw_gbps <= 0):
+            or not isinstance(bw_gbps, (int, float))):
         raise ValueError(
             f'bandwidth_bound_ms: bw_gbps={bw_gbps!r} must be finite and '
             f'positive.')
-    return float(nbytes) / (float(bw_gbps) * 1e9) * 1e3
+    try:
+        bw_value = float(bw_gbps)
+    except OverflowError:
+        raise ValueError(
+            f'bandwidth_bound_ms: bw_gbps={bw_gbps!r} must be finite and '
+            f'positive.') from None
+    if not math.isfinite(bw_value) or bw_value <= 0:
+        raise ValueError(
+            f'bandwidth_bound_ms: bw_gbps={bw_gbps!r} must be finite and '
+            f'positive.')
+    return nbytes_value / (bw_value * 1e9) * 1e3
