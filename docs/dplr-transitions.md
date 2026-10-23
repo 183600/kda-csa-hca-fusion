@@ -105,15 +105,15 @@ doubling levels) alive. The blocked mode
    rebuild the per-chunk maps from the factors and emit the per-chunk
    states (`NT` applications, which the full scan also pays).
 
-Only `ceil(NT/b)` dense `K x K` maps are live at once instead of `NT`, and
-the composition count drops from about `NT log2(NT)` to
-`NT + (NT/b) log2(NT/b)`. For `NT = 128`, `b = 8`:
+The persistent set of dense `K x K` maps is `ceil(NT/b)` instead of `NT`
+(one block's maps are transient), and the composition count drops from
+about `NT log2(NT)` to `NT + (NT/b) log2(NT/b)`. For `NT = 128`, `b = 8`:
 
 | quantity | full scan | blocked (`b=8`) |
 |---|---:|---:|
 | compositions | 769 | 161 |
 | composition work | 1.0x | **0.21x** |
-| live transition scalars | `128 K^2` | `16 K^2` (**0.125x**) |
+| persistent transition scalars | `128 K^2` | `16 K^2` (**0.125x**) |
 
 Measured on this CPU host (4 threads, fp32, `K=128`, `V=64`, `C=64`;
 median of 3, end-to-end `assoc_scan_chunk_kda`):
