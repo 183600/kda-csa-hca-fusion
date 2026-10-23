@@ -263,6 +263,12 @@ def test_validation_errors():
         db.decode_step_ledger(cfg, T, batch=0)
     with pytest.raises(TypeError):
         db.decode_step_ledger(cfg, T, batch=True)
+    # JSON integers are unbounded: one outside the float range is a malformed
+    # geometry, not an OverflowError leaking out of the byte arithmetic.
+    with pytest.raises(ValueError):
+        db.decode_step_ledger(cfg, T, batch=10 ** 400)
+    with pytest.raises(ValueError):
+        db.route_switch_table(cfg, T, batches=(10 ** 400,))
     with pytest.raises(ValueError):
         db.decode_step_ledger(cfg, T, itemsize=0)
     with pytest.raises(ValueError):

@@ -107,6 +107,14 @@ def _validate_batch(batch: int) -> None:
     if batch < 1:
         raise ValueError(
             f'decode_bandwidth: batch={batch} must be >= 1.')
+    try:
+        float(batch)
+    except OverflowError:
+        # JSON integers are unbounded; a batch outside the float range
+        # cannot participate in the byte/bandwidth arithmetic below.
+        raise ValueError(
+            f'decode_bandwidth: batch={batch!r} must be representable as a '
+            f'finite float.') from None
 
 
 _STORAGE_OPS = ('memory', 'csa', 'hca')
