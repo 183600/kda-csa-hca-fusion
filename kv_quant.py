@@ -237,15 +237,24 @@ def storage_bytes(n_elements, spec: StorageSpec) -> float:
     element has no well-defined group count.
     """
     if (not isinstance(n_elements, (int, float))
-            or isinstance(n_elements, bool)
-            or not math.isfinite(n_elements)):
+            or isinstance(n_elements, bool)):
+        raise ValueError(
+            f'storage_bytes: n_elements must be a finite number, got '
+            f'{n_elements!r}')
+    try:
+        elements_float = float(n_elements)
+    except OverflowError:
+        raise ValueError(
+            f'storage_bytes: n_elements must be a finite number, got '
+            f'{n_elements!r}')
+    if not math.isfinite(elements_float):
         raise ValueError(
             f'storage_bytes: n_elements must be a finite number, got '
             f'{n_elements!r}')
     if n_elements < 0:
         raise ValueError(
             f'storage_bytes: n_elements must be >= 0, got {n_elements!r}')
-    if float(n_elements).is_integer():
+    if elements_float.is_integer():
         n = int(n_elements)
         payload_bits = (FP8_BITS if isinstance(spec, FP8Spec) else spec.bits)
         scale_bits = (spec.scale_bits
@@ -276,12 +285,21 @@ def compression_ratio(spec: StorageSpec,
     non-positive baseline.
     """
     if (not isinstance(baseline_bits, (int, float))
-            or isinstance(baseline_bits, bool)
-            or not math.isfinite(baseline_bits) or baseline_bits <= 0):
+            or isinstance(baseline_bits, bool)):
         raise ValueError(
             f'compression_ratio: baseline_bits must be finite and positive, '
             f'got {baseline_bits!r}')
-    return float(baseline_bits) / bits_per_element(spec)
+    try:
+        baseline = float(baseline_bits)
+    except OverflowError:
+        raise ValueError(
+            f'compression_ratio: baseline_bits must be finite and positive, '
+            f'got {baseline_bits!r}')
+    if not math.isfinite(baseline) or baseline <= 0:
+        raise ValueError(
+            f'compression_ratio: baseline_bits must be finite and positive, '
+            f'got {baseline_bits!r}')
+    return baseline / bits_per_element(spec)
 
 
 def spec_summary(spec: StorageSpec,
