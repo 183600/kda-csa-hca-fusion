@@ -160,6 +160,9 @@ build is the lever.
 * The blocked scan changes the association order of the chunk prefix.
   It is not bit-identical to the full scan and must not be used to
   justify a bitwise-reproducibility claim.
+* The reduced live-map count is a **forward/inference** bound.  Under
+  autograd the recomputed per-chunk maps are saved for backward, so
+  training peak memory is not reduced by the same factor.
 * `scan_work_plan` is a dominant-term MAC model. It has no cache,
   launch-overhead or warp-occupancy term; the measured table above is the
   authoritative CPU answer.
