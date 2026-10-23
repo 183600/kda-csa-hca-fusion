@@ -280,6 +280,17 @@ def test_accounting_validation():
         mqa.kv_state_elements_per_token(0, HEAD_DIM)
     with pytest.raises(ValueError):
         mqa.attention_kv_read_elements(4, 2, HEAD_DIM, batch=0)
+    huge = 10 ** 400
+    with pytest.raises(ValueError):
+        mqa.attention_prefill_flops(huge, D_MODEL, H, 2, HEAD_DIM)
+    with pytest.raises(ValueError):
+        mqa.attention_prefill_flops(4, huge, H, 2, HEAD_DIM)
+    with pytest.raises(ValueError):
+        mqa.kv_bytes_reduction(huge, 1)
+    with pytest.raises(ValueError):
+        mqa.attention_kv_read_elements(huge, 2, HEAD_DIM)
+    with pytest.raises(ValueError):
+        mqa.attention_kv_read_elements(4, 2, HEAD_DIM, batch=huge)
     with pytest.raises(ValueError):
         mqa.expand_kv_heads(torch.zeros(1, 2, 2, 4), torch.zeros(1, 2, 2, 4),
                             n_heads=5, n_kv_heads=2)

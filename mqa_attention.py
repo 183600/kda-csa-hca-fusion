@@ -58,6 +58,14 @@ FP32_BYTES = 4
 def _require_positive_int(name: str, value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name}={value!r} must be a positive int.")
+    try:
+        float(value)
+    except OverflowError:
+        # JSON integers are unbounded; the accounting helpers multiply this
+        # value into float FLOP/reduction arithmetic.
+        raise ValueError(
+            f"{name}={value!r} must be representable as a finite float."
+        ) from None
     return value
 
 
@@ -330,6 +338,11 @@ def attention_prefill_flops(T: int, d_model: int, n_heads: int,
     """
     if isinstance(T, bool) or not isinstance(T, int) or T < 0:
         raise ValueError(f"T={T!r} must be a non-negative int.")
+    try:
+        float(T)
+    except OverflowError:
+        raise ValueError(
+            f"T={T!r} must be representable as a finite float.") from None
     d_model = _require_positive_int('d_model', d_model)
     n_heads = _require_positive_int('n_heads', n_heads)
     n_kv_heads = _require_positive_int('n_kv_heads', n_kv_heads)
@@ -363,6 +376,11 @@ def attention_kv_read_elements(T: int, n_kv_heads: int, head_dim: int,
     """
     if isinstance(T, bool) or not isinstance(T, int) or T < 0:
         raise ValueError(f"T={T!r} must be a non-negative int.")
+    try:
+        float(T)
+    except OverflowError:
+        raise ValueError(
+            f"T={T!r} must be representable as a finite float.") from None
     batch = _require_positive_int('batch', batch)
     return int(batch * T * kv_state_elements_per_token(n_kv_heads, head_dim))
 
