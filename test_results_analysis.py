@@ -112,6 +112,12 @@ def test_curve_diagnosis_keeps_extreme_finite_curves_json_safe():
     rep = diagnose_training_curves(mixed_extremes)
     json.dumps(rep, allow_nan=False)
     assert rep['train']['tail_slope_per_point'] is not None
+    # JSON permits arbitrarily large integers. One too large for float is a
+    # malformed metric: classify it as non-finite at that point, not crash.
+    rep = diagnose_training_curves([10 ** 400])
+    json.dumps(rep, allow_nan=False)
+    assert rep['verdict'] == 'diverged'
+    assert rep['train']['non_finite_at'] == 0
     # Ordinary curves still have the historical values.
     rep = diagnose_training_curves([3.0, 2.0, 1.0])
     assert rep['train']['head_mean'] == 3.0

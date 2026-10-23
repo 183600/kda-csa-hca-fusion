@@ -43,7 +43,17 @@ import torch
 
 
 def _finite(values: Sequence[float]) -> bool:
-    return all(v is not None and math.isfinite(float(v)) for v in values)
+    for v in values:
+        if v is None:
+            return False
+        try:
+            if not math.isfinite(float(v)):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            # JSON has unbounded integers; a value too large for float is
+            # malformed for this numeric report, not a reason to crash.
+            return False
+    return True
 
 
 def _safe_mean(values: Sequence[float]) -> float | None:
@@ -249,7 +259,10 @@ def diagnose_training_curves(train_losses: Sequence[float],
     # Preserve ``None`` entries (JSON ``null``, e.g. a non-finite loss that
     # was sanitized before being persisted) so the non-finite branch below
     # can report *where* the curve broke instead of crashing on float(None).
-    train = [None if v is None else float(v) for v in train_losses]
+    # Oversized integers are also mapped to None: JSON permits them, but
+    # they are not representable here and used to raise OverflowError before
+    # the non-finite verdict could be formed.
+    train = [_finite_float_or_none(v) for v in train_losses]
     if not train:
         report['recommendations'].append(
             'no training curve was recorded; log the per-step loss so the '
@@ -272,7 +285,7 @@ def diagnose_training_curves(train_losses: Sequence[float],
 
     val = None
     if val_losses is not None:
-        val = [None if v is None else float(v) for v in val_losses]
+        val = [_finite_float_or_none(v) for v in val_losses]
     if val is not None and val and not _finite(val):
         report['val'] = {
             'n_points': len(val),
