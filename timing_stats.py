@@ -117,8 +117,13 @@ def _safe_stdev(values):
 def _check_bootstrap(n_boot, alpha):
     if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
         raise ValueError(f'n_boot={n_boot!r} must be a positive int.')
-    if not (isinstance(alpha, (int, float)) and not isinstance(alpha, bool)
-            and 0.0 < float(alpha) < 1.0):
+    if not (isinstance(alpha, (int, float)) and not isinstance(alpha, bool)):
+        raise ValueError(f'alpha={alpha!r} must be in (0, 1).')
+    try:
+        alpha_value = float(alpha)
+    except OverflowError:
+        raise ValueError(f'alpha={alpha!r} must be in (0, 1).') from None
+    if not 0.0 < alpha_value < 1.0:
         raise ValueError(f'alpha={alpha!r} must be in (0, 1).')
 
 

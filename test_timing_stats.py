@@ -110,7 +110,8 @@ def test_ratio_of_medians_ci():
     except ValueError:
         raised = True
     _ok('paired mismatch is rejected', raised, '')
-    for kwargs in ({'n_boot': 0}, {'alpha': 0.0}, {'alpha': 1.0}):
+    for kwargs in ({'n_boot': 0}, {'alpha': 0.0}, {'alpha': 1.0},
+                   {'alpha': 10 ** 400}):
         raised = False
         try:
             ts.summarize_timings_ms([1.0, 2.0], **kwargs)
