@@ -375,13 +375,20 @@ def _bonferroni_crit_q(n, alpha=0.05):
     """
     if n < 2:
         return None
-    if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
-            or not math.isfinite(float(alpha))
-            or not 0.0 < float(alpha) < 1.0):
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
         raise ValueError(
             f'_bonferroni_crit_q: alpha={alpha!r} must be a finite number '
             f'in (0, 1).')
-    alpha = float(alpha)
+    try:
+        alpha = float(alpha)
+    except OverflowError:
+        raise ValueError(
+            f'_bonferroni_crit_q: alpha={alpha!r} must be a finite number '
+            f'in (0, 1).')
+    if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
+        raise ValueError(
+            f'_bonferroni_crit_q: alpha={alpha!r} must be a finite number '
+            f'in (0, 1).')
     # t_{1-alpha} = -t_alpha by the symmetry of the t distribution. The
     # dependency-free fallback below only brackets the UPPER tail, so asking
     # it for a quantile below the median (alpha > 0.5) used to return ~0

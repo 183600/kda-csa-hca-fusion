@@ -1102,7 +1102,7 @@ def test_lower_tail_bonferroni_quantile_is_the_mirror():
             assert abs(got - want) <= 1e-7 * max(1.0, abs(want)), (
                 n, alpha, got, want)
 
-    for bad in (0, 1, -0.1, 1.1, float('nan'), True, '0.05'):
+    for bad in (0, 1, -0.1, 1.1, float('nan'), True, '0.05', 10 ** 400):
         try:
             _bonferroni_crit_q(5, alpha=bad)
         except ValueError:
