@@ -316,6 +316,8 @@ def test_kda_g_clamp_rejects_positive_infinity_and_nan():
     ``g.clamp(min=+inf)`` makes every log-decay ``+inf`` (state becomes
     non-finite), so both the operators and the backend adapter must reject
     it before the clamp. ``-inf`` (disabled) and finite bounds still work.
+    A JSON-sized int is likewise a malformed bound: ``float(10**400)`` is
+    not representable, so it must fail here rather than inside ``clamp``.
     """
     from ops_kda import naive_chunk_kda, naive_recurrent_kda
     from ops_kda_autograd import custom_recurrent_kda
@@ -333,7 +335,7 @@ def test_kda_g_clamp_rejects_positive_infinity_and_nan():
             (naive_chunk_kda, {'chunk_size': 2}),
             (custom_recurrent_kda, {}),
             (kda_forward, {'use_chunk': False})):
-        for bad in (float('inf'), float('nan'), True):
+        for bad in (float('inf'), float('nan'), True, 10 ** 400):
             try:
                 fn(q, k, v, g, beta, g_clamp_min=bad, **kwargs)
             except (TypeError, ValueError):

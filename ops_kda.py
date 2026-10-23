@@ -289,6 +289,14 @@ def _validate_g_clamp_min(value, fn_name):
         raise ValueError(
             f"{fn_name}: g_clamp_min=+inf is not a valid lower bound; pass "
             f"a finite value or -inf to disable clamping.")
+    try:
+        float(value)
+    except OverflowError:
+        # JSON integers are unbounded; a bound that cannot be represented as
+        # a float would surface as OverflowError from ``g.clamp`` later.
+        raise ValueError(
+            f"{fn_name}: g_clamp_min={value!r} must be representable as a "
+            f"finite float (or -inf to disable clamping).") from None
 
 
 def _compute_dtype(dtype):

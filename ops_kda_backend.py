@@ -335,9 +335,17 @@ def kda_forward(
     backend = validate_kda_backend(backend)
     if not isinstance(g_clamp_min, (int, float)) or isinstance(g_clamp_min, bool):
         raise TypeError(f"g_clamp_min must be a real number, got {g_clamp_min!r}")
-    if math.isnan(float(g_clamp_min)):
+    try:
+        g_clamp_value = float(g_clamp_min)
+    except OverflowError:
+        # A JSON-sized int cannot be represented as a float, so the clamp
+        # would fail later with an opaque OverflowError. Reject it here.
+        raise ValueError(
+            "g_clamp_min must be representable as a finite float or -inf "
+            f"(clamp disabled), got {g_clamp_min!r}") from None
+    if math.isnan(g_clamp_value):
         raise ValueError("g_clamp_min must not be NaN")
-    if float(g_clamp_min) == float('inf'):
+    if g_clamp_value == float('inf'):
         raise ValueError(
             "g_clamp_min must be finite or -inf (clamp disabled); +inf "
             "would clamp every log-decay to +inf and make the recurrence "
@@ -352,8 +360,8 @@ def kda_forward(
     # Do NOT pass a -inf sentinel to the FLA path: the FLA Triton kernel
     # may compute exp(g_clamp_min), yielding 0.0 or NaN and corrupting the
     # delta-rule state update.
-    if g_clamp_min > -float('inf'):
-        g = g.clamp(min=float(g_clamp_min))
+    if g_clamp_value > -float('inf'):
+        g = g.clamp(min=g_clamp_value)
     downstream_clamp = g_clamp_min
     # The reference operators (naive_recurrent_kda / the chunk paths) apply
     # their own ``g_clamp_min`` clamp to ``g``; with the same bound that
