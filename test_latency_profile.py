@@ -574,6 +574,31 @@ def test_benchmark_compiled_kda_row_metadata():
         meta.get('param_elements') == 0, str(meta.get('param_elements')))
 
 
+def test_benchmark_weight_init_seeds_hash_the_byte_labels():
+    """The manifest seed map must hash the same bytes the builders use.
+
+    The labels are bytes literals; calling ``.encode`` on them raised
+    ``AttributeError`` at the very end of a successful benchmark run, so the
+    run manifest was never written. Pin the exact seeds used by the timed
+    weight initializers.
+    """
+    import run_benchmark as rb
+    import zlib
+
+    seeds = rb.benchmark_weight_init_seeds()
+    _ok('all timed weight initializers are present',
+        set(seeds) == {'mamba2_layer', 'hybrid', 'hybrid_mamba2'},
+        str(sorted(seeds)))
+    _ok('seeds equal crc32 of the bytes passed to torch.manual_seed',
+        seeds['mamba2_layer'] == zlib.crc32(b'mamba2_layer_weights')
+        and seeds['hybrid'] == zlib.crc32(b'hybrid_weights')
+        and seeds['hybrid_mamba2'] == zlib.crc32(b'hybrid_mamba2_weights'),
+        str(seeds))
+    _ok('seeds fit the 32-bit manifest contract',
+        all(isinstance(v, int) and 0 <= v <= 0xFFFFFFFF
+            for v in seeds.values()), str(seeds))
+
+
 def test_run_roofline_accounts_compiled_kda_route():
     print('\nTest: run_roofline prices the compiled KDA row as chunked core')
     import roofline
@@ -639,6 +664,7 @@ _TEST_FUNCS = [
     test_real_profile_small_and_json_roundtrip,
     test_benchmark_chunked_scan_row_metadata,
     test_benchmark_compiled_kda_row_metadata,
+    test_benchmark_weight_init_seeds_hash_the_byte_labels,
     test_run_roofline_accounts_compiled_kda_route,
 ]
 

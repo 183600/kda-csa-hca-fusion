@@ -109,6 +109,26 @@ def benchmark_input_seed(op_name, T):
 #: Rows whose timed implementation reuses another row's input stream.
 _BENCH_INPUT_SEED_ALIASES = {'kda_chunk_compiled': 'kda_chunk'}
 
+#: Weight labels whose scoped initializers seed ``torch.manual_seed``.
+_BENCH_WEIGHT_INIT_LABELS = (
+    ('mamba2_layer', b'mamba2_layer_weights'),
+    ('hybrid', b'hybrid_weights'),
+    ('hybrid_mamba2', b'hybrid_mamba2_weights'),
+)
+
+
+def benchmark_weight_init_seeds():
+    """Stable weight-initialization seeds shared with the timed builders.
+
+    The labels are bytes (``zlib.crc32`` accepts bytes directly); encoding
+    them again would raise ``AttributeError`` and abort the manifest write
+    after an otherwise successful benchmark.
+    """
+    return {
+        name: zlib.crc32(label) & 0xFFFFFFFF
+        for name, label in _BENCH_WEIGHT_INIT_LABELS
+    }
+
 
 def _make_op_gen(op_name, T, device):
     """Build a seeded ``torch.Generator`` keyed on (op_name, T).
@@ -974,13 +994,7 @@ def main():
     input_seeds = {
         benchmark_input_seed(r['op'], int(r['T']))
         for r in results if 'op' in r and 'T' in r}
-    weight_init_seeds = {
-        name: zlib.crc32(label.encode('utf-8')) & 0xFFFFFFFF
-        for name, label in (
-            ('mamba2_layer', b'mamba2_layer_weights'),
-            ('hybrid', b'hybrid_weights'),
-            ('hybrid_mamba2', b'hybrid_mamba2_weights'),
-        )}
+    weight_init_seeds = benchmark_weight_init_seeds()
     used_seeds = sorted(input_seeds | set(weight_init_seeds.values()))
     append_run_manifest(make_run_manifest_entry(
         experiment='exp2_benchmark',
