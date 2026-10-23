@@ -122,6 +122,17 @@ def test_row_contract_matrix_accepts_valid_and_flags_defects():
             'total_layers': 10}
     assert rs.validate_rows('exp5b_ablation_matrix', rows, meta) == []
 
+    # Finite per-seed accuracies near the float limit overflow their raw
+    # sum; the contract must re-derive the (finite) mean without rejecting
+    # a valid row.
+    huge = _matrix_row('KDA-H', 'kda', (1e308, 1e308))
+    huge['mean_acc'] = 1e308
+    assert rs._recomputed_mean(huge['per_seed'])[0] == 1e308
+    huge_meta = {'expected_groups': meta['expected_groups'] + ['KDA-H'],
+                 'total_layers': 10}
+    assert rs.validate_rows(
+        'exp5b_ablation_matrix', rows + [huge], huge_meta) == []
+
     # Duplicate (group, n_kv) key.
     assert rs.validate_rows('exp5b_ablation_matrix',
                             rows + [dict(rows[0])], meta)

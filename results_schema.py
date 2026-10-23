@@ -515,7 +515,17 @@ def _recomputed_mean(per_seed: list) -> tuple[float | None, int]:
             accs.append(float(acc))
     if not accs:
         return None, 0
-    return sum(accs) / len(accs), len(accs)
+    total = sum(accs)
+    if math.isfinite(total):
+        mean = total / len(accs)
+    else:
+        # Two finite accuracies near the float limit can overflow their
+        # sum even though their mean is finite. The row contract must
+        # re-derive that mean, or it falsely rejects a valid row.
+        scale = max(abs(a) for a in accs)
+        mean = (scale * (math.fsum(a / scale for a in accs) / len(accs))
+                if scale else 0.0)
+    return (mean if math.isfinite(mean) else None), len(accs)
 
 
 @register_row_contract('exp5b_ablation_matrix')
