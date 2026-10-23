@@ -246,12 +246,48 @@ def test_account_row_matches_prefill_flops():
     _ok('incomplete hybrid workload raises KeyError', raised, '')
 
 
+def test_roofline_rejects_unrepresentable_geometry():
+    """JSON-sized ints are malformed geometry, not ``OverflowError``."""
+    huge = 10 ** 400
+    cases = [
+        ('softmax_core_flops', lambda: roofline.softmax_core_flops(
+            huge, 2, 8)),
+        ('softmax heads', lambda: roofline.softmax_core_flops(
+            4, huge, 8)),
+        ('kda_core_flops', lambda: roofline.kda_core_flops(
+            huge, 2, 8, 8)),
+        ('kda chunk_size', lambda: roofline.kda_core_flops(
+            4, 2, 8, 8, chunked=True, chunk_size=huge)),
+        ('ssd_core_flops', lambda: roofline.ssd_core_flops(
+            huge, 2, 8, 4)),
+        ('ssd chunk_size', lambda: roofline.ssd_core_flops(
+            8, 2, 8, 4, chunked=True, chunk_size=huge)),
+        ('arithmetic_intensity', lambda: roofline.arithmetic_intensity(
+            huge, 1.0)),
+        ('ridge_point', lambda: roofline.ridge_point(huge, 100.0)),
+        ('roofline_point', lambda: roofline.roofline_point(
+            flops=1.0, nbytes=1.0, time_ms=huge)),
+    ]
+    for name, call in cases:
+        raised = False
+        try:
+            call()
+        except ValueError:
+            raised = True
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'{name} rejects an oversized geometry', False,
+                f'{type(exc).__name__}: {exc}')
+            continue
+        _ok(f'{name} rejects an oversized geometry', raised, '')
+
+
 _TEST_FUNCS = [
     test_schema_detects_legacy_and_current_versions,
     test_schema_rejects_non_mapping_metadata,
     test_schema_versioned_envelope_roundtrip,
     test_schema_future_version_is_refused,
     test_roofline_core_math,
+    test_roofline_rejects_unrepresentable_geometry,
     test_roofline_point_classification,
     test_roofline_device_presets,
     test_roofline_host_microbenchmarks_smoke,

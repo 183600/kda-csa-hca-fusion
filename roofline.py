@@ -166,16 +166,44 @@ def measure_gemm_tflops(device: str = 'cpu', *, n: int = 1024,
 
 def arithmetic_intensity(flops: float, nbytes: float) -> float:
     """``FLOPs / byte``; ``inf`` when bytes are zero but work is not."""
-    if nbytes > 0:
-        return flops / nbytes
-    return math.inf if flops > 0 else 0.0
+    try:
+        flops_value = float(flops)
+        nbytes_value = float(nbytes)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'arithmetic_intensity: flops={flops!r} and nbytes={nbytes!r} '
+            f'must be real numbers representable as finite floats'
+        ) from None
+    if nbytes_value > 0:
+        return flops_value / nbytes_value
+    return math.inf if flops_value > 0 else 0.0
 
 
 def ridge_point(peak_flops_per_s: float, peak_bw_gbps: float) -> float:
     """Machine balance point in FLOPs/byte: ``peak_flops / peak_bw``."""
-    if peak_bw_gbps <= 0:
+    if isinstance(peak_bw_gbps, bool) or not isinstance(
+            peak_bw_gbps, (int, float)):
+        raise ValueError(
+            f'peak_bw_gbps={peak_bw_gbps!r} must be a real number')
+    try:
+        bw_value = float(peak_bw_gbps)
+    except OverflowError:
+        raise ValueError(
+            f'peak_bw_gbps={peak_bw_gbps!r} must be representable as a '
+            f'finite float') from None
+    if bw_value <= 0:
         raise ValueError('peak_bw_gbps must be positive')
-    return peak_flops_per_s / (peak_bw_gbps * 1e9)
+    if isinstance(peak_flops_per_s, bool) or not isinstance(
+            peak_flops_per_s, (int, float)):
+        raise ValueError(
+            f'peak_flops_per_s={peak_flops_per_s!r} must be a real number')
+    try:
+        flops_value = float(peak_flops_per_s)
+    except OverflowError:
+        raise ValueError(
+            f'peak_flops_per_s={peak_flops_per_s!r} must be representable '
+            f'as a finite float') from None
+    return flops_value / (bw_value * 1e9)
 
 
 def bound_for(ai: float, peak_flops_per_s: float,
@@ -201,22 +229,32 @@ def roofline_point(*, flops: float, nbytes: float, time_ms: float,
         'arithmetic_intensity_flops_per_byte': arithmetic_intensity(flops,
                                                                     nbytes),
     }
-    if time_ms and time_ms > 0:
-        out['achieved_tflops'] = flops / (time_ms * 1e-3) / 1e12
-        out['achieved_bw_gbps'] = nbytes / (time_ms * 1e-3) / 1e9
+    try:
+        time_value = float(time_ms)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'roofline_point: time_ms={time_ms!r} must be representable as '
+            f'a finite float') from None
+    if time_value > 0:
+        # ``arithmetic_intensity`` already rejected unrepresentable
+        # flops/nbytes, so these casts cannot overflow.
+        flops_value = float(flops)
+        nbytes_value = float(nbytes)
+        out['achieved_tflops'] = flops_value / (time_value * 1e-3) / 1e12
+        out['achieved_bw_gbps'] = nbytes_value / (time_value * 1e-3) / 1e9
     else:
         out['achieved_tflops'] = None
         out['achieved_bw_gbps'] = None
-    if peak_flops_per_s and peak_bw_gbps and time_ms and time_ms > 0:
+    if peak_flops_per_s and peak_bw_gbps and time_value > 0:
         ridge = ridge_point(peak_flops_per_s, peak_bw_gbps)
-        compute_time_s = flops / peak_flops_per_s
-        memory_time_s = nbytes / (peak_bw_gbps * 1e9)
+        compute_time_s = float(flops) / float(peak_flops_per_s)
+        memory_time_s = float(nbytes) / (float(peak_bw_gbps) * 1e9)
         ceiling_s = max(compute_time_s, memory_time_s)
         out['ridge_point_flops_per_byte'] = ridge
         out['roofline_bound'] = 'compute' if out[
             'arithmetic_intensity_flops_per_byte'] >= ridge else 'memory'
         out['roofline_ceiling_ms'] = ceiling_s * 1e3
-        out['pct_of_roofline'] = ceiling_s * 1e3 / time_ms * 100.0
+        out['pct_of_roofline'] = ceiling_s * 1e3 / time_value * 100.0
         out['efficiency_label'] = efficiency_label(
             out['pct_of_roofline'])
     return out
@@ -238,6 +276,25 @@ def efficiency_label(pct_of_roofline: float | None) -> str:
     return 'overhead-bound'
 
 
+def _validate_core_int(name: str, value, fn_name: str, *,
+                       minimum: int = 0) -> int:
+    """Exact int geometry for the core FLOPs models, float-representable.
+
+    JSON integers are unbounded; one outside the float range cannot enter
+    the ``float`` FLOP arithmetic and used to raise ``OverflowError``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(
+            f'{fn_name}: {name}={value!r} must be an int >= {minimum}.')
+    try:
+        float(value)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: {name}={value!r} must be representable as a finite '
+            f'float.') from None
+    return value
+
+
 def softmax_core_flops(T: int, heads: int, head_dim: int,
                        value_dim: int | None = None) -> float:
     """Causal softmax attention FLOPs for the *core only* (pre-projected).
@@ -245,6 +302,13 @@ def softmax_core_flops(T: int, heads: int, head_dim: int,
     ``QK^T`` + ``softmax @ V`` over the ``T*(T+1)/2`` causal entries:
     ``2 * entries * heads * (K + V)``.
     """
+    _validate_core_int('T', T, 'softmax_core_flops')
+    _validate_core_int('heads', heads, 'softmax_core_flops', minimum=1)
+    _validate_core_int('head_dim', head_dim, 'softmax_core_flops',
+                       minimum=1)
+    if value_dim is not None:
+        _validate_core_int('value_dim', value_dim, 'softmax_core_flops',
+                           minimum=1)
     V = value_dim if value_dim is not None else head_dim
     entries = T * (T + 1) // 2
     return 2.0 * entries * heads * (head_dim + V)
@@ -260,6 +324,13 @@ def kda_core_flops(T: int, heads: int, k_dim: int, v_dim: int, *,
     computes. Projections are excluded: Exp 2 times the core with q/k/v/g/beta
     pre-projected.
     """
+    _validate_core_int('T', T, 'kda_core_flops')
+    _validate_core_int('heads', heads, 'kda_core_flops', minimum=1)
+    _validate_core_int('k_dim', k_dim, 'kda_core_flops', minimum=1)
+    _validate_core_int('v_dim', v_dim, 'kda_core_flops', minimum=1)
+    if chunked:
+        _validate_core_int('chunk_size', chunk_size, 'kda_core_flops',
+                           minimum=1)
     flops = 6.0 * T * heads * k_dim * v_dim
     if chunked:
         flops += 3.0 * T * heads * chunk_size * k_dim
@@ -337,11 +408,23 @@ def _validate_ssd_flops_args(T, heads, headdim, d_state, chunk_size) -> None:
             raise ValueError(
                 f"ssd_core_flops: {name}={val!r} must be "
                 f"{'a non-negative' if name == 'T' else 'a positive'} int.")
+        try:
+            float(val)
+        except OverflowError:
+            raise ValueError(
+                f"ssd_core_flops: {name}={val!r} must be representable as a "
+                f"finite float.") from None
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) \
             or chunk_size < 1:
         raise ValueError(
             f"ssd_core_flops: chunk_size={chunk_size!r} must be a positive "
             f"int.")
+    try:
+        float(chunk_size)
+    except OverflowError:
+        raise ValueError(
+            f"ssd_core_flops: chunk_size={chunk_size!r} must be "
+            f"representable as a finite float.") from None
 
 
 def ssd_core_flops(
