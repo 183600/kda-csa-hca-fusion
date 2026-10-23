@@ -155,6 +155,26 @@ def _validate_rope_base(owner: str, rope_base) -> float:
     return float(rope_base)
 
 
+def _validate_sink_shape(owner: str, sink_logits, nh: int) -> None:
+    """Require the documented ``[nh]`` sink-logit shape.
+
+    ``forward_step``/``forward_chunk`` re-view the sink to ``[1, 1, nh, 1]``
+    downstream. A tensor with the same element count but another shape
+    (e.g. ``[nh, 1]``) would be silently reinterpreted, and a different
+    count fails with an opaque RuntimeError from ``view``.
+    """
+    if sink_logits is None:
+        return
+    if not isinstance(sink_logits, torch.Tensor):
+        raise TypeError(
+            f'{owner}: sink_logits must be a torch.Tensor or None, got '
+            f'{type(sink_logits).__name__}.')
+    if tuple(sink_logits.shape) != (nh,):
+        raise ValueError(
+            f'{owner}: sink_logits.shape={tuple(sink_logits.shape)} must '
+            f'equal (nh,)=({nh},).')
+
+
 def _attention_compute_dtype(cache_dtype: torch.dtype,
                             *tensors: torch.Tensor | None) -> torch.dtype:
     """Compute dtype for an attention read of the cache.
@@ -1630,6 +1650,7 @@ class CSADecodingCache:
                     f'CSADecodingCache.forward_step: {name}.device='
                     f'{tensor.device} does not match cache\'s '
                     f'device={self.device}.')
+        _validate_sink_shape('CSADecodingCache.forward_step', sink_logits, nh)
         if sink_logits is not None and sink_logits.device != self.device:
             raise ValueError(
                 f'CSADecodingCache.forward_step: sink_logits.device='
@@ -2057,6 +2078,7 @@ class CSADecodingCache:
                 f'CSADecodingCache.forward_chunk: w_idx shape '
                 f'{tuple(w_idx.shape)} does not match '
                 f'{(B, T_new, nIh)}.')
+        _validate_sink_shape('CSADecodingCache.forward_chunk', sink_logits, nh)
         if q.device != self.device:
             raise ValueError(
                 f'CSADecodingCache.forward_chunk: q.device={q.device} does '
@@ -2767,6 +2789,7 @@ class HCADecodingCache:
                 f"HCADecodingCache.forward_step: q.device={q.device} does "
                 f"not match cache's device={self.device}. Call "
                 f"cache.to(device=q.device) or move q to the cache's device.")
+        _validate_sink_shape('HCADecodingCache.forward_step', sink_logits, nh)
         if sink_logits is not None and sink_logits.device != self.device:
             raise ValueError(
                 f'HCADecodingCache.forward_step: sink_logits.device='
@@ -2980,6 +3003,7 @@ class HCADecodingCache:
             raise ValueError(
                 f'HCADecodingCache.forward_chunk: Z_new.shape[1]='
                 f'{Z_new.shape[1]} does not match C_new.shape[1]={T_new}.')
+        _validate_sink_shape('HCADecodingCache.forward_chunk', sink_logits, nh)
         if q.device != self.device:
             raise ValueError(
                 f'HCADecodingCache.forward_chunk: q.device={q.device} does '

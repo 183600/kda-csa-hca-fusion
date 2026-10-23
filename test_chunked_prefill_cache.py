@@ -327,9 +327,31 @@ def test_forward_chunk_validates_shapes():
         cache.forward_chunk(
             dh['C'][:1], dh['Z'][:1], dh['B_pos'], dh['q'][:1],
             nh=dh['nh'])
+    # The documented sink shape is exactly [nh]. A same-element-count but
+    # differently shaped tensor must be rejected instead of re-viewed.
+    bad_sink = torch.zeros(dh['nh'], 1, dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.forward_chunk(
+            dh['C'], dh['Z'], dh['B_pos'], dh['q'], nh=dh['nh'],
+            sink_logits=bad_sink)
+    with pytest.raises(ValueError):
+        cache.forward_step(
+            dh['q'][:, :1], nh=dh['nh'], sink_logits=bad_sink)
 
     dc = _make_csa(n0=4, T=4)
     cache = dc['cache']
+    bad_sink = torch.zeros(dc['nh'], 1, dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.forward_chunk(
+            *dc['P'], dc['Ba'], dc['Bb'], dc['B_idx'],
+            dc['q'], dc['q_idx'], dc['w_idx'],
+            topk=dc['topk'], nh=dc['nh'], nIh=dc['nIh'],
+            sink_logits=bad_sink)
+    with pytest.raises(ValueError):
+        cache.forward_step(
+            dc['q'][:, :1], dc['q_idx'][:, :1], dc['w_idx'][:, :1],
+            topk=dc['topk'], nh=dc['nh'], nIh=dc['nIh'],
+            sink_logits=bad_sink)
     with pytest.raises(ValueError):
         cache.forward_chunk(
             *dc['P'], dc['Ba'], dc['Bb'], dc['B_idx'],
