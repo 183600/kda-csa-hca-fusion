@@ -310,6 +310,30 @@ def test_nonfinite_diagnosis_gradients_and_clean():
     json.dumps(rep, allow_nan=False)
 
 
+def test_nonfinite_diagnosis_skips_oversized_json_scalars():
+    """A JSON int beyond the float range is malformed, not an OverflowError.
+
+    ``loss``, ``fp32_forward_loss`` and ``grad_norm`` can arrive from a
+    result row; the triage report must stay JSON-safe and classify the
+    unrepresentable gradient norm as non-finite.
+    """
+    huge = 10 ** 400
+    rep = diagnose_nonfinite(loss=huge)
+    assert rep['verdict'] == 'loss_nonfinite'
+    json.dumps(rep, allow_nan=False)
+
+    rep = diagnose_nonfinite(loss=1.0, amp_enabled=True,
+                             fp32_forward_loss=huge)
+    assert rep['verdict'] == 'no_nonfinite_signal'
+    json.dumps(rep, allow_nan=False)
+
+    rep = diagnose_nonfinite(loss=1.0, grad_norm=huge)
+    assert rep['verdict'] == 'gradients_nonfinite'
+    gradients = [c for c in rep['checks'] if c['check'] == 'gradients'][0]
+    assert gradients['status'] == 'fail'
+    json.dumps(rep, allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # Efficiency / accuracy Pareto annotation
 # ---------------------------------------------------------------------------

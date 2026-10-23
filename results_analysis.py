@@ -569,9 +569,17 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
         record('token_ids', 'skipped', 'no token ids / range supplied')
 
     loss_val = None
+    loss_malformed = False
     if loss is not None:
-        loss_val = float(loss) if not isinstance(loss, torch.Tensor) else float(loss.detach())
-        loss_finite = math.isfinite(loss_val)
+        try:
+            loss_val = (float(loss) if not isinstance(loss, torch.Tensor)
+                        else float(loss.detach()))
+        except (TypeError, ValueError, OverflowError):
+            # A non-numeric or out-of-float-range loss is malformed; keep
+            # the report JSON-safe instead of leaking OverflowError.
+            loss_val = None
+            loss_malformed = True
+        loss_finite = loss_val is not None and math.isfinite(loss_val)
         # The loss is the SYMPTOM, not a stage: record it in order but let
         # the more specific stages below (parameters / logits / AMP /
         # gradients) claim the verdict when they fail.
@@ -636,10 +644,13 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
             pass
     fp32_finite = None
     if fp32_forward_loss is not None:
-        fp32_val = (float(fp32_forward_loss)
-                    if not isinstance(fp32_forward_loss, torch.Tensor)
-                    else float(fp32_forward_loss.detach()))
-        fp32_finite = math.isfinite(fp32_val)
+        try:
+            fp32_val = (float(fp32_forward_loss)
+                        if not isinstance(fp32_forward_loss, torch.Tensor)
+                        else float(fp32_forward_loss.detach()))
+        except (TypeError, ValueError, OverflowError):
+            fp32_val = None
+        fp32_finite = fp32_val is not None and math.isfinite(fp32_val)
         amp_detail['fp32_forward_loss'] = fp32_val
     if amp_enabled:
         if (loss_val is not None and not math.isfinite(loss_val)
@@ -663,7 +674,16 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
     grad_info = _tensor_map_finiteness(grads_map)
     bad_grads = [k for k, v in grad_info.items() if not v['finite']]
     if grads_map or grad_norm is not None:
-        detail = {'non_finite': bad_grads[:10], 'grad_norm': grad_norm}
+        try:
+            grad_norm_val = (None if grad_norm is None
+                             else float(grad_norm))
+        except (TypeError, ValueError, OverflowError):
+            # A malformed/oversized norm cannot be a healthy measurement;
+            # classify it with the non-finite norms and keep the report
+            # JSON-safe.
+            grad_norm_val = None
+        grad_norm_bad = (grad_norm is not None and grad_norm_val is None)
+        detail = {'non_finite': bad_grads[:10], 'grad_norm': grad_norm_val}
         if bad_grads:
             if verdict is None:
                 verdict = 'gradients_nonfinite'
@@ -672,12 +692,13 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
                            f'check for log(0)/division by zero in the loss, '
                            f'and lower the LR')
             record('gradients', 'fail', detail)
-        elif grad_norm is not None and not math.isfinite(float(grad_norm)):
+        elif grad_norm_bad or (grad_norm_val is not None
+                               and not math.isfinite(grad_norm_val)):
             if verdict is None:
                 verdict = 'gradients_nonfinite'
                 summary = 'total gradient norm is non-finite (explosion)'
             record('gradients', 'fail', detail)
-        elif grad_norm is not None and float(grad_norm) > 1e3:
+        elif grad_norm_val is not None and grad_norm_val > 1e3:
             record('gradients', 'warn',
                    {**detail, 'note': 'gradients are exploding; clip and/or '
                                       'lower the learning rate'})
@@ -686,13 +707,21 @@ def diagnose_nonfinite(*, loss: torch.Tensor | float | None = None,
     else:
         record('gradients', 'skipped', 'no gradients / grad norm supplied')
 
-    if (verdict is None and loss_val is not None
-            and not math.isfinite(loss_val)):
+    if verdict is None and (loss_malformed
+                            or (loss_val is not None
+                                and not math.isfinite(loss_val))):
         verdict = 'loss_nonfinite'
-        summary = (f'the loss is {loss_val} while every supplied stage was '
-                   f'finite: trace the forward pass for log(0) / division '
-                   f'by zero / unsafe softmax (supply logits and grads for '
-                   f'a narrower verdict)')
+        if loss_malformed:
+            summary = ('the loss is not representable as a finite float '
+                       'while every supplied stage was finite: trace the '
+                       'forward pass for log(0) / division by zero / unsafe '
+                       'softmax (supply logits and grads for a narrower '
+                       'verdict)')
+        else:
+            summary = (f'the loss is {loss_val} while every supplied stage '
+                       f'was finite: trace the forward pass for log(0) / '
+                       f'division by zero / unsafe softmax (supply logits and '
+                       f'grads for a narrower verdict)')
 
     return {
         'context': context,
