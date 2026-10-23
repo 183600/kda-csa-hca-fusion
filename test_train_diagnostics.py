@@ -208,6 +208,21 @@ def test_validation_curve_gap_ignores_json_null_training_losses():
     json.dumps(block, allow_nan=False)
 
 
+def test_validation_curve_gap_is_finite_for_extreme_finite_losses():
+    """Finite losses must not make the reported gap +/-inf.
+
+    ``sum([1e308] * 10)`` overflows to inf even though the mean and the
+    gap are finite. The gap must use the scaled mean and stay strict-JSON.
+    """
+    curve = _curve([(1e308, 0.5), (1e308, 0.5), (1e308, 0.5)],
+                   steps=2, val_every=1)
+    for step in range(3):
+        curve.record(step)
+    block = curve.finalize([1e308] * 20)
+    assert block['generalization_gap'] == 0.0
+    json.dumps(block, allow_nan=False)
+
+
 def test_validation_curve_rejects_swapped_fields_and_disabled_is_empty():
     curve = _curve([(1.0, 3.0)], steps=1, val_every=1)
     with pytest.raises(ValueError, match='accuracy must lie in'):

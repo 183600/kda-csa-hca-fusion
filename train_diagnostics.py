@@ -591,7 +591,13 @@ class ValidationCurve:
                 if math.isfinite(value):
                     tail.append(value)
             if tail:
-                gap = float(final['loss']) - sum(tail) / len(tail)
+                # Use the overflow-safe mean: ten finite 1e308 losses sum
+                # to inf, which made the gap -inf even though every input
+                # (and the true gap) is finite. An unrepresentable true gap
+                # is reported as None, not +/-inf.
+                gap = float(final['loss']) - _finite_safe_mean(tail)
+                if not math.isfinite(gap):
+                    gap = None
         block = {
             'val_every': self.val_every,
             'val_history': self.history,
