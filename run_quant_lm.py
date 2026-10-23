@@ -809,11 +809,21 @@ def _aggregate(values: list) -> dict:
             'max': max(values)}
 
 
+def _finite_float_or_none(value):
+    """Finite real float, or ``None`` for a malformed/oversized metric."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _moment(values: list) -> dict:
     """Mean, sample std, and 95% t-CI (plus min/max) over finite values."""
-    vals = [v for v in values
-            if v is not None and isinstance(v, (int, float))
-            and math.isfinite(float(v))]
+    vals = [v for v in (_finite_float_or_none(value) for value in values)
+            if v is not None]
     if not vals:
         return {'mean': None, 'std': None, 'ci95': None,
                 'min': None, 'max': None, 'n': 0}

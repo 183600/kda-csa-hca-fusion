@@ -63,6 +63,7 @@ from run_quant_lm import (  # noqa: E402
     run_part_a,
     run_part_b,
     _decode_state_snr,
+    _moment,
 )
 
 
@@ -688,6 +689,18 @@ def test_quant_lm_report_rows():
         and abs(fp16['ppl_ratio_mean'] - 1.0) < 1e-12, '')
 
 
+def test_moment_skips_oversized_json_integers():
+    """A JSON int beyond the float range is not a usable PPL sample."""
+    print('\nTest: _moment skips oversized JSON integers')
+    rep = _moment([10 ** 400, 1.0, 2.0, float('nan')])
+    _ok('keeps the finite samples', rep['n'] == 2
+        and rep['mean'] == 1.5, f'{rep}')
+    empty = _moment([10 ** 400])
+    _ok('all-malformed input is undefined', empty['n'] == 0
+        and empty['mean'] is None, f'{empty}')
+    json.dumps(rep, allow_nan=False)
+
+
 _TEST_FUNCS = [
     test_fake_quantize_inplace_contract,
     test_ste_autograd_contract,
@@ -698,6 +711,7 @@ _TEST_FUNCS = [
     test_part_b_matched_budget_control,
     test_decode_state_snr_measures_the_quantized_trajectory,
     test_quant_lm_report_rows,
+    test_moment_skips_oversized_json_integers,
 ]
 
 
