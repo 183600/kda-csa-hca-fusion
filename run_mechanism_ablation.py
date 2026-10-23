@@ -1044,8 +1044,198 @@ def _variant_factor_diffs(variant, baseline):
     return diffs
 
 
+# The ACTUAL implementation switches behind each declared mechanism factor.
+# ``rope`` is deliberately a bundled factor: the variant table defines it as
+# partial RoPE on the CSA/HCA core-attention pair, so one factor maps to two
+# HybridConfig fields. The audit below checks that the built config changes
+# exactly this bundle (and nothing else), which is what makes the declared
+# single-factor contrast honest. ``ste`` is an instance attribute set after
+# construction, not a config field.
+_VARIANT_CONFIG_FIELDS = {
+    'rope': ('csa_rope_dim', 'hca_rope_dim'),
+    'topk': ('csa_topk',),
+}
+_VARIANT_INSTANCE_FIELDS = {
+    'ste': ('use_ste',),
+}
+def _variant_state_signature(cfg, use_ste):
+    """Stable signature of one fully-built variant for duplicate detection."""
+    return (tuple((field.name, repr(getattr(cfg, field.name)))
+                  for field in dataclasses.fields(cfg)),
+            bool(use_ste))
+
+
+def variant_config_audit(variants, baseline=None, d_model=32):
+    """Check that built configs match each variant's declared factor changes.
+
+    ``ablation_design_audit`` classifies the *declared* variant table. This
+    companion audit verifies the implementation behind that table: for every
+    non-baseline variant, the fields that actually change in
+    :func:`make_variant_cfg` (plus the post-construction ``use_ste`` switch)
+    must be exactly the switches mapped from its declared factors. That
+    catches a silent drift where, say, a "RoPE only" variant also changes
+    ``csa_topk``: the table would still look leave-one-out complete, but the
+    paired contrast would no longer be single-factor.
+
+    It also flags non-treatments: a non-baseline variant whose built state is
+    identical to the baseline (no declared factor differs) and two variants
+    that build the same state under different names. Either makes the
+    reported "single-factor" cell a duplicate rather than a treatment.
+
+    Returns a JSON-safe dict with ``status`` one of ``'controlled'`` /
+    ``'mismatch'`` / ``'non_treatment'`` / ``'no_baseline'`` / ``'error'``.
+    """
+    variants = list(variants or ())
+    if baseline is None:
+        baseline = next((v for v in variants
+                         if isinstance(v, dict)
+                         and v.get('name') == 'baseline'), None)
+    if baseline is None:
+        return {
+            'status': 'no_baseline',
+            'baseline_present': False,
+            'variants': [],
+            'mismatches': [],
+            'no_change_variants': [],
+            'duplicate_treatments': [],
+            'error': None,
+            'note': ('A config audit needs the baseline variant to define '
+                     'the reference switches.'),
+        }
+
+    def _safe(fn, *args):
+        try:
+            return fn(*args), None
+        except Exception as exc:  # noqa: BLE001 - audit must not crash a run
+            return None, f'{type(exc).__name__}: {exc}'
+
+    base_cfg, base_error = _safe(make_variant_cfg, baseline, d_model)
+    base_ste = bool(baseline.get('use_ste', True))
+    if base_cfg is None:
+        return {
+            'status': 'error',
+            'baseline_present': True,
+            'variants': [],
+            'mismatches': [],
+            'no_change_variants': [],
+            'duplicate_treatments': [],
+            'error': f'baseline config build failed: {base_error}',
+            'note': 'The controlled-variable check could not build the '
+                    'baseline config.',
+        }
+
+    rows = []
+    mismatches = []
+    no_change = []
+    errors = []
+    state_to_names: dict = {}
+    for v in variants:
+        if not isinstance(v, dict) or 'name' not in v:
+            errors.append(f'malformed variant record: {v!r}')
+            continue
+        name = str(v['name'])
+        is_baseline = (v is baseline) or name == 'baseline'
+        if is_baseline:
+            declared = []
+        else:
+            try:
+                declared = _variant_factor_diffs(v, baseline)
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f'{name}: malformed factor record: {exc}')
+                mismatches.append({
+                    'name': name,
+                    'reason': 'malformed_factor_record',
+                    'error': f'{type(exc).__name__}: {exc}',
+                })
+                continue
+        expected_cfg = sorted({
+            field for factor in declared
+            for field in _VARIANT_CONFIG_FIELDS.get(factor, ())})
+        expected_inst = sorted({
+            field for factor in declared
+            for field in _VARIANT_INSTANCE_FIELDS.get(factor, ())})
+        cfg, cfg_error = _safe(make_variant_cfg, v, d_model)
+        if cfg is None:
+            errors.append(f'{name}: config build failed: {cfg_error}')
+            rows.append({
+                'name': name,
+                'declared_factors': declared,
+                'expected_config_fields': expected_cfg,
+                'expected_instance_fields': expected_inst,
+                'actual_config_fields': None,
+                'actual_instance_fields': None,
+                'config_build_error': cfg_error,
+                'matches_declared': False,
+            })
+            mismatches.append({
+                'name': name,
+                'reason': 'config_build_error',
+                'error': cfg_error,
+            })
+            continue
+        actual_cfg = sorted(
+            field.name for field in dataclasses.fields(base_cfg)
+            if getattr(base_cfg, field.name) != getattr(cfg, field.name))
+        actual_inst = (['use_ste']
+                       if bool(v.get('use_ste', True)) != base_ste else [])
+        matches = (actual_cfg == expected_cfg
+                   and actual_inst == expected_inst)
+        if not matches:
+            mismatches.append({
+                'name': name,
+                'declared_factors': declared,
+                'expected_config_fields': expected_cfg,
+                'actual_config_fields': actual_cfg,
+                'expected_instance_fields': expected_inst,
+                'actual_instance_fields': actual_inst,
+            })
+        if not is_baseline and not declared:
+            no_change.append(name)
+        state_sig = _variant_state_signature(cfg, v.get('use_ste', True))
+        state_to_names.setdefault(state_sig, []).append(name)
+        rows.append({
+            'name': name,
+            'declared_factors': declared,
+            'expected_config_fields': expected_cfg,
+            'expected_instance_fields': expected_inst,
+            'actual_config_fields': actual_cfg,
+            'actual_instance_fields': actual_inst,
+            'matches_declared': matches,
+        })
+
+    duplicate_treatments = [
+        names for names in state_to_names.values()
+        if len(names) > 1 and not all(n == 'baseline' for n in names)]
+    if errors:
+        status = 'error'
+    elif mismatches:
+        status = 'mismatch'
+    elif no_change or duplicate_treatments:
+        status = 'non_treatment'
+    else:
+        status = 'controlled'
+    return {
+        'status': status,
+        'baseline_present': True,
+        'variants': rows,
+        'mismatches': mismatches,
+        'no_change_variants': sorted(set(no_change)),
+        'duplicate_treatments': [sorted(set(names))
+                                 for names in duplicate_treatments],
+        'errors': errors,
+        'error': None,
+        'note': (
+            'Each non-baseline variant must change exactly the config fields '
+            'and instance switches mapped from its declared factors; a '
+            'configured "single-factor" variant that also changes another '
+            'switch supports no single-factor claim. The rope factor is a '
+            'declared bundle (CSA+HCA partial RoPE), so both rope fields are '
+            'expected together.'),
+    }
+
+
 def ablation_design_audit(variants, rows=None, requested=None,
-                          recipe=None):
+                          recipe=None, d_model=32):
     """Audit the selected variant set as a controlled ablation design.
 
     Exp 8 toggles three CSA mechanism factors — partial RoPE, the top-k
@@ -1056,6 +1246,16 @@ def ablation_design_audit(variants, rows=None, requested=None,
     single-factor claim on its own. A ``MECH_VARIANTS`` subset can silently
     drop the one-factor counterpart of a factor while still producing a
     paired-vs-baseline table, so the coverage is audited and recorded.
+
+    The declared table is not trusted on its own. ``config_audit`` (see
+    :func:`variant_config_audit`) rebuilds every variant's
+    ``HybridConfig`` and checks that the fields which actually change are
+    exactly the switches mapped from the declared factors (``rope`` is a
+    declared CSA+HCA bundle; ``ste`` is the post-construction instance
+    switch). A variant whose built config changes an extra field is a
+    multi-factor manipulation no matter what the table says, and a
+    non-baseline variant that builds the same state as another is not a
+    treatment at all.
 
     When ``rows`` (the summarized result rows) are given, the audit also
     cross-checks the controlled-variable claim empirically: the observed
@@ -1070,7 +1270,9 @@ def ablation_design_audit(variants, rows=None, requested=None,
     ``'leave_one_out_complete'`` / ``'incomplete'`` / ``'no_baseline'``.
     ``controlled_variables['controls_status']`` separately reports
     ``'controlled'`` / ``'recipe_mismatch'`` / ``'seed_mismatch'`` /
-    ``'partially_observed'``.
+    ``'partially_observed'``. ``config_audit['status']`` is
+    ``'controlled'`` only when the implementation matches the declaration;
+    ``single_factor_claims_valid`` is true only when both checks pass.
     """
     names = [v['name'] for v in variants]
     baseline = next((v for v in variants if v['name'] == 'baseline'), None)
@@ -1116,6 +1318,8 @@ def ablation_design_audit(variants, rows=None, requested=None,
     else:
         status = 'incomplete'
 
+    config_audit = variant_config_audit(variants, baseline=baseline,
+                                        d_model=d_model)
     audit = {
         'status': status,
         'selected_variants': names,
@@ -1125,6 +1329,12 @@ def ablation_design_audit(variants, rows=None, requested=None,
         'factors': factors,
         'interaction_variants': interactions,
         'missing_single_factor_variants': missing,
+        # Implementation-level check: the declared factors must be the
+        # switches that actually change in the built config/instance.
+        'config_audit': config_audit,
+        'single_factor_claims_valid': bool(
+            status == 'leave_one_out_complete'
+            and config_audit.get('status') == 'controlled'),
         'note': (
             'A single-factor (leave-one-out) claim for a factor needs the '
             'baseline plus a variant differing from it in exactly that '
@@ -1679,8 +1889,10 @@ def main():
 
     # Ablation-design audit: verify the selected variant set actually
     # supports the single-factor claims it reports (baseline + exactly-one-
-    # factor counterparts), and cross-check the controlled-variable claim
-    # against the observed parameter counts / depths.
+    # factor counterparts), that the BUILT configs change exactly the
+    # declared switches (no silent second factor), and cross-check the
+    # controlled-variable claim against the observed parameter counts /
+    # depths.
     design_audit = ablation_design_audit(
         variants, rows=all_rows,
         requested=requested if requested else None,
@@ -1692,6 +1904,16 @@ def main():
             'corresponding mechanism claims are NOT supported by this run.',
             design_audit['status'],
             design_audit['missing_single_factor_variants'])
+    cfg_audit = design_audit.get('config_audit') or {}
+    if cfg_audit.get('status') != 'controlled':
+        logger.warning(
+            '  WARNING: built variant configs do not match the declared '
+            'single-factor switches (%s): mismatches=%s no_change=%s '
+            'duplicates=%s. The affected single-factor claims are NOT '
+            'supported by this run.',
+            cfg_audit.get('status'), cfg_audit.get('mismatches'),
+            cfg_audit.get('no_change_variants'),
+            cfg_audit.get('duplicate_treatments'))
     cv = design_audit.get('controlled_variables') or {}
     if cv.get('parameter_count_parity') is False:
         logger.warning(

@@ -441,7 +441,8 @@ PLANS: dict[str, dict] = {
         'stopping_rule': (
             'fixed variant set and seed count fixed before the run; the '
             'audit refuses single-factor claims when the one-factor '
-            'counterpart is missing'),
+            'counterpart is missing or when the built variant config changes '
+            'a switch outside its declared factor'),
         'pilot': {
             'group_key': 'variant',
             'reference': 'baseline',

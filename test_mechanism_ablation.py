@@ -346,6 +346,23 @@ def test_ablation_design_audit():
         full['interaction_variants'] ==
         {'no_rope_dense': ['rope', 'topk']},
         str(full['interaction_variants']))
+    cfg_audit = full.get('config_audit') or {}
+    _ok('built configs match the declared single-factor switches',
+        cfg_audit.get('status') == 'controlled'
+        and full.get('single_factor_claims_valid') is True,
+        f"config_status={cfg_audit.get('status')}")
+    by_name = {row['name']: row for row in cfg_audit.get('variants', [])}
+    _ok('rope is audited as the declared CSA+HCA bundle',
+        by_name['no_rope']['actual_config_fields']
+        == ['csa_rope_dim', 'hca_rope_dim']
+        and by_name['no_rope']['matches_declared'] is True, '')
+    _ok('topk is audited as one config field',
+        by_name['topk1']['actual_config_fields'] == ['csa_topk']
+        and by_name['dense']['actual_config_fields'] == ['csa_topk'], '')
+    _ok('ste is audited as the post-construction instance switch',
+        by_name['frozen_indexer']['actual_config_fields'] == []
+        and by_name['frozen_indexer']['actual_instance_fields']
+        == ['use_ste'], '')
 
     subset = [v for v in M.VARIANTS
               if v['name'] in ('baseline', 'no_rope')]
@@ -439,6 +456,56 @@ def test_ablation_design_audit():
         == 'seed_mismatch'
         and diverged['controlled_variables']['seed_alignment_ok'] is False,
         str(diverged['controlled_variables']))
+
+
+def test_variant_config_audit_detects_drift_and_non_treatments():
+    """The config-level audit catches a second factor and duplicate arms.
+
+    The declared variant table can look leave-one-out complete while the
+    implementation silently changes another switch. This pins that the
+    audit rebuilds the actual configs instead of trusting the table, and
+    that a "treatment" identical to the baseline is not counted as one.
+    """
+    print("\nTest: Exp 8 config-level single-factor audit")
+    import dataclasses
+    from unittest import mock
+
+    baseline = next(v for v in M.VARIANTS if v['name'] == 'baseline')
+    no_rope = next(v for v in M.VARIANTS if v['name'] == 'no_rope')
+
+    fake = [baseline,
+            {'name': 'also_baseline', 'rope': baseline['rope'],
+             'topk': baseline['topk'], 'use_ste': baseline['use_ste']}]
+    no_change = M.variant_config_audit(fake)
+    _ok('a no-change arm is flagged as a non-treatment',
+        no_change['status'] == 'non_treatment'
+        and no_change['no_change_variants'] == ['also_baseline'],
+        f"status={no_change['status']} "
+        f"no_change={no_change['no_change_variants']}")
+
+    duplicate = M.variant_config_audit([
+        baseline, no_rope, dict(no_rope, name='no_rope_copy')])
+    _ok('two arms that build the same state are duplicates',
+        duplicate['status'] == 'non_treatment'
+        and duplicate['duplicate_treatments'], str(duplicate))
+
+    original = M.make_variant_cfg
+
+    def drifted(variant, d_model=32):
+        cfg = original(variant, d_model)
+        if variant.get('name') == 'no_rope':
+            # Simulate an implementation drift: the "RoPE only" arm also
+            # changes the compression block size.
+            cfg = dataclasses.replace(cfg, csa_m=8)
+        return cfg
+
+    with mock.patch.object(M, 'make_variant_cfg', drifted):
+        drift = M.variant_config_audit(M.VARIANTS)
+    _ok('an extra config field is a mismatch, not a single-factor arm',
+        drift['status'] == 'mismatch'
+        and any(m['name'] == 'no_rope'
+                and 'csa_m' in m['actual_config_fields']
+                for m in drift['mismatches']), str(drift['mismatches']))
 
 
 def test_exp8_smoke_envelope():
@@ -606,6 +673,7 @@ _TEST_FUNCS = [
     test_sparse_variant_recall_is_below_one_or_none,
     test_paired_stats_math,
     test_ablation_design_audit,
+    test_variant_config_audit_detects_drift_and_non_treatments,
     test_exp8_smoke_envelope,
     test_single_seed_aggregate_reports_undefined_std,
     test_paired_family_size_counts_every_n_kv_cell,

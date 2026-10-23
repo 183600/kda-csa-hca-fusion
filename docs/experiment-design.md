@@ -180,6 +180,34 @@ The runners attach this audit to their result metadata as
 confirmatory without reconstructing the seed count by hand. The audit never
 changes the experiment or its exit code; it only labels the evidence.
 
+## Single-factor claims are audited against the built config
+
+A "leave-one-factor-out" table is only as trustworthy as its implementation.
+Exp 8 therefore carries two complementary audits in
+`metadata.ablation_design`:
+
+* `status` / `missing_single_factor_variants` classify the *declared* variant
+  table: every factor needs the baseline plus a variant that differs from it
+  in exactly that factor, and a variant changing two or more factors is an
+  interaction cell.
+* `config_audit` rebuilds each variant's `HybridConfig` and compares it with
+  the baseline. The fields that actually change (plus the post-construction
+  `use_ste` switch) must be exactly the switches mapped from the declared
+  factors. A table entry that says "RoPE only" while the config also changes
+  `csa_topk` is reported as `mismatch`, not as a single-factor arm.
+  Non-baseline variants whose built state is identical to the baseline (or to
+  another variant) are reported as `no_change_variants` /
+  `duplicate_treatments`; they are not treatments.
+* `single_factor_claims_valid` is true only when both checks pass. The
+  runner logs a warning otherwise; the audit never deletes or rewrites a
+  result row, it labels the evidence.
+
+The `rope` factor is a **declared bundle**: disabling partial RoPE on both
+the CSA and HCA core-attention layers is one treatment factor, so the audit
+expects both `csa_rope_dim` and `hca_rope_dim` to change together. It does
+not support a claim about RoPE in CSA alone; that would need a separate
+variant that leaves HCA's rotation intact.
+
 ## Requested vs analyzed seeds (attrition)
 
 A pre-registered `n = 11` is a statement about the seeds the experiment
