@@ -164,6 +164,16 @@ def test_quantized_row_bytes_bridge():
         _ok('unknown policy stem rejected', False, 'no error')
     except ValueError:
         _ok('unknown policy stem rejected', True)
+    # JSON integers are unbounded; an element count too large for float is a
+    # malformed row, not an OverflowError from the byte pricing.
+    for key in ('core_read_elements', 'state_elements'):
+        bad = dict(row)
+        bad[key] = 10 ** 400
+        try:
+            quantized_row_bytes(bad)
+            _ok(f'oversized {key} rejected', False, 'no error')
+        except ValueError:
+            _ok(f'oversized {key} rejected', True)
     # A QuantSpec applies to every component; None = fp16 baseline.
     allq = quantized_row_bytes(row, QuantSpec(8, 64))
     baseq = quantized_row_bytes(row)

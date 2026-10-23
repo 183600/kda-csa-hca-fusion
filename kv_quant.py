@@ -740,7 +740,22 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
         if value is None:
             out[key] = None
             continue
-        b = float(value) * bpe
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f'quantized_row_bytes: {key} must be a finite number or '
+                f'None, got {value!r}')
+        try:
+            elements = float(value)
+        except OverflowError:
+            # JSON integers are unbounded; a count outside the float range
+            # cannot be priced and is a malformed row, not a crash.
+            raise ValueError(
+                f'quantized_row_bytes: {key}={value!r} must be '
+                f'representable as a finite float') from None
+        if not math.isfinite(elements):
+            raise ValueError(
+                f'quantized_row_bytes: {key}={value!r} must be finite')
+        b = elements * bpe
         out[key] = b
         if stem == 'state':
             # The retained state is storage, not a per-query read; it is
