@@ -75,12 +75,24 @@ from run_kv_cache import causal_block_entries, causal_selected_entries
 def _validate_T(T: int, fn_name: str) -> None:
     if not isinstance(T, int) or isinstance(T, bool) or T < 0:
         raise ValueError(f'{fn_name}: T must be a non-negative int, got {T!r}')
+    try:
+        float(T)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: T must be representable as a finite float, '
+            f'got {T!r}') from None
 
 
 def _validate_positive(value: int, name: str, fn_name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(
             f'{fn_name}: {name} must be a positive int, got {value!r}')
+    try:
+        float(value)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: {name} must be representable as a finite float, '
+            f'got {value!r}') from None
 
 
 def sliding_window_entries(T: int, window: int) -> int:
@@ -440,6 +452,13 @@ def _validate_ratio(ratio, fn_name: str) -> tuple:
         raise ValueError(
             f'{fn_name}: ratio components must be non-negative ints, '
             f'got {ratio!r}')
+    for n in ratio:
+        try:
+            float(n)
+        except OverflowError:
+            raise ValueError(
+                f'{fn_name}: ratio components must be representable as '
+                f'finite floats, got {ratio!r}') from None
     n_kda, n_csa, n_hca = (int(n) for n in ratio)
     if n_kda + n_csa + n_hca == 0:
         raise ValueError(f'{fn_name}: empty layout')

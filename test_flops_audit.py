@@ -310,6 +310,10 @@ def test_audit_validation():
         fa.audit_layer('kda', cfg, 64.0)
     with pytest.raises(ValueError):
         fa.canonical_flops('kda', cfg, 64, batch=0)
+    huge = 10 ** 400
+    for args in ((64, dict(batch=huge)), (huge, {})):
+        with pytest.raises(ValueError):
+            fa.canonical_flops('kda', cfg, args[0], **args[1])
 
 
 # ---------------------------------------------------------------------------

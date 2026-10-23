@@ -197,6 +197,24 @@ def test_core_bytes_ssd_accounting():
     except ValueError:
         raised = True
     _ok('chunk_size=0 rejected when chunked', raised, '')
+    huge = 10 ** 400
+    for kwargs in ({'T': huge}, {'heads': huge}, {'head_dim': huge},
+                   {'chunked': True, 'chunk_size': huge},
+                   {'itemsize': huge}):
+        call = dict(heads=2, head_dim=8)
+        call.update(kwargs)
+        raised = False
+        try:
+            roofline.core_bytes('kda', call.pop('T', 4), **call)
+        except ValueError:
+            raised = True
+        _ok(f'kda rejects oversized {kwargs}', raised, '')
+    raised = False
+    try:
+        roofline.elements_to_bytes(huge)
+    except ValueError:
+        raised = True
+    _ok('elements_to_bytes rejects an oversized count', raised, '')
 
 
 # --- run_roofline integration --------------------------------------------

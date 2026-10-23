@@ -400,16 +400,36 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
         if isinstance(val, bool) or not isinstance(val, int) or val < minimum:
             raise ValueError(
                 f"core_bytes: {name}={val!r} must be an int >= {minimum}.")
+        try:
+            float(val)
+        except OverflowError:
+            raise ValueError(
+                f"core_bytes: {name}={val!r} must be representable as a "
+                'finite float.') from None
     for name, val in (('value_dim', value_dim), ('d_state', d_state)):
         if val is not None and (isinstance(val, bool)
                                 or not isinstance(val, int) or val < 1):
             raise ValueError(
                 f"core_bytes: {name}={val!r} must be a positive int or None.")
+        if val is not None:
+            try:
+                float(val)
+            except OverflowError:
+                raise ValueError(
+                    f"core_bytes: {name}={val!r} must be representable as "
+                    'a finite float.') from None
     if chunked and (isinstance(chunk_size, bool)
                     or not isinstance(chunk_size, int) or chunk_size < 1):
         raise ValueError(
             f"core_bytes: chunk_size={chunk_size!r} must be a positive int "
             'when chunked=True.')
+    if chunked:
+        try:
+            float(chunk_size)
+        except OverflowError:
+            raise ValueError(
+                f"core_bytes: chunk_size={chunk_size!r} must be "
+                'representable as a finite float.') from None
     V = value_dim if value_dim is not None else head_dim
     if op == 'softmax':
         # q + k read at head_dim, v read at value_dim, o written at
@@ -442,4 +462,11 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
 
 def elements_to_bytes(elements: float, *, itemsize: int = FP32_BYTES) -> float:
     """Convert an element count to bytes under the fp32 accounting used here."""
-    return float(elements) * itemsize
+    try:
+        elements = float(elements)
+        itemsize = float(itemsize)
+    except OverflowError:
+        raise ValueError(
+            'elements_to_bytes: elements/itemsize must be representable as '
+            'finite floats.') from None
+    return elements * itemsize

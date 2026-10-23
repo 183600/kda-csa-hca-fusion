@@ -312,6 +312,13 @@ def _validate(kind: str, T: int, batch: int = 1) -> None:
         raise TypeError(f'flops_audit: batch={batch!r} must be an int.')
     if batch < 1:
         raise ValueError(f'flops_audit: batch={batch} must be >= 1.')
+    for name, value in (('T', T), ('batch', batch)):
+        try:
+            float(value)
+        except OverflowError:
+            raise ValueError(
+                f'flops_audit: {name}={value!r} must be representable as a '
+                f'finite float.') from None
 
 
 def kda_path(cfg, T: int) -> str:

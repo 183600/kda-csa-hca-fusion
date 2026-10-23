@@ -174,6 +174,19 @@ def test_op_and_layout_dispatch():
     except ValueError:
         raised = True
     _ok('empty layout raises ValueError', raised, '')
+    huge = 10 ** 400
+    for label, call in (
+            ('T', lambda: kv_budget.softmax_read_elements(huge, 2, 16, 16)),
+            ('c', lambda: kv_budget.csa_read_elements(
+                16, m=4, topk=2, c=huge, c_i=16)),
+            ('ratio', lambda: kv_budget.layout_read_elements(
+                16, (huge, 0, 1), spec))):
+        raised = False
+        try:
+            call()
+        except ValueError:
+            raised = True
+        _ok(f'oversized {label} rejected', raised, '')
     for name, fn, kwargs in (
             ('CSA', kv_budget.csa_read_elements,
              dict(T=16, m=4, topk=2, c=32, c_i=16)),
