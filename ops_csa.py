@@ -1286,6 +1286,7 @@ def csa_lightning_indexer(
     # are silently stripped under optimization.
     _require_int_geometry('csa_lightning_indexer', 'topk', topk,
                           minimum=0)
+    _require_scale('csa_lightning_indexer', scale)
     # ``query_chunk`` tiles the QUERY axis (see the docstring section of the
     # same name). Negative values are rejected rather than silently treated
     # as "disabled": a typo like ``query_chunk=-4096`` would otherwise run

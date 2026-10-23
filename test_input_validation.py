@@ -439,6 +439,26 @@ def test_rwkv_reference_rejects_oversized_scale_without_overflow():
                              'scale')
 
 
+def test_csa_indexer_rejects_oversized_scale_without_overflow():
+    """The public lightning indexer validates its temperature too."""
+    from ops_csa import csa_lightning_indexer
+
+    B, T, HI, DI, N = 1, 3, 2, 2, 4
+    q_idx = torch.randn(B, T, HI, DI)
+    k_idx = torch.randn(B, N, DI)
+    w_idx = torch.randn(B, T, HI)
+    try:
+        csa_lightning_indexer(q_idx, k_idx, w_idx, 2, scale=10 ** 400)
+    except ValueError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - the point is the type
+        raise AssertionError(
+            f'csa_lightning_indexer leaked {type(exc).__name__}: {exc}')
+    else:
+        raise AssertionError(
+            'csa_lightning_indexer accepted an oversized scale')
+
+
 def test_rope_rejects_invalid_dims_bases_and_positions():
     """RoPE parameter errors fail before they can produce NaN tables.
 
