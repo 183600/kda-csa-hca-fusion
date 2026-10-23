@@ -1189,6 +1189,16 @@ def _needle_learned_retrieval_family_key(row: dict) -> tuple:
     )
 
 
+def _is_finite_real(value) -> bool:
+    """True for a real (non-bool) value representable as a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _needle_primary_precision_rank(row: dict) -> tuple:
     """Prefer the unquantized reference cell, then the widest format."""
     if not row.get('quantized'):
@@ -1236,9 +1246,7 @@ def _needle_hypothesis_family(rows: list[dict], hypothesis_key: str,
         claim = checks.get(hypothesis_key) if isinstance(checks, dict) else None
         p_value = (claim.get('p_value_directional')
                    if isinstance(claim, dict) else None)
-        if (isinstance(p_value, bool)
-                or not isinstance(p_value, (int, float))
-                or not math.isfinite(float(p_value))
+        if (not _is_finite_real(p_value)
                 or not 0.0 <= float(p_value) <= 1.0):
             continue
         key = _needle_learned_retrieval_family_key(row)
@@ -1364,9 +1372,7 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
                 or not isinstance(context_len, int) or context_len < 0
                 or isinstance(pos, bool)
                 or not isinstance(pos, int) or pos < 0
-                or isinstance(acc, bool)
-                or not isinstance(acc, (int, float))
-                or not math.isfinite(float(acc))):
+                or not _is_finite_real(acc)):
             continue
         key = (context_len, r.get('memory_type'))
         by_axis.setdefault(key, {}).setdefault(pos, []).append(float(acc))
@@ -1411,8 +1417,7 @@ def summarize_needle_hypotheses(rows: list[dict]) -> dict:
     rule_accs = []
     for r in rules:
         acc = r.get('accuracy')
-        if (isinstance(acc, bool) or not isinstance(acc, (int, float))
-                or not math.isfinite(float(acc))):
+        if not _is_finite_real(acc):
             continue
         rule_accs.append(float(acc))
     return {

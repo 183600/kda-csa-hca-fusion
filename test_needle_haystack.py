@@ -574,13 +574,19 @@ def test_distance_effect_uses_accuracy_at_extreme_positions():
         {'row_kind': 'needle_recall', 'memory_type': 'kda',
          'context_len': 256, 'needle_pos': 128, 'accuracy_mean': 0.5,
          'hypothesis_checks': {'learned_retrieval': []}},
+        _row(256, 128, 'kda', 10 ** 400, 'fp32'),
+        {'row_kind': 'needle_recall', 'memory_type': 'kda',
+         'context_len': 256, 'needle_pos': 128, 'accuracy_mean': 0.5,
+         'hypothesis_checks': {'learned_retrieval':
+                               {'p_value_directional': 10 ** 400}}},
         {'row_kind': 'needle_rule_baseline', 'accuracy': 'bad'},
+        {'row_kind': 'needle_rule_baseline', 'accuracy': 10 ** 400},
         {'row_kind': 'needle_rule_baseline', 'accuracy': 0.25},
     ]
     summary = summarize_needle_hypotheses(hardened)
     _ok('malformed non-distance rows are skipped safely',
         summary['rule_baseline_accuracy_mean'] == 0.25
-        and summary['n_rule_baseline_rows'] == 2
+        and summary['n_rule_baseline_rows'] == 3
         and len(summary['distance_effects']) == 1,
         f"rule={summary['rule_baseline_accuracy_mean']}, "
         f"n_rule={summary['n_rule_baseline_rows']}")
