@@ -2537,8 +2537,8 @@ def main(argv=None) -> int:
             return 1
         print(f'[experiment_design] {len(PLANS)} plans valid; every '
               'declared confirmatory budget reaches its target power, and '
-              'every equivalence endpoint either reaches its TOST budget or '
-              'is marked required_for_claim=False')
+              'every equivalence or 2x2-interaction endpoint either reaches '
+              'its own budget or is marked required_for_claim=False')
         return 0
 
     plan_ids = args.plan or list(PLAN_IDS)
