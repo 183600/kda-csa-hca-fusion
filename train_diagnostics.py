@@ -637,16 +637,21 @@ class ValidationCurve:
             block['best_val_is_final'] = (
                 bool(final_finite and final['step'] == self.best['step']))
             if final_finite:
-                block['val_loss_regret_from_best'] = float(
-                    final['loss'] - self.best['loss'])
+                # The final-minus-best loss can exceed the float range even
+                # though both endpoints are finite (e.g. best=-1e308,
+                # final=+1e308). A non-representable regret is reported as
+                # None, not inf, so the record stays strict-JSON.
+                loss_regret = final['loss'] - self.best['loss']
+                loss_regret = (float(loss_regret)
+                               if math.isfinite(loss_regret) else None)
+                block['val_loss_regret_from_best'] = loss_regret
                 block['early_stopping_summary'] = {
                     'selected_step': int(self.best['step']),
                     'final_step': int(final['step']),
                     'steps_saved': int(final['step'] - self.best['step']),
                     'val_loss_at_selection': float(self.best['loss']),
                     'val_loss_at_final': float(final['loss']),
-                    'val_loss_regret': float(final['loss']
-                                             - self.best['loss']),
+                    'val_loss_regret': loss_regret,
                     'val_acc_at_selection': float(self.best['acc']),
                     'val_acc_at_final': float(final['acc']),
                     'val_acc_regret': float(

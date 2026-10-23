@@ -222,6 +222,16 @@ def test_validation_curve_gap_is_finite_for_extreme_finite_losses():
     assert block['generalization_gap'] == 0.0
     json.dumps(block, allow_nan=False)
 
+    # The best-to-final regret is also a difference of finite endpoints
+    # that can overflow; it must be None, not +inf.
+    curve = _curve([(-1e308, 0.5), (1e308, 0.5)], steps=1, val_every=1)
+    curve.record(0)
+    curve.record(1)
+    block = curve.finalize([1.0])
+    assert block['val_loss_regret_from_best'] is None
+    assert block['early_stopping_summary']['val_loss_regret'] is None
+    json.dumps(block, allow_nan=False)
+
 
 def test_validation_curve_rejects_swapped_fields_and_disabled_is_empty():
     curve = _curve([(1.0, 3.0)], steps=1, val_every=1)
