@@ -20,6 +20,14 @@ module turns that block into an actionable check instead of a passive record:
   edited after the run, which is a different (and more serious) problem than
   environment drift. Legacy files without a digest are still checked for
   provenance and reported as ``missing`` integrity.
+* **Pre-registration binding** — multi-seed results embed the plan
+  fingerprint and the plan snapshot that ``audit_run`` evaluated them
+  against. The verifier re-hashes the snapshot and compares it with the
+  current registry. A changed SESOI, seed budget, required control, or
+  decision rule after the run is reported as ``registry_drift``; an edited
+  snapshot is ``snapshot_mismatch``. Legacy audits without a fingerprint are
+  reported as ``unbound`` and remain verifiable (with a warning), so the
+  check is backward compatible.
 
 Usage::
 
@@ -34,7 +42,8 @@ Usage::
     python reproducibility.py --identity
 
 Exit codes: ``0`` all checked results reproducible; ``1`` at least one code,
-runtime or content-integrity drift; ``2`` provenance was absent/unverifiable.
+runtime, content-integrity or pre-registration drift; ``2`` provenance or a
+design binding was absent/unverifiable.
 
 The comparison is intentionally conservative: missing evidence is reported
 as unverifiable rather than treated as agreement.
@@ -254,14 +263,198 @@ def compare_provenance(recorded, current=None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Pre-registration binding
+# ---------------------------------------------------------------------------
+
+#: Keys that identify a runtime design audit (``experiment_design.audit_run``)
+#: rather than an arbitrary metadata mapping that happens to contain
+#: ``plan_id``.
+_DESIGN_AUDIT_MARKERS = ('plan_sha256', 'plan_definition', 'planning',
+                         'checks')
+
+
+def extract_design_audit(record) -> dict:
+    """Find the pre-registered design audit embedded in a result payload.
+
+    Runners attach ``experiment_design.audit_run(...)`` under
+    ``metadata.experiment_design``; the ratio sweep also writes it into its
+    sidecar ``provenance.experiment_design`` block. Both layouts are
+    supported, plus a top-level block for ad-hoc records. Returns ``{}``
+    when no recognizable audit exists (a legacy result written before the
+    binding existed).
+    """
+    if not isinstance(record, dict):
+        return {}
+    candidates = []
+    metadata = record.get('metadata')
+    if isinstance(metadata, dict):
+        candidates.append(metadata.get('experiment_design'))
+    candidates.append(record.get('experiment_design'))
+    provenance = record.get('provenance')
+    if isinstance(provenance, dict):
+        candidates.append(provenance.get('experiment_design'))
+    for value in candidates:
+        if isinstance(value, dict) and 'plan_id' in value and any(
+                marker in value for marker in _DESIGN_AUDIT_MARKERS):
+            return value
+    return {}
+
+
+_HEX_DIGEST_LEN = 64
+
+
+def _is_sha256_hex(value) -> bool:
+    if not isinstance(value, str) or len(value) != _HEX_DIGEST_LEN:
+        return False
+    return all(ch in '0123456789abcdef' for ch in value.lower())
+
+
+def compare_design_binding(record) -> dict:
+    """Check the run's embedded plan fingerprint against the registry.
+
+    A runtime audit records the plan it was evaluated against. The audit
+    carries both the fingerprint and a snapshot of the plan definition, so
+    this check can distinguish:
+
+    * ``match`` — the recorded plan is byte-identical (canonically) to the
+      currently registered plan;
+    * ``registry_drift`` — the result was audited against a DIFFERENT plan
+      definition than the one in this checkout (e.g. the SESOI, seed
+      budget, required controls or decision rule changed after the run);
+    * ``snapshot_mismatch`` — the audit's own plan snapshot does not hash to
+      its recorded ``plan_sha256``, so the audit block was edited after the
+      fact;
+    * ``unbound`` / ``missing`` — a legacy audit with no fingerprint /
+      no audit at all. These are warnings only: historical files predate
+      the binding and cannot be retroactively bound;
+    * ``unknown_plan`` / ``registry_unavailable`` / ``malformed`` — the
+      registry cannot currently resolve the plan, so the binding is
+      unverifiable rather than falsely reported as matching.
+
+    Drift matters scientifically: a result labelled ``confirmatory`` under
+    one SESOI/family is not the pre-registered experiment if the registry's
+    SESOI/family changed later. The audit snapshot preserves the original
+    definition even when the current registry no longer matches.
+    """
+    audit = extract_design_audit(record)
+    report = {
+        'status': 'missing',
+        'plan_id': None,
+        'recorded_sha256': None,
+        'snapshot_sha256': None,
+        'current_sha256': None,
+        'scope': None,
+        'has_snapshot': False,
+        'warnings': [],
+        'note': ('the design fingerprint binds a result to the exact '
+                 'pre-registered plan definition it was audited against'),
+    }
+    if not audit:
+        report['warnings'].append(
+            'no pre-registered design audit was found (legacy result); the '
+            'run cannot be tied to a registered plan')
+        return report
+
+    plan_id = audit.get('plan_id')
+    recorded = audit.get('plan_sha256')
+    snapshot = audit.get('plan_definition')
+    scope = audit.get('plan_fingerprint_scope')
+    report['plan_id'] = plan_id if isinstance(plan_id, str) else None
+    report['recorded_sha256'] = (
+        recorded if isinstance(recorded, str) else None)
+    report['has_snapshot'] = isinstance(snapshot, dict)
+    report['scope'] = scope if isinstance(scope, str) else None
+
+    # Import here so a result file can still be checked for provenance when
+    # the planning module is unavailable (e.g. a partial install).
+    try:
+        from experiment_design import (PLANS, PLAN_FINGERPRINT_SCOPE,
+                                        plan_sha256)
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        report['status'] = 'registry_unavailable'
+        report['warnings'].append(
+            f'the pre-registered design registry is unavailable '
+            f'({type(exc).__name__}: {exc}); the binding cannot be checked')
+        return report
+
+    if not isinstance(plan_id, str) or plan_id not in PLANS:
+        report['status'] = 'unknown_plan'
+        report['warnings'].append(
+            f'the audited plan {plan_id!r} is not registered in this '
+            'checkout; the run cannot be tied to a current plan')
+        return report
+
+    if recorded is None:
+        report['status'] = 'unbound'
+        report['warnings'].append(
+            'the design audit carries no plan_sha256 (legacy result); the '
+            'pre-registration cannot be verified')
+        return report
+    if not _is_sha256_hex(recorded):
+        report['status'] = 'malformed'
+        report['warnings'].append(
+            'the design audit carries a malformed plan_sha256; the '
+            'pre-registration cannot be verified')
+        return report
+    recorded = recorded.lower()
+    report['recorded_sha256'] = recorded
+
+    if scope is not None and scope != PLAN_FINGERPRINT_SCOPE:
+        report['status'] = 'malformed'
+        report['warnings'].append(
+            'the recorded plan fingerprint uses an unrecognized scope; the '
+            'digest algorithm may have changed, so the binding is not '
+            'comparable')
+        return report
+
+    if isinstance(snapshot, dict):
+        try:
+            report['snapshot_sha256'] = plan_sha256(snapshot)
+        except Exception as exc:
+            report['status'] = 'malformed'
+            report['warnings'].append(
+                f'the embedded plan snapshot is not hashable '
+                f'({type(exc).__name__}: {exc})')
+            return report
+        if report['snapshot_sha256'] != recorded:
+            report['status'] = 'snapshot_mismatch'
+            report['warnings'].append(
+                'the embedded plan snapshot does not hash to the recorded '
+                'plan_sha256: the audit block was edited after the run')
+            return report
+
+    try:
+        report['current_sha256'] = plan_sha256(plan_id)
+    except Exception as exc:
+        report['status'] = 'registry_unavailable'
+        report['warnings'].append(
+            f'the registered plan could not be hashed '
+            f'({type(exc).__name__}: {exc})')
+        return report
+
+    if report['current_sha256'] != recorded:
+        report['status'] = 'registry_drift'
+        report['warnings'].append(
+            'the registered plan definition changed after this run: the '
+            'recorded SESOI/seed budget/controls/decision rule no longer '
+            'matches the current registry')
+    else:
+        report['status'] = 'match'
+    return report
+
+
 def verify_record(record, current=None) -> dict:
     """Extract the provenance block from ``record`` and compare it.
 
-    The report also carries an ``integrity`` sub-report. A digest mismatch
-    is treated as ``drift`` even when the code and runtime match: the file
-    no longer contains the numbers the recorded run wrote. A missing digest
-    (legacy file) is a warning only, while an unreadable/unsupported digest
-    degrades a would-be ``reproducible`` verdict to ``unverifiable``.
+    The report also carries an ``integrity`` sub-report and a ``design``
+    sub-report. A digest mismatch is treated as ``drift`` even when the code
+    and runtime match: the file no longer contains the numbers the recorded
+    run wrote. A design-fingerprint mismatch is likewise drift, because the
+    result is no longer tied to the registered analysis plan. A missing
+    digest or a legacy unbound audit is a warning only, while an
+    unreadable/unsupported digest or an unresolvable plan degrades a
+    would-be ``reproducible`` verdict to ``unverifiable``.
     """
     report = compare_provenance(extract_provenance(record), current=current)
     try:
@@ -300,6 +493,30 @@ def verify_record(record, current=None) -> dict:
             'numbers cannot be checked for post-hoc edits')
     else:
         report['n_integrity_mismatches'] = 0
+
+    design = compare_design_binding(record)
+    report['design'] = design
+    report['n_design_mismatches'] = 0
+    if design['status'] in ('registry_drift', 'snapshot_mismatch'):
+        report['n_design_mismatches'] = 1
+        report['status'] = 'drift'
+        report['reproducible'] = False
+        report['warnings'].append(
+            'the result is not bound to the pre-registered analysis plan: '
+            'the recorded plan fingerprint differs from the current '
+            'registry or from the audit snapshot')
+    elif design['status'] in ('unverifiable', 'unknown_plan',
+                              'registry_unavailable', 'malformed'):
+        if report['status'] == 'reproducible':
+            report['status'] = 'unverifiable'
+            report['reproducible'] = False
+        report['warnings'].append(
+            f'the pre-registered design binding is {design["status"]}; the '
+            'plan behind this result cannot be verified')
+    else:
+        # ``missing`` / ``unbound`` are legacy-only states and must not
+        # invalidate otherwise-verifiable historical results.
+        report['warnings'].extend(design.get('warnings') or [])
     return report
 
 
@@ -308,6 +525,11 @@ def _format_report(path: str, report: dict) -> str:
     integrity = report.get('integrity')
     if isinstance(integrity, dict):
         lines.append(f'  integrity: {integrity.get("status", "unknown")}')
+    design = report.get('design')
+    if isinstance(design, dict):
+        plan = design.get('plan_id') or '-'
+        lines.append(
+            f'  design:    {design.get("status", "unknown")} (plan={plan})')
     for name, check in report.get('checks', {}).items():
         if check['status'] == 'match':
             continue

@@ -204,7 +204,20 @@ def _write_experiment_design_manifest(profile: str) -> dict:
               'blocked, but fix these before citing it:')
         for error in design_errors:
             print(f'  - {error}')
-    manifest = experiment_design.design_manifest(seeds_by_plan=design_seeds)
+    # Bind the pre-registration to the tree/runtime that writes it. Imported
+    # lazily because experiment_design itself is stdlib-only; if provenance
+    # capture fails the manifest is still written (planning must not depend
+    # on torch), but the failure is visible in the run log.
+    try:
+        from kaggle_setup import capture_provenance
+        design_provenance = capture_provenance()
+    except Exception as exc:  # pragma: no cover - defensive
+        design_provenance = None
+        print(f'[run_all] WARNING: could not capture design provenance '
+              f'({type(exc).__name__}: {exc}); the design manifest will not '
+              f'be bound to a source revision')
+    manifest = experiment_design.design_manifest(
+        seeds_by_plan=design_seeds, provenance=design_provenance)
     experiment_design.write_design_manifest(
         'results/experiment_design.json', manifest=manifest)
     for row in manifest['results']:
@@ -215,15 +228,18 @@ def _write_experiment_design_manifest(profile: str) -> dict:
               f"power={plan['planned_power']} "
               f"status={row['status']} "
               f"eq_n={eq.get('required_seeds_at_zero', '-')} "
-              f"eq_status={eq.get('status', '-')}")
+              f"eq_status={eq.get('status', '-')} "
+              f"plan_sha={row['plan_sha256'][:12]}")
     return {
         'path': 'results/experiment_design.json',
         'run_profile': profile,
         'validation_errors': design_errors,
+        'provenance_captured': design_provenance is not None,
         'plans': {
             row['plan_id']: {
                 'n_seeds': row['n_seeds'],
                 'status': row['status'],
+                'plan_sha256': row['plan_sha256'],
                 'required_seeds': row['planning']['required_seeds'],
                 'planned_power': row['planning']['planned_power'],
                 'equivalence_required_seeds': (

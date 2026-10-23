@@ -31,7 +31,7 @@ each one, records:
 * the stopping rule (fixed n, no optional stopping, no replacing failed
   seeds) and the decision rule.
 
-Two things follow from that registry:
+Three things follow from that registry:
 
 1. :func:`planning_report` computes the prospective required seed count and
    the power the current budget would actually have. A plan whose
@@ -46,6 +46,12 @@ Two things follow from that registry:
    metadata, so neither a 5-seed screening run nor a run that silently
    dropped failed seeds can be mistaken for the pre-registered confirmatory
    experiment.
+3. :func:`plan_sha256` fingerprints the canonical plan definition and
+   :func:`audit_run` carries both the fingerprint and a plan snapshot. A
+   result can therefore be checked against the registry after the fact
+   (``reproducibility.compare_design_binding``): changing the SESOI, seed
+   budget, required controls or decision rule after a run is detectable,
+   not just a silent code edit.
 
 The distinction between the REQUESTED seed block and the seeds that
 actually entered the analysis matters. A training run that crashes, diverges
@@ -94,6 +100,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import hashlib
 import json
 import math
 import os
@@ -110,6 +117,7 @@ __all__ = [
     'PLANS',
     'PLAN_IDS',
     'get_plan',
+    'plan_sha256',
     'validate_plan',
     'validate_plans',
     'planning_report',
@@ -567,6 +575,46 @@ def get_plan(plan_id: str) -> dict:
         raise DesignError(f'unknown experiment plan {plan_id!r}; valid ids: '
                           f'{list(PLANS)}')
     return copy.deepcopy(PLANS[plan_id])
+
+
+#: Scope string stored next to every plan fingerprint. It documents exactly
+#: what the digest covers so a reader does not have to guess the canonical
+#: form. Changing the scope is a breaking change: bump the version suffix.
+PLAN_FINGERPRINT_SCOPE = (
+    'sha256 of the canonical JSON (sorted keys, compact separators, UTF-8, '
+    'strict numbers) of one pre-registered plan dictionary')
+
+
+def plan_sha256(plan) -> str:
+    """Stable SHA-256 fingerprint of a pre-registered plan definition.
+
+    ``plan`` may be a plan id or the plan dict itself. The digest is
+    canonical (sorted keys, compact separators, strict JSON), so key order
+    and pretty-printing do not change it, while ANY semantic change to the
+    plan -- SESOI, assumed SD, seed budget, required controls, analysis or
+    decision rule -- does.
+
+    The fingerprint is embedded in every runtime audit and in the
+    prospective design manifest. It turns "the plan was pre-registered" into
+    a checkable claim: a result recorded under a different plan definition
+    can be detected after the fact, even though the registry is code and can
+    be edited. Use :func:`reproducibility.compare_design_binding` to check a
+    result file against the current registry.
+
+    Raises :class:`DesignError` for an unknown plan id or a plan that is not
+    a JSON object with strict (finite, JSON-native) values.
+    """
+    if isinstance(plan, str):
+        plan = get_plan(plan)
+    if not isinstance(plan, dict):
+        raise DesignError(
+            f'plan must be a plan id or a dict, got {type(plan).__name__}')
+    try:
+        canonical = json.dumps(plan, sort_keys=True, separators=(',', ':'),
+                               allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise DesignError(f'plan is not strict JSON: {exc}') from None
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
 def validate_plan(plan) -> list[str]:
@@ -1493,6 +1541,13 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             plan, seeds=n_analyzed, family_size=family_size, sd=sd)
     return {
         'plan_id': plan_id,
+        # Content fingerprint of the plan this run was audited against. The
+        # full definition travels with the audit so a reader can see the
+        # registered SESOI/controls/decision rule without the historical
+        # checkout, and can re-hash it independently.
+        'plan_sha256': plan_sha256(plan),
+        'plan_fingerprint_scope': PLAN_FINGERPRINT_SCOPE,
+        'plan_definition': plan,
         'status': status,
         'n_seeds': n_seeds,
         'n_analyzed': n_analyzed,
@@ -1931,13 +1986,27 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
 # Manifest and CLI
 # ---------------------------------------------------------------------------
 
-def design_manifest(plan_ids=None, *, seeds_by_plan=None) -> dict:
+def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> dict:
     """Build a versioned, JSON-safe manifest of the registered plans.
 
     ``seeds_by_plan`` maps plan id -> an explicit seed list or a seed
     COUNT. Overrides are recorded in the manifest next to the plan so the
     audit is reproducible. The manifest is intentionally not an experiment
     result with row contracts: it records the plan, not measurements.
+
+    ``provenance`` is the optional ``capture_provenance()`` block captured
+    at the moment the manifest is written. Supplying it binds the
+    pre-registration to the exact working tree and runtime that produced
+    it. It is an explicit argument rather than an internal import so this
+    module stays stdlib-only and usable before torch is installed; callers
+    that already have :mod:`kaggle_setup` (e.g. ``run_all``) pass it in.
+
+    Every row also carries ``plan_sha256`` (the same fingerprint that
+    :func:`audit_run` embeds in each result file), so the prospective
+    manifest and the retrospective audit can be matched mechanically. The
+    fingerprint covers the REGISTERED plan definition; per-invocation seed
+    overrides remain visible in the row's ``seeds`` / ``n_seeds`` fields and
+    are not part of the registry identity.
     """
     ids = list(PLAN_IDS if plan_ids is None else plan_ids)
     unknown = [p for p in ids if p not in PLANS]
@@ -1947,6 +2016,19 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None) -> dict:
     unknown = [p for p in overrides if p not in PLANS]
     if unknown:
         raise DesignError(f'seeds_by_plan names unknown plan(s) {unknown!r}')
+    if provenance is not None:
+        if not isinstance(provenance, dict):
+            raise DesignError(
+                'provenance must be the dict returned by '
+                f'capture_provenance(), got {type(provenance).__name__}')
+        try:
+            # Reject NaN/Inf or non-JSON values now: the manifest is written
+            # with allow_nan=False and a failure at write time would lose the
+            # pre-registration that is supposed to exist BEFORE the run.
+            json.dumps(provenance, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise DesignError(f'provenance is not strict JSON: {exc}') from None
+        provenance = copy.deepcopy(provenance)
     rows = []
     for plan_id in ids:
         plan = get_plan(plan_id)
@@ -1956,33 +2038,41 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None) -> dict:
         row = dict(plan)
         row['seeds'] = seed_list
         row['n_seeds'] = len(seed_list)
+        row['plan_sha256'] = plan_sha256(plan)
+        row['plan_fingerprint_scope'] = PLAN_FINGERPRINT_SCOPE
         row['planning'] = planning
         row['status'] = planning['status']
         rows.append(row)
+    metadata = {
+        'generated_by': 'experiment_design.design_manifest',
+        'seed_base': DEFAULT_SEED_BASE,
+        'note': ('Registry of the pre-registered multi-seed designs. '
+                 'planning is prospective (SESOI + assumed SD + '
+                 'corrected alpha), not post-hoc. A run whose audit '
+                 'status is screening is not confirmatory.'),
+        'method': ('normal approximation for planning only; inference '
+                   'uses multi_seed_stats exact sign/permutation and '
+                   't tests'),
+        'plan_fingerprint_scope': PLAN_FINGERPRINT_SCOPE,
+    }
+    if provenance is not None:
+        metadata['provenance'] = provenance
     return {
         'schema_version': '1.0',
         'kind': 'experiment_design',
         'created_utc': _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        'metadata': {
-            'generated_by': 'experiment_design.design_manifest',
-            'seed_base': DEFAULT_SEED_BASE,
-            'note': ('Registry of the pre-registered multi-seed designs. '
-                     'planning is prospective (SESOI + assumed SD + '
-                     'corrected alpha), not post-hoc. A run whose audit '
-                     'status is screening is not confirmatory.'),
-            'method': ('normal approximation for planning only; inference '
-                       'uses multi_seed_stats exact sign/permutation and '
-                       't tests'),
-        },
+        'metadata': metadata,
         'results': rows,
     }
 
 
 def write_design_manifest(path: str, *, plan_ids=None,
-                          seeds_by_plan=None, manifest=None) -> str:
+                          seeds_by_plan=None, manifest=None,
+                          provenance=None) -> str:
     """Atomically write a design manifest (strict JSON) and return the path."""
     if manifest is None:
-        manifest = design_manifest(plan_ids, seeds_by_plan=seeds_by_plan)
+        manifest = design_manifest(plan_ids, seeds_by_plan=seeds_by_plan,
+                                   provenance=provenance)
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)

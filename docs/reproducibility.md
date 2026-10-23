@@ -62,8 +62,8 @@ Exit codes are part of the contract:
 | Code | Meaning |
 |---:|---|
 | `0` | every checked result matches this checkout |
-| `1` | at least one code or numerical-runtime field drifted |
-| `2` | provenance is absent, unreadable, or cannot be verified |
+| `1` | at least one code, numerical-runtime, content-integrity or pre-registration field drifted |
+| `2` | provenance or a design binding is absent, unreadable, or cannot be verified |
 
 The verifier separates three severities:
 
@@ -81,6 +81,15 @@ A dirty run that has a source digest is verifiable by content: if the digest
 matches, the exact uncommitted code is present. A dirty run **without** a
 source digest is reported as `unverifiable`, because the commit hash cannot
 reconstruct it.
+
+The report also carries a `design:` line for multi-seed results. The runtime
+audit embeds the canonical fingerprint and a snapshot of the pre-registered
+plan it was evaluated against; the verifier re-hashes the snapshot and
+compares it with the current registry. A post-hoc change to the SESOI, seed
+budget, required controls, analysis family, or decision rule is
+`registry_drift` (exit `1`); an edited snapshot is `snapshot_mismatch` (exit
+`1`); a legacy audit without a fingerprint is `unbound` (warning only).
+See [preregistration-binding.md](preregistration-binding.md).
 
 ## Result content integrity
 

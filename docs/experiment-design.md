@@ -299,9 +299,36 @@ pilot.
 `run_all.py` writes `results/experiment_design.json` before any experiment
 starts. It records the actual seed budget planned for each experiment in this
 pipeline invocation (`MQAR_SEEDS`, `ABL_SEEDS`, `MECH_SEEDS`), the required n
-at the declared SESOI, and the resulting status. This is a provenance artifact:
-if the plan is edited after the run, the committed manifest no longer matches
-the result metadata.
+at the declared SESOI, the resulting status, and a canonical `plan_sha256`
+per row. When provenance capture succeeds it also embeds the
+`capture_provenance()` block, binding the pre-registration to the working
+tree and runtime that wrote it. This is a provenance artifact: if the plan is
+edited after the run, the committed manifest and the result metadata no
+longer agree.
+
+## Binding a result to the plan it was audited against
+
+The audit's status alone does not show *which* plan definition produced it,
+and the registry is code that can be edited after a run. `audit_run()`
+therefore records the same canonical `plan_sha256`, its documented scope, and
+a full `plan_definition` snapshot in every result that embeds the audit.
+`reproducibility.compare_design_binding()` re-hashes the snapshot and compares
+it with the current registry: a post-hoc change to the SESOI, seed budget,
+required controls, analysis family, or decision rule is reported as
+`registry_drift` (exit 1), and an edited snapshot as `snapshot_mismatch`.
+Legacy results without a fingerprint stay readable and are reported as
+`unbound` with a warning.
+
+```bash
+# The design: line is added to the usual provenance/integrity report.
+python reproducibility.py results/exp4_mqar.json
+```
+
+See [preregistration-binding.md](preregistration-binding.md) for the field
+contract and the full status table. The snapshot is evidence of the plan
+content, not a cryptographic signature; the before-the-run ordering still
+comes from the committed history and from `run_all.py` writing the manifest
+before any experiment starts.
 
 ## CLI
 
