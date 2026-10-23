@@ -170,14 +170,14 @@ def test_chunked_boundary_metadata():
                 f"{md['scan_levels']}) model=({br['n_chunks']},"
                 f"{br['padded_len']},{br['scan_levels']})")
 
-    for bad in (-1, 1.5, True, None):
+    for bad in (-1, 1.5, True, None, 10 ** 400):
         try:
             mamba2_scan_boundary_metadata(bad, chunk_size=4)
         except ValueError:
             pass
         else:
             _ok(f'seqlen={bad!r} rejected', False, 'no error raised')
-    for bad in (0, -1, 1.5, True, None):
+    for bad in (0, -1, 1.5, True, None, 10 ** 400):
         try:
             mamba2_scan_boundary_metadata(8, chunk_size=bad)
         except ValueError:
@@ -409,14 +409,15 @@ def test_chunked_validation_rejections():
     _raises_all(x, dt, Bm, Cm, A, D, 'initial_state shape',
                 initial_state=S0[:, :, :, :d_state - 1])
     # chunk_size contract (chunked path only).
-    for bad in (0, -1, 1.5, True, None):
+    for bad in (0, -1, 1.5, True, None, 10 ** 400):
         try:
             chunked_mamba2_scan(x, dt, Bm, Cm, A, D, chunk_size=bad)
         except ValueError:
             pass
         else:
             _ok(f'chunk_size={bad!r} rejected', False, 'no error raised')
-    _ok('all bad chunk_size values rejected', True, '0,-1,1.5,True,None')
+    _ok('all bad chunk_size values rejected', True,
+        '0,-1,1.5,True,None,10**400')
 
 
 # --- scan core ------------------------------------------------------------

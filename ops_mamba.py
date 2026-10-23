@@ -924,11 +924,23 @@ def mamba2_scan_boundary_metadata(
         raise ValueError(
             f"mamba2_scan_boundary_metadata: seqlen={seqlen!r} must be a "
             f"non-negative int.")
+    try:
+        float(seqlen)
+    except OverflowError:
+        raise ValueError(
+            f"mamba2_scan_boundary_metadata: seqlen={seqlen!r} must be "
+            f"representable as a finite float.") from None
     if (isinstance(chunk_size, bool) or not isinstance(chunk_size, int)
             or chunk_size < 1):
         raise ValueError(
             f"mamba2_scan_boundary_metadata: chunk_size={chunk_size!r} must "
             f"be a positive int.")
+    try:
+        float(chunk_size)
+    except OverflowError:
+        raise ValueError(
+            f"mamba2_scan_boundary_metadata: chunk_size={chunk_size!r} must "
+            f"be representable as a finite float.") from None
     n_chunks = ((seqlen + chunk_size - 1) // chunk_size) if seqlen else 0
     padded_len = n_chunks * chunk_size
     levels = math.ceil(math.log2(n_chunks)) if n_chunks > 1 else 0
@@ -1023,6 +1035,12 @@ def chunked_mamba2_scan(
         raise ValueError(
             f"chunked_mamba2_scan: chunk_size={chunk_size!r} must be a "
             f"positive int.")
+    try:
+        float(chunk_size)
+    except OverflowError:
+        raise ValueError(
+            f"chunked_mamba2_scan: chunk_size={chunk_size!r} must be "
+            f"representable as a finite float.") from None
     v = _validate_mamba2_scan_inputs(
         x, dt, B, C, A, D, initial_state, 'chunked_mamba2_scan')
     batch, seqlen = v['batch'], v['seqlen']
