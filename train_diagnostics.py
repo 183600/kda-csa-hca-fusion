@@ -100,6 +100,46 @@ def _finite_float_or_none(value):
         return None
     return number if math.isfinite(number) else None
 
+
+def _weighted_mean(pairs):
+    """Weighted mean of ``(value, weight)`` pairs without overflowing.
+
+    ``sum(value * weight)`` can overflow for finite values near the float
+    limit even though the weighted mean is representable. The ordinary
+    path is kept for in-range data; the scaled path evaluates the same
+    ratio when the raw sum is infinite.
+    """
+    pairs = [(value, weight) for value, weight in pairs
+             if weight and value is not None and math.isfinite(value)]
+    total_weight = sum(weight for _, weight in pairs)
+    if not total_weight:
+        return None
+    try:
+        total_weight_float = float(total_weight)
+    except OverflowError:
+        total_weight_float = None
+    if total_weight_float is not None:
+        try:
+            total = sum(value * weight for value, weight in pairs)
+        except OverflowError:
+            total = float('inf')
+        if math.isfinite(total):
+            return total / total_weight_float
+    # Scale both axes before forming the ratio so neither a huge weight nor
+    # a huge value can overflow the intermediate sum.
+    value_scale = max(abs(value) for value, _ in pairs)
+    if value_scale == 0.0:
+        return 0.0
+    weight_scale = max(weight for _, weight in pairs)
+    numerator = math.fsum(
+        (value / value_scale) * (weight / weight_scale)
+        for value, weight in pairs)
+    denominator = math.fsum(weight / weight_scale for _, weight in pairs)
+    if denominator == 0.0:
+        return None
+    mean = value_scale * (numerator / denominator)
+    return mean if math.isfinite(mean) else None
+
 # --------------------------------------------------------------------------
 # 1. Systematic NaN/Inf triage
 # --------------------------------------------------------------------------
@@ -968,26 +1008,20 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
                 ca = conf_acc.setdefault(c, {
                     'n_scored': 0,
                     'n_confident_wrong': 0,
-                    'sum_pred_prob': 0.0,
-                    'sum_target_prob': 0.0,
-                    'sum_margin': 0.0,
-                    'sum_entropy_ratio': 0.0,
+                    'pred_prob': [],
+                    'target_prob': [],
+                    'margin': [],
+                    'entropy_ratio': [],
                 })
                 ca['n_scored'] += n_scored
                 ca['n_confident_wrong'] += int(
                     conf.get('n_confident_wrong', 0) or 0)
-                ca['sum_pred_prob'] += (
-                    (_finite_float_or_none(conf.get('mean_pred_prob'))
-                     or 0.0) * n_scored)
-                ca['sum_target_prob'] += (
-                    (_finite_float_or_none(conf.get('mean_target_prob'))
-                     or 0.0) * n_scored)
-                ca['sum_margin'] += (
-                    (_finite_float_or_none(conf.get('mean_margin'))
-                     or 0.0) * n_scored)
-                ca['sum_entropy_ratio'] += (
-                    (_finite_float_or_none(conf.get('mean_entropy_ratio'))
-                     or 0.0) * n_scored)
+                for key in ('pred_prob', 'target_prob', 'margin',
+                            'entropy_ratio'):
+                    value = _finite_float_or_none(
+                        conf.get(f'mean_{key}'))
+                    if value is not None:
+                        ca[key].append((value, n_scored))
     for v in pooled.values():
         v['rate_of_wrong'] = (v['count'] / n_wrong) if n_wrong else 0.0
         v['rate_of_all'] = (v['count'] / n_samples) if n_samples else 0.0
@@ -997,10 +1031,10 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
             'n_scored': int(n),
             'n_confident_wrong': int(ca['n_confident_wrong']),
             'rate_confident_wrong': ca['n_confident_wrong'] / n,
-            'mean_pred_prob': ca['sum_pred_prob'] / n,
-            'mean_target_prob': ca['sum_target_prob'] / n,
-            'mean_margin': ca['sum_margin'] / n,
-            'mean_entropy_ratio': ca['sum_entropy_ratio'] / n,
+            'mean_pred_prob': _weighted_mean(ca['pred_prob']),
+            'mean_target_prob': _weighted_mean(ca['target_prob']),
+            'mean_margin': _weighted_mean(ca['margin']),
+            'mean_entropy_ratio': _weighted_mean(ca['entropy_ratio']),
         }
     n_scored_all = sum(ca['n_scored'] for ca in conf_acc.values())
     confidence_summary = None
@@ -1010,14 +1044,18 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
             'n_scored_wrong': int(n_scored_all),
             'n_confident_wrong': int(n_conf),
             'rate_confident_wrong': n_conf / n_scored_all,
-            'mean_pred_prob': (sum(ca['sum_pred_prob']
-                                   for ca in conf_acc.values())
-                               / n_scored_all),
-            'mean_target_prob': (sum(ca['sum_target_prob']
-                                     for ca in conf_acc.values())
-                                 / n_scored_all),
-            'mean_margin': (sum(ca['sum_margin']
-                                for ca in conf_acc.values()) / n_scored_all),
+            'mean_pred_prob': _weighted_mean(
+                [(v, w) for ca in conf_acc.values()
+                 for v, w in ca['pred_prob']]),
+            'mean_target_prob': _weighted_mean(
+                [(v, w) for ca in conf_acc.values()
+                 for v, w in ca['target_prob']]),
+            'mean_margin': _weighted_mean(
+                [(v, w) for ca in conf_acc.values()
+                 for v, w in ca['margin']]),
+            'mean_entropy_ratio': _weighted_mean(
+                [(v, w) for ca in conf_acc.values()
+                 for v, w in ca['entropy_ratio']]),
             'note': ('Pooled confidence over every analyzed wrong sample: '
                      'high values mean the failures are confident blind '
                      'spots rather than ambiguous near-ties.'),

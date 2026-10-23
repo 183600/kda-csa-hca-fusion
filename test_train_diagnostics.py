@@ -400,6 +400,19 @@ def test_oversized_json_integers_are_skipped_by_tradeoff_and_pooling():
     assert math.isfinite(pooled['confidence']['mean_pred_prob'])
     json.dumps(pooled, allow_nan=False)
 
+    # Finite extreme confidence values times large sample counts must not
+    # overflow the pooled weighted sum to inf.
+    extreme = pool_error_analyses([
+        seed(1, 0.5, {'n_scored': 10 ** 9, 'n_confident_wrong': 1,
+                      'mean_pred_prob': 1e308, 'mean_target_prob': 1e308,
+                      'mean_margin': 1e308, 'mean_entropy_ratio': 1e308}),
+        seed(2, 0.4, {'n_scored': 10 ** 9, 'n_confident_wrong': 1,
+                      'mean_pred_prob': 1e308, 'mean_target_prob': 1e308,
+                      'mean_margin': 1e308, 'mean_entropy_ratio': 1e308}),
+    ])
+    assert extreme['confidence']['mean_pred_prob'] == 1e308
+    json.dumps(extreme, allow_nan=False)
+
 
 def test_nonfinite_triage_names_first_failing_stage_and_gradient_triage():
     bad = torch.tensor([float('nan'), 1.0])
