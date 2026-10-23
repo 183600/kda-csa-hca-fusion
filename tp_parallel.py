@@ -120,6 +120,14 @@ def _validate_tp_size(tp_size: int) -> None:
     if tp_size < 1:
         raise ValueError(
             f'tp_parallel: tp_size={tp_size} must be >= 1.')
+    try:
+        float(tp_size)
+    except OverflowError:
+        # JSON integers are unbounded; the ring-volume term divides by the
+        # degree in float arithmetic, so an unrepresentable size is invalid.
+        raise ValueError(
+            f'tp_parallel: tp_size={tp_size!r} must be representable as a '
+            f'finite float.') from None
 
 
 def _validate_cfg(cfg: HybridConfig) -> None:
@@ -1087,6 +1095,12 @@ def layer_flops_split(cfg: HybridConfig, kind: str, T: int) -> dict:
     if isinstance(T, bool) or not isinstance(T, int) or T < 0:
         raise ValueError(
             f'layer_flops_split: T={T!r} must be a non-negative int.')
+    try:
+        float(T)
+    except OverflowError:
+        raise ValueError(
+            f'layer_flops_split: T={T!r} must be representable as a finite '
+            f'float.') from None
     cfg_d, H, K, V = cfg.d_model, cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v
     HV = cfg.n_heads_v
     if kind == 'kda':
@@ -1351,12 +1365,21 @@ def ring_allreduce_ms(nbytes: float, tp_size: int,
     ``2(P-1)`` ring steps.  ``P == 1`` has no communication.
     """
     _validate_tp_size(tp_size)
-    if nbytes < 0:
+    if isinstance(nbytes, bool) or not isinstance(nbytes, (int, float)):
+        raise ValueError(
+            f'ring_allreduce_ms: nbytes={nbytes!r} must be a real number.')
+    try:
+        nbytes_value = float(nbytes)
+    except OverflowError:
+        raise ValueError(
+            f'ring_allreduce_ms: nbytes={nbytes!r} must be representable as '
+            f'a finite float.') from None
+    if nbytes_value < 0:
         raise ValueError(
             f'ring_allreduce_ms: nbytes={nbytes} must be >= 0.')
-    if tp_size == 1 or nbytes == 0:
+    if tp_size == 1 or nbytes_value == 0:
         return 0.0
-    volume = 2.0 * (tp_size - 1) / tp_size * nbytes
+    volume = 2.0 * (tp_size - 1) / tp_size * nbytes_value
     bandwidth_ms = volume / (hardware.link_bw_gbps * 1e9) * 1e3
     latency_ms = 2.0 * (tp_size - 1) * hardware.allreduce_latency_us * 1e-3
     return bandwidth_ms + latency_ms

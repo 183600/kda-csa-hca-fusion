@@ -348,6 +348,16 @@ def test_tp_latency_sweep_invariants():
                    {'allreduce_latency_us': huge}, {'itemsize': huge}):
         with pytest.raises(ValueError):
             tp.HardwareModel(**kwargs)
+    # The communication/FLOP helpers feed these same integers into float
+    # arithmetic: an unrepresentable value must be a ValueError, not an
+    # OverflowError leaking from ``2.0 * (P - 1)`` or ``float(T)``.
+    hw = tp.HardwareModel()
+    with pytest.raises(ValueError):
+        tp.ring_allreduce_ms(huge, 2, hw)
+    with pytest.raises(ValueError):
+        tp.ring_allreduce_ms(1, huge, hw)
+    with pytest.raises(ValueError):
+        tp.layer_flops_split(cfg, 'kda', huge)
 
 
 def test_hardware_from_gpu_cpu_fallback(monkeypatch):
