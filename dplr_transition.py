@@ -302,6 +302,17 @@ def kda_chunk_factors(k: torch.Tensor, g: torch.Tensor,
     kc, nt = _reshape_chunks(k, chunk_size, 0.0, time_dim=-3)
     gc, _ = _reshape_chunks(g, chunk_size, 0.0, time_dim=-3)
     bc, _ = _reshape_chunks(beta, chunk_size, 0.0, time_dim=-2)
+    if nt == 0:
+        # Empty sequence: there is no chunk to compose.  ``torch.stack``
+        # rejects an empty list, so return the naturally shaped empty
+        # factors (zero chunks, zero-width rank) instead.  ``kc`` is
+        # ``[B, NT, C, H, K]`` here, so the documented factor layout
+        # ``[B, H, NT, K, r]`` is assembled from the batch/head/dim axes.
+        lead = (kc.shape[0], kc.shape[-2], 0)
+        dim = kc.shape[-1]
+        return (kc.new_empty(*lead, dim),
+                kc.new_empty(*lead, dim, 0),
+                kc.new_empty(*lead, dim, 0))
     diag_list, left_list, right_list = [], [], []
     for n in range(nt):
         diag = None
@@ -341,6 +352,13 @@ def rwkv7_chunk_factors(w: torch.Tensor, kk: torch.Tensor,
     wc, nt = _reshape_chunks(w, chunk_size, 1.0, time_dim=-2)
     kkc, _ = _reshape_chunks(kk, chunk_size, 0.0, time_dim=-2)
     kkac, _ = _reshape_chunks(kka, chunk_size, 0.0, time_dim=-2)
+    if nt == 0:
+        # Empty sequence: no chunk map to compose (see the KDA counterpart).
+        lead = wc.shape[:-3] + (0,)
+        dim = wc.shape[-1]
+        return (wc.new_empty(*lead, dim),
+                wc.new_empty(*lead, dim, 0),
+                wc.new_empty(*lead, dim, 0))
     diag_list, left_list, right_list = [], [], []
     for n in range(nt):
         diag = None

@@ -223,6 +223,31 @@ def test_rwkv7_chunk_factors_place_the_chunk_axis_before_the_key_axis(device):
         rtol=1e-12, atol=1e-12)
 
 
+def test_chunk_factors_handle_an_empty_sequence(device):
+    """``T == 0`` has no chunks; return empty factors instead of stacking []."""
+    b, h, k = 2, 3, 5
+    kk = torch.zeros(b, 0, h, k, dtype=torch.float64)
+    g = torch.zeros(b, 0, h, k, dtype=torch.float64)
+    beta = torch.zeros(b, 0, h, dtype=torch.float64)
+    dc, lc, rc = D.kda_chunk_factors(kk, g, beta, 4)
+    assert dc.shape == (b, h, 0, k)
+    assert lc.shape == rc.shape == (b, h, 0, k, 0)
+    assert dc.dtype == lc.dtype == rc.dtype == torch.float64
+    assert D.effective_rank(lc, rc) == 0
+
+    w = torch.ones(b, h, 0, k, dtype=torch.float64)
+    d, left, right = D.rwkv7_chunk_factors(w, kk, kk, 4)
+    assert d.shape == (b, h, 0, k)
+    assert left.shape == right.shape == (b, h, 0, k, 0)
+
+    # The reduced 2-D form must preserve the same lead/rank layout.
+    w2 = torch.ones(0, k, dtype=torch.float64)
+    z2 = torch.zeros(0, k, dtype=torch.float64)
+    d2, l2, r2 = D.rwkv7_chunk_factors(w2, z2, z2, 4)
+    assert d2.shape == (0, k)
+    assert l2.shape == r2.shape == (0, k, 0)
+
+
 def test_certificate_matches_the_wy_construction_over_a_regression_matrix(
         device):
     cases = [
