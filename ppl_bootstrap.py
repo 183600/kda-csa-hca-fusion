@@ -90,8 +90,14 @@ def _ppl_from_mean_nll(mean_nll: float) -> float:
 
 def _validate_boot_args(alpha: float, n_boot: int,
                         seed: int | None = None) -> None:
-    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
-            or not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
+    try:
+        alpha_value = float(alpha)
+    except OverflowError:
+        raise ValueError(
+            f'alpha must be in (0, 1), got {alpha!r}') from None
+    if not math.isfinite(alpha_value) or not 0.0 < alpha_value < 1.0:
         raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
     if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
         raise ValueError(f'n_boot must be >= 1, got {n_boot!r}')

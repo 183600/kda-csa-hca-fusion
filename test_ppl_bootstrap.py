@@ -124,7 +124,7 @@ def test_bootstrap_ci_deterministic_rng_isolated_and_nested():
     for bad_n_boot in (True, 1.5, '10'):
         with pytest.raises(ValueError):
             P.bootstrap_ppl_ci(units, n_boot=bad_n_boot)
-    for bad_alpha in (True, float('nan'), '0.05'):
+    for bad_alpha in (True, float('nan'), '0.05', 10 ** 400):
         with pytest.raises(ValueError):
             P.bootstrap_ppl_ci(units, alpha=bad_alpha)
 
