@@ -102,6 +102,15 @@ def test_size_study_rows_and_diagnostics():
     except ValueError:
         raised = True
     _ok('missing/invalid tolerance is rejected', raised, '')
+    for bad in ({'n_pairs': 5, 'tol': 10 ** 400},
+                {'n_pairs': 5, 'tol': 0.05, 'alpha': 10 ** 400},
+                {'n_pairs': 5, 'tol': 0.05, 'noise_sd': 10 ** 400}):
+        raised = False
+        try:
+            mc.size_study([bad], reps=2)
+        except ValueError:
+            raised = True
+        _ok(f'oversized scenario scalar rejected: {bad}', raised, '')
 
 
 def test_conservative_size_verdict_is_reachable_and_accepted():
@@ -157,6 +166,16 @@ def test_coverage_and_power_rows():
     _ok('power rows record their floor',
         all(r['min_power'] == r['threshold'] if 'threshold' in r
             else r['min_power'] > 0 for r in pow_rows), '')
+    for bad in ({'n_pairs': 10, 'effect': 10 ** 400, 'min_power': 0.8},
+                {'n_pairs': 10, 'effect': 0.5, 'min_power': 10 ** 400},
+                {'n_pairs': 10, 'effect': 0.5, 'min_power': 0.8,
+                 'alpha': 10 ** 400}):
+        raised = False
+        try:
+            mc.power_study([bad], reps=2)
+        except ValueError:
+            raised = True
+        _ok(f'oversized power scalar rejected: {bad}', raised, '')
 
 
 def test_report_is_json_safe_and_gate_consistent():

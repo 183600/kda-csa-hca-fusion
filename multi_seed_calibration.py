@@ -68,6 +68,13 @@ def _is_finite_real(value) -> bool:
     except (OverflowError, ValueError):
         return False
 
+
+def _study_float(value, label: str) -> float:
+    """Convert a JSON-sourced scenario scalar or reject it as non-finite."""
+    if not _is_finite_real(value):
+        raise ValueError(f'{label} must be finite, got {value!r}')
+    return float(value)
+
 __all__ = [
     'simulate_paired_diffs',
     'size_study',
@@ -210,14 +217,14 @@ def size_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
     for s_i, scenario in enumerate(scenarios):
         n_pairs = _require_int(scenario['n_pairs'], f'scenario {s_i} n_pairs',
                                minimum=2)
-        alpha = float(scenario.get('alpha', DEFAULT_ALPHA))
-        tol = float(scenario['tol'])
+        alpha = _study_float(scenario.get('alpha', DEFAULT_ALPHA), f'scenario {s_i} alpha')
+        tol = _study_float(scenario['tol'], f'scenario {s_i} tol')
         if not (0.0 < alpha < 1.0):
             raise ValueError(f'scenario {s_i}: alpha must be in (0, 1)')
         if not (math.isfinite(tol) and tol > 0.0):
             raise ValueError(f'scenario {s_i}: tol must be positive')
         distribution = str(scenario.get('distribution', 'normal'))
-        noise_sd = float(scenario.get('noise_sd', DEFAULT_NOISE_SD))
+        noise_sd = _study_float(scenario.get('noise_sd', DEFAULT_NOISE_SD), f'scenario {s_i} noise_sd')
         diagnostics = set(scenario.get('diagnostic_methods', ()))
         name = str(scenario.get('name', f'{distribution}_n{n_pairs}'))
         counts = {m: 0 for m in SIZE_METHODS}
@@ -279,15 +286,15 @@ def coverage_study(scenarios, *, reps=DEFAULT_REPS, n_boot=DEFAULT_NBOOT,
     for s_i, scenario in enumerate(scenarios):
         n_pairs = _require_int(scenario['n_pairs'], f'scenario {s_i} n_pairs',
                                minimum=2)
-        alpha = float(scenario.get('alpha', DEFAULT_ALPHA))
-        tol = float(scenario['tol'])
+        alpha = _study_float(scenario.get('alpha', DEFAULT_ALPHA), f'scenario {s_i} alpha')
+        tol = _study_float(scenario['tol'], f'scenario {s_i} tol')
         if not (0.0 < alpha < 1.0):
             raise ValueError(f'scenario {s_i}: alpha must be in (0, 1)')
         if not (math.isfinite(tol) and tol > 0.0):
             raise ValueError(f'scenario {s_i}: tol must be positive')
         distribution = str(scenario.get('distribution', 'normal'))
-        noise_sd = float(scenario.get('noise_sd', DEFAULT_NOISE_SD))
-        effect = float(scenario.get('effect', 0.5))
+        noise_sd = _study_float(scenario.get('noise_sd', DEFAULT_NOISE_SD), f'scenario {s_i} noise_sd')
+        effect = _study_float(scenario.get('effect', 0.5), f'scenario {s_i} effect')
         name = str(scenario.get('name', f'{distribution}_n{n_pairs}'))
         diagnostic = bool(scenario.get('diagnostic', False))
         n_covered = 0
@@ -346,9 +353,10 @@ def power_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
     for s_i, scenario in enumerate(scenarios):
         n_pairs = _require_int(scenario['n_pairs'], f'scenario {s_i} n_pairs',
                                minimum=2)
-        alpha = float(scenario.get('alpha', DEFAULT_ALPHA))
-        effect = float(scenario['effect'])
-        floor = float(scenario['min_power'])
+        alpha = _study_float(scenario.get('alpha', DEFAULT_ALPHA), f'scenario {s_i} alpha')
+        effect = _study_float(scenario['effect'],
+                              f'scenario {s_i} effect')
+        floor = _study_float(scenario['min_power'], f'scenario {s_i} min_power')
         if not (0.0 < alpha < 1.0):
             raise ValueError(f'scenario {s_i}: alpha must be in (0, 1)')
         if not (math.isfinite(effect) and effect > 0.0):
@@ -356,7 +364,7 @@ def power_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
         if not (math.isfinite(floor) and 0.0 < floor <= 1.0):
             raise ValueError(f'scenario {s_i}: min_power must be in (0, 1]')
         distribution = str(scenario.get('distribution', 'normal'))
-        noise_sd = float(scenario.get('noise_sd', DEFAULT_NOISE_SD))
+        noise_sd = _study_float(scenario.get('noise_sd', DEFAULT_NOISE_SD), f'scenario {s_i} noise_sd')
         name = str(scenario.get('name', f'{distribution}_n{n_pairs}'))
         n_significant = 0
         for r in range(int(reps)):
@@ -408,14 +416,14 @@ def family_study(scenarios, *, reps=DEFAULT_REPS, seed=0):
         m = _require_int(scenario['m'], f'scenario {s_i} m', minimum=2)
         n_pairs = _require_int(scenario['n_pairs'], f'scenario {s_i} n_pairs',
                                minimum=2)
-        alpha = float(scenario.get('alpha', DEFAULT_ALPHA))
-        tol = float(scenario['tol'])
+        alpha = _study_float(scenario.get('alpha', DEFAULT_ALPHA), f'scenario {s_i} alpha')
+        tol = _study_float(scenario['tol'], f'scenario {s_i} tol')
         if not (0.0 < alpha < 1.0):
             raise ValueError(f'scenario {s_i}: alpha must be in (0, 1)')
         if not (math.isfinite(tol) and tol > 0.0):
             raise ValueError(f'scenario {s_i}: tol must be positive')
         distribution = str(scenario.get('distribution', 'normal'))
-        noise_sd = float(scenario.get('noise_sd', DEFAULT_NOISE_SD))
+        noise_sd = _study_float(scenario.get('noise_sd', DEFAULT_NOISE_SD), f'scenario {s_i} noise_sd')
         diagnostic = bool(scenario.get('diagnostic', False))
         name = str(scenario.get('name', f'{distribution}_m{m}_n{n_pairs}'))
         n_family = 0
