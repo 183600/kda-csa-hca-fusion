@@ -695,6 +695,92 @@ def test_summarize_variant_ignores_malformed_metrics():
     assert row['seeds'] == [1, 2, 3, 4, 5]
 
 
+def test_single_factor_verdict_requires_controlled_runtime():
+    """A complete table with a drifted arm is not a single-factor design."""
+    names = [v['name'] for v in M.VARIANTS]
+
+    def rows(**overrides):
+        out = []
+        for name in names:
+            row = {
+                'variant': name,
+                'n_params': 100,
+                'n_layers': 5,
+                'steps': 200,
+                'train_batch': 16,
+                'lr': 3e-3,
+                'seeds': [42, 43],
+                'per_seed': [
+                    {'seed': 42, 'final_acc': 0.2},
+                    {'seed': 43, 'final_acc': 0.2},
+                ],
+            }
+            row.update(overrides.get(name, {}))
+            out.append(row)
+        return out
+
+    clean = M.ablation_design_audit(M.VARIANTS, rows=rows())
+    assert clean['single_factor_claims_valid'] is True
+    assert clean['interaction_claims_valid'] is True
+    assert clean['controlled_variables']['controls_verified'] is True
+    assert clean['single_factor_claim_failures'] == []
+
+    budget = M.ablation_design_audit(
+        M.VARIANTS, rows=rows(no_rope={'steps': 100}))
+    assert budget['controlled_variables']['controls_status'] == \
+        'recipe_mismatch'
+    assert budget['single_factor_claims_valid'] is False
+    assert budget['interaction_claims_valid'] is False
+    assert budget['single_factor_claim_failures'] == [
+        'runtime_controls_recipe_mismatch']
+
+    capacity = M.ablation_design_audit(
+        M.VARIANTS, rows=rows(no_rope={'n_params': 101}))
+    assert capacity['controlled_variables']['controls_status'] == \
+        'capacity_mismatch'
+    assert capacity['single_factor_claims_valid'] is False
+    assert capacity['single_factor_claim_failures'] == [
+        'runtime_controls_capacity_mismatch']
+
+    depth = M.ablation_design_audit(
+        M.VARIANTS, rows=rows(no_rope={'n_layers': 6}))
+    assert depth['controlled_variables']['controls_status'] == \
+        'capacity_mismatch'
+    assert depth['single_factor_claims_valid'] is False
+
+    # An unobserved control is not verified, so the claim stays withheld.
+    partial = M.ablation_design_audit(
+        M.VARIANTS, rows=rows(no_rope={'n_params': None}))
+    assert partial['controlled_variables']['controls_status'] == \
+        'partially_observed'
+    assert partial['single_factor_claims_valid'] is False
+
+    seed = M.ablation_design_audit(
+        M.VARIANTS, rows=rows(no_rope={
+            'seeds': [42],
+            'per_seed': [{'seed': 42, 'final_acc': 0.2}]}))
+    assert seed['controlled_variables']['controls_status'] == 'seed_mismatch'
+    assert seed['single_factor_claims_valid'] is False
+
+    # A declared arm with no result row never ran: the factor it was meant
+    # to isolate has no observed treatment, so the claim is not supported.
+    absent = M.ablation_design_audit(
+        M.VARIANTS, rows=[r for r in rows() if r['variant'] != 'no_rope'])
+    assert absent['controlled_variables']['controls_status'] == \
+        'missing_results'
+    assert absent['controlled_variables']['missing_result_variants'] == \
+        ['no_rope']
+    assert absent['controlled_variables']['results_complete'] is False
+    assert absent['single_factor_claims_valid'] is False
+
+    # With no observed rows only the static checks are available; the
+    # declared design and the built configs still have to pass.
+    static = M.ablation_design_audit(M.VARIANTS)
+    assert static['single_factor_claims_valid'] is True
+    assert static['single_factor_claim_failures'] == []
+    assert 'controlled_variables' not in static
+
+
 _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
@@ -704,6 +790,7 @@ _TEST_FUNCS = [
     test_sparse_variant_recall_is_below_one_or_none,
     test_paired_stats_math,
     test_ablation_design_audit,
+    test_single_factor_verdict_requires_controlled_runtime,
     test_variant_config_audit_detects_drift_and_non_treatments,
     test_exp8_smoke_envelope,
     test_single_seed_aggregate_reports_undefined_std,

@@ -185,7 +185,8 @@ For Exp 5b:
 For Exp 8:
 
 1. Single-factor claims require the baseline + exactly-one-factor variant,
-   and the built config audit must pass.
+   the built config audit must pass, and the observed arms must share the
+   training recipe, parameter count, depth and seed set.
 2. The factorial interaction is a separate row; the four main effects do not
    replace it.
 3. `no_rope_dense` supports only an interaction claim, not a RoPE-only or

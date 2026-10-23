@@ -254,10 +254,10 @@ The runners attach this audit to their result metadata as
 confirmatory without reconstructing the seed count by hand. The audit never
 changes the experiment or its exit code; it only labels the evidence.
 
-## Single-factor claims are audited against the built config
+## Single-factor claims are audited against the built config and observed run
 
 A "leave-one-factor-out" table is only as trustworthy as its implementation.
-Exp 8 therefore carries two complementary audits in
+Exp 8 therefore carries three complementary audits in
 `metadata.ablation_design`:
 
 * `status` / `missing_single_factor_variants` classify the *declared* variant
@@ -272,9 +272,20 @@ Exp 8 therefore carries two complementary audits in
   Non-baseline variants whose built state is identical to the baseline (or to
   another variant) are reported as `no_change_variants` /
   `duplicate_treatments`; they are not treatments.
-* `single_factor_claims_valid` is true only when both checks pass. The
-  runner logs a warning otherwise; the audit never deletes or rewrites a
-  result row, it labels the evidence.
+* `controlled_variables` checks the observed rows. Every declared variant
+  must have a result row, and those arms must use the same training recipe
+  (steps, batch, learning rate), parameter count, depth and successfully
+  evaluated seed set. A drift is reported as `missing_results`,
+  `recipe_mismatch`, `capacity_mismatch`, `seed_mismatch` or
+  `partially_observed`. A mechanism switch that silently changes capacity or
+  training budget is a second factor even if the built config fields match.
+
+`single_factor_claims_valid` is true only when all three checks pass (the
+runtime check is required whenever rows are supplied). The reasons for a
+false verdict are listed in `single_factor_claim_failures`, and the
+corresponding interaction verdict in `interaction_claims_valid` /
+`interaction_claim_failures`. The runner logs a warning otherwise; the audit
+never deletes or rewrites a result row, it labels the evidence.
 
 The `rope` factor is a **declared bundle**: disabling partial RoPE on both
 the CSA and HCA core-attention layers is one treatment factor, so the audit

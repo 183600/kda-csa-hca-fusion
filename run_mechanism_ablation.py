@@ -40,8 +40,13 @@ is recorded in the ``ablation_design`` metadata: a single-factor
 that differs from it in EXACTLY that factor; ``no_rope_dense`` is an
 interaction cell. A ``MECH_VARIANTS`` subset that drops a one-factor
 counterpart is flagged (``status='incomplete'`` + the missing factors),
-never silently treated as a complete ablation; the audit also cross-checks
-the observed parameter-count / depth parity across variants.
+never silently treated as a complete ablation. The audit also checks the
+built config of each arm and cross-checks the observed rows: every declared
+variant must have a result row with the same parameter count, depth,
+training recipe and successful seed set. A drift withholds
+``single_factor_claims_valid`` (the reasons are recorded in
+``single_factor_claim_failures``) instead of labelling a multi-factor
+comparison as single-factor.
 
 Main effects are not interactions. The four variants ``baseline``,
 ``no_rope``, ``dense`` and ``no_rope_dense`` form a complete
@@ -792,6 +797,7 @@ def train_variant(variant: dict, *, seed, steps, device, seq_len=SEQ_LEN,
         'seed': seed,
         'steps': steps,
         'train_batch': train_batch,
+        'lr': lr,
         'rope': bool(variant['rope']),
         'topk': int(variant['topk']),
         'use_ste': bool(variant['use_ste']),
@@ -1067,6 +1073,9 @@ def summarize_variant(per_seed, variant):
         'chance_gold_mrr': chance_gold_mrr,
         'gold_recall_skipped_reason': skip_reason,
         'mean_fwd_ms': mean_fwd,
+        'steps': ok[0].get('steps') if ok else None,
+        'train_batch': ok[0].get('train_batch') if ok else None,
+        'lr': ok[0].get('lr') if ok else None,
         'n_params': ok[0]['n_params'] if ok else None,
         'n_layers': ok[0]['n_layers'] if ok else None,
         'mean_train_time_s': (sum(r.get('train_time_s', 0.0) for r in ok)
@@ -1340,10 +1349,17 @@ def ablation_design_audit(variants, rows=None, requested=None,
     Returns a JSON-safe dict with ``status`` one of
     ``'leave_one_out_complete'`` / ``'incomplete'`` / ``'no_baseline'``.
     ``controlled_variables['controls_status']`` separately reports
-    ``'controlled'`` / ``'recipe_mismatch'`` / ``'seed_mismatch'`` /
-    ``'partially_observed'``. ``config_audit['status']`` is
-    ``'controlled'`` only when the implementation matches the declaration;
-    ``single_factor_claims_valid`` is true only when both checks pass.
+    ``'controlled'`` / ``'missing_results'`` / ``'recipe_mismatch'`` /
+    ``'capacity_mismatch'`` / ``'seed_mismatch'`` /
+    ``'partially_observed'``. ``config_audit['status']``
+    is ``'controlled'`` only when the implementation matches the
+    declaration. ``single_factor_claims_valid`` is true only when the
+    declared design is complete, the built configs are controlled, AND
+    (when rows were supplied) the observed recipe, parameter count, depth
+    and successful seed set are all controlled. The reasons for a false
+    verdict are listed in ``single_factor_claim_failures``;
+    ``interaction_claims_valid`` applies the same requirements to the
+    factorial cells and lists ``interaction_claim_failures``.
     """
     names = [v['name'] for v in variants]
     baseline = next((v for v in variants if v['name'] == 'baseline'), None)
@@ -1408,10 +1424,6 @@ def ablation_design_audit(variants, rows=None, requested=None,
             'missing_cells': missing_cells,
             'complete': not missing_cells,
         }
-    interaction_claims_valid = bool(
-        factorial_designs
-        and all(d['complete'] for d in factorial_designs.values())
-        and config_audit.get('status') == 'controlled')
     audit = {
         'status': status,
         'selected_variants': names,
@@ -1421,14 +1433,10 @@ def ablation_design_audit(variants, rows=None, requested=None,
         'factors': factors,
         'interaction_variants': interactions,
         'factorial_designs': factorial_designs,
-        'interaction_claims_valid': interaction_claims_valid,
         'missing_single_factor_variants': missing,
         # Implementation-level check: the declared factors must be the
         # switches that actually change in the built config/instance.
         'config_audit': config_audit,
-        'single_factor_claims_valid': bool(
-            status == 'leave_one_out_complete'
-            and config_audit.get('status') == 'controlled'),
         'note': (
             'A single-factor (leave-one-out) claim for a factor needs the '
             'baseline plus a variant differing from it in exactly that '
@@ -1500,6 +1508,7 @@ def ablation_design_audit(variants, rows=None, requested=None,
                     successful_seeds[name].add(seed)
 
         names_with_rows = [n for n in names if n in values]
+        missing_result_variants = [n for n in names if n not in values]
 
         def _parity(field):
             per_variant = [values[n][field] for n in names_with_rows]
@@ -1537,18 +1546,35 @@ def ablation_design_audit(variants, rows=None, requested=None,
 
         mismatched_fields = [f for f, ok in recipe_parity.items()
                              if ok is False]
-        if (any(v is False for v in recipe_matches_expected.values())
+        capacity_parity = {'n_params': _parity('n_params'),
+                           'n_layers': _parity('n_layers')}
+        capacity_bad = any(v is False for v in capacity_parity.values())
+        if missing_result_variants:
+            # A declared arm with no result row never produced a treatment,
+            # so neither its paired contrast nor the factor it was meant to
+            # isolate can support a claim.
+            controls_status = 'missing_results'
+        elif (any(v is False for v in recipe_matches_expected.values())
                 or mismatched_fields):
             controls_status = 'recipe_mismatch'
+        elif capacity_bad:
+            # A variant that changes the parameter count or depth is not a
+            # same-capacity mechanism contrast, even when the declared
+            # config switches match.
+            controls_status = 'capacity_mismatch'
         elif seed_alignment_ok is False:
             controls_status = 'seed_mismatch'
         elif (any(v is None for v in recipe_parity.values())
+              or any(v is None for v in capacity_parity.values())
               or seed_alignment_ok is None):
             controls_status = 'partially_observed'
         else:
             controls_status = 'controlled'
 
         audit['controlled_variables'] = {
+            'missing_result_variants': missing_result_variants,
+            'results_complete': not missing_result_variants,
+            'capacity_parity': capacity_parity,
             'parameter_count_by_variant': {
                 n: next(iter(values[n]['n_params']))
                 for n in names_with_rows if values[n]['n_params']},
@@ -1575,11 +1601,55 @@ def ablation_design_audit(variants, rows=None, requested=None,
                 s for s in common_seeds if s is not None),
             'seed_alignment_ok': seed_alignment_ok,
             'controls_status': controls_status,
-            'note': ('A single-factor mechanism claim also requires the '
-                     'variants to share steps/batch/lr and the requested '
-                     'seed set; otherwise the contrast mixes the mechanism '
-                     'with a budget or sampling difference.'),
+            'controls_verified': controls_status == 'controlled',
+            'note': ('A single-factor mechanism claim also requires every '
+                     'declared variant to have a result row and the variants '
+                     'to share steps/batch/lr, parameter count and depth, and '
+                     'the requested/successful seed set; otherwise the '
+                     'contrast mixes the mechanism with a missing arm, '
+                     'budget, capacity or sampling difference.'),
         }
+    # The static checks above prove that the declared design is complete
+    # and that the built configs change only the declared switches. When
+    # rows are available, a single-factor claim additionally requires the
+    # observed run to have held the recipe, capacity and seed set fixed:
+    # a complete leave-one-out table with a different training budget or
+    # parameter count in one arm is still a multi-factor comparison. Fold
+    # that runtime check into the claim verdict instead of reporting two
+    # contradictory flags in the same metadata block.
+    runtime_controls = audit.get('controlled_variables')
+    runtime_controls_ok = (
+        runtime_controls.get('controls_status') == 'controlled'
+        if isinstance(runtime_controls, dict) else None)
+
+    single_factor_failures = []
+    if status != 'leave_one_out_complete':
+        single_factor_failures.append(f'declared_design_{status}')
+    if config_audit.get('status') != 'controlled':
+        single_factor_failures.append(
+            f'config_{config_audit.get("status") or "unknown"}')
+    if runtime_controls_ok is False:
+        single_factor_failures.append(
+            'runtime_controls_'
+            f'{runtime_controls.get("controls_status") or "unknown"}')
+    audit['single_factor_claims_valid'] = not single_factor_failures
+    audit['single_factor_claim_failures'] = single_factor_failures
+
+    interaction_failures = []
+    if not factorial_designs:
+        interaction_failures.append('no_factorial_design')
+    for design_name, spec in sorted(factorial_designs.items()):
+        if not spec.get('complete'):
+            interaction_failures.append(f'missing_cells:{design_name}')
+    if config_audit.get('status') != 'controlled':
+        interaction_failures.append(
+            f'config_{config_audit.get("status") or "unknown"}')
+    if runtime_controls_ok is False:
+        interaction_failures.append(
+            'runtime_controls_'
+            f'{runtime_controls.get("controls_status") or "unknown"}')
+    audit['interaction_claims_valid'] = not interaction_failures
+    audit['interaction_claim_failures'] = interaction_failures
     return audit
 
 
@@ -1852,6 +1922,7 @@ def main():
                         'variant': variant['name'], 'n_kv': n_kv,
                         'seed': seed, 'steps': steps,
                         'train_batch': train_batch,
+                        'lr': lr,
                         'rope': bool(variant['rope']),
                         'topk': int(variant['topk']),
                         'use_ste': bool(variant['use_ste']),
@@ -2185,12 +2256,21 @@ def main():
         logger.warning(
             '  WARNING: observed depths differ across variants: %s',
             cv.get('depth_by_variant'))
-    if cv.get('controls_status') in ('recipe_mismatch', 'seed_mismatch'):
+    if cv.get('controls_status') in ('missing_results', 'recipe_mismatch',
+                                     'capacity_mismatch', 'seed_mismatch'):
         logger.warning(
             '  WARNING: controlled-variable check failed (%s): '
-            'recipe_parity=%s seed_alignment_ok=%s',
-            cv.get('controls_status'), cv.get('recipe_parity'),
+            'missing_result_variants=%s recipe_parity=%s '
+            'parameter_count_parity=%s depth_parity=%s '
+            'seed_alignment_ok=%s',
+            cv.get('controls_status'),
+            cv.get('missing_result_variants'), cv.get('recipe_parity'),
+            cv.get('parameter_count_parity'), cv.get('depth_parity'),
             cv.get('seed_alignment_ok'))
+    if not design_audit.get('single_factor_claims_valid', False):
+        logger.warning(
+            '  WARNING: the Exp 8 single-factor claims are NOT valid: %s',
+            design_audit.get('single_factor_claim_failures'))
     if not design_audit.get('interaction_claims_valid', False):
         missing_cells = {
             name: spec.get('missing_cells')
@@ -2199,9 +2279,10 @@ def main():
             if not spec.get('complete')}
         logger.warning(
             '  WARNING: the selected variant set does not cover a complete '
-            'factorial cell for every pre-registered interaction (%s). '
+            'factorial cell for every pre-registered interaction (%s): %s. '
             'The corresponding interaction claims are NOT supported by '
-            'this run.', missing_cells)
+            'this run.', missing_cells,
+            design_audit.get('interaction_claim_failures'))
 
     # Prospective audit against the pre-registered Exp 8 plan: the actual
     # seed budget and compared-variant family are checked against the
