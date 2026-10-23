@@ -649,11 +649,12 @@ def test_finite_metric_filters_diverged_seed_values():
         {'seed': 5, 'final_acc': None, 'gold_pr_auc': None},
         {'seed': 6, 'final_acc': 0.8, 'gold_pr_auc': 0.9},
         {'seed': 7, 'final_acc': 0.9, 'gold_pr_auc': 0.95, 'error': 'x'},
+        {'seed': 8, 'final_acc': 10 ** 400, 'gold_pr_auc': 10 ** 400},
         'not-a-record',
     ]
     assert M._finite_metric(records[0], 'final_acc') == 0.4
     assert M._finite_metric(records[0], 'gold_pr_auc') == 0.5
-    invalid = [records[i] for i in (1, 2, 3, 4, 7)]
+    invalid = [records[i] for i in (1, 2, 3, 4, 7, 8)]
     for record in invalid:
         assert M._finite_metric(record, 'final_acc') is None, record
         assert M._finite_metric(record, 'gold_pr_auc') is None, record

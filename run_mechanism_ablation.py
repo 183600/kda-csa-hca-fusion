@@ -887,7 +887,11 @@ def _finite_metric(record, key):
     value = record.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # A JSON int beyond the float range is not a measurement.
+        return None
     return number if math.isfinite(number) else None
 
 
