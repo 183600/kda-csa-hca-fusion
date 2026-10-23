@@ -135,6 +135,44 @@ def per_channel_log_decay_bias(
               / half_lives / float(decay_scale))
     inverse = target + torch.log(-torch.expm1(-target))
     channel_bias = inverse.to(torch.float32)
+    if bool(torch.isfinite(channel_bias).all()):
+        return channel_bias.repeat(n_heads)
+
+    # Fast path overflowed: ``max/min`` exceeded the float range (making
+    # ``half_lives`` infinite and the inverse-softplus -inf), or the target
+    # exceeded float32. Recompute the same quantity in log space. The
+    # returned tensor is float32, so a target outside its finite range is a
+    # malformed initializer, not a value we should silently saturate.
+    log_min = _math.log(float(min_half_life))
+    log_max = _math.log(float(max_half_life))
+    log_half_lives = log_min + fractions * (log_max - log_min)
+    log_target = (torch.tensor(
+        _math.log(_math.log(2.0)) - _math.log(float(decay_scale)),
+        dtype=torch.float64) - log_half_lives)
+    max_log = _math.log(float(torch.finfo(torch.float32).max))
+    if not bool(torch.isfinite(log_target).all()):
+        raise ValueError(
+            "per_channel_log_decay_bias: the requested half-life range and "
+            "decay_scale produce an unrepresentable bias.")
+    if bool((log_target > max_log).any()):
+        raise ValueError(
+            "per_channel_log_decay_bias: the requested half-life range and "
+            "decay_scale need a bias above the finite float32 range "
+            f"(max half-life={max_half_life!r}, "
+            f"min half-life={min_half_life!r}, "
+            f"decay_scale={decay_scale!r}). Use a wider decay_scale or a "
+            f"narrower half-life range.")
+    target = torch.exp(log_target)
+    inverse = target + torch.log(-torch.expm1(-target))
+    # ``exp(log_target)`` underflows to exactly zero for extremely large
+    # half-lives; the true inverse is then ``log(target) = log_target``
+    # (the ``log(1 - exp(-target))`` correction vanishes).
+    inverse = torch.where(target == 0, log_target, inverse)
+    channel_bias = inverse.to(torch.float32)
+    if not bool(torch.isfinite(channel_bias).all()):
+        raise ValueError(
+            "per_channel_log_decay_bias: the requested half-life range and "
+            "decay_scale produce a bias outside the finite float32 range.")
     return channel_bias.repeat(n_heads)
 
 
