@@ -79,6 +79,27 @@ def test_ties_reduce_effective_pairs_and_raise_the_floor():
     assert r['shortfall_pairs_raw'] == 2
 
 
+def test_extreme_positive_floors_do_not_overflow():
+    """A subnormal p floor times an arbitrary-size family must stay finite.
+
+    Both the Holm product and ``alpha / p_floor`` can exceed the float
+    range for large effective n. They are still ordinary real quantities:
+    the adjusted p is 1.0 and the supported family is an exact big integer,
+    not an OverflowError.
+    """
+    tiny = M.exact_test_resolution(1030)
+    assert 0.0 < tiny['min_attainable_p_raw'] < 1e-300
+    assert tiny['family_testable'] is True
+    assert tiny['max_comparisons_at_alpha'] > 10 ** 300
+
+    huge_family = M.exact_test_resolution(1030, family_size=10 ** 400)
+    assert huge_family['min_attainable_p_holm'] == 1.0
+    assert huge_family['family_testable'] is False
+    assert huge_family['min_effective_pairs_holm'] > 1300
+    assert huge_family['max_comparisons_at_alpha'] > 10 ** 300
+    json.dumps(huge_family, allow_nan=False)
+
+
 def test_resolution_validation():
     for bad in (-1, 1.5, True, '5'):
         with pytest.raises(ValueError):

@@ -526,10 +526,16 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
         p_min = 1.0 if log_floor >= 0.0 else math.exp(log_floor)
     if p_min <= 0.0:
         p_holm = 0.0
-    elif family_size > 1.0 / p_min:
-        p_holm = 1.0
     else:
-        p_holm = min(1.0, family_size * p_min)
+        # ``family_size`` is an arbitrary Python int: converting a very large
+        # one to float (implicitly, in ``family_size * p_min``) raises
+        # OverflowError. Fall back to log-space only for that case, so the
+        # ordinary integral products keep their exact float arithmetic.
+        try:
+            p_holm = min(1.0, family_size * p_min)
+        except OverflowError:
+            log_product = math.log(family_size) + math.log(p_min)
+            p_holm = 1.0 if log_product >= 0.0 else math.exp(log_product)
 
     def _min_effective(multiplier: int) -> int:
         # smallest n >= 1 with multiplier * sided / 2**n <= alpha,
@@ -552,7 +558,18 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
     if p_min <= 0.0:
         max_family = None
     else:
-        max_family = int(math.floor(alpha / p_min))
+        ratio = alpha / p_min
+        if math.isfinite(ratio):
+            max_family = int(math.floor(ratio))
+        else:
+            # ``alpha / p_min`` overflowed for a tiny (but positive) floor.
+            # The true quotient is still an ordinary (if enormous) integer;
+            # compute its floor exactly from the float representations rather
+            # than returning None or crashing in int(inf).
+            from fractions import Fraction
+            max_family = int(
+                (Fraction.from_float(alpha)
+                 / Fraction.from_float(p_min)).__floor__())
     return {
         'n_pairs': n_pairs,
         'n_zero': n_zero,
