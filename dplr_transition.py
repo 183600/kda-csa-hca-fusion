@@ -359,9 +359,14 @@ def rwkv7_chunk_factors(w: torch.Tensor, kk: torch.Tensor,
         diag_list.append(diag)
         left_list.append(left)
         right_list.append(right)
+    # ``diag`` is ``[..., K]`` (one fewer axis than ``left``/``right``), so
+    # the new chunk axis sits at ``-2`` for the diagonal but at ``-3`` for
+    # the rank factors: stacking the latter with ``-2`` would interleave
+    # the chunk axis between K and the rank axis, yielding
+    # ``[..., K, NT, r]`` instead of the documented ``[..., NT, K, r]``.
     return (torch.stack(diag_list, dim=-2),
-            torch.stack(left_list, dim=-2),
-            torch.stack(right_list, dim=-2))
+            torch.stack(left_list, dim=-3),
+            torch.stack(right_list, dim=-3))
 
 
 # ---------------------------------------------------------------------------

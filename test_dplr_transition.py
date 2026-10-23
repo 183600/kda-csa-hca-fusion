@@ -177,6 +177,52 @@ def test_chunk_factors_match_the_product_of_steps(device):
             torch.testing.assert_close(got, ref, rtol=1e-10, atol=1e-10)
 
 
+def test_rwkv7_chunk_factors_place_the_chunk_axis_before_the_key_axis(device):
+    """The documented layout is ``[..., NT, K, r]``, not ``[..., K, NT, r]``.
+
+    ``diag`` has one axis fewer than ``left``/``right``, so the chunk axis
+    must be inserted at a different relative position; an off-by-one here
+    makes every consumer's ``[..., n, :]`` slice select a key row instead
+    of a chunk.
+    """
+    torch.manual_seed(25)
+    b, h, t, k, chunk = 2, 3, 10, 5, 4
+    w = torch.rand(b, h, t, k, dtype=torch.float64) * 0.9 + 0.1
+    kk = torch.randn(b, h, t, k, dtype=torch.float64) * 0.1
+    kka = torch.randn(b, h, t, k, dtype=torch.float64) * 0.1
+
+    dc, lc, rc = D.rwkv7_chunk_factors(w, kk, kka, chunk)
+    nt = math.ceil(t / chunk)
+    assert dc.shape == (b, h, nt, k)
+    assert lc.shape[:3] == rc.shape[:3] == (b, h, nt)
+    assert lc.shape[-2:] == (k, lc.shape[-1])
+    assert lc.shape[-1] == rc.shape[-1] <= min(chunk, k)
+
+    pad = (-t) % chunk
+    wp = F.pad(w, (0, 0, 0, pad), value=1.0)
+    kkp = F.pad(kk, (0, 0, 0, pad), value=0.0)
+    kkap = F.pad(kka, (0, 0, 0, pad), value=0.0)
+    for n in range(nt):
+        ref = torch.eye(k, dtype=w.dtype).expand(b, h, k, k).clone()
+        for c in range(chunk):
+            idx = n * chunk + c
+            step = (torch.diag_embed(wp[:, :, idx])
+                    + kkap[:, :, idx].unsqueeze(-1)
+                    * kkp[:, :, idx].unsqueeze(-2))
+            ref = step @ ref
+        got = D.dense(dc[:, :, n], lc[:, :, n], rc[:, :, n])
+        torch.testing.assert_close(got, ref, rtol=1e-11, atol=1e-11)
+
+    # The same contract for the reduced 2-D form used by RWKV helpers.
+    d2, l2, r2 = D.rwkv7_chunk_factors(w[0, 0], kk[0, 0], kka[0, 0], chunk)
+    assert d2.shape == (nt, k)
+    assert l2.shape[:2] == r2.shape[:2] == (nt, k)
+    torch.testing.assert_close(
+        D.dense(d2[0], l2[0], r2[0]),
+        D.dense(dc[0, 0, 0], lc[0, 0, 0], rc[0, 0, 0]),
+        rtol=1e-12, atol=1e-12)
+
+
 def test_certificate_matches_the_wy_construction_over_a_regression_matrix(
         device):
     cases = [
