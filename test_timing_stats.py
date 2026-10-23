@@ -167,12 +167,43 @@ def test_producer_wiring_reports_uncertainty():
         == 'percentile_bootstrap_median', _LAST_TIMING_STATS)
 
 
+def test_extreme_finite_timings_stay_json_safe():
+    """Finite timings near the float limit must not emit inf/NaN.
+
+    A raw ``sum([1e308, 1e308])`` is inf even though the mean is finite,
+    and ``(a + b) / 2`` overflows for two large but finite medians.
+    """
+    import json
+    for vals in ([1e308, 1e308], [1e308, 1.1e308], [0.0, 1e308],
+                 [5e-324, 1e308]):
+        stats = ts.summarize_timings_ms(vals, n_boot=8)
+        json.dumps(stats, allow_nan=False)
+        for key in ('median_ms', 'mean_ms', 'std_ms', 'ci95_low_ms',
+                    'ci95_high_ms', 'ci95_halfwidth_ms', 'q10_ms',
+                    'q90_ms'):
+            _ok(f'{vals}: {key} finite',
+                stats[key] is not None and math.isfinite(stats[key]),
+                stats[key])
+        _ok(f'{vals}: cv finite',
+            stats['cv'] is not None and math.isfinite(stats['cv']),
+            stats['cv'])
+
+    # An unrepresentable median ratio is reported as undefined, not inf.
+    ratio = ts.ratio_of_medians_ci([1e308, 1e308],
+                                   [5e-324, 5e-324], n_boot=8)
+    json.dumps(ratio, allow_nan=False)
+    _ok('overflowed median ratio is undefined',
+        ratio['ratio_median'] is None and ratio['ratio_ci95_low'] is None,
+        ratio)
+
+
 _TEST_FUNCS = [
     test_summary_hand_values_and_quantiles,
     test_summary_seconds_and_edge_cases,
     test_ratio_of_medians_ci,
     test_paired_ratio_drops_whole_trials_after_invalid_values,
     test_producer_wiring_reports_uncertainty,
+    test_extreme_finite_timings_stay_json_safe,
 ]
 
 

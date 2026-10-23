@@ -57,6 +57,63 @@ def _clean(values):
     return out
 
 
+def _safe_mean(values):
+    """Mean of finite non-negative values without an overflowing sum."""
+    n = len(values)
+    total = sum(values)
+    if math.isfinite(total):
+        return total / n
+    scale = max(abs(v) for v in values)
+    if scale == 0.0:
+        return 0.0
+    mean = scale * (math.fsum(v / scale for v in values) / n)
+    return mean if math.isfinite(mean) else None
+
+
+def _safe_median(values):
+    """Median whose even-sample midpoint cannot overflow to ``inf``."""
+    n = len(values)
+    if n == 0:
+        return None
+    ordered = sorted(values)
+    if n % 2:
+        return ordered[n // 2]
+    a, b = ordered[n // 2 - 1], ordered[n // 2]
+    mid = (a + b) / 2.0
+    if math.isfinite(mid):
+        return mid
+    # ``a + (b-a)/2`` avoids the overflowing sum and is exact for the
+    # non-negative timing samples this module handles.
+    mid = a + (b - a) / 2.0
+    if math.isfinite(mid):
+        return mid
+    mid = a / 2.0 + b / 2.0
+    return mid if math.isfinite(mid) else None
+
+
+def _safe_stdev(values):
+    """Sample SD with a scaled fallback when the raw variance overflows."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    try:
+        std = statistics.stdev(values)
+    except (OverflowError, ValueError):
+        std = None
+    if std is not None and math.isfinite(std):
+        return std
+    scale = max(abs(v) for v in values)
+    if scale == 0.0:
+        return 0.0
+    scaled = [v / scale for v in values]
+    mean = _safe_mean(scaled)
+    if mean is None:
+        return None
+    var = math.fsum((v - mean) ** 2 for v in scaled) / (n - 1)
+    std = scale * math.sqrt(var)
+    return std if math.isfinite(std) else None
+
+
 def _check_bootstrap(n_boot, alpha):
     if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
         raise ValueError(f'n_boot={n_boot!r} must be a positive int.')
@@ -85,7 +142,7 @@ def bootstrap_median_ci(values, *, n_boot=DEFAULT_BOOTSTRAP_REPS,
     meds = []
     for _ in range(n_boot):
         sample = [vals[rng.randrange(n)] for _ in range(n)]
-        meds.append(statistics.median(sample))
+        meds.append(_safe_median(sample))
     meds.sort()
     return (_percentile(meds, 100.0 * float(alpha) / 2.0),
             _percentile(meds, 100.0 * (1.0 - float(alpha) / 2.0)))
@@ -106,11 +163,11 @@ def summarize_timings_ms(times_ms, *, n_boot=DEFAULT_BOOTSTRAP_REPS,
             'bootstrap_reps': n_boot, 'alpha': float(alpha),
         }
     ordered = sorted(vals)
-    mean = sum(vals) / len(vals)
-    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    mean = _safe_mean(vals)
+    std = _safe_stdev(vals)
     low, high = bootstrap_median_ci(vals, n_boot=n_boot, alpha=alpha,
                                     seed=seed)
-    median = statistics.median(vals)
+    median = _safe_median(vals)
     return {
         'median_ms': median,
         'mean_ms': mean,
@@ -122,8 +179,10 @@ def summarize_timings_ms(times_ms, *, n_boot=DEFAULT_BOOTSTRAP_REPS,
         'ci95_low_ms': low,
         'ci95_high_ms': high,
         'ci95_halfwidth_ms': ((high - low) / 2.0
-                              if low is not None else None),
-        'cv': (std / mean) if mean > 0 else None,
+                              if low is not None and high is not None
+                              else None),
+        'cv': ((std / mean) if (std is not None and mean not in (None, 0.0))
+               else None),
         'n': len(vals),
         'ci_method': 'percentile_bootstrap_median',
         'bootstrap_reps': n_boot,
@@ -181,9 +240,13 @@ def ratio_of_medians_ci(a_ms, b_ms, *, paired=False,
         b = _clean(b_ms)
     if not a or not b:
         raise ValueError('ratio requires two non-empty samples.')
-    med_a = statistics.median(a)
-    med_b = statistics.median(b)
-    point = (med_a / med_b) if med_b > 0 else None
+    med_a = _safe_median(a)
+    med_b = _safe_median(b)
+    point = ((med_a / med_b)
+             if (med_a is not None and med_b is not None and med_b > 0)
+             else None)
+    if point is not None and not math.isfinite(point):
+        point = None
     rng = random.Random(seed)
     ratios = []
     for _ in range(n_boot):
@@ -194,9 +257,12 @@ def ratio_of_medians_ci(a_ms, b_ms, *, paired=False,
         else:
             sa = [a[rng.randrange(len(a))] for _ in range(len(a))]
             sb = [b[rng.randrange(len(b))] for _ in range(len(b))]
-        mb = statistics.median(sb)
-        if mb > 0:
-            ratios.append(statistics.median(sa) / mb)
+        mb = _safe_median(sb)
+        ma = _safe_median(sa)
+        if mb is not None and ma is not None and mb > 0:
+            ratio = ma / mb
+            if math.isfinite(ratio):
+                ratios.append(ratio)
     if not ratios:
         low = high = None
     else:
