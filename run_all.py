@@ -223,12 +223,15 @@ def _write_experiment_design_manifest(profile: str) -> dict:
     for row in manifest['results']:
         plan = row['planning']
         eq = plan.get('equivalence') or {}
+        inter = plan.get('interaction') or {}
         print(f"[design] {row['plan_id']}: n={row['n_seeds']} "
               f"required={plan['required_seeds']} "
               f"power={plan['planned_power']} "
               f"status={row['status']} "
               f"eq_n={eq.get('required_seeds_at_zero', '-')} "
               f"eq_status={eq.get('status', '-')} "
+              f"int_n={inter.get('required_seeds', '-')} "
+              f"int_status={inter.get('status', '-')} "
               f"plan_sha={row['plan_sha256'][:12]}")
     return {
         'path': 'results/experiment_design.json',
@@ -247,6 +250,14 @@ def _write_experiment_design_manifest(profile: str) -> dict:
                         'required_seeds_at_zero')),
                 'equivalence_status': row['planning'].get(
                     'equivalence_status'),
+                # Interaction claims are a separate budget: surface it so a
+                # main-effect superiority budget cannot be read as a
+                # transfer/complementarity budget.
+                'interaction_required_seeds': (
+                    (row['planning'].get('interaction') or {}).get(
+                        'required_seeds')),
+                'interaction_status': row['planning'].get(
+                    'interaction_status'),
             }
             for row in manifest['results']
         },

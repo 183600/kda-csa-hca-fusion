@@ -7606,6 +7606,90 @@ def test_online_softmax_shared_kv_tiling(device='cpu'):
     return results
 
 
+def test_interaction_planning_is_four_cell_budgeted(device='cpu'):
+    """A pre-registered 2x2 interaction must not reuse the main-effect SD.
+
+    Exp 5b/8 pre-register difference-in-differences claims (the KDA/Mamba-2
+    route x layout transfer in particular). ``I = d-b-c+a`` is a four-cell
+    contrast: under the shared-seed / independent-cell-noise model its SD is
+    sqrt(2) times the two-cell paired-difference SD that ``assumed_sd``
+    describes. This check pins the arithmetic, the descriptive-only label
+    for the registered 14-seed budget, the audit warning (which must not
+    change the main-effect status), and the promotion path when the budget
+    actually reaches the interaction requirement.
+    """
+    import experiment_design as design
+
+    results = []
+    for plan_id, family in (('exp5b_matrix', 24), ('exp8_mechanism', 6)):
+        rep = design.planning_report(plan_id)
+        inter = rep['interaction']
+        results.append(_ok(
+            f'{plan_id}: interaction has its own variance budget',
+            inter is not None
+            and inter['family_size'] == family
+            and inter['alternative'] == 'two-sided'
+            and abs(inter['sd_interaction']
+                    - rep['assumed_sd'] * inter['sd_inflation']) < 1e-12,
+            f"sd={inter['sd_interaction']:.4f} inflation="
+            f"{inter['sd_inflation']:.4f}"))
+        results.append(_ok(
+            f'{plan_id}: main-effect budget does not power the interaction',
+            inter['required_seeds'] > rep['required_seeds']
+            and inter['planned_power'] < rep['planned_power']
+            and inter['supports_interaction_at_planned_n'] is False
+            and inter['status'] == 'underpowered_at_sesoi',
+            f"need={inter['required_seeds']} "
+            f"power={inter['planned_power']:.3f} at n={inter['seeds']}"))
+    results.append(_ok(
+        'plans without an interaction report no interaction claim',
+        design.planning_report('exp4_mqar')['interaction'] is None
+        and design.planning_report('exp4_mqar')[
+            'interaction_claim_allowed'] is None, ''))
+
+    levels = {'memory': ['kda', 'mamba2', 'rwkv7'],
+              'layout_unit': ['A', 'B', 'C', 'D']}
+    rep = design.planning_report('exp5b_matrix')
+    unpowered = design.audit_run(
+        'exp5b_matrix', seeds=[42 + i for i in range(14)],
+        levels=levels, family_size=24)
+    results.append(_ok(
+        'audit keeps the main status but withholds the interaction claim',
+        unpowered['status'] == 'confirmatory'
+        and unpowered['interaction_claim_allowed'] is False
+        and unpowered['checks']['interaction_budget_supports_claim'] is False
+        and 'interaction_claim_at_sesoi' not in unpowered['claims_allowed']
+        and any('interaction' in w and 'descriptive' in w
+                for w in unpowered['design_warnings']),
+        f"need={unpowered['interaction']['required_seeds']}"))
+    enough = rep['interaction']['required_seeds']
+    powered = design.audit_run(
+        'exp5b_matrix', seeds=[42 + i for i in range(enough)],
+        levels=levels, family_size=24)
+    results.append(_ok(
+        'audit promotes the interaction only when its own budget is met',
+        powered['status'] == 'confirmatory'
+        and powered['interaction_claim_allowed'] is True
+        and 'interaction_claim_at_sesoi' in powered['claims_allowed']
+        and not any('interaction' in w for w in powered['design_warnings']),
+        f'n={enough}'))
+
+    stale = design.get_plan('exp8_mechanism')
+    stale['interaction']['required_for_claim'] = True
+    stale_errors = design.validate_plan(stale)
+    bad = design.get_plan('exp8_mechanism')
+    bad['interaction']['sd_inflation'] = 0.5
+    bad_errors = design.validate_plan(bad)
+    results.append(_ok(
+        'registry rejects an unpromotable interaction and a sub-1.0 inflation',
+        any('interaction.required_for_claim is set' in e
+            for e in stale_errors)
+        and any('sd_inflation must be >= 1.0' in e for e in bad_errors)
+        and design.validate_plans() == [],
+        f'{stale_errors[:1]}'))
+    return results
+
+
 def main():
     info = configure_torch_for_device()
     device = info.device
@@ -7804,6 +7888,10 @@ def main():
     # FP8 block-scaled state storage priced through the decode ledger.
     all_results += _run_safe(test_fp8_state_storage_ledger, device)
     all_results += _run_safe(test_online_softmax_shared_kv_tiling, device)
+    # Planning-layer contract: a pre-registered 2x2 interaction is a
+    # four-cell contrast and cannot borrow the main-effect seed budget.
+    all_results += _run_safe(test_interaction_planning_is_four_cell_budgeted,
+                             device)
 
     passed = sum(r['status'] == 'PASS' for r in all_results)
     logger.info('-' * 70)

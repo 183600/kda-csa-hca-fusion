@@ -124,6 +124,8 @@ __all__ = [
     'equivalence_seeds_required',
     'equivalence_power',
     'equivalence_plan',
+    'interaction_planning',
+    'INTERACTION_SD_INFLATION',
     'common_analyzed_seeds',
     'audit_run',
     'pilot_sd_from_rows',
@@ -137,6 +139,23 @@ DEFAULT_SEED_BASE = 42
 DEFAULT_ALPHA = 0.05
 DEFAULT_TARGET_POWER = 0.80
 DEFAULT_ASSUMED_SD = 0.10
+
+# A 2x2 interaction I = d - b - c + a is a FOUR-cell contrast, not a
+# two-cell one. Under the shared-seed / independent-cell-noise model that
+# motivates the paired design (cell value = treatment mean + shared seed
+# effect + independent cell noise of variance sigma^2):
+#
+#   Var(B - A) = 2 * sigma^2
+#   Var(I)     = 4 * sigma^2      (the shared seed effect cancels)
+#
+# so SD(I) = sqrt(2) * SD(B - A). The registry's ``assumed_sd`` is already
+# a paired-DIFFERENCE SD (the pilot extracts ``sd_diff``), so interaction
+# planning must inflate it by sqrt(2); reusing the main-effect SD for a
+# four-cell contrast overstates its power and understates the seed budget
+# by a factor of about two. Positive cross-cell correlation of the
+# treatment noise makes this conservative; a negative correlation would
+# violate it, so the assumption is recorded in every interaction report.
+INTERACTION_SD_INFLATION = math.sqrt(2.0)
 
 
 class DesignError(ValueError):
@@ -384,6 +403,33 @@ PLANS: dict[str, dict] = {
                      '0.10 superiority SESOI, so equivalence at 0.05 is '
                      'reported but not powered'),
         },
+        # The transfer question is an INTERACTION, so it needs its own
+        # variance budget: I_route = (D-A)_r1 - (D-A)_r2 is a four-cell
+        # contrast whose SD is sqrt(2) times the two-cell paired-difference
+        # SD that ``assumed_sd`` describes. Planning it at the main-effect
+        # SD would quietly overstate the transfer power. The interaction
+        # is tested inside the SAME run-wide family (24), so the record
+        # inherits that family rather than pretending it is 3 independent
+        # tests. It is marked required_for_claim=False for the same reason
+        # as the TOST endpoint: the registered 14-seed budget is sized for
+        # the main effects and does not reach the interaction requirement.
+        'interaction': {
+            'estimand': ('route x layout transfer '
+                         'I_route(D) = (D-A)_route1 - (D-A)_route2, one row '
+                         'per memory-route pair (KDA/Mamba-2 included)'),
+            'sesoi': 0.10,
+            'alternative': 'two-sided',
+            'sd_inflation': INTERACTION_SD_INFLATION,
+            'required_for_claim': False,
+            'source': ('run_ablation._matrix_contrast_report computes '
+                       'I_route with multi_seed_stats.interaction_contrast '
+                       'and tests it two-sided inside the same run-wide '
+                       'Bonferroni family as the main contrasts'),
+            'note': ('a 2x2 interaction has SD sqrt(2) x the paired '
+                     'difference SD assumed for a main effect; the '
+                     'interaction budget is therefore larger than the '
+                     'main-effect budget and is reported separately'),
+        },
         'analysis': (
             'seed-paired t-test under one Bonferroni family over every '
             'contrast row; one-sided for the pre-registered layout '
@@ -454,6 +500,26 @@ PLANS: dict[str, dict] = {
         'target_power': DEFAULT_TARGET_POWER,
         'screening_seeds': 5,
         'planned_seeds': 14,
+        # The pre-registered RoPE x density interaction is a four-cell
+        # contrast: its SD is sqrt(2) x the paired-difference SD used for
+        # the main effects, and it is tested inside the shared family of 6.
+        # The 14-seed main-effect budget is not the interaction budget, so
+        # the interaction record is descriptive unless a dedicated run
+        # reaches its own required n (see docs/experiment-design.md).
+        'interaction': {
+            'estimand': ('RoPE x selection-density interaction '
+                         'I = no_rope_dense - no_rope - dense + baseline'),
+            'sesoi': 0.10,
+            'alternative': 'two-sided',
+            'sd_inflation': INTERACTION_SD_INFLATION,
+            'required_for_claim': False,
+            'source': ('run_mechanism_ablation.mechanism_interaction_contrasts '
+                       'via multi_seed_stats.interaction_contrast; one test '
+                       'in the shared family of 6'),
+            'note': ('the registered 14-seed budget is sized for the '
+                     'main-effect SESOI; a 2x2 interaction needs a larger '
+                     'seed block at the same SESOI'),
+        },
         'analysis': (
             'two-sided seed-paired t-test vs baseline, Bonferroni-corrected '
             'over the compared variants and the pre-registered interaction; '
@@ -756,6 +822,52 @@ def validate_plan(plan) -> list[str]:
                 errors.append('equivalence.required_for_claim must be a bool')
             else:
                 equiv_required = flag
+    # The interaction endpoint has its own SESOI, family, alternative and
+    # variance inflation. It is optional (only plans that pre-register a
+    # 2x2 difference-in-differences need it), but when present it must be
+    # internally coherent and it may not silently reuse a looser test.
+    inter = plan.get('interaction')
+    interaction_required = False
+    if inter is not None:
+        if not isinstance(inter, dict):
+            errors.append('interaction must be a dict when present')
+        else:
+            i_sesoi = inter.get('sesoi', plan.get('sesoi'))
+            if not _is_number(i_sesoi) or float(i_sesoi) <= 0.0:
+                errors.append('interaction.sesoi must be a finite number > 0')
+            i_alt = inter.get('alternative', 'two-sided')
+            if i_alt not in ('two-sided', 'greater', 'less'):
+                errors.append(
+                    "interaction.alternative must be "
+                    "'two-sided'|'greater'|'less'")
+            i_family = inter.get('family_size', family)
+            if not _is_int(i_family) or i_family < 1:
+                errors.append('interaction.family_size must be an int >= 1')
+            i_alpha = inter.get('alpha', alpha)
+            if not _is_number(i_alpha) or not (0.0 < float(i_alpha) < 1.0):
+                errors.append('interaction.alpha must be in (0,1)')
+            elif _is_int(i_family) and i_family >= 1 \
+                    and float(i_alpha) / i_family >= 0.5:
+                errors.append(
+                    'interaction.alpha / interaction.family_size must be '
+                    'below 0.5')
+            i_target = inter.get('target_power', target)
+            if not _is_number(i_target) or not (0.0 < float(i_target) < 1.0):
+                errors.append('interaction.target_power must be in (0,1)')
+            i_inflation = inter.get('sd_inflation', INTERACTION_SD_INFLATION)
+            if not _is_number(i_inflation) or float(i_inflation) <= 0.0:
+                errors.append(
+                    'interaction.sd_inflation must be a finite number > 0')
+            elif float(i_inflation) < 1.0:
+                errors.append(
+                    'interaction.sd_inflation must be >= 1.0: a four-cell '
+                    'interaction cannot be less variable than the two-cell '
+                    'contrast it is built from')
+            flag = inter.get('required_for_claim', False)
+            if not isinstance(flag, bool):
+                errors.append('interaction.required_for_claim must be a bool')
+            else:
+                interaction_required = flag
     if errors:
         return errors
     # A plan whose declared confirmatory budget does not reach its own
@@ -801,6 +913,20 @@ def validate_plan(plan) -> list[str]:
                 f"alpha={eq.get('alpha_per_test')!r}; raise planned_seeds, "
                 'widen the pre-specified margin, or record '
                 'required_for_claim=False and treat equivalence as '
+                'descriptive')
+    if interaction_required:
+        ip = rep.get('interaction') or {}
+        if not ip.get('supports_interaction_at_planned_n'):
+            errors.append(
+                'interaction.required_for_claim is set, but the planned '
+                f"seeds={plan.get('planned_seeds')!r} do not reach the "
+                f"interaction requirement "
+                f"required_seeds={ip.get('required_seeds')!r} at "
+                f"sesoi={ip.get('sesoi')!r}, sd_inflation="
+                f"{ip.get('sd_inflation')!r} and the corrected per-test "
+                f"alpha={ip.get('alpha_per_test')!r}; raise planned_seeds, "
+                'reduce the interaction SESOI, or record '
+                'required_for_claim=False and treat the interaction as '
                 'descriptive')
     return errors
 
@@ -1026,6 +1152,148 @@ def equivalence_plan(*, margin, sd, seeds, alpha=DEFAULT_ALPHA,
     }
 
 
+def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
+                         family_size=1, alternative='two-sided',
+                         target_power=DEFAULT_TARGET_POWER,
+                         sd_inflation=INTERACTION_SD_INFLATION,
+                         required_for_claim=False, estimand=None,
+                         source=None, note=None) -> dict:
+    """Prospective read-out for a pre-registered 2x2 interaction endpoint.
+
+    A difference-in-differences ``I = d - b - c + a`` is a four-cell
+    contrast. ``sd`` is the paired-difference SD used for a two-cell main
+    effect; the interaction SD is ``sd * sd_inflation`` because
+    ``Var(I) = 4*sigma^2`` while ``Var(B-A) = 2*sigma^2`` under the
+    shared-seed / independent-cell-noise model. ``sd_inflation`` is
+    exposed so a plan can replace the default with a value calibrated from
+    a dedicated interaction pilot, but it may not be below 1.0: a
+    four-cell contrast cannot be less variable than a two-cell one without
+    a negative cross-cell correlation, which the design does not assume.
+
+    ``family_size`` is the multiplicity family the interaction is tested
+    in (the same run-wide family as the main contrasts for Exp 5b/8), not
+    the number of interaction rows. ``required_for_claim`` mirrors the TOST
+    endpoint: when true the registry must actually reach this budget.
+    """
+    sesoi = _need_number(sesoi, 'interaction sesoi', positive=True)
+    sd_value = _need_number(sd, 'sd', positive=True)
+    inflation = _need_number(sd_inflation, 'interaction sd_inflation',
+                             positive=True)
+    if inflation < 1.0:
+        raise DesignError(
+            'interaction sd_inflation must be >= 1.0: a four-cell '
+            'difference-in-differences cannot have a smaller SD than the '
+            f'two-cell contrast it is built from, got {inflation!r}')
+    if not _is_int(seeds) or seeds < 0:
+        raise DesignError(f'seeds must be a non-negative int, got {seeds!r}')
+    alpha_value = _need_number(alpha, 'alpha')
+    if not (0.0 < alpha_value < 1.0):
+        raise DesignError(f'alpha must be in (0,1), got {alpha_value!r}')
+    if not _is_int(family_size) or family_size < 1:
+        raise DesignError(
+            f'interaction family_size must be an int >= 1, got '
+            f'{family_size!r}')
+    if alternative not in ('two-sided', 'greater', 'less'):
+        raise DesignError(
+            "interaction alternative must be "
+            f"'two-sided'|'greater'|'less', got {alternative!r}")
+    target = _need_number(target_power, 'target_power', positive=True)
+    if not (0.0 < target < 1.0):
+        raise DesignError(f'target_power must be in (0,1), got {target!r}')
+    if not isinstance(required_for_claim, bool):
+        raise DesignError(
+            f'required_for_claim must be a bool, got {required_for_claim!r}')
+    sd_interaction = sd_value * inflation
+    if not math.isfinite(sd_interaction):
+        raise DesignError(
+            'sd * interaction sd_inflation is not a finite float')
+    # ``alpha_test`` is the one-sided TAIL probability the runner's
+    # corrected threshold uses; multi_seed_stats takes a TEST level and
+    # halves it internally, so undo that for the symmetric alternatives.
+    alpha_test = (alpha_value / family_size
+                  if alternative in ('greater', 'less')
+                  else alpha_value / (2.0 * family_size))
+    planning_alpha = (alpha_test if alternative in ('greater', 'less')
+                      else 2.0 * alpha_test)
+    dz = sesoi / sd_interaction
+    required = seeds_required(
+        dz, alpha=planning_alpha, power=target, alternative=alternative)
+    if required is not None:
+        required = max(2, int(required))
+    mde = min_detectable_effect(
+        seeds, sd_interaction, alpha=planning_alpha, power=target,
+        alternative=alternative)
+    planning_effect = -sesoi if alternative == 'less' else sesoi
+    achieved = power_at_effect(
+        seeds, sd_interaction, planning_effect, alpha=planning_alpha,
+        alternative=alternative)
+    exact = exact_test_resolution(
+        seeds, alpha=alpha_value, family_size=family_size,
+        alternative=alternative)
+    supported = bool(
+        required is not None and seeds >= required
+        and achieved is not None and achieved >= target - 1e-9
+        and exact.get('family_testable', True))
+    if seeds < 2 or required is None:
+        status = 'not_estimable'
+    elif supported:
+        status = 'confirmatory_ready'
+    else:
+        status = 'underpowered_at_sesoi'
+    exact_warning = None
+    if not exact.get('family_testable', True):
+        exact_warning = (
+            'the exact sign-flip test has no rejection region for this '
+            f'interaction at n={seeds} and family_size={family_size}: the '
+            'smallest attainable Holm-adjusted p is '
+            f"{exact.get('min_attainable_p_holm')!r} > alpha="
+            f'{alpha_value:g}; the interaction is screening-only')
+    shortfall = (max(0, int(required) - int(seeds))
+                 if required is not None else None)
+    return {
+        'estimand': estimand,
+        'sesoi': sesoi,
+        'assumed_sd': sd_value,
+        'sd_inflation': inflation,
+        'sd_interaction': sd_interaction,
+        'standardized_effect_dz': dz,
+        'alpha_family_wise': alpha_value,
+        'family_size': family_size,
+        'alpha_per_test': alpha_test,
+        'alternative': alternative,
+        'target_power': target,
+        'seeds': int(seeds),
+        'required_seeds': required,
+        'shortfall_seeds': shortfall,
+        'planned_mde': mde,
+        'planned_power': achieved,
+        'power_gap': (None if achieved is None else target - achieved),
+        'supports_interaction_at_planned_n': supported,
+        'required_for_claim': bool(required_for_claim),
+        'claim_allowed': bool(supported),
+        'status': status,
+        'exact_test_resolution': exact,
+        'exact_test_warning': exact_warning,
+        'source': source,
+        'note': note,
+        'method': (
+            'normal approximation for planning only: '
+            'n = ceil(((z_crit + z_power) * sd_interaction / SESOI)^2), '
+            'with sd_interaction = sd * sqrt(2) under the shared-seed / '
+            'independent-cell-noise model; inference uses the paired t / '
+            'exact sign-flip tests on the per-seed difference-in-'
+            'differences in multi_seed_stats.interaction_contrast'),
+        'caveat': (
+            'the sqrt(2) inflation is a model assumption, not a measured '
+            'quantity: a shared seed effect cancels in I but independent '
+            'cell noise does not. Positive cross-cell correlation makes it '
+            'conservative; a dedicated four-cell pilot can replace it. The '
+            'main-effect seed budget is not the interaction budget, and a '
+            'non-significant interaction is inconclusive, never evidence '
+            'of additivity'),
+    }
+
+
 def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                     alpha=None, alternative=None, sesoi=None,
                     target_power=None) -> dict:
@@ -1160,6 +1428,42 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
             source=equiv_cfg.get('source'),
             note=equiv_cfg.get('note'),
         )
+    # Interactions are a separate endpoint with a DIFFERENT variance
+    # budget from the main effects. Reporting it next to (not inside) the
+    # main planning record keeps "this run is confirmatory for a two-cell
+    # contrast" from being read as "this run is confirmatory for the
+    # difference-in-differences".
+    interaction = None
+    interaction_cfg = plan.get('interaction')
+    if interaction_cfg is not None:
+        if not isinstance(interaction_cfg, Mapping):
+            raise DesignError(
+                'plan.interaction must be a mapping of sesoi/alternative/'
+                f'family_size/sd_inflation, got '
+                f'{type(interaction_cfg).__name__}')
+        interaction_flag = interaction_cfg.get('required_for_claim', False)
+        if not isinstance(interaction_flag, bool):
+            raise DesignError(
+                'plan.interaction.required_for_claim must be a bool, got '
+                f'{interaction_flag!r}')
+        interaction = interaction_planning(
+            sesoi=interaction_cfg.get('sesoi', sesoi_value),
+            sd=sd_value,
+            seeds=n_seeds,
+            alpha=(alpha if interaction_cfg.get('alpha') is None
+                   else interaction_cfg['alpha']),
+            family_size=(family if interaction_cfg.get('family_size') is None
+                         else interaction_cfg['family_size']),
+            alternative=interaction_cfg.get('alternative', 'two-sided'),
+            target_power=(target if interaction_cfg.get('target_power') is None
+                          else interaction_cfg['target_power']),
+            sd_inflation=interaction_cfg.get(
+                'sd_inflation', INTERACTION_SD_INFLATION),
+            required_for_claim=interaction_flag,
+            estimand=interaction_cfg.get('estimand'),
+            source=interaction_cfg.get('source'),
+            note=interaction_cfg.get('note'),
+        )
     return {
         'sesoi': sesoi_value,
         'assumed_sd': sd_value,
@@ -1183,6 +1487,12 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         'equivalence_claim_allowed': (
             None if equivalence is None
             else equivalence['supports_equivalence_at_planned_n']),
+        'interaction': interaction,
+        'interaction_status': (
+            None if interaction is None else interaction['status']),
+        'interaction_claim_allowed': (
+            None if interaction is None
+            else interaction['supports_interaction_at_planned_n']),
         'method': ('normal approximation for planning only: '
                    'n = ceil(((z_crit + z_power) / (SESOI / SD))^2); '
                    'inference uses the exact/t tests in multi_seed_stats'),
@@ -1192,7 +1502,10 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                  'n, so treat the target power as a floor to beat, not a '
                  'promise. Equivalence is a separate endpoint: see the '
                  'nested equivalence record, whose required n is usually '
-                 'larger. exact_test_resolution is an independent '
+                 'larger. A 2x2 interaction is a four-cell contrast with a '
+                 'larger SD than the main-effect paired difference: see the '
+                 'nested interaction record, whose required n is usually '
+                 'larger still. exact_test_resolution is an independent '
                  'feasibility check on the discrete exact test: when '
                  'family_testable is False no p-value from that family '
                  'could have crossed alpha, whatever the observed effect.'),
@@ -1428,6 +1741,10 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     equivalence_supported = bool(
         equivalence is not None
         and equivalence.get('supports_equivalence_at_planned_n'))
+    interaction = planning.get('interaction')
+    interaction_supported = bool(
+        interaction is not None
+        and interaction.get('supports_interaction_at_planned_n'))
     planned_family = plan.get('planned_family_size')
     family_reduced = (family_size is not None
                       and family_size < int(planned_family))
@@ -1461,6 +1778,11 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         # None = the plan makes no TOST equivalence claim.
         'equivalence_supported': (
             None if equivalence is None else equivalence_supported),
+        # None = the plan makes no pre-registered interaction claim. A
+        # four-cell interaction has its own (larger) seed requirement; the
+        # main-effect confirmatory status does not cover it.
+        'interaction_budget_supports_claim': (
+            None if interaction is None else interaction_supported),
         # A necessary (not sufficient) feasibility check: if the discrete
         # exact test has no rejection region at this n/family, no outcome
         # could have crossed alpha.
@@ -1477,6 +1799,17 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             f"{equivalence['target_power']:.0%} power at a true difference "
             f"of zero; this run has {n_seeds}. Equivalence verdicts are "
             "descriptive only and must not be cited as confirmatory")
+    if interaction is not None and not interaction_supported:
+        design_warnings.append(
+            f"the pre-registered interaction {interaction.get('estimand')!r} "
+            f"needs {interaction.get('required_seeds')!r} seeds for "
+            f"{interaction['target_power']:.0%} power at its SESOI "
+            f"{interaction['sesoi']!r} with sd_inflation "
+            f"{interaction['sd_inflation']!r} (four-cell contrast); this run "
+            f"has {n_seeds} seeds at family size "
+            f"{interaction['family_size']}. The interaction verdict is "
+            "descriptive only and must not be cited as a confirmatory "
+            "transfer/complementarity claim")
     if family_expanded:
         design_warnings.append(
             f"the observed family size {family_size} exceeds the "
@@ -1531,6 +1864,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                   'directional_claim_at_sesoi']
         if equivalence_supported:
             claims.append('practical_equivalence_at_margin')
+    # The interaction is a separate estimand: even a confirmatory main-effect
+    # run may only cite it when its own four-cell budget reaches its own
+    # required n. This never upgrades a screening/reduced-family run.
+    if interaction is not None and interaction_supported \
+            and status == 'confirmatory':
+        claims.append('interaction_claim_at_sesoi')
     analysis_planning = None
     if population_provided and n_analyzed is not None:
         # Realized sensitivity of the population that was actually
@@ -1570,6 +1909,10 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'equivalence_claim_allowed': (
             None if equivalence is None
             else bool(equivalence_supported and status == 'confirmatory')),
+        'interaction': interaction,
+        'interaction_claim_allowed': (
+            None if interaction is None
+            else bool(interaction_supported and status == 'confirmatory')),
         'design_warnings': design_warnings,
         'claims_allowed': claims,
         'interpretation': {
@@ -1580,7 +1923,10 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                              'reported as confirmatory. A practical-'
                              'equivalence claim additionally requires '
                              'equivalence_claim_allowed=True, which uses '
-                             'the separate TOST margin and family'),
+                             'the separate TOST margin and family. An '
+                             'interaction claim additionally requires '
+                             'interaction_claim_allowed=True, which uses '
+                             'the separate four-cell SD budget'),
             'reduced_family': (
                 'the run reaches the required n only because it tests a '
                 'subset of the pre-registered contrast family; report it as '
@@ -1929,6 +2275,13 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
         required_equivalence_conservative = (
             conservative_plan.get('equivalence') or {}
         ).get('required_seeds_at_zero')
+    # Interaction endpoints are a four-cell contrast on the same pilot
+    # difference SD. Report their own (larger) requirement next to the
+    # main-effect recommendation; a pilot meant to size an interaction
+    # claim should still measure the difference-in-differences SD directly
+    # rather than relying on the sqrt(2) model assumption.
+    interaction = pooled_plan.get('interaction') or {}
+    required_interaction = interaction.get('required_seeds')
     return {
         'plan_id': plan_id,
         'status': status,
@@ -1955,6 +2308,7 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
         'required_seeds_equivalence': required_equivalence,
         'required_seeds_equivalence_conservative':
             required_equivalence_conservative,
+        'required_seeds_interaction': required_interaction,
         'recommended_seeds': recommended,
         'planned_confirmatory_seeds': plan['planned_seeds'],
         'recommendation': (
@@ -1974,6 +2328,15 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
                 if required_equivalence_conservative is not None else '')
              + '; the superiority recommendation above is not sufficient '
              'for a practical-equivalence claim')),
+        'interaction_recommendation': (
+            'this plan makes no pre-registered interaction claim'
+            if not interaction else
+            (f'the four-cell interaction at SESOI '
+             f'{interaction.get("sesoi")} needs '
+             f'{required_interaction} seeds at the pooled SD '
+             f'(SD_interaction = {interaction.get("sd_inflation")} x the '
+             'pilot difference SD); the main-effect recommendation above '
+             'is not sufficient for a transfer/complementarity claim')),
         'caveat': (
             'the pilot SD is estimated from few seed pairs and is itself '
             'uncertain; the conservative recommendation uses the largest '
@@ -2049,7 +2412,10 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
         'note': ('Registry of the pre-registered multi-seed designs. '
                  'planning is prospective (SESOI + assumed SD + '
                  'corrected alpha), not post-hoc. A run whose audit '
-                 'status is screening is not confirmatory.'),
+                 'status is screening is not confirmatory. Equivalence and '
+                 '2x2-interaction endpoints carry their own budgets (TOST '
+                 'margin and four-cell SD respectively); a superiority '
+                 'budget does not cover either'),
         'method': ('normal approximation for planning only; inference '
                    'uses multi_seed_stats exact sign/permutation and '
                    't tests'),
@@ -2097,7 +2463,8 @@ def write_design_manifest(path: str, *, plan_ids=None,
 
 def _print_table(manifest: dict) -> None:
     header = (f"{'plan':<16} {'n':>3} {'family':>6} {'SESOI':>6} "
-              f"{'SD':>5} {'need':>5} {'power':>6} {'eq_n':>5}  status")
+              f"{'SD':>5} {'need':>5} {'power':>6} {'eq_n':>5} "
+              f"{'int_n':>5}  status")
     print(header)
     print('-' * len(header))
     for row in manifest['results']:
@@ -2109,16 +2476,23 @@ def _print_table(manifest: dict) -> None:
         eq = p.get('equivalence') or {}
         eq_need = ('-' if eq.get('required_seeds_at_zero') is None
                    else str(eq['required_seeds_at_zero']))
+        inter = p.get('interaction') or {}
+        int_need = ('-' if inter.get('required_seeds') is None
+                    else str(inter['required_seeds']))
         print(f"{row['plan_id']:<16} {row['n_seeds']:>3} "
               f"{p['family_size']:>6} {p['sesoi']:>6.2f} "
               f"{p['assumed_sd']:>5.2f} {need:>5} {power:>6} "
-              f"{eq_need:>5}  {row['status']}")
+              f"{eq_need:>5} {int_need:>5}  {row['status']}")
     print('\nPlanning is normal-approximation; status=screening means the '
           'seed budget is below the pre-registered confirmatory n.')
     print('eq_n is the separate TOST budget at the registered equivalence '
           'margin; "-" means the plan makes no equivalence claim. A plan can '
           'be confirmatory_ready for superiority and still not support an '
           'equivalence claim.')
+    print('int_n is the separate four-cell interaction budget (SD = '
+          'sqrt(2) x the main-effect paired-difference SD); "-" means the '
+          'plan makes no interaction claim. The main-effect budget is not '
+          'the interaction budget.')
 
 
 def main(argv=None) -> int:

@@ -857,3 +857,84 @@ def test_planning_mde_and_minimum_margin_are_json_safe_at_float_limit():
     json.dumps(report, allow_nan=False)
     assert D._is_number(10 ** 400) is False
     assert D._clean_float(10 ** 400) is None
+
+
+def test_interaction_planning_uses_the_four_cell_variance_budget():
+    """A 2x2 interaction is planned at sqrt(2) x the main-effect SD."""
+    for plan_id, expected_family in (('exp5b_matrix', 24),
+                                     ('exp8_mechanism', 6)):
+        rep = D.planning_report(plan_id)
+        inter = rep['interaction']
+        assert inter is not None
+        assert inter['family_size'] == expected_family
+        assert inter['alternative'] == 'two-sided'
+        assert inter['sd_inflation'] == D.INTERACTION_SD_INFLATION
+        assert abs(inter['sd_interaction']
+                   - rep['assumed_sd'] * inter['sd_inflation']) < 1e-12
+        # The four-cell contrast is strictly less powerful than the
+        # two-cell main effect at the same n and SESOI: same budget must
+        # not silently cover the interaction.
+        assert inter['required_seeds'] > rep['required_seeds']
+        assert inter['planned_power'] < rep['planned_power']
+        assert inter['supports_interaction_at_planned_n'] is False
+        assert inter['status'] == 'underpowered_at_sesoi'
+        assert inter['shortfall_seeds'] == (
+            inter['required_seeds'] - inter['seeds'])
+        json.dumps(rep, allow_nan=False)
+
+    assert D.planning_report('exp4_mqar')['interaction'] is None
+    assert D.planning_report('exp4_mqar')['interaction_status'] is None
+    assert D.planning_report('exp4_mqar')['interaction_claim_allowed'] is None
+    assert D.validate_plans() == []
+
+
+def test_interaction_audit_labels_without_upgrading_the_main_status():
+    levels = {'memory': ['kda', 'mamba2', 'rwkv7'],
+              'layout_unit': ['A', 'B', 'C', 'D']}
+    rep = D.planning_report('exp5b_matrix')
+    unpowered = D.audit_run(
+        'exp5b_matrix', seeds=[42 + i for i in range(14)],
+        levels=levels, family_size=24)
+    # The main-effect design is confirmatory; the interaction claim is not.
+    assert unpowered['status'] == 'confirmatory'
+    assert unpowered['interaction_claim_allowed'] is False
+    assert unpowered['checks']['interaction_budget_supports_claim'] is False
+    assert 'interaction_claim_at_sesoi' not in unpowered['claims_allowed']
+    assert any('interaction' in w and 'descriptive' in w
+               for w in unpowered['design_warnings'])
+
+    enough = rep['interaction']['required_seeds']
+    powered = D.audit_run(
+        'exp5b_matrix', seeds=[42 + i for i in range(enough)],
+        levels=levels, family_size=24)
+    assert powered['status'] == 'confirmatory'
+    assert powered['interaction_claim_allowed'] is True
+    assert 'interaction_claim_at_sesoi' in powered['claims_allowed']
+    assert not any('interaction' in w for w in powered['design_warnings'])
+
+    # A plan that *requires* the interaction cannot keep a budget that
+    # cannot power it.
+    stale = D.get_plan('exp8_mechanism')
+    stale['interaction']['required_for_claim'] = True
+    errors = D.validate_plan(stale)
+    assert any('interaction.required_for_claim is set' in e for e in errors)
+    # The four-cell variance can never be below the two-cell one.
+    bad = D.get_plan('exp8_mechanism')
+    bad['interaction']['sd_inflation'] = 0.5
+    assert any('sd_inflation must be >= 1.0' in e
+               for e in D.validate_plan(bad))
+
+
+def test_pilot_reports_the_separate_interaction_budget():
+    rows = []
+    for group, base in (('KDA-A', 0.5), ('KDA-D', 0.7)):
+        rows.append({'group': group, 'n_kv': 1,
+                     'per_seed': [
+                         {'seed': seed, 'final_acc': acc}
+                         for seed, acc in zip(
+                             (42, 43, 44),
+                             (base, base + 0.05, base - 0.05))]})
+    rep = D.pilot_report('exp5b_matrix', rows)
+    assert rep['required_seeds_interaction'] is not None
+    assert rep['required_seeds_interaction'] >= rep['required_seeds_pooled_sd']
+    assert 'four-cell interaction' in rep['interaction_recommendation']
