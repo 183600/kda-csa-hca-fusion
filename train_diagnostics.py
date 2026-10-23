@@ -84,6 +84,22 @@ VAL_MONITOR_SEED_OFFSET = 6_000_000
 # example printed here can never be one the model was trained or selected on.
 ERROR_ANALYSIS_SEED_OFFSET = 7_000_000
 
+
+def _finite_float_or_none(value):
+    """Finite real float, or ``None`` for a malformed/oversized metric.
+
+    Result rows are JSON, whose integers are unbounded; ``float(10**400)``
+    raises ``OverflowError``. Such a value is not a usable measurement, so
+    callers skip it instead of aborting the analysis.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
 # --------------------------------------------------------------------------
 # 1. Systematic NaN/Inf triage
 # --------------------------------------------------------------------------
@@ -308,7 +324,14 @@ def summarize_gradient_norms(grad_norms, *, clip_norm: float | None = None
     All values are finite-only; non-finite norms are counted separately
     (``n_nonfinite``) rather than poisoning the summary with NaN.
     """
-    vals = [float(g) for g in grad_norms if g is not None]
+    vals = []
+    for g in grad_norms:
+        if g is None:
+            continue
+        number = _finite_float_or_none(g)
+        # A malformed/oversized norm is counted like any other non-finite
+        # value instead of raising from float().
+        vals.append(float('nan') if number is None else number)
     if not vals:
         return None
     finite = [v for v in vals if math.isfinite(v)]
@@ -764,24 +787,28 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         'cost_keys': list(cost_keys),
         'recommendation': '',
     }
-    if acc is None or base is None or not (
-            math.isfinite(float(acc)) and math.isfinite(float(base))):
+    if acc is None or base is None:
+        candidate_acc = baseline_acc = None
+    else:
+        candidate_acc = _finite_float_or_none(acc)
+        baseline_acc = _finite_float_or_none(base)
+    if candidate_acc is None or baseline_acc is None:
         report['recommendation'] = (
             'no comparable accuracy recorded for both sides; refusing to '
             'call this an improvement.')
         return report
 
-    delta = float(acc) - float(base)
+    delta = candidate_acc - baseline_acc
     report['accuracy_delta'] = delta
-    report['relative_accuracy_gain'] = (delta / float(base)) if base else None
+    report['relative_accuracy_gain'] = (
+        delta / baseline_acc) if baseline_acc else None
 
     ratios = {}
     missing = []
     for key in cost_keys:
-        c, b = candidate.get(key), baseline.get(key)
-        try:
-            c, b = float(c), float(b)
-        except (TypeError, ValueError):
+        c = _finite_float_or_none(candidate.get(key))
+        b = _finite_float_or_none(baseline.get(key))
+        if c is None or b is None:
             missing.append(key)
             continue
         if not (math.isfinite(c) and math.isfinite(b)):
@@ -929,13 +956,17 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
                 ca['n_confident_wrong'] += int(
                     conf.get('n_confident_wrong', 0) or 0)
                 ca['sum_pred_prob'] += (
-                    float(conf.get('mean_pred_prob') or 0.0) * n_scored)
+                    (_finite_float_or_none(conf.get('mean_pred_prob'))
+                     or 0.0) * n_scored)
                 ca['sum_target_prob'] += (
-                    float(conf.get('mean_target_prob') or 0.0) * n_scored)
+                    (_finite_float_or_none(conf.get('mean_target_prob'))
+                     or 0.0) * n_scored)
                 ca['sum_margin'] += (
-                    float(conf.get('mean_margin') or 0.0) * n_scored)
+                    (_finite_float_or_none(conf.get('mean_margin'))
+                     or 0.0) * n_scored)
                 ca['sum_entropy_ratio'] += (
-                    float(conf.get('mean_entropy_ratio') or 0.0) * n_scored)
+                    (_finite_float_or_none(conf.get('mean_entropy_ratio'))
+                     or 0.0) * n_scored)
     for v in pooled.values():
         v['rate_of_wrong'] = (v['count'] / n_wrong) if n_wrong else 0.0
         v['rate_of_all'] = (v['count'] / n_samples) if n_samples else 0.0
@@ -972,10 +1003,10 @@ def pool_error_analyses(per_seed: Sequence[Mapping], *,
         }
 
     def _acc(r):
-        value = r.get(accuracy_key)
-        if value is None or not math.isfinite(float(value)):
+        value = _finite_float_or_none(r.get(accuracy_key))
+        if value is None:
             return float('inf')
-        return float(value)
+        return value
 
     worst = min(rows, key=_acc)
     worst_ea = worst['error_analysis']

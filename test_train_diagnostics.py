@@ -336,6 +336,52 @@ def test_accuracy_cost_tradeoff_screens_effect_significance_and_cost():
     assert len(complete['measured_cost_keys']) == 6
 
 
+def test_oversized_json_integers_are_skipped_by_tradeoff_and_pooling():
+    """JSON ints beyond the float range are malformed metrics, not crashes.
+
+    They must not raise from ``float()`` in the gradient summary, the
+    accuracy/cost screen, or the bad-case pooling.
+    """
+    huge = 10 ** 400
+
+    grads = summarize_gradient_norms([huge, 1.0], clip_norm=1.0)
+    assert grads['n_steps'] == 2 and grads['n_nonfinite'] == 1
+    assert grads['max'] == 1.0
+    json.dumps(grads, allow_nan=False)
+
+    base = {'mean_acc': 0.5, 'n_params': 10, 'mean_train_time_s': 1.0}
+    no_acc = accuracy_cost_tradeoff({**base, 'mean_acc': huge}, base)
+    assert no_acc['verdict'] == 'indeterminate'
+    assert 'no comparable accuracy' in no_acc['recommendation']
+    huge_cost = accuracy_cost_tradeoff(
+        {**base, 'mean_acc': 0.6, 'n_params': huge}, base)
+    assert 'n_params' in huge_cost['missing_cost_keys']
+    json.dumps(huge_cost, allow_nan=False)
+
+    def seed(seed_id, acc, confidence):
+        return {
+            'seed': seed_id, 'final_acc': acc,
+            'error_analysis': {
+                'n_samples': 10, 'n_wrong': 1,
+                'categories': {'other': {
+                    'count': 1, 'definition': 'other',
+                    'confidence': confidence}},
+                'examples': {'other': [seed_id]},
+            },
+        }
+    pooled = pool_error_analyses([
+        seed(1, huge, {'n_scored': 2, 'n_confident_wrong': 1,
+                       'mean_pred_prob': huge, 'mean_target_prob': 0.1,
+                       'mean_margin': 0.2, 'mean_entropy_ratio': 0.3}),
+        seed(2, 0.4, {'n_scored': 2, 'n_confident_wrong': 1,
+                      'mean_pred_prob': 0.7, 'mean_target_prob': 0.1,
+                      'mean_margin': 0.2, 'mean_entropy_ratio': 0.3}),
+    ])
+    assert pooled['representative_seed'] == 2
+    assert math.isfinite(pooled['confidence']['mean_pred_prob'])
+    json.dumps(pooled, allow_nan=False)
+
+
 def test_nonfinite_triage_names_first_failing_stage_and_gradient_triage():
     bad = torch.tensor([float('nan'), 1.0])
     diag = triage_nonfinite(inputs={'x': bad}, loss=float('nan'))
