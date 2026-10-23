@@ -151,7 +151,8 @@ def test_resolution_validation():
     for bad_family in (0, -2, 1.5, True):
         with pytest.raises(ValueError):
             M.exact_test_resolution(5, family_size=bad_family)
-    for bad_alpha in (0.0, 1.0, -0.1, 1.1, float('nan'), True):
+    for bad_alpha in (0.0, 1.0, -0.1, 1.1, float('nan'), True,
+                      10 ** 400):
         with pytest.raises(ValueError):
             M.exact_test_resolution(5, alpha=bad_alpha)
     with pytest.raises(ValueError):

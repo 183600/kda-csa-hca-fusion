@@ -329,10 +329,27 @@ def _safe_median(values):
 def _validate_alpha(alpha) -> float:
     if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
         raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
-    alpha = float(alpha)
+    try:
+        alpha = float(alpha)
+    except OverflowError:
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
     if not (0.0 < alpha < 1.0):
         raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
     return alpha
+
+
+def _is_finite_real(value) -> bool:
+    """True for a non-bool real representable as a finite float.
+
+    JSON integers are unbounded; a value too large for ``float()`` is a
+    malformed numeric input, not a reason to leak ``OverflowError``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def _beta_quantile(q: float, a: float, b: float) -> float:
@@ -1009,7 +1026,10 @@ def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
         raise ValueError(
             f'alpha must be in (0, 0.5) for an equivalence CI to exist, '
             f'got {alpha!r}')
-    margin = float(margin)
+    try:
+        margin = float(margin)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f'margin must be finite and > 0, got {margin!r}')
     if not math.isfinite(margin) or margin <= 0.0:
         raise ValueError(
             f'margin must be finite and > 0, got {margin!r}')
@@ -1021,14 +1041,22 @@ def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
     if n_pairs >= 1:
         if mean_diff is None:
             raise ValueError('mean_diff is required when n_pairs >= 1')
-        mean = float(mean_diff)
+        try:
+            mean = float(mean_diff)
+        except (OverflowError, TypeError, ValueError):
+            raise ValueError(
+                f'mean_diff must be finite, got {mean_diff!r}')
         if not math.isfinite(mean):
             raise ValueError(f'mean_diff must be finite, got {mean_diff!r}')
     sd = None
     if n_pairs >= 2:
         if sd_diff is None:
             raise ValueError('sd_diff is required when n_pairs >= 2')
-        sd = float(sd_diff)
+        try:
+            sd = float(sd_diff)
+        except (OverflowError, TypeError, ValueError):
+            raise ValueError(
+                f'sd_diff must be finite and >= 0, got {sd_diff!r}')
         if not math.isfinite(sd) or sd < 0.0:
             raise ValueError(
                 f'sd_diff must be finite and >= 0, got {sd_diff!r}')
@@ -1138,7 +1166,10 @@ def holm_adjust(p_values, alpha: float = 0.05) -> dict:
         if isinstance(p, bool) or not isinstance(p, (int, float)):
             raise ValueError(
                 f'p_values[{i}]={p!r} is not a real number in [0,1]')
-        p = float(p)
+        try:
+            p = float(p)
+        except OverflowError:
+            raise ValueError(f'p_values[{i}]={p!r} is not in [0,1]')
         if not (0.0 <= p <= 1.0) or not math.isfinite(p):
             raise ValueError(f'p_values[{i}]={p!r} is not in [0,1]')
         vals.append(p)
@@ -1180,8 +1211,7 @@ def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
     if not (0.0 < alpha < 1.0) or not (0.0 < power < 1.0):
         raise ValueError(
             f'alpha and power must be in (0,1), got {alpha!r}, {power!r}')
-    if isinstance(sd, bool) or not isinstance(sd, (int, float)) \
-            or not math.isfinite(sd) or sd < 0.0:
+    if not _is_finite_real(sd) or sd < 0.0:
         raise ValueError(f'sd must be finite and >= 0, got {sd!r}')
     if alternative not in ('two-sided', 'greater', 'less'):
         raise ValueError(
@@ -1218,7 +1248,12 @@ def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
             f"got {alternative!r}")
     if isinstance(dz, bool) or not isinstance(dz, (int, float)):
         raise ValueError(f'dz must be a real number, got {dz!r}')
-    dz = float(dz)
+    try:
+        dz = float(dz)
+    except OverflowError:
+        # A JSON-sized integer is not representable; like inf/nan it has no
+        # actionable finite seed budget.
+        return None
     if not math.isfinite(dz) or dz == 0.0:
         return None
     z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
@@ -1270,11 +1305,9 @@ def power_at_effect(n: int, sd: float, effect: float,
         raise ValueError(
             f"alternative must be 'two-sided'|'greater'|'less', "
             f"got {alternative!r}")
-    if isinstance(sd, bool) or not isinstance(sd, (int, float)) \
-            or not math.isfinite(sd) or sd < 0.0:
+    if not _is_finite_real(sd) or sd < 0.0:
         raise ValueError(f'sd must be finite and >= 0, got {sd!r}')
-    if isinstance(effect, bool) or not isinstance(effect, (int, float)) \
-            or not math.isfinite(effect):
+    if not _is_finite_real(effect):
         raise ValueError(f'effect must be finite, got {effect!r}')
     if n < 2:
         return None

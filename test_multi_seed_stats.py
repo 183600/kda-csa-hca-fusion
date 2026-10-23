@@ -464,12 +464,23 @@ def test_power_planning_rejects_invalid_arguments_before_undefined_n():
     with pytest.raises(ValueError):
         M.min_detectable_effect(5, True)
     with pytest.raises(ValueError):
+        M.min_detectable_effect(5, 10 ** 400)
+    with pytest.raises(ValueError):
+        M.power_at_effect(5, 10 ** 400, 0.1)
+    with pytest.raises(ValueError):
+        M.power_at_effect(5, 1.0, 10 ** 400)
+    with pytest.raises(ValueError):
+        M.holm_adjust([10 ** 400])
+    with pytest.raises(ValueError):
+        M.tost_from_summary(0.1, 0.1, 10, 10 ** 400)
+    with pytest.raises(ValueError):
         M.seeds_required(True)
     with pytest.raises(ValueError):
         M.seeds_required('1.0')
     # Zero and non-finite effects stay the documented None cases.
     assert M.seeds_required(float('nan')) is None
     assert M.seeds_required(float('inf')) is None
+    assert M.seeds_required(10 ** 400) is None
 
 
 def test_resampling_arguments_reject_bool_float_and_zero():
