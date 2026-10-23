@@ -636,6 +636,7 @@ def test_worst_seed_selection_picks_lowest_accuracy():
         {'seed': 1, 'accuracy': None},
         {'seed': 2, 'accuracy': 0.10},
         {'seed': 3, 'accuracy': float('nan')},
+        {'seed': 4, 'accuracy': 10 ** 400},
     ]
     worst_mixed = min(mixed, key=R._seed_accuracy_rank)
     _ok('missing accuracy does not win the ranking',

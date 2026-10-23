@@ -2910,10 +2910,8 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     ok_per_seed = [
         r for r in per_seed
         if 'error' not in r
-        and r.get('final_acc') is not None
-        and math.isfinite(r['final_acc'])
-        and r.get('final_loss') is not None
-        and math.isfinite(r['final_loss'])
+        and _is_finite_real(r.get('final_acc'))
+        and _is_finite_real(r.get('final_loss'))
     ]
     if not ok_per_seed:
         # All seeds failed: propagate the error so the caller can record

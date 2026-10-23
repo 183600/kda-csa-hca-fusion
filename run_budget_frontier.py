@@ -794,8 +794,13 @@ def build_quality_join(spec, context_T=MQAR_SEQ_LEN, source_records=None):
             if not isinstance(r, dict):
                 continue
             acc = r.get('mean_acc')
-            if acc is None or not isinstance(acc, (int, float)) \
-                    or not math.isfinite(acc):
+            if acc is None or not isinstance(acc, (int, float)):
+                continue
+            try:
+                acc_ok = math.isfinite(float(acc))
+            except OverflowError:
+                acc_ok = False
+            if not acc_ok:
                 continue
             budget = None
             label = None

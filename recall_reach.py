@@ -1355,7 +1355,7 @@ def _seed_accuracy_rank(seed_row: dict) -> tuple[int, float]:
         return (1, float('inf'))
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (1, float('inf'))
     if not math.isfinite(value):
         return (1, float('inf'))
