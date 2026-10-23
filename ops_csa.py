@@ -136,6 +136,27 @@ def _require_int_geometry(fn_name: str, name: str, value,
     return value
 
 
+def _require_scale(fn_name: str, scale) -> None:
+    """Validate the optional attention temperature as a representable real.
+
+    ``scale=None`` selects the operator's documented per-branch default and
+    finite stress values (e.g. ``1e39``) are legitimate. A JSON-sized int
+    cannot be converted to float, so it must fail here instead of raising
+    ``OverflowError`` from ``scores * scale``.
+    """
+    if scale is None:
+        return
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError(
+            f'{fn_name}: scale={scale!r} must be a real number or None.')
+    try:
+        float(scale)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: scale={scale!r} must be representable as a finite '
+            f'float.') from None
+
+
 def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:
     """Cached ``[T, win]`` boolean mask (True = real position)."""
     key = (T, win, str(device))
@@ -1551,6 +1572,7 @@ def naive_csa(
     _require_int_geometry('naive_csa', 'nh', nh)
     _require_int_geometry('naive_csa', 'c', c)
     _require_int_geometry('naive_csa', 'dc', dc)
+    _require_scale('naive_csa', scale)
     # ``c_I`` (indexer key dim) and ``nIh`` (indexer head count) are
     # validated here, not inside ``csa_lightning_indexer``: the explicit
     # ``scale=c_I ** -0.5`` below requires c_I > 0, and ``nIh == 0`` makes

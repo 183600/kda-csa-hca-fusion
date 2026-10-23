@@ -273,6 +273,41 @@ def test_hca_decode_step_keeps_overflowed_scores_finite():
         f'{tuple(out_sink.shape)} {out_sink.dtype}')
 
 
+def test_reference_operators_reject_oversized_scale():
+    """A JSON-sized int temperature is a ValueError, not OverflowError."""
+    from ops_csa import naive_csa
+    from ops_hca import naive_hca
+    torch.manual_seed(13)
+    B, T, d = 1, 4, 8
+    m, topk, nh, nIh, c, c_I, dc = 4, 2, 2, 2, 8, 4, 8
+    H = torch.rand(B, T, d)
+    csa_args = (
+        H, torch.rand(c, d), torch.rand(c, d), torch.rand(c, d),
+        torch.rand(c, d), torch.rand(m, c), torch.rand(m, c),
+        torch.rand(dc, d), torch.rand(c * nh, dc),
+        torch.rand(c_I * nIh, dc), torch.rand(nIh, d), torch.rand(c_I, d),
+        torch.rand(c_I, d), torch.rand(m, c_I))
+    m2, nh2, c2, dc2 = 4, 2, 8, 8
+    hca_args = (
+        torch.rand(B, T, d), torch.rand(c2, d), torch.rand(c2, d),
+        torch.rand(m2, c2), torch.rand(dc2, d),
+        torch.rand(c2 * nh2, dc2))
+    huge = 10 ** 400
+    try:
+        naive_csa(*csa_args, m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I,
+                  dc=dc, scale=huge)
+    except ValueError:
+        _ok('naive_csa rejects an oversized scale', True, '')
+    else:
+        _ok('naive_csa rejects an oversized scale', False, 'no ValueError')
+    try:
+        naive_hca(*hca_args, m2=m2, nh=nh2, c=c2, dc=dc2, scale=huge)
+    except ValueError:
+        _ok('naive_hca rejects an oversized scale', True, '')
+    else:
+        _ok('naive_hca rejects an oversized scale', False, 'no ValueError')
+
+
 _TEST_FUNCS = [
     test_fully_masked_rows_return_zeros,
     test_finite_rows_match_torch_softmax,
@@ -281,6 +316,7 @@ _TEST_FUNCS = [
     test_explicit_all_masked_mask_is_honoured,
     test_sink_softmax_positive_infinity_rows_stay_finite,
     test_reference_sink_keeps_overflowed_scores_finite,
+    test_reference_operators_reject_oversized_scale,
     test_joint_softmax_chunk_matches_the_nan_safe_contract,
     test_hca_decode_step_keeps_overflowed_scores_finite,
 ]

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from ops_csa import (
     _require_int_geometry,
+    _require_scale,
     csa_compress_kv,
     _causal_block_mask,
     _causal_block_mask_invalid,
@@ -126,6 +127,7 @@ def naive_hca(
     _require_int_geometry('naive_hca', 'dc', dc)
     _require_int_geometry('naive_hca', 'sliding_window', sliding_window,
                           minimum=0)
+    _require_scale('naive_hca', scale)
     if not torch.is_floating_point(H):
         raise TypeError(
             f"naive_hca: H must be a floating-point tensor, got dtype={H.dtype}")
