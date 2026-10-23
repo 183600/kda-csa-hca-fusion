@@ -71,6 +71,7 @@ from ops_kda import (
     _validate_g_clamp_min,
     _validate_kda_inputs,
     _validate_kda_shapes,
+    _validate_scale,
     _warn_if_nonfinite,
     naive_recurrent_kda,
 )
@@ -329,6 +330,7 @@ def custom_recurrent_kda(
     """
     dtype = v.dtype
     _validate_g_clamp_min(g_clamp_min, 'custom_recurrent_kda')
+    _validate_scale(scale, 'custom_recurrent_kda')
     _validate_kda_inputs(q, k, v, g, beta,
                          fn_name='custom_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]

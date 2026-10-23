@@ -378,6 +378,16 @@ def test_kda_rejects_oversized_scale_without_overflow():
         else:
             raise AssertionError(
                 f'{fn.__name__} accepted an oversized scale')
+    # The custom-autograd path only multiplies by ``scale`` when a graph is
+    # needed (otherwise it delegates); validate that branch too.
+    qg = q.clone().requires_grad_(True)
+    try:
+        custom_recurrent_kda(qg, k, v, g, beta, scale=huge)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('custom_recurrent_kda accepted an oversized '
+                             'scale on the autograd path')
 
 
 def test_rwkv_reference_rejects_oversized_scale_without_overflow():
