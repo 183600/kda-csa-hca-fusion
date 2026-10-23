@@ -302,6 +302,7 @@ def kda_forward(
     backend: str = "reference",
     recompute_attn: bool = False,
     assoc_scan: bool = False,
+    scan_block_size: int = 0,
 ):
     """Run KDA through the selected reference or optional FLA backend.
 
@@ -331,6 +332,12 @@ def kda_forward(
     ``recompute_attn`` are mutually exclusive (the scan needs the cached
     ``Aqk`` readout matrices). Like ``recompute_attn``, the flag is ignored
     by the FLA backend and by the recurrent path.
+
+    ``scan_block_size`` (reference chunk path only, and only meaningful
+    with ``assoc_scan=True``) selects the work-efficient two-phase block
+    scan: ``0`` keeps the full Hillis-Steele scan, ``>=2`` composes blocks
+    sequentially and scans only the block maps (same values up to fp
+    association, fewer compositions and a smaller live transition set).
     """
     backend = validate_kda_backend(backend)
     if not isinstance(g_clamp_min, (int, float)) or isinstance(g_clamp_min, bool):
@@ -437,6 +444,7 @@ def kda_forward(
                 output_final_state=output_final_state,
                 chunk_size=chunk_size,
                 g_clamp_min=ref_clamp,
+                scan_block_size=scan_block_size,
             )
         # ``scripted_chunk_kda`` compiles the same inner loop
         # (``ops_kda._chunk_kda_inner_loop``) with ``torch.jit.script``,

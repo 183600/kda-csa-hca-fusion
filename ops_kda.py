@@ -1525,6 +1525,119 @@ def _assoc_scan_chunk_states(
     return S_in, S_final, levels
 
 
+def _blocked_chunk_states(
+    kexp: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    glast: torch.Tensor,
+    S0: torch.Tensor,
+    block_size: int,
+) -> tuple:
+    """Two-phase (block-reduce / block-propagate) prefix scan for KDA.
+
+    A work-efficient alternative to the full Hillis–Steele scan over all
+    ``NT`` chunk maps.  The chunk sequence is partitioned into blocks of
+    ``block_size``; each block's affine map is composed sequentially
+    (the "producer"/reduce phase), the ``NT / block_size`` block maps are
+    prefix-scanned with the existing doubling core (the "scanner"), and
+    the per-chunk incoming states are then expanded inside each block
+    from the DPLR factors (the "consumer"/propagate phase).
+
+    This keeps only ``ceil(NT/block_size)`` dense ``K x K`` maps alive at
+    once instead of ``NT`` of them, and performs
+    ``NT + (NT/block_size) log2(NT/block_size)`` map compositions instead
+    of the full scan's ``NT log2(NT)``.  The per-chunk maps are rebuilt
+    from the DPLR factors in the expansion phase rather than cached, which
+    trades a small amount of arithmetic for the memory bound.
+
+    The inputs are the prepared KDA factor tensors
+    (``kexp``/``w``/``u`` from :func:`_chunk_kda_prepare` and
+    ``glast = gexp[..., -1, :]``).  No input is mutated and the function is
+    autograd-safe (out-of-place ops plus a final ``stack``).
+
+    Returns:
+        ``(S_in, S_final, meta)`` with ``S_in`` ``[B, HV, NT, K, V]``,
+        ``S_final`` ``[B, HV, K, V]`` and a JSON-safe ``meta`` dict
+        recording the composition counts.  The math is identical to
+        :func:`_assoc_scan_chunk_states`; only the association order
+        differs.
+    """
+    B, HV, NT = kexp.shape[:3]
+    V = u.shape[-1]
+    n_blocks = (NT + block_size - 1) // block_size
+
+    def _chunk_map(n: int) -> tuple:
+        # M_n = Diag(glast) - kexp_n^T w_n,  b_n = kexp_n^T u_n.
+        m = torch.diag_embed(glast[:, :, n]) - \
+            kexp[:, :, n].transpose(-1, -2) @ w[:, :, n]
+        src = kexp[:, :, n].transpose(-1, -2) @ u[:, :, n]
+        return m, src
+
+    block_maps = []
+    block_sources = []
+    within_compositions = 0
+    for nb in range(n_blocks):
+        # A block shorter than ``block_size`` (only the final block can be)
+        # simply stops early.  Seeding from the first chunk map avoids one
+        # identity composition per block; the remaining chunks compose as
+        # M_c @ (M_{c-1} ... M_first).
+        n0 = nb * block_size
+        mb, fb = _chunk_map(n0)
+        for c in range(1, block_size):
+            n = n0 + c
+            if n >= NT:
+                break
+            m, src = _chunk_map(n)
+            fb = m @ fb + src
+            mb = m @ mb
+            within_compositions += 1
+        block_maps.append(mb)
+        block_sources.append(fb)
+    MB = torch.stack(block_maps, dim=2)
+    FB = torch.stack(block_sources, dim=2)
+    block_in, S_final, block_levels = _assoc_scan_chunk_states(MB, FB, S0)
+
+    # Propagate: replay each block from its scanned incoming state.  Chunk
+    # maps are rebuilt here (they were not cached above), which bounds the
+    # live dense-map set to one block.
+    states = []
+    for nb in range(n_blocks):
+        S = block_in[:, :, nb]
+        for c in range(block_size):
+            n = nb * block_size + c
+            if n >= NT:
+                break
+            states.append(S)
+            m, src = _chunk_map(n)
+            S = m @ S + src
+    S_in = torch.stack(states, dim=2)
+
+    hillis = 0
+    off = 1
+    while off < NT:
+        hillis += NT - off
+        off *= 2
+    block_scan = 0
+    off = 1
+    while off < n_blocks:
+        block_scan += n_blocks - off
+        off *= 2
+    total = within_compositions + block_scan
+    meta = {
+        'n_chunks': int(NT),
+        'block_size': int(block_size),
+        'n_blocks': int(n_blocks),
+        'block_scan_levels': int(block_levels),
+        'within_block_compositions': int(within_compositions),
+        'block_scan_compositions': int(block_scan),
+        'total_compositions': int(total),
+        'hillis_steele_compositions': int(hillis),
+        'composition_savings_factor': (
+            float(hillis / total) if total else 1.0),
+    }
+    return S_in, S_final, meta
+
+
 def assoc_scan_chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1538,6 +1651,7 @@ def assoc_scan_chunk_kda(
     *,
     g_clamp_min: float = -10.0,
     state_dtype: torch.dtype | None = None,
+    scan_block_size: int = 0,
 ):
     """Chunkwise KDA via an **associative scan over chunks** (reference).
 
@@ -1571,9 +1685,25 @@ def assoc_scan_chunk_kda(
     padding / dtype / final-state handling is shared with the sequential
     paths.
 
+    ``scan_block_size`` selects a work-efficient **two-phase block scan**
+    (``>= 2``).  Chunks are grouped into blocks; each block's affine map is
+    composed sequentially (producer/reduce phase), only the
+    ``ceil(NT / b)`` block maps are prefix-scanned, and the per-chunk
+    incoming states are expanded inside each block from the DPLR factors
+    (consumer/propagate phase).  Relative to ``0`` (full Hillis–Steele)
+    this performs ``NT + (NT/b) log2(NT/b)`` map compositions instead of
+    ``NT log2(NT)`` and keeps ``ceil(NT/b)`` dense ``K x K`` maps live
+    instead of ``NT``.  The result is the same up to fp association.
+
     Args:
-        Same as :func:`naive_chunk_kda`.
+        Same as :func:`naive_chunk_kda`, plus ``scan_block_size`` (0 =
+            full scan, >=2 = blocked two-phase scan; 1 is treated as 0).
     """
+    if isinstance(scan_block_size, bool) or not isinstance(
+            scan_block_size, int) or scan_block_size < 0:
+        raise ValueError(
+            f"assoc_scan_chunk_kda: scan_block_size={scan_block_size!r} must "
+            f"be a non-negative int (0 = full Hillis-Steele scan).")
     prep = _chunk_kda_prepare(
         q, k, v, g, beta, scale, initial_state, output_final_state,
         chunk_size, g_clamp_min, state_dtype, fn_name='assoc_scan_chunk_kda',
@@ -1602,21 +1732,29 @@ def assoc_scan_chunk_kda(
         kexp = kk * kexp
     else:
         kexp.mul_(kk)
-    kexp_t = kexp.transpose(-1, -2)
-    if torch.is_grad_enabled():
-        M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
+    if scan_block_size >= 2:
+        # Two-phase scan: the dense per-chunk maps are never materialised
+        # for the whole sequence, and the prefix scan runs on block maps.
+        S_in, S_final, _meta = _blocked_chunk_states(
+            kexp, w, u, ggx[..., -1, :], S0, scan_block_size)
     else:
-        # ``diag(d) - X`` == ``diag(d) + (-X)`` elementwise (identical for
-        # signed zeros / NaN too): negate the fresh matmul output and add
-        # the diagonal in place instead of materializing ``diag_embed``.
-        M = kexp_t @ w
-        M.neg_()
-        M.diagonal(dim1=-2, dim2=-1).add_(ggx[..., -1, :])
-    b = kexp_t @ u
-    # ``M`` and ``b`` are fresh matmul outputs with no other readers, so
-    # the no-grad scan may consume (overwrite) them instead of cloning.
-    S_in, S_final, _levels = _assoc_scan_chunk_states(
-        M, b, S0, _owns_inputs=True)
+        kexp_t = kexp.transpose(-1, -2)
+        if torch.is_grad_enabled():
+            M = torch.diag_embed(ggx[..., -1, :]) - kexp_t @ w
+        else:
+            # ``diag(d) - X`` == ``diag(d) + (-X)`` elementwise (identical
+            # for signed zeros / NaN too): negate the fresh matmul output
+            # and add the diagonal in place instead of materialising
+            # ``diag_embed``.
+            M = kexp_t @ w
+            M.neg_()
+            M.diagonal(dim1=-2, dim2=-1).add_(ggx[..., -1, :])
+        b = kexp_t @ u
+        # ``M`` and ``b`` are fresh matmul outputs with no other readers,
+        # so the no-grad scan may consume (overwrite) them instead of
+        # cloning.
+        S_in, S_final, _levels = _assoc_scan_chunk_states(
+            M, b, S0, _owns_inputs=True)
     C = qq * ggx - Aqk @ w
     a = Aqk @ u
     o_all = C @ S_in + a

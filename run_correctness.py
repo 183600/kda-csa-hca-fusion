@@ -47,7 +47,9 @@ from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_js
 from ops_kda import (
     naive_recurrent_kda, naive_chunk_kda, scripted_chunk_kda,
     compiled_recurrent_kda, per_channel_log_decay_bias,
+    assoc_scan_chunk_kda,
 )
+from dplr_transition import kda_dplr_certificate
 from ops_csa import csa_compress_kv_overlapped, csa_lightning_indexer, _causal_block_mask, naive_csa
 from ops_hca import naive_hca
 from ops_fused import (HybridAttentionStack, HybridKCHAttention,
@@ -1158,6 +1160,94 @@ def test_kda_unnormalized_input_warns(device='cpu'):
             norm_no_warning,
             'the warning must not be spurious noise on well-behaved inputs'),
     ]
+
+
+def test_kda_dplr_transition_certificate(device='cpu'):
+    """The KDA chunk transition is a certified diagonal-plus-low-rank map.
+
+    Independent constructions of the same chunk map are compared:
+
+    * the per-step product ``prod_t [Diag(exp(g_t)) - beta_t k_t
+      (exp(g_t) k_t)^T]``;
+    * the explicit DPLR composition in ``dplr_transition``;
+    * the implicit delta-rule/wY map used by the chunk and scan paths,
+      ``Diag(gexp_last) - kexp^T w`` with source ``kexp^T u``.
+
+    This checks the transition itself (and its source term), not just the
+    end-to-end output, and runs the blocked two-phase scan against the
+    full scan on the same inputs.
+    """
+    logger.info("Test: KDA DPLR transition certificate + blocked scan")
+    results = []
+    worst_map = 0.0
+    worst_state = 0.0
+    rank_ok = True
+    for seed, t, h, k, vdim, bt, strong in [
+            (51, 64, 2, 16, 5, 16, False),
+            (52, 130, 1, 16, 3, 32, False),
+            (53, 192, 1, 8, 4, 16, True),
+            (54, 7, 1, 8, 3, 16, False)]:
+        dtype = torch.float64 if seed % 2 else torch.float32
+        torch.manual_seed(seed)
+        b = 2
+        kk = F.normalize(torch.randn(b, t, h, k, dtype=dtype,
+                                     device=device), dim=-1)
+        g = -torch.rand(b, t, h, k, dtype=dtype, device=device) * 0.05
+        if strong:
+            g[:, 5:] = -0.5
+        beta = torch.rand(b, t, h, dtype=dtype, device=device) * 0.2
+        vv = torch.randn(b, t, h, vdim, dtype=dtype, device=device) * 0.1
+        cert = kda_dplr_certificate(kk, g, beta, vv, bt)
+        worst_map = max(worst_map, cert['max_abs_map_error'])
+        worst_state = max(worst_state,
+                          cert['max_abs_state_error'],
+                          cert['max_abs_wy_state_error'])
+        rank_ok = rank_ok and (
+            1 <= cert['rank_max'] <= cert['rank_bound']
+            and cert['rank_max'] == cert['wy_rank_max'])
+        if not cert['passed']:
+            logger.error(f"  certificate failed for seed={seed}: {cert}")
+    results.append(_ok(
+        'DPLR chunk map matches the per-step product',
+        worst_map < 1e-6 and worst_state < 1e-6,
+        f'max|map|={worst_map:.2e} max|state|={worst_state:.2e}'))
+    results.append(_ok(
+        'DPLR low-rank rank equals the wY rank and respects min(C, K)',
+        rank_ok, f'rank check={rank_ok}'))
+
+    # Work-efficient two-phase scan: same values as the full scan.
+    torch.manual_seed(55)
+    b, t, h, k, vdim = 1, 130, 2, 16, 8
+    q = F.normalize(torch.randn(b, t, h, k, dtype=torch.float64,
+                                device=device), dim=-1)
+    kk = F.normalize(torch.randn(b, t, h, k, dtype=torch.float64,
+                                 device=device), dim=-1)
+    vv = torch.randn(b, t, h, vdim, dtype=torch.float64,
+                     device=device) * 0.1
+    g = -torch.rand(b, t, h, k, dtype=torch.float64,
+                    device=device) * 0.05
+    beta = torch.rand(b, t, h, dtype=torch.float64,
+                      device=device) * 0.2
+    o_full, s_full = assoc_scan_chunk_kda(
+        q, kk, vv, g, beta, output_final_state=True, chunk_size=32)
+    o_blk, s_blk = assoc_scan_chunk_kda(
+        q, kk, vv, g, beta, output_final_state=True, chunk_size=32,
+        scan_block_size=4)
+    scan_err = max(float((o_full - o_blk).abs().max().item()),
+                   float((s_full - s_blk).abs().max().item()))
+    results.append(_ok(
+        'blocked two-phase scan matches the full Hillis-Steele scan',
+        scan_err < 1e-12, f'max|diff|={scan_err:.2e}'))
+    rejected = False
+    try:
+        assoc_scan_chunk_kda(q, kk, vv, g, beta, output_final_state=True,
+                             chunk_size=32, scan_block_size=-1)
+    except ValueError:
+        rejected = True
+    results.append(_ok(
+        'blocked-scan block size is validated',
+        rejected, f'rejected={rejected}'))
+    return results
 
 
 def test_kda_chunk_vs_recurrent_gradient(device='cpu'):
@@ -7758,6 +7848,9 @@ def main():
     all_results += _run_safe(test_kda_unnormalized_input_warns, device)
     # Regression test for chunk-vs-recurrent gradient agreement (fp64).
     all_results += _run_safe(test_kda_chunk_vs_recurrent_gradient, device)
+    # DPLR transition certificate (chunk map vs per-step product) and
+    # the work-efficient two-phase scan.
+    all_results += _run_safe(test_kda_dplr_transition_certificate, device)
     all_results += _run_safe(test_csa_indexer_validity, device)
     # Boundary regression: compressed blocks become visible when windows close.
     all_results += _run_safe(test_causal_block_mask_window_close, device)
