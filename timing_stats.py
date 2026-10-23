@@ -50,7 +50,7 @@ def _clean(values):
     for value in values:
         try:
             v = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(v) and v >= 0.0:
             out.append(v)
