@@ -59,6 +59,26 @@ __all__ = [
 _NEG_INF = float('-inf')
 
 
+def _validate_scale(scale, fn_name: str) -> None:
+    """Reject a non-real / float-unrepresentable attention temperature.
+
+    ``scale=1e39`` is a legitimate (finite) stress value, so only the
+    inability to represent the number as a float is rejected: a JSON-sized
+    int would otherwise raise ``OverflowError`` from ``scores * scale``.
+    """
+    if scale is None:
+        return
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError(
+            f'{fn_name}: scale={scale!r} must be a real number or None.')
+    try:
+        float(scale)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: scale={scale!r} must be representable as a finite '
+            f'float.') from None
+
+
 def _shrink(shift: torch.Tensor) -> torch.Tensor:
     """``exp(shift)`` with the empty-row cases mapped to ``+0``.
 
@@ -125,6 +145,7 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         raise ValueError(
             'online_softmax_state: q/k/v must be 4-D [B, H, T, D]; got '
             f'{tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}.')
+    _validate_scale(scale, 'online_softmax_state')
     if k.shape != v.shape:
         raise ValueError(
             'online_softmax_state: k and v must share shape (shared-KV / '
@@ -371,6 +392,7 @@ def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
         raise ValueError(
             f'online_softmax_attention: query_chunk={query_chunk!r} must be '
             f'a non-negative int (0 = single query tile).')
+    _validate_scale(scale, 'online_softmax_attention')
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             'online_softmax_attention: q/k/v must be 4-D [B, H, T, D]; got '

@@ -297,7 +297,29 @@ def test_empty_key_block_is_rejected_with_a_clear_error():
         _ok('empty key block raises ValueError', False, 'no ValueError')
 
 
+def test_oversized_scale_is_rejected_without_overflow():
+    """A JSON-sized int temperature must be a ValueError, not OverflowError."""
+    torch.manual_seed(7)
+    B, H, T, N, D = 1, 2, 3, 4, 8
+    q = torch.randn(B, H, T, D)
+    k = torch.randn(B, H, N, D)
+    v = torch.randn(B, H, N, D)
+    huge = 10 ** 400
+    for call in (
+            lambda: online_softmax_state(q, k, v, scale=huge),
+            lambda: online_softmax_attention(q, k, v, scale=huge),
+            lambda: online_softmax_attention(
+                q, k, v, scale=huge, key_chunk=2, query_chunk=2)):
+        try:
+            call()
+        except ValueError:
+            _ok('oversized scale is rejected', True, '')
+        else:
+            _ok('oversized scale is rejected', False, 'no ValueError')
+
+
 _TEST_FUNCS = [
+    test_oversized_scale_is_rejected_without_overflow,
     test_empty_key_block_is_rejected_with_a_clear_error,
     test_singleton_key_axis_mask_survives_key_chunking,
     test_materialized_masks_are_still_sliced_per_chunk,
