@@ -24,6 +24,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from results_analysis import (  # noqa: E402
+    _safe_ratio,
     lm_token_diagnostics,
     annotate_rows_with_pareto,
     binary_ranking_metrics,
@@ -1119,7 +1120,7 @@ def test_lm_token_diagnostics_rejects_malformed_inputs():
     for bad_k in (0, -1, True, 2.5):
         with pytest.raises(ValueError):
             lm_token_diagnostics(logits, labels, input_ids, top_k=bad_k)
-    for bad_conf in (-0.1, 1.1, float('nan'), True):
+    for bad_conf in (-0.1, 1.1, float('nan'), True, 10 ** 400):
         with pytest.raises(ValueError):
             lm_token_diagnostics(logits, labels, input_ids,
                                  confidence=bad_conf)
@@ -1508,3 +1509,10 @@ def test_curve_gap_summaries_use_overflow_safe_mean():
     summary = _curve_diagnosis_summary(rows, 'ratio')
     assert summary['mean_generalization_gap'] == 1e308
     json.dumps(summary, allow_nan=False)
+
+
+def test_safe_ratio_returns_none_for_unrepresentable_denominator():
+    huge = 10 ** 400
+    assert _safe_ratio(1.0, huge) is None
+    assert _safe_ratio(huge, 1.0) is None
+    assert _safe_ratio(3.0, 2.0) == 1.5

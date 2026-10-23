@@ -756,7 +756,10 @@ def _safe_ratio(numerator, denominator) -> float | None:
     """Ratio with a non-positive / non-finite denominator, or overflow → None."""
     if denominator is None:
         return None
-    denominator = float(denominator)
+    try:
+        denominator = float(denominator)
+    except (TypeError, ValueError, OverflowError):
+        return None
     if not math.isfinite(denominator) or denominator <= 0.0:
         return None
     try:
@@ -1028,7 +1031,12 @@ def lm_token_diagnostics(logits: torch.Tensor, labels: torch.Tensor,
             or not isinstance(confidence, (int, float))):
         raise ValueError(
             f'confidence={confidence!r} must be a number in [0, 1]')
-    confidence = float(confidence)
+    try:
+        confidence = float(confidence)
+    except OverflowError:
+        raise ValueError(
+            f'confidence={confidence} must be a finite number in [0, 1]'
+        ) from None
     if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
         raise ValueError(
             f'confidence={confidence} must be a finite number in [0, 1]')
