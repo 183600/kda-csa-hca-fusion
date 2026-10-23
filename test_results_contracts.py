@@ -690,8 +690,10 @@ def test_contrast_annotation_without_margin_makes_no_equivalence_claim():
     assert summary['n_equivalent'] == 0
     assert 'tost_equivalent' not in contrasts[0]
     assert 'not evidence of no effect' in summary['verdict_scope']
-    with pytest.raises(ValueError):
-        _annotate_contrast_significance(contrasts, equivalence_margin=0.0)
+    for bad_margin in (0.0, float('inf'), 10 ** 400):
+        with pytest.raises(ValueError):
+            _annotate_contrast_significance(
+                contrasts, equivalence_margin=bad_margin)
 
 
 # ---------------------------------------------------------------------------

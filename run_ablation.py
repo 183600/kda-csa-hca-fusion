@@ -2777,7 +2777,16 @@ def _annotate_contrast_significance(contrasts: list,
       * ``family_size`` etc. on the returned summary
     """
     if equivalence_margin is not None:
-        equivalence_margin = float(equivalence_margin)
+        if isinstance(equivalence_margin, bool):
+            raise ValueError(
+                'equivalence_margin must be finite and > 0, got '
+                f'{equivalence_margin!r}')
+        try:
+            equivalence_margin = float(equivalence_margin)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'equivalence_margin must be finite and > 0, got '
+                f'{equivalence_margin!r}') from None
         if not math.isfinite(equivalence_margin) \
                 or equivalence_margin <= 0.0:
             raise ValueError(
