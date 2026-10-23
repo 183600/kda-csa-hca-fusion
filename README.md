@@ -230,6 +230,17 @@ silently dropped failed seeds is labelled `incomplete_attrition` instead of
 to turn a pilot's paired SD into a confirmatory seed budget. See
 [docs/experiment-design.md](docs/experiment-design.md).
 
+The comparative/ablation design also tests **interactions**, not just main
+effects: Exp 5b reports the route × layout transfer estimand
+`I_route = (D-A)_route1 - (D-A)_route2`, and Exp 8 reports the
+`RoPE × selection-density` 2×2 interaction. Both are seed-paired
+difference-in-differences rows in the same multiplicity family as the main
+contrasts. Every two-cell matrix contrast also carries
+`capacity_matched` / `claim_scope`; the fixed-structure groups differ in
+parameter count, and a contrast outside the pre-registered 5% tolerance is
+an operator-bundle + capacity effect, not a capacity-neutral mechanism
+result. See [docs/comparative-ablation.md](docs/comparative-ablation.md).
+
 ### Switchable KDA / Mamba-2 memory route (quick start)
 
 ```python
@@ -318,7 +329,9 @@ runs during development.
 | `results/exp4_mqar.json` | `{metadata, results: [{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]}` | multi-seed with CI95 + Bonferroni; rows now carry `task` + `n_params` and include the `mamba2` operator by default |
 | `results/exp4b_quality_tasks.json` | `{metadata, results: [...]}` | same envelope for the kv-update / long-range / multi-agg probes (`MQAR_TASKS`) |
 | `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | same envelope as exp4 minus the metadata wrapper (`ABL_MODE=ratio`) |
-| `results/exp5b_ablation_matrix.json` | `[{group, memory, layout, n_kv, per_seed, mean_acc, n_params, total_layers, d_model, ...}, ...]` | the eight-group matrix and its presets (`ABL_MODE=matrix`) |
+| `results/exp5b_ablation_matrix.json` | `[{group, memory, layout, n_kv, per_seed, mean_acc, n_params, total_layers, d_model, ...}, ...]` | the eight-group matrix and its presets (`ABL_MODE=matrix`); `metadata.design_audit.capacity_audit` labels parameter-count confounds |
+| `results/exp5b_ablation_matrix_contrasts.json` | `[{n_kv, memory, contrast, mean_diff, t_stat, sd_diff, n_common_seeds, predicted_direction, capacity_matched, claim_scope, interaction_type, interaction_cells, ...}, ...]` | paired contrasts; includes `I_route(D)=(D-A)_route1-(D-A)_route2` and per-row capacity bookkeeping |
+| `results/exp8_mechanism_ablation.json` | `{metadata, results: [{variant, n_kv, per_seed, mean_acc, paired_vs_baseline_*, gold_pr_auc, ...}, ...]}` | `metadata.factorial_interactions.results` holds the pre-registered RoPE × selection-density 2×2 interaction |
 | `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, compute_boundary, n_layers, ...}, ...]` | softmax / KDA / CSA / HCA / hybrid (standalone CSA/HCA and hybrid use incremental decoding caches; `n_layers` marks hybrid as a 5-layer stack vs single-layer methods) |
 | `results/experiment_design.json` | `{schema_version, kind: "experiment_design", metadata, results: [{plan_id, factors, sesoi, planned_seeds, planning, status}, ...]}` | prospective plan + required n, written by `run_all.py` before the experiments start |
 | `results/summary.json` | `{env: {git_commit, torch_version, cuda_version, kda_backend, ...}, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | produced by `run_all.py` |

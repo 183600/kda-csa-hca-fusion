@@ -1063,3 +1063,89 @@ def test_leave_one_out_relative_shift_overflow_is_json_safe():
 
 def test_min_detectable_effect_returns_none_when_unrepresentable():
     assert M.min_detectable_effect(5, 1e308) is None
+
+
+# ---------------------------------------------------------------------------
+# 2x2 interaction (difference-in-differences)
+# ---------------------------------------------------------------------------
+
+def test_interaction_contrast_matches_hand_computed_did():
+    # a = control, b = factor 1, c = factor 2, d = both.
+    # Per-seed I = d - b - c + a.
+    a = {42: 0.20, 43: 0.40}
+    b = {42: 0.50, 43: 0.80}
+    c = {42: 0.40, 43: 0.60}
+    d = {42: 0.80, 43: 0.90}
+    rep = M.interaction_contrast(a, b, c, d, labels=('A', 'B', 'C', 'D'))
+    # I_42 = .8-.5-.4+.2 = .1; I_43 = .9-.8-.6+.4 = -.1? No:
+    # .9 - .8 - .6 + .4 = -0.1.  mean = 0.0.
+    assert rep['common_seeds'] == [42, 43]
+    assert rep['n_pairs'] == 2
+    assert rep['mean_diff'] == pytest.approx(0.0)
+    assert rep['sd_diff'] == pytest.approx(0.1414213562373095)
+    assert rep['unanimous'] == 'mixed'
+    assert rep['labels'] == ['A', 'B', 'C', 'D']
+    assert rep['cell_means']['a'] == pytest.approx(0.30)
+    assert rep['cell_means']['d'] == pytest.approx(0.85)
+    json.dumps(rep, allow_nan=False)
+
+
+def test_interaction_contrast_zero_when_effects_are_additive():
+    seeds = [42, 43, 44, 45]
+    base = {s: 0.1 for s in seeds}
+    b = {s: 0.3 for s in seeds}
+    c = {s: 0.5 for s in seeds}
+    d = {s: 0.7 for s in seeds}
+    rep = M.interaction_contrast(base, b, c, d)
+    assert rep['mean_diff'] == pytest.approx(0.0, abs=1e-15)
+    assert rep['sd_diff'] == 0.0
+    assert rep['t_stat'] is None
+    assert rep['direction'] == 'none'
+    assert rep['effect_size_cohens_dz'] is None
+    json.dumps(rep, allow_nan=False)
+
+
+def test_interaction_contrast_negative_and_sign_verdict():
+    # RoPE-on/sparse etc. analogue: I = no_rope_dense - no_rope - dense
+    # + baseline is consistently -0.2.
+    seeds = [42, 43, 44, 45, 46]
+    a = {s: 0.5 for s in seeds}
+    b = {s: 0.4 for s in seeds}
+    c = {s: 0.5 for s in seeds}
+    d = {s: 0.2 for s in seeds}
+    rep = M.interaction_contrast(a, b, c, d)
+    assert rep['mean_diff'] == pytest.approx(-0.2)
+    assert rep['unanimous'] == 'negative'
+    assert rep['direction'] == 'less'
+    assert rep['t_stat'] is None
+
+
+def test_interaction_contrast_requires_two_common_seeds_and_validates():
+    a = {42: 0.2, 43: 0.4}
+    b = {42: 0.5, 43: 0.8}
+    c = {42: 0.4, 43: 0.6}
+    d = {99: 0.9}
+    rep = M.interaction_contrast(a, b, c, d)
+    assert rep['n_pairs'] == 0
+    assert rep['mean_diff'] is None
+    assert rep['direction'] == 'none'
+
+    with pytest.raises(ValueError):
+        M.interaction_contrast(a, b, c, {42: float('nan'), 43: 0.9})
+    with pytest.raises(ValueError):
+        M.interaction_contrast(a, b, c, {True: 0.9})
+    with pytest.raises(ValueError):
+        M.interaction_contrast(a, b, c, 'not-a-cell')
+    with pytest.raises(ValueError):
+        M.interaction_contrast(a, b, c, d, labels=('only', 'three'))
+
+
+def test_interaction_contrast_is_json_safe_at_float_limit():
+    a = {42: 1e308, 43: -1e308}
+    b = {42: 0.0, 43: 0.0}
+    c = {42: 0.0, 43: 0.0}
+    d = {42: 0.0, 43: 0.0}
+    rep = M.interaction_contrast(a, b, c, d)
+    assert rep['n_pairs'] == 2
+    assert math.isfinite(rep['mean_diff'])
+    json.dumps(rep, allow_nan=False)

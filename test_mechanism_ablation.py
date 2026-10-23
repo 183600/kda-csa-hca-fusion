@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -746,3 +747,95 @@ def test_mechanism_aggregators_are_json_safe_at_float_limit():
     assert stats['mean'] == 0.0
     assert stats['t_stat'] == 0.0
     json.dumps(stats, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered 2x2 interaction + factorial coverage
+# ---------------------------------------------------------------------------
+
+def _mech_row(name, accs, n_kv=1):
+    return {
+        'variant': name, 'n_kv': n_kv,
+        'per_seed': [{'seed': 42 + i, 'final_acc': a}
+                     for i, a in enumerate(accs)],
+    }
+
+
+def test_mechanism_interaction_is_difference_in_differences():
+    seeds = [42, 43, 44, 45, 46]
+    rows = [
+        _mech_row('baseline', [0.5] * 5),
+        _mech_row('no_rope', [0.4] * 5),
+        _mech_row('dense', [0.5] * 5),
+        # I = .5 - .4 - .5 + .5 = +.1 for every seed: super-additive.
+        _mech_row('no_rope_dense', [0.5] * 5),
+    ]
+    out = M.mechanism_interaction_contrasts(
+        rows, [1], M.MECHANISM_INTERACTION_HYPOTHESES, 0.05)
+    assert len(out) == 1
+    rec = out[0]
+    assert rec['design'] == 'rope_x_selection_density'
+    assert rec['mean_diff'] == pytest.approx(0.1)
+    assert rec['n_common_seeds'] == 5
+    # Zero-variance unanimous positive: exact one-sided p = 2^-5 = .03125.
+    assert rec['significant_positive'] is True
+    assert rec['significant_bonferroni'] is True
+    assert rec['hypothesis_status'] == 'contradicted'
+    assert rec['min_detectable_effect'] is not None
+    assert rec['min_detectable_effect_alpha'] == 0.05
+    # Zero-variance interaction: d_z is undefined, so no seed
+    # requirement is fabricated from a degenerate SD.
+    assert rec['seeds_required_80pct_power'] is None
+    # I = 0 is the additive case, never "supported".
+    additive = [
+        _mech_row('baseline', [0.5] * 5),
+        _mech_row('no_rope', [0.4] * 5),
+        _mech_row('dense', [0.5] * 5),
+        _mech_row('no_rope_dense', [0.4] * 5),
+    ]
+    rec0 = M.mechanism_interaction_contrasts(
+        additive, [1], M.MECHANISM_INTERACTION_HYPOTHESES, 0.05)[0]
+    assert rec0['mean_diff'] == pytest.approx(0.0)
+    assert rec0['hypothesis_status'] == 'not_supported'
+    assert rec0['significant_bonferroni'] is False
+    # A unanimous negative interaction supports the nonpositive prediction
+    # through the same exact 2^-n rule (t is undefined at zero variance).
+    negative = [
+        _mech_row('baseline', [0.5] * 5),
+        _mech_row('no_rope', [0.4] * 5),
+        _mech_row('dense', [0.5] * 5),
+        _mech_row('no_rope_dense', [0.2] * 5),
+    ]
+    recn = M.mechanism_interaction_contrasts(
+        negative, [1], M.MECHANISM_INTERACTION_HYPOTHESES, 0.05)[0]
+    assert recn['significant_negative'] is True
+    assert recn['hypothesis_status'] == 'supported'
+
+
+def test_mechanism_interaction_skips_a_missing_factorial_cell():
+    rows = [
+        _mech_row('baseline', [0.5] * 5),
+        _mech_row('no_rope', [0.4] * 5),
+        _mech_row('dense', [0.5] * 5),
+    ]
+    assert M.mechanism_interaction_contrasts(
+        rows, [1], M.MECHANISM_INTERACTION_HYPOTHESES, 0.05) == []
+    # A cell row that exists but carries < 2 finite seeds is also skipped.
+    rows.append(_mech_row('no_rope_dense', []))
+    assert M.mechanism_interaction_contrasts(
+        rows, [1], M.MECHANISM_INTERACTION_HYPOTHESES, 0.05) == []
+
+
+def test_mechanism_audit_reports_factorial_coverage():
+    full = M.ablation_design_audit(M.VARIANTS)
+    assert full['interaction_claims_valid'] is True
+    spec = full['factorial_designs']['rope_x_selection_density']
+    assert spec['complete'] is True
+    assert spec['missing_cells'] == []
+
+    subset = [v for v in M.VARIANTS if v['name'] != 'no_rope_dense']
+    audit = M.ablation_design_audit(subset)
+    spec = audit['factorial_designs']['rope_x_selection_density']
+    assert spec['complete'] is False
+    assert spec['missing_cells'] == ['no_rope_dense']
+    assert audit['interaction_claims_valid'] is False

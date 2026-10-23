@@ -85,6 +85,12 @@ the whole pipeline for a list of seed-paired differences:
     interval from the binomial order statistics.  At n=5 no 95% interval
     exists; the function says so (minimum n=6) instead of returning a
     spuriously narrow interval.
+14. :func:`interaction_contrast` — the seed-paired 2x2 difference-in-
+    differences ``(d - b) - (c - a)``.  A main-effect contrast cannot
+    answer an interaction question: "does the benefit of CSA depend on
+    the memory route?" or "does removing RoPE hurt more when selection is
+    dense?" needs the paired interaction estimand, not two separate
+    within-route tests read side by side.
 
 Design constraints
 ------------------
@@ -120,6 +126,7 @@ __all__ = [
     'student_t_cdf',
     'student_t_sf',
     'paired_t_test',
+    'interaction_contrast',
     'sign_test',
     'permutation_test',
     'bootstrap_paired_ci',
@@ -774,6 +781,168 @@ def paired_t_test(diffs, alternative: str = 'two-sided') -> dict:
             't_stat': t_stat, 'dof': dof, 'p_value': p,
             'all_positive': all_pos, 'all_negative': all_neg,
             'alternative': alternative}
+
+
+def _clean_seed_cell(cell, label) -> dict[int, float]:
+    """Validate one ``seed -> metric`` cell of a paired factorial design.
+
+    The cell is the unit the runner stores as a per-seed result block. It
+    must be keyed by a non-negative integer seed and carry only finite real
+    values: a malformed seed or a diverged metric must be filtered by the
+    caller (and reported as attrition) rather than silently dropped here,
+    because dropping one cell and not its partners would break the pairing.
+    """
+    if not isinstance(cell, dict):
+        raise ValueError(
+            f'cell {label!r} must be a seed -> metric mapping, got '
+            f'{type(cell).__name__}')
+    out: dict[int, float] = {}
+    for seed, value in cell.items():
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError(
+                f'cell {label!r} has a non-negative-integer seed key '
+                f'{seed!r}; filter malformed rows before calling '
+                f'interaction_contrast')
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f'cell {label!r}[seed {seed}]={value!r} is not a real '
+                f'number; filter diverged seeds before calling '
+                f'interaction_contrast')
+        try:
+            value = float(value)
+        except OverflowError:
+            raise ValueError(
+                f'cell {label!r}[seed {seed}]={value!r} is not '
+                f'representable as a finite float') from None
+        if not math.isfinite(value):
+            raise ValueError(
+                f'cell {label!r}[seed {seed}]={value!r} is not finite; '
+                f'filter diverged seeds before calling '
+                f'interaction_contrast')
+        out[seed] = value
+    return out
+
+
+def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
+                         labels=('a', 'b', 'c', 'd')) -> dict:
+    """Seed-paired 2x2 difference-in-differences (interaction) contrast.
+
+    Given four cells of a 2x2 design — ``a`` = neither factor, ``b`` =
+    factor 1 only, ``c`` = factor 2 only, ``d`` = both — the interaction
+    is estimated **per seed** as::
+
+        I_i = (d_i - b_i) - (c_i - a_i) = d_i - b_i - c_i + a_i
+
+    and then averaged over the seeds common to all four cells. The pairing
+    is what makes this a within-seed contrast: every term in ``I_i`` comes
+    from the same training seed, so seed-to-seed variance in task
+    difficulty cancels. Testing ``b - a`` and ``d - c`` separately and
+    comparing their p-values is **not** an interaction test — the two
+    estimates are correlated, and neither p-value bounds the difference
+    between them.
+
+    This is the estimand behind claims such as "the CSA benefit transfers
+    across memory routes" (route x layout interaction), "removing RoPE
+    hurts more under dense selection" (rope x sparsity interaction), or
+    "the two operators are complementary" (``I = D - B - C + A``). A
+    non-significant interaction is inconclusive; it is not evidence of
+    additivity.
+
+    ``labels`` names the four cells in the returned ``cell_means`` /
+    ``cell_n`` blocks (in a/b/c/d order). Inputs are validated like every
+    other function here: non-integer seeds, booleans, non-finite values
+    and non-numeric metrics raise ``ValueError`` instead of poisoning the
+    report. Fewer than two common seeds yields a JSON-safe record with
+    ``mean_diff=None`` and ``n_pairs < 2`` rather than a fabricated
+    estimate.
+
+    Returns a JSON-safe dict with the per-seed definition, the four cell
+    means and sample sizes, the common seed set, the mean/SD of the
+    interaction differences, the paired t statistic (``None`` when the
+    differences are all identical), Cohen's ``d_z``, and a
+    ``unanimous`` / ``direction`` description.
+    """
+    if (isinstance(labels, (str, bytes))
+            or not hasattr(labels, '__len__')
+            or len(labels) != 4):
+        raise ValueError(
+            f"labels must be four names in (a, b, c, d) order, got "
+            f"{labels!r}")
+    labels = tuple(str(x) for x in labels)
+    cells = {
+        'a': _clean_seed_cell(cell_a, labels[0]),
+        'b': _clean_seed_cell(cell_b, labels[1]),
+        'c': _clean_seed_cell(cell_c, labels[2]),
+        'd': _clean_seed_cell(cell_d, labels[3]),
+    }
+    common = sorted(set.intersection(*(set(c) for c in cells.values())))
+    n = len(common)
+    record = {
+        'definition': ('interaction I = (d - b) - (c - a) = '
+                       'd - b - c + a, paired by seed'),
+        'labels': list(labels),
+        'n_pairs': n,
+        'common_seeds': common,
+        'cell_means': {
+            key: _safe_mean([cells[key][s] for s in common])
+            if common else None
+            for key in ('a', 'b', 'c', 'd')},
+        'cell_n': {key: len(cells[key]) for key in ('a', 'b', 'c', 'd')},
+        'mean_diff': None,
+        'sd_diff': None,
+        't_stat': None,
+        'dof': None,
+        'effect_size_cohens_dz': None,
+        'unanimous': None,
+        'direction': 'none',
+        'numerically_zero_tolerance': None,
+        'note': ('fewer than two seeds are common to all four cells; no '
+                 'paired interaction is estimable'),
+    }
+    if n < 2:
+        return record
+    diffs = [cells['d'][s] - cells['b'][s] - cells['c'][s] + cells['a'][s]
+             for s in common]
+    mean = _safe_mean(diffs)
+    sd = _sample_sd(diffs, mean)
+    if sd is None:
+        sd = 0.0
+    t_stat = (mean / (sd / math.sqrt(n))) if sd > 0.0 else None
+    if all(x > 0 for x in diffs):
+        unanimous = 'positive'
+    elif all(x < 0 for x in diffs):
+        unanimous = 'negative'
+    else:
+        unanimous = 'mixed'
+    # A difference-in-differences of values that are themselves rounded
+    # can be a few ULPs away from an exact zero even when the design is
+    # additive by construction. Do not report that residue as a direction:
+    # the tolerance scales with the largest cell value, so it is a
+    # relative-precision floor, not an absolute effect-size threshold.
+    cell_scale = max(abs(v) for cell in cells.values()
+                     for v in cell.values()) if common else 0.0
+    zero_tol = (4.0 * math.ulp(cell_scale)) if cell_scale > 0.0 else 0.0
+    if abs(mean) <= zero_tol:
+        direction = 'none'
+    else:
+        direction = 'greater' if mean > 0 else 'less'
+    record.update({
+        'mean_diff': mean,
+        'sd_diff': sd,
+        't_stat': t_stat,
+        'dof': n - 1,
+        'effect_size_cohens_dz': (mean / sd) if sd > 0.0 else None,
+        'unanimous': unanimous,
+        'direction': direction,
+        'numerically_zero_tolerance': zero_tol,
+        'note': (
+            'interaction is a within-seed difference-in-differences; a '
+            'non-significant I does not establish additivity, and a '
+            'significant I is the only evidence for a non-additive '
+            'combination. Use the paired t / exact sign-flip test with the '
+            'same multiplicity correction as the main contrasts.'),
+    })
+    return record
 
 
 def sign_test(diffs, *, alpha: float = 0.05) -> dict:

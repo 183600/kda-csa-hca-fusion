@@ -327,8 +327,9 @@ PLANS: dict[str, dict] = {
             'and does the layout conclusion transfer across the KDA and '
             'Mamba-2 memory routes?'),
         'design': ('complete layout factorial (A/B/C/D) per memory route at '
-                   'fixed depth, plus cross-route replacement contrasts; '
-                   'seeds are complete blocks'),
+                   'fixed depth, plus cross-route replacement contrasts and '
+                   'the pre-registered layout x route interaction; seeds are '
+                   'complete blocks'),
         'unit': ('one trained 10-layer matrix group at one (memory, layout, '
                  'n_kv, seed)'),
         'factors': {
@@ -346,23 +347,26 @@ PLANS: dict[str, dict] = {
         'required_levels': {},
         'primary_contrast': (
             'B-A, C-A, D-B, D-C and the I=D-B-C+A interaction within each '
-            'memory route, plus the A/D cross-route replacement contrasts'),
+            'memory route, the A/D cross-route replacement contrasts, and '
+            'the route x layout transfer interaction '
+            'I_route(D) = (D-A)_route1 - (D-A)_route2'),
         'endpoint': 'final_acc',
         'direction': 'higher_is_better',
         'sesoi': 0.10,
         'assumed_sd': DEFAULT_ASSUMED_SD,
         'alpha': DEFAULT_ALPHA,
-        # 15 within-route layout contrasts (5 x 3 routes) plus 6 cross-route
-        # A/D contrasts for 3 route pairs. Planning with the full family is
-        # conservative and keeps the cross-route two-sided tests honest.
-        'planned_family_size': 21,
+        # 15 within-route layout contrasts (5 x 3 routes), 6 cross-route
+        # A/D replacement contrasts for 3 route pairs, and 3 route x layout
+        # transfer interactions. Planning with the full family is
+        # conservative and keeps the two-sided tests honest.
+        'planned_family_size': 24,
         'alternative': 'greater',
         'target_power': DEFAULT_TARGET_POWER,
         'screening_seeds': 7,
         'planned_seeds': 14,
         'equivalence': {
             'margin': 0.05,
-            'family_size': 21,
+            'family_size': 24,
             'alpha': DEFAULT_ALPHA,
             'required_for_claim': False,
             'source': ('run_ablation.CONTRAST_EQUIVALENCE_MARGIN, overridable '
@@ -375,13 +379,19 @@ PLANS: dict[str, dict] = {
         'analysis': (
             'seed-paired t-test under one Bonferroni family over every '
             'contrast row; one-sided for the pre-registered layout '
-            'directions, two-sided for cross-route replacement; TOST at the '
-            'separately pre-specified equivalence margin (0.05) as a '
-            'secondary endpoint'),
+            'directions, two-sided for cross-route replacement and the '
+            'route x layout interaction; TOST at the separately '
+            'pre-specified equivalence margin (0.05) as a secondary '
+            'endpoint. A non-significant interaction is inconclusive, not '
+            'evidence that the benefit transfers'),
         'decision_rule': (
             'only significant_bonferroni=True rows may be cited; the '
-            'interaction row is a claim about complementarity, not a '
-            'license to rank raw means'),
+            'within-route interaction row is a claim about complementarity '
+            'and the I_route row is the transfer claim, not a license to '
+            'rank raw means. Every two-cell contrast reports its parameter-'
+            'count gap; outside the 5% tolerance it is an operator-bundle + '
+            'capacity effect and cannot be quoted as a capacity-neutral '
+            'mechanism result'),
         'stopping_rule': (
             'fixed group set, depth, recipe and seed count fixed before the '
             'run; no optional stopping and no survivor-only matrix'),
@@ -403,8 +413,10 @@ PLANS: dict[str, dict] = {
             'Which CSA mechanisms - partial RoPE, sparse top-k selection, '
             'and indexer STE learning - change MQAR accuracy?'),
         'design': ('leave-one-factor-out mechanism ablation inside the '
-                   'frozen 3:1:1 layout; all variants share depth and '
-                   'parameter count, seeds are complete blocks'),
+                   'frozen 3:1:1 layout, including the pre-registered '
+                   'RoPE x selection-density 2x2 interaction; all variants '
+                   'share depth and parameter count, seeds are complete '
+                   'blocks'),
         'unit': 'one trained variant at one (variant, n_kv, seed)',
         'factors': {
             'variant': {
@@ -419,25 +431,34 @@ PLANS: dict[str, dict] = {
         'required_levels': {'variant': ['baseline']},
         'primary_contrast': (
             'each mechanism variant minus the baseline, paired by seed, '
-            'with the pre-registered sign in run_mechanism_ablation.VARIANTS'),
+            'with the pre-registered sign in '
+            'run_mechanism_ablation.VARIANTS, plus the pre-registered '
+            '2x2 interaction I = no_rope_dense - no_rope - dense + '
+            'baseline'),
         'endpoint': 'final_acc',
         'direction': 'pre_registered_sign',
         'sesoi': 0.10,
         'assumed_sd': DEFAULT_ASSUMED_SD,
         'alpha': DEFAULT_ALPHA,
-        'planned_family_size': 5,
+        # 5 non-baseline main-effect contrasts + 1 factorial interaction.
+        'planned_family_size': 6,
         'alternative': 'two-sided',
         'target_power': DEFAULT_TARGET_POWER,
         'screening_seeds': 5,
         'planned_seeds': 14,
         'analysis': (
             'two-sided seed-paired t-test vs baseline, Bonferroni-corrected '
-            'over the compared variants; the pre-registered sign decides '
-            'supported vs contradicted; exact tests as robustness checks'),
+            'over the compared variants and the pre-registered interaction; '
+            'the pre-registered sign decides supported vs contradicted; '
+            'exact tests as robustness checks. The interaction is a '
+            'difference-in-differences over the four 2x2 cells, not a '
+            'comparison of the four baseline contrasts'),
         'decision_rule': (
             'a prediction is supported only by a corrected significant '
             'difference in the pre-registered direction; non-significance '
-            'is not_supported (inconclusive), never a confirmed null'),
+            'is not_supported (inconclusive), never a confirmed null. A '
+            'non-significant interaction is inconclusive, never evidence of '
+            'additivity'),
         'stopping_rule': (
             'fixed variant set and seed count fixed before the run; the '
             'audit refuses single-factor claims when the one-factor '

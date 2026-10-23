@@ -24,14 +24,20 @@ Two modes, selected by ``ABL_MODE``:
   twice), the same outer layer structure, and the same training
   recipe, so CSA's and HCA's contributions are ablated independently
   of the memory operator. Paired seed-matched contrasts
-  (B-A / C-A / D-B / D-C, the I=D-B-C+A interaction per route, and
-  the cross-route A/D replacement differences) are computed, tested
-  with a Bonferroni-corrected seed-paired t-test against their
-  PRE-REGISTERED hypotheses (``MATRIX_CONTRAST_HYPOTHESES``), and
-  written to ``results/exp5b_ablation_matrix_contrasts.json``. A raw
+  (B-A / C-A / D-B / D-C, the I=D-B-C+A interaction per route, the
+  cross-route A/D replacement differences, and the route x layout
+  transfer interaction I_route = (D-A)_R1 - (D-A)_R2) are computed,
+  tested with a Bonferroni-corrected seed-paired t-test against their
+  PRE-REGISTERED hypotheses (``MATRIX_CONTRAST_HYPOTHESES`` /
+  ``CROSS_ROUTE_INTERACTION_HYPOTHESIS``), and written to
+  ``results/exp5b_ablation_matrix_contrasts.json``. A raw
   t-statistic is not evidence: only rows with
   ``significant_bonferroni=true`` support their prediction (or, for
   the two-sided cross-route rows, show a significant difference).
+  Every two-cell contrast also carries a parameter-capacity audit:
+  the matrix is fixed-structure, not parameter-matched, so a row
+  outside the 5% tolerance is labelled ``operator_plus_capacity``
+  rather than presented as a capacity-neutral mechanism effect.
   Additional presets (``ABL_MATRIX=csa_csa | position | budget``)
   cover the follow-up ablations: HCA-vs-more-CSA, layer placement,
   and compression-budget allocation at fixed cache bytes.
@@ -121,6 +127,7 @@ from train_diagnostics import (
     snapshot_parameters, summarize_gradient_norms, triage_gradient,
 )
 from multi_seed_stats import (
+    interaction_contrast,
     min_detectable_effect, seeds_required, tost_from_summary,
     _safe_mean, _sample_sd,
 )
@@ -1175,6 +1182,40 @@ CROSS_ROUTE_CONTRAST_HYPOTHESIS = {
     'direction': 'two_sided',
 }
 
+# Pre-registered hypothesis for the LAYOUT x ROUTE interaction contrast
+# ``I_route(D) = (D_Ra - A_Ra) - (D_Rb - A_Rb)``. This is the direct test of
+# "does the full-hybrid benefit transfer across memory operators?"; the two
+# separate replacement contrasts (``D_Ra - D_Rb`` and ``A_Ra - A_Rb``) do
+# not answer it, because each also contains the route's baseline difference
+# and the two estimates are correlated. Two-sided on purpose: a transfer
+# claim needs evidence that the benefit is route-DEPENDENT, not merely that
+# the two routes differ somewhere.
+CROSS_ROUTE_INTERACTION_HYPOTHESIS = {
+    'hypothesis': ('Does the benefit of replacing two recurrent memory slots '
+                   'with CSA+HCA (D - A) depend on the memory operator? The '
+                   'estimand is the layout x route interaction '
+                   'I = (D-A)_route1 - (D-A)_route2.'),
+    'prediction': ('no pre-registered direction: the estimand is the '
+                   'two-sided seed-paired difference-in-differences; a '
+                   'significant I means the layout conclusion is '
+                   'route-dependent, not that one route is better.'),
+    'falsified_if': ('not applicable: this is a two-sided route-dependence '
+                     'screen with no directional prior to falsify. A '
+                     'significant I is reported as route-dependence. A '
+                     'NON-significant I is INCONCLUSIVE at this seed budget '
+                     'and is never evidence that the benefit transfers; '
+                     'that requires an equivalence-powered interaction '
+                     'test.'),
+    'direction': 'two_sided',
+}
+
+# Relative parameter-count gap above which a fixed-structure matrix contrast
+# is labelled capacity-confounded. The ~5% figure is the same tolerance the
+# two-step protocol in docs/mamba2-framework.md uses for the budget-matching
+# follow-up; it is pre-registered here so the label cannot be chosen after
+# seeing which contrasts came out significant.
+CAPACITY_MATCH_TOLERANCE = 0.05
+
 
 def _contrast_hypothesis(name: str) -> dict:
     """Return the pre-registered hypothesis for a contrast row name."""
@@ -2075,6 +2116,66 @@ def _tuned_baseline_contrast_report(
     return rows
 
 
+def _capacity_fields(candidate_row, reference_row,
+                     tolerance: float = CAPACITY_MATCH_TOLERANCE) -> dict:
+    """Parameter-count bookkeeping for one fixed-structure contrast.
+
+    The matrix holds depth and width fixed, but replacing a recurrent slot
+    with CSA/HCA changes the trainable parameter count substantially. A
+    significant ``B - A`` therefore establishes that the CSA bundle helps
+    at this budget, not that the *mechanism* alone does: the bundle also
+    buys capacity. This helper makes that confound machine-readable next
+    to every contrast row instead of leaving it to a footnote, and marks a
+    contrast capacity-matched only when the relative gap is within the
+    pre-registered tolerance (the same ~5% used by the budget-matching
+    follow-up in docs/mamba2-framework.md).
+
+    Unknown parameter counts yield ``capacity_matched=None`` (unknown),
+    never a silent ``True``.
+    """
+    cand = _row_design_field(candidate_row, 'n_params')
+    ref = _row_design_field(reference_row, 'n_params')
+    record = {
+        'capacity_match_tolerance': float(tolerance),
+        'candidate_n_params': cand,
+        'reference_n_params': ref,
+        'param_ratio': None,
+        'param_delta_pct': None,
+        'capacity_matched': None,
+        'capacity_status': 'unknown',
+        'capacity_note': (
+            'parameter counts are unavailable; cannot rule out a capacity '
+            'confound'),
+    }
+    if not (_is_finite_real(cand) and _is_finite_real(ref)) or ref <= 0:
+        return record
+    ratio = float(cand) / float(ref)
+    delta = float(cand) / float(ref) - 1.0
+    matched = abs(delta) <= tolerance
+    if matched:
+        status = 'matched'
+    elif delta > 0:
+        status = 'candidate_larger'
+    else:
+        status = 'candidate_smaller'
+    record.update({
+        'param_ratio': ratio,
+        'param_delta_pct': 100.0 * delta,
+        'capacity_matched': bool(matched),
+        'capacity_status': status,
+        'capacity_note': (
+            'capacity-matched within the pre-registered tolerance'
+            if matched else
+            'candidate and reference differ in parameter count by '
+            f'{100.0 * delta:+.1f}% (> {100.0 * tolerance:.0f}% '
+            'tolerance): this contrast is the operator bundle PLUS its '
+            'capacity change, not an isolated mechanism effect. The '
+            'budget-matching follow-up is required before a capacity-'
+            'neutral claim.'),
+    })
+    return record
+
+
 def _matrix_contrast_report(all_results: list) -> list:
     """Paired CSA/HCA contrasts per memory route (the matrix's key reads).
 
@@ -2093,7 +2194,15 @@ def _matrix_contrast_report(all_results: list) -> list:
     and, for every PAIR of memory routes (R, R') sharing the A/D groups
     (e.g. the KDA-vs-RWKV-7 replacement question), the full-model
     replacement difference ``D_R - D_R'`` plus the pure-baseline
-    replacement difference ``A_R - A_R'``.
+    replacement difference ``A_R - A_R'``, and the route x layout
+    interaction ``I_route = (D_R - A_R) - (D_R' - A_R')``. The interaction
+    is the actual transfer estimand: it is zero when the hybrid benefit is
+    the same under both routes, regardless of how different the two
+    baselines are.
+
+    Every two-cell contrast carries the parameter-count bookkeeping from
+    :func:`_capacity_fields`, so a fixed-structure ``operator + capacity``
+    difference cannot be quoted as a capacity-neutral mechanism effect.
 
     Only rows with >= 2 common seeds produce a t-stat. The returned
     list is written to ``results/exp5b_ablation_matrix_contrasts.json``
@@ -2147,37 +2256,29 @@ def _matrix_contrast_report(all_results: list) -> list:
                     'candidate_group': f'{route.upper()}-{ga}',
                     'reference_memory': route,
                     'reference_group': f'{route.upper()}-{gb}',
+                    # Fixed-structure capacity bookkeeping: a significant
+                    # contrast is the operator BUNDLE plus whatever parameter
+                    # capacity it adds. The label is not a correction; it
+                    # prevents a capacity-neutral mechanism claim.
+                    **_capacity_fields(groups[ga], groups[gb]),
                 })
             # Interaction I_R = D - B - C + A on the COMMON seeds of all
             # four groups.
             if all(groups[g] is not None for g in 'ABCD'):
-                common = (set(accs['A']) & set(accs['B'])
-                          & set(accs['C']) & set(accs['D']))
-                if len(common) >= 2:
-                    inter = [accs['D'][s] - accs['B'][s] - accs['C'][s]
-                             + accs['A'][s] for s in sorted(common)]
-                    n = len(inter)
-                    mean_i = sum(inter) / n
-                    sd_i = _sample_sd(inter, mean_i)
-                    if sd_i is None:
-                        sd_i = 0.0
-                    t_i = (mean_i / (sd_i / math.sqrt(n))) \
-                        if sd_i > 0 else None
-                    if all(x > 0 for x in inter):
-                        unanimous_i = 'positive'
-                    elif all(x < 0 for x in inter):
-                        unanimous_i = 'negative'
-                    else:
-                        unanimous_i = 'mixed'
+                inter = interaction_contrast(
+                    accs['A'], accs['B'], accs['C'], accs['D'],
+                    labels=('A', 'B', 'C', 'D'))
+                if inter['mean_diff'] is not None:
                     hyp = _contrast_hypothesis(
                         'I=D-B-C+A (CSA/HCA interaction)')
                     contrasts.append({
                         'n_kv': n_kv, 'memory': route,
                         'contrast': 'I=D-B-C+A (CSA/HCA interaction)',
-                        'mean_diff': mean_i, 't_stat': t_i,
-                        'sd_diff': sd_i,
-                        'n_common_seeds': n,
-                        'unanimous': unanimous_i,
+                        'mean_diff': inter['mean_diff'],
+                        't_stat': inter['t_stat'],
+                        'sd_diff': inter['sd_diff'],
+                        'n_common_seeds': inter['n_pairs'],
+                        'unanimous': inter['unanimous'],
                         'predicted_direction': hyp['direction'],
                         'hypothesis': hyp['hypothesis'],
                         'prediction': hyp['prediction'],
@@ -2190,6 +2291,26 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'candidate_group': None,
                         'reference_memory': None,
                         'reference_group': None,
+                        'interaction_type': 'within_route_complementarity',
+                        # Machine-readable cell decomposition (generic
+                        # difference-in-differences). The consistency audit
+                        # re-derives the number from these cells.
+                        'interaction_cells': [
+                            {'memory': route,
+                             'group': f'{route.upper()}-{g}',
+                             'coefficient': coef}
+                            for g, coef in (('A', 1.0), ('B', -1.0),
+                                            ('C', -1.0), ('D', 1.0))],
+                        'interaction_labels': list(inter['labels']),
+                        'interaction_cell_means': inter['cell_means'],
+                        'capacity_match_tolerance': CAPACITY_MATCH_TOLERANCE,
+                        'capacity_matched': None,
+                        'capacity_status': 'four_cell_functional',
+                        'capacity_note': (
+                            'a four-cell interaction has no single '
+                            'candidate/reference pair; the capacity '
+                            'bookkeeping is reported per cell in '
+                            'interaction_cells.'),
                     })
         # --- cross-route replacement contrasts ---------------------------
         for i, ra in enumerate(routes):
@@ -2229,7 +2350,83 @@ def _matrix_contrast_report(all_results: list) -> list:
                         'candidate_group': f'{ra.upper()}-{g}',
                         'reference_memory': rb,
                         'reference_group': f'{rb.upper()}-{g}',
+                        **(_capacity_fields(res_a, res_b)
+                           if g in 'AD' else {}),
                     })
+                # --- route x layout (transfer) interaction ----------------
+                # I_route = (D_ra - A_ra) - (D_rb - A_rb), paired by seed.
+                # This is the direct transfer estimand; the two replacement
+                # contrasts above also contain the routes' baseline gap,
+                # and neither alone bounds their difference.
+                cells = {
+                    ra: {'A': _seed_accuracy_map(
+                             by_key.get((n_kv, ra, f'{ra.upper()}-A')) or {}),
+                         'D': _seed_accuracy_map(
+                             by_key.get((n_kv, ra, f'{ra.upper()}-D')) or {})},
+                    rb: {'A': _seed_accuracy_map(
+                             by_key.get((n_kv, rb, f'{rb.upper()}-A')) or {}),
+                         'D': _seed_accuracy_map(
+                             by_key.get((n_kv, rb, f'{rb.upper()}-D')) or {})},
+                }
+                if not (cells[ra]['A'] and cells[ra]['D']
+                        and cells[rb]['A'] and cells[rb]['D']):
+                    continue
+                # a = A_rb, b = D_rb, c = A_ra, d = D_ra yields
+                # (D_ra - A_ra) - (D_rb - A_rb).
+                inter = interaction_contrast(
+                    cells[rb]['A'], cells[rb]['D'],
+                    cells[ra]['A'], cells[ra]['D'],
+                    labels=(f'{rb.upper()}-A', f'{rb.upper()}-D',
+                            f'{ra.upper()}-A', f'{ra.upper()}-D'))
+                if inter['mean_diff'] is None:
+                    continue
+                hyp = CROSS_ROUTE_INTERACTION_HYPOTHESIS
+                contrasts.append({
+                    'n_kv': n_kv,
+                    'memory': f'{ra} vs {rb}',
+                    'contrast': (f'I_route(D)=(D-A)_{ra.upper()} - '
+                                 f'(D-A)_{rb.upper()}'),
+                    'mean_diff': inter['mean_diff'],
+                    't_stat': inter['t_stat'],
+                    'sd_diff': inter['sd_diff'],
+                    'n_common_seeds': inter['n_pairs'],
+                    'unanimous': inter['unanimous'],
+                    'predicted_direction': hyp['direction'],
+                    'hypothesis': hyp['hypothesis'],
+                    'prediction': hyp['prediction'],
+                    'falsified_if': hyp['falsified_if'],
+                    'metric': 'final_acc',
+                    'direction': 'higher_is_better',
+                    'question': ('does the full-hybrid (D - A) benefit '
+                                 'depend on the memory route?'),
+                    # No single candidate/reference pair: this is a
+                    # four-cell difference-in-differences.
+                    'candidate_memory': None,
+                    'candidate_group': None,
+                    'reference_memory': None,
+                    'reference_group': None,
+                    'interaction_type': 'route_x_layout_transfer',
+                    'interaction_cells': [
+                        {'memory': ra, 'group': f'{ra.upper()}-D',
+                         'coefficient': 1.0},
+                        {'memory': ra, 'group': f'{ra.upper()}-A',
+                         'coefficient': -1.0},
+                        {'memory': rb, 'group': f'{rb.upper()}-D',
+                         'coefficient': -1.0},
+                        {'memory': rb, 'group': f'{rb.upper()}-A',
+                         'coefficient': 1.0},
+                    ],
+                    'interaction_labels': list(inter['labels']),
+                    'interaction_cell_means': inter['cell_means'],
+                    'capacity_match_tolerance': CAPACITY_MATCH_TOLERANCE,
+                    'capacity_matched': None,
+                    'capacity_status': 'four_cell_functional',
+                    'capacity_note': (
+                        'the transfer interaction is capacity-neutral only '
+                        'if BOTH routes\' (D - A) contrasts are capacity-'
+                        'matched; see the per-route capacity fields in '
+                        'interaction_cells and the matrix capacity audit.'),
+                })
     return contrasts
 
 
@@ -2307,6 +2504,12 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
        tuned simple-baseline rungs; and
     3. every contrasted cell shares the same requested seed set, so the
        paired differences are genuinely paired.
+
+    It additionally reports ``capacity_audit``: the parameter-count gap
+    between each non-baseline group and its route's A baseline. This is a
+    claim-scope label (fixed-structure vs capacity-matched), not a fourth
+    pass/fail condition; the factorial design can be complete while every
+    contrast is capacity-confounded.
     """
     if requested_seeds is None:
         requested_seeds = [42 + i for i in range(int(n_seeds))]
@@ -2409,6 +2612,64 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
     baseline_parity = {f: len(baseline_values[f]) <= 1
                        for f in recipe_fields}
 
+    # --- parameter-capacity audit -------------------------------------
+    # The matrix is fixed-structure, not parameter-matched, so B-A/C-A etc.
+    # change capacity as well as the operator. Report the real gap per
+    # factorial cell and whether it is inside the pre-registered tolerance;
+    # this is a CLAIM-SCOPE audit, not a reason to discard the contrast.
+    capacity_cells = []
+    for n_kv in n_kv_list:
+        for memory in sorted(expected_by_route):
+            if memory in baseline_routes:
+                continue
+            base = by_key.get((n_kv, memory, f'{memory.upper()}-A'))
+            if base is None:
+                continue
+            # Audit every non-A factorial group of this route (B/C/D for
+            # main8, D/E for csa_csa), so a preset cannot hide a
+            # capacity-confounded comparison by renaming the group.
+            base_group = f'{memory.upper()}-A'
+            for gid in sorted(expected_by_route[memory]):
+                if gid == base_group:
+                    continue
+                row = by_key.get((n_kv, memory, gid))
+                if row is None:
+                    continue
+                rec = _capacity_fields(
+                    row, base, tolerance=CAPACITY_MATCH_TOLERANCE)
+                rec.update({'n_kv': n_kv, 'memory': memory,
+                            'group': gid,
+                            'reference_group': base_group})
+                capacity_cells.append(rec)
+    capacity_observed = [c for c in capacity_cells
+                         if c['capacity_matched'] is not None]
+    capacity_confounded = [c for c in capacity_observed
+                           if c['capacity_matched'] is False]
+    if not capacity_cells:
+        capacity_status = 'not_computable'
+    elif not capacity_observed:
+        capacity_status = 'unknown'
+    elif capacity_confounded:
+        capacity_status = 'capacity_confounded'
+    else:
+        capacity_status = 'capacity_matched'
+    capacity_audit = {
+        'status': capacity_status,
+        'tolerance': CAPACITY_MATCH_TOLERANCE,
+        'n_cells': len(capacity_cells),
+        'n_observed': len(capacity_observed),
+        'n_matched': len(capacity_observed) - len(capacity_confounded),
+        'n_confounded': len(capacity_confounded),
+        'cells': capacity_cells,
+        'note': (
+            'The matrix holds depth/width/recipe fixed but NOT parameter '
+            'count. A two-cell layout contrast is therefore an operator '
+            'bundle plus its capacity change unless the relative gap is '
+            'within the pre-registered tolerance. This audit labels the '
+            'claim scope; it never censors a contrast. Run the '
+            'budget-matching follow-up before a capacity-neutral claim.'),
+    }
+
     violations = []
     if missing_groups:
         violations.append(f'missing_groups:{missing_groups}')
@@ -2449,6 +2710,7 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
         'cells': cells,
         'missing_groups': missing_groups,
         'factorial_incomplete_cells': factorial_incomplete,
+        'capacity_audit': capacity_audit,
         'controls': {
             'recipe_fields': list(recipe_fields),
             'hybrid_values': hybrid_values,
@@ -2535,16 +2797,33 @@ def _annotate_contrast_significance(contrasts: list,
         'null_hypothesis': ('H0: the mean seed-paired accuracy difference '
                             'is zero (for directional contrasts, against '
                             'the pre-registered positive direction)'),
-        'zero_variance_rule': ('a UNANIMOUS sweep of a directional '
-                               'contrast (t_stat=None) counts as significant '
-                               'in that direction only if the exact one-sided '
-                               'sign-flip p-value 2^{-n} clears the '
-                               'corrected alpha; all other zero-variance '
-                               'rows can never reject'),
+        'zero_variance_rule': ('a UNANIMOUS sweep (t_stat=None) counts as '
+                               'significant only if the exact sign-flip '
+                               'p-value clears the corrected alpha: 2^{-n} '
+                               'one-sided for a directional contrast, '
+                               '2^{-(n-1)} two-sided for a cross-route / '
+                               'interaction contrast; all other '
+                               'zero-variance rows can never reject'),
         'n_significant': 0,
         'n_supported': 0,
         'n_contradicted': 0,
         'n_significant_but_below_min_effect': 0,
+        'n_capacity_confounded': 0,
+        'capacity': {
+            'match_tolerance': CAPACITY_MATCH_TOLERANCE,
+            'scope': ('two-cell contrasts only; fixed-structure groups '
+                      'receive the operator bundle plus its parameter '
+                      'capacity change'),
+            'claim_scope_values': {
+                'matched': 'capacity-matched within tolerance',
+                'operator_plus_capacity':
+                    'significant effect includes a capacity change; the '
+                    'budget-matching follow-up is required before a '
+                    'capacity-neutral mechanism claim',
+                'interaction': 'four-cell functional; see interaction_cells',
+                'unknown': 'parameter counts unavailable',
+            },
+        },
         'effect_size': {
             'measure': ("Cohen's d_z = mean seed-paired difference / SD of "
                         'the paired differences'),
@@ -2607,9 +2886,37 @@ def _annotate_contrast_significance(contrasts: list,
                     if (alpha_test is not None and n >= 2) else None)
             sig = bool(crit is not None and t_stat is not None
                        and abs(t_stat) > crit)
+            if (t_stat is None and n >= 2 and alpha_test is not None
+                    and mean_diff is not None
+                    and c.get('unanimous') in ('positive', 'negative')
+                    and mean_diff != 0):
+                # Zero-variance unanimous sweep for a two-sided contrast:
+                # the exact sign-flip p is 2 / 2^n = 2^{-(n-1)}. Use the
+                # same discreteness convention as the directional branch
+                # instead of letting an undefined t hide a unanimous
+                # interaction. Never claim a degenerate 2-seed sweep.
+                exact_p = 2.0 ** (-(n - 1))
+                sig = bool(exact_p <= alpha_test)
         c['alpha_bonferroni'] = alpha_test
         c['t_crit_bonferroni'] = crit
         c['significant_bonferroni'] = sig
+
+        # Capacity bookkeeping: a significant fixed-structure contrast is
+        # still the operator bundle plus its parameter change. Label the
+        # claim scope; never silently upgrade it to a mechanism claim.
+        if c.get('interaction_cells'):
+            c['claim_scope'] = 'interaction'
+            c['capacity_confounded'] = False
+        elif c.get('capacity_matched') is True:
+            c['claim_scope'] = 'capacity_matched'
+            c['capacity_confounded'] = False
+        elif c.get('capacity_matched') is False:
+            c['claim_scope'] = 'operator_plus_capacity'
+            c['capacity_confounded'] = True
+            summary['n_capacity_confounded'] += 1
+        else:
+            c['claim_scope'] = 'unknown_capacity'
+            c['capacity_confounded'] = None
 
         # Standardized effect size + planning quantities. The t-statistic
         # alone hides whether a significant contrast is a large effect or
@@ -2741,6 +3048,8 @@ def _annotate_contrast_significance(contrasts: list,
         **MATRIX_CONTRAST_HYPOTHESES,
         'cross_route (dynamic names A_KDA - A_MAMBA2, ...)':
             CROSS_ROUTE_CONTRAST_HYPOTHESIS,
+        'cross_route_interaction (dynamic I_route(D) rows)':
+            CROSS_ROUTE_INTERACTION_HYPOTHESIS,
     }
     return summary
 
@@ -2785,8 +3094,11 @@ def _log_contrast_table(contrasts: list) -> None:
             'points; equiv=YES is positive evidence of practical '
             'equivalence, equiv=no is inconclusive (not a difference).')
     logger.info(
-        '  NOTE: interaction rows (I=D-B-C+A) support complementarity '
-        'claims ONLY with statistical evidence;')
+        '  NOTE: interaction rows (I=D-B-C+A, I_route) support '
+        'complementarity/transfer claims ONLY with statistical evidence;')
+    logger.info(
+        '  NOTE: a non-significant interaction is inconclusive, not '
+        'evidence of additivity or of route-independent transfer.')
     logger.info(
         '  sign-flip loss/PPL metrics before reusing this helper.')
     logger.info('=' * 104)
@@ -2855,7 +3167,49 @@ def _contrast_consistency_violations(all_results: list,
         if not _is_finite_real(reported):
             continue  # the row contract reports non-finite means
         where = f'{name!r} ({memory}, n_kv={n_kv})'
-        if isinstance(memory, str) and ' vs ' in memory:
+        if c.get('interaction_cells'):
+            # Generic four-cell difference-in-differences. Parsing the
+            # machine-readable decomposition (rather than the display
+            # name) keeps the audit valid for both the within-route
+            # complementarity cell and the cross-route transfer cell.
+            decomposition = c.get('interaction_cells')
+            if not isinstance(decomposition, (list, tuple)) \
+                    or len(decomposition) < 2:
+                out.append(f'{where}: malformed interaction_cells')
+                continue
+            members = []
+            coefficients = []
+            malformed = False
+            for cell in decomposition:
+                if not isinstance(cell, dict):
+                    malformed = True
+                    break
+                try:
+                    coef = float(cell.get('coefficient'))
+                except (TypeError, ValueError, OverflowError):
+                    malformed = True
+                    break
+                member = accs.get((n_kv, cell.get('memory'),
+                                   cell.get('group')))
+                if member is None or not math.isfinite(coef):
+                    malformed = True
+                    break
+                members.append(member)
+                coefficients.append(coef)
+            if malformed or len(members) != len(decomposition):
+                out.append(f'{where}: references a missing group or a '
+                           f'non-finite interaction coefficient')
+                continue
+            common = sorted(set.intersection(*(set(m) for m in members)))
+            if len(common) < 2:
+                out.append(f'{where}: fewer than 2 common seeds in the rows')
+                continue
+            diffs = [sum(coef * member[s]
+                         for coef, member in zip(coefficients, members))
+                     for s in common]
+            expected, expected_sd = paired_stats(diffs)
+            n_common = len(common)
+        elif isinstance(memory, str) and ' vs ' in memory:
             route_a, route_b = (p.strip() for p in memory.split(' vs ', 1))
             # name is 'A_KDA - A_MAMBA2' -> the ablated group letter 'A'.
             group = name.split(' ', 1)[0].split('_', 1)[0]
@@ -3737,6 +4091,21 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                                       'complete_preset'):
         logger.warning(f'Matrix design is NOT verified: '
                        f'{design_audit["violations"]}')
+    capacity_audit = design_audit.get('capacity_audit') or {}
+    logger.info(
+        'Capacity audit: %s (%s/%s factorial cells outside the %.0f%% '
+        'parameter-match tolerance)',
+        capacity_audit.get('status'), capacity_audit.get('n_confounded'),
+        capacity_audit.get('n_observed'),
+        100.0 * float(capacity_audit.get('tolerance',
+                                         CAPACITY_MATCH_TOLERANCE)))
+    if capacity_audit.get('status') == 'capacity_confounded':
+        logger.warning(
+            'Parameter counts differ across the fixed-structure groups; '
+            'the layout contrasts are operator-bundle + capacity effects. '
+            'Run the budget-matching follow-up before a capacity-neutral '
+            'mechanism claim. Per-cell gaps are in '
+            'metadata.design_audit.capacity_audit.')
 
     # Prospective audit of the pre-registered Exp 5b plan: the actual seed
     # budget and the number of contrast rows in THIS run are compared with
@@ -3834,15 +4203,19 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                                if include_baselines else {}),
             'contrasts': MATRIX_CONTRAST_HYPOTHESES,
             'cross_route': CROSS_ROUTE_CONTRAST_HYPOTHESIS,
+            'cross_route_interaction': CROSS_ROUTE_INTERACTION_HYPOTHESIS,
             'note': ('Pre-registered in run_ablation.MATRIX_CONTRAST_'
-                     'HYPOTHESES / CROSS_ROUTE_CONTRAST_HYPOTHESIS. A '
-                     'contrast supports its prediction only when '
+                     'HYPOTHESES / CROSS_ROUTE_CONTRAST_HYPOTHESIS / '
+                     'CROSS_ROUTE_INTERACTION_HYPOTHESIS. A contrast '
+                     'supports its prediction only when '
                      'significant_bonferroni=True in the contrasts side '
                      'file; non-significant rows are inconclusive. '
                      'PRACTICAL EQUIVALENCE must be read from the TOST '
                      'fields (tost_equivalent=True), not from a '
                      'non-significant superiority test; the margin was '
-                     'pre-specified before the run.'),
+                     'pre-specified before the run. The cross-route '
+                     'interaction I_route is the transfer estimand; the '
+                     'separate replacement rows do not test it.'),
         },
         # Corrected significance + equivalence verdicts for the contrast
         # family (TOST margin is inside this block, so the registration

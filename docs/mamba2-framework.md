@@ -301,6 +301,15 @@ The `budget` matrix preset (`ABL_MATRIX=budget`) is the hook for the
 cache-byte side of that follow-up: the D layout at equal
 compressed-entry budgets (`1/csa_m + 1/hca_m2` matched within families).
 
+The fixed-structure run now records this distinction in the artifact, not
+only in a log line: every two-cell contrast carries
+`capacity_matched` / `claim_scope` / `param_delta_pct`, and
+`metadata.design_audit.capacity_audit` reports the per-group gap against
+the pre-registered 5% tolerance. Outside that tolerance a significant
+layout contrast is labelled `operator_plus_capacity`; it may be reported
+as "the CSA/HCA bundle at this budget", but not as a capacity-neutral
+mechanism effect. See [comparative-ablation.md](comparative-ablation.md).
+
 Follow-up ablation presets (design §10): `csa_csa` (is HCA better than a
 second CSA layer? A/D/E), `position` (alternating vs. back-loaded
 placement at identical operator counts — fix depth AND ratio, vary only

@@ -43,6 +43,18 @@ counterpart is flagged (``status='incomplete'`` + the missing factors),
 never silently treated as a complete ablation; the audit also cross-checks
 the observed parameter-count / depth parity across variants.
 
+Main effects are not interactions. The four variants ``baseline``,
+``no_rope``, ``dense`` and ``no_rope_dense`` form a complete
+RoPE x selection-density 2x2, so the runner also estimates the
+pre-registered seed-paired difference-in-differences
+``I = no_rope_dense - no_rope - dense + baseline``. It is reported in
+``metadata.factorial_interactions`` and joins the SAME Bonferroni family as
+the main-effect tests. The prediction is ``I <= 0`` (not super-additive);
+only a corrected significant POSITIVE ``I`` contradicts it, and a
+non-significant interaction is inconclusive rather than evidence of
+additivity. ``ablation_design.factorial_designs`` records whether every
+required cell of the 2x2 actually ran.
+
 Mechanistic diagnostic: indexer gold-block recall
 -------------------------------------------------
 Accuracy alone cannot tell whether CSA contributes retrieval or the KDA
@@ -144,7 +156,10 @@ from results_analysis import (binary_ranking_metrics,
 from results_schema import write as write_schema
 from experiment_design import (audit_run as audit_experiment_design,
                                common_analyzed_seeds)
-from multi_seed_stats import _safe_mean, _sample_sd
+from multi_seed_stats import (
+    interaction_contrast, min_detectable_effect, seeds_required,
+    _safe_mean, _sample_sd,
+)
 from run_ablation import (
     _aggregate_curve_diagnosis,
     _attach_curve_diagnostics,
@@ -273,6 +288,40 @@ VARIANTS: tuple[dict, ...] = (
      'predicted_acc_sign': 'nonpositive'},
 )
 VARIANT_NAMES = tuple(v['name'] for v in VARIANTS)
+
+# Pre-registered 2x2 interaction among the mechanism variants. The table
+# contains baseline, no_rope, dense and no_rope_dense, i.e. a complete
+# RoPE x selection-density factorial. Testing each single-factor variant
+# against the baseline does NOT test their interaction: the interaction is
+# the seed-paired difference-in-differences
+# ``I = (no_rope_dense - no_rope) - (dense - baseline)``.
+#
+# Predicted sign is ``nonpositive``: the single-factor results predict that
+# removing RoPE hurts and dense selection does not help, so their
+# combination should not be super-additive. Only a corrected SIGNIFICANT
+# POSITIVE interaction contradicts that prediction; a non-significant
+# interaction is inconclusive and is never reported as evidence of
+# additivity.
+MECHANISM_INTERACTION_HYPOTHESES = {
+    'rope_x_selection_density': {
+        'cells': ('baseline', 'no_rope', 'dense', 'no_rope_dense'),
+        'definition': ('I = (no_rope_dense - no_rope) - '
+                       '(dense - baseline) = no_rope_dense - no_rope - '
+                       'dense + baseline'),
+        'hypothesis': ('The cost of removing partial RoPE is not additive '
+                       'with the cost/benefit of dense top-k selection at '
+                       'this budget: the two single-factor effects do not '
+                       'combine additively.'),
+        'prediction': ('I <= 0: the two ablations are not super-additive. '
+                       'A significantly POSITIVE I would mean each change '
+                       'hurts alone but the combination helps.'),
+        'falsified_if': ('the Bonferroni-corrected one-sided test rejects '
+                         'I <= 0 (significantly positive interaction); a '
+                         'non-significant I is inconclusive, NOT evidence '
+                         'of additivity.'),
+        'predicted_acc_sign': 'nonpositive',
+    },
+}
 
 
 def make_variant_cfg(variant: dict, d_model: int = 32):
@@ -1342,6 +1391,27 @@ def ablation_design_audit(variants, rows=None, requested=None,
 
     config_audit = variant_config_audit(variants, baseline=baseline,
                                         d_model=d_model)
+    # Interaction coverage: the single-factor audit above says each factor
+    # has a leave-one-out arm. It does not say the FACTORIAL cell needed to
+    # estimate an interaction ran. Record that separately so a selected
+    # subset cannot silently turn an interaction claim into two main
+    # effects read side by side.
+    factorial_designs = {}
+    for design_name, spec in MECHANISM_INTERACTION_HYPOTHESES.items():
+        required = list(spec['cells'])
+        present = [n for n in required if n in names]
+        missing_cells = [n for n in required if n not in names]
+        factorial_designs[design_name] = {
+            **spec,
+            'required_cells': required,
+            'present_cells': present,
+            'missing_cells': missing_cells,
+            'complete': not missing_cells,
+        }
+    interaction_claims_valid = bool(
+        factorial_designs
+        and all(d['complete'] for d in factorial_designs.values())
+        and config_audit.get('status') == 'controlled')
     audit = {
         'status': status,
         'selected_variants': names,
@@ -1350,6 +1420,8 @@ def ablation_design_audit(variants, rows=None, requested=None,
         'baseline_present': baseline is not None,
         'factors': factors,
         'interaction_variants': interactions,
+        'factorial_designs': factorial_designs,
+        'interaction_claims_valid': interaction_claims_valid,
         'missing_single_factor_variants': missing,
         # Implementation-level check: the declared factors must be the
         # switches that actually change in the built config/instance.
@@ -1511,6 +1583,136 @@ def ablation_design_audit(variants, rows=None, requested=None,
     return audit
 
 
+def mechanism_interaction_contrasts(all_rows, n_kv_list, designs,
+                                    alpha_corrected):
+    """Estimate the pre-registered 2x2 interaction rows from variant rows.
+
+    Factored out of :func:`main` so the arithmetic and the prediction
+    verdict can be tested without training. ``all_rows`` is the summarized
+    per-(variant, n_kv) result list; ``designs`` maps a design name to a
+    spec with a four-element ``cells`` tuple in (a, b, c, d) order.
+    ``alpha_corrected`` is the shared per-test alpha; it must already
+    include these interaction tests in its family count.
+
+    Returns one JSON-safe dict per estimable (design, n_kv). A design with
+    a missing cell or fewer than two common seeds is skipped rather than
+    estimated from a partial factorial.
+    """
+    def _variant_acc_map(row):
+        out = {}
+        per_seed = row.get('per_seed') if isinstance(row, dict) else None
+        if not isinstance(per_seed, (list, tuple)):
+            return out
+        for r in per_seed:
+            if not isinstance(r, dict) or 'error' in r:
+                continue
+            seed = r.get('seed')
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                continue
+            acc = _finite_metric(r, 'final_acc')
+            if acc is not None:
+                out[seed] = acc
+        return out
+
+    by_variant = {(r.get('n_kv'), r.get('variant')): r
+                  for r in all_rows if isinstance(r, dict)}
+    rows_out = []
+    for n_kv in n_kv_list:
+        for design_name, spec in designs.items():
+            cells = list(spec['cells'])
+            variant_rows = [by_variant.get((n_kv, cell)) for cell in cells]
+            if any(r is None for r in variant_rows):
+                continue
+            maps = [_variant_acc_map(r) for r in variant_rows]
+            if any(len(m) < 2 for m in maps):
+                continue
+            inter = interaction_contrast(
+                maps[0], maps[1], maps[2], maps[3], labels=tuple(cells))
+            if inter['mean_diff'] is None:
+                continue
+            n = inter['n_pairs']
+            crit = (_bonferroni_crit_q(n, alpha=alpha_corrected)
+                    if alpha_corrected is not None and n >= 2 else None)
+            sig_pos = bool(crit is not None and inter['t_stat'] is not None
+                           and inter['t_stat'] > crit)
+            sig_neg = bool(crit is not None and inter['t_stat'] is not None
+                           and inter['t_stat'] < -crit)
+            if inter['t_stat'] is None and alpha_corrected is not None:
+                # Zero-variance unanimous sweep: exact one-sided sign-flip
+                # p = 2^-n, the same convention as the main rows. Both
+                # signs matter: a unanimous negative interaction supports
+                # the pre-registered nonpositive prediction.
+                exact_p = 2.0 ** (-n)
+                if (inter['unanimous'] == 'positive'
+                        and inter['mean_diff'] > 0):
+                    sig_pos = bool(exact_p <= alpha_corrected)
+                elif (inter['unanimous'] == 'negative'
+                      and inter['mean_diff'] < 0):
+                    sig_neg = bool(exact_p <= alpha_corrected)
+            if sig_pos:
+                hypothesis_status = 'contradicted'
+            elif sig_neg:
+                hypothesis_status = 'supported'
+            else:
+                hypothesis_status = 'not_supported'
+            # Interaction-specific planning quantities. A 2x2 interaction
+            # has materially less power than either main effect, so report
+            # its own MDE / seed requirement rather than inheriting the
+            # main-effect budget.
+            sd = inter['sd_diff']
+            dz = inter['effect_size_cohens_dz']
+            mde = None
+            required_n = None
+            if (alpha_corrected is not None and n >= 2
+                    and sd is not None):
+                mde = min_detectable_effect(
+                    n, float(sd), alpha=alpha_corrected, power=0.8,
+                    alternative='greater')
+            if (dz is not None and alpha_corrected is not None):
+                required_n = seeds_required(
+                    dz, alpha=alpha_corrected, power=0.8,
+                    alternative='greater')
+            below_min = (abs(inter['mean_diff']) < DEFAULT_MIN_EFFECT)
+            rows_out.append({
+                'design': design_name,
+                'n_kv': n_kv,
+                'cells': cells,
+                'definition': spec['definition'],
+                'hypothesis': spec['hypothesis'],
+                'prediction': spec['prediction'],
+                'falsified_if': spec['falsified_if'],
+                'predicted_acc_sign': spec['predicted_acc_sign'],
+                'n_common_seeds': n,
+                'common_seeds': inter['common_seeds'],
+                'cell_means': inter['cell_means'],
+                'cell_n': inter['cell_n'],
+                'mean_diff': inter['mean_diff'],
+                'sd_diff': inter['sd_diff'],
+                't_stat': inter['t_stat'],
+                'dof': inter['dof'],
+                'effect_size_cohens_dz': inter['effect_size_cohens_dz'],
+                'unanimous': inter['unanimous'],
+                'direction': inter['direction'],
+                't_crit_bonferroni': crit,
+                'alpha_bonferroni': alpha_corrected,
+                'significant_positive': sig_pos,
+                'significant_negative': sig_neg,
+                'significant_bonferroni': bool(sig_pos or sig_neg),
+                'min_detectable_effect': mde,
+                'min_detectable_effect_alpha': alpha_corrected,
+                'seeds_required_80pct_power': required_n,
+                'below_default_min_effect': bool(below_min),
+                'hypothesis_status': hypothesis_status,
+                'prediction_status': hypothesis_status,
+                'note': ('a significant positive I contradicts the '
+                         'nonpositive prediction (super-additive); a '
+                         'significant negative I supports it; '
+                         'non-significance is inconclusive, never evidence '
+                         'of additivity.'),
+            })
+    return rows_out
+
+
 def _paired_family_size(variants, n_kv_list) -> int:
     """Accuracy contrasts vs baseline: one per non-baseline variant per n_kv.
 
@@ -1598,13 +1800,20 @@ def main():
     # Shared Bonferroni family: one paired accuracy test vs baseline per
     # non-baseline variant (only when the baseline variant is present) PLUS
     # one paired gold-PR-AUC test vs baseline per non-baseline variant PLUS
-    # one one-sided recall-vs-chance test per variant (baseline included).
-    # All use alpha_corrected below, so all must be counted; each test is
-    # repeated for every n_kv group.
+    # one one-sided recall-vs-chance test per variant (baseline included)
+    # PLUS one pre-registered 2x2 interaction test per n_kv cell when all
+    # four interaction cells are selected. All use alpha_corrected below,
+    # so all must be counted; each test is repeated for every n_kv group.
+    selected_names = {v['name'] for v in variants}
+    interaction_designs = {
+        name: spec for name, spec in MECHANISM_INTERACTION_HYPOTHESES.items()
+        if all(cell in selected_names for cell in spec['cells'])
+    }
     n_paired_tests = _paired_family_size(variants, n_kv_list)
     n_pr_auc_tests = n_paired_tests
+    n_interaction_tests = len(interaction_designs) * len(n_kv_list)
     n_tests = (n_paired_tests + n_pr_auc_tests
-               + len(variants) * len(n_kv_list))
+               + len(variants) * len(n_kv_list) + n_interaction_tests)
     alpha_corrected = 0.05 / n_tests if n_tests else None
 
     seeds = [42 + i for i in range(n_seeds)]
@@ -1832,6 +2041,20 @@ def main():
                 row['gold_recall_significant_bonferroni'] = (
                     recall_crit is not None and recall_t > recall_crit)
 
+    # Pre-registered factorial interaction contrasts. The per-variant
+    # `vs baseline` tests above are main effects; they cannot test whether
+    # the RoPE and selection-density manipulations interact. The 2x2 cell
+    # is estimated per seed from the same four variant runs, so seed
+    # difficulty cancels exactly as in the main paired contrasts.
+    interaction_contrasts = mechanism_interaction_contrasts(
+        all_rows, n_kv_list, interaction_designs, alpha_corrected)
+    for rec in interaction_contrasts:
+        logger.info(
+            "Interaction %s (n_kv=%s): I=%+.4f  t=%s  n=%s  status=%s",
+            rec['design'], rec['n_kv'], rec['mean_diff'],
+            _fmt_num(rec['t_stat']), rec['n_common_seeds'],
+            rec['hypothesis_status'])
+
     # Accuracy-vs-cost screen for every non-baseline variant. The paired
     # test answers "is the accuracy difference real?"; it does not answer
     # "is the variant worth adopting?". A significant gain that costs twice
@@ -1877,6 +2100,18 @@ def main():
                              if r.get('prediction_status') == 'contradicted')
     n_hyp_not_supported = sum(1 for r in all_rows
                               if r.get('prediction_status') == 'not_supported')
+    n_int_contradicted = sum(
+        1 for r in interaction_contrasts
+        if r.get('hypothesis_status') == 'contradicted')
+    n_int_supported = sum(
+        1 for r in interaction_contrasts
+        if r.get('hypothesis_status') == 'supported')
+    n_int_not_supported = sum(
+        1 for r in interaction_contrasts
+        if r.get('hypothesis_status') == 'not_supported')
+    n_int_significant = sum(
+        1 for r in interaction_contrasts
+        if r.get('significant_bonferroni'))
     conclusions_valid = bool(
         n_seeds >= 5 and min_seeds_ok >= 5 and len(ok_rows) == len(all_rows)
         and (n_sig_paired > 0 or n_sig_recall > 0))
@@ -1901,6 +2136,11 @@ def main():
                 f'/ {n_hyp_contradicted} contradicted / '
                 f'{n_hyp_not_supported} not_supported (inconclusive at this '
                 f'budget)')
+    logger.info(f'  factorial interactions: {n_int_significant} significant '
+                f'/ {len(interaction_contrasts)} tested '
+                f'({n_int_supported} supported, '
+                f'{n_int_contradicted} contradicted, '
+                f'{n_int_not_supported} not_supported)')
     logger.info(f'  conclusions_valid: {conclusions_valid}')
     if not conclusions_valid:
         logger.warning(
@@ -1951,6 +2191,17 @@ def main():
             'recipe_parity=%s seed_alignment_ok=%s',
             cv.get('controls_status'), cv.get('recipe_parity'),
             cv.get('seed_alignment_ok'))
+    if not design_audit.get('interaction_claims_valid', False):
+        missing_cells = {
+            name: spec.get('missing_cells')
+            for name, spec in
+            (design_audit.get('factorial_designs') or {}).items()
+            if not spec.get('complete')}
+        logger.warning(
+            '  WARNING: the selected variant set does not cover a complete '
+            'factorial cell for every pre-registered interaction (%s). '
+            'The corresponding interaction claims are NOT supported by '
+            'this run.', missing_cells)
 
     # Prospective audit against the pre-registered Exp 8 plan: the actual
     # seed budget and compared-variant family are checked against the
@@ -1967,7 +2218,7 @@ def main():
         'exp8_mechanism',
         seeds=[42 + i for i in range(n_seeds)],
         levels={'variant': [v['name'] for v in variants]},
-        family_size=max(1, _paired_family_size(variants, n_kv_list)),
+        family_size=max(1, n_paired_tests + n_interaction_tests),
         analyzed_seeds=mechanism_analyzed_population,
     )
     logger.info(f'Design audit: {mechanism_experiment_design["status"]} '
@@ -2002,6 +2253,25 @@ def main():
              'predicted_acc_sign': v['predicted_acc_sign']}
             for v in variants],
         'ablation_design': design_audit,
+        # Pre-registered 2x2 interaction estimands. These are NOT the
+        # per-variant main effects: each row is a seed-paired
+        # difference-in-differences over four variants. Kept as a separate
+        # list because an interaction row has no single "variant" field.
+        'factorial_interactions': {
+            'designs': MECHANISM_INTERACTION_HYPOTHESES,
+            'n_tests_in_shared_family': n_interaction_tests,
+            'alpha_bonferroni': alpha_corrected,
+            'results': interaction_contrasts,
+            'n_significant': n_int_significant,
+            'n_supported': n_int_supported,
+            'n_contradicted': n_int_contradicted,
+            'n_not_supported': n_int_not_supported,
+            'note': ('A 2x2 interaction I = (d - b) - (c - a) is the only '
+                     'test of non-additivity; the four main-effect '
+                     'contrasts versus baseline cannot substitute for it. '
+                     'A non-significant I is inconclusive, never evidence '
+                     'of additivity.'),
+        },
         # Prospective power/seed audit against the pre-registered plan.
         'experiment_design': mechanism_experiment_design,
         'prediction_status_definition': (
@@ -2016,11 +2286,15 @@ def main():
             'supported': n_hyp_supported,
             'contradicted': n_hyp_contradicted,
             'not_supported': n_hyp_not_supported,
-            'note': ('Counts over all reported (variant, n_kv) rows. A '
+            'interaction_supported': n_int_supported,
+            'interaction_contradicted': n_int_contradicted,
+            'interaction_not_supported': n_int_not_supported,
+            'note': ('Counts over all reported (variant, n_kv) rows for '
+                     'the main effects, plus the 2x2 interaction rows. A '
                      'prediction is only "supported" under a Bonferroni-'
                      'significant paired contrast in the predicted '
-                     'direction; the two-sided design can contradict a '
-                     'prediction but cannot confirm a null.'),
+                     'direction; non-significance is inconclusive and '
+                     'cannot confirm a null or additivity.'),
         },
         'gold_recall_definition': (
             "fraction of sequences where the compressed block containing "

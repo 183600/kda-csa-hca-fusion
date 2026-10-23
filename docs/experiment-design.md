@@ -131,7 +131,7 @@ default seven operators), not just the five vs-softmax contrasts, and
 |---|---:|---:|---:|
 | `exp4_mqar` | 11 | 21 | 68 |
 | `exp5_ratio` | 14 | 6 | 55 |
-| `exp5b_matrix` | 14 | 21 | 68 |
+| `exp5b_matrix` | 14 | 24 | 69 |
 
 At the registered budgets and the **planning** SD, the `(1-2*alpha)`
 interval half-width already exceeds 0.05, so with a sample SD at the planning
@@ -323,6 +323,27 @@ python experiment_design.py --plan exp4_mqar --sd 0.05
 python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json
 python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json --sd 0.12
 ```
+
+## Interactions and capacity are separate estimands
+
+The registry's main-effect budgets do not automatically cover interaction
+claims. Exp 5b now pre-registers the route × layout transfer interaction
+`I_route(D) = (D-A)_route1 - (D-A)_route2` (3 rows, family 24), and Exp 8
+pre-registers the `RoPE × selection-density` interaction
+`I = no_rope_dense - no_rope - dense + baseline` (family 6). Both use
+`multi_seed_stats.interaction_contrast`, a seed-paired
+difference-in-differences; the separate main-effect contrasts cannot
+substitute for them. A non-significant interaction is inconclusive, never
+evidence of additivity or route-independent transfer.
+
+The fixed-structure matrix is not parameter-matched. Every two-cell contrast
+carries `capacity_matched` / `claim_scope`, and
+`_matrix_design_audit.capacity_audit` reports the per-cell parameter gap
+against the pre-registered 5% tolerance. Outside that tolerance, a
+significant layout effect is an **operator bundle plus capacity** effect and
+must not be written as a capacity-neutral mechanism result. See
+[comparative-ablation.md](comparative-ablation.md) for the full decision
+rules and field definitions.
 
 ## Post-run sensitivity
 

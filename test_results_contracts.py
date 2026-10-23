@@ -1304,3 +1304,118 @@ def test_curve_summaries_skip_oversized_json_integers():
     assert summary['max_gradient_over_clip'] is None
     json.dumps(summary, allow_nan=False)
 
+
+
+# ---------------------------------------------------------------------------
+# Route x layout transfer interaction + capacity audit
+# ---------------------------------------------------------------------------
+
+def test_matrix_route_interaction_is_seed_paired_difference_in_differences():
+    accmaps = {
+        'kda': {'A': (0.20, 0.40), 'B': (0.50, 0.80),
+                'C': (0.40, 0.60), 'D': (0.80, 0.90)},
+        'mamba2': {'A': (0.10, 0.30), 'B': (0.20, 0.25),
+                   'C': (0.30, 0.35), 'D': (0.50, 0.55)},
+    }
+    rows = [_matrix_row(f'{mem.upper()}-{g}', mem, accs)
+            for mem, per_group in accmaps.items()
+            for g, accs in per_group.items()]
+    contrasts = _matrix_contrast_report(rows)
+    row = next(c for c in contrasts
+               if c.get('interaction_type') == 'route_x_layout_transfer')
+    # (D-A)_KDA = [(.8-.2)+(.9-.4)]/2 = .55
+    # (D-A)_MAMBA2 = [(.5-.1)+(.55-.3)]/2 = .325
+    assert row['mean_diff'] == pytest.approx(0.225)
+    assert row['n_common_seeds'] == 2
+    assert row['predicted_direction'] == 'two_sided'
+    assert row['candidate_group'] is None
+    assert len(row['interaction_cells']) == 4
+    assert _contrast_consistency_violations(rows, contrasts) == []
+
+    tampered = [dict(c, mean_diff=(
+        c['mean_diff'] + 0.1
+        if c is row else c['mean_diff'])) for c in contrasts]
+    assert any('I_route' in v for v in _contrast_consistency_violations(
+        rows, tampered))
+
+
+def test_matrix_capacity_audit_labels_operator_plus_capacity():
+    rows = [
+        _matrix_row('KDA-A', 'kda', (0.2, 0.4), n_params=1000),
+        _matrix_row('KDA-B', 'kda', (0.5, 0.8), n_params=1400),
+    ]
+    contrasts = _matrix_contrast_report(rows)
+    assert len(contrasts) == 1
+    c = contrasts[0]
+    assert c['capacity_matched'] is False
+    assert c['capacity_status'] == 'candidate_larger'
+    assert c['param_delta_pct'] == pytest.approx(40.0)
+    summary = _annotate_contrast_significance(contrasts)
+    assert c['claim_scope'] == 'operator_plus_capacity'
+    assert c['capacity_confounded'] is True
+    assert summary['n_capacity_confounded'] == 1
+
+    # A matched pair keeps the same arithmetic but a capacity-neutral label.
+    matched = [
+        _matrix_row('KDA-A', 'kda', (0.2, 0.4), n_params=1000),
+        _matrix_row('KDA-B', 'kda', (0.5, 0.8), n_params=1040),
+    ]
+    mcontrasts = _matrix_contrast_report(matched)
+    _annotate_contrast_significance(mcontrasts)
+    assert mcontrasts[0]['capacity_matched'] is True
+    assert mcontrasts[0]['claim_scope'] == 'capacity_matched'
+    assert mcontrasts[0]['capacity_confounded'] is False
+
+
+def test_matrix_design_audit_reports_capacity_confound_without_failing_design():
+    groups = build_experiment_matrix('main8', 10, ('kda',))
+    params = {'A': 1000, 'B': 1400, 'C': 1300, 'D': 1700}
+    rows = []
+    for spec in groups:
+        group = spec[0]
+        unit = group.rsplit('-', 1)[-1]
+        row = _matrix_row(group, 'kda', (0.2, 0.4),
+                          n_params=params.get(unit, 1000))
+        row.update({'steps': 100, 'train_batch': 16, 'lr': 3e-3,
+                    'd_model': 32})
+        rows.append(row)
+    audit = _matrix_design_audit(
+        rows, groups, preset='main8', n_kv_list=[1], n_seeds=2)
+    assert audit['status'] == 'complete_factorial'
+    cap = audit['capacity_audit']
+    assert cap['status'] == 'capacity_confounded'
+    assert cap['n_confounded'] == 3
+    assert cap['n_matched'] == 0
+    # The capacity audit labels the evidence; it does not invalidate the
+    # factorial design or change any p-value.
+    assert audit['violations'] == []
+
+    matched_rows = [dict(r, n_params=1000) for r in rows]
+    matched = _matrix_design_audit(
+        matched_rows, groups, preset='main8', n_kv_list=[1], n_seeds=2)
+    assert matched['capacity_audit']['status'] == 'capacity_matched'
+    assert matched['capacity_audit']['n_confounded'] == 0
+
+
+def test_two_sided_zero_variance_interaction_uses_exact_sign_floor():
+    def row(n):
+        return {
+            'n_kv': 1, 'memory': 'kda vs mamba2',
+            'contrast': 'I_route(D)=(D-A)_KDA - (D-A)_MAMBA2',
+            'mean_diff': 0.2, 't_stat': None, 'sd_diff': 0.0,
+            'n_common_seeds': n, 'unanimous': 'positive',
+            'predicted_direction': 'two_sided', 'metric': 'final_acc',
+            'direction': 'higher_is_better',
+        }
+    five = [row(5)]
+    _annotate_contrast_significance(five)
+    # Exact two-sided floor at n=5 is 2/2^5 = .0625 > .05.
+    assert five[0]['significant_bonferroni'] is False
+    # At n=6 the exact two-sided p 2/2^6 = .03125 is still above the
+    # corrected .025 two-sided alpha; n=7 is the first rejection region.
+    six = [row(6)]
+    _annotate_contrast_significance(six)
+    assert six[0]['significant_bonferroni'] is False
+    seven = [row(7)]
+    _annotate_contrast_significance(seven)
+    assert seven[0]['significant_bonferroni'] is True
