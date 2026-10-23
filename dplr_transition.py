@@ -67,7 +67,7 @@ __all__ = [
     'effective_rank',
     'from_kda_step',
     'from_rwkv7_step',
-    'kda_chunk_certificate',
+    'kda_dplr_certificate',
     'kda_chunk_factors',
     'rwkv7_chunk_factors',
     'scan_work_plan',
