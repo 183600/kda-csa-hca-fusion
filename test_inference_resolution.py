@@ -224,6 +224,20 @@ def test_median_order_statistic_interval():
     assert twenty['ci_low'] <= 9.5 <= twenty['ci_high']
 
 
+def test_median_interval_tiny_alpha_does_not_overflow_or_overstate():
+    """A subnormal alpha must not turn 2/alpha into inf or widen the slack.
+
+    The minimum n is computed in log space (1075 for the smallest positive
+    float), and the tail test uses a relative slack: at n=50 the full-range
+    coverage is far below 1 - alpha, so no interval exists even though the
+    binomial tail (~8.9e-16) is below the old absolute 1e-15 epsilon.
+    """
+    r = M.median_order_statistic_ci(list(range(50)), alpha=5e-324)
+    assert r['min_pairs_for_ci'] == 1075
+    assert r['ci_low'] is None and r['ci_high'] is None
+    json.dumps(r, allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # summarize_paired integration
 # ---------------------------------------------------------------------------

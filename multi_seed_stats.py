@@ -414,7 +414,8 @@ def median_order_statistic_ci(diffs, *, alpha: float = 0.05) -> dict:
     alpha = _validate_alpha(alpha)
     d = _as_clean_diffs(diffs)
     n = len(d)
-    min_pairs = max(1, int(math.ceil(math.log2(2.0 / alpha))))
+    min_pairs = max(1, int(math.ceil(
+        math.log2(2.0) - math.log2(alpha))))
     out = {
         'n_pairs': n, 'alpha': alpha, 'ci_level': 1.0 - alpha,
         'k': None, 'ci_low': None, 'ci_high': None,
@@ -435,10 +436,17 @@ def median_order_statistic_ci(diffs, *, alpha: float = 0.05) -> dict:
     k_best = 0
     tail_best = None
     lo, hi = 1, (n + 1) // 2
+    # A relative (not absolute) slack absorbs the last-ulp error of the
+    # incomplete-beta tail without letting a tiny alpha be dominated by a
+    # fixed 1e-15 epsilon: for alpha below that scale the old check accepted
+    # every tail computed as <= 1e-15 and returned an interval whose true
+    # coverage was far below 1 - alpha.
+    threshold = alpha / 2.0
+    slack = threshold * 1e-12
     while lo <= hi:
         mid = (lo + hi) // 2
         tail = _tail(mid)
-        if tail <= alpha / 2.0 + 1e-15:
+        if tail <= threshold + slack:
             k_best, tail_best = mid, tail
             lo = mid + 1
         else:
