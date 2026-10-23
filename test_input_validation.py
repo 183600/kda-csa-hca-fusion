@@ -380,6 +380,29 @@ def test_kda_rejects_oversized_scale_without_overflow():
                 f'{fn.__name__} accepted an oversized scale')
 
 
+def test_rwkv_reference_rejects_oversized_scale_without_overflow():
+    """The RWKV-7 reference scale is validated like the other operators'."""
+    from ops_rwkv import rwkv7_reference_scan
+
+    B, T, H, K, V = 1, 3, 1, 2, 2
+    r = torch.randn(B, T, H, K)
+    log_w = -torch.rand(B, T, H, K)
+    k = torch.randn(B, T, H, K)
+    v = torch.randn(B, T, H, V)
+    kk = torch.nn.functional.normalize(torch.randn(B, T, H, K), dim=-1)
+    a = torch.rand(B, T, H, K)
+    try:
+        rwkv7_reference_scan(r, log_w, k, v, kk, a, scale=10 ** 400)
+    except ValueError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - the point is the type
+        raise AssertionError(
+            f'rwkv7_reference_scan leaked {type(exc).__name__}: {exc}')
+    else:
+        raise AssertionError('rwkv7_reference_scan accepted an oversized '
+                             'scale')
+
+
 def test_rope_rejects_invalid_dims_bases_and_positions():
     """RoPE parameter errors fail before they can produce NaN tables.
 
