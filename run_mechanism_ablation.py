@@ -1446,20 +1446,22 @@ def ablation_design_audit(variants, rows=None, requested=None,
             'run, regardless of any paired contrast that still computes.'),
     }
     if rows is not None:
-        def _observed(row, field):
+        def _observed_values(row, field):
             if not isinstance(row, dict):
-                return None
+                return []
+            found = []
             value = row.get(field)
-            if value is None:
-                per_seed = row.get('per_seed')
-                if isinstance(per_seed, (list, tuple)):
-                    for seed_row in per_seed:
-                        if not isinstance(seed_row, dict):
-                            continue
-                        value = seed_row.get(field)
-                        if value is not None:
-                            break
-            return value
+            if value is not None:
+                found.append(value)
+            per_seed = row.get('per_seed')
+            if isinstance(per_seed, (list, tuple)):
+                for seed_row in per_seed:
+                    if not isinstance(seed_row, dict):
+                        continue
+                    value = seed_row.get(field)
+                    if value is not None:
+                        found.append(value)
+            return found
 
         recipe_fields = ('steps', 'train_batch', 'lr')
         observed_fields = ('n_params', 'n_layers') + recipe_fields
@@ -1478,8 +1480,7 @@ def ablation_design_audit(variants, rows=None, requested=None,
             requested_seeds.setdefault(name, set())
             successful_seeds.setdefault(name, set())
             for field in observed_fields:
-                value = _observed(r, field)
-                if value is not None:
+                for value in _observed_values(r, field):
                     try:
                         values[name][field].add(value)
                     except TypeError:
