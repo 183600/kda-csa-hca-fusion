@@ -526,7 +526,14 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
         log_floor = math.log(sided) - n_eff * math.log(2.0)
         p_min = 1.0 if log_floor >= 0.0 else math.exp(log_floor)
     if p_min <= 0.0:
-        p_holm = 0.0
+        # The exact floor ``sided / 2**n_eff`` underflowed to 0.0 for a very
+        # large n_eff, but ``family_size * floor`` can still be a perfectly
+        # representable p-value (e.g. n_eff=2000 with an enormous family).
+        # Evaluate that product in log space instead of reporting a p of
+        # exactly zero: the floor is small, not zero.
+        log_product = (math.log(family_size) + math.log(sided)
+                       - n_eff * math.log(2.0))
+        p_holm = 1.0 if log_product >= 0.0 else math.exp(log_product)
     else:
         # ``family_size`` is an arbitrary Python int: converting a very large
         # one to float (implicitly, in ``family_size * p_min``) raises
@@ -561,7 +568,16 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
     min_raw = _min_effective(1)
     min_holm = _min_effective(family_size)
     if p_min <= 0.0:
-        max_family = None
+        # The floor underflowed, so ``alpha / p_min`` would be infinite and
+        # returning None would hide a well-defined (if enormous) answer. The
+        # largest supported family is floor(alpha * 2**n_eff / sided); build
+        # it with integer/Fraction arithmetic for every practical n_eff and
+        # refuse only a shift so large that the integer itself is absurd.
+        if n_eff <= 1_000_000:
+            max_family = int(
+                (alpha_frac * (1 << n_eff) / sided).__floor__())
+        else:
+            max_family = None
     else:
         ratio = alpha / p_min
         if math.isfinite(ratio):

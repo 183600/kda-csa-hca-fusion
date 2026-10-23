@@ -100,6 +100,30 @@ def test_extreme_positive_floors_do_not_overflow():
     json.dumps(huge_family, allow_nan=False)
 
 
+def test_underflowed_raw_floor_keeps_the_exact_family_answer():
+    """A p floor below the smallest float still has an exact family bound.
+
+    At n_eff=2000 the two-sided floor ``2/2**2000`` underflows to 0.0, but
+    it is not zero. A 10**400-comparison family therefore has a representable
+    Holm-adjusted p (about 1e-202), and ``max_comparisons_at_alpha`` is still
+    the exact floor(alpha * 2**n_eff / 2), not ``None``.
+    """
+    from fractions import Fraction
+
+    r = M.exact_test_resolution(2000, family_size=10 ** 400)
+    assert r['min_attainable_p_raw'] == 0.0
+    expected_holm = math.exp(math.log(2.0) + math.log(10 ** 400)
+                             - 2000 * math.log(2.0))
+    assert r['min_attainable_p_holm'] == pytest.approx(expected_holm,
+                                                       rel=1e-12)
+    assert r['family_testable'] is True
+    expected_family = int(
+        (Fraction.from_float(0.05) * (1 << 2000) / 2).__floor__())
+    assert r['max_comparisons_at_alpha'] == expected_family
+    assert r['max_comparisons_at_alpha'] > 10 ** 300
+    json.dumps(r, allow_nan=False)
+
+
 def test_exactly_attainable_boundary_counts_the_boundary():
     """The minimum-n search must not round an exact integer boundary up.
 
