@@ -112,6 +112,7 @@ from __future__ import annotations
 
 import math
 import random
+from fractions import Fraction
 from statistics import NormalDist
 
 __all__ = [
@@ -537,21 +538,25 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
             log_product = math.log(family_size) + math.log(p_min)
             p_holm = 1.0 if log_product >= 0.0 else math.exp(log_product)
 
+    alpha_frac = Fraction.from_float(alpha)
+
     def _min_effective(multiplier: int) -> int:
-        # smallest n >= 1 with multiplier * sided / 2**n <= alpha,
-        # compared in log space so an absurd family size cannot overflow
-        # the float conversion of 2**n.
-        log_num = math.log(multiplier) + math.log(sided)
-        log_alpha = math.log(alpha)
-        if log_num - log_alpha <= 0.0:
+        # Smallest n >= 1 with multiplier * sided / 2**n <= alpha.
+        # Compare exact rationals instead of logs: when the boundary is
+        # exactly attainable (e.g. alpha=0.5, family=2 -> 4/2**n <= 0.5 at
+        # n=3), floating-point log/ceil can round 3.0 up to 4 and overstate
+        # the required seed budget by one.
+        need = multiplier * sided * alpha_frac.denominator
+        num = alpha_frac.numerator
+        if num >= need:
             return 0
-        n = max(1, int(math.ceil((log_num - log_alpha) / math.log(2.0))))
-        while log_num - n * math.log(2.0) > log_alpha:
-            n += 1
-        while (n > 1
-               and log_num - (n - 1) * math.log(2.0) <= log_alpha):
+        # Bit lengths give log2(need/num) up to one; correct exactly below.
+        n = max(0, need.bit_length() - num.bit_length())
+        while n > 0 and num * (1 << (n - 1)) >= need:
             n -= 1
-        return n
+        while num * (1 << n) < need:
+            n += 1
+        return max(1, n)
 
     min_raw = _min_effective(1)
     min_holm = _min_effective(family_size)
@@ -566,10 +571,8 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
             # The true quotient is still an ordinary (if enormous) integer;
             # compute its floor exactly from the float representations rather
             # than returning None or crashing in int(inf).
-            from fractions import Fraction
             max_family = int(
-                (Fraction.from_float(alpha)
-                 / Fraction.from_float(p_min)).__floor__())
+                (alpha_frac / Fraction.from_float(p_min)).__floor__())
     return {
         'n_pairs': n_pairs,
         'n_zero': n_zero,

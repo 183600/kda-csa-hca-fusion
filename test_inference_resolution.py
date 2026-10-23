@@ -100,6 +100,23 @@ def test_extreme_positive_floors_do_not_overflow():
     json.dumps(huge_family, allow_nan=False)
 
 
+def test_exactly_attainable_boundary_counts_the_boundary():
+    """The minimum-n search must not round an exact integer boundary up.
+
+    ``2 * 2 / 2**n <= 0.5`` first holds at n=3 (the left side is exactly
+    0.5). Computing the log ratio and applying ``ceil`` can round 3.0 to
+    4, overstating the seed budget by one.
+    """
+    r = M.exact_test_resolution(0, alpha=0.5, family_size=2)
+    assert r['min_effective_pairs_holm'] == 3
+    assert r['shortfall_pairs_holm'] == 3
+
+    # 8 * 2 / 2**n <= 0.25 first holds at n=6 (again exact equality).
+    r = M.exact_test_resolution(0, alpha=0.25, family_size=8)
+    assert r['min_effective_pairs_holm'] == 6
+    assert r['shortfall_pairs_holm'] == 6
+
+
 def test_resolution_validation():
     for bad in (-1, 1.5, True, '5'):
         with pytest.raises(ValueError):
