@@ -103,6 +103,15 @@ def test_curve_diagnosis_keeps_extreme_finite_curves_json_safe():
         json.dumps(rep, allow_nan=False)
         assert rep['train']['head_mean'] is not None
         assert rep['train']['tail_mean'] is not None
+    # ``math.fsum`` can raise OverflowError on an intermediate partial sum
+    # even though the true least-squares slope is representable. A mixed
+    # vector of finite extremes must fall back to scaled arithmetic rather
+    # than aborting the whole curve diagnosis.
+    mixed_extremes = [1.5, 1e-308, 1e-308, 5e-324, -1e308, 1e308,
+                      1e-308, -1e308, 1e-300, 1e308]
+    rep = diagnose_training_curves(mixed_extremes)
+    json.dumps(rep, allow_nan=False)
+    assert rep['train']['tail_slope_per_point'] is not None
     # Ordinary curves still have the historical values.
     rep = diagnose_training_curves([3.0, 2.0, 1.0])
     assert rep['train']['head_mean'] == 3.0

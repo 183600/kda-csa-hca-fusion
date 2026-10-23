@@ -111,8 +111,15 @@ def _tail_slope(losses: Sequence[float], *, frac: float = 0.25
     slope = None
     if denom:
         deviations = [y - mean_y for y in ys]
-        num = math.fsum((x - mean_x) * d for x, d in zip(xs, deviations))
-        candidate = num / denom
+        try:
+            num = math.fsum((x - mean_x) * d
+                            for x, d in zip(xs, deviations))
+            candidate = num / denom
+        except OverflowError:
+            # ``fsum`` raises when an intermediate partial sum overflows,
+            # even if the true slope is finite. Treat it like an
+            # unrepresentable candidate and retry in scaled units below.
+            candidate = math.inf
         if math.isfinite(candidate):
             slope = candidate
         else:
