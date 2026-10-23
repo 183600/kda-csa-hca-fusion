@@ -211,6 +211,34 @@ def test_per_batch_sink_broadcasts_over_heads_when_b_equals_h():
             f'max|d|={(got - want).abs().max().item():.2e}')
 
 
+def test_per_batch_sink_survives_query_tiling_with_b_not_h():
+    """Query tiling must not normalise a ``[B, 1]`` sink against B=1.
+
+    The non-tiled path reads the real batch size when disambiguating a
+    leading singleton axis, but the query-tiled path used a synthetic
+    B=1 probe. With B > 1 and B != H that rejected a valid per-sequence
+    sink (or would have read it as per-head).
+    """
+    B, H, T, N, D = 2, 4, 7, 5, 8
+    torch.manual_seed(31)
+    q = torch.randn(B, H, T, D, dtype=torch.float64)
+    k = torch.randn(B, H, N, D, dtype=torch.float64)
+    v = torch.randn(B, H, N, D, dtype=torch.float64)
+    per_batch = torch.tensor([[[1.0]], [[-1.0]]], dtype=torch.float64)
+    intended = per_batch.unsqueeze(1).expand(B, H, 1, 1)
+    want = online_softmax_attention(q, k, v, sink_logits=intended)
+    for sink, label in (
+            (per_batch, '[B,1,1]'),
+            (per_batch[:, :, 0], '[B,1]')):
+        for query_chunk in (1, 3, T):
+            got = online_softmax_attention(
+                q, k, v, sink_logits=sink, query_chunk=query_chunk)
+            _ok(f'query_chunk={query_chunk}: per-batch sink {label} '
+                f'broadcasts over heads',
+                bool((got - want).abs().max() < 1e-12),
+                f'max|d|={(got - want).abs().max().item():.2e}')
+
+
 def test_shared_kv_mqa_gqa_and_query_tiling():
     """MQA/GQA + query tiles must equal the dense shared-KV reference."""
     torch.manual_seed(21)
@@ -277,6 +305,7 @@ _TEST_FUNCS = [
     test_positive_infinity_scores_use_the_softmax_limit,
     test_all_positive_infinity_scores_average_all_values,
     test_per_batch_sink_broadcasts_over_heads_when_b_equals_h,
+    test_per_batch_sink_survives_query_tiling_with_b_not_h,
     test_shared_kv_mqa_gqa_and_query_tiling,
 ]
 

@@ -386,11 +386,14 @@ def online_softmax_attention(q: torch.Tensor, k: torch.Tensor,
                                        sink_logits=sink_logits)
 
     # Normalise the sink ONCE so a per-query sink can be tiled with the
-    # queries.  ``_align_sink_logits`` only reads the head count / dtype /
-    # device from its second argument, so a 1-row probe is enough.
+    # queries.  ``_align_sink_logits`` reads the batch and head counts from
+    # its second argument, so the probe must carry the REAL batch size: a
+    # ``[B, 1]`` (or ``[B, 1, 1]``) per-sequence sink is disambiguated from
+    # ``[H, 1]`` by its leading batch axis, and a synthetic B=1 probe would
+    # reject it whenever B > 1 and B != H.
     sink = None
     if sink_logits is not None:
-        probe = q.new_zeros(1, q.shape[1], 1, 1)
+        probe = q.new_zeros(q.shape[0], q.shape[1], 1, 1)
         sink = _align_sink_logits(sink_logits, probe)
         if sink.dim() >= 2 and sink.shape[-2] not in (1, T):
             raise ValueError(
