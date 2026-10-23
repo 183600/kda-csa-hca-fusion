@@ -1476,6 +1476,10 @@ def ablation_design_audit(variants, rows=None, requested=None,
             name = r.get('variant')
             if name is None:
                 continue
+            try:
+                hash(name)
+            except TypeError:
+                continue
             values.setdefault(name, {f: set() for f in observed_fields})
             requested_seeds.setdefault(name, set())
             successful_seeds.setdefault(name, set())
