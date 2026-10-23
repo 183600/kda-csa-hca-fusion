@@ -1273,3 +1273,34 @@ def test_per_seed_filters_skip_oversized_json_integers():
     assert _seed_accuracy_map({'per_seed': rows}) == {2: 0.5}
     assert _finite_seed_set({'per_seed': rows}) == {2}
 
+
+def test_curve_summaries_skip_oversized_json_integers():
+    """Curve/gradient summaries must not crash on an out-of-float JSON int."""
+    from run_ablation import (_aggregate_curve_diagnosis,
+                              _curve_diagnosis_summary)
+    huge = 10 ** 400
+    per_seed = [{
+        'generalization_gap': huge,
+        'gradient_norms': {'max_over_clip': huge, 'notes': []},
+        'curve_diagnosis': {'verdict': 'overfitting'},
+        'best_val': {'step': 1},
+    }, {
+        'generalization_gap': 0.1,
+        'gradient_norms': {'max_over_clip': 2.0, 'notes': []},
+        'curve_diagnosis': {'verdict': 'overfitting'},
+        'best_val': {'step': 1},
+    }]
+    diag = _aggregate_curve_diagnosis(per_seed)
+    assert diag['mean_generalization_gap'] == pytest.approx(0.1)
+    assert diag['max_gradient_over_clip'] == pytest.approx(2.0)
+    json.dumps(diag, allow_nan=False)
+
+    summary = _curve_diagnosis_summary([{
+        'ratio': 'a', 'curve_verdict': 'overfitting',
+        'mean_generalization_gap': huge,
+        'max_gradient_over_clip': huge,
+    }])
+    assert summary['mean_generalization_gap'] is None
+    assert summary['max_gradient_over_clip'] is None
+    json.dumps(summary, allow_nan=False)
+

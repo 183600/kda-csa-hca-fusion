@@ -1752,7 +1752,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                 'recall_macro', 'balanced_accuracy', 'pr_auc_macro_ovr',
                 'roc_auc_macro_ovr'):
         vals = [float(r[key]) for r in ok_per_seed
-                if r.get(key) is not None]
+                if _is_finite_real(r.get(key))]
         if not vals:
             class_agg[key] = {'mean': None, 'std': None, 'ci95': None,
                               'n_seeds': 0}
@@ -2398,7 +2398,7 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
             elif field == 'lr':
                 try:
                     value = float(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
             vals.append(value)
         return sorted(set(vals), key=repr)
@@ -2618,19 +2618,13 @@ def _annotate_contrast_significance(contrasts: list,
         # could not have resolved. Additive fields only.
         sd = c.get('sd_diff')
         dz = None
-        if (isinstance(mean_diff, (int, float))
-                and not isinstance(mean_diff, bool)
-                and isinstance(sd, (int, float))
-                and not isinstance(sd, bool)
-                and math.isfinite(float(mean_diff))
-                and math.isfinite(float(sd)) and float(sd) > 0.0):
+        if (_is_finite_real(mean_diff) and _is_finite_real(sd)
+                and float(sd) > 0.0):
             dz = float(mean_diff) / float(sd)
         mde = None
         required_n = None
         if (alpha_test is not None and n >= 2
-                and isinstance(sd, (int, float))
-                and not isinstance(sd, bool)
-                and math.isfinite(float(sd)) and float(sd) >= 0.0):
+                and _is_finite_real(sd) and float(sd) >= 0.0):
             mde_alt = 'greater' if direction == 'greater' else 'two-sided'
             # ``alpha_test`` is the one-sided TAIL probability used by the
             # significance test above.  The planning helpers take a two-sided
@@ -2651,9 +2645,7 @@ def _annotate_contrast_significance(contrasts: list,
         c['min_detectable_effect_alpha'] = alpha_test
         c['min_detectable_effect_power'] = 0.8
         c['seeds_required_80pct_power'] = required_n
-        below_min = (isinstance(mean_diff, (int, float))
-                     and not isinstance(mean_diff, bool)
-                     and math.isfinite(float(mean_diff))
+        below_min = (_is_finite_real(mean_diff)
                      and abs(float(mean_diff)) < DEFAULT_MIN_EFFECT)
         c['below_default_min_effect'] = below_min
         c['significant_but_below_default_min_effect'] = bool(
@@ -2694,11 +2686,8 @@ def _annotate_contrast_significance(contrasts: list,
             mean_diff = c.get('mean_diff')
             sd = c.get('sd_diff')
             if (alpha_tost is None or n < 2
-                    or not isinstance(mean_diff, (int, float))
-                    or isinstance(mean_diff, bool)
-                    or not isinstance(sd, (int, float))
-                    or isinstance(sd, bool)
-                    or not math.isfinite(float(sd))):
+                    or not _is_finite_real(mean_diff)
+                    or not _is_finite_real(sd)):
                 c['equivalence_margin'] = equivalence_margin
                 c['tost_alpha_bonferroni'] = alpha_tost
                 c['tost_p_value'] = None
@@ -2863,9 +2852,7 @@ def _contrast_consistency_violations(all_results: list,
         memory = c.get('memory', '')
         name = c.get('contrast', '')
         reported = c.get('mean_diff')
-        if not (isinstance(reported, (int, float))
-                and not isinstance(reported, bool)
-                and math.isfinite(float(reported))):
+        if not _is_finite_real(reported):
             continue  # the row contract reports non-finite means
         where = f'{name!r} ({memory}, n_kv={n_kv})'
         if isinstance(memory, str) and ' vs ' in memory:
@@ -2914,9 +2901,7 @@ def _contrast_consistency_violations(all_results: list,
             out.append(f'{where}: n_common_seeds={c.get("n_common_seeds")!r} '
                        f'but the rows share {n_common} seed(s)')
         reported_sd = c.get('sd_diff')
-        if (isinstance(reported_sd, (int, float))
-                and not isinstance(reported_sd, bool)
-                and math.isfinite(float(reported_sd))):
+        if _is_finite_real(reported_sd):
             # The stored SD feeds the TOST equivalence verdict; drift
             # between it and the raw rows would silently move the
             # equivalence CI.
@@ -2954,8 +2939,7 @@ def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
     for v in verdicts:
         counts[v] = counts.get(v, 0) + 1
     gaps = [float(r['generalization_gap']) for r in ok_per_seed
-            if r.get('generalization_gap') is not None
-            and math.isfinite(float(r['generalization_gap']))]
+            if _is_finite_real(r.get('generalization_gap'))]
     best_vals = [r['best_val'] for r in ok_per_seed if r.get('best_val')]
     best_step = None
     if best_vals:
@@ -2981,8 +2965,7 @@ def _aggregate_curve_diagnosis(ok_per_seed: list) -> dict:
     grad_clipped = [g for g in grad_records
                     if int(g.get('n_above_clip') or 0) > 0]
     grad_over = [float(g['max_over_clip']) for g in grad_records
-                 if g.get('max_over_clip') is not None
-                 and math.isfinite(float(g['max_over_clip']))]
+                 if _is_finite_real(g.get('max_over_clip'))]
     grad_notes = sorted({note for g in grad_warned
                          for note in (g.get('notes') or [])})
     modal = (max(counts, key=lambda k: counts[k])
@@ -3038,7 +3021,7 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
     for r in counted:
         counts[r['curve_verdict']] = counts.get(r['curve_verdict'], 0) + 1
         g = r.get('mean_generalization_gap')
-        if g is not None and math.isfinite(float(g)):
+        if _is_finite_real(g):
             gaps.append(float(g))
     def _row_saturated(r) -> bool:
         n_ceiling = int(r.get('n_seeds_at_ceiling') or 0)
@@ -3069,8 +3052,7 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
         for r in counted if r.get('n_seeds_with_gradient_warnings'))
     grad_over = [float(r['max_gradient_over_clip'])
                  for r in counted
-                 if r.get('max_gradient_over_clip') is not None
-                 and math.isfinite(float(r['max_gradient_over_clip']))]
+                 if _is_finite_real(r.get('max_gradient_over_clip'))]
 
     summary = {
         'rows_total': len(rows),
