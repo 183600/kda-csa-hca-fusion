@@ -304,6 +304,15 @@ def test_greedy_search_recovers_target():
     assert result['rounds'][-1]['accepted'] is False
 
 
+def test_greedy_search_rejects_oversized_statistics_parameters():
+    """JSON-sized ints are malformed statistics config, not OverflowError."""
+    problem = _fake_problem(lambda cand: 0.0)
+    huge = 10 ** 400
+    for kwargs in ({'alpha': huge}, {'min_delta': huge}):
+        with pytest.raises(ValueError):
+            greedy_search(problem, START, max_rounds=0, **kwargs)
+
+
 def test_greedy_search_respects_state_budget():
     global_best = Candidate(('csa', 'csa', 'csa', 'csa', 'csa'), csa_topk=2)
 

@@ -717,9 +717,32 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
         raise ValueError(
             f'greedy_search: max_rounds must be a non-negative int, got '
             f'{max_rounds!r}.')
-    if not 0.0 < float(alpha) < 1.0:
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
         raise ValueError(
             f'greedy_search: alpha must be in (0, 1), got {alpha!r}.')
+    try:
+        alpha_value = float(alpha)
+    except OverflowError:
+        raise ValueError(
+            f'greedy_search: alpha must be in (0, 1), got {alpha!r}.'
+        ) from None
+    if not 0.0 < alpha_value < 1.0:
+        raise ValueError(
+            f'greedy_search: alpha must be in (0, 1), got {alpha!r}.')
+    if isinstance(min_delta, bool) or not isinstance(min_delta, (int, float)):
+        raise ValueError(
+            f'greedy_search: min_delta must be a finite number, got '
+            f'{min_delta!r}.')
+    try:
+        min_delta_value = float(min_delta)
+    except OverflowError:
+        raise ValueError(
+            f'greedy_search: min_delta must be a finite number, got '
+            f'{min_delta!r}.') from None
+    if not math.isfinite(min_delta_value):
+        raise ValueError(
+            f'greedy_search: min_delta must be a finite number, got '
+            f'{min_delta!r}.')
 
     records: dict[Candidate, dict] = {}
 
@@ -751,13 +774,13 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
             pair[1]['decode_marginal_read_elements'], pair[1]['label']))
         current_score = current_record['score']
         improved = (current_score is None
-                    or best_rec['score'] > current_score + float(min_delta))
+                    or best_rec['score'] > current_score + min_delta_value)
         paired = None
         supported = None
         family_size = len(selectable)
-        alpha_move = (float(alpha) / family_size
+        alpha_move = (alpha_value / family_size
                       if (selection_correction and family_size)
-                      else float(alpha))
+                      else alpha_value)
         if improved and current_score is not None and require_supported:
             pair = _paired_seed_diffs(best_rec, current_record)
             if pair is not None:
@@ -767,7 +790,7 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
                     'seeds': [int(s) for s in pair[0]],
                     'selection_correction': bool(selection_correction),
                     'selection_family_size': family_size,
-                    'alpha_uncorrected': float(alpha),
+                    'alpha_uncorrected': alpha_value,
                     'alpha_used': alpha_move,
                     **pair_stats,
                 }
@@ -781,7 +804,7 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
             reason = (f'mean score improved but not reproducible across '
                       f'seeds (paired one-sided t, '
                       f'alpha={alpha_move:g}'
-                      + (f' = {float(alpha):g}/{family_size} selection-'
+                      + (f' = {alpha_value:g}/{family_size} selection-'
                          f'corrected' if selection_correction else '')
                       + ')')
         rounds.append({
@@ -797,7 +820,7 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
             'improvement_supported': supported,
             'selection_correction': bool(selection_correction),
             'selection_family_size': family_size,
-            'alpha_uncorrected': float(alpha),
+            'alpha_uncorrected': alpha_value,
             'alpha_used': alpha_move,
             'paired': paired,
             'accepted': accepted,
@@ -831,7 +854,7 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
     plateau = [r for r in records.values()
                if r['feasible'] and r['score'] is not None
                and endpoint['score'] is not None
-               and endpoint['score'] - float(min_delta)
+               and endpoint['score'] - min_delta_value
                <= r['score'] <= endpoint['score']]
     best = endpoint
     if plateau:
@@ -852,14 +875,14 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
         final_family_size = max(1, sum(
             1 for r in records.values()
             if r['feasible'] and r['score'] is not None))
-        alpha_final = (float(alpha) / final_family_size
-                       if selection_correction else float(alpha))
+        alpha_final = (alpha_value / final_family_size
+                       if selection_correction else alpha_value)
         pair_stats, supported = _paired_support(pair[1], alpha=alpha_final)
         best_vs_start = {
             'test': ('seed-paired one-sided t on per-seed accuracy '
                      '(best - start); H1: best > start'),
             'alpha': alpha_final,
-            'alpha_uncorrected': float(alpha),
+            'alpha_uncorrected': alpha_value,
             'selection_correction': bool(selection_correction),
             'selection_family_size': final_family_size,
             'seeds': [int(s) for s in pair[0]],
@@ -876,9 +899,9 @@ def greedy_search(problem: SearchProblem, start: Candidate, *,
         'best_vs_start': best_vs_start,
         'acceptance_policy': {
             'raw_rule': 'best feasible neighbor score > current + min_delta',
-            'min_delta': float(min_delta),
+            'min_delta': min_delta_value,
             'require_supported': bool(require_supported),
-            'alpha': float(alpha),
+            'alpha': alpha_value,
             'selection_correction': bool(selection_correction),
             'selection_correction_method': (
                 'bonferroni over all feasible scored contenders in the '
