@@ -146,13 +146,21 @@ def _validate_cache_int(name: str, value, minimum: int = 0) -> int:
 
 def _validate_rope_base(owner: str, rope_base) -> float:
     """Finite positive RoPE base (bool/string/NaN are configuration bugs)."""
-    if (isinstance(rope_base, bool)
-            or not isinstance(rope_base, (int, float))
-            or not math.isfinite(float(rope_base)) or rope_base <= 0):
+    if isinstance(rope_base, bool) or not isinstance(rope_base, (int, float)):
         raise ValueError(
             f'{owner}: rope_base={rope_base!r} must be a finite positive '
             f'number.')
-    return float(rope_base)
+    try:
+        base = float(rope_base)
+    except (OverflowError, ValueError):
+        raise ValueError(
+            f'{owner}: rope_base={rope_base!r} must be a finite positive '
+            f'number.')
+    if not math.isfinite(base) or base <= 0:
+        raise ValueError(
+            f'{owner}: rope_base={rope_base!r} must be a finite positive '
+            f'number.')
+    return base
 
 
 def _validate_sink_shape(owner: str, sink_logits, nh: int) -> None:

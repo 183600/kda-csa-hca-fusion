@@ -170,9 +170,13 @@ def naive_hca(
     # value would otherwise be silently accepted whenever rope_dim_eff == 0
     # (then the downstream partial_rope check never runs). This matches the
     # decoding-cache constructors, which always validate the base.
+    try:
+        _base_finite = math.isfinite(float(rope_base))
+    except (TypeError, ValueError, OverflowError):
+        _base_finite = False
     if (isinstance(rope_base, bool)
             or not isinstance(rope_base, (int, float))
-            or not math.isfinite(float(rope_base)) or rope_base <= 0):
+            or not _base_finite or rope_base <= 0):
         raise ValueError(
             f"naive_hca: rope_base={rope_base!r} must be a finite positive "
             f"number")

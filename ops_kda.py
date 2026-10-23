@@ -37,6 +37,20 @@ _KDA_NONFINITE_WARN = _os.environ.get(
     'KDA_NONFINITE_WARN', '1').strip().lower() not in ('0', 'false', 'off', 'no')
 
 
+def _is_finite_real(value) -> bool:
+    """True for a non-bool real representable as a finite float.
+
+    ``float(10**400)`` raises OverflowError; a JSON-sized integer is a
+    malformed configuration value, not a crash.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return _math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 def per_channel_log_decay_bias(
     n_heads: int,
     head_dim: int,
@@ -89,7 +103,7 @@ def per_channel_log_decay_bias(
                 f"positive int.")
     if (not isinstance(decay_scale, (int, float))
             or isinstance(decay_scale, bool)
-            or not _math.isfinite(float(decay_scale))
+            or not _is_finite_real(decay_scale)
             or decay_scale < 0):
         raise ValueError(
             f"per_channel_log_decay_bias: decay_scale={decay_scale!r} must "
@@ -97,7 +111,7 @@ def per_channel_log_decay_bias(
     for name, value in (('min_half_life', min_half_life),
                         ('max_half_life', max_half_life)):
         if (not isinstance(value, (int, float)) or isinstance(value, bool)
-                or not _math.isfinite(float(value))
+                or not _is_finite_real(value)
                 or value <= 0):
             raise ValueError(
                 f"per_channel_log_decay_bias: {name}={value!r} must be a "

@@ -109,11 +109,17 @@ def _require_positive_int(name: str, value) -> int:
 
 
 def _require_finite_real(name: str, value) -> float:
-    if (isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not _math.isfinite(float(value))):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f'{name}={value!r} must be a finite number.')
-    return float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        # JSON integers are unbounded; one beyond the float range is not a
+        # usable configuration value, and must not leak OverflowError.
+        raise ValueError(f'{name}={value!r} must be a finite number.')
+    if not _math.isfinite(number):
+        raise ValueError(f'{name}={value!r} must be a finite number.')
+    return number
 
 
 def _require_gate_clamp(name: str, value, *, allow_negative_inf: bool) -> float:
@@ -133,7 +139,11 @@ def _require_gate_clamp(name: str, value, *, allow_negative_inf: bool) -> float:
             f'finite meaning).')
     if not allow_negative_inf and value == float('-inf'):
         raise ValueError(f'{name}=-inf is not a valid upper clamp bound.')
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError:
+        raise ValueError(
+            f'{name}={value!r} must be representable as a finite float.')
 
 
 def create_gate(

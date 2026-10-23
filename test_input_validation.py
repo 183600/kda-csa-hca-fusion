@@ -361,6 +361,7 @@ def test_rope_rejects_invalid_dims_bases_and_positions():
             {'rope_dim': 4, 'base': float('nan')},
             {'rope_dim': 4, 'base': float('inf')},
             {'rope_dim': 4, 'base': True},
+            {'rope_dim': 4, 'base': 10 ** 400},
             {'rope_dim': 4.0},
             {'rope_dim': True},
             {'rope_dim': 4, 'dim': True}):
@@ -423,7 +424,7 @@ def test_decoding_cache_geometry_requires_exact_ints():
             else:
                 _ok(f'{ctor.__name__} {bad} rejected', False,
                     'no error raised')
-        for base in (float('nan'), float('inf'), True):
+        for base in (float('nan'), float('inf'), True, 10 ** 400):
             if ctor is CSADecodingCache:
                 call = (1, 4, 4, 2, 4, 'cpu', torch.float32)
             else:
@@ -856,7 +857,7 @@ def test_csa_hca_validate_rope_base_even_when_rope_is_disabled():
     W_IUQ = torch.randn(c_I * nIh, dc)
     W_w = torch.randn(nIh, d)
     H = torch.randn(1, 3, d)
-    for bad in (float('nan'), float('inf'), '10000', True):
+    for bad in (float('nan'), float('inf'), '10000', True, 10 ** 400):
         try:
             naive_csa(
                 H, W, W, W, W, B_pos, B_pos, W_DQ, W_UQ, W_IUQ, W_w,

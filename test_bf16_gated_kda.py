@@ -332,6 +332,35 @@ def test_gated_delta_rule_state_contract_and_mixed_dtype_step():
         f'{o.dtype}')
 
 
+def test_gated_attention_rejects_oversized_config_scalars():
+    """A JSON-sized int is rejected as a config error, not OverflowError."""
+    print('\nTest: oversized gate config scalars are rejected')
+    huge = 10 ** 400
+    for kw in ({'g_init': huge}, {'beta_init': huge},
+               {'g_clamp_min': huge}, {'g_clamp_max': huge}):
+        raised = False
+        try:
+            GatedDeltaRule(2, 4, 4, **kw)
+        except ValueError:
+            raised = True
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'GatedDeltaRule {kw} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+            continue
+        _ok(f'GatedDeltaRule {kw} rejected', raised, '')
+    for kw in ({'init_value': huge}, {'init_std': huge}):
+        raised = False
+        try:
+            create_gate('per_head', 4, 32, **kw)
+        except ValueError:
+            raised = True
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            _ok(f'create_gate {kw} rejected', False,
+                f'{type(exc).__name__}: {exc}')
+            continue
+        _ok(f'create_gate {kw} rejected', raised, '')
+
+
 def test_gated_delta_rule_rejects_mismatched_geometry():
     print('\nTest: GatedDeltaRule rejects mismatched q/k/v geometry')
     B, T, H, K, V = 2, 4, 2, 3, 4
@@ -445,6 +474,7 @@ if __name__ == '__main__':
     test_gated_delta_rule_gradient()
     test_gated_delta_rule_step_functional()
     test_gated_delta_rule_state_contract_and_mixed_dtype_step()
+    test_gated_attention_rejects_oversized_config_scalars()
     test_gated_delta_rule_empty_sequence_dtype_contract()
     test_gated_delta_rule_bf16()
     test_kda_log_decay_init_under_autocast()

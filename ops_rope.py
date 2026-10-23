@@ -383,8 +383,12 @@ def partial_rope(
     if rope_dim % 2 != 0:
         raise ValueError(
             f"partial_rope: rope_dim={rope_dim} must be even.")
+    try:
+        _base_finite = _math.isfinite(float(base))
+    except (TypeError, ValueError, OverflowError):
+        _base_finite = False
     if (isinstance(base, bool) or not isinstance(base, (int, float))
-            or not _math.isfinite(float(base)) or base <= 0):
+            or not _base_finite or base <= 0):
         raise ValueError(
             f"partial_rope: base={base!r} must be a finite positive number.")
     if P == 0:
