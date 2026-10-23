@@ -223,6 +223,20 @@ def test_invalid_inputs_raise():
                     weight_storage={'memory': kv_quant.FP8Spec()})
     with pytest.raises(ValueError):
         resolve_scenario('int4')
+    huge = 10 ** 400
+    for bad_call in (
+            lambda: ttft_ledger(cfg, huge, peak_tflops=PEAK, bw_gbps=BW),
+            lambda: ttft_ledger(cfg, 8, batch=huge,
+                                peak_tflops=PEAK, bw_gbps=BW),
+            lambda: ttft_ledger(cfg, 8, peak_tflops=huge, bw_gbps=BW),
+            lambda: ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=huge),
+            lambda: ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=BW,
+                                compute_speedup=huge),
+            lambda: ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=BW,
+                                weight_elements=huge),
+            lambda: layout_prefill_flops(cfg, 8, batch=huge)):
+        with pytest.raises(ValueError):
+            bad_call()
 
 
 def test_report_is_strict_json():

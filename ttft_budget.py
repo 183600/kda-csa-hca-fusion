@@ -106,14 +106,28 @@ def _validate_positive_int(value, name: str, minimum: int = 1) -> int:
         raise TypeError(f'{name} must be an int, got {value!r}')
     if value < minimum:
         raise ValueError(f'{name} must be >= {minimum}, got {value}')
+    try:
+        float(value)
+    except OverflowError:
+        # JSON integers are unbounded; a size/geometry value outside the
+        # float range cannot enter the byte/FLOP arithmetic.
+        raise ValueError(
+            f'{name} must be representable as a finite float, '
+            f'got {value!r}') from None
     return value
 
 
 def _validate_positive_float(value, name: str) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or value <= 0):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))):
         raise ValueError(f'{name} must be finite and positive, got {value!r}')
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'{name} must be finite and positive, got {value!r}') from None
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f'{name} must be finite and positive, got {value!r}')
+    return number
 
 
 def _require_cfg(cfg) -> None:
@@ -313,6 +327,12 @@ def ttft_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
         raise ValueError(
             f'ttft_ledger: weight_elements={weight_elements!r} must be a '
             f'non-negative int.')
+    try:
+        float(weight_elements)
+    except OverflowError:
+        raise ValueError(
+            f'ttft_ledger: weight_elements={weight_elements!r} must be '
+            f'representable as a finite float.') from None
 
     if weight_storage is None:
         weight_bpe = float(itemsize)
