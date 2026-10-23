@@ -772,6 +772,12 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
     """
     acc = candidate.get('mean_acc', candidate.get('final_acc'))
     base = baseline.get('mean_acc', baseline.get('final_acc'))
+    min_effect_value = _finite_float_or_none(min_effect)
+    max_cost_value = _finite_float_or_none(max_cost_ratio)
+    if min_effect_value is None or max_cost_value is None:
+        raise ValueError('min_effect and max_cost_ratio must be finite '
+                         f'numbers, got {min_effect!r}, {max_cost_ratio!r}')
+    paired = _finite_float_or_none(paired_pvalue)
     report: dict = {
         'verdict': 'indeterminate',
         'accuracy_delta': None,
@@ -780,10 +786,10 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         'worst_cost_ratio': None,
         'measured_cost_keys': [],
         'missing_cost_keys': [],
-        'min_effect': float(min_effect),
-        'max_cost_ratio': float(max_cost_ratio),
+        'min_effect': min_effect_value,
+        'max_cost_ratio': max_cost_value,
         'significant': significant,
-        'paired_pvalue': paired_pvalue,
+        'paired_pvalue': paired,
         'cost_keys': list(cost_keys),
         'recommendation': '',
     }
@@ -799,9 +805,18 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         return report
 
     delta = candidate_acc - baseline_acc
+    if not math.isfinite(delta):
+        # Opposite-sign extremes can overflow the subtraction even though
+        # both endpoints are finite; the difference is not representable.
+        report['recommendation'] = (
+            'the accuracy difference is not representable as a finite '
+            'float; refusing to call this an improvement.')
+        return report
     report['accuracy_delta'] = delta
+    relative = (delta / baseline_acc) if baseline_acc else None
     report['relative_accuracy_gain'] = (
-        delta / baseline_acc) if baseline_acc else None
+        relative if relative is not None and math.isfinite(relative)
+        else None)
 
     ratios = {}
     missing = []
@@ -819,7 +834,13 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         if b <= 0.0:
             missing.append(key)
             continue
-        ratios[key] = c / b
+        ratio = c / b
+        if not math.isfinite(ratio):
+            # The true ratio exceeds the float range; it is not a usable
+            # JSON metric, so record the axis as missing.
+            missing.append(key)
+            continue
+        ratios[key] = ratio
     report['cost_ratios'] = ratios
     report['measured_cost_keys'] = list(ratios)
     report['missing_cost_keys'] = list(missing)
@@ -845,7 +866,7 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
             f'should not be adopted over the baseline.')
         return report
 
-    if delta < float(min_effect):
+    if delta < min_effect_value:
         report['verdict'] = 'below_min_effect'
         report['recommendation'] = (
             f'gain of {delta:+.4f} is below the pre-specified minimum '
@@ -855,17 +876,17 @@ def accuracy_cost_tradeoff(candidate: Mapping, baseline: Mapping, *,
         return report
 
     if significant is False or (
-            paired_pvalue is not None and not (paired_pvalue < 0.05)):
+            paired is not None and not (paired < 0.05)):
         report['verdict'] = 'not_significant'
         report['recommendation'] = (
             f'gain of {delta:+.4f} clears the minimum effect but is not '
             f'separable from seed noise'
-            + (f' (paired p={paired_pvalue:.4g})' if paired_pvalue is not None
+            + (f' (paired p={paired:.4g})' if paired is not None
                else '')
             + '. Report as inconclusive, not as an improvement.')
         return report
 
-    if ratios and report['worst_cost_ratio']['ratio'] > float(max_cost_ratio):
+    if ratios and report['worst_cost_ratio']['ratio'] > max_cost_value:
         worst = report['worst_cost_ratio']
         report['verdict'] = 'cost_prohibitive'
         report['recommendation'] = (

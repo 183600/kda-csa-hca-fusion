@@ -336,6 +336,25 @@ def test_accuracy_cost_tradeoff_screens_effect_significance_and_cost():
     assert len(complete['measured_cost_keys']) == 6
 
 
+def test_accuracy_cost_tradeoff_is_json_safe_at_float_limits():
+    """An unrepresentable delta/ratio must not leak inf into the report."""
+    # Opposite-sign extremes overflow the subtraction.
+    rep = accuracy_cost_tradeoff(
+        {'mean_acc': 1e308}, {'mean_acc': -1e308})
+    assert rep['verdict'] == 'indeterminate'
+    assert rep['accuracy_delta'] is None
+    json.dumps(rep, allow_nan=False)
+
+    # A ratio whose true value exceeds the float range is not JSON-safe;
+    # the axis is reported as missing instead of inf.
+    rep = accuracy_cost_tradeoff(
+        {'mean_acc': 0.6, 'n_params': 1e308},
+        {'mean_acc': 0.5, 'n_params': 1e-300}, paired_pvalue=float('nan'))
+    assert 'n_params' in rep['missing_cost_keys']
+    assert rep['paired_pvalue'] is None
+    json.dumps(rep, allow_nan=False)
+
+
 def test_oversized_json_integers_are_skipped_by_tradeoff_and_pooling():
     """JSON ints beyond the float range are malformed metrics, not crashes.
 
