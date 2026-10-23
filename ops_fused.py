@@ -751,6 +751,32 @@ class HybridConfig:
                            and self.n_kda > 0)
             uses_rwkv7 = (self.memory_type == 'rwkv7'
                           and self.n_kda > 0)
+        # Every integer geometry value is later multiplied/divided in float
+        # arithmetic (or materialized as a layer/tensor count). JSON-sized
+        # ints are unbounded, so an unrepresentable value must be a config
+        # error here instead of an OverflowError/MemoryError deep inside the
+        # first build or forward.
+        for name in (
+                'd_model', 'n_heads_qk', 'n_heads_v', 'head_dim_k',
+                'head_dim_v', 'csa_m', 'csa_topk', 'csa_nh', 'csa_c',
+                'csa_dc', 'csa_nIh', 'csa_cI', 'csa_sliding_window',
+                'csa_indexer_chunk', 'csa_rope_dim', 'hca_m2', 'hca_nh',
+                'hca_c', 'hca_dc', 'hca_sliding_window', 'hca_rope_dim',
+                'n_kda', 'n_csa', 'n_hca', 'kda_chunk_size',
+                'mamba_d_state', 'mamba_d_conv', 'mamba_expand',
+                'mamba_headdim', 'mamba_ngroups', 'mamba_chunk_size',
+                'rwkv_head_dim', 'rwkv_decay_lora', 'rwkv_a_lora',
+                'rwkv_gate_lora'):
+            value = getattr(self, name)
+            if value is None or not isinstance(value, int) \
+                    or isinstance(value, bool):
+                continue
+            try:
+                float(value)
+            except OverflowError:
+                raise ValueError(
+                    f"HybridConfig.{name}={value!r} must be representable "
+                    f"as a finite float.") from None
         if uses_mamba2:
             validate_mamba2_geometry(
                 self.d_model, self.mamba_d_state, self.mamba_d_conv,

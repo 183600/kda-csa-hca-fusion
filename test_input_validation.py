@@ -286,6 +286,14 @@ def test_hybrid_config_rejects_coerced_and_nonfinite_fields():
         {'kda_decay_half_life_min': 10 ** 400},
         {'kda_decay_half_life_max': 10 ** 400},
         {'rope_base': 10 ** 400},
+        {'csa_m': 10 ** 400},
+        {'csa_topk': 10 ** 400},
+        {'csa_nh': 10 ** 400},
+        {'csa_sliding_window': 10 ** 400},
+        {'hca_nh': 10 ** 400},
+        {'n_kda': 10 ** 400},
+        {'kda_chunk_size': 10 ** 400},
+        {'mamba_chunk_size': 10 ** 400},
     )
     for patch in cases:
         try:
