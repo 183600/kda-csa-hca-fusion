@@ -826,6 +826,21 @@ def test_distance_buckets_cap_an_oversized_window():
                 'window'
 
 
+def test_recall_flops_rejects_oversized_geometry_without_overflow():
+    """A JSON-sized int must be a ValueError, not ``math.ceil`` OverflowError."""
+    import pytest
+
+    import recall_flops_audit as rfa
+
+    huge = 10 ** 400
+    with pytest.raises(ValueError):
+        rfa.ratio_layout(1, 1, 0, huge)
+    with pytest.raises(ValueError):
+        rfa.audit_layout(('csa',), seq_len=huge, measure=False)
+    with pytest.raises(ValueError):
+        rfa.audit_layout(('csa',), seq_len=8, batch=huge, measure=False)
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -842,6 +857,7 @@ def main() -> int:
     test_worst_seed_selection_picks_lowest_accuracy()
     test_far_metrics_are_undefined_without_far_placements()
     test_recall_flops_accepts_tuple_layout_forms()
+    test_recall_flops_rejects_oversized_geometry_without_overflow()
     test_distance_buckets_cap_an_oversized_window()
     test_report_materializes_one_shot_inputs()
     print('\nAll recall-reach tests passed.')

@@ -100,6 +100,14 @@ def _validate_positive_int(name: str, value, *, minimum: int = 1) -> int:
             f'{name}={value!r} must be an int (got {type(value).__name__}).')
     if value < minimum:
         raise ValueError(f'{name}={value} must be >= {minimum}.')
+    try:
+        float(value)
+    except OverflowError:
+        # JSON integers are unbounded; a value outside the float range
+        # cannot enter the FLOP/geometry arithmetic (or the ceil below).
+        raise ValueError(
+            f'{name}={value!r} must be representable as a finite float.'
+        ) from None
     return value
 
 
