@@ -121,6 +121,27 @@ def test_simulation_contract_and_rng_isolation():
     else:
         raise AssertionError('a size-control scenario with delta > 0 '
                              'must be refused')
+    huge = 10 ** 400
+    for bad in ({'n_units': 8, 'alpha': 0.1, 'tol': huge},
+                {'n_units': 8, 'alpha': huge, 'tol': 0.05}):
+        try:
+            PC.coverage_study([bad], reps=2, n_boot=2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'coverage_study accepted oversized {bad!r}')
+    for bad in ({'n_units': 8, 'alpha': 0.1, 'delta': huge,
+                 'check': 'size', 'tol': 0.05},
+                {'n_units': 8, 'alpha': 0.1, 'delta': 0.0,
+                 'check': 'size', 'tol': huge},
+                {'n_units': 8, 'alpha': 0.1, 'delta': 0.2,
+                 'check': 'power', 'min_power': huge}):
+        try:
+            PC.paired_study([bad], reps=2, n_boot=2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'paired_study accepted oversized {bad!r}')
 
     # Trial counts, unit counts and seeds are exact ints: silently
     # truncating 2.5 -> 2 would change the measured rate and its denominator.

@@ -73,6 +73,13 @@ def _is_finite_real(value) -> bool:
     except (OverflowError, ValueError):
         return False
 
+
+def _study_float(value, label: str) -> float:
+    """Convert a JSON-sourced scenario scalar or reject it as non-finite."""
+    if not _is_finite_real(value):
+        raise ValueError(f'{label} must be finite, got {value!r}')
+    return float(value)
+
 __all__ = [
     'simulate_units',
     'simulate_paired_units',
@@ -235,7 +242,8 @@ def coverage_study(scenarios, *, n_boot: int = 500, reps: int = 400,
     for s_i, scenario in enumerate(scenarios):
         n_units = scenario['n_units']
         alpha = scenario['alpha']
-        tol = float(scenario['tol'])
+        tol = _study_float(scenario['tol'],
+                           f'scenario {s_i} tol')
         _validate_common(n_units, reps, n_boot)
         _pb._validate_boot_args(alpha, n_boot)
         if not (math.isfinite(tol) and tol > 0.0):
@@ -288,8 +296,10 @@ def paired_study(scenarios, *, n_boot: int = 500, reps: int = 400,
     for s_i, scenario in enumerate(scenarios):
         n_units = scenario['n_units']
         alpha = scenario['alpha']
-        delta = float(scenario.get('delta', 0.0))
-        noise_sd = float(scenario.get('noise_sd', 0.2))
+        delta = _study_float(scenario.get('delta', 0.0),
+                             f'scenario {s_i} delta')
+        noise_sd = _study_float(scenario.get('noise_sd', 0.2),
+                                f'scenario {s_i} noise_sd')
         check = str(scenario.get('check', 'size'))
         _validate_common(n_units, reps, n_boot)
         _pb._validate_boot_args(alpha, n_boot)
@@ -300,7 +310,8 @@ def paired_study(scenarios, *, n_boot: int = 500, reps: int = 400,
             if delta != 0.0:
                 raise ValueError(f'scenario {s_i}: size control needs '
                                  f'delta=0, got {delta!r}')
-            tol = float(scenario['tol'])
+            tol = _study_float(scenario['tol'],
+                           f'scenario {s_i} tol')
             if not (math.isfinite(tol) and tol > 0.0):
                 raise ValueError(f'scenario {s_i}: tol must be positive, '
                                  f'got {tol!r}')
@@ -309,7 +320,8 @@ def paired_study(scenarios, *, n_boot: int = 500, reps: int = 400,
             if not (math.isfinite(delta) and delta > 0.0):
                 raise ValueError(f'scenario {s_i}: power scenario needs '
                                  f'delta > 0, got {delta!r}')
-            floor = float(scenario['min_power'])
+            floor = _study_float(scenario['min_power'],
+                                 f'scenario {s_i} min_power')
             if not (math.isfinite(floor) and 0.0 < floor <= 1.0):
                 raise ValueError(f'scenario {s_i}: min_power must be in '
                                  f'(0, 1], got {floor!r}')
