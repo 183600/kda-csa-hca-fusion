@@ -508,6 +508,35 @@ def test_variant_config_audit_detects_drift_and_non_treatments():
                 for m in drift['mismatches']), str(drift['mismatches']))
 
 
+def test_variant_config_audit_handles_a_malformed_baseline():
+    """A bad baseline record is an audit error, never an AttributeError.
+
+    ``variant_config_audit`` promises not to crash a run on malformed
+    input; a non-mapping baseline and a baseline whose config cannot be
+    built both return the documented ``error`` status with a message.
+    """
+    print("\nTest: Exp 8 config audit tolerates a malformed baseline")
+    for baseline in ('baseline', ['baseline'], 3):
+        result = M.variant_config_audit([], baseline=baseline)
+        _ok(f'malformed baseline {baseline!r} is an error status',
+            result['status'] == 'error'
+            and result['baseline_present'] is True
+            and bool(result['errors'])
+            and bool(result['error']), str(result))
+
+    # A mapping that cannot build a HybridConfig (missing required factor
+    # keys) takes the build-failure path and keeps the same error schema.
+    result = M.variant_config_audit(
+        [{'name': 'baseline'}, {'name': 'no_rope', 'rope': False,
+                                'topk': 2, 'use_ste': True}],
+        baseline={'name': 'baseline'})
+    _ok('an unbuildable baseline reports a build error',
+        result['status'] == 'error'
+        and result['baseline_present'] is True
+        and bool(result['errors'])
+        and 'config build failed' in (result['error'] or ''), str(result))
+
+
 def test_exp8_smoke_envelope():
     """End-to-end smoke: tiny run writes a v1.0 envelope with the right kind."""
     print("\nTest: Exp 8 end-to-end smoke (1 seed x 1 step)")

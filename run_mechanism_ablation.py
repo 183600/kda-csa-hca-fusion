@@ -1098,9 +1098,25 @@ def variant_config_audit(variants, baseline=None, d_model=32):
             'mismatches': [],
             'no_change_variants': [],
             'duplicate_treatments': [],
+            'errors': [],
             'error': None,
             'note': ('A config audit needs the baseline variant to define '
                      'the reference switches.'),
+        }
+    if not isinstance(baseline, dict):
+        message = (f'malformed baseline record: {baseline!r}; a variant '
+                   'record must be a mapping')
+        return {
+            'status': 'error',
+            'baseline_present': True,
+            'variants': [],
+            'mismatches': [],
+            'no_change_variants': [],
+            'duplicate_treatments': [],
+            'errors': [message],
+            'error': message,
+            'note': 'The controlled-variable check could not read the '
+                    'baseline variant.',
         }
 
     def _safe(fn, *args):
@@ -1112,6 +1128,7 @@ def variant_config_audit(variants, baseline=None, d_model=32):
     base_cfg, base_error = _safe(make_variant_cfg, baseline, d_model)
     base_ste = bool(baseline.get('use_ste', True))
     if base_cfg is None:
+        message = f'baseline config build failed: {base_error}'
         return {
             'status': 'error',
             'baseline_present': True,
@@ -1119,7 +1136,8 @@ def variant_config_audit(variants, baseline=None, d_model=32):
             'mismatches': [],
             'no_change_variants': [],
             'duplicate_treatments': [],
-            'error': f'baseline config build failed: {base_error}',
+            'errors': [message],
+            'error': message,
             'note': 'The controlled-variable check could not build the '
                     'baseline config.',
         }
