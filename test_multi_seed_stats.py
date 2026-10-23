@@ -541,6 +541,13 @@ def test_summarize_paired_rejects_nonfinite_inputs():
         M.summarize_paired([1.0, float('nan')])
     with pytest.raises(ValueError):
         M.summarize_paired([1.0, float('inf')])
+    # JSON integers are unbounded; an out-of-float-range one is malformed
+    # for this module and must raise the documented ValueError, not leak
+    # OverflowError from float().
+    with pytest.raises(ValueError):
+        M.summarize_paired([1.0, 10 ** 400])
+    with pytest.raises(ValueError):
+        M.sign_test([1.0, 10 ** 400])
 
 
 def test_sample_sd_keeps_real_spread_at_a_large_offset():

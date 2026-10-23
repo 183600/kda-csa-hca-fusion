@@ -253,7 +253,14 @@ def _as_clean_diffs(diffs) -> list[float]:
             raise ValueError(
                 f'diffs[{i}]={d!r} is not a real number; filter diverged '
                 f'seeds before calling multi_seed_stats')
-        d = float(d)
+        try:
+            d = float(d)
+        except OverflowError:
+            # A JSON integer can be larger than the float range. It is a
+            # malformed/non-representable difference, not a usable seed.
+            raise ValueError(
+                f'diffs[{i}]={d!r} is not representable as a finite float; '
+                f'filter diverged seeds before calling multi_seed_stats')
         if not math.isfinite(d):
             raise ValueError(
                 f'diffs[{i}]={d!r} is not finite; filter diverged seeds '
