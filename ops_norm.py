@@ -81,7 +81,13 @@ def _check_eps(eps: float) -> float:
     if isinstance(eps, bool) or not isinstance(eps, (int, float)):
         raise TypeError(
             f"rms_norm: eps must be a real number, got {eps!r}")
-    value = float(eps)
+    try:
+        value = float(eps)
+    except (OverflowError, ValueError):
+        # JSON integers are unbounded; one outside the float range is a
+        # malformed numeric configuration, not a TypeError.
+        raise ValueError(
+            f"rms_norm: eps must be finite and non-negative, got {eps!r}")
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(
             f"rms_norm: eps must be finite and non-negative, got {eps!r}")

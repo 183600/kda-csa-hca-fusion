@@ -181,6 +181,8 @@ def test_rmsnorm_validation(device='cpu'):
         ('numeric-string eps rejected', lambda: rms_norm(xf, eps='1e-6'),
          TypeError),
         ('bool eps rejected', lambda: rms_norm(xf, eps=True), TypeError),
+        ('oversized int eps rejected', lambda: rms_norm(xf, eps=10 ** 400),
+         ValueError),
         ('normalized_shape mismatch rejected',
          lambda: rms_norm(xf, normalized_shape=(4, 3)), ValueError),
         ('empty normalized_shape rejected',
