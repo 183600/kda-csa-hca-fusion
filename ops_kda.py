@@ -135,14 +135,20 @@ def per_channel_log_decay_bias(
               / half_lives / float(decay_scale))
     inverse = target + torch.log(-torch.expm1(-target))
     channel_bias = inverse.to(torch.float32)
-    if bool(torch.isfinite(channel_bias).all()):
+    # A subnormal ``target`` loses most of its significant bits (the
+    # ``log(-expm1(-target))`` term then sees a quantized value), so use
+    # the log-space path for those rows too even when the result is finite.
+    target_tiny = torch.finfo(torch.float64).tiny
+    if (bool(torch.isfinite(channel_bias).all())
+            and bool((target >= target_tiny).all())):
         return channel_bias.repeat(n_heads)
 
     # Fast path overflowed: ``max/min`` exceeded the float range (making
-    # ``half_lives`` infinite and the inverse-softplus -inf), or the target
-    # exceeded float32. Recompute the same quantity in log space. The
-    # returned tensor is float32, so a target outside its finite range is a
-    # malformed initializer, not a value we should silently saturate.
+    # ``half_lives`` infinite and the inverse-softplus -inf), the target
+    # became subnormal, or it exceeded float32. Recompute the same
+    # quantity in log space. The returned tensor is float32, so a target
+    # outside its finite range is a malformed initializer, not a value we
+    # should silently saturate.
     log_min = _math.log(float(min_half_life))
     log_max = _math.log(float(max_half_life))
     log_half_lives = log_min + fractions * (log_max - log_min)
@@ -164,10 +170,12 @@ def per_channel_log_decay_bias(
             f"narrower half-life range.")
     target = torch.exp(log_target)
     inverse = target + torch.log(-torch.expm1(-target))
-    # ``exp(log_target)`` underflows to exactly zero for extremely large
-    # half-lives; the true inverse is then ``log(target) = log_target``
-    # (the ``log(1 - exp(-target))`` correction vanishes).
-    inverse = torch.where(target == 0, log_target, inverse)
+    # ``exp(log_target)`` underflows to (or lands in the subnormal range
+    # near) zero for extremely large half-lives; the true inverse is then
+    # ``log(target) = log_target`` (the ``log(1 - exp(-target))``
+    # correction vanishes). Using the log value directly avoids the
+    # precision loss of a subnormal intermediate.
+    inverse = torch.where(target < target_tiny, log_target, inverse)
     channel_bias = inverse.to(torch.float32)
     if not bool(torch.isfinite(channel_bias).all()):
         raise ValueError(
