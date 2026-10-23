@@ -1812,6 +1812,7 @@ def main():
     steps = parse_int_env('MECH_STEPS', 200, min_value=1, logger=logger)
     train_batch = parse_int_env('MECH_TRAIN_BATCH', 16, min_value=1,
                                 logger=logger)
+    lr = 3e-3
     # Results-analysis controls: the held-out validation curve is always
     # recorded (read-only), and the bad-case pass is ON by default with the
     # Exp 4 budget (2 batches x 64 held-out samples per seed, dedicated RNG
@@ -1904,7 +1905,7 @@ def main():
                 try:
                     record = train_variant(
                         variant, seed=seed, steps=steps, device=device,
-                        n_kv=n_kv, train_batch=train_batch,
+                        n_kv=n_kv, train_batch=train_batch, lr=lr,
                         error_batches=error_batches,
                         error_batch=error_batch,
                         max_error_examples=error_examples)
@@ -2229,7 +2230,7 @@ def main():
     design_audit = ablation_design_audit(
         variants, rows=all_rows,
         requested=requested if requested else None,
-        recipe={'steps': steps, 'train_batch': train_batch, 'lr': 3e-3})
+        recipe={'steps': steps, 'train_batch': train_batch, 'lr': lr})
     if design_audit['status'] != 'leave_one_out_complete':
         logger.warning(
             '  WARNING: selected variant set is not a complete leave-one-out '
