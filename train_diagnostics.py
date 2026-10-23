@@ -455,7 +455,13 @@ def accuracy_regime(val_accs: Sequence[float],
     """
     if val_accs is None or len(val_accs) < 2:
         return None
-    vals = [float(v) for v in val_accs]
+    vals = []
+    for value in val_accs:
+        number = _finite_float_or_none(value)
+        if number is None:
+            # A malformed/oversized accuracy has no observable regime.
+            return None
+        vals.append(number)
     head_k = max(1, len(vals) // 5)
     val_head = sum(vals[:head_k]) / head_k
     val_tail = sum(vals[-head_k:]) / head_k
@@ -467,21 +473,26 @@ def accuracy_regime(val_accs: Sequence[float],
                                      key=lambda i: vals[i])),
     }
     if ceiling is not None:
-        out['ceiling'] = float(ceiling)
+        ceiling_value = _finite_float_or_none(ceiling)
+    else:
+        ceiling_value = None
+    if ceiling_value is not None:
+        out['ceiling'] = ceiling_value
         out['saturated'] = bool(
-            val_tail >= float(ceiling) * (1.0 - 1e-3))
+            val_tail >= ceiling_value * (1.0 - 1e-3))
     else:
         # No declared ceiling: say so honestly instead of guessing "not
         # saturated" from an arbitrary threshold.
         out['ceiling'] = None
         out['saturated'] = None
     if train_accs:
-        train = [float(v) for v in train_accs]
-        t_head_k = max(1, len(train) // 5)
-        out['train_acc_head_mean'] = sum(train[:t_head_k]) / t_head_k
-        out['train_acc_tail_mean'] = sum(train[-t_head_k:]) / t_head_k
-        out['train_acc_still_rising'] = bool(
-            out['train_acc_tail_mean'] > out['train_acc_head_mean'])
+        train = [_finite_float_or_none(v) for v in train_accs]
+        if all(v is not None for v in train):
+            t_head_k = max(1, len(train) // 5)
+            out['train_acc_head_mean'] = sum(train[:t_head_k]) / t_head_k
+            out['train_acc_tail_mean'] = sum(train[-t_head_k:]) / t_head_k
+            out['train_acc_still_rising'] = bool(
+                out['train_acc_tail_mean'] > out['train_acc_head_mean'])
     return out
 
 

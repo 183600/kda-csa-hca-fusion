@@ -274,6 +274,17 @@ def test_accuracy_regime_separates_saturation_from_overfitting():
     assert accuracy_regime([0.5]) is None
 
 
+def test_accuracy_regime_skips_oversized_or_missing_values():
+    """A JSON-sized accuracy/ceiling has no observable regime."""
+    huge = 10 ** 400
+    assert accuracy_regime([0.2, huge]) is None
+    assert accuracy_regime([0.2, None]) is None
+    assert accuracy_regime([0.2, 0.3], ceiling=huge)['saturated'] is None
+    regime = accuracy_regime([0.2, 0.3], [0.1, None], ceiling=0.5)
+    assert 'train_acc_head_mean' not in regime
+    json.dumps(regime, allow_nan=False)
+
+
 def test_train_lm_accuracy_regime_reports_optimizer_step_not_index():
     from train_lm_autodl import _accuracy_regime_for_history
 
