@@ -103,6 +103,13 @@ def online_softmax_merge(state_a: tuple, state_b: tuple) -> tuple:
         raise ValueError(
             f'online_softmax_merge: state shapes differ '
             f'({tuple(m_a.shape)} vs {tuple(m_b.shape)}).')
+    if den_a.shape != m_a.shape or den_b.shape != m_b.shape:
+        # ``den`` is contractually the same [B, H, T, 1] shape as ``m``; a
+        # broadcastable but different shape would silently mix rows.
+        raise ValueError(
+            f'online_softmax_merge: m/den shapes differ '
+            f'({tuple(m_a.shape)} vs {tuple(den_a.shape)}; '
+            f'{tuple(m_b.shape)} vs {tuple(den_b.shape)}).')
     m = torch.maximum(m_a, m_b)
     a_a = _shrink(m_a - m)
     a_b = _shrink(m_b - m)

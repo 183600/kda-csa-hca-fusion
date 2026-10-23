@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import torch  # noqa: E402
 
 from online_softmax import (  # noqa: E402
-    online_softmax_attention, online_softmax_state)
+    online_softmax_attention, online_softmax_merge, online_softmax_state)
 
 
 def _ok(name, cond, detail=''):
@@ -318,7 +318,24 @@ def test_oversized_scale_is_rejected_without_overflow():
             _ok('oversized scale is rejected', False, 'no ValueError')
 
 
+def test_merge_rejects_mismatched_denominator_shapes():
+    """``den`` must have the contract shape, not merely a broadcastable one."""
+    q = torch.randn(1, 1, 2, 4)
+    k = torch.randn(1, 1, 2, 4)
+    v = torch.randn(1, 1, 2, 4)
+    state = online_softmax_state(q, k, v)
+    bad = (state[0], torch.ones_like(state[1]).squeeze(-1), state[2])
+    try:
+        online_softmax_merge(state, bad)
+    except ValueError:
+        _ok('mismatched denominator shape rejected', True, '')
+    else:
+        _ok('mismatched denominator shape rejected', False,
+            'no ValueError')
+
+
 _TEST_FUNCS = [
+    test_merge_rejects_mismatched_denominator_shapes,
     test_oversized_scale_is_rejected_without_overflow,
     test_empty_key_block_is_rejected_with_a_clear_error,
     test_singleton_key_axis_mask_survives_key_chunking,
