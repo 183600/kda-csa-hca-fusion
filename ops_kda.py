@@ -299,6 +299,26 @@ def _validate_g_clamp_min(value, fn_name):
             f"finite float (or -inf to disable clamping).") from None
 
 
+def _validate_scale(value, fn_name):
+    """Validate the optional softmax temperature.
+
+    ``None`` selects the documented ``1/sqrt(K)`` default and finite stress
+    values are accepted. A JSON-sized int is not representable as a float,
+    so it must fail here rather than inside ``q * scale``.
+    """
+    if value is None or isinstance(value, torch.Tensor):
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"{fn_name}: scale={value!r} must be a real number or None.")
+    try:
+        float(value)
+    except OverflowError:
+        raise ValueError(
+            f"{fn_name}: scale={value!r} must be representable as a finite "
+            f"float.") from None
+
+
 def _compute_dtype(dtype):
     """Pick the compute dtype for KDA math."""
     return torch.float64 if dtype == torch.float64 else torch.float
@@ -506,6 +526,7 @@ def naive_recurrent_kda(
     """
     dtype = v.dtype
     _validate_g_clamp_min(g_clamp_min, 'naive_recurrent_kda')
+    _validate_scale(scale, 'naive_recurrent_kda')
     _validate_kda_inputs(q, k, v, g, beta, fn_name='naive_recurrent_kda')
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     _validate_kda_shapes(q, k, v, g, beta, fn_name='naive_recurrent_kda',
@@ -939,6 +960,7 @@ def _chunk_kda_prepare(
     """
     dtype = v.dtype
     _validate_g_clamp_min(g_clamp_min, fn_name)
+    _validate_scale(scale, fn_name)
     _validate_kda_inputs(q, k, v, g, beta, fn_name=fn_name)
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     _validate_kda_shapes(q, k, v, g, beta, fn_name=fn_name,

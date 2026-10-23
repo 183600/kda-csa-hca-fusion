@@ -144,7 +144,7 @@ def _require_scale(fn_name: str, scale) -> None:
     cannot be converted to float, so it must fail here instead of raising
     ``OverflowError`` from ``scores * scale``.
     """
-    if scale is None:
+    if scale is None or isinstance(scale, torch.Tensor):
         return
     if isinstance(scale, bool) or not isinstance(scale, (int, float)):
         raise ValueError(

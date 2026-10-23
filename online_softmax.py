@@ -66,7 +66,7 @@ def _validate_scale(scale, fn_name: str) -> None:
     inability to represent the number as a float is rejected: a JSON-sized
     int would otherwise raise ``OverflowError`` from ``scores * scale``.
     """
-    if scale is None:
+    if scale is None or isinstance(scale, torch.Tensor):
         return
     if isinstance(scale, bool) or not isinstance(scale, (int, float)):
         raise ValueError(

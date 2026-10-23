@@ -350,6 +350,36 @@ def test_kda_g_clamp_rejects_positive_infinity_and_nan():
             fn(q, k, v, g, beta, g_clamp_min=negative_inf, **kwargs)
 
 
+def test_kda_rejects_oversized_scale_without_overflow():
+    """A JSON-sized int temperature must be a ValueError, not OverflowError."""
+    from ops_kda import naive_chunk_kda, naive_recurrent_kda
+    from ops_kda_autograd import custom_recurrent_kda
+    from ops_kda_backend import kda_forward
+
+    B, T, H, K, HV, V = 1, 3, 1, 2, 1, 2
+    q = torch.randn(B, T, H, K)
+    k = torch.randn(B, T, H, K)
+    v = torch.randn(B, T, HV, V)
+    g = -torch.rand(B, T, HV, K)
+    beta = torch.rand(B, T, HV)
+    huge = 10 ** 400
+    for fn, kwargs in (
+            (naive_recurrent_kda, {}),
+            (naive_chunk_kda, {'chunk_size': 2}),
+            (custom_recurrent_kda, {}),
+            (kda_forward, {'use_chunk': False})):
+        try:
+            fn(q, k, v, g, beta, scale=huge, **kwargs)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            raise AssertionError(
+                f'{fn.__name__} leaked {type(exc).__name__}: {exc}')
+        else:
+            raise AssertionError(
+                f'{fn.__name__} accepted an oversized scale')
+
+
 def test_rope_rejects_invalid_dims_bases_and_positions():
     """RoPE parameter errors fail before they can produce NaN tables.
 
