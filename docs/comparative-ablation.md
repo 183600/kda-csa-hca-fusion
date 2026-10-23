@@ -140,6 +140,21 @@ interaction row also carries its own `min_detectable_effect` and
 `seeds_required_80pct_power`, because a 2×2 interaction is usually much
 less powered than either main effect.
 
+That post-hoc read-out is not a prospective budget. `experiment_design`
+therefore plans the interaction with its own four-cell SD
+(`sqrt(2) * assumed_sd` under the shared-seed / independent-cell-noise
+model) and reports `planning_report(plan)['interaction']`. At the planning
+SD the registered 14-seed budgets give only 33% (Exp 5b, family 24) and 50%
+(Exp 8, family 6) power for an interaction SESOI of 0.10; the required
+budgets are 31 and 25 seeds. The registry records
+`interaction.required_for_claim: False` for both plans, so
+`audit_run.interaction_claim_allowed` is false at the registered budget and
+the transfer/complementarity verdict is descriptive even when the main
+effects are confirmatory. A run may only cite `I` as a confirmatory claim
+after reaching the interaction requirement (or after a dedicated four-cell
+pilot replaces the `sqrt(2)` assumption with a measured DiD SD). See
+[experiment-design.md](experiment-design.md#interactions-are-a-separate-four-cell-budget).
+
 The existing evidence-quality rules still apply and are not replaced by the
 new rows:
 

@@ -7674,6 +7674,33 @@ def test_interaction_planning_is_four_cell_budgeted(device='cpu'):
         and not any('interaction' in w for w in powered['design_warnings']),
         f'n={enough}'))
 
+    # Calibrate the sqrt(2) planning assumption on a synthetic 2x2 with a
+    # shared seed effect and independent cell noise: the DiD SD must be
+    # ~sqrt(2) x the two-cell paired-difference SD, and the shipped
+    # interaction_contrast must return that same DiD sample SD.
+    import random
+    import statistics
+    from multi_seed_stats import interaction_contrast
+    rng = random.Random(7)
+    cells = {key: {} for key in 'abcd'}
+    n_sim = 4000
+    for seed in range(n_sim):
+        shared = rng.gauss(0.0, 1.0)
+        for key in 'abcd':
+            cells[key][seed] = shared + rng.gauss(0.0, 1.0)
+    main_diffs = [cells['b'][s] - cells['a'][s] for s in range(n_sim)]
+    did_diffs = [cells['d'][s] - cells['b'][s] - cells['c'][s] + cells['a'][s]
+                 for s in range(n_sim)]
+    ratio = statistics.stdev(did_diffs) / statistics.stdev(main_diffs)
+    rec = interaction_contrast(cells['a'], cells['b'], cells['c'], cells['d'])
+    results.append(_ok(
+        'simulated 2x2 calibrates SD(I)/SD(B-A) ~= sqrt(2)',
+        abs(ratio - 2.0 ** 0.5) < 0.06
+        and abs(rec['sd_diff'] - statistics.stdev(did_diffs)) < 1e-9
+        and abs(rec['mean_diff']
+                - statistics.mean(did_diffs)) < 1e-9,
+        f'ratio={ratio:.4f} target={2.0 ** 0.5:.4f}'))
+
     stale = design.get_plan('exp8_mechanism')
     stale['interaction']['required_for_claim'] = True
     stale_errors = design.validate_plan(stale)

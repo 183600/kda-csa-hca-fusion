@@ -41,8 +41,9 @@ same problem appears in subtler forms:
 | `primary_contrast` | the pre-registered estimand |
 | `endpoint` / `direction` | the outcome and its interpretation |
 | `sesoi` | smallest effect of interest, in endpoint units |
-| `assumed_sd` | working per-seed difference SD used for planning |
+| `assumed_sd` | working per-seed difference SD used for planning (a two-cell paired difference) |
 | `equivalence` | optional TOST block: margin, family, alpha, target power, and whether an equivalence claim is required |
+| `interaction` | optional 2×2 block: SESOI, family, alternative, `sd_inflation` (`sqrt(2)` by default), and whether an interaction claim is required |
 | `alpha` / `planned_family_size` / `alternative` | the analysis family and correction |
 | `target_power` | planning target (80% by default) |
 | `screening_seeds` | the cheap default budget, explicitly non-confirmatory |
@@ -160,6 +161,79 @@ an omission:
 
 `exp8_mechanism` intentionally has no equivalence block: that runner reports
 non-significance as inconclusive and makes no TOST claim.
+
+## Interactions are a separate four-cell budget
+
+A pre-registered 2×2 interaction is a different estimand from a main effect,
+and it needs a different seed budget. The registry's `assumed_sd` is the SD of
+a **two-cell** paired difference (`sd_diff`, the quantity the pilot extracts).
+An interaction `I = d - b - c + a` is a **four-cell** difference-in-
+differences. Under the shared-seed / independent-cell-noise model that
+motivates the paired design (cell value = treatment mean + shared seed effect +
+independent cell noise of variance `σ²`),
+
+```
+Var(B - A) = 2 σ²          (the shared seed effect cancels)
+Var(I)     = 4 σ²          (the shared seed effect also cancels)
+SD(I)      = sqrt(2) · SD(B - A)
+```
+
+so the interaction's planning SD is `sqrt(2) * assumed_sd`. Reusing the
+main-effect SD for a four-cell contrast overstates its power and understates
+the seed requirement. The planning formula is the same normal approximation
+with the inflated SD:
+
+```
+n_int = ceil(((z_crit + z_power) * sqrt(2) * sd / SESOI_int)^2)
+```
+
+and `z_crit` uses the alpha corrected for the family the interaction is
+actually tested in — the **shared** run-wide family, not the number of
+interaction rows. `experiment_design.interaction_planning` is the helper;
+`planning_report(plan)['interaction']` carries `sd_inflation`,
+`sd_interaction`, `required_seeds`, `planned_power`, `planned_mde`,
+`shortfall_seeds`, the exact-test resolution, and
+`supports_interaction_at_planned_n`.
+
+At `sd = 0.10` (paired-difference SD), `SESOI_int = 0.10`, 80% target power:
+
+| plan | interaction estimand | shared family | registered n | interaction n | power at registered n | MDE at registered n |
+|---|---|---:|---:|---:|---:|---:|
+| `exp5b_matrix` | `I_route(D) = (D-A)_r1 - (D-A)_r2` | 24 | 14 | 31 | 0.33 | 0.148 |
+| `exp8_mechanism` | `no_rope_dense - no_rope - dense + baseline` | 6 | 14 | 25 | 0.50 | 0.132 |
+
+The transfer/complementarity question is therefore **descriptive** at the
+registered 14-seed budgets, even though those budgets are confirmatory for the
+main effects. This is deliberate and auditable:
+
+* `planning_report` reports the interaction budget next to (not inside) the
+  main-effect record, so "confirmatory for a two-cell contrast" cannot be read
+  as "confirmatory for the difference-in-differences";
+* `audit_run` returns `interaction_claim_allowed` and adds
+  `interaction_claim_at_sesoi` to `claims_allowed` **only** when the run
+  reaches the interaction requirement; otherwise it adds a `design_warnings`
+  entry and leaves the main-effect status unchanged (the main experiment is
+  still confirmatory; only the interaction claim is withheld);
+* both plans record `required_for_claim: False`. A plan that sets it to `True`
+  while its `planned_seeds` falls short fails `validate_plan`, exactly like an
+  unpromotable TOST endpoint;
+* `sd_inflation` may be replaced by a value calibrated from a dedicated
+  four-cell pilot, but `validate_plan` rejects a value below 1.0: a four-cell
+  contrast cannot be less variable than the two-cell contrast it is built from
+  without a negative cross-cell correlation, which the design does not assume.
+
+`pilot_report` surfaces `required_seeds_interaction` next to the superiority
+and TOST recommendations. A pilot that is meant to size an interaction claim
+should still measure the difference-in-differences SD directly (the same four
+variants on the same seeds) rather than relying on the `sqrt(2)` model
+assumption; the pilot path uses the model because the generic pilot extractor
+only sees two-cell `sd_diff` rows.
+
+The assumption is a model, not a measurement. Positive cross-cell correlation
+of the treatment noise makes the `sqrt(2)` factor conservative; unequal cell
+variances or a negative correlation invalidate it. The exact-test feasibility
+check is also recomputed for the interaction family, because a small family
+can be testable for the main effects but not for a larger interaction family.
 
 ## Statuses and claims
 
@@ -362,6 +436,13 @@ pre-registers the `RoPE × selection-density` interaction
 difference-in-differences; the separate main-effect contrasts cannot
 substitute for them. A non-significant interaction is inconclusive, never
 evidence of additivity or route-independent transfer.
+
+Planning treats the interaction as its own endpoint (see “Interactions are a
+separate four-cell budget” above). The `int_n` column of the CLI table is the
+interaction seed requirement; `audit_run.interaction_claim_allowed` is true
+only when the run reaches it; and the registered 14-seed budgets are
+explicitly `required_for_claim: False` for the interaction, so they are
+descriptive for the transfer/complementarity question.
 
 The fixed-structure matrix is not parameter-matched. Every two-cell contrast
 carries `capacity_matched` / `claim_scope`, and
