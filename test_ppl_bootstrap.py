@@ -84,6 +84,16 @@ def test_unit_normalization_validation():
             P.unit_nll_stats([(1.0, bad_tokens)])
     with pytest.raises(ValueError):
         P.unit_nll_stats([(True, 1)])  # bool nll_sum
+    # JSON integers are unbounded. Values too large for ``float()`` are
+    # malformed measurements, not a reason to leak OverflowError from the
+    # token-weighted mean.
+    huge = 10 ** 400
+    with pytest.raises(ValueError):
+        P.unit_nll_stats([(huge, 1)])
+    with pytest.raises(ValueError):
+        P.unit_nll_stats([(1.0, huge)])
+    with pytest.raises(ValueError):
+        P.bootstrap_ppl_ci([(huge, 1)], n_boot=2)
 
 
 def test_bootstrap_seed_must_be_an_exact_int():

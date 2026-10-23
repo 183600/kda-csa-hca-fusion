@@ -138,7 +138,14 @@ def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
         if isinstance(nll_sum, bool) or not isinstance(nll_sum, (int, float)):
             raise ValueError(
                 f'unit {i}: nll_sum must be a real number, got {nll_sum!r}')
-        nll_sum = float(nll_sum)
+        try:
+            nll_sum = float(nll_sum)
+        except OverflowError:
+            # A JSON int beyond the float range is not a finite sum.
+            raise ValueError(
+                f'unit {i}: nll_sum={nll_sum!r} is not representable as a '
+                f'finite float; refusing to bootstrap a corrupted metric'
+            ) from None
         if not math.isfinite(nll_sum):
             raise ValueError(
                 f'unit {i}: nll_sum is not finite ({nll_sum!r}); refusing '
@@ -149,6 +156,14 @@ def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
         if n_tokens < 0:
             raise ValueError(f'unit {i}: n_tokens must be >= 0, '
                              f'got {n_tokens}')
+        try:
+            float(n_tokens)
+        except OverflowError:
+            # The pooled corpus mean divides by the token count, which
+            # cannot be represented for an unbounded JSON integer.
+            raise ValueError(
+                f'unit {i}: n_tokens={n_tokens!r} must be representable as '
+                f'a finite float') from None
         out.append((nll_sum, n_tokens))
     return out
 
