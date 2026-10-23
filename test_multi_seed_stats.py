@@ -151,6 +151,22 @@ def test_sign_test_zeros_are_dropped_steel_convention():
     assert math.isclose(mixed['p_value'], 1.0, rel_tol=1e-15)  # 2/2 = 1
 
 
+def test_sign_test_large_n_uses_log_space():
+    """More than 1023 informative pairs must not overflow float(2**n).
+
+    A unanimous 1024-pair sweep has exact two-sided p = 2 / 2**1024 =
+    2**-1023, which is still representable; the old float conversion of
+    ``2**1024`` raised OverflowError before the ratio could be formed.
+    """
+    s = M.sign_test([1.0] * 1024)
+    assert s['n_effective'] == 1024
+    assert s['p_value'] == pytest.approx(2.0 ** -1023, rel=1e-15)
+    assert math.isfinite(s['p_value'])
+    # Balanced 1024-pair test is capped at 1, not NaN.
+    balanced = M.sign_test([1.0] * 512 + [-1.0] * 512)
+    assert balanced['p_value'] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Exact / Monte-Carlo sign-flip permutation test
 # ---------------------------------------------------------------------------

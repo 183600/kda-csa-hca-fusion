@@ -755,7 +755,16 @@ def sign_test(diffs, *, alpha: float = 0.05) -> dict:
     else:
         k = max(n_pos, n_neg)
         tail = sum(math.comb(n_eff, i) for i in range(k, n_eff + 1))
-        p = min(1.0, 2.0 * tail / float(2 ** n_eff))
+        if n_eff <= 1023:
+            p = min(1.0, 2.0 * tail / float(2 ** n_eff))
+        else:
+            # ``float(2**n_eff)`` overflows for more than 1023 informative
+            # pairs. The tail sum is an exact integer, so evaluate the same
+            # ratio in log space; the exact-test resolution helper uses the
+            # identical large-n branch.
+            log_p = (math.log(2.0) + math.log(tail)
+                     - n_eff * math.log(2.0))
+            p = 1.0 if log_p >= 0.0 else math.exp(log_p)
         win_rate = n_pos / float(n_eff)
     ci = binomial_proportion_ci(n_pos, n_eff, alpha=alpha)
     return {'n_pairs': len(d), 'n_positive': n_pos, 'n_negative': n_neg,
