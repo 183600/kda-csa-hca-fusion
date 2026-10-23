@@ -210,6 +210,12 @@ def student_t_cdf(t_value: float, dof: int) -> float:
     """CDF of Student's t with ``dof > 0`` degrees of freedom."""
     if dof <= 0:
         raise ValueError(f'student_t_cdf requires dof > 0, got {dof!r}')
+    try:
+        t_value = float(t_value)
+    except OverflowError:
+        # A JSON-sized integer is beyond the float range; the limiting
+        # CDF is the same as +/-infinity.
+        t_value = math.inf if t_value > 0 else -math.inf
     if not math.isfinite(t_value):
         return 1.0 if t_value > 0 else 0.0
     if t_value == 0.0:
@@ -232,6 +238,10 @@ def student_t_sf(t_value: float, dof: int) -> float:
     """
     if dof <= 0:
         raise ValueError(f'student_t_sf requires dof > 0, got {dof!r}')
+    try:
+        t_value = float(t_value)
+    except OverflowError:
+        t_value = math.inf if t_value > 0 else -math.inf
     if not math.isfinite(t_value):
         return 0.0 if t_value > 0 else 1.0
     if t_value == 0.0:
@@ -1608,7 +1618,7 @@ def leave_one_out_sensitivity(
                 f'{equivalence_margin!r}')
         try:
             margin = float(equivalence_margin)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 f'equivalence_margin must be a positive number, got '
                 f'{equivalence_margin!r}') from None

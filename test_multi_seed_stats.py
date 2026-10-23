@@ -99,6 +99,19 @@ def test_student_t_survival_tail_stays_positive():
             'p_value'] > 0.0
 
 
+def test_student_t_and_leave_one_out_accept_oversized_json_ints():
+    """Oversized JSON integers saturate at the infinite-tail limit and
+    are rejected as a malformed equivalence margin, never OverflowError."""
+    huge = 10 ** 400
+    assert M.student_t_cdf(huge, 5) == 1.0
+    assert M.student_t_cdf(-huge, 5) == 0.0
+    assert M.student_t_sf(huge, 5) == 0.0
+    assert M.student_t_sf(-huge, 5) == 1.0
+    with pytest.raises(ValueError):
+        M.leave_one_out_sensitivity([0.1, 0.2, 0.3],
+                                    equivalence_margin=huge)
+
+
 def test_paired_t_directional_pvalue_is_half_the_two_sided():
     t2 = M.paired_t_test([1, 2, 3, 4, 5])
     tg = M.paired_t_test([1, 2, 3, 4, 5], alternative='greater')
