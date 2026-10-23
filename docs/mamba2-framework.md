@@ -205,7 +205,11 @@ cheap and well-conditioned:
   Hillis-Steele associative prefix scan over chunks
   (`ceil(log2 NT)` batched levels). This is the
   Mamba-2 analogue of `ops_kda._assoc_scan_chunk_states`; because the SSD
-  decay is scalar-per-head, the scan combine is elementwise.
+  decay is scalar-per-head, the scan combine is elementwise. The KDA
+  transition is instead diagonal-plus-low-rank, so its chunk map has a
+  rank-`min(C, K)` factor pair and the scan can be blocked into
+  producer/scanner/consumer phases; see
+  [dplr-transitions.md](dplr-transitions.md).
 
 **Log-space gating.** All exponents are anchored at the *state before the
 chunk starts*: with `G_t = sum_{r<=t} dt_r A` (non-increasing because
