@@ -404,7 +404,7 @@ def kda_executed_flops(cfg, T: int, batch: int = 1) -> float:
     if kda_path(cfg, T) == 'recurrent':
         terms['chunk_inter'] = 0.0
         terms['chunk_a'] = 0.0
-    return float(sum(terms.values()))
+    return _finite_float('executed FLOPs', sum(terms.values()))
 
 
 def kda_broadcast_encoded_macs(cfg, T: int, batch: int = 1) -> int:
@@ -520,8 +520,14 @@ def mamba2_executed_flops(cfg, T: int, batch: int = 1) -> float:
     the broadcast encoding rather than a missing model term.
     """
     _validate('mamba2', T, batch)
-    return (2.0 * mamba2_reference_gemm_macs(cfg, T, batch)
-            + 2.0 * mamba2_broadcast_encoded_macs(cfg, T, batch))
+    try:
+        executed = (2.0 * mamba2_reference_gemm_macs(cfg, T, batch)
+                    + 2.0 * mamba2_broadcast_encoded_macs(cfg, T, batch))
+    except OverflowError:
+        raise ValueError(
+            f'flops_audit: T={T!r} makes the executed FLOP count '
+            f'unrepresentable as a finite float.') from None
+    return _finite_float('executed FLOPs', executed)
 
 
 def mamba2_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
