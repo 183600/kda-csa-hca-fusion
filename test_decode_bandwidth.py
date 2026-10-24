@@ -268,6 +268,8 @@ def test_validation_errors():
     with pytest.raises(ValueError):
         db.decode_step_ledger(cfg, T, batch=10 ** 400)
     with pytest.raises(ValueError):
+        db.decode_step_ledger(cfg, T, batch=10 ** 308)
+    with pytest.raises(ValueError):
         db.route_switch_table(cfg, T, batches=(10 ** 400,))
     with pytest.raises(ValueError):
         db.decode_step_ledger(cfg, T, itemsize=0)
@@ -284,6 +286,8 @@ def test_validation_errors():
         db.bandwidth_bound_ms(1e6, 0.0)
     with pytest.raises(ValueError):
         db.bandwidth_bound_ms(-1.0, 100.0)
+    with pytest.raises(ValueError):
+        db.bandwidth_bound_ms(1e308, 1e-308)
     for bad in (True, float('nan'), float('inf'), 10 ** 400):
         with pytest.raises(ValueError):
             db.bandwidth_bound_ms(bad, 100.0)
@@ -364,6 +368,8 @@ def test_fp8_state_storage_pricing():
         db.decode_traffic_breakdown(cfg, T, storage={'memory': 'fp8'})
     with pytest.raises(TypeError):
         db.decode_traffic_breakdown(cfg, T, storage={'memory': 10 ** 400})
+    with pytest.raises(ValueError):
+        db.decode_traffic_breakdown(cfg, T, storage={'memory': 1e308})
 
 
 # ---------------------------------------------------------------------------

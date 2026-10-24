@@ -120,6 +120,13 @@ def _validate_batch(batch: int) -> None:
 _STORAGE_OPS = ('memory', 'csa', 'hca')
 
 
+def _finite_float(fn_name: str, label: str, value: float) -> float:
+    if not math.isfinite(value):
+        raise ValueError(
+            f'{fn_name}: {label} is unrepresentable as a finite float')
+    return value
+
+
 def _resolve_storage(storage, itemsize: int) -> dict[str, float]:
     """Resolve a per-operator storage policy into bytes/element.
 
@@ -315,11 +322,20 @@ def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
                   'hca': float(hca_read)}
     write_by_op = {'memory': write_total, 'csa': 0.0, 'hca': 0.0}
     total_elements = total_read + write_total
-    read_bytes_by_op = {op: read_by_op[op] * bpe[op] for op in _STORAGE_OPS}
-    write_bytes_by_op = {op: write_by_op[op] * bpe[op]
-                         for op in _STORAGE_OPS}
-    read_bytes = sum(read_bytes_by_op.values())
-    write_bytes = sum(write_bytes_by_op.values())
+    read_bytes_by_op = {
+        op: _finite_float('decode_traffic_breakdown', f'{op} read bytes',
+                          read_by_op[op] * bpe[op])
+        for op in _STORAGE_OPS}
+    write_bytes_by_op = {
+        op: _finite_float('decode_traffic_breakdown', f'{op} write bytes',
+                          write_by_op[op] * bpe[op])
+        for op in _STORAGE_OPS}
+    read_bytes = _finite_float(
+        'decode_traffic_breakdown', 'total read bytes',
+        sum(read_bytes_by_op.values()))
+    write_bytes = _finite_float(
+        'decode_traffic_breakdown', 'total write bytes',
+        sum(write_bytes_by_op.values()))
     return {
         'T': int(T),
         'itemsize': itemsize,
@@ -335,7 +351,9 @@ def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
         'write_bytes_by_op': write_bytes_by_op,
         'read_bytes_per_token': read_bytes,
         'write_bytes_per_token': write_bytes,
-        'total_bytes_per_token': read_bytes + write_bytes,
+        'total_bytes_per_token': _finite_float(
+            'decode_traffic_breakdown', 'total bytes',
+            read_bytes + write_bytes),
     }
 
 
@@ -375,13 +393,40 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
     else:
         weight_elements = 0
         weight_bytes = 0
-    state_read_bytes = batch * traffic['read_bytes_per_token']
-    state_write_bytes = batch * traffic['write_bytes_per_token']
-    state_bytes = state_read_bytes + state_write_bytes
+    state_read_bytes = _finite_float(
+        'decode_step_ledger', 'state read bytes per step',
+        batch * traffic['read_bytes_per_token'])
+    state_write_bytes = _finite_float(
+        'decode_step_ledger', 'state write bytes per step',
+        batch * traffic['write_bytes_per_token'])
+    state_bytes = _finite_float(
+        'decode_step_ledger', 'state bytes per step',
+        state_read_bytes + state_write_bytes)
     state_bytes_per_token = traffic['total_bytes_per_token']
-    total_bytes = weight_bytes + state_bytes
+    total_bytes = _finite_float(
+        'decode_step_ledger', 'total bytes per step',
+        weight_bytes + state_bytes)
     switch_batch = (weight_bytes / state_bytes_per_token
                     if state_bytes_per_token > 0 else None)
+    if switch_batch is not None:
+        switch_batch = _finite_float(
+            'decode_step_ledger', 'weights/state switch batch', switch_batch)
+    state_per_sequence = _finite_float(
+        'decode_step_ledger', 'state bytes per sequence per token',
+        state_bytes / batch)
+    bytes_per_sequence = _finite_float(
+        'decode_step_ledger', 'bytes per sequence per token',
+        total_bytes / batch)
+    read_bytes_by_op_per_step = {
+        op: _finite_float(
+            'decode_step_ledger', f'{op} read bytes per step',
+            batch * traffic['read_bytes_by_op'][op])
+        for op in ('memory', 'csa', 'hca')}
+    write_bytes_by_op_per_step = {
+        op: _finite_float(
+            'decode_step_ledger', f'{op} write bytes per step',
+            batch * traffic['write_bytes_by_op'][op])
+        for op in ('memory', 'csa', 'hca')}
     return {
         'T': int(T),
         'batch': batch,
@@ -396,17 +441,13 @@ def decode_step_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
         'state_write_bytes_per_step': state_write_bytes,
         'state_bytes_per_step': state_bytes,
         'total_bytes_per_step': total_bytes,
-        'state_bytes_per_sequence_per_token': state_bytes / batch,
-        'bytes_per_sequence_per_token': total_bytes / batch,
+        'state_bytes_per_sequence_per_token': state_per_sequence,
+        'bytes_per_sequence_per_token': bytes_per_sequence,
         'weights_share': (weight_bytes / total_bytes) if total_bytes else 0.0,
         'state_share': (state_bytes / total_bytes) if total_bytes else 0.0,
         'weights_state_switch_batch': switch_batch,
-        'read_bytes_by_op_per_step': {
-            op: batch * traffic['read_bytes_by_op'][op]
-            for op in ('memory', 'csa', 'hca')},
-        'write_bytes_by_op_per_step': {
-            op: batch * traffic['write_bytes_by_op'][op]
-            for op in ('memory', 'csa', 'hca')},
+        'read_bytes_by_op_per_step': read_bytes_by_op_per_step,
+        'write_bytes_by_op_per_step': write_bytes_by_op_per_step,
     }
 
 
@@ -573,4 +614,6 @@ def bandwidth_bound_ms(nbytes: float, bw_gbps: float) -> float:
         raise ValueError(
             f'bandwidth_bound_ms: bw_gbps={bw_gbps!r} must be finite and '
             f'positive.')
-    return nbytes_value / (bw_value * 1e9) * 1e3
+    return _finite_float(
+        'bandwidth_bound_ms', 'bandwidth-bound time',
+        nbytes_value / (bw_value * 1e9) * 1e3)
