@@ -196,7 +196,14 @@ def test_op_and_layout_dispatch():
             ('CSA', lambda: kv_budget.csa_read_elements(
                 long_t, m=4, topk=2, c=32, c_i=16)),
             ('HCA', lambda: kv_budget.hca_read_elements(
-                long_t, m2=8, c=32))):
+                long_t, m2=8, c=32)),
+            ('layout ratio', lambda: kv_budget.layout_read_elements(
+                16, (10 ** 308, 0, 0), spec)),
+            ('windowed KDA', lambda: kv_budget.windowed_read_elements(
+                'kda', 0, 10 ** 308, spec)),
+            ('windowed layout', lambda:
+                kv_budget.windowed_layout_read_elements(
+                    (3, 0, 0), 0, 10 ** 308, spec))):
         raised = False
         try:
             call()

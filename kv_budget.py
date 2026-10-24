@@ -482,7 +482,9 @@ def windowed_read_elements(op: str, t0: int, t1: int, spec: dict) -> dict:
     for key, v1 in row1.items():
         if key in ('op', 'T', 'state_elements'):
             continue
-        out[key] = (t1 * float(v1) - t0 * float(row0[key])) / (t1 - t0)
+        out[key] = _finite_total(
+            'windowed_read_elements', f'windowed {key}',
+            (t1 * float(v1) - t0 * float(row0[key])) / (t1 - t0))
     return out
 
 
@@ -517,7 +519,8 @@ def _validate_memory_op(memory_op, fn_name: str) -> str:
 
 
 def _layout_row(time_key: str, time_value, n_kda: int, n_csa: int,
-                n_hca: int, per_layer: dict, memory_op: str = 'kda') -> dict:
+                n_hca: int, per_layer: dict, memory_op: str = 'kda',
+                fn_name: str = 'layout_read_elements') -> dict:
     """Shared row shape for the averaged / marginal / windowed layout views.
 
     ``n_kda`` is the number of memory slots (the ratio's first component);
@@ -526,9 +529,12 @@ def _layout_row(time_key: str, time_value, n_kda: int, n_csa: int,
     for the default KDA route, while ``memory_read_elements`` is route
     neutral and ``mamba2_read_elements`` is populated only on that route.
     """
-    memory = n_kda * per_layer[memory_op]
-    csa = n_csa * per_layer['csa']
-    hca = n_hca * per_layer['hca']
+    memory = _finite_scaled(fn_name, 'memory read total',
+                            n_kda, per_layer[memory_op])
+    csa = _finite_scaled(fn_name, 'CSA read total',
+                         n_csa, per_layer['csa'])
+    hca = _finite_scaled(fn_name, 'HCA read total',
+                         n_hca, per_layer['hca'])
     return {
         time_key: time_value,
         'n_memory': n_kda,
@@ -542,7 +548,8 @@ def _layout_row(time_key: str, time_value, n_kda: int, n_csa: int,
         'mamba2_read_elements': memory if memory_op == 'mamba2' else 0.0,
         'csa_read_elements': csa,
         'hca_read_elements': hca,
-        'total_read_elements': memory + csa + hca,
+        'total_read_elements': _finite_total(
+            fn_name, 'total read elements', memory + csa + hca),
     }
 
 
@@ -563,7 +570,7 @@ def layout_read_elements(T: int, ratio, spec: dict, *,
         op: op_read_elements(op, T, spec)['total_read_elements']
         for op in ('csa', 'hca', memory_op)}
     return _layout_row('T', int(T), n_kda, n_csa, n_hca, per_layer,
-                       memory_op)
+                       memory_op, fn_name='layout_read_elements')
 
 
 def instant_layout_read_elements(ratio, t: int, spec: dict, *,
@@ -580,7 +587,7 @@ def instant_layout_read_elements(ratio, t: int, spec: dict, *,
         op: instant_read_elements(op, t, spec)['total_read_elements']
         for op in ('csa', 'hca', memory_op)}
     return _layout_row('t', int(t), n_kda, n_csa, n_hca, per_layer,
-                       memory_op)
+                       memory_op, fn_name='instant_layout_read_elements')
 
 
 def windowed_layout_read_elements(ratio, t0: int, t1: int,
@@ -609,7 +616,9 @@ def windowed_layout_read_elements(ratio, t0: int, t1: int,
     for key in ('memory_read_elements', 'kda_read_elements',
                 'mamba2_read_elements', 'csa_read_elements',
                 'hca_read_elements', 'total_read_elements'):
-        out[key] = (t1 * row1[key] - t0 * row0[key]) / (t1 - t0)
+        out[key] = _finite_total(
+            'windowed_layout_read_elements', f'windowed {key}',
+            (t1 * row1[key] - t0 * row0[key]) / (t1 - t0))
     return out
 
 
