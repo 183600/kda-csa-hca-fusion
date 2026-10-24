@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import statistics
 import sys
@@ -189,6 +190,20 @@ def hybrid_geometry_kwargs(cfg) -> dict:
     )
 
 
+def _finite_flops(name: str, value) -> float:
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'training_flops_model: {name}={value!r} must be representable '
+            f'as a finite float.') from None
+    if not math.isfinite(number):
+        raise ValueError(
+            f'training_flops_model: {name}={value!r} must be representable '
+            f'as a finite float.')
+    return number
+
+
 def training_flops_model(cfg, policy: str, *, T: int) -> dict:
     """Analytic training FLOPs for one checkpointing policy.
 
@@ -202,15 +217,19 @@ def training_flops_model(cfg, policy: str, *, T: int) -> dict:
     geo = hybrid_geometry_kwargs(cfg)
     fwd_by_kind: dict[str, float] = {}
     for kind in layout:
-        fwd_by_kind[kind] = float(prefill_flops(kind, T, **geo))
+        fwd_by_kind[kind] = _finite_flops(
+            f'prefill FLOPs ({kind})', prefill_flops(kind, T, **geo))
     # Sum over the LAYOUT (one term per layer), not over the deduplicated
     # kind dictionary: repeated memory layers (e.g. the default 3xKDA)
     # each contribute their own forward FLOPs.
-    forward_total = float(sum(fwd_by_kind[kind] for kind in layout))
+    forward_total = _finite_flops(
+        'forward FLOPs', sum(fwd_by_kind[kind] for kind in layout))
     checked = [k for k in layout if gc.should_checkpoint(k, policy)]
-    recompute = float(sum(fwd_by_kind[k] for k in checked))
-    backward = 2.0 * forward_total
-    total = forward_total + backward + recompute
+    recompute = _finite_flops(
+        'recompute FLOPs', sum(fwd_by_kind[k] for k in checked))
+    backward = _finite_flops('backward FLOPs', 2.0 * forward_total)
+    total = _finite_flops(
+        'training FLOPs', forward_total + backward + recompute)
     return {
         'policy': policy,
         'n_layers': len(layout),

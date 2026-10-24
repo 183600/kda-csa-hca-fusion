@@ -413,6 +413,9 @@ def test_runner_rejects_bad_geometry():
             itemsize=4, device='cpu', peaks={}, peak_source='none',
             quality_seeds=(0,), quality_steps=1, quality_lr=3e-3,
             skip_quality=True, timing_reps=1)
+    from run_train_roofline import training_flops_model
+    with pytest.raises(ValueError):
+        training_flops_model(tiny_cfg(), 'none', T=10 ** 308)
 
 
 if __name__ == '__main__':
