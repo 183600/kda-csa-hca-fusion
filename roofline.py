@@ -295,6 +295,28 @@ def _validate_core_int(name: str, value, fn_name: str, *,
     return value
 
 
+def _finite_result(fn_name: str, name: str, value) -> float:
+    """Return ``value`` as a finite float or reject it as malformed geometry.
+
+    The individual geometry arguments are validated by the callers, but a
+    product of representable integers can still exceed the float range
+    (e.g. ``T=10**300`` makes ``T*(T+1)/2`` unrepresentable). JSON integers
+    are unbounded, so such a request is a malformed configuration rather
+    than an ``OverflowError`` from the arithmetic or an ``inf`` result.
+    """
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: {name}={value!r} must be representable as a finite '
+            f'float.') from None
+    if not math.isfinite(number):
+        raise ValueError(
+            f'{fn_name}: {name}={value!r} must be representable as a finite '
+            f'float.')
+    return number
+
+
 def softmax_core_flops(T: int, heads: int, head_dim: int,
                        value_dim: int | None = None) -> float:
     """Causal softmax attention FLOPs for the *core only* (pre-projected).
@@ -311,7 +333,13 @@ def softmax_core_flops(T: int, heads: int, head_dim: int,
                            minimum=1)
     V = value_dim if value_dim is not None else head_dim
     entries = T * (T + 1) // 2
-    return 2.0 * entries * heads * (head_dim + V)
+    try:
+        flops = 2.0 * entries * heads * (head_dim + V)
+    except OverflowError:
+        raise ValueError(
+            f'softmax_core_flops: T={T!r} makes the FLOP count '
+            f'unrepresentable as a finite float.') from None
+    return _finite_result('softmax_core_flops', 'FLOPs', flops)
 
 
 def kda_core_flops(T: int, heads: int, k_dim: int, v_dim: int, *,
@@ -331,11 +359,15 @@ def kda_core_flops(T: int, heads: int, k_dim: int, v_dim: int, *,
     if chunked:
         _validate_core_int('chunk_size', chunk_size, 'kda_core_flops',
                            minimum=1)
-    flops = 6.0 * T * heads * k_dim * v_dim
+    flops = _finite_result(
+        'kda_core_flops', 'FLOPs', 6.0 * T * heads * k_dim * v_dim)
     if chunked:
-        flops += 3.0 * T * heads * chunk_size * k_dim
-        flops += T * heads * chunk_size * chunk_size
-    return flops
+        flops += _finite_result(
+            'kda_core_flops', 'FLOPs',
+            3.0 * T * heads * chunk_size * k_dim)
+        flops += _finite_result(
+            'kda_core_flops', 'FLOPs', T * heads * chunk_size * chunk_size)
+    return _finite_result('kda_core_flops', 'FLOPs', flops)
 
 
 def ssd_core_flops_breakdown(
@@ -387,12 +419,15 @@ def ssd_core_flops_breakdown(
     readout = 2.0 * padded_len * heads * headdim * d_state
     scan = (2.0 * levels * padded_len * heads * headdim * d_state
             / chunk_size)
+    total = _finite_result(
+        'ssd_core_flops_breakdown', 'FLOPs',
+        intra + source + readout + scan)
     return {
         'intra_chunk_attention': intra,
         'chunk_source': source,
         'inter_chunk_readout': readout,
         'assoc_scan': scan,
-        'total': intra + source + readout + scan,
+        'total': total,
         'n_chunks': n_chunks,
         'padded_len': padded_len,
         'scan_levels': levels,
@@ -452,7 +487,8 @@ def ssd_core_flops(
         return ssd_core_flops_breakdown(
             T, heads, headdim, d_state, chunk_size=chunk_size)['total']
     _validate_ssd_flops_args(T, heads, headdim, d_state, chunk_size)
-    return 6.0 * T * heads * headdim * d_state
+    return _finite_result(
+        'ssd_core_flops', 'FLOPs', 6.0 * T * heads * headdim * d_state)
 
 
 def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
@@ -518,7 +554,13 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
         # q + k read at head_dim, v read at value_dim, o written at
         # value_dim (the softmax operator's value/output dimension).
         elements = 2 * T * heads * head_dim + 2 * T * heads * V
-        return float(elements * itemsize)
+        try:
+            nbytes = float(elements * itemsize)
+        except OverflowError:
+            raise ValueError(
+                f'core_bytes: T={T!r} makes the byte count unrepresentable '
+                f'as a finite float.') from None
+        return _finite_result('core_bytes', 'bytes', nbytes)
     if op == 'kda':
         activation = T * heads * (3 * head_dim + 2 * V + 1)
         if chunked:
@@ -526,7 +568,13 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
             state = 2 * n_chunks * heads * head_dim * V
         else:
             state = 2 * T * heads * head_dim * V
-        return float((activation + state) * itemsize)
+        try:
+            nbytes = float((activation + state) * itemsize)
+        except OverflowError:
+            raise ValueError(
+                f'core_bytes: T={T!r} makes the byte count unrepresentable '
+                f'as a finite float.') from None
+        return _finite_result('core_bytes', 'bytes', nbytes)
     if op == 'ssd':
         if d_state is None:
             raise ValueError("core_bytes: op='ssd' requires d_state.")
@@ -538,7 +586,13 @@ def core_bytes(op: str, T: int, *, heads: int, head_dim: int,
         # x + dt + B + C (read) + y (write).
         activation = (2 * T * heads * head_dim + T * heads
                       + 2 * T * ngroups * d_state)
-        return float((activation + state) * itemsize)
+        try:
+            nbytes = float((activation + state) * itemsize)
+        except OverflowError:
+            raise ValueError(
+                f'core_bytes: T={T!r} makes the byte count unrepresentable '
+                f'as a finite float.') from None
+        return _finite_result('core_bytes', 'bytes', nbytes)
     raise ValueError(
         f"core_bytes: op must be 'softmax', 'kda' or 'ssd', got {op!r}")
 
@@ -552,4 +606,5 @@ def elements_to_bytes(elements: float, *, itemsize: int = FP32_BYTES) -> float:
         raise ValueError(
             'elements_to_bytes: elements/itemsize must be representable as '
             'finite floats.') from None
-    return elements * itemsize
+    return _finite_result(
+        'elements_to_bytes', 'bytes', elements * itemsize)

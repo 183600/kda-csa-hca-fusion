@@ -272,6 +272,25 @@ def test_roofline_rejects_unrepresentable_geometry():
             'workload': {'d': 64, 'm2': 8, 'heads': 2, 'c': 16,
                          'dc': 32, 'sliding_window': 8}})),
     ]
+    # A single representable integer can still make a product exceed the
+    # float range; the derived count must be rejected, not leak an
+    # OverflowError or an ``inf`` result.
+    wide = 10 ** 200
+    cases += [
+        ('softmax_core_flops product', lambda: roofline.softmax_core_flops(
+            wide, 2, 8)),
+        ('core_bytes softmax product', lambda: roofline.core_bytes(
+            'softmax', wide, heads=10 ** 150, head_dim=8)),
+        ('core_bytes kda product', lambda: roofline.core_bytes(
+            'kda', wide, heads=10 ** 150, head_dim=8, value_dim=8)),
+        ('core_bytes ssd product', lambda: roofline.core_bytes(
+            'ssd', wide, heads=10 ** 150, head_dim=8, d_state=4)),
+        ('ssd breakdown product',
+         lambda: roofline.ssd_core_flops_breakdown(
+             wide, 10 ** 100, 10 ** 100, 10 ** 100)),
+        ('elements_to_bytes product', lambda: roofline.elements_to_bytes(
+            1e308, itemsize=2)),
+    ]
     for name, call in cases:
         raised = False
         try:
