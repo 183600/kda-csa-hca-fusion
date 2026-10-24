@@ -47,6 +47,7 @@ Honesty notes
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -67,6 +68,19 @@ def _require_positive_int(name: str, value) -> int:
             f"{name}={value!r} must be representable as a finite float."
         ) from None
     return value
+
+
+def _finite_float(name: str, value) -> float:
+    try:
+        result = float(value)
+    except OverflowError:
+        raise ValueError(
+            f"{name}={value!r} must be representable as a finite float."
+        ) from None
+    if not math.isfinite(result):
+        raise ValueError(
+            f"{name}={value!r} must be representable as a finite float.")
+    return result
 
 
 @dataclass(frozen=True)
@@ -351,12 +365,12 @@ def attention_prefill_flops(T: int, d_model: int, n_heads: int,
         raise ValueError(
             f"n_heads={n_heads} must be divisible by n_kv_heads="
             f"{n_kv_heads}.")
-    entries = T * (T + 1) // 2
+    entries = _finite_float('causal_entries', T * (T + 1) // 2)
     core = 2.0 * entries * n_heads * (head_dim + head_dim)
     proj = 2.0 * T * d_model * (n_heads * head_dim
                                 + 2 * n_kv_heads * head_dim)
     out_proj = 2.0 * T * (n_heads * head_dim) * d_model
-    return core + proj + out_proj
+    return _finite_float('attention_prefill_flops', core + proj + out_proj)
 
 
 def kv_state_elements_per_token(n_kv_heads: int, head_dim: int) -> int:

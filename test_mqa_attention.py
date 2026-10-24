@@ -285,6 +285,12 @@ def test_accounting_validation():
         mqa.attention_prefill_flops(huge, D_MODEL, H, 2, HEAD_DIM)
     with pytest.raises(ValueError):
         mqa.attention_prefill_flops(4, huge, H, 2, HEAD_DIM)
+    # ``T`` itself is representable, but the causal-entry product and the
+    # projection term are not; these must not leak OverflowError.
+    with pytest.raises(ValueError):
+        mqa.attention_prefill_flops(10 ** 308, D_MODEL, H, 2, HEAD_DIM)
+    with pytest.raises(ValueError):
+        mqa.attention_prefill_flops(10 ** 200, 10 ** 200, H, 2, HEAD_DIM)
     with pytest.raises(ValueError):
         mqa.kv_bytes_reduction(huge, 1)
     with pytest.raises(ValueError):
