@@ -436,6 +436,36 @@ def test_finite_unit_sums_cannot_overflow_into_non_json_reports():
         json.dumps(rep, allow_nan=False)
 
 
+def test_pooled_token_counts_beyond_float_range_stay_json_safe():
+    """A representable unit count can still make the pooled count too big.
+
+    ``sum(n_tokens)`` is a Python int and the token-weighted mean divides by
+    it; an int beyond ``float``'s range used to leak ``OverflowError``. The
+    same overflow can hit a bootstrap replicate when one huge unit is drawn
+    repeatedly, so both the point stats and the resamplers must stay finite.
+    """
+    import json
+    huge = 10 ** 308
+    units = [(1.0, huge), (1.0, huge)]
+    stats = P.unit_nll_stats(units)
+    assert math.isfinite(stats['mean_nll'])
+    assert stats['n_tokens'] == 2 * huge
+
+    ci = P.bootstrap_ppl_ci(units, n_boot=50, seed=0)
+    assert all(math.isfinite(x) for x in ci['ci_mean_nll'])
+    json.dumps(ci, allow_nan=False)
+
+    paired = P.paired_bootstrap_ppl(units, units, n_boot=50, seed=0)
+    assert paired['p_value'] == 1.0
+    json.dumps(paired, allow_nan=False)
+
+    # The pooled count is representable here, but drawing the huge unit
+    # twice in one replicate overflows the resample denominator.
+    uneven = [(1e-300, huge), (1e-300, 1)]
+    uneven_ci = P.bootstrap_ppl_ci(uneven, n_boot=50, seed=0)
+    json.dumps(uneven_ci, allow_nan=False)
+
+
 def test_throughput_rates_are_json_safe_for_extreme_finite_timings():
     import json
     tiny = P.throughput_summary(n_tokens=1, elapsed_s=5e-324)

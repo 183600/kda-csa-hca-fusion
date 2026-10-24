@@ -106,6 +106,22 @@ def _validate_boot_args(alpha: float, n_boot: int,
         raise ValueError(f'seed must be an int, got {seed!r}')
 
 
+def _divide_by_count(value: float, count: int) -> float:
+    """Divide by a token count that may exceed the float range.
+
+    A pooled or resampled token count can be a Python int beyond
+    ``float``'s maximum even when every individual unit is representable.
+    Scale by a power of two so the quotient stays representable instead of
+    letting ``int`` -> ``float`` conversion raise ``OverflowError``.
+    """
+    try:
+        return value / count
+    except OverflowError:
+        shift = count.bit_length() - 53
+        scaled = count >> shift
+        return math.ldexp(value / scaled, -shift)
+
+
 def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
     """Validate evaluation units and return ``[(nll_sum, n_tokens), ...]``.
 
@@ -209,7 +225,7 @@ def unit_nll_stats(units) -> dict:
         raise ValueError(
             'total nll_sum is not finite after pooling finite units; the '
             'report would contain inf and cannot be strict-JSON safe')
-    mean_nll = total_nll / total_tokens
+    mean_nll = _divide_by_count(total_nll, total_tokens)
     if not math.isfinite(mean_nll):
         raise ValueError('mean_nll is not finite after pooling')
     return {
@@ -266,7 +282,8 @@ def _resample_means(sums: list[float], toks: list[int], n_boot: int,
             i = rng.randrange(n)
             s += scaled[i]
             t += toks[i]
-        reps.append((s / t) * sum_scale if sum_scale else 0.0)
+        reps.append((_divide_by_count(s, t) * sum_scale)
+                    if sum_scale else 0.0)
     return reps
 
 
@@ -396,7 +413,8 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
     shift = stats_a['total_nll'] - stats_b['total_nll']
     delta_finite = math.isfinite(delta)
     shift_finite = math.isfinite(shift)
-    centered_a = ([(nll - shift * (tok / total_tokens), tok)
+    centered_a = ([(nll - shift * _divide_by_count(float(tok), total_tokens),
+                    tok)
                    for nll, tok in a] if shift_finite
                   else [(0.0, tok) for _, tok in a])
 
@@ -438,11 +456,11 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
             sb += b_work[i]
             sc += c_work[i]
             t += toks[i]
-        mean_a = sa / t
-        mean_b = sb / t
+        mean_a = _divide_by_count(sa, t)
+        mean_b = _divide_by_count(sb, t)
         reps.append((mean_a - mean_b) * max_unit if scaled else
                     (mean_a - mean_b))
-        hit_gap = (sc / t) - mean_b
+        hit_gap = _divide_by_count(sc, t) - mean_b
         if abs(hit_gap) >= scaled_abs_delta:
             hits += 1
     # A finite difference can still produce an unrepresentable replicate
