@@ -1988,6 +1988,42 @@ def _safe_mean(values):
     return mean
 
 
+def _safe_median(values):
+    """Median whose even-sample midpoint cannot overflow to ``inf``."""
+    n = len(values)
+    if n == 0:
+        return None
+    ordered = sorted(values)
+    if n % 2:
+        return ordered[n // 2]
+    a, b = ordered[n // 2 - 1], ordered[n // 2]
+    mid = (a + b) / 2.0
+    if math.isfinite(mid):
+        return mid
+    mid = a / 2.0 + b / 2.0
+    if not math.isfinite(mid):
+        raise DesignError('median is not finite after overflow-safe midpoint')
+    return mid
+
+
+def _safe_difference(left, right):
+    """``left - right`` without an overflow for finite opposite-sign values.
+
+    The ordinary expression is kept whenever it is finite. A finite
+    difference outside the float range has no representable value and is
+    reported as ``None`` so a malformed/extreme pilot row can be skipped
+    instead of poisoning the SD estimate with ``inf``/NaN.
+    """
+    diff = left - right
+    if math.isfinite(diff):
+        return diff
+    scale = max(abs(left), abs(right))
+    if scale == 0.0:
+        return 0.0
+    diff = scale * math.fsum([left / scale, -right / scale])
+    return diff if math.isfinite(diff) else None
+
+
 def _sample_sd(values):
     """Sample SD, falling back to scaled arithmetic on an overflow.
 
@@ -2056,7 +2092,7 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
                            'group': label})
     if direct:
         sds = [item['sd'] for item in direct]
-        median_sd = statistics.median(sds)
+        median_sd = _safe_median(sds)
         return {
             'method': 'reported_sd_diff',
             'group_key': group_key,
@@ -2125,7 +2161,18 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
             common = sorted(set(ref) & set(acc), key=str)
             if len(common) < 2:
                 continue
-            diffs = [acc[seed] - ref[seed] for seed in common]
+            diffs = []
+            for seed in common:
+                diff = _safe_difference(acc[seed], ref[seed])
+                if diff is None:
+                    diffs = None
+                    break
+                diffs.append(diff)
+            if diffs is None:
+                # A finite difference outside the float range cannot enter
+                # a finite SD estimate; skip this contrast like any other
+                # unusable pilot pair.
+                continue
             mean_diff = _safe_mean(diffs)
             sd = _sample_sd(diffs)
             if sd is None:
@@ -2176,7 +2223,7 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
                 candidate = scale * math.sqrt(ss_scaled / dof)
                 pooled = candidate if math.isfinite(candidate) else None
     sds = [pair['sd_diff'] for pair in pairs]
-    median_sd = statistics.median(sds)
+    median_sd = _safe_median(sds)
     return {
         'method': 'per_seed_paired_differences',
         'group_key': group_key,

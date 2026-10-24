@@ -669,6 +669,34 @@ def test_pilot_sd_from_rows_keeps_extreme_finite_differences_json_safe():
     assert info is not None and info['n_differences'] == 2
 
 
+def test_pilot_sd_skips_unrepresentable_paired_differences():
+    # 1e308 - (-1e308) overflows; the contrast cannot enter a finite SD.
+    rows = [
+        {'op': 'softmax', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': 1e308},
+                      {'seed': 43, 'final_acc': 1e308}]},
+        {'op': 'kda', 'task': 'mqar', 'n_kv': 1,
+         'per_seed': [{'seed': 42, 'final_acc': -1e308},
+                      {'seed': 43, 'final_acc': -1e308}]},
+    ]
+    assert D.pilot_sd_from_rows(rows, group_key='op', reference='softmax',
+                                cell_keys=['task', 'n_kv']) is None
+
+
+def test_pilot_reported_sd_median_does_not_overflow():
+    rows = [
+        {'contrast': 'B-A', 'n_kv': 1, 'n_common_seeds': 5,
+         'sd_diff': 1.7e308},
+        {'contrast': 'C-A', 'n_kv': 1, 'n_common_seeds': 5,
+         'sd_diff': 1.7e308},
+    ]
+    info = D.pilot_sd_from_rows(rows, group_key='contrast', reference='A',
+                                cell_keys=['n_kv'])
+    assert info['sd_median'] == 1.7e308
+    assert info['sd_pooled'] == 1.7e308
+    json.dumps(info, allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # Manifest + CLI
 # ---------------------------------------------------------------------------
