@@ -756,6 +756,10 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
             raise ValueError(
                 f'quantized_row_bytes: {key}={value!r} must be finite')
         b = elements * bpe
+        if not math.isfinite(b):
+            raise ValueError(
+                f'quantized_row_bytes: {key}={value!r} prices to a '
+                f'non-finite byte count')
         out[key] = b
         if stem == 'state':
             # The retained state is storage, not a per-query read; it is
@@ -769,6 +773,10 @@ def quantized_row_bytes(row: dict, quant=None) -> dict:
             # column already present; adding both would double-count.
             continue
         total += b
+    if not math.isfinite(total):
+        raise ValueError(
+            'quantized_row_bytes: total_read_bytes is unrepresentable as a '
+            'finite float')
     out[_TOTAL_KEY.replace('_elements', '_bytes')] = total
     out['quant_bytes_per_element'] = bytes_per_element_map
     return out

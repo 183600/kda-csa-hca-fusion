@@ -174,6 +174,24 @@ def test_quantized_row_bytes_bridge():
             _ok(f'oversized {key} rejected', False, 'no error')
         except ValueError:
             _ok(f'oversized {key} rejected', True)
+    # A representable element count can still price to an infinite byte count.
+    for key in ('core_read_elements', 'state_elements'):
+        bad = dict(row)
+        bad[key] = 10 ** 308
+        try:
+            quantized_row_bytes(bad)
+            _ok(f'overflowing {key} rejected', False, 'no error')
+        except ValueError:
+            _ok(f'overflowing {key} rejected', True)
+    # Individually finite components must not overflow their total.
+    csa = kv_budget.op_read_elements('csa', 16, _MQAR_SPEC)
+    csa['core_read_elements'] = 5e307
+    csa['indexer_read_elements'] = 5e307
+    try:
+        quantized_row_bytes(csa)
+        _ok('overflowing total rejected', False, 'no error')
+    except ValueError:
+        _ok('overflowing total rejected', True)
     # A QuantSpec applies to every component; None = fp16 baseline.
     allq = quantized_row_bytes(row, QuantSpec(8, 64))
     baseq = quantized_row_bytes(row)
