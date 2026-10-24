@@ -205,9 +205,10 @@ def first_decode_elements(cfg: HybridConfig, T: int) -> dict:
 
     Reads are the *instant* (marginal) budget at position ``T``: the query
     sees ``T // m`` compressed blocks, not the ``0..T-1`` average. The
-    memory route's recurrent read is position-independent and follows the
-    canonical ``lm_consistency`` convention (KDA reads its state twice;
-    Mamba-2 / RWKV-7 read it once). Writes come from
+    memory route's recurrent read is position-independent; KDA and Mamba-2
+    read the state twice per step (update + readout), matching
+    ``kv_budget.instant_read_elements``, while RWKV-7 follows the canonical
+    ``lm_consistency`` one-read convention. Writes come from
     ``decode_elements_per_token`` (one recurrent-state write per memory
     layer; CSA/HCA writes are amortized by the canonical model).
     """
@@ -219,7 +220,7 @@ def first_decode_elements(cfg: HybridConfig, T: int) -> dict:
     route = _memory_route(cfg)
     one_state = float(kv_cache_elements(
         route, 1, mode='compressed_kv_only', **geo))
-    mem_read = (2.0 if route == 'kda' else 1.0) * one_state
+    mem_read = (2.0 if route in ('kda', 'mamba2') else 1.0) * one_state
     instant = {'memory': float(n_mem) * mem_read, 'csa': 0.0, 'hca': 0.0}
     average = {'memory': float(n_mem) * mem_read, 'csa': 0.0, 'hca': 0.0}
     if n_csa:

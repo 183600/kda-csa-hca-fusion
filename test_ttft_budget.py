@@ -101,6 +101,18 @@ def test_explicit_layout_with_mamba_route():
     assert led['memory_route'] == 'mamba2'
     assert led['layout_counts'] == [2, 1, 1]
 
+    # Mamba-2's SSD step reads the recurrent state twice (decayed update
+    # and C @ S^T readout), matching kv_budget.instant_read_elements; the
+    # first-decode budget must not charge it only once.
+    import lm_consistency
+    from run_kv_cache import kv_cache_elements
+    geo = lm_consistency.lm_tower_geometry(cfg)
+    one_state = float(kv_cache_elements(
+        'mamba2', 1, mode='compressed_kv_only', **geo))
+    row = first_decode_elements(cfg, 64)
+    assert row['read_elements_by_op']['memory'] == pytest.approx(
+        2 * 2 * one_state)
+
 
 # ---------------------------------------------------------------------------
 # storage-only FP8: bytes change, FLOPs do not
