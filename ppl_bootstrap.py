@@ -513,7 +513,11 @@ def throughput_summary(*, n_tokens: int, elapsed_s: float,
         raise ValueError(f'n_tokens must be >= 0, got {n_tokens}')
     if isinstance(elapsed_s, bool) or not isinstance(elapsed_s, (int, float)):
         raise ValueError(f'elapsed_s must be a real number, got {elapsed_s!r}')
-    elapsed = float(elapsed_s)
+    try:
+        elapsed = float(elapsed_s)
+    except OverflowError:
+        raise ValueError(f'elapsed_s must be a positive finite number, '
+                         f'got {elapsed_s!r}') from None
     if not math.isfinite(elapsed) or elapsed <= 0.0:
         raise ValueError(f'elapsed_s must be a positive finite number, '
                          f'got {elapsed_s!r}')

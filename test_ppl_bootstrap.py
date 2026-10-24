@@ -265,6 +265,10 @@ def test_throughput_summary_contract():
     for bad_elapsed in (True, '1.0'):
         with pytest.raises(ValueError):
             P.throughput_summary(n_tokens=10, elapsed_s=bad_elapsed)
+    # JSON integers are unbounded; an unrepresentable float must still be a
+    # clean ValueError rather than leaking OverflowError from float().
+    with pytest.raises(ValueError):
+        P.throughput_summary(n_tokens=10, elapsed_s=10 ** 400)
     for bad_sequences in (True, 1.5, '2'):
         with pytest.raises(ValueError):
             P.throughput_summary(
