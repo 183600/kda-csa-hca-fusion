@@ -1162,3 +1162,31 @@ def test_interaction_contrast_is_json_safe_at_float_limit():
     assert rep['n_pairs'] == 2
     assert math.isfinite(rep['mean_diff'])
     json.dumps(rep, allow_nan=False)
+
+
+def test_interaction_contrast_survives_overflowing_per_seed_difference():
+    # Every direct ``d - b - c + a`` overflows to -inf even though the true
+    # interaction is exactly zero for each seed.
+    a = {42: 1e308, 43: 1e308}
+    b = {42: 1e308, 43: 1e308}
+    c = {42: -1e308, 43: -1e308}
+    d = {42: -1e308, 43: -1e308}
+    rep = M.interaction_contrast(a, b, c, d)
+    assert rep['n_pairs'] == 2
+    assert rep['mean_diff'] == 0.0
+    assert rep['sd_diff'] == 0.0
+    assert rep['direction'] == 'none'
+    json.dumps(rep, allow_nan=False)
+
+
+def test_interaction_contrast_reports_unrepresentable_interaction():
+    a = {42: 1e308, 43: 1e308}
+    b = {42: 1e308, 43: 1e308}
+    c = {42: -1e308, 43: -1e308}
+    d = {42: 1e308, 43: 1e308}
+    rep = M.interaction_contrast(a, b, c, d)
+    assert rep['n_pairs'] == 2
+    assert rep['mean_diff'] is None
+    assert rep['sd_diff'] is None
+    assert rep['direction'] == 'none'
+    json.dumps(rep, allow_nan=False)

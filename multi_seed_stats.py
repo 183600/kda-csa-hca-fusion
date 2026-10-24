@@ -911,13 +911,51 @@ def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
     }
     if n < 2:
         return record
-    diffs = [cells['d'][s] - cells['b'][s] - cells['c'][s] + cells['a'][s]
-             for s in common]
-    mean = _safe_mean(diffs)
-    sd = _sample_sd(diffs, mean)
-    if sd is None:
+    # ``d - b - c + a`` can overflow to +-inf for finite cells even when
+    # the true interaction is representable (e.g. all four cells near
+    # 1e308). Keep the historical left-to-right arithmetic for every
+    # in-range seed; only an overflowing seed falls back to a scaled
+    # evaluation, which is the same difference up to round-off.
+    diffs = []
+    diff_scale = max(
+        abs(v) for cell in cells.values() for v in cell.values())
+    for s in common:
+        diff = (cells['d'][s] - cells['b'][s]
+                - cells['c'][s] + cells['a'][s])
+        if not math.isfinite(diff):
+            if diff_scale == 0.0:
+                diff = 0.0
+            else:
+                diff = diff_scale * math.fsum([
+                    cells['d'][s] / diff_scale,
+                    -cells['b'][s] / diff_scale,
+                    -cells['c'][s] / diff_scale,
+                    cells['a'][s] / diff_scale,
+                ])
+        diffs.append(diff)
+    diffs_finite = all(math.isfinite(d) for d in diffs)
+    if diffs_finite:
+        mean = _safe_mean(diffs)
+    else:
+        # At least one per-seed interaction exceeds the float range. The
+        # MEAN can still be representable through cancellation across
+        # seeds, so evaluate the aggregate in the same scaled space and
+        # report the SD/effect size as undefined.
+        mean = diff_scale * (
+            math.fsum(
+                cells['d'][s] / diff_scale
+                - cells['b'][s] / diff_scale
+                - cells['c'][s] / diff_scale
+                + cells['a'][s] / diff_scale
+                for s in common)
+            / n)
+        if not math.isfinite(mean):
+            mean = None
+    sd = (_sample_sd(diffs, mean)
+          if mean is not None and diffs_finite else None)
+    if sd is None and diffs_finite:
         sd = 0.0
-    t_stat = (mean / (sd / math.sqrt(n))) if sd > 0.0 else None
+    t_stat = (mean / (sd / math.sqrt(n))) if sd and sd > 0.0 else None
     if all(x > 0 for x in diffs):
         unanimous = 'positive'
     elif all(x < 0 for x in diffs):
@@ -932,7 +970,9 @@ def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
     cell_scale = max(abs(v) for cell in cells.values()
                      for v in cell.values()) if common else 0.0
     zero_tol = (4.0 * math.ulp(cell_scale)) if cell_scale > 0.0 else 0.0
-    if abs(mean) <= zero_tol:
+    if mean is None:
+        direction = 'none'
+    elif abs(mean) <= zero_tol:
         direction = 'none'
     else:
         direction = 'greater' if mean > 0 else 'less'
@@ -941,7 +981,8 @@ def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
         'sd_diff': sd,
         't_stat': t_stat,
         'dof': n - 1,
-        'effect_size_cohens_dz': (mean / sd) if sd > 0.0 else None,
+        'effect_size_cohens_dz': (
+            mean / sd if mean is not None and sd and sd > 0.0 else None),
         'unanimous': unanimous,
         'direction': direction,
         'numerically_zero_tolerance': zero_tol,
@@ -950,7 +991,10 @@ def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
             'non-significant I does not establish additivity, and a '
             'significant I is the only evidence for a non-additive '
             'combination. Use the paired t / exact sign-flip test with the '
-            'same multiplicity correction as the main contrasts.'),
+            'same multiplicity correction as the main contrasts.'
+            if mean is not None else
+            'the interaction exceeds the representable float range; '
+            'mean_diff and the paired statistics are undefined'),
     })
     return record
 
