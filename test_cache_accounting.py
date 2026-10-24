@@ -633,6 +633,15 @@ def test_paper_aligned_ratio_and_geometry_are_json_safe_at_extremes():
     assert report['total_bytes'] is None
     json.dumps(report, allow_nan=False)
 
+    # Counts beyond the float range must still produce the exact ratio
+    # instead of leaking ``OverflowError`` from ``float(elements)``.
+    huge = cache_accounting.paper_aligned_bytes(
+        cfg, {'csa_compressed_kv': {'elements_allocated': 10 ** 400}})
+    assert huge['ratio_vs_pure_bf16'] == 1.0
+    assert huge['total_bytes'] is None
+    assert huge['by_component']['csa_compressed_kv']['bytes'] is None
+    json.dumps(huge, allow_nan=False)
+
     for call in (
             lambda: kv_cache_elements('csa', 16, csa_c=-4),
             lambda: kv_cache_elements('csa', 16, csa_m=0),

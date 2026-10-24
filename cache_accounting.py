@@ -858,8 +858,14 @@ def paper_aligned_bytes(cfg: HybridConfig, components: dict, *,
             per_element = 1.0
         else:
             per_element = 2.0
-        nbytes = float(elements) * per_element
-        weighted_elements.append((float(elements), per_element))
+        try:
+            elements_f = float(elements)
+        except OverflowError:
+            # JSON integers are unbounded; keep the byte totals JSON-safe
+            # and let the scaled ratio below use the exact integer counts.
+            elements_f = math.inf if elements >= 0 else -math.inf
+        nbytes = elements_f * per_element
+        weighted_elements.append((elements, per_element))
         by_component[name] = {
             'elements_allocated': elements,
             'bytes_per_element': per_element,
