@@ -365,8 +365,9 @@ def test_tp_latency_sweep_invariants():
 
 
 def test_prefill_flops_rejects_unrepresentable_csa_core():
-    with pytest.raises(ValueError):
-        prefill_flops('csa', 10 ** 308)
+    for T in (10 ** 200, 10 ** 308):
+        with pytest.raises(ValueError):
+            prefill_flops('csa', T)
 
 
 def test_hardware_from_gpu_cpu_fallback(monkeypatch):

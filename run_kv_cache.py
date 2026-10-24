@@ -757,7 +757,12 @@ def prefill_flops(op: str, T: int, **kw):
         # strictly-preceding mask. The helper counts the exact selected
         # slots.
         total_sel = causal_selected_entries(T, csa_m, csa_topk)
-        effective_topk = total_sel / T if T > 0 else 0
+        try:
+            effective_topk = total_sel / T if T > 0 else 0
+        except OverflowError:
+            raise ValueError(
+                f'prefill_flops(csa): T={T!r} makes the average effective '
+                f'top-k unrepresentable as a finite float.') from None
         try:
             core = 2 * T * effective_topk * csa_c * csa_nh * 2
         except OverflowError:
@@ -778,7 +783,12 @@ def prefill_flops(op: str, T: int, **kw):
         # This is part of the standalone CSA layer boundary in run_benchmark.py
         # and CSAHybridLayer.o_proj, so Exp3 must count it too.
         out_proj = 2 * T * csa_nh * csa_c * d
-        return compress + query_proj + indexer + core + sw + out_proj
+        try:
+            return compress + query_proj + indexer + core + sw + out_proj
+        except OverflowError:
+            raise ValueError(
+                f'prefill_flops(csa): T={T!r} makes the total FLOP count '
+                f'unrepresentable as a finite float.') from None
     if op == 'hca':
         # KV-side compression: TWO input projections (W_KV, W_Z), each T*d*c.
         compress = 2 * T * d * hca_c * 2
