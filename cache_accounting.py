@@ -760,7 +760,8 @@ def autograd_graph_probe(cfg: HybridConfig, *, total_layers: int | None = None,
     from run_decoding import HybridDecoding
 
     if not isinstance(steps, (tuple, list)) or len(steps) < 2 or \
-            any((not isinstance(s, int)) or s < 1 for s in steps):
+            any((not isinstance(s, int)) or isinstance(s, bool) or s < 1
+                for s in steps):
         raise ValueError(
             f'autograd_graph_probe: steps must be >= 2 positive ints, '
             f'got {steps!r}')
@@ -1006,11 +1007,13 @@ def run_cache_audit_for_model(model, context_len: int, *,
             'run_cache_audit_for_model: expected an LMWithHybrid-style model '
             'exposing ``.hybrid`` and a HybridConfig ``.cfg``, got '
             f'{type(model).__name__}.')
-    if not isinstance(context_len, int) or context_len < 1:
+    if (not isinstance(context_len, int) or isinstance(context_len, bool)
+            or context_len < 1):
         raise ValueError(
             f'run_cache_audit_for_model: context_len must be >= 1, got '
             f'{context_len!r}.')
-    if not isinstance(decode_steps, int) or decode_steps < 0:
+    if (not isinstance(decode_steps, int) or isinstance(decode_steps, bool)
+            or decode_steps < 0):
         raise ValueError(
             f'run_cache_audit_for_model: decode_steps must be >= 0, got '
             f'{decode_steps!r}.')

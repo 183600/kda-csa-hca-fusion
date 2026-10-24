@@ -416,7 +416,12 @@ def test_autograd_hygiene_and_bounded_graph():
         cache_accounting.autograd_graph_probe(cfg, steps=(4,))
     except ValueError:
         raised += 1
-    _ok('graph probe validation', raised == 2, f'raised={raised}')
+    for bad in ((True, 4), (4, True)):
+        try:
+            cache_accounting.autograd_graph_probe(cfg, steps=bad)
+        except ValueError:
+            raised += 1
+    _ok('graph probe validation', raised == 4, f'raised={raised}')
 
 
 def test_paper_aligned_bytes():
@@ -555,7 +560,14 @@ def test_lcm_packing_and_full_report():
         cache_accounting.run_cache_audit_for_model(model, context_len=0)
     except ValueError:
         raised += 1
-    _ok('report validation', raised == 2, f'raised={raised}')
+    for key, kwargs in (
+            ('context_len', {'context_len': True}),
+            ('decode_steps', {'context_len': 8, 'decode_steps': True})):
+        try:
+            cache_accounting.run_cache_audit_for_model(model, **kwargs)
+        except ValueError:
+            raised += 1
+    _ok('report validation', raised == 4, f'raised={raised}')
 
 
 def test_explicit_layout_report_uses_resolved_counts():
