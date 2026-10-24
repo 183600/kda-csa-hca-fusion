@@ -323,6 +323,10 @@ def test_audit_validation():
         fa.kda_executed_flops(cfg, representable)
     with pytest.raises(ValueError):
         fa.mamba2_executed_flops(cfg, representable)
+    with pytest.raises(ValueError):
+        fa.kda_canonical_terms(cfg, representable)
+    with pytest.raises(ValueError):
+        fa.mamba2_canonical_terms(cfg, representable)
     assert math.isfinite(fa.canonical_flops('kda', cfg, 64, batch=2))
 
 

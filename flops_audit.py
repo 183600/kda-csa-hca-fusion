@@ -379,7 +379,7 @@ def kda_canonical_terms(cfg, T: int, batch: int = 1) -> dict:
     chunk_inter = b * 3 * T * HV * c * K
     chunk_a = b * T * HV * c * c
     out_proj = b * 2 * T * HV * V * d
-    return {
+    terms = {
         'proj': proj,
         'short_conv': short_conv,
         'recurrent': recurrent,
@@ -387,6 +387,9 @@ def kda_canonical_terms(cfg, T: int, batch: int = 1) -> dict:
         'chunk_a': chunk_a,
         'out_proj': out_proj,
     }
+    for name, value in terms.items():
+        _finite_float(f'KDA {name} FLOPs', value)
+    return terms
 
 
 def kda_executed_flops(cfg, T: int, batch: int = 1) -> float:
@@ -484,7 +487,7 @@ def mamba2_canonical_terms(cfg, T: int, batch: int = 1) -> dict:
     dt_rank = (max(1, (d + 15) // 16)
                if isinstance(dt_rank_cfg, str) else int(dt_rank_cfg))
     b = float(batch)
-    return {
+    terms = {
         'in_proj': b * 2 * T * d * 2 * d_inner,
         'conv': b * 2 * T * d_inner * cfg.mamba_d_conv,
         'x_proj': b * 2 * T * d_inner * (dt_rank + 2 * ngroups * d_state),
@@ -492,6 +495,9 @@ def mamba2_canonical_terms(cfg, T: int, batch: int = 1) -> dict:
         'scan': b * 2 * 3 * T * nheads * headdim * d_state,
         'out_proj': b * 2 * T * d_inner * d,
     }
+    for name, value in terms.items():
+        _finite_float(f'Mamba-2 {name} FLOPs', value)
+    return terms
 
 
 def mamba2_broadcast_encoded_macs(cfg, T: int, batch: int = 1) -> int:
