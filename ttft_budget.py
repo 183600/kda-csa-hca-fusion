@@ -130,6 +130,37 @@ def _validate_positive_float(value, name: str) -> float:
     return number
 
 
+def _finite_float(value, name: str) -> float:
+    """Convert a size/count/product to a finite float or reject it.
+
+    Individual geometry values can be representable while their product
+    (bytes, FLOPs, state elements) is not. An ``inf`` must never enter the
+    JSON report, so the unrepresentable derived quantity is rejected with
+    the same ValueError contract as an oversized input.
+    """
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(
+            f'{name} is not representable as a finite float, '
+            f'got {value!r}') from None
+    if not math.isfinite(number):
+        raise ValueError(
+            f'{name} is not representable as a finite float, '
+            f'got {value!r}')
+    return number
+
+
+def _finite_call(fn, name: str) -> float:
+    """Evaluate a size-producing call, translating float overflow."""
+    try:
+        value = fn()
+    except OverflowError:
+        raise ValueError(
+            f'{name} is not representable as a finite float') from None
+    return _finite_float(value, name)
+
+
 def _require_cfg(cfg) -> None:
     if not isinstance(cfg, HybridConfig):
         raise TypeError(
@@ -166,7 +197,9 @@ def layout_prefill_flops(cfg: HybridConfig, T: int, *,
     _validate_positive_int(batch, 'batch')
     geo = lm_tower_geometry(cfg)
     op = _HYBRID_OPS[_memory_route(cfg)]
-    return float(batch) * float(prefill_flops(op, T, **geo))
+    flops = _finite_call(
+        lambda: prefill_flops(op, T, **geo), 'prefill FLOPs')
+    return _finite_float(float(batch) * flops, 'prefill FLOPs')
 
 
 def prefill_state_elements(cfg: HybridConfig, T: int, *,
@@ -190,14 +223,27 @@ def prefill_state_elements(cfg: HybridConfig, T: int, *,
     n_mem, n_csa, n_hca = _layout_counts(cfg)
     route = _memory_route(cfg)
     by_op = {
-        'memory': float(n_mem) * float(kv_cache_elements(
-            route, T, mode=mode, **geo)),
-        'csa': (float(n_csa) * float(kv_cache_elements(
-            'csa', T, mode=mode, **geo))) if n_csa else 0.0,
-        'hca': (float(n_hca) * float(kv_cache_elements(
-            'hca', T, mode=mode, **geo))) if n_hca else 0.0,
+        'memory': _finite_float(
+            float(n_mem) * _finite_call(
+                lambda: kv_cache_elements(route, T, mode=mode, **geo),
+                'prefill memory state elements'),
+            'prefill memory state elements'),
+        'csa': (_finite_float(
+            float(n_csa) * _finite_call(
+                lambda: kv_cache_elements('csa', T, mode=mode, **geo),
+                'prefill csa state elements'),
+            'prefill csa state elements')) if n_csa else 0.0,
+        'hca': (_finite_float(
+            float(n_hca) * _finite_call(
+                lambda: kv_cache_elements('hca', T, mode=mode, **geo),
+                'prefill hca state elements'),
+            'prefill hca state elements')) if n_hca else 0.0,
     }
-    return {'by_op': by_op, 'total': sum(by_op.values()), 'mode': mode}
+    return {
+        'by_op': by_op,
+        'total': _finite_float(sum(by_op.values()), 'prefill state elements'),
+        'mode': mode,
+    }
 
 
 def first_decode_elements(cfg: HybridConfig, T: int) -> dict:
@@ -218,34 +264,58 @@ def first_decode_elements(cfg: HybridConfig, T: int) -> dict:
     spec = decode_read_spec(cfg)
     n_mem, n_csa, n_hca = _layout_counts(cfg)
     route = _memory_route(cfg)
-    one_state = float(kv_cache_elements(
-        route, 1, mode='compressed_kv_only', **geo))
-    mem_read = (2.0 if route in ('kda', 'mamba2') else 1.0) * one_state
-    instant = {'memory': float(n_mem) * mem_read, 'csa': 0.0, 'hca': 0.0}
-    average = {'memory': float(n_mem) * mem_read, 'csa': 0.0, 'hca': 0.0}
+    one_state = _finite_call(
+        lambda: kv_cache_elements(
+            route, 1, mode='compressed_kv_only', **geo),
+        'first-decode state elements')
+    mem_read = _finite_float(
+        (2.0 if route in ('kda', 'mamba2') else 1.0) * one_state,
+        'first-decode state read elements')
+    instant = {
+        'memory': _finite_float(
+            float(n_mem) * mem_read, 'first-decode memory read elements'),
+        'csa': 0.0, 'hca': 0.0}
+    average = dict(instant)
     if n_csa:
-        instant['csa'] = float(n_csa) * float(
-            kv_budget.instant_read_elements('csa', T, spec)[
-                'total_read_elements'])
-        average['csa'] = float(n_csa) * float(
-            kv_budget.op_read_elements('csa', T, spec)[
-                'total_read_elements'])
+        instant['csa'] = _finite_float(
+            float(n_csa) * _finite_call(
+                lambda: kv_budget.instant_read_elements(
+                    'csa', T, spec)['total_read_elements'],
+                'first-decode csa instant reads'),
+            'first-decode csa instant reads')
+        average['csa'] = _finite_float(
+            float(n_csa) * _finite_call(
+                lambda: kv_budget.op_read_elements(
+                    'csa', T, spec)['total_read_elements'],
+                'first-decode csa average reads'),
+            'first-decode csa average reads')
     if n_hca:
-        instant['hca'] = float(n_hca) * float(
-            kv_budget.instant_read_elements('hca', T, spec)[
-                'total_read_elements'])
-        average['hca'] = float(n_hca) * float(
-            kv_budget.op_read_elements('hca', T, spec)[
-                'total_read_elements'])
-    write_total = float(decode_elements_per_token(cfg, T)[
-        'write_elements_per_token'])
+        instant['hca'] = _finite_float(
+            float(n_hca) * _finite_call(
+                lambda: kv_budget.instant_read_elements(
+                    'hca', T, spec)['total_read_elements'],
+                'first-decode hca instant reads'),
+            'first-decode hca instant reads')
+        average['hca'] = _finite_float(
+            float(n_hca) * _finite_call(
+                lambda: kv_budget.op_read_elements(
+                    'hca', T, spec)['total_read_elements'],
+                'first-decode hca average reads'),
+            'first-decode hca average reads')
+    write_total = _finite_call(
+        lambda: decode_elements_per_token(cfg, T)['write_elements_per_token'],
+        'first-decode write elements')
     return {
         'read_elements_by_op': instant,
         'average_read_elements_by_op': average,
-        'read_elements': sum(instant.values()),
-        'average_read_elements': sum(average.values()),
+        'read_elements': _finite_float(
+            sum(instant.values()), 'first-decode read elements'),
+        'average_read_elements': _finite_float(
+            sum(average.values()), 'first-decode average read elements'),
         'write_elements': write_total,
-        'total_elements': sum(instant.values()) + write_total,
+        'total_elements': _finite_float(
+            sum(instant.values()) + write_total,
+            'first-decode total elements'),
     }
 
 
@@ -344,46 +414,69 @@ def ttft_ledger(cfg: HybridConfig, T: int, *, batch: int = 1,
     state_summary = storage_summary(state_storage, itemsize)
     state_bpe = state_summary['bytes_per_element_by_op']
 
-    weight_bytes = float(weight_elements) * weight_bpe
-    activation_bytes = (2.0 * float(batch) * float(T) * float(cfg.d_model)
-                        * float(activation_itemsize))
+    weight_bytes = _finite_float(
+        float(weight_elements) * weight_bpe, 'weight bytes')
+    activation_bytes = _finite_float(
+        2.0 * float(batch) * float(T) * float(cfg.d_model)
+        * float(activation_itemsize), 'activation bytes')
     state = prefill_state_elements(cfg, T, mode=state_mode)
     state_elements_by_op = {
-        op: float(batch) * elements
+        op: _finite_float(
+            float(batch) * elements, f'prefill {op} state elements')
         for op, elements in state['by_op'].items()
     }
     state_bytes_by_op = {
-        op: elements * state_bpe[op]
+        op: _finite_float(
+            elements * state_bpe[op], f'prefill {op} state bytes')
         for op, elements in state_elements_by_op.items()
     }
-    state_bytes = sum(state_bytes_by_op.values())
-    prefill_bytes = weight_bytes + activation_bytes + state_bytes
+    state_bytes = _finite_float(
+        sum(state_bytes_by_op.values()), 'prefill state bytes')
+    prefill_bytes = _finite_float(
+        weight_bytes + activation_bytes + state_bytes, 'prefill bytes')
 
     flops_total = layout_prefill_flops(cfg, T, batch=batch)
-    effective_peak_tflops = peak_tflops * compute_speedup
-    compute_ms = flops_total / (effective_peak_tflops * 1e12) * 1e3
-    memory_ms = prefill_bytes / (bw_gbps * 1e9) * 1e3
-    prefill_ms = max(compute_ms, memory_ms)
+    effective_peak_tflops = _finite_float(
+        peak_tflops * compute_speedup, 'effective peak TFLOPs')
+    compute_ms = _finite_float(
+        flops_total / (effective_peak_tflops * 1e12) * 1e3,
+        'prefill compute ms')
+    memory_ms = _finite_float(
+        prefill_bytes / (bw_gbps * 1e9) * 1e3, 'prefill memory ms')
+    prefill_ms = _finite_float(max(compute_ms, memory_ms), 'prefill ms')
     prefill_bound = 'compute' if compute_ms >= memory_ms else 'memory'
-    arithmetic_intensity = (flops_total / prefill_bytes
-                            if prefill_bytes > 0 else math.inf)
-    ridge = effective_peak_tflops * 1e12 / (bw_gbps * 1e9)
+    arithmetic_intensity = (
+        _finite_float(flops_total / prefill_bytes,
+                      'arithmetic intensity')
+        if prefill_bytes > 0 else math.inf)
+    ridge = _finite_float(
+        effective_peak_tflops * 1e12 / (bw_gbps * 1e9),
+        'ridge flops per byte')
 
     first = first_decode_elements(cfg, T)
     first_read_bytes_by_op = {
-        op: elements * state_bpe[op]
+        op: _finite_float(
+            elements * state_bpe[op], f'first-decode {op} read bytes')
         for op, elements in first['read_elements_by_op'].items()
     }
-    first_write_bytes = first['write_elements'] * state_bpe['memory']
-    first_state_bytes = (sum(first_read_bytes_by_op.values())
-                         + first_write_bytes)
-    first_decode_bytes = weight_bytes + float(batch) * first_state_bytes
-    first_decode_ms = first_decode_bytes / (bw_gbps * 1e9) * 1e3
+    first_write_bytes = _finite_float(
+        first['write_elements'] * state_bpe['memory'],
+        'first-decode write bytes')
+    first_state_bytes = _finite_float(
+        sum(first_read_bytes_by_op.values()) + first_write_bytes,
+        'first-decode state bytes')
+    first_decode_bytes = _finite_float(
+        weight_bytes + float(batch) * first_state_bytes,
+        'first-decode bytes')
+    first_decode_ms = _finite_float(
+        first_decode_bytes / (bw_gbps * 1e9) * 1e3,
+        'first-decode ms')
     instant_vs_average = (
-        first['read_elements'] / first['average_read_elements']
+        _finite_float(first['read_elements'] / first['average_read_elements'],
+                      'instant vs average reads')
         if first['average_read_elements'] > 0 else None)
 
-    ttft_ms = prefill_ms + first_decode_ms
+    ttft_ms = _finite_float(prefill_ms + first_decode_ms, 'TTFT ms')
     return {
         'T': int(T),
         'batch': int(batch),

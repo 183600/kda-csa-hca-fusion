@@ -251,6 +251,24 @@ def test_invalid_inputs_raise():
             bad_call()
 
 
+def test_derived_size_overflow_is_rejected():
+    cfg = small_cfg()
+    huge = 10 ** 308
+    for bad_call in (
+            lambda: ttft_ledger(cfg, huge, peak_tflops=PEAK, bw_gbps=BW),
+            lambda: ttft_ledger(cfg, 8, batch=huge,
+                                peak_tflops=PEAK, bw_gbps=BW),
+            lambda: ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=BW,
+                                compute_speedup=huge),
+            lambda: ttft_ledger(cfg, 8, peak_tflops=PEAK, bw_gbps=BW,
+                                weight_elements=huge),
+            lambda: layout_prefill_flops(cfg, 8, batch=huge),
+            lambda: prefill_state_elements(cfg, huge),
+            lambda: first_decode_elements(cfg, huge)):
+        with pytest.raises(ValueError):
+            bad_call()
+
+
 def test_report_is_strict_json():
     cfg = small_cfg()
     led = ttft_ledger(cfg, 64, peak_tflops=PEAK, bw_gbps=BW,
