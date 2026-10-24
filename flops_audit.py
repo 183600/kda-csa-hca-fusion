@@ -297,7 +297,23 @@ def geometry_kwargs(cfg) -> dict:
 def canonical_flops(kind: str, cfg, T: int, batch: int = 1) -> float:
     """Ideal analytic prefill FLOPs (``run_kv_cache`` convention)."""
     _validate(kind, T, batch)
-    return float(batch) * float(prefill_flops(kind, T, **geometry_kwargs(cfg)))
+    per_sequence = _finite_float(
+        'prefill FLOPs', prefill_flops(kind, T, **geometry_kwargs(cfg)))
+    return _finite_float('canonical FLOPs', float(batch) * per_sequence)
+
+
+def _finite_float(name: str, value) -> float:
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'flops_audit: {name}={value!r} must be representable as a '
+            f'finite float.') from None
+    if not math.isfinite(number):
+        raise ValueError(
+            f'flops_audit: {name}={value!r} must be representable as a '
+            f'finite float.')
+    return number
 
 
 def _validate(kind: str, T: int, batch: int = 1) -> None:

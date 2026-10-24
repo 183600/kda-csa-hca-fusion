@@ -314,6 +314,12 @@ def test_audit_validation():
     for args in ((64, dict(batch=huge)), (huge, {})):
         with pytest.raises(ValueError):
             fa.canonical_flops('kda', cfg, args[0], **args[1])
+    representable = 10 ** 308
+    with pytest.raises(ValueError):
+        fa.canonical_flops('kda', cfg, representable)
+    with pytest.raises(ValueError):
+        fa.canonical_flops('kda', cfg, 10 ** 200, batch=10 ** 200)
+    assert math.isfinite(fa.canonical_flops('kda', cfg, 64, batch=2))
 
 
 # ---------------------------------------------------------------------------
