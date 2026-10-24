@@ -42,6 +42,7 @@ from ops_fused import (  # noqa: E402
     HybridKCHAttention,
     KDAHybridLayer,
 )
+from run_kv_cache import prefill_flops  # noqa: E402
 
 
 @pytest.fixture
@@ -358,6 +359,14 @@ def test_tp_latency_sweep_invariants():
         tp.ring_allreduce_ms(1, huge, hw)
     with pytest.raises(ValueError):
         tp.layer_flops_split(cfg, 'kda', huge)
+    for kind in ('kda', 'csa', 'hca'):
+        with pytest.raises(ValueError):
+            tp.layer_flops_split(cfg, kind, 10 ** 308)
+
+
+def test_prefill_flops_rejects_unrepresentable_csa_core():
+    with pytest.raises(ValueError):
+        prefill_flops('csa', 10 ** 308)
 
 
 def test_hardware_from_gpu_cpu_fallback(monkeypatch):

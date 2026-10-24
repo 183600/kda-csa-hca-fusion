@@ -758,7 +758,12 @@ def prefill_flops(op: str, T: int, **kw):
         # slots.
         total_sel = causal_selected_entries(T, csa_m, csa_topk)
         effective_topk = total_sel / T if T > 0 else 0
-        core = 2 * T * effective_topk * csa_c * csa_nh * 2
+        try:
+            core = 2 * T * effective_topk * csa_c * csa_nh * 2
+        except OverflowError:
+            raise ValueError(
+                f'prefill_flops(csa): T={T!r} makes the core FLOP count '
+                f'unrepresentable as a finite float.') from None
         # Sliding window: causal window — query t attends to positions
         # [max(0, t-w+1), t], i.e. min(t+1, w) keys (NOT w keys for every
         # query). Total causal-window entries = T*w - w*(w-1)/2 when

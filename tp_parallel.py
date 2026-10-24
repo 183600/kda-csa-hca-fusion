@@ -1081,6 +1081,20 @@ def _geo_from_cfg(cfg: HybridConfig) -> dict:
     )
 
 
+def _finite_float(name: str, value) -> float:
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'layer_flops_split: {name}={value!r} must be representable as '
+            f'a finite float.') from None
+    if not math.isfinite(number):
+        raise ValueError(
+            f'layer_flops_split: {name}={value!r} must be representable as '
+            f'a finite float.')
+    return number
+
+
 def layer_flops_split(cfg: HybridConfig, kind: str, T: int) -> dict:
     """Split one layer's prefill FLOPs into replicated / head-scaled work.
 
@@ -1101,6 +1115,16 @@ def layer_flops_split(cfg: HybridConfig, kind: str, T: int) -> dict:
         raise ValueError(
             f'layer_flops_split: T={T!r} must be representable as a finite '
             f'float.') from None
+    if kind not in ('kda', 'csa', 'hca'):
+        raise NotImplementedError(
+            f'layer_flops_split: kind {kind!r} is not supported.')
+    try:
+        canonical_value = prefill_flops(kind, T, **_geo_from_cfg(cfg))
+    except OverflowError:
+        raise ValueError(
+            f'layer_flops_split: T={T!r} makes the canonical prefill FLOPs '
+            f'unrepresentable as a finite float.') from None
+    canonical = _finite_float('canonical prefill_flops', canonical_value)
     cfg_d, H, K, V = cfg.d_model, cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v
     HV = cfg.n_heads_v
     if kind == 'kda':
@@ -1164,12 +1188,9 @@ def layer_flops_split(cfg: HybridConfig, kind: str, T: int) -> dict:
             'compress': compress, 'w_dq': w_dq, 'w_uq': w_uq,
             'core': core, 'sliding_window': sw, 'out_proj': out_proj,
         }
-    else:
-        raise NotImplementedError(
-            f'layer_flops_split: kind {kind!r} is not supported.')
     total = replicated + sharded
-    canonical = float(prefill_flops(kind, T, **_geo_from_cfg(cfg)))
-    if abs(total - canonical) > max(1e-6, 1e-9 * abs(canonical)):
+    total_float = _finite_float('split total', total)
+    if abs(total_float - canonical) > max(1e-6, 1e-9 * abs(canonical)):
         raise RuntimeError(
             f'layer_flops_split: {kind} split total {total} does not match '
             f'the canonical prefill_flops {canonical}; the FLOP model and '
