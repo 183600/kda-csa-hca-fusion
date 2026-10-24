@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import platform
 import sys
@@ -208,6 +209,20 @@ def _core_accounting(op: str, T: int, w: dict) -> tuple[float, float]:
     return flops, nbytes
 
 
+def _finite_float(name: str, value) -> float:
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'run_roofline: {name}={value!r} must be representable as a '
+            f'finite float.') from None
+    if not math.isfinite(number):
+        raise ValueError(
+            f'run_roofline: {name}={value!r} must be representable as a '
+            f'finite float.')
+    return number
+
+
 def _e2e_accounting(op: str, T: int, w: dict,
                     param_elements: int | None) -> tuple[float, float, bool]:
     """(flops, bytes, weights_included) for end-to-end CSA/HCA/hybrid rows.
@@ -227,7 +242,7 @@ def _e2e_accounting(op: str, T: int, w: dict,
         geo, kv_op = _hybrid_mamba2_geometry(w), 'hybrid_mamba2'
     else:
         geo, kv_op = _hybrid_geometry(w), 'hybrid_kch'
-    flops = float(prefill_flops(kv_op, T, **geo))
+    flops = _finite_float('prefill FLOPs', prefill_flops(kv_op, T, **geo))
     io_elements = 2 * T * w['d']
     state_elements = kv_cache_elements(kv_op, T, mode='compressed_kv_only',
                                        **geo)

@@ -267,6 +267,10 @@ def test_roofline_rejects_unrepresentable_geometry():
         ('ridge_point', lambda: roofline.ridge_point(huge, 100.0)),
         ('roofline_point', lambda: roofline.roofline_point(
             flops=1.0, nbytes=1.0, time_ms=huge)),
+        ('account_row hca', lambda: _account_row({
+            'op': 'hca', 'T': huge, 'param_elements': None,
+            'workload': {'d': 64, 'm2': 8, 'heads': 2, 'c': 16,
+                         'dc': 32, 'sliding_window': 8}})),
     ]
     for name, call in cases:
         raised = False
