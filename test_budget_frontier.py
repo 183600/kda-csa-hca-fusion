@@ -187,6 +187,22 @@ def test_op_and_layout_dispatch():
         except ValueError:
             raised = True
         _ok(f'oversized {label} rejected', raised, '')
+    # A representable context can still overflow a derived pair count; that
+    # is a malformed geometry, not an OverflowError from int-to-float.
+    long_t = 10 ** 200
+    for label, call in (
+            ('softmax', lambda: kv_budget.softmax_read_elements(
+                10 ** 308, 2, 16, 16)),
+            ('CSA', lambda: kv_budget.csa_read_elements(
+                long_t, m=4, topk=2, c=32, c_i=16)),
+            ('HCA', lambda: kv_budget.hca_read_elements(
+                long_t, m2=8, c=32))):
+        raised = False
+        try:
+            call()
+        except ValueError:
+            raised = True
+        _ok(f'overflowing long-context {label} rejected', raised, '')
     for name, fn, kwargs in (
             ('CSA', kv_budget.csa_read_elements,
              dict(T=16, m=4, topk=2, c=32, c_i=16)),

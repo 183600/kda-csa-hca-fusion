@@ -95,6 +95,27 @@ def _validate_positive(value: int, name: str, fn_name: str) -> None:
             f'got {value!r}') from None
 
 
+def _finite_scaled(fn_name: str, label: str, count, factor) -> float:
+    try:
+        value = count * float(factor)
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: {label} is unrepresentable as a finite float for '
+            f'count={count!r} and scale={factor!r}') from None
+    if not math.isfinite(value):
+        raise ValueError(
+            f'{fn_name}: {label} is unrepresentable as a finite float for '
+            f'count={count!r} and scale={factor!r}')
+    return value
+
+
+def _finite_total(fn_name: str, label: str, value: float) -> float:
+    if not math.isfinite(value):
+        raise ValueError(
+            f'{fn_name}: {label} is unrepresentable as a finite float')
+    return value
+
+
 def sliding_window_entries(T: int, window: int) -> int:
     """Sum over queries of ``min(t + 1, window)`` window entries.
 
@@ -120,7 +141,13 @@ def softmax_read_elements(T: int, n_kv_heads: int, d_k: int, d_v: int) -> float:
     if T == 0:
         return 0.0
     # Query t reads t+1 key/value pairs (inclusive causal), averaged over T.
-    return (T + 1) / 2.0 * n_kv_heads * (d_k + d_v)
+    try:
+        value = (T + 1) / 2.0 * n_kv_heads * (d_k + d_v)
+    except OverflowError:
+        raise ValueError(
+            f'softmax_read_elements: derived read count is unrepresentable '
+            f'as a finite float for T={T!r}') from None
+    return _finite_total('softmax_read_elements', 'derived read count', value)
 
 
 def kda_state_elements(hv: int, d_k: int, d_v: int) -> int:
@@ -155,7 +182,8 @@ def mamba2_read_elements(T: int, nheads: int, headdim: int,
     _validate_T(T, 'mamba2_read_elements')
     if T == 0:
         return 0.0
-    return 2.0 * mamba2_state_elements(nheads, headdim, d_state)
+    return _finite_scaled('mamba2_read_elements', 'derived read count',
+                          2, mamba2_state_elements(nheads, headdim, d_state))
 
 
 def kda_read_elements(T: int, hv: int, d_k: int, d_v: int) -> float:
@@ -170,7 +198,8 @@ def kda_read_elements(T: int, hv: int, d_k: int, d_v: int) -> float:
     _validate_T(T, 'kda_read_elements')
     if T == 0:
         return 0.0
-    return 2.0 * kda_state_elements(hv, d_k, d_v)
+    return _finite_scaled('kda_read_elements', 'derived read count',
+                          2, kda_state_elements(hv, d_k, d_v))
 
 
 def csa_read_elements(T: int, *, m: int, topk: int, c: int, c_i: int,
@@ -204,17 +233,26 @@ def csa_read_elements(T: int, *, m: int, topk: int, c: int, c_i: int,
         return {'selected_read_elements': 0.0, 'window_read_elements': 0.0,
                 'core_read_elements': 0.0, 'indexer_read_elements': 0.0,
                 'total_read_elements': 0.0}
-    selected = causal_selected_entries(T, m, topk) * float(c)
-    window = (sliding_window_entries(T, sliding_window) * float(c)
-              if sliding_window > 0 else 0.0)
-    indexer = causal_block_entries(T, m) * float(c_i) * n_idx_heads
-    core = selected + window
+    selected = _finite_scaled(
+        'csa_read_elements', 'selected read count',
+        causal_selected_entries(T, m, topk), c)
+    window = (_finite_scaled(
+        'csa_read_elements', 'window read count',
+        sliding_window_entries(T, sliding_window), c)
+        if sliding_window > 0 else 0.0)
+    indexer = _finite_total(
+        'csa_read_elements', 'indexer read count',
+        _finite_scaled('csa_read_elements', 'indexer read count',
+                       causal_block_entries(T, m), c_i) * n_idx_heads)
+    core = _finite_total('csa_read_elements', 'core read count',
+                         selected + window)
     return {
         'selected_read_elements': selected / T,
         'window_read_elements': window / T,
         'core_read_elements': core / T,
         'indexer_read_elements': indexer / T,
-        'total_read_elements': (core + indexer) / T,
+        'total_read_elements': _finite_total(
+            'csa_read_elements', 'total read count', core + indexer) / T,
     }
 
 
@@ -237,10 +275,15 @@ def hca_read_elements(T: int, *, m2: int, c: int,
         return {'dense_read_elements': 0.0, 'window_read_elements': 0.0,
                 'core_read_elements': 0.0, 'indexer_read_elements': 0.0,
                 'total_read_elements': 0.0}
-    dense = causal_block_entries(T, m2) * float(c)
-    window = (sliding_window_entries(T, sliding_window) * float(c)
-              if sliding_window > 0 else 0.0)
-    core = dense + window
+    dense = _finite_scaled(
+        'hca_read_elements', 'dense read count',
+        causal_block_entries(T, m2), c)
+    window = (_finite_scaled(
+        'hca_read_elements', 'window read count',
+        sliding_window_entries(T, sliding_window), c)
+        if sliding_window > 0 else 0.0)
+    core = _finite_total('hca_read_elements', 'core read count',
+                         dense + window)
     return {
         'dense_read_elements': dense / T,
         'window_read_elements': window / T,
