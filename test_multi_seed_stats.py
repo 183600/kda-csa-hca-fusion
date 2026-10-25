@@ -219,6 +219,16 @@ def test_permutation_test_monte_carlo_is_deterministic_and_rng_isolated():
     assert isinstance(third['p_value'], float)
 
 
+def test_permutation_test_caps_exact_enumeration_for_huge_max_exact():
+    diffs = [0.01 * (i - 10) for i in range(21)]
+    report = M.permutation_test(diffs, n_permutations=200, seed=5,
+                                max_exact=10 ** 400)
+    assert report['method'] == 'monte_carlo'
+    assert report['n_permutations'] == 200
+    assert 0.0 < report['p_value'] <= 1.0
+    json.dumps(report, allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # Holm-Bonferroni step-down
 # ---------------------------------------------------------------------------

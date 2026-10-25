@@ -153,6 +153,7 @@ _MAX_BETACF_ITER = 200
 _BETACF_EPS = 3.0e-14
 _FPMIN = 1.0e-300
 _NORMAL_T_DOF = 1_000_000_000
+_MAX_EXACT_PERMUTATION_BITS = 20
 
 
 def _sqrt_count(n: int) -> float:
@@ -1192,10 +1193,12 @@ def permutation_test(diffs, alternative: str = 'two-sided',
     Under the null that the per-seed differences are symmetric around
     zero, the signs are exchangeable; the test statistic is the mean of
     the signed differences. For ``n <= max_exact`` every ``2^n`` sign
-    assignment is enumerated (exact test). For larger n a deterministic
-    Monte-Carlo sample is drawn from a *local* RNG seeded with ``seed``
-    (the global RNG stream is never touched), with the standard +1
-    correction so the p-value can never be 0.
+    assignment is enumerated (exact test), up to a hard resource cap of
+    ``2**20`` assignments; a larger ``max_exact`` cannot turn an otherwise
+    Monte-Carlo-sized seed count into an unbounded enumeration. For larger
+    n a deterministic Monte-Carlo sample is drawn from a *local* RNG
+    seeded with ``seed`` (the global RNG stream is never touched), with
+    the standard +1 correction so the p-value can never be 0.
 
     This is the assumption-lightest test in the panel: no normality, no
     scale assumption, exact for small n. Ties (``|stat| >= |observed|``)
@@ -1243,7 +1246,7 @@ def permutation_test(diffs, alternative: str = 'two-sided',
             return stat >= observed or _same_stat(stat, observed)
         return stat <= observed or _same_stat(stat, observed)
 
-    if n <= max_exact:
+    if n <= max_exact and n <= _MAX_EXACT_PERMUTATION_BITS:
         n_perm = 2 ** n
         hits = 0
         for mask in range(n_perm):
