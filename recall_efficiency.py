@@ -84,6 +84,22 @@ def chance_corrected_recall(accuracy, chance):
     return (acc - base) / (1.0 - base)
 
 
+def _per_megabyte(value, nbytes):
+    """Divide by the byte count in decimal MB, keeping the result JSON-safe.
+
+    A positive subnormal byte count can underflow to zero when expressed in
+    MB (``5e-324 / 1e6``), and a tiny non-zero denominator can overflow the
+    quotient to ``+inf``.  Neither is a meaningful efficiency, so both map
+    to ``None`` instead of raising ``ZeroDivisionError`` or emitting a
+    non-finite value.
+    """
+    megabytes = nbytes / _BYTES_PER_MB
+    if megabytes <= 0.0:
+        return None
+    result = value / megabytes
+    return result if math.isfinite(result) else None
+
+
 def recall_per_megabyte(accuracy, chance, bytes_per_token):
     """Chance-corrected recall per decimal MB of per-token decode traffic.
 
@@ -96,7 +112,7 @@ def recall_per_megabyte(accuracy, chance, bytes_per_token):
     nbytes = _finite_or_none(bytes_per_token)
     if skill is None or nbytes is None or nbytes <= 0.0:
         return None
-    return skill / (nbytes / _BYTES_PER_MB)
+    return _per_megabyte(skill, nbytes)
 
 
 def decode_traffic_fields(traffic: Mapping) -> dict:
@@ -235,7 +251,7 @@ def annotate_recall_efficiency(rows: Sequence[dict], *,
             'decode_bytes_per_token': nbytes,
             'chance_corrected_recall': skill,
             'recall_per_megabyte': recall_per_megabyte(acc, base, nbytes),
-            'accuracy_per_megabyte': acc / (nbytes / _BYTES_PER_MB),
+            'accuracy_per_megabyte': _per_megabyte(acc, nbytes),
         }
 
     names = list(points)
