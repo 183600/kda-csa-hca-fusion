@@ -478,6 +478,18 @@ def instant_read_elements(op: str, t: int, spec: dict) -> dict:
             **_instant_op_components(op, t, spec[op])}
 
 
+def _window_mean_count(fn_name: str, label: str, total: int,
+                       dt: int, scale=1) -> float:
+    """Mean per-token count over an integer window, then scaled."""
+    try:
+        count = total / dt
+    except OverflowError:
+        raise ValueError(
+            f'{fn_name}: {label} is unrepresentable as a finite float for '
+            f'a window of {dt!r} positions') from None
+    return _finite_scaled(fn_name, label, count, scale)
+
+
 def windowed_read_elements(op: str, t0: int, t1: int, spec: dict) -> dict:
     """Mean marginal budget over decode positions ``t0 <= t < t1``.
 
@@ -487,9 +499,11 @@ def windowed_read_elements(op: str, t0: int, t1: int, spec: dict) -> dict:
     ``T`` tokens) it gives the budget the measured per-token decode latency
     should be compared against.
 
-    Computed in O(1) as ``(t1 * avg(t1) - t0 * avg(t0)) / (t1 - t0)`` from
-    the closed-form averaged functions, which is exact because every
-    component is additive over positions.
+    Computed in O(1) from the exact integer window sums. The previous
+    ``(t1 * avg(t1) - t0 * avg(t0)) / (t1 - t0)`` form overflowed to
+    ``inf - inf`` for long contexts even when the window mean was finite,
+    and lost the small window increment to cancellation when ``t0`` and
+    ``t1`` were large and close together.
     """
     _validate_t(t0, 'windowed_read_elements')
     _validate_t(t1, 'windowed_read_elements')
@@ -497,16 +511,92 @@ def windowed_read_elements(op: str, t0: int, t1: int, spec: dict) -> dict:
         raise ValueError(
             f'windowed_read_elements: need 0 <= t0 < t1, got '
             f't0={t0!r}, t1={t1!r}')
-    row0 = op_read_elements(op, t0, spec)
     row1 = op_read_elements(op, t1, spec)
+    if t0 == 0:
+        return {key: value for key, value in row1.items()
+                if key not in ('op', 'T')} | {'op': op, 't0': int(t0),
+                                               't1': int(t1)}
+    dt = t1 - t0
+    geo = spec[op]
     out = {'op': op, 't0': int(t0), 't1': int(t1),
            'state_elements': row1['state_elements']}
-    for key, v1 in row1.items():
-        if key in ('op', 'T', 'state_elements'):
-            continue
-        out[key] = _finite_total(
-            'windowed_read_elements', f'windowed {key}',
-            (t1 * float(v1) - t0 * float(row0[key])) / (t1 - t0))
+    if op == 'softmax':
+        positions = (t0 + t1 + 1) * dt // 2
+        total = positions * geo['n_kv_heads'] * (geo['d_k'] + geo['d_v'])
+        core = _window_mean_count(
+            'windowed_read_elements', 'softmax core read count', total, dt)
+        out.update({'core_read_elements': core,
+                    'indexer_read_elements': 0.0,
+                    'total_read_elements': core})
+        return out
+    if op == 'kda':
+        core = _window_mean_count(
+            'windowed_read_elements', 'KDA core read count',
+            dt * 2 * kda_state_elements(
+                geo['hv'], geo['d_k'], geo['d_v']), dt)
+        out.update({'core_read_elements': core,
+                    'indexer_read_elements': 0.0,
+                    'total_read_elements': core})
+        return out
+    if op == 'mamba2':
+        core = _window_mean_count(
+            'windowed_read_elements', 'Mamba-2 core read count',
+            dt * 2 * mamba2_state_elements(
+                geo['nheads'], geo['headdim'], geo['d_state']), dt)
+        out.update({'core_read_elements': core,
+                    'indexer_read_elements': 0.0,
+                    'total_read_elements': core})
+        return out
+    if op == 'csa':
+        selected = _window_mean_count(
+            'windowed_read_elements', 'CSA selected read count',
+            causal_selected_entries(t1, geo['m'], geo['topk'])
+            - causal_selected_entries(t0, geo['m'], geo['topk']),
+            dt, geo['c'])
+        window = (_window_mean_count(
+            'windowed_read_elements', 'CSA window read count',
+            sliding_window_entries(t1, geo['sliding_window'])
+            - sliding_window_entries(t0, geo['sliding_window']),
+            dt, geo['c'])
+            if geo.get('sliding_window', 0) > 0 else 0.0)
+        indexer = _window_mean_count(
+            'windowed_read_elements', 'CSA indexer read count',
+            causal_block_entries(t1, geo['m'])
+            - causal_block_entries(t0, geo['m']),
+            dt, geo['c_i'] * geo.get('n_idx_heads', 1))
+        core = _finite_total(
+            'windowed_read_elements', 'CSA core read count',
+            selected + window)
+        out.update({
+            'selected_read_elements': selected,
+            'window_read_elements': window,
+            'core_read_elements': core,
+            'indexer_read_elements': indexer,
+            'total_read_elements': _finite_total(
+                'windowed_read_elements', 'CSA total read count',
+                core + indexer),
+        })
+        return out
+    dense = _window_mean_count(
+        'windowed_read_elements', 'HCA dense read count',
+        causal_block_entries(t1, geo['m2'])
+        - causal_block_entries(t0, geo['m2']),
+        dt, geo['c'])
+    window = (_window_mean_count(
+        'windowed_read_elements', 'HCA window read count',
+        sliding_window_entries(t1, geo['sliding_window'])
+        - sliding_window_entries(t0, geo['sliding_window']),
+        dt, geo['c'])
+        if geo.get('sliding_window', 0) > 0 else 0.0)
+    core = _finite_total(
+        'windowed_read_elements', 'HCA core read count', dense + window)
+    out.update({
+        'dense_read_elements': dense,
+        'window_read_elements': window,
+        'core_read_elements': core,
+        'indexer_read_elements': 0.0,
+        'total_read_elements': core,
+    })
     return out
 
 
@@ -629,18 +719,14 @@ def windowed_layout_read_elements(ratio, t0: int, t1: int,
         raise ValueError(
             f'windowed_layout_read_elements: need 0 <= t0 < t1, got '
             f't0={t0!r}, t1={t1!r}')
-    row0 = layout_read_elements(t0, ratio, spec, memory_op=memory_op)
-    row1 = layout_read_elements(t1, ratio, spec, memory_op=memory_op)
-    out = {'t0': int(t0), 't1': int(t1), 'n_memory': row1['n_memory'],
-           'n_kda': row1['n_kda'], 'n_mamba2': row1['n_mamba2'],
-           'n_csa': row1['n_csa'], 'n_hca': row1['n_hca'],
-           'memory_op': memory_op}
-    for key in ('memory_read_elements', 'kda_read_elements',
-                'mamba2_read_elements', 'csa_read_elements',
-                'hca_read_elements', 'total_read_elements'):
-        out[key] = _finite_total(
-            'windowed_layout_read_elements', f'windowed {key}',
-            (t1 * row1[key] - t0 * row0[key]) / (t1 - t0))
+    n_kda, n_csa, n_hca = _validate_ratio(
+        ratio, 'windowed_layout_read_elements')
+    per_layer = {
+        op: windowed_read_elements(op, t0, t1, spec)['total_read_elements']
+        for op in ('csa', 'hca', memory_op)}
+    out = _layout_row('t0', int(t0), n_kda, n_csa, n_hca, per_layer,
+                      memory_op, fn_name='windowed_layout_read_elements')
+    out['t1'] = int(t1)
     return out
 
 

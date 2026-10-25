@@ -199,8 +199,6 @@ def test_op_and_layout_dispatch():
                 long_t, m2=8, c=32)),
             ('layout ratio', lambda: kv_budget.layout_read_elements(
                 16, (10 ** 308, 0, 0), spec)),
-            ('windowed KDA', lambda: kv_budget.windowed_read_elements(
-                'kda', 0, 10 ** 308, spec)),
             ('windowed layout', lambda:
                 kv_budget.windowed_layout_read_elements(
                     (3, 0, 0), 0, 10 ** 308, spec))):
@@ -210,6 +208,15 @@ def test_op_and_layout_dispatch():
         except ValueError:
             raised = True
         _ok(f'overflowing long-context {label} rejected', raised, '')
+    # The windowed mean is computed from exact integer window sums, so the
+    # constant KDA term survives a context where the old t*avg(t)
+    # intermediates overflowed to inf - inf.
+    win_kda = kv_budget.windowed_read_elements(
+        'kda', 0, 10 ** 308, spec)
+    _ok('long-context windowed KDA is the finite steady state',
+        win_kda['total_read_elements']
+        == kv_budget.op_read_elements('kda', 1, spec)['total_read_elements'],
+        f"{win_kda['total_read_elements']}")
     # The marginal form multiplies the position by the per-token geometry;
     # a position whose averaged count is still finite can therefore make
     # the marginal total unrepresentable. That must be a ValueError like
@@ -376,6 +383,19 @@ def test_windowed_budget_matches_instant_sums():
                 avg = kv_budget.op_read_elements(op, t1, spec)
                 _ok(f'{op} [0,{t1}): windowed == averaged prefill',
                     all(abs(win[k] - avg[k]) < 1e-9 for k in keys), '')
+    # A one-position window at a huge offset must equal the marginal step.
+    # The old endpoint-difference formula cancelled to 0.0 (or inf - inf)
+    # because t and t+1 round to the same float / their products overflow.
+    for op in kv_budget._BUDGET_OPS:
+        t0 = 10 ** 100
+        win = kv_budget.windowed_read_elements(op, t0, t0 + 1, spec)
+        direct = kv_budget.instant_read_elements(op, t0, spec)
+        bad = [k for k, v in direct.items()
+               if k not in ('op', 't') and isinstance(v, (int, float))
+               and not isinstance(v, bool)
+               and not math.isclose(win[k], v, rel_tol=1e-12, abs_tol=0.0)]
+        _ok(f'{op} huge one-position window == marginal step',
+            not bad, f'{bad}')
     ratio = (3, 1, 1)
     wl = kv_budget.windowed_layout_read_elements(ratio, 4, 20, spec)
     lay = kv_budget.layout_read_elements(20, ratio, spec)
