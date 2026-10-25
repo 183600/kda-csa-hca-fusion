@@ -416,9 +416,17 @@ def summarize_gradient_norms(grad_norms, *, clip_norm: float | None = None
         if clip is not None and math.isfinite(clip) and clip > 0:
             out['clip_norm'] = clip
             out['n_above_clip'] = sum(1 for v in finite if v > clip)
-            out['max_over_clip'] = out['max'] / clip
+            ratio = out['max'] / clip
+            out['max_over_clip'] = ratio if math.isfinite(ratio) else None
             out['n_over_10x_clip'] = sum(1 for v in finite if v > 10.0 * clip)
-            if out['max_over_clip'] > 10.0:
+            if out['max_over_clip'] is None:
+                # A positive subnormal clip can overflow the ratio even
+                # though every input is finite; keep the report JSON-safe.
+                out['notes'].append(
+                    f'peak gradient norm is beyond the float range of the '
+                    f'clip budget: clipping is masking an explosion, not '
+                    f'just stabilizing a healthy step.')
+            elif out['max_over_clip'] > 10.0:
                 out['notes'].append(
                     f"peak gradient norm is {out['max_over_clip']:.1f}x the "
                     f'clip budget: clipping is masking an explosion, not '
@@ -463,8 +471,8 @@ def accuracy_regime(val_accs: Sequence[float],
             return None
         vals.append(number)
     head_k = max(1, len(vals) // 5)
-    val_head = sum(vals[:head_k]) / head_k
-    val_tail = sum(vals[-head_k:]) / head_k
+    val_head = _finite_safe_mean(vals[:head_k])
+    val_tail = _finite_safe_mean(vals[-head_k:])
     out = {
         'val_acc_head_mean': val_head,
         'val_acc_tail_mean': val_tail,
@@ -489,8 +497,10 @@ def accuracy_regime(val_accs: Sequence[float],
         train = [_finite_float_or_none(v) for v in train_accs]
         if all(v is not None for v in train):
             t_head_k = max(1, len(train) // 5)
-            out['train_acc_head_mean'] = sum(train[:t_head_k]) / t_head_k
-            out['train_acc_tail_mean'] = sum(train[-t_head_k:]) / t_head_k
+            out['train_acc_head_mean'] = _finite_safe_mean(
+                train[:t_head_k])
+            out['train_acc_tail_mean'] = _finite_safe_mean(
+                train[-t_head_k:])
             out['train_acc_still_rising'] = bool(
                 out['train_acc_tail_mean'] > out['train_acc_head_mean'])
     return out

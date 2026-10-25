@@ -84,6 +84,13 @@ def test_gradient_norm_summary_names_masked_explosions():
                                                 'tail_mean'))
     json.dumps(huge, allow_nan=False)
 
+    # A subnormal clip budget can overflow the max-over-clip ratio.
+    subnormal = float.fromhex('0x0.0000000000001p-1022')
+    extreme = summarize_gradient_norms([1e308], clip_norm=subnormal)
+    assert extreme['max_over_clip'] is None
+    assert any('beyond the float range' in n for n in extreme['notes'])
+    json.dumps(extreme, allow_nan=False)
+
     assert summarize_gradient_norms([]) is None
     dead = summarize_gradient_norms([float('nan')], clip_norm=1.0)
     assert dead['max'] is None
@@ -283,6 +290,15 @@ def test_accuracy_regime_skips_oversized_or_missing_values():
     regime = accuracy_regime([0.2, 0.3], [0.1, None], ceiling=0.5)
     assert 'train_acc_head_mean' not in regime
     json.dumps(regime, allow_nan=False)
+
+    # Finite values near the float limit must not overflow the head/tail
+    # means; ten samples make the window wider than one.
+    extreme = accuracy_regime([1e308] * 10, [1e308] * 10, ceiling=1e308)
+    assert extreme['val_acc_head_mean'] == 1e308
+    assert extreme['val_acc_tail_mean'] == 1e308
+    assert extreme['train_acc_head_mean'] == 1e308
+    assert extreme['train_acc_tail_mean'] == 1e308
+    json.dumps(extreme, allow_nan=False)
 
 
 def test_train_lm_accuracy_regime_reports_optimizer_step_not_index():
