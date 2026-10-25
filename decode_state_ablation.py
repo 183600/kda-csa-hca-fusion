@@ -72,11 +72,16 @@ def _validate_tol(tol, caller: str):
     if isinstance(tol, bool) or not isinstance(tol, (int, float)):
         raise TypeError(
             f'{caller}: tol must be a real number, got {tol!r}.')
-    value = float(tol)
+    try:
+        value = float(tol)
+    except OverflowError:
+        raise ValueError(
+            f'{caller}: tol must be representable as a finite float, '
+            f'got {tol!r}.') from None
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(
             f'{caller}: tol must be finite and >= 0, got {tol!r}.')
-    return tol
+    return value
 
 
 def available_state_parts(decoder) -> dict:

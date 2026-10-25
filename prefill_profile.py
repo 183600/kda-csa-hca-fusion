@@ -116,7 +116,12 @@ def _positive_int(value, what: str) -> int:
 def _nonnegative_tolerance(value, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f'{name} must be a real number, got {value!r}')
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'{name} must be representable as a finite float, '
+            f'got {value!r}') from None
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(f'{name} must be finite and >= 0, got {value!r}')
     return value

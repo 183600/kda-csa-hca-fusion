@@ -455,6 +455,35 @@ def test_consistency_metrics_start_validation():
         ok['n_positions'] == 3 and ok['consistent'], f'{ok}')
 
 
+def test_consistency_metrics_tolerance_validation():
+    """A malformed tolerance must fail loudly, not poison the JSON report.
+
+    Previously ``tolerance=10**400`` leaked ``OverflowError``, ``nan`` was
+    serialized into a report destined for strict JSON, and a negative value
+    silently certified nothing as consistent.
+    """
+    a = torch.zeros(1, 3, 5)
+    b = torch.zeros(1, 3, 5)
+    for bad in (True, '1e-4', None):
+        try:
+            lm_consistency.consistency_metrics(a, b, tolerance=bad)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f'tolerance={bad!r} accepted')
+    for bad in (-1e-4, float('inf'), float('nan'), 10 ** 400):
+        try:
+            lm_consistency.consistency_metrics(a, b, tolerance=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'tolerance={bad!r} accepted')
+    zero = lm_consistency.consistency_metrics(a, b, tolerance=0)
+    assert zero['tolerance'] == 0.0
+    assert zero['consistent'] is False
+    json.dumps(zero, allow_nan=False)
+
+
 def test_decode_roofline_host_peaks_fallback():
     """``host_peaks`` measures on-host and labels the source; explicit wins."""
     print("\nTest: decode roofline host peaks resolution")
@@ -470,6 +499,7 @@ def test_decode_roofline_host_peaks_fallback():
 _TEST_FUNCS = [
     test_lm_prefill_decode_consistency,
     test_consistency_metrics_start_validation,
+    test_consistency_metrics_tolerance_validation,
     test_selection_diagnostic,
     test_decode_roofline_accounting,
     test_decode_elements_reject_unrepresentable_memory_geometry,

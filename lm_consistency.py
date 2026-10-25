@@ -658,6 +658,28 @@ def _elapsed_ms(start: float) -> float:
     return (time.perf_counter() - start) * 1e3
 
 
+def _validate_tolerance(tolerance, caller: str) -> float:
+    """Reject bools, non-reals and non-finite/negative tolerances.
+
+    JSON integers are unbounded; a value too large for ``float()`` is a
+    malformed numeric input, not a reason to leak ``OverflowError``.
+    """
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError(
+            f'{caller}: tolerance must be a real number, got {tolerance!r}.')
+    try:
+        value = float(tolerance)
+    except OverflowError:
+        raise ValueError(
+            f'{caller}: tolerance must be representable as a finite float, '
+            f'got {tolerance!r}.') from None
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f'{caller}: tolerance must be finite and >= 0, got '
+            f'{tolerance!r}.')
+    return value
+
+
 def consistency_metrics(logits_full: torch.Tensor, logits_inc: torch.Tensor,
                         *, start: int = 0, tolerance: float = DEFAULT_TOLERANCE
                         ) -> dict:
@@ -668,6 +690,7 @@ def consistency_metrics(logits_full: torch.Tensor, logits_inc: torch.Tensor,
     position and averaged over batch. ``consistent`` is the tolerance
     verdict on the max abs drift.
     """
+    tolerance = _validate_tolerance(tolerance, 'consistency_metrics')
     if logits_full.shape != logits_inc.shape:
         raise ValueError(
             f'consistency_metrics: shape mismatch '
@@ -692,7 +715,7 @@ def consistency_metrics(logits_full: torch.Tensor, logits_inc: torch.Tensor,
         'max_abs_logit_diff': max_abs,
         'mean_abs_logit_diff': float(diff.mean().item()),
         'top1_agreement': float(top1.item()),
-        'tolerance': float(tolerance),
+        'tolerance': tolerance,
         'consistent': max_abs < tolerance,
     }
 
@@ -728,6 +751,7 @@ def run_lm_consistency_check(model, input_ids, *, prefill_len: int | None = None
     * ``'state_or_math_divergence'``: drift above tolerance while the
       selections still agree — investigate the incremental caches.
     """
+    tolerance = _validate_tolerance(tolerance, 'run_lm_consistency_check')
     cfg, _hybrid = _tower(model)
     out = prefill_decode_tower_outputs(
         model, input_ids, prefill_len=prefill_len, device=device,
@@ -761,7 +785,7 @@ def run_lm_consistency_check(model, input_ids, *, prefill_len: int | None = None
         'top1_agreement': all_pos['top1_agreement'],
         'decode_max_abs_logit_diff': decode_pos['max_abs_logit_diff'],
         'decode_top1_agreement': decode_pos['top1_agreement'],
-        'tolerance': float(tolerance),
+        'tolerance': tolerance,
         'consistent': all_pos['consistent'],
     }
     report['prefill_full_ms'] = out['prefill_full_ms']

@@ -670,7 +670,7 @@ def test_decode_state_ablation_defaults_to_owned_parts(device):
         with pytest.raises(TypeError):
             decode_state_ablation(
                 decoder, x, prefill_len=2, tol=bad)
-    for bad in (-1.0, float('inf'), float('nan')):
+    for bad in (-1.0, float('inf'), float('nan'), 10 ** 400):
         with pytest.raises(ValueError):
             decode_state_ablation(
                 decoder, x, prefill_len=2, tol=bad)
@@ -809,6 +809,6 @@ def test_decode_causality_audit_nonfinite_suffix_is_json_safe():
     for bad in (True, '1e-5', None):
         with pytest.raises(TypeError):
             decode_causality_audit(_NaNSuffixDecoder(), x, cut=3, tol=bad)
-    for bad in (-1.0, float('inf'), float('nan')):
+    for bad in (-1.0, float('inf'), float('nan'), 10 ** 400):
         with pytest.raises(ValueError):
             decode_causality_audit(_NaNSuffixDecoder(), x, cut=3, tol=bad)

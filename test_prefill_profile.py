@@ -110,7 +110,7 @@ def test_profile_rejects_invalid_tolerances():
         with pytest.raises(TypeError):
             profile_prefill_schedules(model, x, ['full'], repeats=1,
                                       warmup=0, rtol=bad)
-    for bad in (-1.0, float('inf'), float('nan')):
+    for bad in (-1.0, float('inf'), float('nan'), 10 ** 400):
         with pytest.raises(ValueError):
             profile_prefill_schedules(model, x, ['full'], repeats=1,
                                       warmup=0, atol=bad)
