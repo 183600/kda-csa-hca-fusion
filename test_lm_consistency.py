@@ -432,6 +432,55 @@ def test_decode_roofline_rejects_unrepresentable_geometry():
             detail)
 
 
+def test_decode_roofline_rejects_invalid_peaks_and_time():
+    """Machine anchors and measured latency must be usable JSON numbers."""
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8, n_kda=1, n_csa=0, n_hca=0)
+    for name, kwargs in (
+            ('peak_tflops huge', {'peak_tflops': 10 ** 400}),
+            ('peak_tflops nan', {'peak_tflops': float('nan')}),
+            ('peak_tflops zero', {'peak_tflops': 0.0}),
+            ('peak_bw negative', {'peak_bw_gbps': -1.0}),
+            ('measured time huge', {'measured_decode_ms_per_token': 10 ** 400}),
+            ('measured time inf',
+             {'measured_decode_ms_per_token': float('inf')}),
+            ('measured time negative',
+             {'measured_decode_ms_per_token': -1.0}),
+    ):
+        try:
+            lm_consistency.decode_roofline(cfg, 16, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'{name} accepted')
+    point = lm_consistency.decode_roofline(
+        cfg, 16, measured_decode_ms_per_token=0.5,
+        peak_tflops=1.0, peak_bw_gbps=100.0)
+    json.dumps(point, allow_nan=False)
+    assert point['peak_tflops'] == 1.0
+    assert point['peak_bw_gbps'] == 100.0
+
+
+def test_prefill_len_is_an_exact_int():
+    """``prefill_len`` must be an int in range, not bool/float."""
+    class _Model:
+        pass
+    model = _Model()
+    for bad, exc in ((True, TypeError), (2.0, TypeError), (0, ValueError),
+                     (4, ValueError), (10 ** 400, ValueError)):
+        try:
+            lm_consistency.prefill_decode_tower_outputs(
+                model, torch.zeros(1, 3, 5), prefill_len=bad)
+        except exc:
+            pass
+        except Exception as e:
+            raise AssertionError(
+                f'prefill_len={bad!r} raised {type(e).__name__}: {e}')
+        else:
+            raise AssertionError(f'prefill_len={bad!r} accepted')
+
+
 def test_consistency_metrics_start_validation():
     """``start`` must be a non-negative exact int.
 
@@ -500,6 +549,8 @@ _TEST_FUNCS = [
     test_lm_prefill_decode_consistency,
     test_consistency_metrics_start_validation,
     test_consistency_metrics_tolerance_validation,
+    test_decode_roofline_rejects_invalid_peaks_and_time,
+    test_prefill_len_is_an_exact_int,
     test_selection_diagnostic,
     test_decode_roofline_accounting,
     test_decode_elements_reject_unrepresentable_memory_geometry,

@@ -77,6 +77,23 @@ def _preset_for_device(device: str) -> dict | None:
     return roofline.spec_for_device(name)
 
 
+def _validate_positive_peak(value, name: str) -> float:
+    """Reject bools, non-reals and non-finite/non-positive machine peaks."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'host_peaks: {name} must be finite and positive, '
+                         f'got {value!r}')
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'host_peaks: {name} must be representable as a finite float, '
+            f'got {value!r}') from None
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f'host_peaks: {name} must be finite and positive, '
+                         f'got {value!r}')
+    return number
+
+
 def host_peaks(device: str = 'cpu', *, peak_tflops: float | None = None,
                peak_bw_gbps: float | None = None) -> dict:
     """Resolve the machine roofline anchors (TFLOP/s fp32, GB/s).
@@ -85,6 +102,10 @@ def host_peaks(device: str = 'cpu', *, peak_tflops: float | None = None,
     (:mod:`roofline`) -> spec-sheet preset. ``None`` when everything is
     unavailable; ``roofline.roofline_point`` then skips the ceiling fields.
     """
+    if peak_tflops is not None:
+        peak_tflops = _validate_positive_peak(peak_tflops, 'peak_tflops')
+    if peak_bw_gbps is not None:
+        peak_bw_gbps = _validate_positive_peak(peak_bw_gbps, 'peak_bw_gbps')
     sources: dict[str, str] = {}
     if peak_tflops is None:
         measured = roofline.measure_gemm_tflops(device)
@@ -328,6 +349,24 @@ def decode_roofline(cfg: HybridConfig, T: int, *, device: str = 'cpu',
         raise ValueError(
             f'decode_roofline: T={T!r} must be representable as a finite '
             f'float.') from None
+    if measured_decode_ms_per_token is not None:
+        if isinstance(measured_decode_ms_per_token, bool) or not isinstance(
+                measured_decode_ms_per_token, (int, float)):
+            raise ValueError(
+                f'decode_roofline: measured_decode_ms_per_token must be a '
+                f'real number, got {measured_decode_ms_per_token!r}.')
+        try:
+            measured_value = float(measured_decode_ms_per_token)
+        except OverflowError:
+            raise ValueError(
+                f'decode_roofline: measured_decode_ms_per_token must be '
+                f'representable as a finite float, got '
+                f'{measured_decode_ms_per_token!r}.') from None
+        if not math.isfinite(measured_value) or measured_value < 0.0:
+            raise ValueError(
+                f'decode_roofline: measured_decode_ms_per_token must be '
+                f'finite and >= 0, got {measured_decode_ms_per_token!r}.')
+        measured_decode_ms_per_token = measured_value
     if not isinstance(cfg, HybridConfig):
         raise TypeError(
             f'decode_roofline: cfg must be a HybridConfig, got '
@@ -585,18 +624,29 @@ def prefill_decode_tower_outputs(model, input_ids, prefill_len: int | None = Non
     breaks ties on ascending block index), so a mismatch here indicates
     near-tied logits with differing fp ordering or a real selection bug.
     """
-    cfg, hybrid = _tower(model)
+    if not torch.is_tensor(input_ids):
+        raise TypeError(
+            f'prefill_decode_tower_outputs: input_ids must be a torch.Tensor, '
+            f'got {type(input_ids).__name__}.')
+    if input_ids.dim() < 2:
+        raise ValueError(
+            f'prefill_decode_tower_outputs: input_ids must have shape '
+            f'[B, T, ...], got {tuple(input_ids.shape)}.')
     T = int(input_ids.shape[1])
     if T < 1:
         raise ValueError(
             f'prefill_decode_tower_outputs: need T >= 1, got {T}.')
     if prefill_len is None:
         prefill_len = max(1, T // 2)
+    if isinstance(prefill_len, bool) or not isinstance(prefill_len, int):
+        raise TypeError(
+            f'prefill_decode_tower_outputs: prefill_len must be an int, '
+            f'got {prefill_len!r}.')
     if not 1 <= prefill_len <= T:
         raise ValueError(
             f'prefill_decode_tower_outputs: prefill_len={prefill_len} must '
             f'be in [1, T={T}].')
-
+    cfg, hybrid = _tower(model)
     dev = input_ids.device if device is None else device
     was_training = model.training
     model.eval()
