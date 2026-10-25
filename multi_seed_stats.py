@@ -231,6 +231,35 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
     return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
 
 
+def _student_t_sf_positive(t_value: float, dof: int) -> float:
+    """``P(T > t)`` for ``t >= 0``, evaluated in the non-cancelling tail."""
+    if t_value == 0.0:
+        return 0.5
+    if dof >= _NORMAL_T_DOF:
+        return NormalDist().cdf(-t_value)
+    t_sq = t_value * t_value
+    if math.isfinite(t_sq):
+        x = dof / (dof + t_sq)
+        if x > 0.0:
+            return 0.5 * betainc_regularized(0.5 * dof, 0.5, x)
+    # ``t*t`` overflowed (or ``x`` underflowed to zero) even though the
+    # tail itself can still be representable: for t=1e155, dof=1 the true
+    # tail is 3.18e-156 but forming t**2 first returns 0. Use the x -> 0
+    # limit ``I_x(a, b) ~ x**a / (a B(a, b))`` in log space instead; the
+    # dropped O(x) correction is far below float resolution here (x is
+    # below the smallest subnormal).
+    a = 0.5 * dof
+    b = 0.5
+    log_t = math.log(t_value)
+    log_ratio = math.log(dof) - 2.0 * log_t
+    log_x = math.log(dof) - 2.0 * log_t
+    if log_ratio > _MIN_LOG_PROB:
+        log_x -= math.log1p(math.exp(log_ratio))
+    log_ib = (a * log_x - math.log(a)
+              - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)))
+    return 0.5 * math.exp(log_ib)
+
+
 def student_t_cdf(t_value: float, dof: int) -> float:
     """CDF of Student's t with ``dof > 0`` degrees of freedom."""
     if dof <= 0:
@@ -245,13 +274,8 @@ def student_t_cdf(t_value: float, dof: int) -> float:
         return 1.0 if t_value > 0 else 0.0
     if t_value == 0.0:
         return 0.5
-    if dof >= _NORMAL_T_DOF:
-        return NormalDist().cdf(t_value)
-    x = dof / (dof + t_value * t_value)
-    ib = betainc_regularized(0.5 * dof, 0.5, x)
-    if t_value > 0.0:
-        return 1.0 - 0.5 * ib
-    return 0.5 * ib
+    tail = _student_t_sf_positive(abs(t_value), dof)
+    return (1.0 - tail) if t_value > 0.0 else tail
 
 
 def student_t_sf(t_value: float, dof: int) -> float:
@@ -273,13 +297,8 @@ def student_t_sf(t_value: float, dof: int) -> float:
         return 0.0 if t_value > 0 else 1.0
     if t_value == 0.0:
         return 0.5
-    if dof >= _NORMAL_T_DOF:
-        return NormalDist().cdf(-t_value)
-    x = dof / (dof + t_value * t_value)
-    ib = betainc_regularized(0.5 * dof, 0.5, x)
-    if t_value > 0.0:
-        return 0.5 * ib
-    return 1.0 - 0.5 * ib
+    tail = _student_t_sf_positive(abs(t_value), dof)
+    return tail if t_value > 0.0 else 1.0 - tail
 
 
 # ---------------------------------------------------------------------------
@@ -2190,19 +2209,39 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     return record
 
 
-def _t_quantile(p: float, dof: int) -> float:
-    """Inverse t-CDF by bisection on :func:`student_t_cdf` (p in (0,1))."""
-    if not (0.0 < p < 1.0):
-        raise ValueError(f'p must be in (0,1), got {p!r}')
-    lo, hi = -1.0, 1.0
-    while student_t_cdf(lo, dof) > p:
-        lo *= 2.0
-    while student_t_cdf(hi, dof) < p:
+def _positive_t_quantile(q: float, dof: int) -> float:
+    """Upper-tail t quantile ``x > 0`` with ``P(T > x) = q`` (q < 1/2)."""
+    lo, hi = 0.0, 1.0
+    while student_t_sf(hi, dof) > q:
         hi *= 2.0
-    for _ in range(80):
+        if not math.isfinite(hi):
+            return math.inf
+    for _ in range(100):
         mid = 0.5 * (lo + hi)
-        if student_t_cdf(mid, dof) < p:
+        if mid <= lo or mid >= hi:
+            break
+        if student_t_sf(mid, dof) > q:
             lo = mid
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+def _t_quantile(p: float, dof: int) -> float:
+    """Inverse t-CDF (p in (0,1)).
+
+    The t distribution is symmetric, so the upper half is evaluated through
+    :func:`student_t_sf`: for ``p`` close to 1 the forward CDF is a tiny
+    difference from 1 and loses most of its significant digits (at
+    ``p=1-1e-15`` it underflowed to a 5% quantile error), while the
+    survival function keeps the tail relative precision. This also makes
+    the critical values used by the epsilon-level TOST/power helpers
+    accurate instead of systematically too small.
+    """
+    if not (0.0 < p < 1.0):
+        raise ValueError(f'p must be in (0,1), got {p!r}')
+    if p == 0.5:
+        return 0.0
+    if p < 0.5:
+        return -_positive_t_quantile(p, dof)
+    return _positive_t_quantile(1.0 - p, dof)
