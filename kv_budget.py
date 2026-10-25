@@ -383,47 +383,69 @@ def _instant_op_components(op: str, t: int, geo: dict) -> dict:
     unvalidated value.
     """
     if op == 'softmax':
-        core = (t + 1) * geo['n_kv_heads'] * (geo['d_k'] + geo['d_v'])
-        return {'core_read_elements': float(core),
+        core = _finite_scaled(
+            'instant_read_elements', 'softmax core read count',
+            (t + 1) * geo['n_kv_heads'] * (geo['d_k'] + geo['d_v']), 1)
+        return {'core_read_elements': core,
                 'indexer_read_elements': 0.0,
-                'total_read_elements': float(core)}
+                'total_read_elements': core}
     if op == 'kda':
         # Every recurrent step reads the state twice (masked delta read +
         # output read); the delta-rule extreme is position-independent.
-        core = 2.0 * kda_state_elements(geo['hv'], geo['d_k'], geo['d_v'])
+        core = _finite_scaled(
+            'instant_read_elements', 'KDA core read count',
+            kda_state_elements(geo['hv'], geo['d_k'], geo['d_v']), 2)
         return {'core_read_elements': core,
                 'indexer_read_elements': 0.0,
                 'total_read_elements': core}
     if op == 'mamba2':
         # Same two-read contract as KDA: decayed update + C @ S^T readout.
-        core = 2.0 * mamba2_state_elements(
-            geo['nheads'], geo['headdim'], geo['d_state'])
+        core = _finite_scaled(
+            'instant_read_elements', 'Mamba-2 core read count',
+            mamba2_state_elements(
+                geo['nheads'], geo['headdim'], geo['d_state']), 2)
         return {'core_read_elements': core,
                 'indexer_read_elements': 0.0,
                 'total_read_elements': core}
     if op == 'csa':
-        selected = min(geo['topk'], t // geo['m']) * float(geo['c'])
-        window = (min(t + 1, geo['sliding_window']) * float(geo['c'])
-                  if geo.get('sliding_window', 0) > 0 else 0.0)
-        indexer = (t // geo['m']) * float(geo['c_i']) \
-            * geo.get('n_idx_heads', 1)
+        selected = _finite_scaled(
+            'instant_read_elements', 'CSA selected read count',
+            min(geo['topk'], t // geo['m']), geo['c'])
+        window = (_finite_scaled(
+            'instant_read_elements', 'CSA window read count',
+            min(t + 1, geo['sliding_window']), geo['c'])
+            if geo.get('sliding_window', 0) > 0 else 0.0)
+        indexer = _finite_scaled(
+            'instant_read_elements', 'CSA indexer read count',
+            t // geo['m'], geo['c_i'] * geo.get('n_idx_heads', 1))
+        core = _finite_total(
+            'instant_read_elements', 'CSA core read count',
+            selected + window)
         return {
             'selected_read_elements': selected,
             'window_read_elements': window,
-            'core_read_elements': selected + window,
+            'core_read_elements': core,
             'indexer_read_elements': indexer,
-            'total_read_elements': selected + window + indexer,
+            'total_read_elements': _finite_total(
+                'instant_read_elements', 'CSA total read count',
+                core + indexer),
         }
     # hca
-    dense = (t // geo['m2']) * float(geo['c'])
-    window = (min(t + 1, geo['sliding_window']) * float(geo['c'])
-              if geo.get('sliding_window', 0) > 0 else 0.0)
+    dense = _finite_scaled(
+        'instant_read_elements', 'HCA dense read count',
+        t // geo['m2'], geo['c'])
+    window = (_finite_scaled(
+        'instant_read_elements', 'HCA window read count',
+        min(t + 1, geo['sliding_window']), geo['c'])
+        if geo.get('sliding_window', 0) > 0 else 0.0)
+    core = _finite_total(
+        'instant_read_elements', 'HCA core read count', dense + window)
     return {
         'dense_read_elements': dense,
         'window_read_elements': window,
-        'core_read_elements': dense + window,
+        'core_read_elements': core,
         'indexer_read_elements': 0.0,
-        'total_read_elements': dense + window,
+        'total_read_elements': core,
     }
 
 

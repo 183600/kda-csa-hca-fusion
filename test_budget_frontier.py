@@ -210,6 +210,16 @@ def test_op_and_layout_dispatch():
         except ValueError:
             raised = True
         _ok(f'overflowing long-context {label} rejected', raised, '')
+    # The marginal form multiplies the position by the per-token geometry;
+    # a position whose averaged count is still finite can therefore make
+    # the marginal total unrepresentable. That must be a ValueError like
+    # every other malformed/overflowing budget, not a raw OverflowError.
+    raised = False
+    try:
+        kv_budget.instant_read_elements('softmax', 3 * 10 ** 306, spec)
+    except ValueError:
+        raised = True
+    _ok('overflowing marginal softmax total rejected', raised, '')
     for name, fn, kwargs in (
             ('CSA', kv_budget.csa_read_elements,
              dict(T=16, m=4, topk=2, c=32, c_i=16)),
