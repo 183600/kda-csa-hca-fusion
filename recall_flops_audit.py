@@ -100,6 +100,9 @@ def _validate_positive_int(name: str, value, *, minimum: int = 1) -> int:
             f'{name}={value!r} must be an int (got {type(value).__name__}).')
     if value < minimum:
         raise ValueError(f'{name}={value} must be >= {minimum}.')
+    if value > sys.maxsize:
+        raise ValueError(
+            f'{name}={value!r} is too large for a sequence/model dimension.')
     try:
         float(value)
     except OverflowError:
@@ -168,7 +171,12 @@ def ratio_layout(n_kda: int, n_csa: int, n_hca: int,
         raise ValueError('at least one of n_kda/n_csa/n_hca must be > 0.')
     unit = ([memory_kind] * n_kda + ['csa'] * n_csa + ['hca'] * n_hca)
     repeats = math.ceil(total_layers / len(unit))
-    return tuple((unit * repeats)[:total_layers])
+    try:
+        return tuple((unit * repeats)[:total_layers])
+    except (OverflowError, MemoryError):
+        raise ValueError(
+            f'total_layers={total_layers!r} is too large to expand into an '
+            f'explicit layout.') from None
 
 
 def layer_reference_flops(plan, cfg: HybridConfig, T: int,

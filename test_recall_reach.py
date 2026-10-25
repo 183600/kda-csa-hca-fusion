@@ -840,9 +840,16 @@ def test_recall_flops_rejects_oversized_geometry_without_overflow():
     with pytest.raises(ValueError):
         rfa.ratio_layout(1, 1, 0, huge)
     with pytest.raises(ValueError):
+        rfa.ratio_layout(1, 1, 0, 10 ** 100)
+    with pytest.raises(ValueError):
         rfa.audit_layout(('csa',), seq_len=huge, measure=False)
     with pytest.raises(ValueError):
+        rfa.audit_layout(('csa',), seq_len=10 ** 100, measure=False)
+    with pytest.raises(ValueError):
         rfa.audit_layout(('csa',), seq_len=8, batch=huge, measure=False)
+    with pytest.raises(ValueError):
+        rfa.audit_layout(('csa',), seq_len=8, batch=10 ** 100,
+                         measure=False)
 
 
 def main() -> int:
