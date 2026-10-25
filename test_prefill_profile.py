@@ -100,6 +100,25 @@ def test_expand_prefill_schedule_rejects_ambiguous_inputs():
         expand_prefill_schedule(10 ** 9, '1')
 
 
+def test_profile_rejects_invalid_tolerances():
+    model = _tiny_hca(d_model=8)
+    x = torch.randn(1, 4, 8)
+    for bad in (True, '1e-5', None):
+        with pytest.raises(TypeError):
+            profile_prefill_schedules(model, x, ['full'], repeats=1,
+                                      warmup=0, atol=bad)
+        with pytest.raises(TypeError):
+            profile_prefill_schedules(model, x, ['full'], repeats=1,
+                                      warmup=0, rtol=bad)
+    for bad in (-1.0, float('inf'), float('nan')):
+        with pytest.raises(ValueError):
+            profile_prefill_schedules(model, x, ['full'], repeats=1,
+                                      warmup=0, atol=bad)
+        with pytest.raises(ValueError):
+            profile_prefill_schedules(model, x, ['full'], repeats=1,
+                                      warmup=0, rtol=bad)
+
+
 def test_schedule_label_is_stable():
     assert schedule_label('full') == 'full'
     assert schedule_label('8') == '8'

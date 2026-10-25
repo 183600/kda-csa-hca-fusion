@@ -62,6 +62,7 @@ inside the configured tolerance.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import statistics
 import sys
@@ -109,6 +110,15 @@ def _positive_int(value, what: str) -> int:
         raise TypeError(f'{what} must be an int, got {value!r}')
     if value < 1:
         raise ValueError(f'{what} must be >= 1, got {value}')
+    return value
+
+
+def _nonnegative_tolerance(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f'{name} must be a real number, got {value!r}')
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f'{name} must be finite and >= 0, got {value!r}')
     return value
 
 
@@ -518,6 +528,8 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
         raise ValueError(f'warmup must be an int >= 0, got {warmup!r}')
     if x.dim() != 3:
         raise ValueError(f'x must be [B, T, d], got {tuple(x.shape)}')
+    atol = _nonnegative_tolerance(atol, 'atol')
+    rtol = _nonnegative_tolerance(rtol, 'rtol')
     total_len = x.shape[1]
     schedules = list(schedules)
     if not schedules:
