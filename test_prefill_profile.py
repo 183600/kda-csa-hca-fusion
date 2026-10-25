@@ -27,6 +27,7 @@ Or directly::
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -287,6 +288,20 @@ def test_profile_emits_throughput_and_drift_rows():
         assert row['tokens_per_s'] is None or row['tokens_per_s'] > 0.0
         assert row['drift']['finite'] is True
         assert row['passed'] is True
+    json.dumps(report, allow_nan=False)
+
+
+def test_profile_extreme_tolerances_stay_json_safe():
+    """A finite tolerance whose mixed sum overflows must not emit inf."""
+    torch.manual_seed(32)
+    model = _tiny_hca()
+    x = torch.randn(1, 8, 16) * 0.1
+    report = profile_prefill_schedules(
+        model, x, ['full', '4'], repeats=1, warmup=0,
+        atol=1e8, rtol=1e308)
+    assert report['max_abs_tolerance'] is not None
+    assert math.isfinite(report['max_abs_tolerance'])
+    assert report['all_passed'] is True
     json.dumps(report, allow_nan=False)
 
 

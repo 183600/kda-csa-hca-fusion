@@ -570,8 +570,15 @@ def profile_prefill_schedules(model, x: torch.Tensor, schedules, *,
         ref_scale = None
     else:
         ref_scale = 0.0
-    tol_abs = (None if ref_scale is None
-               else float(atol) + float(rtol) * ref_scale)
+    if ref_scale is None:
+        tol_abs = None
+    else:
+        # ``atol + rtol * scale`` can overflow to inf for large but finite
+        # tolerances. Every finite drift is below the float maximum, so
+        # saturating preserves the pass/fail semantics while keeping the
+        # report strictly JSON-serializable (no inf).
+        tol_abs = min(float(atol) + float(rtol) * ref_scale,
+                      sys.float_info.max)
     for spec, sched in zip(schedules, expanded):
         key = tuple(sched)
         if key == tuple(ref_schedule) or key in seen:
