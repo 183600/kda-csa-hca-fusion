@@ -211,15 +211,29 @@ def decode_traffic_fields(traffic: Mapping) -> dict:
                 or not isinstance(layout_raw, Sequence)):
             raise TypeError(
                 f'decode_traffic_fields: layout must be a sequence of '
-                f'layer kinds, got {type(layout_raw).__name__}.')
+                f'layer counts, got {type(layout_raw).__name__}.')
         layout = list(layout_raw)
+        for index, count in enumerate(layout):
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError(
+                    f'decode_traffic_fields: layout[{index}] must be an '
+                    f'int layer count, got {type(count).__name__}.')
+            if count < 0:
+                raise ValueError(
+                    f'decode_traffic_fields: layout[{index}]={count} must '
+                    f'be >= 0.')
+    memory_route = traffic.get('memory_route')
+    if memory_route is not None and not isinstance(memory_route, str):
+        raise TypeError(
+            'decode_traffic_fields: memory_route must be a string or '
+            f'None, got {type(memory_route).__name__}.')
     fields = {
         'decode_T': _ledger_sequence_length(traffic.get('T')),
         'decode_read_bytes_per_token': values['read_bytes_per_token'],
         'decode_write_bytes_per_token': values['write_bytes_per_token'],
         DEFAULT_TRAFFIC_KEY: total,
         'decode_bytes_by_op': by_op,
-        'decode_memory_route': traffic.get('memory_route'),
+        'decode_memory_route': memory_route,
         'decode_layout': layout,
         'decode_traffic_scope': (
             'canonical per-sequence per-token state/cache bytes '
