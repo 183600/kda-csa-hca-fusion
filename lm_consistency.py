@@ -210,11 +210,11 @@ def _finite_scaled(label: str, count, factor) -> float:
     return value
 
 
-def _finite_total(label: str, value: float) -> float:
+def _finite_total(label: str, value: float,
+                  fn_name: str = 'decode_elements_per_token') -> float:
     if not math.isfinite(value):
         raise ValueError(
-            f'decode_elements_per_token: {label} is unrepresentable as a '
-            f'finite float')
+            f'{fn_name}: {label} is unrepresentable as a finite float')
     return value
 
 
@@ -322,17 +322,45 @@ def decode_roofline(cfg: HybridConfig, T: int, *, device: str = 'cpu',
     """
     if not isinstance(T, int) or isinstance(T, bool) or T < 1:
         raise ValueError(f'decode_roofline: T must be a positive int, got {T!r}')
+    try:
+        float(T)
+    except OverflowError:
+        raise ValueError(
+            f'decode_roofline: T={T!r} must be representable as a finite '
+            f'float.') from None
     if not isinstance(cfg, HybridConfig):
         raise TypeError(
             f'decode_roofline: cfg must be a HybridConfig, got '
             f'{type(cfg).__name__}.')
+    if isinstance(itemsize, bool) or not isinstance(itemsize, int):
+        raise TypeError(
+            f'decode_roofline: itemsize={itemsize!r} must be an int '
+            f'(bytes per element; 4 = fp32, the Exp 7 convention).')
+    if itemsize < 1:
+        raise ValueError(
+            f'decode_roofline: itemsize={itemsize} must be >= 1.')
+    try:
+        float(itemsize)
+    except OverflowError:
+        raise ValueError(
+            f'decode_roofline: itemsize={itemsize!r} must be representable '
+            f'as a finite float.') from None
     geo = lm_tower_geometry(cfg)
     hybrid_op = {'kda': 'hybrid_kch', 'mamba2': 'hybrid_mamba2',
                  'rwkv7': 'hybrid_rwkv7'}[_lm_memory_route(cfg)]
-    flops_total = float(prefill_flops(hybrid_op, T, **geo))
+    try:
+        flops_total = float(prefill_flops(hybrid_op, T, **geo))
+    except OverflowError:
+        raise ValueError(
+            f'decode_roofline: prefill FLOPs are unrepresentable as a '
+            f'finite float') from None
+    flops_total = _finite_total(
+        'prefill FLOPs', flops_total, 'decode_roofline')
     flops_per_token = flops_total / T
     elems = decode_elements_per_token(cfg, T)
-    bytes_per_token = elems['total_elements_per_token'] * itemsize
+    bytes_per_token = _finite_total(
+        'bytes per token', elems['total_elements_per_token'] * itemsize,
+        'decode_roofline')
     peaks = host_peaks(device, peak_tflops=peak_tflops,
                        peak_bw_gbps=peak_bw_gbps)
     peak_flops = (peaks['peak_tflops'] or 0.0) * 1e12 or None

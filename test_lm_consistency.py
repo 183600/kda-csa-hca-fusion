@@ -389,6 +389,49 @@ def test_decode_elements_reject_unrepresentable_memory_geometry():
             detail)
 
 
+def test_decode_roofline_rejects_unrepresentable_geometry():
+    """Roofline inputs outside the float range must not leak OverflowError.
+
+    The FLOPs closed form and the byte conversion both multiply unbounded
+    geometry integers. An oversized geometry / ``itemsize`` used to raise
+    the interpreter's raw ``OverflowError`` from ``float(...)``; they must
+    follow the module's ValueError validation contract instead.
+    """
+    print("\nTest: decode roofline rejects unrepresentable geometry")
+    huge = 10 ** 200
+    cfg_huge = HybridConfig(
+        d_model=huge, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        mamba_d_state=huge, mamba_headdim=1, mamba_expand=1,
+        n_kda=1, n_csa=0, n_hca=0, memory_type='mamba2')
+    cfg_small = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        n_kda=1, n_csa=0, n_hca=0)
+    cases = [
+        ('huge geometry', lambda: lm_consistency.decode_roofline(
+            cfg_huge, 16)),
+        ('huge itemsize', lambda: lm_consistency.decode_roofline(
+            cfg_small, 16, itemsize=10 ** 400)),
+        ('huge T', lambda: lm_consistency.decode_roofline(
+            cfg_small, 10 ** 400)),
+    ]
+    for name, fn in cases:
+        detail = ''
+        try:
+            fn()
+            detail = 'no exception'
+        except OverflowError as exc:
+            detail = f'raw OverflowError: {exc}'
+        except ValueError as exc:
+            detail = str(exc)
+        _ok(f'decode_roofline {name} rejected as ValueError',
+            detail.startswith('decode_roofline:')
+            and ('unrepresentable' in detail
+                 or 'representable as a finite float' in detail),
+            detail)
+
+
 def test_consistency_metrics_start_validation():
     """``start`` must be a non-negative exact int.
 
@@ -430,6 +473,7 @@ _TEST_FUNCS = [
     test_selection_diagnostic,
     test_decode_roofline_accounting,
     test_decode_elements_reject_unrepresentable_memory_geometry,
+    test_decode_roofline_rejects_unrepresentable_geometry,
     test_decode_roofline_host_peaks_fallback,
 ]
 
