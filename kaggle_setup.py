@@ -1388,12 +1388,28 @@ def grad_flow_report(named_parameters, *, zero_tol: float = 0.0,
     """
     import math
 
+    if isinstance(zero_tol, bool) or not isinstance(zero_tol, (int, float)):
+        raise ValueError(f'zero_tol must be a real number, got {zero_tol!r}')
+    try:
+        zero_tol = float(zero_tol)
+    except OverflowError:
+        raise ValueError(
+            f'zero_tol={zero_tol!r} must be representable as a finite float.'
+        ) from None
+    if not math.isfinite(zero_tol) or zero_tol < 0.0:
+        raise ValueError(f'zero_tol must be finite and >= 0, got {zero_tol!r}')
+    if isinstance(max_names, bool) or not isinstance(max_names, int):
+        raise ValueError(f'max_names must be an exact int, got {max_names!r}')
+    if max_names < 0:
+        raise ValueError(f'max_names must be >= 0, got {max_names}')
+
     n_total = 0
     n_missing = 0
     n_zero = 0
     missing: list[str] = []
     zero: list[str] = []
-    total_sq = 0.0
+    norms: list[float] = []
+    nonfinite_norm = False
     for name, p in named_parameters:
         if not getattr(p, 'requires_grad', False):
             continue
@@ -1404,12 +1420,42 @@ def grad_flow_report(named_parameters, *, zero_tol: float = 0.0,
             if len(missing) < max_names:
                 missing.append(str(name))
             continue
-        norm = float(g.detach().float().norm())
-        total_sq += norm * norm
+        # fp64 accumulation avoids overflowing a finite fp64 gradient when
+        # it is narrowed to fp32, and keeps the squared sum representable
+        # below. ``abs`` handles complex gradients while staying real.
+        magnitude = g.detach().abs().to(torch.float64)
+        if magnitude.numel() == 0:
+            norm = 0.0
+        else:
+            peak = float(magnitude.max())
+            if not math.isfinite(peak):
+                norm = peak
+            elif peak == 0.0:
+                norm = 0.0
+            else:
+                # torch's norm squares in the tensor dtype, so a finite
+                # 1e200 gradient overflows to inf; scale before squaring.
+                norm = peak * float((magnitude / peak).norm())
+        norms.append(norm)
+        if not math.isfinite(norm):
+            nonfinite_norm = True
         if norm <= zero_tol:
             n_zero += 1
             if len(zero) < max_names:
                 zero.append(str(name))
+    if nonfinite_norm:
+        global_grad_norm = None
+    elif not norms:
+        global_grad_norm = 0.0
+    else:
+        scale = max(norms)
+        if scale == 0.0:
+            global_grad_norm = 0.0
+        else:
+            global_grad_norm = scale * math.sqrt(math.fsum(
+                (norm / scale) ** 2 for norm in norms))
+            if not math.isfinite(global_grad_norm):
+                global_grad_norm = None
     return {
         'n_trainable_tensors': n_total,
         'n_with_grad': n_total - n_missing,
@@ -1419,7 +1465,7 @@ def grad_flow_report(named_parameters, *, zero_tol: float = 0.0,
         'missing_grad_names': missing,
         'zero_grad_names': zero,
         'names_truncated_at': int(max_names),
-        'global_grad_norm': math.sqrt(total_sq),
+        'global_grad_norm': global_grad_norm,
         'note': ('Missing-gradient tensors were not reached by the loss '
                  '(detached or unused branch); zero-gradient tensors are '
                  'reached but contribute nothing on this batch. Both are '

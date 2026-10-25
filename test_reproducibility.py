@@ -18,6 +18,7 @@ collects it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import sys
@@ -1070,6 +1071,26 @@ def test_grad_flow_report_distinguishes_missing_and_zero_grads():
     assert mixed['n_zero_grad'] == 1
     assert mixed['zero_grad_names'] == ['2.weight']
     assert mixed['names_truncated_at'] == 10
+
+    # Finite fp64 gradients near the float limit must not overflow the
+    # report; non-finite gradients map to a JSON-null global norm.
+    huge = torch.nn.Parameter(torch.zeros(2, dtype=torch.float64))
+    huge.grad = torch.tensor([1e200, 1e200], dtype=torch.float64)
+    report = grad_flow_report([('huge', huge)])
+    assert report['global_grad_norm'] == pytest.approx(math.sqrt(2) * 1e200)
+    json.dumps(report, allow_nan=False)
+
+    huge.grad = torch.tensor([float('inf'), 0.0], dtype=torch.float64)
+    report = grad_flow_report([('huge', huge)])
+    assert report['global_grad_norm'] is None
+    json.dumps(report, allow_nan=False)
+
+    for bad in (True, -1.0, float('inf'), 10 ** 400):
+        with pytest.raises(ValueError):
+            grad_flow_report([], zero_tol=bad)
+    for bad in (True, 1.5, -1):
+        with pytest.raises(ValueError):
+            grad_flow_report([], max_names=bad)
 
 
 def test_ablation_manifest_entry_resolves_env_path(monkeypatch, tmp_path):
