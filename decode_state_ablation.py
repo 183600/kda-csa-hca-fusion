@@ -68,6 +68,17 @@ def _validate_inputs(decoder, x):
             f'prefill + decode audit, got T={x.shape[1]}.')
 
 
+def _validate_tol(tol, caller: str):
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError(
+            f'{caller}: tol must be a real number, got {tol!r}.')
+    value = float(tol)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f'{caller}: tol must be finite and >= 0, got {tol!r}.')
+    return tol
+
+
 def available_state_parts(decoder) -> dict:
     """Which state families the decoder actually owns."""
     model = _validate_decoder(decoder)
@@ -215,6 +226,7 @@ def decode_state_ablation(decoder, x, *, prefill_len, parts=None,
         raise ValueError(
             f'decode_state_ablation: need 0 < prefill_len < T, got '
             f'prefill_len={prefill_len}, T={x.shape[1]}.')
+    _validate_tol(tol, 'decode_state_ablation')
     if isinstance(modes, str):
         modes = (modes,)
     modes = tuple(modes)
@@ -294,6 +306,7 @@ def decode_causality_audit(decoder, x, *, cut=None, prefix_chunks=None,
         raise ValueError(
             f'decode_causality_audit: need 0 < cut < T, got cut={cut}, '
             f'T={T}.')
+    _validate_tol(tol, 'decode_causality_audit')
     chunks = _resolve_prefix_chunks(cut, prefix_chunks)
 
     with torch.no_grad():
