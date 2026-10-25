@@ -1331,7 +1331,12 @@ def _class_id_tensor(values, name: str) -> torch.Tensor:
         if _has_bool(values):
             raise ValueError(
                 f'{name} must contain integer class ids, got a bool element')
-    tensor = torch.as_tensor(values)
+    try:
+        tensor = torch.as_tensor(values)
+    except (TypeError, ValueError, OverflowError, RuntimeError) as e:
+        raise ValueError(
+            f'{name} must contain integer class ids '
+            f'(got {type(values).__name__})') from e
     if tensor.numel() and (tensor.dtype == torch.bool
                            or tensor.is_floating_point()
                            or tensor.is_complex()):
