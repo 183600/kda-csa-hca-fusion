@@ -357,6 +357,18 @@ def test_certificate_rejects_malformed_inputs(device):
         D.dense(g, k.unsqueeze(-1), k)  # right rank: malformed
 
 
+def test_effective_rank_rejects_invalid_rtol(device):
+    l = torch.randn(3, 2, dtype=torch.float64, device=device)
+    r = torch.randn(3, 2, dtype=torch.float64, device=device)
+    for bad in (True, '1e-6', object()):
+        with pytest.raises(ValueError):
+            D.effective_rank(l, r, rtol=bad)
+    for bad in (-1.0, float('inf'), float('nan'), 10 ** 400):
+        with pytest.raises(ValueError):
+            D.effective_rank(l, r, rtol=bad)
+    assert D.effective_rank(l, r, rtol=1e-12) == 2
+
+
 def test_two_phase_scan_work_plan(device):
     """The work plan is internally consistent and exposes the trade-off."""
     plan = D.scan_work_plan(128, 8, dim=128, value_dim=64, chunk_size=64)

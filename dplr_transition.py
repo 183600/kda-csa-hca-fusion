@@ -59,6 +59,8 @@ inputs.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 __all__ = [
@@ -143,6 +145,21 @@ def effective_rank(left: torch.Tensor, right: torch.Tensor,
     if rtol is None:
         eps = torch.finfo(left.dtype).eps
         rtol = max(left.shape[-1], left.shape[-2]) * eps
+    elif isinstance(rtol, bool) or not isinstance(rtol, (int, float)):
+        raise ValueError(
+            f'effective_rank: rtol must be a real number or None, '
+            f'got {rtol!r}.')
+    else:
+        try:
+            rtol = float(rtol)
+        except OverflowError:
+            raise ValueError(
+                f'effective_rank: rtol must be representable as a finite '
+                f'float, got {rtol!r}.') from None
+        if not math.isfinite(rtol) or rtol < 0.0:
+            raise ValueError(
+                f'effective_rank: rtol must be finite and >= 0, got '
+                f'{rtol!r}.')
     matrix = left @ right.transpose(-1, -2)
     sv = torch.linalg.svdvals(matrix)
     if sv.numel() == 0 or not torch.isfinite(sv).all():
