@@ -99,6 +99,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import decode_bandwidth as decode_bw  # noqa: E402
+
 from kaggle_setup import (
     configure_torch_for_device, parse_int_env, sanitize_for_json,
     write_json_atomic, write_results_json, capture_provenance,
@@ -119,6 +121,9 @@ from run_quality import (
     analyze_errors, ResidualAttnLayer, NoMixAttn, SoftmaxAttn,
 )
 from results_analysis import multiclass_classification_metrics
+from recall_efficiency import (
+    DEFAULT_TRAFFIC_KEY, annotate_recall_efficiency, decode_traffic_fields,
+)
 from train_diagnostics import (
     DEFAULT_COST_KEYS, DEFAULT_MAX_COST_RATIO, DEFAULT_MIN_EFFECT,
     ERROR_ANALYSIS_SEED_OFFSET, VAL_MONITOR_SEED_OFFSET, ValPoint,
@@ -3544,8 +3549,125 @@ def _curve_diagnosis_summary(all_results: list, label_key: str = 'ratio'):
     return summary
 
 
+def _parse_ratio_label(label) -> tuple[int, int, int] | None:
+    """Parse a ``KDA:CSA:HCA`` row label, or ``None`` for a baseline."""
+    text = str(label)
+    parts = text.split(':')
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    values = tuple(int(p) for p in parts)
+    return values if sum(values) > 0 else None
+
+
+def _attach_decode_traffic(all_results: list, *, d_model: int = 32,
+                           decode_T: int = SEQ_LEN) -> dict:
+    """Price each ratio row's per-token decode state/cache traffic.
+
+    The ratio sweep's existing cost axes (parameters, FLOPs, prefill
+    latency, training time) do not price the phase where the hybrid is
+    memory-bound.  Attach the canonical ``decode_bandwidth`` ledger at a
+    fixed reference context ``decode_T`` to every ratio row, so a later
+    contrast can reject an accuracy gain bought with disproportionate
+    state traffic.  Baselines (``is_baseline`` / non-ratio labels) and
+    failed rows are skipped: their geometry is not a ratio allocation.
+
+    One ledger per unique label is computed and reused across n_kv cells
+    (the traffic depends on the config, not on the task).  A ledger error
+    is recorded on the affected rows instead of aborting the sweep: a
+    missing cost axis must not destroy an otherwise valid accuracy run.
+    """
+    cache: dict[str, tuple[dict | None, str | None]] = {}
+    for row in all_results:
+        if 'error' in row or row.get('is_baseline'):
+            continue
+        ratio = _parse_ratio_label(row.get('ratio'))
+        if ratio is None:
+            continue
+        label = str(row.get('ratio'))
+        if label not in cache:
+            try:
+                cfg = _make_cfg(d_model, ratio)
+                fields = decode_traffic_fields(
+                    decode_bw.decode_traffic_breakdown(cfg, decode_T))
+                cache[label] = (fields, None)
+            except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+                cache[label] = (None, f'{type(exc).__name__}: {exc}')
+        fields, error = cache[label]
+        if fields is None:
+            row[DEFAULT_TRAFFIC_KEY] = None
+            row['decode_traffic_error'] = error
+        else:
+            row.update(fields)
+    return {label: {'fields': fields, 'error': error}
+            for label, (fields, error) in cache.items()}
+
+
+def _attach_recall_efficiency(rows: list, *, name_key: str = 'ratio') -> dict:
+    """Annotate chance-corrected recall per MB and the Pareto frontier.
+
+    Rows are grouped by ``n_kv`` so a harder task cell is never compared
+    directly against an easier one; within a cell the frontier is
+    (accuracy maximise, decode bytes minimise).  Baseline rows are
+    excluded because no ratio traffic was priced for them.
+    """
+    groups: dict = {}
+    for row in rows:
+        if 'error' in row or row.get('is_baseline'):
+            continue
+        if row.get(DEFAULT_TRAFFIC_KEY) is None:
+            continue
+        groups.setdefault(str(row.get('n_kv')), []).append(row)
+    report = {}
+    for n_kv, group in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        report[n_kv] = annotate_recall_efficiency(
+            group, accuracy_key='mean_acc', chance_key='chance_acc',
+            bytes_key=DEFAULT_TRAFFIC_KEY, name_key=name_key)
+    return {
+        'metric': ('chance_corrected MQAR recall per decimal MB of '
+                   'per-token decode state/cache traffic'),
+        'accuracy_key': 'mean_acc',
+        'chance_key': 'chance_acc',
+        'bytes_key': DEFAULT_TRAFFIC_KEY,
+        'decode_T': SEQ_LEN,
+        'scope': ('canonical compulsory-traffic lower bound; tower weights '
+                  'excluded; analysis only, not a kernel measurement'),
+        'by_n_kv': report,
+    }
+
+
+def _log_recall_efficiency(report: dict) -> None:
+    """Log the per-n_kv accuracy-vs-traffic frontier and its dominators."""
+    by_cell = report.get('by_n_kv', {})
+    if not by_cell:
+        logger.info('  (no ratio row carried decode traffic; '
+                    'memory-efficiency frontier skipped)')
+        return
+    logger.info('\n' + '=' * 96)
+    logger.info('Associative-recall efficiency vs decode traffic '
+                f'(reference T={report.get("decode_T")}):')
+    logger.info('=' * 96)
+    for n_kv, cell in by_cell.items():
+        frontier = cell.get('frontier', [])
+        logger.info(f'  n_kv={n_kv}: Pareto frontier (accuracy up, bytes down)'
+                    f' -> {frontier if frontier else "(none)"}')
+        for name, point in cell.get('points', {}).items():
+            ratio_eff = point.get('recall_per_megabyte')
+            eff_text = f'{ratio_eff:+.4f}' if ratio_eff is not None else 'n/a'
+            status = ('frontier' if name in frontier
+                      else f"dominated by {cell['dominated_by'].get(name)}")
+            logger.info(
+                f"    {name:<10} acc={point['accuracy']:.4f}  "
+                f"bytes/token={point['decode_bytes_per_token']:,.0f}  "
+                f"skill={point['chance_corrected_recall']:+.4f}  "
+                f"recall/MB={eff_text}  [{status}]")
+        skipped = cell.get('skipped', [])
+        if skipped:
+            logger.info(f'    skipped (missing accuracy/traffic): {skipped}')
+
+
 def _attach_cost_tradeoffs(contrasts: list, all_results: list,
-                           label_key: str = 'ratio') -> list:
+                           label_key: str = 'ratio',
+                           cost_keys=DEFAULT_COST_KEYS) -> list:
     """Attach an accuracy-vs-cost verdict to each paired contrast row.
 
     The paired contrast answers "is the accuracy difference real?"; it does
@@ -3554,6 +3676,10 @@ def _attach_cost_tradeoffs(contrasts: list, all_results: list,
     significance test, must not be quoted as an improvement. Each contrast
     therefore also carries the cost ratios and an explicit verdict (see
     ``train_diagnostics.accuracy_cost_tradeoff``).
+
+    ``cost_keys`` extends the default screen.  Ratio mode adds the
+    per-token decode traffic, so a memory-bound regression is rejected
+    even when parameters and short-sequence latency look flat.
 
     Significance is taken from the contrast's OWN corrected test, so the
     cost screen and the statistical screen judge the same evidence.
@@ -3570,7 +3696,7 @@ def _attach_cost_tradeoffs(contrasts: list, all_results: list,
                 'difference is reported without a cost verdict.')
             continue
         verdict = accuracy_cost_tradeoff(
-            cand, ref,
+            cand, ref, cost_keys=cost_keys,
             significant=(bool(c.get('significant_bonferroni'))
                          if c.get('significant_bonferroni') is not None
                          else None))
@@ -4538,13 +4664,25 @@ def main():
     ratio_contrast_tests = _annotate_contrast_significance(
         ratio_contrasts, hypotheses=RATIO_SWEEP_HYPOTHESES,
         equivalence_margin=ratio_equiv_margin)
+    # Memory-bound cost axis: price every ratio's per-token decode
+    # state/cache traffic from the canonical ledger, then mark the
+    # accuracy-vs-traffic Pareto frontier (chance-corrected recall per MB).
+    # The sweep's other axes (params, FLOPs, prefill latency) cannot see a
+    # layout that wins MQAR accuracy by moving more state per decoded
+    # token; this closes that blind spot.
+    decode_traffic = _attach_decode_traffic(all_results)
+    memory_efficiency = _attach_recall_efficiency(all_results)
+    ratio_cost_keys = tuple(DEFAULT_COST_KEYS) + (DEFAULT_TRAFFIC_KEY,)
     # Accuracy-vs-cost screen on the SAME contrasts: a real accuracy
     # difference that costs a disproportionate amount of parameters, train
-    # time or inference latency is a different operating point, not a
-    # better one. Runs after _annotate_contrast_significance so the
-    # significance screen and the cost screen judge the same corrected test.
-    _attach_cost_tradeoffs(ratio_contrasts, all_results)
+    # time, inference latency or decode traffic is a different operating
+    # point, not a better one. Runs after _annotate_contrast_significance
+    # so the significance screen and the cost screen judge the same
+    # corrected test.
+    _attach_cost_tradeoffs(ratio_contrasts, all_results,
+                           cost_keys=ratio_cost_keys)
     _log_ratio_contrast_table(ratio_contrasts)
+    _log_recall_efficiency(memory_efficiency)
 
     # Prospective audit of the pre-registered Exp 5 ratio plan. The family
     # is the number of alternative-vs-reference contrasts this run actually
@@ -4706,14 +4844,24 @@ def main():
         provenance['cost_tradeoff_policy'] = {
             'min_effect': DEFAULT_MIN_EFFECT,
             'max_cost_ratio': DEFAULT_MAX_COST_RATIO,
-            'cost_keys': list(DEFAULT_COST_KEYS),
+            'cost_keys': list(ratio_cost_keys),
             'note': (
                 'A paired contrast is only an adoptable improvement if its '
                 'corrected test is significant AND the accuracy gain clears '
                 'min_effect AND no cost axis exceeds max_cost_ratio. The '
                 'accuracy difference and the cost ratios are reported '
-                'separately so either can be quoted on its own.'),
+                'separately so either can be quoted on its own. Ratio mode '
+                'includes decode bytes/token, so a memory-bound regression '
+                'is screened even when parameters and short-sequence '
+                'latency are flat.'),
         }
+        provenance['decode_traffic'] = {
+            'reference_T': SEQ_LEN,
+            'source': ('decode_bandwidth.decode_traffic_breakdown; canonical '
+                       'per-sequence per-token compulsory state/cache bytes'),
+            'by_ratio': decode_traffic,
+        }
+        provenance['recall_efficiency'] = memory_efficiency
         write_results_json(provenance,
                            'results/exp5_ablation_provenance.json',
                            logger=logger)

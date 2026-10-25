@@ -7560,6 +7560,121 @@ def test_fp8_state_storage_ledger(device='cpu'):
 
 
 
+def test_recall_efficiency_ratio_sweep(device='cpu'):
+    """Ratio-sweep rows must carry a consistent recall-per-decode-byte axis.
+
+    Exp 5 now screens an accuracy gain against the canonical per-token
+    decode traffic, not only parameters / prefill latency / training time.
+    This pins the contract end to end:
+
+      * the pure skill/efficiency formulas (chance-corrected recall in
+        [0, 1], exact recall per decimal MB, ``None`` on a zero
+        denominator, no ``+inf``/NaN);
+      * ``_attach_decode_traffic`` prices each ratio through the same
+        ``decode_bandwidth`` ledger, skips baselines, and ordering follows
+        the state-vs-cache geometry;
+      * ``_attach_recall_efficiency`` marks the accuracy-vs-bytes Pareto
+        frontier, names the dominator, and lists byte-less rows under
+        ``skipped`` instead of dropping them;
+      * duplicate row names remain distinct points.
+    """
+    import decode_bandwidth as db
+    from recall_efficiency import (annotate_recall_efficiency,
+                                   chance_corrected_recall,
+                                   recall_per_megabyte)
+    import run_ablation as ra
+
+    problems = []
+
+    def want(cond, msg):
+        if not cond:
+            problems.append(msg)
+
+    chance = 1.0 / 16.0
+    want(abs(chance_corrected_recall(0.375, chance) - (1.0 / 3.0)) < 1e-12,
+         'skill of 0.375 at 1/16 chance must be 1/3')
+    want(chance_corrected_recall(0.01, chance) < 0.0,
+         'below-chance accuracy must keep a negative skill')
+    want(chance_corrected_recall(0.5, 1.0) is None,
+         'chance == 1 leaves no finite skill scale -> None')
+    want(abs(recall_per_megabyte(0.375, chance, 1_000_000.0)
+             - (1.0 / 3.0)) < 1e-12,
+         'skill per decimal MB must be exact at 1 MB')
+    want(recall_per_megabyte(0.375, chance, 0.0) is None,
+         'zero bytes/token must be None, not +inf')
+    want(recall_per_megabyte(0.375, chance, float('nan')) is None,
+         'NaN bytes/token must be None')
+
+    rows = [
+        {'ratio': '3:1:1', 'n_kv': 1, 'mean_acc': 0.30,
+         'chance_acc': chance},
+        {'ratio': '1:1:3', 'n_kv': 1, 'mean_acc': 0.25,
+         'chance_acc': chance},
+        {'ratio': '4:1:0', 'n_kv': 1, 'mean_acc': 0.20,
+         'chance_acc': chance},
+        {'ratio': 'BASELINE-softmax', 'n_kv': 1, 'mean_acc': 0.40,
+         'chance_acc': chance, 'is_baseline': True},
+    ]
+    traffic = ra._attach_decode_traffic(rows)
+    want(set(traffic) == {'3:1:1', '1:1:3', '4:1:0'},
+         f'traffic cache must cover exactly the ratio rows, got {sorted(traffic)}')
+    baseline = rows[3]
+    want(baseline.get('decode_bytes_per_token') is None,
+         'baseline rows must not be priced as ratio allocations')
+    for row in rows[:3]:
+        ratio = tuple(int(x) for x in row['ratio'].split(':'))
+        expected = db.decode_traffic_breakdown(
+            ra._make_cfg(ratio=ratio), ra.SEQ_LEN)['total_bytes_per_token']
+        got = row.get('decode_bytes_per_token')
+        want(got is not None and abs(got - expected) < 1e-9,
+             f"{row['ratio']}: traffic {got} != canonical {expected}")
+    want(rows[1]['decode_bytes_per_token']
+         < rows[0]['decode_bytes_per_token']
+         < rows[2]['decode_bytes_per_token'],
+         'decode traffic order 1:1:3 < 3:1:1 < 4:1:0 violated')
+
+    report = ra._attach_recall_efficiency(rows)
+    cell = report['by_n_kv']['1']
+    want(cell['frontier'] == ['3:1:1', '1:1:3'],
+         f"frontier must be the cheap+HCA and the accurate default, got "
+         f"{cell['frontier']}")
+    want(cell['dominated_by'].get('4:1:0') == '3:1:1',
+         f"4:1:0 must be dominated by 3:1:1, got {cell['dominated_by']}")
+    eff = rows[0]['recall_efficiency']
+    expected_skill = (0.30 - chance) / (1.0 - chance)
+    expected_eff = expected_skill / (rows[0]['decode_bytes_per_token'] / 1e6)
+    want(eff is not None and eff['optimal'] is True
+         and abs(eff['chance_corrected_recall'] - expected_skill) < 1e-12
+         and abs(eff['recall_per_megabyte'] - expected_eff) < 1e-12,
+         f'3:1:1 row efficiency mismatch: {eff}')
+
+    # Duplicate names must remain two distinct Pareto points, and a row
+    # whose traffic is missing/zero must be reported, not silently priced.
+    dup = [
+        {'ratio': 'dup', 'mean_acc': 0.2, 'chance_acc': chance,
+         'decode_bytes_per_token': 1000.0},
+        {'ratio': 'dup', 'mean_acc': 0.3, 'chance_acc': chance,
+         'decode_bytes_per_token': 2000.0},
+    ]
+    dup_rep = annotate_recall_efficiency(dup)
+    want(len(dup_rep['points']) == 2 and not dup_rep['skipped'],
+         f'duplicate names collapsed: {dup_rep}')
+    missing = [{'ratio': 'no-bytes', 'mean_acc': 0.2,
+                'chance_acc': chance, 'decode_bytes_per_token': 0.0}]
+    miss_rep = annotate_recall_efficiency(missing)
+    want(miss_rep['skipped'] == ['no-bytes']
+         and missing[0]['recall_efficiency'] is None,
+         f'byte-less row not reported as skipped: {miss_rep}')
+
+    return [_ok(
+        'recall_efficiency_ratio_sweep',
+        not problems,
+        '; '.join(problems) if problems else
+        'skill/efficiency formulas exact; traffic ledger wired; '
+        '3:1:1 vs 1:1:3 frontier + 4:1:0 dominated; skipped/dup rows safe',
+    )]
+
+
 def test_online_softmax_shared_kv_tiling(device='cpu'):
     """Streaming softmax must honour the shared-KV MQA/GQA contract.
 
@@ -8007,6 +8122,8 @@ def main():
     all_results += _run_safe(test_rwkv7_cache_live_accounting, device)
     # FP8 block-scaled state storage priced through the decode ledger.
     all_results += _run_safe(test_fp8_state_storage_ledger, device)
+    # Exp 5 ratio sweep: accuracy-vs-decode-traffic efficiency/Pareto wiring.
+    all_results += _run_safe(test_recall_efficiency_ratio_sweep, device)
     all_results += _run_safe(test_online_softmax_shared_kv_tiling, device)
     # Planning-layer contract: a pre-registered 2x2 interaction is a
     # four-cell contrast and cannot borrow the main-effect seed budget.
