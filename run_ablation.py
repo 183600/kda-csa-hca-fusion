@@ -3614,8 +3614,6 @@ def _attach_recall_efficiency(rows: list, *, name_key: str = 'ratio') -> dict:
     for row in rows:
         if 'error' in row or row.get('is_baseline'):
             continue
-        if row.get(DEFAULT_TRAFFIC_KEY) is None:
-            continue
         groups.setdefault(str(row.get('n_kv')), []).append(row)
     report = {}
     for n_kv, group in sorted(groups.items(), key=lambda kv: str(kv[0])):
