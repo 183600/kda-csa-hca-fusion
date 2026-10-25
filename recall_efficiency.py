@@ -73,21 +73,14 @@ def _ledger_sequence_length(value):
     """Validate a ledger ``T`` as a non-negative integer (or ``None``)."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(
             f'decode_traffic_fields: T={value!r} must be a non-negative '
             f'int or None.')
-    try:
-        number = float(value)
-    except OverflowError:
+    if value < 0:
         raise ValueError(
-            f'decode_traffic_fields: T={value!r} must be representable as '
-            f'a finite integer.') from None
-    if not math.isfinite(number) or number < 0.0 or number != int(number):
-        raise ValueError(
-            f'decode_traffic_fields: T={value!r} must be a non-negative '
-            f'integer.')
-    return int(number)
+            f'decode_traffic_fields: T={value!r} must be >= 0.')
+    return value
 
 
 def _ledger_op_map(traffic: Mapping, key: str) -> Mapping:
