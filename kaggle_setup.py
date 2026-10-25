@@ -1470,18 +1470,44 @@ def largest_remainder_sizes(n_units: int, fractions) -> list:
     any non-negative weights.
     """
     import math
-    n_units = int(n_units)
+    if isinstance(n_units, bool) or not isinstance(n_units, int):
+        raise ValueError(f'n_units must be an exact int, got {n_units!r}')
     if n_units < 0:
         raise ValueError(f'n_units must be >= 0, got {n_units}')
-    fractions = [float(f) for f in fractions]
+    try:
+        float(n_units)
+    except OverflowError:
+        raise ValueError(
+            f'n_units={n_units!r} must be representable as a finite float.'
+        ) from None
+    try:
+        fractions = [float(f) for f in fractions]
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'fractions must contain finite real numbers, got {fractions!r}'
+        ) from None
     if not fractions:
         raise ValueError('fractions must be non-empty')
+    if any(not math.isfinite(f) for f in fractions):
+        raise ValueError(f'fractions must be finite, got {fractions}')
     if any(f < 0 for f in fractions):
         raise ValueError(f'fractions must be non-negative, got {fractions}')
     total = sum(fractions)
-    if total <= 0:
-        raise ValueError(f'fractions must have a positive sum, got {fractions}')
-    fractions = [f / total for f in fractions]
+    if not math.isfinite(total):
+        # The weights are finite but their sum overflows. Scale by the
+        # largest weight first so the normalized shares stay meaningful.
+        scale = max(fractions)
+        if scale <= 0:
+            raise ValueError(
+                f'fractions must have a positive sum, got {fractions}')
+        scaled = [f / scale for f in fractions]
+        total = math.fsum(scaled)
+        fractions = [f / total for f in scaled]
+    else:
+        if total <= 0:
+            raise ValueError(
+                f'fractions must have a positive sum, got {fractions}')
+        fractions = [f / total for f in fractions]
     raw = [n_units * f for f in fractions]
     sizes = [int(math.floor(x)) for x in raw]
     remainder = n_units - sum(sizes)
@@ -1607,10 +1633,28 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
         Python-int index lists. The lists are pairwise disjoint and their
         union is exactly ``range(n_samples)``.
     """
+    import math
     import random
-    n = int(n_samples)
+    if isinstance(n_samples, bool) or not isinstance(n_samples, int):
+        raise ValueError(
+            f'n_samples must be an exact int, got {n_samples!r}')
+    n = n_samples
     if n < 1:
         raise ValueError(f'n_samples must be >= 1, got {n}')
+    if n > sys.maxsize:
+        raise ValueError(
+            f'n_samples={n!r} is too large to enumerate as a split.')
+    for name, value in (('val_frac', val_frac), ('test_frac', test_frac)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f'{name} must be a real number, got {value!r}')
+        try:
+            number = float(value)
+        except OverflowError:
+            raise ValueError(
+                f'{name}={value!r} must be representable as a finite float.'
+            ) from None
+        if not math.isfinite(number):
+            raise ValueError(f'{name}={value!r} must be finite.')
     val_frac = float(val_frac)
     test_frac = float(test_frac)
     if not 0.0 <= val_frac < 1.0:

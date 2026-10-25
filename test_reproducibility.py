@@ -31,6 +31,7 @@ from kaggle_setup import (  # noqa: E402
     append_run_manifest,
     audit_split,
     grad_flow_report,
+    largest_remainder_sizes,
     make_run_manifest_entry,
     make_seeded_generator,
     recipe_sha256,
@@ -519,6 +520,31 @@ def test_split_tiny_data_keeps_requested_splits_non_empty():
         split_train_val_test(2)
     with pytest.raises(ValueError, match='non-empty splits'):
         split_train_val_test(1, val_frac=0.4, test_frac=0.4)
+
+
+def test_split_helpers_reject_non_exact_and_nonfinite_inputs():
+    huge = 10 ** 400
+    with pytest.raises(ValueError):
+        largest_remainder_sizes(3.5, [0.5, 0.5])
+    with pytest.raises(ValueError):
+        largest_remainder_sizes(True, [0.5, 0.5])
+    with pytest.raises(ValueError):
+        largest_remainder_sizes(10, [float('inf'), 1.0])
+    with pytest.raises(ValueError):
+        largest_remainder_sizes(10, [huge, 1])
+    with pytest.raises(ValueError):
+        largest_remainder_sizes(huge, [0.5, 0.5])
+    # Finite weights whose raw sum overflows still normalize to a sane split.
+    assert largest_remainder_sizes(10, [1e308, 1e308]) == [5, 5]
+    assert largest_remainder_sizes(10 ** 20, [0.5, 0.5]) == [
+        5 * 10 ** 19, 5 * 10 ** 19]
+
+    for bad in (True, 3.5, huge):
+        with pytest.raises(ValueError):
+            split_train_val_test(bad)
+    for bad in ('0.2', float('inf'), float('nan'), huge):
+        with pytest.raises(ValueError):
+            split_train_val_test(10, val_frac=bad)
 
 
 def test_split_keeps_groups_whole():
