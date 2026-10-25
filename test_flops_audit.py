@@ -327,6 +327,10 @@ def test_audit_validation():
         fa.kda_canonical_terms(cfg, representable)
     with pytest.raises(ValueError):
         fa.mamba2_canonical_terms(cfg, representable)
+    with pytest.raises(ValueError):
+        fa.kda_canonical_terms(cfg, huge)
+    with pytest.raises(ValueError):
+        fa.kda_canonical_terms(cfg, 64, batch=huge)
     assert math.isfinite(fa.canonical_flops('kda', cfg, 64, batch=2))
 
 

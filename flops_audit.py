@@ -368,6 +368,7 @@ def kda_canonical_terms(cfg, T: int, batch: int = 1) -> dict:
     Mirrors the ``prefill_flops('kda')`` branches; ``sum(values)`` equals
     ``canonical_flops('kda', ...)`` (pinned by the regression suite).
     """
+    _validate('kda', T, batch)
     d, H, K, V = cfg.d_model, cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v
     HV = cfg.n_heads_v
     b = float(batch)
