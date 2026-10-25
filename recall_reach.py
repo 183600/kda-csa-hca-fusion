@@ -316,9 +316,15 @@ def structural_recall(plan, seq_len: int,
             f'structural_recall: seq_len={seq_len!r} must be an int >= 3 '
             f'(key + value + cue).')
     cue = seq_len - 1
-    positions = (_validate_key_positions(key_positions, cue)
-                 if key_positions is not None
-                 else list(range(0, cue - 1)))
+    if key_positions is not None:
+        positions = _validate_key_positions(key_positions, cue)
+    else:
+        try:
+            positions = list(range(0, cue - 1))
+        except (OverflowError, MemoryError):
+            raise ValueError(
+                f'structural_recall: seq_len={seq_len!r} is too large to '
+                f'enumerate every key placement.') from None
 
     rows: list[dict] = []
     for p in positions:

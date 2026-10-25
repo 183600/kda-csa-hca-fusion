@@ -834,6 +834,10 @@ def test_recall_flops_rejects_oversized_geometry_without_overflow():
 
     huge = 10 ** 400
     with pytest.raises(ValueError):
+        R.structural_recall(_plan(), 10 ** 100)
+    with pytest.raises(ValueError):
+        R.structural_summary(_plan(), 10 ** 100)
+    with pytest.raises(ValueError):
         rfa.ratio_layout(1, 1, 0, huge)
     with pytest.raises(ValueError):
         rfa.audit_layout(('csa',), seq_len=huge, measure=False)
