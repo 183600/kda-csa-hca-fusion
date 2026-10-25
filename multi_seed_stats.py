@@ -423,7 +423,8 @@ def _beta_quantile(q: float, a: float, b: float) -> float:
     return 0.5 * (lo + hi)
 
 
-_SMALL_BINOMIAL_TAIL = 64
+_SMALL_BINOMIAL_TAIL = 1024
+_LARGE_BINOMIAL_N = 100_000_000
 _MIN_LOG_PROB = math.log(5e-324)
 
 
@@ -467,6 +468,25 @@ def _binomial_tail_root(n: int, k: int, target: float) -> float:
         else:
             hi = mid
     return math.exp(0.5 * (lo + hi))
+
+
+def _normal_beta_quantile(q: float, a: int, b: int) -> float:
+    """Normal-moment approximation to a Beta quantile for huge shapes.
+
+    The continued fraction used by :func:`betainc_regularized` loses its
+    scale when ``a`` and ``b`` are both around 1e9 (the first denominator
+    ``1 - (a+b)x/(a+1)`` rounds to zero).  At that size the Beta
+    distribution is extremely well approximated by a normal with the exact
+    Beta mean and variance, so use that stable limit instead of emitting a
+    wrongly narrow interval or an OverflowError.
+    """
+    total = a + b
+    mean = a / total
+    variance = mean * (1.0 - mean) / (total + 1.0)
+    if variance <= 0.0:
+        return mean
+    z = NormalDist().inv_cdf(q)
+    return min(max(mean + z * math.sqrt(variance), 0.0), 1.0)
 
 
 def _small_tail_proportion_ci(k: int, n: int, alpha: float) -> tuple:
@@ -514,6 +534,11 @@ def binomial_proportion_ci(k, n, *, alpha: float = 0.05) -> dict:
         return out
     if n > 1000 and min(k, n - k) <= _SMALL_BINOMIAL_TAIL:
         low, high = _small_tail_proportion_ci(k, n, alpha)
+    elif n > _LARGE_BINOMIAL_N:
+        low = (0.0 if k == 0 else
+               _normal_beta_quantile(alpha / 2.0, k, n - k + 1))
+        high = (1.0 if k == n else
+                _normal_beta_quantile(1.0 - alpha / 2.0, k + 1, n - k))
     else:
         low = 0.0 if k == 0 else _beta_quantile(alpha / 2.0, k, n - k + 1)
         high = 1.0 if k == n else _beta_quantile(
