@@ -355,6 +355,13 @@ def test_tp_latency_sweep_invariants():
     hw = tp.HardwareModel()
     with pytest.raises(ValueError):
         tp.ring_allreduce_ms(huge, 2, hw)
+    for bad_bytes in (float('nan'), float('inf'), float('-inf')):
+        with pytest.raises(ValueError):
+            tp.ring_allreduce_ms(bad_bytes, 2, hw)
+    for bad_size in (True, 1.5, '2'):
+        with pytest.raises(TypeError):
+            tp.tp_sweep(cfg, (bad_size,), prefill_len=32, total_layers=5,
+                        hardware=hw)
     with pytest.raises(ValueError):
         tp.ring_allreduce_ms(1, huge, hw)
     with pytest.raises(ValueError):

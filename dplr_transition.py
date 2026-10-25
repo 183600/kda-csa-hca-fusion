@@ -89,6 +89,10 @@ def _check_factor(diag: torch.Tensor, left: torch.Tensor,
                             f"got {t.dtype}.")
     if diag.dim() < 1:
         raise ValueError(f"{name}: diag must have at least one dimension.")
+    if left.dim() < 2 or right.dim() < 2:
+        raise ValueError(
+            f"{name}: left/right must have at least two dimensions, got "
+            f"{left.dim()} and {right.dim()}.")
     k = diag.shape[-1]
     if left.shape[-2] != k or right.shape[-2] != k:
         raise ValueError(

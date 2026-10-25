@@ -351,6 +351,10 @@ def test_certificate_rejects_malformed_inputs(device):
     with pytest.raises(ValueError):
         D.compose(g, k.unsqueeze(-1), k[..., :3].unsqueeze(-1),
                   g, k.unsqueeze(-1), k.unsqueeze(-1))  # K mismatch
+    with pytest.raises(ValueError):
+        D.dense(g, k, k)  # rank-1 factors: malformed, not IndexError
+    with pytest.raises(ValueError):
+        D.dense(g, k.unsqueeze(-1), k)  # right rank: malformed
 
 
 def test_two_phase_scan_work_plan(device):

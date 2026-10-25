@@ -1395,6 +1395,10 @@ def ring_allreduce_ms(nbytes: float, tp_size: int,
         raise ValueError(
             f'ring_allreduce_ms: nbytes={nbytes!r} must be representable as '
             f'a finite float.') from None
+    if not math.isfinite(nbytes_value):
+        raise ValueError(
+            f'ring_allreduce_ms: nbytes={nbytes!r} must be finite, got '
+            f'{nbytes_value!r}.')
     if nbytes_value < 0:
         raise ValueError(
             f'ring_allreduce_ms: nbytes={nbytes} must be >= 0.')
@@ -1555,12 +1559,11 @@ def tp_sweep(cfg: HybridConfig, tp_sizes, **kwargs) -> dict:
     not in ``tp_sizes``).  Optima are separate for prefill and decode
     because the two phases have opposite communication geometry.
     """
-    sizes = tuple(int(s) for s in tp_sizes)
+    sizes = tuple(tp_sizes)
     if not sizes:
         raise ValueError('tp_sweep: tp_sizes must be non-empty.')
-    if any(s < 1 for s in sizes):
-        raise ValueError(
-            f'tp_sweep: tp_sizes must be >= 1, got {sizes!r}.')
+    for size in sizes:
+        _validate_tp_size(size)
     baseline = tp_latency(cfg, tp_size=1, **kwargs)
     rows = []
     for size in dict.fromkeys(sizes):
