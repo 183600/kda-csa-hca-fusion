@@ -55,9 +55,12 @@ def _finite_or_none(value):
     """Coerce a value to a finite float, or ``None`` when impossible.
 
     Booleans are rejected explicitly: ``True`` is an int in Python and
-    would otherwise be silently priced as one byte.
+    would otherwise be silently priced as one byte.  Strings/bytes are
+    rejected too: a JSON string (even a numeric-looking one) is a
+    malformed measurement, and coercing it would let stringified output
+    silently enter the efficiency frontier.
     """
-    if value is None or isinstance(value, bool):
+    if value is None or isinstance(value, (bool, str, bytes)):
         return None
     try:
         number = float(value)
