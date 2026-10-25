@@ -103,10 +103,22 @@ def resolve_mamba_dt_rank(dt_rank: int | str, d_model: int) -> int:
             raise ValueError(
                 f"d_model={d_model!r} must be a positive int to resolve "
                 f"dt_rank='auto'.")
+        try:
+            float(d_model)
+        except OverflowError:
+            raise ValueError(
+                f"d_model={d_model!r} must be representable as a finite "
+                f"float to resolve dt_rank='auto'.") from None
         return max(1, math.ceil(d_model / 16))
     if not isinstance(dt_rank, int) or isinstance(dt_rank, bool) or dt_rank < 1:
         raise ValueError(
             f"mamba_dt_rank={dt_rank!r} must be 'auto' or a positive int.")
+    try:
+        float(dt_rank)
+    except OverflowError:
+        raise ValueError(
+            f"mamba_dt_rank={dt_rank!r} must be representable as a finite "
+            f"float.") from None
     return dt_rank
 
 
