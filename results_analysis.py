@@ -1166,8 +1166,11 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
              else list(diags))
     if not items:
         return {'n_tokens': 0, 'n_wrong': 0, 'token_accuracy': None,
-                'categories': {}, 'confidence_calibration':
-                confidence_calibration([], []),
+                'categories': {},
+                'target_rank_on_errors': {'mean': None, 'median': None},
+                'top1_prob_on_errors': {'mean': None},
+                'top1_prob_on_correct': {'mean': None},
+                'confidence_calibration': confidence_calibration([], []),
                 'accuracy_by_position_quartile': [],
                 'accuracy_by_repeat_distance': [],
                 'note': 'no diagnostics supplied'}
