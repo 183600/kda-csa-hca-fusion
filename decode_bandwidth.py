@@ -278,13 +278,15 @@ def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
 
     Totals come from the canonical ``lm_consistency`` decode byte model
     (``kv_budget`` per-op reads averaged over the ``T`` prefill queries,
-    plus the recurrent-state writes). The split subtracts the CSA / HCA
-    read terms (recomputed from the SAME ``kv_budget`` call) from the
-    canonical total, so the identity
+    plus the recurrent-state writes). The memory component is taken
+    directly from that model (not by subtracting the CSA / HCA terms, which
+    would cancel at long context), and the CSA / HCA terms are recomputed
+    from the SAME ``kv_budget`` call, so the identity
 
         ``memory + csa + hca == total_read_elements_per_token``
 
-    holds by construction and is pinned by the regression suite.
+    holds up to floating-point rounding and is pinned by the regression
+    suite.
 
     Writes are attributed entirely to the memory route: the canonical
     model amortizes / excludes compressed-block and window writes (see
@@ -307,20 +309,27 @@ def decode_traffic_breakdown(cfg: HybridConfig, T: int, *,
     hca_read = (n_hca * kv_budget.op_read_elements('hca', T, spec)[
         'total_read_elements']) if n_hca else 0.0
     total_read = float(elems['read_elements_per_token'])
-    memory_read = total_read - csa_read - hca_read
-    if memory_read < -1e-6:
-        # The split is derived by subtraction; a negative value means the
-        # canonical model changed underneath us. Fail loudly instead of
-        # returning a fabricated number.
+    # Use the canonical memory component directly instead of subtracting
+    # the CSA/HCA terms from the total: at long context those terms are
+    # O(T^2) while the recurrent state read is O(1), so the subtraction
+    # loses the memory term (or turns it negative) to cancellation.
+    memory_read = float(elems['memory_read_elements_per_token'])
+    reconstructed = memory_read + csa_read + hca_read
+    if not math.isclose(reconstructed, total_read,
+                        rel_tol=1e-12, abs_tol=1e-9):
+        # The split and the canonical total come from the same model; a
+        # mismatch means that model changed underneath us. Fail loudly
+        # instead of returning a fabricated number.
         raise RuntimeError(
-            f'decode_bandwidth: internal split invariant violated — memory '
-            f'read {memory_read} < 0 (total={total_read}, csa={csa_read}, '
-            f'hca={hca_read}); the canonical decode byte model changed.')
-    memory_read = max(0.0, memory_read)
+            f'decode_bandwidth: internal split invariant violated — '
+            f'memory+csa+hca={reconstructed} != total={total_read}; the '
+            f'canonical decode byte model changed.')
     write_total = float(elems['write_elements_per_token'])
     read_by_op = {'memory': memory_read, 'csa': float(csa_read),
                   'hca': float(hca_read)}
-    write_by_op = {'memory': write_total, 'csa': 0.0, 'hca': 0.0}
+    write_by_op = {
+        'memory': float(elems['memory_write_elements_per_token']),
+        'csa': 0.0, 'hca': 0.0}
     total_elements = total_read + write_total
     read_bytes_by_op = {
         op: _finite_float('decode_traffic_breakdown', f'{op} read bytes',

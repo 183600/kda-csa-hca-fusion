@@ -197,6 +197,8 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
     spec = decode_read_spec(cfg)
     reads = 0.0
     writes = 0.0
+    memory_reads = 0.0
+    memory_writes = 0.0
     route = _lm_memory_route(cfg)
     if cfg.layout is not None:
         n_mem = sum(1 for k in cfg.layout if k in ('kda', 'mamba2', 'rwkv7'))
@@ -206,8 +208,10 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
         n_mem, n_csa, n_hca = cfg.n_kda, cfg.n_csa, cfg.n_hca
     if route == 'kda' and n_mem > 0:
         kda = kv_budget.op_read_elements('kda', T, spec)
-        reads += n_mem * kda['total_read_elements']
-        writes += n_mem * (kda['state_elements'] or 0)
+        memory_reads = n_mem * kda['total_read_elements']
+        memory_writes = n_mem * (kda['state_elements'] or 0)
+        reads += memory_reads
+        writes += memory_writes
     elif route == 'mamba2' and n_mem > 0:
         # Mamba-2: the SSM state is fully read and rewritten per step
         # (nheads * headdim * d_state per layer); the conv state
@@ -217,8 +221,10 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
         mamba_heads = (d_inner // cfg.mamba_headdim
                        if cfg.mamba_headdim > 0 else 1)
         ssm = mamba_heads * cfg.mamba_headdim * cfg.mamba_d_state
-        reads += n_mem * ssm
-        writes += n_mem * ssm
+        memory_reads = n_mem * ssm
+        memory_writes = n_mem * ssm
+        reads += memory_reads
+        writes += memory_writes
     elif route == 'rwkv7' and n_mem > 0:
         # RWKV-7: the matrix state is fully read and rewritten per step
         # (H * K * V per layer); the token-shift state (d) is read too
@@ -226,8 +232,10 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
         rwkv_heads = (cfg.d_model // cfg.rwkv_head_dim
                       if cfg.rwkv_head_dim > 0 else 1)
         matrix = rwkv_heads * cfg.rwkv_head_dim * cfg.rwkv_head_dim
-        reads += n_mem * matrix
-        writes += n_mem * matrix
+        memory_reads = n_mem * matrix
+        memory_writes = n_mem * matrix
+        reads += memory_reads
+        writes += memory_writes
     if n_csa > 0:
         csa = kv_budget.op_read_elements('csa', T, spec)
         reads += n_csa * csa['total_read_elements']
@@ -237,6 +245,8 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
     return {'read_elements_per_token': reads,
             'write_elements_per_token': float(writes),
             'total_elements_per_token': reads + writes,
+            'memory_read_elements_per_token': float(memory_reads),
+            'memory_write_elements_per_token': float(memory_writes),
             'memory_route': route,
             'layout': [n_mem, n_csa, n_hca]}
 

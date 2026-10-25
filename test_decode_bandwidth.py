@@ -140,6 +140,20 @@ def test_split_csa_hca_match_kv_budget_rows():
     assert bd['read_elements_by_op']['memory'] > 0.0
 
 
+def test_split_memory_term_survives_long_context():
+    # At long context the CSA/HCA terms are O(T^2) while the recurrent
+    # state read is O(1). Deriving the memory term by subtraction loses it
+    # to floating-point cancellation; the canonical component must survive.
+    for route in db.MEMORY_ROUTES:
+        cfg = small_cfg(memory_type=route)
+        elems = lm_consistency.decode_elements_per_token(cfg, 10 ** 30)
+        bd = db.decode_traffic_breakdown(cfg, 10 ** 30)
+        memory = bd['read_elements_by_op']['memory']
+        assert memory == elems['memory_read_elements_per_token'] > 0.0
+        assert sum(bd['read_elements_by_op'].values()) == pytest.approx(
+            elems['read_elements_per_token'], rel=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # batch-scaling identities
 # ---------------------------------------------------------------------------
