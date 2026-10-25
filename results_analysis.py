@@ -1640,7 +1640,25 @@ def expected_average_precision(n_pos: int, n_neg: int) -> float | None:
     n = n_pos + n_neg
     if n_neg == 0:
         return 1.0
-    harmonic = sum(1.0 / i for i in range(1, n + 1))
+    try:
+        n_float = float(n)
+    except OverflowError:
+        raise ValueError(
+            f'expected_average_precision: n_pos+n_neg={n!r} is too large '
+            f'to represent as a finite float.') from None
+    if not math.isfinite(n_float):
+        raise ValueError(
+            f'expected_average_precision: n_pos+n_neg={n!r} is too large '
+            f'to represent as a finite float.')
+    if n <= 1_000_000:
+        harmonic = sum(1.0 / i for i in range(1, n + 1))
+    else:
+        # Euler-Maclaurin: the exact loop is O(n), and JSON integers are
+        # unbounded. The first terms are accurate far beyond float64
+        # precision for n > 1e6, while a too-large n is rejected above.
+        inv = 1.0 / n_float
+        harmonic = (math.log(n_float) + 0.5772156649015328606
+                    + 0.5 * inv - inv * inv / 12.0 + inv ** 4 / 120.0)
     return float((harmonic
                   + (n_pos - 1) / (n - 1) * (n - harmonic)) / n)
 
