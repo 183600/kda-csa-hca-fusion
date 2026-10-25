@@ -596,6 +596,24 @@ def _sqrt_count(n: int) -> float:
             return math.inf
 
 
+def _ratio_by_count(value: float, count: int) -> float:
+    """Divide a float by an arbitrary-size Python int count.
+
+    ``alpha / family_size`` raises ``OverflowError`` once ``family_size``
+    exceeds the float range, even when the true quotient is still an
+    ordinary representable probability (e.g. 0.05 / 1e309). Scale the
+    denominator by a power of two and apply the same exponent to the
+    quotient, mirroring the overflow-safe token-count division used by the
+    bootstrap helpers.
+    """
+    try:
+        return value / count
+    except OverflowError:
+        shift = count.bit_length() - 53
+        scaled = count >> shift
+        return math.ldexp(value / scaled, -shift)
+
+
 _MAX_EXPLICIT_SEED_COUNT = 1_000_000
 
 
@@ -834,7 +852,7 @@ def validate_plan(plan) -> list[str]:
             if not _is_number(eq_alpha) or not (0.0 < float(eq_alpha) < 1.0):
                 errors.append('equivalence.alpha must be in (0,1)')
             elif _is_int(eq_family) and eq_family >= 1 \
-                    and float(eq_alpha) / eq_family >= 0.5:
+                    and _ratio_by_count(float(eq_alpha), eq_family) >= 0.5:
                 errors.append('equivalence.alpha / equivalence.family_size '
                               'must be below 0.5')
             eq_target = equiv.get('target_power', target)
@@ -870,7 +888,7 @@ def validate_plan(plan) -> list[str]:
             if not _is_number(i_alpha) or not (0.0 < float(i_alpha) < 1.0):
                 errors.append('interaction.alpha must be in (0,1)')
             elif _is_int(i_family) and i_family >= 1 \
-                    and float(i_alpha) / i_family >= 0.5:
+                    and _ratio_by_count(float(i_alpha), i_family) >= 0.5:
                 errors.append(
                     'interaction.alpha / interaction.family_size must be '
                     'below 0.5')
@@ -971,6 +989,25 @@ def validate_plans() -> list[str]:
 _NORMAL = statistics.NormalDist()
 
 
+def _normal_upper_quantile(tail: float) -> float:
+    """Standard-normal ``z`` with upper-tail probability ``tail``.
+
+    ``NormalDist.inv_cdf(1 - tail)`` loses all tail precision once
+    ``tail`` is below the float spacing at 1 (and raises for tail < 5e-17
+    because ``1 - tail`` rounds to exactly 1.0). Mirroring the tail first,
+    ``-inv_cdf(tail)``, keeps the relative accuracy and lets genuinely
+    unrepresentable per-test alphas (underflow to 0) report an infinite
+    requirement instead of crashing.
+    """
+    if tail <= 0.0:
+        return math.inf
+    if tail >= 1.0:
+        return -math.inf
+    if tail >= 1e-8:
+        return _NORMAL.inv_cdf(1.0 - tail)
+    return -_NORMAL.inv_cdf(tail)
+
+
 def equivalence_seeds_required(margin, sd, *, alpha=DEFAULT_ALPHA,
                                family_size=1,
                                power=DEFAULT_TARGET_POWER):
@@ -1005,17 +1042,18 @@ def equivalence_seeds_required(margin, sd, *, alpha=DEFAULT_ALPHA,
         raise DesignError(
             f'equivalence family_size must be an int >= 1, got '
             f'{family_size!r}')
-    if alpha_value / family_size >= 0.5:
+    per_test_alpha = _ratio_by_count(alpha_value, family_size)
+    if per_test_alpha >= 0.5:
         raise DesignError(
             'the per-test equivalence alpha must be below 0.5 so a '
-            f'(1-2*alpha) interval exists, got {alpha_value / family_size!r}')
+            f'(1-2*alpha) interval exists, got {per_test_alpha!r}')
     power_value = _need_number(power, 'power', positive=True)
     if not (0.0 < power_value < 1.0):
         raise DesignError(f'power must be in (0,1), got {power_value!r}')
-    z_crit = _NORMAL.inv_cdf(1.0 - alpha_value / family_size)
+    z_crit = _normal_upper_quantile(per_test_alpha)
     # At a true difference of zero the TOST power is
     # 2*Phi(m/se - z) - 1, so target power needs Phi(...) = 1 - beta/2.
-    z_power = _NORMAL.inv_cdf(0.5 * (1.0 + power_value))
+    z_power = _normal_upper_quantile((1.0 - power_value) / 2.0)
     try:
         required = ((z_crit + z_power) * sd_value / margin) ** 2
     except OverflowError:
@@ -1059,10 +1097,11 @@ def equivalence_power(n, margin, sd, *, alpha=DEFAULT_ALPHA,
         raise DesignError(
             f'equivalence family_size must be an int >= 1, got '
             f'{family_size!r}')
-    if alpha_value / family_size >= 0.5:
+    tail_alpha = _ratio_by_count(alpha_value, family_size)
+    if tail_alpha >= 0.5:
         raise DesignError(
             'the per-test equivalence alpha must be below 0.5 so a '
-            f'(1-2*alpha) interval exists, got {alpha_value / family_size!r}')
+            f'(1-2*alpha) interval exists, got {tail_alpha!r}')
     delta = _need_number(true_diff, 'true_diff')
     if n < 2:
         return None
@@ -1071,8 +1110,7 @@ def equivalence_power(n, margin, sd, *, alpha=DEFAULT_ALPHA,
         # strictly inside the margin (the TOST p is 0 / 0.5 / 1 inside /
         # boundary / outside).
         return 1.0 if abs(delta) < margin else 0.0
-    tail_alpha = alpha_value / family_size
-    z_crit = _NORMAL.inv_cdf(1.0 - tail_alpha)
+    z_crit = _normal_upper_quantile(tail_alpha)
     se = sd_value / _sqrt_count(n)
     if se == 0.0:
         # The standard error underflows for an enormous seed count. The
@@ -1142,8 +1180,9 @@ def equivalence_plan(*, margin, sd, seeds, alpha=DEFAULT_ALPHA,
     # registered margin, the run cannot declare equivalence at that margin.
     minimum_margin = None
     if seeds >= 2:
-        z_crit = _NORMAL.inv_cdf(1.0 - alpha_value / family_size)
-        z_power = _NORMAL.inv_cdf(0.5 * (1.0 + target))
+        per_test_alpha = _ratio_by_count(alpha_value, family_size)
+        z_crit = _normal_upper_quantile(per_test_alpha)
+        z_power = _normal_upper_quantile((1.0 - target) / 2.0)
         minimum_margin = (z_crit + z_power) * sd_value / _sqrt_count(seeds)
         if not math.isfinite(minimum_margin):
             minimum_margin = None
@@ -1155,8 +1194,8 @@ def equivalence_plan(*, margin, sd, seeds, alpha=DEFAULT_ALPHA,
         'note': note,
         'alpha_family_wise': alpha_value,
         'family_size': family_size,
-        'alpha_per_test': alpha_value / family_size,
-        'ci_level': 1.0 - 2.0 * alpha_value / family_size,
+        'alpha_per_test': _ratio_by_count(alpha_value, family_size),
+        'ci_level': 1.0 - 2.0 * _ratio_by_count(alpha_value, family_size),
         'target_power': target,
         'seeds': int(seeds),
         'required_seeds_at_zero': required,
@@ -1239,13 +1278,17 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
     # ``alpha_test`` is the one-sided TAIL probability the runner's
     # corrected threshold uses; multi_seed_stats takes a TEST level and
     # halves it internally, so undo that for the symmetric alternatives.
-    alpha_test = (alpha_value / family_size
-                  if alternative in ('greater', 'less')
-                  else alpha_value / (2.0 * family_size))
+    alpha_test = _ratio_by_count(
+        alpha_value,
+        family_size if alternative in ('greater', 'less')
+        else 2 * family_size)
     planning_alpha = (alpha_test if alternative in ('greater', 'less')
                       else 2.0 * alpha_test)
-    if finite_sd:
-        dz = sesoi / sd_interaction
+    dz = sesoi / sd_interaction if finite_sd else None
+    required = None
+    mde = None
+    achieved = None
+    if finite_sd and planning_alpha > 0.0:
         required = seeds_required(
             dz, alpha=planning_alpha, power=target, alternative=alternative)
         if required is not None:
@@ -1257,14 +1300,9 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         achieved = power_at_effect(
             seeds, sd_interaction, planning_effect, alpha=planning_alpha,
             alternative=alternative)
-    else:
-        # A finite SD can overflow the sqrt(2) inflation. Planning output is
-        # JSON-safe and must stay readable: report the interaction as
-        # not-estimable instead of raising from an otherwise valid plan.
-        dz = None
-        required = None
-        mde = None
-        achieved = None
+    # A non-finite SD (sqrt(2) inflation overflow) or a per-test alpha that
+    # underflowed to zero has no finite/estimable budget: report the
+    # interaction as not-estimable instead of raising from a valid plan.
     exact = exact_test_resolution(
         seeds, alpha=alpha_value, family_size=family_size,
         alternative=alternative)
@@ -1382,8 +1420,8 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
     n_seeds = plan.get('planned_seeds', 2) if seeds is None else seeds
     if not _is_int(n_seeds) or n_seeds < 0:
         raise DesignError(f'seeds must be a non-negative int, got {n_seeds!r}')
-    alpha_test = (alpha / family if alt in ('greater', 'less')
-                  else alpha / (2.0 * family))
+    alpha_test = _ratio_by_count(
+        alpha, family if alt in ('greater', 'less') else 2 * family)
     # ``multi_seed_stats`` interprets ``alpha`` as a two-sided TEST level and
     # halves it again internally.  ``alpha_test`` here is the one-sided TAIL
     # probability the significance test will actually use (matching
@@ -1394,23 +1432,29 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
     planning_alpha = (alpha_test if alt in ('greater', 'less')
                       else 2.0 * alpha_test)
     dz = sesoi_value / sd_value
-    required = seeds_required(dz, alpha=planning_alpha, power=target,
-                              alternative=alt)
-    # A paired test is undefined below two seed pairs. The normal
-    # approximation can return 1 for a very large effect; clamp the
-    # planning answer to the smallest design that can actually be run.
-    if required is not None:
-        required = max(2, int(required))
-    mde = min_detectable_effect(n_seeds, sd_value, alpha=planning_alpha,
-                                power=target, alternative=alt)
-    # The SESOI is a magnitude.  For a lower-tail alternative the effect that
-    # the plan is powered against points DOWN, while for 'greater' and the
-    # symmetric two-sided test it points up.  Passing the positive magnitude
-    # to a directional power calculation would make every 'less' plan look
-    # powerless even when the seed budget is ample.
-    planning_effect = (-sesoi_value if alt == 'less' else sesoi_value)
-    achieved = power_at_effect(n_seeds, sd_value, planning_effect,
-                               alpha=planning_alpha, alternative=alt)
+    required = None
+    mde = None
+    achieved = None
+    if planning_alpha > 0.0:
+        required = seeds_required(dz, alpha=planning_alpha, power=target,
+                                  alternative=alt)
+        # A paired test is undefined below two seed pairs. The normal
+        # approximation can return 1 for a very large effect; clamp the
+        # planning answer to the smallest design that can actually be run.
+        if required is not None:
+            required = max(2, int(required))
+        mde = min_detectable_effect(n_seeds, sd_value, alpha=planning_alpha,
+                                    power=target, alternative=alt)
+        # The SESOI is a magnitude.  For a lower-tail alternative the effect
+        # that the plan is powered against points DOWN, while for 'greater'
+        # and the symmetric two-sided test it points up.  Passing the
+        # positive magnitude to a directional power calculation would make
+        # every 'less' plan look powerless even when the seed budget is ample.
+        planning_effect = (-sesoi_value if alt == 'less' else sesoi_value)
+        achieved = power_at_effect(n_seeds, sd_value, planning_effect,
+                                   alpha=planning_alpha, alternative=alt)
+    # planning_alpha underflowing to zero (an enormous family) leaves no
+    # finite seed budget; the status below is then honestly not_estimable.
     if required is None:
         status = 'not_estimable'
     elif achieved is not None and achieved >= target - 1e-9:
