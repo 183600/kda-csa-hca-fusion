@@ -217,6 +217,16 @@ def test_clopper_pearson_small_tail_is_precise_for_large_n():
     json.dumps(underflow, allow_nan=False)
 
 
+def test_clopper_pearson_json_sized_n_central_rates_are_finite():
+    huge = 10 ** 400
+    for k in (huge // 4, huge // 2, 3 * huge // 4):
+        interval = M.binomial_proportion_ci(k, huge)
+        observed = k / huge
+        assert interval['ci_low'] <= observed <= interval['ci_high']
+        assert 0.0 <= interval['ci_low'] <= interval['ci_high'] <= 1.0
+        json.dumps(interval, allow_nan=False)
+
+
 def test_sign_test_reports_win_rate_and_exact_interval():
     s = M.sign_test([1, 1, 1, 1, 1])
     assert s['win_rate'] == 1.0

@@ -482,7 +482,17 @@ def _normal_beta_quantile(q: float, a: int, b: int) -> float:
     """
     total = a + b
     mean = a / total
-    variance = mean * (1.0 - mean) / (total + 1.0)
+    if q <= 0.0:
+        return 0.0
+    if q >= 1.0:
+        return 1.0
+    total_float = _float_count(total)
+    if total_float is None:
+        # The variance (at most 1/(4*(total+1))) is below the smallest
+        # representable float, so its quantile offset underflows to zero.
+        # Returning the exact mean is the closest representable bound.
+        return mean
+    variance = mean * (1.0 - mean) / (total_float + 1.0)
     if variance <= 0.0:
         return mean
     z = NormalDist().inv_cdf(q)
