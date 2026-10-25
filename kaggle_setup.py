@@ -1197,6 +1197,14 @@ def parse_int_env(var_name: str, default: int, *, min_value: int = 1,
             f'invalid {var_name}={raw!r} (must be >= {min_value}); '
             f'using default {default}')
         return default
+    if val > sys.maxsize:
+        # Python ints are unbounded, but every count from this helper ends
+        # up in a range/loop/tensor shape; silently accepting a value that
+        # cannot be indexed would turn a typo into a hang or OverflowError.
+        log.warning(
+            f'invalid {var_name}={raw!r} (larger than sys.maxsize); '
+            f'using default {default}')
+        return default
     return val
 
 

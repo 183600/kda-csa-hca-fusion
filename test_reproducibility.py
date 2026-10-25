@@ -35,6 +35,7 @@ from kaggle_setup import (  # noqa: E402
     largest_remainder_sizes,
     make_run_manifest_entry,
     make_seeded_generator,
+    parse_int_env,
     recipe_sha256,
     seed_worker,
     set_global_seed,
@@ -1004,6 +1005,15 @@ def test_recipe_sha256_ignores_key_order_and_nan():
     assert recipe_sha256(a) == recipe_sha256(b)
     assert recipe_sha256(a) != recipe_sha256({'lr': 0.1, 'batch': 33})
     assert len(recipe_sha256({})) == 64
+
+
+def test_parse_int_env_rejects_counts_too_large_to_index(monkeypatch):
+    monkeypatch.setenv('FUSION_BIG_COUNT', '9' * 100)
+    assert parse_int_env('FUSION_BIG_COUNT', 7) == 7
+    monkeypatch.setenv('FUSION_BIG_COUNT', str(sys.maxsize))
+    assert parse_int_env('FUSION_BIG_COUNT', 7) == sys.maxsize
+    monkeypatch.setenv('FUSION_BIG_COUNT', str(sys.maxsize + 1))
+    assert parse_int_env('FUSION_BIG_COUNT', 7) == 7
 
 
 def test_manifest_entry_requires_seeds_and_carries_identity():
