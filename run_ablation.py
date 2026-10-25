@@ -3602,14 +3602,25 @@ def _attach_decode_traffic(all_results: list, *, d_model: int = 32,
             for label, (fields, error) in cache.items()}
 
 
-def _attach_recall_efficiency(rows: list, *, name_key: str = 'ratio') -> dict:
+def _attach_recall_efficiency(rows: list, *, name_key: str = 'ratio',
+                              decode_T: int | None = None) -> dict:
     """Annotate chance-corrected recall per MB and the Pareto frontier.
 
     Rows are grouped by ``n_kv`` so a harder task cell is never compared
     directly against an easier one; within a cell the frontier is
     (accuracy maximise, decode bytes minimise).  Baseline rows are
-    excluded because no ratio traffic was priced for them.
+    excluded because no ratio traffic was priced for them.  ``decode_T``
+    defaults to the reference context recorded by
+    :func:`_attach_decode_traffic` on the rows (falling back to
+    ``SEQ_LEN`` for callers that built the rows by hand), so a custom
+    reference context is not mislabelled in the report.
     """
+    if decode_T is None:
+        row_Ts = {
+            row.get('decode_T') for row in rows
+            if isinstance(row, dict) and row.get('decode_T') is not None
+        }
+        decode_T = row_Ts.pop() if len(row_Ts) == 1 else SEQ_LEN
     groups: dict = {}
     for row in rows:
         if 'error' in row or row.get('is_baseline'):
@@ -3626,7 +3637,7 @@ def _attach_recall_efficiency(rows: list, *, name_key: str = 'ratio') -> dict:
         'accuracy_key': 'mean_acc',
         'chance_key': 'chance_acc',
         'bytes_key': DEFAULT_TRAFFIC_KEY,
-        'decode_T': SEQ_LEN,
+        'decode_T': decode_T,
         'scope': ('canonical compulsory-traffic lower bound; tower weights '
                   'excluded; analysis only, not a kernel measurement'),
         'by_n_kv': report,
