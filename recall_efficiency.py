@@ -39,7 +39,7 @@ bound when a wall-clock comparison is needed.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 
 #: Row field written by :func:`decode_traffic_fields` and consumed by the
 #: Pareto/efficiency annotation.  Kept as one constant so producers and
@@ -251,7 +251,7 @@ def _unique_keys(rows: Sequence, name_key: str) -> list[str]:
     return keys
 
 
-def annotate_recall_efficiency(rows: Sequence[dict], *,
+def annotate_recall_efficiency(rows: Sequence[Mapping], *,
                                accuracy_key: str = 'mean_acc',
                                chance_key: str = 'chance_acc',
                                bytes_key: str = DEFAULT_TRAFFIC_KEY,
@@ -283,7 +283,7 @@ def annotate_recall_efficiency(rows: Sequence[dict], *,
     points: dict = {}
     skipped: list[str] = []
     for row, key in zip(rows, keys):
-        if not isinstance(row, dict):
+        if not isinstance(row, Mapping):
             skipped.append(key)
             continue
         acc = _finite_or_none(row.get(accuracy_key))
@@ -292,7 +292,8 @@ def annotate_recall_efficiency(rows: Sequence[dict], *,
         skill = chance_corrected_recall(acc, base)
         if acc is None or skill is None or nbytes is None or nbytes <= 0.0:
             skipped.append(key)
-            row['recall_efficiency'] = None
+            if isinstance(row, MutableMapping):
+                row['recall_efficiency'] = None
             continue
         points[key] = {
             'accuracy': acc,
@@ -329,7 +330,7 @@ def annotate_recall_efficiency(rows: Sequence[dict], *,
 
     frontier = [n for n in names if n not in dominated_by]
     for row, key in zip(rows, keys):
-        if not isinstance(row, dict):
+        if not isinstance(row, MutableMapping):
             continue
         point = points.get(key)
         if point is None:
