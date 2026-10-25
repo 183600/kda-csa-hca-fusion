@@ -96,6 +96,10 @@ DEFAULT_RTOL = 1e-4
 #: Default CLI schedules: one-shot plus a geometric chunk sweep.
 DEFAULT_SCHEDULES = ('full', '64', '32', '16', '8', '1')
 
+#: A uniform schedule is materialized as one list entry per chunk; reject
+#: counts that would exhaust memory before the first forward runs.
+MAX_SCHEDULE_CHUNKS = 1_000_000
+
 
 # ---------------------------------------------------------------------------
 # Schedule construction
@@ -173,6 +177,12 @@ def expand_prefill_schedule(total_len: int, chunks):
 
 
 def _uniform_schedule(total_len: int, size: int) -> list[int]:
+    n_chunks = total_len // size + (1 if total_len % size else 0)
+    if n_chunks > MAX_SCHEDULE_CHUNKS:
+        raise ValueError(
+            f'uniform prefill schedule would have {n_chunks} chunks '
+            f'(limit {MAX_SCHEDULE_CHUNKS}); use a larger chunk size or '
+            f'an explicit schedule')
     return [size] * (total_len // size) + (
         [total_len % size] if total_len % size else [])
 

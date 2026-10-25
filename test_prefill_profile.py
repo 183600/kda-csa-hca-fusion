@@ -94,6 +94,10 @@ def test_expand_prefill_schedule_rejects_ambiguous_inputs():
         expand_prefill_schedule(10, True)
     with pytest.raises(ValueError):
         expand_prefill_schedule(10, 'nonsense')
+    with pytest.raises(ValueError):
+        expand_prefill_schedule(10 ** 9, 1)  # too many chunks to enumerate
+    with pytest.raises(ValueError):
+        expand_prefill_schedule(10 ** 9, '1')
 
 
 def test_schedule_label_is_stable():
