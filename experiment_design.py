@@ -581,6 +581,21 @@ def _need_number(value, name, *, positive=False, allow_zero=True):
     return value
 
 
+def _sqrt_count(n: int) -> float:
+    """Square root of a non-negative integer, ``inf`` if unrepresentable."""
+    if n <= 0:
+        return 0.0
+    try:
+        return math.sqrt(n)
+    except OverflowError:
+        shift = (n.bit_length() - 1) // 2
+        mantissa = n / (1 << (2 * shift))
+        try:
+            return math.ldexp(math.sqrt(mantissa), shift)
+        except OverflowError:
+            return math.inf
+
+
 def _seed_list(n_or_seeds, *, name='seeds'):
     """Normalize an int seed COUNT or an explicit seed sequence to a list."""
     if _is_int(n_or_seeds):
@@ -1050,7 +1065,15 @@ def equivalence_power(n, margin, sd, *, alpha=DEFAULT_ALPHA,
         return 1.0 if abs(delta) < margin else 0.0
     tail_alpha = alpha_value / family_size
     z_crit = _NORMAL.inv_cdf(1.0 - tail_alpha)
-    se = sd_value / math.sqrt(n)
+    se = sd_value / _sqrt_count(n)
+    if se == 0.0:
+        # The standard error underflows for an enormous seed count. The
+        # TOST power is then at its limiting value, not 0/0.
+        lower = (1.0 if delta > -margin
+                 else tail_alpha if delta == -margin else 0.0)
+        upper = (1.0 if delta < margin
+                 else tail_alpha if delta == margin else 0.0)
+        return min(1.0, max(0.0, float(lower + upper - 1.0)))
     lower = _NORMAL.cdf((delta + margin) / se - z_crit)
     upper = _NORMAL.cdf((margin - delta) / se - z_crit)
     return min(1.0, max(0.0, float(lower + upper - 1.0)))
@@ -1113,7 +1136,7 @@ def equivalence_plan(*, margin, sd, seeds, alpha=DEFAULT_ALPHA,
     if seeds >= 2:
         z_crit = _NORMAL.inv_cdf(1.0 - alpha_value / family_size)
         z_power = _NORMAL.inv_cdf(0.5 * (1.0 + target))
-        minimum_margin = (z_crit + z_power) * sd_value / math.sqrt(seeds)
+        minimum_margin = (z_crit + z_power) * sd_value / _sqrt_count(seeds)
         if not math.isfinite(minimum_margin):
             minimum_margin = None
     shortfall = (max(0, int(required) - int(seeds))

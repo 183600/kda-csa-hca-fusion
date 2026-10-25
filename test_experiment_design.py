@@ -218,6 +218,25 @@ def test_equivalence_planning_uses_the_tost_doubled_tail():
     assert D.equivalence_power(5, 0.05, 0.0, true_diff=0.06) == 0.0
 
 
+def test_json_sized_seed_counts_keep_planning_json_safe():
+    huge = 10 ** 400
+    beyond = 10 ** 1000
+    assert D.equivalence_power(huge, 0.05, 0.1) == 1.0
+    assert D.equivalence_power(beyond, 0.05, 0.1) == 1.0
+    eq = D.equivalence_plan(margin=0.05, sd=0.1, seeds=huge)
+    assert eq['status'] == 'equivalence_supported'
+    assert eq['planned_power_at_zero'] == 1.0
+    assert 0.0 < eq['minimum_supportable_margin_at_n'] < 1e-150
+    json.dumps(eq, allow_nan=False)
+    rep = D.planning_report('exp4_mqar', seeds=huge)
+    assert rep['equivalence']['status'] == 'equivalence_supported'
+    json.dumps(rep, allow_nan=False)
+    inter = D.planning_report('exp5b_matrix', seeds=huge)['interaction']
+    assert inter['status'] == 'confirmatory_ready'
+    assert inter['planned_power'] == 1.0
+    json.dumps(inter, allow_nan=False)
+
+
 def test_equivalence_margin_must_not_exceed_the_sesoi():
     base = D.get_plan('exp4_mqar')
     wide = dict(base, equivalence=dict(base['equivalence'], margin=0.20))
