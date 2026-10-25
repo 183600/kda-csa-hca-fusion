@@ -237,6 +237,14 @@ def test_json_sized_seed_counts_keep_planning_json_safe():
     json.dumps(inter, allow_nan=False)
 
 
+def test_json_sized_seed_count_is_rejected_before_enumeration():
+    huge = 10 ** 400
+    with pytest.raises(D.DesignError, match='too large to enumerate'):
+        D.audit_run('exp4_mqar', seeds=huge)
+    with pytest.raises(D.DesignError, match='too large to enumerate'):
+        D.design_manifest(seeds_by_plan={'exp4_mqar': huge})
+
+
 def test_equivalence_margin_must_not_exceed_the_sesoi():
     base = D.get_plan('exp4_mqar')
     wide = dict(base, equivalence=dict(base['equivalence'], margin=0.20))

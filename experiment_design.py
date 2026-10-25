@@ -596,11 +596,19 @@ def _sqrt_count(n: int) -> float:
             return math.inf
 
 
+_MAX_EXPLICIT_SEED_COUNT = 1_000_000
+
+
 def _seed_list(n_or_seeds, *, name='seeds'):
     """Normalize an int seed COUNT or an explicit seed sequence to a list."""
     if _is_int(n_or_seeds):
         if n_or_seeds < 0:
             raise DesignError(f'{name} count must be >= 0, got {n_or_seeds!r}')
+        if n_or_seeds > _MAX_EXPLICIT_SEED_COUNT:
+            raise DesignError(
+                f'{name} count {n_or_seeds!r} is too large to enumerate '
+                f'explicitly (limit {_MAX_EXPLICIT_SEED_COUNT}); pass only '
+                f'the seed ids actually requested')
         return [DEFAULT_SEED_BASE + i for i in range(n_or_seeds)]
     if isinstance(n_or_seeds, (str, bytes)) or not hasattr(n_or_seeds,
                                                            '__iter__'):
