@@ -66,6 +66,39 @@ def _finite_or_none(value):
     return number if math.isfinite(number) else None
 
 
+def _ledger_sequence_length(value):
+    """Validate a ledger ``T`` as a non-negative integer (or ``None``)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f'decode_traffic_fields: T={value!r} must be a non-negative '
+            f'int or None.')
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            f'decode_traffic_fields: T={value!r} must be representable as '
+            f'a finite integer.') from None
+    if not math.isfinite(number) or number < 0.0 or number != int(number):
+        raise ValueError(
+            f'decode_traffic_fields: T={value!r} must be a non-negative '
+            f'integer.')
+    return int(number)
+
+
+def _ledger_op_map(traffic: Mapping, key: str) -> Mapping:
+    """Return a validated per-operator byte map (missing -> empty)."""
+    value = traffic.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f'decode_traffic_fields: {key} must be a mapping, got '
+            f'{type(value).__name__}.')
+    return value
+
+
 def chance_corrected_recall(accuracy, chance):
     """MQAR skill above chance: ``(acc - chance) / (1 - chance)``.
 
@@ -149,26 +182,42 @@ def decode_traffic_fields(traffic: Mapping) -> dict:
         raise ValueError(
             'decode_traffic_fields: total_bytes_per_token does not equal '
             'read + write; refusing to price an inconsistent ledger.')
+    read_by_op = _ledger_op_map(traffic, 'read_bytes_by_op')
+    write_by_op = _ledger_op_map(traffic, 'write_bytes_by_op')
     by_op = {}
     for op in ('memory', 'csa', 'hca'):
-        read = _finite_or_none(
-            (traffic.get('read_bytes_by_op') or {}).get(op))
-        write = _finite_or_none(
-            (traffic.get('write_bytes_by_op') or {}).get(op))
+        read_raw = read_by_op.get(op)
+        write_raw = write_by_op.get(op)
+        read = _finite_or_none(read_raw)
+        write = _finite_or_none(write_raw)
+        for label, raw, number in (
+                ('read', read_raw, read), ('write', write_raw, write)):
+            if raw is not None and (number is None or number < 0.0):
+                raise ValueError(
+                    f'decode_traffic_fields: {op} {label} bytes per token '
+                    f'({raw!r}) must be a finite non-negative number.')
         by_op[op] = {
             'read_bytes_per_token': read,
             'write_bytes_per_token': write,
         }
+    layout_raw = traffic.get('layout')
+    if layout_raw is None:
+        layout = None
+    else:
+        if (isinstance(layout_raw, (str, bytes))
+                or not isinstance(layout_raw, Sequence)):
+            raise TypeError(
+                f'decode_traffic_fields: layout must be a sequence of '
+                f'layer kinds, got {type(layout_raw).__name__}.')
+        layout = list(layout_raw)
     fields = {
-        'decode_T': int(traffic.get('T')) if traffic.get('T') is not None
-        else None,
+        'decode_T': _ledger_sequence_length(traffic.get('T')),
         'decode_read_bytes_per_token': values['read_bytes_per_token'],
         'decode_write_bytes_per_token': values['write_bytes_per_token'],
         DEFAULT_TRAFFIC_KEY: total,
         'decode_bytes_by_op': by_op,
         'decode_memory_route': traffic.get('memory_route'),
-        'decode_layout': (list(traffic['layout'])
-                          if traffic.get('layout') is not None else None),
+        'decode_layout': layout,
         'decode_traffic_scope': (
             'canonical per-sequence per-token state/cache bytes '
             '(compulsory lower bound; tower weights excluded)'),
