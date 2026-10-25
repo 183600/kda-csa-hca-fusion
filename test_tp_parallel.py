@@ -757,3 +757,36 @@ def test_suffix_metrics_are_double_precision_and_json_safe():
     assert metrics['max_abs_diff'] is None
     assert metrics['first_divergence_step'] == 0
     json.dumps(metrics, allow_nan=False)
+
+
+def test_decode_causality_audit_nonfinite_suffix_is_json_safe():
+    import json
+    from decode_state_ablation import decode_causality_audit
+
+    class _NaNSuffixDecoder:
+        class _Model:
+            memory_layers = []
+
+        model = _Model()
+
+        def reset(self):
+            self.pos = 0
+
+        def forward(self, x):
+            out = x.clone()
+            steps = self.pos + torch.arange(x.shape[1])
+            out[:, steps == 5] = float('nan')
+            self.pos += x.shape[1]
+            return out
+
+        __call__ = forward
+
+    x = torch.arange(12, dtype=torch.float32).reshape(1, 6, 2)
+    result = decode_causality_audit(_NaNSuffixDecoder(), x, cut=3)
+    # A poisoned suffix is a changed suffix, not a vacuous probe: the raw
+    # ``NaN > tol`` comparison is False and used to hide the divergence.
+    assert result['future_perturbation_nonvacuous'] is True
+    assert result['future_perturbation_suffix_max_abs_diff'] is None
+    assert result['prefix_unchanged'] is True
+    assert result['incremental_prefix_matches_one_shot'] is True
+    json.dumps(result, allow_nan=False)

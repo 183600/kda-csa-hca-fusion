@@ -317,20 +317,37 @@ def decode_causality_audit(decoder, x, *, cut=None, prefix_chunks=None,
             pieces.append(decoder(x[:, t:t + 1]))
         incremental = torch.cat(pieces, dim=1)
 
-    prefix_diff = (reference[:, :cut] - changed[:, :cut]).abs().max()
-    suffix_diff = (reference[:, cut:] - changed[:, cut:]).abs().max()
-    incremental_diff = (reference[:, :cut] - incremental[:, :cut]).abs().max()
+    # Compute the audit differences in float64 for the same reason as
+    # ``_suffix_metrics``: a finite float64 output above the float32 range
+    # must not be rounded to inf in the difference. A non-finite difference
+    # cannot certify a causal match; for the future perturbation it counts
+    # as non-vacuous (a poisoned suffix is still a changed suffix), never as
+    # a silent no-op from ``NaN > tol`` being False.
+    prefix_diff = (reference[:, :cut].detach().double()
+                   - changed[:, :cut].detach().double()).abs().max()
+    suffix_diff = (reference[:, cut:].detach().double()
+                   - changed[:, cut:].detach().double()).abs().max()
+    incremental_diff = (reference[:, :cut].detach().double()
+                        - incremental[:, :cut].detach().double()).abs().max()
+    prefix_value = float(prefix_diff)
+    suffix_value = float(suffix_diff)
+    incremental_value = float(incremental_diff)
     return {
         'n_tokens': T,
         'cut': cut,
         'prefix_chunks': list(chunks),
         'seed': seed,
         'tol': tol,
-        'prefix_max_abs_diff': float(prefix_diff),
-        'future_perturbation_suffix_max_abs_diff': float(suffix_diff),
-        'incremental_prefix_max_abs_diff': float(incremental_diff),
-        'prefix_unchanged': bool(float(prefix_diff) <= tol),
-        'future_perturbation_nonvacuous': bool(float(suffix_diff) > tol),
+        'prefix_max_abs_diff': (prefix_value
+                                if math.isfinite(prefix_value) else None),
+        'future_perturbation_suffix_max_abs_diff': (
+            suffix_value if math.isfinite(suffix_value) else None),
+        'incremental_prefix_max_abs_diff': (
+            incremental_value if math.isfinite(incremental_value) else None),
+        'prefix_unchanged': bool(math.isfinite(prefix_value)
+                                 and prefix_value <= tol),
+        'future_perturbation_nonvacuous': bool(
+            not math.isfinite(suffix_value) or suffix_value > tol),
         'incremental_prefix_matches_one_shot': bool(
-            float(incremental_diff) <= tol),
+            math.isfinite(incremental_value) and incremental_value <= tol),
     }
