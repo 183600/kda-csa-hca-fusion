@@ -304,6 +304,50 @@ def test_roofline_rejects_unrepresentable_geometry():
         _ok(f'{name} rejects an oversized geometry', raised, '')
 
 
+def test_roofline_rejects_non_finite_coordinates():
+    print("\nTest: roofline rejects NaN/Inf coordinates")
+    nan = float('nan')
+    inf = float('inf')
+    cases = [
+        ('arithmetic_intensity nan flops',
+         lambda: roofline.arithmetic_intensity(nan, 1.0)),
+        ('arithmetic_intensity inf bytes',
+         lambda: roofline.arithmetic_intensity(1.0, inf)),
+        ('arithmetic_intensity negative bytes',
+         lambda: roofline.arithmetic_intensity(1.0, -1.0)),
+        ('arithmetic_intensity product',
+         lambda: roofline.arithmetic_intensity(1e308, 1e-308)),
+        ('ridge_point nan flops',
+         lambda: roofline.ridge_point(nan, 100.0)),
+        ('ridge_point inf bandwidth',
+         lambda: roofline.ridge_point(1e12, inf)),
+        ('roofline_point nan time',
+         lambda: roofline.roofline_point(flops=1.0, nbytes=1.0,
+                                         time_ms=nan)),
+        ('roofline_point inf time',
+         lambda: roofline.roofline_point(flops=1.0, nbytes=1.0,
+                                         time_ms=inf)),
+        ('roofline_point nan flops',
+         lambda: roofline.roofline_point(flops=nan, nbytes=1.0,
+                                         time_ms=1.0)),
+        ('roofline_point subnormal time',
+         lambda: roofline.roofline_point(flops=1.0, nbytes=1.0,
+                                         time_ms=5e-324)),
+    ]
+    for name, call in cases:
+        try:
+            call()
+        except ValueError:
+            pass
+        else:
+            _ok(f'{name} rejects a non-finite coordinate', False, 'no error')
+            continue
+        _ok(f'{name} rejects a non-finite coordinate', True, '')
+    _ok('non-finite efficiency labels are unknown',
+        roofline.efficiency_label(nan) == 'unknown'
+        and roofline.efficiency_label(inf) == 'unknown', '')
+
+
 _TEST_FUNCS = [
     test_schema_detects_legacy_and_current_versions,
     test_schema_rejects_non_mapping_metadata,
@@ -311,6 +355,7 @@ _TEST_FUNCS = [
     test_schema_future_version_is_refused,
     test_roofline_core_math,
     test_roofline_rejects_unrepresentable_geometry,
+    test_roofline_rejects_non_finite_coordinates,
     test_roofline_point_classification,
     test_roofline_device_presets,
     test_roofline_host_microbenchmarks_smoke,

@@ -174,8 +174,21 @@ def arithmetic_intensity(flops: float, nbytes: float) -> float:
             f'arithmetic_intensity: flops={flops!r} and nbytes={nbytes!r} '
             f'must be real numbers representable as finite floats'
         ) from None
+    if not math.isfinite(flops_value) or not math.isfinite(nbytes_value):
+        raise ValueError(
+            f'arithmetic_intensity: flops={flops!r} and nbytes={nbytes!r} '
+            f'must be real numbers representable as finite floats'
+        )
+    if nbytes_value < 0:
+        raise ValueError(
+            f'arithmetic_intensity: nbytes={nbytes!r} must be non-negative')
     if nbytes_value > 0:
-        return flops_value / nbytes_value
+        value = flops_value / nbytes_value
+        if not math.isfinite(value):
+            raise ValueError(
+                f'arithmetic_intensity: flops={flops!r} and '
+                f'nbytes={nbytes!r} produce an unrepresentable intensity')
+        return value
     return math.inf if flops_value > 0 else 0.0
 
 
@@ -191,8 +204,9 @@ def ridge_point(peak_flops_per_s: float, peak_bw_gbps: float) -> float:
         raise ValueError(
             f'peak_bw_gbps={peak_bw_gbps!r} must be representable as a '
             f'finite float') from None
-    if bw_value <= 0:
-        raise ValueError('peak_bw_gbps must be positive')
+    if not math.isfinite(bw_value) or bw_value <= 0:
+        raise ValueError(
+            f'peak_bw_gbps={peak_bw_gbps!r} must be finite and positive')
     if isinstance(peak_flops_per_s, bool) or not isinstance(
             peak_flops_per_s, (int, float)):
         raise ValueError(
@@ -203,7 +217,16 @@ def ridge_point(peak_flops_per_s: float, peak_bw_gbps: float) -> float:
         raise ValueError(
             f'peak_flops_per_s={peak_flops_per_s!r} must be representable '
             f'as a finite float') from None
-    return flops_value / (bw_value * 1e9)
+    if not math.isfinite(flops_value):
+        raise ValueError(
+            f'peak_flops_per_s={peak_flops_per_s!r} must be finite')
+    value = flops_value / (bw_value * 1e9)
+    if not math.isfinite(value):
+        raise ValueError(
+            f'ridge_point: peak_flops_per_s={peak_flops_per_s!r} and '
+            f'peak_bw_gbps={peak_bw_gbps!r} produce an unrepresentable '
+            f'ridge point')
+    return value
 
 
 def bound_for(ai: float, peak_flops_per_s: float,
@@ -235,26 +258,47 @@ def roofline_point(*, flops: float, nbytes: float, time_ms: float,
         raise ValueError(
             f'roofline_point: time_ms={time_ms!r} must be representable as '
             f'a finite float') from None
+    if not math.isfinite(time_value):
+        raise ValueError(
+            f'roofline_point: time_ms={time_ms!r} must be finite')
     if time_value > 0:
         # ``arithmetic_intensity`` already rejected unrepresentable
         # flops/nbytes, so these casts cannot overflow.
         flops_value = float(flops)
         nbytes_value = float(nbytes)
-        out['achieved_tflops'] = flops_value / (time_value * 1e-3) / 1e12
-        out['achieved_bw_gbps'] = nbytes_value / (time_value * 1e-3) / 1e9
+        time_s = time_value * 1e-3
+        if time_s <= 0.0:
+            raise ValueError(
+                f'roofline_point: time_ms={time_ms!r} is too small to '
+                f'represent as seconds')
+        out['achieved_tflops'] = _finite_result(
+            'roofline_point', 'achieved TFLOP/s',
+            flops_value / time_s / 1e12)
+        out['achieved_bw_gbps'] = _finite_result(
+            'roofline_point', 'achieved bandwidth',
+            nbytes_value / time_s / 1e9)
     else:
         out['achieved_tflops'] = None
         out['achieved_bw_gbps'] = None
     if peak_flops_per_s and peak_bw_gbps and time_value > 0:
         ridge = ridge_point(peak_flops_per_s, peak_bw_gbps)
-        compute_time_s = float(flops) / float(peak_flops_per_s)
-        memory_time_s = float(nbytes) / (float(peak_bw_gbps) * 1e9)
-        ceiling_s = max(compute_time_s, memory_time_s)
+        compute_time_s = _finite_result(
+            'roofline_point', 'compute time',
+            float(flops) / float(peak_flops_per_s))
+        memory_time_s = _finite_result(
+            'roofline_point', 'memory time',
+            float(nbytes) / (float(peak_bw_gbps) * 1e9))
+        ceiling_s = _finite_result(
+            'roofline_point', 'roofline ceiling',
+            max(compute_time_s, memory_time_s))
         out['ridge_point_flops_per_byte'] = ridge
         out['roofline_bound'] = 'compute' if out[
             'arithmetic_intensity_flops_per_byte'] >= ridge else 'memory'
-        out['roofline_ceiling_ms'] = ceiling_s * 1e3
-        out['pct_of_roofline'] = ceiling_s * 1e3 / time_value * 100.0
+        out['roofline_ceiling_ms'] = _finite_result(
+            'roofline_point', 'roofline ceiling ms', ceiling_s * 1e3)
+        out['pct_of_roofline'] = _finite_result(
+            'roofline_point', 'percent of roofline',
+            ceiling_s * 1e3 / time_value * 100.0)
         out['efficiency_label'] = efficiency_label(
             out['pct_of_roofline'])
     return out
@@ -269,9 +313,15 @@ def efficiency_label(pct_of_roofline: float | None) -> str:
     """
     if pct_of_roofline is None:
         return 'unknown'
-    if pct_of_roofline >= 50.0:
+    try:
+        pct_value = float(pct_of_roofline)
+    except (TypeError, ValueError, OverflowError):
+        return 'unknown'
+    if not math.isfinite(pct_value):
+        return 'unknown'
+    if pct_value >= 50.0:
         return 'near-roofline'
-    if pct_of_roofline >= 10.0:
+    if pct_value >= 10.0:
         return 'moderate'
     return 'overhead-bound'
 
