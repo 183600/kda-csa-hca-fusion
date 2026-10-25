@@ -578,6 +578,14 @@ def test_audit_split_detects_overlap_and_missing_rows():
     straddling = {'train': [0, 1], 'val': [2], 'test': [3]}
     report = audit_split(straddling, 4, group_ids=['a', 'a', 'b', 'b'])
     assert not report['ok'] and not report['group_integrity']
+    # Malformed indices are reported, not leaked as TypeError from min().
+    malformed = audit_split(
+        {'train': ['x'], 'val': [1], 'test': [2]}, 3)
+    assert not malformed['ok']
+    assert any('non-integer' in p for p in malformed['problems'])
+    for bad in (True, 3.5, -1, 10 ** 400):
+        with pytest.raises(ValueError):
+            audit_split({'train': [0], 'val': [1], 'test': [2]}, bad)
 
 
 def test_clean_lm_texts_drops_empty_duplicates_and_unlearnable():

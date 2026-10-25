@@ -1777,18 +1777,37 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
     booleans and a ``problems`` list. Callers should abort on
     ``ok == False`` instead of training on a compromised split.
     """
+    import collections.abc
+    if not isinstance(split, collections.abc.Mapping):
+        raise TypeError(
+            f'audit_split: split must be a mapping, got {type(split).__name__}')
+    if isinstance(n_samples, bool) or not isinstance(n_samples, int):
+        raise ValueError(
+            f'audit_split: n_samples must be an exact int, got {n_samples!r}')
+    n = n_samples
+    if n < 0:
+        raise ValueError(f'audit_split: n_samples must be >= 0, got {n}')
+    if n > sys.maxsize:
+        raise ValueError(
+            f'audit_split: n_samples={n!r} is too large to audit.')
     problems = []
-    n = int(n_samples)
     expected_keys = {'train', 'val', 'test'}
     if set(split) != expected_keys:
         problems.append(
             f'split keys must be {sorted(expected_keys)}, got {sorted(split)}')
     index_sets = {}
     for key in ('train', 'val', 'test'):
-        idx = list(split.get(key) or [])
-        index_sets[key] = idx
-        if any(not isinstance(i, int) for i in idx):
+        raw_idx = list(split.get(key) or [])
+        idx = []
+        malformed = False
+        for i in raw_idx:
+            if isinstance(i, bool) or not isinstance(i, int):
+                malformed = True
+                continue
+            idx.append(i)
+        if malformed:
             problems.append(f'{key}: non-integer index present')
+        index_sets[key] = idx
         if len(set(idx)) != len(idx):
             problems.append(f'{key}: duplicate indices within the split')
         if idx and (min(idx) < 0 or max(idx) >= n):
@@ -1804,9 +1823,12 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
     union = set()
     for idx in index_sets.values():
         union.update(idx)
-    complete = union == set(range(n))
+    # Every valid index is in [0, n), so the union size is the number of
+    # assigned rows. Comparing sizes avoids materialising ``set(range(n))``
+    # for a huge (but still auditable) sample count.
+    complete = len(union) == n
     if not complete:
-        missing = len(set(range(n)) - union)
+        missing = n - len(union)
         problems.append(f'{missing} row(s) not assigned to any split')
     non_empty = all(len(v) > 0 for v in index_sets.values())
     if not non_empty:
