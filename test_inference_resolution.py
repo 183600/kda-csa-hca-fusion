@@ -100,6 +100,17 @@ def test_extreme_positive_floors_do_not_overflow():
     json.dumps(huge_family, allow_nan=False)
 
 
+def test_json_sized_pair_count_keeps_the_resolution_json_safe():
+    huge = 10 ** 400
+    r = M.exact_test_resolution(huge)
+    assert r['min_attainable_p_raw'] == 0.0
+    assert r['min_attainable_p_holm'] == 0.0
+    assert r['family_testable'] is True
+    assert r['min_effective_pairs_raw'] == 6
+    assert r['max_comparisons_at_alpha'] is None
+    json.dumps(r, allow_nan=False)
+
+
 def test_underflowed_raw_floor_keeps_the_exact_family_answer():
     """A p floor below the smallest float still has an exact family bound.
 

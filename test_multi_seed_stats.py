@@ -1190,3 +1190,18 @@ def test_interaction_contrast_reports_unrepresentable_interaction():
     assert rep['sd_diff'] is None
     assert rep['direction'] == 'none'
     json.dumps(rep, allow_nan=False)
+
+
+def test_json_sized_seed_counts_do_not_leak_overflow():
+    huge = 10 ** 400
+    mde = M.min_detectable_effect(huge, 1.0)
+    assert mde is not None and 0.0 < mde < 1e-150
+    assert M.power_at_effect(huge, 1.0, 0.1) == 1.0
+    assert M.power_at_effect(huge, 1.0, 0.0) == pytest.approx(0.05)
+    assert M.power_at_effect(huge, 1.0, -0.1,
+                             alternative='greater') == 0.0
+    tost = M.tost_from_summary(0.0, 1.0, huge, 0.1)
+    assert tost['p_value'] == 0.0
+    assert tost['ci_equiv_lo'] == 0.0
+    assert tost['ci_equiv_hi'] == 0.0
+    json.dumps(tost, allow_nan=False)

@@ -154,6 +154,29 @@ _BETACF_EPS = 3.0e-14
 _FPMIN = 1.0e-300
 
 
+def _sqrt_count(n: int) -> float:
+    """Square root of a non-negative integer, ``inf`` if unrepresentable."""
+    if n <= 0:
+        return 0.0
+    try:
+        return math.sqrt(n)
+    except OverflowError:
+        shift = (n.bit_length() - 1) // 2
+        mantissa = n / (1 << (2 * shift))
+        try:
+            return math.ldexp(math.sqrt(mantissa), shift)
+        except OverflowError:
+            return math.inf
+
+
+def _float_count(n: int) -> float | None:
+    """Float value of an integer count, or ``None`` beyond float range."""
+    try:
+        return float(n)
+    except OverflowError:
+        return None
+
+
 def _betacf(a: float, b: float, x: float) -> float:
     """Continued fraction for the incomplete beta function (NR 6.4)."""
     qab, qap, qam = a + b, a + 1.0, a - 1.0
@@ -572,7 +595,12 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
         p_min = min(1.0, sided / float(1 << n_eff))
     else:
         # exp(log) keeps the floor finite for n far beyond 2**1024.
-        log_floor = math.log(sided) - n_eff * math.log(2.0)
+        try:
+            log_floor = math.log(sided) - n_eff * math.log(2.0)
+        except OverflowError:
+            # A JSON-sized count cannot be converted to float. Its floor is
+            # far below the smallest representable float.
+            log_floor = -math.inf
         p_min = 1.0 if log_floor >= 0.0 else math.exp(log_floor)
     if p_min <= 0.0:
         # The exact floor ``sided / 2**n_eff`` underflowed to 0.0 for a very
@@ -580,8 +608,11 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
         # representable p-value (e.g. n_eff=2000 with an enormous family).
         # Evaluate that product in log space instead of reporting a p of
         # exactly zero: the floor is small, not zero.
-        log_product = (math.log(family_size) + math.log(sided)
-                       - n_eff * math.log(2.0))
+        try:
+            log_product = (math.log(family_size) + math.log(sided)
+                           - n_eff * math.log(2.0))
+        except OverflowError:
+            log_product = -math.inf
         p_holm = 1.0 if log_product >= 0.0 else math.exp(log_product)
     else:
         # ``family_size`` is an arbitrary Python int: converting a very large
@@ -591,7 +622,10 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
         try:
             p_holm = min(1.0, family_size * p_min)
         except OverflowError:
-            log_product = math.log(family_size) + math.log(p_min)
+            try:
+                log_product = math.log(family_size) + math.log(p_min)
+            except OverflowError:
+                log_product = -math.inf
             p_holm = 1.0 if log_product >= 0.0 else math.exp(log_product)
 
     alpha_frac = Fraction.from_float(alpha)
@@ -1295,8 +1329,10 @@ def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
         return out
     dof = n_pairs - 1
     out['dof'] = dof
-    if sd <= 0.0:
-        # Every per-seed difference is identical (numerically): the
+    se = sd / _sqrt_count(n_pairs) if sd > 0.0 else 0.0
+    if se == 0.0 or _float_count(dof) is None:
+        # Every per-seed difference is identical (numerically), or the seed
+        # count is so large that its standard error underflows. The
         # (1-2*alpha) CI degenerates to the point [mean, mean], so the
         # verdict is decided by where that point sits relative to the
         # margin. The exact p is 0 / 0.5 / 1 at inside / boundary /
@@ -1312,7 +1348,6 @@ def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
                    equivalent=bool(abs(mean) < margin),
                    ci_equiv_lo=mean, ci_equiv_hi=mean)
         return out
-    se = sd / math.sqrt(n_pairs)
     t_lower = (mean + margin) / se
     t_upper = (mean - margin) / se
     p_lower = student_t_sf(t_lower, dof)
@@ -1445,7 +1480,7 @@ def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
     z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
         else _ND.inv_cdf(1.0 - alpha)
     z_power = _ND.inv_cdf(power)
-    value = (z_crit + z_power) * sd / math.sqrt(n)
+    value = (z_crit + z_power) * sd / _sqrt_count(n)
     # A finite SD can still exceed the representable MDE range; the module
     # convention for an unrepresentable statistic is ``None``, never inf.
     return value if math.isfinite(value) else None
@@ -1552,7 +1587,19 @@ def power_at_effect(n: int, sd: float, effect: float,
     # the lower tail, so a positive effect has power BELOW alpha rather
     # than the ``greater`` power.  The two-sided computation is symmetric
     # and uses the magnitude.
-    ncp = effect / (float(sd) / math.sqrt(n))
+    sqrt_n = _sqrt_count(n)
+    se = float(sd) / sqrt_n
+    if se == 0.0:
+        # The standard error underflows for an enormous seed count; the
+        # normal power is at its limiting value instead of 0/0.
+        if effect == 0.0:
+            return float(alpha)
+        if alternative == 'two-sided':
+            return 1.0
+        if alternative == 'greater':
+            return 1.0 if effect > 0.0 else 0.0
+        return 1.0 if effect < 0.0 else 0.0
+    ncp = effect / se
     if alternative == 'two-sided':
         z_crit = _ND.inv_cdf(1.0 - alpha / 2.0)
         power = ((1.0 - _ND.cdf(z_crit - abs(ncp)))
