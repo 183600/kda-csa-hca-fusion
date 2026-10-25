@@ -411,7 +411,10 @@ def summarize_gradient_norms(grad_norms, *, clip_norm: float | None = None
     if clip_norm is not None:
         try:
             clip = float(clip_norm)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # A JSON-sized integer is not representable as a float; treat
+            # it like any other unusable clip budget instead of leaking
+            # OverflowError from the summary.
             clip = None
         if clip is not None and math.isfinite(clip) and clip > 0:
             out['clip_norm'] = clip

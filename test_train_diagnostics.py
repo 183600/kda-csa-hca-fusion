@@ -91,6 +91,12 @@ def test_gradient_norm_summary_names_masked_explosions():
     assert any('beyond the float range' in n for n in extreme['notes'])
     json.dumps(extreme, allow_nan=False)
 
+    # A JSON-sized clip budget is unusable, not a reason to crash.
+    oversized = summarize_gradient_norms([1.0], clip_norm=10 ** 400)
+    assert oversized['clip_norm'] is None
+    assert oversized['max_over_clip'] is None
+    json.dumps(oversized, allow_nan=False)
+
     assert summarize_gradient_norms([]) is None
     dead = summarize_gradient_norms([float('nan')], clip_norm=1.0)
     assert dead['max'] is None
