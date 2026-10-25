@@ -1375,6 +1375,12 @@ def confusion_matrix(pred, target, *, num_classes: int | None = None):
             f'num_classes={num_classes!r} must be a non-negative int or None')
     if num_classes < 0:
         raise ValueError(f'num_classes={num_classes} must be >= 0')
+    if num_classes > 0:
+        max_cells = torch.iinfo(torch.long).max
+        if num_classes > max_cells // num_classes:
+            raise ValueError(
+                f'num_classes={num_classes} is too large to materialize a '
+                f'confusion matrix')
     if explicit_num_classes and pred.numel():
         max_id = int(max(pred.max(), target.max()).item())
         if max_id >= num_classes:
@@ -1386,8 +1392,13 @@ def confusion_matrix(pred, target, *, num_classes: int | None = None):
     if num_classes == 0:
         return torch.zeros(0, 0, dtype=torch.long)
     flat = target * num_classes + pred
-    counts = torch.bincount(flat, minlength=num_classes * num_classes)
-    return counts.reshape(num_classes, num_classes).to(dtype=torch.long)
+    try:
+        counts = torch.bincount(flat, minlength=num_classes * num_classes)
+        return counts.reshape(num_classes, num_classes).to(dtype=torch.long)
+    except (OverflowError, RuntimeError, MemoryError) as e:
+        raise ValueError(
+            f'num_classes={num_classes} is too large to materialize a '
+            f'confusion matrix') from e
 
 
 def _prf(tp: float, fp: float, fn: float):

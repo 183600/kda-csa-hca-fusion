@@ -494,6 +494,11 @@ def test_confusion_matrix_rejects_out_of_range_explicit_classes():
     for bad_classes in (True, 2.5, '3'):
         with pytest.raises(ValueError):
             confusion_matrix([0], [0], num_classes=bad_classes)
+    # A count whose matrix cannot be materialized is a malformed explicit
+    # class count, not an OverflowError/RuntimeError from torch.
+    for huge_classes in (10 ** 9, 10 ** 18, 10 ** 20, 10 ** 400):
+        with pytest.raises(ValueError):
+            confusion_matrix([0], [0], num_classes=huge_classes)
 
     # Class ids are exact too: 1.9 must not silently become class 1.
     for bad_pred, bad_target in (
