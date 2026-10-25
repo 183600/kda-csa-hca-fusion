@@ -366,17 +366,27 @@ class HybridConfig:
             raise TypeError(
                 f"HybridConfig.dropout={self.dropout!r} must be a float, "
                 f"got bool.")
-        if math.isnan(self.dropout) or math.isinf(self.dropout):
+        # Convert once with an explicit guard: JSON integers are unbounded,
+        # and ``math.isnan``/``math.isinf`` raise ``OverflowError`` on an
+        # int outside the float range instead of reporting the malformed
+        # config.
+        try:
+            dropout = float(self.dropout)
+        except (OverflowError, ValueError):
+            raise ValueError(
+                f"HybridConfig.dropout={self.dropout!r} must be a finite "
+                f"float (not NaN or Inf).") from None
+        if not math.isfinite(dropout):
             raise ValueError(
                 f"HybridConfig.dropout={self.dropout} must be finite "
                 f"(not NaN or Inf).")
-        if self.dropout < 0.0 or self.dropout > 1.0:
+        if dropout < 0.0 or dropout > 1.0:
             raise ValueError(
                 f"HybridConfig.dropout={self.dropout} must be in [0.0, 1.0].")
         # Now the legitimate-but-unimplemented case: a valid float in [0,1]
         # that is not 0.0. Raise NotImplementedError pointing at the missing
         # implementation (NOT at the value itself, which is a valid config).
-        if self.dropout != 0.0:
+        if dropout != 0.0:
             raise NotImplementedError(
                 f"HybridConfig.dropout={self.dropout} is not yet implemented. "
                 f"The KDA/CSA/HCA sub-layers do not apply dropout in their "
