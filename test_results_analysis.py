@@ -28,6 +28,7 @@ from results_analysis import (  # noqa: E402
     lm_token_diagnostics,
     annotate_rows_with_pareto,
     binary_ranking_metrics,
+    confidence_calibration,
     diagnose_nonfinite,
     expected_average_precision,
     diagnose_training_curves,
@@ -664,6 +665,109 @@ def test_binary_ranking_metrics_rare_positive_and_ties():
         torch.tensor([-1, 0, 1]), valid=torch.tensor([False, True, True]))
     assert allowed_labels['n'] == 2
     assert allowed_labels['recall_at_1'] == pytest.approx(1.0)
+
+
+def test_confidence_calibration_perfect_forecast():
+    """A perfectly calibrated forecast has zero ECE/MCE/Brier and full skill."""
+    rep = confidence_calibration([0.0, 0.0, 1.0, 1.0], [0, 0, 1, 1])
+    assert rep['n'] == 4
+    assert rep['accuracy'] == pytest.approx(0.5)
+    assert rep['mean_confidence'] == pytest.approx(0.5)
+    assert rep['confidence_minus_accuracy'] == pytest.approx(0.0)
+    assert rep['brier_score'] == pytest.approx(0.0)
+    assert rep['brier_baseline'] == pytest.approx(0.25)
+    assert rep['brier_skill_score'] == pytest.approx(1.0)
+    assert rep['equal_width']['ece'] == pytest.approx(0.0)
+    assert rep['equal_width']['mce'] == pytest.approx(0.0)
+    assert rep['equal_mass']['ece'] == pytest.approx(0.0)
+    # Correct predictions are ranked above wrong ones: discrimination is
+    # perfect even though this case happens to also be calibrated.
+    assert rep['discrimination']['roc_auc'] == pytest.approx(1.0)
+    assert rep['discrimination']['pr_auc'] == pytest.approx(1.0)
+    json.dumps(rep, allow_nan=False)
+
+
+def test_confidence_calibration_detects_overconfidence_and_binning_sensitivity():
+    """Constant high confidence on mostly-wrong tokens is overconfidence.
+
+    The ECE must not be reported as a single binning-dependent number: with
+    two bins the equal-width and equal-mass rules group the observations
+    differently, so both values (and their gap) must be present.
+    """
+    over = confidence_calibration([0.9] * 4, [1, 0, 0, 0])
+    assert over['accuracy'] == pytest.approx(0.25)
+    assert over['mean_confidence'] == pytest.approx(0.9)
+    assert over['confidence_minus_accuracy'] == pytest.approx(0.65)
+    assert over['brier_score'] == pytest.approx(0.61)
+    assert over['brier_baseline'] == pytest.approx(0.1875)
+    assert over['brier_skill_score'] == pytest.approx(
+        1.0 - 0.61 / 0.1875)
+    assert over['equal_width']['ece'] == pytest.approx(0.65)
+    assert over['equal_width']['mce'] == pytest.approx(0.65)
+
+    split = confidence_calibration(
+        [0.05, 0.06, 0.07, 0.94], [0, 0, 0, 1], n_bins=2)
+    # Equal-width bins: 3/4 in [0, 0.5) with gap 0.06, 1/4 in [0.5, 1]
+    # with gap 0.06 -> 0.06. Equal-mass bins: [0.05, 0.06] (gap 0.055)
+    # and [0.07, 0.94] (gap 0.005) -> 0.03.
+    assert split['equal_width']['ece'] == pytest.approx(0.06)
+    assert split['equal_mass']['ece'] == pytest.approx(0.03)
+    assert split['binning_sensitivity'] == pytest.approx(0.03)
+    assert split['discrimination']['roc_auc'] == pytest.approx(1.0)
+    json.dumps(split, allow_nan=False)
+
+
+def test_confidence_calibration_degenerate_and_invalid_inputs():
+    """Empty / single-class samples stay JSON-safe; malformed inputs raise."""
+    empty = confidence_calibration([], [])
+    assert empty['n'] == 0
+    for key in ('accuracy', 'mean_confidence', 'confidence_minus_accuracy',
+                'brier_score', 'brier_skill_score', 'binning_sensitivity'):
+        assert empty[key] is None
+    assert all(b['count'] == 0 for b in empty['equal_width']['reliability'])
+    assert empty['discrimination']['roc_auc'] is None
+    json.dumps(empty, allow_nan=False)
+
+    # All outcomes identical: the base rate is 0 or 1, so Brier skill is
+    # undefined rather than a fabricated 0/0 value.
+    all_correct = confidence_calibration([0.2, 0.3, 0.4], [1, 1, 1])
+    assert all_correct['brier_score'] == pytest.approx(1.49 / 3.0)
+    assert all_correct['brier_baseline'] == 0.0
+    assert all_correct['brier_skill_score'] is None
+    assert all_correct['discrimination']['roc_auc'] is None
+
+    for bad_prob in ([0.1, float('nan')], [0.1, float('inf')],
+                     [-0.1, 0.2], [1.1, 0.2], [0.1, 10 ** 400]):
+        with pytest.raises(ValueError):
+            confidence_calibration(bad_prob, [1, 0])
+    with pytest.raises(ValueError):
+        confidence_calibration([0.1, 0.2], [1])
+    with pytest.raises(ValueError):
+        confidence_calibration([0.1, 0.2], [1, 2])
+    with pytest.raises(ValueError):
+        confidence_calibration([0.1, 0.2], [1.0, 0.5])
+    for bad_bins in (0, -1, True, 2.5, 10 ** 400):
+        with pytest.raises(ValueError):
+            confidence_calibration([0.1], [1], n_bins=bad_bins)
+
+
+def test_summarize_lm_diagnostics_includes_confidence_calibration():
+    """The LM bad-case summary must validate its own confidence scale."""
+    s = summarize_lm_diagnostics([_toy_diagnostics(), _toy_diagnostics()])
+    cal = s['confidence_calibration']
+    assert cal['n'] == s['n_tokens'] == 10
+    assert cal['accuracy'] == pytest.approx(s['token_accuracy'])
+    assert cal['n'] == 10
+    # The toy batch contains one highly-confident wrong token per 5
+    # positions, so the reliability record must not claim zero gap.
+    assert cal['mean_confidence'] > cal['accuracy']
+    json.dumps(s, allow_nan=False)
+
+    empty = summarize_lm_diagnostics(lm_token_diagnostics(
+        torch.zeros(1, 0, 4), torch.zeros(1, 0, dtype=torch.long),
+        torch.zeros(1, 0, dtype=torch.long)))
+    assert empty['confidence_calibration']['n'] == 0
+    json.dumps(empty, allow_nan=False)
 
 
 def test_tune_baseline_lr_selects_on_validation_stream():

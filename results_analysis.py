@@ -26,6 +26,14 @@ number and move on":
    recall@1) for binary retrieval-style decisions whose positives are
    rare. PR-AUC is the primary metric in that regime: with a huge
    negative base, FPR grows slowly and ROC-AUC stays optimistic.
+6. :func:`confidence_calibration` — whether a reported confidence score
+   means what it says: reliability bins, equal-width AND equal-mass
+   ECE/MCE, Brier score/skill, over/under-confidence gap, and a
+   discrimination block (ROC-AUC). A model can rank correct above wrong
+   (high AUC) while being badly overconfident, and the token-level
+   ``confident_wrong`` category in this module *assumes* the raw top-1
+   probability is calibrated; this report tests that assumption instead
+   of leaving it implicit.
 
 All functions are pure (no RNG, no global state) so they can be called
 from training loops, tests, and notebooks without perturbing an
@@ -1168,7 +1176,6 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
     top1_prob = torch.cat([d['top1_prob'].reshape(-1) for d in items])
     seen_earlier = torch.cat([d['seen_earlier'].reshape(-1) for d in items])
     distance = torch.cat([d['last_seen_distance'].reshape(-1) for d in items])
-    position = torch.cat([d['position'].reshape(-1) for d in items])
     categories = [c for d in items for row in d['category'] for c in row]
 
     n_tokens = int(valid.sum())
@@ -1204,6 +1211,7 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
     rank_on_err = target_rank[err].float()
     prob_err = top1_prob[err].float()
     prob_ok = top1_prob[valid & correct].float()
+    calibration = confidence_calibration(top1_prob[valid], correct[valid])
 
     def _acc(mask: torch.Tensor) -> dict:
         n = int(mask.sum())
@@ -1273,12 +1281,20 @@ def summarize_lm_diagnostics(diags: Mapping | Sequence) -> dict:
         'top1_prob_on_correct': {
             'mean': float(prob_ok.mean()) if prob_ok.numel() else None,
         },
+        # The confidence-based ``confident_wrong`` category assumes that a
+        # raw top-1 probability means what it says. Test that assumption on
+        # the same tokens instead of leaving it to the reader: ECE/MCE +
+        # Brier skill + discrimination, under two binning rules.
+        'confidence_calibration': calibration,
         'accuracy_by_position_quartile': pos_buckets,
         'accuracy_by_repeat_distance': dist_buckets,
         'note': ('Token-level bad cases on a held-out split: category mix '
                  'separates near-misses / confident blind spots / copy '
                  'failures / novel tokens, and the repeat-distance curve '
-                 'localizes long-range retrieval failures.'),
+                 'localizes long-range retrieval failures. '
+                 'confidence_calibration reports whether top1_prob is a '
+                 'usable probability, which the confidence threshold in the '
+                 'category assignment implicitly assumes.'),
     }
 
 
@@ -1757,3 +1773,239 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
     # recall@1 must divide by the number of relevant items.
     report['recall_at_1'] = bool(top1) if n_pos == 1 else top1 / n_pos
     return report
+
+
+def _calibration_table(probabilities: torch.Tensor,
+                       outcomes: torch.Tensor,
+                       assignments: torch.Tensor, *, n_bins: int,
+                       binning: str,
+                       equal_width_bounds: bool) -> dict:
+    """Reliability table + ECE/MCE for one fixed bin assignment.
+
+    ``assignments[i]`` is the bin index of observation ``i``. Empty bins
+    are kept in the table (with ``count = 0`` and undefined statistics) so
+    the JSON schema does not change with the sample. ECE is the
+    count-weighted mean absolute gap; MCE is the largest absolute gap
+    among non-empty bins. Both are descriptive, not a test.
+    """
+    n = int(probabilities.numel())
+    reliability = []
+    ece = 0.0
+    mce = None
+    for b in range(n_bins):
+        mask = assignments == b
+        count = int(mask.sum())
+        entry = {
+            'bin': b,
+            'lower': (b / n_bins if equal_width_bounds else None),
+            'upper': ((b + 1) / n_bins if equal_width_bounds else None),
+            'count': count,
+            'fraction': (count / n if n else None),
+            'mean_confidence': None,
+            'accuracy': None,
+            'confidence_minus_accuracy': None,
+            'abs_confidence_gap': None,
+        }
+        if count:
+            mean_conf = float(probabilities[mask].mean().item())
+            accuracy = float(outcomes[mask].mean().item())
+            gap = mean_conf - accuracy
+            abs_gap = abs(gap)
+            ece += (count / n) * abs_gap
+            mce = abs_gap if mce is None else max(mce, abs_gap)
+            entry.update({
+                'mean_confidence': mean_conf,
+                'accuracy': accuracy,
+                'confidence_minus_accuracy': gap,
+                'abs_confidence_gap': abs_gap,
+            })
+            if not equal_width_bounds:
+                entry['lower'] = float(probabilities[mask].min().item())
+                entry['upper'] = float(probabilities[mask].max().item())
+        reliability.append(entry)
+    return {
+        'binning': binning,
+        'n_bins': n_bins,
+        'ece': (ece if n else None),
+        'mce': mce,
+        'reliability': reliability,
+        'boundary_note': ('fixed equal-width probability bins'
+                          if equal_width_bounds else
+                          'equal-count bins; lower/upper are the observed '
+                          'confidence range, and tied scores may be split '
+                          'across adjacent bins'),
+    }
+
+
+def _equal_mass_assignments(probabilities: torch.Tensor,
+                            n_bins: int) -> torch.Tensor:
+    """Stable equal-count bin indices for ``probabilities``.
+
+    Ties are ordered by input position (stable sort), so a run is
+    deterministic and never depends on torch's default unstable sort.
+    """
+    n = int(probabilities.numel())
+    assignments = torch.zeros(n, dtype=torch.long,
+                              device=probabilities.device)
+    if n == 0:
+        return assignments
+    order = torch.argsort(probabilities, stable=True)
+    base, extra = divmod(n, n_bins)
+    start = 0
+    for b in range(n_bins):
+        size = base + (1 if b < extra else 0)
+        if size:
+            assignments[order[start:start + size]] = b
+        start += size
+    return assignments
+
+
+def confidence_calibration(probabilities, correct, *, n_bins: int = 10) -> dict:
+    """Calibration analysis of a confidence score against binary outcomes.
+
+    This answers a question that accuracy / AUC / error categories cannot:
+    when the model says "0.9", is it right about 90% of the time? A model
+    can discriminate well (rank correct predictions above wrong ones) and
+    still be systematically overconfident, which makes any confidence-
+    thresholded diagnostic (e.g. the ``confident_wrong`` category in
+    :func:`lm_token_diagnostics`) systematically misleading.
+
+    Parameters
+    ----------
+    probabilities : array-like[float], shape [N]
+        Predicted confidence in the event that ``correct`` is 1. Values
+        must be finite and lie in ``[0, 1]``; invalid values raise instead
+        of being silently dropped, because dropping low-confidence or
+        high-confidence tokens would change the calibration estimate.
+    correct : array-like[bool or 0/1], shape [N]
+        Whether the prediction was correct (1) or wrong (0).
+    n_bins : int, optional
+        Number of reliability bins (default 10).
+
+    Returns
+    -------
+    dict with:
+
+      * ``n`` / ``accuracy`` / ``mean_confidence``;
+      * ``confidence_minus_accuracy`` — positive means overconfidence
+        (the reported confidence exceeds the observed hit rate);
+      * ``brier_score`` — mean squared error of the confidence forecast;
+      * ``brier_baseline`` — Brier score of always predicting the base
+        rate (``accuracy``), and ``brier_skill_score = 1 - Brier /
+        baseline``. A skill score ``<= 0`` means the confidence score has
+        no probabilistic resolution beyond the base rate; it is ``None``
+        when every outcome is the same class (baseline 0).
+      * ``discrimination`` — ROC-AUC / PR-AUC of confidence as a ranking
+        of correct over wrong predictions, with their chance references.
+        This is **not** a calibration measure: high AUC + poor ECE is a
+        common and important combination.
+      * ``equal_width`` / ``equal_mass`` — two ECE/MCE + reliability
+        tables. ECE is sensitive to the binning rule, so both are
+        reported and ``binning_sensitivity`` is their absolute
+        difference; a conclusion that depends on one binning is fragile.
+      * ``notes`` — interpretation contract, including the fact that ECE /
+        MCE are descriptive and that empty bins are retained.
+
+    All values are strict-JSON scalars/containers (``None`` for
+    undefined), and the function is deterministic (no RNG).
+    """
+    if isinstance(n_bins, bool) or not isinstance(n_bins, int):
+        raise ValueError(f'n_bins={n_bins!r} must be a positive int')
+    if n_bins < 1:
+        raise ValueError(f'n_bins={n_bins} must be a positive int')
+    if n_bins > 1_000_000:
+        raise ValueError(
+            f'n_bins={n_bins} is too large to build a reliability table')
+
+    try:
+        prob = torch.as_tensor(probabilities,
+                               dtype=torch.float64).reshape(-1)
+        outcomes_raw = torch.as_tensor(correct).reshape(-1)
+    except (TypeError, ValueError, OverflowError, RuntimeError) as e:
+        raise ValueError(
+            'probabilities/correct must be numeric 1-D arrays or tensors '
+            f'(got {type(probabilities).__name__}/'
+            f'{type(correct).__name__})') from e
+    if prob.numel() != outcomes_raw.numel():
+        raise ValueError(
+            f'probabilities/correct length mismatch: {prob.numel()} vs '
+            f'{outcomes_raw.numel()}')
+    if outcomes_raw.dtype.is_complex:
+        raise ValueError('correct must be boolean or exact 0/1 values')
+    if outcomes_raw.dtype == torch.bool:
+        outcomes = outcomes_raw.to(dtype=torch.float64)
+    else:
+        if (outcomes_raw.numel()
+                and bool(((outcomes_raw != 0)
+                          & (outcomes_raw != 1)).any().item())):
+            raise ValueError(
+                'correct must contain only boolean or exact 0/1 values')
+        outcomes = outcomes_raw.to(dtype=torch.float64)
+    if prob.numel() and not bool(torch.isfinite(prob).all().item()):
+        raise ValueError('probabilities must be finite')
+    if prob.numel() and bool(((prob < 0.0) | (prob > 1.0)).any().item()):
+        raise ValueError('probabilities must lie in [0, 1]')
+
+    n = int(prob.numel())
+    accuracy = float(outcomes.mean().item()) if n else None
+    mean_conf = float(prob.mean().item()) if n else None
+    gap = (mean_conf - accuracy) if n else None
+    brier = (float(((prob - outcomes) ** 2).mean().item())
+             if n else None)
+    baseline = (accuracy * (1.0 - accuracy)
+                if accuracy is not None else None)
+    ratio = _safe_ratio(brier, baseline)
+    bss = (1.0 - ratio) if ratio is not None else None
+    if bss is not None and not math.isfinite(bss):
+        bss = None
+
+    disc = binary_ranking_metrics(prob, outcomes_raw.to(dtype=torch.bool))
+    discrimination = {
+        'roc_auc': disc['roc_auc'],
+        'pr_auc': disc['pr_auc'],
+        'chance_roc_auc': disc['chance_roc_auc'],
+        'chance_pr_auc': disc['chance_pr_auc'],
+        'positive_class': 'correct',
+        'note': ('ranking quality of confidence, not calibration: a high '
+                 'AUC can coexist with a large overconfidence gap.'),
+    }
+
+    width_assign = torch.clamp((prob * n_bins).to(torch.long),
+                               min=0, max=n_bins - 1)
+    equal_width = _calibration_table(
+        prob, outcomes, width_assign, n_bins=n_bins,
+        binning='equal_width', equal_width_bounds=True)
+    equal_mass = _calibration_table(
+        prob, outcomes, _equal_mass_assignments(prob, n_bins),
+        n_bins=n_bins, binning='equal_mass', equal_width_bounds=False)
+
+    sensitivity = None
+    if equal_width['ece'] is not None and equal_mass['ece'] is not None:
+        sensitivity = abs(equal_width['ece'] - equal_mass['ece'])
+
+    return {
+        'n': n,
+        'accuracy': accuracy,
+        'mean_confidence': mean_conf,
+        'confidence_minus_accuracy': gap,
+        'brier_score': brier,
+        'brier_baseline': baseline,
+        'brier_skill_score': bss,
+        'discrimination': discrimination,
+        'equal_width': equal_width,
+        'equal_mass': equal_mass,
+        'binning_sensitivity': sensitivity,
+        'notes': [
+            'ECE/MCE are binning-dependent descriptive statistics, not a '
+            'hypothesis test; equal-width and equal-mass values are both '
+            'reported so a conclusion cannot hinge on one binning rule.',
+            'Brier skill <= 0 means this confidence score adds no '
+            'probabilistic resolution beyond always predicting the base '
+            'rate; it is None when the base rate is 0 or 1.',
+            'A high discrimination (ROC-)AUC only means confidence ranks '
+            'correct above wrong; calibrate the probabilities before '
+            'interpreting confidence thresholds as error probabilities.',
+            'Empty reliability bins are retained (count 0, undefined '
+            'statistics) so the record has a stable schema.',
+        ],
+    }
