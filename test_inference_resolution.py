@@ -196,6 +196,27 @@ def test_clopper_pearson_known_endpoints_and_symmetry():
                                                  abs=1e-9)
 
 
+def test_clopper_pearson_small_tail_is_precise_for_large_n():
+    n = 10 ** 18
+    zero = M.binomial_proportion_ci(0, n)
+    assert zero['ci_high'] == pytest.approx(
+        -math.log(0.025) / n, rel=1e-12)
+    one = M.binomial_proportion_ci(1, n)
+    assert one['ci_low'] == pytest.approx(
+        -math.log(0.975) / n, rel=1e-12)
+    assert one['ci_high'] * n == pytest.approx(5.571643390938886,
+                                                rel=1e-12)
+    near = M.binomial_proportion_ci(n - 1, n)
+    assert near['ci_low'] == 1.0 - one['ci_high']
+    assert near['ci_high'] == 1.0 - one['ci_low']
+
+    huge = 10 ** 400
+    underflow = M.binomial_proportion_ci(1, huge)
+    assert underflow['ci_low'] == 0.0
+    assert underflow['ci_high'] == 0.0
+    json.dumps(underflow, allow_nan=False)
+
+
 def test_sign_test_reports_win_rate_and_exact_interval():
     s = M.sign_test([1, 1, 1, 1, 1])
     assert s['win_rate'] == 1.0

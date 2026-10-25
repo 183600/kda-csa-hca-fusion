@@ -152,6 +152,7 @@ __all__ = [
 _MAX_BETACF_ITER = 200
 _BETACF_EPS = 3.0e-14
 _FPMIN = 1.0e-300
+_NORMAL_T_DOF = 1_000_000_000
 
 
 def _sqrt_count(n: int) -> float:
@@ -243,6 +244,8 @@ def student_t_cdf(t_value: float, dof: int) -> float:
         return 1.0 if t_value > 0 else 0.0
     if t_value == 0.0:
         return 0.5
+    if dof >= _NORMAL_T_DOF:
+        return NormalDist().cdf(t_value)
     x = dof / (dof + t_value * t_value)
     ib = betainc_regularized(0.5 * dof, 0.5, x)
     if t_value > 0.0:
@@ -269,6 +272,8 @@ def student_t_sf(t_value: float, dof: int) -> float:
         return 0.0 if t_value > 0 else 1.0
     if t_value == 0.0:
         return 0.5
+    if dof >= _NORMAL_T_DOF:
+        return NormalDist().cdf(-t_value)
     x = dof / (dof + t_value * t_value)
     ib = betainc_regularized(0.5 * dof, 0.5, x)
     if t_value > 0.0:
@@ -418,6 +423,67 @@ def _beta_quantile(q: float, a: float, b: float) -> float:
     return 0.5 * (lo + hi)
 
 
+_SMALL_BINOMIAL_TAIL = 64
+_MIN_LOG_PROB = math.log(5e-324)
+
+
+def _binomial_cdf_small(n: int, k: int, p: float) -> float:
+    """Exact ``P(X <= k)`` for a small ``k`` without huge log-gamma terms."""
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    if p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 0.0
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
+    n_log_q = math.log(n) + math.log(-log_q)
+    n_q_term = -math.exp(n_log_q) if n_log_q <= 709.0 else -math.inf
+    log_comb = 0.0
+    terms = []
+    for i in range(k + 1):
+        if i:
+            log_comb += math.log(n - i + 1) - math.log(i)
+        terms.append(log_comb + i * log_p + n_q_term - i * log_q)
+    peak = max(terms)
+    if peak == -math.inf:
+        return 0.0
+    return math.exp(peak) * math.fsum(
+        math.exp(term - peak) for term in terms)
+
+
+def _binomial_tail_root(n: int, k: int, target: float) -> float:
+    """Solve ``P(Binomial(n, p) <= k) = target`` in log-probability space."""
+    lo = _MIN_LOG_PROB
+    hi = 0.0
+    if _binomial_cdf_small(n, k, math.exp(lo)) < target:
+        return 0.0
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if _binomial_cdf_small(n, k, math.exp(mid)) > target:
+            lo = mid
+        else:
+            hi = mid
+    return math.exp(0.5 * (lo + hi))
+
+
+def _small_tail_proportion_ci(k: int, n: int, alpha: float) -> tuple:
+    if k <= n - k:
+        low = 0.0 if k == 0 else _binomial_tail_root(
+            n, k - 1, 1.0 - alpha / 2.0)
+        high = 1.0 if k == n else _binomial_tail_root(
+            n, k, alpha / 2.0)
+        return low, high
+    kk = n - k
+    low = 1.0 - (1.0 if kk == n else _binomial_tail_root(
+        n, kk, alpha / 2.0))
+    high = 1.0 - (0.0 if kk == 0 else _binomial_tail_root(
+        n, kk - 1, 1.0 - alpha / 2.0))
+    return low, high
+
+
 def binomial_proportion_ci(k, n, *, alpha: float = 0.05) -> dict:
     """Exact Clopper-Pearson interval for a binomial proportion ``k/n``.
 
@@ -446,9 +512,12 @@ def binomial_proportion_ci(k, n, *, alpha: float = 0.05) -> dict:
     }
     if n == 0:
         return out
-    low = 0.0 if k == 0 else _beta_quantile(alpha / 2.0, k, n - k + 1)
-    high = 1.0 if k == n else _beta_quantile(
-        1.0 - alpha / 2.0, k + 1, n - k)
+    if n > 1000 and min(k, n - k) <= _SMALL_BINOMIAL_TAIL:
+        low, high = _small_tail_proportion_ci(k, n, alpha)
+    else:
+        low = 0.0 if k == 0 else _beta_quantile(alpha / 2.0, k, n - k + 1)
+        high = 1.0 if k == n else _beta_quantile(
+            1.0 - alpha / 2.0, k + 1, n - k)
     # Guard against a last-ulp inversion on extreme shapes.
     low = min(max(low, 0.0), 1.0)
     high = min(max(high, 0.0), 1.0)

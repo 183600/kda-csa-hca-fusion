@@ -1192,6 +1192,16 @@ def test_interaction_contrast_reports_unrepresentable_interaction():
     json.dumps(rep, allow_nan=False)
 
 
+def test_student_t_uses_the_normal_limit_for_large_dof():
+    from statistics import NormalDist
+    expected = NormalDist().cdf(1.0)
+    for dof in (10 ** 9, 10 ** 12, 10 ** 18, 10 ** 400):
+        assert M.student_t_cdf(1.0, dof) == pytest.approx(expected)
+        assert M.student_t_sf(1.0, dof) == pytest.approx(1.0 - expected)
+        assert M.student_t_cdf(-1.0, dof) == pytest.approx(1.0 - expected)
+        assert M.student_t_sf(-1.0, dof) == pytest.approx(expected)
+
+
 def test_json_sized_seed_counts_do_not_leak_overflow():
     huge = 10 ** 400
     mde = M.min_detectable_effect(huge, 1.0)
