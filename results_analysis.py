@@ -1683,16 +1683,35 @@ def binary_ranking_metrics(scores, labels, *, valid=None) -> dict:
     PR-AUC breaks ties by candidate order — document/track that when
     scores come from a quantized model.
     """
-    scores_t = torch.as_tensor(scores, dtype=torch.float64).reshape(-1)
-    labels_raw = torch.as_tensor(labels).reshape(-1)
+    try:
+        scores_t = torch.as_tensor(scores, dtype=torch.float64).reshape(-1)
+        labels_raw = torch.as_tensor(labels).reshape(-1)
+    except (TypeError, ValueError, OverflowError, RuntimeError) as e:
+        # JSON integers are unbounded and a numeric-looking string is not a
+        # score: both must become an actionable ValueError rather than an
+        # OverflowError / torch conversion error from the parser.
+        raise ValueError(
+            'scores/labels must be numeric 1-D arrays or tensors '
+            f'(got {type(scores).__name__}/{type(labels).__name__})') from e
     if scores_t.numel() != labels_raw.numel():
         raise ValueError(
             f'scores/labels length mismatch: {scores_t.numel()} vs '
             f'{labels_raw.numel()}')
+    if labels_raw.dtype.is_complex:
+        raise ValueError('labels must be boolean or exact 0/1 values')
     if valid is not None:
-        valid_raw = torch.as_tensor(valid).reshape(-1)
+        try:
+            valid_raw = torch.as_tensor(valid).reshape(-1)
+        except (TypeError, ValueError, OverflowError, RuntimeError) as e:
+            raise ValueError(
+                'valid must be a boolean mask (or exact 0/1 values), got '
+                f'{type(valid).__name__}') from e
         if valid_raw.numel() != scores_t.numel():
             raise ValueError('valid mask length mismatch')
+        if valid_raw.dtype.is_complex:
+            raise ValueError(
+                'valid must be a boolean mask (or exact 0/1 values), '
+                f'got {valid!r}')
         if valid_raw.dtype != torch.bool:
             if valid_raw.numel() and not bool(
                     ((valid_raw == 0) | (valid_raw == 1)).all().item()):
