@@ -1578,7 +1578,12 @@ def multiclass_classification_metrics(pred, target, *, num_classes: int | None =
     }
 
     if scores is not None:
-        scores_t = torch.as_tensor(scores, dtype=torch.float32)
+        try:
+            scores_t = torch.as_tensor(scores, dtype=torch.float32)
+        except (TypeError, ValueError, OverflowError, RuntimeError) as e:
+            raise ValueError(
+                'scores must be a numeric [N, num_classes] array or tensor '
+                f'(got {type(scores).__name__})') from e
         if scores_t.ndim != 2 or scores_t.shape[1] != num_classes:
             raise ValueError(
                 f'scores must be [N, {num_classes}], got '
