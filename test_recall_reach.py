@@ -841,6 +841,11 @@ def test_recall_flops_rejects_oversized_geometry_without_overflow():
         rfa.ratio_layout(1, 1, 0, huge)
     with pytest.raises(ValueError):
         rfa.ratio_layout(1, 1, 0, 10 ** 100)
+    # Huge counts are either rejected when unrepresentable or truncated
+    # without allocating the whole unit when the depth is small.
+    with pytest.raises(ValueError):
+        rfa.ratio_layout(10 ** 100, 1, 0, 5)
+    assert rfa.ratio_layout(10 ** 12, 1, 0, 4) == ('kda',) * 4
     with pytest.raises(ValueError):
         rfa.audit_layout(('csa',), seq_len=huge, measure=False)
     with pytest.raises(ValueError):

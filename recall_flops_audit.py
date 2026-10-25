@@ -159,19 +159,27 @@ def ratio_layout(n_kda: int, n_csa: int, n_hca: int,
     """
     for name, value in (('n_kda', n_kda), ('n_csa', n_csa),
                         ('n_hca', n_hca)):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f'{name}={value!r} must be an int.')
-        if value < 0:
-            raise ValueError(f'{name}={value} must be >= 0.')
+        _validate_positive_int(name, value, minimum=0)
     _validate_positive_int('total_layers', total_layers)
     if memory_kind not in _MEMORY_KINDS:
         raise ValueError(
             f'memory_kind={memory_kind!r} must be one of {_MEMORY_KINDS}.')
     if n_kda + n_csa + n_hca == 0:
         raise ValueError('at least one of n_kda/n_csa/n_hca must be > 0.')
-    unit = ([memory_kind] * n_kda + ['csa'] * n_csa + ['hca'] * n_hca)
-    repeats = math.ceil(total_layers / len(unit))
     try:
+        # Materialize only the first ``total_layers`` entries of the
+        # repeating unit: a huge count with a small depth is well-defined
+        # and must not allocate the whole unit (or overflow list repeat).
+        unit = []
+        remaining = total_layers
+        for kind, count in ((memory_kind, n_kda), ('csa', n_csa),
+                            ('hca', n_hca)):
+            if remaining == 0:
+                break
+            take = min(count, remaining)
+            unit.extend([kind] * take)
+            remaining -= take
+        repeats = math.ceil(total_layers / len(unit))
         return tuple((unit * repeats)[:total_layers])
     except (OverflowError, MemoryError):
         raise ValueError(
