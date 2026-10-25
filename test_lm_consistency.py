@@ -326,6 +326,69 @@ def test_decode_roofline_accounting(device='cpu'):
     _ok('decode_roofline rejects T<1', raised, '')
 
 
+def test_decode_elements_reject_unrepresentable_memory_geometry():
+    """Huge SSM state geometry must fail as ``ValueError``, not raw overflow.
+
+    ``decode_elements_per_token`` multiplies unbounded config integers into
+    the compulsory read/write totals. For an extreme but structurally valid
+    Mamba-2 / RWKV-7 geometry, the old code did ``reads += memory_reads``
+    with a Python int too large for a float and leaked the interpreter's
+    ``OverflowError`` instead of the module's documented validation error.
+    """
+    print("\nTest: decode elements reject unrepresentable memory geometry")
+
+    cfg_mamba = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        mamba_d_state=8, mamba_headdim=4, mamba_expand=2,
+        n_kda=1, n_csa=0, n_hca=0, memory_type='mamba2')
+    mamba = lm_consistency.decode_elements_per_token(cfg_mamba, 16)
+    _ok('normal Mamba-2 decode elements stay finite',
+        mamba['memory_read_elements_per_token'] == 512.0
+        and mamba['memory_write_elements_per_token'] == 512.0
+        and mamba['total_elements_per_token'] == 1024.0,
+        f'{mamba}')
+
+    cfg_rwkv = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=8, head_dim_v=8,
+        rwkv_head_dim=8, rwkv_gate_lora=8,
+        rwkv_decay_lora=8, rwkv_a_lora=8,
+        n_kda=1, n_csa=0, n_hca=0, memory_type='rwkv7')
+    rwkv = lm_consistency.decode_elements_per_token(cfg_rwkv, 16)
+    _ok('normal RWKV-7 decode elements stay finite',
+        rwkv['memory_read_elements_per_token'] == 256.0
+        and rwkv['memory_write_elements_per_token'] == 256.0
+        and rwkv['total_elements_per_token'] == 512.0,
+        f'{rwkv}')
+
+    huge = 10 ** 200
+    cases = [
+        ('Mamba-2', HybridConfig(
+            d_model=huge, n_heads_qk=2, n_heads_v=2,
+            head_dim_k=16, head_dim_v=16,
+            mamba_d_state=huge, mamba_headdim=1, mamba_expand=1,
+            n_kda=1, n_csa=0, n_hca=0, memory_type='mamba2')),
+        ('RWKV-7', HybridConfig(
+            d_model=huge, n_heads_qk=2, n_heads_v=2,
+            head_dim_k=16, head_dim_v=16, rwkv_head_dim=huge,
+            n_kda=1, n_csa=0, n_hca=0, memory_type='rwkv7')),
+    ]
+    for name, cfg in cases:
+        detail = ''
+        try:
+            lm_consistency.decode_elements_per_token(cfg, 16)
+            detail = 'no exception'
+        except OverflowError as exc:
+            detail = f'raw OverflowError: {exc}'
+        except ValueError as exc:
+            detail = str(exc)
+        _ok(f'{name} huge state rejected as ValueError',
+            detail.startswith('decode_elements_per_token:')
+            and 'unrepresentable as a finite float' in detail,
+            detail)
+
+
 def test_consistency_metrics_start_validation():
     """``start`` must be a non-negative exact int.
 
@@ -366,6 +429,7 @@ _TEST_FUNCS = [
     test_consistency_metrics_start_validation,
     test_selection_diagnostic,
     test_decode_roofline_accounting,
+    test_decode_elements_reject_unrepresentable_memory_geometry,
     test_decode_roofline_host_peaks_fallback,
 ]
 

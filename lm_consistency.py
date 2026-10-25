@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import math
 import time
 
 import torch
@@ -181,6 +182,42 @@ def decode_read_spec(cfg: HybridConfig) -> dict:
     }
 
 
+def _finite_scaled(label: str, count, factor) -> float:
+    """Multiply a count by a scale, rejecting unrepresentable totals.
+
+    Geometry fields are unbounded Python ints, so ``count * float(factor)``
+    can raise a raw ``OverflowError`` (or produce ``inf``) before any
+    downstream validation runs.  The decode accounting has no meaningful
+    finite value in that regime, so convert it to the same ``ValueError``
+    used by ``kv_budget`` for unrepresentable counts.
+    """
+    try:
+        if isinstance(count, int) and isinstance(factor, int):
+            # Keep the exact integer product and round only once, matching
+            # the pre-guard arithmetic for finite in-range geometry.
+            value = float(count * factor)
+        else:
+            value = count * float(factor)
+    except OverflowError:
+        raise ValueError(
+            f'decode_elements_per_token: {label} is unrepresentable as a '
+            f'finite float for count={count!r} and scale={factor!r}'
+        ) from None
+    if not math.isfinite(value):
+        raise ValueError(
+            f'decode_elements_per_token: {label} is unrepresentable as a '
+            f'finite float for count={count!r} and scale={factor!r}')
+    return value
+
+
+def _finite_total(label: str, value: float) -> float:
+    if not math.isfinite(value):
+        raise ValueError(
+            f'decode_elements_per_token: {label} is unrepresentable as a '
+            f'finite float')
+    return value
+
+
 def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
     """Compulsory KV-side elements moved per decoded token at context ``T``.
 
@@ -208,8 +245,10 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
         n_mem, n_csa, n_hca = cfg.n_kda, cfg.n_csa, cfg.n_hca
     if route == 'kda' and n_mem > 0:
         kda = kv_budget.op_read_elements('kda', T, spec)
-        memory_reads = n_mem * kda['total_read_elements']
-        memory_writes = n_mem * (kda['state_elements'] or 0)
+        memory_reads = _finite_scaled(
+            'KDA memory read total', n_mem, kda['total_read_elements'])
+        memory_writes = _finite_scaled(
+            'KDA memory write total', n_mem, kda['state_elements'] or 0)
         reads += memory_reads
         writes += memory_writes
     elif route == 'mamba2' and n_mem > 0:
@@ -220,9 +259,13 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
         d_inner = cfg.mamba_expand * cfg.d_model
         mamba_heads = (d_inner // cfg.mamba_headdim
                        if cfg.mamba_headdim > 0 else 1)
-        ssm = mamba_heads * cfg.mamba_headdim * cfg.mamba_d_state
-        memory_reads = n_mem * ssm
-        memory_writes = n_mem * ssm
+        ssm = _finite_scaled(
+            'Mamba-2 state elements per layer', mamba_heads,
+            cfg.mamba_headdim * cfg.mamba_d_state)
+        memory_reads = _finite_scaled(
+            'Mamba-2 memory read total', n_mem, ssm)
+        memory_writes = _finite_scaled(
+            'Mamba-2 memory write total', n_mem, ssm)
         reads += memory_reads
         writes += memory_writes
     elif route == 'rwkv7' and n_mem > 0:
@@ -231,22 +274,33 @@ def decode_elements_per_token(cfg: HybridConfig, T: int) -> dict:
         # but is second-order — excluded, mirroring the KDA convention.
         rwkv_heads = (cfg.d_model // cfg.rwkv_head_dim
                       if cfg.rwkv_head_dim > 0 else 1)
-        matrix = rwkv_heads * cfg.rwkv_head_dim * cfg.rwkv_head_dim
-        memory_reads = n_mem * matrix
-        memory_writes = n_mem * matrix
+        matrix = _finite_scaled(
+            'RWKV-7 matrix state elements per layer', rwkv_heads,
+            cfg.rwkv_head_dim * cfg.rwkv_head_dim)
+        memory_reads = _finite_scaled(
+            'RWKV-7 memory read total', n_mem, matrix)
+        memory_writes = _finite_scaled(
+            'RWKV-7 memory write total', n_mem, matrix)
         reads += memory_reads
         writes += memory_writes
     if n_csa > 0:
         csa = kv_budget.op_read_elements('csa', T, spec)
-        reads += n_csa * csa['total_read_elements']
+        reads = _finite_total(
+            'read total', reads + _finite_scaled(
+                'CSA read total', n_csa, csa['total_read_elements']))
     if n_hca > 0:
         hca = kv_budget.op_read_elements('hca', T, spec)
-        reads += n_hca * hca['total_read_elements']
+        reads = _finite_total(
+            'read total', reads + _finite_scaled(
+                'HCA read total', n_hca, hca['total_read_elements']))
     return {'read_elements_per_token': reads,
-            'write_elements_per_token': float(writes),
-            'total_elements_per_token': reads + writes,
-            'memory_read_elements_per_token': float(memory_reads),
-            'memory_write_elements_per_token': float(memory_writes),
+            'write_elements_per_token': _finite_total('write total', writes),
+            'total_elements_per_token': _finite_total(
+                'total elements', reads + writes),
+            'memory_read_elements_per_token': _finite_total(
+                'memory read total', memory_reads),
+            'memory_write_elements_per_token': _finite_total(
+                'memory write total', memory_writes),
             'memory_route': route,
             'layout': [n_mem, n_csa, n_hca]}
 
