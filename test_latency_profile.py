@@ -356,6 +356,19 @@ def test_time_call_synchronize_hook():
         f'{events}')
 
 
+def test_time_call_rejects_nonfinite_clock():
+    print('\nTest: non-finite / unrepresentable clock samples are rejected')
+    for bad in (float('nan'), float('inf'), 1e308):
+        ticks = iter([0.0, bad])
+        raised = False
+        try:
+            lp.time_call(lambda: None, warmup=0, repeats=1,
+                         timer=lambda: next(ticks))
+        except ValueError:
+            raised = True
+        _ok(f'rejects elapsed={bad!r}', raised, '')
+
+
 def _fake_inputs(T=8):
     return {'x': torch.zeros(1, T, 1, 1), 'dt': torch.ones(1, T, 1)}
 
@@ -461,6 +474,35 @@ def test_selection_bias_detects_winners_curse():
     ])['rows'][0]
     _ok('one repeat is flagged instead of guessed',
         thin['available'] is False and 'repeat' in thin['reason'], thin)
+
+
+def test_selection_bias_skips_nonfinite_times():
+    print('\nTest: split-half diagnostic rejects non-finite timings')
+    rows = [
+        {'T': 64, 'mode': 'sequential', 'chunk_size': None,
+         'times_ms': [10.0, 10.0, 10.0, 10.0]},
+        {'T': 64, 'mode': 'chunked', 'chunk_size': 16,
+         'times_ms': [1.0, float('inf'), 1.0, 1.0]},
+        {'T': 64, 'mode': 'chunked', 'chunk_size': 32,
+         'times_ms': [9.0, 9.0, 9.0, 9.0]},
+    ]
+    result = lp.selection_bias_study(rows)
+    row = result['rows'][0]
+    _ok('row with an Inf sample is not summarized',
+        row['available'] is False, row)
+    json.dumps(result, allow_nan=False)
+
+    huge = [
+        {'T': 32, 'mode': 'sequential', 'chunk_size': None,
+         'times_ms': [10.0, 10.0]},
+        {'T': 32, 'mode': 'chunked', 'chunk_size': 16,
+         'times_ms': [1.0, 10 ** 400]},
+        {'T': 32, 'mode': 'chunked', 'chunk_size': 32,
+         'times_ms': [9.0, 9.0]},
+    ]
+    row = lp.selection_bias_study(huge)['rows'][0]
+    _ok('row with an unrepresentable JSON int is not summarized',
+        row['available'] is False, row)
 
 
 def test_profile_parity_guard_detects_divergence():
@@ -657,8 +699,10 @@ _TEST_FUNCS = [
     test_run_roofline_accounts_mamba_route,
     test_time_call_fake_clock,
     test_time_call_synchronize_hook,
+    test_time_call_rejects_nonfinite_clock,
     test_profile_fake_runner_and_rows,
     test_selection_bias_detects_winners_curse,
+    test_selection_bias_skips_nonfinite_times,
     test_profile_parity_guard_detects_divergence,
     test_recommend_and_summarize_synthetic,
     test_real_profile_small_and_json_roundtrip,

@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import random
 import statistics
@@ -178,14 +179,32 @@ def time_call(
     for _ in range(warmup):
         fn()
     times: list[float] = []
+    times_ms: list[float] = []
     for _ in range(repeats):
         barrier()
         t0 = timer()
         fn()
         barrier()
-        times.append(max(0.0, timer() - t0))
+        try:
+            elapsed = float(timer() - t0)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'time_call: timer() must return finite seconds; got an '
+                'unrepresentable elapsed time.') from None
+        if not math.isfinite(elapsed):
+            raise ValueError(
+                'time_call: timer() returned a non-finite elapsed time '
+                f'({elapsed!r}); a NaN/Inf sample cannot be reported.')
+        elapsed = max(0.0, elapsed)
+        elapsed_ms = elapsed * 1e3
+        if not math.isfinite(elapsed_ms):
+            raise ValueError(
+                f'time_call: elapsed={elapsed!r}s cannot be represented in '
+                f'milliseconds as a finite float.')
+        times.append(elapsed)
+        times_ms.append(elapsed_ms)
     stats = summarize_timings_s(times)
-    stats['times_ms'] = [t * 1e3 for t in times]
+    stats['times_ms'] = times_ms
     return stats
 
 
@@ -255,13 +274,20 @@ def selection_bias_study(rows, *, seed: int = 0) -> dict:
             continue
         if row.get('mode') not in ('sequential', 'chunked'):
             continue
-        if any(not isinstance(t, (int, float)) or t != t for t in times):
+        if any(isinstance(t, bool) or not isinstance(t, (int, float))
+               for t in times):
+            continue
+        try:
+            numeric = [float(t) for t in times]
+        except OverflowError:
+            continue
+        if any(not math.isfinite(v) for v in numeric):
             continue
         entry = by_t.setdefault(row['T'], {'sequential': None, 'chunked': {}})
         if row['mode'] == 'sequential':
-            entry['sequential'] = [float(t) for t in times]
+            entry['sequential'] = numeric
         elif row.get('chunk_size') is not None:
-            entry['chunked'][int(row['chunk_size'])] = [float(t) for t in times]
+            entry['chunked'][int(row['chunk_size'])] = numeric
     out = []
     for T in sorted(by_t):
         entry = by_t[T]
