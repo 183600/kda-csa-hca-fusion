@@ -153,6 +153,15 @@ def test_neighbors_skip_topk_without_csa():
 # cost model
 # ---------------------------------------------------------------------------
 
+def test_candidate_config_rejects_truncated_geometry():
+    """Geometry must be an exact int before make_grid_cfg can int() it."""
+    for field, value in (('m', 4.5), ('m2', 8.0), ('m2', True),
+                         ('d_model', 32.5), ('d_model', 0)):
+        kwargs = dict(SMALL, **{field: value})
+        with pytest.raises(ValueError):
+            candidate_config(START, **kwargs)
+
+
 def test_state_bytes_match_analytic_components():
     cfg = candidate_config(START, **SMALL)
     report = cost_report(START, T=512, **SMALL)
@@ -585,6 +594,18 @@ def test_mqar_objective_seed_statistics():
         else:
             raise AssertionError(
                 f'make_mqar_objective accepted seeds={bad_seeds!r}')
+
+
+def test_mqar_objective_rejects_truncated_geometry():
+    """The probe must not train a geometry different from the one recorded."""
+    base = dict(m=4, m2=8, seeds=(0,), steps=1, seq_len=8, d_model=32,
+                train_batch=4, eval_batches=1, eval_batch=8, device='cpu')
+    for field, value in (('m', 4.5), ('m2', 8.0), ('m2', True),
+                         ('steps', 1.5), ('seq_len', 8.0),
+                         ('d_model', 32.5), ('train_batch', True),
+                         ('eval_batches', 0), ('eval_batch', -1)):
+        with pytest.raises(ValueError):
+            make_mqar_objective(**dict(base, **{field: value}))
 
 
 def test_mqar_objective_trains_with_the_candidate_topk():

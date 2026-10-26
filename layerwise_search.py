@@ -283,6 +283,14 @@ def _validate_T(T: int, fn_name: str) -> None:
         raise ValueError(f'{fn_name}: T must be a non-negative int, got {T!r}')
 
 
+def _require_positive_int(value, field_name: str) -> None:
+    """Reject float/bool geometry before ``int()`` can silently truncate it."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(
+            f'{field_name} must be a positive exact int, got {value!r}; '
+            f'silently truncating it would change the configured geometry.')
+
+
 def candidate_config(candidate: Candidate, *, m: int, m2: int,
                      d_model: int = 32):
     """Build the probe ``HybridConfig`` for one candidate.
@@ -299,9 +307,12 @@ def candidate_config(candidate: Candidate, *, m: int, m2: int,
         raise TypeError(
             f'candidate_config: candidate must be a Candidate, got '
             f'{type(candidate).__name__}.')
-    return make_grid_cfg(int(m), int(m2), candidate.layout,
-                         d_model=int(d_model),
-                         csa_topk=int(candidate.csa_topk))
+    _require_positive_int(m, 'candidate_config: m')
+    _require_positive_int(m2, 'candidate_config: m2')
+    _require_positive_int(d_model, 'candidate_config: d_model')
+    return make_grid_cfg(m, m2, candidate.layout,
+                         d_model=d_model,
+                         csa_topk=candidate.csa_topk)
 
 
 def _state_bytes_at(cfg, T: int, dtype_bytes: int
@@ -972,20 +983,26 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
     if not isinstance(stream, str) or not stream:
         raise ValueError('make_mqar_objective: stream must be a non-empty '
                          f'string, got {stream!r}')
+    for field_name, value in (('m', m), ('m2', m2), ('steps', steps),
+                              ('seq_len', seq_len), ('d_model', d_model),
+                              ('train_batch', train_batch),
+                              ('eval_batches', eval_batches),
+                              ('eval_batch', eval_batch)):
+        _require_positive_int(value, f'make_mqar_objective: {field_name}')
 
     def evaluate(candidate: Candidate) -> dict:
         accuracies: list[float | None] = []
         final_losses: list[float | None] = []
         for seed in seed_list:
             model, embed, head, losses = train_recall_model(
-                candidate.layout, int(m), int(m2), seed=int(seed),
-                steps=int(steps), seq_len=int(seq_len), d_model=int(d_model),
-                train_batch=int(train_batch), device=device,
-                csa_topk=int(candidate.csa_topk))
+                candidate.layout, m, m2, seed=seed,
+                steps=steps, seq_len=seq_len, d_model=d_model,
+                train_batch=train_batch, device=device,
+                csa_topk=candidate.csa_topk)
             result = evaluate_recall(
-                model, embed, head, seq_len=int(seq_len),
-                n_batches=int(eval_batches), batch=int(eval_batch),
-                seed=int(seed), device=device, gen_offset=int(gen_offset))
+                model, embed, head, seq_len=seq_len,
+                n_batches=eval_batches, batch=eval_batch,
+                seed=seed, device=device, gen_offset=gen_offset)
             accuracies.append(result['accuracy'])
             final_losses.append(losses[-1] if losses else None)
             if logger is not None:
@@ -1014,10 +1031,10 @@ def make_mqar_objective(*, m: int, m2: int, seeds: Sequence[int] = (42, 43, 44),
                 'seeds': list(seed_list),
                 'final_loss': [None if v is None else float(v)
                                for v in final_losses],
-                'steps': int(steps),
-                'seq_len': int(seq_len),
-                'm': int(m),
-                'm2': int(m2),
+                'steps': steps,
+                'seq_len': seq_len,
+                'm': m,
+                'm2': m2,
                 'probe': 'mqar-long-range-cue-last',
                 'evaluation_stream': str(stream),
                 'eval_gen_offset': int(gen_offset),
