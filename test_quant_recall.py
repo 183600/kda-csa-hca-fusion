@@ -655,5 +655,18 @@ def test_quantization_extremes_stay_finite_and_json_safe():
     assert stats['signal_rms'] is not None
     json.dumps(stats, allow_nan=False)
 
+    for dtype in (torch.float16, torch.float32, torch.float64):
+        limit = torch.finfo(dtype).max
+        extremes = torch.tensor([[limit, -limit]], dtype=dtype)
+        for sym in (True, False):
+            qspec = QuantSpec(bits=8, group_size=2, symmetric=sym)
+            q = fake_quantize(extremes, qspec, ste=False)
+            assert q.dtype == dtype
+            assert bool(torch.isfinite(q).all())
+            qstats = quantization_error(extremes, qspec)
+            assert qstats['max_abs_error'] is not None
+            assert qstats['rms_error'] is not None
+            assert qstats['signal_rms'] is not None
+
     n = 5 * 10 ** 307
     assert storage_bytes(n, QuantSpec(bits=4, group_size=64)) == 2.65625e307

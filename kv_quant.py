@@ -461,6 +461,7 @@ def fake_quantize(x: torch.Tensor, spec: StorageSpec,
                                 torch.ones_like(amax))
         codes = torch.round(groups / scale).clamp(-qmax, qmax)
         deq = codes * scale
+        deq_low, deq_high = -amax, amax
     else:
         # min/max scale + integer zero point per group. The representable
         # range must include zero: the unsigned code grid is ``[0, qmax]``
@@ -511,6 +512,15 @@ def fake_quantize(x: torch.Tensor, spec: StorageSpec,
             # letting the reconstruction overflow to +-inf.
             deq = torch.where(overflow_groups,
                               torch.clamp(deq, min=lo, max=hi), deq)
+        deq_low, deq_high = lo, hi
+
+    overflow = (~torch.isfinite(deq)
+                | (deq.abs() > float(torch.finfo(orig_dtype).max)))
+    if bool(overflow.any()):
+        safe = torch.clamp(torch.where(torch.isnan(deq),
+                                       torch.zeros_like(deq), deq),
+                           min=deq_low, max=deq_high)
+        deq = torch.where(overflow, safe, deq)
 
     deq = deq.reshape(*lead, -1)[..., :n].to(orig_dtype)
     if ste and x.requires_grad:
