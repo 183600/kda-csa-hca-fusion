@@ -127,6 +127,47 @@ def _reduction_dims(x: torch.Tensor, normalized_shape: tuple[int, ...]):
     return tuple(range(first, x.dim()))
 
 
+def _rms_normalize(x: torch.Tensor, dims, eps: float, *,
+                   inplace: bool) -> torch.Tensor:
+    """Apply RMS normalization, with an overflow-safe fallback.
+
+    The direct expression is bit-identical to the historical formula.  For
+    finite inputs whose square (or mean) overflows the dtype, ``rsqrt(inf)``
+    is zero and would erase the whole row, even though the true normalized
+    direction is well defined.  Only in that case fall back to a
+    scale-normalized evaluation: with ``s = max(|x|)``,
+
+        x / sqrt(mean(x**2) + eps)
+          = (x/s) * rsqrt(mean((x/s)**2) + eps/s**2).
+
+    The inner denominator is additionally normalized by its larger term so
+    extreme ``eps`` cannot overflow either.  Ordinary rows never enter this
+    branch, preserving the exact historical values (and gradients).
+    """
+    mean_square = x.pow(2).mean(dim=dims, keepdim=True)
+    denominator = mean_square + eps
+    if (bool(torch.isfinite(denominator).all())
+            or not bool(torch.isfinite(x).all())):
+        if inplace:
+            x.mul_(torch.rsqrt(denominator))
+            return x
+        return x * torch.rsqrt(denominator)
+
+    scale = x.detach().abs().amax(dim=dims, keepdim=True)
+    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    scaled = x / safe_scale
+    mean_scaled = scaled.pow(2).mean(dim=dims, keepdim=True)
+    eps_scaled = (eps / safe_scale) / safe_scale
+    pivot = torch.maximum(mean_scaled, eps_scaled)
+    inv = torch.rsqrt(mean_scaled / pivot + eps_scaled / pivot)
+    inv = inv * torch.rsqrt(pivot)
+    y = scaled * inv
+    if inplace:
+        x.copy_(y)
+        return x
+    return y
+
+
 def rms_norm(
     x: torch.Tensor,
     eps: float = RMS_NORM_EPS,
@@ -163,8 +204,7 @@ def rms_norm(
     _check_affine(x, "bias", bias, shape)
 
     dims = _reduction_dims(x, shape)
-    mean_square = x.pow(2).mean(dim=dims, keepdim=True)
-    y = x * torch.rsqrt(mean_square + eps)
+    y = _rms_normalize(x, dims, eps, inplace=False)
     if weight is not None:
         y = y * weight
     if bias is not None:
@@ -196,8 +236,7 @@ def rms_norm_(
             "rms_norm_ does not support autograd; use rms_norm instead")
 
     dims = _reduction_dims(x, shape)
-    mean_square = x.pow(2).mean(dim=dims, keepdim=True)
-    x.mul_(torch.rsqrt(mean_square + eps))
+    x = _rms_normalize(x, dims, eps, inplace=True)
     if weight is not None:
         x.mul_(weight)
     if bias is not None:

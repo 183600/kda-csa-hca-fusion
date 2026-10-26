@@ -207,6 +207,52 @@ def test_rmsnorm_validation(device='cpu'):
     return results
 
 
+def test_rmsnorm_overflow_finite_inputs(device='cpu'):
+    """Finite inputs at the dtype limit must not collapse to all zeros.
+
+    ``x.pow(2)`` overflows to inf at ``finfo.max``; the historical
+    ``rsqrt(inf) = 0`` then multiplied the whole row away.  The fallback
+    keeps the normalized direction finite while leaving ordinary rows
+    bit-identical (pinned by the other tests in this file).
+    """
+    results = []
+    sqrt2 = 2.0 ** 0.5
+    tolerances = {torch.float16: 2e-3, torch.bfloat16: 2e-3,
+                  torch.float32: 1e-6, torch.float64: 1e-12}
+    for dtype, tol in tolerances.items():
+        limit = torch.finfo(dtype).max
+        x = torch.tensor([[limit, 0.0], [limit, limit],
+                          [-limit, limit]], dtype=dtype, device=device)
+        y = rms_norm(x)
+        expected = torch.tensor([[sqrt2, 0.0], [1.0, 1.0], [-1.0, 1.0]],
+                                dtype=dtype, device=device)
+        y_inplace = x.clone()
+        rms_norm_(y_inplace)
+        _check(results, f'rms_norm finite at {dtype} limit',
+               y.dtype == dtype and bool(torch.isfinite(y).all())
+               and torch.allclose(y, expected, atol=tol, rtol=tol),
+               f'{y.tolist()}')
+        _check(results, f'rms_norm_ matches rms_norm at {dtype} limit',
+               torch.equal(y_inplace, y), '')
+
+    x = torch.tensor([[1.0, 2.0]], device=device)
+    huge_eps = float(torch.finfo(torch.float32).max)
+    y = rms_norm(x, eps=huge_eps)
+    _check(results, 'rms_norm stays finite for an eps at the dtype limit',
+           bool(torch.isfinite(y).all()) and bool((y > 0).all()),
+           f'{y.tolist()}')
+
+    limit = torch.finfo(torch.float32).max
+    xg = torch.tensor([[limit, 0.0], [limit, limit]],
+                      dtype=torch.float32, device=device,
+                      requires_grad=True)
+    yg = rms_norm(xg)
+    (grad,) = torch.autograd.grad(yg.sum(), xg)
+    _check(results, 'rms_norm fallback gradient finite at dtype limit',
+           bool(torch.isfinite(grad).all()), f'{grad.tolist()}')
+    return results
+
+
 def test_qk_normalize_delegates_to_rmsnorm(device='cpu'):
     results = []
     q = torch.randn(2, 4, 3, 8, dtype=torch.float32, device=device) * 0.7
@@ -225,6 +271,7 @@ def main():
     all_results = []
     for fn in (test_rmsnorm_shape_polymorphism, test_rmsnorm_inplace_and_affine,
                test_rmsnorm_dtype_and_autograd, test_rmsnorm_validation,
+               test_rmsnorm_overflow_finite_inputs,
                test_qk_normalize_delegates_to_rmsnorm):
         all_results += fn()
     failed = [r for r in all_results if r['status'] != 'PASS']
