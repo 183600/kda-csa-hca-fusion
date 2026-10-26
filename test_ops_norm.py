@@ -267,6 +267,33 @@ def test_qk_normalize_delegates_to_rmsnorm(device='cpu'):
     return results
 
 
+def test_qk_l2_normalize_preserves_finite_dtype_limit_direction():
+    """Finite rows whose L2 norm overflows must not become all zeros."""
+    import torch.nn.functional as functional
+
+    inv_sqrt2 = 1.0 / (2.0 ** 0.5)
+    tolerances = {torch.float16: 2e-3, torch.bfloat16: 2e-3,
+                  torch.float32: 1e-6, torch.float64: 1e-12}
+    for dtype, tol in tolerances.items():
+        normal = torch.randn(3, 7, dtype=dtype) * 0.7
+        assert torch.equal(_qk_normalize(normal, 'l2'),
+                           functional.normalize(normal, dim=-1))
+
+        limit = torch.finfo(dtype).max
+        x = torch.tensor([[limit, 0.0], [limit, limit],
+                          [-limit, limit], [0.0, 0.0]], dtype=dtype)
+        expected = torch.tensor(
+            [[1.0, 0.0], [inv_sqrt2, inv_sqrt2],
+             [-inv_sqrt2, inv_sqrt2], [0.0, 0.0]], dtype=dtype)
+        y = _qk_normalize(x, 'l2')
+        assert bool(torch.isfinite(y).all())
+        torch.testing.assert_close(y, expected, atol=tol, rtol=tol)
+
+        y_inplace = x.clone()
+        assert _qk_normalize_(y_inplace, 'l2') is y_inplace
+        torch.testing.assert_close(y_inplace, expected, atol=tol, rtol=tol)
+
+
 def main():
     all_results = []
     for fn in (test_rmsnorm_shape_polymorphism, test_rmsnorm_inplace_and_affine,

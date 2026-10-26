@@ -815,6 +815,38 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
     return p
 
 
+def _l2_normalize_overflow_fallback(x: torch.Tensor) -> torch.Tensor:
+    """L2-normalize finite rows whose norm overflows the input dtype.
+
+    ``x / ||x||`` is well defined even when ``||x||`` itself is not
+    representable. Normalize by the row maximum first and divide by the
+    resulting (small) norm, preserving the direction instead of returning
+    the all-zero vector from ``x / inf``. Non-finite rows keep the ordinary
+    ``F.normalize`` result by scaling with 1 rather than an inf/NaN max.
+    """
+    work = (x.float() if x.dtype in (torch.float16, torch.bfloat16) else x)
+    scale = work.detach().abs().amax(dim=-1, keepdim=True)
+    safe_scale = torch.where(torch.isfinite(scale) & (scale > 0),
+                             scale, torch.ones_like(scale))
+    scaled = work / safe_scale
+    denom = scaled.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
+    return (scaled / denom).to(x.dtype)
+
+
+def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    """``F.normalize(x, dim=-1)`` with an overflow-safe finite-row fallback.
+
+    The direct expression is bit-identical to ``F.normalize`` (which is
+    ``x / clamp_min(||x||_2, 1e-12)``). Only rows whose norm is not finite
+    enter the fallback, so ordinary values and their gradients are
+    unchanged.
+    """
+    denom = x.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
+    if bool(torch.isfinite(denom).all()):
+        return x / denom
+    return _l2_normalize_overflow_fallback(x)
+
+
 def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
     """Normalize queries / compressed KV before the core attention.
 
@@ -839,7 +871,7 @@ def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
       pin any other temperature.
     """
     if mode == 'l2':
-        return F.normalize(x, dim=-1)
+        return _l2_normalize(x)
     if mode == 'rms':
         return rms_norm(x, eps=RMS_NORM_EPS)
     raise ValueError(
@@ -862,7 +894,11 @@ def _qk_normalize_(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
     """
     if mode == 'l2':
         denom = x.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
-        return x.div_(denom)
+        if bool(torch.isfinite(denom).all()):
+            return x.div_(denom)
+        # ``x.div_(inf)`` would erase a finite row; compute the direction
+        # from a scaled copy and write it back (the caller owns ``x``).
+        return x.copy_(_l2_normalize_overflow_fallback(x))
     if mode == 'rms':
         return rms_norm_(x, eps=RMS_NORM_EPS)
     raise ValueError(
@@ -1377,8 +1413,8 @@ def csa_lightning_indexer(
     # projection scaling. Set ``normalize_qk=False`` to restore the
     # un-normalized (paper-literal) behaviour (e.g. for ablation).
     if normalize_qk:
-        q_idx = F.normalize(q_idx, dim=-1)
-        k_idx = F.normalize(k_idx, dim=-1)
+        q_idx = _l2_normalize(q_idx)
+        k_idx = _l2_normalize(k_idx)
 
     # Query-axis tiling dispatch. ``query_chunk <= 0`` (the default) or a
     # tile at least as large as T evaluates everything in ONE call to
