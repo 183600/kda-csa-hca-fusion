@@ -762,6 +762,16 @@ def test_suffix_metrics_are_double_precision_and_json_safe():
     assert metrics['first_divergence_step'] == 0
     json.dumps(metrics, allow_nan=False)
 
+    # The difference itself can overflow even though both suffixes are
+    # finite; the normalized drift is still well defined.
+    ref = torch.full((1, 4, 2), 1e308, dtype=torch.float64)
+    got = -ref
+    metrics = _suffix_metrics(ref, got, 2, 1e-5)
+    assert metrics['rel_l2'] == 2.0
+    assert metrics['max_abs_diff'] is None
+    assert metrics['first_divergence_step'] == 0
+    json.dumps(metrics, allow_nan=False)
+
     # A NaN suffix is a divergence, not a non-event: ``NaN > tol`` is
     # False, so it must be detected separately or a dropped state family
     # that poisons the output is reported as not load-bearing.

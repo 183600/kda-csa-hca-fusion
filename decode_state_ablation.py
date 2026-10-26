@@ -165,15 +165,37 @@ def _suffix_metrics(reference, observed, start, tol):
     # float32 would turn it into inf and hide a real divergence.
     ref = reference[:, start:].detach().double()
     got = observed[:, start:].detach().double()
-    diff = (ref - got).abs()
-    ref_norm = float(torch.linalg.vector_norm(ref))
-    diff_norm = float(torch.linalg.vector_norm(ref - got))
-    if ref_norm > 0.0:
-        rel_l2 = diff_norm / ref_norm
+    raw_diff = ref - got
+    overflowed = not bool(torch.isfinite(raw_diff).all())
+    if overflowed:
+        # The subtraction can overflow even when both suffixes are finite
+        # (e.g. 1e308 vs -1e308). Normalize by the larger magnitude so the
+        # per-step mask and relative-L2 remain computable; fields whose
+        # original-unit value still exceeds the float range report None.
+        scale = max(float(ref.abs().max()), float(got.abs().max()))
+        ref_scaled = ref / scale
+        got_scaled = got / scale
+        diff = (ref_scaled - got_scaled).abs() * scale
     else:
-        # 0/0 is undefined, and a nonzero difference over a zero reference
-        # has no finite relative scale; None is the JSON-safe statement.
-        rel_l2 = 0.0 if diff_norm == 0.0 else None
+        diff = raw_diff.abs()
+    ref_norm = float(torch.linalg.vector_norm(ref))
+    if overflowed:
+        scaled_diff_norm = float(torch.linalg.vector_norm(
+            ref_scaled - got_scaled))
+        scaled_ref_norm = float(torch.linalg.vector_norm(ref_scaled))
+        if scaled_ref_norm > 0.0:
+            rel_l2 = scaled_diff_norm / scaled_ref_norm
+        else:
+            rel_l2 = 0.0 if scaled_diff_norm == 0.0 else None
+    else:
+        diff_norm = float(torch.linalg.vector_norm(raw_diff))
+        if ref_norm > 0.0:
+            rel_l2 = diff_norm / ref_norm
+        else:
+            # 0/0 is undefined, and a nonzero difference over a zero
+            # reference has no finite relative scale; None is the
+            # JSON-safe statement.
+            rel_l2 = 0.0 if diff_norm == 0.0 else None
     if rel_l2 is not None and not math.isfinite(rel_l2):
         rel_l2 = None
     per_step = diff.amax(dim=(0, 2))
