@@ -59,7 +59,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ops_csa import naive_csa, _qk_normalize_
+from ops_csa import naive_csa, _qk_normalize, _qk_normalize_
 from ops_hca import naive_hca
 from ops_kda import per_channel_log_decay_bias
 from ops_kda_backend import kda_forward, validate_kda_backend
@@ -1122,14 +1122,17 @@ class KDAHybridLayer(nn.Module):
         if detach_lookback:
             new_lookback = new_lookback.detach()
         new_lookback = new_lookback.clone()
-        # View BEFORE normalize: ``F.normalize(dim=-1)`` must operate on each
+        # View BEFORE normalize: L2 normalization must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector —
         # otherwise each head's L2 norm becomes ~1/sqrt(H) instead of 1 and
         # the q.k dot products shrink by a factor of 1/H. Mirrors the
-        # CSA/HCA branches below.
+        # CSA/HCA branches below. Both branches use the same normalization
+        # chain (including the finite-overflow fallback).
         if torch.is_grad_enabled():
-            q = F.normalize(F.silu(self.q_proj(x_conv)).view(B, T, H, K), dim=-1)
-            k = F.normalize(F.silu(self.k_proj(x_conv)).view(B, T, H, K), dim=-1)
+            q = _qk_normalize(
+                F.silu(self.q_proj(x_conv)).view(B, T, H, K), 'l2')
+            k = _qk_normalize(
+                F.silu(self.k_proj(x_conv)).view(B, T, H, K), 'l2')
             v = F.silu(self.v_proj(x_conv)).view(B, T, HV, V)
         else:
             # The projections are fresh linear outputs; outside autograd the

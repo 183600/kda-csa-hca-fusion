@@ -115,8 +115,9 @@ import torch
 from ops_cache import normal_tensor_scope
 from ops_rope import effective_rope_dim, partial_rope
 from ops_csa import (csa_compress_kv, _csa_compress_kv_overlapped_prev,
-                     csa_lightning_indexer, _qk_normalize, _qk_normalize_,
-                     _nan_safe_softmax, _sink_softmax, _require_scale)
+                     csa_lightning_indexer, _l2_normalize, _qk_normalize,
+                     _qk_normalize_, _nan_safe_softmax, _sink_softmax,
+                     _require_scale)
 
 
 def _validate_cache_dtype(dtype) -> None:
@@ -1787,8 +1788,8 @@ class CSADecodingCache:
                 # normalized the same way (it is a single [B, 1, nIh, c_I]
                 # row per step).
                 _qk_normalize_(K_IComp_valid, 'l2')
-                q_idx_n = torch.nn.functional.normalize(
-                    _to_dtype(q_idx, compute_dtype), dim=-1)
+                q_idx_n = _l2_normalize(
+                    _to_dtype(q_idx, compute_dtype))
                 # ``scale=1.0`` + ``normalize_qk=False`` reproduces the
                 # indexer's ``normalize_qk=True`` auto-scale exactly.
                 indexer_result = csa_lightning_indexer(
@@ -2181,8 +2182,8 @@ class CSADecodingCache:
             if (normalize_qk and not torch.is_grad_enabled()
                     and self.dtype != compute_dtype):
                 _qk_normalize_(K_I, 'l2')
-                q_idx_n = torch.nn.functional.normalize(
-                    _to_dtype(q_idx, compute_dtype), dim=-1)
+                q_idx_n = _l2_normalize(
+                    _to_dtype(q_idx, compute_dtype))
                 indexer_result = csa_lightning_indexer(
                     q_idx_n, K_I, _to_dtype(w_idx, compute_dtype), topk,
                     scale=1.0, causal_block_mask=cbm,
