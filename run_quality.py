@@ -465,58 +465,46 @@ def _bonferroni_crit_q(n, alpha=0.05):
             return bt * _betacf(a, b, x) / a
         return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
 
-    def _student_t_cdf(t_value, dof):
-        if t_value == 0.0:
-            return 0.5
+    dof = n - 1
+    # Compute the upper-tail probability directly from the incomplete beta
+    # function.  ``1 - CDF`` is unusable here: for a large dof the CDF
+    # rounds to exactly 1.0 well before the tail probability reaches alpha,
+    # so an anchored bracket either never opens (RuntimeError) or stops at
+    # a 1e-15 floor.  The identity
+    #
+    #     SF(t) = 0.5 * I_{dof/(dof+t^2)}(dof/2, 1/2)
+    #
+    # keeps the tail's relative precision (and its log) down to underflow,
+    # which is exactly the regime of a Bonferroni-corrected alpha.
+    def _log_sf(t_value):
+        if t_value <= 0.0:
+            return math.log(0.5)
         x = dof / (dof + t_value * t_value)
         ib = _betai(0.5 * dof, 0.5, x)
-        if t_value > 0.0:
-            return 1.0 - 0.5 * ib
-        return 0.5 * ib
+        if ib <= 0.0:
+            return -math.inf
+        # Guard only against a last-bit overshoot from the continued
+        # fraction; the true regularized beta is in [0, 1].
+        return math.log(0.5) + math.log(min(ib, 1.0))
 
-    dof = n - 1
-    # For small dof and extreme tail quantiles (e.g. dof=4, alpha=0.0125,
-    # target_p=0.9875, true crit ≈ 3.5), the continued-fraction _betacf can
-    # lose precision when x is very small.  We bracket the quantile with a
-    # coarse exponential scan, then refine with a *regularised* bisection
-    # that uses the log-survival function log(1 - CDF) instead of the raw
-    # CDF.  The log-survival function is numerically much better behaved in
-    # the far upper tail: 1 - CDF(t) ≈ 0.5 * ib for large t, and ib itself
-    # is computed from _betai which is stable for small x.  Taking logs
-    # avoids catastrophic cancellation when CDF(t) is extremely close to 1.
-    target_log_sf = math.log(max(alpha, 1e-300))  # log(1 - target_p) = log(alpha)
-    # Coarse bracket: find lo, hi such that log_sf(lo) > target_log_sf > log_sf(hi)
+    target_log_sf = math.log(alpha)  # log(1 - target_p) = log(alpha)
+    # Coarse bracket: find lo, hi such that log_sf(lo) > target_log_sf >
+    # log_sf(hi).  The old 1e6 cap was below the quantile for dof=1 even at
+    # alpha=1e-12, and the saturation check above could not see that the
+    # true tail had already crossed alpha.
     lo = 0.0
     hi = 1.0
-    while True:
-        cdf_hi = _student_t_cdf(hi, dof)
-        if cdf_hi >= 1.0 - 1e-15:
-            # Already saturated; push hi further
-            hi *= 2.0
-            if hi > 1.0e6:
-                raise RuntimeError(
-                    f"_bonferroni_crit_q fallback could not bracket quantile "
-                    f"for n={n}, alpha={alpha}")
-            continue
-        log_sf_hi = math.log(max(1.0 - cdf_hi, 1e-300))
-        if log_sf_hi <= target_log_sf:
-            break
+    while _log_sf(hi) > target_log_sf:
         hi *= 2.0
-        if hi > 1.0e6:
-            raise RuntimeError(
-                f"_bonferroni_crit_q fallback could not bracket quantile "
-                f"for n={n}, alpha={alpha}")
+        if not math.isfinite(hi) or hi > 1.0e308:
+            raise ValueError(
+                f"_bonferroni_crit_q: alpha={alpha!r} for n={n} needs a "
+                f"critical value outside the float range")
     # Refine with log-survival bisection (80 iterations, ~1e-24 relative
     # precision on the quantile).
     for _ in range(80):
         mid = 0.5 * (lo + hi)
-        cdf_mid = _student_t_cdf(mid, dof)
-        if cdf_mid >= 1.0 - 1e-15:
-            # mid is already in the saturated region; move hi down
-            hi = mid
-            continue
-        log_sf_mid = math.log(max(1.0 - cdf_mid, 1e-300))
-        if log_sf_mid > target_log_sf:
+        if _log_sf(mid) > target_log_sf:
             lo = mid
         else:
             hi = mid
