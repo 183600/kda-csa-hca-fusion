@@ -394,6 +394,22 @@ def test_drift_metrics_rms_survives_squaring_overflow():
     json.dumps(drift, allow_nan=False)
 
 
+def test_drift_metrics_extreme_finite_difference_stays_json_safe():
+    import json
+    ref = torch.tensor([1e308, 0.0], dtype=torch.float64)
+    cand = torch.tensor([-1e308, 0.0], dtype=torch.float64)
+    drift = drift_metrics(ref, cand)
+    assert drift['finite'] is True
+    # The difference itself (2e308) is unrepresentable, but the normalized
+    # statistics are well defined and must not turn into NaN.
+    assert drift['max_abs'] is None
+    assert drift['mean_abs'] == pytest.approx(1e308, rel=1e-12)
+    assert drift['rms'] == pytest.approx(2 ** 0.5 * 1e308, rel=1e-12)
+    assert drift['relative_l2'] == pytest.approx(2.0, rel=1e-12)
+    assert drift['cosine'] == pytest.approx(-1.0, abs=1e-12)
+    json.dumps(drift, allow_nan=False)
+
+
 def test_drift_metrics_huge_finite_tensors_are_json_safe():
     import json
     a = torch.tensor([[1e154, 1e154]], dtype=torch.float64)

@@ -378,18 +378,35 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
             'n_elements': int(ref.numel()),
         }
     diff = cand - ref
-    abs_diff = diff.abs()
-    max_abs = abs_diff.max()
-    mean_abs = abs_diff.mean()
-    rms = torch.sqrt(torch.mean(diff * diff))
-    if not bool(torch.isfinite(rms)):
-        # ``diff**2`` can overflow even when the RMS itself is
-        # representable (e.g. a 2e200 difference in fp64). Scale before
-        # squaring; the ordinary in-range value above is unchanged bit for
-        # bit.
-        scale = abs_diff.max()
-        if bool(torch.isfinite(scale)) and float(scale) > 0.0:
-            rms = torch.sqrt(torch.mean((diff / scale) ** 2)) * scale
+    scaled = None
+    if bool(torch.isfinite(diff).all()):
+        abs_diff = diff.abs()
+        max_abs = abs_diff.max()
+        mean_abs = abs_diff.mean()
+        rms = torch.sqrt(torch.mean(diff * diff))
+        if not bool(torch.isfinite(rms)):
+            # ``diff**2`` can overflow even when the RMS itself is
+            # representable (e.g. a 2e200 difference in fp64). Scale before
+            # squaring; the ordinary in-range value above is unchanged bit
+            # for bit.
+            scale = abs_diff.max()
+            if bool(torch.isfinite(scale)) and float(scale) > 0.0:
+                rms = torch.sqrt(torch.mean((diff / scale) ** 2)) * scale
+    else:
+        # The subtraction itself overflowed although both inputs are finite
+        # (e.g. 1e308 - -1e308). Work in units of the larger input so the
+        # mean/RMS/relative-L2 terms stay computable; an individual result
+        # that still exceeds the float range is reported as None by the
+        # finite-float guard below.
+        scale = max(float(ref.abs().max()), float(cand.abs().max()))
+        rs = ref / scale
+        cs = cand / scale
+        diff = cs - rs
+        abs_diff = diff.abs()
+        scaled = (rs, cs, diff, scale)
+        max_abs = abs_diff.max() * scale
+        mean_abs = abs_diff.mean() * scale
+        rms = torch.sqrt(torch.mean(diff * diff)) * scale
 
     def _safe_norm(t):
         norm = torch.linalg.vector_norm(t)
@@ -402,9 +419,14 @@ def drift_metrics(reference: torch.Tensor, candidate: torch.Tensor, *,
 
     ref_norm = _safe_norm(ref)
     cand_norm = _safe_norm(cand)
-    diff_norm = _safe_norm(diff)
     tiny = torch.finfo(dtype).tiny
-    relative_l2 = diff_norm / ref_norm.clamp_min(tiny)
+    if scaled is not None:
+        rs, _cs, diff, _scale = scaled
+        relative_l2 = (
+            _safe_norm(diff) / _safe_norm(rs).clamp_min(tiny))
+    else:
+        diff_norm = _safe_norm(diff)
+        relative_l2 = diff_norm / ref_norm.clamp_min(tiny)
     if ref_norm <= tiny or cand_norm <= tiny:
         # Cosine is defined as 1.0 for two zero vectors and 0.0 when only
         # one is zero; mirror ``F.cosine_similarity``'s eps convention.
