@@ -64,22 +64,32 @@ def _bf16_scale_if_needed(
     Prevents gradual accumulation of large values over long sequences.
     For finite rows whose bf16 norm overflows to inf, the scale is computed
     from a dimensionless row norm in fp32 instead, so the row is scaled to
-    ``max_norm`` rather than multiplied by zero.
+    ``max_norm`` rather than multiplied by zero. Rows that already contain
+    non-finite values keep the historical result and never disable the
+    fallback for finite rows in the same tensor.
     """
     if x.dtype != torch.bfloat16:
         return x
     norms = x.norm(p=2, dim=-1, keepdim=True)
     scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
-    if (bool(torch.isfinite(norms).all())
-            or not bool(torch.isfinite(x).all())):
+    finite_rows = torch.isfinite(x).all(dim=-1, keepdim=True)
+    fallback_rows = finite_rows & ~torch.isfinite(norms)
+    if not bool(fallback_rows.any()):
         return x * scale
-    xf = x.float()
+    # Recompute the direct result from safe rows so the discarded branch
+    # cannot feed the overflowing ``norms`` graph into autograd.
+    x_direct = torch.where(fallback_rows, torch.ones_like(x), x)
+    norms_direct = x_direct.norm(p=2, dim=-1, keepdim=True)
+    scale_direct = (max_norm / (norms_direct + 1e-8)).clamp(max=1.0)
+    direct = x_direct * scale_direct
+    xf = torch.where(fallback_rows, x, torch.zeros_like(x)).float()
     amax = xf.abs().amax(dim=-1, keepdim=True)
     safe_amax = torch.where(amax > 0, amax, torch.ones_like(amax))
     scaled_norm = (xf / safe_amax).norm(p=2, dim=-1, keepdim=True)
-    scale = ((max_norm / safe_amax)
-             / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
-    return (xf * scale).to(x.dtype)
+    fb_scale = ((max_norm / safe_amax)
+                / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
+    fallback = (xf * fb_scale).to(x.dtype)
+    return torch.where(fallback_rows, fallback, direct)
 
 
 def _bf16_safe_einsum_sum(
@@ -837,14 +847,29 @@ def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
     """``F.normalize(x, dim=-1)`` with an overflow-safe finite-row fallback.
 
     The direct expression is bit-identical to ``F.normalize`` (which is
-    ``x / clamp_min(||x||_2, 1e-12)``). Only rows whose norm is not finite
-    enter the fallback, so ordinary values and their gradients are
-    unchanged.
+    ``x / clamp_min(||x||_2, 1e-12)``). Only finite rows whose own norm is
+    not finite enter the fallback, so ordinary values and their gradients
+    are unchanged. Rows that already contain non-finite values keep the
+    historical direct result (which may be NaN) and do not force the
+    fallback for their finite neighbours.
     """
     denom = x.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
-    if bool(torch.isfinite(denom).all()):
+    finite_rows = torch.isfinite(x).all(dim=-1, keepdim=True)
+    # ``denom == 0`` happens for float16 rows whose norm (or the 1e-12
+    # epsilon) underflows; the direct division would produce 0/0 = NaN even
+    # for an all-zero row. Treat those rows like overflow rows: the
+    # fp32 fallback gives zeros for zero rows and a unit direction for tiny
+    # subnormal rows.
+    fallback_rows = finite_rows & (~torch.isfinite(denom) | (denom == 0))
+    if not bool(fallback_rows.any()):
         return x / denom
-    return _l2_normalize_overflow_fallback(x)
+    # Replace fallback rows by ones before recomputing the denominator so
+    # the discarded direct branch cannot feed inf/NaN into autograd.
+    x_direct = torch.where(fallback_rows, torch.ones_like(x), x)
+    direct = x_direct / x_direct.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
+    fallback = _l2_normalize_overflow_fallback(
+        torch.where(fallback_rows, x, torch.zeros_like(x)))
+    return torch.where(fallback_rows, fallback, direct)
 
 
 def _qk_normalize(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
@@ -894,11 +919,13 @@ def _qk_normalize_(x: torch.Tensor, mode: str = 'l2') -> torch.Tensor:
     """
     if mode == 'l2':
         denom = x.norm(2, dim=-1, keepdim=True).clamp_min(1e-12)
-        if bool(torch.isfinite(denom).all()):
+        finite_rows = torch.isfinite(x).all(dim=-1, keepdim=True)
+        fallback_rows = finite_rows & (~torch.isfinite(denom) | (denom == 0))
+        if not bool(fallback_rows.any()):
             return x.div_(denom)
-        # ``x.div_(inf)`` would erase a finite row; compute the direction
-        # from a scaled copy and write it back (the caller owns ``x``).
-        return x.copy_(_l2_normalize_overflow_fallback(x))
+        # ``x.div_(inf)`` would erase a finite row; the per-row helper keeps
+        # every unaffected row bit-identical to the historical division.
+        return x.copy_(_l2_normalize(x))
     if mode == 'rms':
         return rms_norm_(x, eps=RMS_NORM_EPS)
     raise ValueError(

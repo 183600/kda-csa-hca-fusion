@@ -68,22 +68,29 @@ def _bf16_scale_if_needed(
 
     Mirrors ``ops_csa``: an overflowing finite bf16 norm falls back to an
     fp32 dimensionless norm so the row is scaled to ``max_norm`` instead of
-    being erased by a zero scale.
+    being erased by a zero scale. The fallback is selected per row, so a
+    non-finite row elsewhere in the tensor cannot erase a finite row.
     """
     if x.dtype != torch.bfloat16:
         return x
     norms = x.norm(p=2, dim=-1, keepdim=True)
     scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
-    if (bool(torch.isfinite(norms).all())
-            or not bool(torch.isfinite(x).all())):
+    finite_rows = torch.isfinite(x).all(dim=-1, keepdim=True)
+    fallback_rows = finite_rows & ~torch.isfinite(norms)
+    if not bool(fallback_rows.any()):
         return x * scale
-    xf = x.float()
+    x_direct = torch.where(fallback_rows, torch.ones_like(x), x)
+    norms_direct = x_direct.norm(p=2, dim=-1, keepdim=True)
+    scale_direct = (max_norm / (norms_direct + 1e-8)).clamp(max=1.0)
+    direct = x_direct * scale_direct
+    xf = torch.where(fallback_rows, x, torch.zeros_like(x)).float()
     amax = xf.abs().amax(dim=-1, keepdim=True)
     safe_amax = torch.where(amax > 0, amax, torch.ones_like(amax))
     scaled_norm = (xf / safe_amax).norm(p=2, dim=-1, keepdim=True)
-    scale = ((max_norm / safe_amax)
-             / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
-    return (xf * scale).to(x.dtype)
+    fb_scale = ((max_norm / safe_amax)
+                / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
+    fallback = (xf * fb_scale).to(x.dtype)
+    return torch.where(fallback_rows, fallback, direct)
 
 
 # Query-axis tile budget for the dense score / joint-softmax / value

@@ -485,6 +485,16 @@ def test_bf16_scale_helpers_at_dtype_limit():
                                     rtol=5e-2)),
             f'{y.tolist()} norms={row_norms.tolist()}')
 
+    mixed = torch.tensor([[limit, 0.0], [float('nan'), 1.0]],
+                         dtype=torch.bfloat16)
+    for fn in (csa_scale, hca_scale):
+        y = fn(mixed)
+        norm = float(y[0].float().norm())
+        _ok(f'{fn.__module__}: non-finite neighbour does not erase a '
+            f'finite row', bool(torch.isfinite(y[0]).all())
+            and abs(norm - 1e4) <= 5e-2 * 1e4,
+            f'{y.tolist()} norm={norm}')
+
     S_normal = torch.randn(2, 3, 4, 5, dtype=torch.bfloat16) * 0.3
     S_historical = S_normal * (
         1e4 / (S_normal.norm(p=2, dim=(-2, -1), keepdim=True) + 1e-8)

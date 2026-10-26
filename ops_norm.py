@@ -141,27 +141,41 @@ def _rms_normalize(x: torch.Tensor, dims, eps: float, *,
           = (x/s) * rsqrt(mean((x/s)**2) + eps/s**2).
 
     The inner denominator is additionally normalized by its larger term so
-    extreme ``eps`` cannot overflow either.  Ordinary rows never enter this
-    branch, preserving the exact historical values (and gradients).
+    extreme ``eps`` cannot overflow either.  Only the finite rows whose own
+    denominator overflowed enter this branch; every other row keeps the
+    exact historical values (and gradients), including rows that already
+    contain non-finite values (whose historical result is NaN/zero rather
+    than the all-NaN fallback).
     """
     mean_square = x.pow(2).mean(dim=dims, keepdim=True)
     denominator = mean_square + eps
-    if (bool(torch.isfinite(denominator).all())
-            or not bool(torch.isfinite(x).all())):
+    finite_rows = torch.isfinite(x).all(dim=dims, keepdim=True)
+    fallback_rows = finite_rows & ~torch.isfinite(denominator)
+    if not bool(fallback_rows.any()):
         if inplace:
             x.mul_(torch.rsqrt(denominator))
             return x
         return x * torch.rsqrt(denominator)
 
+    # Recompute the direct branch from safe values on fallback rows (its
+    # result is discarded there) so autograd cannot see the inf from
+    # ``x**2``; unaffected rows still use the historical expression.
+    x_direct = torch.where(fallback_rows, torch.ones_like(x), x)
+    mean_square_direct = x_direct.pow(2).mean(dim=dims, keepdim=True)
+    direct = x_direct * torch.rsqrt(mean_square_direct + eps)
+
     scale = x.detach().abs().amax(dim=dims, keepdim=True)
-    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    scaled = x / safe_scale
+    safe_scale = torch.where(fallback_rows & (scale > 0), scale,
+                             torch.ones_like(scale))
+    # Substitute ones on non-fallback rows: their values are discarded but
+    # keep the fallback graph free of 0/0 and 0*inf NaN gradients.
+    scaled = torch.where(fallback_rows, x, torch.ones_like(x)) / safe_scale
     mean_scaled = scaled.pow(2).mean(dim=dims, keepdim=True)
     eps_scaled = (eps / safe_scale) / safe_scale
     pivot = torch.maximum(mean_scaled, eps_scaled)
     inv = torch.rsqrt(mean_scaled / pivot + eps_scaled / pivot)
     inv = inv * torch.rsqrt(pivot)
-    y = scaled * inv
+    y = torch.where(fallback_rows, scaled * inv, direct)
     if inplace:
         x.copy_(y)
         return x

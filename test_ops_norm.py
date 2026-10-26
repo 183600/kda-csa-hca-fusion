@@ -235,6 +235,20 @@ def test_rmsnorm_overflow_finite_inputs(device='cpu'):
         _check(results, f'rms_norm_ matches rms_norm at {dtype} limit',
                torch.equal(y_inplace, y), '')
 
+        normal_rows = torch.tensor([[1.0, 2.0], [3.0, -1.0]], dtype=dtype,
+                                   device=device)
+        mixed = torch.cat(
+            [x[:1], normal_rows,
+             torch.tensor([[float('nan'), 1.0]], dtype=dtype,
+                          device=device)])
+        mixed_y = rms_norm(mixed)
+        _check(results, f'rms_norm mixed rows keep ordinary rows exact '
+               f'at {dtype}',
+               torch.equal(mixed_y[1:3], rms_norm(normal_rows)), '')
+        _check(results, f'rms_norm mixed rows keep finite rows at {dtype}',
+               bool(torch.isfinite(mixed_y[0]).all())
+               and bool(mixed_y[0].abs().sum() > 0), f'{mixed_y.tolist()}')
+
     x = torch.tensor([[1.0, 2.0]], device=device)
     huge_eps = float(torch.finfo(torch.float32).max)
     y = rms_norm(x, eps=huge_eps)
@@ -292,6 +306,19 @@ def test_qk_l2_normalize_preserves_finite_dtype_limit_direction():
         y_inplace = x.clone()
         assert _qk_normalize_(y_inplace, 'l2') is y_inplace
         torch.testing.assert_close(y_inplace, expected, atol=tol, rtol=tol)
+
+        normal_row = normal[:1, :2]
+        mixed = torch.cat(
+            [normal_row, x[:1],
+             torch.tensor([[float('nan'), 1.0]], dtype=dtype)])
+        mixed_y = _qk_normalize(mixed, 'l2')
+        assert torch.equal(mixed_y[:1],
+                           functional.normalize(normal_row, dim=-1))
+        assert bool(torch.isfinite(mixed_y[1]).all())
+        assert bool(mixed_y[1].abs().sum() > 0)
+        mixed_inplace = mixed.clone()
+        assert _qk_normalize_(mixed_inplace, 'l2') is mixed_inplace
+        torch.testing.assert_close(mixed_inplace, mixed_y, equal_nan=True)
 
 
 def main():
