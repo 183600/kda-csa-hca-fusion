@@ -201,25 +201,25 @@ def test_decode_caches_reject_oversized_scale():
     B, c, c_I, m, win, nh, nIh = 1, 4, 4, 2, 4, 2, 2
     csa = CSADecodingCache(B, c, c_I, m, win, 'cpu', torch.float32)
     hca = HCADecodingCache(B, c, m, win, 'cpu', torch.float32)
-    huge = 10 ** 400
     q = torch.randn(B, 1, nh, c)
     q_idx = torch.randn(B, 1, nIh, c_I)
     w_idx = torch.randn(B, 1, nIh)
-    try:
-        csa.forward_step(q, q_idx, w_idx, topk=2, nh=nh, nIh=nIh,
-                         scale=huge)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('CSADecodingCache.forward_step accepted an '
-                             'oversized scale')
-    try:
-        hca.forward_step(q, nh=nh, scale=huge)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('HCADecodingCache.forward_step accepted an '
-                             'oversized scale')
+    for bad in (10 ** 400, float('inf'), float('-inf'), float('nan')):
+        try:
+            csa.forward_step(q, q_idx, w_idx, topk=2, nh=nh, nIh=nIh,
+                             scale=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'CSADecodingCache.forward_step accepted '
+                                 f'scale={bad!r}')
+        try:
+            hca.forward_step(q, nh=nh, scale=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'HCADecodingCache.forward_step accepted '
+                                 f'scale={bad!r}')
 
 
 def test_kda_chunk_size_requires_an_exact_positive_int():
@@ -396,32 +396,33 @@ def test_kda_rejects_oversized_scale_without_overflow():
     v = torch.randn(B, T, HV, V)
     g = -torch.rand(B, T, HV, K)
     beta = torch.rand(B, T, HV)
-    huge = 10 ** 400
-    for fn, kwargs in (
-            (naive_recurrent_kda, {}),
-            (naive_chunk_kda, {'chunk_size': 2}),
-            (custom_recurrent_kda, {}),
-            (kda_forward, {'use_chunk': False})):
+    for bad in (10 ** 400, float('inf'), float('-inf'), float('nan')):
+        for fn, kwargs in (
+                (naive_recurrent_kda, {}),
+                (naive_chunk_kda, {'chunk_size': 2}),
+                (custom_recurrent_kda, {}),
+                (kda_forward, {'use_chunk': False})):
+            try:
+                fn(q, k, v, g, beta, scale=bad, **kwargs)
+            except ValueError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - the point is the type
+                raise AssertionError(
+                    f'{fn.__name__} leaked {type(exc).__name__} for '
+                    f'scale={bad!r}: {exc}')
+            else:
+                raise AssertionError(
+                    f'{fn.__name__} accepted scale={bad!r}')
+        # The custom-autograd path only multiplies by ``scale`` when a graph
+        # is needed (otherwise it delegates); validate that branch too.
+        qg = q.clone().requires_grad_(True)
         try:
-            fn(q, k, v, g, beta, scale=huge, **kwargs)
+            custom_recurrent_kda(qg, k, v, g, beta, scale=bad)
         except ValueError:
             pass
-        except Exception as exc:  # noqa: BLE001 - the point is the type
-            raise AssertionError(
-                f'{fn.__name__} leaked {type(exc).__name__}: {exc}')
         else:
-            raise AssertionError(
-                f'{fn.__name__} accepted an oversized scale')
-    # The custom-autograd path only multiplies by ``scale`` when a graph is
-    # needed (otherwise it delegates); validate that branch too.
-    qg = q.clone().requires_grad_(True)
-    try:
-        custom_recurrent_kda(qg, k, v, g, beta, scale=huge)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('custom_recurrent_kda accepted an oversized '
-                             'scale on the autograd path')
+            raise AssertionError('custom_recurrent_kda accepted '
+                                 f'scale={bad!r} on the autograd path')
 
 
 def test_rwkv_reference_rejects_oversized_scale_without_overflow():
@@ -435,16 +436,18 @@ def test_rwkv_reference_rejects_oversized_scale_without_overflow():
     v = torch.randn(B, T, H, V)
     kk = torch.nn.functional.normalize(torch.randn(B, T, H, K), dim=-1)
     a = torch.rand(B, T, H, K)
-    try:
-        rwkv7_reference_scan(r, log_w, k, v, kk, a, scale=10 ** 400)
-    except ValueError:
-        pass
-    except Exception as exc:  # noqa: BLE001 - the point is the type
-        raise AssertionError(
-            f'rwkv7_reference_scan leaked {type(exc).__name__}: {exc}')
-    else:
-        raise AssertionError('rwkv7_reference_scan accepted an oversized '
-                             'scale')
+    for bad in (10 ** 400, float('inf'), float('-inf'), float('nan')):
+        try:
+            rwkv7_reference_scan(r, log_w, k, v, kk, a, scale=bad)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            raise AssertionError(
+                f'rwkv7_reference_scan leaked {type(exc).__name__} for '
+                f'scale={bad!r}: {exc}')
+        else:
+            raise AssertionError(
+                f'rwkv7_reference_scan accepted scale={bad!r}')
 
 
 def test_csa_indexer_rejects_oversized_scale_without_overflow():
@@ -455,16 +458,18 @@ def test_csa_indexer_rejects_oversized_scale_without_overflow():
     q_idx = torch.randn(B, T, HI, DI)
     k_idx = torch.randn(B, N, DI)
     w_idx = torch.randn(B, T, HI)
-    try:
-        csa_lightning_indexer(q_idx, k_idx, w_idx, 2, scale=10 ** 400)
-    except ValueError:
-        pass
-    except Exception as exc:  # noqa: BLE001 - the point is the type
-        raise AssertionError(
-            f'csa_lightning_indexer leaked {type(exc).__name__}: {exc}')
-    else:
-        raise AssertionError(
-            'csa_lightning_indexer accepted an oversized scale')
+    for bad in (10 ** 400, float('inf'), float('-inf'), float('nan')):
+        try:
+            csa_lightning_indexer(q_idx, k_idx, w_idx, 2, scale=bad)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the point is the type
+            raise AssertionError(
+                f'csa_lightning_indexer leaked {type(exc).__name__} for '
+                f'scale={bad!r}: {exc}')
+        else:
+            raise AssertionError(
+                f'csa_lightning_indexer accepted scale={bad!r}')
 
 
 def test_rope_rejects_invalid_dims_bases_and_positions():

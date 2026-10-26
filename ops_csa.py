@@ -162,11 +162,14 @@ def _require_scale(fn_name: str, scale) -> None:
         raise ValueError(
             f'{fn_name}: scale={scale!r} must be a real number or None.')
     try:
-        float(scale)
+        value = float(scale)
     except OverflowError:
         raise ValueError(
             f'{fn_name}: scale={scale!r} must be representable as a finite '
             f'float.') from None
+    if not math.isfinite(value):
+        raise ValueError(
+            f'{fn_name}: scale={scale!r} must be finite.')
 
 
 def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:

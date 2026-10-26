@@ -304,18 +304,19 @@ def test_oversized_scale_is_rejected_without_overflow():
     q = torch.randn(B, H, T, D)
     k = torch.randn(B, H, N, D)
     v = torch.randn(B, H, N, D)
-    huge = 10 ** 400
-    for call in (
-            lambda: online_softmax_state(q, k, v, scale=huge),
-            lambda: online_softmax_attention(q, k, v, scale=huge),
-            lambda: online_softmax_attention(
-                q, k, v, scale=huge, key_chunk=2, query_chunk=2)):
-        try:
-            call()
-        except ValueError:
-            _ok('oversized scale is rejected', True, '')
-        else:
-            _ok('oversized scale is rejected', False, 'no ValueError')
+    for huge in (10 ** 400, float('inf'), float('-inf'), float('nan')):
+        for call in (
+                lambda: online_softmax_state(q, k, v, scale=huge),
+                lambda: online_softmax_attention(q, k, v, scale=huge),
+                lambda: online_softmax_attention(
+                    q, k, v, scale=huge, key_chunk=2, query_chunk=2)):
+            try:
+                call()
+            except ValueError:
+                _ok(f'invalid scale {huge!r} is rejected', True, '')
+            else:
+                _ok(f'invalid scale {huge!r} is rejected', False,
+                    'no ValueError')
 
 
 def test_merge_rejects_mismatched_denominator_shapes():

@@ -47,6 +47,8 @@ avoid.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 __all__ = [
@@ -72,11 +74,14 @@ def _validate_scale(scale, fn_name: str) -> None:
         raise ValueError(
             f'{fn_name}: scale={scale!r} must be a real number or None.')
     try:
-        float(scale)
+        value = float(scale)
     except OverflowError:
         raise ValueError(
             f'{fn_name}: scale={scale!r} must be representable as a finite '
             f'float.') from None
+    if not math.isfinite(value):
+        raise ValueError(
+            f'{fn_name}: scale={scale!r} must be finite.')
 
 
 def _shrink(shift: torch.Tensor) -> torch.Tensor:

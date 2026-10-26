@@ -375,13 +375,16 @@ def rwkv7_reference_scan(
                 f"rwkv7_reference_scan: scale={scale!r} must be a real "
                 f"number.")
         try:
-            float(scale)
+            scale_value = float(scale)
         except OverflowError:
             # JSON integers are unbounded; the scale multiplies the
             # receptance in float arithmetic.
             raise ValueError(
                 f"rwkv7_reference_scan: scale={scale!r} must be "
                 f"representable as a finite float.") from None
+        if not math.isfinite(scale_value):
+            raise ValueError(
+                f"rwkv7_reference_scan: scale={scale!r} must be finite.")
     if r.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             f"rwkv7_reference_scan: r/k/v must be [B, T, H, D] (got "

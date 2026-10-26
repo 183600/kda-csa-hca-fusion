@@ -358,11 +358,14 @@ def _validate_scale(value, fn_name):
         raise ValueError(
             f"{fn_name}: scale={value!r} must be a real number or None.")
     try:
-        float(value)
+        value_float = float(value)
     except OverflowError:
         raise ValueError(
             f"{fn_name}: scale={value!r} must be representable as a finite "
             f"float.") from None
+    if not _math.isfinite(value_float):
+        raise ValueError(
+            f"{fn_name}: scale={value!r} must be finite.")
 
 
 def _compute_dtype(dtype):
