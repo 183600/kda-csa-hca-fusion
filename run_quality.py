@@ -479,13 +479,29 @@ def _bonferroni_crit_q(n, alpha=0.05):
     def _log_sf(t_value):
         if t_value <= 0.0:
             return math.log(0.5)
-        x = dof / (dof + t_value * t_value)
-        ib = _betai(0.5 * dof, 0.5, x)
-        if ib <= 0.0:
-            return -math.inf
-        # Guard only against a last-bit overshoot from the continued
-        # fraction; the true regularized beta is in [0, 1].
-        return math.log(0.5) + math.log(min(ib, 1.0))
+        t_sq = t_value * t_value
+        if math.isfinite(t_sq):
+            x = dof / (dof + t_sq)
+            ib = _betai(0.5 * dof, 0.5, x)
+            if ib > 0.0:
+                # Guard only against a last-bit overshoot from the
+                # continued fraction; the true regularized beta is in
+                # [0, 1].
+                return math.log(0.5) + math.log(min(ib, 1.0))
+        # ``t**2`` overflowed or the incomplete beta underflowed. The true
+        # x = dof / (dof + t^2) is then far below the smallest normal
+        # float, so use the x -> 0 limit in log space:
+        #     I_x(a, b) ~ x**a / (a * B(a, b)).
+        # Without this fallback the bracket stopped at t ~ 1e154 and
+        # returned a critical value orders of magnitude too small for
+        # extreme alphas (e.g. n=2, alpha=1e-300).
+        a = 0.5 * dof
+        b = 0.5
+        log_x = math.log(dof) - 2.0 * math.log(t_value)
+        log_ib = (a * log_x - math.log(a)
+                  - (math.lgamma(a) + math.lgamma(b)
+                     - math.lgamma(a + b)))
+        return math.log(0.5) + log_ib
 
     target_log_sf = math.log(alpha)  # log(1 - target_p) = log(alpha)
     # Coarse bracket: find lo, hi such that log_sf(lo) > target_log_sf >
@@ -495,6 +511,10 @@ def _bonferroni_crit_q(n, alpha=0.05):
     lo = 0.0
     hi = 1.0
     while _log_sf(hi) > target_log_sf:
+        # Keep the last bracketing point. Starting every bisection from
+        # [0, hi] leaves only absolute resolution; for a quantile near
+        # 1e300 the 80 halvings cannot resolve its leading digits at all.
+        lo = hi
         hi *= 2.0
         if not math.isfinite(hi) or hi > 1.0e308:
             raise ValueError(

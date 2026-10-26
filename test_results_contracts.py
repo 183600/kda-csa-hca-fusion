@@ -1116,6 +1116,22 @@ def test_lower_tail_bonferroni_quantile_is_the_mirror():
     assert _bonferroni_crit_q(1, alpha=0.05) is None
 
 
+def test_bonferroni_extreme_tail_is_not_truncated_at_t_squared_overflow():
+    """The Cauchy tail must stay accurate past ``t**2 = inf``.
+
+    For dof=1 the survival function is ``1/(pi*t)`` in the far tail, so
+    ``t_{1-alpha} = 1/(pi*alpha)``.  Computing ``x = dof/(dof+t**2)`` used
+    to underflow once ``t`` exceeded ~1e154, ending the bracket early and
+    returning a critical value dozens of orders of magnitude too small.
+    """
+    from run_quality import _bonferroni_crit_q
+
+    for alpha in (1e-100, 1e-200, 1e-300):
+        got = _bonferroni_crit_q(2, alpha=alpha)
+        want = 1.0 / (math.pi * alpha)
+        assert abs(got / want - 1.0) < 1e-10, (alpha, got, want)
+
+
 def test_seed_accuracy_map_ignores_malformed_seed_metrics():
     """Paired contrasts use only finite numeric per-seed accuracies."""
     from run_ablation import _seed_accuracy_map
