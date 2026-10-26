@@ -179,16 +179,8 @@ def _suffix_metrics(reference, observed, start, tol):
     else:
         diff = raw_diff.abs()
     ref_norm = float(torch.linalg.vector_norm(ref))
-    if overflowed:
-        scaled_diff_norm = float(torch.linalg.vector_norm(
-            ref_scaled - got_scaled))
-        scaled_ref_norm = float(torch.linalg.vector_norm(ref_scaled))
-        if scaled_ref_norm > 0.0:
-            rel_l2 = scaled_diff_norm / scaled_ref_norm
-        else:
-            rel_l2 = 0.0 if scaled_diff_norm == 0.0 else None
-    else:
-        diff_norm = float(torch.linalg.vector_norm(raw_diff))
+    diff_norm = float(torch.linalg.vector_norm(raw_diff))
+    if math.isfinite(ref_norm) and math.isfinite(diff_norm):
         if ref_norm > 0.0:
             rel_l2 = diff_norm / ref_norm
         else:
@@ -196,6 +188,23 @@ def _suffix_metrics(reference, observed, start, tol):
             # reference has no finite relative scale; None is the
             # JSON-safe statement.
             rel_l2 = 0.0 if diff_norm == 0.0 else None
+    else:
+        # Squaring can overflow the norm even when every element and the
+        # elementwise difference are finite (e.g. 1e200 in fp64). The
+        # elementwise-difference path above already scales; the
+        # norm-overflow case needs the same treatment or a well-defined
+        # relative L2 would be reported as None.
+        scale = max(float(ref.abs().max()), float(got.abs().max()))
+        if scale == 0.0:
+            rel_l2 = 0.0
+        else:
+            scaled_diff_norm = float(torch.linalg.vector_norm(
+                (ref / scale) - (got / scale)))
+            scaled_ref_norm = float(torch.linalg.vector_norm(ref / scale))
+            if scaled_ref_norm > 0.0:
+                rel_l2 = scaled_diff_norm / scaled_ref_norm
+            else:
+                rel_l2 = 0.0 if scaled_diff_norm == 0.0 else None
     if rel_l2 is not None and not math.isfinite(rel_l2):
         rel_l2 = None
     per_step = diff.amax(dim=(0, 2))
