@@ -528,6 +528,26 @@ def test_fp8_fake_quantize_contract():
         _ok(f'extreme finite input stays finite ({fmt})',
             bool(torch.isfinite(dq_extreme).all()),
             f'{dq_extreme.tolist()}')
+    # The same contract must hold for every storage dtype and for BOTH
+    # scale modes: a finite float16 value at finfo.max used to overflow the
+    # final cast to inf (the E8M0 cap was computed from float32), and an
+    # exact scale at the float64 endpoint could round one ULP past DBL_MAX.
+    for dtype in (torch.float16, torch.bfloat16, torch.float32,
+                  torch.float64):
+        limit = torch.finfo(dtype).max
+        x_ext = torch.tensor(
+            [[limit, -limit, 0.0, limit / 2, 1.0]], dtype=dtype)
+        for fmt in ('e4m3fn', 'e5m2'):
+            for pow2 in (True, False):
+                dq = fake_quantize(
+                    x_ext, FP8Spec(format=fmt, group_size=5,
+                                   power_of_two=pow2), ste=False)
+                _ok(f'finite dtype-limit input stays finite '
+                    f'({fmt}, {dtype}, pow2={pow2})',
+                    dq.dtype == dtype
+                    and bool(torch.isfinite(dq).all())
+                    and bool((dq.abs() <= limit).all()),
+                    f'{dq.tolist()}')
     bad = x.clone()
     bad[0, 0] = float('inf')
     try:

@@ -362,7 +362,8 @@ def _fp8_round_magnitude(values: torch.Tensor, fmt: str) -> torch.Tensor:
         max=max_finite)
 
 
-def _fp8_group_scale(groups: torch.Tensor, spec: FP8Spec) -> torch.Tensor:
+def _fp8_group_scale(groups: torch.Tensor, spec: FP8Spec, *,
+                     dtype: torch.dtype | None = None) -> torch.Tensor:
     with torch.no_grad():
         amax = groups.abs().amax(dim=-1, keepdim=True)
         scale = torch.where(amax > 0, amax / spec.max_finite,
@@ -377,13 +378,19 @@ def _fp8_group_scale(groups: torch.Tensor, spec: FP8Spec) -> torch.Tensor:
                 exp_min, exp_max = -126.0, 127.0
             exp = torch.ceil(torch.log2(scale.clamp(min=min_scale)))
             # A power-of-two scale rounded UP can push the largest code
-            # (``max_finite``) past the compute dtype's largest finite
-            # value: e.g. fp32 E4M3 input FLT_MAX gets scale 2**120 and
-            # dequantizes to 2**128 = inf. Cap the exponent so the grid's
-            # top point stays representable. This leaves every ordinary
-            # group (whose scale is far below the cap) bit-identical.
-            safe_exp_max = math.floor(math.log2(
-                torch.finfo(groups.dtype).max / spec.max_finite))
+            # (``max_finite``) past the largest finite value of either the
+            # compute dtype OR the tensor's own dtype: e.g. fp32 E4M3 input
+            # FLT_MAX gets scale 2**120 and dequantizes to 2**128 = inf,
+            # while fp16 input 65504 gets the same 2**120 scale and
+            # overflows the final fp16 cast to inf. Cap the exponent so the
+            # grid's top point stays representable in both dtypes. This
+            # leaves every ordinary group (whose scale is far below the
+            # cap) bit-identical.
+            cap_dtype = groups.dtype if dtype is None else dtype
+            cap_max = min(float(finfo.max),
+                          float(torch.finfo(cap_dtype).max))
+            safe_exp_max = math.floor(
+                math.log2(cap_max / spec.max_finite))
             exp = exp.clamp(exp_min, min(exp_max, float(safe_exp_max)))
             scale = torch.exp2(exp)
     return scale
@@ -398,10 +405,22 @@ def _fake_quantize_fp8(x: torch.Tensor, spec: FP8Spec,
     padded, n = _pad_last_dim(work, spec.group_size)
     lead = padded.shape[:-1]
     groups = padded.reshape(*lead, -1, spec.group_size)
-    scale = _fp8_group_scale(groups, spec)
+    scale = _fp8_group_scale(groups, spec, dtype=orig_dtype)
     magnitude = groups.abs() / scale
     codes = _fp8_round_magnitude(magnitude, spec.format)
     deq = torch.sign(groups) * codes * scale
+    # Backstop for the exact-scale path: at a dtype endpoint the product
+    # ``max_finite * scale`` can round one ULP above the input dtype's
+    # maximum (observed for fp64 FLT_MAX/DBL_MAX). Saturate only the
+    # offending entries so ordinary groups stay bit-identical.
+    limit = float(torch.finfo(orig_dtype).max)
+    overflow = (~torch.isfinite(deq)) | (deq.abs() > limit)
+    if bool(overflow.any()):
+        finite_max = torch.tensor(limit, dtype=deq.dtype,
+                                  device=deq.device)
+        safe = torch.where(torch.isnan(deq), torch.zeros_like(deq), deq)
+        deq = torch.where(overflow,
+                          torch.clamp(safe, -finite_max, finite_max), deq)
     deq = deq.reshape(*lead, -1)[..., :n].to(orig_dtype)
     if ste and x.requires_grad:
         deq = x + (deq - x).detach()
