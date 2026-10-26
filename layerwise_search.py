@@ -550,7 +550,19 @@ class SearchProblem:
                 raise TypeError(
                     f'evaluate() must return a dict, got '
                     f'{type(ev).__name__}.')
-            score = ev.get('score')
+            raw_score = ev.get('score')
+            if raw_score is None:
+                score = None
+            else:
+                if isinstance(raw_score, bool):
+                    raise TypeError(
+                        'evaluate() score must be a finite float or None, '
+                        f'got {raw_score!r}.')
+                score = float(raw_score)
+                if not math.isfinite(score):
+                    raise ValueError(
+                        'evaluate() score must be finite or None, got '
+                        f'{raw_score!r}.')
             metrics = ev.get('metrics', {}) or {}
             error = None
         except Exception as exc:  # noqa: BLE001 — search robustness
@@ -560,7 +572,7 @@ class SearchProblem:
             'layout': list(candidate.layout),
             'label': candidate.label,
             'csa_topk': int(candidate.csa_topk),
-            'score': None if score is None else float(score),
+            'score': score,
             'metrics': dict(metrics),
             'error': error,
             **cost,

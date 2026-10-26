@@ -365,6 +365,19 @@ def test_search_records_errors_and_skips_them():
         result['best']['label'] == START.label
 
 
+def test_search_records_nonfinite_scores_as_errors():
+    """NaN/Inf/huge scores must not poison selection or strict JSON."""
+    for bad_score in (float('nan'), float('inf'), float('-inf'), 10 ** 400,
+                      True):
+        problem = SearchProblem(
+            evaluate=lambda cand, s=bad_score: {'score': s, 'metrics': {}},
+            cost=lambda cand: cost_report(cand, T=256, **SMALL))
+        record = problem.record(START)
+        assert record['score'] is None, f'accepted score={bad_score!r}'
+        assert record['error'] is not None
+        json.dumps(record, allow_nan=False)
+
+
 def test_greedy_search_is_deterministic():
     def score(cand):
         return 3.0 - 0.25 * sum(int(a != b)
