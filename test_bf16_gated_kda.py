@@ -457,6 +457,50 @@ def test_kda_log_decay_init_under_autocast():
         '')
 
 
+def test_bf16_scale_helpers_at_dtype_limit():
+    print('\nTest: bf16 norm-clipping helpers at the dtype limit')
+    from ops_csa import _bf16_scale_if_needed as csa_scale
+    from ops_hca import _bf16_scale_if_needed as hca_scale
+    from ops_kda_autograd import _state_scale_correction
+
+    torch.manual_seed(0)
+    normal = torch.randn(3, 7, dtype=torch.bfloat16) * 3.0
+    for fn in (csa_scale, hca_scale):
+        historical = normal * (
+            1e4 / (normal.norm(p=2, dim=-1, keepdim=True) + 1e-8)
+        ).clamp(max=1.0)
+        _ok(f'{fn.__module__}: ordinary rows stay bit-identical',
+            torch.equal(fn(normal), historical), '')
+
+    limit = torch.finfo(torch.bfloat16).max
+    x = torch.tensor([[limit, 0.0], [limit, limit], [-limit, limit]],
+                     dtype=torch.bfloat16)
+    for fn in (csa_scale, hca_scale):
+        y = fn(x)
+        row_norms = y.float().norm(p=2, dim=-1)
+        _ok(f'{fn.__module__}: finite bf16 input is not erased',
+            bool(torch.isfinite(y).all())
+            and bool((row_norms > 0).all())
+            and bool(torch.allclose(row_norms, torch.full_like(row_norms, 1e4),
+                                    rtol=5e-2)),
+            f'{y.tolist()} norms={row_norms.tolist()}')
+
+    S_normal = torch.randn(2, 3, 4, 5, dtype=torch.bfloat16) * 0.3
+    S_historical = S_normal * (
+        1e4 / (S_normal.norm(p=2, dim=(-2, -1), keepdim=True) + 1e-8)
+    ).clamp(max=1.0)
+    _ok('state correction: ordinary state stays bit-identical',
+        torch.equal(_state_scale_correction(S_normal), S_historical), '')
+
+    S = torch.full((1, 1, 2, 2), limit, dtype=torch.bfloat16)
+    y = _state_scale_correction(S)
+    norm = float(y.float().norm())
+    _ok('state correction: finite extreme state is not erased',
+        bool(torch.isfinite(y).all()) and norm > 0
+        and abs(norm - 1e4) <= 5e-2 * 1e4,
+        f'{y.tolist()} norm={norm}')
+
+
 if __name__ == '__main__':
     test_bf16_forward_parity()
     test_bf16_backward_parity()
@@ -478,5 +522,6 @@ if __name__ == '__main__':
     test_gated_delta_rule_empty_sequence_dtype_contract()
     test_gated_delta_rule_bf16()
     test_kda_log_decay_init_under_autocast()
+    test_bf16_scale_helpers_at_dtype_limit()
 
     print('\n=== ALL TESTS PASSED ===')

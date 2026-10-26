@@ -62,12 +62,24 @@ def _bf16_scale_if_needed(
     """Scale tensor down if its norm exceeds max_norm (bf16 only).
 
     Prevents gradual accumulation of large values over long sequences.
+    For finite rows whose bf16 norm overflows to inf, the scale is computed
+    from a dimensionless row norm in fp32 instead, so the row is scaled to
+    ``max_norm`` rather than multiplied by zero.
     """
     if x.dtype != torch.bfloat16:
         return x
     norms = x.norm(p=2, dim=-1, keepdim=True)
     scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
-    return x * scale
+    if (bool(torch.isfinite(norms).all())
+            or not bool(torch.isfinite(x).all())):
+        return x * scale
+    xf = x.float()
+    amax = xf.abs().amax(dim=-1, keepdim=True)
+    safe_amax = torch.where(amax > 0, amax, torch.ones_like(amax))
+    scaled_norm = (xf / safe_amax).norm(p=2, dim=-1, keepdim=True)
+    scale = ((max_norm / safe_amax)
+             / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
+    return (xf * scale).to(x.dtype)
 
 
 def _bf16_safe_einsum_sum(

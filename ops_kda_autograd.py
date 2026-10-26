@@ -99,14 +99,25 @@ def _state_scale_correction(S: torch.Tensor, max_norm: float = 1e4) -> torch.Ten
     """Per-channel state norm clipping to prevent bfloat16 overflow.
 
     Computes ||S_h||_F per head and scales down if exceeding max_norm.
-    Only activates for bfloat16; no-op for fp32/fp64.
+    Only activates for bfloat16; no-op for fp32/fp64. A finite state whose
+    bf16 norm overflows falls back to an fp32 dimensionless norm, so it is
+    scaled to ``max_norm`` instead of being zeroed by the inf ratio.
     """
     if S.dtype != torch.bfloat16:
         return S
     # S: [B, HV, K, V] -> norm over (K, V) per head
     norms = S.norm(p=2, dim=(-2, -1), keepdim=True)  # [B, HV, 1, 1]
     scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
-    return S * scale
+    if (bool(torch.isfinite(norms).all())
+            or not bool(torch.isfinite(S).all())):
+        return S * scale
+    Sf = S.float()
+    amax = Sf.abs().amax(dim=(-2, -1), keepdim=True)
+    safe_amax = torch.where(amax > 0, amax, torch.ones_like(amax))
+    scaled_norm = (Sf / safe_amax).norm(p=2, dim=(-2, -1), keepdim=True)
+    scale = ((max_norm / safe_amax)
+             / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
+    return (Sf * scale).to(S.dtype)
 
 
 def _bf16_safe_addcmul(

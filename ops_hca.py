@@ -64,12 +64,26 @@ def _bf16_safe_exp(x: torch.Tensor, clamp_max: float = 50.0) -> torch.Tensor:
 def _bf16_scale_if_needed(
     x: torch.Tensor, max_norm: float = 1e4
 ) -> torch.Tensor:
-    """Scale tensor down if its norm exceeds max_norm (bf16 only)."""
+    """Scale tensor down if its norm exceeds max_norm (bf16 only).
+
+    Mirrors ``ops_csa``: an overflowing finite bf16 norm falls back to an
+    fp32 dimensionless norm so the row is scaled to ``max_norm`` instead of
+    being erased by a zero scale.
+    """
     if x.dtype != torch.bfloat16:
         return x
     norms = x.norm(p=2, dim=-1, keepdim=True)
     scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
-    return x * scale
+    if (bool(torch.isfinite(norms).all())
+            or not bool(torch.isfinite(x).all())):
+        return x * scale
+    xf = x.float()
+    amax = xf.abs().amax(dim=-1, keepdim=True)
+    safe_amax = torch.where(amax > 0, amax, torch.ones_like(amax))
+    scaled_norm = (xf / safe_amax).norm(p=2, dim=-1, keepdim=True)
+    scale = ((max_norm / safe_amax)
+             / (scaled_norm + 1e-8 / safe_amax)).clamp(max=1.0)
+    return (xf * scale).to(x.dtype)
 
 
 # Query-axis tile budget for the dense score / joint-softmax / value
