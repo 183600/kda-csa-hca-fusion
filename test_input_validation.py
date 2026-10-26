@@ -891,6 +891,55 @@ def test_t0_memory_mixers_reject_wrong_full_state_geometry():
     rwkv.forward_functional(x_rwkv, None, torch.zeros(1, 1, 64))
 
 
+def test_t0_official_mamba_rejects_wrong_full_state_geometry(monkeypatch):
+    """The official backend T=0 branch must enforce its full state layouts.
+
+    It previously only checked ``state.shape[0] == B`` (and the batch of the
+    official conv state), so a same-batch state from a different geometry
+    was echoed back on an empty call. The official conv layout is
+    ``[B, conv_dim, d_conv]``, not the reference ``[B, d_inner, d_conv-1]``.
+    """
+    from ops_mamba_backend import OfficialMamba2Mixer
+
+    monkeypatch.setattr(
+        OfficialMamba2Mixer, '_require_cuda', lambda self, x: None)
+    mixer = object.__new__(OfficialMamba2Mixer)
+    mixer.d_model = 8
+    mixer.nheads = 2
+    mixer.headdim = 4
+    mixer.d_state = 3
+    mixer.d_conv = 2
+    mixer.d_inner = 8
+    mixer.conv_dim = 14
+
+    x = torch.zeros(1, 0, 8)
+    state = torch.zeros(1, mixer.nheads, mixer.headdim, mixer.d_state)
+    conv = torch.zeros(1, mixer.conv_dim, mixer.d_conv)
+    mixer.forward_functional(x, state, conv)
+
+    for bad in (torch.zeros(1, mixer.nheads, mixer.headdim,
+                            mixer.d_state + 1),
+                torch.zeros(1, mixer.nheads, mixer.headdim + 1,
+                            mixer.d_state)):
+        try:
+            mixer.forward_functional(x, bad, conv)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'official Mamba T=0 accepted a wrong state {tuple(bad.shape)}')
+    for bad in (torch.zeros(1, mixer.conv_dim + 1, mixer.d_conv),
+                torch.zeros(1, mixer.conv_dim, mixer.d_conv + 1)):
+        try:
+            mixer.forward_functional(x, state, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                'official Mamba T=0 accepted a wrong conv state '
+                f'{tuple(bad.shape)}')
+
+
 def test_csa_hca_geometry_requires_exact_ints():
     """Bool/float geometry must not silently mean a different operator.
 

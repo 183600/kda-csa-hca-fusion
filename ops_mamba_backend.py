@@ -358,6 +358,13 @@ class OfficialMamba2Mixer(nn.Module):
         compute_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
         if T == 0:
             if state is not None and state.shape[0] == B:
+                expected = (B, self.nheads, self.headdim, self.d_state)
+                if tuple(state.shape) != expected:
+                    raise ValueError(
+                        f"OfficialMamba2Mixer: state.shape="
+                        f"{tuple(state.shape)} does not match the expected "
+                        f"{expected} ([B, nheads, headdim, d_state]) even "
+                        f"though T=0.")
                 new_state = state.to(device=x.device, dtype=compute_dtype)
             else:
                 new_state = torch.zeros(
@@ -373,6 +380,13 @@ class OfficialMamba2Mixer(nn.Module):
                     # batch size.
                     new_conv = None
                 else:
+                    expected_conv = (B, self.conv_dim, self.d_conv)
+                    if tuple(new_conv.shape) != expected_conv:
+                        raise ValueError(
+                            f"OfficialMamba2Mixer: conv_state.shape="
+                            f"{tuple(new_conv.shape)} does not match the "
+                            f"expected {expected_conv} "
+                            f"([B, conv_dim, d_conv]) even though T=0.")
                     # Single cast+copy into a fresh tensor: ``copy=True``
                     # makes ``to`` allocate and copy in one pass, so no
                     # second clone is needed (the result never aliases the
@@ -417,6 +431,12 @@ class OfficialMamba2Mixer(nn.Module):
                      torch.zeros(B, self.conv_dim, self.d_conv,
                                  device=x.device, dtype=x.dtype))
         if state is not None and state.shape[0] == B:
+            expected = (B, self.nheads, self.headdim, self.d_state)
+            if tuple(state.shape) != expected:
+                raise ValueError(
+                    f"OfficialMamba2Mixer: state.shape="
+                    f"{tuple(state.shape)} does not match the expected "
+                    f"{expected} ([B, nheads, headdim, d_state]).")
             # ``to(copy=True)`` = cast-if-needed plus unconditional copy.
             ssm_seed = state.to(compute_dtype, copy=True)
         else:
