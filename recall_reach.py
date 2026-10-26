@@ -282,6 +282,27 @@ def _validate_key_positions(key_positions, cue: int) -> list[int]:
     return out
 
 
+def _key_pos_tensor(key_pos, *, label: str) -> torch.Tensor:
+    """Coerce integer key positions without silently truncating floats.
+
+    ``torch.as_tensor(key_pos, dtype=torch.long)`` turns ``1.9`` into
+    ``1`` and ``True`` into ``1``. Those are different placements (and a
+    bool is not a position at all), so validate the dtype before the cast.
+    """
+    try:
+        key_pos_t = torch.as_tensor(key_pos)
+    except (TypeError, ValueError, OverflowError, RuntimeError) as exc:
+        raise ValueError(
+            f'{label}: key_pos must contain integer positions, got '
+            f'{key_pos!r}') from exc
+    if (key_pos_t.dtype == torch.bool or key_pos_t.dtype.is_floating_point
+            or key_pos_t.dtype.is_complex):
+        raise ValueError(
+            f'{label}: key_pos must contain integer positions, got dtype '
+            f'{key_pos_t.dtype}.')
+    return key_pos_t.to(dtype=torch.long)
+
+
 def structural_recall(plan, seq_len: int,
                       key_positions=None) -> dict:
     """Exact per-placement reachability of a (key, value) pair.
@@ -471,7 +492,8 @@ def per_layer_indexer_recall(model, x_emb: torch.Tensor, key_pos,
         raise ValueError(
             f'per_layer_indexer_recall: cue_pos={cue_pos!r} out of range '
             f'[0, T={T}).')
-    key_pos_t = torch.as_tensor(key_pos, dtype=torch.long)
+    key_pos_t = _key_pos_tensor(
+        key_pos, label='per_layer_indexer_recall')
     if key_pos_t.dim() != 1 or key_pos_t.shape[0] != B:
         raise ValueError(
             f'per_layer_indexer_recall: key_pos must be a [B={B}] tensor, '
@@ -616,7 +638,8 @@ def hca_block_coverage(model, key_pos, *, cue_pos: int) -> dict:
     entry — but larger ``m2`` means the entry mixes more tokens, so its
     fraction is the *upper bound* on what HCA can localise.
     """
-    key_pos_t = torch.as_tensor(key_pos, dtype=torch.long)
+    key_pos_t = _key_pos_tensor(
+        key_pos, label='hca_block_coverage')
     if key_pos_t.dim() != 1 or key_pos_t.numel() == 0:
         raise ValueError('hca_block_coverage: key_pos must be 1-D non-empty.')
     if not isinstance(cue_pos, int) or cue_pos < 0:

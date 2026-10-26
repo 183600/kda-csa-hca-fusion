@@ -303,6 +303,9 @@ def test_indexer_recall_error_paths_and_no_csa():
         {'key_pos': [-1, 0], 'cue_pos': cue},
         {'key_pos': [0, 99], 'cue_pos': cue},
         {'key_pos': [0, cue - 1], 'cue_pos': cue},
+        {'key_pos': [0.0, 0.0], 'cue_pos': cue},
+        {'key_pos': [True, False], 'cue_pos': cue},
+        {'key_pos': torch.tensor([0.0, 0.0]), 'cue_pos': cue},
     ):
         try:
             R.per_layer_indexer_recall(model2, x_emb, **kwargs)
@@ -345,6 +348,13 @@ def test_hca_coverage_matches_structural():
                 - by_index[l['layer_index']]['block_hit_fraction']) < 1e-12,
             f"{l['resolved_fraction']!r} vs "
             f"{by_index[l['layer_index']]['block_hit_fraction']!r}")
+    for bad in ([0.0], [True], torch.tensor([0.0])):
+        try:
+            R.hca_block_coverage(model, bad, cue_pos=cue)
+            raised = False
+        except ValueError:
+            raised = True
+        _ok(f'hca coverage rejects non-integer key_pos {bad!r}', raised, '')
 
 
 def test_report_strict_json_and_budget():
