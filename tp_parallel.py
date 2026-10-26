@@ -329,6 +329,12 @@ def _conv_features(layer, x: torch.Tensor,
     if lookback is not None:
         if lookback.shape[0] != B:
             lookback = None
+        elif tuple(lookback.shape) != (B, ksize - 1, d):
+            raise ValueError(
+                'kda_layer_forward_tp: conv_lookback.shape='
+                f'{tuple(lookback.shape)} does not match the expected '
+                f'{(B, ksize - 1, d)} ([B, ksize-1, d]). The lookback '
+                'was likely persisted from a different kernel/geometry.')
         elif lookback.device != x.device or lookback.dtype != x.dtype:
             lookback = lookback.to(device=x.device, dtype=x.dtype)
     if lookback is None:
@@ -392,13 +398,33 @@ def kda_layer_forward_tp(
         compute_dtype = (torch.float64 if x.dtype == torch.float64
                          else torch.float)
         if state_shard is not None and state_shard.shape[0] == B:
+            expected = (B, hv, K, V)
+            if tuple(state_shard.shape) != expected:
+                raise ValueError(
+                    'kda_layer_forward_tp: state_shard.shape='
+                    f'{tuple(state_shard.shape)} does not match the expected '
+                    f'{expected} ([B, hv, K, V]) even though T=0.')
             new_state = state_shard.to(device=x.device,
                                        dtype=compute_dtype)
         else:
             new_state = torch.zeros(B, hv, K, V, device=x.device,
                                     dtype=compute_dtype)
+        new_lookback = conv_lookback
+        if new_lookback is not None:
+            if new_lookback.shape[0] != B:
+                new_lookback = None
+            else:
+                expected_lb = (B, layer.short_conv.kernel_size[0] - 1, d)
+                if tuple(new_lookback.shape) != expected_lb:
+                    raise ValueError(
+                        'kda_layer_forward_tp: conv_lookback.shape='
+                        f'{tuple(new_lookback.shape)} does not match the '
+                        f'expected {expected_lb} ([B, ksize-1, d]) even '
+                        'though T=0.')
+                new_lookback = new_lookback.to(
+                    device=x.device, dtype=x.dtype)
         return {'output': x.new_zeros(B, 0, d), 'state': new_state,
-                'conv_lookback': conv_lookback,
+                'conv_lookback': new_lookback,
                 'backend': requested_backend,
                 'resolved_backend': resolved_backend}
     x_conv, new_lookback = _conv_features(layer, x, conv_lookback)

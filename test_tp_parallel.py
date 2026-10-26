@@ -594,6 +594,52 @@ def test_hybrid_streaming_tp_contract(device):
         tp.hybrid_stack_forward_tp_streaming(mamba_stack, x, 2)
 
 
+def test_kda_tp_rejects_malformed_state_geometry(device):
+    """T=0 TP forwards must not echo a same-batch but wrong-shaped state.
+
+    The reference KDA/Mamba-2/RWKV empty-chunk paths validate the full
+    recurrent/lookback geometry; the TP shard helper and streaming wrapper
+    must enforce the same contract instead of silently carrying a state
+    from a different geometry into the next decode step.
+    """
+    torch.manual_seed(19)
+    cfg = _kda_cfg(0)
+    layer = KDAHybridLayer(cfg).to(device).eval()
+    B = 2
+    hv = cfg.n_heads_v // 2
+    K, V = cfg.head_dim_k, cfg.head_dim_v
+    x = torch.randn(B, 4, cfg.d_model, device=device)
+    with torch.no_grad():
+        with pytest.raises(ValueError):
+            tp.kda_layer_forward_tp(
+                layer, x[:, :0],
+                torch.zeros(B, hv + 1, K, V, device=device), 0, 2)
+        ksize = layer.short_conv.kernel_size[0]
+        with pytest.raises(ValueError):
+            tp.kda_layer_forward_tp(
+                layer, x[:, :0], None, 0, 2,
+                conv_lookback=torch.zeros(B, ksize, cfg.d_model,
+                                          device=device))
+        with pytest.raises(ValueError):
+            tp.kda_layer_forward_tp(
+                layer, x[:, :2], None, 0, 2,
+                conv_lookback=torch.zeros(B, ksize, cfg.d_model,
+                                          device=device))
+
+    model = HybridAttentionStack(cfg, total_layers=2).to(device).eval()
+    with torch.no_grad():
+        first = tp.hybrid_stack_forward_tp_streaming(model, x, 2)
+        bad = dict(first['state'])
+        lookbacks = list(bad['conv_lookbacks'])
+        lookbacks[0] = torch.zeros(
+            B, lookbacks[0].shape[1] + 1, lookbacks[0].shape[2],
+            device=device)
+        bad['conv_lookbacks'] = lookbacks
+        with pytest.raises(ValueError):
+            tp.hybrid_stack_forward_tp_streaming(
+                model, x[:, :0], 2, state=bad)
+
+
 @pytest.mark.parametrize('memory_type', ['kda', 'mamba2', 'rwkv7'])
 def test_hybrid_decode_state_ablation(device, memory_type):
     """Decode caches are load-bearing, and future tokens cannot leak.
