@@ -460,6 +460,45 @@ class KDAAttnDecoding(nn.Module):
     def forward(self, x):
         B, T_new, d = x.shape
         ksize = self.short_conv.kernel_size[0]
+        if T_new == 0:
+            # Empty-chunk contract: preserve/initialize the recurrent state
+            # and leave the conv lookback unchanged, mirroring
+            # KDAHybridLayer.forward and the other decoding wrappers. Without
+            # this branch the left-pad has fewer than ``ksize - 1`` steps and
+            # the depthwise conv raises a shape error instead of returning a
+            # zero-length output.
+            compute_dtype = (torch.float64 if x.dtype == torch.float64
+                             else torch.float)
+            state = self._state
+            if state is not None and state.shape[0] == B:
+                expected = (B, self.H, self.K, self.V)
+                if tuple(state.shape) != expected:
+                    raise ValueError(
+                        'KDAAttnDecoding: state.shape='
+                        f'{tuple(state.shape)} does not match the expected '
+                        f'{expected} ([B, H, K, V]) even though T_new=0.')
+                new_state = state.to(device=x.device, dtype=compute_dtype)
+            else:
+                new_state = torch.zeros(
+                    B, self.H, self.K, self.V, device=x.device,
+                    dtype=compute_dtype)
+            new_lookback = self._conv_lookback
+            if new_lookback is not None:
+                if new_lookback.shape[0] != B:
+                    new_lookback = None
+                else:
+                    expected_lb = (B, ksize - 1, d)
+                    if tuple(new_lookback.shape) != expected_lb:
+                        raise ValueError(
+                            'KDAAttnDecoding: conv_lookback.shape='
+                            f'{tuple(new_lookback.shape)} does not match the '
+                            f'expected {expected_lb} ([B, ksize-1, d]) even '
+                            'though T_new=0.')
+                    new_lookback = new_lookback.to(
+                        device=x.device, dtype=x.dtype).detach().clone()
+            self._state = new_state
+            self._conv_lookback = new_lookback
+            return x.new_zeros(B, 0, self.q.in_features)
         # Build the conv input with proper LEFT context, mirroring
         # KDAHybridLayer.forward: prepend the previous chunk's last
         # ``ksize - 1`` tokens if available, else left-pad with zeros.
