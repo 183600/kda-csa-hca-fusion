@@ -321,6 +321,36 @@ def test_qk_l2_normalize_preserves_finite_dtype_limit_direction():
         torch.testing.assert_close(mixed_inplace, mixed_y, equal_nan=True)
 
 
+def test_rwkv7_key_norm_preserves_finite_overflow(monkeypatch):
+    from types import SimpleNamespace
+
+    import ops_rwkv_backend
+    from ops_rwkv import Rwkv7Mixer
+
+    cfg = SimpleNamespace(
+        d_model=16, rwkv_head_dim=4, rwkv_decay_lora=4,
+        rwkv_a_lora=4, rwkv_gate_lora=4)
+    mixer = Rwkv7Mixer(cfg).eval()
+    with torch.no_grad():
+        mixer.k_k.fill_(1e30)
+    captured = {}
+    real_forward = ops_rwkv_backend.rwkv7_forward
+
+    def capture_forward(r, w, k, v, kk, a, **kwargs):
+        captured['kk'] = kk.detach().clone()
+        return real_forward(r, w, k, v, kk, a, **kwargs)
+
+    monkeypatch.setattr(ops_rwkv_backend, 'rwkv7_forward', capture_forward)
+    x = torch.randn(1, 3, 16)
+    with torch.no_grad():
+        mixer.forward_functional(x, None, None)
+    kk = captured['kk']
+    assert torch.isfinite(kk).all()
+    norms = kk.norm(dim=-1)
+    torch.testing.assert_close(
+        norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5)
+
+
 def main():
     all_results = []
     for fn in (test_rmsnorm_shape_polymorphism, test_rmsnorm_inplace_and_affine,

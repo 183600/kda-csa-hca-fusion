@@ -130,6 +130,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ops_csa import _l2_normalize
+
 # ---------------------------------------------------------------------------
 # Upstream provenance (recorded in experiment result rows via
 # run_ablation / run_quality provenance blocks).
@@ -941,7 +943,7 @@ class Rwkv7Mixer(nn.Module):
         B, T, C = k.shape
         # L2-normalize the scaled key per head (kk), then mix the
         # in-context learning rate into k.
-        kk = F.normalize((k * self.k_k).view(B, T, H, N), dim=-1, p=2.0)
+        kk = _l2_normalize((k * self.k_k).view(B, T, H, N))
         k = k * (1 + (a - 1) * self.k_a)
 
         # Reshape to [B, T, H, D] for the scan (K == N; V == N here —
