@@ -49,7 +49,7 @@ from kaggle_setup import (append_run_manifest, configure_torch_for_device,
                           capture_provenance, make_run_manifest_entry,
                           set_global_seed)
 from ops_kda_backend import kda_forward, validate_kda_backend
-from ops_csa import naive_csa, _qk_normalize
+from ops_csa import naive_csa, _l2_normalize, _qk_normalize
 from ops_hca import naive_hca
 from ops_decoding_cache import CSADecodingCache, HCADecodingCache
 from ops_fused import (
@@ -490,12 +490,14 @@ class KDAAttnDecoding(nn.Module):
                 self._conv_lookback = torch.cat(
                     [torch.zeros(B, pad_len, d, device=x.device, dtype=x.dtype),
                      x], dim=1).detach().clone()
-        # View BEFORE normalize: F.normalize(dim=-1) must operate on each
+        # View BEFORE normalize: L2 normalization must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector.
         # Normalizing the full H*K vector would shrink each head's L2 norm
         # to ~1/sqrt(H) and under-scale q.k dot products by 1/H.
-        q = F.normalize(F.silu(self.q(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
-        k = F.normalize(F.silu(self.k(x_conv)).view(B, T_new, self.H, self.K), dim=-1)
+        q = _l2_normalize(
+            F.silu(self.q(x_conv)).view(B, T_new, self.H, self.K))
+        k = _l2_normalize(
+            F.silu(self.k(x_conv)).view(B, T_new, self.H, self.K))
         v = F.silu(self.v(x_conv)).view(B, T_new, self.H, self.V)
         # Log-space gate: low-rank down/up with a softplus-style decay,
         # matching ops_fused.KDAHybridLayer and run_kv_cache.prefill_flops.
@@ -887,7 +889,7 @@ class CSAAttnDecoding(nn.Module):
         Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = self._project(x)
         compute_dtype = (
             torch.float64 if x.dtype == torch.float64 else torch.float)
-        q_n = F.normalize(q.to(compute_dtype), dim=-1)
+        q_n = _l2_normalize(q.to(compute_dtype))
         # Detach projections before caching (KV cache should not retain the
         # autograd graph across decode steps — mirrors the
         # SoftmaxAttnDecoding / KDAAttnDecoding pattern).
@@ -1001,7 +1003,7 @@ class HCAAttnDecoding(nn.Module):
         C, Z, q = self._project(x)
         compute_dtype = (
             torch.float64 if x.dtype == torch.float64 else torch.float)
-        q_n = F.normalize(q.to(compute_dtype), dim=-1)
+        q_n = _l2_normalize(q.to(compute_dtype))
         o = cache.forward_chunk(
             C.detach(), Z.detach(), self.B_pos.detach(), q_n,
             nh=self.nh, scale=1.0, sink_logits=self.sink,

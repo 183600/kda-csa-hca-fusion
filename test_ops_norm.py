@@ -351,6 +351,25 @@ def test_rwkv7_key_norm_preserves_finite_overflow(monkeypatch):
         norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5)
 
 
+def test_kda_runner_qk_norm_preserves_finite_overflow():
+    from run_decoding import KDAAttnDecoding
+    from run_quality import KDAAttn
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 3, 16)
+    modules = [KDAAttnDecoding(16, H=2, K=4, V=4),
+               KDAAttn(16, H=2, K=4, V=4)]
+    for module in modules:
+        module.eval()
+        with torch.no_grad():
+            module.q.weight.mul_(1e25)
+            module.k.weight.mul_(1e25)
+        with torch.no_grad():
+            y = module(x)
+        assert torch.isfinite(y).all()
+        assert y.abs().max() > 0
+
+
 def main():
     all_results = []
     for fn in (test_rmsnorm_shape_polymorphism, test_rmsnorm_inplace_and_affine,

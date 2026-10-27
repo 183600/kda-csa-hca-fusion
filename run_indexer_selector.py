@@ -65,8 +65,8 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from ops_csa import (  # noqa: E402
-    _TOPK_SORT_MAX_ELEMS, _canonical_topk_indices, csa_lightning_indexer,
-    naive_csa,
+    _TOPK_SORT_MAX_ELEMS, _canonical_topk_indices, _l2_normalize,
+    csa_lightning_indexer, naive_csa,
 )
 from ops_decoding_cache import CSADecodingCache, _block_valid_mask  # noqa: E402
 import ops_csa  # noqa: E402
@@ -382,8 +382,8 @@ def bench_indexer_latency(topk: int, geom: dict, lengths) -> list:
         w_idx = torch.randn(1, 1, geom['nIh'])
         K = cache.K_IComp
         K32 = K.to(torch.float32)
-        qn = F.normalize(q_idx, dim=-1)
-        Kn = F.normalize(K32, dim=-1)
+        qn = _l2_normalize(q_idx)
+        Kn = _l2_normalize(K32)
         cbm = _block_valid_mask(
             nb, (cache.n_tokens_seen - 1) // geom['m'],
             torch.device('cpu'))[None, :]
@@ -510,7 +510,7 @@ def bench_sink_guard() -> list:
         Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = proj
         cache.append_step(
             Ca, Cb, Za, Zb, K_idx, Z_idx, p['Ba'], p['Bb'], p['B_idx'])
-        q_n = F.normalize(q.to(torch.float), dim=-1)
+        q_n = _l2_normalize(q.to(torch.float))
         o_t = cache.forward_step(
             q_n, q_idx, w_idx, topk=0, nh=nh, nIh=nIh, scale=1.0,
             sink_logits=sink, use_ste=False)
@@ -544,7 +544,7 @@ def bench_sink_guard() -> list:
         Ca, Cb, Za, Zb, K_idx, Z_idx, q, q_idx, w_idx = proj
         cache2.append_step(
             Ca, Cb, Za, Zb, K_idx, Z_idx, p2['Ba'], p2['Bb'], p2['B_idx'])
-        q_n = F.normalize(q.to(torch.float), dim=-1)
+        q_n = _l2_normalize(q.to(torch.float))
         o_t = cache2.forward_step(
             q_n, q_idx, w_idx, topk=2, nh=nh, nIh=nIh, scale=1.0,
             sink_logits=None, use_ste=False)

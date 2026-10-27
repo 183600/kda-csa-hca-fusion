@@ -110,6 +110,7 @@ from kv_quant import (
     spec_summary,
     storage_bytes,
 )
+from ops_csa import _l2_normalize
 from ops_fused import HybridConfig, HybridKCHAttention, _memory_layer_lookback
 from multi_seed_stats import (_safe_mean, _sample_sd, holm_adjust,
                                summarize_paired)
@@ -703,8 +704,10 @@ class NeedleStepwiseKDA(nn.Module):
         ksize = self.kda.short_conv.kernel_size[0]
         x_conv = self.kda.short_conv(
             F.pad(x.transpose(1, 2), (ksize - 1, 0))).transpose(1, 2)
-        q = F.normalize(F.silu(self.kda.q(x_conv)).view(B, T, self.kda.H, self.kda.K), dim=-1)
-        k = F.normalize(F.silu(self.kda.k(x_conv)).view(B, T, self.kda.H, self.kda.K), dim=-1)
+        q = _l2_normalize(
+            F.silu(self.kda.q(x_conv)).view(B, T, self.kda.H, self.kda.K))
+        k = _l2_normalize(
+            F.silu(self.kda.k(x_conv)).view(B, T, self.kda.H, self.kda.K))
         v = F.silu(self.kda.v(x_conv)).view(B, T, self.kda.H, self.kda.V)
         g = -F.softplus(
             self.kda.g_up(F.silu(self.kda.g_down(x_conv))).view(B, T, self.kda.H, self.kda.K)

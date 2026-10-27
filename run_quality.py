@@ -77,7 +77,7 @@ from kaggle_setup import (configure_torch_for_device, parse_int_env,
                           capture_provenance, grad_flow_report,
                           make_run_manifest_entry, append_run_manifest)
 from ops_kda_backend import kda_forward, validate_kda_backend
-from ops_csa import naive_csa
+from ops_csa import naive_csa, _l2_normalize
 from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
@@ -1385,13 +1385,15 @@ class KDAAttn(nn.Module):
         x_conv = self.short_conv(
             F.pad(x.transpose(1, 2), (ksize - 1, 0))
         ).transpose(1, 2)
-        # View BEFORE normalize: F.normalize(dim=-1) must operate on each
+        # View BEFORE normalize: L2 normalization must operate on each
         # per-head K-dim vector, not on the concatenated H*K vector —
         # otherwise each head's L2 norm becomes ~1/sqrt(H) instead of 1 and
         # the q.k dot products shrink by a factor of 1/H. Mirrors
         # ops_fused.py::KDAHybridLayer.
-        q = F.normalize(F.silu(self.q(x_conv)).view(B, T, self.H, self.K), dim=-1)
-        k = F.normalize(F.silu(self.k(x_conv)).view(B, T, self.H, self.K), dim=-1)
+        q = _l2_normalize(
+            F.silu(self.q(x_conv)).view(B, T, self.H, self.K))
+        k = _l2_normalize(
+            F.silu(self.k(x_conv)).view(B, T, self.H, self.K))
         v = F.silu(self.v(x_conv)).view(B, T, self.H, self.V)
         # Log-space gate: low-rank down/up with a softplus-style decay,
         # matching ops_fused.KDAHybridLayer and run_kv_cache.prefill_flops.

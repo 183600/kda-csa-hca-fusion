@@ -109,6 +109,7 @@ from kv_quant import (  # noqa: E402
 )
 from lm_consistency import build_decoding_clone  # noqa: E402
 from multi_seed_stats import summarize_paired  # noqa: E402
+from ops_csa import _l2_normalize  # noqa: E402
 from ops_fused import HybridConfig  # noqa: E402
 from ppl_bootstrap import paired_bootstrap_ppl  # noqa: E402
 from ops_kda import naive_recurrent_kda  # noqa: E402
@@ -509,10 +510,10 @@ class StepwiseKDALM(KDAAttn):
         ksize = self.short_conv.kernel_size[0]
         x_conv = self.short_conv(
             F.pad(x.transpose(1, 2), (ksize - 1, 0))).transpose(1, 2)
-        q = F.normalize(F.silu(self.q(x_conv)).view(B, T, self.H, self.K),
-                        dim=-1)
-        k = F.normalize(F.silu(self.k(x_conv)).view(B, T, self.H, self.K),
-                        dim=-1)
+        q = _l2_normalize(
+            F.silu(self.q(x_conv)).view(B, T, self.H, self.K))
+        k = _l2_normalize(
+            F.silu(self.k(x_conv)).view(B, T, self.H, self.K))
         v = F.silu(self.v(x_conv)).view(B, T, self.H, self.V)
         g = -F.softplus(
             self.g_up(F.silu(self.g_down(x_conv))).view(B, T, self.H, self.K)

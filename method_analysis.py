@@ -33,7 +33,8 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import configure_torch_for_device
-from ops_csa import csa_compress_kv, _causal_block_mask, _nan_safe_softmax
+from ops_csa import (csa_compress_kv, _causal_block_mask, _l2_normalize,
+                     _nan_safe_softmax)
 from ops_kda import naive_recurrent_kda
 
 
@@ -239,8 +240,8 @@ class HeadwiseFusedAttention(nn.Module):
             # no KDA head to run, so return the empty [B, T, 0, hd] block
             # instead of calling a recurrence with H=0.
             return x.new_zeros(B, T, 0, hd)
-        q = F.normalize(F.silu(self.kda_q(x)).view(B, T, H, hd), dim=-1)
-        k = F.normalize(F.silu(self.kda_k(x)).view(B, T, H, hd), dim=-1)
+        q = _l2_normalize(F.silu(self.kda_q(x)).view(B, T, H, hd))
+        k = _l2_normalize(F.silu(self.kda_k(x)).view(B, T, H, hd))
         v = F.silu(self.kda_v(x)).view(B, T, H, hd)
         g = (-F.softplus(self.kda_g(x)) * self.DECAY_SCALE).view(B, T, H, hd)
         beta = torch.sigmoid(self.kda_beta(x)).view(B, T, H)
@@ -262,8 +263,9 @@ class HeadwiseFusedAttention(nn.Module):
         C = self.csa_kv(x)
         Z = self.csa_z(x)
         C_comp = csa_compress_kv(C, Z, self.csa_B, m)
-        C_comp_n = F.normalize(C_comp, dim=-1)
-        q = F.normalize(self.csa_q(x).view(B, Tp, H, c).to(C_comp_n.dtype), dim=-1)
+        C_comp_n = _l2_normalize(C_comp)
+        q = _l2_normalize(
+            self.csa_q(x).view(B, Tp, H, c).to(C_comp_n.dtype))
         cbm = _causal_block_mask(Tp, n_blocks, m, x.device)
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
@@ -291,8 +293,9 @@ class HeadwiseFusedAttention(nn.Module):
         C = self.hca_kv(x)
         Z = self.hca_z(x)
         C_comp = csa_compress_kv(C, Z, self.hca_B, m2)
-        C_comp_n = F.normalize(C_comp, dim=-1)
-        q = F.normalize(self.hca_q(x).view(B, Tp, H, c).to(C_comp_n.dtype), dim=-1)
+        C_comp_n = _l2_normalize(C_comp)
+        q = _l2_normalize(
+            self.hca_q(x).view(B, Tp, H, c).to(C_comp_n.dtype))
         cbm = _causal_block_mask(Tp, n_blocks, m2, x.device)
         scores = torch.einsum('b t h d, b n d -> b h t n', q, C_comp_n) * self.scale
         scores = scores.masked_fill(~cbm[None, None, :, :], float('-inf'))
