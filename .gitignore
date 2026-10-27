@@ -159,3 +159,6 @@ uv.lock
 # LM training checkpoints written by train_lm_autodl.py / run_autodl_lm.sh
 # (~50-300 MB per save; must never be committed).
 checkpoints_lm/
+
+# Papers are referenced by arXiv link in README; keep PDFs out of git.
+*.pdf

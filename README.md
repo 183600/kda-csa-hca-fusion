@@ -562,6 +562,14 @@ caveat, and the corpus-fingerprint framing fix.
 
 ---
 
+## Papers
+
+The implementation follows these two arXiv reports. The PDFs are no longer
+committed to this repository (see `.gitignore`); download them from arXiv:
+
+* [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence (arXiv:2606.19348)](https://arxiv.org/abs/2606.19348)
+* [Kimi Linear: An Expressive, Efficient Attention Architecture (arXiv:2510.26692)](https://arxiv.org/abs/2510.26692)
+
 ## License
 
 See `LICENSE`.
