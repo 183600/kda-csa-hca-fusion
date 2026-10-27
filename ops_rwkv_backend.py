@@ -16,8 +16,9 @@ always emits the *log-decay* (``log_w = -0.6065306597126334 *
 sigmoid(w_lora(xw))``, so ``decay = exp(log_w)``). The two upstream
 conventions differ:
 
-  * ``fla.ops.rwkv7.chunk_rwkv7`` / ``fused_mul_recurrent_rwkv7`` take
-    ``log_w`` (``gk``) directly -> **pass-through, no transform**.
+  * ``fla.ops.rwkv7.chunk_rwkv7`` / the recurrent kernels take the
+    log-decay directly (``log_w`` on the fork, ``w`` on mainline) ->
+    **pass-through, no transform**.
   * the BlinkDL x070 ``RWKV7_OP`` takes a raw pre-activation and
     applies ``exp(-exp(w))`` INSIDE the op -> a raw-w adapter must feed
     it ``w_raw = log(-log_w)``-style pre-activations, never the
@@ -34,10 +35,14 @@ decay argument differently depending on the installed distribution:
 ``w=`` that it converts internally, while mainline
 ``flash-linear-attention`` names the log-decay ``w=`` and has no
 ``log_w`` at all. The adapter therefore reads the installed signature
-(:func:`_chunk_decay_param`) and forwards the log-decay under whichever
+(:func:`_decay_param`) and forwards the log-decay under whichever
 keyword that revision expects — forwarding ``w=`` to the fork would
 convert the decay a second time, and forwarding ``log_w=`` to mainline
-leaves its required ``w`` unbound.
+leaves its required ``w`` unbound. The recurrent kernels also differ in
+their low-rank operands: mainline's ``fused_mul_recurrent_rwkv7`` takes
+``kk``/``a`` and forms the update internally, while the fork's
+``fused_recurrent_rwkv7`` takes preformed ``a``/``b``; the adapter
+selects the spelling from the installed signature too.
 
 **State layout.** The fla kernels use ``[B, H, K, V]`` (rows = key dim,
 columns = value dim) — the same layout as the reference scan in
@@ -83,6 +88,7 @@ _FLA_MODULE = None
 # alive, so the decay-keyword classification is computed once per function
 # (a decode loop dispatches through here on every token).
 _DECAY_PARAM_CACHE: dict[Any, str] = {}
+_RECURRENT_AB_CACHE: dict[Any, bool] = {}
 
 
 def validate_rwkv_backend(backend: str) -> str:
@@ -130,7 +136,17 @@ def _load_fla_rwkv7():
                 raise ImportError(_FLA_IMPORT_ERROR)
             return _FLA_CHUNK_FN, _FLA_RECURRENT_FN
     try:
-        from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
+        from fla.ops.rwkv7 import chunk_rwkv7
+        try:
+            from fla.ops.rwkv7 import fused_mul_recurrent_rwkv7
+        except ImportError:
+            # The RWKV-Vibe fork exports ``fused_recurrent_rwkv7`` instead
+            # of mainline's ``fused_mul_recurrent_rwkv7``.  Both implement
+            # the same recurrence; only their operand spelling differs (the
+            # adapter reads that from the signature in
+            # :func:`_fla_rwkv7_scan`).
+            from fla.ops.rwkv7 import (
+                fused_recurrent_rwkv7 as fused_mul_recurrent_rwkv7)
     except Exception as exc:  # noqa: BLE001 - broken installs raise anything
         _FLA_IMPORT_ERROR = ImportError(
             "The RWKV-7 'fla' backend requires flash-linear-attention "
@@ -186,19 +202,19 @@ def resolve_rwkv_backend(requested: str) -> str:
     return 'reference'
 
 
-def _chunk_decay_param(chunk_fn) -> str:
-    """Return the keyword that carries the log-decay into ``chunk_fn``.
+def _decay_param(fn, *, default: str = 'log_w') -> str:
+    """Return the keyword that carries the log-decay into ``fn``.
 
-    The chunked RWKV-7 kernel has two upstream spellings for the decay:
+    Both RWKV-7 kernels have two upstream spellings for the decay:
 
     * ``RWKV-Vibe/rwkv-fla`` (the fork this repo cites for the
-      parameterization) — ``chunk_rwkv7(r, k, v, a, b, w=None, log_w=None)``.
-      ``log_w`` carries the log-decay and is forwarded **unchanged**; ``w``
-      is a RAW pre-activation that the kernel converts internally
+      parameterization) — ``(..., w=None, log_w=None)``.  ``log_w`` carries
+      the log-decay and is forwarded **unchanged**; ``w`` is a RAW
+      pre-activation that the kernel converts internally
       (``log_w = -exp(w)``).
     * mainline ``flash-linear-attention`` (the version ``pyproject.toml``
-      pins) — ``chunk_rwkv7(r, w, k, v, a, b)`` where ``w`` IS the
-      log-decay (``gk=w``, forwarded unchanged).
+      pins) — the parameter is named ``w`` and IS the log-decay
+      (``gk=w``, forwarded unchanged); there is no ``log_w``.
 
     Both spellings expect the SAME log-decay from this module, so the
     keyword is chosen from the INSTALLED signature: forwarding ``w=`` to
@@ -206,11 +222,11 @@ def _chunk_decay_param(chunk_fn) -> str:
     silently change the decay; forwarding ``log_w=`` to mainline is
     swallowed by its ``**kwargs`` and leaves the required ``w`` unbound.
     """
-    cached = _DECAY_PARAM_CACHE.get(chunk_fn)
+    cached = _DECAY_PARAM_CACHE.get(fn)
     if cached is not None:
         return cached
     try:
-        params = inspect.signature(chunk_fn).parameters
+        params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         params = {}
     if 'log_w' in params:
@@ -218,12 +234,37 @@ def _chunk_decay_param(chunk_fn) -> str:
     elif 'w' in params:
         param = 'w'
     else:
-        # Signature not introspectable (a compiled wrapper): keep the
-        # documented fork contract.  A mainline kernel then raises
+        # Signature not introspectable (a compiled wrapper): use the
+        # caller's documented contract.  A mismatched kernel then raises
         # TypeError, which the 'auto' path surfaces as a fallback.
-        param = 'log_w'
-    _DECAY_PARAM_CACHE[chunk_fn] = param
+        param = default
+    _DECAY_PARAM_CACHE[fn] = param
     return param
+
+
+def _chunk_decay_param(chunk_fn) -> str:
+    """Backward-compatible wrapper for the chunked-kernel contract."""
+    return _decay_param(chunk_fn, default='log_w')
+
+
+def _recurrent_uses_ab(recurrent_fn) -> bool:
+    """Whether ``recurrent_fn`` takes preformed ``a``/``b`` operands.
+
+    Mainline's ``fused_mul_recurrent_rwkv7(r, w, k, v, kk, a, ...)`` takes
+    ``kk``/``a`` and forms ``a_op=-kk``/``b_op=kk*a`` internally.  The
+    fork's ``fused_recurrent_rwkv7(r, k, v, a, b, w=None, log_w=None, ...)``
+    takes the already-formed operands and has no ``kk`` parameter.
+    """
+    cached = _RECURRENT_AB_CACHE.get(recurrent_fn)
+    if cached is not None:
+        return cached
+    try:
+        params = inspect.signature(recurrent_fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    uses_ab = 'kk' not in params and 'b' in params
+    _RECURRENT_AB_CACHE[recurrent_fn] = uses_ab
+    return uses_ab
 
 
 def _fla_rwkv7_scan(
@@ -248,8 +289,10 @@ def _fla_rwkv7_scan(
       applies ``exp()`` internally exactly once);
     * the fla kernels' low-rank update operands are ``a_op = -kk`` and
       ``b_op = kk * a`` while this module's contract passes ``kk`` and
-      ``a`` separately -> the adapter forms ``a_op`` / ``b_op``
-      itself, so a caller can never double-negate;
+      ``a`` separately -> the adapter forms ``a_op`` / ``b_op`` for
+      kernels that take preformed ``a``/``b`` (the fork's
+      ``fused_recurrent_rwkv7``), or forwards ``kk``/``a`` to mainline's
+      ``fused_mul_recurrent_rwkv7``, so a caller can never double-negate;
     * the fla state layout ``[B, H, K, V]`` matches the reference scan
       -> no transposes;
     * ``chunk_rwkv7`` (the differentiable training path) is used for
@@ -262,13 +305,20 @@ def _fla_rwkv7_scan(
     chunk_fn, recurrent_fn = _load_fla_rwkv7()
     if r.shape[1] == 1:
         # Decode step: the fused recurrent kernel is selected for T == 1.
-        # Same math, same state contract.
-        o, state = recurrent_fn(
-            r=r, w=log_w, k=k, v=v, kk=kk, a=a,
+        # Same math, same state contract; the operand/decay spelling follows
+        # the installed signature (mainline ``kk``/``a`` vs fork ``a``/``b``).
+        recurrent_kwargs = dict(
+            r=r, k=k, v=v,
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
         )
+        if _recurrent_uses_ab(recurrent_fn):
+            recurrent_kwargs.update(a=-kk, b=kk * a)
+        else:
+            recurrent_kwargs.update(kk=kk, a=a)
+        recurrent_kwargs[_decay_param(recurrent_fn, default='w')] = log_w
+        o, state = recurrent_fn(**recurrent_kwargs)
         return o, state
     # The decay keyword differs between the two upstream spellings; both
     # receive the log-decay unchanged (see :func:`_chunk_decay_param`).

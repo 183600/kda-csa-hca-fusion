@@ -126,14 +126,15 @@ def _broken_fla_ops_rwkv7():
     return {'fla': fla, 'fla.ops': ops, 'fla.ops.rwkv7': broken}
 
 
-def _fake_fla_ops_rwkv7(chunk_fn, recurrent_fn):
+def _fake_fla_ops_rwkv7(chunk_fn, recurrent_fn,
+                        recurrent_name='fused_mul_recurrent_rwkv7'):
     fla = types.ModuleType('fla')
     fla.__path__ = []
     ops = types.ModuleType('fla.ops')
     ops.__path__ = []
     rwkv7 = types.ModuleType('fla.ops.rwkv7')
     rwkv7.chunk_rwkv7 = chunk_fn
-    rwkv7.fused_mul_recurrent_rwkv7 = recurrent_fn
+    setattr(rwkv7, recurrent_name, recurrent_fn)
     ops.rwkv7 = rwkv7
     fla.ops = ops
     return {'fla': fla, 'fla.ops': ops, 'fla.ops.rwkv7': rwkv7}
@@ -348,6 +349,77 @@ def test_rwkv_chunk_decay_keyword_matches_installed_signature():
             kw.get('log_w') is None, f'{kw.get("log_w")!r}')
         _ok('mainline spelling still forms a_op=-kk, b_op=kk*a',
             torch.equal(kw.get('a'), -kk)
+            and torch.equal(kw.get('b'), kk * a), '')
+
+
+def test_rwkv_recurrent_kernel_convention_matches_installed_signature():
+    """The T==1 recurrent kernel follows its installed signature.
+
+    Mainline ``fused_mul_recurrent_rwkv7(r, w, k, v, kk, a, ...)`` takes
+    the log-decay as ``w`` and the raw ``kk``/``a`` operands.  The
+    RWKV-Vibe fork exports ``fused_recurrent_rwkv7(r, k, v, a, b,
+    w=None, log_w=None, ...)``: the log-decay must go to ``log_w`` (``w``
+    is a raw pre-activation) and the adapter must preform
+    ``a=-kk``/``b=kk*a`` because the fork has no ``kk`` parameter.
+    """
+    calls: dict = {}
+
+    def chunk_fn(**kwargs):
+        return kwargs['r'] * 0.0 + 7.0, kwargs['r'] * 0.0 + 1.0
+
+    def fork_recurrent_fn(r, k, v, a, b, w=None, log_w=None, scale=1.0,
+                          initial_state=None, output_final_state=True):
+        calls['fork'] = {'w': w, 'log_w': log_w, 'a': a, 'b': b}
+        return r * 0.0 + 9.0, r * 0.0 + 2.0
+
+    def mainline_recurrent_fn(r, w, k, v, kk, a, scale=1.0,
+                              initial_state=None, output_final_state=False):
+        calls['mainline'] = {'w': w, 'kk': kk, 'a': a}
+        return r * 0.0 + 8.0, r * 0.0 + 2.0
+
+    B, T, H, N = 1, 1, 2, 3
+    torch.manual_seed(3)
+    r = torch.randn(B, T, H, N)
+    log_w = -0.1 * torch.ones(B, T, H, N)
+    k = torch.randn(B, T, H, N)
+    v = torch.randn(B, T, H, N)
+    kk = torch.randn(B, T, H, N)
+    a = torch.sigmoid(torch.randn(B, T, H, N))
+
+    with _reset_rwkv_cache() as rb, _injected_modules(
+            _fake_fla_ops_rwkv7(chunk_fn, fork_recurrent_fn)):
+        rb.rwkv7_forward(r, log_w, k, v, kk, a, backend='fla')
+        kw = calls.get('fork', {})
+        _ok('fork recurrent receives the log-decay as log_w',
+            torch.equal(kw.get('log_w'), log_w)
+            and kw.get('w') is None, f'{kw.get("log_w")!r}')
+        _ok('fork recurrent forms a_op=-kk, b_op=kk*a',
+            torch.equal(kw.get('a'), -kk)
+            and torch.equal(kw.get('b'), kk * a), '')
+
+    calls.clear()
+    with _reset_rwkv_cache() as rb, _injected_modules(
+            _fake_fla_ops_rwkv7(chunk_fn, mainline_recurrent_fn)):
+        rb.rwkv7_forward(r, log_w, k, v, kk, a, backend='fla')
+        kw = calls.get('mainline', {})
+        _ok('mainline recurrent receives the log-decay as w',
+            torch.equal(kw.get('w'), log_w), '')
+        _ok('mainline recurrent receives raw kk/a operands',
+            torch.equal(kw.get('kk'), kk)
+            and torch.equal(kw.get('a'), a), '')
+
+    # The fork exports ``fused_recurrent_rwkv7``; the loader must fall back
+    # when mainline's ``fused_mul_recurrent_rwkv7`` is absent.
+    calls.clear()
+    with _reset_rwkv_cache() as rb, _injected_modules(
+            _fake_fla_ops_rwkv7(
+                chunk_fn, fork_recurrent_fn,
+                recurrent_name='fused_recurrent_rwkv7')):
+        rb.rwkv7_forward(r, log_w, k, v, kk, a, backend='fla')
+        kw = calls.get('fork', {})
+        _ok('fork-only install loads fused_recurrent_rwkv7',
+            torch.equal(kw.get('log_w'), log_w)
+            and torch.equal(kw.get('a'), -kk)
             and torch.equal(kw.get('b'), kk * a), '')
 
 
