@@ -105,6 +105,28 @@ def _assert_lookbacks_close(name, got, want):
             _assert_close(f'{name}[{idx}]', a, b)
 
 
+def test_kda_head_shard_equivalence_at_norm_overflow(device):
+    """TP must preserve finite q/k directions whose norm overflows."""
+    torch.manual_seed(23)
+    cfg = _kda_cfg(0)
+    layer = KDAHybridLayer(cfg).to(device).eval()
+    with torch.no_grad():
+        layer.q_proj.weight.mul_(1e25)
+        layer.k_proj.weight.mul_(1e25)
+    x = torch.randn(2, 4, cfg.d_model, device=device) * 0.5
+    with torch.no_grad():
+        full, full_state, _ = layer.forward_functional(x, None, None)
+        parts, states = [], []
+        for rank in range(2):
+            out = tp.kda_layer_forward_tp(layer, x, None, rank, 2)
+            parts.append(out['output'])
+            states.append(out['state'])
+    assert torch.isfinite(full).all()
+    assert torch.isfinite(full_state).all()
+    _assert_close('overflow TP output', torch.stack(parts).sum(dim=0), full)
+    _assert_close('overflow TP state', torch.cat(states, dim=1), full_state)
+
+
 @pytest.mark.parametrize('schedule', ([1, 3, 4, 3], [5, 6], [11],
                                       [0, 4, 0, 7]))
 @pytest.mark.parametrize('tp_size', (2, 4))

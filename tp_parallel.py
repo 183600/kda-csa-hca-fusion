@@ -428,10 +428,10 @@ def kda_layer_forward_tp(
                 'backend': requested_backend,
                 'resolved_backend': resolved_backend}
     x_conv, new_lookback = _conv_features(layer, x, conv_lookback)
-    q = F.normalize(
-        F.silu(layer.q_proj(x_conv)).view(B, T, H, K), dim=-1)
-    k = F.normalize(
-        F.silu(layer.k_proj(x_conv)).view(B, T, H, K), dim=-1)
+    q = _qk_normalize(
+        F.silu(layer.q_proj(x_conv)).view(B, T, H, K), 'l2')
+    k = _qk_normalize(
+        F.silu(layer.k_proj(x_conv)).view(B, T, H, K), 'l2')
     q = q.repeat_interleave(G, dim=2)[:, :, lo:hi]
     k = k.repeat_interleave(G, dim=2)[:, :, lo:hi]
     v_weight = layer.v_proj.weight.view(HV, V, d)[lo:hi].reshape(hv * V, d)
