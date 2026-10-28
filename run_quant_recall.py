@@ -307,7 +307,7 @@ def _aggregate(values: list) -> dict:
         from run_quality import _t_crit_975
         crit = _t_crit_975(n)
         if crit is not None:
-            half = crit * std / math.sqrt(n)
+            half = crit * (std / math.sqrt(n))
             ci95 = [mean - half, mean + half]
     return {'mean': mean, 'std': std, 'ci95': ci95,
             'min': min(values), 'max': max(values), 'n': n}

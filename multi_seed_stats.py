@@ -2230,7 +2230,10 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     if n >= 2 and sd is not None and sd > 0.0:
         # Two-sided t critical value via bisection on the forward CDF.
         crit = _positive_t_quantile(alpha / 2.0, n - 1)
-        half = crit * sd / math.sqrt(n)
+        # Scale the SD by sqrt(n) BEFORE multiplying by the critical value:
+        # ``crit * sd`` can overflow even when the half-width
+        # ``crit * (sd / sqrt(n))`` and both endpoints are representable.
+        half = crit * (sd / math.sqrt(n))
         ci_lo, ci_hi = mean - half, mean + half
         # Finite inputs can produce a half-width beyond the float range;
         # an unrepresentable interval is reported as undefined so the

@@ -836,7 +836,7 @@ def _moment(values: list) -> dict:
         from run_quality import _t_crit_975
         crit = _t_crit_975(len(vals))
         if crit is not None:
-            half = crit * std / math.sqrt(len(vals))
+            half = crit * (std / math.sqrt(len(vals)))
             ci = [mean - half, mean + half]
     return {'mean': mean, 'std': std, 'ci95': ci,
             'min': min(vals), 'max': max(vals), 'n': len(vals)}

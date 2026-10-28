@@ -834,8 +834,13 @@ if __name__ == '__main__':
 def test_needle_mean_ci_is_json_safe_for_finite_extremes():
     from run_needle_haystack import _mean_ci95
     import json
+    import math
     assert _mean_ci95([1e308, 1e308, 1e308]) == [1e308, 1e308]
     assert _mean_ci95([1e308, -1e308]) is None
+    # ``crit * sd`` overflows while the half-width and endpoints do not.
+    extreme = _mean_ci95([8e307] * 5 + [-8e307] * 5)
+    assert extreme is not None
+    assert all(math.isfinite(x) for x in extreme)
     ci = _mean_ci95([1, 2, 3, 4])
     assert ci is not None
     json.dumps(ci, allow_nan=False)

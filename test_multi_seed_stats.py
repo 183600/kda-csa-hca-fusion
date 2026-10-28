@@ -1075,6 +1075,14 @@ def test_finite_extreme_differences_keep_reports_json_safe():
         json.dumps(rep, allow_nan=False)
     assert M.tost_paired([1.5e308, -1.5e308], margin=1.0)[
         'p_value'] is None
+    # ``crit * sd`` can overflow even though the half-width
+    # ``crit * (sd / sqrt(n))`` and both endpoints are representable.
+    # The interval must stay finite for a symmetric extreme sample.
+    symmetric_extreme = [8e307] * 5 + [-8e307] * 5
+    extreme_ci = M.summarize_paired(
+        symmetric_extreme, n_boot=20)['ci95_mean_diff_t']
+    assert all(math.isfinite(x) for x in extreme_ci)
+    assert extreme_ci[0] < 0.0 < extreme_ci[1]
     # A normal-range sample keeps the exact legacy arithmetic.
     assert M.summarize_paired([1.0, 2.0, 3.0, 4.0],
                               n_boot=10)['median_diff'] == 2.5

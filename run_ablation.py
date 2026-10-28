@@ -967,7 +967,7 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         var_acc = sum((a - mean_acc) ** 2 for a in accs) / (n - 1)
         std_acc = math.sqrt(var_acc)
         t = _t_crit_975(n)
-        ci_acc = t * std_acc / math.sqrt(n)
+        ci_acc = t * (std_acc / math.sqrt(n))
     else:
         std_acc = None
         ci_acc = None
@@ -1780,7 +1780,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
         var_acc = sum((a - mean_acc) ** 2 for a in accs) / (n - 1)
         std_acc = math.sqrt(var_acc)
         t = _t_crit_975(n)
-        ci_acc = t * std_acc / math.sqrt(n)
+        ci_acc = t * (std_acc / math.sqrt(n))
     else:
         std_acc = None
         ci_acc = None
@@ -1807,7 +1807,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
         if len(vals) > 1:
             sd = math.sqrt(sum((v - m) ** 2 for v in vals) / (len(vals) - 1))
             crit = _t_crit_975(len(vals))
-            ci = (crit * sd / math.sqrt(len(vals))
+            ci = (crit * (sd / math.sqrt(len(vals)))
                   if crit is not None else None)
         else:
             # One surviving seed has no sample SD; 0.0 would claim perfect

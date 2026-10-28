@@ -506,7 +506,7 @@ def quality_probe(*, seeds: tuple[int, ...], device, d_model: int,
             from run_quality import _t_crit_975
             crit = _t_crit_975(len(accs))
             if crit is not None:
-                half = crit * std / (len(accs) ** 0.5)
+                half = crit * (std / (len(accs) ** 0.5))
                 ci = [mean - half, mean + half]
         common = sorted(set(seed_accs) & set(ref))
         paired = None

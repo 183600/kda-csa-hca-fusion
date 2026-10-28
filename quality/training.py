@@ -787,8 +787,8 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         std_loss = math.sqrt(var_loss)
         # 95% CI half-width using t-distribution with n-1 dof.
         t = _t_crit_975(n)
-        ci_acc = t * std_acc / math.sqrt(n)
-        ci_loss = t * std_loss / math.sqrt(n)
+        ci_acc = t * (std_acc / math.sqrt(n))
+        ci_loss = t * (std_loss / math.sqrt(n))
     else:
         # With a single seed, the sample std is undefined and the t-CI is
         # NOT zero — the uncertainty is maximal. Return None (like ci95)

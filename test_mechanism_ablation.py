@@ -827,8 +827,15 @@ if __name__ == '__main__':
 
 def test_mechanism_aggregators_are_json_safe_at_float_limit():
     import json
+    import math
     mean, std, ci = M._mean_ci([1e308, 1e308, 1e308])
     assert mean == 1e308 and std == 0.0 and ci == 0.0
+    # ``crit * sd`` overflows while the actual CI half-width and both
+    # endpoints remain representable; the interval must stay finite.
+    extreme = [8e307] * 5 + [-8e307] * 5
+    mean, std, ci = M._mean_ci(extreme)
+    assert math.isfinite(ci)
+    assert M.paired_stats(extreme)['ci95'] is not None
     assert M.paired_stats([1e308, 1e308])['mean'] == 1e308
     stats = M.paired_stats([1e308, -1e308])
     assert stats['mean'] == 0.0

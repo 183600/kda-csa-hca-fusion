@@ -2124,7 +2124,7 @@ def _mean_ci95(values: list[float]) -> list[float] | None:
     if crit is None:
         return None
     try:
-        half = crit * sd / math.sqrt(n)
+        half = crit * (sd / math.sqrt(n))
         lower, upper = mean - half, mean + half
     except OverflowError:
         return None

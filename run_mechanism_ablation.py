@@ -860,7 +860,8 @@ def _mean_ci(values, label=''):
         var = sum((v - mean) ** 2 for v in values) / (n - 1)
         std = math.sqrt(var)
         crit = _t_crit_975(n)
-        ci = crit * std / math.sqrt(n) if crit is not None else None
+        ci = (crit * (std / math.sqrt(n))
+              if crit is not None else None)
         if math.isfinite(mean) and math.isfinite(std) and (
                 ci is None or math.isfinite(ci)):
             return mean, std, ci
@@ -875,7 +876,8 @@ def _mean_ci(values, label=''):
     if std is None or not math.isfinite(std):
         return mean, None, None
     crit = _t_crit_975(n)
-    ci = crit * std / math.sqrt(n) if crit is not None else None
+    ci = (crit * (std / math.sqrt(n))
+              if crit is not None else None)
     if ci is not None and not math.isfinite(ci):
         ci = None
     return mean, std, ci
@@ -902,7 +904,8 @@ def paired_stats(diffs):
         var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
         std = math.sqrt(var)
         crit = _t_crit_975(n)
-        ci = crit * std / math.sqrt(n) if crit is not None else None
+        ci = (crit * (std / math.sqrt(n))
+              if crit is not None else None)
         t_stat = mean / (std / math.sqrt(n)) if std > 0 else None
         if (math.isfinite(mean) and math.isfinite(std)
                 and (ci is None or math.isfinite(ci))
@@ -920,7 +923,8 @@ def paired_stats(diffs):
     if std is None or not math.isfinite(std):
         return {'n_pairs': n, 'mean': mean, 'ci95': None, 't_stat': None}
     crit = _t_crit_975(n)
-    ci = crit * std / math.sqrt(n) if crit is not None else None
+    ci = (crit * (std / math.sqrt(n))
+              if crit is not None else None)
     if ci is not None and not math.isfinite(ci):
         ci = None
     t_stat = mean / (std / math.sqrt(n)) if std > 0 else None
