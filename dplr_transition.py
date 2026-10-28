@@ -140,8 +140,10 @@ def effective_rank(left: torch.Tensor, right: torch.Tensor,
     usual SVD cut-off.  The returned rank is an ``int`` and therefore
     JSON-safe.  A zero-width factor has rank 0.
     """
-    if left.shape[-1] == 0:
-        return 0
+    if not torch.is_tensor(left) or not torch.is_tensor(right):
+        raise TypeError(
+            'effective_rank: left/right must be tensors, got '
+            f'{type(left).__name__} and {type(right).__name__}.')
     if rtol is None:
         eps = torch.finfo(left.dtype).eps
         rtol = max(left.shape[-1], left.shape[-2]) * eps
@@ -160,6 +162,11 @@ def effective_rank(left: torch.Tensor, right: torch.Tensor,
             raise ValueError(
                 f'effective_rank: rtol must be finite and >= 0, got '
                 f'{rtol!r}.')
+    # Validate the tolerance before the zero-width early return: an empty
+    # factor has rank 0, but it must not silently accept an invalid config
+    # that the non-empty path rejects.
+    if left.shape[-1] == 0:
+        return 0
     matrix = left @ right.transpose(-1, -2)
     sv = torch.linalg.svdvals(matrix)
     if sv.numel() == 0 or not torch.isfinite(sv).all():
