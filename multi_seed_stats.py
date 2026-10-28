@@ -236,7 +236,11 @@ def _student_t_sf_positive(t_value: float, dof: int) -> float:
     if t_value == 0.0:
         return 0.5
     if dof >= _NORMAL_T_DOF:
-        return NormalDist().cdf(-t_value)
+        # ``NormalDist().cdf(-t)`` is ``0.5 * (1 + erf(-t/sqrt(2)))``:
+        # once erf rounds to -1 (t around 9), the subtraction cancels to
+        # exactly zero even though the tail is still representable
+        # (t=10 -> 7.6e-24). ``erfc`` evaluates that tail directly.
+        return 0.5 * math.erfc(t_value / math.sqrt(2.0))
     t_sq = t_value * t_value
     if math.isfinite(t_sq):
         x = dof / (dof + t_sq)
