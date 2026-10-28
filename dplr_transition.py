@@ -144,6 +144,24 @@ def effective_rank(left: torch.Tensor, right: torch.Tensor,
         raise TypeError(
             'effective_rank: left/right must be tensors, got '
             f'{type(left).__name__} and {type(right).__name__}.')
+    for tag, t in (('left', left), ('right', right)):
+        if not t.is_floating_point():
+            raise TypeError(
+                f'effective_rank: {tag} must be a floating-point tensor, '
+                f'got {t.dtype}.')
+        if t.dim() < 2:
+            raise ValueError(
+                f'effective_rank: {tag} must have at least two dimensions, '
+                f'got {t.dim()}.')
+    if (left.shape[:-2] != right.shape[:-2]
+            or left.shape[-1] != right.shape[-1]):
+        raise ValueError(
+            'effective_rank: left/right must share the leading dimensions '
+            f'and rank, got {tuple(left.shape)} and {tuple(right.shape)}.')
+    if left.device != right.device:
+        raise ValueError(
+            'effective_rank: left/right must share a device, got '
+            f'{left.device} and {right.device}.')
     if rtol is None:
         eps = torch.finfo(left.dtype).eps
         rtol = max(left.shape[-1], left.shape[-2]) * eps

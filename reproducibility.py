@@ -494,7 +494,8 @@ def _verify_artifact(role: str, record, *, base_dir=None) -> dict:
     report['recorded_sha256'] = (
         recorded.lower() if isinstance(recorded, str) else None)
     report['recorded_n_bytes'] = (
-        recorded_bytes if isinstance(recorded_bytes, int) else None)
+        recorded_bytes if isinstance(recorded_bytes, int)
+        and not isinstance(recorded_bytes, bool) else None)
     if not isinstance(path, str) or not path:
         report['status'] = 'malformed'
         report['warnings'].append(

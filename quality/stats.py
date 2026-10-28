@@ -158,7 +158,12 @@ def _bonferroni_crit_q(n, alpha=0.05):
             _T_ISF = False
     if _T_PP:
         if _T_ISF is not None:
-            return float(_T_ISF(alpha, n - 1))
+            value = float(_T_ISF(alpha, n - 1))
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"_bonferroni_crit_q: alpha={alpha!r} for n={n} needs "
+                    f"a critical value outside the float range")
+            return value
         return float(_T_PP(1 - alpha, n - 1))
     # scipy unavailable: compute the Student-t quantile directly via the
     # regularized incomplete beta function and bisection. The numerical
