@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+from statistics import NormalDist
+
 from ._shared import *  # noqa: F401,F403
 
 
 _T_PP = None
 _T_ISF = None
+
+# Above this many degrees of freedom the normal quantile is at least as
+# accurate as the dependency-free t inversion (whose ``lgamma`` difference
+# loses ~4e-7 at dof=1e8 and ~5e-6 at dof=1e9), while the t-vs-normal gap
+# is only ~1.5e-8.  The guard is also required for huge dof: the stable
+# ratio ``dof/(dof+t^2)`` rounds to 1.0 even at the median, which used to
+# flatten the survival function and return values like 8.0 instead of
+# ~1.645.
+_NORMAL_DOF_LIMIT = 1.0e8
 
 
 def _t_crit_975(n):
@@ -17,16 +28,16 @@ def _t_crit_975(n):
     one-sided 97.5% quantile, ``scipy.stats.t.ppf(0.975, n - 1)``).
 
     Resolution order:
+      0. For ``n - 1 >= _NORMAL_DOF_LIMIT`` (including integers too large
+         for a float) the standard-normal 97.5% quantile is returned; the
+         t/normal gap is below 1e-7 there and the direct t inversion loses
+         precision to ``lgamma`` cancellation.
       1. ``scipy.stats.t.ppf`` when scipy is importable (exact for any n).
       2. A hardcoded table covering ``n = 2..100`` (df = 1..99).
-      3. For ``n > 100`` a first-order Cornish-Fisher expansion
-         ``1.96 + (1.96^3 + 1.96) / (4 * (n - 1))`` is used. Under
-         Bonferroni correction (e.g. alpha=0.05/28 ~= 0.0018) the relevant
-         critical value is the 99.9% quantile, where the normal approx's
-         error balloons past 60% (``t.ppf(0.999, 100) ~= 3.17`` vs ``3.09``
-         for the normal). The Cornish-Fisher expansion keeps the error
-         below 0.1% at n=101 for the 97.5% level and is a much better
-         approximation for the corrected alphas used downstream.
+      3. For ``n > 100`` delegates to ``_bonferroni_crit_q(n, alpha=0.025)``
+         (the exact dependency-free inverse CDF). A first-order
+         Cornish-Fisher expansion remains only as a last-resort fallback
+         if that path raises.
       4. For ``n < 2`` the CI is undefined; returns ``None`` (NOT ``0.0``),
          so a 1-seed estimate never becomes a zero-width CI that reads as
          "the estimate is exact". Callers MUST handle ``None`` (the
@@ -42,6 +53,14 @@ def _t_crit_975(n):
         # propagates as "undefined" and the t-test guard already handles it
         # (``crit is not None and ...``).
         return None
+    try:
+        dof_float = float(n - 1)
+    except (OverflowError, TypeError):
+        # A JSON-sized integer can exceed the float range; the t limit is
+        # the normal quantile and no further arithmetic is representable.
+        return NormalDist().inv_cdf(0.975)
+    if not math.isfinite(dof_float) or dof_float >= _NORMAL_DOF_LIMIT:
+        return NormalDist().inv_cdf(0.975)
     if _T_PP is None:
         try:
             from scipy.stats import t as _t_dist
@@ -89,15 +108,26 @@ def _t_crit_975(n):
         return _bonferroni_crit_q(n, alpha=0.025)
     except Exception:
         # Fallback to Cornish-Fisher if _bonferroni path itself fails
-        # (should never happen, but keep a safe net).
+        # (should never happen, but keep a safe net).  For dof beyond the
+        # float range the expansion's ``4.0*(n-1)`` would itself overflow;
+        # the normal limit is the only representable answer.
         z = 1.959963984540054  # scipy.stats.norm.ppf(0.975)
-        return z + (z ** 3 + z) / (4.0 * (n - 1))
+        try:
+            dof_float = float(n - 1)
+        except (OverflowError, TypeError):
+            return z
+        if not math.isfinite(dof_float) or dof_float >= _NORMAL_DOF_LIMIT:
+            return z
+        return z + (z ** 3 + z) / (4.0 * dof_float)
 
 
 def _bonferroni_crit_q(n, alpha=0.05):
     """Bonferroni-corrected ONE-SIDED t critical value with ``n-1`` dof.
 
     Resolution order (mirrors ``_t_crit_975``):
+      0. For ``n - 1 >= _NORMAL_DOF_LIMIT`` (including integers too large
+         for a float) the standard-normal quantile is returned; this also
+         keeps the huge-dof ratio ``dof/(dof+t^2)`` from rounding to 1.0.
       1. ``scipy.stats.t.ppf`` when scipy is importable (exact for any n).
       2. For ``n`` in 2..100 a hardcoded table of the 97.5% one-sided
          quantiles (same table as ``_t_crit_975``, reused via lookup).
@@ -143,6 +173,15 @@ def _bonferroni_crit_q(n, alpha=0.05):
     # numerically identical and lets the fallback stay upper-tail only.)
     if alpha > 0.5:
         return -_bonferroni_crit_q(n, 1.0 - alpha)
+    try:
+        dof_float = float(n - 1)
+    except (OverflowError, TypeError):
+        dof_float = math.inf
+    if not math.isfinite(dof_float) or dof_float >= _NORMAL_DOF_LIMIT:
+        # The Student-t limit is the standard normal; use it for huge or
+        # unrepresentable dof so the result is finite and correct instead
+        # of overflowing inside scipy/lgamma.
+        return -NormalDist().inv_cdf(alpha)
     # Try scipy first (exact for any alpha / any n). Use the inverse
     # survival function rather than ``ppf(1 - alpha)``: for alpha below
     # the float spacing at 1, ``1 - alpha`` rounds to exactly 1.0 and
@@ -239,13 +278,28 @@ def _bonferroni_crit_q(n, alpha=0.05):
             return math.log(0.5)
         t_sq = t_value * t_value
         if math.isfinite(t_sq):
-            x = dof / (dof + t_sq)
-            ib = _betai(0.5 * dof, 0.5, x)
-            if ib > 0.0:
-                # Guard only against a last-bit overshoot from the
-                # continued fraction; the true regularized beta is in
-                # [0, 1].
-                return math.log(0.5) + math.log(min(ib, 1.0))
+            denom = dof + t_sq
+            if math.isfinite(denom):
+                a = 0.5 * dof
+                b = 0.5
+                # ``y = t^2/(dof+t^2)`` is the stable complement of
+                # ``x = dof/(dof+t^2)``.  When y is small the direct x
+                # ratio rounds to exactly 1.0 and ``_betai`` returns 1.0,
+                # flattening SF at 0.5 even for quantiles near the median
+                # (large dof).  Use I_x(a,b) = 1 - I_y(b,a) there, which
+                # keeps the small tail probability ``I_y`` accurate.
+                y = t_sq / denom
+                if y < (b + 1.0) / (a + b + 2.0):
+                    ib = _betai(b, a, y)
+                    if ib < 1.0:
+                        return math.log(0.5) + math.log1p(-ib)
+                x = dof / denom
+                ib = _betai(a, b, x)
+                if ib > 0.0:
+                    # Guard only against a last-bit overshoot from the
+                    # continued fraction; the true regularized beta is in
+                    # [0, 1].
+                    return math.log(0.5) + math.log(min(ib, 1.0))
         # ``t**2`` overflowed or the incomplete beta underflowed. The true
         # x = dof / (dof + t^2) is then far below the smallest normal
         # float, so use the x -> 0 limit in log space:

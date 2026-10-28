@@ -1132,6 +1132,46 @@ def test_bonferroni_extreme_tail_is_not_truncated_at_t_squared_overflow():
         assert abs(got / want - 1.0) < 1e-10, (alpha, got, want)
 
 
+def test_bonferroni_huge_dof_and_near_median_are_stable():
+    """Huge dof must use the normal limit instead of flattening the tail.
+
+    ``x = dof/(dof+t**2)`` rounds to 1.0 for huge dof even at the median;
+    the dependency-free path then returned 8.0 instead of ~1.645 (or
+    overflowed for a JSON-sized ``n``).  A much smaller dof exposed the
+    same ratio at near-median alpha, where ``x`` also rounded to 1.0.
+    """
+    from statistics import NormalDist
+
+    import quality.stats as stats
+    from run_quality import _bonferroni_crit_q, _t_crit_975
+
+    # The guard applies regardless of whether scipy is installed.
+    for n in (10 ** 12, 10 ** 18):
+        for alpha in (0.05, 1e-6, 0.5):
+            got = _bonferroni_crit_q(n, alpha=alpha)
+            want = -NormalDist().inv_cdf(alpha)
+            assert abs(got - want) <= 1e-15 * max(1.0, abs(want)), (
+                n, alpha, got, want)
+    huge = 10 ** 400
+    assert abs(_bonferroni_crit_q(huge, alpha=0.05)
+               - -NormalDist().inv_cdf(0.05)) <= 1e-15
+    assert abs(_t_crit_975(huge)
+               - NormalDist().inv_cdf(0.975)) <= 1e-15
+
+    # Dependency-free path: with dof=1e6 the near-median quantile is tiny,
+    # so the old x ratio rounded to 1.0 and SF stayed flat at 0.5.  The
+    # stable y complement recovers the linear normal tail
+    # t ~ (0.5 - alpha) * sqrt(2*pi).
+    saved = (stats._T_PP, stats._T_ISF)
+    stats._T_PP = stats._T_ISF = False
+    try:
+        got = _bonferroni_crit_q(10 ** 6, alpha=0.5 - 1e-10)
+    finally:
+        stats._T_PP, stats._T_ISF = saved
+    want = 1e-10 * math.sqrt(2.0 * math.pi)
+    assert abs(got - want) <= 1e-6 * want, (got, want)
+
+
 def test_seed_accuracy_map_ignores_malformed_seed_metrics():
     """Paired contrasts use only finite numeric per-seed accuracies."""
     from run_ablation import _seed_accuracy_map
