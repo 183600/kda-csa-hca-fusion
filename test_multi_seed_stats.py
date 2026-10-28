@@ -1202,6 +1202,23 @@ def test_interaction_contrast_reports_unrepresentable_interaction():
     json.dumps(rep, allow_nan=False)
 
 
+def test_interaction_contrast_reports_unrepresentable_sd():
+    # Finite per-seed interactions with a finite mean whose sample SD
+    # exceeds the float range: the SD is undefined (None), not zero.
+    d_val = 1.7e308
+    a = {0: 0.0, 1: 0.0, 2: 0.0}
+    b = {0: 0.0, 1: 0.0, 2: 0.0}
+    c = {0: 0.0, 1: 0.0, 2: 0.0}
+    d = {0: d_val, 1: -d_val, 2: d_val}
+    rep = M.interaction_contrast(a, b, c, d)
+    assert rep['n_pairs'] == 3
+    assert math.isfinite(rep['mean_diff'])
+    assert rep['sd_diff'] is None
+    assert rep['t_stat'] is None
+    assert rep['effect_size_cohens_dz'] is None
+    json.dumps(rep, allow_nan=False)
+
+
 def test_student_t_uses_the_normal_limit_for_large_dof():
     from statistics import NormalDist
     expected = NormalDist().cdf(1.0)

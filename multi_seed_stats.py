@@ -1178,8 +1178,6 @@ def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
             mean = None
     sd = (_sample_sd(diffs, mean)
           if mean is not None and diffs_finite else None)
-    if sd is None and diffs_finite:
-        sd = 0.0
     t_stat = (mean / (sd / math.sqrt(n))) if sd and sd > 0.0 else None
     if all(x > 0 for x in diffs):
         unanimous = 'positive'
