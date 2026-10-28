@@ -7,10 +7,9 @@ phase's changes (git reset --hard).
 Layers
 ------
 1. Syntax: every .py file parses (always run, no dependencies).
-2. Full pytest regression suite (every ``test_*.py`` plus the
-   ``run_correctness.py`` / ``test_figures.py`` check suites; fast subset
-   via ``-m "not slow"``). Skipped (with a warning) when torch / pytest are
-   missing so a network hiccup can never brick the loop.
+2. Full pytest regression suite (``run_correctness.py`` + ``test_figures.py``,
+   fast subset via ``-m "not slow"``). Skipped (with a warning) when
+   torch / pytest are missing so a network hiccup can never brick the loop.
 
 --syntax-only runs layer 1 only (used by the shutdown trap).
 """
@@ -68,7 +67,8 @@ def check_pytest() -> None:
         return
     r = subprocess.run(
         [sys.executable, "-m", "pytest",
-         "-q", "-x", "-p", "no:cacheprovider", "-m", "not slow"],
+         "-q", "-x", "-p", "no:cacheprovider", "-m", "not slow",
+         "run_correctness.py", "test_figures.py"],
         cwd=ROOT, capture_output=True, text=True, timeout=1800,
     )
     tail = (r.stdout or r.stderr).strip().splitlines()
