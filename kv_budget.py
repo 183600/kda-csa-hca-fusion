@@ -180,10 +180,14 @@ def mamba2_read_elements(T: int, nheads: int, headdim: int,
     state; only the value-head geometry differs.
     """
     _validate_T(T, 'mamba2_read_elements')
+    # Validate the state geometry even for T == 0: the recurrent state size
+    # is position-independent, so an empty window must not accept a
+    # malformed geometry that the T > 0 path rejects.
+    state_elements = mamba2_state_elements(nheads, headdim, d_state)
     if T == 0:
         return 0.0
     return _finite_scaled('mamba2_read_elements', 'derived read count',
-                          2, mamba2_state_elements(nheads, headdim, d_state))
+                          2, state_elements)
 
 
 def kda_read_elements(T: int, hv: int, d_k: int, d_v: int) -> float:
@@ -196,10 +200,13 @@ def kda_read_elements(T: int, hv: int, d_k: int, d_v: int) -> float:
     :func:`op_read_elements` as ``state_elements``.
     """
     _validate_T(T, 'kda_read_elements')
+    # Validate the state geometry even for T == 0 (see
+    # ``mamba2_read_elements``): the state size is position-independent.
+    state_elements = kda_state_elements(hv, d_k, d_v)
     if T == 0:
         return 0.0
     return _finite_scaled('kda_read_elements', 'derived read count',
-                          2, kda_state_elements(hv, d_k, d_v))
+                          2, state_elements)
 
 
 def csa_read_elements(T: int, *, m: int, topk: int, c: int, c_i: int,
