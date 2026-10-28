@@ -1362,15 +1362,8 @@ def _run_overfit_gate(*, sweep, ops_list, task_list, device):
             },
             'reports': overfit_reports,
         }
-        try:
-            write_json_atomic(gate_payload, 'results/exp4_overfit_gate.json',
-                              indent=2, allow_nan=False)
-        except ValueError as e:
-            logger.error(f'non-finite value in overfit gate payload; '
-                         f'sanitizing to null: {e}')
-            write_json_atomic(sanitize_for_json(gate_payload),
-                              'results/exp4_overfit_gate.json',
-                              indent=2, allow_nan=False)
+        write_results_json(gate_payload, 'results/exp4_overfit_gate.json',
+                           logger=logger)
         logger.info('Saved: results/exp4_overfit_gate.json')
         # Failed = checked cells (not skipped memoryless controls) that did
         # not pass the memorization criterion.

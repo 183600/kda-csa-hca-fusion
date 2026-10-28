@@ -37,13 +37,21 @@ Usage::
     # Machine-readable report; exit code follows the same contract.
     python reproducibility.py --json results/*.json
 
+    # Verify the append-only run ledger and every artifact digest it
+    # recorded (code/runtime identity is not re-checked per entry).
+    python reproducibility.py --manifest results/run_manifest.jsonl
+
+    # Check a manifest and the result files together.
+    python reproducibility.py --manifest results/run_manifest.jsonl \
+        results/exp4_mqar.json
+
     # Print the identity of the current working tree (what a new result
     # would record) without running an experiment.
     python reproducibility.py --identity
 
 Exit codes: ``0`` all checked results reproducible; ``1`` at least one code,
-runtime, content-integrity or pre-registration drift; ``2`` provenance or a
-design binding was absent/unverifiable.
+runtime, content-integrity, artifact or pre-registration drift; ``2``
+provenance or a design binding was absent/unverifiable.
 
 The comparison is intentionally conservative: missing evidence is reported
 as unverifiable rather than treated as agreement.
@@ -52,9 +60,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
-from kaggle_setup import capture_provenance, capture_source_identity
+from kaggle_setup import (capture_provenance, capture_source_identity,
+                          file_sha256, manifest_entry_sha256)
 
 #: Fields that identify the code that executed.
 CODE_FIELDS = ('git_commit', 'source_tree_sha256')
@@ -444,6 +454,254 @@ def compare_design_binding(record) -> dict:
     return report
 
 
+def _manifest_artifact_base(path: str) -> str:
+    """Directory that relative artifact paths in ``path`` are resolved to.
+
+    The ledger conventionally lives at ``<campaign>/results/run_manifest.
+    jsonl`` and stores paths such as ``results/exp4_mqar.json``, i.e.
+    relative to the campaign root (the parent of ``results``), so that is
+    the base. Manifests kept anywhere else fall back to their own
+    directory. Absolute artifact paths are never rewritten.
+    """
+    manifest_dir = os.path.dirname(os.path.abspath(path))
+    if os.path.basename(manifest_dir) == 'results':
+        return os.path.dirname(manifest_dir)
+    return manifest_dir
+
+
+def _verify_artifact(role: str, record, *, base_dir=None) -> dict:
+    """Verify one ``artifact_digests`` entry against the file on disk."""
+    report = {
+        'role': role,
+        'path': None,
+        'resolved_path': None,
+        'recorded_sha256': None,
+        'observed_sha256': None,
+        'recorded_n_bytes': None,
+        'observed_n_bytes': None,
+        'status': 'unverifiable',
+        'warnings': [],
+    }
+    if not isinstance(record, dict):
+        report['status'] = 'malformed'
+        report['warnings'].append(
+            f'artifact digest for role {role!r} is not an object')
+        return report
+    path = record.get('path')
+    recorded = record.get('sha256')
+    recorded_bytes = record.get('n_bytes')
+    report['path'] = path if isinstance(path, str) else None
+    report['recorded_sha256'] = (
+        recorded.lower() if isinstance(recorded, str) else None)
+    report['recorded_n_bytes'] = (
+        recorded_bytes if isinstance(recorded_bytes, int) else None)
+    if not isinstance(path, str) or not path:
+        report['status'] = 'malformed'
+        report['warnings'].append(
+            f'artifact digest for role {role!r} has no valid path')
+        return report
+    if not _is_sha256_hex(recorded):
+        report['status'] = 'malformed'
+        report['warnings'].append(
+            f'artifact digest for role {role!r} is not a sha256 hex value')
+        return report
+    resolved = (
+        path if os.path.isabs(path)
+        else os.path.join(base_dir or os.getcwd(), path))
+    report['resolved_path'] = resolved
+    try:
+        if not os.path.isfile(resolved):
+            report['status'] = 'missing'
+            report['warnings'].append(
+                f'artifact for role {role!r} is missing: {resolved}')
+            return report
+        observed = file_sha256(resolved)
+        observed_bytes = os.path.getsize(resolved)
+    except OSError as exc:
+        report['status'] = 'unreadable'
+        report['warnings'].append(
+            f'artifact for role {role!r} cannot be read '
+            f'({type(exc).__name__}: {exc}): {resolved}')
+        return report
+    report['observed_sha256'] = observed
+    report['observed_n_bytes'] = observed_bytes
+    if observed != report['recorded_sha256']:
+        report['status'] = 'mismatch'
+        report['warnings'].append(
+            f'artifact for role {role!r} changed after the run: {resolved}')
+    elif (report['recorded_n_bytes'] is not None
+          and observed_bytes != report['recorded_n_bytes']):
+        report['status'] = 'mismatch'
+        report['warnings'].append(
+            f'artifact for role {role!r} has a different size: {resolved}')
+    else:
+        report['status'] = 'ok'
+    return report
+
+
+def verify_manifest_entry(entry, *, base_dir=None) -> dict:
+    """Verify one run-manifest entry (entry digest + artifact digests).
+
+    Status is one of:
+
+    * ``verified`` — the entry digest matches and every recorded artifact
+      is present with the recorded bytes;
+    * ``drift`` — the entry itself was edited, or an artifact's bytes /
+      size changed after the run (a different number, seed, or recipe is
+      no longer the archived run);
+    * ``unverifiable`` — a legacy entry without ``entry_sha256`` /
+      ``artifact_digests``, or an artifact is missing/unreadable. Missing
+      evidence is never treated as agreement;
+    * ``malformed`` — the entry or a digest block cannot be interpreted.
+
+    Provenance (code/runtime identity) is *not* re-checked here: a ledger
+    can legitimately aggregate runs from several commits. Use
+    :func:`verify_record` on the result artifacts for that comparison.
+    Relative artifact paths are resolved against ``base_dir`` (default:
+    the current directory).
+    """
+    report = {
+        'status': 'malformed',
+        'experiment': None,
+        'created_utc': None,
+        'entry_sha256': {
+            'recorded': None,
+            'observed': None,
+            'status': 'unverifiable',
+        },
+        'artifacts': {},
+        'warnings': [],
+    }
+    if not isinstance(entry, dict):
+        report['warnings'].append(
+            f'manifest entry must be an object, found '
+            f'{type(entry).__name__}')
+        return report
+    report['experiment'] = (
+        entry.get('experiment') if isinstance(entry.get('experiment'), str)
+        else None)
+    report['created_utc'] = (
+        entry.get('created_utc')
+        if isinstance(entry.get('created_utc'), str) else None)
+
+    recorded = entry.get('entry_sha256')
+    entry_check = report['entry_sha256']
+    entry_check['recorded'] = recorded if isinstance(recorded, str) else None
+    if recorded is None:
+        entry_check['status'] = 'missing'
+        report['warnings'].append(
+            'the manifest entry carries no entry_sha256 (legacy ledger); '
+            'the line cannot be checked for post-hoc edits')
+    elif not _is_sha256_hex(recorded):
+        entry_check['status'] = 'malformed'
+        report['warnings'].append(
+            'the manifest entry carries a malformed entry_sha256')
+    else:
+        try:
+            observed = manifest_entry_sha256(entry)
+        except Exception as exc:
+            entry_check['status'] = 'malformed'
+            report['warnings'].append(
+                f'the manifest entry cannot be canonicalized '
+                f'({type(exc).__name__}: {exc})')
+        else:
+            entry_check['observed'] = observed
+            if observed != recorded.lower():
+                entry_check['status'] = 'mismatch'
+                report['warnings'].append(
+                    'the manifest entry content does not match its '
+                    'entry_sha256: at least one field was edited after '
+                    'the line was written')
+            else:
+                entry_check['status'] = 'ok'
+
+    artifacts = entry.get('artifacts')
+    digests = entry.get('artifact_digests')
+    if not isinstance(digests, dict):
+        digests = {}
+        if isinstance(artifacts, dict) and any(
+                isinstance(p, str) and p for p in artifacts.values()):
+            report['warnings'].append(
+                'the manifest entry lists artifacts but carries no '
+                'artifact_digests (legacy ledger); their bytes cannot be '
+                'verified')
+    for role, record in sorted(digests.items()):
+        check = _verify_artifact(str(role), record, base_dir=base_dir)
+        report['artifacts'][str(role)] = check
+        report['warnings'].extend(check.get('warnings') or [])
+
+    statuses = [entry_check['status']]
+    statuses.extend(c['status'] for c in report['artifacts'].values())
+    if any(s == 'mismatch' for s in statuses):
+        report['status'] = 'drift'
+    elif any(s == 'malformed' for s in statuses):
+        report['status'] = 'malformed'
+    elif any(s in ('missing', 'unverifiable', 'unreadable')
+             for s in statuses):
+        report['status'] = 'unverifiable'
+    else:
+        report['status'] = 'verified'
+    return report
+
+
+def verify_manifest_file(path: str) -> dict:
+    """Verify every line of an append-only run-manifest JSONL file.
+
+    Returns a strict-JSON report. A corrupt/blank line, a legacy entry, or
+    a missing artifact is ``unverifiable``; a digest mismatch is ``drift``.
+    The top-level status follows the worst per-entry status, with
+    ``drift`` taking precedence over ``unverifiable``.
+    """
+    report = {
+        'path': path,
+        'artifact_base': _manifest_artifact_base(path),
+        'status': 'unverifiable',
+        'n_entries': 0,
+        'entries': [],
+        'warnings': [],
+    }
+    try:
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError as exc:
+        report['status'] = 'unreadable'
+        report['warnings'].append(
+            f'{path} cannot be read ({type(exc).__name__}: {exc})')
+        return report
+    seen_drift = False
+    seen_unverifiable = False
+    for lineno, line in enumerate(lines, 1):
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            entry = json.loads(text)
+        except ValueError as exc:
+            seen_unverifiable = True
+            report['entries'].append({
+                'line': lineno,
+                'status': 'malformed',
+                'warnings': [f'line {lineno} is not valid JSON: {exc}'],
+            })
+            continue
+        check = verify_manifest_entry(
+            entry, base_dir=report['artifact_base'])
+        check['line'] = lineno
+        report['entries'].append(check)
+        report['n_entries'] += 1
+        if check['status'] == 'drift':
+            seen_drift = True
+        elif check['status'] != 'verified':
+            seen_unverifiable = True
+    if seen_drift:
+        report['status'] = 'drift'
+    elif seen_unverifiable or not report['entries']:
+        report['status'] = 'unverifiable'
+    else:
+        report['status'] = 'verified'
+    return report
+
+
 def verify_record(record, current=None) -> dict:
     """Extract the provenance block from ``record`` and compare it.
 
@@ -541,6 +799,22 @@ def _format_report(path: str, report: dict) -> str:
     return '\n'.join(lines)
 
 
+def _format_manifest_report(path: str, report: dict) -> str:
+    lines = [f'{path}: {report.get("status", "unknown").upper()} '
+             f'({report.get("n_entries", 0)} entries)']
+    for entry in report.get('entries', []):
+        if entry.get('status') == 'verified':
+            continue
+        lines.append(
+            f'  line {entry.get("line", "?")}: {entry.get("status", "?")} '
+            f'{entry.get("experiment") or "-"}')
+        for warning in entry.get('warnings', []):
+            lines.append(f'    warning: {warning}')
+    for warning in report.get('warnings', []):
+        lines.append(f'  warning: {warning}')
+    return '\n'.join(lines)
+
+
 def _load_json(path: str):
     with open(path, encoding='utf-8') as f:
         return json.load(f)
@@ -557,6 +831,9 @@ def main(argv=None) -> int:
     parser.add_argument(
         '--identity', action='store_true',
         help='print the current source/environment identity and exit')
+    parser.add_argument(
+        '--manifest', action='append', default=[], metavar='PATH',
+        help='verify a run-manifest JSONL ledger (repeatable)')
     args = parser.parse_args(argv)
 
     if args.identity:
@@ -566,42 +843,65 @@ def main(argv=None) -> int:
         }
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         return 0
-    if not args.paths:
-        parser.error('provide at least one result JSON path (or --identity)')
+    if not args.paths and not args.manifest:
+        parser.error(
+            'provide at least one result JSON path, --manifest, or '
+            '--identity')
 
-    current = capture_provenance()
+    current = capture_provenance() if args.paths else None
     reports = {}
     saw_drift = False
     saw_unverifiable = False
-    for path in args.paths:
-        try:
-            record = _load_json(path)
-        except (OSError, ValueError) as exc:
-            reports[path] = {
-                'status': 'unreadable',
-                'reproducible': False,
-                'error': f'{type(exc).__name__}: {exc}',
-                'checks': {},
-                'warnings': [],
-            }
-            saw_unverifiable = True
-            continue
-        report = verify_record(record, current=current)
-        reports[path] = report
+    if current is not None:
+        for path in args.paths:
+            try:
+                record = _load_json(path)
+            except (OSError, ValueError) as exc:
+                reports[path] = {
+                    'status': 'unreadable',
+                    'reproducible': False,
+                    'error': f'{type(exc).__name__}: {exc}',
+                    'checks': {},
+                    'warnings': [],
+                }
+                saw_unverifiable = True
+                continue
+            report = verify_record(record, current=current)
+            reports[path] = report
+            if report['status'] == 'drift':
+                saw_drift = True
+            elif report['status'] in ('unverifiable', 'no_provenance'):
+                saw_unverifiable = True
+
+    manifest_reports = {}
+    for path in args.manifest:
+        report = verify_manifest_file(path)
+        manifest_reports[path] = report
         if report['status'] == 'drift':
             saw_drift = True
-        elif report['status'] in ('unverifiable', 'no_provenance'):
+        elif report['status'] != 'verified':
             saw_unverifiable = True
 
     if args.json:
-        print(json.dumps(reports, indent=2, sort_keys=True, allow_nan=False))
+        if manifest_reports:
+            payload = {'results': reports, 'manifests': manifest_reports}
+        else:
+            payload = reports
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
         for path, report in reports.items():
             print(_format_report(path, report))
-        n_ok = sum(1 for r in reports.values()
-                   if r['status'] == 'reproducible')
-        print(f'\n{n_ok}/{len(reports)} result(s) reproducible against this '
-              f'checkout')
+        for path, report in manifest_reports.items():
+            print(_format_manifest_report(path, report))
+        if reports:
+            n_ok = sum(1 for r in reports.values()
+                       if r['status'] == 'reproducible')
+            print(f'\n{n_ok}/{len(reports)} result(s) reproducible against '
+                  f'this checkout')
+        if manifest_reports:
+            n_ok = sum(1 for r in manifest_reports.values()
+                       if r['status'] == 'verified')
+            print(f'{n_ok}/{len(manifest_reports)} manifest(s) verified')
 
     if saw_drift:
         return 1

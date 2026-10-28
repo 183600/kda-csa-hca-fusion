@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pytest  # noqa: E402
 
 import results_schema as rs  # noqa: E402
-from kaggle_setup import capture_provenance, write_json_atomic  # noqa: E402
+from kaggle_setup import (capture_provenance,  # noqa: E402
+                          write_json_atomic, write_results_json)
 from reproducibility import verify_record  # noqa: E402
 
 
@@ -96,6 +97,36 @@ def test_compute_integrity_does_not_mutate_payload(tmp_path):
     block = rs.compute_integrity(payload)
     assert payload == before
     assert block['algorithm'] == rs.INTEGRITY_ALGORITHM
+
+
+def test_shared_writer_seals_mapping_payloads_and_reseals_sanitized_data(
+        tmp_path):
+    # Legacy dict-style records (provenance sidecars, run records, the
+    # overfit-gate report) now carry the same content digest as an
+    # envelope, so a later edit is detectable without changing their
+    # historical layout.
+    payload = {
+        'kind': 'legacy_report',
+        'metadata': {'note': 'kept as a dict'},
+        'results': [{'value': 1.5}],
+    }
+    path = tmp_path / 'legacy.json'
+    write_results_json(payload, str(path))
+    with open(path, encoding='utf-8') as fh:
+        sealed = json.load(fh)
+    assert rs.verify_integrity(sealed)['status'] == 'ok'
+    assert sealed['kind'] == 'legacy_report'
+
+    # Sanitization must happen BEFORE the digest is computed; otherwise
+    # the null substitution would invalidate the just-written digest.
+    nan_path = tmp_path / 'nan.json'
+    write_results_json({'value': float('nan'), 'nested': [float('inf')]},
+                       str(nan_path))
+    with open(nan_path, encoding='utf-8') as fh:
+        nan_sealed = json.load(fh)
+    assert nan_sealed['value'] is None
+    assert nan_sealed['nested'] == [None]
+    assert rs.verify_integrity(nan_sealed)['status'] == 'ok'
 
 
 def test_cli_checks_integrity_and_can_require_it(tmp_path, capsys):

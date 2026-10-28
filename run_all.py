@@ -1257,6 +1257,49 @@ def run_all(seeds=None, steps=None):
                           indent=2, allow_nan=False)
         print('\nSaved: results/summary.json')
 
+        # Final campaign entry: bind the synthesis (summary + prospective
+        # design manifest + generated figures) into the append-only ledger.
+        # Per-experiment entries already hash their own result files; this
+        # line makes the campaign-level claims checkable too.
+        try:
+            from kaggle_setup import (append_run_manifest,
+                                      make_run_manifest_entry)
+            campaign_artifacts = {
+                'summary': 'results/summary.json',
+                'experiment_design': 'results/experiment_design.json',
+            }
+            for fig_path in sorted(glob.glob('figures/*')):
+                if os.path.isfile(fig_path):
+                    campaign_artifacts[
+                        f'figure:{os.path.basename(fig_path)}'] = fig_path
+            append_run_manifest(make_run_manifest_entry(
+                experiment='run_all_campaign',
+                seeds=[],
+                provenance=summary.get('env'),
+                hyperparameters={
+                    'run_profile': summary.get('run_profile'),
+                    'seeds': summary.get('seeds'),
+                },
+                data={
+                    'kind': 'campaign_directory',
+                    'n_runs': len(summary.get('runs') or []),
+                },
+                artifacts=campaign_artifacts,
+                results={
+                    'n_ok': summary.get('n_ok'),
+                    'n_fail': summary.get('n_fail'),
+                    'total_time_s': summary.get('total_time_s'),
+                },
+                status=('completed' if not summary.get('n_fail')
+                        else 'partial'),
+            ))
+            print('Saved: results/run_manifest.jsonl (campaign entry)')
+        except Exception as exc:
+            # The ledger is bookkeeping; a failure to append the campaign
+            # line must not invalidate the experiment outputs themselves.
+            print(f'[run_all] WARNING: could not append campaign manifest '
+                  f'entry: {type(exc).__name__}: {exc}')
+
         # Return the summary AND a non-zero exit code when any run
         # failed. Return the summary dict so programmatic callers
         # (notebook, downstream scripts) can inspect ``n_fail``, and

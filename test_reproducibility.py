@@ -31,10 +31,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (  # noqa: E402
     append_run_manifest,
     audit_split,
+    file_sha256,
     grad_flow_report,
     largest_remainder_sizes,
     make_run_manifest_entry,
     make_seeded_generator,
+    manifest_entry_sha256,
     parse_int_env,
     recipe_sha256,
     seed_worker,
@@ -1050,6 +1052,113 @@ def test_manifest_append_is_strict_jsonl_and_env_resolved(monkeypatch,
     append_run_manifest(e1)
     assert json.loads(
         env_path.read_text().splitlines()[0])['experiment'] == 'a'
+
+
+def test_manifest_entry_digests_bind_artifacts_and_detect_edits(tmp_path):
+    import reproducibility
+
+    artifact = tmp_path / 'result.json'
+    artifact.write_text('{"value": 1}\n', encoding='utf-8')
+    entry = make_run_manifest_entry(
+        experiment='digest_probe', seeds=[7],
+        artifacts={'result': str(artifact)},
+        results={'value': 1})
+    assert entry['entry_sha256'] == manifest_entry_sha256(entry)
+    assert entry['artifact_digests']['result'] == {
+        'path': str(artifact),
+        'sha256': file_sha256(str(artifact)),
+        'n_bytes': artifact.stat().st_size,
+    }
+
+    manifest = tmp_path / 'run_manifest.jsonl'
+    append_run_manifest(entry, str(manifest))
+    report = reproducibility.verify_manifest_file(str(manifest))
+    assert report['status'] == 'verified'
+    assert report['entries'][0]['artifacts']['result']['status'] == 'ok'
+
+    # A byte change to an archived artifact is drift, not a warning.
+    artifact.write_text('{"value": 2}\n', encoding='utf-8')
+    drifted = reproducibility.verify_manifest_file(str(manifest))
+    assert drifted['status'] == 'drift'
+    assert drifted['entries'][0]['artifacts']['result']['status'] == 'mismatch'
+
+    # Restoring the artifact leaves the entry digest valid; editing the
+    # ledger line itself (seeds) is then detected by entry_sha256.
+    artifact.write_text('{"value": 1}\n', encoding='utf-8')
+    edited = json.loads(manifest.read_text().splitlines()[0])
+    edited['seeds'] = [8]
+    entry_report = reproducibility.verify_manifest_entry(edited)
+    assert entry_report['status'] == 'drift'
+    assert entry_report['entry_sha256']['status'] == 'mismatch'
+
+    # A missing artifact is unverifiable rather than silently accepted.
+    artifact.unlink()
+    missing = reproducibility.verify_manifest_entry(entry)
+    assert missing['status'] == 'unverifiable'
+    assert missing['artifacts']['result']['status'] == 'missing'
+
+
+def test_manifest_relative_artifacts_resolve_from_campaign_root(
+        tmp_path, monkeypatch):
+    import reproducibility
+
+    campaign = tmp_path / 'campaign'
+    results_dir = campaign / 'results'
+    results_dir.mkdir(parents=True)
+    (results_dir / 'exp.json').write_text('{"n": 1}\n', encoding='utf-8')
+    manifest = results_dir / 'run_manifest.jsonl'
+    # The entry is created by a runner whose CWD is the campaign root.
+    monkeypatch.chdir(campaign)
+    entry = make_run_manifest_entry(
+        experiment='relative_probe', seeds=1,
+        artifacts={'result': 'results/exp.json'})
+    append_run_manifest(entry, str(manifest))
+
+    # Verification may run from any directory; the recorded path is
+    # relative to the campaign root, not to the caller.
+    monkeypatch.chdir(tmp_path)
+    report = reproducibility.verify_manifest_file(str(manifest))
+    assert report['status'] == 'verified'
+    assert report['artifact_base'] == str(campaign)
+    assert (report['entries'][0]['artifacts']['result']['resolved_path']
+            == str(results_dir / 'exp.json'))
+
+
+def test_manifest_legacy_entry_is_unverifiable(tmp_path, capsys):
+    import reproducibility
+
+    legacy = make_run_manifest_entry(experiment='legacy', seeds=1)
+    legacy.pop('entry_sha256', None)
+    legacy.pop('artifact_digests', None)
+    path = tmp_path / 'legacy.jsonl'
+    path.write_text(json.dumps(legacy) + '\n', encoding='utf-8')
+    report = reproducibility.verify_manifest_entry(legacy)
+    assert report['status'] == 'unverifiable'
+    assert reproducibility.main(['--manifest', str(path)]) == 2
+    capsys.readouterr()
+
+
+def test_manifest_cli_verified_and_tampered(tmp_path, capsys):
+    import reproducibility
+
+    artifact = tmp_path / 'artifact.json'
+    artifact.write_text('{"n": 1}\n', encoding='utf-8')
+    entry = make_run_manifest_entry(
+        experiment='cli_probe', seeds=3,
+        artifacts={'result': str(artifact)})
+    path = tmp_path / 'run_manifest.jsonl'
+    append_run_manifest(entry, str(path))
+
+    assert reproducibility.main(['--manifest', str(path)]) == 0
+    capsys.readouterr()
+    assert reproducibility.main(
+        ['--json', '--manifest', str(path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['manifests'][str(path)]['status'] == 'verified'
+
+    artifact.write_text('{"n": 2}\n', encoding='utf-8')
+    assert reproducibility.main(['--manifest', str(path)]) == 1
+    capsys.readouterr()
 
 
 def test_grad_flow_report_distinguishes_missing_and_zero_grads():

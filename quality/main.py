@@ -1337,14 +1337,7 @@ def main():
     other_rows = [r for r in all_results if r.get('task', 'mqar') != 'mqar']
     if 'mqar' in task_list:
         payload = {'metadata': _base_metadata(), 'results': mqar_rows}
-        try:
-            write_json_atomic(payload, 'results/exp4_mqar.json',
-                              indent=2, allow_nan=False)
-        except ValueError as e:
-            logger.error(f'non-finite value in payload; sanitizing to null: {e}')
-            write_json_atomic(sanitize_for_json(payload),
-                              'results/exp4_mqar.json',
-                              indent=2, allow_nan=False)
+        write_results_json(payload, 'results/exp4_mqar.json', logger=logger)
         logger.info('\nSaved: results/exp4_mqar.json')
     if other_rows:
         payload_b = {
@@ -1357,14 +1350,8 @@ def main():
             },
             'results': other_rows,
         }
-        try:
-            write_json_atomic(payload_b, 'results/exp4b_quality_tasks.json',
-                              indent=2, allow_nan=False)
-        except ValueError as e:
-            logger.error(f'non-finite value in payload; sanitizing to null: {e}')
-            write_json_atomic(sanitize_for_json(payload_b),
-                              'results/exp4b_quality_tasks.json',
-                              indent=2, allow_nan=False)
+        write_results_json(payload_b, 'results/exp4b_quality_tasks.json',
+                           logger=logger)
         logger.info('Saved: results/exp4b_quality_tasks.json')
     # Return non-zero if any op's training crashed (``'error' in r``), so
     # ``run_all._run`` records the experiment as ``status='fail'`` instead

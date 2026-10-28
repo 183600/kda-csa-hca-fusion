@@ -148,6 +148,50 @@ legitimate consequence of rerunning on another host. The campaign summary
 (`results/summary.json`) uses the same block, so its pass/fail list and
 timings are covered too.
 
+## Run-manifest binding
+
+The append-only run manifest (`results/run_manifest.jsonl`) is the
+campaign-level index. Each entry already records the experiment, seeds,
+recipe hash, data version, provenance and artifact paths. Two additions make
+that ledger independently checkable:
+
+* every existing artifact named in the entry is hashed at append time into
+  `artifact_digests` (`role -> {path, sha256, n_bytes}`), so replacing or
+  editing a result file after the run is visible;
+* the whole line is sealed with `entry_sha256`, computed over the canonical
+  JSON of every other field. Editing a seed, metric, path or provenance
+  value after the line was appended no longer passes unnoticed.
+
+Each runner appends its own entry; `run_all` finishes with a
+`run_all_campaign` line that digests `results/summary.json`, the prospective
+`results/experiment_design.json`, and every generated figure. That binds the
+synthesis and the visuals to the same ledger as the individual experiments.
+Relative artifact paths are resolved from the campaign root, so the check
+can be run from any directory.
+
+```bash
+# Verify the ledger: entry digests + every recorded artifact.
+python reproducibility.py --manifest results/run_manifest.jsonl
+
+# Machine-readable; may be combined with result-file checks.
+python reproducibility.py --json --manifest results/run_manifest.jsonl \
+    results/exp4_mqar.json
+```
+
+Exit codes use the same contract: `1` for a changed entry/artifact, `2` for
+a legacy line without digests, a missing/unreadable artifact, or a malformed
+line, `0` only when every entry and artifact verifies.
+
+The artifact digest is byte-level and deliberately changes if a JSON file is
+re-serialized; the envelope `integrity` digest is the formatting-neutral
+check. Both are tamper evidence, not signatures: they detect accidental or
+naive edits, not an adversary who rewrites the content and the stored digest.
+
+Mapping-style records written by the shared `kaggle_setup.write_results_json`
+helper (provenance sidecars, LM run records, the Exp 4 overfit-gate report)
+are sealed with the same envelope digest, so those files no longer depend on
+a separate schema envelope to be checkable.
+
 ## Cross-source comparability
 
 `run_budget_frontier.audit_join_sources()` joins measured rows from Exp 4,
@@ -194,9 +238,13 @@ path / rename sensitivity, non-source exclusion, no-git fallback), the
 commit/branch/dirty record, credential redaction, verifier statuses, and the
 Exp 9 `mixed_source_trees` verdict. `test_result_integrity.py` covers the
 envelope content digest (formatting neutrality, row/metadata/provenance
-tampering, legacy `missing`, `malformed`/`unsupported` statuses, and the
-`--check-integrity` CLI).
+tampering, legacy `missing`, `malformed`/`unsupported` statuses, the
+`--check-integrity` CLI, and the shared writer's sanitize-then-seal path).
+`test_reproducibility.py` covers the run-manifest binding
+(`artifact_digests`, `entry_sha256`, post-hoc artifact/ledger edits, legacy
+entries, and the `--manifest` CLI exit codes).
 
 ```bash
-pytest -q test_source_identity.py test_result_integrity.py
+pytest -q test_source_identity.py test_result_integrity.py \
+    test_reproducibility.py
 ```

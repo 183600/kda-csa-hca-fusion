@@ -1952,13 +1952,97 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
     }
 
 
+def file_sha256(path: str, *, chunk_size: int = 1 << 20) -> str:
+    """Return the lowercase SHA-256 of ``path``'s exact bytes.
+
+    Used to bind a run-manifest entry to the artifacts it produced. The
+    hash is over the bytes on disk (not a canonical re-serialization), so
+    pretty-printing a result file *does* change its artifact digest; that
+    is intentional for a byte-level archive check. The envelope
+    ``integrity`` digest is the formatting-neutral complement.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(int(chunk_size)), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_manifest_bytes(entry: dict) -> bytes:
+    """Canonical JSON bytes of a manifest entry without its own digest."""
+    import json
+
+    body = {k: v for k, v in entry.items() if k != 'entry_sha256'}
+    text = json.dumps(sanitize_for_json(body), sort_keys=True,
+                      separators=(',', ':'), allow_nan=False, default=str)
+    return text.encode('utf-8')
+
+
+def manifest_entry_sha256(entry: dict) -> str:
+    """Content digest of one run-manifest entry.
+
+    The digest covers every field except ``entry_sha256`` itself, including
+    the artifact digests and provenance block, so editing a seed, a metric,
+    or an artifact path after the line was appended is detectable. Like the
+    envelope integrity digest it is tamper evidence, not a signature.
+    """
+    import hashlib
+
+    if not isinstance(entry, dict):
+        raise TypeError(
+            f'manifest_entry_sha256 expects a dict, found '
+            f'{type(entry).__name__}')
+    return hashlib.sha256(_canonical_manifest_bytes(entry)).hexdigest()
+
+
+def _artifact_digests(artifacts) -> dict:
+    """Hash every existing file named in a role -> path mapping."""
+    digests = {}
+    if not isinstance(artifacts, dict):
+        return digests
+    for role, path in artifacts.items():
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            if not os.path.isfile(path):
+                continue
+            digests[str(role)] = {
+                'path': path,
+                'sha256': file_sha256(path),
+                'n_bytes': os.path.getsize(path),
+            }
+        except OSError:
+            # A missing/unreadable artifact is recorded by its absence;
+            # hashing must never be the reason a run fails to log itself.
+            continue
+    return digests
+
+
 def write_results_json(payload, target_path, *, indent=2, logger=None):
     """Shared "atomic write + sanitize-fallback" helper.
 
     Consolidates the ``try: write_json_atomic(allow_nan=False)
     except ValueError: write_json_atomic(sanitize_for_json(...))`` pattern
     so future changes land in one place.
+
+    Mapping payloads are sealed with ``results_schema.attach_integrity``
+    before writing, so a legacy dict-style record (provenance sidecar, run
+    record, overfit-gate report, ...) carries the same canonical content
+    digest as a schema envelope. Bare lists stay bare for backward
+    compatibility; their campaign-level identity is provided by the
+    run-manifest artifact digest.
     """
+    if isinstance(payload, dict):
+        try:
+            from results_schema import attach_integrity
+            payload = attach_integrity(payload)
+        except Exception as exc:  # pragma: no cover - defensive
+            if logger is not None:
+                logger.warning(
+                    f'could not attach content integrity to '
+                    f'{target_path}: {type(exc).__name__}: {exc}')
     try:
         write_json_atomic(payload, target_path, indent=indent,
                           allow_nan=False)
@@ -1982,12 +2066,25 @@ def write_results_json(payload, target_path, *, indent=2, logger=None):
         # ``default=str`` so the write still succeeds (the offending
         # value becomes its ``str()`` representation, which is enough
         # for debugging — the alternative is losing ALL results).
+        def _reseal(value):
+            # Sanitizing changes the content, so the earlier digest is
+            # stale. Recompute it over exactly what is about to be written.
+            if isinstance(value, dict):
+                try:
+                    from results_schema import attach_integrity
+                    return attach_integrity(value)
+                except Exception:  # pragma: no cover - defensive
+                    return value
+            return value
+
         try:
-            write_json_atomic(sanitize_for_json(payload), target_path,
-                              indent=indent, allow_nan=False)
+            write_json_atomic(_reseal(sanitize_for_json(payload)),
+                              target_path, indent=indent,
+                              allow_nan=False)
         except (TypeError, ValueError):
-            write_json_atomic(sanitize_for_json(payload), target_path,
-                              indent=indent, allow_nan=False, default=str)
+            write_json_atomic(_reseal(sanitize_for_json(payload)),
+                              target_path, indent=indent,
+                              allow_nan=False, default=str)
 
 
 # --------------------------------------------------------------------------
@@ -2043,9 +2140,16 @@ def make_run_manifest_entry(*, experiment: str, seeds, provenance=None,
             ``recipe_sha256`` identity is added alongside).
         data: data-version block (corpus fingerprints, split sizes, ...).
         artifacts: mapping of role -> path so every artifact is findable.
+            Existing files are also hashed into ``artifact_digests`` (role
+            -> path / sha256 / n_bytes), so a later edit is detectable.
         results: final numbers (loss/perplexity/accuracy/verdict, ...).
         status: ``'completed'`` / ``'failed'`` / ``'partial'``.
         manifest_version: schema version for forward compatibility.
+
+    The returned entry is sealed with ``entry_sha256`` over the canonical
+    JSON of every other field. ``reproducibility.py --manifest`` recomputes
+    it and re-hashes the artifacts to distinguish an untouched ledger from
+    a post-hoc edit or a replaced output.
     """
     import datetime
 
@@ -2054,6 +2158,7 @@ def make_run_manifest_entry(*, experiment: str, seeds, provenance=None,
     if provenance is None:
         provenance = capture_provenance()
     hyperparameters = sanitize_for_json(hyperparameters or {})
+    artifacts = sanitize_for_json(artifacts or {})
     entry = {
         'manifest_version': int(manifest_version),
         'experiment': str(experiment),
@@ -2064,10 +2169,18 @@ def make_run_manifest_entry(*, experiment: str, seeds, provenance=None,
         'recipe_sha256': recipe_sha256(hyperparameters),
         'hyperparameters': hyperparameters,
         'data': sanitize_for_json(data or {}),
-        'artifacts': sanitize_for_json(artifacts or {}),
+        'artifacts': artifacts,
+        # Byte-level identity of every artifact that existed when the entry
+        # was created. ``artifacts`` remains the backward-compatible
+        # role -> path mapping; this block adds the digest and size so a
+        # later edit/replacement is detectable.
+        'artifact_digests': _artifact_digests(artifacts),
         'results': sanitize_for_json(results or {}),
         'provenance': provenance,
     }
+    # Seal the line last, after every field is fixed. A reader can recompute
+    # the digest over the canonical entry and detect post-hoc edits.
+    entry['entry_sha256'] = manifest_entry_sha256(entry)
     return entry
 
 

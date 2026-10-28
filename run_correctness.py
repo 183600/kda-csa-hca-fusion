@@ -15,7 +15,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kaggle_setup import configure_torch_for_device, sanitize_for_json, write_json_atomic
+from kaggle_setup import (append_run_manifest, capture_provenance,
+                          configure_torch_for_device, make_run_manifest_entry,
+                          sanitize_for_json, write_json_atomic)
 
 from checks._shared import *  # noqa: F401,F403
 from checks.kda import *  # noqa: F401,F403
@@ -261,6 +263,37 @@ def main():
                           'results/exp1_correctness.json',
                           indent=2, allow_nan=False)
     logger.info('Saved: results/exp1_correctness.json')
+    # Bind the raw check list to the campaign ledger. The file itself is a
+    # bare array for backward compatibility, so the manifest artifact digest
+    # is its byte-level identity.
+    try:
+        provenance = capture_provenance()
+        append_run_manifest(make_run_manifest_entry(
+            experiment='exp1_correctness',
+            seeds=[],
+            provenance=provenance,
+            hyperparameters={
+                'device': str(device),
+                'n_checks': len(all_results),
+                'runner': 'run_correctness.main',
+            },
+            data={
+                'kind': 'operator_regression_suite',
+                'randomness': ('deterministic per-check seeds; no corpus '
+                               'file'),
+            },
+            artifacts={'results': 'results/exp1_correctness.json'},
+            results={
+                'passed': int(passed),
+                'total': int(len(all_results)),
+            },
+            status=('completed' if passed == len(all_results)
+                    else 'partial'),
+        ), logger=logger)
+    except Exception as exc:
+        logger.warning(
+            f'could not append the correctness run to the manifest: '
+            f'{type(exc).__name__}: {exc}')
     return 0 if passed == len(all_results) else 1
 
 

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (configure_torch_for_device, parse_int_env,
                           sanitize_for_json, write_json_atomic,
+                          write_results_json,
                           make_seeded_generator, set_global_seed,
                           capture_provenance, grad_flow_report,
                           make_run_manifest_entry, append_run_manifest)
@@ -40,7 +41,7 @@ from train_diagnostics import (
     snapshot_parameters,
     summarize_gradient_norms,
 )
-from results_schema import CURRENT_SCHEMA_VERSION
+from results_schema import CURRENT_SCHEMA_VERSION, attach_integrity
 
 logger = logging.getLogger(__name__)
 
