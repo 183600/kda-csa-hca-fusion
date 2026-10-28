@@ -651,6 +651,16 @@ def main() -> int:
         return 1
     print('\nSaved: results/exp14_indexer_selector.json '
           '(schema kind=exp14_indexer_selector)')
+    # Write the provenance sidecar BEFORE the manifest entry so its
+    # artifact digest is recorded in the same ledger line.
+    try:
+        prov = capture_provenance()
+        prov['seeds'] = metadata['seeds']
+        write_json_atomic(
+            prov, 'results/exp14_indexer_selector_provenance.json',
+            indent=2, allow_nan=False)
+    except Exception as e:  # pragma: no cover - side file only
+        print(f'[exp14] WARNING: failed to write provenance: {e}')
     append_run_manifest(make_run_manifest_entry(
         experiment='exp14_indexer_selector',
         seeds=0,
@@ -682,14 +692,6 @@ def main() -> int:
             'guard_ok': True,
         },
     ))
-    try:
-        prov = capture_provenance()
-        prov['seeds'] = metadata['seeds']
-        write_json_atomic(
-            prov, 'results/exp14_indexer_selector_provenance.json',
-            indent=2, allow_nan=False)
-    except Exception as e:  # pragma: no cover - side file only
-        print(f'[exp14] WARNING: failed to write provenance: {e}')
     return 0
 
 
