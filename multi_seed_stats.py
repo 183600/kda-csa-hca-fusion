@@ -490,6 +490,73 @@ def _binomial_tail_root(n: int, k: int, target: float) -> float:
     return math.exp(0.5 * (lo + hi))
 
 
+def _binomial_log_sf(n: int, k: int, p: float) -> float:
+    """``log P(Binomial(n, p) >= k)`` for a small ``k``.
+
+    Sums the upper tail directly in log space.  The lower-tail root
+    ``P(X <= k-1) = 1 - alpha/2`` cannot be solved by bisection for
+    sub-epsilon ``alpha`` because ``1 - alpha/2`` rounds to exactly 1.0;
+    this survival-function form keeps the requested tail probability.
+    Terms are evaluated by the ratio recurrence, so no huge log-gamma
+    difference or ``n * log1p(-p)`` product is formed.
+    """
+    if k <= 0:
+        return 0.0
+    if p <= 0.0:
+        return -math.inf
+    if p >= 1.0:
+        return 0.0
+    if k >= n:
+        return n * math.log(p)
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
+    log_comb = 0.0
+    for i in range(1, k + 1):
+        log_comb += math.log(n - i + 1)
+    log_comb -= math.lgamma(k + 1)
+    n_log_q = math.log(n) + math.log(-log_q)
+    n_q_term = -math.exp(n_log_q) if n_log_q <= 709.0 else -math.inf
+    log_term = log_comb + k * log_p + n_q_term - k * log_q
+    if not math.isfinite(log_term):
+        return log_term
+    term = 1.0
+    total = 1.0
+    i = k
+    while i < n:
+        log_ratio = (math.log(n - i) - math.log(i + 1)
+                     + log_p - log_q)
+        term *= math.exp(log_ratio)
+        total += term
+        i += 1
+        if term <= total * 1e-18:
+            break
+    return log_term + math.log(total)
+
+
+def _binomial_sf_root(n: int, k: int, target: float) -> float:
+    """Solve ``P(Binomial(n, p) >= k) = target`` for a small ``k``."""
+    if target <= 0.0:
+        return 0.0
+    if target >= 1.0:
+        return 1.0
+    log_hi = math.log(k) - math.log(n)
+    if log_hi < _MIN_LOG_PROB:
+        # The root is below the smallest positive float.
+        return 0.0
+    lo = _MIN_LOG_PROB
+    hi = log_hi
+    log_target = math.log(target)
+    if _binomial_log_sf(n, k, math.exp(lo)) > log_target:
+        return 0.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if _binomial_log_sf(n, k, math.exp(mid)) > log_target:
+            hi = mid
+        else:
+            lo = mid
+    return math.exp(0.5 * (lo + hi))
+
+
 def _normal_beta_quantile(q: float, a: int, b: int) -> float:
     """Normal-moment approximation to a Beta quantile for huge shapes.
 
@@ -521,16 +588,16 @@ def _normal_beta_quantile(q: float, a: int, b: int) -> float:
 
 def _small_tail_proportion_ci(k: int, n: int, alpha: float) -> tuple:
     if k <= n - k:
-        low = 0.0 if k == 0 else _binomial_tail_root(
-            n, k - 1, 1.0 - alpha / 2.0)
+        low = 0.0 if k == 0 else _binomial_sf_root(
+            n, k, alpha / 2.0)
         high = 1.0 if k == n else _binomial_tail_root(
             n, k, alpha / 2.0)
         return low, high
     kk = n - k
     low = 1.0 - (1.0 if kk == n else _binomial_tail_root(
         n, kk, alpha / 2.0))
-    high = 1.0 - (0.0 if kk == 0 else _binomial_tail_root(
-        n, kk - 1, 1.0 - alpha / 2.0))
+    high = 1.0 - (0.0 if kk == 0 else _binomial_sf_root(
+        n, kk, alpha / 2.0))
     return low, high
 
 
@@ -567,12 +634,15 @@ def binomial_proportion_ci(k, n, *, alpha: float = 0.05) -> dict:
     elif n > _LARGE_BINOMIAL_N:
         low = (0.0 if k == 0 else
                _normal_beta_quantile(alpha / 2.0, k, n - k + 1))
-        high = (1.0 if k == n else
-                _normal_beta_quantile(1.0 - alpha / 2.0, k + 1, n - k))
+        # Upper bound by symmetry: BetaInv(1 - q; a, b) =
+        # 1 - BetaInv(q; b, a). This avoids ``1 - alpha/2`` rounding to
+        # exactly 1.0 (which returned a spurious upper bound of 1.0).
+        high = (1.0 if k == n else 1.0 - _normal_beta_quantile(
+            alpha / 2.0, n - k, k + 1))
     else:
         low = 0.0 if k == 0 else _beta_quantile(alpha / 2.0, k, n - k + 1)
-        high = 1.0 if k == n else _beta_quantile(
-            1.0 - alpha / 2.0, k + 1, n - k)
+        high = 1.0 if k == n else 1.0 - _beta_quantile(
+            alpha / 2.0, n - k, k + 1)
     # Guard against a last-ulp inversion on extreme shapes.
     low = min(max(low, 0.0), 1.0)
     high = min(max(high, 0.0), 1.0)
@@ -774,26 +844,23 @@ def exact_test_resolution(n_pairs, *, alpha: float = 0.05,
 
     min_raw = _min_effective(1)
     min_holm = _min_effective(family_size)
-    if p_min <= 0.0:
-        # The floor underflowed, so ``alpha / p_min`` would be infinite and
-        # returning None would hide a well-defined (if enormous) answer. The
-        # largest supported family is floor(alpha * 2**n_eff / sided); build
-        # it with integer/Fraction arithmetic for every practical n_eff and
-        # refuse only a shift so large that the integer itself is absurd.
-        if n_eff <= 1_000_000:
-            max_family = int(
-                (alpha_frac * (1 << n_eff) / sided).__floor__())
-        else:
-            max_family = None
+    # The largest supported family is floor(alpha * 2**n_eff / sided).
+    # Build it with exact integer/Fraction arithmetic for every practical
+    # n_eff, not only when the float floor underflowed: for n_eff in
+    # 1024..1030 ``p_min`` is a rounded exp(log_floor), so ``alpha / p_min``
+    # inherits its relative error and lands one comparison below the exact
+    # boundary. Refuse only a shift so large that the integer itself is
+    # absurd.
+    if n_eff <= 1_000_000:
+        max_family = int(
+            (alpha_frac * (1 << n_eff) / sided).__floor__())
+    elif p_min <= 0.0:
+        max_family = None
     else:
         ratio = alpha / p_min
         if math.isfinite(ratio):
             max_family = int(math.floor(ratio))
         else:
-            # ``alpha / p_min`` overflowed for a tiny (but positive) floor.
-            # The true quotient is still an ordinary (if enormous) integer;
-            # compute its floor exactly from the float representations rather
-            # than returning None or crashing in int(inf).
             max_family = int(
                 (alpha_frac / Fraction.from_float(p_min)).__floor__())
     return {
@@ -1479,7 +1546,7 @@ def tost_from_summary(mean_diff, sd_diff, n_pairs: int, margin: float,
     p_lower = student_t_sf(t_lower, dof)
     p_upper = student_t_cdf(t_upper, dof)
     p = min(1.0, max(0.0, max(p_lower, p_upper)))
-    half = _t_quantile(1.0 - alpha, dof) * se
+    half = _positive_t_quantile(alpha, dof) * se
     ci_lo, ci_hi = mean - half, mean + half
     # A finite mean/SD can still produce an interval endpoint beyond the
     # float range (half ~1e308).  ``inf`` is not JSON-serializable, so an
@@ -1524,7 +1591,7 @@ def equivalence_margin_supported(diffs, alpha: float = 0.05) -> float | None:
     if sd is None or sd <= 0.0:
         return abs(mean)
     se = sd / math.sqrt(n)
-    supported = abs(mean) + _t_quantile(1.0 - alpha, n - 1) * se
+    supported = abs(mean) + _positive_t_quantile(alpha, n - 1) * se
     # The true infimum can exceed the float range for extreme finite
     # differences; ``inf`` cannot be stored in the strict-JSON record.
     return supported if math.isfinite(supported) else None
@@ -1579,6 +1646,23 @@ def holm_adjust(p_values, alpha: float = 0.05) -> dict:
 _ND = NormalDist()
 
 
+def _normal_upper_quantile(tail: float) -> float:
+    """Standard-normal ``z`` with upper-tail probability ``tail``.
+
+    ``NormalDist.inv_cdf(1 - tail)`` loses all tail precision once
+    ``tail`` is below the float spacing at 1 (and raises for tail < 5e-17
+    because ``1 - tail`` rounds to exactly 1.0). Mirroring the tail first
+    keeps the relative accuracy for sub-epsilon alphas.
+    """
+    if tail <= 0.0:
+        return math.inf
+    if tail >= 1.0:
+        return -math.inf
+    if tail >= 1e-8:
+        return _ND.inv_cdf(1.0 - tail)
+    return -_ND.inv_cdf(tail)
+
+
 def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
                           power: float = 0.8,
                           alternative: str = 'two-sided') -> float | None:
@@ -1603,8 +1687,9 @@ def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
             f"got {alternative!r}")
     if n < 2:
         return None
-    z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
-        else _ND.inv_cdf(1.0 - alpha)
+    z_crit = (_normal_upper_quantile(alpha / 2.0)
+              if alternative == 'two-sided'
+              else _normal_upper_quantile(alpha))
     z_power = _ND.inv_cdf(power)
     value = (z_crit + z_power) * sd / _sqrt_count(n)
     # A finite SD can still exceed the representable MDE range; the module
@@ -1640,8 +1725,9 @@ def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
         return None
     if not math.isfinite(dz) or dz == 0.0:
         return None
-    z_crit = _ND.inv_cdf(1.0 - alpha / 2.0) if alternative == 'two-sided' \
-        else _ND.inv_cdf(1.0 - alpha)
+    z_crit = (_normal_upper_quantile(alpha / 2.0)
+              if alternative == 'two-sided'
+              else _normal_upper_quantile(alpha))
     z_power = _ND.inv_cdf(power)
     try:
         required = ((z_crit + z_power) / abs(dz)) ** 2
@@ -1727,14 +1813,14 @@ def power_at_effect(n: int, sd: float, effect: float,
         return 1.0 if effect < 0.0 else 0.0
     ncp = effect / se
     if alternative == 'two-sided':
-        z_crit = _ND.inv_cdf(1.0 - alpha / 2.0)
+        z_crit = _normal_upper_quantile(alpha / 2.0)
         power = ((1.0 - _ND.cdf(z_crit - abs(ncp)))
                  + _ND.cdf(-z_crit - abs(ncp)))
     elif alternative == 'greater':
-        z_crit = _ND.inv_cdf(1.0 - alpha)
+        z_crit = _normal_upper_quantile(alpha)
         power = 1.0 - _ND.cdf(z_crit - ncp)
     else:
-        z_crit = _ND.inv_cdf(1.0 - alpha)
+        z_crit = _normal_upper_quantile(alpha)
         power = _ND.cdf(-z_crit - ncp)
     return min(1.0, max(0.0, float(power)))
 
@@ -2141,7 +2227,7 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     ci_lo = ci_hi = None
     if n >= 2 and sd is not None and sd > 0.0:
         # Two-sided t critical value via bisection on the forward CDF.
-        crit = _t_quantile(1.0 - alpha / 2.0, n - 1)
+        crit = _positive_t_quantile(alpha / 2.0, n - 1)
         half = crit * sd / math.sqrt(n)
         ci_lo, ci_hi = mean - half, mean + half
         # Finite inputs can produce a half-width beyond the float range;
@@ -2211,6 +2297,12 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
 
 def _positive_t_quantile(q: float, dof: int) -> float:
     """Upper-tail t quantile ``x > 0`` with ``P(T > x) = q`` (q < 1/2)."""
+    if q <= 0.0:
+        # The requested tail is below the smallest representable
+        # probability; the limiting critical value is unbounded.
+        return math.inf
+    if q == 0.5:
+        return 0.0
     lo, hi = 0.0, 1.0
     while student_t_sf(hi, dof) > q:
         hi *= 2.0

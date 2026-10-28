@@ -6,6 +6,7 @@ from ._shared import *  # noqa: F401,F403
 
 
 _T_PP = None
+_T_ISF = None
 
 
 def _t_crit_975(n):
@@ -35,7 +36,7 @@ def _t_crit_975(n):
     The scipy availability check runs once and is cached in ``_T_PP`` so
     repeated calls are essentially free.
     """
-    global _T_PP
+    global _T_PP, _T_ISF
     if n < 2:
         # The CI is undefined for n<2 (zero degrees of freedom); ``None``
         # propagates as "undefined" and the t-test guard already handles it
@@ -45,8 +46,10 @@ def _t_crit_975(n):
         try:
             from scipy.stats import t as _t_dist
             _T_PP = _t_dist.ppf
+            _T_ISF = _t_dist.isf
         except ImportError:
             _T_PP = False
+            _T_ISF = False
     if _T_PP:
         return _T_PP(0.975, n - 1)
     # Hardcoded two-sided 95% critical values, n = 2..100 (df = 1..99),
@@ -140,15 +143,22 @@ def _bonferroni_crit_q(n, alpha=0.05):
     # numerically identical and lets the fallback stay upper-tail only.)
     if alpha > 0.5:
         return -_bonferroni_crit_q(n, 1.0 - alpha)
-    # Try scipy first (exact for any alpha / any n).
-    global _T_PP
+    # Try scipy first (exact for any alpha / any n). Use the inverse
+    # survival function rather than ``ppf(1 - alpha)``: for alpha below
+    # the float spacing at 1, ``1 - alpha`` rounds to exactly 1.0 and
+    # scipy returns ``inf`` even when the true quantile is representable.
+    global _T_PP, _T_ISF
     if _T_PP is None:
         try:
             from scipy.stats import t as _t_dist
             _T_PP = _t_dist.ppf
+            _T_ISF = _t_dist.isf
         except ImportError:
             _T_PP = False
+            _T_ISF = False
     if _T_PP:
+        if _T_ISF is not None:
+            return float(_T_ISF(alpha, n - 1))
         return float(_T_PP(1 - alpha, n - 1))
     # scipy unavailable: compute the Student-t quantile directly via the
     # regularized incomplete beta function and bisection. The numerical
