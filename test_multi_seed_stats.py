@@ -99,6 +99,31 @@ def test_student_t_survival_tail_stays_positive():
             'p_value'] > 0.0
 
 
+def test_student_t_sf_keeps_small_t_deviation_for_large_dof():
+    """``x = dof / (dof + t^2)`` must not round the tail away.
+
+    For large dof and small |t| the naive x rounds to exactly 1.0, so the
+    survival function used to return a spurious 0.5 (and the inverse CDF
+    correspondingly returned a quantile thousands of times too large).
+    The normal limit is accurate here: the t correction is
+    ``O(t / dof)``, far below the tolerance.
+    """
+    from multi_seed_stats import _t_quantile
+
+    for dof in (10 ** 5, 10 ** 6, 10 ** 7):
+        for t_value in (1e-6, 1e-4):
+            sf = M.student_t_sf(t_value, dof)
+            normal = 0.5 * math.erfc(t_value / math.sqrt(2.0))
+            assert sf == pytest.approx(normal, abs=1e-9)
+            assert sf < 0.5
+            assert math.isclose(M.student_t_cdf(t_value, dof) + sf, 1.0,
+                                rel_tol=1e-15)
+    # Upper-tail quantile for a CDF just above 0.5 (normal z ~ 2.5066e-9).
+    quantile = _t_quantile(0.5 + 1e-9, 10 ** 6)
+    assert quantile == pytest.approx(1e-9 * math.sqrt(2.0 * math.pi),
+                                     rel=1e-6)
+
+
 def test_student_t_and_leave_one_out_accept_oversized_json_ints():
     """Oversized JSON integers saturate at the infinite-tail limit and
     are rejected as a malformed equivalence margin, never OverflowError."""

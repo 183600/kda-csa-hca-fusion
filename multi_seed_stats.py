@@ -243,9 +243,30 @@ def _student_t_sf_positive(t_value: float, dof: int) -> float:
         return 0.5 * math.erfc(t_value / math.sqrt(2.0))
     t_sq = t_value * t_value
     if math.isfinite(t_sq):
-        x = dof / (dof + t_sq)
-        if x > 0.0:
-            return 0.5 * betainc_regularized(0.5 * dof, 0.5, x)
+        # The survival-function identity is
+        #     SF(t) = 0.5 * I_x(dof/2, 1/2),  x = dof / (dof + t^2).
+        # For small |t| and large dof, ``x`` rounds to exactly 1.0 even
+        # though ``1 - x`` is still representable: e.g. dof=999999,
+        # t=1e-6 gives x=1.0 and a spurious SF of exactly 0.5 instead of
+        # 0.4999996010578. When the incomplete beta would be evaluated on
+        # the near-1 side, form ``y = 1 - x = t^2 / (dof + t^2)`` directly
+        # (no cancellation) and use the symmetry
+        # ``I_x(a, b) = 1 - I_y(b, a)``. The branch threshold is the same
+        # one ``betainc_regularized`` uses internally, so ``I_y(b, a)`` is
+        # evaluated by its direct (non-complemented) continued fraction.
+        a = 0.5 * dof
+        b = 0.5
+        denom = dof + t_sq
+        if math.isfinite(denom):
+            y = t_sq / denom
+            if y < (b + 1.0) / (a + b + 2.0):
+                if y == 0.0:
+                    # |t| is below the representable deviation from 0.5.
+                    return 0.5
+                return 0.5 * (1.0 - betainc_regularized(b, a, y))
+            x = dof / denom
+            if x > 0.0:
+                return 0.5 * betainc_regularized(a, b, x)
     # ``t*t`` overflowed (or ``x`` underflowed to zero) even though the
     # tail itself can still be representable: for t=1e155, dof=1 the true
     # tail is 3.18e-156 but forming t**2 first returns 0. Use the x -> 0
