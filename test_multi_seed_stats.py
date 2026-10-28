@@ -406,6 +406,10 @@ def test_equivalence_margin_supported_matches_ci_half_width():
     assert M.equivalence_margin_supported([0.1]) is None
     # Zero variance: infimum is |mean| (strict inequality documented).
     assert M.equivalence_margin_supported([0.4] * 5) == pytest.approx(0.4)
+    # An SD beyond the float range makes the margin unrepresentable; it
+    # must not be reported as the zero-variance infimum |mean|.
+    assert M.equivalence_margin_supported(
+        [1.7e308, -1.7e308, 1.7e308]) is None
     with pytest.raises(ValueError):
         M.equivalence_margin_supported(d, alpha=0.5)
 

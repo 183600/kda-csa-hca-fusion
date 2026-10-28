@@ -1586,7 +1586,11 @@ def equivalence_margin_supported(diffs, alpha: float = 0.05) -> float | None:
         return None
     mean = _safe_mean(d)
     sd = _sample_sd(d, mean)
-    if sd is None or sd <= 0.0:
+    if sd is None:
+        # The sample SD exceeds the float range: the supported margin is
+        # unrepresentable, not the zero-variance infimum.
+        return None
+    if sd <= 0.0:
         return abs(mean)
     se = sd / math.sqrt(n)
     supported = abs(mean) + _positive_t_quantile(alpha, n - 1) * se
