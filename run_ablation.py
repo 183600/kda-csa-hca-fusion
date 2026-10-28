@@ -2052,9 +2052,11 @@ def _paired_contrast(accs_a: dict[int, float], accs_b: dict[int, float]):
     # numerically zero spread, so a real spread around a large common offset
     # is not mistaken for a flat sweep.
     std = _sample_sd(diffs, mean_diff)
-    if std is None:
-        std = 0.0
-    t_stat = (mean_diff / (std / math.sqrt(n))) if std > 0 else None
+    # ``_sample_sd`` returns None only when the true SD exceeds the float
+    # range (a genuinely zero-variance vector returns 0.0). Keep that
+    # undefined: storing 0.0 would make a TOST re-run read the contrast as
+    # a zero-variance point and fabricate an equivalence verdict.
+    t_stat = (mean_diff / (std / math.sqrt(n))) if std else None
     if all(d > 0 for d in diffs):
         unanimous = 'positive'
     elif all(d < 0 for d in diffs):

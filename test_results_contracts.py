@@ -1281,6 +1281,18 @@ def test_paired_contrast_keeps_a_finite_mean_under_sum_overflow():
     assert sd == 0.0 and t_stat is None
 
 
+def test_paired_contrast_keeps_an_unrepresentable_sd_undefined():
+    """A finite mean with an overflowed SD is not a zero-variance sweep."""
+    d = 1.7e308
+    a = {0: d, 1: -d, 2: d}
+    b = {0: 0.0, 1: 0.0, 2: 0.0}
+    mean_diff, t_stat, n, unanimous, sd = _paired_contrast(a, b)
+    assert math.isfinite(mean_diff)
+    assert n == 3 and unanimous == 'mixed'
+    assert sd is None
+    assert t_stat is None
+
+
 def test_per_seed_filters_skip_oversized_json_integers():
     """A JSON int too large for float is a malformed seed, not a crash."""
     from run_quality import _finite_per_seed_acc
