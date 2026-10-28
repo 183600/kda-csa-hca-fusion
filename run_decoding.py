@@ -507,6 +507,12 @@ class KDAAttnDecoding(nn.Module):
             # Batch-size / device / dtype guards (mirrors KDAHybridLayer).
             if lookback.shape[0] != B:
                 lookback = None
+            elif tuple(lookback.shape) != (B, ksize - 1, d):
+                raise ValueError(
+                    'KDAAttnDecoding: conv_lookback.shape='
+                    f'{tuple(lookback.shape)} does not match the expected '
+                    f'{(B, ksize - 1, d)} ([B, ksize-1, d]). The lookback '
+                    'was likely persisted from a different kernel/geometry.')
             elif lookback.device != x.device or lookback.dtype != x.dtype:
                 lookback = lookback.to(device=x.device, dtype=x.dtype).detach()
             else:
