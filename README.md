@@ -72,6 +72,7 @@ eight-group experiment matrix.
 ├── ops_fused.py           # HybridConfig + build_mixer factory + HybridAttentionStack
 │                          #   (HybridKCHAttention kept as the compat name)
 ├── docs/mamba2-framework.md # Switchable KDA/Mamba-2 framework design document
+├── COMPARISON.md          # ops_* vs early toy implementation comparison
 ├── run_correctness.py     # 290+ regression checks (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
 ├── run_quality.py         # Exp 4: MQAR + kv-update/long-range/multi-agg probes (multi-seed)
@@ -494,8 +495,10 @@ caveat, and the corpus-fingerprint framing fix.
   sink (DeepSeek-V4 Eq. 27). `ops_csa._sliding_window_attention` is a
   standalone chunked helper (`O(chunk_t · win · c)` peak memory) for
   callers that do not need the joint softmax; it is numerically identical
-  to the unfold softmax path. The long-context experiments that need the
-  memory bound (notebook `gathered_attention`) chunk explicitly.
+  to the unfold softmax path. Long-context experiments that need the memory
+  bound call that chunked helper directly (`ops_csa._sliding_window_attention`
+  in `ops_csa.py`); the reference `naive_csa` / `naive_hca` paths remain
+  unfold-based.
 * **Incremental decoding cache (CSA / HCA).** The
   `ops_decoding_cache.CSADecodingCache` / `HCADecodingCache` enable
   token-by-token autoregressive decoding for CSA / HCA. The cache maintains
@@ -606,7 +609,7 @@ See `LICENSE`.
 相关实验数值会有变化，请用 `python run_all.py` 重新生成 `results/`。
 
 ### 为什么不替换原有ops
-对比见 `COMPARISON.md`：原有 `ops_kda/csa/hca` 已处理g clamp, STE, sink, NaN-safe, chunked SW, decoding cache等20+处边界case，比早期toy实现更适合发论文。因此保留原实现，仅增加训练管线。
+对比见 [COMPARISON.md](COMPARISON.md)：原有 `ops_kda/csa/hca` 已处理 g clamp、STE、sink、NaN-safe、chunked SW、decoding cache 等 20+ 处边界 case，比早期 toy 实现更适合发论文。因此保留原实现，仅增加训练管线。
 
 ### AutoDL一键运行
 ```bash
