@@ -258,6 +258,37 @@ def _betacf(a: float, b: float, x: float) -> float:
     return h
 
 
+def _betainc_regularized_from_logs(a: float, b: float, x: float,
+                                   y: float, log_x: float,
+                                   log_y: float) -> float:
+    """``I_x(a, b)`` with caller-supplied accurate ``log(x)``/``log(1-x)``."""
+    log_bt = -_log_beta(a, b) + a * log_x + b * log_y
+    bt = math.exp(log_bt)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, y) / b
+
+
+def _log_betainc_regularized_from_logs(a: float, b: float, x: float,
+                                       y: float, log_x: float,
+                                       log_y: float) -> float:
+    """``log(I_x(a, b))`` with caller-supplied accurate logs."""
+    log_bt = -_log_beta(a, b) + a * log_x + b * log_y
+    if x < (a + 1.0) / (a + b + 2.0):
+        h = _betacf(a, b, x)
+        if h > 0.0 and math.isfinite(log_bt):
+            log_ib = log_bt + math.log(h) - math.log(a)
+            if log_ib <= 0.0:
+                return log_ib
+    else:
+        h = _betacf(b, a, y)
+        if h > 0.0 and math.isfinite(log_bt):
+            log_iy = log_bt + math.log(h) - math.log(b)
+            if log_iy < 0.0:
+                return math.log1p(-math.exp(log_iy))
+    return _log_betainc_regularized(a, b, x)
+
+
 def betainc_regularized(a: float, b: float, x: float) -> float:
     """Regularized incomplete beta ``I_x(a, b)`` for ``a, b > 0``."""
     if not (a > 0.0 and b > 0.0):
@@ -310,7 +341,10 @@ def _student_t_sf_positive(t_value: float, dof: int) -> float:
                 return 0.5 * (1.0 - betainc_regularized(b, a, y))
             x = dof / denom
             if x > 0.0:
-                return 0.5 * betainc_regularized(a, b, x)
+                log_x = math.log1p(-y) if x > 0.5 else math.log(x)
+                log_y = math.log1p(-x) if y > 0.5 else math.log(y)
+                return 0.5 * _betainc_regularized_from_logs(
+                    a, b, x, y, log_x, log_y)
     # ``t*t`` overflowed (or ``x`` underflowed to zero) even though the
     # tail itself can still be representable: for t=1e155, dof=1 the true
     # tail is 3.18e-156 but forming t**2 first returns 0. Use the x -> 0
@@ -352,8 +386,11 @@ def _log_student_t_sf_positive(t_value: float, dof: int) -> float:
                 return math.log(0.5) + math.log1p(-math.exp(log_iy))
             x = dof / denom
             if x > 0.0:
+                log_x = math.log1p(-y) if x > 0.5 else math.log(x)
+                log_y = math.log1p(-x) if y > 0.5 else math.log(y)
                 return (math.log(0.5)
-                        + _log_betainc_regularized(a, b, x))
+                        + _log_betainc_regularized_from_logs(
+                            a, b, x, y, log_x, log_y))
     a = 0.5 * dof
     b = 0.5
     log_x = math.log(dof) - 2.0 * math.log(t_value)

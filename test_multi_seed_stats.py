@@ -141,6 +141,23 @@ def test_incomplete_beta_large_shapes_stay_normalized():
         assert left + right == pytest.approx(1.0, abs=1e-7)
 
 
+def test_student_t_sf_large_dof_keeps_extreme_tail_accuracy():
+    """The beta argument must be formed without cancelling ``1 - x``.
+
+    At dof=999999999 the t tail at t=30 is ~4.9e-198.  Passing
+    ``x = dof / (dof + t^2)`` to the incomplete beta made ``a*log(x)``
+    lose enough precision to shift that tail by ~2.5e-8 relative; using
+    ``log1p(-y)`` for the near-one argument removes the cancellation.
+    The reference values were computed with mpmath.betainc at 80 digits.
+    """
+    dof = 999_999_999
+    want = 4.90770984398472683348515126138e-198
+    assert M.student_t_sf(30.0, dof) == pytest.approx(want, rel=1e-9)
+    assert M.student_t_cdf(-30.0, dof) == pytest.approx(want, rel=1e-9)
+    assert M._log_student_t_sf_positive(30.0, dof) == pytest.approx(
+        -454.32104100671249389264460158, abs=1e-9)
+
+
 def test_student_t_sf_large_but_representable_dof_keeps_t_tail():
     """At dof=1e8 the t/normal gap is resolved, not rounded into the tail.
 
