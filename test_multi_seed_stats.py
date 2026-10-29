@@ -537,6 +537,19 @@ def test_seeds_required_hand_values_and_monotonicity():
     assert M.seeds_required(0.2) > M.seeds_required(0.4)
 
 
+def test_log_normal_upper_tail_switches_to_series_only_when_accurate():
+    """At z=8 the first omitted asymptotic term is ~1e-7 in the log tail.
+
+    The old switch at z>=8 therefore lost more than the float precision
+    that ``erfc`` still provides; the series is only competitive near
+    z=30.  Reference values are high-precision ``log(erfc(z/sqrt(2))/2)``.
+    """
+    assert M._log_normal_upper_tail(8.012569222908038) == pytest.approx(
+        -35.1155943082450935520211770204, abs=1e-12)
+    assert M._log_normal_upper_tail(30.0) == pytest.approx(
+        -454.321243956343197107355771338, abs=1e-10)
+
+
 def test_planning_handles_subnormal_two_sided_alpha():
     # alpha/2 underflows for subnormal alpha; the normal critical value is
     # still finite (~38.5) and planning must not collapse to None.

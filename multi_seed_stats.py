@@ -2108,7 +2108,7 @@ def _normal_upper_quantile(tail: float) -> float:
 
 def _log_normal_upper_tail(z: float) -> float:
     """``log P(Z > z)`` for large positive ``z`` without erfc underflow."""
-    if z < 8.0:
+    if z < 30.0:
         return math.log(0.5 * math.erfc(z / math.sqrt(2.0)))
     z2 = z * z
     inv = 1.0 / z2
