@@ -295,19 +295,20 @@ def _bonferroni_crit_q(n, alpha=0.05):
                         return math.log(0.5) + math.log1p(-ib)
                 x = dof / denom
                 ib = _betai(a, b, x)
-                if ib > 0.0:
+                if ib >= 2.2250738585072014e-308:
                     # Guard only against a last-bit overshoot from the
                     # continued fraction; the true regularized beta is in
                     # [0, 1].
                     return math.log(0.5) + math.log(min(ib, 1.0))
-                if x > 0.0 and x < (a + 1.0) / (a + b + 2.0):
-                    # ``_betai`` evaluates the direct continued fraction on
-                    # this side, so a zero means the regularized beta
-                    # underflowed to 0 (the true tail is below ~5e-324).
-                    # Re-evaluate the SAME quantity in log space instead of
-                    # falling through to the x -> 0 asymptote, which is only
-                    # valid for x near zero and returned a quantile near
-                    # 107 instead of 38 for dof=9999, alpha=1e-300.
+                if (x > 0.0 and x < (a + 1.0) / (a + b + 2.0)):
+                    # A subnormal (or zero) ``ib`` has too few significant
+                    # bits for ``log(ib)`` to locate the quantile; a zero
+                    # also used to fall through to the x -> 0 asymptote,
+                    # which is only valid for x near zero and returned a
+                    # quantile near 107 instead of 38 for dof=9999,
+                    # alpha=1e-300. Re-evaluate the SAME incomplete beta
+                    # in log space on this side (where the direct
+                    # continued fraction is the right branch).
                     log_bt = (
                         math.lgamma(a + b) - math.lgamma(a)
                         - math.lgamma(b)
@@ -316,6 +317,8 @@ def _bonferroni_crit_q(n, alpha=0.05):
                     if h > 0.0 and math.isfinite(log_bt):
                         log_ib = log_bt + math.log(h) - math.log(a)
                         return math.log(0.5) + log_ib
+                if ib > 0.0:
+                    return math.log(0.5) + math.log(min(ib, 1.0))
         # ``t**2`` overflowed or the incomplete beta underflowed. The true
         # x = dof / (dof + t^2) is then far below the smallest normal
         # float, so use the x -> 0 limit in log space:

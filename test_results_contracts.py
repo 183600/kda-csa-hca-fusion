@@ -1145,11 +1145,12 @@ def test_bonferroni_extreme_tail_stays_accurate_at_moderate_dof():
     saved = (stats._T_PP, stats._T_ISF)
     stats._T_PP = stats._T_ISF = False
     try:
-        for n, want in (
-                (10000, 38.3565190606602483467),
-                (1000, 54.3142111153478186114)):
-            got = _bonferroni_crit_q(n, alpha=1e-300)
-            assert abs(got - want) <= 1e-9 * want, (n, got, want)
+        for n, alpha, want in (
+                (10000, 1e-300, 38.3565190606602483467),
+                (1000, 1e-300, 54.3142111153478186114),
+                (10000, 5e-324, 39.936522488407604)):
+            got = _bonferroni_crit_q(n, alpha=alpha)
+            assert abs(got - want) <= 1e-9 * want, (n, alpha, got, want)
     finally:
         stats._T_PP, stats._T_ISF = saved
 
