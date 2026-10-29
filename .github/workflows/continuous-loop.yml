@@ -671,8 +671,54 @@ jobs:
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
           # improve 阶段特殊：不直调 opencode，改由 xuen 驱动（任务固定为 TASK_IMPROVE）
+          # ================= 前置测试门（pre-opencode test gate） =================
+          # 需求：每次 opencode 调用（testfix 测试修复类除外）之前，先跑一遍本仓库测试。
+          # 测试定义与 maybe_run_tests 的 /tmp/tg_run.sh 完全一致（退出码语义相同）：
+          #   42=无可识别测试 / 43=测试依赖环境不可用 / 124|137|143=测试超时 → 视为无法判定失败，放行。
+          # 明确失败 → 提交并推送当前状态（保存进度）→ 提前结束本 job（exit 86）：
+          #   后继 run 已由开头的 “Queue next run” 派发进 concurrency 队列，
+          #   并有收尾 next-run job 与 */15|*/30 心跳兜底，本 job 一结束下一个几秒内自动开始。
+          pre_phase_test() {
+            local phase="$1"
+            cat > /tmp/pretest_run.sh <<'PTGEOF'
+            set +e
+            [ -f ci_gate.py ] || exit 42
+            python3 ci_gate.py
+            exit $?
+          PTGEOF
+            local LOG=/tmp/pretest_gate.log
+            echo "=========== PRE-OPENCODE TEST GATE (phase=$phase) ==========="
+            local EC=0
+            timeout --kill-after=60 1500 bash /tmp/pretest_run.sh > "$LOG" 2>&1 || EC=$?
+            tail -25 "$LOG" 2>/dev/null || true
+            if [ "$EC" -eq 0 ]; then
+              echo "[pre-test] phase=$phase: 测试通过"
+              return 0
+            fi
+            case "$EC" in
+              42)  echo "[pre-test] phase=$phase: 本仓库无可识别测试(42)，放行"; return 0 ;;
+              43)  echo "[pre-test] phase=$phase: 测试依赖环境不可用(43)，放行"; return 0 ;;
+              124|137|143) echo "[pre-test] phase=$phase: 测试超时/中断($EC)，结果不确定，放行"; return 0 ;;
+            esac
+            echo "[pre-test] phase=$phase: 测试失败(exit=$EC) → 推送当前状态并提前结束本 job"
+            git add -A
+            git commit -m "auto: pre-opencode test gate failed (phase=$phase, exit=$EC)" \
+              || echo "[pre-test] 没有新内容可提交"
+            local BRANCH_PT="${GITHUB_REF_NAME:-master}"
+            git pull --rebase origin "$BRANCH_PT" 2>/dev/null || git rebase --abort 2>/dev/null || true
+            git push origin "HEAD:$BRANCH_PT" \
+              || echo "[pre-test] [warn] push 失败，收尾步骤(Final commit and push)会重试"
+            return 1
+          }
+
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
+            # ⭐ 前置测试门：除 testfix（测试修复类）外，任何阶段调用 opencode 前必须先过一次测试；
+            # 失败即推送当前状态并以 exit 86 提前结束本 job（后继 run 已在队列中，数秒内自动接续）。
+            case "$phase" in
+              testfix) : ;;
+              *) pre_phase_test "$phase" || exit 86 ;;
+            esac
             local attempt=0
             FAIL_COUNT=0
             RATE_COUNT=0
