@@ -124,6 +124,20 @@ def test_student_t_sf_keeps_small_t_deviation_for_large_dof():
                                      rel=1e-6)
 
 
+def test_t_quantile_resolves_subnormal_tail_and_keeps_paired_ci_finite():
+    from multi_seed_stats import _t_quantile
+
+    want = -196.03487687295737
+    assert _t_quantile(5e-324, 306) == pytest.approx(want, rel=1e-9)
+
+    summary = M.summarize_paired(
+        [0.1, 0.2, 0.3, 0.4, 0.5], alpha=5e-324, n_boot=20)
+    ci_lo, ci_hi = summary['ci95_mean_diff_t']
+    assert math.isfinite(ci_lo) and math.isfinite(ci_hi)
+    assert ci_lo < summary['mean_diff'] < ci_hi
+    json.dumps(summary, allow_nan=False)
+
+
 def test_student_t_and_leave_one_out_accept_oversized_json_ints():
     """Oversized JSON integers saturate at the infinite-tail limit and
     are rejected as a malformed equivalence margin, never OverflowError."""

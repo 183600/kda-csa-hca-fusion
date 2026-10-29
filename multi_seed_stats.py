@@ -285,6 +285,41 @@ def _student_t_sf_positive(t_value: float, dof: int) -> float:
     return 0.5 * math.exp(log_ib)
 
 
+def _log_student_t_sf_positive(t_value: float, dof: int) -> float:
+    if dof <= 0:
+        raise ValueError(f'student_t_sf requires dof > 0, got {dof!r}')
+    if t_value == 0.0:
+        return math.log(0.5)
+    if dof >= _NORMAL_T_DOF:
+        return _log_normal_upper_tail(t_value)
+    t_sq = t_value * t_value
+    if math.isfinite(t_sq):
+        denom = dof + t_sq
+        if math.isfinite(denom):
+            a = 0.5 * dof
+            b = 0.5
+            y = t_sq / denom
+            if y < (b + 1.0) / (a + b + 2.0):
+                if y == 0.0:
+                    return math.log(0.5)
+                log_iy = _log_betainc_regularized(b, a, y)
+                if log_iy >= 0.0:
+                    return -math.inf
+                return math.log(0.5) + math.log1p(-math.exp(log_iy))
+            x = dof / denom
+            if x > 0.0:
+                return (math.log(0.5)
+                        + _log_betainc_regularized(a, b, x))
+    a = 0.5 * dof
+    b = 0.5
+    log_x = math.log(dof) - 2.0 * math.log(t_value)
+    if log_x > _MIN_LOG_PROB:
+        log_x -= math.log1p(math.exp(log_x))
+    log_ib = (a * log_x - math.log(a)
+              - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)))
+    return math.log(0.5) + log_ib
+
+
 def student_t_cdf(t_value: float, dof: int) -> float:
     """CDF of Student's t with ``dof > 0`` degrees of freedom."""
     if dof <= 0:
@@ -2456,8 +2491,14 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     # t-based CI for the mean difference (companion to the bootstrap CI).
     ci_lo = ci_hi = None
     if n >= 2 and sd is not None and sd > 0.0:
-        # Two-sided t critical value via bisection on the forward CDF.
-        crit = _positive_t_quantile(alpha / 2.0, n - 1)
+        # Two-sided t critical value via bisection on the log survival
+        # function; ``alpha / 2`` underflows for a subnormal alpha.
+        half_alpha = alpha / 2.0
+        if half_alpha > 0.0:
+            crit = _positive_t_quantile(half_alpha, n - 1)
+        else:
+            crit = _positive_t_quantile_from_log(
+                math.log(alpha) - math.log(2.0), n - 1)
         # Scale the SD by sqrt(n) BEFORE multiplying by the critical value:
         # ``crit * sd`` can overflow even when the half-width
         # ``crit * (sd / sqrt(n))`` and both endpoints are representable.
@@ -2528,16 +2569,13 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     return record
 
 
-def _positive_t_quantile(q: float, dof: int) -> float:
-    """Upper-tail t quantile ``x > 0`` with ``P(T > x) = q`` (q < 1/2)."""
-    if q <= 0.0:
-        # The requested tail is below the smallest representable
-        # probability; the limiting critical value is unbounded.
-        return math.inf
-    if q == 0.5:
+def _positive_t_quantile_from_log(log_q: float, dof: int) -> float:
+    if log_q >= math.log(0.5):
         return 0.0
+    if log_q == -math.inf:
+        return math.inf
     lo, hi = 0.0, 1.0
-    while student_t_sf(hi, dof) > q:
+    while _log_student_t_sf_positive(hi, dof) > log_q:
         hi *= 2.0
         if not math.isfinite(hi):
             return math.inf
@@ -2545,11 +2583,20 @@ def _positive_t_quantile(q: float, dof: int) -> float:
         mid = 0.5 * (lo + hi)
         if mid <= lo or mid >= hi:
             break
-        if student_t_sf(mid, dof) > q:
+        if _log_student_t_sf_positive(mid, dof) > log_q:
             lo = mid
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+def _positive_t_quantile(q: float, dof: int) -> float:
+    """Upper-tail t quantile ``x > 0`` with ``P(T > x) = q`` (q < 1/2)."""
+    if q <= 0.0:
+        # The requested tail is below the smallest representable
+        # probability; the limiting critical value is unbounded.
+        return math.inf
+    return _positive_t_quantile_from_log(math.log(q), dof)
 
 
 def _t_quantile(p: float, dof: int) -> float:
