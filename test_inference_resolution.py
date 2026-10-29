@@ -312,6 +312,17 @@ def test_median_interval_tiny_alpha_does_not_overflow_or_overstate():
     assert r['ci_low'] is None and r['ci_high'] is None
     json.dumps(r, allow_nan=False)
 
+    # At the minimum sample size the full range is exactly admissible
+    # (tail 2**-1075 <= alpha/2); the log-space test must not reject a
+    # positive tail that merely rounds to zero in float space.
+    at_min = M.median_order_statistic_ci(list(range(1075)), alpha=5e-324)
+    assert at_min['k'] == 1
+    assert (at_min['ci_low'], at_min['ci_high']) == (0, 1074)
+
+    # A rounded-up tail must not admit an extra order statistic.
+    rounded = M.median_order_statistic_ci(list(range(1541)), alpha=5e-324)
+    assert rounded['k'] == 84
+
 
 # ---------------------------------------------------------------------------
 # summarize_paired integration

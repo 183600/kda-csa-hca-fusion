@@ -913,6 +913,9 @@ def median_order_statistic_ci(diffs, *, alpha: float = 0.05) -> dict:
     def _tail(k: int) -> float:
         return betainc_regularized(n - k + 1, k, 0.5)
 
+    def _log_tail(k: int) -> float:
+        return _log_betainc_regularized(n - k + 1, k, 0.5)
+
     k_best = 0
     tail_best = None
     lo, hi = 1, (n + 1) // 2
@@ -922,12 +925,15 @@ def median_order_statistic_ci(diffs, *, alpha: float = 0.05) -> dict:
     # every tail computed as <= 1e-15 and returned an interval whose true
     # coverage was far below 1 - alpha.
     threshold = alpha / 2.0
-    slack = threshold * 1e-12
+    if threshold > 0.0:
+        log_threshold = math.log(threshold)
+    else:
+        log_threshold = math.log(alpha) - math.log(2.0)
+    log_slack = math.log1p(1e-12)
     while lo <= hi:
         mid = (lo + hi) // 2
-        tail = _tail(mid)
-        if tail <= threshold + slack:
-            k_best, tail_best = mid, tail
+        if _log_tail(mid) <= log_threshold + log_slack:
+            k_best, tail_best = mid, _tail(mid)
             lo = mid + 1
         else:
             hi = mid - 1
