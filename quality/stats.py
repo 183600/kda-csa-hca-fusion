@@ -300,6 +300,22 @@ def _bonferroni_crit_q(n, alpha=0.05):
                     # continued fraction; the true regularized beta is in
                     # [0, 1].
                     return math.log(0.5) + math.log(min(ib, 1.0))
+                if x > 0.0 and x < (a + 1.0) / (a + b + 2.0):
+                    # ``_betai`` evaluates the direct continued fraction on
+                    # this side, so a zero means the regularized beta
+                    # underflowed to 0 (the true tail is below ~5e-324).
+                    # Re-evaluate the SAME quantity in log space instead of
+                    # falling through to the x -> 0 asymptote, which is only
+                    # valid for x near zero and returned a quantile near
+                    # 107 instead of 38 for dof=9999, alpha=1e-300.
+                    log_bt = (
+                        math.lgamma(a + b) - math.lgamma(a)
+                        - math.lgamma(b)
+                        + a * math.log(x) + b * math.log1p(-x))
+                    h = _betacf(a, b, x)
+                    if h > 0.0 and math.isfinite(log_bt):
+                        log_ib = log_bt + math.log(h) - math.log(a)
+                        return math.log(0.5) + log_ib
         # ``t**2`` overflowed or the incomplete beta underflowed. The true
         # x = dof / (dof + t^2) is then far below the smallest normal
         # float, so use the x -> 0 limit in log space:

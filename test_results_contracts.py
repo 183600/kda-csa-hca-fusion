@@ -1132,6 +1132,28 @@ def test_bonferroni_extreme_tail_is_not_truncated_at_t_squared_overflow():
         assert abs(got / want - 1.0) < 1e-10, (alpha, got, want)
 
 
+def test_bonferroni_extreme_tail_stays_accurate_at_moderate_dof():
+    """An underflowed incomplete beta must not fall back to x -> 0.
+
+    For n=10000 (dof=9999) and alpha=1e-300 the quantile is ~38.36, but
+    ``_betai`` underflows to exactly 0 a little above it.  The old code
+    then used the x -> 0 asymptote even though x=0.86, reporting ~107.
+    """
+    import quality.stats as stats
+    from run_quality import _bonferroni_crit_q
+
+    saved = (stats._T_PP, stats._T_ISF)
+    stats._T_PP = stats._T_ISF = False
+    try:
+        for n, want in (
+                (10000, 38.3565190606602483467),
+                (1000, 54.3142111153478186114)):
+            got = _bonferroni_crit_q(n, alpha=1e-300)
+            assert abs(got - want) <= 1e-9 * want, (n, got, want)
+    finally:
+        stats._T_PP, stats._T_ISF = saved
+
+
 def test_bonferroni_huge_dof_and_near_median_are_stable():
     """Huge dof must use the normal limit instead of flattening the tail.
 
