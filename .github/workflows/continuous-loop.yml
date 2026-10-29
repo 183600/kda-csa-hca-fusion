@@ -293,6 +293,9 @@ jobs:
           # SINGLE 与 SCI_1~6 一起进入随机池：命中时本轮 sci 做单因素实验检查。
           PROMPT_SINGLE='确保需要是单因素实验的实验都是单因素实验。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_CLEAN='整理仓库：确保仓库里没有实验产物文件（REPORT*.md、临时图表、.pyc、.opencode 残留、临时脚本等）；确保仓库里没有任何关于性能、预算、花费、修复了哪些bug的记录（包括注释）；删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README.md 是项目说明文档，同样必须保留，不能删除或移动；ci_gate.py 是 CI 质量门禁脚本；conftest.py / run_correctness.py / test_figures.py 是对拍测试套件；results_lm/ 是已提交的实验数据；2510.26692v2.pdf、2510.26692v2.txt、2606.19348v1.pdf、2606.19348v1.txt 是论文参考文献——以上全部必须原样保留，绝对不能删除、修改或移动。清理只针对多余内容，不要重构或改动源代码本身。'
+          # ================= 新增：docs 阶段提示词（每次循环 1/10 概率执行） =================
+          PROMPT_DOCS='优化这个项目的代码和文档。代码方面：只做不改变参考实现数值语义的重构（命名、注释、消除重复、结构清晰），保持公共接口（函数签名、HybridConfig 默认值、各 run_*.py 脚本的命令行参数）不变；每次改动后运行 python3 ci_gate.py 自检（含全量 pytest 对拍），不通过就自己修好。文档方面：改进 README.md 的表述、结构与示例；可以修改内容，但不得删除或移动文件，也不得添加关于性能、预算、花费或修复了哪些bug的记录。不要输出或写入“优化了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README.md、ci_gate.py、conftest.py、run_correctness.py、test_figures.py、results_lm/ 目录以及 2510.26692v2.pdf 等论文参考文件同样绝对不能删除、修改或移动。'
+
 
           # improve 阶段不直调 opencode，而是由 xuen 驱动（任务固定为：改进这个项目）。
           # xuen 会把任务 + 随机灵感词 + 想法区/产物区拼成提示词交给 opencode，
@@ -305,6 +308,8 @@ jobs:
           SCI_TIMEOUT=$((3*3600))      # 3h
           IMPROVE_TIMEOUT=$((3*3600))  # 3h
           CLEAN_TIMEOUT=$((3*3600))    # 3h
+          DOCS_TIMEOUT=$((3*3600))    # 3h（docs 阶段：优化代码与文档，1/10 概率执行）
+
 
           # ================= workflow 防删自愈 =================
           # opencode 的 clean 阶段可能把 .github 当作“多余内容”删除。
@@ -926,6 +931,33 @@ jobs:
 
               sleep 5
             done
+
+            # ================= 新增：docs 阶段（每次循环 1/10 概率执行） =================
+            # 每次循环迭代掷一次骰子：1/10 概率命中才执行「优化代码和文档」阶段。
+            # 未命中时直接跳过、不占用本轮预算；命中时复用既有 run_phase / 质量门禁 / commit 机制。
+            DOCS_ROLL=$(( RANDOM % 10 ))
+            if [ "$DOCS_ROLL" -eq 0 ]; then
+              echo "[info] docs 阶段命中 1/10 概率（roll=0），本轮执行代码与文档优化"
+              P="$PROMPT_DOCS"
+              T="$DOCS_TIMEOUT"
+              REMAIN=$(( DEADLINE - $(date +%s) ))
+              if [ "$REMAIN" -le 0 ]; then
+                echo "[info] 全局时间已到，跳过 docs 阶段"
+              else
+                if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
+                echo ">>> iteration #$i | phase=docs | budget=${T}s"
+                PHASE_BASE="$(git rev-parse HEAD)"
+                run_phase docs "$P" "$T"
+                # ---- 质量门禁：通过才提交；不通过则整段撤销 ----
+                if gate_check; then
+                  commit_and_push "$i-docs"
+                else
+                  reject_phase
+                fi
+              fi
+            else
+              echo "[info] docs 阶段未命中 1/10 概率（roll=$DOCS_ROLL），本轮跳过"
+            fi
           done
 
       - name: Cleanup repo artifacts
