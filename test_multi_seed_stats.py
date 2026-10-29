@@ -124,6 +124,36 @@ def test_student_t_sf_keeps_small_t_deviation_for_large_dof():
                                      rel=1e-6)
 
 
+def test_incomplete_beta_large_shapes_stay_normalized():
+    """The CF must not truncate at a fixed 200 iterations for large shapes.
+
+    ``I_{0.5}(a, a) = 0.5`` exactly for every shape; with a=1e6 the old
+    fixed iteration cap returned 0.499687, and at a=1e8 it returned a
+    negative probability. The large-shape log-beta path also needs the
+    Stirling ratio to avoid ``lgamma`` cancellation.
+    """
+    for a in (10 ** 4, 10 ** 6, 10 ** 8):
+        assert M.betainc_regularized(a, a, 0.5) == pytest.approx(
+            0.5, rel=1e-7)
+        x = 0.25
+        left = M.betainc_regularized(a, a, x)
+        right = M.betainc_regularized(a, a, 1.0 - x)
+        assert left + right == pytest.approx(1.0, abs=1e-7)
+
+
+def test_student_t_sf_large_but_representable_dof_keeps_t_tail():
+    """At dof=1e8 the t/normal gap is resolved, not rounded into the tail.
+
+    "Large dof" is not a licence to return the normal limit early: the
+    true sf(1, 1e8)=0.15865525514131067 differs from the normal value by
+    ~5.7e-8 relative, and ``lgamma`` cancellation in the incomplete-beta
+    prefactor used to produce exactly that error.
+    """
+    want = 0.15865525514131067
+    assert M.student_t_sf(1.0, 10 ** 8) == pytest.approx(want, rel=2e-12)
+    assert M.student_t_cdf(-1.0, 10 ** 8) == pytest.approx(want, rel=2e-12)
+
+
 def test_t_quantile_resolves_subnormal_tail_and_keeps_paired_ci_finite():
     from multi_seed_stats import _t_quantile
 

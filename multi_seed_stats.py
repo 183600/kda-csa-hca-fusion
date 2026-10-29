@@ -149,9 +149,11 @@ __all__ = [
 # Student-t distribution (forward CDF / survival function)
 # ---------------------------------------------------------------------------
 
-_MAX_BETACF_ITER = 200
+_MIN_BETACF_ITER = 200
+_MAX_BETACF_ITER = 100_000
 _BETACF_EPS = 3.0e-14
 _FPMIN = 1.0e-300
+_STABLE_LOG_BETA_MIN = 1.0e3
 _NORMAL_T_DOF = 1_000_000_000
 _MAX_EXACT_PERMUTATION_BITS = 20
 
@@ -179,6 +181,48 @@ def _float_count(n: int) -> float | None:
         return None
 
 
+def _log_gamma_ratio_asym(z: float, m: float) -> float:
+    """``logGamma(z + m) - logGamma(z)`` for large ``z``.
+
+    Subtracting two ``math.lgamma`` values loses about
+    ``eps * lgamma(z)`` absolute precision when ``z`` is large and ``m`` is
+    small.  Stirling's expansion keeps the small difference directly.
+    """
+    log_ratio = math.log1p(m / z)
+    out = m * (math.log(z) - 1.0) + (z + m - 0.5) * log_ratio
+    inv_z = 1.0 / z
+    inv_sum = 1.0 / (z + m)
+    out += (inv_sum - inv_z) / 12.0
+    out -= (inv_sum ** 3 - inv_z ** 3) / 360.0
+    return out
+
+
+def _log_beta(a: float, b: float) -> float:
+    """``log(Beta(a, b))`` with a cancellation-safe large-shape path."""
+    z, m = (a, b) if a >= b else (b, a)
+    if (z >= _STABLE_LOG_BETA_MIN and math.isfinite(z + m)):
+        return math.lgamma(m) - _log_gamma_ratio_asym(z, m)
+    # Keep the historical subtraction order and sign exactly: the callers
+    # used ``-(lgamma(a+b) - lgamma(a) - lgamma(b))`` for the log-beta.
+    return -(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b))
+
+
+def _betacf_max_iter(a: float, b: float) -> int:
+    """Enough CF iterations for the largest shape parameter.
+
+    The continued fraction needs roughly ``0.25 * sqrt(max(a, b))``
+    iterations near the distribution's mode; the old fixed cap of 200
+    truncated it for large shapes and could even return a negative
+    regularized beta.  Small shapes still converge in a few iterations and
+    exit early.
+    """
+    try:
+        scaled = 2.0 * math.sqrt(max(a, b)) + _MIN_BETACF_ITER
+    except (OverflowError, ValueError):
+        return _MAX_BETACF_ITER
+    return min(_MAX_BETACF_ITER, max(_MIN_BETACF_ITER, int(scaled)))
+
+
 def _betacf(a: float, b: float, x: float) -> float:
     """Continued fraction for the incomplete beta function (NR 6.4)."""
     qab, qap, qam = a + b, a + 1.0, a - 1.0
@@ -188,7 +232,7 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = _FPMIN
     d = 1.0 / d
     h = d
-    for m in range(1, _MAX_BETACF_ITER + 1):
+    for m in range(1, _betacf_max_iter(a, b) + 1):
         m2 = 2 * m
         aa = m * (b - m) * x / ((qam + m2) * (a + m2))
         d = 1.0 + aa * d
@@ -223,7 +267,7 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
     if x >= 1.0:
         return 1.0
     bt = math.exp(
-        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        -_log_beta(a, b)
         + a * math.log(x) + b * math.log1p(-x)
     )
     if x < (a + 1.0) / (a + b + 2.0):
@@ -484,7 +528,7 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
     if x >= 1.0:
         return 0.0
     log_bt = (
-        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        -_log_beta(a, b)
         + a * math.log(x) + b * math.log1p(-x))
     if x < (a + 1.0) / (a + b + 2.0):
         h = _betacf(a, b, x)
@@ -496,7 +540,7 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
         return math.log(value) if value > 0.0 else -math.inf
     y = 1.0 - x
     log_bt = (
-        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        -_log_beta(a, b)
         + b * math.log(y) + a * math.log1p(-y))
     h = _betacf(b, a, y)
     if h > 0.0 and math.isfinite(log_bt):
