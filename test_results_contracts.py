@@ -1155,6 +1155,29 @@ def test_bonferroni_extreme_tail_stays_accurate_at_moderate_dof():
         stats._T_PP, stats._T_ISF = saved
 
 
+def test_bonferroni_nonfinite_scipy_isf_falls_back_to_exact_tail():
+    """A non-finite scipy tail is not proof that the quantile is infinite.
+
+    scipy's ``t.isf`` returns ``-inf`` for alpha=1e-300 at dof=9 and for
+    alpha=1e-315 at dof=29, although both quantiles are finite. The
+    dependency-free log-survival inversion resolves them.
+    """
+    import quality.stats as stats
+
+    saved = (stats._T_PP, stats._T_ISF)
+    stats._T_PP = stats._T_ISF = lambda *args, **kwargs: -math.inf
+    try:
+        for n, alpha, want in (
+                (10, 1e-300, 5.1494410746007657e+33),
+                (30, 1e-315, 358231200893.13226)):
+            got = stats._bonferroni_crit_q(n, alpha=alpha)
+            assert got == pytest.approx(want, rel=1e-9), (n, alpha, got)
+        with pytest.raises(ValueError):
+            stats._bonferroni_crit_q(2, alpha=1e-310)
+    finally:
+        stats._T_PP, stats._T_ISF = saved
+
+
 def test_bonferroni_huge_dof_and_near_median_are_stable():
     """Huge dof must use the normal limit instead of flattening the tail.
 

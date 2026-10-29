@@ -198,14 +198,13 @@ def _bonferroni_crit_q(n, alpha=0.05):
     if _T_PP:
         if _T_ISF is not None:
             value = float(_T_ISF(alpha, n - 1))
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"_bonferroni_crit_q: alpha={alpha!r} for n={n} needs "
-                    f"a critical value outside the float range")
+        else:
+            value = float(_T_PP(1 - alpha, n - 1))
+        if math.isfinite(value):
             return value
-        return float(_T_PP(1 - alpha, n - 1))
-    # scipy unavailable: compute the Student-t quantile directly via the
-    # regularized incomplete beta function and bisection. The numerical
+    # scipy unavailable, or its tail underflowed to +/-inf even though the
+    # true quantile is finite: compute the Student-t quantile directly via
+    # the regularized incomplete beta function and bisection. The numerical
     # integration below is dependency-free and accurate for the small seed
     # counts used by Exp4/Exp5.
     target_p = 1.0 - alpha
