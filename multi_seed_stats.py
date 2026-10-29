@@ -695,10 +695,11 @@ def _normal_beta_quantile(q: float, a: int, b: int, *,
     if q <= 0.0:
         if log_q is None:
             return 0.0
-        # ``alpha/2`` underflowed to zero. The normal quantile at the
-        # smallest positive float is the closest representable z for the
-        # subnormal-tail range (|z| is between ~37.6 and ~38.5 there).
-        q = 5e-324
+        z = -_normal_upper_quantile_from_log_tail(log_q)
+    else:
+        if q >= 1.0:
+            return 1.0
+        z = NormalDist().inv_cdf(q)
     if q >= 1.0:
         return 1.0
     total_float = _float_count(total)
@@ -710,7 +711,6 @@ def _normal_beta_quantile(q: float, a: int, b: int, *,
     variance = mean * (1.0 - mean) / (total_float + 1.0)
     if variance <= 0.0:
         return mean
-    z = NormalDist().inv_cdf(q)
     return min(max(mean + z * math.sqrt(variance), 0.0), 1.0)
 
 
@@ -1827,6 +1827,47 @@ def _normal_upper_quantile(tail: float) -> float:
     return -_ND.inv_cdf(tail)
 
 
+def _log_normal_upper_tail(z: float) -> float:
+    """``log P(Z > z)`` for large positive ``z`` without erfc underflow."""
+    if z < 8.0:
+        return math.log(0.5 * math.erfc(z / math.sqrt(2.0)))
+    z2 = z * z
+    inv = 1.0 / z2
+    series = (1.0 - inv + 3.0 * inv ** 2 - 15.0 * inv ** 3
+              + 105.0 * inv ** 4 - 945.0 * inv ** 5)
+    return (-0.5 * z2 - math.log(z) - 0.5 * math.log(2.0 * math.pi)
+            + math.log(series))
+
+
+def _normal_upper_quantile_from_log_tail(log_tail: float) -> float:
+    """Standard-normal ``z`` for an upper-tail probability given in logs."""
+    if log_tail >= 0.0:
+        return -math.inf
+    if log_tail == -math.inf:
+        return math.inf
+    if math.exp(log_tail) > 0.0:
+        return _normal_upper_quantile(math.exp(log_tail))
+    lo, hi = 0.0, 1.0
+    while _log_normal_upper_tail(hi) > log_tail:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _log_normal_upper_tail(mid) > log_tail:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _normal_twosided_critical(alpha: float) -> float:
+    """``z`` with two-sided normal tail ``alpha``, even if alpha/2 underflows."""
+    half = alpha / 2.0
+    if half > 0.0:
+        return _normal_upper_quantile(half)
+    return _normal_upper_quantile_from_log_tail(
+        math.log(alpha) - math.log(2.0))
+
+
 def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
                           power: float = 0.8,
                           alternative: str = 'two-sided') -> float | None:
@@ -1851,7 +1892,7 @@ def min_detectable_effect(n: int, sd: float, alpha: float = 0.05,
             f"got {alternative!r}")
     if n < 2:
         return None
-    z_crit = (_normal_upper_quantile(alpha / 2.0)
+    z_crit = (_normal_twosided_critical(alpha)
               if alternative == 'two-sided'
               else _normal_upper_quantile(alpha))
     z_power = _ND.inv_cdf(power)
@@ -1889,7 +1930,7 @@ def seeds_required(dz: float, alpha: float = 0.05, power: float = 0.8,
         return None
     if not math.isfinite(dz) or dz == 0.0:
         return None
-    z_crit = (_normal_upper_quantile(alpha / 2.0)
+    z_crit = (_normal_twosided_critical(alpha)
               if alternative == 'two-sided'
               else _normal_upper_quantile(alpha))
     z_power = _ND.inv_cdf(power)
@@ -1977,7 +2018,7 @@ def power_at_effect(n: int, sd: float, effect: float,
         return 1.0 if effect < 0.0 else 0.0
     ncp = effect / se
     if alternative == 'two-sided':
-        z_crit = _normal_upper_quantile(alpha / 2.0)
+        z_crit = _normal_twosided_critical(alpha)
         power = ((1.0 - _ND.cdf(z_crit - abs(ncp)))
                  + _ND.cdf(-z_crit - abs(ncp)))
     elif alternative == 'greater':

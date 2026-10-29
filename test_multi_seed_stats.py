@@ -452,6 +452,16 @@ def test_seeds_required_hand_values_and_monotonicity():
     assert M.seeds_required(0.2) > M.seeds_required(0.4)
 
 
+def test_planning_handles_subnormal_two_sided_alpha():
+    # alpha/2 underflows for subnormal alpha; the normal critical value is
+    # still finite (~38.5) and planning must not collapse to None.
+    mde = M.min_detectable_effect(1000, 1.0, alpha=5e-324)
+    assert mde is not None and 1.0 < mde < 1.5
+    seeds = M.seeds_required(0.5, alpha=5e-324)
+    assert seeds is not None and 6000 < seeds < 6300
+    assert M.power_at_effect(seeds, 1.0, 0.5, alpha=5e-324) >= 0.8
+
+
 def test_min_detectable_effect_decreases_with_seeds():
     mde_5 = M.min_detectable_effect(5, 0.1)
     mde_20 = M.min_detectable_effect(20, 0.1)
