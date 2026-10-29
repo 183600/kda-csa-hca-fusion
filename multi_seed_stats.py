@@ -207,6 +207,51 @@ def _log_beta(a: float, b: float) -> float:
     return -(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b))
 
 
+def _stirling_beta_correction(a: float, b: float, s: float) -> float:
+    """Stirling correction for ``log(Beta(a, b))`` at large shapes."""
+    ia, ib, isum = 1.0 / a, 1.0 / b, 1.0 / s
+    return ((ia + ib - isum) / 12.0
+            - (ia ** 3 + ib ** 3 - isum ** 3) / 360.0
+            + (ia ** 5 + ib ** 5 - isum ** 5) / 1260.0)
+
+
+def _log_beta_exponent(a: float, b: float, x: float) -> float:
+    """``log(x**a * (1-x)**b / Beta(a, b))`` without large cancellation."""
+    if min(a, b) < _STABLE_LOG_BETA_MIN:
+        return -_log_beta(a, b) + a * math.log(x) + b * math.log1p(-x)
+    s = a + b
+    if not math.isfinite(s):
+        return -_log_beta(a, b) + a * math.log(x) + b * math.log1p(-x)
+    y = 1.0 - x
+    log_x = math.log1p(-y) if x > 0.5 else math.log(x)
+    log_y = math.log1p(-x) if y > 0.5 else math.log(y)
+    if a <= b:
+        p = a / s
+        log_p = math.log(p)
+        log_q = math.log1p(-p)
+        ratio_x = (x - p) / p
+        log_ratio_x = (math.log1p(ratio_x) if -0.5 < ratio_x < 1.0
+                       else log_x - log_p)
+        ratio_y = (p - x) / (1.0 - p)
+        log_ratio_y = (math.log1p(ratio_y) if -0.5 < ratio_y < 1.0
+                       else log_y - log_q)
+    else:
+        q = b / s
+        log_q = math.log(q)
+        log_p = math.log1p(-q)
+        diff = math.fsum([1.0, -x, -q])
+        ratio_y = diff / q
+        log_ratio_y = (math.log1p(ratio_y) if -0.5 < ratio_y < 1.0
+                       else log_y - log_q)
+        ratio_x = -diff / (1.0 - q)
+        log_ratio_x = (math.log1p(ratio_x) if -0.5 < ratio_x < 1.0
+                       else log_x - log_p)
+    log_scale = (math.log(2.0 * math.pi) - math.log(s)
+                 - log_p - log_q)
+    return (a * log_ratio_x + b * log_ratio_y
+            - 0.5 * log_scale - _stirling_beta_correction(a, b, s))
+
+
 def _betacf_max_iter(a: float, b: float) -> int:
     """Enough CF iterations for the largest shape parameter.
 
@@ -297,10 +342,7 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
         return 0.0
     if x >= 1.0:
         return 1.0
-    bt = math.exp(
-        -_log_beta(a, b)
-        + a * math.log(x) + b * math.log1p(-x)
-    )
+    bt = math.exp(_log_beta_exponent(a, b, x))
     if x < (a + 1.0) / (a + b + 2.0):
         return bt * _betacf(a, b, x) / a
     return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
@@ -564,9 +606,7 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
         return -math.inf
     if x >= 1.0:
         return 0.0
-    log_bt = (
-        -_log_beta(a, b)
-        + a * math.log(x) + b * math.log1p(-x))
+    log_bt = _log_beta_exponent(a, b, x)
     if x < (a + 1.0) / (a + b + 2.0):
         h = _betacf(a, b, x)
         if h > 0.0 and math.isfinite(log_bt):
@@ -576,9 +616,12 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
         value = betainc_regularized(a, b, x)
         return math.log(value) if value > 0.0 else -math.inf
     y = 1.0 - x
-    log_bt = (
-        -_log_beta(a, b)
-        + b * math.log(y) + a * math.log1p(-y))
+    if min(a, b) >= _STABLE_LOG_BETA_MIN:
+        log_bt = _log_beta_exponent(b, a, y)
+    else:
+        log_bt = (
+            -_log_beta(a, b)
+            + b * math.log(y) + a * math.log1p(-y))
     h = _betacf(b, a, y)
     if h > 0.0 and math.isfinite(log_bt):
         log_iy = log_bt + math.log(h) - math.log(b)

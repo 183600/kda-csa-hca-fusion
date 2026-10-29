@@ -141,6 +141,20 @@ def test_incomplete_beta_large_shapes_stay_normalized():
         assert left + right == pytest.approx(1.0, abs=1e-7)
 
 
+def test_incomplete_beta_large_shapes_center_avoids_cancellation():
+    """``I_0.5(a,a)=0.5`` must survive a ~1e9-sized exponent cancellation.
+
+    The old prefactor formed ``a*log(x)+b*log(1-x)-log(Beta(a,b))`` from
+    two ~1e9 terms; at a=b=1e9 the result was 0.5000002187.  The Stirling
+    beta exponent keeps the center accurate to ~1e-11.
+    """
+    for a in (10 ** 8, 10 ** 9):
+        assert M.betainc_regularized(a, a, 0.5) == pytest.approx(
+            0.5, abs=1e-10)
+        assert M._log_betainc_regularized(a, a, 0.5) == pytest.approx(
+            math.log(0.5), abs=1e-10)
+
+
 def test_student_t_sf_large_dof_keeps_extreme_tail_accuracy():
     """The beta argument must be formed without cancelling ``1 - x``.
 
