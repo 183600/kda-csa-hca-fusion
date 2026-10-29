@@ -216,6 +216,18 @@ def test_clopper_pearson_subnormal_alpha_keeps_interval_endpoints():
     assert 0.0 < huge['ci_low'] < 0.5 < huge['ci_high'] < 1.0
 
 
+def test_clopper_pearson_extreme_alpha_resolves_lower_endpoint():
+    ci = M.binomial_proportion_ci(1, 1000, alpha=1e-300)
+    want = -math.expm1(math.log1p(-(1e-300 / 2.0)) / 1000.0)
+    assert ci['ci_low'] == pytest.approx(want, rel=1e-11)
+    assert 0.4 < ci['ci_high'] < 0.6
+
+    underflow = M.binomial_proportion_ci(1, 1000, alpha=5e-324)
+    assert underflow['ci_low'] == 0.0
+    assert 0.4 < underflow['ci_high'] < 0.6
+
+
+
 def test_clopper_pearson_small_tail_is_precise_for_large_n():
     n = 10 ** 18
     zero = M.binomial_proportion_ci(0, n)

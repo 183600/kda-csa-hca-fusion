@@ -472,6 +472,27 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
     return math.log(value) if value > 0.0 else -math.inf
 
 
+def _beta_quantile_log_space(log_q: float, a: float, b: float,
+                             hi: float) -> float:
+    x_min = 5e-324
+    log_lo = math.log(x_min)
+    log_hi = math.log(hi)
+    if _log_betainc_regularized(a, b, x_min) > log_q:
+        return 0.0
+    if log_hi <= log_lo:
+        return x_min
+    for _ in range(100):
+        log_mid = 0.5 * (log_lo + log_hi)
+        mid = math.exp(log_mid)
+        if mid <= x_min or mid >= hi:
+            break
+        if _log_betainc_regularized(a, b, mid) < log_q:
+            log_lo = log_mid
+        else:
+            log_hi = log_mid
+    return math.exp(0.5 * (log_lo + log_hi))
+
+
 def _beta_quantile_from_log(log_q: float, a: float, b: float) -> float:
     """Beta quantile for a tail probability given as ``log(q)``."""
     if log_q >= 0.0:
@@ -487,6 +508,8 @@ def _beta_quantile_from_log(log_q: float, a: float, b: float) -> float:
             lo = mid
         else:
             hi = mid
+    if lo == 0.0:
+        return _beta_quantile_log_space(log_q, a, b, hi)
     return 0.5 * (lo + hi)
 
 
@@ -513,6 +536,8 @@ def _beta_quantile(q: float, a: float, b: float) -> float:
             lo = mid
         else:
             hi = mid
+    if lo == 0.0:
+        return _beta_quantile_log_space(math.log(q), a, b, hi)
     return 0.5 * (lo + hi)
 
 
