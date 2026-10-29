@@ -665,26 +665,31 @@ def _binomial_tail_root(n: int, k: int, target: float, *,
     return math.exp(0.5 * (lo + hi))
 
 
-def _binomial_log_sf(n: int, k: int, p: float) -> float:
-    """``log P(Binomial(n, p) >= k)`` for a small ``k``.
+def _scale_int_by_float(n: int, value: float) -> float:
+    """``n * value`` for an integer count that may exceed the float range.
 
-    Sums the upper tail directly in log space.  The lower-tail root
-    ``P(X <= k-1) = 1 - alpha/2`` cannot be solved by bisection for
-    sub-epsilon ``alpha`` because ``1 - alpha/2`` rounds to exactly 1.0;
-    this survival-function form keeps the requested tail probability.
-    Terms are evaluated by the ratio recurrence, so no huge log-gamma
-    difference or ``n * log1p(-p)`` product is formed.
+    ``n * value`` raises ``OverflowError`` when ``n`` cannot be converted
+    to float, even if the product is representable (a huge count times a
+    tiny log-probability). Fall back to a log-space product in that case.
     """
-    if k <= 0:
+    if n == 0 or value == 0.0:
         return 0.0
-    if p <= 0.0:
-        return -math.inf
-    if p >= 1.0:
-        return 0.0
-    if k >= n:
-        return n * math.log(p)
-    log_p = math.log(p)
-    log_q = math.log1p(-p)
+    try:
+        return n * value
+    except OverflowError:
+        log_mag = math.log(n) + math.log(abs(value))
+        if log_mag > 709.782712893384:
+            return math.copysign(math.inf, value)
+        return math.copysign(math.exp(log_mag), value)
+
+
+def _binomial_log_sf_downward(n: int, k: int, log_p: float,
+                              log_q: float) -> float:
+    """``log P(X >= k)`` when ``k`` is at/above the mode.
+
+    The ratio recurrence is evaluated downward from ``k``, so every term
+    is non-increasing and the sum cannot overflow.
+    """
     log_comb = 0.0
     for i in range(1, k + 1):
         log_comb += math.log(n - i + 1)
@@ -706,6 +711,133 @@ def _binomial_log_sf(n: int, k: int, p: float) -> float:
         if term <= total * 1e-18:
             break
     return log_term + math.log(total)
+
+
+def _binomial_log_upper_tail_down(n: int, k: int, log_s: float,
+                                  log_f: float) -> float:
+    """Stable upper tail for a start point above the mode.
+
+    ``log_s``/``log_f`` are the log success and failure probabilities.
+    Terms decay from ``k``, so this is used for the mirrored binomial when
+    the original start point lies below its mode.
+    """
+    if k <= 0:
+        return 0.0
+    if k >= n:
+        return _scale_int_by_float(n, log_s)
+    if k <= 200_000:
+        log_comb = 0.0
+        for i in range(1, k + 1):
+            log_comb += math.log(n - i + 1) - math.log(i)
+    else:
+        try:
+            log_comb = (math.lgamma(n + 1) - math.lgamma(k + 1)
+                        - math.lgamma(n - k + 1))
+        except OverflowError:
+            log_comb = 0.0
+            for i in range(1, k + 1):
+                log_comb += math.log(n - i + 1) - math.log(i)
+    log_term = (log_comb + _scale_int_by_float(k, log_s)
+                + _scale_int_by_float(n - k, log_f))
+    if not math.isfinite(log_term):
+        return log_term
+    term = 1.0
+    total = 1.0
+    i = k
+    while i < n:
+        log_ratio = (math.log(n - i) - math.log(i + 1)
+                     + log_s - log_f)
+        term *= math.exp(log_ratio)
+        total += term
+        i += 1
+        if term <= total * 1e-18:
+            break
+    return log_term + math.log(total)
+
+
+def _binomial_log_lower_tail_below_mean(n: int, j: int, log_p: float,
+                                        log_q: float) -> float:
+    """``log P(X <= j)`` for ``j`` below the binomial mean.
+
+    Lagging terms are summed relative to ``q**n`` (so a tiny ``q**n`` does
+    not erase a moderate lower tail), or through the mirrored upper tail
+    when ``j`` is in the upper half.
+    """
+    if j < 0:
+        return -math.inf
+    if j >= n:
+        return 0.0
+    if j == 0:
+        bound = _scale_int_by_float(n, log_q)
+    else:
+        x = j / n
+        p = math.exp(log_p)
+        q = math.exp(log_q)
+        if 0.0 < x < p and q > 0.0:
+            d = (x * math.log(x / p)
+                 + (1.0 - x) * math.log((1.0 - x) / q))
+            bound = _scale_int_by_float(n, -d)
+        else:
+            bound = 0.0
+    if bound < _MIN_LOG_PROB:
+        # The lower tail is below the smallest positive float, so the
+        # survival probability rounds to exactly one.
+        return -math.inf
+    if j <= n - j:
+        log_comb = 0.0
+        term = 0.0
+        max_term = 0.0
+        scaled = 1.0
+        for i in range(1, j + 1):
+            log_comb += math.log(n - i + 1) - math.log(i)
+            term = log_comb + i * (log_p - log_q)
+            if term > max_term:
+                scaled = scaled * math.exp(max_term - term) + 1.0
+                max_term = term
+            else:
+                scaled += math.exp(term - max_term)
+        return (_scale_int_by_float(n, log_q) + max_term
+                + math.log(scaled))
+    kk = n - j
+    return _binomial_log_upper_tail_down(n, kk, log_q, log_p)
+
+
+def _binomial_log_sf(n: int, k: int, p: float) -> float:
+    """``log P(Binomial(n, p) >= k)`` for a small ``k``.
+
+    Sums the upper tail directly in log space.  The lower-tail root
+    ``P(X <= k-1) = 1 - alpha/2`` cannot be solved by bisection for
+    sub-epsilon ``alpha`` because ``1 - alpha/2`` rounds to exactly 1.0;
+    this survival-function form keeps the requested tail probability.
+    Terms are evaluated by the ratio recurrence, so no huge log-gamma
+    difference or ``n * log1p(-p)`` product is formed.  When ``k`` lies
+    below the mode the direct recurrence grows through the mode and can
+    overflow; that case is evaluated as the complement of the lower tail.
+    """
+    if k <= 0:
+        return 0.0
+    if k > n:
+        return -math.inf
+    if p <= 0.0:
+        return -math.inf
+    if p >= 1.0:
+        return 0.0
+    if k == n:
+        return _scale_int_by_float(n, math.log(p))
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
+    if math.log(k) < math.log(n) + log_p:
+        downward = _binomial_log_sf_downward(n, k, log_p, log_q)
+        if math.isfinite(downward) and downward <= 0.0:
+            return downward
+        lower = _binomial_log_lower_tail_below_mean(
+            n, k - 1, log_p, log_q)
+        if lower >= 0.0:
+            lower = 0.0
+        if lower == -math.inf:
+            return 0.0
+        return math.log1p(-math.exp(lower))
+    return _binomial_log_sf_downward(n, k, log_p, log_q)
 
 
 def _binomial_sf_root(n: int, k: int, target: float, *,

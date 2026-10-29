@@ -203,6 +203,30 @@ def test_sign_test_zeros_are_dropped_steel_convention():
     assert math.isclose(mixed['p_value'], 1.0, rel_tol=1e-15)  # 2/2 = 1
 
 
+def test_binomial_log_sf_below_mode_uses_lower_tail_complement():
+    # k far below n*p: the upward ratio recurrence grew through the mode
+    # and overflowed to inf even though the survival probability is one.
+    assert M._binomial_log_sf(
+        955085, 258, 0.005269162871948142) == 0.0
+    assert M._binomial_log_sf(
+        302684, 814, 0.7972125131776783) == 0.0
+
+    # Moderate lower tail, both direct (k <= n/2) and mirrored
+    # (k > n/2) paths. The expected log survival is log1p(-cdf) from an
+    # exact high-precision evaluation.
+    assert M._binomial_log_sf(1000, 400, 0.6) == pytest.approx(
+        -1.2350210922376e-37, rel=1e-9)
+    assert M._binomial_log_sf(1000, 900, 0.999) == pytest.approx(
+        -2.3351116402767e-163, rel=1e-9)
+    for k, p in ((400, 0.6), (900, 0.999)):
+        assert M._binomial_log_sf(1000, k, p) <= 0.0
+
+    # k > n has no mass; the old k >= n branch returned p**n.
+    assert M._binomial_log_sf(5, 6, 0.5) == -math.inf
+    assert M._binomial_log_sf(0, 1, 0.5) == -math.inf
+    assert M._binomial_log_sf(0, 0, 0.5) == 0.0
+
+
 def test_sign_test_large_n_uses_log_space():
     """More than 1023 informative pairs must not overflow float(2**n).
 
