@@ -105,6 +105,14 @@ def test_planning_uses_corrected_alpha_and_mde():
     assert screening['planned_power'] < plan['target_power']
 
 
+def test_normal_upper_quantile_mirrors_small_tails():
+    """Planning must not lose tail precision before 1-tail rounds to 1."""
+    assert D._normal_upper_quantile(1e-8) == pytest.approx(
+        5.61200124417479, abs=1e-12)
+    assert D._normal_upper_quantile(1e-12) == pytest.approx(
+        7.034483825301132, abs=1e-12)
+
+
 def test_two_sided_planning_applies_bonferroni_once():
     # exp5_ratio is a two-sided family: alpha_per_test is the one-sided TAIL
     # probability (alpha/(2*family)).  multi_seed_stats takes a test level,

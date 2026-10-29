@@ -550,6 +550,19 @@ def test_log_normal_upper_tail_switches_to_series_only_when_accurate():
         -454.321243956343197107355771338, abs=1e-10)
 
 
+def test_normal_upper_quantile_mirrors_small_tails():
+    """``inv_cdf(1-tail)`` loses tail precision before 1-tail reaches 1.
+
+    At tail=1e-8 it is off by ~8.7e-10 in z; the mirrored ``-inv_cdf(tail)``
+    keeps the full relative accuracy.  Reference values are high-precision
+    normal quantiles (also returned by scipy.special.ndtri).
+    """
+    assert M._normal_upper_quantile(1e-8) == pytest.approx(
+        5.61200124417479, abs=1e-12)
+    assert M._normal_upper_quantile(1e-12) == pytest.approx(
+        7.034483825301132, abs=1e-12)
+
+
 def test_planning_handles_subnormal_two_sided_alpha():
     # alpha/2 underflows for subnormal alpha; the normal critical value is
     # still finite (~38.5) and planning must not collapse to None.

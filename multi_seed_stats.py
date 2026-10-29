@@ -2101,7 +2101,7 @@ def _normal_upper_quantile(tail: float) -> float:
         return math.inf
     if tail >= 1.0:
         return -math.inf
-    if tail >= 1e-8:
+    if tail >= 1e-4:
         return _ND.inv_cdf(1.0 - tail)
     return -_ND.inv_cdf(tail)
 
