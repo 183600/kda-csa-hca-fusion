@@ -442,6 +442,54 @@ def _is_finite_real(value) -> bool:
         return False
 
 
+def _log_betainc_regularized(a: float, b: float, x: float) -> float:
+    """``log(I_x(a, b))`` without exponentiating an underflowing tail."""
+    if x <= 0.0:
+        return -math.inf
+    if x >= 1.0:
+        return 0.0
+    log_bt = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        h = _betacf(a, b, x)
+        if h > 0.0 and math.isfinite(log_bt):
+            log_ib = log_bt + math.log(h) - math.log(a)
+            if log_ib <= 0.0:
+                return log_ib
+        value = betainc_regularized(a, b, x)
+        return math.log(value) if value > 0.0 else -math.inf
+    y = 1.0 - x
+    log_bt = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + b * math.log(y) + a * math.log1p(-y))
+    h = _betacf(b, a, y)
+    if h > 0.0 and math.isfinite(log_bt):
+        log_iy = log_bt + math.log(h) - math.log(b)
+        if log_iy < 0.0:
+            return math.log1p(-math.exp(log_iy))
+    value = betainc_regularized(a, b, x)
+    return math.log(value) if value > 0.0 else -math.inf
+
+
+def _beta_quantile_from_log(log_q: float, a: float, b: float) -> float:
+    """Beta quantile for a tail probability given as ``log(q)``."""
+    if log_q >= 0.0:
+        return 1.0
+    if log_q == -math.inf:
+        return 0.0
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid <= lo or mid >= hi:
+            break
+        if _log_betainc_regularized(a, b, mid) < log_q:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def _beta_quantile(q: float, a: float, b: float) -> float:
     """Quantile of the Beta(a, b) distribution by forward-CDF bisection.
 
@@ -500,10 +548,52 @@ def _binomial_cdf_small(n: int, k: int, p: float) -> float:
         math.exp(term - peak) for term in terms)
 
 
-def _binomial_tail_root(n: int, k: int, target: float) -> float:
+def _binomial_log_cdf_small(n: int, k: int, p: float) -> float:
+    """``log P(X <= k)`` for a small ``k`` without underflowing the sum."""
+    if k < 0:
+        return -math.inf
+    if k >= n:
+        return 0.0
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return -math.inf
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
+    n_log_q = math.log(n) + math.log(-log_q)
+    n_q_term = -math.exp(n_log_q) if n_log_q <= 709.0 else -math.inf
+    log_comb = 0.0
+    terms = []
+    for i in range(k + 1):
+        if i:
+            log_comb += math.log(n - i + 1) - math.log(i)
+        terms.append(log_comb + i * log_p + n_q_term - i * log_q)
+    peak = max(terms)
+    if peak == -math.inf:
+        return -math.inf
+    return peak + math.log(math.fsum(
+        math.exp(term - peak) for term in terms))
+
+
+def _binomial_tail_root(n: int, k: int, target: float, *,
+                        log_target: float | None = None) -> float:
     """Solve ``P(Binomial(n, p) <= k) = target`` in log-probability space."""
     lo = _MIN_LOG_PROB
     hi = 0.0
+    if log_target is not None:
+        if log_target == -math.inf:
+            return 0.0
+        if log_target >= 0.0:
+            return 1.0
+        if _binomial_log_cdf_small(n, k, math.exp(lo)) < log_target:
+            return 0.0
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            if _binomial_log_cdf_small(n, k, math.exp(mid)) > log_target:
+                lo = mid
+            else:
+                hi = mid
+        return math.exp(0.5 * (lo + hi))
     if _binomial_cdf_small(n, k, math.exp(lo)) < target:
         return 0.0
     for _ in range(80):
@@ -558,19 +648,26 @@ def _binomial_log_sf(n: int, k: int, p: float) -> float:
     return log_term + math.log(total)
 
 
-def _binomial_sf_root(n: int, k: int, target: float) -> float:
+def _binomial_sf_root(n: int, k: int, target: float, *,
+                      log_target: float | None = None) -> float:
     """Solve ``P(Binomial(n, p) >= k) = target`` for a small ``k``."""
-    if target <= 0.0:
-        return 0.0
-    if target >= 1.0:
-        return 1.0
+    if log_target is None:
+        if target <= 0.0:
+            return 0.0
+        if target >= 1.0:
+            return 1.0
+        log_target = math.log(target)
+    else:
+        if log_target == -math.inf:
+            return 0.0
+        if log_target >= 0.0:
+            return 1.0
     log_hi = math.log(k) - math.log(n)
     if log_hi < _MIN_LOG_PROB:
         # The root is below the smallest positive float.
         return 0.0
     lo = _MIN_LOG_PROB
     hi = log_hi
-    log_target = math.log(target)
     if _binomial_log_sf(n, k, math.exp(lo)) > log_target:
         return 0.0
     for _ in range(100):
@@ -582,7 +679,8 @@ def _binomial_sf_root(n: int, k: int, target: float) -> float:
     return math.exp(0.5 * (lo + hi))
 
 
-def _normal_beta_quantile(q: float, a: int, b: int) -> float:
+def _normal_beta_quantile(q: float, a: int, b: int, *,
+                          log_q: float | None = None) -> float:
     """Normal-moment approximation to a Beta quantile for huge shapes.
 
     The continued fraction used by :func:`betainc_regularized` loses its
@@ -595,7 +693,12 @@ def _normal_beta_quantile(q: float, a: int, b: int) -> float:
     total = a + b
     mean = a / total
     if q <= 0.0:
-        return 0.0
+        if log_q is None:
+            return 0.0
+        # ``alpha/2`` underflowed to zero. The normal quantile at the
+        # smallest positive float is the closest representable z for the
+        # subnormal-tail range (|z| is between ~37.6 and ~38.5 there).
+        q = 5e-324
     if q >= 1.0:
         return 1.0
     total_float = _float_count(total)
@@ -612,17 +715,36 @@ def _normal_beta_quantile(q: float, a: int, b: int) -> float:
 
 
 def _small_tail_proportion_ci(k: int, n: int, alpha: float) -> tuple:
+    tail = alpha / 2.0
+    if tail == 0.0:
+        # Halving a subnormal alpha underflows. Use the representable log
+        # of the requested tail rather than treating it as exactly zero,
+        # which collapsed a valid interval endpoint to 0 or 1.
+        log_tail = math.log(alpha) - math.log(2.0)
+        low_args = {'log_target': log_tail}
+        if k <= n - k:
+            low = 0.0 if k == 0 else _binomial_sf_root(
+                n, k, 0.0, **low_args)
+            high = 1.0 if k == n else _binomial_tail_root(
+                n, k, 0.0, **low_args)
+            return low, high
+        kk = n - k
+        low = 1.0 - (1.0 if kk == n else _binomial_tail_root(
+            n, kk, 0.0, **low_args))
+        high = 1.0 - (0.0 if kk == 0 else _binomial_sf_root(
+            n, kk, 0.0, **low_args))
+        return low, high
     if k <= n - k:
         low = 0.0 if k == 0 else _binomial_sf_root(
-            n, k, alpha / 2.0)
+            n, k, tail)
         high = 1.0 if k == n else _binomial_tail_root(
-            n, k, alpha / 2.0)
+            n, k, tail)
         return low, high
     kk = n - k
     low = 1.0 - (1.0 if kk == n else _binomial_tail_root(
-        n, kk, alpha / 2.0))
+        n, kk, tail))
     high = 1.0 - (0.0 if kk == 0 else _binomial_sf_root(
-        n, kk, alpha / 2.0))
+        n, kk, tail))
     return low, high
 
 
@@ -657,17 +779,32 @@ def binomial_proportion_ci(k, n, *, alpha: float = 0.05) -> dict:
     if n > 1000 and min(k, n - k) <= _SMALL_BINOMIAL_TAIL:
         low, high = _small_tail_proportion_ci(k, n, alpha)
     elif n > _LARGE_BINOMIAL_N:
+        tail = alpha / 2.0
+        log_tail = (math.log(alpha) - math.log(2.0)
+                    if tail == 0.0 else None)
         low = (0.0 if k == 0 else
-               _normal_beta_quantile(alpha / 2.0, k, n - k + 1))
+               _normal_beta_quantile(tail, k, n - k + 1,
+                                     log_q=log_tail))
         # Upper bound by symmetry: BetaInv(1 - q; a, b) =
         # 1 - BetaInv(q; b, a). This avoids ``1 - alpha/2`` rounding to
         # exactly 1.0 (which returned a spurious upper bound of 1.0).
         high = (1.0 if k == n else 1.0 - _normal_beta_quantile(
-            alpha / 2.0, n - k, k + 1))
+            tail, n - k, k + 1, log_q=log_tail))
     else:
-        low = 0.0 if k == 0 else _beta_quantile(alpha / 2.0, k, n - k + 1)
-        high = 1.0 if k == n else 1.0 - _beta_quantile(
-            alpha / 2.0, n - k, k + 1)
+        tail = alpha / 2.0
+        if tail == 0.0:
+            # ``alpha`` is a subnormal float, so halving it underflowed to
+            # zero. Bisecting on q=0 collapses the interval to [0, 1];
+            # keep the representable log tail instead.
+            log_tail = math.log(alpha) - math.log(2.0)
+
+            def _quantile(a, b):
+                return _beta_quantile_from_log(log_tail, a, b)
+        else:
+            def _quantile(a, b):
+                return _beta_quantile(tail, a, b)
+        low = 0.0 if k == 0 else _quantile(k, n - k + 1)
+        high = 1.0 if k == n else 1.0 - _quantile(n - k, k + 1)
     # Guard against a last-ulp inversion on extreme shapes.
     low = min(max(low, 0.0), 1.0)
     high = min(max(high, 0.0), 1.0)

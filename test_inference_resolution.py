@@ -196,6 +196,26 @@ def test_clopper_pearson_known_endpoints_and_symmetry():
                                                  abs=1e-9)
 
 
+def test_clopper_pearson_subnormal_alpha_keeps_interval_endpoints():
+    # alpha/2 underflows for a subnormal alpha; the exact bounds are still
+    # representable and must not collapse to [0, 1].
+    n = 1000
+    ci = M.binomial_proportion_ci(0, n, alpha=5e-324)
+    want = 1.0 - math.exp((math.log(5e-324) - math.log(2.0)) / n)
+    assert ci['ci_low'] == 0.0
+    assert ci['ci_high'] == pytest.approx(want, rel=1e-12)
+
+    # n > 1000 takes the small-tail binomial-root branch.
+    mid = M.binomial_proportion_ci(1000, 2000, alpha=5e-324)
+    assert 0.0 < mid['ci_low'] < 0.5 < mid['ci_high'] < 1.0
+    assert mid['ci_low'] == pytest.approx(1.0 - mid['ci_high'],
+                                          abs=1e-12)
+
+    # n > 1e8 takes the normal-beta branch.
+    huge = M.binomial_proportion_ci(10 ** 9 // 2, 10 ** 9, alpha=5e-324)
+    assert 0.0 < huge['ci_low'] < 0.5 < huge['ci_high'] < 1.0
+
+
 def test_clopper_pearson_small_tail_is_precise_for_large_n():
     n = 10 ** 18
     zero = M.binomial_proportion_ci(0, n)
