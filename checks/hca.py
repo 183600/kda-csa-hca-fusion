@@ -81,6 +81,79 @@ def test_csa_hca_fp16_dtype_consistency(device='cpu'):
     return results
 
 
+def test_hca_score_tiling_parity(device='cpu'):
+    """Force the long-context query-tiling branch and certify it against the
+    untiled forward (fp32 and bf16), including gradients.
+
+    The tiler only engages when the dense score tensor exceeds
+    ``_HCA_SCORE_TILE_ELEMS``, so no in-gate test previously exercised it.
+    We lower the threshold and compare the identical geometry, sink and
+    sliding-window/RoPE configuration: every operation in the tiled loop is
+    row-wise along the query axis, so the outputs must agree to fp32
+    round-off (bf16 to storage-grid equivalence), not merely approximately.
+    """
+    logger.info("Test: HCA score-tiling parity (long-context path)")
+    import ops_hca
+
+    torch.manual_seed(77)
+    B, T, d = 2, 96, 32
+    m2, nh, c, dc = 16, 3, 16, 24
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=77)
+    sink = torch.randn(nh, device=device) * 0.1
+    results = []
+    old_threshold = ops_hca._HCA_SCORE_TILE_ELEMS
+    try:
+        for dtype in (torch.float32, torch.bfloat16):
+            eps = float(torch.finfo(dtype).eps)
+            for win in (0, 8):
+                H = (torch.randn(B, T, d, device=device) * 0.2).to(dtype)
+                params = {k: v.to(dtype) for k, v in p.items()}
+                sink_d = sink.to(dtype)
+                kw = dict(m2=m2, nh=nh, c=c, dc=dc, sliding_window=win,
+                          sink_logits=sink_d, rope_dim=8)
+                ops_hca._HCA_SCORE_TILE_ELEMS = 1 << 30
+                full = naive_hca(H, **params, **kw)
+                ops_hca._HCA_SCORE_TILE_ELEMS = 1
+                tiled = naive_hca(H, **params, **kw)
+                if dtype == torch.bfloat16:
+                    tol = 2.0 * eps * max(
+                        1.0, float(full.float().abs().max().item()))
+                else:
+                    tol = TOL['bit_match'][torch.float32]
+                diff = (tiled.float() - full.float()).abs().max().item()
+                results.append(_ok(
+                    f'HCA tiled forward == untiled ({dtype}, win={win})',
+                    diff <= tol, f'max_diff={diff:.2e} tol={tol:.2e}'))
+
+        H = (torch.randn(B, T, d, device=device) * 0.2).requires_grad_(True)
+        params = {k: v.clone().requires_grad_(True) for k, v in p.items()}
+        sink_g = sink.clone().requires_grad_(True)
+        kw = dict(m2=m2, nh=nh, c=c, dc=dc, sliding_window=8,
+                  sink_logits=sink_g, rope_dim=8)
+        grads = []
+        for threshold in (1 << 30, 1):
+            ops_hca._HCA_SCORE_TILE_ELEMS = threshold
+            out = naive_hca(H, **params, **kw)
+            (out.square().sum()).backward()
+            grads.append((H.grad.clone(), sink_g.grad.clone(),
+                          {k: v.grad.clone() for k, v in params.items()}))
+            for t in (H, sink_g, *params.values()):
+                t.grad = None
+        h_diff = (grads[0][0] - grads[1][0]).abs().max().item()
+        sink_diff = (grads[0][1] - grads[1][1]).abs().max().item()
+        w_diff = max(
+            (grads[0][2][k] - grads[1][2][k]).abs().max().item()
+            for k in params)
+        grad_tol = TOL['match'][torch.float32]
+        results.append(_ok(
+            'HCA tiled backward == untiled (fp32)',
+            max(h_diff, sink_diff, w_diff) <= grad_tol,
+            f'dH={h_diff:.2e}, dsink={sink_diff:.2e}, dW={w_diff:.2e}'))
+    finally:
+        ops_hca._HCA_SCORE_TILE_ELEMS = old_threshold
+    return results
+
+
 def test_hca_forward_smoke(device='cpu'):
     """Forward-output shape + finiteness smoke test (does NOT verify
     causality — see ``test_hca_sliding_window_causality``)."""
@@ -1475,6 +1548,7 @@ def test_csa_hca_qk_norm_mode_rms(device='cpu'):
 
 __all__ = [
     'test_csa_hca_fp16_dtype_consistency',
+    'test_hca_score_tiling_parity',
     'test_hca_forward_smoke',
     'test_hca_sliding_window_causality',
     'test_csa_hca_right_padding_correctness',

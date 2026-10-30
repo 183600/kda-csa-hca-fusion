@@ -59,6 +59,9 @@ def main():
     all_results += _run_safe(test_scripted_chunk_kda_matches_naive, device)
     all_results += _run_safe(test_csa_causality, device)
     all_results += _run_safe(test_hca_forward_smoke, device)
+    # Long-context query tiling of the HCA dense score tensor: force the
+    # tiled branch and certify forward/backward equivalence with the full path.
+    all_results += _run_safe(test_hca_score_tiling_parity, device)
     all_results += _run_safe(test_fused_hybrid, device)
     # New reviewer-driven checks.
     all_results += _run_safe(test_overlap_causality, device)
