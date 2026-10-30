@@ -113,6 +113,7 @@ from near_duplicates import (
     DEFAULT_NEAR_DUP_SHINGLE_SIZE,
     DEFAULT_NEAR_DUP_THRESHOLD,
     near_duplicate_clusters,
+    near_duplicate_cluster_labels,
     near_duplicate_pairs,
     summarize_cross_split,
     _check_parameters as _check_near_dup_parameters,
@@ -869,6 +870,37 @@ def _filter_leaking_heldout(train_texts, val_texts, test_texts, tokenizer,
                  'would empty it, and window_overlap_audit then reports the '
                  'residual leak.'),
     }
+
+
+def _near_duplicate_cluster_report(
+        texts, tokenizer, seq_len, *, threshold, shingle_size,
+        num_perm, max_candidate_pairs):
+    """Cluster a held-out split by token-window near-duplicate similarity.
+
+    The returned ``cluster_ids`` are aligned to ``texts`` (one label per
+    document) and are consumed by ``ppl_bootstrap`` so a held-out corpus
+    with redundant near-copies is not treated as that many independent
+    evaluation samples. This is a data-only audit: it reads no model
+    metric and does not drop rows.
+    """
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    if not callable(getattr(tokenizer, 'encode', None)):
+        raise ValueError('tokenizer must provide a callable encode()')
+    token_ids = []
+    n_tokenize_errors = 0
+    for text in texts:
+        try:
+            ids = _validated_token_ids(tokenizer.encode(
+                text, truncation=True, max_length=seq_len + 1))
+            token_ids.append(np.asarray(ids, dtype=np.uint64))
+        except Exception:
+            n_tokenize_errors += 1
+            token_ids.append(None)
+    report = near_duplicate_cluster_labels(
+        token_ids, threshold=threshold, shingle_size=shingle_size,
+        num_perm=num_perm, max_candidate_pairs=max_candidate_pairs)
+    report['n_tokenize_errors'] = int(n_tokenize_errors)
+    return report
 
 
 def near_duplicate_leakage_audit(
@@ -3693,6 +3725,31 @@ def main():
                     f"at Jaccard >= {args.near_dup_threshold}); rerun with "
                     "--dedup_near or relax --strict_near_dup")
 
+    # Cluster the sealed test split by near-duplicate similarity. This is
+    # a data-only audit (no model metric), so it can be computed before
+    # the split is opened for its single evaluation. The labels make the
+    # final perplexity bootstrap resample redundant near-copies as ONE
+    # evaluation unit instead of pretending they are independent samples.
+    test_cluster_report = None
+    if not args.skip_near_dup_audit:
+        test_cluster_report = _near_duplicate_cluster_report(
+            test_texts, tokenizer, seq_len,
+            threshold=args.near_dup_threshold,
+            shingle_size=args.near_dup_shingle,
+            num_perm=DEFAULT_NEAR_DUP_NUM_PERM,
+            max_candidate_pairs=args.near_dup_max_candidates)
+        if test_cluster_report['candidates_truncated']:
+            print("[data] WARNING: test-split near-duplicate clustering "
+                  "hit the candidate budget; cluster labels are a lower "
+                  "bound (raise --near_dup_max_candidates for a complete "
+                  "redundancy audit)")
+        if test_cluster_report['n_redundant_documents']:
+            print(f"[data] test-split redundancy: "
+                  f"{test_cluster_report['n_redundant_documents']} "
+                  f"near-duplicate document(s) in "
+                  f"{test_cluster_report['n_clusters']} cluster(s); the "
+                  f"perplexity bootstrap will resample whole clusters")
+
     # Per-split length/unk statistics. Descriptive distribution-shift
     # diagnostics ONLY; they are never fitted or applied to features. The
     # test split's stats are computed with its single evaluation at the
@@ -3953,6 +4010,7 @@ def main():
                 'content_fingerprint_sha256': None,
                 'token_length_stats': None,
                 'sealed_until_final_evaluation': True,
+                'near_duplicate_clusters': test_cluster_report,
             },
         },
         'split_audit': split_report,
@@ -4334,13 +4392,24 @@ def main():
         n_tokens=test_report['n_tokens'],
         elapsed_s=test_report['elapsed_s'],
         n_sequences=test_report['n_sequences'])
-    # Unit-level bootstrap CI for the final perplexity: quantifies the
-    # sampling uncertainty of THIS held-out corpus (resampling whole
-    # sequences, not tokens). Cheap (pure-Python, same single pass).
+    # Cluster-robust bootstrap CI for the final perplexity: quantifies the
+    # sampling uncertainty of THIS held-out corpus. Near-duplicate
+    # documents are resampled as whole clusters (they are not independent
+    # samples); with no redundancy the labels are all singletons and the
+    # arithmetic reduces exactly to the historical unit-level bootstrap.
     n_boot = int(getattr(args, 'ppl_bootstrap_nboot', 0) or 0)
+    test_cluster_ids = None
+    if test_cluster_report is not None and test_units:
+        labels = test_cluster_report['cluster_ids']
+        try:
+            test_cluster_ids = [labels[int(unit['index'])]
+                                for unit in test_units]
+        except (IndexError, KeyError, TypeError, ValueError):
+            test_cluster_ids = None
     if test_units and n_boot > 0:
         test_report['ppl_bootstrap'] = bootstrap_ppl_ci(
-            test_units, n_boot=n_boot, seed=args.seed)
+            test_units, n_boot=n_boot, seed=args.seed,
+            cluster_ids=test_cluster_ids)
     else:
         test_report['ppl_bootstrap'] = {
             'skipped': True,

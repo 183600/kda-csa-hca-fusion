@@ -98,3 +98,77 @@ pb.throughput_summary(n_tokens=report['n_tokens'],
 * Small held-out corpora (the Kaggle/AutoDL regime) make the intervals
   wide on purpose: that width is the honest report of what the split can
   support, not a defect of the method.
+
+## Cluster-robust evaluation (near-duplicate / grouped units)
+
+The unit bootstrap assumes the scored units are independent draws from the
+corpus. A held-out split that still contains near-duplicates violates that
+assumption: two edited copies of the same story are correlated, so
+resampling them separately understates the corpus variance and makes the
+CI (and the paired p-value) optimistic. This is the inference-side
+counterpart of the data-integrity audit: detection makes the redundancy
+visible, cluster resampling makes the uncertainty honest.
+
+`near_duplicates.near_duplicate_cluster_labels(token_ids, ...)` returns one
+label per document, aligned to document order:
+
+* a singleton document keeps its own index;
+* every member of a near-duplicate component shares the component's lowest
+  document index;
+* `candidates_truncated` is reported, so a capped search is never mistaken
+  for a complete clustering.
+
+Both bootstrap entry points accept `cluster_ids=`:
+
+```python
+from near_duplicates import near_duplicate_cluster_labels
+import ppl_bootstrap as pb
+
+clusters = near_duplicate_cluster_labels(test_token_windows)
+ci = pb.bootstrap_ppl_ci(units, cluster_ids=clusters['cluster_ids'])
+rep = pb.paired_bootstrap_ppl(
+    units_a, units_b, cluster_ids=clusters['cluster_ids'])
+```
+
+With `cluster_ids`, each replicate draws `n_clusters` clusters **with
+replacement** and pools every unit of each selected cluster. The paired
+test uses the same cluster draw for both models, so the pairing is
+preserved. Point estimates (`mean_nll`, `perplexity`, `delta_mean_nll`,
+`ppl_ratio_a_over_b`) are unchanged; only the interval and the decision are
+computed at the cluster level. The report adds:
+
+| Field | Meaning |
+|---|---|
+| `n_clusters` | number of independent clusters resampled |
+| `resampling_unit` | `cluster` or `evaluation_unit` |
+| `cluster_design.effective_n_units` | Kish effective sample size `(Σmᵢ)² / Σmᵢ²` |
+| `cluster_design.design_effect` | `n_units / effective_n_units` |
+| `cluster_design.cluster_sizes` | min / max / mean / largest share |
+
+The design effect is **size-only** and assumes perfect within-cluster
+correlation. It is a conservative description of the redundancy, not an
+ICC estimated from the outcome. With all-singleton labels the cluster draw
+is identical to the historical unit draw, so the report is bit-identical
+to `cluster_ids=None` (apart from the added labels/summary).
+
+`train_lm_autodl.py` computes the test-split cluster labels from the
+truncated `seq_len + 1` token windows with the same threshold and shingle
+size as the near-duplicate audit. This is a data-only step performed
+before the sealed test split is opened for its single evaluation, and the
+labels are recorded under `splits.test.near_duplicate_clusters`. The final
+`ppl_bootstrap` block is therefore cluster-aware whenever the audit is
+enabled; skipping the near-duplicate audit (`--skip_near_dup_audit`) falls
+back to the unit-level bootstrap.
+
+### Caveats
+
+* Cluster-aware resampling repairs dependence inside the **detected**
+  near-duplicate clusters. Lexical Jaccard does not detect true paraphrase,
+  so semantic redundancy remains a lower-bound problem (see
+  [data-integrity.md](data-integrity.md)).
+* Dependence across clusters (same author, source, template or document
+  family) is not inferred from text similarity. Pass explicit `group_ids`
+  as `cluster_ids` when that structure is known.
+* If the candidate cap is exhausted, the labels are a lower bound and the
+  recorded `candidates_truncated` flag says so. Raise the cap or report the
+  interval as a lower-bound uncertainty statement.

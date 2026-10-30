@@ -140,7 +140,12 @@ For a paper/report, state:
   `candidates_truncated`;
 * if the threshold is varied as a sensitivity analysis, report both runs.
   Do **not** choose the threshold that makes the held-out number look
-  best.
+  best;
+* whether held-out inference was cluster-aware. `ppl_bootstrap` accepts
+  `cluster_ids` so near-duplicate documents are resampled as one unit
+  instead of independent samples; report `n_clusters`, the design effect
+  and `candidates_truncated` from the final bootstrap block. See
+  [ppl-bootstrap.md](ppl-bootstrap.md#cluster-robust-evaluation-near-duplicate--grouped-units).
 
 Near-duplicate dedup changes the evaluation population. A run with
 `--dedup_near` and a run without it are different experiments; compare

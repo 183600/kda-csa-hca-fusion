@@ -35,7 +35,10 @@ sufficient statistic ``(nll_sum, n_tokens)``:
   tokens/s measured over the same evaluation loop that produced the
   perplexity (evaluation is a pure-prefill workload);
 * :func:`normalize_units` / :func:`unit_nll_stats` — validation and
-  point statistics shared by all of the above.
+  point statistics shared by all of the above;
+* :func:`cluster_design_report` — size-only summary of a cluster
+  assignment (Kish effective sample size / design effect) for corpora
+  whose units are not independent.
 
 The primitives are pure Python (no numpy/scipy) and draw from a LOCAL
 ``random.Random(seed)`` instance: the same seed gives a bit-identical
@@ -54,6 +57,10 @@ What the bootstrap does and does not cover
   that as ``degenerate`` instead of pretending).
 * The CI/PPL mapping is exact: ``exp`` is monotone, so the PPL interval
   is the exponentiated mean-NLL interval (no extra approximation).
+* Units are assumed independent unless ``cluster_ids`` is supplied. With
+  near-duplicate / grouped units, pass the labels from
+  ``near_duplicates.near_duplicate_cluster_labels`` so whole clusters are
+  resampled; otherwise the interval is too narrow.
 
 Intended use in this repo: the LM evaluation path runs on Kaggle /
 AutoDL images where the held-out corpus is a small split, so two
@@ -66,6 +73,7 @@ environment*; this module bootstraps a *statistic*.)
 from __future__ import annotations
 
 import math
+import numbers
 import random
 import sys
 
@@ -74,6 +82,7 @@ __all__ = [
     'unit_nll_stats',
     'bootstrap_ppl_ci',
     'paired_bootstrap_ppl',
+    'cluster_design_report',
     'throughput_summary',
     'MAX_LOG_PPL',
 ]
@@ -184,6 +193,100 @@ def _parse_units(units, label: str = 'units') -> list[tuple[float, int]]:
     return out
 
 
+def _parse_cluster_ids(cluster_ids, n_units: int,
+                       label: str = 'cluster_ids') -> list[int | str] | None:
+    """Validate one cluster label per evaluation unit.
+
+    Cluster ids identify the independent sampling unit when several
+    evaluation units are not independent (for example, a cluster of
+    near-duplicate documents). Labels must be exact integers or strings:
+    silently coercing ``0.9`` to ``0`` or ``True`` to ``1`` would merge
+    unrelated units, the same failure mode the split helpers reject.
+    """
+    if cluster_ids is None:
+        return None
+    ids = list(cluster_ids)
+    if len(ids) != int(n_units):
+        raise ValueError(
+            f'{label} has length {len(ids)} but there are {n_units} '
+            f'evaluation units; pass one label per scored unit, in the '
+            f'same order as the units')
+    out: list[int | str] = []
+    for i, value in enumerate(ids):
+        if value is None or isinstance(value, bool):
+            raise ValueError(
+                f'{label}[{i}] must be an exact int or str, got {value!r}')
+        if isinstance(value, numbers.Integral):
+            out.append(int(value))
+        elif isinstance(value, str):
+            out.append(value)
+        else:
+            raise ValueError(
+                f'{label}[{i}] must be an exact int or str, got {value!r}')
+    return out
+
+
+def _cluster_groups(cluster_ids: list[int | str]) -> list[list[int]]:
+    """Unit indices grouped by cluster, in first-appearance order."""
+    groups: dict[int | str, list[int]] = {}
+    for i, label in enumerate(cluster_ids):
+        groups.setdefault(label, []).append(i)
+    return list(groups.values())
+
+
+def _kish_design(groups: list[list[int]], n_units: int) -> dict:
+    """Size-only design summary for a cluster-resampled estimate.
+
+    ``effective_n_units = (sum m_i)^2 / sum m_i^2`` is Kish's effective
+    sample size for unequal cluster sizes. It assumes perfectly correlated
+    units inside a cluster, so it is a conservative lower bound on the
+    information the corpus carries; the actual within-cluster correlation
+    is not estimated from the outcome. For singleton clusters it equals
+    ``n_units`` and the design effect is 1.
+    """
+    sizes = [len(group) for group in groups]
+    total = sum(sizes)
+    sum_sq = sum(m * m for m in sizes)
+    effective = ((total * total) / sum_sq) if sum_sq else 0.0
+    if n_units <= 0:
+        effective = 0.0
+    design_effect = (n_units / effective) if effective > 0.0 else None
+    return {
+        'n_units': int(n_units),
+        'n_clusters': len(groups),
+        'n_singleton_clusters': sum(1 for m in sizes if m == 1),
+        'n_multi_unit_clusters': sum(1 for m in sizes if m > 1),
+        'cluster_sizes': {
+            'min': (min(sizes) if sizes else None),
+            'max': (max(sizes) if sizes else None),
+            'mean': ((total / len(sizes)) if sizes else None),
+            'largest_share': ((max(sizes) / total) if total else None),
+        },
+        'effective_n_units': effective,
+        'design_effect': design_effect,
+        'method': ('Kish effective sample size over cluster sizes; assumes '
+                   'perfect within-cluster correlation (conservative, not '
+                   'estimated from the outcome)'),
+    }
+
+
+def cluster_design_report(cluster_ids) -> dict:
+    """Describe the clustering of evaluation units without any outcome.
+
+    ``cluster_ids`` is one label per unit. The report is deterministic,
+    reads no metric, and can therefore be recorded before or independently
+    of a model evaluation. It is the same block embedded in
+    :func:`bootstrap_ppl_ci` / :func:`paired_bootstrap_ppl` when
+    ``cluster_ids`` is supplied.
+    """
+    if cluster_ids is None:
+        raise ValueError('cluster_ids must be an iterable of one label per '
+                         'unit, got None')
+    ids = list(cluster_ids)
+    parsed = _parse_cluster_ids(ids, len(ids))
+    return _kish_design(_cluster_groups(parsed), len(parsed))
+
+
 def normalize_units(units) -> list[tuple[float, int]]:
     """Validate evaluation units and return ``[(nll_sum, n_tokens), ...]``.
 
@@ -287,8 +390,39 @@ def _resample_means(sums: list[float], toks: list[int], n_boot: int,
     return reps
 
 
+def _resample_cluster_means(sums: list[float], toks: list[int],
+                            groups: list[list[int]], n_boot: int,
+                            seed: int) -> list[float]:
+    """Bootstrap the token-weighted mean by resampling whole clusters.
+
+    A replicate draws ``len(groups)`` clusters WITH replacement and pools
+    every unit of each selected cluster. Clusters are the independent
+    sampling units; drawing individual units inside a correlated cluster
+    would understate the corpus variance.
+    """
+    rng = random.Random(int(seed))
+    n_clusters = len(groups)
+    sum_scale = max((abs(x) for x in sums), default=0.0)
+    if sum_scale == 0.0:
+        scaled = [0.0] * len(sums)
+    else:
+        scaled = [x / sum_scale for x in sums]
+    reps: list[float] = []
+    for _ in range(int(n_boot)):
+        s = 0.0
+        t = 0
+        for _ in range(n_clusters):
+            group = groups[rng.randrange(n_clusters)]
+            for i in group:
+                s += scaled[i]
+                t += toks[i]
+        reps.append((_divide_by_count(s, t) * sum_scale)
+                    if sum_scale else 0.0)
+    return reps
+
+
 def bootstrap_ppl_ci(units, *, alpha: float = 0.05, n_boot: int = 10000,
-                     seed: int = 0) -> dict:
+                     seed: int = 0, cluster_ids=None) -> dict:
     """Percentile bootstrap CI for one model's corpus perplexity.
 
     Resamples evaluation units (sequences/windows) with replacement,
@@ -296,21 +430,48 @@ def bootstrap_ppl_ci(units, *, alpha: float = 0.05, n_boot: int = 10000,
     Because ``exp`` is monotone, the perplexity interval is exactly the
     exponentiated mean-NLL interval — no separate approximation.
 
-    With a single informative unit the interval degenerates to the point
-    estimate and ``degenerate`` is set: there is no resampling evidence to
-    estimate corpus uncertainty from. JSON-serializable report.
+    ``cluster_ids`` (optional) is one label per unit. When supplied, whole
+    clusters are resampled instead of individual units: documents in one
+    near-duplicate cluster are not independent observations, so resampling
+    them separately would make the interval too narrow. The report then
+    also carries ``n_clusters`` and a ``cluster_design`` block with the
+    conservative Kish effective sample size. ``cluster_ids=None`` keeps
+    the historical unit-level behaviour.
+
+    With a single informative unit (or a single cluster) the interval
+    degenerates to the point estimate and ``degenerate`` is set: there is
+    no resampling evidence to estimate corpus uncertainty from.
+    JSON-serializable report.
     """
     _validate_boot_args(alpha, n_boot, seed)
-    norm = normalize_units(units)
+    raw = _parse_units(units, 'units')
+    ids = _parse_cluster_ids(cluster_ids, len(raw))
+    if ids is None:
+        norm = normalize_units(raw)
+        groups = None
+    else:
+        # Drop the zero-token units of the single model, keeping the
+        # cluster labels aligned with the surviving units.
+        keep = [i for i, (_, tok) in enumerate(raw) if tok > 0]
+        norm = [raw[i] for i in keep]
+        if not norm:
+            raise ValueError(
+                'no informative evaluation units (all missing or zero '
+                'supervised tokens)')
+        ids = [ids[i] for i in keep]
+        groups = _cluster_groups(ids)
     stats = unit_nll_stats(norm)
     n = len(norm)
     sums = [nll for nll, _ in norm]
     toks = [tok for _, tok in norm]
-    reps = _resample_means(sums, toks, int(n_boot), seed)
+    if groups is None:
+        reps = _resample_means(sums, toks, int(n_boot), seed)
+    else:
+        reps = _resample_cluster_means(sums, toks, groups, int(n_boot), seed)
     ordered = sorted(reps)
     lo = _percentile(ordered, float(alpha) / 2.0)
     hi = _percentile(ordered, 1.0 - float(alpha) / 2.0)
-    return {
+    report = {
         'n_units': stats['n_units'],
         'n_tokens': stats['n_tokens'],
         'mean_nll': stats['mean_nll'],
@@ -321,14 +482,26 @@ def bootstrap_ppl_ci(units, *, alpha: float = 0.05, n_boot: int = 10000,
         'n_boot': int(n_boot),
         'seed': int(seed),
         'degenerate': n < 2,
+        'resampling_unit': ('evaluation_unit' if groups is None else 'cluster'),
         'method': ('percentile bootstrap over evaluation units '
                    '(token-weighted pooling; unit = scored sequence)'),
     }
+    if groups is not None:
+        report.update({
+            'n_clusters': len(groups),
+            'degenerate': n < 2 or len(groups) < 2,
+            'cluster_design': _kish_design(groups, n),
+            'method': ('percentile cluster bootstrap over evaluation units '
+                       '(token-weighted pooling; whole near-duplicate / '
+                       'group clusters resampled with replacement)'),
+        })
+    return report
 
 
 def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
                          n_boot: int = 10000, seed: int = 0,
-                         check_alignment: bool = True) -> dict:
+                         check_alignment: bool = True,
+                         cluster_ids=None) -> dict:
     """Paired bootstrap comparison of two models on the same units.
 
     ``units_a`` / ``units_b`` are the per-unit ``(nll_sum, n_tokens)``
@@ -361,6 +534,12 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
     ``check_alignment`` (default True) verifies that unit token counts
     match pairwise — a mismatch means the two evaluations did not see the
     same data and the pairing would be wrong.
+
+    ``cluster_ids`` (optional) is one label per raw unit. When supplied,
+    every replicate resamples whole clusters (the SAME cluster draw for
+    both models), because near-duplicate documents inside one cluster are
+    not independent evaluation samples. The point estimates are unchanged;
+    only the uncertainty/decision is computed at the cluster level.
     """
     _validate_boot_args(alpha, n_boot, seed)
     raw_a = _parse_units(units_a, 'units_a')
@@ -389,6 +568,11 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
             f'paired bootstrap needs the same number of raw units for both '
             f'models, got {len(raw_a)} vs {len(raw_b)}; score both models '
             f'on the same corpus with the same batch size/max_batches')
+    ids = _parse_cluster_ids(cluster_ids, len(raw_a))
+    groups = None
+    if ids is not None:
+        ids = [ids[i] for i in keep]
+        groups = _cluster_groups(ids)
     if len(a) != len(b):
         raise ValueError(
             f'paired bootstrap needs the same number of informative units '
@@ -447,8 +631,18 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
         scaled_abs_delta = abs_delta
     reps: list[float] = []
     hits = 0
+
+    def _draw_indices() -> list[int]:
+        if groups is None:
+            return [rng.randrange(n) for _ in range(n)]
+        n_clusters = len(groups)
+        drawn: list[int] = []
+        for _ in range(n_clusters):
+            drawn.extend(groups[rng.randrange(n_clusters)])
+        return drawn
+
     for _ in range(int(n_boot)):
-        idx = [rng.randrange(n) for _ in range(n)]
+        idx = _draw_indices()
         sa = sb = sc = 0.0
         t = 0
         for i in idx:
@@ -472,7 +666,8 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
         hi = _percentile(ordered, 1.0 - float(alpha) / 2.0)
     else:
         lo = hi = None
-    if n < 2 or not (delta_finite and shift_finite):
+    if n < 2 or (groups is not None and len(groups) < 2) \
+            or not (delta_finite and shift_finite):
         # Without a representable observed shift / centered resample there
         # is no valid centered hypothesis test to report.
         p_value = None
@@ -482,7 +677,7 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
         p_value = (hits + 1) / (int(n_boot) + 1)
         significant = bool(p_value <= float(alpha))
         worse = ('a' if delta > 0 else 'b') if significant else None
-    return {
+    report = {
         'n_units': n,
         'n_pairs': n,
         'n_tokens_a': stats_a['n_tokens'],
@@ -504,13 +699,23 @@ def paired_bootstrap_ppl(units_a, units_b, *, alpha: float = 0.05,
         'alpha': float(alpha),
         'n_boot': int(n_boot),
         'seed': int(seed),
-        'degenerate': n < 2,
+        'degenerate': (n < 2 or (groups is not None and len(groups) < 2)),
+        'resampling_unit': ('evaluation_unit' if groups is None else 'cluster'),
         'direction': ('delta_mean_nll = mean_nll(model_a) - '
                       'mean_nll(model_b); positive => model_a is worse'),
         'method': ('paired percentile bootstrap over shared evaluation '
                    'units + two-sided centered bootstrap hypothesis test '
                    '(Davison & Hinkley 1997, §4.4)'),
     }
+    if groups is not None:
+        report.update({
+            'n_clusters': len(groups),
+            'cluster_design': _kish_design(groups, n),
+            'method': ('paired percentile cluster bootstrap over shared '
+                       'evaluation units + two-sided centered bootstrap '
+                       'hypothesis test (Davison & Hinkley 1997, §4.4)'),
+        })
+    return report
 
 
 def throughput_summary(*, n_tokens: int, elapsed_s: float,

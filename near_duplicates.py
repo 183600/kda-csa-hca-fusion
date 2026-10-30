@@ -34,12 +34,14 @@ The detector is intentionally conservative about what it *claims*:
   shingles could in principle collide (probability ~2**-64 per pair of
   shingles; not a correctness issue at corpus scale).
 
-The module exposes four building blocks:
+The module exposes five building blocks:
 
 ``minhash_signature``       -- the MinHash sketch for one token sequence.
 ``near_duplicate_pairs``     -- candidate retrieval + exact verification.
 ``near_duplicate_clusters``  -- connected components of the reported pairs,
                                used to drop all but one representative.
+``cluster_labels``           -- one cluster label per document, aligned to
+                               the input order (for cluster-robust inference).
 ``summarize_cross_split``    -- split-aware counts/examples for the audit.
 """
 from __future__ import annotations
@@ -478,6 +480,91 @@ def near_duplicate_clusters(pairs: Iterable[Sequence], n_documents: int,
                 if len(members) > 1]
     clusters.sort(key=lambda members: members[0])
     return clusters
+
+
+def cluster_labels(pairs: Iterable[Sequence], n_documents: int) -> list[int]:
+    """One cluster label per document, aligned to document index.
+
+    Singleton documents are labelled with their own index; every member of
+    a near-duplicate component is labelled with the component's lowest
+    document index. The labels are therefore deterministic, in
+    first-appearance order, and can be passed directly to
+    ``ppl_bootstrap.bootstrap_ppl_ci(..., cluster_ids=labels)`` so that
+    inference resamples whole near-duplicate clusters instead of treating
+    the copies as independent evaluation samples.
+
+    ``pairs`` has the same accepted shape as
+    :func:`near_duplicate_clusters`.
+    """
+    n = _require_int('n_documents', n_documents, minimum=0)
+    labels = list(range(n))
+    for members in near_duplicate_clusters(pairs, n):
+        representative = members[0]
+        for member in members:
+            labels[member] = representative
+    return labels
+
+
+def near_duplicate_cluster_labels(
+        token_ids: Iterable[Sequence[int] | None], *,
+        threshold: float = DEFAULT_NEAR_DUP_THRESHOLD,
+        shingle_size: int = DEFAULT_NEAR_DUP_SHINGLE_SIZE,
+        num_perm: int = DEFAULT_NEAR_DUP_NUM_PERM,
+        band_rows: int = DEFAULT_NEAR_DUP_BAND_ROWS,
+        seed: int = 0,
+        max_candidate_pairs: int = DEFAULT_NEAR_DUP_MAX_CANDIDATES,
+) -> dict:
+    """Detect near duplicates and return document-aligned cluster labels.
+
+    Convenience wrapper around :func:`near_duplicate_pairs` +
+    :func:`cluster_labels`. It reports the detector summary (including
+    ``candidates_truncated``) next to the labels so a caller can tell
+    whether the clustering is complete or a lower bound. The labels are
+    intended for cluster-robust evaluation inference, not for dropping
+    rows (pre-split dedup remains ``clean_lm_texts(..., dedup_near=True)``).
+    """
+    token_ids = list(token_ids)
+    detector = near_duplicate_pairs(
+        token_ids, threshold=threshold, shingle_size=shingle_size,
+        num_perm=num_perm, band_rows=band_rows, seed=seed,
+        max_candidate_pairs=max_candidate_pairs)
+    labels = cluster_labels(detector['pairs'], len(token_ids))
+    sizes: dict[int, int] = {}
+    for label in labels:
+        sizes[label] = sizes.get(label, 0) + 1
+    size_values = list(sizes.values())
+    total = len(labels)
+    return {
+        'cluster_ids': labels,
+        'n_documents': total,
+        'n_clusters': len(sizes),
+        'n_redundant_documents': total - len(sizes),
+        'cluster_sizes': {
+            'min': (min(size_values) if size_values else None),
+            'max': (max(size_values) if size_values else None),
+            'mean': ((total / len(size_values)) if size_values else None),
+            'largest_share': ((max(size_values) / total)
+                              if total else None),
+        },
+        'candidates_truncated': bool(detector['candidates_truncated']),
+        'detector': {
+            'method': 'token-n-gram jaccard (minhash + exact verification)',
+            'threshold': float(detector['threshold']),
+            'shingle_size': int(detector['shingle_size']),
+            'num_perm': int(detector['num_perm']),
+            'band_rows': int(detector['band_rows']),
+            'seed': int(detector['seed']),
+            'n_candidate_pairs': int(detector['n_candidate_pairs']),
+            'n_pairs': int(detector['n_pairs']),
+            'candidates_truncated': bool(detector['candidates_truncated']),
+            'exact_verification': bool(detector['exact_verification']),
+        },
+        'labels_are_document_indices': True,
+        'note': ('Singleton documents keep their own index; members of a '
+                 'near-duplicate component share its lowest document index. '
+                 'When candidates_truncated is True the clustering is a '
+                 'lower bound.'),
+    }
 
 
 def summarize_cross_split(pairs: Iterable[Sequence],

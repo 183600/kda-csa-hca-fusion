@@ -15,6 +15,8 @@ from fractions import Fraction
 import numpy as np
 
 from near_duplicates import (
+    cluster_labels,
+    near_duplicate_cluster_labels,
     near_duplicate_clusters,
     near_duplicate_pairs,
     summarize_cross_split,
@@ -23,6 +25,7 @@ from train_lm_autodl import (
     _FallbackCharTokenizer,
     _is_nonfinite_document,
     _evenly_spaced_probe_indices,
+    _near_duplicate_cluster_report,
     _probe_token_lengths,
     _text_length_stats,
     _window_digest,
@@ -509,3 +512,54 @@ def test_unigram_counts_must_be_exact_non_negative_integers():
             pass
         else:  # pragma: no cover
             raise AssertionError(f'malformed counters accepted: {fit!r}')
+
+
+def test_cluster_labels_align_to_documents_and_mark_singletons():
+    pairs = [[0, 2, 0.9], [2, 4, 0.85]]
+    assert cluster_labels(pairs, 6) == [0, 1, 0, 3, 0, 5]
+    assert cluster_labels([], 3) == [0, 1, 2]
+    for bad_n in (-1, True, 1.5):
+        try:
+            cluster_labels([], bad_n)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f'invalid n_documents accepted: {bad_n!r}')
+    try:
+        cluster_labels([[0, 9, 0.9]], 3)
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError('out-of-range pair accepted')
+
+
+def test_near_duplicate_cluster_labels_report_is_json_safe():
+    base = list(range(100))
+    near = base.copy()
+    near[50] = 999
+    other = list(range(1000, 1100))
+    report = near_duplicate_cluster_labels(
+        [base, near, other], threshold=0.8, shingle_size=5)
+    assert report['cluster_ids'] == [0, 0, 2]
+    assert report['n_documents'] == 3
+    assert report['n_clusters'] == 2
+    assert report['n_redundant_documents'] == 1
+    assert report['cluster_sizes']['max'] == 2
+    assert report['candidates_truncated'] is False
+    assert report['labels_are_document_indices'] is True
+    json.dumps(report, allow_nan=False)
+
+
+def test_heldout_cluster_report_aligns_texts_to_bootstrap_labels():
+    tok = _FallbackCharTokenizer()
+    base = ' '.join(f'w{i}' for i in range(120))
+    near = base.replace('w20', 'w999')
+    other = ' '.join(f'z{i}' for i in range(120))
+    report = _near_duplicate_cluster_report(
+        [base, near, other], tok, 1024, threshold=0.8,
+        shingle_size=5, num_perm=64, max_candidate_pairs=1000)
+    assert report['cluster_ids'][0] == report['cluster_ids'][1]
+    assert report['cluster_ids'][2] == 2
+    assert report['n_redundant_documents'] == 1
+    assert report['n_tokenize_errors'] == 0
+    json.dumps(report, allow_nan=False)

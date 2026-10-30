@@ -476,3 +476,111 @@ def test_throughput_rates_are_json_safe_for_extreme_finite_timings():
     assert slow['tokens_per_second'] == 1e-308
     assert slow['ms_per_sequence'] is None
     json.dumps(slow, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# Cluster-robust inference (near-duplicate / group resampling)
+# ---------------------------------------------------------------------------
+
+def test_cluster_design_report_arithmetic_and_validation():
+    report = P.cluster_design_report([0, 0, 1, 2, 2, 2])
+    assert report['n_units'] == 6
+    assert report['n_clusters'] == 3
+    assert report['n_singleton_clusters'] == 1
+    assert report['n_multi_unit_clusters'] == 2
+    assert report['cluster_sizes']['min'] == 1
+    assert report['cluster_sizes']['max'] == 3
+    assert report['cluster_sizes']['mean'] == pytest.approx(2.0)
+    # Kish: (2 + 1 + 3)^2 / (4 + 1 + 9) = 36 / 14.
+    assert report['effective_n_units'] == pytest.approx(36.0 / 14.0)
+    assert report['design_effect'] == pytest.approx(14.0 / 6.0)
+
+    singleton = P.cluster_design_report([0, 1, 2, 3])
+    assert singleton['effective_n_units'] == pytest.approx(4.0)
+    assert singleton['design_effect'] == pytest.approx(1.0)
+
+    empty = P.cluster_design_report([])
+    assert empty['n_units'] == 0 and empty['n_clusters'] == 0
+    assert empty['cluster_sizes']['min'] is None
+    assert empty['design_effect'] is None
+
+    for bad in (None, [0, True], [0, None], [0, 1.5], [0, [1]]):
+        with pytest.raises(ValueError):
+            P.cluster_design_report(bad)
+
+
+def test_cluster_bootstrap_singletons_match_unit_bootstrap_exactly():
+    units = [(4.0, 2), (5.0, 2), (3.0, 1), (6.0, 3), (2.0, 2)]
+    ids = list(range(len(units)))
+    base = P.bootstrap_ppl_ci(units, n_boot=500, seed=7)
+    clustered = P.bootstrap_ppl_ci(units, n_boot=500, seed=7,
+                                   cluster_ids=ids)
+    assert clustered['ci_mean_nll'] == base['ci_mean_nll']
+    assert clustered['perplexity'] == base['perplexity']
+    assert clustered['n_clusters'] == len(units)
+    assert clustered['cluster_design']['design_effect'] == pytest.approx(1.0)
+    assert clustered['resampling_unit'] == 'cluster'
+
+
+def test_cluster_bootstrap_widens_ci_for_redundant_units():
+    # Two groups of three identical documents, with very different NLL.
+    # Treating all six as independent hides the between-group variance;
+    # resampling the two clusters exposes it.
+    units = [(1.0 * 10, 10)] * 3 + [(3.0 * 10, 10)] * 3
+    ids = [0, 0, 0, 1, 1, 1]
+    base = P.bootstrap_ppl_ci(units, n_boot=2000, seed=3)
+    clustered = P.bootstrap_ppl_ci(units, n_boot=2000, seed=3,
+                                   cluster_ids=ids)
+    base_width = base['ci_mean_nll'][1] - base['ci_mean_nll'][0]
+    cluster_width = (clustered['ci_mean_nll'][1]
+                     - clustered['ci_mean_nll'][0])
+    assert cluster_width > base_width
+    assert clustered['n_clusters'] == 2
+    assert clustered['cluster_design']['design_effect'] == pytest.approx(3.0)
+    assert clustered['degenerate'] is False
+    import json
+    json.dumps(clustered, allow_nan=False)
+
+    # A single cluster has no resampling distribution at all.
+    one = P.bootstrap_ppl_ci(units, n_boot=100, seed=3,
+                             cluster_ids=[0] * 6)
+    assert one['degenerate'] is True
+    assert one['ci_mean_nll'][0] == one['ci_mean_nll'][1]
+
+
+def test_cluster_ids_align_after_zero_token_filtering():
+    units = [(1.0, 0), (2.0, 4), (3.0, 4)]
+    rep = P.bootstrap_ppl_ci(units, n_boot=50, seed=0,
+                             cluster_ids=[0, 0, 1])
+    # The zero-token unit is dropped, so labels [0, 0, 1] become [0, 1].
+    assert rep['n_units'] == 2 and rep['n_clusters'] == 2
+
+    a = [(1.0, 4), (5.0, 0), (3.0, 4), (4.0, 4)]
+    b = [(1.1, 4), (2.0, 4), (3.1, 0), (4.1, 4)]
+    paired = P.paired_bootstrap_ppl(
+        a, b, n_boot=50, seed=0, cluster_ids=[0, 1, 2, 3])
+    # The UNION of zero-token positions {1, 2} is dropped; labels for the
+    # surviving units are [0, 3].
+    assert paired['n_units'] == 2 and paired['n_clusters'] == 2
+
+    for bad in ([0], [0, 1.5, 2], [0, True, 2], [0, None, 2]):
+        with pytest.raises(ValueError):
+            P.bootstrap_ppl_ci(units, n_boot=10, cluster_ids=bad)
+    with pytest.raises(ValueError):
+        P.paired_bootstrap_ppl(
+            [(1.0, 2), (2.0, 2)], [(1.0, 2), (2.0, 2)],
+            n_boot=10, cluster_ids=[0])
+
+
+def test_paired_cluster_bootstrap_singletons_match_unit_path():
+    a = _units_from_means([2.0 + 0.1 * i for i in range(10)])
+    b = _units_from_means([2.4 + 0.1 * i for i in range(10)])
+    ids = list(range(len(a)))
+    base = P.paired_bootstrap_ppl(a, b, n_boot=500, seed=9)
+    clustered = P.paired_bootstrap_ppl(a, b, n_boot=500, seed=9,
+                                       cluster_ids=ids)
+    assert clustered['ci_delta_mean_nll'] == base['ci_delta_mean_nll']
+    assert clustered['p_value'] == base['p_value']
+    assert clustered['delta_mean_nll'] == base['delta_mean_nll']
+    assert clustered['n_clusters'] == len(a)
+    assert clustered['resampling_unit'] == 'cluster'
