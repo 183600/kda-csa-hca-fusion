@@ -97,6 +97,37 @@ def _ratio_vs_gqa(row, kind, default_mode='5l'):
     return ratio if ratio is not None else None
 
 
+def _select_accounting_mode(data):
+    """Pick the preferred accounting mode present in a result set."""
+    available_modes = {r.get('accounting_mode') for r in data
+                       if 'accounting_mode' in r}
+    if 'full_accounting' in available_modes:
+        return 'full_accounting'
+    if 'compressed_kv_only' in available_modes:
+        return 'compressed_kv_only'
+    return None
+
+
+def _accounting_mode_note(mode) -> str:
+    """Human-readable label for the accounting mode used by a figure."""
+    return {'full_accounting': 'full KV accounting',
+            'compressed_kv_only': 'compressed-KV-only accounting'}.get(
+                mode, f'accounting_mode={mode!r}')
+
+
+def _ratios_by_op(data, kind, mode):
+    """Group the selected KV/FLOPs ratio by operator for plotting."""
+    ops = {}
+    for row in data:
+        if mode is not None and row.get('accounting_mode', mode) != mode:
+            continue
+        ratio = _ratio_vs_gqa(row, kind)
+        if ratio is None:
+            continue
+        ops.setdefault(row['op'], []).append((row['T'], ratio))
+    return ops
+
+
 def _ratio_layers(ratio: str) -> int:
     """Return the total layer count encoded by a ratio string like '3:1:1'.
 
@@ -234,28 +265,13 @@ def fig_benchmark():
 def fig_kv_cache():
     """Figure: KV cache size ratio vs GQA baseline."""
     data = load('exp3_kv_cache.json')
-    available_modes = {r.get('accounting_mode') for r in data if 'accounting_mode' in r}
-    if 'full_accounting' in available_modes:
-        mode = 'full_accounting'
-    elif 'compressed_kv_only' in available_modes:
-        mode = 'compressed_kv_only'
-    else:
-        mode = None
-    ops = {}
-    for r in data:
-        if mode is not None and r.get('accounting_mode', mode) != mode:
-            continue
-        ratio = _ratio_vs_gqa(r, 'kv')
-        if ratio is None:
-            continue
-        ops.setdefault(r['op'], []).append((r['T'], ratio))
+    mode = _select_accounting_mode(data)
+    ops = _ratios_by_op(data, 'kv', mode)
     if not ops:
         print('Skipping fig_kv_cache (no data to plot for the selected '
               f'accounting_mode={mode!r})')
         return
-    mode_note = {'full_accounting': 'full KV accounting',
-                 'compressed_kv_only': 'compressed-KV-only accounting'}.get(
-                     mode, f'accounting_mode={mode!r}')
+    mode_note = _accounting_mode_note(mode)
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}
@@ -289,28 +305,13 @@ def fig_kv_cache():
 def fig_flops():
     """Figure: prefill FLOPs ratio vs GQA baseline."""
     data = load('exp3_kv_cache.json')
-    available_modes = {r.get('accounting_mode') for r in data if 'accounting_mode' in r}
-    if 'full_accounting' in available_modes:
-        mode = 'full_accounting'
-    elif 'compressed_kv_only' in available_modes:
-        mode = 'compressed_kv_only'
-    else:
-        mode = None
-    ops = {}
-    for r in data:
-        if mode is not None and r.get('accounting_mode', mode) != mode:
-            continue
-        ratio = _ratio_vs_gqa(r, 'flops')
-        if ratio is None:
-            continue
-        ops.setdefault(r['op'], []).append((r['T'], ratio))
+    mode = _select_accounting_mode(data)
+    ops = _ratios_by_op(data, 'flops', mode)
     if not ops:
         print('Skipping fig_flops (no data to plot for the selected '
               f'accounting_mode={mode!r})')
         return
-    mode_note = {'full_accounting': 'full KV accounting',
-                 'compressed_kv_only': 'compressed-KV-only accounting'}.get(
-                     mode, f'accounting_mode={mode!r}')
+    mode_note = _accounting_mode_note(mode)
     fig, ax = plt.subplots(figsize=(7, 4.5))
     markers = {'softmax_gqa': 'o-', 'kda': 's-', 'csa': 'D-',
                'hca': 'v-', 'hybrid_kch': 'p-'}

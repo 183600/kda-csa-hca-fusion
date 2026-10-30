@@ -2,9 +2,10 @@
 
 **English** · [中文](#中文版)
 
-A naive PyTorch reference implementation and experimental harness for a hybrid
-linear-attention architecture that combines three operators from recent
-long-context / efficient-attention literature:
+This repository provides a readable, correctness-first PyTorch reference
+implementation and experimental harness for a hybrid linear-attention stack.
+The stack pairs a switchable recurrent-memory operator with two complementary
+retrieval operators from recent long-context / efficient-attention literature:
 
 * **KDA** — Kimi-style Delta Attention (recurrent delta-rule with per-channel
   log-decay). Bulk token mixing, O(1) state per head.
@@ -59,23 +60,44 @@ eight-group experiment matrix.
 
 ---
 
+## Contents
+
+- [Repository layout](#repository-layout)
+- [Installation](#installation)
+- [Running the experiments](#running-the-experiments)
+- [Tests](#tests)
+- [Result files](#result-files)
+- [Fairness notes](#fairness-notes-read-before-interpreting-figures)
+- [Limitations](#limitations)
+- [Papers](#papers)
+- [License](#license)
+
+---
+
 ## Repository layout
 
 ```
 .
 ├── ops_kda.py             # KDA reference: naive_recurrent_kda, naive_chunk_kda
 ├── ops_kda_backend.py     # Optional KDA backend adapter: reference / FLA / auto
+├── ops_kda_autograd.py    # Custom autograd for the recurrent KDA path
 ├── ops_mamba.py           # Mamba-2 (SSD) reference mixer: scan + unified prefill/step
 ├── ops_mamba_backend.py   # Optional Mamba-2 backend adapter: reference / mamba_ssm / auto
+├── ops_rwkv.py            # RWKV-7 reference mixer (third memory route)
+├── ops_rwkv_backend.py    # Optional RWKV-7 backend adapter
 ├── ops_rope.py            # Partial RoPE (DeepSeek-V4 §2.3.3) for CSA/HCA
+├── ops_norm.py            # RMSNorm reference helpers shared by the operators
 ├── ops_csa.py             # CSA: compress_kv (overlapped), lightning indexer, naive_csa
 ├── ops_hca.py             # HCA: heavy compression + dense MQA + SW, naive_hca
 ├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache / Mamba2DecodingState
 ├── ops_fused.py           # HybridConfig + build_mixer factory + HybridAttentionStack
 │                          #   (HybridKCHAttention kept as the compat name)
+├── checks/                # Correctness checks grouped by subsystem
+├── quality/               # MQAR task, model, training, and statistics helpers
+├── docs/                  # Design notes and experiment contracts
 ├── docs/mamba2-framework.md # Switchable KDA/Mamba-2 framework design document
 ├── COMPARISON.md          # ops_* vs early toy implementation comparison
-├── run_correctness.py     # 290+ regression checks (custom runner; pytest-importable)
+├── run_correctness.py     # Regression checks (custom runner; pytest-importable)
 ├── run_benchmark.py       # Exp 2: latency vs. sequence length (with op_boundary metadata)
 ├── run_quality.py         # Exp 4: MQAR + kv-update/long-range/multi-agg probes (multi-seed)
 ├── run_ablation.py        # Exp 5: ratio sweep (ABL_MODE=ratio) | eight-group matrix (matrix)
@@ -109,7 +131,7 @@ matrix). The `pyproject.toml` declares `requires-python = ">=3.10,<3.14"`.
 git clone https://gitee.com/qwe12345678/kda-csa-hca-fusion.git
 cd kda-csa-hca-fusion
 
-# 2. Install dependencies (pinned to match the committed historical results)
+# 2. Install the package and its runtime dependencies
 pip install -e .        # installs torch, einops, matplotlib, numpy, scipy
 #    OR, if you only need the runtime deps without the dev toolchain:
 #    pip install -r requirements.txt
@@ -151,6 +173,28 @@ python -m run_correctness       # or: python run_correctness.py
 python -m run_benchmark
 python -m run_all
 ```
+
+### Quick start
+
+```python
+import torch
+from ops_fused import HybridConfig, HybridAttentionStack
+
+cfg = HybridConfig(d_model=64, n_heads_qk=2, n_heads_v=2,
+                   head_dim_k=16, head_dim_v=16, kda_chunk_size=4)
+model = HybridAttentionStack(cfg, total_layers=5).eval()
+
+x = torch.randn(2, 8, cfg.d_model)
+with torch.no_grad():
+    y = model(x)
+
+print(y.shape)  # torch.Size([2, 8, 64])
+```
+
+`HybridAttentionStack` applies the configured memory/CSA/HCA layout and
+returns a tensor shaped `[batch, sequence, d_model]`. See
+[Switchable KDA / Mamba-2 memory route](#switchable-kda--mamba-2-memory-route-quick-start)
+for layout overrides and per-op configuration.
 
 ### Kaggle
 
@@ -681,7 +725,7 @@ with `run_quality.py` / `run_decoding.py`.
 
 [English](#kda-csa-hca-fusion) · **中文**
 
-一个朴素的 PyTorch 参考实现与实验框架，实现一种混合线性注意力架构，组合了近期长上下文 / 高效注意力文献中的三类算子：
+本仓库提供一个可读、正确性优先的 PyTorch 参考实现与实验框架，用于一种混合线性注意力栈。该栈把一个可切换的递归记忆算子与两个互补的检索算子组合在一起：
 
 * **KDA** —— Kimi 风格的 Delta Attention（带逐通道对数衰减的递归 delta-rule）。承担主要的 token 混合，每头状态为 O(1)。
 * **Mamba-2** —— SSD（arXiv:2405.21060）混合器，带逐头矩阵状态；是第二条可选的递归记忆路线（`memory_type='mamba2'`），与 KDA 遵循相同的 O(1) 状态解码契约。
@@ -703,23 +747,44 @@ with `run_quality.py` / `run_decoding.py`.
 
 ---
 
+## 目录
+
+- [仓库结构](#仓库结构)
+- [安装](#安装)
+- [运行实验](#运行实验)
+- [测试](#测试)
+- [结果文件](#结果文件)
+- [公平性说明](#公平性说明解读图表前必读)
+- [局限性](#局限性)
+- [论文](#论文)
+- [许可证](#许可证)
+
+---
+
 ## 仓库结构
 
 ```
 .
 ├── ops_kda.py             # KDA 参考实现：naive_recurrent_kda、naive_chunk_kda
 ├── ops_kda_backend.py     # 可选 KDA 后端适配器：reference / FLA / auto
+├── ops_kda_autograd.py    # 递归 KDA 路径的自定义 autograd
 ├── ops_mamba.py           # Mamba-2 (SSD) 参考混合器：scan + 统一的 prefill/step
 ├── ops_mamba_backend.py   # 可选 Mamba-2 后端适配器：reference / mamba_ssm / auto
+├── ops_rwkv.py            # RWKV-7 参考混合器（第三条记忆路线）
+├── ops_rwkv_backend.py    # 可选 RWKV-7 后端适配器
 ├── ops_rope.py            # CSA/HCA 用的部分 RoPE（DeepSeek-V4 §2.3.3）
+├── ops_norm.py            # 各算子共享的 RMSNorm 参考实现
 ├── ops_csa.py             # CSA：compress_kv（重叠式）、lightning 索引器、naive_csa
 ├── ops_hca.py             # HCA：重度压缩 + 稠密 MQA + SW，naive_hca
 ├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache / Mamba2DecodingState
 ├── ops_fused.py           # HybridConfig + build_mixer 工厂 + HybridAttentionStack
 │                          #   （HybridKCHAttention 保留为兼容名）
+├── checks/                # 按子系统分组的正确性检查
+├── quality/               # MQAR 任务、模型、训练与统计辅助
+├── docs/                  # 设计说明与实验契约
 ├── docs/mamba2-framework.md # 可切换 KDA/Mamba-2 框架的设计文档
 ├── COMPARISON.md          # ops_* 与早期 toy 实现的对比
-├── run_correctness.py     # 290+ 项回归检查（自定义 runner；可被 pytest 导入）
+├── run_correctness.py     # 回归检查（自定义 runner；可被 pytest 导入）
 ├── run_benchmark.py       # 实验 2：延迟 vs 序列长度（含 op_boundary 元数据）
 ├── run_quality.py         # 实验 4：MQAR + kv-update/long-range/multi-agg 探针（多种子）
 ├── run_ablation.py        # 实验 5：比例扫描（ABL_MODE=ratio）| 八组矩阵（matrix）
@@ -751,7 +816,7 @@ with `run_quality.py` / `run_decoding.py`.
 git clone https://gitee.com/qwe12345678/kda-csa-hca-fusion.git
 cd kda-csa-hca-fusion
 
-# 2. 安装依赖（与已提交的历史结果对齐锁定）
+# 2. 安装包及其运行时依赖
 pip install -e .        # 安装 torch、einops、matplotlib、numpy、scipy
 #    或者，只需要运行时依赖、不需要开发工具链时：
 #    pip install -r requirements.txt
@@ -787,6 +852,27 @@ python -m run_correctness       # 或者：python run_correctness.py
 python -m run_benchmark
 python -m run_all
 ```
+
+### 快速开始
+
+```python
+import torch
+from ops_fused import HybridConfig, HybridAttentionStack
+
+cfg = HybridConfig(d_model=64, n_heads_qk=2, n_heads_v=2,
+                   head_dim_k=16, head_dim_v=16, kda_chunk_size=4)
+model = HybridAttentionStack(cfg, total_layers=5).eval()
+
+x = torch.randn(2, 8, cfg.d_model)
+with torch.no_grad():
+    y = model(x)
+
+print(y.shape)  # torch.Size([2, 8, 64])
+```
+
+`HybridAttentionStack` 按配置的记忆 / CSA / HCA 布局执行前向，返回形状为
+`[batch, sequence, d_model]` 的张量。布局覆盖与各算子配置见
+[可切换的 KDA / Mamba-2 记忆路由](#可切换的-kda--mamba-2-记忆路由快速上手)。
 
 ### Kaggle
 

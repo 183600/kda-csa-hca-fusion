@@ -62,16 +62,7 @@ import math
 import random
 
 import ppl_bootstrap as _pb
-
-
-def _is_finite_real(value) -> bool:
-    """True for a non-bool real representable as a finite float."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except (OverflowError, ValueError):
-        return False
+from multi_seed_stats import _is_finite_real
 
 
 def _study_float(value, label: str) -> float:

@@ -78,28 +78,6 @@ def _none_or_norm(g):
         return 'None'
     return float(g.abs().sum().item())
 
-def _ok(name: str, cond: bool, detail: str = '') -> dict:
-    status = 'PASS' if cond else 'FAIL'
-    msg = f"  [{status}] {name}: {detail}"
-    if cond:
-        logger.info(msg)
-    else:
-        logger.error(msg)
-    return {'name': name, 'status': status, 'detail': detail}
-
-
-def _none_or_norm(g):
-    """Return ``'None'`` if ``g is None`` else the L1 norm as a float.
-
-    Used by ``test_csa_indexer_ste_gradient`` to render the per-parameter
-    gradient in a compact form for the failure detail message. Returning
-    the L1 norm (instead of the full tensor) keeps log lines short even
-    when the test runs at large ``c`` / ``c_I``.
-    """
-    if g is None:
-        return 'None'
-    return float(g.abs().sum().item())
-
 
 def _make_csa_decoding_params(d, c, c_I, m, nh, nIh, dc, device, seed=0):
     """Build random CSA parameters for the decoding cache tests."""

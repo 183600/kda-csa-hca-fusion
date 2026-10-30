@@ -109,8 +109,9 @@ import sys
 import tempfile
 from collections.abc import Mapping
 
-from multi_seed_stats import (exact_test_resolution, min_detectable_effect,
-                              power_at_effect, seeds_required)
+from multi_seed_stats import (_sqrt_count, exact_test_resolution,
+                              min_detectable_effect, power_at_effect,
+                              seeds_required)
 
 __all__ = [
     'DesignError',
@@ -660,21 +661,6 @@ def _need_number(value, name, *, positive=False, allow_zero=True):
     if not allow_zero and value == 0.0:
         raise DesignError(f'{name} must be non-zero, got {value!r}')
     return value
-
-
-def _sqrt_count(n: int) -> float:
-    """Square root of a non-negative integer, ``inf`` if unrepresentable."""
-    if n <= 0:
-        return 0.0
-    try:
-        return math.sqrt(n)
-    except OverflowError:
-        shift = (n.bit_length() - 1) // 2
-        mantissa = n / (1 << (2 * shift))
-        try:
-            return math.ldexp(math.sqrt(mantissa), shift)
-        except OverflowError:
-            return math.inf
 
 
 def _ratio_by_count(value: float, count: int) -> float:

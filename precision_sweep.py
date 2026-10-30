@@ -77,19 +77,10 @@ from ops_kda_autograd import custom_recurrent_kda  # noqa: E402
 from ops_mamba import (chunked_mamba2_scan, naive_mamba2_scan,  # noqa: E402
                        quadratic_mamba2_scan)
 from ops_rwkv import rwkv7_reference_scan  # noqa: E402
+from multi_seed_stats import _is_finite_real  # noqa: E402
 
 #: ``results_schema`` kind for the optional JSON output.
 SWEEP_KIND = 'precision_sweep'
-
-
-def _is_finite_real(value) -> bool:
-    """True for a non-bool real representable as a finite float."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except (OverflowError, ValueError):
-        return False
 
 
 #: Unit roundoff (half a ulp at 1.0; IEEE binary formats).

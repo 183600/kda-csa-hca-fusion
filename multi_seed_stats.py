@@ -162,6 +162,16 @@ _NORMAL_T_DOF = 200_000_000
 _MAX_EXACT_PERMUTATION_BITS = 20
 
 
+def _is_finite_real(value) -> bool:
+    """True for a non-bool real representable as a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 def _sqrt_count(n: int) -> float:
     """Square root of a non-negative integer, ``inf`` if unrepresentable."""
     if n <= 0:

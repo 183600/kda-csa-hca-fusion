@@ -51,22 +51,13 @@ import random
 import sys
 
 from multi_seed_stats import (
+    _is_finite_real,
     bootstrap_paired_ci,
     holm_adjust,
     paired_t_test,
     permutation_test,
     sign_test,
 )
-
-
-def _is_finite_real(value) -> bool:
-    """True for a non-bool real representable as a finite float."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except (OverflowError, ValueError):
-        return False
 
 
 def _study_float(value, label: str) -> float:
