@@ -1,5 +1,7 @@
 # KDA-CSA-HCA Fusion
 
+**English** · [中文](#中文版)
+
 A naive PyTorch reference implementation and experimental harness for a hybrid
 linear-attention architecture that combines three operators from recent
 long-context / efficient-attention literature:
@@ -577,6 +579,425 @@ committed to this repository (see `.gitignore`); download them from arXiv:
 
 See `LICENSE`.
 
+
+---
+
+## What's new: real LM training + AutoDL for under ¥120 (2026-07)
+
+The repository's original six experiments are correctness / benchmark / MQAR
+probes. The new `train_lm_autodl.py` performs real language-model training
+with `ops_fused.HybridKCHAttention`, supports both Kaggle and AutoDL, and
+costs far less than ¥120.
+
+### 2026-08 paper alignment + regression fixes (changes experiment numbers — please regenerate results/)
+
+Fixes applied after re-reviewing the implementation against
+arXiv:2510.26692 / arXiv:2606.19348:
+
+1. **KDA chunked-path regression fix (P0).** An earlier automated fix had
+   mistakenly changed the A-matrix mask from `diagonal=0` back to
+   `diagonal=1`, which made `naive_chunk_kda` / `scripted_chunk_kda` deviate
+   from the recurrent path by O(1e-2) (25 correctness checks failed,
+   including fp64 gradient consistency). `diagonal=0` has been restored, and
+   a comment was added to prevent the regression from recurring.
+2. **Causal block mask off-by-one (P2-1).** `_causal_block_mask` changed from
+   the window-close form `b < (t+1)//m` to the strictly-preceding form
+   `b < t//m` of the paper's Eq. 16. The decoding caches, the FLOPs
+   accounting, and the corresponding tests were updated in sync.
+3. **Partial RoPE and output counter-rotation per §2.3.3 (P2-2).** New
+   `ops_rope.py`; the CSA/HCA query, compressed KV, and sliding-window keys
+   are rotated on their last `rope_dim` dims (paper value 64, clamped to the
+   head dim), and the output is counter-rotated by −t. Enabled by default at
+   the model level; off by default in the raw operators (backward
+   compatible); the incremental decoding caches support it as well.
+4. **Sliding-window branch restored to the Eq. 27 joint softmax.** Compressed
+   blocks and sliding-window tokens share a single softmax denominator
+   (including the sink), instead of each branch applying its own softmax and
+   the two results being added.
+5. Others: `qk_norm_mode='rms'` option (the paper §2.3.3 RMSNorm form); a
+   fp16 round-trip precision fix for the KDA decode state; a corrected
+   attribution comment for the indexer cosine normalization; Kaggle
+   compatibility (the `run_all.py` version gate relaxed to a warning; the
+   torch upper bound removed).
+
+The correctness suite is now 267 checks, all passing. Because of the mask and
+RoPE changes, CSA/HCA-related experiment numbers will change — please
+regenerate `results/` with `python run_all.py`.
+
+### Why the original ops were not replaced
+
+See [COMPARISON.md](COMPARISON.md) for the comparison: the existing
+`ops_kda/csa/hca` already handle 20+ edge cases (g clamping, STE, sink,
+NaN-safety, chunked SW, decoding cache, ...), which makes them more suitable
+for a paper than the early toy implementation. The original implementations
+are therefore kept, and only the training pipeline was added.
+
+### AutoDL one-command run
+
+```bash
+# max_steps counts optimizer steps; with the small default config the cost on
+# a 3090/4090 stays far below ¥120
+pip install -r requirements.txt
+pip install transformers datasets accelerate
+python train_lm_autodl.py --autodl --max_steps 2000 --seq_len 1024 --batch_size 2
+```
+
+### Kaggle
+
+```python
+!pip install -q transformers datasets
+!python train_lm_autodl.py --kaggle
+```
+
+Default Kaggle config: d=256, 5 layers (3:1:1), seq 512, 500 steps — roughly
+40 minutes on a single T4 (the script uses one GPU, no DDP; on a T4x2
+instance only one of the two cards is used).
+
+> **Note (avoiding a torch downgrade).** Kaggle GPU images ship a CUDA build
+> of torch preinstalled. Just run `!pip install -q transformers datasets`,
+> and do not perform any torch reinstall on Kaggle beyond
+> `pip install -r requirements.txt` / `pip install -e .`. This repository's
+> dependency range is `torch>=2.2,<3`, a no-op for the preinstalled version;
+> if you manually pin an old upper bound such as `<2.7`, pip will downgrade
+> the CUDA torch to a CPU wheel and the GPU becomes unusable.
+
+### Cost breakdown
+
+| Phase | Duration on a 3090 | Cost |
+|---|---|---|
+| Phase1 1024 ctx 2000 optimizer steps | several hours | far below ¥120 |
+| Phase2 4096 ctx 500 optimizer steps | GPU-dependent | far below ¥120 |
+| Total | GPU-dependent | << ¥120 |
+
+Even scaled up to d=512, 12 layers, 4000 steps: 4 h on a 4090 ≈ ¥11 — still
+within budget.
+
+The run produces `checkpoints_lm/final_lm.pt`, which can be further evaluated
+with `run_quality.py` / `run_decoding.py`.
+
+---
+
+# 中文版
+
+[English](#kda-csa-hca-fusion) · **中文**
+
+一个朴素的 PyTorch 参考实现与实验框架，实现一种混合线性注意力架构，组合了近期长上下文 / 高效注意力文献中的三类算子：
+
+* **KDA** —— Kimi 风格的 Delta Attention（带逐通道对数衰减的递归 delta-rule）。承担主要的 token 混合，每头状态为 O(1)。
+* **Mamba-2** —— SSD（arXiv:2405.21060）混合器，带逐头矩阵状态；是第二条可选的递归记忆路线（`memory_type='mamba2'`），与 KDA 遵循相同的 O(1) 状态解码契约。
+* **CSA** —— DeepSeek-V4 压缩稀疏注意力（重叠式双分支 KV 压缩 + 为每个 query 选出 top-k 压缩块的 lightning 索引器）。负责稀疏长程检索。
+* **HCA** —— DeepSeek-V4 重度压缩注意力（单分支重度压缩，在极少量压缩条目上做稠密 MQA，可选滑动窗口）。提供廉价的全局上下文。
+
+默认情况下，混合栈按 `3:1:1` 的 memory:CSA:HCA 比例交错堆叠（见 `ops_fused.HybridAttentionStack`；`HybridKCHAttention` 保留为向后兼容名）。递归记忆槽位可以通过一个配置字段在 KDA 与 Mamba-2 之间切换——设计细节与八组实验矩阵见 [docs/mamba2-framework.md](docs/mamba2-framework.md)。
+
+> **它是什么。** 一个研究级、正确性优先的参考实现。数值边界情况（因果性、dtype、空序列、sink 稳定性、跨解码步的状态管理）的处理比典型的"研究代码堆"更细致——见 `run_correctness.py` 中大量的回归检查。
+>
+> **它不是什么。** 它**不是**生产级 kernel。KDA 用 Python `for` 循环逐时间步递推；CSA/HCA 用基于 `unfold` 的滑窗；没有任何算子做过融合或 Triton 化。`run_benchmark.py` 的延迟数字测的是这个朴素参考实现，**不得**拿来与 FLA / FlashAttention / DeepSeek 生产 kernel 比较。见下文*局限性*一节。
+>
+> **加速路径。** 出于正确性 / 可读性考虑，上述朴素路径仍是默认路径，但仓库提供可选的加速封装，保持完全相同的数值契约：
+>
+> - `ops_kda.compiled_recurrent_kda` —— `naive_recurrent_kda` 的 `torch.compile` 封装，按（形状、dtype、requires_grad）签名缓存。适合中等规模的 `T`（≥1024）；GPU 上典型加速 5–20×。
+> - `ops_kda.scripted_chunk_kda` —— `naive_chunk_kda` 内层逐 chunk 循环的 `torch.jit.script` 封装；当 TorchScript 拒绝输入时会优雅回退到 eager 路径。
+> - `ops_csa._sliding_window_attention` —— 独立的显存高效滑窗注意力；当 `T * win * c > 8M` 个元素时自动分块，把峰值显存从 `O(T · win · c)` 降为 `O(chunk_t · win · c)`。`naive_csa` / `naive_hca` 用的是基于 unfold 的 `_sliding_window_scores`，使窗口条目与压缩分支得分、attention sink 共享同一个联合 softmax。
+> - `naive_csa` 本身把 6 次 `F.linear(H, W_*)` 调用（`W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx`）通过 `torch.cat` + `tensor.split` 融合为单个 matmul，把 kernel 启动开销降低 6×。
+
+---
+
+## 仓库结构
+
+```
+.
+├── ops_kda.py             # KDA 参考实现：naive_recurrent_kda、naive_chunk_kda
+├── ops_kda_backend.py     # 可选 KDA 后端适配器：reference / FLA / auto
+├── ops_mamba.py           # Mamba-2 (SSD) 参考混合器：scan + 统一的 prefill/step
+├── ops_mamba_backend.py   # 可选 Mamba-2 后端适配器：reference / mamba_ssm / auto
+├── ops_rope.py            # CSA/HCA 用的部分 RoPE（DeepSeek-V4 §2.3.3）
+├── ops_csa.py             # CSA：compress_kv（重叠式）、lightning 索引器、naive_csa
+├── ops_hca.py             # HCA：重度压缩 + 稠密 MQA + SW，naive_hca
+├── ops_decoding_cache.py  # CSADecodingCache / HCADecodingCache / Mamba2DecodingState
+├── ops_fused.py           # HybridConfig + build_mixer 工厂 + HybridAttentionStack
+│                          #   （HybridKCHAttention 保留为兼容名）
+├── docs/mamba2-framework.md # 可切换 KDA/Mamba-2 框架的设计文档
+├── COMPARISON.md          # ops_* 与早期 toy 实现的对比
+├── run_correctness.py     # 290+ 项回归检查（自定义 runner；可被 pytest 导入）
+├── run_benchmark.py       # 实验 2：延迟 vs 序列长度（含 op_boundary 元数据）
+├── run_quality.py         # 实验 4：MQAR + kv-update/long-range/multi-agg 探针（多种子）
+├── run_ablation.py        # 实验 5：比例扫描（ABL_MODE=ratio）| 八组矩阵（matrix）
+├── run_decoding.py        # 实验 6：prefill + 逐 token 解码延迟（两条记忆路线都测）
+├── run_kv_cache.py        # 实验 3：解析式 KV-cache + FLOPs 核算（+ 状态分解）
+├── method_analysis.py     # 逐头原型（demo 中把 CSA 简化为稠密）
+├── make_figures.py        # 从 results/ 生成 figures/*（含 quality-vs-cost）
+├── run_all.py             # 单入口 runner（RUN_ALL_PROFILE=smoke|screen|full）
+├── experiment_design.py   # 预注册方案、前瞻功效/MDE、运行时审计
+├── kaggle_setup.py        # CUDA 引导 + 共享工具（sanitize_for_json、parse_int_env）
+├── near_duplicates.py     # token n-gram MinHash/LSH 近重复泄漏检测器
+├── docs/data-integrity.md # 近重复 + 指纹的数据完整性契约
+├── test_figures.py        # 图表生成管线的测试
+├── results/               # 生成的 JSON 输出（gitignored；用 run_all.py 重新生成）
+├── figures/               # 生成的 PDF/PNG 输出（gitignored；用 make_figures.py 重新生成）
+├── requirements.txt
+├── pyproject.toml         # `pip install -e .` 之后各模块可作为包导入
+└── README.md              # 本文件（中英双语）
+```
+
+---
+
+## 安装
+
+**需要 Python 3.10–3.13**（源码使用 PEP 604 的 `X | None` 联合类型语法，完整回归套件在 3.10–3.13 解释器矩阵上验证过）。`pyproject.toml` 声明了 `requires-python = ">=3.10,<3.14"`。
+
+```bash
+# 1. 克隆
+git clone https://gitee.com/qwe12345678/kda-csa-hca-fusion.git
+cd kda-csa-hca-fusion
+
+# 2. 安装依赖（与已提交的历史结果对齐锁定）
+pip install -e .        # 安装 torch、einops、matplotlib、numpy、scipy
+#    或者，只需要运行时依赖、不需要开发工具链时：
+#    pip install -r requirements.txt
+
+# 3.（可选）安装开发工具（pytest、pytest-xdist、mypy、ruff）：
+pip install -e .[dev]
+
+# 4.（可选）安装 FLA KDA 后端。这不会改变默认的参考实验；
+#    需要在 HybridConfig 里显式选择。
+pip install -e '.[fla]'
+```
+
+默认的 `HybridConfig(kda_backend="reference")` 保留原始的 PyTorch KDA 实现。要在 GPU 实验中启用 FLA：
+
+```python
+from ops_fused import HybridConfig
+cfg = HybridConfig(kda_backend="fla")
+```
+
+使用 `kda_backend="auto"` 时，只有当 FLA 已安装且张量在 CUDA 上才会尝试 FLA，否则回退到参考路径。对独立的质量 / 解码 / 基准 runner，在启动前设置同样的选择：
+
+```bash
+KDA_BACKEND=fla python run_benchmark.py
+KDA_BACKEND=auto python run_decoding.py
+```
+
+适配器直接传入已归一化的 q/k、对数空间的门控以及 sigmoid 之后的 beta 值，不会重复施加这些变换。CSA/HCA 始终走仓库参考路径；常规实验不需要任何 Hugging Face 或 vLLM 依赖。
+
+`pip install -e .` 之后，实验脚本可以作为模块运行：
+
+```bash
+python -m run_correctness       # 或者：python run_correctness.py
+python -m run_benchmark
+python -m run_all
+```
+
+### Kaggle
+
+把仓库作为 Dataset 上传，然后在 notebook 单元格里：
+
+```python
+!pip install -q einops matplotlib
+import sys; sys.path.insert(0, '/kaggle/input/<your-dataset-name>')
+%run /kaggle/input/<your-dataset-name>/run_all.py
+```
+
+在 Kaggle T4 上跑 GPU 时，请按 `kaggle_setup.bootstrap_kaggle_cuda()` 记录的 CUDA 引导流程操作（先装 CUDA wheel，再重启 kernel——`setup_kaggle()` 只*验证* CUDA 可用性，不会就地安装）。当前 Kaggle 镜像的 torch 自带 CUDA 预装，因此引导通常是无操作。引导会锁定与检测到的 CUDA wheel 索引**精确匹配**的 torch 版本（`kaggle_setup.py` 里的 `_BOOTSTRAP_TORCH_PINS`）：例如 cu118/cu124/cu126 对应 `torch==2.6.0`，cu121 对应 `torch==2.5.1`（它的最后一个版本），cu128 对应 `torch==2.7.1`（cu128 wheel 的起点）——而且在提示重启之前会验证已安装的 wheel 确实带 `+cuXXX` 构建标签，因此 CPU 回退安装无法再伪装成成功。
+
+面向预装环境的依赖策略：`run_all.py` 不再硬性拒绝超出历史测试边界的 torch/numpy/matplotlib 版本——改为警告并继续（算子代码在正确性上没有版本敏感的 API 依赖；只有 softmax 基线的基准延迟可能随 torch 版本漂移）。缺失的包仍会被安装。设置 `STRICT_DEPS=1` 可以恢复硬版本门禁，用于比特级可复现的历史重跑。相应地，`torch` 在 `requirements.txt` / `pyproject.toml` 中只保留宽松上界（`<3`），保证 `pip install -e .` 绝不降级 Kaggle 预装的 CUDA torch；要复现已提交的历史数字，请自行 pin `torch==2.6.*`。numpy / matplotlib / scipy 的建议区间会在完整套件于新版本上重新验证后扩展（最近一次：2026-08，numpy 2.5.2 / matplotlib 3.11.1 / scipy 1.18.1 / torch 2.13.0）。
+
+Kaggle 免费额度（2×T4、每周 30 小时）下的资源占用：默认参数的 `run_all.py` 是 CPU 量级（约 10 分钟）——不需要 GPU。默认的 `train_lm_autodl.py --kaggle` 配置（d=256、5 层、序列 512、500 个 optimizer 步）在 2×T4 上约 40 分钟、占用几 GB 显存——轻松落在免费额度内。`train_lm_autodl.py` 在没有 `transformers`/`datasets` 时也能运行（对合成文本使用字符级回退分词器），因此纯 CPU 会话也能跑通整条管线。
+
+---
+
+## 运行实验
+
+| 实验 | 脚本 | 输出 | 耗时（CPU） |
+|---|---|---|---|
+| 1. 正确性 | `run_correctness.py` | `results/exp1_correctness.json` | ~10 秒 |
+| 2. 延迟基准 | `run_benchmark.py` | `results/exp2_benchmark.json` | ~30 秒 |
+| 3. KV-cache + FLOPs | `run_kv_cache.py` | `results/exp3_kv_cache.json` | ~1 秒 |
+| 4. 质量探针 | `run_quality.py` | `results/exp4_mqar.json`（+ `exp4b_quality_tasks.json`） | ~3 分钟（5 种子 × 200 步） |
+| 5. 比例消融 | `ABL_MODE=ratio python run_ablation.py` | `results/exp5_ablation.json` | ~5 分钟（7 种子 × 7 种布局） |
+| 5b. 八组矩阵 | `ABL_MODE=matrix python run_ablation.py` | `results/exp5b_ablation_matrix.json` | 见下文 |
+| 6. 解码延迟 | `run_decoding.py` | `results/exp6_decoding.json` | ~30 秒 |
+| 图表 | `make_figures.py` | `figures/fig_*.{pdf,png}` + `quality_vs_*.png` | ~5 秒 |
+
+端到端全部运行：
+
+```bash
+python run_all.py                        # 历史筛选预算（默认）
+RUN_ALL_PROFILE=smoke python run_all.py  # 分钟级：只验证链路
+RUN_ALL_PROFILE=full python run_all.py   # 7 种子，用于多种子统计
+```
+
+任何实验开始之前，`run_all.py` 会先写入 `results/experiment_design.json`：预注册的 SESOI（最小感兴趣效应量）、分析族、所需种子数，以及当前预算实际交付的功效。每个多种子 runner 还会把运行时审计嵌入 `metadata.experiment_design`（`confirmatory` / `reduced_family` / `screening` / `incomplete_attrition` / `exploratory_missing_controls`）。审计会比较"请求的种子块"与"实际进入分析的种子"，因此悄悄丢弃了失败种子的运行会被标记为 `incomplete_attrition` 而非 `confirmatory`。用 `python experiment_design.py --check` 校验注册表；用 `python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json` 把试点的配对 SD 换算成验证性种子预算。见 [docs/experiment-design.md](docs/experiment-design.md)。
+
+比较 / 消融设计还检验**交互效应**，而不只是主效应：实验 5b 报告 route × layout 迁移估计量 `I_route = (D-A)_route1 - (D-A)_route2`，实验 8 报告 `RoPE × selection-density` 的 2×2 交互。两者都是与主对比同一多重性族内的种子配对双重差分行。每个二格矩阵对比还携带 `capacity_matched` / `claim_scope`；固定结构的组之间参数量不同，超出预注册 5% 容差的对比是"算子束 + 容量"效应，而不是容量中立的机制结论。见 [docs/comparative-ablation.md](docs/comparative-ablation.md)。
+
+### 可切换的 KDA / Mamba-2 记忆路由（快速上手）
+
+```python
+from ops_fused import HybridConfig, HybridAttentionStack
+
+# 历史 KDA 路由（默认；与旧行为比特级一致）：
+cfg = HybridConfig(d_model=256)                  # memory_type='kda'
+model = HybridAttentionStack(cfg, total_layers=5)
+
+# Mamba-2 路由：一个字段切换记忆算子，CSA/HCA 原封不动：
+cfg = HybridConfig(d_model=256, memory_type='mamba2',
+                   mamba_d_state=64, mamba_headdim=64)
+model = HybridAttentionStack(cfg, total_layers=5)
+
+# 显式布局（例如八组矩阵的 D 组，10 层）：
+cfg = HybridConfig(d_model=256, memory_type='mamba2',
+                   layout=('memory', 'memory', 'memory', 'csa', 'hca') * 2)
+model = HybridAttentionStack(cfg, total_layers=10)
+```
+
+八组主实验（固定深度下的 KDA/Mamba2 × A/B/C/D）：
+
+```bash
+ABL_MODE=matrix ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
+# 后续预设：ABL_MATRIX=csa_csa | position | budget
+```
+
+环境变量开关（启动前设置）：
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `MQAR_SEEDS` | `5` | 实验 4 的种子数 |
+| `MQAR_STEPS` | `200` | 实验 4 中非 softmax 算子的训练步数 |
+| `MQAR_SOFTMAX_STEPS` | 同 `MQAR_STEPS` | 可选的、显式标注的 softmax 长训练敏感性运行 |
+| `MQAR_OPS` | `softmax,kda,mamba2,csa,hca` | 实验 4 的算子列表（设为 `softmax,kda,csa,hca` 可复现历史 4 算子表格） |
+| `MQAR_TASKS` | `mqar` | 实验 4 的任务列表：`mqar`、`kv_update`、`long_range`、`multi_agg` 或 `all` |
+| `ABL_SEEDS` | `7` | 实验 5 的种子数 |
+| `ABL_STEPS` | `100` | 实验 5 的训练步数 |
+| `ABL_MODE` | `ratio` | `ratio`（历史扫描）或 `matrix`（八组设计） |
+| `ABL_MATRIX` | `main8` | 矩阵预设：`main8`、`csa_csa`、`position`、`budget` |
+| `ABL_TOTAL_LAYERS` | `10` | 所有矩阵组的固定深度（5 的倍数） |
+| `ABL_MEMORY` | `kda,mamba2` | 矩阵中交叉的记忆路由 |
+| `ABL_D_MODEL` | `32` | 矩阵模型宽度（从筛选到正式阶段可调大） |
+| `BENCH_LENGTHS` | `128,256,512,1024,2048` | 实验 2 的序列长度 |
+| `BENCH_REPEATS` | `5` | 实验 2 中每个 (T, op) 的计时重复次数 |
+| `MQAR_TRAIN_BATCH` | `32` | 实验 4 的训练 batch size |
+| `ABL_TRAIN_BATCH` | `16` | 实验 5 的训练 batch size |
+| `MQAR_NKV` | `1` | 逗号分隔的实验 4 MQAR `n_kv` 取值（例如 `1,2,4`） |
+| `ABL_NKV` | `1` | 逗号分隔的实验 5 MQAR `n_kv` 取值 |
+| `SKIP_SLOW` | `0` | `1` 时在 CPU 上截断实验 2/4/5 |
+| `SKIP_CUDA_CHECK` | `0` | `1` 时绕过 CUDA 可用性守卫 |
+| `KDA_BACKEND` | `reference` | `reference`、`fla` 或 `auto`；作用于混合模型、独立 KDA 质量 / 解码、消融以及 KDA 基准路径 |
+| `MAMBA_BACKEND` | `reference` | `reference`、`official`（需要 CUDA + `pip install -e '.[mamba]'`；不可用时会明确报错）或 `auto`；解析到的后端会记录到每个结果行 |
+| `MAMBA2_D_STATE` / `MAMBA2_HEADDIM` / `MAMBA2_EXPAND` / `MAMBA2_D_CONV` | `16` / `16` / `2` / `4` | 质量 / 消融 / 矩阵 runner 的小模型 Mamba-2 几何参数（headdim 自动钳位到能整除 `expand × d_model` 的值） |
+| `RUN_ALL_PROFILE` | `screen` | `run_all.py` 的 `smoke` / `screen` / `full` 预算档（预设只碰你没有显式 export 的环境变量） |
+
+---
+
+## 测试
+
+```bash
+# 自定义 runner（290+ 项检查，含长耗时的正确性检查）：
+python run_correctness.py
+
+# pytest 兼容：测试函数遵循标准 `test_*` 命名约定，
+# 因此也能被 pytest 发现：
+pip install pytest
+pytest -q run_correctness.py
+pytest -q test_figures.py
+```
+
+自定义 runner 是规范入口——它输出结构化的 `results/exp1_correctness.json` 和供 `run_all.py` 编排器消费的通过 / 失败汇总。开发过程中用 `pytest` 做选择性 / 并行运行。
+
+---
+
+## 结果文件
+
+| 文件 | Schema | 说明 |
+|---|---|---|
+| `results/exp1_correctness.json` | `[{name, status, detail}, ...]` | 自定义 runner 的逐检查行 |
+| `results/exp2_benchmark.json` | `[{T, op, time_ms, peak_mem_MB, device, repeats, compute_boundary, n_layers, note}, ...]` | **`compute_boundary` 因算子而异**——见*公平性说明* |
+| `results/exp3_kv_cache.json` | `[{T, op, accounting_mode, accounting_semantics, kv_bytes, kv_elements, ...}, ...]` | 解析模型，非实测 |
+| `results/exp4_mqar.json` | `{metadata, results: [{op, n_kv, per_seed: [...], mean_acc, std_acc, ci95_acc, chance_acc, conclusions_valid, ...}, ...]}` | 多种子 + CI95 + Bonferroni；行内带 `task` + `n_params`，默认包含 `mamba2` 算子 |
+| `results/exp4b_quality_tasks.json` | `{metadata, results: [...]}` | kv-update / long-range / multi-agg 探针（`MQAR_TASKS`）使用同一信封 |
+| `results/exp5_ablation.json` | `[{ratio, layout, n_kv, per_seed, mean_acc, ...}, ...]` | 与 exp4 相同的信封但无 metadata 包装（`ABL_MODE=ratio`） |
+| `results/exp5b_ablation_matrix.json` | `[{group, memory, layout, n_kv, per_seed, mean_acc, n_params, total_layers, d_model, ...}, ...]` | 八组矩阵及其预设（`ABL_MODE=matrix`）；`metadata.design_audit.capacity_audit` 标注参数量混杂 |
+| `results/exp5b_ablation_matrix_contrasts.json` | `[{n_kv, memory, contrast, mean_diff, t_stat, sd_diff, n_common_seeds, predicted_direction, capacity_matched, claim_scope, interaction_type, interaction_cells, ...}, ...]` | 配对对比；含 `I_route(D)=(D-A)_route1-(D-A)_route2` 与逐行容量记账 |
+| `results/exp8_mechanism_ablation.json` | `{metadata, results: [{variant, n_kv, per_seed, mean_acc, paired_vs_baseline_*, gold_pr_auc, ...}, ...]}` | `metadata.factorial_interactions.results` 保存预注册的 RoPE × selection-density 2×2 交互 |
+| `results/exp6_decoding.json` | `[{op, prefill_ms, mean_decode_ms_per_token, median_decode_ms_per_token, peak_mem_MB, uses_incremental_cache, prefill_cache_build, compute_boundary, n_layers, ...}, ...]` | softmax / KDA / CSA / HCA / 混合（独立 CSA/HCA 与混合模型使用增量解码缓存；`n_layers` 标注混合模型是 5 层栈而其余是单层方法） |
+| `results/experiment_design.json` | `{schema_version, kind: "experiment_design", metadata, results: [{plan_id, factors, sesoi, planned_seeds, planning, status}, ...]}` | 前瞻方案 + 所需 n，由 `run_all.py` 在实验开始前写入 |
+| `results/summary.json` | `{env: {git_commit, torch_version, cuda_version, kda_backend, ...}, runs: [{name, status, time_s}], n_ok, n_fail, total_time_s}` | 由 `run_all.py` 产出 |
+
+> **已知的 schema 不一致。** 实验 4 把结果包在 `{metadata, results: [...]}` 里；其他实验输出裸列表。为了对下游图表代码（`make_figures.load` 两种都能处理）保持向后兼容，我们保留两种形状。后续工作：统一为带 `schema_version` 字段的信封。
+
+---
+
+## 公平性说明（解读图表前必读）
+
+若干实验决策会影响跨算子比较。图表和 JSON 输出会尽可能标注这些点，但它们很容易被忽略：
+
+### 1. 基准测试的计算边界（实验 2）
+
+`run_benchmark.py` 里的算子在**不同的边界**下计时：
+
+| 算子 | 边界 | 包含的内容 |
+|---|---|---|
+| `softmax`, `kda_rec`, `kda_chunk`, `mamba2_scan` | `core` | 只计注意力 / 递推 kernel；q/k/v（以及 g/beta、x/dt/B/C）在计时区之外预先投影。`mamba2_scan` 与 `kda_rec` 容量匹配（4 头 × 32×32 状态） |
+| `csa`, `hca`, `mamba2_layer` | `end_to_end_single_layer` | 单层端到端：输入投影 + 压缩 / conv + 索引器 / scan + 注意力 + 输出投影 |
+| `hybrid`, `hybrid_mamba2` | `end_to_end_multi_layer` | 5 层栈，含 LayerNorm、投影、注意力、状态管理；两行的 CSA/HCA 几何完全相同，因此这一对隔离了记忆算子的替换 |
+
+这些数字**不可**直接当作"算子延迟"来比较。`make_figures.fig_benchmark` 会按 `compute_boundary` 拆成不同子图，并在图注中打印警告。本仓库提交的旧 `results/exp2_benchmark.json` 早于 `compute_boundary` 字段；请用 `python run_benchmark.py` 重新生成以获得该元数据，或依赖 `make_figures.py` 中的 `_OP_BOUNDARY_FALLBACK` 映射处理旧文件。
+
+### 2. softmax 基线的训练步数（实验 4）
+
+主对比给**每个算子相同的 optimizer 步数预算**（`MQAR_STEPS`，默认 200）。这避免让 softmax 占到额外优化的便宜。由于 softmax 收敛可能更慢，可选的敏感性运行可以显式把 `MQAR_SOFTMAX_STEPS` 设为更大的值；这类运行不是固定预算对比，必须单独标注。每种子的 `steps` 字段记录实际使用的预算。
+
+### 3. MQAR 的统计功效（实验 4）
+
+默认 MQAR 配置（`vocab=16, seq_len=16, n_kv=1`）的随机水平准确率为 6.25%。若干消融落在随机水平上下几个百分点内，因此 `run_quality.py` 中的 `conclusions_valid` 标志和 Bonferroni 校正的 t 检验才是权威信号——只看 `mean_acc` 会有误导性。请把接近随机水平的结果当作*冒烟级质量探针*，而不是结构性结论。目前报告的统计检验主要是**相对随机基线**的，不是算子两两之间的检验；除非你补做并报告显式的两两检验，否则不要声称算子 A 显著优于算子 B。
+
+### 4. 解码实验的范围（实验 6）
+
+`run_decoding.py` 对 **softmax、KDA、Mamba-2、CSA、HCA 以及混合栈（两条记忆路由）** 同时测量 prefill 和逐 token 解码延迟。CSA 和 HCA 使用 `ops_decoding_cache.py` 实现的增量解码缓存（`CSADecodingCache` / `HCADecodingCache`），它维护：
+
+* **部分 token 累加器**（Python `list`）——缓冲 0..m-1 个新 token，直到能凑出一个压缩块；
+* **压缩块缓存**（`[B, n_blocks, c]` 张量）——每 `m`（CSA）/ `m2`（HCA）个 token 增加一行；
+* **滑窗环形缓冲**（`[B, win, c]` 张量）——最近 `win` 个未压缩局部 key 的定长 FIFO；
+* **动态更新的索引器 key 缓存**（仅 CSA，`[B, n_blocks, c_I]` 张量）——与压缩块缓存同步增长，使 lightning 索引器不必重算完整历史就能为新块打分。
+
+缓存避免了每步解码都对整个前缀重新压缩，但注意力 / 索引器的工作量仍随已完成压缩块的数量增长：CSA 大约是 **O(T/m + win)**，HCA 大约是 **O(T/m2 + win)**（另有 Python 参考实现的开销）。独立 CSA/HCA 行和混合行在 token 解码期间使用这些缓存；混合包装器为完整 KDA+CSA+HCA 栈的每个 CSA/HCA 子层各接入一个缓存，使 CSA/HCA 层能看到 prefill 历史而不只是当前 token。小型解码基准使用的几何比实验 4/5 的模型更轻（`csa_topk=2`、`c=8`、`dc=8`、`m2=4`、`d_model=64`，保留稀疏 top-k 路径）；它的逐 token 解码数字不能与实验 4/5 的质量结果正面比较。启用缓存的 CSA/HCA/混合行的 `prefill_ms` 包含正确性优先的 Python 缓存填充（JSON 中的 `prefill_cache_build`：独立 CSA/HCA 为 `"batched_append_from_naive_output"`，混合模型为 `"batched_populate_layer_by_layer"`）；因此它是一个偏保守的参考封装 prefill 数字。逐 token 解码耗时才是缓存效率的主要信号。
+
+### 5. KV-cache + FLOPs 是解析式（实验 3）
+
+`run_kv_cache.py` 用闭式公式计算 KV 字节数和 FLOPs（由算子定义推导，并对 ceil 块数、因果条目、输入**与分组输出**投影项、以及增量 CSA/HCA 运行时状态——部分 token 累加器、固定滑窗环形缓冲容量、CSA 重叠状态——做了修正）。它们**不是**从真实前向传播测得的。`run_correctness.py` 中的单元测试（`test_prefill_flops_*`、`test_kv_cache_ceil_block_count`）用手算期望值验证公式；生产级结论请用 `torch.cuda.memory_allocated` 和 FLOP 计数器交叉验证。
+
+### 6. 近重复泄漏与数据指纹
+
+LM 数据协议在切分前去除精确重复以及空白 / Unicode 归一化后的重复，并审计相同的截断模型窗口。它还审计**近重复**——同一个故事只改了几个词——精确哈希看不到这种情况，而如果两份拷贝横跨 train/val/test，就会抬高留出集分数。`near_duplicates.py` 按 token n-gram Jaccard（默认阈值 `0.8`，5-gram）比较截断的 `seq_len+1` token 窗口，用 MinHash+LSH 找候选，再用精确的第二遍计算所报告的相似度。跨切分审计默认在 `train_lm_autodl.py` 中运行；`--dedup_near` 在切分前去除近重复；`--strict_near_dup` 在仍存在任何跨切分对（或候选上限导致审计不完整）时拒绝训练。审计是结构性的（不依赖模型指标），因此可以在测试集仍处于封存状态时运行。完整契约、记录的 `near_duplicate_audit` 字段、候选截断的注意事项以及语料指纹框架的修正见 [docs/data-integrity.md](docs/data-integrity.md)。
+
+---
+
+## 局限性
+
+* **KDA 要求数值稳定的单位范数 `q`/`k`。** `naive_recurrent_kda` 和 `naive_chunk_kda` 都不强制这一点——没有任何机制阻止调用方传入原始（未归一化）的 `q`/`k`。除非有特别理由，调用 KDA 前务必先 `F.normalize(q, dim=-1)` / `F.normalize(k, dim=-1)`。
+* **参考实现是 Python 循环。** KDA 的递归路径是对时间的 Python `for` 循环；分块路径仍有对 chunk 的 Python 循环。CSA 的索引器按头循环。可选的加速路径（`ops_kda.compiled_recurrent_kda`、`ops_kda.scripted_chunk_kda`，以及 GPU 上的 `HybridConfig(kda_backend="fla")`）可以提供更好的性能。朴素路径仍是正确性 / 可读性优先的默认选择。
+* **CSA 索引器的 STE。** 默认的直通估计器（`ste_mode='topk_columns'`）把梯度路由到 `soft_weights` 中 top-k 选中的列（见 `ops_csa.py::naive_csa`）。未被选中的块收不到"你本该被选中"的梯度，除非选择可选的 `ste_mode='full_softmax'` 稠密代理；`aux_contrastive_loss` 仍是未来工作。STE 路径仅用于训练：`naive_csa` 和解码缓存在 `torch.no_grad()` 下自动跳过软代理，使推理 / 基准延迟测量的是硬 top-k 路径而非训练代理。
+* **融合 6 个 KV/索引器投影。** `naive_csa` 默认把 `W_aKV, W_bKV, W_aZ, W_bZ, W_KV_idx, W_Z_idx` 融合为一次 `F.linear` 调用（`fuse_projections=True`），纯粹是 kernel 启动次数的优化。如果你需要原始的 6 次独立 matmul 路径（例如在 `use_ste=False` 下保留 `W_KV_idx`/`W_Z_idx` 的 `None` 梯度），请传 `fuse_projections=False`。
+* **参考算子的滑窗基于 unfold。** `naive_csa` 和 `naive_hca` 用 `_sliding_window_scores` 计算窗口分支（`unfold`，峰值显存 `O(T · win · c)`），因为窗口得分必须与压缩分支得分和 attention sink 共享同一个 softmax（DeepSeek-V4 Eq. 27）。`ops_csa._sliding_window_attention` 是独立的分块辅助函数（峰值显存 `O(chunk_t · win · c)`），供不需要联合 softmax 的调用方使用；它与 unfold softmax 路径数值一致。需要显存上界的大上下文实验直接调用该分块辅助函数（`ops_csa.py` 中的 `ops_csa._sliding_window_attention`）；参考 `naive_csa` / `naive_hca` 路径保持 unfold 实现。
+* **增量解码缓存（CSA / HCA）。** `ops_decoding_cache.CSADecodingCache` / `HCADecodingCache` 让 CSA / HCA 支持逐 token 自回归解码。缓存维护部分 token 累加器、压缩块缓存、滑窗环形缓冲以及（CSA 的）动态更新的索引器 key 缓存。缓存避免了每步解码的全前缀重压缩；每 token 的工作量仍随已完成的压缩块增长（CSA 约 O(T/m + win)，HCA 约 O(T/m2 + win)）。实验 6 的混合包装器为完整栈的每个 CSA/HCA 子层各接入一个这样的缓存。
+* **Dropout 未实现。** `HybridConfig.dropout != 0` 会抛出 `NotImplementedError`，而不是静默无操作。MQAR 规模的模型不需要 dropout；更大规模的训练应自行接入（或删掉该字段）。
+* **因果块掩码是严格前置的（与论文精确一致）。** `_causal_block_mask` 使用 `b < t // m`（DeepSeek-V4 Eq. 16：query 只关注索引严格小于 `floor(t/m)` 的块）。因此一个压缩块最早在下一个块的第一个 token 处才可见；query 自身所在的块——无论是否完整——永远无法通过稀疏分支被访问，其局部上下文由滑窗分支提供（§2.3.3）。解码缓存与 FLOPs 核算（`run_kv_cache.causal_block_entries`）使用同一规则。（历史注记：更早的修订使用窗口关闭变体 `b < (t + 1) // m`，它会在块的最后一个源 token 处暴露 query 自身的块——因果上安全但与论文差一；在 2026-08 修复轮中与下文的部分 RoPE 一起对齐到论文精确掩码。）
+* **部分 RoPE（DeepSeek-V4 §2.3.3）已实现，且模型级默认开启。** query、压缩 KV 条目（在共享 KV 的 MQA 中同时充当 key 与 value）以及滑窗 key 在其末 `rope_dim` 维旋转（论文值 64，小实验几何下自动钳位到头维 `c`），核心注意力的输出在取负的 query 位置处逆旋转，使每个 KV 条目的贡献携带相对（条目 − query）距离。论文留白的解释性选择记录在 `ops_rope.py`：压缩条目 `s` 锚定在位置 `s·m`（块起点），输出对策按 −t（query 位置）旋转。`HybridConfig.csa_rope_dim` / `hca_rope_dim` 默认为 64；设为 `None`/0 可关闭（修复前的历史行为）。原始算子（`naive_csa` / `naive_hca`）为向后兼容保持 `rope_dim=None` 默认值，增量解码缓存也接受同样的 `rope_dim` / `rope_base` 参数——开启 RoPE 时 prefill 与逐 token 解码在 fp32 容差内一致（由 `test_csa_hca_rope_prefill_vs_cache` 钉住）。索引器刻意不做 RoPE：§2.3.3 把 RoPE 的范围限定在核心注意力，Eq. 15–16 不含位置项。
+* **query/KV 归一化：默认 L2，可选论文式 RMSNorm。** §2.3.3 规定对 query 的每个头以及压缩 KV 条目做 RMSNorm；仓库的历史行为是对两者做 L2 归一化（余弦注意力，`scale=1.0`）。`naive_csa` / `naive_hca` 接受 `qk_norm_mode='rms'` 以使用论文式 RMSNorm（此时数值保持范数 ~`sqrt(c)`，并自动选用标准的 `1/sqrt(c)` 温度，与 DeepSeek-V2/V3 将逐头 RMSNorm 与标准缩放结合的方式一致）。论文没有固定核心注意力的温度，因此两种形式都与论文兼容；`'l2'` 仍为默认值，以保证仓库历史实验数字可复现。
+* **余弦缩放固定为 1.0（默认 'l2' 模式）。** `naive_csa` / `naive_hca` 对 `q` 和 `C_comp` 做 L2 归一化并使用 `scale=1.0`（一次刻意的修复——旧的 `c ** -0.5` 会把 softmax 压平）。仓库实验还为 CSA lightning 索引器传 `normalize_qk=True`，使 top-k 选择基于方向而非被 q_idx / K_idx 的向量范数主导——注意这个索引器归一化是仓库侧的选择，不是论文要求（Eq. 15–16 定义的是普通的加权 ReLU 点积）。没有暴露可学习温度。传 `scale=` 可显式覆盖。
+
+---
+
+## 论文
+
+实现遵循以下两篇 arXiv 报告。PDF 不再提交到本仓库（见 `.gitignore`）；请从 arXiv 下载：
+
+* [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence (arXiv:2606.19348)](https://arxiv.org/abs/2606.19348)
+* [Kimi Linear: An Expressive, Efficient Attention Architecture (arXiv:2510.26692)](https://arxiv.org/abs/2510.26692)
+
+## 许可证
+
+见 `LICENSE`。
 
 ---
 
