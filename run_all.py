@@ -345,6 +345,34 @@ def _write_timing_design_manifest(profile: str) -> dict:
     }
 
 
+def _check_environment_contract() -> dict:
+    """Record whether the declared dependency files agree at campaign start.
+
+    This does not change the numerical environment: it only preserves, inside
+    the hashed campaign summary, the fact that ``pyproject.toml``,
+    ``requirements.txt`` and the CI pins described the same stack when the run
+    began. Unavailable parsers are recorded as ``unavailable`` rather than
+    failing the campaign, matching ``ci_gate.py``'s graceful degradation.
+    """
+    try:
+        import dependency_contract
+    except Exception as exc:
+        print(f'[run_all] WARNING: dependency contract checker unavailable '
+              f'({type(exc).__name__}: {exc})')
+        return {'status': 'unavailable', 'reason': type(exc).__name__}
+    try:
+        report = dependency_contract.check_contract(HERE)
+    except dependency_contract.ContractUnavailable as exc:
+        print(f'[run_all] WARNING: dependency contract parsers unavailable '
+              f'({exc})')
+        return {'status': 'unavailable', 'reason': str(exc)}
+    if not report.get('ok'):
+        print('[run_all] WARNING: declared dependency files disagree at '
+              'campaign start: ' + '; '.join(report.get('errors') or []))
+        return {'status': 'drift', 'report': report}
+    return {'status': 'ok', 'report': report}
+
+
 def _version_tuple(raw: str) -> tuple[int, ...]:
     """Parse the numeric prefix of a package version for bound checks."""
     parts = re.findall(r"\d+", raw)
@@ -877,6 +905,9 @@ def run_all(seeds=None, steps=None):
             print(f'[run_all] WARNING: could not write the timing design '
                   f'manifest: {exc}')
             summary['timing_design'] = {'error': str(exc)}
+
+        # Bind the declared dependency contract into the hashed summary.
+        summary['dependency_contract'] = _check_environment_contract()
 
         # Import after deps are installed.
         import run_correctness

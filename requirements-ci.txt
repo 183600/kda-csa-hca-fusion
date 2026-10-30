@@ -12,7 +12,8 @@
 #     --extra-index-url https://download.pytorch.org/whl/cpu
 #
 # 注意：版本必须与仓库 requirements.txt / pyproject.toml 保持一致；
-#       本文件由批量改造生成、生成时没有仓库 checkout，首次接入请人工核对版本。
+#       dependency_contract.py（ci_gate.py 的第 2 层）会静态校验每个
+#       exact pin 都落在 pyproject.toml 的范围内，不一致时 gate 直接失败。
 numpy==2.5.4
 torch==2.14.1
 einops==0.8.1

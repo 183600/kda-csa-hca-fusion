@@ -231,6 +231,20 @@ when its commit matches.
   `_SECRET_ARG_FLAGS` are redacted, but secrets passed through environment
   variables or non-standard flags remain the caller's responsibility.
 
+## Declared environment contract
+
+Source identity says what code ran; it does not say whether the declared
+dependency files would install the same numerical stack again. The three
+declarations (`pyproject.toml`, `requirements.txt`, `requirements-ci.txt`) are
+therefore checked mechanically by `dependency_contract.py`: bounds must
+mirror, CI exact pins must satisfy those bounds, and every top-level module
+and package must be installable by `pip install -e .`. `ci_gate.py` runs the
+check as a separate layer, `run_all.py` snapshots its status into the hashed
+campaign summary, and `test_engineering_contract.py` covers drift in each
+declaration. See
+[engineering-standards.md](engineering-standards.md) for the contract and
+the lock-file procedure.
+
 ## Tests
 
 `test_source_identity.py` covers the digest contract (determinism, content /
