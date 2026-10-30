@@ -1319,7 +1319,7 @@ def variant_config_audit(variants, baseline=None, d_model=32):
 
 
 def ablation_design_audit(variants, rows=None, requested=None,
-                          recipe=None, d_model=32):
+                          recipe=None, d_model=32, n_kv_list=None):
     """Audit the selected variant set as a controlled ablation design.
 
     Exp 8 toggles three CSA mechanism factors — partial RoPE, the top-k
@@ -1349,6 +1349,16 @@ def ablation_design_audit(variants, rows=None, requested=None,
     successfully evaluated seed set. ``recipe`` may pass the expected
     recipe explicitly; otherwise it is inferred from the rows where
     available.
+
+    ``n_kv`` is part of the experimental unit. When rows carry ``n_kv`` or
+    ``n_kv_list`` is supplied, every selected variant must have a row in
+    EVERY requested cell, not merely somewhere in the table: one n_kv cell
+    that silently lost an arm cannot support a single-factor claim for that
+    cell. ``controlled_variables['missing_result_cells']`` lists the absent
+    ``(variant, n_kv)`` cells, and the factorial-coverage records get a
+    per-cell ``cells_by_n_kv`` breakdown. Rows without n_kv keep the older
+    variant-level behaviour, so callers with aggregate-only rows are not
+    forced to invent a cell id.
 
     Returns a JSON-safe dict with ``status`` one of
     ``'leave_one_out_complete'`` / ``'incomplete'`` / ``'no_baseline'``.
@@ -1411,6 +1421,49 @@ def ablation_design_audit(variants, rows=None, requested=None,
 
     config_audit = variant_config_audit(variants, baseline=baseline,
                                         d_model=d_model)
+
+    # Collect the observed n_kv cells before validating factorial coverage:
+    # an interaction cell can be present globally but absent in one n_kv
+    # cell, which is enough to make that cell's interaction unestimable.
+    requested_n_kv = []
+    if n_kv_list is not None:
+        try:
+            raw_n_kv = list(n_kv_list)
+        except TypeError:
+            raw_n_kv = []
+        for n_kv in raw_n_kv:
+            try:
+                hash(n_kv)
+            except TypeError:
+                continue
+            if n_kv not in requested_n_kv:
+                requested_n_kv.append(n_kv)
+    observed_n_kv = []
+    seen_n_kv = set()
+    cells_present_by_n_kv: dict = {}
+    for r in rows or ():
+        if not isinstance(r, dict):
+            continue
+        n_kv = r.get('n_kv')
+        if n_kv is None:
+            continue
+        try:
+            hash(n_kv)
+        except TypeError:
+            continue
+        if n_kv not in seen_n_kv:
+            seen_n_kv.add(n_kv)
+            observed_n_kv.append(n_kv)
+        name = r.get('variant')
+        try:
+            hash(name)
+        except TypeError:
+            continue
+        if name is not None:
+            cells_present_by_n_kv.setdefault(n_kv, set()).add(name)
+    cell_n_kv = requested_n_kv or observed_n_kv
+    cell_mode = bool(cell_n_kv)
+
     # Interaction coverage: the single-factor audit above says each factor
     # has a leave-one-out arm. It does not say the FACTORIAL cell needed to
     # estimate an interaction ran. Record that separately so a selected
@@ -1421,13 +1474,31 @@ def ablation_design_audit(variants, rows=None, requested=None,
         required = list(spec['cells'])
         present = [n for n in required if n in names]
         missing_cells = [n for n in required if n not in names]
-        factorial_designs[design_name] = {
+        record = {
             **spec,
             'required_cells': required,
             'present_cells': present,
             'missing_cells': missing_cells,
             'complete': not missing_cells,
         }
+        if cell_mode:
+            by_n_kv = {}
+            incomplete_n_kv = []
+            for n_kv in cell_n_kv:
+                seen_here = cells_present_by_n_kv.get(n_kv, set())
+                present_here = [n for n in required if n in seen_here]
+                missing_here = [n for n in required if n not in seen_here]
+                by_n_kv[str(n_kv)] = {
+                    'present_cells': present_here,
+                    'missing_cells': missing_here,
+                    'complete': not missing_here,
+                }
+                if missing_here:
+                    incomplete_n_kv.append(n_kv)
+            record['cells_by_n_kv'] = by_n_kv
+            record['incomplete_n_kv'] = incomplete_n_kv
+            record['complete'] = not missing_cells and not incomplete_n_kv
+        factorial_designs[design_name] = record
     audit = {
         'status': status,
         'selected_variants': names,
@@ -1518,6 +1589,21 @@ def ablation_design_audit(variants, rows=None, requested=None,
 
         names_with_rows = [n for n in names if n in values]
         missing_result_variants = [n for n in names if n not in values]
+        missing_result_cells = []
+        results_by_cell = {}
+        if cell_mode:
+            for n_kv in cell_n_kv:
+                seen_here = cells_present_by_n_kv.get(n_kv, set())
+                present_here = [n for n in names if n in seen_here]
+                missing_here = [n for n in names if n not in seen_here]
+                results_by_cell[str(n_kv)] = {
+                    'present_variants': present_here,
+                    'missing_variants': missing_here,
+                    'complete': not missing_here,
+                }
+                for name in missing_here:
+                    missing_result_cells.append(
+                        {'variant': name, 'n_kv': n_kv})
 
         def _parity(field):
             per_variant = [values[n][field] for n in names_with_rows]
@@ -1558,10 +1644,11 @@ def ablation_design_audit(variants, rows=None, requested=None,
         capacity_parity = {'n_params': _parity('n_params'),
                            'n_layers': _parity('n_layers')}
         capacity_bad = any(v is False for v in capacity_parity.values())
-        if missing_result_variants:
+        if missing_result_variants or missing_result_cells:
             # A declared arm with no result row never produced a treatment,
             # so neither its paired contrast nor the factor it was meant to
-            # isolate can support a claim.
+            # isolate can support a claim. The same is true when the arm is
+            # present globally but missing from one n_kv cell.
             controls_status = 'missing_results'
         elif (any(v is False for v in recipe_matches_expected.values())
                 or mismatched_fields):
@@ -1582,7 +1669,13 @@ def ablation_design_audit(variants, rows=None, requested=None,
 
         audit['controlled_variables'] = {
             'missing_result_variants': missing_result_variants,
-            'results_complete': not missing_result_variants,
+            'missing_result_cells': missing_result_cells,
+            'results_by_cell': results_by_cell,
+            'observed_n_kv': sorted(observed_n_kv, key=repr),
+            'requested_n_kv': sorted(cell_n_kv, key=repr),
+            'cell_audit': cell_mode,
+            'results_complete': (not missing_result_variants
+                                 and not missing_result_cells),
             'capacity_parity': capacity_parity,
             'parameter_count_by_variant': {
                 n: next(iter(values[n]['n_params']))
@@ -1612,9 +1705,10 @@ def ablation_design_audit(variants, rows=None, requested=None,
             'controls_status': controls_status,
             'controls_verified': controls_status == 'controlled',
             'note': ('A single-factor mechanism claim also requires every '
-                     'declared variant to have a result row and the variants '
-                     'to share steps/batch/lr, parameter count and depth, and '
-                     'the requested/successful seed set; otherwise the '
+                     'declared variant to have a result row in every '
+                     'requested n_kv cell and the variants to share '
+                     'steps/batch/lr, parameter count and depth, and the '
+                     'requested/successful seed set; otherwise the '
                      'contrast mixes the mechanism with a missing arm, '
                      'budget, capacity or sampling difference.'),
         }
@@ -2239,7 +2333,8 @@ def main():
     design_audit = ablation_design_audit(
         variants, rows=all_rows,
         requested=requested if requested else None,
-        recipe={'steps': steps, 'train_batch': train_batch, 'lr': lr})
+        recipe={'steps': steps, 'train_batch': train_batch, 'lr': lr},
+        n_kv_list=n_kv_list)
     if design_audit['status'] != 'leave_one_out_complete':
         logger.warning(
             '  WARNING: selected variant set is not a complete leave-one-out '
@@ -2270,11 +2365,12 @@ def main():
                                      'capacity_mismatch', 'seed_mismatch'):
         logger.warning(
             '  WARNING: controlled-variable check failed (%s): '
-            'missing_result_variants=%s recipe_parity=%s '
-            'parameter_count_parity=%s depth_parity=%s '
+            'missing_result_variants=%s missing_result_cells=%s '
+            'recipe_parity=%s parameter_count_parity=%s depth_parity=%s '
             'seed_alignment_ok=%s',
             cv.get('controls_status'),
-            cv.get('missing_result_variants'), cv.get('recipe_parity'),
+            cv.get('missing_result_variants'),
+            cv.get('missing_result_cells'), cv.get('recipe_parity'),
             cv.get('parameter_count_parity'), cv.get('depth_parity'),
             cv.get('seed_alignment_ok'))
     if not design_audit.get('single_factor_claims_valid', False):
@@ -2283,7 +2379,8 @@ def main():
             design_audit.get('single_factor_claim_failures'))
     if not design_audit.get('interaction_claims_valid', False):
         missing_cells = {
-            name: spec.get('missing_cells')
+            name: (spec.get('missing_cells')
+                   or spec.get('incomplete_n_kv'))
             for name, spec in
             (design_audit.get('factorial_designs') or {}).items()
             if not spec.get('complete')}

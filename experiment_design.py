@@ -483,7 +483,14 @@ PLANS: dict[str, dict] = {
                      'note': 'default MECH_NKV=1'},
             'seed': {'role': 'block', 'levels': '42 .. 42 + n_seeds - 1'},
         },
-        'required_levels': {'variant': ['baseline']},
+        # Every one-factor arm is a required control for the corresponding
+        # mechanism claim. A subset that drops one is exploratory, not a
+        # smaller confirmatory ablation; the interaction cell is optional
+        # because the interaction is descriptive at the registered budget.
+        'required_levels': {
+            'variant': ['baseline', 'no_rope', 'topk1', 'dense',
+                        'frozen_indexer'],
+        },
         'primary_contrast': (
             'each mechanism variant minus the baseline, paired by seed, '
             'with the pre-registered sign in '
@@ -537,8 +544,8 @@ PLANS: dict[str, dict] = {
         'stopping_rule': (
             'fixed variant set and seed count fixed before the run; the '
             'audit refuses single-factor claims when the one-factor '
-            'counterpart is missing or when the built variant config changes '
-            'a switch outside its declared factor'),
+            'counterpart is missing from any n_kv cell or when the built '
+            'variant config changes a switch outside its declared factor'),
         'pilot': {
             'group_key': 'variant',
             'reference': 'baseline',

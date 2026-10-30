@@ -273,12 +273,17 @@ Exp 8 therefore carries three complementary audits in
   another variant) are reported as `no_change_variants` /
   `duplicate_treatments`; they are not treatments.
 * `controlled_variables` checks the observed rows. Every declared variant
-  must have a result row, and those arms must use the same training recipe
-  (steps, batch, learning rate), parameter count, depth and successfully
-  evaluated seed set. A drift is reported as `missing_results`,
+  must have a result row in **every requested `n_kv` cell**, and those arms
+  must use the same training recipe (steps, batch, learning rate), parameter
+  count, depth and successfully evaluated seed set. `missing_result_cells`
+  lists the absent `(variant, n_kv)` treatments; `results_by_cell` records
+  per-cell presence. A drift is reported as `missing_results`,
   `recipe_mismatch`, `capacity_mismatch`, `seed_mismatch` or
   `partially_observed`. A mechanism switch that silently changes capacity or
   training budget is a second factor even if the built config fields match.
+  Likewise, `factorial_designs[*].cells_by_n_kv` and `incomplete_n_kv` make
+  a missing interaction cell in one `n_kv` group explicit instead of letting
+  coverage in another group stand in for it.
 
 `single_factor_claims_valid` is true only when all three checks pass (the
 runtime check is required whenever rows are supplied). The reasons for a

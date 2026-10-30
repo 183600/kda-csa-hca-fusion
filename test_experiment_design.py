@@ -325,6 +325,29 @@ def test_mechanism_plan_makes_no_equivalence_claim():
     assert 'practical_equivalence_at_margin' not in audit['claims_allowed']
 
 
+def test_mechanism_plan_requires_every_single_factor_arm():
+    """Exp 8's prospective audit must not accept a smaller ablation.
+
+    Each one-factor variant names a separate mechanism contrast. Dropping
+    one and keeping the remaining rows does not make the run a smaller
+    confirmatory ablation; it makes the corresponding mechanism claim
+    exploratory because its control is absent.
+    """
+    arms = ['baseline', 'no_rope', 'topk1', 'dense', 'frozen_indexer']
+    complete = D.audit_run(
+        'exp8_mechanism', seeds=[42 + i for i in range(14)],
+        levels={'variant': arms}, family_size=6)
+    assert complete['status'] == 'confirmatory'
+    assert complete['missing_required_levels'] == []
+
+    subset = D.audit_run(
+        'exp8_mechanism', seeds=[42 + i for i in range(14)],
+        levels={'variant': ['baseline', 'no_rope']}, family_size=5)
+    assert subset['status'] == 'exploratory_missing_controls'
+    assert set(subset['missing_required_levels']) == {
+        'variant:topk1', 'variant:dense', 'variant:frozen_indexer'}
+
+
 def test_runner_equivalence_margins_match_the_registry():
     """The pre-registered TOST margin must equal the runner's default.
 

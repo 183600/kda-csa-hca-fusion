@@ -459,6 +459,77 @@ def test_ablation_design_audit():
         str(diverged['controlled_variables']))
 
 
+def test_ablation_design_audit_requires_every_variant_in_each_n_kv_cell():
+    """A variant present in one n_kv cell cannot cover another cell.
+
+    Exp 8 reports one paired contrast per (variant, n_kv), so an arm that
+    globally has a row but is missing from one cell is still a missing
+    treatment for that cell. The audit must withhold the single-factor
+    verdict instead of checking only the global variant set.
+    """
+    print("\nTest: Exp 8 per-n_kv arm completeness")
+
+    def rows():
+        out = []
+        for n_kv in (1, 2):
+            for name in [v['name'] for v in M.VARIANTS]:
+                out.append({
+                    'variant': name, 'n_kv': n_kv,
+                    'n_params': 100, 'n_layers': 5,
+                    'steps': 200, 'train_batch': 16, 'lr': 3e-3,
+                    'seeds': [42, 43],
+                    'per_seed': [
+                        {'seed': 42, 'final_acc': 0.2},
+                        {'seed': 43, 'final_acc': 0.2},
+                    ],
+                })
+        return out
+
+    full = M.ablation_design_audit(M.VARIANTS, rows=rows(),
+                                    n_kv_list=[1, 2])
+    cv = full['controlled_variables']
+    _ok('every variant is present in every requested n_kv cell',
+        cv['cell_audit'] is True
+        and cv['missing_result_cells'] == []
+        and cv['results_complete'] is True
+        and cv['controls_status'] == 'controlled',
+        str(cv))
+
+    missing_one_cell = [
+        r for r in rows()
+        if not (r['variant'] == 'no_rope' and r['n_kv'] == 2)]
+    partial = M.ablation_design_audit(M.VARIANTS, rows=missing_one_cell,
+                                      n_kv_list=[1, 2])
+    cv = partial['controlled_variables']
+    _ok('an arm missing from one n_kv cell is a missing treatment',
+        cv['controls_status'] == 'missing_results'
+        and cv['missing_result_cells']
+        == [{'variant': 'no_rope', 'n_kv': 2}]
+        and cv['results_by_cell']['1']['complete'] is True
+        and cv['results_by_cell']['2']['missing_variants'] == ['no_rope'],
+        str(cv))
+    _ok('single-factor claims are withheld for the incomplete cell',
+        partial['single_factor_claims_valid'] is False
+        and partial['single_factor_claim_failures']
+        == ['runtime_controls_missing_results'],
+        str(partial['single_factor_claim_failures']))
+
+    missing_interaction_cell = [
+        r for r in rows()
+        if not (r['variant'] == 'no_rope_dense' and r['n_kv'] == 2)]
+    interaction = M.ablation_design_audit(
+        M.VARIANTS, rows=missing_interaction_cell, n_kv_list=[1, 2])
+    spec = interaction['factorial_designs']['rope_x_selection_density']
+    _ok('factorial coverage is audited per n_kv cell',
+        spec['complete'] is False
+        and spec['incomplete_n_kv'] == [2]
+        and spec['cells_by_n_kv']['1']['complete'] is True
+        and spec['cells_by_n_kv']['2']['missing_cells']
+        == ['no_rope_dense']
+        and interaction['interaction_claims_valid'] is False,
+        str(spec))
+
+
 def test_variant_config_audit_detects_drift_and_non_treatments():
     """The config-level audit catches a second factor and duplicate arms.
 
@@ -790,6 +861,7 @@ _TEST_FUNCS = [
     test_sparse_variant_recall_is_below_one_or_none,
     test_paired_stats_math,
     test_ablation_design_audit,
+    test_ablation_design_audit_requires_every_variant_in_each_n_kv_cell,
     test_single_factor_verdict_requires_controlled_runtime,
     test_variant_config_audit_detects_drift_and_non_treatments,
     test_exp8_smoke_envelope,
