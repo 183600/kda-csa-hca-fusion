@@ -62,6 +62,9 @@ def main():
     # Long-context query tiling of the HCA dense score tensor: force the
     # tiled branch and certify forward/backward equivalence with the full path.
     all_results += _run_safe(test_hca_score_tiling_parity, device)
+    # Causal key-range tiling: the tiled path scores only the blocks visible
+    # to each tile (causal triangle), and a sink-only tile returns exact zeros.
+    all_results += _run_safe(test_hca_causal_score_tiling, device)
     all_results += _run_safe(test_fused_hybrid, device)
     # New reviewer-driven checks.
     all_results += _run_safe(test_overlap_causality, device)

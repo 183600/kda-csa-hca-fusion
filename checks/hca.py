@@ -154,6 +154,88 @@ def test_hca_score_tiling_parity(device='cpu'):
     return results
 
 
+def test_hca_causal_score_tiling(device='cpu'):
+    """Certify the causal key-range tiling, including sink-only tiles.
+
+    The long-context tiled forward now scores only the compressed blocks
+    visible to the LAST query of each tile (``k_max = (hi - 1) // m2``)
+    instead of the full ``n_blocks`` rectangle. That removes the masked
+    future-block rectangle (the dense HCA work becomes the causal
+    triangle, matching ``run_kv_cache.causal_block_entries``) without
+    changing any per-row softmax input.
+
+    Two edge cases are pinned here:
+
+    * a tile whose queries see NO compressed block (``T <= m2``, or the
+      first tile of a longer sequence) must fall back to the sink-only
+      zero output when ``sliding_window=0``; the sink is a
+      denominator-only virtual entry with zero value;
+    * a non-zero sink and the sliding-window branch must still produce
+      the same output and gradients as the untiled path.
+    """
+    logger.info("Test: HCA causal key-range tiling (incl. sink-only tiles)")
+    import ops_hca
+
+    torch.manual_seed(91)
+    B, d = 2, 32
+    m2, nh, c, dc = 16, 3, 16, 24
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=91)
+    sink = torch.tensor([0.7, -0.2, 0.4], device=device)
+    results = []
+    old_threshold = ops_hca._HCA_SCORE_TILE_ELEMS
+    try:
+        for T in (1, 8, 16, 17, 33, 96):
+            H = torch.randn(B, T, d, device=device) * 0.2
+            for win in (0, 8):
+                kw = dict(m2=m2, nh=nh, c=c, dc=dc, sliding_window=win,
+                          sink_logits=sink, rope_dim=8)
+                ops_hca._HCA_SCORE_TILE_ELEMS = 1 << 30
+                full = naive_hca(H, **p, **kw)
+                ops_hca._HCA_SCORE_TILE_ELEMS = 1
+                tiled = naive_hca(H, **p, **kw)
+                diff = (full - tiled).abs().max().item()
+                results.append(_ok(
+                    f'HCA causal tiled == untiled (T={T}, win={win})',
+                    diff <= TOL['bit_match'][torch.float32],
+                    f'max_diff={diff:.2e}'))
+                if win == 0 and T <= m2:
+                    absmax = tiled.abs().max().item()
+                    results.append(_ok(
+                        f'HCA sink-only tile is exactly zero (T={T})',
+                        absmax == 0.0, f'absmax={absmax:.2e}'))
+
+        # Gradient parity on a geometry that exercises both a sink-only
+        # first tile and later dense tiles.
+        T = 33
+        H = (torch.randn(B, T, d, device=device) * 0.2).requires_grad_(True)
+        params = {k: v.clone().requires_grad_(True) for k, v in p.items()}
+        sink_g = sink.clone().requires_grad_(True)
+        kw = dict(m2=m2, nh=nh, c=c, dc=dc, sliding_window=8,
+                  sink_logits=sink_g, rope_dim=8)
+        grads = []
+        for threshold in (1 << 30, 1):
+            ops_hca._HCA_SCORE_TILE_ELEMS = threshold
+            out = naive_hca(H, **params, **kw)
+            out.square().sum().backward()
+            grads.append((H.grad.clone(), sink_g.grad.clone(),
+                          {k: v.grad.clone() for k, v in params.items()}))
+            for t in (H, sink_g, *params.values()):
+                t.grad = None
+        h_diff = (grads[0][0] - grads[1][0]).abs().max().item()
+        sink_diff = (grads[0][1] - grads[1][1]).abs().max().item()
+        w_diff = max(
+            (grads[0][2][k] - grads[1][2][k]).abs().max().item()
+            for k in params)
+        grad_tol = TOL['match'][torch.float32]
+        results.append(_ok(
+            'HCA causal tiled backward == untiled (fp32)',
+            max(h_diff, sink_diff, w_diff) <= grad_tol,
+            f'dH={h_diff:.2e}, dsink={sink_diff:.2e}, dW={w_diff:.2e}'))
+    finally:
+        ops_hca._HCA_SCORE_TILE_ELEMS = old_threshold
+    return results
+
+
 def test_hca_forward_smoke(device='cpu'):
     """Forward-output shape + finiteness smoke test (does NOT verify
     causality — see ``test_hca_sliding_window_causality``)."""
@@ -1549,6 +1631,7 @@ def test_csa_hca_qk_norm_mode_rms(device='cpu'):
 __all__ = [
     'test_csa_hca_fp16_dtype_consistency',
     'test_hca_score_tiling_parity',
+    'test_hca_causal_score_tiling',
     'test_hca_forward_smoke',
     'test_hca_sliding_window_causality',
     'test_csa_hca_right_padding_correctness',

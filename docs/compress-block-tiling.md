@@ -92,6 +92,8 @@ iterations would not amortize).
 
 ## Related
 
+* `docs/hca-causal-score-tiling.md` — query-axis tiling of HCA's dense
+  attention that also restricts each tile to its causally visible blocks.
 * `docs/csa-indexer-chunking.md` — the same idea on the indexer's query axis.
 * `docs/chunked-prefill-cache.md` — the incremental decode/prefill cache,
   which already compresses one block at a time via

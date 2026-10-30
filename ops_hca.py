@@ -231,9 +231,13 @@ def naive_hca(
     # Query-axis tiling for the dense score / joint-softmax / value
     # pipeline. Every operation below is row-wise along the query axis, so
     # evaluating query tiles is value-identical per row while the peak score
-    # tensor shrinks from ``B*nh*T*n_blocks`` to
-    # ``B*nh*T_tile*n_blocks``. Small shapes (including every bit-exact test
-    # geometry) keep the single-shot path below.
+    # tensor shrinks from ``B*nh*T*n_blocks`` to at most
+    # ``B*nh*T_tile*n_blocks``. Inside each tile the key axis is further
+    # restricted to the causally visible prefix
+    # ``k_max = (hi - 1) // m2``, so the dense work follows the causal
+    # triangle rather than the full rectangle (see
+    # ``docs/hca-causal-score-tiling.md``). Small shapes (including every
+    # bit-exact test geometry) keep the single-shot path below.
     score_elems = B_ * nh * T * n_blocks
     tile_T = T
     if T > 1 and n_blocks > 0 and score_elems > _HCA_SCORE_TILE_ELEMS:
@@ -242,10 +246,10 @@ def naive_hca(
         # dispatch can select a different reduction kernel).
         tile_T = max(8, _HCA_SCORE_TILE_ELEMS // max(1, B_ * nh * n_blocks))
     use_tiles = tile_T < T
-    # When tiling, the blocked mask is rebuilt per query tile
-    # (O(T_tile*n_blocks)) instead of materializing and caching the full
-    # [T, n_blocks] table; the untiled path keeps using the cached negation
-    # (same values for every row).
+    # When tiling, the blocked mask is rebuilt per query tile and only over
+    # that tile's causally visible block prefix instead of materializing and
+    # caching the full [T, n_blocks] table; the untiled path keeps using the
+    # cached negation (same values for every row).
     cbm_invalid = (None if use_tiles else
                    _causal_block_mask_invalid(T, n_blocks, m2, device))
 
@@ -339,8 +343,20 @@ def naive_hca(
                if not torch.is_grad_enabled() else None)
         for lo in range(0, T, tile_T):
             hi = min(T, lo + tile_T)
+            # Causal key range. Query ``t`` sees a compressed block ``b``
+            # iff ``b < t // m2`` (strictly preceding blocks), so the LAST
+            # query in this tile needs at most ``(hi - 1) // m2`` blocks.
+            # Scoring only that prefix skips the masked future-block
+            # rectangle that the untiled path materializes; the per-row
+            # softmax sees exactly the same non-``-inf`` entries in the
+            # same order, and the work now matches the causal
+            # ``causal_block_entries(T, m2)`` ledger instead of the full
+            # ``T * n_blocks`` rectangle (~2x fewer dense score/value
+            # MACs at long context).
+            k_max = (hi - 1) // m2
+            C_tile = C_comp_n[:, :k_max]
             scores_t = torch.einsum(
-                'b t h d, b n d -> b h t n', q[:, lo:hi], C_comp_n)
+                'b t h d, b n d -> b h t n', q[:, lo:hi], C_tile)
             if scale != 1.0:
                 # Multiplying by exactly 1.0 is an IEEE no-op; skipping the
                 # multiply keeps values/gradients bit-for-bit identical.
@@ -351,28 +367,40 @@ def naive_hca(
             # The einsum output is freshly allocated and only consumed by
             # the joint softmax below, so the mask is written in place.
             # Same blocked-causal table as ``_causal_block_mask`` (strictly
-            # preceding blocks visible), built for this tile only.
-            invalid_t = (
-                torch.arange(lo, hi, device=device)[:, None] // m2
-                <= torch.arange(n_blocks, device=device)[None, :])
-            scores_t.masked_fill_(invalid_t[None, None], float('-inf'))
+            # preceding blocks visible), built for this tile's prefix only.
+            if k_max:
+                invalid_t = (
+                    torch.arange(lo, hi, device=device)[:, None] // m2
+                    <= torch.arange(k_max, device=device)[None, :])
+                scores_t.masked_fill_(invalid_t[None, None], float('-inf'))
             p_t = _joint_p(scores_t, scores_w[:, :, lo:hi])
-            p_dense_t = p_t[..., :n_blk]
-            p_w_t = p_t[..., n_blk:]
-            # Accumulate the window contribution IN PLACE into the dense
-            # einsum output (same values as ``a + b``; see ``naive_csa``
-            # for the gradient-safety note).
-            out_t = torch.einsum(
-                'b h t n, b n d -> b t h d', p_dense_t, C_comp_n)
-            if sliding_window > 0:
-                p_w_perm = p_w_t.permute(0, 2, 1, 3)
-                if C_windows_full is not None:
-                    windows_t = C_windows_full[:, lo:hi]
-                else:
-                    windows_t = _sliding_window_chunk_windows(
-                        C_padded_sw, lo, hi, win)
-                out_t.add_(torch.einsum(
-                    'b t h w, b t w d -> b t h d', p_w_perm, windows_t))
+            if p_t is None:
+                # No compressed block and no window entry is visible to
+                # this tile (the tile lies inside the first compression
+                # block with sliding_window=0). The sink is a virtual
+                # denominator-only entry with zero value, so the output
+                # is exactly zero. The untiled path reaches the same
+                # result through its empty-column branch.
+                out_t = torch.zeros(
+                    B_, hi - lo, nh, c,
+                    dtype=compute_dtype, device=device)
+            else:
+                p_dense_t = p_t[..., :k_max]
+                p_w_t = p_t[..., k_max:]
+                # Accumulate the window contribution IN PLACE into the
+                # dense einsum output (same values as ``a + b``; see
+                # ``naive_csa`` for the gradient-safety note).
+                out_t = torch.einsum(
+                    'b h t n, b n d -> b t h d', p_dense_t, C_tile)
+                if sliding_window > 0:
+                    p_w_perm = p_w_t.permute(0, 2, 1, 3)
+                    if C_windows_full is not None:
+                        windows_t = C_windows_full[:, lo:hi]
+                    else:
+                        windows_t = _sliding_window_chunk_windows(
+                            C_padded_sw, lo, hi, win)
+                    out_t.add_(torch.einsum(
+                        'b t h w, b t w d -> b t h d', p_w_perm, windows_t))
             if out is None:
                 tile_outs.append(out_t)
             else:
