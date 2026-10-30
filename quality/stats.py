@@ -210,134 +210,20 @@ def _bonferroni_crit_q(n, alpha=0.05):
     # true quantile is finite: compute the Student-t quantile directly via
     # the regularized incomplete beta function and bisection. The numerical
     # integration below is dependency-free and accurate for the small seed
-    # counts used by Exp4/Exp5.
-    target_p = 1.0 - alpha
-
-    def _betacf(a, b, x):
-        # Continued fraction for incomplete beta (Numerical Recipes).
-        max_iter = 200
-        eps = 3.0e-14
-        fpmin = 1.0e-300
-        qab = a + b
-        qap = a + 1.0
-        qam = a - 1.0
-        c = 1.0
-        d = 1.0 - qab * x / qap
-        if abs(d) < fpmin:
-            d = fpmin
-        d = 1.0 / d
-        h = d
-        for m in range(1, max_iter + 1):
-            m2 = 2 * m
-            aa = m * (b - m) * x / ((qam + m2) * (a + m2))
-            d = 1.0 + aa * d
-            if abs(d) < fpmin:
-                d = fpmin
-            c = 1.0 + aa / c
-            if abs(c) < fpmin:
-                c = fpmin
-            d = 1.0 / d
-            h *= d * c
-            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-            d = 1.0 + aa * d
-            if abs(d) < fpmin:
-                d = fpmin
-            c = 1.0 + aa / c
-            if abs(c) < fpmin:
-                c = fpmin
-            d = 1.0 / d
-            delta = d * c
-            h *= delta
-            if abs(delta - 1.0) < eps:
-                break
-        return h
-
-    def _betai(a, b, x):
-        if x <= 0.0:
-            return 0.0
-        if x >= 1.0:
-            return 1.0
-        bt = math.exp(
-            math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-            + a * math.log(x) + b * math.log1p(-x)
-        )
-        if x < (a + 1.0) / (a + b + 2.0):
-            return bt * _betacf(a, b, x) / a
-        return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
-
+    # counts used by Exp4/Exp5. The shared helper also keeps the
+    # subnormal-alpha and t**2-overflow regimes exact.
     dof = n - 1
-    # Compute the upper-tail probability directly from the incomplete beta
-    # function.  ``1 - CDF`` is unusable here: for a large dof the CDF
-    # rounds to exactly 1.0 well before the tail probability reaches alpha,
-    # so an anchored bracket either never opens (RuntimeError) or stops at
-    # a 1e-15 floor.  The identity
-    #
-    #     SF(t) = 0.5 * I_{dof/(dof+t^2)}(dof/2, 1/2)
-    #
-    # keeps the tail's relative precision (and its log) down to underflow,
-    # which is exactly the regime of a Bonferroni-corrected alpha.
-    def _log_sf(t_value):
-        if t_value <= 0.0:
-            return math.log(0.5)
-        t_sq = t_value * t_value
-        if math.isfinite(t_sq):
-            denom = dof + t_sq
-            if math.isfinite(denom):
-                a = 0.5 * dof
-                b = 0.5
-                # ``y = t^2/(dof+t^2)`` is the stable complement of
-                # ``x = dof/(dof+t^2)``.  When y is small the direct x
-                # ratio rounds to exactly 1.0 and ``_betai`` returns 1.0,
-                # flattening SF at 0.5 even for quantiles near the median
-                # (large dof).  Use I_x(a,b) = 1 - I_y(b,a) there, which
-                # keeps the small tail probability ``I_y`` accurate.
-                y = t_sq / denom
-                if y < (b + 1.0) / (a + b + 2.0):
-                    ib = _betai(b, a, y)
-                    if ib < 1.0:
-                        return math.log(0.5) + math.log1p(-ib)
-                x = dof / denom
-                ib = _betai(a, b, x)
-                if ib >= 2.2250738585072014e-308:
-                    # Guard only against a last-bit overshoot from the
-                    # continued fraction; the true regularized beta is in
-                    # [0, 1].
-                    return math.log(0.5) + math.log(min(ib, 1.0))
-                if (x > 0.0 and x < (a + 1.0) / (a + b + 2.0)):
-                    # A subnormal (or zero) ``ib`` has too few significant
-                    # bits for ``log(ib)`` to locate the quantile; a zero
-                    # also used to fall through to the x -> 0 asymptote,
-                    # which is only valid for x near zero and returned a
-                    # quantile near 107 instead of 38 for dof=9999,
-                    # alpha=1e-300. Re-evaluate the SAME incomplete beta
-                    # in log space on this side (where the direct
-                    # continued fraction is the right branch).
-                    log_bt = (
-                        math.lgamma(a + b) - math.lgamma(a)
-                        - math.lgamma(b)
-                        + a * math.log(x) + b * math.log1p(-x))
-                    h = _betacf(a, b, x)
-                    if h > 0.0 and math.isfinite(log_bt):
-                        log_ib = log_bt + math.log(h) - math.log(a)
-                        return math.log(0.5) + log_ib
-                if ib > 0.0:
-                    return math.log(0.5) + math.log(min(ib, 1.0))
-        # ``t**2`` overflowed or the incomplete beta underflowed. The true
-        # x = dof / (dof + t^2) is then far below the smallest normal
-        # float, so use the x -> 0 limit in log space:
-        #     I_x(a, b) ~ x**a / (a * B(a, b)).
-        # Without this fallback the bracket stopped at t ~ 1e154 and
-        # returned a critical value orders of magnitude too small for
-        # extreme alphas (e.g. n=2, alpha=1e-300).
-        a = 0.5 * dof
-        b = 0.5
-        log_x = math.log(dof) - 2.0 * math.log(t_value)
-        log_ib = (a * log_x - math.log(a)
-                  - (math.lgamma(a) + math.lgamma(b)
-                     - math.lgamma(a + b)))
-        return math.log(0.5) + log_ib
 
-    target_log_sf = math.log(alpha)  # log(1 - target_p) = log(alpha)
+    from multi_seed_stats import _log_student_t_sf_positive
+
+    def _log_sf(t_value):
+        # Share the robust Student-t log-survival implementation: it keeps
+        # the subnormal beta tail, large-dof and t**2-overflow regimes
+        # accurate (the previous local continued fraction lost ~1e-8 near
+        # the median at dof~1e7 because of ``lgamma`` cancellation).
+        return _log_student_t_sf_positive(t_value, dof)
+
+    target_log_sf = math.log(alpha)
     # Coarse bracket: find lo, hi such that log_sf(lo) > target_log_sf >
     # log_sf(hi).  The old 1e6 cap was below the quantile for dof=1 even at
     # alpha=1e-12, and the saturation check above could not see that the

@@ -1535,3 +1535,29 @@ def test_two_sided_zero_variance_interaction_uses_exact_sign_floor():
     seven = [row(7)]
     _annotate_contrast_significance(seven)
     assert seven[0]['significant_bonferroni'] is True
+
+
+def test_bonferroni_moderate_dof_matches_exact_t_quantiles():
+    """The dependency-free fallback must keep ~1e-9 accuracy at dof~1e7.
+
+    The old local continued fraction formed ``log(Beta)`` from three
+    ``lgamma`` calls; at dof=1e7-1 their cancellation shifted alpha=0.05
+    and 0.10 quantiles by ~2e-8 relative.  References are mpmath tails at
+    50 digits (identical to scipy.stats.t.isf here).
+    """
+    import quality.stats as stats
+    from run_quality import _bonferroni_crit_q
+
+    saved = (stats._T_PP, stats._T_ISF)
+    stats._T_PP = stats._T_ISF = False
+    try:
+        for n, alpha, want in (
+                (10 ** 7, 0.05, 1.6448537793284168851),
+                (10 ** 7, 0.10, 1.2815516502030913223),
+                (10 ** 8 - 1, 0.05, 1.6448536421891644581),
+                (10 ** 8 - 1, 0.10, 1.2815515740104482483),
+        ):
+            got = _bonferroni_crit_q(n, alpha=alpha)
+            assert got == pytest.approx(want, rel=1e-10), (n, alpha, got)
+    finally:
+        stats._T_PP, stats._T_ISF = saved
