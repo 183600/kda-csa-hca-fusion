@@ -143,6 +143,7 @@ __all__ = [
     'exact_test_resolution',
     'binomial_proportion_ci',
     'median_order_statistic_ci',
+    'cross_cell_paired_analysis',
 ]
 
 # ---------------------------------------------------------------------------
@@ -1502,7 +1503,9 @@ def paired_t_test(diffs, alternative: str = 'two-sided') -> dict:
             'alternative': alternative}
 
 
-def _clean_seed_cell(cell, label) -> dict[int, float]:
+def _clean_seed_cell(cell, label, *,
+                     caller: str = 'interaction_contrast'
+                     ) -> dict[int, float]:
     """Validate one ``seed -> metric`` cell of a paired factorial design.
 
     The cell is the unit the runner stores as a per-seed result block. It
@@ -1521,12 +1524,12 @@ def _clean_seed_cell(cell, label) -> dict[int, float]:
             raise ValueError(
                 f'cell {label!r} has a non-negative-integer seed key '
                 f'{seed!r}; filter malformed rows before calling '
-                f'interaction_contrast')
+                f'{caller}')
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(
                 f'cell {label!r}[seed {seed}]={value!r} is not a real '
                 f'number; filter diverged seeds before calling '
-                f'interaction_contrast')
+                f'{caller}')
         try:
             value = float(value)
         except OverflowError:
@@ -1537,7 +1540,7 @@ def _clean_seed_cell(cell, label) -> dict[int, float]:
             raise ValueError(
                 f'cell {label!r}[seed {seed}]={value!r} is not finite; '
                 f'filter diverged seeds before calling '
-                f'interaction_contrast')
+                f'{caller}')
         out[seed] = value
     return out
 
@@ -1704,6 +1707,301 @@ def interaction_contrast(cell_a, cell_b, cell_c, cell_d, *,
             'mean_diff and the paired statistics are undefined'),
     })
     return record
+
+
+def _f_survival(f_stat, df1: int, df2: int) -> float | None:
+    """Upper-tail probability ``P(F > f_stat)`` for the F distribution."""
+    if df1 <= 0 or df2 <= 0:
+        raise ValueError(
+            f'F survival requires positive dof, got {df1!r}, {df2!r}')
+    if isinstance(f_stat, bool):
+        raise ValueError(f'f_stat must be a real number, got {f_stat!r}')
+    try:
+        f_stat = float(f_stat)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if math.isnan(f_stat):
+        return None
+    if f_stat == math.inf:
+        return 0.0
+    if f_stat <= 0.0:
+        return 1.0
+    denom = df2 + df1 * f_stat
+    if not math.isfinite(denom):
+        return 0.0
+    x = df2 / denom
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    return betainc_regularized(0.5 * df2, 0.5 * df1, x)
+
+
+def _cross_cell_heterogeneity(cells, names, common) -> dict:
+    """Repeated-measures cell x seed F test on a balanced cell matrix."""
+    k = len(names)
+    n = len(common)
+    if k < 2 or n < 2:
+        return {
+            'method': 'repeated_measures_cell_x_seed_f_test',
+            'F': None,
+            'df1': None,
+            'df2': None,
+            'p_value': None,
+            'between_cell_sd': None,
+            'within_seed_sd': None,
+            'zero_residual_variance': None,
+            'sphericity_assumed': True,
+            'note': ('fewer than two cells or two common seeds; '
+                     'heterogeneity is not estimable'),
+        }
+    values = [cells[name][s] for s in common for name in names]
+    scale = max(abs(v) for v in values)
+    if scale == 0.0:
+        scaled = {(s, name): 0.0 for s in common for name in names}
+    else:
+        scaled = {(s, name): cells[name][s] / scale
+                  for s in common for name in names}
+    cell_means = {
+        name: _safe_mean([scaled[(s, name)] for s in common])
+        for name in names}
+    seed_means = {
+        s: _safe_mean([scaled[(s, name)] for name in names])
+        for s in common}
+    grand = _safe_mean(
+        [scaled[(s, name)] for s in common for name in names])
+    ss_cells = n * math.fsum(
+        (cell_means[name] - grand) ** 2 for name in names)
+    ss_error = math.fsum(
+        (scaled[(s, name)] - seed_means[s] - cell_means[name] + grand) ** 2
+        for s in common for name in names)
+    df1 = k - 1
+    df2 = (n - 1) * (k - 1)
+    original_means = {
+        name: _safe_mean([cells[name][s] for s in common])
+        for name in names}
+    original_grand = _safe_mean(
+        [cells[name][s] for s in common for name in names])
+    between_sd = _sample_sd(
+        [original_means[name] for name in names], original_grand)
+    # Constant cell offsets leave only last-bit residue in ``ss_error``.
+    # Treat that residue as zero instead of reporting an astronomical F
+    # from round-off; the tolerance is on the unit-scaled matrix.
+    residual_tol = 64.0 * math.ulp(1.0) * max(1.0, ss_cells + n * k)
+    zero_residual = ss_error <= residual_tol
+    if zero_residual:
+        f_stat = None
+        p_value = 0.0 if ss_cells > 0.0 else 1.0
+        within_sd = 0.0
+    else:
+        f_stat = (ss_cells / df1) / (ss_error / df2)
+        if not math.isfinite(f_stat):
+            f_stat = None
+            p_value = 0.0
+        else:
+            p_value = _f_survival(f_stat, df1, df2)
+        within_sd = scale * math.sqrt(ss_error / df2)
+        if not math.isfinite(within_sd):
+            within_sd = None
+    return {
+        'method': 'repeated_measures_cell_x_seed_f_test',
+        'F': f_stat,
+        'df1': df1,
+        'df2': df2,
+        'p_value': p_value,
+        'between_cell_sd': between_sd,
+        'within_seed_sd': within_sd,
+        'zero_residual_variance': bool(zero_residual),
+        'sphericity_assumed': True,
+        'note': (
+            'Descriptive repeated-measures check: a large F means the '
+            'cell means differ by more than the within-seed cell-to-cell '
+            'variation. The F test assumes sphericity (exact for two '
+            'cells; potentially anti-conservative for more) and is not '
+            'the replication test. The seed-level paired panel in '
+            'primary is the inferential result.'),
+    }
+
+
+def cross_cell_paired_analysis(cells, *, alpha: float = 0.05,
+                               seed: int = 0, n_boot: int = 10000,
+                               n_permutations: int = 10000,
+                               max_exact: int = 16,
+                               family_size: int = 1,
+                               min_cells: int = 2,
+                               include_seed_influence: bool = False) -> dict:
+    """Replicate one paired contrast across several cells (tasks/datasets).
+
+    ``cells`` maps a cell name to a ``seed -> paired difference`` mapping,
+    where the difference is oriented so positive means the first operator
+    is better. The per-cell analysis in ``run_quality`` tests each
+    ``(task, n_kv)`` cell in its own Holm family. That is the right unit
+    for a cell-specific claim, but it also means a reader can select the
+    cell where an operator ordering happens to be significant. This
+    function asks the complementary question: does the ordering hold when
+    every pre-specified cell is considered together?
+
+    The primary test is **seed-balanced**, not observation-weighted: for
+    each seed present in every cell, average that seed's paired difference
+    across cells, then run the ordinary paired panel
+    (:func:`summarize_paired`) on the averaged differences. The seed is
+    the experimental unit, so a cell with more surviving seeds cannot
+    dominate, and the cells are not treated as independent studies. The
+    estimand is the average paired difference across the included cells;
+    a cell-specific effect must still be read from the per-cell panel.
+
+    Two descriptive checks guard against over-reading the pooled mean:
+
+    * ``mixed_direction`` — the per-cell mean differences do not all share
+      a sign, so the pooled average is not a replicated ordering.
+    * ``aggregation_reversal`` — the naive observation-weighted mean (all
+      cell/seed pairs) has the opposite sign from the seed-balanced mean.
+      This is the Simpson-style aggregation failure: pooling raw rows
+      across unequal cells can reverse the effect.
+
+    ``heterogeneity`` is a balanced repeated-measures F test for a
+    cell x seed interaction. It is descriptive (it assumes sphericity),
+    not a confirmatory test.
+
+    Only seeds present in every cell enter the primary test; seeds dropped
+    by that balance requirement are listed explicitly. A contrast seen in
+    fewer than ``min_cells`` cells is labelled ``insufficient_cells`` and
+    must not be presented as a replication. The caller remains
+    responsible for multiplicity correction across contrasts; the
+    ``run_quality`` integration applies Holm across the cross-cell family.
+    """
+    alpha = _validate_alpha(alpha)
+    if (isinstance(family_size, bool) or not isinstance(family_size, int)
+            or family_size < 1):
+        raise ValueError(
+            f'family_size must be a positive int, got {family_size!r}')
+    if (isinstance(min_cells, bool) or not isinstance(min_cells, int)
+            or min_cells < 2):
+        raise ValueError(
+            f'min_cells must be an int >= 2, got {min_cells!r}')
+    if hasattr(cells, 'items'):
+        items = list(cells.items())
+    else:
+        items = list(cells)
+    cleaned: dict[str, dict[int, float]] = {}
+    for name, cell in items:
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f'cell names must be non-empty strings, got {name!r}')
+        if name in cleaned:
+            raise ValueError(f'duplicate cell name {name!r}')
+        cleaned[name] = _clean_seed_cell(
+            cell, name, caller='cross_cell_paired_analysis')
+    names = list(cleaned)
+    k = len(names)
+    cell_summaries = {}
+    all_diffs = []
+    for name in names:
+        vals = list(cleaned[name].values())
+        all_diffs.extend(vals)
+        mean = _safe_mean(vals) if vals else None
+        sd = (_sample_sd(vals, mean)
+              if mean is not None and len(vals) >= 2 else None)
+        cell_summaries[name] = {
+            'n_pairs': len(vals),
+            'mean_diff': mean,
+            'sd_diff': sd,
+            'direction': ('none' if mean is None or mean == 0.0
+                          else ('greater' if mean > 0 else 'less')),
+        }
+    if k:
+        common = sorted(set.intersection(
+            *(set(cell) for cell in cleaned.values())))
+        all_seeds = sorted(set().union(
+            *(set(cell) for cell in cleaned.values())))
+    else:
+        common = []
+        all_seeds = []
+    common_set = set(common)
+    dropped = [s for s in all_seeds if s not in common_set]
+    n_common = len(common)
+    naive_pooled = _safe_mean(all_diffs) if all_diffs else None
+    seed_balanced = None
+    primary = None
+    if n_common >= 2:
+        seed_diffs = [
+            _safe_mean([cleaned[name][s] for name in names])
+            for s in common]
+        seed_balanced = _safe_mean(seed_diffs)
+        if k >= min_cells:
+            primary = summarize_paired(
+                seed_diffs, seed=seed, n_boot=n_boot,
+                n_permutations=n_permutations, max_exact=max_exact,
+                alpha=alpha, family_size=family_size,
+                include_seed_influence=include_seed_influence)
+    cell_means = [cell_summaries[name]['mean_diff'] for name in names]
+    n_pos = sum(1 for m in cell_means if m is not None and m > 0.0)
+    n_neg = sum(1 for m in cell_means if m is not None and m < 0.0)
+    n_zero = sum(1 for m in cell_means if m is not None and m == 0.0)
+    if seed_balanced is None or seed_balanced == 0.0:
+        same_direction = 0
+    elif seed_balanced > 0.0:
+        same_direction = n_pos
+    else:
+        same_direction = n_neg
+    all_same = bool(k and (n_pos == k or n_neg == k))
+    mixed = bool(n_pos and n_neg)
+    reversal = bool(
+        naive_pooled is not None and seed_balanced is not None
+        and naive_pooled != 0.0 and seed_balanced != 0.0
+        and (naive_pooled > 0.0) != (seed_balanced > 0.0))
+    if k < min_cells:
+        status = 'insufficient_cells'
+    elif n_common < 2:
+        status = 'insufficient_balanced_seeds'
+    elif seed_balanced is None:
+        status = 'undefined'
+    elif reversal:
+        status = 'aggregation_reversal'
+    elif mixed:
+        status = 'mixed_direction'
+    else:
+        status = 'consistent_direction'
+    return {
+        'method': 'seed_balanced_cross_cell_paired_analysis',
+        'definition': (
+            'for each seed common to every cell, average the paired '
+            'differences across cells; test the averaged differences '
+            'across seeds with the paired panel'),
+        'n_cells': k,
+        'cell_names': names,
+        'min_cells': min_cells,
+        'n_seeds_common': n_common,
+        'common_seeds': common,
+        'n_seeds_dropped': len(dropped),
+        'dropped_seeds': dropped,
+        'n_observations': len(all_diffs),
+        'cells': cell_summaries,
+        'cell_direction_counts': {
+            'positive': n_pos,
+            'negative': n_neg,
+            'zero': n_zero,
+            'same_as_seed_balanced': same_direction,
+        },
+        'all_cells_same_direction': all_same,
+        'mixed_direction': mixed,
+        'naive_pooled_mean_diff': naive_pooled,
+        'seed_balanced_mean_diff': seed_balanced,
+        'aggregation_reversal': reversal,
+        'heterogeneity': _cross_cell_heterogeneity(
+            cleaned, names, common),
+        'primary': primary,
+        'status': status,
+        'note': (
+            'Cells share the same training seeds, so this is not a '
+            'meta-analysis of independent studies. Only seeds present in '
+            'every cell enter the primary test; the estimand is the '
+            'average paired difference across the included cells, not a '
+            'cell-specific effect. mixed_direction or '
+            'aggregation_reversal forbids reading the pooled mean as a '
+            'replicated ordering. Significance requires the caller\'s '
+            'multiplicity correction on primary.'),
+    }
 
 
 def sign_test(diffs, *, alpha: float = 0.05) -> dict:

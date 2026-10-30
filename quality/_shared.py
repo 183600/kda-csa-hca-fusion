@@ -26,8 +26,10 @@ from ops_hca import naive_hca
 from ops_fused import HybridConfig
 from ops_mamba import build_mamba2_mixer
 from ops_rwkv import RWKV7_UPSTREAM_BINDING, build_rwkv7_mixer
-from multi_seed_stats import (_safe_mean, _sample_sd, exact_test_resolution,
-                               holm_adjust, summarize_paired)
+from multi_seed_stats import (_safe_mean, _sample_sd,
+                               cross_cell_paired_analysis,
+                               exact_test_resolution, holm_adjust,
+                               summarize_paired)
 from experiment_design import (audit_run as audit_experiment_design,
                                common_analyzed_seeds)
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,

@@ -150,3 +150,7 @@ rep['drops'][5]['mean_diff']  # the remaining mean after deleting seed 5
 * `test_multi_seed_stats.py` — hand-computed sign/decision flips,
   degenerate cases, determinism/JSON safety, and the `run_quality`
   integration.
+
+For the complementary question — whether an ordering replicates across
+all `(task, n_kv)` cells rather than within one cell — see
+[cross-cell-replication.md](cross-cell-replication.md).

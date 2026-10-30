@@ -883,6 +883,96 @@ def _pairwise_family_resolution(records, alpha):
     }
 
 
+def _cross_cell_pairwise_report(pair_cell_diffs, *, alpha, n_boot,
+                                n_permutations, max_exact):
+    """Holm-corrected replication test across (task, n_kv) cells.
+
+    Each pair's per-cell seed-paired differences are combined by
+    ``multi_seed_stats.cross_cell_paired_analysis``: the seed is the unit,
+    so a cell with more surviving seeds cannot dominate, and a pair that
+    appears in only one cell is explicitly ``insufficient_cells`` rather
+    than called a replication.
+    """
+    eligible = {}
+    for pair_key, cells in pair_cell_diffs.items():
+        if len(cells) < 2:
+            continue
+        common = set.intersection(
+            *(set(seed_values) for seed_values in cells.values()))
+        if len(common) >= 2:
+            eligible[pair_key] = cells
+    family_size = len(eligible)
+    records = {}
+    p_values = []
+    for pair_key, cells in pair_cell_diffs.items():
+        rec = cross_cell_paired_analysis(
+            cells, alpha=alpha, n_boot=n_boot,
+            n_permutations=n_permutations, max_exact=max_exact,
+            family_size=family_size if pair_key in eligible else 1)
+        records[pair_key] = rec
+        if pair_key in eligible:
+            primary = rec.get('primary')
+            if primary is not None:
+                p_values.append(
+                    (pair_key,
+                     primary['permutation_test']['p_value_two_sided']))
+    holm = holm_adjust([p for _, p in p_values], alpha=alpha)
+    for idx, (pair_key, _p) in enumerate(p_values):
+        rec = records[pair_key]
+        rec['holm_adjusted_p_permutation'] = holm['adjusted'][idx]
+        rec['significant_holm_permutation'] = bool(holm['rejected'][idx])
+        mean = rec['primary']['mean_diff']
+        if rec['significant_holm_permutation']:
+            rec['verdict'] = ('op_a_better' if mean > 0
+                              else 'op_b_better')
+        else:
+            rec['verdict'] = 'not_significant'
+    for rec in records.values():
+        rec.setdefault('holm_adjusted_p_permutation', None)
+        rec.setdefault('significant_holm_permutation', False)
+        if 'verdict' not in rec:
+            rec['verdict'] = (
+                'insufficient_balanced_seeds'
+                if rec.get('n_cells', 0) >= 2 else 'insufficient_cells')
+    statuses = [rec.get('status') for rec in records.values()]
+    verdicts = [rec.get('verdict') for rec in records.values()]
+    significant = ('op_a_better', 'op_b_better')
+    return {
+        'alpha': alpha,
+        'correction': 'holm_bonferroni',
+        'family_scope': (
+            'one family over operator pairs testable (>=2 common seeds) '
+            'in at least two (task, n_kv) cells'),
+        'n_pairs_total': len(records),
+        'n_tests': len(p_values),
+        'n_significant': sum(1 for v in verdicts if v in significant),
+        'n_significant_and_consistent': sum(
+            1 for rec in records.values()
+            if rec.get('verdict') in significant
+            and rec.get('status') == 'consistent_direction'),
+        'n_consistent_direction': statuses.count('consistent_direction'),
+        'n_mixed_direction': statuses.count('mixed_direction'),
+        'n_aggregation_reversal': statuses.count(
+            'aggregation_reversal'),
+        'n_insufficient_cells': statuses.count('insufficient_cells'),
+        'n_insufficient_balanced_seeds': statuses.count(
+            'insufficient_balanced_seeds'),
+        'pairs': records,
+        'note': (
+            'Cross-cell records re-use the per-cell seed-paired '
+            'differences, so only cells where the pair had >=2 common '
+            'seeds enter the cross-cell set. The primary test averages '
+            'within seed across those cells, so the seed (not the cell) '
+            'is the experimental unit and the cells are not treated as '
+            'independent studies. A pair seen in only one testable cell '
+            'is not a replication. aggregation_reversal means the naive '
+            'observation-weighted mean has the opposite sign from the '
+            'seed-balanced mean; mixed_direction means the per-cell means '
+            'disagree. Neither is repaired by the pooled test, and '
+            'neither licenses a cell-specific claim.'),
+    }
+
+
 def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                              n_boot=2000, n_permutations=10000,
                              max_exact=16, equivalence_margin=None):
@@ -955,6 +1045,17 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
     the opponent under ``pairwise_direction_fragile_wins``. The report
     aggregates the per-cell counts under ``seed_influence``.
 
+    Cross-cell replication: the per-cell family is the right unit for a
+    cell-specific claim, but it also lets a reader select whichever
+    ``(task, n_kv)`` cell happens to show a significant ordering. The
+    report therefore also carries ``cross_cell_replication`` from
+    ``multi_seed_stats.cross_cell_paired_analysis``: for every operator
+    pair, the per-seed differences are averaged across cells (seed = the
+    experimental unit, not the cell) and tested in one Holm family. It
+    also reports mixed per-cell directions and Simpson-style aggregation
+    reversal. A pair observed in only one cell is ``insufficient_cells``,
+    not a replication.
+
     Side effect: every row participating in >= 1 testable pair gets
     ``pairwise_tests``, ``pairwise_significant_wins`` and
     ``pairwise_significant_losses`` (operator-name lists) so downstream
@@ -970,6 +1071,7 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         if 'error' in r or r.get('mean_acc') is None:
             continue
         groups.setdefault((r.get('task', 'mqar'), r['n_kv']), []).append(r)
+    pair_cell_diffs: dict = {}
 
     report = {
         'alpha': alpha,
@@ -1047,6 +1149,8 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
                     cell['n_skipped'] += 1
                     continue
                 diffs = [a_seed[s] - b_seed[s] for s in common]
+                pair_cell_diffs.setdefault(pair_key, {})[cell_key] = {
+                    s: a_seed[s] - b_seed[s] for s in common}
                 stats = summarize_paired(
                     diffs, seed=seed, n_boot=n_boot,
                     n_permutations=n_permutations,
@@ -1167,6 +1271,10 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         report['n_boundary_sensitive'] += cell['n_boundary_sensitive']
         report['n_seed_influence_stable'] += cell['n_seed_influence_stable']
         report['n_resolution_limited'] += cell['n_resolution_limited']
+
+    report['cross_cell_replication'] = _cross_cell_pairwise_report(
+        pair_cell_diffs, alpha=alpha, n_boot=n_boot,
+        n_permutations=n_permutations, max_exact=max_exact)
 
     cells_with_resolution = [
         cell['resolution'] for cell in report['cells'].values()

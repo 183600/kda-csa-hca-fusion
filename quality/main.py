@@ -719,6 +719,18 @@ def main():
             f"{op_pairwise['n_boundary_sensitive']} boundary-sensitive, "
             f"{op_pairwise['n_seed_influence_stable']} stable "
             f"(descriptive; not a test)")
+        _cross = op_pairwise.get('cross_cell_replication') or {}
+        if _cross.get('n_pairs_total'):
+            logger.info(
+                f"  cross-cell replication (seed-balanced, one Holm "
+                f"family): "
+                f"{_cross.get('n_significant_and_consistent', 0)}/"
+                f"{_cross.get('n_tests', 0)} pair(s) significant and "
+                f"direction-consistent; "
+                f"{_cross.get('n_mixed_direction', 0)} mixed-direction, "
+                f"{_cross.get('n_aggregation_reversal', 0)} "
+                f"aggregation-reversal, "
+                f"{_cross.get('n_insufficient_cells', 0)} single-cell-only")
 
     # Experiment-level statistical validity summary. Mirrors run_ablation.py
     # but with the appropriate thresholds for the 4-op MQAR sweep.

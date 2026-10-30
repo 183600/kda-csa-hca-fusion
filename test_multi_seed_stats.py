@@ -1391,6 +1391,224 @@ def test_interaction_contrast_reports_unrepresentable_sd():
     json.dumps(rep, allow_nan=False)
 
 
+def test_cross_cell_replication_balances_seeds_not_cells():
+    """The primary test must average within seed, not weight big cells."""
+    cells = {
+        'mqar/n_kv=1': {1: 0.1, 2: 0.2, 3: 0.3, 4: 0.4},
+        'kv/n_kv=2': {1: 0.3, 2: 0.4, 3: 0.5, 4: 0.6,
+                      5: 0.9, 6: 0.9},
+    }
+    rep = M.cross_cell_paired_analysis(
+        cells, n_boot=50, n_permutations=100)
+    json.dumps(rep, allow_nan=False)
+    assert rep['n_cells'] == 2
+    assert rep['n_seeds_common'] == 4
+    assert rep['n_seeds_dropped'] == 2
+    assert rep['dropped_seeds'] == [5, 6]
+    assert rep['n_observations'] == 10
+    # Per-seed averages are 0.2, 0.3, 0.4, 0.5; the two extra high seeds
+    # in the larger cell are dropped from the balanced estimand instead of
+    # pulling its mean upward.
+    assert rep['seed_balanced_mean_diff'] == pytest.approx(0.35)
+    assert rep['primary']['mean_diff'] == pytest.approx(0.35)
+    assert rep['naive_pooled_mean_diff'] == pytest.approx(0.46)
+    assert rep['status'] == 'consistent_direction'
+    assert rep['all_cells_same_direction'] is True
+    assert rep['cells']['mqar/n_kv=1']['direction'] == 'greater'
+    assert rep['cells']['kv/n_kv=2']['direction'] == 'greater'
+
+
+def test_cross_cell_replication_flags_mixed_direction_and_reversal():
+    mixed = {
+        'a': {i: 0.2 for i in range(6)},
+        'b': {i: -0.1 for i in range(6)},
+    }
+    rep = M.cross_cell_paired_analysis(
+        mixed, n_boot=20, n_permutations=20)
+    json.dumps(rep, allow_nan=False)
+    assert rep['status'] == 'mixed_direction'
+    assert rep['mixed_direction'] is True
+    assert rep['aggregation_reversal'] is False
+    assert rep['cell_direction_counts'] == {
+        'positive': 1, 'negative': 1, 'zero': 0,
+        'same_as_seed_balanced': 1}
+
+    # A large negative cell dominates the observation-weighted mean, while
+    # the two common seeds both favour the positive cell: the naive pooled
+    # sign reverses the seed-balanced sign (Simpson-style aggregation).
+    reversal = {
+        'small': {1: 0.2, 2: 0.2},
+        'large': {**{1: -0.1, 2: -0.1},
+                  **{i: -0.1 for i in range(3, 101)}},
+    }
+    rep = M.cross_cell_paired_analysis(
+        reversal, n_boot=20, n_permutations=20)
+    json.dumps(rep, allow_nan=False)
+    assert rep['status'] == 'aggregation_reversal'
+    assert rep['aggregation_reversal'] is True
+    assert rep['seed_balanced_mean_diff'] == pytest.approx(0.05)
+    assert rep['naive_pooled_mean_diff'] < 0.0
+    assert rep['n_seeds_dropped'] == 98
+
+
+def test_cross_cell_replication_heterogeneity_is_descriptive():
+    constant_offset = {
+        'a': {1: 0.1, 2: 0.2, 3: 0.3, 4: 0.4},
+        'b': {1: 0.2, 2: 0.3, 3: 0.4, 4: 0.5},
+    }
+    rep = M.cross_cell_paired_analysis(
+        constant_offset, n_boot=20, n_permutations=20)
+    het = rep['heterogeneity']
+    assert het['zero_residual_variance'] is True
+    assert het['F'] is None and het['p_value'] == 0.0
+    assert het['df1'] == 1 and het['df2'] == 3
+    assert het['sphericity_assumed'] is True
+
+    interaction = {
+        'a': {1: 0.1, 2: 0.4, 3: 0.1, 4: 0.4},
+        'b': {1: 0.4, 2: 0.1, 3: 0.4, 4: 0.1},
+    }
+    rep = M.cross_cell_paired_analysis(
+        interaction, n_boot=20, n_permutations=20)
+    het = rep['heterogeneity']
+    assert het['F'] == pytest.approx(0.0)
+    assert het['p_value'] == pytest.approx(1.0)
+    assert rep['status'] == 'consistent_direction'
+    assert rep['mixed_direction'] is False
+
+
+def test_cross_cell_replication_status_and_validation():
+    one = M.cross_cell_paired_analysis({'only': {1: 0.1, 2: 0.2}})
+    assert one['status'] == 'insufficient_cells'
+    assert one['primary'] is None
+    json.dumps(one, allow_nan=False)
+
+    disjoint = M.cross_cell_paired_analysis({
+        'a': {1: 0.1, 2: 0.2},
+        'b': {3: 0.1, 4: 0.2},
+    })
+    assert disjoint['status'] == 'insufficient_balanced_seeds'
+    assert disjoint['primary'] is None
+    assert disjoint['n_seeds_common'] == 0
+    json.dumps(disjoint, allow_nan=False)
+
+    with pytest.raises(ValueError):
+        M.cross_cell_paired_analysis({
+            'a': {1: float('nan')}, 'b': {1: 0.1}})
+    with pytest.raises(ValueError):
+        M.cross_cell_paired_analysis([
+            ('a', {1: 0.1}), ('a', {2: 0.2})])
+    with pytest.raises(ValueError):
+        M.cross_cell_paired_analysis(
+            {'a': {1: 0.1}, 'b': {1: 0.2}}, min_cells=1)
+    with pytest.raises(ValueError):
+        M.cross_cell_paired_analysis(
+            {'a': {1: 0.1}, 'b': {1: 0.2}}, family_size=0)
+
+
+def test_pairwise_report_adds_cross_cell_replication():
+    rows = [
+        _row('op_a', [0.9] * 6, task='mqar', n_kv=1),
+        _row('op_b', [0.1] * 6, task='mqar', n_kv=1),
+        _row('op_a', [0.8] * 6, task='kv', n_kv=1),
+        _row('op_b', [0.2] * 6, task='kv', n_kv=1),
+    ]
+    report = _pairwise_op_comparisons(
+        rows, alpha=0.05, seed=0, n_boot=100, n_permutations=100)
+    json.dumps(report, allow_nan=False)
+    cross = report['cross_cell_replication']
+    assert cross['n_tests'] == 1
+    assert cross['n_significant'] == 1
+    assert cross['n_significant_and_consistent'] == 1
+    rec = cross['pairs']['op_a~op_b']
+    assert rec['status'] == 'consistent_direction'
+    assert rec['n_cells'] == 2
+    assert rec['primary']['mean_diff'] == pytest.approx(0.7)
+    assert rec['verdict'] == 'op_a_better'
+    assert rec['significant_holm_permutation'] is True
+    assert rec['holm_adjusted_p_permutation'] >= \
+        rec['primary']['permutation_test']['p_value_two_sided']
+
+
+def test_pairwise_cross_cell_disjoint_seeds_are_not_in_family():
+    rows = [
+        _row('op_a', [0.9] * 6, task='mqar', n_kv=1),
+        _row('op_b', [0.1] * 6, task='mqar', n_kv=1),
+        _row('op_a', [0.8] * 6, task='kv', n_kv=1),
+        _row('op_b', [0.2] * 6, task='kv', n_kv=1),
+    ]
+    for item in rows[2]['per_seed'] + rows[3]['per_seed']:
+        item['seed'] += 100
+    report = _pairwise_op_comparisons(
+        rows, alpha=0.05, seed=0, n_boot=100, n_permutations=100)
+    cross = report['cross_cell_replication']
+    assert cross['n_pairs_total'] == 1
+    assert cross['n_tests'] == 0
+    assert cross['n_insufficient_balanced_seeds'] == 1
+    rec = cross['pairs']['op_a~op_b']
+    assert rec['status'] == 'insufficient_balanced_seeds'
+    assert rec['verdict'] == 'insufficient_balanced_seeds'
+    assert rec['holm_adjusted_p_permutation'] is None
+    json.dumps(report, allow_nan=False)
+
+
+def test_pairwise_cross_cell_significant_mixed_is_not_replicated():
+    rows = [
+        _row('op_a', [0.9] * 6, task='mqar', n_kv=1),
+        _row('op_b', [0.4] * 6, task='mqar', n_kv=1),
+        _row('op_a', [0.2] * 6, task='kv', n_kv=1),
+        _row('op_b', [0.6] * 6, task='kv', n_kv=1),
+    ]
+    report = _pairwise_op_comparisons(
+        rows, alpha=0.05, seed=0, n_boot=100, n_permutations=100)
+    cross = report['cross_cell_replication']
+    rec = cross['pairs']['op_a~op_b']
+    assert rec['status'] == 'mixed_direction'
+    assert rec['significant_holm_permutation'] is True
+    assert rec['verdict'] == 'op_a_better'
+    assert cross['n_significant'] == 1
+    assert cross['n_significant_and_consistent'] == 0
+    json.dumps(report, allow_nan=False)
+
+
+def test_pairwise_cross_cell_significant_reversal_is_not_replicated():
+    rows = [
+        _row('op_a', [0.7] * 6, task='mqar', n_kv=1),
+        _row('op_b', [0.5] * 6, task='mqar', n_kv=1),
+        _row('op_a', [0.4] * 100, task='kv', n_kv=1),
+        _row('op_b', [0.5] * 100, task='kv', n_kv=1),
+    ]
+    report = _pairwise_op_comparisons(
+        rows, alpha=0.05, seed=0, n_boot=100, n_permutations=100)
+    cross = report['cross_cell_replication']
+    rec = cross['pairs']['op_a~op_b']
+    assert rec['status'] == 'aggregation_reversal'
+    assert rec['seed_balanced_mean_diff'] > 0.0
+    assert rec['naive_pooled_mean_diff'] < 0.0
+    assert rec['significant_holm_permutation'] is True
+    assert rec['verdict'] == 'op_a_better'
+    assert cross['n_significant'] == 1
+    assert cross['n_significant_and_consistent'] == 0
+    json.dumps(report, allow_nan=False)
+
+
+def test_pairwise_report_does_not_call_one_cell_a_replication():
+    rows = [
+        _row('op_a', [0.9] * 6, task='mqar', n_kv=1),
+        _row('op_b', [0.1] * 6, task='mqar', n_kv=1),
+    ]
+    report = _pairwise_op_comparisons(
+        rows, alpha=0.05, seed=0, n_boot=100, n_permutations=100)
+    cross = report['cross_cell_replication']
+    assert cross['n_tests'] == 0
+    assert cross['n_insufficient_cells'] == 1
+    rec = cross['pairs']['op_a~op_b']
+    assert rec['status'] == 'insufficient_cells'
+    assert rec['verdict'] == 'insufficient_cells'
+    assert rec['holm_adjusted_p_permutation'] is None
+    json.dumps(report, allow_nan=False)
+
+
 def test_student_t_uses_the_normal_limit_for_large_dof():
     from statistics import NormalDist
     expected = NormalDist().cdf(1.0)
