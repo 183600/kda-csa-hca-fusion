@@ -49,6 +49,7 @@ from ops_mamba import (Mamba2Mixer, build_mamba2_mixer, chunked_mamba2_scan,
 from ops_mamba_backend import validate_mamba_backend
 from timing_stats import summarize_timings_s
 from results_schema import RowContractError, validate_rows
+import timing_design
 import ops_kda
 
 logger = logging.getLogger(__name__)
@@ -827,13 +828,20 @@ def main():
     }
 
     results = []
+    raw_trials = []
     n_repeats = parse_int_env('BENCH_REPEATS', 5, min_value=1, logger=logger)
+    schedule = timing_design.balanced_schedule(
+        [name for name, _factory in benches], len(seq_lengths),
+        seed=timing_design.DEFAULT_SCHEDULE_SEED)
+    bench_by_name = dict(benches)
+    warmup_passes = min(timing_design.DEFAULT_WARMUP_PASSES, n_repeats)
     prev_nonfinite_warn = ops_kda._KDA_NONFINITE_WARN
     ops_kda._KDA_NONFINITE_WARN = False
     try:
-        for T in seq_lengths:
+        for block_index, T in enumerate(seq_lengths):
             logger.info(f'\n-- T = {T} --')
-            for name, factory in benches:
+            for order_position, name in enumerate(schedule[block_index]):
+                factory = bench_by_name[name]
                 try:
                     _clear_cache(device)
                     meta = {}
@@ -842,7 +850,11 @@ def main():
                     row = {'T': T, 'op': name, 'time_ms': t * 1e3, 'peak_mem_MB': mem,
                            'device': str(device), 'repeats': n_repeats,
                            'tokens_per_s': ((B * T) / t) if t > 0 else None,
-                           'param_elements': meta.get('param_elements')}
+                           'param_elements': meta.get('param_elements'),
+                           'warmup': warmup_passes,
+                           'schedule_id': f'balanced_rotation:{timing_design.DEFAULT_SCHEDULE_SEED}',
+                           'schedule_block': block_index,
+                           'order_position': order_position}
                     if name in {'kda_rec', 'kda_chunk', 'kda_chunk_compiled',
                                 'kda_rec_hybrid', 'kda_chunk_hybrid',
                                 'hybrid'}:
@@ -908,6 +920,13 @@ def main():
                     row.update(op_boundary[name])
                     row['workload'] = op_workload.get(name, {})
                     results.append(row)
+                    raw_trials.append({
+                        'T': T,
+                        'op': name,
+                        'device': str(device),
+                        'samples_ms': [value * 1e3 for value in
+                                       _LAST_TIMING_STATS.get('times', [])],
+                    })
                     mem_str = f'{mem:8.2f} MB' if mem is not None else '     n/a'
                     print(f'  {name:12s}  time={t*1e3:8.2f} ms  mem={mem_str}')
                 except Exception as e:
@@ -939,6 +958,10 @@ def main():
                         'time_bootstrap_reps': None,
                         'repeats': n_repeats,
                         'param_elements': None,
+                        'warmup': warmup_passes,
+                        'schedule_id': f'balanced_rotation:{timing_design.DEFAULT_SCHEDULE_SEED}',
+                        'schedule_block': block_index,
+                        'order_position': order_position,
                     }
                     if name == 'kda_chunk_compiled':
                         err_row['kda_execution'] = 'torch.compile'
@@ -970,6 +993,15 @@ def main():
         write_json_atomic(sanitize_for_json(results),
                           'results/exp2_benchmark.json',
                           indent=2, allow_nan=False)
+    try:
+        raw_doc = timing_design.raw_manifest(
+            'exp2_benchmark', raw_trials, warmup=warmup_passes,
+            schedule_id=(f'balanced_rotation:'
+                         f'{timing_design.DEFAULT_SCHEDULE_SEED}'))
+        timing_design.write_raw_manifest(
+            'results/exp2_benchmark_raw.json', manifest=raw_doc)
+    except Exception as e:
+        logger.warning(f'failed to write raw timing trials: {e}')
     prov = None
     try:
         prov = capture_provenance()
@@ -982,6 +1014,21 @@ def main():
                        'by the scoped weight-init seeding (torch.manual_seed '
                        'wrapped in get/set_rng_state); no global seed needed'),
         }
+        try:
+            timing_cells = timing_design.cells_from_benchmark_rows(results)
+            family_size = (
+                len(timing_design.get_plan('exp2_benchmark')['primary_contrasts'])
+                * len(seq_lengths))
+            prov['timing_design'] = timing_design.audit_run(
+                'exp2_benchmark', timing_cells, repeats=n_repeats,
+                warmup=warmup_passes, schedule=schedule,
+                family_size=family_size, device=str(device),
+                workloads=seq_lengths)
+            prov['timing_design']['raw_contrast_rows'] = (
+                timing_design.raw_contrast_rows(
+                    'exp2_benchmark', raw_trials, family_size=family_size))
+        except Exception as e:
+            prov['timing_design'] = {'error': str(e)}
         write_json_atomic(prov,
                           'results/exp2_benchmark_provenance.json',
                           indent=2, allow_nan=False)
@@ -1009,6 +1056,11 @@ def main():
             'seed_scheme': ('per-(op, T) zlib.crc32 seeds; scoped weight '
                             'init restores the caller RNG state'),
             'weight_init_seeds': weight_init_seeds,
+            'timing_schedule': {
+                'schedule_id': (f'balanced_rotation:'
+                                f'{timing_design.DEFAULT_SCHEDULE_SEED}'),
+                'warmup_passes': warmup_passes,
+            },
         },
         data={
             'kind': 'synthetic_benchmark_workloads',

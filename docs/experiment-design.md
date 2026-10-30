@@ -506,7 +506,11 @@ and never upgrades a claim. See
   failure and re-run the whole block.
 * The registry covers the multi-seed inference experiments. Timing experiments
   (Exp 2/6/9) need a different design vocabulary (repeats, interleaving,
-  order effects); they are not squeezed into the seed-power model.
+  order effects); they are not squeezed into the seed-power model. Exp 2 and
+  Exp 6 have their own pre-registered measurement plans, balanced schedules,
+  and run audits in [`timing_design.py`](../timing_design.py); see
+  [timing-design.md](timing-design.md). Exp 9 remains covered by its own
+  recall protocol.
 * A plan is not a substitute for a clean data split. The data-separation
   contract lives in the runners (`run_quality.py`'s train / validation /
   headline-eval / bad-case streams).

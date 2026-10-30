@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_setup import (append_run_manifest, configure_torch_for_device,
                           write_json_atomic, make_seeded_generator,
                           capture_provenance, make_run_manifest_entry,
-                          set_global_seed)
+                          parse_int_env, set_global_seed)
 from ops_kda_backend import kda_forward, validate_kda_backend
 from ops_csa import naive_csa, _l2_normalize, _qk_normalize
 from ops_hca import naive_hca
@@ -63,6 +63,7 @@ from ops_rwkv_backend import validate_rwkv_backend
 from results_schema import (SchemaError, write_checked as
                             write_results_checked)
 from timing_stats import summarize_timings_ms
+import timing_design
 
 # Operator groups shared by the result rows and their contracts
 # (``results_schema``'s exp6_decoding contract mirrors the cache-flag
@@ -1660,6 +1661,18 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
     # treating two medians as an ordering.
     prefill_stats = summarize_timings_ms(prefill_times)
     decode_stats = summarize_timings_ms(flat_decode)
+    # Trial-level medians are the independent replicates for the timing
+    # design: token samples within one prefill+decode loop share the same
+    # cache and thermal state. The across-trial CV is therefore the
+    # planning/audit unit, not the token-level ``decode_cv``.
+    trial_medians = [statistics.median(trial) for trial in all_decode_times
+                     if trial]
+    if len(trial_medians) >= 2:
+        trial_mean = statistics.mean(trial_medians)
+        trial_cv = (statistics.stdev(trial_medians) / trial_mean
+                    if trial_mean > 0 else None)
+    else:
+        trial_cv = None
 
     return {
         'prefill_ms': prefill_ms,
@@ -1682,6 +1695,9 @@ def bench_decoding(model, d_model, prefill_len, n_decode, device, repeats=3):
         'decode_ci95_halfwidth_ms': decode_stats['ci95_halfwidth_ms'],
         'decode_cv': decode_stats['cv'],
         'decode_n': decode_stats['n'],
+        'decode_trial_medians_ms': trial_medians,
+        'decode_trial_cv': trial_cv,
+        'decode_trial_n': len(trial_medians),
         'timing_ci_method': prefill_stats['ci_method'],
         'timing_bootstrap_reps': prefill_stats['bootstrap_reps'],
         'timing_ci_alpha': prefill_stats['alpha'],
@@ -1728,7 +1744,10 @@ def main():
             f"DECODE_N_TOKENS={n_decode!r} must be a positive int.")
     # Hoist n_repeats into a module-visible variable so the error path can
     # record the same value as the success path.
-    N_REPEATS = 3
+    N_REPEATS = parse_int_env('DECODE_REPEATS', 3, min_value=1)
+    # One untimed prefill+decode warmup loop in bench_decoding (see its
+    # ``model.reset(); model(x_prefill); for _ in range(n_decode)`` block).
+    WARMUP_PASSES = 1
 
     models = {
         'softmax': lambda: SoftmaxAttnDecoding(d_model),
@@ -1747,16 +1766,34 @@ def main():
     set_global_seed(0, deterministic=True)
     torch.manual_seed(0)
 
+    schedule = timing_design.balanced_schedule(
+        list(models), len(prefill_lens),
+        seed=timing_design.DEFAULT_SCHEDULE_SEED)
+    model_by_name = dict(models)
     results = []
-    for plen in prefill_lens:
+    raw_trials = []
+    for block_index, plen in enumerate(prefill_lens):
         print(f'\n-- prefill_len = {plen}, decode {n_decode} tokens --')
-        for name, factory in models.items():
+        for order_position, name in enumerate(schedule[block_index]):
+            factory = model_by_name[name]
             try:
                 torch.manual_seed(0)
                 model = factory()
                 r = bench_decoding(model, d_model, plen, n_decode, device,
                                    repeats=N_REPEATS)
                 r['op'] = name
+                if r.get('decode_trial_medians_ms'):
+                    raw_trials.append({
+                        'prefill_len': plen,
+                        'op': name,
+                        'device': str(device),
+                        'samples_ms': list(r['decode_trial_medians_ms']),
+                    })
+                r['warmup'] = WARMUP_PASSES
+                r['schedule_id'] = (
+                    f'balanced_rotation:{timing_design.DEFAULT_SCHEDULE_SEED}')
+                r['schedule_block'] = block_index
+                r['order_position'] = order_position
                 r['n_layers'] = 5 if name in HYBRID_OPS else 1
                 r['compute_boundary'] = (
                     'end_to_end_multi_layer' if name in HYBRID_OPS
@@ -1862,8 +1899,17 @@ def main():
                                 'decode_state_allocated_bytes': None,
                                 'decode_state_breakdown': {},
                                 'decode_state_note': None,
+                                'decode_trial_medians_ms': [],
+                                'decode_trial_cv': None,
+                                'decode_trial_n': 0,
                                 'n_decode': n_decode,
                                 'repeats': N_REPEATS,
+                                'warmup': WARMUP_PASSES,
+                                'schedule_id': (
+                                    f'balanced_rotation:'
+                                    f'{timing_design.DEFAULT_SCHEDULE_SEED}'),
+                                'schedule_block': block_index,
+                                'order_position': order_position,
                                 'upper_bound': False,
                                 'uses_incremental_cache': name in INCREMENTAL_CACHE_OPS,
                                 'seed': 0,
@@ -1927,6 +1973,22 @@ def main():
 
     os.makedirs('results', exist_ok=True)
 
+    try:
+        timing_cells = timing_design.cells_from_decoding_rows(results)
+        family_size = (
+            len(timing_design.get_plan('exp6_decoding')['primary_contrasts'])
+            * len(prefill_lens))
+        timing_audit = timing_design.audit_run(
+            'exp6_decoding', timing_cells, repeats=N_REPEATS,
+            warmup=WARMUP_PASSES, schedule=schedule,
+            family_size=family_size, device=str(device),
+            workloads=prefill_lens)
+        timing_audit['raw_contrast_rows'] = (
+            timing_design.raw_contrast_rows(
+                'exp6_decoding', raw_trials, family_size=family_size))
+    except Exception as e:
+        timing_audit = {'error': str(e)}
+
     # Write the main results file as a versioned ``results_schema``
     # envelope (kind='exp6_decoding'). ``write_checked`` sanitizes
     # non-finite floats to null (a NaN/Inf in ``prefill_ms`` /
@@ -1961,6 +2023,7 @@ def main():
             'spare capacity. The certificate classifies each op as '
             'constant (recurrent state) or growing (softmax KV / '
             'compressed-block caches).'),
+        'timing_design': timing_audit,
         # Code/environment provenance in the main envelope itself (the side
         # file below duplicates it), so a single archived result file is a
         # complete run record.
@@ -1975,6 +2038,16 @@ def main():
         return 1
     print('\nSaved: results/exp6_decoding.json '
           '(schema kind=exp6_decoding)')
+    try:
+        raw_doc = timing_design.raw_manifest(
+            'exp6_decoding', raw_trials, warmup=WARMUP_PASSES,
+            schedule_id=(f'balanced_rotation:'
+                         f'{timing_design.DEFAULT_SCHEDULE_SEED}'))
+        timing_design.write_raw_manifest(
+            'results/exp6_decoding_raw.json', manifest=raw_doc)
+    except Exception as e:
+        print(f'[run_decoding] WARNING: failed to write raw timing '
+              f'trials: {e}')
     # Provenance side file: the code version / environment / seed scheme
     # is recorded next to the main results envelope.
     try:
@@ -1987,6 +2060,7 @@ def main():
                        'prefill/decode inputs; see run_decoding.main / '
                        'bench_decoding'),
         }
+        prov['timing_design'] = timing_audit
         write_json_atomic(prov, 'results/exp6_decoding_provenance.json',
                           indent=2, allow_nan=False)
     except Exception as e:
@@ -2006,6 +2080,11 @@ def main():
             'n_repeats': metadata['n_repeats'],
             'ops': metadata['ops'],
             'seed_scheme': metadata['seeds']['scheme'],
+            'timing_schedule': {
+                'schedule_id': (f'balanced_rotation:'
+                                f'{timing_design.DEFAULT_SCHEDULE_SEED}'),
+                'warmup_passes': WARMUP_PASSES,
+            },
         },
         data={
             'kind': 'synthetic_decode_workload',

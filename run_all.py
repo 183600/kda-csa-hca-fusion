@@ -72,6 +72,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import experiment_design  # noqa: E402  (needs HERE on sys.path)
+import timing_design  # noqa: E402  (needs HERE on sys.path)
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +89,11 @@ import experiment_design  # noqa: E402  (needs HERE on sys.path)
 #     matrix (exp5b smoke) so the ABL_MODE=matrix path is CI-covered.
 #   * ``screen`` (default) — the small-scale screening tier.
 #   * ``full``   — the formal-validation tier: seed counts raised to 7 so
-#     the multi-seed statistics stabilise. Step budgets are NOT silently
-#     raised (scale those explicitly via MQAR_STEPS / ABL_STEPS / ... once
-#     the screening curves say where the plateau sits).
+#     the multi-seed statistics stabilise, and the timing repeat counts
+#     raised to the pre-registered confirmatory budget
+#     (``timing_design.TIMING_PLANS``). Training step budgets are NOT
+#     silently raised (scale those explicitly via MQAR_STEPS / ABL_STEPS /
+#     ... once the screening curves say where the plateau sits).
 #
 # Application rule: a preset only sets variables the caller did NOT
 # export — an explicit env var always wins over the profile, so
@@ -120,6 +123,9 @@ _RUN_PROFILES: dict[str, dict[str, str] | None] = {
     'full': {
         'MQAR_SEEDS': '7', 'ABL_SEEDS': '7', 'MECH_SEEDS': '7',
         'RECALL_SEEDS': '7',
+        # The timing plans' confirmatory repeat budget (timing_design.py).
+        # Screening defaults (5 / 3) remain for smoke and screen profiles.
+        'BENCH_REPEATS': '15', 'DECODE_REPEATS': '15',
     },
 }
 
@@ -163,6 +169,16 @@ def _env_seed_list(name: str, default: int) -> list[int]:
     if count < 1:
         count = int(default)
     return [experiment_design.DEFAULT_SEED_BASE + i for i in range(count)]
+
+
+def _env_count(name: str, default: int) -> int:
+    """Read an env-var count with the runners' fallback semantics."""
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(default)
+    return value if value >= 1 else int(default)
 
 
 def _raise_seed_floor(name: str, default: int, minimum: int = 5) -> int:
@@ -261,6 +277,68 @@ def _write_experiment_design_manifest(profile: str) -> dict:
                         'required_seeds')),
                 'interaction_status': row['planning'].get(
                     'interaction_status'),
+            }
+            for row in manifest['results']
+        },
+    }
+
+
+def _write_timing_design_manifest(profile: str) -> dict:
+    """Write the prospective latency measurement designs BEFORE the runs.
+
+    The repeat budget is read from the same env vars the runners use, so the
+    manifest records the measurement actually about to happen. A stale or
+    under-budget registry is reported but does not block the pipeline; each
+    runner attaches its own runtime audit (balanced order, warmup, achieved
+    CV) to its result metadata.
+    """
+    repeats_by_plan = {
+        'exp2_benchmark': _env_count('BENCH_REPEATS', 5),
+        'exp6_decoding': _env_count('DECODE_REPEATS', 3),
+    }
+    design_errors = timing_design.validate_plans()
+    bad_plans = {plan_id: messages for plan_id, messages
+                 in design_errors.items() if messages}
+    if bad_plans:
+        print('[run_all] WARNING: the pre-registered timing design registry '
+              'is inconsistent; the manifest is still written so the run is '
+              'not blocked, but fix these before citing it:')
+        for plan_id, messages in bad_plans.items():
+            for message in messages:
+                print(f'  - {plan_id}: {message}')
+    try:
+        from kaggle_setup import capture_provenance
+        design_provenance = capture_provenance()
+    except Exception as exc:  # pragma: no cover - defensive
+        design_provenance = None
+        print(f'[run_all] WARNING: could not capture timing-design provenance '
+              f'({type(exc).__name__}: {exc}); the manifest will not be bound '
+              f'to a source revision')
+    manifest = timing_design.design_manifest(
+        repeats_by_plan=repeats_by_plan, provenance=design_provenance)
+    timing_design.write_design_manifest(
+        'results/timing_design.json', manifest=manifest)
+    for row in manifest['results']:
+        planning = row['planning']
+        print(f"[timing-design] {row['plan_id']}: n={row['n_repeats']} "
+              f"family={planning['family_size']} "
+              f"need={planning['required_repeats']} "
+              f"power={planning['planned_power']} "
+              f"status={row['status']} "
+              f"plan_sha={row['plan_sha256'][:12]}")
+    return {
+        'path': 'results/timing_design.json',
+        'run_profile': profile,
+        'validation_errors': design_errors,
+        'provenance_captured': design_provenance is not None,
+        'plans': {
+            row['plan_id']: {
+                'n_repeats': row['n_repeats'],
+                'status': row['status'],
+                'plan_sha256': row['plan_sha256'],
+                'required_repeats': row['planning']['required_repeats'],
+                'planned_power': row['planning']['planned_power'],
+                'planned_mde_ratio': row['planning']['planned_mde_ratio'],
             }
             for row in manifest['results']
         },
@@ -420,7 +498,8 @@ def _setup():
 _EXPERIMENT_OUTPUTS = {
     'exp1_correctness': ['results/exp1_correctness.json'],
     'exp2_benchmark': ['results/exp2_benchmark.json',
-                       'results/exp2_benchmark_provenance.json'],
+                       'results/exp2_benchmark_provenance.json',
+                       'results/exp2_benchmark_raw.json'],
     'exp3_kv_cache': ['results/exp3_kv_cache.json'],
     'exp4_mqar': ['results/exp4_mqar.json',
                   'results/exp4b_quality_tasks.json',
@@ -432,7 +511,8 @@ _EXPERIMENT_OUTPUTS = {
         'results/exp5b_ablation_matrix_contrasts.json',
         'results/exp5b_ablation_matrix_provenance.json'],
     'exp6_decoding': ['results/exp6_decoding.json',
-                      'results/exp6_decoding_provenance.json'],
+                      'results/exp6_decoding_provenance.json',
+                      'results/exp6_decoding_raw.json'],
     'exp14_indexer_selector': ['results/exp14_indexer_selector.json',
                                'results/exp14_indexer_selector_provenance.json'],
     'exp15_ppl_calibration': ['results/exp15_ppl_calibration.json',
@@ -454,6 +534,7 @@ _EXPERIMENT_OUTPUTS = {
         'checkpoints_lm/smoke_softmax/run_record.json'],
     # Prospective design manifest written before the experiments start.
     'experiment_design': ['results/experiment_design.json'],
+    'timing_design': ['results/timing_design.json'],
 }
 
 # Result files listed in ``_EXPERIMENT_OUTPUTS`` that are NOT results_schema
@@ -464,15 +545,18 @@ _EXPERIMENT_OUTPUTS = {
 # ``results_schema`` payload or the gate fails the pipeline.
 _RAW_SIDE_FILES = {
     'results/exp2_benchmark_provenance.json',
+    'results/exp2_benchmark_raw.json',
     'results/exp5_ablation_provenance.json',
     'results/exp5b_ablation_matrix_provenance.json',
     'results/exp6_decoding_provenance.json',
+    'results/exp6_decoding_raw.json',
     'results/exp14_indexer_selector_provenance.json',
     'results/exp15_ppl_calibration_provenance.json',
     'results/exp16_paired_stats_calibration_provenance.json',
     'results/exp4_overfit_gate.json',
     'results/exp9_recall_reach.json',
     'results/experiment_design.json',
+    'results/timing_design.json',
     'checkpoints_lm/smoke_hybrid/run_record.json',
     'checkpoints_lm/smoke_softmax/run_record.json',
 }
@@ -661,7 +745,8 @@ def run_all(seeds=None, steps=None):
                  # Run-profile + matrix-mode variables: run_all itself may
                  # set these (profile presets, the matrix smoke pass), so
                  # the finally block has to restore the caller's state.
-                 'RUN_ALL_PROFILE', 'BENCH_REPEATS', 'MQAR_OPS',
+                 'RUN_ALL_PROFILE', 'BENCH_REPEATS', 'DECODE_REPEATS',
+                 'MQAR_OPS',
                  'MQAR_TASKS', 'MAMBA_BACKEND', 'ABL_MODE', 'ABL_MATRIX',
                  'ABL_TOTAL_LAYERS', 'ABL_MEMORY', 'ABL_D_MODEL',
                  'ABL_TRAIN_BATCH',
@@ -784,6 +869,14 @@ def run_all(seeds=None, steps=None):
             print(f'[run_all] WARNING: could not write the experiment '
                   f'design manifest: {exc}')
             summary['experiment_design'] = {'error': str(exc)}
+
+        try:
+            summary['timing_design'] = \
+                _write_timing_design_manifest(profile)
+        except Exception as exc:  # planning must never block the experiments
+            print(f'[run_all] WARNING: could not write the timing design '
+                  f'manifest: {exc}')
+            summary['timing_design'] = {'error': str(exc)}
 
         # Import after deps are installed.
         import run_correctness
@@ -1295,6 +1388,7 @@ def run_all(seeds=None, steps=None):
             campaign_artifacts = {
                 'summary': 'results/summary.json',
                 'experiment_design': 'results/experiment_design.json',
+                'timing_design': 'results/timing_design.json',
             }
             for fig_path in sorted(glob.glob('figures/*')):
                 if os.path.isfile(fig_path):

@@ -124,6 +124,7 @@ py-modules = [
     "run_kv_cache",
     "run_all",
     "experiment_design",
+    "timing_design",
     "make_figures",
     "method_analysis",
     "recall_flops_audit",
