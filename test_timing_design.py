@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import math
 
+import pytest
+
 import timing_design as td
 
 
@@ -281,3 +283,19 @@ def test_fingerprint_changes_with_plan_definition():
     original = td.plan_sha256(plan)
     plan['sesoi_ratio'] = 1.20
     assert td.plan_sha256(plan) != original
+
+
+def test_oversized_json_integer_is_a_validation_error_not_a_crash():
+    """A JSON int beyond float range is malformed, not an OverflowError."""
+    huge = 10 ** 400
+    assert td._is_number(huge) is False
+    assert td._safe_log(huge) is None
+    try:
+        td._need_number(huge, 'assumed_cv', positive=True)
+    except td.TimingDesignError:
+        pass
+    else:
+        raise AssertionError('oversized integer was accepted as a number')
+
+    with pytest.raises(td.TimingDesignError):
+        td.planning_report(td.get_plan('exp2_benchmark'), cv=huge)

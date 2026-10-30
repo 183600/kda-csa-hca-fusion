@@ -254,8 +254,14 @@ _SCHEDULES = ('balanced_rotation',)
 
 
 def _is_number(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        # JSON integers are unbounded; one beyond the float range is a
+        # malformed number, not a reason to abort the design audit.
+        return False
 
 
 def _need_number(value, name, *, positive=False):
