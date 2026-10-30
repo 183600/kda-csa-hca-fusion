@@ -238,6 +238,32 @@ def test_student_t_sf_near_normal_limit_keeps_cf_precision():
             math.log(want), abs=1e-9)
 
 
+def test_student_t_sf_below_normal_limit_keeps_direct_cf_precision():
+    """The direct beta CF must not lose digits just below the 2e8 cutoff.
+
+    For these shapes the double Lentz recurrence stops as soon as one
+    ``delta`` rounds to 1, even though the cumulative sub-epsilon tail
+    still shifts the result by ~1e-9.  The high-precision fallback also
+    rebuilds ``x`` from the accurate small complement; using the rounded
+    ``dof/(dof+t^2)`` directly amplifies its last-bit error by ``a``.
+    """
+    cases = (
+        (150000000, 4.0, 3.167125700054808863379043565795623802142e-05),
+        (199999999, 3.5, 2.326291296238537676337685845576157715235e-04),
+        (199999999, 4.0, 3.167125320869061978668385210830680832315e-05),
+        (199999999, 5.0, 2.866518134711982890745602800540290086059e-07),
+        (199999999, 6.0, 9.86589331096438330085740713854239100779e-10),
+        (199999999, 8.0, 6.220993414113715952332263131762872250864e-16),
+        (199999999, 10.0, 7.619950169055689309090205383254117930154e-24),
+        (199999999, 30.0, 4.911695521220544485092014299858125126964e-198),
+    )
+    for dof, t_value, want in cases:
+        assert M.student_t_sf(t_value, dof) == pytest.approx(
+            want, rel=1e-12)
+        assert M._log_student_t_sf_positive(t_value, dof) == pytest.approx(
+            math.log(want), abs=1e-11)
+
+
 def test_student_t_sf_large_but_representable_dof_keeps_t_tail():
     """At dof=1e8 the t/normal gap is resolved, not rounded into the tail.
 

@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import math
 import random
+from decimal import Decimal, localcontext
 from fractions import Fraction
 from statistics import NormalDist
 
@@ -334,8 +335,80 @@ def _betacf_max_iter(a: float, b: float) -> int:
     return min(_MAX_BETACF_ITER, max(_MIN_BETACF_ITER, int(scaled)))
 
 
-def _betacf(a: float, b: float, x: float) -> float:
+def _betacf_high_precision(a: float, b: float, x: float,
+                           y: float | None = None) -> float | None:
+    """Decimal evaluation of the beta continued fraction near ``x = 1``.
+
+    The double-precision Lentz recurrence accumulates a relative error of
+    a few ``1e-9`` for a huge first shape and ``x`` close to one: the early
+    ``delta == 1`` terms are individually below the double epsilon but are
+    numerous, and the double evaluation cannot recover their tail.  A
+    short 40-digit fallback (a few dozen iterations for the Student-t
+    regimes) keeps the direct branch accurate without altering the
+    dependency-free path for ordinary shapes.
+    """
+    if not (math.isfinite(a) and math.isfinite(b) and math.isfinite(x)):
+        return None
+    if not (a > 0.0 and b > 0.0 and 0.0 < x < 1.0):
+        return None
+    with localcontext() as ctx:
+        ctx.prec = 40
+        da, db = Decimal(a), Decimal(b)
+        # The caller's ``y = 1 - x`` is often formed without cancellation
+        # (e.g. t^2/(dof+t^2)); rebuild x from it so the CF is evaluated
+        # at the unrounded complement of the accurate small argument.
+        dx = (Decimal(1) - Decimal(y) if y is not None else Decimal(x))
+        if dx <= 0:
+            return None
+        qab, qap, qam = da + db, da + 1, da - 1
+        tiny = Decimal('1e-200')
+        c = Decimal(1)
+        d = Decimal(1) - qab * dx / qap
+        if abs(d) < tiny:
+            d = tiny
+        d = 1 / d
+        h = d
+        max_iter = min(_betacf_max_iter(a, b), 5000)
+        for m in range(1, max_iter + 1):
+            m2 = 2 * m
+            dm = Decimal(m)
+            aa = dm * (db - dm) * dx / ((qam + m2) * (da + m2))
+            d = 1 + aa * d
+            if abs(d) < tiny:
+                d = tiny
+            c = 1 + aa / c
+            if abs(c) < tiny:
+                c = tiny
+            d = 1 / d
+            h *= d * c
+            aa = (-(da + dm) * (qab + dm) * dx
+                  / ((da + m2) * (qap + m2)))
+            d = 1 + aa * d
+            if abs(d) < tiny:
+                d = tiny
+            c = 1 + aa / c
+            if abs(c) < tiny:
+                c = tiny
+            d = 1 / d
+            delta = d * c
+            h *= delta
+            if abs(delta - 1) < Decimal('1e-30'):
+                try:
+                    precise = float(h)
+                except (OverflowError, ValueError):
+                    return None
+                return precise if math.isfinite(precise) else None
+    return None
+
+
+def _betacf(a: float, b: float, x: float, *,
+            y: float | None = None) -> float:
     """Continued fraction for the incomplete beta function (NR 6.4)."""
+    small = y if y is not None else 1.0 - x
+    if a >= 1.0e6 and x > 0.5 and small * a < 1.0e4:
+        precise = _betacf_high_precision(a, b, x, y)
+        if precise is not None and precise > 0.0:
+            return precise
     qab, qap, qam = a + b, a + 1.0, a - 1.0
     c = 1.0
     d = 1.0 - qab * x / qap
@@ -404,7 +477,7 @@ def _betainc_regularized_from_logs(a: float, b: float, x: float,
     log_bt = -_log_beta(a, b) + a * log_x + b * log_y
     bt = math.exp(log_bt)
     if x < (a + 1.0) / (a + b + 2.0):
-        value = bt * _betacf(a, b, x) / a
+        value = bt * _betacf(a, b, x, y=y) / a
         if value > 1.0e-8:
             stable = _complement_tail_value(a, b, x, y, log_bt)
             if stable is not None:
@@ -419,7 +492,7 @@ def _log_betainc_regularized_from_logs(a: float, b: float, x: float,
     """``log(I_x(a, b))`` with caller-supplied accurate logs."""
     log_bt = -_log_beta(a, b) + a * log_x + b * log_y
     if x < (a + 1.0) / (a + b + 2.0):
-        h = _betacf(a, b, x)
+        h = _betacf(a, b, x, y=y)
         if h > 0.0 and math.isfinite(log_bt):
             log_ib = log_bt + math.log(h) - math.log(a)
             if log_ib <= 0.0:
@@ -452,7 +525,7 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
     log_bt = _log_beta_exponent(a, b, x)
     bt = math.exp(log_bt)
     if x < (a + 1.0) / (a + b + 2.0):
-        value = bt * _betacf(a, b, x) / a
+        value = bt * _betacf(a, b, x, y=1.0 - x) / a
         if value > 1.0e-8:
             stable = _complement_tail_value(a, b, x, 1.0 - x, log_bt)
             if stable is not None:
@@ -756,7 +829,7 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
             return approx[1]
     log_bt = _log_beta_exponent(a, b, x)
     if x < (a + 1.0) / (a + b + 2.0):
-        h = _betacf(a, b, x)
+        h = _betacf(a, b, x, y=1.0 - x)
         if h > 0.0 and math.isfinite(log_bt):
             log_ib = log_bt + math.log(h) - math.log(a)
             if log_ib <= 0.0:
