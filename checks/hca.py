@@ -236,6 +236,68 @@ def test_hca_causal_score_tiling(device='cpu'):
     return results
 
 
+def test_hca_forward_chunk_causal_prefix(device='cpu'):
+    """Certify the causal block prefix in ``HCADecodingCache.forward_chunk``.
+
+    ``forward_chunk`` appends the whole chunk before attending, so its
+    cache may contain blocks that no query in the chunk can see (the
+    block containing the last query, plus any block completed by the
+    chunk). The optimized path slices the block axis to
+    ``k_max = min(n_blocks, (n0 + T_new - 1) // m2)``; this check pins
+    that the sliced chunk output still equals the full-sequence
+    ``naive_hca`` reference, including a sink and a sliding window.
+    """
+    logger.info("Test: HCA forward_chunk causal block prefix")
+    from ops_decoding_cache import HCADecodingCache
+
+    torch.manual_seed(133)
+    d, c, m2, nh, dc = 32, 8, 4, 2, 8
+    win = 4
+    p = _make_hca_decoding_params(d, c, m2, nh, dc, device, seed=133)
+    sink = torch.tensor([0.3, -0.4], device=device)
+    results = []
+    for n0, T_new in ((0, 3), (0, 16), (5, 7), (3, 12)):
+        B = 1
+        H = torch.randn(B, n0 + T_new, d, device=device) * 0.1
+        o_full = naive_hca(
+            H, p['W_KV'], p['W_Z'], p['B_pos'], p['W_DQ'], p['W_UQ'],
+            m2=m2, nh=nh, c=c, dc=dc,
+            sliding_window=win, sink_logits=sink)
+        C, Z, q = _project_hca_for_cache(H, p, c, dc, nh)
+        q_n = F.normalize(q.to(torch.float), dim=-1)
+        cache = HCADecodingCache(B, c, m2, win, device, torch.float32)
+        if n0:
+            cache.append_step(C[:, :n0], Z[:, :n0], p['B_pos'])
+        out = cache.forward_chunk(
+            C[:, n0:], Z[:, n0:], p['B_pos'], q_n[:, n0:],
+            nh=nh, scale=1.0, sink_logits=sink)
+        diff = (out.reshape(B, T_new, nh * c)
+                - o_full[:, n0:]).abs().max().item()
+        kmax = (min(cache.n_blocks, (n0 + T_new - 1) // m2)
+                if cache.n_blocks else 0)
+        results.append(_ok(
+            f'HCA forward_chunk == naive_hca (n0={n0}, T={T_new})',
+            diff <= TOL['match'][torch.float32],
+            f'max_diff={diff:.2e}, n_blocks={cache.n_blocks}, '
+            f'k_max={kmax}'))
+
+    # No completed block and no window: the chunk is sink-only and must
+    # return exact zeros (the empty-prefix branch).
+    B, T0 = 1, 3
+    H = torch.randn(B, T0, d, device=device) * 0.1
+    C, Z, q = _project_hca_for_cache(H, p, c, dc, nh)
+    cache = HCADecodingCache(B, c, m2, 0, device, torch.float32)
+    out = cache.forward_chunk(
+        C, Z, p['B_pos'], F.normalize(q.to(torch.float), dim=-1),
+        nh=nh, scale=1.0, sink_logits=sink)
+    absmax = out.abs().max().item()
+    results.append(_ok(
+        'HCA forward_chunk sink-only chunk is exactly zero',
+        absmax == 0.0 and cache.n_blocks == 0,
+        f'absmax={absmax:.2e}, n_blocks={cache.n_blocks}'))
+    return results
+
+
 def test_hca_forward_smoke(device='cpu'):
     """Forward-output shape + finiteness smoke test (does NOT verify
     causality — see ``test_hca_sliding_window_causality``)."""
@@ -1632,6 +1694,7 @@ __all__ = [
     'test_csa_hca_fp16_dtype_consistency',
     'test_hca_score_tiling_parity',
     'test_hca_causal_score_tiling',
+    'test_hca_forward_chunk_causal_prefix',
     'test_hca_forward_smoke',
     'test_hca_sliding_window_causality',
     'test_csa_hca_right_padding_correctness',

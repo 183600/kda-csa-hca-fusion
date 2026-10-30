@@ -26,9 +26,10 @@ k_max = (hi - 1) // m2
 scores = q[:, lo:hi] @ C_comp_n[:, :k_max].T
 ```
 
-and masks only within that prefix. The last tile can still use all
-`n_blocks` entries, so the memory bound is unchanged. For long sequences
-the total dense score/value entries become
+and masks only within that prefix. The last tile still scales with
+`n_blocks` (`k_max = (T - 1) // m2 <= n_blocks - 1`), so the per-tile
+memory bound is unchanged. For long sequences the total dense score/value
+entries become
 
 ```
 sum_tiles (hi - lo) * ((hi - 1) // m2)  ~=  T * n_blocks / 2
@@ -71,6 +72,25 @@ Pinned by `checks/hca.py::test_hca_causal_score_tiling` in
 
 The original untiled/tiled parity test
 (`test_hca_score_tiling_parity`) continues to pass unchanged.
+
+## Incremental chunked prefill
+
+`HCADecodingCache.forward_chunk` appends the whole chunk before attending,
+so its cache can hold blocks that no query in the chunk can see. It uses
+the same prefix rule:
+
+```
+k_max = min(n_blocks, (n0 + T_new - 1) // m2)
+```
+
+and masks only inside that prefix. A chunk with `k_max == 0` (no completed
+block and `win=0`) takes the existing empty-column branch and returns exact
+zeros. Pinned by
+`checks/hca.py::test_hca_forward_chunk_causal_prefix` against the
+full-sequence `naive_hca` reference for chunks that start at `0`, start
+mid-block, and end exactly on a block boundary (the case that excludes the
+last completed block). The existing `test_chunked_prefill_cache.py`
+per-token/chunk parity matrix continues to pass.
 
 ## Measured effect (CPU, fp32, this host)
 

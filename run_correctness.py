@@ -65,6 +65,9 @@ def main():
     # Causal key-range tiling: the tiled path scores only the blocks visible
     # to each tile (causal triangle), and a sink-only tile returns exact zeros.
     all_results += _run_safe(test_hca_causal_score_tiling, device)
+    # The incremental chunked-prefill cache applies the same causal block
+    # prefix; its chunk output must still match the full-sequence reference.
+    all_results += _run_safe(test_hca_forward_chunk_causal_prefix, device)
     all_results += _run_safe(test_fused_hybrid, device)
     # New reviewer-driven checks.
     all_results += _run_safe(test_overlap_causality, device)

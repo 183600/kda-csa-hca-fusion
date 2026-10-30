@@ -3072,11 +3072,18 @@ class HCADecodingCache:
             core_scale = scale
 
         n_blocks = self._n_blocks
-        if n_blocks:
-            cbm = (torch.arange(n_blocks, device=self.device)[None, :]
-                   < (t_pos // self.m2)[:, None])                    # [T, nb]
+        # Causal key range (same optimization as ``naive_hca``'s tiled
+        # path): the last query in this chunk is at ``n0 + T_new - 1`` and
+        # can only see blocks ``b < (n0 + T_new - 1) // m2``. Slicing the
+        # block axis to that prefix drops the masked future-block
+        # rectangle; rows still keep their strictly-preceding mask below.
+        k_max = (min(n_blocks, (n0 + T_new - 1) // self.m2)
+                 if n_blocks else 0)
+        if k_max:
+            cbm = (torch.arange(k_max, device=self.device)[None, :]
+                   < (t_pos // self.m2)[:, None])                    # [T, k_max]
             C_comp_n = _to_dtype(
-                self._C_comp[:, :n_blocks], compute_dtype)
+                self._C_comp[:, :k_max], compute_dtype)
             if torch.is_grad_enabled() and self.dtype == compute_dtype:
                 # Same grad-mode clone contract as ``forward_step``: the
                 # cast aliases the cache storage when the dtypes match,
