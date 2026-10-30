@@ -373,6 +373,39 @@ def _check_environment_contract() -> dict:
     return {'status': 'ok', 'report': report}
 
 
+def _write_environment_lock() -> dict:
+    """Record the exact installed environment at campaign start.
+
+    The dependency contract proves the three declarations agree; this lock
+    additionally pins the transitive closure that actually produced the
+    results.  It is written into the campaign output directory and bound into
+    the hashed summary / run manifest, so a replay host can run
+    ``python dependency_contract.py --check-lock results/environment_lock.json``
+    before trusting a rerun.  Lock creation is bookkeeping: a metadata failure
+    must not prevent the experiments from running.
+    """
+    try:
+        import dependency_contract
+        lock = dependency_contract.write_environment_lock(
+            'results/environment_lock.json', HERE)
+    except Exception as exc:
+        print(f'[run_all] WARNING: could not write the environment lock '
+              f'({type(exc).__name__}: {exc})')
+        return {'status': 'unavailable',
+                'reason': f'{type(exc).__name__}: {exc}'}
+    return {
+        'status': 'ok',
+        'path': 'results/environment_lock.json',
+        'lock_sha256': lock.get('lock_sha256'),
+        'n_packages': len(lock.get('installed_packages') or {}),
+        'python': lock.get('python'),
+        'declarations': {
+            name: row.get('sha256')
+            for name, row in (lock.get('declarations') or {}).items()
+        },
+    }
+
+
 def _version_tuple(raw: str) -> tuple[int, ...]:
     """Parse the numeric prefix of a package version for bound checks."""
     parts = re.findall(r"\d+", raw)
@@ -908,6 +941,11 @@ def run_all(seeds=None, steps=None):
 
         # Bind the declared dependency contract into the hashed summary.
         summary['dependency_contract'] = _check_environment_contract()
+        # Pin the exact installed transitive closure alongside it. The
+        # declaration contract can agree while the host still has a different
+        # numpy/scipy/torch patch release; the lock makes that difference
+        # checkable without rerunning the campaign.
+        summary['environment_lock'] = _write_environment_lock()
 
         # Import after deps are installed.
         import run_correctness
@@ -1421,6 +1459,9 @@ def run_all(seeds=None, steps=None):
                 'experiment_design': 'results/experiment_design.json',
                 'timing_design': 'results/timing_design.json',
             }
+            if os.path.isfile('results/environment_lock.json'):
+                campaign_artifacts['environment_lock'] = (
+                    'results/environment_lock.json')
             for fig_path in sorted(glob.glob('figures/*')):
                 if os.path.isfile(fig_path):
                     campaign_artifacts[

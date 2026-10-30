@@ -141,3 +141,146 @@ def test_run_all_snapshots_the_contract_into_the_campaign_summary():
     assert block['status'] == 'ok', block
     assert block['report']['ok'] is True
     json.dumps(block, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# CI gate: the documented environment-contract layer must actually run
+# ---------------------------------------------------------------------------
+
+def test_ci_gate_environment_contract_layer_passes_on_this_repository():
+    import ci_gate
+
+    before = list(ci_gate.FAILURES)
+    try:
+        ci_gate.check_environment_contract()
+        assert ci_gate.FAILURES == before
+    finally:
+        ci_gate.FAILURES[:] = before
+
+
+def test_ci_gate_environment_contract_layer_fails_on_drift(
+        tmp_path, monkeypatch):
+    import ci_gate
+
+    root = _write_project(tmp_path)
+    (root / 'orphan.py').write_text('VALUE = 2\n', encoding='utf-8')
+    monkeypatch.setattr(ci_gate, 'ROOT', root)
+    before = list(ci_gate.FAILURES)
+    try:
+        ci_gate.check_environment_contract()
+        assert any('orphan' in failure for failure in ci_gate.FAILURES), (
+            ci_gate.FAILURES)
+    finally:
+        ci_gate.FAILURES[:] = before
+
+
+# ---------------------------------------------------------------------------
+# Environment lock: exact installed closure + declaration identity
+# ---------------------------------------------------------------------------
+
+def test_environment_lock_is_deterministic_and_self_verifying(tmp_path):
+    lock_a = dependency_contract.build_environment_lock(ROOT)
+    lock_b = dependency_contract.build_environment_lock(ROOT)
+    assert lock_a['kind'] == dependency_contract.LOCK_KIND
+    assert lock_a['lock_sha256'] == lock_b['lock_sha256']
+    assert lock_a['installed_packages']
+    assert set(lock_a['declarations']) == {
+        'pyproject.toml', 'requirements.txt', 'requirements-ci.txt'}
+
+    path = tmp_path / 'environment_lock.json'
+    written = dependency_contract.write_environment_lock(path, ROOT)
+    on_disk = json.loads(path.read_text(encoding='utf-8'))
+    assert on_disk == written
+    report = dependency_contract.verify_environment_lock(on_disk, ROOT)
+    assert report['ok'] is True, report
+    assert report['status'] == 'ok'
+    assert report['integrity']['status'] == 'ok'
+    assert report['python']['status'] == 'match'
+
+
+def test_environment_lock_detects_declaration_and_version_drift(tmp_path):
+    root = _write_project(tmp_path)
+    lock = dependency_contract.build_environment_lock(root)
+    assert dependency_contract.verify_environment_lock(lock, root)['ok']
+
+    (root / 'requirements.txt').write_text(
+        'demo-dep>=1,<2\npytest>=7,<10\n', encoding='utf-8')
+    report = dependency_contract.verify_environment_lock(lock, root)
+    assert report['status'] == 'drift'
+    assert report['declarations']['requirements.txt']['status'] == 'mismatch'
+    assert report['ok'] is False
+
+    lock = dependency_contract.build_environment_lock(ROOT)
+    installed = lock['installed_packages']
+    name = next(name for name, version in installed.items()
+                if isinstance(version, str))
+    installed[name] = '0.0.0-not-installed'
+    lock['lock_sha256'] = dependency_contract.environment_lock_sha256(lock)
+    report = dependency_contract.verify_environment_lock(lock, ROOT)
+    assert report['status'] == 'drift'
+    assert any(row['name'] == name
+               for row in report['packages']['drift'])
+
+
+def test_environment_lock_cli_roundtrip_and_tamper_detection(
+        tmp_path, capsys):
+    path = tmp_path / 'environment_lock.json'
+    assert dependency_contract.main(
+        ['--root', str(ROOT), '--write-lock', str(path), '--json']) == 0
+    written = json.loads(capsys.readouterr().out)
+    assert written['ok'] is True
+    assert written['lock_sha256']
+
+    assert dependency_contract.main(
+        ['--root', str(ROOT), '--check-lock', str(path), '--json']) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['status'] == 'ok'
+
+    lock = json.loads(path.read_text(encoding='utf-8'))
+    lock['python']['version'] = '0.0.0'
+    path.write_text(json.dumps(lock), encoding='utf-8')
+    assert dependency_contract.main(
+        ['--root', str(ROOT), '--check-lock', str(path), '--json']) == 1
+    tampered = json.loads(capsys.readouterr().out)
+    assert tampered['status'] == 'drift'
+    assert tampered['integrity']['status'] == 'mismatch'
+
+    path.write_text('{not json', encoding='utf-8')
+    assert dependency_contract.main(
+        ['--root', str(ROOT), '--check-lock', str(path), '--json']) == 2
+
+
+def test_environment_lock_rejects_malformed_shapes_and_duplicate_drift():
+    lock = dependency_contract.build_environment_lock(ROOT)
+    lock['installed_packages'] = []
+    lock['lock_sha256'] = dependency_contract.environment_lock_sha256(lock)
+    report = dependency_contract.verify_environment_lock(lock, ROOT)
+    assert report['status'] == 'unverifiable'
+    assert report['ok'] is False
+    assert 'installed_packages' in report['errors'][0]
+
+    lock = dependency_contract.build_environment_lock(ROOT)
+    installed = lock['installed_packages']
+    name = next(name for name, version in installed.items()
+                if isinstance(version, str))
+    installed[name] = [installed[name], '0.0.0-extra-provider']
+    lock['lock_sha256'] = dependency_contract.environment_lock_sha256(lock)
+    report = dependency_contract.verify_environment_lock(lock, ROOT)
+    assert report['status'] == 'drift'
+    assert any(row['name'] == name
+               for row in report['packages']['drift'])
+
+
+def test_run_all_writes_a_campaign_environment_lock(tmp_path, monkeypatch):
+    import run_all
+
+    monkeypatch.chdir(tmp_path)
+    block = run_all._write_environment_lock()
+    assert block['status'] == 'ok', block
+    path = tmp_path / 'results' / 'environment_lock.json'
+    assert path.is_file()
+    lock = json.loads(path.read_text(encoding='utf-8'))
+    assert lock['lock_sha256'] == block['lock_sha256']
+    assert lock['lock_sha256'] in path.read_text(encoding='utf-8')
+    report = dependency_contract.verify_environment_lock(lock, ROOT)
+    assert report['status'] == 'ok', report

@@ -245,6 +245,22 @@ declaration. See
 [engineering-standards.md](engineering-standards.md) for the contract and
 the lock-file procedure.
 
+The declarations are bounds, not an exact environment. `run_all.py` therefore
+also writes `results/environment_lock.json`, a deterministic snapshot of the
+declaration hashes and every installed distribution version, and binds its
+`lock_sha256` into `summary.json` and the final run-manifest entry. Verify it
+on a replay host before running the campaign:
+
+```bash
+python dependency_contract.py --write-lock results/environment_lock.json
+python dependency_contract.py --check-lock results/environment_lock.json
+```
+
+Exit codes follow the same contract as `reproducibility.py`: `0` match,
+`1` drift, `2` unreadable/unsupported. Because the lock records the installed
+transitive closure, it is host-specific; a CPU/CUDA or optional-backend
+difference is real drift, not noise.
+
 ## Tests
 
 `test_source_identity.py` covers the digest contract (determinism, content /

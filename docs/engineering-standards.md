@@ -74,18 +74,38 @@ declarations disagreed.
 
 The declared files keep **bounds** so a preinstalled CUDA stack is not
 downgraded by `pip install -e .`. They do not pin every transitive package.
-For a bit-exact replay, generate an environment lock from the machine that
-will run the campaign and keep it with the artifact:
+For a bit-exact replay, generate an environment lock on the machine that
+produced the artifact and keep it with the artifact:
 
 ```bash
-python -m pip freeze --all > constraints.txt
+# Canonical JSON lock: declaration digests + exact installed closure.
+python dependency_contract.py --write-lock results/environment_lock.json
+
+# On the replay host, fail before running experiments if the environment
+# differs (0 = match, 1 = drift, 2 = unreadable/unsupported).
+python dependency_contract.py --check-lock results/environment_lock.json
 ```
 
-`constraints.txt` is intentionally not committed (`.gitignore` ignores
-`*.lock`; add the generated file explicitly if a project needs one). The
-per-result provenance already records the exact installed versions, the
-resolved backends, the source-tree digest and the command line; the lock file
-adds the transitive closure that provenance does not enumerate.
+The lock is deterministic: it contains the SHA-256 and size of
+`pyproject.toml`, `requirements.txt` and `requirements-ci.txt`, the declared
+specifiers and CI pins, Python implementation/version/`requires-python`, the
+OS system/machine, every installed distribution version (the transitive
+closure), and a canonical `lock_sha256` over all of it. It is self-checking,
+so editing a recorded version after the fact is reported as drift rather than
+silently accepted. `run_all.py` writes `results/environment_lock.json` at
+campaign start and binds it into the hashed `summary.json` and the final
+run-manifest entry; it is also included as `summary["environment_lock"]` so
+the campaign records both the declarations (`dependency_contract`) and the
+installed stack (`environment_lock`).
+
+A lock is **host-specific** because it records the installed closure. A CPU
+campaign lock verified on a CUDA host, or after intentionally installing an
+optional backend extra, is expected to drift. Keep the lock with the artifact;
+do not silently regenerate it to make the check pass, because that erases the
+difference the check exists to expose. If a campaign is intentionally moved to
+a new host or backend, record a new lock as a new environment. Lock files are
+not committed by default (`results/` and `*.lock` are ignored); add one
+explicitly only if the project needs to pin a particular archive environment.
 
 `requirements-ci.txt` is the CI's exact pin set. It is deliberately small:
 the gate only needs torch, einops, numpy, matplotlib and pytest. Optional
@@ -122,10 +142,15 @@ from recurring.
 
 ## Code map
 
-* `dependency_contract.py` — parser and checks (`check_contract`, CLI).
-* `ci_gate.py` — layer 2 of the continuous-loop gate.
+* `dependency_contract.py` — parser, declaration checks (`check_contract`),
+  and the deterministic environment lock (`build_environment_lock`,
+  `write_environment_lock`, `verify_environment_lock`; CLI
+  `--write-lock` / `--check-lock`).
+* `ci_gate.py` — layers 2–3 of the continuous-loop gate (environment
+  contract, then the full fast pytest suite).
 * `run_all.py` — snapshots the contract into the campaign summary.
 * `test_engineering_contract.py` — repository-clean, synthetic-drift, CLI,
-  campaign-snapshot, and pre-registration-runner wiring tests.
+  campaign-snapshot, CI-gate-layer, environment-lock round-trip / tamper /
+  drift, and pre-registration-runner wiring tests.
 * `pyproject.toml`, `requirements.txt`, `requirements-ci.txt` — the three
   declarations.
