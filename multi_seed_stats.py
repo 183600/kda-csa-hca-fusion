@@ -155,6 +155,8 @@ _MAX_BETACF_ITER = 100_000
 _BETACF_EPS = 3.0e-14
 _FPMIN = 1.0e-300
 _STABLE_LOG_BETA_MIN = 1.0e3
+_LARGE_BETA_NORMAL_MIN = 1.0e12
+_LARGE_BETA_NORMAL_Z = 8.0
 _NORMAL_T_DOF = 1_000_000_000
 _MAX_EXACT_PERMUTATION_BITS = 20
 
@@ -253,6 +255,69 @@ def _log_beta_exponent(a: float, b: float, x: float) -> float:
             - 0.5 * log_scale - _stirling_beta_correction(a, b, s))
 
 
+def _large_beta_normal_cdf(a: float, b: float,
+                           x: float) -> tuple[float, float] | None:
+    """Normal/Edgeworth approximation for a huge-shape Beta CDF.
+
+    The continued fraction loses its scale once both shapes are large:
+    at ``a=b=1e14`` the first denominator rounds away and the iteration
+    cap truncates before convergence, yielding values outside ``[0, 1]``.
+    The Beta distribution is then concentrated within ~``1/sqrt(a)`` of
+    its mean, so the normal limit with the exact moments and a first-order
+    skew correction is accurate to well below float resolution.
+    """
+    try:
+        total = a + b
+        total_is_finite = math.isfinite(total)
+    except OverflowError:
+        total = math.inf
+        total_is_finite = False
+    if total_is_finite:
+        mean = a / total
+    elif a == b:
+        mean = 0.5
+    else:
+        ratio = b / a
+        if math.isfinite(ratio):
+            mean = 1.0 / (1.0 + ratio)
+        elif ratio == math.inf:
+            mean = 0.0
+        else:
+            mean = 0.5
+    if not total_is_finite:
+        if x < mean:
+            return 0.0, -math.inf
+        if x > mean:
+            return 1.0, 0.0
+        return 0.5, math.log(0.5)
+    variance = mean * (1.0 - mean) / (total + 1.0)
+    if variance <= 0.0:
+        if x < mean:
+            return 0.0, -math.inf
+        if x > mean:
+            return 1.0, 0.0
+        return 0.5, math.log(0.5)
+    sd = math.sqrt(variance)
+    z = (x - mean) / sd
+    if not math.isfinite(z) or abs(z) > _LARGE_BETA_NORMAL_Z:
+        return None
+    sqrt_ab = math.sqrt(a) * math.sqrt(b)
+    gamma1 = (2.0 * ((b - a) / sqrt_ab)
+              * (math.sqrt(total + 1.0) / (total + 2.0)))
+    phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    correction = gamma1 / 6.0 * (1.0 - z * z) * phi
+    if z <= 0.0:
+        lower = 0.5 * math.erfc(-z / math.sqrt(2.0))
+        cdf = lower + correction
+        log_cdf = (math.log(lower) + math.log1p(correction / lower)
+                   if lower > 0.0 else -math.inf)
+    else:
+        upper = 0.5 * math.erfc(z / math.sqrt(2.0))
+        cdf = 1.0 - upper + correction
+        log_cdf = math.log1p(-upper + correction)
+    return min(1.0, max(0.0, cdf)), log_cdf
+
+
 def _betacf_max_iter(a: float, b: float) -> int:
     """Enough CF iterations for the largest shape parameter.
 
@@ -343,6 +408,10 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
         return 0.0
     if x >= 1.0:
         return 1.0
+    if min(a, b) >= _LARGE_BETA_NORMAL_MIN:
+        approx = _large_beta_normal_cdf(a, b, x)
+        if approx is not None:
+            return approx[0]
     bt = math.exp(_log_beta_exponent(a, b, x))
     if x < (a + 1.0) / (a + b + 2.0):
         return bt * _betacf(a, b, x) / a
@@ -607,6 +676,10 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
         return -math.inf
     if x >= 1.0:
         return 0.0
+    if min(a, b) >= _LARGE_BETA_NORMAL_MIN:
+        approx = _large_beta_normal_cdf(a, b, x)
+        if approx is not None:
+            return approx[1]
     log_bt = _log_beta_exponent(a, b, x)
     if x < (a + 1.0) / (a + b + 2.0):
         h = _betacf(a, b, x)

@@ -155,6 +155,30 @@ def test_incomplete_beta_large_shapes_center_avoids_cancellation():
             math.log(0.5), abs=1e-10)
 
 
+def test_incomplete_beta_huge_shapes_stay_normalized():
+    """The CF must fall back to the normal limit once it cannot converge.
+
+    At ``a=b=1e14`` the first CF denominator rounds away and the iteration
+    cap truncates before convergence, returning values outside ``[0, 1]``;
+    at ``1e300`` the prefactor overflows.  The normal/Edgeworth limit with
+    exact Beta moments keeps the center at exactly 0.5 up to the largest
+    representable shapes.
+    """
+    for a in (10 ** 12, 10 ** 14, 10 ** 18, 10 ** 300, 10 ** 308):
+        assert M.betainc_regularized(a, a, 0.5) == 0.5
+        assert M._log_betainc_regularized(a, a, 0.5) == math.log(0.5)
+    a = 10 ** 14
+    sd = math.sqrt(0.25 / (2 * a + 1))
+    for z in (-3.0, -1.0, 0.5, 3.0):
+        x = 0.5 + z * sd
+        value = M.betainc_regularized(a, a, x)
+        assert 0.0 <= value <= 1.0
+        assert M._log_betainc_regularized(a, a, x) == pytest.approx(
+            math.log(value), abs=1e-14)
+        assert value + M.betainc_regularized(a, a, 1.0 - x) == pytest.approx(
+            1.0, abs=1e-9)
+
+
 def test_student_t_sf_large_dof_keeps_extreme_tail_accuracy():
     """The beta argument must be formed without cancelling ``1 - x``.
 
