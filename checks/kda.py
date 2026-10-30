@@ -1176,6 +1176,62 @@ def test_kda_state_dtype_preservation(device='cpu'):
     return results
 
 
+def test_kda_long_context_bf16_equivalence(device='cpu'):
+    """Long-context (T=4096) chunk/recurrent/assoc agreement in bf16 and fp32.
+
+    The operators compute in fp32 and round only the output to the storage
+    dtype, so the three reduction orders must agree to sub-ulp at bf16 and
+    to fp32 round-off at fp32. The margin is derived from the dtype grid
+    rather than tuned on the observed error: two storage ulps for bf16 and
+    the file's fp32 bit-match tolerance. This is the long-context bf16
+    equivalence certificate for the KDA route (the existing T=2048 check
+    lives outside the CI gate and only watches for NaN/Inf).
+    """
+    logger.info("Test: KDA long-context bf16 equivalence (T=4096)")
+    results = []
+    B, T, H, K, V = 1, 4096, 2, 16, 16
+    for dtype in (torch.float32, torch.bfloat16):
+        eps = float(torch.finfo(dtype).eps)
+        for seed in (0, 1):
+            torch.manual_seed(seed)
+            q = F.normalize(torch.randn(B, T, H, K), dim=-1).to(dtype)
+            k = F.normalize(torch.randn(B, T, H, K), dim=-1).to(dtype)
+            v = (torch.randn(B, T, H, V) * 0.3).to(dtype)
+            g = (-torch.rand(B, T, H, K) * 0.1).to(dtype)
+            beta = (torch.rand(B, T, H) * 0.3).to(dtype)
+            o_rec, s_rec = naive_recurrent_kda(
+                q, k, v, g, beta, output_final_state=True)
+            variants = (
+                ('chunk', naive_chunk_kda(
+                    q, k, v, g, beta, output_final_state=True, chunk_size=64)),
+                ('assoc', assoc_scan_chunk_kda(
+                    q, k, v, g, beta, output_final_state=True, chunk_size=64)),
+            )
+            for name, (o, s) in variants:
+                if dtype == torch.bfloat16:
+                    o_tol = 2.0 * eps * max(
+                        1.0, float(o_rec.float().abs().max().item()))
+                    s_tol = 2.0 * eps * max(
+                        1.0, float(s_rec.abs().max().item()))
+                else:
+                    o_tol = s_tol = TOL['bit_match'][torch.float32]
+                o_diff = (o.float() - o_rec.float()).abs().max().item()
+                s_diff = (s - s_rec).abs().max().item()
+                results.append(_ok(
+                    f'{name} output equivalence ({dtype}, seed={seed})',
+                    o_diff <= o_tol,
+                    f'max_diff={o_diff:.2e} tol={o_tol:.2e}'))
+                results.append(_ok(
+                    f'{name} state equivalence ({dtype}, seed={seed})',
+                    s_diff <= s_tol,
+                    f'max_diff={s_diff:.2e} tol={s_tol:.2e}'))
+                results.append(_ok(
+                    f'{name} dtype contract ({dtype}, seed={seed})',
+                    o.dtype == dtype and s.dtype == torch.float32,
+                    f'o={o.dtype}, s={s.dtype}'))
+    return results
+
+
 def test_kda_single_token_decode(device='cpu'):
     """Verify KDA handles T=1 (single-token decode step).
 
@@ -1288,6 +1344,7 @@ __all__ = [
     'test_kda_chunk_vs_recurrent_gradient',
     'test_kda_cross_chunk_bptt',
     'test_kda_state_dtype_preservation',
+    'test_kda_long_context_bf16_equivalence',
     'test_kda_single_token_decode',
     'test_standalone_kda_gate_matches_hybrid',
 ]

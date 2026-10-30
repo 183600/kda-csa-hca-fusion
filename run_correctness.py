@@ -95,6 +95,9 @@ def main():
     all_results += _run_safe(test_kda_cross_chunk_bptt, device)
     # P1-2 regression: KDA state preserves fp32 precision for fp16/bf16 inputs.
     all_results += _run_safe(test_kda_state_dtype_preservation, device)
+    # Long-context bf16/fp32 equivalence certificate for the three KDA
+    # reduction orders (T=4096; margins derived from the dtype grid).
+    all_results += _run_safe(test_kda_long_context_bf16_equivalence, device)
     all_results += _run_safe(test_hca_sliding_window_causality, device)
     all_results += _run_safe(test_csa_full_pipeline_causality, device)
     # Regression tests for bugs found during code review.
