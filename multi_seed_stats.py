@@ -415,7 +415,21 @@ def _betacf(a: float, b: float, x: float, *,
             y: float | None = None) -> float:
     """Continued fraction for the incomplete beta function (NR 6.4)."""
     small = y if y is not None else 1.0 - x
-    if a >= 1.0e6 and x > 0.5 and small * a < 1.0e4:
+    # The first denominator of the Lentz recurrence is
+    # ``1 - (a+b)x/(a+1)``. When it nearly cancels, its last-bit error is
+    # amplified by ``1/d`` and the double recurrence loses many digits even
+    # though the CF itself converges (e.g. a=1e7, b=1e12 at the Beta mode).
+    # The large-shape fallback below rebuilds that first denominator in
+    # Decimal, so route near-cancellation cases through it as well.
+    try:
+        first_den = 1.0 - (a + b) * x / (a + 1.0)
+    except (OverflowError, ZeroDivisionError):
+        first_den = math.inf
+    near_cancellation = (math.isfinite(first_den)
+                         and abs(first_den) < 1.0e-6
+                         and max(a, b) >= 1.0e9)
+    if ((a >= 1.0e6 and x > 0.5 and small * a < 1.0e4)
+            or near_cancellation):
         precise = _betacf_high_precision(a, b, x, y)
         if precise is not None and precise > 0.0:
             return precise
@@ -468,7 +482,7 @@ def _complement_tail_value(a: float, b: float, x: float, y: float,
     y_cut = (b + 1.0) / (a + b + 2.0)
     if y > 4.0 * y_cut:
         return None
-    h = _betacf(b, a, y)
+    h = _betacf(b, a, y, y=x)
     if not (h > 0.0 and math.isfinite(log_bt)):
         return None
     try:
@@ -497,7 +511,7 @@ def _betainc_regularized_from_logs(a: float, b: float, x: float,
             if stable is not None:
                 return stable
         return value
-    return 1.0 - bt * _betacf(b, a, y) / b
+    return 1.0 - bt * _betacf(b, a, y, y=x) / b
 
 
 def _log_betainc_regularized_from_logs(a: float, b: float, x: float,
@@ -516,7 +530,7 @@ def _log_betainc_regularized_from_logs(a: float, b: float, x: float,
                         return math.log(stable)
                 return log_ib
     else:
-        h = _betacf(b, a, y)
+        h = _betacf(b, a, y, y=x)
         if h > 0.0 and math.isfinite(log_bt):
             log_iy = log_bt + math.log(h) - math.log(b)
             if log_iy < 0.0:
@@ -545,7 +559,7 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
             if stable is not None:
                 return stable
         return value
-    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+    return 1.0 - bt * _betacf(b, a, 1.0 - x, y=x) / b
 
 
 def _student_t_sf_positive(t_value: float, dof: int) -> float:
@@ -851,13 +865,20 @@ def _log_betainc_regularized(a: float, b: float, x: float) -> float:
         value = betainc_regularized(a, b, x)
         return math.log(value) if value > 0.0 else -math.inf
     y = 1.0 - x
-    if min(a, b) >= _STABLE_LOG_BETA_MIN:
-        log_bt = _log_beta_exponent(b, a, y)
-    else:
-        log_bt = (
-            -_log_beta(a, b)
-            + b * math.log(y) + a * math.log1p(-y))
-    h = _betacf(b, a, y)
+    # ``log(x**a * (1-x)**b / B(a,b))`` is symmetric under
+    # ``(a,b,x) <-> (b,a,1-x)``. Keep the already-computed exponent when
+    # ``x`` is the small side; rebuilding it from ``y`` near one loses
+    # digits for huge shapes (the a=1e7, b=1e12 mode case shifted the log
+    # CDF by ~5e-10). Only swap to the complement when that is the
+    # smaller, better-conditioned side.
+    if x > 0.5:
+        if min(a, b) >= _STABLE_LOG_BETA_MIN:
+            log_bt = _log_beta_exponent(b, a, y)
+        else:
+            log_bt = (
+                -_log_beta(a, b)
+                + b * math.log(y) + a * math.log1p(-y))
+    h = _betacf(b, a, y, y=x)
     if h > 0.0 and math.isfinite(log_bt):
         log_iy = log_bt + math.log(h) - math.log(b)
         if log_iy < 0.0:

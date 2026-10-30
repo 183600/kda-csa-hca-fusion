@@ -1762,3 +1762,29 @@ def test_json_sized_seed_counts_do_not_leak_overflow():
     assert tost['ci_equiv_lo'] == 0.0
     assert tost['ci_equiv_hi'] == 0.0
     json.dumps(tost, allow_nan=False)
+
+
+def test_incomplete_beta_huge_complement_shape_keeps_mode_accuracy():
+    """The complementary CF must rebuild ``x`` from the accurate complement.
+
+    For ``a=1e7, b=1e12`` and ``x`` just above the Beta mode, the direct
+    branch is (correctly) evaluated as ``1 - I_y(b, a)``.  The first Lentz
+    denominator of that fraction cancels to ~1e-10, so the double
+    recurrence lost ~7e-8 relative accuracy.  The high-precision fallback
+    must also be fed the exact complement (``y=x``), because rebuilding
+    ``1-x`` from the rounded float reintroduces the same last-bit error
+    amplified by the huge shape.  References are mpmath at 80 digits.
+    """
+    cases = (
+        (1e7, 1e12, 1e-5,
+         0.51265561178317427857544002035729348781104745573616961539448),
+        (1e5, 1e12, 1.00099989990001e-7,
+         0.62444513664478984143697212878196644695225658001706790519098),
+        (1e6, 1e12, 1.0009989990010009e-6,
+         0.84134490727288748241258892074672087025732820397420799511100),
+    )
+    for a, b, x, want in cases:
+        assert M.betainc_regularized(a, b, x) == pytest.approx(
+            want, rel=1e-12)
+        assert M._log_betainc_regularized(a, b, x) == pytest.approx(
+            math.log(want), abs=1e-12)
