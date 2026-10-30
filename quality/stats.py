@@ -70,7 +70,11 @@ def _t_crit_975(n):
             _T_PP = False
             _T_ISF = False
     if _T_PP:
-        return _T_PP(0.975, n - 1)
+        # Normalize scipy's ``numpy.float64`` to a plain float: mixing it
+        # with a near-float-max standard error raises a spurious
+        # RuntimeWarning on an intermediate overflow even when the caller
+        # guards the final half-width. Python floats simply return inf.
+        return float(_T_PP(0.975, n - 1))
     # Hardcoded two-sided 95% critical values, n = 2..100 (df = 1..99),
     # covering the common multi-seed CI range without falling back to the
     # normal approximation (which has ~4% relative error at n=31..100).
