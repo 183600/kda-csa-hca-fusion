@@ -427,7 +427,18 @@ def _student_t_sf_positive(t_value: float, dof: int) -> float:
         # once erf rounds to -1 (t around 9), the subtraction cancels to
         # exactly zero even though the tail is still representable
         # (t=10 -> 7.6e-24). ``erfc`` evaluates that tail directly.
-        return 0.5 * math.erfc(t_value / math.sqrt(2.0))
+        tail = 0.5 * math.erfc(t_value / math.sqrt(2.0))
+        t_sq = t_value * t_value
+        if math.isfinite(t_sq) and dof <= 10 ** 300:
+            phi = math.exp(-0.5 * t_sq) / math.sqrt(2.0 * math.pi)
+            if phi > 0.0:
+                t_four = t_sq * t_sq
+                first = (t_sq + 1.0) * t_value * phi / 4.0
+                second = (tail / 6.0 + t_value * (t_sq - 3.0)
+                          * (3.0 * t_four + 2.0 * t_sq + 1.0)
+                          * phi / 96.0)
+                tail += first / dof + second / dof / dof
+        return tail
     t_sq = t_value * t_value
     if math.isfinite(t_sq):
         # The survival-function identity is
@@ -481,7 +492,27 @@ def _log_student_t_sf_positive(t_value: float, dof: int) -> float:
     if t_value == 0.0:
         return math.log(0.5)
     if dof >= _NORMAL_T_DOF:
-        return _log_normal_upper_tail(t_value)
+        log_tail = _log_normal_upper_tail(t_value)
+        t_sq = t_value * t_value
+        if math.isfinite(t_sq) and dof <= 10 ** 300:
+            log_phi = -0.5 * t_sq - 0.5 * math.log(2.0 * math.pi)
+            log_ratio = (math.log(t_value) + math.log1p(t_sq)
+                         - math.log(dof) - math.log(4.0)
+                         + log_phi - log_tail)
+            if log_ratio < math.log(0.1):
+                t_four = t_sq * t_sq
+                log_poly = (math.log(t_value)
+                            + math.log(abs(t_sq - 3.0))
+                            + math.log(3.0 * t_four + 2.0 * t_sq + 1.0)
+                            - math.log(96.0))
+                signed = math.exp(log_poly + log_phi - log_tail)
+                if t_sq < 3.0:
+                    signed = -signed
+                ratio = (math.exp(log_ratio)
+                         + (1.0 / 6.0 + signed) / dof / dof)
+                if 0.0 < ratio < 0.1:
+                    return log_tail + math.log1p(ratio)
+        return log_tail
     t_sq = t_value * t_value
     if math.isfinite(t_sq):
         denom = dof + t_sq

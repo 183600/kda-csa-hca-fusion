@@ -196,6 +196,25 @@ def test_student_t_sf_large_dof_keeps_extreme_tail_accuracy():
         -454.32104100671249389264460158, abs=1e-9)
 
 
+def test_student_t_sf_normal_limit_keeps_finite_dof_correction():
+    """The dof>=1e9 normal limit must retain the leading 1/dof t correction.
+
+    Plain ``erfc`` drops the t-vs-normal gap: at dof=1e9, t=30 it is off by
+    ~2e-4 relative and at t=10 by ~2.5e-6.  The first two terms of the
+    large-dof expansion restore the mpmath reference to ~1e-12.
+    """
+    cases = (
+        (10 ** 9, 10.0, 7.6198724530455390421e-24),
+        (10 ** 9, 30.0, 4.9077098439837308162e-198),
+        (10 ** 10, 30.0, 4.9068135097902900325e-198),
+    )
+    for dof, t_value, want in cases:
+        assert M.student_t_sf(t_value, dof) == pytest.approx(
+            want, rel=1e-9)
+        assert M._log_student_t_sf_positive(t_value, dof) == pytest.approx(
+            math.log(want), abs=1e-9)
+
+
 def test_student_t_sf_large_but_representable_dof_keeps_t_tail():
     """At dof=1e8 the t/normal gap is resolved, not rounded into the tail.
 
