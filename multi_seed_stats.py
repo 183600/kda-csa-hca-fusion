@@ -157,7 +157,7 @@ _FPMIN = 1.0e-300
 _STABLE_LOG_BETA_MIN = 1.0e3
 _LARGE_BETA_NORMAL_MIN = 1.0e12
 _LARGE_BETA_NORMAL_Z = 8.0
-_NORMAL_T_DOF = 1_000_000_000
+_NORMAL_T_DOF = 200_000_000
 _MAX_EXACT_PERMUTATION_BITS = 20
 
 
@@ -369,6 +369,34 @@ def _betacf(a: float, b: float, x: float) -> float:
     return h
 
 
+def _complement_tail_value(a: float, b: float, x: float, y: float,
+                           log_bt: float) -> float | None:
+    """Left-tail mass from the complementary CF when that side is stable.
+
+    For a huge first shape and ``x`` just below the direct-CF branch
+    threshold, the direct fraction subtracts nearly equal ``a*x``-scale
+    terms and loses several digits, while the complementary fraction is
+    still in its convergence region and the final ``1 - I_y`` is not a
+    catastrophic cancellation. Return ``None`` when that regime does not
+    apply so callers keep the direct value.
+    """
+    if not (x > 0.5 and a >= 1.0e6 and y <= 1.0e-2):
+        return None
+    y_cut = (b + 1.0) / (a + b + 2.0)
+    if y > 4.0 * y_cut:
+        return None
+    h = _betacf(b, a, y)
+    if not (h > 0.0 and math.isfinite(log_bt)):
+        return None
+    try:
+        p = math.exp(log_bt + math.log(h) - math.log(b))
+    except (OverflowError, ValueError):
+        return None
+    if not (0.0 < p < 1.0):
+        return None
+    return 1.0 - p
+
+
 def _betainc_regularized_from_logs(a: float, b: float, x: float,
                                    y: float, log_x: float,
                                    log_y: float) -> float:
@@ -376,7 +404,12 @@ def _betainc_regularized_from_logs(a: float, b: float, x: float,
     log_bt = -_log_beta(a, b) + a * log_x + b * log_y
     bt = math.exp(log_bt)
     if x < (a + 1.0) / (a + b + 2.0):
-        return bt * _betacf(a, b, x) / a
+        value = bt * _betacf(a, b, x) / a
+        if value > 1.0e-8:
+            stable = _complement_tail_value(a, b, x, y, log_bt)
+            if stable is not None:
+                return stable
+        return value
     return 1.0 - bt * _betacf(b, a, y) / b
 
 
@@ -390,6 +423,10 @@ def _log_betainc_regularized_from_logs(a: float, b: float, x: float,
         if h > 0.0 and math.isfinite(log_bt):
             log_ib = log_bt + math.log(h) - math.log(a)
             if log_ib <= 0.0:
+                if log_ib > math.log(1.0e-8):
+                    stable = _complement_tail_value(a, b, x, y, log_bt)
+                    if stable is not None and stable > 0.0:
+                        return math.log(stable)
                 return log_ib
     else:
         h = _betacf(b, a, y)
@@ -412,9 +449,15 @@ def betainc_regularized(a: float, b: float, x: float) -> float:
         approx = _large_beta_normal_cdf(a, b, x)
         if approx is not None:
             return approx[0]
-    bt = math.exp(_log_beta_exponent(a, b, x))
+    log_bt = _log_beta_exponent(a, b, x)
+    bt = math.exp(log_bt)
     if x < (a + 1.0) / (a + b + 2.0):
-        return bt * _betacf(a, b, x) / a
+        value = bt * _betacf(a, b, x) / a
+        if value > 1.0e-8:
+            stable = _complement_tail_value(a, b, x, 1.0 - x, log_bt)
+            if stable is not None:
+                return stable
+        return value
     return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
 
 

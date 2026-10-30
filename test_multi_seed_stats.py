@@ -215,6 +215,29 @@ def test_student_t_sf_normal_limit_keeps_finite_dof_correction():
             math.log(want), abs=1e-9)
 
 
+def test_student_t_sf_near_normal_limit_keeps_cf_precision():
+    """The CF must stay accurate just below the normal-limit crossover.
+
+    At dof=999999999 the direct incomplete-beta branch used to lose
+    ~6e-8 relative accuracy at t=2 because its first denominator formed
+    ``a*x`` near 1; the stable complementary side restores the tail.  The
+    same cases exercise the 1/dof expansion once dof reaches 2e8.
+    """
+    cases = (
+        (10 ** 8, 2.0, 0.022750133297953345),
+        (999999999, 2.0, 0.022750132083156613),
+        (999999999, 3.0, 0.001349898064868959),
+        (999999999, 5.0, 2.866516201975809e-07),
+        (999999999, 8.0, 6.220967142227408e-16),
+        (999999999, 10.0, 7.619872453045549e-24),
+    )
+    for dof, t_value, want in cases:
+        assert M.student_t_sf(t_value, dof) == pytest.approx(
+            want, rel=1e-10)
+        assert M._log_student_t_sf_positive(t_value, dof) == pytest.approx(
+            math.log(want), abs=1e-9)
+
+
 def test_student_t_sf_large_but_representable_dof_keeps_t_tail():
     """At dof=1e8 the t/normal gap is resolved, not rounded into the tail.
 
