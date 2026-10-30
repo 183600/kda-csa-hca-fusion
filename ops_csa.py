@@ -541,11 +541,69 @@ def _causal_block_mask_invalid(T: int, n_blocks: int, m: int,
     return invalid
 
 
+# ---------------------------------------------------------------------------
+# Block tiling for the compression kernels
+# ---------------------------------------------------------------------------
+# Compression is row-wise over compressed blocks: block ``i`` reads only its
+# own ``m`` source tokens (and, for the overlapped variant, the previous
+# block's ``m`` tokens). Tiling the block axis therefore changes memory
+# locality, never a value. The full path materializes one
+# ``[B, n_blocks, m, c]`` (single branch) or ``[B, n_blocks, 2m, c]``
+# (overlapped) logits buffer plus the same-sized softmax output. At long
+# context that is the largest transient in the CSA/HCA prefill path.
+#
+# Auto-tiling engages only when the full logits buffer is large enough for the
+# allocation / cache miss cost to dominate the extra Python-loop iterations.
+# The tile sizes were chosen empirically on CPU (fp32): the tiled path is
+# value-equivalent (fp64 bit-identical; fp32/bf16 within the softmax ULP) and
+# measured ~1.5-4x faster once the buffer exceeds the threshold (see
+# docs/compress-block-tiling.md). Callers can pass an explicit
+# ``compress_chunk`` to override the heuristic.
+_COMPRESS_TILE_MIN_ELEMS = 262_144
+_COMPRESS_TILE_BLOCKS_SINGLE = 128
+_COMPRESS_TILE_BLOCKS_OVERLAP = 64
+
+
+def _resolve_compress_tile(
+    compress_chunk: int,
+    B: int,
+    n_blocks: int,
+    m: int,
+    c: int,
+    *,
+    overlapped: bool,
+) -> int:
+    """Resolve the number of compressed blocks per tile.
+
+    ``compress_chunk == 0`` selects the automatic heuristic (full buffer when
+    the materialized logits are small, a cache-sized tile otherwise); a
+    positive value is an explicit cap. The returned value is always in
+    ``[1, n_blocks]`` for ``n_blocks > 0``; an empty sequence returns 0.
+    """
+    if compress_chunk < 0:
+        # ``_require_int_geometry`` already enforces this at the public
+        # entry points; keep the helper total for internal callers.
+        raise ValueError(
+            f'compress_chunk={compress_chunk} must be >= 0.')
+    if n_blocks <= 1:
+        return n_blocks
+    if compress_chunk > 0:
+        return min(compress_chunk, n_blocks)
+    per_block = B * m * c * (2 if overlapped else 1)
+    if n_blocks * per_block <= _COMPRESS_TILE_MIN_ELEMS:
+        return n_blocks
+    cap = (_COMPRESS_TILE_BLOCKS_OVERLAP if overlapped
+           else _COMPRESS_TILE_BLOCKS_SINGLE)
+    return min(cap, n_blocks)
+
+
 def csa_compress_kv(
     C: torch.Tensor,
     Z: torch.Tensor,
     B_pos: torch.Tensor,
     m: int,
+    *,
+    compress_chunk: int = 0,
 ) -> torch.Tensor:
     """Compress ``[B, T, c]`` KV entries ``C`` into ``[B, T//m, c]``.
 
@@ -558,6 +616,12 @@ def csa_compress_kv(
         Z: compression weights ``[B, T, c]``
         B_pos: learnable positional bias ``[m, c]``
         m: compression factor (T must be divisible by m).
+        compress_chunk: compressed blocks per forward tile. ``0`` (default)
+            selects the automatic memory/locality heuristic; a positive value
+            caps the tile. Tiling is value-equivalent up to the softmax
+            kernel's reduction ULP (fp64 is bit-identical; pinned by
+            ``test_compress_chunk_tiling_parity``) and applies to the
+            no-grad/inference path only.
     """
     B_, T, c = C.shape
     # Validate m BEFORE ``T % m`` so that m=0 is rejected with a clear
@@ -566,6 +630,8 @@ def csa_compress_kv(
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
     # are silently stripped under optimization.
     _require_int_geometry('csa_compress_kv', 'm', m)
+    _require_int_geometry('csa_compress_kv', 'compress_chunk',
+                          compress_chunk, minimum=0)
     if T % m != 0:
         raise ValueError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
@@ -573,6 +639,17 @@ def csa_compress_kv(
     compute_dtype = torch.float64 if C.dtype == torch.float64 else torch.float
     C = C.to(compute_dtype).view(B_, n_blocks, m, c)
     Z = Z.to(compute_dtype).view(B_, n_blocks, m, c)
+    if not torch.is_grad_enabled():
+        tile = _resolve_compress_tile(
+            compress_chunk, B_, n_blocks, m, c, overlapped=False)
+        if tile < n_blocks:
+            out = C.new_empty(B_, n_blocks, c)
+            bias = B_pos[None, None, :, :].to(Z)
+            for i0 in range(0, n_blocks, tile):
+                i1 = min(n_blocks, i0 + tile)
+                S = _bf16_safe_softmax(Z[:, i0:i1] + bias, dim=2)
+                out[:, i0:i1] = S.mul_(C[:, i0:i1]).sum(2)
+            return _bf16_scale_if_needed(out)
     logits = Z + B_pos[None, None, :, :].to(Z)
     S = _bf16_safe_softmax(logits, dim=2)                 # [B, n_blocks, m, c]
     if torch.is_grad_enabled():
@@ -593,6 +670,8 @@ def _overlapped_compress_no_pad(
     Ba: torch.Tensor,
     Bb: torch.Tensor,
     m: int,
+    *,
+    compress_chunk: int = 0,
 ) -> torch.Tensor:
     """Inference-only overlapped compression over pre-blocked inputs.
 
@@ -601,10 +680,50 @@ def _overlapped_compress_no_pad(
     zero value contribution) and is written directly into the logits buffer,
     avoiding the two full ``[B, n, m, c]`` shifted copies that the autograd
     path builds with ``F.pad``.
+
+    When ``compress_chunk`` (or the auto heuristic) selects a tile smaller
+    than ``n``, the block axis is processed in independent tiles. Each tile
+    owns one ``[B, tile, 2m, c]`` logits buffer, so the peak transient is
+    ``O(B * tile * 2m * c)`` instead of ``O(B * n * 2m * c)``. Block ``i``
+    reads only block ``i`` (a-branch) and block ``i-1`` (b-branch), so the
+    per-row softmax and weighted sums are bit-identical to the full path.
     """
     B, n, _, c = Ca.shape
     if n == 0:
         return Ca.new_zeros(B, 0, c)
+    tile = _resolve_compress_tile(
+        compress_chunk, B, n, m, c, overlapped=True)
+    if tile < n:
+        out = Ca.new_empty(B, n, c)
+        bias_a = Ba[None, None, :, :].to(Ca)
+        bias_b = Bb[None, None, :, :].to(Ca)
+        for i0 in range(0, n, tile):
+            i1 = min(n, i0 + tile)
+            k = i1 - i0
+            all_logits = torch.empty(
+                B, k, 2 * m, c, device=Ca.device, dtype=Ca.dtype)
+            torch.add(Za[:, i0:i1], bias_a, out=all_logits[:, :, :m])
+            if i0 == 0:
+                # The first block has no previous block.
+                if k > 1:
+                    torch.add(Zb[:, :k - 1], bias_b,
+                              out=all_logits[:, 1:, m:])
+                all_logits[:, 0, m:].fill_(float('-inf'))
+            else:
+                # Row r of this tile uses the physical block i0 + r - 1.
+                torch.add(Zb[:, i0 - 1:i1 - 1], bias_b,
+                          out=all_logits[:, :, m:])
+            S = _bf16_safe_softmax(all_logits, dim=2)
+            tile_out = S[:, :, :m].mul_(Ca[:, i0:i1]).sum(2)
+            if i0 == 0:
+                if k > 1:
+                    tile_out[:, 1:].add_(
+                        S[:, 1:, m:].mul_(Cb[:, :k - 1]).sum(2))
+            else:
+                tile_out.add_(
+                    S[:, :, m:].mul_(Cb[:, i0 - 1:i1 - 1]).sum(2))
+            out[:, i0:i1] = tile_out
+        return _bf16_scale_if_needed(out)
     all_logits = torch.empty(
         B, n, 2 * m, c, device=Ca.device, dtype=Ca.dtype)
     torch.add(Za, Ba[None, None, :, :].to(Za), out=all_logits[:, :, :m])
@@ -627,6 +746,8 @@ def csa_compress_kv_overlapped(
     Ba: torch.Tensor,
     Bb: torch.Tensor,
     m: int,
+    *,
+    compress_chunk: int = 0,
 ) -> torch.Tensor:
     """Two-branch overlapped compression (CSA, Eq. 11–12).
 
@@ -636,7 +757,13 @@ def csa_compress_kv_overlapped(
 
     Under ``torch.no_grad`` the shifted b-branch is written directly into the
     logits buffer, so inference does not allocate full ``[B, T, c]``
-    ``Zb_prev`` / ``Cb_prev`` copies.
+    ``Zb_prev`` / ``Cb_prev`` copies. ``compress_chunk`` additionally tiles
+    the compressed-block axis (``0`` = automatic heuristic, positive = cap;
+    see :func:`_resolve_compress_tile`), bounding the logits transient to
+    ``B * compress_chunk * 2m * c``. The per-block value chain is unchanged;
+    the only observable difference is the softmax kernel's reduction ULP
+    (fp64 is bit-identical, fp32/bf16 agree to < 1e-6 in the regression). The argument is an inference-path memory/locality
+    hint; the autograd path always keeps the single full-buffer graph.
     """
     B_, T, c = Ca.shape
     # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv): m=0 is rejected
@@ -645,6 +772,8 @@ def csa_compress_kv_overlapped(
     # survives ``python -O`` / ``PYTHONOPTIMIZE=1``; ``assert`` statements
     # are silently stripped under optimization.
     _require_int_geometry('csa_compress_kv_overlapped', 'm', m)
+    _require_int_geometry('csa_compress_kv_overlapped', 'compress_chunk',
+                          compress_chunk, minimum=0)
     if T % m != 0:
         raise ValueError(f"T={T} must be divisible by m={m}")
     n_blocks = T // m
@@ -672,7 +801,9 @@ def csa_compress_kv_overlapped(
     Zb = Zb.to(compute_dtype).view(B_, n_blocks, m, c)
 
     if not torch.is_grad_enabled():
-        return _overlapped_compress_no_pad(Ca, Cb, Za, Zb, Ba, Bb, m)
+        return _overlapped_compress_no_pad(
+            Ca, Cb, Za, Zb, Ba, Bb, m,
+            compress_chunk=compress_chunk)
 
     # Two-branch overlapped compression.
     # b-branch entries shifted by one so block i uses block i-1; the first
@@ -1579,6 +1710,7 @@ def naive_csa(
     rope_base: float = 10000.0,
     qk_norm_mode: str = 'l2',
     indexer_chunk: int = 0,
+    compress_chunk: int = 0,
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -1621,6 +1753,15 @@ def naive_csa(
     ``test_csa_chunk_fla_adapter.py``); only the
     intermediate memory footprint changes. Useful for long-context prefill and
     for `torch.compile`'d call sites that need bounded intermediate buffers.
+
+    ``compress_chunk`` (default 0 = automatic) forwards a block-axis tile size
+    to both KV-compression kernels. ``0`` selects the automatic
+    memory/locality heuristic in :func:`_resolve_compress_tile`; a positive
+    value caps the number of compressed blocks processed per tile. The
+    output is value-equivalent (up to the softmax-kernel reduction ULP) and
+    the transient logits buffers shrink from ``O(B · T · c)`` /
+    ``O(B · T · 2c)`` to ``O(B · compress_chunk · m · c)``
+    (``2m`` for the overlapped branch).
 
     .. warning:: **``fuse_projections`` and the**
         ``use_ste=False`` **gradient contract.**
@@ -1695,6 +1836,11 @@ def naive_csa(
     # Negative values would silently run the untiled path (looking like a
     # memory bound was applied) — reject them.
     _require_int_geometry('naive_csa', 'indexer_chunk', indexer_chunk,
+                          minimum=0)
+    # ``compress_chunk`` tiles the compressed-block axis of the KV
+    # compression kernels. 0 = automatic heuristic; negative values would
+    # silently run the untiled path, so reject them here.
+    _require_int_geometry('naive_csa', 'compress_chunk', compress_chunk,
                           minimum=0)
     # Cosine-attention scale: when both ``q`` and ``C_comp`` are L2-normalized
     # (i.e. when ``normalize_qk=True``, see the normalization block below),
@@ -1884,7 +2030,8 @@ def naive_csa(
     # below reuses the same storage instead of re-casting.
     Ca_c = Ca.to(compute_dtype)
     C_comp = csa_compress_kv_overlapped(
-        Ca_c, Cb, Za, Zb, Ba, Bb, m)                                 # [B, n_blocks, c]
+        Ca_c, Cb, Za, Zb, Ba, Bb, m,
+        compress_chunk=compress_chunk)                               # [B, n_blocks, c]
     # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
     # rotated entry serves as BOTH the attention key and the attention
     # value (shared-KV MQA). The anchor position of compressed entry ``s``
@@ -1911,7 +2058,9 @@ def naive_csa(
     # KV entries / outputs, not to the indexer scores (Eq. 15–16 have no
     # positional term).
     # K_idx_raw and Z_idx were computed in the merged matmul above.
-    K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)            # [B, n_blocks, c_I]
+    K_IComp = csa_compress_kv(
+        K_idx_raw, Z_idx, B_idx, m,
+        compress_chunk=compress_chunk)                               # [B, n_blocks, c_I]
     # indexer queries (low-rank)
     cQ = F.linear(H, W_DQ)                                        # [B, T, dc]
     q_idx = F.linear(cQ, W_IUQ).view(B_, T, nIh, c_I)              # [B, T, nIh, c_I]

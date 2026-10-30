@@ -119,6 +119,7 @@ def naive_hca(
     rope_dim: int | None = None,
     rope_base: float = 10000.0,
     qk_norm_mode: str = 'l2',
+    compress_chunk: int = 0,
 ):
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
 
@@ -147,6 +148,8 @@ def naive_hca(
     _require_int_geometry('naive_hca', 'c', c)
     _require_int_geometry('naive_hca', 'dc', dc)
     _require_int_geometry('naive_hca', 'sliding_window', sliding_window,
+                          minimum=0)
+    _require_int_geometry('naive_hca', 'compress_chunk', compress_chunk,
                           minimum=0)
     _require_scale('naive_hca', scale)
     if not torch.is_floating_point(H):
@@ -227,7 +230,9 @@ def naive_hca(
     # --- 1. Heavy KV compression (single branch, no overlap) ---
     C = F.linear(H, W_KV)                                          # [B, T, c]
     Z = F.linear(H, W_Z)                                           # [B, T, c]
-    C_comp = csa_compress_kv(C, Z, B_pos, m2)                     # [B, n_blocks, c] in compute_dtype
+    C_comp = csa_compress_kv(
+        C, Z, B_pos, m2,
+        compress_chunk=compress_chunk)                            # [B, n_blocks, c] in compute_dtype
     # Partial RoPE on the compressed KV entries (DeepSeek-V4 §2.3.3): the
     # rotated entry serves as BOTH the attention key and the attention
     # value (shared-KV MQA). The anchor position of heavy-compressed entry

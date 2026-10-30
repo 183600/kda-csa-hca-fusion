@@ -188,6 +188,44 @@ def test_csa_indexer_query_chunk_memory_bound(device='cpu'):
         f'{chunk_peak} vs {B * HI * tile * n_blocks}')
 
 
+def test_csa_naive_compress_chunk_end_to_end(device='cpu'):
+    """``naive_csa(compress_chunk=...)`` output must stay value-equivalent."""
+    torch.manual_seed(42)
+    B, T, d = 2, 21, 32
+    c, c_I, dc, nh, nIh, m, topk = 8, 4, 16, 2, 1, 7, 3
+
+    def rp(out, inp):
+        return (torch.randn(out, inp, device=device) * 0.2)
+
+    args = (
+        torch.randn(B, T, d, device=device) * 0.1,
+        rp(c, d), rp(c, d), rp(c, d), rp(c, d),
+        torch.randn(m, c, device=device) * 0.1,
+        torch.randn(m, c, device=device) * 0.1,
+        rp(dc, d), rp(c * nh, dc), rp(c_I * nIh, dc), rp(nIh, d),
+        rp(c_I, d), rp(c_I, d),
+        torch.randn(m, c_I, device=device) * 0.1,
+    )
+    kw = dict(m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=c_I, dc=dc,
+              sliding_window=4, sink_logits=torch.zeros(nh),
+              normalize_qk=True)
+    with torch.no_grad():
+        o_full = naive_csa(*args, **kw, compress_chunk=T + 1)
+        for chunk in (1, 5):
+            o_chunk = naive_csa(*args, **kw, compress_chunk=chunk)
+            diff = float((o_full - o_chunk).abs().max().item())
+            _ok(f'naive_csa output unchanged (compress_chunk={chunk})',
+                torch.allclose(o_full, o_chunk, atol=1e-6, rtol=0),
+                f'max_diff={diff:.2e}')
+
+    bad_raised = False
+    try:
+        naive_csa(*args, **kw, compress_chunk=-1)
+    except ValueError:
+        bad_raised = True
+    _ok('naive_csa rejects negative compress_chunk', bad_raised, '')
+
+
 def test_csa_indexer_query_chunk_gradients(device='cpu'):
     """Dense-indexer gradients must be tiling-invariant."""
     torch.manual_seed(37)
@@ -656,6 +694,7 @@ if __name__ == '__main__':
     test_csa_indexer_query_chunk_memory_bound()
     test_csa_indexer_query_chunk_gradients()
     test_csa_naive_indexer_chunk_end_to_end()
+    test_csa_naive_compress_chunk_end_to_end()
     test_hybrid_config_indexer_chunk_wiring()
     test_kda_fla_backend_adapter_contract()
     test_kda_tp_layer_honors_configured_fla_backend()

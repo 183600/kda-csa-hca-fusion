@@ -132,6 +132,9 @@ def main():
     all_results += _run_safe(test_csa_compress_kv_overlapped_zero_length, device)
     # Inference overlapped compression avoids the full-size shifted pads.
     all_results += _run_safe(test_overlapped_compress_no_pad_parity, device)
+    # Block-tiled compression: auto/explicit tiles are value-equivalent and
+    # bound the logits transient at long context.
+    all_results += _run_safe(test_compress_chunk_tiling_parity, device)
     # Regression test for missing input validation (c_I=0, nIh=0,
     # sliding_window<0, topk<0, total_layers<0).
     all_results += _run_safe(test_csa_hca_input_validation, device)

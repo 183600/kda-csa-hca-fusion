@@ -1081,6 +1081,104 @@ def test_overlapped_compress_no_pad_parity(device='cpu'):
     return results
 
 
+def test_compress_chunk_tiling_parity(device='cpu'):
+    """Block-tiled KV compression must match the full-buffer reference.
+
+    Both compression kernels are row-wise over compressed blocks, so tiling
+    the block axis only changes the size of the transient logits / softmax
+    buffers. This pins (a) the automatic heuristic engages for a large
+    buffer, (b) every explicit tile size agrees with the forced full path,
+    and (c) ``compress_chunk`` rejects non-int / negative values. fp64 is
+    expected to be bit-identical; fp32/bf16 may differ by the shape-dependent
+    softmax reduction ULP (< 1e-6 on the test data).
+    """
+    logger.info("Test: block-tiled KV compression parity")
+    from ops_csa import (csa_compress_kv, csa_compress_kv_overlapped,
+                         _resolve_compress_tile)
+
+    cases = [
+        (1, 64, 8, 16, torch.float32),
+        (2, 32, 4, 8, torch.float32),
+        (1, 64, 16, 4, torch.float64),
+        (1, 64, 1, 8, torch.float32),
+        (3, 48, 16, 12, torch.bfloat16),
+    ]
+    results = []
+    for B, T, m, c, dtype in cases:
+        torch.manual_seed(911 + T + m)
+        C = torch.randn(B, T, c, dtype=dtype, device=device)
+        Z = torch.randn(B, T, c, dtype=dtype, device=device)
+        bias = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+        Ca = torch.randn(B, T, c, dtype=dtype, device=device)
+        Cb = torch.randn(B, T, c, dtype=dtype, device=device)
+        Za = torch.randn(B, T, c, dtype=dtype, device=device)
+        Zb = torch.randn(B, T, c, dtype=dtype, device=device)
+        Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+        Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+        n_blocks = T // m
+        with torch.no_grad():
+            ref_s = csa_compress_kv(
+                C, Z, bias, m, compress_chunk=n_blocks)
+            ref_o = csa_compress_kv_overlapped(
+                Ca, Cb, Za, Zb, Ba, Bb, m, compress_chunk=n_blocks)
+            auto_s = csa_compress_kv(C, Z, bias, m)
+            auto_o = csa_compress_kv_overlapped(
+                Ca, Cb, Za, Zb, Ba, Bb, m)
+            max_diff = 0.0
+            for tile in (1, 2, 3, n_blocks):
+                got_s = csa_compress_kv(
+                    C, Z, bias, m, compress_chunk=tile)
+                got_o = csa_compress_kv_overlapped(
+                    Ca, Cb, Za, Zb, Ba, Bb, m, compress_chunk=tile)
+                max_diff = max(
+                    max_diff,
+                    (got_s.float() - ref_s.float()).abs().max().item(),
+                    (got_o.float() - ref_o.float()).abs().max().item())
+            max_diff = max(
+                max_diff,
+                (auto_s.float() - ref_s.float()).abs().max().item(),
+                (auto_o.float() - ref_o.float()).abs().max().item())
+        label = f'B={B},T={T},m={m},c={c},{str(dtype).split(".")[-1]}'
+        # fp64 must be exact; float32/bf16 tolerate the softmax-kernel ULP.
+        tol = 0.0 if dtype == torch.float64 else 1e-6
+        results.append(_ok(
+            f'compress tiled parity ({label})', max_diff <= tol,
+            f'max|diff|={max_diff:.2e} (tol={tol:.0e})'))
+
+    # The auto heuristic must keep small buffers on the full path and tile a
+    # multi-megabyte buffer. The model-level long-context prefill is exactly
+    # the regime the tiling exists for.
+    small = _resolve_compress_tile(
+        0, 1, 4, 16, 8, overlapped=False)
+    large = _resolve_compress_tile(
+        0, 1, 4096, 16, 64, overlapped=True)
+    explicit = _resolve_compress_tile(
+        7, 1, 100, 16, 64, overlapped=True)
+    results.append(_ok(
+        'compress auto tile heuristic',
+        small == 4 and 0 < large < 4096 and explicit == 7,
+        f'small={small}, large={large}, explicit={explicit}'))
+
+    bad_accepted = []
+    for bad in (True, 1.5, -1):
+        for fn, args in (
+                (csa_compress_kv, (C, Z, bias, m)),
+                (csa_compress_kv_overlapped,
+                 (Ca, Cb, Za, Zb, Ba, Bb, m))):
+            try:
+                fn(*args, compress_chunk=bad)
+            except ValueError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                bad_accepted.append(f'{bad!r}: {type(exc).__name__}')
+                continue
+            bad_accepted.append(repr(bad))
+    results.append(_ok(
+        'compress_chunk validates geometry', not bad_accepted,
+        f'rejected={bad_accepted}'))
+    return results
+
+
 def test_partial_rope_properties(device='cpu'):
     """Unit properties of the partial RoPE (DeepSeek-V4 §2.3.3).
 
@@ -1160,5 +1258,6 @@ __all__ = [
     'test_csa_topk_zero',
     'test_csa_compress_kv_overlapped_zero_length',
     'test_overlapped_compress_no_pad_parity',
+    'test_compress_chunk_tiling_parity',
     'test_partial_rope_properties',
 ]
