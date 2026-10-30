@@ -199,6 +199,24 @@ def test_incomplete_beta_large_asymmetric_shapes_keep_extreme_tail():
         math.log(want), abs=1e-9)
 
 
+def test_beta_quantile_resolves_root_at_linear_bisection_floor():
+    """A root just above ``2**-200`` must not stop at the midpoint.
+
+    The linear bisection has a final interval width of ``2**-200`` (~6e-61).
+    For this non-integer shape pair the root lies at the very bottom of
+    that interval, so returning the interval midpoint overestimated it by
+    46% (``9.3e-61`` instead of ``6.4e-61``). Refining the last few ulps in
+    log space recovers the mpmath root.
+    """
+    a = 4.474536612072222
+    b = 0.08457788813331206
+    log_q = math.log(1e-271)
+    want = 6.37707879135400932672061773727e-61
+    assert M._beta_quantile_from_log(log_q, a, b) == pytest.approx(
+        want, rel=1e-9)
+    assert M._beta_quantile(1e-271, a, b) == pytest.approx(want, rel=1e-9)
+
+
 def test_student_t_sf_large_dof_keeps_extreme_tail_accuracy():
     """The beta argument must be formed without cancelling ``1 - x``.
 

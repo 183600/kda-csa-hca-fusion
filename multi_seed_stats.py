@@ -892,7 +892,12 @@ def _beta_quantile_from_log(log_q: float, a: float, b: float) -> float:
             lo = mid
         else:
             hi = mid
-    if lo == 0.0:
+    if lo == 0.0 or hi < 1.0e-50:
+        # The linear bisection interval is still thousands of ulps wide at
+        # the smallest normal/subnormal roots (the final width is
+        # 2**-200 ~ 6e-61). When the root sits at that floor, ``lo`` can
+        # be positive but the midpoint is off by tens of percent; refine
+        # the remaining narrow range in log space instead.
         return _beta_quantile_log_space(log_q, a, b, hi)
     return 0.5 * (lo + hi)
 
@@ -920,7 +925,7 @@ def _beta_quantile(q: float, a: float, b: float) -> float:
             lo = mid
         else:
             hi = mid
-    if lo == 0.0:
+    if lo == 0.0 or hi < 1.0e-50:
         return _beta_quantile_log_space(math.log(q), a, b, hi)
     return 0.5 * (lo + hi)
 
