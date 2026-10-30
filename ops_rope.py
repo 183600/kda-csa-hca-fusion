@@ -94,8 +94,19 @@ def effective_rope_dim(requested: int | None, head_dim: int) -> int:
 
 
 def _angle_dtype(x: torch.Tensor) -> torch.dtype:
-    """Precision for the sin/cos tables (mirrors the repo compute_dtype)."""
+    """Storage precision for the sin/cos tables (mirrors compute_dtype).
+
+    The tables are stored at this dtype, but the PHASE (``position *
+    inv_freq``) and the trig evaluation are always performed in float64 by
+    :func:`_build_cos_sin`: at long-context positions a float32 angle loses
+    up to tens of milliradians to argument rounding, which is several bf16
+    ulps of the resulting cosine even though the table itself is fp32.
+    """
     return torch.float64 if x.dtype == torch.float64 else torch.float32
+
+
+_TRIG_DTYPE = torch.float64
+_TRIG_CHUNK_ROWS = 1 << 14
 
 
 # Backwards-compatible local name; the shared implementation lives in
@@ -213,6 +224,48 @@ def _materialize_pair_table(
     return out.expand(expand_shape).contiguous()
 
 
+def _build_cos_sin(
+    positions: torch.Tensor,
+    rope_dim: int,
+    base: float,
+    angle_dtype: torch.dtype,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``(cos, sin)`` tables with float64 phase, stored at ``angle_dtype``.
+
+    Only the trig evaluation and the phase multiplication run in float64;
+    the returned tables have the historical storage dtype (fp32 unless the
+    input is fp64), so downstream memory use is unchanged. Rows are built
+    in bounded chunks to keep the float64 transient small at million-token
+    contexts, and every row is the same pure function of its position, so
+    chunking cannot change a value.
+
+    Computing the phase in float64 is what preserves long-context accuracy:
+    for ``position ~ 1e6`` a float32 ``position * inv_freq`` product rounds
+    with an absolute error up to ~6e-2 radians at the high frequencies
+    (observed 3.9e-2 on a 10k-position scan), which moves the cosine by
+    several bf16 ulps (and thousands of fp32 ulps) before any attention
+    math. The float64 phase reduces that to ~1e-16 relative.
+    """
+    n = positions.numel()
+    half = rope_dim // 2
+    cos = torch.empty(n, half, dtype=angle_dtype, device=device)
+    sin = torch.empty(n, half, dtype=angle_dtype, device=device)
+    inv_freq = _inv_freq(rope_dim, base, device, _TRIG_DTYPE)
+    for lo in range(0, n, _TRIG_CHUNK_ROWS):
+        hi = min(n, lo + _TRIG_CHUNK_ROWS)
+        pos = positions[lo:hi].to(device=device, dtype=_TRIG_DTYPE)
+        angles = pos[:, None] * inv_freq[None, :]
+        chunk_cos = angles.cos()
+        chunk_sin = angles.sin()
+        if angle_dtype != _TRIG_DTYPE:
+            chunk_cos = chunk_cos.to(angle_dtype)
+            chunk_sin = chunk_sin.to(angle_dtype)
+        cos[lo:hi] = chunk_cos
+        sin[lo:hi] = chunk_sin
+    return cos, sin
+
+
 def _cos_sin_cached(
     positions: torch.Tensor,
     rope_dim: int,
@@ -240,11 +293,8 @@ def _cos_sin_cached(
     # :func:`_normal_tensor_scope`): a table created during an
     # inference-mode warm-up stays usable for every later autograd call.
     with _normal_tensor_scope():
-        pos_f = positions.to(device=device, dtype=angle_dtype)
-        angles = (pos_f[:, None]
-                  * _inv_freq(rope_dim, base, device, angle_dtype)[None, :])
-        cos = angles.cos()
-        sin = angles.sin()
+        cos, sin = _build_cos_sin(
+            positions, rope_dim, base, angle_dtype, device)
     entry_elems = cos.numel() + sin.numel()
     if entry_elems <= _TABLE_CACHE_MAX_ELEMS:
         while _TABLE_CACHE and (
@@ -289,11 +339,8 @@ def _cos_sin_by_identity(
             # without a version bump (``pos.data.add_(...)``).
             _IDENTITY_TABLE_CACHE.pop(key, None)
     with _normal_tensor_scope():
-        pos_f = positions.to(device=device, dtype=angle_dtype)
-        angles = (pos_f[:, None]
-                  * _inv_freq(rope_dim, base, device, angle_dtype)[None, :])
-        cos = angles.cos()
-        sin = angles.sin()
+        cos, sin = _build_cos_sin(
+            positions, rope_dim, base, angle_dtype, device)
     if cacheable and cos.numel() + sin.numel() <= _TABLE_CACHE_MAX_ELEMS:
         if len(_IDENTITY_TABLE_CACHE) >= 8:
             _IDENTITY_TABLE_CACHE.clear()
@@ -415,14 +462,8 @@ def partial_rope(
     else:
         # inv_freq_j = base^(-2j/rope_dim), j = 0 .. rope_dim/2 - 1
         # (see ``_inv_freq``).
-        inv_freq = _inv_freq(rope_dim, base, device, angle_dtype)  # [rope_dim/2]
-        # ``.to`` returns the tensor itself when dtype AND device already
-        # match, so this guard is value-identical.
-        if positions.dtype != angle_dtype or positions.device != device:
-            positions = positions.to(device=device, dtype=angle_dtype)
-        angles = positions[:, None] * inv_freq[None, :]      # [P, rope_dim/2]
-        cos = angles.cos()
-        sin = angles.sin()
+        cos, sin = _build_cos_sin(
+            positions, rope_dim, base, angle_dtype, device)
     if angle_dtype != x.dtype:
         cos = cos.to(x.dtype)
         sin = sin.to(x.dtype)

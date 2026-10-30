@@ -185,6 +185,7 @@ def main():
     # embedding for CSA/HCA: unit properties, module wiring, and
     # incremental-decode equivalence with the full-sequence operators.
     all_results += _run_safe(test_partial_rope_properties, device)
+    all_results += _run_safe(test_partial_rope_long_context_phase, device)
     all_results += _run_safe(test_csa_hca_rope_changes_output, device)
     all_results += _run_safe(test_csa_hca_rope_prefill_vs_cache, device)
     all_results += _run_safe(test_csa_hca_rope_module_matches_naive, device)

@@ -96,6 +96,21 @@ plain non-significant superiority test can never make.
   scales (loss, PPL) pass a margin on that scale instead; `ppl_bootstrap`
   comparisons use their own paired-bootstrap machinery.
 
+## Numerical equivalence is a different question
+
+The TOST machinery above compares *seed-paired experimental results*. A
+deterministic operator comparison (chunked vs recurrent KDA, tiled vs
+untiled compression, long-context prefill vs incremental decode) needs a
+different certificate: a pre-specified absolute/relative margin checked
+against a higher-precision oracle. The margin comes from the storage
+dtype's unit roundoff, not from a p-value; a deterministic rerun has zero
+variance, so a seed-paired test would be either degenerate or meaningless.
+`precision_sweep.py` is the general harness for the operator case, and
+`checks/csa.py::test_partial_rope_long_context_phase` is a focused example
+(see [long-context-rope-precision.md](long-context-rope-precision.md)).
+Keep the two claims separate in reports: "practically the same across
+seeds" is TOST, "the same up to one bf16 ulp" is a numerical bound.
+
 ## Code map
 
 * `multi_seed_stats.tost_paired`, `tost_from_summary` (the summary-

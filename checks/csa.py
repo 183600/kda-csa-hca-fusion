@@ -1179,6 +1179,75 @@ def test_compress_chunk_tiling_parity(device='cpu'):
     return results
 
 
+def test_partial_rope_long_context_phase(device='cpu'):
+    """Long-context RoPE phase accuracy + grouped/per-token equivalence.
+
+    At positions near 1e6, a float32 ``position * inv_freq`` phase loses up
+    to ~1e-2 radians at the high frequencies, which perturbs the cached
+    cosine/sine by multiple bf16 ulps (and thousands of fp32 ulps) before
+    any attention math. The reference here builds the tables from a float64
+    phase and rounds once to the storage dtype, so it is an absolute
+    equivalence margin rather than a self-comparison.
+
+    The second half pins the equivalence-testing contract that matters for
+    long-context inference: rotating a whole position vector at once and
+    rotating each position in its own call must produce identical bits
+    (prefill versus incremental decode), including across the short/long
+    table-cache boundary.
+    """
+    from ops_rope import partial_rope, token_positions
+
+    logger.info("Test: long-context partial RoPE phase accuracy")
+    results = []
+    rope_dim, base = 8, 10000.0
+    pos = 1_000_000 + torch.arange(64, device=device) * 7919
+    inv64 = base ** (-torch.arange(
+        0, rope_dim, 2, dtype=torch.float64, device=device) / rope_dim)
+    angles = pos.to(torch.float64)[:, None] * inv64[None, :]
+    ref_cos = angles.cos()
+    ref_sin = angles.sin()
+
+    for dtype in (torch.float32, torch.bfloat16):
+        x = torch.zeros(1, pos.numel(), 1, rope_dim,
+                        dtype=dtype, device=device)
+        x[..., 0::2] = 1.0
+        y = partial_rope(x, pos, rope_dim, base, dim=1)
+        got_cos = y[..., 0::2].reshape(pos.numel(), rope_dim // 2)
+        got_sin = y[..., 1::2].reshape(pos.numel(), rope_dim // 2)
+        want_cos = ref_cos.to(dtype)
+        want_sin = ref_sin.to(dtype)
+        cos_err = (got_cos.float() - want_cos.float()).abs().max().item()
+        sin_err = (got_sin.float() - want_sin.float()).abs().max().item()
+        tol = 1e-6 if dtype == torch.float32 else float(
+            torch.finfo(dtype).eps)
+        results.append(_ok(
+            f'long-context RoPE cos accuracy ({dtype})',
+            cos_err <= tol, f'max_err={cos_err:.2e}, tol={tol:.1e}'))
+        results.append(_ok(
+            f'long-context RoPE sin accuracy ({dtype})',
+            sin_err <= tol, f'max_err={sin_err:.2e}, tol={tol:.1e}'))
+
+        xs = torch.randn(2, pos.numel(), 2, rope_dim,
+                         dtype=dtype, device=device)
+        grouped = partial_rope(xs, pos, rope_dim, base, dim=1)
+        per_token = torch.cat([
+            partial_rope(xs[:, i:i + 1], pos[i:i + 1], rope_dim, base, dim=1)
+            for i in range(pos.numel())
+        ], dim=1)
+        results.append(_ok(
+            f'long-context RoPE grouped == per-token ({dtype})',
+            torch.equal(grouped, per_token),
+            'bit-identical across the table-cache boundary'))
+
+    small_bits = partial_rope(
+        torch.ones(1, 4, 1, rope_dim, device=device),
+        token_positions(4, device), rope_dim, base, dim=1)
+    results.append(_ok(
+        'short-context RoPE still finite after long-context tables',
+        bool(torch.isfinite(small_bits).all()), ''))
+    return results
+
+
 def test_partial_rope_properties(device='cpu'):
     """Unit properties of the partial RoPE (DeepSeek-V4 §2.3.3).
 
@@ -1259,5 +1328,6 @@ __all__ = [
     'test_csa_compress_kv_overlapped_zero_length',
     'test_overlapped_compress_no_pad_parity',
     'test_compress_chunk_tiling_parity',
+    'test_partial_rope_long_context_phase',
     'test_partial_rope_properties',
 ]
