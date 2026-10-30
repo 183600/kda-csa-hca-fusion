@@ -867,6 +867,52 @@ def test_recall_flops_rejects_oversized_geometry_without_overflow():
                          measure=False)
 
 
+def test_registry_plan_matches_grid_and_binds_report():
+    """The pre-registered plan mirrors the grid and binds trained reports.
+
+    The registry is stdlib-only, so its factor levels are hand-written; this
+    pin catches the silent drift that would otherwise let an audit claim a
+    layout/pair was observed when the runner used a different grid. The
+    trained report must also carry a fingerprint that the verifier can
+    re-hash against the current registry.
+    """
+    import experiment_design as D
+    from reproducibility import compare_design_binding
+
+    plan = D.get_plan('exp9_recall')
+    _ok('registry pair levels mirror BUDGET_PAIRS',
+        plan['factors']['compression_pair']['levels']
+        == [f'{int(m)}x{int(m2)}' for m, m2 in R.BUDGET_PAIRS],
+        str(plan['factors']['compression_pair']['levels']))
+    _ok('registry layout levels mirror LAYOUT_PRESETS',
+        plan['factors']['layout']['levels'] == list(R.LAYOUT_PRESETS),
+        str(plan['factors']['layout']['levels']))
+
+    trained = R.run_recall_report(
+        pairs=((4, 8),), layouts=['alternating'], steps=1, seeds=(42, 43),
+        seq_len=16, train_batch=8, eval_batches=1, eval_batch=8)
+    audit = trained.get('experiment_design')
+    _ok('trained report carries the design audit', isinstance(audit, dict),
+        str(type(audit).__name__))
+    _ok('audit names the registered plan and fingerprint',
+        audit.get('plan_id') == 'exp9_recall'
+        and audit.get('plan_sha256') == D.plan_sha256(plan)
+        and audit.get('plan_definition') == plan, str(audit.get('plan_id')))
+    _ok('audit records the observed grid and complete seed block',
+        audit['level_checks']['layout']['observed'] == ['alternating']
+        and audit['level_checks']['compression_pair']['observed'] == ['4x8']
+        and audit['family_size'] == 1
+        and audit['analysis_population']['missing_seeds'] == [],
+        str(audit['analysis_population']))
+    _ok('binding verifies against the current registry',
+        compare_design_binding(trained)['status'] == 'match', '')
+
+    structural = R.run_recall_report(
+        pairs=((4, 8),), layouts=['alternating'], train=False)
+    _ok('structural-only report makes no confirmatory audit',
+        'experiment_design' not in structural, '')
+
+
 def main() -> int:
     test_structural_recall_hand_derived()
     test_structural_validation_and_distance()
@@ -886,6 +932,7 @@ def main() -> int:
     test_recall_flops_rejects_oversized_geometry_without_overflow()
     test_distance_buckets_cap_an_oversized_window()
     test_report_materializes_one_shot_inputs()
+    test_registry_plan_matches_grid_and_binds_report()
     print('\nAll recall-reach tests passed.')
     return 0
 

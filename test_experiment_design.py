@@ -829,7 +829,7 @@ def test_cpu_skip_slow_seed_floor_is_recorded(monkeypatch, tmp_path):
     monkeypatch.setenv('ABL_SEEDS', '2')
     monkeypatch.setenv('MECH_SEEDS', '2')
     for var, default in (('MQAR_SEEDS', 5), ('ABL_SEEDS', 7),
-                         ('MECH_SEEDS', 5)):
+                         ('MECH_SEEDS', 5), ('RECALL_SEEDS', 3)):
         assert run_all._raise_seed_floor(var, default) == 5
     # A malformed value falls back to the default and is then floored.
     monkeypatch.setenv('MQAR_SEEDS', 'not-an-int')
@@ -837,7 +837,7 @@ def test_cpu_skip_slow_seed_floor_is_recorded(monkeypatch, tmp_path):
     block = run_all._write_experiment_design_manifest('smoke')
     assert {plan: row['n_seeds'] for plan, row in block['plans'].items()} \
         == {'exp4_mqar': 5, 'exp5_ratio': 5, 'exp5b_matrix': 5,
-            'exp8_mechanism': 5}
+            'exp8_mechanism': 5, 'exp9_recall': 5}
 
 
 def test_malformed_plan_and_audit_inputs_raise_design_errors():

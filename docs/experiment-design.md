@@ -383,9 +383,9 @@ pilot.
 
 `run_all.py` writes `results/experiment_design.json` before any experiment
 starts. It records the actual seed budget planned for each experiment in this
-pipeline invocation (`MQAR_SEEDS`, `ABL_SEEDS`, `MECH_SEEDS`), the required n
-at the declared SESOI, the resulting status, and a canonical `plan_sha256`
-per row. When provenance capture succeeds it also embeds the
+pipeline invocation (`MQAR_SEEDS`, `ABL_SEEDS`, `MECH_SEEDS`,
+`RECALL_SEEDS`), the required n at the declared SESOI, the resulting status,
+and a canonical `plan_sha256` per row. When provenance capture succeeds it also embeds the
 `capture_provenance()` block, binding the pre-registration to the working
 tree and runtime that wrote it. This is a provenance artifact: if the plan is
 edited after the run, the committed manifest and the result metadata no

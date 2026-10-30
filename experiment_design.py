@@ -544,6 +544,87 @@ PLANS: dict[str, dict] = {
             'cell_keys': ['n_kv'],
         },
     },
+    'exp9_recall': {
+        'plan_id': 'exp9_recall',
+        'title': ('Exp 9 - compression block size x interleaving '
+                  'associative-recall reach'),
+        'runner': 'recall_reach.py',
+        'result_files': ['results/exp9_recall_reach.json'],
+        'question': (
+            'Does the learned CSA indexer retrieve the gold compressed '
+            'block above uniform selection as compression block size and '
+            'retrieval-layer interleaving vary, and does that selection '
+            'signal track long-range MQAR accuracy?'),
+        'design': (
+            'seed-blocked structural + trained grid over equal-compressed-'
+            'entry (m, m2) pairs x fixed-depth layout interleavings; every '
+            'cell trains the same seed list, and the analytic reachability '
+            'table is frozen with the grid'),
+        'unit': ('one trained hybrid stack at one (compression pair, '
+                 'layout, seed), plus the analytic structural row for the '
+                 'same geometry'),
+        'factors': {
+            'compression_pair': {
+                'role': 'treatment',
+                # Mirrors recall_reach.BUDGET_PAIRS; the registry is
+                # stdlib-only, so it cannot import the torch module. A test
+                # pins the two lists together.
+                'levels': ['4x8', '8x4', '4x4', '3x6', '6x3'],
+            },
+            'layout': {
+                'role': 'treatment',
+                # Mirrors recall_reach.LAYOUT_PRESETS. Every preset has the
+                # same operator counts (6 memory + 2 CSA + 2 HCA), so only
+                # position changes.
+                'levels': ['alternating', 'retrieval_back',
+                           'retrieval_front', 'spread'],
+            },
+            'seed': {
+                'role': 'block',
+                'levels': '42 .. 42 + n_seeds - 1',
+            },
+        },
+        'required_levels': {
+            'layout': ['alternating'],
+            'compression_pair': ['4x8'],
+        },
+        'primary_contrast': (
+            'per-cell indexer union recall minus the analytic uniform-'
+            'selection union chance, paired by seed; Holm across the '
+            'trained cells (the pre-registered H4 in recall_reach)'),
+        'endpoint': 'indexer_union_recall_mean',
+        'direction': 'higher_is_better',
+        'sesoi': 0.10,
+        'assumed_sd': DEFAULT_ASSUMED_SD,
+        'alpha': DEFAULT_ALPHA,
+        # The full default grid is 6 pairs x 4 layouts = 24 cells. Holm is
+        # applied over the empirical cells, so that is the family size.
+        'planned_family_size': 24,
+        'alternative': 'greater',
+        'target_power': DEFAULT_TARGET_POWER,
+        'screening_seeds': 3,
+        'planned_seeds': 14,
+        'analysis': (
+            'exact sign / sign-flip tests and the seed-paired directional '
+            't-test on indexer union recall minus the analytic uniform '
+            'chance, Holm-corrected across cells; structural reachability '
+            'is exact and needs no inference. A run below 3 seeds is '
+            'labelled exploratory before any cell is compared'),
+        'decision_rule': (
+            'only a Holm-corrected positive union-recall gain may be called '
+            'content-addressed selection; a non-significant cell is '
+            'inconclusive, and accuracy differences across layouts are '
+            'descriptive unless their own paired contrast was registered'),
+        'stopping_rule': (
+            'fixed (m, m2) pairs, layout presets and seed count fixed before '
+            'the grid; no optional stopping, no dropping a cell after seeing '
+            'its accuracy, and no replacing failed seeds'),
+        'pilot': {
+            'group_key': 'layout',
+            'reference': 'alternating',
+            'cell_keys': ['m', 'm2'],
+        },
+    },
 }
 
 PLAN_IDS = tuple(PLANS)

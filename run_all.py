@@ -101,6 +101,7 @@ _RUN_PROFILES: dict[str, dict[str, str] | None] = {
         'MQAR_SEEDS': '2', 'MQAR_STEPS': '30',
         'ABL_SEEDS': '2', 'ABL_STEPS': '30',
         'MECH_SEEDS': '2', 'MECH_STEPS': '30',
+        'RECALL_SEEDS': '2', 'RECALL_STEPS': '20',
         'BENCH_LENGTHS': '128,256', 'BENCH_REPEATS': '3',
         'BUDGET_PREFILL_LENS': '256', 'BUDGET_DECODE_TOKENS': '3',
         'BUDGET_REPEATS': '1', 'SKIP_SLOW': '1',
@@ -118,6 +119,7 @@ _RUN_PROFILES: dict[str, dict[str, str] | None] = {
     'screen': None,   # default — no preset overrides
     'full': {
         'MQAR_SEEDS': '7', 'ABL_SEEDS': '7', 'MECH_SEEDS': '7',
+        'RECALL_SEEDS': '7',
     },
 }
 
@@ -196,6 +198,7 @@ def _write_experiment_design_manifest(profile: str) -> dict:
         'exp5_ratio': _env_seed_list('ABL_SEEDS', 7),
         'exp5b_matrix': _env_seed_list('ABL_SEEDS', 7),
         'exp8_mechanism': _env_seed_list('MECH_SEEDS', 5),
+        'exp9_recall': _env_seed_list('RECALL_SEEDS', 3),
     }
     design_errors = experiment_design.validate_plans()
     if design_errors:
@@ -439,6 +442,7 @@ _EXPERIMENT_OUTPUTS = {
         'results/exp16_paired_stats_calibration_provenance.json'],
     'exp7_roofline': ['results/exp7_roofline.json'],
     'exp8_mechanism_ablation': ['results/exp8_mechanism_ablation.json'],
+    'exp9_recall': ['results/exp9_recall_reach.json'],
     'exp9_budget_frontier': ['results/exp9_budget_frontier.json'],
     'exp10_quant_recall': ['results/exp10_quant_recall.json'],
     'exp11_quant_lm': ['results/exp11_quant_lm.json'],
@@ -467,6 +471,7 @@ _RAW_SIDE_FILES = {
     'results/exp15_ppl_calibration_provenance.json',
     'results/exp16_paired_stats_calibration_provenance.json',
     'results/exp4_overfit_gate.json',
+    'results/exp9_recall_reach.json',
     'results/experiment_design.json',
     'checkpoints_lm/smoke_hybrid/run_record.json',
     'checkpoints_lm/smoke_softmax/run_record.json',
@@ -752,7 +757,8 @@ def run_all(seeds=None, steps=None):
         if skip_slow and is_cpu:
             for _seed_var, _seed_default in (('MQAR_SEEDS', 5),
                                              ('ABL_SEEDS', 7),
-                                             ('MECH_SEEDS', 5)):
+                                             ('MECH_SEEDS', 5),
+                                             ('RECALL_SEEDS', 3)):
                 _raise_seed_floor(_seed_var, _seed_default)
 
         # Store structured provenance rather than only ``repr(EnvInfo)`` so
@@ -785,6 +791,7 @@ def run_all(seeds=None, steps=None):
         import run_benchmark
         import run_quality
         import run_ablation
+        import recall_reach
         import run_mechanism_ablation
         import run_decoding
         import run_indexer_selector
@@ -1010,6 +1017,26 @@ def run_all(seeds=None, steps=None):
         summary['runs'].append(
             _run('exp8_mechanism_ablation', run_mechanism_ablation.main))
 
+        # 6c. Block-size x interleaving associative-recall reach (Exp 9).
+        #     Structural tables are analytic; the trained grid uses the
+        #     registered seed list (RECALL_SEEDS) and is bound to the
+        #     exp9_recall plan by audit_run. Same SKIP_SLOW policy as the
+        #     other multi-seed grids: keep the seed count usable (>= 5) and
+        #     truncate only the step budget.
+        if skip_slow and is_cpu:
+            try:
+                _recall_seeds = int(os.environ.get('RECALL_SEEDS', '3'))
+            except ValueError:
+                _recall_seeds = 3
+            os.environ['RECALL_SEEDS'] = str(max(5, _recall_seeds))
+            try:
+                _recall_steps = int(os.environ.get('RECALL_STEPS', '80'))
+            except ValueError:
+                _recall_steps = 80
+            os.environ['RECALL_STEPS'] = str(min(_recall_steps, 50))
+        summary['runs'].append(
+            _run('exp9_recall', recall_reach.main))
+
         # 7. Decoding latency.
         summary['runs'].append(_run('exp6_decoding', run_decoding.main))
 
@@ -1215,6 +1242,7 @@ def run_all(seeds=None, steps=None):
             'MQAR_SEEDS': os.environ.get('MQAR_SEEDS'),
             'ABL_SEEDS': os.environ.get('ABL_SEEDS'),
             'MECH_SEEDS': os.environ.get('MECH_SEEDS'),
+            'RECALL_SEEDS': os.environ.get('RECALL_SEEDS'),
             'QUANT_SEEDS': os.environ.get('QUANT_SEEDS'),
             'QLM_SEEDS': os.environ.get('QLM_SEEDS'),
             'base_seed': 42,

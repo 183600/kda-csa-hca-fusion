@@ -103,6 +103,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import experiment_design as design_registry  # noqa: E402
 from kaggle_setup import (  # noqa: E402
     append_run_manifest,
     capture_provenance,
@@ -1391,6 +1392,41 @@ def _seed_accuracy_rank(seed_row: dict) -> tuple[int, float]:
     return (0, value)
 
 
+def _compression_pair_label(m: int, m2: int) -> str:
+    """Registry label for one (m, m2) budget pair (e.g. ``4x8``).
+
+    Kept deliberately separate from the numeric row fields: the plan
+    registry is stdlib-only and cannot import this torch module, so both
+    sides spell the factor level the same way.
+    """
+    return f'{int(m)}x{int(m2)}'
+
+
+def _recall_design_audit(rows: list[dict], *, seeds, layouts) -> dict:
+    """Bind a trained recall grid to the pre-registered ``exp9_recall`` plan.
+
+    The audit records the observed layout/compression levels, the actual
+    test family (one empirical cell = one row), the requested seed block,
+    and the complete-case seed intersection across all cells. It therefore
+    distinguishes a short screening run from the registered confirmatory
+    budget without changing any measured number.
+    """
+    levels = {
+        'compression_pair': sorted({
+            _compression_pair_label(r['m'], r['m2']) for r in rows}),
+        'layout': sorted({str(name) for name, _seq in layouts}),
+    }
+    analyzed = design_registry.common_analyzed_seeds(
+        rows, finite_keys=('accuracy',))
+    return design_registry.audit_run(
+        'exp9_recall',
+        seeds=[int(seed) for seed in seeds],
+        levels=levels,
+        family_size=len(rows),
+        analyzed_seeds=analyzed,
+    )
+
+
 def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                       steps: int = 80, seeds=(42, 43, 44), seq_len: int = SEQ_LEN,
                       d_model: int = D_MODEL, train_batch: int = 16,
@@ -1608,7 +1644,7 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
                 }
             rows.append(row)
 
-    return {
+    report = {
         'experiment': 'exp9_recall_reach',
         'design': {
             'question': ('how do compression block size and retrieval-layer '
@@ -1672,6 +1708,14 @@ def run_recall_report(*, pairs=BUDGET_PAIRS, layouts=None,
         },
         'rows': rows,
     }
+    if train:
+        # Structural-only runs make no trained estimate, so they carry no
+        # confirmatory audit. A trained grid is tied to the registered plan
+        # by fingerprint + snapshot, which is what reproducibility.py
+        # verifies against the current registry.
+        report['experiment_design'] = _recall_design_audit(
+            rows, seeds=seeds, layouts=layouts)
+    return report
 
 
 # ===========================================================================

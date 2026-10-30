@@ -33,8 +33,8 @@ unverifiable rather than compared against a different algorithm.
 | `plan_definition` | the full plan snapshot the verdict was computed from |
 
 Every runner that already embeds the audit (`run_quality`, `run_ablation`
-matrix/ratio, `run_mechanism_ablation`) therefore writes the binding into its
-result file automatically. The ratio sweep's sidecar
+matrix/ratio, `run_mechanism_ablation`, and trained `recall_reach` grids)
+therefore writes the binding into its result file automatically. The ratio sweep's sidecar
 `provenance.experiment_design` block is supported as well as the usual
 `metadata.experiment_design`.
 
@@ -88,7 +88,9 @@ checked by the code/runtime layers of the same verifier. See
 `test_design_binding.py` covers canonicalization and content sensitivity, the
 snapshot embedded by every registered plan, manifest provenance, both result
 layouts, tampered snapshots, post-hoc registry changes, legacy `unbound`
-audits, unknown plans, and scope changes.
+audits, unknown plans, and scope changes. `test_recall_reach.py` additionally
+pins the `exp9_recall` factor levels to the runner's grids and verifies that a
+trained recall report re-hashes to a `match`.
 
 ```bash
 pytest -q test_design_binding.py
