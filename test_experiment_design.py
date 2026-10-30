@@ -828,6 +828,7 @@ def test_cpu_skip_slow_seed_floor_is_recorded(monkeypatch, tmp_path):
     monkeypatch.setenv('MQAR_SEEDS', '2')
     monkeypatch.setenv('ABL_SEEDS', '2')
     monkeypatch.setenv('MECH_SEEDS', '2')
+    monkeypatch.setenv('RECALL_SEEDS', '2')
     for var, default in (('MQAR_SEEDS', 5), ('ABL_SEEDS', 7),
                          ('MECH_SEEDS', 5), ('RECALL_SEEDS', 3)):
         assert run_all._raise_seed_floor(var, default) == 5
