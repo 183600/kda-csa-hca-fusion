@@ -179,6 +179,26 @@ def test_incomplete_beta_huge_shapes_stay_normalized():
             1.0, abs=1e-9)
 
 
+def test_incomplete_beta_large_asymmetric_shapes_keep_extreme_tail():
+    """The complement CF must not replace an accurate small direct tail.
+
+    Here the first shape is huge and the second is moderate, so the
+    direct branch already resolves the tiny lower tail without
+    cancellation. Using the complementary fraction instead computed
+    ``p = I_y(b, a)`` as ``1 - 6.4e-8`` in double precision and returned
+    the CF error, ``1.0e-4``, instead of the true ``5.9e-8``. The
+    reference was computed with ``mpmath.betainc`` at 60 digits from the
+    exact float inputs.
+    """
+    a = 680107877.5646358
+    b = 64.8478957308672
+    x = 0.9999998281832388
+    want = 5.910909363106801082175727e-08
+    assert M.betainc_regularized(a, b, x) == pytest.approx(want, rel=1e-9)
+    assert M._log_betainc_regularized(a, b, x) == pytest.approx(
+        math.log(want), abs=1e-9)
+
+
 def test_student_t_sf_large_dof_keeps_extreme_tail_accuracy():
     """The beta argument must be formed without cancelling ``1 - x``.
 

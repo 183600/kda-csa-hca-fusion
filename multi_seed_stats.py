@@ -465,7 +465,11 @@ def _complement_tail_value(a: float, b: float, x: float, y: float,
         p = math.exp(log_bt + math.log(h) - math.log(b))
     except (OverflowError, ValueError):
         return None
-    if not (0.0 < p < 1.0):
+    # If ``p`` is itself close to one, ``1 - p`` is dominated by the CF
+    # error instead of the desired small tail: the direct branch is then
+    # both well conditioned and more accurate. Only use the complement
+    # when it is the genuinely smaller side of the distribution.
+    if not (0.0 < p < 0.9):
         return None
     return 1.0 - p
 
