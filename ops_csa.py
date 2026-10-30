@@ -585,6 +585,40 @@ def csa_compress_kv(
     return _bf16_scale_if_needed(out)
 
 
+def _overlapped_compress_no_pad(
+    Ca: torch.Tensor,
+    Cb: torch.Tensor,
+    Za: torch.Tensor,
+    Zb: torch.Tensor,
+    Ba: torch.Tensor,
+    Bb: torch.Tensor,
+    m: int,
+) -> torch.Tensor:
+    """Inference-only overlapped compression over pre-blocked inputs.
+
+    ``Ca``/``Cb``/``Za``/``Zb`` arrive as ``[B, n, m, c]`` views of the
+    sequence. The first b-branch row has no previous block (``-inf`` logits,
+    zero value contribution) and is written directly into the logits buffer,
+    avoiding the two full ``[B, n, m, c]`` shifted copies that the autograd
+    path builds with ``F.pad``.
+    """
+    B, n, _, c = Ca.shape
+    if n == 0:
+        return Ca.new_zeros(B, 0, c)
+    all_logits = torch.empty(
+        B, n, 2 * m, c, device=Ca.device, dtype=Ca.dtype)
+    torch.add(Za, Ba[None, None, :, :].to(Za), out=all_logits[:, :, :m])
+    if n > 1:
+        torch.add(Zb[:, :-1], Bb[None, None, :, :].to(Zb[:, :-1]),
+                  out=all_logits[:, 1:, m:])
+    all_logits[:, 0, m:].fill_(float('-inf'))
+    S = _bf16_safe_softmax(all_logits, dim=2)
+    out = S[:, :, :m].mul_(Ca).sum(2)
+    if n > 1:
+        out[:, 1:].add_(S[:, 1:, m:].mul_(Cb[:, :-1]).sum(2))
+    return _bf16_scale_if_needed(out)
+
+
 def csa_compress_kv_overlapped(
     Ca: torch.Tensor,
     Cb: torch.Tensor,
@@ -599,6 +633,10 @@ def csa_compress_kv_overlapped(
     Each compressed entry fuses ``m`` entries from ``Ca`` at the current block
     and ``m`` entries from ``Cb`` of the *previous* block, so consecutive
     compressed entries share half of their source tokens.
+
+    Under ``torch.no_grad`` the shifted b-branch is written directly into the
+    logits buffer, so inference does not allocate full ``[B, T, c]``
+    ``Zb_prev`` / ``Cb_prev`` copies.
     """
     B_, T, c = Ca.shape
     # Validate m BEFORE ``T % m`` (mirrors csa_compress_kv): m=0 is rejected
@@ -633,6 +671,9 @@ def csa_compress_kv_overlapped(
     Za = Za.to(compute_dtype).view(B_, n_blocks, m, c)
     Zb = Zb.to(compute_dtype).view(B_, n_blocks, m, c)
 
+    if not torch.is_grad_enabled():
+        return _overlapped_compress_no_pad(Ca, Cb, Za, Zb, Ba, Bb, m)
+
     # Two-branch overlapped compression.
     # b-branch entries shifted by one so block i uses block i-1; the first
     # block has no previous -> pad with -inf so softmax assigns 0 weight
@@ -640,20 +681,10 @@ def csa_compress_kv_overlapped(
     Zb_prev = F.pad(Zb[:, :-1], (0, 0, 0, 0, 1, 0),
                     value=float('-inf'))                          # [B, n_blocks, m, c]
     # a-branch logits for ALL blocks, then both branches concatenated along
-    # the m axis. Without autograd the sums are written directly into the
-    # two halves of one [B, n_blocks, 2m, c] buffer (the ``out=`` sums
-    # compute the same elementwise adds). While a graph is recorded the
-    # cat-of-sums form is kept (``out=`` does not build a graph).
-    if torch.is_grad_enabled():
-        A_logits = Za + Ba[None, None, :, :].to(Za)
-        Bb_logits = Zb_prev + Bb[None, None, :, :].to(Zb_prev)
-        all_logits = torch.cat([A_logits, Bb_logits], dim=2)
-    else:
-        all_logits = torch.empty(B_, n_blocks, 2 * m, c,
-                                 device=Ca.device, dtype=compute_dtype)
-        torch.add(Za, Ba[None, None, :, :].to(Za), out=all_logits[:, :, :m])
-        torch.add(Zb_prev, Bb[None, None, :, :].to(Zb_prev),
-                  out=all_logits[:, :, m:])
+    # the m axis.
+    A_logits = Za + Ba[None, None, :, :].to(Za)
+    Bb_logits = Zb_prev + Bb[None, None, :, :].to(Zb_prev)
+    all_logits = torch.cat([A_logits, Bb_logits], dim=2)
     S = _bf16_safe_softmax(all_logits, dim=2)                          # [B, n_blocks, 2m, c]
     Sa = S[:, :, :m]                                              # [B, n_blocks, m, c]
     Sb = S[:, :, m:]                                              # [B, n_blocks, m, c]
@@ -661,17 +692,7 @@ def csa_compress_kv_overlapped(
     # Cb shifted the same way: first block has no previous -> zero contribution.
     Cb_prev = F.pad(Cb[:, :-1], (0, 0, 0, 0, 1, 0),
                     value=0.0)                                    # [B, n_blocks, m, c]
-
-    if torch.is_grad_enabled():
-        out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)            # [B, n_blocks, c]
-    else:
-        # ``Sa`` / ``Sb`` are views of the fresh softmax output ``S`` (no
-        # other reader), and ``Ca`` / ``Cb_prev`` are only read; the in-place
-        # products evaluate the identical elementwise chains before the same
-        # sums. The second branch sum is added in place into the fresh first
-        # sum (same addition, one fewer [B, n_blocks, c] temporary).
-        out = Sa.mul_(Ca).sum(2)
-        out.add_(Sb.mul_(Cb_prev).sum(2))
+    out = (Sa * Ca).sum(2) + (Sb * Cb_prev).sum(2)                # [B, n_blocks, c]
     return _bf16_scale_if_needed(out)
 
 

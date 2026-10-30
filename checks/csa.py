@@ -1029,6 +1029,58 @@ def test_csa_compress_kv_overlapped_zero_length(device='cpu'):
     ]
 
 
+def test_overlapped_compress_no_pad_parity(device='cpu'):
+    """No-grad overlapped compression must match the padded autograd path.
+
+    The inference path writes the shifted b-branch directly into the logits
+    buffer instead of materializing full ``[B, T, c]`` ``Zb_prev`` /
+    ``Cb_prev`` pads. This regression test pins both value parity and the
+    absence of ``F.pad`` on that path.
+    """
+    logger.info("Test: overlapped compression no-pad inference parity")
+    results = []
+    cases = [
+        (1, 8, 8, 16, torch.float32),
+        (3, 16, 4, 8, torch.float32),
+        (1, 16, 16, 4, torch.float64),
+        (2, 32, 8, 32, torch.bfloat16),
+    ]
+    for B, T, m, c, dtype in cases:
+        torch.manual_seed(311 + T + m)
+        Ca = torch.randn(B, T, c, dtype=dtype, device=device)
+        Cb = torch.randn(B, T, c, dtype=dtype, device=device)
+        Za = torch.randn(B, T, c, dtype=dtype, device=device)
+        Zb = torch.randn(B, T, c, dtype=dtype, device=device)
+        Ba = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+        Bb = torch.randn(m, c, dtype=dtype, device=device) * 0.1
+
+        pad_calls = []
+        orig_pad = torch.nn.functional.pad
+
+        def _record_pad(*args, **kwargs):
+            pad_calls.append(1)
+            return orig_pad(*args, **kwargs)
+
+        torch.nn.functional.pad = _record_pad
+        try:
+            with torch.no_grad():
+                fast = csa_compress_kv_overlapped(
+                    Ca, Cb, Za, Zb, Ba, Bb, m)
+        finally:
+            torch.nn.functional.pad = orig_pad
+
+        ref = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)
+        diff = (fast.float() - ref.float()).abs().max().item()
+        label = f'B={B},T={T},m={m},c={c},{str(dtype).split(".")[-1]}'
+        results += [
+            _ok(f'overlapped no-pad parity ({label})', diff == 0.0,
+                f'max|diff|={diff:.2e}'),
+            _ok(f'overlapped no-pad avoids F.pad ({label})',
+                not pad_calls, f'pad calls={len(pad_calls)}'),
+        ]
+    return results
+
+
 def test_partial_rope_properties(device='cpu'):
     """Unit properties of the partial RoPE (DeepSeek-V4 §2.3.3).
 
@@ -1107,5 +1159,6 @@ __all__ = [
     'test_csa_topk_edge_cases',
     'test_csa_topk_zero',
     'test_csa_compress_kv_overlapped_zero_length',
+    'test_overlapped_compress_no_pad_parity',
     'test_partial_rope_properties',
 ]
