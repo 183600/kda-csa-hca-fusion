@@ -486,6 +486,14 @@ class GatedDeltaRule(nn.Module):
         work_dtype = torch.promote_types(
             torch.promote_types(q.dtype, k.dtype),
             torch.promote_types(v.dtype, S.dtype))
+        # ``gate``/``beta`` are learnable parameters and can be stored in a
+        # higher precision than the activations (e.g. a float64 module with
+        # float32 inputs). Include them in the promotion exactly like
+        # ``gated_delta_rule_step``; otherwise the casts below silently round
+        # the parameters to the activation dtype and the module and step
+        # disagree on both output dtype and values.
+        work_dtype = torch.promote_types(work_dtype, gate_state.dtype)
+        work_dtype = torch.promote_types(work_dtype, beta.dtype)
         if q.dtype != work_dtype:
             q = q.to(work_dtype)
         if k.dtype != work_dtype:

@@ -332,6 +332,39 @@ def test_gated_delta_rule_state_contract_and_mixed_dtype_step():
         f'{o.dtype}')
 
 
+def test_gated_delta_rule_module_matches_step_for_high_precision_params():
+    print('\nTest: GatedDeltaRule module/step parity with fp64 params')
+    torch.manual_seed(11)
+    B, T, H, K, V = 2, 5, 3, 4, 5
+    layer = GatedDeltaRule(H, K, V, gate_type='per_channel').double()
+    q = torch.randn(B, T, H, K)
+    k = torch.randn(B, T, H, K)
+    v = torch.randn(B, T, H, V)
+    init = torch.randn(B, H, K, V)
+
+    o, S = layer(q, k, v, initial_state=init)
+    gate = layer.g.clamp(
+        min=layer.g_clamp_min, max=layer.g_clamp_max).exp()
+    S_step = init.clone()
+    outs = []
+    for t in range(T):
+        o_t, S_step = gated_delta_rule_step(
+            S_step, q[:, t], k[:, t], v[:, t], gate, layer.beta)
+        outs.append(o_t)
+    ref = torch.stack(outs, dim=1)
+
+    # fp64 gate/beta parameters must promote the fp32 activations/state, just
+    # like ``gated_delta_rule_step``; rounding them to fp32 would disagree.
+    _ok('high-precision params promote output', o.dtype == torch.float64,
+        f'{o.dtype}')
+    _ok('high-precision params promote state', S.dtype == torch.float64,
+        f'{S.dtype}')
+    _ok('module matches step values',
+        torch.equal(o, ref) and torch.equal(S, S_step),
+        f'out_diff={(o - ref).abs().max().item()}, '
+        f'state_diff={(S - S_step).abs().max().item()}')
+
+
 def test_gated_attention_rejects_oversized_config_scalars():
     """A JSON-sized int is rejected as a config error, not OverflowError."""
     print('\nTest: oversized gate config scalars are rejected')
@@ -528,6 +561,7 @@ if __name__ == '__main__':
     test_gated_delta_rule_gradient()
     test_gated_delta_rule_step_functional()
     test_gated_delta_rule_state_contract_and_mixed_dtype_step()
+    test_gated_delta_rule_module_matches_step_for_high_precision_params()
     test_gated_attention_rejects_oversized_config_scalars()
     test_gated_delta_rule_empty_sequence_dtype_contract()
     test_gated_delta_rule_bf16()
