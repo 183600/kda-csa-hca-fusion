@@ -2371,11 +2371,20 @@ def split_half_selection_validation(cells, *, min_seeds: int = 4,
     dropped_seeds = (sorted(set().union(
         *(set(cleaned[name]) for name in usable)) - set(common))
         if usable else [])
-    full_means = {
-        name: _safe_mean([cleaned[name][seed] for seed in common])
-        for name in usable} if common else {}
-    full_order = sorted(usable, key=lambda name: (-full_means[name], name))
-    full_best = full_order[0] if full_order else None
+    if common:
+        full_means = {
+            name: _safe_mean([cleaned[name][seed] for seed in common])
+            for name in usable}
+        full_order = sorted(usable,
+                            key=lambda name: (-full_means[name], name))
+        full_best = full_order[0]
+    else:
+        # Candidates with disjoint seed sets have no common full-data
+        # ranking; leave the ranking fields empty and return the
+        # ``insufficient_data`` base record below.
+        full_means = {}
+        full_order = []
+        full_best = None
     base = {
         'method': 'split_half_seed_selection_validation',
         'definition': (

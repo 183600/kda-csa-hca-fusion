@@ -1883,6 +1883,16 @@ def test_split_half_selection_validation_insufficient_and_empty_groups():
     })
     assert empty['status'] == 'insufficient_data'
     assert empty['candidates_without_values'] == ['b']
+    # Disjoint seed sets leave no common full-data ranking; this must be
+    # reported as insufficient data, not raise KeyError.
+    disjoint = M.split_half_selection_validation({
+        'a': {42: 1.0, 43: 1.0},
+        'b': {44: 0.0, 45: 0.0},
+    })
+    assert disjoint['status'] == 'insufficient_data'
+    assert disjoint['common_seeds'] == []
+    assert disjoint['full_data_best'] is None
+    assert disjoint['full_ranking'] == []
 
 
 def test_split_half_selection_validation_caps_partitions_deterministically():
