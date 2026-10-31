@@ -2718,6 +2718,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     audit exists to report.
     """
     plan = get_plan(plan_id)
+    # Normalize once: the role is accepted case-insensitively, and the
+    # status/warning branches below must use the same canonical value that
+    # ``seed_ids`` and ``audit_seed_block`` use. Comparing the raw argument
+    # would let ``seed_role='Pilot'`` draw pilot seeds but skip the pilot
+    # claim/status handling.
+    seed_role = _normalize_seed_role(seed_role)
     seed_list = (seed_ids(seeds, role=seed_role, plan_id=plan_id)
                  if _is_int(seeds) else _seed_list(seeds))
     n_seeds = len(seed_list)

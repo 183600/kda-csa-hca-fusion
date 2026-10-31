@@ -861,6 +861,17 @@ def test_audit_labels_pilot_seeded_runs_exploratory():
     assert any('labelled a pilot' in w
                for w in relabelled['design_warnings'])
 
+    # The role is normalized case-insensitively everywhere; a spelling
+    # variant must not bypass the pilot status and warning above.
+    relabelled_variant = D.audit_run(
+        'exp4_mqar', seeds=[42, 43, 44], levels=levels, family_size=1,
+        seed_role='  Pilot ')
+    assert relabelled_variant['status'] == 'exploratory_pilot'
+    assert relabelled_variant['checks'][
+        'pilot_role_uses_confirmatory_seeds'] is False
+    assert any('labelled a pilot' in w
+               for w in relabelled_variant['design_warnings'])
+
 
 def test_pilot_report_tracks_seed_provenance():
     overlapping = D.pilot_report('exp4_mqar', _exp4_rows())
