@@ -53,6 +53,30 @@ latter mixes in cheap early positions and understates late-context cost.
   `causal_selected_entries`) are imported from `run_kv_cache`, so the read
   budget and the Exp 3 KV/FLOPs accounting cannot disagree on causality.
 
+## Chunkwise scan state budget
+
+`chunkwise_scan_state_elements(T, chunk_size, hv=..., d_k=..., d_v=...,
+batch=...)` prices the working set that KDA's full Hillis-Steele chunk
+scan (`kda_assoc_scan`) adds on top of the sequential state carry. With
+`NT = ceil(T / chunk_size)` it returns:
+
+| field | elements |
+|---|---|
+| `checkpoint_elements` | `batch * hv * NT * d_k * d_v` (the `S_in` consumed by each chunk readout) |
+| `transition_elements` | `batch * hv * NT * d_k * d_k` (the composed `E` maps) |
+| `source_elements` | `batch * hv * NT * d_k * d_v` (the composed `F` sources) |
+| `final_state_elements` | `batch * hv * d_k * d_v` |
+
+The sequential chunk path keeps one `hv x d_k x d_v` state; the parallel
+form materialises one affine map per chunk and resolves the prefix with
+`ceil(log2 NT)` batched doubling levels. `flops_audit.audit_layer` attaches
+this dict as `assoc_scan_state` when `kda_assoc_scan` is active on the
+chunk path. The count is **scan-core only**: the intra-chunk `A`/`Aqk`
+matrices and the `C`/`a` readout are excluded because the sequential chunk
+path materialises them too. It is an analytical element count, not a
+profiled peak — the doubling levels mutate `E`/`F` in place, and the
+two-phase `scan_block_size` variant keeps only block maps.
+
 ## Exp 9 sections
 
 | `section` | Rows | Content |

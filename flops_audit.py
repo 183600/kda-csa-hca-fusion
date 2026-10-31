@@ -86,6 +86,7 @@ import math
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from kv_budget import chunkwise_scan_state_elements
 from ops_fused import HybridConfig, build_mixer
 from ops_kda import _attn_block_rows, _recompute_block_rows
 from run_kv_cache import prefill_flops
@@ -755,6 +756,10 @@ def audit_layer(kind: str, cfg, T: int, batch: int = 1, *,
         result['executed_flops'] = kda_executed_flops(cfg, T, batch)
         result['broadcast_encoded_macs'] = kda_broadcast_encoded_macs(
             cfg, T, batch)
+        if cfg.kda_assoc_scan and result['path'] == 'chunk':
+            result['assoc_scan_state'] = chunkwise_scan_state_elements(
+                T, cfg.kda_chunk_size, hv=cfg.n_heads_v,
+                d_k=cfg.head_dim_k, d_v=cfg.head_dim_v, batch=batch)
     elif kind == 'mamba2':
         result['path'] = mamba2_path(cfg)
         if result['path'] == 'sequential':

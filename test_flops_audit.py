@@ -153,6 +153,37 @@ def test_kda_exact_model_assoc_scan(T, device):
     assert fa.kda_broadcast_encoded_macs(cfg, T) == 0
 
 
+def test_kda_assoc_scan_reports_state_budget(device):
+    """The parallel scan's per-chunk state maps are exposed with the ledger."""
+    cfg = _cfg(kda_assoc_scan=True)
+    T = 3 * cfg.kda_chunk_size
+    row = fa.audit_layer('kda', cfg, T, batch=2, device=device)
+    state = row['assoc_scan_state']
+    assert state['n_chunks'] == 3
+    per_seq = 2 * cfg.n_heads_v * 3
+    assert state['checkpoint_elements'] == (
+        per_seq * cfg.head_dim_k * cfg.head_dim_v)
+    assert state['transition_elements'] == (
+        per_seq * cfg.head_dim_k ** 2)
+    assert state['source_elements'] == (
+        per_seq * cfg.head_dim_k * cfg.head_dim_v)
+    assert state['final_state_elements'] == (
+        2 * cfg.n_heads_v * cfg.head_dim_k * cfg.head_dim_v)
+    assert state['total_elements'] == (
+        state['checkpoint_elements'] + state['transition_elements']
+        + state['source_elements'] + state['final_state_elements'])
+
+
+def test_assoc_scan_state_budget_only_on_the_scan_path(device):
+    seq = _cfg()
+    assert 'assoc_scan_state' not in fa.audit_layer(
+        'kda', seq, 3 * seq.kda_chunk_size, device=device)
+    short = _cfg(kda_assoc_scan=True)
+    row = fa.audit_layer('kda', short, short.kda_chunk_size - 1, device=device)
+    assert row['path'] == 'recurrent'
+    assert 'assoc_scan_state' not in row
+
+
 def test_kda_assoc_scan_short_sequence_uses_recurrent_model(device):
     """The scan flag is ignored below one chunk, so price the recurrent path."""
     cfg = _cfg(kda_assoc_scan=True)

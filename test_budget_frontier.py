@@ -128,6 +128,54 @@ def test_budget_scaling_claims():
         dense['selected_read_elements'] == full['selected_read_elements'], '')
 
 
+def test_chunkwise_scan_state_budget_hand_values():
+    print('\nTest: chunkwise parallel scan state budget')
+    st = kv_budget.chunkwise_scan_state_elements(
+        128, 64, hv=2, d_k=8, d_v=8, batch=2)
+    _ok('T=128, C=64 -> NT=2', st['n_chunks'] == 2, st['n_chunks'])
+    _ok('checkpoint = 2*2*2*8*8 = 512',
+        st['checkpoint_elements'] == 512, st['checkpoint_elements'])
+    _ok('transition = 2*2*2*8*8 = 512',
+        st['transition_elements'] == 512, st['transition_elements'])
+    _ok('source = 2*2*2*8*8 = 512',
+        st['source_elements'] == 512, st['source_elements'])
+    _ok('final state = 2*2*8*8 = 256',
+        st['final_state_elements'] == 256, st['final_state_elements'])
+    _ok('total = 1792', st['total_elements'] == 1792,
+        st['total_elements'])
+    no_trans = kv_budget.chunkwise_scan_state_elements(
+        128, 64, hv=2, d_k=8, d_v=8, batch=2, include_transitions=False)
+    _ok('without transitions only checkpoints + final',
+        no_trans['transition_elements'] == 0
+        and no_trans['source_elements'] == 0
+        and no_trans['total_elements'] == 768,
+        f"{no_trans}")
+    empty = kv_budget.chunkwise_scan_state_elements(
+        0, 64, hv=2, d_k=8, d_v=8, batch=2)
+    _ok('T=0 has no scan workspace',
+        empty['n_chunks'] == 0 and empty['total_elements'] == 0, f'{empty}')
+    one = kv_budget.chunkwise_scan_state_elements(
+        1, 64, hv=2, d_k=8, d_v=8, batch=2)
+    _ok('T=1 materialises one chunk map plus the final state',
+        one['n_chunks'] == 1 and one['checkpoint_elements'] == 256
+        and one['total_elements'] == 256 + 256 + 256 + 256, f'{one}')
+    for bad in (-1, True, 1.0):
+        raised = False
+        try:
+            kv_budget.chunkwise_scan_state_elements(
+                bad, 64, hv=2, d_k=8, d_v=8)
+        except (TypeError, ValueError):
+            raised = True
+        _ok(f'rejects T={bad!r}', raised, '')
+    raised = False
+    try:
+        kv_budget.chunkwise_scan_state_elements(
+            8, 4, hv=2, d_k=8, d_v=8, include_transitions=1)
+    except TypeError:
+        raised = True
+    _ok('rejects non-bool include_transitions', raised, '')
+
+
 def test_op_and_layout_dispatch():
     print('\nTest: op/layout dispatch and validation')
     spec = {
@@ -931,6 +979,7 @@ _TEST_FUNCS = [
     test_sliding_window_entries_hand_values,
     test_op_budget_hand_values_mqar_geometry,
     test_budget_scaling_claims,
+    test_chunkwise_scan_state_budget_hand_values,
     test_op_and_layout_dispatch,
     test_instant_budget_hand_values,
     test_layout_memory_route_substitution,

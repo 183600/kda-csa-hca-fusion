@@ -91,8 +91,12 @@ path, and `_kda_assoc_scan_extra_macs` adds the per-chunk affine map
 (`E_tail @ E_shift` and `E_tail @ F_shift`), the exclusive prefix and
 final state, plus the `C`/`a`/`C @ S_in` readout. Regression tests pin the
 model to the dispatch counter across chunk counts, padding, batch, and
-GVA. The two-phase `scan_block_size` variant is a direct-call option
-(no `HybridConfig` field) and is not part of the layer-level model.
+GVA. `audit_layer` also attaches `assoc_scan_state` from
+`kv_budget.chunkwise_scan_state_elements`, the per-chunk `S_in`/`E`/`F`
+working set the parallel form adds to the sequential state carry
+(scan-core only; see [kv-budget-model.md](kv-budget-model.md)). The
+two-phase `scan_block_size` variant is a direct-call option (no
+`HybridConfig` field) and is not part of the layer-level model.
 Likewise the chunked Mamba-2 scan (`mamba_chunk_size > 0`) has a
 different intra-chunk ledger and is measured from the dispatch counter
 instead of the closed form.

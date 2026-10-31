@@ -190,6 +190,90 @@ def mamba2_read_elements(T: int, nheads: int, headdim: int,
                           2, state_elements)
 
 
+def chunkwise_scan_state_elements(T: int, chunk_size: int, *, hv: int,
+                                  d_k: int, d_v: int, batch: int = 1,
+                                  include_transitions: bool = True) -> dict:
+    """Analytical working set of the full Hillis-Steele KDA chunk scan.
+
+    The chunkwise parallel form resolves the per-chunk affine recurrence
+    ``S_{n+1} = M_n S_n + b_n`` with a prefix scan. Unlike the sequential
+    state carry (one ``hv * d_k * d_v`` state per layer), the scan keeps
+    per-chunk tensors alive:
+
+    * ``checkpoint_elements`` — the incoming-state tensor ``S_in`` consumed
+      by each chunk's readout, ``n_chunks * hv * d_k * d_v``;
+    * ``transition_elements`` — the composed ``E_n`` maps,
+      ``n_chunks * hv * d_k * d_k``;
+    * ``source_elements`` — the composed ``F_n`` sources,
+      ``n_chunks * hv * d_k * d_v``;
+    * ``final_state_elements`` — the returned final state,
+      ``hv * d_k * d_v``.
+
+    All counts include ``batch``. This is a *scan-core* budget: it excludes
+    the intra-chunk ``A``/``Aqk`` matrices and the ``C``/``a`` readout,
+    which the sequential chunk path also materialises. It is an analytical
+    element count, not a profiled peak (the doubling levels mutate ``E`` /
+    ``F`` in place, and the two-phase ``scan_block_size`` variant keeps
+    only block maps).
+
+    This is the extra state budget the parallel form trades for its
+    ``ceil(log2 n_chunks)`` batched scan levels; it is not part of the
+    per-query KV read currency priced by :func:`op_read_elements`.
+    """
+    _validate_T(T, 'chunkwise_scan_state_elements')
+    _validate_positive(chunk_size, 'chunk_size',
+                       'chunkwise_scan_state_elements')
+    _validate_positive(hv, 'hv', 'chunkwise_scan_state_elements')
+    _validate_positive(d_k, 'd_k', 'chunkwise_scan_state_elements')
+    _validate_positive(d_v, 'd_v', 'chunkwise_scan_state_elements')
+    _validate_positive(batch, 'batch', 'chunkwise_scan_state_elements')
+    if not isinstance(include_transitions, bool):
+        raise TypeError(
+            'chunkwise_scan_state_elements: include_transitions must be a '
+            f'bool, got {include_transitions!r}')
+    n_chunks = (T + chunk_size - 1) // chunk_size
+    if T == 0:
+        return {
+            'T': 0,
+            'chunk_size': int(chunk_size),
+            'n_chunks': 0,
+            'batch': int(batch),
+            'hv': int(hv),
+            'checkpoint_elements': 0.0,
+            'transition_elements': 0.0,
+            'source_elements': 0.0,
+            'final_state_elements': 0.0,
+            'total_elements': 0.0,
+        }
+    per_seq = hv * n_chunks
+    checkpoint = _finite_scaled(
+        'chunkwise_scan_state_elements', 'checkpoint elements',
+        per_seq * batch, d_k * d_v)
+    transition = (_finite_scaled(
+        'chunkwise_scan_state_elements', 'transition elements',
+        per_seq * batch, d_k * d_k) if include_transitions else 0.0)
+    source = (_finite_scaled(
+        'chunkwise_scan_state_elements', 'source elements',
+        per_seq * batch, d_k * d_v) if include_transitions else 0.0)
+    final = _finite_scaled(
+        'chunkwise_scan_state_elements', 'final-state elements',
+        hv * batch, d_k * d_v)
+    return {
+        'T': int(T),
+        'chunk_size': int(chunk_size),
+        'n_chunks': int(n_chunks),
+        'batch': int(batch),
+        'hv': int(hv),
+        'checkpoint_elements': checkpoint,
+        'transition_elements': transition,
+        'source_elements': source,
+        'final_state_elements': final,
+        'total_elements': _finite_total(
+            'chunkwise_scan_state_elements', 'total elements',
+            checkpoint + transition + source + final),
+    }
+
+
 def kda_read_elements(T: int, hv: int, d_k: int, d_v: int) -> float:
     """Average state elements READ per query by the KDA delta-rule step.
 
