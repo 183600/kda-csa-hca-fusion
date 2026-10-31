@@ -67,10 +67,11 @@ GEMM MACs **exactly** for the tested `T` (including padded `T=100`):
   `k^T@v`.
 * **CSA**: dense indexer masks at `Tp`, `core` on the full `topk` (not
   clamped to the block count), `window` on the sliding window.
-* **HCA**: `core` on `nb` blocks, `window` on the sliding window. Caveat:
-  with a single block (`nb == 1`) the reference folds the PV product into
-  `mul + sum`, so no `bmm` dispatches; the model over-reports by
-  `Tp * c * nh`. Tests allow that documented shortfall.
+* **HCA**: `core` on `nb` blocks, `window` on the sliding window. With a
+  single block (`nb == 1`) the reference folds the PV product into
+  `mul + sum`, so the model subtracts that `Tp * c * nh` term; the same
+  fold is handled for a one-token sliding window and for CSA's
+  `topk == 1` core.
 * **Mamba-2**: in_proj (`2*d_inner`), the depthwise causal short conv,
   x_proj (`dt_rank + 2*G*N`), dt_proj, the sequential scan's per-step
   `baddbmm` readout (`nheads*headdim*d_state`), and out_proj. The state
@@ -83,10 +84,18 @@ GEMM MACs **exactly** for the tested `T` (including padded `T=100`):
   and a non-reference backend raise `NotImplementedError` rather than
   being priced with the sequential model.
 
-`associated_scan` (KDA's alternative core) is not modelled: `audit_layer`
-raises rather than mis-pricing it. Likewise the chunked Mamba-2 scan
-(`mamba_chunk_size > 0`) has a different intra-chunk ledger and is measured
-from the dispatch counter instead of the closed form.
+`kda_assoc_scan` (KDA's full Hillis-Steele chunk scan) is modelled
+exactly: the common prepare terms are shared with the sequential chunk
+path, and `_kda_assoc_scan_extra_macs` adds the per-chunk affine map
+(`M_n`, `b_n`), the `ceil(log2 NT)` doubling levels
+(`E_tail @ E_shift` and `E_tail @ F_shift`), the exclusive prefix and
+final state, plus the `C`/`a`/`C @ S_in` readout. Regression tests pin the
+model to the dispatch counter across chunk counts, padding, batch, and
+GVA. The two-phase `scan_block_size` variant is a direct-call option
+(no `HybridConfig` field) and is not part of the layer-level model.
+Likewise the chunked Mamba-2 scan (`mamba_chunk_size > 0`) has a
+different intra-chunk ledger and is measured from the dispatch counter
+instead of the closed form.
 
 ## Online-softmax oracle
 

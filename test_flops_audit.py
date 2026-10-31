@@ -113,6 +113,10 @@ def _cfg(**overrides):
     return fa.probe_config(**overrides)
 
 
+def cfg_heads():
+    return fa.probe_config().n_heads_qk
+
+
 @pytest.mark.parametrize('T', [8, 32, 63])
 def test_kda_exact_model_recurrent(T, device):
     cfg = _cfg()
@@ -133,6 +137,37 @@ def test_kda_exact_model_chunk(T, device):
     assert row['model_matches_measurement'], (
         f'T={T}: model={row["reference_model_macs"]} '
         f'measured={row["reference_gemm_macs"]}')
+
+
+@pytest.mark.parametrize('T', [64, 128, 100, 256])
+def test_kda_exact_model_assoc_scan(T, device):
+    """The Hillis-Steele scan's affine-map and prefix terms are itemised."""
+    cfg = _cfg(kda_assoc_scan=True)
+    row = fa.audit_layer('kda', cfg, T, device=device)
+    assert row['path'] == 'chunk'
+    assert row['ledger'].trsm_calls > 0
+    assert row['model_matches_measurement'], (
+        f'T={T}: model={row["reference_model_macs"]} '
+        f'measured={row["reference_gemm_macs"]} '
+        f'diff={row["model_minus_measured_macs"]}')
+    assert fa.kda_broadcast_encoded_macs(cfg, T) == 0
+
+
+def test_kda_assoc_scan_short_sequence_uses_recurrent_model(device):
+    """The scan flag is ignored below one chunk, so price the recurrent path."""
+    cfg = _cfg(kda_assoc_scan=True)
+    T = cfg.kda_chunk_size - 1
+    row = fa.audit_layer('kda', cfg, T, device=device)
+    assert row['path'] == 'recurrent'
+    assert row['model_matches_measurement'], row['model_minus_measured_macs']
+
+
+@pytest.mark.parametrize('T', [16, 32, 64])
+def test_kda_assoc_scan_batch_and_gva_scale(T, device):
+    cfg = _cfg(kda_assoc_scan=True, n_heads_v=2 * cfg_heads())
+    row = fa.audit_layer('kda', cfg, T, batch=2, device=device)
+    assert row['model_matches_measurement'], (
+        f'T={T}: diff={row["model_minus_measured_macs"]}')
 
 
 def test_kda_exact_model_padded_sequence(device):
@@ -207,6 +242,17 @@ def test_csa_topk1_folded_value_term_is_not_charged(device):
             f'diff={row["model_minus_measured_macs"]}')
 
 
+def test_csa_single_column_window_fold_is_not_charged(device):
+    """A one-entry window folds its value contraction into mul+sum."""
+    cfg = _cfg(csa_sliding_window=1)
+    for T in (16, 64, 100):
+        row = fa.audit_layer('csa', cfg, T, device=device)
+        assert row['model_matches_measurement'], (
+            f'T={T}: model={row["reference_model_macs"]} '
+            f'measured={row["reference_gemm_macs"]} '
+            f'diff={row["model_minus_measured_macs"]}')
+
+
 def test_hca_exact_model(device):
     cfg = _cfg()
     for T in (96, 128, 100):
@@ -216,12 +262,23 @@ def test_hca_exact_model(device):
             f'measured={row["reference_gemm_macs"]}')
 
 
-def test_hca_single_block_value_fold_documented(device):
+def test_hca_single_block_value_fold_is_exact(device):
+    """A single compressed block folds the value contraction; the model
+    subtracts exactly that term instead of reporting a shortfall."""
     cfg = _cfg()
     row = fa.audit_layer('hca', cfg, 32, device=device)
-    Tp = 32
-    shortfall = row['model_minus_measured_macs']
-    assert 0 <= shortfall <= Tp * cfg.hca_c * cfg.hca_nh
+    assert row['model_matches_measurement'], row['model_minus_measured_macs']
+    assert row['model_minus_measured_macs'] == 0
+
+
+def test_hca_single_column_window_fold_is_not_charged(device):
+    cfg = _cfg(hca_sliding_window=1)
+    for T in (16, 64, 100):
+        row = fa.audit_layer('hca', cfg, T, device=device)
+        assert row['model_matches_measurement'], (
+            f'T={T}: model={row["reference_model_macs"]} '
+            f'measured={row["reference_gemm_macs"]} '
+            f'diff={row["model_minus_measured_macs"]}')
 
 
 def test_geometry_kwargs_matches_exp14_mapping():

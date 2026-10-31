@@ -56,19 +56,21 @@ gap between the two is always visible.
 
 Scope and honesty
 -----------------
-* CPU/fp32 reference path, fresh state, ``batch`` sequences, default
-  flags: ``kda_recompute_attn=False`` / ``kda_assoc_scan=False``.  The
-  associative-scan variant adds batched state-combine matmuls that this
-  model does not itemize (the audit still measures them; the exact-model
-  function raises instead of guessing).
+* CPU/fp32 reference path, fresh state, ``batch`` sequences. The exact
+  model covers both chunk cores: the sequential carry
+  (``kda_recompute_attn`` on/off) and the full Hillis-Steele
+  associative scan (``kda_assoc_scan=True``, including its affine-map
+  build, doubling levels, and prefix/final state materialisation).
+  ``scan_block_size`` is a direct-call option with no ``HybridConfig``
+  field, so it is outside the layer-level audit.
 * The KDA recurrent path implements two of its three per-step contractions
   as elementwise broadcast-reduce (`(k_i * S).sum(-2)` and the
   ``addcmul_`` outer product).  Their MACs are real work but not GEMM
   dispatches; ``kda_broadcast_encoded_macs`` reports them separately.
-* HCA with a single compressed block (``n_blocks == 1``) lets PyTorch fold
-  the value contraction into a mul+sum, so the measured GEMM can fall
-  short of the model by one ``T * c * nh`` term there.  Tests use
-  ``n_blocks >= 2``; the audit reports the raw difference either way.
+* Single-column value contractions (HCA with one compressed block, CSA
+  top-k == 1, or a one-token sliding window) are folded by PyTorch into
+  mul+sum. The exact model subtracts those ``Tp * c * nh`` terms, so the
+  audit remains MAC-exact in those degenerate geometries too.
 
 Usage::
 
@@ -425,14 +427,62 @@ def kda_broadcast_encoded_macs(cfg, T: int, batch: int = 1) -> int:
     return batch * 2 * T * cfg.n_heads_v * cfg.head_dim_k * cfg.head_dim_v
 
 
+def _kda_assoc_scan_extra_macs(batch: int, *,
+                               BT: int, NT: int, HV: int,
+                               K: int, V: int) -> int:
+    """Net MAC change of the full Hillis-Steele KDA chunk scan.
+
+    ``assoc_scan_chunk_kda`` reuses :func:`_chunk_kda_prepare` (so the
+    projections, ``A``/``Aqk`` build, triangular solve, and ``w``/``u``
+    terms are unchanged) but replaces the sequential state carry with
+    per-chunk affine maps:
+
+    * build the map ``M_n = Diag(glast) - kexp_n^T w_n`` (``K x BT x K``)
+      and source ``b_n = kexp_n^T u_n`` (``K x BT x V``);
+    * each doubling level composes ``E_tail @ E_shift``
+      (``K^3``) and ``E_tail @ F_shift`` (``K^2 V``) for the ``NT - off``
+      already-composed rows;
+    * materialise the exclusive prefix ``E[:-1] @ S0 + F[:-1]``
+      (``(NT - 1) K^2 V``) and the final state ``E[-1] @ S0 + F[-1]``
+      (``K^2 V``);
+    * the readout builds ``C = q * gexp - Aqk @ w`` (``BT x BT x K``),
+      ``a = Aqk @ u`` (``BT x BT x V``), and ``o = C @ S_in + a``
+      (``BT x K x V``).
+
+    The sequential inner loop's ``w @ S``, ``q @ S``, ``Aqk @ v`` and
+    ``k^T @ v`` contractions are not executed and therefore never enter
+    the common chunk ledger. All terms carry the ``B * HV`` batch/head
+    factor.
+    """
+    B = batch
+    per_chunk = B * HV * NT * (
+        K * BT * K          # M_n build
+        + K * BT * V        # b_n build
+        + BT * BT * K       # C_n readout
+        + BT * BT * V       # a_n readout
+        + BT * K * V        # C_n @ S_in
+    )
+    levels = (NT - 1).bit_length()
+    scan = B * HV * sum(
+        (NT - 2 ** i) * (K * K * K + K * K * V)
+        for i in range(levels)
+    )
+    prefix = B * HV * (NT - 1) * K * K * V
+    final = B * HV * K * K * V
+    return per_chunk + scan + prefix + final
+
+
 def kda_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
-    """Exact GEMM+TRSM MACs executed by ``KDAHybridLayer`` at length ``T``."""
+    """Exact GEMM+TRSM MACs executed by ``KDAHybridLayer`` at length ``T``.
+
+    Covers the recurrent path, the sequential chunk path, and the
+    associative-scan chunk path (``cfg.kda_assoc_scan``). The scan path's
+    extra affine-map build, doubling levels, prefix/final state
+    materialisation and readout are itemised by
+    :func:`_kda_assoc_scan_extra_macs`; the ``T < chunk_size`` dispatch
+    stays on the recurrent path, where the flag is ignored.
+    """
     _validate('kda', T, batch)
-    if cfg.kda_assoc_scan:
-        raise NotImplementedError(
-            'flops_audit: the associative-scan KDA variant adds batched '
-            'state-combine matmuls that this exact model does not itemize. '
-            'Call measure_forward() to measure it instead.')
     d, H, K, V = cfg.d_model, cfg.n_heads_qk, cfg.head_dim_k, cfg.head_dim_v
     HV, B, BT = cfg.n_heads_v, batch, cfg.kda_chunk_size
     proj = B * T * (d * (2 * H * K + HV * V + K + HV) + K * HV * K)
@@ -453,12 +503,16 @@ def kda_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
     trsm = B * HV * NT * BT * BT * (BT - 1) // 2
     w_macs = B * HV * NT * BT * BT * K
     u_macs = B * HV * NT * BT * BT * V
+    common = (proj + conv + out_proj + a_macs + aqk_macs + trsm
+              + w_macs + u_macs)
+    if cfg.kda_assoc_scan:
+        return common + _kda_assoc_scan_extra_macs(
+            batch, BT=BT, NT=NT, HV=HV, K=K, V=V)
     ws_macs = B * HV * NT * BT * K * V
     qs_macs = B * HV * NT * BT * K * V
     aqv_macs = B * HV * NT * BT * BT * V
     ksv_macs = B * HV * NT * K * BT * V
-    return (proj + conv + out_proj + a_macs + aqk_macs + trsm + w_macs
-            + u_macs + ws_macs + qs_macs + aqv_macs + ksv_macs)
+    return common + ws_macs + qs_macs + aqv_macs + ksv_macs
 
 
 def mamba2_path(cfg) -> str:
@@ -608,6 +662,10 @@ def csa_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
         # one Tp*c*nh GEMM term is not dispatched.
         core -= B * Tp * c * nh
     window = B * 2 * Tp * sw * c * nh if sw > 0 else 0
+    if sw == 1:
+        # A one-column gather folds the value contraction into mul+sum,
+        # exactly like the top-k == 1 core above.
+        window -= B * Tp * c * nh
     return proj + indexer + core + window
 
 
@@ -616,9 +674,9 @@ def hca_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
 
     Mirrors ``ops_hca.naive_hca``: per-token projections on the padded
     sequence, dense shared-KV attention over ALL compressed blocks, and
-    the dense sliding window.  With ``n_blocks == 1`` PyTorch may fold the
-    value contraction into a mul+sum (one ``Tp * c * nh`` term short);
-    tests use ``n_blocks >= 2``.
+    the dense sliding window. With ``n_blocks == 1`` (or a one-token
+    window) PyTorch folds the value contraction into a mul+sum, so the
+    corresponding ``Tp * c * nh`` GEMM term is not charged.
     """
     _validate('hca', T, batch)
     d, c, dc = cfg.d_model, cfg.hca_c, cfg.hca_dc
@@ -627,7 +685,14 @@ def hca_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
     nb = Tp // m2
     proj = B * (Tp * d * (2 * c + dc) + Tp * dc * c * nh + T * nh * c * d)
     core = B * 2 * Tp * nb * c * nh if nb > 0 else 0
+    if nb == 1:
+        # With a single compressed block the value contraction folds into
+        # mul+sum (same PyTorch behaviour as CSA's top-k == 1 core).
+        core -= B * Tp * c * nh
     window = B * 2 * Tp * sw * c * nh if sw > 0 else 0
+    if sw == 1:
+        # A one-column gather folds the value contraction into mul+sum.
+        window -= B * Tp * c * nh
     return proj + core + window
 
 
