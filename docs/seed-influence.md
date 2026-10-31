@@ -153,4 +153,6 @@ rep['drops'][5]['mean_diff']  # the remaining mean after deleting seed 5
 
 For the complementary question — whether an ordering replicates across
 all `(task, n_kv)` cells rather than within one cell — see
-[cross-cell-replication.md](cross-cell-replication.md).
+[cross-cell-replication.md](cross-cell-replication.md). For whether a
+**data-selected winner** survives on held-out seeds (the winner's curse),
+see [selection-inference.md](selection-inference.md).

@@ -577,6 +577,14 @@ and never upgrades a claim. See
 [seed-influence.md](seed-influence.md) for the status definitions and the
 `n = 6` exact-test caveat.
 
+A different post-run question is whether the **data-selected winner**
+survives on held-out seeds. `multi_seed_stats.split_half_selection_validation`
+selects the best operator on one seed half and evaluates it on the other, and
+`run_quality` records the result as `selection_validation` in each cell
+(`stable` / `fragile` / `unstable` / `insufficient_data`). It is a descriptive
+winner's-curse diagnostic, not a test, and cannot upgrade a claim. See
+[selection-inference.md](selection-inference.md).
+
 ## Limitations
 
 * The normal approximation is optimistic at small n; treat the target power as

@@ -825,8 +825,9 @@ def main():
     cross_op_checks = {}
     for (task_name, n_kv_key), rows in groups.items():
         cell_key = f'{task_name}/n_kv={n_kv_key}'
-        cell_res = ((op_pairwise.get('cells', {}).get(cell_key) or {})
-                    .get('resolution'))
+        cell_report = op_pairwise.get('cells', {}).get(cell_key) or {}
+        cell_res = cell_report.get('resolution')
+        selection_validation = cell_report.get('selection_validation')
         live = [r for r in rows if 'error' not in r
                 and r.get('mean_acc') is not None
                 and r.get('mean_train_time_s') is not None
@@ -932,6 +933,25 @@ def main():
                     equiv_claim = (
                         'No op is declared practically equivalent to it at '
                         'the pre-specified margin.')
+            selection_note = ''
+            if selection_validation is not None:
+                sel_status = selection_validation.get('status')
+                sel_freq = selection_validation.get(
+                    'full_winner_selection_frequency')
+                if sel_status in ('fragile', 'unstable'):
+                    freq_str = (f'{sel_freq:.0%}'
+                                if isinstance(sel_freq, (int, float))
+                                else 'n/a')
+                    selection_note = (
+                        f" Split-half seed validation selects the "
+                        f"full-data winner on {freq_str} of held-out seed "
+                        f"halves (status={sel_status}); the ranking is not "
+                        f"a replicated ordering.")
+                elif sel_status == 'insufficient_data':
+                    selection_note = (
+                        ' Split-half seed validation is unavailable at this '
+                        'seed count; the ranking is not independently '
+                        'validated.')
             cross_op_checks[f'{task_name}/n_kv={n_kv_key}'] = {
                 'best_op': best['op'],
                 'best_mean_acc': best['mean_acc'],
@@ -944,6 +964,7 @@ def main():
                     best_equiv_to if equivalence_margin is not None
                     else None),
                 'family_resolution': cell_res,
+                'selection_validation': selection_validation,
                 'paired_test_note': (
                     'CI overlap is a continuity heuristic, not a test: '
                     'overlapping CIs do not imply a non-significant '
@@ -957,7 +978,8 @@ def main():
                     + (f"Its 95% CI overlaps {overlaps}."
                        if overlaps else
                        "Its 95% CI is disjoint from every other op.")
-                    + (f" {equiv_claim}" if equiv_claim else '')),
+                    + (f" {equiv_claim}" if equiv_claim else '')
+                    + selection_note),
             }
             if not best_sig_wins:
                 logger.warning(

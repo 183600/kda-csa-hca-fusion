@@ -91,6 +91,11 @@ the whole pipeline for a list of seed-paired differences:
     the memory route?" or "does removing RoPE hurt more when selection is
     dense?" needs the paired interaction estimand, not two separate
     within-route tests read side by side.
+15. :func:`split_half_selection_validation` — a descriptive check of a
+    DATA-SELECTED winner: select on one seed half, evaluate on the other,
+    and report how often the full-data winner survives. This labels the
+    winner's curse instead of quoting the selected mean's naive CI as if
+    it were an unbiased estimate.
 
 Design constraints
 ------------------
@@ -116,6 +121,7 @@ runner. The two implementations agree to <1e-9 on the shared domain.
 """
 from __future__ import annotations
 
+import itertools
 import math
 import random
 from decimal import Decimal, localcontext
@@ -145,6 +151,7 @@ __all__ = [
     'binomial_proportion_ci',
     'median_order_statistic_ci',
     'cross_cell_paired_analysis',
+    'split_half_selection_validation',
 ]
 
 # ---------------------------------------------------------------------------
@@ -2262,6 +2269,272 @@ def cross_cell_paired_analysis(cells, *, alpha: float = 0.05,
             'replicated ordering. Significance requires the caller\'s '
             'multiplicity correction on primary.'),
     }
+
+
+def split_half_selection_validation(cells, *, min_seeds: int = 4,
+                                    stability_threshold: float = 0.8,
+                                    fragile_threshold: float = 0.5,
+                                    max_partitions: int = 4096) -> dict:
+    """Check whether a data-selected winner survives on held-out seeds.
+
+    ``cells`` maps a candidate name to its ``seed -> metric`` mapping. The
+    ordinary per-cell report selects the candidate with the highest
+    full-data mean and then describes it as "the best". That label is
+    data-dependent: with 5-7 seeds the maximum of several noisy means is
+    biased upward (the winner's curse), and the plain CI around the winner
+    is not a CI for the winner's population mean. This function asks the
+    complementary, descriptive question: **would the winner have been
+    selected on only part of the seed block, and does it still win on the
+    held-out seeds?**
+
+    Method: intersect the seed sets (complete-case, as everywhere else),
+    enumerate all balanced seed-half partitions of size ``n // 2``, and for
+    each partition select the winner on one half and evaluate it on the
+    complement. Both directions are evaluated (small-half selection for an
+    odd seed count; both halves for an even one). The reported statistics
+    are:
+
+    * ``full_winner_selection_frequency`` — how often the full-data winner
+      is selected on a half;
+    * ``full_winner_holdout_top1_rate`` — how often the full-data winner
+      actually has the highest mean on the held-out half;
+    * ``mean_selection_optimism`` — mean(selection-half mean - holdout
+      mean) for the selected candidate. Selection noise makes this
+      positive; it is the direct winner's-curse estimate;
+    * ``cross_fitted_selected_mean`` — the mean holdout value of the
+      selected candidate, i.e. an honest estimate of "the candidate this
+      procedure picks";
+    * ``selection_frequency`` / ``holdout_best_frequency`` — per-candidate
+      selection rates, so a near-tie between several candidates is visible.
+
+    The ``status`` is ``stable``, ``fragile`` or ``unstable`` when the
+    full-data winner is selected on at least ``stability_threshold``,
+    ``fragile_threshold`` or fewer partitions respectively, and
+    ``insufficient_data`` when fewer than ``min_seeds`` seeds are common
+    to at least two candidates. The function is deterministic (ties break
+    by candidate name), uses no global RNG, and returns strict-JSON-safe
+    values.
+
+    This is **not** a hypothesis test and never upgrades a claim: it
+    reuses the same seeds, returns no p-value, is not multiplicity-
+    corrected, and cannot turn a non-significant contrast into a
+    significant one. It only labels the stability of a data-driven
+    ranking.
+    """
+    if (isinstance(min_seeds, bool) or not isinstance(min_seeds, int)
+            or min_seeds < 2):
+        raise ValueError(
+            f'min_seeds must be an int >= 2, got {min_seeds!r}')
+    if (isinstance(max_partitions, bool)
+            or not isinstance(max_partitions, int) or max_partitions < 1):
+        raise ValueError(
+            f'max_partitions must be a positive int, got {max_partitions!r}')
+    thresholds = {}
+    for label, value in (
+            ('stability_threshold', stability_threshold),
+            ('fragile_threshold', fragile_threshold)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f'{label} must be a real number, got {value!r}')
+        try:
+            value = float(value)
+        except OverflowError:
+            raise ValueError(
+                f'{label} must be a finite number in [0, 1]') from None
+        if not math.isfinite(value) or not (0.0 <= value <= 1.0):
+            raise ValueError(
+                f'{label} must be a finite number in [0, 1], got {value!r}')
+        thresholds[label] = value
+    if thresholds['fragile_threshold'] > thresholds['stability_threshold']:
+        raise ValueError(
+            'fragile_threshold must not exceed stability_threshold, got '
+            f"{thresholds['fragile_threshold']!r} > "
+            f"{thresholds['stability_threshold']!r}")
+    if hasattr(cells, 'items'):
+        items = list(cells.items())
+    else:
+        items = list(cells)
+    cleaned: dict[str, dict[int, float]] = {}
+    for name, cell in items:
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f'candidate names must be non-empty strings, got {name!r}')
+        if name in cleaned:
+            raise ValueError(f'duplicate candidate name {name!r}')
+        cleaned[name] = _clean_seed_cell(
+            cell, name, caller='split_half_selection_validation')
+    names = list(cleaned)
+    usable = [name for name in names if cleaned[name]]
+    groups_without_values = [name for name in names if not cleaned[name]]
+    common = (sorted(set.intersection(
+        *(set(cleaned[name]) for name in usable))) if usable else [])
+    dropped_seeds = (sorted(set().union(
+        *(set(cleaned[name]) for name in usable)) - set(common))
+        if usable else [])
+    full_means = {
+        name: _safe_mean([cleaned[name][seed] for seed in common])
+        for name in usable} if common else {}
+    full_order = sorted(usable, key=lambda name: (-full_means[name], name))
+    full_best = full_order[0] if full_order else None
+    base = {
+        'method': 'split_half_seed_selection_validation',
+        'definition': (
+            'for every balanced seed-half partition, select the candidate '
+            'with the highest mean on one half and evaluate it on the '
+            'complement; repeat in the reverse direction'),
+        'n_candidates': len(names),
+        'n_candidates_used': len(usable),
+        'candidate_names': [name for name in usable],
+        'candidates_without_values': groups_without_values,
+        'n_seeds_common': len(common),
+        'common_seeds': common,
+        'n_seeds_dropped': len(dropped_seeds),
+        'dropped_seeds': dropped_seeds,
+        'min_seeds': min_seeds,
+        'stability_threshold': thresholds['stability_threshold'],
+        'fragile_threshold': thresholds['fragile_threshold'],
+        'full_data_best': full_best,
+        'full_data_best_mean': (full_means[full_best]
+                                if full_best is not None else None),
+        'full_ranking': [
+            {'candidate': name, 'mean': full_means[name], 'rank': rank + 1}
+            for rank, name in enumerate(full_order)],
+        'n_combinations_total': 0,
+        'n_combinations_used': 0,
+        'partition_sampling': None,
+        'partitions_truncated': False,
+        'n_selection_events': 0,
+        'selection_frequency': {},
+        'holdout_best_frequency': {},
+        'full_winner_selection_frequency': None,
+        'full_winner_holdout_top1_rate': None,
+        'full_winner_mean_holdout_rank': None,
+        'top1_agreement_rate': None,
+        'mean_selected_selection_half_value': None,
+        'mean_selected_holdout_value': None,
+        'cross_fitted_selected_mean': None,
+        'mean_selection_optimism': None,
+        'status': 'insufficient_data',
+        'note': (
+            'Descriptive seed-resampling check, not a hypothesis test: it '
+            'reuses the same seeds, returns no p-value, is not '
+            'multiplicity-corrected, and never upgrades a claim. It labels '
+            'whether a DATA-SELECTED winner survives on held-out seeds, '
+            'not whether a pre-registered contrast is significant.'),
+    }
+    if len(usable) < 2 or len(common) < min_seeds:
+        return base
+    half = len(common) // 2
+    total = math.comb(len(common), half)
+    if total <= max_partitions:
+        sampled_combinations = list(itertools.combinations(common, half))
+        partition_sampling = 'exhaustive'
+    else:
+        # Deterministic local RNG: do not iterate a combinatorial number
+        # of partitions (C(100, 50) is not enumerable). The seed is derived
+        # from the candidate names and seed ids, never from the global RNG,
+        # so reruns and JSON comparisons are stable.
+        rng_seed = 0
+        for name in sorted(usable):
+            for char in name:
+                rng_seed = ((rng_seed * 131) + ord(char)) % (2 ** 31 - 1)
+        for seed in common:
+            rng_seed = ((rng_seed * 1_000_003) + int(seed) + 1) % (2 ** 31 - 1)
+        rng = random.Random(rng_seed)
+        sampled = set()
+        target = min(total, max_partitions)
+        attempts = 0
+        while len(sampled) < target and attempts < target * 20 + 100:
+            sampled.add(tuple(sorted(rng.sample(common, half))))
+            attempts += 1
+        sampled_combinations = sorted(sampled)
+        partition_sampling = 'deterministic_random_balanced_sample'
+    selection_counts = {name: 0 for name in usable}
+    holdout_counts = {name: 0 for name in usable}
+    n_events = 0
+    n_combinations_used = 0
+    top1_agreement = 0
+    full_winner_selected = 0
+    full_winner_holdout_top1 = 0
+    full_winner_rank_sum = 0
+    selection_value_sum = 0.0
+    holdout_value_sum = 0.0
+    cross_fitted_sum = 0.0
+    common_list = list(common)
+    for combo in sampled_combinations:
+        selected_seeds = tuple(combo)
+        chosen = set(selected_seeds)
+        complement = tuple(seed for seed in common_list if seed not in chosen)
+        n_combinations_used += 1
+        directions = [(selected_seeds, complement)]
+        if len(common) % 2:
+            directions.append((complement, selected_seeds))
+        for selection_seeds, evaluation_seeds in directions:
+            selection_means = {
+                name: _safe_mean(
+                    [cleaned[name][seed] for seed in selection_seeds])
+                for name in usable}
+            evaluation_means = {
+                name: _safe_mean(
+                    [cleaned[name][seed] for seed in evaluation_seeds])
+                for name in usable}
+            selected = min(
+                usable, key=lambda name: (-selection_means[name], name))
+            holdout_best = min(
+                usable, key=lambda name: (-evaluation_means[name], name))
+            n_events += 1
+            selection_counts[selected] += 1
+            holdout_counts[holdout_best] += 1
+            top1_agreement += int(holdout_best == selected)
+            selection_value_sum += selection_means[selected]
+            holdout_value_sum += evaluation_means[selected]
+            cross_fitted_sum += evaluation_means[selected]
+            if selected == full_best:
+                full_winner_selected += 1
+            full_winner_value = evaluation_means[full_best]
+            full_winner_rank = 1 + sum(
+                1 for name in usable
+                if evaluation_means[name] > full_winner_value)
+            full_winner_rank_sum += full_winner_rank
+            full_winner_holdout_top1 += int(holdout_best == full_best)
+    if n_events == 0:
+        return base
+    selection_frequency = {
+        name: selection_counts[name] / n_events for name in usable}
+    holdout_frequency = {
+        name: holdout_counts[name] / n_events for name in usable}
+    full_winner_selection_frequency = selection_frequency[full_best]
+    if full_winner_selection_frequency >= thresholds['stability_threshold']:
+        status = 'stable'
+    elif full_winner_selection_frequency >= thresholds['fragile_threshold']:
+        status = 'fragile'
+    else:
+        status = 'unstable'
+    report = dict(base)
+    report.update({
+        'n_combinations_total': total,
+        'n_combinations_used': n_combinations_used,
+        'partition_sampling': partition_sampling,
+        'partitions_truncated': bool(n_combinations_used < total),
+        'n_selection_events': n_events,
+        'n_full_winner_selected': full_winner_selected,
+        'selection_frequency': selection_frequency,
+        'holdout_best_frequency': holdout_frequency,
+        'full_winner_selection_frequency': (
+            full_winner_selection_frequency),
+        'full_winner_holdout_top1_rate': (
+            full_winner_holdout_top1 / n_events),
+        'full_winner_mean_holdout_rank': (
+            full_winner_rank_sum / n_events),
+        'top1_agreement_rate': top1_agreement / n_events,
+        'mean_selected_selection_half_value': (
+            selection_value_sum / n_events),
+        'mean_selected_holdout_value': holdout_value_sum / n_events,
+        'cross_fitted_selected_mean': cross_fitted_sum / n_events,
+        'mean_selection_optimism': (
+            (selection_value_sum - holdout_value_sum) / n_events),
+        'status': status,
+    })
+    return report
 
 
 def sign_test(diffs, *, alpha: float = 0.05) -> dict:

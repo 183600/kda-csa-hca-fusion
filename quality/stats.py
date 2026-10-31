@@ -6,6 +6,8 @@ from statistics import NormalDist
 
 from ._shared import *  # noqa: F401,F403
 
+from multi_seed_stats import split_half_selection_validation  # noqa: F401
+
 
 _T_PP = None
 _T_ISF = None
@@ -989,6 +991,10 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         'n_boundary_sensitive': 0,
         'n_seed_influence_stable': 0,
         'n_resolution_limited': 0,
+        'n_selection_stable': 0,
+        'n_selection_fragile': 0,
+        'n_selection_unstable': 0,
+        'n_selection_insufficient': 0,
         'resolution': None,
         'equivalence': {
             'enabled': equivalence_margin is not None,
@@ -1018,9 +1024,18 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
     for (task_name, n_kv_key), rows in groups.items():
         cell_key = f'{task_name}/n_kv={n_kv_key}'
         rows_sorted = sorted(rows, key=lambda r: str(r.get('op')))
+        selection_cells = {}
+        for index, row in enumerate(rows_sorted):
+            candidate = str(row.get('op'))
+            while candidate in selection_cells:
+                candidate = f'{candidate}#{index}'
+            selection_cells[candidate] = _finite_per_seed_acc(
+                row.get('per_seed', []))
         cell = {'n_tests': 0, 'n_significant': 0, 'n_skipped': 0,
                 'n_equivalent': 0, 'n_direction_fragile': 0,
                 'n_boundary_sensitive': 0, 'n_seed_influence_stable': 0,
+                'selection_validation': split_half_selection_validation(
+                    selection_cells),
                 'pairs': OrderedDict()}
         records = []
         for i in range(len(rows_sorted)):
@@ -1161,6 +1176,15 @@ def _pairwise_op_comparisons(all_results, alpha=0.05, seed=0,
         report['n_boundary_sensitive'] += cell['n_boundary_sensitive']
         report['n_seed_influence_stable'] += cell['n_seed_influence_stable']
         report['n_resolution_limited'] += cell['n_resolution_limited']
+        selection_status = cell['selection_validation']['status']
+        if selection_status == 'stable':
+            report['n_selection_stable'] += 1
+        elif selection_status == 'fragile':
+            report['n_selection_fragile'] += 1
+        elif selection_status == 'unstable':
+            report['n_selection_unstable'] += 1
+        else:
+            report['n_selection_insufficient'] += 1
 
     report['cross_cell_replication'] = _cross_cell_pairwise_report(
         pair_cell_diffs, alpha=alpha, n_boot=n_boot,
@@ -1320,4 +1344,5 @@ __all__ = [
     '_pairwise_family_resolution',
     '_pairwise_op_comparisons',
     '_print_pairwise_report',
+    'split_half_selection_validation',
 ]

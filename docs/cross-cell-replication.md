@@ -155,5 +155,7 @@ replication.
   tests.
 
 See [seed-influence.md](seed-influence.md) for the single-seed
-leave-one-out check and [inference-resolution.md](inference-resolution.md)
-for the exact-test resolution floor.
+leave-one-out check, [selection-inference.md](selection-inference.md) for
+the split-half validation of a data-selected winner, and
+[inference-resolution.md](inference-resolution.md) for the exact-test
+resolution floor.

@@ -1011,6 +1011,22 @@ def test_pairwise_op_comparisons_skips_when_fewer_than_two_common_seeds():
     assert 'pairwise_tests' not in a
 
 
+def test_pairwise_op_comparisons_attaches_selection_validation():
+    rows = [_row('op_a', [0.9] * 6), _row('op_b', [0.1] * 6)]
+    report = _pairwise_op_comparisons(rows, alpha=0.05, seed=0,
+                                      n_boot=200, n_permutations=200)
+    cell = report['cells']['mqar/n_kv=1']
+    sv = cell['selection_validation']
+    json.dumps(sv, allow_nan=False)
+    assert sv['status'] == 'stable'
+    assert sv['full_data_best'] == 'op_a'
+    assert sv['full_winner_selection_frequency'] == 1.0
+    assert report['n_selection_stable'] == 1
+    assert report['n_selection_fragile'] == 0
+    assert report['n_selection_unstable'] == 0
+    assert report['n_selection_insufficient'] == 0
+
+
 def test_pairwise_op_comparisons_holm_family_spans_the_cell():
     # Three ops in one cell -> 3 pairwise tests in one Holm family; a
     # marginal raw p-value must be adjusted upwards.
@@ -1788,3 +1804,126 @@ def test_incomplete_beta_huge_complement_shape_keeps_mode_accuracy():
             want, rel=1e-12)
         assert M._log_betainc_regularized(a, b, x) == pytest.approx(
             math.log(want), abs=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Split-half selection validation (winner's-curse diagnostic)
+# ---------------------------------------------------------------------------
+
+def test_split_half_selection_validation_stable_dominant_winner():
+    common = list(range(42, 48))
+    cells = {
+        'a': {s: 0.90 + 0.01 * (s - 42) for s in common},
+        'b': {s: 0.60 + 0.01 * (s - 42) for s in common},
+        'c': {s: 0.70 + 0.01 * (s - 42) for s in common},
+    }
+    rep = M.split_half_selection_validation(cells)
+    json.dumps(rep, allow_nan=False)
+    assert rep['status'] == 'stable'
+    assert rep['full_data_best'] == 'a'
+    assert rep['full_winner_selection_frequency'] == 1.0
+    assert rep['full_winner_holdout_top1_rate'] == 1.0
+    assert rep['top1_agreement_rate'] == 1.0
+    assert rep['n_selection_events'] > 0
+    assert rep['n_seeds_common'] == 6
+    assert rep['partition_sampling'] == 'exhaustive'
+    assert [row['candidate'] for row in rep['full_ranking']] == ['a', 'c', 'b']
+
+
+def test_split_half_selection_validation_exposes_winner_curse():
+    # 'a' wins on the full block only because seed 42 is an outlier. In
+    # half the partitions the outlier is in the selection half (a is
+    # selected, then fails on the held-out half); in the other half it is
+    # in the held-out half (b is selected, then loses to a). The full-data
+    # winner is therefore selected only half the time, and the held-out
+    # top-1 never agrees with the selection.
+    common = list(range(8))
+    cells = {
+        'a': {s: (0.90 if s == 0 else 0.10) for s in common},
+        'b': {s: 0.19 for s in common},
+    }
+    rep = M.split_half_selection_validation(cells)
+    json.dumps(rep, allow_nan=False)
+    assert rep['status'] == 'fragile'
+    assert rep['full_data_best'] == 'a'
+    assert rep['full_winner_selection_frequency'] == pytest.approx(0.5)
+    assert rep['full_winner_holdout_top1_rate'] == pytest.approx(0.5)
+    assert rep['top1_agreement_rate'] == 0.0
+    assert rep['mean_selection_optimism'] == pytest.approx(0.1)
+    assert rep['cross_fitted_selected_mean'] == pytest.approx(0.145)
+    assert rep['selection_frequency']['a'] == pytest.approx(0.5)
+    assert rep['selection_frequency']['b'] == pytest.approx(0.5)
+
+
+def test_split_half_selection_validation_uses_common_seeds_and_reports_drops():
+    cells = {
+        'a': {42: 0.9, 43: 0.9, 44: 0.9, 45: 0.9, 46: 0.9},
+        'b': {42: 0.1, 43: 0.1, 44: 0.1, 45: 0.1},
+    }
+    rep = M.split_half_selection_validation(cells)
+    assert rep['common_seeds'] == [42, 43, 44, 45]
+    assert rep['dropped_seeds'] == [46]
+    assert rep['n_seeds_dropped'] == 1
+    assert rep['n_seeds_common'] == 4
+    assert rep['status'] == 'stable'
+
+
+def test_split_half_selection_validation_insufficient_and_empty_groups():
+    few = M.split_half_selection_validation({
+        'a': {42: 1.0, 43: 1.0, 44: 1.0},
+        'b': {42: 0.0, 43: 0.0, 44: 0.0},
+    })
+    assert few['status'] == 'insufficient_data'
+    assert few['full_winner_selection_frequency'] is None
+    one = M.split_half_selection_validation({'a': {42: 1.0}})
+    assert one['status'] == 'insufficient_data'
+    empty = M.split_half_selection_validation({
+        'a': {42: 1.0, 43: 1.0, 44: 1.0, 45: 1.0},
+        'b': {},
+    })
+    assert empty['status'] == 'insufficient_data'
+    assert empty['candidates_without_values'] == ['b']
+
+
+def test_split_half_selection_validation_caps_partitions_deterministically():
+    common = list(range(16))
+    cells = {
+        'a': {s: (1.0 if s % 4 == 0 else 0.2) for s in common},
+        'b': {s: 0.3 for s in common},
+        'c': {s: 0.1 for s in common},
+    }
+    first = M.split_half_selection_validation(cells, max_partitions=10)
+    second = M.split_half_selection_validation(cells, max_partitions=10)
+    assert first == second
+    assert first['n_combinations_total'] == math.comb(16, 8)
+    assert first['n_combinations_used'] == 10
+    assert first['partitions_truncated'] is True
+    assert first['partition_sampling'] == (
+        'deterministic_random_balanced_sample')
+    assert first['n_selection_events'] == 10
+    json.dumps(first, allow_nan=False)
+
+
+def test_split_half_selection_validation_validates_inputs():
+    cells = {'a': {42: 1.0, 43: 1.0}, 'b': {42: 0.0, 43: 0.0}}
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation(cells, min_seeds=1)
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation(cells, max_partitions=0)
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation(cells, stability_threshold=1.1)
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation(
+            cells, fragile_threshold=0.9, stability_threshold=0.8)
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation({'': {42: 1.0}})
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation({'a': {True: 1.0}})
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation({'a': {42: float('nan')}})
+    one_common = M.split_half_selection_validation(
+        {'a': {42: 1.0}, 'a2': {42: 0.0}}, min_seeds=2)
+    assert one_common['status'] == 'insufficient_data'
+    with pytest.raises(ValueError):
+        M.split_half_selection_validation([('a', {42: 1.0}),
+                                           ('a', {42: 0.0})])
