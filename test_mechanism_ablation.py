@@ -664,6 +664,22 @@ def test_exp8_smoke_envelope():
             _ok('design metadata documents the diagnostic',
                 'gold_recall_definition' in payload.get('metadata', {})
                 and 'caveats' in payload.get('metadata', {}), '')
+            schedule = payload.get('metadata', {}).get(
+                'execution_schedule', {})
+            _ok('runner records the balanced schedule it executed',
+                schedule.get('n_runs') == 2
+                and schedule.get('matches_planned_schedule') is True
+                and bool(schedule.get('schedule_sha256'))
+                and bool(schedule.get('observed_sha256')),
+                f'schedule={schedule}')
+            design_meta = payload.get('metadata', {}).get(
+                'experiment_design', {})
+            order = design_meta.get('execution_order') or {}
+            _ok('runner passes its observed order to the design audit',
+                design_meta.get('checks', {})
+                .get('execution_order_provided') is True
+                and order.get('matches_planned_schedule') is True,
+                f"order_status={order.get('status')}")
             audit = payload.get('metadata', {}).get('ablation_design', {})
             _ok('ablation-design audit embedded in metadata',
                 audit.get('status') == 'incomplete'

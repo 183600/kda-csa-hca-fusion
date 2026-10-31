@@ -160,6 +160,7 @@ from results_analysis import (binary_ranking_metrics,
                               expected_average_precision)
 from results_schema import write as write_schema
 from experiment_design import (audit_run as audit_experiment_design,
+                               balanced_execution_schedule,
                                common_analyzed_seeds)
 from multi_seed_stats import (
     interaction_contrast, min_detectable_effect, seeds_required,
@@ -1991,6 +1992,109 @@ def main():
     alpha_corrected = 0.05 / n_tests if n_tests else None
 
     seeds = [42 + i for i in range(n_seeds)]
+    # Execution order is part of the design. Materialize the pre-registered
+    # balanced schedule for the ACTUAL opt-in levels (MECH_VARIANTS / MECH_NKV)
+    # and train in that order: every seed is a complete block of every cell,
+    # with the cell order rotated across blocks. Without this, a
+    # variant-major loop aliases treatment with time / allocator state /
+    # device-frequency drift even when each seed block is complete.
+    run_levels = {
+        'variant': [v['name'] for v in variants],
+        'n_kv': list(n_kv_list),
+    }
+    schedule = balanced_execution_schedule(
+        'exp8_mechanism', seeds, levels=run_levels)
+    logger.info(f'\nBalanced execution schedule: {schedule["schedule_id"]} '
+                f'({schedule["n_runs"]} runs in '
+                f'{schedule["n_blocks"]} seed block(s), '
+                f'{schedule["n_cells"]} cell(s) per block)')
+    variant_by_name = {v['name']: v for v in variants}
+    per_cell = {(name, n_kv): [] for name in run_levels['variant']
+                for n_kv in n_kv_list}
+    observed_execution = []
+    for block_index, block in enumerate(schedule['blocks']):
+        seed = schedule['seeds'][block_index]
+        logger.info(f'\n{"=" * 70}')
+        logger.info(f'  seed block {block_index + 1}/{schedule["n_blocks"]} '
+                    f'(seed={seed}, {len(block)} cells)')
+        logger.info(f'{"=" * 70}')
+        for cell_index in block:
+            cell = schedule['cells'][cell_index]
+            variant = variant_by_name[cell['variant']]
+            n_kv = cell['n_kv']
+            logger.info(f'\n-- variant {variant["name"]} '
+                        f'(n_kv={n_kv}, seed={seed}) --')
+            t0 = time.time()
+            try:
+                record = train_variant(
+                    variant, seed=seed, steps=steps, device=device,
+                    n_kv=n_kv, train_batch=train_batch, lr=lr,
+                    error_batches=error_batches,
+                    error_batch=error_batch,
+                    max_error_examples=error_examples)
+                record['train_time_s'] = time.time() - t0
+                logger.info(
+                    f'    seed {seed}: acc={record["final_acc"]:.4f}  '
+                    f'loss={record["final_loss"]:.4f}  '
+                    f'recall={_fmt_recall(record["gold_recall"])}  '
+                    f'fwd={record["fwd_ms"]:.2f}ms  '
+                    f'time={record["train_time_s"]:.1f}s')
+            except Exception as e:
+                logger.warning(f'    seed {seed} FAILED: {e}')
+                record = {
+                    'variant': variant['name'], 'n_kv': n_kv,
+                    'seed': seed, 'steps': steps,
+                    'train_batch': train_batch,
+                    'lr': lr,
+                    'rope': bool(variant['rope']),
+                    'topk': int(variant['topk']),
+                    'use_ste': bool(variant['use_ste']),
+                    'final_acc': None, 'final_loss': None,
+                    'fwd_ms': None, 'n_params': None, 'n_layers': None,
+                    'last_train_loss': None, 'mean_last10_loss': None,
+                    'loss_curve': [], 'acc_curve': [],
+                    'gradient_norms': None,
+                    # Mirror the success-row diagnostic schema
+                    # (held-out curve + bad cases) so
+                    # pd.DataFrame(per_seed) has uniform columns.
+                    'val_every': None,
+                    'val_history': [],
+                    'curve_diagnosis': None,
+                    'generalization_gap': None,
+                    'best_val': None,
+                    'val_loss_first': None, 'val_loss_last': None,
+                    'val_acc_first': None, 'val_acc_last': None,
+                    'val_acc_peak': None,
+                    'error_analysis': None,
+                    'error_analysis_seed_offset':
+                        ERROR_ANALYSIS_SEED_OFFSET,
+                    'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
+                    'gold_recall': None,
+                    # Mirror the success-row diagnostic schema so
+                    # pd.DataFrame(per_seed) has uniform columns.
+                    'gold_recall_n_samples': 0,
+                    'gold_topk_effective': None,
+                    'gold_n_available_blocks': None,
+                    'chance_gold_recall': None,
+                    'gold_pr_auc': None, 'gold_roc_auc': None,
+                    'gold_mrr': None, 'gold_top1_recall': None,
+                    'gold_pr_auc_pooled': None,
+                    'gold_roc_auc_pooled': None,
+                    'chance_gold_pr_auc': None,
+                    'chance_gold_roc_auc': None,
+                    'chance_gold_mrr': None,
+                    'gold_n_ranking_queries': 0,
+                    'gold_recall_skipped_reason': None,
+                    'layout': None,
+                    'error': str(e),
+                    'train_time_s': time.time() - t0,
+                }
+            per_cell[(variant['name'], n_kv)].append(record)
+            observed_execution.append({
+                'variant': variant['name'], 'n_kv': n_kv, 'seed': seed})
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
     all_rows = []
     for n_kv in n_kv_list:
         logger.info(f'\n{"=" * 70}')
@@ -1999,84 +2103,9 @@ def main():
         baseline_acc = {}
         baseline_pr_auc = {}
         for variant in variants:
-            logger.info(f'\n-- variant {variant["name"]} '
-                        f'(rope={variant["rope"]}, topk={variant["topk"]}, '
-                        f'ste={variant["use_ste"]}, n_seeds={n_seeds}) --')
-            per_seed = []
-            for seed in seeds:
-                t0 = time.time()
-                try:
-                    record = train_variant(
-                        variant, seed=seed, steps=steps, device=device,
-                        n_kv=n_kv, train_batch=train_batch, lr=lr,
-                        error_batches=error_batches,
-                        error_batch=error_batch,
-                        max_error_examples=error_examples)
-                    record['train_time_s'] = time.time() - t0
-                    logger.info(
-                        f'    seed {seed}: acc={record["final_acc"]:.4f}  '
-                        f'loss={record["final_loss"]:.4f}  '
-                        f'recall={_fmt_recall(record["gold_recall"])}  '
-                        f'fwd={record["fwd_ms"]:.2f}ms  '
-                        f'time={record["train_time_s"]:.1f}s')
-                    per_seed.append(record)
-                except Exception as e:
-                    logger.warning(f'    seed {seed} FAILED: {e}')
-                    per_seed.append({
-                        'variant': variant['name'], 'n_kv': n_kv,
-                        'seed': seed, 'steps': steps,
-                        'train_batch': train_batch,
-                        'lr': lr,
-                        'rope': bool(variant['rope']),
-                        'topk': int(variant['topk']),
-                        'use_ste': bool(variant['use_ste']),
-                        'final_acc': None, 'final_loss': None,
-                        'fwd_ms': None, 'n_params': None, 'n_layers': None,
-                        'last_train_loss': None, 'mean_last10_loss': None,
-                        'loss_curve': [], 'acc_curve': [],
-                        'gradient_norms': None,
-                        # Mirror the success-row diagnostic schema
-                        # (held-out curve + bad cases) so
-                        # pd.DataFrame(per_seed) has uniform columns.
-                        'val_every': None,
-                        'val_history': [],
-                        'curve_diagnosis': None,
-                        'generalization_gap': None,
-                        'best_val': None,
-                        'val_loss_first': None, 'val_loss_last': None,
-                        'val_acc_first': None, 'val_acc_last': None,
-                        'val_acc_peak': None,
-                        'error_analysis': None,
-                        'error_analysis_seed_offset':
-                            ERROR_ANALYSIS_SEED_OFFSET,
-                        'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
-                        'gold_recall': None,
-                        # Mirror the success-row diagnostic schema so
-                        # pd.DataFrame(per_seed) has uniform columns.
-                        'gold_recall_n_samples': 0,
-                        'gold_topk_effective': None,
-                        'gold_n_available_blocks': None,
-                        'chance_gold_recall': None,
-                        'gold_pr_auc': None, 'gold_roc_auc': None,
-                        'gold_mrr': None, 'gold_top1_recall': None,
-                        'gold_pr_auc_pooled': None,
-                        'gold_roc_auc_pooled': None,
-                        'chance_gold_pr_auc': None,
-                        'chance_gold_roc_auc': None,
-                        'chance_gold_mrr': None,
-                        'gold_n_ranking_queries': 0,
-                        'gold_recall_skipped_reason': None,
-                        'layout': None,
-                        'error': str(e),
-                        'train_time_s': time.time() - t0,
-                    })
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
-
+            per_seed = per_cell[(variant['name'], n_kv)]
             row = summarize_variant(per_seed, variant)
             if variant['name'] == 'baseline':
-                baseline_acc = {}
-                baseline_pr_auc = {}
                 for seed_row in per_seed:
                     if not isinstance(seed_row, dict) or 'error' in seed_row:
                         continue
@@ -2405,9 +2434,10 @@ def main():
     mechanism_experiment_design = audit_experiment_design(
         'exp8_mechanism',
         seeds=[42 + i for i in range(n_seeds)],
-        levels={'variant': [v['name'] for v in variants]},
+        levels=run_levels,
         family_size=max(1, n_paired_tests + n_interaction_tests),
         analyzed_seeds=mechanism_analyzed_population,
+        execution_order=observed_execution,
     )
     logger.info(f'Design audit: {mechanism_experiment_design["status"]} '
                 f'(requested={mechanism_experiment_design["n_seeds"]}, '
@@ -2441,6 +2471,30 @@ def main():
              'predicted_acc_sign': v['predicted_acc_sign']}
             for v in variants],
         'ablation_design': design_audit,
+        # The executed order is evidence, not an assumption. The runner now
+        # trains in the pre-registered balanced schedule (one complete
+        # variant block per seed, cell order rotated across blocks) instead
+        # of a variant-major loop, and the observed sequence is audited
+        # against the schedule fingerprint.
+        'execution_schedule': {
+            'schedule_id': schedule['schedule_id'],
+            'schedule_sha256': schedule['schedule_sha256'],
+            'schedule_seed': schedule['schedule_seed'],
+            'n_cells': schedule['n_cells'],
+            'n_blocks': schedule['n_blocks'],
+            'n_runs': schedule['n_runs'],
+            'balance': schedule['balance'],
+            'levels': run_levels,
+            'observed_sha256': (
+                (mechanism_experiment_design.get('execution_order') or {})
+                .get('observed_schedule_sha256')),
+            'observed_status': (
+                (mechanism_experiment_design.get('execution_order') or {})
+                .get('status')),
+            'matches_planned_schedule': (
+                (mechanism_experiment_design.get('execution_order') or {})
+                .get('matches_planned_schedule')),
+        },
         # Pre-registered 2x2 interaction estimands. These are NOT the
         # per-variant main effects: each row is a seed-paired
         # difference-in-differences over four variants. Kept as a separate

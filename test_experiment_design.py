@@ -1038,6 +1038,67 @@ def test_pilot_reports_the_separate_interaction_budget():
     assert 'four-cell interaction' in rep['interaction_recommendation']
 
 
+def test_interaction_sd_from_four_cell_pilot_is_measured_and_used():
+    """A complete 2x2 pilot replaces the sqrt(2) model with its own SD."""
+    import statistics
+
+    cells = ['baseline', 'no_rope', 'dense', 'no_rope_dense']
+    base = {42: 0.50, 43: 0.55, 44: 0.45}
+    shifts = {
+        'baseline': (0.0, 0.0, 0.0),
+        'no_rope': (-0.10, -0.08, -0.12),
+        'dense': (0.00, 0.02, -0.02),
+        # Chosen so the per-seed interactions are exactly -0.02/-0.03/-0.01.
+        'no_rope_dense': (-0.12, -0.09, -0.15),
+    }
+    rows = []
+    for name in cells:
+        rows.append({
+            'variant': name, 'n_kv': 1,
+            'per_seed': [
+                {'seed': seed, 'final_acc': base[seed] + shift}
+                for seed, shift in zip(sorted(base), shifts[name])],
+        })
+    measured = D.interaction_sd_from_rows(
+        rows, group_key='variant', cells=cells)
+    expected = [-0.02, -0.03, -0.01]
+    assert measured is not None
+    assert measured['method'] == 'four_cell_paired_interaction'
+    assert measured['n_cells'] == 1
+    assert measured['n_seeds'] == 3
+    assert measured['sd'] == pytest.approx(
+        statistics.stdev(expected), abs=1e-12)
+    assert measured['sd_max'] == pytest.approx(
+        statistics.stdev(expected), abs=1e-12)
+    assert measured['per_cell'][0]['mean_interaction'] == pytest.approx(
+        sum(expected) / len(expected))
+
+    rep = D.planning_report(
+        'exp8_mechanism', seeds=5, family_size=6, sd=0.10,
+        interaction_sd=measured['sd'])
+    inter = rep['interaction']
+    assert inter['sd_source'] == 'measured_four_cell_pilot'
+    assert inter['sd_interaction'] == pytest.approx(measured['sd'])
+    assert inter['sd_inflation'] == pytest.approx(measured['sd'] / 0.10)
+    assert inter['required_seeds'] is not None
+    json.dumps(rep, allow_nan=False)
+
+    pilot = D.pilot_report('exp8_mechanism', rows, family_size=6)
+    assert pilot['interaction_planning_source'] == 'measured_four_cell_pilot'
+    assert pilot['interaction_sd']['method'] == 'four_cell_paired_interaction'
+    assert pilot['required_seeds_interaction'] == (
+        inter['required_seeds'])
+
+    # An incomplete 2x2 cannot be measured: the caller must fall back to
+    # the registered sqrt(2) model instead of silently using three cells.
+    partial = [row for row in rows if row['variant'] != 'no_rope_dense']
+    assert D.interaction_sd_from_rows(
+        partial, group_key='variant', cells=cells) is None
+    assert D.pilot_report(
+        'exp8_mechanism', partial, family_size=6
+    )['interaction_planning_source'] == 'sd_inflation_model'
+
+
 # ---------------------------------------------------------------------------
 # Execution order: balanced schedules and observed-order audits
 # ---------------------------------------------------------------------------

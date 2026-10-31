@@ -224,10 +224,17 @@ main effects. This is deliberate and auditable:
 
 `pilot_report` surfaces `required_seeds_interaction` next to the superiority
 and TOST recommendations. A pilot that is meant to size an interaction claim
-should still measure the difference-in-differences SD directly (the same four
+should measure the difference-in-differences SD directly (the same four
 variants on the same seeds) rather than relying on the `sqrt(2)` model
-assumption; the pilot path uses the model because the generic pilot extractor
-only sees two-cell `sd_diff` rows.
+assumption. `interaction_sd_from_rows` does exactly that when the registered
+interaction block names its four cells (`interaction.cells`, in the
+`(a, b, c, d)` order of `I = d - b - c + a`): it intersects the common seeds,
+forms one interaction value per seed, and pools the within-cell SD. Exp 8's
+pilot path therefore reports
+`interaction_planning_source = measured_four_cell_pilot` when all four cells
+are present, and falls back to `sd_inflation_model` when they are not. The
+measured value still comes from a pilot: it sizes the follow-up run, it never
+promotes the pilot rows themselves to confirmatory evidence.
 
 The assumption is a model, not a measurement. Positive cross-cell correlation
 of the treatment noise makes the `sqrt(2)` factor conservative; unequal cell
@@ -327,11 +334,19 @@ cell that never ran.
 The manifest's schedule fingerprint is generated from the **registered**
 treatment levels. An opt-in run that uses a subset must call
 `balanced_execution_schedule` with its explicit `levels`, execute that
-exact order, and verify the resulting schedule hash. The current runner
-loops do not yet consume the schedule automatically and do not all record
-their observed sequence, so `audit_run` keeps the order checks at `None`
-when `execution_order` is absent. Absence of evidence is not evidence of a
-balanced order; a confirmatory protocol should record it.
+exact order, and verify the resulting schedule hash. Exp 8 now does this
+automatically: `run_mechanism_ablation.py` materializes the schedule for the
+actual `MECH_VARIANTS` and `MECH_NKV` levels, trains in seed blocks with the
+cell order rotated across blocks, records the observed sequence, and passes
+it to `audit_run`. Its metadata carries `execution_schedule` and
+`experiment_design.execution_order`, so a treatment-major regression would be
+labelled `order_confounded` rather than silently accepted.
+
+The Exp 5/5b runners still use their historical cell-major loops and do not
+record an observed sequence, so `audit_run` keeps their order checks at
+`None`. Absence of evidence is not evidence of a balanced order; those
+confirmatory protocols should consume the schedule before claiming order
+balance.
 
 ## Single-factor claims are audited against the built config and observed run
 

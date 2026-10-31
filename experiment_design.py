@@ -547,6 +547,10 @@ PLANS: dict[str, dict] = {
         'interaction': {
             'estimand': ('RoPE x selection-density interaction '
                          'I = no_rope_dense - no_rope - dense + baseline'),
+            # Ordered (a, b, c, d) labels for I = d - b - c + a. The
+            # pilot extractor uses them to measure the interaction SD
+            # directly instead of assuming sqrt(2) x the two-cell SD.
+            'cells': ['baseline', 'no_rope', 'dense', 'no_rope_dense'],
             'sesoi': 0.10,
             'alternative': 'two-sided',
             'sd_inflation': INTERACTION_SD_INFLATION,
@@ -1330,6 +1334,7 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
                          family_size=1, alternative='two-sided',
                          target_power=DEFAULT_TARGET_POWER,
                          sd_inflation=INTERACTION_SD_INFLATION,
+                         sd_interaction=None,
                          required_for_claim=False, estimand=None,
                          source=None, note=None) -> dict:
     """Prospective read-out for a pre-registered 2x2 interaction endpoint.
@@ -1340,24 +1345,40 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
     ``Var(I) = 4*sigma^2`` while ``Var(B-A) = 2*sigma^2`` under the
     shared-seed / independent-cell-noise model. ``sd_inflation`` is
     exposed so a plan can replace the default with a value calibrated from
-    a dedicated interaction pilot, but it may not be below 1.0: a
-    four-cell contrast cannot be less variable than a two-cell one without
-    a negative cross-cell correlation, which the design does not assume.
+    a dedicated interaction pilot, but the MODEL inflation may not be below
+    1.0: a four-cell contrast cannot be less variable than a two-cell one
+    without a negative cross-cell correlation, which the design does not
+    assume. A directly measured ``sd_interaction`` is exempt from that
+    constraint because it is an observation, not an assumed variance
+    decomposition.
 
     ``family_size`` is the multiplicity family the interaction is tested
     in (the same run-wide family as the main contrasts for Exp 5b/8), not
-    the number of interaction rows. ``required_for_claim`` mirrors the TOST
-    endpoint: when true the registry must actually reach this budget.
+    the number of interaction rows. ``sd_interaction`` may supply a
+    directly measured four-cell difference-in-differences SD (from
+    :func:`interaction_sd_from_rows`); it then replaces the
+    ``sd * sd_inflation`` model assumption and is labelled as measured.
+    ``required_for_claim`` mirrors the TOST endpoint: when true the registry
+    must actually reach this budget.
     """
     sesoi = _need_number(sesoi, 'interaction sesoi', positive=True)
     sd_value = _need_number(sd, 'sd', positive=True)
-    inflation = _need_number(sd_inflation, 'interaction sd_inflation',
-                             positive=True)
-    if inflation < 1.0:
-        raise DesignError(
-            'interaction sd_inflation must be >= 1.0: a four-cell '
-            'difference-in-differences cannot have a smaller SD than the '
-            f'two-cell contrast it is built from, got {inflation!r}')
+    if sd_interaction is not None:
+        measured_sd = _need_number(
+            sd_interaction, 'interaction sd', positive=True)
+        inflation = measured_sd / sd_value
+        sd_interaction_value = measured_sd
+        sd_source = 'measured_four_cell_pilot'
+    else:
+        inflation = _need_number(sd_inflation, 'interaction sd_inflation',
+                                 positive=True)
+        if inflation < 1.0:
+            raise DesignError(
+                'interaction sd_inflation must be >= 1.0: a four-cell '
+                'difference-in-differences cannot have a smaller SD than '
+                f'the two-cell contrast it is built from, got {inflation!r}')
+        sd_interaction_value = sd_value * inflation
+        sd_source = 'sd_inflation_model'
     if not _is_int(seeds) or seeds < 0:
         raise DesignError(f'seeds must be a non-negative int, got {seeds!r}')
     alpha_value = _need_number(alpha, 'alpha')
@@ -1377,8 +1398,7 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
     if not isinstance(required_for_claim, bool):
         raise DesignError(
             f'required_for_claim must be a bool, got {required_for_claim!r}')
-    sd_interaction = sd_value * inflation
-    finite_sd = math.isfinite(sd_interaction)
+    finite_sd = math.isfinite(sd_interaction_value)
     # ``alpha_test`` is the one-sided TAIL probability the runner's
     # corrected threshold uses; multi_seed_stats takes a TEST level and
     # halves it internally, so undo that for the symmetric alternatives.
@@ -1388,7 +1408,7 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         else 2 * family_size)
     planning_alpha = (alpha_test if alternative in ('greater', 'less')
                       else 2.0 * alpha_test)
-    dz = sesoi / sd_interaction if finite_sd else None
+    dz = sesoi / sd_interaction_value if finite_sd else None
     required = None
     mde = None
     achieved = None
@@ -1398,11 +1418,11 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         if required is not None:
             required = max(2, int(required))
         mde = min_detectable_effect(
-            seeds, sd_interaction, alpha=planning_alpha, power=target,
+            seeds, sd_interaction_value, alpha=planning_alpha, power=target,
             alternative=alternative)
         planning_effect = -sesoi if alternative == 'less' else sesoi
         achieved = power_at_effect(
-            seeds, sd_interaction, planning_effect, alpha=planning_alpha,
+            seeds, sd_interaction_value, planning_effect, alpha=planning_alpha,
             alternative=alternative)
     # A non-finite SD (sqrt(2) inflation overflow) or a per-test alpha that
     # underflowed to zero has no finite/estimable budget: report the
@@ -1435,7 +1455,8 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         'sesoi': sesoi,
         'assumed_sd': sd_value,
         'sd_inflation': inflation,
-        'sd_interaction': (sd_interaction if finite_sd else None),
+        'sd_source': sd_source,
+        'sd_interaction': (sd_interaction_value if finite_sd else None),
         'standardized_effect_dz': dz,
         'alpha_family_wise': alpha_value,
         'family_size': family_size,
@@ -1459,16 +1480,20 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
         'method': (
             'normal approximation for planning only: '
             'n = ceil(((z_crit + z_power) * sd_interaction / SESOI)^2), '
-            'with sd_interaction = sd * sqrt(2) under the shared-seed / '
+            'with sd_interaction measured from a four-cell pilot when '
+            'supplied, otherwise sd * sqrt(2) under the shared-seed / '
             'independent-cell-noise model; inference uses the paired t / '
             'exact sign-flip tests on the per-seed difference-in-'
             'differences in multi_seed_stats.interaction_contrast'),
         'caveat': (
-            'the sqrt(2) inflation is a model assumption, not a measured '
-            'quantity: a shared seed effect cancels in I but independent '
-            'cell noise does not. Positive cross-cell correlation makes it '
-            'conservative; a dedicated four-cell pilot can replace it. The '
-            'main-effect seed budget is not the interaction budget, and a '
+            ('sd_interaction is measured directly from the four-cell '
+             'pilot; the remaining caveat is that a small pilot SD is '
+             'itself uncertain. ' if sd_source != 'sd_inflation_model' else
+             'the sqrt(2) inflation is a model assumption, not a measured '
+             'quantity: a shared seed effect cancels in I but independent '
+             'cell noise does not. Positive cross-cell correlation makes it '
+             'conservative; a dedicated four-cell pilot can replace it. ')
+            + 'The main-effect seed budget is not the interaction budget, and a '
             'non-significant interaction is inconclusive, never evidence '
             'of additivity'
             + ('' if finite_sd else
@@ -1479,11 +1504,14 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
 
 def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                     alpha=None, alternative=None, sesoi=None,
-                    target_power=None) -> dict:
+                    target_power=None, interaction_sd=None) -> dict:
     """Compute the prospective seed budget and the power it delivers.
 
     All overrides are for "what if" planning and are validated; the
-    defaults come from the plan. ``alpha`` is the FAMILY-WISE alpha. The
+    defaults come from the plan. ``interaction_sd`` replaces the
+    ``sqrt(2) * sd`` model assumption for the nested interaction record
+    with a directly measured four-cell difference-in-differences SD (see
+    :func:`interaction_sd_from_rows`). ``alpha`` is the FAMILY-WISE alpha. The
     per-test threshold used here is the one-sided TAIL probability used by
     the runners: ``alpha / family_size`` for a directional family and
     ``alpha / (2 * family_size)`` for a two-sided family.  The planning
@@ -1624,6 +1652,10 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
     # difference-in-differences".
     interaction = None
     interaction_cfg = plan.get('interaction')
+    if interaction_sd is not None and interaction_cfg is None:
+        raise DesignError(
+            'interaction_sd was supplied but this plan registers no '
+            'interaction endpoint')
     if interaction_cfg is not None:
         if not isinstance(interaction_cfg, Mapping):
             raise DesignError(
@@ -1635,6 +1667,8 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
             raise DesignError(
                 'plan.interaction.required_for_claim must be a bool, got '
                 f'{interaction_flag!r}')
+        if interaction_sd is not None:
+            _need_number(interaction_sd, 'interaction_sd', positive=True)
         interaction = interaction_planning(
             sesoi=interaction_cfg.get('sesoi', sesoi_value),
             sd=sd_value,
@@ -1648,6 +1682,7 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                           else interaction_cfg['target_power']),
             sd_inflation=interaction_cfg.get(
                 'sd_inflation', INTERACTION_SD_INFLATION),
+            sd_interaction=interaction_sd,
             required_for_claim=interaction_flag,
             estimand=interaction_cfg.get('estimand'),
             source=interaction_cfg.get('source'),
@@ -3068,6 +3103,164 @@ def pilot_sd_from_rows(rows, *, group_key: str, reference,
     }
 
 
+def interaction_sd_from_rows(rows, *, group_key: str, cells,
+                             cell_keys=('n_kv',)) -> dict | None:
+    """Measure the four-cell interaction SD from a pilot result payload.
+
+    ``cells`` is the ordered four-tuple ``(a, b, c, d)`` of ``group_key``
+    labels for the difference-in-differences
+    ``I = d - b - c + a``. Every inner cell (for example each ``n_kv``)
+    must contain all four groups and at least two common seeds. One
+    interaction value is formed per seed from that seed's four paired
+    outcomes, so seed difficulty cancels exactly as it does in the
+    confirmatory ``multi_seed_stats.interaction_contrast``.
+
+    The primary estimate is the pooled within-cell SD of those per-seed
+    interactions; ``sd_max`` is the largest per-cell SD (the conservative
+    companion). This replaces the ``sqrt(2) * sd_diff`` planning model
+    with a measured quantity and is still a pilot estimate: it must never
+    be used to promote the same rows to confirmatory evidence.
+    """
+    rows = _rows_from_payload(rows)
+    if isinstance(cells, (str, bytes)) or not hasattr(cells, '__iter__'):
+        raise DesignError(
+            f'interaction cells must be an ordered four-tuple, got '
+            f'{type(cells).__name__}')
+    cell_labels = list(cells)
+    if len(cell_labels) != 4:
+        raise DesignError(
+            'interaction cells must name exactly four groups '
+            f'(a, b, c, d), got {len(cell_labels)}')
+    known = set()
+    seen_keys = set()
+    for label in cell_labels:
+        if not _is_hashable(label):
+            raise DesignError(
+                f'interaction cell label must be hashable, got {label!r}')
+        key = _canonical_json(label, name='interaction cell label')
+        if key in seen_keys:
+            raise DesignError(
+                f'interaction cells contain duplicate label {label!r}')
+        seen_keys.add(key)
+        known.add(label)
+    cell_keys = list(cell_keys)
+    groups: dict[tuple, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or 'error' in row:
+            continue
+        group = row.get(group_key)
+        if not _is_hashable(group) or group not in known:
+            continue
+        cell = _cell_key(row, cell_keys)
+        if not _is_hashable(cell):
+            continue
+        per_seed = row.get('per_seed') or []
+        if not isinstance(per_seed, (list, tuple)):
+            continue
+        values = {}
+        for seed_row in per_seed:
+            if not isinstance(seed_row, dict) or 'error' in seed_row:
+                continue
+            seed = seed_row.get('seed')
+            acc = seed_row.get('final_acc')
+            if acc is None:
+                acc = seed_row.get('acc')
+            acc = _clean_float(acc)
+            if seed is None or not _is_hashable(seed) or acc is None:
+                continue
+            values[seed] = acc
+        if values:
+            groups.setdefault(cell, {})[group] = values
+    if not groups:
+        return None
+    a, b, c, d = cell_labels
+    per_cell = []
+    all_interactions = []
+    pooled_ss = 0.0
+    pooled_dof = 0
+    for cell, by_group in groups.items():
+        missing = [label for label in cell_labels if label not in by_group]
+        if missing:
+            per_cell.append({
+                'cell': list(cell), 'n_common_seeds': 0,
+                'missing_groups': missing, 'sd_interaction': None,
+            })
+            continue
+        common = set(by_group[a])
+        for label in (b, c, d):
+            common &= set(by_group[label])
+        if len(common) < 2:
+            per_cell.append({
+                'cell': list(cell), 'n_common_seeds': len(common),
+                'missing_groups': [], 'sd_interaction': None,
+            })
+            continue
+        interactions = []
+        skipped = False
+        for seed in sorted(common, key=str):
+            d_minus_b = _safe_difference(
+                by_group[d][seed], by_group[b][seed])
+            c_minus_a = _safe_difference(
+                by_group[c][seed], by_group[a][seed])
+            if d_minus_b is None or c_minus_a is None:
+                skipped = True
+                break
+            interaction = _safe_difference(d_minus_b, c_minus_a)
+            if interaction is None:
+                skipped = True
+                break
+            interactions.append(interaction)
+        if skipped or len(interactions) < 2:
+            per_cell.append({
+                'cell': list(cell), 'n_common_seeds': len(common),
+                'missing_groups': [], 'sd_interaction': None,
+            })
+            continue
+        sd = _sample_sd(interactions)
+        mean = _safe_mean(interactions)
+        if mean is not None:
+            pooled_ss += math.fsum(
+                (value - mean) ** 2 for value in interactions)
+            pooled_dof += len(interactions) - 1
+        all_interactions.extend(interactions)
+        per_cell.append({
+            'cell': list(cell),
+            'n_common_seeds': len(interactions),
+            'mean_interaction': mean,
+            'sd_interaction': sd,
+            'missing_groups': [],
+        })
+    valid = [record for record in per_cell
+             if record.get('sd_interaction') is not None]
+    if not valid:
+        return None
+    pooled = None
+    if pooled_dof > 0:
+        pooled = math.sqrt(pooled_ss / pooled_dof)
+        if not math.isfinite(pooled):
+            pooled = None
+    median_sd = _safe_median(
+        [record['sd_interaction'] for record in valid])
+    return {
+        'method': 'four_cell_paired_interaction',
+        'group_key': group_key,
+        'cells': cell_labels,
+        'cell_keys': cell_keys,
+        'n_cells': len(valid),
+        'n_seeds': len(all_interactions),
+        'sd': pooled if pooled is not None else median_sd,
+        'sd_pooled': pooled,
+        'sd_median': median_sd,
+        'sd_max': max(record['sd_interaction'] for record in valid),
+        'per_cell': per_cell,
+        'note': ('one difference-in-differences value per seed from the '
+                 'four cells; the interaction SD is measured directly '
+                 'instead of assuming sqrt(2) x the two-cell SD. A pilot '
+                 'SD is itself uncertain and cannot promote these rows to '
+                 'confirmatory evidence.'),
+    }
+
+
 def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
     """Turn a pilot result payload into a confirmatory seed recommendation.
 
@@ -3127,6 +3320,28 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
                if sd_info.get('pairs') else None)
     pooled_plan = planning_report(plan, seeds=pilot_n or plan['screening_seeds'],
                                   family_size=family, sd=sd_info['sd'])
+    # A four-cell interaction is planned with its OWN variance. When the
+    # pilot carries all four pre-registered cells, measure the
+    # difference-in-differences SD directly instead of assuming
+    # sqrt(2) x the two-cell SD. The model remains the fallback when the
+    # pilot is incomplete.
+    interaction_cfg = plan.get('interaction') or {}
+    measured_interaction = None
+    interaction_cells = interaction_cfg.get('cells')
+    if interaction_cells:
+        measured_interaction = interaction_sd_from_rows(
+            rows, group_key=pilot_cfg['group_key'],
+            cells=interaction_cells,
+            cell_keys=pilot_cfg.get('cell_keys', ('task', 'n_kv')))
+    measured_interaction_sd = (
+        measured_interaction.get('sd')
+        if isinstance(measured_interaction, dict) else None)
+    interaction_plan = None
+    if measured_interaction_sd is not None:
+        interaction_plan = planning_report(
+            plan, seeds=pilot_n or plan['screening_seeds'],
+            family_size=family, sd=sd_info['sd'],
+            interaction_sd=measured_interaction_sd)
     required = pooled_plan['required_seeds']
     conservative = (
         planning_report(plan, seeds=plan['planned_seeds'], family_size=family,
@@ -3159,7 +3374,8 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
     # main-effect recommendation; a pilot meant to size an interaction
     # claim should still measure the difference-in-differences SD directly
     # rather than relying on the sqrt(2) model assumption.
-    interaction = pooled_plan.get('interaction') or {}
+    interaction = ((interaction_plan or pooled_plan).get('interaction')
+                   or {})
     required_interaction = interaction.get('required_seeds')
     return {
         'plan_id': plan_id,
@@ -3188,6 +3404,10 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
         'required_seeds_equivalence_conservative':
             required_equivalence_conservative,
         'required_seeds_interaction': required_interaction,
+        # How the interaction budget was sized: a directly measured
+        # four-cell pilot SD when available, otherwise the sqrt(2) model.
+        'interaction_sd': measured_interaction,
+        'interaction_planning_source': interaction.get('sd_source'),
         'recommended_seeds': recommended,
         'planned_confirmatory_seeds': plan['planned_seeds'],
         'recommendation': (
@@ -3212,10 +3432,16 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
             if not interaction else
             (f'the four-cell interaction at SESOI '
              f'{interaction.get("sesoi")} needs '
-             f'{required_interaction} seeds at the pooled SD '
-             f'(SD_interaction = {interaction.get("sd_inflation")} x the '
-             'pilot difference SD); the main-effect recommendation above '
-             'is not sufficient for a transfer/complementarity claim')),
+             f'{required_interaction} seeds '
+             + ('at the measured four-cell pilot SD '
+                f"(SD_interaction = {interaction.get('sd_interaction')})"
+                if interaction.get('sd_source')
+                == 'measured_four_cell_pilot' else
+                'at the pooled SD (SD_interaction = '
+                f"{interaction.get('sd_inflation')} x the pilot "
+                'difference SD)')
+             + '; the main-effect recommendation above is not sufficient '
+             'for a transfer/complementarity claim')),
         'caveat': (
             'the pilot SD is estimated from few seed pairs and is itself '
             'uncertain; the conservative recommendation uses the largest '

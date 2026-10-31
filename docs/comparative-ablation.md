@@ -152,7 +152,11 @@ budgets are 31 and 25 seeds. The registry records
 the transfer/complementarity verdict is descriptive even when the main
 effects are confirmatory. A run may only cite `I` as a confirmatory claim
 after reaching the interaction requirement (or after a dedicated four-cell
-pilot replaces the `sqrt(2)` assumption with a measured DiD SD). See
+pilot replaces the `sqrt(2)` assumption with a measured DiD SD via
+`experiment_design.interaction_sd_from_rows`). Exp 8's registered
+`interaction.cells` lets `pilot_report` use the measured SD directly; an
+incomplete 2x2 falls back to the `sqrt(2)` model and says so in
+`interaction_planning_source`. See
 [experiment-design.md](experiment-design.md#interactions-are-a-separate-four-cell-budget).
 
 The existing evidence-quality rules still apply and are not replaced by the
