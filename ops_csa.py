@@ -215,6 +215,33 @@ def _windows_contiguous(windows: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _auto_sw_chunk_t(T: int, win: int, c: int) -> int:
+    """Largest query tile whose ``[ct, win, c]`` window slab fits the budget.
+
+    The previous auto heuristic floored the tile at 64 rows and rounded the
+    threshold-derived target UP to a multiple of 64.  Both rules can exceed
+    ``CHUNKED_SW_THRESHOLD``: with ``win=4096, c=64`` the target is 30 rows,
+    but the floor/round-up selected 64, i.e. a 16.8M-element slab (2.1x the
+    documented 8M budget).  This helper rounds DOWN to a 64-row multiple when
+    the budget allows it and otherwise keeps the exact target (minimum 1), so
+    the transient bound holds for every window size.  One row that alone
+    exceeds the budget (``win * c > CHUNKED_SW_THRESHOLD``) still uses 1 row;
+    a single row cannot be split further.
+
+    Tiling is row-wise, so the chosen size changes only the transient
+    allocation, never a per-row value.
+    """
+    if T <= 0:
+        return 0
+    per_row = max(1, win * c)
+    target = CHUNKED_SW_THRESHOLD // per_row
+    if target >= 64:
+        target -= target % 64
+    else:
+        target = max(1, target)
+    return max(1, min(T, target))
+
+
 def _sliding_window_attention(
     q: torch.Tensor,           # [B, T, nh, c]   (L2-normalized)
     C_local: torch.Tensor,     # [B, T, c]       (L2-normalized)
@@ -239,8 +266,9 @@ def _sliding_window_attention(
             scale; typically 1.0 for normalized q/k).
         device: torch.device for any intermediates.
         chunk_t: number of query positions to process per chunk. ``None``
-            auto-picks ``min(T, max(64, ceil(T * win / (CHUNKED_SW_THRESHOLD /
-            win))))``.
+            auto-picks the largest tile (capped at ``T``) whose window slab
+            fits ``CHUNKED_SW_THRESHOLD`` elements; see
+            :func:`_auto_sw_chunk_t`.
 
     Numerical contract:
         Identical to the equivalent ``unfold``-based implementation, up to
@@ -255,13 +283,11 @@ def _sliding_window_attention(
     valid_mask = _sliding_window_valid_mask(T, win, device)  # True=real
 
     # Auto-pick chunk_t if not given, targeting
-    # CHUNKED_SW_THRESHOLD / (win * c) positions per chunk; rounded up to a
-    # multiple of 64.
+    # chunk_t * win * c <= CHUNKED_SW_THRESHOLD. See _auto_sw_chunk_t for
+    # why the tile is rounded DOWN (rounding up broke the budget for
+    # large windows).
     if chunk_t is None:
-        # Target: chunk_t * win * c <= CHUNKED_SW_THRESHOLD
-        # => chunk_t <= CHUNKED_SW_THRESHOLD / (win * c)
-        target = max(64, CHUNKED_SW_THRESHOLD // max(1, win * c))
-        chunk_t = min(T, ((target + 63) // 64) * 64)
+        chunk_t = _auto_sw_chunk_t(T, win, c)
     chunk_t = max(1, chunk_t)
 
     # Left-pad C_local so we can extract the window for query ``t`` as a
@@ -301,7 +327,13 @@ def _sliding_window_attention(
         # ``j = win - ct + i``).  Discard the leading ``win - ct``
         # all-zero windows so the window axis has length ``ct`` and matches
         # ``q_chunk`` in the einsum below.
-        C_windows = _windows_contiguous(C_windows[:, -ct:])   # [B, ct, win, c]
+        C_windows = C_windows[:, -ct:]                        # [B, ct, win, c]
+        # The overlapping unfold view is consumed directly by both einsums.
+        # Densifying it doubles the transient, which defeats the memory
+        # budget this helper exists to enforce for large windows; only small
+        # slabs (where the dense layout measures faster) are copied.
+        if ct * win * c <= _SW_TILE_DENSIFY_MAX:
+            C_windows = _windows_contiguous(C_windows)
         q_chunk = q[:, t_lo:t_hi]                            # [B, ct, nh, c]
         mask_chunk = valid_mask[t_lo:t_hi]                   # [ct, win]
         scores = torch.einsum('b t h d, b t w d -> b t h w', q_chunk, C_windows)
@@ -321,13 +353,13 @@ def _sw_query_chunk(T: int, win: int, c: int, chunk_t: int | None = None) -> int
     """Query-axis tile size for the chunked sliding-window helpers.
 
     ``None`` targets ``CHUNKED_SW_THRESHOLD`` elements per ``[ct, win, c]``
-    window slab (rounded up to a multiple of 64), mirroring
-    :func:`_sliding_window_attention`. The tiling is row-wise: it changes
-    only the transient buffer size, never any per-row value.
+    window slab, mirroring :func:`_sliding_window_attention` and using the
+    same budget-preserving :func:`_auto_sw_chunk_t` rule. The tiling is
+    row-wise: it changes only the transient buffer size, never any per-row
+    value.
     """
     if chunk_t is None:
-        target = max(64, CHUNKED_SW_THRESHOLD // max(1, win * c))
-        chunk_t = min(T, ((target + 63) // 64) * 64)
+        chunk_t = _auto_sw_chunk_t(T, win, c)
     return max(1, min(chunk_t, T)) if T > 0 else 0
 
 

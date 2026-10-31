@@ -112,6 +112,10 @@ def main():
     # reduction orders (T=4096; margins derived from the dtype grid).
     all_results += _run_safe(test_kda_long_context_bf16_equivalence, device)
     all_results += _run_safe(test_hca_sliding_window_causality, device)
+    # Auto-chunking must keep the sliding-window transient within the
+    # documented element budget for large windows, and the tiled joint
+    # softmax (with a denominator-only sink) must stay exact.
+    all_results += _run_safe(test_sliding_window_auto_chunk_budget, device)
     all_results += _run_safe(test_csa_full_pipeline_causality, device)
     # Regression tests for bugs found during code review.
     all_results += _run_safe(test_hybrid_padding_no_crash, device)

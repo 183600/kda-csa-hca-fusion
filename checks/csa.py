@@ -1367,6 +1367,98 @@ def test_partial_rope_properties(device='cpu'):
     return results
 
 
+
+
+def test_sliding_window_auto_chunk_budget(device='cpu'):
+    """Auto-chunking must honour its own memory budget for every window size.
+
+    The historical heuristic floored the query tile at 64 rows and rounded
+    the threshold-derived target UP to a multiple of 64.  For large windows
+    that broke the documented ``CHUNKED_SW_THRESHOLD`` bound (e.g.
+    ``win=4096, c=64`` selected 64 rows = 16.8M elements, 2.1x the budget).
+    This check pins the budget-preserving ``_auto_sw_chunk_t`` rule and the
+    exactness of the resulting tiled window scores / value contraction in the
+    joint softmax with a denominator-only attention sink.
+    """
+    logger.info("Test: sliding-window auto-chunk budget + joint sink parity")
+    import ops_csa
+    from ops_csa import (_auto_sw_chunk_t, _sw_query_chunk,
+                         _sliding_window_scores, _sliding_window_output,
+                         _sink_softmax)
+
+    budget_ok = True
+    detail = ''
+    for T in (1, 63, 64, 65, 257, 1000):
+        for win in (1, 31, 64, 255, 1024, 4096):
+            for c in (4, 16, 64):
+                ct = _auto_sw_chunk_t(T, win, c)
+                if not (1 <= ct <= T):
+                    budget_ok = False
+                    detail = f'T={T}, win={win}, c={c}: ct={ct}'
+                elif win * c <= ops_csa.CHUNKED_SW_THRESHOLD:
+                    if ct * win * c > ops_csa.CHUNKED_SW_THRESHOLD:
+                        budget_ok = False
+                        detail = (f'T={T}, win={win}, c={c}: '
+                                  f'ct*win*c={ct * win * c} > budget')
+                elif ct != 1:
+                    budget_ok = False
+                    detail = (f'T={T}, win={win}, c={c}: oversized row but '
+                              f'ct={ct} != 1')
+                if _sw_query_chunk(T, win, c) != ct:
+                    budget_ok = False
+                    detail = f'_sw_query_chunk disagrees at T={T}, win={win}'
+                if not budget_ok:
+                    break
+            if not budget_ok:
+                break
+        if not budget_ok:
+            break
+
+    # Force the AUTO tiled path on a small geometry by lowering the budget,
+    # then compare against the full-unfold scores/value path with a sink.
+    torch.manual_seed(7)
+    B, T, win, c, nh, k = 2, 300, 128, 16, 3, 5
+    q = F.normalize(torch.randn(B, T, nh, c, device=device), dim=-1)
+    C = F.normalize(torch.randn(B, T, c, device=device), dim=-1)
+    old_budget = ops_csa.CHUNKED_SW_THRESHOLD
+    ops_csa.CHUNKED_SW_THRESHOLD = 20_000
+    try:
+        tile = _auto_sw_chunk_t(T, win, c)
+        forced_tiling = 0 < tile < T
+        full, C_windows, _ = _sliding_window_scores(
+            q, C, win, 1.0, device, return_windows=True)
+        tiled, fresh_windows, _ = _sliding_window_scores(
+            q, C, win, 1.0, device, return_windows=False)
+        finite = torch.isfinite(full) & torch.isfinite(tiled)
+        score_ok = (
+            torch.equal(torch.isinf(full), torch.isinf(tiled))
+            and torch.allclose(full[finite], tiled[finite],
+                               atol=1e-6, rtol=1e-6))
+        sink = torch.randn(nh, device=device)
+        blocks = torch.randn(B, T, nh, k, device=device)
+        cat = torch.cat([blocks, full], dim=-1)
+        all_invalid = torch.zeros(B, T, 1, 1, dtype=torch.bool,
+                                  device=device)
+        p = _sink_softmax(cat, sink.view(1, 1, nh, 1), all_invalid)
+        p_w = p[..., k:]
+        o_full = torch.einsum('b t h w, b t w d -> b t h d', p_w, C_windows)
+        o_tiled = _sliding_window_output(p_w, C, win, device)
+        out_ok = torch.allclose(o_full, o_tiled, atol=1e-6, rtol=1e-6)
+        fresh_windows_ok = fresh_windows is None
+    finally:
+        ops_csa.CHUNKED_SW_THRESHOLD = old_budget
+
+    return [
+        _ok('sliding-window auto chunk respects element budget',
+            budget_ok, detail or 'all grid points within budget'),
+        _ok('small budget forces a real auto tile', forced_tiling,
+            f'tile={tile}, T={T}, win={win}, c={c}'),
+        _ok('auto-tiled window scores match full unfold (incl. -inf mask)',
+            score_ok, ''),
+        _ok('joint-softmax window values with sink match full path',
+            out_ok and fresh_windows_ok, ''),
+    ]
+
 __all__ = [
     'test_csa_causality',
     'test_overlap_causality',
@@ -1385,4 +1477,5 @@ __all__ = [
     'test_compress_chunk_tiling_parity',
     'test_partial_rope_long_context_phase',
     'test_partial_rope_properties',
+    'test_sliding_window_auto_chunk_budget',
 ]
