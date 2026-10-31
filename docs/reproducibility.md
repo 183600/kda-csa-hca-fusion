@@ -23,7 +23,12 @@ the working-tree code/config files. The digest includes tracked files plus
 untracked-not-ignored files, and frames each repo-relative path before its
 content, so a rename is a different identity even when the bytes are
 unchanged. It covers `.py`, `.toml`, `.txt`, `.sh`, `.cfg`, `.ini`, `.yml`,
-`.yaml` and the conventional `Dockerfile` / `Makefile` names. It is **code
+`.yaml` and the conventional `Dockerfile` / `Makefile` names. Reference-paper
+`.txt` files in arXiv filename form (e.g. `2510.26692v2.txt`,
+`2606.19348v1.txt`) are **excluded**: they are experiment inputs, not
+executable source, so a paper edit or a newly added preprint does not
+masquerade as code drift. Ordinary text manifests
+(`requirements*.txt`, `constraints*.txt`, …) remain in scope. It is **code
 identity**, not a data fingerprint: corpus versions are recorded separately
 by each runner's data-version block.
 
@@ -215,11 +220,11 @@ when its commit matches.
 ## Scope and limitations
 
 * The digest identifies code/config content. It does not hash datasets,
-  generated result files, PDFs or figures; use the data-version block and the
-  per-file `sha256` in Exp 9 for those. The envelope `integrity` digest does
-  cover a result file, but it is tamper evidence, not a signature: it detects
-  accidental or naive edits, not an adversary who rewrites both the content
-  and the stored digest.
+  generated result files, PDFs, figures or the arXiv reference-paper text;
+  use the data-version block and the per-file `sha256` in Exp 9 for those.
+  The envelope `integrity` digest does cover a result file, but it is tamper
+  evidence, not a signature: it detects accidental or naive edits, not an
+  adversary who rewrites both the content and the stored digest.
 * The digest is a working-tree digest. It intentionally changes when a source
   file is edited, renamed, added or deleted; reproducing a historical run
   therefore means restoring the same tree, not merely checking out the same
@@ -264,9 +269,11 @@ difference is real drift, not noise.
 ## Tests
 
 `test_source_identity.py` covers the digest contract (determinism, content /
-path / rename sensitivity, non-source exclusion, no-git fallback), the
-commit/branch/dirty record, credential redaction, verifier statuses, and the
-Exp 9 `mixed_source_trees` verdict. `test_result_integrity.py` covers the
+path / rename sensitivity, non-source exclusion, reference-paper exclusion,
+no-git fallback), the commit/branch/dirty record, credential redaction,
+verifier statuses, and the Exp 9 `mixed_source_trees` verdict.
+`run_correctness.py::test_source_identity_scope` pins the same paper/manifest
+split inside the fast CI gate. `test_result_integrity.py` covers the
 envelope content digest (formatting neutrality, row/metadata/provenance
 tampering, legacy `missing`, `malformed`/`unsupported` statuses, the
 `--check-integrity` CLI, and the shared writer's sanitize-then-seal path).

@@ -28,6 +28,7 @@ from checks.flops import *  # noqa: F401,F403
 from checks.decoding import *  # noqa: F401,F403
 from checks.mamba import *  # noqa: F401,F403
 from checks.rwkv import *  # noqa: F401,F403
+from checks.provenance import *  # noqa: F401,F403
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ def main():
     # hand-duplicated setup/tail code.
     all_results += _run_safe(test_scripted_chunk_kda_matches_naive, device)
     all_results += _run_safe(test_csa_causality, device)
+    # Provenance scope: reference-paper text is data, not code identity;
+    # dependency manifests remain part of the digest.
+    all_results += _run_safe(test_source_identity_scope, device)
     all_results += _run_safe(test_hca_forward_smoke, device)
     # Long-context query tiling of the HCA dense score tensor: force the
     # tiled branch and certify forward/backward equivalence with the full path.

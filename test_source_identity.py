@@ -22,6 +22,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import (  # noqa: E402
+    _is_source_file,
     _redact_command_line,
     capture_provenance,
     capture_source_identity,
@@ -95,6 +96,42 @@ def test_source_tree_digest_is_content_and_path_sensitive(tmp_path):
     renamed_digest = source_tree_sha256(str(root))
     (root / 'data.bin').unlink()
     assert source_tree_sha256(str(root)) == renamed_digest
+
+
+
+def test_reference_papers_are_not_code_identity(tmp_path):
+    """arXiv reference text is an experiment input, not executable source.
+
+    ``.txt`` is in the source suffix allowlist for dependency manifests, so
+    the paper payloads used to enter ``source_tree_sha256``. A paper edit or
+    a newly added preprint then looked like code drift to the verifier. The
+    digest now excludes the arXiv filename form while keeping ordinary text
+    manifests in scope.
+    """
+    assert _is_source_file('2510.26692v2.txt') is False
+    assert _is_source_file('2606.19348v1.txt') is False
+    assert _is_source_file('references/2510.26692v2.txt') is False
+    assert _is_source_file('requirements-ci.txt') is True
+    assert _is_source_file('constraints.txt') is True
+    assert _is_source_file('notes.txt') is True
+
+    root = tmp_path / 'plain'
+    root.mkdir()
+    (root / 'module.py').write_text('X = 1\n', encoding='utf-8')
+    (root / 'requirements.txt').write_text('torch>=2\n', encoding='utf-8')
+    (root / '2510.26692v2.txt').write_text('paper v1\n', encoding='utf-8')
+    (root / 'notes.txt').write_text('config notes\n', encoding='utf-8')
+
+    before = source_tree_sha256(str(root))
+    identity = capture_source_identity(str(root))
+    # module.py + requirements.txt + notes.txt; the paper is excluded.
+    assert identity['source_file_count'] == 3
+
+    (root / '2510.26692v2.txt').write_text('paper v2\n', encoding='utf-8')
+    assert source_tree_sha256(str(root)) == before
+
+    (root / 'notes.txt').write_text('changed config notes\n', encoding='utf-8')
+    assert source_tree_sha256(str(root)) != before
 
 
 @pytest.mark.skipif(GIT is None, reason='git is not installed')

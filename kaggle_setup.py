@@ -708,7 +708,17 @@ _SOURCE_FILE_SUFFIXES = frozenset({
     '.py', '.toml', '.txt', '.sh', '.cfg', '.ini', '.yml', '.yaml',
 })
 _SOURCE_FILE_NAMES = frozenset({'Dockerfile', 'Makefile', 'makefile'})
-_SOURCE_TREE_DIGEST_VERSION = b'kda-csa-hca-source-tree-v1\x00'
+# Reference papers (arXiv IDs such as ``2510.26692v2.txt``) are experiment
+# inputs/docs, not executable source. Their ``.txt`` payloads would otherwise
+# enter the code digest through the dependency-manifest suffix rule, so a
+# paper typo fix or a newly added preprint would be misclassified as code
+# drift by the reproducibility verifier. Match only the arXiv filename form;
+# ordinary ``.txt`` manifests (``requirements*.txt``, ``constraints*.txt``)
+# stay part of the identity.
+_REFERENCE_PAPER_RE = re.compile(r'^\d{4}\.\d{4,5}v\d+\.txt$', re.IGNORECASE)
+# v2: exclude reference-paper text from the source-tree digest (the scope is
+# code/config, as the docstring already promised).
+_SOURCE_TREE_DIGEST_VERSION = b'kda-csa-hca-source-tree-v2\x00'
 
 # Arguments that may carry credentials; their values are redacted before the
 # command line is stored in a result file.
@@ -736,8 +746,15 @@ def _source_tree_root(root=None) -> str:
 
 
 def _is_source_file(rel_path: str) -> bool:
-    """Whether a repo-relative path is part of the code/config identity."""
+    """Whether a repo-relative path is part of the code/config identity.
+
+    The suffix allowlist includes ``.txt`` because dependency manifests are
+    plain text, but a reference-paper ``.txt`` (arXiv filename form) is data,
+    not code: it is excluded so paper edits do not masquerade as code drift.
+    """
     name = rel_path.rsplit('/', 1)[-1]
+    if _REFERENCE_PAPER_RE.match(name):
+        return False
     if name in _SOURCE_FILE_NAMES:
         return True
     dot = name.rfind('.')
@@ -820,7 +837,9 @@ def source_tree_sha256(root=None) -> str | None:
 
     Covers ``.py`` / ``.toml`` / ``.txt`` / ``.sh`` / ``.cfg`` / ``.ini`` /
     ``.yml`` / ``.yaml`` files (tracked plus untracked non-ignored) and the
-    conventional ``Dockerfile`` / ``Makefile`` names. This is code identity,
+    conventional ``Dockerfile`` / ``Makefile`` names. Reference-paper ``.txt``
+    files (arXiv filename form, e.g. ``2510.26692v2.txt``) are excluded:
+    they are experiment inputs, not executable source. This is code identity,
     not a data fingerprint: corpus files are recorded separately by each
     runner's data-version block. Returns ``None`` when no source files are
     found (e.g. a broken package install).
