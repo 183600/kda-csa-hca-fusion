@@ -495,10 +495,11 @@ def kda_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
     NT = Tp // BT
     block_rows = _attn_block_rows(B, HV, NT, BT, K)
     entries = _prepare_entries(block_rows, BT)
-    a_macs = B * HV * NT * entries * K
+    a_macs = 0 if K == 1 else B * HV * NT * entries * K
     if cfg.kda_recompute_attn:
         recompute_rows = _recompute_block_rows(B, HV, NT, BT, K)
-        aqk_macs = B * HV * NT * _recompute_entries(recompute_rows, BT) * K
+        aqk_macs = (0 if K == 1 else
+                    B * HV * NT * _recompute_entries(recompute_rows, BT) * K)
     else:
         aqk_macs = a_macs
     trsm = B * HV * NT * BT * BT * (BT - 1) // 2
@@ -655,18 +656,22 @@ def csa_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
     proj = B * (Tp * d * (4 * c + 2 * cI + dc)
                 + Tp * dc * (c * nh + cI * nIh)
                 + Tp * d * nIh + T * nh * c * d)
-    indexer = B * (Tp * nb * cI * nIh + Tp * nb * nIh)
+    indexer = B * ((Tp * nb * cI * nIh if cI > 1 else 0) + Tp * nb * nIh)
     core = B * 2 * Tp * topk * c * nh if nb > 0 else 0
     if nb > 0 and topk == 1:
         # With a one-column gather PyTorch folds the value contraction
         # into a mul+sum, exactly like HCA's single compressed block, so
         # one Tp*c*nh GEMM term is not dispatched.
         core -= B * Tp * c * nh
+    if nb > 0 and c == 1:
+        core -= B * Tp * topk * nh
     window = B * 2 * Tp * sw * c * nh if sw > 0 else 0
     if sw == 1:
         # A one-column gather folds the value contraction into mul+sum,
         # exactly like the top-k == 1 core above.
         window -= B * Tp * c * nh
+    if sw > 0 and c == 1:
+        window -= B * Tp * sw * nh
     return proj + indexer + core + window
 
 
@@ -690,10 +695,14 @@ def hca_reference_gemm_macs(cfg, T: int, batch: int = 1) -> int:
         # With a single compressed block the value contraction folds into
         # mul+sum (same PyTorch behaviour as CSA's top-k == 1 core).
         core -= B * Tp * c * nh
+    if nb > 0 and c == 1:
+        core -= B * Tp * nb * nh
     window = B * 2 * Tp * sw * c * nh if sw > 0 else 0
     if sw == 1:
         # A one-column gather folds the value contraction into mul+sum.
         window -= B * Tp * c * nh
+    if sw > 0 and c == 1:
+        window -= B * Tp * sw * nh
     return proj + core + window
 
 

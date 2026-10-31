@@ -201,6 +201,24 @@ def test_kda_assoc_scan_batch_and_gva_scale(T, device):
         f'T={T}: diff={row["model_minus_measured_macs"]}')
 
 
+def test_kda_single_key_dim_folds_attn_builds(device):
+    """K == 1 folds the A/Aqk score contraction into mul+sum."""
+    for overrides in (
+        dict(head_dim_k=1, kda_chunk_size=8),
+        dict(head_dim_k=1, kda_chunk_size=3, kda_recompute_attn=True),
+        dict(head_dim_k=1, kda_chunk_size=4, kda_assoc_scan=True),
+    ):
+        cfg = _cfg(**overrides)
+        for T in (8, 17, 64):
+            row = fa.audit_layer('kda', cfg, T, device=device)
+            if T < cfg.kda_chunk_size:
+                continue
+            assert row['model_matches_measurement'], (
+                f'{overrides} T={T}: model={row["reference_model_macs"]} '
+                f'measured={row["reference_gemm_macs"]} '
+                f'diff={row["model_minus_measured_macs"]}')
+
+
 def test_kda_exact_model_padded_sequence(device):
     cfg = _cfg()
     row = fa.audit_layer('kda', cfg, 100, device=device)
@@ -284,6 +302,22 @@ def test_csa_single_column_window_fold_is_not_charged(device):
             f'diff={row["model_minus_measured_macs"]}')
 
 
+def test_csa_single_feature_and_indexer_feature_folds(device):
+    """c == 1 folds the score einsum; cI == 1 folds the indexer score."""
+    for overrides in (
+        dict(csa_c=1, csa_topk=1, csa_sliding_window=3),
+        dict(csa_c=1, csa_topk=2, csa_sliding_window=1),
+        dict(csa_cI=1, csa_nIh=2),
+    ):
+        cfg = _cfg(**overrides)
+        for T in (1, 17, 64):
+            row = fa.audit_layer('csa', cfg, T, device=device)
+            assert row['model_matches_measurement'], (
+                f'{overrides} T={T}: model={row["reference_model_macs"]} '
+                f'measured={row["reference_gemm_macs"]} '
+                f'diff={row["model_minus_measured_macs"]}')
+
+
 def test_hca_exact_model(device):
     cfg = _cfg()
     for T in (96, 128, 100):
@@ -305,6 +339,16 @@ def test_hca_single_block_value_fold_is_exact(device):
 def test_hca_single_column_window_fold_is_not_charged(device):
     cfg = _cfg(hca_sliding_window=1)
     for T in (16, 64, 100):
+        row = fa.audit_layer('hca', cfg, T, device=device)
+        assert row['model_matches_measurement'], (
+            f'T={T}: model={row["reference_model_macs"]} '
+            f'measured={row["reference_gemm_macs"]} '
+            f'diff={row["model_minus_measured_macs"]}')
+
+
+def test_hca_single_feature_fold_is_not_charged(device):
+    cfg = _cfg(hca_c=1, hca_sliding_window=3)
+    for T in (1, 17, 64):
         row = fa.audit_layer('hca', cfg, T, device=device)
         assert row['model_matches_measurement'], (
             f'T={T}: model={row["reference_model_macs"]} '
