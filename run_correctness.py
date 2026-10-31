@@ -108,6 +108,13 @@ def main():
     # P0-2 regression: ste_mode='full_softmax' must be a distinct branch
     # (not silently aliased to 'topk_columns').
     all_results += _run_safe(test_csa_indexer_ste_full_softmax, device)
+    # Memory-efficient CSA indexer STE: checkpointed per-tile recomputation
+    # must preserve the forward/gradient contract while dropping the retained
+    # [B, T, n_blocks] soft distribution.
+    all_results += _run_safe(test_csa_indexer_recompute_ste_parity, device)
+    all_results += _run_safe(test_csa_indexer_recompute_ste_memory, device)
+    # Config -> CSAHybridLayer -> naive_csa plumbing for the recompute flag.
+    all_results += _run_safe(test_csa_recompute_indexer_plumbing, device)
     # P0-3 regression: detach_lookback=False enables cross-chunk BPTT.
     all_results += _run_safe(test_kda_cross_chunk_bptt, device)
     # P1-2 regression: KDA state preserves fp32 precision for fp16/bf16 inputs.

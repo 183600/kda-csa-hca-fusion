@@ -500,6 +500,7 @@ def csa_layer_forward_tp(
         use_ste=layer.use_ste,
         normalize_qk=True,
         indexer_chunk=cfg.csa_indexer_chunk,
+        recompute_indexer=cfg.csa_recompute_indexer,
     )
     o_proj = layer.o_proj.weight[:, lo * cfg.csa_c:hi * cfg.csa_c]
     return {'output': F.linear(o, o_proj), 'state': None}

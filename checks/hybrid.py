@@ -41,6 +41,60 @@ def test_fused_hybrid(device='cpu'):
     ]
 
 
+def test_csa_recompute_indexer_plumbing(device='cpu'):
+    """``HybridConfig.csa_recompute_indexer`` must reach ``naive_csa``.
+
+    The CSA layer owns the config -> ``naive_csa`` forwarding, so a typo in
+    the plumbing would silently keep the historical full-softmax backward.
+    This test builds two identically initialized CSA layers, enables the
+    recompute path on one, and checks forward/gradient parity plus the
+    strict-bool config validation.
+    """
+    from ops_fused import CSAHybridLayer
+    logger.info("Test: CSA recompute indexer config plumbing")
+    torch.manual_seed(19)
+    base = dict(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=3, csa_nh=2, csa_c=8, csa_dc=16,
+        csa_nIh=2, csa_cI=8, csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=8, hca_dc=16, hca_sliding_window=8,
+        n_kda=0, n_csa=1, n_hca=0,
+    )
+    cfg_off = HybridConfig(**base, csa_recompute_indexer=False)
+    cfg_on = HybridConfig(**base, csa_recompute_indexer=True)
+    layer_off = CSAHybridLayer(cfg_off).to(device).double()
+    layer_on = CSAHybridLayer(cfg_on).to(device).double()
+    layer_on.load_state_dict(layer_off.state_dict())
+    x = torch.randn(2, 24, cfg_off.d_model, device=device,
+                    dtype=torch.float64) * 0.1
+    o_off, _ = layer_off(x)
+    o_on, _ = layer_on(x)
+    fwd_diff = (o_off - o_on).abs().max().item()
+    torch.manual_seed(5)
+    w = torch.randn_like(o_off)
+    (o_off * w).sum().backward()
+    (o_on * w).sum().backward()
+    grad_diff = max(
+        (p_off.grad - p_on.grad).abs().max().item()
+        for p_off, p_on in zip(layer_off.parameters(),
+                               layer_on.parameters())
+        if p_off.grad is not None and p_on.grad is not None)
+    bad_raised = False
+    try:
+        HybridConfig(**base, csa_recompute_indexer=1)
+    except TypeError:
+        bad_raised = True
+    return [
+        _ok('CSA layer recompute indexer forward parity',
+            fwd_diff <= 1e-12, f'max_abs_diff={fwd_diff:.3e}'),
+        _ok('CSA layer recompute indexer gradient parity',
+            grad_diff <= 1e-10, f'max_abs_diff={grad_diff:.3e}'),
+        _ok('HybridConfig rejects non-bool csa_recompute_indexer',
+            bad_raised, ''),
+    ]
+
+
 def test_hybrid_padding_no_crash(device='cpu'):
     """Regression: HybridKCHAttention must not crash when T is not divisible
     by csa_m / hca_m2.
@@ -897,6 +951,7 @@ def test_hybrid_decoding_mamba2_route(device='cpu'):
 
 __all__ = [
     'test_fused_hybrid',
+    'test_csa_recompute_indexer_plumbing',
     'test_hybrid_padding_no_crash',
     'test_hybrid_state_buffer_registration',
     'test_bench_hybrid_no_grad_inference',

@@ -808,6 +808,181 @@ def test_csa_indexer_ste_full_softmax(device='cpu'):
     ]
 
 
+def test_csa_indexer_recompute_ste_parity(device='cpu'):
+    """Memory-efficient indexer STE must match the historical graph.
+
+    ``naive_csa(recompute_indexer=True)`` replaces the retained full
+    ``[B, T, n_blocks]`` soft distribution with checkpointed per-query-tile
+    recomputation and a retained ``[B, T, topk]`` selected-weight tensor.
+    This test pins the numerical contract: forward values, hard selection,
+    and every parameter gradient must agree with the historical path in
+    fp64, for both scale policies and for auto / explicit query tiling.
+    Sink logits, sliding-window scores, and partial RoPE are enabled so the
+    parity covers the full indexer input path, not just the plain logits.
+    """
+    import copy
+    logger.info("Test: CSA indexer recompute STE parity")
+    torch.manual_seed(2026)
+    B, T, d = 2, 37, 16
+    m, topk, nh, nIh, c, cI, dc = 4, 3, 2, 2, 8, 4, 8
+    H = torch.randn(B, T, d, device=device, dtype=torch.float64)
+
+    def _make_params():
+        return dict(
+            W_aKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_aZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            Ba=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            Bb=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            W_DQ=torch.randn(dc, d, dtype=torch.float64) * 0.1,
+            W_UQ=torch.randn(c * nh, dc, dtype=torch.float64) * 0.1,
+            W_IUQ=torch.randn(cI * nIh, dc, dtype=torch.float64) * 0.1,
+            W_w=torch.randn(nIh, d, dtype=torch.float64) * 0.1,
+            W_KV_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            W_Z_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            B_idx=torch.randn(m, cI, dtype=torch.float64) * 0.02,
+        )
+
+    base = _make_params()
+    param_names = list(base)
+    sink = torch.randn(nh, dtype=torch.float64) * 0.1
+    max_fwd_diff = 0.0
+    max_grad_diff = 0.0
+    for normalize_qk in (False, True):
+        for indexer_chunk in (0, 7):
+            p_ref = copy.deepcopy(base)
+            p_new = copy.deepcopy(base)
+            for p in (p_ref, p_new):
+                for name in param_names:
+                    p[name] = p[name].clone().requires_grad_(True)
+            common = dict(
+                m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+                sliding_window=3, sink_logits=sink,
+                normalize_qk=normalize_qk, rope_dim=8, qk_norm_mode='l2',
+            )
+            o_ref = naive_csa(H, **p_ref, use_ste=True,
+                              recompute_indexer=False,
+                              indexer_chunk=indexer_chunk, **common)
+            o_new = naive_csa(H, **p_new, use_ste=True,
+                              recompute_indexer=True,
+                              indexer_chunk=indexer_chunk, **common)
+            fwd_diff = (o_ref - o_new).abs().max().item()
+            max_fwd_diff = max(max_fwd_diff, fwd_diff)
+            torch.manual_seed(7)
+            loss_weight = torch.randn_like(o_ref)
+            (o_ref * loss_weight).sum().backward()
+            (o_new * loss_weight).sum().backward()
+            for name in param_names:
+                g_ref, g_new = p_ref[name].grad, p_new[name].grad
+                if g_ref is None or g_new is None:
+                    max_grad_diff = float('inf')
+                    continue
+                max_grad_diff = max(
+                    max_grad_diff, (g_ref - g_new).abs().max().item())
+
+    # ``full_softmax`` needs the full distribution, so the flag must be a
+    # no-op there: forward values stay identical to the historical branch.
+    p_fs_ref = copy.deepcopy(base)
+    p_fs_new = copy.deepcopy(base)
+    common_fs = dict(
+        m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+        sliding_window=0, sink_logits=None, normalize_qk=True)
+    o_fs_ref = naive_csa(H, **p_fs_ref, use_ste=True,
+                         ste_mode='full_softmax', recompute_indexer=False,
+                         **common_fs)
+    o_fs_new = naive_csa(H, **p_fs_new, use_ste=True,
+                         ste_mode='full_softmax', recompute_indexer=True,
+                         **common_fs)
+    fs_diff = (o_fs_ref - o_fs_new).abs().max().item()
+
+    return [
+        _ok('recompute indexer STE forward parity (fp64)',
+            max_fwd_diff <= 1e-12, f'max_abs_diff={max_fwd_diff:.3e}'),
+        _ok('recompute indexer STE gradient parity (fp64)',
+            max_grad_diff <= 1e-10, f'max_abs_diff={max_grad_diff:.3e}'),
+        _ok('recompute_indexer is a no-op for full_softmax',
+            fs_diff <= 1e-12, f'max_abs_diff={fs_diff:.3e}'),
+    ]
+
+
+def test_csa_indexer_recompute_ste_memory(device='cpu'):
+    """The recompute path must not retain the full soft distribution.
+
+    Uses saved-tensor hooks to assert two things about the forward graph:
+    the historical path saves a ``[B, T, n_blocks]`` activation, while the
+    recompute path never does; and the recompute path retains strictly
+    fewer bytes overall. The byte comparison is the user-visible benefit
+    (long-context CSA training memory), the shape assertion is the
+    structural invariant that keeps the benefit from silently regressing.
+    """
+    from grad_checkpointing import SavedBytesProbe
+    logger.info("Test: CSA indexer recompute STE memory")
+    torch.manual_seed(11)
+    B, T, d = 1, 128, 16
+    m, topk, nh, nIh, c, cI, dc = 4, 4, 2, 2, 8, 8, 8
+    n_blocks = (T + m - 1) // m
+    H = torch.randn(B, T, d, device=device, dtype=torch.float64)
+
+    def _make_params():
+        return dict(
+            W_aKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bKV=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_aZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            W_bZ=torch.randn(c, d, dtype=torch.float64) * 0.1,
+            Ba=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            Bb=torch.randn(m, c, dtype=torch.float64) * 0.02,
+            W_DQ=torch.randn(dc, d, dtype=torch.float64) * 0.1,
+            W_UQ=torch.randn(c * nh, dc, dtype=torch.float64) * 0.1,
+            W_IUQ=torch.randn(cI * nIh, dc, dtype=torch.float64) * 0.1,
+            W_w=torch.randn(nIh, d, dtype=torch.float64) * 0.1,
+            W_KV_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            W_Z_idx=torch.randn(cI, d, dtype=torch.float64) * 0.1,
+            B_idx=torch.randn(m, cI, dtype=torch.float64) * 0.02,
+        )
+
+    base = _make_params()
+    common = dict(
+        m=m, topk=topk, nh=nh, nIh=nIh, c=c, c_I=cI, dc=dc,
+        sliding_window=8, sink_logits=None, normalize_qk=True,
+        rope_dim=8, qk_norm_mode='l2', indexer_chunk=0,
+    )
+    retained_bytes = {}
+    saved_shapes = {}
+    for flag in (False, True):
+        p = {k: v.clone().requires_grad_(True) for k, v in base.items()}
+        probe = SavedBytesProbe()
+        with probe.measure():
+            naive_csa(H, **p, use_ste=True, recompute_indexer=flag,
+                      **common)
+        retained_bytes[flag] = probe.total_bytes()
+
+        p = {k: v.clone().requires_grad_(True) for k, v in base.items()}
+        shapes = []
+
+        def _pack(t):
+            shapes.append(tuple(t.shape))
+            return t
+
+        with torch.autograd.graph.saved_tensors_hooks(_pack, lambda t: t):
+            naive_csa(H, **p, use_ste=True, recompute_indexer=flag,
+                      **common)
+        saved_shapes[flag] = shapes
+
+    full_shape = (B, T, n_blocks)
+    old_retains_full = full_shape in saved_shapes[False]
+    new_retains_full = full_shape in saved_shapes[True]
+    return [
+        _ok('historical indexer STE retains full [B,T,n_blocks] soft weights',
+            old_retains_full, f'shape={full_shape}'),
+        _ok('recompute indexer STE does not retain full soft weights',
+            not new_retains_full, f'shape={full_shape}'),
+        _ok('recompute indexer STE retains fewer bytes',
+            retained_bytes[True] < retained_bytes[False],
+            f'old={retained_bytes[False]}, new={retained_bytes[True]}'),
+    ]
+
+
 def test_csa_full_pipeline_causality(device='cpu'):
     """Verify the full ``naive_csa`` pipeline (compression + indexer + sparse
     MQA core attention) is causal end-to-end.
@@ -1469,6 +1644,9 @@ __all__ = [
     'test_csa_indexer_ste_gradient',
     'test_csa_fuse_projections_grad_contract',
     'test_csa_indexer_ste_full_softmax',
+    'test_csa_indexer_recompute_ste_parity',
+    'test_csa_indexer_recompute_ste_memory',
+    'test_csa_selector_tie_reuse_fast_path',
     'test_csa_full_pipeline_causality',
     'test_csa_topk_edge_cases',
     'test_csa_topk_zero',

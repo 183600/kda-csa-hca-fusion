@@ -112,7 +112,11 @@ Rules of thumb:
 
 * The returned `soft_weights` tensor is still `[B, T, n_blocks]` when the STE
   is active — tiling bounds the *transient* per-head scores, not the STE
-  distribution the backward pass consumes in full.
+  distribution the backward pass consumes in full. For training, combine
+  this with `naive_csa(recompute_indexer=True)` /
+  `HybridConfig(csa_recompute_indexer=True)`, which recomputes the
+  distribution per query tile and retains only `[B, T, topk]` selected
+  weights (see [`csa-indexer-recompute.md`](csa-indexer-recompute.md)).
 * The untiled `topk=0` path also materializes the full logits; `topk=0` is an
   inference-only degenerate configuration, so it is deliberately not tiled.
 * The core attention over the selected blocks is already `O(T · topk · c)`

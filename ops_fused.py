@@ -222,6 +222,16 @@ class HybridConfig:
     # (row-wise ops + canonical tie-break), only the intermediate
     # memory footprint. Relevant for long-context prefill.
     csa_indexer_chunk: int = 0
+    # Memory-efficient CSA indexer STE (training only). False (default)
+    # retains the historical full ``[B, T, n_blocks]`` soft distribution
+    # for backward. True recomputes the per-tile logits under activation
+    # checkpointing and retains only the gathered ``[B, T, topk]``
+    # selected weights; forward values and gradients match the historical
+    # path up to fp reduction order. Applies to the default
+    # ``ste_mode='topk_columns'`` only (``full_softmax`` needs the full
+    # distribution). With ``csa_indexer_chunk=0`` the tile is auto-sized
+    # from ``ops_csa._CSA_INDEXER_STE_TILE_ELEMS``.
+    csa_recompute_indexer: bool = False
     # HCA config
     hca_m2: int = 64            # heavy compression (>> csa_m)
     hca_nh: int = 4
@@ -579,6 +589,14 @@ class HybridConfig:
                 f"csa_indexer_chunk={self.csa_indexer_chunk!r} must be a "
                 f"non-negative int (0 disables query-axis tiling of the "
                 f"CSA lightning indexer).")
+        # ``csa_recompute_indexer`` is a strict bool: the alternative
+        # backward graph must be selected explicitly, never by a truthy
+        # int. It only affects the training STE path.
+        if not isinstance(self.csa_recompute_indexer, bool):
+            raise TypeError(
+                f"csa_recompute_indexer={self.csa_recompute_indexer!r} must "
+                f"be a bool (False retains the full STE soft distribution; "
+                f"True recomputes it per query tile under checkpointing).")
         # HCA-specific: mirrors CSA's checks for the HCA analogs.
         if (not isinstance(self.hca_nh, int) or isinstance(self.hca_nh, bool)
                 or self.hca_nh < 1):
@@ -1300,6 +1318,9 @@ class CSAHybridLayer(nn.Module):
             normalize_qk=True,
             # Bounded-memory indexer scoring (0 = full-sequence scoring).
             indexer_chunk=cfg.csa_indexer_chunk,
+            # Memory-efficient STE backward (training only): retain the
+            # selected top-k weights, recompute the full softmax per tile.
+            recompute_indexer=cfg.csa_recompute_indexer,
         )
         return self.o_proj(o), None
 

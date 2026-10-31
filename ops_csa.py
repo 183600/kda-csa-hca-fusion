@@ -21,6 +21,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as _torch_checkpoint
 
 from ops_cache import normal_tensor_scope
 from ops_norm import RMS_NORM_EPS, rms_norm, rms_norm_
@@ -129,6 +130,16 @@ CHUNKED_SW_THRESHOLD = 8_000_000
 # densifies only up to this many elements (the full-slab and output paths
 # always use the view).
 _SW_TILE_DENSIFY_MAX = 5_000_000
+
+# Element budget for one query tile of the memory-efficient indexer STE
+# path (``naive_csa(recompute_indexer=True)``). The transient
+# ``[B, nIh, tile, n_blocks]`` logits/softmax tensor is bounded by this
+# many elements when the caller leaves ``indexer_chunk=0``; an explicit
+# positive ``indexer_chunk`` always wins. The full ``[B, T, n_blocks]``
+# soft distribution is never retained for backward: each tile is wrapped
+# in non-reentrant activation checkpointing and its logits are recomputed
+# during the backward pass.
+_CSA_INDEXER_STE_TILE_ELEMS = 4_000_000
 
 # Shape-keyed cache for the static ``[T, win]`` sliding-window validity mask
 # (True = real, non-padding position). The mask depends only on
@@ -1740,6 +1751,126 @@ def csa_lightning_indexer(
     return idx
 
 
+def _indexer_ste_query_chunk(B: int, HI: int, T: int, n_blocks: int,
+                             requested: int) -> int:
+    """Query tile for the recomputed indexer STE path.
+
+    An explicit positive ``requested`` value (``naive_csa.indexer_chunk``)
+    is honoured. ``0`` selects the largest tile whose per-tile
+    ``[B, HI, tile, n_blocks]`` logits tensor fits
+    ``_CSA_INDEXER_STE_TILE_ELEMS``; the tile is rounded DOWN to a
+    multiple of 64 when the budget allows it (aligned GEMM shape) and
+    floored at one row otherwise. Tiling is row-wise along the query axis,
+    so it changes only the transient allocation, never a per-query value.
+    """
+    if requested > 0:
+        return max(1, min(T, requested))
+    if T <= 0:
+        return 0
+    per_row = max(1, B * HI * n_blocks)
+    target = _CSA_INDEXER_STE_TILE_ELEMS // per_row
+    if target >= 64:
+        target -= target % 64
+    else:
+        target = max(1, target)
+    return max(1, min(T, target))
+
+
+def _indexer_ste_chunk(q_chunk: torch.Tensor,
+                       k_idx: torch.Tensor,
+                       w_chunk: torch.Tensor | None,
+                       topk: int,
+                       scale: float,
+                       mask_chunk: torch.Tensor | None,
+                       invalid_chunk: torch.Tensor | None):
+    """Recompute one query tile's hard indices and selected STE weights.
+
+    Returns ``(idx, selected)`` where ``selected`` is the gathered
+    softmax mass over the selected columns only, masked to zero for the
+    ``-1`` padding slots. Keeping the gather INSIDE the checkpointed
+    function is what makes the memory optimization work: the full
+    ``[B, tile, n_blocks]`` soft distribution is a transient inside the
+    forward and is recomputed during backward, never retained.
+    """
+    idx, soft = _lightning_indexer_chunk(
+        q_chunk, k_idx, w_chunk, topk, scale,
+        mask_chunk, True, invalid_chunk)
+    valid = idx >= 0
+    idx_safe = idx.clamp(min=0)
+    selected = torch.gather(soft, dim=-1, index=idx_safe)
+    selected = selected * valid.to(selected.dtype)
+    return idx, selected
+
+
+def _csa_indexer_ste_recompute(
+    q_idx: torch.Tensor,
+    k_idx: torch.Tensor,
+    w_idx: torch.Tensor | None,
+    topk: int,
+    *,
+    normalize_qk: bool,
+    causal_block_mask: torch.Tensor | None,
+    causal_block_mask_invalid: torch.Tensor | None,
+    query_chunk: int = 0,
+):
+    """Memory-efficient indexer STE: hard top-k + selected soft weights.
+
+    Mirrors the ``return_soft_weights=True`` branch of
+    :func:`csa_lightning_indexer` for ``ste_mode='topk_columns'`` but
+    never materializes the full differentiable distribution as a retained
+    activation. Each query tile is evaluated under
+    :func:`torch.utils.checkpoint.checkpoint` (non-reentrant), so the
+    ``[B, tile, n_blocks]`` logits / softmax intermediates are rebuilt in
+    the backward pass. The returned selected weights have shape
+    ``[B, T, topk]`` and carry the exact same gradient path (selected
+    columns of the full softmax) as the historical implementation.
+
+    The scale policy matches :func:`csa_lightning_indexer`: cosine scale
+    ``1.0`` when ``normalize_qk=True`` (both operands are L2-normalized
+    here, once, outside the tiles) and ``c_I ** -0.5`` otherwise.
+    """
+    B_, T, HI, DI = q_idx.shape
+    compute_dtype = (torch.float64 if q_idx.dtype == torch.float64
+                     else torch.float32)
+    if q_idx.dtype != compute_dtype:
+        q_idx = q_idx.to(compute_dtype)
+    if k_idx.dtype != compute_dtype:
+        k_idx = k_idx.to(compute_dtype)
+    if w_idx is not None and w_idx.dtype != compute_dtype:
+        w_idx = w_idx.to(compute_dtype)
+    if normalize_qk:
+        q_idx = _l2_normalize(q_idx)
+        k_idx = _l2_normalize(k_idx)
+    scale = 1.0 if normalize_qk else DI ** -0.5
+    n_blocks = k_idx.shape[1]
+    tile = _indexer_ste_query_chunk(B_, HI, T, n_blocks, query_chunk)
+    can_checkpoint = (
+        torch.is_grad_enabled()
+        and any(t is not None and t.requires_grad
+                for t in (q_idx, k_idx, w_idx)))
+    idx_tiles: list[torch.Tensor] = []
+    selected_tiles: list[torch.Tensor] = []
+    for start in range(0, T, tile):
+        end = min(start + tile, T)
+        q_chunk = q_idx[:, start:end]
+        w_chunk = None if w_idx is None else w_idx[:, start:end]
+        mask_chunk = (None if causal_block_mask is None
+                      else causal_block_mask[start:end])
+        invalid_chunk = (None if causal_block_mask_invalid is None
+                         else causal_block_mask_invalid[start:end])
+        if can_checkpoint:
+            idx_chunk, selected_chunk = _torch_checkpoint.checkpoint(
+                _indexer_ste_chunk, q_chunk, k_idx, w_chunk, topk, scale,
+                mask_chunk, invalid_chunk, use_reentrant=False)
+        else:
+            idx_chunk, selected_chunk = _indexer_ste_chunk(
+                q_chunk, k_idx, w_chunk, topk, scale,
+                mask_chunk, invalid_chunk)
+        idx_tiles.append(idx_chunk)
+        selected_tiles.append(selected_chunk)
+    return torch.cat(idx_tiles, dim=1), torch.cat(selected_tiles, dim=1)
+
+
 def _fused_projection_weight(weights: tuple) -> torch.Tensor:
     """Return ``cat(weights, dim=0)`` for an inference forward.
 
@@ -1789,6 +1920,7 @@ def naive_csa(
     qk_norm_mode: str = 'l2',
     indexer_chunk: int = 0,
     compress_chunk: int = 0,
+    recompute_indexer: bool = False,
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -1831,6 +1963,22 @@ def naive_csa(
     ``test_csa_chunk_fla_adapter.py``); only the
     intermediate memory footprint changes. Useful for long-context prefill and
     for `torch.compile`'d call sites that need bounded intermediate buffers.
+
+    ``recompute_indexer`` (default False) selects the memory-efficient STE
+    path for ``ste_mode='topk_columns'``. Instead of retaining the full
+    ``[B, T, n_blocks]`` differentiable soft distribution for backward,
+    query tiles are evaluated under non-reentrant activation
+    checkpointing and only the gathered ``[B, T, topk]`` selected weights
+    are kept; the per-tile logits are recomputed during backward. The
+    forward values, hard top-k selection, and parameter gradients are the
+    same as the historical path up to batched-GEMM reduction order
+    (pinned by ``test_csa_indexer_recompute_ste_parity``). When
+    ``indexer_chunk=0`` the tile is auto-sized to keep the transient
+    ``[B, nIh, tile, n_blocks]`` tensor within
+    ``_CSA_INDEXER_STE_TILE_ELEMS``; an explicit positive
+    ``indexer_chunk`` overrides the tile size. Ignored for
+    ``ste_mode='full_softmax'`` (that mode needs the full distribution)
+    and when STE is inactive (inference / ``no_grad``).
 
     ``compress_chunk`` (default 0 = automatic) forwards a block-axis tile size
     to both KV-compression kernels. ``0`` selects the automatic
@@ -1915,6 +2063,14 @@ def naive_csa(
     # memory bound was applied) — reject them.
     _require_int_geometry('naive_csa', 'indexer_chunk', indexer_chunk,
                           minimum=0)
+    # ``recompute_indexer`` is a strict bool (ints are rejected so
+    # ``recompute_indexer=1`` cannot silently enable the alternative
+    # backward graph). It only affects the STE training path.
+    if not isinstance(recompute_indexer, bool):
+        raise TypeError(
+            f"naive_csa: recompute_indexer={recompute_indexer!r} must be a "
+            f"bool (False retains the full STE soft distribution; True "
+            f"recomputes it per query tile).")
     # ``compress_chunk`` tiles the compressed-block axis of the KV
     # compression kernels. 0 = automatic heuristic; negative values would
     # silently run the untiled path, so reject them here.
@@ -2158,24 +2314,42 @@ def naive_csa(
     #   * normalize_qk=True  -> scale=1.0 (cosine similarity)
     #   * normalize_qk=False -> scale=c_I**-0.5 (classical dot-product attention)
     # Callers pass scale=None to defer to that policy.
-    indices = csa_lightning_indexer(q_idx, K_IComp, w_idx, topk,
-                                    scale=None,
-                                    causal_block_mask=cbm,
-                                    return_soft_weights=effective_use_ste,
-                                    ste_mode=ste_mode,
-                                    normalize_qk=normalize_qk,
-                                    query_chunk=indexer_chunk,
-                                    _causal_block_mask_invalid=cbm_invalid
-                                    )                              # [B, T, topk]
-    # When STE is active, the indexer also returns a differentiable
-    # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
-    # straight-through estimator. We keep it in a variable that is ``None``
-    # when STE is disabled (or no-grad inference is active) so the gather code
-    # below can branch cleanly.
-    if effective_use_ste:
-        indices, soft_weights = indices  # unpack the (idx, soft_weights) tuple
+    # Memory-efficient STE path: only ``topk_columns`` can skip the full
+    # soft distribution (``full_softmax`` needs every column's gradient
+    # and therefore keeps the historical path). The selected weights are
+    # produced inside checkpointed query tiles, so the retained
+    # activation is ``[B, T, topk]`` instead of ``[B, T, n_blocks]``.
+    use_recompute_indexer = (
+        recompute_indexer and effective_use_ste
+        and ste_mode == 'topk_columns' and topk > 0)
+    soft_weights = None
+    soft_weights_selected = None
+    if use_recompute_indexer:
+        indices, soft_weights_selected = _csa_indexer_ste_recompute(
+            q_idx, K_IComp, w_idx, topk,
+            normalize_qk=normalize_qk,
+            causal_block_mask=cbm,
+            causal_block_mask_invalid=cbm_invalid,
+            query_chunk=indexer_chunk,
+        )
     else:
-        soft_weights = None
+        indices = csa_lightning_indexer(
+            q_idx, K_IComp, w_idx, topk,
+            scale=None,
+            causal_block_mask=cbm,
+            return_soft_weights=effective_use_ste,
+            ste_mode=ste_mode,
+            normalize_qk=normalize_qk,
+            query_chunk=indexer_chunk,
+            _causal_block_mask_invalid=cbm_invalid
+        )                                                          # [B, T, topk]
+        # When STE is active, the indexer also returns a differentiable
+        # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
+        # straight-through estimator. We keep it in a variable that is
+        # ``None`` when STE is disabled (or no-grad inference is active) so
+        # the gather code below can branch cleanly.
+        if effective_use_ste:
+            indices, soft_weights = indices  # unpack the (idx, soft_weights)
 
     # --- 3. Shared-KV MQA core attention ---
     # attention queries (low-rank up-projection)
@@ -2344,13 +2518,17 @@ def naive_csa(
         # both the forward-equivalence and the backward-distinctness
         # (non-selected blocks receive non-zero gradient only under
         # ``full_softmax``).
-        if effective_use_ste and soft_weights is not None:
+        if effective_use_ste and (soft_weights is not None
+                                  or soft_weights_selected is not None):
             # Common path: gather top-k columns of soft_weights. This is
             # the differentiable surrogate for both modes (forward-equivalent
             # to the hard gather). ``full_softmax`` adds an additional
-            # term below.
-            soft_weights_selected = torch.gather(
-                soft_weights, dim=-1, index=idx_safe)                # [B, T, topk]
+            # term below. The memory-efficient path already gathered the
+            # selected columns inside its checkpointed tiles, so it skips
+            # the full-distribution gather here.
+            if soft_weights_selected is None:
+                soft_weights_selected = torch.gather(
+                    soft_weights, dim=-1, index=idx_safe)            # [B, T, topk]
             # Mask out invalid (-1) slots so they contribute zero
             # gradient (mirrors the hard path's valid_mask).
             soft_weights_selected = soft_weights_selected * \
