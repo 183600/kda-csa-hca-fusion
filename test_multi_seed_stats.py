@@ -1927,3 +1927,41 @@ def test_split_half_selection_validation_validates_inputs():
     with pytest.raises(ValueError):
         M.split_half_selection_validation([('a', {42: 1.0}),
                                            ('a', {42: 0.0})])
+
+
+def test_cohens_dz_ci_is_reproducible_scale_invariant_and_json_safe():
+    d = [0.4, -0.1, 0.7, 0.2, 0.5]
+    ci = M.cohens_dz_ci(d, n_boot=2000, seed=7)
+    again = M.cohens_dz_ci(d, n_boot=2000, seed=7)
+    assert ci == again
+    assert ci['ci_level'] == 0.95
+    assert ci['method'] == 'percentile_bootstrap_paired_diffs'
+    assert ci['ci_lo'] <= ci['ci_hi']
+    assert 0 <= ci['n_undefined'] <= ci['n_boot']
+    json.dumps(ci, allow_nan=False)
+
+    scaled = M.cohens_dz_ci([10.0 * x for x in d], n_boot=2000, seed=7)
+    assert scaled['ci_lo'] == pytest.approx(ci['ci_lo'])
+    assert scaled['ci_hi'] == pytest.approx(ci['ci_hi'])
+
+    summary = M.summarize_paired(d, seed=7, n_boot=2000,
+                                 n_permutations=1000)
+    assert summary['ci95_cohens_dz'] == [ci['ci_lo'], ci['ci_hi']]
+    assert summary['cohens_dz_bootstrap'] == {
+        'n_boot': 2000, 'seed': 7, 'n_undefined': ci['n_undefined']}
+    json.dumps(summary, allow_nan=False)
+
+
+def test_cohens_dz_ci_degenerate_and_validation():
+    for values in ([0.5], [0.5, 0.5], []):
+        out = M.cohens_dz_ci(values, n_boot=100)
+        assert out['ci_lo'] is None and out['ci_hi'] is None
+        assert out['n_pairs'] == len(values)
+    with pytest.raises(ValueError):
+        M.cohens_dz_ci([0.1, 0.2], alpha=0.0)
+    with pytest.raises(ValueError):
+        M.cohens_dz_ci([0.1, 0.2], n_boot=0)
+    with pytest.raises(ValueError):
+        M.cohens_dz_ci([0.1, 0.2], seed=True)
+    with pytest.raises(ValueError):
+        M.cohens_dz_ci([0.1, float('inf')])

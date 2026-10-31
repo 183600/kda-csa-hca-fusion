@@ -25,6 +25,7 @@ from checks.csa import *  # noqa: F401,F403
 from checks.hca import *  # noqa: F401,F403
 from checks.hybrid import *  # noqa: F401,F403
 from checks.flops import *  # noqa: F401,F403
+from checks.stats import *  # noqa: F401,F403
 from checks.decoding import *  # noqa: F401,F403
 from checks.mamba import *  # noqa: F401,F403
 from checks.rwkv import *  # noqa: F401,F403
@@ -215,6 +216,10 @@ def main():
     # filler noise must never leak key/value/answer tokens.
     all_results += _run_safe(test_mqar_noise_excludes_keys_and_values, device)
     all_results += _run_safe(test_ranking_chance_reference_is_exact, device)
+    # Effect-size uncertainty: Cohen's d_z bootstrap CI, its
+    # scale-invariance/degenerate contracts, and its integration into the
+    # one-call paired panel.
+    all_results += _run_safe(test_effect_size_ci, device)
 
     # Partial RoPE (DeepSeek-V4 §2.3.3) — paper-faithful positional
     # embedding for CSA/HCA: unit properties, module wiring, and

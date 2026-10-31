@@ -96,6 +96,19 @@ plain non-significant superiority test can never make.
   scales (loss, PPL) pass a margin on that scale instead; `ppl_bootstrap`
   comparisons use their own paired-bootstrap machinery.
 
+### Effect-size uncertainty
+
+A standardized effect without an interval invites over-reading: at the
+5-7-seed budgets used here, `d_z` itself is noisy. `summarize_paired` now
+carries `ci95_cohens_dz` from `multi_seed_stats.cohens_dz_ci`, a percentile
+bootstrap over the same seed-paired differences (same local RNG seed as the
+mean-difference bootstrap, so the two intervals describe the same
+resamples). Bootstrap draws with zero variance are counted in
+`cohens_dz_bootstrap.n_undefined` instead of being turned into `inf`; fewer
+than two pairs or a constant difference vector yields `None`. The interval
+is descriptive uncertainty, not an exact coverage guarantee, and it never
+substitutes for the permutation/equivalence evidence above.
+
 ## Numerical equivalence is a different question
 
 The TOST machinery above compares *seed-paired experimental results*. A

@@ -138,6 +138,7 @@ __all__ = [
     'permutation_test',
     'bootstrap_paired_ci',
     'cohens_dz',
+    'cohens_dz_ci',
     'tost_paired',
     'tost_from_summary',
     'equivalence_margin_supported',
@@ -2723,6 +2724,76 @@ def cohens_dz(diffs) -> float | None:
     return mean / sd
 
 
+def cohens_dz_ci(diffs, alpha: float = 0.05, n_boot: int = 10000,
+                 seed: int = 0) -> dict:
+    """Percentile-bootstrap confidence interval for Cohen's ``d_z``.
+
+    The point estimate :func:`cohens_dz` hides how much the standardized
+    effect itself moves with the seed sample. In a 5-seed panel that
+    uncertainty is large; a ``d_z = 0.8`` with a CI spanning ``[-0.3,
+    1.9]`` must not be read as a confirmed large effect. This function
+    resamples the paired differences with replacement (the same local
+    ``random.Random(seed)`` scheme as :func:`bootstrap_paired_ci`, so with
+    the same seed the two intervals come from the same resamples) and
+    reports the ``1 - alpha`` percentile interval.
+
+    Bootstrap samples with zero variance are undefined ``d_z`` values and
+    are skipped (the count is returned as ``n_undefined``); if no resample
+    is defined, the interval is ``None`` rather than fabricated. This is a
+    descriptive uncertainty interval, not an exact coverage guarantee: at
+    the smallest seed budgets the percentile bootstrap is optimistic, so
+    pair it with the exact/permutation evidence, never replace it.
+
+    Returns a strict-JSON dict with ``ci_lo`` / ``ci_hi`` (``None`` when
+    undefined), ``ci_level``, and the resampling provenance.
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
+        raise ValueError(f'n_boot must be a positive int, got {n_boot!r}')
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f'seed must be an int, got {seed!r}')
+    d = _as_clean_diffs(diffs)
+    n = len(d)
+    out = {
+        'n_pairs': n,
+        'n_boot': n_boot,
+        'seed': seed,
+        'ci_level': 1.0 - alpha,
+        'ci_lo': None,
+        'ci_hi': None,
+        'n_undefined': 0,
+        'method': 'percentile_bootstrap_paired_diffs',
+    }
+    if n < 2:
+        return out
+    mean = _safe_mean(d)
+    sd = _sample_sd(d, mean)
+    if sd is None or sd <= 0.0:
+        return out
+    rng = random.Random(seed)
+    dzs = []
+    for _ in range(n_boot):
+        sample = [d[rng.randrange(n)] for _ in range(n)]
+        m = _safe_mean(sample)
+        s = _sample_sd(sample, m)
+        if s is None or s <= 0.0:
+            continue
+        dz = m / s
+        if math.isfinite(dz):
+            dzs.append(dz)
+    out['n_undefined'] = n_boot - len(dzs)
+    if not dzs:
+        return out
+    dzs.sort()
+    m_boot = len(dzs)
+    lo_idx = int(math.floor((alpha / 2.0) * m_boot))
+    hi_idx = int(math.ceil((1.0 - alpha / 2.0) * m_boot)) - 1
+    out['ci_lo'] = dzs[min(max(lo_idx, 0), m_boot - 1)]
+    out['ci_hi'] = dzs[min(max(hi_idx, 0), m_boot - 1)]
+    return out
+
+
 def tost_paired(diffs, margin: float, alpha: float = 0.05) -> dict:
     """Two one-sided paired t-tests (TOST) for practical equivalence.
 
@@ -3510,11 +3581,11 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
 
     Returns a single JSON-safe record containing the effect estimate,
     t-based and bootstrap CIs, the parametric t-test, the exact sign test,
-    the sign-flip permutation test, Cohen's ``d_z``, the seed win rate,
-    and the number of seeds a follow-up run would need for ``power`` at
-    the observed effect. ``direction`` is ``'greater'`` when the mean
-    difference is positive, ``'less'`` when negative, ``'none'`` when
-    exactly zero.
+    the sign-flip permutation test, Cohen's ``d_z`` together with its
+    paired-bootstrap ``ci95_cohens_dz``, the seed win rate, and the number
+    of seeds a follow-up run would need for ``power`` at the observed
+    effect. ``direction`` is ``'greater'`` when the mean difference is
+    positive, ``'less'`` when negative, ``'none`` when exactly zero.
 
     When ``equivalence_margin`` is given (a PRE-SPECIFIED smallest effect
     of interest, on the same scale as the differences), the record
@@ -3577,6 +3648,7 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                             max_exact=max_exact)
     boot = bootstrap_paired_ci(d, alpha=alpha, n_boot=n_boot, seed=seed)
     dz = cohens_dz(d)
+    dz_ci = cohens_dz_ci(d, alpha=alpha, n_boot=n_boot, seed=seed)
     n_pos = sum(1 for x in d if x > 0)
     n_neg = sum(1 for x in d if x < 0)
     n_nonzero = n_pos + n_neg
@@ -3612,6 +3684,10 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
         'median_diff': median,
         'sd_diff': sd,
         'cohens_dz': dz,
+        'ci95_cohens_dz': [dz_ci['ci_lo'], dz_ci['ci_hi']],
+        'cohens_dz_bootstrap': {
+            'n_boot': dz_ci['n_boot'], 'seed': dz_ci['seed'],
+            'n_undefined': dz_ci['n_undefined']},
         'direction': direction,
         'win_rate': win_rate,
         'win_rate_ci95': sign['win_rate_ci95'],
