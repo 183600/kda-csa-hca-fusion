@@ -334,6 +334,23 @@ bit-identical reference paths. The precision sweep and
 ``test_needle_haystack.py::test_bf16_csa_hca_no_nan_inf`` pins the CSA/HCA
 bf16 path.
 
+### Incremental decode caches stay in compute precision
+
+The full-sequence CSA/HCA operators compute compressed blocks in fp32
+(only the final output is rounded to the input dtype). The incremental
+``CSADecodingCache`` / ``HCADecodingCache`` used by ``run_decoding``
+therefore store their persistent cache at compute precision as well
+(``_cache_storage_dtype``: fp32 for fp16/bf16 inputs, fp64 for fp64),
+mirroring the KDA/Mamba-2/RWKV-7 recurrent-state contract. Storing the
+cache at bf16 instead adds a second rounding of the compressed blocks;
+the lightning indexer can then select a different top-k block on a
+near-tie, and the decoded suffix diverges from a one-shot prefill by
+many bf16 ulps on some seeds. The multi-seed regression
+``test_hybrid_decode_bf16_cache_precision`` pins bit-exact parity (with a
+2-ulp budget) for the KDA, Mamba-2, and RWKV-7 routes. The cost is 2x
+CSA/HCA cache bytes under bf16/fp16 deployment; the constant-state
+scaling claim is unchanged.
+
 ## Entry points
 
 ```bash

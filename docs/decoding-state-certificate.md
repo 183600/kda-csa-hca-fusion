@@ -54,6 +54,32 @@ the live numbers can be reconciled one-to-one with Exp 3's analytical
 model. The allocated capacity follows the same geometric rule
 (`next pow2 >= n_blocks`), which is what makes that reconciliation exact.
 
+## Storage precision (bf16/fp16 deployments)
+
+The certificate above is about state SIZE; the state's numerical
+contract is separate. The memory-route recurrent state (KDA / Mamba-2 /
+RWKV-7) is stored in compute precision (fp32 for fp16/bf16 inputs, fp64
+for fp64), and `run_decoding` now applies the same rule to the CSA/HCA
+incremental caches via `_cache_storage_dtype`. Storing compressed blocks
+at the input dtype instead adds one extra bf16 rounding relative to the
+full-sequence prefill; near-tied lightning-indexer scores can then cross
+a tie boundary and change the hard top-k selection. On the 3:1:1 hybrid
+that produced up to ~11 bf16 ulps of prefill-vs-decode output drift on
+one seed while other seeds stayed within 1 ulp — exactly the kind of
+seed-dependent regression a single-draw smoke test misses. With
+compute-precision caches, token-by-token bf16 decode is bit-identical to
+a one-shot bf16 prefill across seeds and across all three memory routes
+(`checks/decoding.py::test_hybrid_decode_bf16_cache_precision`, budget
+2 bf16 ulps of the output scale).
+
+The tradeoff is explicit: bf16/fp16 deployment pays 2x CSA/HCA cache
+bytes (the same 2x the recurrent state already pays). That does not
+change the constant-vs-growing classification, but it does double the
+`decode_state_bytes` of CSA/HCA rows under a low-precision model. A
+production kernel that wants the bandwidth back must make the
+lower-precision cache an explicit, separately validated choice rather
+than the silent default.
+
 ## Invariants pinned by tests
 
 `test_decode_state_certificate.py` checks 18 properties, among them:

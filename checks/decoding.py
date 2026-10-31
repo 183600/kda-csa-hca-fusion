@@ -412,6 +412,82 @@ def test_decoding_cache_reset_clears_state(device='cpu'):
         f'sw_valid={cache.sw_buffer.n_valid if cache.sw_buffer else 0}')]
 
 
+def test_hybrid_decode_bf16_cache_precision(device='cpu'):
+    """bf16 token-by-token decode must match a one-shot bf16 prefill.
+
+    The persistent KDA / Mamba-2 / RWKV-7 recurrent state already lives in
+    compute precision (fp32 for bf16 inputs). The CSA/HCA incremental
+    caches historically stored their compressed blocks at the INPUT dtype,
+    which added one extra bf16 rounding relative to the full-sequence
+    prefill. That rounding can move near-tied lightning-indexer scores
+    across a tie boundary, changing the hard top-k selection and making
+    the decode suffix differ from prefill by many bf16 ulps on some seeds
+    (observed: ~11 ulp on seed 1 of the 3:1:1 hybrid, while other seeds
+    were within 1 ulp).
+
+    This is a MULTI-SEED certificate, not a one-draw smoke test: a single
+    lucky seed would have passed the old bf16-cache path. All three memory
+    routes share the same CSA/HCA cache code, so each route is checked
+    across seeds. The budget is two bf16 ulps of the output scale (the
+    incremental and one-shot paths use different softmax reduction
+    orders; with compute-precision caches the observed diff is exactly
+    zero, so 2 ulp leaves headroom for platform-specific reduction ULP
+    without admitting the old requantization error).
+    """
+    import copy
+    from run_decoding import HybridDecoding
+
+    torch.manual_seed(0)
+    d_model, total_layers = 32, 5
+    T, prefill = 64, 32
+    seeds = (0, 1, 2)
+    results = []
+    for route in ('kda', 'mamba2', 'rwkv7'):
+        for seed in seeds:
+            torch.manual_seed(seed)
+            ref = HybridDecoding(d_model=d_model, total_layers=total_layers,
+                                 memory_type=route).to(device).eval()
+            low = copy.deepcopy(ref).to(dtype=torch.bfloat16).eval()
+            x = torch.randn(1, T, d_model, device=device)
+            with torch.no_grad():
+                full = low(x.bfloat16())
+                low.reset()
+                outs = [low(x[:, :prefill].bfloat16())]
+                for t in range(prefill, T):
+                    outs.append(low(x[:, t:t + 1].bfloat16()))
+                dec = torch.cat(outs, dim=1)
+            diff = (dec.float() - full.float()).abs().max().item()
+            scale = full.float().abs().max().item()
+            tol = 2.0 * float(torch.finfo(torch.bfloat16).eps) * max(1.0, scale)
+            caches = [c for c in (*low._csa_caches, *low._hca_caches)
+                      if c is not None]
+            cache_fp32 = bool(caches) and all(
+                c.dtype == torch.float32 for c in caches)
+            state = low.model._kda_state
+            state_fp32 = state is None or state.dtype == torch.float32
+            results.append(_ok(
+                f'{route} bf16 decode == prefill (seed={seed})',
+                diff <= tol and cache_fp32 and state_fp32,
+                f'max_diff={diff:.3e} tol={tol:.3e} scale={scale:.3e} '
+                f'cache_dtypes={[str(c.dtype) for c in caches]} '
+                f'state_dtype={None if state is None else state.dtype}'))
+
+    # The standalone CSA/HCA benchmark wrappers share the same helper; pin
+    # their cache storage dtype directly so a future refactor cannot
+    # silently reintroduce the bf16 requantization only in those paths.
+    from run_decoding import CSAAttnDecoding, HCAAttnDecoding
+    for name, cls in (('csa', CSAAttnDecoding), ('hca', HCAAttnDecoding)):
+        mod = cls(d_model).to(device).to(torch.bfloat16).eval()
+        with torch.no_grad():
+            mod(torch.randn(1, 8, d_model, device=device).bfloat16())
+            mod(torch.randn(1, 1, d_model, device=device).bfloat16())
+        results.append(_ok(
+            f'standalone {name} bf16 cache stores fp32',
+            mod._cache is not None and mod._cache.dtype == torch.float32,
+            f'cache_dtype={None if mod._cache is None else mod._cache.dtype}'))
+    return results
+
+
 __all__ = [
     'test_decoding_batch_size_change',
     'test_csa_decoding_cache_correctness',
@@ -422,4 +498,5 @@ __all__ = [
     'test_csa_decoding_cache_prefill_then_decode',
     'test_hca_decoding_cache_compressed_blocks_match',
     'test_decoding_cache_reset_clears_state',
+    'test_hybrid_decode_bf16_cache_precision',
 ]

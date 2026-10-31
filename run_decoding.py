@@ -103,6 +103,29 @@ _DEFERRED_IMPORT_WARNING = (
 )
 
 
+def _cache_storage_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Persistent decode-cache storage dtype.
+
+    KDA / Mamba-2 / RWKV-7 keep their recurrent state in compute
+    precision (fp32 for fp16/bf16 inputs, fp64 for fp64) so the state is
+    never requantized between steps. The CSA/HCA incremental caches must
+    follow the SAME contract: storing compressed blocks at the input
+    dtype (bf16) adds one extra rounding relative to the full-sequence
+    prefill, which shifts near-tied indexer scores and can change the
+    hard top-k selection. That makes token-by-token decode disagree with
+    a one-shot prefill by many bf16 ulps (up to ~11 ulp observed across
+    seeds), even though both paths implement the same math. Storing the
+    cache in compute precision restores bit-exact prefill/decode parity
+    while the OUTPUT still follows the input dtype.
+
+    The cost is 2x cache bytes for bf16/fp16 deployment (the same 2x
+    the memory-route recurrent state already pays). This is the
+    correctness-first reference default; a production kernel can trade
+    it back for bandwidth with an explicit lower-precision cache.
+    """
+    return torch.float64 if dtype == torch.float64 else torch.float32
+
+
 def _clear_cache(device):
     gc.collect()
     if device.type == 'cuda':
@@ -796,6 +819,12 @@ class CSAAttnDecoding(nn.Module):
     The parameterization mirrors :class:`ops_fused.CSAHybridLayer` so
     the decode-cost comparison reflects the SAME operator the fused
     model uses.
+
+    The persistent cache is allocated in COMPUTE precision (fp32 for
+    fp16/bf16 inputs), not the input dtype; see
+    :func:`_cache_storage_dtype`. This keeps token-by-token decode
+    bit-identical to a one-shot prefill under reduced precision. The
+    output still follows the input dtype.
     """
 
     def __init__(self, d_model, m=4, topk=2, nh=2, c=8, dc=8,
@@ -855,12 +884,16 @@ class CSAAttnDecoding(nn.Module):
         return _cache_state_breakdown(self._cache)
 
     def _ensure_cache(self, B, device, dtype):
+        # Persistent cache state lives in compute precision, not the
+        # input dtype; see ``_cache_storage_dtype`` for the bf16
+        # top-k/precision rationale.
+        storage_dtype = _cache_storage_dtype(dtype)
         if self._cache is None or self._cache.B != B \
                 or self._cache.device != device \
-                or self._cache.dtype != dtype:
+                or self._cache.dtype != storage_dtype:
             self._cache = CSADecodingCache(
                 B, self.c, self.c_I, self.m, self.sliding_window,
-                device, dtype,
+                device, storage_dtype,
                 rope_dim=self.rope_dim, rope_base=self.rope_base,
             )
 
@@ -959,6 +992,8 @@ class HCAAttnDecoding(nn.Module):
     dense MQA + SW, no indexer). Uses
     :class:`ops_decoding_cache.HCADecodingCache` for the incremental
     path. The parameterization mirrors :class:`ops_fused.HCAHybridLayer`.
+    The persistent cache is allocated in compute precision (see
+    :func:`_cache_storage_dtype`); the output follows the input dtype.
     """
 
     def __init__(self, d_model, m2=4, nh=2, c=8, dc=8,
@@ -999,11 +1034,15 @@ class HCAAttnDecoding(nn.Module):
         return _cache_state_breakdown(self._cache)
 
     def _ensure_cache(self, B, device, dtype):
+        # Compute-precision persistent cache; see
+        # ``_cache_storage_dtype``.
+        storage_dtype = _cache_storage_dtype(dtype)
         if self._cache is None or self._cache.B != B \
                 or self._cache.device != device \
-                or self._cache.dtype != dtype:
+                or self._cache.dtype != storage_dtype:
             self._cache = HCADecodingCache(
-                B, self.c, self.m2, self.sliding_window, device, dtype,
+                B, self.c, self.m2, self.sliding_window, device,
+                storage_dtype,
                 rope_dim=self.rope_dim, rope_base=self.rope_base,
             )
 
@@ -1205,6 +1244,12 @@ class HybridDecoding(nn.Module):
         CSA/HCA sub-layer's incremental cache (grown by ``~T/m``).
         Mirrors ``cache_accounting.live_cache_components``' attribution,
         but returns plain ints for the Exp 6 certificate.
+
+        Under fp16/bf16 inputs the recurrent state and the CSA/HCA caches
+        are stored in fp32 (compute precision), so these bytes are 2x the
+        input-dtype storage. The growth classification is unchanged; the
+        precision rationale is in ``_cache_storage_dtype`` and
+        ``docs/decoding-state-certificate.md``.
         """
         components = {}
         memory_state = getattr(self.model, '_kda_state', None)
@@ -1249,11 +1294,12 @@ class HybridDecoding(nn.Module):
         cfg = layer.cfg
         B = h.shape[0]
         cache = self._csa_caches[idx]
+        storage_dtype = _cache_storage_dtype(h.dtype)
         if cache is None or cache.B != B or cache.device != h.device \
-                or cache.dtype != h.dtype:
+                or cache.dtype != storage_dtype:
             cache = CSADecodingCache(
                 B, cfg.csa_c, cfg.csa_cI, cfg.csa_m,
-                cfg.csa_sliding_window, h.device, h.dtype,
+                cfg.csa_sliding_window, h.device, storage_dtype,
                 rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
                 qk_norm_mode=cfg.csa_qk_norm_mode,
             )
@@ -1265,11 +1311,12 @@ class HybridDecoding(nn.Module):
         cfg = layer.cfg
         B = h.shape[0]
         cache = self._hca_caches[idx]
+        storage_dtype = _cache_storage_dtype(h.dtype)
         if cache is None or cache.B != B or cache.device != h.device \
-                or cache.dtype != h.dtype:
+                or cache.dtype != storage_dtype:
             cache = HCADecodingCache(
                 B, cfg.hca_c, cfg.hca_m2, cfg.hca_sliding_window,
-                h.device, h.dtype,
+                h.device, storage_dtype,
                 rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
                 qk_norm_mode=cfg.hca_qk_norm_mode,
             )

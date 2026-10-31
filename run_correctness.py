@@ -186,6 +186,10 @@ def main():
     all_results += _run_safe(test_decoding_cache_reset_clears_state, device)
     # Integrated Exp6 hybrid decode-cache path (KDA state + CSA/HCA caches).
     all_results += _run_safe(test_hybrid_decoding_cache_matches_full_sequence, device)
+    # Multi-seed bf16 certificate: persistent CSA/HCA caches must stay in
+    # compute precision so token-by-token decode matches one-shot prefill
+    # (the input-dtype cache requantization shifted top-k on some seeds).
+    all_results += _run_safe(test_hybrid_decode_bf16_cache_precision, device)
     # The tensor-parallel streaming oracle must carry the same KDA state,
     # conv lookbacks, and CSA/HCA caches and reproduce the unsharded decoder.
     all_results += _run_safe(test_hybrid_streaming_tp_matches_unsharded, device)

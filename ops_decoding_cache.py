@@ -53,6 +53,16 @@ decode and a continuation chunk agree on both values and output dtype.
 SW keys remain prepared in the cache's own compute dtype, exactly like
 ``append_step``, so the query precision can never change stored state.
 
+Callers deploying fp16/bf16 models should construct the cache with the
+COMPUTE dtype (fp32 for fp16/bf16, fp64 for fp64), not the input dtype.
+The full-sequence operators compute compressed blocks in compute
+precision and round only their output; a cache stored at the input dtype
+adds one extra rounding, which can move near-tied indexer scores across a
+top-k boundary and break prefill/decode agreement on some seeds.
+``run_decoding._cache_storage_dtype`` applies this rule to the decode
+wrappers, and ``test_hybrid_decode_bf16_cache_precision`` certifies it
+across seeds and memory routes.
+
 The bit-equivalence holds because:
 
   * The compressed block cache stores EXACTLY the ``C_comp`` tensor that
