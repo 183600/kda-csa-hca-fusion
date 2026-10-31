@@ -244,6 +244,10 @@ def main():
     all_results += _run_safe(test_mamba2_state_request_independence, device)
     all_results += _run_safe(test_hybrid_stack_memory_routes, device)
     all_results += _run_safe(test_mamba2_official_backend_parity, device)
+    # CPU-runnable wrapper contract with a fake mamba_ssm: the real kernel
+    # is CUDA-only, so state bookkeeping would otherwise be untested in CI.
+    all_results += _run_safe(test_mamba2_official_wrapper_contract_fake,
+                             device)
     all_results += _run_safe(test_mamba2_backend_selection_contract, device)
 
     # RWKV-7 (Goose) reference mixer — the third memory route. Covers the

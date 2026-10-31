@@ -129,11 +129,21 @@ spellings across `mamba_ssm` revisions). The official module fuses
 reference keeps the Mamba-1-style `x_proj` + `dt_proj` head and an x-only
 short conv, so those tensors are structurally incompatible;
 `transfer_reference_state` raises a `ValueError` listing them rather than
-silently producing wrong outputs. The parity test
-(`test_mamba2_official_backend_parity`) copies the transferable weights
-into the official module and requires output/state agreement within
-dtype-scaled tolerance (reduction orders differ; bit-equality is not the
-contract). It self-skips with a recorded note on CPU-only boxes.
+silently producing wrong outputs. Consequently a *full-mixer* output
+parity test is impossible by construction; claiming one would be a
+false certificate. The parity test
+(`test_mamba2_official_backend_parity`) therefore certifies the layer
+where the two implementations must agree — the SSD scan kernel — by
+feeding `mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined` and
+the repository's recurrent/chunked scans identical `(x, dt, A, B, C, D,
+S0)` and comparing outputs/final states within a dtype-scaled tolerance
+(reduction orders differ; bit-equality is not the contract). It also
+pins the official wrapper's own prefill+step state protocol, the fused
+head's refusal to accept reference weights, and the
+`conv_state` layout. The CUDA-gated part self-skips with a recorded note
+on CPU-only boxes; `test_mamba2_official_wrapper_contract_fake` covers
+the wrapper's state bookkeeping on CPU by injecting a fake CUDA-free
+`mamba_ssm` module.
 
 The two backends also expose different runtime state layouts: the SSM
 state is identical (`[B, nheads, headdim, d_state]`), but the official

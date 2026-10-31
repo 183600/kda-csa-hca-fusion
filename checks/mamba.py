@@ -422,14 +422,23 @@ def test_hybrid_stack_memory_routes(device='cpu'):
 
 
 def test_mamba2_official_backend_parity(device='cpu'):
-    """Reference vs official mamba_ssm outputs/gradients match, when installed.
+    """Official-backend parity is certified at the SHARED SSD scan.
+
+    The reference and official *mixer heads* are structurally different:
+    ``mamba_ssm.Mamba2`` fuses ``[z, x, B, C, dt]`` into ``in_proj``, runs
+    one conv over ``xBC``, and appends a gated RMSNorm, while the reference
+    keeps the Mamba-1-style ``x_proj``/``dt_proj`` head and an x-only conv.
+    A full-mixer weight transfer can therefore NEVER reproduce the
+    reference output; :func:`transfer_reference_state` correctly raises
+    for the fused parameters. What CAN and MUST agree is the mathematical
+    core both backends evaluate: the SSD scan over identical
+    ``(x, dt, A, B, C, D, initial_state)``. This test pins that core
+    against ``mamba_chunk_scan_combined`` (the actual Triton kernel the
+    official mixer calls), plus the official wrapper's own
+    prefill-plus-step state protocol.
 
     Skipped (recorded as PASS-with-note) when the optional ``mamba-ssm``
-    extra or CUDA is unavailable — mirroring how the FLA KDA backend is
-    handled. When it IS available, the test transfers the reference
-    weights into the official module and requires output agreement within
-    a dtype-scaled tolerance (fp32: 1e-4; the official kernels use
-    different reduction orders, so bit-equality is NOT the contract).
+    extra or CUDA is unavailable — mirroring the FLA KDA backend.
     """
     results = []
     if device != 'cuda' or not mamba2_official_available():
@@ -439,35 +448,242 @@ def test_mamba2_official_backend_parity(device='cpu'):
             f"device={device}, official_available="
             f"{mamba2_official_available()}"))
         return results
-    from ops_mamba_backend import (OfficialMamba2Mixer,
-                                    build_official_mamba2_mixer,
-                                    transfer_reference_state)
+    from ops_mamba import chunked_mamba2_scan, naive_mamba2_scan
+    from ops_mamba_backend import (build_official_mamba2_mixer,
+                                   transfer_reference_state)
     torch.manual_seed(9)
     cfg = _mamba2_small_cfg()
     ref = Mamba2Mixer(cfg).to(device).eval()
     off = build_official_mamba2_mixer(cfg).to(device).eval()
-    transfer_reference_state(off.mamba, ref)
-    B, T, d = 2, 40, 32
+
+    # The fused official head is not weight-compatible with the reference
+    # head; the transfer helper must say so instead of silently producing
+    # a mixed-parameter module.
+    raised = None
+    try:
+        transfer_reference_state(off.mamba, ref)
+    except ValueError as exc:
+        raised = exc
+    results.append(_ok(
+        'fused official head refuses reference weight transfer',
+        raised is not None and 'in_proj.weight' in str(raised),
+        f'raised={type(raised).__name__ if raised else None}'))
+
+    # --- shared SSD-scan parity -------------------------------------
+    B, T, H, P, N, G = 2, 37, 4, 16, 16, 1
+    x = torch.randn(B, T, H, P, device=device)
+    dt_raw = torch.randn(B, T, H, device=device) * 0.1 - 1.0
+    dt = F.softplus(dt_raw)
+    Bm = torch.randn(B, T, G, N, device=device)
+    Cm = torch.randn(B, T, G, N, device=device)
+    A = -torch.rand(H, device=device) - 0.05
+    D = torch.randn(H, device=device)
+    s0 = torch.randn(B, H, P, N, device=device)
+    y_ref, s_ref = naive_mamba2_scan(
+        x, dt, Bm, Cm, A, D, initial_state=s0)
+    y_chunk, s_chunk = chunked_mamba2_scan(
+        x, dt, Bm, Cm, A, D, initial_state=s0, chunk_size=16)
+    from mamba_ssm.ops.triton.ssd_combined import (
+        mamba_chunk_scan_combined)
+    y_off, s_off = mamba_chunk_scan_combined(
+        x, dt_raw, A, Bm, Cm, 16, D=D,
+        dt_bias=torch.zeros(H, device=device), dt_softplus=True,
+        initial_states=s0, return_final_states=True)
+    tol = 5e-3
+    diff_y = (y_ref.float() - y_off.float()).abs().max().item()
+    diff_s = (s_ref.float() - s_off.float()).abs().max().item()
+    diff_c = (y_chunk.float() - y_off.float()).abs().max().item()
+    results.append(_ok(
+        'official mamba_chunk_scan_combined == reference recurrent scan',
+        diff_y < tol, f'maxdiff={diff_y:.2e} (tol={tol:g})'))
+    results.append(_ok(
+        'official scan final state == reference recurrent final state',
+        diff_s < tol, f'maxdiff={diff_s:.2e} (tol={tol:g})'))
+    results.append(_ok(
+        'official scan == repository chunked scan (same initial state)',
+        diff_c < tol, f'maxdiff={diff_c:.2e} (tol={tol:g})'))
+
+    # --- wrapper state protocol (only meaningful on its own module) ---
+    B, T, d = 2, 40, cfg.d_model
     x = torch.randn(B, T, d, device=device)
     with torch.no_grad():
-        out_ref, s_ref, c_ref = ref.forward_functional(x, None, None)
         out_off, s_off, c_off = off.forward_functional(x, None, None)
-    tol_out = 1e-4
-    diff = (out_ref.float() - out_off.float()).abs().max().item()
-    results.append(_ok('official backend output parity (fp32)',
-                       diff < tol_out, f'maxdiff={diff:.2e}'))
-    diff_s = (s_ref.float() - s_off.float()).abs().max().item()
-    results.append(_ok('official backend SSM state parity',
-                       diff_s < tol_out, f'maxdiff={diff_s:.2e}'))
-    # Prefill+step equivalence through the official wrapper.
-    with torch.no_grad():
         out_pre, st = off.prefill(x[:, :30])
         o1, st = off.step(x[:, 30:31], st)
         o2, st = off.step(x[:, 31:32], st)
         steps = torch.cat([o1, o2], dim=1)
+        # T=0 preserves the incoming states and returns a zero-length out.
+        e_out, e_s, e_c = off.forward_functional(
+            x.new_zeros(B, 0, d), s_off, c_off)
     diff_steps = (steps.float() - out_off[:, 30:32].float()).abs().max().item()
+    tol_steps = 1e-3
     results.append(_ok('official prefill+step parity',
-                       diff_steps < tol_out, f'maxdiff={diff_steps:.2e}'))
+                       diff_steps < tol_steps,
+                       f'maxdiff={diff_steps:.2e}'))
+    results.append(_ok('official conv state uses the xBC layout',
+                       tuple(c_off.shape) == (B, off.conv_dim,
+                                              off.d_conv),
+                       f'{tuple(c_off.shape)} vs '
+                       f'{(B, off.conv_dim, off.d_conv)}'))
+    results.append(_ok('official T=0 preserves state and shape',
+                       e_out.shape == (B, 0, d)
+                       and torch.equal(e_s, s_off.detach())
+                       and torch.equal(e_c, c_off.detach()), ''))
+    raised = None
+    try:
+        off.forward_functional(x, s_off, c_off)
+    except ValueError as exc:
+        raised = exc
+    results.append(_ok(
+        'official T>1 with incoming state is rejected loudly',
+        raised is not None and 'fresh prefix' in str(raised),
+        f'raised={type(raised).__name__ if raised else None}'))
+    return results
+
+
+def test_mamba2_official_wrapper_contract_fake(device='cpu'):
+    """CPU contract test for ``OfficialMamba2Mixer`` with a fake mamba_ssm.
+
+    The real Triton kernels are CUDA-only, so on a CPU CI box the official
+    wrapper's *state bookkeeping* (InferenceParams seeding, conv/SSM
+    write-back, detach policy, T=0 handling, batch-change reset) has no
+    coverage at all. A tiny pure-PyTorch ``Mamba2`` stub implementing the
+    InferenceParams protocol exercises exactly that plumbing; the CUDA-only
+    device guard is bypassed for the duration of the test.
+    """
+    import contextlib
+    import sys
+    import types
+    from unittest import mock
+
+    import torch.nn as nn
+
+    import ops_mamba_backend as mba
+
+    class _FakeInferenceParams:
+        def __init__(self, max_seqlen, max_batch_size):
+            self.max_seqlen = max_seqlen
+            self.max_batch_size = max_batch_size
+            self.seqlen_offset = 0
+            self.key_value_memory_dict = {}
+
+    class _FakeMamba2(nn.Module):
+        """Minimal diagonal SSM over the first ``d_inner`` channels."""
+
+        def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
+                     headdim=16, ngroups=1, dt_rank='auto', layer_idx=0):
+            super().__init__()
+            self.d_model = d_model
+            self.d_state = d_state
+            self.d_conv = d_conv
+            self.d_inner = expand * d_model
+            self.headdim = headdim
+            self.nheads = self.d_inner // headdim
+            self.ngroups = ngroups
+            self.layer_idx = layer_idx
+            self.conv_dim = self.d_inner + 2 * ngroups * d_state
+            self.register_buffer('anchor', torch.zeros(1))
+
+        def forward(self, x, inference_params=None):
+            if inference_params is None:
+                raise AssertionError('wrapper must pass InferenceParams')
+            conv, ssm = inference_params.key_value_memory_dict[
+                self.layer_idx]
+            batch, seqlen, _ = x.shape
+            outs = []
+            for t in range(seqlen):
+                xin = x[:, t].repeat(1, self.d_inner // self.d_model)
+                conv.copy_(torch.roll(conv, -1, dims=-1))
+                conv[:, :self.d_inner, -1] = xin
+                c = conv[:, :self.d_inner, -1]
+                ssm.copy_(0.5 * ssm
+                          + c.view(batch, self.nheads, self.headdim, 1))
+                outs.append(ssm.sum(-1).reshape(batch, self.d_inner))
+            y = (torch.stack(outs, dim=1) if outs
+                 else x.new_zeros(batch, 0, self.d_inner))
+            return y[..., :self.d_model]
+
+    def _mods():
+        names = ('mamba_ssm', 'mamba_ssm.modules',
+                 'mamba_ssm.modules.mamba2', 'mamba_ssm.utils',
+                 'mamba_ssm.utils.generation')
+        mods = {}
+        for name in names:
+            mod = types.ModuleType(name)
+            mod.__path__ = []
+            mods[name] = mod
+        mods['mamba_ssm.modules.mamba2'].Mamba2 = _FakeMamba2
+        mods['mamba_ssm.utils.generation'].InferenceParams = (
+            _FakeInferenceParams)
+        return mods
+
+    @contextlib.contextmanager
+    def _injected(mods):
+        saved = {name: sys.modules.get(name) for name in mods}
+        saved_cache = (mba._MAMBA2_CLS, mba._INFERENCE_PARAMS_CLS,
+                       mba._IMPORT_ERROR)
+        try:
+            sys.modules.update(mods)
+            mba._MAMBA2_CLS = None
+            mba._INFERENCE_PARAMS_CLS = None
+            mba._IMPORT_ERROR = None
+            yield
+        finally:
+            (mba._MAMBA2_CLS, mba._INFERENCE_PARAMS_CLS,
+             mba._IMPORT_ERROR) = saved_cache
+            for name, mod in saved.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+    results = []
+    cfg = _mamba2_small_cfg()
+    with _injected(_mods()), mock.patch.object(
+            mba.OfficialMamba2Mixer, '_require_cuda',
+            lambda self, x: None):
+        off = mba.OfficialMamba2Mixer(cfg).eval()
+        B, T, d = 2, 7, cfg.d_model
+        torch.manual_seed(4)
+        x = torch.randn(B, T, d)
+        with torch.no_grad():
+            out_full, s_full, c_full = off.forward_functional(
+                x, None, None)
+            out_pre, st = off.prefill(x[:, :5])
+            o1, st = off.step(x[:, 5:6], st)
+            o2, st = off.step(x[:, 6:7], st)
+            steps = torch.cat([o1, o2], dim=1)
+            # Different batch -> the lookback resets instead of being
+            # silently broadcast onto the new request.
+            _, _, c_new = off.forward_functional(
+                x.new_zeros(1, 0, d), None, c_full)
+            # T=0 echoes a caller-owned state without aliasing it.
+            e_out, e_s, e_c = off.forward_functional(
+                x.new_zeros(B, 0, d), s_full, c_full)
+            e_c.add_(1.0)
+        results.append(_ok(
+            'fake-official full forward shape',
+            out_full.shape == (B, T, d), f'{tuple(out_full.shape)}'))
+        results.append(_ok(
+            'fake-official prefill+step == full forward',
+            torch.equal(out_pre, out_full[:, :5])
+            and torch.equal(steps, out_full[:, 5:])
+            and torch.equal(st['ssm_state'], s_full)
+            and torch.equal(st['conv_state'], c_full), ''))
+        results.append(_ok(
+            'fake-official conv/SSM state layouts',
+            tuple(c_full.shape) == (B, off.conv_dim, off.d_conv)
+            and tuple(s_full.shape)
+            == (B, off.nheads, off.headdim, off.d_state), ''))
+        results.append(_ok(
+            'fake-official batch change drops the stale conv lookback',
+            c_new is None, f'{None if c_new is None else c_new.shape}'))
+        results.append(_ok(
+            'fake-official T=0 returns a fresh zero-length output and '
+            'copies (never aliases) the conv state',
+            e_out.shape == (B, 0, d)
+            and torch.equal(e_s, s_full)
+            and not torch.equal(e_c, c_full), ''))
     return results
 
 
@@ -526,5 +742,6 @@ __all__ = [
     'test_mamba2_state_request_independence',
     'test_hybrid_stack_memory_routes',
     'test_mamba2_official_backend_parity',
+    'test_mamba2_official_wrapper_contract_fake',
     'test_mamba2_backend_selection_contract',
 ]
