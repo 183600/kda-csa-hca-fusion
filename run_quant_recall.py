@@ -55,15 +55,30 @@ Honesty / scope
   recall; "exact" means min-over-seeds == 1.0 (conservative). Three seeds
   keep the probe fast; the 2-bit cells are the noisy ones and are
   reported with their full spread.
+* Nearest-value decisions are made from **fp64 distances** even when the
+  recurrence itself runs in fp32. The fp32 distance matrix can round two
+  candidates to the same float and let tensor order (not the state) decide
+  the recall, which is exactly the numerical-stability failure a quantized
+  state is most exposed to. The relative decision margin
+  ``(d_wrong - d_correct) / (d_wrong + d_correct)`` and an ambiguous-tie
+  count are reported next to recall so a cell that only barely decodes is
+  not read as a comfortable pass.
+* **Iso-budget frontier.** ``frontier_summary`` answers "what is the
+  cheapest exact cell"; it does not answer the benchmark-design question
+  "at a fixed state-byte budget, which measured cell has the best
+  worst-seed recall?" ``iso_budget_frontier`` rows answer that under the
+  same conservative min-over-seeds objective, so the two routes can be
+  compared at matched storage cost instead of at unmatched byte counts.
 
 Output
 ------
 ``results/exp10_quant_recall.json`` (versioned envelope via
 ``results_schema``) with ``row_kind`` in {``quant_recall``,
-``frontier_summary``}; CLI::
+``frontier_summary``, ``iso_budget_frontier``}; CLI::
 
     python3 run_quant_recall.py
     QUANT_BITS=2,3,4 QUANT_SEEDS=0,1 python3 run_quant_recall.py
+    QUANT_BUDGETS=18,34,64 python3 run_quant_recall.py
 """
 
 from __future__ import annotations
@@ -207,14 +222,54 @@ def read_back(route: str, keys: torch.Tensor, state: torch.Tensor):
                      f'{list(ROUTES)}.')
 
 
+#: Relative margin below which a nearest-value decision is treated as a
+#: numerical tie (both distances differ by less than this fraction of their
+#: sum). Such a decision can flip between two mathematically equivalent
+#: code paths, so it must not be counted as a stable recall.
+DECISION_TIE_TOL = 1e-9
+
+
 def _decode_recall(reads: torch.Tensor, values: torch.Tensor):
-    """Nearest-value decode: recall fraction and max read-back error."""
-    dist = torch.cdist(reads.float(), values.float())
+    """Nearest-value decode: recall, max error and decision margin.
+
+    Distances are always evaluated in fp64. Casting an fp64 unsaturated /
+    quantized state down to fp32 before ``cdist`` can collapse two
+    candidates onto the same float; the argmin then follows tensor order
+    rather than the storage grid, conflating a real recall loss with a
+    round-off tie. The relative margin
+    ``(d_wrong - d_correct) / (d_wrong + d_correct)`` is in ``[-1, 1]``
+    and is reported so near-boundary cells are visible.
+    """
+    reads64 = reads.detach().to(torch.float64)
+    values64 = values.detach().to(torch.float64)
+    dist = torch.cdist(reads64, values64)
     pred = dist.argmin(dim=-1)
     target = torch.arange(values.shape[0], device=values.device)
-    recall = float((pred == target).float().mean())
-    max_err = float((reads - values).abs().max())
-    return recall, max_err
+    correct = pred == target
+    recall = float(correct.to(torch.float64).mean())
+    max_err = float((reads64 - values64).abs().max())
+    if dist.shape[0] < 2:
+        return recall, max_err, {
+            'readback_min_margin': None,
+            'readback_mean_margin': 0.0,
+            'n_ambiguous_decisions': 0,
+        }
+    target_col = target[:, None]
+    correct_dist = dist.gather(1, target_col).squeeze(1)
+    wrong_dist = dist.masked_fill(
+        torch.eye(dist.shape[0], dtype=torch.bool, device=dist.device),
+        float('inf')).min(dim=-1).values
+    denom = (correct_dist + wrong_dist).clamp_min(
+        torch.finfo(torch.float64).tiny)
+    margin = (wrong_dist - correct_dist) / denom
+    correct_margin = margin[correct]
+    return recall, max_err, {
+        'readback_min_margin': (float(correct_margin.min())
+                                if correct_margin.numel() else None),
+        'readback_mean_margin': float(margin.mean()),
+        'n_ambiguous_decisions': int(
+            (margin.abs() <= DECISION_TIE_TOL).sum().item()),
+    }
 
 
 def run_planted_recall(route: str, keys: torch.Tensor, values: torch.Tensor,
@@ -234,11 +289,12 @@ def run_planted_recall(route: str, keys: torch.Tensor, values: torch.Tensor,
     state = _STATE_FN[route](keys, values, spec,
                              quantize_after_write=spec is not None)
     reads = read_back(route, keys, state)
-    recall, max_err = _decode_recall(reads, values)
+    recall, max_err, margins = _decode_recall(reads, values)
     return {
         'readback_recall': recall,
         'max_read_error': max_err,
         'state_elements': int(state.numel()),
+        **margins,
     }
 
 
@@ -319,11 +375,15 @@ def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
                             n_keys=DEFAULT_N_KEYS,
                             value_dim=DEFAULT_VALUE_DIM,
                             routes=ROUTES,
-                            include_asymmetric=True) -> list:
+                            include_asymmetric=True,
+                            budgets=None) -> list:
     """Run the probe matrix and return flat, JSON-safe rows.
 
-    One row per (route, spec) cell aggregating over seeds, plus a
-    ``frontier_summary`` row per route (cheapest exact-recall cell).
+    One row per (route, spec) cell aggregating over seeds, a
+    ``frontier_summary`` row per route (cheapest exact-recall cell), and
+    one ``iso_budget_frontier`` row per (route, byte cap). ``budgets=None``
+    uses every measured cell's ``state_bytes`` as a cap (plus fp16), so the
+    frontier never depends on an unmeasured/interpolated cost.
     """
     rows: list = []
     seeds = list(seeds)
@@ -335,11 +395,14 @@ def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
         for spec in default_sweep_specs(bits_list, group_sizes,
                                         include_asymmetric):
             recalls, max_errs, state_elements = [], [], None
+            margins, ambiguous = [], []
             for seed in seeds:
                 keys, values = planted_batch(n_keys, value_dim, seed, device)
                 out = run_planted_recall(route, keys, values, spec)
                 recalls.append(out['readback_recall'])
                 max_errs.append(out['max_read_error'])
+                margins.append(out['readback_min_margin'])
+                ambiguous.append(out['n_ambiguous_decisions'])
                 if state_elements is None:
                     state_elements = out['state_elements']
                 elif state_elements != out['state_elements']:
@@ -348,6 +411,7 @@ def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
                         'probe geometry must be fixed')
             rec = _aggregate(recalls)
             errmax = _aggregate(max_errs)
+            finite_margins = [m for m in margins if m is not None]
             if spec is None:
                 row = {
                     'row_kind': 'quant_recall',
@@ -387,10 +451,18 @@ def build_quant_recall_rows(device='cpu', seeds=DEFAULT_SEEDS,
                 'n_seeds': rec['n'],
                 'max_read_error_mean': errmax['mean'],
                 'max_read_error_max': errmax['max'],
+                'decision_margin_min': (min(finite_margins)
+                                        if finite_margins else None),
+                'decision_margin_mean': (
+                    sum(finite_margins) / len(finite_margins)
+                    if finite_margins else None),
+                'n_ambiguous_decisions': int(sum(ambiguous)),
+                'decision_tie_tolerance': DECISION_TIE_TOL,
                 'exact_recall': bool(rec['min'] == 1.0),
             })
             rows.append(row)
     rows.extend(build_frontier_summary(rows, routes))
+    rows.extend(build_iso_budget_frontier(rows, routes, budgets=budgets))
     return rows
 
 
@@ -417,6 +489,115 @@ def build_frontier_summary(rows: list, routes=ROUTES) -> list:
                 min(any_cell, key=lambda r: r['state_bytes'])
                 if any_cell else None),
         })
+    return out
+
+
+def _validate_budgets(budgets) -> list:
+    """Positive finite byte caps, deduplicated and sorted."""
+    if isinstance(budgets, (int, float)) and not isinstance(budgets, bool):
+        budgets = (budgets,)
+    out = []
+    for budget in budgets:
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            raise ValueError(
+                f'build_iso_budget_frontier: budget={budget!r} must be a '
+                f'positive finite number of bytes.')
+        try:
+            value = float(budget)
+        except OverflowError:
+            raise ValueError(
+                f'build_iso_budget_frontier: budget={budget!r} is not '
+                f'representable as a float.') from None
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f'build_iso_budget_frontier: budget={budget!r} must be a '
+                f'positive finite number of bytes.')
+        out.append(value)
+    if not out:
+        raise ValueError(
+            'build_iso_budget_frontier: budgets must be non-empty.')
+    return sorted(set(out))
+
+
+def build_iso_budget_frontier(rows, routes=ROUTES, budgets=None) -> list:
+    """Best measured cell at or below each state-byte budget.
+
+    This is the *budget-constrained* companion to
+    :func:`build_frontier_summary` (cheapest exact cell). For every cap it
+    picks the feasible cell with the highest worst-seed recall
+    (``recall_min``), breaking ties by mean recall and then by cheaper
+    storage. ``budgets=None`` uses the measured caps themselves (plus the
+    fp16 state size), so no cap is an unmeasured interpolation.
+
+    The strict ``<=`` comparison is intentional: a cell whose metadata
+    pushes it one byte over the cap is not feasible, and reporting it as
+    such is the point of a budget frontier. Each row records the selected
+    cell and the headroom so a reader can see whether the choice is tight.
+    """
+    cells = [r for r in rows if r.get('row_kind') == 'quant_recall']
+    if not cells:
+        return []
+    if budgets is None:
+        budgets = sorted({float(r['state_bytes']) for r in cells})
+    caps = _validate_budgets(budgets)
+    out = []
+    for route in routes:
+        route_cells = [r for r in cells if r['route'] == route]
+        if not route_cells:
+            continue
+        fp16 = next((r for r in route_cells if not r['quantized']), None)
+        for cap in caps:
+            feasible = [r for r in route_cells
+                        if float(r['state_bytes']) <= cap]
+            row = {
+                'row_kind': 'iso_budget_frontier',
+                'route': route,
+                'budget_bytes': cap,
+                'fp16_state_bytes': (
+                    fp16['fp16_state_bytes'] if fp16 is not None else None),
+                'covered': bool(feasible),
+                'n_feasible': len(feasible),
+            }
+            if not feasible:
+                row.update({
+                    'selected': None,
+                    'selected_state_bytes': None,
+                    'selected_recall_min': None,
+                    'selected_recall_mean': None,
+                    'selected_exact_recall': None,
+                    'selected_compression_vs_fp16': None,
+                    'budget_headroom_bytes': None,
+                    'budget_utilization': None,
+                })
+            else:
+                best = max(
+                    feasible,
+                    key=lambda r: (float(r['recall_min']),
+                                   float(r['recall_mean']),
+                                   -float(r['state_bytes'])))
+                headroom = cap - float(best['state_bytes'])
+                row.update({
+                    'selected': {
+                        'quantized': best['quantized'],
+                        'bits': best['bits'],
+                        'group_size': best['group_size'],
+                        'symmetric': best['symmetric'],
+                        'state_bytes': best['state_bytes'],
+                        'recall_min': best['recall_min'],
+                        'recall_mean': best['recall_mean'],
+                        'exact_recall': best['exact_recall'],
+                    },
+                    'selected_state_bytes': best['state_bytes'],
+                    'selected_recall_min': best['recall_min'],
+                    'selected_recall_mean': best['recall_mean'],
+                    'selected_exact_recall': best['exact_recall'],
+                    'selected_compression_vs_fp16':
+                        best['compression_vs_fp16'],
+                    'budget_headroom_bytes': headroom,
+                    'budget_utilization': (
+                        float(best['state_bytes']) / cap),
+                })
+            out.append(row)
     return out
 
 
@@ -477,9 +658,51 @@ def _print_frontier(rows: list) -> None:
                 f"recall min {cheapest['recall_min']:.3f}")
 
 
+def _print_iso_budget(rows: list) -> None:
+    logger.info('\n-- iso-byte budget frontier (best worst-seed recall at '
+                'or below the cap) --')
+    for row in rows:
+        if row['row_kind'] != 'iso_budget_frontier':
+            continue
+        if not row['covered']:
+            logger.info(
+                f"  {row['route']:>7} cap={row['budget_bytes']:>7.1f} B: "
+                f"no measured cell fits")
+            continue
+        selected = row['selected']
+        label = ('fp16' if not selected['quantized'] else
+                 f"{selected['bits']}b/g{selected['group_size']}"
+                 f"{'sym' if selected['symmetric'] else 'asym'}")
+        logger.info(
+            f"  {row['route']:>7} cap={row['budget_bytes']:>7.1f} B -> "
+            f"{label:>12} {selected['state_bytes']:>7.1f} B "
+            f"(headroom {row['budget_headroom_bytes']:.1f} B), "
+            f"recall min {selected['recall_min']:.3f} "
+            f"mean {selected['recall_mean']:.3f}")
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def _parse_float_list(raw, name, min_value=0.0):
+    values = []
+    for part in str(raw).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError as e:
+            raise ValueError(f'{name}: {part!r} is not a number') from e
+        if not math.isfinite(value) or value <= min_value:
+            raise ValueError(
+                f'{name}: {value!r} must be a finite number > {min_value}')
+        values.append(value)
+    if not values:
+        raise ValueError(f'{name}: empty list')
+    return tuple(dict.fromkeys(values))
+
+
 def _parse_int_list(raw, name, min_value=0):
     values = []
     for part in str(raw).split(','):
@@ -523,16 +746,23 @@ def main():
     value_dim = _parse_int_list(os.environ.get('QUANT_VALUE_DIM',
                                                str(DEFAULT_VALUE_DIM)),
                                 'QUANT_VALUE_DIM', 1)[0]
+    budgets_env = os.environ.get('QUANT_BUDGETS')
+    budgets = (_parse_float_list(budgets_env, 'QUANT_BUDGETS')
+               if budgets_env is not None and budgets_env.strip() else None)
     logger.info(f'  routes: {list(ROUTES)}')
     logger.info(f'  bits: {list(bits_list)}, groups: {list(group_sizes)}, '
                 f'seeds: {list(seeds)}')
     logger.info(f'  geometry: n_keys={n_keys}, value_dim={value_dim}')
+    logger.info(f'  iso-byte caps: '
+                f'{list(budgets) if budgets is not None else "measured"}')
 
     rows = build_quant_recall_rows(
         device=device, seeds=seeds, bits_list=bits_list,
-        group_sizes=group_sizes, n_keys=n_keys, value_dim=value_dim)
+        group_sizes=group_sizes, n_keys=n_keys, value_dim=value_dim,
+        budgets=budgets)
     _print_rows(rows)
     _print_frontier(rows)
+    _print_iso_budget(rows)
 
     specs_provenance = [spec_summary(QuantSpec(bits=b, group_size=g))
                         for b in bits_list for g in group_sizes]
@@ -546,7 +776,10 @@ def main():
             '= nearest-value decode accuracy vs state bytes (payload + '
             'group metadata). Crosses the matrix memory-route axis with a '
             'state-bits axis; seeds are aggregated to mean, sample std, '
-            '95% t-CI, min/max.'),
+            '95% t-CI, min/max. Nearest-value decisions use fp64 distances '
+            'and report a relative decision margin; iso_budget_frontier '
+            'selects the best worst-seed recall at each measured byte cap '
+            'so routes can be compared at matched storage cost.'),
         'probe_geometry': {
             'n_keys': n_keys,
             'value_dim': value_dim,
@@ -568,6 +801,21 @@ def main():
             'bits_per_element charges payload bits plus '
             '(scale_bits + zero_bits)/group_size metadata bits. '
             'compression_vs_fp16 = 16 / bits_per_element.'),
+        'decision_currency': (
+            'Nearest-value distances are computed in fp64 even when the '
+            'recurrence runs in fp32. The relative margin is '
+            '(d_wrong - d_correct) / (d_wrong + d_correct); a decision '
+            f'with |margin| <= {DECISION_TIE_TOL} is counted as an '
+            'ambiguous numerical tie and is not evidence of a stable '
+            'recall.'),
+        'iso_budget_frontier': (
+            'For each byte cap, the measured cell (including the fp16 '
+            'reference) with the highest worst-seed recall among cells '
+            'whose state_bytes <= cap, ties broken by mean recall then '
+            'cheaper storage. Caps default to the measured state_bytes '
+            'values, so no interpolated cost is used.'),
+        'iso_budget_caps_bytes': (
+            list(budgets) if budgets is not None else None),
         'specs': specs_provenance,
         'caveats': [
             'Single-operator probe, no training and no model weights: it '
@@ -584,6 +832,10 @@ def main():
             'visible seed variance (sample std, 95% t-CI and min..max '
             'reported). With only three seeds the CI is wide and is a '
             'descriptive uncertainty statement, not a population guarantee.',
+            'The iso-budget frontier optimizes the observed worst-seed '
+            'recall at the measured caps; it is a selection over a finite '
+            'grid, not a proof that a cell remains exact on unseen keys, '
+            'and the caps are not hardware-enforced quotas.',
         ],
         'provenance': capture_provenance(),
     }
@@ -602,6 +854,9 @@ def main():
             'group_sizes': list(group_sizes),
             'probe_geometry': metadata['probe_geometry'],
             'specs': specs_provenance,
+            'iso_budget_caps_bytes': (
+                list(budgets) if budgets is not None else 'measured'),
+            'decision_tie_tolerance': DECISION_TIE_TOL,
         },
         data={
             'kind': 'synthetic_planted_associative_recall',

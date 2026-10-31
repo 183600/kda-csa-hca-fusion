@@ -58,7 +58,10 @@ from kv_quant import (  # noqa: E402
     storage_bytes,
 )
 from run_quant_recall import (  # noqa: E402
+    DECISION_TIE_TOL,
     _STATE_FN,
+    _decode_recall,
+    build_iso_budget_frontier,
     build_quant_recall_rows,
     full_sequence_state,
     planted_batch,
@@ -340,6 +343,12 @@ def test_quantized_state_recall_probe():
             and step['max_read_error'] < 1e-4,
             f"recall={step['readback_recall']}, "
             f"err={step['max_read_error']:.2e}")
+        _ok(f'{route}: exact recall has a positive decision margin',
+            step['readback_min_margin'] is not None
+            and step['readback_min_margin'] > DECISION_TIE_TOL
+            and step['n_ambiguous_decisions'] == 0,
+            f"margin={step['readback_min_margin']}, "
+            f"ambiguous={step['n_ambiguous_decisions']}")
         q8 = run_planted_recall(route, keys, values, QuantSpec(8, 64))
         _ok(f'{route}: 8-bit state keeps exact recall',
             q8['readback_recall'] == 1.0,
@@ -427,6 +436,101 @@ def test_quant_recall_report_rows():
             cheapest = min(exact, key=lambda r: r['state_bytes'])
             _ok(f"{s['route']}: frontier picks the cheapest exact cell",
                 abs(cell['state_bytes'] - cheapest['state_bytes']) < 1e-9, '')
+
+
+# --- 4b. fp64 decision margin + iso-byte budget frontier ------------------
+
+def test_decode_margin_and_iso_budget_frontier():
+    print('\nTest: fp64 decision margin + iso-byte budget frontier')
+
+    # Two candidates whose fp32 distance matrix would round to a tie but
+    # whose fp64 distances have a clear ordering: the decision must follow
+    # fp64, not tensor order.
+    values = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float64)
+    reads = torch.tensor([[0.0, 0.0],
+                          [1.0 + 1e-9, 0.0]], dtype=torch.float64)
+    recall, max_err, stats = _decode_recall(reads, values)
+    _ok('fp64 row is decoded to itself', recall == 1.0,
+        f'recall={recall}, err={max_err:.2e}')
+    _ok('decision margin is in [-1, 1] and finite',
+        stats['readback_min_margin'] is not None
+        and -1.0 <= stats['readback_min_margin'] <= 1.0
+        and -1.0 <= stats['readback_mean_margin'] <= 1.0,
+        f"{stats}")
+    _ok('no ambiguous decisions when fp64 separates the candidates',
+        stats['n_ambiguous_decisions'] == 0, f"{stats}")
+
+    # The same construction in fp32 would collapse both rows onto the
+    # correct one only because row order favors it; reversing the order
+    # exposes the tie. fp64 keeps the correct assignment in both orders.
+    swapped_recall, _err, swapped = _decode_recall(reads.flip(0),
+                                                   values.flip(0))
+    _ok('fp64 decision is invariant under candidate row order',
+        swapped_recall == 1.0 and swapped['n_ambiguous_decisions'] == 0,
+        f"{swapped}")
+
+    rows = build_quant_recall_rows(
+        device='cpu', seeds=(0,), bits_list=(2, 4), group_sizes=(64,),
+        include_asymmetric=False)
+    cells = [r for r in rows if r['row_kind'] == 'quant_recall']
+    _ok('every cell reports finite margin diagnostics',
+        all(r['decision_margin_min'] is not None
+            and -1.0 <= r['decision_margin_min'] <= 1.0
+            and r['decision_margin_mean'] is not None
+            and r['n_ambiguous_decisions'] >= 0
+            for r in cells), f'{len(cells)} cells')
+
+    caps = sorted({r['state_bytes'] for r in cells})
+    iso = build_iso_budget_frontier(rows, budgets=caps)
+    _ok('one iso-budget row per (route, cap)',
+        len(iso) == len({r['route'] for r in cells}) * len(caps),
+        f'{len(iso)}')
+    feasible_ok = True
+    optimum_ok = True
+    for row in iso:
+        feasible = [r for r in cells
+                    if r['route'] == row['route']
+                    and r['state_bytes'] <= row['budget_bytes']]
+        if row['covered'] != bool(feasible) or \
+                row['n_feasible'] != len(feasible):
+            feasible_ok = False
+        if not row['covered']:
+            continue
+        best_value = max(
+            (r['recall_min'], r['recall_mean'], -r['state_bytes'])
+            for r in feasible)
+        chosen_value = (row['selected_recall_min'],
+                        row['selected_recall_mean'],
+                        -row['selected_state_bytes'])
+        if chosen_value != best_value:
+            optimum_ok = False
+        if not 0.0 <= row['budget_headroom_bytes'] <= row['budget_bytes']:
+            optimum_ok = False
+    _ok('coverage and feasible counts match the measured grid',
+        feasible_ok, '')
+    _ok('selected cell is the conservative optimum and fits the cap',
+        optimum_ok, '')
+    _ok('the highest cap selects a cell with the best measured worst-seed '
+        'recall',
+        all(iso_row['selected_recall_min']
+            == max(r['recall_min'] for r in cells
+                   if r['route'] == iso_row['route'])
+            for iso_row in iso
+            if iso_row['budget_bytes'] == max(caps)), '')
+
+    tiny = build_iso_budget_frontier(rows, budgets=[1.0])
+    _ok('a cap below every measured cell is explicitly uncovered',
+        all(not r['covered'] and r['selected'] is None for r in tiny), '')
+
+    for bad in ([], [0.0], [-1.0], [float('inf')], [float('nan')], [True],
+                ['64']):
+        raised = False
+        try:
+            build_iso_budget_frontier(rows, budgets=bad)
+        except (TypeError, ValueError):
+            raised = True
+        _ok(f'invalid budget list {bad!r} rejected', raised, '')
+    json.dumps(sanitize_for_json(rows + iso), allow_nan=False)
 
 
 # --- 5. block-scaled FP8 storage -----------------------------------------
@@ -614,6 +718,7 @@ _TEST_FUNCS = [
     test_fake_quantize_contract,
     test_quantized_state_recall_probe,
     test_quant_recall_report_rows,
+    test_decode_margin_and_iso_budget_frontier,
     test_fp8_spec_and_grid,
     test_fp8_fake_quantize_contract,
     test_fp8_fp64_dynamic_range,

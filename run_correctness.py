@@ -220,6 +220,10 @@ def main():
     # scale-invariance/degenerate contracts, and its integration into the
     # one-call paired panel.
     all_results += _run_safe(test_effect_size_ci, device)
+    # Exp 10: matched state-byte budget frontier and fp64 nearest-value
+    # decision margins (a quantized-state probe must not read an fp32
+    # distance tie as a stable recall).
+    all_results += _run_safe(test_quant_recall_iso_budget_and_margin, device)
 
     # Partial RoPE (DeepSeek-V4 §2.3.3) — paper-faithful positional
     # embedding for CSA/HCA: unit properties, module wiring, and

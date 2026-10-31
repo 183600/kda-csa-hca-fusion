@@ -69,4 +69,59 @@ def test_effect_size_ci(device='cpu'):
     return results
 
 
-__all__ = ['test_effect_size_ci']
+def test_quant_recall_iso_budget_and_margin(device='cpu'):
+    """Exp 10's matched-budget frontier and fp64 decision margin.
+
+    A budget frontier is only meaningful if (a) it never selects a cell
+    above the cap, (b) it maximizes the conservative worst-seed recall
+    among the feasible measured cells, and (c) its decisions do not hinge
+    on an fp32 distance tie. This pins all three on a tiny CPU probe.
+    """
+    from run_quant_recall import (DECISION_TIE_TOL, build_quant_recall_rows)
+
+    rows = build_quant_recall_rows(
+        device='cpu', seeds=(0,), bits_list=(2, 4), group_sizes=(64,),
+        n_keys=8, value_dim=4, include_asymmetric=False)
+    cells = [r for r in rows if r['row_kind'] == 'quant_recall']
+    iso = [r for r in rows if r['row_kind'] == 'iso_budget_frontier']
+    results = []
+    results.append(_ok(
+        'Exp 10 cells report a finite fp64 decision margin',
+        all(r['decision_margin_min'] is not None
+            and -1.0 <= r['decision_margin_min'] <= 1.0
+            and r['n_ambiguous_decisions'] >= 0
+            and r['decision_tie_tolerance'] == DECISION_TIE_TOL
+            for r in cells), f'{len(cells)} cells'))
+    caps = sorted({r['state_bytes'] for r in cells})
+    results.append(_ok(
+        'Exp 10 iso-budget frontier covers every measured route x cap',
+        len(iso) == len({r['route'] for r in cells}) * len(caps),
+        f'{len(iso)} rows'))
+
+    def _best(route, cap):  # noqa: E306 - small local helper
+        feasible = [r for r in cells
+                    if r['route'] == route and r['state_bytes'] <= cap]
+        if not feasible:
+            return None
+        return max(feasible,
+                   key=lambda r: (r['recall_min'], r['recall_mean'],
+                                  -r['state_bytes']))
+
+    ok = True
+    for row in iso:
+        best = _best(row['route'], row['budget_bytes'])
+        if row['covered'] != (best is not None):
+            ok = False
+        elif best is not None:
+            ok = ok and row['selected_state_bytes'] == best['state_bytes'] \
+                and row['selected_recall_min'] == best['recall_min'] \
+                and 0.0 <= row['budget_headroom_bytes'] \
+                <= row['budget_bytes']
+    results.append(_ok(
+        'Exp 10 iso-budget selects the conservative optimum under the cap',
+        ok, ''))
+    json.dumps(sanitize_for_json(rows), allow_nan=False)
+    return results
+
+
+__all__ = ['test_effect_size_ci', 'test_quant_recall_iso_budget_and_margin']

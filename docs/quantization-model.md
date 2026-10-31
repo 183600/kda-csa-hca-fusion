@@ -94,6 +94,43 @@ contiguous buffer. Result rows: mean/min/max recall over seeds, max
 read-back error, `state_bytes`, `bits_per_element`, compression, and a
 conservative `exact_recall` flag (min-over-seeds == 1.0).
 
+### Numerically stable recall decisions
+
+Recall is a hard nearest-value decision, so an fp32 distance matrix can
+round two candidates to the same float and let row order, not the stored
+state, decide the outcome. `_decode_recall` therefore converts the
+read-back and the values to **fp64 before `cdist`** (the recurrence still
+runs in the caller's dtype). Each cell also reports
+
+```
+relative margin = (d_wrong - d_correct) / (d_wrong + d_correct)  # [-1, 1]
+```
+
+with `decision_margin_min` (worst correctly decoded query, min over
+seeds), `decision_margin_mean`, and `n_ambiguous_decisions` (absolute
+margin at or below `DECISION_TIE_TOL = 1e-9`). A cell with a near-zero
+margin is treated as a numerical tie, not as evidence of stable recall.
+
+### Iso-byte budget frontier
+
+The `frontier_summary` row names the cheapest *exact* cell. It cannot
+compare routes at matched cost, because a cheap inexact cell and an
+expensive exact cell are not alternatives under the same byte cap. The
+new `iso_budget_frontier` rows answer that question directly: for every
+byte cap and route, select the measured cell (fp16 included) with
+
+* `state_bytes <= cap` (strict; metadata bytes are charged),
+* highest `recall_min` (conservative min over seeds),
+* ties broken by `recall_mean`, then by cheaper storage.
+
+Caps default to the measured `state_bytes` values, so the frontier never
+interpolates a cost that was not measured. Each row records
+`selected`, `budget_headroom_bytes`, and `budget_utilization`; a cap
+below every measured cell is reported as `covered: false` rather than
+silently snapping to the cheapest cell. `QUANT_BUDGETS=18,34,64`
+overrides the caps; the defaults are best for comparing this grid, while
+explicit caps speak the bytes a deployment actually budgets.
+
 ## Scope / honesty
 
 * Single-operator probe, **no training, no weights**: it measures
