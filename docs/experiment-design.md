@@ -351,7 +351,7 @@ balance.
 ## Single-factor claims are audited against the built config and observed run
 
 A "leave-one-factor-out" table is only as trustworthy as its implementation.
-Exp 8 therefore carries three complementary audits in
+Exp 8 therefore carries four complementary audits in
 `metadata.ablation_design`:
 
 * `status` / `missing_single_factor_variants` classify the *declared* variant
@@ -378,13 +378,22 @@ Exp 8 therefore carries three complementary audits in
   Likewise, `factorial_designs[*].cells_by_n_kv` and `incomplete_n_kv` make
   a missing interaction cell in one `n_kv` group explicit instead of letting
   coverage in another group stand in for it.
+* `manipulation_audit` (`run_mechanism_ablation.mechanism_manipulation_audit`)
+  checks the treatment at runtime, not just in the table. It rebuilds each
+  arm with the baseline weights on one fixed batch and verifies that the
+  declared switch is load-bearing: RoPE off and top-k changes alter the
+  logits, a dense arm selects every causally available block, and STE
+  removal zeroes the indexer gradients while leaving the forward output and
+  the rest of the backward pass unchanged. A no-op arm is a `failed` audit,
+  not a null result.
 
-`single_factor_claims_valid` is true only when all three checks pass (the
-runtime check is required whenever rows are supplied). The reasons for a
-false verdict are listed in `single_factor_claim_failures`, and the
-corresponding interaction verdict in `interaction_claims_valid` /
-`interaction_claim_failures`. The runner logs a warning otherwise; the audit
-never deletes or rewrites a result row, it labels the evidence.
+`single_factor_claims_valid` is true only when all four checks pass (the
+runtime checks are required whenever rows or a manipulation audit are
+supplied). The reasons for a false verdict are listed in
+`single_factor_claim_failures`, and the corresponding interaction verdict in
+`interaction_claims_valid` / `interaction_claim_failures`. The runner logs a
+warning otherwise; the audit never deletes or rewrites a result row, it
+labels the evidence.
 
 The `rope` factor is a **declared bundle**: disabling partial RoPE on both
 the CSA and HCA core-attention layers is one treatment factor, so the audit

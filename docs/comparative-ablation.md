@@ -130,6 +130,46 @@ single candidate/reference pair, so the capacity check is per cell. For
 `I_route`, the transfer interaction is capacity-neutral only if **both**
 routes' `(D - A)` contrasts are matched.
 
+## 4.1 Intervention fidelity: a declared switch is not a treatment
+
+The capacity audit labels what a contrast *means*; it does not check that
+the treatment was actually applied. A variant table can say "partial RoPE
+off" while the built forward still rotates, or "indexer frozen" while the
+straight-through estimator still sends gradients to the indexer. Such an
+arm is a **no-op**: its paired contrast is not a null mechanism result, it
+is an untreated comparison that looks like evidence of no effect.
+
+Exp 8 therefore runs `mechanism_manipulation_audit` before the sweep. It
+rebuilds the baseline and every arm with the **same weights** and one fixed
+MQAR batch, then checks the declared factor at the point where it must act:
+
+| Factor | Manipulation check |
+|---|---|
+| `rope` | disabling partial RoPE changes the forward logits |
+| `topk` | the realized valid selection count is `min(topk, t // m)` at every position, selected blocks are unique, a dense arm covers every causally available block at the cue, and the logits change |
+| `ste` | the baseline indexer parameters receive non-zero gradients, the frozen arm's indexer parameters receive none, the frozen arm's forward output is unchanged, and a non-indexer parameter still receives a gradient |
+
+The first two are forward-path checks; the STE check is a backward-path
+check because its whole intervention is the gradient route, not the forward
+computation. Requiring the forward output to stay identical under
+`use_ste=False` also confirms that the arm is a clean backward-only
+ablation rather than a second, undeclared forward change.
+
+The result is stored as `ablation_design.manipulation_audit` with per-arm
+`status` (`verified` / `failed`) and machine-readable evidence. A failure
+is not repaired or deleted: it adds `manipulation_failed` to both
+`single_factor_claim_failures` and `interaction_claim_failures`, so the
+same run cannot still report a mechanism claim. A subset containing only
+the baseline returns `no_variants`, which withholds the mechanism claims
+but does not invalidate the baseline run.
+
+This is a validity check, not an effect-size test. It says the switch was
+load-bearing on one fixed batch; it does not say the effect is large, nor
+does it replace the trained paired contrast. It also does not cover every
+possible implementation drift (e.g. a switch that changes only a
+diagnostic), so the config audit and the observed-recipe audit remain
+necessary companions.
+
 ## 5. Multiplicity, attrition, and sensitivity
 
 The interaction rows join the **same** Bonferroni family as the main
@@ -201,6 +241,10 @@ For Exp 8:
 * The capacity audit measures parameter count, not compute or state size.
   Matching parameters does not match FLOPs, cache bytes, or optimization
   difficulty.
+* The manipulation audit is a one-batch intervention check on rebuilt
+  weights. It can certify that a switch is load-bearing, not that the
+  trained contrast isolates the mechanism from optimization differences;
+  the observed-recipe and seed-alignment audits remain necessary.
 * The interaction test is a difference-in-differences under the paired-seed
   design. It assumes the same seeds are exchangeable across the four cells
   (they are), but it does not remove order/position confounds inside the

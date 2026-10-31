@@ -868,6 +868,84 @@ def test_single_factor_verdict_requires_controlled_runtime():
     assert 'controlled_variables' not in static
 
 
+def test_mechanism_manipulation_audit_verifies_each_factor():
+    """Each declared switch must be load-bearing in the actual graph.
+
+    Config-level equality is not enough: a no-op "RoPE off" arm would pass
+    every metadata check and still produce a null contrast. The audit must
+    see the forward change (rope/topk) or the gradient-path change (ste).
+    """
+    import json
+    print("\nTest: Exp 8 manipulation audit verifies every factor")
+    audit = M.mechanism_manipulation_audit(
+        M.VARIANTS, d_model=32, device='cpu')
+    _ok('full variant set passes the manipulation audit',
+        audit['status'] == 'verified' and not audit['failures'],
+        f"status={audit['status']} failures={audit['failures']}")
+    checks = audit['checks']
+    _ok('no_rope changes the forward output',
+        checks['no_rope']['factors']['rope']['passed'] is True, '')
+    _ok('topk1 realizes exactly one selected block',
+        checks['topk1']['factors']['topk']['selection'][
+            'observed_selected_max'] == 1, '')
+    dense = checks['dense']['factors']['topk']['selection']
+    _ok('dense covers every available block at the cue',
+        dense['dense_covers_all_at_cue'] is True
+        and dense['count_mismatch'] == 0,
+        f"{dense}")
+    ste = checks['frozen_indexer']['factors']['ste']
+    _ok('STE removal zeroes the indexer gradients',
+        ste['frozen_indexer_gradients_zero'] is True, '')
+    _ok('STE removal leaves the forward output unchanged',
+        ste['forward_unchanged'] is True, '')
+    _ok('the rest of the model still receives gradients',
+        ste['non_indexer_gradient_alive'] is True, '')
+    json.dumps(audit, allow_nan=False)
+
+
+def test_manipulation_audit_detects_a_noop_arm():
+    """A variant whose declared switch is ignored is not a treatment."""
+    print("\nTest: Exp 8 manipulation audit catches a no-op ablation")
+    original = M.make_variant_cfg
+
+    def _ignore_rope(variant, d_model=32):
+        if variant.get('name') == 'no_rope':
+            variant = dict(variant)
+            variant['rope'] = True
+        return original(variant, d_model)
+
+    M.make_variant_cfg = _ignore_rope
+    try:
+        audit = M.mechanism_manipulation_audit(
+            M.VARIANTS, d_model=32, device='cpu')
+    finally:
+        M.make_variant_cfg = original
+    _ok('a no-op rope switch fails the audit',
+        audit['status'] == 'failed'
+        and 'no_rope:rope' in audit['failures'],
+        f"status={audit['status']} failures={audit['failures']}")
+
+
+def test_manipulation_failure_withholds_ablation_claims():
+    """A failed intervention check invalidates mechanism claims."""
+    print("\nTest: Exp 8 manipulation failure withholds claims")
+    failed = {
+        'status': 'failed',
+        'failures': ['no_rope:rope'],
+        'checks': {},
+    }
+    audit = M.ablation_design_audit(
+        M.VARIANTS, manipulation_audit=failed)
+    _ok('single-factor claims are withheld',
+        audit['single_factor_claims_valid'] is False
+        and 'manipulation_failed' in audit['single_factor_claim_failures'],
+        f"{audit['single_factor_claim_failures']}")
+    _ok('interaction claims are withheld',
+        audit['interaction_claims_valid'] is False
+        and 'manipulation_failed' in audit['interaction_claim_failures'],
+        f"{audit['interaction_claim_failures']}")
+
+
 _TEST_FUNCS = [
     test_variant_configs_valid_and_param_matched,
     test_indexer_topk_matches_operator,
@@ -879,6 +957,9 @@ _TEST_FUNCS = [
     test_ablation_design_audit,
     test_ablation_design_audit_requires_every_variant_in_each_n_kv_cell,
     test_single_factor_verdict_requires_controlled_runtime,
+    test_mechanism_manipulation_audit_verifies_each_factor,
+    test_manipulation_audit_detects_a_noop_arm,
+    test_manipulation_failure_withholds_ablation_claims,
     test_variant_config_audit_detects_drift_and_non_treatments,
     test_exp8_smoke_envelope,
     test_single_seed_aggregate_reports_undefined_std,

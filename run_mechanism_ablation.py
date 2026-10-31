@@ -48,6 +48,17 @@ training recipe and successful seed set. A drift withholds
 ``single_factor_claim_failures``) instead of labelling a multi-factor
 comparison as single-factor.
 
+Metadata checks are necessary but not sufficient: a config can declare
+RoPE off while the forward still rotates, or declare an indexer frozen
+while STE still reaches it. ``mechanism_manipulation_audit`` therefore
+rebuilds each arm with the BASELINE weights on one fixed batch and verifies
+that the declared switch is load-bearing: rope/top-k change the forward
+output, a dense arm covers every causally available block, and STE removal
+zeroes only the indexer gradients while leaving the forward output and the
+rest of the backward pass intact. A failed manipulation check is recorded
+in ``ablation_design.manipulation_audit`` and withholds both the
+single-factor and interaction claims.
+
 Main effects are not interactions. The four variants ``baseline``,
 ``no_rope``, ``dense`` and ``no_rope_dense`` form a complete
 RoPE x selection-density 2x2, so the runner also estimates the
@@ -1320,8 +1331,343 @@ def variant_config_audit(variants, baseline=None, d_model=32):
     }
 
 
+_MANIPULATION_INDEXER_PARAMS = (
+    'W_IUQ', 'W_w', 'W_KV_idx', 'W_Z_idx', 'B_idx')
+_MANIPULATION_TOL = 1e-7
+
+
+def _single_csa_layer(model):
+    layers = [layer for layer in model.layers
+              if isinstance(layer, CSAHybridLayer)]
+    if len(layers) != 1:
+        raise RuntimeError(
+            f'expected exactly 1 CSA layer in the {RATIO} layout, '
+            f'found {len(layers)}')
+    return layers[0]
+
+
+def _audit_build_stack(variant, d_model, device, seed):
+    torch.manual_seed(int(seed))
+    embed = nn.Embedding(VOCAB, d_model).to(device)
+    head = MQARHead(d_model, VOCAB).to(device)
+    model = HybridKCHAttention(
+        make_variant_cfg(variant, d_model),
+        total_layers=sum(RATIO)).to(device)
+    set_indexer_ste(model, variant.get('use_ste', True))
+    return embed, head, model
+
+
+def _audit_build_model(variant, d_model, device, seed):
+    torch.manual_seed(int(seed))
+    model = HybridKCHAttention(
+        make_variant_cfg(variant, d_model),
+        total_layers=sum(RATIO)).to(device)
+    set_indexer_ste(model, variant.get('use_ste', True))
+    return model
+
+
+def _probe_variant(model, head, x_emb, cue):
+    layer = _single_csa_layer(model)
+    captured = {}
+
+    def _capture(_module, args):
+        captured['x'] = args[0].detach()
+
+    handle = layer.register_forward_pre_hook(_capture)
+    was_training = model.training
+    try:
+        model.eval()
+        with torch.no_grad():
+            model.reset_state()
+            h = model(x_emb)
+            logits = head(h, cue)
+            if 'x' not in captured:
+                raise RuntimeError('forward pre-hook captured no CSA input')
+            indices = indexer_topk_from_layer(layer, captured['x'])
+    finally:
+        handle.remove()
+        model.train(was_training)
+    return logits, indices
+
+
+def _selection_audit(indices, m, topk, cue):
+    """Compare the realized top-k counts with the strict causal geometry."""
+    batch, _t_padded, _topk = indices.shape
+    n_positions = cue + 1
+    valid = (indices >= 0).sum(dim=-1)[:, :n_positions]
+    positions = torch.arange(n_positions, device=indices.device)
+    expected = torch.clamp(positions // int(m), max=int(topk))
+    expected = expected.unsqueeze(0).expand(batch, -1)
+    count_mismatch = int((valid != expected).sum().item())
+    unique_mismatch = 0
+    for b in range(batch):
+        for t in range(n_positions):
+            selected = indices[b, t]
+            selected = selected[selected >= 0]
+            if int(torch.unique(selected).numel()) != int(expected[b, t]):
+                unique_mismatch += 1
+    n_available = int(min(cue // int(m), _t_padded // int(m)))
+    dense_covers_all = True
+    for b in range(batch):
+        selected = indices[b, cue]
+        selected = {int(x) for x in selected.tolist() if x >= 0}
+        if selected != set(range(n_available)):
+            dense_covers_all = False
+            break
+    return {
+        'n_positions_checked': n_positions,
+        'n_available_at_cue': n_available,
+        'expected_topk_at_cue': int(min(int(topk), n_available)),
+        'observed_selected_min': int(valid.min().item()) if valid.numel()
+        else 0,
+        'observed_selected_max': int(valid.max().item()) if valid.numel()
+        else 0,
+        'count_mismatch': count_mismatch,
+        'unique_mismatch': unique_mismatch,
+        'dense_covers_all_at_cue': dense_covers_all,
+    }
+
+
+def _indexer_grad_norms(model, head, x_emb, target, cue):
+    layer = _single_csa_layer(model)
+    was_training = model.training
+    was_head_training = head.training
+    model.train()
+    head.train()
+    model.zero_grad(set_to_none=True)
+    head.zero_grad(set_to_none=True)
+    model.reset_state()
+    # The fixed batch is reused for several backward probes; detach its
+    # embedding graph so only the model parameters are differentiated.
+    logits = head(model(x_emb.detach()), cue)
+    F.cross_entropy(logits, target).backward()
+    grads = {}
+    for name in _MANIPULATION_INDEXER_PARAMS:
+        param = getattr(layer, name)
+        if isinstance(param, nn.Linear):
+            param = param.weight
+        grads[name] = (None if param.grad is None
+                       else float(param.grad.detach().norm().item()))
+    other = layer.W_aKV.weight
+    grads['__other__'] = (None if other.grad is None
+                          else float(other.grad.detach().norm().item()))
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+    head.train(was_head_training)
+    return grads
+
+
+def mechanism_manipulation_audit(variants, baseline=None, d_model=32,
+                                 device='cpu', seed=0, tol=_MANIPULATION_TOL,
+                                 batch=8, n_kv=1):
+    """Check that each declared ablation actually manipulates its mechanism.
+
+    The config audit proves that a variant *declares* a different switch; it
+    cannot prove that the switch is load-bearing in the forward/backward
+    graph. A no-op ``no_rope`` (config says ``rope_dim=None`` but the
+    implementation still rotates) would pass every metadata check while
+    producing a null contrast, and a "frozen" indexer that still receives
+    STE gradients would be an untreated arm.
+
+    This audit rebuilds the baseline and each variant with the SAME weights
+    and the SAME fixed MQAR batch, then verifies the declared factor:
+
+    * ``rope``: disabling partial RoPE changes the logits.
+    * ``topk``: the realized valid selection count equals
+      ``min(topk, t // m)`` at every position (strict causal mask), the
+      selected blocks are unique, a dense arm covers every available block
+      at the cue, and the logits change.
+    * ``ste``: the baseline indexer parameters receive non-zero gradients,
+      the frozen arm's indexer parameters receive none, the frozen arm's
+      forward output is unchanged, and a non-indexer parameter still gets a
+      gradient (so the backward pass is not vacuous).
+
+    It is a validity check, not an effect-size test: it says the treatment
+    was applied, not that it helped. A failed check makes the corresponding
+    single-factor and interaction claims unsupported.
+    """
+    variants = [v for v in (variants or ())
+                if isinstance(v, dict) and 'name' in v]
+    if baseline is None:
+        baseline = next((v for v in variants
+                         if v.get('name') == 'baseline'), None)
+    if baseline is None:
+        return {
+            'status': 'no_baseline',
+            'baseline_present': False,
+            'checks': {},
+            'failures': [],
+            'error': None,
+            'note': 'A manipulation audit needs the baseline arm.',
+        }
+    if isinstance(device, str):
+        device = torch.device(device)
+    cpu_state = torch.get_rng_state()
+    cuda_states = (torch.cuda.get_rng_state_all()
+                   if torch.cuda.is_available() else None)
+    try:
+        embed, head, base_model = _audit_build_stack(
+            baseline, d_model, device, seed)
+        gen = make_seeded_generator(int(seed) + 17_000_000, device=device)
+        x_emb, target, cue = make_mqar_batch(
+            int(batch), SEQ_LEN, int(n_kv), VOCAB, embed, device,
+            generator=gen)
+        head.eval()
+        base_logits, base_indices = _probe_variant(
+            base_model, head, x_emb, cue)
+        base_selection = _selection_audit(
+            base_indices, SMALL_MODEL_SPEC['csa_m'],
+            baseline.get('topk', SMALL_MODEL_SPEC['csa_topk']), cue)
+        base_grads = _indexer_grad_norms(
+            base_model, head, x_emb, target, cue)
+
+        checks = {}
+        failures = []
+        for variant in variants:
+            name = str(variant['name'])
+            if variant is baseline or name == str(baseline['name']):
+                continue
+            try:
+                declared = _variant_factor_diffs(variant, baseline)
+            except (KeyError, TypeError, ValueError) as exc:
+                checks[name] = {
+                    'declared_factors': [],
+                    'status': 'failed',
+                    'factors': {},
+                    'error': f'{type(exc).__name__}: {exc}',
+                }
+                failures.append(f'{name}:malformed_factor_record')
+                continue
+            if not declared:
+                checks[name] = {
+                    'declared_factors': [],
+                    'status': 'failed',
+                    'factors': {},
+                    'error': 'variant declares no factor change',
+                }
+                failures.append(f'{name}:no_declared_factors')
+                continue
+            try:
+                model = _audit_build_model(variant, d_model, device, seed)
+                model.load_state_dict(base_model.state_dict())
+                set_indexer_ste(model, variant.get('use_ste', True))
+                logits, indices = _probe_variant(model, head, x_emb, cue)
+                delta = float((logits - base_logits).abs().max().item())
+                selection = _selection_audit(
+                    indices, SMALL_MODEL_SPEC['csa_m'],
+                    variant.get('topk', SMALL_MODEL_SPEC['csa_topk']), cue)
+                factors = {}
+                if 'rope' in declared:
+                    factors['rope'] = {
+                        'passed': bool(delta > tol),
+                        'max_abs_logit_delta': delta,
+                        'criterion': ('disabling partial RoPE must change '
+                                      'the forward output'),
+                    }
+                if 'topk' in declared:
+                    topk = int(variant.get(
+                        'topk', SMALL_MODEL_SPEC['csa_topk']))
+                    needs_full = topk >= selection['n_available_at_cue']
+                    passed = (
+                        selection['count_mismatch'] == 0
+                        and selection['unique_mismatch'] == 0
+                        and delta > tol
+                        and (not needs_full
+                             or selection['dense_covers_all_at_cue']))
+                    factors['topk'] = {
+                        'passed': bool(passed),
+                        'topk': topk,
+                        'max_abs_logit_delta': delta,
+                        'selection': selection,
+                        'criterion': ('realized valid top-k count must equal '
+                                      'min(topk, t // m); a dense arm must '
+                                      'cover every available block and the '
+                                      'logits must change'),
+                    }
+                if 'ste' in declared:
+                    variant_grads = _indexer_grad_norms(
+                        model, head, x_emb, target, cue)
+                    baseline_nonzero = all(
+                        base_grads[p] is not None and base_grads[p] > 0.0
+                        for p in _MANIPULATION_INDEXER_PARAMS)
+                    frozen_zero = all(
+                        variant_grads[p] is None or variant_grads[p] == 0.0
+                        for p in _MANIPULATION_INDEXER_PARAMS)
+                    other_alive = (
+                        variant_grads['__other__'] is not None
+                        and variant_grads['__other__'] > 0.0)
+                    forward_unchanged = delta <= tol
+                    factors['ste'] = {
+                        'passed': bool(baseline_nonzero and frozen_zero
+                                       and other_alive
+                                       and forward_unchanged),
+                        'max_abs_logit_delta': delta,
+                        'baseline_indexer_grad_norms': base_grads,
+                        'variant_indexer_grad_norms': variant_grads,
+                        'baseline_indexer_gradients_nonzero':
+                            baseline_nonzero,
+                        'frozen_indexer_gradients_zero': frozen_zero,
+                        'non_indexer_gradient_alive': other_alive,
+                        'forward_unchanged': forward_unchanged,
+                        'criterion': ('STE removal must zero the indexer '
+                                      'gradients without changing the '
+                                      'forward output; the rest of the '
+                                      'model must still receive gradients'),
+                    }
+                failed = [f for f, rec in factors.items()
+                          if not rec.get('passed')]
+                checks[name] = {
+                    'declared_factors': declared,
+                    'status': 'verified' if not failed else 'failed',
+                    'factors': factors,
+                    'error': None,
+                }
+                failures.extend(f'{name}:{factor}' for factor in failed)
+            except Exception as exc:  # noqa: BLE001 - audit must not crash
+                checks[name] = {
+                    'declared_factors': declared,
+                    'status': 'failed',
+                    'factors': {},
+                    'error': f'{type(exc).__name__}: {exc}',
+                }
+                failures.append(f'{name}:audit_error')
+        status = ('verified' if checks and not failures
+                  else ('failed' if failures else 'no_variants'))
+        return {
+            'status': status,
+            'baseline_present': True,
+            'baseline': str(baseline['name']),
+            'tolerance': float(tol),
+            'seed': int(seed),
+            'n_kv': int(n_kv),
+            'checks': checks,
+            'failures': failures,
+            'error': None,
+            'note': ('Rebuilds every arm with the baseline weights and one '
+                     'fixed batch. A factor must change the forward output '
+                     '(rope/topk) or the gradient path (ste); otherwise the '
+                     'arm is not a treatment and its contrasts cannot '
+                     'support a mechanism claim.'),
+        }
+    except Exception as exc:  # noqa: BLE001 - audit must not crash a run
+        return {
+            'status': 'error',
+            'baseline_present': True,
+            'baseline': str(baseline.get('name')),
+            'checks': {},
+            'failures': [f'audit_error:{type(exc).__name__}'],
+            'error': f'{type(exc).__name__}: {exc}',
+            'note': 'The manipulation audit could not build or run an arm.',
+        }
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 def ablation_design_audit(variants, rows=None, requested=None,
-                          recipe=None, d_model=32, n_kv_list=None):
+                          recipe=None, d_model=32, n_kv_list=None,
+                          manipulation_audit=None):
     """Audit the selected variant set as a controlled ablation design.
 
     Exp 8 toggles three CSA mechanism factors — partial RoPE, the top-k
@@ -1376,6 +1722,12 @@ def ablation_design_audit(variants, rows=None, requested=None,
     verdict are listed in ``single_factor_claim_failures``;
     ``interaction_claims_valid`` applies the same requirements to the
     factorial cells and lists ``interaction_claim_failures``.
+
+    ``manipulation_audit`` (the result of
+    :func:`mechanism_manipulation_audit`) is an optional fourth check: when
+    supplied, a non-``verified`` status withholds both claim verdicts,
+    because an arm whose declared switch is a no-op cannot support a
+    mechanism contrast no matter how clean its metadata looks.
     """
     names = [v['name'] for v in variants]
     baseline = next((v for v in variants if v['name'] == 'baseline'), None)
@@ -1737,6 +2089,14 @@ def ablation_design_audit(variants, rows=None, requested=None,
         single_factor_failures.append(
             'runtime_controls_'
             f'{runtime_controls.get("controls_status") or "unknown"}')
+    if manipulation_audit is not None:
+        audit['manipulation_audit'] = manipulation_audit
+        manipulation_status = (
+            manipulation_audit.get('status')
+            if isinstance(manipulation_audit, dict) else 'invalid')
+        if manipulation_status != 'verified':
+            single_factor_failures.append(
+                f'manipulation_{manipulation_status or "unknown"}')
     audit['single_factor_claims_valid'] = not single_factor_failures
     audit['single_factor_claim_failures'] = single_factor_failures
 
@@ -1753,6 +2113,13 @@ def ablation_design_audit(variants, rows=None, requested=None,
         interaction_failures.append(
             'runtime_controls_'
             f'{runtime_controls.get("controls_status") or "unknown"}')
+    if manipulation_audit is not None:
+        manipulation_status = (
+            manipulation_audit.get('status')
+            if isinstance(manipulation_audit, dict) else 'invalid')
+        if manipulation_status != 'verified':
+            interaction_failures.append(
+                f'manipulation_{manipulation_status or "unknown"}')
     audit['interaction_claims_valid'] = not interaction_failures
     audit['interaction_claim_failures'] = interaction_failures
     return audit
@@ -1972,6 +2339,22 @@ def main():
         gate_cells, device, n_kv=n_kv_list[0], env_prefix='MECH')
     if not proceed:
         return 1
+
+    # Intervention-fidelity check: every selected arm must actually apply
+    # its declared switch before the paired sweep spends compute on it. A
+    # no-op ablation (config says RoPE off but the forward still rotates, or
+    # a "frozen" indexer that still receives STE gradients) would otherwise
+    # produce a clean-looking null contrast. The audit rebuilds each arm
+    # with the baseline weights on one fixed batch; a failed check is
+    # recorded and withholds the mechanism claims below.
+    manipulation_audit = mechanism_manipulation_audit(
+        variants, d_model=32, device=device)
+    if manipulation_audit['status'] == 'failed':
+        logger.warning(
+            '  WARNING: mechanism manipulation audit FAILED (%s); the '
+            'affected arms are not treatments, so their single-factor and '
+            'interaction claims are withheld.',
+            ', '.join(manipulation_audit.get('failures') or []))
 
     # Shared Bonferroni family: one paired accuracy test vs baseline per
     # non-baseline variant (only when the baseline variant is present) PLUS
@@ -2364,7 +2747,8 @@ def main():
         variants, rows=all_rows,
         requested=requested if requested else None,
         recipe={'steps': steps, 'train_batch': train_batch, 'lr': lr},
-        n_kv_list=n_kv_list)
+        n_kv_list=n_kv_list,
+        manipulation_audit=manipulation_audit)
     if design_audit['status'] != 'leave_one_out_complete':
         logger.warning(
             '  WARNING: selected variant set is not a complete leave-one-out '
