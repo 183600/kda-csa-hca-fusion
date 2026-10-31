@@ -93,6 +93,7 @@ from kaggle_setup import (configure_torch_for_device, set_global_seed,
                           seed_worker, capture_provenance,
                           write_json_atomic, write_results_json,
                           split_train_val_test, audit_split,
+                          strata_balance_report,
                           grad_flow_report, make_run_manifest_entry,
                           append_run_manifest)
 from results_analysis import (LM_ERROR_CATEGORIES, diagnose_nonfinite,
@@ -612,7 +613,7 @@ def clean_lm_texts(texts, tokenizer, seq_len, *, dedup=True, min_tokens=2,
 
 
 def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
-                      group_ids=None, chronological=False,
+                      group_ids=None, chronological=False, strata=None,
                       tokenizer=None, seq_len=None,
                       near_dup_audit=False,
                       near_dup_threshold=DEFAULT_NEAR_DUP_THRESHOLD,
@@ -632,7 +633,14 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         used to fit or select anything that predicts the past;
       * ``group_ids`` — one label per document (user / author / session /
         source id): all documents of a group land on the SAME side, so
-        no group straddles train/val/test.
+        no group straddles train/val/test;
+      * ``strata`` — one PRE-SPECIFIED covariate label per document (for
+        example a fixed token-length bin). The split is drawn separately
+        inside each stratum at the same global fractions, so val/test
+        keep the train length mix instead of relying on a small random
+        sample to balance it. Only the covariate is used, never a label
+        or model metric. Mutually exclusive with ``group_ids`` /
+        ``chronological``.
 
     On top of the structural audit this verifies that the three text
     partitions share no exact OR normalized duplicate (same content after
@@ -661,12 +669,17 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         raise ValueError(
             f'group_ids has length {len(group_ids)} but there are '
             f'{len(texts)} texts')
+    if strata is not None and len(strata) != len(texts):
+        raise ValueError(
+            f'strata has length {len(strata)} but there are '
+            f'{len(texts)} texts')
     split = split_train_val_test(len(texts), val_frac=val_frac,
                                  test_frac=test_frac, seed=seed,
                                  group_ids=group_ids,
-                                 chronological=chronological)
+                                 chronological=chronological,
+                                 strata=strata)
     audit = audit_split(split, len(texts), group_ids=group_ids,
-                        chronological=chronological)
+                        chronological=chronological, strata=strata)
     by_split = {k: [texts[i] for i in split[k]]
                 for k in ('train', 'val', 'test')}
     digests = {k: _text_digests(v) for k, v in by_split.items()}
@@ -696,6 +709,7 @@ def split_clean_texts(texts, *, val_frac=0.1, test_frac=0.1, seed=0,
         'group_aware': group_ids is not None,
         'n_groups': (len(set(map(str, group_ids)))
                      if group_ids is not None else None),
+        'stratified': strata is not None,
         'chronological_order_verified': order_verified,
         'audit': audit,
         'exact_text_overlaps': overlaps,
@@ -1044,6 +1058,60 @@ def _text_length_stats(texts, tokenizer, seq_len, *, n_probe=256):
         'cap_frac': sum(1 for x in lengths if x >= seq_len + 1) / len(lengths),
         'unk_rate': (unk / total) if total else 0.0,
     }
+
+
+def _length_strata(texts, tokenizer, seq_len, *, n_bins=4):
+    """Pre-specified relative token-length bins for a stratified split.
+
+    The boundaries are fixed fractions of the model window
+    (``cap/2**(n_bins-1)`` ... ``cap/2``), NOT corpus quantiles: a quantile
+    boundary would depend on the held-out rows, while a fixed boundary is
+    a property of the model's context geometry and can be declared before
+    looking at the data. Short documents are separated more finely than
+    long ones because TinyStories-like corpora cluster well below the cap.
+
+    Returns ``(labels, stats)``. ``labels[i]`` is the stratum of text
+    ``i``; ``stats`` is JSON-serializable and records the boundaries,
+    per-bin counts and tokenize errors. Encoding every document is the
+    cost of stratifying on length, so this helper is opt-in.
+    """
+    import bisect
+    n_bins = _exact_int_arg('n_bins', n_bins, minimum=2)
+    if n_bins > 8:
+        raise ValueError(f'n_bins must be <= 8, got {n_bins}')
+    seq_len = _exact_int_arg('seq_len', seq_len, minimum=1)
+    cap = seq_len + 1
+    boundaries = [cap / float(2 ** (n_bins - 1 - i))
+                  for i in range(n_bins - 1)]
+    labels = []
+    counts = {f'len_bin_{i}': 0 for i in range(n_bins)}
+    counts['len_bin_unknown'] = 0
+    n_errors = 0
+    for text in texts:
+        try:
+            ids = _validated_token_ids(tokenizer.encode(
+                str(text), truncation=True, max_length=cap))
+        except Exception:
+            labels.append('len_bin_unknown')
+            counts['len_bin_unknown'] += 1
+            n_errors += 1
+            continue
+        idx = bisect.bisect_left(boundaries, len(ids))
+        label = f'len_bin_{idx}'
+        labels.append(label)
+        counts[label] += 1
+    stats = {
+        'scheme': 'relative_token_length_geometric',
+        'n_bins': int(n_bins),
+        'window_tokens': int(cap),
+        'boundaries': boundaries,
+        'counts': counts,
+        'n_tokenize_errors': int(n_errors),
+        'note': ('boundaries are fixed fractions of the model window, '
+                 'not corpus quantiles; the covariate is computed before '
+                 'the split and no label or model metric is used'),
+    }
+    return labels, stats
 
 
 def _probe_token_lengths(texts, tokenizer, seq_len, *, n_probe=256):
@@ -3174,6 +3242,19 @@ def main():
                              "corpora (prevent future->past leakage). "
                              "Default: off (i.i.d. story split via a seeded "
                              "shuffle).")
+    parser.add_argument("--stratify_by", choices=("none", "length"),
+                        default="none",
+                        help="Draw the split inside pre-specified covariate "
+                             "strata so val/test keep the train distribution "
+                             "of that covariate. 'length' uses fixed "
+                             "relative token-length bins (see "
+                             "docs/data-integrity.md). Only the covariate is "
+                             "used, never a label or model metric; cannot be "
+                             "combined with --chronological_split. Default: "
+                             "none (plain seeded shuffle).")
+    parser.add_argument("--stratify_bins", type=int, default=4,
+                        help="Number of relative token-length bins for "
+                             "--stratify_by length (2-8, default 4).")
     parser.add_argument("--dedup_windows", action="store_true",
                         help="Additionally drop documents whose truncated "
                              "seq_len+1 token window was already seen (the "
@@ -3345,6 +3426,12 @@ def main():
     if args.val_frac + args.test_frac >= 1.0:
         raise SystemExit("--val_frac + --test_frac must leave a positive "
                          "train fraction")
+    if args.stratify_bins < 2 or args.stratify_bins > 8:
+        raise SystemExit("--stratify_bins must be in [2, 8]")
+    if args.stratify_by == "length" and args.chronological_split:
+        raise SystemExit("--stratify_by length cannot be combined with "
+                         "--chronological_split: a time-ordered split "
+                         "already fixes every row's position")
     if args.val_every < 0:
         raise SystemExit("--val_every must be >= 0")
     if args.eval_max_batches < 0:
@@ -3646,9 +3733,19 @@ def main():
             f"only {len(clean_texts)} usable documents after cleaning "
             f"(raw={len(raw_texts)}); refusing to train on a degenerate "
             f"corpus")
+    strata = None
+    strata_report = None
+    if args.stratify_by == "length":
+        strata, strata_report = _length_strata(
+            clean_texts, tokenizer, seq_len, n_bins=args.stratify_bins)
+        print(f"[data] length-stratified split: "
+              f"bins={strata_report['n_bins']} "
+              f"boundaries={strata_report['boundaries']} "
+              f"counts={strata_report['counts']}")
     split, split_report = split_clean_texts(
         clean_texts, val_frac=args.val_frac, test_frac=args.test_frac,
-        seed=args.seed, chronological=bool(args.chronological_split))
+        seed=args.seed, chronological=bool(args.chronological_split),
+        strata=strata)
     train_texts = [clean_texts[i] for i in split['train']]
     val_texts = [clean_texts[i] for i in split['val']]
     test_texts = [clean_texts[i] for i in split['test']]
@@ -3664,6 +3761,16 @@ def main():
               f"{leak_filter['test_dropped']} test row(s) whose "
               f"truncated window already appeared in train; kept "
               f"val={len(val_texts)} test={len(test_texts)}")
+    final_strata_balance = None
+    if strata is not None:
+        index_by_text = {text: i for i, text in enumerate(clean_texts)}
+        final_index_split = {
+            name: [index_by_text[text] for text in texts]
+            for name, texts in (('train', train_texts),
+                                ('val', val_texts),
+                                ('test', test_texts))}
+        final_strata_balance = strata_balance_report(
+            final_index_split, strata, len(clean_texts))
     window_audit = _window_overlap_audit(
         train_texts, val_texts, test_texts, tokenizer, seq_len)
     if window_audit['any']:
@@ -3790,7 +3897,8 @@ def main():
           f"near_dup={cleaning['stats']['n_near_duplicates']}, "
           f"too_short={cleaning['stats']['n_too_short_to_supervise']})")
     print(f"Split (seed={args.seed}, "
-          f"chronological={bool(args.chronological_split)}): "
+          f"chronological={bool(args.chronological_split)}, "
+          f"stratified_by={args.stratify_by}): "
           f"train={len(train_texts)} "
           f"val={len(val_texts)} test={len(test_texts)} "
           f"[val/test sealed until final evaluation]")
@@ -3963,6 +4071,9 @@ def main():
             'test_frac': float(args.test_frac),
             'chronological': bool(args.chronological_split),
             'group_ids': None,
+            'stratified_by': args.stratify_by,
+            'stratification': strata_report,
+            'post_filter_strata_balance': final_strata_balance,
             'chronological_order_verified':
                 split_report['chronological_order_verified'],
             'note': ('Story-level deterministic split drawn with a '
@@ -3978,10 +4089,14 @@ def main():
                      '--dedup_windows; near-duplicates (token n-gram '
                      'Jaccard >= near_dup_threshold) are audited across '
                      'splits and dropped before the split only with '
-                     '--dedup_near. No fitted preprocessing '
-                     'transform exists in this pipeline; were one added '
-                     '(e.g. a tokenizer or length normalizer), it must '
-                     'be fitted on train indices only.'),
+                     '--dedup_near. With --stratify_by length the split '
+                     'is drawn inside fixed relative token-length bins; '
+                     'that uses only the pre-specified covariate, not a '
+                     'label or any model/held-out metric. No fitted '
+                     'preprocessing transform exists in this pipeline; '
+                     'were one added (e.g. a tokenizer or length '
+                     'normalizer), it must be fitted on train indices '
+                     'only.'),
         },
         'near_dup_policy': {
             'pre_split_dedup': bool(args.dedup_near),

@@ -1659,9 +1659,82 @@ def _partition_group_order(order, members, targets, active, buckets):
     return result
 
 
+def _validate_strata(strata, n_samples: int):
+    """Canonicalize per-row stratum labels (``None`` means unstratified)."""
+    if strata is None:
+        return None
+    if isinstance(strata, (str, bytes)):
+        raise ValueError(
+            'strata must be a sequence of labels, not a single string')
+    try:
+        labels = [str(label) for label in strata]
+    except TypeError:
+        raise ValueError(
+            'strata must be a sequence of per-row labels') from None
+    if len(labels) != n_samples:
+        raise ValueError(
+            f'strata has length {len(labels)} but n_samples={n_samples}')
+    return labels
+
+
+def _stratum_seed(seed: int, label: str) -> int:
+    """Deterministic per-stratum RNG seed independent of Python hashing."""
+    import hashlib
+    payload = f'{int(seed)}\x00{label}'.encode('utf-8', 'replace')
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], 'big')
+
+
+def _stratified_partition(strata, *, train_frac: float, val_frac: float,
+                          test_frac: float, active, buckets, seed: int):
+    """Allocate rows to splits within each stratum, then repair empties.
+
+    Each stratum is shuffled with its own SHA-256-derived RNG seed and cut
+    with Hamilton rounding at the GLOBAL split fractions. This keeps every
+    sufficiently large stratum represented in every requested split while
+    leaving the global row budget approximately unchanged. A requested
+    split that is still empty (possible when every stratum is smaller than
+    the number of splits) receives one row from the largest bucket; the
+    caller's strata audit reports the affected cell as missing rather than
+    hiding the imbalance.
+    """
+    import random
+    groups: dict[str, list[int]] = {}
+    for i, label in enumerate(strata):
+        groups.setdefault(label, []).append(i)
+    fractions = [train_frac, val_frac, test_frac]
+    result = {bucket: [] for bucket in buckets}
+    for label in sorted(groups):
+        rows = groups[label]
+        random.Random(_stratum_seed(seed, label)).shuffle(rows)
+        sizes = largest_remainder_sizes(len(rows), fractions)
+        cursor = 0
+        for idx in range(3):
+            result[buckets[idx]].extend(rows[cursor:cursor + sizes[idx]])
+            cursor += sizes[idx]
+    n_repairs = 0
+    for idx in active:
+        key = buckets[idx]
+        if result[key]:
+            continue
+        donors = [bucket for bucket in buckets if len(result[bucket]) > 1]
+        if not donors:
+            donors = [bucket for bucket in buckets if result[bucket]]
+        if not donors:
+            break
+        donor = max(donors,
+                    key=lambda bucket: (len(result[bucket]),
+                                        -buckets.index(bucket)))
+        result[key].append(result[donor].pop())
+        n_repairs += 1
+    for key in result:
+        result[key].sort()
+    return result, n_repairs
+
+
 def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
                          test_frac: float = 0.1, seed: int = 0,
-                         group_ids=None, chronological: bool = False) -> dict:
+                         group_ids=None, chronological: bool = False,
+                         strata=None) -> dict:
     """Partition ``range(n_samples)`` into disjoint train / val / test sets.
 
     Args:
@@ -1681,6 +1754,16 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
             set. Use this for time series / any data with meaningful
             order, so the model never sees the future of the data it is
             validating or testing on.
+        strata: optional length-``n_samples`` sequence of PRE-SPECIFIED
+            covariate labels (e.g. fixed token-length bins). The split is
+            drawn independently inside every stratum at the same global
+            fractions, which keeps the held-out splits representative of
+            the covariate and reduces split-to-split variance. Stratifying
+            uses only this covariate, never a label, model metric or
+            held-out score. Mutually exclusive with ``chronological`` and
+            ``group_ids``: ordered or indivisible-group data already has a
+            structural split, and silently mixing the two rules would make
+            the audit ambiguous.
 
     Returns:
         ``{'train': [...], 'val': [...], 'test': [...]}`` with sorted
@@ -1720,6 +1803,16 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
         raise ValueError(
             f'val_frac + test_frac must leave a positive train fraction, '
             f'got val={val_frac}, test={test_frac}')
+
+    strata_labels = _validate_strata(strata, n)
+    if strata_labels is not None and chronological:
+        raise ValueError(
+            'strata cannot be combined with chronological=True: a '
+            'time-ordered split already fixes every row\'s position')
+    if strata_labels is not None and group_ids is not None:
+        raise ValueError(
+            'strata cannot be combined with group_ids: group-aware and '
+            'stratified allocation rules would conflict; use one of them')
 
     if group_ids is not None:
         if len(group_ids) != n:
@@ -1782,6 +1875,12 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
             targets[idx] += 1
 
     result = {'train': [], 'val': [], 'test': []}
+    if strata_labels is not None:
+        result, _ = _stratified_partition(
+            strata_labels, train_frac=train_frac, val_frac=val_frac,
+            test_frac=test_frac, active=active, buckets=buckets,
+            seed=int(seed))
+        return result
     if members is not None:
         # Whole-group partition. The order is the seeded shuffle for
         # i.i.d. groups or first-appearance order for chronological data;
@@ -1807,8 +1906,69 @@ def split_train_val_test(n_samples: int, *, val_frac: float = 0.1,
     return result
 
 
+def _strata_balance_from_index_sets(index_sets, strata_labels):
+    """Covariate-balance block from already-validated per-split indices."""
+    keys = ('train', 'val', 'test')
+    labels = sorted(set(strata_labels))
+    counts = {label: {key: 0 for key in keys} for label in labels}
+    n_assigned = sum(len(index_sets[key]) for key in keys)
+    for key in keys:
+        for i in index_sets[key]:
+            if isinstance(i, bool) or not isinstance(i, int):
+                continue
+            if 0 <= i < len(strata_labels):
+                counts[strata_labels[i]][key] += 1
+    stratum_sizes = {
+        label: sum(counts[label].values()) for label in labels}
+    global_fractions = {
+        key: (len(index_sets[key]) / n_assigned) if n_assigned else 0.0
+        for key in keys}
+    max_deviation = 0.0
+    missing_cells = 0
+    for label in labels:
+        size = stratum_sizes[label]
+        for key in keys:
+            if size:
+                max_deviation = max(
+                    max_deviation,
+                    abs(counts[label][key] / size - global_fractions[key]))
+            if index_sets[key] and counts[label][key] == 0:
+                missing_cells += 1
+    return {
+        'n_strata': len(labels),
+        'stratum_sizes': stratum_sizes,
+        'counts': counts,
+        'global_fractions': global_fractions,
+        'max_abs_fraction_deviation': max_deviation,
+        'n_missing_stratum_split_cells': missing_cells,
+        'note': ('descriptive covariate balance, not a leakage gate; '
+                 'a stratum smaller than the number of splits cannot '
+                 'populate every split'),
+    }
+
+
+def strata_balance_report(split, strata, n_samples: int):
+    """Public covariate-balance report for any (possibly filtered) split.
+
+    Unlike :func:`audit_split`, this does not require the split to be
+    complete: it is also used AFTER the post-split window-leak filter,
+    when some held-out rows have been removed. ``n_samples`` is the
+    original cleaned-corpus size that ``strata`` indexes into.
+    """
+    strata_labels = _validate_strata(strata, n_samples)
+    if strata_labels is None:
+        return None
+    index_sets = {}
+    for key in ('train', 'val', 'test'):
+        index_sets[key] = [
+            i for i in (split.get(key) or [])
+            if not isinstance(i, bool) and isinstance(i, int)
+            and 0 <= i < n_samples]
+    return _strata_balance_from_index_sets(index_sets, strata_labels)
+
+
 def audit_split(split: dict, n_samples: int, group_ids=None,
-                chronological: bool = False) -> dict:
+                chronological: bool = False, strata=None) -> dict:
     """Independently verify a train/val/test assignment has no leakage.
 
     Checks, in order:
@@ -1827,6 +1987,12 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
         catches a future refactor that shuffles a time-ordered split
         while the caller believes it is chronological.
 
+    ``strata`` adds a DESCRIPTIVE covariate-balance block: per-stratum
+    split counts, the global split fractions, and the largest absolute
+    deviation from those fractions. It does not change ``ok``: a stratum
+    smaller than the number of requested splits cannot populate all of
+    them, so balance is reported rather than turned into a pass/fail gate.
+
     Returns a JSON-serializable report with ``ok`` plus the individual
     booleans and a ``problems`` list. Callers should abort on
     ``ok == False`` instead of training on a compromised split.
@@ -1844,6 +2010,7 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
     if n > sys.maxsize:
         raise ValueError(
             f'audit_split: n_samples={n!r} is too large to audit.')
+    strata_labels = _validate_strata(strata, n)
     problems = []
     expected_keys = {'train', 'val', 'test'}
     if set(split) != expected_keys:
@@ -1938,6 +2105,10 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
             problems.append(
                 'chronological audit requested but group_ids length does '
                 'not match n_samples')
+    strata_report = None
+    if strata_labels is not None:
+        strata_report = _strata_balance_from_index_sets(
+            index_sets, strata_labels)
     return {
         'ok': not problems,
         'pairwise_disjoint': paired_disjoint,
@@ -1946,6 +2117,8 @@ def audit_split(split: dict, n_samples: int, group_ids=None,
         'group_integrity': groups_ok,
         'chronological': bool(chronological),
         'chronological_order_verified': chronological_ok,
+        'stratified': strata_labels is not None,
+        'strata': strata_report,
         'n_samples': n,
         'sizes': {k: len(v) for k, v in index_sets.items()},
         'problems': problems,

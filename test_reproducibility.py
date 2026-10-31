@@ -42,6 +42,7 @@ from kaggle_setup import (  # noqa: E402
     seed_worker,
     set_global_seed,
     split_train_val_test,
+    strata_balance_report,
 )
 from ops_fused import HybridConfig  # noqa: E402
 from run_ablation import (  # noqa: E402
@@ -63,6 +64,7 @@ from train_lm_autodl import (  # noqa: E402
     SealedTestSet,
     TinyStoriesLM,
     _FallbackCharTokenizer,
+    _length_strata,
     _probe_token_lengths,
     _text_length_stats,
     _texts_fingerprint,
@@ -570,6 +572,99 @@ def test_split_keeps_groups_whole():
                    if members & set(split[k]))
 
 
+def test_split_train_val_test_stratified_balances_each_stratum():
+    n = 200
+    strata = [f'bin{i % 4}' for i in range(n)]
+    split = split_train_val_test(n, val_frac=0.2, test_frac=0.1, seed=3,
+                                 strata=strata)
+    report = audit_split(split, n, strata=strata)
+    assert report['ok'], report['problems']
+    assert report['stratified'] is True
+    block = report['strata']
+    assert block['n_strata'] == 4
+    # Every 50-row stratum is split 35/10/5, so the held-out length mix
+    # matches train exactly instead of relying on a random draw.
+    for label, counts in block['counts'].items():
+        assert counts == {'train': 35, 'val': 10, 'test': 5}, (label, counts)
+        assert block['stratum_sizes'][label] == 50
+    assert block['max_abs_fraction_deviation'] == pytest.approx(0.0)
+    assert block['n_missing_stratum_split_cells'] == 0
+    # Deterministic for one seed, different assignment for another, and
+    # still RNG-neutral.
+    assert split == split_train_val_test(
+        n, val_frac=0.2, test_frac=0.1, seed=3, strata=strata)
+    assert split != split_train_val_test(
+        n, val_frac=0.2, test_frac=0.1, seed=4, strata=strata)
+    state = torch.get_rng_state()
+    try:
+        split_train_val_test(50, seed=11, strata=['a'] * 50)
+        assert torch.equal(state, torch.get_rng_state())
+    finally:
+        torch.set_rng_state(state)
+
+
+def test_strata_balance_report_handles_a_filtered_split():
+    # The post-split window-leak filter can drop rows, so this report must
+    # not require the split to be complete.
+    block = strata_balance_report(
+        {'train': [0, 1], 'val': [3], 'test': [5]},
+        ['a', 'a', 'b', 'b', 'a', 'b'], 6)
+    assert block['n_strata'] == 2
+    assert block['counts']['a'] == {'train': 2, 'val': 0, 'test': 0}
+    assert block['counts']['b'] == {'train': 0, 'val': 1, 'test': 1}
+    assert block['stratum_sizes'] == {'a': 2, 'b': 2}
+    assert block['n_missing_stratum_split_cells'] == 3
+    assert strata_balance_report(
+        {'train': [0], 'val': [1], 'test': [2]}, None, 3) is None
+
+
+def test_stratified_split_repairs_tiny_empty_splits_and_validates_inputs():
+    strata = ['a', 'b', 'c']
+    split = split_train_val_test(3, seed=0, strata=strata)
+    assert all(split[k] for k in ('train', 'val', 'test'))
+    assert audit_split(split, 3, strata=strata)['ok']
+    with pytest.raises(ValueError, match='strata has length'):
+        split_train_val_test(10, strata=['a'] * 9)
+    with pytest.raises(ValueError, match='not a single string'):
+        split_train_val_test(10, strata='a' * 10)
+    with pytest.raises(ValueError, match='chronological'):
+        split_train_val_test(10, chronological=True, strata=['a'] * 10)
+    with pytest.raises(ValueError, match='group_ids'):
+        split_train_val_test(10, group_ids=['g'] * 10, strata=['a'] * 10)
+
+
+def test_length_strata_use_fixed_relative_bins_and_cover_all_rows():
+    tok = _FallbackCharTokenizer()
+    seq_len = 64  # cap=65, boundaries 65/8, 65/4, 65/2
+    texts = ['x', 'x' * 8, 'x' * 16, 'x' * 32, 'x' * 64, 'x' * 200]
+    labels, stats = _length_strata(texts, tok, seq_len, n_bins=4)
+    assert labels == [
+        'len_bin_0', 'len_bin_0', 'len_bin_1',
+        'len_bin_2', 'len_bin_3', 'len_bin_3']
+    assert len(labels) == len(texts)
+    assert stats['boundaries'] == [65 / 8, 65 / 4, 65 / 2]
+    assert stats['counts'] == {
+        'len_bin_0': 2, 'len_bin_1': 1, 'len_bin_2': 1,
+        'len_bin_3': 2, 'len_bin_unknown': 0}
+    json.dumps(stats, allow_nan=False)
+    with pytest.raises(ValueError):
+        _length_strata(texts, tok, seq_len, n_bins=1)
+    with pytest.raises(ValueError):
+        _length_strata(texts, tok, seq_len, n_bins=9)
+
+    class _BrokenTokenizer:
+        def encode(self, text, truncation=False, max_length=None):
+            if 'bad' in text:
+                raise ValueError('cannot encode')
+            return [1] * len(text)
+
+    labels, stats = _length_strata(
+        ['ok text', 'bad text'], _BrokenTokenizer(), seq_len, n_bins=4)
+    assert labels == ['len_bin_0', 'len_bin_unknown']
+    assert stats['n_tokenize_errors'] == 1
+    assert stats['counts']['len_bin_unknown'] == 1
+
+
 def test_audit_split_detects_overlap_and_missing_rows():
     bad = {'train': [0, 1, 2, 2], 'val': [2, 3], 'test': [4]}
     report = audit_split(bad, 6)
@@ -776,6 +871,31 @@ def test_split_clean_texts_groups_stay_on_one_side():
     # A mismatched group list is rejected before any split is drawn.
     with pytest.raises(ValueError):
         split_clean_texts(texts, group_ids=group_ids[:-1])
+
+
+def test_split_clean_texts_stratified_reports_covariate_balance():
+    tok = _FallbackCharTokenizer()
+    texts = [f'unique story number {i}' for i in range(120)]
+    strata = ['short'] * 60 + ['long'] * 60
+    split, report = split_clean_texts(
+        texts, val_frac=0.2, test_frac=0.1, seed=2, strata=strata)
+    assert report['stratified'] is True
+    assert report['audit']['ok'], report['audit']['problems']
+    block = report['audit']['strata']
+    assert block['n_strata'] == 2
+    for label in ('short', 'long'):
+        assert block['counts'][label] == {
+            'train': 42, 'val': 12, 'test': 6}
+    assert block['max_abs_fraction_deviation'] == pytest.approx(0.0)
+    # Same seed -> same split; another seed changes the assignment.
+    again, _ = split_clean_texts(
+        texts, val_frac=0.2, test_frac=0.1, seed=2, strata=strata)
+    assert again == split
+    other, _ = split_clean_texts(
+        texts, val_frac=0.2, test_frac=0.1, seed=3, strata=strata)
+    assert other != split
+    with pytest.raises(ValueError, match='strata has length'):
+        split_clean_texts(texts, strata=strata[:-1])
 
 
 def test_needle_train_eval_seed_streams_are_reserved_and_disjoint():

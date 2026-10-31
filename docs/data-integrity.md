@@ -112,6 +112,81 @@ reported so a reader can see that the detector fired without treating
 redundancy as contamination. `examples` is capped, but every count is a
 full count (unless `candidates_truncated=True`).
 
+## Stratified splitting (covariate balance)
+
+The seeded shuffle is unbiased in expectation, but a small held-out split
+can still draw an unrepresentative covariate mix. If val/test are shorter
+or longer than train, the held-out loss partly measures that mismatch, and
+the split-to-split variance inflates the seed budget. The split helpers now
+accept a pre-specified `strata` sequence (one label per row):
+
+```python
+from kaggle_setup import split_train_val_test
+
+strata = [...]  # one pre-specified covariate label per row
+split = split_train_val_test(n, val_frac=0.1, test_frac=0.1,
+                             seed=0, strata=strata)
+```
+
+`split_clean_texts(..., strata=...)` forwards the same argument, and the LM
+entry point exposes it as `--stratify_by length --stratify_bins 4`.
+
+### What the strata are
+
+A stratum is a **covariate label fixed before the split**, not a target
+label, a loss, or a metric. The built-in `length` scheme bins each
+document by the number of tokens in its truncated model window. The
+boundaries are fixed
+fractions of the window (`cap/8, cap/4, cap/2` for four bins, where
+`cap = seq_len + 1`), not corpus quantiles: a quantile boundary would
+depend on the held-out rows, while a fixed boundary is a property of the
+model geometry that can be declared before looking at the data. Documents
+that fail tokenization go to `len_bin_unknown` instead of aborting the
+split.
+
+### Allocation rule
+
+Inside each stratum the rows are shuffled with a dedicated RNG seeded by
+`SHA-256(seed, stratum_label)` and cut with Hamilton rounding at the global
+train/val/test fractions. The RNG is local, so the split still cannot
+perturb Python/NumPy/torch training streams, and the result is independent
+of row order. If a requested split would remain empty (possible when every
+stratum is smaller than the number of splits), one row is moved from the
+largest bucket, and the audit reports the affected stratum/split cell as
+empty instead of hiding the imbalance.
+
+`audit_split(..., strata=...)` adds a descriptive block:
+
+```text
+stratified, strata: {
+  n_strata, stratum_sizes, counts: {label: {train, val, test}},
+  global_fractions, max_abs_fraction_deviation,
+  n_missing_stratum_split_cells, note
+}
+```
+
+It is deliberately **not** a pass/fail leakage gate: a stratum with one row
+cannot populate three splits, so the audit reports the imbalance instead of
+rejecting an otherwise valid split. `ok` continues to mean the structural
+invariants (disjoint, complete, non-empty) hold. The post-split
+window-leak filter can remove held-out rows after this audit; the LM run
+record therefore also stores `split_protocol.post_filter_strata_balance`,
+the same balance block computed on the rows that are actually evaluated.
+
+### Reporting and limitations
+
+Report `stratified_by`, the bin boundaries/counts and the per-stratum split
+counts next to the split seed. A stratified run and an unstratified run are
+different data protocols; compare them as a protocol sensitivity check, not
+as two views of one number. Stratification balances only the chosen
+covariate — it does not fix a domain shift in vocabulary, style or topic
+(use the unigram audit above), and it cannot repair near-duplicate leakage.
+Choose the covariate and bins before inspecting held-out metrics; changing
+them after seeing a shift or a score is a selection effect. `strata` is
+mutually exclusive with `group_ids` and `chronological` in the current
+implementation, because those modes already impose a structural split and
+mixing the rules would make the audit ambiguous.
+
 ## Fingerprint framing
 
 `TinyStoriesLM.data_fingerprint` is the corpus version id embedded in the
@@ -141,6 +216,8 @@ For a paper/report, state:
 * if the threshold is varied as a sensitivity analysis, report both runs.
   Do **not** choose the threshold that makes the held-out number look
   best;
+* whether the split was stratified (`--stratify_by`), the pre-specified
+  bins/boundaries and the per-stratum counts from `split_audit.strata`;
 * whether held-out inference was cluster-aware. `ppl_bootstrap` accepts
   `cluster_ids` so near-duplicate documents are resampled as one unit
   instead of independent samples; report `n_clusters`, the design effect
