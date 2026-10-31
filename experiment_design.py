@@ -81,6 +81,21 @@ report also carries a conservative recommendation based on the largest
 observed per-contrast SD. This makes the screening -> power -> confirmatory
 sequence explicit instead of an informal judgement call.
 
+The pilot and the confirmatory run must use DISJOINT seeds. Reusing a pilot
+seed in the confirmatory block makes the confirmatory test dependent on the
+data that chose its sample size (and on the pilot outcome), so the nominal
+alpha and power no longer describe the test. The registry therefore reserves
+two seed namespaces: confirmatory seeds start at :data:`DEFAULT_SEED_BASE`
+(42) and pilot seeds at :data:`DEFAULT_PILOT_SEED_BASE` (10_000).
+:func:`registered_seed_blocks` exposes both blocks,
+:func:`audit_seed_block` checks a run against them, and :func:`audit_run`
+labels any confirmatory run that overlaps the pilot block
+``exploratory_pilot``. Set ``EXPERIMENT_SEED_ROLE=pilot`` when running the
+screening tier so every runner draws from the pilot block; leave it unset
+(or ``confirmatory``) for the preregistered run. :func:`pilot_report`
+records whether the pilot rows came from the reserved block and refuses to
+call an overlapping pilot eligible for planning.
+
 CLI
 ---
 ``python experiment_design.py`` prints the plan table.
@@ -145,7 +160,15 @@ __all__ = [
     'audit_execution_order',
     'DEFAULT_SCHEDULE_SEED',
     'EXECUTION_SCHEDULE_SCOPE',
+    'DEFAULT_SEED_BASE',
+    'DEFAULT_PILOT_SEED_BASE',
+    'SEED_BLOCK_ROLES',
+    'seed_block_role',
+    'seed_ids',
+    'registered_seed_blocks',
+    'audit_seed_block',
     'audit_run',
+    'pilot_seed_ids',
     'pilot_sd_from_rows',
     'pilot_report',
     'design_manifest',
@@ -154,10 +177,22 @@ __all__ = [
 ]
 
 DEFAULT_SEED_BASE = 42
+#: Reserved start of the screening/pilot seed namespace. It is deliberately
+#: far from the confirmatory block (42 + planned_seeds) so the two blocks
+#: cannot overlap for any plausible plan budget. A pilot estimates the SD;
+#: the confirmatory run must use fresh seeds, otherwise the sample size and
+#: the test share rows and the nominal error rate is no longer valid.
+DEFAULT_PILOT_SEED_BASE = 10_000
 DEFAULT_ALPHA = 0.05
 DEFAULT_TARGET_POWER = 0.80
 DEFAULT_ASSUMED_SD = 0.10
 DEFAULT_SCHEDULE_SEED = 0
+SEED_BLOCK_ROLES = ('confirmatory', 'pilot')
+
+#: Environment variable that selects the seed namespace used by the runners.
+#: Unset (or ``confirmatory``) preserves the historical 42 + i seeds;
+#: ``pilot`` selects 10_000 + i for the screening tier.
+SEED_ROLE_ENV = 'EXPERIMENT_SEED_ROLE'
 
 #: Scope string stored next to every execution-schedule fingerprint. The
 #: digest covers the factor cells, the seed-block order and the rotation seed;
@@ -743,6 +778,73 @@ def _seed_list(n_or_seeds, *, name='seeds'):
     return list(n_or_seeds)
 
 
+def _normalize_seed_role(role) -> str:
+    if role is None:
+        return 'confirmatory'
+    if not isinstance(role, str):
+        raise DesignError(
+            f'seed role must be a string, got {type(role).__name__}')
+    selected = role.strip().lower()
+    if selected not in SEED_BLOCK_ROLES:
+        raise DesignError(
+            f'unknown seed role {role!r}; valid roles: '
+            f'{list(SEED_BLOCK_ROLES)}')
+    return selected
+
+
+def seed_block_role(role=None) -> str:
+    """Return the selected seed namespace (``confirmatory`` or ``pilot``).
+
+    ``role`` overrides the process environment. When omitted,
+    ``EXPERIMENT_SEED_ROLE`` is read (default ``confirmatory``); setting it
+    to ``pilot`` makes every runner draw screening seeds from the reserved
+    :data:`DEFAULT_PILOT_SEED_BASE` block instead of reusing the
+    confirmatory seeds.
+    """
+    if role is None:
+        role = os.environ.get(SEED_ROLE_ENV, 'confirmatory')
+    return _normalize_seed_role(role)
+
+
+def seed_ids(n, *, role=None, base=None, plan_id=None) -> list[int]:
+    """Return ``n`` consecutive seed ids from the selected seed namespace.
+
+    This is the single source of truth used by the runners. The default
+    (confirmatory) namespace still starts at :data:`DEFAULT_SEED_BASE` (42),
+    so historical runs are unchanged. ``role='pilot'`` (or
+    ``EXPERIMENT_SEED_ROLE=pilot``) starts at
+    :data:`DEFAULT_PILOT_SEED_BASE` (10_000), keeping the screening block
+    disjoint from every registered confirmatory block. ``plan_id`` makes
+    the helper honor a plan-specific ``confirmatory_seed_base`` or
+    ``pilot.seed_base``; the runners use it where a plan can override the
+    defaults.
+    """
+    if not _is_int(n) or n < 0:
+        raise DesignError(f'seed count must be a non-negative int, got {n!r}')
+    if n > _MAX_EXPLICIT_SEED_COUNT:
+        raise DesignError(
+            f'seed count {n!r} is too large to enumerate explicitly '
+            f'(limit {_MAX_EXPLICIT_SEED_COUNT})')
+    if base is None:
+        selected = seed_block_role(role)
+        if plan_id is not None:
+            plan = get_plan(plan_id)
+            if selected == 'pilot':
+                pilot_cfg = plan.get('pilot')
+                if not isinstance(pilot_cfg, dict):
+                    raise DesignError('plan.pilot must be a dict')
+                base = pilot_cfg.get('seed_base', DEFAULT_PILOT_SEED_BASE)
+            else:
+                base = plan.get('confirmatory_seed_base', DEFAULT_SEED_BASE)
+        else:
+            base = (DEFAULT_PILOT_SEED_BASE if selected == 'pilot'
+                    else DEFAULT_SEED_BASE)
+    if not _is_int(base) or base < 0:
+        raise DesignError(
+            f'seed base must be a non-negative int, got {base!r}')
+    return [base + i for i in range(n)]
+
+
 def _cell_key(row, keys):
     return tuple(row.get(k) for k in keys)
 
@@ -790,6 +892,184 @@ def get_plan(plan_id: str) -> dict:
         raise DesignError(f'unknown experiment plan {plan_id!r}; valid ids: '
                           f'{list(PLANS)}')
     return copy.deepcopy(PLANS[plan_id])
+
+
+def _seed_base_field(value, name):
+    if not _is_int(value) or value < 0:
+        raise DesignError(f'{name} must be a non-negative int, got {value!r}')
+    return value
+
+
+def _seed_count_field(value, name):
+    if not _is_int(value) or value < 0:
+        raise DesignError(f'{name} must be a non-negative int, got {value!r}')
+    if value > _MAX_EXPLICIT_SEED_COUNT:
+        raise DesignError(
+            f'{name}={value!r} is too large to enumerate explicitly '
+            f'(limit {_MAX_EXPLICIT_SEED_COUNT})')
+    return value
+
+
+def _seed_range_overlap(base_a, count_a, base_b, count_b):
+    """Return ``(count, first, last)`` for the intersection of two ranges."""
+    start = max(base_a, base_b)
+    stop = min(base_a + count_a, base_b + count_b)
+    if start >= stop:
+        return 0, None, None
+    return stop - start, start, stop - 1
+
+
+def registered_seed_blocks(plan_id: str, *, pilot_count=None) -> dict:
+    """Return the disjoint confirmatory and pilot seed blocks of a plan.
+
+    The confirmatory block starts at the plan's ``confirmatory_seed_base``
+    (default :data:`DEFAULT_SEED_BASE`, 42) and has ``planned_seeds`` ids.
+    The pilot block starts at the plan's nested ``pilot.seed_base`` (default
+    :data:`DEFAULT_PILOT_SEED_BASE`, 10_000) and has ``screening_seeds`` ids
+    unless ``pilot_count`` is supplied (a pilot may run more seeds than the
+    minimum screening tier). The two blocks must be disjoint; a plan that
+    makes them overlap is rejected by :func:`validate_plan`.
+    """
+    plan = get_plan(plan_id)
+    confirm_base = _seed_base_field(
+        plan.get('confirmatory_seed_base', DEFAULT_SEED_BASE),
+        'confirmatory_seed_base')
+    pilot_cfg = plan.get('pilot')
+    if not isinstance(pilot_cfg, dict):
+        raise DesignError('plan.pilot must be a dict')
+    pilot_base = _seed_base_field(
+        pilot_cfg.get('seed_base', DEFAULT_PILOT_SEED_BASE),
+        'pilot.seed_base')
+    confirm_count = _seed_count_field(
+        plan.get('planned_seeds'), 'planned_seeds')
+    if pilot_count is None:
+        pilot_count = plan.get('screening_seeds')
+    pilot_count = _seed_count_field(pilot_count, 'pilot_count')
+    confirmatory = [confirm_base + i for i in range(confirm_count)]
+    pilot = [pilot_base + i for i in range(pilot_count)]
+    overlap = sorted(set(confirmatory) & set(pilot))
+    return {
+        'plan_id': plan_id,
+        'confirmatory': {
+            'role': 'confirmatory',
+            'base': confirm_base,
+            'count': confirm_count,
+            'seeds': confirmatory,
+        },
+        'pilot': {
+            'role': 'pilot',
+            'base': pilot_base,
+            'count': pilot_count,
+            'seeds': pilot,
+        },
+        'overlap': overlap,
+        'disjoint': not overlap,
+        'status': 'disjoint' if not overlap else 'overlapping',
+        'note': (
+            'pilot seeds estimate the planning SD only. Confirmatory seeds '
+            'are the independent test block; a confirmatory run may not '
+            'reuse any pilot seed, because choosing the sample size from '
+            'the pilot and then testing on the same seeds invalidates the '
+            'nominal alpha/power.'),
+    }
+
+
+def audit_seed_block(plan_id: str, seeds, *, role=None) -> dict:
+    """Check a run's seed list against the registered seed blocks.
+
+    ``seeds`` must be an explicit iterable (an int count is ambiguous here
+    and is rejected). ``role`` is the namespace the caller intended to use;
+    it defaults to ``confirmatory`` and does not read the environment, so
+    the audit is deterministic. The returned ``status`` distinguishes a run
+    on the registered confirmatory block from a pilot, a subset of the
+    confirmatory block, and a confirmatory run that contaminates the pilot
+    block.
+    """
+    role = _normalize_seed_role(role)
+    if isinstance(seeds, (str, bytes)) or not hasattr(seeds, '__iter__'):
+        raise DesignError(
+            'seeds must be an explicit iterable of seed ids (an int is a '
+            f'seed COUNT, which is ambiguous here), got {seeds!r}')
+    seed_list = list(seeds)
+    bad = [s for s in seed_list if not _is_int(s) or s < 0]
+    seen: set[int] = set()
+    duplicate_ids: set[int] = set()
+    for seed in seed_list:
+        if not _is_int(seed):
+            continue
+        if seed in seen:
+            duplicate_ids.add(seed)
+        seen.add(seed)
+    duplicates = sorted(duplicate_ids)
+    blocks = registered_seed_blocks(plan_id)
+    requested = {s for s in seed_list if _is_int(s) and s >= 0}
+    confirmatory = set(blocks['confirmatory']['seeds'])
+    pilot = set(blocks['pilot']['seeds'])
+    overlap_pilot = sorted(requested & pilot)
+    overlap_confirmatory = sorted(requested & confirmatory)
+    within_pilot = bool(requested) and requested <= pilot
+    within_confirmatory = bool(requested) and requested <= confirmatory
+    exactly_confirmatory = requested == confirmatory
+    if not seed_list or bad:
+        status = 'invalid'
+    elif role == 'pilot':
+        status = ('registered_pilot_block' if within_pilot
+                  else 'pilot_outside_registered_block')
+    elif overlap_pilot:
+        status = 'pilot_block'
+    elif exactly_confirmatory:
+        status = 'registered_confirmatory_block'
+    elif within_confirmatory:
+        status = 'subset_of_confirmatory_block'
+    else:
+        status = 'outside_confirmatory_block'
+    notes = {
+        'registered_confirmatory_block': (
+            'the run uses exactly the pre-registered confirmatory seed '
+            'block'),
+        'subset_of_confirmatory_block': (
+            'the run uses only part of the pre-registered confirmatory '
+            'block; it is a smaller (possibly screening) run, not the full '
+            'registered experiment'),
+        'outside_confirmatory_block': (
+            'the run uses seeds outside the pre-registered confirmatory '
+            'block; record why the seed block changed, and do not describe '
+            'this as the preregistered confirmatory test'),
+        'pilot_block': (
+            'the run uses seeds from the reserved pilot block. Pilot rows '
+            'size a future study; they cannot also supply its confirmatory '
+            'evidence. The confirmatory run must use fresh seeds from the '
+            'confirmatory block'),
+        'registered_pilot_block': (
+            'the run is a pilot on the reserved pilot seed block; its rows '
+            'are eligible for SD planning but not for confirmatory claims'),
+        'pilot_outside_registered_block': (
+            'the run was labelled a pilot but uses seeds outside the '
+            'reserved pilot block; verify that it did not reuse any '
+            'confirmatory seed before planning the confirmatory run'),
+        'invalid': (
+            'the seed list is empty or contains non-integer/negative ids; '
+            'no seed-block membership can be certified'),
+    }
+    return {
+        'plan_id': plan_id,
+        'requested_role': role,
+        'seeds': seed_list,
+        'blocks': blocks,
+        'overlap_with_confirmatory_block': overlap_confirmatory,
+        'overlap_with_pilot_block': overlap_pilot,
+        'duplicate_seeds': duplicates,
+        'status': status,
+        'checks': {
+            'seeds_clear_of_pilot_block': not overlap_pilot,
+            'seeds_within_confirmatory_block': within_confirmatory,
+            'seeds_exactly_confirmatory_block': exactly_confirmatory,
+            'pilot_and_confirmatory_blocks_disjoint': blocks['disjoint'],
+            'pilot_role_uses_confirmatory_seeds': not (
+                role == 'pilot' and bool(overlap_confirmatory)),
+        },
+        'note': notes[status],
+    }
 
 
 #: Scope string stored next to every plan fingerprint. It documents exactly
@@ -933,6 +1213,31 @@ def validate_plan(plan) -> list[str]:
         if not isinstance(exclude, list) \
                 or not all(_is_nonempty_str(k) for k in exclude):
             errors.append('pilot.exclude must be a list of names')
+    # The pilot and confirmatory blocks must be disjoint. If they overlap,
+    # the confirmatory test reuses rows that chose its sample size: the
+    # nominal alpha/power no longer describe the test, even if the run has
+    # plenty of seeds.
+    confirm_base = plan.get('confirmatory_seed_base', DEFAULT_SEED_BASE)
+    if not _is_int(confirm_base) or confirm_base < 0:
+        errors.append('confirmatory_seed_base must be a non-negative int')
+    pilot_base = (pilot.get('seed_base', DEFAULT_PILOT_SEED_BASE)
+                  if isinstance(pilot, dict) else DEFAULT_PILOT_SEED_BASE)
+    if not _is_int(pilot_base) or pilot_base < 0:
+        errors.append('pilot.seed_base must be a non-negative int')
+    confirm_n = plan.get('planned_seeds')
+    pilot_n = plan.get('screening_seeds')
+    if _is_int(confirm_base) and confirm_base >= 0 \
+            and _is_int(pilot_base) and pilot_base >= 0 \
+            and _is_int(confirm_n) and confirm_n >= 0 \
+            and _is_int(pilot_n) and pilot_n >= 0:
+        overlap_n, first, last = _seed_range_overlap(
+            confirm_base, confirm_n, pilot_base, pilot_n)
+        if overlap_n:
+            errors.append(
+                f'pilot and confirmatory seed blocks overlap in '
+                f'{overlap_n} seed(s) (first={first}, last={last}); move '
+                f'pilot.seed_base or confirmatory_seed_base so the pilot '
+                f'cannot choose the sample size and then test the same rows')
     # The equivalence (TOST) endpoint has its own margin, family, alpha and
     # power requirement. It is optional (some mechanism runs make no
     # equivalence claim), but when present it must be internally coherent and
@@ -2373,7 +2678,7 @@ def common_analyzed_seeds(rows, *, per_seed_key: str = 'per_seed',
 
 def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
               sd=None, analyzed_seeds=None, execution_order=None,
-              schedule_seed=DEFAULT_SCHEDULE_SEED) -> dict:
+              schedule_seed=DEFAULT_SCHEDULE_SEED, seed_role=None) -> dict:
     """Compare an actual run configuration with its pre-registered plan.
 
     ``seeds`` is the explicit seed list REQUESTED by the run. ``levels``
@@ -2400,14 +2705,21 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     device drift is aliased with the treatment, not whether seeds survived
     the analysis.
 
+    ``seed_role`` records the intended seed namespace (``confirmatory`` by
+    default, or ``pilot``). Independently of that label, any run whose
+    seeds intersect the reserved pilot block is labelled
+    ``exploratory_pilot``: pilot rows may size a future study but cannot
+    also be its confirmatory test.
+
     The audit never changes the experiment; it is attached to the result
     metadata so a reader can see whether a claim is confirmatory. It does
     not raise for a merely underpowered, control-less, attrition-afflicted,
-    or order-confounded run: those are exactly the states the audit exists
-    to report.
+    order-confounded, or pilot-seeded run: those are exactly the states the
+    audit exists to report.
     """
     plan = get_plan(plan_id)
-    seed_list = _seed_list(seeds)
+    seed_list = (seed_ids(seeds, role=seed_role, plan_id=plan_id)
+                 if _is_int(seeds) else _seed_list(seeds))
     n_seeds = len(seed_list)
     if levels is None:
         levels = {}
@@ -2431,6 +2743,11 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         seed_errors.append('seed list contains duplicates')
     if bad_seeds:
         seed_errors.append(f'seeds must be non-negative ints, got {bad_seeds!r}')
+
+    # ---- Seed namespace (pilot vs confirmatory) -------------------------
+    # Membership is checked independently of the requested role: a run that
+    # uses pilot seeds is a pilot even if the caller forgot to label it.
+    seed_block = audit_seed_block(plan_id, seed_list, role=seed_role)
 
     # ---- Analysis population (optional post-run attrition audit) --------
     population_provided = analyzed_seeds is not None
@@ -2567,6 +2884,18 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'at_least_two_seeds': n_seeds >= 2,
         'seeds_unique': unique_seeds,
         'seeds_are_non_negative_ints': not bad_seeds,
+        # The pilot block is reserved for sizing; a confirmatory run must
+        # not reuse it. None is not used here: membership is always known.
+        'seeds_clear_of_pilot_block': (
+            seed_block['checks']['seeds_clear_of_pilot_block']),
+        'seeds_within_confirmatory_block': (
+            seed_block['checks']['seeds_within_confirmatory_block']),
+        'seeds_exactly_confirmatory_block': (
+            seed_block['checks']['seeds_exactly_confirmatory_block']),
+        'pilot_and_confirmatory_blocks_disjoint': (
+            seed_block['checks']['pilot_and_confirmatory_blocks_disjoint']),
+        'pilot_role_uses_confirmatory_seeds': (
+            seed_block['checks']['pilot_role_uses_confirmatory_seeds']),
         'required_levels_present': not missing_required,
         # None = the caller did not pass the observed family, so it cannot
         # be checked either way.
@@ -2619,6 +2948,26 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'seeds_present', 'at_least_two_seeds', 'seeds_unique',
         'seeds_are_non_negative_ints'))
     design_warnings: list[str] = []
+    if seed_block['overlap_with_pilot_block']:
+        design_warnings.append(
+            f"the requested seeds overlap the reserved pilot block at "
+            f"{seed_block['overlap_with_pilot_block']!r}; those rows may "
+            f"size a future study but cannot also be its confirmatory "
+            f"evidence. Run the confirmatory block with fresh seeds "
+            f"({seed_block['blocks']['confirmatory']['base']} + i) so the "
+            f"pilot and the test are independent")
+    if seed_role == 'pilot' and not seed_block['checks'][
+            'pilot_role_uses_confirmatory_seeds']:
+        design_warnings.append(
+            f"this run is labelled a pilot but uses confirmatory seed(s) "
+            f"{seed_block['overlap_with_confirmatory_block']!r}; that "
+            f"contaminates the preregistered confirmatory block, so a "
+            f"future confirmatory run must move to a fresh block")
+    if not seed_block['checks']['pilot_and_confirmatory_blocks_disjoint']:
+        design_warnings.append(
+            'the registered pilot and confirmatory seed blocks overlap; '
+            'the plan is invalid and no run can be confirmatory until the '
+            'blocks are separated')
     if equivalence is not None and not equivalence_supported:
         design_warnings.append(
             f"the TOST margin {equivalence['margin']!r} needs "
@@ -2671,6 +3020,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     if not valid_seeds:
         status = 'invalid'
         claims = []
+    elif (seed_role == 'pilot'
+          or not seed_block['checks']['seeds_clear_of_pilot_block']):
+        # A pilot estimates the SD; it is not the confirmatory test, and a
+        # confirmatory run that reuses the pilot block is not independent.
+        status = 'exploratory_pilot'
+        claims = ['descriptive', 'exploratory_inference_with_caveat']
     elif missing_required:
         status = 'exploratory_missing_controls'
         claims = ['descriptive_only']
@@ -2746,6 +3101,7 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'n_seeds': n_seeds,
         'n_analyzed': n_analyzed,
         'seeds': seed_list,
+        'seed_block': seed_block,
         'analysis_population': analysis_population,
         'execution_order': execution_audit,
         'screening_seeds': plan.get('screening_seeds'),
@@ -2772,6 +3128,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'design_warnings': design_warnings,
         'claims_allowed': claims,
         'interpretation': {
+            'exploratory_pilot': (
+                'the run uses the reserved pilot seed block (or was labelled '
+                'a pilot). It can estimate the paired-difference SD and size '
+                'the next study, but it cannot also supply that study\'s '
+                'confirmatory evidence. Run the confirmatory block with '
+                'fresh seeds and re-audit'),
             'confirmatory': ('the seed budget reaches the pre-registered '
                              'required n, the full planned contrast family '
                              'is present, and the required controls are '
@@ -3261,6 +3623,38 @@ def interaction_sd_from_rows(rows, *, group_key: str, cells,
     }
 
 
+def pilot_seed_ids(rows) -> list[int]:
+    """Collect the explicit seed ids carried by a pilot/result payload.
+
+    Per-seed rows are the canonical source (``per_seed[*].seed``), but a
+    summary row may carry ``seeds`` or ``seed_ids`` directly. Rows that only
+    report ``n_common_seeds`` cannot certify provenance and contribute no
+    ids. The result is sorted and de-duplicated; negative/non-integer ids
+    are ignored (the audit reports them separately when they are explicit).
+    """
+    payload = _rows_from_payload(rows)
+    ids: set[int] = set()
+    for row in payload:
+        if not isinstance(row, Mapping):
+            continue
+        per_seed = row.get('per_seed')
+        if isinstance(per_seed, list):
+            for record in per_seed:
+                if isinstance(record, Mapping):
+                    seed = record.get('seed')
+                    if _is_int(seed) and seed >= 0:
+                        ids.add(seed)
+        for key in ('seeds', 'seed_ids'):
+            sequence = row.get(key)
+            if isinstance(sequence, (str, bytes)) \
+                    or not hasattr(sequence, '__iter__'):
+                continue
+            for seed in sequence:
+                if _is_int(seed) and seed >= 0:
+                    ids.add(seed)
+    return sorted(ids)
+
+
 def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
     """Turn a pilot result payload into a confirmatory seed recommendation.
 
@@ -3273,6 +3667,33 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
     pilot_cfg = plan['pilot']
     family = plan['planned_family_size'] if family_size is None \
         else family_size
+    pilot_ids = pilot_seed_ids(rows) if rows is not None else []
+    seed_block = (audit_seed_block(plan_id, pilot_ids, role='pilot')
+                  if pilot_ids else None)
+    overlap_confirmatory = (
+        seed_block['overlap_with_confirmatory_block']
+        if seed_block is not None else [])
+    planning_eligible = (None if seed_block is None
+                         else not overlap_confirmatory)
+    if planning_eligible is False:
+        seed_provenance_warning = (
+            f'the pilot rows reuse confirmatory seed(s) '
+            f'{overlap_confirmatory!r}; the SD estimate is still descriptive, '
+            f'but the confirmatory run must move to fresh seeds from the '
+            f'confirmatory block so the pilot and the test are independent')
+    elif planning_eligible is None:
+        seed_provenance_warning = (
+            'the pilot payload does not carry explicit seed ids (only '
+            'per_seed[*].seed or seeds/seed_ids can prove disjointness); '
+            'record the seed block before planning the confirmatory run')
+    else:
+        seed_provenance_warning = None
+    provenance = {
+        'pilot_seed_ids': pilot_ids,
+        'seed_block': seed_block,
+        'planning_eligible': planning_eligible,
+        'seed_provenance_warning': seed_provenance_warning,
+    }
     if sd is not None:
         sd_info = {
             'method': 'supplied_sd',
@@ -3294,6 +3715,7 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
     if sd_info is None:
         return {
             'plan_id': plan_id,
+            **provenance,
             'status': 'insufficient_pilot_data',
             'planning': planning_report(plan, family_size=family),
             'observed_sd': None,
@@ -3307,6 +3729,7 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
         # instead of dividing by zero and inventing a sample size.
         return {
             'plan_id': plan_id,
+            **provenance,
             'status': 'degenerate_zero_sd',
             'pilot_is_confirmatory': False,
             'planning': planning_report(plan, family_size=family),
@@ -3379,6 +3802,7 @@ def pilot_report(plan_id: str, rows, *, family_size=None, sd=None) -> dict:
     required_interaction = interaction.get('required_seeds')
     return {
         'plan_id': plan_id,
+        **provenance,
         'status': status,
         # A pilot contributes an SD estimate, never confirmatory rows: the
         # same data cannot both choose the sample size and test the
@@ -3500,14 +3924,20 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
     rows = []
     for plan_id in ids:
         plan = get_plan(plan_id)
-        seeds = overrides.get(plan_id, plan['planned_seeds'])
-        seed_list = _seed_list(seeds, name=f'{plan_id} seeds')
+        if plan_id in overrides:
+            seed_list = _seed_list(overrides[plan_id],
+                                   name=f'{plan_id} seeds')
+        else:
+            seed_list = seed_ids(plan['planned_seeds'], plan_id=plan_id)
         planning = planning_report(plan, seeds=len(seed_list))
         row = dict(plan)
         row['seeds'] = seed_list
         row['n_seeds'] = len(seed_list)
         row['plan_sha256'] = plan_sha256(plan)
         row['plan_fingerprint_scope'] = PLAN_FINGERPRINT_SCOPE
+        row['seed_blocks'] = registered_seed_blocks(plan_id)
+        row['seed_block_audit'] = audit_seed_block(
+            plan_id, seed_list, role='confirmatory')
         row['planning'] = planning
         row['status'] = planning['status']
         if seed_list:
@@ -3547,7 +3977,13 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
     metadata = {
         'generated_by': 'experiment_design.design_manifest',
         'seed_base': DEFAULT_SEED_BASE,
+        'pilot_seed_base': DEFAULT_PILOT_SEED_BASE,
+        'seed_role_env': SEED_ROLE_ENV,
         'note': ('Registry of the pre-registered multi-seed designs. '
+                 'Confirmatory seeds start at seed_base and pilot seeds at '
+                 'pilot_seed_base; the two blocks must remain disjoint so '
+                 'the pilot cannot choose the sample size and then test the '
+                 'same rows. '
                  'planning is prospective (SESOI + assumed SD + '
                  'corrected alpha), not post-hoc. A run whose audit '
                  'status is screening is not confirmatory. Equivalence and '
@@ -3654,6 +4090,9 @@ def main(argv=None) -> int:
     parser.add_argument('--schedule', action='store_true',
                         help='print the balanced execution schedule for the '
                              'selected plan(s) and exit')
+    parser.add_argument('--seed-blocks', action='store_true',
+                        help='print the disjoint pilot and confirmatory seed '
+                             'blocks for the selected plan(s) and exit')
     parser.add_argument('--seeds', type=int, default=None,
                         help='override the seed count for the manifest or '
                              '--schedule')
@@ -3671,15 +4110,22 @@ def main(argv=None) -> int:
                 print(f'  - {error}')
             return 1
         print(f'[experiment_design] {len(PLANS)} plans valid; every '
-              'declared confirmatory budget reaches its target power, and '
-              'every equivalence or 2x2-interaction endpoint either reaches '
-              'its own budget or is marked required_for_claim=False')
+              'declared confirmatory budget reaches its target power, every '
+              'equivalence or 2x2-interaction endpoint either reaches its '
+              'own budget or is marked required_for_claim=False, and every '
+              'pilot block is disjoint from its confirmatory block')
         return 0
 
     plan_ids = args.plan or list(PLAN_IDS)
     unknown = [p for p in plan_ids if p not in PLANS]
     if unknown:
         parser.error(f'unknown plan(s) {unknown!r}; valid ids: {list(PLANS)}')
+    if args.seed_blocks:
+        print(json.dumps([registered_seed_blocks(plan_id)
+                          for plan_id in plan_ids],
+                         indent=2, sort_keys=True))
+        return 0
+
     if args.pilot:
         if len(plan_ids) != 1:
             parser.error('--pilot needs exactly one --plan id')

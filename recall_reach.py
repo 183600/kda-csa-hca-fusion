@@ -1424,6 +1424,7 @@ def _recall_design_audit(rows: list[dict], *, seeds, layouts) -> dict:
         levels=levels,
         family_size=len(rows),
         analyzed_seeds=analyzed,
+        seed_role=design_registry.seed_block_role(),
     )
 
 
@@ -1795,7 +1796,8 @@ def main(argv=None) -> int:
             raise SystemExit('--seeds must contain at least one integer.')
     else:
         n_seeds = parse_int_env('RECALL_SEEDS', 3, min_value=1, logger=logger)
-        seeds = tuple(42 + i for i in range(n_seeds))
+        seeds = tuple(design_registry.seed_ids(n_seeds,
+                                               plan_id='exp9_recall'))
     if not args.no_train and len(seeds) < 3:
         logger.warning(
             'only %d seed(s) requested: per-cell differences are '

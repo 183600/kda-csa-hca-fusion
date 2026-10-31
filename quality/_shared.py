@@ -31,7 +31,8 @@ from multi_seed_stats import (_safe_mean, _sample_sd,
                                exact_test_resolution, holm_adjust,
                                summarize_paired)
 from experiment_design import (audit_run as audit_experiment_design,
-                               common_analyzed_seeds)
+                               common_analyzed_seeds, seed_block_role,
+                               seed_ids)
 from results_analysis import (annotate_rows_with_pareto, diagnose_nonfinite,
                               diagnose_training_curves,
                               multiclass_classification_metrics)

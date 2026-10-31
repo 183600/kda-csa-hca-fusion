@@ -662,7 +662,7 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
     # from a notebook don't hit AttributeError on ``device.type`` below.
     if isinstance(device, str):
         device = torch.device(device)
-    seeds = [42 + i for i in range(n_seeds)]
+    seeds = seed_ids(n_seeds, plan_id='exp4_mqar')
     # Compute the actual training-step count for THIS op once, mirroring
     # ``train_one``'s ``actual_steps = softmax_steps if op_name == 'softmax'
     # else steps`` logic, so the recorded ``steps`` field in the per-seed

@@ -137,7 +137,8 @@ from multi_seed_stats import (
     _safe_mean, _sample_sd,
 )
 from experiment_design import (audit_run as audit_experiment_design,
-                               common_analyzed_seeds)
+                               common_analyzed_seeds, seed_block_role,
+                               seed_ids)
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +197,7 @@ def _make_cfg(d_model=32, ratio=(3, 1, 1)):
     )
 
 
-def _run_provenance(n_seeds, steps, overfit_gate=None):
+def _run_provenance(n_seeds, steps, overfit_gate=None, plan_id=None):
     """Environment provenance + seed list + training recipe for side files.
 
     Each side file records the code/environment alongside the seeds and the
@@ -206,7 +207,7 @@ def _run_provenance(n_seeds, steps, overfit_gate=None):
     travels with the run record.
     """
     prov = capture_provenance()
-    prov['seeds'] = [42 + i for i in range(int(n_seeds))]
+    prov['seeds'] = seed_ids(int(n_seeds), plan_id=plan_id)
     prov['training'] = {
         'optimizer': 'AdamW',
         'lr': 3e-3,
@@ -252,7 +253,9 @@ def _append_ablation_manifest(mode, return_code, n_seeds, steps,
     line (seeds, recipe, data version, artifact paths, status), so the
     ablation is findable without opening its result file first.
     """
-    prov = _run_provenance(n_seeds, steps)
+    prov = _run_provenance(
+        n_seeds, steps,
+        plan_id='exp5b_matrix' if mode == 'matrix' else 'exp5_ratio')
     if mode == 'matrix':
         experiment = 'exp5b_ablation_matrix'
         artifacts = {
@@ -889,7 +892,7 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
 def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
     if isinstance(device, str):
         device = torch.device(device)
-    seeds = [42 + i for i in range(n_seeds)]
+    seeds = seed_ids(n_seeds, plan_id='exp5_ratio')
     stub_train_batch = kw.get('train_batch')
     if stub_train_batch is None:
         stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
@@ -1706,7 +1709,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     else:
         group_id, memory_type, layout, description = group_spec
         cfg_overrides = None
-    seeds = [42 + i for i in range(n_seeds)]
+    seeds = seed_ids(n_seeds, plan_id='exp5b_matrix')
     stub_train_batch = kw.get('train_batch')
     if stub_train_batch is None:
         stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
@@ -2519,7 +2522,7 @@ def _matrix_design_audit(all_results: list, groups: list, *, preset: str,
     contrast is capacity-confounded.
     """
     if requested_seeds is None:
-        requested_seeds = [42 + i for i in range(int(n_seeds))]
+        requested_seeds = seed_ids(int(n_seeds), plan_id='exp5b_matrix')
     requested = set(requested_seeds)
     recipe_fields = ('steps', 'train_batch', 'lr', 'n_layers', 'd_model')
 
@@ -4265,13 +4268,14 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         all_results, finite_keys=('final_acc', 'final_loss'))
     matrix_experiment_design = audit_experiment_design(
         'exp5b_matrix',
-        seeds=[42 + i for i in range(n_seeds)],
+        seeds=seed_ids(n_seeds, plan_id='exp5b_matrix'),
         levels={
             'memory': list(memory_types),
             'layout_unit': sorted({_unit_of_group(spec[0]) for spec in groups}),
         },
         family_size=max(1, len(contrasts)),
         analyzed_seeds=matrix_analyzed_population,
+        seed_role=seed_block_role(),
     )
     logger.info(f'Design audit: {matrix_experiment_design["status"]} '
                 f'(requested={matrix_experiment_design["n_seeds"]}, '
@@ -4417,7 +4421,8 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         logger.error(f'result rows failed their contract: {e}')
         return 1
     try:
-        write_results_json(_run_provenance(n_seeds, steps, gate_record),
+        write_results_json(_run_provenance(n_seeds, steps, gate_record,
+                                           plan_id='exp5b_matrix'),
                            'results/exp5b_ablation_matrix_provenance.json',
                            logger=logger)
     except Exception as e:
@@ -4706,11 +4711,12 @@ def main():
         all_results, finite_keys=('final_acc', 'final_loss'))
     ratio_experiment_design = audit_experiment_design(
         'exp5_ratio',
-        seeds=[42 + i for i in range(n_seeds)],
+        seeds=seed_ids(n_seeds, plan_id='exp5_ratio'),
         levels={'ratio': sorted({str(r.get('ratio')) for r in all_results
                                  if r.get('ratio') is not None})},
         family_size=max(1, len(ratio_contrasts)),
         analyzed_seeds=ratio_analyzed_population,
+        seed_role=seed_block_role(),
     )
     logger.info(f'Design audit: {ratio_experiment_design["status"]} '
                 f'(requested={ratio_experiment_design["n_seeds"]}, '
@@ -4838,7 +4844,8 @@ def main():
     write_results_json(all_results, 'results/exp5_ablation.json',
                        logger=logger)
     try:
-        provenance = _run_provenance(n_seeds, steps, gate_record)
+        provenance = _run_provenance(n_seeds, steps, gate_record,
+                                     plan_id='exp5_ratio')
         # The paired ratio contrasts + the pre-registered decision rule
         # travel with the run record (the historical rows stay a bare
         # list for backward compatibility with existing consumers).

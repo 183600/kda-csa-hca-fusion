@@ -478,6 +478,65 @@ conservative recommendation uses the maximum rather than the pooled estimate.
 After the confirmatory run, use the audit on the new seed count, not on the
 pilot.
 
+## Pilot and confirmatory seeds must be disjoint
+
+`pilot_is_confirmatory=False` is necessary but not sufficient. Even when the
+pilot is labelled correctly, reusing one of its seeds in the confirmatory run
+makes the test depend on the rows that chose its sample size. The planning SD
+and the confirmatory decision then share data, and the nominal alpha/power no
+longer describe the test. To make the separation checkable, the registry
+reserves two seed namespaces:
+
+| role | first seed | default size |
+| --- | ---: | --- |
+| confirmatory | `DEFAULT_SEED_BASE` = 42 | `planned_seeds` |
+| pilot | `DEFAULT_PILOT_SEED_BASE` = 10,000 | `screening_seeds` |
+
+`registered_seed_blocks(plan_id)` returns both blocks and their overlap.
+`validate_plan` rejects a plan whose blocks intersect, so a malformed registry
+cannot silently reintroduce the circular design. `seed_ids(n, plan_id=...)`
+is the runners' single source of truth and still returns `42 + i` by default,
+so existing result files are unaffected.
+
+Run the screening tier on the pilot block:
+
+```bash
+EXPERIMENT_SEED_ROLE=pilot MQAR_SEEDS=5 python run_quality.py
+EXPERIMENT_SEED_ROLE=pilot ABL_SEEDS=5 python run_ablation.py --mode ratio
+EXPERIMENT_SEED_ROLE=pilot MECH_SEEDS=5 python run_mechanism_ablation.py
+EXPERIMENT_SEED_ROLE=pilot RECALL_SEEDS=5 python recall_reach.py
+```
+
+`EXPERIMENT_SEED_ROLE` is read by `seed_ids` (unset or `confirmatory` keeps
+the historical block). The pilot result metadata then records seeds
+`10,000 + i`. Leave the variable unset for the confirmatory run: it draws the
+fresh `42 + i` block.
+
+`pilot_report` now carries the provenance fields:
+
+* `pilot_seed_ids` — the explicit ids found in `per_seed[*].seed` (or a
+  top-level `seeds`/`seed_ids` field);
+* `seed_block` — the `audit_seed_block` record, including overlap with the
+  confirmatory block;
+* `planning_eligible` — `True` only when the pilot ids are disjoint from the
+  confirmatory block; `None` when the payload carries no ids (for example the
+  Exp 5b contrast side file reports only `n_common_seeds`);
+* `seed_provenance_warning` — the actionable reason when eligibility is
+  `False` or unverified.
+
+`audit_run` also checks membership independently of the caller's label. A run
+whose seeds intersect the pilot block gets status `exploratory_pilot`, limited
+to descriptive/exploratory claims, even if it has enough seeds and all
+controls. The returned `seed_block` records `overlap_with_pilot_block`,
+`overlap_with_confirmatory_block`, and checks such as
+`seeds_clear_of_pilot_block` and `seeds_exactly_confirmatory_block`.
+
+If a legacy pilot already used part of the default confirmatory block, that
+block is no longer naive. Do not reuse it: register a fresh
+`confirmatory_seed_base` (or a new plan id with one) and point `seed_ids` at it
+via `plan_id=...`; record the reason in the plan. Moving the old pilot rows to
+the pilot block after the fact does not make the confirmatory test independent.
+
 ## The pipeline manifest
 
 `run_all.py` writes `results/experiment_design.json` before any experiment
@@ -530,7 +589,11 @@ python experiment_design.py --json results/experiment_design.json
 python experiment_design.py --plan exp5b_matrix --seeds 20 --family-size 15
 python experiment_design.py --plan exp4_mqar --sd 0.05
 
-# Pilot analysis from a result file (or supply an SD directly).
+# Show the disjoint pilot/confirmatory seed blocks.
+python experiment_design.py --plan exp4_mqar --seed-blocks
+
+# Pilot analysis from a result file (or supply an SD directly). Check
+# planning_eligible and seed_provenance_warning before using the SD.
 python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json
 python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json --sd 0.12
 ```
@@ -611,7 +674,11 @@ winner's-curse diagnostic, not a test, and cannot upgrade a claim. See
   If the missing seeds are plausibly treatment-related, the honest options
   are to report the complete-case estimate with its attrition, or to fix the
   failure and re-run the whole block.
-* The registry covers the multi-seed inference experiments. Seed-blocked
+* The registry covers the multi-seed inference experiments. Pilot and
+  confirmatory seeds are separate namespaces and the audit rejects overlap,
+  but a runner that bypasses `seed_ids` (or a result file without explicit
+  seed ids) can still produce an unverified provenance block; the report says
+  `planning_eligible=None` rather than assuming disjointness. Seed-blocked
   plans now share a balanced execution schedule and an opt-in observed-order
   audit, but the runner loops do not consume the schedule automatically;
   until a runner records its sequence, order balance is unverified (`None`),

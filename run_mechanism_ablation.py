@@ -161,7 +161,8 @@ from results_analysis import (binary_ranking_metrics,
 from results_schema import write as write_schema
 from experiment_design import (audit_run as audit_experiment_design,
                                balanced_execution_schedule,
-                               common_analyzed_seeds)
+                               common_analyzed_seeds, seed_block_role,
+                               seed_ids)
 from multi_seed_stats import (
     interaction_contrast, min_detectable_effect, seeds_required,
     _safe_mean, _sample_sd,
@@ -1991,7 +1992,7 @@ def main():
                + len(variants) * len(n_kv_list) + n_interaction_tests)
     alpha_corrected = 0.05 / n_tests if n_tests else None
 
-    seeds = [42 + i for i in range(n_seeds)]
+    seeds = seed_ids(n_seeds, plan_id='exp8_mechanism')
     # Execution order is part of the design. Materialize the pre-registered
     # balanced schedule for the ACTUAL opt-in levels (MECH_VARIANTS / MECH_NKV)
     # and train in that order: every seed is a complete block of every cell,
@@ -2433,11 +2434,12 @@ def main():
         all_rows, finite_keys=('final_acc',))
     mechanism_experiment_design = audit_experiment_design(
         'exp8_mechanism',
-        seeds=[42 + i for i in range(n_seeds)],
+        seeds=seed_ids(n_seeds, plan_id='exp8_mechanism'),
         levels=run_levels,
         family_size=max(1, n_paired_tests + n_interaction_tests),
         analyzed_seeds=mechanism_analyzed_population,
         execution_order=observed_execution,
+        seed_role=seed_block_role(),
     )
     logger.info(f'Design audit: {mechanism_experiment_design["status"]} '
                 f'(requested={mechanism_experiment_design["n_seeds"]}, '

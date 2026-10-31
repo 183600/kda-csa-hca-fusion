@@ -145,10 +145,11 @@ def main():
         * len(_sweep_cells(task_list, n_kv_list)))
     experiment_design_audit = audit_experiment_design(
         'exp4_mqar',
-        seeds=[42 + i for i in range(n_seeds)],
+        seeds=seed_ids(n_seeds, plan_id='exp4_mqar'),
         levels={'operator': list(ops_list), 'task': list(task_list),
                 'n_kv': list(n_kv_list)},
         family_size=design_family_size,
+        seed_role=seed_block_role(),
     )
     logger.info(
         f'  design audit  : {experiment_design_audit["status"]} '
@@ -1017,11 +1018,12 @@ def main():
         all_results, finite_keys=('final_acc', 'final_loss'))
     experiment_design_audit = audit_experiment_design(
         'exp4_mqar',
-        seeds=[42 + i for i in range(n_seeds)],
+        seeds=seed_ids(n_seeds, plan_id='exp4_mqar'),
         levels={'operator': list(ops_list), 'task': list(task_list),
                 'n_kv': list(n_kv_list)},
         family_size=design_family_size,
         analyzed_seeds=analyzed_population,
+        seed_role=seed_block_role(),
     )
     logger.info(
         f'  design audit (post-run): {experiment_design_audit["status"]} '
@@ -1080,7 +1082,8 @@ def main():
             # the exact training recipe. Without these a results file cannot
             # be traced back to the run that produced it.
             'provenance': capture_provenance(),
-            'seeds': [42 + i for i in range(n_seeds)],
+            'seeds': seed_ids(n_seeds, plan_id='exp4_mqar'),
+            'seed_block_role': seed_block_role(),
             'n_seeds': n_seeds,
             # Runtime audit of the pre-registered Exp 4 design: status,
             # required vs actual seed budget, per-test alpha, MDE and the

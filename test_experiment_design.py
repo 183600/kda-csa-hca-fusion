@@ -756,6 +756,162 @@ def test_pilot_reported_sd_median_does_not_overflow():
 
 
 # ---------------------------------------------------------------------------
+# Pilot and confirmatory seeds are disjoint
+# ---------------------------------------------------------------------------
+
+def _exp4_rows_on(seed_base, n_seeds=5):
+    rows = _exp4_rows(n_seeds)
+    for row in rows:
+        for record in row['per_seed']:
+            record['seed'] = seed_base + (record['seed'] - 42)
+    return rows
+
+
+def test_registered_seed_blocks_are_disjoint():
+    plan = D.get_plan('exp4_mqar')
+    blocks = D.registered_seed_blocks('exp4_mqar')
+    assert blocks['disjoint'] is True
+    assert blocks['overlap'] == []
+    assert blocks['confirmatory']['base'] == 42
+    assert blocks['confirmatory']['seeds'][0] == 42
+    assert blocks['confirmatory']['count'] == plan['planned_seeds']
+    assert blocks['pilot']['base'] == 10_000
+    assert blocks['pilot']['seeds'][0] == 10_000
+    assert blocks['pilot']['count'] == plan['screening_seeds']
+    assert not (set(blocks['confirmatory']['seeds'])
+                & set(blocks['pilot']['seeds']))
+
+    assert D.seed_ids(3) == [42, 43, 44]
+    assert D.seed_ids(3, role='pilot') == [10_000, 10_001, 10_002]
+    assert D.seed_ids(3, plan_id='exp4_mqar') == [42, 43, 44]
+    assert D.seed_ids(3, plan_id='exp4_mqar',
+                      role='pilot') == [10_000, 10_001, 10_002]
+    assert D.seed_ids(2, base=7) == [7, 8]
+    with pytest.raises(D.DesignError, match='unknown seed role'):
+        D.seed_ids(2, role='holdout')
+    with pytest.raises(D.DesignError, match='non-negative int'):
+        D.seed_ids(-1)
+
+
+def test_seed_role_environment_selects_the_pilot_block(monkeypatch):
+    monkeypatch.setenv(D.SEED_ROLE_ENV, 'pilot')
+    assert D.seed_block_role() == 'pilot'
+    assert D.seed_ids(2) == [10_000, 10_001]
+    monkeypatch.setenv(D.SEED_ROLE_ENV, 'confirmatory')
+    assert D.seed_block_role() == 'confirmatory'
+    assert D.seed_ids(2) == [42, 43]
+    monkeypatch.setenv(D.SEED_ROLE_ENV, 'nonsense')
+    with pytest.raises(D.DesignError, match='unknown seed role'):
+        D.seed_block_role()
+
+
+def test_validate_plan_rejects_overlapping_seed_blocks():
+    assert D.validate_plan(D.get_plan('exp4_mqar')) == []
+    plan = D.get_plan('exp4_mqar')
+    plan['pilot']['seed_base'] = 42
+    errors = D.validate_plan(plan)
+    assert any('pilot and confirmatory seed blocks overlap' in e
+               for e in errors), errors
+    plan = D.get_plan('exp4_mqar')
+    plan['pilot']['seed_base'] = 42 + plan['planned_seeds'] - 1
+    errors = D.validate_plan(plan)
+    assert any('overlap in 1 seed' in e for e in errors), errors
+    plan = D.get_plan('exp4_mqar')
+    plan['confirmatory_seed_base'] = -1
+    assert any('confirmatory_seed_base' in e
+               for e in D.validate_plan(plan))
+
+
+def test_audit_labels_pilot_seeded_runs_exploratory():
+    plan = D.get_plan('exp4_mqar')
+    levels = {'operator': ['linear', 'softmax', 'kda'],
+              'task': ['mqar'], 'n_kv': [1]}
+    pilot_seeds = D.seed_ids(plan['screening_seeds'], role='pilot')
+    audit = D.audit_run(
+        'exp4_mqar', seeds=pilot_seeds, levels=levels,
+        family_size=plan['planned_family_size'])
+    assert audit['status'] == 'exploratory_pilot'
+    assert audit['claims_allowed'] == [
+        'descriptive', 'exploratory_inference_with_caveat']
+    assert audit['checks']['seeds_clear_of_pilot_block'] is False
+    assert audit['seed_block']['status'] == 'pilot_block'
+    assert audit['seed_block']['overlap_with_pilot_block'] == pilot_seeds
+    assert "cannot also supply that study's confirmatory evidence" in \
+        audit['interpretation']
+    assert any('reserved pilot block' in w for w in audit['design_warnings'])
+
+    confirmatory = D.audit_run(
+        'exp4_mqar',
+        seeds=D.seed_ids(plan['planned_seeds'], plan_id='exp4_mqar'),
+        levels=levels, family_size=plan['planned_family_size'])
+    assert confirmatory['status'] == 'confirmatory'
+    assert confirmatory['checks']['seeds_clear_of_pilot_block'] is True
+    assert confirmatory['checks']['seeds_exactly_confirmatory_block'] is True
+    assert confirmatory['seed_block']['status'] == \
+        'registered_confirmatory_block'
+
+    # A caller that labels a run a pilot cannot promote the pre-registered
+    # confirmatory rows to confirmatory evidence.
+    relabelled = D.audit_run(
+        'exp4_mqar', seeds=[42, 43, 44], levels=levels, family_size=1,
+        seed_role='pilot')
+    assert relabelled['status'] == 'exploratory_pilot'
+    assert relabelled['checks'][
+        'pilot_role_uses_confirmatory_seeds'] is False
+    assert any('labelled a pilot' in w
+               for w in relabelled['design_warnings'])
+
+
+def test_pilot_report_tracks_seed_provenance():
+    overlapping = D.pilot_report('exp4_mqar', _exp4_rows())
+    assert overlapping['pilot_seed_ids'] == [42, 43, 44, 45, 46]
+    assert overlapping['planning_eligible'] is False
+    assert overlapping['seed_block']['overlap_with_confirmatory_block'] == \
+        [42, 43, 44, 45, 46]
+    assert 'reuse confirmatory seed' in \
+        overlapping['seed_provenance_warning']
+    assert overlapping['pilot_is_confirmatory'] is False
+
+    disjoint = D.pilot_report('exp4_mqar', _exp4_rows_on(10_000))
+    assert disjoint['pilot_seed_ids'] == [10_000, 10_001, 10_002,
+                                          10_003, 10_004]
+    assert disjoint['planning_eligible'] is True
+    assert disjoint['seed_provenance_warning'] is None
+    assert disjoint['seed_block']['status'] == 'registered_pilot_block'
+    json.dumps(disjoint, allow_nan=False)
+
+    # Contrast-shaped rows carry only counts, not ids: provenance cannot be
+    # certified, so the report must say so instead of assuming disjointness.
+    unverifiable = D.pilot_report('exp5b_matrix', [
+        {'contrast': 'B-A', 'n_kv': 1, 'n_common_seeds': 5,
+         'sd_diff': 0.10, 'mean_diff': 0.05},
+        {'contrast': 'C-A', 'n_kv': 1, 'n_common_seeds': 5,
+         'sd_diff': 0.20, 'mean_diff': -0.05},
+    ], family_size=2)
+    assert unverifiable['pilot_seed_ids'] == []
+    assert unverifiable['planning_eligible'] is None
+    assert 'does not carry explicit seed ids' in \
+        unverifiable['seed_provenance_warning']
+
+
+def test_manifest_records_seed_blocks_and_flags_pilot_overlap():
+    manifest = D.design_manifest(['exp4_mqar'])
+    row = manifest['results'][0]
+    assert row['seed_blocks']['disjoint'] is True
+    assert row['seed_block_audit']['status'] == \
+        'registered_confirmatory_block'
+    assert manifest['metadata']['pilot_seed_base'] == 10_000
+    assert manifest['metadata']['seed_role_env'] == D.SEED_ROLE_ENV
+
+    pilot_seeds = D.seed_ids(3, role='pilot')
+    piloted = D.design_manifest(
+        ['exp4_mqar'], seeds_by_plan={'exp4_mqar': pilot_seeds})
+    row = piloted['results'][0]
+    assert row['seed_block_audit']['status'] == 'pilot_block'
+    assert row['seed_block_audit']['overlap_with_pilot_block'] == pilot_seeds
+
+
+# ---------------------------------------------------------------------------
 # Manifest + CLI
 # ---------------------------------------------------------------------------
 

@@ -130,6 +130,7 @@ from kaggle_setup import (  # noqa: E402
     sanitize_for_json,
     write_results_json,
 )
+from experiment_design import seed_ids  # noqa: E402
 from kv_budget import (  # noqa: E402
     instant_layout_read_elements,
     layout_read_elements,
@@ -1231,7 +1232,7 @@ def main(argv=None) -> int:
     else:
         n_seeds = parse_int_env('SEARCH_SEEDS', 3, min_value=1,
                                 logger=logger)
-        seeds = tuple(42 + i for i in range(n_seeds))
+        seeds = tuple(seed_ids(n_seeds))
     if len(seeds) < 3:
         logger.warning(
             'only %d probe seed(s): the seed-paired acceptance test is '
