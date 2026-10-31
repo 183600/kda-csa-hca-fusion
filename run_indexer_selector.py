@@ -9,7 +9,10 @@ makes that selection a pure function of the score vector (ties break on
 ascending block index), so prefill and incremental decode agree exactly.
 Two interchangeable kernels implement that rule: a stable descending sort
 (whose output *is* the canonical rule) and an ``O(n)`` boundary path
-(``kthvalue`` + comparison masks) for multi-row sparse scores.
+(one ``topk`` for the boundary + comparison masks) for multi-row sparse
+scores. At long rows the boundary path reuses boundary ties already in
+the top-k instead of running a second full-row scan (see
+``_TOPK_TIE_REUSE_MIN_ELEMS``).
 
 ``ops_csa._canonical_topk_indices`` picks its kernel by COST only
 (both kernels implement the identical canonical rule; see
@@ -206,7 +209,9 @@ def _historical_sort_selector(scores: torch.Tensor, k: int) -> torch.Tensor:
     order = torch.sort(
         scores, dim=-1, descending=True, stable=True).indices[..., :s]
     values = scores.gather(-1, order)
-    return order.masked_fill(torch.isinf(values), -1)
+    # Only -inf is the invalid-slot sentinel; +inf is a valid score (see
+    # ``_canonical_topk_indices`` and ``_nan_safe_softmax``).
+    return order.masked_fill(torch.isneginf(values), -1)
 
 
 def _reference_selector(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -244,13 +249,16 @@ def bench_parity(topk: int) -> list:
                   (1, 2048), (1, 4096), (4, 4096), (3, 33)):
         n = shape[-1]
         for k in (0, 1, 3, topk, n):
-            for pat in ('random', 'ties', 'inf', 'nan'):
+            for pat in ('random', 'ties', 'inf', 'posinf', 'nan'):
                 base = torch.randn(n, generator=g) * 3
                 if pat == 'ties':
                     base = (torch.randint(0, 3, (n,), generator=g)
                             .float() - 1.0)
                 elif pat == 'inf':
                     base[torch.randperm(n, generator=g)[: max(1, n // 5)]] = NINF
+                elif pat == 'posinf':
+                    idx = torch.randperm(n, generator=g)[: max(1, n // 9)]
+                    base[idx] = float('inf')
                 elif pat == 'nan':
                     base[torch.randperm(n, generator=g)[: max(1, n // 7)]] = NAN
                 scores = base.unsqueeze(0).repeat(shape[0], 1)

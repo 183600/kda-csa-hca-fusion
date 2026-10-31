@@ -155,6 +155,61 @@ def test_csa_indexer_validity(device='cpu'):
     ]
 
 
+def test_csa_selector_tie_reuse_fast_path(device='cpu'):
+    """The long-row tie-reuse specialization preserves the canonical rule.
+
+    At ``n >= _TOPK_TIE_REUSE_MIN_ELEMS`` the boundary kernel reuses the
+    boundary ties already present in its top-k when they exactly fill the
+    free slots, instead of launching a second full-row top-k. This check
+    covers the fast path (unique boundary, +inf boundary), the fallback
+    (heavy ReLU ties, all -inf), and the NaN under-fill/re-run contract,
+    comparing the final selector against an independent stable-sort
+    reference (``NaN -> -inf``, ``-inf`` slots -> -1).
+    """
+    logger.info("Test: CSA canonical top-k tie-reuse fast path")
+    from ops_csa import _TOPK_TIE_REUSE_MIN_ELEMS, _canonical_topk_indices
+
+    n = _TOPK_TIE_REUSE_MIN_ELEMS
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def _reference(scores, k):
+        s = min(k, scores.shape[-1])
+        safe = scores.masked_fill(torch.isnan(scores), float('-inf'))
+        order = torch.sort(
+            safe, dim=-1, descending=True, stable=True).indices[..., :s]
+        values = safe.gather(-1, order)
+        return order.masked_fill(torch.isneginf(values), -1)
+
+    unique = torch.randn(2, n, generator=g, device=device)
+    heavy = torch.zeros(1, n, device=device)
+    heavy[0, : n // 2] = 1.0
+    posinf = torch.randn(1, n, generator=g, device=device)
+    posinf[0, 5] = float('inf')
+    nan_boundary = torch.randn(1, n, generator=g, device=device)
+    nan_boundary[0, 7] = float('nan')
+    neginf = torch.full((1, n), float('-inf'), device=device)
+    cases = (
+        ('unique boundary', unique),
+        ('heavy boundary ties', heavy),
+        ('+inf boundary', posinf),
+        ('NaN boundary', nan_boundary),
+        ('all -inf', neginf),
+    )
+    bad = []
+    for name, scores in cases:
+        for k in (1, 8):
+            got = _canonical_topk_indices(scores, k)
+            want = _reference(scores, k)
+            if not torch.equal(got, want):
+                bad.append((name, k, got[0].tolist()[:6],
+                            want[0].tolist()[:6]))
+    return [
+        _ok('CSA selector tie-reuse fast/fallback parity',
+            not bad,
+            f'n={n}, cases={len(cases)}, bad={bad[:2]}'),
+    ]
+
+
 def test_causal_block_mask_window_close(device='cpu'):
     """Boundary regression for the DeepSeek-V4 strictly-preceding mask.
 

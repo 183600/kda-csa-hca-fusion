@@ -1099,6 +1099,15 @@ _TOPK_SELECT_CHUNK_ELEMS = 1 << 22
 # dispatch only selects which kernel runs.
 _TOPK_SORT_MAX_ELEMS = 2048
 
+# Minimum row length for the boundary path's tie-reuse specialization. At
+# and above this length, when every boundary tie already sits inside the
+# top-``s`` block, the selector reuses those indices instead of launching a
+# second full-row top-k over an ``int64`` index tensor. The rule is
+# identical either way (parity-tested); the threshold is a cost heuristic:
+# below it the full-row scan is not the bottleneck, and paying for the
+# tie-count reduction would be a regression.
+_TOPK_TIE_REUSE_MIN_ELEMS = 1 << 15
+
 
 def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
     """Canonical top-``s`` indices of each row of ``blk`` (boundary path).
@@ -1116,6 +1125,19 @@ def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
     comparisons against the boundary), so a NaN row can under-fill: the
     missing slots then hold the sentinel ``n`` (the row length). The caller
     detects that with one range check and re-runs on a NaN-free copy.
+
+    Tie-reuse fast path
+    -------------------
+    The canonical rule only needs boundary ties that are NOT already in the
+    top-``s`` block. When the number of boundary ties equals the number of
+    free slots (``s - n_above``) in EVERY row — the common long-context
+    decode case, where continuous scores have one boundary tie — those
+    indices are already present in ``top_i``. The selector then derives
+    them with a small ``[rows, s]`` sort instead of a second full-row
+    ``topk`` over an ``int64`` index tensor. If any row has extra boundary
+    ties outside the top-``s`` block (heavy ReLU ties), or a NaN boundary,
+    the full-row scan runs as before. Both branches implement the same
+    rule; the fast path only reduces transient scratch and latency.
     """
     n = blk.shape[-1]
     # One top-k supplies the boundary value AND the indices of the
@@ -1131,18 +1153,34 @@ def _boundary_selected_indices(blk: torch.Tensor, s: int) -> torch.Tensor:
     # int64 promotion below. Counts never exceed the row length, so int32
     # holds every value exactly.
     n_above = above.sum(dim=-1, keepdim=True, dtype=torch.int32)
-    ar = torch.arange(n, device=blk.device)
     # Indices strictly above the boundary, ascending: sorting the small
     # ``[rows, s]`` index block (sentinel ``n`` pads the unused slots after
     # the valid ascending prefix) is cheaper than scanning the wide row.
     above_idx = torch.sort(
         torch.where(above, top_i, n), dim=-1).values
-    # Fill the remaining slots with the SMALLEST indices tied at the
-    # boundary (the canonical rule): one masked-index top-k gives them
-    # already in ascending order.
-    tie_idx = torch.topk(
-        torch.where(blk == boundary, ar, n),
-        s, dim=-1, largest=False, sorted=True).values
+    tie_idx = None
+    tie_mask = None
+    if n >= _TOPK_TIE_REUSE_MIN_ELEMS and not bool(torch.isnan(top_s).any()):
+        # ``need`` is at least 1 for a finite boundary (the boundary entry
+        # itself is a tie). Equality means every boundary tie is already
+        # inside ``top_i``, so no full-row scan is required.
+        need = s - n_above
+        tie_mask = blk == boundary
+        tie_count = tie_mask.sum(dim=-1, keepdim=True)
+        if bool((tie_count == need).all()):
+            tie_idx = torch.sort(
+                torch.where(top_s == boundary, top_i, n), dim=-1).values
+    if tie_idx is None:
+        # Fill the remaining slots with the SMALLEST indices tied at the
+        # boundary (the canonical rule): one masked-index top-k gives them
+        # already in ascending order. The mask is reused when the fast-path
+        # decision already materialized it.
+        if tie_mask is None:
+            tie_mask = blk == boundary
+        ar = torch.arange(n, device=blk.device)
+        tie_idx = torch.topk(
+            torch.where(tie_mask, ar, n),
+            s, dim=-1, largest=False, sorted=True).values
     slots = torch.arange(s, device=blk.device)
     tie_slot = (slots - n_above).clamp_(min=0)
     return torch.where(
@@ -1167,9 +1205,12 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     This selector makes the selection a pure function of the score vector
     by breaking ties on ASCENDING block index. The returned slots reproduce
     ``torch.topk``'s score-descending order (stable, so ties keep the
-    ascending-index rule) and entries selected at ``-inf`` (fewer than
-    ``k`` finite scores available) are reported as ``-1`` (invalid slot).
-    ``k`` may exceed the score count; the caller pads the result.
+    ascending-index rule) and entries selected at ``-inf`` (the causal /
+    empty-slot sentinel) are reported as ``-1`` (invalid slot). ``+inf`` is
+    a VALID score, not an invalid slot: it is kept selectable so the
+    selection agrees with :func:`_nan_safe_softmax`, which places all mass
+    on ``+inf`` entries instead of zeroing the row. ``k`` may exceed the
+    score count; the caller pads the result.
 
     Path selection
     --------------
@@ -1187,7 +1228,10 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
       selections on larger rows, INCLUDING the single-query-per-step
       decode shape once the block count exceeds the sort threshold, where
       the sort's ``O(n_blocks log n_blocks)`` term would dominate the
-      per-token step.
+      per-token step. For rows at least ``_TOPK_TIE_REUSE_MIN_ELEMS``
+      long whose boundary ties all fit inside the top-``s`` block, the
+      boundary path reuses those indices and skips the second full-row
+      ``topk`` (see that function's "Tie-reuse fast path" section).
 
     Non-finite scores
     -----------------
@@ -1196,7 +1240,9 @@ def _canonical_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     NaN anywhere in the score tensor can neither crash the selector nor
     silently occupy a real block index. ``-inf`` entries keep the documented
     "selected at ``-inf`` -> ``-1``" contract, and a NaN competes as
-    ``-inf`` for the boundary/tie rules.
+    ``-inf`` for the boundary/tie rules. ``+inf`` is selectable and sorts
+    above every finite score; multiple ``+inf`` entries tie by ascending
+    index, matching the deterministic rule.
     """
     n = scores.shape[-1]
     s = min(k, n)

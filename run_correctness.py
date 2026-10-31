@@ -85,6 +85,10 @@ def main():
     # the work-efficient two-phase scan.
     all_results += _run_safe(test_kda_dplr_transition_certificate, device)
     all_results += _run_safe(test_csa_indexer_validity, device)
+    # Long-row tie-reuse specialization of the canonical top-k selector:
+    # fast path, heavy-tie fallback, +inf, and NaN under-fill/re-run must
+    # all match the independent stable-sort reference.
+    all_results += _run_safe(test_csa_selector_tie_reuse_fast_path, device)
     # Boundary regression: compressed blocks become visible when windows close.
     all_results += _run_safe(test_causal_block_mask_window_close, device)
     # P0 regression: w_idx=None branch of csa_lightning_indexer.

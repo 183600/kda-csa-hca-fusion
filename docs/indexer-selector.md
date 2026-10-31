@@ -21,18 +21,38 @@ instead.
 
 ## The two kernels
 
-| | stable-sort kernel | boundary kernel (`_boundary_selected_mask`) |
+| | stable-sort kernel | boundary kernel (`_boundary_selected_indices`) |
 |---|---|---|
-| cost | `O(n log n)` | `O(n)`: one `kthvalue` + comparison masks |
+| cost | `O(n log n)` | `O(n)`: one `topk` for the boundary + vectorized masks |
 | used for | dense `2*s >= n`, or small arrays | sparse selections on larger arrays |
 | tile size | one sort | chunked boolean/int32 masks (`_TOPK_SELECT_CHUNK_ELEMS`) |
-| NaN handling | re-sort a NaN→`-inf` copy iff a NaN entered the top-`s` slots | under-fill detection (`selected.sum(-1) < s`) → re-run on a NaN-free copy |
+| NaN handling | re-sort a NaN→`-inf` copy iff a NaN entered the top-`s` slots | sentinel under-fill detection (`indices >= n`) → re-run on a NaN-free copy |
 
 Both kernels implement the SAME canonical rule. The kernel choice is a
 pure **cost heuristic** (`2*s >= n or rows*n <= _TOPK_SORT_MAX_ELEMS`,
 default 2048 elements), documented at the constant. Because both kernels
 are covered by the same parity tests, the heuristic cannot change any
 result — only which kernel runs.
+
+### Tie-reuse fast path
+
+The boundary kernel normally fills the free slots with a second full-row
+`topk` over masked block indices. For rows of at least
+`_TOPK_TIE_REUSE_MIN_ELEMS` (32,768) entries, it first checks whether the
+boundary ties already present in the first `topk` exactly fill those
+slots (`tie_count == s - n_above`). If so, the tie indices are recovered
+by sorting `where(top_s == boundary, top_i, n)` and the second full-row
+scan is skipped. Any other case — extra boundary ties (heavy ReLU-style
+ties, all `-inf`), shorter rows, or a NaN in the boundary — falls back to
+the full scan. The fast path is a **cost-only specialization**: it is
+index-identical to the full scan and is disabled whenever a NaN in
+`top_s` would make the tie count ambiguous.
+
+On CPU (`torch 2.14.1`, one row, `k=16`, median of 40 runs), the full
+selector drops from ~1.33 ms to ~0.34 ms at `n=65,536` (about 4x) and
+from ~0.30 ms to ~0.28 ms at `n=32,768`; below the threshold the previous
+full scan is unchanged. Besides latency, skipping the second scan avoids
+its full-row `int64` scratch, lowering transient decode memory.
 
 ## The NaN policy
 
@@ -44,6 +64,12 @@ Downstream consumers already treat `-1` as "no block"
 signal degrades to "selects nothing" (sink / sliding-window only) rather
 than desynchronizing decode from prefill.
 
+Only `-inf` is the invalid-slot sentinel. `+inf` is a **valid** score: it
+sorts above every finite score and multiple `+inf` entries tie by
+ascending block index, consistent with `_nan_safe_softmax`, which places
+all probability mass on `+inf` logits. Test references therefore mask
+`-inf` (`torch.isneginf`), never `+inf`.
+
 This matches the module's existing philosophy: `_nan_safe_softmax` exists
 precisely so non-finite logits do not take down the forward pass.
 
@@ -51,10 +77,13 @@ precisely so non-finite logits do not take down the forward pass.
 
 * `test_indexer_selector.py` — grid that provably exercises BOTH kernels
   against an independent reference (stable sort over `NaN -> -inf`),
-  the NaN hazard shapes, valid-slot-count invariants, and cache-level
+  the NaN hazard shapes, `+inf` as a valid score, the tie-reuse fast path
+  and its full-scan fallback, valid-slot-count invariants, and cache-level
   decode == `naive_csa` with sink + sparse tied top-k, the sink-only
   degenerate config, and NaN-poisoned indexer weights.
 * `test_csa_tiebreak.py` — the canonical tie-break contract.
+* `checks/csa.py` (gate) — `test_csa_selector_tie_reuse_fast_path` pins
+  fast-path/fallback/NaN parity against an independent stable sort.
 * `run_correctness.py` (gate) — full prefill/decode equivalence suite.
 * `run_indexer_selector.py` — Exp 14: parity gate runs BEFORE any timing
   row is archived; the `exp14_indexer_selector` results contract refuses
@@ -62,11 +91,14 @@ precisely so non-finite logits do not take down the forward pass.
 
 ## Limitations
 
-* The dispatch threshold is an element-count heuristic
-  (`_TOPK_SORT_MAX_ELEMS = 2048` elements). On accelerators the crossover
-  may differ; the constant is documented for revisiting per device, and a
-  wrong choice costs performance, never correctness (parity tests pin
-  both kernels).
+* The dispatch thresholds are element-count heuristics
+  (`_TOPK_SORT_MAX_ELEMS = 2048`, `_TOPK_TIE_REUSE_MIN_ELEMS = 32768`).
+  The CPU crossover measured above is ~32k; on accelerators it may differ.
+  A wrong choice costs performance, never correctness (parity tests pin
+  both kernels and the fast-path fallback).
+* The tie-reuse fast path assumes the common decode case of a nearly
+  unique boundary; adversarial score distributions with many boundary
+  ties take the full-scan fallback (still canonical, just not faster).
 * The NaN policy makes NaN scores behave as `-inf`; it does not diagnose
   *why* NaNs appeared upstream (that is the caller's job — the selector
   only guarantees NaN cannot become a real block index or a crash).

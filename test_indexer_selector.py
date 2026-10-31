@@ -45,8 +45,9 @@ import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from ops_csa import (  # noqa: E402
-    _TOPK_SORT_MAX_ELEMS, _canonical_topk_indices, csa_lightning_indexer,
-    naive_csa,
+    _TOPK_SORT_MAX_ELEMS, _TOPK_TIE_REUSE_MIN_ELEMS,
+    _boundary_selected_indices, _canonical_topk_indices,
+    csa_lightning_indexer, naive_csa,
 )
 from ops_decoding_cache import CSADecodingCache  # noqa: E402
 from run_indexer_selector import (  # noqa: E402
@@ -84,7 +85,10 @@ def _reference(scores, k):
     order = torch.sort(
         safe, dim=-1, descending=True, stable=True).indices[..., :s]
     values = safe.gather(-1, order)
-    return order.masked_fill(torch.isinf(values), -1)
+    # Only -inf is the invalid-slot sentinel. ``+inf`` is a valid score
+    # (``_nan_safe_softmax`` puts all mass on it), so ``isinf`` here would
+    # wrongly reject the selector's correct +inf handling.
+    return order.masked_fill(torch.isneginf(values), -1)
 
 
 def _would_use_boundary(shape, k):
@@ -116,6 +120,9 @@ def _score_patterns(n, seed):
     rows.append(torch.full((n,), NINF))                          # all -inf
     r = torch.zeros(n)                                           # boundary tie
     r[: max(1, n // 2)] = 1.0
+    rows.append(r)
+    r = torch.randn(n, generator=g)                              # +inf valid
+    r[torch.randperm(n, generator=g)[:max(1, n // 9)]] = float('inf')
     rows.append(r)
     return rows
 
@@ -222,6 +229,67 @@ def test_nan_scores_are_unselectable_not_a_crash():
             torch.equal(valid, want_valid)
             and bool(got.max() <= shape[-1] - 1),
             f'valid={valid.tolist()} want={want_valid.tolist()}')
+
+
+def _full_row_boundary_reference(blk, s):
+    """Pre-specialization boundary kernel (full-row tie scan), for parity."""
+    n = blk.shape[-1]
+    top_s, top_i = torch.topk(blk, s, dim=-1, sorted=True)
+    boundary = top_s[..., -1:]
+    above = top_s > boundary
+    n_above = above.sum(dim=-1, keepdim=True, dtype=torch.int32)
+    ar = torch.arange(n, device=blk.device)
+    above_idx = torch.sort(torch.where(above, top_i, n), dim=-1).values
+    tie_idx = torch.topk(
+        torch.where(blk == boundary, ar, n),
+        s, dim=-1, largest=False, sorted=True).values
+    slots = torch.arange(s, device=blk.device)
+    tie_slot = (slots - n_above).clamp_(min=0)
+    return torch.where(
+        slots >= n_above, tie_idx.gather(-1, tie_slot), above_idx)
+
+
+def test_tie_reuse_fast_path_matches_full_row_scan():
+    """The tie-reuse specialization is index-identical to the full scan.
+
+    The fast path fires when every boundary tie already sits in the top-s
+    block (unique-boundary continuous scores, +inf ties that all fit) and
+    must fall back for extra boundary ties (heavy ReLU ties, all -inf) and
+    NaN boundaries. The full-row kernel is the independent reference, and
+    the final selector is checked against the canonical sort reference too.
+    """
+    n = _TOPK_TIE_REUSE_MIN_ELEMS
+    torch.manual_seed(0)
+    r = torch.randn(2, n)
+    unique = r
+    heavy = torch.zeros(2, n)
+    heavy[:, : n // 2] = 1.0
+    posinf = torch.randn(1, n)
+    posinf[0, 5] = float('inf')
+    nan_boundary = torch.randn(1, n)
+    nan_boundary[0, 7] = NAN
+    cases = (
+        ('unique boundary', unique),
+        ('heavy boundary ties', heavy),
+        ('+inf boundary', posinf),
+        ('NaN boundary', nan_boundary),
+        ('all -inf', torch.full((1, n), NINF)),
+    )
+    for name, scores in cases:
+        for k in (1, 3, 16, 100):
+            s = min(k, n)
+            got = _boundary_selected_indices(scores, s)
+            want = _full_row_boundary_reference(scores, s)
+            _ok(
+                f'tie-reuse parity [{name}, k={k}]',
+                torch.equal(got, want),
+                f'got={got[0].tolist()[:8]}... want={want[0].tolist()[:8]}...')
+            final = _canonical_topk_indices(scores, k)
+            ref = _reference(scores, k)
+            _ok(
+                f'canonical parity [{name}, k={k}]',
+                torch.equal(final, ref),
+                f'got={final[0].tolist()[:8]}... ref={ref[0].tolist()[:8]}...')
 
 
 def test_indexer_nan_weights_multi_row_no_crash():
@@ -378,6 +446,7 @@ def test_timing_samples_feed_the_ci_fields():
 def main() -> int:
     test_selector_grid_matches_reference_on_both_paths()
     test_nan_scores_are_unselectable_not_a_crash()
+    test_tie_reuse_fast_path_matches_full_row_scan()
     test_indexer_nan_weights_multi_row_no_crash()
     test_cache_decode_with_sink_sparse_ties_and_nan_weights()
     test_timing_samples_feed_the_ci_fields()
