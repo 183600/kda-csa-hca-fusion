@@ -246,6 +246,8 @@ analyzed_seeds=...)` compares an actual run with the plan:
 | `reduced_family` | the seed budget is adequate only for a subset of the pre-registered contrast family | confirmatory only for the tested subset |
 | `screening` | fewer seeds than required (or a larger-than-planned family) | descriptive / exploratory inference only |
 | `incomplete_attrition` | the analyzed seed block is smaller than the requested block, or contains seeds outside it (see below) | descriptive; complete-case paired inference only |
+| `incomplete_execution` | the observed execution sequence is missing, duplicating or adding runs relative to the expected seed blocks | descriptive only |
+| `order_confounded` | every expected run is present, but the execution order is non-contiguous or position-imbalanced across seed blocks | descriptive / exploratory inference with an explicit order confound |
 | `exploratory_missing_controls` | a required control or level is absent | descriptive only; the treatment effect is confounded |
 | `invalid` | fewer than two unique non-negative integer seeds | none |
 
@@ -253,6 +255,83 @@ The runners attach this audit to their result metadata as
 `metadata.experiment_design`, so a reader can see whether a result was
 confirmatory without reconstructing the seed count by hand. The audit never
 changes the experiment or its exit code; it only labels the evidence.
+
+## Execution order is part of the design
+
+Seeds are complete blocks, but the order in which those blocks and cells run
+is also a design variable. If every KDA run happens in the first hour and
+every HCA run in the last, treatment is aliased with time, allocator state,
+device frequency drift or another slow-changing nuisance. A complete seed
+block does not repair that confound.
+
+`balanced_execution_schedule` builds a deterministic randomized
+complete-block order before any outcome is seen:
+
+```python
+from experiment_design import balanced_execution_schedule
+
+schedule = balanced_execution_schedule(
+    'exp8_mechanism', seeds=13,
+    levels={'variant': ['baseline', 'no_rope', 'topk1'],
+            'n_kv': [1]})
+schedule['schedule_sha256']  # binds cells, seed order and rotation seed
+schedule['blocks']           # integer indices into schedule['cells']
+```
+
+Each seed is one block containing every treatment cell exactly once. The
+base permutation is shuffled with a local `random.Random(schedule_seed)`
+and rotated by one position per block, so a cell is not always run first or
+last. The global RNG is untouched. The design manifest records a compact
+summary (`schedule_id`, full `schedule_sha256`, counts and balance) for
+every registered plan; materialize the full cells/blocks with:
+
+```bash
+python experiment_design.py --plan exp8_mechanism --seeds 13 --schedule > results/exp8_schedule.json
+```
+
+An actual run can be audited against the design by passing its observed
+sequence to `audit_execution_order`, or directly to `audit_run`:
+
+```python
+from experiment_design import audit_execution_order, audit_run
+
+# Each record may name the treatment factors at top level, or under ``cell``
+# / ``factors``. ``seed`` identifies the complete block.
+observed = [
+    {'variant': 'baseline', 'n_kv': 1, 'seed': 42},
+    {'variant': 'no_rope',  'n_kv': 1, 'seed': 42},
+    ...
+]
+
+order_audit = audit_execution_order(
+    'exp8_mechanism', observed,
+    seeds=[42 + i for i in range(13)],
+    levels={'variant': ['baseline', 'no_rope', 'topk1'], 'n_kv': [1]})
+order_audit['status']  # balanced / order_confounded / incomplete / invalid
+
+run_audit = audit_run(
+    'exp8_mechanism', seeds=[42 + i for i in range(13)],
+    levels={'variant': ['baseline', 'no_rope', 'topk1'], 'n_kv': [1]},
+    family_size=6, execution_order=observed)
+run_audit['status']  # order_confounded or incomplete_execution can downgrade
+```
+
+A treatment-major loop is the canonical failure: every expected run may be
+present, but each seed block is interrupted by the other treatments, so the
+audit reports `order_confounded` rather than `balanced`. If a treatment
+factor is omitted from `levels`, its levels are inferred from the observed
+rows and listed in `levels_inferred`; pass the explicit level list when an
+entire cell may have been dropped, because inferred levels cannot reveal a
+cell that never ran.
+
+The manifest's schedule fingerprint is generated from the **registered**
+treatment levels. An opt-in run that uses a subset must call
+`balanced_execution_schedule` with its explicit `levels`, execute that
+exact order, and verify the resulting schedule hash. The current runner
+loops do not yet consume the schedule automatically and do not all record
+their observed sequence, so `audit_run` keeps the order checks at `None`
+when `execution_order` is absent. Absence of evidence is not evidence of a
+balanced order; a confirmatory protocol should record it.
 
 ## Single-factor claims are audited against the built config and observed run
 
@@ -509,11 +588,14 @@ and never upgrades a claim. See
   If the missing seeds are plausibly treatment-related, the honest options
   are to report the complete-case estimate with its attrition, or to fix the
   failure and re-run the whole block.
-* The registry covers the multi-seed inference experiments. Timing experiments
-  (Exp 2/6/9) need a different design vocabulary (repeats, interleaving,
-  order effects); they are not squeezed into the seed-power model. Exp 2 and
-  Exp 6 have their own pre-registered measurement plans, balanced schedules,
-  and run audits in [`timing_design.py`](../timing_design.py); see
+* The registry covers the multi-seed inference experiments. Seed-blocked
+  plans now share a balanced execution schedule and an opt-in observed-order
+  audit, but the runner loops do not consume the schedule automatically;
+  until a runner records its sequence, order balance is unverified (`None`),
+  not assumed. Timing experiments (Exp 2/6) need a different design
+  vocabulary (repeats, interleaving, warmup); their pre-registered
+  measurement plans, balanced schedules and run audits live in
+  [`timing_design.py`](../timing_design.py); see
   [timing-design.md](timing-design.md). Exp 9 remains covered by its own
   recall protocol.
 * A plan is not a substitute for a clean data split. The data-separation

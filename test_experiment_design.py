@@ -1036,3 +1036,199 @@ def test_pilot_reports_the_separate_interaction_budget():
     assert rep['required_seeds_interaction'] is not None
     assert rep['required_seeds_interaction'] >= rep['required_seeds_pooled_sd']
     assert 'four-cell interaction' in rep['interaction_recommendation']
+
+
+# ---------------------------------------------------------------------------
+# Execution order: balanced schedules and observed-order audits
+# ---------------------------------------------------------------------------
+
+def _execution_records(schedule):
+    records = []
+    for seed, block in zip(schedule['seeds'], schedule['blocks']):
+        for index in block:
+            record = dict(schedule['cells'][index])
+            record['seed'] = seed
+            records.append(record)
+    return records
+
+
+def test_balanced_execution_schedule_is_deterministic_and_complete():
+    levels = {'variant': ['baseline', 'no_rope', 'topk1'],
+              'n_kv': [1, 2]}
+    first = D.balanced_execution_schedule(
+        'exp8_mechanism', 6, levels=levels)
+    second = D.balanced_execution_schedule(
+        'exp8_mechanism', 6, levels=levels)
+    assert first == second
+    assert first['kind'] == 'experiment_execution_schedule'
+    assert first['n_cells'] == 6
+    assert first['n_blocks'] == 6
+    assert first['n_runs'] == 36
+    expected_cells = {(variant, n_kv)
+                      for variant in levels['variant']
+                      for n_kv in levels['n_kv']}
+    assert {(cell['variant'], cell['n_kv'])
+            for cell in first['cells']} == expected_cells
+    for block in first['blocks']:
+        assert sorted(block) == list(range(first['n_cells']))
+    assert first['balance']['complete_permutations'] is True
+    assert first['balance']['balanced'] is True
+    assert all(value == 6
+               for value in first['balance']['per_cell_distinct_positions'])
+    assert first['schedule_id'].startswith('exec:')
+    assert len(first['schedule_sha256']) == 64
+    json.dumps(first, allow_nan=False)
+
+
+def test_execution_schedule_rejects_malformed_inputs():
+    with pytest.raises(D.DesignError):
+        D.balanced_execution_schedule(
+            'exp8_mechanism', 3,
+            levels={'variant': ['baseline', 'baseline']})
+    with pytest.raises(D.DesignError):
+        D.balanced_execution_schedule(
+            'exp8_mechanism', 3, levels={'not_a_factor': ['x']})
+    with pytest.raises(D.DesignError):
+        D.balanced_execution_schedule('exp8_mechanism', [42, 42])
+    with pytest.raises(D.DesignError):
+        D.balanced_execution_schedule('exp8_mechanism', [])
+    with pytest.raises(D.DesignError):
+        D.balanced_execution_schedule(
+            'exp8_mechanism', 3, schedule_seed=-1)
+    with pytest.raises(D.DesignError):
+        D.balanced_execution_schedule(
+            'exp8_mechanism', 3, schedule_seed=True)
+    with pytest.raises(D.DesignError):
+        D.treatment_cells('exp8_mechanism', levels={'variant': 'baseline'})
+
+
+def test_execution_order_balances_the_plan_and_detects_treatment_major_runs():
+    levels = {'variant': D.get_plan('exp8_mechanism')
+              ['factors']['variant']['levels'],
+              'n_kv': [1]}
+    schedule = D.balanced_execution_schedule(
+        'exp8_mechanism', 6, levels=levels)
+    records = _execution_records(schedule)
+    balanced = D.audit_execution_order('exp8_mechanism', records)
+    assert balanced['status'] == 'balanced'
+    assert all(balanced['checks'].values())
+    assert balanced['claims_allowed'] == ['execution_order_balanced']
+    assert balanced['matches_planned_schedule'] is True
+    assert balanced['planned_schedule_sha256'] == schedule['schedule_sha256']
+    assert balanced['observed_schedule_sha256'] is not None
+
+    # A treatment-major loop visits every expected run, but each seed block
+    # is split by the other treatments, so time is aliased with treatment.
+    treatment_major = []
+    for cell in schedule['cells']:
+        for seed in schedule['seeds']:
+            record = dict(cell)
+            record['seed'] = seed
+            treatment_major.append(record)
+    confounded = D.audit_execution_order(
+        'exp8_mechanism', treatment_major)
+    assert confounded['status'] == 'order_confounded'
+    assert confounded['checks']['all_expected_runs_present'] is True
+    assert confounded['checks']['contiguous_seed_blocks'] is False
+    assert confounded['checks']['position_balanced'] is False
+    assert confounded['claims_allowed'] == [
+        'descriptive', 'exploratory_inference_with_caveat']
+
+    incomplete = D.audit_execution_order(
+        'exp8_mechanism', records[:-1])
+    assert incomplete['status'] == 'incomplete'
+    assert incomplete['n_observed'] == incomplete['n_expected'] - 1
+    assert incomplete['missing_cells']
+
+    # An explicitly registered extra level reveals a cell that never ran.
+    # Without the explicit list, inferred levels cannot know it existed.
+    dropped = D.audit_execution_order(
+        'exp8_mechanism', records,
+        levels={'variant': levels['variant'] + ['extra_variant'],
+                'n_kv': [1]})
+    assert dropped['status'] == 'incomplete'
+    assert dropped['missing_cells'][0]['cell']['variant'] == 'extra_variant'
+
+    # An empty observed sequence is an invalid audit input, not a crash.
+    empty = D.audit_execution_order('exp8_mechanism', [])
+    assert empty['status'] == 'invalid'
+    assert empty['checks']['all_expected_runs_present'] is False
+    assert empty['checks']['contiguous_seed_blocks'] is False
+
+    # A record may carry its treatment mapping under ``cell`` rather than
+    # at top level; the audit accepts both shapes.
+    wrapped = [{'cell': {key: value for key, value in record.items()
+                         if key != 'seed'},
+                'seed': record['seed']}
+               for record in records]
+    assert D.audit_execution_order(
+        'exp8_mechanism', wrapped)['status'] == 'balanced'
+
+
+def test_audit_run_downgrades_confounded_or_incomplete_execution():
+    plan = D.get_plan('exp8_mechanism')
+    levels = {'variant': plan['factors']['variant']['levels'],
+              'n_kv': [1]}
+    seeds = list(range(42, 55))
+    schedule = D.balanced_execution_schedule(
+        'exp8_mechanism', seeds, levels=levels)
+    good = D.audit_run(
+        'exp8_mechanism', seeds=seeds, levels=levels, family_size=6,
+        execution_order=_execution_records(schedule))
+    assert good['status'] == 'confirmatory'
+    assert good['checks']['execution_order_provided'] is True
+    assert good['checks']['execution_order_complete'] is True
+    assert good['checks']['execution_order_balanced'] is True
+    assert good['checks']['execution_order_matches_planned_schedule'] is True
+
+    treatment_major = []
+    for cell in schedule['cells']:
+        for seed in seeds:
+            record = dict(cell)
+            record['seed'] = seed
+            treatment_major.append(record)
+    confounded = D.audit_run(
+        'exp8_mechanism', seeds=seeds, levels=levels, family_size=6,
+        execution_order=treatment_major)
+    assert confounded['status'] == 'order_confounded'
+    assert confounded['checks']['execution_order_complete'] is True
+    assert confounded['checks']['execution_order_balanced'] is False
+    assert any('aliased' in warning
+               for warning in confounded['design_warnings'])
+
+    incomplete = D.audit_run(
+        'exp8_mechanism', seeds=seeds, levels=levels, family_size=6,
+        execution_order=_execution_records(schedule)[:-1])
+    assert incomplete['status'] == 'incomplete_execution'
+    assert incomplete['checks']['execution_order_complete'] is False
+    assert incomplete['execution_order']['missing_cells']
+
+
+def test_manifest_records_the_execution_schedule_fingerprint():
+    manifest = D.design_manifest(
+        ['exp8_mechanism'],
+        seeds_by_plan={'exp8_mechanism': 3})
+    row = manifest['results'][0]
+    summary = row['execution_schedule']
+    full = D.balanced_execution_schedule('exp8_mechanism', 3)
+    assert summary['schedule_sha256'] == full['schedule_sha256']
+    assert summary['schedule_id'] == full['schedule_id']
+    assert summary['n_blocks'] == 3
+    assert summary['n_runs'] == summary['n_cells'] * 3
+    assert summary['balance']['balanced'] is True
+    assert summary['levels_source'] == 'registered_plan_treatment_levels'
+    assert 'execution_schedule' in manifest['metadata']['note']
+    json.dumps(manifest, allow_nan=False)
+
+
+def test_schedule_cli_prints_a_materializable_schedule(capsys):
+    rc = D.main(['--plan', 'exp8_mechanism', '--seeds', '2',
+                 '--schedule'])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['kind'] == 'experiment_execution_schedule'
+    schedule = payload['schedules'][0]
+    assert schedule['plan_id'] == 'exp8_mechanism'
+    assert schedule['n_blocks'] == 2
+    assert schedule['n_runs'] == schedule['n_cells'] * 2
+    assert schedule['balance']['balanced'] is True

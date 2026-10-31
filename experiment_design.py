@@ -53,6 +53,14 @@ Three things follow from that registry:
    budget, required controls or decision rule after a run is detectable,
    not just a silent code edit.
 
+Execution order is a fourth part of the contract. :func:`balanced_execution_schedule`
+builds a deterministic randomized complete-block order over treatment cells
+and seed blocks, and :func:`audit_execution_order` labels an observed
+sequence ``balanced`` / ``order_confounded`` / ``incomplete``. A treatment-
+major loop can visit every expected run while still aliasing treatment with
+time, allocator state or device drift; the order audit makes that visible
+instead of treating a complete block as sufficient.
+
 The distinction between the REQUESTED seed block and the seeds that
 actually entered the analysis matters. A training run that crashes, diverges
 or produces a non-finite metric is normally excluded from the aggregate, but
@@ -83,6 +91,8 @@ writes the versioned plan manifest.
 ``python experiment_design.py --plan exp4_mqar --pilot results/exp4_mqar.json``
 computes the observed paired SD and the recommended confirmatory seed budget
 without re-running the experiment.
+``python experiment_design.py --plan exp4_mqar --seeds 11 --schedule``
+prints the balanced execution schedule as strict JSON.
 
 Design constraints
 ------------------
@@ -101,9 +111,11 @@ from __future__ import annotations
 import copy
 import datetime as _dt
 import hashlib
+import itertools
 import json
 import math
 import os
+import random
 import statistics
 import sys
 import tempfile
@@ -128,6 +140,11 @@ __all__ = [
     'interaction_planning',
     'INTERACTION_SD_INFLATION',
     'common_analyzed_seeds',
+    'treatment_cells',
+    'balanced_execution_schedule',
+    'audit_execution_order',
+    'DEFAULT_SCHEDULE_SEED',
+    'EXECUTION_SCHEDULE_SCOPE',
     'audit_run',
     'pilot_sd_from_rows',
     'pilot_report',
@@ -140,6 +157,19 @@ DEFAULT_SEED_BASE = 42
 DEFAULT_ALPHA = 0.05
 DEFAULT_TARGET_POWER = 0.80
 DEFAULT_ASSUMED_SD = 0.10
+DEFAULT_SCHEDULE_SEED = 0
+
+#: Scope string stored next to every execution-schedule fingerprint. The
+#: digest covers the factor cells, the seed-block order and the rotation seed;
+#: it does not cover observed timings or outcomes.
+EXECUTION_SCHEDULE_SCOPE = (
+    'sha256 of the canonical JSON (sorted keys, compact separators, UTF-8, '
+    'strict numbers) of a pre-registered balanced execution schedule '
+    '(plan fingerprint, factor cells, seed blocks and rotation seed)')
+
+#: Guard against accidentally enumerating a factor product that is too large
+#: to review or execute. The registered plans are far below this limit.
+_MAX_EXECUTION_CELLS = 100_000
 
 # A 2x2 interaction I = d - b - c + a is a FOUR-cell contrast, not a
 # two-cell one. Under the shared-seed / independent-cell-noise model that
@@ -1672,6 +1702,578 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
 
 
 # ---------------------------------------------------------------------------
+# Execution order: randomization is part of the design
+# ---------------------------------------------------------------------------
+
+def _canonical_json(value, *, name='value') -> str:
+    """Canonical strict-JSON encoding used by schedule fingerprints."""
+    try:
+        return json.dumps(value, sort_keys=True, separators=(',', ':'),
+                          allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise DesignError(f'{name} is not strict JSON: {exc}') from None
+
+
+def _schedule_factor_names(plan) -> list[str]:
+    factors = plan.get('factors')
+    if not isinstance(factors, Mapping) or not factors:
+        raise DesignError('plan has no factors mapping')
+    names = [name for name, factor in factors.items()
+             if isinstance(factor, Mapping)
+             and factor.get('role') == 'treatment']
+    if not names:
+        raise DesignError('plan has no treatment factors to schedule')
+    return names
+
+
+def _schedule_level_list(raw, *, name: str) -> list:
+    if isinstance(raw, (str, bytes)) or not hasattr(raw, '__iter__'):
+        raise DesignError(
+            f'{name} must be an iterable of levels, got '
+            f'{type(raw).__name__}; a bare string is ambiguous')
+    levels = list(raw)
+    if not levels:
+        raise DesignError(f'{name} must contain at least one level')
+    if len(levels) > _MAX_EXECUTION_CELLS:
+        raise DesignError(
+            f'{name} has too many levels to enumerate '
+            f'({len(levels)} > {_MAX_EXECUTION_CELLS})')
+    seen: set[str] = set()
+    for level in levels:
+        key = _canonical_json(level, name=f'level in {name}')
+        if key in seen:
+            raise DesignError(f'{name} contains duplicate level {level!r}')
+        seen.add(key)
+    return levels
+
+
+def _schedule_levels(plan, levels=None, *, infer_from=None) -> tuple[dict,
+                                                                    list[str]]:
+    """Resolve the treatment levels used by a schedule.
+
+    Explicit ``levels`` win. Factors omitted from a partial ``levels``
+    mapping are inferred from ``infer_from`` (observed cell mappings) when
+    available; otherwise the registered plan levels are used. The second
+    return value names the factors whose levels were inferred from observed
+    rows, so the audit can disclose that a dropped cell could not be
+    detected without an explicit level list.
+    """
+    names = _schedule_factor_names(plan)
+    if levels is None:
+        provided: dict = {}
+    elif not isinstance(levels, Mapping):
+        raise DesignError(
+            f'levels must be a mapping of factor name -> levels, got '
+            f'{type(levels).__name__}')
+    else:
+        provided = dict(levels)
+    unknown = [name for name in provided if name not in names]
+    if unknown:
+        raise DesignError(
+            f'levels names non-treatment or unknown factor(s) {unknown!r}; '
+            f'treatment factors are {names!r}')
+    inferred: list[str] = []
+    resolved: dict[str, list] = {}
+    for name in names:
+        if name in provided:
+            resolved[name] = _schedule_level_list(
+                provided[name], name=f'levels[{name!r}]')
+            continue
+        seen: set[str] = set()
+        observed: list = []
+        for cell in infer_from or ():
+            if not isinstance(cell, Mapping) or name not in cell:
+                continue
+            key = _canonical_json(cell[name],
+                                  name=f'observed level for {name!r}')
+            if key not in seen:
+                seen.add(key)
+                observed.append(cell[name])
+        if infer_from is not None:
+            if not observed:
+                raise DesignError(
+                    f'cannot infer levels for treatment factor {name!r} from '
+                    'the observed rows; pass levels explicitly')
+            # Keep the registered level order where possible so an inferred
+            # schedule is still comparable to the plan fingerprint. Levels
+            # outside the registry are appended in first-seen order.
+            registered = plan['factors'][name].get('levels')
+            if isinstance(registered, list):
+                observed_keys = {_canonical_json(
+                    level, name=f'observed level for {name!r}')
+                    for level in observed}
+                ordered = [level for level in registered
+                           if _canonical_json(
+                               level, name=f'registered level for {name!r}')
+                           in observed_keys]
+                registered_keys = {_canonical_json(
+                    level, name=f'registered level for {name!r}')
+                    for level in registered}
+                ordered.extend(level for level in observed
+                               if _canonical_json(
+                                   level,
+                                   name=f'observed level for {name!r}')
+                               not in registered_keys)
+                observed = ordered
+            resolved[name] = observed
+            inferred.append(name)
+        else:
+            factor = plan['factors'][name]
+            resolved[name] = _schedule_level_list(
+                factor.get('levels'), name=f'plan factor {name!r}')
+    n_cells = math.prod(len(value) for value in resolved.values())
+    if n_cells > _MAX_EXECUTION_CELLS:
+        raise DesignError(
+            f'the treatment design expands to {n_cells} cells, above the '
+            f'limit {_MAX_EXECUTION_CELLS}; pass a smaller explicit level set')
+    return resolved, inferred
+
+
+def treatment_cells(plan_id: str, *, levels=None) -> list[dict]:
+    """Return the treatment cells of a plan in deterministic product order.
+
+    Only factors with ``role == 'treatment'`` are enumerated; the seed
+    factor is the block, not a treatment. ``levels`` may override one or
+    more treatment factors (for example to schedule the actual opt-in
+    subset rather than the full registered factorial). Values are strict
+    JSON and duplicate levels are rejected.
+    """
+    plan = get_plan(plan_id)
+    resolved, _ = _schedule_levels(plan, levels=levels)
+    names = list(resolved)
+    return [dict(zip(names, combo))
+            for combo in itertools.product(*(resolved[name]
+                                             for name in names))]
+
+
+def _schedule_seed_list(seeds) -> list[int]:
+    seed_list = _seed_list(seeds, name='execution schedule seeds')
+    if not seed_list:
+        raise DesignError('execution schedule seeds must not be empty')
+    bad = [seed for seed in seed_list if not _is_int(seed) or seed < 0]
+    if bad:
+        raise DesignError(
+            f'execution schedule seeds must be non-negative ints, got {bad!r}')
+    if len(set(seed_list)) != len(seed_list):
+        raise DesignError('execution schedule seeds must be unique')
+    return seed_list
+
+
+def _schedule_seed_value(seed) -> int:
+    if isinstance(seed, bool) or not _is_int(seed) or seed < 0:
+        raise DesignError(
+            f'schedule_seed must be a non-negative int, got {seed!r}')
+    return seed
+
+
+def _execution_schedule_balance(blocks, *, n_cells: int | None = None) -> dict:
+    """Summarize whether cell positions are balanced across seed blocks."""
+    if not isinstance(blocks, (list, tuple)) or not blocks:
+        return {
+            'n_blocks': 0,
+            'n_cells': n_cells,
+            'complete_permutations': False,
+            'balanced': False,
+            'max_position_span': None,
+            'max_position_share': None,
+            'per_cell_distinct_positions': [],
+        }
+    normalized = []
+    for block in blocks:
+        if not isinstance(block, (list, tuple)):
+            return {
+                'n_blocks': len(blocks),
+                'n_cells': n_cells,
+                'complete_permutations': False,
+                'balanced': False,
+                'max_position_span': None,
+                'max_position_share': None,
+                'per_cell_distinct_positions': [],
+            }
+        normalized.append(list(block))
+    observed_cells = {cell for block in normalized for cell in block}
+    if n_cells is None:
+        n_cells = len(observed_cells)
+    expected = set(range(int(n_cells)))
+    complete = bool(
+        n_cells
+        and all(len(block) == n_cells and len(set(block)) == n_cells
+                and set(block) == expected for block in normalized))
+    positions: dict[int, dict[int, int]] = {
+        cell: {} for cell in range(int(n_cells))}
+    if complete:
+        for block in normalized:
+            for position, cell in enumerate(block):
+                positions[cell][position] = positions[cell].get(position, 0) + 1
+    distinct = [
+        sum(1 for count in positions[cell].values() if count)
+        for cell in range(int(n_cells))
+    ]
+    spans = []
+    for cell in range(int(n_cells)):
+        counts = [positions[cell].get(position, 0)
+                  for position in range(int(n_cells))]
+        spans.append(max(counts) - min(counts))
+    max_span = max(spans) if spans else None
+    expected_distinct = min(len(normalized), int(n_cells)) if n_cells else 0
+    balanced = bool(
+        complete
+        and len(normalized) >= 2
+        and max_span is not None
+        and max_span <= 1
+        and all(value == expected_distinct for value in distinct))
+    if complete:
+        max_position_share = max(
+            (count for counts in positions.values()
+             for count in counts.values()), default=0) / len(normalized)
+    else:
+        max_position_share = None
+    return {
+        'n_blocks': len(normalized),
+        'n_cells': int(n_cells) if n_cells else 0,
+        'complete_permutations': complete,
+        'balanced': balanced,
+        'max_position_span': max_span,
+        'max_position_share': max_position_share,
+        'per_cell_distinct_positions': distinct,
+    }
+
+
+def balanced_execution_schedule(plan_id: str, seeds, *, levels=None,
+                                schedule_seed=DEFAULT_SCHEDULE_SEED) -> dict:
+    """Build a deterministic randomized complete-block execution schedule.
+
+    Every seed is a block containing each treatment cell exactly once. The
+    cell order is a shuffled base permutation rotated by one position per
+    block, so a cell is not always trained first or last. ``seeds`` is an
+    explicit seed list or a seed COUNT (following :func:`_seed_list`).
+    ``levels`` may override treatment levels for an opt-in run. The local
+    ``random.Random(schedule_seed)`` instance is the only randomness used;
+    the global RNG is untouched.
+
+    The returned schedule is strict JSON. ``schedule_sha256`` fingerprints
+    the exact cells, seed-block order and rotation seed before any outcome
+    is seen; ``blocks`` contains integer indices into ``cells`` so the
+    schedule stays compact.
+    """
+    plan = get_plan(plan_id)
+    schedule_seed = _schedule_seed_value(schedule_seed)
+    resolved, _ = _schedule_levels(plan, levels=levels)
+    names = list(resolved)
+    cells = [dict(zip(names, combo))
+             for combo in itertools.product(*(resolved[name]
+                                              for name in names))]
+    seed_list = _schedule_seed_list(seeds)
+    n_cells = len(cells)
+    base = list(range(n_cells))
+    random.Random(schedule_seed).shuffle(base)
+    blocks = []
+    for block in range(len(seed_list)):
+        shift = block % n_cells
+        blocks.append(base[shift:] + base[:shift])
+    balance = _execution_schedule_balance(blocks, n_cells=n_cells)
+    payload = {
+        'scope': EXECUTION_SCHEDULE_SCOPE,
+        'plan_id': plan_id,
+        'plan_sha256': plan_sha256(plan),
+        'schedule_seed': schedule_seed,
+        'seeds': seed_list,
+        'cells': cells,
+        'blocks': blocks,
+    }
+    digest = hashlib.sha256(
+        _canonical_json(payload, name='execution schedule').encode('utf-8')
+    ).hexdigest()
+    return {
+        'schema_version': '1.0',
+        'kind': 'experiment_execution_schedule',
+        'scope': EXECUTION_SCHEDULE_SCOPE,
+        'plan_id': plan_id,
+        'plan_sha256': payload['plan_sha256'],
+        'schedule_seed': schedule_seed,
+        'schedule_id': f'exec:{digest[:16]}',
+        'schedule_sha256': digest,
+        'n_cells': n_cells,
+        'n_blocks': len(seed_list),
+        'n_runs': n_cells * len(seed_list),
+        'seeds': seed_list,
+        'cells': cells,
+        'blocks': blocks,
+        'balance': balance,
+        'method': ('deterministic randomized complete blocks: shuffled base '
+                   'permutation rotated by one position per seed block'),
+        'note': ('Order is part of the design. Record the observed sequence '
+                 'and pass it to audit_execution_order/audit_run; a '
+                 'treatment-major run is order-confounded even when every '
+                 'seed block is complete.'),
+    }
+
+
+def _normalize_observed_order(observed, factor_names) -> tuple[list[dict],
+                                                               list[dict]]:
+    if isinstance(observed, Mapping):
+        for key in ('runs', 'order', 'execution_order'):
+            if key in observed:
+                observed = observed[key]
+                break
+        else:
+            raise DesignError(
+                'observed order must be a sequence of records or an object '
+                "with a 'runs', 'order' or 'execution_order' list")
+    if isinstance(observed, (str, bytes)) or not hasattr(observed, '__iter__'):
+        raise DesignError(
+            'observed order must be an iterable of records, got '
+            f'{type(observed).__name__}')
+    records: list[dict] = []
+    invalid: list[dict] = []
+    for index, record in enumerate(observed):
+        if not isinstance(record, Mapping):
+            invalid.append({'index': index,
+                            'reason': 'record is not a mapping'})
+            continue
+        cell = record.get('cell')
+        if cell is None:
+            cell = record.get('factors')
+        if cell is None:
+            cell = {name: record[name] for name in factor_names
+                    if name in record}
+        if not isinstance(cell, Mapping):
+            invalid.append({'index': index,
+                            'reason': 'cell/factors is not a mapping'})
+            continue
+        missing = [name for name in factor_names if name not in cell]
+        if missing:
+            invalid.append({
+                'index': index,
+                'reason': f'missing treatment factor(s) {missing!r}'})
+            continue
+        seed = record.get('seed')
+        if not _is_int(seed) or seed < 0:
+            invalid.append({
+                'index': index,
+                'reason': f'seed must be a non-negative int, got {seed!r}'})
+            continue
+        try:
+            cell_obj = {name: cell[name] for name in factor_names}
+            cell_key = _canonical_json(
+                cell_obj, name=f'observed cell at index {index}')
+        except DesignError as exc:
+            invalid.append({'index': index, 'reason': str(exc)})
+            continue
+        records.append({
+            'index': index,
+            'seed': seed,
+            'cell': cell_obj,
+            'cell_key': cell_key,
+        })
+    return records, invalid
+
+
+def audit_execution_order(plan_id: str, observed, *, seeds=None, levels=None,
+                          schedule_seed=DEFAULT_SCHEDULE_SEED) -> dict:
+    """Audit whether an observed run sequence is a balanced seed-block design.
+
+    ``observed`` is the execution order as a sequence of records. Each
+    record may provide the treatment factors at top level (for example
+    ``{'variant': 'baseline', 'n_kv': 1, 'seed': 42}``) or carry them under
+    ``cell`` / ``factors``. ``seed`` names the block.
+
+    When ``levels`` omits a treatment factor, its levels are inferred from
+    the observed rows; the result records that inference in
+    ``levels_inferred`` because an entirely dropped cell cannot be detected
+    without an explicit level list. ``seeds`` defaults to the first-seen
+    seed order.
+
+    A balanced schedule is not merely "each seed appears": every seed block
+    must contain every expected cell, blocks must be contiguous, and cell
+    positions must be balanced across blocks. A treatment-major loop (all
+    seeds of treatment A, then all seeds of treatment B) is complete but
+    non-contiguous in seed blocks, and is labelled ``order_confounded``.
+    """
+    plan = get_plan(plan_id)
+    schedule_seed = _schedule_seed_value(schedule_seed)
+    factor_names = _schedule_factor_names(plan)
+    records, invalid = _normalize_observed_order(observed, factor_names)
+    if seeds is None:
+        seed_list: list[int] = []
+        seen_seeds: set[int] = set()
+        for record in records:
+            if record['seed'] not in seen_seeds:
+                seen_seeds.add(record['seed'])
+                seed_list.append(record['seed'])
+    else:
+        seed_list = _schedule_seed_list(seeds)
+    levels_cover_all = (isinstance(levels, Mapping)
+                        and all(name in levels for name in factor_names))
+    inferred_cells = (None if levels_cover_all or not records else
+                      [record['cell'] for record in records])
+    resolved, inferred = _schedule_levels(
+        plan, levels=levels, infer_from=inferred_cells)
+    names = list(resolved)
+    expected_cells = [dict(zip(names, combo))
+                      for combo in itertools.product(
+                          *(resolved[name] for name in names))]
+    expected_keys = [_canonical_json(cell, name='expected cell')
+                     for cell in expected_cells]
+    expected_cell_by_key = dict(zip(expected_keys, expected_cells))
+    expected_key_set = set(expected_keys)
+
+    seed_sequence = [record['seed'] for record in records]
+    seen_seeds: set[int] = set()
+    previous_seed = None
+    contiguous = True
+    for seed in seed_sequence:
+        if seed != previous_seed:
+            if seed in seen_seeds:
+                contiguous = False
+            seen_seeds.add(seed)
+            previous_seed = seed
+    contiguous = bool(records) and contiguous
+    by_seed: dict[int, list[dict]] = {}
+    for record in records:
+        by_seed.setdefault(record['seed'], []).append(record)
+
+    observed_seed_set = set(by_seed)
+    expected_seed_set = set(seed_list)
+    missing_seeds = sorted(expected_seed_set - observed_seed_set)
+    unexpected_seeds = sorted(observed_seed_set - expected_seed_set)
+    missing_cells: list[dict] = []
+    unexpected_cells: list[dict] = []
+    duplicate_runs: list[dict] = []
+    for seed in seed_list:
+        observed_records = by_seed.get(seed, [])
+        counts: dict[str, int] = {}
+        for record in observed_records:
+            counts[record['cell_key']] = counts.get(
+                record['cell_key'], 0) + 1
+        for key in expected_keys:
+            if key not in counts:
+                missing_cells.append({'seed': seed,
+                                      'cell': expected_cell_by_key[key]})
+        for record in observed_records:
+            if record['cell_key'] not in expected_key_set:
+                unexpected_cells.append({
+                    'seed': seed,
+                    'cell': record['cell'],
+                })
+        for key, count in counts.items():
+            if count > 1:
+                cell = (expected_cell_by_key.get(key)
+                        or next((record['cell'] for record in observed_records
+                                 if record['cell_key'] == key), None))
+                duplicate_runs.append({
+                    'seed': seed,
+                    'cell': cell,
+                    'count': count,
+                })
+    for seed in unexpected_seeds:
+        for record in by_seed.get(seed, []):
+            unexpected_cells.append({'seed': seed, 'cell': record['cell']})
+    complete = bool(
+        records
+        and not invalid
+        and not missing_seeds
+        and not unexpected_seeds
+        and not missing_cells
+        and not unexpected_cells
+        and not duplicate_runs)
+    if complete:
+        key_to_index = {key: index for index, key in enumerate(expected_keys)}
+        observed_blocks = [
+            [key_to_index[record['cell_key']]
+             for record in by_seed[seed]]
+            for seed in seed_list
+        ]
+        balance = _execution_schedule_balance(
+            observed_blocks, n_cells=len(expected_cells))
+        planned = balanced_execution_schedule(
+            plan_id, seed_list,
+            levels={name: resolved[name] for name in names},
+            schedule_seed=schedule_seed)
+        adherent = observed_blocks == planned['blocks']
+        observed_digest = hashlib.sha256(_canonical_json(
+            {'seeds': seed_list, 'cells': expected_cells,
+             'blocks': observed_blocks},
+            name='observed execution schedule').encode('utf-8')).hexdigest()
+    else:
+        balance = _execution_schedule_balance([], n_cells=len(expected_cells))
+        planned = None
+        adherent = False
+        observed_digest = None
+    if not records:
+        status = 'invalid'
+    elif invalid or not complete:
+        status = 'incomplete'
+    elif not contiguous or not balance['balanced']:
+        status = 'order_confounded'
+    else:
+        status = 'balanced'
+    checks = {
+        'observed_records_valid': not invalid,
+        'seed_blocks_complete': (bool(seed_list)
+                                 and not missing_seeds
+                                 and not unexpected_seeds),
+        'cell_blocks_complete': (bool(seed_list)
+                                 and not missing_cells
+                                 and not unexpected_cells
+                                 and not duplicate_runs),
+        'all_expected_runs_present': complete,
+        'contiguous_seed_blocks': contiguous,
+        'position_balanced': balance['balanced'],
+        'matches_planned_schedule': adherent,
+    }
+    claims = {
+        'balanced': ['execution_order_balanced'],
+        'order_confounded': ['descriptive',
+                             'exploratory_inference_with_caveat'],
+        'incomplete': ['descriptive'],
+        'invalid': [],
+    }[status]
+    notes = {
+        'balanced': ('every seed block is a complete permutation of the '
+                     'expected cells and cell positions are balanced across '
+                     'blocks; order is not confounded with the treatment'),
+        'order_confounded': ('the complete seed blocks were executed in a '
+                            'non-contiguous or position-imbalanced order, so '
+                            'treatment and time/device drift cannot be '
+                            'separated; re-run with the balanced schedule'),
+        'incomplete': ('the observed sequence is missing, duplicating or '
+                       'adding runs relative to the expected seed blocks; '
+                       'do not treat it as the pre-registered design'),
+        'invalid': 'the observed sequence contains no valid run records',
+    }[status]
+    return {
+        'plan_id': plan_id,
+        'plan_sha256': plan_sha256(plan),
+        'scope': EXECUTION_SCHEDULE_SCOPE,
+        'status': status,
+        'n_observed': len(records),
+        'n_expected': len(expected_cells) * len(seed_list),
+        'n_blocks': len(seed_list),
+        'n_cells': len(expected_cells),
+        'seeds': seed_list,
+        'levels': {name: resolved[name] for name in names},
+        'levels_inferred': inferred,
+        'checks': checks,
+        'missing_seeds': missing_seeds,
+        'unexpected_seeds': unexpected_seeds,
+        'missing_cells': missing_cells,
+        'unexpected_cells': unexpected_cells,
+        'duplicate_runs': duplicate_runs,
+        'invalid_records': invalid,
+        'balance': balance,
+        'planned_schedule_id': (
+            None if planned is None else planned['schedule_id']),
+        'planned_schedule_sha256': (
+            None if planned is None else planned['schedule_sha256']),
+        'observed_schedule_sha256': observed_digest,
+        'matches_planned_schedule': adherent,
+        'claims_allowed': claims,
+        'note': notes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Runtime audit
 # ---------------------------------------------------------------------------
 
@@ -1735,7 +2337,8 @@ def common_analyzed_seeds(rows, *, per_seed_key: str = 'per_seed',
 
 
 def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
-              sd=None, analyzed_seeds=None) -> dict:
+              sd=None, analyzed_seeds=None, execution_order=None,
+              schedule_seed=DEFAULT_SCHEDULE_SEED) -> dict:
     """Compare an actual run configuration with its pre-registered plan.
 
     ``seeds`` is the explicit seed list REQUESTED by the run. ``levels``
@@ -1754,10 +2357,19 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
     at random, which the data cannot establish. Omitting the argument keeps
     the historical behaviour (the audit reports only the requested block).
 
+    ``execution_order`` is the optional observed run sequence (see
+    :func:`audit_execution_order`). When supplied, an incomplete sequence
+    is labelled ``incomplete_execution`` and a complete but unbalanced or
+    non-contiguous sequence is labelled ``order_confounded``. Those labels
+    are deliberately separate from attrition: they describe whether time/
+    device drift is aliased with the treatment, not whether seeds survived
+    the analysis.
+
     The audit never changes the experiment; it is attached to the result
     metadata so a reader can see whether a claim is confirmatory. It does
-    not raise for a merely underpowered, control-less, or attrition-afflicted
-    run: those are exactly the states the audit exists to report.
+    not raise for a merely underpowered, control-less, attrition-afflicted,
+    or order-confounded run: those are exactly the states the audit exists
+    to report.
     """
     plan = get_plan(plan_id)
     seed_list = _seed_list(seeds)
@@ -1892,6 +2504,12 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             'missing': missing,
         }
 
+    execution_audit = None
+    if execution_order is not None:
+        execution_audit = audit_execution_order(
+            plan_id, execution_order, seeds=seed_list, levels=levels,
+            schedule_seed=schedule_seed)
+
     planning = planning_report(plan, seeds=n_seeds, family_size=family_size,
                                sd=sd)
     exact_testable = bool(
@@ -1946,6 +2564,21 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         # exact test has no rejection region at this n/family, no outcome
         # could have crossed alpha.
         'exact_test_has_rejection_region': exact_testable,
+        # None = no observed execution sequence was supplied, so order
+        # balance cannot be checked. A supplied but incomplete sequence is
+        # an execution failure; a complete but non-contiguous/
+        # position-imbalanced sequence aliases treatment with time.
+        'execution_order_provided': execution_audit is not None,
+        'execution_order_complete': (
+            None if execution_audit is None
+            else bool(execution_audit['checks']
+                      ['all_expected_runs_present'])),
+        'execution_order_balanced': (
+            None if execution_audit is None
+            else execution_audit['status'] == 'balanced'),
+        'execution_order_matches_planned_schedule': (
+            None if execution_audit is None
+            else execution_audit['matches_planned_schedule']),
     }
     valid_seeds = all(checks[key] for key in (
         'seeds_present', 'at_least_two_seeds', 'seeds_unique',
@@ -1980,6 +2613,26 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
             planning.get('exact_test_warning')
             or ('the exact sign-flip test has no rejection region at this '
                 'seed count and family size; treat the run as screening'))
+    if execution_audit is not None:
+        if execution_audit['status'] == 'incomplete':
+            design_warnings.append(
+                'the observed execution sequence is incomplete or malformed '
+                f"({execution_audit['n_observed']} of "
+                f"{execution_audit['n_expected']} expected runs observed); "
+                'the run is not the pre-registered complete block')
+        elif execution_audit['status'] == 'order_confounded':
+            design_warnings.append(
+                'the observed runs are complete but not a balanced, '
+                'contiguous seed-block order; treatment is aliased with '
+                'time/device drift, so paired differences cannot be '
+                'attributed cleanly to the treatment')
+        elif (execution_audit['status'] == 'balanced'
+              and not execution_audit['matches_planned_schedule']):
+            design_warnings.append(
+                'the observed order is balanced but does not match the '
+                'pre-registered schedule fingerprint; record the deviation '
+                'and use the balanced order from the manifest for any '
+                'confirmatory re-run')
     if not valid_seeds:
         status = 'invalid'
         claims = []
@@ -1993,6 +2646,14 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                       'complete_case_paired_inference_only']
         else:
             claims = []
+    elif (execution_audit is not None
+          and execution_audit['status'] in ('incomplete', 'invalid')):
+        status = 'incomplete_execution'
+        claims = ['descriptive']
+    elif (execution_audit is not None
+          and execution_audit['status'] == 'order_confounded'):
+        status = 'order_confounded'
+        claims = ['descriptive', 'exploratory_inference_with_caveat']
     elif (planning['status'] == 'confirmatory_ready'
           and not exact_testable):
         # The normal-approximation power target is met, but the exact test
@@ -2051,6 +2712,7 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
         'n_analyzed': n_analyzed,
         'seeds': seed_list,
         'analysis_population': analysis_population,
+        'execution_order': execution_audit,
         'screening_seeds': plan.get('screening_seeds'),
         'planned_seeds': plan.get('planned_seeds'),
         'family_size': family_size,
@@ -2108,6 +2770,17 @@ def audit_run(plan_id: str, *, seeds, levels=None, family_size=None,
                 'a required control/level is absent, so treatment '
                 'differences cannot be attributed to the factor under '
                 'test; re-run with the complete control set'),
+            'incomplete_execution': (
+                'the observed execution sequence is missing, duplicating or '
+                'adding runs relative to the pre-registered seed blocks, so '
+                'the run is not the complete design. Report only descriptive '
+                'evidence and re-run the complete schedule'),
+            'order_confounded': (
+                'every expected run is present, but the execution order is '
+                'not a balanced, contiguous seed-block sequence. Treatment '
+                'is aliased with time/device drift, so a treatment contrast '
+                'cannot be separated from an order effect; re-run with the '
+                'pre-registered balanced execution schedule'),
             'invalid': ('the seed design is malformed (fewer than two '
                         'unique non-negative integer seeds); no paired '
                         'inference is defined'),
@@ -2611,6 +3284,39 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
         row['plan_fingerprint_scope'] = PLAN_FINGERPRINT_SCOPE
         row['planning'] = planning
         row['status'] = planning['status']
+        if seed_list:
+            schedule = balanced_execution_schedule(plan_id, seed_list)
+            row['execution_schedule'] = {
+                'schedule_id': schedule['schedule_id'],
+                'schedule_sha256': schedule['schedule_sha256'],
+                'schedule_seed': schedule['schedule_seed'],
+                'n_cells': schedule['n_cells'],
+                'n_blocks': schedule['n_blocks'],
+                'n_runs': schedule['n_runs'],
+                'balance': schedule['balance'],
+                'levels_source': 'registered_plan_treatment_levels',
+                'note': ('Fingerprint of the pre-registered balanced '
+                         'execution order using the registered treatment '
+                         'levels. Call balanced_execution_schedule(plan_id, '
+                         'seeds, levels=...) to materialize the full '
+                         'cells/blocks for an opt-in subset, then verify '
+                         'schedule_sha256.'),
+            }
+        else:
+            row['execution_schedule'] = {
+                'schedule_id': None,
+                'schedule_sha256': None,
+                'schedule_seed': DEFAULT_SCHEDULE_SEED,
+                'n_cells': None,
+                'n_blocks': 0,
+                'n_runs': 0,
+                'balance': None,
+                'levels_source': 'registered_plan_treatment_levels',
+                'status': 'unavailable',
+                'note': ('No seed blocks were requested, so there is no '
+                         'execution schedule; the paired design is already '
+                         'invalid at zero seeds.'),
+            }
         rows.append(row)
     metadata = {
         'generated_by': 'experiment_design.design_manifest',
@@ -2621,7 +3327,10 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
                  'status is screening is not confirmatory. Equivalence and '
                  '2x2-interaction endpoints carry their own budgets (TOST '
                  'margin and four-cell SD respectively); a superiority '
-                 'budget does not cover either'),
+                 'budget does not cover either. execution_schedule binds a '
+                 'balanced seed-block order before outcomes are seen; it is '
+                 'a fingerprint plus counts, not a substitute for recording '
+                 'the observed order'),
         'method': ('normal approximation for planning only; inference '
                    'uses multi_seed_stats exact sign/permutation and '
                    't tests'),
@@ -2716,8 +3425,12 @@ def main(argv=None) -> int:
                         help='write the versioned design manifest to PATH')
     parser.add_argument('--pilot', metavar='RESULTS_JSON', default=None,
                         help='estimate the paired SD from a pilot result file')
+    parser.add_argument('--schedule', action='store_true',
+                        help='print the balanced execution schedule for the '
+                             'selected plan(s) and exit')
     parser.add_argument('--seeds', type=int, default=None,
-                        help='override the seed count for the manifest')
+                        help='override the seed count for the manifest or '
+                             '--schedule')
     parser.add_argument('--family-size', type=int, default=None,
                         help='override the analysis family size')
     parser.add_argument('--sd', type=float, default=None,
@@ -2753,6 +3466,23 @@ def main(argv=None) -> int:
             return 1
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report['status'] != 'insufficient_pilot_data' else 1
+
+    if args.schedule:
+        schedules = []
+        for plan_id in plan_ids:
+            count = (args.seeds if args.seeds is not None
+                     else PLANS[plan_id]['planned_seeds'])
+            schedules.append(balanced_execution_schedule(plan_id, count))
+        payload = {
+            'schema_version': '1.0',
+            'kind': ('experiment_execution_schedule'
+                     if len(schedules) == 1
+                     else 'experiment_execution_schedules'),
+            'created_utc': _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            'schedules': schedules,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+        return 0
 
     seeds_by_plan = ({plan_id: args.seeds for plan_id in plan_ids}
                      if args.seeds is not None else None)
