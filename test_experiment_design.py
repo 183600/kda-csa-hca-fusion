@@ -905,6 +905,16 @@ def test_pilot_report_tracks_seed_provenance():
         unverifiable['seed_provenance_warning']
 
 
+def test_manifest_keeps_confirmatory_seeds_in_pilot_environment(monkeypatch):
+    monkeypatch.setenv(D.SEED_ROLE_ENV, 'pilot')
+    manifest = D.design_manifest(['exp4_mqar'])
+    row = manifest['results'][0]
+    assert row['seeds'] == [D.DEFAULT_SEED_BASE + i
+                            for i in range(D.get_plan('exp4_mqar')['planned_seeds'])]
+    assert row['seed_block_audit']['status'] == \
+        'registered_confirmatory_block'
+
+
 def test_manifest_records_seed_blocks_and_flags_pilot_overlap():
     manifest = D.design_manifest(['exp4_mqar'])
     row = manifest['results'][0]

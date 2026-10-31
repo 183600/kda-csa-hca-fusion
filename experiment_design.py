@@ -3934,7 +3934,13 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
             seed_list = _seed_list(overrides[plan_id],
                                    name=f'{plan_id} seeds')
         else:
-            seed_list = seed_ids(plan['planned_seeds'], plan_id=plan_id)
+            # The manifest is the pre-registered CONFIRMATORY registry:
+            # never let EXPERIMENT_SEED_ROLE=pilot (used by the screening
+            # runners) silently replace its seed block. Explicit
+            # ``seeds_by_plan`` overrides remain the only way to record a
+            # different block, and they are audited below.
+            seed_list = seed_ids(plan['planned_seeds'], role='confirmatory',
+                                 plan_id=plan_id)
         planning = planning_report(plan, seeds=len(seed_list))
         row = dict(plan)
         row['seeds'] = seed_list
