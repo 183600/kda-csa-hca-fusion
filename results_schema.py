@@ -861,10 +861,10 @@ def _validate_exp6_rows(rows: list, metadata: dict) -> list[str]:
         stray_ops = sorted({op for op, _plen in cells} - set(ops_expected))
         if stray_ops:
             out.append(f'op value(s) {stray_ops} not in metadata.ops')
-        if prefill_lens_ok:
+        if prefill_lens_ok and isinstance(prefill_lens, list):
             missing_cells = sorted(
                 ((op, plen) for op in ops_expected
-                 for plen in (prefill_lens or [])
+                 for plen in prefill_lens
                  if (op, plen) not in cells),
                 key=repr,
             )
