@@ -234,6 +234,12 @@ def test_row_contract_exp6_cache_flags_are_honest():
         meta)
     # An incomplete benchmark grid (op list recorded in metadata).
     assert rs.validate_rows('exp6_decoding', rows[:-1], meta)
+    # Mixed-type metadata labels must be reported, not crash sorting the
+    # missing-cell list.
+    mixed_meta = {'prefill_lens': [128], 'ops': [1, 'kda']}
+    violations = rs.validate_rows(
+        'exp6_decoding', [dict(rows[0])], mixed_meta)
+    assert any('missing (op, prefill_len) cell' in v for v in violations)
     # An unhashable build tag must be reported, not crash the validator.
     violations = rs.validate_rows(
         'exp6_decoding',
