@@ -1070,7 +1070,8 @@ def _validate_exp14_rows(rows: list, metadata: dict) -> list[str]:
                     out.append(f"{where}: {sp!r} must be finite and > 0, "
                                f'got {value!r}')
                 a, b = row.get(hist), row.get(shipped)
-                if _finite_number(a) and _finite_number(b) and float(b) > 0:
+                if (_finite_number(value) and _finite_number(a)
+                        and _finite_number(b) and float(b) > 0):
                     want = float(a) / float(b)
                     if abs(float(value) - want) > 1e-6 * max(1.0, want):
                         out.append(f'{where}: {sp}={value!r} != '

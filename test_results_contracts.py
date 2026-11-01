@@ -308,6 +308,19 @@ def test_row_contract_exp14_parity_counts_reject_bools():
         assert any(field in v for v in violations), violations
 
 
+def test_row_contract_exp14_speedup_malformed_is_violation_not_crash():
+    """A malformed speedup must not crash the row-contract validator."""
+    base = {'section': 'selector_latency', 'rows': 8, 'n_blocks': 16,
+            'topk': 4, 'dispatch': 'sort', 'shipped_ms': 2.0,
+            'historical_sort_ms': 4.0, 'torch_topk_ms': 3.0,
+            'speedup_vs_sort': 2.0}
+    assert rs.validate_rows('exp14_indexer_selector', [base], {}) == []
+    for bad_value in ('oops', None, 10 ** 400):
+        bad = dict(base, speedup_vs_sort=bad_value)
+        violations = rs.validate_rows('exp14_indexer_selector', [bad], {})
+        assert any('speedup_vs_sort' in v for v in violations), violations
+
+
 def test_unknown_kinds_and_legacy_payloads_pass():
     assert rs.validate_rows('no_such_kind', [{'anything': 1}], {}) == []
     assert rs.validate_payload([{'legacy': True}]) == []
