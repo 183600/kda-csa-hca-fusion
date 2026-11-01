@@ -331,6 +331,13 @@ def test_exp15_row_contract_reports_overflow_instead_of_crashing():
     row['ci_ppl_ratio'] = [math.exp(700.0), math.exp(700.0)]
     violations = contract(rows, {})
     assert any('ci_ppl_ratio' in v for v in violations), violations
+    # An unbounded JSON n_reps makes float/int SE division overflow; the
+    # row must be reported, not abort the validator.
+    for index in (0, 1, 2):
+        huge = copy.deepcopy(_valid_exp15_rows())
+        huge[index]['n_reps'] = 10 ** 400
+        violations = contract(huge, {})
+        assert violations, index
 
 
 def test_exp15_row_contract_rejects_malformed_types_without_crashing():

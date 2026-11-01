@@ -480,6 +480,21 @@ def _positive_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _float_div(numerator: float, denominator: int) -> float:
+    """Divide a float by an unbounded JSON int without ``OverflowError``.
+
+    ``_positive_int`` accepts arbitrarily large JSON integers, but CPython
+    raises ``OverflowError`` when a float is divided by an int too large
+    for a C double (int/int division uses a different algorithm). A huge
+    denominator makes the quotient underflow to zero, which is exactly
+    the limit the SE arithmetic wants.
+    """
+    try:
+        return numerator / denominator
+    except OverflowError:
+        return 0.0
+
+
 def _ci_ratio_matches(ci, ci_ratio) -> bool:
     """Whether ``ci_ratio`` is the exponentiation of ``ci``.
 
@@ -1188,9 +1203,9 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
                         < 1e-9):
                     out.append(f"{where}: bias={bias!r} != coverage - nominal")
             if (_finite_number(coverage) and _positive_int(n_reps)):
-                want_se = math.sqrt(max(0.0, float(coverage)
-                                        * (1.0 - float(coverage))
-                                        / int(n_reps)))
+                want_se = math.sqrt(max(0.0, _float_div(
+                    float(coverage) * (1.0 - float(coverage)),
+                    int(n_reps))))
                 if not (_finite_number(se)
                         and abs(float(se) - want_se) < 1e-9):
                     out.append(f"{where}: se={se!r} != binomial SE "
@@ -1259,7 +1274,8 @@ def _validate_exp15_rows(rows: list, metadata: dict) -> list[str]:
                         and abs(float(rate) - want) < 1e-9):
                     out.append(f'{where}: rejection_rate={rate!r} != '
                                f'n_significant/n_reps={want!r}')
-                want_se = math.sqrt(max(0.0, want * (1.0 - want) / n_reps))
+                want_se = math.sqrt(max(0.0, _float_div(
+                    want * (1.0 - want), n_reps)))
                 if not (_finite_number(row.get('se'))
                         and abs(float(row['se']) - want_se) < 1e-9):
                     out.append(f"{where}: se={row.get('se')!r} != "
