@@ -388,6 +388,12 @@ class GatedDeltaRule(nn.Module):
                 torch.full((num_heads,), self.beta_init))
         else:
             raise ValueError(f"gate_type={gate_type!r} must be 'per_head' or 'per_channel'")
+        # Inference-time cache for per-channel gate exp to avoid repeated clamp+exp
+        # when the log-gate parameters are frozen. The cache is keyed by the
+        # tensor version to detect updates during training.
+        self._gate_exp_cache = None
+        self._gate_version = -1
+        self._gate_cache_enabled = True
 
     def forward(
         self,
@@ -460,8 +466,24 @@ class GatedDeltaRule(nn.Module):
         device = q.device
 
         # Compute gate = exp(clamped(g))
-        g_clamped = self.g.clamp(min=self.g_clamp_min, max=self.g_clamp_max)
-        gate = g_clamped.exp()  # [H, K] or [H]
+        # Inference cache: skip clamp+exp when parameters are frozen to reduce
+        # per-forward overhead for per-channel gating (the dominant cost in the
+        # attention-gather / sink path when the gate is static).
+        if (not torch.is_grad_enabled()
+                and self._gate_cache_enabled
+                and hasattr(self.g, '_version')):
+            g_version = self.g._version
+            if self._gate_exp_cache is not None and g_version == self._gate_version:
+                gate = self._gate_exp_cache
+            else:
+                g_clamped = self.g.clamp(min=self.g_clamp_min, max=self.g_clamp_max)
+                gate = g_clamped.exp()
+                # Store a detached copy for inference reuse
+                self._gate_exp_cache = gate.detach()
+                self._gate_version = g_version
+        else:
+            g_clamped = self.g.clamp(min=self.g_clamp_min, max=self.g_clamp_max)
+            gate = g_clamped.exp()
 
         # Expand gate for broadcasting: match S shape [B, H, K, V]
         if self.gate_type == 'per_channel':
