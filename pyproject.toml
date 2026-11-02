@@ -111,6 +111,7 @@ mamba = [
 py-modules = [
     "cache_accounting",
     "ci_gate",
+    "ci_lint",
     "decode_bandwidth",
     "decode_state_ablation",
     "dependency_contract",
