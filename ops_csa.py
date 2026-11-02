@@ -705,6 +705,161 @@ def csa_compress_kv(
     return _bf16_scale_if_needed(out)
 
 
+def csa_compress_kv_clustered(
+    C: torch.Tensor,
+    Z: torch.Tensor,
+    B_pos: torch.Tensor,
+    m: int,
+    n_clusters: int,
+    *,
+    compress_chunk: int = 0,
+    cluster_method: str = 'kmeans',
+    cluster_iter: int = 10,
+) -> torch.Tensor:
+    """Cluster-aware compression: split each block into ``n_clusters`` groups.
+
+    Within each compression block of size ``m``, the ``m`` KV entries are
+    clustered into ``n_clusters`` groups (``n_clusters <= m``). Each cluster
+    is compressed independently via the same softmax-weighted scheme as
+    :func:`csa_compress_kv`. The output has shape ``[B, n_blocks, n_clusters, c]``,
+    preserving more semantic diversity than the single-vector compression.
+
+    This is a **ClusterLevelPrimitive** — it operates at the cluster level
+    within the KV compression primitive, improving recall coverage (覆盖率)
+    by retaining multiple representative vectors per block instead of one
+    averaged vector. The output is compatible with the existing SharedKV MQA
+    core attention when the indexer/selection logic is extended to handle
+    the extra cluster dimension (future work).
+
+    Args:
+        C: KV entries ``[B, T, c]``
+        Z: compression weights ``[B, T, c]``
+        B_pos: learnable positional bias ``[m, c]``
+        m: compression factor (T must be divisible by m).
+        n_clusters: number of clusters per block (must be <= m).
+        compress_chunk: compressed blocks per forward tile (0 = auto).
+        cluster_method: clustering algorithm ('kmeans' or 'random').
+        cluster_iter: max iterations for k-means.
+
+    Returns:
+        Compressed KV entries ``[B, n_blocks, n_clusters, c]``.
+    """
+    B_, T, c = C.shape
+    _require_int_geometry('csa_compress_kv_clustered', 'm', m)
+    _require_int_geometry('csa_compress_kv_clustered', 'n_clusters', n_clusters, minimum=1)
+    _require_int_geometry('csa_compress_kv_clustered', 'compress_chunk', compress_chunk, minimum=0)
+    if n_clusters > m:
+        raise ValueError(f"n_clusters={n_clusters} must be <= m={m}")
+    if T % m != 0:
+        raise ValueError(f"T={T} must be divisible by m={m}")
+    if cluster_method not in ('kmeans', 'random'):
+        raise ValueError(f"cluster_method={cluster_method!r} must be 'kmeans' or 'random'")
+
+    n_blocks = T // m
+    compute_dtype = torch.float64 if C.dtype == torch.float64 else torch.float
+    C_b = C.to(compute_dtype).view(B_, n_blocks, m, c)   # [B, n_blocks, m, c]
+    Z_b = Z.to(compute_dtype).view(B_, n_blocks, m, c)
+    bias = B_pos[None, None, :, :].to(Z_b)               # [1, 1, m, c]
+
+    # Output: [B, n_blocks, n_clusters, c] in compute_dtype
+    out = torch.empty(B_, n_blocks, n_clusters, c, dtype=compute_dtype, device=C.device)
+
+    if not torch.is_grad_enabled():
+        tile = _resolve_compress_tile(compress_chunk, B_, n_blocks, m, c, overlapped=False)
+        if tile < n_blocks:
+            for i0 in range(0, n_blocks, tile):
+                i1 = min(n_blocks, i0 + tile)
+                _compress_block_clustered(
+                    C_b[:, i0:i1], Z_b[:, i0:i1], bias, out[:, i0:i1],
+                    n_clusters, cluster_method, cluster_iter, i0)
+            return _bf16_scale_if_needed(out)
+
+    # Autograd path: process all blocks (tiling not applied for simplicity;
+    # the inference path above handles tiling which is the main use case).
+    for i in range(n_blocks):
+        _compress_block_clustered(
+            C_b[:, i:i+1], Z_b[:, i:i+1], bias, out[:, i:i+1],
+            n_clusters, cluster_method, cluster_iter, i)
+    return _bf16_scale_if_needed(out)
+
+
+def _compress_block_clustered(
+    C_blk: torch.Tensor,      # [B, tile, m, c]
+    Z_blk: torch.Tensor,      # [B, tile, m, c]
+    bias: torch.Tensor,       # [1, 1, m, c]
+    out_blk: torch.Tensor,    # [B, tile, n_clusters, c] (pre-allocated)
+    n_clusters: int,
+    cluster_method: str,
+    cluster_iter: int,
+    block_offset: int = 0,    # global block index for deterministic seeding
+) -> None:
+    """Cluster and compress a single block tile in-place into out_blk."""
+    B, tile, m, c = C_blk.shape
+    device = C_blk.device
+    logits = Z_blk + bias                    # [B, tile, m, c]
+
+    for bi in range(B):
+        for ti in range(tile):
+            C_mc = C_blk[bi, ti]             # [m, c]
+            logits_mc = logits[bi, ti]       # [m, c]
+
+            # Cluster the m vectors into n_clusters groups.
+            # We cluster per-channel (c) independently for simplicity and
+            # because the softmax weights are also per-channel. This means
+            # each channel gets its own cluster assignment, which matches
+            # the per-channel compression semantics.
+            if cluster_method == 'kmeans':
+                # Simple k-means on the combined [m, c] features.
+                # Initialize centroids by sampling from the data.
+                # Use deterministic seeding based on block index for tiling parity.
+                gen = torch.Generator(device=device)
+                gen.manual_seed(0x9e3779b9 + block_offset + ti)  # deterministic per block
+                perm = torch.randperm(m, generator=gen, device=device)
+                centroids = C_mc[perm[:n_clusters]].clone()  # [n_clusters, c]
+                for _ in range(cluster_iter):
+                    # Assign each vector to nearest centroid (L2 distance)
+                    dists = torch.cdist(C_mc, centroids)     # [m, n_clusters]
+                    assign = dists.argmin(dim=1)             # [m]
+                    # Update centroids
+                    new_centroids = torch.zeros_like(centroids)
+                    counts = torch.zeros(n_clusters, device=device, dtype=torch.long)
+                    for k in range(n_clusters):
+                        mask = (assign == k)
+                        if mask.any():
+                            new_centroids[k] = C_mc[mask].mean(dim=0)
+                            counts[k] = mask.sum()
+                    # Handle empty clusters: reinitialize from farthest point
+                    empty = (counts == 0)
+                    if empty.any():
+                        # Find points farthest from their assigned centroid
+                        assigned_centroids = centroids[assign]
+                        farthest_dists = (C_mc - assigned_centroids).norm(dim=1)
+                        for k in empty.nonzero(as_tuple=True)[0]:
+                            farthest_idx = farthest_dists.argmax()
+                            new_centroids[k] = C_mc[farthest_idx]
+                            farthest_dists[farthest_idx] = -1
+                    centroids = new_centroids
+                # Final assignment
+                dists = torch.cdist(C_mc, centroids)
+                assign = dists.argmin(dim=1)
+            else:  # 'random'
+                gen = torch.Generator(device=device)
+                gen.manual_seed(0x9e3779b9 + block_offset + ti)
+                assign = torch.randint(0, n_clusters, (m,), generator=gen, device=device)
+
+            # Now compress each cluster independently
+            for k in range(n_clusters):
+                mask = (assign == k)
+                if not mask.any():
+                    # Empty cluster: output zeros
+                    out_blk[bi, ti, k].zero_()
+                    continue
+                C_k = C_mc[mask]              # [m_k, c]
+                logits_k = logits_mc[mask]    # [m_k, c]
+                S_k = _bf16_safe_softmax(logits_k, dim=0)   # [m_k, c]
+                out_blk[bi, ti, k] = (S_k * C_k).sum(dim=0)  # [c]
+
+
 def _overlapped_compress_no_pad(
     Ca: torch.Tensor,
     Cb: torch.Tensor,

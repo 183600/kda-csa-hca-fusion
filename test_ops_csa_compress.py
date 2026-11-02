@@ -9,7 +9,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ops_csa import csa_compress_kv, csa_compress_kv_overlapped  # noqa: E402
+from ops_csa import (
+    csa_compress_kv,
+    csa_compress_kv_overlapped,
+    csa_compress_kv_clustered,
+)  # noqa: E402
 
 
 def test_overlapped_zero_length_matches_single_branch_dtype():
@@ -111,3 +115,116 @@ def test_naive_hca_compress_chunk_end_to_end():
         except ValueError:
             continue
         raise AssertionError(f'naive_hca accepted compress_chunk={bad!r}')
+
+
+def test_csa_compress_kv_clustered_shape_and_dtype():
+    """Clustered compression returns [B, n_blocks, n_clusters, c] in compute dtype."""
+    torch.manual_seed(42)
+    B, T, m, c = 2, 32, 8, 16
+    n_clusters = 3
+    C = torch.randn(B, T, c, dtype=torch.float16)
+    Z = torch.randn(B, T, c, dtype=torch.float16)
+    bias = torch.randn(m, c, dtype=torch.float16) * 0.1
+
+    with torch.no_grad():
+        out = csa_compress_kv_clustered(C, Z, bias, m, n_clusters)
+    assert out.shape == (B, T // m, n_clusters, c)
+    assert out.dtype == torch.float32  # compute dtype for fp16 input
+
+
+def test_csa_compress_kv_clustered_n_clusters_le_m():
+    """n_clusters must be <= m."""
+    B, T, m, c = 1, 8, 4, 4
+    C = torch.randn(B, T, c)
+    Z = torch.randn(B, T, c)
+    bias = torch.randn(m, c)
+    for bad in (5, 10):
+        try:
+            csa_compress_kv_clustered(C, Z, bias, m, bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'accepted n_clusters={bad} > m={m}')
+
+
+def test_csa_compress_kv_clustered_rejects_invalid_method():
+    """cluster_method must be 'kmeans' or 'random'."""
+    B, T, m, c = 1, 8, 4, 4
+    C = torch.randn(B, T, c)
+    Z = torch.randn(B, T, c)
+    bias = torch.randn(m, c)
+    try:
+        csa_compress_kv_clustered(C, Z, bias, m, 2, cluster_method='invalid')
+    except ValueError:
+        return
+    raise AssertionError('accepted invalid cluster_method')
+
+
+def test_csa_compress_kv_clustered_kmeans_vs_random_differ():
+    """k-means and random clustering produce different outputs."""
+    torch.manual_seed(123)
+    B, T, m, c = 1, 16, 8, 8
+    C = torch.randn(B, T, c)
+    Z = torch.randn(B, T, c)
+    bias = torch.randn(m, c) * 0.1
+
+    with torch.no_grad():
+        out_kmeans = csa_compress_kv_clustered(C, Z, bias, m, 3, cluster_method='kmeans')
+        out_random = csa_compress_kv_clustered(C, Z, bias, m, 3, cluster_method='random')
+    # Should differ (very high probability)
+    assert not torch.allclose(out_kmeans, out_random, atol=1e-6, rtol=0)
+
+
+def test_csa_compress_kv_clustered_tiling_parity():
+    """Tiled and full-path clustered compression match (inference)."""
+    torch.manual_seed(456)
+    B, T, m, c = 2, 64, 4, 8
+    n_clusters = 2
+    C = torch.randn(B, T, c)
+    Z = torch.randn(B, T, c)
+    bias = torch.randn(m, c) * 0.1
+
+    with torch.no_grad():
+        full = csa_compress_kv_clustered(C, Z, bias, m, n_clusters, compress_chunk=T + 1)
+        for chunk in (1, 3, 5):
+            got = csa_compress_kv_clustered(C, Z, bias, m, n_clusters, compress_chunk=chunk)
+            assert torch.allclose(got, full, atol=1e-6, rtol=0), f'chunk={chunk} mismatch'
+
+
+def test_csa_compress_kv_clustered_gradients():
+    """Clustered compression produces gradients for all inputs."""
+    torch.manual_seed(789)
+    B, T, m, c = 1, 16, 4, 8
+    n_clusters = 2
+    C = torch.randn(B, T, c, requires_grad=True)
+    Z = torch.randn(B, T, c, requires_grad=True)
+    bias = torch.randn(m, c, requires_grad=True)
+
+    out = csa_compress_kv_clustered(C, Z, bias, m, n_clusters)
+    loss = out.sum()
+    loss.backward()
+
+    assert C.grad is not None and torch.isfinite(C.grad).all()
+    assert Z.grad is not None and torch.isfinite(Z.grad).all()
+    assert bias.grad is not None and torch.isfinite(bias.grad).all()
+
+
+def test_csa_compress_kv_clustered_empty_cluster_handling():
+    """Empty clusters (k-means) produce zero output without crashing."""
+    # Construct a case where k-means might produce empty clusters:
+    # very few points, many clusters
+    torch.manual_seed(999)
+    B, T, m, c = 1, 4, 4, 2
+    n_clusters = 3  # m=4, n_clusters=3 - possible empty cluster
+    C = torch.zeros(B, T, c)
+    C[0, 0] = torch.tensor([1.0, 0.0])
+    C[0, 1] = torch.tensor([1.0, 0.0])
+    C[0, 2] = torch.tensor([0.0, 1.0])
+    C[0, 3] = torch.tensor([0.0, 1.0])
+    Z = torch.zeros(B, T, c)
+    bias = torch.zeros(m, c)
+
+    with torch.no_grad():
+        out = csa_compress_kv_clustered(C, Z, bias, m, n_clusters, cluster_method='kmeans')
+    # Should not crash, output shape correct
+    assert out.shape == (B, 1, n_clusters, c)
+    assert torch.isfinite(out).all()
