@@ -267,6 +267,7 @@ jobs:
         timeout-minutes: 180
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -562,16 +563,28 @@ jobs:
           smoke_test() {
             local m="$1" extra=""
             case "$m" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
+            # NVIDIA 重度推理模型给足冒烟时间；免费池快速失败（网关挂起时省时）
+            local st=90; case "$m" in nvidia/*) st=300 ;; esac
             # shellcheck disable=SC2086
-            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+            timeout --kill-after=30 $st opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
           }
 
           detect_provider() {
             local pass cand model
             for pass in 1 2; do
-              for cand in free glm pickle; do
+              # 主力：NVIDIA NIM API（opencode 内置 provider，鉴权走 NVIDIA_API_KEY）。
+              # 模型链（指定顺序）：deepseek-v4.1-flash → glm-5.3-flash → glm-5.3
+              #   → minimax-m3.1-flash → step-5-preview；其后 Zen 免费池兜底
+              #   （免费池 2026-11-01 起对 runner 大面积挂起，恢复后仍可被选中）。
+              # 不再使用 DeepSeek 官方 API。
+              for cand in nv-ds nv-glm nv-glm2 nv-mmx nv-step free glm pickle; do
                 is_broken "$cand" && continue
                 case "$cand" in
+                  nv-ds)   model="nvidia/deepseek-ai/deepseek-v4.1-flash" ;;
+                  nv-glm)  model="nvidia/z-ai/glm-5.3-flash" ;;
+                  nv-glm2) model="nvidia/z-ai/glm-5.3" ;;
+                  nv-mmx)  model="nvidia/minimaxai/minimax-m3.1-flash" ;;
+                  nv-step) model="nvidia/stepfun-ai/step-5-preview" ;;
                   free)   model="$FREE_MODEL" ;;
                   glm)    model="$GLM_MODEL" ;;
                   pickle) model="$PICKLE_MODEL" ;;
