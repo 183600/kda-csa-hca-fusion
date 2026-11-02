@@ -203,7 +203,7 @@ def _sliding_window_valid_mask(T: int, win: int, device) -> torch.Tensor:
             _t = torch.arange(T, device=device)
             mask = _j[None, :] >= (win - 1 - _t[:, None])
         if len(_SLIDING_WINDOW_MASK_CACHE) >= 64:
-            _SLIDING_WINDOW_MASK_CACHE.clear()
+            _SLIDING_WINDOW_MASK_CACHE.pop(next(iter(_SLIDING_WINDOW_MASK_CACHE)), None)
         _SLIDING_WINDOW_MASK_CACHE[key] = mask
     return mask
 
@@ -556,7 +556,7 @@ def _causal_block_mask(T: int, n_blocks: int, m: int, device) -> torch.Tensor:
         i_b = torch.arange(n_blocks, device=device)
         mask = i_t[:, None] // m > i_b[None, :]
     if len(_CAUSAL_BLOCK_MASK_CACHE) >= 64:
-        _CAUSAL_BLOCK_MASK_CACHE.clear()
+        _CAUSAL_BLOCK_MASK_CACHE.pop(next(iter(_CAUSAL_BLOCK_MASK_CACHE)), None)
     _CAUSAL_BLOCK_MASK_CACHE[key] = mask
     return mask
 
@@ -570,7 +570,7 @@ _CAUSAL_BLOCK_MASK_INVALID_CACHE: dict = {}
 
 
 def _causal_block_mask_invalid(T: int, n_blocks: int, m: int,
-                               device) -> torch.Tensor:
+                                device) -> torch.Tensor:
     """Cached ``~_causal_block_mask(T, n_blocks, m, device)`` (read-only)."""
     key = (T, n_blocks, m, str(device))
     cached = _CAUSAL_BLOCK_MASK_INVALID_CACHE.get(key)
@@ -579,7 +579,7 @@ def _causal_block_mask_invalid(T: int, n_blocks: int, m: int,
     with normal_tensor_scope():
         invalid = ~_causal_block_mask(T, n_blocks, m, device)
     if len(_CAUSAL_BLOCK_MASK_INVALID_CACHE) >= 64:
-        _CAUSAL_BLOCK_MASK_INVALID_CACHE.clear()
+        _CAUSAL_BLOCK_MASK_INVALID_CACHE.pop(next(iter(_CAUSAL_BLOCK_MASK_INVALID_CACHE)), None)
     _CAUSAL_BLOCK_MASK_INVALID_CACHE[key] = invalid
     return invalid
 

@@ -978,7 +978,7 @@ def _chunk_constants(BT: int, dtype: torch.dtype, device):
                 torch.ones(BT, BT, dtype=torch.bool, device=device),
                 diagonal=1)
         if len(_CHUNK_CONST_CACHE) >= 64:
-            _CHUNK_CONST_CACHE.clear()
+            _CHUNK_CONST_CACHE.pop(next(iter(_CHUNK_CONST_CACHE)), None)
         entry = (eye, upper_mask)
         _CHUNK_CONST_CACHE[key] = entry
     return entry

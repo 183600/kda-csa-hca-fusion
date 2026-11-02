@@ -244,7 +244,7 @@ def _causal_chunk_mask(BT: int, device) -> torch.Tensor:
                 torch.ones(BT, BT, dtype=torch.bool, device=device))
         if BT * BT <= _CAUSAL_CHUNK_MASK_MAX_ELEMS:
             if len(_CAUSAL_CHUNK_MASK_CACHE) >= 64:
-                _CAUSAL_CHUNK_MASK_CACHE.clear()
+                _CAUSAL_CHUNK_MASK_CACHE.pop(next(iter(_CAUSAL_CHUNK_MASK_CACHE)), None)
             _CAUSAL_CHUNK_MASK_CACHE[key] = mask
     return mask
 
@@ -264,7 +264,7 @@ def _noncausal_chunk_mask(BT: int, device) -> torch.Tensor:
             mask = ~_causal_chunk_mask(BT, device)
         if BT * BT <= _CAUSAL_CHUNK_MASK_MAX_ELEMS:
             if len(_NONCAUSAL_CHUNK_MASK_CACHE) >= 64:
-                _NONCAUSAL_CHUNK_MASK_CACHE.clear()
+                _NONCAUSAL_CHUNK_MASK_CACHE.pop(next(iter(_NONCAUSAL_CHUNK_MASK_CACHE)), None)
             _NONCAUSAL_CHUNK_MASK_CACHE[key] = mask
     return mask
 

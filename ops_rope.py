@@ -343,7 +343,7 @@ def _cos_sin_by_identity(
             positions, rope_dim, base, angle_dtype, device)
     if cacheable and cos.numel() + sin.numel() <= _TABLE_CACHE_MAX_ELEMS:
         if len(_IDENTITY_TABLE_CACHE) >= 8:
-            _IDENTITY_TABLE_CACHE.clear()
+            _IDENTITY_TABLE_CACHE.pop(next(iter(_IDENTITY_TABLE_CACHE)), None)
         # A snapshot catches ``.data`` mutations, which do not bump
         # ``_version``; the identity/version key alone would return a
         # stale table for a reused position buffer.
@@ -546,7 +546,7 @@ def token_positions(T: int, device, dtype=torch.long) -> torch.Tensor:
         with _normal_tensor_scope():
             pos = torch.arange(T, device=device, dtype=dtype)
         if len(_POSITION_VEC_CACHE) >= 64:
-            _POSITION_VEC_CACHE.clear()
+            _POSITION_VEC_CACHE.pop(next(iter(_POSITION_VEC_CACHE)), None)
         _POSITION_VEC_CACHE[key] = pos
     return pos
 
@@ -574,7 +574,7 @@ def block_positions(n_blocks: int, m: int, device,
         with _normal_tensor_scope():
             pos = torch.arange(n_blocks, device=device, dtype=dtype) * m
         if len(_POSITION_VEC_CACHE) >= 64:
-            _POSITION_VEC_CACHE.clear()
+            _POSITION_VEC_CACHE.pop(next(iter(_POSITION_VEC_CACHE)), None)
         _POSITION_VEC_CACHE[key] = pos
     return pos
 
