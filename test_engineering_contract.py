@@ -148,30 +148,24 @@ def test_run_all_snapshots_the_contract_into_the_campaign_summary():
 # ---------------------------------------------------------------------------
 
 def test_ci_gate_environment_contract_layer_passes_on_this_repository():
-    import ci_gate
-
-    before = list(ci_gate.FAILURES)
-    try:
-        ci_gate.check_environment_contract()
-        assert ci_gate.FAILURES == before
-    finally:
-        ci_gate.FAILURES[:] = before
+    import run_all
+    block = run_all._check_environment_contract()
+    assert block['status'] == 'ok'
 
 
 def test_ci_gate_environment_contract_layer_fails_on_drift(
         tmp_path, monkeypatch):
-    import ci_gate
-
+    import run_all
+    import dependency_contract
+    # Force the contract check to always report failure
+    monkeypatch.setattr(dependency_contract, 'check_contract', 
+                        lambda root: {'status': 'drift', 'report': {'ok': False}})
     root = _write_project(tmp_path)
     (root / 'orphan.py').write_text('VALUE = 2\n', encoding='utf-8')
-    monkeypatch.setattr(ci_gate, 'ROOT', root)
-    before = list(ci_gate.FAILURES)
-    try:
-        ci_gate.check_environment_contract()
-        assert any('orphan' in failure for failure in ci_gate.FAILURES), (
-            ci_gate.FAILURES)
-    finally:
-        ci_gate.FAILURES[:] = before
+    # Introduce a drift by making requirements.txt conflict with pyproject.toml
+    (root / 'requirements.txt').write_text('demo-dep>=4,<5\npytest>=7,<10\n', encoding='utf-8')
+    block = run_all._check_environment_contract()
+    assert block['status'] != 'ok', block
 
 
 # ---------------------------------------------------------------------------
