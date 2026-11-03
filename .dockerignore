@@ -1,0 +1,34 @@
+# Git
+.git
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Large data / caches that should be mounted
+results_lm/
+backups/
+cache_accounting.py
+wt103_cache
+checkpoints_lm
+
+# Temporary files
+*.tmp
+*.log

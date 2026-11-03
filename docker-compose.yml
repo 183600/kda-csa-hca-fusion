@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  kda-csa-hca-fusion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kda-csa-hca-fusion:latest
+    container_name: kda-csa-hca-fusion-dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - results_lm:/workspace/results_lm
+      - backups:/workspace/backups
+    environment:
+      - PYTHONPATH=/workspace
+    # Keep container running for interactive use
+    command: tail -f /dev/null
+    # Optional: uncomment to enable GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  results_lm:
+    driver: local
+  backups:
+    driver: local

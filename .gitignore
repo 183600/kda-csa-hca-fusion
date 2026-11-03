@@ -160,5 +160,8 @@ uv.lock
 # (~50-300 MB per save; must never be committed).
 checkpoints_lm/
 
+# Data backups created by backup_results.py; never commit archives.
+backups/
+
 # Papers are referenced by arXiv link in README; keep PDFs out of git.
 *.pdf
