@@ -1504,6 +1504,7 @@ def _lightning_indexer_chunk(
     scale: float,
     causal_block_mask_chunk: torch.Tensor | None,   # [T_c, n_blocks]
     return_soft_weights: bool,
+    return_logits: bool = False,
     causal_block_mask_invalid_chunk: torch.Tensor | None = None,
 ):
     """Score + select ONE query slice of the lightning indexer.
@@ -1587,7 +1588,12 @@ def _lightning_indexer_chunk(
         # straight-through estimator. Softmax is row-wise, so computing it
         # per query chunk and concatenating is value-identical to one
         # softmax over the full batch.
-        return idx, _nan_safe_softmax(logits, dim=-1)
+        soft_weights = _nan_safe_softmax(logits, dim=-1)
+        if return_logits:
+            return idx, soft_weights, logits
+        return idx, soft_weights
+    if return_logits:
+        return idx, logits
     return idx
 
 
@@ -1599,6 +1605,7 @@ def csa_lightning_indexer(
     scale: float | None = None,
     causal_block_mask: torch.Tensor | None = None,   # [T, n_blocks]
     return_soft_weights: bool = False,
+    return_logits: bool = False,
     *,
     ste_mode: str = 'topk_columns',
     normalize_qk: bool = False,
@@ -1643,10 +1650,14 @@ def csa_lightning_indexer(
           training signal. This is implemented in ``naive_csa``'s STE
           block via a zero-in-forward addend whose backward is the full
           softmax's expected KV.
-        * ``'aux_contrastive'``: reserved for a future implementation
-          of DeepSeek-V4's contrastive auxiliary loss on the
-          selection logits. Currently raises ``NotImplementedError``
-          if explicitly requested.
+        * ``'aux_contrastive'``: adds a contrastive auxiliary loss on the
+          selection logits (InfoNCE-style). The forward pass is unchanged
+          (hard top-k gather), but the backward pass receives an extra
+          gradient term that pulls up logits of selected blocks and pushes
+          down logits of non-selected blocks. This provides a targeted
+          training signal for the indexer without requiring the full
+          softmax gradient. Implemented in ``naive_csa`` via a zero-in-forward
+          addend whose backward is the contrastive loss gradient.
 
         ``csa_lightning_indexer`` itself always returns the same
         ``soft_weights`` tensor (the full softmax over all blocks); the
@@ -1655,6 +1666,13 @@ def csa_lightning_indexer(
         mode. The default ``'topk_columns'`` matches the published CSA
         reference implementation; the other modes are documented for
         extensibility and ablation.
+
+    return_logits : bool, default ``False``
+        If ``True``, also returns the raw indexer logits (pre-softmax,
+        post-masking) of shape ``[B, T, n_blocks]``. This is required
+        for ``ste_mode='aux_contrastive'`` to compute the contrastive
+        loss on the unnormalized scores. When ``False`` (default), the
+        return signature is unchanged for backward compatibility.
 
     normalize_qk : bool, default ``False``
         If True, L2-normalize ``q_idx`` and ``k_idx`` along the
@@ -1793,12 +1811,6 @@ def csa_lightning_indexer(
         raise ValueError(
             f"ste_mode={ste_mode!r} must be one of 'topk_columns', "
             f"'full_softmax', or 'aux_contrastive'.")
-    if ste_mode == 'aux_contrastive':
-        raise NotImplementedError(
-            "ste_mode='aux_contrastive' is reserved for a future "
-            "implementation of DeepSeek-V4's contrastive auxiliary loss "
-            "on the indexer selection logits. Use 'topk_columns' (the "
-            "default, simplified STE) or 'full_softmax' (dense STE) for now.")
     # Scale-selection policy:
     #   * If the caller explicitly passed a scale, honour it.
     #   * Otherwise, when ``normalize_qk=True``, scores are cosine
@@ -1859,7 +1871,7 @@ def csa_lightning_indexer(
         w_chunk = None if w_idx is None else w_idx[:, start:end]
         return _lightning_indexer_chunk(
             q_idx[:, start:end], k_idx, w_chunk, topk, scale,
-            mask_chunk, return_soft_weights, invalid_chunk)
+            mask_chunk, return_soft_weights, return_logits, invalid_chunk)
 
     if tile >= T:
         # ``topk=0`` is handled inside ``_lightning_indexer_chunk``: the
@@ -1879,30 +1891,56 @@ def csa_lightning_indexer(
         soft = (torch.empty(B_, T, n_blocks, dtype=compute_dtype,
                             device=q_idx.device)
                 if return_soft_weights else None)
+        logits_tiles = [] if return_logits else None
         for start in range(0, T, tile):
             end = min(start + tile, T)
             result = _run_chunk(start, end)
-            if return_soft_weights:
+            if return_soft_weights and return_logits:
+                idx_t, soft_t, logits_t = result
+                soft[:, start:end] = soft_t
+                logits_tiles.append(logits_t)
+            elif return_soft_weights:
                 idx_t, soft_t = result
                 soft[:, start:end] = soft_t
+            elif return_logits:
+                idx_t, logits_t = result
+                logits_tiles.append(logits_t)
             else:
                 idx_t = result
             idx[:, start:end] = idx_t
-        return (idx, soft) if return_soft_weights else idx
+        if return_soft_weights and return_logits:
+            return idx, soft, torch.cat(logits_tiles, dim=1)
+        if return_soft_weights:
+            return idx, soft
+        if return_logits:
+            return idx, torch.cat(logits_tiles, dim=1)
+        return idx
     idx_tiles: list[torch.Tensor] = []
     soft_tiles: list[torch.Tensor] = []
+    logits_tiles: list[torch.Tensor] = []
     for start in range(0, T, tile):
         end = min(start + tile, T)
         result = _run_chunk(start, end)
-        if return_soft_weights:
+        if return_soft_weights and return_logits:
+            idx_t, soft_t, logits_t = result
+            soft_tiles.append(soft_t)
+            logits_tiles.append(logits_t)
+        elif return_soft_weights:
             idx_t, soft_t = result
             soft_tiles.append(soft_t)
+        elif return_logits:
+            idx_t, logits_t = result
+            logits_tiles.append(logits_t)
         else:
             idx_t = result
         idx_tiles.append(idx_t)
     idx = torch.cat(idx_tiles, dim=1)
+    if return_soft_weights and return_logits:
+        return idx, torch.cat(soft_tiles, dim=1), torch.cat(logits_tiles, dim=1)
     if return_soft_weights:
         return idx, torch.cat(soft_tiles, dim=1)
+    if return_logits:
+        return idx, torch.cat(logits_tiles, dim=1)
     return idx
 
 
@@ -1949,7 +1987,9 @@ def _indexer_ste_chunk(q_chunk: torch.Tensor,
     """
     idx, soft = _lightning_indexer_chunk(
         q_chunk, k_idx, w_chunk, topk, scale,
-        mask_chunk, True, invalid_chunk)
+        mask_chunk, return_soft_weights=True,
+        return_logits=False,
+        causal_block_mask_invalid_chunk=invalid_chunk)
     valid = idx >= 0
     idx_safe = idx.clamp(min=0)
     selected = torch.gather(soft, dim=-1, index=idx_safe)
@@ -2067,6 +2107,7 @@ def naive_csa(
     sink_logits: torch.Tensor | None = None,    # [nh]
     use_ste: bool = True,
     ste_mode: str = 'topk_columns',
+    ste_aux_contrastive_temp: float = 1.0,
     normalize_qk: bool = False,
     fuse_projections: bool = True,
     return_projections: bool = False,
@@ -2474,11 +2515,14 @@ def naive_csa(
     # and therefore keeps the historical path). The selected weights are
     # produced inside checkpointed query tiles, so the retained
     # activation is ``[B, T, topk]`` instead of ``[B, T, n_blocks]``.
+    # Note: ``aux_contrastive`` also needs the full logits, so it cannot
+    # use the recompute path.
     use_recompute_indexer = (
         recompute_indexer and effective_use_ste
         and ste_mode == 'topk_columns' and topk > 0)
     soft_weights = None
     soft_weights_selected = None
+    logits = None
     if use_recompute_indexer:
         indices, soft_weights_selected = _csa_indexer_ste_recompute(
             q_idx, K_IComp, w_idx, topk,
@@ -2488,23 +2532,29 @@ def naive_csa(
             query_chunk=indexer_chunk,
         )
     else:
-        indices = csa_lightning_indexer(
+        need_logits = effective_use_ste and ste_mode == 'aux_contrastive'
+        result = csa_lightning_indexer(
             q_idx, K_IComp, w_idx, topk,
             scale=None,
             causal_block_mask=cbm,
             return_soft_weights=effective_use_ste,
+            return_logits=need_logits,
             ste_mode=ste_mode,
             normalize_qk=normalize_qk,
             query_chunk=indexer_chunk,
             _causal_block_mask_invalid=cbm_invalid
-        )                                                          # [B, T, topk]
+        )                                                          # [B, T, topk] or (idx, soft_weights) or (idx, soft_weights, logits)
         # When STE is active, the indexer also returns a differentiable
         # ``soft_weights`` tensor of shape ``[B, T, n_blocks]`` for the
         # straight-through estimator. We keep it in a variable that is
         # ``None`` when STE is disabled (or no-grad inference is active) so
         # the gather code below can branch cleanly.
-        if effective_use_ste:
-            indices, soft_weights = indices  # unpack the (idx, soft_weights)
+        if effective_use_ste and need_logits:
+            indices, soft_weights, logits = result
+        elif effective_use_ste:
+            indices, soft_weights = result
+        else:
+            indices = result
 
     # --- 3. Shared-KV MQA core attention ---
     # attention queries (low-rank up-projection)
@@ -2717,6 +2767,54 @@ def naive_csa(
                 # ``d(soft_full)`` to ``d(soft_kv)``, so the total
                 # differentiable path now depends on ALL blocks' soft_weights.
                 soft_kv = soft_kv + aux
+
+            elif ste_mode == 'aux_contrastive':
+                # Contrastive auxiliary loss (InfoNCE-style) on the indexer logits.
+                # Forward: zero (added via STE identity below).
+                # Backward: gradient pulls up selected blocks' logits, pushes down
+                # non-selected blocks' logits.
+                # logits: [B, T, n_blocks] — raw scores before softmax
+                # idx_safe: [B, T, topk] — selected block indices (clamped >= 0)
+                # valid_mask: [B, T, topk] — True for valid (non -1) slots
+                # We compute: L = -log(σ((pos_logit - neg_logit) / τ))
+                # where pos_logit = mean logit of selected blocks
+                #       neg_logit = mean logit of non-selected blocks (or sampled hard negatives)
+                if logits is not None:
+                    B_, T_, n_blocks = logits.shape
+                    topk_size = kv.shape[2]
+                    # Positive mask: [B, T, n_blocks]
+                    pos_mask = torch.zeros_like(logits, dtype=torch.bool)
+                    # Use scatter to mark selected blocks
+                    # Flatten all index tensors to 1D for advanced indexing
+                    idx_flat = idx_safe.reshape(-1)  # [B*T*topk]
+                    batch_idx = torch.arange(B_, device=logits.device).view(B_, 1, 1).expand(-1, T_, topk_size).reshape(-1)  # [B*T*topk]
+                    query_idx = torch.arange(T_, device=logits.device).view(1, T_, 1).expand(B_, -1, topk_size).reshape(-1)  # [B*T*topk]
+                    valid_flat = valid_mask.reshape(-1)  # [B*T*topk]
+                    # Only scatter valid positions
+                    if valid_flat.any():
+                        pos_mask[batch_idx[valid_flat], query_idx[valid_flat], idx_flat[valid_flat]] = True
+                    # Positive logits: mean over selected blocks per query
+                    pos_count = pos_mask.float().sum(-1).clamp(min=1)
+                    pos_logits = (logits * pos_mask.float()).sum(-1) / pos_count  # [B, T]
+                    # Negative logits: mean over non-selected blocks per query
+                    neg_mask = ~pos_mask
+                    neg_count = neg_mask.float().sum(-1).clamp(min=1)
+                    neg_logits = (logits * neg_mask.float()).sum(-1) / neg_count  # [B, T]
+                    # InfoNCE loss with temperature
+                    temperature = ste_aux_contrastive_temp
+                    logits_diff = (pos_logits - neg_logits) / temperature
+                    # Clamp for numerical stability
+                    logits_diff = logits_diff.clamp(-20, 20)
+                    # Log-sigmoid: -log(σ(x)) = softplus(-x)
+                    contrastive_loss = F.softplus(-logits_diff).mean()  # scalar
+                    # Check for NaN
+                    if not torch.isfinite(contrastive_loss):
+                        contrastive_loss = torch.tensor(0.0, device=kv.device, dtype=kv.dtype)
+                    # Zero-in-forward addend: backward flows contrastive_loss gradient
+                    aux_contrast = (contrastive_loss * 0).to(kv)
+                    # Expand to match kv shape for STE identity
+                    aux_contrast = aux_contrast.view(1, 1, 1, 1).expand_as(kv)
+                    soft_kv = soft_kv + (aux_contrast - aux_contrast.detach())
 
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
             #

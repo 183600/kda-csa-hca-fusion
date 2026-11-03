@@ -109,6 +109,9 @@ def main():
     # P0-2 regression: ste_mode='full_softmax' must be a distinct branch
     # (not silently aliased to 'topk_columns').
     all_results += _run_safe(test_csa_indexer_ste_full_softmax, device)
+    # New: ste_mode='aux_contrastive' must be a distinct branch with
+    # contrastive auxiliary loss on selection logits.
+    all_results += _run_safe(test_csa_indexer_ste_aux_contrastive, device)
     # Memory-efficient CSA indexer STE: checkpointed per-tile recomputation
     # must preserve the forward/gradient contract while dropping the retained
     # [B, T, n_blocks] soft distribution.

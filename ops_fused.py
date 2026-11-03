@@ -228,10 +228,19 @@ class HybridConfig:
     # checkpointing and retains only the gathered ``[B, T, topk]``
     # selected weights; forward values and gradients match the historical
     # path up to fp reduction order. Applies to the default
-    # ``ste_mode='topk_columns'`` only (``full_softmax`` needs the full
-    # distribution). With ``csa_indexer_chunk=0`` the tile is auto-sized
+    # ``ste_mode='topk_columns'`` only (``full_softmax`` and
+    # ``aux_contrastive`` need the full distribution). With
+    # ``csa_indexer_chunk=0`` the tile is auto-sized
     # from ``ops_csa._CSA_INDEXER_STE_TILE_ELEMS``.
     csa_recompute_indexer: bool = False
+    # CSA indexer STE mode. Controls the backward-path behaviour of the
+    # straight-through estimator:
+    #   'topk_columns' (default): gradient only on selected blocks
+    #   'full_softmax': gradient on all blocks via full softmax
+    #   'aux_contrastive': contrastive auxiliary loss on selection logits
+    csa_ste_mode: str = 'topk_columns'
+    # Temperature for aux_contrastive loss (InfoNCE)
+    csa_aux_contrastive_temp: float = 1.0
     # HCA config
     hca_m2: int = 64            # heavy compression (>> csa_m)
     hca_nh: int = 4
@@ -404,6 +413,20 @@ class HybridConfig:
                 f"dropout in KDAHybridLayer / CSAHybridLayer / HCAHybridLayer "
                 f"before enabling it."
             )
+        # Validate CSA STE mode
+        valid_ste_modes = ('topk_columns', 'full_softmax', 'aux_contrastive')
+        if self.csa_ste_mode not in valid_ste_modes:
+            raise ValueError(
+                f"HybridConfig.csa_ste_mode={self.csa_ste_mode!r} must be one of {valid_ste_modes}.")
+        # Validate aux_contrastive temperature
+        try:
+            temp = float(self.csa_aux_contrastive_temp)
+        except (OverflowError, ValueError, TypeError):
+            raise ValueError(
+                f"HybridConfig.csa_aux_contrastive_temp={self.csa_aux_contrastive_temp!r} must be a finite float.")
+        if not math.isfinite(temp) or temp <= 0:
+            raise ValueError(
+                f"HybridConfig.csa_aux_contrastive_temp={self.csa_aux_contrastive_temp} must be positive and finite.")
         # KDA backend selection is deliberately validated at config creation,
         # while the optional FLA import remains lazy until a forward pass. This
         # keeps the default reference experiments dependency-free and makes a
@@ -1313,6 +1336,8 @@ class CSAHybridLayer(nn.Module):
             rope_base=cfg.rope_base,
             qk_norm_mode=cfg.csa_qk_norm_mode,
             use_ste=self.use_ste,
+            ste_mode=cfg.csa_ste_mode,
+            ste_aux_contrastive_temp=cfg.csa_aux_contrastive_temp,
             # Match the cosine-style CSA indexer contract: rankings should be
             # driven by direction, not by arbitrary q_idx / K_idx magnitudes.
             normalize_qk=True,
