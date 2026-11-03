@@ -1809,7 +1809,8 @@ def interaction_planning(*, sesoi, sd, seeds, alpha=DEFAULT_ALPHA,
 
 def planning_report(plan, *, seeds=None, family_size=None, sd=None,
                     alpha=None, alternative=None, sesoi=None,
-                    target_power=None, interaction_sd=None) -> dict:
+                    target_power=None, interaction_sd=None,
+                    what_if_scenarios=None) -> dict:
     """Compute the prospective seed budget and the power it delivers.
 
     All overrides are for "what if" planning and are validated; the
@@ -1826,6 +1827,13 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
 
     The returned record is JSON-safe and includes the arithmetic inputs so a
     reader can audit the sample-size decision without importing this module.
+
+    If ``what_if_scenarios`` is provided, it must be a list of dicts, each
+    mapping override keys (``seeds``, ``family_size``, ``sd``, ``alpha``,
+    ``alternative``, ``sesoi``, ``target_power``) to new values.  For each
+    scenario a mini-report is generated and appended under
+    ``what_if_results``; the first scenario that matches the current plan
+    (no overrides) is also included as ``baseline`` for reference.
     """
     plan = get_plan(plan) if isinstance(plan, str) else plan
     if not isinstance(plan, dict):
@@ -1993,6 +2001,230 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
             source=interaction_cfg.get('source'),
             note=interaction_cfg.get('note'),
         )
+    what_if_results = []
+    if what_if_scenarios is not None:
+        for scenario in what_if_scenarios:
+            try:
+                rep = planning_report(
+                    plan,
+                    seeds=scenario.get('seeds'),
+                    family_size=scenario.get('family_size'),
+                    sd=scenario.get('sd'),
+                    alpha=scenario.get('alpha'),
+                    alternative=scenario.get('alternative'),
+                    sesoi=scenario.get('sesoi'),
+                    target_power=scenario.get('target_power'),
+                )
+                what_if_results.append({
+                    'scenario': scenario,
+                    'report': rep,
+                })
+            except DesignError as exc:
+                what_if_results.append({
+                    'scenario': scenario,
+                    'error': str(exc),
+                })
+
+    # Include the baseline (no overrides) as the first entry for reference
+    if not what_if_results:
+        # Avoid recursion: call the core planning logic directly without
+        # the what_if_scenarios parameter by using a thin wrapper.
+        baseline = _planning_report_baseline(plan)
+        what_if_results.insert(0, {
+            'scenario': {'note': 'baseline (no overrides)'},
+            'report': baseline,
+        })
+
+    return {
+        'sesoi': sesoi_value,
+        'assumed_sd': sd_value,
+        'standardized_effect_dz': dz,
+        'alpha_family_wise': alpha,
+        'family_size': family,
+        'alpha_per_test': alpha_test,
+        'alternative': alt,
+        'target_power': target,
+        'seeds': int(n_seeds),
+        'required_seeds': required,
+        'planned_mde': mde,
+        'planned_power': achieved,
+        'power_gap': (None if achieved is None else target - achieved),
+        'status': status,
+        'exact_test_resolution': exact_resolution,
+        'exact_test_warning': exact_warning,
+        'equivalence': equivalence,
+        'equivalence_status': (
+            None if equivalence is None else equivalence['status']),
+        'equivalence_claim_allowed': (
+            None if equivalence is None
+            else equivalence['supports_equivalence_at_planned_n']),
+        'interaction': interaction,
+        'interaction_status': (
+            None if interaction is None else interaction['status']),
+        'interaction_claim_allowed': (
+            None if interaction is None
+            else interaction['supports_interaction_at_planned_n']),
+        'method': ('normal approximation for planning only: '
+                   'n = ceil(((z_crit + z_power) / (SESOI / SD))^2); '
+                   'inference uses the exact/t tests in multi_seed_stats'),
+        'note': ('A plan is confirmatory-ready only when the seed count '
+                 'reaches required_seeds at the corrected per-test alpha; '
+                 'the normal approximation is slightly optimistic at small '
+                 'n, so treat the target power as a floor to beat, not a '
+                 'promise. Equivalence is a separate endpoint: see the '
+                 'nested equivalence record, whose required n is usually '
+                 'larger. A 2x2 interaction is a four-cell contrast with a '
+                 'larger SD than the main-effect paired difference: see the '
+                 'nested interaction record, whose required n is usually '
+                 'larger still. exact_test_resolution is an independent '
+                 'feasibility check on the discrete exact test: when '
+                 'family_testable is False no p-value from that family '
+                 'could have crossed alpha, whatever the observed effect.'),
+'what_if_results': what_if_results,
+
+    }
+
+
+def _planning_report_baseline(plan) -> dict:
+    """Run planning_report without the what_if_scenarios parameter.
+
+    This avoids recursion when the baseline is computed inside the
+    what-if logic: we manually invoke the core planning arithmetic
+    instead of calling planning_report(plan) again.
+    """
+    from experiment_design import (
+        get_plan, _need_number, _is_int, _is_nonempty_str,
+        _ratio_by_count, DEFAULT_ALPHA, DEFAULT_TARGET_POWER,
+        DEFAULT_ASSUMED_SD, plan_sha256,
+    )
+    plan = get_plan(plan) if isinstance(plan, str) else plan
+    if not isinstance(plan, dict):
+        raise DesignError('plan must be a plan id or a dict')
+    alpha = _need_number(
+        plan.get('alpha', DEFAULT_ALPHA), 'alpha')
+    if not (0.0 < alpha < 1.0):
+        raise DesignError(f'alpha must be in (0,1), got {alpha!r}')
+    family = plan.get('planned_family_size', 1)
+    if not _is_int(family) or family < 1:
+        raise DesignError(f'family_size must be an int >= 1, got {family!r}')
+    alt = plan.get('alternative', 'two-sided')
+    if alt not in ('two-sided', 'greater', 'less'):
+        raise DesignError(f'invalid alternative {alt!r}')
+    sesoi_value = _need_number(
+        plan.get('sesoi', 0.10), 'sesoi', positive=True)
+    sd_value = _need_number(
+        plan.get('assumed_sd', DEFAULT_ASSUMED_SD), 'sd', positive=True)
+    target = _need_number(
+        plan.get('target_power', DEFAULT_TARGET_POWER),
+        'target_power', positive=True)
+    if not (0.0 < target < 1.0):
+        raise DesignError(f'target_power must be in (0,1), got {target!r}')
+    n_seeds = plan.get('planned_seeds', 2)
+    if not _is_int(n_seeds) or n_seeds < 0:
+        raise DesignError(f'seeds must be a non-negative int, got {n_seeds!r}')
+    alpha_test = _ratio_by_count(
+        alpha, family if alt in ('greater', 'less') else 2 * family)
+    planning_alpha = (alpha_test if alt in ('greater', 'less')
+                      else 2.0 * alpha_test)
+    dz = sesoi_value / sd_value
+    required = None
+    mde = None
+    achieved = None
+    if planning_alpha > 0.0:
+        from multi_seed_stats import seeds_required, min_detectable_effect, power_at_effect
+        required = seeds_required(dz, alpha=planning_alpha, power=target,
+                                  alternative=alt)
+        if required is not None:
+            required = max(2, int(required))
+        mde = min_detectable_effect(n_seeds, sd_value,
+                                    alpha=planning_alpha,
+                                    power=target, alternative=alt)
+        planning_effect = (-sesoi_value if alt == 'less' else sesoi_value)
+        achieved = power_at_effect(n_seeds, sd_value, planning_effect,
+                                  alpha=planning_alpha, alternative=alt)
+    if required is None:
+        status = 'not_estimable'
+    elif achieved is not None and achieved >= target - 1e-9:
+        status = 'confirmatory_ready'
+    else:
+        status = 'underpowered_at_sesoi'
+    exact_resolution = exact_test_resolution(
+        n_seeds, alpha=alpha, family_size=family, alternative=alt)
+    exact_warning = None
+    if not exact_resolution['family_testable']:
+        exact_warning = (
+            f'the exact sign-flip test has no rejection region at '
+            f'n={n_seeds} and family_size={family}: the smallest '
+            f'attainable Holm-adjusted p is '
+            f"{exact_resolution['min_attainable_p_holm']:.6g} > "
+            f'alpha={alpha:g}. The normal-approximation power number is '
+            f'therefore unattainable; this is a screening design, not a '
+            f'confirmatory one. It needs '
+            f"{exact_resolution['min_effective_pairs_holm']} effective "
+            f'seed pairs (shortfall '
+            f"{exact_resolution['shortfall_pairs_holm']}).")
+    equivalence = None
+    equiv_cfg = plan.get('equivalence')
+    if equiv_cfg is not None:
+        from collections.abc import Mapping
+        if not isinstance(equiv_cfg, Mapping):
+            raise DesignError(
+                'plan.equivalence must be a mapping of margin/family_size/'
+                f'alpha, got {type(equiv_cfg).__name__}')
+        required_flag = equiv_cfg.get('required_for_claim', False)
+        if not isinstance(required_flag, bool):
+            raise DesignError(
+                'plan.equivalence.required_for_claim must be a bool, got '
+                f'{required_flag!r}')
+        from experiment_design import equivalence_plan
+        equivalence = equivalence_plan(
+            margin=equiv_cfg.get('margin'),
+            sd=sd_value,
+            seeds=n_seeds,
+            alpha=(alpha if equiv_cfg.get('alpha') is None
+                   else equiv_cfg['alpha']),
+            family_size=(family if equiv_cfg.get('family_size') is None
+                         else equiv_cfg['family_size']),
+            target_power=(target if equiv_cfg.get('target_power') is None
+                         else equiv_cfg['target_power']),
+            required_for_claim=required_flag,
+            source=equiv_cfg.get('source'),
+            note=equiv_cfg.get('note'),
+        )
+    interaction = None
+    interaction_cfg = plan.get('interaction')
+    if interaction_cfg is not None:
+        from collections.abc import Mapping
+        if not isinstance(interaction_cfg, Mapping):
+            raise DesignError(
+                'plan.interaction must be a mapping of sesoi/alternative/'
+                f'family_size/sd_inflation, got '
+                f'{type(interaction_cfg).__name__}')
+        interaction_flag = interaction_cfg.get('required_for_claim', False)
+        if not isinstance(interaction_flag, bool):
+            raise DesignError(
+                'plan.interaction.required_for_claim must be a bool, got '
+                f'{interaction_flag!r}')
+        from experiment_design import interaction_planning
+        interaction = interaction_planning(
+            sesoi=interaction_cfg.get('sesoi', sesoi_value),
+            sd=sd_value,
+            seeds=n_seeds,
+            alpha=(alpha if interaction_cfg.get('alpha') is None
+                   else interaction_cfg['alpha']),
+            family_size=(family if interaction_cfg.get('family_size') is None
+                         else interaction_cfg['family_size']),
+            alternative=interaction_cfg.get('alternative', 'two-sided'),
+            target_power=(target if interaction_cfg.get('target_power') is None
+                         else interaction_cfg['target_power']),
+            sd_inflation=interaction_cfg.get(
+                'sd_inflation', None),  # sqrt(2) model by default
+            sd_interaction=None,
+            required_for_claim=interaction_flag,
+            estimand=interaction_cfg.get('estimand'),
+            source=interaction_cfg.get('source'),
+            note=interaction_cfg.get('note'),
+        )
     return {
         'sesoi': sesoi_value,
         'assumed_sd': sd_value,
@@ -2044,7 +2276,6 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
 # ---------------------------------------------------------------------------
 # Execution order: randomization is part of the design
 # ---------------------------------------------------------------------------
-
 def _canonical_json(value, *, name='value') -> str:
     """Canonical strict-JSON encoding used by schedule fingerprints."""
     try:
