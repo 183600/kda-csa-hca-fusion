@@ -137,6 +137,7 @@ from multi_seed_stats import (
     _safe_mean, _sample_sd,
 )
 from experiment_design import (audit_run as audit_experiment_design,
+                               balanced_execution_schedule,
                                common_analyzed_seeds, seed_block_role,
                                seed_ids)
 
@@ -889,66 +890,93 @@ def eval_layout(ratio, d_model=32, seq_len=SEQ_LEN, n_kv=1, steps=100, lr=3e-3, 
     }
 
 
-def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
+def eval_layout_one_seed(ratio, seed, steps=100, device='cpu', **kw):
+    """Train + evaluate ONE ratio layout at ONE seed.
+
+    This is the single-seed unit of :func:`eval_layout_multi_seed` and of
+    the seed-blocked ratio sweep in :func:`main`: a seed-blocked execution
+    schedule trains every (ratio, n_kv) cell of one seed before moving to
+    the next seed, so the runner needs a per-cell, per-seed entry point
+    that records a per-seed failure as a stub instead of raising.
+    """
     if isinstance(device, str):
         device = torch.device(device)
-    seeds = seed_ids(n_seeds, plan_id='exp5_ratio')
     stub_train_batch = kw.get('train_batch')
     if stub_train_batch is None:
         stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
                                          logger=logger)
-    per_seed = []
-    for s in seeds:
-        t0 = time.time()
-        try:
-            r = eval_layout(ratio, seed=s, steps=steps, device=device, **kw)
-            r['train_time_s'] = time.time() - t0
-            logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
-                        f"fwd={r['fwd_ms']:.2f}ms  time={r['train_time_s']:.1f}s")
-            per_seed.append(r)
-        except Exception as e:
-            logger.warning(f"    seed {s} FAILED: {e}")
-            ratio_str = f'{ratio[0]}:{ratio[1]}:{ratio[2]}' if isinstance(ratio, tuple) else str(ratio)
-            per_seed.append({
-                'ratio': ratio_str,
-                'n_kv': kw.get('n_kv', 1),
-                'layout': None,
-                'final_acc': None,
-                'final_loss': None,
-                'fwd_ms': None,
-                'n_params': None,
-                'n_layers': None,
-                'seed': s,
-                'steps': steps,
-                'train_batch': stub_train_batch,
-                'last_train_loss': None,
-                'mean_last10_loss': None,
-                'loss_curve': [],
-                'acc_curve': [],
-                'gradient_norms': None,
-                # Same keys as a live row, so a consumer can read every
-                # per_seed entry with one code path (mirrors run_quality's
-                # failed-seed stub).
-                'val_every': (int(kw.get('val_every', 0) or 0)
-                              or max(1, steps // 4)),
-                'val_history': [],
-                'curve_diagnosis': None,
-                'generalization_gap': None,
-                'best_val': None,
-                'val_loss_first': None,
-                'val_loss_last': None,
-                'val_acc_first': None,
-                'val_acc_last': None,
-                'val_acc_peak': None,
-                'error_analysis': None,
-                'error_analysis_seed_offset': ERROR_ANALYSIS_SEED_OFFSET,
-                'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
-                'train_time_s': time.time() - t0,
-                'error': str(e),
-            })
+    t0 = time.time()
+    try:
+        r = eval_layout(ratio, seed=seed, steps=steps, device=device, **kw)
+        r['train_time_s'] = time.time() - t0
+        logger.info(f"    seed {seed}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
+                    f"fwd={r['fwd_ms']:.2f}ms  time={r['train_time_s']:.1f}s")
+        return r
+    except Exception as e:
+        logger.warning(f"    seed {seed} FAILED: {e}")
+        ratio_str = f'{ratio[0]}:{ratio[1]}:{ratio[2]}' if isinstance(ratio, tuple) else str(ratio)
+        return {
+            'ratio': ratio_str,
+            'n_kv': kw.get('n_kv', 1),
+            'layout': None,
+            'final_acc': None,
+            'final_loss': None,
+            'fwd_ms': None,
+            'n_params': None,
+            'n_layers': None,
+            'seed': seed,
+            'steps': steps,
+            'train_batch': stub_train_batch,
+            'last_train_loss': None,
+            'mean_last10_loss': None,
+            'loss_curve': [],
+            'acc_curve': [],
+            'gradient_norms': None,
+            # Same keys as a live row, so a consumer can read every
+            # per_seed entry with one code path (mirrors run_quality's
+            # failed-seed stub).
+            'val_every': (int(kw.get('val_every', 0) or 0)
+                          or max(1, steps // 4)),
+            'val_history': [],
+            'curve_diagnosis': None,
+            'generalization_gap': None,
+            'best_val': None,
+            'val_loss_first': None,
+            'val_loss_last': None,
+            'val_acc_first': None,
+            'val_acc_last': None,
+            'val_acc_peak': None,
+            'error_analysis': None,
+            'error_analysis_seed_offset': ERROR_ANALYSIS_SEED_OFFSET,
+            'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
+            'train_time_s': time.time() - t0,
+            'error': str(e),
+        }
+    finally:
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
+
+def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
+    if isinstance(device, str):
+        device = torch.device(device)
+    seeds = seed_ids(n_seeds, plan_id='exp5_ratio')
+    per_seed = [
+        eval_layout_one_seed(ratio, s, steps=steps, device=device, **kw)
+        for s in seeds
+    ]
+    return summarize_layout_results(ratio, per_seed, seeds)
+
+
+def summarize_layout_results(ratio, per_seed, seeds):
+    """Aggregate per-seed ratio rows into the multi-seed summary row.
+
+    ``per_seed`` holds success rows and/or error stubs as produced by
+    :func:`eval_layout_one_seed`; ``seeds`` is the REQUESTED seed id list,
+    recorded verbatim in the summary. Raises ``RuntimeError`` when no seed
+    survived. The seed-blocked ratio sweep calls this once per
+    (ratio, n_kv) cell after the whole seed-block schedule has finished.
+    """
     ok_per_seed = [
         r for r in per_seed
         if 'error' not in r
@@ -958,7 +986,8 @@ def eval_layout_multi_seed(ratio, n_seeds=5, steps=100, device='cpu', **kw):
         and math.isfinite(r['final_loss'])
     ]
     if not ok_per_seed:
-        raise RuntimeError(f"all {n_seeds} seeds failed for ratio {ratio}; "
+        raise RuntimeError(f"all {len(per_seed)} seeds failed for ratio "
+                           f"{ratio}; "
                            f"first error: {per_seed[0].get('error')}")
 
     accs = [r['final_acc'] for r in ok_per_seed]
@@ -1694,6 +1723,71 @@ def eval_group(group_id, memory_type, layout, d_model=32, seq_len=SEQ_LEN,
     }
 
 
+def eval_group_one_seed(group_spec, seed, steps=100, device='cpu', **kw):
+    """Train + evaluate ONE matrix group at ONE seed.
+
+    This is the single-seed unit of :func:`eval_group_multi_seed` and of
+    the seed-blocked matrix sweep in :func:`_run_matrix_mode`; the stub
+    semantics mirror :func:`eval_layout_one_seed`.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    if len(group_spec) == 5:
+        group_id, memory_type, layout, description, cfg_overrides = group_spec
+    else:
+        group_id, memory_type, layout, description = group_spec
+        cfg_overrides = None
+    stub_train_batch = kw.get('train_batch')
+    if stub_train_batch is None:
+        stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
+                                         logger=logger)
+    t0 = time.time()
+    try:
+        r = eval_group(group_id, memory_type, layout, seed=seed, steps=steps,
+                       device=device, cfg_overrides=cfg_overrides,
+                       description=description, **kw)
+        r['train_time_s'] = time.time() - t0
+        logger.info(f"    seed {seed}: acc={r['final_acc']:.4f}  "
+                    f"loss={r['final_loss']:.4f}  fwd={r['fwd_ms']:.2f}ms"
+                    f"  time={r['train_time_s']:.1f}s")
+        return r
+    except Exception as e:
+        logger.warning(f"    seed {seed} FAILED: {e}")
+        return {
+            'group': group_id, 'memory': memory_type,
+            'description': description,
+            'n_kv': kw.get('n_kv', 1), 'layout': None,
+            'final_acc': None, 'final_loss': None, 'fwd_ms': None,
+            'n_params': None, 'n_layers': None,
+            'seed': seed, 'steps': steps,
+            'lr': kw.get('lr', 3e-3),
+            'train_batch': stub_train_batch,
+            'last_train_loss': None, 'mean_last10_loss': None,
+            'loss_curve': [],
+            'acc_curve': [],
+            'gradient_norms': None,
+            'val_every': (int(kw.get('val_every', 0) or 0)
+                          or max(1, steps // 4)),
+            'val_history': [],
+            'curve_diagnosis': None,
+            'generalization_gap': None,
+            'best_val': None,
+            'val_loss_first': None,
+            'val_loss_last': None,
+            'val_acc_first': None,
+            'val_acc_last': None,
+            'val_acc_peak': None,
+            'error_analysis': None,
+            'error_analysis_seed_offset': ERROR_ANALYSIS_SEED_OFFSET,
+            'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
+            'train_time_s': time.time() - t0,
+            'error': str(e),
+        }
+    finally:
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+
 def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
                           **kw):
     """Multi-seed wrapper for a matrix group (mirrors eval_layout_multi_seed).
@@ -1704,63 +1798,28 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     """
     if isinstance(device, str):
         device = torch.device(device)
+    seeds = seed_ids(n_seeds, plan_id='exp5b_matrix')
+    per_seed = [
+        eval_group_one_seed(group_spec, s, steps=steps, device=device, **kw)
+        for s in seeds
+    ]
+    return summarize_group_results(group_spec, per_seed, seeds)
+
+
+def summarize_group_results(group_spec, per_seed, seeds):
+    """Aggregate per-seed matrix-group rows into the multi-seed summary row.
+
+    ``per_seed`` holds success rows and/or error stubs as produced by
+    :func:`eval_group_one_seed`; ``seeds`` is the REQUESTED seed id list.
+    Raises ``RuntimeError`` when no seed survived. The seed-blocked matrix
+    sweep calls this once per (group, n_kv) cell after the whole
+    seed-block schedule has finished.
+    """
     if len(group_spec) == 5:
         group_id, memory_type, layout, description, cfg_overrides = group_spec
     else:
         group_id, memory_type, layout, description = group_spec
         cfg_overrides = None
-    seeds = seed_ids(n_seeds, plan_id='exp5b_matrix')
-    stub_train_batch = kw.get('train_batch')
-    if stub_train_batch is None:
-        stub_train_batch = parse_int_env('ABL_TRAIN_BATCH', 16, min_value=1,
-                                         logger=logger)
-    per_seed = []
-    for s in seeds:
-        t0 = time.time()
-        try:
-            r = eval_group(group_id, memory_type, layout, seed=s, steps=steps,
-                           device=device, cfg_overrides=cfg_overrides,
-                           description=description, **kw)
-            r['train_time_s'] = time.time() - t0
-            logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  "
-                        f"loss={r['final_loss']:.4f}  fwd={r['fwd_ms']:.2f}ms"
-                        f"  time={r['train_time_s']:.1f}s")
-            per_seed.append(r)
-        except Exception as e:
-            logger.warning(f"    seed {s} FAILED: {e}")
-            per_seed.append({
-                'group': group_id, 'memory': memory_type,
-                'description': description,
-                'n_kv': kw.get('n_kv', 1), 'layout': None,
-                'final_acc': None, 'final_loss': None, 'fwd_ms': None,
-                'n_params': None, 'n_layers': None,
-                'seed': s, 'steps': steps,
-                'lr': kw.get('lr', 3e-3),
-                'train_batch': stub_train_batch,
-                'last_train_loss': None, 'mean_last10_loss': None,
-                'loss_curve': [],
-                'acc_curve': [],
-                'gradient_norms': None,
-                'val_every': (int(kw.get('val_every', 0) or 0)
-                              or max(1, steps // 4)),
-                'val_history': [],
-                'curve_diagnosis': None,
-                'generalization_gap': None,
-                'best_val': None,
-                'val_loss_first': None,
-                'val_loss_last': None,
-                'val_acc_first': None,
-                'val_acc_last': None,
-                'val_acc_peak': None,
-                'error_analysis': None,
-                'error_analysis_seed_offset': ERROR_ANALYSIS_SEED_OFFSET,
-                'val_monitor_seed_offset': VAL_MONITOR_SEED_OFFSET,
-                'train_time_s': time.time() - t0,
-                'error': str(e),
-            })
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
     ok_per_seed = [
         r for r in per_seed
         if 'error' not in r
@@ -1771,7 +1830,7 @@ def eval_group_multi_seed(group_spec, n_seeds=5, steps=100, device='cpu',
     ]
     if not ok_per_seed:
         raise RuntimeError(
-            f"all {n_seeds} seeds failed for group {group_id}; "
+            f"all {len(per_seed)} seeds failed for group {group_id}; "
             f"first error: {per_seed[0].get('error')}")
 
     accs = [r['final_acc'] for r in ok_per_seed]
@@ -4048,6 +4107,75 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
                 f'(scipy={bonferroni_available}; fallback=exact-beta-bisection)')
 
+    # Execution order is part of the design (docs/experiment-design.md):
+    # the matrix runs the pre-registered BALANCED schedule for Exp 5b —
+    # every seed is one block that trains every (memory, layout_unit,
+    # n_kv) cell exactly once, with the cell order rotated across blocks,
+    # so treatment is never aliased with time / allocator state /
+    # device-frequency drift. The observed sequence is recorded and
+    # audited against the schedule fingerprint after the run.
+    def _matrix_layout_unit(spec):
+        # The layout unit is the group id without the '<MEM>-' prefix
+        # ('KDA-A' -> 'A', 'RWKV7-D-m4-m2_8' -> 'D-m4-m2_8',
+        # 'RWKV7-alternating' -> 'alternating'). Simple-baseline groups
+        # ('BASELINE-linear') have no route prefix, so the full group id
+        # is the unit; the (memory, layout_unit) pair stays unique.
+        gid, mem = str(spec[0]), str(spec[1])
+        prefix = f'{mem.upper()}-'
+        return gid[len(prefix):] if gid.upper().startswith(prefix) else gid
+
+    run_levels = {
+        'memory': sorted({str(spec[1]) for spec in groups}),
+        'layout_unit': sorted({_matrix_layout_unit(spec) for spec in groups}),
+        'n_kv': list(n_kv_list),
+    }
+    exp5b_seed_ids = seed_ids(n_seeds, plan_id='exp5b_matrix')
+    schedule = balanced_execution_schedule(
+        'exp5b_matrix', exp5b_seed_ids, levels=run_levels)
+    logger.info(f'\nBalanced execution schedule: {schedule["schedule_id"]} '
+                f'({schedule["n_runs"]} runs in '
+                f'{schedule["n_blocks"]} seed block(s), '
+                f'{schedule["n_cells"]} cell(s) per block)')
+    spec_by_cell = {(str(spec[1]), _matrix_layout_unit(spec)): spec
+                    for spec in groups}
+    per_cell = {(spec[0], n_kv): []
+                for spec in groups for n_kv in n_kv_list}
+    observed_execution = []
+    for block_index, block in enumerate(schedule['blocks']):
+        seed = schedule['seeds'][block_index]
+        logger.info(f'\n{"=" * 70}')
+        logger.info(f'  seed block {block_index + 1}/{schedule["n_blocks"]} '
+                    f'(seed={seed}, {len(block)} cells)')
+        logger.info(f'{"=" * 70}')
+        for cell_index in block:
+            cell = schedule['cells'][cell_index]
+            spec = spec_by_cell[(cell['memory'], cell['layout_unit'])]
+            gid = spec[0]
+            n_kv = cell['n_kv']
+            logger.info(f'\n-- group {gid} (n_kv={n_kv}, seed={seed}) --')
+            try:
+                record = eval_group_one_seed(
+                    spec, seed, steps=steps, device=device,
+                    n_kv=n_kv, d_model=d_model,
+                    lr=baseline_lrs.get(gid, 3e-3),
+                    error_batches=error_batches,
+                    error_batch=error_batch,
+                    max_error_examples=error_examples)
+            except Exception as e:
+                # eval_group_one_seed already converts per-seed failures
+                # into stub rows; this guard only covers failures of the
+                # runner itself so the sweep survives.
+                import traceback as _tb
+                logger.warning(f'    seed {seed} FAILED: {e}')
+                _tb.print_exc()
+                record = {'group': gid, 'memory': spec[1], 'n_kv': n_kv,
+                          'seed': seed, 'error': str(e),
+                          'final_acc': None, 'final_loss': None}
+            per_cell[(gid, n_kv)].append(record)
+            observed_execution.append({
+                'memory': cell['memory'], 'layout_unit': cell['layout_unit'],
+                'n_kv': n_kv, 'seed': seed})
+
     all_results = []
     for n_kv in n_kv_list:
         logger.info(f'\n{"=" * 70}')
@@ -4055,15 +4183,9 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         logger.info(f'{"=" * 70}')
         for spec in groups:
             gid = spec[0]
-            logger.info(f'\n-- group {gid} (n_kv={n_kv}, {n_seeds} seeds) --')
             try:
-                res = eval_group_multi_seed(
-                    spec, n_seeds=n_seeds, steps=steps, device=device,
-                    n_kv=n_kv, d_model=d_model,
-                    lr=baseline_lrs.get(gid, 3e-3),
-                    error_batches=error_batches,
-                    error_batch=error_batch,
-                    max_error_examples=error_examples)
+                res = summarize_group_results(
+                    spec, per_cell[(gid, n_kv)], exp5b_seed_ids)
                 t_stat = res.get('t_stat_vs_chance')
                 n_ok = res.get('n_seeds_ok', 0)
                 if t_stat is not None and n_ok >= 2:
@@ -4268,13 +4390,11 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         all_results, finite_keys=('final_acc', 'final_loss'))
     matrix_experiment_design = audit_experiment_design(
         'exp5b_matrix',
-        seeds=seed_ids(n_seeds, plan_id='exp5b_matrix'),
-        levels={
-            'memory': list(memory_types),
-            'layout_unit': sorted({_unit_of_group(spec[0]) for spec in groups}),
-        },
+        seeds=exp5b_seed_ids,
+        levels=run_levels,
         family_size=max(1, len(contrasts)),
         analyzed_seeds=matrix_analyzed_population,
+        execution_order=observed_execution,
         seed_role=seed_block_role(),
     )
     logger.info(f'Design audit: {matrix_experiment_design["status"]} '
@@ -4289,6 +4409,15 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
             'reported contrasts are complete-case, not the pre-registered '
             'complete block (see metadata.experiment_design.'
             'analysis_population).')
+    _matrix_order = matrix_experiment_design.get('execution_order') or {}
+    logger.info(f'Execution order: {_matrix_order.get("status")} '
+                f'(matches_planned_schedule='
+                f'{_matrix_order.get("matches_planned_schedule")})')
+    if _matrix_order.get('status') == 'order_confounded':
+        logger.warning(
+            'The observed matrix order deviates from the balanced '
+            'schedule; treatment is aliased with execution time and the '
+            'run is labelled order_confounded.')
 
     # Regime of the matrix as a whole (same vocabulary as the ratio sweep):
     # are the rows saturated / underfitting / overfitting, and do the seeds
@@ -4337,6 +4466,26 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         # Machine-readable check that the promised cells actually ran with
         # a common recipe and a common seed set (see _matrix_design_audit).
         'design_audit': design_audit,
+        # The executed order is evidence, not an assumption. The matrix
+        # trains in the pre-registered balanced schedule (one complete
+        # (memory, layout_unit, n_kv) block per seed, cell order rotated
+        # across blocks) instead of a group-major loop, and the observed
+        # sequence is audited against the schedule fingerprint.
+        'execution_schedule': {
+            'schedule_id': schedule['schedule_id'],
+            'schedule_sha256': schedule['schedule_sha256'],
+            'schedule_seed': schedule['schedule_seed'],
+            'n_cells': schedule['n_cells'],
+            'n_blocks': schedule['n_blocks'],
+            'n_runs': schedule['n_runs'],
+            'balance': schedule['balance'],
+            'levels': run_levels,
+            'observed_sha256': _matrix_order.get(
+                'observed_schedule_sha256'),
+            'observed_status': _matrix_order.get('status'),
+            'matches_planned_schedule': _matrix_order.get(
+                'matches_planned_schedule'),
+        },
         # Prospective audit of the same run against the pre-registered
         # Exp 5b plan (seed budget, family size, required n at the SESOI).
         'experiment_design': matrix_experiment_design,
@@ -4556,29 +4705,88 @@ def main():
                 f'Bonferroni-corrected alpha={alpha_corrected:.4f} '
                 f'(scipy={bonferroni_available}; fallback=exact-beta-bisection)')
 
+    # Execution order is part of the design (docs/experiment-design.md):
+    # the sweep runs the pre-registered BALANCED schedule for Exp 5 —
+    # every seed is one block that trains every (ratio/baseline, n_kv)
+    # cell exactly once, with the cell order rotated across blocks, so
+    # treatment is never aliased with time / allocator state /
+    # device-frequency drift. The observed sequence is recorded and
+    # audited against the schedule fingerprint after the run.
+    def _ratio_cell_label(kind, spec):
+        if kind == 'ratio':
+            return f'{spec[0]}:{spec[1]}:{spec[2]}'
+        return spec[0]
+
+    run_levels = {
+        'ratio': [_ratio_cell_label(kind, spec) for kind, spec in cells],
+        'n_kv': list(n_kv_list),
+    }
+    exp5_seed_ids = seed_ids(n_seeds, plan_id='exp5_ratio')
+    schedule = balanced_execution_schedule(
+        'exp5_ratio', exp5_seed_ids, levels=run_levels)
+    logger.info(f'\nBalanced execution schedule: {schedule["schedule_id"]} '
+                f'({schedule["n_runs"]} runs in '
+                f'{schedule["n_blocks"]} seed block(s), '
+                f'{schedule["n_cells"]} cell(s) per block)')
+    cell_by_label = {_ratio_cell_label(kind, spec): (kind, spec)
+                     for kind, spec in cells}
+    per_cell = {(label, n_kv): []
+                for label in run_levels['ratio'] for n_kv in n_kv_list}
+    observed_execution = []
+    for block_index, block in enumerate(schedule['blocks']):
+        seed = schedule['seeds'][block_index]
+        logger.info(f'\n{"=" * 70}')
+        logger.info(f'  seed block {block_index + 1}/{schedule["n_blocks"]} '
+                    f'(seed={seed}, {len(block)} cells)')
+        logger.info(f'{"=" * 70}')
+        for cell_index in block:
+            cell = schedule['cells'][cell_index]
+            label, n_kv = cell['ratio'], cell['n_kv']
+            kind, spec = cell_by_label[label]
+            if kind == 'ratio':
+                label_desc = f'ratio KDA:CSA:HCA = {spec[0]}:{spec[1]}:{spec[2]}'
+            else:
+                label_desc = spec[3]
+            logger.info(f'\n-- {label_desc} (n_kv={n_kv}, seed={seed}) --')
+            try:
+                record = (eval_layout_one_seed if kind == 'ratio'
+                          else eval_group_one_seed)(
+                    spec, seed, steps=steps, device=device,
+                    n_kv=n_kv, error_batches=error_batches,
+                    error_batch=error_batch,
+                    max_error_examples=error_examples)
+            except Exception as e:
+                # The one-seed helpers already convert per-seed failures
+                # into stub rows; this guard only covers failures of the
+                # runner itself so the sweep survives.
+                import traceback as _tb
+                logger.warning(f'    seed {seed} FAILED: {e}')
+                _tb.print_exc()
+                record = {'ratio': label, 'n_kv': n_kv, 'seed': seed,
+                          'error': str(e), 'final_acc': None,
+                          'final_loss': None}
+            per_cell[(label, n_kv)].append(record)
+            observed_execution.append({
+                'ratio': label, 'n_kv': n_kv, 'seed': seed})
+
     all_results = []
     for n_kv in n_kv_list:
         logger.info(f'\n{"=" * 70}')
         logger.info(f'  n_kv = {n_kv}   (harder: {n_kv} KV pairs to disambiguate)')
         logger.info(f'{"=" * 70}')
         for kind, spec in cells:
+            label = _ratio_cell_label(kind, spec)
             if kind == 'ratio':
-                label = f'ratio KDA:CSA:HCA = {spec[0]}:{spec[1]}:{spec[2]}'
-                ratio_str = f'{spec[0]}:{spec[1]}:{spec[2]}'
+                ratio_str = label
             else:
-                group_id, _memory, _layout, desc = spec
-                label = desc
-                ratio_str = group_id
-            logger.info(f'\n-- {label} (n_kv={n_kv}, {n_seeds} seeds) --')
+                ratio_str = spec[0]
             try:
-                kw = dict(n_seeds=n_seeds, steps=steps, device=device,
-                          n_kv=n_kv, error_batches=error_batches,
-                          error_batch=error_batch,
-                          max_error_examples=error_examples)
                 if kind == 'ratio':
-                    res = eval_layout_multi_seed(spec, **kw)
+                    res = summarize_layout_results(
+                        spec, per_cell[(label, n_kv)], exp5_seed_ids)
                 else:
-                    res = eval_group_multi_seed(spec, **kw)
+                    res = summarize_group_results(
+                        spec, per_cell[(label, n_kv)], exp5_seed_ids)
                 res['ratio'] = ratio_str
                 res['is_baseline'] = (kind == 'baseline')
                 t_stat = res.get('t_stat_vs_chance')
@@ -4711,11 +4919,11 @@ def main():
         all_results, finite_keys=('final_acc', 'final_loss'))
     ratio_experiment_design = audit_experiment_design(
         'exp5_ratio',
-        seeds=seed_ids(n_seeds, plan_id='exp5_ratio'),
-        levels={'ratio': sorted({str(r.get('ratio')) for r in all_results
-                                 if r.get('ratio') is not None})},
+        seeds=exp5_seed_ids,
+        levels=run_levels,
         family_size=max(1, len(ratio_contrasts)),
         analyzed_seeds=ratio_analyzed_population,
+        execution_order=observed_execution,
         seed_role=seed_block_role(),
     )
     logger.info(f'Design audit: {ratio_experiment_design["status"]} '
@@ -4729,6 +4937,15 @@ def main():
             'Failed seeds were dropped from the ratio sweep; the reported '
             'contrasts are complete-case, not the pre-registered complete '
             'block (see results/exp5_ablation_provenance.json).')
+    _ratio_order = ratio_experiment_design.get('execution_order') or {}
+    logger.info(f'Execution order: {_ratio_order.get("status")} '
+                f'(matches_planned_schedule='
+                f'{_ratio_order.get("matches_planned_schedule")})')
+    if _ratio_order.get('status') == 'order_confounded':
+        logger.warning(
+            'The observed ratio-sweep order deviates from the balanced '
+            'schedule; treatment is aliased with execution time and the '
+            'run is labelled order_confounded.')
 
     # Regime of the sweep as a whole. Individual rows already carry their
     # own verdict; this is the one-line answer to "can this ranking be
@@ -4855,6 +5072,26 @@ def main():
         # Prospective audit against the pre-registered Exp 5 plan: seed
         # budget, actual contrast family and required n at the SESOI.
         provenance['experiment_design'] = ratio_experiment_design
+        # The executed order is evidence, not an assumption: the sweep
+        # trains in the pre-registered balanced schedule (one complete
+        # (ratio/baseline, n_kv) block per seed, cell order rotated across
+        # blocks) and the observed sequence is audited against the
+        # schedule fingerprint.
+        provenance['execution_schedule'] = {
+            'schedule_id': schedule['schedule_id'],
+            'schedule_sha256': schedule['schedule_sha256'],
+            'schedule_seed': schedule['schedule_seed'],
+            'n_cells': schedule['n_cells'],
+            'n_blocks': schedule['n_blocks'],
+            'n_runs': schedule['n_runs'],
+            'balance': schedule['balance'],
+            'levels': run_levels,
+            'observed_sha256': _ratio_order.get(
+                'observed_schedule_sha256'),
+            'observed_status': _ratio_order.get('status'),
+            'matches_planned_schedule': _ratio_order.get(
+                'matches_planned_schedule'),
+        }
         # Sweep-wide training regime + the accuracy-vs-cost screen, so the
         # artifact records not only which layout won but whether the win
         # survives the curve diagnosis and what it cost.

@@ -640,6 +640,113 @@ def _compact_overfit_report(report):
             if k not in ('loss_curve', 'acc_curve', 'elapsed_s', 'seed_info')}
 
 
+def train_one_seed_record(op_name, seed, steps=100, softmax_steps=None,
+                          device='cpu', **kw):
+    """Run ONE seed of ``op_name`` and return its per-seed record.
+
+    This is the single-seed unit of :func:`train_multi_seed` and of the
+    seed-blocked sweep in ``quality.main``: a seed-blocked execution
+    schedule trains every treatment cell of one seed before moving to the
+    next seed, so the runner needs a per-cell, per-seed entry point that
+    never raises for a per-seed failure.
+
+    Returns the success row from :func:`train_one`, or an error stub with
+    the same schema when the seed diverged / OOMed / failed for any other
+    reason (the stub carries ``'error'`` and ``None`` metrics). The caller
+    decides what to do with a failed seed; this function only records it.
+    """
+    # Coerce string device -> torch.device so callers passing 'cpu'/'cuda'
+    # from a notebook don't hit AttributeError on ``device.type`` below.
+    if isinstance(device, str):
+        device = torch.device(device)
+    # Compute the actual training-step count for THIS op once, mirroring
+    # ``train_one``'s ``actual_steps = softmax_steps if op_name == 'softmax'
+    # else steps`` logic, so the recorded ``steps`` field in the per-seed
+    # error stub matches what a SUCCESS row would have recorded.
+    actual_steps_for_op = softmax_steps if op_name == 'softmax' else steps
+    stub_train_batch = kw.get('train_batch')
+    if stub_train_batch is None:
+        stub_train_batch = parse_int_env('MQAR_TRAIN_BATCH', 32, min_value=1,
+                                         logger=logger)
+    t0 = time.time()
+    try:
+        r = _public_api('train_one', train_one)(
+            op_name, seed=seed, steps=steps, device=device,
+                      softmax_steps=softmax_steps, **kw)
+        r['train_time_s'] = time.time() - t0
+        # Log BEFORE the caller appends the record anywhere, so a failure
+        # inside ``logger.info`` cannot record the seed as a success first
+        # and then append a duplicate error stub for the same seed.
+        logger.info(f"    seed {seed}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
+                    f"steps={r['steps']}  time={r['train_time_s']:.1f}s")
+        return r
+    except Exception as e:
+        logger.warning(f"    seed {seed} FAILED: {e}")
+        # Per-seed error stub: include ALL success-row fields (set to
+        # None / 0 where not applicable) so downstream consumers using
+        # ``pd.DataFrame(per_seed)`` or ``per_seed[0].get('steps', ...)``
+        # see a consistent schema. ``pd.DataFrame(per_seed)`` uses the
+        # first record's keys as columns, and
+        # ``make_figures._plot_mqar_group`` reads
+        # ``per_seed[0].get('steps', 100)`` for the figure title.
+        return {
+            'op': op_name,
+            'task': kw.get('task', 'mqar'),
+            'n_kv': kw.get('n_kv', 1),
+            'n_params': None,
+            'final_acc': None,
+            'final_loss': None,
+            'chance_acc': 1.0 / kw.get('vocab', 16) if 'vocab' in kw else None,
+            'last_train_acc': None,
+            'mean_last10_loss': None,
+            'mean_last10_acc': None,
+            # Use the OP-SPECIFIC step count (softmax_steps for softmax,
+            # steps for others) so the stub matches what a success row
+            # would record, even when
+            # MQAR_SOFTMAX_STEPS != MQAR_STEPS.
+            'steps': actual_steps_for_op,
+            'seed': seed,
+            'train_batch': stub_train_batch,
+            'train_time_s': time.time() - t0,
+            'error': str(e),
+            # Mirror the success-row training-curve keys (empty) so the
+            # per_seed schema is uniform across success/error records.
+            'lr': kw.get('lr', 3e-3),
+            'loss_curve': [],
+            'acc_curve': [],
+            # Mirror the results-analysis keys so a DataFrame over
+            # per_seed has one schema for success and error rows.
+            'val_history': [],
+            'curve_diagnosis': None,
+            'error_analysis': None,
+            'final_eval_time_s': None,
+            'final_eval_ms_per_sample': None,
+            'generalization_gap': None,
+            'best_val': None,
+            'val_loss_regret_from_best': None,
+            'val_acc_regret_from_best': None,
+            'steps_since_best': None,
+            'best_val_is_final': None,
+            'early_stopping_summary': None,
+            'accuracy_regime': None,
+            'val_acc_first': None,
+            'val_acc_last': None,
+            'val_acc_peak': None,
+            'gradient_norms': None,
+            'final_metrics': None,
+            'final_f1_macro': None,
+            'final_f1_weighted': None,
+            'final_balanced_accuracy': None,
+            'final_pr_auc_macro_ovr': None,
+            'final_roc_auc_macro_ovr': None,
+        }
+    finally:
+        # On GPU, clear the CUDA cache between seeds so the allocator does
+        # not accumulate freed-but-unreleased blocks across seeds.
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+
 def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
                      device='cpu', **kw):
     """Train ``op_name`` over ``n_seeds`` seeds.
@@ -657,103 +764,37 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
 
     ``device`` may be passed as a string or a ``torch.device``; string
     inputs are coerced for notebook callers.
+
+    The per-seed unit is :func:`train_one_seed_record` and the aggregate
+    is :func:`summarize_train_results`; the seed-blocked sweep in
+    ``quality.main`` calls the two directly (one seed block runs every
+    (operator, task, n_kv) cell before the next seed starts), so this
+    wrapper and the blocked sweep share one code path.
     """
     # Coerce string device -> torch.device so callers passing 'cpu'/'cuda'
     # from a notebook don't hit AttributeError on ``device.type`` below.
     if isinstance(device, str):
         device = torch.device(device)
     seeds = seed_ids(n_seeds, plan_id='exp4_mqar')
-    # Compute the actual training-step count for THIS op once, mirroring
-    # ``train_one``'s ``actual_steps = softmax_steps if op_name == 'softmax'
-    # else steps`` logic, so the recorded ``steps`` field in the per-seed
-    # error stub matches what a SUCCESS row would have recorded.
-    actual_steps_for_op = softmax_steps if op_name == 'softmax' else steps
-    stub_train_batch = kw.get('train_batch')
-    if stub_train_batch is None:
-        stub_train_batch = parse_int_env('MQAR_TRAIN_BATCH', 32, min_value=1,
-                                         logger=logger)
-    per_seed = []
-    for s in seeds:
-        t0 = time.time()
-        # Per-seed try/except: one divergent seed should not crash the
-        # whole operator. We log and record a stub; the aggregate stats
-        # are computed over whichever seeds succeeded.
-        try:
-            r = _public_api('train_one', train_one)(
-                op_name, seed=s, steps=steps, device=device,
-                          softmax_steps=softmax_steps, **kw)
-            r['train_time_s'] = time.time() - t0
-            # Log BEFORE appending to per_seed, so a failure inside
-            # ``logger.info`` cannot record the seed as a success first and
-            # then append a duplicate error stub for the same seed.
-            logger.info(f"    seed {s}: acc={r['final_acc']:.4f}  loss={r['final_loss']:.4f}  "
-                        f"steps={r['steps']}  time={r['train_time_s']:.1f}s")
-            per_seed.append(r)
-        except Exception as e:
-            logger.warning(f"    seed {s} FAILED: {e}")
-            # Per-seed error stub: include ALL success-row fields (set to
-            # None / 0 where not applicable) so downstream consumers using
-            # ``pd.DataFrame(per_seed)`` or ``per_seed[0].get('steps', ...)``
-            # see a consistent schema. ``pd.DataFrame(per_seed)`` uses the
-            # first record's keys as columns, and
-            # ``make_figures._plot_mqar_group`` reads
-            # ``per_seed[0].get('steps', 100)`` for the figure title.
-            per_seed.append({
-                'op': op_name,
-                'task': kw.get('task', 'mqar'),
-                'n_kv': kw.get('n_kv', 1),
-                'n_params': None,
-                'final_acc': None,
-                'final_loss': None,
-                'chance_acc': 1.0 / kw.get('vocab', 16) if 'vocab' in kw else None,
-                'last_train_acc': None,
-                'mean_last10_loss': None,
-                'mean_last10_acc': None,
-                # Use the OP-SPECIFIC step count (softmax_steps for softmax,
-                # steps for others) so the stub matches what a success row
-                # would record, even when
-                # MQAR_SOFTMAX_STEPS != MQAR_STEPS.
-                'steps': actual_steps_for_op,
-                'seed': s,
-                'train_batch': stub_train_batch,
-                'train_time_s': time.time() - t0,
-                'error': str(e),
-                # Mirror the success-row training-curve keys (empty) so the
-                # per_seed schema is uniform across success/error records.
-                'lr': kw.get('lr', 3e-3),
-                'loss_curve': [],
-                'acc_curve': [],
-                # Mirror the results-analysis keys so a DataFrame over
-                # per_seed has one schema for success and error rows.
-                'val_history': [],
-                'curve_diagnosis': None,
-                'error_analysis': None,
-                'final_eval_time_s': None,
-                'final_eval_ms_per_sample': None,
-                'generalization_gap': None,
-                'best_val': None,
-                'val_loss_regret_from_best': None,
-                'val_acc_regret_from_best': None,
-                'steps_since_best': None,
-                'best_val_is_final': None,
-                'early_stopping_summary': None,
-                'accuracy_regime': None,
-                'val_acc_first': None,
-                'val_acc_last': None,
-                'val_acc_peak': None,
-                'gradient_norms': None,
-                'final_metrics': None,
-                'final_f1_macro': None,
-                'final_f1_weighted': None,
-                'final_balanced_accuracy': None,
-                'final_pr_auc_macro_ovr': None,
-                'final_roc_auc_macro_ovr': None,
-            })
-        # On GPU, clear the CUDA cache between seeds so the allocator does
-        # not accumulate freed-but-unreleased blocks across seeds.
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+    per_seed = [
+        train_one_seed_record(op_name, s, steps=steps,
+                              softmax_steps=softmax_steps, device=device,
+                              **kw)
+        for s in seeds
+    ]
+    return summarize_train_results(op_name, per_seed, seeds)
 
+
+def summarize_train_results(op_name, per_seed, seeds):
+    """Aggregate per-seed records into the multi-seed summary row.
+
+    ``per_seed`` holds success rows and/or error stubs as produced by
+    :func:`train_one_seed_record` (order does not matter); ``seeds`` is
+    the REQUESTED seed id list, recorded verbatim in the summary. Raises
+    ``RuntimeError`` when no seed survived. The seed-blocked sweep calls
+    this once per (operator, task, n_kv) cell after the whole seed-block
+    schedule has finished.
+    """
     # Filter out failed seeds before computing aggregate stats.
     # A seed that diverged to NaN loss is caught by train_one's NaN guard
     # and recorded with an 'error' key — but a seed that produced a NaN
@@ -772,7 +813,7 @@ def train_multi_seed(op_name, n_seeds=5, steps=100, softmax_steps=None,
         # All seeds failed: propagate the error so the caller can record
         # a stub result for this operator.
         raise RuntimeError(
-            f"all {n_seeds} seeds failed for op '{op_name}'; "
+            f"all {len(per_seed)} seeds failed for op '{op_name}'; "
             f"first error: {per_seed[0].get('error')}")
 
     accs = [r['final_acc'] for r in ok_per_seed]

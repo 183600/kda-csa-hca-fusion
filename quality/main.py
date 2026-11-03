@@ -35,7 +35,9 @@ from .training import (  # noqa: F401
     _parse_task_list,
     _sweep_cells,
     run_overfit_sanity_check,
+    summarize_train_results,
     train_multi_seed,
+    train_one_seed_record,
     tune_baseline_lr,
 )
 
@@ -262,18 +264,98 @@ def main():
             logger.info(f'  [tune] {op}: selected lr={best_lr:g}')
         logger.info('=' * 70)
 
-    all_results = []
+    # ------------------------------------------------------------------
+    # Execution order is part of the design (experiment-design.md): the
+    # sweep runs the pre-registered BALANCED schedule for Exp 4 whenever
+    # the sweep is the full (operator x task x n_kv) product — every seed
+    # is one block that trains every treatment cell exactly once, with the
+    # cell order rotated across blocks, so treatment is never aliased with
+    # time / allocator state / device-frequency drift. The observed
+    # sequence is recorded and audited against the schedule fingerprint
+    # after the run. A task mix that does not sweep n_kv uniformly (opt-in
+    # probes with a fixed default_n_kv) is not a product; it keeps the
+    # historical cell-major order and the audit reports the order check as
+    # unverified (None) instead of pretending it was balanced.
+    # ------------------------------------------------------------------
+    run_levels = {'operator': list(ops_list), 'task': list(task_list),
+                  'n_kv': list(n_kv_list)}
+    sweep_is_product = len(sweep) == len(task_list) * len(n_kv_list)
+    exp4_schedule = None
+    if sweep_is_product:
+        exp4_schedule = balanced_execution_schedule(
+            'exp4_mqar', seed_ids(n_seeds, plan_id='exp4_mqar'),
+            levels=run_levels)
+        logger.info(f'\nBalanced execution schedule: '
+                    f'{exp4_schedule["schedule_id"]} '
+                    f'({exp4_schedule["n_runs"]} runs in '
+                    f'{exp4_schedule["n_blocks"]} seed block(s), '
+                    f'{exp4_schedule["n_cells"]} cell(s) per block)')
+    else:
+        logger.info('\nBalanced execution schedule: SKIPPED (the selected '
+                    'task mix does not sweep n_kv uniformly, so the sweep '
+                    'is not the full product; execution order stays '
+                    'unverified in the design audit)')
+    exp4_seed_ids = seed_ids(n_seeds, plan_id='exp4_mqar')
+    if exp4_schedule is not None:
+        execution_units = [
+            (exp4_schedule['seeds'][block_index], exp4_schedule['cells'][ci])
+            for block_index, block in enumerate(exp4_schedule['blocks'])
+            for ci in block
+        ]
+    else:
+        execution_units = [
+            (seed, {'operator': op, 'task': task, 'n_kv': n_kv})
+            for task, n_kv, _, _ in sweep
+            for op in ops_list
+            for seed in exp4_seed_ids
+        ]
+    per_cell_records = {
+        (op, task, n_kv): []
+        for task, n_kv, _, _ in sweep
+        for op in ops_list
+    }
+    observed_execution = []
     for task, n_kv, task_seq_len, task_vocab in sweep:
         spec = SYNTHETIC_TASKS[task]
-        chance = 1.0 / task_vocab
         logger.info(f'\n{"=" * 70}')
         logger.info(f'  task = {task} (n_kv={n_kv}, seq_len={task_seq_len}, '
                     f'vocab={task_vocab}) — {spec["description"]}')
-        logger.info(f'  chance accuracy = {chance:.4f}')
-        logger.info(f'{"=" * 70}')
+        logger.info(f'  chance accuracy = {1.0 / task_vocab:.4f}')
+    logger.info(f'{"=" * 70}')
+    for seed, cell in execution_units:
+        op, task, n_kv = cell['operator'], cell['task'], cell['n_kv']
+        spec = SYNTHETIC_TASKS[task]
+        logger.info(f'\nTraining {op} (task={task}, n_kv={n_kv}, '
+                    f'seed={seed})...')
+        try:
+            record = train_one_seed_record(
+                op, seed, steps=steps, softmax_steps=softmax_steps,
+                device=device, n_kv=n_kv, vocab=spec['vocab'],
+                seq_len=spec['seq_len'], task=task,
+                lr=tuned_lrs.get(op, 3e-3),
+                val_every=val_every, val_batches=val_batches,
+                val_batch=val_batch, error_batches=error_batches,
+                error_batch=error_batch)
+        except Exception as e:
+            # train_one_seed_record already converts per-seed failures into
+            # stub rows; this guard only covers failures of the runner
+            # itself (e.g. a broken logger) so the sweep survives.
+            import traceback as _tb
+            logger.error(f'  run (op={op}, task={task}, n_kv={n_kv}, '
+                         f'seed={seed}) FAILED: {e}')
+            _tb.print_exc()
+            record = {
+                'op': op, 'task': task, 'n_kv': n_kv, 'seed': seed,
+                'steps': steps, 'error': str(e), 'final_acc': None,
+                'final_loss': None,
+            }
+        per_cell_records[(op, task, n_kv)].append(record)
+        observed_execution.append({
+            'operator': op, 'task': task, 'n_kv': n_kv, 'seed': seed})
+
+    all_results = []
+    for task, n_kv, task_seq_len, task_vocab in sweep:
         for op in ops_list:
-            logger.info(f'\nTraining {op} (task={task}, n_kv={n_kv}, '
-                        f'{n_seeds} seeds)...')
             # Per-operator try/except so ONE failing operator (all seeds
             # diverged / OOMed) does not crash the whole experiment and
             # lose the other operators' results. The error is logged and
@@ -281,16 +363,8 @@ def main():
             # and downstream figure generation can skip the missing op
             # gracefully (mirrors run_ablation.py's per-ratio try/except).
             try:
-                r = train_multi_seed(op, n_seeds=n_seeds, steps=steps,
-                                     softmax_steps=softmax_steps, device=device,
-                                     n_kv=n_kv, vocab=task_vocab,
-                                     seq_len=task_seq_len, task=task,
-                                     lr=tuned_lrs.get(op, 3e-3),
-                                     val_every=val_every,
-                                     val_batches=val_batches,
-                                     val_batch=val_batch,
-                                     error_batches=error_batches,
-                                     error_batch=error_batch)
+                r = summarize_train_results(
+                    op, per_cell_records[(op, task, n_kv)], exp4_seed_ids)
                 # Attach the non-learned rule reference for this cell next
                 # to the row it contextualizes (see evaluate_rule_baseline:
                 # ceiling reference, not the tuned comparison baseline).
@@ -302,7 +376,8 @@ def main():
                 # n==1 case (the sample std is undefined, not zero).
                 ci_str = f"{r['ci95_acc']:.4f}" if r['ci95_acc'] is not None else 'n/a'
                 std_str = f"{r['std_acc']:.4f}" if r['std_acc'] is not None else 'n/a'
-                logger.info(f"  -> mean_acc={r['mean_acc']:.4f} +/- {ci_str} "
+                logger.info(f"  -> {op} (task={task}, n_kv={n_kv}) "
+                            f"mean_acc={r['mean_acc']:.4f} +/- {ci_str} "
                             f"(std={std_str}, t_vs_chance={_fmt_tstat(r['t_stat_vs_chance'], width=0, prec=2)})")
                 # Curve verdicts: over/underfitting is a property of the
                 # training CURVE, reported per op so a good mean accuracy
@@ -1023,6 +1098,8 @@ def main():
                 'n_kv': list(n_kv_list)},
         family_size=design_family_size,
         analyzed_seeds=analyzed_population,
+        execution_order=(observed_execution
+                         if exp4_schedule is not None else None),
         seed_role=seed_block_role(),
     )
     logger.info(
@@ -1036,6 +1113,17 @@ def main():
             'reported estimates are complete-case, not the pre-registered '
             'complete block. See metadata.experiment_design.'
             'analysis_population.')
+    if exp4_schedule is not None:
+        _order = experiment_design_audit.get('execution_order') or {}
+        logger.info(
+            f'  execution order: {_order.get("status")} '
+            f'(matches_planned_schedule='
+            f'{_order.get("matches_planned_schedule")})')
+        if _order.get('status') == 'order_confounded':
+            logger.warning(
+                '  [design] the observed run order deviates from the '
+                'balanced schedule; treatment is aliased with execution '
+                'time and the run is labelled order_confounded.')
 
     os.makedirs('results', exist_ok=True)
     # Write strict JSON (allow_nan=False): if a divergent seed slipped
@@ -1089,6 +1177,43 @@ def main():
             # required vs actual seed budget, per-test alpha, MDE and the
             # claims this run is allowed to support (see experiment_design).
             'experiment_design': experiment_design_audit,
+            # The executed order is evidence, not an assumption. The sweep
+            # trains in the pre-registered balanced schedule (one complete
+            # operator/task/n_kv block per seed, cell order rotated across
+            # blocks) whenever the sweep is the full product, and the
+            # observed sequence is audited against the schedule
+            # fingerprint. ``enabled=False`` records the honest state:
+            # order balance is unverified, not assumed.
+            'execution_schedule': (
+                {
+                    'enabled': True,
+                    'schedule_id': exp4_schedule['schedule_id'],
+                    'schedule_sha256': exp4_schedule['schedule_sha256'],
+                    'schedule_seed': exp4_schedule['schedule_seed'],
+                    'n_cells': exp4_schedule['n_cells'],
+                    'n_blocks': exp4_schedule['n_blocks'],
+                    'n_runs': exp4_schedule['n_runs'],
+                    'balance': exp4_schedule['balance'],
+                    'levels': run_levels,
+                    'observed_sha256': (
+                        (experiment_design_audit.get('execution_order') or {})
+                        .get('observed_schedule_sha256')),
+                    'observed_status': (
+                        (experiment_design_audit.get('execution_order') or {})
+                        .get('status')),
+                    'matches_planned_schedule': (
+                        (experiment_design_audit.get('execution_order') or {})
+                        .get('matches_planned_schedule')),
+                }
+                if exp4_schedule is not None else
+                {
+                    'enabled': False,
+                    'levels': run_levels,
+                    'note': ('the sweep is not the full (operator x task '
+                             'x n_kv) product (opt-in probes with a fixed '
+                             'default_n_kv), so no balanced schedule was '
+                             'consumed; execution_order is unverified'),
+                }),
             # Data version block: this experiment's "dataset" is synthetic
             # and fully determined by (generator function, task spec, seed
             # + offset). Recording all three makes the data version explicit
