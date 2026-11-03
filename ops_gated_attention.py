@@ -393,7 +393,7 @@ class GatedDeltaRule(nn.Module):
         # tensor version to detect updates during training.
         self._gate_exp_cache = None
         self._gate_version = -1
-        self._gate_cache_enabled = True
+        self._gate_cache_enabled = False  # disabled to avoid stale cache issues
 
     def forward(
         self,
